@@ -2160,15 +2160,6 @@ pub(crate) unsafe fn set_user_object_security_descriptor(handle: u64, descriptor
     (&mut *core::ptr::addr_of_mut!(OBJ_TABLE)).set_security_descriptor(handle, descriptor)
 }
 
-pub(crate) unsafe fn switch_desktop_would_change_input_desktop(hdesk: u64) -> bool {
-    let target_body = (*core::ptr::addr_of!(OBJ_TABLE)).lookup_body(hdesk);
-    if target_body == 0 {
-        return false;
-    }
-    let gpdesk = read_volatile((WIN32K_CODE_VA + GPDESK_INPUT_DESKTOP_RVA) as *const u64);
-    gpdesk != target_body
-}
-
 /// Classify the `OBJECT_TYPE` pointer win32k passed into an [`ObKind`] (`None` = an unrecognized
 /// type). The pointer is the value held in win32k's imported `ExDesktopObjectType` /
 /// `ExWindowStationObjectType` data cell — now the address of a **real** `OBJECT_TYPE` static (see

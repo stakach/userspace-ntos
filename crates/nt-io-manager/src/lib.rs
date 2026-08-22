@@ -35,6 +35,7 @@ mod open;
 mod pipe;
 mod projection;
 mod read_write;
+mod retained_completion;
 mod store;
 mod wdm_x64;
 
@@ -71,6 +72,7 @@ pub use pipe::{
     STATUS_PIPE_BUSY, STATUS_PIPE_CONNECTED, STATUS_PIPE_DISCONNECTED, STATUS_PIPE_LISTENING,
     STATUS_PIPE_NOT_AVAILABLE,
 };
+pub use retained_completion::{RetainedCompletion, RetainedCompletionError, RetainedIrpCompletion};
 pub use store::{GenStore, IoId};
 pub use wdm_x64::{
     write_wdm_device_object, write_wdm_driver_object, write_wdm_file_object,
@@ -1111,6 +1113,7 @@ mod tests {
             parameters,
             buffer: None,
             user_data: 0,
+            requestor_tid: 0,
         }
     }
 
@@ -1538,6 +1541,7 @@ mod tests {
         file_id: Option<FileId>,
         major: u8,
         user_data: u64,
+        requestor_tid: u64,
         parameters: IoParameters,
         input_len: u32,
         output_len: u32,
@@ -1564,6 +1568,7 @@ mod tests {
                 file_id: irp.file_id,
                 major: irp.major,
                 user_data: irp.user_data,
+                requestor_tid: irp.requestor_tid,
                 parameters: irp.parameters.clone(),
                 input_len: irp.buffer.map(|b| b.input_len).unwrap_or(0),
                 output_len: irp.buffer.map(|b| b.output_len).unwrap_or(0),
@@ -1638,6 +1643,7 @@ mod tests {
                 device,
                 None,
                 0xABCD,
+                77,
                 major::IRP_MJ_SET_INFORMATION,
                 params.clone(),
                 buf.len() as u32,
@@ -1660,6 +1666,7 @@ mod tests {
                 file_id: None,
                 major: major::IRP_MJ_SET_INFORMATION,
                 user_data: 0xABCD,
+                requestor_tid: 77,
                 parameters: params,
                 input_len: 5,
                 output_len: 0,
@@ -1686,6 +1693,7 @@ mod tests {
                 driver,
                 None,
                 0x1234,
+                88,
                 major::IRP_MJ_DEVICE_CONTROL,
                 params,
                 4,
@@ -1702,6 +1710,7 @@ mod tests {
         assert_eq!(seen[0].device_id, DeviceId::NULL);
         assert_eq!(seen[0].driver_id, driver);
         assert_eq!(seen[0].user_data, 0x1234);
+        assert_eq!(seen[0].requestor_tid, 88);
         assert_eq!((seen[0].input_len, seen[0].output_len), (4, 4));
     }
 

@@ -242,6 +242,7 @@ pub(crate) struct CompletedWin32kDispatch {
 
 pub(crate) const COMPLETED_ARG_SNAPSHOT_BYTES: usize =
     nt_user_callback::DISPATCH_ARG_SNAPSHOT_BYTES;
+pub(crate) const COMPLETED_MSG_SNAPSHOT_BYTES: usize = 48;
 
 impl CompletedWin32kDispatch {
     pub(crate) const fn new(ssn: u64, args: [u64; 4], caller_sp: u64, status: u64) -> Self {
@@ -3304,7 +3305,17 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         dispatch_context.caller_sp,
         component.result,
     );
-    if dispatch_context.ssn == win32k_subsystem::SSN_NT_USER_INITIALIZE && component.result == 0 {
+    if matches!(
+        dispatch_context.ssn,
+        nt_user_callback::NTUSER_GET_MESSAGE_SSN | nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
+    ) {
+        // Get/Peek use the shared argument window for their MSG output. Nested callbacks can reuse
+        // that window before the parked outer dispatch resumes, so bind the final bytes to this
+        // completed dispatch before control returns to the executive service loop.
+        let _ = outer_dispatch.capture_arg_snapshot(COMPLETED_MSG_SNAPSHOT_BYTES as u64);
+    } else if dispatch_context.ssn == win32k_subsystem::SSN_NT_USER_INITIALIZE
+        && component.result == 0
+    {
         let frame_snapshot_len = completed_frame.arg_snapshot_len() as usize;
         if frame_snapshot_len != 0 {
             let snapshot = &completed_frame.arg_snapshot()[..frame_snapshot_len];

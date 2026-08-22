@@ -28,6 +28,7 @@ impl<P> IoManager<P> {
         device_id: DeviceId,
         file_id: Option<FileId>,
         user_data: u64,
+        requestor_tid: u64,
         major: u8,
         params: IoParameters,
         input_len: u32,
@@ -44,6 +45,7 @@ impl<P> IoManager<P> {
             device_id,
             file_id,
             user_data,
+            requestor_tid,
             major,
             params,
             input_len,
@@ -61,6 +63,7 @@ impl<P> IoManager<P> {
         driver_id: DriverId,
         file_id: Option<FileId>,
         user_data: u64,
+        requestor_tid: u64,
         major: u8,
         params: IoParameters,
         input_len: u32,
@@ -73,6 +76,7 @@ impl<P> IoManager<P> {
             DeviceId::NULL,
             file_id,
             user_data,
+            requestor_tid,
             major,
             params,
             input_len,
@@ -88,6 +92,7 @@ impl<P> IoManager<P> {
         device_id: DeviceId,
         file_id: Option<FileId>,
         user_data: u64,
+        requestor_tid: u64,
         major: u8,
         params: IoParameters,
         input_len: u32,
@@ -100,6 +105,7 @@ impl<P> IoManager<P> {
 
         let mut irp = IrpRecord::new(client, device_id, file_id, major);
         irp.user_data = user_data;
+        irp.requestor_tid = requestor_tid;
         let mut sl = IoStackLocation::new(major, device_id, file_id);
         sl.parameters = params;
         irp.stack.push(sl);

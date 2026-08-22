@@ -2608,6 +2608,13 @@ impl ObjectWaiterTable {
             .filter(|entry| entry.is_live())
     }
 
+    fn contains_tid(&self, tid: u64) -> bool {
+        self.entries
+            .iter()
+            .copied()
+            .any(|entry| entry.is_live() && entry.tid == tid)
+    }
+
     fn clear_pending_wakes(&mut self) {
         for entry in self.entries.iter_mut().filter(|entry| entry.is_live()) {
             entry.pending_wake_index = u64::MAX;
@@ -3941,6 +3948,16 @@ pub(crate) fn winlogon_dialog_modal_thread_matches(badge: u64, tid: u64, message
     WINLOGON_DIALOG_MODAL_BADGE.load(Ordering::Relaxed) == badge
         && observed_tid == tid
         && WINLOGON_DIALOG_MODAL_MSG.load(Ordering::Relaxed) == message
+}
+
+/// Match the thread that owns the correlated IDD_LOGON modal pump after its initial message
+/// sequence has been established. `MSG *` is per-call scratch storage and user32 may move it when
+/// nested callbacks unwind, so it is not part of the pump's stable identity beyond that sequence.
+pub(crate) fn winlogon_dialog_modal_thread_is_owner(badge: u64, tid: u64) -> bool {
+    badge == WINLOGON_BADGE
+        && tid != 0
+        && WINLOGON_DIALOG_MODAL_BADGE.load(Ordering::Relaxed) == badge
+        && WINLOGON_DIALOG_MODAL_TID.load(Ordering::Relaxed) == tid
 }
 
 pub(crate) unsafe fn winlogon_pwnd_for_hwnd(hwnd: u64) -> u64 {
@@ -6583,6 +6600,8 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
     print_u64(driver_launch::FSD_POOL_DOUBLE_FREES.load(Ordering::Relaxed));
     print_str(b" pool-list-cycles=");
     print_u64(driver_launch::FSD_POOL_LIST_CYCLES.load(Ordering::Relaxed));
+    print_str(b" pool-invalid-frees=");
+    print_u64(driver_launch::FSD_POOL_INVALID_FREES.load(Ordering::Relaxed));
     print_str(
         b"
 ",
@@ -6607,6 +6626,13 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
             && boot_checkpoints >= 1
             && boot_checkpoint_bytes > 0
             && boot_checkpoint_failures == 0,
+        passed,
+    );
+    check(
+        b"exec_hosted_driver_pool_integrity",
+        driver_launch::FSD_POOL_DOUBLE_FREES.load(Ordering::Relaxed) == 0
+            && driver_launch::FSD_POOL_LIST_CYCLES.load(Ordering::Relaxed) == 0
+            && driver_launch::FSD_POOL_INVALID_FREES.load(Ordering::Relaxed) == 0,
         passed,
     );
     // (2) lsass' `\pipe\lsarpc` rpcrt4 SERVER thread crossed the WHOLE handoff and reached
@@ -15959,6 +15985,10 @@ fn object_waiter_record(slot: usize) -> Option<ObjectWaiterRecord> {
     unsafe { (&*core::ptr::addr_of!(OBJECT_WAITERS)).record(slot) }
 }
 
+fn object_waiter_contains_tid(tid: u64) -> bool {
+    unsafe { (&*core::ptr::addr_of!(OBJECT_WAITERS)).contains_tid(tid) }
+}
+
 fn object_waiter_next_deadline() -> Option<u64> {
     unsafe { (&*core::ptr::addr_of!(OBJECT_WAITERS)).next_deadline() }
 }
@@ -17098,6 +17128,15 @@ unsafe fn wait_park_multi(
 /// semaphore tokens are consumed in waiter-slot order; process/thread objects are level-signalled.
 unsafe fn wait_wake_dispatcher_set(handler: &mut ExecNtHandler) -> u64 {
     wait_wake_dispatcher(handler, None)
+}
+
+/// Close the readiness-to-registration window between native syscall dispatch and reply-cap
+/// parking. The dispatcher scan may immediately resume this waiter if its condition became true
+/// during post-dispatch work. The caller must only mark the thread as waiting when its record
+/// remains installed afterward.
+unsafe fn wait_recheck_after_park(handler: &mut ExecNtHandler, tid: u64) -> bool {
+    let _ = wait_wake_dispatcher_set(handler);
+    object_waiter_contains_tid(tid)
 }
 
 /// Pulse uses the same waiter selection, but clears the event before any parked thread resumes.
@@ -24292,47 +24331,8 @@ static FB_HEIGHT: AtomicU64 = AtomicU64::new(0);
 static FB_SCANLINE: AtomicU64 = AtomicU64::new(0);
 static FB_SIZE_BYTES: AtomicU64 = AtomicU64::new(0);
 static FB_BITS_PER_PLANE: AtomicU64 = AtomicU64::new(0);
-/// Framebuffer-pixel readback result after the desktop-graphics init: 0=not run, 1=unchanged, 2=drew.
-static FB_PIXELS_DREW: AtomicU64 = AtomicU64::new(0);
-/// Count (of the 768-px sampled grid) whose value == [`FB_DESKTOP_BG`] after the desktop-graphics
-/// init — i.e. how many sampled pixels hold the authentic WC_DESKTOP background win32k painted.
-/// A single non-background sample is permitted only at the real cursor overlay point.
-static FB_PIXELS_MATCH: AtomicU64 = AtomicU64::new(0);
-/// Count (of the 768-px sampled grid) whose value changed from the magenta pre-paint marker.
-static FB_PIXELS_CHANGED: AtomicU64 = AtomicU64::new(0);
-/// Count of samples that are not the desktop background color.
-static FB_NON_BG_COUNT: AtomicU64 = AtomicU64::new(0);
-/// Flat framebuffer index of the sole/latest non-background sample in the grid.
-static FB_NON_BG_INDEX: AtomicU64 = AtomicU64::new(0);
-/// Pixel value of the sole/latest non-background sample in the grid.
-static FB_NON_BG_VALUE: AtomicU64 = AtomicU64::new(0);
-/// The first sampled pixel (grid origin) after the desktop-graphics init — recorded so the gate
-/// report shows the actual painted COLORREF (expected [`FB_DESKTOP_BG`]).
-static FB_PIXELS_SAMPLE0: AtomicU64 = AtomicU64::new(0);
-/// The number of framebuffer pixels sampled on the readback grid (24 rows x 32 cols).
-const FB_SAMPLE_COUNT: u64 = 24 * 32;
-/// The sampled point covered by the real arrow cursor after user32 loads and sets the default cursor.
-const FB_CURSOR_SAMPLE_INDEX: u64 = 12 * 32 * 1024 + 16 * 32;
-/// Proof that winlogon's OWN natural NtUserSwitchDesktop -> co_IntShowDesktop -> IntPaintDesktop
-/// flow paints the framebuffer. Set by the forward arm around winlogon's SwitchDesktop (SSN 0x1288):
-/// the fb is cleared to magenta (0x00FF00FF) BEFORE the switch and the sampled grid is re-read AFTER —
-/// this records how many sampled pixels winlogon's flow re-painted to [`FB_DESKTOP_BG`]. 0 = not yet
-/// observed; a full 768 = the natural flow paints. The EAGER SSN_INIT_DESKTOP_GFX scaffold is now
-/// fully RETIRED — winlogon's own DC-op drives BOTH the display init (co_IntGraphicsCheck ->
-/// co_IntInitializeDesktopGraphics) and this paint; this is the sole source of the counted spec.
-static WINLOGON_NATURAL_PAINT: AtomicU64 = AtomicU64::new(0);
-/// Once-guard (BATCH 46): winlogon issues its interactive NtUserSwitchDesktop TWICE (both to the same
-/// Default desktop). Only the FIRST is a real transition that drives the InitVideo + IntPaintDesktop
-/// paint; the SECOND is win32k's `pdesk == gpdeskInputDesktop` already-current early-return (zero paint
-/// work). The magenta-clear must run only before an unobserved painting switch, and the readback is
-/// latched either immediately or after NtCallbackReturn resumes a suspended switch; otherwise the second
-/// switch wipes the fb back to magenta and re-reads 0/768. Set to 1 once the paint has been sampled.
-pub(crate) static WINLOGON_PAINT_DONE: AtomicU64 = AtomicU64::new(0);
-/// The authentic desktop background COLORREF that win32k's WC_DESKTOP class `hbrBackground` paints
-/// (co_IntShowDesktop -> IntPaintDesktop -> NtGdiPatBlt -> DrvBitBlt -> the real framebuffer). This
-/// is the value the Phase-0a magenta (0x00FF00FF) test pattern must flip to when the desktop is
-/// painted; the `exec_win32k_desktop_painted` gate spec asserts the sampled grid changed from magenta
-/// and is this color except for the exact cursor overlay sample.
+/// The authentic desktop background COLORREF that win32k's WC_DESKTOP class paints. Final dialog
+/// and Explorer readback compare against it without mutating the framebuffer under observation.
 const FB_DESKTOP_BG: u32 = 0x003a_6ea5;
 /// The executive's Phase-0a framebuffer window (also read back after the desktop-graphics init to
 /// confirm GDI/display-driver pixels landed).
@@ -30554,59 +30554,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         }
     }
 
-    // --- Graphics: the counted desktop paint. The ENTIRE eager desktop-graphics scaffold is RETIRED —
-    // both the display init AND the paint are now winlogon-natural. winlogon's OWN first GUI DC-op
-    // (NtUserSwitchDesktop -> co_IntShowDesktop -> WM_ERASEBKGND -> DceAllocDCE -> co_IntGraphicsCheck)
-    // lazily drives co_IntInitializeDesktopGraphics (InitVideo/surface) THEN IntPaintDesktop paints the
-    // framebuffer (the m0==0x1288 forward arm cleared the fb to magenta first, then re-read the grid,
-    // stashing the result in FB_PIXELS_DREW/MATCH/CHANGED/SAMPLE0). There is no longer any m0==0x125a arm; win32k's
-    // own NtUserInitialize dispatch only seeds the host prerequisites (system font + WinSta0/Default Ob).
+    // The video-device projection is a mechanism proof independent of the framebuffer-content gates.
+    // IDD_LOGON and Explorer validate pixels later without clearing or otherwise modifying the display.
     {
-        let d = FB_PIXELS_DREW.load(Ordering::Relaxed);
-        let matched = FB_PIXELS_MATCH.load(Ordering::Relaxed);
-        let changed = FB_PIXELS_CHANGED.load(Ordering::Relaxed);
-        let non_bg_count = FB_NON_BG_COUNT.load(Ordering::Relaxed);
-        let non_bg_index = FB_NON_BG_INDEX.load(Ordering::Relaxed);
-        let non_bg_value = FB_NON_BG_VALUE.load(Ordering::Relaxed);
-        let sample0 = FB_PIXELS_SAMPLE0.load(Ordering::Relaxed);
-        let cursor_overlay = matched + 1 == FB_SAMPLE_COUNT
-            && non_bg_count == 1
-            && non_bg_index == FB_CURSOR_SAMPLE_INDEX
-            && non_bg_value as u32 != 0x00ff_00ff;
-        let full_desktop = d == 2
-            && changed == FB_SAMPLE_COUNT
-            && sample0 as u32 == FB_DESKTOP_BG
-            && (matched == FB_SAMPLE_COUNT || cursor_overlay);
-        print_str(b"[ntos-exec] win32k desktop-graphics framebuffer pixels: ");
-        print_str(match d {
-            2 => b"DREW (non-magenta)\n".as_slice(),
-            1 => b"unchanged (no draw)\n".as_slice(),
-            _ => b"gfx-init not reached\n".as_slice(),
-        });
-        print_str(b"[ntos-exec] desktop-bg match ");
-        print_u64(matched);
-        print_str(b"/");
-        print_u64(FB_SAMPLE_COUNT);
-        print_str(b" px, px0=0x");
-        print_hex(sample0 as u32);
-        print_str(b" (expected 0x");
-        print_hex(FB_DESKTOP_BG);
-        print_str(b")\n");
-        print_str(b"[ntos-exec] desktop samples changed ");
-        print_u64(changed);
-        print_str(b"/");
-        print_u64(FB_SAMPLE_COUNT);
-        print_str(b", non-bg ");
-        print_u64(non_bg_count);
-        print_str(b" at 0x");
-        print_hex(non_bg_index as u32);
-        print_str(b" value=0x");
-        print_hex(non_bg_value as u32);
-        print_str(if cursor_overlay {
-            b" (cursor overlay)\n".as_slice()
-        } else {
-            b"\n".as_slice()
-        });
         let (video_ready, video_driver, video_device, video_file) =
             video_device::video_device_projection_proofs();
         print_str(b"[video-device] projection ready=");
@@ -30626,29 +30576,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             video_ready == 1 && video_driver != 0 && video_device != 0 && video_file != 0,
             &mut passed,
         );
-        // PERMANENT GATE: the sampled framebuffer grid must have fully changed from the magenta marker
-        // and hold the authentic WC_DESKTOP background painted by winlogon's natural boot flow. The only
-        // accepted exception is the exact grid sample covered by the real arrow cursor.
-        check(b"exec_win32k_desktop_painted", full_desktop, &mut passed);
-        // Echo winlogon's natural-paint count (same source as the counted spec above — the scaffold
-        // paint is retired, so these agree by construction).
-        let nat = WINLOGON_NATURAL_PAINT.load(Ordering::Relaxed);
-        print_str(b"[ntos-exec] winlogon NATURAL SwitchDesktop paint: ");
-        print_u64(nat);
-        print_str(b"/");
-        print_u64(FB_SAMPLE_COUNT);
-        print_str(if nat == FB_SAMPLE_COUNT {
-            b" px re-painted 0x003a6ea5 (natural flow PAINTS)\n".as_slice()
-        } else if cursor_overlay {
-            b" px re-painted 0x003a6ea5 plus cursor overlay (natural flow PAINTS)\n".as_slice()
-        } else {
-            b" px (natural flow did NOT fully re-paint)\n".as_slice()
-        });
-
-        // The historical "desktop shell frontier" duplicated the later explorer-shell proof while
-        // also requiring userinit to remain live-linked at quiesce. At the real NT boundary userinit
-        // is a transient launcher and may exit after starting explorer, so the durable shell proof is
-        // the stronger `exec_explorer_shell_chrome_painted` gate below.
     }
 
     // SELF-CONTAINED delay specs: exercise the `nt_delay_execution` PUBLIC interface directly

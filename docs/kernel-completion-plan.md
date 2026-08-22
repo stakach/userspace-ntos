@@ -9800,3 +9800,58 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     reference counts and access/type validation; the later generic hosted-kernel call broker should
     carry both object services and synchronization handoffs. Separately, diagnose the LSA event
     waiter as a generic event/thread-scheduling problem before accepting the next full desktop run.
+
+    Hosted pending-IRP ownership and natural-paint cleanup checkpoint (2026-08-22): retained driver
+    completion no longer depends on the fixed 30-read/128-write result stashes. The existing
+    pending-IRP owner node now retains the terminal status, information, output source, separate
+    reclaim pointer, buffer length, flags, and monotonic completion sequence in place. The 256
+    inline owner slots overflow into the hosted pool, so completion capacity scales with actual
+    request ownership instead of dropping an LSA pipe result at a compiled limit. Executive
+    delivery copies completed bytes before unlinking the owner and then validates and releases the
+    complete IRP/IOSL/MDL/buffer graph exactly once. Buffered reads correctly distinguish an NPFS
+    replacement `SystemBuffer` from the original request allocation, while direct and neither I/O
+    retain their actual output surface. The shared dispatch ABI now carries the requesting NT TID;
+    cancellation selects only that thread's requests, cleanup/close redrives newly completed
+    requests, and dispatcher wait registration rechecks readiness after installing the waiter to
+    close the signal-before-park race.
+
+    The historical post-switch magenta framebuffer marker, its direct paint state, and
+    `exec_win32k_desktop_painted` are deleted. Login and Explorer proof now comes only from the real
+    dialog/message/WINDOWPROC/GDI path. Completed outer Get/Peek callback dispatches retain a
+    validated final `MSG` snapshot, so a nested callback that temporarily returns `STATUS_PENDING`
+    cannot make the credential observer consume stale pre-callback message bytes. This closes the
+    observed 12-of-13 credential delivery stall without synthesizing a queue entry or callback
+    result.
+
+    The new exact hosted-pool integrity gate exposed an older provider-domain violation:
+    `NdisFreeMemory` received `NULL` while the bridge privately freed only the dependent component's
+    allocation. Provider allocations are now paired with their dependent shadows. Successful
+    `NdisAllocateMemoryWithTag` records the real provider pool pointer before publishing the
+    dependent VA; `NdisFreeMemory` replays that provider pointer through the real ndis.sys export,
+    then releases only the dependent shadow after provider completion. Pre-dispatch failure,
+    possibly-executed/incomplete pump failure, work-queue failure, and instance teardown all retire
+    both halves with free-list-aware ownership checks, so retries cannot replay stale addresses and
+    teardown cannot leave records that alias a reused instance slot.
+
+    Serialized proof `.tmp/run-desktop-retained-irp-provider-pair-lifetime-20260822.log` is accepted.
+    `NdisFreeMemory` pairs dependent `0x000001000e801ae0` with provider
+    `0x000001000e883d50`; pool double-free, cycle, invalid-free, and corruption counters remain zero.
+    All 13 real credential `WM_CHAR` messages and Return are delivered, userinit and Explorer launch
+    dynamically, Explorer completes 668 api0 callbacks without live/dead callback failures, and all
+    786,432 framebuffer pixels are non-background with at least 32 colors. The run passes `293/293`
+    and reaches the sentinel. Validation is green for `cargo fmt --all`, `cargo test -p
+    nt-hosted-runtime` (`53/53`), `cargo test -p nt-io-manager` (`132/132`), executive `cargo check
+    --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff
+    --check`.
+
+    Review adjustment: the retained-node change removes the immediate bounded-result loss but does
+    not yet make raw hosted WDM ownership canonical. Next, add a host-tested I/O Manager pending
+    outcome and completion queue keyed by `IrpId`; keep cancellation in `CancelRequested` until the
+    driver completes; retain a FileRecord outstanding-IRP reference through completion delivery and
+    ACK; and defer CLOSE until that reference reaches zero. Then pass the canonical `IrpId` into the
+    hosted transport, insert its raw owner before calling `MajorFunction`, reconcile inline versus
+    pending completion, publish every device/major through the generic completion broker, and delete
+    fid/direction-specific retained delivery and completion-discard cancellation. After that, add
+    the real `IoCompleteRequest` stack unwinder, including completion controls, pending propagation,
+    driver-local IRPs, and `STATUS_MORE_PROCESSING_REQUIRED`. Contended executive synchronization
+    handoff and the remaining fail-closed win32k import surface remain open in parallel workstreams.

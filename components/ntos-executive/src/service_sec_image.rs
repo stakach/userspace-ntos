@@ -73,7 +73,6 @@ static GUI_MESSAGE_WAIT_READY_REDRIVES: AtomicU64 = AtomicU64::new(0);
 static GUI_MESSAGE_WAIT_TRACE: AtomicU64 = AtomicU64::new(0);
 static USERCONNECT_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_MSG_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
-static WINLOGON_DESKTOP_PAINT_PENDING: AtomicU64 = AtomicU64::new(0);
 static BUILD_HWND_LIST_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static GET_ICON_INFO_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CREATE_BITMAP_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -703,6 +702,54 @@ unsafe fn process_completed_user_callback_outer_dispatch(
     completion_faults: usize,
     completion_scratch_base: u64,
 ) -> bool {
+    if matches!(
+        dispatch.ssn,
+        nt_user_callback::NTUSER_GET_MESSAGE_SSN | nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
+    ) {
+        if dispatch.arg_snapshot_len as usize != win32k_glue::COMPLETED_MSG_SNAPSHOT_BYTES {
+            let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+            if failures < 8 {
+                print_str(b"[win32k-svc] completed callback MSG snapshot missing pi=");
+                print_u64(completion_pi as u64);
+                print_str(b" ssn=0x");
+                print_hex(dispatch.ssn as u32);
+                print_str(b" expected=");
+                print_u64(win32k_glue::COMPLETED_MSG_SNAPSHOT_BYTES as u64);
+                print_str(b" got=");
+                print_u64(dispatch.arg_snapshot_len as u64);
+                print_str(b"\n");
+            }
+            return false;
+        }
+        let message = u32::from_le_bytes(dispatch.arg_snapshot[8..12].try_into().unwrap());
+        let should_copy = dispatch.status != 0
+            || (dispatch.ssn == nt_user_callback::NTUSER_GET_MESSAGE_SSN && message == WM_QUIT);
+        if should_copy
+            && !img_spawn::client_copyout_mapped(
+                completion_pi as u64,
+                dispatch.args[0],
+                &dispatch.arg_snapshot[..win32k_glue::COMPLETED_MSG_SNAPSHOT_BYTES],
+                completion_filled_pages,
+                completion_faults,
+                completion_scratch_base,
+            )
+        {
+            let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+            if failures < 8 {
+                print_str(b"[win32k-svc] completed callback MSG copy-out failed pi=");
+                print_u64(completion_pi as u64);
+                print_str(b" buffer=0x");
+                print_hex_u64(dispatch.args[0]);
+                print_str(b"\n");
+            }
+            return false;
+        }
+        if completion_pi == 2 && dispatch.status == 1 {
+            let hwnd = u64::from_le_bytes(dispatch.arg_snapshot[0..8].try_into().unwrap());
+            let wparam = u64::from_le_bytes(dispatch.arg_snapshot[16..24].try_into().unwrap());
+            winlogon_credential_observe_retrieved(hwnd, message, wparam);
+        }
+    }
     if dispatch.ssn == win32k_subsystem::SSN_NT_USER_INITIALIZE && dispatch.status == 0 {
         let blen = dispatch.args[2].min(win32k_subsystem::WIN32K_ARG_FRAMES * 0x1000);
         if dispatch.arg_snapshot_len as u64 != blen {
@@ -3332,10 +3379,6 @@ unsafe fn observe_winlogon_completed_dispatch(
     faults: usize,
     scratch_base: u64,
 ) {
-    if dispatch.ssn == 0x1288 {
-        observe_winlogon_natural_switch_desktop(dispatch.status);
-        return;
-    }
     if dispatch.ssn != 0x1077 || dispatch.status == 0 {
         return;
     }
@@ -3453,79 +3496,6 @@ unsafe fn observe_winlogon_completed_dispatch(
     print_str(b" correlated=");
     print_u64(correlated as u64);
     print_str(b"\n");
-}
-
-unsafe fn observe_winlogon_natural_switch_desktop(status: u64) {
-    if status == 0 {
-        return;
-    }
-    if WINLOGON_PAINT_DONE.load(Ordering::Relaxed) != 0 {
-        return;
-    }
-
-    // Read back the 768-px sampled grid; count how many winlogon's OWN SwitchDesktop flow
-    // painted to the WC_DESKTOP background. This can run either immediately after a
-    // non-callback switch or after NtCallbackReturn resumes the suspended switch.
-    let fb = FB_VADDR as *const u32;
-    let mut matched = 0u32;
-    let mut changed = 0u32;
-    let mut non_bg_count = 0u32;
-    let mut non_bg_index = 0u64;
-    let mut non_bg_value = 0u32;
-    let mut sample0 = 0u32;
-    for r in 0..24u64 {
-        for c in 0..32u64 {
-            let idx = r * 32 * 1024 + c * 32;
-            let px = core::ptr::read_volatile(fb.add(idx as usize));
-            if r == 0 && c == 0 {
-                sample0 = px;
-            }
-            if px != 0x00FF_00FF {
-                changed += 1;
-            }
-            if px == FB_DESKTOP_BG {
-                matched += 1;
-            } else {
-                non_bg_count += 1;
-                non_bg_index = idx;
-                non_bg_value = px;
-            }
-        }
-    }
-    WINLOGON_NATURAL_PAINT.store(matched as u64, Ordering::Relaxed);
-    FB_PIXELS_DREW.store(if changed > 0 { 2 } else { 1 }, Ordering::Relaxed);
-    FB_PIXELS_MATCH.store(matched as u64, Ordering::Relaxed);
-    FB_PIXELS_CHANGED.store(changed as u64, Ordering::Relaxed);
-    FB_NON_BG_COUNT.store(non_bg_count as u64, Ordering::Relaxed);
-    FB_NON_BG_INDEX.store(non_bg_index, Ordering::Relaxed);
-    FB_NON_BG_VALUE.store(non_bg_value as u64, Ordering::Relaxed);
-    FB_PIXELS_SAMPLE0.store(sample0 as u64, Ordering::Relaxed);
-    let cursor_overlay = matched as u64 + 1 == FB_SAMPLE_COUNT
-        && non_bg_count == 1
-        && non_bg_index == FB_CURSOR_SAMPLE_INDEX
-        && non_bg_value != 0x00FF_00FF;
-    let full_desktop = changed as u64 == FB_SAMPLE_COUNT
-        && sample0 == FB_DESKTOP_BG
-        && (matched as u64 == FB_SAMPLE_COUNT || cursor_overlay);
-    if full_desktop {
-        WINLOGON_PAINT_DONE.store(1, Ordering::Relaxed);
-        WINLOGON_DESKTOP_PAINT_PENDING.store(0, Ordering::Relaxed);
-    }
-    print_str(b"[win32k-svc] winlogon NtUserSwitchDesktop ret=0x");
-    print_hex(status as u32);
-    print_str(b" -> NATURAL fb readback: changed ");
-    print_u64(changed as u64);
-    print_str(b"/768, desktop-bg ");
-    print_u64(matched as u64);
-    print_str(b"/768 (px0=0x");
-    print_hex(sample0);
-    print_str(b", non-bg ");
-    print_u64(non_bg_count as u64);
-    print_str(b" at 0x");
-    print_hex(non_bg_index as u32);
-    print_str(b" value=0x");
-    print_hex(non_bg_value);
-    print_str(b")\n");
 }
 
 unsafe fn observe_completed_dialog_modal_dispatch(
@@ -5839,13 +5809,14 @@ pub(crate) unsafe fn service_sec_image(
         for watch_pi in 1..5usize {
             crate::teb_tail_watch(watch_pi, 0, m0, badge);
         }
-        // ★ ARM THE IN-`recv` DEADMAN once authentic desktop pixels exist. From here the boot is past
-        // the first real win32k paint and into SCM/EventLog/shell work, where a hosted component can
-        // still block the single executive loop from inside a nested receive. A true silence now
-        // reports itself (`[deadman]`) instead of leaving the run to hang.
+        // Arm once the genuine dialog pump has drained painted messages or the later evidence/token
+        // path shows the interactive boot is live. A true silence after that point reports itself
+        // instead of hanging in recv; no synthetic framebuffer marker participates in this trigger.
         if crate::EXEC_DEADMAN_WATCHDOG
             && crate::WATCHDOG_ARMED.load(Ordering::Relaxed) == 0
-            && (WINLOGON_PAINT_DONE.load(Ordering::Relaxed) != 0
+            && ((WINLOGON_DIALOG_MODAL_DRAINED.load(Ordering::Relaxed) != 0
+                && WINLOGON_DIALOG_MODAL_PAINTS.load(Ordering::Relaxed) != 0)
+                || WINLOGON_DIALOG_FB_VERIFIED.load(Ordering::Relaxed) != 0
                 || WINLOGON_LOGON_TOKEN_QUERIES.load(Ordering::Relaxed) != 0)
         {
             crate::watchdog_arm(delay_queue);
@@ -10467,11 +10438,7 @@ pub(crate) unsafe fn service_sec_image(
                     && m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
                     && WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) != 0
                     && !winlogon_dialog_modal_target_alive()
-                    && winlogon_dialog_modal_thread_matches(
-                        badge,
-                        current_tid,
-                        modal_message_buffer,
-                    )
+                    && winlogon_dialog_modal_thread_is_owner(badge, current_tid)
                 {
                     // A destroyed IDD_LOGON is only an ERROR while nobody has typed into it. Once
                     // the credential keystrokes went in, `EndDialog` destroying it is the dialog
@@ -10485,11 +10452,7 @@ pub(crate) unsafe fn service_sec_image(
                 } else if winlogon_gui_client
                     && m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
                     && WINLOGON_DIALOG_MODAL_DRAINED.load(Ordering::Relaxed) != 0
-                    && winlogon_dialog_modal_thread_matches(
-                        badge,
-                        current_tid,
-                        modal_message_buffer,
-                    )
+                    && winlogon_dialog_modal_thread_is_owner(badge, current_tid)
                 {
                     // ★ HEADLESS CREDENTIAL INPUT. The dialog is painted and its pump is about to
                     // block for a keystroke nobody can type. Post real WM_CHARs / VK_RETURN into
@@ -13662,41 +13625,6 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                 }
-                // ★ THE COUNTED DESKTOP PAINT — winlogon's OWN natural NtUserSwitchDesktop paints the
-                // framebuffer, and THIS is the source of the `exec_win32k_desktop_painted` gate spec
-                // (scaffold RETIRED — see the m0==0x125a arm, which now runs ONLY the InitVideo/surface
-                // bringup, not the paint). Right BEFORE winlogon's SSN 0x1288 we clear the WHOLE fb to
-                // magenta — now LOAD-BEARING: it wipes any earlier pixels so the counted spec genuinely
-                // proves winlogon's co_IntShowDesktop -> co_UserRedrawWindow -> DesktopWindowProc
-                // WM_ERASEBKGND -> IntPaintDesktop re-painted 0x003a6ea5 by the AUTHENTIC boot flow
-                // (BOOTBOOT -> kernel -> smss -> csrss -> winlogon -> win32k), not a stale scaffold paint.
-                // ★ BATCH 46 — only the FIRST winlogon switch is the real (painting) transition; the second
-                // is win32k's `pdesk == gpdeskInputDesktop` already-current no-op (zero paint work). The
-                // first switch can park in user callbacks before the paint completes, so the readback is
-                // latched either here for a non-callback dispatch or later from NtCallbackReturn's completed
-                // outer-dispatch observer. Once latched, the already-current second switch must not clear the fb.
-                let winlogon_switch_requested = m0 == 0x1288
-                    && hosted_main_badge_has_role(
-                        &nt_handler,
-                        badge,
-                        nt_exe_image::HostedProcessRole::InteractiveLogon,
-                    )
-                    && WINLOGON_PAINT_DONE.load(Ordering::Relaxed) == 0;
-                let winlogon_switch_transitions = winlogon_switch_requested
-                    && win32k_subsystem::switch_desktop_would_change_input_desktop(a0);
-                let winlogon_switch_observe_after = winlogon_switch_requested
-                    && (winlogon_switch_transitions
-                        || WINLOGON_DESKTOP_PAINT_PENDING.load(Ordering::Relaxed) != 0);
-                if winlogon_switch_transitions {
-                    WINLOGON_DESKTOP_PAINT_PENDING.store(1, Ordering::Relaxed);
-                    let fb = FB_VADDR as *mut u32;
-                    for i in 0..(1024u64 * 768) {
-                        core::ptr::write_volatile(fb.add(i as usize), 0x00FF_00FF);
-                    }
-                    print_str(
-                        b"[win32k-svc] fb cleared to magenta before winlogon NtUserSwitchDesktop\n",
-                    );
-                }
                 let dispatch_peb_mirror = hosted_peb_mirror_for_pi(pi);
                 let dispatch_client_teb = nt_handler
                     .pm
@@ -15007,9 +14935,6 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                 }
-                if winlogon_switch_observe_after && !redirected_user_callback {
-                    observe_winlogon_natural_switch_desktop(st);
-                }
                 if has_buf && ok && st == 0 && !redirected_user_callback {
                     let userconnect = core::slice::from_raw_parts_mut(
                         win32k_subsystem::WIN32K_ARG_VADDR as *mut u8,
@@ -15120,16 +15045,6 @@ pub(crate) unsafe fn service_sec_image(
                         record_hosted_client_gdi_mapping(&nt_handler, pi, gdi_va);
                     }
                 }
-                // ★ EAGER DESKTOP-GFX HOOK FULLY RETIRED. There is no longer any m0==0x125a
-                // SSN_INIT_DESKTOP_GFX scaffold here: win32k's own NtUserInitialize (0x125a) dispatch
-                // seeds the host prerequisites the display init depends on (the system font +
-                // WinSta0/Default Ob objects — see win32k_subsystem::dispatch_loop's post-0x125a step). The
-                // actual InitVideo/framebuf-surface bringup AND the paint now happen FULLY LAZILY from
-                // winlogon's OWN first GUI DC-op: NtUserSwitchDesktop → co_IntShowDesktop →
-                // co_UserRedrawWindow → WM_ERASEBKGND → UserGetDCEx(DCX_CACHE) → DceAllocDCE →
-                // DceCreateDisplayDC → co_IntGraphicsCheck(TRUE) → co_AddGuiApp →
-                // co_IntInitializeDesktopGraphics (InitVideo/surface :278/:286 + the atomic paint :340).
-                // The counted exec_win32k_desktop_painted spec is fed by the m0==0x1288 arm above.
                 if redirected_user_callback {
                     result = nt_user_callback::STATUS_PENDING as u32 as u64;
                 } else if ok {
@@ -15822,16 +15737,18 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.current_tid,
                     park_wait_deadline,
                 ) {
+                    let current_tid = nt_handler.current_tid;
+                    let wait_still_parked = wait_recheck_after_park(&mut nt_handler, current_tid);
                     delay_timer_rearm_after_park(
                         delay_queue,
                         &mut nt_handler,
                         park_wait_deadline.is_some(),
                     );
-                    if winlogon_worker_can_signal {
+                    if winlogon_worker_can_signal && wait_still_parked {
                         WINLOGON_MAIN_EVENT_WAIT_PARKED.store(1, Ordering::Relaxed);
                         print_str(b"[wl-main] parked on worker-ready event; runnable worker remains a signaler\n");
                     }
-                    if park_wait_deadline.is_none() {
+                    if park_wait_deadline.is_none() && wait_still_parked {
                         trace_indefinite_wait_park(
                             &nt_handler,
                             badge,
@@ -15873,6 +15790,8 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.current_tid,
                     park_wait_deadline,
                 ) {
+                    let current_tid = nt_handler.current_tid;
+                    let wait_still_parked = wait_recheck_after_park(&mut nt_handler, current_tid);
                     delay_timer_rearm_after_park(
                         delay_queue,
                         &mut nt_handler,
@@ -15887,7 +15806,7 @@ pub(crate) unsafe fn service_sec_image(
                     } else {
                         b" events, WaitAny) UNSIGNALLED -> PARK caller\n"
                     });
-                    if park_wait_deadline.is_none() {
+                    if park_wait_deadline.is_none() && wait_still_parked {
                         trace_indefinite_wait_park(
                             &nt_handler,
                             badge,

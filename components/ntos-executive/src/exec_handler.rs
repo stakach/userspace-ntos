@@ -10578,10 +10578,14 @@ impl ExecNtHandler {
                 major as u64,
                 0,
                 file_id,
+                self.current_tid,
                 &[],
                 &mut empty,
             )
         };
+        // CLEANUP/CLOSE may complete retained reads in the FSD. Run the same generic completion
+        // drain used after writes so their waiters observe the terminal driver result promptly.
+        self.pipe_write_redrive = true;
     }
 
     fn cancel_target_for_handle(&self, handle: u64) -> Result<(Option<u64>, bool), u32> {
@@ -10775,7 +10779,12 @@ impl ExecNtHandler {
         status
     }
 
-    unsafe fn cancel_retained_file_irps(&mut self, device_id: u64, file_id: u64) -> u64 {
+    unsafe fn cancel_retained_file_irps(
+        &mut self,
+        device_id: u64,
+        file_id: u64,
+        requestor_tid: u64,
+    ) -> u64 {
         let resolved_device_id = if device_id != 0 {
             device_id
         } else {
@@ -10784,7 +10793,11 @@ impl ExecNtHandler {
         if resolved_device_id == 0 || file_id == 0 {
             return 0;
         }
-        match driver_launch::cancel_pending_file_irps(resolved_device_id, file_id) {
+        match driver_launch::cancel_pending_file_irps(
+            resolved_device_id,
+            file_id,
+            requestor_tid,
+        ) {
             Ok(cancelled) => {
                 let trace = PIPE_RETAINED_CANCEL_TRACE_N.fetch_add(1, Ordering::Relaxed);
                 if trace < 64 || cancelled != 0 {
@@ -10819,7 +10832,7 @@ impl ExecNtHandler {
     }
 
     unsafe fn complete_cancelled_pipe_waiter(&mut self, waiter: nt_io_manager::PipeWaiter) {
-        let _ = self.cancel_retained_file_irps(waiter.device_id, waiter.file_id);
+        let _ = self.cancel_retained_file_irps(waiter.device_id, waiter.file_id, waiter.tid);
         let mut status = STATUS_CANCELLED;
         let mut information = 0u64;
         let apc_status = self.queue_file_user_apc(
@@ -10858,7 +10871,11 @@ impl ExecNtHandler {
     }
 
     unsafe fn complete_cancelled_pipe_listen(&mut self, listen: nt_io_manager::AsyncListen) {
-        let _ = self.cancel_retained_file_irps(listen.device_id, listen.server_file_id);
+        let _ = self.cancel_retained_file_irps(
+            listen.device_id,
+            listen.server_file_id,
+            listen.tid,
+        );
         let mut status = STATUS_CANCELLED;
         let mut information = 0u64;
         let apc_status = self.queue_file_user_apc(
@@ -10893,7 +10910,7 @@ impl ExecNtHandler {
             self.complete_cancelled_pipe_waiter(waiter);
             return;
         }
-        let _ = self.cancel_retained_file_irps(waiter.device_id, waiter.file_id);
+        let _ = self.cancel_retained_file_irps(waiter.device_id, waiter.file_id, waiter.tid);
         release_reply_pool_cap(waiter.reply_cap);
         thread_wait_state_clear_badge_ready(self, waiter.badge);
         self.release_file_reference(waiter.file_id);
@@ -17977,6 +17994,7 @@ impl ExecNtHandler {
             major,
             fsctl,
             route.file_id,
+            self.current_tid,
             input,
             output,
         )?;

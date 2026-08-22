@@ -497,6 +497,7 @@ pub const SH_REQ_INLEN: u64 = 0x58; // in:  input buffer length (u64)
 pub const SH_REQ_OUTLEN: u64 = 0x60; // in:  output buffer length (u64)
 pub const SH_REQ_FILEID: u64 = 0x68; // in/out: opaque FILE_OBJECT id (u64)
 pub const SH_REQ_STATUS: u64 = 0x70; // out: IoStatus.Status (i32)
+pub const SH_REQ_REQUESTOR_TID: u64 = 0x74; // in: requesting NT thread id (u32)
 pub const SH_REQ_INFO: u64 = 0x78; // out: IoStatus.Information (u64)
 
 const WDM_X64_DRIVER_EXTENSION_ADD_DEVICE_OFFSET: u64 = 0x08;
@@ -647,6 +648,8 @@ const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
 const IRP_BUFFERED_IO: u32 = 0x0000_0010;
 const IRP_DEALLOCATE_BUFFER: u32 = 0x0000_0020;
 const IRP_INPUT_OPERATION: u32 = 0x0000_0040;
+const COMPLETION_SOURCE_SYSTEM_BUFFER: u8 = 0;
+const COMPLETION_SOURCE_REQUEST_DATA: u8 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -663,14 +666,20 @@ struct PendingIrp {
     /// (`statesup.c:163/289/…`), so a completion racing a disconnect would key the delivered
     /// bytes under fid 0 and the parked reader would never be woken.
     fid: u64,
+    requestor_tid: u64,
     major: u8,
+    /// Selects the WDM output surface without conflating it with buffer ownership. Buffered pipe
+    /// reads may replace SystemBuffer; direct and neither I/O always complete into `data`.
+    completion_source_kind: u8,
     /// This pending IRP completes with bytes for the caller's read/output buffer. `READ` and
     /// `FSCTL_PIPE_TRANSCEIVE` both enter npfs's read queue and are completed by a peer write.
     read_completion: bool,
     /// Whether THIS IRP owns the FILE_OBJECT block. Only a transient FILE_OBJECT may be freed on
     /// completion; registered per-open FILE_OBJECTs live until cleanup/close.
     owns_fo: bool,
-    _pad: [u8; 5],
+    _pad: [u8; 4],
+    /// Completion is published in this owner record before any request buffer is reclaimed.
+    completion: nt_io_manager::RetainedIrpCompletion,
 }
 
 static mut DATA_TRACE_COUNT: u32 = 0;
@@ -1022,36 +1031,15 @@ unsafe fn allocate_nonpaged_mdl(virtual_address: u64, length: u64) -> u64 {
     mdl
 }
 
-// BATCH 37 — completed-pending-READ stash. When a pipe READ goes STATUS_PENDING, npfs retains the
+// Retained pending-IRP completion. When a pipe READ goes STATUS_PENDING, npfs retains the
 // read IRP in its inbound queue (QueueState=ReadEntries) and the EXECUTIVE parks the caller. The
 // peer's later WRITE is serviced by npfs's OWN NpWriteDataQueue fast path, which copies the write
 // payload DIRECTLY into that pending read IRP's buffer and completes it via IoCompleteRequest —
 // synchronously, during the write call. So by the time control returns to the executive the read data
-// is IN the freed read IRP and the inbound queue is drained; a FRESH re-drive read would find nothing
-// (or stale bytes). Capture the completed read's bytes here, keyed by the reader's fid, so the
-// executive's pipe re-drive delivers THESE bytes to the parked reader instead of re-reading. The read
-// result buffer npfs fills for a pending read is the IRP's user buffer (== our `data`, METHOD_NEITHER).
+// is in the retained read IRP and the inbound queue is drained; a fresh re-drive read would find
+// nothing. Completion is therefore recorded in the existing pending-IRP owner node. Its buffers are
+// reclaimed only after the executive consumes the result through the mirrored component pool.
 const COMPLETED_READ_BYTE_CAP: usize = (FSD_ARG_FRAMES as usize) * 0x1000;
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CompletedRead {
-    seq: u64,
-    fid: u64,
-    status: u32,
-    length: u32,
-    info: u64,
-    bytes: [u8; COMPLETED_READ_BYTE_CAP],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CompletedWrite {
-    seq: u64,
-    fid: u64,
-    status: u32,
-    _pad: u32,
-    info: u64,
-}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1059,21 +1047,6 @@ struct PendingIrpNode {
     next: u64,
     entry: PendingIrp,
 }
-const EMPTY_COMPLETED_READ: CompletedRead = CompletedRead {
-    seq: 0,
-    fid: 0,
-    status: 0,
-    length: 0,
-    info: 0,
-    bytes: [0; COMPLETED_READ_BYTE_CAP],
-};
-const EMPTY_COMPLETED_WRITE: CompletedWrite = CompletedWrite {
-    seq: 0,
-    fid: 0,
-    status: 0,
-    _pad: 0,
-    info: 0,
-};
 const EMPTY_PENDING_IRP: PendingIrp = PendingIrp {
     irp: 0,
     iosl: 0,
@@ -1082,10 +1055,13 @@ const EMPTY_PENDING_IRP: PendingIrp = PendingIrp {
     aux_data: 0,
     mdl: 0,
     fid: 0,
+    requestor_tid: 0,
     major: 0,
+    completion_source_kind: COMPLETION_SOURCE_SYSTEM_BUFFER,
     read_completion: false,
     owns_fo: false,
-    _pad: [0; 5],
+    _pad: [0; 4],
+    completion: nt_io_manager::RetainedIrpCompletion::pending(),
 };
 const EMPTY_PENDING_IRP_NODE: PendingIrpNode = PendingIrpNode {
     next: 0,
@@ -1094,21 +1070,9 @@ const EMPTY_PENDING_IRP_NODE: PendingIrpNode = PendingIrpNode {
 
 const FSD_RUNTIME_TABLES_OFF: u64 = 0x2000;
 const FSD_COMPLETION_SEQ_OFF: u64 = FSD_RUNTIME_TABLES_OFF;
-const FSD_COMPLETED_WRITE_CAP: usize = 128;
-const FSD_COMPLETED_READ_CAP: usize = 30;
 const FSD_PENDING_IRP_CAP: usize = 256;
 const FSD_PENDING_IRP_HEAD_OFF: u64 = FSD_RUNTIME_TABLES_OFF + 0x08;
-const FSD_COMPLETED_WRITES_OFF: u64 = align_up_u64(FSD_RUNTIME_TABLES_OFF + 0x10, 8);
-const FSD_COMPLETED_READS_OFF: u64 = align_up_u64(
-    FSD_COMPLETED_WRITES_OFF
-        + core::mem::size_of::<CompletedWrite>() as u64 * FSD_COMPLETED_WRITE_CAP as u64,
-    8,
-);
-const FSD_PENDING_IRPS_OFF: u64 = align_up_u64(
-    FSD_COMPLETED_READS_OFF
-        + core::mem::size_of::<CompletedRead>() as u64 * FSD_COMPLETED_READ_CAP as u64,
-    8,
-);
+const FSD_PENDING_IRPS_OFF: u64 = align_up_u64(FSD_RUNTIME_TABLES_OFF + 0x10, 8);
 const _: () = assert!(
     FSD_PENDING_IRPS_OFF
         + core::mem::size_of::<PendingIrpNode>() as u64 * FSD_PENDING_IRP_CAP as u64
@@ -1132,20 +1096,6 @@ unsafe fn next_completion_seq(data_base: u64) -> u64 {
 #[inline]
 unsafe fn pending_irp_head(data_base: u64) -> *mut u64 {
     (data_base + FSD_PENDING_IRP_HEAD_OFF) as *mut u64
-}
-
-#[inline]
-unsafe fn completed_write_slot(data_base: u64, index: usize) -> *mut CompletedWrite {
-    (data_base
-        + FSD_COMPLETED_WRITES_OFF
-        + (index as u64) * core::mem::size_of::<CompletedWrite>() as u64) as *mut CompletedWrite
-}
-
-#[inline]
-unsafe fn completed_read_slot(data_base: u64, index: usize) -> *mut CompletedRead {
-    (data_base
-        + FSD_COMPLETED_READS_OFF
-        + (index as u64) * core::mem::size_of::<CompletedRead>() as u64) as *mut CompletedRead
 }
 
 #[inline]
@@ -1193,9 +1143,26 @@ unsafe fn pending_irp_exists(irp: u64) -> bool {
     false
 }
 
+unsafe fn find_pending_irp_node(irp: u64) -> Option<(u64, PendingIrp)> {
+    let mut node = read_volatile(pending_irp_head(FSD_DATA_VADDR));
+    let mut steps = 0u64;
+    while node != 0 && steps < POOL_FREE_LIST_MAX {
+        if !pending_irp_node_valid(node) {
+            return None;
+        }
+        let entry = read_volatile((node + 8) as *const PendingIrp);
+        if entry.irp == irp {
+            return Some((node, entry));
+        }
+        node = read_volatile(node as *const u64);
+        steps += 1;
+    }
+    None
+}
+
 unsafe fn take_pending_irp(irp: u64) -> Option<PendingIrp> {
     let head = pending_irp_head(FSD_DATA_VADDR);
-    let mut prev = head;
+    let mut previous_next = head;
     let mut node = read_volatile(head);
     let mut steps = 0u64;
     while node != 0 && steps < POOL_FREE_LIST_MAX {
@@ -1205,7 +1172,7 @@ unsafe fn take_pending_irp(irp: u64) -> Option<PendingIrp> {
         let next = read_volatile(node as *const u64);
         let entry = read_volatile((node + 8) as *const PendingIrp);
         if entry.irp == irp {
-            write_volatile(prev, next);
+            write_volatile(previous_next, next);
             let table_start = FSD_DATA_VADDR + FSD_PENDING_IRPS_OFF;
             let table_end = table_start
                 + core::mem::size_of::<PendingIrpNode>() as u64 * FSD_PENDING_IRP_CAP as u64;
@@ -1216,11 +1183,55 @@ unsafe fn take_pending_irp(irp: u64) -> Option<PendingIrp> {
             }
             return Some(entry);
         }
-        prev = node as *mut u64;
+        previous_next = node as *mut u64;
         node = next;
         steps += 1;
     }
     None
+}
+
+unsafe fn release_pending_irp_graph_component(entry: PendingIrp) {
+    let reclaim = entry
+        .completion
+        .completed()
+        .map(|completion| completion.reclaim)
+        .unwrap_or(0);
+    let candidates = [
+        reclaim,
+        entry.mdl,
+        if entry.aux_data != entry.data {
+            entry.aux_data
+        } else {
+            0
+        },
+        entry.data,
+        entry.iosl,
+        entry.irp,
+        if entry.owns_fo { entry.file_object } else { 0 },
+    ];
+    for (index, pointer) in candidates.iter().copied().enumerate() {
+        if pointer != 0 && !candidates[..index].contains(&pointer) {
+            pool_free(pointer);
+        }
+    }
+}
+
+unsafe fn unlink_pending_irp_node_component(
+    previous_next: *mut u64,
+    node: u64,
+    next: u64,
+    entry: PendingIrp,
+) {
+    write_volatile(previous_next, next);
+    release_pending_irp_graph_component(entry);
+    let table_start = FSD_DATA_VADDR + FSD_PENDING_IRPS_OFF;
+    let table_end = table_start
+        + core::mem::size_of::<PendingIrpNode>() as u64 * FSD_PENDING_IRP_CAP as u64;
+    if node >= table_start && node < table_end {
+        write_volatile(node as *mut PendingIrpNode, EMPTY_PENDING_IRP_NODE);
+    } else {
+        pool_free(node);
+    }
 }
 
 unsafe fn insert_pending_irp(entry: PendingIrp) -> bool {
@@ -1254,7 +1265,10 @@ struct PendingIrpCancelTarget {
     cancel_routine: u64,
 }
 
-unsafe fn find_pending_irp_cancel_target(fid: u64) -> Option<PendingIrpCancelTarget> {
+unsafe fn find_pending_irp_cancel_target(
+    fid: u64,
+    requestor_tid: u64,
+) -> Option<PendingIrpCancelTarget> {
     if fid == 0 {
         return None;
     }
@@ -1265,7 +1279,11 @@ unsafe fn find_pending_irp_cancel_target(fid: u64) -> Option<PendingIrpCancelTar
             return None;
         }
         let entry = read_volatile((node + 8) as *const PendingIrp);
-        if entry.fid == fid && entry.irp != 0 {
+        if entry.fid == fid
+            && (requestor_tid == 0 || entry.requestor_tid == requestor_tid)
+            && entry.irp != 0
+            && entry.completion.completed().is_none()
+        {
             let cancel_routine =
                 read_unaligned((entry.irp + WDM_X64_IRP_CANCEL_ROUTINE_OFFSET) as *const u64);
             if cancel_routine != 0 {
@@ -1281,36 +1299,50 @@ unsafe fn find_pending_irp_cancel_target(fid: u64) -> Option<PendingIrpCancelTar
     None
 }
 
-unsafe fn discard_completed_file_records(fid: u64) -> u64 {
+unsafe fn discard_completed_file_records(fid: u64, requestor_tid: u64) -> u64 {
     if fid == 0 {
         return 0;
     }
-    let mut discarded = 0u64;
-    for index in 0..FSD_COMPLETED_READ_CAP {
-        let ptr = completed_read_slot(FSD_DATA_VADDR, index);
-        if read_volatile(ptr).fid == fid {
-            write_volatile(ptr, EMPTY_COMPLETED_READ);
-            discarded += 1;
+    let head = pending_irp_head(FSD_DATA_VADDR);
+    let mut previous_next = head;
+    let mut node = read_volatile(head);
+    let mut steps = 0u64;
+    let mut discarded = 0;
+    while node != 0 && steps < POOL_FREE_LIST_MAX {
+        if !pending_irp_node_valid(node) {
+            break;
         }
-    }
-    for index in 0..FSD_COMPLETED_WRITE_CAP {
-        let ptr = completed_write_slot(FSD_DATA_VADDR, index);
-        if read_volatile(ptr).fid == fid {
-            write_volatile(ptr, EMPTY_COMPLETED_WRITE);
+        let next = read_volatile(node as *const u64);
+        let entry = read_volatile((node + 8) as *const PendingIrp);
+        if entry.fid == fid
+            && (requestor_tid == 0 || entry.requestor_tid == requestor_tid)
+            && entry.completion.completed().is_some()
+        {
+            unlink_pending_irp_node_component(previous_next, node, next, entry);
             discarded += 1;
+            node = next;
+            steps += 1;
+            continue;
         }
+        previous_next = node as *mut u64;
+        node = next;
+        steps += 1;
     }
     discarded
 }
 
-unsafe fn cancel_pending_irps_for_file(fid: u64, _device_object: u64) -> u64 {
+unsafe fn cancel_pending_irps_for_file(
+    fid: u64,
+    requestor_tid: u64,
+    _device_object: u64,
+) -> u64 {
     let mut cancelled = 0u64;
     loop {
-        let Some(target) = find_pending_irp_cancel_target(fid) else {
+        let Some(target) = find_pending_irp_cancel_target(fid, requestor_tid) else {
             break;
         };
         let cancelled_this = s_io_cancel_irp(target.irp);
-        let discarded = discard_completed_file_records(fid);
+        let discarded = discard_completed_file_records(fid, requestor_tid);
         let trace = FSD_CANCEL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
         if trace < 32 {
             print_str(b"[fsd-cancel] fid=0x");
@@ -1331,130 +1363,205 @@ unsafe fn cancel_pending_irps_for_file(fid: u64, _device_object: u64) -> u64 {
             break;
         }
         cancelled += 1;
-        if cancelled >= FSD_PENDING_IRP_CAP as u64 {
+        if cancelled >= POOL_FREE_LIST_MAX {
             break;
         }
     }
-    let _ = discard_completed_file_records(fid);
+    let _ = discard_completed_file_records(fid, requestor_tid);
     cancelled
 }
 
-unsafe fn insert_completed_write(fid: u64, status: u32, info: u64) -> bool {
-    if fid == 0 {
-        return false;
+unsafe fn pending_irp_node_exec_va(win: ExecVaWindow, node: u64) -> Option<u64> {
+    let table_start = FSD_DATA_VADDR + FSD_PENDING_IRPS_OFF;
+    let table_bytes =
+        core::mem::size_of::<PendingIrpNode>() as u64 * FSD_PENDING_IRP_CAP as u64;
+    if node >= table_start
+        && node.checked_add(core::mem::size_of::<PendingIrpNode>() as u64)?
+            <= table_start.checked_add(table_bytes)?
+        && (node - table_start) % core::mem::size_of::<PendingIrpNode>() as u64 == 0
+    {
+        return win.data_va.checked_add(node - FSD_DATA_VADDR);
     }
-    let seq = next_completion_seq(FSD_DATA_VADDR);
-    for index in 0..FSD_COMPLETED_WRITE_CAP {
-        let ptr = completed_write_slot(FSD_DATA_VADDR, index);
-        if read_volatile(ptr).fid == 0 {
-            write_volatile(
-                ptr,
-                CompletedWrite {
-                    seq,
-                    fid,
-                    status,
-                    _pad: 0,
-                    info,
-                },
-            );
-            return true;
-        }
-    }
-    false
+    hosted_pool_allocation_exec_va(
+        win.pool_va,
+        node,
+        core::mem::size_of::<PendingIrpNode>() as u64,
+    )
 }
 
-unsafe fn insert_completed_read(
-    fid: u64,
-    status: u32,
-    info: u64,
-    source: u64,
-    length: usize,
+unsafe fn release_pending_irp_graph_for_instance(
+    inst: DriverInstance,
+    entry: PendingIrp,
+    completion: nt_io_manager::RetainedCompletion,
 ) -> bool {
-    if fid == 0 {
-        return false;
-    }
-    let seq = next_completion_seq(FSD_DATA_VADDR);
-    for index in 0..FSD_COMPLETED_READ_CAP {
-        let ptr = completed_read_slot(FSD_DATA_VADDR, index);
-        if read_volatile(ptr).fid == 0 {
-            let mut record = EMPTY_COMPLETED_READ;
-            record.seq = seq;
-            record.fid = fid;
-            record.status = status;
-            record.info = info;
-            record.length = length as u32;
-            let mut byte = 0usize;
-            while byte < length {
-                record.bytes[byte] = read_volatile((source + byte as u64) as *const u8);
-                byte += 1;
+    let candidates = [
+        completion.reclaim,
+        entry.mdl,
+        if entry.aux_data != entry.data {
+            entry.aux_data
+        } else {
+            0
+        },
+        entry.data,
+        entry.iosl,
+        entry.irp,
+        if entry.owns_fo { entry.file_object } else { 0 },
+    ];
+    for (index, pointer) in candidates.iter().copied().enumerate() {
+        if pointer != 0
+            && !candidates[..index].contains(&pointer)
+            && hosted_pool_allocation_exec_va(inst.exec_pool_va, pointer, 1).is_none()
+        {
+            if FSD_POOL_INVALID_FREES.fetch_add(1, Ordering::Relaxed) == 0 {
+                print_str(b"[fsd-pool-invalid] retained graph release index=");
+                print_u64(index as u64);
+                print_str(b" pointer=");
+                print_hex64(pointer);
+                print_str(b" irp=");
+                print_hex64(entry.irp);
+                print_str(b" fid=");
+                print_hex64(entry.fid);
+                print_str(b"\n");
             }
-            write_volatile(ptr, record);
-            return true;
+            return false;
         }
     }
-    false
+    for (index, pointer) in candidates.iter().copied().enumerate() {
+        if pointer == 0 || candidates[..index].contains(&pointer) {
+            continue;
+        }
+        if !hosted_instance_pool_free(inst, pointer) {
+            panic!("validated hosted IRP graph allocation could not be released");
+        }
+    }
+    true
 }
 
-unsafe fn take_completed_read_from_instance(
+unsafe fn pending_irp_graph_valid_for_instance(
+    inst: DriverInstance,
+    entry: PendingIrp,
+    completion: nt_io_manager::RetainedCompletion,
+) -> bool {
+    let candidates = [
+        completion.reclaim,
+        entry.mdl,
+        if entry.aux_data != entry.data {
+            entry.aux_data
+        } else {
+            0
+        },
+        entry.data,
+        entry.iosl,
+        entry.irp,
+        if entry.owns_fo { entry.file_object } else { 0 },
+    ];
+    candidates.iter().copied().enumerate().all(|(index, pointer)| {
+        pointer == 0
+            || candidates[..index].contains(&pointer)
+            || hosted_pool_allocation_exec_va(inst.exec_pool_va, pointer, 1).is_some()
+    })
+}
+
+unsafe fn take_retained_completion_from_instance(
     instance: usize,
     fid: u64,
-) -> Option<(u32, u64, alloc::vec::Vec<u8>)> {
+    read_completion: bool,
+) -> Option<(
+    PendingIrp,
+    nt_io_manager::RetainedCompletion,
+    alloc::vec::Vec<u8>,
+)> {
     if fid == 0 {
         return None;
     }
+    let inst = driver_instances()?.get(instance).copied()?;
     let win = ExecVaWindow::try_for_instance(instance)?;
-    let mut best_slot = usize::MAX;
-    let mut best_seq = u64::MAX;
-    for slot_index in 0..FSD_COMPLETED_READ_CAP {
-        let slot = read_volatile(completed_read_slot(win.data_va, slot_index));
-        if slot.fid == fid && slot.seq < best_seq {
-            best_slot = slot_index;
-            best_seq = slot.seq;
+    let head = (win.data_va + FSD_PENDING_IRP_HEAD_OFF) as *mut u64;
+    let mut previous_next = head;
+    let mut node = read_volatile(head);
+    let mut best: Option<(u64, u64, u64, PendingIrp, nt_io_manager::RetainedCompletion)> = None;
+    let mut steps = 0u64;
+    while node != 0 && steps < POOL_FREE_LIST_MAX {
+        let node_exec = pending_irp_node_exec_va(win, node)?;
+        let next = read_volatile(node_exec as *const u64);
+        let entry = read_volatile((node_exec + 8) as *const PendingIrp);
+        if entry.fid == fid
+            && entry.read_completion == read_completion
+            && (read_completion || entry.major as u64 == IRP_MJ_WRITE)
+        {
+            if let Some(completion) = entry.completion.completed() {
+                if best
+                    .as_ref()
+                    .is_none_or(|(_, _, _, _, current)| completion.sequence < current.sequence)
+                {
+                    best = Some((previous_next as u64, node, next, entry, completion));
+                }
+            }
         }
+        previous_next = node_exec as *mut u64;
+        node = next;
+        steps += 1;
     }
-    if best_slot == usize::MAX {
+    let (best_previous_next, best_node, best_next, entry, completion) = best?;
+    let length = if read_completion {
+        completion.length as usize
+    } else {
+        0
+    };
+    if length > COMPLETED_READ_BYTE_CAP {
         return None;
     }
-    let ptr = completed_read_slot(win.data_va, best_slot);
-    let slot = read_volatile(ptr);
-    write_volatile(ptr, EMPTY_COMPLETED_READ);
-    let length = (slot.length as usize).min(COMPLETED_READ_BYTE_CAP);
-    let mut bytes = Vec::with_capacity(length);
-    bytes.extend_from_slice(&slot.bytes[..length]);
-    Some((slot.status, slot.info, bytes))
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(length).ok()?;
+    if length != 0 {
+        let source_exec =
+            hosted_pool_allocation_exec_va(win.pool_va, completion.source, length as u64)?;
+        let source = core::slice::from_raw_parts(source_exec as *const u8, length);
+        bytes.extend_from_slice(source);
+    }
+    if !pending_irp_graph_valid_for_instance(inst, entry, completion) {
+        if FSD_POOL_INVALID_FREES.fetch_add(1, Ordering::Relaxed) == 0 {
+            print_str(b"[fsd-pool-invalid] retained graph validation irp=");
+            print_hex64(entry.irp);
+            print_str(b" fid=");
+            print_hex64(entry.fid);
+            print_str(b" source/reclaim=");
+            print_hex64(completion.source);
+            print_str(b"/");
+            print_hex64(completion.reclaim);
+            print_str(b"\n");
+        }
+        return None;
+    }
+
+    let best_node_exec = pending_irp_node_exec_va(win, best_node)?;
+    write_volatile(best_previous_next as *mut u64, best_next);
+    let table_start = FSD_DATA_VADDR + FSD_PENDING_IRPS_OFF;
+    let table_end = table_start
+        + core::mem::size_of::<PendingIrpNode>() as u64 * FSD_PENDING_IRP_CAP as u64;
+    if best_node >= table_start && best_node < table_end {
+        write_volatile(best_node_exec as *mut PendingIrpNode, EMPTY_PENDING_IRP_NODE);
+    } else {
+        if !hosted_instance_pool_free(inst, best_node) {
+            panic!("validated pending-IRP owner node could not be released");
+        }
+    }
+    if !release_pending_irp_graph_for_instance(inst, entry, completion) {
+        panic!("validated hosted IRP graph became invalid during release");
+    }
+    Some((entry, completion, bytes))
 }
 
-/// Take (consume) a stashed completed-pending-read for `fid` from `device_id`'s hosted component.
-/// Returns `(status, info, bytes)`.
+/// Consume the oldest completed retained read for `fid` only after copying its bytes out of the
+/// driver-owned request graph. Allocation or pointer-validation failure leaves the owner record
+/// linked for a later retry.
 pub(crate) unsafe fn take_completed_read_for_device(
     device_id: u64,
     fid: u64,
 ) -> Option<(u32, u64, alloc::vec::Vec<u8>)> {
     let (instance, _) = instance_by_device_id(device_id)?;
-    take_completed_read_from_instance(instance, fid)
-}
-
-unsafe fn take_completed_write_from_instance(instance: usize, fid: u64) -> Option<(u32, u64)> {
-    if fid == 0 {
-        return None;
-    }
-    let win = ExecVaWindow::try_for_instance(instance)?;
-    let mut best_slot = usize::MAX;
-    let mut best_seq = u64::MAX;
-    for slot_index in 0..FSD_COMPLETED_WRITE_CAP {
-        let slot = read_volatile(completed_write_slot(win.data_va, slot_index));
-        if slot.fid == fid && slot.seq < best_seq {
-            best_slot = slot_index;
-            best_seq = slot.seq;
-        }
-    }
-    if best_slot == usize::MAX {
-        return None;
-    }
-    let ptr = completed_write_slot(win.data_va, best_slot);
-    let slot = read_volatile(ptr);
-    write_volatile(ptr, EMPTY_COMPLETED_WRITE);
-    Some((slot.status, slot.info))
+    let (_, completion, bytes) = take_retained_completion_from_instance(instance, fid, true)?;
+    Some((completion.status, completion.information, bytes))
 }
 
 pub(crate) unsafe fn take_completed_write_for_device(
@@ -1462,12 +1569,13 @@ pub(crate) unsafe fn take_completed_write_for_device(
     fid: u64,
 ) -> Option<(u32, u64)> {
     let (instance, _) = instance_by_device_id(device_id)?;
-    take_completed_write_from_instance(instance, fid)
+    let (_, completion, _) = take_retained_completion_from_instance(instance, fid, false)?;
+    Some((completion.status, completion.information))
 }
 
 // --- host-side pool allocator (the trampolines run in the component) --------------------------
 
-/// Hard bound on a free-list traversal. The pool is 4 MiB with a 16-byte header, so a well-formed
+/// Hard bound on a free-list traversal. The pool has a 16-byte header, so a well-formed
 /// list can never be longer than this; anything past it means the list is CORRUPT (a cycle), and a
 /// cycle must degrade to the bump path rather than spin the whole executive.
 const POOL_FREE_LIST_MAX: u64 = (FSD_POOL_FRAMES * 0x1000) / 16;
@@ -1475,19 +1583,13 @@ const POOL_FREE_LIST_MAX: u64 = (FSD_POOL_FRAMES * 0x1000) / 16;
 /// Both are counter-backed so a regression is a gate failure rather than a silent 555-second hang.
 pub(crate) static FSD_POOL_DOUBLE_FREES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FSD_POOL_LIST_CYCLES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FSD_POOL_INVALID_FREES: AtomicU64 = AtomicU64::new(0);
 
 /// A simple free-list allocator: an FSD alloc/frees file objects; a leak-forever bump would exhaust
 /// under FSCTL churn. Header = 16 B ([+0]=capacity, [+8]=next-free). `pool_free` pushes onto the
 /// single free list (head @ [POOL+8]); `pool_alloc` first-fits it before bumping. Counter @ [POOL+0].
 ///
-/// ★ The first-fit walk is CYCLE-BOUNDED. A block pushed onto the free list twice has
-/// `next == itself`, so the unbounded walk below used to loop forever *inside the executive* — no
-/// fault, no log line, every hosted thread frozen, the boot simply stopping. That is exactly what
-/// happened once lsass' `\pipe\lsarpc` self-RPC put TWO concurrent IRPs on the SAME npfs
-/// FILE_OBJECT (the per-connection worker's pending read plus the thread-pool worker's response
-/// write): `s_io_complete_request` frees `slot.file_object` per completion, so the second completion
-/// double-freed it. `pool_free` now refuses the double free (the real fix); this bound is the
-/// belt-and-braces so a corrupt list can never again hang the system.
+/// The first-fit walk is cycle-bounded so allocator metadata damage cannot spin the executive.
 pub(crate) unsafe fn pool_alloc(size: u64) -> u64 {
     POOL_CALLS += 1;
     if POOL_CALLS % 16384 == 0 {
@@ -1541,15 +1643,7 @@ pub(crate) unsafe fn pool_alloc(size: u64) -> u64 {
     block
 }
 
-/// Push `p` back onto the single free list — **idempotently**.
-///
-/// ★ DOUBLE-FREE GUARD (the real fix for the LSA-self-RPC hang). Pushing a block that is ALREADY on
-/// the list sets its `next` pointer to itself, and the allocator's first-fit walk then never
-/// terminates. `s_io_complete_request` frees `slot.file_object` on EVERY IRP completion, so as soon
-/// as two IRPs are outstanding on the same FILE_OBJECT — which is the normal rpcrt4 server shape:
-/// `RPCRT4_io_thread` keeps a read pending on the connection while `RPCRT4_worker_thread` writes the
-/// response on it — the second completion double-freed it. A real allocator must reject that rather
-/// than corrupt its own list, so scan (bounded) and drop the redundant push.
+/// Push one exact allocation base back onto the free list, rejecting invalid and duplicate frees.
 unsafe fn pool_free(p: u64) {
     POOL_CALLS += 1;
     if POOL_CALLS % 16384 == 0 {
@@ -1559,7 +1653,12 @@ unsafe fn pool_free(p: u64) {
         print_hex(p as u32);
         print_str(b"\n");
     }
-    if p < FSD_POOL_VADDR + POOL_DATA_OFF || p >= FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000 {
+    if component_pool_allocation_capacity(p).is_none() {
+        if FSD_POOL_INVALID_FREES.fetch_add(1, Ordering::Relaxed) == 0 {
+            print_str(b"[fsd-pool-invalid] component free pointer=");
+            print_hex64(p);
+            print_str(b"\n");
+        }
         return;
     }
     let head_slot = (FSD_POOL_VADDR + 8) as *mut u64;
@@ -2539,6 +2638,44 @@ fn component_pool_end() -> u64 {
     FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000
 }
 
+unsafe fn component_pool_allocation_capacity(component_va: u64) -> Option<u64> {
+    if component_va < FSD_POOL_VADDR + POOL_DATA_OFF + 16
+        || component_va & 15 != 0
+        || component_va >= component_pool_end()
+    {
+        return None;
+    }
+    let bump = read_volatile(FSD_POOL_VADDR as *const u64);
+    let used_end = FSD_POOL_VADDR.checked_add(bump.min(FSD_POOL_FRAMES * 0x1000))?;
+    let capacity = read_volatile((component_va - 16) as *const u64);
+    if capacity == 0 || component_va.checked_add(capacity)? > used_end {
+        return None;
+    }
+    Some(capacity)
+}
+
+unsafe fn hosted_pool_allocation_exec_va(
+    exec_pool_va: u64,
+    component_va: u64,
+    bytes: u64,
+) -> Option<u64> {
+    if exec_pool_va == 0
+        || component_va < FSD_POOL_VADDR + POOL_DATA_OFF + 16
+        || component_va & 15 != 0
+        || component_va >= component_pool_end()
+    {
+        return None;
+    }
+    let exec_va = exec_pool_va.checked_add(component_va - FSD_POOL_VADDR)?;
+    let bump = read_volatile(exec_pool_va as *const u64);
+    let used_end = exec_pool_va.checked_add(bump.min(FSD_POOL_FRAMES * 0x1000))?;
+    let capacity = read_volatile((exec_va - 16) as *const u64);
+    if capacity == 0 || bytes > capacity || exec_va.checked_add(capacity)? > used_end {
+        return None;
+    }
+    Some(exec_va)
+}
+
 fn component_pool_to_exec_va(exec_pool_va: u64, component_va: u64, bytes: u64) -> Option<u64> {
     if component_va < FSD_POOL_VADDR + POOL_DATA_OFF
         || component_va >= component_pool_end()
@@ -2723,15 +2860,16 @@ unsafe fn hosted_instance_pool_alloc(inst: DriverInstance, size: u64) -> Option<
 }
 
 unsafe fn hosted_instance_pool_free(inst: DriverInstance, p: u64) -> bool {
-    if inst.exec_pool_va == 0 || p < FSD_POOL_VADDR + POOL_DATA_OFF || p >= component_pool_end() {
-        return false;
-    }
-    let Some(p_exec) = inst.exec_pool_va.checked_add(p - FSD_POOL_VADDR) else {
+    let Some(p_exec) = hosted_pool_allocation_exec_va(inst.exec_pool_va, p, 1) else {
+        if FSD_POOL_INVALID_FREES.fetch_add(1, Ordering::Relaxed) == 0 {
+            print_str(b"[fsd-pool-invalid] executive free pointer=");
+            print_hex64(p);
+            print_str(b" device=");
+            print_hex64(inst.device_id);
+            print_str(b"\n");
+        }
         return false;
     };
-    if p_exec < inst.exec_pool_va + 16 {
-        return false;
-    }
     let Some(head_slot_exec) = inst.exec_pool_va.checked_add(8) else {
         return false;
     };
@@ -2760,6 +2898,53 @@ unsafe fn hosted_instance_pool_free(inst: DriverInstance, p: u64) -> bool {
     );
     write_volatile(head_slot_exec as *mut u64, p);
     true
+}
+
+unsafe fn hosted_instance_pool_allocation_is_free(
+    inst: DriverInstance,
+    p: u64,
+) -> Option<bool> {
+    hosted_pool_allocation_exec_va(inst.exec_pool_va, p, 1)?;
+    let head_slot_exec = inst.exec_pool_va.checked_add(8)?;
+    let exec_pool_end = inst
+        .exec_pool_va
+        .checked_add(FSD_POOL_FRAMES.checked_mul(0x1000)?)?;
+    let mut current = read_volatile(head_slot_exec as *const u64);
+    let mut steps = 0u64;
+    while current != 0 {
+        if steps >= POOL_FREE_LIST_MAX
+            || current < FSD_POOL_VADDR + POOL_DATA_OFF + 16
+            || current >= component_pool_end()
+        {
+            return None;
+        }
+        if current == p {
+            return Some(true);
+        }
+        let current_exec = inst
+            .exec_pool_va
+            .checked_add(current.checked_sub(FSD_POOL_VADDR)?)?;
+        if current_exec < inst.exec_pool_va + POOL_DATA_OFF + 16 || current_exec >= exec_pool_end {
+            return None;
+        }
+        current = read_volatile((current_exec - 8) as *const u64);
+        steps += 1;
+    }
+    Some(false)
+}
+
+unsafe fn release_hosted_instance_pool_allocation_if_live(
+    inst: DriverInstance,
+    p: u64,
+) -> bool {
+    if p == 0 {
+        return true;
+    }
+    match hosted_instance_pool_allocation_is_free(inst, p) {
+        Some(true) => true,
+        Some(false) => hosted_instance_pool_free(inst, p),
+        None => false,
+    }
 }
 
 unsafe fn print_active_irp_graph_for_deadman(inst: &DriverInstance) {
@@ -8776,7 +8961,16 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
                 print_str(b"\n");
             }
         }
-        let Some(slot) = take_pending_irp(irp) else {
+        if component_pool_allocation_capacity(irp)
+            .is_none_or(|capacity| capacity < WDM_X64_IRP_SIZE as u64)
+        {
+            panic!("IoCompleteRequest received an invalid hosted IRP");
+        }
+        let status = read_unaligned((irp + 0x30) as *const u32);
+        if status == STATUS_PENDING {
+            panic!("IoCompleteRequest cannot complete an IRP with STATUS_PENDING");
+        }
+        let Some((node, mut slot)) = find_pending_irp_node(irp) else {
             if PEER_COMPLETION_TRACE_COUNT < 8 {
                 PEER_COMPLETION_TRACE_COUNT += 1;
                 print_str(b"[fsd-peer-complete] IRP=0x");
@@ -8786,7 +8980,6 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
             }
             return;
         };
-        let status = read_unaligned((irp + 0x30) as *const u32);
         let information = read_unaligned((irp + 0x38) as *const u64);
         // BATCH 37/38: a completing pending READ carries the peer's just-written payload in its IRP
         // buffer. Stash those bytes keyed by the reader's fid so the executive's pipe re-drive delivers
@@ -8798,33 +8991,59 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
         // bytes live at the IRP's CURRENT AssociatedIrp.SystemBuffer (irp+0x18) — which npfs just
         // overwrote — NOT the stale `slot.data`. Reading `slot.data` returned 16 zero bytes (the
         // untouched original buffer), which is why rpcrt4 rejected the bind. Read irp+0x18 live.
-        if slot.read_completion {
-            let fid = slot.fid;
+        let retain_for_waiter = slot.read_completion || slot.major as u64 == IRP_MJ_WRITE;
+        if retain_for_waiter {
             // The buffer npfs actually filled = the IRP's CURRENT SystemBuffer (it may have reassigned
             // it). Fall back to our original buffer only if npfs left it in place.
             let sysbuf = read_unaligned((irp + 0x18) as *const u64);
             let irp_flags = read_unaligned((irp + 0x10) as *const u32);
-            let length = (information as usize).min(COMPLETED_READ_BYTE_CAP);
-            let source = if sysbuf != 0 { sysbuf } else { slot.data };
-            let pool_end = FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000;
-            let source_valid = source >= FSD_POOL_VADDR + POOL_DATA_OFF
-                && source
-                    .checked_add(length as u64)
-                    .is_some_and(|end| end <= pool_end);
-            let _ = insert_completed_read(
-                fid,
-                if source_valid { status } else { 0xC000_0005 },
-                if source_valid { information } else { 0 },
-                source,
-                if source_valid { length } else { 0 },
-            );
-            // IoCompleteRequest normally owns a replacement SystemBuffer carrying
-            // IRP_DEALLOCATE_BUFFER. Reclaim it while the component pool is mapped.
-            if sysbuf != slot.data && irp_flags & 0x20 != 0 {
-                pool_free(sysbuf);
+            let length = if slot.read_completion {
+                (information as usize).min(COMPLETED_READ_BYTE_CAP)
+            } else {
+                0
+            };
+            let source = if slot.read_completion {
+                if slot.completion_source_kind == COMPLETION_SOURCE_REQUEST_DATA {
+                    slot.data
+                } else if sysbuf != 0 {
+                    sysbuf
+                } else {
+                    slot.data
+                }
+            } else {
+                0
+            };
+            let source_valid = !slot.read_completion
+                || length == 0
+                || component_pool_allocation_capacity(source)
+                    .is_some_and(|capacity| length as u64 <= capacity);
+            let reclaim = if irp_flags & IRP_DEALLOCATE_BUFFER != 0 {
+                sysbuf
+            } else {
+                0
+            };
+            let reclaim_valid = reclaim == 0 || component_pool_allocation_capacity(reclaim).is_some();
+            let completion_valid = source_valid && reclaim_valid;
+            let sequence = next_completion_seq(FSD_DATA_VADDR);
+            if slot
+                .completion
+                .complete(
+                    sequence,
+                    if completion_valid { status } else { 0xC000_0005 },
+                    if completion_valid { information } else { 0 },
+                    if completion_valid { source } else { 0 },
+                    if reclaim_valid { reclaim } else { 0 },
+                    if completion_valid { length as u32 } else { 0 },
+                    irp_flags,
+                )
+                .is_err()
+            {
+                print_str(b"[fsd-peer-complete] ERROR duplicate retained completion irp=");
+                print_hex64(irp);
+                print_str(b"\n");
+                panic!("hosted driver completed the same retained IRP twice");
             }
-        } else if slot.major as u64 == IRP_MJ_WRITE {
-            let _ = insert_completed_write(slot.fid, status, information);
+            write_volatile((node + 8) as *mut PendingIrp, slot);
         }
         if PEER_COMPLETION_TRACE_COUNT < 8 {
             PEER_COMPLETION_TRACE_COUNT += 1;
@@ -8836,16 +9055,11 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
             print_u64(information);
             print_str(b"\n");
         }
-        // The FSD pool exists only in the component VSpace. No graph pointer may escape this
-        // callback for root-side reclamation.
-        pool_free_request_buffers(slot.data, slot.aux_data, slot.mdl);
-        pool_free(slot.iosl);
-        pool_free(slot.irp);
-        // ★ The FILE_OBJECT is NOT freed here. It OUTLIVES the IRP: it belongs to the OPEN and npfs
-        // keeps pointing at it (`Ccb->FileObject[end]`, written through on disconnect/close). Only a
-        // transient FILE_OBJECT owned only by this IRP dies with the request.
-        if slot.owns_fo {
-            pool_free(slot.file_object);
+        if !retain_for_waiter {
+            let Some(completed) = take_pending_irp(irp) else {
+                panic!("completed hosted IRP disappeared before reclamation");
+            };
+            release_pending_irp_graph_component(completed);
         }
     }
 }
@@ -13182,6 +13396,14 @@ struct ProviderMarshalState {
     copyout_count: usize,
     deferred_frees: [ProviderMarshalDeferredFree; HOSTED_PROVIDER_EXPORT_ARG_CAP],
     deferred_free_count: usize,
+    pointer_allocation_dependent_instance: usize,
+    pointer_allocation_dependent_component_va: u64,
+    pointer_allocation_provider_output_exec_va: u64,
+    pointer_allocation_bytes: u64,
+    pointer_free_dependent_instance: usize,
+    pointer_free_dependent_component_va: u64,
+    pointer_free_provider_instance: usize,
+    pointer_free_provider_component_va: u64,
     ndis_device_property_outputs:
         [ProviderMarshalNdisDevicePropertyOutput; HOSTED_PROVIDER_EXPORT_ARG_CAP],
     ndis_device_property_output_count: usize,
@@ -13246,6 +13468,14 @@ impl ProviderMarshalState {
                 condition: 0,
             }; HOSTED_PROVIDER_EXPORT_ARG_CAP],
             deferred_free_count: 0,
+            pointer_allocation_dependent_instance: usize::MAX,
+            pointer_allocation_dependent_component_va: 0,
+            pointer_allocation_provider_output_exec_va: 0,
+            pointer_allocation_bytes: 0,
+            pointer_free_dependent_instance: usize::MAX,
+            pointer_free_dependent_component_va: 0,
+            pointer_free_provider_instance: usize::MAX,
+            pointer_free_provider_component_va: 0,
             ndis_device_property_outputs: [ProviderMarshalNdisDevicePropertyOutput {
                 dependent_exec_va: 0,
                 provider_exec_va: 0,
@@ -13504,7 +13734,9 @@ struct HostedProviderCallbackRecord {
 struct HostedProviderPointerAllocation {
     present: bool,
     dependent_instance: usize,
-    component_va: u64,
+    dependent_component_va: u64,
+    provider_instance: usize,
+    provider_component_va: u64,
     bytes: u64,
 }
 
@@ -13513,7 +13745,9 @@ impl HostedProviderPointerAllocation {
         Self {
             present: false,
             dependent_instance: 0,
-            component_va: 0,
+            dependent_component_va: 0,
+            provider_instance: 0,
+            provider_component_va: 0,
             bytes: 0,
         }
     }
@@ -14798,10 +15032,11 @@ unsafe fn complete_hosted_provider_miniport_registration(
 
 unsafe fn register_hosted_provider_pointer_allocation(
     dependent_instance: usize,
-    component_va: u64,
+    dependent_component_va: u64,
+    provider_instance: usize,
     bytes: u64,
 ) -> bool {
-    if component_va == 0 || bytes == 0 {
+    if dependent_component_va == 0 || bytes == 0 {
         return false;
     }
     let records = hosted_provider_pointer_allocations_mut();
@@ -14810,7 +15045,9 @@ unsafe fn register_hosted_provider_pointer_allocation(
             *record = HostedProviderPointerAllocation {
                 present: true,
                 dependent_instance,
-                component_va,
+                dependent_component_va,
+                provider_instance,
+                provider_component_va: 0,
                 bytes,
             };
             return true;
@@ -14819,26 +15056,52 @@ unsafe fn register_hosted_provider_pointer_allocation(
     records.push(HostedProviderPointerAllocation {
         present: true,
         dependent_instance,
-        component_va,
+        dependent_component_va,
+        provider_instance,
+        provider_component_va: 0,
         bytes,
     });
     true
 }
 
-unsafe fn hosted_provider_pointer_allocation_matches(
+unsafe fn hosted_provider_pointer_allocation(
     dependent_instance: usize,
-    component_va: u64,
+    dependent_component_va: u64,
     bytes: u64,
-) -> bool {
+) -> Option<HostedProviderPointerAllocation> {
     let Some(records) = hosted_provider_pointer_allocations() else {
-        return false;
+        return None;
     };
     for record in records.iter().copied() {
         if record.present
             && record.dependent_instance == dependent_instance
-            && record.component_va == component_va
+            && record.dependent_component_va == dependent_component_va
             && (bytes == 0 || bytes <= record.bytes)
         {
+            return Some(record);
+        }
+    }
+    None
+}
+
+unsafe fn associate_hosted_provider_pointer_allocation(
+    dependent_instance: usize,
+    dependent_component_va: u64,
+    provider_instance: usize,
+    provider_component_va: u64,
+) -> bool {
+    if provider_component_va == 0 {
+        return false;
+    }
+    let records = hosted_provider_pointer_allocations_mut();
+    for record in records.iter_mut() {
+        if record.present
+            && record.dependent_instance == dependent_instance
+            && record.dependent_component_va == dependent_component_va
+            && record.provider_instance == provider_instance
+            && record.provider_component_va == 0
+        {
+            record.provider_component_va = provider_component_va;
             return true;
         }
     }
@@ -14853,7 +15116,7 @@ unsafe fn take_hosted_provider_pointer_allocation(
     for record in records.iter_mut() {
         if record.present
             && record.dependent_instance == dependent_instance
-            && record.component_va == component_va
+            && record.dependent_component_va == component_va
         {
             let taken = *record;
             *record = HostedProviderPointerAllocation::empty();
@@ -14862,6 +15125,95 @@ unsafe fn take_hosted_provider_pointer_allocation(
     }
     HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
     None
+}
+
+unsafe fn release_hosted_provider_pointer_allocation(
+    record: HostedProviderPointerAllocation,
+    provider_component_override: u64,
+) -> bool {
+    let Some(dependent_inst) = instance(record.dependent_instance) else {
+        return false;
+    };
+    let provider_component_va = if provider_component_override != 0 {
+        provider_component_override
+    } else {
+        record.provider_component_va
+    };
+    let dependent_released = release_hosted_instance_pool_allocation_if_live(
+        dependent_inst,
+        record.dependent_component_va,
+    );
+    let provider_released = if provider_component_va == 0 {
+        true
+    } else if let Some(provider_inst) = instance(record.provider_instance) {
+        release_hosted_instance_pool_allocation_if_live(provider_inst, provider_component_va)
+    } else {
+        false
+    };
+    dependent_released && provider_released
+}
+
+unsafe fn abort_provider_export_marshal_before_dispatch(state: &ProviderMarshalState) {
+    if state.pointer_allocation_dependent_component_va == 0 {
+        return;
+    }
+    let Some(record) = take_hosted_provider_pointer_allocation(
+        state.pointer_allocation_dependent_instance,
+        state.pointer_allocation_dependent_component_va,
+    ) else {
+        return;
+    };
+    if !release_hosted_provider_pointer_allocation(record, 0) {
+        HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+unsafe fn abort_provider_export_marshal_after_possible_dispatch(state: &ProviderMarshalState) {
+    if state.pointer_allocation_dependent_component_va != 0 {
+        let provider_component_va = read_unaligned(
+            state.pointer_allocation_provider_output_exec_va as *const u64,
+        );
+        if let Some(record) = take_hosted_provider_pointer_allocation(
+            state.pointer_allocation_dependent_instance,
+            state.pointer_allocation_dependent_component_va,
+        ) {
+            if !release_hosted_provider_pointer_allocation(record, provider_component_va) {
+                HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    if state.pointer_free_dependent_component_va != 0 {
+        if let Some(record) = take_hosted_provider_pointer_allocation(
+            state.pointer_free_dependent_instance,
+            state.pointer_free_dependent_component_va,
+        ) {
+            if record.provider_instance != state.pointer_free_provider_instance
+                || record.provider_component_va != state.pointer_free_provider_component_va
+                || !release_hosted_provider_pointer_allocation(record, 0)
+            {
+                HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+unsafe fn clear_hosted_provider_pointer_allocations_for_instance(instance_index: usize) -> u64 {
+    let records = hosted_provider_pointer_allocations_mut();
+    let mut failures = 0u64;
+    for record in records.iter_mut() {
+        if !record.present
+            || record.dependent_instance != instance_index
+                && record.provider_instance != instance_index
+        {
+            continue;
+        }
+        let taken = *record;
+        *record = HostedProviderPointerAllocation::empty();
+        if !release_hosted_provider_pointer_allocation(taken, 0) {
+            failures += 1;
+        }
+    }
+    failures
 }
 
 fn provider_shared_component_to_exec(
@@ -19239,6 +19591,7 @@ unsafe fn provider_marshal_input_dma_common_buffer(
 
 unsafe fn provider_marshal_output_pointer_from_length(
     state: &mut ProviderMarshalState,
+    provider_instance: usize,
     dependent_index: usize,
     dependent_inst: DriverInstance,
     provider_shared: u64,
@@ -19256,8 +19609,12 @@ unsafe fn provider_marshal_output_pointer_from_length(
     let Some(allocated_component_va) = hosted_instance_pool_alloc(dependent_inst, length) else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
-    if !register_hosted_provider_pointer_allocation(dependent_index, allocated_component_va, length)
-    {
+    if !register_hosted_provider_pointer_allocation(
+        dependent_index,
+        allocated_component_va,
+        provider_instance,
+        length,
+    ) {
         hosted_instance_pool_free(dependent_inst, allocated_component_va);
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
@@ -19295,21 +19652,33 @@ unsafe fn provider_marshal_output_pointer_from_length(
         hosted_instance_pool_free(dependent_inst, allocated_component_va);
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
+    state.pointer_allocation_dependent_instance = dependent_index;
+    state.pointer_allocation_dependent_component_va = allocated_component_va;
+    state.pointer_allocation_provider_output_exec_va = provider_exec_va;
+    state.pointer_allocation_bytes = length;
     Ok(provider_component_va)
 }
 
 unsafe fn provider_marshal_owned_allocation(
     state: &mut ProviderMarshalState,
+    provider_instance: usize,
     dependent_index: usize,
     arg_value: u64,
     length: u64,
 ) -> Result<u64, i32> {
     if arg_value == 0 {
-        return Ok(0);
-    }
-    if !hosted_provider_pointer_allocation_matches(dependent_index, arg_value, length) {
         return Err(STATUS_INVALID_PARAMETER);
     }
+    let Some(record) = hosted_provider_pointer_allocation(dependent_index, arg_value, length) else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    if record.provider_instance != provider_instance || record.provider_component_va == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    state.pointer_free_dependent_instance = dependent_index;
+    state.pointer_free_dependent_component_va = arg_value;
+    state.pointer_free_provider_instance = provider_instance;
+    state.pointer_free_provider_component_va = record.provider_component_va;
     provider_marshal_add_deferred_free(
         state,
         dependent_index,
@@ -19317,7 +19686,7 @@ unsafe fn provider_marshal_owned_allocation(
         PROVIDER_MARSHAL_FREE_ALWAYS,
     )
     .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
-    Ok(0)
+    Ok(record.provider_component_va)
 }
 
 unsafe fn provider_marshal_ndis_request(
@@ -19829,6 +20198,7 @@ unsafe fn prepare_provider_export_marshal(
                 let length_index = length_arg as usize;
                 provider_marshal_owned_allocation(
                     &mut state,
+                    provider_instance,
                     dependent_index,
                     arg,
                     provider_marshal_u32_arg(policy, args, length_index)?,
@@ -20272,6 +20642,7 @@ unsafe fn prepare_provider_export_marshal(
                 let length_index = length_arg as usize;
                 provider_marshal_output_pointer_from_length(
                     &mut state,
+                    provider_instance,
                     dependent_index,
                     dependent_inst,
                     provider_shared,
@@ -20330,9 +20701,43 @@ unsafe fn prepare_provider_export_marshal(
 unsafe fn complete_provider_export_marshal(
     policy: HostedProviderExportMarshalPolicy,
     state: &ProviderMarshalState,
-    result: u64,
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    result: &mut u64,
 ) {
-    let success = provider_export_result_success(policy, result);
+    let mut success = provider_export_result_success(policy, *result);
+    if state.pointer_allocation_dependent_component_va != 0 {
+        let provider_component_va = read_unaligned(
+            state.pointer_allocation_provider_output_exec_va as *const u64,
+        );
+        let provider_pointer_valid = provider_component_va != 0
+            && hosted_pool_allocation_exec_va(
+                provider_inst.exec_pool_va,
+                provider_component_va,
+                state.pointer_allocation_bytes,
+            )
+            .is_some();
+        if success
+            && provider_pointer_valid
+            && associate_hosted_provider_pointer_allocation(
+                state.pointer_allocation_dependent_instance,
+                state.pointer_allocation_dependent_component_va,
+                provider_instance,
+                provider_component_va,
+            )
+        {
+            // The paired provider allocation is retained until the dependent calls
+            // NdisFreeMemory. The fixed copyout below publishes only the dependent address.
+        } else {
+            if provider_pointer_valid {
+                let _ = hosted_instance_pool_free(provider_inst, provider_component_va);
+            }
+            if success {
+                *result = STATUS_INVALID_PARAMETER as u32 as u64;
+                success = false;
+            }
+        }
+    }
     let mut index = 0usize;
     while index < state.copyout_count {
         let copyout = state.copyouts[index];
@@ -21167,6 +21572,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
                 status,
                 b"resource",
             );
+            abort_provider_export_marshal_before_dispatch(&marshal_state);
             return hosted_provider_export_failure(status);
         }
     } else if marshal_state.resource_projection_required {
@@ -21177,6 +21583,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
             STATUS_INVALID_DEVICE_REQUEST,
             b"resource-required",
         );
+        abort_provider_export_marshal_before_dispatch(&marshal_state);
         return hosted_provider_export_failure(STATUS_INVALID_DEVICE_REQUEST);
     }
     write_volatile(
@@ -21275,6 +21682,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
             STATUS_UNSUCCESSFUL,
             b"pump",
         );
+        abort_provider_export_marshal_after_possible_dispatch(&marshal_state);
         return hosted_provider_export_failure(STATUS_UNSUCCESSFUL);
     }
     let provider_inst = instance(singleton.instance).unwrap_or(provider_inst);
@@ -21310,7 +21718,24 @@ pub(crate) unsafe fn service_hosted_provider_export(
         dependent_index,
         dependent_inst,
     );
-    complete_provider_export_marshal(policy, &marshal_state, result);
+    if let Err(status) = drain_hosted_work_queue_for_instance(singleton.instance, provider_inst) {
+        trace_hosted_provider_export_rejection(
+            &singleton.provider,
+            provider_domain_cookie,
+            provider_export_rva,
+            status,
+            b"work-queue",
+        );
+        abort_provider_export_marshal_after_possible_dispatch(&marshal_state);
+        return hosted_provider_export_failure(status);
+    }
+    complete_provider_export_marshal(
+        policy,
+        &marshal_state,
+        singleton.instance,
+        provider_inst,
+        &mut result,
+    );
     trace_provider_resource_list_export(
         policy,
         provider_export_rva,
@@ -21333,16 +21758,6 @@ pub(crate) unsafe fn service_hosted_provider_export(
         &args,
         result,
     );
-    if let Err(status) = drain_hosted_work_queue_for_instance(singleton.instance, provider_inst) {
-        trace_hosted_provider_export_rejection(
-            &singleton.provider,
-            provider_domain_cookie,
-            provider_export_rva,
-            status,
-            b"work-queue",
-        );
-        return hosted_provider_export_failure(status);
-    }
     complete_provider_resource_mapping(
         policy,
         &marshal_state,
@@ -25144,8 +25559,10 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
     }
     if major == FSD_DISPATCH_CANCEL_PENDING_FILE {
         let file_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
+        let requestor_tid =
+            read_volatile((FSD_SHARED_VADDR + SH_REQ_REQUESTOR_TID) as *const u32) as u64;
         let devobj = read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64);
-        let cancelled = cancel_pending_irps_for_file(file_id, devobj);
+        let cancelled = cancel_pending_irps_for_file(file_id, requestor_tid, devobj);
         return (0, cancelled);
     }
     if major == FSD_DISPATCH_ADD_DEVICE {
@@ -25498,6 +25915,8 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     let fsctl = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
 
     let file_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
+    let requestor_tid =
+        read_volatile((FSD_SHARED_VADDR + SH_REQ_REQUESTOR_TID) as *const u32) as u64;
     let uses_file_object = major != IRP_MJ_PNP;
 
     // ★ Audit the CCB's data queues (and the FILE_OBJECTs npfs holds) BEFORE handing it an IRP.
@@ -25931,6 +26350,17 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     }
     let irp_owns_fo = owns_fo && !fo_registered;
     let read_completion = pending_irp_returns_read_bytes(major, fsctl, outlen);
+    let completion_source_kind = if read_completion
+        && !(major == IRP_MJ_FILE_SYSTEM_CONTROL && fsctl == FSCTL_PIPE_TRANSCEIVE)
+        && matches!(
+            control_method,
+            Some(ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT | ioctl::METHOD_NEITHER)
+        )
+    {
+        COMPLETION_SOURCE_REQUEST_DATA
+    } else {
+        COMPLETION_SOURCE_SYSTEM_BUFFER
+    };
     if (major == IRP_MJ_READ || major == IRP_MJ_WRITE) && DATA_TRACE_COUNT < 12 {
         DATA_TRACE_COUNT += 1;
         print_str(b"[fsd-data-result] major=");
@@ -25983,10 +26413,13 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             // `FILE_OBJECT->FsContext`, but executive waiters are parked on the exact endpoint fid
             // carried in this request.
             fid: if file_id != 0 { file_id } else { fsctx },
+            requestor_tid,
             major: major as u8,
+            completion_source_kind,
             read_completion,
             owns_fo: irp_owns_fo,
-            _pad: [0; 5],
+            _pad: [0; 4],
+            completion: nt_io_manager::RetainedIrpCompletion::pending(),
         });
         if !inserted {
             pool_free_request_buffers(data, aux_data, mdl);
@@ -28306,6 +28739,7 @@ impl DriverDispatchBackend for HostedDriverBackend {
                             device_object,
                             fsctl,
                             irp.user_data,
+                            irp.requestor_tid,
                             &input,
                             &mut ctx.system_buffer[..output_len],
                         ),
@@ -28322,6 +28756,7 @@ impl DriverDispatchBackend for HostedDriverBackend {
                     device_object,
                     fsctl,
                     irp.user_data,
+                    irp.requestor_tid,
                     &input,
                     &mut ctx.system_buffer[..output_len],
                 )
@@ -28479,6 +28914,7 @@ fn dispatch_external_irp_to_driver_record_result(
     major: u64,
     fsctl: u64,
     file_id: u64,
+    requestor_tid: u64,
     in_data: &[u8],
     out: &mut [u8],
 ) -> Result<(i32, u64), u32> {
@@ -28496,6 +28932,7 @@ fn dispatch_external_irp_to_driver_record_result(
             DriverId(driver_id),
             None::<FileId>,
             file_id,
+            requestor_tid,
             major,
             params,
             input_len,
@@ -28515,6 +28952,7 @@ fn dispatch_external_irp_to_device_record_result(
     major: u64,
     fsctl: u64,
     file_id: u64,
+    requestor_tid: u64,
     in_data: &[u8],
     out: &mut [u8],
 ) -> Result<(i32, u64), u32> {
@@ -28532,6 +28970,7 @@ fn dispatch_external_irp_to_device_record_result(
             nt_io_manager::DeviceId(device_id),
             None::<FileId>,
             file_id,
+            requestor_tid,
             major,
             params,
             input_len,
@@ -32265,6 +32704,14 @@ fn clear_instance(i: usize) {
     }
     clear_hosted_device_bindings_for_instance(i);
     unsafe {
+        let pointer_failures = clear_hosted_provider_pointer_allocations_for_instance(i);
+        if pointer_failures != 0 {
+            print_str(b"[driver-launch] provider pointer allocation release failed inst=");
+            print_u64(i as u64);
+            print_str(b" failures=");
+            print_u64(pointer_failures);
+            print_str(b"\n");
+        }
         clear_hosted_provider_ndis_shadows_for_instance(i);
         clear_hosted_provider_miniport_interrupt_shadows_for_instance(i);
         clear_hosted_provider_miniport_timer_shadows_for_instance(i);
@@ -35007,6 +35454,7 @@ pub(crate) unsafe fn start_hosted_device(
         binding.device_object,
         0,
         binding.pdo_object,
+        0,
         resource_list,
         &mut out,
     )
@@ -35061,6 +35509,7 @@ unsafe fn dispatch_hosted_device_interrupt_once(
         binding.device_object,
         0,
         tokens.interrupt_id,
+        0,
         &[],
         &mut out,
     )
@@ -35421,6 +35870,7 @@ unsafe fn dispatch_irp_for_instance(
     device_object: u64,
     fsctl: u64,
     file_id: u64,
+    requestor_tid: u64,
     in_data: &[u8],
     out: &mut [u8],
 ) -> Option<(i32, u64)> {
@@ -35474,6 +35924,7 @@ unsafe fn dispatch_irp_for_instance(
     write_volatile((sh + SH_REQ_OUTLEN) as *mut u64, out.len() as u64);
     write_volatile((sh + SH_REQ_FILEID) as *mut u64, file_id);
     write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
+    write_volatile((sh + SH_REQ_REQUESTOR_TID) as *mut u32, requestor_tid as u32);
     write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
     write_volatile((sh + SH_ACTIVE_IRP) as *mut u64, 0);
     write_volatile((sh + SH_ACTIVE_IOSL) as *mut u64, 0);
@@ -35637,7 +36088,7 @@ pub(crate) unsafe fn dispatch_irp_to_driver_result(
     if io_manager_mut().driver(DriverId(driver_id)).is_none() {
         return Err(STATUS_DEVICE_NOT_READY as u32);
     }
-    dispatch_external_irp_to_driver_record_result(driver_id, major, fsctl, file_id, in_data, out)
+    dispatch_external_irp_to_driver_record_result(driver_id, major, fsctl, file_id, 0, in_data, out)
 }
 
 pub(crate) unsafe fn dispatch_irp_to_device_result(
@@ -35645,14 +36096,27 @@ pub(crate) unsafe fn dispatch_irp_to_device_result(
     major: u64,
     fsctl: u64,
     file_id: u64,
+    requestor_tid: u64,
     in_data: &[u8],
     out: &mut [u8],
 ) -> Result<(i32, u64), u32> {
     require_hosted_device_ready_for_dispatch(device_id)?;
-    dispatch_external_irp_to_device_record_result(device_id, major, fsctl, file_id, in_data, out)
+    dispatch_external_irp_to_device_record_result(
+        device_id,
+        major,
+        fsctl,
+        file_id,
+        requestor_tid,
+        in_data,
+        out,
+    )
 }
 
-pub(crate) unsafe fn cancel_pending_file_irps(device_id: u64, file_id: u64) -> Result<u64, u32> {
+pub(crate) unsafe fn cancel_pending_file_irps(
+    device_id: u64,
+    file_id: u64,
+    requestor_tid: u64,
+) -> Result<u64, u32> {
     let (instance, inst, device_object) = hosted_dispatch_instance_for_device_id(device_id)?;
     if !inst.ready || inst.driver_id == 0 || device_object == 0 {
         return Err(STATUS_DEVICE_NOT_READY as u32);
@@ -35671,6 +36135,7 @@ pub(crate) unsafe fn cancel_pending_file_irps(device_id: u64, file_id: u64) -> R
         device_object,
         0,
         file_id,
+        requestor_tid,
         &[],
         &mut out,
     )
@@ -35737,7 +36202,7 @@ unsafe fn dispatch_irp_to_named_device_result(
     out: &mut [u8],
 ) -> Result<(i32, u64), u32> {
     let device_id = device_id_by_name(path).ok_or(STATUS_DEVICE_NOT_READY as u32)?;
-    dispatch_irp_to_device_result(device_id, major, fsctl, file_id, in_data, out)
+    dispatch_irp_to_device_result(device_id, major, fsctl, file_id, 0, in_data, out)
 }
 
 /// Route one IRP to the driver-declared `\Device\NamedPipe` route. Kept as a semantic npfs wrapper

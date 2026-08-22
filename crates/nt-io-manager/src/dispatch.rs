@@ -92,6 +92,7 @@ pub struct IrpProjection {
     pub parameters: IoParameters,
     pub buffer: Option<IoBufferRef>,
     pub user_data: u64,
+    pub requestor_tid: u64,
 }
 
 impl IrpProjection {
@@ -110,6 +111,7 @@ impl IrpProjection {
             parameters,
             buffer: record.buffer,
             user_data: record.user_data,
+            requestor_tid: record.requestor_tid,
         }
     }
 }

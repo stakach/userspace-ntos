@@ -220,6 +220,8 @@ pub struct IrpRecord {
     pub buffer: Option<IoBufferRef>,
     pub cancel: CancelState,
     pub user_data: u64,
+    /// Requesting thread identity used by NT's thread-scoped cancellation contract.
+    pub requestor_tid: u64,
 }
 
 impl IrpRecord {
@@ -246,6 +248,7 @@ impl IrpRecord {
             buffer: None,
             cancel: CancelState::NotCancelled,
             user_data: 0,
+            requestor_tid: 0,
         }
     }
 
