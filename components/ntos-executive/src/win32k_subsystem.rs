@@ -560,20 +560,8 @@ pub const PDEVOBJ_L_CHANGE_DISPLAY_SETTINGS_RVA: u64 = 0x2e100;
 
 /// SSN NtUserSwitchDesktop — SSDT idx 0x288 (== `WIN32K_SERVICE_BASE + 0x288`).
 pub const SSN_NT_USER_SWITCH_DESKTOP: u64 = 0x1288;
-/// SSN NtUserRedrawWindow — SSDT idx 0x012 (w32ksvc64.h: `SVC_(UserRedrawWindow, 4) // 0x1012`).
-pub const SSN_NT_USER_REDRAW_WINDOW: u64 = 0x1012;
 /// SSN NtUserSetProcessWindowStation — win32k's real PROCESSINFO/EPROCESS station association.
 pub const SSN_NT_USER_SET_PROCESS_WINDOW_STATION: u64 = 0x10ac;
-/// `co_IntGraphicsCheck(BOOL Create)` RVA (guicheck.c) — win32k's AUTHENTIC lazy-graphics entry.
-/// Disasm-confirmed for THIS build (0.4.17): prologue at 0x7a100 does
-/// `W32Data = PsGetCurrentProcessWin32Process(); if (Create && !(W32PF_CREATEDWINORDC|W32PF_MANUALGUICHECK))
-///  co_AddGuiApp(W32Data);` where `co_AddGuiApp` (RVA 0x7a080) sets W32PF_CREATEDWINORDC, does
-/// `InterlockedIncrement(&NrGuiAppsRunning@0x20be88)` and, on the 0→1 transition, calls
-/// `co_IntInitializeDesktopGraphics` (RVA 0xfca10) — the REAL InitVideo (display surface + SM_CX/CYSCREEN)
-/// whose tail runs `co_IntShowDesktop(IntGetActiveDesktop(), SM_CX, SM_CY, TRUE)` = the authentic
-/// IntPaintDesktop that blits 0x003a6ea5 through the selected display DLL. This is the exact call win32k makes
-/// from `DceCreateDisplayDC` (windc.c:44) on the first display-DC alloc.
-pub const CO_INT_GRAPHICS_CHECK_RVA: u64 = 0x7a100;
 
 /// NtUserCreateWindowStation — SSDT idx 0x22f (w32ksvc64.h), RVA read from the registered SSDT.
 pub const NT_USER_CREATE_WINDOW_STATION_RVA: u64 = 0xfa710;
@@ -5619,6 +5607,320 @@ unsafe fn current_w32thread() -> u64 {
         .unwrap_or(0)
 }
 
+static mut WIN32K_EXECUTIVE_RESOURCES: Option<nt_kernel_exec::executive_sync::ExecutiveResourceStore> =
+    None;
+
+fn executive_resources_mut(
+) -> &'static mut nt_kernel_exec::executive_sync::ExecutiveResourceStore {
+    unsafe {
+        let slot = &mut *core::ptr::addr_of_mut!(WIN32K_EXECUTIVE_RESOURCES);
+        if slot.is_none() {
+            *slot = Some(nt_kernel_exec::executive_sync::ExecutiveResourceStore::new());
+        }
+        slot.as_mut().expect("initialized above")
+    }
+}
+
+#[cold]
+fn reject_executive_sync(
+    operation: &'static [u8],
+    error: nt_kernel_exec::executive_sync::ExecutiveSyncError,
+) -> ! {
+    print_str(b"[win32k-sync] ERROR: ");
+    print_str(operation);
+    print_str(b" rejected, reason=0x");
+    print_hex(error as u32);
+    print_str(b"\n");
+    panic!("win32k executive synchronization contract violated")
+}
+
+#[cold]
+fn reject_resource_sync(
+    operation: &'static [u8],
+    error: nt_kernel_exec::executive_sync::ExecutiveSyncError,
+    resource: u64,
+    thread: u64,
+) -> ! {
+    print_str(b"[win32k-sync] resource=0x");
+    print_win32k_hex64(resource);
+    print_str(b" current-thread=0x");
+    print_win32k_hex64(thread);
+    if resource != 0 && resource & 7 == 0 {
+        unsafe {
+            let active_count = read_unaligned(
+                (resource + nt_kernel_exec::executive_sync::eresource_layout::ACTIVE_COUNT as u64)
+                    as *const i16,
+            );
+            let flags = read_unaligned(
+                (resource + nt_kernel_exec::executive_sync::eresource_layout::FLAG as u64)
+                    as *const u16,
+            );
+            let owner = read_unaligned(
+                (resource + nt_kernel_exec::executive_sync::eresource_layout::OWNER_ENTRY as u64)
+                    as *const u64,
+            );
+            let recursion = read_unaligned(
+                (resource
+                    + nt_kernel_exec::executive_sync::eresource_layout::OWNER_ENTRY as u64
+                    + nt_kernel_exec::executive_sync::owner_entry_layout::OWNER_COUNT_OR_TABLE_SIZE
+                        as u64) as *const u32,
+            );
+            let active_entries = read_unaligned(
+                (resource
+                    + nt_kernel_exec::executive_sync::eresource_layout::ACTIVE_ENTRIES as u64)
+                    as *const u32,
+            );
+            print_str(b" native-owner=0x");
+            print_win32k_hex64(owner);
+            print_str(b" recursion=");
+            print_u64(recursion as u64);
+            print_str(b" active=");
+            print_u64(active_count as u16 as u64);
+            print_str(b" entries=");
+            print_u64(active_entries as u64);
+            print_str(b" flags=0x");
+            print_hex(flags as u32);
+        }
+    }
+    print_str(b"\n");
+    reject_executive_sync(operation, error)
+}
+
+#[cold]
+fn reject_fast_mutex_sync(
+    operation: &'static [u8],
+    error: nt_kernel_exec::executive_sync::ExecutiveSyncError,
+    mutex: u64,
+    thread: u64,
+) -> ! {
+    print_str(b"[win32k-sync] fast-mutex=0x");
+    print_win32k_hex64(mutex);
+    print_str(b" current-thread=0x");
+    print_win32k_hex64(thread);
+    if mutex != 0 && mutex & 7 == 0 {
+        unsafe {
+            let count = read_unaligned(
+                (mutex + nt_kernel_exec::executive_sync::fast_mutex_layout::COUNT as u64)
+                    as *const i32,
+            );
+            let owner = read_unaligned(
+                (mutex + nt_kernel_exec::executive_sync::fast_mutex_layout::OWNER as u64)
+                    as *const u64,
+            );
+            let contention = read_unaligned(
+                (mutex + nt_kernel_exec::executive_sync::fast_mutex_layout::CONTENTION as u64)
+                    as *const u32,
+            );
+            print_str(b" native-owner=0x");
+            print_win32k_hex64(owner);
+            print_str(b" count=");
+            print_u64(count as u32 as u64);
+            print_str(b" contention=");
+            print_u64(contention as u64);
+        }
+    }
+    print_str(b"\n");
+    reject_executive_sync(operation, error)
+}
+
+/// `NTSTATUS ExInitializeResourceLite(PERESOURCE Resource)`.
+extern "win64" fn s_ex_initialize_resource_lite(resource: u64) -> i32 {
+    match unsafe { executive_resources_mut().initialize(resource as *mut u8) } {
+        Ok(()) => 0,
+        Err(nt_kernel_exec::executive_sync::ExecutiveSyncError::AllocationFailed) => {
+            STATUS_INSUFFICIENT_RESOURCES_I32
+        }
+        Err(_) => STATUS_INVALID_PARAMETER_I32,
+    }
+}
+
+/// `NTSTATUS ExDeleteResourceLite(PERESOURCE Resource)`.
+extern "win64" fn s_ex_delete_resource_lite(resource: u64) -> i32 {
+    match unsafe { executive_resources_mut().delete(resource as *mut u8) } {
+        Ok(()) => 0,
+        Err(error) => reject_executive_sync(b"ExDeleteResourceLite", error),
+    }
+}
+
+fn acquire_resource_lite(
+    resource: u64,
+    wait: bool,
+    mode: nt_kernel_exec::executive_sync::ResourceMode,
+    operation: &'static [u8],
+) -> u8 {
+    let thread = unsafe { current_ethread() };
+    match unsafe {
+        executive_resources_mut().acquire(resource as *mut u8, thread, mode)
+    } {
+        Ok(nt_kernel_exec::executive_sync::AcquireResult::Acquired) => 1,
+        Ok(nt_kernel_exec::executive_sync::AcquireResult::WouldBlock) if !wait => 0,
+        Ok(nt_kernel_exec::executive_sync::AcquireResult::WouldBlock) => reject_resource_sync(
+            operation,
+            nt_kernel_exec::executive_sync::ExecutiveSyncError::BlockingWaitRequired,
+            resource,
+            thread,
+        ),
+        Err(error) => reject_resource_sync(operation, error, resource, thread),
+    }
+}
+
+/// `BOOLEAN ExAcquireResourceExclusiveLite(PERESOURCE Resource, BOOLEAN Wait)`.
+extern "win64" fn s_ex_acquire_resource_exclusive_lite(resource: u64, wait: u8) -> u8 {
+    acquire_resource_lite(
+        resource,
+        wait != 0,
+        nt_kernel_exec::executive_sync::ResourceMode::Exclusive,
+        b"ExAcquireResourceExclusiveLite",
+    )
+}
+
+/// `BOOLEAN ExAcquireResourceSharedLite(PERESOURCE Resource, BOOLEAN Wait)`.
+extern "win64" fn s_ex_acquire_resource_shared_lite(resource: u64, wait: u8) -> u8 {
+    acquire_resource_lite(
+        resource,
+        wait != 0,
+        nt_kernel_exec::executive_sync::ResourceMode::Shared,
+        b"ExAcquireResourceSharedLite",
+    )
+}
+
+/// `VOID ExReleaseResourceLite(PERESOURCE Resource)`.
+extern "win64" fn s_ex_release_resource_lite(resource: u64) {
+    let thread = unsafe { current_ethread() };
+    if let Err(error) =
+        unsafe { executive_resources_mut().release(resource as *mut u8, thread) }
+    {
+        reject_resource_sync(b"ExReleaseResourceLite", error, resource, thread);
+    }
+}
+
+/// `BOOLEAN ExIsResourceAcquiredExclusiveLite(PERESOURCE Resource)`.
+extern "win64" fn s_ex_is_resource_acquired_exclusive_lite(resource: u64) -> u8 {
+    let thread = unsafe { current_ethread() };
+    match executive_resources_mut().is_acquired_exclusive(resource, thread) {
+        Ok(acquired) => acquired as u8,
+        Err(error) => reject_resource_sync(
+            b"ExIsResourceAcquiredExclusiveLite",
+            error,
+            resource,
+            thread,
+        ),
+    }
+}
+
+/// `ULONG ExIsResourceAcquiredSharedLite(PERESOURCE Resource)`.
+extern "win64" fn s_ex_is_resource_acquired_shared_lite(resource: u64) -> u32 {
+    let thread = unsafe { current_ethread() };
+    match executive_resources_mut().acquired_count(resource, thread) {
+        Ok(count) => count,
+        Err(error) => reject_resource_sync(
+            b"ExIsResourceAcquiredSharedLite",
+            error,
+            resource,
+            thread,
+        ),
+    }
+}
+
+/// `VOID KeEnterCriticalRegion(VOID)`.
+extern "win64" fn s_ke_enter_critical_region() {
+    let thread = unsafe { current_ethread() };
+    if let Err(error) = unsafe {
+        nt_kernel_exec::executive_sync::enter_critical_region(thread as *mut u8)
+    } {
+        reject_executive_sync(b"KeEnterCriticalRegion", error);
+    }
+}
+
+/// `VOID KeLeaveCriticalRegion(VOID)`.
+extern "win64" fn s_ke_leave_critical_region() {
+    let thread = unsafe { current_ethread() };
+    if let Err(error) = unsafe {
+        nt_kernel_exec::executive_sync::leave_critical_region(thread as *mut u8)
+    } {
+        reject_executive_sync(b"KeLeaveCriticalRegion", error);
+    }
+}
+
+/// `VOID KeEnterGuardedRegion(VOID)`.
+extern "win64" fn s_ke_enter_guarded_region() {
+    let thread = unsafe { current_ethread() };
+    if let Err(error) = unsafe {
+        nt_kernel_exec::executive_sync::enter_guarded_region(thread as *mut u8)
+    } {
+        reject_executive_sync(b"KeEnterGuardedRegion", error);
+    }
+}
+
+/// `VOID KeLeaveGuardedRegion(VOID)`.
+extern "win64" fn s_ke_leave_guarded_region() {
+    let thread = unsafe { current_ethread() };
+    if let Err(error) = unsafe {
+        nt_kernel_exec::executive_sync::leave_guarded_region(thread as *mut u8)
+    } {
+        reject_executive_sync(b"KeLeaveGuardedRegion", error);
+    }
+}
+
+/// `PVOID ExEnterCriticalRegionAndAcquireResourceShared(PERESOURCE Resource)`.
+extern "win64" fn s_ex_enter_critical_region_and_acquire_resource_shared(resource: u64) -> u64 {
+    s_ke_enter_critical_region();
+    let _ = s_ex_acquire_resource_shared_lite(resource, 1);
+    unsafe { current_w32thread() }
+}
+
+/// `PVOID ExEnterCriticalRegionAndAcquireResourceExclusive(PERESOURCE Resource)`.
+extern "win64" fn s_ex_enter_critical_region_and_acquire_resource_exclusive(resource: u64) -> u64 {
+    s_ke_enter_critical_region();
+    let _ = s_ex_acquire_resource_exclusive_lite(resource, 1);
+    unsafe { current_w32thread() }
+}
+
+/// `VOID ExReleaseResourceAndLeaveCriticalRegion(PERESOURCE Resource)`.
+extern "win64" fn s_ex_release_resource_and_leave_critical_region(resource: u64) {
+    s_ex_release_resource_lite(resource);
+    s_ke_leave_critical_region();
+}
+
+/// `VOID ExAcquireFastMutexUnsafe(PFAST_MUTEX FastMutex)`.
+extern "win64" fn s_ex_acquire_fast_mutex_unsafe(mutex: u64) {
+    let thread = unsafe { current_ethread() };
+    match unsafe {
+        nt_kernel_exec::executive_sync::acquire_fast_mutex_unsafe(mutex as *mut u8, thread)
+    } {
+        Ok(nt_kernel_exec::executive_sync::AcquireResult::Acquired) => {}
+        Ok(nt_kernel_exec::executive_sync::AcquireResult::WouldBlock) => reject_fast_mutex_sync(
+            b"ExAcquireFastMutexUnsafe",
+            nt_kernel_exec::executive_sync::ExecutiveSyncError::BlockingWaitRequired,
+            mutex,
+            thread,
+        ),
+        Err(error) => reject_fast_mutex_sync(b"ExAcquireFastMutexUnsafe", error, mutex, thread),
+    }
+}
+
+/// `VOID ExReleaseFastMutexUnsafe(PFAST_MUTEX FastMutex)`.
+extern "win64" fn s_ex_release_fast_mutex_unsafe(mutex: u64) {
+    let thread = unsafe { current_ethread() };
+    if let Err(error) = unsafe {
+        nt_kernel_exec::executive_sync::release_fast_mutex_unsafe(mutex as *mut u8, thread)
+    } {
+        reject_fast_mutex_sync(b"ExReleaseFastMutexUnsafe", error, mutex, thread);
+    }
+}
+
+/// `VOID ExEnterCriticalRegionAndAcquireFastMutexUnsafe(PFAST_MUTEX FastMutex)`.
+extern "win64" fn s_ex_enter_critical_region_and_acquire_fast_mutex_unsafe(mutex: u64) {
+    s_ke_enter_critical_region();
+    s_ex_acquire_fast_mutex_unsafe(mutex);
+}
+
+/// `VOID ExReleaseFastMutexUnsafeAndLeaveCriticalRegion(PFAST_MUTEX FastMutex)`.
+extern "win64" fn s_ex_release_fast_mutex_unsafe_and_leave_critical_region(mutex: u64) {
+    s_ex_release_fast_mutex_unsafe(mutex);
+    s_ke_leave_critical_region();
+}
+
 fn print_win32k_hex64(value: u64) {
     print_hex((value >> 32) as u32);
     print_hex(value as u32);
@@ -8934,10 +9236,22 @@ fn register_trampolines() -> bool {
         "KeWaitForSingleObject",
         s_ke_wait_for_single_object as usize as u64,
     );
-    reg.bind("KeEnterCriticalRegion", s_void as usize as u64);
-    reg.bind("KeLeaveCriticalRegion", s_void as usize as u64);
-    reg.bind("KeEnterGuardedRegion", s_void as usize as u64);
-    reg.bind("KeLeaveGuardedRegion", s_void as usize as u64);
+    reg.bind(
+        "KeEnterCriticalRegion",
+        s_ke_enter_critical_region as usize as u64,
+    );
+    reg.bind(
+        "KeLeaveCriticalRegion",
+        s_ke_leave_critical_region as usize as u64,
+    );
+    reg.bind(
+        "KeEnterGuardedRegion",
+        s_ke_enter_guarded_region as usize as u64,
+    );
+    reg.bind(
+        "KeLeaveGuardedRegion",
+        s_ke_leave_guarded_region as usize as u64,
+    );
     reg.bind("EngGetTickCount", s_eng_get_tick_count as usize as u64);
     reg.bind("EngGetTickCount32", s_eng_get_tick_count as usize as u64);
     reg.bind("RtlGetExpWinVer", s_rtl_get_exp_winver as usize as u64);
@@ -9254,22 +9568,62 @@ fn register_trampolines() -> bool {
         s_ke_query_performance_counter as usize as u64,
     );
     reg.bind("DbgPrint", s_dbg_print as usize as u64);
-    // --- batch 4: resource / lock acquire → BOOLEAN TRUE (single-threaded host: always acquired) ---
-    reg.bind("ExAcquireResourceExclusiveLite", s_true as usize as u64);
-    reg.bind("ExAcquireResourceSharedLite", s_true as usize as u64);
-    reg.bind("ExIsResourceAcquiredExclusiveLite", s_true as usize as u64);
-    reg.bind("ExIsResourceAcquiredSharedLite", s_true as usize as u64);
+    // --- batch 4: native executive resources / critical regions / fast mutexes ---
+    reg.bind(
+        "ExInitializeResourceLite",
+        s_ex_initialize_resource_lite as usize as u64,
+    );
+    reg.bind(
+        "ExDeleteResourceLite",
+        s_ex_delete_resource_lite as usize as u64,
+    );
+    reg.bind(
+        "ExAcquireResourceExclusiveLite",
+        s_ex_acquire_resource_exclusive_lite as usize as u64,
+    );
+    reg.bind(
+        "ExAcquireResourceSharedLite",
+        s_ex_acquire_resource_shared_lite as usize as u64,
+    );
+    reg.bind(
+        "ExReleaseResourceLite",
+        s_ex_release_resource_lite as usize as u64,
+    );
+    reg.bind(
+        "ExIsResourceAcquiredExclusiveLite",
+        s_ex_is_resource_acquired_exclusive_lite as usize as u64,
+    );
+    reg.bind(
+        "ExIsResourceAcquiredSharedLite",
+        s_ex_is_resource_acquired_shared_lite as usize as u64,
+    );
     reg.bind(
         "ExEnterCriticalRegionAndAcquireResourceShared",
-        s_true as usize as u64,
+        s_ex_enter_critical_region_and_acquire_resource_shared as usize as u64,
     );
     reg.bind(
         "ExEnterCriticalRegionAndAcquireResourceExclusive",
-        s_true as usize as u64,
+        s_ex_enter_critical_region_and_acquire_resource_exclusive as usize as u64,
+    );
+    reg.bind(
+        "ExReleaseResourceAndLeaveCriticalRegion",
+        s_ex_release_resource_and_leave_critical_region as usize as u64,
+    );
+    reg.bind(
+        "ExAcquireFastMutexUnsafe",
+        s_ex_acquire_fast_mutex_unsafe as usize as u64,
+    );
+    reg.bind(
+        "ExReleaseFastMutexUnsafe",
+        s_ex_release_fast_mutex_unsafe as usize as u64,
     );
     reg.bind(
         "ExEnterCriticalRegionAndAcquireFastMutexUnsafe",
-        s_true as usize as u64,
+        s_ex_enter_critical_region_and_acquire_fast_mutex_unsafe as usize as u64,
+    );
+    reg.bind(
+        "ExReleaseFastMutexUnsafeAndLeaveCriticalRegion",
+        s_ex_release_fast_mutex_unsafe_and_leave_critical_region as usize as u64,
     );
     reg.bind("ExfAcquirePushLockExclusive", s_true as usize as u64);
     reg.bind("ExfTryToWakePushLock", s_true as usize as u64);
@@ -10606,121 +10960,6 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         _ => return STATUS_INVALID_SYSTEM_SERVICE,
     };
     observe_gdi_handle_return(ssn, ret);
-    // ★ BATCH 46 — restore the desktop-paint TRIGGER on winlogon's real SwitchDesktop.
-    //
-    // ROOT CAUSE (instruction-confirmed, NtUserSwitchDesktop RVA 0x6c2f8/0x6c579): winlogon's switch is
-    // the FIRST switch, so `gpdeskInputDesktop == NULL` on entry → win32k computes `bRedrawDesktop = FALSE`
-    // (the `if (gpdeskInputDesktop != NULL)` VISIBLE-check branch is skipped) → `co_IntShowDesktop` runs
-    // with SWP_NOREDRAW → NO `co_UserRedrawWindow` → NO WM_ERASEBKGND → NO GetDC → NO `co_IntGraphicsCheck`
-    // → `NrGuiAppsRunning` stays 0 → `co_IntInitializeDesktopGraphics` (InitVideo) NEVER runs → SM_CX/CYSCREEN
-    // stay 0 → IntPaintDesktop blits to a 0×0 surface (0/768 px). The counter proves it: NrGuiAppsRunning=0
-    // both before AND after winlogon's switch.
-    //
-    // In real Windows the lazy InitVideo fires from winlogon's first GUI display-DC alloc
-    // (`DceCreateDisplayDC → co_IntGraphicsCheck(TRUE)`, windc.c:44) once a message loop pumps the desktop
-    // window's WM_PAINT/WM_ERASEBKGND. Our single-threaded host short-circuits the SAS window's WINDOWPROC
-    // callbacks (BATCH 45) and never runs a message loop, so that natural DC-alloc never happens. The
-    // FAITHFUL trigger — the SAME function win32k itself calls — is `co_IntGraphicsCheck(TRUE)`: it runs the
-    // REAL `co_AddGuiApp → co_IntInitializeDesktopGraphics` (display surface init via PDEVOBJ_lChangeDisplay
-    // Settings + IntGdiCreateDC(L"DISPLAY") + IntCreatePrimarySurface) whose tail does
-    // `co_IntShowDesktop(IntGetActiveDesktop()=gpdeskInputDesktop, SM_CX, SM_CY, bRedraw=TRUE)` = the genuine
-    // IntPaintDesktop that blits 0x003a6ea5 to the BOOTBOOT framebuffer through the selected display DLL.
-    // NOTHING is faked — win32k's own GDI paints the pixels; we only supply the DC-alloc trigger our missing
-    // message loop would otherwise supply, at the authentic point (right after the desktop is made current).
-    if ssn == SSN_NT_USER_SWITCH_DESKTOP {
-        let gpdesk = read_volatile((WIN32K_CODE_VA + GPDESK_INPUT_DESKTOP_RVA) as *const u64);
-        let ngui = read_volatile((WIN32K_CODE_VA + NR_GUI_APPS_RUNNING_RVA) as *const u32);
-        print_str(b"[win32k-paint] POST-SwitchDesktop ret=0x");
-        print_hex(ret as u32);
-        print_str(b" gpdeskInputDesktop=0x");
-        print_hex((gpdesk >> 32) as u32);
-        print_hex(gpdesk as u32);
-        print_str(b" NrGuiAppsRunning=0x");
-        print_hex(ngui);
-        print_str(b"\n");
-        // Fire the lazy graphics init exactly once, when a desktop is current (gpdeskInputDesktop set) and
-        // InitVideo has not yet run (NrGuiAppsRunning == 0). co_IntGraphicsCheck's own W32PF_CREATEDWINORDC
-        // guard makes a repeat call a no-op, but gating on ngui==0 keeps the log clean and matches the real
-        // first-DC-alloc semantics.
-        if gpdesk != 0 && ngui == 0 {
-            print_str(b"[win32k-paint] driving co_IntGraphicsCheck(TRUE) -> InitVideo + IntPaintDesktop...\n");
-            let gfx: extern "win64" fn(u64) -> i32 =
-                core::mem::transmute((WIN32K_CODE_VA + CO_INT_GRAPHICS_CHECK_RVA) as *const ());
-            let gret = gfx(1);
-            let ngui2 = read_volatile((WIN32K_CODE_VA + NR_GUI_APPS_RUNNING_RVA) as *const u32);
-            print_str(b"[win32k-paint] co_IntGraphicsCheck ret=0x");
-            print_hex(gret as u32);
-            print_str(b" NrGuiAppsRunning=0x");
-            print_hex(ngui2);
-            print_str(b"\n");
-        }
-
-        if gpdesk != 0 {
-            // FULL-DESKTOP REPAINT. InitVideo's own `co_IntShowDesktop(pdesk, 1024, 768, TRUE)` GREW the
-            // desktop window from the default 640×480 (winlogon's FIRST bRedraw=FALSE switch pre-showed it at
-            // the boot-default SM_CX/CYSCREEN) to full 1024×768. co_WinPosSetWindowPos preserves the old
-            // 640×480 area (SWP bitblt) and RDW_INVALIDATE only invalidates the newly-exposed L-region → the
-            // top-left 640×480 keeps its NEVER-painted (magenta) content (observed: 468/768, an L-shape with a
-            // 640×480 top-left hole). Force a WHOLE-desktop erase so IntPaintDesktop repaints the FULL screen:
-            // invoke win32k's own `NtUserRedrawWindow(hwndDesktop, NULL, NULL,
-            // RDW_INVALIDATE|RDW_ERASE|RDW_UPDATENOW|RDW_ALLCHILDREN)` — this is exactly the whole-desktop
-            // repaint path win32k uses on WM_SYSCOLORCHANGE (desktop.c DesktopWindowProc) → DesktopWindowProc
-            // WM_ERASEBKGND → IntPaintDesktop over the full clip box. The pixels are still painted by win32k's
-            // real GDI, not by us. The desktop HWND is `gpdesk->pDeskInfo->spwnd->head.h` (WND HEAD.h @ spwnd+0).
-            let pdeskinfo = read_volatile((gpdesk + 0x08) as *const u64); // DESKTOP.pDeskInfo
-            let spwnd = if pdeskinfo != 0 {
-                read_volatile((pdeskinfo + 0x10) as *const u64)
-            } else {
-                0
-            };
-            let hwnd_desktop = if spwnd != 0 {
-                read_volatile(spwnd as *const u64)
-            } else {
-                0
-            }; // WND HEAD.h
-            if hwnd_desktop != 0 {
-                // Per-client THREADINFO isolation means the desktop window can still carry the bootstrap
-                // desktop-thread owner while this repaint runs in winlogon's isolated thread. In this
-                // single-threaded host that turns DesktopWindowProc delivery into a queued cross-thread send
-                // that no desktop thread will pump. Rebind the desktop WND to the current dispatch thread so
-                // co_UserRedrawWindow dispatches WM_ERASEBKGND synchronously, as the original shared-thread
-                // model did.
-                let current_pti = current_w32thread();
-                let owner_pti = read_volatile((spwnd + WND_HEAD_PTI_OFF) as *const u64);
-                if current_pti != 0 && owner_pti != current_pti {
-                    write_volatile((spwnd + WND_HEAD_PTI_OFF) as *mut u64, current_pti);
-                    print_str(b"[win32k-paint] rebound desktop WND owner pti=0x");
-                    print_hex((owner_pti >> 32) as u32);
-                    print_hex(owner_pti as u32);
-                    print_str(b" -> 0x");
-                    print_hex((current_pti >> 32) as u32);
-                    print_hex(current_pti as u32);
-                    print_str(b"\n");
-                }
-                // RDW_INVALIDATE(0x1)|RDW_ERASE(0x4)|RDW_UPDATENOW(0x100)|RDW_ALLCHILDREN(0x80) = 0x185.
-                const RDW_FULL: u64 = 0x1 | 0x4 | 0x100 | 0x80;
-                let ssdt_base = read_volatile((WIN32K_SHARED_VADDR + SH_SSDT_BASE) as *const u64);
-                let ridx = SSN_NT_USER_REDRAW_WINDOW - WIN32K_SERVICE_BASE;
-                let rh = read_volatile((ssdt_base + ridx * 8) as *const u64);
-                if rh != 0 {
-                    let redraw: extern "win64" fn(u64, u64, u64, u64) -> i32 =
-                        core::mem::transmute(rh as *const ());
-                    let rret = redraw(hwnd_desktop, 0, 0, RDW_FULL);
-                    print_str(b"[win32k-paint] NtUserRedrawWindow(hwndDesktop=0x");
-                    print_hex(hwnd_desktop as u32);
-                    print_str(b", RDW_FULL) ret=0x");
-                    print_hex(rret as u32);
-                    print_str(b"\n");
-                } else {
-                    print_str(b"[win32k-paint] WARN: NtUserRedrawWindow SSN unresolved\n");
-                }
-            } else {
-                print_str(
-                    b"[win32k-paint] WARN: no desktop HWND (spwnd null) - full repaint skipped\n",
-                );
-            }
-        }
-    }
 
     // Publish only the interactive Default desktop after Ob creation has already installed its real
     // parent window station and desktop heap. Service desktops remain scoped to their own window

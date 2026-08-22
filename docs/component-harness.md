@@ -150,8 +150,10 @@ Load-bearing fragilities flagged in-code (do NOT "clean up"): pool must stay a p
 (`win32k_subsystem.rs:50-54, 499-501`); win32k's own stack must NOT be at `STACK_BASE` (`:55-60`);
 FreeType arena isolation (`:524-547`); gptiDesktopThread == current dispatch thread (`:3030-3044`);
 BATCH-43 thread↔desktop re-assert before every dispatch (`:3372-3404`); BATCH-44 wide-arg garbage-hMenu
-wall (`:162-184` + `service_sec_image.rs:3245-3253`); BATCH-46 paint trigger `co_IntGraphicsCheck(TRUE)`
-(`:2788-2872`).
+wall (`:162-184` + `service_sec_image.rs:3245-3253`). The former BATCH-46 post-`SwitchDesktop`
+`co_IntGraphicsCheck(TRUE)`/direct-redraw trigger is retired: native ERESOURCE ownership exposed that
+the component was entering USER internals after the syscall had released `UserLock`. Login and shell
+paint must arrive through the ordinary message, callback, display-DC, and GDI paths.
 
 ---
 

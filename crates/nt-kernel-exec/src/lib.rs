@@ -18,6 +18,7 @@ mod dispatcher_wait;
 mod dpc;
 mod driver_thread;
 mod event;
+pub mod executive_sync;
 pub mod gdi_bitmap;
 mod interrupt;
 mod irql;

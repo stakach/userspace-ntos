@@ -9765,3 +9765,38 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `RtlMultiByteToUnicodeN`, leaving 81 genuinely unresolved code imports plus the explicit
     placeholder-bound set. Continue next with shared `ERESOURCE`, critical-region, and
     `FAST_MUTEX` semantics; do not weaken the final fail-closed import switch to land it early.
+
+    Win32k native executive-synchronization checkpoint (2026-08-22): `nt-kernel-exec` now owns a
+    host-tested native x64 synchronization model instead of win32k reporting unconditional success
+    for resource and fast-mutex operations. It projects the exact 0x68-byte `ERESOURCE`,
+    0x10-byte `OWNER_ENTRY`, 0x38-byte `FAST_MUTEX`, and KTHREAD APC-disable fields; tracks
+    recursive exclusive ownership, multiple recursive shared owners in a dynamically sized native
+    owner table, checked release/delete/query operations, and checked critical/guarded-region
+    nesting. `Wait=FALSE` contention returns false without mutating ownership. A blocking acquire
+    that needs a handoff returns an explicit `WouldBlock` from the neutral crate and the current
+    win32k adapter fails loudly until it is connected to the executive continuation/wait broker; it
+    never grants ownership early.
+
+    All 16 declared win32k resource/critical-region/fast-mutex imports are bound to this model. The
+    first runtime attempt correctly rejected a post-`NtUserSwitchDesktop` component-local
+    `co_IntGraphicsCheck(TRUE)` call when it released the native `UserLock` without owning it. That
+    old direct graphics call, its direct `NtUserRedrawWindow` invocation, and its desktop-window
+    THREADINFO owner rewrite are now deleted. With those interventions gone,
+    `.tmp/run-desktop-win32k-sync-natural-paint-20260822.log` and its serialized retry reach the
+    ordinary IDD_LOGON message pump, 12 real `WM_PAINT` WINDOWPROC callbacks, real
+    `NtUserBeginPaint`/`NtUserEndPaint` and GDI traffic, and a rendered 13-character credential edit
+    without any synchronization-contract failure. The retry delivers the real credential Return,
+    then exposes a separate timing-dependent LSA API 2 wait: LSASS parks on an unsignalled event
+    after concurrent `svchost.exe` startup and does not reply to winlogon, so userinit/Explorer are
+    not launched in that run. This is not an accepted desktop proof and must not be hidden by
+    restoring the retired paint trigger or delaying SCM policy in the kernel.
+
+    Validation is green for `cargo fmt --all`, `cargo test -p nt-kernel-exec` (`166/166`),
+    `cargo test -p nt-compat-exports` (`35/35`), executive `cargo check --manifest-path
+    components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+    Review adjustment: keep the synchronization imports classified as partial until contended
+    resource and fast-mutex acquires use a continuation-aware waiter queue and release performs the
+    real wake/ownership transfer. The next import-ownership slice can proceed with object-body
+    reference counts and access/type validation; the later generic hosted-kernel call broker should
+    carry both object services and synchronization handoffs. Separately, diagnose the LSA event
+    waiter as a generic event/thread-scheduling problem before accepting the next full desktop run.
