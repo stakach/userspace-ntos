@@ -27310,7 +27310,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // 128 KiB bump heap is exhausted by this point (after smss/csrss) and the rootserver
             // stack is only 16 KiB — load_into parses win32k.sys manually and records the W^X
             // frame rights into its own `static`.
-            let entry_rva = match win32k_subsystem::load_into(WIN32KBUF_VADDR, win32k_size) {
+            let nls_sizes = [
+                NLS_ANSI_SIZE.load(Ordering::Relaxed) as usize,
+                NLS_OEM_SIZE.load(Ordering::Relaxed) as usize,
+                NLS_CASE_SIZE.load(Ordering::Relaxed) as usize,
+            ];
+            let entry_rva = match win32k_subsystem::load_into(
+                WIN32KBUF_VADDR,
+                win32k_size,
+                nls_sizes,
+            ) {
                 Some(entry_rva) => {
                     let _ = register_system_module(
                         b"reactos\\system32\\win32k.sys",
@@ -27319,7 +27328,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     );
                     entry_rva
                 }
-                None => 0,
+                None => panic!("win32k image rejected by its native load contract"),
             };
             print_str(b"[win32k-svc] loaded win32k.sys; DriverEntry rva=0x");
             print_hex(entry_rva);
@@ -27364,6 +27373,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let code_rights_static: &'static [u64] =
                     core::mem::transmute::<&[u64], &'static [u64]>(win32k_subsystem::code_rights());
                 let font_base = FONTBUF_START.load(Ordering::Relaxed);
+                let nls_ansi_base = NLS_ANSI_START.load(Ordering::Relaxed);
+                let nls_oem_base = NLS_OEM_START.load(Ordering::Relaxed);
+                let nls_case_base = NLS_CASE_START.load(Ordering::Relaxed);
                 let mut regions: [Region; 32] = [Region {
                     source: FrameSource::Alias(0),
                     base_va: 0,
@@ -27437,24 +27449,45 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     };
                     n += 1;
                 }
-                // SYSTEM hive buffer: win32k's ntoskrnl registry imports now resolve real keys
+                // Native RTL NLS state. The storage host owns the file-backed frames; the win32k
+                // component receives read-only, non-executable aliases and validates their actual
+                // byte lengths before DriverEntry. All three tables and the SYSTEM hive below fit
+                // one 2 MiB page-table window.
+                regions[n] = Region {
+                    source: FrameSource::Alias(nls_ansi_base),
+                    base_va: NLS_ANSI_VADDR,
+                    count: NLS_ANSI_FRAMES,
+                    rights: Rights::Uniform(RO_NX),
+                    pts: 1,
+                };
+                n += 1;
+                regions[n] = Region {
+                    source: FrameSource::Alias(nls_oem_base),
+                    base_va: NLS_OEM_VADDR,
+                    count: NLS_OEM_FRAMES,
+                    rights: Rights::Uniform(RO_NX),
+                    pts: 0,
+                };
+                n += 1;
+                regions[n] = Region {
+                    source: FrameSource::Alias(nls_case_base),
+                    base_va: NLS_CASE_VADDR,
+                    count: NLS_CASE_FRAMES,
+                    rights: Rights::Uniform(RO_NX),
+                    pts: 0,
+                };
+                n += 1;
+
+                // SYSTEM hive buffer: win32k's ntoskrnl registry imports resolve real keys
                 // directly against the mounted regf bytes. Map the same staged hive read-only into
                 // the component rather than publishing a key/value mirror.
                 let system_hive_base = HIVEBUF_START.load(Ordering::Relaxed);
                 if system_hive_base != 0 {
                     regions[n] = Region {
-                        source: FrameSource::Alias(0),
-                        base_va: NLS_ANSI_VADDR,
-                        count: 0,
-                        rights: Rights::Uniform(2),
-                        pts: 1,
-                    };
-                    n += 1;
-                    regions[n] = Region {
                         source: FrameSource::Alias(system_hive_base),
                         base_va: HIVEBUF_VADDR,
                         count: HIVEBUF_FRAMES,
-                        rights: Rights::Uniform(2),
+                        rights: Rights::Uniform(RO_NX),
                         pts: 0,
                     };
                     n += 1;

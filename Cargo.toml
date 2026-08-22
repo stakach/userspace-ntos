@@ -26,6 +26,7 @@ members = [
     "crates/nt-io-completion",
     "crates/nt-video-miniport",
     "crates/nt-kernel-abi",
+    "crates/nt-nls",
     "crates/nt-pe-loader",
     "crates/nt-compat-exports",
     "crates/nt-driver-abi",
@@ -126,6 +127,7 @@ nt-io-client = { path = "crates/nt-io-client" }
 nt-io-completion = { path = "crates/nt-io-completion" }
 nt-video-miniport = { path = "crates/nt-video-miniport" }
 nt-kernel-abi = { path = "crates/nt-kernel-abi" }
+nt-nls = { path = "crates/nt-nls" }
 nt-pe-loader = { path = "crates/nt-pe-loader" }
 nt-compat-exports = { path = "crates/nt-compat-exports" }
 nt-driver-abi = { path = "crates/nt-driver-abi" }

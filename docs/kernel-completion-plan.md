@@ -9727,3 +9727,41 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     reference counts, and the generic hosted-kernel call broker for stateful CM, memory, process,
     I/O, LPC, and section services. Keep `export_addr` fail-closed conversion as the final switch
     after unresolved and placeholder-bound coverage both reach zero.
+
+    Win32k native NLS ownership and import checkpoint (2026-08-22): native table parsing and
+    conversion policy now live in the allocation-free, `no_std`, host-tested `nt-nls` crate;
+    `nt-ntdll` preserves its public allocation-owning APIs as thin adapters over that neutral core
+    rather than owning a second parser/case mapper, and the executive does not depend on ntdll.
+    The storage-owned `c_1252.nls`, `c_437.nls`, and `l_intl.nls` frames are mapped into win32k as
+    read-only, non-executable aliases independently of SYSTEM-hive presence. `load_into` consumes
+    the storage host's actual byte lengths, requires complete SBCS CP1252/CP437 forward and reverse
+    tables, checks table identity samples, validates every reachable three-level upper/lower case
+    offset, and publishes only the compact validated layout plus `NlsMbCodePageTag` in fixed
+    `WIN32K_DATA` memory. A missing, malformed, or wrong table rejects the image with a named
+    diagnostic and panics before the win32k component is mapped or spawned; there is no ASCII,
+    Latin-1, RVA-zero, or hive-dependent fallback.
+
+    The complete declared NLS import family is now real: `RtlGetDefaultCodePage`,
+    `RtlAnsiStringToUnicodeString`, `RtlMultiByteToUnicodeN`,
+    `RtlUnicodeStringToAnsiString`, `RtlxUnicodeStringToAnsiSize`,
+    `RtlUnicodeToMultiByteSize`, `RtlOemToUnicodeN`, `RtlUpcaseUnicodeChar`, and
+    `RtlAnsiCharToUnicodeChar`. Counted-string allocation uses the matching reclaiming win32k pool,
+    overflow/terminator/status behavior follows the native contracts, CP1252/CP437 conversions use
+    the mapped tables, and uppercase uses the validated `l_intl` signed-delta map without an
+    impossible-case identity fallback. Validation is green for `cargo fmt --all`, `cargo test -p
+    nt-nls` (`9/9`), `cargo test -p nt-ntdll` (`709/709`), `cargo test -p nt-compat-exports`
+    (`35/35`), executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+    x86_64-unknown-none`, and `git diff --check`.
+
+    The accepted serialized desktop proof
+    `.tmp/run-desktop-win32k-nls-imports-retry-20260822.log` validates CP1252/CP437/l_intl before
+    `DriverEntry`, grows the win32k registry from `177` to `185` real bindings, delivers the real
+    credential Return, dynamically launches userinit/Explorer, redirects 673 Explorer api0
+    callbacks with zero live/dead callback failures, paints all 786,432 framebuffer pixels with at
+    least 32 colors, passes `293/293`, and reaches the sentinel. An earlier retry parked after one
+    injected `WM_CHAR` completion returned `STATUS_PENDING`; it had no NLS rejection, panic, or
+    callback fault, and the clean serialized retry closed that transport nondeterminism. Review
+    adjustment: this removes eight unresolved imports and replaces the existing synthetic
+    `RtlMultiByteToUnicodeN`, leaving 81 genuinely unresolved code imports plus the explicit
+    placeholder-bound set. Continue next with shared `ERESOURCE`, critical-region, and
+    `FAST_MUTEX` semantics; do not weaken the final fail-closed import switch to land it early.

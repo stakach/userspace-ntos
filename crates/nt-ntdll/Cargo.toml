@@ -18,6 +18,7 @@ nt-syscall-abi = { path = "../nt-syscall-abi" }
 nt-ntdll-layout = { workspace = true }
 nt-compat-exports = { workspace = true }
 nt-kernel-exec = { workspace = true }
+nt-nls = { workspace = true }
 nt-security = { workspace = true }
 nt-pe-loader = { workspace = true }
 nt-port-core = { workspace = true }

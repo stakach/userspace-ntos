@@ -192,39 +192,9 @@ pub const fn wide_is_xdigit(c: u32) -> u16 {
     wide_ctype(c, WCTYPE_HEX)
 }
 
-/// Decode one ReactOS three-level Unicode case table entry.
-///
-/// Each level contains `u16` offsets into the same table; the leaf is a signed delta from the
-/// original UTF-16 unit. A malformed or truncated table returns `None` instead of reading beyond
-/// the mapped NLS image.
-pub fn nls_case_map(table: &[u16], unit: u16) -> Option<u16> {
-    let high = *table.get((unit >> 8) as usize)? as usize;
-    let middle = *table.get(high.checked_add(((unit >> 4) & 0x0f) as usize)?)? as usize;
-    let delta = *table.get(middle.checked_add((unit & 0x0f) as usize)?)? as i16;
-    Some((unit as i32 + delta as i32) as u16)
-}
-
-/// Apply the ReactOS `RtlpUpcaseUnicodeChar` ASCII fast path and NLS-table lookup.
-pub fn wide_upcase_with_table(unit: u16, table: &[u16]) -> u16 {
-    if unit < b'a' as u16 {
-        unit
-    } else if unit <= b'z' as u16 {
-        unit - (b'a' - b'A') as u16
-    } else {
-        nls_case_map(table, unit).unwrap_or(unit)
-    }
-}
-
-/// Apply the ReactOS `RtlpDowncaseUnicodeChar` ASCII fast path and NLS-table lookup.
-pub fn wide_downcase_with_table(unit: u16, table: &[u16]) -> u16 {
-    if unit < b'A' as u16 {
-        unit
-    } else if unit <= b'Z' as u16 {
-        unit + (b'a' - b'A') as u16
-    } else {
-        nls_case_map(table, unit).unwrap_or(unit)
-    }
-}
+// Preserve nt-ntdll's public CRT API while sharing the bounded three-level case-table decoder with
+// kernel-side consumers through the neutral no_std crate.
+pub use nt_nls::{nls_case_map, wide_downcase_with_table, wide_upcase_with_table};
 
 fn ascii_fold_byte(c: u8) -> u8 {
     ascii_tolower(c as i32) as u8

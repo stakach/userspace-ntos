@@ -96,6 +96,25 @@ pub const WIN32K_KPCR_VA: u64 = WIN32K_DATA_VADDR + 0x2000;
 const WIN32K_SE_EXPORTS_VA: u64 = WIN32K_DATA_VADDR + 0x800;
 /// The SID blob pool the `SE_EXPORTS` pointer members reference (DATA page 0, after the struct).
 const WIN32K_SE_SID_POOL_VA: u64 = WIN32K_DATA_VADDR + 0xA00;
+const WIN32K_NLS_MB_TAG_VA: u64 = WIN32K_DATA_VADDR + 0x200;
+const WIN32K_NLS_STATE_VA: u64 = WIN32K_DATA_VADDR + 0x208;
+const WIN32K_NLS_STATE_MAGIC: u32 = u32::from_le_bytes(*b"NLS1");
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Win32kNlsState {
+    magic: u32,
+    ansi_size: u32,
+    oem_size: u32,
+    case_size: u32,
+    ansi_code_page: u16,
+    oem_code_page: u16,
+    ansi_multi_byte_index: u32,
+    ansi_wide_byte_offset: u32,
+    oem_multi_byte_index: u32,
+    upper_case_index: u32,
+    upper_case_len: u32,
+}
 /// Current-process win32 state (page 4): compatibility cells mirroring the selected runtime
 /// context + a copy of win32k's callout table (recorded by PsEstablishWin32Callouts).
 const SLOT_W32PROCESS: u64 = WIN32K_DATA_VADDR + 0x4000; // Ps{Set,Get}ProcessWin32Process slot
@@ -7211,10 +7230,10 @@ extern "win64" fn s_rtl_free_unicode_string(string: *mut u8) {
         let buffer = read_unaligned(string.add(8) as *const u64);
         if buffer != 0 {
             reclaiming_pool_free(buffer);
+            write_unaligned(string as *mut u16, 0);
+            write_unaligned((string as *mut u16).add(1), 0);
+            write_unaligned(string.add(8) as *mut u64, 0);
         }
-        write_unaligned(string as *mut u16, 0);
-        write_unaligned((string as *mut u16).add(1), 0);
-        write_unaligned(string.add(8) as *mut u64, 0);
     }
 }
 
@@ -7250,9 +7269,105 @@ extern "win64" fn s_rtl_create_unicode_string(dest: *mut u8, src: u64) -> u32 {
     1
 }
 
-/// `NTSTATUS RtlMultiByteToUnicodeN(PWCH Unicode, ULONG MaxBytes, PULONG BytesOut, PCSTR Mb, ULONG
-/// MbBytes)` — convert a multibyte string to UTF-16. Simplified to a zero-extending (ASCII/Latin-1)
-/// conversion, which is exact for font/face names. Backs win32k's EngMultiByteToUnicodeN forwarder.
+#[cold]
+fn nls_contract_trap() -> ! {
+    unsafe {
+        print_str(b"[win32k-nls] validated runtime state is unavailable\n");
+        core::arch::asm!("ud2", options(noreturn));
+    }
+}
+
+unsafe fn win32k_nls_state() -> Win32kNlsState {
+    let state = read_unaligned(WIN32K_NLS_STATE_VA as *const Win32kNlsState);
+    let ansi_mb_end = (state.ansi_multi_byte_index as usize)
+        .checked_mul(2)
+        .and_then(|offset| offset.checked_add(256 * 2));
+    let ansi_wide_end = (state.ansi_wide_byte_offset as usize).checked_add(0x1_0000);
+    let oem_mb_end = (state.oem_multi_byte_index as usize)
+        .checked_mul(2)
+        .and_then(|offset| offset.checked_add(256 * 2));
+    let upper_end = (state.upper_case_index as usize)
+        .checked_add(state.upper_case_len as usize)
+        .and_then(|words| words.checked_mul(2));
+    if state.magic != WIN32K_NLS_STATE_MAGIC
+        || state.ansi_code_page != 1252
+        || state.oem_code_page != 437
+        || state.ansi_size as u64 > NLS_ANSI_FRAMES * 0x1000
+        || state.oem_size as u64 > NLS_OEM_FRAMES * 0x1000
+        || state.case_size as u64 > NLS_CASE_FRAMES * 0x1000
+        || ansi_mb_end.map_or(true, |end| end > state.ansi_size as usize)
+        || ansi_wide_end.map_or(true, |end| end > state.ansi_size as usize)
+        || oem_mb_end.map_or(true, |end| end > state.oem_size as usize)
+        || upper_end.map_or(true, |end| end > state.case_size as usize)
+    {
+        nls_contract_trap();
+    }
+    state
+}
+
+unsafe fn nls_byte_to_unicode_table(base: u64, index: u32) -> &'static [u16] {
+    core::slice::from_raw_parts((base + index as u64 * 2) as *const u16, 256)
+}
+
+unsafe fn nls_unicode_to_byte_table(base: u64, byte_offset: u32) -> &'static [u8] {
+    core::slice::from_raw_parts((base + byte_offset as u64) as *const u8, 0x1_0000)
+}
+
+unsafe fn nls_upper_case_table(state: Win32kNlsState) -> &'static [u16] {
+    core::slice::from_raw_parts(
+        (NLS_CASE_VADDR + state.upper_case_index as u64 * 2) as *const u16,
+        state.upper_case_len as usize,
+    )
+}
+
+const STATUS_INVALID_PARAMETER_2: i32 = 0xC000_00F0u32 as i32;
+
+unsafe fn sbcs_to_unicode_n(
+    table: &[u16],
+    unicode: *mut u16,
+    max_bytes: u32,
+    bytes_out: *mut u32,
+    source: *const u8,
+    source_bytes: u32,
+) -> i32 {
+    let capacity = (max_bytes / 2) as usize;
+    let input_len = source_bytes as usize;
+    if (capacity != 0 && unicode.is_null()) || (input_len != 0 && source.is_null()) {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    let output: &mut [u16] = if capacity == 0 {
+        &mut []
+    } else {
+        core::slice::from_raw_parts_mut(unicode, capacity)
+    };
+    let input: &[u8] = if input_len == 0 {
+        &[]
+    } else {
+        core::slice::from_raw_parts(source, input_len)
+    };
+    let Some(written) = nt_nls::custom_cp_to_unicode_into(table, max_bytes as usize, input, output)
+    else {
+        nls_contract_trap();
+    };
+    if !bytes_out.is_null() {
+        write_unaligned(bytes_out, (written * 2) as u32);
+    }
+    0
+}
+
+/// `VOID RtlGetDefaultCodePage(PUSHORT Ansi, PUSHORT Oem)`.
+extern "win64" fn s_rtl_get_default_code_page(ansi: *mut u16, oem: *mut u16) {
+    unsafe {
+        let state = win32k_nls_state();
+        if ansi.is_null() || oem.is_null() {
+            nls_contract_trap();
+        }
+        write_unaligned(ansi, state.ansi_code_page);
+        write_unaligned(oem, state.oem_code_page);
+    }
+}
+
+/// `NTSTATUS RtlMultiByteToUnicodeN(...)`, backed by the validated CP1252 table.
 extern "win64" fn s_rtl_multibyte_to_unicode_n(
     unicode: *mut u16,
     max_bytes: u32,
@@ -7260,19 +7375,231 @@ extern "win64" fn s_rtl_multibyte_to_unicode_n(
     mb: *const u8,
     mb_bytes: u32,
 ) -> i32 {
-    let max_chars = (max_bytes / 2) as usize;
-    let n = (mb_bytes as usize).min(max_chars);
     unsafe {
-        if !unicode.is_null() && !mb.is_null() {
-            for i in 0..n {
-                core::ptr::write_unaligned(unicode.add(i), *mb.add(i) as u16);
-            }
-        }
-        if !bytes_out.is_null() {
-            core::ptr::write_unaligned(bytes_out, (n * 2) as u32);
-        }
+        let state = win32k_nls_state();
+        let table = nls_byte_to_unicode_table(NLS_ANSI_VADDR, state.ansi_multi_byte_index);
+        sbcs_to_unicode_n(table, unicode, max_bytes, bytes_out, mb, mb_bytes)
     }
-    0 // STATUS_SUCCESS
+}
+
+/// `NTSTATUS RtlOemToUnicodeN(...)`, backed by the validated CP437 table.
+extern "win64" fn s_rtl_oem_to_unicode_n(
+    unicode: *mut u16,
+    max_bytes: u32,
+    bytes_out: *mut u32,
+    oem: *const u8,
+    oem_bytes: u32,
+) -> i32 {
+    unsafe {
+        let state = win32k_nls_state();
+        let table = nls_byte_to_unicode_table(NLS_OEM_VADDR, state.oem_multi_byte_index);
+        sbcs_to_unicode_n(table, unicode, max_bytes, bytes_out, oem, oem_bytes)
+    }
+}
+
+/// `WCHAR RtlAnsiCharToUnicodeChar(PUCHAR *SourceCharacter)`.
+extern "win64" fn s_rtl_ansi_char_to_unicode_char(source_character: *mut u64) -> u16 {
+    unsafe {
+        if source_character.is_null() {
+            nls_contract_trap();
+        }
+        let source = read_unaligned(source_character);
+        if source == 0 {
+            nls_contract_trap();
+        }
+        let state = win32k_nls_state();
+        let table = nls_byte_to_unicode_table(NLS_ANSI_VADDR, state.ansi_multi_byte_index);
+        let result = table[read_volatile(source as *const u8) as usize];
+        write_unaligned(source_character, source + 1);
+        result
+    }
+}
+
+/// `WCHAR RtlUpcaseUnicodeChar(WCHAR Source)`.
+extern "win64" fn s_rtl_upcase_unicode_char(source: u16) -> u16 {
+    unsafe {
+        if source < b'a' as u16 {
+            return source;
+        }
+        if source <= b'z' as u16 {
+            return source - (b'a' - b'A') as u16;
+        }
+        let state = win32k_nls_state();
+        let table = nls_upper_case_table(state);
+        let Some(mapped) = nt_nls::nls_case_map(table, source) else {
+            nls_contract_trap();
+        };
+        mapped
+    }
+}
+
+/// `NTSTATUS RtlAnsiStringToUnicodeString(PUNICODE_STRING, PANSI_STRING, BOOLEAN)`.
+extern "win64" fn s_rtl_ansi_string_to_unicode_string(
+    destination: *mut u8,
+    source: *const u8,
+    allocate_destination: u8,
+) -> i32 {
+    unsafe {
+        if destination.is_null() || source.is_null() {
+            return STATUS_ACCESS_VIOLATION_I32;
+        }
+        let source_len = read_unaligned(source as *const u16) as usize;
+        let source_buffer = read_unaligned(source.add(8) as *const u64);
+        if source_len != 0 && source_buffer == 0 {
+            return STATUS_ACCESS_VIOLATION_I32;
+        }
+        let Some(required) = source_len.checked_add(1).and_then(|units| units.checked_mul(2)) else {
+            return STATUS_INVALID_PARAMETER_2;
+        };
+        if required > u16::MAX as usize {
+            return STATUS_INVALID_PARAMETER_2;
+        }
+        let output_len = required - 2;
+        write_unaligned(destination as *mut u16, output_len as u16);
+
+        let output_buffer = if allocate_destination != 0 {
+            write_unaligned((destination as *mut u16).add(1), required as u16);
+            write_unaligned(destination.add(8) as *mut u64, 0);
+            let buffer = reclaiming_pool_alloc(required as u64);
+            if buffer == 0 {
+                return STATUS_NO_MEMORY;
+            }
+            write_unaligned(destination.add(8) as *mut u64, buffer);
+            buffer
+        } else {
+            let maximum = read_unaligned((destination as *const u16).add(1)) as usize;
+            if output_len >= maximum {
+                return STATUS_BUFFER_OVERFLOW;
+            }
+            read_unaligned(destination.add(8) as *const u64)
+        };
+        if output_buffer == 0 {
+            return STATUS_ACCESS_VIOLATION_I32;
+        }
+
+        let mut written = 0u32;
+        let status = s_rtl_multibyte_to_unicode_n(
+            output_buffer as *mut u16,
+            output_len as u32,
+            &mut written,
+            source_buffer as *const u8,
+            source_len as u32,
+        );
+        if status != 0 {
+            if allocate_destination != 0 {
+                reclaiming_pool_free(output_buffer);
+                write_unaligned(destination.add(8) as *mut u64, 0);
+            }
+            return status;
+        }
+        write_unaligned((output_buffer + written as u64) as *mut u16, 0);
+        0
+    }
+}
+
+/// `NTSTATUS RtlUnicodeToMultiByteSize(PULONG, PCWCH, ULONG)` for the validated SBCS ANSI page.
+extern "win64" fn s_rtl_unicode_to_multibyte_size(
+    multibyte_size: *mut u32,
+    _unicode: *const u16,
+    unicode_bytes: u32,
+) -> i32 {
+    unsafe {
+        let _ = win32k_nls_state();
+        if multibyte_size.is_null() {
+            return STATUS_ACCESS_VIOLATION_I32;
+        }
+        write_unaligned(multibyte_size, unicode_bytes / 2);
+    }
+    0
+}
+
+/// `ULONG RtlxUnicodeStringToAnsiSize(PCUNICODE_STRING)`, including the terminator.
+extern "win64" fn s_rtlx_unicode_string_to_ansi_size(source: *const u8) -> u32 {
+    unsafe {
+        let _ = win32k_nls_state();
+        if source.is_null() {
+            nls_contract_trap();
+        }
+        read_unaligned(source as *const u16) as u32 / 2 + 1
+    }
+}
+
+/// `NTSTATUS RtlUnicodeStringToAnsiString(PANSI_STRING, PCUNICODE_STRING, BOOLEAN)`.
+extern "win64" fn s_rtl_unicode_string_to_ansi_string(
+    destination: *mut u8,
+    source: *const u8,
+    allocate_destination: u8,
+) -> i32 {
+    unsafe {
+        if destination.is_null() || source.is_null() {
+            return STATUS_ACCESS_VIOLATION_I32;
+        }
+        let source_bytes = read_unaligned(source as *const u16) as usize;
+        if source_bytes & 1 != 0 {
+            return STATUS_INVALID_PARAMETER_2;
+        }
+        let source_units = source_bytes / 2;
+        let source_buffer = read_unaligned(source.add(8) as *const u64);
+        if source_units != 0 && source_buffer == 0 {
+            return STATUS_ACCESS_VIOLATION_I32;
+        }
+        let required = source_units + 1;
+        if required > u16::MAX as usize {
+            return STATUS_INVALID_PARAMETER_2;
+        }
+        write_unaligned(destination as *mut u16, source_units as u16);
+        let (output_buffer, output_len, status) = if allocate_destination != 0 {
+            write_unaligned((destination as *mut u16).add(1), required as u16);
+            write_unaligned(destination.add(8) as *mut u64, 0);
+            let buffer = reclaiming_pool_alloc(required as u64);
+            if buffer == 0 {
+                return STATUS_NO_MEMORY;
+            }
+            write_unaligned(destination.add(8) as *mut u64, buffer);
+            (buffer, source_units, 0)
+        } else {
+            let maximum = read_unaligned((destination as *const u16).add(1)) as usize;
+            if maximum == 0 {
+                return STATUS_BUFFER_OVERFLOW;
+            }
+            let output_len = source_units.min(maximum - 1);
+            let status = if output_len != source_units {
+                write_unaligned(destination as *mut u16, output_len as u16);
+                STATUS_BUFFER_OVERFLOW
+            } else {
+                0
+            };
+            (
+                read_unaligned(destination.add(8) as *const u64),
+                output_len,
+                status,
+            )
+        };
+        if output_buffer == 0 {
+            return STATUS_ACCESS_VIOLATION_I32;
+        }
+        let state = win32k_nls_state();
+        let wide_table = nls_unicode_to_byte_table(
+            NLS_ANSI_VADDR,
+            state.ansi_wide_byte_offset,
+        );
+        let input: &[u16] = if source_units == 0 {
+            &[]
+        } else {
+            core::slice::from_raw_parts(source_buffer as *const u16, source_units)
+        };
+        let output: &mut [u8] = if output_len == 0 {
+            &mut []
+        } else {
+            core::slice::from_raw_parts_mut(output_buffer as *mut u8, output_len)
+        };
+        if nt_nls::unicode_to_custom_cp_into(wide_table, output_len, input, false, output).is_none()
+        {
+            nls_contract_trap();
+        }
+        write_volatile((output_buffer + output_len as u64) as *mut u8, 0);
+        status
+    }
 }
 /// `int _wcsnicmp(PCWSTR, PCWSTR, size_t)` — case-insensitive wide compare (0 = equal).
 extern "win64" fn s_wcsnicmp(a: u64, b: u64, n: u64) -> i32 {
@@ -8687,6 +9014,38 @@ fn register_trampolines() -> bool {
         "RtlMultiByteToUnicodeN",
         s_rtl_multibyte_to_unicode_n as usize as u64,
     );
+    reg.bind(
+        "RtlGetDefaultCodePage",
+        s_rtl_get_default_code_page as usize as u64,
+    );
+    reg.bind(
+        "RtlAnsiStringToUnicodeString",
+        s_rtl_ansi_string_to_unicode_string as usize as u64,
+    );
+    reg.bind(
+        "RtlUnicodeStringToAnsiString",
+        s_rtl_unicode_string_to_ansi_string as usize as u64,
+    );
+    reg.bind(
+        "RtlxUnicodeStringToAnsiSize",
+        s_rtlx_unicode_string_to_ansi_size as usize as u64,
+    );
+    reg.bind(
+        "RtlUnicodeToMultiByteSize",
+        s_rtl_unicode_to_multibyte_size as usize as u64,
+    );
+    reg.bind(
+        "RtlOemToUnicodeN",
+        s_rtl_oem_to_unicode_n as usize as u64,
+    );
+    reg.bind(
+        "RtlUpcaseUnicodeChar",
+        s_rtl_upcase_unicode_char as usize as u64,
+    );
+    reg.bind(
+        "RtlAnsiCharToUnicodeChar",
+        s_rtl_ansi_char_to_unicode_char as usize as u64,
+    );
     reg.bind("wcslen", s_wcslen as usize as u64);
     reg.bind("_wcsnicmp", s_wcsnicmp as usize as u64);
     reg.bind("wcsnicmp", s_wcsnicmp as usize as u64);
@@ -9026,8 +9385,8 @@ pub fn export_addr(name: &str) -> u64 {
 /// static (see [`object_type_cell_value`]) — their `0` here is a placeholder overridden in
 /// `load_into`. `SeExports` now points at a **real** `nt_security::se_exports` `SE_EXPORTS` struct
 /// ([`WIN32K_SE_EXPORTS_VA`], well-known SIDs + privilege LUIDs) built in `load_into` (backlog item 3,
-/// Se→nt-security); `NlsMbCodePageTag` still points at a zeroed placeholder (backlog: Nls data); the
-/// Mm boundary constants hold their x64 values directly.
+/// Se→nt-security); `NlsMbCodePageTag` points at the validated ANSI table's published DBCS flag;
+/// the Mm boundary constants hold their x64 values directly.
 const DATA_EXPORTS: &[(&str, u64)] = &[
     ("PsProcessType", 0),
     ("PsThreadType", 0),
@@ -9036,14 +9395,14 @@ const DATA_EXPORTS: &[(&str, u64)] = &[
     ("ExEventObjectType", 0),
     ("LpcPortObjectType", 0),
     ("SeExports", WIN32K_SE_EXPORTS_VA),
-    ("NlsMbCodePageTag", WIN32K_DATA_VADDR + 0x200),
+    ("NlsMbCodePageTag", WIN32K_NLS_MB_TAG_VA),
     ("MmSystemRangeStart", 0xFFFF_0800_0000_0000),
     ("MmUserProbeAddress", 0x0000_7FFF_FFFF_0000),
     ("MmHighestUserAddress", 0x0000_7FFF_FFFF_EFFF),
 ];
 
 /// Resolve an object-type data-export name to the address of its **real** `OBJECT_TYPE` static, or
-/// [`None`] for a non-object-type export (Se/Nls placeholder, Mm constant). win32k reads this value
+/// [`None`] for a non-object-type export (Se/NLS state or Mm constant). win32k reads this value
 /// out of the import cell as its `POBJECT_TYPE` type identity and, for the desktop / window-station
 /// types, writes its `->TypeInfo.{GenericMapping,ValidAccessMask,DefaultNonPagedPoolCharge}` fields
 /// into the struct (offsets +0xB0/+0xC0/+0xD0) — the `OBJECT_TYPE` static is sized and writable to
@@ -9275,11 +9634,91 @@ unsafe fn log_unresolved_gdi_driver_import(import_name: &[u8]) {
     print_str(b"\n");
 }
 
+unsafe fn reject_win32k_nls(reason: &[u8]) -> bool {
+    print_str(b"[win32k-nls] reject image: ");
+    print_str(reason);
+    print_str(b"\n");
+    false
+}
+
+unsafe fn validate_and_publish_win32k_nls(nls_sizes: [usize; 3]) -> bool {
+    let [ansi_size, oem_size, case_size] = nls_sizes;
+    if ansi_size == 0
+        || ansi_size & 1 != 0
+        || ansi_size as u64 > NLS_ANSI_FRAMES * 0x1000
+    {
+        return reject_win32k_nls(b"invalid c_1252.nls size");
+    }
+    if oem_size == 0 || oem_size & 1 != 0 || oem_size as u64 > NLS_OEM_FRAMES * 0x1000 {
+        return reject_win32k_nls(b"invalid c_437.nls size");
+    }
+    if case_size == 0 || case_size & 1 != 0 || case_size as u64 > NLS_CASE_FRAMES * 0x1000 {
+        return reject_win32k_nls(b"invalid l_intl.nls size");
+    }
+
+    let ansi = core::slice::from_raw_parts(NLS_ANSI_VADDR as *const u16, ansi_size / 2);
+    let oem = core::slice::from_raw_parts(NLS_OEM_VADDR as *const u16, oem_size / 2);
+    let case = core::slice::from_raw_parts(NLS_CASE_VADDR as *const u16, case_size / 2);
+    let Some(ansi_layout) = nt_nls::validate_sbcs_code_page(ansi, 1252) else {
+        return reject_win32k_nls(b"c_1252.nls is not a complete SBCS CP1252 table");
+    };
+    let Some(oem_layout) = nt_nls::validate_sbcs_code_page(oem, 437) else {
+        return reject_win32k_nls(b"c_437.nls is not a complete SBCS CP437 table");
+    };
+    let Some(case_layout) = nt_nls::validate_case_table(case) else {
+        return reject_win32k_nls(b"l_intl.nls contains an invalid case-map offset");
+    };
+
+    let ansi_bytes = core::slice::from_raw_parts(NLS_ANSI_VADDR as *const u8, ansi_size);
+    let ansi_wide_offset = ansi_layout.wide_char_index * 2;
+    if ansi[ansi_layout.multi_byte_index + 0x80] != 0x20ac
+        || ansi_bytes[ansi_wide_offset + 0x20ac] != 0x80
+    {
+        return reject_win32k_nls(b"c_1252.nls conversion tables disagree");
+    }
+    if oem[oem_layout.multi_byte_index + 0x80] != 0x00c7 {
+        return reject_win32k_nls(b"c_437.nls byte table has the wrong identity");
+    }
+    let upper = &case[case_layout.upper_index..case_layout.upper_index + case_layout.upper_len];
+    if nt_nls::wide_upcase_with_table(0x00e9, upper) != 0x00c9 {
+        return reject_win32k_nls(b"l_intl.nls uppercase table has the wrong identity");
+    }
+
+    let (Ok(ansi_size), Ok(oem_size), Ok(case_size)) = (
+        u32::try_from(ansi_size),
+        u32::try_from(oem_size),
+        u32::try_from(case_size),
+    ) else {
+        return reject_win32k_nls(b"NLS file size cannot be published");
+    };
+    let state = Win32kNlsState {
+        magic: WIN32K_NLS_STATE_MAGIC,
+        ansi_size,
+        oem_size,
+        case_size,
+        ansi_code_page: ansi_layout.code_page,
+        oem_code_page: oem_layout.code_page,
+        ansi_multi_byte_index: ansi_layout.multi_byte_index as u32,
+        ansi_wide_byte_offset: ansi_wide_offset as u32,
+        oem_multi_byte_index: oem_layout.multi_byte_index as u32,
+        upper_case_index: case_layout.upper_index as u32,
+        upper_case_len: case_layout.upper_len as u32,
+    };
+    write_volatile(WIN32K_NLS_MB_TAG_VA as *mut u8, ansi_layout.dbcs_code_page as u8);
+    write_unaligned(WIN32K_NLS_STATE_VA as *mut Win32kNlsState, state);
+    print_str(b"[win32k-nls] validated CP1252/CP437/l_intl tables\n");
+    true
+}
+
 /// Runs in the EXECUTIVE. `src_va`/`src_size` name the raw win32k.sys staged in WIN32KBUF; the
 /// image frames are mapped RW at [`WIN32K_CODE_VA`] and the DATA region at [`WIN32K_DATA_VADDR`].
 /// Copy the sections into their virtual offsets, apply DIR64 relocs, initialise the data-export
-/// cells + placeholders, patch the IAT. Fills [`CODE_RIGHTS`]. Returns the DriverEntry RVA.
-pub unsafe fn load_into(src_va: u64, _src_size: usize) -> Option<u32> {
+/// cells, validate and publish the mapped NLS tables, then patch the IAT. Fills [`CODE_RIGHTS`].
+/// Returns the DriverEntry RVA.
+pub unsafe fn load_into(src_va: u64, _src_size: usize, nls_sizes: [usize; 3]) -> Option<u32> {
+    if !validate_and_publish_win32k_nls(nls_sizes) {
+        return None;
+    }
     let e = read_unaligned((src_va + 0x3c) as *const u32) as u64; // e_lfanew
     let nt = src_va + e; // "PE\0\0"
     if read_unaligned(nt as *const u32) != 0x0000_4550 {
