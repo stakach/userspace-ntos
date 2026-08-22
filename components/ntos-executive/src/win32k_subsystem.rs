@@ -40,7 +40,12 @@ use nt_compat_exports::{
 };
 
 // Pure, driver-agnostic ntoskrnl byte/string primitives shared with the FSD class.
-use crate::ntoskrnl_shared::{s_memcpy, s_memmove, s_memset, s_wcslen};
+use crate::ntoskrnl_shared::{
+    s_ex_query_depth_slist, s_exp_interlocked_pop_entry_slist,
+    s_exp_interlocked_push_entry_slist, s_ke_query_performance_counter, s_memcpy, s_memmove,
+    s_memset, s_rtl_compare_memory, s_rtl_integer_to_unicode_string, s_rtl_time_to_time_fields,
+    s_rtl_unicode_string_to_integer, s_wcslen,
+};
 
 use crate::*;
 
@@ -665,10 +670,10 @@ unsafe fn pool_alloc(size: u64) -> u64 {
     start
 }
 
-/// A SEPARATE arena for FreeType (ftfd) allocations. FreeType's ReactOS glue allocates through
-/// `EngAllocMem(TAG_FREETYPE)` and frees through `EngFreeMem`, so unlike the main win32k pool this
-/// arena must reclaim blocks or each GUI client consumes the whole window while probing fonts.
-/// Counter at +0, address-ordered free-list head at +8, payload starts at +0x1000.
+/// A separate reclaiming arena for allocations with explicit lifetime. FreeType first required it
+/// for `EngAllocMem(TAG_FREETYPE)` churn; allocated RTL strings use the same allocator so
+/// `RtlFreeUnicodeString` has matching ownership. Counter at +0, address-ordered free-list head at
+/// +8, payload starts at +0x1000.
 pub const WIN32K_FTYP_VADDR: u64 = 0x0000_0100_0B00_0000;
 pub const WIN32K_FTYP_FRAMES: u64 = 512; // 2 MiB (own window, pre-mapped)
 /// FreeType's `EngAllocMem` tag ('FTYP', little-endian) — see the ftfd ft_alloc disasm.
@@ -681,7 +686,7 @@ fn align16(size: u64) -> u64 {
     (size + 15) & !15
 }
 
-unsafe fn ftyp_alloc(size: u64) -> u64 {
+unsafe fn reclaiming_pool_alloc(size: u64) -> u64 {
     if size == 0 {
         return 0;
     }
@@ -734,7 +739,7 @@ unsafe fn ftyp_alloc(size: u64) -> u64 {
     hdr + FTYP_HDR_SIZE
 }
 
-unsafe fn ftyp_free(p: u64) {
+unsafe fn reclaiming_pool_free(p: u64) {
     let arena_start = WIN32K_FTYP_VADDR + POOL_DATA_OFF;
     let arena_end = WIN32K_FTYP_VADDR + WIN32K_FTYP_FRAMES * 0x1000;
     if p < arena_start + FTYP_HDR_SIZE || p >= arena_end || (p & 15) != 0 {
@@ -4439,7 +4444,7 @@ extern "win64" fn s_mm_map_view_of_section(
 extern "win64" fn s_ex_alloc_pool_with_tag(_pool: u64, size: u64, tag: u64) -> u64 {
     unsafe {
         if (tag as u32) as u64 == FTYP_TAG {
-            ftyp_alloc(size)
+            reclaiming_pool_alloc(size)
         } else {
             pool_alloc(size)
         }
@@ -4625,7 +4630,7 @@ extern "win64" fn s_vdbg_print_ex_with_prefix(
 /// dedicated FTYP arena has real frees because ReactOS ftfd alloc/free churns heavily per client.
 extern "win64" fn s_ex_free_pool_with_tag(p: u64, _tag: u64) {
     unsafe {
-        ftyp_free(p);
+        reclaiming_pool_free(p);
     }
 }
 
@@ -7075,32 +7080,146 @@ extern "win64" fn s_rtl_equal_unicode_string(
 /// `NTSTATUS RtlAppendUnicodeToString(PUNICODE_STRING Dest, PCWSTR Src)` — append a wide string.
 extern "win64" fn s_rtl_append_unicode_to_string(dest: *mut u8, src: u64) -> i32 {
     if dest.is_null() {
+        return STATUS_INVALID_PARAMETER_I32;
+    }
+    if src == 0 {
         return 0;
     }
     unsafe {
         let max = read_unaligned((dest as *const u16).add(1)) as u64; // MaximumLength (bytes)
         let buf = read_unaligned(dest.add(8) as *const u64);
-        if buf == 0 || src == 0 {
-            return 0;
+        let current = read_unaligned(dest as *const u16) as u64;
+        let source_bytes = s_wcslen(src).saturating_mul(2);
+        if source_bytes > max.saturating_sub(current) {
+            return STATUS_BUFFER_TOO_SMALL_I32;
         }
-        let mut pos = read_unaligned(dest as *const u16) as u64; // current Length (bytes)
-        let mut w = 0u64;
-        loop {
-            let c = read_unaligned((src + w * 2) as *const u16);
-            if c == 0 || pos + 2 > max {
-                break;
-            }
-            write_unaligned((buf + pos) as *mut u16, c);
-            pos += 2;
-            w += 1;
+        if source_bytes != 0 && buf == 0 {
+            return STATUS_ACCESS_VIOLATION_I32;
         }
-        write_unaligned(dest as *mut u16, pos as u16); // new Length
+        let mut offset = 0u64;
+        while offset < source_bytes {
+            write_unaligned(
+                (buf + current + offset) as *mut u16,
+                read_unaligned((src + offset) as *const u16),
+            );
+            offset += 2;
+        }
+        let length = current + source_bytes;
+        write_unaligned(dest as *mut u16, length as u16);
+        if max > length {
+            write_unaligned((buf + length) as *mut u16, 0);
+        }
     }
     0
 }
+
+/// `NTSTATUS RtlAppendUnicodeStringToString(PUNICODE_STRING, PCUNICODE_STRING)`.
+extern "win64" fn s_rtl_append_unicode_string_to_string(dest: *mut u8, src: *const u8) -> i32 {
+    if dest.is_null() || src.is_null() {
+        return STATUS_INVALID_PARAMETER_I32;
+    }
+    unsafe {
+        let source_length = read_unaligned(src as *const u16) as u64;
+        let source_buffer = read_unaligned(src.add(8) as *const u64);
+        let length = read_unaligned(dest as *const u16) as u64;
+        let maximum = read_unaligned((dest as *const u16).add(1)) as u64;
+        let buffer = read_unaligned(dest.add(8) as *const u64);
+        if source_length > maximum.saturating_sub(length) {
+            return STATUS_BUFFER_TOO_SMALL_I32;
+        }
+        if source_length != 0 && (source_buffer == 0 || buffer == 0) {
+            return STATUS_ACCESS_VIOLATION_I32;
+        }
+        let mut offset = 0u64;
+        while offset < source_length {
+            write_volatile(
+                (buffer + length + offset) as *mut u8,
+                read_volatile((source_buffer + offset) as *const u8),
+            );
+            offset += 1;
+        }
+        let new_length = length + source_length;
+        write_unaligned(dest as *mut u16, new_length as u16);
+        if maximum > new_length {
+            write_unaligned((buffer + new_length) as *mut u16, 0);
+        }
+    }
+    0
+}
+
+/// `NTSTATUS RtlFormatCurrentUserKeyPath(PUNICODE_STRING)`.
+extern "win64" fn s_rtl_format_current_user_key_path(key_path: *mut u8) -> i32 {
+    const PREFIX: &[u8] = b"\\Registry\\User\\";
+    if key_path.is_null() {
+        return STATUS_INVALID_PARAMETER_I32;
+    }
+    unsafe {
+        write_unaligned(key_path as *mut u16, 0);
+        write_unaligned((key_path as *mut u16).add(1), 0);
+        write_unaligned(key_path.add(8) as *mut u64, 0);
+
+        let Some(process_index) = current_process_context_index() else {
+            return STATUS_NO_TOKEN_I32;
+        };
+        let token = ensure_primary_token_object(process_index);
+        if token == 0 {
+            return STATUS_NO_TOKEN_I32;
+        }
+        let mut native_sid = [0u8; WIN32K_TOKEN_USER_SID_MAX];
+        let Some(native_sid_len) = primary_token_user_sid(token, &mut native_sid) else {
+            return STATUS_NO_TOKEN_I32;
+        };
+
+        let mut path = [0u16; 208];
+        for (unit, byte) in path.iter_mut().zip(PREFIX) {
+            *unit = *byte as u16;
+        }
+        let sid_units = match nt_security::write_native_sid_sddl_utf16(
+            &native_sid[..native_sid_len],
+            &mut path[PREFIX.len()..],
+        ) {
+            Ok(units) => units,
+            Err(status) => return status as i32,
+        };
+        let units = PREFIX.len() + sid_units;
+        let bytes = units * 2;
+        let allocation_bytes = bytes + 2;
+        let buffer = reclaiming_pool_alloc(allocation_bytes as u64);
+        if buffer == 0 {
+            return STATUS_NO_MEMORY;
+        }
+        for (index, unit) in path[..units].iter().enumerate() {
+            write_unaligned((buffer + index as u64 * 2) as *mut u16, *unit);
+        }
+        write_unaligned((buffer + bytes as u64) as *mut u16, 0);
+        write_unaligned(key_path as *mut u16, bytes as u16);
+        write_unaligned(
+            (key_path as *mut u16).add(1),
+            allocation_bytes as u16,
+        );
+        write_unaligned(key_path.add(8) as *mut u64, buffer);
+    }
+    0
+}
+
+/// `VOID RtlFreeUnicodeString(PUNICODE_STRING)`.
+extern "win64" fn s_rtl_free_unicode_string(string: *mut u8) {
+    if string.is_null() {
+        return;
+    }
+    unsafe {
+        let buffer = read_unaligned(string.add(8) as *const u64);
+        if buffer != 0 {
+            reclaiming_pool_free(buffer);
+        }
+        write_unaligned(string as *mut u16, 0);
+        write_unaligned((string as *mut u16).add(1), 0);
+        write_unaligned(string.add(8) as *mut u64, 0);
+    }
+}
+
 /// `BOOLEAN RtlCreateUnicodeString(PUNICODE_STRING Dest, PCWSTR Src)` — allocate a NUL-terminated
-/// copy of `Src` from the win32k pool and point `Dest` at it. Returns TRUE on success. win32k's font
-/// init logs "RtlCreateUnicodeString failed" if this returns FALSE, so it must really allocate+copy.
+/// copy of `Src` from the reclaiming win32k pool and point `Dest` at it. Returns TRUE on success.
 extern "win64" fn s_rtl_create_unicode_string(dest: *mut u8, src: u64) -> u32 {
     if dest.is_null() {
         return 0;
@@ -7114,7 +7233,7 @@ extern "win64" fn s_rtl_create_unicode_string(dest: *mut u8, src: u64) -> u32 {
             }
         }
         let bytes = n * 2;
-        let buf = pool_alloc(bytes + 2); // + NUL wchar
+        let buf = reclaiming_pool_alloc(bytes + 2); // + NUL wchar
         if buf == 0 {
             return 0;
         }
@@ -8549,6 +8668,18 @@ fn register_trampolines() -> bool {
         s_rtl_append_unicode_to_string as usize as u64,
     );
     reg.bind(
+        "RtlAppendUnicodeStringToString",
+        s_rtl_append_unicode_string_to_string as usize as u64,
+    );
+    reg.bind(
+        "RtlFormatCurrentUserKeyPath",
+        s_rtl_format_current_user_key_path as usize as u64,
+    );
+    reg.bind(
+        "RtlFreeUnicodeString",
+        s_rtl_free_unicode_string as usize as u64,
+    );
+    reg.bind(
         "RtlCreateUnicodeString",
         s_rtl_create_unicode_string as usize as u64,
     );
@@ -8559,6 +8690,19 @@ fn register_trampolines() -> bool {
     reg.bind("wcslen", s_wcslen as usize as u64);
     reg.bind("_wcsnicmp", s_wcsnicmp as usize as u64);
     reg.bind("wcsnicmp", s_wcsnicmp as usize as u64);
+    reg.bind("RtlCompareMemory", s_rtl_compare_memory as usize as u64);
+    reg.bind(
+        "RtlIntegerToUnicodeString",
+        s_rtl_integer_to_unicode_string as usize as u64,
+    );
+    reg.bind(
+        "RtlUnicodeStringToInteger",
+        s_rtl_unicode_string_to_integer as usize as u64,
+    );
+    reg.bind(
+        "RtlTimeToTimeFields",
+        s_rtl_time_to_time_fields as usize as u64,
+    );
     // --- batch 2: real va_list DbgPrintEx backend (nt_kernel_exec::dbg) ---
     reg.bind(
         "vDbgPrintExWithPrefix",
@@ -8592,6 +8736,18 @@ fn register_trampolines() -> bool {
     reg.bind(
         "ExInitializeNPagedLookasideList",
         s_ex_init_npaged_lookaside as usize as u64,
+    );
+    reg.bind(
+        "ExpInterlockedPushEntrySList",
+        s_exp_interlocked_push_entry_slist as usize as u64,
+    );
+    reg.bind(
+        "ExpInterlockedPopEntrySList",
+        s_exp_interlocked_pop_entry_slist as usize as u64,
+    );
+    reg.bind(
+        "ExQueryDepthSList",
+        s_ex_query_depth_slist as usize as u64,
     );
     // --- batch 3: Zw virtual-memory / registry / file (canned; see backlog) ---
     reg.bind(
@@ -8733,6 +8889,10 @@ fn register_trampolines() -> bool {
     reg.bind(
         "KeAddSystemServiceTable",
         s_ke_add_system_service_table as usize as u64,
+    );
+    reg.bind(
+        "KeQueryPerformanceCounter",
+        s_ke_query_performance_counter as usize as u64,
     );
     reg.bind("DbgPrint", s_dbg_print as usize as u64);
     // --- batch 4: resource / lock acquire → BOOLEAN TRUE (single-threaded host: always acquired) ---

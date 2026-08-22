@@ -1,4 +1,5 @@
 use super::*;
+use alloc::string::String;
 use alloc::vec;
 
 const MACHINE: u32 = 0x1234;
@@ -85,6 +86,34 @@ fn sid_sddl_preserves_large_identifier_authority() {
         sub_authorities: Vec::new(),
     };
     assert_eq!(sid.to_sddl(), "S-1-0x010203040506");
+}
+
+#[test]
+fn native_sid_formats_into_caller_owned_utf16() {
+    let sid = Sid::local_account(4660, 1000);
+    let mut native = [0u8; 68];
+    let native_len = sid.write_native(&mut native).unwrap();
+    let mut output = [0u16; 64];
+    let written = write_native_sid_sddl_utf16(&native[..native_len], &mut output).unwrap();
+    assert_eq!(
+        String::from_utf16(&output[..written]).unwrap(),
+        "S-1-5-21-4660-1000"
+    );
+}
+
+#[test]
+fn native_sid_formatter_preserves_large_authority_and_bounds_checks() {
+    let native = [1, 0, 1, 2, 3, 4, 5, 6];
+    let mut output = [0u16; 32];
+    let written = write_native_sid_sddl_utf16(&native, &mut output).unwrap();
+    assert_eq!(
+        String::from_utf16(&output[..written]).unwrap(),
+        "S-1-0x010203040506"
+    );
+    assert_eq!(
+        write_native_sid_sddl_utf16(&native, &mut output[..4]),
+        Err(0xC000_0023)
+    );
 }
 
 #[test]

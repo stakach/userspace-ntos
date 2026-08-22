@@ -25,7 +25,7 @@ pub const HAL: &[ExportDescriptor] = &[
         Partial,
         "updates simulated IRQL; no preemption",
     ),
-    // Timing (stub: no real timing source yet).
+    // Timing.
     e(
         "KeStallExecutionProcessor",
         StubSuccess,
@@ -33,8 +33,8 @@ pub const HAL: &[ExportDescriptor] = &[
     ),
     e(
         "KeQueryPerformanceCounter",
-        StubSuccess,
-        "returns a monotonic-ish counter; frequency is nominal",
+        Partial,
+        "executive monotonic 100ns clock with a matching 10MHz frequency",
     ),
     // Bus/hardware access (fail-fast).
     e("HalGetBusData", Unsupported, ""),

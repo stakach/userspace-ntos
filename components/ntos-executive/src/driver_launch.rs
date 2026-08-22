@@ -99,7 +99,10 @@ use nt_video_miniport::{
 
 // Pure, driver-agnostic ntoskrnl byte/string primitives shared with the Subsystem (win32k) class.
 use crate::ntoskrnl_shared::{
-    s_memcpy, s_memmove, s_memset, s_rtl_compare_memory, s_wcsicmp, s_wcslen,
+    s_ex_query_depth_slist, s_exp_interlocked_pop_entry_slist,
+    s_exp_interlocked_push_entry_slist, s_ke_query_performance_counter, s_memcpy, s_memmove,
+    s_memset, s_rtl_compare_memory, s_rtl_integer_to_unicode_string,
+    s_rtl_unicode_string_to_integer, s_rtl_upcase_unicode_char, s_wcsicmp, s_wcslen,
 };
 
 use crate::*;
@@ -5279,108 +5282,6 @@ extern "win64" fn s_rtl_compare_string(left: u64, right: u64, case_insensitive: 
     }
 }
 
-/// `NTSTATUS RtlIntegerToUnicodeString(ULONG Value, ULONG Base, PUNICODE_STRING String)`.
-extern "win64" fn s_rtl_integer_to_unicode_string(value: u32, base: u32, dst: u64) -> i32 {
-    if dst == 0 {
-        return STATUS_INVALID_PARAMETER;
-    }
-    let radix = if base == 0 { 10 } else { base };
-    if !(2..=16).contains(&radix) {
-        return STATUS_INVALID_PARAMETER;
-    }
-    unsafe {
-        let max_len =
-            read_unaligned((dst + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16) & !1;
-        let buf = read_unaligned((dst + UNICODE_STRING_BUFFER_OFFSET) as *const u64);
-        if buf == 0 {
-            return STATUS_INVALID_PARAMETER;
-        }
-        let mut tmp = [0u16; 32];
-        let mut n = 0usize;
-        let mut v = value;
-        loop {
-            let d = (v % radix) as u8;
-            tmp[n] = if d < 10 {
-                (b'0' + d) as u16
-            } else {
-                (b'A' + d - 10) as u16
-            };
-            n += 1;
-            v /= radix;
-            if v == 0 {
-                break;
-            }
-        }
-        let need = (n * 2) as u16;
-        if need > max_len {
-            return STATUS_BUFFER_TOO_SMALL;
-        }
-        let mut i = 0usize;
-        while i < n {
-            write_unaligned((buf + (i as u64) * 2) as *mut u16, tmp[n - 1 - i]);
-            i += 1;
-        }
-        write_unaligned((dst + UNICODE_STRING_LENGTH_OFFSET) as *mut u16, need);
-        if need <= max_len.saturating_sub(2) {
-            write_unaligned((buf + need as u64) as *mut u16, 0);
-        }
-    }
-    STATUS_SUCCESS
-}
-
-/// `NTSTATUS RtlUnicodeStringToInteger(PCUNICODE_STRING String, ULONG Base, PULONG Value)`.
-extern "win64" fn s_rtl_unicode_string_to_integer(src: u64, base: u32, value_out: u64) -> i32 {
-    if src == 0 || value_out == 0 {
-        return STATUS_INVALID_PARAMETER;
-    }
-    let mut radix = if base == 0 { 10 } else { base };
-    if !(2..=16).contains(&radix) {
-        return STATUS_INVALID_PARAMETER;
-    }
-    unsafe {
-        let (len, _max, buf) = unicode_string_triplet(src).unwrap_or((0, 0, 0));
-        if len != 0 && buf == 0 {
-            return STATUS_INVALID_PARAMETER;
-        }
-        let chars = (len / 2) as u64;
-        let mut i = 0u64;
-        while i < chars && read_unaligned((buf + i * 2) as *const u16) == b' ' as u16 {
-            i += 1;
-        }
-        if base == 0
-            && i + 1 < chars
-            && read_unaligned((buf + i * 2) as *const u16) == b'0' as u16
-            && ascii_upcase_u16(read_unaligned((buf + (i + 1) * 2) as *const u16)) == b'X' as u16
-        {
-            radix = 16;
-            i += 2;
-        }
-        let mut value = 0u32;
-        let mut saw_digit = false;
-        while i < chars {
-            let c = ascii_upcase_u16(read_unaligned((buf + i * 2) as *const u16));
-            let digit = if (b'0' as u16..=b'9' as u16).contains(&c) {
-                c - b'0' as u16
-            } else if (b'A' as u16..=b'F' as u16).contains(&c) {
-                c - b'A' as u16 + 10
-            } else {
-                break;
-            };
-            if digit as u32 >= radix {
-                break;
-            }
-            value = value.saturating_mul(radix).saturating_add(digit as u32);
-            saw_digit = true;
-            i += 1;
-        }
-        if !saw_digit {
-            return STATUS_INVALID_PARAMETER;
-        }
-        write_unaligned(value_out as *mut u32, value);
-    }
-    STATUS_SUCCESS
-}
-
 /// `wcsncmp`.
 extern "win64" fn s_wcsncmp(left: u64, right: u64, count: u64) -> i32 {
     unsafe {
@@ -9388,35 +9289,6 @@ extern "win64" fn s_ex_interlocked_add_ulong(addend: u64, increment: u32, _lock:
     }
 }
 
-/// `PSLIST_ENTRY ExpInterlockedPushEntrySList(PSLIST_HEADER, PSLIST_ENTRY)`.
-extern "win64" fn s_exp_interlocked_push_entry_slist(head: u64, entry: u64) -> u64 {
-    if head == 0 || entry == 0 {
-        return 0;
-    }
-    unsafe {
-        let old = read_unaligned(head as *const u64);
-        write_unaligned(entry as *mut u64, old);
-        write_unaligned(head as *mut u64, entry);
-        old
-    }
-}
-
-/// `PSLIST_ENTRY ExpInterlockedPopEntrySList(PSLIST_HEADER)`.
-extern "win64" fn s_exp_interlocked_pop_entry_slist(head: u64) -> u64 {
-    if head == 0 {
-        return 0;
-    }
-    unsafe {
-        let old = read_unaligned(head as *const u64);
-        if old != 0 {
-            let next = read_unaligned(old as *const u64);
-            write_unaligned(head as *mut u64, next);
-            write_unaligned(old as *mut u64, 0);
-        }
-        old
-    }
-}
-
 /// `VOID ExQueueWorkItem(PWORK_QUEUE_ITEM, WORK_QUEUE_TYPE)`.
 extern "win64" fn s_ex_queue_work_item(work_item: u64, _queue_type: u32) {
     if work_item == 0 {
@@ -10220,16 +10092,6 @@ extern "win64" fn s_ke_query_system_time(out: u64) {
     }
 }
 
-/// `LARGE_INTEGER KeQueryPerformanceCounter(PLARGE_INTEGER Frequency)`.
-extern "win64" fn s_ke_query_performance_counter(freq_out: u64) -> u64 {
-    if freq_out != 0 {
-        unsafe {
-            write_unaligned(freq_out as *mut u64, 10_000_000);
-        }
-    }
-    monotonic_time_100ns()
-}
-
 const KDPC_DEFERRED_ROUTINE_OFFSET: u64 = 0x18;
 const KDPC_DEFERRED_CONTEXT_OFFSET: u64 = 0x20;
 const KDPC_SYSTEM_ARGUMENT1_OFFSET: u64 = 0x28;
@@ -10493,14 +10355,6 @@ extern "win64" fn s_ex_is_resource_acquired_exclusive_lite(_res: u64) -> u8 {
     1
 }
 
-/// `USHORT ExQueryDepthSList(PSLIST_HEADER)`.
-extern "win64" fn s_ex_query_depth_slist(head: u64) -> u16 {
-    if head == 0 {
-        return 0;
-    }
-    unsafe { read_unaligned(head as *const u16) }
-}
-
 /// A GENERAL_LOOKASIDE default allocate callback.
 extern "win64" fn s_lookaside_alloc(_pool_type: u64, size: u64, _tag: u64) -> u64 {
     unsafe { pool_alloc(size) }
@@ -10695,16 +10549,6 @@ extern "win64" fn s_rtl_are_bits_clear(bm: u64, start: u32, count: u32) -> u8 {
         1
     } else {
         0
-    }
-}
-
-/// `WCHAR RtlUpcaseUnicodeChar(WCHAR)` — ASCII upcase (the pipe namespace is ASCII).
-extern "win64" fn s_rtl_upcase_char(c: u64) -> u64 {
-    let w = c as u16;
-    if (b'a' as u16..=b'z' as u16).contains(&w) {
-        (w - 32) as u64
-    } else {
-        w as u64
     }
 }
 
@@ -24156,7 +24000,7 @@ fn register_fsd_trampolines() -> bool {
     );
     reg.bind(
         "RtlUpcaseUnicodeChar",
-        s_rtl_upcase_char as *const () as usize as u64,
+        s_rtl_upcase_unicode_char as *const () as usize as u64,
     );
     reg.bind("ZwClose", s_zw_close as *const () as usize as u64);
     reg.bind("ZwOpenKey", s_zw_open_key as *const () as usize as u64);

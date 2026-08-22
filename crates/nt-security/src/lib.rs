@@ -42,7 +42,7 @@ pub use native_sd::{
     SACL_SECURITY_INFORMATION, STATUS_INVALID_SECURITY_DESCR, STATUS_UNKNOWN_REVISION,
     UNPROTECTED_DACL_SECURITY_INFORMATION, UNPROTECTED_SACL_SECURITY_INFORMATION,
 };
-pub use sid::{Luid, Sid};
+pub use sid::{write_native_sid_sddl_utf16, Luid, Sid};
 pub use token::{
     AccessToken, PrivilegeAdjustment, PrivilegeAdjustmentSummary, SecurityImpersonationLevel,
     TokenGroup, TokenId, TokenPrivilege, TokenSource, TokenStatistics, TokenStore, TokenType,

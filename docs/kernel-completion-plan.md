@@ -9689,3 +9689,41 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     next no-fallback target is to bind the remainder of win32k's declared NT import surface to real
     implementations, then remove `s_zero` and make unknown imports reject the image with a named
     diagnostic. Do not replace that work with generic success/failure stubs.
+
+    Win32k native-import audit and shared leaf checkpoint (2026-08-22): the declared native
+    contract is 224 `ntoskrnl.exe` imports plus the one HAL performance-counter import. Before this
+    slice, 100 code imports were not registered and therefore reached `s_zero`; a further 14
+    declared imports were registered to explicit `s_true`/`s_void`/canned-failure helpers. The
+    first genuine leaf tranche now binds nine previously unresolved imports: allocation-free
+    `RtlIntegerToUnicodeString`, `RtlUnicodeStringToInteger`, `RtlCompareMemory`, native counted
+    `RtlAppendUnicodeStringToString`, host-tested NT calendar `RtlTimeToTimeFields`, all three x64
+    `SLIST_HEADER` push/pop/depth operations, and `KeQueryPerformanceCounter` backed by the
+    executive monotonic 100ns clock with its matching 10MHz frequency. The SList primitive lives in
+    `nt-kernel-exec` with native depth/sequence/header encoding and host tests; the pure ABI
+    trampolines live once in `ntoskrnl_shared`, and the duplicated hosted-driver integer, SList, and
+    performance-counter bodies were removed. The existing `RtlAppendUnicodeToString` path was also
+    corrected from silent truncation to the native bounds-checked contract. The first desktop proof
+    `.tmp/run-desktop-win32k-import-contract-20260822.log` was correctly rejected: the newly real
+    append exposed `RtlFormatCurrentUserKeyPath` still returning synthetic success through `s_zero`,
+    so ReactOS passed its uninitialized output descriptor into the append at win32k RVA `0x3c0c9`.
+    The upstream pair is now real: `RtlFormatCurrentUserKeyPath` formats the selected process token's
+    native SID through allocation-free, host-tested `nt-security` logic into an owned
+    `\Registry\User\<SID>` string, and `RtlFreeUnicodeString` returns that buffer through the matching
+    reclaiming allocator and clears the descriptor. `RtlCreateUnicodeString` uses that allocator too.
+    The accepted serialized proof `.tmp/run-desktop-win32k-current-user-path-20260822.log` reaches
+    genuine Explorer shell chrome and the sentinel with `293/293`; the win32k registry grows from
+    `166` to `177` real bindings, Explorer receives 665 api0 redirects without callback failures,
+    and all 786,432 framebuffer pixels are non-background with at least 32 colors. Validation is
+    green for `cargo fmt --all -- --check`, `cargo test -p nt-security` (`61/61`), `cargo test -p
+    nt-kernel-exec` (`159/159`), `cargo test -p nt-compat-exports` (`35/35`), executive `cargo check
+    --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff
+    --check`. The audit deliberately leaves `RtlUpcaseUnicodeChar` and `RtlAnsiCharToUnicodeChar`
+    unresolved until they use the staged NLS tables; ASCII/Latin-1 widening is not counted as
+    complete. Review adjustment: 89 code imports remain genuinely unresolved, plus the
+    placeholder-bound set. The next ownership slice is now the genuine NLS boundary: extract the
+    allocation-free table parser/case mapper into a neutral crate, map and validate staged
+    c_1252/c_437/l_intl read-only in the win32k component, and bind the complete related RTL family.
+    Then implement shared `ERESOURCE`, critical-region, and `FAST_MUTEX` semantics, object-body
+    reference counts, and the generic hosted-kernel call broker for stateful CM, memory, process,
+    I/O, LPC, and section services. Keep `export_addr` fail-closed conversion as the final switch
+    after unresolved and placeholder-bound coverage both reach zero.

@@ -31,6 +31,7 @@ pub mod rtl_time;
 mod runtime;
 mod semaphore;
 pub mod session_section;
+pub mod slist;
 mod spin;
 mod timer;
 pub mod timezone;

@@ -8,7 +8,94 @@ const SID_REVISION: u8 = 1;
 const SID_HEADER_SIZE: usize = 8;
 const SID_MAX_SUB_AUTHORITIES: u8 = 15;
 const STATUS_INVALID_SID: u32 = 0xC000_0078;
+const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+
+fn write_ascii_utf16(output: &mut [u16], cursor: &mut usize, value: &[u8]) -> Result<(), u32> {
+    let end = cursor
+        .checked_add(value.len())
+        .ok_or(STATUS_BUFFER_TOO_SMALL)?;
+    let target = output
+        .get_mut(*cursor..end)
+        .ok_or(STATUS_BUFFER_TOO_SMALL)?;
+    for (unit, byte) in target.iter_mut().zip(value) {
+        *unit = *byte as u16;
+    }
+    *cursor = end;
+    Ok(())
+}
+
+fn write_decimal_utf16(output: &mut [u16], cursor: &mut usize, mut value: u64) -> Result<(), u32> {
+    let mut reversed = [0u8; 20];
+    let mut length = 0usize;
+    loop {
+        reversed[length] = b'0' + (value % 10) as u8;
+        length += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    let end = cursor.checked_add(length).ok_or(STATUS_BUFFER_TOO_SMALL)?;
+    let target = output
+        .get_mut(*cursor..end)
+        .ok_or(STATUS_BUFFER_TOO_SMALL)?;
+    for (index, unit) in target.iter_mut().enumerate() {
+        *unit = reversed[length - index - 1] as u16;
+    }
+    *cursor = end;
+    Ok(())
+}
+
+/// Format a native in-memory SID as SDDL UTF-16 without allocating.
+///
+/// Returns the number of code units written, excluding a terminator. The caller owns termination.
+pub fn write_native_sid_sddl_utf16(bytes: &[u8], output: &mut [u16]) -> Result<usize, u32> {
+    if bytes.len() < SID_HEADER_SIZE
+        || bytes[0] != SID_REVISION
+        || bytes[1] > SID_MAX_SUB_AUTHORITIES
+    {
+        return Err(STATUS_INVALID_SID);
+    }
+    let count = bytes[1] as usize;
+    let sid_len = SID_HEADER_SIZE
+        .checked_add(count.checked_mul(4).ok_or(STATUS_INVALID_SID)?)
+        .ok_or(STATUS_INVALID_SID)?;
+    if sid_len > bytes.len() {
+        return Err(STATUS_INVALID_SID);
+    }
+
+    let mut cursor = 0usize;
+    write_ascii_utf16(output, &mut cursor, b"S-")?;
+    write_decimal_utf16(output, &mut cursor, bytes[0] as u64)?;
+    write_ascii_utf16(output, &mut cursor, b"-")?;
+    if bytes[2] == 0 && bytes[3] == 0 {
+        let authority = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        write_decimal_utf16(output, &mut cursor, authority as u64)?;
+    } else {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        write_ascii_utf16(output, &mut cursor, b"0x")?;
+        for byte in &bytes[2..8] {
+            write_ascii_utf16(
+                output,
+                &mut cursor,
+                &[HEX[(byte >> 4) as usize], HEX[(byte & 0x0f) as usize]],
+            )?;
+        }
+    }
+    for index in 0..count {
+        let offset = SID_HEADER_SIZE + index * 4;
+        let sub_authority = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
+        write_ascii_utf16(output, &mut cursor, b"-")?;
+        write_decimal_utf16(output, &mut cursor, sub_authority as u64)?;
+    }
+    Ok(cursor)
+}
 
 /// A security identifier (spec §7.1).
 #[derive(Clone, Debug, PartialEq, Eq)]

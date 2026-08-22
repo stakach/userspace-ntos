@@ -150,22 +150,32 @@ pub fn init_ansi_len(bytes_until_nul: &[u8]) -> u16 {
 /// `RtlIntegerToUnicodeString`: format an unsigned integer in `base`
 /// (2/8/10/16) into UTF-16 units. Returns `None` for an unsupported base.
 pub fn integer_to_unicode(value: u32, base: u32) -> Option<Vec<u16>> {
+    let mut buffer = [0u16; 32];
+    let length = integer_to_unicode_into(value, base, &mut buffer)?;
+    Some(buffer[..length].to_vec())
+}
+
+/// Allocation-free `RtlIntegerToUnicodeString` formatting for kernel import trampolines.
+///
+/// Returns the number of UTF-16 units written into `buffer`, or `None` for an unsupported base.
+pub fn integer_to_unicode_into(value: u32, base: u32, buffer: &mut [u16; 32]) -> Option<usize> {
     if !matches!(base, 2 | 8 | 10 | 16) {
         return None;
     }
-    if value == 0 {
-        return Some(alloc::vec![b'0' as u16]);
-    }
-    let mut digits = Vec::new();
+    let mut length = 0usize;
     let mut v = value;
-    while v > 0 {
+    loop {
         let d = (v % base) as u8;
-        let ch = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
-        digits.push(ch as u16);
+        let ch = if d < 10 { b'0' + d } else { b'A' + (d - 10) };
+        buffer[length] = ch as u16;
+        length += 1;
         v /= base;
+        if v == 0 {
+            break;
+        }
     }
-    digits.reverse();
-    Some(digits)
+    buffer[..length].reverse();
+    Some(length)
 }
 
 /// `RtlUnicodeStringToInteger`: parse a counted UTF-16 integer in `base`.
@@ -338,10 +348,14 @@ mod tests {
     #[test]
     fn integer_roundtrip() {
         assert_eq!(integer_to_unicode(0, 10).unwrap(), u("0"));
-        assert_eq!(integer_to_unicode(255, 16).unwrap(), u("ff"));
+        assert_eq!(integer_to_unicode(255, 16).unwrap(), u("FF"));
         assert_eq!(integer_to_unicode(10, 2).unwrap(), u("1010"));
         assert_eq!(integer_to_unicode(64, 8).unwrap(), u("100"));
         assert!(integer_to_unicode(1, 7).is_none());
+
+        let mut buffer = [0u16; 32];
+        let length = integer_to_unicode_into(0x1234_abcd, 16, &mut buffer).unwrap();
+        assert_eq!(&buffer[..length], &u("1234ABCD"));
 
         assert_eq!(unicode_string_to_integer(&u("255"), 10), Some(255));
         assert_eq!(unicode_string_to_integer(&u("0xFF"), 0), Some(255));
