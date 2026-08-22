@@ -9668,3 +9668,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     root CSpace/cap banks and the recycled-frame cache bounded where their limits express real seL4
     geometry or eviction policy; continue the owner-by-owner audit of remaining large fixed metadata
     stores and replace only admission limits that are unrelated to a real kernel resource.
+
+    Growable driver-export registry checkpoint (2026-08-22): `nt-compat-exports` no longer limits
+    the hosted NT/HAL trampoline catalog to a fixed 384-name array. `DriverExportRegistry` is now a
+    growable, allocation-fallible catalog with bootstrap reservation and
+    binding/capacity/growth/failure telemetry. Both the general hosted-driver and win32k catalogs are
+    populated before the service-loop heap checkpoint, and allocation failure is part of
+    `exec_vm_pool_headroom`; additional drivers or exports can therefore grow metadata without a
+    kernel admission constant. Validation is green for `cargo fmt --all`, `cargo test -p
+    nt-compat-exports` (`35/35`), executive `cargo check --manifest-path
+    components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`, and
+    serialized desktop proof `.tmp/run-desktop-growable-driver-exports-retry-20260822.log`. The
+    proof reaches dynamic driver startup and genuine Explorer chrome with `293/293` plus the
+    sentinel; final catalog telemetry is `262/384/0/0` for general hosted drivers and
+    `166/384/0/0` for win32k (`bindings/capacity/growth/allocation-failures`). A rejected precursor
+    `.tmp/run-desktop-growable-driver-exports-20260822.log` also clarified the next cleanup: making
+    win32k import resolution immediately fail-closed stops at the first declared import that still
+    relies on the pre-existing zero trampoline, before win32k DriverEntry can run. That behavior was
+    not folded into this storage refactor. Review adjustment: the fixed catalog wall is closed; the
+    next no-fallback target is to bind the remainder of win32k's declared NT import surface to real
+    implementations, then remove `s_zero` and make unknown imports reject the image with a named
+    diagnostic. Do not replace that work with generic success/failure stubs.

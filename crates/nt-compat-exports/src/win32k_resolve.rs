@@ -9,7 +9,9 @@
 //! names win32k imports ([`export_descriptor`]) and which are the data-cell
 //! exports it reads ([`WIN32K_DATA_EXPORTS`]).
 
-use crate::{hal, ntoskrnl, win32k, DriverExportRegistry, ExportDescriptor, DRIVER_TRAMPOLINE_CAP};
+use crate::{
+    hal, ntoskrnl, win32k, DriverExportRegistry, ExportDescriptor, DRIVER_EXPORT_INITIAL_RESERVE,
+};
 
 /// Retained name for the shared [`DriverExportRegistry`] — win32k resolves its
 /// `ntoskrnl.exe` imports through the SAME driver-agnostic registry mechanism as
@@ -17,8 +19,8 @@ use crate::{hal, ntoskrnl, win32k, DriverExportRegistry, ExportDescriptor, DRIVE
 /// was retired; this alias keeps the win32k call sites readable.
 pub type Win32kExportRegistry = DriverExportRegistry;
 
-/// Retained alias for the shared trampoline-array capacity ([`DRIVER_TRAMPOLINE_CAP`]).
-pub const WIN32K_TRAMPOLINE_CAP: usize = DRIVER_TRAMPOLINE_CAP;
+/// Retained win32k-specific name for the shared registry's bootstrap reservation.
+pub const WIN32K_EXPORT_INITIAL_RESERVE: usize = DRIVER_EXPORT_INITIAL_RESERVE;
 
 /// Look up an export's static compatibility descriptor across the whole declared
 /// contract (`ntoskrnl.exe` MVP + win32k's extra ntoskrnl surface + `hal.dll`).
@@ -60,8 +62,6 @@ mod tests {
     extern crate std;
     use super::*;
     use crate::ExportStatus;
-    use std::boxed::Box;
-    use std::vec::Vec;
 
     /// The first batch migrated onto the registry (pool + RTL-atom + Ob groups).
     /// Every one must be a *declared* export backed by a real `nt-*` subsystem
@@ -117,24 +117,35 @@ mod tests {
     }
 
     #[test]
-    fn capacity_boundary() {
-        // Exercise the shared registry boundary directly with generated static names.
+    fn registry_grows_past_bootstrap_reservation() {
+        const NAMES: &[&str] = &[
+            "win32k-export-00",
+            "win32k-export-01",
+            "win32k-export-02",
+            "win32k-export-03",
+            "win32k-export-04",
+            "win32k-export-05",
+            "win32k-export-06",
+            "win32k-export-07",
+            "win32k-export-08",
+            "win32k-export-09",
+            "win32k-export-10",
+            "win32k-export-11",
+            "win32k-export-12",
+            "win32k-export-13",
+            "win32k-export-14",
+            "win32k-export-15",
+        ];
         let mut reg = Win32kExportRegistry::new();
-        let names: Vec<&'static str> = (0..WIN32K_TRAMPOLINE_CAP)
-            .map(|i| &*Box::leak(std::format!("w{i}").into_boxed_str()))
-            .collect();
-        for (i, name) in names.iter().enumerate() {
-            assert!(reg.bind(name, i as u64 + 1));
+        assert!(reg.reserve_initial(8));
+        let initial_capacity = reg.stats().capacity;
+        assert!(initial_capacity < NAMES.len());
+        for (index, name) in NAMES.iter().take(initial_capacity + 1).enumerate() {
+            assert!(reg.bind(name, index as u64 + 1));
         }
-        assert_eq!(reg.len(), WIN32K_TRAMPOLINE_CAP);
-        assert!(!reg.is_exhausted());
-        // A new name past capacity is rejected.
-        assert!(!reg.bind("overflow_name", 0xFFFF));
-        assert!(reg.is_exhausted());
-        // But re-binding an already-present name still works (no growth needed).
-        let existing = names[0];
-        assert!(reg.bind(existing, 0x1234));
-        assert_eq!(reg.lookup(existing), Some(0x1234));
+        assert_eq!(reg.len(), initial_capacity + 1);
+        assert!(reg.stats().capacity > initial_capacity);
+        assert_eq!(reg.stats().allocation_failures, 0);
     }
 
     #[test]

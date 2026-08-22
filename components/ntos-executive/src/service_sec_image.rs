@@ -5379,6 +5379,14 @@ pub(crate) unsafe fn service_sec_image(
     if !reset_gui_message_waiters() {
         panic!("GUI message waiter table allocation failed");
     }
+    // Driver import catalogs are durable and may be consulted from later PnP or win32k loads.
+    // Populate their growable storage before the per-syscall bump-heap checkpoint.
+    if !initialize_fsd_export_registry() {
+        panic!("hosted driver export registry allocation failed");
+    }
+    if !win32k_subsystem::initialize_export_registry() {
+        panic!("win32k export registry allocation failed");
+    }
     // Heap high-water mark taken AFTER all persistent state (the service table + the
     // pre-reserved process handle tables, SEC_IMAGE process scratch, TP worker window resources,
     // private VAD rows, and cooperative/message wait tables) is allocated. Committed image/runtime mapping rows

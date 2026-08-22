@@ -5709,6 +5709,8 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
         ROOT_CSPACE_END.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
     let slots_available = root_slot_available_count();
     let frame_registry = client_frame_registry_stats();
+    let fsd_exports = fsd_export_registry_stats();
+    let win32k_exports = win32k_subsystem::export_registry_stats();
     let vad = VM_REGION_HW.load(Ordering::Relaxed);
     let committed_mappings = VM_COMMITTED_MAPPING_HW.load(Ordering::Relaxed);
     let committed_mapping_fails = VM_COMMITTED_MAPPING_REGISTRATION_FAILS.load(Ordering::Relaxed);
@@ -5741,6 +5743,8 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
             && frame_registry.allocation_failures == 0
             && frame_registry.frame_conflicts == 0
             && frame_registry.ownership_conflicts == 0
+            && fsd_exports.allocation_failures == 0
+            && win32k_exports.allocation_failures == 0
             && SHARED_IMAGE_MAPPING_FAILS.load(Ordering::Relaxed) == 0
             && committed_mapping_fails == 0
             && UT_RETYPE_FAILS.load(Ordering::Relaxed) == 0
@@ -9736,6 +9740,8 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     let live_untyped = UT_RETYPE_LIVE_BYTES.load(Ordering::Relaxed);
     let cumulative_untyped = UT_RETYPE_BYTES.load(Ordering::Relaxed);
     let frame_registry = client_frame_registry_stats();
+    let fsd_exports = fsd_export_registry_stats();
+    let win32k_exports = win32k_subsystem::export_registry_stats();
     print_str(b"[pools] ");
     print_str(tag);
     print_str(b" untyped=");
@@ -9799,6 +9805,22 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(frame_registry.frame_conflicts);
     print_str(b"/");
     print_u64(frame_registry.ownership_conflicts);
+    print_str(b" driver-exports=");
+    print_u64(fsd_exports.bindings as u64);
+    print_str(b"/");
+    print_u64(fsd_exports.capacity as u64);
+    print_str(b"/");
+    print_u64(fsd_exports.growths);
+    print_str(b"/");
+    print_u64(fsd_exports.allocation_failures);
+    print_str(b":");
+    print_u64(win32k_exports.bindings as u64);
+    print_str(b"/");
+    print_u64(win32k_exports.capacity as u64);
+    print_str(b"/");
+    print_u64(win32k_exports.growths);
+    print_str(b"/");
+    print_u64(win32k_exports.allocation_failures);
     print_str(b" image-mapcaps=");
     print_u64(SHARED_IMAGE_MAPPING_HW.load(Ordering::Relaxed));
     print_str(b" image-mapcap-fails=");

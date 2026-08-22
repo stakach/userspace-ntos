@@ -27,7 +27,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
-use nt_compat_exports::DriverExportRegistry;
+use nt_compat_exports::{
+    DriverExportRegistry, DriverExportRegistryStats, DRIVER_EXPORT_INITIAL_RESERVE,
+};
 use nt_dma_manager::{
     DmaError, DmaLogicalRangeKind, DmaManager as HostedDmaManager, DmaOwner, FixedDescriptorLayout,
 };
@@ -13044,9 +13046,9 @@ extern "win64" fn s_video_port_initialize(
 
 // --- the SHARED ntoskrnl export surface (registration-driven, the win32k model) ---------------
 
-/// The FSD's ntoskrnl-import registry: a heap-free `name -> trampoline-VA` map (the SHARED
-/// `nt-compat-exports` mechanism). The executive binds each `s_*` trampoline by name; the PE loader
-/// resolves the FSD's IAT through [`fsd_export_addr`]. Reusable for the next FSD (fastfat) unchanged.
+/// The FSD's ntoskrnl-import registry (the shared `nt-compat-exports` mechanism). The executive
+/// binds each `s_*` trampoline by name; the PE loader resolves the FSD's IAT through
+/// [`fsd_export_addr`]. Reusable for the next FSD (fastfat) unchanged.
 static mut FSD_EXPORTS: DriverExportRegistry = DriverExportRegistry::new();
 static mut FSD_EXPORTS_READY: bool = false;
 
@@ -23611,9 +23613,12 @@ unsafe fn register_loaded_dependency_image(
 }
 
 /// Bind the FSD ntoskrnl trampolines into [`FSD_EXPORTS`]. Idempotent (`bind` updates in place).
-fn register_fsd_trampolines() {
+fn register_fsd_trampolines() -> bool {
     // SAFETY: single-threaded executive; the registry is only touched here + in fsd_export_addr.
     let reg = unsafe { &mut *core::ptr::addr_of_mut!(FSD_EXPORTS) };
+    if !reg.reserve_initial(DRIVER_EXPORT_INITIAL_RESERVE) {
+        return false;
+    }
     // pool (ExAllocatePool* → the FSD arena)
     reg.bind(
         "ExAllocatePoolWithTag",
@@ -24567,9 +24572,23 @@ fn register_fsd_trampolines() {
         s_ke_query_performance_counter as *const () as usize as u64,
     );
 
-    if reg.is_exhausted() {
-        panic!("FSD export registry capacity exhausted");
+    reg.stats().allocation_failures == 0
+}
+
+pub(crate) fn initialize_fsd_export_registry() -> bool {
+    unsafe {
+        if !FSD_EXPORTS_READY {
+            if !register_fsd_trampolines() {
+                return false;
+            }
+            FSD_EXPORTS_READY = true;
+        }
+        true
     }
+}
+
+pub(crate) fn fsd_export_registry_stats() -> DriverExportRegistryStats {
+    unsafe { (&*core::ptr::addr_of!(FSD_EXPORTS)).stats() }
 }
 
 fn hosted_kernel_provider_dll(dll: &str) -> bool {
@@ -24778,14 +24797,12 @@ pub fn fsd_export_addr(dll: &str, name: &str) -> Option<u64> {
     if let Some(addr) = fsd_data_export_addr(name) {
         return Some(addr);
     }
-    // SAFETY: single-threaded; the registry is populated once (lazily) and read-only thereafter.
-    unsafe {
-        if !FSD_EXPORTS_READY {
-            register_fsd_trampolines();
-            FSD_EXPORTS_READY = true;
-        }
+    if initialize_fsd_export_registry() {
+        // SAFETY: single-threaded; initialization is complete and the registry is read-only.
+        unsafe {
         if let Some(va) = (*core::ptr::addr_of!(FSD_EXPORTS)).lookup(name) {
             return Some(va);
+        }
         }
     }
     unsafe {

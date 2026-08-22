@@ -17,9 +17,9 @@
 //!   * the EXECUTIVE (which owns the heap + the staged image at `WIN32KBUF`) parses the PE,
 //!     copies its 8 sections into a run of untyped-backed frames at [`WIN32K_CODE_VA`]
 //!     (VIRTUAL layout — not a `PeFile::map()` Vec, which the 128 KiB bump heap can't hold),
-//!     applies the 1920 DIR64 relocations in place, and patches the IAT: init-path imports →
-//!     real trampolines below, data-export globals → non-null placeholder cells, everything
-//!     else → a benign zero stub. See [`load_into`].
+//!     applies the 1920 DIR64 relocations in place, and patches the IAT: init-path imports ->
+//!     real trampolines below, data-export globals -> non-null placeholder cells, everything
+//!     else -> the legacy zero stub. See [`load_into`].
 //!   * the COMPONENT (the spawned Subsystem-class component) maps the image W^X (RX code / RW
 //!     data), a pool arena, the data-export region, and calls `DriverEntry(DRIVER_OBJECT*,
 //!     UNICODE_STRING*)` with its fault endpoint armed. On return it writes a verdict + the
@@ -36,7 +36,7 @@ use nt_compat_exports::{
         x64_argument_count_from_sspt_byte,
         WIN32K_SERVICE_TABLE_INDEX as NT_WIN32K_SERVICE_TABLE_INDEX,
     },
-    DriverExportRegistry,
+    DriverExportRegistry, DriverExportRegistryStats, DRIVER_EXPORT_INITIAL_RESERVE,
 };
 
 // Pure, driver-agnostic ntoskrnl byte/string primitives shared with the FSD class.
@@ -8403,9 +8403,12 @@ static mut WIN32K_EXPORTS_READY: bool = false;
 /// Bind the first-batch trampolines into [`WIN32K_EXPORTS`]. Idempotent (`bind` updates in place),
 /// so it is safe to call from any loader (win32k / dxg / driver) regardless of order; each bound VA
 /// is IDENTICAL to what the `match` in [`export_addr`] would return, so resolution is unchanged.
-fn register_trampolines() {
+fn register_trampolines() -> bool {
     // SAFETY: single-threaded executive; the registry is only ever touched here + in export_addr.
     let reg = unsafe { &mut *core::ptr::addr_of_mut!(WIN32K_EXPORTS) };
+    if !reg.reserve_initial(DRIVER_EXPORT_INITIAL_RESERVE) {
+        return false;
+    }
     // pool (Driver Host arena)
     reg.bind(
         "ExAllocatePoolWithTag",
@@ -8822,21 +8825,36 @@ fn register_trampolines() {
         );
         di += 1;
     }
+    reg.stats().allocation_failures == 0
 }
 
 /// Resolve an import name to its IAT-slot value: a code trampoline VA, or (for the 11 data
 /// exports) the data-cell address. Pure registry resolve now (Workstream B): the executive
 /// registered every real trampoline + data cell by name into the `nt-compat-exports`
-/// [`Win32kExportRegistry`]; unregistered names get the benign zero stub (STATUS_SUCCESS / null
-/// / void), which is how the declared stub / `TrapIfCalled` / off-path imports resolve. The
-/// hardcoded match is GONE.
-pub fn export_addr(name: &str) -> u64 {
-    // SAFETY: single-threaded; the registry is populated once (lazily) and read-only thereafter.
+/// [`Win32kExportRegistry`]. The remaining unregistered declared imports retain the existing zero
+/// trampoline until their real implementations are added and the loader can become fully
+/// fail-closed.
+pub(crate) fn initialize_export_registry() -> bool {
     unsafe {
         if !WIN32K_EXPORTS_READY {
-            register_trampolines();
+            if !register_trampolines() {
+                return false;
+            }
             WIN32K_EXPORTS_READY = true;
         }
+        true
+    }
+}
+
+pub(crate) fn export_registry_stats() -> DriverExportRegistryStats {
+    unsafe { (&*core::ptr::addr_of!(WIN32K_EXPORTS)).stats() }
+}
+
+pub fn export_addr(name: &str) -> u64 {
+    if !initialize_export_registry() {
+        return 0;
+    }
+    unsafe {
         (*core::ptr::addr_of!(WIN32K_EXPORTS))
             .lookup(name)
             .unwrap_or(s_zero as usize as u64)

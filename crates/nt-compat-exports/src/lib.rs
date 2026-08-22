@@ -21,14 +21,16 @@ pub mod ssdt;
 pub mod win32k;
 pub mod win32k_resolve;
 
-pub use driver_resolve::{DriverExportRegistry, DRIVER_TRAMPOLINE_CAP};
+pub use driver_resolve::{
+    DriverExportRegistry, DriverExportRegistryStats, DRIVER_EXPORT_INITIAL_RESERVE,
+};
 pub use registry::{ExportRegistry, ImportCheck, ImportOutcome, ImportReport};
 pub use ssdt::{
     ServiceTable, ServiceTableRegistry, WIN32K_SERVICE_BASE, WIN32K_SERVICE_TABLE_INDEX,
 };
 pub use win32k::{WIN32K_FTFD_IMPORTS, WIN32K_HAL_IMPORTS, WIN32K_NTOSKRNL_IMPORTS};
 pub use win32k_resolve::{
-    export_descriptor, Win32kExportRegistry, WIN32K_DATA_EXPORTS, WIN32K_TRAMPOLINE_CAP,
+    export_descriptor, Win32kExportRegistry, WIN32K_DATA_EXPORTS, WIN32K_EXPORT_INITIAL_RESERVE,
 };
 
 /// The v0.1 compatibility status of an export (spec §7.3).
