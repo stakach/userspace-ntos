@@ -96,6 +96,7 @@ use nt_kernel_exec::{EventKind, EventStore, IrqlState, WaitResult};
 use nt_lpc_abi::LpcReply;
 use nt_lpc_client::LpcClient;
 pub(crate) use nt_memory_manager::{
+    ClientFrameInsert, ClientFrameRecord, ClientFrameRegistry, ClientFrameRegistryStats,
     GenericSection, GenericSectionBacking, GenericSectionTable, GenericSectionTableStats,
     GenericSectionView, GENERIC_SECTION_BACKING_ANON, GENERIC_SECTION_BACKING_DISK,
     GENERIC_SECTION_BACKING_OVERLAY, SECTION_ATTR_SEC_COMMIT, SECTION_ATTR_SEC_FILE,
@@ -2294,7 +2295,9 @@ const HOSTED_THREAD_RUNTIME_INITIAL_RESERVE: usize =
     MAX_PI * (1 + PM_RUNTIME_THREAD_SLOTS + TP_WORKER_SLOT_COUNT) + 16;
 const HOSTED_THREAD_WAIT_INITIAL_RESERVE: usize = HOSTED_THREAD_RUNTIME_INITIAL_RESERVE;
 const WAIT_REPLY_POOL_INITIAL_RESERVE: usize = HOSTED_THREAD_WAIT_INITIAL_RESERVE + 1;
-static WAIT_TABLE_GROWTH_DIRTY: AtomicBool = AtomicBool::new(false);
+/// Set when a service-loop-owned growable table reallocates above the current bump-heap reset mark.
+/// The loop consumes this bit before resetting so the new backing storage remains durable.
+static DURABLE_TABLE_GROWTH_DIRTY: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 struct WaitReplyPoolRecord {
@@ -2310,12 +2313,12 @@ static WAIT_REPLY_POOL_SLOT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WAIT_REPLY_POOL_RETYPE_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WAIT_REPLY_POOL_STORE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
-fn mark_wait_table_growth_dirty() {
-    WAIT_TABLE_GROWTH_DIRTY.store(true, Ordering::Relaxed);
+fn mark_durable_table_growth_dirty() {
+    DURABLE_TABLE_GROWTH_DIRTY.store(true, Ordering::Relaxed);
 }
 
-fn take_wait_table_growth_dirty() -> bool {
-    WAIT_TABLE_GROWTH_DIRTY.swap(false, Ordering::Relaxed)
+fn take_durable_table_growth_dirty() -> bool {
+    DURABLE_TABLE_GROWTH_DIRTY.swap(false, Ordering::Relaxed)
 }
 
 struct ThreadWaitParkTable {
@@ -2364,7 +2367,7 @@ impl ThreadWaitParkTable {
                 self.store_failures = self.store_failures.saturating_add(1);
                 return;
             }
-            mark_wait_table_growth_dirty();
+            mark_durable_table_growth_dirty();
         }
         self.badges_plus_one.push(encoded);
     }
@@ -2577,7 +2580,7 @@ impl ObjectWaiterTable {
                 self.store_failures = self.store_failures.saturating_add(1);
                 return None;
             }
-            mark_wait_table_growth_dirty();
+            mark_durable_table_growth_dirty();
         }
         let index = self.entries.len();
         self.entries.push(ObjectWaiterRecord::empty());
@@ -2753,7 +2756,7 @@ impl KeyedWaiterTable {
                 self.store_failures = self.store_failures.saturating_add(1);
                 return None;
             }
-            mark_wait_table_growth_dirty();
+            mark_durable_table_growth_dirty();
         }
         let index = self.entries.len();
         self.entries.push(KeyedWaiterRecord::empty());
@@ -5692,11 +5695,11 @@ fn image_writecopy_cow_spec(passed: &mut u64) {
 
 /// ═══ EVERY POOL THAT BACKS HOSTED PRIVATE MEMORY HAS MEASURED HEADROOM ══════════════════════════
 ///
-/// The recurring wall in this codebase is a fixed-capacity resource that answers "no" in silence:
-/// the bump heap at 93 %, `HEAP_FRAMES`, the VAD map, the frame registry. Each one is now measured
-/// with a HIGH-WATER mark next to its capacity and printed at the gate (`[pools]`), and this spec
-/// makes exhaustion a RED SPEC rather than a mystery. Thresholds are deliberately below capacity:
-/// the point is to fail BEFORE the wall, while there is still room to diagnose.
+/// The recurring wall in this codebase is a bounded resource that answers "no" in silence: root
+/// CSpace, the executive bump heap, the VAD map, and the recycled-frame cache. Each real bound is
+/// measured with a HIGH-WATER mark next to its capacity and printed at the gate (`[pools]`).
+/// Bookkeeping registries grow instead; their allocation and consistency failures are gate errors.
+/// This makes exhaustion a RED SPEC rather than a mystery.
 fn vm_pool_headroom_spec(passed: &mut u64) {
     let untyped_used = UT_RETYPE_LIVE_BYTES.load(Ordering::Relaxed);
     let untyped_total = UT_TOTAL_BYTES.load(Ordering::Relaxed);
@@ -5705,7 +5708,7 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
     let slots_total =
         ROOT_CSPACE_END.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
     let slots_available = root_slot_available_count();
-    let registry = CSRSS_FRAME_HW.load(Ordering::Relaxed);
+    let frame_registry = client_frame_registry_stats();
     let vad = VM_REGION_HW.load(Ordering::Relaxed);
     let committed_mappings = VM_COMMITTED_MAPPING_HW.load(Ordering::Relaxed);
     let committed_mapping_fails = VM_COMMITTED_MAPPING_REGISTRATION_FAILS.load(Ordering::Relaxed);
@@ -5722,9 +5725,10 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
             // The executive bump heap is also a hard cap; fail while there is still room to
             // diagnose instead of letting the next permanent CM/PnP allocation turn into a null.
             && executive_heap_remaining >= MIN_EXECUTIVE_HEAP_HEADROOM_BYTES
-            // Every executive-side fixed pool remains strictly under three quarters of its capacity.
+            // Every executive-side pool with real fixed geometry remains strictly under three
+            // quarters of its capacity. The client-frame registry is growable metadata, so only
+            // allocation or key-consistency failures are meaningful here.
             && slots_total != 0
-            && registry * 4 < CSRSS_FRAME_CAP as u64 * 3
             && vad * 4 < VM_REGION_CAPACITY as u64 * 3
             && committed_mappings * 4 < PROCESS_COMMITTED_MAPPING_CAPACITY as u64 * 3
             && protection_overrides * 4
@@ -5734,7 +5738,9 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
             // the bump range plus deleted root slots returned through the recycle stack.
             && slots_available >= 2048
             // … with nothing having been refused by any of them.
-            && CSRSS_FRAME_FULL.load(Ordering::Relaxed) == 0
+            && frame_registry.allocation_failures == 0
+            && frame_registry.frame_conflicts == 0
+            && frame_registry.ownership_conflicts == 0
             && SHARED_IMAGE_MAPPING_FAILS.load(Ordering::Relaxed) == 0
             && committed_mapping_fails == 0
             && UT_RETYPE_FAILS.load(Ordering::Relaxed) == 0
@@ -8325,22 +8331,17 @@ unsafe fn dll_cache_evict_unreferenced_all() -> u64 {
 // pi. Winlogon's runtime worker stacks are created late, after the former 8192-entry table could
 // already be full; silently dropping those entries made win32k attach an unrelated page at the same
 // user VA.
-const CSRSS_FRAME_CAP: usize = 32768;
-static mut CSRSS_FRAME_PI: [u8; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
-static mut CSRSS_FRAME_VA: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
-static mut CSRSS_FRAME_FR: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
-static mut CSRSS_FRAME_ALIAS: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
-static mut CSRSS_FRAME_ALIAS_CAP: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
-static mut CSRSS_FRAME_SOURCE_CAP: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
-static mut CSRSS_FRAME_OWNS_FRAME: [bool; CSRSS_FRAME_CAP] = [false; CSRSS_FRAME_CAP];
-static mut CSRSS_FRAME_N: usize = 0;
+const CLIENT_FRAME_REGISTRY_INITIAL_RESERVE: usize = 16384;
+static mut CLIENT_FRAME_REGISTRY: ClientFrameRegistry = ClientFrameRegistry::new();
 static CLIENT_COPY_TEMP_CAP: AtomicU64 = AtomicU64::new(0);
-#[derive(Copy, Clone)]
-struct CsrssFrameRecord {
-    frame: u64,
-    alias: u64,
-    source_cap: u64,
-    owns_frame: bool,
+
+unsafe fn client_frame_registry_reserve_initial() -> bool {
+    (&mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY))
+        .reserve_initial(CLIENT_FRAME_REGISTRY_INITIAL_RESERVE)
+}
+
+fn client_frame_registry_stats() -> ClientFrameRegistryStats {
+    unsafe { (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).stats() }
 }
 /// Record GUI client `pi`'s frame cap `fr` for page VA `page` (once per (pi,page)).
 unsafe fn csrss_frame_put(pi: u64, page: u64, fr: u64) {
@@ -8391,120 +8392,36 @@ unsafe fn csrss_frame_put_at_cap_source_owned(
     source_cap: u64,
     owns_frame: bool,
 ) -> bool {
-    let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N)).min(CSRSS_FRAME_CAP);
-    let vas = core::ptr::addr_of!(CSRSS_FRAME_VA) as *const u64;
-    let pis = core::ptr::addr_of!(CSRSS_FRAME_PI) as *const u8;
-    let frs = core::ptr::addr_of!(CSRSS_FRAME_FR) as *const u64;
-    for i in 0..n {
-        if core::ptr::read(vas.add(i)) == page && core::ptr::read(pis.add(i)) as u64 == pi {
-            if core::ptr::read(frs.add(i)) != fr {
-                return false;
+    match (&mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY)).insert(
+        pi,
+        page,
+        fr,
+        alias,
+        alias_cap,
+        source_cap,
+        owns_frame,
+    ) {
+        Ok(ClientFrameInsert::Inserted { grew }) => {
+            if grew {
+                mark_durable_table_growth_dirty();
             }
-            if alias != 0 {
-                let aliases = core::ptr::addr_of_mut!(CSRSS_FRAME_ALIAS) as *mut u64;
-                if core::ptr::read(aliases.add(i)) == 0 {
-                    core::ptr::write(aliases.add(i), alias);
-                }
-            }
-            if alias_cap != 0 {
-                let alias_caps = core::ptr::addr_of_mut!(CSRSS_FRAME_ALIAS_CAP) as *mut u64;
-                if core::ptr::read(alias_caps.add(i)) == 0 {
-                    core::ptr::write(alias_caps.add(i), alias_cap);
-                }
-            }
-            if source_cap != 0 {
-                let source_caps = core::ptr::addr_of_mut!(CSRSS_FRAME_SOURCE_CAP) as *mut u64;
-                if core::ptr::read(source_caps.add(i)) == 0 {
-                    core::ptr::write(source_caps.add(i), source_cap);
-                }
-            }
-            let owned = core::ptr::addr_of_mut!(CSRSS_FRAME_OWNS_FRAME) as *mut bool;
-            if core::ptr::read(owned.add(i)) != owns_frame {
-                return false;
-            }
-            return true;
+            true
         }
-    }
-    if n < CSRSS_FRAME_CAP {
-        core::ptr::write(
-            (core::ptr::addr_of_mut!(CSRSS_FRAME_PI) as *mut u8).add(n),
-            pi as u8,
-        );
-        core::ptr::write(
-            (core::ptr::addr_of_mut!(CSRSS_FRAME_VA) as *mut u64).add(n),
-            page,
-        );
-        core::ptr::write(
-            (core::ptr::addr_of_mut!(CSRSS_FRAME_FR) as *mut u64).add(n),
-            fr,
-        );
-        core::ptr::write(
-            (core::ptr::addr_of_mut!(CSRSS_FRAME_ALIAS) as *mut u64).add(n),
-            alias,
-        );
-        core::ptr::write(
-            (core::ptr::addr_of_mut!(CSRSS_FRAME_ALIAS_CAP) as *mut u64).add(n),
-            alias_cap,
-        );
-        core::ptr::write(
-            (core::ptr::addr_of_mut!(CSRSS_FRAME_SOURCE_CAP) as *mut u64).add(n),
-            source_cap,
-        );
-        core::ptr::write(
-            (core::ptr::addr_of_mut!(CSRSS_FRAME_OWNS_FRAME) as *mut bool).add(n),
-            owns_frame,
-        );
-        core::ptr::write(core::ptr::addr_of_mut!(CSRSS_FRAME_N), n + 1);
-        note_high_water(&CSRSS_FRAME_HW, (n + 1) as u64);
-        true
-    } else {
-        CSRSS_FRAME_FULL.fetch_add(1, Ordering::Relaxed);
-        false
+        Ok(ClientFrameInsert::Updated) => true,
+        Err(_) => false,
     }
 }
 unsafe fn csrss_frame_take(pi: u64, page: u64) -> Option<(u64, u64, u64, bool)> {
-    let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N)).min(CSRSS_FRAME_CAP);
-    let vas = core::ptr::addr_of_mut!(CSRSS_FRAME_VA) as *mut u64;
-    let pis = core::ptr::addr_of_mut!(CSRSS_FRAME_PI) as *mut u8;
-    let frs = core::ptr::addr_of_mut!(CSRSS_FRAME_FR) as *mut u64;
-    let aliases = core::ptr::addr_of_mut!(CSRSS_FRAME_ALIAS) as *mut u64;
-    let alias_caps = core::ptr::addr_of_mut!(CSRSS_FRAME_ALIAS_CAP) as *mut u64;
-    let source_caps = core::ptr::addr_of_mut!(CSRSS_FRAME_SOURCE_CAP) as *mut u64;
-    let owns_frames = core::ptr::addr_of_mut!(CSRSS_FRAME_OWNS_FRAME) as *mut bool;
-    for index in 0..n {
-        if core::ptr::read(vas.add(index)) == page && core::ptr::read(pis.add(index)) as u64 == pi {
-            let frame = core::ptr::read(frs.add(index));
-            let alias_cap = core::ptr::read(alias_caps.add(index));
-            let source_cap = core::ptr::read(source_caps.add(index));
-            let owns_frame = core::ptr::read(owns_frames.add(index));
-            let last = n - 1;
-            if index != last {
-                core::ptr::write(vas.add(index), core::ptr::read(vas.add(last)));
-                core::ptr::write(pis.add(index), core::ptr::read(pis.add(last)));
-                core::ptr::write(frs.add(index), core::ptr::read(frs.add(last)));
-                core::ptr::write(aliases.add(index), core::ptr::read(aliases.add(last)));
-                core::ptr::write(alias_caps.add(index), core::ptr::read(alias_caps.add(last)));
-                core::ptr::write(
-                    source_caps.add(index),
-                    core::ptr::read(source_caps.add(last)),
-                );
-                core::ptr::write(
-                    owns_frames.add(index),
-                    core::ptr::read(owns_frames.add(last)),
-                );
-            }
-            core::ptr::write(vas.add(last), 0);
-            core::ptr::write(pis.add(last), 0);
-            core::ptr::write(frs.add(last), 0);
-            core::ptr::write(aliases.add(last), 0);
-            core::ptr::write(alias_caps.add(last), 0);
-            core::ptr::write(source_caps.add(last), 0);
-            core::ptr::write(owns_frames.add(last), false);
-            core::ptr::write(core::ptr::addr_of_mut!(CSRSS_FRAME_N), last);
-            return Some((frame, alias_cap, source_cap, owns_frame));
-        }
-    }
-    None
+    (&mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY))
+        .take(pi, page)
+        .map(|record| {
+            (
+                record.frame,
+                record.alias_cap,
+                record.source_cap,
+                record.owns_frame,
+            )
+        })
 }
 
 pub(crate) unsafe fn csrss_frame_drop_process_range(pi: u64, base: u64, size: u64) -> u64 {
@@ -8545,19 +8462,11 @@ pub(crate) unsafe fn csrss_frame_drop_process_range(pi: u64, base: u64, size: u6
 pub(crate) unsafe fn csrss_frame_drop_process_all(pi: u64) -> u64 {
     let mut dropped = 0u64;
     loop {
-        let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N)).min(CSRSS_FRAME_CAP);
-        let vas = core::ptr::addr_of!(CSRSS_FRAME_VA) as *const u64;
-        let pis = core::ptr::addr_of!(CSRSS_FRAME_PI) as *const u8;
-        let mut page = 0u64;
-        for index in 0..n {
-            if core::ptr::read(pis.add(index)) as u64 == pi {
-                page = core::ptr::read(vas.add(index));
-                break;
-            }
-        }
-        if page == 0 {
+        let Some(page) = (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY))
+            .first_page_for_process(pi)
+        else {
             break;
-        }
+        };
         detach_win32k_attached_page_for_thread_release(pi as usize, page);
         while let Some((frame, alias_cap, source_cap, owns_frame)) = csrss_frame_take(pi, page) {
             if owns_frame {
@@ -8580,76 +8489,37 @@ pub(crate) unsafe fn csrss_frame_drop_process_all(pi: u64) -> u64 {
 /// executable-page cache, which is important when deciding whether a writable client page has a
 /// persistent private backing frame.
 unsafe fn csrss_frame_get_exact(pi: u64, page: u64) -> (u64, usize) {
-    let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N)).min(CSRSS_FRAME_CAP);
-    let vas = core::ptr::addr_of!(CSRSS_FRAME_VA) as *const u64;
-    let frs = core::ptr::addr_of!(CSRSS_FRAME_FR) as *const u64;
-    let pis = core::ptr::addr_of!(CSRSS_FRAME_PI) as *const u8;
-    for i in 0..n {
-        if core::ptr::read(vas.add(i)) == page && core::ptr::read(pis.add(i)) as u64 == pi {
-            return (core::ptr::read(frs.add(i)), i);
-        }
-    }
-    (0, usize::MAX)
+    (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY))
+        .get_with_index(pi, page)
+        .map(|(index, record)| (record.frame, index))
+        .unwrap_or((0, usize::MAX))
 }
-unsafe fn csrss_frame_get_exact_record(pi: u64, page: u64) -> Option<CsrssFrameRecord> {
-    let (frame, index) = csrss_frame_get_exact(pi, page);
-    if index == usize::MAX || frame == 0 {
-        return None;
-    }
-    Some(CsrssFrameRecord {
-        frame,
-        alias: core::ptr::read((core::ptr::addr_of!(CSRSS_FRAME_ALIAS) as *const u64).add(index)),
-        source_cap: core::ptr::read(
-            (core::ptr::addr_of!(CSRSS_FRAME_SOURCE_CAP) as *const u64).add(index),
-        ),
-        owns_frame: core::ptr::read(
-            (core::ptr::addr_of!(CSRSS_FRAME_OWNS_FRAME) as *const bool).add(index),
-        ),
-    })
+unsafe fn csrss_frame_get_exact_record(pi: u64, page: u64) -> Option<ClientFrameRecord> {
+    (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).get(pi, page)
 }
 unsafe fn csrss_frame_next_page_after(pi: u64, page: u64) -> Option<u64> {
-    let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N)).min(CSRSS_FRAME_CAP);
-    let vas = core::ptr::addr_of!(CSRSS_FRAME_VA) as *const u64;
-    let pis = core::ptr::addr_of!(CSRSS_FRAME_PI) as *const u8;
-    let mut next = None;
-    for i in 0..n {
-        if core::ptr::read(pis.add(i)) as u64 == pi {
-            let candidate = core::ptr::read(vas.add(i));
-            if candidate > page && next.is_none_or(|current| candidate < current) {
-                next = Some(candidate);
-            }
-        }
-    }
-    next
+    (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).next_page_after(pi, page)
 }
 unsafe fn csrss_frame_alias_get(pi: u64, page: u64) -> u64 {
-    let (_, index) = csrss_frame_get_exact(pi, page);
-    if index == usize::MAX {
-        0
-    } else {
-        core::ptr::read((core::ptr::addr_of!(CSRSS_FRAME_ALIAS) as *const u64).add(index))
-    }
+    csrss_frame_get_exact_record(pi, page)
+        .map(|record| record.alias)
+        .unwrap_or(0)
 }
 pub(crate) unsafe fn csrss_frame_source_cap_get(pi: u64, page: u64) -> u64 {
-    let (_, index) = csrss_frame_get_exact(pi, page);
-    if index == usize::MAX {
-        0
-    } else {
-        core::ptr::read((core::ptr::addr_of!(CSRSS_FRAME_SOURCE_CAP) as *const u64).add(index))
-    }
+    csrss_frame_get_exact_record(pi, page)
+        .map(|record| record.source_cap)
+        .unwrap_or(0)
 }
 pub(crate) unsafe fn csrss_frame_clone_source_cap_get(pi: u64, page: u64) -> u64 {
-    let (frame, index) = csrss_frame_get_exact(pi, page);
-    if index == usize::MAX || frame == 0 {
-        return 0;
-    }
-    let source_cap =
-        core::ptr::read((core::ptr::addr_of!(CSRSS_FRAME_SOURCE_CAP) as *const u64).add(index));
-    if source_cap != 0 {
-        source_cap
-    } else {
-        frame
-    }
+    csrss_frame_get_exact_record(pi, page)
+        .map(|record| {
+            if record.source_cap != 0 {
+                record.source_cap
+            } else {
+                record.frame
+            }
+        })
+        .unwrap_or(0)
 }
 unsafe fn copy_registered_frame_cap(source: u64) -> (u64, u64) {
     if source == 0 {
@@ -8791,8 +8661,8 @@ unsafe fn csrss_frame_probe_primary_after_source_failure(
 /// scratch aliases are intentionally not consulted here, because a missing/invalid source is a real
 /// frame-registration bug that should stay visible.
 pub(crate) unsafe fn csrss_frame_copy_exact_for_win32k(pi: u64, page: u64) -> (u64, u64, u64) {
-    let (frame, index) = csrss_frame_get_exact(pi, page);
-    if index == usize::MAX || frame == 0 {
+    let (frame, _) = csrss_frame_get_exact(pi, page);
+    if frame == 0 {
         return (0, 0, 3);
     }
     let source_cap = csrss_frame_source_cap_get(pi, page);
@@ -8900,26 +8770,21 @@ impl FrameRegistryCensus {
 
 unsafe fn collect_frame_registry_census() -> FrameRegistryCensus {
     let mut census = FrameRegistryCensus::new(MAX_PI);
-    let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N)).min(CSRSS_FRAME_CAP);
-    let vas = core::ptr::addr_of!(CSRSS_FRAME_VA) as *const u64;
-    let pis = core::ptr::addr_of!(CSRSS_FRAME_PI) as *const u8;
-    let aliases = core::ptr::addr_of!(CSRSS_FRAME_ALIAS) as *const u64;
-    let source_caps = core::ptr::addr_of!(CSRSS_FRAME_SOURCE_CAP) as *const u64;
-    let owns_frames = core::ptr::addr_of!(CSRSS_FRAME_OWNS_FRAME) as *const bool;
+    let registry = &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY);
 
-    for index in 0..n {
-        let pi = core::ptr::read(pis.add(index)) as usize;
-        let page = core::ptr::read(vas.add(index));
+    for record in registry.records() {
+        let pi = record.pi as usize;
+        let page = record.page;
         census.live = census.live.saturating_add(1);
-        if core::ptr::read(owns_frames.add(index)) {
+        if record.owns_frame {
             census.owned = census.owned.saturating_add(1);
         } else {
             census.borrowed = census.borrowed.saturating_add(1);
         }
-        if core::ptr::read(source_caps.add(index)) != 0 {
+        if record.source_cap != 0 {
             census.source_caps = census.source_caps.saturating_add(1);
         }
-        if core::ptr::read(aliases.add(index)) != 0 {
+        if record.alias != 0 {
             census.aliases = census.aliases.saturating_add(1);
         }
         let Some(by_pi) = census.by_pi.get_mut(pi) else {
@@ -9001,12 +8866,25 @@ fn print_frame_registry_top_pi(by_pi: &[u64]) {
 
 fn print_frame_registry_census(tag: &[u8]) {
     let census = unsafe { collect_frame_registry_census() };
+    let registry = client_frame_registry_stats();
     print_str(b"[frame-reg-census] ");
     print_str(tag);
     print_str(b" live=");
     print_u64(census.live);
     print_str(b" hw=");
-    print_u64(CSRSS_FRAME_HW.load(Ordering::Relaxed));
+    print_u64(registry.high_water as u64);
+    print_str(b" storage=");
+    print_u64(registry.records as u64);
+    print_str(b"/");
+    print_u64(registry.capacity as u64);
+    print_str(b"/");
+    print_u64(registry.growths);
+    print_str(b"/");
+    print_u64(registry.allocation_failures);
+    print_str(b" conflicts=");
+    print_u64(registry.frame_conflicts);
+    print_str(b"/");
+    print_u64(registry.ownership_conflicts);
     print_str(b" owned/borrowed=");
     print_u64(census.owned);
     print_str(b"/");
@@ -9728,10 +9606,10 @@ unsafe fn client_copyin_frame_alias_get(pi: u64, page: u64) -> u64 {
         .unwrap_or(0)
 }
 // --- POOL CENSUS (batch 59) ------------------------------------------------------------------
-// A fixed-capacity resource that silently returns "no" is this codebase's recurring wall (the bump
-// heap at 93 %; `HEAP_FRAMES`; the VAD map). Every pool that backs a hosted process's private
-// memory is now MEASURED — a high-water mark next to its capacity — and printed at the gate, so the
-// NEXT exhaustion names itself instead of surfacing as a mysterious `STATUS_INSUFFICIENT_RESOURCES`.
+// Every bounded pool that backs hosted private memory is measured and printed at the gate. Dynamic
+// metadata registries report live/capacity/growth/failure telemetry rather than imposing an
+// arbitrary admission cap. The next real resource exhaustion therefore names itself instead of
+// surfacing as a mysterious `STATUS_INSUFFICIENT_RESOURCES`.
 /// Cumulative successful bytes carved out of the single boot Untyped (`CAP_INIT_UNTYPED`; size from
 /// BootInfo).
 /// This is diagnostic churn: live runway is tracked separately because root-cap delete can return
@@ -9756,11 +9634,6 @@ pub(crate) const MIN_EXECUTIVE_HEAP_HEADROOM_BYTES: usize = 1024 * 1024;
 pub(crate) static UT_RETYPE_FAILS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static UT_LAST_FAIL_LABEL: AtomicU64 = AtomicU64::new(0);
 pub(crate) static UT_LAST_FAIL_OBJ: AtomicU64 = AtomicU64::new(0);
-/// High-water of the (pi, page) -> frame-cap registry (`CSRSS_FRAME_CAP`).
-pub(crate) static CSRSS_FRAME_HW: AtomicU64 = AtomicU64::new(0);
-/// Times the registry refused an insert because it was FULL — the failure that turns into
-/// `STATUS_INSUFFICIENT_RESOURCES` out of `vm_map_private_page` with every seL4 call succeeding.
-pub(crate) static CSRSS_FRAME_FULL: AtomicU64 = AtomicU64::new(0);
 /// High-water of resident shared image process-map caps. These are not client frames: they exist so
 /// mapped-image protect and write-copy faults can unmap/promote the exact PTE owner without
 /// polluting the GUI/client frame registry.
@@ -9862,6 +9735,7 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
         ROOT_CSPACE_END.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
     let live_untyped = UT_RETYPE_LIVE_BYTES.load(Ordering::Relaxed);
     let cumulative_untyped = UT_RETYPE_BYTES.load(Ordering::Relaxed);
+    let frame_registry = client_frame_registry_stats();
     print_str(b"[pools] ");
     print_str(tag);
     print_str(b" untyped=");
@@ -9912,11 +9786,19 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_str(b" corrupt=");
     print_u64(ROOT_SLOT_RECYCLE_CORRUPT.load(Ordering::Relaxed));
     print_str(b" frame-reg=");
-    print_u64(CSRSS_FRAME_HW.load(Ordering::Relaxed));
+    print_u64(frame_registry.records as u64);
     print_str(b"/");
-    print_u64(CSRSS_FRAME_CAP as u64);
-    print_str(b" reg-full=");
-    print_u64(CSRSS_FRAME_FULL.load(Ordering::Relaxed));
+    print_u64(frame_registry.high_water as u64);
+    print_str(b"/");
+    print_u64(frame_registry.capacity as u64);
+    print_str(b"/");
+    print_u64(frame_registry.growths);
+    print_str(b" frame-reg-fails=");
+    print_u64(frame_registry.allocation_failures);
+    print_str(b"/");
+    print_u64(frame_registry.frame_conflicts);
+    print_str(b"/");
+    print_u64(frame_registry.ownership_conflicts);
     print_str(b" image-mapcaps=");
     print_u64(SHARED_IMAGE_MAPPING_HW.load(Ordering::Relaxed));
     print_str(b" image-mapcap-fails=");
@@ -10829,17 +10711,13 @@ pub(crate) unsafe fn teb_tail_alias_scan(pi: usize) {
         return;
     }
     let mut aliases = 0u64;
-    let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N)).min(CSRSS_FRAME_CAP);
-    let vas = core::ptr::addr_of!(CSRSS_FRAME_VA) as *const u64;
-    let pis = core::ptr::addr_of!(CSRSS_FRAME_PI) as *const u8;
-    let frames = core::ptr::addr_of!(CSRSS_FRAME_FR) as *const u64;
-    for index in 0..n {
-        if core::ptr::read(frames.add(index)) == frame {
+    for record in (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).records() {
+        if record.frame == frame {
             aliases += 1;
             print_str(b" | client-frame pi=");
-            print_u64(core::ptr::read(pis.add(index)) as u64);
+            print_u64(record.pi);
             print_str(b" va=0x");
-            print_hex_u64(core::ptr::read(vas.add(index)));
+            print_hex_u64(record.page);
         }
     }
     if let Some(chunks) = dll_cache_chunks() {
@@ -15319,7 +15197,7 @@ fn wait_reply_pool_insert_cap(cap: u64, used: bool) -> Option<usize> {
             return None;
         }
         if pool.capacity() != old_capacity {
-            mark_wait_table_growth_dirty();
+            mark_durable_table_growth_dirty();
         }
         pool.push(WaitReplyPoolRecord { cap, used });
         Some(pool.len() - 1)
@@ -15820,7 +15698,7 @@ unsafe fn delay_park(
         return false;
     }
     if queue.capacity() != old_capacity {
-        mark_wait_table_growth_dirty();
+        mark_durable_table_growth_dirty();
     }
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
@@ -25445,6 +25323,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     // The executive front-end allocates (ObjectClient etc.), so give it its own heap.
     map_own_heap();
+    if !client_frame_registry_reserve_initial() {
+        panic!("client frame registry allocation failed");
+    }
     if e_rm == 0 {
         if !wait_reply_pool_initialize(rm, WAIT_REPLY_POOL_INITIAL_RESERVE) {
             print_str(b"[reply-pool] initialize failed\n");

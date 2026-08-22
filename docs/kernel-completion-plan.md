@@ -9647,3 +9647,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     E1000 TX/RX. The later DC21x4 proof closed B3's packet-array receive target; continue with
     repeated driver/device scaling, additional NDIS protocol surfaces, and packaging/ownership
     cleanup without adding driver-name, service-name, or packet-success fallbacks.
+
+    Growable client-frame registry checkpoint (2026-08-22): the executive no longer stores
+    `(process, page) -> frame/cap` ownership in seven parallel arrays with a 32,768-row admission
+    limit. `nt-memory-manager` now owns a host-tested growable `ClientFrameRegistry`; it preserves
+    duplicate-registration enrichment, rejects conflicting frame/ownership keys atomically, compacts
+    removals, and reports live/capacity/high-water/growth/allocation/conflict telemetry. The executive
+    reserves 16,384 rows during bootstrap and pins any later reallocation above the service-loop
+    bump-heap rewind mark. SEC_IMAGE prefetch no longer treats bookkeeping capacity as memory
+    pressure: only actual root-CSpace and Untyped headroom throttle it. The 4,096-row recycled-frame
+    list remains intentionally bounded because it is a cache, not an ownership registry; overflow
+    deletes the frame cap and returns the underlying resources. Validation is green for
+    `cargo fmt --all`, `cargo test -p nt-memory-manager` (`13/13`), executive `cargo check
+    --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+    `git diff --check`, and serialized desktop proof
+    `.tmp/run-desktop-client-frame-registry-vec-20260822.log`. The proof reaches genuine Explorer
+    shell chrome and the sentinel with `293/293`; the final registry census is `10394` live,
+    `11536` high-water, `16384` capacity, zero runtime growth, zero allocation failures, and zero
+    frame/ownership conflicts. Review adjustment: this artificial frame-record wall is closed. Keep
+    root CSpace/cap banks and the recycled-frame cache bounded where their limits express real seL4
+    geometry or eviction policy; continue the owner-by-owner audit of remaining large fixed metadata
+    stores and replace only admission limits that are unrelated to a real kernel resource.

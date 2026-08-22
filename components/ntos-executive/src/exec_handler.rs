@@ -22387,7 +22387,7 @@ impl ExecNtHandler {
                                             let old_capacity = waiters.capacity();
                                             let wait_capacity = waiters.ensure_capacity();
                                             if wait_capacity && waiters.capacity() != old_capacity {
-                                                crate::mark_wait_table_growth_dirty();
+                                                crate::mark_durable_table_growth_dirty();
                                             }
                                             let reply_capacity =
                                                 REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0

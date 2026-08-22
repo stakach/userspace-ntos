@@ -20,7 +20,13 @@ use alloc::vec::Vec;
 
 use nt_cache_manager::{CachedStreamBacking, SharedCacheMap};
 
+mod client_frame;
 mod runtime_section;
+
+pub use client_frame::{
+    ClientFrameInsert, ClientFrameInsertError, ClientFrameRecord, ClientFrameRegistry,
+    ClientFrameRegistryStats,
+};
 
 pub use runtime_section::{
     GenericSection, GenericSectionBacking, GenericSectionTable, GenericSectionTableStats,
