@@ -9788,10 +9788,8 @@ pub(crate) unsafe fn service_sec_image(
                     if synchronous_file_wait_park(waiter) {
                         synchronous_file_wait_parked = true;
                         let waiter_tid = nt_handler.current_tid;
-                        let apc_interrupted = reconcile_user_apc_file_acquisition_wait(
-                            &mut nt_handler,
-                            waiter_tid,
-                        );
+                        let apc_interrupted =
+                            reconcile_user_apc_file_wait(&mut nt_handler, waiter_tid);
                         if !apc_interrupted {
                             trace_indefinite_wait_park(
                                 &nt_handler,
@@ -16064,6 +16062,7 @@ pub(crate) unsafe fn service_sec_image(
             if let Some((pending, wait_for_completion, reservation)) =
                 transfer_pending_file_io.take()
             {
+                let pending_tid = pending.tid;
                 pending_file_io_transfer(
                     pending,
                     wait_for_completion,
@@ -16072,6 +16071,9 @@ pub(crate) unsafe fn service_sec_image(
                     sp,
                     flags,
                 );
+                if wait_for_completion {
+                    let _ = reconcile_user_apc_file_wait(&mut nt_handler, pending_tid);
+                }
                 if wait_for_completion {
                     trace_indefinite_wait_park(
                         &nt_handler,
@@ -22862,7 +22864,7 @@ unsafe fn lsa_deliver_reply(nt_handler: &mut ExecNtHandler, replymsg: u64) -> bo
 
 /// Redirect one alertable pre-dispatch File acquisition waiter when its target
 /// thread has a queued user APC.
-pub(crate) unsafe fn reconcile_user_apc_file_acquisition_wait(
+unsafe fn reconcile_user_apc_file_acquisition_wait(
     nt_handler: &mut ExecNtHandler,
     tid: u64,
 ) -> bool {
@@ -22948,6 +22950,61 @@ pub(crate) unsafe fn reconcile_user_apc_file_acquisition_wait(
     thread_wait_state_clear_badge_ready(nt_handler, removed.badge);
     bump_progress();
     true
+}
+
+/// Reconcile a queued APC with either phase of an alertable synchronous File
+/// wait. Pre-dispatch acquisition returns immediately; an in-flight IRP is
+/// cancelled exactly and remains parked until terminal completion wins.
+pub(crate) unsafe fn reconcile_user_apc_file_wait(
+    nt_handler: &mut ExecNtHandler,
+    tid: u64,
+) -> bool {
+    if reconcile_user_apc_file_acquisition_wait(nt_handler, tid) {
+        return true;
+    }
+    let Some((slot, pending)) = (&*core::ptr::addr_of!(PENDING_FILE_IO))
+        .user_apc_interrupt_candidate(tid)
+    else {
+        return false;
+    };
+    let Ok(target_tid) = nt_process::ThreadId::try_from(tid) else {
+        return false;
+    };
+    if nt_handler.pm.peek_user_apc(target_tid).is_none()
+        || nt_handler.file_completion.io_mode(pending.file_id)
+            != Ok(nt_io_completion::FileIoMode::SynchronousAlertable)
+    {
+        return false;
+    }
+
+    // A terminal manager result means the I/O completion won the alert race.
+    // Leave the APC queued for a later alertable wait and let normal redrive
+    // return this operation's real result.
+    if driver_launch::completed_irp_exact(pending.irp_id).is_some() {
+        FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+        return false;
+    }
+    (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+        .mark_user_apc_interrupt_requested_exact(
+            slot,
+            pending.irp_id,
+            pending.file_id,
+            pending.tid,
+        )
+        .expect("APC interruption candidate lost its exact pending File owner");
+
+    match driver_launch::cancel_irp_if_pending(pending.irp_id) {
+        Ok(true) => {
+            FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+            true
+        }
+        Ok(false) | Err(_) => {
+            (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                .rollback_user_apc_interrupt_requested_exact(slot, pending.irp_id)
+                .expect("failed APC interruption lost its exact pending File owner");
+            false
+        }
+    }
 }
 
 /// Transfer one general File syscall into its exact pending-IRP delivery owner. Synchronous
@@ -23257,6 +23314,11 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
     let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
     let saved_pi = nt_handler.pi;
+    let saved_tid = nt_handler.current_tid;
+    let saved_badge = nt_handler.current_badge;
+    let saved_resume_ip = nt_handler.current_resume_ip;
+    let saved_sp = nt_handler.current_sp;
+    let saved_flags = nt_handler.current_flags;
     let saved_ctx = nt_handler.loop_ctx.take();
     macro_rules! restore_file_io_mirrors {
         () => {{
@@ -23268,6 +23330,11 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
             ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
             nt_handler.pi = saved_pi;
+            nt_handler.current_tid = saved_tid;
+            nt_handler.current_badge = saved_badge;
+            nt_handler.current_resume_ip = saved_resume_ip;
+            nt_handler.current_sp = saved_sp;
+            nt_handler.current_flags = saved_flags;
         }};
     }
 
@@ -23312,6 +23379,11 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         ACTIVE_CLIENT_PI.store(pending.pi as u64, Ordering::Relaxed);
         ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
         nt_handler.pi = pending.pi as usize;
+        nt_handler.current_tid = pending.tid;
+        nt_handler.current_badge = pending.badge;
+        nt_handler.current_resume_ip = pending.resume_ip;
+        nt_handler.current_sp = pending.resume_sp;
+        nt_handler.current_flags = pending.resume_flags;
 
         let mut delivery_state = (&*core::ptr::addr_of!(PENDING_FILE_IO))
             .get(slot)
@@ -23613,11 +23685,20 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         if pending.reply_required
             && delivery_state & nt_io_manager::IO_DELIVERY_REPLY_PUBLISHED == 0
         {
+            if pending.user_apc_interrupt_requested
+                && nt_handler.stage_current_user_apc(terminal_status) != Ok(true)
+            {
+                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                restore_file_io_mirrors!();
+                continue;
+            }
             let cap = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
                 .claim_reply_cap_exact(slot, pending.irp_id)
                 .expect("pending File reply owner disappeared")
                 .expect("pending File reply cap was claimed without publication");
-            if pending.native_call_transport {
+            if pending.user_apc_interrupt_requested {
+                let _ = client_reply_on(cap, 0, 0, 0, 0, 0);
+            } else if pending.native_call_transport {
                 let _ = client_reply_on(cap, 1, terminal_status as u64, 0, 0, 0);
             } else {
                 let mut index = 4;

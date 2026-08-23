@@ -29315,6 +29315,18 @@ pub(crate) unsafe fn request_cancel_irp(irp_id: u64) -> Result<(), u32> {
     Ok(())
 }
 
+pub(crate) unsafe fn cancel_irp_if_pending(irp_id: u64) -> Result<bool, u32> {
+    if irp_id == 0 {
+        return Err(STATUS_INVALID_PARAMETER as u32);
+    }
+    let io = io_manager_mut();
+    let selected = io
+        .cancel_if_pending(ClientId(IO_MANAGER_COMPONENT_ID), IrpId(irp_id))
+        .map_err(|status| status.raw() as u32)?;
+    io.pump();
+    Ok(selected)
+}
+
 /// Request cancellation of the current thread's exact canonical File IRPs and return the manager's
 /// post-pump drain state. Caller-visible completion remains owned by each IRP's delivery record.
 pub(crate) unsafe fn cancel_file_thread_io(

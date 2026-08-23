@@ -10678,3 +10678,45 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     neither `STATUS_USER_APC` nor `STATUS_CANCELLED` may be synthesized. Last-handle CLEANUP remains
     the following FIFO owner, then LISTEN/root WAIT/control-buffer cleanup proceeds in the recorded
     order.
+
+    Pending synchronous-IRP APC checkpoint (2026-08-24): a user APC queued after dispatch can now
+    interrupt exactly one already-pending request on a synchronous-alertable File. `PendingFileIo`
+    carries an exact, initially-clear interruption owner bit; selection requires the matching thread,
+    File generation, synchronous reply owner, transfer delivery state, and canonical
+    `SynchronousAlertable` File mode. The I/O Manager exposes exact `IrpId` cancellation: an unknown
+    or already-terminal request is left alone, a pending request is cancelled once, and a repeated
+    observation of the same cancel request is idempotent. No thread-wide or File-wide cancellation
+    scan participates.
+
+    The completion race remains authoritative. Reconciliation pumps the backend and checks for an
+    exact terminal result before marking cancellation, so ordinary completion can win and leave the
+    APC queued for the next alertable boundary. Once interruption wins, the syscall remains parked
+    non-alertably until the exact IRP reaches a real terminal result. The ordinary completion path
+    still publishes output, IOSB, explicit event or synchronous File signal, APC-or-IOCP state, and
+    releases the File Busy owner before staging the queued user APC. `KiUserApcDispatcher` receives
+    that real terminal status in its saved context, the parked syscall Reply cap is consumed with the
+    length-zero redirect shape, and only then are backend ACK and the retained File reference
+    released. Teardown now requests the same exact cancellation instead of re-dispatching a second
+    cancel operation.
+
+    Focused validation is green for `nt-io-manager` (`182/182`), `nt-thread-start` (`14/14`), and the
+    freestanding executive check. Tests prove sibling-IRP isolation, foreign-client denial,
+    idempotent exact cancellation, a terminal success winning the cancel race, exact pending-row
+    mark/rollback, asynchronous and post-delivery exclusion, and propagation of an arbitrary terminal
+    status through the APC context. Serialized desktop proof
+    `.tmp/run-desktop-20260824-001417.log` is accepted for the integrated tree: genuine Explorer
+    reaches 2 BeginPaint, 20 EndPaint, 185 direct GDI returns, and 131 batch flushes carrying 171
+    records; all 786,432 framebuffer pixels are non-background with at least 32 colors, all `293/293`
+    checks pass, and the sentinel is emitted. The immediately preceding run
+    `.tmp/run-desktop-20260823-234917.log` suspended a user thread on a null-page fault before the
+    quiescence gate; the clean retry passed beyond that point. The accepted workload did not exercise
+    this APC edge, so on-target proof remains a future deterministic cancellation stimulus and the
+    one-run boot fault remains recorded as residual timing risk.
+
+    Review adjustment: the pre-dispatch and already-pending synchronous File APC owners are complete
+    at the implementation and focused-test boundary. Next transfer the last user-handle reference to
+    a cleanup owner and enqueue `IRP_MJ_CLEANUP` behind the same File Busy FIFO, preserving ordinary
+    operation order and the manager's pending lifecycle ownership. After that, migrate
+    `FSCTL_PIPE_LISTEN` into `PendingFileIo`, route root `FSCTL_PIPE_WAIT` through the canonical
+    hosted File/device boundary, remove their compatibility tables, and replace the 16 KiB hosted
+    control-buffer ceiling with growable or banked transport.

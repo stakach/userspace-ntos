@@ -10614,7 +10614,7 @@ impl ExecNtHandler {
                     print_str(b"\n");
                 }
                 let _ = unsafe {
-                    crate::service_sec_image::reconcile_user_apc_file_acquisition_wait(
+                    crate::service_sec_image::reconcile_user_apc_file_wait(
                         self,
                         target_tid as u64,
                     )
@@ -10998,6 +10998,7 @@ impl ExecNtHandler {
                     sync_lock_owner_tid: 0,
                     badge: self.current_badge,
                     consumer_abandoned: false,
+                    user_apc_interrupt_requested: false,
                     output_va: args[8],
                     output_len: raw_output_len as u32,
                     output_offset: 0,
@@ -11089,7 +11090,7 @@ impl ExecNtHandler {
         (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
             .abandon_thread_transfers_with(tid, |pending| transfers.push(pending));
         for pending in transfers.iter().copied() {
-            let _ = driver_launch::request_cancel_irp(pending.irp_id);
+            let _ = driver_launch::cancel_irp_if_pending(pending.irp_id);
             if pending.reply_cap != 0 {
                 release_reply_pool_cap(pending.reply_cap);
             }
@@ -18342,6 +18343,7 @@ impl ExecNtHandler {
                 sync_lock_owner_tid: 0,
                 badge: self.current_badge,
                 consumer_abandoned: false,
+                user_apc_interrupt_requested: false,
                 output_va: 0,
                 output_len: 0,
                 output_offset: 0,
@@ -20046,9 +20048,7 @@ impl ExecNtHandler {
                 }
                 if status == nt_fs::STATUS_SUCCESS {
                     let _ = unsafe {
-                        crate::service_sec_image::reconcile_user_apc_file_acquisition_wait(
-                            self, apc_tid,
-                        )
+                        crate::service_sec_image::reconcile_user_apc_file_wait(self, apc_tid)
                     };
                 }
             }
@@ -21306,7 +21306,7 @@ impl ExecNtHandler {
                         print_hex_u64(apc.routine);
                         print_str(b"\n");
                         let _ = unsafe {
-                            crate::service_sec_image::reconcile_user_apc_file_acquisition_wait(
+                            crate::service_sec_image::reconcile_user_apc_file_wait(
                                 self,
                                 target_tid as u64,
                             )
@@ -23308,6 +23308,7 @@ impl ExecNtHandler {
                             sync_lock_owner_tid: 0,
                             badge: self.current_badge,
                             consumer_abandoned: false,
+                            user_apc_interrupt_requested: false,
                             output_va: args[8],
                             output_len: raw_output_len as u32,
                             output_offset: 0,
@@ -27850,6 +27851,7 @@ impl ExecNtHandler {
                                 sync_lock_owner_tid: 0,
                                 badge: self.current_badge,
                                 consumer_abandoned: false,
+                                user_apc_interrupt_requested: false,
                                 output_va: output,
                                 output_len: output_capacity as u32,
                                 output_offset: 0,
@@ -29146,6 +29148,7 @@ impl ExecNtHandler {
                         sync_lock_owner_tid: 0,
                         badge: self.current_badge,
                         consumer_abandoned: false,
+                        user_apc_interrupt_requested: false,
                         output_va: 0,
                         output_len: 0,
                         output_offset: 0,
@@ -29634,6 +29637,7 @@ impl ExecNtHandler {
                         sync_lock_owner_tid: 0,
                         badge: self.current_badge,
                         consumer_abandoned: false,
+                        user_apc_interrupt_requested: false,
                         output_va: buffer,
                         output_len: len as u32,
                         output_offset: 0,
@@ -29979,6 +29983,7 @@ impl ExecNtHandler {
                                             sync_lock_owner_tid: 0,
                                             badge: self.current_badge,
                                             consumer_abandoned: false,
+                                            user_apc_interrupt_requested: false,
                                             output_va: 0,
                                             output_len: 0,
                                             output_offset: 0,
@@ -30196,6 +30201,7 @@ impl ExecNtHandler {
                             sync_lock_owner_tid: 0,
                             badge: self.current_badge,
                             consumer_abandoned: false,
+                            user_apc_interrupt_requested: false,
                             output_va: 0,
                             output_len: 0,
                             output_offset: 0,

@@ -2582,6 +2582,50 @@ mod tests {
     }
 
     #[test]
+    fn cancel_if_pending_targets_only_one_exact_irp() {
+        let mut mock = MockDriverBackend::new();
+        mock.set_force_pending(true);
+        let (mut om, client, handle) = open_device_with(mock, AccessMask::GENERIC_READ);
+        let mut output = [0u8; 8];
+        assert_eq!(
+            om.read(client, handle, 0, &mut output),
+            Err(NtStatus::PENDING)
+        );
+        assert_eq!(
+            om.read(client, handle, 1, &mut output),
+            Err(NtStatus::PENDING)
+        );
+        let irps = om.pending_irps();
+        assert_eq!(irps.len(), 2);
+
+        assert!(om.cancel_if_pending(client, irps[0]).unwrap());
+        assert_eq!(om.irp(irps[0]).unwrap().state, IrpState::CancelRequested);
+        assert_eq!(om.irp(irps[1]).unwrap().state, IrpState::Pending);
+        assert!(om.cancel_if_pending(client, irps[0]).unwrap());
+        assert!(!om.cancel_if_pending(client, IrpId(u64::MAX)).unwrap());
+        let other = om.register_client();
+        assert_eq!(
+            om.cancel_if_pending(other, irps[1]),
+            Err(NtStatus::ACCESS_DENIED)
+        );
+        assert_eq!(om.irp(irps[1]).unwrap().state, IrpState::Pending);
+    }
+
+    #[test]
+    fn cancel_if_pending_preserves_a_terminal_completion_that_won() {
+        let mut mock = MockDriverBackend::new();
+        mock.set_force_pending(true);
+        mock.set_pending_completion(NtStatus::SUCCESS, 4);
+        let (mut om, client, irp) = pending_read(mock);
+
+        assert_eq!(om.pump(), 1);
+        assert_eq!(om.completed_irp(irp).unwrap().status, NtStatus::SUCCESS);
+        assert!(!om.cancel_if_pending(client, irp).unwrap());
+        assert_eq!(om.completed_irp(irp).unwrap().status, NtStatus::SUCCESS);
+        om.acknowledge_completed_irp(irp).unwrap();
+    }
+
+    #[test]
     fn abandoned_pending_irp_is_cancelled_and_reclaimed_without_delivery() {
         let mut mock = MockDriverBackend::new();
         mock.set_force_pending(true);

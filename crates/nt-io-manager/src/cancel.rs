@@ -137,6 +137,28 @@ impl<P: ObjectManagerPort> IoManager<P> {
         Ok(())
     }
 
+    /// Request cancellation only when this exact IRP is still in flight. The
+    /// boolean distinguishes a selected pending owner from an unknown or
+    /// already-terminal generation, and an existing CancelRequested owner is
+    /// not redispatched to its backend.
+    pub fn cancel_if_pending(&mut self, client: ClientId, irp_id: IrpId) -> Result<bool, NtStatus> {
+        let (owner, state) = match self.irp(irp_id) {
+            Some(irp) => (irp.client_id, irp.state),
+            None => return Ok(false),
+        };
+        if owner != client {
+            return Err(NtStatus::ACCESS_DENIED);
+        }
+        match state {
+            IrpState::Pending => {
+                self.cancel(client, irp_id)?;
+                Ok(true)
+            }
+            IrpState::CancelRequested => Ok(true),
+            _ => Ok(false),
+        }
+    }
+
     /// Relinquish delivery of one exact IRP. Pending work is cancelled through
     /// its owning backend; whichever terminal result wins is acknowledged and
     /// reclaimed automatically instead of being exposed to a departed consumer.

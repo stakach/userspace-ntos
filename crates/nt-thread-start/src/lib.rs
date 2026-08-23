@@ -654,6 +654,28 @@ mod tests {
     }
 
     #[test]
+    fn user_apc_context_preserves_an_io_terminal_status() {
+        let mut bytes = [0u8; AMD64_CONTEXT_SIZE];
+        assert!(initialize_amd64_user_apc_context(
+            &mut bytes,
+            &[0u64; 20],
+            0x7fff_1234,
+            0x7000_ff00,
+            0x202,
+            0xc000_0120,
+            1,
+            2,
+            3,
+            4,
+        ));
+        let offset = CONTEXT_RAX_OFFSET as usize;
+        assert_eq!(
+            u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()),
+            0xc000_0120
+        );
+    }
+
+    #[test]
     fn context_initializer_rejects_short_storage() {
         let mut bytes = [0u8; AMD64_CONTEXT_SIZE - 1];
         assert!(!initialize_amd64_user_context(&mut bytes, 1, 2, 3));

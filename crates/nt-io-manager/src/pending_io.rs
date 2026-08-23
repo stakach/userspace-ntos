@@ -76,6 +76,9 @@ pub struct PendingFileIo {
     /// The initiating thread is gone, but the canonical IRP owner must remain until terminal
     /// completion so its synchronous File lock and retained reference are released in order.
     pub consumer_abandoned: bool,
+    /// A queued user APC interrupted the alertable synchronous IRP wait. The
+    /// caller remains parked until this exact IRP reaches a real terminal result.
+    pub user_apc_interrupt_requested: bool,
     /// Optional caller output buffer and its byte capacity.
     pub output_va: u64,
     pub output_len: u32,
@@ -230,6 +233,7 @@ impl PendingFileIoTable {
                 || pending.sync_lock_owner_tid == 0)
             && (!pending.consumer_abandoned
                 || matches!(pending.operation, PendingFileIoOperation::Transfer))
+            && !pending.user_apc_interrupt_requested
             && (pending.output_len == 0 || pending.output_va != 0)
             && (pending.apc_routine == 0 || !pending.publish_iocp)
             && pending.reply_required == (pending.reply_cap != 0)
@@ -352,6 +356,62 @@ impl PendingFileIoTable {
 
     pub fn get(&self, slot: usize) -> Option<PendingFileIo> {
         self.slots.get(slot).copied().flatten()
+    }
+
+    /// Find one synchronous transfer owner whose alertable wait can be
+    /// interrupted. File-mode alertability remains canonical in the File policy
+    /// table and must be checked by the caller before marking this record.
+    pub fn user_apc_interrupt_candidate(&self, tid: u64) -> Option<(usize, PendingFileIo)> {
+        self.slots.iter().enumerate().find_map(|(slot, pending)| {
+            pending
+                .filter(|pending| {
+                    pending.tid == tid
+                        && pending.sync_lock_owner_tid == tid
+                        && pending.reply_required
+                        && !pending.consumer_abandoned
+                        && !pending.user_apc_interrupt_requested
+                        && pending.delivery_state == 0
+                        && matches!(pending.operation, PendingFileIoOperation::Transfer)
+                })
+                .map(|pending| (slot, pending))
+        })
+    }
+
+    pub fn mark_user_apc_interrupt_requested_exact(
+        &mut self,
+        slot: usize,
+        irp_id: u64,
+        file_id: u64,
+        tid: u64,
+    ) -> Option<()> {
+        let pending = self.slots.get_mut(slot)?.as_mut()?;
+        if pending.irp_id != irp_id
+            || pending.file_id != file_id
+            || pending.tid != tid
+            || pending.sync_lock_owner_tid != tid
+            || !pending.reply_required
+            || pending.consumer_abandoned
+            || pending.user_apc_interrupt_requested
+            || pending.delivery_state != 0
+            || !matches!(pending.operation, PendingFileIoOperation::Transfer)
+        {
+            return None;
+        }
+        pending.user_apc_interrupt_requested = true;
+        Some(())
+    }
+
+    pub fn rollback_user_apc_interrupt_requested_exact(
+        &mut self,
+        slot: usize,
+        irp_id: u64,
+    ) -> Option<()> {
+        let pending = self.slots.get_mut(slot)?.as_mut()?;
+        if pending.irp_id != irp_id || !pending.user_apc_interrupt_requested {
+            return None;
+        }
+        pending.user_apc_interrupt_requested = false;
+        Some(())
     }
 
     /// Validate that a terminal manager projection belongs to this exact delivery owner.
@@ -575,6 +635,7 @@ impl PendingFileIoTable {
             }
             let original = *pending;
             pending.consumer_abandoned = true;
+            pending.user_apc_interrupt_requested = false;
             pending.output_va = 0;
             pending.output_len = 0;
             pending.output_offset = 0;
@@ -650,6 +711,7 @@ mod tests {
             sync_lock_owner_tid: 0,
             badge: 9,
             consumer_abandoned: false,
+            user_apc_interrupt_requested: false,
             output_va: 0x1000,
             output_len: 64,
             output_offset: 0,
@@ -870,6 +932,45 @@ mod tests {
             .mark_delivery_exact(slot, 2, IO_DELIVERY_FILE_LOCK_RELEASED)
             .unwrap();
         assert!(table.completion_surfaces_published_exact(slot, 2));
+    }
+
+    #[test]
+    fn user_apc_interruption_marks_only_one_exact_synchronous_transfer() {
+        let mut table = PendingFileIoTable::new();
+        let asynchronous_slot = table.park(pending(1, 2, 7)).unwrap();
+        let mut synchronous = pending(3, 4, 7);
+        synchronous.sync_lock_owner_tid = 7;
+        let synchronous_slot = table.park(synchronous).unwrap();
+
+        let (slot, candidate) = table.user_apc_interrupt_candidate(7).unwrap();
+        assert_eq!(slot, synchronous_slot);
+        assert_eq!(candidate.irp_id, 4);
+        assert!(table
+            .mark_user_apc_interrupt_requested_exact(slot, 5, 3, 7)
+            .is_none());
+        table
+            .mark_user_apc_interrupt_requested_exact(slot, 4, 3, 7)
+            .unwrap();
+        assert!(table.user_apc_interrupt_candidate(7).is_none());
+        assert!(
+            !table
+                .get(asynchronous_slot)
+                .unwrap()
+                .user_apc_interrupt_requested
+        );
+        assert!(table.get(slot).unwrap().user_apc_interrupt_requested);
+        assert!(table
+            .rollback_user_apc_interrupt_requested_exact(slot, 5)
+            .is_none());
+        table
+            .rollback_user_apc_interrupt_requested_exact(slot, 4)
+            .unwrap();
+        assert_eq!(table.user_apc_interrupt_candidate(7).unwrap().0, slot);
+
+        table
+            .mark_delivery_exact(slot, 4, IO_DELIVERY_IOSB_PUBLISHED)
+            .unwrap();
+        assert!(table.user_apc_interrupt_candidate(7).is_none());
     }
 
     #[test]
