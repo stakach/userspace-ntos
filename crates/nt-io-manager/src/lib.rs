@@ -100,6 +100,16 @@ pub use nt_io_abi::{
     FileObjectProjection, IoRequestId, IrpId,
 };
 
+#[inline]
+pub(crate) const fn is_create_major(major: u8) -> bool {
+    matches!(
+        major,
+        nt_io_abi::major::IRP_MJ_CREATE
+            | nt_io_abi::major::IRP_MJ_CREATE_NAMED_PIPE
+            | nt_io_abi::major::IRP_MJ_CREATE_MAILSLOT
+    )
+}
+
 /// The canonical I/O Manager (spec §6): owns the driver / device / file / IRP
 /// stores, the registered dispatch backends, and the port to the Object Manager
 /// (`P`). Single-threaded (`&mut self`).
@@ -525,7 +535,7 @@ impl<P> IoManager<P> {
                 .ok_or(NtStatus::INVALID_PARAMETER)?
                 .driver_id;
             let valid_state = match record.major {
-                nt_io_abi::major::IRP_MJ_CREATE => file.state == FileState::Allocated,
+                major if is_create_major(major) => file.state == FileState::Allocated,
                 nt_io_abi::major::IRP_MJ_CLEANUP => file.state == FileState::CleanupPending,
                 nt_io_abi::major::IRP_MJ_CLOSE => file.state == FileState::ClosePending,
                 _ => file.state == FileState::Open,
@@ -537,7 +547,7 @@ impl<P> IoManager<P> {
             {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
-            if record.major != nt_io_abi::major::IRP_MJ_CREATE {
+            if !is_create_major(record.major) {
                 record.user_data = file.driver_context.unwrap_or(0);
             }
             let file = self.files.get_mut(file_id).expect("validated file");
@@ -1906,6 +1916,82 @@ mod tests {
     }
 
     #[test]
+    fn external_named_pipe_create_uses_the_canonical_file_lifecycle() {
+        let mut om = io();
+        let client = ClientId(67);
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(std::vec::Vec::new()));
+        let driver = om
+            .create_driver(
+                &path("\\Driver\\ExternalNamedPipe"),
+                Box::new(RecordingBackend {
+                    seen: seen.clone(),
+                    status: NtStatus::SUCCESS,
+                    information: 0,
+                    file_context: Some(0xCCB1),
+                    output: std::vec::Vec::new(),
+                }),
+            )
+            .unwrap();
+        let device = om
+            .create_device(
+                driver,
+                Some(&path("\\Device\\ExternalNamedPipe0")),
+                DeviceType::NAMED_PIPE,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let file_id = om
+            .allocate_external_file(
+                client,
+                device,
+                AccessMask::GENERIC_READ | AccessMask::GENERIC_WRITE,
+                ShareAccess::READ | ShareAccess::WRITE,
+                CreateOptions::empty(),
+                Some(path("\\pipe\\svc")),
+            )
+            .unwrap();
+        let mut empty = [];
+        assert_eq!(
+            om.build_and_dispatch_external_to_device(
+                client,
+                device,
+                Some(file_id),
+                0xDEAD,
+                79,
+                major::IRP_MJ_CREATE_NAMED_PIPE,
+                IoParameters::Create(CreateParameters::default()),
+                0,
+                0,
+                &mut empty,
+            ),
+            Ok(ExternalDispatchResult::Completed {
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: Some(0xCCB1),
+            })
+        );
+        assert_eq!(om.external_file_context(client, file_id), Ok(Some(0xCCB1)));
+        om.release_external_file(client, file_id).unwrap();
+        assert!(om.file(file_id).is_none());
+        let seen = seen.borrow();
+        assert_eq!(
+            seen.iter()
+                .map(|entry| entry.major)
+                .collect::<std::vec::Vec<_>>(),
+            [
+                major::IRP_MJ_CREATE_NAMED_PIPE,
+                major::IRP_MJ_CLEANUP,
+                major::IRP_MJ_CLOSE,
+            ]
+        );
+        assert!(seen.iter().all(|entry| entry.file_id == Some(file_id)));
+        assert_eq!(seen[0].user_data, 0);
+        assert!(seen[1..].iter().all(|entry| entry.user_data == 0xCCB1));
+    }
+
+    #[test]
     fn io_on_bad_handle_rejected() {
         let (mut om, client, _handle) =
             open_device_with(MockDriverBackend::new(), AccessMask::GENERIC_READ);
@@ -2047,7 +2133,7 @@ mod tests {
             _ctx: DispatchContext<'_>,
             irp: &IrpProjection,
         ) -> Result<DispatchOutcome, NtStatus> {
-            if irp.major == major::IRP_MJ_CREATE {
+            if is_create_major(irp.major) {
                 Ok(DispatchOutcome::Pending)
             } else {
                 Ok(DispatchOutcome::Completed {
@@ -2106,6 +2192,64 @@ mod tests {
         om.acknowledge_completed_irp(irp).unwrap();
         assert!(om.file(file_id).is_none());
         assert_eq!(om.port().retained_reference_count(), 0);
+    }
+
+    #[test]
+    fn releasing_pending_external_named_pipe_create_cancels_and_retires_file() {
+        let mut om = io();
+        let client = om.register_client();
+        let driver = om
+            .create_driver(
+                &path("\\Driver\\PendingExternalPipe"),
+                Box::new(PendingCreateBackend::default()),
+            )
+            .unwrap();
+        let device = om
+            .create_device(
+                driver,
+                Some(&path("\\Device\\PendingExternalPipe0")),
+                DeviceType::NAMED_PIPE,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let file_id = om
+            .allocate_external_file(
+                client,
+                device,
+                AccessMask::GENERIC_READ,
+                ShareAccess::READ,
+                CreateOptions::empty(),
+                Some(path("\\pipe\\pending")),
+            )
+            .unwrap();
+        let mut empty = [];
+        let pending = om
+            .build_and_dispatch_external_to_device(
+                client,
+                device,
+                Some(file_id),
+                0,
+                80,
+                major::IRP_MJ_CREATE_NAMED_PIPE,
+                IoParameters::Create(CreateParameters::default()),
+                0,
+                0,
+                &mut empty,
+            )
+            .unwrap();
+        let irp_id = match pending {
+            ExternalDispatchResult::Pending { irp_id } => irp_id,
+            other => panic!("expected pending named-pipe create, got {other:?}"),
+        };
+        om.release_external_file(client, file_id).unwrap();
+        assert_eq!(om.file(file_id).unwrap().state, FileState::ClosePending);
+        assert_eq!(om.irp(irp_id).unwrap().state, IrpState::CancelRequested);
+        assert_eq!(om.pump(), 1);
+        assert!(om.file(file_id).is_none());
+        assert!(om.irp(irp_id).is_none());
+        assert!(om.next_completed_irp().is_none());
     }
 
     fn pending_read(mock: MockDriverBackend) -> (IoManager<MockObjectPort>, ClientId, IrpId) {

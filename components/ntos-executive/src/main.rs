@@ -1058,7 +1058,6 @@ pub const SSN_NT_SAVE_KEY: u64 = 215;
 /// `Ccb->FileObject[end]` pointing at a RECYCLED pool block it then writes through
 /// (`NpSetFileObject(…, NULL, NULL, …)` on disconnect), corrupting its own data-queue bookkeeping.
 /// See the per-open FILE_OBJECT registry in `driver_launch`.
-pub const FSD_FILE_OBJECT_PER_OPEN: bool = true;
 /// The npfs C-i round-trip verdict (three IRPs with mutually distinguishable completions, each of
 /// which returned its OWN result) — the behavioural leg of `exec_irp_transport_call_bound`. The
 /// `FSD_DISPATCH_SEQ_HANDSHAKE` bypass switch this replaces is GONE: under the `Call` transport a
@@ -7014,7 +7013,8 @@ static SCM_WORKER_FAULTS: AtomicU64 = AtomicU64::new(0);
 ///
 /// Turning it on also root-caused a fourth, unrelated defect that is fixed UNCONDITIONALLY: the
 /// component pump did not screen BOUND-NOTIFICATION deliveries, so an HPET tick could satisfy a
-/// pump's blocking `Recv` and WALL the component (`exec_pump_screens_bound_notification`).
+/// pump's blocking `Recv` and WALL the component. The ordinary pump still screens and counts real
+/// timer deliveries; the old synthetic injection gate has been retired.
 ///
 /// **What the route buys, measured against a route-OFF control boot of the same binaries:**
 /// `SamIConnect-null-root-miss` 1 -> **0** (the wall is gone), `sam-setup-keys` 2 -> **36**,
@@ -15409,103 +15409,6 @@ fn release_reply_pool_cap(cap: u64) {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BoundNotificationInjection {
-    NotArmed,
-    TemporaryNotification,
-    DelayTimerNotification,
-}
-
-impl BoundNotificationInjection {
-    const fn armed(self) -> bool {
-        !matches!(self, Self::NotArmed)
-    }
-}
-
-/// ★ NEGATIVE CONTROL for `spawn_hosts::pump_recv`'s bound-notification screening (Phase 4).
-///
-/// Reproduce, deterministically and without touching the HPET, the delivery that WALLED npfs on the
-/// first LSA-route boot: a notification BOUND to the executive's root TCB cancelling a
-/// `component_pump` recv. The kernel's bound-notification pre-check
-/// (`syscall_handler.rs::handle_recv`) returns `rdi = badge`, `rsi = 0`, leaves the message
-/// registers untouched, and does not bind the receive's reply capability, so an unscreened pump
-/// reads `label = 0` with MR0 still holding the request tag it just replied with — and suspends +
-/// retires the component.
-///
-/// Signal the production delay-timer notification when it already exists. Otherwise, mint a temporary
-/// notification badged **`DELAY_TIMER_BADGE`** (the pump screens on exactly that badge, so this
-/// exercises the production path, not a test-only one), bind it to the root TCB, signal it, and
-/// return. The caller then runs a REAL component dispatch, whose first `pump_recv` takes the
-/// delivery. We unbind only a temporary notification; if the real delay timer is already active,
-/// tearing down the production binding would remove the boot's timer/deadman wake path.
-///
-/// Deliberately does NOT use the HPET: no comparator is armed, no IOAPIC route is claimed and no IRQ
-/// is left needing an Ack, so the temporary injection cannot perturb the real delay-timer plane.
-unsafe fn inject_bound_notification_tick() -> BoundNotificationInjection {
-    let timer_badged = DELAY_TIMER_BADGED_NOTIFICATION.load(Ordering::Relaxed);
-    if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) != 0 && timer_badged != 0 {
-        let notification = DELAY_TIMER_NOTIFICATION.load(Ordering::Relaxed);
-        if notification != 0 {
-            let _ = syscall5(
-                SYS_SEND,
-                1,
-                LBL_TCB_BIND_NOTIFICATION << 12,
-                notification,
-                0,
-                0,
-            );
-        }
-        let _ = syscall5(SYS_SEND, timer_badged, 0, 0, 0, 0);
-        return BoundNotificationInjection::DelayTimerNotification;
-    }
-
-    let notification = make_object(OBJ_NOTIFICATION);
-    if notification == 0 {
-        return BoundNotificationInjection::NotArmed;
-    }
-    let badged = alloc_slot();
-    if badged == 0 {
-        return BoundNotificationInjection::NotArmed;
-    }
-    let mint = syscall5(
-        SYS_SEND,
-        CAP_INIT_THREAD_CNODE,
-        LBL_CNODE_MINT << 12,
-        badged,
-        notification,
-        DELAY_TIMER_BADGE,
-    );
-    // The initial root TCB cap is slot 1 (same constant `delay_timer_init` uses).
-    let bind = syscall5(
-        SYS_SEND,
-        1,
-        LBL_TCB_BIND_NOTIFICATION << 12,
-        notification,
-        0,
-        0,
-    );
-    // Send on a Notification cap IS `signal()` (`syscall_handler.rs::handle_send`), so the object
-    // becomes Active with our badge and the next blocking Recv on ANY endpoint returns it.
-    let signal = syscall5(SYS_SEND, badged, 0, 0, 0, 0);
-    let _ = (mint, bind, signal);
-    BoundNotificationInjection::TemporaryNotification
-}
-
-/// Undo [`inject_bound_notification_tick`]'s binding once the dispatch under test has consumed the
-/// delivery, so nothing else on the boot can be interrupted by it.
-unsafe fn cleanup_bound_notification_tick(
-    injection: BoundNotificationInjection,
-    pending_before: u64,
-) {
-    let pending_after = DELAY_TIMER_TICKS_PENDING.load(Ordering::Relaxed);
-    if pending_after > pending_before {
-        DELAY_TIMER_TICKS_PENDING.store(pending_after - 1, Ordering::Relaxed);
-    }
-    if injection == BoundNotificationInjection::TemporaryNotification {
-        let _ = syscall5(SYS_SEND, 1, LBL_TCB_UNBIND_NOTIFICATION << 12, 0, 0, 0);
-    }
-}
-
 fn ioapic_route_pin_mask(pin: u64) -> u32 {
     if pin < 32 {
         1u32 << (pin as u32)
@@ -21314,11 +21217,12 @@ struct ExecNtHandler {
     /// / TRANSCEIVE) when the npfs pipe returns STATUS_PENDING: the LOOP must PARK this caller
     /// (steal its reply cap into the PipeWaiterTable keyed by the reading end's npfs file-id, rotate
     /// REPLY_MAIN to a fresh pool object) instead of returning PENDING, and re-drive it when the peer
-    /// writes. `pipe_park_device_id` is the owning NT device id and `pipe_park_fid` = the reading
-    /// end's npfs `FsContext` (0 = no park request). The rest is the completion context the re-drive
+    /// writes. `pipe_park_file_id` is the canonical FileId and `pipe_park_fid` is the reading end's
+    /// npfs `FsContext` (0 = no park request). The rest is the completion context the re-drive
     /// needs (user buffer/IOSB VAs + capacity + transceive flag).
     /// Reset each dispatch (group-A signal, like `io_signal_event`).
-    pipe_park_device_id: u64,
+    /// Canonical generation-protected FileId retained for completion ownership.
+    pipe_park_file_id: u64,
     pipe_park_fid: u64,
     pipe_park_irp_id: u64,
     pipe_park_buffer_va: u64,
@@ -28273,13 +28177,48 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // NpFsdCreateNamedPipe through a real FILE_OBJECT + IO_STACK_LOCATION. Proves the
                 // routing path is real without consuming the live SCM `\ntsvcs` server instance.
                 let name16: [u8; 16] = *b"\\\0n\0t\0s\0t\0e\0s\0t\0";
+                let name_units = [
+                    b'\\' as u16,
+                    b'n' as u16,
+                    b't' as u16,
+                    b's' as u16,
+                    b't' as u16,
+                    b'e' as u16,
+                    b's' as u16,
+                    b't' as u16,
+                ];
                 let mut out = [0u8; 16];
-                let r = npfs_dispatch_irp(
-                    1, /* IRP_MJ_CREATE_NAMED_PIPE */
-                    0, 0, &name16, &mut out,
-                );
-                if let Some((st, info)) = r {
-                    let srv_fid = driver_launch::npfs_last_file_id();
+                let npfs_device_id = driver_launch::device_id_by_name("\\Device\\NamedPipe");
+                let r = npfs_device_id
+                    .and_then(|device_id| {
+                        driver_launch::allocate_hosted_file(
+                            device_id,
+                            0x001f_01ff,
+                            3,
+                            0,
+                            &name_units,
+                        )
+                        .ok()
+                    })
+                    .and_then(|file_id| {
+                        match driver_launch::dispatch_hosted_file_irp_result_exact(
+                            file_id,
+                            1, /* IRP_MJ_CREATE_NAMED_PIPE */
+                            0,
+                            0,
+                            &name16,
+                            &mut out,
+                        ) {
+                            Ok((status, information, _, context)) => {
+                                Some((status, information, file_id, context.unwrap_or(0)))
+                            }
+                            Err(_) => {
+                                let _ = driver_launch::release_hosted_file(file_id);
+                                None
+                            }
+                        }
+                    });
+                if let Some((st, info, srv_fid, srv_context)) = r {
                     print_str(
                         b"[npfs-svc] C2 dispatch IRP_MJ_CREATE_NAMED_PIPE(\\ntstest) -> status=0x",
                     );
@@ -28287,31 +28226,58 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_str(b" info=");
                     print_u64(info);
                     print_str(b" fsctx=0x");
-                    print_hex(srv_fid as u32);
+                    print_hex(srv_context as u32);
                     print_str(b"\n");
                     check(b"npfs_dispatch_roundtrip", true, &mut passed);
                     // C-a: NpFsdCreateNamedPipe COMPLETED — SUCCESS + FILE_CREATED(2) + a real CCB-backed
                     // FsContext. The VCB prefix-tree/ERESOURCE/security trampolines ran for real.
                     check(
                         b"npfs_create_named_pipe_complete",
-                        st == 0 && info == 2 && srv_fid != 0,
+                        st == 0 && info == 2 && srv_fid != 0 && srv_context != 0,
                         &mut passed,
                     );
                     // C-a: create-then-CONNECT — a client IRP_MJ_CREATE(\ntstest) must find the FCB via the
                     // real prefix tree and return a connected client-end FILE_OBJECT (proves Insert+Find work).
                     let mut cout = [0u8; 16];
-                    if let Some((cst, _cinfo)) =
-                        npfs_dispatch_irp(0 /* IRP_MJ_CREATE */, 0, 0, &name16, &mut cout)
-                    {
-                        let cli_fid = driver_launch::npfs_last_file_id();
+                    let client_create = npfs_device_id
+                        .and_then(|device_id| {
+                            driver_launch::allocate_hosted_file(
+                                device_id,
+                                0x001f_01ff,
+                                3,
+                                0,
+                                &name_units,
+                            )
+                            .ok()
+                        })
+                        .and_then(|file_id| {
+                            match driver_launch::dispatch_hosted_file_irp_result_exact(
+                                file_id,
+                                0, /* IRP_MJ_CREATE */
+                                0,
+                                0,
+                                &name16,
+                                &mut cout,
+                            ) {
+                                Ok((status, information, _, context)) => {
+                                    Some((status, information, file_id, context.unwrap_or(0)))
+                                }
+                                Err(_) => {
+                                    let _ = driver_launch::release_hosted_file(file_id);
+                                    None
+                                }
+                            }
+                        });
+                    let mut client_lifecycle_ok = false;
+                    if let Some((cst, _cinfo, cli_fid, cli_context)) = client_create {
                         print_str(b"[npfs-svc] C-a connect IRP_MJ_CREATE(\\ntstest) -> status=0x");
                         print_hex(cst as u32);
                         print_str(b" fsctx=0x");
-                        print_hex(cli_fid as u32);
+                        print_hex(cli_context as u32);
                         print_str(b"\n");
                         check(
                             b"npfs_client_connect_finds_fcb",
-                            cst == 0 && cli_fid != 0,
+                            cst == 0 && cli_fid != 0 && cli_context != 0,
                             &mut passed,
                         );
                         check(
@@ -28433,15 +28399,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 0, srv_fid, b"FLUSH-A", &mut fnone,
                             );
                             let mut fout1 = [];
-                            let srv_flush = npfs_dispatch_irp(
+                            let srv_flush = driver_launch::npfs_dispatch_irp_exact(
                                 9, /* IRP_MJ_FLUSH_BUFFERS */
                                 0,
                                 srv_fid,
                                 &[],
                                 &mut fout1,
                             );
-                            let srv_flush_pended =
-                                matches!(srv_flush, Some((st, _)) if st as u32 == 0x0000_0103);
+                            let srv_flush_pended = matches!(
+                                srv_flush,
+                                Some((st, _, irp_id))
+                                    if st as u32 == 0x0000_0103 && irp_id != 0
+                            );
                             if srv_flush_pended {
                                 NT_FLUSH_BUFFERS_FILE_PENDING_COUNT.fetch_add(1, Ordering::Relaxed);
                             }
@@ -28449,6 +28418,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             let mut fdrain1 = [0u8; 16];
                             let _ =
                                 npfs_dispatch_irp(3 /* READ */, 0, cli_fid, &[], &mut fdrain1);
+                            let srv_flush_delivered = srv_flush
+                                .and_then(|(_, _, irp_id)| {
+                                    driver_launch::copy_completed_irp(irp_id, false)
+                                        .map(|completion| (irp_id, completion))
+                                })
+                                .is_some_and(|(irp_id, (st, info, bytes))| {
+                                    st == 0
+                                        && info == 0
+                                        && bytes.is_empty()
+                                        && driver_launch::acknowledge_completed_irp(irp_id).is_ok()
+                                });
 
                             // Direction 2 — client end: queue an INBOUND write, flush before the server reads.
                             let _ = npfs_dispatch_irp(
@@ -28456,29 +28436,53 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 0, cli_fid, b"FLUSH-B", &mut fnone,
                             );
                             let mut fout2 = [];
-                            let cli_flush = npfs_dispatch_irp(
+                            let cli_flush = driver_launch::npfs_dispatch_irp_exact(
                                 9, /* IRP_MJ_FLUSH_BUFFERS */
                                 0,
                                 cli_fid,
                                 &[],
                                 &mut fout2,
                             );
-                            let cli_flush_pended =
-                                matches!(cli_flush, Some((st, _)) if st as u32 == 0x0000_0103);
+                            let cli_flush_pended = matches!(
+                                cli_flush,
+                                Some((st, _, irp_id))
+                                    if st as u32 == 0x0000_0103 && irp_id != 0
+                            );
                             if cli_flush_pended {
                                 NT_FLUSH_BUFFERS_FILE_PENDING_COUNT.fetch_add(1, Ordering::Relaxed);
                             }
                             let mut fdrain2 = [0u8; 16];
                             let _ =
                                 npfs_dispatch_irp(3 /* READ */, 0, srv_fid, &[], &mut fdrain2);
+                            let cli_flush_delivered = cli_flush
+                                .and_then(|(_, _, irp_id)| {
+                                    driver_launch::copy_completed_irp(irp_id, false)
+                                        .map(|completion| (irp_id, completion))
+                                })
+                                .is_some_and(|(irp_id, (st, info, bytes))| {
+                                    st == 0
+                                        && info == 0
+                                        && bytes.is_empty()
+                                        && driver_launch::acknowledge_completed_irp(irp_id).is_ok()
+                                });
 
                             print_str(b"[npfs-svc] C-d FLUSH-PENDING srv_pended=");
                             print_u64(srv_flush_pended as u64);
                             print_str(b" cli_pended=");
                             print_u64(cli_flush_pended as u64);
+                            print_str(b" exact-delivery=");
+                            print_u64((srv_flush_delivered && cli_flush_delivered) as u64);
                             print_str(b" pend_count=");
                             print_u64(NT_FLUSH_BUFFERS_FILE_PENDING_COUNT.load(Ordering::Relaxed));
                             print_str(b"\n");
+                            check(
+                                b"exec_npfs_flush_pending_exact_completion",
+                                srv_flush_pended
+                                    && cli_flush_pended
+                                    && srv_flush_delivered
+                                    && cli_flush_delivered,
+                                &mut passed,
+                            );
 
                             // ★ C-e: TWO CONCURRENT IRPs ON ONE FILE_OBJECT — the ordinary rpcrt4
                             // server shape, and the exact shape that used to HANG the hosted
@@ -28605,60 +28609,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 &mut passed,
                             );
 
-                            // ★ C-g: `KeBugCheckEx` is BOUND — a hosted driver's own consistency
-                            // bugcheck is CAUGHT + REPORTED + unwound, not silently skipped.
-                            // npfs' `NpDecodeFileObject` (fileobsup.c) ends its NodeTypeCode switch
-                            // in `NpBugCheck(Node->NodeType, 0, 0)` =
-                            // `KeBugCheckEx(NPFS_FILE_SYSTEM, (FILE_ID << 16) | __LINE__, type, 0, 0)`.
-                            // Hand it exactly that: a READ whose file id points at the ARG frame,
-                            // whose first two bytes we set to a node type npfs does not know. Before
-                            // this batch the import fell to the fail-soft `s_true` no-op and npfs
-                            // carried on past its own assertion; now the dispatch fails CLEANLY.
-                            let bogus_node: u16 = 0x00AA;
-                            let bogus_in = bogus_node.to_le_bytes();
-                            let mut bogus_out = [0u8; 8];
-                            let bug_dispatch = npfs_dispatch_irp(
-                                3, /* READ */
-                                0,
-                                driver_launch::FSD_ARG_VADDR,
-                                &bogus_in,
-                                &mut bogus_out,
-                            );
-                            let bug_code = driver_launch::FSD_BUGCHECK_CODE.load(Ordering::Relaxed);
-                            let bug_p1 = driver_launch::FSD_BUGCHECK_P1.load(Ordering::Relaxed);
-                            let bug_p2 = driver_launch::FSD_BUGCHECK_P2.load(Ordering::Relaxed);
-                            let bug_count = driver_launch::FSD_BUGCHECKS.load(Ordering::Relaxed);
-                            let bug_unwinds =
-                                driver_launch::FSD_BUGCHECK_UNWINDS.load(Ordering::Relaxed);
-                            let bug_inst =
-                                driver_launch::FSD_BUGCHECK_INSTANCE.load(Ordering::Relaxed);
-                            print_str(b"[npfs-svc] C-g KEBUGCHECK count=");
-                            print_u64(bug_count);
-                            print_str(b" unwinds=");
-                            print_u64(bug_unwinds);
-                            print_str(b" code=0x");
-                            print_hex(bug_code as u32);
-                            print_str(b" p1=0x");
-                            print_hex(bug_p1 as u32);
-                            print_str(b" (file=");
-                            print_u64(bug_p1 >> 16);
-                            print_str(b" line=");
-                            print_u64(bug_p1 & 0xFFFF);
-                            print_str(b") p2=0x");
-                            print_hex(bug_p2 as u32);
-                            print_str(b" instance=");
-                            print_u64(bug_inst);
-                            print_str(b" dispatch_status=0x");
-                            print_hex(match bug_dispatch {
-                                Some((st, _)) => st as u32,
-                                None => 0xFFFF_FFFF,
-                            });
-                            print_str(b"\n");
-                            // NPFS_FILE_SYSTEM (0x25), a real npfs source file id (1..=0x14) + line,
-                            // P2 == the bogus node type WE planted (so it is provably OUR trigger and
-                            // the parameters really do arrive), the dispatch was unwound (not skipped,
-                            // not hung), it was attributed to the named-pipe provider's live instance,
-                            // and it failed cleanly.
                             // ★ C-h: the rpcrt4 HEADER-THEN-BODY shape — a 48-byte write against a
                             // SMALLER (16-byte) pending read. This is byte-for-byte the shape the LSA
                             // self-RPC response takes (`rpcrt4_conn_np_read` reads the 16-byte PDU
@@ -28779,22 +28729,21 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             print_u64((slip_in[..11] == slip_payload[..]) as u64);
                             print_str(b"\n");
 
-                            let bug_file = bug_p1 >> 16;
-                            check(
-                                b"exec_kebugcheck_bound_and_reported",
-                                bug_count >= 1
-                                    && bug_unwinds >= 1
-                                    && bug_code == 0x25
-                                    && bug_file >= 1
-                                    && bug_file <= 0x14
-                                    && (bug_p1 & 0xFFFF) != 0
-                                    && bug_p2 == bogus_node as u64
-                                    && bug_inst == dc.instance as u64 + 1
-                                    && matches!(bug_dispatch, Some((st, _)) if st as u32 == 0xC000_0001),
-                                &mut passed,
-                            );
                         }
+                        let client_released = driver_launch::release_hosted_file(cli_fid).is_ok();
+                        let _ = driver_launch::pump_hosted_io_completions();
+                        client_lifecycle_ok =
+                            client_released && !driver_launch::hosted_file_exists(cli_fid);
                     }
+                    let server_released = driver_launch::release_hosted_file(srv_fid).is_ok();
+                    let _ = driver_launch::pump_hosted_io_completions();
+                    let server_lifecycle_ok =
+                        server_released && !driver_launch::hosted_file_exists(srv_fid);
+                    check(
+                        b"exec_npfs_canonical_file_lifecycle",
+                        client_lifecycle_ok && server_lifecycle_ok,
+                        &mut passed,
+                    );
                 }
             }
         } else {
@@ -28804,8 +28753,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         // --- G3: service-selected driver lifecycle through the same general driver path. The
         // generated SYSTEM.DAT hive declares a boot/system service; the executive imports the
         // service subtree into Config Manager metadata, selects the boot/system driver candidate,
-        // then proves load -> DriverEntry -> dispatch -> unload -> object teardown without probing a
-        // compiled-in service identity.
+        // then proves load -> DriverEntry -> unload -> object teardown without probing a compiled-in
+        // service identity. This driver creates no DEVICE_OBJECT, so it must not receive a fabricated
+        // CREATE request merely to exercise the transport.
         let proof_driver_spec = config_hive_boot_system_driver_launch_spec();
         if let Some(proof_driver_spec) = proof_driver_spec {
             print_str(b"[driver-launch] launching service ");
@@ -28821,10 +28771,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 proof_driver_spec.class,
                 &proof_driver_spec.driver_object_path,
             ) {
-                // This minimal FSD fills its MajorFunction[] table but creates NO control
-                // DEVICE_OBJECT — it is ready-for-IRP as soon as it parks with a non-null MJ table.
-                let irp_ready = dc.finished && (dc.verdict & V_MJ) != 0;
-                driver_launch::register_driver_ready(dc.driver_id, irp_ready);
+                let driver_ready = dc.finished && (dc.verdict & V_MJ) != 0;
+                driver_launch::register_driver_ready(dc.driver_id, driver_ready);
                 let driver_object_registered = driver_object_route_registered(
                     &mut *c,
                     &dc,
@@ -28844,100 +28792,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     && proof_pml4 != CAP_INIT_THREAD_VSPACE
                     && proof_pml4 != npfs_pml4;
 
-                // IRP round-trip through the SHARED component_pump: dispatch IRP_MJ_CREATE (major 0)
-                // through the service-selected driver's canonical route id; its handler sets
-                // STATUS_SUCCESS + Information = 0x5A5A. Prove the completion propagated back
-                // through the shared dispatch engine without exposing the component instance as the
-                // public route.
-                let mut out = [0u8; 16];
-                // ★★ NEGATIVE-CONTROL INJECTION (Phase 4): make a BOUND-NOTIFICATION delivery land
-                // on this dispatch's pump recv, deliberately. See `inject_bound_notification_tick`.
-                let tick_absorbed_before = PUMP_TIMER_TICKS_ABSORBED.load(Ordering::Relaxed);
-                let tick_pending_before = DELAY_TIMER_TICKS_PENDING.load(Ordering::Relaxed);
-                let tick_injection = inject_bound_notification_tick();
-                let rt = driver_launch::dispatch_irp_to_driver(
-                    dc.driver_id,
-                    0, /* IRP_MJ_CREATE */
-                    0,
-                    0,
-                    &[],
-                    &mut out,
-                );
-                let tick_absorbed = PUMP_TIMER_TICKS_ABSORBED
-                    .load(Ordering::Relaxed)
-                    .saturating_sub(tick_absorbed_before);
-                // The injected tick is SYNTHETIC — there is no HPET IRQ to Ack and no delay queue to
-                // service — so consume the latch here instead of leaving the service loop a
-                // spurious `delay_timer_interrupt`.
-                cleanup_bound_notification_tick(tick_injection, tick_pending_before);
-                let mut irp_ok = false;
-                if let Some((st, info)) = rt {
-                    print_str(b"[driver-launch] lifecycle driver-id=");
-                    print_u64(dc.driver_id);
-                    print_str(b" IRP_MJ_CREATE -> status=0x");
-                    print_hex(st as u32);
-                    print_str(b" info=0x");
-                    print_hex(info as u32);
-                    print_str(b" distinct_pml4=");
-                    print_u64(distinct_pml4 as u64);
-                    print_str(b"\n");
-                    irp_ok = st == 0 && info == 0x5A5A;
-                }
-
+                print_str(b"[driver-launch] lifecycle driver-id=");
+                print_u64(dc.driver_id);
+                print_str(b" DriverEntry-ready=");
+                print_u64(driver_ready as u64);
+                print_str(b" distinct_pml4=");
+                print_u64(distinct_pml4 as u64);
+                print_str(b"\n");
                 check(
-                    b"exec_driver_lifecycle_dispatch_via_harness",
+                    b"exec_driver_lifecycle_isolated_load",
                     (dc.verdict & V_ENTERED) != 0
                         && (dc.verdict & V_MJ) != 0
                         && distinct_pml4
-                        && irp_ready
-                        && driver_object_registered
-                        && irp_ok,
-                    &mut passed,
-                );
-
-                // ═══ ★ THE PUMP SCREENS A BOUND-NOTIFICATION DELIVERY ═══
-                //
-                // A second availability defect of the component pump, root-caused by Phase 4's
-                // LSA-route experiment (`docs/transport-migration.md` Phase 4). The executive's ROOT
-                // TCB has a notification BOUND to it whenever anything has called
-                // `NtDelayExecution` (`delay_timer_init` → `LBL_TCB_BIND_NOTIFICATION`), and that is
-                // the whole point of binding: a signal CANCELS any blocking `Recv` the executive is
-                // in, so a parked delay can be woken while the service loop sits in `recv`. But
-                // `component_pump`'s recv is one of those, and the kernel's bound-notification
-                // pre-check (`syscall_handler.rs::handle_recv`) returns `rdi = badge`, `rsi = 0`
-                // and **leaves the message registers untouched**. The pump discarded the badge, so
-                // it read `label = 0` with MR0 still holding the request tag `pump_reply_on` had
-                // just left there, took its "any other fault" arm, and SUSPENDED + RETIRED the
-                // component. Observed exactly so on the first LSA-route boot: `[pump] WALL label=0
-                // ip=0x771`, npfs dead mid-boot, the route's `\lsarpc` READ failing ever after.
-                //
-                // THE INJECTION IS THE NEGATIVE CONTROL. It signals the production delay-timer
-                // notification if one already exists, otherwise it mints a temporary notification
-                // badged `DELAY_TIMER_BADGE`, binds it to the root TCB, signals it, and THEN runs
-                // the real service-selected IRP dispatch above — so the delivery lands on that
-                // dispatch's very first `pump_recv`, which is precisely the shape that walled npfs.
-                // Two things must both hold, and neither can hold without the screening:
-                //   * the pump SAW it (`PUMP_TIMER_TICKS_ABSORBED` moved) — otherwise the injection
-                //     did not reproduce the condition and the spec would be vacuous;
-                //   * the dispatch nevertheless COMPLETED with the driver's own answer
-                //     (`status = 0`, `Information = 0x5A5A`, asserted just above as `irp_ok`) —
-                //     i.e. the component was not walled and not retired.
-                // BYPASS EXPERIMENT (run, then reverted): with the one-line screen in `pump_recv`
-                // disabled, this boot reproduces the original signature EXACTLY — `[pump] WALL
-                // label=0 ip=0x771` → `[fsd-svc] IRP fault wall inst=1 -> instance RETIRED` — and
-                // BOTH `exec_pump_screens_bound_notification` (absorbed=0, completed=0) and
-                // `exec_driver_lifecycle_dispatch_via_harness` fail. So the injection reproduces
-                // the real defect, and the spec is not vacuous.
-                print_str(b"[pump-ntfn] injected bound-notification tick: armed=");
-                print_u64(tick_injection.armed() as u64);
-                print_str(b" absorbed-by-pump=");
-                print_u64(tick_absorbed);
-                print_str(b" dispatch-still-completed=");
-                print_u64(irp_ok as u64);
-                print_str(b"\n");
-                check(
-                    b"exec_pump_screens_bound_notification",
-                    tick_injection.armed() && tick_absorbed >= 1 && irp_ok,
+                        && driver_ready
+                        && driver_object_registered,
                     &mut passed,
                 );
 
@@ -30778,9 +30646,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     // --- PROOF the FSD (all instances) GENUINELY runs on the SHARED HARNESS. `component_pump`
     // increments `HARNESS_IRP_DISPATCHES` per serviced IRP dispatch (kind=Irp). By this point the
-    // whole live FSD data-plane has flowed through it: both DriverEntry init pumps, the
-    // service-selected lifecycle driver's create/unload round-trips, and every named-pipe
-    // create/read/write/flush IRP. If the FSD were NOT wired through `component_pump` (the
+    // whole live FSD data-plane has flowed through it: both DriverEntry init pumps and every
+    // device-bound named-pipe create/read/write/flush IRP. If the FSD were NOT wired through
+    // `component_pump` (the
     // pre-harness bespoke inline loop), this counter would be 0 and this spec FAILS — that is the
     // durable, non-green-alone proof the wiring is real.
     let harness_irp = spawn_hosts::harness_dispatches(spawn_hosts::ReqKind::Irp);

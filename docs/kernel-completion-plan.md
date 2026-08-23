@@ -2495,7 +2495,9 @@ notification-package fallbacks.
   Remaining B3 cleanup should continue by subsystem ownership, with priority on real SEC_IMAGE/fault
   scratch ceilings and any device/runtime publication state that still encodes a one-boot fixture.
 - `[x]` B4: Replace fixture-specific driver proof paths with generic driver lifecycle gates:
-  load, `DriverEntry`, dispatch, stop, unload, object teardown.
+  load, `DriverEntry`, isolated runtime, stop, unload, and object teardown. Dispatch is proven only
+  on real DEVICE_OBJECT-bound NPFS/PnP traffic; a loaded driver with no device is no longer sent a
+  fabricated CREATE request.
 
 ### C. Memory Manager And VAD Correctness
 
@@ -10032,12 +10034,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     failure is retried before Object Manager reference release. `IoManager::disconnect_client`
     abandons live requests through cancel/terminal ACK, dispatches real CLEANUP then CLOSE, and
     retires the Object Manager client only after canonical IRP and File ownership drains. The
-    production executive does not use that path yet: `release_file_handle_reference` still removes
-    its `FileCompletionTable` entry before firing raw CLEANUP and CLOSE, ignores both dispatch
-    outcomes, and cannot retain a pending lifecycle `IrpId`. Migrating that teardown is part of the
-    canonical File boundary below; the manager-level behavior must not be cited as production boot
-    proof until the old executive machinery is deleted. User APC queues now grow fallibly as FIFO
-    `VecDeque`s instead of failing at a fixed 16-entry policy cap.
+    production executive did not use that path at this checkpoint: its handle release still fired
+    raw CLEANUP and CLOSE without retaining pending lifecycle ownership. The canonical production
+    File-boundary checkpoint below completes that migration and deletes the old executive machinery.
+    User APC queues now grow fallibly as FIFO `VecDeque`s instead of failing at a fixed 16-entry
+    policy cap.
 
     Host validation is green for `cargo fmt --all`, `cargo test -p nt-process` (`106/106`), `cargo
     test -p nt-io-manager` (`148/148`), the freestanding executive check, and `git diff --check`.
@@ -10162,3 +10163,48 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     exact dispatch-id/generation waiter state machine that transfers the parked reply cap into
     callback ownership and reparks a valid empty Peek without using the global argument VA. Do not
     claim generic asynchronous Get/Peek callback semantics until that state machine is green.
+
+    Canonical production File-boundary checkpoint (2026-08-23): all three hosted CREATE majors now
+    use one manager-owned, generation-protected File lifecycle. The executive allocates the File
+    before CREATE, the hosted component binds that exact FileId to one stable FILE_OBJECT before
+    entering `MajorFunction`, and subsequent IRPs resolve the binding fail-closed. FsContext and
+    FsContext2 remain mutable driver payload and are never used as cross-domain identity. Named-pipe
+    waiters and async listens carry both identities explicitly: canonical FileId for cancellation,
+    signal, completion-port, and reference ownership; raw NPFS context only for endpoint queue and
+    connection correlation.
+
+    Final handle release now enters the I/O Manager's exact CLEANUP, outstanding-IRP drain, and CLOSE
+    state machine once. The old executive raw lifecycle dispatcher, `npfs_last_file_id`, raw
+    device/name IRP entry points, and the always-on per-open compatibility switch are deleted. The
+    NPFS boot proof retains exact pending FLUSH IrpIds through terminal copy/ACK and proves that both
+    canonical Files are retired after real CLEANUP/CLOSE. The service-selected proof driver has no
+    DEVICE_OBJECT, so its old fabricated CREATE and synthetic bound-notification injection have also
+    been removed; its gate now proves registry selection, isolated DriverEntry, unload, and object
+    teardown, while real harness dispatch is measured on device-bound traffic.
+
+    Host validation is green for `cargo fmt --all`, `cargo test -p nt-io-manager` (`153/153`), the
+    freestanding executive check, and `git diff --check`. The first serialized run,
+    `.tmp/run-desktop-20260823-172234.log`, is rejected only as a gate result: real LSA bind-ack writes
+    occurred and Explorer painted, but the write-side proof still passed canonical FileId to the raw
+    FsContext-to-pipe-name map and therefore undercounted the working LSA route. Pipe diagnostics now
+    take an explicitly raw FsContext while File signaling, cancellation, IOCP, and lifetime continue
+    to use canonical FileId.
+
+    Serialized production proof `.tmp/run-desktop-20260823-172915.log` is accepted. Both exact NPFS
+    pending-FLUSH completions are copied and acknowledged by IrpId, the client and server canonical
+    Files retire after real CLEANUP/CLOSE, and the service-selected driver gate proves isolated load
+    without a fabricated CREATE. LSA records 29 worker PDUs with bind then bind-ack, Winlogon
+    activates the real shell, and Explorer completes 665 api0 callbacks with zero callback failures.
+    Paint reaches 2 BeginPaint, 20 EndPaint, 185 direct GDI returns, and 131 batch flushes carrying
+    171 records; all 786,432 framebuffer pixels are non-background with at least 32 colors. The run
+    passes `293/293` and emits the sentinel. The wrapper required an interrupt after the sentinel;
+    no guest proof was outstanding.
+
+    Review adjustment: the canonical File boundary is complete, but the audit exposed a broader
+    pending-I/O debt. Device control, query/set information, flush, and non-transceive FSCTL paths can
+    still discard a returned IrpId when they see STATUS_PENDING. The next ownership tranche must add
+    one generic pending File-I/O delivery record carrying exact IrpId/FileId, IOSB, output target,
+    event/APC/IOCP publication state, and synchronous reply ownership. Do not add per-service or
+    per-FSCTL wait tables, and do not proceed to the multi-stack completion unwinder until every
+    general pending syscall either transfers that record or cancels and drains the exact IRP before
+    returning.

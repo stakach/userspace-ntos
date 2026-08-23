@@ -1609,9 +1609,9 @@ unsafe fn acknowledge_pending_irp_completion(canonical_irp_id: u64) -> bool {
                 && (completion.status as i32).is_negative();
             if !entry.owns_fo
                 && (entry.major as u64 == IRP_MJ_CLOSE || create_failed)
-                && entry.fid != 0
+                && entry.canonical_file_id != 0
             {
-                fo_release(entry.fid);
+                fo_release(entry.canonical_file_id);
             }
             release_pending_irp_graph_component(entry);
             tombstone_pending_irp_owner(node, consuming);
@@ -1720,8 +1720,12 @@ unsafe fn poll_hosted_completion(instance: usize) -> Option<nt_io_manager::Drive
             irp_id: IrpId(canonical_irp_id),
             status: nt_status::NtStatus(completion.status as i32),
             information: completion.information,
-            file_context: if entry.major == major::IRP_MJ_CREATE
-                || entry.major == major::IRP_MJ_CREATE_NAMED_PIPE
+            file_context: if matches!(
+                entry.major,
+                major::IRP_MJ_CREATE
+                    | major::IRP_MJ_CREATE_NAMED_PIPE
+                    | major::IRP_MJ_CREATE_MAILSLOT
+            )
             {
                 Some(entry.fid)
             } else {
@@ -1913,8 +1917,8 @@ unsafe fn pool_free(p: u64) {
 
 #[derive(Clone, Copy)]
 struct FileObjectSlot {
-    /// npfs' `FsContext` for this open (the opaque file id the executive routes by).
-    fid: u64,
+    /// Generation-protected I/O Manager identity for this open.
+    canonical_file_id: u64,
     /// The FILE_OBJECT block in the FSD pool.
     fo: u64,
 }
@@ -1947,16 +1951,16 @@ unsafe fn file_objects() -> Option<&'static Vec<FileObjectSlot>> {
     (*core::ptr::addr_of!(FILE_OBJECTS)).as_ref()
 }
 
-/// The per-open FILE_OBJECT for `fid`, or 0.
-unsafe fn fo_lookup(fid: u64) -> u64 {
-    if fid == 0 {
+/// The per-open FILE_OBJECT for one canonical FileId, or 0.
+unsafe fn fo_lookup(canonical_file_id: u64) -> u64 {
+    if canonical_file_id == 0 {
         return 0;
     }
     let Some(table) = file_objects() else {
         return 0;
     };
     for slot in table.iter() {
-        if slot.fid == fid {
+        if slot.canonical_file_id == canonical_file_id {
             return slot.fo;
         }
     }
@@ -1965,7 +1969,7 @@ unsafe fn fo_lookup(fid: u64) -> u64 {
 
 unsafe fn fo_reserve_new_slot() -> bool {
     let table = file_objects_mut();
-    if table.iter().any(|slot| slot.fid == 0) || table.len() < table.capacity() {
+    if table.iter().any(|slot| slot.canonical_file_id == 0) || table.len() < table.capacity() {
         return true;
     }
     if table.try_reserve(1).is_ok() {
@@ -1981,28 +1985,29 @@ unsafe fn fo_is_registered(fo: u64) -> bool {
     let Some(table) = file_objects() else {
         return false;
     };
-    table.iter().any(|slot| slot.fid != 0 && slot.fo == fo)
+    table
+        .iter()
+        .any(|slot| slot.canonical_file_id != 0 && slot.fo == fo)
 }
 
-/// Register `fo` as the per-open FILE_OBJECT for `fid`. A stale row for the same `fid` (the pool
-/// re-issued a CCB address after a close) is replaced and its old block released.
-unsafe fn fo_register(fid: u64, fo: u64) -> bool {
-    if fid == 0 || fo == 0 {
+/// Register `fo` as the per-open FILE_OBJECT for a canonical FileId. A live
+/// generation can name only one component-local object.
+unsafe fn fo_register(canonical_file_id: u64, fo: u64) -> bool {
+    if canonical_file_id == 0 || fo == 0 {
         return false;
     }
     let table = file_objects_mut();
     for slot in table.iter_mut() {
-        if slot.fid == fid {
-            if slot.fo != fo {
-                pool_free(slot.fo);
-                slot.fo = fo;
-            }
-            return true;
+        if slot.canonical_file_id == canonical_file_id {
+            return slot.fo == fo;
         }
     }
     for slot in table.iter_mut() {
-        if slot.fid == 0 {
-            *slot = FileObjectSlot { fid, fo };
+        if slot.canonical_file_id == 0 {
+            *slot = FileObjectSlot {
+                canonical_file_id,
+                fo,
+            };
             FSD_FO_OPENS.fetch_add(1, Ordering::Relaxed);
             return true;
         }
@@ -2011,21 +2016,28 @@ unsafe fn fo_register(fid: u64, fo: u64) -> bool {
         FSD_FO_TABLE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    table.push(FileObjectSlot { fid, fo });
+    table.push(FileObjectSlot {
+        canonical_file_id,
+        fo,
+    });
     FSD_FO_OPENS.fetch_add(1, Ordering::Relaxed);
     true
 }
 
-/// Release the per-open FILE_OBJECT for `fid` (CLEANUP/CLOSE — the ONLY place a FILE_OBJECT dies).
-unsafe fn fo_release(fid: u64) {
-    if fid == 0 {
+/// Release the per-open FILE_OBJECT for one canonical FileId. CLOSE is the only
+/// normal place this component-local object dies.
+unsafe fn fo_release(canonical_file_id: u64) {
+    if canonical_file_id == 0 {
         return;
     }
     let table = file_objects_mut();
     for slot in table.iter_mut() {
-        if slot.fid == fid {
+        if slot.canonical_file_id == canonical_file_id {
             pool_free(slot.fo);
-            *slot = FileObjectSlot { fid: 0, fo: 0 };
+            *slot = FileObjectSlot {
+                canonical_file_id: 0,
+                fo: 0,
+            };
             return;
         }
     }
@@ -26271,7 +26283,16 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     let file_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
     let requestor_tid =
         read_volatile((FSD_SHARED_VADDR + SH_REQ_REQUESTOR_TID) as *const u32) as u64;
-    let uses_file_object = major != IRP_MJ_PNP;
+    let is_create = matches!(major as u8, major::IRP_MJ_CREATE
+        | major::IRP_MJ_CREATE_NAMED_PIPE
+        | major::IRP_MJ_CREATE_MAILSLOT);
+    if is_create && canonical_file_id == 0 {
+        return (0xC000_0008u32 as i32, 0); // STATUS_INVALID_HANDLE
+    }
+    // A kernel-originated PnP/control request may legitimately have no FILE_OBJECT. Any request
+    // carrying a canonical FileId, however, must use the exact component-local object bound by
+    // CREATE. The component never fabricates a replacement for a missing binding.
+    let uses_file_object = canonical_file_id != 0;
 
     // ★ Audit the CCB's data queues (and the FILE_OBJECTs npfs holds) BEFORE handing it an IRP.
     // npfs' own ASSERTs over these invariants are compiled out of the release binary, and a broken
@@ -26292,13 +26313,16 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     // FILE_OBJECT — ONE per OPEN, reused by every IRP on that open, freed at CLEANUP/CLOSE.
     // A FILE_OBJECT outlives the IRP that introduced it (npfs stores it in `Ccb->FileObject[end]`
     // and writes through that pointer on disconnect), so it must NOT be rebuilt/freed per request.
-    let existing = if uses_file_object && crate::FSD_FILE_OBJECT_PER_OPEN {
-        fo_lookup(file_id)
+    let existing = if uses_file_object {
+        fo_lookup(canonical_file_id)
     } else {
         0
     };
-    let owns_fo = uses_file_object && existing == 0;
-    if owns_fo && crate::FSD_FILE_OBJECT_PER_OPEN && !fo_reserve_new_slot() {
+    if (is_create && existing != 0) || (!is_create && uses_file_object && existing == 0) {
+        return (0xC000_0008u32 as i32, 0); // STATUS_INVALID_HANDLE
+    }
+    let owns_fo = is_create;
+    if owns_fo && !fo_reserve_new_slot() {
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
     }
     let fo = if !uses_file_object {
@@ -26454,7 +26478,9 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     let mut create_access_state = 0u64;
     let mut create_parameters = 0u64;
     let stack_parameters = match major {
-        0 | 1 => {
+        major if matches!(major as u8, major::IRP_MJ_CREATE
+            | major::IRP_MJ_CREATE_NAMED_PIPE
+            | major::IRP_MJ_CREATE_MAILSLOT) => {
             // IRP_MJ_CREATE (client open) / IRP_MJ_CREATE_NAMED_PIPE (server create). The FSD derefs
             // SecurityContext->{AccessState,DesiredAccess}, Options (disposition<<24), ShareAccess, and
             // (create-named-pipe only) the NAMED_PIPE_CREATE_PARAMETERS. Build valid blocks from the pool.
@@ -26498,8 +26524,12 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                                                                  // shutdown and called rpcrt4_conn_close_read on the just-handed-off connection, setting
                                                                  // conn->read_closed=1, so the per-connection worker's rpcrt4_conn_np_read skipped NtReadFile
                                                                  // and the bind was never read. Client opens (major 0) still use FILE_OPEN (1).
-            let disposition: u32 = if major == 1 { 3 } else { 1 }; // create-named-pipe=FILE_OPEN_IF, open=FILE_OPEN
-            let named_pipe_parameters = if major == 1 {
+            let disposition: u32 = match major as u8 {
+                major::IRP_MJ_CREATE_NAMED_PIPE => 3, // FILE_OPEN_IF
+                major::IRP_MJ_CREATE_MAILSLOT => 2,  // FILE_CREATE
+                _ => 1,                              // FILE_OPEN
+            };
+            let named_pipe_parameters = if major as u8 == major::IRP_MJ_CREATE_NAMED_PIPE {
                 // NAMED_PIPE_CREATE_PARAMETERS (0x28 bytes): NamedPipeType@0, ReadMode@4, CompletionMode@8,
                 // MaximumInstances@0xc, InboundQuota@0x10, OutboundQuota@0x14, DefaultTimeout@0x18 (LI, must
                 // be < 0 = relative), TimeoutSpecified@0x20 (BOOLEAN, must be TRUE + MaximumInstances != 0).
@@ -26530,6 +26560,28 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                     -50_000_000i64,
                 ); // DefaultTimeout = -5s (relative)
                 write_unaligned((create_parameters + 0x20) as *mut u8, 1); // TimeoutSpecified
+                Some(create_parameters)
+            } else if major as u8 == major::IRP_MJ_CREATE_MAILSLOT {
+                // MAILSLOT_CREATE_PARAMETERS: timeout, quota, maximum message size.
+                create_parameters = pool_alloc(0x10);
+                if create_parameters == 0 {
+                    pool_free_irp_auxiliary_graph(
+                        0,
+                        create_security_context,
+                        create_access_state,
+                        0,
+                    );
+                    pool_free(iosl);
+                    pool_free_request_buffers(data, aux_data, mdl);
+                    if owns_fo {
+                        pool_free(fo);
+                    }
+                    return (0xC000_009Au32 as i32, 0);
+                }
+                zero(create_parameters, 0x10);
+                write_unaligned((create_parameters + 0x00) as *mut i64, -50_000_000i64);
+                write_unaligned((create_parameters + 0x08) as *mut u32, 0x1000);
+                write_unaligned((create_parameters + 0x0c) as *mut u32, 0);
                 Some(create_parameters)
             } else {
                 None
@@ -26710,6 +26762,25 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         release_pending_irp_graph_component(initial_owner);
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
     };
+    // Publish the FileId -> FILE_OBJECT binding before entering the driver. A create handler may
+    // complete or issue nested work inline, so registering after MajorFunction returns is too late.
+    let fo_registered = !owns_fo || fo_register(canonical_file_id, fo);
+    if !fo_registered {
+        let state = pending_irp_owner_state(owner_node).load(Ordering::Acquire);
+        let consuming = hosted_irp_state_with_kind(state, HOSTED_IRP_CONSUMING);
+        pending_irp_owner_state(owner_node).store(consuming, Ordering::Release);
+        let entry = read_volatile(pending_irp_entry_address(owner_node) as *const PendingIrp);
+        release_pending_irp_graph_component(entry);
+        tombstone_pending_irp_owner(owner_node, consuming);
+        return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
+    }
+    if owns_fo {
+        write_volatile(
+            (pending_irp_entry_address(owner_node)
+                + core::mem::offset_of!(PendingIrp, owns_fo) as u64) as *mut bool,
+            false,
+        );
+    }
     write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_IRP) as *mut u64, irp);
     write_volatile(
         (FSD_SHARED_VADDR + SH_ACTIVE_IOSL) as *mut u64,
@@ -26793,22 +26864,10 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         file_id
     };
     write_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *mut u64, fsctx);
-    // A freshly-created open: bind THIS FILE_OBJECT to the context npfs just handed back, so every
-    // later IRP on that open reuses it (and npfs' stored `Ccb->FileObject[end]` stays valid).
-    let mut fo_registered = false;
-    if uses_file_object && crate::FSD_FILE_OBJECT_PER_OPEN && owns_fo && fsctx != 0 && fsctx != 1 {
-        fo_registered = fo_register(fsctx, fo);
-    }
-    let irp_owns_fo = owns_fo && !fo_registered;
     write_volatile(
         (pending_irp_entry_address(owner_node)
             + core::mem::offset_of!(PendingIrp, fid) as u64) as *mut u64,
         if file_id != 0 { file_id } else { fsctx },
-    );
-    write_volatile(
-        (pending_irp_entry_address(owner_node)
-            + core::mem::offset_of!(PendingIrp, owns_fo) as u64) as *mut bool,
-        irp_owns_fo,
     );
 
     let (st, info, retained_completion, consuming_state) = loop {
@@ -26929,8 +26988,8 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         }
         let completed = read_volatile(pending_irp_entry_address(owner_node) as *const PendingIrp);
         release_pending_irp_graph_component(completed);
-        if uses_file_object && major == IRP_MJ_CLOSE && !irp_owns_fo {
-            fo_release(file_id);
+        if uses_file_object && (major == IRP_MJ_CLOSE || is_create && st < 0) {
+            fo_release(canonical_file_id);
         }
         tombstone_pending_irp_owner(owner_node, consuming_state);
     }
@@ -29365,7 +29424,8 @@ impl DriverDispatchBackend for HostedDriverBackend {
                 status: nt_status::NtStatus(status),
                 information,
                 file_context: if irp.major == major::IRP_MJ_CREATE
-                    || irp.major == major::IRP_MJ_CREATE_NAMED_PIPE
+                || irp.major == major::IRP_MJ_CREATE_NAMED_PIPE
+                || irp.major == major::IRP_MJ_CREATE_MAILSLOT
                 {
                     Some(file_context)
                 } else {
@@ -29554,7 +29614,9 @@ fn external_irp_parameters(
     output_len: u32,
 ) -> Option<IoParameters> {
     match major {
-        major::IRP_MJ_CREATE | major::IRP_MJ_CREATE_NAMED_PIPE => {
+        major::IRP_MJ_CREATE
+        | major::IRP_MJ_CREATE_NAMED_PIPE
+        | major::IRP_MJ_CREATE_MAILSLOT => {
             Some(IoParameters::Create(Default::default()))
         }
         major::IRP_MJ_CLEANUP => Some(IoParameters::Cleanup),
@@ -29602,83 +29664,16 @@ fn external_irp_parameters(
     }
 }
 
-fn dispatch_external_irp_to_driver_record_result(
-    driver_id: u64,
-    major: u64,
-    fsctl: u64,
-    file_id: u64,
-    requestor_tid: u64,
-    in_data: &[u8],
-    out: &mut [u8],
-) -> Result<(i32, u64), u32> {
-    let major = external_major(major).ok_or(STATUS_INVALID_PARAMETER as u32)?;
-    let (input_len, output_len, system_buffer_len) =
-        external_dispatch_buffer_lengths(in_data.len(), out.len())?;
-    let params = external_irp_parameters(major, fsctl, input_len, output_len)
-        .ok_or(STATUS_INVALID_PARAMETER as u32)?;
-    let mut system_buffer = Vec::new();
-    system_buffer.resize(system_buffer_len, 0);
-    system_buffer[..in_data.len()].copy_from_slice(in_data);
-    let result = io_manager_mut()
-        .build_and_dispatch_external_to_driver(
-            ClientId(IO_MANAGER_COMPONENT_ID),
-            DriverId(driver_id),
-            None::<FileId>,
-            file_id,
-            requestor_tid,
-            major,
-            params,
-            input_len,
-            output_len,
-            &mut system_buffer,
-        )
-        .map_err(|status| status.raw() as u32)?;
-    match result {
-        ExternalDispatchResult::Completed {
-            status,
-            information,
-            ..
-        } => {
-            let copy_len = (information as usize)
-                .min(out.len())
-                .min(system_buffer.len());
-            out[..copy_len].copy_from_slice(&system_buffer[..copy_len]);
-            Ok((status.raw(), information))
-        }
-        ExternalDispatchResult::Pending { .. } => Ok((STATUS_PENDING as i32, 0)),
-    }
-}
-
-fn dispatch_external_irp_to_device_record_result(
-    device_id: u64,
-    major: u64,
-    fsctl: u64,
-    file_id: u64,
-    requestor_tid: u64,
-    in_data: &[u8],
-    out: &mut [u8],
-) -> Result<(i32, u64), u32> {
-    dispatch_external_irp_to_device_record_result_exact(
-        device_id,
-        major,
-        fsctl,
-        file_id,
-        requestor_tid,
-        in_data,
-        out,
-    )
-    .map(|(status, information, _)| (status, information))
-}
-
 fn dispatch_external_irp_to_device_record_result_exact(
     device_id: u64,
+    canonical_file_id: Option<FileId>,
     major: u64,
     fsctl: u64,
     file_id: u64,
     requestor_tid: u64,
     in_data: &[u8],
     out: &mut [u8],
-) -> Result<(i32, u64, Option<IrpId>), u32> {
+) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
     let major = external_major(major).ok_or(STATUS_INVALID_PARAMETER as u32)?;
     let (input_len, output_len, system_buffer_len) =
         external_dispatch_buffer_lengths(in_data.len(), out.len())?;
@@ -29691,7 +29686,7 @@ fn dispatch_external_irp_to_device_record_result_exact(
         .build_and_dispatch_external_to_device(
             ClientId(IO_MANAGER_COMPONENT_ID),
             nt_io_manager::DeviceId(device_id),
-            None::<FileId>,
+            canonical_file_id,
             file_id,
             requestor_tid,
             major,
@@ -29705,16 +29700,16 @@ fn dispatch_external_irp_to_device_record_result_exact(
         ExternalDispatchResult::Completed {
             status,
             information,
-            ..
+            file_context,
         } => {
             let copy_len = (information as usize)
                 .min(out.len())
                 .min(system_buffer.len());
             out[..copy_len].copy_from_slice(&system_buffer[..copy_len]);
-            Ok((status.raw(), information, None))
+            Ok((status.raw(), information, None, file_context))
         }
         ExternalDispatchResult::Pending { irp_id } => {
-            Ok((STATUS_PENDING as i32, 0, Some(irp_id)))
+            Ok((STATUS_PENDING as i32, 0, Some(irp_id), None))
         }
     }
 }
@@ -36403,16 +36398,6 @@ pub(crate) fn npfs_pml4() -> u64 {
         .unwrap_or(0)
 }
 
-/// The opaque FILE_OBJECT id (npfs's `FsContext`) from the last dispatched IRP to
-/// `\Device\NamedPipe`.
-pub(crate) unsafe fn npfs_last_file_id() -> u64 {
-    let sh = device_id_by_name("\\Device\\NamedPipe")
-        .and_then(instance_by_device_id)
-        .map(|(_, d)| d.exec_shared_va)
-        .unwrap_or(FSD_SHARED_VADDR);
-    read_volatile((sh + SH_REQ_FILEID) as *const u64)
-}
-
 pub(crate) fn print_active_driver_dispatch_for_deadman() {
     let seq = FSD_ACTIVE_DISPATCH_SEQ.load(Ordering::Relaxed);
     if seq == 0 {
@@ -36810,78 +36795,84 @@ unsafe fn dispatch_irp_for_instance(
     Some((st, info, file_context))
 }
 
-/// Route one IRP to a launched driver by its canonical driver route id.
-pub(crate) unsafe fn dispatch_irp_to_driver(
-    driver_id: u64,
-    major: u64,
-    fsctl: u64,
-    file_id: u64,
-    in_data: &[u8],
-    out: &mut [u8],
-) -> Option<(i32, u64)> {
-    dispatch_irp_to_driver_result(driver_id, major, fsctl, file_id, in_data, out).ok()
-}
-
-pub(crate) unsafe fn dispatch_irp_to_driver_result(
-    driver_id: u64,
-    major: u64,
-    fsctl: u64,
-    file_id: u64,
-    in_data: &[u8],
-    out: &mut [u8],
-) -> Result<(i32, u64), u32> {
-    let Some((_, inst)) = instance_by_driver_id(driver_id) else {
-        return Err(STATUS_DEVICE_NOT_READY as u32);
-    };
-    if !inst.ready || inst.driver_object == 0 {
-        return Err(STATUS_DEVICE_NOT_READY as u32);
-    }
-    if io_manager_mut().driver(DriverId(driver_id)).is_none() {
-        return Err(STATUS_DEVICE_NOT_READY as u32);
-    }
-    dispatch_external_irp_to_driver_record_result(driver_id, major, fsctl, file_id, 0, in_data, out)
-}
-
-pub(crate) unsafe fn dispatch_irp_to_device_result(
+/// Allocate the canonical File before a hosted driver sees CREATE. Process
+/// handles remain executive-owned; all File and IRP lifetime is manager-owned.
+pub(crate) fn allocate_hosted_file(
     device_id: u64,
-    major: u64,
-    fsctl: u64,
-    file_id: u64,
-    requestor_tid: u64,
-    in_data: &[u8],
-    out: &mut [u8],
-) -> Result<(i32, u64), u32> {
+    desired_access: u32,
+    share_access: u32,
+    create_options: u32,
+    file_name: &[u16],
+) -> Result<u64, u32> {
     require_hosted_device_ready_for_dispatch(device_id)?;
-    dispatch_external_irp_to_device_record_result(
-        device_id,
-        major,
-        fsctl,
-        file_id,
-        requestor_tid,
-        in_data,
-        out,
-    )
+    let file_name = if file_name.is_empty() {
+        None
+    } else {
+        Some(NtPath::parse(file_name).map_err(|_| STATUS_INVALID_PARAMETER as u32)?)
+    };
+    io_manager_mut()
+        .allocate_external_file(
+            ClientId(IO_MANAGER_COMPONENT_ID),
+            nt_io_manager::DeviceId(device_id),
+            AccessMask::from_bits_retain(desired_access),
+            ShareAccess::from_bits_retain(share_access),
+            CreateOptions::from_bits_retain(create_options),
+            file_name,
+        )
+        .map(|file_id| file_id.raw())
+        .map_err(|status| status.raw() as u32)
 }
 
-pub(crate) unsafe fn dispatch_irp_to_device_result_exact(
-    device_id: u64,
+/// Resolve the canonical File's immutable device route and current mutable
+/// driver context. Absence or stale generation fails closed.
+pub(crate) fn hosted_file_route(file_id: u64) -> Option<(u64, u64)> {
+    let file = io_manager_mut().file(FileId(file_id))?;
+    if file.client_id != ClientId(IO_MANAGER_COMPONENT_ID) || !file.state.is_open() {
+        return None;
+    }
+    Some((file.device_id.raw(), file.driver_context.unwrap_or(0)))
+}
+
+pub(crate) fn hosted_file_exists(file_id: u64) -> bool {
+    io_manager_mut().file(FileId(file_id)).is_some()
+}
+
+/// Dispatch one IRP through a canonical File. The manager derives the mutable
+/// FsContext payload from that File record and attaches the exact FileId to the
+/// IRP; callers cannot supply an independent identity cookie.
+pub(crate) unsafe fn dispatch_hosted_file_irp_result_exact(
+    file_id: u64,
     major: u64,
     fsctl: u64,
-    file_id: u64,
     requestor_tid: u64,
     in_data: &[u8],
     out: &mut [u8],
-) -> Result<(i32, u64, Option<IrpId>), u32> {
+) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
+    let canonical_file_id = FileId(file_id);
+    let device_id = io_manager_mut()
+        .file(canonical_file_id)
+        .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID))
+        .map(|file| file.device_id.raw())
+        .ok_or(STATUS_INVALID_HANDLE as u32)?;
     require_hosted_device_ready_for_dispatch(device_id)?;
     dispatch_external_irp_to_device_record_result_exact(
         device_id,
+        Some(canonical_file_id),
         major,
         fsctl,
-        file_id,
+        0,
         requestor_tid,
         in_data,
         out,
     )
+}
+
+/// Begin canonical CLEANUP/CLOSE after the executive's final process handle
+/// reference is gone. Retry and pending completion remain manager-owned.
+pub(crate) fn release_hosted_file(file_id: u64) -> Result<(), u32> {
+    io_manager_mut()
+        .release_external_file(ClientId(IO_MANAGER_COMPONENT_ID), FileId(file_id))
+        .map_err(|status| status.raw() as u32)
 }
 
 fn hosted_device_ready_for_dispatch(device_id: u64) -> bool {
@@ -36919,41 +36910,6 @@ fn require_hosted_device_ready_for_dispatch(device_id: u64) -> Result<(), u32> {
     Ok(())
 }
 
-unsafe fn dispatch_irp_to_named_device(
-    path: &str,
-    major: u64,
-    fsctl: u64,
-    file_id: u64,
-    in_data: &[u8],
-    out: &mut [u8],
-) -> Option<(i32, u64)> {
-    dispatch_irp_to_named_device_result(path, major, fsctl, file_id, in_data, out).ok()
-}
-
-unsafe fn dispatch_irp_to_named_device_result(
-    path: &str,
-    major: u64,
-    fsctl: u64,
-    file_id: u64,
-    in_data: &[u8],
-    out: &mut [u8],
-) -> Result<(i32, u64), u32> {
-    let device_id = device_id_by_name(path).ok_or(STATUS_DEVICE_NOT_READY as u32)?;
-    dispatch_irp_to_device_result(device_id, major, fsctl, file_id, 0, in_data, out)
-}
-
-unsafe fn dispatch_irp_to_named_device_result_exact(
-    path: &str,
-    major: u64,
-    fsctl: u64,
-    file_id: u64,
-    in_data: &[u8],
-    out: &mut [u8],
-) -> Result<(i32, u64, Option<IrpId>), u32> {
-    let device_id = device_id_by_name(path).ok_or(STATUS_DEVICE_NOT_READY as u32)?;
-    dispatch_irp_to_device_result_exact(device_id, major, fsctl, file_id, 0, in_data, out)
-}
-
 /// Route one IRP to the driver-declared `\Device\NamedPipe` route. Kept as a semantic npfs wrapper
 /// for existing named-pipe call sites; it no longer assumes instance 0.
 pub(crate) unsafe fn npfs_dispatch_irp(
@@ -36963,17 +36919,9 @@ pub(crate) unsafe fn npfs_dispatch_irp(
     in_data: &[u8],
     out: &mut [u8],
 ) -> Option<(i32, u64)> {
-    dispatch_irp_to_named_device("\\Device\\NamedPipe", major, fsctl, file_id, in_data, out)
-}
-
-pub(crate) unsafe fn npfs_dispatch_irp_result(
-    major: u64,
-    fsctl: u64,
-    file_id: u64,
-    in_data: &[u8],
-    out: &mut [u8],
-) -> Result<(i32, u64), u32> {
-    dispatch_irp_to_named_device_result("\\Device\\NamedPipe", major, fsctl, file_id, in_data, out)
+    dispatch_hosted_file_irp_result_exact(file_id, major, fsctl, 0, in_data, out)
+        .ok()
+        .map(|(status, information, _, _)| (status, information))
 }
 
 pub(crate) unsafe fn npfs_dispatch_irp_exact(
@@ -36983,16 +36931,9 @@ pub(crate) unsafe fn npfs_dispatch_irp_exact(
     in_data: &[u8],
     out: &mut [u8],
 ) -> Option<(i32, u64, u64)> {
-    dispatch_irp_to_named_device_result_exact(
-        "\\Device\\NamedPipe",
-        major,
-        fsctl,
-        file_id,
-        in_data,
-        out,
-    )
+    dispatch_hosted_file_irp_result_exact(file_id, major, fsctl, 0, in_data, out)
     .ok()
-    .map(|(status, information, irp_id)| {
+    .map(|(status, information, irp_id, _)| {
         (
             status,
             information,

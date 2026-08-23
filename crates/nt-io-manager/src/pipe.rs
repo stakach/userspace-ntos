@@ -740,7 +740,7 @@ pub const IO_DELIVERY_REPLY_PUBLISHED: u16 = 1 << 7;
 
 /// One parked pipe read awaiting peer data. All fields are the executive-side
 /// context needed to complete the read when data arrives: the owning device id,
-/// exact canonical IRP, the npfs `file_id` used for file-completion bookkeeping,
+/// exact canonical IRP, the canonical FileId used for completion bookkeeping,
 /// the owning process index + thread id (whose VSpace/stack-mirror the bytes land in), the
 /// user `buffer`/`iosb` VAs, the buffer length, the seL4 reply cap held for the
 /// blocked thread, and its native-syscall resume context (RCX/RSP/RFLAGS). The
@@ -748,10 +748,12 @@ pub const IO_DELIVERY_REPLY_PUBLISHED: u16 = 1 << 7;
 /// table's duplicate-waiter policy; completion ownership is always `irp_id`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct PipeWaiter {
-    /// NT I/O manager device id that owns `file_id`.
-    pub device_id: u64,
+    /// Generation-protected I/O Manager File identity used for cancellation and completion.
+    pub canonical_file_id: u64,
     /// npfs `FsContext` of the READING end this waiter is blocked on (the slot key).
     pub file_id: u64,
+    /// Stable pipe-name correlation captured while the open is live.
+    pub name_hash: u64,
     /// Exact generation-protected canonical IRP retained by the I/O Manager.
     pub irp_id: u64,
     /// Completion surfaces already published for this exact IRP.
@@ -972,7 +974,7 @@ impl PipeWaiterTable {
         count
     }
 
-    /// Cancel + free any waiter owned by `tid` for `file_id`, invoking `complete` with every removed
+    /// Cancel + free any waiter owned by `tid` for canonical `file_id`, invoking `complete` with every removed
     /// waiter. This models `NtCancelIoFile`: only IRPs issued by the current thread for the target
     /// FILE_OBJECT are cancelled, and the caller owns finalizing the waiter surfaces.
     pub fn cancel_thread_file_with<F>(&mut self, tid: u64, file_id: u64, mut complete: F) -> usize
@@ -982,7 +984,9 @@ impl PipeWaiterTable {
         let mut count = 0;
         for slot in self.slots.iter_mut() {
             if slot.is_some_and(|waiter| {
-                waiter.delivery_state == 0 && waiter.tid == tid && waiter.file_id == file_id
+                waiter.delivery_state == 0
+                    && waiter.tid == tid
+                    && waiter.canonical_file_id == file_id
             }) {
                 let waiter = slot.take().unwrap();
                 complete(waiter);
@@ -1315,8 +1319,8 @@ impl PipePreconnectedServerTable {
 /// `iosb_va` in the server's VSpace, and signals `event_obj_idx`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct AsyncListen {
-    /// NT I/O manager device id that owns `server_file_id`.
-    pub device_id: u64,
+    /// Generation-protected I/O Manager File identity used for cancellation and completion.
+    pub canonical_file_id: u64,
     /// npfs `FsContext` of the SERVER end that posted FSCTL_PIPE_LISTEN (the slot key).
     pub server_file_id: u64,
     /// Exact generation-protected canonical listen IRP retained by the I/O Manager.
@@ -1691,7 +1695,9 @@ impl AsyncListenTable {
         let mut count = 0;
         for slot in self.slots.iter_mut() {
             if slot.is_some_and(|listen| {
-                listen.delivery_state == 0 && listen.tid == tid && listen.server_file_id == file_id
+                listen.delivery_state == 0
+                    && listen.tid == tid
+                    && listen.canonical_file_id == file_id
             }) {
                 let listen = slot.take().unwrap();
                 complete(listen);
@@ -1841,8 +1847,9 @@ mod tests {
 
     fn wtr(file_id: u64, pi: u32, tid: u64) -> PipeWaiter {
         PipeWaiter {
-            device_id: 0xD00D,
+            canonical_file_id: file_id,
             file_id,
+            name_hash: 0,
             irp_id: 0x1_0000 + file_id,
             delivery_state: 0,
             pi,
@@ -2059,11 +2066,11 @@ mod tests {
         let mut cancelled = std::vec::Vec::new();
         assert_eq!(
             t.cancel_thread_with(7, |waiter| {
-                cancelled.push((waiter.device_id, waiter.file_id, waiter.tid))
+                cancelled.push((waiter.canonical_file_id, waiter.file_id, waiter.tid))
             }),
             2
         );
-        assert_eq!(cancelled, std::vec![(0xD00D, 0xAA, 7), (0xD00D, 0xBB, 7)]);
+        assert_eq!(cancelled, std::vec![(0xAA, 0xAA, 7), (0xBB, 0xBB, 7)]);
         assert_eq!(t.len(), 1);
         assert!(!t.parked_on(0xAA));
         assert!(!t.parked_on(0xBB));
@@ -2089,6 +2096,24 @@ mod tests {
             .collect();
         assert_eq!(remaining, std::vec![(7, 0xBB), (8, 0xAA)]);
         assert_eq!(t.len(), 2);
+    }
+
+    #[test]
+    fn pipe_waiter_cancels_by_canonical_file_but_correlates_by_raw_context() {
+        let mut t = PipeWaiterTable::new();
+        let mut first = wtr(0xCCB, 3, 7);
+        first.canonical_file_id = 0x1_0001;
+        let mut second = wtr(0xCCB, 3, 7);
+        second.canonical_file_id = 0x1_0002;
+        second.is_write = true;
+        t.park(first).unwrap();
+        t.park(second).unwrap();
+
+        assert!(t.parked_on_dir(0xCCB, false));
+        assert!(t.parked_on_dir(0xCCB, true));
+        assert_eq!(t.cancel_thread_file_with(7, 0x1_0001, |_| {}), 1);
+        assert!(!t.parked_on_dir(0xCCB, false));
+        assert!(t.parked_on_dir(0xCCB, true));
     }
 
     #[test]
@@ -2614,7 +2639,7 @@ mod tests {
 
     fn al(server_file_id: u64, event_obj_idx: u64) -> AsyncListen {
         AsyncListen {
-            device_id: 0xD00D,
+            canonical_file_id: server_file_id,
             server_file_id,
             irp_id: 0x2_0000 + server_file_id,
             delivery_state: 0,
@@ -2798,7 +2823,7 @@ mod tests {
         assert_eq!(
             t.cancel_thread_with(77, |listen| {
                 cancelled.push((
-                    listen.device_id,
+                    listen.canonical_file_id,
                     listen.server_file_id,
                     listen.event_obj_idx,
                 ))
@@ -2807,7 +2832,7 @@ mod tests {
         );
         assert_eq!(
             cancelled,
-            std::vec![(0xD00D, 0xA, 1), (0xD00D, 0xB, 2), (0xD00D, 0xC, 3)]
+            std::vec![(0xA, 0xA, 1), (0xB, 0xB, 2), (0xC, 0xC, 3)]
         );
         assert!(t.is_empty());
     }
@@ -2829,6 +2854,20 @@ mod tests {
         assert!(!t.armed(0xA));
         assert!(t.armed(0xB));
         assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn async_listen_cancels_by_canonical_file_but_connects_by_raw_context() {
+        let mut t = AsyncListenTable::new();
+        let mut listen = al(0xCCB, 1);
+        listen.canonical_file_id = 0x2_0001;
+        t.arm(listen).unwrap();
+
+        assert!(t.armed(0xCCB));
+        assert_eq!(t.cancel_thread_file_with(77, 0xCCB, |_| {}), 0);
+        assert!(t.armed(0xCCB));
+        assert_eq!(t.cancel_thread_file_with(77, 0x2_0001, |_| {}), 1);
+        assert!(!t.armed(0xCCB));
     }
 
     #[test]

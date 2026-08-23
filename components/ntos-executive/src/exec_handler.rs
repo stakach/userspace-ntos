@@ -124,8 +124,12 @@ unsafe fn reserve_pipe_waiter(file_id: u64, is_write: bool) -> bool {
 
 #[derive(Clone, Copy)]
 pub(crate) struct NpfsFileRoute {
+    /// Canonical generation-protected File identity.
     file_id: u64,
     device_id: u64,
+    /// Mutable npfs `FILE_OBJECT.FsContext` payload used only for pipe queue
+    /// correlation and diagnostics.
+    fs_context: u64,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -548,7 +552,7 @@ fn trace_named_pipe_io(
     tid: u64,
     op: &[u8],
     handle: u64,
-    file_id: u64,
+    fs_context: u64,
     len: usize,
     status: u32,
     info: u64,
@@ -556,8 +560,8 @@ fn trace_named_pipe_io(
     apc_context: u64,
     sample: &[u8],
 ) {
-    let name_hash = crate::pipe_fid_name_hash(file_id);
-    if file_id == 0 || name_hash == 0 {
+    let name_hash = crate::pipe_fid_name_hash(fs_context);
+    if fs_context == 0 || name_hash == 0 {
         return;
     }
     let n = NAMED_PIPE_IO_TRACE_N.fetch_add(1, Ordering::Relaxed);
@@ -577,7 +581,7 @@ fn trace_named_pipe_io(
     print_str(b" handle=0x");
     print_hex(handle as u32);
     print_str(b" fid=0x");
-    print_hex(file_id as u32);
+    print_hex(fs_context as u32);
     print_str(b" name_hash=0x");
     print_hex_u64(name_hash);
     print_str(b" len=");
@@ -2688,7 +2692,7 @@ impl ExecNtHandler {
         write_field!(io_completion_timeout, PendingWaitTimeout::none());
         write_field!(io_completion_wake, None);
         write_field!(io_signal_event, -1);
-        write_field!(pipe_park_device_id, 0);
+        write_field!(pipe_park_file_id, 0);
         write_field!(pipe_park_fid, 0);
         write_field!(pipe_park_irp_id, 0);
         write_field!(pipe_park_buffer_va, 0);
@@ -8927,7 +8931,7 @@ impl ExecNtHandler {
         synchronous: bool,
     ) -> Option<u64> {
         let pid = self.pm_pid_for_pi(self.pi)?;
-        let device_id = driver_launch::device_id_by_name("\\Device\\NamedPipe")?;
+        let (device_id, _) = driver_launch::hosted_file_route(file_id)?;
         self.file_completion
             .insert_file(file_id, device_id, synchronous)
             .ok()?;
@@ -8938,7 +8942,9 @@ impl ExecNtHandler {
         ) {
             Ok(handle) => handle,
             Err(_) => {
-                self.release_file_reference(file_id);
+                // No process handle became visible, so this is a publication rollback rather than
+                // NT handle close. The caller still owns the canonical File and will release it once.
+                let _ = self.file_completion.release_handle(file_id);
                 return None;
             }
         };
@@ -10589,11 +10595,8 @@ impl ExecNtHandler {
         }
     }
 
-    fn release_file_handle_reference(&mut self, file_id: u64, device_id: u64) {
-        if let Ok(mut release) = self.file_completion.release_handle(file_id) {
-            if release.device_id == 0 {
-                release.device_id = device_id;
-            }
+    fn release_file_handle_reference(&mut self, file_id: u64) {
+        if let Ok(release) = self.file_completion.release_handle(file_id) {
             self.complete_file_reference_release(file_id, release);
         }
     }
@@ -10603,43 +10606,25 @@ impl ExecNtHandler {
         file_id: u64,
         release: nt_io_completion::FileReferenceRelease,
     ) {
-        let server_file_id =
-            nt_io_manager::pipe_server_file_id_for_endpoint(file_id).unwrap_or(file_id);
         if release.cleanup_required {
-            crate::pipe_server_preconnected_forget(server_file_id);
-            crate::pipe_server_available_forget(file_id);
-            self.dispatch_file_lifecycle_irp(file_id, release.device_id, major::IRP_MJ_CLEANUP);
-        }
-        if release.close_required {
-            self.dispatch_file_lifecycle_irp(file_id, release.device_id, major::IRP_MJ_CLOSE);
-            crate::pipe_server_preconnected_forget(server_file_id);
-            crate::pipe_server_available_forget(file_id);
-            crate::pipe_fid_name_forget(file_id);
+            // FsContext is mutable driver payload, so capture it while the File is still Open.
+            // release_external_file owns the canonical CLEANUP -> IRP-drain -> CLOSE sequence and
+            // may retire the File record before returning when every operation completed inline.
+            if let Some((_, fs_context)) = driver_launch::hosted_file_route(file_id) {
+                let server_context = nt_io_manager::pipe_server_file_id_for_endpoint(fs_context)
+                    .unwrap_or(fs_context);
+                crate::pipe_server_preconnected_forget(server_context);
+                crate::pipe_server_available_forget(fs_context);
+                crate::pipe_fid_name_forget(fs_context);
+            }
+            let _ = driver_launch::release_hosted_file(file_id);
+            // CLEANUP/CLOSE may complete retained reads in the FSD. Run the same generic completion
+            // drain used after writes so their waiters observe the terminal driver result promptly.
+            self.pipe_write_redrive = true;
         }
         if let Some(port_id) = release.port_id {
             let _ = self.io_completion_ports.release(port_id);
         }
-    }
-
-    fn dispatch_file_lifecycle_irp(&mut self, file_id: u64, device_id: u64, major: u8) {
-        if file_id == 0 || device_id == 0 {
-            return;
-        }
-        let mut empty: [u8; 0] = [];
-        let _ = unsafe {
-            driver_launch::dispatch_irp_to_device_result(
-                device_id,
-                major as u64,
-                0,
-                file_id,
-                self.current_tid,
-                &[],
-                &mut empty,
-            )
-        };
-        // CLEANUP/CLOSE may complete retained reads in the FSD. Run the same generic completion
-        // drain used after writes so their waiters observe the terminal driver result promptly.
-        self.pipe_write_redrive = true;
     }
 
     fn cancel_target_for_handle(&self, handle: u64) -> Result<(Option<u64>, bool), u32> {
@@ -10724,18 +10709,9 @@ impl ExecNtHandler {
                 return STATUS_INVALID_HANDLE;
             }
         };
-        let route = match self.pm.lookup_handle(pid, handle) {
-            Some(nt_process::HandleObject::RoutedFile { file_id, device_id }) if file_id != 0 => {
-                NpfsFileRoute { file_id, device_id }
-            }
-            Some(nt_process::HandleObject::File(file_id)) if file_id != 0 => {
-                let Some(device_id) = driver_launch::device_id_by_name("\\Device\\NamedPipe")
-                else {
-                    self.write_current_iosb(iosb, STATUS_DEVICE_NOT_READY, 0);
-                    return STATUS_DEVICE_NOT_READY;
-                };
-                NpfsFileRoute { file_id, device_id }
-            }
+        let route = match self.npfs_file_route_for(args[0]) {
+            Some(route) => route,
+            None => match self.pm.lookup_handle(pid, handle) {
             Some(nt_process::HandleObject::DiskFile { .. })
             | Some(nt_process::HandleObject::Directory { .. })
             | Some(nt_process::HandleObject::OverlayFile(_))
@@ -10752,6 +10728,7 @@ impl ExecNtHandler {
                 self.write_current_iosb(iosb, STATUS_INVALID_HANDLE, 0);
                 return STATUS_INVALID_HANDLE;
             }
+            },
         };
 
         let required_access = nt_io_abi::ioctl::access(ioctl);
@@ -10798,7 +10775,7 @@ impl ExecNtHandler {
             &input,
             &mut output,
         ) {
-            Ok((driver_status, completed, _, _)) => {
+            Ok((driver_status, completed, _)) => {
                 information = completed;
                 driver_status as u32
             }
@@ -10853,7 +10830,7 @@ impl ExecNtHandler {
         self.abandon_pipe_irp(waiter.irp_id);
         release_reply_pool_cap(waiter.reply_cap);
         thread_wait_state_clear_badge_ready(self, waiter.badge);
-        self.release_file_reference(waiter.file_id);
+        self.release_file_reference(waiter.canonical_file_id);
     }
 
     unsafe fn complete_cancelled_pipe_name_waiter(
@@ -10881,7 +10858,9 @@ impl ExecNtHandler {
         let waiters: Vec<_> = (&*core::ptr::addr_of!(PIPE_WAITERS))
             .drain_all()
             .filter_map(|(_, waiter)| {
-                (waiter.delivery_state == 0 && waiter.tid == tid && waiter.file_id == file_id)
+                (waiter.delivery_state == 0
+                    && waiter.tid == tid
+                    && waiter.canonical_file_id == file_id)
                     .then_some(waiter.irp_id)
             })
             .collect();
@@ -10890,7 +10869,7 @@ impl ExecNtHandler {
             .filter_map(|(_, listen)| {
                 (listen.delivery_state == 0
                     && listen.tid == tid
-                    && listen.server_file_id == file_id)
+                    && listen.canonical_file_id == file_id)
                     .then_some(listen.irp_id)
             })
             .collect();
@@ -15558,12 +15537,10 @@ impl ExecNtHandler {
                 let _ = self.io_completion_ports.release(id);
             }
             nt_process::HandleObject::File(file_id) => {
-                let device_id =
-                    driver_launch::device_id_by_name("\\Device\\NamedPipe").unwrap_or(0);
-                self.release_file_handle_reference(file_id, device_id);
+                self.release_file_handle_reference(file_id);
             }
-            nt_process::HandleObject::RoutedFile { file_id, device_id } => {
-                self.release_file_handle_reference(file_id, device_id);
+            nt_process::HandleObject::RoutedFile { file_id, .. } => {
+                self.release_file_handle_reference(file_id);
             }
             nt_process::HandleObject::Directory { object_id, .. } => {
                 let _ = self.directory_opens.release(object_id);
@@ -17921,43 +17898,60 @@ impl ExecNtHandler {
         )
     }
 
-    /// Route a live pipe IRP through the isolated npfs component. `major` is an `IRP_MJ_*`; `name16` is
-    /// the (normalized-here) pipe name for CREATE/CREATE_NAMED_PIPE; `file_id` is npfs's FsContext for
-    /// an existing pipe (FSCTL/read/write). Returns `(status, file_id)` when the live npfs device
-    /// accepted the IRP, or an NTSTATUS describing why the dynamic route was unavailable.
-    pub(crate) unsafe fn npfs_route(
+    /// Allocate one canonical File, then route CREATE through the isolated npfs
+    /// component. Returns `(status, FileId, FsContext)`; only FileId is identity.
+    pub(crate) unsafe fn npfs_create_file(
         &mut self,
         major: u64,
-        fsctl: u64,
         name16: &[u16],
-        file_id: u64,
-    ) -> Result<(i32, u64), u32> {
+        desired_access: u32,
+        share_access: u32,
+        create_options: u32,
+    ) -> Result<(i32, u64, u64), u32> {
         if !driver_launch::npfs_ready() {
             return Err(STATUS_DEVICE_NOT_READY);
         }
-        // Build the ARG-frame input (buffered I/O): the pipe name as raw UTF-16 bytes.
+        let device_id = driver_launch::device_id_by_name("\\Device\\NamedPipe")
+            .ok_or(STATUS_DEVICE_NOT_READY)?;
+        let canonical_file_id = driver_launch::allocate_hosted_file(
+            device_id,
+            desired_access,
+            share_access,
+            create_options,
+            name16,
+        )?;
         let mut in_bytes = alloc::vec::Vec::with_capacity(name16.len() * 2);
         for &w in name16 {
             in_bytes.extend_from_slice(&w.to_le_bytes());
         }
         let mut out = [0u8; 64];
-        let (st, _, fid) = self.npfs_route_raw(major, fsctl, file_id, &in_bytes, &mut out)?;
-        Ok((st, fid))
-    }
-
-    /// Route an npfs IRP with its native byte payload and preserve completion output.
-    pub(crate) unsafe fn npfs_route_raw(
-        &mut self,
-        major: u64,
-        fsctl: u64,
-        file_id: u64,
-        input: &[u8],
-        output: &mut [u8],
-    ) -> Result<(i32, u64, u64), u32> {
-        let (status, information) =
-            driver_launch::npfs_dispatch_irp_result(major, fsctl, file_id, input, output)?;
+        let dispatch = driver_launch::dispatch_hosted_file_irp_result_exact(
+                canonical_file_id,
+                major,
+                0,
+                self.current_tid,
+                &in_bytes,
+                &mut out,
+            );
+        let (status, _, pending_irp_id, file_context) = match dispatch {
+            Ok(result) => result,
+            Err(status) => {
+                let _ = driver_launch::release_hosted_file(canonical_file_id);
+                return Err(status);
+            }
+        };
         NPFS_ROUTED_IRPS.fetch_add(1, Ordering::Relaxed);
-        Ok((status, information, driver_launch::npfs_last_file_id()))
+        if pending_irp_id.is_some() {
+            return Ok((status, canonical_file_id, 0));
+        }
+        if status as u32 & 0xC000_0000 == 0xC000_0000 {
+            let _ = driver_launch::release_hosted_file(canonical_file_id);
+            return Ok((status, 0, 0));
+        }
+        let fs_context = file_context
+            .or_else(|| driver_launch::hosted_file_route(canonical_file_id).map(|(_, ctx)| ctx))
+            .unwrap_or(0);
+        Ok((status, canonical_file_id, fs_context))
     }
 
     /// Route an endpoint IRP through the device that owned the handle's FILE_OBJECT.
@@ -17968,14 +17962,13 @@ impl ExecNtHandler {
         fsctl: u64,
         input: &[u8],
         output: &mut [u8],
-    ) -> Result<(i32, u64, u64, u64), u32> {
-        let (status, information, pending_irp_id) =
-            driver_launch::dispatch_irp_to_device_result_exact(
-            route.device_id,
-            major,
-            fsctl,
-            route.file_id,
-            self.current_tid,
+    ) -> Result<(i32, u64, u64), u32> {
+        let (status, information, pending_irp_id, _) =
+            driver_launch::dispatch_hosted_file_irp_result_exact(
+                route.file_id,
+                major,
+                fsctl,
+                self.current_tid,
             input,
             output,
         )?;
@@ -17983,12 +17976,11 @@ impl ExecNtHandler {
         Ok((
             status,
             information,
-            route.file_id,
             pending_irp_id.map(|irp_id| irp_id.raw()).unwrap_or(0),
         ))
     }
 
-    /// Resolve a process-local typed file handle to npfs's FILE_OBJECT context.
+    /// Resolve a process-local typed file handle to its canonical hosted File identity.
     pub(crate) fn npfs_file_id_for(&self, handle: u64) -> u64 {
         self.npfs_file_route_for(handle)
             .map(|route| route.file_id)
@@ -18000,16 +17992,21 @@ impl ExecNtHandler {
         let Some(pid) = self.pm_pid_for_pi(self.pi) else {
             return None;
         };
-        match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
+        let (file_id, process_device_id) = match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
             Some(nt_process::HandleObject::RoutedFile { file_id, device_id }) if file_id != 0 => {
-                Some(NpfsFileRoute { file_id, device_id })
+                (file_id, device_id)
             }
-            Some(nt_process::HandleObject::File(file_id)) if file_id != 0 => {
-                let device_id = driver_launch::device_id_by_name("\\Device\\NamedPipe")?;
-                Some(NpfsFileRoute { file_id, device_id })
-            }
-            _ => None,
+            _ => return None,
+        };
+        let (device_id, fs_context) = driver_launch::hosted_file_route(file_id)?;
+        if process_device_id != device_id {
+            return None;
         }
+        Some(NpfsFileRoute {
+            file_id,
+            device_id,
+            fs_context,
+        })
     }
 
     /// Resolve a typed pipe handle and enforce the write access granted at create/open time.
@@ -19813,8 +19810,14 @@ impl ExecNtHandler {
             let is_pipe = nt_fs::is_named_pipe_path(&nm);
             if is_pipe {
                 let leaf = Self::pipe_leaf16(&nm);
-                match self.npfs_route(0 /* IRP_MJ_CREATE */, 0, &leaf, 0) {
-                    Ok((st, fid)) => {
+                match self.npfs_create_file(
+                    major::IRP_MJ_CREATE as u64,
+                    &leaf,
+                    desired_access,
+                    share_access,
+                    open_options,
+                ) {
+                    Ok((st, canonical_file_id, fid)) => {
                         let mut status = st as u32;
                         let pipe_hash = nt_io_manager::pipe_name_hash(&leaf);
                         let mut redrive_server_fid = 0;
@@ -19839,7 +19842,7 @@ impl ExecNtHandler {
                                     match crate::pipe_server_preconnected_remember(server_fid) {
                                         Ok(recorded) => {
                                             let handle = self.mint_file_handle(
-                                                fid,
+                                                canonical_file_id,
                                                 desired_access,
                                                 synchronous,
                                             );
@@ -19862,7 +19865,7 @@ impl ExecNtHandler {
                                     }
                                 } else {
                                     let handle =
-                                        self.mint_file_handle(fid, desired_access, synchronous);
+                                        self.mint_file_handle(canonical_file_id, desired_access, synchronous);
                                     if handle.is_none() {
                                         crate::pipe_fid_name_forget(fid);
                                         status = 0xC000_009A;
@@ -19879,6 +19882,9 @@ impl ExecNtHandler {
                             }
                             None
                         };
+                        if opened_handle.is_none() && canonical_file_id != 0 {
+                            let _ = driver_launch::release_hosted_file(canonical_file_id);
+                        }
                         if let Some(handle) = opened_handle {
                             self.queue_write(file_handle_out, handle);
                             if status == 0 {
@@ -22188,6 +22194,8 @@ impl ExecNtHandler {
                 let leaf = Self::pipe_leaf16(&name16);
                 let info: u64 = nt_fs::FILE_CREATED as u64;
                 let mut routed_file_id = 0;
+                let mut routed_fs_context = 0;
+                let options = nt_ulong_arg(args[6]);
 
                 let mut nm_ascii = [b'.'; 24];
                 for (i, &w) in leaf.iter().take(24).enumerate() {
@@ -22207,29 +22215,48 @@ impl ExecNtHandler {
                     }
                 }
 
-                let status = match self
-                    .npfs_route(1 /* IRP_MJ_CREATE_NAMED_PIPE */, 0, &leaf, 0)
-                {
-                    Ok((0, fid)) if fid != 0 => {
+                let status = match self.npfs_create_file(
+                    major::IRP_MJ_CREATE_NAMED_PIPE as u64,
+                    &leaf,
+                    desired_access,
+                    3,
+                    options,
+                ) {
+                    Ok((0, canonical_file_id, fid)) if canonical_file_id != 0 && fid != 0 => {
                         // Remember this server fid -> pipe leaf name-hash for FSCTL_PIPE_WAIT
                         // readiness probes. Client connects complete listens by exact server fid.
                         let name_hash = nt_io_manager::pipe_name_hash(&leaf);
                         match crate::pipe_fid_name_remember(fid, name_hash) {
                             Ok(()) => match crate::pipe_server_available_remember(fid, name_hash) {
                                 Ok(()) => {
-                                    routed_file_id = fid;
+                                    routed_file_id = canonical_file_id;
+                                    routed_fs_context = fid;
                                     nt_fs::STATUS_SUCCESS
                                 }
                                 Err(availability_status) => {
                                     crate::pipe_fid_name_forget(fid);
+                                    let _ = driver_launch::release_hosted_file(canonical_file_id);
                                     availability_status
                                 }
                             },
-                            Err(name_status) => name_status,
+                            Err(name_status) => {
+                                let _ = driver_launch::release_hosted_file(canonical_file_id);
+                                name_status
+                            }
                         }
                     }
-                    Ok((0, _)) => nt_fs::STATUS_INVALID_DEVICE_REQUEST,
-                    Ok((st, _)) => st as u32,
+                    Ok((0, canonical_file_id, _)) => {
+                        if canonical_file_id != 0 {
+                            let _ = driver_launch::release_hosted_file(canonical_file_id);
+                        }
+                        nt_fs::STATUS_INVALID_DEVICE_REQUEST
+                    }
+                    Ok((st, canonical_file_id, _)) => {
+                        if canonical_file_id != 0 {
+                            let _ = driver_launch::release_hosted_file(canonical_file_id);
+                        }
+                        st as u32
+                    }
                     Err(route_status) => route_status,
                 };
                 if status != nt_fs::STATUS_SUCCESS {
@@ -22249,14 +22276,14 @@ impl ExecNtHandler {
                     return status;
                 }
 
-                let options = nt_ulong_arg(args[6]);
                 let synchronous = options
                     & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
                     != 0;
                 let Some(h) = self.mint_file_handle(routed_file_id, desired_access, synchronous)
                 else {
-                    crate::pipe_server_available_forget(routed_file_id);
-                    crate::pipe_fid_name_forget(routed_file_id);
+                    crate::pipe_server_available_forget(routed_fs_context);
+                    crate::pipe_fid_name_forget(routed_fs_context);
+                    let _ = driver_launch::release_hosted_file(routed_file_id);
                     if self.pi >= 2 {
                         self.queue_write(file_handle_out, 0);
                         if iosb != 0 {
@@ -22331,7 +22358,7 @@ impl ExecNtHandler {
                 let raw_output_len = nt_ulong_arg(args[9]) as usize;
                 let file_route = self.npfs_file_route_for(args[0]);
                 let fid = file_route.map(|route| route.file_id).unwrap_or(0);
-                let route_device_id = file_route.map(|route| route.device_id).unwrap_or(0);
+                let fs_context = file_route.map(|route| route.fs_context).unwrap_or(0);
                 let is_pipe_wait = (fsctl as u32) == FSCTL_PIPE_WAIT;
                 let is_pipe_transceive = (fsctl as u32) == FSCTL_PIPE_TRANSCEIVE;
                 let mut transceive_file_retained = false;
@@ -22473,7 +22500,7 @@ impl ExecNtHandler {
                                 true
                             };
                             let waiter_capacity = if sync_reply_capacity {
-                                reserve_pipe_waiter(route.file_id, false)
+                                reserve_pipe_waiter(route.fs_context, false)
                             } else {
                                 false
                             };
@@ -22497,7 +22524,7 @@ impl ExecNtHandler {
                                     &input,
                                     &mut output,
                                 ) {
-                                    Ok((st, completed, _, pending_irp_id)) => {
+                                    Ok((st, completed, pending_irp_id)) => {
                                         routed_endpoint_fsctl = true;
                                         status = st as u64;
                                         information = completed;
@@ -22532,8 +22559,8 @@ impl ExecNtHandler {
                 {
                     let synchronous = self.file_completion.is_synchronous(fid).unwrap_or(true);
                     if synchronous {
-                        self.pipe_park_device_id = route_device_id;
-                        self.pipe_park_fid = fid;
+                        self.pipe_park_file_id = fid;
+                        self.pipe_park_fid = fs_context;
                         self.pipe_park_irp_id = pending_endpoint_irp_id;
                         self.pipe_park_buffer_va = args[8];
                         self.pipe_park_buffer_len = nt_ulong_arg(args[9]);
@@ -22545,8 +22572,9 @@ impl ExecNtHandler {
                         self.pipe_park_transceive = true;
                     } else {
                         let waiter = nt_io_manager::PipeWaiter {
-                            device_id: route_device_id,
-                            file_id: fid,
+                            canonical_file_id: fid,
+                            file_id: fs_context,
+                            name_hash: crate::pipe_fid_name_hash(fs_context),
                             irp_id: pending_endpoint_irp_id,
                             delivery_state: 0,
                             pi: self.pi as u32,
@@ -22581,13 +22609,17 @@ impl ExecNtHandler {
                 // keeps running until a client connect completes the listen. Record the completion event
                 // and IOSB in the server's own process context; the client-connect redrive fills/signals
                 // them and leaves the listen armed until then.
-                if is_pipe_listen && (status as u32) == STATUS_PENDING && fid != 0 {
+                if is_pipe_listen
+                    && (status as u32) == STATUS_PENDING
+                    && fid != 0
+                    && fs_context != 0
+                {
                     let table = &mut *core::ptr::addr_of_mut!(crate::PIPE_ASYNC_LISTENS);
-                    let already_armed = table.armed(fid);
-                    let listen_name_hash = crate::pipe_fid_name_hash(fid);
+                    let already_armed = table.armed(fs_context);
+                    let listen_name_hash = crate::pipe_fid_name_hash(fs_context);
                     let retain_status = if listen_name_hash == 0 {
                         print_str(b"[pipe-listen] REFUSED unnamed server fid=0x");
-                        print_hex(fid as u32);
+                        print_hex(fs_context as u32);
                         print_str(b" pi=");
                         print_u64(self.pi as u64);
                         print_str(b"\n");
@@ -22600,8 +22632,8 @@ impl ExecNtHandler {
                     let old_capacity = table.capacity();
                     let armed = retain_status.is_ok().then(|| {
                         table.arm(nt_io_manager::AsyncListen {
-                                device_id: route_device_id,
-                                server_file_id: fid,
+                                canonical_file_id: fid,
+                                server_file_id: fs_context,
                                 irp_id: pending_endpoint_irp_id,
                                 delivery_state: 0,
                                 event_obj_idx,
@@ -22622,16 +22654,18 @@ impl ExecNtHandler {
                     }
                     if armed.is_some() {
                         crate::PIPE_LISTEN_ARMED_COUNT.fetch_add(1, Ordering::Relaxed);
-                        let connected_before_listen = crate::pipe_server_preconnected_take(fid);
+                        let connected_before_listen =
+                            crate::pipe_server_preconnected_take(fs_context);
                         if connected_before_listen {
-                            self.pipe_connect_redrive_server_fid = fid;
+                            self.pipe_connect_redrive_server_fid = fs_context;
                         } else {
-                            if crate::pipe_server_available_remember(fid, listen_name_hash).is_err()
+                            if crate::pipe_server_available_remember(fs_context, listen_name_hash)
+                                .is_err()
                             {
                                 print_str(
                                     b"[pipe-listen] availability record failed server fid=0x",
                                 );
-                                print_hex(fid as u32);
+                                print_hex(fs_context as u32);
                                 print_str(b" pi=");
                                 print_u64(self.pi as u64);
                                 print_str(b"\n");
@@ -22639,7 +22673,7 @@ impl ExecNtHandler {
                             self.pipe_name_wait_redrive = listen_name_hash;
                         }
                         print_str(b"[pipe-listen] ARMED server fid=0x");
-                        print_hex(fid as u32);
+                        print_hex(fs_context as u32);
                         print_str(b" event_obj=0x");
                         print_hex(event_obj_idx as u32);
                         print_str(b" pi=");
@@ -22649,7 +22683,7 @@ impl ExecNtHandler {
                         }
                         print_str(b"\n");
                         // Overlapped: DON'T write the PENDING IOSB now — it's filled on completion.
-                        self.pipe_listen_fid = fid;
+                        self.pipe_listen_fid = fs_context;
                     } else {
                         self.abandon_pipe_irp(pending_endpoint_irp_id);
                         if !already_armed && retain_status.is_ok() {
@@ -22662,9 +22696,9 @@ impl ExecNtHandler {
                     }
                 } else if is_pipe_listen
                     && (status as u32) == nt_io_manager::STATUS_PIPE_CONNECTED.raw() as u32
-                    && fid != 0
+                    && fs_context != 0
                 {
-                    crate::pipe_server_available_consume(fid);
+                    crate::pipe_server_available_consume(fs_context);
                 }
                 if iosb != 0
                     && self.pipe_park_fid == 0
@@ -27003,7 +27037,7 @@ impl ExecNtHandler {
                         &[],
                         &mut *routed_output,
                     ) {
-                        Ok((driver_status, completed, _, _)) => {
+                        Ok((driver_status, completed, _)) => {
                             information = completed;
                             driver_status as u32
                         }
@@ -27702,10 +27736,19 @@ impl ExecNtHandler {
                         status = nt_fs::STATUS_OBJECT_NAME_COLLISION;
                     } else {
                         let leaf = Self::pipe_leaf16(&name16);
-                        match self.npfs_route(0, 0, &leaf, 0) {
-                            Ok((st, file_id)) => {
+                        match self.npfs_create_file(
+                            major::IRP_MJ_CREATE as u64,
+                            &leaf,
+                            desired_access,
+                            share_access,
+                            create_options,
+                        ) {
+                            Ok((st, canonical_file_id, fs_context)) => {
                                 status = st as u32;
-                                if status == nt_fs::STATUS_SUCCESS && file_id != 0 {
+                                if status == nt_fs::STATUS_SUCCESS
+                                    && canonical_file_id != 0
+                                    && fs_context != 0
+                                {
                                     let pipe_hash = nt_io_manager::pipe_name_hash(&leaf);
                                     let synchronous = create_options
                                         & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT
@@ -27714,22 +27757,25 @@ impl ExecNtHandler {
                                     // The client fid is the accepted CCB with NamedPipeEnd == CLIENT.
                                     // Complete the exact server-end listen IRP for the same CCB.
                                     if let Some(server_fid) =
-                                        nt_io_manager::pipe_server_file_id_for_endpoint(file_id)
+                                        nt_io_manager::pipe_server_file_id_for_endpoint(fs_context)
                                     {
                                         let listen_already_armed =
                                             (&*core::ptr::addr_of!(crate::PIPE_ASYNC_LISTENS))
                                                 .armed(server_fid);
                                         if let Err(name_status) =
-                                            crate::pipe_fid_name_remember(file_id, pipe_hash)
+                                            crate::pipe_fid_name_remember(fs_context, pipe_hash)
                                         {
                                             status = name_status;
+                                            let _ = driver_launch::release_hosted_file(
+                                                canonical_file_id,
+                                            );
                                         } else if !listen_already_armed {
                                             match crate::pipe_server_preconnected_remember(
                                                 server_fid,
                                             ) {
                                                 Ok(recorded) => {
                                                     if let Some(handle) = self.mint_file_handle(
-                                                        file_id,
+                                                        canonical_file_id,
                                                         desired_access,
                                                         synchronous,
                                                     ) {
@@ -27741,22 +27787,28 @@ impl ExecNtHandler {
                                                         self.pipe_connect_redrive_server_fid =
                                                             server_fid;
                                                     } else {
-                                                        crate::pipe_fid_name_forget(file_id);
+                                                        crate::pipe_fid_name_forget(fs_context);
                                                         if recorded {
                                                             crate::pipe_server_preconnected_forget(
                                                                 server_fid,
                                                             );
                                                         }
                                                         status = 0xC000_009A;
+                                                        let _ = driver_launch::release_hosted_file(
+                                                            canonical_file_id,
+                                                        );
                                                     }
                                                 }
                                                 Err(preconnect_status) => {
-                                                    crate::pipe_fid_name_forget(file_id);
+                                                    crate::pipe_fid_name_forget(fs_context);
                                                     status = preconnect_status;
+                                                    let _ = driver_launch::release_hosted_file(
+                                                        canonical_file_id,
+                                                    );
                                                 }
                                             }
                                         } else if let Some(handle) = self.mint_file_handle(
-                                            file_id,
+                                            canonical_file_id,
                                             desired_access,
                                             synchronous,
                                         ) {
@@ -27765,14 +27817,25 @@ impl ExecNtHandler {
                                             crate::pipe_server_available_consume(server_fid);
                                             self.pipe_connect_redrive_server_fid = server_fid;
                                         } else {
-                                            crate::pipe_fid_name_forget(file_id);
+                                            crate::pipe_fid_name_forget(fs_context);
                                             status = 0xC000_009A;
+                                            let _ = driver_launch::release_hosted_file(
+                                                canonical_file_id,
+                                            );
                                         }
                                     } else {
                                         status = nt_fs::STATUS_INVALID_DEVICE_REQUEST;
+                                        let _ = driver_launch::release_hosted_file(
+                                            canonical_file_id,
+                                        );
                                     }
                                 } else if status == nt_fs::STATUS_SUCCESS {
                                     status = nt_fs::STATUS_INVALID_DEVICE_REQUEST;
+                                    if canonical_file_id != 0 {
+                                        let _ = driver_launch::release_hosted_file(
+                                            canonical_file_id,
+                                        );
+                                    }
                                 }
                             }
                             Err(route_status) => status = route_status,
@@ -28149,8 +28212,9 @@ impl ExecNtHandler {
                 let mut information = 0u64;
                 let mut routed = false;
                 let mut completion_file_id = 0u64;
-                let mut pending_write_device_id = 0u64;
+                let mut routed_fs_context = 0u64;
                 let mut pending_write_fid = 0u64;
+                let mut pending_write_fs_context = 0u64;
                 let mut pending_write_irp_id = 0u64;
                 let mut async_file_retained = false;
                 let mut io_request_prepared = false;
@@ -28198,6 +28262,7 @@ impl ExecNtHandler {
                                     Ok(route) => {
                                         let file_id = route.file_id;
                                         completion_file_id = file_id;
+                                        routed_fs_context = route.fs_context;
                                         let synchronous = self
                                             .file_completion
                                             .is_synchronous(file_id)
@@ -28210,7 +28275,7 @@ impl ExecNtHandler {
                                             true
                                         };
                                         let waiter_capacity = if sync_reply_capacity {
-                                            reserve_pipe_waiter(file_id, true)
+                                            reserve_pipe_waiter(route.fs_context, true)
                                         } else {
                                             false
                                         };
@@ -28235,15 +28300,14 @@ impl ExecNtHandler {
                                                     Ok((
                                                         driver_status,
                                                         completed,
-                                                        _,
                                                         pending_irp_id,
                                                     )) => {
                                                         routed = true;
                                                         information = completed;
                                                         if driver_status as u32 == 0x0000_0103 {
-                                                            pending_write_device_id =
-                                                                route.device_id;
                                                             pending_write_fid = file_id;
+                                                            pending_write_fs_context =
+                                                                route.fs_context;
                                                             pending_write_irp_id = pending_irp_id;
                                                         }
                                                         driver_status as u32
@@ -28278,8 +28342,8 @@ impl ExecNtHandler {
                     let event_obj_idx =
                         completion_event_index.map_or(u64::MAX, |index| index as u64);
                     if synchronous {
-                        self.pipe_park_device_id = pending_write_device_id;
-                        self.pipe_park_fid = pending_write_fid;
+                        self.pipe_park_file_id = pending_write_fid;
+                        self.pipe_park_fid = pending_write_fs_context;
                         self.pipe_park_irp_id = pending_write_irp_id;
                         self.pipe_park_buffer_va = 0;
                         self.pipe_park_buffer_len = 0;
@@ -28292,8 +28356,9 @@ impl ExecNtHandler {
                         self.pipe_park_is_write = true;
                     } else {
                         let waiter = nt_io_manager::PipeWaiter {
-                            device_id: pending_write_device_id,
-                            file_id: pending_write_fid,
+                            canonical_file_id: pending_write_fid,
+                            file_id: pending_write_fs_context,
+                            name_hash: crate::pipe_fid_name_hash(pending_write_fs_context),
                             irp_id: pending_write_irp_id,
                             delivery_state: 0,
                             pi: self.pi as u32,
@@ -28368,7 +28433,7 @@ impl ExecNtHandler {
                     self.current_tid,
                     b"write",
                     fh,
-                    completion_file_id,
+                    routed_fs_context,
                     len,
                     status,
                     information,
@@ -28385,8 +28450,7 @@ impl ExecNtHandler {
                     && payload_ok
                     && len >= 4
                     && payload.first() == Some(&5)
-                    && crate::pipe_fid_name_hash(self.npfs_file_id_for(fh))
-                        == lsarpc_pipe_name_hash()
+                    && crate::pipe_fid_name_hash(routed_fs_context) == lsarpc_pipe_name_hash()
                 {
                     let pdu_type = payload.get(2).copied().unwrap_or(0xFF) as u64;
                     if self
@@ -28497,8 +28561,8 @@ impl ExecNtHandler {
                 let mut output = alloc::vec![0u8; output_capacity];
                 let mut information = 0u64;
                 let mut routed = false;
-                let mut pending_read_device_id = 0u64;
                 let mut pending_read_fid = 0u64; // BATCH 33: npfs fid if the read went PENDING → park
+                let mut pending_read_fs_context = 0u64;
                 let mut pending_read_irp_id = 0u64;
                 let mut completion_file_id = 0u64;
                 let mut async_file_retained = false;
@@ -28653,7 +28717,7 @@ impl ExecNtHandler {
                                     Ok(route) => {
                                         npfs_route_status = nt_fs::STATUS_SUCCESS;
                                         let file_id = route.file_id;
-                                        npfs_route_fid = file_id;
+                                        npfs_route_fid = route.fs_context;
                                         completion_file_id = file_id;
                                         let synchronous = self
                                             .file_completion
@@ -28666,7 +28730,7 @@ impl ExecNtHandler {
                                             true
                                         };
                                         let waiter_capacity = if sync_reply_capacity {
-                                            reserve_pipe_waiter(file_id, false)
+                                            reserve_pipe_waiter(route.fs_context, false)
                                         } else {
                                             false
                                         };
@@ -28690,7 +28754,6 @@ impl ExecNtHandler {
                                                     Ok((
                                                         driver_status,
                                                         completed,
-                                                        _,
                                                         pending_irp_id,
                                                     )) => {
                                                         routed = true;
@@ -28710,7 +28773,7 @@ impl ExecNtHandler {
                                                             if self.current_process_is_lsass()
                                                                 && output.first() == Some(&5)
                                                                 && crate::pipe_fid_name_hash(
-                                                                    file_id,
+                                                                    route.fs_context,
                                                                 ) == lsarpc_pipe_name_hash()
                                                             {
                                                                 let pdu_type = output
@@ -28748,9 +28811,9 @@ impl ExecNtHandler {
                                                             }
                                                         }
                                                         if driver_status as u32 == 0x0000_0103 {
-                                                            pending_read_device_id =
-                                                                route.device_id;
                                                             pending_read_fid = file_id;
+                                                            pending_read_fs_context =
+                                                                route.fs_context;
                                                             pending_read_irp_id = pending_irp_id;
                                                         }
                                                         driver_status as u32
@@ -28785,8 +28848,8 @@ impl ExecNtHandler {
                     let event_obj_idx =
                         completion_event_index.map_or(u64::MAX, |index| index as u64);
                     if synchronous {
-                        self.pipe_park_device_id = pending_read_device_id;
-                        self.pipe_park_fid = pending_read_fid;
+                        self.pipe_park_file_id = pending_read_fid;
+                        self.pipe_park_fid = pending_read_fs_context;
                         self.pipe_park_irp_id = pending_read_irp_id;
                         self.pipe_park_buffer_va = buffer;
                         self.pipe_park_buffer_len = len as u32;
@@ -28798,8 +28861,9 @@ impl ExecNtHandler {
                         self.pipe_park_transceive = false;
                     } else {
                         let waiter = nt_io_manager::PipeWaiter {
-                            device_id: pending_read_device_id,
-                            file_id: pending_read_fid,
+                            canonical_file_id: pending_read_fid,
+                            file_id: pending_read_fs_context,
+                            name_hash: crate::pipe_fid_name_hash(pending_read_fs_context),
                             irp_id: pending_read_irp_id,
                             delivery_state: 0,
                             pi: self.pi as u32,
@@ -28864,7 +28928,7 @@ impl ExecNtHandler {
                     self.current_tid,
                     b"read",
                     fh,
-                    completion_file_id,
+                    npfs_route_fid,
                     len,
                     status,
                     information,
@@ -29089,7 +29153,7 @@ impl ExecNtHandler {
                                 &payload[..8],
                                 &mut output,
                             ) {
-                                Ok((driver_status, completed, _, _)) => {
+                                Ok((driver_status, completed, _)) => {
                                     information = completed;
                                     driver_status as u32
                                 }
@@ -29216,7 +29280,7 @@ impl ExecNtHandler {
                                 &[],
                                 &mut output,
                             ) {
-                                Ok((driver_status, completed, _, _)) => {
+                                Ok((driver_status, completed, _)) => {
                                     routed = true;
                                     information = completed;
                                     driver_status as u32

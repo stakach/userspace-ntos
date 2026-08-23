@@ -594,11 +594,13 @@ stage a `.sys` + declare a `DriverSpec { path, class }` and it runs on the SAME 
 bespoke code. `DriverClass` → caps/regions via `caps_and_layout_for` (the ONLY per-class code): `Fsd`
 (default IRP server), `Filter` + `Device` (future-wiring seams, `#[allow(dead_code)]`), and
 `GuiSyscallServer` (win32k's unique privileged class — kept its Syscall substrate, not routed
-through the IRP builder). Reuse is proven by `exec_driver_lifecycle_dispatch_via_harness` and
-`exec_driver_lifecycle_unload_teardown`: a service-selected by-path IRP driver runs in its own
-isolated PML4, dispatches through the shared harness, and tears down through the canonical
-I/O/Object Manager path. Family B (driver-host + KMDF fixtures) stays on its thin one-shot
-`run_once` shape — a test-lifecycle fixture, NOT a general driver path.
+through the IRP builder). Reuse is proven by `exec_driver_lifecycle_isolated_load` and
+`exec_driver_lifecycle_unload_teardown`: a service-selected by-path driver runs `DriverEntry` in its
+own isolated PML4 and tears down through the canonical I/O/Object Manager path. Real dispatch proof
+comes from drivers that publish a DEVICE_OBJECT, including the device-bound NPFS and PnP paths. A
+driver with no DEVICE_OBJECT is never sent a fabricated CREATE merely to exercise the harness.
+Family B (driver-host + KMDF fixtures) stays on its thin one-shot `run_once` shape - a test-lifecycle
+fixture, not a general driver path.
 
 **Isolated vs. deliberately in-executive.**
 * ISOLATED as their own seL4 components (own VSpace/CSpace/TCB): the four SURT-brokered managers —

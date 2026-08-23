@@ -314,7 +314,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .expect("validated completed IRP disappeared after backend acknowledgement");
 
         if let Some(file_id) = completed.file_id {
-            if completed.major == major::IRP_MJ_CREATE && completed.status.is_success() {
+            if crate::is_create_major(completed.major) && completed.status.is_success() {
                 if let Some(file) = self.file_mut(file_id) {
                     if file.state == crate::FileState::CreateIrpDispatched {
                         file.driver_context = completed.file_context;

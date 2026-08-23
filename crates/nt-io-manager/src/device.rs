@@ -13,6 +13,7 @@ impl DeviceType {
     pub const BEEP: DeviceType = DeviceType(0x0000_0001);
     pub const DISK: DeviceType = DeviceType(0x0000_0007);
     pub const KEYBOARD: DeviceType = DeviceType(0x0000_000b);
+    pub const NAMED_PIPE: DeviceType = DeviceType(0x0000_0011);
     pub const NULL: DeviceType = DeviceType(0x0000_0015);
     pub const SERIAL_PORT: DeviceType = DeviceType(0x0000_001b);
     pub const UNKNOWN: DeviceType = DeviceType(0x0000_0022);

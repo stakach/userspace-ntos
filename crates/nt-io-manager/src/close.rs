@@ -41,7 +41,28 @@ impl<P: ObjectManagerPort> IoManager<P> {
         };
         match state {
             FileState::Allocated | FileState::Closed => return self.release_file_record(file_id),
-            FileState::CreateIrpDispatched => return Err(NtStatus::PENDING),
+            FileState::CreateIrpDispatched => {
+                // No process handle was published for a pending external create. Relinquishing the
+                // File therefore abandons that exact create IRP and keeps the File alive only until
+                // the driver's terminal completion is acknowledged.
+                let create_irp = self
+                    .irps
+                    .iter()
+                    .find(|(_, irp)| {
+                        irp.file_id == Some(file_id) && crate::is_create_major(irp.major)
+                    })
+                    .map(|(irp_id, _)| irp_id);
+                let file = self.file_mut(file_id).expect("validated external File");
+                file.transition(FileState::ClosePending);
+                file.close_deferred = true;
+                if let Some(irp_id) = create_irp {
+                    self.abandon_irp_delivery(client, irp_id)?;
+                }
+                if self.finish_deferred_file_close(file_id).is_err() {
+                    self.schedule_deferred_file_close(file_id);
+                }
+                return Ok(());
+            }
             FileState::Open => {
                 let file = self.file_mut(file_id).expect("validated external File");
                 file.transition(FileState::CleanupPending);

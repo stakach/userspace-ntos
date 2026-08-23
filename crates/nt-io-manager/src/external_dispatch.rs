@@ -166,7 +166,7 @@ impl<P> IoManager<P> {
             {
                 return Err(NtStatus::INVALID_HANDLE);
             }
-            if major == nt_io_abi::major::IRP_MJ_CREATE {
+            if crate::is_create_major(major) {
                 0
             } else {
                 file.driver_context.unwrap_or(0)
@@ -190,7 +190,7 @@ impl<P> IoManager<P> {
             access: BufferAccess::ReadWrite,
         });
         let irp_id = self.allocate_irp(irp)?;
-        if major == nt_io_abi::major::IRP_MJ_CREATE {
+        if crate::is_create_major(major) {
             if let Some(file_id) = file_id {
                 self.file_mut(file_id)
                     .expect("CREATE File disappeared after IRP allocation")
@@ -299,7 +299,7 @@ impl<P> IoManager<P> {
                     irp.transition(IrpState::Completed);
                 }
                 self.free_irp(irp_id);
-                if major == nt_io_abi::major::IRP_MJ_CREATE {
+                if crate::is_create_major(major) {
                     if let Some(file_id) = file_id {
                         if status.is_success() {
                             let file = self.file_mut(file_id).expect("CREATE File disappeared");
@@ -322,7 +322,7 @@ impl<P> IoManager<P> {
                     irp.transition(IrpState::Failed);
                 }
                 self.free_irp(irp_id);
-                if major == nt_io_abi::major::IRP_MJ_CREATE {
+                if crate::is_create_major(major) {
                     if let Some(file_id) = file_id {
                         if let Some(file) = self.file_mut(file_id) {
                             file.transition(FileState::Closed);

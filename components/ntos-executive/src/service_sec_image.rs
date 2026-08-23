@@ -8941,7 +8941,7 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_io_completion_deadline: Option<u64> = None;
             // BATCH 33 — pipe-pending park request latched from the handler (0 = none). Consumed at the
             // reply site (the reply-cap steal needs resume_ip/sp/flags, known there).
-            let mut park_pipe_device_id: u64 = 0;
+            let mut park_pipe_file_id: u64 = 0;
             let mut park_pipe_fid: u64 = 0;
             let mut park_pipe_irp_id: u64 = 0;
             let mut park_pipe_buffer_va: u64 = 0;
@@ -9056,7 +9056,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.io_completion_timeout = PendingWaitTimeout::none();
                 nt_handler.io_completion_wake = None;
                 nt_handler.io_signal_event = -1;
-                nt_handler.pipe_park_device_id = 0;
+                nt_handler.pipe_park_file_id = 0;
                 nt_handler.pipe_park_fid = 0;
                 nt_handler.pipe_park_irp_id = 0;
                 nt_handler.pipe_park_buffer_va = 0;
@@ -9744,7 +9744,7 @@ pub(crate) unsafe fn service_sec_image(
                     park_dbgk_reporter = true;
                 }
                 if nt_handler.pipe_park_fid != 0 {
-                    park_pipe_device_id = nt_handler.pipe_park_device_id;
+                    park_pipe_file_id = nt_handler.pipe_park_file_id;
                     park_pipe_fid = nt_handler.pipe_park_fid;
                     park_pipe_irp_id = nt_handler.pipe_park_irp_id;
                     park_pipe_buffer_va = nt_handler.pipe_park_buffer_va;
@@ -15957,7 +15957,7 @@ pub(crate) unsafe fn service_sec_image(
             // retaining an owned IRP would leave both completion and ThreadIsIoPending inconsistent.
             if park_pipe_fid != 0 && park_pipe_irp_id != 0 && reply_main != 0 {
                 if pipe_wait_park(
-                    park_pipe_device_id,
+                    park_pipe_file_id,
                     park_pipe_fid,
                     park_pipe_irp_id,
                     pi as u32,
@@ -16002,7 +16002,7 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     print_str(b"[pipe-park] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n");
                     let _ = driver_launch::abandon_pending_irp(park_pipe_irp_id);
-                    nt_handler.release_file_reference(park_pipe_fid);
+                    nt_handler.release_file_reference(park_pipe_file_id);
                     result = 0xC000_009A;
                 }
             }
@@ -22748,7 +22748,7 @@ unsafe fn lsa_deliver_reply(nt_handler: &mut ExecNtHandler, replymsg: u64) -> bo
 /// false if the reply pool is unavailable or the growable waiter table cannot allocate the record. The
 /// stolen cap resumes the blocked thread when the peer writes (`pipe_redrive_all`).
 unsafe fn pipe_wait_park(
-    device_id: u64,
+    canonical_file_id: u64,
     file_id: u64,
     irp_id: u64,
     pi: u32,
@@ -22778,8 +22778,9 @@ unsafe fn pipe_wait_park(
     let table = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
     let old_capacity = table.capacity();
     let parked = table.park(nt_io_manager::PipeWaiter {
-        device_id,
+        canonical_file_id,
         file_id,
+        name_hash: pipe_fid_name_hash(file_id),
         irp_id,
         delivery_state: 0,
         pi,
@@ -23036,7 +23037,7 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             );
             if lsass_pi == Some(w.pi as usize)
                 && output.first() == Some(&5)
-                && pipe_fid_name_hash(w.file_id) == lsarpc_pipe_name_hash()
+                && w.name_hash == lsarpc_pipe_name_hash()
             {
                 let pdu_type = output.get(2).copied().unwrap_or(0xFF) as u64;
                 if nt_handler
@@ -23066,7 +23067,7 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                     print_str(b"[pipe-redrive-rpc] fid=0x");
                     print_hex(w.file_id as u32);
                     print_str(b" name_hash=0x");
-                    print_hex_u64(pipe_fid_name_hash(w.file_id));
+                    print_hex_u64(w.name_hash);
                     print_str(b" pi=");
                     print_u64(w.pi as u64);
                     print_str(b" badge=");
@@ -23136,8 +23137,8 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             delivery_state = state;
         }
         if delivery_state & nt_io_manager::IO_DELIVERY_FILE_PUBLISHED == 0 {
-            let signal_status =
-                nt_handler.signal_file_completion(w.file_id, completion_status);
+            let signal_status = nt_handler
+                .signal_file_completion(w.canonical_file_id, completion_status);
             if signal_status != nt_fs::STATUS_SUCCESS {
                 PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
                 restore_redrive_mirrors!();
@@ -23155,7 +23156,7 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         }
         if delivery_state & nt_io_manager::IO_DELIVERY_IOCP_PUBLISHED == 0 {
             let post_status = nt_handler.post_file_completion_packet(
-                w.file_id,
+                w.canonical_file_id,
                 w.apc_context,
                 completion_status,
                 completion_information,
@@ -23235,14 +23236,14 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         table_mut
             .complete_exact(slot, w.irp_id)
             .expect("ACKed pipe waiter disappeared");
-        nt_handler.release_file_reference(w.file_id);
+        nt_handler.release_file_reference(w.canonical_file_id);
         woken += 1;
         PIPE_WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
         if PIPE_REDRIVE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 128 {
             print_str(b"[pipe-redrive] WOKE reader fid=0x");
             print_hex(w.file_id as u32);
             print_str(b" name_hash=0x");
-            print_hex_u64(pipe_fid_name_hash(w.file_id));
+            print_hex_u64(w.name_hash);
             print_str(b" pi=");
             print_u64(w.pi as u64);
             print_str(b" badge=");
@@ -23362,7 +23363,7 @@ unsafe fn pipe_listen_deliver_exact(
         // completion packet. Use the shared file-completion path so success and cancellation expose
         // the same surfaces.
         if delivery_state & nt_io_manager::IO_DELIVERY_FILE_PUBLISHED == 0 {
-            let signal_status = nt_handler.signal_file_completion(l.server_file_id, status);
+            let signal_status = nt_handler.signal_file_completion(l.canonical_file_id, status);
             if signal_status != nt_fs::STATUS_SUCCESS {
                 PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
                 break 'delivery false;
@@ -23379,7 +23380,7 @@ unsafe fn pipe_listen_deliver_exact(
         }
         if delivery_state & nt_io_manager::IO_DELIVERY_IOCP_PUBLISHED == 0 {
             let post_status = nt_handler.post_file_completion_packet(
-                l.server_file_id,
+                l.canonical_file_id,
                 l.apc_context,
                 status,
                 information,
@@ -23439,7 +23440,7 @@ unsafe fn pipe_listen_deliver_exact(
         table_mut
             .complete_exact(slot, l.irp_id)
             .expect("ACKed pipe listen disappeared");
-        nt_handler.release_file_reference(l.server_file_id);
+        nt_handler.release_file_reference(l.canonical_file_id);
         PIPE_LISTEN_SIGNALLED_COUNT.fetch_add(1, Ordering::Relaxed);
         true
     };
