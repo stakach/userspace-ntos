@@ -1024,6 +1024,101 @@ mod tests {
     }
 
     #[test]
+    fn async_pipe_listen_uses_generic_event_and_iocp_surfaces() {
+        const FSCTL_PIPE_LISTEN: u32 = 0x0011_0008;
+        let mut table = PendingFileIoTable::new();
+        let mut request = pending(1, 2, 7);
+        request.major = nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL;
+        request.control_code = FSCTL_PIPE_LISTEN;
+        request.output_va = 0;
+        request.output_len = 0;
+        request.reply_cap = 0;
+        request.reply_required = false;
+        request.apc_routine = 0;
+        request.publish_iocp = true;
+        request.signal_file = false;
+        let slot = table.park(request).unwrap();
+
+        for flag in [
+            IO_DELIVERY_IOSB_PUBLISHED,
+            IO_DELIVERY_EVENT_PUBLISHED,
+            IO_DELIVERY_IOCP_PUBLISHED,
+        ] {
+            table.mark_delivery_exact(slot, 2, flag).unwrap();
+        }
+        assert!(table.completion_surfaces_published_exact(slot, 2));
+        table.mark_backend_acked_exact(slot, 2).unwrap();
+        let finished = table.finish_exact(slot, 2).unwrap();
+        assert_eq!(finished.file_id, request.file_id);
+        assert_eq!(finished.irp_id, request.irp_id);
+        assert_eq!(finished.control_code, FSCTL_PIPE_LISTEN);
+    }
+
+    #[test]
+    fn pipe_listen_apc_excludes_iocp_and_allows_rearm_generation() {
+        const FSCTL_PIPE_LISTEN: u32 = 0x0011_0008;
+        let mut table = PendingFileIoTable::new();
+        let mut first = pending(1, 2, 7);
+        first.major = nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL;
+        first.control_code = FSCTL_PIPE_LISTEN;
+        first.output_va = 0;
+        first.output_len = 0;
+        first.reply_cap = 0;
+        first.reply_required = false;
+        first.publish_iocp = false;
+        let first_slot = table.park(first).unwrap();
+
+        let mut second = first;
+        second.irp_id = 3;
+        second.event_obj_idx = 8;
+        let second_slot = table.park(second).unwrap();
+        assert_ne!(first_slot, second_slot);
+        assert_eq!(table.len(), 2);
+
+        for flag in [
+            IO_DELIVERY_IOSB_PUBLISHED,
+            IO_DELIVERY_EVENT_PUBLISHED,
+            IO_DELIVERY_APC_PUBLISHED,
+        ] {
+            table.mark_delivery_exact(first_slot, 2, flag).unwrap();
+        }
+        assert!(table.completion_surfaces_published_exact(first_slot, 2));
+        assert!(!table.completion_surfaces_published_exact(second_slot, 3));
+    }
+
+    #[test]
+    fn synchronous_pipe_listen_requires_file_lock_and_reply_before_ack() {
+        const FSCTL_PIPE_LISTEN: u32 = 0x0011_0008;
+        let mut table = PendingFileIoTable::new();
+        let mut request = pending(1, 2, 7);
+        request.major = nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL;
+        request.control_code = FSCTL_PIPE_LISTEN;
+        request.output_va = 0;
+        request.output_len = 0;
+        request.apc_routine = 0;
+        request.publish_iocp = true;
+        request.signal_file = true;
+        request.sync_lock_owner_tid = request.tid;
+        let slot = table.park(request).unwrap();
+
+        for flag in [
+            IO_DELIVERY_IOSB_PUBLISHED,
+            IO_DELIVERY_EVENT_PUBLISHED,
+            IO_DELIVERY_FILE_PUBLISHED,
+            IO_DELIVERY_IOCP_PUBLISHED,
+        ] {
+            table.mark_delivery_exact(slot, 2, flag).unwrap();
+        }
+        assert_eq!(table.claim_reply_cap_exact(slot, 2), Some(Some(0x50)));
+        table.mark_reply_published_exact(slot, 2).unwrap();
+        assert!(!table.completion_surfaces_published_exact(slot, 2));
+        table
+            .mark_delivery_exact(slot, 2, IO_DELIVERY_FILE_LOCK_RELEASED)
+            .unwrap();
+        assert!(table.completion_surfaces_published_exact(slot, 2));
+    }
+
+    #[test]
     fn non_control_pending_owner_rejects_control_code_metadata() {
         let mut table = PendingFileIoTable::new();
         let mut request = pending(1, 2, 7);

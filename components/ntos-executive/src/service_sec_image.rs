@@ -4,7 +4,6 @@
 use crate::*;
 use crate::exec_handler::HostedCreatePublication;
 
-static PIPE_LISTEN_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
 pub(crate) static FILE_IO_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
 static FILE_IO_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
 static PIPE_TRANSCEIVE_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -9084,15 +9083,11 @@ pub(crate) unsafe fn service_sec_image(
                 );
                 nt_handler.dbgk_block_request = false;
                 nt_handler.pipe_endpoint_progress = false;
-                nt_handler.pipe_listen_fid = 0;
-                nt_handler.pipe_listen_event_handle = 0;
-                nt_handler.pipe_listen_iosb_va = 0;
                 nt_handler.pipe_name_wait_hash = 0;
                 nt_handler.pipe_name_wait_iosb_va = 0;
                 nt_handler.pipe_name_wait_event_obj_idx = u64::MAX;
                 nt_handler.pipe_name_wait_timeout = PendingWaitTimeout::none();
                 nt_handler.pipe_name_wait_redrive = 0;
-                nt_handler.pipe_connect_redrive_server_fid = 0;
                 nt_handler.lpc_rendezvous_conn = 0;
                 nt_handler.lpc_receive_park_port = 0;
                 nt_handler.lpc_receive_park_msg = 0;
@@ -9889,18 +9884,6 @@ pub(crate) unsafe fn service_sec_image(
                     let _ = pending_file_io_redrive_all(&mut nt_handler);
                     let _ = file_cleanup_redrive_all(&mut nt_handler);
                 }
-                // ★ BATCH 34: a client CONNECT to a pipe completes the exact async server
-                // FSCTL_PIPE_LISTEN for the accepted CCB's server end. Only a CONNECT (not a write)
-                // completes a listen; writes re-drive parked reads once the connection exists.
-                if nt_handler.pipe_connect_redrive_server_fid != 0 {
-                    let server_fid = nt_handler.pipe_connect_redrive_server_fid;
-                    let listens = pipe_listen_complete_server_fid(&mut nt_handler, server_fid);
-                    if listens != 0 {
-                        print_str(b"[pipe-listen] completed ");
-                        print_u64(listens);
-                        print_str(b" pending server listen(s) on client connect\n");
-                    }
-                }
                 if nt_handler.pipe_name_wait_redrive != 0 {
                     let name_hash = nt_handler.pipe_name_wait_redrive;
                     let waiters = pipe_name_wait_complete_named(&mut nt_handler, name_hash);
@@ -9910,16 +9893,8 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" waiter(s) on available pipe\n");
                     }
                 }
-                if nt_handler.pipe_endpoint_progress
-                    || hosted_io_progress != 0
-                    || PIPE_LISTEN_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel)
-                {
-                    let listens = pipe_listen_redrive_all(&mut nt_handler);
-                    if listens != 0 {
-                        print_str(b"[pipe-listen] exact completion redrive delivered ");
-                        print_u64(listens);
-                        print_str(b" listen(s)\n");
-                    }
+                if nt_handler.pipe_endpoint_progress || hosted_io_progress != 0 {
+                    let _ = pending_file_io_redrive_all(&mut nt_handler);
                 }
                 // Cancellation drains are ordered after the original IRP owners. A waiter becomes
                 // runnable only once generic/LISTEN publication has ACKed and removed every exact
@@ -16170,7 +16145,6 @@ pub(crate) unsafe fn service_sec_image(
                 let _ = driver_launch::pump_hosted_io_completions();
                 let _ = pending_file_io_redrive_all(&mut nt_handler);
                 let _ = file_cleanup_redrive_all(&mut nt_handler);
-                let _ = pipe_listen_redrive_all(&mut nt_handler);
                 let _ = file_irp_drain_redrive_all(&mut nt_handler);
                 pin_durable_table_growth_if_dirty(&mut heap_mark);
                 let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
@@ -23519,9 +23493,18 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         }};
     }
 
-    let snapshot: alloc::vec::Vec<_> = (&*core::ptr::addr_of!(PENDING_FILE_IO))
+    let mut snapshot: alloc::vec::Vec<_> = (&*core::ptr::addr_of!(PENDING_FILE_IO))
         .drain_all()
         .collect();
+    // Publish provider CREATE metadata before transfers whose completion depends on that endpoint
+    // transition. In particular, a client pipe CREATE records/consumes its exact server-instance
+    // readiness before the accepted LISTEN exposes its completion event.
+    snapshot.sort_by_key(|(_, pending)| {
+        matches!(
+            pending.operation,
+            nt_io_manager::PendingFileIoOperation::Transfer
+        )
+    });
     let mut delivered = 0u64;
     for (slot, pending) in snapshot {
         let Some(completed) = driver_launch::completed_irp_exact(pending.irp_id) else {
@@ -23541,6 +23524,11 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         }
         let is_pipe_transceive = pending.major == nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL
             && pending.control_code == crate::exec_handler::FSCTL_PIPE_TRANSCEIVE;
+        let is_pipe_listen = pending.major == nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL
+            && pending.control_code == crate::exec_handler::FSCTL_PIPE_LISTEN;
+        let pipe_listen_server_context = is_pipe_listen
+            .then(|| driver_launch::hosted_file_route(pending.file_id).map(|(_, context)| context))
+            .flatten();
         if nt_handler.hosted_file_is_named_pipe(pending.file_id)
             && (matches!(
                 pending.major,
@@ -23572,6 +23560,17 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             .delivery_state;
         let mut terminal_status = completed.status;
         let mut terminal_information = completed.information;
+        if let Some(server_context) = pipe_listen_server_context {
+            // A terminal LISTEN is no longer a root-WAIT-ready server instance. Successful accept
+            // also consumes the one-shot connect-before-listen edge; cancellation deliberately
+            // leaves that edge intact when a client already won the race.
+            crate::pipe_server_available_forget(server_context);
+            if terminal_status == nt_fs::STATUS_SUCCESS
+                || terminal_status == nt_io_manager::STATUS_PIPE_CONNECTED.raw() as u32
+            {
+                crate::pipe_server_preconnected_forget(server_context);
+            }
+        }
         if let nt_io_manager::PendingFileIoOperation::Create(create) = pending.operation {
             if delivery_state & nt_io_manager::IO_DELIVERY_CREATE_COMMITTED == 0 {
                 let reservation = ExecNtHandler::pending_create_reservation(create);
@@ -23622,10 +23621,7 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                     )
                     .expect("pending CREATE result could not be committed");
                 if publication.wake_server_fid != 0 {
-                    let _ = pipe_listen_complete_server_fid(
-                        nt_handler,
-                        publication.wake_server_fid,
-                    );
+                    nt_handler.pipe_endpoint_progress = true;
                 }
                 if publication.wake_name_hash != 0 {
                     let _ = pipe_name_wait_complete_named(
@@ -24044,221 +24040,6 @@ unsafe fn file_irp_drain_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     nt_handler.pi = saved_pi;
     nt_handler.loop_ctx = saved_ctx;
     resumed
-}
-
-/// BATCH 34 — complete the pending async server `FSCTL_PIPE_LISTEN` for `server_fid` after a client
-/// CONNECT to the same CCB. The ncacn_np rpcrt4 SERVER posted an OVERLAPPED
-/// FSCTL_PIPE_LISTEN (STATUS_PENDING, no client) with a completion EVENT, then parked on
-/// `NtWaitForMultipleObjects([mgr_event, listen_event])`. The client just connected (npfs paired the
-/// ends in one CCB), so ONE matching pending listen is now satisfied. Consume the exact canonical
-/// listen IRP completion, then fill its IOSB in the SERVER's VSpace (switch in the listener's context
-/// for the copyout, then restore) and signal its completion event via the shared dispatcher wake path
-/// NtSetEvent wake path — waking the server's wait-array so it reads the client's first PDU (the bind).
-/// Matching the server fid matters when multiple instances of one pipe name are listening: the FSD
-/// has already selected the accepted instance, so the executive must not pick by name. Returns 1 if a
-/// listen was completed, else 0. Re-armable: rpcrt4 re-posts a fresh
-/// FSCTL_PIPE_LISTEN for the next client (a NEW record). Completes ONE listen per connect (one client).
-unsafe fn pipe_listen_deliver_exact(
-    nt_handler: &mut ExecNtHandler,
-    slot: usize,
-    pending: nt_io_manager::AsyncListen,
-) -> u64 {
-    let Some((driver_status, driver_information, _)) =
-        driver_launch::copy_completed_irp(pending.irp_id, false)
-    else {
-        if driver_launch::completed_irp_copy_requires_retry(pending.irp_id) {
-            PIPE_LISTEN_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
-        }
-        return 0;
-    };
-    let l = pending;
-    let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
-    let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
-    let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
-    let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
-    let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
-    let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
-    let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
-    let saved_pi = nt_handler.pi;
-    let saved_ctx = nt_handler.loop_ctx.take();
-    let delivered = 'delivery: {
-        // Point the IOSB copyout at the SERVER listener's VSpace mirrors.
-        let badge = l.badge;
-        let (sb, ss, smv, hmv, imv, scratch_base) = mirror_ctx_for(badge, l.pi as usize);
-        ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
-        ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
-        ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
-        ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
-        ACTIVE_IMAGE_MIRROR.store(imv, Ordering::Relaxed);
-        ACTIVE_CLIENT_PI.store(l.pi as u64, Ordering::Relaxed);
-        ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
-        nt_handler.pi = l.pi as usize;
-        let status = driver_status;
-        let information = driver_information;
-        let mut delivery_state = l.delivery_state;
-        if delivery_state & nt_io_manager::IO_DELIVERY_BUFFER_PUBLISHED == 0 {
-            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
-            let state = table_mut
-                .mark_delivery_exact(
-                    slot,
-                    l.irp_id,
-                    nt_io_manager::IO_DELIVERY_BUFFER_PUBLISHED,
-                )
-                .expect("pipe listen disappeared before delivery");
-            delivery_state = state;
-        }
-        // Publish the isolated driver's exact terminal result once, before any visible completion
-        // surface can let user mode inspect or reuse the IOSB.
-        if delivery_state & nt_io_manager::IO_DELIVERY_IOSB_PUBLISHED == 0 {
-            if l.iosb_va != 0
-                && (!nt_handler.xas_try_write_buf(l.iosb_va, &status.to_le_bytes())
-                    || !nt_handler.xas_try_write_buf(l.iosb_va + 8, &information.to_le_bytes()))
-            {
-                PIPE_LISTEN_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
-                break 'delivery false;
-            }
-            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
-            let state = table_mut
-                .mark_delivery_exact(
-                    slot,
-                    l.irp_id,
-                    nt_io_manager::IO_DELIVERY_IOSB_PUBLISHED,
-                )
-                .expect("updated pipe listen IOSB disappeared");
-            delivery_state = state;
-        }
-        if delivery_state & nt_io_manager::IO_DELIVERY_APC_PUBLISHED == 0 {
-            let apc_status =
-                nt_handler.queue_file_user_apc(l.tid, l.apc_routine, l.apc_context, l.iosb_va);
-            if apc_status != nt_fs::STATUS_SUCCESS && !nt_handler.file_apc_target_gone(l.tid) {
-                PIPE_LISTEN_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
-                break 'delivery false;
-            }
-            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
-            let state = table_mut
-                .mark_delivery_exact(
-                    slot,
-                    l.irp_id,
-                    nt_io_manager::IO_DELIVERY_APC_PUBLISHED,
-                )
-                .expect("queued pipe listen APC disappeared");
-            delivery_state = state;
-        }
-        // NT file objects are waitable, and files associated with an I/O completion port receive a
-        // completion packet. Use the shared file-completion path so success and cancellation expose
-        // the same surfaces.
-        if delivery_state & nt_io_manager::IO_DELIVERY_FILE_PUBLISHED == 0 {
-            let signal_status = nt_handler.signal_file_completion(l.canonical_file_id, status);
-            if signal_status != nt_fs::STATUS_SUCCESS {
-                PIPE_LISTEN_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
-                break 'delivery false;
-            }
-            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
-            let state = table_mut
-                .mark_delivery_exact(
-                    slot,
-                    l.irp_id,
-                    nt_io_manager::IO_DELIVERY_FILE_PUBLISHED,
-                )
-                .expect("signaled pipe listen file disappeared");
-            delivery_state = state;
-        }
-        if delivery_state & nt_io_manager::IO_DELIVERY_IOCP_PUBLISHED == 0 {
-            let post_status = nt_handler.post_file_completion_packet(
-                l.canonical_file_id,
-                l.apc_context,
-                status,
-                information,
-                false,
-                l.completion_port_suppressed,
-            );
-            if post_status != nt_fs::STATUS_SUCCESS {
-                PIPE_LISTEN_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
-                break 'delivery false;
-            }
-            if nt_handler.io_completion_wake.is_some() {
-                let _ = io_completion_deliver(nt_handler);
-            }
-            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
-            let state = table_mut
-                .mark_delivery_exact(
-                    slot,
-                    l.irp_id,
-                    nt_io_manager::IO_DELIVERY_IOCP_PUBLISHED,
-                )
-                .expect("posted pipe listen IOCP disappeared");
-            delivery_state = state;
-        }
-        // Signal the overlapped event and reevaluate waiters only once for this exact listen.
-        if delivery_state & nt_io_manager::IO_DELIVERY_EVENT_PUBLISHED == 0 {
-            if l.event_obj_idx != u64::MAX {
-                let idx = l.event_obj_idx as usize;
-                if nt_handler.events.set_existing(idx as u64).is_none() {
-                    PIPE_LISTEN_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
-                    break 'delivery false;
-                }
-                let woken = wait_wake_dispatcher_set(nt_handler);
-                if PIPE_LISTEN_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
-                    print_str(b"[pipe-listen] COMPLETE server fid=0x");
-                    print_hex(l.server_file_id as u32);
-                    print_str(b" signalled event_obj=0x");
-                    print_hex(idx as u32);
-                    print_str(b" -> woke ");
-                    print_u64(woken);
-                    print_str(b" server wait(s)\n");
-                }
-            }
-            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
-            table_mut
-                .mark_delivery_exact(
-                    slot,
-                    l.irp_id,
-                    nt_io_manager::IO_DELIVERY_EVENT_PUBLISHED,
-                )
-                .expect("signaled pipe listen event disappeared");
-        }
-        if driver_launch::acknowledge_completed_irp(l.irp_id).is_err() {
-            PIPE_LISTEN_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
-            break 'delivery false;
-        }
-        let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
-        table_mut
-            .complete_exact(slot, l.irp_id)
-            .expect("ACKed pipe listen disappeared");
-        nt_handler.release_file_reference(l.canonical_file_id);
-        PIPE_LISTEN_SIGNALLED_COUNT.fetch_add(1, Ordering::Relaxed);
-        true
-    };
-    ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
-    ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
-    ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
-    ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
-    ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
-    ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
-    ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
-    nt_handler.pi = saved_pi;
-    nt_handler.loop_ctx = saved_ctx;
-    u64::from(delivered)
-}
-
-unsafe fn pipe_listen_complete_server_fid(nt_handler: &mut ExecNtHandler, server_fid: u64) -> u64 {
-    let Some((slot, pending)) =
-        (&*core::ptr::addr_of!(PIPE_ASYNC_LISTENS)).find_active(server_fid)
-    else {
-        return 0;
-    };
-    pipe_listen_deliver_exact(nt_handler, slot, pending)
-}
-
-unsafe fn pipe_listen_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
-    let pending: alloc::vec::Vec<_> = (&*core::ptr::addr_of!(PIPE_ASYNC_LISTENS))
-        .drain_all()
-        .collect();
-    let mut completed = 0;
-    for (slot, listen) in pending {
-        completed += pipe_listen_deliver_exact(nt_handler, slot, listen);
-    }
-    completed
 }
 
 unsafe fn ensure_client_copyin_dll_page(

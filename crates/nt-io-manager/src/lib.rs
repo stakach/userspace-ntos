@@ -84,10 +84,10 @@ pub use pending_io::{
 };
 pub use pipe::{
     decode_pipe_wait_name, decode_pipe_wait_request, pipe_endpoint_end, pipe_endpoint_file_id,
-    pipe_endpoint_primary_context, pipe_name_hash, pipe_server_file_id_for_endpoint, AsyncListen,
-    AsyncListenTable, PipeConnection, PipeEnd, PipeFcb, PipeFidName, PipeFidNameTable, PipeHandle,
-    PipeInformation, PipeNameWaiter, PipeNameWaiterTable, PipeParams, PipePreconnectedServerTable,
-    PipeRegistry, PipeServerAvailability, PipeServerAvailabilityTable, PipeState, PipeWaitRequest,
+    pipe_endpoint_primary_context, pipe_name_hash, pipe_server_file_id_for_endpoint,
+    PipeConnection, PipeEnd, PipeFcb, PipeFidName, PipeFidNameTable, PipeHandle, PipeInformation,
+    PipeNameWaiter, PipeNameWaiterTable, PipeParams, PipePreconnectedServerTable, PipeRegistry,
+    PipeServerAvailability, PipeServerAvailabilityTable, PipeState, PipeWaitRequest,
     FILE_PIPE_BYTE_STREAM_MODE, FILE_PIPE_BYTE_STREAM_TYPE, FILE_PIPE_CLIENT_END,
     FILE_PIPE_COMPLETE_OPERATION, FILE_PIPE_FULL_DUPLEX, FILE_PIPE_INBOUND, FILE_PIPE_MESSAGE_MODE,
     FILE_PIPE_MESSAGE_TYPE, FILE_PIPE_OUTBOUND, FILE_PIPE_QUEUE_OPERATION, FILE_PIPE_SERVER_END,

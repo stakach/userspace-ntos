@@ -9,7 +9,7 @@ use nt_io_abi::major;
 
 const INTERNAL_DISPATCHER_EVENT_BASE: u64 = 1 << 40;
 const NPFS_ROOT_HANDLE_TAG: u64 = 0x4E50_4653_0000_0000; // "NPFS"
-const FSCTL_PIPE_LISTEN: u32 = 0x0011_0008;
+pub(crate) const FSCTL_PIPE_LISTEN: u32 = 0x0011_0008;
 const FSCTL_PIPE_WAIT: u32 = 0x0011_0018;
 pub(crate) const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
 const STATUS_PENDING: u32 = 0x0000_0103;
@@ -315,7 +315,6 @@ static SCM_WORKER_READ_IO_TRACE_N: [AtomicU64; TP_WORKER_SLOT_COUNT] =
 static SCM_WORKER_FLUSH_IO_TRACE_N: [AtomicU64; TP_WORKER_SLOT_COUNT] =
     [const { AtomicU64::new(0) }; TP_WORKER_SLOT_COUNT];
 static NT_CANCEL_IO_FILE_TRACE_N: AtomicU64 = AtomicU64::new(0);
-static PIPE_RETAINED_CANCEL_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static HOSTED_EXE_OPEN_FAILURE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static LPC_CACHE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static LPC_CACHE_MISS_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -2788,16 +2787,12 @@ impl ExecNtHandler {
         write_field!(pending_file_irp_drain, None);
         write_field!(dbgk_block_request, false);
         write_field!(pipe_endpoint_progress, false);
-        write_field!(pipe_listen_fid, 0);
-        write_field!(pipe_listen_event_handle, 0);
-        write_field!(pipe_listen_iosb_va, 0);
         write_field!(pipe_name_wait_root_handle, 0);
         write_field!(pipe_name_wait_hash, 0);
         write_field!(pipe_name_wait_iosb_va, 0);
         write_field!(pipe_name_wait_event_obj_idx, u64::MAX);
         write_field!(pipe_name_wait_timeout, PendingWaitTimeout::none());
         write_field!(pipe_name_wait_redrive, 0);
-        write_field!(pipe_connect_redrive_server_fid, 0);
         write_field!(anon_event_seq, 0);
         write_field!(pnp_event_cursor, 0);
         write_field!(pnp_notify_event, 0);
@@ -10712,6 +10707,21 @@ impl ExecNtHandler {
         })
     }
 
+    fn pending_pipe_listen_for_server(&self, server_context: u64) -> bool {
+        server_context != 0
+            && unsafe {
+                (&*core::ptr::addr_of!(PENDING_FILE_IO))
+                    .drain_all()
+                    .any(|(_, pending)| {
+                        pending.delivery_state == 0
+                            && pending.major == major::IRP_MJ_FILE_SYSTEM_CONTROL
+                            && pending.control_code == FSCTL_PIPE_LISTEN
+                            && driver_launch::hosted_file_route(pending.file_id)
+                                .is_some_and(|(_, context)| context == server_context)
+                    })
+            }
+    }
+
     pub(crate) fn complete_terminal_file_io(
         &mut self,
         file_id: u64,
@@ -11066,22 +11076,6 @@ impl ExecNtHandler {
         status
     }
 
-    unsafe fn abandon_pipe_irp(&mut self, irp_id: u64) {
-        let status = driver_launch::abandon_pending_irp(irp_id);
-        let trace = PIPE_RETAINED_CANCEL_TRACE_N.fetch_add(1, Ordering::Relaxed);
-        if trace < 64 || status.is_err() {
-            print_str(b"[pipe-abandon-irp] #");
-            print_u64(trace);
-            print_str(b" irp=0x");
-            print_hex_u64(irp_id);
-            if let Err(status) = status {
-                print_str(b" status=0x");
-                print_hex(status);
-            }
-            print_str(b"\n");
-        }
-    }
-
     unsafe fn complete_cancelled_pipe_name_waiter(
         &mut self,
         waiter: nt_io_manager::PipeNameWaiter,
@@ -11192,21 +11186,7 @@ impl ExecNtHandler {
     }
 
     pub(crate) unsafe fn cancel_file_io_for_thread_teardown(&mut self, tid: u64) -> usize {
-        let listens: Vec<_> = (&*core::ptr::addr_of!(PIPE_ASYNC_LISTENS))
-            .drain_all()
-            .filter_map(|(_, listen)| {
-                (listen.delivery_state == 0 && listen.tid == tid).then_some(listen.irp_id)
-            })
-            .collect();
-        let mut cancelled = 0;
-        for irp_id in listens {
-            if driver_launch::request_cancel_irp(irp_id).is_ok() {
-                cancelled += 1;
-            }
-        }
-        self.pipe_endpoint_progress = cancelled != 0;
-        cancelled
-            + self.abandon_pending_file_io_for_thread(tid)
+        self.abandon_pending_file_io_for_thread(tid)
             + self.abandon_synchronous_file_waiters_for_thread(tid)
             + self.abandon_file_irp_drain_waiters_for_thread(tid)
             + self.abandon_file_cleanup_waiters_for_thread(tid)
@@ -12679,8 +12659,7 @@ impl ExecNtHandler {
                     THREAD_QUERY_INFORMATION,
                 )?;
                 let pending = unsafe {
-                    (&*core::ptr::addr_of!(PIPE_ASYNC_LISTENS)).has_thread(tid as u64)
-                        || (&*core::ptr::addr_of!(PENDING_FILE_IO)).has_thread(tid as u64)
+                    (&*core::ptr::addr_of!(PENDING_FILE_IO)).has_thread(tid as u64)
                         || (&*core::ptr::addr_of!(PIPE_NAME_WAITERS)).has_thread(tid as u64)
                 };
                 output[..4].copy_from_slice(&(pending as u32).to_le_bytes());
@@ -18465,7 +18444,7 @@ impl ExecNtHandler {
                     .ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
                 wake_server_fid = server_fid;
                 crate::pipe_fid_name_remember(fs_context, provider_context).and_then(|()| {
-                    if (&*core::ptr::addr_of!(crate::PIPE_ASYNC_LISTENS)).armed(server_fid) {
+                    if self.pending_pipe_listen_for_server(server_fid) {
                         Ok(())
                     } else {
                         preconnected_recorded =
@@ -20683,7 +20662,7 @@ impl ExecNtHandler {
                 };
                 if publication.handle != 0 {
                     self.queue_write(file_handle_out, publication.handle);
-                    self.pipe_connect_redrive_server_fid = publication.wake_server_fid;
+                    self.pipe_endpoint_progress |= publication.wake_server_fid != 0;
                 } else {
                     self.write_nt_open_file_handle_out(file_handle_out, 0);
                 }
@@ -23091,8 +23070,8 @@ impl ExecNtHandler {
                     return STATUS_ACCESS_VIOLATION;
                 }
                 // Hosted pipe clients route FSCTLs (LISTEN/WAIT/TRANSCEIVE) to npfs for tracked pipe
-                // endpoint handles. WaitNamedPipe opens the NPFS root/control file first; its
-                // FSCTL_PIPE_WAIT probes the same async-listen table that client connects consume.
+                // endpoint handles. WaitNamedPipe opens the NPFS root/control file first and probes
+                // provider-owned server-instance availability.
                 let fsctl = nt_ulong_arg(args[5]) as u64;
                 let mut status: u64;
                 let mut information = 0u64;
@@ -23131,6 +23110,21 @@ impl ExecNtHandler {
                 }) {
                     return STATUS_INVALID_PARAMETER;
                 }
+                let pipe_listen_name_hash = if is_pipe_listen {
+                    if fs_context == 0 {
+                        return nt_fs::STATUS_INVALID_DEVICE_REQUEST;
+                    }
+                    let name_hash = crate::pipe_fid_name_hash(fs_context);
+                    if name_hash == 0 {
+                        return nt_fs::STATUS_INVALID_DEVICE_REQUEST;
+                    }
+                    if !crate::reserve_pipe_server_availability() {
+                        return STATUS_INSUFFICIENT_RESOURCES;
+                    }
+                    name_hash
+                } else {
+                    0
+                };
                 const HOSTED_FSCTL_BUFFER_CAP: usize = 0x4000;
                 if !is_root_pipe_wait
                     && (raw_input_len > HOSTED_FSCTL_BUFFER_CAP
@@ -23146,19 +23140,14 @@ impl ExecNtHandler {
                     return STATUS_ACCESS_VIOLATION;
                 }
                 let generic_synchronous_file = if let Some(route) = file_route {
-                    if is_pipe_listen {
-                        false
-                    } else {
-                        match self.file_completion.is_synchronous(route.file_id) {
-                            Ok(synchronous) => synchronous,
-                            Err(status) => return status,
-                        }
+                    match self.file_completion.is_synchronous(route.file_id) {
+                        Ok(synchronous) => synchronous,
+                        Err(status) => return status,
                     }
                 } else {
                     false
                 };
                 if file_route.is_some()
-                    && !is_pipe_listen
                     && (!self.reserve_pending_file_io_owner()
                         || (generic_synchronous_file
                             && (REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
@@ -23180,7 +23169,6 @@ impl ExecNtHandler {
                 let mut pending_endpoint_irp_id = 0u64;
                 let mut pipe_wait_trace_name: Option<alloc::vec::Vec<u16>> = None;
                 let mut pipe_wait_trace_hash = 0u64;
-                let mut pipe_wait_trace_armed = false;
                 let mut pipe_wait_trace_available = false;
                 let mut pipe_wait_trace_known = false;
                 let mut routed_hosted_fsctl = false;
@@ -23209,13 +23197,11 @@ impl ExecNtHandler {
                                     let pipe_wait_name_hash = nt_io_manager::pipe_name_hash(&leaf);
                                     pipe_wait_trace_name = Some(leaf.clone());
                                     pipe_wait_trace_hash = pipe_wait_name_hash;
-                                    let listens = &*core::ptr::addr_of!(crate::PIPE_ASYNC_LISTENS);
-                                    pipe_wait_trace_armed = listens.armed_name(pipe_wait_name_hash);
                                     pipe_wait_trace_available =
                                         crate::pipe_server_name_available(pipe_wait_name_hash);
                                     pipe_wait_trace_known =
                                         crate::pipe_name_hash_known(pipe_wait_name_hash);
-                                    if pipe_wait_trace_armed || pipe_wait_trace_available {
+                                    if pipe_wait_trace_available {
                                         status = nt_fs::STATUS_SUCCESS as u64;
                                     } else if !pipe_wait_trace_known {
                                         status = nt_fs::STATUS_OBJECT_NAME_NOT_FOUND as u64;
@@ -23271,8 +23257,6 @@ impl ExecNtHandler {
                         print_hex(status as u32);
                         print_str(b" hash=0x");
                         print_hex_u64(pipe_wait_trace_hash);
-                        print_str(b" armed=");
-                        print_u64(pipe_wait_trace_armed as u64);
                         print_str(b" available=");
                         print_u64(pipe_wait_trace_available as u64);
                         print_str(b" known=");
@@ -23302,21 +23286,17 @@ impl ExecNtHandler {
                     if !input_ok || !output_ok {
                         status = STATUS_ACCESS_VIOLATION as u64;
                     } else {
-                        let prepared = if is_pipe_listen {
-                            Ok(())
-                        } else {
-                            let granted = self
-                                .hosted_file_access_for(args[0])
-                                .ok_or(STATUS_INVALID_HANDLE);
-                            match granted.and_then(|granted| {
-                                self.prepare_hosted_file_io(route, args[0], granted)
-                            }) {
-                                Err(status) => Err(status),
-                                Ok(false) => return STATUS_PENDING,
-                                Ok(true) => {
-                                    generic_file_retained = true;
-                                    self.file_completion.set_signaled(route.file_id, false)
-                                }
+                        let granted = self
+                            .hosted_file_access_for(args[0])
+                            .ok_or(STATUS_INVALID_HANDLE);
+                        let prepared = match granted.and_then(|granted| {
+                            self.prepare_hosted_file_io(route, args[0], granted)
+                        }) {
+                            Err(status) => Err(status),
+                            Ok(false) => return STATUS_PENDING,
+                            Ok(true) => {
+                                generic_file_retained = true;
+                                self.file_completion.set_signaled(route.file_id, false)
                             }
                         };
                         match prepared {
@@ -23414,103 +23394,44 @@ impl ExecNtHandler {
                 if fid != 0 && (status as u32) == STATUS_PENDING {
                     let _ = self.file_completion.set_signaled(fid, false);
                 }
-                // A server posting an overlapped FSCTL_PIPE_LISTEN that NPFS returns STATUS_PENDING for
-                // keeps running until a client connect completes the listen. Record the completion event
-                // and IOSB in the server's own process context; the client-connect redrive fills/signals
-                // them and leaves the listen armed until then.
+                // Readiness is NPFS provider state; completion remains owned by the generic exact-IRP
+                // record above. A connect that won before this listen consumes its one-shot edge and
+                // must not make the already-connected instance visible to a root WAIT.
                 if is_pipe_listen
                     && (status as u32) == STATUS_PENDING
                     && fid != 0
                     && fs_context != 0
                 {
-                    let table = &mut *core::ptr::addr_of_mut!(crate::PIPE_ASYNC_LISTENS);
-                    let already_armed = table.armed(fs_context);
-                    let listen_name_hash = crate::pipe_fid_name_hash(fs_context);
-                    let retain_status = if listen_name_hash == 0 {
-                        print_str(b"[pipe-listen] REFUSED unnamed server fid=0x");
-                        print_hex(fs_context as u32);
-                        print_str(b" pi=");
-                        print_u64(self.pi as u64);
-                        print_str(b"\n");
-                        Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST)
-                    } else if already_armed {
-                        Ok(())
+                    let connected_before_listen =
+                        crate::pipe_server_preconnected_take(fs_context);
+                    if connected_before_listen {
+                        self.pipe_endpoint_progress = true;
                     } else {
-                        self.file_completion.retain_file(fid)
-                    };
-                    let old_capacity = table.capacity();
-                    let armed = retain_status.is_ok().then(|| {
-                        table.arm(nt_io_manager::AsyncListen {
-                                canonical_file_id: fid,
-                                server_file_id: fs_context,
-                                irp_id: pending_endpoint_irp_id,
-                                delivery_state: 0,
-                                event_obj_idx,
-                                pi: self.pi as u32,
-                                tid: self.current_tid,
-                                badge: self.current_badge,
-                                iosb_va: iosb,
-                                apc_routine: args[2],
-                                apc_context: args[3],
-                                completion_port_suppressed,
-                                // The server pipe's leaf name-hash (recorded at NtCreateNamedPipeFile) so a
-                                // client connect completes ONLY the matching-name listen.
-                                name_hash: listen_name_hash,
-                            })
-                    }).flatten();
-                    if armed.is_some() && table.capacity() != old_capacity {
-                        crate::mark_durable_table_growth_dirty();
+                        crate::pipe_server_available_remember(
+                            fs_context,
+                            pipe_listen_name_hash,
+                        )
+                        .expect("pre-reserved pipe availability slot disappeared");
+                        self.pipe_name_wait_redrive = pipe_listen_name_hash;
                     }
-                    if armed.is_some() {
-                        crate::PIPE_LISTEN_ARMED_COUNT.fetch_add(1, Ordering::Relaxed);
-                        let connected_before_listen =
-                            crate::pipe_server_preconnected_take(fs_context);
-                        if connected_before_listen {
-                            self.pipe_connect_redrive_server_fid = fs_context;
-                        } else {
-                            if crate::pipe_server_available_remember(fs_context, listen_name_hash)
-                                .is_err()
-                            {
-                                print_str(
-                                    b"[pipe-listen] availability record failed server fid=0x",
-                                );
-                                print_hex(fs_context as u32);
-                                print_str(b" pi=");
-                                print_u64(self.pi as u64);
-                                print_str(b"\n");
-                            }
-                            self.pipe_name_wait_redrive = listen_name_hash;
-                        }
-                        print_str(b"[pipe-listen] ARMED server fid=0x");
-                        print_hex(fs_context as u32);
-                        print_str(b" event_obj=0x");
-                        print_hex(event_obj_idx as u32);
-                        print_str(b" pi=");
-                        print_u64(self.pi as u64);
-                        if connected_before_listen {
-                            print_str(b" preconnected=1");
-                        }
-                        print_str(b"\n");
-                        // Overlapped: DON'T write the PENDING IOSB now — it's filled on completion.
-                        self.pipe_listen_fid = fs_context;
-                    } else {
-                        self.abandon_pipe_irp(pending_endpoint_irp_id);
-                        if !already_armed && retain_status.is_ok() {
-                            self.release_file_reference(fid);
-                        }
-                        status = retain_status
-                            .err()
-                            .unwrap_or(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
-                            as u64;
+                    print_str(b"[pipe-listen] PENDING server fid=0x");
+                    print_hex(fs_context as u32);
+                    print_str(b" event_obj=0x");
+                    print_hex(event_obj_idx as u32);
+                    print_str(b" pi=");
+                    print_u64(self.pi as u64);
+                    if connected_before_listen {
+                        print_str(b" preconnected=1");
                     }
+                    print_str(b"\n");
                 } else if is_pipe_listen
                     && (status as u32) == nt_io_manager::STATUS_PIPE_CONNECTED.raw() as u32
                     && fs_context != 0
                 {
                     crate::pipe_server_available_consume(fs_context);
+                    crate::pipe_server_preconnected_forget(fs_context);
                 }
                 if iosb != 0
-                    && self.pipe_listen_fid == 0
                     && self.pipe_name_wait_hash == 0
                     && !generic_pending
                     && !routed_hosted_fsctl
@@ -23521,7 +23442,6 @@ impl ExecNtHandler {
                 }
                 if routed_hosted_fsctl
                     && (status as u32) != STATUS_PENDING
-                    && self.pipe_listen_fid == 0
                     && !self.user_apc_redirected
                 {
                     self.complete_terminal_file_io(
@@ -28683,8 +28603,7 @@ impl ExecNtHandler {
                             info = publication.information;
                             if publication.handle != 0 {
                                 self.queue_write(file_handle_out, publication.handle);
-                                self.pipe_connect_redrive_server_fid =
-                                    publication.wake_server_fid;
+                                self.pipe_endpoint_progress |= publication.wake_server_fid != 0;
                             }
                         } else {
                             status = STATUS_PENDING;

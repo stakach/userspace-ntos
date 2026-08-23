@@ -2848,23 +2848,9 @@ static mut PENDING_FILE_IRP_DRAINS: nt_io_manager::PendingFileIrpDrainTable =
 /// A pending backend request could not transfer into its already-reserved generic owner. This is a
 /// fail-closed allocation/reply-cap path, never a compatibility fallback, and must remain zero.
 static PENDING_FILE_IO_TRANSFER_FAILURES: AtomicU64 = AtomicU64::new(0);
-// ─── BATCH 34: the async ncacn_np SERVER completion edge ──────────────────────────────────────────
-/// Pending async server-side `FSCTL_PIPE_LISTEN`s (host-tested `nt_io_manager::AsyncListenTable`). The
-/// ncacn_np rpcrt4 server posts an OVERLAPPED FSCTL_PIPE_LISTEN (STATUS_PENDING while no client) with a
-/// completion EVENT, then parks on `NtWaitForMultipleObjects([mgr_event, listen_event])` — it does NOT
-/// block on a pipe read. When the client (winlogon) connects/writes, the executive completes the
-/// pending listen + signals its event through the shared dispatcher wake path so the
-/// server's wait-array wakes → it reads the bind PDU → rpcrt4 emits bind_ack. The table uses the
-/// pipe model's default bootstrap reservation and grows as real RPC/service listeners accumulate.
-static mut PIPE_ASYNC_LISTENS: nt_io_manager::AsyncListenTable =
-    nt_io_manager::AsyncListenTable::new();
 const PIPE_NAME_WAITER_INITIAL_RESERVE: usize = HOSTED_THREAD_WAIT_INITIAL_RESERVE;
 static mut PIPE_NAME_WAITERS: nt_io_manager::PipeNameWaiterTable =
     nt_io_manager::PipeNameWaiterTable::new();
-/// Proof/diagnostic counters: server listens armed, and completed (client connect → event signalled).
-static PIPE_LISTEN_ARMED_COUNT: AtomicU64 = AtomicU64::new(0);
-static PIPE_LISTEN_SIGNALLED_COUNT: AtomicU64 = AtomicU64::new(0);
-static PIPE_LISTEN_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static PIPE_NAME_WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static PIPE_NAME_WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 static PIPE_NAME_WAIT_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -2910,6 +2896,22 @@ pub(crate) fn pipe_server_available_consume(server_fid: u64) -> bool {
 
 pub(crate) fn pipe_server_available_forget(server_fid: u64) -> bool {
     unsafe { (&mut *core::ptr::addr_of_mut!(PIPE_SERVER_AVAILABILITY)).remove(server_fid) }
+}
+
+/// Guarantee that one accepted LISTEN can publish provider readiness without allocating after the
+/// canonical IRP has been dispatched.
+pub(crate) fn reserve_pipe_server_availability() -> bool {
+    unsafe {
+        let available = &mut *core::ptr::addr_of_mut!(PIPE_SERVER_AVAILABILITY);
+        let old_capacity = available.capacity();
+        if !available.ensure_capacity() {
+            return false;
+        }
+        if available.capacity() != old_capacity {
+            mark_durable_table_growth_dirty();
+        }
+        true
+    }
 }
 
 pub(crate) fn pipe_server_preconnected_remember(server_fid: u64) -> Result<bool, u32> {
@@ -16006,8 +16008,7 @@ fn pipe_name_waiter_table_reset() -> bool {
 
 fn hosted_io_owner_tables_reset() -> bool {
     unsafe {
-        (&mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS)).reset()
-            && (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO)).reset()
+        (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO)).reset()
             && (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS)).reset()
             && (&mut *core::ptr::addr_of_mut!(PENDING_FILE_CLEANUP_WAITS)).reset()
             && (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS)).reset()
@@ -21280,29 +21281,12 @@ struct ExecNtHandler {
     /// An npfs endpoint transition may have completed another retained read/transceive/listen IRP.
     /// The loop drains those exact driver completions; this latch never owns their publication.
     pipe_endpoint_progress: bool,
-    /// BATCH 34 — the async ncacn_np SERVER completion edge. rpcrt4's ncacn_np server does NOT block
-    /// on a plain pipe read; it posts an OVERLAPPED `NtFsControlFile(FSCTL_PIPE_LISTEN)` (which returns
-    /// STATUS_PENDING when no client is connected yet) with an EVENT handle for completion, then parks
-    /// on `NtWaitForMultipleObjects([mgr_event, listen_event])`. When a client (winlogon) connects +
-    /// writes, the pending listen must complete and its EVENT be signalled so the server's wait-array
-    /// wakes. `pipe_listen_fid` = the server end's npfs `FsContext` (0 = no pending-listen request);
-    /// `pipe_listen_event_handle` = the overlapped completion Event handle (RDX); `pipe_listen_iosb_va`
-    /// = the listen IO_STATUS_BLOCK VA (filled SUCCESS on completion). Reset each dispatch.
-    pipe_listen_fid: u64,
-    pipe_listen_event_handle: u64,
-    pipe_listen_iosb_va: u64,
     pipe_name_wait_root_handle: u64,
     pipe_name_wait_hash: u64,
     pipe_name_wait_iosb_va: u64,
     pipe_name_wait_event_obj_idx: u64,
     pipe_name_wait_timeout: PendingWaitTimeout,
     pipe_name_wait_redrive: u64,
-    /// BATCH 34 — set to the connected pipe's SERVER-end fid by a client pipe CONNECT
-    /// (NtOpenFile/NtCreateFile IRP_MJ_CREATE on a pipe). The endpoint relation is decoded through
-    /// `nt_io_manager::pipe_server_file_id_for_endpoint`, keeping the ReactOS NPFS `FsContext`
-    /// encoding out of syscall code. The loop completes that one pending `FSCTL_PIPE_LISTEN` IRP,
-    /// not merely the first listen with the same pipe name.
-    pipe_connect_redrive_server_fid: u64,
     /// Monotonic counter for anonymous (unnamed) event objects (rpcrt4's server_ready_event/mgr_event).
     /// Each anon event gets a unique synthetic name so no two dedup. See `obj_create_anon_event`.
     anon_event_seq: u32,

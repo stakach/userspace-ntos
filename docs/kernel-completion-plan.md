@@ -10765,3 +10765,37 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `FSCTL_PIPE_WAIT` through a canonical hosted File/device request next and remove the executive
     name-wait compatibility table. Finally replace the explicit 16 KiB hosted control-buffer ceiling
     with a growable or banked transport before claiming arbitrary NT control-buffer lengths.
+
+    Generic pipe-LISTEN ownership checkpoint (2026-08-24): `FSCTL_PIPE_LISTEN` now crosses the same
+    canonical File boundary as every other filesystem control request. Dispatch resolves the real
+    File mode, reserves the exact generic owner before entering the provider, retains the File, and
+    acquires the synchronous File Busy/FIFO when required. A pending asynchronous listen returns
+    `STATUS_PENDING`; a pending synchronous listen transfers and parks its real syscall reply. Both
+    are represented by `PendingFileIo` with the canonical File generation, exact `IrpId`, control
+    code, IOSB, explicit event, APC-or-IOCP choice, File-signal policy, and optional Busy/reply owner.
+    Terminal publication, cancellation, thread teardown, backend ACK, and File-reference release now
+    use the one generic state machine.
+
+    The former `AsyncListen`/`AsyncListenTable`, executive global, manual post-dispatch allocation and
+    File retain, special thread-cancel scan, handler latches, retry flag, exact-listen redrive, and
+    duplicate IOSB/APC/File/IOCP/event publisher have been deleted. Root WAIT readiness continues to
+    use the separate NPFS provider availability state and no longer peeks into completion ownership.
+    Client CREATE correlation finds an active LISTEN by its generic File owner and dynamically
+    resolved provider context; pre-connected edges remain exact one-shot provider metadata. Pending
+    CREATE publication is ordered before dependent transfers, and a terminal LISTEN removes stale
+    provider availability before exposing its completion surfaces. No pipe identity was added to the
+    generic completion record.
+
+    Focused validation is green for `nt-io-manager` (`174/174`) and the freestanding executive check
+    at the existing 212-warning baseline. New tests prove zero-output LISTEN event plus IOCP
+    publication, APC/IOCP exclusivity, multiple exact rearm generations on one File, and synchronous
+    File signal, Busy release, and reply obligations before ACK. The removal deletes 1,020 lines net
+    from specialized completion machinery. A serialized desktop boot remains the integration gate
+    before this checkpoint is considered on-target complete.
+
+    Review adjustment: LISTEN completion ownership and synchronous File ordering are closed at the
+    implementation and focused-test boundary. The immediate integration check must prove genuine RPC
+    server LISTEN events and Explorer desktop rendering through the generic owner. Once accepted,
+    route root `FSCTL_PIPE_WAIT` through a canonical hosted NPFS root File/device request and remove
+    `PipeNameWaiterTable` plus the executive name-wait path. The growable or banked control-buffer
+    transport remains after root WAIT; the explicit 16 KiB ceiling must not survive that step.

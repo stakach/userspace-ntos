@@ -29304,17 +29304,6 @@ pub(crate) unsafe fn acknowledge_completed_irp(irp_id: u64) -> Result<(), u32> {
         .map_err(|status| status.raw() as u32)
 }
 
-pub(crate) unsafe fn request_cancel_irp(irp_id: u64) -> Result<(), u32> {
-    if irp_id == 0 {
-        return Err(STATUS_INVALID_PARAMETER as u32);
-    }
-    let io = io_manager_mut();
-    io.cancel(ClientId(IO_MANAGER_COMPONENT_ID), IrpId(irp_id))
-        .map_err(|status| status.raw() as u32)?;
-    io.pump();
-    Ok(())
-}
-
 pub(crate) unsafe fn cancel_irp_if_pending(irp_id: u64) -> Result<bool, u32> {
     if irp_id == 0 {
         return Err(STATUS_INVALID_PARAMETER as u32);
