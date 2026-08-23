@@ -74,7 +74,6 @@ pub(crate) use driver_launch::*;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
-const STATUS_IO_TIMEOUT: u32 = 0xC000_00B5;
 
 use alloc::alloc::alloc;
 use alloc::boxed::Box;
@@ -2848,21 +2847,10 @@ static mut PENDING_FILE_IRP_DRAINS: nt_io_manager::PendingFileIrpDrainTable =
 /// A pending backend request could not transfer into its already-reserved generic owner. This is a
 /// fail-closed allocation/reply-cap path, never a compatibility fallback, and must remain zero.
 static PENDING_FILE_IO_TRANSFER_FAILURES: AtomicU64 = AtomicU64::new(0);
-const PIPE_NAME_WAITER_INITIAL_RESERVE: usize = HOSTED_THREAD_WAIT_INITIAL_RESERVE;
-static mut PIPE_NAME_WAITERS: nt_io_manager::PipeNameWaiterTable =
-    nt_io_manager::PipeNameWaiterTable::new();
-static PIPE_NAME_WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
-static PIPE_NAME_WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
-static PIPE_NAME_WAIT_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
-static PIPE_NAME_WAIT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Growable fid -> pipe-leaf-name-hash map, populated at `NtCreateNamedPipeFile` and client
-/// `NtCreateFile`/`NtOpenFile` time. Async LISTEN completion and WAIT probing must be name-scoped;
-/// missing metadata is an error/non-match, never a wildcard.
+/// `NtCreateFile`/`NtOpenFile` time. Completion correlation is always endpoint-scoped; missing
+/// metadata is an error/non-match, never a wildcard.
 static mut PIPE_FID_NAMES: nt_io_manager::PipeFidNameTable = nt_io_manager::PipeFidNameTable::new();
-/// Exact server-instance availability for root `FSCTL_PIPE_WAIT`. A pipe name can be known while all
-/// instances are already connected; readiness must therefore be tracked separately from fid metadata.
-static mut PIPE_SERVER_AVAILABILITY: nt_io_manager::PipeServerAvailabilityTable =
-    nt_io_manager::PipeServerAvailabilityTable::new();
 /// Exact server endpoints that accepted a client before the server posted its async listen IRP.
 /// This models the documented `CreateFile` before `ConnectNamedPipe` race generically: the later
 /// `FSCTL_PIPE_LISTEN` completes the already-connected server fid once, without matching by name.
@@ -2880,38 +2868,6 @@ pub(crate) fn pipe_fid_name_remember(fid: u64, name_hash: u64) -> Result<(), u32
 
 pub(crate) fn pipe_fid_name_forget(fid: u64) -> bool {
     unsafe { (&mut *core::ptr::addr_of_mut!(PIPE_FID_NAMES)).forget(fid) }
-}
-
-pub(crate) fn pipe_server_available_remember(server_fid: u64, name_hash: u64) -> Result<(), u32> {
-    unsafe {
-        (&mut *core::ptr::addr_of_mut!(PIPE_SERVER_AVAILABILITY))
-            .mark_available(server_fid, name_hash)
-            .map_err(|_| nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
-    }
-}
-
-pub(crate) fn pipe_server_available_consume(server_fid: u64) -> bool {
-    unsafe { (&mut *core::ptr::addr_of_mut!(PIPE_SERVER_AVAILABILITY)).consume(server_fid) }
-}
-
-pub(crate) fn pipe_server_available_forget(server_fid: u64) -> bool {
-    unsafe { (&mut *core::ptr::addr_of_mut!(PIPE_SERVER_AVAILABILITY)).remove(server_fid) }
-}
-
-/// Guarantee that one accepted LISTEN can publish provider readiness without allocating after the
-/// canonical IRP has been dispatched.
-pub(crate) fn reserve_pipe_server_availability() -> bool {
-    unsafe {
-        let available = &mut *core::ptr::addr_of_mut!(PIPE_SERVER_AVAILABILITY);
-        let old_capacity = available.capacity();
-        if !available.ensure_capacity() {
-            return false;
-        }
-        if available.capacity() != old_capacity {
-            mark_durable_table_growth_dirty();
-        }
-        true
-    }
 }
 
 pub(crate) fn pipe_server_preconnected_remember(server_fid: u64) -> Result<bool, u32> {
@@ -2943,16 +2899,7 @@ pub(crate) fn reserve_pipe_create_metadata(server: bool) -> bool {
             mark_durable_table_growth_dirty();
         }
 
-        if server {
-            let available = &mut *core::ptr::addr_of_mut!(PIPE_SERVER_AVAILABILITY);
-            let available_capacity = available.capacity();
-            if !available.ensure_capacity() {
-                return false;
-            }
-            if available.capacity() != available_capacity {
-                mark_durable_table_growth_dirty();
-            }
-        } else {
+        if !server {
             let preconnected = &mut *core::ptr::addr_of_mut!(PIPE_PRECONNECTED_SERVERS);
             let preconnected_capacity = preconnected.capacity();
             if !preconnected.ensure_capacity() {
@@ -2964,14 +2911,6 @@ pub(crate) fn reserve_pipe_create_metadata(server: bool) -> bool {
         }
         true
     }
-}
-
-pub(crate) fn pipe_name_hash_known(name_hash: u64) -> bool {
-    unsafe { (&*core::ptr::addr_of!(PIPE_FID_NAMES)).contains_name_hash(name_hash) }
-}
-
-pub(crate) fn pipe_server_name_available(name_hash: u64) -> bool {
-    unsafe { (&*core::ptr::addr_of!(PIPE_SERVER_AVAILABILITY)).available_name(name_hash) }
 }
 
 /// The name-hash recorded for `fid` (0 = unknown).
@@ -3320,7 +3259,7 @@ const DELAY_TIMER_SOURCE_EVENT_WAIT: u64 = 2;
 const DELAY_TIMER_SOURCE_KEYED_WAIT: u64 = 3;
 const DELAY_TIMER_SOURCE_IO_COMPLETION: u64 = 4;
 const DELAY_TIMER_SOURCE_WATCHDOG: u64 = 5;
-const DELAY_TIMER_SOURCE_PIPE_NAME: u64 = 6;
+const DELAY_TIMER_SOURCE_HOSTED_KERNEL_TIMER: u64 = 6;
 const DELAY_TIMER_SOURCE_USER_TIMER: u64 = 7;
 const DELAY_TIMER_SOURCE_KEYED_RELEASE: u64 = 8;
 const DELAY_TIMER_SOURCE_HOSTED_DRIVER: u64 = 9;
@@ -10214,23 +10153,6 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_str(b"/");
     print_u64(io_completion_wait_store_fails);
     let (
-        pipe_name_wait_live,
-        pipe_name_wait_records,
-        pipe_name_wait_cap,
-        pipe_name_wait_alloc_fails,
-        pipe_name_wait_store_fails,
-    ) = pipe_name_waiter_table_stats();
-    print_str(b" pipe-name-wait=");
-    print_u64(pipe_name_wait_live as u64);
-    print_str(b"/");
-    print_u64(pipe_name_wait_records as u64);
-    print_str(b"/");
-    print_u64(pipe_name_wait_cap as u64);
-    print_str(b"/");
-    print_u64(pipe_name_wait_alloc_fails);
-    print_str(b"/");
-    print_u64(pipe_name_wait_store_fails);
-    let (
         thread_wait_park_live,
         thread_wait_park_records,
         thread_wait_park_cap,
@@ -15558,11 +15480,11 @@ unsafe fn delay_timer_next_deadline(
         unsafe { (&*core::ptr::addr_of!(KEYED_RELEASE_WAITERS)).next_deadline() };
     let io_completion_deadline =
         unsafe { (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)).next_deadline() };
-    let pipe_name_deadline = unsafe { (&*core::ptr::addr_of!(PIPE_NAME_WAITERS)).next_deadline() };
     let user_timer_deadline = match USER_TIMER_NEXT_DEADLINE.load(Ordering::Relaxed) {
         u64::MAX => None,
         deadline => Some(deadline),
     };
+    let hosted_kernel_timer_deadline = driver_launch::hosted_driver_timer_next_deadline();
     let hosted_driver_deadline = driver_launch::hosted_driver_wait_next_deadline();
     let deadman_deadline = watchdog_deadline();
     let deadline = delay_deadline
@@ -15571,8 +15493,8 @@ unsafe fn delay_timer_next_deadline(
         .chain(keyed_deadline)
         .chain(keyed_release_deadline)
         .chain(io_completion_deadline)
-        .chain(pipe_name_deadline)
         .chain(user_timer_deadline)
+        .chain(hosted_kernel_timer_deadline)
         .chain(hosted_driver_deadline)
         .chain(deadman_deadline)
         .min()?;
@@ -15586,10 +15508,10 @@ unsafe fn delay_timer_next_deadline(
         DELAY_TIMER_SOURCE_KEYED_RELEASE
     } else if io_completion_deadline == Some(deadline) {
         DELAY_TIMER_SOURCE_IO_COMPLETION
-    } else if pipe_name_deadline == Some(deadline) {
-        DELAY_TIMER_SOURCE_PIPE_NAME
     } else if user_timer_deadline == Some(deadline) {
         DELAY_TIMER_SOURCE_USER_TIMER
+    } else if hosted_kernel_timer_deadline == Some(deadline) {
+        DELAY_TIMER_SOURCE_HOSTED_KERNEL_TIMER
     } else if hosted_driver_deadline == Some(deadline) {
         DELAY_TIMER_SOURCE_HOSTED_DRIVER
     } else {
@@ -15791,27 +15713,6 @@ unsafe fn io_completion_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
     woken
 }
 
-unsafe fn pipe_name_wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
-    let mut woken = 0;
-    while let Some(waiter) =
-        unsafe { (&mut *core::ptr::addr_of_mut!(PIPE_NAME_WAITERS)).pop_due(now) }
-    {
-        pipe_name_wait_complete_one(handler, waiter, STATUS_IO_TIMEOUT);
-        PIPE_NAME_WAIT_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
-        woken += 1;
-        if PIPE_NAME_WAIT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
-            print_str(b"[pipe-name-wait] TIMEOUT name_hash=0x");
-            print_hex_u64(waiter.name_hash);
-            print_str(b" pi=");
-            print_u64(waiter.pi as u64);
-            print_str(b" badge=");
-            print_u64(waiter.badge);
-            print_str(b"\n");
-        }
-    }
-    woken
-}
-
 unsafe fn user_timer_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
     let fired = handler.user_timer_fire_due(now);
     if fired != 0 {
@@ -15834,8 +15735,8 @@ unsafe fn delay_timer_drain_due_work(
         + subdrain!(2, keyed_wait_wake_due(handler, now_100ns))
         + subdrain!(3, keyed_release_wait_wake_due(handler, now_100ns))
         + subdrain!(4, io_completion_wake_due(handler, now_100ns))
-        + subdrain!(5, pipe_name_wait_wake_due(handler, now_100ns))
-        + subdrain!(6, user_timer_wake_due(handler, now_100ns))
+        + subdrain!(5, user_timer_wake_due(handler, now_100ns))
+        + subdrain!(6, driver_launch::hosted_driver_timer_wake_due(now_100ns))
         + subdrain!(7, driver_launch::hosted_driver_wait_wake_due(now_100ns))
         + watchdog_tick
 }
@@ -15999,32 +15900,12 @@ fn io_completion_waiter_table_stats() -> (usize, usize, usize, u64, u64) {
     }
 }
 
-fn pipe_name_waiter_table_reset() -> bool {
-    unsafe {
-        (&mut *core::ptr::addr_of_mut!(PIPE_NAME_WAITERS))
-            .reset(PIPE_NAME_WAITER_INITIAL_RESERVE)
-    }
-}
-
 fn hosted_io_owner_tables_reset() -> bool {
     unsafe {
         (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO)).reset()
             && (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS)).reset()
             && (&mut *core::ptr::addr_of_mut!(PENDING_FILE_CLEANUP_WAITS)).reset()
             && (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS)).reset()
-    }
-}
-
-fn pipe_name_waiter_table_stats() -> (usize, usize, usize, u64, u64) {
-    unsafe {
-        let waiters = &*core::ptr::addr_of!(PIPE_NAME_WAITERS);
-        (
-            waiters.len(),
-            waiters.records(),
-            waiters.capacity(),
-            waiters.allocation_failures(),
-            waiters.store_failures(),
-        )
     }
 }
 
@@ -16829,21 +16710,6 @@ pub(crate) unsafe fn release_unregistered_hosted_thread_spawn(spawn: HostedThrea
 
 unsafe fn hosted_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
     let _ = handler.cancel_file_io_for_thread_teardown(tid);
-    let name_waiters = &mut *core::ptr::addr_of_mut!(PIPE_NAME_WAITERS);
-    let _ = name_waiters.cancel_thread_with(tid, |waiter| {
-        if waiter.reply_cap != 0 {
-            let cap = waiter.reply_cap;
-            let deleted = cnode_delete_r(cap);
-            let retyped = if deleted == 0 {
-                untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
-            } else {
-                u64::MAX
-            };
-            if deleted == 0 && retyped == 0 {
-                release_reply_pool_cap(cap);
-            }
-        }
-    });
     thread_wait_state_clear_tid(handler, tid);
 }
 
@@ -21281,12 +21147,6 @@ struct ExecNtHandler {
     /// An npfs endpoint transition may have completed another retained read/transceive/listen IRP.
     /// The loop drains those exact driver completions; this latch never owns their publication.
     pipe_endpoint_progress: bool,
-    pipe_name_wait_root_handle: u64,
-    pipe_name_wait_hash: u64,
-    pipe_name_wait_iosb_va: u64,
-    pipe_name_wait_event_obj_idx: u64,
-    pipe_name_wait_timeout: PendingWaitTimeout,
-    pipe_name_wait_redrive: u64,
     /// Monotonic counter for anonymous (unnamed) event objects (rpcrt4's server_ready_event/mgr_event).
     /// Each anon event gets a unique synthetic name so no two dedup. See `obj_create_anon_event`.
     anon_event_seq: u32,

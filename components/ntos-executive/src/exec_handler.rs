@@ -8,9 +8,7 @@ use crate::*;
 use nt_io_abi::major;
 
 const INTERNAL_DISPATCHER_EVENT_BASE: u64 = 1 << 40;
-const NPFS_ROOT_HANDLE_TAG: u64 = 0x4E50_4653_0000_0000; // "NPFS"
 pub(crate) const FSCTL_PIPE_LISTEN: u32 = 0x0011_0008;
-const FSCTL_PIPE_WAIT: u32 = 0x0011_0018;
 pub(crate) const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
 const STATUS_PENDING: u32 = 0x0000_0103;
 const STATUS_NO_YIELD_PERFORMED: u32 = 0x4000_0024;
@@ -33,9 +31,6 @@ const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 const STATUS_UNHANDLED_EXCEPTION: u32 = 0xC000_0144;
 const STATUS_DEVICE_NOT_READY: u32 = 0xC000_00A3;
-const STATUS_ILLEGAL_FUNCTION: u32 = 0xC000_00AF;
-const STATUS_IO_TIMEOUT: u32 = 0xC000_00B5;
-const STATUS_CANCELLED: u32 = 0xC000_0120;
 const HIGHEST_USER_ADDRESS: u64 = 0x0000_07ff_fffe_ffff;
 const NT_CREATE_THREAD_CLIENT_ID_ARG: usize = 4;
 const NT_CREATE_THREAD_CONTEXT_ARG: usize = 5;
@@ -71,7 +66,6 @@ const EXCEPTION_RECORD_ADDRESS_OFFSET: usize = 0x10;
 const EXCEPTION_RECORD_PARAMETERS_OFFSET: usize = 0x18;
 const EXCEPTION_RECORD_INFORMATION_OFFSET: usize = 0x20;
 const EXCEPTION_MAXIMUM_PARAMETERS: u32 = 15;
-const PIPE_DEFAULT_WAIT_INTERVAL_100NS: i64 = -50_000_000;
 const REGISTRY_SERVICES_CANON: &str = r"\registry\machine\system\controlset001\services";
 const REGISTRY_SERVICE_GROUP_ORDER_CANON: &str =
     r"\registry\machine\system\controlset001\control\servicegrouporder";
@@ -95,19 +89,6 @@ const PNP_BUS_RELATIONS: u32 = 3;
 const GUID_DEVICE_ENUMERATED_BYTES: [u8; 16] = [
     0x0a, 0x40, 0x3a, 0xcb, 0xf0, 0x46, 0xd0, 0x11, 0xb0, 0x8f, 0x00, 0x60, 0x97, 0x13, 0x05, 0x3f,
 ];
-
-fn pipe_wait_timeout(request: &nt_io_manager::PipeWaitRequest) -> PendingWaitTimeout {
-    let timeout = if request.timeout_specified {
-        request.timeout_100ns
-    } else {
-        PIPE_DEFAULT_WAIT_INTERVAL_100NS
-    };
-    if timeout == i64::MIN {
-        PendingWaitTimeout::none()
-    } else {
-        PendingWaitTimeout::from_interval(timeout)
-    }
-}
 
 fn io_control_access_granted(granted: u32, control_code: u32) -> bool {
     const FILE_READ_DATA: u32 = 0x0000_0001;
@@ -197,7 +178,6 @@ pub(crate) struct HostedCreatePublication {
     pub information: u64,
     pub handle: u64,
     pub wake_server_fid: u64,
-    pub wake_name_hash: u64,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -306,7 +286,6 @@ static TP_WORKER_PREFERRED_BUSY_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NT_YIELD_EXECUTION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PIPE_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PIPE_OPEN_TRACE_N: AtomicU64 = AtomicU64::new(0);
-static PIPE_WAIT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NAMED_PIPE_IO_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NT_QUERY_INFORMATION_FILE_NPFS_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static CSR_DUPLICATE_CLIENT_SOURCE_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -2787,12 +2766,6 @@ impl ExecNtHandler {
         write_field!(pending_file_irp_drain, None);
         write_field!(dbgk_block_request, false);
         write_field!(pipe_endpoint_progress, false);
-        write_field!(pipe_name_wait_root_handle, 0);
-        write_field!(pipe_name_wait_hash, 0);
-        write_field!(pipe_name_wait_iosb_va, 0);
-        write_field!(pipe_name_wait_event_obj_idx, u64::MAX);
-        write_field!(pipe_name_wait_timeout, PendingWaitTimeout::none());
-        write_field!(pipe_name_wait_redrive, 0);
         write_field!(anon_event_seq, 0);
         write_field!(pnp_event_cursor, 0);
         write_field!(pnp_notify_event, 0);
@@ -8984,33 +8957,6 @@ impl ExecNtHandler {
         self.mint_handle()
     }
 
-    /// Mint a process-local handle for the NPFS root/control file object. This is the object opened
-    /// by `WaitNamedPipe*` before issuing `FSCTL_PIPE_WAIT`; endpoint pipe opens remain typed
-    /// routed file handles and route through npfs's create/connect path.
-    pub(crate) fn mint_npfs_root_handle(&mut self, access: u32) -> Option<u64> {
-        let pid = self.pm_pid_for_pi(self.pi)?;
-        self.insert_process_handle(
-            pid,
-            nt_process::HandleObject::Opaque(NPFS_ROOT_HANDLE_TAG),
-            access,
-        )
-        .ok()
-        .map(|handle| handle as u64)
-    }
-
-    pub(crate) fn is_npfs_root_handle(&self, handle: u64) -> bool {
-        let Some(pid) = self.pm_pid_for_pi(self.pi) else {
-            return false;
-        };
-        if handle > u32::MAX as u64 {
-            return false;
-        }
-        matches!(
-            self.pm.lookup_handle(pid, handle as nt_process::Handle),
-            Some(nt_process::HandleObject::Opaque(tag)) if tag == NPFS_ROOT_HANDLE_TAG
-        )
-    }
-
     fn reserve_current_process_handle_slot(
         &mut self,
     ) -> Result<nt_process::HandleReservation, u32> {
@@ -10816,7 +10762,7 @@ impl ExecNtHandler {
         self.complete_file_reference_release(file_id, release);
     }
 
-    fn cancel_target_for_handle(&self, handle: u64) -> Result<(Option<u64>, bool), u32> {
+    fn cancel_target_for_handle(&self, handle: u64) -> Result<Option<u64>, u32> {
         const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
         let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
         if handle > u32::MAX as u64 {
@@ -10828,16 +10774,13 @@ impl ExecNtHandler {
                 if file_id == 0 || self.file_completion.is_signaled(file_id).is_err() {
                     Err(STATUS_INVALID_HANDLE)
                 } else {
-                    Ok((Some(file_id), false))
+                    Ok(Some(file_id))
                 }
             }
             Some(nt_process::HandleObject::DiskFile { .. })
             | Some(nt_process::HandleObject::Directory { .. })
             | Some(nt_process::HandleObject::OverlayFile(_))
-            | Some(nt_process::HandleObject::BootStatusFile) => Ok((None, false)),
-            Some(nt_process::HandleObject::Opaque(tag)) if tag == NPFS_ROOT_HANDLE_TAG => {
-                Ok((None, true))
-            }
+            | Some(nt_process::HandleObject::BootStatusFile) => Ok(None),
             Some(_) => Err(STATUS_OBJECT_TYPE_MISMATCH),
             None => Err(STATUS_INVALID_HANDLE),
         }
@@ -10902,8 +10845,7 @@ impl ExecNtHandler {
             Some(nt_process::HandleObject::DiskFile { .. })
             | Some(nt_process::HandleObject::Directory { .. })
             | Some(nt_process::HandleObject::OverlayFile(_))
-            | Some(nt_process::HandleObject::BootStatusFile)
-            | Some(nt_process::HandleObject::Opaque(NPFS_ROOT_HANDLE_TAG)) => {
+            | Some(nt_process::HandleObject::BootStatusFile) => {
                 self.write_current_iosb(iosb, STATUS_INVALID_DEVICE_REQUEST, 0);
                 return STATUS_INVALID_DEVICE_REQUEST;
             }
@@ -11076,26 +11018,6 @@ impl ExecNtHandler {
         status
     }
 
-    unsafe fn complete_cancelled_pipe_name_waiter(
-        &mut self,
-        waiter: nt_io_manager::PipeNameWaiter,
-    ) {
-        if waiter.iosb_va != 0 {
-            let _ = self.write_current_iosb(waiter.iosb_va, STATUS_CANCELLED, 0);
-        }
-        if waiter.event_obj_idx != u64::MAX {
-            let _ = self.signal_event_index(waiter.event_obj_idx as usize);
-        }
-        if waiter.reply_cap != 0 {
-            set_reply_mr(15, waiter.resume_ip);
-            set_reply_mr(16, waiter.resume_sp);
-            set_reply_mr(17, waiter.resume_flags);
-            client_reply_on(waiter.reply_cap, 18, STATUS_CANCELLED as u64, 0, 0, 0);
-            release_reply_pool_cap(waiter.reply_cap);
-            thread_wait_state_clear_badge_ready(self, waiter.badge);
-        }
-    }
-
     unsafe fn abandon_pending_file_io_for_thread(&mut self, tid: u64) -> usize {
         let mut transfers = Vec::new();
         (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
@@ -11192,21 +11114,13 @@ impl ExecNtHandler {
             + self.abandon_file_cleanup_waiters_for_thread(tid)
     }
 
-    unsafe fn cancel_pipe_name_waits_for_root_handle(&mut self, root_handle: u64) -> usize {
-        (&mut *core::ptr::addr_of_mut!(PIPE_NAME_WAITERS)).cancel_thread_handle_with(
-            self.current_tid,
-            root_handle,
-            |waiter| self.complete_cancelled_pipe_name_waiter(waiter),
-        )
-    }
-
     unsafe fn nt_cancel_io_file_service(&mut self, args: &[u64]) -> u32 {
         let file_handle = args[0];
         let iosb = args[1];
         if iosb == 0 || !self.probe_user_output(iosb, 16) {
             return STATUS_ACCESS_VIOLATION;
         }
-        let (file_id, is_npfs_root) = match self.cancel_target_for_handle(file_handle) {
+        let file_id = match self.cancel_target_for_handle(file_handle) {
             Ok(target) => target,
             Err(status) => return status,
         };
@@ -11275,10 +11189,7 @@ impl ExecNtHandler {
                 }
             }
         }
-        let mut cancelled = matched;
-        if is_npfs_root {
-            cancelled += self.cancel_pipe_name_waits_for_root_handle(file_handle);
-        }
+        let cancelled = matched;
         if self.pending_file_irp_drain.is_none() {
             // ReactOS treats this final write as best effort and still returns success if another
             // thread invalidated the probed IOSB while cancellation drained.
@@ -12660,7 +12571,6 @@ impl ExecNtHandler {
                 )?;
                 let pending = unsafe {
                     (&*core::ptr::addr_of!(PENDING_FILE_IO)).has_thread(tid as u64)
-                        || (&*core::ptr::addr_of!(PIPE_NAME_WAITERS)).has_thread(tid as u64)
                 };
                 output[..4].copy_from_slice(&(pending as u32).to_le_bytes());
                 4
@@ -13613,7 +13523,6 @@ impl ExecNtHandler {
                 {
                     b"SymbolicLink"
                 }
-                nt_process::HandleObject::Opaque(tag) if tag == NPFS_ROOT_HANDLE_TAG => b"File",
                 nt_process::HandleObject::Opaque(tag) if tag == KEYEDEVENT_HANDLE_TAG => {
                     b"KeyedEvent"
                 }
@@ -18252,6 +18161,7 @@ impl ExecNtHandler {
         &mut self,
         major: u8,
         name16: &[u16],
+        provider_context: u64,
         desired_access: u32,
         share_access: u32,
         create_options: u32,
@@ -18278,7 +18188,7 @@ impl ExecNtHandler {
             || !self.reserve_pending_file_io_owner()
             || REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
             || !wait_reply_pool_has_free()
-            || !crate::reserve_pipe_create_metadata(server)
+            || (provider_context != 0 && !crate::reserve_pipe_create_metadata(server))
         {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
@@ -18340,7 +18250,7 @@ impl ExecNtHandler {
                     nt_io_manager::PendingFileCreate {
                         handle_va: file_handle_va,
                         desired_access,
-                        provider_context: nt_io_manager::pipe_name_hash(name16),
+                        provider_context,
                         reservation_pid: reservation.process_id,
                         reserved_handle: reservation.handle,
                         reservation_generation: reservation.generation,
@@ -18426,18 +18336,30 @@ impl ExecNtHandler {
         } else {
             live_context
         };
-        if device_id != named_pipe_device || fs_context == 0 || provider_context == 0 {
+        if device_id != named_pipe_device || fs_context == 0 {
+            return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+        }
+
+        // A zero provider context denotes the NPFS root/control File. The RootDcb FILE_OBJECT is a
+        // canonical routed File, but it has no endpoint-name metadata to publish in the executive.
+        if major == major::IRP_MJ_CREATE && provider_context == 0 {
+            let handle = self.bind_reserved_file_handle(file_id, reservation, desired_access)?;
+            return Ok(HostedCreatePublication {
+                status,
+                information,
+                handle,
+                wake_server_fid: 0,
+            });
+        }
+        if provider_context == 0 {
             return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
         }
 
         let mut wake_server_fid = 0;
-        let mut wake_name_hash = 0;
         let mut preconnected_recorded = false;
         let provider_result = match major {
             major::IRP_MJ_CREATE_NAMED_PIPE => {
-                crate::pipe_fid_name_remember(fs_context, provider_context).and_then(|()| {
-                    crate::pipe_server_available_remember(fs_context, provider_context)
-                })
+                crate::pipe_fid_name_remember(fs_context, provider_context)
             }
             major::IRP_MJ_CREATE => {
                 let server_fid = nt_io_manager::pipe_server_file_id_for_endpoint(fs_context)
@@ -18457,9 +18379,10 @@ impl ExecNtHandler {
         };
         if let Err(provider_status) = provider_result {
             crate::pipe_fid_name_forget(fs_context);
-            if major == major::IRP_MJ_CREATE_NAMED_PIPE {
-                crate::pipe_server_available_forget(fs_context);
-            } else if wake_server_fid != 0 && preconnected_recorded {
+            if major != major::IRP_MJ_CREATE_NAMED_PIPE
+                && wake_server_fid != 0
+                && preconnected_recorded
+            {
                 crate::pipe_server_preconnected_forget(wake_server_fid);
             }
             return Err(provider_status);
@@ -18469,25 +18392,20 @@ impl ExecNtHandler {
             Ok(handle) => handle,
             Err(handle_status) => {
                 crate::pipe_fid_name_forget(fs_context);
-                if major == major::IRP_MJ_CREATE_NAMED_PIPE {
-                    crate::pipe_server_available_forget(fs_context);
-                } else if wake_server_fid != 0 && preconnected_recorded {
+                if major != major::IRP_MJ_CREATE_NAMED_PIPE
+                    && wake_server_fid != 0
+                    && preconnected_recorded
+                {
                     crate::pipe_server_preconnected_forget(wake_server_fid);
                 }
                 return Err(handle_status);
             }
         };
-        if major == major::IRP_MJ_CREATE_NAMED_PIPE {
-            wake_name_hash = provider_context;
-        } else {
-            crate::pipe_server_available_consume(wake_server_fid);
-        }
         Ok(HostedCreatePublication {
             status,
             information,
             handle,
             wake_server_fid,
-            wake_name_hash,
         })
     }
 
@@ -18514,7 +18432,6 @@ impl ExecNtHandler {
                 information,
                 handle: 0,
                 wake_server_fid: 0,
-                wake_name_hash: 0,
             });
         }
         let Some(reservation) = reservation else {
@@ -18523,7 +18440,6 @@ impl ExecNtHandler {
                 information: 0,
                 handle: 0,
                 wake_server_fid: 0,
-                wake_name_hash: 0,
             });
         };
         match self.publish_npfs_create(
@@ -18548,7 +18464,6 @@ impl ExecNtHandler {
                         information: 0,
                         handle: 0,
                         wake_server_fid: 0,
-                        wake_name_hash: 0,
                     })
                 }
             },
@@ -18559,7 +18474,6 @@ impl ExecNtHandler {
                     information: 0,
                     handle: 0,
                     wake_server_fid: 0,
-                    wake_name_hash: 0,
                 })
             }
         }
@@ -20566,76 +20480,29 @@ impl ExecNtHandler {
                 return status;
             }
         }
-        // Named-pipe client open: a `\??\pipe\NAME` / `\Device\NamedPipe\NAME` open routes to
-        // npfs (IRP_MJ_CREATE = client connect -> finds the FCB via the real prefix tree).
+        // Named-pipe root and endpoint opens both cross the canonical NPFS CREATE boundary. The root
+        // path opens a real RootDcb FILE_OBJECT; a leaf path connects to its FCB endpoint.
         {
             let oa_probe = args[2];
             let nm = self.read_objattr_name_pe(oa_probe);
             let lc: alloc::vec::Vec<u8> =
                 nm.iter().map(|&w| (w as u8).to_ascii_lowercase()).collect();
-            if Self::is_named_pipe_root_path(&nm) {
-                let mut status = if driver_launch::npfs_ready() {
-                    nt_fs::STATUS_SUCCESS
+            let is_pipe_root = Self::is_named_pipe_root_path(&nm);
+            if is_pipe_root || nt_fs::is_named_pipe_path(&nm) {
+                let leaf = if is_pipe_root {
+                    alloc::vec![b'\\' as u16]
                 } else {
-                    STATUS_DEVICE_NOT_READY
+                    Self::pipe_leaf16(&nm)
                 };
-                let opened_handle = if status == nt_fs::STATUS_SUCCESS {
-                    match self.mint_npfs_root_handle(desired_access) {
-                        Some(handle) => Some(handle),
-                        None => {
-                            status = 0xC000_009A;
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-                if let Some(handle) = opened_handle {
-                    self.queue_write(file_handle_out, handle);
-                } else {
-                    self.write_nt_open_file_handle_out(file_handle_out, 0);
-                }
-                let info = if status == nt_fs::STATUS_SUCCESS {
-                    nt_fs::FILE_OPENED as u64
-                } else {
+                let provider_context = if is_pipe_root {
                     0
+                } else {
+                    nt_io_manager::pipe_name_hash(&leaf)
                 };
-                let iosb = args[3];
-                if iosb != 0 {
-                    self.xas_write_buf(iosb, &status.to_le_bytes());
-                    self.xas_write_buf(iosb + 8, &info.to_le_bytes());
-                }
-                trace_pipe_open(
-                    b"NtOpenFile",
-                    self.pi,
-                    self.current_badge,
-                    self.current_tid,
-                    desired_access,
-                    share_access,
-                    nt_fs::FILE_OPEN,
-                    open_options,
-                    status,
-                    info,
-                    &nm,
-                );
-                loader_trace_record(
-                    self.pi,
-                    LoaderOp::OpenFile,
-                    status,
-                    None,
-                    0,
-                    opened_handle.unwrap_or(0),
-                    &lc,
-                );
-                return status;
-            }
-            let is_pipe = nt_fs::is_named_pipe_path(&nm);
-            if is_pipe {
-                let leaf = Self::pipe_leaf16(&nm);
-                let pipe_hash = nt_io_manager::pipe_name_hash(&leaf);
                 let dispatch = self.npfs_create_file(
                     major::IRP_MJ_CREATE,
                     &leaf,
+                    provider_context,
                     desired_access,
                     share_access,
                     open_options,
@@ -20647,14 +20514,13 @@ impl ExecNtHandler {
                         dispatch,
                         major::IRP_MJ_CREATE,
                         desired_access,
-                        pipe_hash,
+                        provider_context,
                     ),
                     Err(status) => Some(HostedCreatePublication {
                         status,
                         information: 0,
                         handle: 0,
                         wake_server_fid: 0,
-                        wake_name_hash: 0,
                     }),
                 };
                 let Some(publication) = publication else {
@@ -23012,6 +22878,7 @@ impl ExecNtHandler {
                 let dispatch = self.npfs_create_file(
                     major::IRP_MJ_CREATE_NAMED_PIPE,
                     &leaf,
+                    name_hash,
                     desired_access,
                     3,
                     options,
@@ -23030,7 +22897,6 @@ impl ExecNtHandler {
                         information: 0,
                         handle: 0,
                         wake_server_fid: 0,
-                        wake_name_hash: 0,
                     }),
                 };
                 let Some(publication) = publication else {
@@ -23050,7 +22916,6 @@ impl ExecNtHandler {
                     return publication.status;
                 }
                 NAMED_PIPE_CREATED.fetch_add(1, Ordering::Relaxed);
-                self.pipe_name_wait_redrive = publication.wake_name_hash;
                 publication.status
             },
             // NtDeviceIoControlFile captured args: FileHandle=args[0], Event=args[1],
@@ -23069,9 +22934,8 @@ impl ExecNtHandler {
                 if iosb == 0 || !self.probe_user_output(iosb, 16) {
                     return STATUS_ACCESS_VIOLATION;
                 }
-                // Hosted pipe clients route FSCTLs (LISTEN/WAIT/TRANSCEIVE) to npfs for tracked pipe
-                // endpoint handles. WaitNamedPipe opens the NPFS root/control file first and probes
-                // provider-owned server-instance availability.
+                // Route endpoint and root/control FSCTLs through the canonical File/device owner.
+                // ReactOS NPFS itself owns LISTEN, WAIT, timeout, cancellation, and wake ordering.
                 let fsctl = nt_ulong_arg(args[5]) as u64;
                 let mut status: u64;
                 let mut information = 0u64;
@@ -23083,13 +22947,8 @@ impl ExecNtHandler {
                 let file_route = self.hosted_file_route_for(args[0]);
                 let fid = file_route.map(|route| route.file_id).unwrap_or(0);
                 let fs_context = file_route.map(|route| route.fs_context).unwrap_or(0);
-                let is_pipe_wait = (fsctl as u32) == FSCTL_PIPE_WAIT;
                 let is_pipe_transceive = (fsctl as u32) == FSCTL_PIPE_TRANSCEIVE;
-                let is_root_pipe_wait = is_pipe_wait && self.is_npfs_root_handle(args[0]);
-                if is_pipe_transceive && self.is_npfs_root_handle(args[0]) {
-                    return nt_io_manager::STATUS_PIPE_DISCONNECTED.raw() as u32;
-                }
-                if !is_pipe_wait && file_route.is_none() {
+                if file_route.is_none() {
                     return STATUS_INVALID_HANDLE;
                 }
                 if let Some(route) = file_route {
@@ -23110,25 +22969,17 @@ impl ExecNtHandler {
                 }) {
                     return STATUS_INVALID_PARAMETER;
                 }
-                let pipe_listen_name_hash = if is_pipe_listen {
+                if is_pipe_listen {
                     if fs_context == 0 {
                         return nt_fs::STATUS_INVALID_DEVICE_REQUEST;
                     }
-                    let name_hash = crate::pipe_fid_name_hash(fs_context);
-                    if name_hash == 0 {
+                    if crate::pipe_fid_name_hash(fs_context) == 0 {
                         return nt_fs::STATUS_INVALID_DEVICE_REQUEST;
                     }
-                    if !crate::reserve_pipe_server_availability() {
-                        return STATUS_INSUFFICIENT_RESOURCES;
-                    }
-                    name_hash
-                } else {
-                    0
-                };
+                }
                 const HOSTED_FSCTL_BUFFER_CAP: usize = 0x4000;
-                if !is_root_pipe_wait
-                    && (raw_input_len > HOSTED_FSCTL_BUFFER_CAP
-                        || raw_output_len > HOSTED_FSCTL_BUFFER_CAP)
+                if raw_input_len > HOSTED_FSCTL_BUFFER_CAP
+                    || raw_output_len > HOSTED_FSCTL_BUFFER_CAP
                 {
                     return STATUS_INVALID_BUFFER_SIZE;
                 }
@@ -23139,19 +22990,17 @@ impl ExecNtHandler {
                 {
                     return STATUS_ACCESS_VIOLATION;
                 }
-                let generic_synchronous_file = if let Some(route) = file_route {
-                    match self.file_completion.is_synchronous(route.file_id) {
-                        Ok(synchronous) => synchronous,
-                        Err(status) => return status,
-                    }
-                } else {
-                    false
+                let generic_synchronous_file = match self
+                    .file_completion
+                    .is_synchronous(file_route.expect("validated File route").file_id)
+                {
+                    Ok(synchronous) => synchronous,
+                    Err(status) => return status,
                 };
-                if file_route.is_some()
-                    && (!self.reserve_pending_file_io_owner()
-                        || (generic_synchronous_file
-                            && (REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
-                                || !wait_reply_pool_has_free())))
+                if !self.reserve_pending_file_io_owner()
+                    || (generic_synchronous_file
+                        && (REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
+                            || !wait_reply_pool_has_free()))
                 {
                     return STATUS_INSUFFICIENT_RESOURCES;
                 }
@@ -23167,115 +23016,8 @@ impl ExecNtHandler {
                 let mut generic_file_retained = false;
                 let mut generic_pending = false;
                 let mut pending_endpoint_irp_id = 0u64;
-                let mut pipe_wait_trace_name: Option<alloc::vec::Vec<u16>> = None;
-                let mut pipe_wait_trace_hash = 0u64;
-                let mut pipe_wait_trace_available = false;
-                let mut pipe_wait_trace_known = false;
                 let mut routed_hosted_fsctl = false;
-                if is_root_pipe_wait {
-                    const PIPE_WAIT_INPUT_CAP: usize = 0x1_000c;
-                    if !driver_launch::npfs_ready() {
-                        status = STATUS_DEVICE_NOT_READY as u64;
-                    } else if raw_input_len > PIPE_WAIT_INPUT_CAP {
-                        status = STATUS_INVALID_BUFFER_SIZE as u64;
-                    } else if raw_output_len != 0
-                        && !self.probe_user_output(args[8], raw_output_len.min(0x4000))
-                    {
-                        status = STATUS_ACCESS_VIOLATION as u64;
-                    } else if raw_input_len == 0 {
-                        status = STATUS_INVALID_PARAMETER as u64;
-                    } else if args[6] == 0 {
-                        status = STATUS_ACCESS_VIOLATION as u64;
-                    } else {
-                        let mut input = alloc::vec![0u8; raw_input_len];
-                        if !self.xas_read(args[6], &mut input) {
-                            status = STATUS_ACCESS_VIOLATION as u64;
-                        } else {
-                            match nt_io_manager::decode_pipe_wait_request(&input) {
-                                Ok(wait_request) => {
-                                    let leaf = Self::pipe_leaf16(&wait_request.name);
-                                    let pipe_wait_name_hash = nt_io_manager::pipe_name_hash(&leaf);
-                                    pipe_wait_trace_name = Some(leaf.clone());
-                                    pipe_wait_trace_hash = pipe_wait_name_hash;
-                                    pipe_wait_trace_available =
-                                        crate::pipe_server_name_available(pipe_wait_name_hash);
-                                    pipe_wait_trace_known =
-                                        crate::pipe_name_hash_known(pipe_wait_name_hash);
-                                    if pipe_wait_trace_available {
-                                        status = nt_fs::STATUS_SUCCESS as u64;
-                                    } else if !pipe_wait_trace_known {
-                                        status = nt_fs::STATUS_OBJECT_NAME_NOT_FOUND as u64;
-                                    } else {
-                                        let timeout = pipe_wait_timeout(&wait_request);
-                                        if timeout
-                                            .due_now()
-                                            .is_some_and(|due| due == nt_delay_execution::Due::Immediate)
-                                        {
-                                            status = STATUS_IO_TIMEOUT as u64;
-                                        } else {
-                                            let waiters = &mut *core::ptr::addr_of_mut!(
-                                                crate::PIPE_NAME_WAITERS
-                                            );
-                                            let old_capacity = waiters.capacity();
-                                            let wait_capacity = waiters.ensure_capacity();
-                                            if wait_capacity && waiters.capacity() != old_capacity {
-                                                crate::mark_durable_table_growth_dirty();
-                                            }
-                                            let reply_capacity =
-                                                REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0
-                                                    && wait_reply_pool_has_free();
-                                            if !wait_capacity || !reply_capacity {
-                                                status =
-                                                    nt_io_completion::STATUS_INSUFFICIENT_RESOURCES
-                                                        as u64;
-                                            } else {
-                                                self.pipe_name_wait_hash = pipe_wait_name_hash;
-                                                self.pipe_name_wait_root_handle = args[0];
-                                                self.pipe_name_wait_iosb_va = iosb;
-                                                self.pipe_name_wait_event_obj_idx = event_obj_idx;
-                                                self.pipe_name_wait_timeout = timeout;
-                                                status = STATUS_PENDING as u64;
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(wait_status) => status = wait_status.0 as u32 as u64,
-                            }
-                        }
-                    }
-                    let trace = PIPE_WAIT_TRACE_N.fetch_add(1, Ordering::Relaxed);
-                    if trace < 96 || status != nt_fs::STATUS_SUCCESS as u64 {
-                        print_str(b"[pipe-wait] #");
-                        print_u64(trace);
-                        print_str(b" pi=");
-                        print_u64(self.pi as u64);
-                        print_str(b" badge=");
-                        print_u64(self.current_badge);
-                        print_str(b" tid=");
-                        print_u64(self.current_tid);
-                        print_str(b" status=0x");
-                        print_hex(status as u32);
-                        print_str(b" hash=0x");
-                        print_hex_u64(pipe_wait_trace_hash);
-                        print_str(b" available=");
-                        print_u64(pipe_wait_trace_available as u64);
-                        print_str(b" known=");
-                        print_u64(pipe_wait_trace_known as u64);
-                        print_str(b" in_len=");
-                        print_u64(raw_input_len as u64);
-                        print_str(b" name=\"");
-                        if let Some(name) = pipe_wait_trace_name.as_ref() {
-                            print_sanitized_utf16_ascii(name, 96);
-                        }
-                        print_str(b"\"\n");
-                    }
-                } else if is_pipe_wait {
-                    status = if fid == 0 {
-                        STATUS_INVALID_HANDLE
-                    } else {
-                        STATUS_ILLEGAL_FUNCTION
-                    } as u64;
-                } else if let Some(route) = file_route {
+                if let Some(route) = file_route {
                     let input_len = raw_input_len;
                     let output_len = raw_output_len;
                     let mut input = alloc::vec![0u8; input_len];
@@ -23304,7 +23046,7 @@ impl ExecNtHandler {
                             Ok(()) => {
                                 match self.dispatch_hosted_file_irp_for(
                                     route,
-                                    0xd,
+                                    major::IRP_MJ_FILE_SYSTEM_CONTROL as u64,
                                     fsctl,
                                     &input,
                                     &mut output,
@@ -23394,9 +23136,8 @@ impl ExecNtHandler {
                 if fid != 0 && (status as u32) == STATUS_PENDING {
                     let _ = self.file_completion.set_signaled(fid, false);
                 }
-                // Readiness is NPFS provider state; completion remains owned by the generic exact-IRP
-                // record above. A connect that won before this listen consumes its one-shot edge and
-                // must not make the already-connected instance visible to a root WAIT.
+                // Completion remains owned by the generic exact-IRP record above. Preserve the exact
+                // connect-before-listen edge until the provider's pending LISTEN owner can redrive it.
                 if is_pipe_listen
                     && (status as u32) == STATUS_PENDING
                     && fid != 0
@@ -23406,13 +23147,6 @@ impl ExecNtHandler {
                         crate::pipe_server_preconnected_take(fs_context);
                     if connected_before_listen {
                         self.pipe_endpoint_progress = true;
-                    } else {
-                        crate::pipe_server_available_remember(
-                            fs_context,
-                            pipe_listen_name_hash,
-                        )
-                        .expect("pre-reserved pipe availability slot disappeared");
-                        self.pipe_name_wait_redrive = pipe_listen_name_hash;
                     }
                     print_str(b"[pipe-listen] PENDING server fid=0x");
                     print_hex(fs_context as u32);
@@ -23428,11 +23162,9 @@ impl ExecNtHandler {
                     && (status as u32) == nt_io_manager::STATUS_PIPE_CONNECTED.raw() as u32
                     && fs_context != 0
                 {
-                    crate::pipe_server_available_consume(fs_context);
                     crate::pipe_server_preconnected_forget(fs_context);
                 }
                 if iosb != 0
-                    && self.pipe_name_wait_hash == 0
                     && !generic_pending
                     && !routed_hosted_fsctl
                     && !self.user_apc_redirected
@@ -28554,16 +28286,41 @@ impl ExecNtHandler {
                 } else if Self::is_named_pipe_root_path(&name16) {
                     if create_disposition != nt_fs::FILE_OPEN {
                         status = nt_fs::STATUS_INVALID_PARAMETER;
-                    } else if !driver_launch::npfs_ready() {
-                        status = STATUS_DEVICE_NOT_READY;
                     } else {
-                        match self.mint_npfs_root_handle(desired_access) {
-                            Some(handle) => {
-                                self.queue_write(file_handle_out, handle);
-                                status = nt_fs::STATUS_SUCCESS;
-                                info = nt_fs::FILE_OPENED as u64;
+                        let root_name = [b'\\' as u16];
+                        let dispatch = self.npfs_create_file(
+                            major::IRP_MJ_CREATE,
+                            &root_name,
+                            0,
+                            desired_access,
+                            share_access,
+                            create_options,
+                            file_handle_out,
+                            iosb,
+                        );
+                        let publication = match dispatch {
+                            Ok(dispatch) => self.finish_npfs_create_dispatch(
+                                dispatch,
+                                major::IRP_MJ_CREATE,
+                                desired_access,
+                                0,
+                            ),
+                            Err(route_status) => Some(HostedCreatePublication {
+                                status: route_status,
+                                information: 0,
+                                handle: 0,
+                                wake_server_fid: 0,
+                            }),
+                        };
+                        if let Some(publication) = publication {
+                            status = publication.status;
+                            info = publication.information;
+                            if publication.handle != 0 {
+                                self.queue_write(file_handle_out, publication.handle);
                             }
-                            None => status = 0xC000_009A,
+                        } else {
+                            status = STATUS_PENDING;
+                            pending_pipe_create = true;
                         }
                     }
                 } else if nt_fs::is_named_pipe_path(&name16) {
@@ -28577,6 +28334,7 @@ impl ExecNtHandler {
                         let dispatch = self.npfs_create_file(
                             major::IRP_MJ_CREATE,
                             &leaf,
+                            pipe_hash,
                             desired_access,
                             share_access,
                             create_options,
@@ -28595,7 +28353,6 @@ impl ExecNtHandler {
                                 information: 0,
                                 handle: 0,
                                 wake_server_fid: 0,
-                                wake_name_hash: 0,
                             }),
                         };
                         if let Some(publication) = publication {

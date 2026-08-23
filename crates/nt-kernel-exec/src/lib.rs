@@ -65,7 +65,7 @@ pub use semaphore::{
     map_semaphore_access, SemaphoreError, SemaphoreStore, SEMAPHORE_OBJECT,
 };
 pub use spin::{SpinError, SpinLockTable};
-pub use timer::{map_timer_access, Clock, FakeClock, TimerQueue};
+pub use timer::{map_timer_access, Clock, FakeClock, TimerExpiry, TimerQueue};
 pub use work_item::WorkQueue;
 
 /// Invokes driver callbacks (DPC / timer-DPC / work-item routines) — function

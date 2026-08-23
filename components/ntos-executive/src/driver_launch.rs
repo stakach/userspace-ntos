@@ -522,6 +522,8 @@ pub const V_SYMLINK: u32 = 0x80; // IoCreateSymbolicLink declared a valid link/t
 
 const PASSIVE_LEVEL: u8 = 0;
 const DISPATCH_LEVEL: u8 = 2;
+const TIMER_NOTIFICATION_OBJECT: u8 = 8;
+const TIMER_SYNCHRONIZATION_OBJECT: u8 = 9;
 const HOSTED_WORK_QUEUE_KIND_EX: u64 = 1;
 const HOSTED_WORK_QUEUE_KIND_IO: u64 = 2;
 const NDIS_MINIPORT_CHECK_FOR_HANG_CALLBACK_OFFSET_X64: u64 = 0x08;
@@ -607,6 +609,8 @@ pub const FSD_SERVICE_PS_TERMINATE_SYSTEM_THREAD_LABEL: u64 = 0x778;
 pub const FSD_SERVICE_REGISTRY_LABEL: u64 = 0x779;
 pub const FSD_SERVICE_PROVIDER_EXPORT_LABEL: u64 = 0x77A;
 pub const FSD_SERVICE_PROVIDER_CALLBACK_LABEL: u64 = 0x77B;
+pub const FSD_SERVICE_KE_SET_TIMER_LABEL: u64 = 0x77C;
+pub const FSD_SERVICE_KE_CANCEL_TIMER_LABEL: u64 = 0x77D;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_INTERRUPT: u64 = u64::MAX - 0x773;
@@ -619,6 +623,7 @@ pub const FSD_DISPATCH_PROVIDER_CALLBACK: u64 = u64::MAX - 0x77A;
 pub const FSD_DISPATCH_CANCEL_IRP: u64 = u64::MAX - 0x77B;
 pub const FSD_DISPATCH_COPY_COMPLETION: u64 = u64::MAX - 0x77C;
 pub const FSD_DISPATCH_ACK_COMPLETION: u64 = u64::MAX - 0x77D;
+pub const FSD_DISPATCH_TIMER_DPC: u64 = u64::MAX - 0x77E;
 
 pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
     matches!(
@@ -633,6 +638,8 @@ pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
             | FSD_SERVICE_REGISTRY_LABEL
             | FSD_SERVICE_PROVIDER_EXPORT_LABEL
             | FSD_SERVICE_PROVIDER_CALLBACK_LABEL
+            | FSD_SERVICE_KE_SET_TIMER_LABEL
+            | FSD_SERVICE_KE_CANCEL_TIMER_LABEL
     )
 }
 
@@ -3972,16 +3979,40 @@ extern "win64" fn s_ke_release_mutex(_mutex: u64, _wait: u8) -> i32 {
     1
 }
 
-extern "win64" fn s_ke_cancel_timer(_timer: u64) -> u8 {
-    0
+extern "win64" fn s_ke_cancel_timer(timer: u64) -> u8 {
+    if timer == 0 {
+        return 0;
+    }
+    let (_label, active, _, _, _) = unsafe {
+        call_on4(
+            (FSD_SERVICE_KE_CANCEL_TIMER_LABEL << 12) | 1,
+            timer,
+            0,
+            0,
+            0,
+        )
+    };
+    active as u8
 }
 
-extern "win64" fn s_ke_set_timer(_timer: u64, _due_time: u64, _dpc: u64) -> u8 {
-    0
+extern "win64" fn s_ke_set_timer(timer: u64, due_time: u64, dpc: u64) -> u8 {
+    s_ke_set_timer_ex(timer, due_time, 0, dpc)
 }
 
-extern "win64" fn s_ke_set_timer_ex(_timer: u64, _due_time: u64, _period: i32, _dpc: u64) -> u8 {
-    0
+extern "win64" fn s_ke_set_timer_ex(timer: u64, due_time: u64, period: i32, dpc: u64) -> u8 {
+    if timer == 0 || period < 0 {
+        return 0;
+    }
+    let (_label, active, _, _, _) = unsafe {
+        call_on4(
+            (FSD_SERVICE_KE_SET_TIMER_LABEL << 12) | 4,
+            timer,
+            due_time,
+            period as u32 as u64,
+            dpc,
+        )
+    };
+    active as u8
 }
 
 extern "win64" fn s_ke_stall_execution_processor(microseconds: u32) {
@@ -10024,6 +10055,9 @@ unsafe fn hosted_dispatcher_ready(object: u64) -> Result<bool, i32> {
     if object_type == SEMAPHORE_OBJECT {
         return Ok(ksemaphore_read_state(object as *const u8) > 0);
     }
+    if object_type == TIMER_NOTIFICATION_OBJECT || object_type == TIMER_SYNCHRONIZATION_OBJECT {
+        return Ok(read_unaligned((object + 4) as *const i32) > 0);
+    }
     Err(STATUS_INVALID_PARAMETER)
 }
 
@@ -10038,6 +10072,13 @@ unsafe fn hosted_dispatcher_consume(object: u64) -> bool {
     }
     if object_type == SEMAPHORE_OBJECT {
         return ksemaphore_try_wait(object as *mut u8);
+    }
+    if object_type == TIMER_NOTIFICATION_OBJECT {
+        return true;
+    }
+    if object_type == TIMER_SYNCHRONIZATION_OBJECT {
+        write_unaligned((object + 4) as *mut i32, 0);
+        return true;
     }
     false
 }
@@ -10405,6 +10446,81 @@ pub(crate) fn hosted_driver_wait_next_deadline() -> Option<u64> {
     }
 }
 
+pub(crate) fn hosted_driver_timer_next_deadline() -> Option<u64> {
+    unsafe {
+        (*core::ptr::addr_of!(HOSTED_DRIVER_TIMERS))
+            .as_ref()?
+            .iter()
+            .filter_map(nt_kernel_exec::TimerQueue::next_deadline)
+            .min()
+    }
+}
+
+pub(crate) unsafe fn hosted_driver_timer_wake_due(_now_100ns: u64) -> u64 {
+    let queue_count = (*core::ptr::addr_of!(HOSTED_DRIVER_TIMERS))
+        .as_ref()
+        .map(Vec::len)
+        .unwrap_or(0);
+    let mut delivered = 0u64;
+    for instance_index in 0..queue_count {
+        let expirations = {
+            let queues = (*core::ptr::addr_of_mut!(HOSTED_DRIVER_TIMERS))
+                .as_mut()
+                .unwrap();
+            queues[instance_index].run_due_expirations(&ExecutiveClock)
+        };
+        if expirations.is_empty() {
+            continue;
+        }
+        let Some(inst) = instance(instance_index) else {
+            continue;
+        };
+        for expiry in expirations {
+            let runtime = hosted_driver_runtime_for_worker_component_range(
+                instance_index,
+                expiry.timer_ptr,
+                0x40,
+            );
+            let exec_timer = component_to_exec_va_for_instance(
+                instance_index,
+                inst,
+                expiry.timer_ptr,
+                0x40,
+            )
+            .or_else(|| {
+                runtime.and_then(|worker| {
+                    hosted_worker_component_to_exec_va(worker, expiry.timer_ptr, 0x40)
+                })
+            });
+            let Some(exec_timer) = exec_timer else {
+                continue;
+            };
+            write_unaligned((exec_timer + 4) as *mut i32, 1);
+            delivered = delivered.saturating_add(1);
+            delivered = delivered
+                .saturating_add(wake_hosted_driver_waiters_for_instance(instance_index));
+
+            if let Some(dpc) = expiry.dpc_ptr {
+                let mut no_output = [];
+                let _ = dispatch_irp_for_instance(
+                    instance_index,
+                    FSD_DISPATCH_TIMER_DPC,
+                    0,
+                    0,
+                    0,
+                    0,
+                    dpc,
+                    expiry.timer_ptr,
+                    0,
+                    &[],
+                    &mut no_output,
+                );
+            }
+        }
+    }
+    delivered
+}
+
 pub(crate) unsafe fn hosted_driver_wait_wake_due(now_100ns: u64) -> u64 {
     let mut woken = 0u64;
     loop {
@@ -10546,9 +10662,14 @@ extern "win64" fn s_ke_initialize_timer_ex(timer: u64, timer_type: u32) {
     if timer == 0 {
         return;
     }
+    let _ = s_ke_cancel_timer(timer);
     unsafe {
         core::ptr::write_bytes(timer as *mut u8, 0, 0x40);
-        let type_byte = if timer_type == 0 { 8u8 } else { 9u8 };
+        let type_byte = if timer_type == 0 {
+            TIMER_NOTIFICATION_OBJECT
+        } else {
+            TIMER_SYNCHRONIZATION_OBJECT
+        };
         write_unaligned(timer as *mut u8, type_byte);
         write_unaligned((timer + 2) as *mut u8, 0x0A);
     }
@@ -25926,6 +26047,27 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
             (0xC000_000Du32 as i32, 0) // STATUS_INVALID_PARAMETER
         };
     }
+    if major == FSD_DISPATCH_TIMER_DPC {
+        let timer = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
+        let dpc = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
+        if timer == 0 {
+            return (STATUS_INVALID_PARAMETER, 0);
+        }
+        write_unaligned((timer + 4) as *mut i32, 1);
+        if dpc != 0 {
+            let routine = read_unaligned((dpc + KDPC_DEFERRED_ROUTINE_OFFSET) as *const u64);
+            if routine == 0 {
+                return (STATUS_INVALID_PARAMETER, 0);
+            }
+            let context = read_unaligned((dpc + KDPC_DEFERRED_CONTEXT_OFFSET) as *const u64);
+            let callback: extern "win64" fn(u64, u64, u64, u64) =
+                core::mem::transmute(routine as *const ());
+            let old_irql = hosted_raise_irql(DISPATCH_LEVEL);
+            callback(dpc, context, 0, 0);
+            hosted_lower_irql(old_irql);
+        }
+        return (STATUS_SUCCESS, 0);
+    }
     if major == FSD_DISPATCH_ADD_DEVICE {
         let add_device = read_volatile((FSD_SHARED_VADDR + SH_ADD_DEVICE) as *const u64);
         if add_device == 0 {
@@ -32928,6 +33070,19 @@ static mut HOSTED_DRIVER_THREAD_TABLES: Option<Vec<HostedDriverThreadTable>> = N
 static mut HOSTED_DRIVER_THREAD_RUNTIMES: Option<Vec<HostedDriverThreadRuntime>> = None;
 static mut HOSTED_DRIVER_WAITERS: Option<Vec<HostedDriverRawWaiter>> = None;
 static mut HOSTED_DRIVER_REPLY_POOLS: Option<Vec<HostedDriverReplyPool>> = None;
+static mut HOSTED_DRIVER_TIMERS: Option<Vec<nt_kernel_exec::TimerQueue>> = None;
+
+struct ExecutiveClock;
+
+impl nt_kernel_exec::Clock for ExecutiveClock {
+    fn now_100ns(&self) -> u64 {
+        crate::monotonic_time_100ns()
+    }
+
+    fn system_time_100ns(&self) -> i64 {
+        crate::nt_system_time_100ns() as i64
+    }
+}
 
 unsafe fn driver_instances_mut() -> &'static mut Vec<DriverInstance> {
     let slot = &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCES);
@@ -32978,6 +33133,22 @@ unsafe fn hosted_driver_waiters_mut() -> &'static mut Vec<HostedDriverRawWaiter>
         *slot = Some(Vec::new());
     }
     slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_driver_timer_queue_mut(
+    instance: usize,
+) -> (&'static mut nt_kernel_exec::TimerQueue, bool) {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DRIVER_TIMERS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    let queues = slot.as_mut().unwrap();
+    let old_capacity = queues.capacity();
+    while queues.len() <= instance {
+        queues.push(nt_kernel_exec::TimerQueue::new());
+    }
+    let grew = queues.capacity() != old_capacity;
+    (&mut queues[instance], grew)
 }
 
 unsafe fn hosted_driver_reply_pools_mut() -> &'static mut Vec<HostedDriverReplyPool> {
@@ -33162,6 +33333,17 @@ fn clear_hosted_driver_waits_for_instance(instance: usize) {
         if removed {
             let _ = crate::service_sec_image::rearm_registered_delay_timer();
         }
+    }
+}
+
+fn clear_hosted_driver_timers_for_instance(instance: usize) {
+    unsafe {
+        if let Some(queues) = (*core::ptr::addr_of_mut!(HOSTED_DRIVER_TIMERS)).as_mut() {
+            if let Some(queue) = queues.get_mut(instance) {
+                queue.clear();
+            }
+        }
+        let _ = crate::service_sec_image::rearm_registered_delay_timer();
     }
 }
 
@@ -33503,6 +33685,7 @@ pub(crate) struct HostedVideoRouteInfo {
 
 fn clear_instance(i: usize) {
     clear_hosted_driver_waits_for_instance(i);
+    clear_hosted_driver_timers_for_instance(i);
     clear_hosted_driver_threads_for_instance(i);
     unsafe {
         let failures = clear_hosted_resource_map_caps_for_instance(i);
@@ -34391,6 +34574,80 @@ pub(crate) fn service_hosted_driver_ke_set_event(
         print_str(b"\n");
     }
     previous
+}
+
+pub(crate) fn service_hosted_driver_ke_set_timer(
+    ch: &crate::spawn_hosts::PumpChannel,
+    timer: u64,
+    due_time: i64,
+    period_ms: u32,
+    dpc: u64,
+    active_reply_cap: u64,
+    caller_badge: u64,
+) -> u8 {
+    if timer == 0 {
+        return 0;
+    }
+    let Some((instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+        return 0;
+    };
+    let runtime = hosted_driver_runtime_by_badge(instance, caller_badge);
+    let Some(exec_timer) = hosted_driver_wait_object_exec_va(instance, inst, runtime, timer) else {
+        return 0;
+    };
+    if dpc != 0
+        && component_to_exec_va_for_instance(instance, inst, dpc, KDPC_SIZE).is_none()
+        && runtime
+            .and_then(|worker| hosted_worker_component_to_exec_va(worker, dpc, KDPC_SIZE))
+            .is_none()
+    {
+        return 0;
+    }
+
+    unsafe {
+        write_unaligned((exec_timer + 4) as *mut i32, 0);
+        let (queue, outer_grew) = hosted_driver_timer_queue_mut(instance);
+        let old_capacity = queue.capacity();
+        let was_active = queue.set(
+            timer,
+            due_time,
+            period_ms,
+            (dpc != 0).then_some(dpc),
+            &ExecutiveClock,
+        );
+        if outer_grew || queue.capacity() != old_capacity {
+            crate::mark_durable_table_growth_dirty();
+        }
+        let _ = crate::service_sec_image::rearm_registered_delay_timer();
+        was_active as u8
+    }
+}
+
+pub(crate) fn service_hosted_driver_ke_cancel_timer(
+    ch: &crate::spawn_hosts::PumpChannel,
+    timer: u64,
+    active_reply_cap: u64,
+    caller_badge: u64,
+) -> u8 {
+    if timer == 0 {
+        return 0;
+    }
+    let Some((instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+        return 0;
+    };
+    let runtime = hosted_driver_runtime_by_badge(instance, caller_badge);
+    if hosted_driver_wait_object_exec_va(instance, inst, runtime, timer).is_none() {
+        return 0;
+    }
+    unsafe {
+        let (queue, grew) = hosted_driver_timer_queue_mut(instance);
+        if grew {
+            crate::mark_durable_table_growth_dirty();
+        }
+        let was_active = queue.cancel(timer);
+        let _ = crate::service_sec_image::rearm_registered_delay_timer();
+        was_active as u8
+    }
 }
 
 pub(crate) fn service_hosted_driver_ke_pulse_event(
@@ -36691,7 +36948,8 @@ unsafe fn dispatch_irp_for_instance(
     let mut sh = d.exec_shared_va;
     let mut driver_object = d.driver_object;
     let mut provider_binding = None;
-    if let Some(route) = hosted_provider_dispatch_route_for_instance(inst) {
+    if major != FSD_DISPATCH_TIMER_DPC {
+        if let Some(route) = hosted_provider_dispatch_route_for_instance(inst) {
         if !route.add_device_ready() {
             return Some((STATUS_INVALID_DEVICE_REQUEST, 0, 0));
         }
@@ -36713,6 +36971,7 @@ unsafe fn dispatch_irp_for_instance(
         sh = provider_inst.exec_shared_va;
         driver_object = route.provider_driver_object;
         provider_binding = Some(binding);
+        }
     }
     let ep = d.fault_ep;
     let pml4 = d.pml4;

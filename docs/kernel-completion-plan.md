@@ -10805,3 +10805,50 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the caller's IOSB/event completion surfaces, root-handle cleanup, and exact provider-name
     correlation in the I/O Manager/provider boundary. The growable or banked control-buffer
     transport remains after root WAIT; the explicit 16 KiB ceiling must not survive that step.
+
+    Native NPFS root-WAIT checkpoint (2026-08-24): NPFS root opens now allocate a canonical I/O
+    Manager File, dispatch a real `IRP_MJ_CREATE` for `\` to the dynamically registered NamedPipe
+    device, retain the provider's RootDcb context, and publish an ordinary routed File handle. Root
+    and endpoint filesystem controls consequently share one path: exact File/device resolution,
+    access and synchronous-Busy policy, real provider dispatch, `PendingFileIo` transfer, native
+    IOSB/event/APC-or-IOCP/File-signal publication, cancellation by exact `IrpId`, lifecycle cleanup,
+    backend acknowledgement, and final File release. `FSCTL_PIPE_WAIT` name matching and wake order
+    now belong entirely to ReactOS NPFS's VCB wait queue.
+
+    Native finite waits required the missing hosted kernel-timer boundary. `KeSetTimer`,
+    `KeSetTimerEx`, and `KeCancelTimer` now cross component service labels into a per-driver
+    `nt-kernel-exec::TimerQueue`. The shared HPET deadline arbiter includes the earliest active
+    hosted timer; expiry sets the real KTIMER dispatcher header, wakes object waiters, and sends the
+    timer's KDPC back to the exact owning component, where its deferred routine runs at
+    `DISPATCH_LEVEL`. Notification and synchronization timers participate in the hosted dispatcher
+    wait rules, reset replaces a prior generation, cancellation is idempotent, periodic timers
+    rearm, and instance teardown clears its timer identities. Timer-table allocation growth is
+    marked durable across the service loop's bump-heap rewind.
+
+    The synthetic NPFS root-handle tag, request decoder, `PipeNameWaiterTable`,
+    `PipeServerAvailabilityTable`, root-only executive park/reply/timeout/wake/census/cancel path,
+    handler latches, create-time wake hash, and their tests are deleted. The only pipe-specific
+    executive metadata retained is endpoint name correlation plus the exact one-shot
+    connect-before-listen edge needed to redrive a provider IRP that lost that transport race. This
+    step removes 870 net code lines while replacing the timer stubs with a reusable kernel
+    mechanism.
+
+    Focused validation is green for `nt-kernel-exec` (`167/167`), `nt-io-manager` (`165/165`), the
+    freestanding executive check, the release executive build/staging path, and `git diff --check`.
+    Serialized desktop proof `.tmp/run-desktop-20260824-073906.log` is accepted for the exact
+    integrated tree. It issues one real root `FSCTL_PIPE_WAIT` through NPFS with a provider-owned
+    success result, keeps 34 real pending LISTEN requests under generic ownership, and dispatches 12
+    observed hosted timer DPC entries successfully. Genuine userinit and Explorer launch, Explorer
+    completes 669 real api0 callbacks with zero callback failures, and paint reaches 5 BeginPaint,
+    20 EndPaint, 187 direct GDI returns, and 135 batch flushes carrying 184 records. All 786,432
+    framebuffer pixels are non-background with at least 32 colors; all `293/293` checks pass and the
+    sentinel is emitted.
+
+    Review adjustment: root WAIT is closed at the canonical provider boundary. The accepted boot's
+    WAIT completed immediately because a matching NPFS instance was already listening, while the
+    same run independently exercised repeated real timer/DPC expiry. Queue, deadline, reset,
+    cancellation, no-DPC expiry, and periodic semantics remain covered by deterministic
+    `nt-kernel-exec` tests rather than overstated as a pending NPFS timeout stimulus. Next replace
+    the explicit `HOSTED_FSCTL_BUFFER_CAP` and fixed shared argument-window assumption with a
+    growable or banked control-buffer transport. No filesystem/device control path may reject a
+    valid NT request merely because its input or output exceeds 16 KiB.

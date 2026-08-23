@@ -79,6 +79,16 @@ struct Timer {
     generation: u64,
 }
 
+/// A timer that became signaled during a queue drain.
+///
+/// The runtime needs the timer identity even when no DPC is attached so it can
+/// publish the dispatcher-header signal state and wake object waiters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimerExpiry {
+    pub timer_ptr: u64,
+    pub dpc_ptr: Option<u64>,
+}
+
 /// The Driver Host's timer queue (spec §6.4).
 #[derive(Default)]
 pub struct TimerQueue {
@@ -177,6 +187,25 @@ impl TimerQueue {
         self.timers.iter().filter(|t| t.active).count()
     }
 
+    pub fn capacity(&self) -> usize {
+        self.timers.capacity()
+    }
+
+    /// Earliest active monotonic deadline, in 100ns units.
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.timers
+            .iter()
+            .filter(|timer| timer.active)
+            .map(|timer| timer.due_mono)
+            .min()
+    }
+
+    /// Discard all timer identities owned by this queue.
+    pub fn clear(&mut self) {
+        self.timers.clear();
+        self.next_gen = 0;
+    }
+
     /// The timer's current generation (bumped on every `set`; a stale expiry
     /// captured against an older generation must be ignored, spec §6.4).
     pub fn generation(&self, ptr: u64) -> Option<u64> {
@@ -186,17 +215,18 @@ impl TimerQueue {
             .map(|t| t.generation)
     }
 
-    /// Expire all due timers: set their signaled state, reschedule periodic ones,
-    /// and return the `KDPC` pointers to queue (spec §6.4).
-    pub fn run_due(&mut self, clock: &dyn Clock) -> Vec<u64> {
+    /// Expire all due timers: set their signaled state, reschedule periodic
+    /// ones, and return both the timer and optional `KDPC` identities.
+    pub fn run_due_expirations(&mut self, clock: &dyn Clock) -> Vec<TimerExpiry> {
         let now = clock.now_100ns();
         let mut fired = Vec::new();
         for t in self.timers.iter_mut() {
             if t.active && t.due_mono <= now {
                 t.signaled = true;
-                if let Some(d) = t.dpc_ptr {
-                    fired.push(d);
-                }
+                fired.push(TimerExpiry {
+                    timer_ptr: t.ptr,
+                    dpc_ptr: t.dpc_ptr,
+                });
                 if t.period_100ns > 0 {
                     t.due_mono = now + t.period_100ns; // periodic: reschedule
                 } else {
@@ -205,6 +235,14 @@ impl TimerQueue {
             }
         }
         fired
+    }
+
+    /// Compatibility helper for runtimes that only consume queued DPCs.
+    pub fn run_due(&mut self, clock: &dyn Clock) -> Vec<u64> {
+        self.run_due_expirations(clock)
+            .into_iter()
+            .filter_map(|expiry| expiry.dpc_ptr)
+            .collect()
     }
 }
 
@@ -283,6 +321,29 @@ mod tests {
         assert!(!tq.cancel(0x700)); // no longer active
         clk.advance_100ns(2_000);
         assert!(tq.run_due(&clk).is_empty()); // cancelled → no fire
+    }
+
+    #[test]
+    fn expiration_reports_timer_without_dpc_and_tracks_next_deadline() {
+        let mut clk = FakeClock::new();
+        let mut tq = TimerQueue::new();
+        tq.set(0x700, -1_000, 0, None, &clk);
+        tq.set(0x800, -2_000, 0, Some(0xD2), &clk);
+        assert_eq!(tq.next_deadline(), Some(1_000));
+
+        clk.advance_100ns(1_000);
+        assert_eq!(
+            tq.run_due_expirations(&clk),
+            vec![TimerExpiry {
+                timer_ptr: 0x700,
+                dpc_ptr: None,
+            }]
+        );
+        assert_eq!(tq.next_deadline(), Some(2_000));
+
+        tq.clear();
+        assert_eq!(tq.next_deadline(), None);
+        assert_eq!(tq.active_count(), 0);
     }
 
     #[test]

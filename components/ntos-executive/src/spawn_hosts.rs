@@ -1947,6 +1947,28 @@ unsafe fn component_pump_loop(
             );
             pump_reply_recv_into!(ch, *reply_cap, msg, 1, previous as u32 as u64);
             continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_KE_SET_TIMER_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let previous = crate::driver_launch::service_hosted_driver_ke_set_timer(
+                ch,
+                msg.m0,
+                msg.m1 as i64,
+                msg.m2 as u32,
+                msg.m3,
+                *reply_cap,
+                msg.badge,
+            );
+            pump_reply_recv_into!(ch, *reply_cap, msg, 1, previous as u64);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_KE_CANCEL_TIMER_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let previous = crate::driver_launch::service_hosted_driver_ke_cancel_timer(
+                ch, msg.m0, *reply_cap, msg.badge,
+            );
+            pump_reply_recv_into!(ch, *reply_cap, msg, 1, previous as u64);
+            continue;
         } else if label == crate::driver_launch::FSD_SERVICE_KE_PULSE_EVENT_LABEL
             && ch.caps.kind == ReqKind::Irp
         {

@@ -5392,9 +5392,6 @@ pub(crate) unsafe fn service_sec_image(
     if !hosted_io_owner_tables_reset() {
         panic!("hosted I/O owner table allocation failed");
     }
-    if !pipe_name_waiter_table_reset() {
-        panic!("pipe-name wait table allocation failed");
-    }
     if !thread_wait_state_reset() {
         panic!("thread wait parked-state allocation failed");
     }
@@ -8957,11 +8954,6 @@ pub(crate) unsafe fn service_sec_image(
                 nt_io_manager::PendingFileCleanupWaitReservation,
             )> = None;
             let mut synchronous_file_wait_parked = false;
-            let mut park_pipe_name_wait_root_handle: u64 = 0;
-            let mut park_pipe_name_wait_hash: u64 = 0;
-            let mut park_pipe_name_wait_iosb_va: u64 = 0;
-            let mut park_pipe_name_wait_event_obj_idx: u64 = u64::MAX;
-            let mut park_pipe_name_wait_timeout = PendingWaitTimeout::none();
             let mut park_lpc_receive_port: u64 = 0;
             let mut park_lpc_receive_msg: u64 = 0;
             let mut park_lpc_receive_ctx: u64 = 0;
@@ -9083,11 +9075,6 @@ pub(crate) unsafe fn service_sec_image(
                 );
                 nt_handler.dbgk_block_request = false;
                 nt_handler.pipe_endpoint_progress = false;
-                nt_handler.pipe_name_wait_hash = 0;
-                nt_handler.pipe_name_wait_iosb_va = 0;
-                nt_handler.pipe_name_wait_event_obj_idx = u64::MAX;
-                nt_handler.pipe_name_wait_timeout = PendingWaitTimeout::none();
-                nt_handler.pipe_name_wait_redrive = 0;
                 nt_handler.lpc_rendezvous_conn = 0;
                 nt_handler.lpc_receive_park_port = 0;
                 nt_handler.lpc_receive_park_msg = 0;
@@ -9870,28 +9857,12 @@ pub(crate) unsafe fn service_sec_image(
                 if nt_handler.dbgk_block_request {
                     park_dbgk_reporter = true;
                 }
-                if nt_handler.pipe_name_wait_hash != 0 {
-                    park_pipe_name_wait_root_handle = nt_handler.pipe_name_wait_root_handle;
-                    park_pipe_name_wait_hash = nt_handler.pipe_name_wait_hash;
-                    park_pipe_name_wait_iosb_va = nt_handler.pipe_name_wait_iosb_va;
-                    park_pipe_name_wait_event_obj_idx = nt_handler.pipe_name_wait_event_obj_idx;
-                    park_pipe_name_wait_timeout = nt_handler.pipe_name_wait_timeout;
-                }
                 let hosted_io_progress = driver_launch::pump_hosted_io_completions();
                 if hosted_io_progress != 0
                     || FILE_IO_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel)
                 {
                     let _ = pending_file_io_redrive_all(&mut nt_handler);
                     let _ = file_cleanup_redrive_all(&mut nt_handler);
-                }
-                if nt_handler.pipe_name_wait_redrive != 0 {
-                    let name_hash = nt_handler.pipe_name_wait_redrive;
-                    let waiters = pipe_name_wait_complete_named(&mut nt_handler, name_hash);
-                    if waiters != 0 {
-                        print_str(b"[pipe-name-wait] completed ");
-                        print_u64(waiters);
-                        print_str(b" waiter(s) on available pipe\n");
-                    }
                 }
                 if nt_handler.pipe_endpoint_progress || hosted_io_progress != 0 {
                     let _ = pending_file_io_redrive_all(&mut nt_handler);
@@ -16156,60 +16127,6 @@ pub(crate) unsafe fn service_sec_image(
                 m2 = nm2;
                 m3 = nm3;
                 continue;
-            }
-            if park_pipe_name_wait_hash != 0 && reply_main != 0 {
-                let park_pipe_name_wait_deadline_100ns = park_pipe_name_wait_timeout
-                    .deadline_at_park()
-                    .unwrap_or(u64::MAX);
-                if park_pipe_name_wait_deadline_100ns != u64::MAX && !delay_timer_init() {
-                    result = 0xC000_009A;
-                } else if pipe_name_wait_park(
-                    park_pipe_name_wait_root_handle,
-                    park_pipe_name_wait_hash,
-                    pi as u32,
-                    nt_handler.current_tid,
-                    badge,
-                    park_pipe_name_wait_iosb_va,
-                    park_pipe_name_wait_event_obj_idx,
-                    park_pipe_name_wait_deadline_100ns,
-                    resume_ip,
-                    sp,
-                    flags,
-                ) {
-                    if park_pipe_name_wait_deadline_100ns != u64::MAX {
-                        delay_timer_rearm_after_park(delay_queue, &mut nt_handler, true);
-                    }
-                    print_str(b"[pipe-name-wait] badge=");
-                    print_u64(badge);
-                    print_str(b" name_hash=0x");
-                    print_hex_u64(park_pipe_name_wait_hash);
-                    print_str(b" -> PARK waiter\n");
-                    if park_pipe_name_wait_deadline_100ns == u64::MAX {
-                        trace_indefinite_wait_park(
-                            &nt_handler,
-                            badge,
-                            live_top_badges(&nt_handler),
-                            crash_parked,
-                            wait_parked,
-                        );
-                        mark_wait_parked!(pi, resume_ip);
-                    }
-                    pin_durable_table_growth_if_dirty(&mut heap_mark);
-                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
-                    badge = nb;
-                    mi = nmi;
-                    m0 = nm0;
-                    m1 = nm1;
-                    m2 = nm2;
-                    m3 = nm3;
-                    continue;
-                } else {
-                    print_str(
-                        b"[pipe-name-wait] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n",
-                    );
-                    result = 0xC000_009A;
-                }
             }
             // ★ Dbgk TARGET-SIDE BLOCK, SYSCALL flavour (`DbgkpQueueMessage`'s wait on
             // `DebugEvent->ContinueEvent`). This syscall posted a debug event for a process whose
@@ -23174,7 +23091,6 @@ pub(crate) unsafe fn start_file_cleanup(nt_handler: &mut ExecNtHandler, file_id:
             let server_context = nt_io_manager::pipe_server_file_id_for_endpoint(fs_context)
                 .unwrap_or(fs_context);
             crate::pipe_server_preconnected_forget(server_context);
-            crate::pipe_server_available_forget(fs_context);
             crate::pipe_fid_name_forget(fs_context);
         }
     }
@@ -23334,130 +23250,6 @@ unsafe fn file_cleanup_wait_transfer(
     true
 }
 
-unsafe fn pipe_name_wait_park(
-    root_handle: u64,
-    name_hash: u64,
-    pi: u32,
-    tid: u64,
-    badge: u64,
-    iosb_va: u64,
-    event_obj_idx: u64,
-    deadline_100ns: u64,
-    resume_ip: u64,
-    sp: u64,
-    flags: u64,
-) -> bool {
-    let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-    if stolen == 0 {
-        return false;
-    }
-    let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
-        return false;
-    };
-    let table = &mut *core::ptr::addr_of_mut!(PIPE_NAME_WAITERS);
-    let old_capacity = table.capacity();
-    let parked = table.arm(nt_io_manager::PipeNameWaiter {
-        root_handle,
-        name_hash,
-        pi,
-        tid,
-        badge,
-        iosb_va,
-        event_obj_idx,
-        reply_cap: stolen,
-        resume_ip,
-        resume_sp: sp,
-        resume_flags: flags,
-        deadline_100ns,
-    });
-    if parked.is_none() {
-        return false;
-    }
-    if table.capacity() != old_capacity {
-        mark_durable_table_growth_dirty();
-    }
-    wait_reply_pool_mark_used(fresh_index);
-    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
-    PIPE_NAME_WAIT_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
-    true
-}
-
-pub(crate) unsafe fn pipe_name_wait_complete_one(
-    nt_handler: &mut ExecNtHandler,
-    waiter: nt_io_manager::PipeNameWaiter,
-    status: u32,
-) {
-    let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
-    let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
-    let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
-    let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
-    let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
-    let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
-    let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
-    let saved_pi = nt_handler.pi;
-    let saved_ctx = nt_handler.loop_ctx.take();
-    let (sb, ss, smv, hmv, imv, scratch_base) = mirror_ctx_for(waiter.badge, waiter.pi as usize);
-    ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
-    ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
-    ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
-    ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
-    ACTIVE_IMAGE_MIRROR.store(imv, Ordering::Relaxed);
-    ACTIVE_CLIENT_PI.store(waiter.pi as u64, Ordering::Relaxed);
-    ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
-    nt_handler.pi = waiter.pi as usize;
-    if waiter.iosb_va != 0 {
-        nt_handler.xas_write_buf(waiter.iosb_va, &status.to_le_bytes());
-        nt_handler.xas_write_buf(waiter.iosb_va + 8, &0u64.to_le_bytes());
-    }
-    if waiter.event_obj_idx != u64::MAX {
-        let _ = nt_handler.events.set_existing(waiter.event_obj_idx);
-        let _ = wait_wake_dispatcher_set(nt_handler);
-    }
-    if waiter.reply_cap != 0 {
-        set_reply_mr(15, waiter.resume_ip);
-        set_reply_mr(16, waiter.resume_sp);
-        set_reply_mr(17, waiter.resume_flags);
-        client_reply_on(waiter.reply_cap, 18, status as u64, 0, 0, 0);
-        release_reply_pool_cap(waiter.reply_cap);
-        thread_wait_state_clear_badge_ready(nt_handler, waiter.badge);
-    }
-    ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
-    ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
-    ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
-    ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
-    ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
-    ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
-    ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
-    nt_handler.pi = saved_pi;
-    nt_handler.loop_ctx = saved_ctx;
-}
-
-unsafe fn pipe_name_wait_complete_named(nt_handler: &mut ExecNtHandler, name_hash: u64) -> u64 {
-    let mut woken = 0u64;
-    loop {
-        let waiter = {
-            let table = &mut *core::ptr::addr_of_mut!(PIPE_NAME_WAITERS);
-            table.complete_by_name(name_hash)
-        };
-        let Some(waiter) = waiter else {
-            break;
-        };
-        pipe_name_wait_complete_one(nt_handler, waiter, 0);
-        woken += 1;
-        PIPE_NAME_WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
-        if PIPE_NAME_WAIT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
-            print_str(b"[pipe-name-wait] COMPLETE name_hash=0x");
-            print_hex_u64(name_hash);
-            print_str(b" pi=");
-            print_u64(waiter.pi as u64);
-            print_str(b" badge=");
-            print_u64(waiter.badge);
-            print_str(b"\n");
-        }
-    }
-    woken
-}
-
 /// Publish terminal results for general pending File IRPs in NT completion order. The backend
 /// completion remains retained until every required surface and synchronous reply is visible.
 unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
@@ -23561,10 +23353,8 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         let mut terminal_status = completed.status;
         let mut terminal_information = completed.information;
         if let Some(server_context) = pipe_listen_server_context {
-            // A terminal LISTEN is no longer a root-WAIT-ready server instance. Successful accept
-            // also consumes the one-shot connect-before-listen edge; cancellation deliberately
-            // leaves that edge intact when a client already won the race.
-            crate::pipe_server_available_forget(server_context);
+            // Successful accept consumes the one-shot connect-before-listen edge; cancellation
+            // deliberately leaves that edge intact when a client already won the race.
             if terminal_status == nt_fs::STATUS_SUCCESS
                 || terminal_status == nt_io_manager::STATUS_PIPE_CONNECTED.raw() as u32
             {
@@ -23582,7 +23372,6 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                         information: completed.information,
                         handle: 0,
                         wake_server_fid: 0,
-                        wake_name_hash: 0,
                     }
                 } else {
                     match nt_handler.publish_npfs_create(
@@ -23606,7 +23395,6 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                                 information: 0,
                                 handle: 0,
                                 wake_server_fid: 0,
-                                wake_name_hash: 0,
                             }
                         }
                     }
@@ -23622,12 +23410,6 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                     .expect("pending CREATE result could not be committed");
                 if publication.wake_server_fid != 0 {
                     nt_handler.pipe_endpoint_progress = true;
-                }
-                if publication.wake_name_hash != 0 {
-                    let _ = pipe_name_wait_complete_named(
-                        nt_handler,
-                        publication.wake_name_hash,
-                    );
                 }
                 delivery_state = (&*core::ptr::addr_of!(PENDING_FILE_IO))
                     .get(slot)
