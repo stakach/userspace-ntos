@@ -28,6 +28,12 @@ use alloc::vec::Vec;
 
 use nt_status::NtStatus;
 
+use crate::pending_io::IO_DELIVERY_REPLY_CLAIMED;
+#[cfg(test)]
+use crate::pending_io::{
+    IO_DELIVERY_APC_PUBLISHED, IO_DELIVERY_EVENT_PUBLISHED, IO_DELIVERY_FILE_PUBLISHED,
+};
+
 // --- NPFS constants (references/reactos/sdk/include/ndk/iotypes.h) ----------
 
 /// `FILE_PIPE_BYTE_STREAM_TYPE` / `FILE_PIPE_MESSAGE_TYPE`.
@@ -728,15 +734,6 @@ fn valid_completion_mode(mode: u32) -> bool {
 // canonical IRP retained by npfs. On a progress edge it pumps the driver
 // completion broker and probes those exact ids; `complete` frees only the slots
 // whose terminal completion was delivered.
-
-pub const IO_DELIVERY_BUFFER_PUBLISHED: u16 = 1 << 0;
-pub const IO_DELIVERY_IOSB_PUBLISHED: u16 = 1 << 1;
-pub const IO_DELIVERY_APC_PUBLISHED: u16 = 1 << 2;
-pub const IO_DELIVERY_FILE_PUBLISHED: u16 = 1 << 3;
-pub const IO_DELIVERY_IOCP_PUBLISHED: u16 = 1 << 4;
-pub const IO_DELIVERY_EVENT_PUBLISHED: u16 = 1 << 5;
-pub const IO_DELIVERY_REPLY_CLAIMED: u16 = 1 << 6;
-pub const IO_DELIVERY_REPLY_PUBLISHED: u16 = 1 << 7;
 
 /// One parked pipe read awaiting peer data. All fields are the executive-side
 /// context needed to complete the read when data arrives: the owning device id,

@@ -10208,3 +10208,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     per-FSCTL wait tables, and do not proceed to the multi-stack completion unwinder until every
     general pending syscall either transfers that record or cancels and drains the exact IRP before
     returning.
+
+    Generic pending File-I/O crate checkpoint (2026-08-23): `nt-io-manager` now owns one reusable
+    `PendingFileIo` delivery record and growable `PendingFileIoTable`. The record keeps canonical
+    FileId/IrpId identity separate from user output/IOSB addresses and from APC, File, IOCP, event,
+    and optional synchronous-reply surfaces. Publication bits are monotonic and generation-exact;
+    reply-cap ownership transfers once, null or duplicate canonical IRPs fail closed, capacity is
+    reserved before dispatch and grows without a policy limit, and thread teardown can extract only
+    records that have not begun publication. The existing pipe waiters now reuse the generic
+    publication-bit contract instead of defining a second set of flags. Host validation is green for
+    `cargo fmt --all` and `cargo test -p nt-io-manager` (`158/158`). Review adjustment: this is the
+    pure ownership foundation, not completion proof. Wire one executive table into the common hosted
+    completion pump, cancellation, and thread teardown first; then migrate device control,
+    non-special FSCTL, query/set information, and flush paths to transfer every STATUS_PENDING IrpId
+    into it. Specialized pipe read/write/transceive/listen records remain only for their endpoint
+    progress triggers and must retain the same exact publication/ACK contract.
