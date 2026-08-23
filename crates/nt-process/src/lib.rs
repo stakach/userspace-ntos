@@ -130,6 +130,14 @@ pub type Handle = u32;
 pub type SectionId = u32;
 pub type AddressSpaceId = u32;
 
+/// Opaque ownership token for one exact, process-local handle slot that is not yet visible.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HandleReservation {
+    pub process_id: ProcessId,
+    pub handle: Handle,
+    pub generation: u64,
+}
+
 /// NT client ids are handle-shaped values: non-zero multiples of four. ReactOS GDI also stores
 /// low-bit metadata in owner fields and masks it before comparing against `PsGetCurrentProcessId`.
 pub const CLIENT_ID_GRANULARITY: u32 = 4;
@@ -542,12 +550,12 @@ pub struct NtProcess {
     security_descriptor: Vec<u8>,
     /// Per-process handle table (spec §8.1). A dense **array of entries** indexed by handle slot —
     /// the real NT `HANDLE_TABLE` shape — rather than a `BTreeMap`. Slot `i` ↔ handle value
-    /// `(i + 1) * 4` (NT handles are non-zero multiples of 4). Freed slots (`None`) are reused (as
-    /// the real handle table does). This representation is **pre-reservable**: a host that reserves
-    /// capacity up front ([`ProcessManager::reserve_handles`]) gets `insert_handle` writing into
-    /// pre-allocated storage with **no reallocation**, so it can run on a bump allocator whose
-    /// transient region is reset per call without corrupting the durable table.
-    handles: Vec<Option<HandleEntry>>,
+    /// `(i + 1) * 4` (NT handles are non-zero multiples of 4). Freed slots are reused. A reserved
+    /// slot fixes one future handle value before an external CREATE begins while remaining
+    /// invisible to lookup and ordinary insertion. Capacity can still be reserved up front for
+    /// allocation-free ordinary inserts.
+    handles: Vec<HandleSlot>,
+    next_handle_reservation_generation: u64,
 }
 
 impl NtProcess {
@@ -638,6 +646,43 @@ struct HandleEntry {
     object: HandleObject,
     granted_access: u32,
     flags: HandleFlags,
+}
+
+enum HandleSlot {
+    Free,
+    Reserved(u64),
+    Bound { generation: u64, entry: HandleEntry },
+    Occupied(HandleEntry),
+}
+
+impl HandleSlot {
+    fn is_free(&self) -> bool {
+        matches!(self, Self::Free)
+    }
+
+    fn entry(&self) -> Option<&HandleEntry> {
+        match self {
+            Self::Occupied(entry) => Some(entry),
+            Self::Free | Self::Reserved(_) | Self::Bound { .. } => None,
+        }
+    }
+
+    fn entry_mut(&mut self) -> Option<&mut HandleEntry> {
+        match self {
+            Self::Occupied(entry) => Some(entry),
+            Self::Free | Self::Reserved(_) | Self::Bound { .. } => None,
+        }
+    }
+
+    fn take_entry(&mut self) -> Option<HandleEntry> {
+        if !matches!(self, Self::Occupied(_)) {
+            return None;
+        }
+        let Self::Occupied(entry) = core::mem::replace(self, Self::Free) else {
+            unreachable!();
+        };
+        Some(entry)
+    }
 }
 
 /// The NT handle-value ↔ table-slot mapping: handle `h` (a non-zero multiple of 4) indexes slot
@@ -933,6 +978,7 @@ impl ProcessManager {
                 create_reported: false,
                 security_descriptor: Vec::from(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..]),
                 handles: Vec::new(),
+                next_handle_reservation_generation: 1,
             },
         );
         pid
@@ -951,18 +997,159 @@ impl ProcessManager {
         }
     }
 
-    /// Ensure one more handle can be inserted without allocating. A freed slot already satisfies
-    /// the reservation; otherwise grow the dense handle table fallibly before an external
-    /// operation is allowed to begin.
-    pub fn try_reserve_handle_slot(&mut self, pid: ProcessId) -> Result<(), u32> {
+    /// Claim one exact, invisible handle slot before an external operation begins. Ordinary handle
+    /// insertion skips it until commit or cancellation consumes the reservation.
+    pub fn try_reserve_handle_slot(&mut self, pid: ProcessId) -> Result<HandleReservation, u32> {
         let proc = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
-        if proc.handles.iter().any(Option::is_none) || proc.handles.len() < proc.handles.capacity()
-        {
-            return Ok(());
+        let generation = proc.next_handle_reservation_generation;
+        proc.next_handle_reservation_generation = generation.wrapping_add(1).max(1);
+        let slot = if let Some(slot) = proc.handles.iter().position(HandleSlot::is_free) {
+            proc.handles[slot] = HandleSlot::Reserved(generation);
+            slot
+        } else {
+            if proc.handles.len() == proc.handles.capacity() {
+                proc.handles
+                    .try_reserve(1)
+                    .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+            }
+            let slot = proc.handles.len();
+            proc.handles.push(HandleSlot::Reserved(generation));
+            slot
+        };
+        Ok(HandleReservation {
+            process_id: pid,
+            handle: slot_to_handle(slot),
+            generation,
+        })
+    }
+
+    /// Bind an object into its exact reservation while keeping the handle invisible. This is the
+    /// first leg of a cross-subsystem publication transaction.
+    pub fn bind_reserved_handle(
+        &mut self,
+        reservation: HandleReservation,
+        object: HandleObject,
+        granted_access: u32,
+    ) -> Result<(), u32> {
+        match object {
+            HandleObject::Process(target) if !self.processes.contains_key(&target) => {
+                return Err(STATUS_INVALID_HANDLE);
+            }
+            HandleObject::Thread(target) if !self.threads.contains_key(&target) => {
+                return Err(STATUS_INVALID_HANDLE);
+            }
+            _ => {}
         }
-        proc.handles
-            .try_reserve(1)
-            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)
+        let proc = self
+            .processes
+            .get_mut(&reservation.process_id)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let slot = handle_to_slot(reservation.handle).ok_or(STATUS_INVALID_HANDLE)?;
+        let entry = proc.handles.get_mut(slot).ok_or(STATUS_INVALID_HANDLE)?;
+        if !matches!(entry, HandleSlot::Reserved(generation) if *generation == reservation.generation)
+        {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        *entry = HandleSlot::Bound {
+            generation: reservation.generation,
+            entry: HandleEntry {
+                object,
+                granted_access,
+                flags: HandleFlags::default(),
+            },
+        };
+        Ok(())
+    }
+
+    /// Make one bound handle visible. No allocation or object validation remains at this point.
+    pub fn publish_reserved_handle(
+        &mut self,
+        reservation: HandleReservation,
+    ) -> Result<Handle, u32> {
+        let proc = self
+            .processes
+            .get_mut(&reservation.process_id)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let slot = handle_to_slot(reservation.handle).ok_or(STATUS_INVALID_HANDLE)?;
+        let entry = proc.handles.get_mut(slot).ok_or(STATUS_INVALID_HANDLE)?;
+        let HandleSlot::Bound {
+            generation,
+            entry: _,
+        } = entry
+        else {
+            return Err(STATUS_INVALID_HANDLE);
+        };
+        if *generation != reservation.generation {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let HandleSlot::Bound { entry: bound, .. } = core::mem::replace(entry, HandleSlot::Free)
+        else {
+            unreachable!();
+        };
+        let debug_object = match bound.object {
+            HandleObject::DebugObject(object) => Some(object),
+            _ => None,
+        };
+        *entry = HandleSlot::Occupied(bound);
+        if let Some(object) = debug_object {
+            if let Some(debug_object) = self.dbgk.get_mut(object) {
+                debug_object.add_handle();
+            }
+        }
+        Ok(reservation.handle)
+    }
+
+    /// Release an exact reservation that has not been bound.
+    pub fn cancel_reserved_handle(&mut self, reservation: HandleReservation) -> Result<(), u32> {
+        let proc = self
+            .processes
+            .get_mut(&reservation.process_id)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let slot = handle_to_slot(reservation.handle).ok_or(STATUS_INVALID_HANDLE)?;
+        let entry = proc.handles.get_mut(slot).ok_or(STATUS_INVALID_HANDLE)?;
+        if !matches!(entry, HandleSlot::Reserved(generation) if *generation == reservation.generation)
+        {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        *entry = HandleSlot::Free;
+        Ok(())
+    }
+
+    /// Roll back a bound but still-invisible handle and return its object to the external owner.
+    pub fn cancel_bound_handle(
+        &mut self,
+        reservation: HandleReservation,
+    ) -> Result<HandleObject, u32> {
+        let proc = self
+            .processes
+            .get_mut(&reservation.process_id)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let slot = handle_to_slot(reservation.handle).ok_or(STATUS_INVALID_HANDLE)?;
+        let entry = proc.handles.get_mut(slot).ok_or(STATUS_INVALID_HANDLE)?;
+        if !matches!(entry, HandleSlot::Bound { generation, .. } if *generation == reservation.generation)
+        {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let HandleSlot::Bound { entry: bound, .. } = core::mem::replace(entry, HandleSlot::Free)
+        else {
+            unreachable!();
+        };
+        Ok(bound.object)
+    }
+
+    pub fn handle_reservation_count(&self, pid: ProcessId) -> usize {
+        self.processes
+            .get(&pid)
+            .map(|process| {
+                process
+                    .handles
+                    .iter()
+                    .filter(|slot| {
+                        matches!(slot, HandleSlot::Reserved(_) | HandleSlot::Bound { .. })
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     /// Pre-reserve the per-process TID link set. This is separate from
@@ -2077,7 +2264,7 @@ impl ProcessManager {
             && !self.processes.values().any(|process| {
                 process.handles.iter().any(|entry| {
                     entry
-                        .as_ref()
+                        .entry()
                         .is_some_and(|entry| entry.object == HandleObject::Thread(tid))
                 })
             })
@@ -3168,14 +3355,14 @@ impl ProcessManager {
                 granted_access,
                 flags: HandleFlags::default(),
             };
-            let free = proc.handles.iter().position(|e| e.is_none());
+            let free = proc.handles.iter().position(HandleSlot::is_free);
             match free {
                 Some(i) => {
-                    proc.handles[i] = Some(entry);
+                    proc.handles[i] = HandleSlot::Occupied(entry);
                     i
                 }
                 None => {
-                    proc.handles.push(Some(entry));
+                    proc.handles.push(HandleSlot::Occupied(entry));
                     proc.handles.len() - 1
                 }
             }
@@ -3192,14 +3379,14 @@ impl ProcessManager {
         let proc = self.processes.get(&pid)?;
         proc.handles
             .get(handle_to_slot(handle)?)?
-            .as_ref()
+            .entry()
             .map(|e| e.object)
     }
     pub fn handle_access(&self, pid: ProcessId, handle: Handle) -> Option<u32> {
         let proc = self.processes.get(&pid)?;
         proc.handles
             .get(handle_to_slot(handle)?)?
-            .as_ref()
+            .entry()
             .map(|e| e.granted_access)
     }
     /// Return the mutable per-handle attributes for `handle`.
@@ -3207,7 +3394,7 @@ impl ProcessManager {
         let proc = self.processes.get(&pid)?;
         proc.handles
             .get(handle_to_slot(handle)?)?
-            .as_ref()
+            .entry()
             .map(|e| e.flags)
     }
     /// Update the mutable per-handle attributes for `handle`.
@@ -3222,7 +3409,7 @@ impl ProcessManager {
         let entry = proc
             .handles
             .get_mut(slot)
-            .and_then(Option::as_mut)
+            .and_then(HandleSlot::entry_mut)
             .ok_or(STATUS_INVALID_HANDLE)?;
         entry.flags = flags;
         Ok(())
@@ -3234,7 +3421,7 @@ impl ProcessManager {
         let slot = handle_to_slot(handle).ok_or(STATUS_INVALID_HANDLE)?;
         proc.handles
             .get_mut(slot)
-            .and_then(Option::take)
+            .and_then(HandleSlot::take_entry)
             .map(|entry| entry.object)
             .ok_or(STATUS_INVALID_HANDLE)
     }
@@ -3249,7 +3436,7 @@ impl ProcessManager {
         if proc
             .handles
             .get(slot)
-            .and_then(Option::as_ref)
+            .and_then(HandleSlot::entry)
             .ok_or(STATUS_INVALID_HANDLE)?
             .flags
             .protect_from_close
@@ -3258,7 +3445,7 @@ impl ProcessManager {
         }
         proc.handles
             .get_mut(slot)
-            .and_then(Option::take)
+            .and_then(HandleSlot::take_entry)
             .map(|entry| entry.object)
             .ok_or(STATUS_INVALID_HANDLE)
     }
@@ -3276,7 +3463,7 @@ impl ProcessManager {
         let proc = self.processes.get_mut(&pid)?;
         proc.handles
             .iter_mut()
-            .find_map(|entry| entry.take().map(|entry| entry.object))
+            .find_map(|entry| entry.take_entry().map(|entry| entry.object))
     }
     /// Close the first handle in `pid`'s table whose entry refers to `object` (spec §8.1), freeing
     /// the slot; returns whether one was found. A host that assigns its own handle VALUES (outside
@@ -3290,9 +3477,9 @@ impl ProcessManager {
         if let Some(slot) = proc
             .handles
             .iter()
-            .position(|e| e.as_ref().is_some_and(|h| h.object == object))
+            .position(|e| e.entry().is_some_and(|h| h.object == object))
         {
-            proc.handles[slot] = None;
+            proc.handles[slot] = HandleSlot::Free;
             if let HandleObject::Process(target) = object {
                 let _ = self.clear_deleted_process_debug_object_if_unreferenced(target);
             }
@@ -3324,7 +3511,7 @@ impl ProcessManager {
                 .processes
                 .get(&src_pid)
                 .and_then(|p| p.handles.get(handle_to_slot(handle)?))
-                .and_then(|e| e.as_ref())
+                .and_then(HandleSlot::entry)
                 .ok_or(STATUS_INVALID_HANDLE)?;
             (e.object, e.granted_access, e.flags)
         };
@@ -3335,7 +3522,7 @@ impl ProcessManager {
     pub fn handle_count(&self, pid: ProcessId) -> usize {
         self.processes
             .get(&pid)
-            .map(|p| p.handles.iter().filter(|e| e.is_some()).count())
+            .map(|p| p.handles.iter().filter_map(HandleSlot::entry).count())
             .unwrap_or(0)
     }
 
@@ -3349,7 +3536,7 @@ impl ProcessManager {
                 process
                     .handles
                     .iter()
-                    .filter(|entry| entry.as_ref().is_some_and(|entry| entry.object == object))
+                    .filter(|entry| entry.entry().is_some_and(|entry| entry.object == object))
                     .count()
             })
             .sum()

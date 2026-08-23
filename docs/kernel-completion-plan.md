@@ -10316,3 +10316,45 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     real driver dispatch, centralize immediate and terminal provider/handle publication, carry
     `file_context` in the exact completion projection, and make transfer failure plus thread teardown
     distinguish an unpublished CREATE File from an ordinary retained File reference.
+
+    Pending CREATE executive-wiring checkpoint (2026-08-23): all three NPFS CREATE entry points
+    (`NtCreateNamedPipeFile`, named-pipe `NtCreateFile`, and named-pipe `NtOpenFile`) now use one
+    publication path. Before entering the driver, the executive verifies both caller outputs and
+    reserves generic pending-I/O storage, synchronous reply ownership, one generation-protected
+    process handle slot, one provisional File-completion entry, and the applicable pipe-provider
+    metadata slot. The reserved handle slot is hidden from ordinary lookup, insertion, duplication,
+    close, and process handle enumeration, so unrelated handle traffic cannot consume or observe it.
+    The executive allocates the canonical File before dispatch and preserves an exact pending CREATE
+    IrpId, FileId, output addresses, access, synchronization mode, reservation token, and provider
+    name identity without writing a handle or IOSB while the driver still owns the request.
+
+    The exact completion projection now carries the driver's terminal `file_context`. Terminal
+    publication first commits that context into the canonical File lifecycle, publishes the pipe
+    endpoint metadata and connection/name wake trigger, binds the real `RoutedFile` object into the
+    still-hidden exact handle slot, commits the provisional File-completion reference, and records
+    one immutable status/information/handle tuple in the generic owner. Handle and IOSB copyout are
+    independently retryable but cannot mint a replacement handle. The bound slot becomes visible to
+    the process only after handle copyout succeeds; once visible, it is process-owned and pending-I/O
+    teardown cannot close it by a reusable numeric value. Backend ACK and record retirement occur
+    only after all caller surfaces are visible. Driver failure, publication failure, transfer failure,
+    cancellation, and thread teardown before publication cancel the exact generation token and
+    release the File through the I/O Manager lifecycle. The old post-dispatch `mint_file_handle`
+    path and its direct `insert_file` wrapper are deleted, leaving exact reserve/bind/publish or
+    reserve/cancel as the only hosted CREATE publication mechanism.
+
+    Host validation is green for `cargo fmt --all`, `cargo test -p nt-process` (`107/107`), `cargo
+    test -p nt-io-manager` (`168/168`), the freestanding executive check, and `git diff --check`.
+    Serialized desktop proof `.tmp/run-desktop-20260823-191027.log` is accepted: real userinit and
+    Explorer launch, Explorer completes 665 api0 callbacks with zero callback failures, paint reaches
+    2 BeginPaint, 20 EndPaint, 185 direct GDI returns, and 131 batch flushes carrying
+    171 records; all 786,432 framebuffer pixels are non-background with at least 32 colors. The run
+    passes `293/293` and emits the sentinel. The live workload's NPFS CREATEs completed inline, so
+    the run proves the centralized immediate publisher and full desktop regression but does not
+    claim a live pending-CREATE occurrence; exact pending publication is covered by the reusable
+    manager state machine and the freestanding integration.
+
+    Review adjustment: pending CREATE ownership is now complete. Migrate specialized pipe WRITE to
+    `PendingFileIo` next, then READ and TRANSCEIVE, retaining only endpoint queue progress triggers
+    outside the generic terminal publisher. Migrate LISTEN after those data paths, then move root
+    `FSCTL_PIPE_WAIT` behind a real hosted File/device request. Delete each legacy waiter field and
+    delivery branch as its final consumer moves; do not keep compatibility fallback paths.

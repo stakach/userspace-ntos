@@ -2,6 +2,7 @@
 //! Extracted verbatim from `main.rs` (pure reorg; no logic change).
 #![allow(clippy::all)]
 use crate::*;
+use crate::exec_handler::HostedCreatePublication;
 
 static PIPE_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
 pub(crate) static FILE_IO_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
@@ -16004,8 +16005,14 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 } else {
                     let _ = driver_launch::abandon_pending_irp(pending.irp_id);
-                    nt_handler.release_file_reference(pending.file_id);
                     result = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES as u64;
+                    if let nt_io_manager::PendingFileIoOperation::Create(create) = pending.operation
+                    {
+                        let _ = nt_handler.xas_try_write_buf(create.handle_va, &0u64.to_le_bytes());
+                        nt_handler.release_unpublished_hosted_create(pending);
+                    } else {
+                        nt_handler.release_file_reference(pending.file_id);
+                    }
                     if pending.iosb_va != 0 {
                         let _ = nt_handler.write_current_iosb(pending.iosb_va, result as u32, 0);
                     }
@@ -23104,14 +23111,109 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             .get(slot)
             .expect("pending File owner disappeared")
             .delivery_state;
+        let mut terminal_status = completed.status;
+        let mut terminal_information = completed.information;
+        if let nt_io_manager::PendingFileIoOperation::Create(create) = pending.operation {
+            if delivery_state & nt_io_manager::IO_DELIVERY_CREATE_COMMITTED == 0 {
+                let reservation = ExecNtHandler::pending_create_reservation(create);
+                let publication = if (completed.status as i32) < 0 {
+                    nt_handler
+                        .cancel_hosted_create_publication(pending.file_id, reservation);
+                    HostedCreatePublication {
+                        status: completed.status,
+                        information: completed.information,
+                        handle: 0,
+                        wake_server_fid: 0,
+                        wake_name_hash: 0,
+                    }
+                } else {
+                    match nt_handler.publish_npfs_create(
+                        pending.major,
+                        pending.file_id,
+                        completed.file_context.unwrap_or(0),
+                        reservation,
+                        create.desired_access,
+                        create.provider_context,
+                        completed.status,
+                        completed.information,
+                    ) {
+                        Ok(publication) => publication,
+                        Err(status) => {
+                            nt_handler.cancel_hosted_create_publication(
+                                pending.file_id,
+                                reservation,
+                            );
+                            HostedCreatePublication {
+                                status,
+                                information: 0,
+                                handle: 0,
+                                wake_server_fid: 0,
+                                wake_name_hash: 0,
+                            }
+                        }
+                    }
+                };
+                (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                    .commit_create_exact(
+                        slot,
+                        pending.irp_id,
+                        publication.status,
+                        publication.information,
+                        publication.handle,
+                    )
+                    .expect("pending CREATE result could not be committed");
+                if publication.wake_server_fid != 0 {
+                    let _ = pipe_listen_complete_server_fid(
+                        nt_handler,
+                        publication.wake_server_fid,
+                    );
+                }
+                if publication.wake_name_hash != 0 {
+                    let _ = pipe_name_wait_complete_named(
+                        nt_handler,
+                        publication.wake_name_hash,
+                    );
+                }
+                delivery_state = (&*core::ptr::addr_of!(PENDING_FILE_IO))
+                    .get(slot)
+                    .expect("committed pending CREATE owner disappeared")
+                    .delivery_state;
+            }
+            let committed = (&*core::ptr::addr_of!(PENDING_FILE_IO))
+                .get(slot)
+                .expect("committed pending CREATE owner disappeared");
+            let nt_io_manager::PendingFileIoOperation::Create(create) = committed.operation else {
+                panic!("pending CREATE changed operation kind");
+            };
+            terminal_status = create.status;
+            terminal_information = create.information;
+            if delivery_state & nt_io_manager::IO_DELIVERY_HANDLE_PUBLISHED == 0 {
+                if !nt_handler.xas_try_write_buf(create.handle_va, &create.handle_value.to_le_bytes())
+                {
+                    FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                    restore_file_io_mirrors!();
+                    continue;
+                }
+                if create.handle_value != 0 {
+                    let reservation = ExecNtHandler::pending_create_reservation(create);
+                    let published = nt_handler
+                        .publish_bound_file_handle(reservation)
+                        .expect("pending CREATE bound handle could not be published");
+                    assert_eq!(published, create.handle_value);
+                }
+                delivery_state = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                    .mark_create_handle_published_exact(slot, pending.irp_id)
+                    .expect("pending CREATE handle owner disappeared");
+            }
+        }
         if pending.output_va != 0
             && pending.output_len != 0
             && delivery_state & nt_io_manager::IO_DELIVERY_BUFFER_PUBLISHED == 0
         {
-            let delivery_len = if completed.status & 0xC000_0000 == 0xC000_0000 {
+            let delivery_len = if terminal_status & 0xC000_0000 == 0xC000_0000 {
                 0
             } else {
-                u32::try_from(completed.information)
+                u32::try_from(terminal_information)
                     .ok()
                     .filter(|length| *length <= pending.output_len)
                     .expect("terminal File output exceeds delivery target")
@@ -23170,10 +23272,10 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         if pending.iosb_va != 0
             && delivery_state & nt_io_manager::IO_DELIVERY_IOSB_PUBLISHED == 0
         {
-            if !nt_handler.xas_try_write_buf(pending.iosb_va, &completed.status.to_le_bytes())
+            if !nt_handler.xas_try_write_buf(pending.iosb_va, &terminal_status.to_le_bytes())
                 || !nt_handler.xas_try_write_buf(
                     pending.iosb_va + 8,
-                    &completed.information.to_le_bytes(),
+                    &terminal_information.to_le_bytes(),
                 )
             {
                 FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
@@ -23209,7 +23311,7 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         if pending.signal_file
             && delivery_state & nt_io_manager::IO_DELIVERY_FILE_PUBLISHED == 0
         {
-            if nt_handler.signal_file_completion(pending.file_id, completed.status)
+            if nt_handler.signal_file_completion(pending.file_id, terminal_status)
                 != nt_fs::STATUS_SUCCESS
             {
                 FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
@@ -23253,8 +23355,8 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             let status = nt_handler.post_file_completion_packet(
                 pending.file_id,
                 pending.apc_context,
-                completed.status,
-                completed.information,
+                terminal_status,
+                terminal_information,
                 false,
                 pending.completion_port_suppressed,
             );
@@ -23285,7 +23387,7 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             set_reply_mr(15, pending.resume_ip);
             set_reply_mr(16, pending.resume_sp);
             set_reply_mr(17, pending.resume_flags);
-            let _ = client_reply_on(cap, 18, completed.status as u64, 0, 0, 0);
+            let _ = client_reply_on(cap, 18, terminal_status as u64, 0, 0, 0);
             release_reply_pool_cap(cap);
             thread_wait_state_clear_badge_ready(nt_handler, pending.badge);
             (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
@@ -23307,10 +23409,19 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         table
             .mark_backend_acked_exact(slot, pending.irp_id)
             .expect("ACKed pending File owner disappeared");
-        table
+        let finished = table
             .finish_exact(slot, pending.irp_id)
             .expect("completed pending File owner did not retire");
-        nt_handler.release_file_reference(pending.file_id);
+        match finished.operation {
+            nt_io_manager::PendingFileIoOperation::Transfer => {
+                nt_handler.release_file_reference(finished.file_id);
+            }
+            nt_io_manager::PendingFileIoOperation::Create(create) => {
+                if create.handle_value == 0 {
+                    nt_handler.release_unpublished_hosted_create(finished);
+                }
+            }
+        }
         delivered += 1;
         if FILE_IO_COMPLETION_TRACE.fetch_add(1, Ordering::Relaxed) < 32 {
             print_str(b"[file-io-complete] irp=0x");
@@ -23320,9 +23431,9 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             print_str(b" major=0x");
             print_hex(pending.major as u32);
             print_str(b" status=0x");
-            print_hex(completed.status);
+            print_hex(terminal_status);
             print_str(b" info=");
-            print_u64(completed.information);
+            print_u64(terminal_information);
             print_str(b"\n");
         }
     }

@@ -955,24 +955,51 @@ fn reserved_handle_table_never_reallocates() {
 }
 
 #[test]
-fn fallible_handle_slot_reservation_reuses_free_space_and_grows_headroom() {
+fn exact_handle_reservations_are_hidden_distinct_and_generation_checked() {
     let mut pm = ProcessManager::new();
     let pid = pm.create_process("host.exe", None, None);
 
-    pm.try_reserve_handle_slot(pid).unwrap();
-    let reserved = pm.handle_capacity(pid);
-    assert!(reserved >= 1);
-    let handle = pm
+    let first = pm.try_reserve_handle_slot(pid).unwrap();
+    let second = pm.try_reserve_handle_slot(pid).unwrap();
+    assert_ne!(first.handle, second.handle);
+    assert_eq!(pm.handle_reservation_count(pid), 2);
+    assert_eq!(pm.lookup_handle(pid, first.handle), None);
+    assert_eq!(pm.handle_count(pid), 0);
+
+    let ordinary = pm
         .insert_handle(pid, HandleObject::Opaque(0x1234), 0)
         .unwrap();
-    assert_eq!(pm.handle_capacity(pid), reserved);
-
-    pm.close_handle(pid, handle).unwrap();
-    pm.try_reserve_handle_slot(pid).unwrap();
-    assert_eq!(pm.handle_capacity(pid), reserved);
-    pm.insert_handle(pid, HandleObject::Opaque(0x5678), 0)
+    assert_ne!(ordinary, first.handle);
+    assert_ne!(ordinary, second.handle);
+    pm.bind_reserved_handle(first, HandleObject::Opaque(0x5678), 0x40)
         .unwrap();
-    assert_eq!(pm.handle_capacity(pid), reserved);
+    assert_eq!(pm.lookup_handle(pid, first.handle), None);
+    assert_eq!(pm.handle_count(pid), 1);
+    assert_eq!(pm.publish_reserved_handle(first), Ok(first.handle));
+    assert_eq!(
+        pm.lookup_handle(pid, first.handle),
+        Some(HandleObject::Opaque(0x5678))
+    );
+    assert_eq!(pm.handle_access(pid, first.handle), Some(0x40));
+    assert_eq!(pm.handle_count(pid), 2);
+
+    pm.cancel_reserved_handle(second).unwrap();
+    assert_eq!(pm.handle_reservation_count(pid), 0);
+    let reused = pm.try_reserve_handle_slot(pid).unwrap();
+    assert_eq!(reused.handle, second.handle);
+    assert_ne!(reused.generation, second.generation);
+    assert_eq!(
+        pm.cancel_reserved_handle(second),
+        Err(STATUS_INVALID_HANDLE),
+        "a stale token cannot cancel a reused slot"
+    );
+    pm.bind_reserved_handle(reused, HandleObject::Opaque(0x9ABC), 0)
+        .unwrap();
+    assert_eq!(
+        pm.cancel_bound_handle(reused),
+        Ok(HandleObject::Opaque(0x9ABC))
+    );
+    assert_eq!(pm.handle_reservation_count(pid), 0);
     assert_eq!(
         pm.try_reserve_handle_slot(ProcessId::MAX),
         Err(STATUS_INVALID_HANDLE)

@@ -35,6 +35,9 @@ pub struct PendingFileCreate {
     pub desired_access: u32,
     pub synchronous: bool,
     pub provider_context: u64,
+    pub reservation_pid: u32,
+    pub reserved_handle: u32,
+    pub reservation_generation: u64,
     /// Locally committed result after provider metadata and handle ownership are established.
     pub status: u32,
     pub information: u64,
@@ -160,6 +163,9 @@ impl PendingFileIoTable {
             PendingFileIoOperation::Create(create) => {
                 crate::is_create_major(pending.major)
                     && create.handle_va != 0
+                    && create.reservation_pid != 0
+                    && create.reserved_handle != 0
+                    && create.reservation_generation != 0
                     && create.status == nt_status::NtStatus::PENDING.raw() as u32
                     && create.information == 0
                     && create.handle_value == 0
@@ -309,6 +315,9 @@ impl PendingFileIoTable {
         let PendingFileIoOperation::Create(mut create) = pending.operation else {
             return None;
         };
+        if handle_value != 0 && handle_value != create.reserved_handle as u64 {
+            return None;
+        }
         if pending.delivery_state & IO_DELIVERY_CREATE_COMMITTED != 0 {
             return (create.status == status
                 && create.information == information
@@ -666,6 +675,9 @@ mod tests {
             desired_access: 0x12019F,
             synchronous: true,
             provider_context: 0xAABB,
+            reservation_pid: 4,
+            reserved_handle: 0x44,
+            reservation_generation: 7,
             status: nt_status::NtStatus::PENDING.raw() as u32,
             information: 0,
             handle_value: 0,
@@ -707,6 +719,9 @@ mod tests {
             desired_access: 0,
             synchronous: false,
             provider_context: 0xAABB,
+            reservation_pid: 4,
+            reserved_handle: 0x44,
+            reservation_generation: 8,
             status: nt_status::NtStatus::PENDING.raw() as u32,
             information: 0,
             handle_value: 0,

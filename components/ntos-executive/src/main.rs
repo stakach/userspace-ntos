@@ -2934,6 +2934,42 @@ pub(crate) fn pipe_server_preconnected_forget(server_fid: u64) -> bool {
     unsafe { (&mut *core::ptr::addr_of_mut!(PIPE_PRECONNECTED_SERVERS)).remove(server_fid) }
 }
 
+/// Reserve every executive-side metadata slot needed to publish one successful NPFS CREATE
+/// without allocating after the driver has accepted the IRP.
+pub(crate) fn reserve_pipe_create_metadata(server: bool) -> bool {
+    unsafe {
+        let names = &mut *core::ptr::addr_of_mut!(PIPE_FID_NAMES);
+        let names_capacity = names.capacity();
+        if !names.ensure_capacity() {
+            return false;
+        }
+        if names.capacity() != names_capacity {
+            mark_durable_table_growth_dirty();
+        }
+
+        if server {
+            let available = &mut *core::ptr::addr_of_mut!(PIPE_SERVER_AVAILABILITY);
+            let available_capacity = available.capacity();
+            if !available.ensure_capacity() {
+                return false;
+            }
+            if available.capacity() != available_capacity {
+                mark_durable_table_growth_dirty();
+            }
+        } else {
+            let preconnected = &mut *core::ptr::addr_of_mut!(PIPE_PRECONNECTED_SERVERS);
+            let preconnected_capacity = preconnected.capacity();
+            if !preconnected.ensure_capacity() {
+                return false;
+            }
+            if preconnected.capacity() != preconnected_capacity {
+                mark_durable_table_growth_dirty();
+            }
+        }
+        true
+    }
+}
+
 pub(crate) fn pipe_name_hash_known(name_hash: u64) -> bool {
     unsafe { (&*core::ptr::addr_of!(PIPE_FID_NAMES)).contains_name_hash(name_hash) }
 }
@@ -21488,9 +21524,26 @@ impl ExecFileCompletion {
         Self { table }
     }
 
-    fn insert_file(&mut self, file_id: u64, device_id: u64, synchronous: bool) -> Result<(), u32> {
+    fn reserve_file_handle_publication(
+        &mut self,
+        file_id: u64,
+        device_id: u64,
+        synchronous: bool,
+    ) -> Result<(), u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).insert_file(file_id, device_id, synchronous) }
+        unsafe {
+            (&mut *self.table).reserve_file_handle_publication(file_id, device_id, synchronous)
+        }
+    }
+
+    fn commit_reserved_file_handle(&mut self, file_id: u64) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).commit_reserved_file_handle(file_id) }
+    }
+
+    fn cancel_reserved_file_handle(&mut self, file_id: u64) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).cancel_reserved_file_handle(file_id) }
     }
 
     fn retain_handle(&mut self, file_id: u64) -> Result<(), u32> {
@@ -21551,6 +21604,11 @@ impl ExecFileCompletion {
     fn is_synchronous(&self, file_id: u64) -> Result<bool, u32> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).is_synchronous(file_id) }
+    }
+
+    fn device_id(&self, file_id: u64) -> Result<u64, u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).device_id(file_id) }
     }
 
     fn set_signaled(&mut self, file_id: u64, signaled: bool) -> Result<(), u32> {

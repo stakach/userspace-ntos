@@ -29246,6 +29246,7 @@ pub(crate) struct HostedCompletedIrp {
     pub major: u8,
     pub status: u32,
     pub information: u64,
+    pub file_context: Option<u64>,
 }
 
 /// Resolve immutable terminal metadata for one exact canonical IRP. Generic executive delivery
@@ -29263,6 +29264,7 @@ pub(crate) unsafe fn completed_irp_exact(irp_id: u64) -> Option<HostedCompletedI
         major: completion.major,
         status: completion.status.raw() as u32,
         information: completion.information,
+        file_context: completion.file_context,
     })
 }
 
