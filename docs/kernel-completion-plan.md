@@ -9960,3 +9960,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     its KEY_INFORMATION write, and registry counted-string capture must require exactly the declared
     `UNICODE_STRING.Length`. These are mechanism fixes, not reasons to reintroduce message, registry,
     or boot-order fallbacks.
+
+    Canonical completion-delivery contract checkpoint (2026-08-23): `DriverDispatchBackend` now
+    separates idempotent retained-output reads from the one consuming completion acknowledgement.
+    The I/O Manager resolves only an exact generation-protected completed `IrpId`, validates the
+    driver's backend and the terminal `IoStatus.Information` against the recorded output extent,
+    and supports bounded offset reads so an executive copy can resume after a partial client-memory
+    transfer. Copy failure, stale identity, invalid offset, and an over-reporting backend leave the
+    completion and enumeration order unchanged. Backend ACK runs before canonical reclamation; an
+    ACK error therefore leaves output, IRP, and File reference intact and retryable, while a
+    successful ACK is the single release point before the canonical record is freed and deferred
+    CLOSE is resumed. Backends with no retained asynchronous output fail closed for a nonempty copy
+    request and have no resource action at ACK.
+
+    Host coverage uses a retaining backend to prove two offset chunks, a repeated idempotent chunk,
+    bounds rejection, copy after a failed ACK, exactly one successful backend release, and stale-id
+    rejection after ACK. Validation is green for `cargo fmt --all`, `cargo test -p nt-io-manager`
+    (`139/139`), and `git diff --check`. This completes the manager-side delivery API only. The next
+    substep remains to carry canonical `IrpId`/`FileId` through the hosted WDM ABI, publish the raw
+    graph before `MajorFunction`, and implement these hooks against the exact hosted owner. The old
+    fid/direction queues remain scheduled for deletion only after the executive delivery consumer
+    has moved to exact-ID copy then ACK; they are not an accepted fallback path.

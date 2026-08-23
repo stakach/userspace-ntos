@@ -171,6 +171,31 @@ pub trait DriverDispatchBackend {
         None
     }
 
+    /// Copy retained output for a terminal asynchronous completion. The I/O
+    /// Manager calls this only after `irp_id` has been published as completed
+    /// and bounds the destination to `IoStatus.Information`. Backends that can
+    /// complete pending requests with nonzero output must retain that output
+    /// until [`acknowledge_completion`](Self::acknowledge_completion).
+    fn copy_completion_output(
+        &mut self,
+        _irp_id: IrpId,
+        _offset: u64,
+        output: &mut [u8],
+    ) -> Result<usize, NtStatus> {
+        if output.is_empty() {
+            Ok(0)
+        } else {
+            Err(NtStatus::NOT_SUPPORTED)
+        }
+    }
+
+    /// Release backend-owned state for an acknowledged terminal completion.
+    /// Failure leaves the canonical completion live so the consumer can retry.
+    /// Backends without retained asynchronous state have nothing to release.
+    fn acknowledge_completion(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> {
+        Ok(())
+    }
+
     /// Whether the backend's driver has faulted/disconnected (spec §16.6). The
     /// I/O Manager's `pump` faults such a driver — failing its in-flight IRPs and
     /// marking its devices delete-pending. In-process backends never fault.

@@ -2132,6 +2132,160 @@ mod tests {
         assert!(om.file(file_id).is_none());
     }
 
+    #[derive(Default)]
+    struct RetainedOutputState {
+        irp_id: Option<IrpId>,
+        output: std::vec::Vec<u8>,
+        completion_ready: bool,
+        fail_ack: bool,
+        acknowledgements: usize,
+    }
+
+    struct RetainedOutputBackend {
+        state: std::rc::Rc<std::cell::RefCell<RetainedOutputState>>,
+    }
+
+    impl DriverDispatchBackend for RetainedOutputBackend {
+        fn dispatch_irp(
+            &mut self,
+            _ctx: DispatchContext<'_>,
+            irp: &IrpProjection,
+        ) -> Result<DispatchOutcome, NtStatus> {
+            let mut state = self.state.borrow_mut();
+            state.irp_id = Some(irp.irp_id);
+            state.completion_ready = true;
+            Ok(DispatchOutcome::Pending)
+        }
+
+        fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> {
+            Err(NtStatus::NOT_SUPPORTED)
+        }
+
+        fn poll_completion(&mut self) -> Option<DriverCompletion> {
+            let mut state = self.state.borrow_mut();
+            if !state.completion_ready {
+                return None;
+            }
+            state.completion_ready = false;
+            Some(DriverCompletion {
+                irp_id: state.irp_id?,
+                status: NtStatus::SUCCESS,
+                information: state.output.len() as u64,
+            })
+        }
+
+        fn copy_completion_output(
+            &mut self,
+            irp_id: IrpId,
+            offset: u64,
+            output: &mut [u8],
+        ) -> Result<usize, NtStatus> {
+            let state = self.state.borrow();
+            let offset = usize::try_from(offset).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+            if state.irp_id != Some(irp_id) || offset > state.output.len() {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            let copied = output.len().min(state.output.len() - offset);
+            output[..copied].copy_from_slice(&state.output[offset..offset + copied]);
+            Ok(copied)
+        }
+
+        fn acknowledge_completion(&mut self, irp_id: IrpId) -> Result<(), NtStatus> {
+            let mut state = self.state.borrow_mut();
+            if state.irp_id != Some(irp_id) {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            if state.fail_ack {
+                return Err(NtStatus::DEVICE_NOT_READY);
+            }
+            state.irp_id = None;
+            state.output.clear();
+            state.acknowledgements += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn retained_output_is_exact_and_ack_failure_is_retryable() {
+        let state = std::rc::Rc::new(std::cell::RefCell::new(RetainedOutputState {
+            output: b"done".to_vec(),
+            ..RetainedOutputState::default()
+        }));
+        let mut om = io();
+        let client = om.register_client();
+        let driver = om
+            .create_driver(
+                &path("\\Driver\\RetainedOutput"),
+                Box::new(RetainedOutputBackend {
+                    state: state.clone(),
+                }),
+            )
+            .unwrap();
+        let mut dispatch_buffer = [0u8; 4];
+        let result = om
+            .build_and_dispatch_external_to_driver(
+                client,
+                driver,
+                None,
+                0,
+                0,
+                major::IRP_MJ_READ,
+                IoParameters::Read(ReadWriteParameters {
+                    length: 4,
+                    key: 0,
+                    offset: 0,
+                }),
+                0,
+                4,
+                &mut dispatch_buffer,
+            )
+            .unwrap();
+        let irp_id = match result {
+            ExternalDispatchResult::Pending { irp_id } => irp_id,
+            other => panic!("expected retained pending output, got {other:?}"),
+        };
+        assert_eq!(om.pump(), 1);
+        assert_eq!(om.completed_irp(irp_id).unwrap().information, 4);
+        let mut output = [0u8; 4];
+        assert_eq!(
+            om.copy_completed_irp_output(irp_id, 0, &mut output[..2]),
+            Ok(2)
+        );
+        assert_eq!(
+            om.copy_completed_irp_output(irp_id, 2, &mut output[2..]),
+            Ok(2)
+        );
+        assert_eq!(&output, b"done");
+        let mut repeated = [0u8; 2];
+        assert_eq!(
+            om.copy_completed_irp_output(irp_id, 1, &mut repeated),
+            Ok(2)
+        );
+        assert_eq!(&repeated, b"on");
+        assert_eq!(
+            om.copy_completed_irp_output(irp_id, 5, &mut output),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        assert_eq!(om.copy_completed_irp_output(irp_id, 4, &mut output), Ok(0));
+
+        state.borrow_mut().fail_ack = true;
+        assert_eq!(
+            om.acknowledge_completed_irp(irp_id),
+            Err(NtStatus::DEVICE_NOT_READY)
+        );
+        assert_eq!(om.next_completed_irp().unwrap().id, irp_id);
+        assert_eq!(om.copy_completed_irp_output(irp_id, 0, &mut output), Ok(4));
+
+        state.borrow_mut().fail_ack = false;
+        assert_eq!(om.acknowledge_completed_irp(irp_id).unwrap().id, irp_id);
+        assert_eq!(state.borrow().acknowledgements, 1);
+        assert!(om.completed_irp(irp_id).is_none());
+        assert_eq!(
+            om.copy_completed_irp_output(irp_id, 0, &mut output),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+    }
+
     #[test]
     fn cleanup_close_lifecycle() {
         let (mut om, client, handle) = open_device_with(

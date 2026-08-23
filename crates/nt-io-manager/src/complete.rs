@@ -127,6 +127,61 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .and_then(|id| self.completed_irp_snapshot(*id))
     }
 
+    /// Resolve one exact terminal completion without changing enumeration or
+    /// ownership. Unknown, stale, pending, and already-acknowledged ids fail.
+    pub fn completed_irp(&self, irp_id: IrpId) -> Option<CompletedIrp> {
+        self.completed_irp_snapshot(irp_id)
+    }
+
+    /// Copy the retained output of one exact terminal completion. Output stays
+    /// owned by the backend until acknowledgement, so a failed client copy can
+    /// be retried without redispatching or losing the terminal result.
+    pub fn copy_completed_irp_output(
+        &mut self,
+        irp_id: IrpId,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<usize, NtStatus> {
+        let (driver_id, information, output_capacity) = {
+            let irp = self.irp(irp_id).ok_or(NtStatus::INVALID_PARAMETER)?;
+            if irp.state != IrpState::Completed {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            (
+                irp.driver_id,
+                usize::try_from(irp.information).map_err(|_| NtStatus::INVALID_PARAMETER)?,
+                irp.buffer
+                    .map(|buffer| buffer.output_len as usize)
+                    .unwrap_or(0),
+            )
+        };
+        if information > output_capacity {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let offset = usize::try_from(offset).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+        if offset > information {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let copy_capacity = output.len().min(information - offset);
+        if copy_capacity == 0 {
+            return Ok(0);
+        }
+        let backend_index = self
+            .driver(driver_id)
+            .map(|driver| driver.backend.0 as usize)
+            .filter(|index| *index < self.backends.len())
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        let copied = self.backends[backend_index].copy_completion_output(
+            irp_id,
+            offset as u64,
+            &mut output[..copy_capacity],
+        )?;
+        if copied > copy_capacity {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(copied)
+    }
+
     /// Acknowledge a published completion, reclaim its canonical IRP, and resume
     /// any FILE_OBJECT close that was waiting for this reference. Consumers may
     /// acknowledge independent ready requests out of enumeration order.
@@ -139,8 +194,15 @@ impl<P: ObjectManagerPort> IoManager<P> {
         let completed = self
             .completed_irp_snapshot(irp_id)
             .ok_or(NtStatus::INVALID_PARAMETER)?;
+        let backend_index = self
+            .driver(completed.driver_id)
+            .map(|driver| driver.backend.0 as usize)
+            .filter(|index| *index < self.backends.len())
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        self.backends[backend_index].acknowledge_completion(irp_id)?;
         self.completed_irps.remove(queue_index);
-        self.free_irp(irp_id).ok_or(NtStatus::INVALID_PARAMETER)?;
+        self.free_irp(irp_id)
+            .expect("validated completed IRP disappeared after backend acknowledgement");
 
         if let Some(file_id) = completed.file_id {
             if completed.major == major::IRP_MJ_CLEANUP {
