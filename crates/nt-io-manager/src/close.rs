@@ -116,8 +116,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
         }
     }
 
-    /// Release the user-visible handle and begin final FILE_OBJECT close. Driver
-    /// close is deferred while canonical IRPs still reference the file.
+    /// Release the user-visible handle and begin the canonical CLEANUP -> CLOSE
+    /// lifecycle. Driver close is deferred while canonical IRPs still reference
+    /// the file.
     pub fn close(&mut self, client: ClientId, handle: HandleValue) -> Result<(), NtStatus> {
         let file_id = self.reference_file(client, handle, AccessMask::empty())?;
         let state = self.file(file_id).ok_or(NtStatus::INVALID_HANDLE)?.state;
@@ -128,9 +129,15 @@ impl<P: ObjectManagerPort> IoManager<P> {
             return Err(NtStatus::FILE_CLOSED);
         }
         self.port.close_handle(client, handle)?;
-        self.file_mut(file_id)
-            .expect("validated file")
-            .transition(FileState::ClosePending);
+        let file = self.file_mut(file_id).expect("validated file");
+        match state {
+            FileState::Open => {
+                file.transition(FileState::CleanupPending);
+            }
+            FileState::CleanupPending | FileState::CleanupComplete => {}
+            _ => unreachable!("validated close state changed without concurrency"),
+        }
+        file.close_deferred = true;
         if self.finish_deferred_file_close(file_id).is_err() {
             self.schedule_deferred_file_close(file_id);
         }

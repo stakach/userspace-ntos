@@ -2837,6 +2837,10 @@ static mut PENDING_FILE_IO: nt_io_manager::PendingFileIoTable =
 /// table owns lock policy; this table owns FIFO continuation identity and the retained route.
 static mut SYNCHRONOUS_FILE_WAITERS: nt_io_manager::SynchronousFileWaitTable =
     nt_io_manager::SynchronousFileWaitTable::new();
+/// `NtClose` continuations blocked in the kernel close procedure while the
+/// distinct File cleanup policy/IRP owners drain.
+static mut PENDING_FILE_CLEANUP_WAITS: nt_io_manager::PendingFileCleanupWaitTable =
+    nt_io_manager::PendingFileCleanupWaitTable::new();
 /// Parked `NtCancelIoFile` callers waiting for the I/O Manager to retire every exact current-thread
 /// IRP after its original completion owner has published surfaces and acknowledged the backend.
 static mut PENDING_FILE_IRP_DRAINS: nt_io_manager::PendingFileIrpDrainTable =
@@ -16005,6 +16009,7 @@ fn hosted_io_owner_tables_reset() -> bool {
         (&mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS)).reset()
             && (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO)).reset()
             && (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS)).reset()
+            && (&mut *core::ptr::addr_of_mut!(PENDING_FILE_CLEANUP_WAITS)).reset()
             && (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS)).reset()
     }
 }
@@ -21254,6 +21259,10 @@ struct ExecNtHandler {
     pending_file_io_reservation: Option<nt_io_manager::PendingFileIoReservation>,
     /// Contended synchronous File acquisition transferred into the FIFO owner at the reply site.
     pending_synchronous_file_wait: Option<nt_io_manager::SynchronousFileWaiter>,
+    /// Final-handle `NtClose` continuation reserved before removing the process handle. File Busy
+    /// ordering and CLEANUP/CLOSE ownership remain in their canonical policy/manager tables.
+    pending_file_cleanup_wait:
+        Option<(u64, nt_io_manager::PendingFileCleanupWaitReservation)>,
     /// `NtCancelIoFile` continuation reserved before cancellation and transferred into its drain
     /// table only at the reply-capability park site.
     pending_file_irp_drain: Option<(
@@ -21552,6 +21561,19 @@ impl ExecFileCompletion {
         unsafe { (&mut *self.table).release_handle(file_id) }
     }
 
+    fn release_cleanup_reference(
+        &mut self,
+        file_id: u64,
+    ) -> Result<nt_io_completion::FileReferenceRelease, u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).release_cleanup_reference(file_id) }
+    }
+
+    fn cleanup_required_on_handle_close(&self, file_id: u64) -> Result<bool, u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).cleanup_required_on_handle_close(file_id) }
+    }
+
     fn associate(
         &mut self,
         file_id: u64,
@@ -21600,6 +21622,14 @@ impl ExecFileCompletion {
         unsafe { (&mut *self.table).begin_io(file_id, tid) }
     }
 
+    fn begin_cleanup(
+        &mut self,
+        file_id: u64,
+    ) -> Result<nt_io_completion::FileIoAcquireResult, u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).begin_cleanup(file_id) }
+    }
+
     fn cancel_io_waiter(&mut self, file_id: u64) -> Result<u32, u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe { (&mut *self.table).cancel_io_waiter(file_id) }
@@ -21610,6 +21640,21 @@ impl ExecFileCompletion {
         unsafe { (&mut *self.table).promote_io_waiter(file_id, tid) }
     }
 
+    fn promote_cleanup_if_ready(&mut self, file_id: u64) -> Result<bool, u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).promote_cleanup_if_ready(file_id) }
+    }
+
+    fn mark_cleanup_lifecycle_started(&mut self, file_id: u64) -> Result<bool, u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).mark_cleanup_lifecycle_started(file_id) }
+    }
+
+    fn active_cleanup_from(&self, start: usize) -> Option<(usize, u64)> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).active_cleanup_from(start) }
+    }
+
     fn release_io(
         &mut self,
         file_id: u64,
@@ -21617,6 +21662,14 @@ impl ExecFileCompletion {
     ) -> Result<nt_io_completion::FileIoRelease, u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe { (&mut *self.table).release_io(file_id, tid) }
+    }
+
+    fn release_cleanup_io(
+        &mut self,
+        file_id: u64,
+    ) -> Result<nt_io_completion::FileIoRelease, u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).release_cleanup_io(file_id) }
     }
 
     fn cancel_promoted_io(

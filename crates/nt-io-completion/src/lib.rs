@@ -139,6 +139,13 @@ struct FileCompletionEntry {
     lock_waiters: u32,
     signaled: bool,
     cleanup_sent: bool,
+    /// The final handle reference has become the close procedure's cleanup
+    /// reference and must be released only after CLEANUP has drained.
+    cleanup_reference_held: bool,
+    /// A synchronous cleanup owner is ordered after every already-referenced
+    /// ordinary waiter without masquerading as a user thread.
+    cleanup_waiting: bool,
+    cleanup_lifecycle_started: bool,
     notification_modes: u32,
     binding: Option<FileCompletionBinding>,
 }
@@ -151,6 +158,8 @@ pub struct FileCompletionTable<const FILES: usize> {
 }
 
 impl<const FILES: usize> FileCompletionTable<FILES> {
+    const CLEANUP_LOCK_OWNER: u64 = u64::MAX;
+
     pub const fn new() -> Self {
         assert!(FILES > 0);
         Self {
@@ -166,6 +175,9 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
                 lock_waiters: 0,
                 signaled: false,
                 cleanup_sent: false,
+                cleanup_reference_held: false,
+                cleanup_waiting: false,
+                cleanup_lifecycle_started: false,
                 notification_modes: 0,
                 binding: None,
             }; FILES],
@@ -239,6 +251,9 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
             lock_waiters: 0,
             signaled: true,
             cleanup_sent: false,
+            cleanup_reference_held: false,
+            cleanup_waiting: false,
+            cleanup_lifecycle_started: false,
             notification_modes: 0,
             binding: None,
         };
@@ -294,6 +309,9 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
             lock_waiters: 0,
             signaled: true,
             cleanup_sent: false,
+            cleanup_reference_held: false,
+            cleanup_waiting: false,
+            cleanup_lifecycle_started: false,
             notification_modes: 0,
             binding: None,
         };
@@ -366,19 +384,45 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
     }
 
     /// Drop one user-visible file handle reference. Cleanup is required when the last handle closes;
-    /// close is required when this also drops the final file-object reference.
+    /// that final handle reference transfers to the cleanup owner until the
+    /// driver's CLEANUP/CLOSE lifecycle has drained.
     pub fn release_handle(&mut self, file_id: u64) -> Result<FileReferenceRelease, u32> {
         let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
         if entry.handle_references == 0 {
             return Err(STATUS_INVALID_HANDLE);
         }
         entry.handle_references -= 1;
-        entry.references -= 1;
         let cleanup_required = entry.handle_references == 0 && !entry.cleanup_sent;
         if cleanup_required {
             entry.cleanup_sent = true;
+            entry.cleanup_reference_held = true;
+        } else {
+            entry.references -= 1;
         }
         Ok(Self::finish_release(entry, cleanup_required))
+    }
+
+    /// Release the reference transferred from the final handle after the
+    /// cleanup owner has finished the canonical driver lifecycle.
+    pub fn release_cleanup_reference(&mut self, file_id: u64) -> Result<FileReferenceRelease, u32> {
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if !entry.cleanup_reference_held
+            || entry.handle_references != 0
+            || entry.cleanup_waiting
+            || entry.lock_owner_tid == Self::CLEANUP_LOCK_OWNER
+            || !entry.cleanup_lifecycle_started
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        entry.cleanup_reference_held = false;
+        entry.cleanup_lifecycle_started = false;
+        entry.references -= 1;
+        Ok(Self::finish_release(entry, false))
+    }
+
+    pub fn cleanup_required_on_handle_close(&self, file_id: u64) -> Result<bool, u32> {
+        let entry = self.entry(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        Ok(entry.handle_references == 1 && !entry.cleanup_sent)
     }
 
     pub fn associate(&mut self, file_id: u64, binding: FileCompletionBinding) -> Result<(), u32> {
@@ -438,7 +482,15 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
         }
         let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
         if !entry.io_mode.is_synchronous() {
+            if entry.cleanup_reference_held {
+                return Err(STATUS_INVALID_HANDLE);
+            }
             return Ok(FileIoAcquireResult::Bypassed);
+        }
+        if entry.cleanup_reference_held
+            && !(entry.lock_owner_tid == tid && entry.lock_grant_tid == tid)
+        {
+            return Err(STATUS_INVALID_HANDLE);
         }
         if entry.lock_owner_tid == 0 {
             entry.lock_owner_tid = tid;
@@ -455,6 +507,29 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
         Ok(FileIoAcquireResult::Contended {
             alertable: entry.io_mode.is_alertable(),
         })
+    }
+
+    /// Acquire Busy for the internal, non-alertable CLEANUP owner. A contended
+    /// cleanup is held behind the ordinary waiter count and becomes eligible
+    /// only after the final pre-existing operation releases Busy.
+    pub fn begin_cleanup(&mut self, file_id: u64) -> Result<FileIoAcquireResult, u32> {
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if !entry.cleanup_reference_held
+            || entry.handle_references != 0
+            || entry.cleanup_waiting
+            || entry.lock_owner_tid == Self::CLEANUP_LOCK_OWNER
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if !entry.io_mode.is_synchronous() {
+            return Ok(FileIoAcquireResult::Bypassed);
+        }
+        if entry.lock_owner_tid == 0 && entry.lock_waiters == 0 {
+            entry.lock_owner_tid = Self::CLEANUP_LOCK_OWNER;
+            return Ok(FileIoAcquireResult::Acquired);
+        }
+        entry.cleanup_waiting = true;
+        Ok(FileIoAcquireResult::Contended { alertable: false })
     }
 
     /// Undo a contention count when the executive could not publish or no longer needs a waiter.
@@ -487,6 +562,55 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
         Ok(entry.lock_waiters)
     }
 
+    pub fn promote_cleanup_if_ready(&mut self, file_id: u64) -> Result<bool, u32> {
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if !entry.cleanup_waiting {
+            return Ok(false);
+        }
+        if !entry.cleanup_reference_held || !entry.io_mode.is_synchronous() {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if entry.lock_owner_tid != 0 || entry.lock_grant_tid != 0 || entry.lock_waiters != 0 {
+            return Ok(false);
+        }
+        entry.cleanup_waiting = false;
+        entry.lock_owner_tid = Self::CLEANUP_LOCK_OWNER;
+        Ok(true)
+    }
+
+    /// Mark the canonical manager lifecycle active before crossing the driver
+    /// boundary. Repeated callers observe the existing owner and must redrive it
+    /// rather than dispatching a second cleanup generation.
+    pub fn mark_cleanup_lifecycle_started(&mut self, file_id: u64) -> Result<bool, u32> {
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if !entry.cleanup_reference_held || entry.handle_references != 0 || entry.cleanup_waiting {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if entry.io_mode.is_synchronous() && entry.lock_owner_tid != Self::CLEANUP_LOCK_OWNER {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if entry.cleanup_lifecycle_started {
+            return Ok(false);
+        }
+        entry.cleanup_lifecycle_started = true;
+        Ok(true)
+    }
+
+    /// Allocation-free enumeration of cleanup owners whose canonical manager
+    /// lifecycle has started but whose transferred File reference is still live.
+    pub fn active_cleanup_from(&self, start: usize) -> Option<(usize, u64)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find_map(|(slot, entry)| {
+                (entry.references != 0
+                    && entry.cleanup_reference_held
+                    && entry.cleanup_lifecycle_started)
+                    .then_some((slot, entry.file_id))
+            })
+    }
+
     /// Release a completed synchronous operation. The executive uses the returned waiter count to
     /// promote exactly one FIFO acquisition owner before making that thread runnable.
     pub fn release_io(&mut self, file_id: u64, tid: u64) -> Result<FileIoRelease, u32> {
@@ -495,6 +619,17 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
             || entry.lock_owner_tid != tid
             || entry.lock_grant_tid != 0
         {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        entry.lock_owner_tid = 0;
+        Ok(FileIoRelease {
+            waiters: entry.lock_waiters,
+        })
+    }
+
+    pub fn release_cleanup_io(&mut self, file_id: u64) -> Result<FileIoRelease, u32> {
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if entry.lock_owner_tid != Self::CLEANUP_LOCK_OWNER || entry.lock_grant_tid != 0 {
             return Err(STATUS_INVALID_PARAMETER);
         }
         entry.lock_owner_tid = 0;
@@ -1349,6 +1484,18 @@ mod tests {
             files.release_handle(10),
             Ok(FileReferenceRelease {
                 cleanup_required: true,
+                close_required: false,
+                device_id: 77,
+                port_id: None,
+            })
+        );
+        assert_eq!(files.binding(10).unwrap().port_id, 3);
+        assert_eq!(files.begin_cleanup(10), Ok(FileIoAcquireResult::Bypassed));
+        assert_eq!(files.mark_cleanup_lifecycle_started(10), Ok(true));
+        assert_eq!(
+            files.release_cleanup_reference(10),
+            Ok(FileReferenceRelease {
+                cleanup_required: false,
                 close_required: true,
                 device_id: 77,
                 port_id: Some(3),
@@ -1378,7 +1525,13 @@ mod tests {
         assert_eq!(files.is_synchronous(10), Ok(false));
         assert_eq!(files.retain_file(10), Ok(()));
         assert_eq!(files.release_file(10).unwrap().close_required, false);
-        assert_eq!(files.release_handle(10).unwrap().close_required, true);
+        assert_eq!(files.release_handle(10).unwrap().cleanup_required, true);
+        assert_eq!(files.begin_cleanup(10), Ok(FileIoAcquireResult::Bypassed));
+        files.mark_cleanup_lifecycle_started(10).unwrap();
+        assert_eq!(
+            files.release_cleanup_reference(10).unwrap().close_required,
+            true
+        );
 
         files.reserve_file_handle_publication(20, 88, true).unwrap();
         assert_eq!(files.cancel_reserved_file_handle(20), Ok(()));
@@ -1417,10 +1570,17 @@ mod tests {
             files.release_file(10),
             Ok(FileReferenceRelease {
                 cleanup_required: false,
-                close_required: true,
+                close_required: false,
                 device_id: 77,
-                port_id: Some(3),
+                port_id: None,
             })
+        );
+        assert_eq!(files.binding(10).unwrap().port_id, 3);
+        assert_eq!(files.begin_cleanup(10), Ok(FileIoAcquireResult::Bypassed));
+        files.mark_cleanup_lifecycle_started(10).unwrap();
+        assert_eq!(
+            files.release_cleanup_reference(10).unwrap().close_required,
+            true
         );
         assert_eq!(files.binding(10), None);
     }
@@ -1513,6 +1673,54 @@ mod tests {
         assert_eq!(files.begin_io(10, 300), Ok(FileIoAcquireResult::Acquired));
         assert_eq!(files.release_io(10, 300), Ok(FileIoRelease { waiters: 0 }));
         assert_eq!(files.io_lock_owner(10), Ok(None));
+    }
+
+    #[test]
+    fn last_handle_cleanup_follows_every_existing_synchronous_waiter() {
+        let mut files = FileCompletionTable::<1>::new();
+        files
+            .insert_file_with_mode(10, 77, FileIoMode::SynchronousNonAlertable)
+            .unwrap();
+        files.begin_io(10, 100).unwrap();
+        assert!(matches!(
+            files.begin_io(10, 200),
+            Ok(FileIoAcquireResult::Contended { .. })
+        ));
+
+        let release = files.release_handle(10).unwrap();
+        assert!(release.cleanup_required);
+        assert!(!release.close_required);
+        assert_eq!(files.begin_io(10, 300), Err(STATUS_INVALID_HANDLE));
+        assert!(matches!(
+            files.begin_cleanup(10),
+            Ok(FileIoAcquireResult::Contended { alertable: false })
+        ));
+        assert_eq!(files.io_waiter_count(10), Ok(1));
+
+        assert_eq!(files.release_io(10, 100).unwrap().waiters, 1);
+        assert_eq!(files.promote_cleanup_if_ready(10), Ok(false));
+        files.promote_io_waiter(10, 200).unwrap();
+        files.begin_io(10, 200).unwrap();
+        assert_eq!(files.release_io(10, 200).unwrap().waiters, 0);
+        assert_eq!(files.promote_cleanup_if_ready(10), Ok(true));
+        assert!(files.io_lock_owner(10).unwrap().is_some());
+        assert_eq!(files.promote_cleanup_if_ready(10), Ok(false));
+        assert_eq!(files.mark_cleanup_lifecycle_started(10), Ok(true));
+        assert_eq!(files.mark_cleanup_lifecycle_started(10), Ok(false));
+        assert_eq!(files.active_cleanup_from(0), Some((0, 10)));
+        assert_eq!(files.release_cleanup_io(10).unwrap().waiters, 0);
+        assert!(files.release_cleanup_reference(10).unwrap().close_required);
+        assert_eq!(files.io_mode(10), Err(STATUS_INVALID_HANDLE));
+    }
+
+    #[test]
+    fn asynchronous_cleanup_bypasses_busy_but_keeps_its_reference() {
+        let mut files = FileCompletionTable::<1>::new();
+        files.insert_file(10, 77, false).unwrap();
+        assert!(files.release_handle(10).unwrap().cleanup_required);
+        assert_eq!(files.begin_cleanup(10), Ok(FileIoAcquireResult::Bypassed));
+        files.mark_cleanup_lifecycle_started(10).unwrap();
+        assert!(files.release_cleanup_reference(10).unwrap().close_required);
     }
 
     #[test]

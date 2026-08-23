@@ -8953,6 +8953,10 @@ pub(crate) unsafe fn service_sec_image(
                 nt_io_manager::PendingFileIrpDrain,
                 nt_io_manager::PendingFileIrpDrainReservation,
             )> = None;
+            let mut transfer_file_cleanup_wait: Option<(
+                nt_io_manager::PendingFileCleanupWait,
+                nt_io_manager::PendingFileCleanupWaitReservation,
+            )> = None;
             let mut synchronous_file_wait_parked = false;
             let mut park_pipe_name_wait_root_handle: u64 = 0;
             let mut park_pipe_name_wait_hash: u64 = 0;
@@ -9070,6 +9074,10 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.pending_file_io_transfer = None;
                 nt_handler.pending_file_io_wait = false;
                 nt_handler.pending_synchronous_file_wait = None;
+                assert!(
+                    nt_handler.pending_file_cleanup_wait.is_none(),
+                    "previous syscall leaked a File cleanup continuation reservation"
+                );
                 assert!(
                     nt_handler.pending_file_irp_drain.is_none(),
                     "previous syscall leaked a File IRP drain reservation"
@@ -9816,6 +9824,25 @@ pub(crate) unsafe fn service_sec_image(
                     pending.resume_flags = flags;
                     transfer_file_irp_drain = Some((pending, reservation));
                 }
+                if let Some((file_id, reservation)) =
+                    nt_handler.pending_file_cleanup_wait.take()
+                {
+                    let mut pending = nt_io_manager::PendingFileCleanupWait {
+                        file_id,
+                        pi: pi as u32,
+                        tid: nt_handler.current_tid,
+                        badge,
+                        native_call_transport,
+                        resume_ip,
+                        resume_sp: sp,
+                        resume_flags: flags,
+                        ..nt_io_manager::PendingFileCleanupWait::default()
+                    };
+                    if !native_call_transport {
+                        pending.reply_mrs = syscall_reply_context.regs;
+                    }
+                    transfer_file_cleanup_wait = Some((pending, reservation));
+                }
                 if let Some(stale_grant) = nt_handler.active_synchronous_file_retry.take() {
                     let _ = nt_handler
                         .file_completion
@@ -9860,6 +9887,7 @@ pub(crate) unsafe fn service_sec_image(
                     || FILE_IO_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel)
                 {
                     let _ = pending_file_io_redrive_all(&mut nt_handler);
+                    let _ = file_cleanup_redrive_all(&mut nt_handler);
                 }
                 // ★ BATCH 34: a client CONNECT to a pipe completes the exact async server
                 // FSCTL_PIPE_LISTEN for the accepted CCB's server end. Only a CONNECT (not a write)
@@ -16087,7 +16115,34 @@ pub(crate) unsafe fn service_sec_image(
                 // The manager may already hold the terminal result (for example a completion
                 // published during the post-dispatch pump before reply ownership moved here).
                 let _ = pending_file_io_redrive_all(&mut nt_handler);
+                let _ = file_cleanup_redrive_all(&mut nt_handler);
                 if wait_for_completion {
+                    pin_durable_table_growth_if_dirty(&mut heap_mark);
+                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                    badge = nb;
+                    mi = nmi;
+                    m0 = nm0;
+                    m1 = nm1;
+                    m2 = nm2;
+                    m3 = nm3;
+                    continue;
+                }
+            }
+            if let Some((pending, reservation)) = transfer_file_cleanup_wait.take() {
+                if file_cleanup_wait_transfer(&mut nt_handler, pending, reservation) {
+                    trace_indefinite_wait_park(
+                        &nt_handler,
+                        badge,
+                        live_top_badges(&nt_handler),
+                        crash_parked,
+                        wait_parked,
+                    );
+                    mark_wait_parked!(pi, resume_ip);
+                    // The manager may have reached terminal CLOSE between the pre-reply pump and
+                    // continuation publication. Redrive after ownership is visible so that edge
+                    // completes the exact parked `NtClose` instead of waiting for another event.
+                    let _ = file_cleanup_redrive_all(&mut nt_handler);
                     pin_durable_table_growth_if_dirty(&mut heap_mark);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
@@ -16114,6 +16169,7 @@ pub(crate) unsafe fn service_sec_image(
                 // original owner unconditionally before testing the separate drain owner.
                 let _ = driver_launch::pump_hosted_io_completions();
                 let _ = pending_file_io_redrive_all(&mut nt_handler);
+                let _ = file_cleanup_redrive_all(&mut nt_handler);
                 let _ = pipe_listen_redrive_all(&mut nt_handler);
                 let _ = file_irp_drain_redrive_all(&mut nt_handler);
                 pin_durable_table_growth_if_dirty(&mut heap_mark);
@@ -23041,6 +23097,14 @@ pub(crate) unsafe fn synchronous_file_wake_next(
     loop {
         let table = &mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS);
         let Some((slot, waiter)) = table.oldest_waiting_for_file(file_id) else {
+            if nt_handler
+                .file_completion
+                .promote_cleanup_if_ready(file_id)
+                .expect("synchronous File cleanup lost its policy owner")
+            {
+                start_file_cleanup(nt_handler, file_id);
+                return true;
+            }
             return handled;
         };
         nt_handler
@@ -23110,15 +23174,99 @@ pub(crate) unsafe fn synchronous_file_release_and_wake(
         .file_completion
         .release_io(file_id, owner_tid)
         .expect("synchronous File lock released by a stale owner");
-    if release.waiters == 0 {
-        false
-    } else {
+    if release.waiters != 0 {
         assert!(
             synchronous_file_wake_next(nt_handler, file_id),
             "synchronous File waiter count has no FIFO owner"
         );
         true
+    } else {
+        synchronous_file_wake_next(nt_handler, file_id)
     }
+}
+
+/// Start the one canonical lifecycle owned by the transferred final-handle
+/// reference. The policy state is committed before entering the manager because
+/// inline driver completion may re-enter the service loop.
+pub(crate) unsafe fn start_file_cleanup(nt_handler: &mut ExecNtHandler, file_id: u64) {
+    let first_start = nt_handler
+        .file_completion
+        .mark_cleanup_lifecycle_started(file_id)
+        .expect("File cleanup started without its Busy/reference owner");
+    if first_start {
+        // FsContext is mutable driver payload, so retire the auxiliary endpoint
+        // indices only once cleanup actually owns its place behind ordinary I/O.
+        if let Some((_, fs_context)) = driver_launch::hosted_file_route(file_id) {
+            let server_context = nt_io_manager::pipe_server_file_id_for_endpoint(fs_context)
+                .unwrap_or(fs_context);
+            crate::pipe_server_preconnected_forget(server_context);
+            crate::pipe_server_available_forget(fs_context);
+            crate::pipe_fid_name_forget(fs_context);
+        }
+    }
+    driver_launch::release_hosted_file(file_id)
+        .expect("canonical File cleanup was rejected before driver acceptance");
+    // CLEANUP can complete retained reads/listens. Their ordinary completion
+    // owners must publish and ACK before the manager is allowed to send CLOSE.
+    nt_handler.pipe_endpoint_progress = true;
+    FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+}
+
+/// Retire manager-complete cleanup owners without allocating or manufacturing a
+/// user completion. Synchronous Busy is released before the transferred File
+/// reference, matching the FILE_OBJECT delete invariant.
+unsafe fn file_cleanup_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
+    let mut cursor = 0usize;
+    let mut completed = 0u64;
+    while let Some((slot, file_id)) = nt_handler.file_completion.active_cleanup_from(cursor) {
+        cursor = slot + 1;
+        if driver_launch::hosted_file_exists(file_id) {
+            driver_launch::release_hosted_file(file_id)
+                .expect("active File cleanup lost its canonical manager owner");
+        }
+        if driver_launch::hosted_file_exists(file_id) {
+            continue;
+        }
+        let continuation =
+            (&mut *core::ptr::addr_of_mut!(PENDING_FILE_CLEANUP_WAITS)).take_file(file_id);
+        if nt_handler
+            .file_completion
+            .io_mode(file_id)
+            .expect("completed cleanup lost its File policy")
+            .is_synchronous()
+        {
+            let release = nt_handler
+                .file_completion
+                .release_cleanup_io(file_id)
+                .expect("completed cleanup lost synchronous Busy");
+            assert_eq!(
+                release.waiters, 0,
+                "last-handle cleanup completed before ordinary File waiters"
+            );
+        }
+        nt_handler.release_file_cleanup_reference(file_id);
+        if let Some(pending) = continuation {
+            if pending.native_call_transport {
+                let _ = client_reply_on(pending.reply_cap, 1, 0, 0, 0, 0);
+            } else {
+                for index in 4..pending.reply_mrs.len() {
+                    set_reply_mr(index, pending.reply_mrs[index]);
+                }
+                let _ = client_reply_on(
+                    pending.reply_cap,
+                    18,
+                    0,
+                    pending.reply_mrs[1],
+                    pending.reply_mrs[2],
+                    pending.reply_mrs[3],
+                );
+            }
+            release_reply_pool_cap(pending.reply_cap);
+            thread_wait_state_clear_badge_ready(nt_handler, pending.badge);
+        }
+        completed += 1;
+    }
+    completed
 }
 
 unsafe fn pending_file_io_transfer(
@@ -23177,6 +23325,39 @@ unsafe fn file_irp_drain_transfer(
         .expect("reserved File IRP drain owner rejected its exact continuation");
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+}
+
+/// Transfer the final-handle `NtClose` reply only when its canonical File lifecycle still exists.
+/// Inline CLEANUP/CLOSE completion retires the policy before this tail and therefore needs no park.
+unsafe fn file_cleanup_wait_transfer(
+    nt_handler: &mut ExecNtHandler,
+    mut pending: nt_io_manager::PendingFileCleanupWait,
+    reservation: nt_io_manager::PendingFileCleanupWaitReservation,
+) -> bool {
+    let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_CLEANUP_WAITS);
+    if nt_handler.file_completion.io_mode(pending.file_id).is_err() {
+        assert!(
+            table.cancel_reservation(reservation),
+            "inline File cleanup left a stale continuation reservation"
+        );
+        return false;
+    }
+    let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    assert_ne!(stolen, 0, "File cleanup reply cap disappeared after preflight");
+    let (fresh_index, fresh) = wait_reply_pool_find_free()
+        .expect("File cleanup reply-pool claim disappeared after preflight");
+    pending.reply_cap = stolen;
+    if !pending.native_call_transport {
+        pending.reply_mrs[15] = pending.resume_ip;
+        pending.reply_mrs[16] = pending.resume_sp;
+        pending.reply_mrs[17] = pending.resume_flags;
+    }
+    table
+        .park_reserved(reservation, pending)
+        .expect("reserved File cleanup owner rejected its exact continuation");
+    wait_reply_pool_mark_used(fresh_index);
+    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    true
 }
 
 unsafe fn pipe_name_wait_park(

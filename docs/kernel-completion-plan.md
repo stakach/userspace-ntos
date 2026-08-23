@@ -10720,3 +10720,48 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `FSCTL_PIPE_LISTEN` into `PendingFileIo`, route root `FSCTL_PIPE_WAIT` through the canonical
     hosted File/device boundary, remove their compatibility tables, and replace the 16 KiB hosted
     control-buffer ceiling with growable or banked transport.
+
+    Final-handle cleanup FIFO checkpoint (2026-08-24): the last user-visible File handle reference
+    now transfers to a distinct cleanup owner instead of disappearing before driver teardown.
+    Synchronous cleanup is a non-alertable policy tail behind the exact ordinary Busy owner and every
+    already-admitted FIFO waiter; it is not represented as a hosted thread, reply capability, or fake
+    I/O operation. New operations are refused after final handle removal, while an already-promoted
+    waiter can consume its grant and finish before cleanup promotion. Asynchronous Files bypass Busy
+    but retain the same final-reference and lifecycle invariants. Cleanup acquires policy before the
+    component crosses into the canonical I/O Manager, and the transferred reference and completion
+    association remain live through pending CLEANUP, outstanding-IRP ACK drain, pending CLOSE, and
+    terminal File retirement.
+
+    The I/O Manager's public `close` path now performs CLEANUP automatically when callers have not
+    issued a separate cleanup request; no public caller can jump an open File directly to CLOSE.
+    The executive removes the process handle before driver cleanup and pre-reserves any continuation
+    resource before that irreversible transition. A separate generation-exact continuation table
+    keeps final-handle `NtClose` blocked while the manager File remains live without leaking seL4
+    transport state into File Busy policy. Inline lifecycle completion cancels the unused reservation
+    and takes the ordinary reply path. Pending completion resumes native calls with one status word
+    and restores all 18 message registers for UnknownSyscall transport only after Busy, manager File,
+    the transferred reference, and its completion-port binding have retired. Dead-thread teardown
+    releases only the reply capability; it never cancels cleanup, releases Busy, or drops the
+    lifecycle reference. Oversized process handles are no longer truncated during close lookup.
+
+    Focused validation is green for `nt-io-manager` (`187/187`), including pending lifecycle and
+    automatic public-close coverage, `nt-io-completion` (`33/33`), including exact ordinary-waiter
+    ordering and asynchronous cleanup, and the freestanding executive check at the existing
+    212-warning baseline. The cleanup continuation table tests reservation generation, reset ABA
+    rejection, capacity restoration, duplicate File/thread/reply exclusion, exact-once take, and
+    teardown isolation. Serialized desktop proof `.tmp/run-desktop-20260824-005430.log` is accepted:
+    it dispatches real `IRP_MJ_CLEANUP` followed by `IRP_MJ_CLOSE` for both ends of an isolated named
+    pipe, dynamically launches genuine userinit and Explorer, completes 669 real api0 callbacks with
+    zero callback failures, and reaches 5 BeginPaint, 20 EndPaint, 187 direct GDI returns, and 135
+    batch flushes carrying 184 records. All 786,432 framebuffer pixels are non-background with at
+    least 32 colors; all `293/293` checks pass and the sentinel is emitted. This boot exercised the
+    immediate lifecycle path; queued/pending `NtClose` continuation behavior remains established by
+    focused policy/manager tests rather than overstated as a deterministic on-target stimulus.
+
+    Review adjustment: final-handle cleanup ordering and continuation ownership are closed. The next
+    step is to migrate `FSCTL_PIPE_LISTEN` from `AsyncListenTable` into the generic `PendingFileIo`
+    owner, preserving exact File/IrpId completion and synchronous File acquisition rules, then delete
+    the specialized listen table and its redrive/cancellation machinery. Route root
+    `FSCTL_PIPE_WAIT` through a canonical hosted File/device request next and remove the executive
+    name-wait compatibility table. Finally replace the explicit 16 KiB hosted control-buffer ceiling
+    with a growable or banked transport before claiming arbitrary NT control-buffer lengths.

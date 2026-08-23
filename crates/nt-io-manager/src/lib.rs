@@ -19,6 +19,7 @@ use nt_types::{ClientId, NtPath, ObjectId};
 
 mod cancel;
 mod cancel_wait;
+mod cleanup_wait;
 mod close;
 mod complete;
 mod device;
@@ -47,6 +48,9 @@ pub use cancel::FileThreadIrpDrainState;
 pub use cancel_wait::{
     PendingFileIrpDrain, PendingFileIrpDrainReservation, PendingFileIrpDrainTable,
     FILE_IRP_DRAIN_IOSB_PUBLISHED, FILE_IRP_DRAIN_REPLY_CLAIMED, FILE_IRP_DRAIN_REPLY_PUBLISHED,
+};
+pub use cleanup_wait::{
+    PendingFileCleanupWait, PendingFileCleanupWaitReservation, PendingFileCleanupWaitTable,
 };
 pub use complete::CompletedIrp;
 pub use device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
@@ -3229,6 +3233,22 @@ mod tests {
         let state = std::rc::Rc::new(std::cell::RefCell::new(LifecycleDispatchState::default()));
         let (mut om, client, _handle, file_id) = lifecycle_device(state.clone());
         om.disconnect_client(client).unwrap();
+        assert!(om.file(file_id).is_none());
+        assert_eq!(
+            state.borrow().majors,
+            std::vec![
+                major::IRP_MJ_CREATE,
+                major::IRP_MJ_CLEANUP,
+                major::IRP_MJ_CLOSE
+            ]
+        );
+    }
+
+    #[test]
+    fn close_dispatches_cleanup_without_a_separate_public_cleanup_call() {
+        let state = std::rc::Rc::new(std::cell::RefCell::new(LifecycleDispatchState::default()));
+        let (mut om, client, handle, file_id) = lifecycle_device(state.clone());
+        om.close(client, handle).unwrap();
         assert!(om.file(file_id).is_none());
         assert_eq!(
             state.borrow().majors,

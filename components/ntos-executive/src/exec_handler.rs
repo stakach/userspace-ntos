@@ -160,6 +160,17 @@ unsafe fn reserve_file_irp_drain_waiter(
     reservation
 }
 
+unsafe fn reserve_file_cleanup_waiter(
+) -> Option<nt_io_manager::PendingFileCleanupWaitReservation> {
+    let waiters = &mut *core::ptr::addr_of_mut!(PENDING_FILE_CLEANUP_WAITS);
+    let old_capacity = waiters.allocation_capacity();
+    let reservation = waiters.reserve();
+    if reservation.is_some() && waiters.allocation_capacity() != old_capacity {
+        crate::mark_durable_table_growth_dirty();
+    }
+    reservation
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct HostedFileRoute {
     /// Canonical generation-protected File identity.
@@ -2773,6 +2784,7 @@ impl ExecNtHandler {
         write_field!(pending_file_io_wait, false);
         write_field!(pending_file_io_reservation, None);
         write_field!(pending_synchronous_file_wait, None);
+        write_field!(pending_file_cleanup_wait, None);
         write_field!(pending_file_irp_drain, None);
         write_field!(dbgk_block_request, false);
         write_field!(pipe_endpoint_progress, false);
@@ -10769,24 +10781,29 @@ impl ExecNtHandler {
         release: nt_io_completion::FileReferenceRelease,
     ) {
         if release.cleanup_required {
-            // FsContext is mutable driver payload, so capture it while the File is still Open.
-            // release_external_file owns the canonical CLEANUP -> IRP-drain -> CLOSE sequence and
-            // may retire the File record before returning when every operation completed inline.
-            if let Some((_, fs_context)) = driver_launch::hosted_file_route(file_id) {
-                let server_context = nt_io_manager::pipe_server_file_id_for_endpoint(fs_context)
-                    .unwrap_or(fs_context);
-                crate::pipe_server_preconnected_forget(server_context);
-                crate::pipe_server_available_forget(fs_context);
-                crate::pipe_fid_name_forget(fs_context);
+            match self
+                .file_completion
+                .begin_cleanup(file_id)
+                .expect("last File handle lost its cleanup policy owner")
+            {
+                nt_io_completion::FileIoAcquireResult::Bypassed
+                | nt_io_completion::FileIoAcquireResult::Acquired => unsafe {
+                    crate::service_sec_image::start_file_cleanup(self, file_id);
+                },
+                nt_io_completion::FileIoAcquireResult::Contended { .. } => {}
             }
-            let _ = driver_launch::release_hosted_file(file_id);
-            // CLEANUP/CLOSE may complete retained reads in the FSD. Run the same generic completion
-            // drain used after writes so their waiters observe the terminal driver result promptly.
-            self.pipe_endpoint_progress = true;
         }
         if let Some(port_id) = release.port_id {
             let _ = self.io_completion_ports.release(port_id);
         }
+    }
+
+    pub(crate) fn release_file_cleanup_reference(&mut self, file_id: u64) {
+        let release = self
+            .file_completion
+            .release_cleanup_reference(file_id)
+            .expect("completed File cleanup lost its transferred handle reference");
+        self.complete_file_reference_release(file_id, release);
     }
 
     fn cancel_target_for_handle(&self, handle: u64) -> Result<(Option<u64>, bool), u32> {
@@ -11159,6 +11176,21 @@ impl ExecNtHandler {
         waiters.len()
     }
 
+    unsafe fn abandon_file_cleanup_waiters_for_thread(&mut self, tid: u64) -> usize {
+        let mut waiters = Vec::new();
+        (&mut *core::ptr::addr_of_mut!(PENDING_FILE_CLEANUP_WAITS))
+            .take_thread_with(tid, |waiter| waiters.push(waiter));
+        for waiter in waiters.iter().copied() {
+            if waiter.reply_cap != 0 {
+                release_reply_pool_cap(waiter.reply_cap);
+            }
+            thread_wait_state_clear_badge_ready(self, waiter.badge);
+        }
+        // The thread owns only its reply continuation. The final-handle reference and canonical
+        // CLEANUP/CLOSE lifecycle survive caller teardown and continue to manager completion.
+        waiters.len()
+    }
+
     pub(crate) unsafe fn cancel_file_io_for_thread_teardown(&mut self, tid: u64) -> usize {
         let listens: Vec<_> = (&*core::ptr::addr_of!(PIPE_ASYNC_LISTENS))
             .drain_all()
@@ -11177,6 +11209,7 @@ impl ExecNtHandler {
             + self.abandon_pending_file_io_for_thread(tid)
             + self.abandon_synchronous_file_waiters_for_thread(tid)
             + self.abandon_file_irp_drain_waiters_for_thread(tid)
+            + self.abandon_file_cleanup_waiters_for_thread(tid)
     }
 
     unsafe fn cancel_pipe_name_waits_for_root_handle(&mut self, root_handle: u64) -> usize {
@@ -15930,10 +15963,10 @@ impl ExecNtHandler {
         pid: nt_process::ProcessId,
         handle: u64,
     ) -> Result<bool, u32> {
-        match self
-            .pm
-            .take_handle_for_close(pid, handle as nt_process::Handle)
-        {
+        let Ok(handle) = nt_process::Handle::try_from(handle) else {
+            return Ok(false);
+        };
+        match self.pm.take_handle_for_close(pid, handle) {
             Ok(object) => {
                 self.release_handle_object(object);
                 PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
@@ -21225,15 +21258,62 @@ impl ExecNtHandler {
             NativeService::NtClose => {
                 let mut closed = false;
                 let mut closed_user_object = false;
+                let pid = self.pm_pid_for_pi(self.pi);
+                if let (Some(pid), Ok(handle)) = (pid, nt_process::Handle::try_from(args[0])) {
+                    if self
+                        .pm
+                        .handle_flags(pid, handle)
+                        .is_some_and(|flags| flags.protect_from_close)
+                    {
+                        return nt_process::STATUS_HANDLE_NOT_CLOSABLE;
+                    }
+                    let cleanup_file = match self.pm.lookup_handle(pid, handle) {
+                        Some(nt_process::HandleObject::File(file_id))
+                        | Some(nt_process::HandleObject::RoutedFile { file_id, .. }) => self
+                            .file_completion
+                            .cleanup_required_on_handle_close(file_id)
+                            .expect("process File handle has no completion-policy identity")
+                            .then_some(file_id),
+                        _ => None,
+                    };
+                    if let Some(file_id) = cleanup_file {
+                        if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
+                            || !wait_reply_pool_has_free()
+                        {
+                            return STATUS_INSUFFICIENT_RESOURCES;
+                        }
+                        let Some(reservation) = (unsafe { reserve_file_cleanup_waiter() }) else {
+                            return STATUS_INSUFFICIENT_RESOURCES;
+                        };
+                        assert!(self.pending_file_cleanup_wait.is_none());
+                        self.pending_file_cleanup_wait = Some((file_id, reservation));
+                    }
+                }
+                if let Some(pid) = pid {
+                    match self.close_process_handle_checked(pid, args[0]) {
+                        Ok(was_closed) => closed = was_closed,
+                        Err(status) => {
+                            if let Some((_, reservation)) = self.pending_file_cleanup_wait.take() {
+                                assert!(unsafe {
+                                    (&mut *core::ptr::addr_of_mut!(PENDING_FILE_CLEANUP_WAITS))
+                                        .cancel_reservation(reservation)
+                                });
+                            }
+                            return status;
+                        }
+                    }
+                }
+                if !closed {
+                    if let Some((_, reservation)) = self.pending_file_cleanup_wait.take() {
+                        assert!(unsafe {
+                            (&mut *core::ptr::addr_of_mut!(PENDING_FILE_CLEANUP_WAITS))
+                                .cancel_reservation(reservation)
+                        });
+                    }
+                }
                 if let Some(loop_ctx) = self.loop_ctx {
                     unsafe {
                         let _ = (&mut *loop_ctx.exe_images).close(self.pi, args[0]);
-                    }
-                }
-                if let Some(pid) = self.pm_pid_for_pi(self.pi) {
-                    match self.close_process_handle_checked(pid, args[0]) {
-                        Ok(was_closed) => closed = was_closed,
-                        Err(status) => return status,
                     }
                 }
                 if closed {
