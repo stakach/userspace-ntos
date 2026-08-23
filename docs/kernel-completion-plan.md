@@ -9981,3 +9981,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     graph before `MajorFunction`, and implement these hooks against the exact hosted owner. The old
     fid/direction queues remain scheduled for deletion only after the executive delivery consumer
     has moved to exact-ID copy then ACK; they are not an accepted fallback path.
+
+    Hosted canonical-identity transport checkpoint (2026-08-23): the hosted WDM shared request now
+    carries canonical generation-protected `IrpId` and `FileId` in the verified unused
+    `[0x390,0x3a0)` gap, with compile-time non-overlap checks against the path buffers and resource
+    grant fields. These identities are written on every private IRP transport dispatch, read by the
+    component-side builder, and retained in the raw owner record. The existing `SH_REQ_FILEID`
+    remains a distinct driver-private `FILE_OBJECT.FsContext`/PDO cookie; no pointer or FsContext is
+    cast into a canonical id. Internal PnP, interrupt, and legacy cancellation dispatches explicitly
+    carry null canonical identities instead of inheriting stale shared-page values. Validation is
+    green for `cargo fmt --all -- --check`, the freestanding executive check, and
+    `git diff --check`.
+
+    This checkpoint deliberately does not yet reinterpret hosted `STATUS_PENDING`: owner insertion
+    still occurs after `MajorFunction`, and the backend has not implemented exact poll/copy/ACK.
+    Flipping only the outcome would strand canonical IRPs. Next, consolidate the complete raw graph
+    into the owner record, publish it before exposing the active IRP and entering the driver, and
+    reconcile inline completion versus pending versus synchronous return by exact owner identity.

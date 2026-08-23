@@ -320,6 +320,8 @@ pub const SH_DEVICE_NAME_BUF: u64 = 0x90; // out: UTF-16LE path capture
 pub const SH_SYMLINK_LINK_BUF: u64 = 0x190; // out: UTF-16LE path capture
 pub const SH_SYMLINK_TARGET_BUF: u64 = 0x290; // out: UTF-16LE path capture
 pub const SH_CAPTURED_PATH_BYTES: usize = 0x100;
+pub const SH_REQ_IRP_ID: u64 = 0x390; // in: canonical generation-protected IrpId
+pub const SH_REQ_CANONICAL_FILE_ID: u64 = 0x398; // in: canonical FileId, never FsContext
 pub const SH_RESOURCE_MMIO_PHYS: u64 = 0x3A0; // in: granted physical BAR base for MmMapIoSpace
 pub const SH_RESOURCE_MMIO_LEN: u64 = 0x3A8; // in: granted physical BAR/resource length
 pub const SH_RESOURCE_MMIO_VA: u64 = 0x3B0; // in: component VA for the mapped BAR
@@ -499,6 +501,10 @@ pub const SH_REQ_FILEID: u64 = 0x68; // in/out: opaque FILE_OBJECT id (u64)
 pub const SH_REQ_STATUS: u64 = 0x70; // out: IoStatus.Status (i32)
 pub const SH_REQ_REQUESTOR_TID: u64 = 0x74; // in: requesting NT thread id (u32)
 pub const SH_REQ_INFO: u64 = 0x78; // out: IoStatus.Information (u64)
+const _: () = assert!(
+    SH_SYMLINK_TARGET_BUF + SH_CAPTURED_PATH_BYTES as u64 <= SH_REQ_IRP_ID
+);
+const _: () = assert!(SH_REQ_CANONICAL_FILE_ID + 8 <= SH_RESOURCE_MMIO_PHYS);
 
 const WDM_X64_DRIVER_EXTENSION_ADD_DEVICE_OFFSET: u64 = 0x08;
 
@@ -660,6 +666,10 @@ struct PendingIrp {
     data: u64,
     aux_data: u64,
     mdl: u64,
+    /// Canonical I/O Manager identities. These are transport ids, never driver
+    /// pointers or FsContext cookies, and stay attached through completion ACK.
+    canonical_irp_id: u64,
+    canonical_file_id: u64,
     /// The npfs `FsContext` (opaque file id) this IRP was issued on, captured at ISSUE time.
     /// ★ Must NOT be re-read from `FILE_OBJECT->FsContext` at completion time: npfs NULLs that
     /// field through `NpSetFileObject(fo, NULL, NULL, …)` when a pipe end disconnects
@@ -1054,6 +1064,8 @@ const EMPTY_PENDING_IRP: PendingIrp = PendingIrp {
     data: 0,
     aux_data: 0,
     mdl: 0,
+    canonical_irp_id: 0,
+    canonical_file_id: 0,
     fid: 0,
     requestor_tid: 0,
     major: 0,
@@ -25913,6 +25925,9 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     let inlen = read_volatile((FSD_SHARED_VADDR + SH_REQ_INLEN) as *const u64);
     let outlen = read_volatile((FSD_SHARED_VADDR + SH_REQ_OUTLEN) as *const u64);
     let fsctl = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
+    let canonical_irp_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_IRP_ID) as *const u64);
+    let canonical_file_id =
+        read_volatile((FSD_SHARED_VADDR + SH_REQ_CANONICAL_FILE_ID) as *const u64);
 
     let file_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
     let requestor_tid =
@@ -26409,6 +26424,8 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             data,
             aux_data,
             mdl,
+            canonical_irp_id,
+            canonical_file_id,
             // Capture the caller's open identity NOW: npfs may normalize or later NULL
             // `FILE_OBJECT->FsContext`, but executive waiters are parked on the exact endpoint fid
             // carried in this request.
@@ -28753,6 +28770,8 @@ impl DriverDispatchBackend for HostedDriverBackend {
                             irp.major as u64,
                             irp.minor as u64,
                             device_object,
+                            irp.irp_id.raw(),
+                            irp.file_id.map(|file_id| file_id.raw()).unwrap_or(0),
                             fsctl,
                             irp.user_data,
                             irp.requestor_tid,
@@ -28770,6 +28789,8 @@ impl DriverDispatchBackend for HostedDriverBackend {
                     irp.major as u64,
                     irp.minor as u64,
                     device_object,
+                    irp.irp_id.raw(),
+                    irp.file_id.map(|file_id| file_id.raw()).unwrap_or(0),
                     fsctl,
                     irp.user_data,
                     irp.requestor_tid,
@@ -35485,6 +35506,8 @@ pub(crate) unsafe fn start_hosted_device(
         IRP_MN_START_DEVICE,
         binding.device_object,
         0,
+        0,
+        0,
         binding.pdo_object,
         0,
         resource_list,
@@ -35539,6 +35562,8 @@ unsafe fn dispatch_hosted_device_interrupt_once(
         FSD_DISPATCH_INTERRUPT,
         tokens.vector as u64,
         binding.device_object,
+        0,
+        0,
         0,
         tokens.interrupt_id,
         0,
@@ -35900,6 +35925,8 @@ unsafe fn dispatch_irp_for_instance(
     major: u64,
     minor: u64,
     device_object: u64,
+    canonical_irp_id: u64,
+    canonical_file_id: u64,
     fsctl: u64,
     file_id: u64,
     requestor_tid: u64,
@@ -35955,6 +35982,11 @@ unsafe fn dispatch_irp_for_instance(
     write_volatile((sh + SH_REQ_INLEN) as *mut u64, inlen as u64);
     write_volatile((sh + SH_REQ_OUTLEN) as *mut u64, out.len() as u64);
     write_volatile((sh + SH_REQ_FILEID) as *mut u64, file_id);
+    write_volatile((sh + SH_REQ_IRP_ID) as *mut u64, canonical_irp_id);
+    write_volatile(
+        (sh + SH_REQ_CANONICAL_FILE_ID) as *mut u64,
+        canonical_file_id,
+    );
     write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
     write_volatile((sh + SH_REQ_REQUESTOR_TID) as *mut u32, requestor_tid as u32);
     write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
@@ -36165,6 +36197,8 @@ pub(crate) unsafe fn cancel_pending_file_irps(
         FSD_DISPATCH_CANCEL_PENDING_FILE,
         0,
         device_object,
+        0,
+        0,
         0,
         file_id,
         requestor_tid,
