@@ -5800,7 +5800,7 @@ unsafe fn winlogon_profile_copied_spec(passed: &mut u64) {
     );
 }
 
-/// ═══ THE BLOCKING-`NtUserGetMessage` GUARD IS LIVE, AND IT REALLY FIRED ═════════════════════════
+/// ═══ THE BLOCKING-`NtUserGetMessage` GUARD ACCOUNTS FOR EVERY PREFLIGHT ════════════
 ///
 /// This is the batch's PERFORMANCE guard, and it is counted rather than timed on purpose: the
 /// symptom it prevents is not "slow", it is a PERMANENT stop. win32k is driven synchronously by the
@@ -5810,22 +5810,30 @@ unsafe fn winlogon_profile_copied_spec(passed: &mut u64) {
 /// kills QEMU at 555 s, `RUNEXIT=124`).
 ///
 /// `PREFLIGHT_PEEKS >= 1` proves the non-blocking `NtUserPeekMessage(PM_NOREMOVE)` really runs
-/// ahead of every blocking GetMessage; `EMPTY_QUEUE_PARKS >= 1` proves it really caught a call that
-/// would have blocked forever and parked the caller instead. The fact that this spec RUNS AT ALL is
-/// the other half of the proof — with the guard bypassed the gate is never reached.
+/// ahead of blocking GetMessage. Every preflight must then be classified as already non-empty,
+/// repopulated by the real second-SAS path, or parked. This is schedule-independent: a boot whose
+/// queues never drain must not fail merely because no park was necessary.
 fn get_message_guard_spec(passed: &mut u64) {
     let peeks = GET_MESSAGE_PREFLIGHT_PEEKS.load(Ordering::Relaxed);
+    let ready = GET_MESSAGE_PREFLIGHT_READY.load(Ordering::Relaxed);
+    let repopulated = GET_MESSAGE_EMPTY_QUEUE_REPOPULATED.load(Ordering::Relaxed);
     let parks = GET_MESSAGE_EMPTY_QUEUE_PARKS.load(Ordering::Relaxed);
     print_str(b"[wl-getmessage] preflight PeekMessage(PM_NOREMOVE) calls=");
     print_u64(peeks);
-    print_str(b" empty-queue parks (hangs prevented)=");
+    print_str(b" ready/repopulated/parked=");
+    print_u64(ready);
+    print_str(b"/");
+    print_u64(repopulated);
+    print_str(b"/");
     print_u64(parks);
     print_str(b" guard=");
     print_u64(GET_MESSAGE_EMPTY_QUEUE_GUARD as u64);
     print_str(b"\n");
     check(
         b"exec_win32k_blocking_getmessage_guarded",
-        !GET_MESSAGE_EMPTY_QUEUE_GUARD || (peeks >= 1 && parks >= 1 && peeks >= parks),
+        !GET_MESSAGE_EMPTY_QUEUE_GUARD
+            || (peeks >= 1
+                && peeks == ready.saturating_add(repopulated).saturating_add(parks)),
         passed,
     );
 }
@@ -7335,17 +7343,18 @@ pub(crate) static W32_DISPATCH_SPANNED: AtomicU64 = AtomicU64::new(0);
 /// ═══ THE BLOCKING-`NtUserGetMessage` GUARD ═══════════════════════════════════════════════════
 ///
 /// `PREFLIGHT_PEEKS` counts the non-blocking `NtUserPeekMessage(PM_NOREMOVE)` the executive issues
-/// before ever letting a blocking `NtUserGetMessage` into win32k; `EMPTY_QUEUE_PARKS` counts the
-/// times that peek came back EMPTY and the caller was parked instead. Every one of those parks is a
-/// PERMANENT system-wide hang that did not happen: win32k is driven synchronously by the
-/// single-threaded service loop, so `co_IntGetPeekMessage`'s wait would stop the whole boot AND the
-/// loop-top stall watchdog with it (measured: silent from t=310 s to the 555 s kill, `RUNEXIT=124`).
+/// before ever letting a blocking `NtUserGetMessage` into win32k. The outcome counters classify
+/// every peek as ready, safely repopulated, or parked. An unhandled empty result would be a
+/// permanent system-wide hang: win32k is driven synchronously by the single-threaded service loop,
+/// so its wait would stop both the boot and the loop-top stall watchdog.
 pub(crate) static PROFILE_FRONTIER_TRACED: AtomicU64 = AtomicU64::new(0);
 /// The guard's kill switch — the BYPASS control. `false` restores the pre-batch behaviour exactly
 /// (a blocking `NtUserGetMessage` is dispatched straight into win32k), which is a permanent
 /// system-wide hang the moment one finds an empty queue.
 pub(crate) const GET_MESSAGE_EMPTY_QUEUE_GUARD: bool = true;
 pub(crate) static GET_MESSAGE_PREFLIGHT_PEEKS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static GET_MESSAGE_PREFLIGHT_READY: AtomicU64 = AtomicU64::new(0);
+pub(crate) static GET_MESSAGE_EMPTY_QUEUE_REPOPULATED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static GET_MESSAGE_EMPTY_QUEUE_PARKS: AtomicU64 = AtomicU64::new(0);
 
 /// Record a win32k dispatch entry for the census, and tick the periodic heartbeat from inside the

@@ -1159,6 +1159,123 @@ fn memfs_streaming_snapshot_commit_matches_exported_snapshot() {
 }
 
 #[test]
+fn memfs_streaming_snapshot_repeated_mutation_round_trips_mixed_storage() {
+    const SYSTEM: &str = r"\??\C:\ReactOS\System32\Config\SYSTEM";
+    const LOG: &str = r"\??\C:\ReactOS\System32\Config\SYSTEM.LOG";
+    const SPARSE: &str = r"\??\C:\Profiles\Administrator\sparse.bin";
+    const SPARSE_LEN: u64 = 0x2_0000;
+
+    let mut fs = FileSystem::new(MemFs::new());
+    fs.provision_file_owned(SYSTEM, alloc::vec![0x11; 32 * 1024])
+        .unwrap();
+    fs.provision_file_owned(LOG, alloc::vec::Vec::new())
+        .unwrap();
+    fs.provision_file_owned(SPARSE, alloc::vec::Vec::new())
+        .unwrap();
+    for index in 0..48 {
+        let directory = alloc::format!(r"\??\C:\Profiles\User{index:02}");
+        let file = alloc::format!(r"{directory}\state.bin");
+        assert!(fs.provision_directory(&directory));
+        fs.provision_file_owned(&file, alloc::vec![index as u8; 64])
+            .unwrap();
+    }
+    assert!(fs.node_count() >= 100);
+
+    let system = fs.zw_create_file(
+        SYSTEM,
+        FILE_READ_DATA | FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(system.status, STATUS_SUCCESS);
+    let sparse = fs.zw_create_file(
+        SPARSE,
+        FILE_READ_DATA | FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(sparse.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_set_information_file(
+            sparse.handle,
+            FILE_END_OF_FILE_INFORMATION,
+            &SPARSE_LEN.to_le_bytes(),
+        ),
+        STATUS_SUCCESS
+    );
+
+    let store = SnapshotBlockStore::new(0, 1024);
+    let mut dev = MemoryBlockDevice::new(512, 1024);
+    let mut expected_log = alloc::vec::Vec::new();
+    for generation in 1u64..=12 {
+        let image = alloc::vec![generation as u8; 32 * 1024 + generation as usize * 31];
+        assert_eq!(
+            fs.replace_file_data_owned(system.handle, image.clone()),
+            STATUS_SUCCESS
+        );
+        let record = [generation as u8; 37];
+        assert_eq!(fs.append_file_by_path(LOG, &record), (STATUS_SUCCESS, 37));
+        expected_log.extend_from_slice(&record);
+        let sparse_offset = 0x1000 + generation * 0x100;
+        let marker = generation.to_le_bytes();
+        assert_eq!(
+            fs.zw_write_file(sparse.handle, Some(sparse_offset), &marker),
+            (STATUS_SUCCESS, marker.len())
+        );
+
+        assert_eq!(fs.file_bytes(SYSTEM), Some(image.as_slice()));
+        assert_eq!(
+            fs.file_bytes_owned(LOG).as_deref(),
+            Some(expected_log.as_slice())
+        );
+        if generation >= 2 {
+            assert_eq!(fs.file_bytes(LOG), None);
+        }
+
+        let expected = fs.export_volume_snapshot().unwrap();
+        let (actual_generation, bytes) = fs.commit_volume_snapshot(&store, &mut dev).unwrap();
+        assert_eq!((actual_generation, bytes), (generation, expected.len()));
+        let stored = store.read_latest(&mut dev).unwrap().unwrap();
+        assert_eq!(stored.generation, generation);
+        assert_eq!(stored.payload.as_slice(), expected.as_slice());
+
+        let (mut restored, restored_generation, restored_bytes) =
+            FileSystem::restore_volume_snapshot_from_store(&store, &mut dev)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            (restored_generation, restored_bytes),
+            (generation, expected.len())
+        );
+        assert_eq!(restored.file_bytes(SYSTEM), Some(image.as_slice()));
+        assert_eq!(
+            restored.file_bytes_owned(LOG).as_deref(),
+            Some(expected_log.as_slice())
+        );
+        assert_eq!(restored.file_len(SPARSE), Some(SPARSE_LEN));
+        let restored_sparse = restored.zw_create_file(
+            SPARSE,
+            FILE_READ_DATA,
+            0,
+            0,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE,
+        );
+        assert_eq!(restored_sparse.status, STATUS_SUCCESS);
+        assert_eq!(
+            restored
+                .zw_read_file(restored_sparse.handle, Some(sparse_offset), marker.len())
+                .1,
+            marker
+        );
+    }
+}
+
+#[test]
 fn ntfile_hive_provider_installs_primary_image_by_replace_rename() {
     let fs = RefCell::new(FileSystem::new(MemFs::with_fixture()));
     let mut provider = NtFileHiveIoProvider::open(&fs, SYSTEM_HIVE);

@@ -543,7 +543,8 @@ impl MemFs {
     /// intentionally not part of the image; a restored boot reopens files through normal Zw paths.
     pub fn to_snapshot(&self) -> Result<Vec<u8>, MemFsSnapshotError> {
         let mut record_count = 0u32;
-        let payload_len = self.measure_snapshot_children(0, "", &mut record_count)?;
+        let mut path = String::new();
+        let payload_len = self.measure_snapshot_children(0, &mut path, &mut record_count)?;
 
         let mut out = Vec::new();
         let total_len = MEMFS_SNAPSHOT_HEADER_LEN
@@ -553,7 +554,7 @@ impl MemFs {
             .map_err(|_| MemFsSnapshotError::OutOfMemory)?;
         out.resize(MEMFS_SNAPSHOT_HEADER_LEN, 0);
         let mut written_records = 0u32;
-        self.write_snapshot_children(0, "", &mut out, &mut written_records)?;
+        self.write_snapshot_children(0, &mut path, &mut out, &mut written_records)?;
         if written_records != record_count || out.len() != total_len {
             return Err(MemFsSnapshotError::InvalidRecord);
         }
@@ -683,20 +684,13 @@ impl MemFs {
         store: &SnapshotBlockStore,
         dev: &mut D,
     ) -> Result<(u64, usize), SnapshotBlockStoreError> {
-        let mut record_count = 0u32;
-        let payload_len = self
-            .measure_snapshot_children(0, "", &mut record_count)
-            .map_err(snapshot_error_to_store_error)?;
+        let mut payload_crc_sink = SnapshotCrcSink::new();
+        let record_count = self.write_snapshot_payload_to_sink(&mut payload_crc_sink)?;
+        let (payload_crc, payload_written) = payload_crc_sink.finish();
+        let payload_len = payload_written;
         let total_len = MEMFS_SNAPSHOT_HEADER_LEN
             .checked_add(payload_len)
             .ok_or(SnapshotBlockStoreError::Corrupt)?;
-
-        let mut payload_crc_sink = SnapshotCrcSink::new();
-        let written_records = self.write_snapshot_payload_to_sink(&mut payload_crc_sink)?;
-        let (payload_crc, payload_written) = payload_crc_sink.finish();
-        if written_records != record_count || payload_written != payload_len {
-            return Err(SnapshotBlockStoreError::Corrupt);
-        }
 
         let payload_len_u64 =
             u64::try_from(payload_len).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
@@ -733,7 +727,7 @@ impl MemFs {
     fn write_snapshot_children(
         &self,
         parent: u64,
-        prefix: &str,
+        path: &mut String,
         out: &mut Vec<u8>,
         record_count: &mut u32,
     ) -> Result<(), MemFsSnapshotError> {
@@ -747,22 +741,22 @@ impl MemFs {
             let Some(child) = self.node(*child_id) else {
                 return Err(MemFsSnapshotError::InvalidRecord);
             };
-            let mut path = String::new();
-            let extra_sep = usize::from(!prefix.is_empty());
-            path.try_reserve_exact(prefix.len() + extra_sep + name.len())
+            let prefix_len = path.len();
+            let extra_sep = usize::from(prefix_len != 0);
+            path.try_reserve_exact(extra_sep + name.len())
                 .map_err(|_| MemFsSnapshotError::OutOfMemory)?;
-            path.push_str(prefix);
-            if !prefix.is_empty() {
+            if prefix_len != 0 {
                 path.push('\\');
             }
             path.push_str(name);
-            self.write_snapshot_record(&path, child, out)?;
+            self.write_snapshot_record(path, child, out)?;
             *record_count = record_count
                 .checked_add(1)
                 .ok_or(MemFsSnapshotError::InvalidRecord)?;
             if child.is_dir {
-                self.write_snapshot_children(*child_id, &path, out, record_count)?;
+                self.write_snapshot_children(*child_id, path, out, record_count)?;
             }
+            path.truncate(prefix_len);
         }
         Ok(())
     }
@@ -772,14 +766,15 @@ impl MemFs {
         sink: &mut S,
     ) -> Result<u32, SnapshotBlockStoreError> {
         let mut record_count = 0u32;
-        self.write_snapshot_children_to_sink(0, "", sink, &mut record_count)?;
+        let mut path = String::new();
+        self.write_snapshot_children_to_sink(0, &mut path, sink, &mut record_count)?;
         Ok(record_count)
     }
 
     fn write_snapshot_children_to_sink<S: SnapshotPayloadSink>(
         &self,
         parent: u64,
-        prefix: &str,
+        path: &mut String,
         sink: &mut S,
         record_count: &mut u32,
     ) -> Result<(), SnapshotBlockStoreError> {
@@ -793,22 +788,22 @@ impl MemFs {
             let Some(child) = self.node(*child_id) else {
                 return Err(SnapshotBlockStoreError::Corrupt);
             };
-            let mut path = String::new();
-            let extra_sep = usize::from(!prefix.is_empty());
-            path.try_reserve_exact(prefix.len() + extra_sep + name.len())
+            let prefix_len = path.len();
+            let extra_sep = usize::from(prefix_len != 0);
+            path.try_reserve_exact(extra_sep + name.len())
                 .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
-            path.push_str(prefix);
-            if !prefix.is_empty() {
+            if prefix_len != 0 {
                 path.push('\\');
             }
             path.push_str(name);
-            self.write_snapshot_record_to_sink(&path, child, sink)?;
+            self.write_snapshot_record_to_sink(path, child, sink)?;
             *record_count = record_count
                 .checked_add(1)
                 .ok_or(SnapshotBlockStoreError::Corrupt)?;
             if child.is_dir {
-                self.write_snapshot_children_to_sink(*child_id, &path, sink, record_count)?;
+                self.write_snapshot_children_to_sink(*child_id, path, sink, record_count)?;
             }
+            path.truncate(prefix_len);
         }
         Ok(())
     }
@@ -816,7 +811,7 @@ impl MemFs {
     fn measure_snapshot_children(
         &self,
         parent: u64,
-        prefix: &str,
+        path: &mut String,
         record_count: &mut u32,
     ) -> Result<usize, MemFsSnapshotError> {
         let Some(node) = self.node(parent) else {
@@ -830,26 +825,26 @@ impl MemFs {
             let Some(child) = self.node(*child_id) else {
                 return Err(MemFsSnapshotError::InvalidRecord);
             };
-            let mut path = String::new();
-            let extra_sep = usize::from(!prefix.is_empty());
-            path.try_reserve_exact(prefix.len() + extra_sep + name.len())
+            let prefix_len = path.len();
+            let extra_sep = usize::from(prefix_len != 0);
+            path.try_reserve_exact(extra_sep + name.len())
                 .map_err(|_| MemFsSnapshotError::OutOfMemory)?;
-            path.push_str(prefix);
-            if !prefix.is_empty() {
+            if prefix_len != 0 {
                 path.push('\\');
             }
             path.push_str(name);
             total = total
-                .checked_add(self.snapshot_record_len(&path, child)?)
+                .checked_add(self.snapshot_record_len(path, child)?)
                 .ok_or(MemFsSnapshotError::InvalidRecord)?;
             *record_count = record_count
                 .checked_add(1)
                 .ok_or(MemFsSnapshotError::InvalidRecord)?;
             if child.is_dir {
                 total = total
-                    .checked_add(self.measure_snapshot_children(*child_id, &path, record_count)?)
+                    .checked_add(self.measure_snapshot_children(*child_id, path, record_count)?)
                     .ok_or(MemFsSnapshotError::InvalidRecord)?;
             }
+            path.truncate(prefix_len);
         }
         Ok(total)
     }

@@ -10945,3 +10945,51 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Fold or delete the older `nt-kernel-exec::CompletionTracker` once no production path uses it.
     First, close the common durable-state finalizer hole above and add a repeated snapshot/mutation
     regression so a transient allocator scope cannot invalidate persistent filesystem ownership.
+
+    Durable service-loop and snapshot checkpoint (2026-08-24): durable executive state is now
+    finalized through one `finalize_service_loop_durable_state` path before every allocator rewind.
+    The normal service-loop tail and all four post-action no-reply edges use it: successful and
+    failed current-thread continuation, current-thread termination, and drop-reply process
+    termination. A last mapped-section writeback can therefore grow persistent MemFs or registry
+    state without leaving the old heap mark behind when control immediately returns to receive.
+
+    MemFs snapshot construction now reuses one path buffer throughout recursive traversal and makes
+    three tree walks instead of four: sizing, CRC/count, then encoding. The on-disk format and CRC
+    coverage are unchanged. A repeated mixed-storage regression mutates and commits twelve
+    generations over more than one hundred nodes, including owned bytes, an extent-backed append
+    log, and a sparse file; it compares streamed snapshots byte-for-byte and restores every final
+    payload. All `nt-fs` tests pass (`64/64`), and the freestanding release executive builds and
+    stages at the existing 212-warning baseline.
+
+    The historical GetMessage gate no longer requires a particular queue schedule to produce an
+    empty park. Every guarded preflight is instead classified exactly as immediately ready,
+    second-SAS repopulated, or genuinely parked, and the gate requires the total to equal the number
+    of preflights. This preserves the real empty-queue block while rejecting any unclassified or
+    bypassed request. Serialized desktop proof `.tmp/run-desktop-20260824-091622.log` is accepted for
+    the integrated tree: generation 5 commits 822,142 bytes, the guard accounts for all 17
+    preflights (`11 + 0 + 6`), genuine userinit and Explorer launch, and Explorer completes 668 real
+    api0 callbacks with zero callback failures. Paint reaches 5 BeginPaint, 20 EndPaint, 187 direct
+    GDI returns, and 135 batch flushes carrying 184 records. All 786,432 framebuffer pixels are
+    non-background with at least 32 colors; all `293/293` checks pass and the sentinel is emitted.
+    The earlier CRC-read fault has not recurred in the subsequent complete desktop runs. The real
+    allocator-lifetime hole is closed, but the absence of recurrence is not claimed as proof that it
+    caused that one fault.
+
+    Review adjustment: durable service-loop finalization and repeated snapshot ownership are closed.
+    The next deletion-oriented checkpoint is canonical device-stack identity. First extend the
+    host-tested I/O Manager model so `IrpProjection` is sourced exclusively from the current
+    `IO_STACK_LOCATION` and carries its exact `DriverId`, `DeviceId`, and stack index. Preserve an
+    immutable origin identity separately from the mutable current dispatch/completion owner, route
+    open/read/write/close/external requests through the canonical top attached device, and permit
+    exact lower-driver pending completion and cancellation. Prove a three-driver stack, lower async
+    completion/cancel, top-related-device resolution, and rejection of mixed header/current-stack
+    fields before executive integration.
+
+    Then introduce a stable hosted-domain identity and scope every compatibility pointer as
+    `(domain, address) -> DriverId/DeviceId`. Carry domain, provider instance/cookie, canonical IDs,
+    and current stack location in one verified component dispatch envelope. Make
+    `IoGetRelatedDeviceObject` resolve File to canonical device to top-of-stack. Once that path is
+    live, delete global raw-pointer routing, direct raw root-PDO dispatch, partial-known attach
+    success fallbacks, the singular per-driver device fields, and the aliased shared request slot.
+    Finally move remaining component harnesses to the canonical unwinder and remove the unused
+    `nt-kernel-exec::CompletionTracker`; do not retain it as a parallel completion model.

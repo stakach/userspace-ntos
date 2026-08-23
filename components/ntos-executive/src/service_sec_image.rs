@@ -1403,6 +1403,111 @@ fn pin_generic_section_growth_if_dirty(heap_mark: &mut usize) {
     }
 }
 
+/// Preserve every service-loop allocation that became durable during the current dispatch.
+///
+/// Post-actions can receive the next caller without reaching the normal syscall tail. They must run
+/// this same finalizer first; otherwise the next iteration's allocator rewind can reclaim live
+/// registry, process, section, or writable-filesystem storage.
+fn finalize_service_loop_durable_state(
+    nt_handler: &mut ExecNtHandler,
+    heap_mark: &mut usize,
+) -> u32 {
+    if nt_handler.overlay_dirty {
+        nt_handler.overlay_dirty = false;
+        pin_durable_heap_mark(heap_mark);
+    }
+    if nt_handler.mutable_hives_dirty {
+        let _alloc_scope = allocator::enter_scope(b"service-loop-mutable-hives");
+        nt_handler.mutable_hives_dirty = false;
+        pin_durable_heap_mark(heap_mark);
+    }
+    if nt_handler.registry_services_order_cache_dirty {
+        nt_handler.registry_services_order_cache_dirty = false;
+        pin_durable_heap_mark(heap_mark);
+    }
+    if nt_handler.registry_virtual_roots_dirty {
+        nt_handler.registry_virtual_roots_dirty = false;
+        pin_durable_heap_mark(heap_mark);
+    }
+    if nt_handler.hosted_exe_dirty {
+        let _alloc_scope = allocator::enter_scope(b"service-loop-hosted-exe");
+        nt_handler.hosted_exe_dirty = false;
+        pin_durable_heap_mark(heap_mark);
+    }
+    if nt_handler.token_dirty {
+        nt_handler.token_dirty = false;
+        pin_durable_heap_mark(heap_mark);
+    }
+    if nt_handler.process_dirty {
+        let _alloc_scope = allocator::enter_scope(b"service-loop-process-state");
+        nt_handler.process_dirty = false;
+        pin_durable_heap_mark(heap_mark);
+    }
+    if nt_handler.lpc_connections_dirty {
+        nt_handler.lpc_connections_dirty = false;
+        pin_durable_heap_mark(heap_mark);
+    }
+    if nt_handler.user_timers_dirty {
+        nt_handler.user_timers_dirty = false;
+        pin_durable_heap_mark(heap_mark);
+    }
+    if take_object_namespace_growth_dirty() {
+        pin_durable_heap_mark(heap_mark);
+    }
+    pin_durable_table_growth_if_dirty(heap_mark);
+    pin_generic_section_growth_if_dirty(heap_mark);
+    if nt_handler.hive_mounts_dirty {
+        let _alloc_scope = allocator::enter_scope(b"service-loop-hive-mounts");
+        nt_handler.hive_mounts_dirty = false;
+        pin_durable_heap_mark(heap_mark);
+    }
+
+    let writable_fs_mount_dirty = crate::writable_fs::take_mount_dirty();
+    let writable_fs_runtime_dirty = crate::writable_fs::take_runtime_dirty();
+    let writable_fs_touched = nt_handler.writable_fs_dirty
+        || writable_fs_mount_dirty
+        || writable_fs_runtime_dirty;
+    let mut checkpoint_status = nt_fs::STATUS_SUCCESS;
+    if writable_fs_touched {
+        let _alloc_scope = allocator::enter_scope(b"service-loop-writable-fs");
+        nt_handler.writable_fs_dirty = false;
+        pin_durable_heap_mark(heap_mark);
+        if crate::writable_fs::snapshot_restore_seen()
+            && nt_handler.refresh_boot_hive_checkpoints_from_writable_config()
+        {
+            nt_handler.hive_mounts_dirty = false;
+            pin_durable_heap_mark(heap_mark);
+        }
+        if nt_handler.writable_fs_commit_required {
+            let checkpoint_mark = allocator::mark();
+            checkpoint_status = {
+                let _alloc_ctx =
+                    allocator::enter_context(allocator::ALLOC_CTX_WRITABLE_SNAPSHOT);
+                unsafe { crate::writable_fs::checkpoint_dirty_volume() }
+            };
+            unsafe { allocator::reset_to(checkpoint_mark) };
+            if checkpoint_status != nt_fs::STATUS_SUCCESS {
+                print_str(b"[writable-fs-snapshot] service-loop checkpoint status=0x");
+                print_hex(checkpoint_status);
+                print_str(b"\n");
+            } else {
+                nt_handler.complete_committed_mutable_hive_journal_snapshot(b"service-loop");
+            }
+        }
+    }
+    nt_handler.writable_fs_commit_required = false;
+
+    if take_shared_image_mapping_dirty()
+        || take_dll_cache_dirty()
+        || take_service_dll_arena_paging_dirty()
+        || take_service_dll_pe_store_dirty()
+    {
+        pin_durable_heap_mark(heap_mark);
+    }
+    pin_durable_table_growth_if_dirty(heap_mark);
+    checkpoint_status
+}
+
 fn checkpoint_boot_hives_at_quiesce(nt_handler: &mut ExecNtHandler) -> u32 {
     if !unsafe { crate::writable_fs::writable_fs_mounted() } {
         return nt_fs::STATUS_SUCCESS;
@@ -9306,6 +9411,10 @@ pub(crate) unsafe fn service_sec_image(
                             procs[pi].first = first;
                             procs[pi].ntfaults = ntfaults;
                             pfilled[pi] = *filled_pages;
+                            let _ = finalize_service_loop_durable_state(
+                                &mut nt_handler,
+                                &mut heap_mark,
+                            );
                             let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                             let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                             badge = nb;
@@ -9333,6 +9442,10 @@ pub(crate) unsafe fn service_sec_image(
                             procs[pi].first = first;
                             procs[pi].ntfaults = ntfaults;
                             pfilled[pi] = *filled_pages;
+                            let _ = finalize_service_loop_durable_state(
+                                &mut nt_handler,
+                                &mut heap_mark,
+                            );
                             let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                             let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                             badge = nb;
@@ -9371,6 +9484,8 @@ pub(crate) unsafe fn service_sec_image(
                         procs[pi].first = first;
                         procs[pi].ntfaults = ntfaults;
                         pfilled[pi] = *filled_pages;
+                        let _ =
+                            finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                         let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                         if trace_index < 8 {
                             crate::win32k_glue::trace_hosted_tcb_debug_state(
@@ -9479,6 +9594,10 @@ pub(crate) unsafe fn service_sec_image(
                             procs[pi].first = first;
                             procs[pi].ntfaults = ntfaults;
                             pfilled[pi] = *filled_pages;
+                            let _ = finalize_service_loop_durable_state(
+                                &mut nt_handler,
+                                &mut heap_mark,
+                            );
                             let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                             let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                             badge = nb;
@@ -9509,121 +9628,11 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     ExecPostAction::None => {}
                 }
-                // CM write plane: a handler that mutated the registry overlay (NtCreateKey/
-                // NtSetValueKey) allocated `String`/`Vec` on the bump heap ABOVE `heap_mark`. Pin the
-                // mark PAST them now so the next iteration's `reset_to(heap_mark)` keeps them (real
-                // NT: created keys/values persist). The mark also swallows this iteration's transient
-                // allocations — a bounded leak (only a handful of overlay mutations per boot), well
-                // within the 2 MiB heap; non-mutating iterations still reset fully.
-                if nt_handler.overlay_dirty {
-                    nt_handler.overlay_dirty = false;
-                    pin_durable_heap_mark(&mut heap_mark);
+                let durable_status =
+                    finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
+                if durable_status != nt_fs::STATUS_SUCCESS {
+                    result = durable_status as u64;
                 }
-                if nt_handler.mutable_hives_dirty {
-                    let _alloc_scope = allocator::enter_scope(b"service-loop-mutable-hives");
-                    nt_handler.mutable_hives_dirty = false;
-                    pin_durable_heap_mark(&mut heap_mark);
-                }
-                if nt_handler.registry_services_order_cache_dirty {
-                    nt_handler.registry_services_order_cache_dirty = false;
-                    pin_durable_heap_mark(&mut heap_mark);
-                }
-                if nt_handler.registry_virtual_roots_dirty {
-                    nt_handler.registry_virtual_roots_dirty = false;
-                    pin_durable_heap_mark(&mut heap_mark);
-                }
-                // Dynamic hosted-EXE plane: NtOpenFile can admit a new executable from disk for a
-                // later NtCreateSection/NtCreateProcessEx. Its pool bytes are reset-safe, but the
-                // parsed PE section table and owned image catalog state are bump-allocated loop
-                // metadata. Pin them before the next per-syscall reset so the process can fault its
-                // main image just like a bootstrap image.
-                if nt_handler.hosted_exe_dirty {
-                    let _alloc_scope = allocator::enter_scope(b"service-loop-hosted-exe");
-                    nt_handler.hosted_exe_dirty = false;
-                    pin_durable_heap_mark(&mut heap_mark);
-                }
-                if nt_handler.token_dirty {
-                    nt_handler.token_dirty = false;
-                    pin_durable_heap_mark(&mut heap_mark);
-                }
-                if nt_handler.process_dirty {
-                    let _alloc_scope = allocator::enter_scope(b"service-loop-process-state");
-                    nt_handler.process_dirty = false;
-                    pin_durable_heap_mark(&mut heap_mark);
-                }
-                if nt_handler.lpc_connections_dirty {
-                    nt_handler.lpc_connections_dirty = false;
-                    pin_durable_heap_mark(&mut heap_mark);
-                }
-                if nt_handler.user_timers_dirty {
-                    nt_handler.user_timers_dirty = false;
-                    pin_durable_heap_mark(&mut heap_mark);
-                }
-                if take_object_namespace_growth_dirty() {
-                    pin_durable_heap_mark(&mut heap_mark);
-                }
-                pin_durable_table_growth_if_dirty(&mut heap_mark);
-                pin_generic_section_growth_if_dirty(&mut heap_mark);
-                // HIVE MOUNT plane: `NtLoadKey`/`NtUnloadKey` grew the `\Registry\User` mount
-                // table's path `String`s and the mutable hive import arena above `heap_mark`. Same
-                // contract as `overlay_dirty` — a mounted hive must outlive the syscall that
-                // mounted it. (The source regf BYTES live in a static slot; the mutable cells own
-                // their runtime strings/value data.)
-                if nt_handler.hive_mounts_dirty {
-                    let _alloc_scope = allocator::enter_scope(b"service-loop-hive-mounts");
-                    nt_handler.hive_mounts_dirty = false;
-                    pin_durable_heap_mark(&mut heap_mark);
-                }
-                // WRITABLE FILESYSTEM plane: a handler that touched the writable overlay
-                // (`writable_fs`) — its lazy mount, or a create/write/set-information/close — grew
-                // the volume's `Vec`/`String` state ABOVE `heap_mark`. Pin the mark PAST it so the
-                // directories and files a hosted process created SURVIVE the next per-syscall
-                // reset. Exactly the `overlay_dirty` contract, for the file system instead of the
-                // registry; bounded (the profile tree is a handful of nodes) and only on the
-                // iterations that actually touched the volume.
-                let writable_fs_mount_dirty = crate::writable_fs::take_mount_dirty();
-                let writable_fs_runtime_dirty = crate::writable_fs::take_runtime_dirty();
-                let writable_fs_touched = nt_handler.writable_fs_dirty
-                    || writable_fs_mount_dirty
-                    || writable_fs_runtime_dirty;
-                if writable_fs_touched {
-                    let _alloc_scope = allocator::enter_scope(b"service-loop-writable-fs");
-                    nt_handler.writable_fs_dirty = false;
-                    pin_durable_heap_mark(&mut heap_mark);
-                    if crate::writable_fs::snapshot_restore_seen()
-                        && nt_handler.refresh_boot_hive_checkpoints_from_writable_config()
-                    {
-                        nt_handler.hive_mounts_dirty = false;
-                        pin_durable_heap_mark(&mut heap_mark);
-                    }
-                    if nt_handler.writable_fs_commit_required {
-                        let checkpoint_mark = allocator::mark();
-                        let snapshot_status = {
-                            let _alloc_ctx =
-                                allocator::enter_context(allocator::ALLOC_CTX_WRITABLE_SNAPSHOT);
-                            crate::writable_fs::checkpoint_dirty_volume()
-                        };
-                        unsafe { allocator::reset_to(checkpoint_mark) };
-                        if snapshot_status != nt_fs::STATUS_SUCCESS {
-                            print_str(b"[writable-fs-snapshot] service-loop checkpoint status=0x");
-                            print_hex(snapshot_status);
-                            print_str(b"\n");
-                            result = snapshot_status as u64;
-                        } else {
-                            nt_handler
-                                .complete_committed_mutable_hive_journal_snapshot(b"service-loop");
-                        }
-                    }
-                }
-                nt_handler.writable_fs_commit_required = false;
-                if take_shared_image_mapping_dirty()
-                    || take_dll_cache_dirty()
-                    || take_service_dll_arena_paging_dirty()
-                    || take_service_dll_pe_store_dirty()
-                {
-                    pin_durable_heap_mark(&mut heap_mark);
-                }
-                pin_durable_table_growth_if_dirty(&mut heap_mark);
                 // PROFILE FRONTIER (batch 58): once winlogon has resolved the profiles root, trace
                 // every NATIVE syscall of its that FAILS, with the SSN and the NTSTATUS. `userenv`
                 // only ever prints `GetLastError()`, and several distinct NTSTATUSes collapse onto
@@ -10697,7 +10706,7 @@ pub(crate) unsafe fn service_sec_image(
                             .pm_main_tid_for_pi(pi)
                             .map(u64::from)
                             .unwrap_or(0);
-                        if !post_winlogon_second_sas_after_welcome_drain(
+                        if post_winlogon_second_sas_after_welcome_drain(
                             pi,
                             badge,
                             current_tid,
@@ -10712,6 +10721,8 @@ pub(crate) unsafe fn service_sec_image(
                             scratch_base,
                             win32k_token_context(&nt_handler, pi),
                         ) {
+                            GET_MESSAGE_EMPTY_QUEUE_REPOPULATED.fetch_add(1, Ordering::Relaxed);
+                        } else {
                             let n = GET_MESSAGE_EMPTY_QUEUE_PARKS.fetch_add(1, Ordering::Relaxed);
                             let queue_event_body = if shell_gui_client {
                                 win32k_subsystem::current_thread_queue_event_body().unwrap_or(0)
@@ -10792,6 +10803,8 @@ pub(crate) unsafe fn service_sec_image(
                                 wl_park_defer_quiesce = defer;
                             }
                         }
+                    } else {
+                        GET_MESSAGE_PREFLIGHT_READY.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 // Tell win32k_dispatch WHICH client this call belongs to (csrss pi 1 / winlogon pi 2 /
