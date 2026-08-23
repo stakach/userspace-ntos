@@ -10223,3 +10223,29 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     non-special FSCTL, query/set information, and flush paths to transfer every STATUS_PENDING IrpId
     into it. Specialized pipe read/write/transceive/listen records remain only for their endpoint
     progress triggers and must retain the same exact publication/ACK contract.
+
+    Generic pending File-I/O executive checkpoint (2026-08-23): the component now owns one durable
+    `PendingFileIoTable`, reserved before the service-loop heap watermark and redriven from the common
+    hosted-completion pump. Completion lookup validates IrpId, canonical FileId, requestor TID, and
+    major function before publishing anything. Terminal delivery is resumable and ordered: bounded
+    output copy, IOSB, explicit event or synchronous File signal, APC xor IOCP, synchronous syscall
+    reply, backend ACK, record retirement, and final File-reference release. Publication and reply
+    ownership are generation-exact, partially delivered records survive retry, current-thread/File
+    cancellation includes the generic table, and thread teardown abandons the exact backend IRP and
+    releases all transferred ownership. `NtFlushBuffersFile` is the first migrated syscall: it
+    reserves delivery capacity and reply ownership before dispatch, retains the canonical File,
+    leaves the caller's IOSB untouched on `STATUS_PENDING`, and parks even for an asynchronous File
+    object because the NT API itself is synchronous.
+
+    Host validation is green for `cargo fmt --all`, `cargo test -p nt-io-manager` (`161/161`), the
+    freestanding executive check, and `git diff --check`. Serialized desktop proof
+    `.tmp/run-desktop-20260823-175717.log` is accepted as a regression gate: userinit and Explorer
+    launch dynamically, Explorer completes 668 api0 callbacks without callback failures, all
+    786,432 framebuffer pixels are non-background with at least 32 colors, `293/293` checks pass,
+    and the sentinel is emitted. The live desktop workload's four ordinary `NtFlushBuffersFile`
+    calls completed synchronously, so this run does not claim production exercise of the new
+    generic pending-FLUSH publisher; the existing exact NPFS pending-FLUSH gate still passes through
+    its specialized retained-completion owner. Review adjustment: preserve that distinction and
+    migrate the always-synchronous query/set-information APIs next, then device control and ordinary
+    FSCTL. Once those owners are green, fold the specialized transceive/listen records onto the same
+    terminal publisher while retaining only their endpoint-specific progress triggers.

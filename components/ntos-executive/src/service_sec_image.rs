@@ -4,6 +4,9 @@
 use crate::*;
 
 static PIPE_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
+pub(crate) static FILE_IO_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
+static FILE_IO_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
+static mut FILE_IO_COPY_WORK: [u8; 4096] = [0; 4096];
 static CALLBACK_MESSAGE_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) const SEC_IMAGE_FAULT_CAP: u64 = 15000;
@@ -8939,6 +8942,7 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_io_completion_apc_out: u64 = 0;
             let mut park_io_completion_iosb_out: u64 = 0;
             let mut park_io_completion_deadline: Option<u64> = None;
+            let mut park_pending_file_io: Option<nt_io_manager::PendingFileIo> = None;
             // BATCH 33 — pipe-pending park request latched from the handler (0 = none). Consumed at the
             // reply site (the reply-cap steal needs resume_ip/sp/flags, known there).
             let mut park_pipe_file_id: u64 = 0;
@@ -9056,6 +9060,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.io_completion_timeout = PendingWaitTimeout::none();
                 nt_handler.io_completion_wake = None;
                 nt_handler.io_signal_event = -1;
+                nt_handler.pending_file_io_park = None;
                 nt_handler.pipe_park_file_id = 0;
                 nt_handler.pipe_park_fid = 0;
                 nt_handler.pipe_park_irp_id = 0;
@@ -9728,6 +9733,9 @@ pub(crate) unsafe fn service_sec_image(
                 if nt_handler.io_signal_event >= 0 {
                     let _ = wait_wake_dispatcher_set(&mut nt_handler);
                 }
+                if nt_handler.pending_file_io_park.is_some() {
+                    park_pending_file_io = nt_handler.pending_file_io_park.take();
+                }
                 if nt_handler.user_timer_rearm_requested {
                     delay_timer_rearm(delay_queue);
                 }
@@ -9766,6 +9774,11 @@ pub(crate) unsafe fn service_sec_image(
                     park_pipe_name_wait_timeout = nt_handler.pipe_name_wait_timeout;
                 }
                 let hosted_io_progress = driver_launch::pump_hosted_io_completions();
+                if hosted_io_progress != 0
+                    || FILE_IO_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel)
+                {
+                    let _ = pending_file_io_redrive_all(&mut nt_handler);
+                }
                 // ★ BATCH 34: a client CONNECT to a pipe completes the exact async server
                 // FSCTL_PIPE_LISTEN for the accepted CCB's server end. Only a CONNECT (not a write)
                 // completes a listen; writes re-drive parked reads once the connection exists.
@@ -15947,6 +15960,42 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     print_str(b"[wait] array park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n");
                     result = 0xC000_009A;
+                }
+            }
+            // A synchronous general File API waits on its exact canonical IRP even when the File
+            // object itself was opened asynchronously. Transfer this reply before the specialized
+            // endpoint waiters so every non-pipe-major completion uses one broker.
+            if let Some(pending) = park_pending_file_io.take() {
+                if pending_file_io_park(pending, resume_ip, sp, flags) {
+                    // The manager may already hold the terminal result (for example a completion
+                    // published during the post-dispatch pump before reply ownership moved here).
+                    let delivered = pending_file_io_redrive_all(&mut nt_handler);
+                    if delivered == 0 {
+                        trace_indefinite_wait_park(
+                            &nt_handler,
+                            badge,
+                            live_top_badges(&nt_handler),
+                            crash_parked,
+                            wait_parked,
+                        );
+                        mark_wait_parked!(pi, resume_ip);
+                    }
+                    pin_durable_table_growth_if_dirty(&mut heap_mark);
+                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                    badge = nb;
+                    mi = nmi;
+                    m0 = nm0;
+                    m1 = nm1;
+                    m2 = nm2;
+                    m3 = nm3;
+                    continue;
+                }
+                let _ = driver_launch::abandon_pending_irp(pending.irp_id);
+                nt_handler.release_file_reference(pending.file_id);
+                result = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES as u64;
+                if pending.iosb_va != 0 {
+                    let _ = nt_handler.write_current_iosb(pending.iosb_va, result as u32, 0);
                 }
             }
             // BATCH 33 — PIPE-PENDING PARK: a real npfs pipe read / TRANSCEIVE returned STATUS_PENDING
@@ -22741,6 +22790,38 @@ unsafe fn lsa_deliver_reply(nt_handler: &mut ExecNtHandler, replymsg: u64) -> bo
     true
 }
 
+/// Transfer a synchronous general File syscall's reply into its exact pending-IRP delivery owner.
+unsafe fn pending_file_io_park(
+    mut pending: nt_io_manager::PendingFileIo,
+    resume_ip: u64,
+    sp: u64,
+    flags: u64,
+) -> bool {
+    let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    if stolen == 0 {
+        return false;
+    }
+    let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
+        return false;
+    };
+    pending.reply_cap = stolen;
+    pending.reply_required = true;
+    pending.resume_ip = resume_ip;
+    pending.resume_sp = sp;
+    pending.resume_flags = flags;
+    let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
+    let old_capacity = table.capacity();
+    if table.park(pending).is_none() {
+        return false;
+    }
+    if table.capacity() != old_capacity {
+        mark_durable_table_growth_dirty();
+    }
+    wait_reply_pool_mark_used(fresh_index);
+    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    true
+}
+
 /// BATCH 33 — PARK a caller whose npfs pipe read returned STATUS_PENDING. Mirrors the event
 /// `wait_park_multi` reply-cap steal EXACTLY (steal the active REPLY_MAIN, rotate a fresh pool object
 /// into REPLY_MAIN so the next recv binds a new object), but records the wait in the PipeWaiterTable
@@ -22936,6 +23017,294 @@ unsafe fn pipe_name_wait_complete_named(nt_handler: &mut ExecNtHandler, name_has
         }
     }
     woken
+}
+
+/// Publish terminal results for general pending File IRPs in NT completion order. The backend
+/// completion remains retained until every required surface and synchronous reply is visible.
+unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
+    let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
+    let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
+    let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
+    let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
+    let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
+    let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
+    let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+    let saved_pi = nt_handler.pi;
+    let saved_ctx = nt_handler.loop_ctx.take();
+    macro_rules! restore_file_io_mirrors {
+        () => {{
+            ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
+            ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
+            ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
+            ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
+            ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
+            ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
+            ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
+            nt_handler.pi = saved_pi;
+        }};
+    }
+
+    let snapshot: alloc::vec::Vec<_> = (&*core::ptr::addr_of!(PENDING_FILE_IO))
+        .drain_all()
+        .collect();
+    let mut delivered = 0u64;
+    for (slot, pending) in snapshot {
+        let Some(completed) = driver_launch::completed_irp_exact(pending.irp_id) else {
+            if driver_launch::completed_irp_copy_requires_retry(pending.irp_id) {
+                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+            }
+            continue;
+        };
+        if !(&*core::ptr::addr_of!(PENDING_FILE_IO)).matches_completion_exact(
+            slot,
+            pending.irp_id,
+            completed.file_id,
+            completed.requestor_tid,
+            completed.major,
+        ) {
+            panic!("pending File completion identity mismatch");
+        }
+
+        let (sb, ss, smv, hmv, imv, scratch_base) =
+            mirror_ctx_for(pending.badge, pending.pi as usize);
+        ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
+        ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
+        ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
+        ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
+        ACTIVE_IMAGE_MIRROR.store(imv, Ordering::Relaxed);
+        ACTIVE_CLIENT_PI.store(pending.pi as u64, Ordering::Relaxed);
+        ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
+        nt_handler.pi = pending.pi as usize;
+
+        let mut delivery_state = (&*core::ptr::addr_of!(PENDING_FILE_IO))
+            .get(slot)
+            .expect("pending File owner disappeared")
+            .delivery_state;
+        if pending.output_va != 0
+            && pending.output_len != 0
+            && delivery_state & nt_io_manager::IO_DELIVERY_BUFFER_PUBLISHED == 0
+        {
+            let delivery_len = if completed.status & 0xC000_0000 == 0xC000_0000 {
+                0
+            } else {
+                u32::try_from(completed.information)
+                    .ok()
+                    .filter(|length| *length <= pending.output_len)
+                    .expect("terminal File output exceeds delivery target")
+            };
+            let mut offset = (&*core::ptr::addr_of!(PENDING_FILE_IO))
+                .get(slot)
+                .expect("pending File output owner disappeared")
+                .output_offset;
+            let mut copy_failed = false;
+            while offset < delivery_len {
+                let chunk = ((delivery_len - offset) as usize).min(4096);
+                let work = &mut *core::ptr::addr_of_mut!(FILE_IO_COPY_WORK);
+                let copied = match driver_launch::copy_completed_irp_output_exact(
+                    pending.irp_id,
+                    offset as u64,
+                    &mut work[..chunk],
+                ) {
+                    Ok(copied) if copied != 0 => copied,
+                    _ => {
+                        copy_failed = true;
+                        break;
+                    }
+                };
+                if !nt_handler.xas_try_write_buf(
+                    pending.output_va + offset as u64,
+                    &work[..copied],
+                ) {
+                    copy_failed = true;
+                    break;
+                }
+                offset = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                    .advance_output_exact(
+                        slot,
+                        pending.irp_id,
+                        copied as u32,
+                        delivery_len,
+                    )
+                    .expect("pending File output progress lost");
+            }
+            if delivery_len == 0 {
+                (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                    .advance_output_exact(slot, pending.irp_id, 0, 0)
+                    .expect("pending File empty output owner disappeared");
+            }
+            if copy_failed {
+                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                restore_file_io_mirrors!();
+                continue;
+            }
+            delivery_state = (&*core::ptr::addr_of!(PENDING_FILE_IO))
+                .get(slot)
+                .expect("published File output owner disappeared")
+                .delivery_state;
+        }
+
+        if pending.iosb_va != 0
+            && delivery_state & nt_io_manager::IO_DELIVERY_IOSB_PUBLISHED == 0
+        {
+            if !nt_handler.xas_try_write_buf(pending.iosb_va, &completed.status.to_le_bytes())
+                || !nt_handler.xas_try_write_buf(
+                    pending.iosb_va + 8,
+                    &completed.information.to_le_bytes(),
+                )
+            {
+                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                restore_file_io_mirrors!();
+                continue;
+            }
+            delivery_state = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                .mark_delivery_exact(
+                    slot,
+                    pending.irp_id,
+                    nt_io_manager::IO_DELIVERY_IOSB_PUBLISHED,
+                )
+                .expect("pending File IOSB owner disappeared");
+        }
+
+        if pending.event_obj_idx != u64::MAX
+            && delivery_state & nt_io_manager::IO_DELIVERY_EVENT_PUBLISHED == 0
+        {
+            if nt_handler.events.set_existing(pending.event_obj_idx).is_none() {
+                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                restore_file_io_mirrors!();
+                continue;
+            }
+            let _ = wait_wake_dispatcher_set(nt_handler);
+            delivery_state = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                .mark_delivery_exact(
+                    slot,
+                    pending.irp_id,
+                    nt_io_manager::IO_DELIVERY_EVENT_PUBLISHED,
+                )
+                .expect("pending File event owner disappeared");
+        }
+        if pending.signal_file
+            && delivery_state & nt_io_manager::IO_DELIVERY_FILE_PUBLISHED == 0
+        {
+            if nt_handler.signal_file_completion(pending.file_id, completed.status)
+                != nt_fs::STATUS_SUCCESS
+            {
+                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                restore_file_io_mirrors!();
+                continue;
+            }
+            delivery_state = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                .mark_delivery_exact(
+                    slot,
+                    pending.irp_id,
+                    nt_io_manager::IO_DELIVERY_FILE_PUBLISHED,
+                )
+                .expect("pending File signal owner disappeared");
+        }
+
+        if pending.apc_routine != 0
+            && delivery_state & nt_io_manager::IO_DELIVERY_APC_PUBLISHED == 0
+        {
+            let status = nt_handler.queue_file_user_apc(
+                pending.tid,
+                pending.apc_routine,
+                pending.apc_context,
+                pending.iosb_va,
+            );
+            if status != nt_fs::STATUS_SUCCESS && !nt_handler.file_apc_target_gone(pending.tid) {
+                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                restore_file_io_mirrors!();
+                continue;
+            }
+            delivery_state = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                .mark_delivery_exact(
+                    slot,
+                    pending.irp_id,
+                    nt_io_manager::IO_DELIVERY_APC_PUBLISHED,
+                )
+                .expect("pending File APC owner disappeared");
+        } else if pending.apc_routine == 0
+            && pending.publish_iocp
+            && delivery_state & nt_io_manager::IO_DELIVERY_IOCP_PUBLISHED == 0
+        {
+            let status = nt_handler.post_file_completion_packet(
+                pending.file_id,
+                pending.apc_context,
+                completed.status,
+                completed.information,
+                false,
+                pending.completion_port_suppressed,
+            );
+            if status != nt_fs::STATUS_SUCCESS {
+                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                restore_file_io_mirrors!();
+                continue;
+            }
+            if nt_handler.io_completion_wake.is_some() {
+                let _ = io_completion_deliver(nt_handler);
+            }
+            delivery_state = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                .mark_delivery_exact(
+                    slot,
+                    pending.irp_id,
+                    nt_io_manager::IO_DELIVERY_IOCP_PUBLISHED,
+                )
+                .expect("pending File IOCP owner disappeared");
+        }
+
+        if pending.reply_required
+            && delivery_state & nt_io_manager::IO_DELIVERY_REPLY_PUBLISHED == 0
+        {
+            let cap = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                .claim_reply_cap_exact(slot, pending.irp_id)
+                .expect("pending File reply owner disappeared")
+                .expect("pending File reply cap was claimed without publication");
+            set_reply_mr(15, pending.resume_ip);
+            set_reply_mr(16, pending.resume_sp);
+            set_reply_mr(17, pending.resume_flags);
+            let _ = client_reply_on(cap, 18, completed.status as u64, 0, 0, 0);
+            release_reply_pool_cap(cap);
+            thread_wait_state_clear_badge_ready(nt_handler, pending.badge);
+            (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                .mark_reply_published_exact(slot, pending.irp_id)
+                .expect("pending File reply publication owner disappeared");
+        }
+
+        if !(&*core::ptr::addr_of!(PENDING_FILE_IO))
+            .completion_surfaces_published_exact(slot, pending.irp_id)
+        {
+            panic!("pending File completion reached ACK before required surfaces");
+        }
+        if driver_launch::acknowledge_completed_irp(pending.irp_id).is_err() {
+            FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+            restore_file_io_mirrors!();
+            continue;
+        }
+        let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
+        table
+            .mark_backend_acked_exact(slot, pending.irp_id)
+            .expect("ACKed pending File owner disappeared");
+        table
+            .finish_exact(slot, pending.irp_id)
+            .expect("completed pending File owner did not retire");
+        nt_handler.release_file_reference(pending.file_id);
+        delivered += 1;
+        if FILE_IO_COMPLETION_TRACE.fetch_add(1, Ordering::Relaxed) < 32 {
+            print_str(b"[file-io-complete] irp=0x");
+            print_hex_u64(pending.irp_id);
+            print_str(b" file=0x");
+            print_hex_u64(pending.file_id);
+            print_str(b" major=0x");
+            print_hex(pending.major as u32);
+            print_str(b" status=0x");
+            print_hex(completed.status);
+            print_str(b" info=");
+            print_u64(completed.information);
+            print_str(b"\n");
+        }
+    }
+    restore_file_io_mirrors!();
+    nt_handler.loop_ctx = saved_ctx;
+    delivered
 }
 
 /// BATCH 33 — finalize parked pipe I/O after a peer operation. Pending pipe IRPs stay owned by npfs:

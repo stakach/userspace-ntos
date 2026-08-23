@@ -29239,6 +29239,48 @@ pub(crate) unsafe fn copy_completed_irp(
     ))
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct HostedCompletedIrp {
+    pub file_id: u64,
+    pub requestor_tid: u64,
+    pub major: u8,
+    pub status: u32,
+    pub information: u64,
+}
+
+/// Resolve immutable terminal metadata for one exact canonical IRP. Generic executive delivery
+/// validates all of these identities before publishing its first user-visible surface.
+pub(crate) unsafe fn completed_irp_exact(irp_id: u64) -> Option<HostedCompletedIrp> {
+    if irp_id == 0 {
+        return None;
+    }
+    let io = io_manager_mut();
+    io.pump();
+    let completion = io.completed_irp(IrpId(irp_id))?;
+    Some(HostedCompletedIrp {
+        file_id: completion.file_id?.raw(),
+        requestor_tid: completion.requestor_tid,
+        major: completion.major,
+        status: completion.status.raw() as u32,
+        information: completion.information,
+    })
+}
+
+/// Copy one retained terminal-output chunk without consuming the canonical completion.
+pub(crate) unsafe fn copy_completed_irp_output_exact(
+    irp_id: u64,
+    offset: u64,
+    output: &mut [u8],
+) -> Result<usize, u32> {
+    if irp_id == 0 {
+        return Err(STATUS_INVALID_PARAMETER as u32);
+    }
+    let io = io_manager_mut();
+    io.pump();
+    io.copy_completed_irp_output(IrpId(irp_id), offset, output)
+        .map_err(|status| status.raw() as u32)
+}
+
 pub(crate) unsafe fn completed_irp_copy_requires_retry(irp_id: u64) -> bool {
     if irp_id == 0 {
         return false;

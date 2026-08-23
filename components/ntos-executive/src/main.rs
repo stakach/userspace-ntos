@@ -2841,6 +2841,10 @@ static KEYED_RELEASE_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 /// bring-up table.
 /// A refusal now means real allocation failure or reply-cap exhaustion, not "another service came up".
 static mut PIPE_WAITERS: nt_io_manager::PipeWaiterTable = nt_io_manager::PipeWaiterTable::new();
+/// Pending File-bound IRPs not owned by a pipe endpoint progress operation. Records retain exact
+/// canonical File/IRP generations through user publication and backend acknowledgement.
+static mut PENDING_FILE_IO: nt_io_manager::PendingFileIoTable =
+    nt_io_manager::PendingFileIoTable::new();
 /// Times a pipe read/write park was refused after a pending-capable IRP route wanted to retain it. A
 /// refusal is a functional degrade (the caller gets `STATUS_INSUFFICIENT_RESOURCES` for an I/O that
 /// should have completed later), so this must stay 0.
@@ -15982,6 +15986,7 @@ fn pipe_waiter_tables_reset() -> bool {
     unsafe {
         (&mut *core::ptr::addr_of_mut!(PIPE_WAITERS)).reset()
             && (&mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS)).reset()
+            && (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO)).reset()
     }
 }
 
@@ -21213,6 +21218,9 @@ struct ExecNtHandler {
     /// A synchronous file-I/O completion requested signaling this real executive event. The loop
     /// consumes it after dispatch so it can also wake reply-cap parked waiters.
     io_signal_event: i64,
+    /// A pending general File IRP whose syscall must wait for terminal completion. The service loop
+    /// attaches the live reply cap and transfers the completed record into `PENDING_FILE_IO`.
+    pending_file_io_park: Option<nt_io_manager::PendingFileIo>,
     /// BATCH 33 — pipe-pending completion edge. Set by NtReadFile / NtFsControlFile(FSCTL_PIPE_LISTEN
     /// / TRANSCEIVE) when the npfs pipe returns STATUS_PENDING: the LOOP must PARK this caller
     /// (steal its reply cap into the PipeWaiterTable keyed by the reading end's npfs file-id, rotate

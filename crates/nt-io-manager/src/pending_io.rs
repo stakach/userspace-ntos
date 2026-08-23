@@ -15,6 +15,14 @@ pub const IO_DELIVERY_IOCP_PUBLISHED: u16 = 1 << 4;
 pub const IO_DELIVERY_EVENT_PUBLISHED: u16 = 1 << 5;
 pub const IO_DELIVERY_REPLY_CLAIMED: u16 = 1 << 6;
 pub const IO_DELIVERY_REPLY_PUBLISHED: u16 = 1 << 7;
+pub const IO_DELIVERY_BACKEND_ACKED: u16 = 1 << 8;
+
+const IO_DELIVERY_PUBLIC_FLAGS: u16 = IO_DELIVERY_BUFFER_PUBLISHED
+    | IO_DELIVERY_IOSB_PUBLISHED
+    | IO_DELIVERY_APC_PUBLISHED
+    | IO_DELIVERY_FILE_PUBLISHED
+    | IO_DELIVERY_IOCP_PUBLISHED
+    | IO_DELIVERY_EVENT_PUBLISHED;
 
 /// One pending File-bound operation and every completion surface owned by that exact IRP.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -23,6 +31,8 @@ pub struct PendingFileIo {
     pub file_id: u64,
     /// Generation-protected I/O Manager IRP identity used for terminal copy and acknowledgement.
     pub irp_id: u64,
+    /// IRP major function used to reject a completion routed to the wrong syscall owner.
+    pub major: u8,
     /// Completion surfaces already published for this exact record generation.
     pub delivery_state: u16,
     /// Owning process index, thread id, and hosted fault badge.
@@ -32,6 +42,8 @@ pub struct PendingFileIo {
     /// Optional caller output buffer and its byte capacity.
     pub output_va: u64,
     pub output_len: u32,
+    /// Bytes already copied from the retained completion output.
+    pub output_offset: u32,
     /// Caller IO_STATUS_BLOCK.
     pub iosb_va: u64,
     /// Optional user APC and its caller-supplied context.
@@ -39,10 +51,16 @@ pub struct PendingFileIo {
     pub apc_context: u64,
     /// Whether the request's tagged event suppresses completion-port publication.
     pub completion_port_suppressed: bool,
+    /// Whether terminal completion must signal the File object.
+    pub signal_file: bool,
+    /// Whether terminal completion owns an IOCP packet when no APC is supplied.
+    pub publish_iocp: bool,
     /// Executive event-object index, or `u64::MAX` when no event was supplied.
     pub event_obj_idx: u64,
-    /// Stolen synchronous syscall reply cap. Zero means the syscall returned STATUS_PENDING.
+    /// Stolen synchronous syscall reply cap. Async requests have no reply owner.
     pub reply_cap: u64,
+    /// Whether this record owns a parked synchronous syscall reply.
+    pub reply_required: bool,
     /// Native-syscall resume context restored before replying to a synchronous request.
     pub resume_ip: u64,
     pub resume_sp: u64,
@@ -114,6 +132,9 @@ impl PendingFileIoTable {
     pub fn park(&mut self, pending: PendingFileIo) -> Option<usize> {
         if pending.file_id == 0
             || pending.irp_id == 0
+            || pending.delivery_state != 0
+            || pending.output_offset != 0
+            || pending.reply_required != (pending.reply_cap != 0)
             || self
                 .slots
                 .iter()
@@ -167,9 +188,65 @@ impl PendingFileIoTable {
         self.slots.get(slot).copied().flatten()
     }
 
-    pub fn complete_exact(&mut self, slot: usize, irp_id: u64) -> Option<PendingFileIo> {
+    /// Validate that a terminal manager projection belongs to this exact delivery owner.
+    pub fn matches_completion_exact(
+        &self,
+        slot: usize,
+        irp_id: u64,
+        file_id: u64,
+        requestor_tid: u64,
+        major: u8,
+    ) -> bool {
+        self.get(slot).is_some_and(|pending| {
+            pending.irp_id == irp_id
+                && pending.file_id == file_id
+                && pending.tid == requestor_tid
+                && pending.major == major
+        })
+    }
+
+    fn required_delivery_state(pending: PendingFileIo) -> u16 {
+        let mut required = IO_DELIVERY_BACKEND_ACKED;
+        if pending.output_va != 0 && pending.output_len != 0 {
+            required |= IO_DELIVERY_BUFFER_PUBLISHED;
+        }
+        if pending.iosb_va != 0 {
+            required |= IO_DELIVERY_IOSB_PUBLISHED;
+        }
+        if pending.signal_file {
+            required |= IO_DELIVERY_FILE_PUBLISHED;
+        }
+        if pending.event_obj_idx != u64::MAX {
+            required |= IO_DELIVERY_EVENT_PUBLISHED;
+        }
+        if pending.apc_routine != 0 {
+            required |= IO_DELIVERY_APC_PUBLISHED;
+        } else if pending.publish_iocp {
+            required |= IO_DELIVERY_IOCP_PUBLISHED;
+        }
+        if pending.reply_required {
+            required |= IO_DELIVERY_REPLY_CLAIMED | IO_DELIVERY_REPLY_PUBLISHED;
+        }
+        required
+    }
+
+    pub fn completion_surfaces_published_exact(&self, slot: usize, irp_id: u64) -> bool {
+        self.get(slot).is_some_and(|pending| {
+            pending.irp_id == irp_id
+                && pending.delivery_state
+                    & (Self::required_delivery_state(pending) & !IO_DELIVERY_BACKEND_ACKED)
+                    == Self::required_delivery_state(pending) & !IO_DELIVERY_BACKEND_ACKED
+        })
+    }
+
+    /// Remove an exact owner only after all required surfaces and backend ACK were committed.
+    pub fn finish_exact(&mut self, slot: usize, irp_id: u64) -> Option<PendingFileIo> {
         let entry = self.slots.get_mut(slot)?;
-        if entry.is_some_and(|pending| pending.irp_id == irp_id) {
+        if entry.is_some_and(|pending| {
+            pending.irp_id == irp_id
+                && pending.delivery_state & Self::required_delivery_state(pending)
+                    == Self::required_delivery_state(pending)
+        }) {
             entry.take()
         } else {
             None
@@ -177,6 +254,12 @@ impl PendingFileIoTable {
     }
 
     pub fn mark_delivery_exact(&mut self, slot: usize, irp_id: u64, flag: u16) -> Option<u16> {
+        if flag.count_ones() != 1
+            || flag & IO_DELIVERY_PUBLIC_FLAGS == 0
+            || flag & !IO_DELIVERY_PUBLIC_FLAGS != 0
+        {
+            return None;
+        }
         let pending = self.slots.get_mut(slot)?.as_mut()?;
         if pending.irp_id != irp_id {
             return None;
@@ -185,10 +268,37 @@ impl PendingFileIoTable {
         Some(pending.delivery_state)
     }
 
+    /// Advance an idempotent retained-output copy. The buffer surface is published only when every
+    /// terminal byte has reached the caller.
+    pub fn advance_output_exact(
+        &mut self,
+        slot: usize,
+        irp_id: u64,
+        copied: u32,
+        terminal_output_len: u32,
+    ) -> Option<u32> {
+        let pending = self.slots.get_mut(slot)?.as_mut()?;
+        if pending.irp_id != irp_id
+            || terminal_output_len > pending.output_len
+            || pending.output_offset > terminal_output_len
+        {
+            return None;
+        }
+        let next = pending.output_offset.checked_add(copied)?;
+        if next > terminal_output_len {
+            return None;
+        }
+        pending.output_offset = next;
+        if next == terminal_output_len {
+            pending.delivery_state |= IO_DELIVERY_BUFFER_PUBLISHED;
+        }
+        Some(next)
+    }
+
     /// Transfer synchronous reply ownership exactly once. `Some(None)` means it was already claimed.
     pub fn claim_reply_cap_exact(&mut self, slot: usize, irp_id: u64) -> Option<Option<u64>> {
         let pending = self.slots.get_mut(slot)?.as_mut()?;
-        if pending.irp_id != irp_id {
+        if pending.irp_id != irp_id || !pending.reply_required {
             return None;
         }
         if pending.delivery_state & IO_DELIVERY_REPLY_CLAIMED != 0 {
@@ -199,14 +309,41 @@ impl PendingFileIoTable {
         Some(Some(reply_cap))
     }
 
-    /// Remove undelivered requests owned by a terminating thread. The caller must abandon each IRP.
-    pub fn take_undelivered_thread_with<F>(&mut self, tid: u64, mut take: F) -> usize
+    pub fn mark_reply_published_exact(&mut self, slot: usize, irp_id: u64) -> Option<u16> {
+        let pending = self.slots.get_mut(slot)?.as_mut()?;
+        if pending.irp_id != irp_id
+            || !pending.reply_required
+            || pending.delivery_state & IO_DELIVERY_REPLY_CLAIMED == 0
+        {
+            return None;
+        }
+        pending.delivery_state |= IO_DELIVERY_REPLY_PUBLISHED;
+        Some(pending.delivery_state)
+    }
+
+    pub fn mark_backend_acked_exact(&mut self, slot: usize, irp_id: u64) -> Option<u16> {
+        let pending = self.slots.get_mut(slot)?.as_mut()?;
+        if pending.irp_id != irp_id
+            || pending.delivery_state & IO_DELIVERY_BACKEND_ACKED != 0
+            || pending.delivery_state
+                & (Self::required_delivery_state(*pending) & !IO_DELIVERY_BACKEND_ACKED)
+                != Self::required_delivery_state(*pending) & !IO_DELIVERY_BACKEND_ACKED
+        {
+            return None;
+        }
+        pending.delivery_state |= IO_DELIVERY_BACKEND_ACKED;
+        Some(pending.delivery_state)
+    }
+
+    /// Remove every request owned by a terminating thread. The caller must release any reply cap,
+    /// request cancellation/abandonment, and release the retained File reference.
+    pub fn take_thread_with<F>(&mut self, tid: u64, mut take: F) -> usize
     where
         F: FnMut(PendingFileIo),
     {
         let mut count = 0;
         for slot in self.slots.iter_mut() {
-            if slot.is_some_and(|pending| pending.delivery_state == 0 && pending.tid == tid) {
+            if slot.is_some_and(|pending| pending.tid == tid) {
                 let pending = slot.take().unwrap();
                 take(pending);
                 count += 1;
@@ -227,17 +364,22 @@ mod tests {
         PendingFileIo {
             file_id,
             irp_id,
+            major: nt_io_abi::major::IRP_MJ_DEVICE_CONTROL,
             pi: 3,
             tid,
             badge: 9,
             output_va: 0x1000,
             output_len: 64,
+            output_offset: 0,
             iosb_va: 0x2000,
             apc_routine: 0x3000,
             apc_context: 0x4000,
             completion_port_suppressed: false,
+            signal_file: false,
+            publish_iocp: false,
             event_obj_idx: 7,
             reply_cap: 0x50,
+            reply_required: true,
             resume_ip: 0x5000,
             resume_sp: 0x6000,
             resume_flags: 0x202,
@@ -285,10 +427,8 @@ mod tests {
             table.mark_delivery_exact(slot, 2, IO_DELIVERY_EVENT_PUBLISHED),
             Some(IO_DELIVERY_IOSB_PUBLISHED | IO_DELIVERY_EVENT_PUBLISHED)
         );
-        assert!(table.complete_exact(slot, 3).is_none());
-        let mut expected = request;
-        expected.delivery_state = IO_DELIVERY_IOSB_PUBLISHED | IO_DELIVERY_EVENT_PUBLISHED;
-        assert_eq!(table.complete_exact(slot, 2), Some(expected));
+        assert!(table.finish_exact(slot, 3).is_none());
+        assert!(table.finish_exact(slot, 2).is_none());
     }
 
     #[test]
@@ -301,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_teardown_takes_only_undelivered_requests() {
+    fn thread_teardown_takes_untouched_and_partially_published_requests() {
         let mut table = PendingFileIoTable::new();
         let first = table.park(pending(1, 2, 7)).unwrap();
         table.park(pending(1, 3, 7)).unwrap();
@@ -311,12 +451,92 @@ mod tests {
             .unwrap();
         let mut taken = Vec::new();
         assert_eq!(
-            table.take_undelivered_thread_with(7, |pending| taken.push(pending.irp_id)),
-            1
+            table.take_thread_with(7, |pending| taken.push(pending.irp_id)),
+            2
         );
-        assert_eq!(taken, vec![3]);
-        assert_eq!(table.len(), 2);
-        assert!(table.has_thread(7));
+        assert_eq!(taken, vec![2, 3]);
+        assert_eq!(table.len(), 1);
+        assert!(!table.has_thread(7));
         assert!(table.has_thread(8));
+    }
+
+    #[test]
+    fn completion_identity_includes_file_thread_and_major() {
+        let mut table = PendingFileIoTable::new();
+        let request = pending(1, 2, 7);
+        let slot = table.park(request).unwrap();
+        assert!(table.matches_completion_exact(
+            slot,
+            2,
+            1,
+            7,
+            nt_io_abi::major::IRP_MJ_DEVICE_CONTROL,
+        ));
+        assert!(!table.matches_completion_exact(
+            slot,
+            2,
+            3,
+            7,
+            nt_io_abi::major::IRP_MJ_DEVICE_CONTROL,
+        ));
+        assert!(!table.matches_completion_exact(
+            slot,
+            2,
+            1,
+            8,
+            nt_io_abi::major::IRP_MJ_DEVICE_CONTROL,
+        ));
+        assert!(!table.matches_completion_exact(
+            slot,
+            2,
+            1,
+            7,
+            nt_io_abi::major::IRP_MJ_FLUSH_BUFFERS,
+        ));
+    }
+
+    #[test]
+    fn delivery_flags_and_finish_are_strict() {
+        let mut table = PendingFileIoTable::new();
+        let slot = table.park(pending(1, 2, 7)).unwrap();
+        assert!(table
+            .mark_delivery_exact(
+                slot,
+                2,
+                IO_DELIVERY_IOSB_PUBLISHED | IO_DELIVERY_EVENT_PUBLISHED,
+            )
+            .is_none());
+        assert!(table
+            .mark_delivery_exact(slot, 2, IO_DELIVERY_REPLY_CLAIMED)
+            .is_none());
+        assert!(table.finish_exact(slot, 2).is_none());
+
+        assert_eq!(table.advance_output_exact(slot, 2, 32, 64), Some(32));
+        assert_eq!(table.get(slot).unwrap().output_offset, 32);
+        assert_eq!(table.advance_output_exact(slot, 2, 32, 64), Some(64));
+        for flag in [
+            IO_DELIVERY_IOSB_PUBLISHED,
+            IO_DELIVERY_EVENT_PUBLISHED,
+            IO_DELIVERY_APC_PUBLISHED,
+        ] {
+            table.mark_delivery_exact(slot, 2, flag).unwrap();
+        }
+        assert_eq!(table.claim_reply_cap_exact(slot, 2), Some(Some(0x50)));
+        table.mark_reply_published_exact(slot, 2).unwrap();
+        assert!(table.completion_surfaces_published_exact(slot, 2));
+        assert!(table.finish_exact(slot, 2).is_none());
+        table.mark_backend_acked_exact(slot, 2).unwrap();
+        assert!(table.finish_exact(slot, 2).is_some());
+    }
+
+    #[test]
+    fn async_record_cannot_claim_a_reply() {
+        let mut table = PendingFileIoTable::new();
+        let mut request = pending(1, 2, 7);
+        request.reply_cap = 0;
+        request.reply_required = false;
+        let slot = table.park(request).unwrap();
+        assert_eq!(table.claim_reply_cap_exact(slot, 2), None);
+        assert!(table.mark_reply_published_exact(slot, 2).is_none());
     }
 }

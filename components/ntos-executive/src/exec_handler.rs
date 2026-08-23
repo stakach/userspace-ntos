@@ -122,6 +122,16 @@ unsafe fn reserve_pipe_waiter(file_id: u64, is_write: bool) -> bool {
     reserved
 }
 
+unsafe fn reserve_pending_file_io() -> bool {
+    let pending = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
+    let old_capacity = pending.capacity();
+    let reserved = pending.ensure_capacity();
+    if reserved && pending.capacity() != old_capacity {
+        crate::mark_durable_table_growth_dirty();
+    }
+    reserved
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct NpfsFileRoute {
     /// Canonical generation-protected File identity.
@@ -2692,6 +2702,7 @@ impl ExecNtHandler {
         write_field!(io_completion_timeout, PendingWaitTimeout::none());
         write_field!(io_completion_wake, None);
         write_field!(io_signal_event, -1);
+        write_field!(pending_file_io_park, None);
         write_field!(pipe_park_file_id, 0);
         write_field!(pipe_park_fid, 0);
         write_field!(pipe_park_irp_id, 0);
@@ -10654,7 +10665,12 @@ impl ExecNtHandler {
         }
     }
 
-    unsafe fn write_current_iosb(&self, iosb: u64, status: u32, information: u64) -> bool {
+    pub(crate) unsafe fn write_current_iosb(
+        &self,
+        iosb: u64,
+        status: u32,
+        information: u64,
+    ) -> bool {
         if iosb == 0 || !self.probe_user_output(iosb, 16) {
             return false;
         }
@@ -10883,6 +10899,44 @@ impl ExecNtHandler {
         cancelled
     }
 
+    unsafe fn cancel_pending_file_io_for_file_id(&mut self, file_id: u64) -> usize {
+        let irps: Vec<_> = (&*core::ptr::addr_of!(PENDING_FILE_IO))
+            .drain_all()
+            .filter_map(|(_, pending)| {
+                (pending.delivery_state == 0
+                    && pending.tid == self.current_tid
+                    && pending.file_id == file_id)
+                    .then_some(pending.irp_id)
+            })
+            .collect();
+        let mut cancelled = 0;
+        for irp_id in irps {
+            if driver_launch::request_cancel_irp(irp_id).is_ok() {
+                cancelled += 1;
+            }
+        }
+        if cancelled != 0 {
+            crate::service_sec_image::FILE_IO_DELIVERY_RETRY_PENDING
+                .store(true, Ordering::Release);
+        }
+        cancelled
+    }
+
+    unsafe fn abandon_pending_file_io_for_thread(&mut self, tid: u64) -> usize {
+        let mut records = Vec::new();
+        (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+            .take_thread_with(tid, |pending| records.push(pending));
+        for pending in records.iter().copied() {
+            let _ = driver_launch::abandon_pending_irp(pending.irp_id);
+            if pending.reply_cap != 0 {
+                release_reply_pool_cap(pending.reply_cap);
+            }
+            thread_wait_state_clear_badge_ready(self, pending.badge);
+            self.release_file_reference(pending.file_id);
+        }
+        records.len()
+    }
+
     pub(crate) unsafe fn cancel_pipe_io_for_thread_teardown(&mut self, tid: u64) -> usize {
         let waiters: Vec<_> = (&*core::ptr::addr_of!(PIPE_WAITERS))
             .drain_all()
@@ -10917,7 +10971,7 @@ impl ExecNtHandler {
             }
         }
         self.pipe_write_redrive = redrive || cancelled != 0;
-        cancelled
+        cancelled + self.abandon_pending_file_io_for_thread(tid)
     }
 
     unsafe fn cancel_pipe_name_waits_for_root_handle(&mut self, root_handle: u64) -> usize {
@@ -10941,6 +10995,9 @@ impl ExecNtHandler {
         let mut cancelled = file_id
             .map(|file_id| self.cancel_pipe_io_for_file_id(file_id))
             .unwrap_or(0);
+        if let Some(file_id) = file_id {
+            cancelled += self.cancel_pending_file_io_for_file_id(file_id);
+        }
         if is_npfs_root {
             cancelled += self.cancel_pipe_name_waits_for_root_handle(file_handle);
         }
@@ -12314,6 +12371,7 @@ impl ExecNtHandler {
                 let pending = unsafe {
                     (&*core::ptr::addr_of!(PIPE_WAITERS)).has_thread(tid as u64)
                         || (&*core::ptr::addr_of!(PIPE_ASYNC_LISTENS)).has_thread(tid as u64)
+                        || (&*core::ptr::addr_of!(PENDING_FILE_IO)).has_thread(tid as u64)
                         || (&*core::ptr::addr_of!(PIPE_NAME_WAITERS)).has_thread(tid as u64)
                 };
                 output[..4].copy_from_slice(&(pending as u32).to_le_bytes());
@@ -29250,9 +29308,12 @@ impl ExecNtHandler {
                 let iosb_ok = iosb != 0 && self.xas_read(iosb, &mut iosb_probe);
                 let mut information = 0u64;
                 let mut file_id = 0u64;
+                let mut pending_irp_id = 0u64;
+                let mut file_retained = false;
+                let mut synchronous_file = false;
                 let mut routed = false;
                 let mut npfs_route_status = 0xFFFF_FFFEu32;
-                let status = if !iosb_ok {
+                let mut status = if !iosb_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
                 } else if self.boot_status_handle_access(handle).is_ok() {
                     match self.boot_status_check_access(handle, 0x0000_0002, 0x4000_0000) {
@@ -29272,30 +29333,95 @@ impl ExecNtHandler {
                         Ok(route) => {
                             npfs_route_status = nt_fs::STATUS_SUCCESS;
                             file_id = route.file_id;
-                            let mut output = [];
-                            match self.npfs_route_raw_for(
-                                route,
-                                major::IRP_MJ_FLUSH_BUFFERS as u64,
-                                0,
-                                &[],
-                                &mut output,
-                            ) {
-                                Ok((driver_status, completed, _)) => {
-                                    routed = true;
-                                    information = completed;
-                                    driver_status as u32
+                            synchronous_file = self
+                                .file_completion
+                                .is_synchronous(file_id)
+                                .unwrap_or(true);
+                            let prepared = if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
+                                || !wait_reply_pool_has_free()
+                                || !reserve_pending_file_io()
+                            {
+                                Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
+                            } else {
+                                self.file_completion.retain_file(file_id).map(|()| {
+                                    file_retained = true;
+                                })
+                            };
+                            match prepared {
+                                Err(status) => status,
+                                Ok(()) => {
+                                    let _ = self.file_completion.set_signaled(file_id, false);
+                                    let mut output = [];
+                                    match self.npfs_route_raw_for(
+                                        route,
+                                        major::IRP_MJ_FLUSH_BUFFERS as u64,
+                                        0,
+                                        &[],
+                                        &mut output,
+                                    ) {
+                                        Ok((driver_status, completed, irp_id)) => {
+                                            routed = true;
+                                            information = completed;
+                                            pending_irp_id = irp_id;
+                                            driver_status as u32
+                                        }
+                                        Err(route_status) => route_status,
+                                    }
                                 }
-                                Err(route_status) => route_status,
                             }
                         }
                     }
                 };
-                if iosb_ok {
+                if status == STATUS_PENDING {
+                    if !file_retained || pending_irp_id == 0 {
+                        if pending_irp_id != 0 {
+                            let _ = driver_launch::abandon_pending_irp(pending_irp_id);
+                        }
+                        if file_retained {
+                            self.release_file_reference(file_id);
+                            file_retained = false;
+                        }
+                        status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
+                        information = 0;
+                    } else {
+                        self.pending_file_io_park = Some(nt_io_manager::PendingFileIo {
+                            file_id,
+                            irp_id: pending_irp_id,
+                            major: major::IRP_MJ_FLUSH_BUFFERS,
+                            delivery_state: 0,
+                            pi: self.pi as u32,
+                            tid: self.current_tid,
+                            badge: self.current_badge,
+                            output_va: 0,
+                            output_len: 0,
+                            output_offset: 0,
+                            iosb_va: iosb,
+                            apc_routine: 0,
+                            apc_context: 0,
+                            completion_port_suppressed: true,
+                            signal_file: synchronous_file,
+                            publish_iocp: false,
+                            event_obj_idx: u64::MAX,
+                            reply_cap: 0,
+                            reply_required: false,
+                            resume_ip: 0,
+                            resume_sp: 0,
+                            resume_flags: 0,
+                        });
+                    }
+                }
+                if iosb_ok && status != STATUS_PENDING {
                     self.xas_write_buf(iosb, &status.to_le_bytes());
                     self.xas_write_buf(iosb + 8, &information.to_le_bytes());
                 }
                 if routed && status == 0x0000_0103 {
                     NT_FLUSH_BUFFERS_FILE_PENDING_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                if file_retained && status != STATUS_PENDING {
+                    if synchronous_file {
+                        let _ = self.signal_file_completion(file_id, status);
+                    }
+                    self.release_file_reference(file_id);
                 }
                 if let Some(slot) = scm_worker_slot_for(self) {
                     let seq = SCM_WORKER_FLUSH_IO_TRACE_N[slot].fetch_add(1, Ordering::Relaxed);
