@@ -10298,3 +10298,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     IOSB, and provider endpoint metadata from the terminal completion before ACK. Failure,
     cancellation, thread teardown, or publication failure must release the unhandled canonical File
     through its exact lifecycle. Do not introduce a CREATE-specific wait table.
+
+    Pending CREATE publication-reservation checkpoint (2026-08-23): the reusable ownership crates
+    now expose the resources required to make deferred CREATE publication atomic. `nt-process`
+    fallibly reserves one dense handle-table slot and reuses free slots without growth.
+    `FileCompletionTable` can claim a provisional first-handle entry before dispatch, commit it only
+    when a real process handle is installed, or roll it back without manufacturing CLEANUP/CLOSE.
+    The pipe fid/name, availability, and preconnected tables can reserve their next provider record
+    before dispatch. `PendingFileIo` now distinguishes ordinary transfer from CREATE, persists one
+    locally committed status/information/handle tuple, and requires that exact handle value to be
+    copied before reply/ACK; retry cannot mint a substitute handle.
+
+    Host validation is green for `cargo test -p nt-process` (`107/107`), `cargo test -p
+    nt-io-completion` (`26/26`), `cargo test -p nt-io-manager` (`168/168`), `cargo fmt --all`, the
+    freestanding executive check, and `git diff --check`. Review adjustment: these reservations are
+    not evidence that pending CREATE is wired. The next step must consume all of them before the
+    real driver dispatch, centralize immediate and terminal provider/handle publication, carry
+    `file_context` in the exact completion projection, and make transfer failure plus thread teardown
+    distinguish an unpublished CREATE File from an ordinary retained File reference.

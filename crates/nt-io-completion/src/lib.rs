@@ -59,6 +59,7 @@ struct FileCompletionEntry {
     device_id: u64,
     references: u32,
     handle_references: u32,
+    handle_publication_reserved: bool,
     synchronous: bool,
     signaled: bool,
     cleanup_sent: bool,
@@ -82,6 +83,7 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
                 device_id: 0,
                 references: 0,
                 handle_references: 0,
+                handle_publication_reserved: false,
                 synchronous: false,
                 signaled: false,
                 cleanup_sent: false,
@@ -110,6 +112,7 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
             if entry.device_id != device_id
                 || entry.synchronous != synchronous
                 || entry.cleanup_sent
+                || entry.handle_publication_reserved
             {
                 return Err(STATUS_INVALID_PARAMETER);
             }
@@ -133,6 +136,7 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
             device_id,
             references: 1,
             handle_references: 1,
+            handle_publication_reserved: false,
             synchronous,
             signaled: true,
             cleanup_sent: false,
@@ -142,9 +146,71 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
         Ok(())
     }
 
+    /// Claim one fixed File-completion slot before dispatching CREATE. The reservation owns the
+    /// future handle reference, but is not yet a user-visible handle and can be rolled back without
+    /// generating CLEANUP/CLOSE completion policy.
+    pub fn reserve_file_handle_publication(
+        &mut self,
+        file_id: u64,
+        device_id: u64,
+        synchronous: bool,
+    ) -> Result<(), u32> {
+        if file_id == 0 || device_id == 0 {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        if self.entry(file_id).is_some() {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.references == 0)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        *entry = FileCompletionEntry {
+            file_id,
+            device_id,
+            references: 1,
+            handle_references: 0,
+            handle_publication_reserved: true,
+            synchronous,
+            signaled: true,
+            cleanup_sent: false,
+            notification_modes: 0,
+            binding: None,
+        };
+        Ok(())
+    }
+
+    /// Convert an exact pre-CREATE reservation into the first real handle reference.
+    pub fn commit_reserved_file_handle(&mut self, file_id: u64) -> Result<(), u32> {
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if !entry.handle_publication_reserved
+            || entry.handle_references != 0
+            || entry.references != 1
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        entry.handle_publication_reserved = false;
+        entry.handle_references = 1;
+        Ok(())
+    }
+
+    /// Roll back an unpublished pre-CREATE reservation without manufacturing handle-close policy.
+    pub fn cancel_reserved_file_handle(&mut self, file_id: u64) -> Result<(), u32> {
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if !entry.handle_publication_reserved
+            || entry.handle_references != 0
+            || entry.references != 1
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        *entry = FileCompletionEntry::default();
+        Ok(())
+    }
+
     pub fn retain_handle(&mut self, file_id: u64) -> Result<(), u32> {
         let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
-        if entry.cleanup_sent {
+        if entry.cleanup_sent || entry.handle_publication_reserved {
             return Err(STATUS_INVALID_PARAMETER);
         }
         entry.references = entry
@@ -160,6 +226,9 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
 
     pub fn retain_file(&mut self, file_id: u64) -> Result<(), u32> {
         let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if entry.handle_publication_reserved {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
         entry.references = entry
             .references
             .checked_add(1)
@@ -170,6 +239,9 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
     /// Drop one non-handle file-object reference, usually held by a pending I/O operation.
     pub fn release_file(&mut self, file_id: u64) -> Result<FileReferenceRelease, u32> {
         let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if entry.handle_publication_reserved {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
         entry.references -= 1;
         Ok(Self::finish_release(entry, false))
     }
@@ -199,7 +271,7 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
 
     pub fn can_associate(&self, file_id: u64) -> Result<(), u32> {
         let entry = self.entry(file_id).ok_or(STATUS_INVALID_HANDLE)?;
-        if entry.synchronous || entry.binding.is_some() {
+        if entry.synchronous || entry.binding.is_some() || entry.handle_publication_reserved {
             return Err(STATUS_INVALID_PARAMETER);
         }
         Ok(())
@@ -1027,6 +1099,37 @@ mod tests {
             })
         );
         assert_eq!(files.binding(10), None);
+    }
+
+    #[test]
+    fn reserved_file_handle_publication_commits_or_rolls_back_exactly() {
+        let mut files = FileCompletionTable::<1>::new();
+        files
+            .reserve_file_handle_publication(10, 77, false)
+            .unwrap();
+        assert_eq!(files.retain_file(10), Err(STATUS_INVALID_PARAMETER));
+        assert_eq!(files.retain_handle(10), Err(STATUS_INVALID_PARAMETER));
+        assert_eq!(
+            files.insert_file(10, 77, false),
+            Err(STATUS_INVALID_PARAMETER)
+        );
+        assert_eq!(
+            files.reserve_file_handle_publication(20, 77, false),
+            Err(STATUS_INSUFFICIENT_RESOURCES)
+        );
+
+        files.commit_reserved_file_handle(10).unwrap();
+        assert_eq!(files.is_synchronous(10), Ok(false));
+        assert_eq!(files.retain_file(10), Ok(()));
+        assert_eq!(files.release_file(10).unwrap().close_required, false);
+        assert_eq!(files.release_handle(10).unwrap().close_required, true);
+
+        files.reserve_file_handle_publication(20, 88, true).unwrap();
+        assert_eq!(files.cancel_reserved_file_handle(20), Ok(()));
+        assert_eq!(files.is_synchronous(20), Err(STATUS_INVALID_HANDLE));
+        files
+            .reserve_file_handle_publication(30, 99, false)
+            .unwrap();
     }
 
     #[test]

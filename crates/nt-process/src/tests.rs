@@ -955,6 +955,31 @@ fn reserved_handle_table_never_reallocates() {
 }
 
 #[test]
+fn fallible_handle_slot_reservation_reuses_free_space_and_grows_headroom() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("host.exe", None, None);
+
+    pm.try_reserve_handle_slot(pid).unwrap();
+    let reserved = pm.handle_capacity(pid);
+    assert!(reserved >= 1);
+    let handle = pm
+        .insert_handle(pid, HandleObject::Opaque(0x1234), 0)
+        .unwrap();
+    assert_eq!(pm.handle_capacity(pid), reserved);
+
+    pm.close_handle(pid, handle).unwrap();
+    pm.try_reserve_handle_slot(pid).unwrap();
+    assert_eq!(pm.handle_capacity(pid), reserved);
+    pm.insert_handle(pid, HandleObject::Opaque(0x5678), 0)
+        .unwrap();
+    assert_eq!(pm.handle_capacity(pid), reserved);
+    assert_eq!(
+        pm.try_reserve_handle_slot(ProcessId::MAX),
+        Err(STATUS_INVALID_HANDLE)
+    );
+}
+
+#[test]
 fn pre_created_main_thread_bound_at_spawn() {
     // The host pre-creates the main thread as an identity at boot (entry unknown), then binds the
     // real image entry at spawn (alloc-free), and terminates for the lifecycle teardown.

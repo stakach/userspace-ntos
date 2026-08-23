@@ -35,6 +35,7 @@ pub const STATUS_INVALID_CID: u32 = 0xC000_000B;
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 pub const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 pub const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+pub const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 pub const STATUS_PORT_ALREADY_SET: u32 = 0xC000_0048;
 pub const STATUS_SUSPEND_COUNT_EXCEEDED: u32 = 0xC000_004A;
 pub const STATUS_HANDLE_NOT_CLOSABLE: u32 = 0xC000_0235;
@@ -948,6 +949,20 @@ impl ProcessManager {
                 proc.handles.reserve(capacity - proc.handles.capacity());
             }
         }
+    }
+
+    /// Ensure one more handle can be inserted without allocating. A freed slot already satisfies
+    /// the reservation; otherwise grow the dense handle table fallibly before an external
+    /// operation is allowed to begin.
+    pub fn try_reserve_handle_slot(&mut self, pid: ProcessId) -> Result<(), u32> {
+        let proc = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        if proc.handles.iter().any(Option::is_none) || proc.handles.len() < proc.handles.capacity()
+        {
+            return Ok(());
+        }
+        proc.handles
+            .try_reserve(1)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)
     }
 
     /// Pre-reserve the per-process TID link set. This is separate from

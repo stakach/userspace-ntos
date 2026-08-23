@@ -16,6 +16,8 @@ pub const IO_DELIVERY_EVENT_PUBLISHED: u16 = 1 << 5;
 pub const IO_DELIVERY_REPLY_CLAIMED: u16 = 1 << 6;
 pub const IO_DELIVERY_REPLY_PUBLISHED: u16 = 1 << 7;
 pub const IO_DELIVERY_BACKEND_ACKED: u16 = 1 << 8;
+pub const IO_DELIVERY_CREATE_COMMITTED: u16 = 1 << 9;
+pub const IO_DELIVERY_HANDLE_PUBLISHED: u16 = 1 << 10;
 
 const IO_DELIVERY_PUBLIC_FLAGS: u16 = IO_DELIVERY_BUFFER_PUBLISHED
     | IO_DELIVERY_IOSB_PUBLISHED
@@ -23,6 +25,28 @@ const IO_DELIVERY_PUBLIC_FLAGS: u16 = IO_DELIVERY_BUFFER_PUBLISHED
     | IO_DELIVERY_FILE_PUBLISHED
     | IO_DELIVERY_IOCP_PUBLISHED
     | IO_DELIVERY_EVENT_PUBLISHED;
+
+/// State needed to turn one successful terminal CREATE into a process-visible handle. The provider
+/// context is opaque to the generic owner; the executive interprets it only after resolving the
+/// File's dynamically registered device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct PendingFileCreate {
+    pub handle_va: u64,
+    pub desired_access: u32,
+    pub synchronous: bool,
+    pub provider_context: u64,
+    /// Locally committed result after provider metadata and handle ownership are established.
+    pub status: u32,
+    pub information: u64,
+    pub handle_value: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PendingFileIoOperation {
+    #[default]
+    Transfer,
+    Create(PendingFileCreate),
+}
 
 /// One pending File-bound operation and every completion surface owned by that exact IRP.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -33,6 +57,7 @@ pub struct PendingFileIo {
     pub irp_id: u64,
     /// IRP major function used to reject a completion routed to the wrong syscall owner.
     pub major: u8,
+    pub operation: PendingFileIoOperation,
     /// Completion surfaces already published for this exact record generation.
     pub delivery_state: u16,
     /// Owning process index, thread id, and hosted fault badge.
@@ -130,8 +155,26 @@ impl PendingFileIoTable {
 
     /// Insert one exact pending owner. A canonical IRP may have only one delivery owner.
     pub fn park(&mut self, pending: PendingFileIo) -> Option<usize> {
+        let create_valid = match pending.operation {
+            PendingFileIoOperation::Transfer => !crate::is_create_major(pending.major),
+            PendingFileIoOperation::Create(create) => {
+                crate::is_create_major(pending.major)
+                    && create.handle_va != 0
+                    && create.status == nt_status::NtStatus::PENDING.raw() as u32
+                    && create.information == 0
+                    && create.handle_value == 0
+                    && pending.output_va == 0
+                    && pending.output_len == 0
+                    && pending.iosb_va != 0
+                    && pending.apc_routine == 0
+                    && !pending.signal_file
+                    && !pending.publish_iocp
+                    && pending.event_obj_idx == u64::MAX
+            }
+        };
         if pending.file_id == 0
             || pending.irp_id == 0
+            || !create_valid
             || pending.delivery_state != 0
             || pending.output_offset != 0
             || (pending.output_len != 0 && pending.output_va == 0)
@@ -209,6 +252,9 @@ impl PendingFileIoTable {
 
     fn required_delivery_state(pending: PendingFileIo) -> u16 {
         let mut required = IO_DELIVERY_BACKEND_ACKED;
+        if matches!(pending.operation, PendingFileIoOperation::Create(_)) {
+            required |= IO_DELIVERY_CREATE_COMMITTED | IO_DELIVERY_HANDLE_PUBLISHED;
+        }
         if pending.output_va != 0 && pending.output_len != 0 {
             required |= IO_DELIVERY_BUFFER_PUBLISHED;
         }
@@ -239,6 +285,54 @@ impl PendingFileIoTable {
                     & (Self::required_delivery_state(pending) & !IO_DELIVERY_BACKEND_ACKED)
                     == Self::required_delivery_state(pending) & !IO_DELIVERY_BACKEND_ACKED
         })
+    }
+
+    /// Commit the local CREATE publication result once. Retrying the user handle write can then
+    /// reuse the exact same handle without allocating or duplicating process-visible ownership.
+    pub fn commit_create_exact(
+        &mut self,
+        slot: usize,
+        irp_id: u64,
+        status: u32,
+        information: u64,
+        handle_value: u64,
+    ) -> Option<u16> {
+        if status == nt_status::NtStatus::PENDING.raw() as u32
+            || ((status as i32) >= 0) != (handle_value != 0)
+        {
+            return None;
+        }
+        let pending = self.slots.get_mut(slot)?.as_mut()?;
+        if pending.irp_id != irp_id {
+            return None;
+        }
+        let PendingFileIoOperation::Create(mut create) = pending.operation else {
+            return None;
+        };
+        if pending.delivery_state & IO_DELIVERY_CREATE_COMMITTED != 0 {
+            return (create.status == status
+                && create.information == information
+                && create.handle_value == handle_value)
+                .then_some(pending.delivery_state);
+        }
+        create.status = status;
+        create.information = information;
+        create.handle_value = handle_value;
+        pending.operation = PendingFileIoOperation::Create(create);
+        pending.delivery_state |= IO_DELIVERY_CREATE_COMMITTED;
+        Some(pending.delivery_state)
+    }
+
+    pub fn mark_create_handle_published_exact(&mut self, slot: usize, irp_id: u64) -> Option<u16> {
+        let pending = self.slots.get_mut(slot)?.as_mut()?;
+        if pending.irp_id != irp_id
+            || !matches!(pending.operation, PendingFileIoOperation::Create(_))
+            || pending.delivery_state & IO_DELIVERY_CREATE_COMMITTED == 0
+        {
+            return None;
+        }
+        pending.delivery_state |= IO_DELIVERY_HANDLE_PUBLISHED;
+        Some(pending.delivery_state)
     }
 
     /// Remove an exact owner only after all required surfaces and backend ACK were committed.
@@ -367,6 +461,7 @@ mod tests {
             file_id,
             irp_id,
             major: nt_io_abi::major::IRP_MJ_DEVICE_CONTROL,
+            operation: PendingFileIoOperation::Transfer,
             pi: 3,
             tid,
             badge: 9,
@@ -559,5 +654,75 @@ mod tests {
         let slot = table.park(request).unwrap();
         assert_eq!(table.claim_reply_cap_exact(slot, 2), None);
         assert!(table.mark_reply_published_exact(slot, 2).is_none());
+    }
+
+    #[test]
+    fn pending_create_commits_one_handle_and_requires_its_publication() {
+        let mut table = PendingFileIoTable::new();
+        let mut request = pending(1, 2, 7);
+        request.major = nt_io_abi::major::IRP_MJ_CREATE;
+        request.operation = PendingFileIoOperation::Create(PendingFileCreate {
+            handle_va: 0x7000,
+            desired_access: 0x12019F,
+            synchronous: true,
+            provider_context: 0xAABB,
+            status: nt_status::NtStatus::PENDING.raw() as u32,
+            information: 0,
+            handle_value: 0,
+        });
+        request.output_va = 0;
+        request.output_len = 0;
+        request.iosb_va = 0x7100;
+        request.apc_routine = 0;
+        request.signal_file = false;
+        request.publish_iocp = false;
+        request.event_obj_idx = u64::MAX;
+        let slot = table.park(request).unwrap();
+
+        assert!(!table.completion_surfaces_published_exact(slot, 2));
+        assert!(table.commit_create_exact(slot, 2, 0, 1, 0x44).is_some());
+        assert_eq!(
+            table.commit_create_exact(slot, 2, 0, 1, 0x48),
+            None,
+            "a retry cannot substitute a second handle"
+        );
+        table.mark_create_handle_published_exact(slot, 2).unwrap();
+        table
+            .mark_delivery_exact(slot, 2, IO_DELIVERY_IOSB_PUBLISHED)
+            .unwrap();
+        assert_eq!(table.claim_reply_cap_exact(slot, 2), Some(Some(0x50)));
+        table.mark_reply_published_exact(slot, 2).unwrap();
+        assert!(table.completion_surfaces_published_exact(slot, 2));
+        table.mark_backend_acked_exact(slot, 2).unwrap();
+        assert!(table.finish_exact(slot, 2).is_some());
+    }
+
+    #[test]
+    fn pending_create_failure_commits_a_null_handle() {
+        let mut table = PendingFileIoTable::new();
+        let mut request = pending(1, 2, 7);
+        request.major = nt_io_abi::major::IRP_MJ_CREATE_NAMED_PIPE;
+        request.operation = PendingFileIoOperation::Create(PendingFileCreate {
+            handle_va: 0x7000,
+            desired_access: 0,
+            synchronous: false,
+            provider_context: 0xAABB,
+            status: nt_status::NtStatus::PENDING.raw() as u32,
+            information: 0,
+            handle_value: 0,
+        });
+        request.output_va = 0;
+        request.output_len = 0;
+        request.apc_routine = 0;
+        request.signal_file = false;
+        request.publish_iocp = false;
+        request.event_obj_idx = u64::MAX;
+        let slot = table.park(request).unwrap();
+
+        assert!(table
+            .commit_create_exact(slot, 2, 0xC000_0022, 0, 0)
+            .is_some());
+        assert!(table.commit_create_exact(slot, 2, 0, 1, 0).is_none());
+        table.mark_create_handle_published_exact(slot, 2).unwrap();
     }
 }

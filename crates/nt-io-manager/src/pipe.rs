@@ -1067,6 +1067,14 @@ impl PipeFidNameTable {
         }
     }
 
+    pub fn ensure_capacity(&mut self) -> bool {
+        self.entries.len() < self.entries.capacity() || self.entries.try_reserve(1).is_ok()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.entries.capacity()
+    }
+
     pub fn remember(&mut self, file_id: u64, name_hash: u64) -> Result<(), ()> {
         if file_id == 0 || name_hash == 0 {
             return Err(());
@@ -1154,6 +1162,14 @@ impl PipeServerAvailabilityTable {
         Self {
             entries: Vec::new(),
         }
+    }
+
+    pub fn ensure_capacity(&mut self) -> bool {
+        self.entries.len() < self.entries.capacity() || self.entries.try_reserve(1).is_ok()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.entries.capacity()
     }
 
     pub fn mark_available(&mut self, server_file_id: u64, name_hash: u64) -> Result<(), ()> {
@@ -1258,6 +1274,15 @@ impl PipePreconnectedServerTable {
         Self {
             server_file_ids: Vec::new(),
         }
+    }
+
+    pub fn ensure_capacity(&mut self) -> bool {
+        self.server_file_ids.len() < self.server_file_ids.capacity()
+            || self.server_file_ids.try_reserve(1).is_ok()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.server_file_ids.capacity()
     }
 
     /// Record a server endpoint whose client side already connected. Idempotent for the same fid.
@@ -3024,6 +3049,27 @@ mod tests {
         assert_eq!(table.name_hash(0x123), None);
         assert_eq!(table.len(), 39);
         assert!(!table.forget(0x123));
+    }
+
+    #[test]
+    fn pipe_provider_tables_reserve_publication_without_late_growth() {
+        let mut names = PipeFidNameTable::new();
+        assert!(names.ensure_capacity());
+        let names_capacity = names.capacity();
+        names.remember(0x101, 0xA1).unwrap();
+        assert_eq!(names.capacity(), names_capacity);
+
+        let mut available = PipeServerAvailabilityTable::new();
+        assert!(available.ensure_capacity());
+        let available_capacity = available.capacity();
+        available.mark_available(0x101, 0xA1).unwrap();
+        assert_eq!(available.capacity(), available_capacity);
+
+        let mut preconnected = PipePreconnectedServerTable::new();
+        assert!(preconnected.ensure_capacity());
+        let preconnected_capacity = preconnected.capacity();
+        assert_eq!(preconnected.remember(0x101), Ok(true));
+        assert_eq!(preconnected.capacity(), preconnected_capacity);
     }
 
     #[test]

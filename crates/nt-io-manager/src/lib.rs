@@ -64,10 +64,11 @@ pub use irp::{
 pub use mock_driver::{IoctlBehavior, MockDriverBackend};
 pub use object_port::{MockObjectPort, ObjectManagerPort};
 pub use pending_io::{
-    PendingFileIo, PendingFileIoTable, IO_DELIVERY_APC_PUBLISHED, IO_DELIVERY_BACKEND_ACKED,
-    IO_DELIVERY_BUFFER_PUBLISHED, IO_DELIVERY_EVENT_PUBLISHED, IO_DELIVERY_FILE_PUBLISHED,
-    IO_DELIVERY_IOCP_PUBLISHED, IO_DELIVERY_IOSB_PUBLISHED, IO_DELIVERY_REPLY_CLAIMED,
-    IO_DELIVERY_REPLY_PUBLISHED,
+    PendingFileCreate, PendingFileIo, PendingFileIoOperation, PendingFileIoTable,
+    IO_DELIVERY_APC_PUBLISHED, IO_DELIVERY_BACKEND_ACKED, IO_DELIVERY_BUFFER_PUBLISHED,
+    IO_DELIVERY_CREATE_COMMITTED, IO_DELIVERY_EVENT_PUBLISHED, IO_DELIVERY_FILE_PUBLISHED,
+    IO_DELIVERY_HANDLE_PUBLISHED, IO_DELIVERY_IOCP_PUBLISHED, IO_DELIVERY_IOSB_PUBLISHED,
+    IO_DELIVERY_REPLY_CLAIMED, IO_DELIVERY_REPLY_PUBLISHED,
 };
 pub use pipe::{
     decode_pipe_wait_name, decode_pipe_wait_request, pipe_endpoint_end, pipe_endpoint_file_id,
