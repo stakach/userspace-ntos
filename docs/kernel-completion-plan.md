@@ -10444,3 +10444,53 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     terminal owner. Finally route root `FSCTL_PIPE_WAIT` through the real hosted File/device boundary
     and remove the executive name-wait compatibility machinery; no legacy fallback remains after
     each owner moves.
+
+    Pending TRANSCEIVE generic-owner checkpoint (2026-08-23): routed
+    `FSCTL_PIPE_TRANSCEIVE` now uses the ordinary `NtFsControlFile` path and the same exact
+    `PendingFileIo` owner as other pending File transfers. The record preserves the filesystem
+    control code alongside the canonical FileId, IrpId, output target, IOSB, event/File signal,
+    APC-xor-IOCP state, optional synchronous reply, and backend acknowledgement. Access encoded in
+    the control code is checked against the File before event reset or dispatch, APC plus a
+    completion-port-bound File is rejected at the same preflight boundary, and a pending result
+    without an exact nonzero IrpId fails closed. Zero-length output remains a valid pending
+    transceive rather than being converted into an inline success.
+
+    Immediate and retained completion use the common status contract and publication order. A
+    success or warning may copy no more than the driver's exact completion length; partial warning
+    output is preserved, while an inline hard error leaves caller surfaces untouched. Endpoint
+    progress and DCE/RPC observation remain narrow NPFS hooks discovered from the canonical File's
+    dynamically resolved NamedPipe device and current FsContext; neither hook owns caller-visible
+    completion. A same-end second transceive is rejected with `STATUS_PIPE_BUSY` while the first
+    exact read remains pending, and an accepted peer write clears that state. The executive now
+    rejects hosted control buffers above its current 16 KiB transport capacity explicitly instead
+    of truncating them.
+
+    The complete specialized transceive owner has been removed: `PipeWaiter`, `PipeWaiterTable`,
+    their global table, reply-cap park path, redrive loop, cancellation and teardown branches,
+    direction/exclusion fields, counters, exports, and tests no longer exist. Generic completion
+    transfer failures have a bounded counter and fail the LSA route gate, preventing a silent return
+    to the deleted path. The only remaining specialized pending named-pipe data owner is
+    `AsyncListenTable` for `FSCTL_PIPE_LISTEN`; root `FSCTL_PIPE_WAIT` still uses the separate
+    executive name-wait compatibility path.
+
+    Host validation is green for `cargo fmt --all`, `cargo test -p nt-io-manager` (`162/162`), the
+    freestanding executive check, and `git diff --check`. Serialized desktop proof
+    `.tmp/run-desktop-20260823-205558.log` is accepted: it records 14 successful generic exact
+    `IRP_MJ_FILE_SYSTEM_CONTROL` completions for control `0x0011c017`, no specialized
+    `[pipe-park]`/`[pipe-redrive]` trace, and zero generic transfer-publication failures. Userinit and
+    Explorer launch dynamically; Explorer completes 669 api0 callbacks with zero callback failures,
+    paint reaches 5 BeginPaint, 20 EndPaint, 187 direct GDI returns, and 135 batch flushes carrying
+    184 records. All 786,432 framebuffer pixels are non-background with at least 32 colors;
+    `293/293` checks pass and the sentinel is emitted.
+
+    Review adjustment: specialized TRANSCEIVE ownership is closed, but the NT/ReactOS audit exposed
+    two generic I/O Manager obligations that should precede the final LISTEN migration. Operations
+    on a synchronous File must acquire and serialize that File across threads and distinguish
+    alertable from non-alertable synchronous waits; merely parking the initiating syscall does not
+    prevent another thread sharing the File from dispatching concurrently. `NtCancelIoFile` must
+    also wait until the current thread's matching IRPs reach terminal cancellation rather than only
+    requesting cancellation. Implement those policies in reusable File/pending-I/O state, then move
+    `FSCTL_PIPE_LISTEN` to `PendingFileIo`, route root `FSCTL_PIPE_WAIT` through the hosted
+    File/device boundary, and delete both remaining compatibility wait tables. Replace the explicit
+    16 KiB hosted control-buffer ceiling with a growable or banked transport before claiming
+    arbitrary NT control-buffer lengths.

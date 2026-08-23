@@ -2829,31 +2829,13 @@ static KEYED_WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 static KEYED_RELEASE_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static KEYED_RELEASE_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 
-// ─── BATCH 33: pipe-pending completion (park a pending pipe read, re-drive on peer write) ─────────
-/// The pending-transceive table (host-tested `nt_io_manager::PipeWaiterTable`). A caller whose npfs
-/// `FSCTL_PIPE_TRANSCEIVE` returned STATUS_PENDING is parked here — its seL4 reply
-/// cap withheld (stolen into a pool like the event waiters), keyed by the reading end's npfs file-id
-/// — and re-driven when the peer writes. The single-threaded executive owns all mutation.
-///
-/// This starts with a small default bootstrap reservation and grows like the async listen table.
-/// There is no tiny global NT limit on pending named-pipe IRPs: service startup, RPC servers, and
-/// driver control paths can legitimately accumulate more transceives than the old 16-slot
-/// bring-up table.
-/// A refusal now means real allocation failure or reply-cap exhaustion, not "another service came up".
-static mut PIPE_WAITERS: nt_io_manager::PipeWaiterTable = nt_io_manager::PipeWaiterTable::new();
 /// Pending File-bound IRPs retain exact canonical File/IRP generations through user publication
 /// and backend acknowledgement, independent of the provider that owns the request.
 static mut PENDING_FILE_IO: nt_io_manager::PendingFileIoTable =
     nt_io_manager::PendingFileIoTable::new();
-/// Times a pipe transceive park was refused after a pending-capable IRP route wanted to retain it. A
-/// refusal is a functional degrade (the caller gets `STATUS_INSUFFICIENT_RESOURCES` for an I/O that
-/// should have completed later), so this must stay 0.
-pub(crate) static PIPE_WAITERS_REFUSED: AtomicU64 = AtomicU64::new(0);
-/// Proof/diagnostic counters (specs + boot log): transceives parked and completed.
-static PIPE_WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
-static PIPE_WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
-static PIPE_REDRIVE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
-static PIPE_REDRIVE_RPC_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+/// A pending backend request could not transfer into its already-reserved generic owner. This is a
+/// fail-closed allocation/reply-cap path, never a compatibility fallback, and must remain zero.
+static PENDING_FILE_IO_TRANSFER_FAILURES: AtomicU64 = AtomicU64::new(0);
 // ─── BATCH 34: the async ncacn_np SERVER completion edge ──────────────────────────────────────────
 /// Pending async server-side `FSCTL_PIPE_LISTEN`s (host-tested `nt_io_manager::AsyncListenTable`). The
 /// ncacn_np rpcrt4 server posts an OVERLAPPED FSCTL_PIPE_LISTEN (STATUS_PENDING while no client) with a
@@ -6732,7 +6714,7 @@ fn lsa_worker_route_spec(passed: &mut u64) {
     let client_writes = LSA_SELF_RPC_CLIENT_WRITES.load(Ordering::Relaxed);
     let ticks_absorbed = PUMP_TIMER_TICKS_ABSORBED.load(Ordering::Relaxed);
     let ticks_drained = PUMP_TIMER_TICKS_DRAINED.load(Ordering::Relaxed);
-    let pipe_refusals = PIPE_WAITERS_REFUSED.load(Ordering::Relaxed);
+    let file_io_transfer_failures = PENDING_FILE_IO_TRANSFER_FAILURES.load(Ordering::Relaxed);
     let wall_suspends = spawn_hosts::PUMP_WALL_SUSPENDS.load(Ordering::Relaxed);
     let reply_errors = spawn_hosts::PUMP_REPLY_ERRORS.load(Ordering::Relaxed);
     print_str(b"[lsa-route] worker PDUs read=");
@@ -6749,8 +6731,8 @@ fn lsa_worker_route_spec(passed: &mut u64) {
     print_u64(ticks_absorbed);
     print_str(b" drained=");
     print_u64(ticks_drained);
-    print_str(b" pipe-waiter-refusals=");
-    print_u64(pipe_refusals);
+    print_str(b" file-io-transfer-failures=");
+    print_u64(file_io_transfer_failures);
     print_str(b" pump-walls=");
     print_u64(wall_suspends);
     print_str(b"\n");
@@ -6768,7 +6750,7 @@ fn lsa_worker_route_spec(passed: &mut u64) {
     //  * ZERO pump walls and ZERO reply errors over the whole boot — the availability defect the
     //    route used to hit does not recur, and every request found its reply object BOUND;
     //  * every HPET tick a pump absorbed was DRAINED by the service loop (none dropped);
-    //  * ZERO pipe-waiter-table refusals, so no async pipe I/O was silently degraded.
+    //  * ZERO generic pending-I/O transfer failures, so no issued request lost its completion owner.
     let route_shape = if LSA_WORKER_ROUTE_ENABLED {
         // Route ON: the handshake really happened, in the right order. Thresholds are the
         // INVARIANTS (>= 1 each + the FIRST PDU type of each direction), not the depth — how far
@@ -6794,7 +6776,7 @@ fn lsa_worker_route_spec(passed: &mut u64) {
             && wall_suspends == 0
             && reply_errors == 0
             && ticks_drained + 1 >= ticks_absorbed
-            && pipe_refusals == 0,
+            && file_io_transfer_failures == 0,
         passed,
     );
     delay_timer_disarm_spec(passed);
@@ -7529,10 +7511,6 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
     print_u64(TIMER_TICKS_SEEN.load(Ordering::Relaxed));
     print_str(b"/");
     print_u64(TIMER_TICKS_SPURIOUS.load(Ordering::Relaxed));
-    print_str(b" pipe=");
-    print_u64(PIPE_WAIT_PARKED_COUNT.load(Ordering::Relaxed));
-    print_str(b"/");
-    print_u64(PIPE_WAIT_WOKEN_COUNT.load(Ordering::Relaxed));
     {
         let (sw, st, mw, mt, outstanding) = driver_launch::hosted_driver_wait_census();
         print_str(b" drvwait=");
@@ -7699,10 +7677,6 @@ pub(crate) fn print_census_counters(tag: &[u8]) {
     print_u64(nested);
     print_str(b" ucb-seq=");
     print_u64(seq);
-    print_str(b" pipe-parked=");
-    print_u64(PIPE_WAIT_PARKED_COUNT.load(Ordering::Relaxed));
-    print_str(b" pipe-woken=");
-    print_u64(PIPE_WAIT_WOKEN_COUNT.load(Ordering::Relaxed));
     let (
         w32_dispatch_rows,
         w32_dispatch_cap,
@@ -16018,10 +15992,9 @@ fn pipe_name_waiter_table_reset() -> bool {
     }
 }
 
-fn pipe_waiter_tables_reset() -> bool {
+fn hosted_io_owner_tables_reset() -> bool {
     unsafe {
-        (&mut *core::ptr::addr_of_mut!(PIPE_WAITERS)).reset()
-            && (&mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS)).reset()
+        (&mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS)).reset()
             && (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO)).reset()
     }
 }
@@ -16352,7 +16325,7 @@ unsafe fn wait_cancel_thread(handler: &ExecNtHandler, tid: u64) {
 /// `DbgkpQueueMessage` blocks the thread that reported a debug event on the event's `ContinueEvent`
 /// until `NtDebugContinue` runs `DbgkpWakeTarget`. Our reporting thread is blocked in-kernel on the
 /// Call that delivered its fault/syscall, so "park" is the SAME reply-capability steal every other
-/// wait uses (`wait_park` / `keyed_wait_park` / `pipe_wait_park`): take the Reply object the last
+/// wait uses (`wait_park` / `keyed_wait_park` / pending File I/O): take the Reply object the last
 /// recv bound to this caller and rotate a fresh pool object into `REPLY_MAIN_SLOT` so the loop's
 /// next recv binds a NEW one. The stolen capability rides on the `DEBUG_EVENT` itself
 /// ([`nt_process::dbgk::ReporterBlock`]) — exactly where NT keeps the waiting reporter.
@@ -16838,8 +16811,8 @@ pub(crate) unsafe fn release_unregistered_hosted_thread_spawn(spawn: HostedThrea
     release_hosted_thread_mechanism_caps(0, spawn.mechanism());
 }
 
-unsafe fn pipe_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
-    let _ = handler.cancel_pipe_io_for_thread_teardown(tid);
+unsafe fn hosted_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
+    let _ = handler.cancel_file_io_for_thread_teardown(tid);
     let name_waiters = &mut *core::ptr::addr_of_mut!(PIPE_NAME_WAITERS);
     let _ = name_waiters.cancel_thread_with(tid, |waiter| {
         if waiter.reply_cap != 0 {
@@ -16869,7 +16842,7 @@ unsafe fn terminate_hosted_thread_mechanism(
     wait_cancel_thread(handler, tid);
     keyed_wait_cancel_thread(handler, tid);
     keyed_release_wait_cancel_thread(handler, tid);
-    pipe_io_cancel_thread(tid, handler);
+    hosted_io_cancel_thread(tid, handler);
     let abandoned_mutants = handler.abandon_mutants_for_thread(tid);
     if abandoned_mutants != 0 {
         print_str(b"[thread-term] abandoned mutants tid=");
@@ -21259,25 +21232,6 @@ struct ExecNtHandler {
     /// synchronous File object must wait for terminal completion.
     pending_file_io_transfer: Option<nt_io_manager::PendingFileIo>,
     pending_file_io_wait: bool,
-    /// BATCH 33 — pipe-pending completion edge. Set by
-    /// NtFsControlFile(FSCTL_PIPE_TRANSCEIVE) when npfs returns STATUS_PENDING: the loop must park this caller
-    /// (steal its reply cap into the PipeWaiterTable keyed by the reading end's npfs file-id, rotate
-    /// REPLY_MAIN to a fresh pool object) instead of returning PENDING, and re-drive it when the peer
-    /// writes. `pipe_park_file_id` is the canonical FileId and `pipe_park_fid` is the reading end's
-    /// npfs `FsContext` (0 = no park request). The rest is the completion context the re-drive
-    /// needs (user buffer/IOSB VAs + capacity).
-    /// Reset each dispatch (group-A signal, like `io_signal_event`).
-    /// Canonical generation-protected FileId retained for completion ownership.
-    pipe_park_file_id: u64,
-    pipe_park_fid: u64,
-    pipe_park_irp_id: u64,
-    pipe_park_buffer_va: u64,
-    pipe_park_buffer_len: u32,
-    pipe_park_iosb_va: u64,
-    pipe_park_apc_routine: u64,
-    pipe_park_apc_context: u64,
-    pipe_park_completion_port_suppressed: bool,
-    pipe_park_event_obj_idx: u64,
     /// ★ Dbgk TARGET-SIDE BLOCKING, SYSCALL flavour. Set by a debug-event post issued from a
     /// SYSCALL arm (`dbgk_module_load` — `DbgkMapViewOfSection`, which NT queues with flags 0 and
     /// therefore BLOCKS the mapping thread on the continue). The handler cannot park: the reply-cap

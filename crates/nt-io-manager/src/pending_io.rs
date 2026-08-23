@@ -60,6 +60,8 @@ pub struct PendingFileIo {
     pub irp_id: u64,
     /// IRP major function used to reject a completion routed to the wrong syscall owner.
     pub major: u8,
+    /// Device or filesystem control code for control IRPs; zero for other major functions.
+    pub control_code: u32,
     pub operation: PendingFileIoOperation,
     /// Completion surfaces already published for this exact record generation.
     pub delivery_state: u16,
@@ -182,9 +184,14 @@ impl PendingFileIoTable {
                     && pending.event_obj_idx == u64::MAX
             }
         };
+        let control_valid = matches!(
+            pending.major,
+            nt_io_abi::major::IRP_MJ_DEVICE_CONTROL | nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL
+        ) || pending.control_code == 0;
         if pending.file_id == 0
             || pending.irp_id == 0
             || !create_valid
+            || !control_valid
             || pending.delivery_state != 0
             || pending.output_offset != 0
             || (pending.output_len != 0 && pending.output_va == 0)
@@ -474,6 +481,7 @@ mod tests {
             file_id,
             irp_id,
             major: nt_io_abi::major::IRP_MJ_DEVICE_CONTROL,
+            control_code: 0,
             operation: PendingFileIoOperation::Transfer,
             pi: 3,
             tid,
@@ -672,6 +680,67 @@ mod tests {
         assert_eq!(table.claim_reply_cap_exact(slot, 2), Some(Some(0x50)));
         table.mark_reply_published_exact(slot, 2).unwrap();
         assert!(table.completion_surfaces_published_exact(slot, 2));
+    }
+
+    #[test]
+    fn pending_transceive_preserves_control_identity_and_async_event_surfaces() {
+        const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
+        let mut table = PendingFileIoTable::new();
+        let mut request = pending(1, 2, 7);
+        request.major = nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL;
+        request.control_code = FSCTL_PIPE_TRANSCEIVE;
+        request.apc_routine = 0;
+        request.publish_iocp = true;
+        request.reply_cap = 0;
+        request.reply_required = false;
+        request.signal_file = false;
+        let slot = table.park(request).unwrap();
+
+        assert_eq!(table.get(slot).unwrap().control_code, FSCTL_PIPE_TRANSCEIVE);
+        table.advance_output_exact(slot, 2, 24, 24).unwrap();
+        for flag in [
+            IO_DELIVERY_IOSB_PUBLISHED,
+            IO_DELIVERY_EVENT_PUBLISHED,
+            IO_DELIVERY_IOCP_PUBLISHED,
+        ] {
+            table.mark_delivery_exact(slot, 2, flag).unwrap();
+        }
+        assert!(table.completion_surfaces_published_exact(slot, 2));
+    }
+
+    #[test]
+    fn pending_transceive_accepts_zero_length_output_and_sync_reply() {
+        let mut table = PendingFileIoTable::new();
+        let mut request = pending(1, 2, 7);
+        request.major = nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL;
+        request.control_code = 0x0011_C017;
+        request.output_va = 0;
+        request.output_len = 0;
+        request.signal_file = true;
+        let slot = table.park(request).unwrap();
+
+        for flag in [
+            IO_DELIVERY_IOSB_PUBLISHED,
+            IO_DELIVERY_EVENT_PUBLISHED,
+            IO_DELIVERY_FILE_PUBLISHED,
+            IO_DELIVERY_APC_PUBLISHED,
+        ] {
+            table.mark_delivery_exact(slot, 2, flag).unwrap();
+        }
+        assert_eq!(table.claim_reply_cap_exact(slot, 2), Some(Some(0x50)));
+        table.mark_reply_published_exact(slot, 2).unwrap();
+        assert!(table.completion_surfaces_published_exact(slot, 2));
+    }
+
+    #[test]
+    fn non_control_pending_owner_rejects_control_code_metadata() {
+        let mut table = PendingFileIoTable::new();
+        let mut request = pending(1, 2, 7);
+        request.major = nt_io_abi::major::IRP_MJ_READ;
+        request.control_code = 0x1122_3344;
+        assert!(table.park(request).is_none());
+        request.control_code = 0;
+        assert!(table.park(request).is_some());
     }
 
     #[test]

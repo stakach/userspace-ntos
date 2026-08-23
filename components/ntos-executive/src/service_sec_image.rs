@@ -4,9 +4,10 @@
 use crate::*;
 use crate::exec_handler::HostedCreatePublication;
 
-static PIPE_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
+static PIPE_LISTEN_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
 pub(crate) static FILE_IO_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
 static FILE_IO_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
+static PIPE_TRANSCEIVE_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
 static mut FILE_IO_COPY_WORK: [u8; 4096] = [0; 4096];
 static CALLBACK_MESSAGE_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
 
@@ -5389,8 +5390,8 @@ pub(crate) unsafe fn service_sec_image(
     if !io_completion_waiter_table_reset() {
         panic!("IO completion wait table allocation failed");
     }
-    if !pipe_waiter_tables_reset() {
-        panic!("pipe completion wait table allocation failed");
+    if !hosted_io_owner_tables_reset() {
+        panic!("hosted I/O owner table allocation failed");
     }
     if !pipe_name_waiter_table_reset() {
         panic!("pipe-name wait table allocation failed");
@@ -8944,18 +8945,6 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_io_completion_iosb_out: u64 = 0;
             let mut park_io_completion_deadline: Option<u64> = None;
             let mut transfer_pending_file_io: Option<(nt_io_manager::PendingFileIo, bool)> = None;
-            // BATCH 33 — pipe-pending park request latched from the handler (0 = none). Consumed at the
-            // reply site (the reply-cap steal needs resume_ip/sp/flags, known there).
-            let mut park_pipe_file_id: u64 = 0;
-            let mut park_pipe_fid: u64 = 0;
-            let mut park_pipe_irp_id: u64 = 0;
-            let mut park_pipe_buffer_va: u64 = 0;
-            let mut park_pipe_buffer_len: u32 = 0;
-            let mut park_pipe_iosb_va: u64 = 0;
-            let mut park_pipe_apc_routine: u64 = 0;
-            let mut park_pipe_apc_context: u64 = 0;
-            let mut park_pipe_completion_port_suppressed = false;
-            let mut park_pipe_event_obj_idx: u64 = u64::MAX;
             let mut park_pipe_name_wait_root_handle: u64 = 0;
             let mut park_pipe_name_wait_hash: u64 = 0;
             let mut park_pipe_name_wait_iosb_va: u64 = 0;
@@ -9061,16 +9050,6 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.io_signal_event = -1;
                 nt_handler.pending_file_io_transfer = None;
                 nt_handler.pending_file_io_wait = false;
-                nt_handler.pipe_park_file_id = 0;
-                nt_handler.pipe_park_fid = 0;
-                nt_handler.pipe_park_irp_id = 0;
-                nt_handler.pipe_park_buffer_va = 0;
-                nt_handler.pipe_park_buffer_len = 0;
-                nt_handler.pipe_park_iosb_va = 0;
-                nt_handler.pipe_park_apc_routine = 0;
-                nt_handler.pipe_park_apc_context = 0;
-                nt_handler.pipe_park_completion_port_suppressed = false;
-                nt_handler.pipe_park_event_obj_idx = u64::MAX;
                 nt_handler.dbgk_block_request = false;
                 nt_handler.pipe_endpoint_progress = false;
                 nt_handler.pipe_listen_fid = 0;
@@ -9746,24 +9725,8 @@ pub(crate) unsafe fn service_sec_image(
                     park_lpc_receive_ctx = nt_handler.lpc_receive_park_ctx;
                     park_lpc_receive_listen_only = nt_handler.lpc_receive_park_listen_only;
                 }
-                // BATCH 33: latch a pending transceive (the reply-cap steal happens at the reply
-                // site where resume_ip/sp/flags are known). Re-drive exact retained transceives on
-                // endpoint progress before replying to the current caller.
                 if nt_handler.dbgk_block_request {
                     park_dbgk_reporter = true;
-                }
-                if nt_handler.pipe_park_fid != 0 {
-                    park_pipe_file_id = nt_handler.pipe_park_file_id;
-                    park_pipe_fid = nt_handler.pipe_park_fid;
-                    park_pipe_irp_id = nt_handler.pipe_park_irp_id;
-                    park_pipe_buffer_va = nt_handler.pipe_park_buffer_va;
-                    park_pipe_buffer_len = nt_handler.pipe_park_buffer_len;
-                    park_pipe_iosb_va = nt_handler.pipe_park_iosb_va;
-                    park_pipe_apc_routine = nt_handler.pipe_park_apc_routine;
-                    park_pipe_apc_context = nt_handler.pipe_park_apc_context;
-                    park_pipe_completion_port_suppressed =
-                        nt_handler.pipe_park_completion_port_suppressed;
-                    park_pipe_event_obj_idx = nt_handler.pipe_park_event_obj_idx;
                 }
                 if nt_handler.pipe_name_wait_hash != 0 {
                     park_pipe_name_wait_root_handle = nt_handler.pipe_name_wait_root_handle;
@@ -9801,15 +9764,9 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 if nt_handler.pipe_endpoint_progress
                     || hosted_io_progress != 0
-                    || PIPE_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel)
+                    || PIPE_LISTEN_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel)
                 {
-                    let woken = pipe_redrive_all(&mut nt_handler);
                     let listens = pipe_listen_redrive_all(&mut nt_handler);
-                    if woken != 0 && PIPE_REDRIVE_TRACE_COUNT.load(Ordering::Relaxed) <= 20 {
-                        print_str(b"[pipe-redrive] peer write woke ");
-                        print_u64(woken);
-                        print_str(b" parked transceive(s)\n");
-                    }
                     if listens != 0 {
                         print_str(b"[pipe-listen] exact completion redrive delivered ");
                         print_u64(listens);
@@ -15998,6 +15955,7 @@ pub(crate) unsafe fn service_sec_image(
                         continue;
                     }
                 } else {
+                    PENDING_FILE_IO_TRANSFER_FAILURES.fetch_add(1, Ordering::Relaxed);
                     let _ = driver_launch::abandon_pending_irp(pending.irp_id);
                     result = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES as u64;
                     if let nt_io_manager::PendingFileIoOperation::Create(create) = pending.operation
@@ -16010,61 +15968,6 @@ pub(crate) unsafe fn service_sec_image(
                     if pending.iosb_va != 0 {
                         let _ = nt_handler.write_current_iosb(pending.iosb_va, result as u32, 0);
                     }
-                }
-            }
-            // BATCH 33 — PIPE-PENDING PARK: a real npfs TRANSCEIVE returned STATUS_PENDING
-            // (no response yet). Steal this caller's reply cap into the PipeWaiterTable keyed by the
-            // end fid (rotate REPLY_MAIN to a fresh pool object), recv the next event WITHOUT replying —
-            // the caller stays blocked in-kernel. A later peer write re-drives it (pipe_redrive_all).
-            // Pool/table exhaustion returns STATUS_INSUFFICIENT_RESOURCES; returning PENDING without
-            // retaining an owned IRP would leave both completion and ThreadIsIoPending inconsistent.
-            if park_pipe_fid != 0 && park_pipe_irp_id != 0 && reply_main != 0 {
-                if pipe_wait_park(
-                    park_pipe_file_id,
-                    park_pipe_fid,
-                    park_pipe_irp_id,
-                    pi as u32,
-                    nt_handler.current_tid,
-                    badge,
-                    park_pipe_buffer_va,
-                    park_pipe_buffer_len,
-                    park_pipe_iosb_va,
-                    park_pipe_apc_routine,
-                    park_pipe_apc_context,
-                    park_pipe_completion_port_suppressed,
-                    park_pipe_event_obj_idx,
-                    resume_ip,
-                    sp,
-                    flags,
-                ) {
-                    print_str(b"[pipe-park] badge=");
-                    print_u64(badge);
-                    print_str(b" fid=0x");
-                    print_hex(park_pipe_fid as u32);
-                    print_str(b" -> PARK transceive (re-driven on peer write)\n");
-                    trace_indefinite_wait_park(
-                        &nt_handler,
-                        badge,
-                        live_top_badges(&nt_handler),
-                        crash_parked,
-                        wait_parked,
-                    );
-                    mark_wait_parked!(pi, resume_ip);
-                    pin_durable_table_growth_if_dirty(&mut heap_mark);
-                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
-                    badge = nb;
-                    mi = nmi;
-                    m0 = nm0;
-                    m1 = nm1;
-                    m2 = nm2;
-                    m3 = nm3;
-                    continue;
-                } else {
-                    print_str(b"[pipe-park] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n");
-                    let _ = driver_launch::abandon_pending_irp(park_pipe_irp_id);
-                    nt_handler.release_file_reference(park_pipe_file_id);
-                    result = 0xC000_009A;
                 }
             }
             if park_pipe_name_wait_hash != 0 && reply_main != 0 {
@@ -22238,15 +22141,15 @@ static mut LSA_CLI_CONNECT_INFO: [u8; LSA_CONNECTION_INFO_SIZE] = [0; LSA_CONNEC
 static mut LSA_CLI_REQUEST: [u8; LSA_API_MSG_MAX] = [0; LSA_API_MSG_MAX];
 
 /// Steal the Reply object bound to the caller the loop is currently servicing and rotate a fresh pool
-/// object into `REPLY_MAIN_SLOT` — the SAME mechanism `wait_park_multi` / `pipe_wait_park` /
+/// object into `REPLY_MAIN_SLOT` — the same mechanism `wait_park_multi` / pending File I/O /
 /// `dbgk_reporter_park` use. `None` ⇒ the pool is exhausted (caller must not park).
 unsafe fn lsa_steal_main_reply() -> Option<u64> {
     steal_main_reply()
 }
 
 /// Resume a thread blocked on a stolen reply cap: restore its native-syscall resume context
-/// (RCX/RSP/RFLAGS in MR15/16/17) and return `status` in MR0 — the identical shape `pipe_redrive_all`
-/// and the event wake use.
+/// (RCX/RSP/RFLAGS in MR15/16/17) and return `status` in MR0, matching generic pending File I/O
+/// and event wakes.
 unsafe fn lsa_wake(cap: u64, status: u64, ip: u64, sp: u64, flags: u64) {
     set_reply_mr(15, ip);
     set_reply_mr(16, sp);
@@ -22256,8 +22159,8 @@ unsafe fn lsa_wake(cap: u64, status: u64, ip: u64, sp: u64, flags: u64) {
 }
 
 /// Run `body` with the executive's cross-address-space copy context pointed at `badge`/`pi`'s VSpace
-/// mirrors, then restore. Mirrors `pipe_redrive_all`'s context switch exactly (including dropping
-/// `loop_ctx` so the copy is mirror-only — the target thread's stack/heap are already mapped).
+/// mirrors, then restore. This matches the generic pending File-I/O context switch, including
+/// dropping `loop_ctx` so the copy is mirror-only; the target thread's stack/heap are already mapped.
 unsafe fn lsa_with_peer<R>(
     nt_handler: &mut ExecNtHandler,
     badge: u64,
@@ -22845,75 +22748,6 @@ unsafe fn pending_file_io_transfer(
     true
 }
 
-/// BATCH 33 — PARK a caller whose npfs pipe transceive returned STATUS_PENDING. Mirrors the event
-/// `wait_park_multi` reply-cap steal EXACTLY (steal the active REPLY_MAIN, rotate a fresh pool object
-/// into REPLY_MAIN so the next recv binds a new object), but records the wait in the PipeWaiterTable
-/// keyed by the endpoint's npfs file-id instead of an obj_ns event index. Returns true on success;
-/// false if the reply pool is unavailable or the growable waiter table cannot allocate the record. The
-/// stolen cap resumes the blocked thread when the peer writes (`pipe_redrive_all`).
-unsafe fn pipe_wait_park(
-    canonical_file_id: u64,
-    file_id: u64,
-    irp_id: u64,
-    pi: u32,
-    tid: u64,
-    badge: u64,
-    buffer_va: u64,
-    buffer_len: u32,
-    iosb_va: u64,
-    apc_routine: u64,
-    apc_context: u64,
-    completion_port_suppressed: bool,
-    event_obj_idx: u64,
-    resume_ip: u64,
-    sp: u64,
-    flags: u64,
-) -> bool {
-    let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-    if stolen == 0 {
-        return false;
-    }
-    // Find a FREE pool object to become the new active REPLY_MAIN (same rotation as wait_park_multi).
-    let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
-        return false; // pool exhausted → caller returns PENDING directly
-    };
-    let table = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
-    let old_capacity = table.capacity();
-    let parked = table.park(nt_io_manager::PipeWaiter {
-        canonical_file_id,
-        file_id,
-        name_hash: pipe_fid_name_hash(file_id),
-        irp_id,
-        delivery_state: 0,
-        pi,
-        tid,
-        badge,
-        buffer_va,
-        buffer_len,
-        iosb_va,
-        apc_routine,
-        apc_context,
-        completion_port_suppressed,
-        event_obj_idx,
-        reply_cap: stolen,
-        resume_ip,
-        resume_sp: sp,
-        resume_flags: flags,
-    });
-    if parked.is_none() {
-        PIPE_WAITERS_REFUSED.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    if table.capacity() != old_capacity {
-        mark_durable_table_growth_dirty();
-    }
-    // Commit the reply-cap rotation only after the waiter is recorded.
-    wait_reply_pool_mark_used(fresh_index);
-    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
-    PIPE_WAIT_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
-    true
-}
-
 unsafe fn pipe_name_wait_park(
     root_handle: u64,
     name_hash: u64,
@@ -23083,10 +22917,14 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         ) {
             panic!("pending File completion identity mismatch");
         }
-        if matches!(
-            pending.major,
-            nt_io_abi::major::IRP_MJ_READ | nt_io_abi::major::IRP_MJ_WRITE
-        ) {
+        let is_pipe_transceive = pending.major == nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL
+            && pending.control_code == crate::exec_handler::FSCTL_PIPE_TRANSCEIVE;
+        if nt_handler.hosted_file_is_named_pipe(pending.file_id)
+            && (matches!(
+                pending.major,
+                nt_io_abi::major::IRP_MJ_READ | nt_io_abi::major::IRP_MJ_WRITE
+            ) || is_pipe_transceive)
+        {
             nt_handler.pipe_endpoint_progress = true;
         }
 
@@ -23238,7 +23076,7 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                     copy_failed = true;
                     break;
                 }
-                if pending.major == nt_io_abi::major::IRP_MJ_READ {
+                if pending.major == nt_io_abi::major::IRP_MJ_READ || is_pipe_transceive {
                     nt_handler.observe_completed_npfs_read(
                         pending.file_id,
                         pending.badge,
@@ -23427,13 +23265,20 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             }
         }
         delivered += 1;
-        if FILE_IO_COMPLETION_TRACE.fetch_add(1, Ordering::Relaxed) < 32 {
+        let trace_completion = FILE_IO_COMPLETION_TRACE.fetch_add(1, Ordering::Relaxed) < 32
+            || (is_pipe_transceive
+                && PIPE_TRANSCEIVE_COMPLETION_TRACE.fetch_add(1, Ordering::Relaxed) < 16);
+        if trace_completion {
             print_str(b"[file-io-complete] irp=0x");
             print_hex_u64(pending.irp_id);
             print_str(b" file=0x");
             print_hex_u64(pending.file_id);
             print_str(b" major=0x");
             print_hex(pending.major as u32);
+            if pending.control_code != 0 {
+                print_str(b" control=0x");
+                print_hex(pending.control_code);
+            }
             print_str(b" status=0x");
             print_hex(terminal_status);
             print_str(b" info=");
@@ -23444,324 +23289,6 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     restore_file_io_mirrors!();
     nt_handler.loop_ctx = saved_ctx;
     delivered
-}
-
-/// BATCH 33 — finalize parked transceives after a peer operation. Pending pipe IRPs stay owned by npfs:
-/// when a peer write satisfies one, npfs completes the retained IRP through `IoCompleteRequest` and
-/// the driver bridge retains the exact completion payload under its canonical IRP id. This redrive
-/// step consumes those exact completions, copies results through the waiter's own VSpace mirrors, signals its
-/// event/file completion surfaces, and releases the waiter. If no real completion is present yet, the
-/// waiter stays parked; issuing a fresh read here would create a second outstanding IRP for the same
-/// FILE_OBJECT and violates `FSCTL_PIPE_TRANSCEIVE`'s single retained read half. Returns woken count.
-unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
-    // Snapshot the active-mirror context + handler identity so we can restore after each re-drive.
-    let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
-    let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
-    let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
-    let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
-    let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
-    let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
-    let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
-    let saved_pi = nt_handler.pi;
-    let saved_ctx = nt_handler.loop_ctx.take(); // copyout via mirrors only during the re-drive
-    macro_rules! restore_redrive_mirrors {
-        () => {{
-            ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
-            ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
-            ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
-            ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
-            ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
-            ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
-            ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
-            nt_handler.pi = saved_pi;
-        }};
-    }
-    let mut woken = 0u64;
-    let table = &*core::ptr::addr_of!(PIPE_WAITERS);
-    let snapshot: alloc::vec::Vec<(usize, nt_io_manager::PipeWaiter)> = table.drain_all().collect();
-    for (slot, w) in snapshot {
-        let mut delivery_state = w.delivery_state;
-        // BATCH 37/I4: a pending TRANSCEIVE is completed only by the IRP npfs retained. A second
-        // read here manufactures another data-queue entry and can make the next SCM
-        // `TransactNamedPipe` fail with the legitimate `STATUS_PIPE_BUSY` precondition.
-        let Some((status, completed, output)) = driver_launch::copy_completed_irp(
-            w.irp_id,
-            delivery_state & nt_io_manager::IO_DELIVERY_BUFFER_PUBLISHED == 0,
-        )
-        else {
-            if driver_launch::completed_irp_copy_requires_retry(w.irp_id) {
-                PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
-            }
-            continue;
-        };
-        if status == 0x0000_0103 {
-            continue; // still PENDING → stays parked (re-armable)
-        }
-        // Data (or a terminal status) available. Point the copyout at the READER's VSpace mirrors.
-        let (sb, ss, smv, hmv, imv, scratch_base) = mirror_ctx_for(w.badge, w.pi as usize);
-        ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
-        ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
-        ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
-        ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
-        ACTIVE_IMAGE_MIRROR.store(imv, Ordering::Relaxed);
-        ACTIVE_CLIENT_PI.store(w.pi as u64, Ordering::Relaxed);
-        ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
-        nt_handler.pi = w.pi as usize;
-        if delivery_state & nt_io_manager::IO_DELIVERY_BUFFER_PUBLISHED == 0 {
-            let copy_len = (completed as usize)
-                .min(w.buffer_len as usize)
-                .min(output.len());
-        // BATCH 37: copy the delivered bytes for SUCCESS *and* STATUS_BUFFER_OVERFLOW (0x80000005) —
-        // a message-mode read of a message larger than the buffer returns the partial bytes WITH
-        // overflow (rpcrt4 reads the 16-byte common header of a 72-byte bind PDU this way, then reads
-        // the remainder). Gating the copyout on `status == 0` left the reader's buffer zeroed on
-        // overflow, so rpcrt4's RPCRT4_ValidateCommonHeader saw an all-zero header and failed. Only a
-        // hard error / PENDING leaves the buffer untouched.
-        if (status == 0 || status == 0x8000_0005)
-            && copy_len != 0
-            && w.buffer_va != 0
-        {
-            driver_launch::trace_dcerpc_read_reassembly_from_slice(
-                w.file_id,
-                status,
-                completed,
-                &output[..copy_len],
-            );
-            if !nt_handler.xas_try_write_buf(w.buffer_va, &output[..copy_len]) {
-                PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
-                restore_redrive_mirrors!();
-                continue;
-            }
-            // ★ LSA SELF-RPC instrumentation: an MS-RPC PDU actually DELIVERED off lsass' own
-            // `\lsarpc` to a parked reader, attributed by badge to the per-connection WORKER (the
-            // bind / request it must service) or to lsass' main thread as the CLIENT (the bind_ack /
-            // response that unblocks `LsaOpenPolicy`). Name-scoped via the fid->pipe-name map.
-            let lsass_pi = live_hosted_pi_for_role(
-                nt_handler,
-                nt_exe_image::HostedProcessRole::LocalSecurityAuthority,
-            );
-            if lsass_pi == Some(w.pi as usize)
-                && output.first() == Some(&5)
-                && w.name_hash == lsarpc_pipe_name_hash()
-            {
-                let pdu_type = output.get(2).copied().unwrap_or(0xFF) as u64;
-                if nt_handler
-                    .hosted_thread_role_for_badge(w.badge)
-                    .is_some_and(|role| role.is_lsa_rpc_worker())
-                {
-                    LSA_WORKER_PDU_READS.fetch_add(1, Ordering::Relaxed);
-                    let _ = LSA_WORKER_FIRST_PDU_TYPE.compare_exchange(
-                        0xFF,
-                        pdu_type,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    );
-                } else {
-                    LSA_SELF_RPC_CLIENT_READS.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-            if copy_len >= 16 && PIPE_REDRIVE_RPC_TRACE_COUNT.load(Ordering::Relaxed) < 96
-            {
-                let pdu = driver_launch::dcerpc_pdu_view_from_slice(&output[..copy_len]);
-                if pdu.is_some()
-                    && PIPE_REDRIVE_RPC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 96
-                {
-                    print_str(b"[pipe-redrive-rpc] fid=0x");
-                    print_hex(w.file_id as u32);
-                    print_str(b" name_hash=0x");
-                    print_hex_u64(w.name_hash);
-                    print_str(b" pi=");
-                    print_u64(w.pi as u64);
-                    print_str(b" badge=");
-                    print_u64(w.badge);
-                    print_str(b" status=0x");
-                    print_hex(status);
-                    print_str(b" bytes=");
-                    print_u64(completed);
-                    driver_launch::print_dcerpc_pdu_view(pdu);
-                    print_str(b"\n");
-                }
-            }
-            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
-            let state = table_mut
-                .mark_delivery_exact(
-                    slot,
-                    w.irp_id,
-                    nt_io_manager::IO_DELIVERY_BUFFER_PUBLISHED,
-                )
-                .expect("copied pipe waiter disappeared");
-            delivery_state = state;
-        }
-        let completion_status = status;
-        let completion_information = completed;
-        if delivery_state & nt_io_manager::IO_DELIVERY_IOSB_PUBLISHED == 0 {
-            if w.iosb_va != 0
-                && (!nt_handler.xas_try_write_buf(w.iosb_va, &completion_status.to_le_bytes())
-                    || !nt_handler.xas_try_write_buf(
-                        w.iosb_va + 8,
-                        &completion_information.to_le_bytes(),
-                    ))
-            {
-                PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
-                restore_redrive_mirrors!();
-                continue;
-            }
-            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
-            let state = table_mut
-                .mark_delivery_exact(
-                    slot,
-                    w.irp_id,
-                    nt_io_manager::IO_DELIVERY_IOSB_PUBLISHED,
-                )
-                .expect("updated pipe IOSB waiter disappeared");
-            delivery_state = state;
-        }
-        if delivery_state & nt_io_manager::IO_DELIVERY_APC_PUBLISHED == 0 {
-            let apc_status = nt_handler.queue_file_user_apc(
-                w.tid,
-                w.apc_routine,
-                w.apc_context,
-                w.iosb_va,
-            );
-            if apc_status != nt_fs::STATUS_SUCCESS && !nt_handler.file_apc_target_gone(w.tid) {
-                PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
-                restore_redrive_mirrors!();
-                continue;
-            }
-            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
-            let state = table_mut
-                .mark_delivery_exact(
-                    slot,
-                    w.irp_id,
-                    nt_io_manager::IO_DELIVERY_APC_PUBLISHED,
-                )
-                .expect("queued pipe APC waiter disappeared");
-            delivery_state = state;
-        }
-        if delivery_state & nt_io_manager::IO_DELIVERY_FILE_PUBLISHED == 0 {
-            let signal_status = nt_handler
-                .signal_file_completion(w.canonical_file_id, completion_status);
-            if signal_status != nt_fs::STATUS_SUCCESS {
-                PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
-                restore_redrive_mirrors!();
-                continue;
-            }
-            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
-            let state = table_mut
-                .mark_delivery_exact(
-                    slot,
-                    w.irp_id,
-                    nt_io_manager::IO_DELIVERY_FILE_PUBLISHED,
-                )
-                .expect("signaled pipe file waiter disappeared");
-            delivery_state = state;
-        }
-        if delivery_state & nt_io_manager::IO_DELIVERY_IOCP_PUBLISHED == 0 {
-            let post_status = nt_handler.post_file_completion_packet(
-                w.canonical_file_id,
-                w.apc_context,
-                completion_status,
-                completion_information,
-                false,
-                w.completion_port_suppressed,
-            );
-            if post_status != nt_fs::STATUS_SUCCESS {
-                PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
-                restore_redrive_mirrors!();
-                continue;
-            }
-            if nt_handler.io_completion_wake.is_some() {
-                let _ = io_completion_deliver(nt_handler);
-            }
-            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
-            let state = table_mut
-                .mark_delivery_exact(
-                    slot,
-                    w.irp_id,
-                    nt_io_manager::IO_DELIVERY_IOCP_PUBLISHED,
-                )
-                .expect("posted pipe IOCP waiter disappeared");
-            delivery_state = state;
-        }
-        if delivery_state & nt_io_manager::IO_DELIVERY_EVENT_PUBLISHED == 0 {
-            if w.event_obj_idx != u64::MAX {
-                if nt_handler.events.set_existing(w.event_obj_idx).is_none() {
-                    PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
-                    restore_redrive_mirrors!();
-                    continue;
-                }
-                let _ = wait_wake_dispatcher_set(nt_handler);
-            }
-            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
-            table_mut
-                .mark_delivery_exact(
-                    slot,
-                    w.irp_id,
-                    nt_io_manager::IO_DELIVERY_EVENT_PUBLISHED,
-                )
-                .expect("signaled pipe waiter disappeared");
-        }
-        if delivery_state & nt_io_manager::IO_DELIVERY_REPLY_PUBLISHED == 0 {
-            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
-            let Some(cap) = table_mut
-                .claim_reply_cap_exact(slot, w.irp_id)
-                .expect("pipe waiter disappeared before reply claim")
-            else {
-                PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
-                restore_redrive_mirrors!();
-                continue;
-            };
-            if cap != 0 {
-                set_reply_mr(15, w.resume_ip);
-                set_reply_mr(16, w.resume_sp);
-                set_reply_mr(17, w.resume_flags);
-                // A successful send or an unbound cap is terminal for this one-shot reply owner.
-                let _ = client_reply_on(cap, 18, completion_status as u64, 0, 0, 0);
-                release_reply_pool_cap(cap);
-                thread_wait_state_clear_badge_ready(nt_handler, w.badge);
-            }
-            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
-            table_mut
-                .mark_delivery_exact(
-                    slot,
-                    w.irp_id,
-                    nt_io_manager::IO_DELIVERY_REPLY_PUBLISHED,
-                )
-                .expect("replied pipe waiter disappeared");
-        }
-        if driver_launch::acknowledge_completed_irp(w.irp_id).is_err() {
-            PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
-            restore_redrive_mirrors!();
-            continue;
-        }
-        let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
-        table_mut
-            .complete_exact(slot, w.irp_id)
-            .expect("ACKed pipe waiter disappeared");
-        nt_handler.release_file_reference(w.canonical_file_id);
-        woken += 1;
-        PIPE_WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
-        if PIPE_REDRIVE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 128 {
-            print_str(b"[pipe-redrive] WOKE reader fid=0x");
-            print_hex(w.file_id as u32);
-            print_str(b" name_hash=0x");
-            print_hex_u64(w.name_hash);
-            print_str(b" pi=");
-            print_u64(w.pi as u64);
-            print_str(b" badge=");
-            print_u64(w.badge);
-            print_str(b" status=0x");
-            print_hex(status);
-            print_str(b" bytes=");
-            print_u64(completed);
-            print_str(b"\n");
-        }
-    }
-    // Restore the active caller's mirror context and handler identity.
-    restore_redrive_mirrors!();
-    nt_handler.loop_ctx = saved_ctx;
-    woken
 }
 
 /// BATCH 34 — complete the pending async server `FSCTL_PIPE_LISTEN` for `server_fid` after a client
@@ -23785,7 +23312,7 @@ unsafe fn pipe_listen_deliver_exact(
         driver_launch::copy_completed_irp(pending.irp_id, false)
     else {
         if driver_launch::completed_irp_copy_requires_retry(pending.irp_id) {
-            PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+            PIPE_LISTEN_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
         }
         return 0;
     };
@@ -23832,7 +23359,7 @@ unsafe fn pipe_listen_deliver_exact(
                 && (!nt_handler.xas_try_write_buf(l.iosb_va, &status.to_le_bytes())
                     || !nt_handler.xas_try_write_buf(l.iosb_va + 8, &information.to_le_bytes()))
             {
-                PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                PIPE_LISTEN_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
                 break 'delivery false;
             }
             let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
@@ -23849,7 +23376,7 @@ unsafe fn pipe_listen_deliver_exact(
             let apc_status =
                 nt_handler.queue_file_user_apc(l.tid, l.apc_routine, l.apc_context, l.iosb_va);
             if apc_status != nt_fs::STATUS_SUCCESS && !nt_handler.file_apc_target_gone(l.tid) {
-                PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                PIPE_LISTEN_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
                 break 'delivery false;
             }
             let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
@@ -23868,7 +23395,7 @@ unsafe fn pipe_listen_deliver_exact(
         if delivery_state & nt_io_manager::IO_DELIVERY_FILE_PUBLISHED == 0 {
             let signal_status = nt_handler.signal_file_completion(l.canonical_file_id, status);
             if signal_status != nt_fs::STATUS_SUCCESS {
-                PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                PIPE_LISTEN_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
                 break 'delivery false;
             }
             let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
@@ -23891,7 +23418,7 @@ unsafe fn pipe_listen_deliver_exact(
                 l.completion_port_suppressed,
             );
             if post_status != nt_fs::STATUS_SUCCESS {
-                PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                PIPE_LISTEN_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
                 break 'delivery false;
             }
             if nt_handler.io_completion_wake.is_some() {
@@ -23912,7 +23439,7 @@ unsafe fn pipe_listen_deliver_exact(
             if l.event_obj_idx != u64::MAX {
                 let idx = l.event_obj_idx as usize;
                 if nt_handler.events.set_existing(idx as u64).is_none() {
-                    PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                    PIPE_LISTEN_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
                     break 'delivery false;
                 }
                 let woken = wait_wake_dispatcher_set(nt_handler);
@@ -23936,7 +23463,7 @@ unsafe fn pipe_listen_deliver_exact(
                 .expect("signaled pipe listen event disappeared");
         }
         if driver_launch::acknowledge_completed_irp(l.irp_id).is_err() {
-            PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+            PIPE_LISTEN_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
             break 'delivery false;
         }
         let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);

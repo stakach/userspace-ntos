@@ -28,11 +28,8 @@ use alloc::vec::Vec;
 
 use nt_status::NtStatus;
 
-use crate::pending_io::IO_DELIVERY_REPLY_CLAIMED;
 #[cfg(test)]
-use crate::pending_io::{
-    IO_DELIVERY_APC_PUBLISHED, IO_DELIVERY_EVENT_PUBLISHED, IO_DELIVERY_FILE_PUBLISHED,
-};
+use crate::pending_io::IO_DELIVERY_EVENT_PUBLISHED;
 
 // --- NPFS constants (references/reactos/sdk/include/ndk/iotypes.h) ----------
 
@@ -272,6 +269,9 @@ pub struct PipeConnection {
     read_message_mode: [bool; 2],
     /// Per-end completion mode (`NP_CCB.CompletionMode[2]`).
     completion_mode: [u32; 2],
+    /// Whether an exact transceive read is queued for each endpoint. NPFS rejects a second
+    /// transaction on that endpoint until the retained read completes or is cancelled.
+    transceive_pending: [bool; 2],
     /// The pipe's write type (byte-stream vs message) from the FCB config.
     write_message_mode: bool,
     /// The pipe's duplex direction (`FILE_PIPE_INBOUND/OUTBOUND/FULL_DUPLEX`).
@@ -293,6 +293,7 @@ impl PipeConnection {
             ],
             read_message_mode: [false, server_msg],
             completion_mode: [FILE_PIPE_QUEUE_OPERATION, params.completion_mode],
+            transceive_pending: [false; 2],
             write_message_mode: msg,
             configuration: params.configuration,
         }
@@ -549,7 +550,15 @@ impl PipeRegistry {
         }
         let msg = conn.write_message_mode;
         let qidx = PipeConnection::write_queue_idx(h.end);
-        Ok(conn.queues[qidx].enqueue(data, msg))
+        let accepted = conn.queues[qidx].enqueue(data, msg);
+        if accepted != 0 {
+            let reader = match h.end {
+                PipeEnd::Server => PipeEnd::Client,
+                PipeEnd::Client => PipeEnd::Server,
+            };
+            conn.transceive_pending[reader.to_raw()] = false;
+        }
+        Ok(accepted)
     }
 
     /// `IRP_MJ_READ` — read up to `max` bytes for `h`'s end from its read queue
@@ -590,13 +599,14 @@ impl PipeRegistry {
             {
                 return Err(STATUS_INVALID_PIPE_STATE);
             }
-            if conn.readable_bytes(h.end) != 0 {
+            if conn.transceive_pending[h.end.to_raw()] || conn.readable_bytes(h.end) != 0 {
                 return Err(STATUS_PIPE_BUSY);
             }
         }
         let written = self.pipe_write(h, out)?;
         let (bytes, more) = self.pipe_read(h, max)?;
-        if bytes.is_empty() && max != 0 {
+        if bytes.is_empty() {
+            self.conn_mut(h)?.transceive_pending[h.end.to_raw()] = true;
             return Err(STATUS_PENDING);
         }
         Ok((written, bytes, more))
@@ -708,293 +718,6 @@ fn valid_completion_mode(mode: u32) -> bool {
         mode,
         FILE_PIPE_QUEUE_OPERATION | FILE_PIPE_COMPLETE_OPERATION
     )
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Pipe-pending completion: the cross-thread park/re-drive bookkeeping (BATCH 33)
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// The live executive runs the REAL isolated npfs.sys as its pipe data plane. A
-// blocking pipe read / FSCTL_PIPE_LISTEN / TRANSCEIVE on an empty pipe returns
-// STATUS_PENDING and, previously, was returned straight to the caller with no
-// re-drive — so a server listener parked on its receive never woke when the peer
-// wrote, and the client's own read got RPC_X_BAD_STUB_DATA.
-//
-// The fix generalizes the EVENT park/wake edge (a caller blocks with its seL4
-// reply cap withheld; a later signal replies to that cap to wake the thread) to
-// pipe data. The seL4-cap side (steal REPLY_MAIN, snapshot RCX/RSP/RFLAGS, send
-// on the stolen cap) stays in the executive — it needs kernel invocations. The
-// PURE bookkeeping (which reads are parked, their npfs file-id + user
-// buffer/IOSB VAs + owning process + resume context) lives here so it is
-// host-testable: park-on-empty, re-drive-on-peer-write, re-armable (a slot frees
-// after a wake and can be re-parked for the next PDU), and bidirectional (server
-// and client sides park independently, keyed by their own file-id).
-//
-// The executive does NOT need a peer→reader map: each waiter carries the exact
-// canonical IRP retained by npfs. On a progress edge it pumps the driver
-// completion broker and probes those exact ids; `complete` frees only the slots
-// whose terminal completion was delivered.
-
-/// One parked `FSCTL_PIPE_TRANSCEIVE` awaiting peer data. All fields are the executive-side
-/// context needed to complete the request when data arrives: the owning device id,
-/// exact canonical IRP, the canonical FileId used for completion bookkeeping,
-/// the owning process index + thread id (whose VSpace/stack-mirror the bytes land in), the
-/// user `buffer`/`iosb` VAs, the buffer length, the seL4 reply cap held for the
-/// blocked thread, and its native-syscall resume context (RCX/RSP/RFLAGS). The
-/// pure table treats them as opaque values. `file_id` participates in the
-/// table's duplicate-waiter policy; completion ownership is always `irp_id`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct PipeWaiter {
-    /// Generation-protected I/O Manager File identity used for cancellation and completion.
-    pub canonical_file_id: u64,
-    /// npfs `FsContext` of the endpoint this transceive is blocked on (the slot key).
-    pub file_id: u64,
-    /// Stable pipe-name correlation captured while the open is live.
-    pub name_hash: u64,
-    /// Exact generation-protected canonical IRP retained by the I/O Manager.
-    pub irp_id: u64,
-    /// Completion surfaces already published for this exact IRP.
-    pub delivery_state: u16,
-    /// Owning process index (which VSpace / stack-mirror to write the bytes into).
-    pub pi: u32,
-    /// The blocked thread id (for diagnostics / targeted cancel).
-    pub tid: u64,
-    /// The caller's fault-EP badge (which per-thread reply/mirror context to restore).
-    pub badge: u64,
-    /// User output-buffer VA the response data must be copied into.
-    pub buffer_va: u64,
-    /// User buffer capacity (bytes).
-    pub buffer_len: u32,
-    /// User IO_STATUS_BLOCK VA (status + information written on completion).
-    pub iosb_va: u64,
-    /// Optional user APC normal routine to queue when the IRP completes.
-    pub apc_routine: u64,
-    /// Caller APC/OVERLAPPED context copied into an associated completion-port packet.
-    pub apc_context: u64,
-    /// Whether the initiating operation tagged its event handle to suppress IOCP notification.
-    pub completion_port_suppressed: bool,
-    /// Executive event-object index to signal on completion (`u64::MAX` for no event).
-    pub event_obj_idx: u64,
-    /// The stolen seL4 MCS reply cap that resumes the blocked thread.
-    /// Zero identifies asynchronous I/O whose initiating syscall already returned STATUS_PENDING.
-    pub reply_cap: u64,
-    /// Native-syscall resume context: RCX (return IP), RSP, RFLAGS.
-    pub resume_ip: u64,
-    pub resume_sp: u64,
-    pub resume_flags: u64,
-}
-
-const PIPE_TABLE_DEFAULT_INITIAL_RESERVE: usize = 16;
-
-/// Reset-safe table of parked pipe transceive requests.
-///
-/// The first reservation size is not a hard NT limit. Real service startup can legitimately have many
-/// RPC clients and driver control pipes with pending transceives at once, so the table grows on demand.
-/// Parking fails only if allocation for the next waiter record fails.
-#[derive(Clone, Debug)]
-pub struct PipeWaiterTable {
-    slots: Vec<Option<PipeWaiter>>,
-    initial_reserve: usize,
-}
-
-impl Default for PipeWaiterTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PipeWaiterTable {
-    pub const fn new() -> Self {
-        Self::with_initial_reserve(PIPE_TABLE_DEFAULT_INITIAL_RESERVE)
-    }
-
-    pub const fn with_initial_reserve(initial_reserve: usize) -> Self {
-        Self {
-            slots: Vec::new(),
-            initial_reserve,
-        }
-    }
-
-    fn grow_reservation(&mut self) -> bool {
-        if self.slots.len() == self.slots.capacity() {
-            let reserve = if self.slots.capacity() == 0 {
-                self.initial_reserve.max(1)
-            } else {
-                1
-            };
-            if self.slots.try_reserve(reserve).is_err() {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Clear stale records and reserve the configured bootstrap storage before an allocator
-    /// watermark is taken. The executive keeps this table alive across syscall-loop rewinds.
-    pub fn reset(&mut self) -> bool {
-        self.slots.clear();
-        if self.slots.capacity() < self.initial_reserve {
-            let additional = self.initial_reserve - self.slots.capacity();
-            if self.slots.try_reserve(additional).is_err() {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Ensure one future [`park`](Self::park) call can record a distinct waiter without allocating at
-    /// the post-IRP park point. The executive calls this before issuing an operation that may pend, so a
-    /// successful NPFS pending IRP always has storage for its completion owner.
-    pub fn ensure_capacity(&mut self) -> bool {
-        if self.slots.iter().any(|slot| slot.is_none()) || self.slots.len() < self.slots.capacity()
-        {
-            return true;
-        }
-        self.grow_reservation()
-    }
-
-    /// Park `w` in a free slot. Returns the slot index, or `None` if the table cannot allocate the next
-    /// record.
-    ///
-    /// Re-armable by construction: a slot freed by [`complete_exact`](Self::complete_exact) or
-    /// [`cancel_thread`](Self::cancel_thread) becomes `None` and is immediately
-    /// reusable for the next PDU's read on the same or a different file-id.
-    pub fn park(&mut self, w: PipeWaiter) -> Option<usize> {
-        for (i, slot) in self.slots.iter_mut().enumerate() {
-            if slot.is_none() {
-                *slot = Some(w);
-                return Some(i);
-            }
-        }
-        if !self.grow_reservation() {
-            return None;
-        }
-        self.slots.push(Some(w));
-        Some(self.slots.len() - 1)
-    }
-
-    /// Number of currently parked waiters.
-    pub fn len(&self) -> usize {
-        self.slots.iter().filter(|s| s.is_some()).count()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.slots.iter().all(|s| s.is_none())
-    }
-
-    pub fn has_capacity(&self) -> bool {
-        self.slots.iter().any(|slot| slot.is_none()) || self.slots.len() < self.slots.capacity()
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.slots.capacity()
-    }
-
-    /// Whether `tid` currently owns any retained pending read/transceive IRP.
-    pub fn has_thread(&self, tid: u64) -> bool {
-        self.slots
-            .iter()
-            .any(|slot| slot.is_some_and(|waiter| waiter.tid == tid))
-    }
-
-    /// A snapshot copy of every parked waiter, for the executive to re-drive on a
-    /// peer write. Copies (not references) so the executive can call npfs +
-    /// `complete` without borrowing the table across its `&mut self` npfs route.
-    /// Order is stable (slot order) so re-drives are deterministic.
-    pub fn drain_all(&self) -> impl Iterator<Item = (usize, PipeWaiter)> + '_ {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| s.map(|w| (i, w)))
-    }
-
-    /// The parked waiter in `slot`, if any (peek without removing).
-    pub fn get(&self, slot: usize) -> Option<PipeWaiter> {
-        self.slots.get(slot).copied().flatten()
-    }
-
-    /// Remove `slot` only when it still names the snapshotted canonical IRP.
-    pub fn complete_exact(&mut self, slot: usize, irp_id: u64) -> Option<PipeWaiter> {
-        let entry = self.slots.get_mut(slot)?;
-        if entry.is_some_and(|waiter| waiter.irp_id == irp_id) {
-            entry.take()
-        } else {
-            None
-        }
-    }
-
-    /// Record one successfully published completion surface for the exact waiter generation.
-    pub fn mark_delivery_exact(&mut self, slot: usize, irp_id: u64, flag: u16) -> Option<u16> {
-        let waiter = self.slots.get_mut(slot)?.as_mut()?;
-        if waiter.irp_id != irp_id {
-            return None;
-        }
-        waiter.delivery_state |= flag;
-        Some(waiter.delivery_state)
-    }
-
-    /// Atomically transfer the exact waiter's reply cap to the completion publisher. `Some(None)`
-    /// means another publisher already owns it; `None` means the slot generation did not match.
-    pub fn claim_reply_cap_exact(&mut self, slot: usize, irp_id: u64) -> Option<Option<u64>> {
-        let waiter = self.slots.get_mut(slot)?.as_mut()?;
-        if waiter.irp_id != irp_id {
-            return None;
-        }
-        if waiter.delivery_state & IO_DELIVERY_REPLY_CLAIMED != 0 {
-            return Some(None);
-        }
-        let reply_cap = core::mem::replace(&mut waiter.reply_cap, 0);
-        waiter.delivery_state |= IO_DELIVERY_REPLY_CLAIMED;
-        Some(Some(reply_cap))
-    }
-
-    /// Cancel + free any waiter owned by `tid`, invoking `complete` with every removed waiter. This
-    /// is the thread-teardown form: the caller owns completing or abandoning the retained I/O in the
-    /// real driver before releasing the table slot.
-    pub fn cancel_thread_with<F>(&mut self, tid: u64, mut complete: F) -> usize
-    where
-        F: FnMut(PipeWaiter),
-    {
-        let mut count = 0;
-        for slot in self.slots.iter_mut() {
-            if slot.is_some_and(|waiter| waiter.delivery_state == 0 && waiter.tid == tid) {
-                let waiter = slot.take().unwrap();
-                complete(waiter);
-                count += 1;
-            }
-        }
-        count
-    }
-
-    /// Cancel + free any waiter owned by `tid` for canonical `file_id`, invoking `complete` with every removed
-    /// waiter. This models `NtCancelIoFile`: only IRPs issued by the current thread for the target
-    /// FILE_OBJECT are cancelled, and the caller owns finalizing the waiter surfaces.
-    pub fn cancel_thread_file_with<F>(&mut self, tid: u64, file_id: u64, mut complete: F) -> usize
-    where
-        F: FnMut(PipeWaiter),
-    {
-        let mut count = 0;
-        for slot in self.slots.iter_mut() {
-            if slot.is_some_and(|waiter| {
-                waiter.delivery_state == 0
-                    && waiter.tid == tid
-                    && waiter.canonical_file_id == file_id
-            }) {
-                let waiter = slot.take().unwrap();
-                complete(waiter);
-                count += 1;
-            }
-        }
-        count
-    }
-
-    /// Is there already a parked read on `file_id`? (Guards double-parking the
-    /// same reading end — a listener that re-issues its read while still parked.)
-    pub fn parked_on(&self, file_id: u64) -> bool {
-        self.slots
-            .iter()
-            .any(|s| s.is_some_and(|w| w.file_id == file_id && w.delivery_state == 0))
-    }
 }
 
 // ─── BATCH 34: the async ncacn_np SERVER completion edge ──────────────────────────────────────────
@@ -1621,6 +1344,8 @@ impl PipeNameWaiterTable {
 /// legitimately have many RPC servers listening before clients drain them. The first reservation
 /// size is just bootstrap storage; the table grows on demand and returns `None` only if the
 /// allocation for another listen record fails.
+const ASYNC_LISTEN_DEFAULT_INITIAL_RESERVE: usize = 16;
+
 #[derive(Clone, Debug)]
 pub struct AsyncListenTable {
     slots: Vec<Option<AsyncListen>>,
@@ -1635,7 +1360,7 @@ impl Default for AsyncListenTable {
 
 impl AsyncListenTable {
     pub const fn new() -> Self {
-        Self::with_initial_reserve(PIPE_TABLE_DEFAULT_INITIAL_RESERVE)
+        Self::with_initial_reserve(ASYNC_LISTEN_DEFAULT_INITIAL_RESERVE)
     }
 
     pub const fn with_initial_reserve(initial_reserve: usize) -> Self {
@@ -1840,35 +1565,6 @@ mod tests {
             .unwrap();
     }
 
-    fn wtr(file_id: u64, pi: u32, tid: u64) -> PipeWaiter {
-        PipeWaiter {
-            canonical_file_id: file_id,
-            file_id,
-            name_hash: 0,
-            irp_id: 0x1_0000 + file_id,
-            delivery_state: 0,
-            pi,
-            tid,
-            badge: pi as u64,
-            buffer_va: 0x1000 + file_id,
-            buffer_len: 256,
-            iosb_va: 0x2000 + file_id,
-            apc_routine: 0,
-            apc_context: 0,
-            completion_port_suppressed: false,
-            event_obj_idx: u64::MAX,
-            reply_cap: 0x40 + file_id,
-            resume_ip: 0x3000 + file_id,
-            resume_sp: 0x4000 + file_id,
-            resume_flags: 0x202,
-        }
-    }
-
-    fn complete_waiter(table: &mut PipeWaiterTable, slot: usize) -> Option<PipeWaiter> {
-        let irp_id = table.get(slot)?.irp_id;
-        table.complete_exact(slot, irp_id)
-    }
-
     fn active_listen(table: &AsyncListenTable, file_id: u64) -> Option<AsyncListen> {
         table.find_active(file_id).map(|(_, listen)| listen)
     }
@@ -1876,233 +1572,6 @@ mod tests {
     fn complete_listen(table: &mut AsyncListenTable, file_id: u64) -> Option<AsyncListen> {
         let (slot, listen) = table.find_active(file_id)?;
         table.complete_exact(slot, listen.irp_id)
-    }
-
-    #[test]
-    fn pipe_waiter_park_on_empty_records_context() {
-        let mut t = PipeWaiterTable::new();
-        assert!(t.is_empty());
-        let slot = t.park(wtr(0xAA, 3, 7)).unwrap();
-        assert_eq!(t.len(), 1);
-        assert!(t.parked_on(0xAA));
-        assert!(!t.parked_on(0xBB));
-        assert!(t.has_thread(7));
-        assert!(!t.has_thread(8));
-        let w = t.get(slot).unwrap();
-        assert_eq!(w.file_id, 0xAA);
-        assert_eq!(w.pi, 3);
-        assert_eq!(w.reply_cap, 0x40 + 0xAA);
-        assert_eq!(w.buffer_va, 0x1000 + 0xAA);
-        assert_eq!(w.iosb_va, 0x2000 + 0xAA);
-    }
-
-    #[test]
-    fn pipe_waiter_delivery_progress_is_exact_and_idempotent() {
-        let mut t = PipeWaiterTable::new();
-        let waiter = wtr(0xAA, 3, 7);
-        let slot = t.park(waiter).unwrap();
-        assert_eq!(
-            t.mark_delivery_exact(slot, waiter.irp_id + 1, IO_DELIVERY_APC_PUBLISHED),
-            None
-        );
-        assert_eq!(
-            t.mark_delivery_exact(slot, waiter.irp_id, IO_DELIVERY_APC_PUBLISHED),
-            Some(IO_DELIVERY_APC_PUBLISHED)
-        );
-        assert_eq!(
-            t.mark_delivery_exact(slot, waiter.irp_id, IO_DELIVERY_FILE_PUBLISHED),
-            Some(IO_DELIVERY_APC_PUBLISHED | IO_DELIVERY_FILE_PUBLISHED)
-        );
-        assert_eq!(
-            t.get(slot).unwrap().delivery_state,
-            IO_DELIVERY_APC_PUBLISHED | IO_DELIVERY_FILE_PUBLISHED
-        );
-    }
-
-    #[test]
-    fn delivered_waiter_does_not_block_next_operation() {
-        let mut t = PipeWaiterTable::new();
-        let first = wtr(0xAA, 3, 7);
-        let first_slot = t.park(first).unwrap();
-        t.mark_delivery_exact(first_slot, first.irp_id, IO_DELIVERY_EVENT_PUBLISHED)
-            .unwrap();
-        assert!(!t.parked_on(0xAA));
-
-        let mut second = wtr(0xAA, 3, 7);
-        second.irp_id += 1;
-        let second_slot = t.park(second).unwrap();
-        assert!(t.parked_on(0xAA));
-        assert_eq!(t.len(), 2);
-        let mut delivered_first = first;
-        delivered_first.delivery_state = IO_DELIVERY_EVENT_PUBLISHED;
-        assert_eq!(
-            t.complete_exact(first_slot, first.irp_id),
-            Some(delivered_first)
-        );
-        assert_eq!(t.get(second_slot), Some(second));
-    }
-
-    #[test]
-    fn asynchronous_pipe_waiter_does_not_own_a_reply_cap() {
-        let mut t = PipeWaiterTable::new();
-        let mut waiter = wtr(0xAA, 3, 7);
-        waiter.reply_cap = 0;
-        waiter.apc_context = 0xDEAD;
-        waiter.event_obj_idx = 9;
-        let slot = t.park(waiter).unwrap();
-        let pending = t.get(slot).unwrap();
-        assert_eq!(pending.reply_cap, 0);
-        assert_eq!(pending.apc_context, 0xDEAD);
-        assert_eq!(pending.event_obj_idx, 9);
-        assert!(t.parked_on(0xAA));
-    }
-
-    #[test]
-    fn pipe_waiter_wake_on_peer_write_drains_and_completes() {
-        // The server listener parks reading server-fid; a peer write re-drives:
-        // drain_all yields the parked read, and complete() frees it after the
-        // executive fills the bytes + replies.
-        let mut t = PipeWaiterTable::new();
-        let slot = t.park(wtr(0xAA, 3, 7)).unwrap();
-        let drained: std::vec::Vec<_> = t.drain_all().collect();
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].0, slot);
-        assert_eq!(drained[0].1.file_id, 0xAA);
-        // Executive re-read npfs (got data), copied it out, replied → complete.
-        let done = complete_waiter(&mut t, slot).unwrap();
-        assert_eq!(done.file_id, 0xAA);
-        assert!(t.is_empty());
-        // Double-complete is benign (a racing write re-drive).
-        assert!(complete_waiter(&mut t, slot).is_none());
-    }
-
-    #[test]
-    fn pipe_waiter_re_armable_across_successive_pdus() {
-        // MSRPC is multi-round-trip: after the bind_ack reply the listener loops
-        // back and re-parks on the SAME reading end for the request PDU. The slot
-        // freed by the first completion must be re-usable.
-        let mut t = PipeWaiterTable::new();
-        let s1 = t.park(wtr(0xAA, 3, 7)).unwrap();
-        complete_waiter(&mut t, s1).unwrap(); // bind read satisfied
-        assert!(t.is_empty());
-        let s2 = t.park(wtr(0xAA, 3, 7)).unwrap(); // request read re-parks
-        assert_eq!(t.len(), 1);
-        assert!(t.parked_on(0xAA));
-        complete_waiter(&mut t, s2).unwrap();
-        assert!(t.is_empty());
-    }
-
-    #[test]
-    fn pipe_waiter_bidirectional_client_and_server_park_independently() {
-        // Both ends can be parked at once (server reading the request, client
-        // reading the response), keyed by their own file-id; completing one does
-        // not disturb the other.
-        let mut t = PipeWaiterTable::new();
-        let server = t.park(wtr(0xAA, 3, 7)).unwrap(); // svc listener reads server end
-        let client = t.park(wtr(0xBB, 2, 4)).unwrap(); // winlogon reads client end
-        assert_eq!(t.len(), 2);
-        assert!(t.parked_on(0xAA) && t.parked_on(0xBB));
-        // A write re-drives both; only the one whose npfs re-read has data completes.
-        let all: std::vec::Vec<_> = t.drain_all().collect();
-        assert_eq!(all.len(), 2);
-        // Complete the server side only (client still PENDING).
-        assert_eq!(complete_waiter(&mut t, server).unwrap().file_id, 0xAA);
-        assert_eq!(t.len(), 1);
-        assert!(t.parked_on(0xBB));
-        assert!(!t.parked_on(0xAA));
-        // Client completes on the next write.
-        assert_eq!(complete_waiter(&mut t, client).unwrap().file_id, 0xBB);
-        assert!(t.is_empty());
-    }
-
-    #[test]
-    fn pipe_waiter_grows_past_initial_reservation() {
-        // The initial reservation is only bootstrap storage. More concurrent RPC/driver pipe
-        // waiters grow the table instead of returning a synthetic out-of-resources status.
-        let mut t = PipeWaiterTable::with_initial_reserve(2);
-        assert!(t.ensure_capacity());
-        assert!(t.park(wtr(0xAA, 3, 7)).is_some());
-        assert!(t.park(wtr(0xBB, 3, 8)).is_some());
-        assert!(t.park(wtr(0xCC, 3, 9)).is_some());
-        assert_eq!(t.len(), 3);
-        assert!(t.capacity() >= 3);
-        // Freeing one re-opens a slot.
-        complete_waiter(&mut t, 0).unwrap();
-        let reused = t.park(wtr(0xDD, 3, 10)).unwrap();
-        assert_eq!(reused, 0);
-    }
-
-    #[test]
-    fn pipe_waiter_cancel_thread_frees_all_its_slots() {
-        let mut t = PipeWaiterTable::new();
-        t.park(wtr(0xAA, 3, 7)).unwrap();
-        t.park(wtr(0xBB, 3, 7)).unwrap(); // same tid, 2nd end
-        t.park(wtr(0xCC, 2, 4)).unwrap(); // different thread
-        let mut cancelled = std::vec::Vec::new();
-        assert_eq!(
-            t.cancel_thread_with(7, |waiter| cancelled.push(waiter.file_id)),
-            2
-        );
-        assert_eq!(cancelled, std::vec![0xAA, 0xBB]);
-        assert_eq!(t.len(), 1);
-        assert!(t.parked_on(0xCC));
-    }
-
-    #[test]
-    fn pipe_waiter_cancel_thread_callback_releases_every_waiter() {
-        let mut t = PipeWaiterTable::new();
-        t.park(wtr(0xAA, 3, 7)).unwrap();
-        t.park(wtr(0xBB, 3, 7)).unwrap();
-        t.park(wtr(0xCC, 2, 4)).unwrap();
-
-        let mut cancelled = std::vec::Vec::new();
-        assert_eq!(
-            t.cancel_thread_with(7, |waiter| {
-                cancelled.push((waiter.canonical_file_id, waiter.file_id, waiter.tid))
-            }),
-            2
-        );
-        assert_eq!(cancelled, std::vec![(0xAA, 0xAA, 7), (0xBB, 0xBB, 7)]);
-        assert_eq!(t.len(), 1);
-        assert!(!t.parked_on(0xAA));
-        assert!(!t.parked_on(0xBB));
-        assert!(t.parked_on(0xCC));
-    }
-
-    #[test]
-    fn pipe_waiter_cancel_thread_file_only_removes_matching_file_object() {
-        let mut t = PipeWaiterTable::new();
-        t.park(wtr(0xAA, 3, 7)).unwrap();
-        t.park(wtr(0xBB, 3, 7)).unwrap();
-        t.park(wtr(0xAA, 3, 8)).unwrap();
-
-        let mut cancelled = std::vec::Vec::new();
-        assert_eq!(
-            t.cancel_thread_file_with(7, 0xAA, |waiter| cancelled.push(waiter.file_id)),
-            1
-        );
-        assert_eq!(cancelled, std::vec![0xAA]);
-        let remaining: std::vec::Vec<_> = t
-            .drain_all()
-            .map(|(_, waiter)| (waiter.tid, waiter.file_id))
-            .collect();
-        assert_eq!(remaining, std::vec![(7, 0xBB), (8, 0xAA)]);
-        assert_eq!(t.len(), 2);
-    }
-
-    #[test]
-    fn pipe_waiter_cancels_by_canonical_file_but_correlates_by_raw_context() {
-        let mut t = PipeWaiterTable::new();
-        let mut first = wtr(0xCCB, 3, 7);
-        first.canonical_file_id = 0x1_0001;
-        let mut second = wtr(0xCCB, 3, 7);
-        second.canonical_file_id = 0x1_0002;
-        t.park(first).unwrap();
-        t.park(second).unwrap();
-
-        assert!(t.parked_on(0xCCB));
-        assert_eq!(t.cancel_thread_file_with(7, 0x1_0001, |_| {}), 1);
-        assert!(t.parked_on(0xCCB));
     }
 
     #[test]
@@ -2489,11 +1958,34 @@ mod tests {
         set_message_read(&mut r, c);
 
         assert_eq!(r.transceive(c, b"svc-control", 4), Err(STATUS_PENDING));
+        assert_eq!(
+            r.transceive(c, b"duplicate", 4),
+            Err(STATUS_PIPE_BUSY),
+            "the retained read, not an executive slot, enforces one transaction per endpoint"
+        );
 
         let (request, more) = r.pipe_read(s, 64).unwrap();
         assert_eq!(&request, b"svc-control");
         assert!(!more);
         assert_eq!(r.readable_bytes(c).unwrap(), 0);
+    }
+
+    #[test]
+    fn zero_output_transceive_still_queues_its_exact_read() {
+        let mut r = dx();
+        let s = r.create_server_pipe("zero", message_params()).unwrap();
+        r.listen(s).unwrap();
+        let c = r.connect_client("zero").unwrap();
+        set_message_read(&mut r, c);
+
+        assert_eq!(r.transceive(c, b"request", 0), Err(STATUS_PENDING));
+        assert_eq!(r.transceive(c, b"second", 0), Err(STATUS_PIPE_BUSY));
+        assert_eq!(r.pipe_read(s, 64).unwrap().0, b"request");
+        r.pipe_write(s, b"response").unwrap();
+        assert_eq!(r.transceive(c, b"third", 0), Err(STATUS_PIPE_BUSY));
+        assert_eq!(r.pipe_read(c, 64).unwrap().0, b"response");
+        assert_eq!(r.transceive(c, b"third", 0), Err(STATUS_PENDING));
+        assert_eq!(r.pipe_read(s, 64).unwrap().0, b"third");
     }
 
     #[test]
@@ -3270,47 +2762,6 @@ mod tests {
     }
 
     #[test]
-    fn pipe_waiter_cancel_thread_clears_parked_on_and_reopens_slot() {
-        // cancel_thread_with must clear the parked_on() key AND free the slot for immediate re-park
-        // after the caller has finalized the real pending IRP.
-        let mut t = PipeWaiterTable::with_initial_reserve(2);
-        t.park(wtr(0xAA, 3, 7)).unwrap();
-        t.park(wtr(0xBB, 3, 7)).unwrap();
-        assert!(t.parked_on(0xAA));
-        assert_eq!(t.cancel_thread_with(7, |_| {}), 2);
-        assert!(!t.parked_on(0xAA), "cancel clears the parked_on key");
-        assert!(!t.parked_on(0xBB));
-        assert!(t.is_empty());
-        // Both freed slots are immediately re-usable, and additional concurrent waiters grow the table.
-        assert!(t.park(wtr(0xCC, 2, 4)).is_some());
-        assert!(t.park(wtr(0xDD, 2, 4)).is_some());
-        assert!(t.park(wtr(0xEE, 2, 4)).is_some());
-        assert_eq!(t.len(), 3);
-    }
-
-    #[test]
-    fn pipe_waiter_active_read_key_reopens_after_exact_completion() {
-        let mut t = PipeWaiterTable::new();
-        let read = wtr(0xAA, 4, 26);
-        t.park(read).unwrap();
-        assert!(t.parked_on(0xAA));
-        assert!(!t.parked_on(0xBB));
-        let (slot, _) = t.drain_all().next().unwrap();
-        complete_waiter(&mut t, slot).unwrap();
-        assert!(!t.parked_on(0xAA));
-    }
-
-    #[test]
-    fn pipe_waiter_cancel_thread_no_match_is_noop() {
-        // cancel_thread_with for a tid with no parked waiters frees nothing and disturbs nobody.
-        let mut t = PipeWaiterTable::new();
-        t.park(wtr(0xAA, 3, 7)).unwrap();
-        assert_eq!(t.cancel_thread_with(999, |_| {}), 0);
-        assert_eq!(t.len(), 1);
-        assert!(t.parked_on(0xAA));
-    }
-
-    #[test]
     fn half_duplex_outbound_rejects_wrong_direction_read() {
         // The READ direction check (read.c:70): on an OUTBOUND pipe the server may NOT read (it only
         // writes); the client may. Only the WRITE direction was covered before — this exercises the
@@ -3400,23 +2851,5 @@ mod tests {
             r.transceive(s, b"x", 16).unwrap_err(),
             STATUS_INVALID_PIPE_STATE
         );
-    }
-
-    #[test]
-    fn drain_all_order_is_stable_slot_order() {
-        // The executive re-drives parked readers in a DETERMINISTIC order (slot order) so a peer write
-        // re-issues reads reproducibly. Freeing a middle slot and re-parking reuses the low slot.
-        let mut t = PipeWaiterTable::new();
-        let s0 = t.park(wtr(0xA0, 1, 1)).unwrap();
-        let _s1 = t.park(wtr(0xA1, 1, 2)).unwrap();
-        let _s2 = t.park(wtr(0xA2, 1, 3)).unwrap();
-        let ids: std::vec::Vec<u64> = t.drain_all().map(|(_, w)| w.file_id).collect();
-        assert_eq!(ids, [0xA0, 0xA1, 0xA2]);
-        // Free the FIRST; a re-park fills the now-lowest free slot (slot 0).
-        complete_waiter(&mut t, s0).unwrap();
-        let s_new = t.park(wtr(0xB0, 1, 9)).unwrap();
-        assert_eq!(s_new, 0, "the lowest free slot is reused");
-        let ids2: std::vec::Vec<u64> = t.drain_all().map(|(_, w)| w.file_id).collect();
-        assert_eq!(ids2, [0xB0, 0xA1, 0xA2]);
     }
 }
