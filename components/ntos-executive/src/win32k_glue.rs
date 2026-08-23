@@ -63,6 +63,7 @@ static USER_CALLBACK_OWNER_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CLIENT_LOOKUP_FAILURES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_INVALID_REQUEST_TRACES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_DISPATCHER: AtomicU64 = AtomicU64::new(0);
+static WIN32K_MESSAGE_STAGE_LEASES: AtomicU64 = AtomicU64::new(0);
 const _: () = assert!(
     nt_user_callback::CLIENT_TOKEN_USER_SID_MAX == win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX
 );
@@ -236,6 +237,7 @@ pub(crate) struct CompletedWin32kDispatch {
     pub args: [u64; 4],
     pub caller_sp: u64,
     pub status: u64,
+    pub provider_output_len: u32,
     pub arg_snapshot_len: u32,
     pub arg_snapshot: [u8; COMPLETED_ARG_SNAPSHOT_BYTES],
 }
@@ -251,18 +253,23 @@ impl CompletedWin32kDispatch {
             args,
             caller_sp,
             status,
+            provider_output_len: 0,
             arg_snapshot_len: 0,
             arg_snapshot: [0; COMPLETED_ARG_SNAPSHOT_BYTES],
         }
     }
 
     pub(crate) unsafe fn capture_arg_snapshot(&mut self, len: u64) -> bool {
+        self.capture_arg_snapshot_from(win32k_subsystem::WIN32K_ARG_VADDR, len)
+    }
+
+    pub(crate) unsafe fn capture_arg_snapshot_from(&mut self, source: u64, len: u64) -> bool {
         if len == 0 || len as usize > COMPLETED_ARG_SNAPSHOT_BYTES {
             self.arg_snapshot_len = 0;
             return false;
         }
         core::ptr::copy_nonoverlapping(
-            win32k_subsystem::WIN32K_ARG_VADDR as *const u8,
+            source as *const u8,
             self.arg_snapshot.as_mut_ptr(),
             len as usize,
         );
@@ -279,6 +286,79 @@ impl CompletedWin32kDispatch {
         self.arg_snapshot[..snapshot.len()].copy_from_slice(snapshot);
         self.arg_snapshot[snapshot.len()..].fill(0);
         true
+    }
+}
+
+pub(crate) fn acquire_win32k_message_stage() -> Option<nt_user_callback::DispatchOutputStage> {
+    let mut leases = WIN32K_MESSAGE_STAGE_LEASES.load(Ordering::Acquire);
+    loop {
+        let free = (!leases).trailing_zeros() as u64;
+        if free >= win32k_subsystem::WIN32K_MESSAGE_STAGE_SLOTS {
+            return None;
+        }
+        let bit = 1u64 << free;
+        match WIN32K_MESSAGE_STAGE_LEASES.compare_exchange_weak(
+            leases,
+            leases | bit,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                let stage = nt_user_callback::DispatchOutputStage {
+                    provider_pointer: win32k_subsystem::WIN32K_MESSAGE_STAGE_BASE
+                        + free * win32k_subsystem::WIN32K_MESSAGE_STAGE_SLOT_BYTES,
+                    capacity: nt_user_callback::DISPATCH_MESSAGE_OUTPUT_BYTES,
+                };
+                unsafe {
+                    core::ptr::write_volatile(
+                        (stage.provider_pointer
+                            + win32k_subsystem::WIN32K_MESSAGE_STAGE_OUTPUT_LENGTH_OFFSET)
+                            as *mut u64,
+                        u64::MAX,
+                    );
+                }
+                return Some(stage);
+            }
+            Err(current) => leases = current,
+        }
+    }
+}
+
+pub(crate) fn release_win32k_message_stage(
+    stage: nt_user_callback::DispatchOutputStage,
+) -> bool {
+    let Some(offset) = stage
+        .provider_pointer
+        .checked_sub(win32k_subsystem::WIN32K_MESSAGE_STAGE_BASE)
+    else {
+        return false;
+    };
+    if stage.capacity != nt_user_callback::DISPATCH_MESSAGE_OUTPUT_BYTES
+        || offset % win32k_subsystem::WIN32K_MESSAGE_STAGE_SLOT_BYTES != 0
+    {
+        return false;
+    }
+    let index = offset / win32k_subsystem::WIN32K_MESSAGE_STAGE_SLOT_BYTES;
+    if index >= win32k_subsystem::WIN32K_MESSAGE_STAGE_SLOTS {
+        return false;
+    }
+    let bit = 1u64 << index;
+    WIN32K_MESSAGE_STAGE_LEASES.fetch_and(!bit, Ordering::AcqRel) & bit != 0
+}
+
+pub(crate) unsafe fn published_win32k_output_length(
+    stage: nt_user_callback::DispatchOutputStage,
+) -> Option<u32> {
+    let len = core::ptr::read_volatile(
+        (stage.provider_pointer + win32k_subsystem::WIN32K_MESSAGE_STAGE_OUTPUT_LENGTH_OFFSET)
+            as *const u64,
+    );
+    (len <= u64::from(stage.capacity)).then_some(len as u32)
+}
+
+unsafe fn release_dispatch_output_stage(context: nt_user_callback::DispatchContext) {
+    if let Some(stage) = context.output_stage {
+        let _ = release_win32k_message_stage(stage);
     }
 }
 
@@ -1123,7 +1203,7 @@ unsafe fn remember_active_dispatch_arg_snapshot(
     if context.ssn != win32k_subsystem::SSN_NT_USER_INITIALIZE {
         return true;
     }
-    let len = context.args[2].min(win32k_subsystem::WIN32K_ARG_FRAMES * 0x1000);
+    let len = context.args[2].min(win32k_subsystem::WIN32K_ARG_GENERAL_BYTES);
     if len == 0 || len as usize > nt_user_callback::DISPATCH_ARG_SNAPSHOT_BYTES {
         return false;
     }
@@ -1555,6 +1635,7 @@ pub(crate) unsafe fn reassert_top_client_callback_window(
 unsafe fn restore_all_client_callback_windows() {
     let active = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE);
     while let Some(frame) = active.discard_top() {
+        release_dispatch_output_stage(*frame.dispatch_context());
         restore_client_callback_window(frame);
     }
 }
@@ -2712,6 +2793,9 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
         }
 
         let stack_ok = result.completed && unwind_controlled_dispatch(request);
+        if !result.callback_suspended {
+            release_dispatch_output_stage(dispatch_context);
+        }
         if !stack_ok {
             abort_controlled_user_callbacks();
         }
@@ -2918,6 +3002,9 @@ pub(crate) unsafe fn unwind_dead_client_user_callbacks(client_pi: u32) -> u64 {
             previous_dispatch,
         );
         unwound += 1;
+        if !component.callback_suspended {
+            release_dispatch_output_stage(dispatch_context);
+        }
         USER_CALLBACK_DEAD_CLIENT_UNWINDS.fetch_add(1, Ordering::Relaxed);
         // A REDIRECTED frame consumed a `real-redirect` that can never become a `real-return`; record
         // it so the redirect ledger stays exact (see the counter's doc comment).
@@ -3176,6 +3263,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     restore_client_callback_window(completed_frame);
     let dispatch_context = *completed_frame.dispatch_context();
     if dispatch_context.dispatch_id != request.dispatch_id {
+        release_dispatch_output_stage(dispatch_context);
         abort_controlled_user_callbacks();
         return None;
     }
@@ -3239,11 +3327,13 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         });
     }
     if !component.completed {
+        release_dispatch_output_stage(dispatch_context);
         abort_controlled_user_callbacks();
         print_str(b"[user-callback] B component continuation failed to complete\n");
         return None;
     }
     if !unwind_controlled_dispatch(request) {
+        release_dispatch_output_stage(dispatch_context);
         abort_controlled_user_callbacks();
         print_str(b"[user-callback] dispatch continuation failed to unwind\n");
         return None;
@@ -3261,6 +3351,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     reassert_top_client_callback_window(&identity);
     let Some(tcb) = (completed_frame.client_tcb() > 1).then_some(completed_frame.client_tcb())
     else {
+        release_dispatch_output_stage(dispatch_context);
         return None;
     };
     let Some(completed_outer_resume_ip) = resolve_callback_resume_ip(
@@ -3273,6 +3364,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         print_str(b"[user-callback] completed callback missing executable outer resume=0x");
         print_crash_hex64(completed_frame.outer_resume_ip());
         print_str(b"\n");
+        release_dispatch_output_stage(dispatch_context);
         return None;
     };
     let completed = nt_user_callback::completed_outer_context(
@@ -3293,6 +3385,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         return_rsp,
     );
     if tcb_write_regs20(tcb, &completed, false) != 0 {
+        release_dispatch_output_stage(dispatch_context);
         return None;
     }
     USER_CALLBACK_REAL_RETURNS.fetch_add(1, Ordering::Relaxed);
@@ -3309,10 +3402,24 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         dispatch_context.ssn,
         nt_user_callback::NTUSER_GET_MESSAGE_SSN | nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
     ) {
-        // Get/Peek use the shared argument window for their MSG output. Nested callbacks can reuse
-        // that window before the parked outer dispatch resumes, so bind the final bytes to this
-        // completed dispatch before control returns to the executive service loop.
-        let _ = outer_dispatch.capture_arg_snapshot(COMPLETED_MSG_SNAPSHOT_BYTES as u64);
+        // The provider publishes output validity only after the real outer handler returns. Bind
+        // those bytes from this dispatch's retained lease before releasing it; nested callbacks use
+        // different leases and therefore cannot overwrite the parked MSG.
+        if let Some(stage) = dispatch_context.output_stage {
+            match published_win32k_output_length(stage) {
+                Some(len) => {
+                    outer_dispatch.provider_output_len = len;
+                    if len != 0 {
+                        let _ = outer_dispatch
+                            .capture_arg_snapshot_from(stage.provider_pointer, u64::from(len));
+                    }
+                }
+                None => outer_dispatch.provider_output_len = u32::MAX,
+            }
+            let _ = release_win32k_message_stage(stage);
+        } else {
+            outer_dispatch.provider_output_len = u32::MAX;
+        }
     } else if dispatch_context.ssn == win32k_subsystem::SSN_NT_USER_INITIALIZE
         && component.result == 0
     {
@@ -3323,6 +3430,8 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         } else {
             let _ = outer_dispatch.capture_arg_snapshot(dispatch_context.args[2]);
         }
+    } else {
+        release_dispatch_output_stage(dispatch_context);
     }
     Some(CompletedUserCallback {
         outer_dispatch: Some(outer_dispatch),
@@ -5508,6 +5617,7 @@ pub(crate) unsafe fn win32k_dispatch_wide(
         caller_sp,
         stack_args,
         [a0, a1, a2, a3],
+        None,
         client,
     )
 }
@@ -5563,6 +5673,7 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
     caller_sp: u64,
     stack_args: &[u64],
     completion_args: [u64; 4],
+    output_stage: Option<nt_user_callback::DispatchOutputStage>,
     client: Win32kClientContext,
 ) -> (u64, bool) {
     let w_fault = WIN32K_FAULT_EP.load(Ordering::Relaxed);
@@ -5633,6 +5744,7 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
             ssn,
             args: completion_args,
             caller_sp,
+            output_stage,
         },
     );
     core::ptr::write_volatile(
@@ -5742,7 +5854,6 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
         i += 1;
     }
     core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_STATUS) as *mut i32, 0);
-
     // ── FAULT LOOP (shared): drive win32k's dispatch through the unified `component_pump`, all win32k
     // capability gates TRUE. Fix (A) [DONE via a plain Send, distinguished by label] + Fix (B) [nested
     // faults answered through the per-caller REPLY_W32 cap so REPLY_MAIN's binding to the outer csrss

@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-08-22
+Last updated: 2026-08-23
 
 ## Objective
 
@@ -9018,8 +9018,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     green, and publishes the dependent miniport-block mirror during E1000 start. The follow-up
     provider-domain proof removed the last inline work-item behavior from this path: hosted
     `IoQueueWorkItem`/`ExQueueWorkItem` now enqueue per instance and the executive drains the FIFO
-    through the guarded hosted component trampoline at `PASSIVE_LEVEL` after provider callbacks,
-    provider exports, and ordinary hosted IRP dispatch. The drain reloads the current instance
+    through the guarded hosted component trampoline at `PASSIVE_LEVEL`. The original implementation
+    drained inline after provider callbacks and exports; the retained-IRP follow-up corrected that
+    ordering so nested cross-domain calls only queue work and the outermost hosted dispatch scans all
+    live instances after the complete callback chain unwinds. The drain reloads the current instance
     transport before nested requests so hosted waits that rotate reply caps remain call-bound, and it
     fails closed on work drops, runaway queues, callback walls, or worker bugchecks. The same patch
     keeps provider callback KIRQL projected into dependent callbacks, preserves provider/dependent
@@ -9998,3 +10000,146 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Flipping only the outcome would strand canonical IRPs. Next, consolidate the complete raw graph
     into the owner record, publish it before exposing the active IRP and entering the driver, and
     reconcile inline completion versus pending versus synchronous return by exact owner identity.
+
+    Exact hosted completion-ownership checkpoint (2026-08-23): the raw hosted WDM graph is now
+    inserted under a generation-tagged owner before `MajorFunction` and before the component's
+    active IRP pointer is published. `IoCompleteRequest` claims that exact raw identity across
+    dispatch, pending, and cancel-routine states; inline completion is reconciled without publishing
+    or freeing the graph twice. Raw identity is atomic, the cancel path moves directly from PENDING
+    to cancel-routine ownership, and an in-routine completion remains unreclaimable until the cancel
+    routine returns. The earlier whole-record volatile prepublication experiment is rejected: it
+    allowed concurrent readers to observe torn owner metadata and produced an SCM pipe-timeout boot.
+
+    `HostedDriverBackend` now implements exact canonical poll/copy/ACK against this owner. Output is
+    idempotently readable until ACK, the complete IRP/IOSL/MDL/buffer/FILE_OBJECT graph is reclaimed
+    only inside the component after the consuming ACK, and a committed ACK is not rolled back by a
+    later work-queue maintenance failure. Rejected backend completions retain failed ACKs for retry.
+    Cancellation transport failures are retried from the manager pump, abandoned consumers request
+    real cancellation and auto-ACK whichever terminal result wins, and fault/close maintenance no
+    longer turns ownership commit into a retryable delivery error.
+
+    Pipe read/transceive/write and async-listen delivery now retain the exact waiter generation
+    through copyout, IOSB, APC, File-object signal, IOCP packet, event, reply, and backend ACK. Each
+    visible completion surface has monotonic per-record publication state, the synchronous reply cap
+    is transferred out of the table exactly once, post-side-effect generation mismatches are hard
+    invariants, and ACK failure retains the record and File reference for retry. A completed listen
+    awaiting ACK no longer blocks a new active listen on the same server File object. The old
+    generation-blind listen find/complete/free APIs and the historical full-duplex feature switch are
+    deleted; full duplex is the ordinary per-direction canonical-IRP rule.
+
+    Manager-level File teardown now distinguishes a locally rejected lifecycle dispatch from a
+    CLEANUP/CLOSE IRP accepted by the driver. Only accepted CLOSE commits `close_dispatched`; local
+    failure is retried before Object Manager reference release. `IoManager::disconnect_client`
+    abandons live requests through cancel/terminal ACK, dispatches real CLEANUP then CLOSE, and
+    retires the Object Manager client only after canonical IRP and File ownership drains. The
+    production executive does not use that path yet: `release_file_handle_reference` still removes
+    its `FileCompletionTable` entry before firing raw CLEANUP and CLOSE, ignores both dispatch
+    outcomes, and cannot retain a pending lifecycle `IrpId`. Migrating that teardown is part of the
+    canonical File boundary below; the manager-level behavior must not be cited as production boot
+    proof until the old executive machinery is deleted. User APC queues now grow fallibly as FIFO
+    `VecDeque`s instead of failing at a fixed 16-entry policy cap.
+
+    Host validation is green for `cargo fmt --all`, `cargo test -p nt-process` (`106/106`), `cargo
+    test -p nt-io-manager` (`148/148`), the freestanding executive check, and `git diff --check`.
+    Coverage
+    includes partial/repeated retained-output reads, rejected completion ACK retry, transient cancel
+    dispatch retry, cancel/completion races, exact waiter/listen delivery progress, listener rearm
+    beside an ACK-retry generation, pre-dispatch CLOSE failure retry, and disconnect CLEANUP/CLOSE
+    ordering. The first serialized run for this exact tranche,
+    `.tmp/run-desktop-20260823-145430.log`, is rejected: it reached the first hosted NDIS transmit,
+    prepared the scatter/gather list, then stopped before `get routine-returned`, dispatch exit,
+    summary, or sentinel. A diagnostic rerun proved that the resumed NDIS component was spinning on
+    the miniport-block lock in `MiniIsBusy`, not lost in the microkernel reply/receive handoff. The
+    receive DPC holds that lock while calling the TCP/IP receive handler. TCP/IP queues its ARP work,
+    but the provider bridge incorrectly drained that PASSIVE_LEVEL queue before replying to the
+    parked NDIS continuation, so the worker re-entered NDIS send while the outer DPC still owned the
+    lock. Provider exports and callbacks no longer drain work inline. The outermost hosted dispatch
+    now scans every live instance and drains all queued work at PASSIVE_LEVEL only after the complete
+    cross-domain pump has unwound. This is dynamic across any number of drivers and NICs. The hosted
+    ABI also publishes one logical processor, so its NT spinlock exports use the corresponding IRQL
+    and compiler-barrier contract rather than an SMP CAS lock. The accepted serialized rerun below
+    crosses this point and satisfies the complete desktop gate.
+
+    Review adjustment: the next ownership step is the canonical File boundary. Add a host-tested
+    live `(DeviceId, driver FsContext) -> FileId` binding, allocate the File record before CREATE,
+    bind the returned FsContext only after the driver accepts the open, carry that FileId on every
+    subsequent IRP including CLEANUP/CLOSE, and fail `STATUS_INVALID_HANDLE` when no exact binding
+    exists. Then delete `npfs_last_file_id` and raw lifecycle routing. After this boundary is green,
+    run the serialized desktop proof and continue to the real multi-stack `IoCompleteRequest`
+    unwinder, completion-control invocation, pending propagation, and
+    `STATUS_MORE_PROCESSING_REQUIRED`. Production handle teardown must call this exact manager
+    lifecycle and delete `FileCompletionTable::finish_release` plus raw
+    `dispatch_file_lifecycle_irp`. Faulted hosted-instance teardown must also explicitly quarantine
+    or reclaim every raw owner before the manager uses faulted-backend ACK bypass.
+
+    Serialized ownership/work-order retry (2026-08-23):
+    `.tmp/run-desktop-20260823-152912.log` is rejected, but it crossed the former NDIS scatter/gather
+    deadlock and progressed into live LSA RPC traffic. It then hit the exact waiter-generation
+    invariant at `copied pipe waiter disappeared` while delivering the first redriven 16-byte LSA
+    bind fragment. Two independent audits found no legal removal or `IrpId` reuse in that window.
+    `PIPE_WAITERS` was the one cooperative wait table whose growable `Vec` storage was neither
+    reserved before the service-loop bump-allocator watermark nor marked durable when it grew.
+    The next `reset_to(heap_mark)` could therefore reclaim live waiter slots, and a transient RPC
+    snapshot/output allocation could overwrite them between copyout and the first exact delivery
+    mark. Parked pipe waiters and async listens are now reset/reserved before the watermark; every
+    later capacity change marks durable growth, including the defensive synchronous park path. The
+    exact slot/generation assertions remain mandatory because weakening them would hide allocator
+    lifetime corruption and permit duplicate completion publication.
+
+    Serialized callback-order retry `.tmp/run-desktop-20260823-154026.log` is rejected. It crossed
+    the former NDIS lock and durable pipe-waiter failures, reached the fully painted credential
+    dialog, and posted all 13 username characters through the real USER queue. The second character
+    was dequeued by a real `NtUserPeekMessage` that parked behind a chained `WM_SETTINGCHANGE`
+    callback sequence; after the outer dispatch completed, the next direct Get returned the third
+    character. The old completion path had only one global 48-byte MSG staging buffer and inferred
+    its ownership from the Get/Peek SSN, so nested dispatches could overwrite the parked outer
+    output. Winlogon consequently observed only 12 exact characters, never posted Return, and parked
+    in the next blocking Get. This is an output-ownership failure, not a queue-post or paint failure.
+
+    The callback output-ownership repair is complete. The shared marshal mapping has a
+    dedicated page of 64 dispatch-scoped MSG leases; a lease is attached to the exact
+    `DispatchContext`, survives chained callbacks in that frame, and is released on direct
+    completion, final callback completion, cancellation, dead-client unwind, or abort. The win32k
+    provider publishes the exact output length inside that same lease, rather than in a global
+    shared-page word that a nested dispatch could overwrite. Direct and callback consumers require
+    the provider length to agree with the Get/Peek return contract before copying one complete MSG,
+    including GetMessage's FALSE-with-WM_QUIT case. The general four-page marshal arena remains
+    separately bounded, so large USERCONNECT/object captures cannot clear live MSG leases.
+
+    Serialized staging retry `.tmp/run-desktop-20260823-160701.log` is rejected. Winlogon's direct
+    GetMessage returned the first SAS messages, but the new lease path was mistakenly limited to
+    userinit and Explorer roles while the SAS observer required leased output. The first SAS was
+    therefore not observed, the second SAS was never posted, and the run parked after painting the
+    welcome controls. Message staging now covers every interactive GUI client, including winlogon.
+    Once the modal pump's initial exact Peek/Get/Dispatch sequence is established, its identity now
+    follows the stable badge/TID owner instead of requiring user32 to reuse a movable MSG scratch
+    pointer for every later paint and drain call. Host validation is green for `cargo test -p
+    nt-user-callback` (`58/58`), the freestanding executive check, and `git diff --check`.
+
+    Serialized exact-ownership proof `.tmp/run-desktop-20260823-162150.log` is accepted. It crosses
+    the hosted NDIS send/work-order frontier and the exact retained pipe-completion path, observes
+    both real SAS messages, correlates IDD_LOGON, and completes the modal paint prefix. One nested
+    Get/Peek callback publishes exactly one 48-byte dispatch-owned MSG, all 13 exact credential
+    `WM_CHAR`s are retrieved in order, the edit control renders the exact username through real GDI,
+    and Return is posted and retrieved. Winlogon activates the real user shell, userinit and Explorer
+    launch dynamically, and Explorer completes 665 api0 callbacks with zero live or dead callback
+    failures. Paint reaches 2 BeginPaint, 20 EndPaint, 185 direct GDI returns, and 131 batch flushes
+    carrying 171 records; all 786,432 framebuffer pixels are non-background with at least 32 colors.
+    The run passes `293/293` and emits the sentinel. The wrapper required an interrupt after the
+    sentinel because teardown did not exit on its own; no guest proof was outstanding at that point.
+
+    Review also found that a deferred PASSIVE work-drain failure could rewrite the just-dispatched
+    IRP result. In particular, replacing a valid `STATUS_PENDING` with the worker's error would stop
+    the executive from recording its canonical waiter while the hosted component still owned the
+    raw IRP. Deferred work failure now retires the instance that owns the failed work item but
+    preserves the unrelated IRP's committed status/information for canonical delivery. The hosted
+    pump-depth protocol uses acquire/release ordering and remains owned by the single-threaded
+    executive. Validation is green for `cargo fmt --all`, `cargo test -p nt-io-manager` (`148/148`),
+    the freestanding executive check, and `git diff --check`. Review adjustment after the accepted
+    run: this closes the exact raw hosted completion, retained delivery, deferred-work ordering,
+    durable pipe waiter, and dispatch-scoped GUI output tranche. The next production ownership step
+    remains the canonical File boundary described above. Separately, queue-event GetMessage redrive
+    still cancels a real callback after it may have dequeued a message; replace that path with an
+    exact dispatch-id/generation waiter state machine that transfers the parked reply cap into
+    callback ownership and reparks a valid empty Peek without using the global argument VA. Do not
+    claim generic asynchronous Get/Peek callback semantics until that state machine is green.

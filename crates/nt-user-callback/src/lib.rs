@@ -255,12 +255,46 @@ pub const NTUSER_REGISTER_HOT_KEY_SSN: u64 = 0x126b;
 pub const NTUSER_PEEK_MESSAGE_SSN: u64 = 0x1001;
 pub const NTUSER_GET_MESSAGE_SSN: u64 = 0x1006;
 pub const NTUSER_DISPATCH_MESSAGE_SSN: u64 = 0x1035;
+pub const WM_QUIT: u32 = 0x0012;
+pub const DISPATCH_MESSAGE_OUTPUT_BYTES: u32 = 48;
 
 /// Whether a completed Get/Peek dispatch returned a message. These USER services return a 32-bit
 /// `BOOL`; the generic win32k transport preserves the handler's full RAX so its high half is not
 /// part of this ABI result and must not participate in the comparison.
 pub const fn message_dispatch_returned_message(ssn: u64, raw_result: u64) -> bool {
     matches!(ssn, NTUSER_GET_MESSAGE_SSN | NTUSER_PEEK_MESSAGE_SSN) && raw_result as u32 == 1
+}
+
+/// Number of bytes a completed USER message dispatch authoritatively staged for its caller.
+///
+/// This is evaluated by the win32k provider after the real handler returns. The executive consumes
+/// the published length rather than inferring ownership from the SSN or from a process role. A
+/// successful Peek/Get returns one `MSG`; GetMessage also returns `FALSE` for a staged `WM_QUIT`.
+pub const fn message_dispatch_output_length(ssn: u64, raw_result: u64, staged_message: u32) -> u32 {
+    if message_dispatch_returned_message(ssn, raw_result)
+        || (ssn == NTUSER_GET_MESSAGE_SSN && raw_result as u32 == 0 && staged_message == WM_QUIT)
+    {
+        DISPATCH_MESSAGE_OUTPUT_BYTES
+    } else {
+        0
+    }
+}
+
+/// Whether provider-published output ownership agrees with the public Get/Peek return contract.
+/// A returned message always owns one complete `MSG`; an empty Peek or a failed call owns none.
+pub const fn message_dispatch_output_length_matches_result(
+    ssn: u64,
+    raw_result: u64,
+    output_length: u32,
+) -> bool {
+    let expected = if message_dispatch_returned_message(ssn, raw_result)
+        || (ssn == NTUSER_GET_MESSAGE_SSN && raw_result as u32 == 0)
+    {
+        DISPATCH_MESSAGE_OUTPUT_BYTES
+    } else {
+        0
+    };
+    output_length == expected
 }
 
 /// `w32ksvc64.h`: `SVC_(UserPostMessage, 4)` — the REAL keyboard/message post path. Used both for
@@ -1135,6 +1169,15 @@ pub struct DispatchContext {
     pub ssn: u64,
     pub args: [u64; 4],
     pub caller_sp: u64,
+    pub output_stage: Option<DispatchOutputStage>,
+}
+
+/// A provider-visible output buffer leased to one win32k dispatch. The lease stays attached to the
+/// exact callback frame while that dispatch is parked, so nested dispatches cannot reuse it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DispatchOutputStage {
+    pub provider_pointer: u64,
+    pub capacity: u32,
 }
 
 impl DispatchContext {
@@ -1143,6 +1186,7 @@ impl DispatchContext {
         ssn: 0,
         args: [0; 4],
         caller_sp: 0,
+        output_stage: None,
     };
 }
 
@@ -1365,6 +1409,7 @@ impl ActiveCallbackFrame {
         self.dispatch_context.ssn = 0;
         self.dispatch_context.args.fill(0);
         self.dispatch_context.caller_sp = 0;
+        self.dispatch_context.output_stage = None;
         self.arg_snapshot_len = 0;
         self.arg_snapshot.fill(0);
         self.bridged_window.fill(0);
@@ -3283,6 +3328,10 @@ mod tests {
                     ssn: 0x1050,
                     args: [1, 2, 3, 4],
                     caller_sp: 0x1000,
+                    output_stage: Some(DispatchOutputStage {
+                        provider_pointer: 0x3000,
+                        capacity: DISPATCH_MESSAGE_OUTPUT_BYTES,
+                    }),
                 },
             )
             .unwrap();
@@ -3294,6 +3343,7 @@ mod tests {
                     ssn: 0x1076,
                     args: [5, 6, 7, 8],
                     caller_sp: 0x2000,
+                    output_stage: None,
                 },
             )
             .unwrap();
@@ -3317,6 +3367,13 @@ mod tests {
         assert_eq!(popped_a.client_token_user_sid()[0], 0xaa);
         assert_eq!(popped_a.client_token_user_sid_len(), 0x12);
         assert_eq!(popped_a.dispatch_context().ssn, 0x1050);
+        assert_eq!(
+            popped_a.dispatch_context().output_stage,
+            Some(DispatchOutputStage {
+                provider_pointer: 0x3000,
+                capacity: DISPATCH_MESSAGE_OUTPUT_BYTES,
+            })
+        );
         assert_eq!(popped_a.outer_resume_ip(), 0xdead);
         assert_eq!(stack.len(), 1);
         // B's frame survived the middle-removal with its own context intact.
@@ -3786,6 +3843,55 @@ mod message_result_tests {
         assert!(!message_dispatch_returned_message(
             NTUSER_DISPATCH_MESSAGE_SSN,
             1,
+        ));
+    }
+
+    #[test]
+    fn provider_publishes_output_only_for_a_real_message() {
+        assert_eq!(
+            message_dispatch_output_length(NTUSER_PEEK_MESSAGE_SSN, 0xfeed_beef_0000_0001, WM_CHAR,),
+            DISPATCH_MESSAGE_OUTPUT_BYTES,
+        );
+        assert_eq!(
+            message_dispatch_output_length(NTUSER_PEEK_MESSAGE_SSN, 0, WM_CHAR),
+            0,
+        );
+        assert_eq!(
+            message_dispatch_output_length(NTUSER_GET_MESSAGE_SSN, 0, WM_QUIT),
+            DISPATCH_MESSAGE_OUTPUT_BYTES,
+        );
+        assert_eq!(
+            message_dispatch_output_length(NTUSER_GET_MESSAGE_SSN, u32::MAX as u64, WM_CHAR),
+            0,
+        );
+        assert_eq!(
+            message_dispatch_output_length(NTUSER_DISPATCH_MESSAGE_SSN, 1, WM_CHAR),
+            0,
+        );
+        assert!(message_dispatch_output_length_matches_result(
+            NTUSER_PEEK_MESSAGE_SSN,
+            1,
+            DISPATCH_MESSAGE_OUTPUT_BYTES,
+        ));
+        assert!(message_dispatch_output_length_matches_result(
+            NTUSER_PEEK_MESSAGE_SSN,
+            0,
+            0,
+        ));
+        assert!(message_dispatch_output_length_matches_result(
+            NTUSER_GET_MESSAGE_SSN,
+            0,
+            DISPATCH_MESSAGE_OUTPUT_BYTES,
+        ));
+        assert!(!message_dispatch_output_length_matches_result(
+            NTUSER_GET_MESSAGE_SSN,
+            1,
+            0,
+        ));
+        assert!(!message_dispatch_output_length_matches_result(
+            NTUSER_PEEK_MESSAGE_SSN,
+            0,
+            DISPATCH_MESSAGE_OUTPUT_BYTES,
         ));
     }
 }

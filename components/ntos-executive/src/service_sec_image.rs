@@ -3,6 +3,9 @@
 #![allow(clippy::all)]
 use crate::*;
 
+static PIPE_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
+static CALLBACK_MESSAGE_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) const SEC_IMAGE_FAULT_CAP: u64 = 15000;
 const SEC_IMAGE_PREFETCH_STEADY_PAGES: u64 = 16;
 const SEC_IMAGE_PREFETCH_SOFT_PAGES: u64 = 8;
@@ -706,29 +709,42 @@ unsafe fn process_completed_user_callback_outer_dispatch(
         dispatch.ssn,
         nt_user_callback::NTUSER_GET_MESSAGE_SSN | nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
     ) {
-        if dispatch.arg_snapshot_len as usize != win32k_glue::COMPLETED_MSG_SNAPSHOT_BYTES {
+        let output_len = dispatch.provider_output_len as usize;
+        if !nt_user_callback::message_dispatch_output_length_matches_result(
+            dispatch.ssn,
+            dispatch.status,
+            dispatch.provider_output_len,
+        ) {
+            return false;
+        }
+        if output_len == 0 {
+            if dispatch.arg_snapshot_len != 0 {
+                return false;
+            }
+        } else if output_len != win32k_glue::COMPLETED_MSG_SNAPSHOT_BYTES
+            || dispatch.arg_snapshot_len as usize != output_len
+        {
             let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
             if failures < 8 {
-                print_str(b"[win32k-svc] completed callback MSG snapshot missing pi=");
+                print_str(b"[win32k-svc] completed callback MSG metadata invalid pi=");
                 print_u64(completion_pi as u64);
                 print_str(b" ssn=0x");
                 print_hex(dispatch.ssn as u32);
-                print_str(b" expected=");
-                print_u64(win32k_glue::COMPLETED_MSG_SNAPSHOT_BYTES as u64);
-                print_str(b" got=");
+                print_str(b" published=");
+                print_u64(dispatch.provider_output_len as u64);
+                print_str(b" snapshot=");
                 print_u64(dispatch.arg_snapshot_len as u64);
                 print_str(b"\n");
             }
             return false;
         }
-        let message = u32::from_le_bytes(dispatch.arg_snapshot[8..12].try_into().unwrap());
-        let should_copy = dispatch.status != 0
-            || (dispatch.ssn == nt_user_callback::NTUSER_GET_MESSAGE_SSN && message == WM_QUIT);
-        if should_copy
+        let message = (output_len != 0)
+            .then(|| u32::from_le_bytes(dispatch.arg_snapshot[8..12].try_into().unwrap()));
+        if output_len != 0
             && !img_spawn::client_copyout_mapped(
                 completion_pi as u64,
                 dispatch.args[0],
-                &dispatch.arg_snapshot[..win32k_glue::COMPLETED_MSG_SNAPSHOT_BYTES],
+                &dispatch.arg_snapshot[..output_len],
                 completion_filled_pages,
                 completion_faults,
                 completion_scratch_base,
@@ -744,16 +760,38 @@ unsafe fn process_completed_user_callback_outer_dispatch(
             }
             return false;
         }
+        let trace = CALLBACK_MESSAGE_COMPLETION_TRACE.fetch_add(1, Ordering::Relaxed);
+        if trace < 32 {
+            let hwnd = (output_len != 0)
+                .then(|| u64::from_le_bytes(dispatch.arg_snapshot[0..8].try_into().unwrap()))
+                .unwrap_or(0);
+            let wparam = (output_len != 0)
+                .then(|| u64::from_le_bytes(dispatch.arg_snapshot[16..24].try_into().unwrap()))
+                .unwrap_or(0);
+            print_str(b"[win32k-callback-output] ssn=0x");
+            print_hex(dispatch.ssn as u32);
+            print_str(b" result=0x");
+            print_hex_u64(dispatch.status);
+            print_str(b" bytes=");
+            print_u64(output_len as u64);
+            print_str(b" hwnd=0x");
+            print_hex_u64(hwnd);
+            print_str(b" message=0x");
+            print_hex(message.unwrap_or(0));
+            print_str(b" wParam=0x");
+            print_hex_u64(wparam);
+            print_str(b"\n");
+        }
         if completion_pi == 2
             && nt_user_callback::message_dispatch_returned_message(dispatch.ssn, dispatch.status)
         {
             let hwnd = u64::from_le_bytes(dispatch.arg_snapshot[0..8].try_into().unwrap());
             let wparam = u64::from_le_bytes(dispatch.arg_snapshot[16..24].try_into().unwrap());
-            winlogon_credential_observe_retrieved(hwnd, message, wparam);
+            winlogon_credential_observe_retrieved(hwnd, message.unwrap_or(0), wparam);
         }
     }
     if dispatch.ssn == win32k_subsystem::SSN_NT_USER_INITIALIZE && dispatch.status == 0 {
-        let blen = dispatch.args[2].min(win32k_subsystem::WIN32K_ARG_FRAMES * 0x1000);
+        let blen = dispatch.args[2].min(win32k_subsystem::WIN32K_ARG_GENERAL_BYTES);
         if dispatch.arg_snapshot_len as u64 != blen {
             let failures = USERCONNECT_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
             if failures < 8 {
@@ -2187,6 +2225,7 @@ unsafe fn dispatch_win32k_for_client_with_completion_args(
     caller_sp: u64,
     stack_args: &[u64],
     completion_args: [u64; 4],
+    output_stage: Option<nt_user_callback::DispatchOutputStage>,
     client: win32k_glue::Win32kClientContext,
 ) -> (u64, bool) {
     let result = win32k_glue::win32k_dispatch_wide_with_completion_args(
@@ -2198,6 +2237,7 @@ unsafe fn dispatch_win32k_for_client_with_completion_args(
         caller_sp,
         stack_args,
         completion_args,
+        output_stage,
         client,
     );
     sync_win32k_context_to_process_manager(nt_handler, client.pi as usize, client.pid, client.tid);
@@ -3505,9 +3545,15 @@ unsafe fn observe_completed_dialog_modal_dispatch(
     badge: u64,
     tid: u64,
 ) {
-    if winlogon_dialog_modal_expected_ssn() != dispatch.ssn
-        || !winlogon_dialog_modal_thread_matches(badge, tid, dispatch.args[0])
-    {
+    if winlogon_dialog_modal_expected_ssn() != dispatch.ssn {
+        return;
+    }
+    let owner_matches = if WINLOGON_DIALOG_MODAL_COMPLETED.load(Ordering::Relaxed) != 0 {
+        winlogon_dialog_modal_thread_is_owner(badge, tid)
+    } else {
+        winlogon_dialog_modal_thread_matches(badge, tid, dispatch.args[0])
+    };
+    if !owner_matches {
         return;
     }
     let hwnd = smss_stack_read(dispatch.args[0]);
@@ -5338,6 +5384,9 @@ pub(crate) unsafe fn service_sec_image(
     }
     if !io_completion_waiter_table_reset() {
         panic!("IO completion wait table allocation failed");
+    }
+    if !pipe_waiter_tables_reset() {
+        panic!("pipe completion wait table allocation failed");
     }
     if !pipe_name_waiter_table_reset() {
         panic!("pipe-name wait table allocation failed");
@@ -8894,6 +8943,7 @@ pub(crate) unsafe fn service_sec_image(
             // reply site (the reply-cap steal needs resume_ip/sp/flags, known there).
             let mut park_pipe_device_id: u64 = 0;
             let mut park_pipe_fid: u64 = 0;
+            let mut park_pipe_irp_id: u64 = 0;
             let mut park_pipe_buffer_va: u64 = 0;
             let mut park_pipe_buffer_len: u32 = 0;
             let mut park_pipe_iosb_va: u64 = 0;
@@ -9008,6 +9058,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.io_signal_event = -1;
                 nt_handler.pipe_park_device_id = 0;
                 nt_handler.pipe_park_fid = 0;
+                nt_handler.pipe_park_irp_id = 0;
                 nt_handler.pipe_park_buffer_va = 0;
                 nt_handler.pipe_park_buffer_len = 0;
                 nt_handler.pipe_park_iosb_va = 0;
@@ -9695,6 +9746,7 @@ pub(crate) unsafe fn service_sec_image(
                 if nt_handler.pipe_park_fid != 0 {
                     park_pipe_device_id = nt_handler.pipe_park_device_id;
                     park_pipe_fid = nt_handler.pipe_park_fid;
+                    park_pipe_irp_id = nt_handler.pipe_park_irp_id;
                     park_pipe_buffer_va = nt_handler.pipe_park_buffer_va;
                     park_pipe_buffer_len = nt_handler.pipe_park_buffer_len;
                     park_pipe_iosb_va = nt_handler.pipe_park_iosb_va;
@@ -9713,6 +9765,7 @@ pub(crate) unsafe fn service_sec_image(
                     park_pipe_name_wait_event_obj_idx = nt_handler.pipe_name_wait_event_obj_idx;
                     park_pipe_name_wait_timeout = nt_handler.pipe_name_wait_timeout;
                 }
+                let hosted_io_progress = driver_launch::pump_hosted_io_completions();
                 // ★ BATCH 34: a client CONNECT to a pipe completes the exact async server
                 // FSCTL_PIPE_LISTEN for the accepted CCB's server end. Only a CONNECT (not a write)
                 // completes a listen; writes re-drive parked reads once the connection exists.
@@ -9734,12 +9787,21 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" waiter(s) on available pipe\n");
                     }
                 }
-                if nt_handler.pipe_write_redrive {
+                if nt_handler.pipe_write_redrive
+                    || hosted_io_progress != 0
+                    || PIPE_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel)
+                {
                     let woken = pipe_redrive_all(&mut nt_handler);
+                    let listens = pipe_listen_redrive_all(&mut nt_handler);
                     if woken != 0 && PIPE_REDRIVE_TRACE_COUNT.load(Ordering::Relaxed) <= 20 {
                         print_str(b"[pipe-redrive] peer write woke ");
                         print_u64(woken);
                         print_str(b" parked reader(s)\n");
+                    }
+                    if listens != 0 {
+                        print_str(b"[pipe-listen] exact completion redrive delivered ");
+                        print_u64(listens);
+                        print_str(b" listen(s)\n");
                     }
                 }
                 // The hosted-exe lane reserved a spawn after validating the owner-local file ->
@@ -10396,11 +10458,15 @@ pub(crate) unsafe fn service_sec_image(
                 let modal_message_buffer = get_recv_mr(9);
                 let dialog_modal_dispatch = dialog_modal_expected_ssn != 0
                     && dialog_modal_expected_ssn == m0
-                    && winlogon_dialog_modal_thread_matches(
-                        badge,
-                        current_tid,
-                        modal_message_buffer,
-                    );
+                    && if WINLOGON_DIALOG_MODAL_COMPLETED.load(Ordering::Relaxed) != 0 {
+                        winlogon_dialog_modal_thread_is_owner(badge, current_tid)
+                    } else {
+                        winlogon_dialog_modal_thread_matches(
+                            badge,
+                            current_tid,
+                            modal_message_buffer,
+                        )
+                    };
                 let explorer_direct_gdi_draw = explorer_gui_client
                     && matches!(
                         m0,
@@ -10770,11 +10836,11 @@ pub(crate) unsafe fn service_sec_image(
                 };
                 let (mut d_a1, blen) = if has_buf {
                     let arg = win32k_subsystem::WIN32K_ARG_VADDR;
-                    let n = a2.min(win32k_subsystem::WIN32K_ARG_FRAMES * 0x1000);
+                    let n = a2.min(win32k_subsystem::WIN32K_ARG_GENERAL_BYTES);
                     core::ptr::write_bytes(
                         arg as *mut u8,
                         0,
-                        (win32k_subsystem::WIN32K_ARG_FRAMES * 0x1000) as usize,
+                        win32k_subsystem::WIN32K_ARG_GENERAL_BYTES as usize,
                     );
                     let input = core::slice::from_raw_parts_mut(arg as *mut u8, n as usize);
                     if !img_spawn::client_copyin_mapped(
@@ -10803,7 +10869,7 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     (a1, 0)
                 };
-                let msg_syscall = shell_gui_client
+                let msg_syscall = interactive_gui_client
                     && a0 != 0
                     && (m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
                         || m0 == nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
@@ -10811,11 +10877,22 @@ pub(crate) unsafe fn service_sec_image(
                 let msg_returns_to_client = msg_syscall
                     && (m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
                         || m0 == nt_user_callback::NTUSER_PEEK_MESSAGE_SSN);
+                let mut message_output_stage = None;
+                let mut message_output_stage_failed = false;
                 if msg_syscall {
                     let arg = win32k_subsystem::WIN32K_ARG_VADDR;
                     if msg_returns_to_client {
-                        core::ptr::write_bytes(arg as *mut u8, 0, WIN32K_MSG_BYTES);
-                        d_a0 = arg;
+                        if let Some(stage) = win32k_glue::acquire_win32k_message_stage() {
+                            core::ptr::write_bytes(
+                                stage.provider_pointer as *mut u8,
+                                0,
+                                stage.capacity as usize,
+                            );
+                            d_a0 = stage.provider_pointer;
+                            message_output_stage = Some(stage);
+                        } else {
+                            message_output_stage_failed = true;
+                        }
                     } else {
                         let input =
                             core::slice::from_raw_parts_mut(arg as *mut u8, WIN32K_MSG_BYTES);
@@ -13590,7 +13667,7 @@ pub(crate) unsafe fn service_sec_image(
                     let name_len = (name_lengths & 0xffff) as usize;
                     let name_max = (name_lengths >> 16) as usize;
                     let arg = win32k_subsystem::WIN32K_ARG_VADDR;
-                    let arg_bytes = (win32k_subsystem::WIN32K_ARG_FRAMES * 0x1000) as usize;
+                    let arg_bytes = win32k_subsystem::WIN32K_ARG_GENERAL_BYTES as usize;
                     let graph_valid = oa_ok
                         && name_ok
                         && prefix_ok
@@ -13709,6 +13786,8 @@ pub(crate) unsafe fn service_sec_image(
                     // so dispatching the blocking GetMessage would park the single-threaded host
                     // inside win32k. The !handled block below owns the wait-park.
                     (0, false)
+                } else if message_output_stage_failed {
+                    (0xC000_009A, true)
                 } else if let Some(handle) = session_cursor_hit {
                     (handle as u64, true)
                 } else if let Some(atom) = session_builtin_class_atom {
@@ -14175,6 +14254,7 @@ pub(crate) unsafe fn service_sec_image(
                         dispatch_sp,
                         dispatch_stack_args,
                         [a0, a1, a2, a3],
+                        message_output_stage,
                         client,
                     );
                     if explorer_direct_gdi_draw && r.1 {
@@ -14569,9 +14649,16 @@ pub(crate) unsafe fn service_sec_image(
                     // DIAG: dump the retrieved MSG for winlogon's SAS GetMessage (a0=R10=&Msg). MSG =
                     // {hwnd@0, message@8, wParam@0x10, lParam@0x18}. Confirms whether the injected
                     // WLX_WM_SAS (0x659) reaches winlogon so DispatchMessageW runs SASWindowProc.
-                    if winlogon_gui_client && (m0 == 0x1006 || m0 == 0x1001) && a0 != 0 {
+                    if winlogon_gui_client
+                        && (m0 == 0x1006 || m0 == 0x1001)
+                        && a0 != 0
+                        && r.1
+                        && message_output_stage.and_then(|stage| {
+                            win32k_glue::published_win32k_output_length(stage)
+                        }) == Some(WIN32K_MSG_BYTES as u32)
+                    {
                         let msg_ptr = if msg_returns_to_client {
-                            win32k_subsystem::WIN32K_ARG_VADDR
+                            d_a0
                         } else {
                             a0
                         };
@@ -14675,15 +14762,44 @@ pub(crate) unsafe fn service_sec_image(
                     r
                 };
                 let callback_suspended = win32k_glue::take_user_callback_pump_suspended();
+                let direct_provider_output_len = if ok
+                    && !callback_suspended
+                    && msg_returns_to_client
+                    && message_output_stage.is_some()
+                {
+                    match message_output_stage
+                        .and_then(|stage| win32k_glue::published_win32k_output_length(stage))
+                    {
+                        Some(len)
+                            if nt_user_callback::message_dispatch_output_length_matches_result(
+                                m0, st, len,
+                            ) =>
+                        {
+                            len
+                        }
+                        Some(_) => {
+                            st = 0xC000_0001;
+                            ok = false;
+                            u32::MAX
+                        }
+                        None => {
+                            st = 0xC000_0001;
+                            ok = false;
+                            u32::MAX
+                        }
+                    }
+                } else {
+                    0
+                };
                 // `DispatchMessage` paint proof is authoritative only after the api0 callback
                 // continuation returns; the completed-dispatch hook samples that final MSG.
                 if dialog_modal_dispatch
                     && !callback_suspended
                     && m0 != nt_user_callback::NTUSER_DISPATCH_MESSAGE_SSN
                 {
-                    let staged_msg = msg_syscall && d_a0 == win32k_subsystem::WIN32K_ARG_VADDR;
+                    let staged_msg = msg_returns_to_client && message_output_stage.is_some();
                     let msg_ptr = if staged_msg {
-                        win32k_subsystem::WIN32K_ARG_VADDR
+                        d_a0
                     } else {
                         a0
                     };
@@ -14753,14 +14869,9 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
                 if ok && !redirected_user_callback && msg_returns_to_client {
-                    let arg = win32k_subsystem::WIN32K_ARG_VADDR;
-                    let staged_message = core::ptr::read_unaligned((arg + 8) as *const u32);
-                    let should_copy_msg = st != 0
-                        || (m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
-                            && staged_message == WM_QUIT);
-                    if should_copy_msg {
+                    if direct_provider_output_len as usize == WIN32K_MSG_BYTES {
                         let output =
-                            core::slice::from_raw_parts(arg as *const u8, WIN32K_MSG_BYTES);
+                            core::slice::from_raw_parts(d_a0 as *const u8, WIN32K_MSG_BYTES);
                         if !img_spawn::client_copyout_mapped(
                             pi as u64,
                             a0,
@@ -14787,7 +14898,7 @@ pub(crate) unsafe fn service_sec_image(
                         let mut msg = [0u8; WIN32K_MSG_BYTES];
                         let copy_ok = if msg_returns_to_client {
                             msg.copy_from_slice(core::slice::from_raw_parts(
-                                win32k_subsystem::WIN32K_ARG_VADDR as *const u8,
+                                d_a0 as *const u8,
                                 WIN32K_MSG_BYTES,
                             ));
                             true
@@ -14834,6 +14945,11 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" time=");
                         print_u64(time as u64);
                         print_str(b"\n");
+                    }
+                }
+                if !callback_suspended {
+                    if let Some(stage) = message_output_stage {
+                        let _ = win32k_glue::release_win32k_message_stage(stage);
                     }
                 }
                 if ok && !redirected_user_callback {
@@ -15839,10 +15955,11 @@ pub(crate) unsafe fn service_sec_image(
             // the caller stays blocked in-kernel. A later peer write re-drives it (pipe_redrive_all).
             // Pool/table exhaustion returns STATUS_INSUFFICIENT_RESOURCES; returning PENDING without
             // retaining an owned IRP would leave both completion and ThreadIsIoPending inconsistent.
-            if park_pipe_fid != 0 && reply_main != 0 {
+            if park_pipe_fid != 0 && park_pipe_irp_id != 0 && reply_main != 0 {
                 if pipe_wait_park(
                     park_pipe_device_id,
                     park_pipe_fid,
+                    park_pipe_irp_id,
                     pi as u32,
                     nt_handler.current_tid,
                     badge,
@@ -15884,6 +16001,7 @@ pub(crate) unsafe fn service_sec_image(
                     continue;
                 } else {
                     print_str(b"[pipe-park] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n");
+                    let _ = driver_launch::abandon_pending_irp(park_pipe_irp_id);
                     nt_handler.release_file_reference(park_pipe_fid);
                     result = 0xC000_009A;
                 }
@@ -22632,6 +22750,7 @@ unsafe fn lsa_deliver_reply(nt_handler: &mut ExecNtHandler, replymsg: u64) -> bo
 unsafe fn pipe_wait_park(
     device_id: u64,
     file_id: u64,
+    irp_id: u64,
     pi: u32,
     tid: u64,
     badge: u64,
@@ -22657,9 +22776,12 @@ unsafe fn pipe_wait_park(
         return false; // pool exhausted → caller returns PENDING directly
     };
     let table = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
+    let old_capacity = table.capacity();
     let parked = table.park(nt_io_manager::PipeWaiter {
         device_id,
         file_id,
+        irp_id,
+        delivery_state: 0,
         pi,
         tid,
         badge,
@@ -22680,6 +22802,9 @@ unsafe fn pipe_wait_park(
     if parked.is_none() {
         PIPE_WAITERS_REFUSED.fetch_add(1, Ordering::Relaxed);
         return false;
+    }
+    if table.capacity() != old_capacity {
+        mark_durable_table_growth_dirty();
     }
     // Commit the reply-cap rotation only after the waiter is recorded.
     wait_reply_pool_mark_used(fresh_index);
@@ -22814,13 +22939,12 @@ unsafe fn pipe_name_wait_complete_named(nt_handler: &mut ExecNtHandler, name_has
 
 /// BATCH 33 — finalize parked pipe I/O after a peer operation. Pending pipe IRPs stay owned by npfs:
 /// when a peer write satisfies one, npfs completes the retained IRP through `IoCompleteRequest` and
-/// the driver bridge stashes the exact completion payload keyed by the waiting file id. This redrive
-/// step consumes those stashes, copies results through the waiter's own VSpace mirrors, signals its
+/// the driver bridge retains the exact completion payload under its canonical IRP id. This redrive
+/// step consumes those exact completions, copies results through the waiter's own VSpace mirrors, signals its
 /// event/file completion surfaces, and releases the waiter. If no real completion is present yet, the
 /// waiter stays parked; issuing a fresh read here would create a second outstanding IRP for the same
 /// FILE_OBJECT and violates `FSCTL_PIPE_TRANSCEIVE`'s single retained read half. Returns woken count.
 unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
-    let transport_capacity = (driver_launch::FSD_ARG_FRAMES * 0x1000) as usize;
     // Snapshot the active-mirror context + handler identity so we can restore after each re-drive.
     let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
     let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
@@ -22831,27 +22955,36 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
     let saved_pi = nt_handler.pi;
     let saved_ctx = nt_handler.loop_ctx.take(); // copyout via mirrors only during the re-drive
+    macro_rules! restore_redrive_mirrors {
+        () => {{
+            ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
+            ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
+            ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
+            ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
+            ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
+            ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
+            ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
+            nt_handler.pi = saved_pi;
+        }};
+    }
     let mut woken = 0u64;
     let table = &*core::ptr::addr_of!(PIPE_WAITERS);
     let snapshot: alloc::vec::Vec<(usize, nt_io_manager::PipeWaiter)> = table.drain_all().collect();
     for (slot, w) in snapshot {
-        let want = (w.buffer_len as usize).min(transport_capacity).max(1);
-        let mut output = alloc::vec![0u8; want];
+        let mut delivery_state = w.delivery_state;
         // BATCH 37/I4: a pending READ/TRANSCEIVE is completed only by the IRP npfs retained. A second
         // read here manufactures another data-queue entry and can make the next SCM
         // `TransactNamedPipe` fail with the legitimate `STATUS_PIPE_BUSY` precondition.
-        let (status, completed) = if w.is_write {
-            match driver_launch::take_completed_write_for_device(w.device_id, w.file_id) {
-                Some(completion) => completion,
-                None => continue,
+        let Some((status, completed, output)) =
+            driver_launch::copy_completed_irp(
+                w.irp_id,
+                !w.is_write
+                    && delivery_state & nt_io_manager::IO_DELIVERY_BUFFER_PUBLISHED == 0,
+            )
+        else {
+            if driver_launch::completed_irp_copy_requires_retry(w.irp_id) {
+                PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
             }
-        } else if let Some((st, info, bytes)) =
-            driver_launch::take_completed_read_for_device(w.device_id, w.file_id)
-        {
-            let n = (bytes.len()).min(output.len());
-            output[..n].copy_from_slice(&bytes[..n]);
-            (st, info)
-        } else {
             continue;
         };
         if status == 0x0000_0103 {
@@ -22867,7 +23000,10 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         ACTIVE_CLIENT_PI.store(w.pi as u64, Ordering::Relaxed);
         ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
         nt_handler.pi = w.pi as usize;
-        let copy_len = (completed as usize).min(output.len());
+        if delivery_state & nt_io_manager::IO_DELIVERY_BUFFER_PUBLISHED == 0 {
+            let copy_len = (completed as usize)
+                .min(w.buffer_len as usize)
+                .min(output.len());
         // BATCH 37: copy the delivered bytes for SUCCESS *and* STATUS_BUFFER_OVERFLOW (0x80000005) —
         // a message-mode read of a message larger than the buffer returns the partial bytes WITH
         // overflow (rpcrt4 reads the 16-byte common header of a 72-byte bind PDU this way, then reads
@@ -22885,7 +23021,11 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 completed,
                 &output[..copy_len],
             );
-            nt_handler.xas_write_buf(w.buffer_va, &output[..copy_len]);
+            if !nt_handler.xas_try_write_buf(w.buffer_va, &output[..copy_len]) {
+                PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                restore_redrive_mirrors!();
+                continue;
+            }
             // ★ LSA SELF-RPC instrumentation: an MS-RPC PDU actually DELIVERED off lsass' own
             // `\lsarpc` to a parked reader, attributed by badge to the per-connection WORKER (the
             // bind / request it must service) or to lsass' main thread as the CLIENT (the bind_ack /
@@ -22915,73 +23055,187 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 }
             }
         }
-        if !w.is_write
-            && copy_len >= 16
-            && PIPE_REDRIVE_RPC_TRACE_COUNT.load(Ordering::Relaxed) < 96
-        {
-            let pdu = driver_launch::dcerpc_pdu_view_from_slice(&output[..copy_len]);
-            if pdu.is_some() && PIPE_REDRIVE_RPC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 96 {
-                print_str(b"[pipe-redrive-rpc] fid=0x");
-                print_hex(w.file_id as u32);
-                print_str(b" name_hash=0x");
-                print_hex_u64(pipe_fid_name_hash(w.file_id));
-                print_str(b" pi=");
-                print_u64(w.pi as u64);
-                print_str(b" badge=");
-                print_u64(w.badge);
-                print_str(b" status=0x");
-                print_hex(status);
-                print_str(b" bytes=");
-                print_u64(completed);
-                driver_launch::print_dcerpc_pdu_view(pdu);
-                print_str(b"\n");
+            if !w.is_write
+                && copy_len >= 16
+                && PIPE_REDRIVE_RPC_TRACE_COUNT.load(Ordering::Relaxed) < 96
+            {
+                let pdu = driver_launch::dcerpc_pdu_view_from_slice(&output[..copy_len]);
+                if pdu.is_some()
+                    && PIPE_REDRIVE_RPC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 96
+                {
+                    print_str(b"[pipe-redrive-rpc] fid=0x");
+                    print_hex(w.file_id as u32);
+                    print_str(b" name_hash=0x");
+                    print_hex_u64(pipe_fid_name_hash(w.file_id));
+                    print_str(b" pi=");
+                    print_u64(w.pi as u64);
+                    print_str(b" badge=");
+                    print_u64(w.badge);
+                    print_str(b" status=0x");
+                    print_hex(status);
+                    print_str(b" bytes=");
+                    print_u64(completed);
+                    driver_launch::print_dcerpc_pdu_view(pdu);
+                    print_str(b"\n");
+                }
             }
+            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
+            let state = table_mut
+                .mark_delivery_exact(
+                    slot,
+                    w.irp_id,
+                    nt_io_manager::IO_DELIVERY_BUFFER_PUBLISHED,
+                )
+                .expect("copied pipe waiter disappeared");
+            delivery_state = state;
         }
-        let mut completion_status = status;
-        let mut completion_information = completed;
-        let apc_status =
-            nt_handler.queue_file_user_apc(w.tid, w.apc_routine, w.apc_context, w.iosb_va);
-        if apc_status != nt_fs::STATUS_SUCCESS {
-            completion_status = apc_status;
-            completion_information = 0;
+        let completion_status = status;
+        let completion_information = completed;
+        if delivery_state & nt_io_manager::IO_DELIVERY_IOSB_PUBLISHED == 0 {
+            if w.iosb_va != 0
+                && (!nt_handler.xas_try_write_buf(w.iosb_va, &completion_status.to_le_bytes())
+                    || !nt_handler.xas_try_write_buf(
+                        w.iosb_va + 8,
+                        &completion_information.to_le_bytes(),
+                    ))
+            {
+                PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                restore_redrive_mirrors!();
+                continue;
+            }
+            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
+            let state = table_mut
+                .mark_delivery_exact(
+                    slot,
+                    w.irp_id,
+                    nt_io_manager::IO_DELIVERY_IOSB_PUBLISHED,
+                )
+                .expect("updated pipe IOSB waiter disappeared");
+            delivery_state = state;
         }
-        if w.iosb_va != 0 {
-            nt_handler.xas_write_buf(w.iosb_va, &completion_status.to_le_bytes());
-            nt_handler.xas_write_buf(
-                w.iosb_va + 8,
-                &(completion_information as u64).to_le_bytes(),
+        if delivery_state & nt_io_manager::IO_DELIVERY_APC_PUBLISHED == 0 {
+            let apc_status = nt_handler.queue_file_user_apc(
+                w.tid,
+                w.apc_routine,
+                w.apc_context,
+                w.iosb_va,
             );
+            if apc_status != nt_fs::STATUS_SUCCESS && !nt_handler.file_apc_target_gone(w.tid) {
+                PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                restore_redrive_mirrors!();
+                continue;
+            }
+            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
+            let state = table_mut
+                .mark_delivery_exact(
+                    slot,
+                    w.irp_id,
+                    nt_io_manager::IO_DELIVERY_APC_PUBLISHED,
+                )
+                .expect("queued pipe APC waiter disappeared");
+            delivery_state = state;
         }
-        if w.event_obj_idx != u64::MAX {
-            let _ = nt_handler.events.set_existing(w.event_obj_idx);
-            let _ = wait_wake_dispatcher_set(nt_handler);
+        if delivery_state & nt_io_manager::IO_DELIVERY_FILE_PUBLISHED == 0 {
+            let signal_status =
+                nt_handler.signal_file_completion(w.file_id, completion_status);
+            if signal_status != nt_fs::STATUS_SUCCESS {
+                PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                restore_redrive_mirrors!();
+                continue;
+            }
+            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
+            let state = table_mut
+                .mark_delivery_exact(
+                    slot,
+                    w.irp_id,
+                    nt_io_manager::IO_DELIVERY_FILE_PUBLISHED,
+                )
+                .expect("signaled pipe file waiter disappeared");
+            delivery_state = state;
         }
-        nt_handler.post_file_completion(
-            w.file_id,
-            w.apc_context,
-            completion_status,
-            completion_information,
-            false,
-            w.completion_port_suppressed,
-        );
-        if nt_handler.io_completion_wake.is_some() {
-            let _ = io_completion_deliver(nt_handler);
+        if delivery_state & nt_io_manager::IO_DELIVERY_IOCP_PUBLISHED == 0 {
+            let post_status = nt_handler.post_file_completion_packet(
+                w.file_id,
+                w.apc_context,
+                completion_status,
+                completion_information,
+                false,
+                w.completion_port_suppressed,
+            );
+            if post_status != nt_fs::STATUS_SUCCESS {
+                PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                restore_redrive_mirrors!();
+                continue;
+            }
+            if nt_handler.io_completion_wake.is_some() {
+                let _ = io_completion_deliver(nt_handler);
+            }
+            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
+            let state = table_mut
+                .mark_delivery_exact(
+                    slot,
+                    w.irp_id,
+                    nt_io_manager::IO_DELIVERY_IOCP_PUBLISHED,
+                )
+                .expect("posted pipe IOCP waiter disappeared");
+            delivery_state = state;
         }
-        // Wake the blocked thread on its stolen reply cap — restore RCX/RSP/RFLAGS (MR15/16/17) and
-        // return `status` in MR0 (→ RAX/r10), exactly like the event wake.
-        let cap = w.reply_cap;
-        if cap != 0 {
-            set_reply_mr(15, w.resume_ip);
-            set_reply_mr(16, w.resume_sp);
-            set_reply_mr(17, w.resume_flags);
-            client_reply_on(cap, 18, completion_status as u64, 0, 0, 0);
-            release_reply_pool_cap(cap);
-            thread_wait_state_clear_badge_ready(nt_handler, w.badge);
+        if delivery_state & nt_io_manager::IO_DELIVERY_EVENT_PUBLISHED == 0 {
+            if w.event_obj_idx != u64::MAX {
+                if nt_handler.events.set_existing(w.event_obj_idx).is_none() {
+                    PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                    restore_redrive_mirrors!();
+                    continue;
+                }
+                let _ = wait_wake_dispatcher_set(nt_handler);
+            }
+            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
+            table_mut
+                .mark_delivery_exact(
+                    slot,
+                    w.irp_id,
+                    nt_io_manager::IO_DELIVERY_EVENT_PUBLISHED,
+                )
+                .expect("signaled pipe waiter disappeared");
         }
-        nt_handler.release_file_reference(w.file_id);
-        // Free the slot (re-armable for the next PDU).
+        if delivery_state & nt_io_manager::IO_DELIVERY_REPLY_PUBLISHED == 0 {
+            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
+            let Some(cap) = table_mut
+                .claim_reply_cap_exact(slot, w.irp_id)
+                .expect("pipe waiter disappeared before reply claim")
+            else {
+                PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                restore_redrive_mirrors!();
+                continue;
+            };
+            if cap != 0 {
+                set_reply_mr(15, w.resume_ip);
+                set_reply_mr(16, w.resume_sp);
+                set_reply_mr(17, w.resume_flags);
+                // A successful send or an unbound cap is terminal for this one-shot reply owner.
+                let _ = client_reply_on(cap, 18, completion_status as u64, 0, 0, 0);
+                release_reply_pool_cap(cap);
+                thread_wait_state_clear_badge_ready(nt_handler, w.badge);
+            }
+            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
+            table_mut
+                .mark_delivery_exact(
+                    slot,
+                    w.irp_id,
+                    nt_io_manager::IO_DELIVERY_REPLY_PUBLISHED,
+                )
+                .expect("replied pipe waiter disappeared");
+        }
+        if driver_launch::acknowledge_completed_irp(w.irp_id).is_err() {
+            PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+            restore_redrive_mirrors!();
+            continue;
+        }
         let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
-        table_mut.complete(slot);
+        table_mut
+            .complete_exact(slot, w.irp_id)
+            .expect("ACKed pipe waiter disappeared");
+        nt_handler.release_file_reference(w.file_id);
         woken += 1;
         PIPE_WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
         if PIPE_REDRIVE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 128 {
@@ -23001,14 +23255,7 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         }
     }
     // Restore the writer's active-mirror context + handler identity.
-    ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
-    ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
-    ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
-    ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
-    ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
-    ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
-    ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
-    nt_handler.pi = saved_pi;
+    restore_redrive_mirrors!();
     nt_handler.loop_ctx = saved_ctx;
     woken
 }
@@ -23017,23 +23264,28 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
 /// CONNECT to the same CCB. The ncacn_np rpcrt4 SERVER posted an OVERLAPPED
 /// FSCTL_PIPE_LISTEN (STATUS_PENDING, no client) with a completion EVENT, then parked on
 /// `NtWaitForMultipleObjects([mgr_event, listen_event])`. The client just connected (npfs paired the
-/// ends in one CCB), so ONE matching pending listen is now satisfied: fill its listen IOSB
-/// `{Status=SUCCESS, Information=0}` in the SERVER's VSpace (switch in the listener's mirror context
+/// ends in one CCB), so ONE matching pending listen is now satisfied. Consume the exact canonical
+/// listen IRP completion, then fill its IOSB in the SERVER's VSpace (switch in the listener's context
 /// for the copyout, then restore) and signal its completion event via the shared dispatcher wake path
 /// NtSetEvent wake path — waking the server's wait-array so it reads the client's first PDU (the bind).
 /// Matching the server fid matters when multiple instances of one pipe name are listening: the FSD
 /// has already selected the accepted instance, so the executive must not pick by name. Returns 1 if a
 /// listen was completed, else 0. Re-armable: rpcrt4 re-posts a fresh
 /// FSCTL_PIPE_LISTEN for the next client (a NEW record). Completes ONE listen per connect (one client).
-unsafe fn pipe_listen_complete_server_fid(nt_handler: &mut ExecNtHandler, server_fid: u64) -> u64 {
-    // Find the pending listen for the accepted server end; take it once per client connect.
-    let l = {
-        let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
-        match table_mut.complete(server_fid) {
-            Some(l) => l,
-            None => return 0,
+unsafe fn pipe_listen_deliver_exact(
+    nt_handler: &mut ExecNtHandler,
+    slot: usize,
+    pending: nt_io_manager::AsyncListen,
+) -> u64 {
+    let Some((driver_status, driver_information, _)) =
+        driver_launch::copy_completed_irp(pending.irp_id, false)
+    else {
+        if driver_launch::completed_irp_copy_requires_retry(pending.irp_id) {
+            PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
         }
+        return 0;
     };
+    let l = pending;
     let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
     let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
     let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
@@ -23043,8 +23295,7 @@ unsafe fn pipe_listen_complete_server_fid(nt_handler: &mut ExecNtHandler, server
     let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
     let saved_pi = nt_handler.pi;
     let saved_ctx = nt_handler.loop_ctx.take();
-    let mut completed = 0u64;
-    {
+    let delivered = 'delivery: {
         // Point the IOSB copyout at the SERVER listener's VSpace mirrors.
         let badge = l.badge;
         let (sb, ss, smv, hmv, imv, scratch_base) = mirror_ctx_for(badge, l.pi as usize);
@@ -23056,50 +23307,142 @@ unsafe fn pipe_listen_complete_server_fid(nt_handler: &mut ExecNtHandler, server
         ACTIVE_CLIENT_PI.store(l.pi as u64, Ordering::Relaxed);
         ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
         nt_handler.pi = l.pi as usize;
-        let mut status = 0u32;
-        let mut information = 0u64;
-        let apc_status =
-            nt_handler.queue_file_user_apc(l.tid, l.apc_routine, l.apc_context, l.iosb_va);
-        if apc_status != nt_fs::STATUS_SUCCESS {
-            status = apc_status;
-            information = 0;
+        let status = driver_status;
+        let information = driver_information;
+        let mut delivery_state = l.delivery_state;
+        if delivery_state & nt_io_manager::IO_DELIVERY_BUFFER_PUBLISHED == 0 {
+            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
+            let state = table_mut
+                .mark_delivery_exact(
+                    slot,
+                    l.irp_id,
+                    nt_io_manager::IO_DELIVERY_BUFFER_PUBLISHED,
+                )
+                .expect("pipe listen disappeared before delivery");
+            delivery_state = state;
         }
-        // Fill the listen IO_STATUS_BLOCK: {Status=STATUS_SUCCESS, Information=0}.
-        if l.iosb_va != 0 {
-            nt_handler.xas_write_buf(l.iosb_va, &status.to_le_bytes());
-            nt_handler.xas_write_buf(l.iosb_va + 8, &information.to_le_bytes());
+        // Publish the isolated driver's exact terminal result once, before any visible completion
+        // surface can let user mode inspect or reuse the IOSB.
+        if delivery_state & nt_io_manager::IO_DELIVERY_IOSB_PUBLISHED == 0 {
+            if l.iosb_va != 0
+                && (!nt_handler.xas_try_write_buf(l.iosb_va, &status.to_le_bytes())
+                    || !nt_handler.xas_try_write_buf(l.iosb_va + 8, &information.to_le_bytes()))
+            {
+                PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                break 'delivery false;
+            }
+            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
+            let state = table_mut
+                .mark_delivery_exact(
+                    slot,
+                    l.irp_id,
+                    nt_io_manager::IO_DELIVERY_IOSB_PUBLISHED,
+                )
+                .expect("updated pipe listen IOSB disappeared");
+            delivery_state = state;
+        }
+        if delivery_state & nt_io_manager::IO_DELIVERY_APC_PUBLISHED == 0 {
+            let apc_status =
+                nt_handler.queue_file_user_apc(l.tid, l.apc_routine, l.apc_context, l.iosb_va);
+            if apc_status != nt_fs::STATUS_SUCCESS && !nt_handler.file_apc_target_gone(l.tid) {
+                PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                break 'delivery false;
+            }
+            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
+            let state = table_mut
+                .mark_delivery_exact(
+                    slot,
+                    l.irp_id,
+                    nt_io_manager::IO_DELIVERY_APC_PUBLISHED,
+                )
+                .expect("queued pipe listen APC disappeared");
+            delivery_state = state;
         }
         // NT file objects are waitable, and files associated with an I/O completion port receive a
         // completion packet. Use the shared file-completion path so success and cancellation expose
         // the same surfaces.
-        nt_handler.post_file_completion(
-            l.server_file_id,
-            l.apc_context,
-            status,
-            information,
-            false,
-            l.completion_port_suppressed,
-        );
-        // SIGNAL the overlapped completion event → wakes the server's NtWaitForMultipleObjects. Reuse
-        // the exact NtSetEvent wake path: set the event's `signalled` flag then reevaluate waiters.
-        if l.event_obj_idx != u64::MAX {
-            let idx = l.event_obj_idx as usize;
-            let _ = nt_handler.events.set_existing(idx as u64);
-            let woken = wait_wake_dispatcher_set(nt_handler);
-            if PIPE_LISTEN_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
-                print_str(b"[pipe-listen] COMPLETE server fid=0x");
-                print_hex(l.server_file_id as u32);
-                print_str(b" signalled event_obj=0x");
-                print_hex(idx as u32);
-                print_str(b" -> woke ");
-                print_u64(woken);
-                print_str(b" server wait(s)\n");
+        if delivery_state & nt_io_manager::IO_DELIVERY_FILE_PUBLISHED == 0 {
+            let signal_status = nt_handler.signal_file_completion(l.server_file_id, status);
+            if signal_status != nt_fs::STATUS_SUCCESS {
+                PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                break 'delivery false;
             }
+            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
+            let state = table_mut
+                .mark_delivery_exact(
+                    slot,
+                    l.irp_id,
+                    nt_io_manager::IO_DELIVERY_FILE_PUBLISHED,
+                )
+                .expect("signaled pipe listen file disappeared");
+            delivery_state = state;
         }
-        completed += 1;
-        PIPE_LISTEN_SIGNALLED_COUNT.fetch_add(1, Ordering::Relaxed);
+        if delivery_state & nt_io_manager::IO_DELIVERY_IOCP_PUBLISHED == 0 {
+            let post_status = nt_handler.post_file_completion_packet(
+                l.server_file_id,
+                l.apc_context,
+                status,
+                information,
+                false,
+                l.completion_port_suppressed,
+            );
+            if post_status != nt_fs::STATUS_SUCCESS {
+                PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                break 'delivery false;
+            }
+            if nt_handler.io_completion_wake.is_some() {
+                let _ = io_completion_deliver(nt_handler);
+            }
+            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
+            let state = table_mut
+                .mark_delivery_exact(
+                    slot,
+                    l.irp_id,
+                    nt_io_manager::IO_DELIVERY_IOCP_PUBLISHED,
+                )
+                .expect("posted pipe listen IOCP disappeared");
+            delivery_state = state;
+        }
+        // Signal the overlapped event and reevaluate waiters only once for this exact listen.
+        if delivery_state & nt_io_manager::IO_DELIVERY_EVENT_PUBLISHED == 0 {
+            if l.event_obj_idx != u64::MAX {
+                let idx = l.event_obj_idx as usize;
+                if nt_handler.events.set_existing(idx as u64).is_none() {
+                    PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                    break 'delivery false;
+                }
+                let woken = wait_wake_dispatcher_set(nt_handler);
+                if PIPE_LISTEN_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
+                    print_str(b"[pipe-listen] COMPLETE server fid=0x");
+                    print_hex(l.server_file_id as u32);
+                    print_str(b" signalled event_obj=0x");
+                    print_hex(idx as u32);
+                    print_str(b" -> woke ");
+                    print_u64(woken);
+                    print_str(b" server wait(s)\n");
+                }
+            }
+            let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
+            table_mut
+                .mark_delivery_exact(
+                    slot,
+                    l.irp_id,
+                    nt_io_manager::IO_DELIVERY_EVENT_PUBLISHED,
+                )
+                .expect("signaled pipe listen event disappeared");
+        }
+        if driver_launch::acknowledge_completed_irp(l.irp_id).is_err() {
+            PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+            break 'delivery false;
+        }
+        let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
+        table_mut
+            .complete_exact(slot, l.irp_id)
+            .expect("ACKed pipe listen disappeared");
         nt_handler.release_file_reference(l.server_file_id);
-    }
+        PIPE_LISTEN_SIGNALLED_COUNT.fetch_add(1, Ordering::Relaxed);
+        true
+    };
     ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
     ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
     ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
@@ -23109,6 +23452,26 @@ unsafe fn pipe_listen_complete_server_fid(nt_handler: &mut ExecNtHandler, server
     ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
     nt_handler.pi = saved_pi;
     nt_handler.loop_ctx = saved_ctx;
+    u64::from(delivered)
+}
+
+unsafe fn pipe_listen_complete_server_fid(nt_handler: &mut ExecNtHandler, server_fid: u64) -> u64 {
+    let Some((slot, pending)) =
+        (&*core::ptr::addr_of!(PIPE_ASYNC_LISTENS)).find_active(server_fid)
+    else {
+        return 0;
+    };
+    pipe_listen_deliver_exact(nt_handler, slot, pending)
+}
+
+unsafe fn pipe_listen_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
+    let pending: alloc::vec::Vec<_> = (&*core::ptr::addr_of!(PIPE_ASYNC_LISTENS))
+        .drain_all()
+        .collect();
+    let mut completed = 0;
+    for (slot, listen) in pending {
+        completed += pipe_listen_deliver_exact(nt_handler, slot, listen);
+    }
     completed
 }
 

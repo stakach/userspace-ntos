@@ -24,17 +24,53 @@ impl<P: ObjectManagerPort> IoManager<P> {
         if owner != client {
             return Err(NtStatus::ACCESS_DENIED);
         }
-        if state != IrpState::Pending {
+        if !matches!(state, IrpState::Pending | IrpState::CancelRequested) {
             return Ok(());
         }
+        let idx = self
+            .driver_backend_index(driver_id)
+            .filter(|index| *index < self.backends.len())
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        if state == IrpState::Pending {
+            if let Some(irp) = self.irp_mut(irp_id) {
+                irp.cancel = CancelState::CancelRequested;
+                irp.transition(IrpState::CancelRequested);
+            }
+        }
+        if self.backends[idx].cancel_irp(irp_id).is_err() {
+            if !self.cancel_dispatch_retries.contains(&irp_id) {
+                self.cancel_dispatch_retries.push(irp_id);
+            }
+        } else if let Some(index) = self
+            .cancel_dispatch_retries
+            .iter()
+            .position(|candidate| *candidate == irp_id)
+        {
+            self.cancel_dispatch_retries.swap_remove(index);
+        }
+        Ok(())
+    }
 
-        if let Some(irp) = self.irp_mut(irp_id) {
-            irp.cancel = CancelState::CancelRequested;
-            irp.transition(IrpState::CancelRequested);
+    /// Relinquish delivery of one exact IRP. Pending work is cancelled through
+    /// its owning backend; whichever terminal result wins is acknowledged and
+    /// reclaimed automatically instead of being exposed to a departed consumer.
+    pub fn abandon_irp_delivery(
+        &mut self,
+        client: ClientId,
+        irp_id: IrpId,
+    ) -> Result<(), NtStatus> {
+        let owner = match self.irp(irp_id) {
+            Some(irp) => irp.client_id,
+            None => return Ok(()),
+        };
+        if owner != client {
+            return Err(NtStatus::ACCESS_DENIED);
         }
-        if let Some(idx) = self.driver_backend_index(driver_id) {
-            let _ = self.backends[idx].cancel_irp(irp_id);
+        if !self.abandoned_irps.contains(&irp_id) {
+            self.abandoned_irps.push(irp_id);
         }
+        self.cancel(client, irp_id)?;
+        self.reap_abandoned_completions();
         Ok(())
     }
 

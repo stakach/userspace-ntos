@@ -66,6 +66,7 @@ impl FileState {
                 | (CreateIrpDispatched, ClosePending) // pending create cancelled by sync caller
                 | (CreateIrpDispatched, Closed) // create failed
                 | (Open, CleanupPending)
+                | (CleanupPending, Open) // cleanup rejected before reaching the driver
                 | (Open, ClosePending)
                 | (CleanupPending, CleanupComplete)
                 | (CleanupPending, ClosePending)
@@ -111,6 +112,8 @@ pub struct FileRecord {
     pub outstanding_irp_refs: u32,
     /// The user handle is gone, but final close is waiting for IRP references.
     pub close_deferred: bool,
+    /// `IRP_MJ_CLEANUP` has been handed to the driver exactly once.
+    pub cleanup_dispatched: bool,
     /// `IRP_MJ_CLOSE` has been handed to the driver exactly once.
     pub close_dispatched: bool,
 }
@@ -141,6 +144,7 @@ impl FileRecord {
             state: FileState::Allocated,
             outstanding_irp_refs: 0,
             close_deferred: false,
+            cleanup_dispatched: false,
             close_dispatched: false,
         }
     }

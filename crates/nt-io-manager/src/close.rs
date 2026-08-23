@@ -11,10 +11,16 @@ use nt_io_abi::major;
 use nt_status::NtStatus;
 use nt_types::{AccessMask, ClientId, HandleValue};
 
+use crate::dispatch::DispatchOutcome;
 use crate::file::FileState;
-use crate::irp::IoParameters;
+use crate::irp::{IoParameters, IoStackLocation, IrpRecord, IrpState};
 use crate::object_port::ObjectManagerPort;
 use crate::{FileId, IoManager, IrpId};
+
+enum LifecycleDispatch {
+    Completed(Result<u64, NtStatus>),
+    Pending(IrpId),
+}
 
 impl<P: ObjectManagerPort> IoManager<P> {
     /// Dispatch `IRP_MJ_CLEANUP`. A pending cleanup retains its file reference;
@@ -24,21 +30,32 @@ impl<P: ObjectManagerPort> IoManager<P> {
         self.file_mut(file_id)
             .expect("referenced file")
             .transition(FileState::CleanupPending);
-        let mut empty: [u8; 0] = [];
-        let result = self.build_and_dispatch_sync(
+        match self.dispatch_lifecycle_irp_once(
             client,
             device_id,
-            Some(file_id),
+            file_id,
             major::IRP_MJ_CLEANUP,
             IoParameters::Cleanup,
-            &mut empty,
-        );
-        if result != Err(NtStatus::PENDING) {
-            self.file_mut(file_id)
-                .expect("cleanup keeps file live")
-                .transition(FileState::CleanupComplete);
+        ) {
+            Err(status) => {
+                self.file_mut(file_id)
+                    .expect("rejected cleanup keeps file live")
+                    .transition(FileState::Open);
+                Err(status)
+            }
+            Ok(LifecycleDispatch::Completed(result)) => {
+                let file = self.file_mut(file_id).expect("cleanup keeps file live");
+                file.cleanup_dispatched = true;
+                file.transition(FileState::CleanupComplete);
+                result.map(|_| ())
+            }
+            Ok(LifecycleDispatch::Pending(_)) => {
+                self.file_mut(file_id)
+                    .expect("pending cleanup keeps file live")
+                    .cleanup_dispatched = true;
+                Err(NtStatus::PENDING)
+            }
         }
-        result.map(|_| ())
     }
 
     /// Release the user-visible handle and begin final FILE_OBJECT close. Driver
@@ -56,13 +73,57 @@ impl<P: ObjectManagerPort> IoManager<P> {
         self.file_mut(file_id)
             .expect("validated file")
             .transition(FileState::ClosePending);
-        self.finish_deferred_file_close(file_id)?;
+        if self.finish_deferred_file_close(file_id).is_err() {
+            self.schedule_deferred_file_close(file_id);
+        }
         Ok(())
     }
 
     /// Complete a close whose outstanding IRP references have drained. This is
     /// called both by `close` and by completion acknowledgement.
     pub(crate) fn finish_deferred_file_close(&mut self, file_id: FileId) -> Result<(), NtStatus> {
+        let state = match self.file(file_id) {
+            Some(file) => file.state,
+            None => return Ok(()),
+        };
+        if state == FileState::CleanupPending {
+            let (client, device_id, dispatched) = {
+                let file = self.file(file_id).expect("checked above");
+                (file.client_id, file.device_id, file.cleanup_dispatched)
+            };
+            if !dispatched {
+                match self.dispatch_lifecycle_irp_once(
+                    client,
+                    device_id,
+                    file_id,
+                    major::IRP_MJ_CLEANUP,
+                    IoParameters::Cleanup,
+                )? {
+                    LifecycleDispatch::Completed(_) => {
+                        let file = self.file_mut(file_id).expect("cleanup keeps file live");
+                        file.cleanup_dispatched = true;
+                        file.transition(FileState::CleanupComplete);
+                    }
+                    LifecycleDispatch::Pending(irp_id) => {
+                        self.file_mut(file_id)
+                            .expect("pending cleanup keeps file live")
+                            .cleanup_dispatched = true;
+                        self.abandon_irp_delivery(client, irp_id)?;
+                        return Ok(());
+                    }
+                }
+            } else {
+                return Ok(());
+            }
+        }
+        if self
+            .file(file_id)
+            .is_some_and(|file| file.state == FileState::CleanupComplete && file.close_deferred)
+        {
+            self.file_mut(file_id)
+                .expect("checked above")
+                .transition(FileState::ClosePending);
+        }
         let (client, device_id, refs, close_dispatched) = match self.file(file_id) {
             Some(file) if file.state == FileState::ClosePending => (
                 file.client_id,
@@ -81,42 +142,98 @@ impl<P: ObjectManagerPort> IoManager<P> {
         }
 
         if close_dispatched {
-            self.file_mut(file_id)
-                .expect("file still live")
-                .transition(FileState::Closed);
-            self.release_file_record(file_id)?;
-            return Ok(());
+            return self.release_file_record(file_id);
         }
 
-        {
-            let file = self.file_mut(file_id).expect("file still live");
-            file.close_deferred = false;
-            file.close_dispatched = true;
-        }
-        let mut empty: [u8; 0] = [];
-        let result = self.build_and_dispatch_sync(
+        self.file_mut(file_id)
+            .expect("file still live")
+            .close_deferred = false;
+        match self.dispatch_lifecycle_irp_once(
             client,
             device_id,
-            Some(file_id),
+            file_id,
             major::IRP_MJ_CLOSE,
             IoParameters::Close,
-            &mut empty,
-        );
+        )? {
+            LifecycleDispatch::Completed(_) => {
+                self.file_mut(file_id)
+                    .expect("close keeps file live")
+                    .close_dispatched = true;
+            }
+            LifecycleDispatch::Pending(irp_id) => {
+                let file = self
+                    .file_mut(file_id)
+                    .expect("pending close keeps file live");
+                file.close_dispatched = true;
+                file.close_deferred = true;
+                self.abandon_irp_delivery(client, irp_id)?;
+                return Ok(());
+            }
+        }
         let refs = self
             .file(file_id)
             .map(|file| file.outstanding_irp_refs)
             .unwrap_or(0);
-        if result == Err(NtStatus::PENDING) || refs != 0 {
+        if refs != 0 {
             if let Some(file) = self.file_mut(file_id) {
                 file.close_deferred = true;
             }
             return Ok(());
         }
-        if let Some(file) = self.file_mut(file_id) {
-            file.transition(FileState::Closed);
-        }
         self.release_file_record(file_id)?;
         Ok(())
+    }
+
+    /// Publish one canonical lifecycle IRP. The outer `Result` means the backend never accepted the
+    /// request; `Completed` and `Pending` both prove that the driver dispatch boundary was crossed.
+    fn dispatch_lifecycle_irp_once(
+        &mut self,
+        client: ClientId,
+        device_id: crate::DeviceId,
+        file_id: FileId,
+        major: u8,
+        parameters: IoParameters,
+    ) -> Result<LifecycleDispatch, NtStatus> {
+        let driver_id = self
+            .device(device_id)
+            .ok_or(NtStatus::INVALID_PARAMETER)?
+            .driver_id;
+        let mut irp = IrpRecord::new(client, device_id, Some(file_id), major);
+        irp.driver_id = driver_id;
+        let mut stack = IoStackLocation::new(major, device_id, Some(file_id));
+        stack.parameters = parameters;
+        irp.stack.push(stack);
+        let irp_id = self.allocate_irp(irp)?;
+        self.irp_mut(irp_id)
+            .expect("just allocated")
+            .transition(IrpState::Initialized);
+        self.irp_mut(irp_id)
+            .expect("just allocated")
+            .transition(IrpState::Dispatched);
+
+        let mut empty: [u8; 0] = [];
+        let outcome = self.dispatch_to_driver(driver_id, irp_id, &mut empty);
+        if self
+            .irp(irp_id)
+            .is_none_or(|irp| irp.state != IrpState::Dispatched)
+        {
+            return Ok(LifecycleDispatch::Pending(irp_id));
+        }
+
+        match outcome {
+            Err(status) => {
+                let _ = self.complete_sync(irp_id, Err(status));
+                Err(status)
+            }
+            Ok(outcome @ DispatchOutcome::Pending) => {
+                let _ = self.complete_sync(irp_id, Ok(outcome));
+                Ok(LifecycleDispatch::Pending(irp_id))
+            }
+            Ok(outcome) => {
+                let result = self.complete_sync(irp_id, Ok(outcome));
+                Ok(LifecycleDispatch::Completed(result))
+            }
+        }
     }
 
     pub(crate) fn release_file_record(&mut self, file_id: FileId) -> Result<(), NtStatus> {
@@ -143,8 +260,8 @@ impl<P: ObjectManagerPort> IoManager<P> {
         Ok(())
     }
 
-    /// A client disconnected or faulted. Canonical records owned by that client
-    /// are invalidated before the Object Manager reaps its handles.
+    /// A client disconnected or faulted. Its live IRPs are abandoned through cancellation and
+    /// terminal ACK; File objects remain strongly referenced through real CLEANUP/CLOSE dispatch.
     pub fn disconnect_client(&mut self, client: ClientId) -> Result<(), NtStatus> {
         let irps: Vec<IrpId> = self
             .irps
@@ -153,7 +270,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .map(|(id, _)| id)
             .collect();
         for id in irps {
-            self.free_irp(id);
+            self.abandon_irp_delivery(client, id)?;
         }
         let files: Vec<FileId> = self
             .files
@@ -162,8 +279,39 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .map(|(id, _)| id)
             .collect();
         for id in files {
-            self.release_file_record(id)?;
+            let state = self.file(id).expect("enumerated file").state;
+            match state {
+                FileState::Allocated => {
+                    self.release_file_record(id)?;
+                    continue;
+                }
+                FileState::CreateIrpDispatched => {
+                    let file = self.file_mut(id).expect("enumerated file");
+                    file.transition(FileState::ClosePending);
+                    file.close_deferred = true;
+                }
+                FileState::Open => {
+                    let file = self.file_mut(id).expect("enumerated file");
+                    file.transition(FileState::CleanupPending);
+                    file.close_deferred = true;
+                }
+                FileState::CleanupPending | FileState::CleanupComplete => {
+                    self.file_mut(id).expect("enumerated file").close_deferred = true;
+                }
+                FileState::ClosePending => {}
+                FileState::Closed => {
+                    self.release_file_record(id)?;
+                    continue;
+                }
+            }
+            if self.finish_deferred_file_close(id).is_err() {
+                self.schedule_deferred_file_close(id);
+            }
         }
-        self.port.close_client(client)
+        if !self.disconnected_client_retries.contains(&client) {
+            self.disconnected_client_retries.push(client);
+        }
+        self.pump();
+        Ok(())
     }
 }

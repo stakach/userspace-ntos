@@ -12,6 +12,7 @@
 
 extern crate alloc;
 
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -132,8 +133,6 @@ pub type AddressSpaceId = u32;
 /// low-bit metadata in owner fields and masks it before comparing against `PsGetCurrentProcessId`.
 pub const CLIENT_ID_GRANULARITY: u32 = 4;
 const FIRST_CLIENT_ID: u32 = CLIENT_ID_GRANULARITY;
-
-pub const THREAD_USER_APC_QUEUE_CAP: usize = 16;
 
 #[inline]
 fn allocate_client_id(next: &mut u32) -> u32 {
@@ -705,9 +704,7 @@ pub struct NtThread {
     hide_from_debugger: bool,
     thread_name_len: u16,
     thread_name: Vec<u16>,
-    user_apc_queue: [UserApc; THREAD_USER_APC_QUEUE_CAP],
-    user_apc_head: u8,
-    user_apc_len: u8,
+    user_apc_queue: VecDeque<UserApc>,
 }
 
 /// Per-thread state installed through `ThreadImpersonationToken`.
@@ -1337,9 +1334,7 @@ impl ProcessManager {
                 hide_from_debugger: false,
                 thread_name_len: 0,
                 thread_name: Vec::new(),
-                user_apc_queue: [UserApc::default(); THREAD_USER_APC_QUEUE_CAP],
-                user_apc_head: 0,
-                user_apc_len: 0,
+                user_apc_queue: VecDeque::new(),
             },
         );
         let _ = self.report_existing_thread_create(tid);
@@ -1812,52 +1807,34 @@ impl ProcessManager {
         if thread.state == ThreadState::Terminated {
             return Err(STATUS_UNSUCCESSFUL);
         }
-        if thread.user_apc_len as usize >= THREAD_USER_APC_QUEUE_CAP {
-            return Err(STATUS_NO_MEMORY);
-        }
-        let tail = (thread.user_apc_head as usize + thread.user_apc_len as usize)
-            % THREAD_USER_APC_QUEUE_CAP;
-        thread.user_apc_queue[tail] = apc;
-        thread.user_apc_len += 1;
+        thread
+            .user_apc_queue
+            .try_reserve(1)
+            .map_err(|_| STATUS_NO_MEMORY)?;
+        thread.user_apc_queue.push_back(apc);
         Ok(())
     }
 
     pub fn has_user_apc(&self, tid: ThreadId) -> bool {
         self.threads
             .get(&tid)
-            .is_some_and(|thread| thread.user_apc_len != 0)
+            .is_some_and(|thread| !thread.user_apc_queue.is_empty())
     }
 
     pub fn peek_user_apc(&self, tid: ThreadId) -> Option<UserApc> {
         let thread = self.threads.get(&tid)?;
-        (thread.user_apc_len != 0).then_some(thread.user_apc_queue[thread.user_apc_head as usize])
+        thread.user_apc_queue.front().copied()
     }
 
     pub fn take_user_apc(&mut self, tid: ThreadId) -> Option<UserApc> {
-        let thread = self.threads.get_mut(&tid)?;
-        if thread.user_apc_len == 0 {
-            return None;
-        }
-        let index = thread.user_apc_head as usize;
-        let apc = thread.user_apc_queue[index];
-        thread.user_apc_queue[index] = UserApc::default();
-        thread.user_apc_len -= 1;
-        if thread.user_apc_len == 0 {
-            thread.user_apc_head = 0;
-        } else {
-            thread.user_apc_head =
-                ((thread.user_apc_head as usize + 1) % THREAD_USER_APC_QUEUE_CAP) as u8;
-        }
-        Some(apc)
+        self.threads.get_mut(&tid)?.user_apc_queue.pop_front()
     }
 
     pub fn clear_user_apcs(&mut self, tid: ThreadId) -> bool {
         let Some(thread) = self.threads.get_mut(&tid) else {
             return false;
         };
-        thread.user_apc_queue.fill(UserApc::default());
-        thread.user_apc_head = 0;
-        thread.user_apc_len = 0;
+        thread.user_apc_queue.clear();
         true
     }
 
@@ -2151,9 +2128,7 @@ impl ProcessManager {
         thread.hide_from_debugger = false;
         thread.thread_name_len = 0;
         thread.thread_name.clear();
-        thread.user_apc_queue.fill(UserApc::default());
-        thread.user_apc_head = 0;
-        thread.user_apc_len = 0;
+        thread.user_apc_queue.clear();
         Ok(())
     }
 
@@ -2239,9 +2214,7 @@ impl ProcessManager {
         }
         t.state = state;
         if state == ThreadState::Terminated {
-            t.user_apc_queue.fill(UserApc::default());
-            t.user_apc_head = 0;
-            t.user_apc_len = 0;
+            t.user_apc_queue.clear();
         }
         Ok(())
     }
@@ -2301,9 +2274,7 @@ impl ProcessManager {
             if transitioned {
                 t.state = ThreadState::Terminated;
                 t.exit_status = Some(exit_status);
-                t.user_apc_queue.fill(UserApc::default());
-                t.user_apc_head = 0;
-                t.user_apc_len = 0;
+                t.user_apc_queue.clear();
                 if exit_time_100ns != 0 || t.exit_time_100ns == 0 {
                     t.exit_time_100ns = exit_time_100ns;
                 }
@@ -2356,9 +2327,7 @@ impl ProcessManager {
         if transitioned {
             t.state = ThreadState::Terminated;
             t.exit_status = Some(exit_status);
-            t.user_apc_queue.fill(UserApc::default());
-            t.user_apc_head = 0;
-            t.user_apc_len = 0;
+            t.user_apc_queue.clear();
             if exit_time_100ns != 0 || t.exit_time_100ns == 0 {
                 t.exit_time_100ns = exit_time_100ns;
             }
@@ -2404,9 +2373,7 @@ impl ProcessManager {
                 if t.state != ThreadState::Terminated {
                     t.state = ThreadState::Terminated;
                     t.exit_status = Some(exit_status);
-                    t.user_apc_queue.fill(UserApc::default());
-                    t.user_apc_head = 0;
-                    t.user_apc_len = 0;
+                    t.user_apc_queue.clear();
                     if exit_time_100ns != 0 || t.exit_time_100ns == 0 {
                         t.exit_time_100ns = exit_time_100ns;
                     }

@@ -138,9 +138,30 @@ pub const WIN32K_SHARED_VADDR: u64 = 0x0000_0100_0718_0000;
 /// The cross-address-space ARG-MARSHAL frame: mapped RW in BOTH the executive and the win32k
 /// component (within the pool PT window). The executive copies a dispatched syscall's user buffers
 /// here (sized per the win32k SSN signature); win32k's handler reads/writes them in its own context;
-/// the executive copies out-params back to the caller on reply. 4 pages = 16 KiB.
+/// the executive copies out-params back to the caller on reply. The first four pages remain the
+/// general marshal arena; the final page contains dispatch-scoped `MSG` output slots which stay
+/// leased while an outer dispatch is parked behind a user-mode callback.
 pub const WIN32K_ARG_VADDR: u64 = 0x0000_0100_071A_0000;
-pub const WIN32K_ARG_FRAMES: u64 = 4;
+pub const WIN32K_ARG_GENERAL_FRAMES: u64 = 4;
+pub const WIN32K_ARG_FRAMES: u64 = WIN32K_ARG_GENERAL_FRAMES + 1;
+pub const WIN32K_ARG_GENERAL_BYTES: u64 = WIN32K_ARG_GENERAL_FRAMES * 0x1000;
+pub const WIN32K_MESSAGE_STAGE_BASE: u64 = WIN32K_ARG_VADDR + WIN32K_ARG_GENERAL_BYTES;
+pub const WIN32K_MESSAGE_STAGE_SLOT_BYTES: u64 = 64;
+pub const WIN32K_MESSAGE_STAGE_SLOTS: u64 = 0x1000 / WIN32K_MESSAGE_STAGE_SLOT_BYTES;
+pub const WIN32K_MESSAGE_STAGE_OUTPUT_LENGTH_OFFSET: u64 = 56;
+const _: () = assert!(
+    WIN32K_MESSAGE_STAGE_BASE
+        + WIN32K_MESSAGE_STAGE_SLOTS * WIN32K_MESSAGE_STAGE_SLOT_BYTES
+        == WIN32K_ARG_VADDR + WIN32K_ARG_FRAMES * 0x1000
+);
+const _: () = assert!(WIN32K_MESSAGE_STAGE_SLOTS <= u64::BITS as u64);
+const _: () = assert!(
+    WIN32K_MESSAGE_STAGE_OUTPUT_LENGTH_OFFSET
+        >= nt_user_callback::DISPATCH_MESSAGE_OUTPUT_BYTES as u64
+);
+const _: () = assert!(
+    WIN32K_MESSAGE_STAGE_OUTPUT_LENGTH_OFFSET + 8 <= WIN32K_MESSAGE_STAGE_SLOT_BYTES
+);
 /// Dedicated cross-address-space video-control window. `EngDeviceIoControl` runs in the win32k
 /// component, but hosted miniport IRPs are executive-owned; this window carries bounded METHOD_BUFFERED
 /// input/output bytes without reusing the live syscall ARG frame or the user-callback shared page.
@@ -10332,6 +10353,15 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     let a1 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A1) as *const u64);
     let a2 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A2) as *const u64);
     let a3 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A3) as *const u64);
+    let output_stage_valid = a0 >= WIN32K_MESSAGE_STAGE_BASE
+        && a0 < WIN32K_MESSAGE_STAGE_BASE + 0x1000
+        && (a0 - WIN32K_MESSAGE_STAGE_BASE) % WIN32K_MESSAGE_STAGE_SLOT_BYTES == 0;
+    if output_stage_valid {
+        write_volatile(
+            (a0 + WIN32K_MESSAGE_STAGE_OUTPUT_LENGTH_OFFSET) as *mut u64,
+            u64::MAX,
+        );
+    }
     let process_id = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_PROCESS_ID) as *const u64);
     let client_pi = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_PI) as *const u64);
     let client_teb = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_TEB) as *const u64);
@@ -10518,6 +10548,15 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         print_hex((mdev >> 32) as u32);
         print_hex(mdev as u32);
         print_str(b"\n");
+    }
+    if output_stage_valid {
+        let staged_message = read_volatile((a0 + 8) as *const u32);
+        let output_length =
+            nt_user_callback::message_dispatch_output_length(ssn, result, staged_message);
+        write_volatile(
+            (a0 + WIN32K_MESSAGE_STAGE_OUTPUT_LENGTH_OFFSET) as *mut u64,
+            u64::from(output_length),
+        );
     }
     (result as u32 as i32, result)
 }

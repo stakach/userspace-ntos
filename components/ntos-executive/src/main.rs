@@ -6671,7 +6671,7 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
 /// `BlockedOnReply` from the instant the kernel pairs it, with no user-visible gap, and the executive
 /// answers with `reply_on` (`decode_reply`), which wakes the bound caller or fails immediately and
 /// **cannot block**. There is no `Send` to an endpoint left to wedge in. The second is fixed by
-/// `PIPE_FULL_DUPLEX_PARK`. **The third was a MISREADING**: a per-badge census of the service loop
+/// per-direction canonical pipe IRP ownership. **The third was a MISREADING**: a per-badge census of the service loop
 /// showed the self-RPC costs ~50-100 events while the executive's own HPET one-shot delivered
 /// 2,745,192 times in one boot, 2,745,189 of them waking nothing. It was an interrupt storm in the
 /// delay timer, not starvation by the RPC — see `exec_delay_timer_disarms`. The route is ON.
@@ -6991,7 +6991,7 @@ static SCM_WORKER_FAULTS: AtomicU64 = AtomicU64::new(0);
 ///    there is no wake `Send` at all: the component is the CALLER, and the executive answers with
 ///    `reply_on` (`decode_reply`), which cannot block.
 ///
-/// 2. **A silent functional degrade** (fixed by `PIPE_FULL_DUPLEX_PARK`, also now ON). Pipe parking
+/// 2. **A silent functional degrade** (fixed by per-direction canonical pipe ownership). Pipe parking
 ///    was per-CONNECTION rather than per-DIRECTION, so an rpcrt4 server's pending READ refused its
 ///    own response WRITE with `STATUS_INSUFFICIENT_RESOURCES` — which is how the 48-byte
 ///    `LsarOpenPolicy` RESPONSE was lost.
@@ -15130,7 +15130,14 @@ pub(crate) static CLIENT_REPLY_BOUND: AtomicU64 = AtomicU64::new(0);
 /// Every call site replies with message LABEL 0 (`msginfo` carries a length only) — a non-zero label
 /// would be parsed as an `InvocationLabel` by `decode_invocation` and rejected before reaching
 /// `decode_reply` (migration correction 1).
-unsafe fn client_reply_on(reply_cptr: u64, msginfo: u64, r0: u64, r1: u64, r2: u64, r3: u64) {
+unsafe fn client_reply_on(
+    reply_cptr: u64,
+    msginfo: u64,
+    r0: u64,
+    r1: u64,
+    r2: u64,
+    r3: u64,
+) -> bool {
     let label = reply_on(reply_cptr, msginfo, r0, r1, r2, r3);
     CLIENT_REPLY_BOUND.fetch_add(1, Ordering::Relaxed);
     if label != 0 && CLIENT_REPLY_ERRORS.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -15142,6 +15149,7 @@ unsafe fn client_reply_on(reply_cptr: u64, msginfo: u64, r0: u64, r1: u64, r2: u
         print_u64(msginfo);
         print_str(b"\n");
     }
+    label == 0
 }
 
 #[inline]
@@ -16067,6 +16075,13 @@ fn pipe_name_waiter_table_reset() -> bool {
     }
 }
 
+fn pipe_waiter_tables_reset() -> bool {
+    unsafe {
+        (&mut *core::ptr::addr_of_mut!(PIPE_WAITERS)).reset()
+            && (&mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS)).reset()
+    }
+}
+
 fn pipe_name_waiter_table_stats() -> (usize, usize, usize, u64, u64) {
     unsafe {
         let waiters = &*core::ptr::addr_of!(PIPE_NAME_WAITERS);
@@ -16459,16 +16474,20 @@ unsafe fn dbgk_reporter_resume(
             set_reply_mr(17, block.resume_flags);
             client_reply_on(block.reply_cap, 18, block.resume_status, 0, 0, 0);
         }
-        DBGK_BLOCK_USER_EXCEPTION => client_reply_on(
-            block.reply_cap,
-            3,
-            block.resume_ip,
-            block.resume_sp,
-            block.resume_flags,
-            0,
-        ),
+        DBGK_BLOCK_USER_EXCEPTION => {
+            client_reply_on(
+                block.reply_cap,
+                3,
+                block.resume_ip,
+                block.resume_sp,
+                block.resume_flags,
+                0,
+            );
+        }
         // VMFault / DebugException: restart with no register transfer.
-        _ => client_reply_on(block.reply_cap, 0, 0, 0, 0, 0),
+        _ => {
+            client_reply_on(block.reply_cap, 0, 0, 0, 0, 0);
+        }
     }
     release_reply_pool_cap(block.reply_cap);
     thread_wait_state_clear_badge_ready(handler, block.badge);
@@ -21301,6 +21320,7 @@ struct ExecNtHandler {
     /// Reset each dispatch (group-A signal, like `io_signal_event`).
     pipe_park_device_id: u64,
     pipe_park_fid: u64,
+    pipe_park_irp_id: u64,
     pipe_park_buffer_va: u64,
     pipe_park_buffer_len: u32,
     pipe_park_iosb_va: u64,
@@ -21617,11 +21637,6 @@ impl ExecFileCompletion {
     fn is_synchronous(&self, file_id: u64) -> Result<bool, u32> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).is_synchronous(file_id) }
-    }
-
-    fn device_id(&self, file_id: u64) -> Result<u64, u32> {
-        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
-        unsafe { (&*self.table).device_id(file_id) }
     }
 
     fn set_signaled(&mut self, file_id: u64, signaled: bool) -> Result<(), u32> {
@@ -28478,15 +28493,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             //      (npfs' `NpWriteDataQueue` → `IofCompleteRequest`) and the delivered
                             //      payload must be byte-exact in the completion stash.
                             let mut pend_out = [0u8; 64];
-                            let srv_pending = npfs_dispatch_irp(
+                            let srv_pending = driver_launch::npfs_dispatch_irp_exact(
                                 3, /* READ */
                                 0,
                                 srv_fid,
                                 &[],
                                 &mut pend_out,
                             );
-                            let srv_read_pended =
-                                matches!(srv_pending, Some((st, _)) if st as u32 == 0x0000_0103);
+                            let srv_read_pended = matches!(
+                                srv_pending,
+                                Some((st, _, irp_id)) if st as u32 == 0x0000_0103 && irp_id != 0
+                            );
                             let mut response = [0u8; 48];
                             for (i, slot) in response.iter_mut().enumerate() {
                                 *slot = 0x40u8.wrapping_add(i as u8);
@@ -28508,13 +28525,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 4, /* WRITE */
                                 0, cli_fid, &wake, &mut cnone,
                             );
-                            let named_pipe_device =
-                                driver_launch::device_id_by_name("\\Device\\NamedPipe")
-                                    .unwrap_or(0);
-                            let stash = driver_launch::take_completed_read_for_device(
-                                named_pipe_device,
-                                srv_fid,
-                            );
+                            let stash = srv_pending.and_then(|(_, _, irp_id)| {
+                                driver_launch::copy_completed_irp(irp_id, true)
+                            });
+                            let stash_acked = srv_pending
+                                .map(|(_, _, irp_id)| {
+                                    driver_launch::acknowledge_completed_irp(irp_id).is_ok()
+                                })
+                                .unwrap_or(false);
                             let pending_delivered = match &stash {
                                 Some((st, info, bytes)) => {
                                     *st == 0
@@ -28545,6 +28563,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 srv_read_pended
                                     && response_ok
                                     && pending_delivered
+                                    && stash_acked
                                     && driver_launch::FSD_FO_REUSED.load(Ordering::Relaxed) >= 4
                                     && driver_launch::FSD_QUEUE_REPAIRS.load(Ordering::Relaxed)
                                         == 0,
@@ -28648,10 +28667,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             // never return from npfs. npfs must complete the reader with
                             // STATUS_BUFFER_OVERFLOW + 16 bytes and queue the 32-byte remainder.
                             let mut hdr_in = [0u8; 16];
-                            let hdr_pend =
-                                npfs_dispatch_irp(3 /* READ */, 0, cli_fid, &[], &mut hdr_in);
-                            let hdr_pended =
-                                matches!(hdr_pend, Some((st, _)) if st as u32 == 0x0000_0103);
+                            let hdr_pend = driver_launch::npfs_dispatch_irp_exact(
+                                3, /* READ */ 0, cli_fid, &[], &mut hdr_in,
+                            );
+                            let hdr_pended = matches!(
+                                hdr_pend,
+                                Some((st, _, irp_id)) if st as u32 == 0x0000_0103 && irp_id != 0
+                            );
                             print_str(b"[npfs-svc] C-h HDR-READ pended=");
                             print_u64(hdr_pended as u64);
                             print_str(b" -> now writing 48 over a 16-byte pending read\n");
@@ -28659,10 +28681,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 4, /* WRITE */
                                 0, srv_fid, &response, &mut cnone,
                             );
-                            let hdr_stash = driver_launch::take_completed_read_for_device(
-                                named_pipe_device,
-                                cli_fid,
-                            );
+                            let hdr_stash = hdr_pend.and_then(|(_, _, irp_id)| {
+                                driver_launch::copy_completed_irp(irp_id, true)
+                            });
+                            let hdr_stash_acked = hdr_pend
+                                .map(|(_, _, irp_id)| {
+                                    driver_launch::acknowledge_completed_irp(irp_id).is_ok()
+                                })
+                                .unwrap_or(false);
                             let hdr_ok = match &hdr_stash {
                                 Some((st, info, bytes)) => {
                                     *st == 0x8000_0005
@@ -28695,6 +28721,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 hdr_pended
                                     && body_write.is_some()
                                     && hdr_ok
+                                    && hdr_stash_acked
                                     && rest_ok
                                     && driver_launch::FSD_QUEUE_REPAIRS.load(Ordering::Relaxed)
                                         == 0,

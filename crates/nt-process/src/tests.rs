@@ -391,11 +391,11 @@ fn kernel_user_apc_targets_resolved_thread_without_user_handle() {
 }
 
 #[test]
-fn user_apc_queue_is_fifo_and_bounded() {
+fn user_apc_queue_is_growable_fifo() {
     let mut pm = ProcessManager::new();
     let pid = pm.create_process("fifo.exe", None, None);
     let tid = pm.create_thread(pid, 0x1000, 0, false).unwrap();
-    for index in 0..THREAD_USER_APC_QUEUE_CAP {
+    for index in 0..64 {
         assert_eq!(
             pm.queue_user_apc(
                 pid,
@@ -411,21 +411,7 @@ fn user_apc_queue_is_fifo_and_bounded() {
             Ok(tid)
         );
     }
-    assert_eq!(
-        pm.queue_user_apc(
-            pid,
-            tid,
-            u64::MAX - 1,
-            UserApc {
-                routine: 0xffff,
-                normal_context: 0,
-                system_argument1: 0,
-                system_argument2: 0,
-            },
-        ),
-        Err(STATUS_NO_MEMORY)
-    );
-    for index in 0..THREAD_USER_APC_QUEUE_CAP {
+    for index in 0..64 {
         assert_eq!(
             pm.take_user_apc(tid),
             Some(UserApc {

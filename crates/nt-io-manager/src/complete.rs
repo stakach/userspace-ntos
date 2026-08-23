@@ -35,18 +35,123 @@ pub struct CompletedIrp {
 }
 
 impl<P: ObjectManagerPort> IoManager<P> {
-    /// Drain every driver backend's ready completions. Terminal records are
-    /// published in arrival order and are not reclaimed here.
+    /// Drain every driver backend's ready completions. Deliverable records are
+    /// published in arrival order; explicitly abandoned records are ACKed and
+    /// reclaimed after their terminal result arrives.
     pub fn pump(&mut self) -> usize {
-        let mut published = 0;
+        let mut progress = self.retry_cancel_dispatches()
+            + self.retry_rejected_completion_acks()
+            + self.retry_deferred_file_closes();
         for idx in 0..self.backends.len() {
             while let Some(completion) = self.backends[idx].poll_completion() {
+                let irp_id = completion.irp_id;
                 if self.publish_backend_completion(idx, completion) {
-                    published += 1;
+                    progress += 1;
+                } else {
+                    // Poll transfers one retained backend completion to the manager. If its
+                    // canonical identity is stale, foreign, or already terminal, it has no valid
+                    // consumer; release that exact backend owner instead of stranding it in a
+                    // backend-specific published state.
+                    if self.backends[idx].acknowledge_completion(irp_id).is_ok() {
+                        progress += 1;
+                    } else if !self.rejected_completion_acks.contains(&(idx, irp_id)) {
+                        self.rejected_completion_acks.push((idx, irp_id));
+                    }
                 }
             }
         }
-        published + self.detect_driver_faults()
+        progress += self.detect_driver_faults();
+        self.reap_abandoned_completions();
+        progress += self.retry_disconnected_clients();
+        progress
+    }
+
+    fn retry_disconnected_clients(&mut self) -> usize {
+        let mut retired = 0;
+        let mut index = 0;
+        while index < self.disconnected_client_retries.len() {
+            let client = self.disconnected_client_retries[index];
+            let owns_irps = self.irps.iter().any(|(_, irp)| irp.client_id == client);
+            let owns_files = self.files.iter().any(|(_, file)| file.client_id == client);
+            if !owns_irps && !owns_files && self.port.close_client(client).is_ok() {
+                self.disconnected_client_retries.swap_remove(index);
+                retired += 1;
+            } else {
+                index += 1;
+            }
+        }
+        retired
+    }
+
+    fn retry_cancel_dispatches(&mut self) -> usize {
+        let mut dispatched = 0;
+        let mut index = 0;
+        while index < self.cancel_dispatch_retries.len() {
+            let irp_id = self.cancel_dispatch_retries[index];
+            let (state, driver_id) = match self.irp(irp_id) {
+                Some(irp) => (irp.state, irp.driver_id),
+                None => {
+                    self.cancel_dispatch_retries.swap_remove(index);
+                    continue;
+                }
+            };
+            if state != IrpState::CancelRequested {
+                self.cancel_dispatch_retries.swap_remove(index);
+                continue;
+            }
+            let backend_index = self
+                .driver(driver_id)
+                .map(|driver| driver.backend.0 as usize);
+            let complete = backend_index
+                .and_then(|backend_index| self.backends.get_mut(backend_index))
+                .is_some_and(|backend| backend.is_faulted() || backend.cancel_irp(irp_id).is_ok());
+            if complete {
+                self.cancel_dispatch_retries.swap_remove(index);
+                dispatched += 1;
+            } else {
+                index += 1;
+            }
+        }
+        dispatched
+    }
+
+    fn retry_rejected_completion_acks(&mut self) -> usize {
+        let mut acknowledged = 0;
+        let mut index = 0;
+        while index < self.rejected_completion_acks.len() {
+            let (backend_index, irp_id) = self.rejected_completion_acks[index];
+            let complete = self.backends.get_mut(backend_index).is_some_and(|backend| {
+                backend.is_faulted() || backend.acknowledge_completion(irp_id).is_ok()
+            });
+            if complete {
+                self.rejected_completion_acks.swap_remove(index);
+                acknowledged += 1;
+            } else {
+                index += 1;
+            }
+        }
+        acknowledged
+    }
+
+    fn retry_deferred_file_closes(&mut self) -> usize {
+        let mut completed = 0;
+        let mut index = 0;
+        while index < self.deferred_file_close_retries.len() {
+            let file_id = self.deferred_file_close_retries[index];
+            if self.file(file_id).is_none() || self.finish_deferred_file_close(file_id).is_ok() {
+                self.deferred_file_close_retries.swap_remove(index);
+                completed += 1;
+            } else {
+                index += 1;
+            }
+        }
+        completed
+    }
+
+    pub(crate) fn schedule_deferred_file_close(&mut self, file_id: FileId) {
+        if !self.deferred_file_close_retries.contains(&file_id) {
+            self.deferred_file_close_retries.push(file_id);
+        }
     }
 
     /// The IRPs currently pending or cancel-requested. Completed-but-unconsumed
@@ -199,7 +304,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .map(|driver| driver.backend.0 as usize)
             .filter(|index| *index < self.backends.len())
             .ok_or(NtStatus::INVALID_PARAMETER)?;
-        self.backends[backend_index].acknowledge_completion(irp_id)?;
+        if !self.backends[backend_index].is_faulted() {
+            self.backends[backend_index].acknowledge_completion(irp_id)?;
+        }
         self.completed_irps.remove(queue_index);
         self.free_irp(irp_id)
             .expect("validated completed IRP disappeared after backend acknowledgement");
@@ -212,9 +319,31 @@ impl<P: ObjectManagerPort> IoManager<P> {
                     }
                 }
             }
-            self.finish_deferred_file_close(file_id)?;
+            if self.finish_deferred_file_close(file_id).is_err() {
+                self.schedule_deferred_file_close(file_id);
+            }
         }
         Ok(completed)
+    }
+
+    pub(crate) fn reap_abandoned_completions(&mut self) {
+        let abandoned = self.abandoned_irps.clone();
+        for irp_id in abandoned {
+            let terminal = self
+                .irp(irp_id)
+                .is_none_or(|irp| irp.state == IrpState::Completed);
+            if terminal
+                && (self.irp(irp_id).is_none() || self.acknowledge_completed_irp(irp_id).is_ok())
+            {
+                if let Some(index) = self
+                    .abandoned_irps
+                    .iter()
+                    .position(|candidate| *candidate == irp_id)
+                {
+                    self.abandoned_irps.swap_remove(index);
+                }
+            }
+        }
     }
 
     fn completed_irp_snapshot(&self, irp_id: IrpId) -> Option<CompletedIrp> {

@@ -22,7 +22,7 @@
 
 use core::mem::MaybeUninit;
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -500,7 +500,8 @@ pub const SH_REQ_OUTLEN: u64 = 0x60; // in:  output buffer length (u64)
 pub const SH_REQ_FILEID: u64 = 0x68; // in/out: opaque FILE_OBJECT id (u64)
 pub const SH_REQ_STATUS: u64 = 0x70; // out: IoStatus.Status (i32)
 pub const SH_REQ_REQUESTOR_TID: u64 = 0x74; // in: requesting NT thread id (u32)
-pub const SH_REQ_INFO: u64 = 0x78; // out: IoStatus.Information (u64)
+pub const SH_REQ_INFO: u64 = 0x78; // in: backend instance; out: IoStatus.Information (u64)
+pub const SH_REQ_OWNER_INSTANCE: u64 = SH_REQ_INFO;
 const _: () = assert!(
     SH_SYMLINK_TARGET_BUF + SH_CAPTURED_PATH_BYTES as u64 <= SH_REQ_IRP_ID
 );
@@ -609,13 +610,15 @@ pub const FSD_SERVICE_PROVIDER_CALLBACK_LABEL: u64 = 0x77B;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_INTERRUPT: u64 = u64::MAX - 0x773;
-pub const FSD_DISPATCH_CANCEL_PENDING_FILE: u64 = u64::MAX - 0x774;
 pub const FSD_DISPATCH_VIDEO_FIND_ADAPTER: u64 = u64::MAX - 0x775;
 pub const FSD_DISPATCH_VIDEO_INITIALIZE: u64 = u64::MAX - 0x776;
 pub const FSD_DISPATCH_VIDEO_START_IO: u64 = u64::MAX - 0x777;
 pub const FSD_DISPATCH_VIDEO_ADD_DEVICE: u64 = u64::MAX - 0x778;
 pub const FSD_DISPATCH_PROVIDER_EXPORT: u64 = u64::MAX - 0x779;
 pub const FSD_DISPATCH_PROVIDER_CALLBACK: u64 = u64::MAX - 0x77A;
+pub const FSD_DISPATCH_CANCEL_IRP: u64 = u64::MAX - 0x77B;
+pub const FSD_DISPATCH_COPY_COMPLETION: u64 = u64::MAX - 0x77C;
+pub const FSD_DISPATCH_ACK_COMPLETION: u64 = u64::MAX - 0x77D;
 
 pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
     matches!(
@@ -656,6 +659,24 @@ const IRP_DEALLOCATE_BUFFER: u32 = 0x0000_0020;
 const IRP_INPUT_OPERATION: u32 = 0x0000_0040;
 const COMPLETION_SOURCE_SYSTEM_BUFFER: u8 = 0;
 const COMPLETION_SOURCE_REQUEST_DATA: u8 = 1;
+const HOSTED_IRP_STATE_MASK: u64 = 0xff;
+const HOSTED_IRP_GENERATION_STEP: u64 = 0x100;
+const HOSTED_IRP_INITIALIZING: u64 = 1;
+const HOSTED_IRP_DISPATCHING: u64 = 2;
+const HOSTED_IRP_PENDING: u64 = 3;
+const HOSTED_IRP_COMPLETING_DISPATCH: u64 = 4;
+const HOSTED_IRP_COMPLETED_DISPATCH: u64 = 5;
+const HOSTED_IRP_COMPLETING_PENDING: u64 = 6;
+const HOSTED_IRP_READY: u64 = 7;
+const HOSTED_IRP_CONSUMING: u64 = 8;
+const HOSTED_IRP_TOMBSTONE: u64 = 9;
+const HOSTED_IRP_ABANDONED: u64 = 10;
+const HOSTED_IRP_CANCEL_ROUTINE: u64 = 12;
+const HOSTED_IRP_COMPLETING_CANCEL: u64 = 13;
+const HOSTED_IRP_COMPLETED_CANCEL: u64 = 14;
+const HOSTED_IRP_PUBLISHED: u64 = 15;
+const HOSTED_IRP_COPYING: u64 = 16;
+const HOSTED_IRP_COMPLETING_DEFERRED: u64 = 17;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -666,10 +687,17 @@ struct PendingIrp {
     data: u64,
     aux_data: u64,
     mdl: u64,
+    output_capacity: u64,
+    pnp_resource_list: u64,
+    create_security_context: u64,
+    create_access_state: u64,
+    create_parameters: u64,
     /// Canonical I/O Manager identities. These are transport ids, never driver
     /// pointers or FsContext cookies, and stay attached through completion ACK.
-    canonical_irp_id: u64,
     canonical_file_id: u64,
+    /// Executive backend instance that originated this request. Provider domains can host owners
+    /// for several dependent drivers, so completion polling filters on this route identity.
+    owner_instance: u64,
     /// The npfs `FsContext` (opaque file id) this IRP was issued on, captured at ISSUE time.
     /// ★ Must NOT be re-read from `FILE_OBJECT->FsContext` at completion time: npfs NULLs that
     /// field through `NpSetFileObject(fo, NULL, NULL, …)` when a pipe end disconnects
@@ -747,11 +775,12 @@ const DCERPC_CONTEXT_FLOW_CREATE_TRACE_CAP: u32 = 64;
 const DCERPC_CONTEXT_FLOW_USE_TRACE_CAP: u32 = 96;
 const DCERPC_CONTEXT_FLOW_MISS_TRACE_CAP: u32 = 96;
 /// Diagnostic heartbeat counters for the two unbounded-loop-capable driver callbacks.
-static mut IO_COMPLETE_CALLS: u64 = 0;
+static IO_COMPLETE_CALLS: AtomicU64 = AtomicU64::new(0);
 static mut POOL_CALLS: u64 = 0;
 static mut POOL_LONG_WALKS: u32 = 0;
-static mut PEER_COMPLETION_TRACE_COUNT: u32 = 0;
+static PEER_COMPLETION_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static FSD_CANCEL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static IO_CANCEL_SPIN_LOCK: AtomicU64 = AtomicU64::new(0);
 static WDM_FORWARD_CALL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static WDM_FORWARD_COMPLETION_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const WDM_FORWARD_TRACE_CAP: u64 = 64;
@@ -1004,6 +1033,24 @@ unsafe fn pool_free_request_buffers(data: u64, aux_data: u64, mdl: u64) {
     }
 }
 
+unsafe fn pool_free_irp_auxiliary_graph(
+    pnp_resource_list: u64,
+    create_security_context: u64,
+    create_access_state: u64,
+    create_parameters: u64,
+) {
+    for pointer in [
+        create_parameters,
+        create_access_state,
+        create_security_context,
+        pnp_resource_list,
+    ] {
+        if pointer != 0 {
+            pool_free(pointer);
+        }
+    }
+}
+
 unsafe fn allocate_nonpaged_mdl(virtual_address: u64, length: u64) -> u64 {
     if virtual_address == 0 || length == 0 || length > u32::MAX as u64 {
         return 0;
@@ -1046,8 +1093,8 @@ unsafe fn allocate_nonpaged_mdl(virtual_address: u64, length: u64) -> u64 {
 // peer's later WRITE is serviced by npfs's OWN NpWriteDataQueue fast path, which copies the write
 // payload DIRECTLY into that pending read IRP's buffer and completes it via IoCompleteRequest —
 // synchronously, during the write call. So by the time control returns to the executive the read data
-// is in the retained read IRP and the inbound queue is drained; a fresh re-drive read would find
-// nothing. Completion is therefore recorded in the existing pending-IRP owner node. Its buffers are
+// is in the retained read IRP and the inbound queue is drained; a fresh read would find nothing.
+// Completion is therefore recorded in the canonical pending-IRP owner node. Its buffers are
 // reclaimed only after the executive consumes the result through the mirrored component pool.
 const COMPLETED_READ_BYTE_CAP: usize = (FSD_ARG_FRAMES as usize) * 0x1000;
 
@@ -1055,31 +1102,16 @@ const COMPLETED_READ_BYTE_CAP: usize = (FSD_ARG_FRAMES as usize) * 0x1000;
 #[derive(Clone, Copy)]
 struct PendingIrpNode {
     next: u64,
+    /// Generation-tagged lifecycle word. It is accessed only through `AtomicU64`; keeping it out
+    /// of `PendingIrp` makes payload snapshots disjoint from concurrent state transitions.
+    owner_state: u64,
+    /// Canonical lookup identity, accessed atomically and cleared before TOMBSTONE publication.
+    canonical_irp_id: u64,
+    /// Raw WDM identity used by `IoCompleteRequest`. This remains separate from the mutable request
+    /// payload so lookup never races post-dispatch FILE_OBJECT bookkeeping.
+    raw_irp: u64,
     entry: PendingIrp,
 }
-const EMPTY_PENDING_IRP: PendingIrp = PendingIrp {
-    irp: 0,
-    iosl: 0,
-    file_object: 0,
-    data: 0,
-    aux_data: 0,
-    mdl: 0,
-    canonical_irp_id: 0,
-    canonical_file_id: 0,
-    fid: 0,
-    requestor_tid: 0,
-    major: 0,
-    completion_source_kind: COMPLETION_SOURCE_SYSTEM_BUFFER,
-    read_completion: false,
-    owns_fo: false,
-    _pad: [0; 4],
-    completion: nt_io_manager::RetainedIrpCompletion::pending(),
-};
-const EMPTY_PENDING_IRP_NODE: PendingIrpNode = PendingIrpNode {
-    next: 0,
-    entry: EMPTY_PENDING_IRP,
-};
-
 const FSD_RUNTIME_TABLES_OFF: u64 = 0x2000;
 const FSD_COMPLETION_SEQ_OFF: u64 = FSD_RUNTIME_TABLES_OFF;
 const FSD_PENDING_IRP_CAP: usize = 256;
@@ -1096,18 +1128,58 @@ const fn align_up_u64(value: u64, align: u64) -> u64 {
 }
 
 unsafe fn next_completion_seq(data_base: u64) -> u64 {
-    let ptr = (data_base + FSD_COMPLETION_SEQ_OFF) as *mut u64;
-    let mut next = read_volatile(ptr).wrapping_add(1);
-    if next == 0 {
-        next = 1;
-    }
-    write_volatile(ptr, next);
-    next
+    let sequence = &*((data_base + FSD_COMPLETION_SEQ_OFF) as *const AtomicU64);
+    sequence
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            let next = current.wrapping_add(1);
+            Some(if next == 0 { 1 } else { next })
+        })
+        .unwrap_or(0)
+        .wrapping_add(1)
+        .max(1)
 }
 
 #[inline]
 unsafe fn pending_irp_head(data_base: u64) -> *mut u64 {
     (data_base + FSD_PENDING_IRP_HEAD_OFF) as *mut u64
+}
+
+#[inline]
+unsafe fn pending_irp_owner_state(node: u64) -> &'static AtomicU64 {
+    &*((node + core::mem::offset_of!(PendingIrpNode, owner_state) as u64) as *const AtomicU64)
+}
+
+#[inline]
+unsafe fn pending_irp_canonical_id(node: u64) -> &'static AtomicU64 {
+    &*((node + core::mem::offset_of!(PendingIrpNode, canonical_irp_id) as u64) as *const AtomicU64)
+}
+
+#[inline]
+unsafe fn pending_irp_raw_irp(node: u64) -> &'static AtomicU64 {
+    &*((node + core::mem::offset_of!(PendingIrpNode, raw_irp) as u64) as *const AtomicU64)
+}
+
+#[inline]
+const fn pending_irp_entry_address(node: u64) -> u64 {
+    node + core::mem::offset_of!(PendingIrpNode, entry) as u64
+}
+
+#[inline]
+fn hosted_irp_state_kind(state: u64) -> u64 {
+    state & HOSTED_IRP_STATE_MASK
+}
+
+#[inline]
+fn hosted_irp_state_with_kind(state: u64, kind: u64) -> u64 {
+    (state & !HOSTED_IRP_STATE_MASK) | kind
+}
+
+fn next_hosted_irp_generation(state: u64) -> u64 {
+    let mut generation = (state & !HOSTED_IRP_STATE_MASK).wrapping_add(HOSTED_IRP_GENERATION_STEP);
+    if generation == 0 {
+        generation = HOSTED_IRP_GENERATION_STEP;
+    }
+    generation
 }
 
 #[inline]
@@ -1138,68 +1210,99 @@ unsafe fn pending_irp_node_valid(node: u64) -> bool {
     in_pool || in_table
 }
 
-unsafe fn pending_irp_exists(irp: u64) -> bool {
-    let mut node = read_volatile(pending_irp_head(FSD_DATA_VADDR));
-    let mut steps = 0u64;
-    while node != 0 && steps < POOL_FREE_LIST_MAX {
-        if !pending_irp_node_valid(node) {
-            return false;
-        }
-        let entry = read_volatile((node + 8) as *const PendingIrp);
-        if entry.irp == irp {
-            return true;
-        }
-        node = read_volatile(node as *const u64);
-        steps += 1;
-    }
-    false
+#[derive(Clone, Copy)]
+struct PendingIrpCompletionTarget {
+    data: u64,
+    output_capacity: u64,
+    completion_source_kind: u8,
+    major: u8,
 }
 
-unsafe fn find_pending_irp_node(irp: u64) -> Option<(u64, PendingIrp)> {
-    let mut node = read_volatile(pending_irp_head(FSD_DATA_VADDR));
+unsafe fn claim_pending_irp_completion(
+    irp: u64,
+) -> Option<(u64, u64, PendingIrpCompletionTarget)> {
+    let mut node = (&*pending_irp_head(FSD_DATA_VADDR).cast::<AtomicU64>()).load(Ordering::Acquire);
     let mut steps = 0u64;
     while node != 0 && steps < POOL_FREE_LIST_MAX {
         if !pending_irp_node_valid(node) {
             return None;
         }
-        let entry = read_volatile((node + 8) as *const PendingIrp);
-        if entry.irp == irp {
-            return Some((node, entry));
-        }
-        node = read_volatile(node as *const u64);
-        steps += 1;
-    }
-    None
-}
-
-unsafe fn take_pending_irp(irp: u64) -> Option<PendingIrp> {
-    let head = pending_irp_head(FSD_DATA_VADDR);
-    let mut previous_next = head;
-    let mut node = read_volatile(head);
-    let mut steps = 0u64;
-    while node != 0 && steps < POOL_FREE_LIST_MAX {
-        if !pending_irp_node_valid(node) {
-            return None;
-        }
-        let next = read_volatile(node as *const u64);
-        let entry = read_volatile((node + 8) as *const PendingIrp);
-        if entry.irp == irp {
-            write_volatile(previous_next, next);
-            let table_start = FSD_DATA_VADDR + FSD_PENDING_IRPS_OFF;
-            let table_end = table_start
-                + core::mem::size_of::<PendingIrpNode>() as u64 * FSD_PENDING_IRP_CAP as u64;
-            if node >= table_start && node < table_end {
-                write_volatile(node as *mut PendingIrpNode, EMPTY_PENDING_IRP_NODE);
-            } else {
-                pool_free(node);
+        let state = pending_irp_owner_state(node).load(Ordering::Acquire);
+        let kind = hosted_irp_state_kind(state);
+        if matches!(
+            kind,
+            HOSTED_IRP_DISPATCHING | HOSTED_IRP_PENDING | HOSTED_IRP_CANCEL_ROUTINE
+        ) {
+            // The raw IRP identity and completion projection remain immutable while the owner is
+            // active. Match the raw IRP before claiming the lifecycle word; the generation-bearing
+            // CAS below proves that the inspected projection was not recycled before the claim.
+            let candidate_irp = pending_irp_raw_irp(node).load(Ordering::Relaxed);
+            if candidate_irp != irp {
+                node = read_volatile(node as *const u64);
+                steps += 1;
+                continue;
             }
-            return Some(entry);
+            let completing = hosted_irp_state_with_kind(
+                state,
+                match kind {
+                    HOSTED_IRP_DISPATCHING => HOSTED_IRP_COMPLETING_DISPATCH,
+                    HOSTED_IRP_PENDING => HOSTED_IRP_COMPLETING_PENDING,
+                    HOSTED_IRP_CANCEL_ROUTINE => HOSTED_IRP_COMPLETING_CANCEL,
+                    _ => unreachable!(),
+                },
+            );
+            if pending_irp_owner_state(node)
+                .compare_exchange(state, completing, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let entry = pending_irp_entry_address(node);
+                return Some((
+                    node,
+                    completing,
+                    PendingIrpCompletionTarget {
+                        data: read_volatile(
+                            (entry + core::mem::offset_of!(PendingIrp, data) as u64) as *const u64,
+                        ),
+                        output_capacity: read_volatile(
+                            (entry + core::mem::offset_of!(PendingIrp, output_capacity) as u64)
+                                as *const u64,
+                        ),
+                        completion_source_kind: read_volatile(
+                            (entry + core::mem::offset_of!(PendingIrp, completion_source_kind) as u64)
+                                as *const u8,
+                        ),
+                        major: read_volatile(
+                            (entry + core::mem::offset_of!(PendingIrp, major) as u64) as *const u8,
+                        ),
+                    },
+                ));
+            }
+            continue;
         }
-        previous_next = node as *mut u64;
-        node = next;
+        node = read_volatile(node as *const u64);
         steps += 1;
     }
     None
+}
+
+unsafe fn tombstone_pending_irp_owner(node: u64, consuming_state: u64) {
+    // `consuming_state` is exclusive. Clear the old identity before publishing TOMBSTONE; after
+    // that release a dispatcher may immediately reuse the node for a new generation.
+    pending_irp_canonical_id(node).store(0, Ordering::Relaxed);
+    pending_irp_raw_irp(node).store(0, Ordering::Relaxed);
+    write_volatile(pending_irp_entry_address(node) as *mut u64, 0);
+    let tombstone = hosted_irp_state_with_kind(consuming_state, HOSTED_IRP_TOMBSTONE);
+    if pending_irp_owner_state(node)
+        .compare_exchange(
+            consuming_state,
+            tombstone,
+            Ordering::Release,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        panic!("hosted IRP owner changed while being retired");
+    }
 }
 
 unsafe fn release_pending_irp_graph_component(entry: PendingIrp) {
@@ -1217,6 +1320,10 @@ unsafe fn release_pending_irp_graph_component(entry: PendingIrp) {
             0
         },
         entry.data,
+        entry.create_parameters,
+        entry.create_access_state,
+        entry.create_security_context,
+        entry.pnp_resource_list,
         entry.iosl,
         entry.irp,
         if entry.owns_fo { entry.file_object } else { 0 },
@@ -1228,82 +1335,119 @@ unsafe fn release_pending_irp_graph_component(entry: PendingIrp) {
     }
 }
 
-unsafe fn unlink_pending_irp_node_component(
-    previous_next: *mut u64,
-    node: u64,
-    next: u64,
-    entry: PendingIrp,
-) {
-    write_volatile(previous_next, next);
-    release_pending_irp_graph_component(entry);
-    let table_start = FSD_DATA_VADDR + FSD_PENDING_IRPS_OFF;
-    let table_end = table_start
-        + core::mem::size_of::<PendingIrpNode>() as u64 * FSD_PENDING_IRP_CAP as u64;
-    if node >= table_start && node < table_end {
-        write_volatile(node as *mut PendingIrpNode, EMPTY_PENDING_IRP_NODE);
-    } else {
-        pool_free(node);
+unsafe fn insert_pending_irp(canonical_irp_id: u64, entry: PendingIrp) -> Option<u64> {
+    let head = pending_irp_head(FSD_DATA_VADDR).cast::<AtomicU64>();
+    let mut node = (&*head).load(Ordering::Acquire);
+    let mut steps = 0u64;
+    while node != 0 && steps < POOL_FREE_LIST_MAX {
+        if !pending_irp_node_valid(node) {
+            return None;
+        }
+        let state = pending_irp_owner_state(node).load(Ordering::Acquire);
+        if hosted_irp_state_kind(state) == HOSTED_IRP_TOMBSTONE {
+            let generation = next_hosted_irp_generation(state);
+            let initializing = generation | HOSTED_IRP_INITIALIZING;
+            if pending_irp_owner_state(node)
+                .compare_exchange(state, initializing, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                write_volatile(pending_irp_entry_address(node) as *mut PendingIrp, entry);
+                pending_irp_canonical_id(node).store(canonical_irp_id, Ordering::Relaxed);
+                pending_irp_raw_irp(node).store(entry.irp, Ordering::Relaxed);
+                let dispatching = generation | HOSTED_IRP_DISPATCHING;
+                pending_irp_owner_state(node).store(dispatching, Ordering::Release);
+                return Some(node);
+            }
+        }
+        node = read_volatile(node as *const u64);
+        steps += 1;
     }
-}
 
-unsafe fn insert_pending_irp(entry: PendingIrp) -> bool {
-    let mut node = 0u64;
+    node = 0;
+    let mut owner_state_initialized = false;
+    let initializing = HOSTED_IRP_GENERATION_STEP | HOSTED_IRP_INITIALIZING;
     for index in 0..FSD_PENDING_IRP_CAP {
         let slot = pending_irp_slot(FSD_DATA_VADDR, index);
-        if read_volatile(slot).entry.irp == 0 {
+        if pending_irp_owner_state(slot as u64)
+            .compare_exchange(0, initializing, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
             node = slot as u64;
+            owner_state_initialized = true;
             break;
         }
     }
     if node == 0 {
         node = pool_alloc(core::mem::size_of::<PendingIrpNode>() as u64);
         if node == 0 {
-            return false;
+            return None;
         }
     }
-    let head = pending_irp_head(FSD_DATA_VADDR);
-    let old = read_volatile(head);
-    write_volatile(
-        node as *mut PendingIrpNode,
-        PendingIrpNode { next: old, entry },
-    );
-    write_volatile(head, node);
-    true
+    let generation = HOSTED_IRP_GENERATION_STEP;
+    write_volatile(node as *mut u64, 0);
+    pending_irp_canonical_id(node).store(canonical_irp_id, Ordering::Relaxed);
+    pending_irp_raw_irp(node).store(entry.irp, Ordering::Relaxed);
+    write_volatile(pending_irp_entry_address(node) as *mut PendingIrp, entry);
+    if !owner_state_initialized {
+        pending_irp_owner_state(node).store(initializing, Ordering::Relaxed);
+    }
+    loop {
+        let old = (&*head).load(Ordering::Acquire);
+        write_volatile(node as *mut u64, old);
+        if (&*head)
+            .compare_exchange(old, node, Ordering::Release, Ordering::Acquire)
+            .is_ok()
+        {
+            break;
+        }
+    }
+    pending_irp_owner_state(node)
+        .store(generation | HOSTED_IRP_DISPATCHING, Ordering::Release);
+    Some(node)
 }
 
 #[derive(Clone, Copy)]
 struct PendingIrpCancelTarget {
+    node: u64,
     irp: u64,
     cancel_routine: u64,
 }
 
-unsafe fn find_pending_irp_cancel_target(
-    fid: u64,
-    requestor_tid: u64,
-) -> Option<PendingIrpCancelTarget> {
-    if fid == 0 {
+unsafe fn claim_pending_irp_cancel_target(canonical_irp_id: u64) -> Option<PendingIrpCancelTarget> {
+    if canonical_irp_id == 0 {
         return None;
     }
-    let mut node = read_volatile(pending_irp_head(FSD_DATA_VADDR));
+    let mut node = (&*pending_irp_head(FSD_DATA_VADDR).cast::<AtomicU64>()).load(Ordering::Acquire);
     let mut steps = 0u64;
     while node != 0 && steps < POOL_FREE_LIST_MAX {
         if !pending_irp_node_valid(node) {
             return None;
         }
-        let entry = read_volatile((node + 8) as *const PendingIrp);
-        if entry.fid == fid
-            && (requestor_tid == 0 || entry.requestor_tid == requestor_tid)
-            && entry.irp != 0
-            && entry.completion.completed().is_none()
+        let state = pending_irp_owner_state(node).load(Ordering::Acquire);
+        if hosted_irp_state_kind(state) == HOSTED_IRP_PENDING
+            && pending_irp_canonical_id(node).load(Ordering::Relaxed) == canonical_irp_id
         {
+            let cancel_state = hosted_irp_state_with_kind(state, HOSTED_IRP_CANCEL_ROUTINE);
+            if pending_irp_owner_state(node)
+                .compare_exchange(state, cancel_state, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            let entry = read_volatile(pending_irp_entry_address(node) as *const PendingIrp);
+            if pending_irp_canonical_id(node).load(Ordering::Relaxed) != canonical_irp_id
+                || entry.irp == 0
+                || pending_irp_raw_irp(node).load(Ordering::Relaxed) != entry.irp
+            {
+                panic!("claimed hosted IRP cancel identity changed");
+            }
             let cancel_routine =
                 read_unaligned((entry.irp + WDM_X64_IRP_CANCEL_ROUTINE_OFFSET) as *const u64);
-            if cancel_routine != 0 {
-                return Some(PendingIrpCancelTarget {
-                    irp: entry.irp,
-                    cancel_routine,
-                });
-            }
+            return Some(PendingIrpCancelTarget {
+                node,
+                irp: entry.irp,
+                cancel_routine,
+            });
         }
         node = read_volatile(node as *const u64);
         steps += 1;
@@ -1311,76 +1455,172 @@ unsafe fn find_pending_irp_cancel_target(
     None
 }
 
-unsafe fn discard_completed_file_records(fid: u64, requestor_tid: u64) -> u64 {
-    if fid == 0 {
-        return 0;
+unsafe fn cancel_pending_irp(canonical_irp_id: u64) -> bool {
+    let Some(target) = claim_pending_irp_cancel_target(canonical_irp_id) else {
+        return false;
+    };
+    let invoked = s_io_cancel_irp(target.irp);
+    loop {
+        let state = pending_irp_owner_state(target.node).load(Ordering::Acquire);
+        match hosted_irp_state_kind(state) {
+            HOSTED_IRP_CANCEL_ROUTINE => {
+                let pending = hosted_irp_state_with_kind(state, HOSTED_IRP_PENDING);
+                if pending_irp_owner_state(target.node)
+                    .compare_exchange(state, pending, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+                break;
+            }
+            // Another worker owns completion and will publish READY. Cancellation must not spin on
+            // a preempted worker, especially on a single-core seL4 schedule.
+            HOSTED_IRP_COMPLETED_CANCEL => {
+                let ready = hosted_irp_state_with_kind(state, HOSTED_IRP_READY);
+                if pending_irp_owner_state(target.node)
+                    .compare_exchange(state, ready, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+                break;
+            }
+            HOSTED_IRP_COMPLETING_CANCEL => {
+                let deferred =
+                    hosted_irp_state_with_kind(state, HOSTED_IRP_COMPLETING_DEFERRED);
+                if pending_irp_owner_state(target.node)
+                    .compare_exchange(state, deferred, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+                break;
+            }
+            HOSTED_IRP_READY => break,
+            other => panic!("invalid hosted IRP post-cancel owner state {other}"),
+        }
     }
-    let head = pending_irp_head(FSD_DATA_VADDR);
-    let mut previous_next = head;
-    let mut node = read_volatile(head);
+    let trace = FSD_CANCEL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if trace < 32 {
+        print_str(b"[fsd-cancel] canonical-irp=0x");
+        print_hex64(canonical_irp_id);
+        print_str(b" raw-irp=0x");
+        print_hex64(target.irp);
+        print_str(b" routine=0x");
+        print_hex64(target.cancel_routine);
+        print_str(b" invoked=");
+        print_u64(invoked as u64);
+        print_str(b"\n");
+    }
+    true
+}
+
+unsafe fn copy_pending_irp_completion(
+    canonical_irp_id: u64,
+    offset: u64,
+    capacity: u64,
+) -> (i32, u64) {
+    if canonical_irp_id == 0 || capacity > COMPLETED_READ_BYTE_CAP as u64 {
+        return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
+    }
+    let mut node = (&*pending_irp_head(FSD_DATA_VADDR).cast::<AtomicU64>()).load(Ordering::Acquire);
     let mut steps = 0u64;
-    let mut discarded = 0;
     while node != 0 && steps < POOL_FREE_LIST_MAX {
         if !pending_irp_node_valid(node) {
-            break;
+            return (0xC000_0001u32 as i32, 0); // STATUS_UNSUCCESSFUL
         }
         let next = read_volatile(node as *const u64);
-        let entry = read_volatile((node + 8) as *const PendingIrp);
-        if entry.fid == fid
-            && (requestor_tid == 0 || entry.requestor_tid == requestor_tid)
-            && entry.completion.completed().is_some()
+        let state = pending_irp_owner_state(node).load(Ordering::Acquire);
+        if hosted_irp_state_kind(state) == HOSTED_IRP_PUBLISHED
+            && pending_irp_canonical_id(node).load(Ordering::Relaxed) == canonical_irp_id
         {
-            unlink_pending_irp_node_component(previous_next, node, next, entry);
-            discarded += 1;
-            node = next;
-            steps += 1;
-            continue;
+            let copying = hosted_irp_state_with_kind(state, HOSTED_IRP_COPYING);
+            if pending_irp_owner_state(node)
+                .compare_exchange(state, copying, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            let entry = read_volatile(pending_irp_entry_address(node) as *const PendingIrp);
+            let Some(completion) = entry.completion.completed() else {
+                pending_irp_owner_state(node).store(state, Ordering::Release);
+                return (0xC000_0001u32 as i32, 0);
+            };
+            let valid_range = offset
+                .checked_add(capacity)
+                .is_some_and(|end| end <= completion.length as u64);
+            let source = completion.source.checked_add(offset);
+            let source_valid = capacity == 0
+                || component_pool_allocation_capacity(completion.source)
+                    .is_some_and(|available| {
+                        offset
+                            .checked_add(capacity)
+                            .is_some_and(|end| end <= available)
+                    });
+            if !valid_range || !source_valid {
+                pending_irp_owner_state(node).store(state, Ordering::Release);
+                return (0xC000_000Du32 as i32, 0);
+            }
+            if let Some(source) = source {
+                let mut index = 0u64;
+                while index < capacity {
+                    let byte = read_volatile((source + index) as *const u8);
+                    write_volatile((FSD_ARG_VADDR + index) as *mut u8, byte);
+                    index += 1;
+                }
+            }
+            pending_irp_owner_state(node).store(state, Ordering::Release);
+            return (0, capacity);
         }
-        previous_next = node as *mut u64;
         node = next;
         steps += 1;
     }
-    discarded
+    (0xC000_000Du32 as i32, 0)
 }
 
-unsafe fn cancel_pending_irps_for_file(
-    fid: u64,
-    requestor_tid: u64,
-    _device_object: u64,
-) -> u64 {
-    let mut cancelled = 0u64;
-    loop {
-        let Some(target) = find_pending_irp_cancel_target(fid, requestor_tid) else {
-            break;
-        };
-        let cancelled_this = s_io_cancel_irp(target.irp);
-        let discarded = discard_completed_file_records(fid, requestor_tid);
-        let trace = FSD_CANCEL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-        if trace < 32 {
-            print_str(b"[fsd-cancel] fid=0x");
-            print_hex(fid as u32);
-            print_str(b" irp=0x");
-            print_hex((target.irp >> 32) as u32);
-            print_hex(target.irp as u32);
-            print_str(b" routine=0x");
-            print_hex((target.cancel_routine >> 32) as u32);
-            print_hex(target.cancel_routine as u32);
-            print_str(b" invoked=");
-            print_u64(cancelled_this as u64);
-            print_str(b" discarded=");
-            print_u64(discarded);
-            print_str(b"\n");
-        }
-        if cancelled_this == 0 {
-            break;
-        }
-        cancelled += 1;
-        if cancelled >= POOL_FREE_LIST_MAX {
-            break;
-        }
+unsafe fn acknowledge_pending_irp_completion(canonical_irp_id: u64) -> bool {
+    if canonical_irp_id == 0 {
+        return false;
     }
-    let _ = discard_completed_file_records(fid, requestor_tid);
-    cancelled
+    let mut node = (&*pending_irp_head(FSD_DATA_VADDR).cast::<AtomicU64>()).load(Ordering::Acquire);
+    let mut steps = 0u64;
+    while node != 0 && steps < POOL_FREE_LIST_MAX {
+        if !pending_irp_node_valid(node) {
+            return false;
+        }
+        let next = read_volatile(node as *const u64);
+        let state = pending_irp_owner_state(node).load(Ordering::Acquire);
+        if hosted_irp_state_kind(state) == HOSTED_IRP_PUBLISHED
+            && pending_irp_canonical_id(node).load(Ordering::Relaxed) == canonical_irp_id
+        {
+            let consuming = hosted_irp_state_with_kind(state, HOSTED_IRP_CONSUMING);
+            if pending_irp_owner_state(node)
+                .compare_exchange(state, consuming, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            let entry = read_volatile(pending_irp_entry_address(node) as *const PendingIrp);
+            let completion = entry
+                .completion
+                .completed()
+                .expect("published hosted IRP owner has no completion payload");
+            let create_failed = matches!(entry.major as u64, 0 | 1)
+                && (completion.status as i32).is_negative();
+            if !entry.owns_fo
+                && (entry.major as u64 == IRP_MJ_CLOSE || create_failed)
+                && entry.fid != 0
+            {
+                fo_release(entry.fid);
+            }
+            release_pending_irp_graph_component(entry);
+            tombstone_pending_irp_owner(node, consuming);
+            return true;
+        }
+        node = next;
+        steps += 1;
+    }
+    false
 }
 
 unsafe fn pending_irp_node_exec_va(win: ExecVaWindow, node: u64) -> Option<u64> {
@@ -1401,188 +1641,87 @@ unsafe fn pending_irp_node_exec_va(win: ExecVaWindow, node: u64) -> Option<u64> 
     )
 }
 
-unsafe fn release_pending_irp_graph_for_instance(
-    inst: DriverInstance,
-    entry: PendingIrp,
-    completion: nt_io_manager::RetainedCompletion,
-) -> bool {
-    let candidates = [
-        completion.reclaim,
-        entry.mdl,
-        if entry.aux_data != entry.data {
-            entry.aux_data
-        } else {
-            0
-        },
-        entry.data,
-        entry.iosl,
-        entry.irp,
-        if entry.owns_fo { entry.file_object } else { 0 },
-    ];
-    for (index, pointer) in candidates.iter().copied().enumerate() {
-        if pointer != 0
-            && !candidates[..index].contains(&pointer)
-            && hosted_pool_allocation_exec_va(inst.exec_pool_va, pointer, 1).is_none()
-        {
-            if FSD_POOL_INVALID_FREES.fetch_add(1, Ordering::Relaxed) == 0 {
-                print_str(b"[fsd-pool-invalid] retained graph release index=");
-                print_u64(index as u64);
-                print_str(b" pointer=");
-                print_hex64(pointer);
-                print_str(b" irp=");
-                print_hex64(entry.irp);
-                print_str(b" fid=");
-                print_hex64(entry.fid);
-                print_str(b"\n");
+fn hosted_completion_storage_instance(instance: usize) -> usize {
+    unsafe {
+        hosted_provider_dispatch_route_for_instance(instance)
+            .map(|route| route.provider_instance)
+            .unwrap_or(instance)
+    }
+}
+
+unsafe fn poll_hosted_completion(instance: usize) -> Option<nt_io_manager::DriverCompletion> {
+    let storage_instance = hosted_completion_storage_instance(instance);
+    let win = ExecVaWindow::try_for_instance(storage_instance)?;
+    let head = (win.data_va + FSD_PENDING_IRP_HEAD_OFF) as *const AtomicU64;
+    loop {
+        let mut node = (&*head).load(Ordering::Acquire);
+        let mut best: Option<(u64, u64, u64)> = None;
+        let mut steps = 0u64;
+        while node != 0 && steps < POOL_FREE_LIST_MAX {
+            let node_exec = pending_irp_node_exec_va(win, node)?;
+            let next = read_volatile(node_exec as *const u64);
+            let ready_state = pending_irp_owner_state(node_exec).load(Ordering::Acquire);
+            if hosted_irp_state_kind(ready_state) != HOSTED_IRP_READY {
+                node = next;
+                steps += 1;
+                continue;
             }
-            return false;
-        }
-    }
-    for (index, pointer) in candidates.iter().copied().enumerate() {
-        if pointer == 0 || candidates[..index].contains(&pointer) {
-            continue;
-        }
-        if !hosted_instance_pool_free(inst, pointer) {
-            panic!("validated hosted IRP graph allocation could not be released");
-        }
-    }
-    true
-}
-
-unsafe fn pending_irp_graph_valid_for_instance(
-    inst: DriverInstance,
-    entry: PendingIrp,
-    completion: nt_io_manager::RetainedCompletion,
-) -> bool {
-    let candidates = [
-        completion.reclaim,
-        entry.mdl,
-        if entry.aux_data != entry.data {
-            entry.aux_data
-        } else {
-            0
-        },
-        entry.data,
-        entry.iosl,
-        entry.irp,
-        if entry.owns_fo { entry.file_object } else { 0 },
-    ];
-    candidates.iter().copied().enumerate().all(|(index, pointer)| {
-        pointer == 0
-            || candidates[..index].contains(&pointer)
-            || hosted_pool_allocation_exec_va(inst.exec_pool_va, pointer, 1).is_some()
-    })
-}
-
-unsafe fn take_retained_completion_from_instance(
-    instance: usize,
-    fid: u64,
-    read_completion: bool,
-) -> Option<(
-    PendingIrp,
-    nt_io_manager::RetainedCompletion,
-    alloc::vec::Vec<u8>,
-)> {
-    if fid == 0 {
-        return None;
-    }
-    let inst = driver_instances()?.get(instance).copied()?;
-    let win = ExecVaWindow::try_for_instance(instance)?;
-    let head = (win.data_va + FSD_PENDING_IRP_HEAD_OFF) as *mut u64;
-    let mut previous_next = head;
-    let mut node = read_volatile(head);
-    let mut best: Option<(u64, u64, u64, PendingIrp, nt_io_manager::RetainedCompletion)> = None;
-    let mut steps = 0u64;
-    while node != 0 && steps < POOL_FREE_LIST_MAX {
-        let node_exec = pending_irp_node_exec_va(win, node)?;
-        let next = read_volatile(node_exec as *const u64);
-        let entry = read_volatile((node_exec + 8) as *const PendingIrp);
-        if entry.fid == fid
-            && entry.read_completion == read_completion
-            && (read_completion || entry.major as u64 == IRP_MJ_WRITE)
-        {
-            if let Some(completion) = entry.completion.completed() {
-                if best
-                    .as_ref()
-                    .is_none_or(|(_, _, _, _, current)| completion.sequence < current.sequence)
-                {
-                    best = Some((previous_next as u64, node, next, entry, completion));
+            let copying_state = hosted_irp_state_with_kind(ready_state, HOSTED_IRP_COPYING);
+            if pending_irp_owner_state(node_exec)
+                .compare_exchange(
+                    ready_state,
+                    copying_state,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                node = next;
+                steps += 1;
+                continue;
+            }
+            let canonical_irp_id = pending_irp_canonical_id(node_exec).load(Ordering::Relaxed);
+            let entry = read_volatile(pending_irp_entry_address(node_exec) as *const PendingIrp);
+            let completion = entry.completion.completed();
+            pending_irp_owner_state(node_exec).store(ready_state, Ordering::Release);
+            if canonical_irp_id != 0 && entry.owner_instance == instance as u64 {
+                if let Some(completion) = completion {
+                    if best
+                        .as_ref()
+                        .is_none_or(|(_, _, sequence)| completion.sequence < *sequence)
+                    {
+                        best = Some((node_exec, ready_state, completion.sequence));
+                    }
                 }
             }
+            node = next;
+            steps += 1;
         }
-        previous_next = node_exec as *mut u64;
-        node = next;
-        steps += 1;
-    }
-    let (best_previous_next, best_node, best_next, entry, completion) = best?;
-    let length = if read_completion {
-        completion.length as usize
-    } else {
-        0
-    };
-    if length > COMPLETED_READ_BYTE_CAP {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    bytes.try_reserve_exact(length).ok()?;
-    if length != 0 {
-        let source_exec =
-            hosted_pool_allocation_exec_va(win.pool_va, completion.source, length as u64)?;
-        let source = core::slice::from_raw_parts(source_exec as *const u8, length);
-        bytes.extend_from_slice(source);
-    }
-    if !pending_irp_graph_valid_for_instance(inst, entry, completion) {
-        if FSD_POOL_INVALID_FREES.fetch_add(1, Ordering::Relaxed) == 0 {
-            print_str(b"[fsd-pool-invalid] retained graph validation irp=");
-            print_hex64(entry.irp);
-            print_str(b" fid=");
-            print_hex64(entry.fid);
-            print_str(b" source/reclaim=");
-            print_hex64(completion.source);
-            print_str(b"/");
-            print_hex64(completion.reclaim);
-            print_str(b"\n");
+        let (node_exec, ready_state, _) = best?;
+        let published_state = hosted_irp_state_with_kind(ready_state, HOSTED_IRP_PUBLISHED);
+        if pending_irp_owner_state(node_exec)
+            .compare_exchange(
+                ready_state,
+                published_state,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            continue;
         }
-        return None;
+        let canonical_irp_id = pending_irp_canonical_id(node_exec).load(Ordering::Relaxed);
+        let entry = read_volatile(pending_irp_entry_address(node_exec) as *const PendingIrp);
+        let completion = entry
+            .completion
+            .completed()
+            .expect("published hosted IRP owner has no completion payload");
+        return Some(nt_io_manager::DriverCompletion {
+            irp_id: IrpId(canonical_irp_id),
+            status: nt_status::NtStatus(completion.status as i32),
+            information: completion.information,
+        });
     }
-
-    let best_node_exec = pending_irp_node_exec_va(win, best_node)?;
-    write_volatile(best_previous_next as *mut u64, best_next);
-    let table_start = FSD_DATA_VADDR + FSD_PENDING_IRPS_OFF;
-    let table_end = table_start
-        + core::mem::size_of::<PendingIrpNode>() as u64 * FSD_PENDING_IRP_CAP as u64;
-    if best_node >= table_start && best_node < table_end {
-        write_volatile(best_node_exec as *mut PendingIrpNode, EMPTY_PENDING_IRP_NODE);
-    } else {
-        if !hosted_instance_pool_free(inst, best_node) {
-            panic!("validated pending-IRP owner node could not be released");
-        }
-    }
-    if !release_pending_irp_graph_for_instance(inst, entry, completion) {
-        panic!("validated hosted IRP graph became invalid during release");
-    }
-    Some((entry, completion, bytes))
-}
-
-/// Consume the oldest completed retained read for `fid` only after copying its bytes out of the
-/// driver-owned request graph. Allocation or pointer-validation failure leaves the owner record
-/// linked for a later retry.
-pub(crate) unsafe fn take_completed_read_for_device(
-    device_id: u64,
-    fid: u64,
-) -> Option<(u32, u64, alloc::vec::Vec<u8>)> {
-    let (instance, _) = instance_by_device_id(device_id)?;
-    let (_, completion, bytes) = take_retained_completion_from_instance(instance, fid, true)?;
-    Some((completion.status, completion.information, bytes))
-}
-
-pub(crate) unsafe fn take_completed_write_for_device(
-    device_id: u64,
-    fid: u64,
-) -> Option<(u32, u64)> {
-    let (instance, _) = instance_by_device_id(device_id)?;
-    let (_, completion, _) = take_retained_completion_from_instance(instance, fid, false)?;
-    Some((completion.status, completion.information))
 }
 
 // --- host-side pool allocator (the trampolines run in the component) --------------------------
@@ -1591,11 +1730,38 @@ pub(crate) unsafe fn take_completed_write_for_device(
 /// list can never be longer than this; anything past it means the list is CORRUPT (a cycle), and a
 /// cycle must degrade to the bump path rather than spin the whole executive.
 const POOL_FREE_LIST_MAX: u64 = (FSD_POOL_FRAMES * 0x1000) / 16;
+const COMPONENT_POOL_LOCK_OFF: u64 = 0x10;
 /// Double `pool_free` calls the guard below rejected, and free-list cycles `pool_alloc` broke out of.
 /// Both are counter-backed so a regression is a gate failure rather than a silent 555-second hang.
 pub(crate) static FSD_POOL_DOUBLE_FREES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FSD_POOL_LIST_CYCLES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FSD_POOL_INVALID_FREES: AtomicU64 = AtomicU64::new(0);
+
+struct ComponentPoolLockGuard;
+
+impl Drop for ComponentPoolLockGuard {
+    fn drop(&mut self) {
+        unsafe {
+            (&*((FSD_POOL_VADDR + COMPONENT_POOL_LOCK_OFF) as *const AtomicU64))
+                .store(0, Ordering::Release);
+        }
+    }
+}
+
+unsafe fn component_pool_lock() -> ComponentPoolLockGuard {
+    let lock = &*((FSD_POOL_VADDR + COMPONENT_POOL_LOCK_OFF) as *const AtomicU64);
+    while lock
+        .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        // Hosted driver threads share one physical CPU. A contended raw spin would prevent the
+        // owner from ever being scheduled, especially when it is parked across an executive
+        // callback. Yielding preserves real mutual exclusion while giving the owner a chance to
+        // finish the bounded allocator mutation and release the lock.
+        crate::yield_now();
+    }
+    ComponentPoolLockGuard
+}
 
 /// A simple free-list allocator: an FSD alloc/frees file objects; a leak-forever bump would exhaust
 /// under FSCTL churn. Header = 16 B ([+0]=capacity, [+8]=next-free). `pool_free` pushes onto the
@@ -1603,6 +1769,7 @@ pub(crate) static FSD_POOL_INVALID_FREES: AtomicU64 = AtomicU64::new(0);
 ///
 /// The first-fit walk is cycle-bounded so allocator metadata damage cannot spin the executive.
 pub(crate) unsafe fn pool_alloc(size: u64) -> u64 {
+    let _guard = component_pool_lock();
     POOL_CALLS += 1;
     if POOL_CALLS % 16384 == 0 {
         print_str(b"[fsd-pool-heartbeat] calls=");
@@ -1657,6 +1824,7 @@ pub(crate) unsafe fn pool_alloc(size: u64) -> u64 {
 
 /// Push one exact allocation base back onto the free list, rejecting invalid and duplicate frees.
 unsafe fn pool_free(p: u64) {
+    let _guard = component_pool_lock();
     POOL_CALLS += 1;
     if POOL_CALLS % 16384 == 0 {
         print_str(b"[fsd-pool-heartbeat] calls=");
@@ -2814,10 +2982,33 @@ fn exec_pool_to_component_va(exec_pool_va: u64, exec_va: u64) -> Option<u64> {
     Some(FSD_POOL_VADDR + off)
 }
 
+struct ExecutivePoolLockGuard(*const AtomicU64);
+
+impl Drop for ExecutivePoolLockGuard {
+    fn drop(&mut self) {
+        unsafe { (&*self.0).store(0, Ordering::Release) }
+    }
+}
+
+unsafe fn hosted_instance_pool_lock(exec_pool_va: u64) -> Option<ExecutivePoolLockGuard> {
+    let lock_address = exec_pool_va.checked_add(COMPONENT_POOL_LOCK_OFF)?;
+    let lock = &*(lock_address as *const AtomicU64);
+    while lock
+        .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        // The lock is shared with hosted component threads. The executive must not monopolize the
+        // only CPU while waiting for a component owner to run and release it.
+        crate::yield_now();
+    }
+    Some(ExecutivePoolLockGuard(lock as *const AtomicU64))
+}
+
 unsafe fn hosted_instance_pool_alloc(inst: DriverInstance, size: u64) -> Option<u64> {
     if inst.exec_pool_va == 0 || size == 0 {
         return None;
     }
+    let _guard = hosted_instance_pool_lock(inst.exec_pool_va)?;
     let pool_bytes = FSD_POOL_FRAMES.checked_mul(0x1000)?;
     let exec_pool_end = inst.exec_pool_va.checked_add(pool_bytes)?;
     let component_pool_end = component_pool_end();
@@ -2871,7 +3062,7 @@ unsafe fn hosted_instance_pool_alloc(inst: DriverInstance, size: u64) -> Option<
     Some(block)
 }
 
-unsafe fn hosted_instance_pool_free(inst: DriverInstance, p: u64) -> bool {
+unsafe fn hosted_instance_pool_free_unlocked(inst: DriverInstance, p: u64) -> bool {
     let Some(p_exec) = hosted_pool_allocation_exec_va(inst.exec_pool_va, p, 1) else {
         if FSD_POOL_INVALID_FREES.fetch_add(1, Ordering::Relaxed) == 0 {
             print_str(b"[fsd-pool-invalid] executive free pointer=");
@@ -2912,7 +3103,14 @@ unsafe fn hosted_instance_pool_free(inst: DriverInstance, p: u64) -> bool {
     true
 }
 
-unsafe fn hosted_instance_pool_allocation_is_free(
+unsafe fn hosted_instance_pool_free(inst: DriverInstance, p: u64) -> bool {
+    let Some(_guard) = hosted_instance_pool_lock(inst.exec_pool_va) else {
+        return false;
+    };
+    hosted_instance_pool_free_unlocked(inst, p)
+}
+
+unsafe fn hosted_instance_pool_allocation_is_free_unlocked(
     inst: DriverInstance,
     p: u64,
 ) -> Option<bool> {
@@ -2952,9 +3150,12 @@ unsafe fn release_hosted_instance_pool_allocation_if_live(
     if p == 0 {
         return true;
     }
-    match hosted_instance_pool_allocation_is_free(inst, p) {
+    let Some(_guard) = hosted_instance_pool_lock(inst.exec_pool_va) else {
+        return false;
+    };
+    match hosted_instance_pool_allocation_is_free_unlocked(inst, p) {
         Some(true) => true,
-        Some(false) => hosted_instance_pool_free(inst, p),
+        Some(false) => hosted_instance_pool_free_unlocked(inst, p),
         None => false,
     }
 }
@@ -3440,8 +3641,6 @@ unsafe fn audit_data_queue(dq: u64) -> bool {
                     };
                     print_str(b" irp-major=");
                     print_u64(mj);
-                    print_str(b" pending=");
-                    print_u64(pending_irp_exists(eirp) as u64);
                 }
                 print_str(b"\n");
                 e = read_volatile(e as *const u64);
@@ -6621,10 +6820,8 @@ extern "win64" fn s_io_set_cancel_routine(irp: u64, cancel_routine: u64) -> u64 
         return 0;
     }
     unsafe {
-        let slot = (irp + WDM_X64_IRP_CANCEL_ROUTINE_OFFSET) as *mut u64;
-        let old = read_unaligned(slot as *const u64);
-        write_unaligned(slot, cancel_routine);
-        old
+        (&*((irp + WDM_X64_IRP_CANCEL_ROUTINE_OFFSET) as *const AtomicU64))
+            .swap(cancel_routine, Ordering::AcqRel)
     }
 }
 
@@ -6738,10 +6935,16 @@ extern "win64" fn s_io_cancel_irp(irp: u64) -> u8 {
     }
     unsafe {
         let old = hosted_raise_irql(DISPATCH_LEVEL);
+        while IO_CANCEL_SPIN_LOCK
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
         write_unaligned((irp + WDM_X64_IRP_CANCEL_OFFSET) as *mut u8, 1);
         write_unaligned((irp + WDM_X64_IRP_CANCEL_IRQL_OFFSET) as *mut u8, old);
-        let routine = read_unaligned((irp + WDM_X64_IRP_CANCEL_ROUTINE_OFFSET) as *const u64);
-        write_unaligned((irp + WDM_X64_IRP_CANCEL_ROUTINE_OFFSET) as *mut u64, 0);
+        let routine = (&*((irp + WDM_X64_IRP_CANCEL_ROUTINE_OFFSET) as *const AtomicU64))
+            .swap(0, Ordering::AcqRel);
         if routine != 0 {
             let stack = irp_current_stack_location(irp);
             let device = if stack != 0 {
@@ -6753,6 +6956,7 @@ extern "win64" fn s_io_cancel_irp(irp: u64) -> u8 {
             f(device, irp);
             return 1;
         }
+        IO_CANCEL_SPIN_LOCK.store(0, Ordering::Release);
         hosted_lower_irql(old);
     }
     0
@@ -6847,6 +7051,12 @@ extern "win64" fn s_io_free_work_item(work_item: u64) {
 extern "win64" fn s_io_acquire_cancel_spin_lock(old_irql_out: u64) {
     unsafe {
         let old = hosted_raise_irql(DISPATCH_LEVEL);
+        while IO_CANCEL_SPIN_LOCK
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
         if old_irql_out != 0 {
             write_unaligned(old_irql_out as *mut u8, old);
         }
@@ -6856,6 +7066,7 @@ extern "win64" fn s_io_acquire_cancel_spin_lock(old_irql_out: u64) {
 /// `VOID IoReleaseCancelSpinLock(KIRQL)`.
 extern "win64" fn s_io_release_cancel_spin_lock(old_irql: u8) {
     unsafe {
+        IO_CANCEL_SPIN_LOCK.store(0, Ordering::Release);
         hosted_lower_irql(old_irql);
     }
 }
@@ -8942,6 +9153,14 @@ extern "win64" fn s_io_register_file_system(_dev: u64) {
 /// npfs's deferred list; reclaim that retained request graph here instead of leaking it forever.
 extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
     unsafe {
+        let Some((node, completing_state, target)) = claim_pending_irp_completion(irp) else {
+            if PEER_COMPLETION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8 {
+                print_str(b"[fsd-peer-complete] IRP=");
+                print_hex64(irp);
+                print_str(b" has no claimable owner\n");
+            }
+            return;
+        };
         let active_seq = FSD_ACTIVE_DISPATCH_SEQ.load(Ordering::Relaxed);
         if active_seq >= 128 && FSD_ACTIVE_COMPLETE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16
         {
@@ -8964,10 +9183,10 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
         // DIAGNOSTIC heartbeat: `NpCompleteDeferredIrps` walks a driver-built LIST_ENTRY chain, so a
         // corrupted (cyclic) deferred list becomes an unbounded completion loop with no other output.
         {
-            IO_COMPLETE_CALLS += 1;
-            if IO_COMPLETE_CALLS % 4096 == 0 {
+            let calls = IO_COMPLETE_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+            if calls % 4096 == 0 {
                 print_str(b"[fsd-complete-heartbeat] calls=");
-                print_u64(IO_COMPLETE_CALLS);
+                print_u64(calls);
                 print_str(b" irp=");
                 print_hex(irp as u32);
                 print_str(b"\n");
@@ -8982,96 +9201,124 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
         if status == STATUS_PENDING {
             panic!("IoCompleteRequest cannot complete an IRP with STATUS_PENDING");
         }
-        let Some((node, mut slot)) = find_pending_irp_node(irp) else {
-            if PEER_COMPLETION_TRACE_COUNT < 8 {
-                PEER_COMPLETION_TRACE_COUNT += 1;
-                print_str(b"[fsd-peer-complete] IRP=0x");
-                print_hex((irp >> 32) as u32);
-                print_hex(irp as u32);
-                print_str(b" NOT in pending table\n");
-            }
-            return;
-        };
         let information = read_unaligned((irp + 0x38) as *const u64);
-        // BATCH 37/38: a completing pending READ carries the peer's just-written payload in its IRP
-        // buffer. Stash those bytes keyed by the reader's fid so the executive's pipe re-drive delivers
-        // them to the parked reader (a fresh re-drive read would miss — npfs already drained the queue
-        // into THIS IRP). ★ BATCH 38 FIX: npfs's `NpWriteDataQueue` completing a *Buffered* read entry
-        // does NOT copy into our original `slot.data` — it ALLOCATES a FRESH pool buffer, copies the
-        // write payload into it, then REASSIGNS `WriteIrp->AssociatedIrp.SystemBuffer = Buffer` and sets
-        // IRP_DEALLOCATE_BUFFER|IRP_BUFFERED_IO|IRP_INPUT_OPERATION (writesup.c:131-135). So the real
-        // bytes live at the IRP's CURRENT AssociatedIrp.SystemBuffer (irp+0x18) — which npfs just
-        // overwrote — NOT the stale `slot.data`. Reading `slot.data` returned 16 zero bytes (the
-        // untouched original buffer), which is why rpcrt4 rejected the bind. Read irp+0x18 live.
-        let retain_for_waiter = slot.read_completion || slot.major as u64 == IRP_MJ_WRITE;
-        if retain_for_waiter {
-            // The buffer npfs actually filled = the IRP's CURRENT SystemBuffer (it may have reassigned
-            // it). Fall back to our original buffer only if npfs left it in place.
-            let sysbuf = read_unaligned((irp + 0x18) as *const u64);
-            let irp_flags = read_unaligned((irp + 0x10) as *const u32);
-            let length = if slot.read_completion {
-                (information as usize).min(COMPLETED_READ_BYTE_CAP)
-            } else {
-                0
-            };
-            let source = if slot.read_completion {
-                if slot.completion_source_kind == COMPLETION_SOURCE_REQUEST_DATA {
-                    slot.data
-                } else if sysbuf != 0 {
-                    sysbuf
-                } else {
-                    slot.data
-                }
-            } else {
-                0
-            };
-            let source_valid = !slot.read_completion
-                || length == 0
-                || component_pool_allocation_capacity(source)
-                    .is_some_and(|capacity| length as u64 <= capacity);
-            let reclaim = if irp_flags & IRP_DEALLOCATE_BUFFER != 0 {
-                sysbuf
-            } else {
-                0
-            };
-            let reclaim_valid = reclaim == 0 || component_pool_allocation_capacity(reclaim).is_some();
-            let completion_valid = source_valid && reclaim_valid;
-            let sequence = next_completion_seq(FSD_DATA_VADDR);
-            if slot
-                .completion
-                .complete(
-                    sequence,
-                    if completion_valid { status } else { 0xC000_0005 },
-                    if completion_valid { information } else { 0 },
-                    if completion_valid { source } else { 0 },
-                    if reclaim_valid { reclaim } else { 0 },
-                    if completion_valid { length as u32 } else { 0 },
-                    irp_flags,
-                )
-                .is_err()
-            {
-                print_str(b"[fsd-peer-complete] ERROR duplicate retained completion irp=");
-                print_hex64(irp);
-                print_str(b"\n");
-                panic!("hosted driver completed the same retained IRP twice");
-            }
-            write_volatile((node + 8) as *mut PendingIrp, slot);
+        // A completing pending READ carries the peer's just-written payload in its IRP buffer. Retain
+        // those bytes under the canonical IRP id so the executive delivers them to the exact waiter.
+        // A fresh read would miss because NPFS already drained the queue into this IRP. NPFS can
+        // replace a buffered read's AssociatedIrp.SystemBuffer while completing a queued read, so
+        // the current IRP field, rather than the request's original buffer, is authoritative.
+        // The buffer the driver actually filled is the live SystemBuffer. NPFS may replace the
+        // original buffered-I/O allocation while completing a queued read.
+        let sysbuf = read_unaligned((irp + 0x18) as *const u64);
+        let irp_flags = read_unaligned((irp + 0x10) as *const u32);
+        let length = information
+            .min(target.output_capacity)
+            .min(COMPLETED_READ_BYTE_CAP as u64) as usize;
+        let source = if length == 0 {
+            0
+        } else if target.completion_source_kind == COMPLETION_SOURCE_REQUEST_DATA {
+            target.data
+        } else if sysbuf != 0 {
+            sysbuf
+        } else {
+            target.data
+        };
+        let source_valid = length == 0
+            || component_pool_allocation_capacity(source)
+                .is_some_and(|capacity| length as u64 <= capacity);
+        let reclaim = if irp_flags & IRP_DEALLOCATE_BUFFER != 0 {
+            sysbuf
+        } else {
+            0
+        };
+        let reclaim_valid = reclaim == 0 || component_pool_allocation_capacity(reclaim).is_some();
+        let information_within_output =
+            target.output_capacity == 0 || information <= target.output_capacity;
+        let completion_valid = source_valid && reclaim_valid && information_within_output;
+        let sequence = next_completion_seq(FSD_DATA_VADDR);
+        let mut completion = nt_io_manager::RetainedIrpCompletion::pending();
+        if completion
+            .complete(
+                sequence,
+                if completion_valid { status } else { 0xC000_0005 },
+                if completion_valid { information } else { 0 },
+                if completion_valid { source } else { 0 },
+                if reclaim_valid { reclaim } else { 0 },
+                if completion_valid { length as u32 } else { 0 },
+                irp_flags,
+            )
+            .is_err()
+        {
+            panic!("hosted driver completed the same retained IRP twice");
         }
-        if PEER_COMPLETION_TRACE_COUNT < 8 {
-            PEER_COMPLETION_TRACE_COUNT += 1;
+        write_volatile(
+            (pending_irp_entry_address(node)
+                + core::mem::offset_of!(PendingIrp, completion) as u64)
+                as *mut nt_io_manager::RetainedIrpCompletion,
+            completion,
+        );
+        let completing_kind = hosted_irp_state_kind(completing_state);
+        match completing_kind {
+            HOSTED_IRP_COMPLETING_DISPATCH => {
+                let completed = hosted_irp_state_with_kind(
+                    completing_state,
+                    HOSTED_IRP_COMPLETED_DISPATCH,
+                );
+                if pending_irp_owner_state(node)
+                    .compare_exchange(
+                        completing_state,
+                        completed,
+                        Ordering::Release,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    let deferred = hosted_irp_state_with_kind(
+                        completing_state,
+                        HOSTED_IRP_COMPLETING_DEFERRED,
+                    );
+                    let ready = hosted_irp_state_with_kind(completing_state, HOSTED_IRP_READY);
+                    pending_irp_owner_state(node)
+                        .compare_exchange(deferred, ready, Ordering::Release, Ordering::Acquire)
+                        .expect("hosted inline completion lost its post-dispatch handoff");
+                }
+            }
+            HOSTED_IRP_COMPLETING_PENDING => pending_irp_owner_state(node).store(
+                hosted_irp_state_with_kind(completing_state, HOSTED_IRP_READY),
+                Ordering::Release,
+            ),
+            HOSTED_IRP_COMPLETING_CANCEL => {
+                let completed =
+                    hosted_irp_state_with_kind(completing_state, HOSTED_IRP_COMPLETED_CANCEL);
+                if pending_irp_owner_state(node)
+                    .compare_exchange(
+                        completing_state,
+                        completed,
+                        Ordering::Release,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    let deferred = hosted_irp_state_with_kind(
+                        completing_state,
+                        HOSTED_IRP_COMPLETING_DEFERRED,
+                    );
+                    let ready = hosted_irp_state_with_kind(completing_state, HOSTED_IRP_READY);
+                    pending_irp_owner_state(node)
+                        .compare_exchange(deferred, ready, Ordering::Release, Ordering::Acquire)
+                        .expect("hosted cancel completion lost its caller handoff");
+                }
+            }
+            _ => unreachable!(),
+        }
+        if PEER_COMPLETION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8 {
             print_str(b"[fsd-peer-complete] major=");
-            print_u64(slot.major as u64);
+            print_u64(target.major as u64);
             print_str(b" status=0x");
             print_hex(status);
             print_str(b" info=");
             print_u64(information);
             print_str(b"\n");
-        }
-        if !retain_for_waiter {
-            let Some(completed) = take_pending_irp(irp) else {
-                panic!("completed hosted IRP disappeared before reclamation");
-            };
-            release_pending_irp_graph_component(completed);
         }
     }
 }
@@ -9588,14 +9835,19 @@ extern "win64" fn s_ke_get_current_irql() -> u8 {
     unsafe { hosted_current_irql() }
 }
 
-/// `KIRQL KeAcquireSpinLockRaiseToDpc(PKSPIN_LOCK)` — single-threaded hosted drivers never spin, but
-/// the lock's driver-visible storage records ownership until release.
+/// `KIRQL KeAcquireSpinLockRaiseToDpc(PKSPIN_LOCK)`.
+///
+/// The hosted NT ABI exposes one logical processor (`KeNumberProcessors == 1`). NT UP spinlocks
+/// therefore provide exclusion by raising IRQL; no inter-processor lock word is acquired. This is
+/// also what permits a protocol receive indication to synchronously re-enter NDIS send code while
+/// the outer indication is at `DISPATCH_LEVEL`.
 extern "win64" fn s_ke_acquire_spin_lock_raise_to_dpc(lock: u64) -> u8 {
     unsafe {
-        let old_irql = hosted_raise_irql(DISPATCH_LEVEL);
-        if lock != 0 {
-            write_unaligned(lock as *mut u64, 1);
+        if lock == 0 {
+            return hosted_current_irql();
         }
+        let old_irql = hosted_raise_irql(DISPATCH_LEVEL);
+        compiler_fence(Ordering::SeqCst);
         old_irql
     }
 }
@@ -9603,28 +9855,25 @@ extern "win64" fn s_ke_acquire_spin_lock_raise_to_dpc(lock: u64) -> u8 {
 /// `void KeReleaseSpinLock(PKSPIN_LOCK, KIRQL)`.
 extern "win64" fn s_ke_release_spin_lock(lock: u64, old_irql: u8) {
     unsafe {
-        if lock != 0 {
-            write_unaligned(lock as *mut u64, 0);
+        if lock == 0 {
+            return;
         }
+        compiler_fence(Ordering::SeqCst);
         hosted_lower_irql(old_irql);
     }
 }
 
-/// `VOID KeAcquireSpinLockAtDpcLevel(PKSPIN_LOCK)`.
+/// `VOID KeAcquireSpinLockAtDpcLevel(PKSPIN_LOCK)` -- barrier-only on the hosted UP ABI.
 extern "win64" fn s_ke_acquire_spin_lock_at_dpc_level(lock: u64) {
-    unsafe {
-        if lock != 0 {
-            write_unaligned(lock as *mut u64, 1);
-        }
+    if lock != 0 {
+        compiler_fence(Ordering::SeqCst);
     }
 }
 
-/// `VOID KeReleaseSpinLockFromDpcLevel(PKSPIN_LOCK)`.
+/// `VOID KeReleaseSpinLockFromDpcLevel(PKSPIN_LOCK)` -- barrier-only on the hosted UP ABI.
 extern "win64" fn s_ke_release_spin_lock_from_dpc_level(lock: u64) {
-    unsafe {
-        if lock != 0 {
-            write_unaligned(lock as *mut u64, 0);
-        }
+    if lock != 0 {
+        compiler_fence(Ordering::SeqCst);
     }
 }
 
@@ -13801,6 +14050,8 @@ static HOSTED_WORK_QUEUE_WALL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_WORK_QUEUE_WALL_TRACE_CAP: u64 = 8;
 static HOSTED_WORK_QUEUE_CAPACITY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_WORK_QUEUE_CAPACITY_TRACE_CAP: u64 = 8;
+static HOSTED_COMPONENT_PUMP_DEPTH: AtomicU64 = AtomicU64::new(0);
+static HOSTED_WORK_QUEUE_DRAIN_ACTIVE: AtomicU64 = AtomicU64::new(0);
 const HOSTED_PROVIDER_TRACE_CAP: u64 = 24;
 static mut HOSTED_PROVIDER_POINTER_ALLOCATIONS: Option<Vec<HostedProviderPointerAllocation>> =
     None;
@@ -21434,6 +21685,29 @@ unsafe fn trace_provider_io_port_range_export(
     print_str(b"\n");
 }
 
+struct HostedComponentPumpDepthGuard;
+
+impl HostedComponentPumpDepthGuard {
+    fn enter() -> Self {
+        HOSTED_COMPONENT_PUMP_DEPTH.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for HostedComponentPumpDepthGuard {
+    fn drop(&mut self) {
+        let previous = HOSTED_COMPONENT_PUMP_DEPTH.fetch_sub(1, Ordering::Release);
+        assert!(previous != 0, "hosted component pump depth underflow");
+    }
+}
+
+unsafe fn hosted_component_pump(
+    ch: &crate::spawn_hosts::PumpChannel,
+) -> crate::spawn_hosts::PumpResult {
+    let _depth = HostedComponentPumpDepthGuard::enter();
+    crate::spawn_hosts::component_pump(ch)
+}
+
 pub(crate) unsafe fn service_hosted_provider_export(
     dependent_channel: &crate::spawn_hosts::PumpChannel,
     provider_export_rva: u64,
@@ -21660,7 +21934,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let pr = crate::spawn_hosts::component_pump(&ch);
+    let pr = hosted_component_pump(&ch);
     if !pr.completed {
         let trace = HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
         if trace < HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_CAP {
@@ -21730,17 +22004,6 @@ pub(crate) unsafe fn service_hosted_provider_export(
         dependent_index,
         dependent_inst,
     );
-    if let Err(status) = drain_hosted_work_queue_for_instance(singleton.instance, provider_inst) {
-        trace_hosted_provider_export_rejection(
-            &singleton.provider,
-            provider_domain_cookie,
-            provider_export_rva,
-            status,
-            b"work-queue",
-        );
-        abort_provider_export_marshal_after_possible_dispatch(&marshal_state);
-        return hosted_provider_export_failure(status);
-    }
     complete_provider_export_marshal(
         policy,
         &marshal_state,
@@ -21901,7 +22164,7 @@ unsafe fn dispatch_hosted_component_target(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let pr = crate::spawn_hosts::component_pump(&ch);
+    let pr = hosted_component_pump(&ch);
     if !pr.completed {
         register_instance_ready(instance_index, false);
         return Err(HostedComponentDispatchError::Wall(pr));
@@ -22106,6 +22369,70 @@ unsafe fn drain_hosted_work_queue_for_instance(
     }
     write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, saved_irql);
     Ok(drained)
+}
+
+struct HostedWorkQueueDrainGuard;
+
+impl HostedWorkQueueDrainGuard {
+    fn enter() -> Option<Self> {
+        HOSTED_WORK_QUEUE_DRAIN_ACTIVE
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for HostedWorkQueueDrainGuard {
+    fn drop(&mut self) {
+        HOSTED_WORK_QUEUE_DRAIN_ACTIVE.store(0, Ordering::Release);
+    }
+}
+
+/// Run queued PASSIVE_LEVEL work only after the outermost hosted component call has returned.
+///
+/// Provider callbacks can cross several isolated driver domains while the original provider still
+/// owns DISPATCH_LEVEL state such as an NDIS miniport lock. Scanning every live instance here keeps
+/// work ownership dynamic (no NIC/driver bitset or identity list) and prevents a nested callback
+/// from running a passive worker before that outer state is released.
+unsafe fn drain_hosted_work_queues_at_passive_level() -> Result<u64, i32> {
+    if HOSTED_COMPONENT_PUMP_DEPTH.load(Ordering::Acquire) != 0 {
+        return Ok(0);
+    }
+    let Some(_drain) = HostedWorkQueueDrainGuard::enter() else {
+        return Ok(0);
+    };
+    let instance_count = driver_instances().map(Vec::len).unwrap_or(0);
+    if instance_count == 0 {
+        return Ok(0);
+    }
+    let sweep_budget = instance_count.saturating_mul(4).max(1);
+    let mut total = 0u64;
+    let mut sweeps = 0usize;
+    while sweeps < sweep_budget {
+        let mut sweep_drained = 0u64;
+        for instance_index in 0..instance_count {
+            let Some(inst) = instance(instance_index) else {
+                continue;
+            };
+            if !inst.ready || inst.exec_shared_va == 0 {
+                continue;
+            }
+            let head = read_volatile((inst.exec_shared_va + SH_WORK_QUEUE_HEAD) as *const u64);
+            let tail = read_volatile((inst.exec_shared_va + SH_WORK_QUEUE_TAIL) as *const u64);
+            let drops = read_volatile((inst.exec_shared_va + SH_WORK_QUEUE_DROPS) as *const u64);
+            if head == tail && drops == 0 {
+                continue;
+            }
+            let drained = drain_hosted_work_queue_for_instance(instance_index, inst)?;
+            sweep_drained = sweep_drained.saturating_add(drained);
+            total = total.saturating_add(drained);
+        }
+        if sweep_drained == 0 {
+            return Ok(total);
+        }
+        sweeps += 1;
+    }
+    Err(STATUS_INSUFFICIENT_RESOURCES)
 }
 
 unsafe fn provider_callback_marshal_window(
@@ -23490,7 +23817,7 @@ pub(crate) unsafe fn service_hosted_provider_callback(
         callback_irql,
     );
 
-    let mut result = {
+    let result = {
         let preflight = if record.callback_kind == HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT
             && record.callback_offset != NDIS_MINIPORT_INITIALIZE_CALLBACK_OFFSET_X64
         {
@@ -23780,17 +24107,6 @@ pub(crate) unsafe fn service_hosted_provider_callback(
         (dependent_shared + SH_HOSTED_CURRENT_IRQL) as *mut u8,
         saved_dependent_irql,
     );
-    if result.is_ok() {
-        if let Some(dependent_inst) = instance(record.dependent_instance) {
-            if let Err(status) =
-                drain_hosted_work_queue_for_instance(record.dependent_instance, dependent_inst)
-            {
-                result = Err(status);
-            }
-        } else {
-            result = Err(STATUS_DEVICE_NOT_READY);
-        }
-    }
     if result.is_ok()
         && record.callback_kind == HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL
         && record.callback_offset == NDIS_PROTOCOL_BIND_ADAPTER_CALLBACK_OFFSET_X64
@@ -25569,13 +25885,27 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
         );
         return (0, (claimed != 0) as u64);
     }
-    if major == FSD_DISPATCH_CANCEL_PENDING_FILE {
-        let file_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
-        let requestor_tid =
-            read_volatile((FSD_SHARED_VADDR + SH_REQ_REQUESTOR_TID) as *const u32) as u64;
-        let devobj = read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64);
-        let cancelled = cancel_pending_irps_for_file(file_id, requestor_tid, devobj);
-        return (0, cancelled);
+    if major == FSD_DISPATCH_CANCEL_IRP {
+        let canonical_irp_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_IRP_ID) as *const u64);
+        return if cancel_pending_irp(canonical_irp_id) {
+            (0, 1)
+        } else {
+            (0xC000_000Du32 as i32, 0) // STATUS_INVALID_PARAMETER
+        };
+    }
+    if major == FSD_DISPATCH_COPY_COMPLETION {
+        let canonical_irp_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_IRP_ID) as *const u64);
+        let offset = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
+        let capacity = read_volatile((FSD_SHARED_VADDR + SH_REQ_OUTLEN) as *const u64);
+        return copy_pending_irp_completion(canonical_irp_id, offset, capacity);
+    }
+    if major == FSD_DISPATCH_ACK_COMPLETION {
+        let canonical_irp_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_IRP_ID) as *const u64);
+        return if acknowledge_pending_irp_completion(canonical_irp_id) {
+            (0, 0)
+        } else {
+            (0xC000_000Du32 as i32, 0) // STATUS_INVALID_PARAMETER
+        };
     }
     if major == FSD_DISPATCH_ADD_DEVICE {
         let add_device = read_volatile((FSD_SHARED_VADDR + SH_ADD_DEVICE) as *const u64);
@@ -25928,6 +26258,8 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     let canonical_irp_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_IRP_ID) as *const u64);
     let canonical_file_id =
         read_volatile((FSD_SHARED_VADDR + SH_REQ_CANONICAL_FILE_ID) as *const u64);
+    let owner_instance =
+        read_volatile((FSD_SHARED_VADDR + SH_REQ_OWNER_INSTANCE) as *const u64);
 
     let file_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
     let requestor_tid =
@@ -26111,18 +26443,43 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         iosl
     };
     let mut pnp_resource_list = 0u64;
+    let mut create_security_context = 0u64;
+    let mut create_access_state = 0u64;
+    let mut create_parameters = 0u64;
     let stack_parameters = match major {
         0 | 1 => {
             // IRP_MJ_CREATE (client open) / IRP_MJ_CREATE_NAMED_PIPE (server create). The FSD derefs
             // SecurityContext->{AccessState,DesiredAccess}, Options (disposition<<24), ShareAccess, and
             // (create-named-pipe only) the NAMED_PIPE_CREATE_PARAMETERS. Build valid blocks from the pool.
-            let sec_ctx = pool_alloc(0x20); // IO_SECURITY_CONTEXT {SecurityQos,AccessState,DesiredAccess,FullCreateOptions}
-            let access_state = pool_alloc(0x80); // ACCESS_STATE — FSD reads AccessState->{SecurityDescriptor,SubjectSecurityContext}
-            zero(sec_ctx, 0x20);
-            zero(access_state, 0x80);
-            write_unaligned((sec_ctx + 0x08) as *mut u64, access_state); // AccessState
-            write_unaligned((sec_ctx + 0x10) as *mut u32, 0x001F_01FF); // DesiredAccess = all
-            write_unaligned((iosl + 0x08) as *mut u64, sec_ctx); // SecurityContext
+            create_security_context = pool_alloc(0x20); // IO_SECURITY_CONTEXT
+            if create_security_context == 0 {
+                pool_free(iosl);
+                pool_free_request_buffers(data, aux_data, mdl);
+                if owns_fo {
+                    pool_free(fo);
+                }
+                return (0xC000_009Au32 as i32, 0);
+            }
+            create_access_state = pool_alloc(0x80); // ACCESS_STATE
+            if create_access_state == 0 {
+                pool_free_irp_auxiliary_graph(0, create_security_context, 0, 0);
+                pool_free(iosl);
+                pool_free_request_buffers(data, aux_data, mdl);
+                if owns_fo {
+                    pool_free(fo);
+                }
+                return (0xC000_009Au32 as i32, 0);
+            }
+            zero(create_security_context, 0x20);
+            zero(create_access_state, 0x80);
+            write_unaligned(
+                (create_security_context + 0x08) as *mut u64,
+                create_access_state,
+            );
+            write_unaligned(
+                (create_security_context + 0x10) as *mut u32,
+                0x001F_01FF,
+            );
                                                                  // Options: Disposition in the high byte, CreateOptions in the low 24.
                                                                  // BATCH 37: CREATE_NAMED_PIPE must use FILE_OPEN_IF (3), NOT FILE_CREATE (2) — this is
                                                                  // exactly what Win32 CreateNamedPipe / NtCreateNamedPipeFile pass (kernel32 npipe.c:393).
@@ -26139,22 +26496,39 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 // NAMED_PIPE_CREATE_PARAMETERS (0x28 bytes): NamedPipeType@0, ReadMode@4, CompletionMode@8,
                 // MaximumInstances@0xc, InboundQuota@0x10, OutboundQuota@0x14, DefaultTimeout@0x18 (LI, must
                 // be < 0 = relative), TimeoutSpecified@0x20 (BOOLEAN, must be TRUE + MaximumInstances != 0).
-                let params = pool_alloc(0x28);
-                zero(params, 0x28);
-                write_unaligned((params + 0x00) as *mut u32, 1); // NamedPipeType = FILE_PIPE_MESSAGE_TYPE
-                write_unaligned((params + 0x04) as *mut u32, 1); // ReadMode = message
-                write_unaligned((params + 0x08) as *mut u32, 0); // CompletionMode = queue
-                write_unaligned((params + 0x0c) as *mut u32, 0xFF); // MaximumInstances = unlimited-ish
-                write_unaligned((params + 0x10) as *mut u32, 0x1000); // InboundQuota
-                write_unaligned((params + 0x14) as *mut u32, 0x1000); // OutboundQuota
-                write_unaligned((params + 0x18) as *mut i64, -50_000_000i64); // DefaultTimeout = -5s (relative)
-                write_unaligned((params + 0x20) as *mut u8, 1); // TimeoutSpecified = TRUE
-                Some(params)
+                create_parameters = pool_alloc(0x28);
+                if create_parameters == 0 {
+                    pool_free_irp_auxiliary_graph(
+                        0,
+                        create_security_context,
+                        create_access_state,
+                        0,
+                    );
+                    pool_free(iosl);
+                    pool_free_request_buffers(data, aux_data, mdl);
+                    if owns_fo {
+                        pool_free(fo);
+                    }
+                    return (0xC000_009Au32 as i32, 0);
+                }
+                zero(create_parameters, 0x28);
+                write_unaligned((create_parameters + 0x00) as *mut u32, 1); // NamedPipeType
+                write_unaligned((create_parameters + 0x04) as *mut u32, 1); // ReadMode
+                write_unaligned((create_parameters + 0x08) as *mut u32, 0); // CompletionMode
+                write_unaligned((create_parameters + 0x0c) as *mut u32, 0xFF); // MaximumInstances
+                write_unaligned((create_parameters + 0x10) as *mut u32, 0x1000); // InboundQuota
+                write_unaligned((create_parameters + 0x14) as *mut u32, 0x1000); // OutboundQuota
+                write_unaligned(
+                    (create_parameters + 0x18) as *mut i64,
+                    -50_000_000i64,
+                ); // DefaultTimeout = -5s (relative)
+                write_unaligned((create_parameters + 0x20) as *mut u8, 1); // TimeoutSpecified
+                Some(create_parameters)
             } else {
                 None
             };
             WdmIoStackParameters::Create {
-                security_context: sec_ctx,
+                security_context: create_security_context,
                 options: disposition << 24,
                 share_access: 3,
                 named_pipe_parameters,
@@ -26226,6 +26600,12 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         if pnp_resource_list != 0 {
             pool_free(pnp_resource_list);
         }
+        pool_free_irp_auxiliary_graph(
+            0,
+            create_security_context,
+            create_access_state,
+            create_parameters,
+        );
         pool_free(iosl);
         pool_free_request_buffers(data, aux_data, mdl);
         if owns_fo {
@@ -26241,6 +26621,12 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         if pnp_resource_list != 0 {
             pool_free(pnp_resource_list);
         }
+        pool_free_irp_auxiliary_graph(
+            0,
+            create_security_context,
+            create_access_state,
+            create_parameters,
+        );
         pool_free(iosl);
         pool_free_request_buffers(data, aux_data, mdl);
         if owns_fo {
@@ -26268,6 +26654,12 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         if pnp_resource_list != 0 {
             pool_free(pnp_resource_list);
         }
+        pool_free_irp_auxiliary_graph(
+            0,
+            create_security_context,
+            create_access_state,
+            create_parameters,
+        );
         pool_free(iosl);
         pool_free_request_buffers(data, aux_data, mdl);
         if owns_fo {
@@ -26275,6 +26667,42 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         }
         return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
     }
+    let read_completion = pending_irp_returns_read_bytes(major, fsctl, outlen);
+    let completion_source_kind = if !(major == IRP_MJ_FILE_SYSTEM_CONTROL
+        && fsctl == FSCTL_PIPE_TRANSCEIVE)
+        && output_is_separate
+    {
+        COMPLETION_SOURCE_REQUEST_DATA
+    } else {
+        COMPLETION_SOURCE_SYSTEM_BUFFER
+    };
+    let initial_owner = PendingIrp {
+        irp,
+        iosl,
+        file_object: fo,
+        data,
+        aux_data,
+        mdl,
+        output_capacity: outlen,
+        pnp_resource_list,
+        create_security_context,
+        create_access_state,
+        create_parameters,
+        canonical_file_id,
+        owner_instance,
+        fid: file_id,
+        requestor_tid,
+        major: major as u8,
+        completion_source_kind,
+        read_completion,
+        owns_fo,
+        _pad: [0; 4],
+        completion: nt_io_manager::RetainedIrpCompletion::pending(),
+    };
+    let Some(owner_node) = insert_pending_irp(canonical_irp_id, initial_owner) else {
+        release_pending_irp_graph_component(initial_owner);
+        return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
+    };
     write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_IRP) as *mut u64, irp);
     write_volatile(
         (FSD_SHARED_VADDR + SH_ACTIVE_IOSL) as *mut u64,
@@ -26332,17 +26760,24 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         // The driver's state is undefined past its own bugcheck. Leak this request graph (the driver
         // may still hold pointers into it) rather than recycle memory it might write to, report the
         // failure to the caller, and let the dispatch loop keep serving — fail-closed, never a hang.
+        let state = pending_irp_owner_state(owner_node).load(Ordering::Acquire);
+        if matches!(
+            hosted_irp_state_kind(state),
+            HOSTED_IRP_DISPATCHING | HOSTED_IRP_COMPLETED_DISPATCH
+        ) {
+            let abandoned = hosted_irp_state_with_kind(state, HOSTED_IRP_ABANDONED);
+            if pending_irp_owner_state(owner_node)
+                .compare_exchange(state, abandoned, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                tombstone_pending_irp_owner(owner_node, abandoned);
+            }
+        }
         write_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *mut u64, file_id);
         return (0xC000_0001u32 as i32, 0); // STATUS_UNSUCCESSFUL
     }
 
-    let irp_status = read_unaligned((irp + 0x30) as *const i32);
-    let info = read_unaligned((irp + 0x38) as *const u64);
-    let st = if irp_status != 0 || info != 0 {
-        irp_status
-    } else {
-        ret
-    };
+    let irp_information = read_unaligned((irp + 0x38) as *const u64);
     // FsContext lands in the FILE_OBJECT; report it as the opaque file id for future file I/O.
     // PnP lifecycle IRPs carry no FILE_OBJECT, so keep SH_REQ_FILEID as the lower PDO token.
     let fsctx = if uses_file_object {
@@ -26357,24 +26792,79 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     if uses_file_object && crate::FSD_FILE_OBJECT_PER_OPEN && owns_fo && fsctx != 0 && fsctx != 1 {
         fo_registered = fo_register(fsctx, fo);
     }
-    // CLOSE is where the FILE_OBJECT memory legitimately dies. CLEANUP may clear its FsContext, but
-    // the same FILE_OBJECT must remain available for the following CLOSE IRP.
-    if uses_file_object && major == IRP_MJ_CLOSE {
-        fo_release(file_id);
-        fo_registered = false;
-    }
     let irp_owns_fo = owns_fo && !fo_registered;
-    let read_completion = pending_irp_returns_read_bytes(major, fsctl, outlen);
-    let completion_source_kind = if read_completion
-        && !(major == IRP_MJ_FILE_SYSTEM_CONTROL && fsctl == FSCTL_PIPE_TRANSCEIVE)
-        && matches!(
-            control_method,
-            Some(ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT | ioctl::METHOD_NEITHER)
-        )
-    {
-        COMPLETION_SOURCE_REQUEST_DATA
-    } else {
-        COMPLETION_SOURCE_SYSTEM_BUFFER
+    write_volatile(
+        (pending_irp_entry_address(owner_node)
+            + core::mem::offset_of!(PendingIrp, fid) as u64) as *mut u64,
+        if file_id != 0 { file_id } else { fsctx },
+    );
+    write_volatile(
+        (pending_irp_entry_address(owner_node)
+            + core::mem::offset_of!(PendingIrp, owns_fo) as u64) as *mut bool,
+        irp_owns_fo,
+    );
+
+    let (st, info, retained_completion, consuming_state) = loop {
+        let state = pending_irp_owner_state(owner_node).load(Ordering::Acquire);
+        match hosted_irp_state_kind(state) {
+            HOSTED_IRP_DISPATCHING => {
+                let next_kind = if ret as u32 == STATUS_PENDING {
+                    HOSTED_IRP_PENDING
+                } else {
+                    HOSTED_IRP_CONSUMING
+                };
+                let next = hosted_irp_state_with_kind(state, next_kind);
+                if pending_irp_owner_state(owner_node)
+                    .compare_exchange(state, next, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+                if next_kind == HOSTED_IRP_PENDING {
+                    // This release transfers the raw graph to the asynchronous owner. Do not read
+                    // any request pointer after it: completion and ACK may now reclaim the graph.
+                    return (STATUS_PENDING as i32, 0);
+                }
+                break (ret, irp_information, None, Some(next));
+            }
+            HOSTED_IRP_COMPLETED_DISPATCH => {
+                let consuming = hosted_irp_state_with_kind(state, HOSTED_IRP_CONSUMING);
+                if pending_irp_owner_state(owner_node)
+                    .compare_exchange(state, consuming, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+                let completion = read_volatile(
+                    (pending_irp_entry_address(owner_node)
+                        + core::mem::offset_of!(PendingIrp, completion) as u64)
+                        as *const nt_io_manager::RetainedIrpCompletion,
+                )
+                .completed()
+                .expect("completed hosted IRP owner has no terminal payload");
+                break (
+                    completion.status as i32,
+                    completion.information,
+                    Some(completion),
+                    Some(consuming),
+                );
+            }
+            HOSTED_IRP_COMPLETING_DISPATCH => {
+                // Completion is still capturing on another hosted worker. Transfer ownership at
+                // this final return edge; the completer will publish READY and this actor will not
+                // touch the graph again.
+                let deferred =
+                    hosted_irp_state_with_kind(state, HOSTED_IRP_COMPLETING_DEFERRED);
+                if pending_irp_owner_state(owner_node)
+                    .compare_exchange(state, deferred, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+                return (STATUS_PENDING as i32, 0);
+            }
+            other => panic!("invalid hosted IRP post-dispatch owner state {other}"),
+        }
     };
     if (major == IRP_MJ_READ || major == IRP_MJ_WRITE) && DATA_TRACE_COUNT < 12 {
         DATA_TRACE_COUNT += 1;
@@ -26416,59 +26906,26 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             inlen,
         );
     }
-    if st as u32 == STATUS_PENDING {
-        let inserted = insert_pending_irp(PendingIrp {
-            irp,
-            iosl,
-            file_object: fo,
-            data,
-            aux_data,
-            mdl,
-            canonical_irp_id,
-            canonical_file_id,
-            // Capture the caller's open identity NOW: npfs may normalize or later NULL
-            // `FILE_OBJECT->FsContext`, but executive waiters are parked on the exact endpoint fid
-            // carried in this request.
-            fid: if file_id != 0 { file_id } else { fsctx },
-            requestor_tid,
-            major: major as u8,
-            completion_source_kind,
-            read_completion,
-            owns_fo: irp_owns_fo,
-            _pad: [0; 4],
-            completion: nt_io_manager::RetainedIrpCompletion::pending(),
-        });
-        if !inserted {
-            pool_free_request_buffers(data, aux_data, mdl);
-            if pnp_resource_list != 0 {
-                pool_free(pnp_resource_list);
-            }
-            pool_free(iosl);
-            pool_free(irp);
-            if irp_owns_fo {
-                pool_free(fo);
-            }
-            return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
-        }
-    } else {
+    if let Some(consuming_state) = consuming_state {
         if read_completion {
             let copy_len = info.min(outlen);
+            let source = retained_completion
+                .map(|completion| completion.source)
+                .filter(|source| *source != 0)
+                .unwrap_or(data);
             let mut index = 0u64;
             while index < copy_len {
-                let byte = read_volatile((data + index) as *const u8);
+                let byte = read_volatile((source + index) as *const u8);
                 write_volatile((FSD_ARG_VADDR + index) as *mut u8, byte);
                 index += 1;
             }
         }
-        pool_free_request_buffers(data, aux_data, mdl);
-        if pnp_resource_list != 0 {
-            pool_free(pnp_resource_list);
+        let completed = read_volatile(pending_irp_entry_address(owner_node) as *const PendingIrp);
+        release_pending_irp_graph_component(completed);
+        if uses_file_object && major == IRP_MJ_CLOSE && !irp_owns_fo {
+            fo_release(file_id);
         }
-        pool_free(iosl);
-        pool_free(irp);
-        if irp_owns_fo {
-            pool_free(fo);
-        }
+        tombstone_pending_irp_owner(owner_node, consuming_state);
     }
     (st, info)
 }
@@ -28069,7 +28526,7 @@ unsafe fn load_driver_reserved(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let pr = crate::spawn_hosts::component_pump(&ch);
+    let pr = hosted_component_pump(&ch);
     let faults = pr.faults;
     let demand = pr.demand;
     let finished = pr.completed;
@@ -28675,6 +29132,94 @@ fn io_manager_mut() -> &'static mut ExecutiveIoManager {
     }
 }
 
+fn copy_completed_external_irp_by_id(
+    irp_id: IrpId,
+    with_output: bool,
+) -> Option<(nt_io_manager::CompletedIrp, Vec<u8>)> {
+    let io = io_manager_mut();
+    io.pump();
+    let completion = io.completed_irp(irp_id)?;
+    let length = if with_output {
+        usize::try_from(completion.information)
+            .ok()?
+            .min(COMPLETED_READ_BYTE_CAP)
+    } else {
+        0
+    };
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(length).ok()?;
+    bytes.resize(length, 0);
+    if length != 0
+        && io
+            .copy_completed_irp_output(irp_id, 0, &mut bytes)
+            .ok()?
+            != length
+    {
+        return None;
+    }
+    Some((completion, bytes))
+}
+
+pub(crate) unsafe fn copy_completed_irp(
+    irp_id: u64,
+    with_output: bool,
+) -> Option<(u32, u64, Vec<u8>)> {
+    let (completion, bytes) =
+        copy_completed_external_irp_by_id(IrpId(irp_id), with_output)?;
+    Some((
+        completion.status.raw() as u32,
+        completion.information,
+        bytes,
+    ))
+}
+
+pub(crate) unsafe fn completed_irp_copy_requires_retry(irp_id: u64) -> bool {
+    if irp_id == 0 {
+        return false;
+    }
+    let io = io_manager_mut();
+    io.pump();
+    io.irp(IrpId(irp_id))
+        .is_some_and(|irp| irp.state == nt_io_manager::IrpState::Completed)
+}
+
+pub(crate) unsafe fn acknowledge_completed_irp(irp_id: u64) -> Result<(), u32> {
+    if irp_id == 0 {
+        return Err(STATUS_INVALID_PARAMETER as u32);
+    }
+    let io = io_manager_mut();
+    io.pump();
+    io.acknowledge_completed_irp(IrpId(irp_id))
+        .map(|_| ())
+        .map_err(|status| status.raw() as u32)
+}
+
+pub(crate) unsafe fn request_cancel_irp(irp_id: u64) -> Result<(), u32> {
+    if irp_id == 0 {
+        return Err(STATUS_INVALID_PARAMETER as u32);
+    }
+    let io = io_manager_mut();
+    io.cancel(ClientId(IO_MANAGER_COMPONENT_ID), IrpId(irp_id))
+        .map_err(|status| status.raw() as u32)?;
+    io.pump();
+    Ok(())
+}
+
+pub(crate) fn pump_hosted_io_completions() -> usize {
+    io_manager_mut().pump()
+}
+
+pub(crate) unsafe fn abandon_pending_irp(irp_id: u64) -> Result<(), u32> {
+    if irp_id == 0 {
+        return Err(STATUS_INVALID_PARAMETER as u32);
+    }
+    let io = io_manager_mut();
+    io.abandon_irp_delivery(ClientId(IO_MANAGER_COMPONENT_ID), IrpId(irp_id))
+        .map_err(|status| status.raw() as u32)?;
+    io.pump();
+    Ok(())
+}
+
 #[inline(never)]
 fn parse_nt_path(path: &str) -> Option<NtPath> {
     NtPath::parse_str(path).ok()
@@ -28764,7 +29309,7 @@ impl DriverDispatchBackend for HostedDriverBackend {
                         &input,
                         &mut ctx.system_buffer[..output_len],
                     ) {
-                        Ok(Some(result)) => Some(result),
+                        Ok(Some((status, information))) => Some((status, information, false)),
                         Ok(None) => dispatch_irp_for_instance(
                             self.instance,
                             irp.major as u64,
@@ -28777,8 +29322,9 @@ impl DriverDispatchBackend for HostedDriverBackend {
                             irp.requestor_tid,
                             &input,
                             &mut ctx.system_buffer[..output_len],
-                        ),
-                        Err(status) => Some((status.raw(), 0)),
+                        )
+                        .map(|(status, information)| (status, information, true)),
+                        Err(status) => Some((status.raw(), 0, false)),
                     }
                 } else {
                     None
@@ -28797,10 +29343,14 @@ impl DriverDispatchBackend for HostedDriverBackend {
                     &input,
                     &mut ctx.system_buffer[..output_len],
                 )
+                .map(|(status, information)| (status, information, true))
             }
         };
         match result {
-            Some((status, information)) => Ok(DispatchOutcome::Completed {
+            Some((status, _, true)) if status as u32 == STATUS_PENDING => {
+                Ok(DispatchOutcome::Pending)
+            }
+            Some((status, information, _)) => Ok(DispatchOutcome::Completed {
                 status: nt_status::NtStatus(status),
                 information,
             }),
@@ -28810,8 +29360,95 @@ impl DriverDispatchBackend for HostedDriverBackend {
         }
     }
 
-    fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
-        Err(nt_status::NtStatus::NOT_SUPPORTED)
+    fn cancel_irp(&mut self, irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
+        let storage_instance = hosted_completion_storage_instance(self.instance);
+        let mut output = [];
+        let (status, _) = unsafe {
+            dispatch_irp_for_instance(
+                storage_instance,
+                FSD_DISPATCH_CANCEL_IRP,
+                0,
+                0,
+                irp_id.raw(),
+                0,
+                0,
+                0,
+                0,
+                &[],
+                &mut output,
+            )
+        }
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(nt_status::NtStatus(status))
+        }
+    }
+
+    fn poll_completion(&mut self) -> Option<nt_io_manager::DriverCompletion> {
+        unsafe { poll_hosted_completion(self.instance) }
+    }
+
+    fn copy_completion_output(
+        &mut self,
+        irp_id: IrpId,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<usize, nt_status::NtStatus> {
+        let storage_instance = hosted_completion_storage_instance(self.instance);
+        let (status, information) = unsafe {
+            dispatch_irp_for_instance(
+                storage_instance,
+                FSD_DISPATCH_COPY_COMPLETION,
+                0,
+                0,
+                irp_id.raw(),
+                0,
+                offset,
+                0,
+                0,
+                &[],
+                output,
+            )
+        }
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+        if status != 0 {
+            return Err(nt_status::NtStatus(status));
+        }
+        usize::try_from(information).map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)
+    }
+
+    fn acknowledge_completion(&mut self, irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
+        let storage_instance = hosted_completion_storage_instance(self.instance);
+        let mut output = [];
+        let (status, _) = unsafe {
+            dispatch_irp_for_instance(
+                storage_instance,
+                FSD_DISPATCH_ACK_COMPLETION,
+                0,
+                0,
+                irp_id.raw(),
+                0,
+                0,
+                0,
+                0,
+                &[],
+                &mut output,
+            )
+        }
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(nt_status::NtStatus(status))
+        }
+    }
+
+    fn is_faulted(&self) -> bool {
+        instance(hosted_completion_storage_instance(self.instance))
+            .map(|instance| !instance.ready)
+            .unwrap_or(true)
     }
 }
 
@@ -29001,6 +29638,27 @@ fn dispatch_external_irp_to_device_record_result(
     in_data: &[u8],
     out: &mut [u8],
 ) -> Result<(i32, u64), u32> {
+    dispatch_external_irp_to_device_record_result_exact(
+        device_id,
+        major,
+        fsctl,
+        file_id,
+        requestor_tid,
+        in_data,
+        out,
+    )
+    .map(|(status, information, _)| (status, information))
+}
+
+fn dispatch_external_irp_to_device_record_result_exact(
+    device_id: u64,
+    major: u64,
+    fsctl: u64,
+    file_id: u64,
+    requestor_tid: u64,
+    in_data: &[u8],
+    out: &mut [u8],
+) -> Result<(i32, u64, Option<IrpId>), u32> {
     let major = external_major(major).ok_or(STATUS_INVALID_PARAMETER as u32)?;
     let (input_len, output_len, system_buffer_len) =
         external_dispatch_buffer_lengths(in_data.len(), out.len())?;
@@ -29032,9 +29690,11 @@ fn dispatch_external_irp_to_device_record_result(
                 .min(out.len())
                 .min(system_buffer.len());
             out[..copy_len].copy_from_slice(&system_buffer[..copy_len]);
-            Ok((status.raw(), information))
+            Ok((status.raw(), information, None))
         }
-        ExternalDispatchResult::Pending { .. } => Ok((STATUS_PENDING as i32, 0)),
+        ExternalDispatchResult::Pending { irp_id } => {
+            Ok((STATUS_PENDING as i32, 0, Some(irp_id)))
+        }
     }
 }
 
@@ -34044,7 +34704,7 @@ unsafe fn dispatch_driver_unload_for_instance(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let pr = crate::spawn_hosts::component_pump(&ch);
+    let pr = hosted_component_pump(&ch);
     if !pr.completed {
         register_instance_ready(index, false);
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
@@ -34134,7 +34794,7 @@ unsafe fn dispatch_video_add_device_for_instance(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let pr = crate::spawn_hosts::component_pump(&ch);
+    let pr = hosted_component_pump(&ch);
     if !pr.completed {
         register_instance_ready(index, false);
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
@@ -34203,7 +34863,7 @@ unsafe fn dispatch_provider_add_device_for_instance(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let pr = crate::spawn_hosts::component_pump(&ch);
+    let pr = hosted_component_pump(&ch);
     if !pr.completed {
         register_instance_ready(route.provider_instance, false);
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
@@ -34278,7 +34938,7 @@ unsafe fn dispatch_add_device_for_instance(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let pr = crate::spawn_hosts::component_pump(&ch);
+    let pr = hosted_component_pump(&ch);
     if !pr.completed {
         register_instance_ready(index, false);
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
@@ -35127,7 +35787,7 @@ unsafe fn dispatch_video_find_adapter_for_instance(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let pr = crate::spawn_hosts::component_pump(&ch);
+    let pr = hosted_component_pump(&ch);
     if !pr.completed {
         register_instance_ready(index, false);
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
@@ -35280,7 +35940,7 @@ unsafe fn dispatch_video_initialize_for_instance(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let pr = crate::spawn_hosts::component_pump(&ch);
+    let pr = hosted_component_pump(&ch);
     if !pr.completed {
         register_instance_ready(index, false);
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
@@ -35358,7 +36018,7 @@ unsafe fn dispatch_video_start_io_for_instance(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let pr = crate::spawn_hosts::component_pump(&ch);
+    let pr = hosted_component_pump(&ch);
     if !pr.completed {
         register_instance_ready(index, false);
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
@@ -35989,7 +36649,7 @@ unsafe fn dispatch_irp_for_instance(
     );
     write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
     write_volatile((sh + SH_REQ_REQUESTOR_TID) as *mut u32, requestor_tid as u32);
-    write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_OWNER_INSTANCE) as *mut u64, inst as u64);
     write_volatile((sh + SH_ACTIVE_IRP) as *mut u64, 0);
     write_volatile((sh + SH_ACTIVE_IOSL) as *mut u64, 0);
     write_volatile((sh + SH_ACTIVE_DATA) as *mut u64, 0);
@@ -36060,7 +36720,7 @@ unsafe fn dispatch_irp_for_instance(
         print_u64(out.len() as u64);
         print_str(b"\n");
     }
-    let pr = crate::spawn_hosts::component_pump(&ch);
+    let pr = hosted_component_pump(&ch);
     FSD_ACTIVE_DISPATCH_SEQ.store(0, Ordering::Relaxed);
     if trace_dispatch {
         print_str(b"[fsd-svc] EXIT inst=");
@@ -36111,11 +36771,13 @@ unsafe fn dispatch_irp_for_instance(
     for i in 0..outlen {
         out[i] = read_volatile((arg + i as u64) as *const u8);
     }
-    if let Err(status) = drain_hosted_work_queue_for_instance(dispatch_index, d) {
-        if dispatch_index != inst {
-            register_instance_ready(inst, false);
-        }
-        return Some((status, 0));
+    if let Err(status) = drain_hosted_work_queues_at_passive_level() {
+        // The drain retires the instance that owns the failed worker. Its failure is independent
+        // of this IRP's already-committed result: rewriting STATUS_PENDING here would orphan the
+        // canonical PendingIrp while the hosted driver still owns its raw IRP.
+        print_str(b"[hosted-work] deferred drain failed status=0x");
+        print_hex(status as u32);
+        print_str(b"; preserving dispatched IRP result\n");
     }
     if let Some(binding) = provider_binding {
         import_provider_device_dispatch_state(binding, dependent_inst.exec_shared_va, sh);
@@ -36176,41 +36838,25 @@ pub(crate) unsafe fn dispatch_irp_to_device_result(
     )
 }
 
-pub(crate) unsafe fn cancel_pending_file_irps(
+pub(crate) unsafe fn dispatch_irp_to_device_result_exact(
     device_id: u64,
+    major: u64,
+    fsctl: u64,
     file_id: u64,
     requestor_tid: u64,
-) -> Result<u64, u32> {
-    let (instance, inst, device_object) = hosted_dispatch_instance_for_device_id(device_id)?;
-    if !inst.ready || inst.driver_id == 0 || device_object == 0 {
-        return Err(STATUS_DEVICE_NOT_READY as u32);
-    }
-    if io_manager_mut()
-        .device(nt_io_manager::DeviceId(device_id))
-        .is_none()
-    {
-        return Err(STATUS_DEVICE_NOT_READY as u32);
-    }
-    let mut out = [];
-    let (status, cancelled) = dispatch_irp_for_instance(
-        instance,
-        FSD_DISPATCH_CANCEL_PENDING_FILE,
-        0,
-        device_object,
-        0,
-        0,
-        0,
+    in_data: &[u8],
+    out: &mut [u8],
+) -> Result<(i32, u64, Option<IrpId>), u32> {
+    require_hosted_device_ready_for_dispatch(device_id)?;
+    dispatch_external_irp_to_device_record_result_exact(
+        device_id,
+        major,
+        fsctl,
         file_id,
         requestor_tid,
-        &[],
-        &mut out,
+        in_data,
+        out,
     )
-    .ok_or(STATUS_DEVICE_NOT_READY as u32)?;
-    if status == 0 {
-        Ok(cancelled)
-    } else {
-        Err(status as u32)
-    }
 }
 
 fn hosted_device_ready_for_dispatch(device_id: u64) -> bool {
@@ -36271,6 +36917,18 @@ unsafe fn dispatch_irp_to_named_device_result(
     dispatch_irp_to_device_result(device_id, major, fsctl, file_id, 0, in_data, out)
 }
 
+unsafe fn dispatch_irp_to_named_device_result_exact(
+    path: &str,
+    major: u64,
+    fsctl: u64,
+    file_id: u64,
+    in_data: &[u8],
+    out: &mut [u8],
+) -> Result<(i32, u64, Option<IrpId>), u32> {
+    let device_id = device_id_by_name(path).ok_or(STATUS_DEVICE_NOT_READY as u32)?;
+    dispatch_irp_to_device_result_exact(device_id, major, fsctl, file_id, 0, in_data, out)
+}
+
 /// Route one IRP to the driver-declared `\Device\NamedPipe` route. Kept as a semantic npfs wrapper
 /// for existing named-pipe call sites; it no longer assumes instance 0.
 pub(crate) unsafe fn npfs_dispatch_irp(
@@ -36291,4 +36949,29 @@ pub(crate) unsafe fn npfs_dispatch_irp_result(
     out: &mut [u8],
 ) -> Result<(i32, u64), u32> {
     dispatch_irp_to_named_device_result("\\Device\\NamedPipe", major, fsctl, file_id, in_data, out)
+}
+
+pub(crate) unsafe fn npfs_dispatch_irp_exact(
+    major: u64,
+    fsctl: u64,
+    file_id: u64,
+    in_data: &[u8],
+    out: &mut [u8],
+) -> Option<(i32, u64, u64)> {
+    dispatch_irp_to_named_device_result_exact(
+        "\\Device\\NamedPipe",
+        major,
+        fsctl,
+        file_id,
+        in_data,
+        out,
+    )
+    .ok()
+    .map(|(status, information, irp_id)| {
+        (
+            status,
+            information,
+            irp_id.map(|irp_id| irp_id.raw()).unwrap_or(0),
+        )
+    })
 }

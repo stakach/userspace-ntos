@@ -109,6 +109,19 @@ fn pipe_wait_timeout(request: &nt_io_manager::PipeWaitRequest) -> PendingWaitTim
     }
 }
 
+unsafe fn reserve_pipe_waiter(file_id: u64, is_write: bool) -> bool {
+    let waiters = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
+    if waiters.parked_on_dir(file_id, is_write) {
+        return false;
+    }
+    let old_capacity = waiters.capacity();
+    let reserved = waiters.ensure_capacity();
+    if reserved && waiters.capacity() != old_capacity {
+        crate::mark_durable_table_growth_dirty();
+    }
+    reserved
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct NpfsFileRoute {
     file_id: u64,
@@ -2677,6 +2690,7 @@ impl ExecNtHandler {
         write_field!(io_signal_event, -1);
         write_field!(pipe_park_device_id, 0);
         write_field!(pipe_park_fid, 0);
+        write_field!(pipe_park_irp_id, 0);
         write_field!(pipe_park_buffer_va, 0);
         write_field!(pipe_park_buffer_len, 0);
         write_field!(pipe_park_iosb_va, 0);
@@ -10404,7 +10418,18 @@ impl ExecNtHandler {
             .map_or_else(|status| status, |_| nt_io_completion::STATUS_SUCCESS)
     }
 
-    pub(crate) fn post_file_completion(
+    pub(crate) fn signal_file_completion(&mut self, file_id: u64, status: u32) -> u32 {
+        let file_signaled = match self.file_completion.complete_file(file_id, status) {
+            Ok(signaled) => signaled,
+            Err(status) => return status,
+        };
+        if file_signaled {
+            unsafe { wait_wake_dispatcher_set(self) };
+        }
+        nt_fs::STATUS_SUCCESS
+    }
+
+    pub(crate) fn post_file_completion_packet(
         &mut self,
         file_id: u64,
         apc_context: u64,
@@ -10412,23 +10437,19 @@ impl ExecNtHandler {
         information: u64,
         completed_inline: bool,
         operation_suppressed: bool,
-    ) {
-        if self
-            .file_completion
-            .complete_file(file_id, status)
-            .unwrap_or(false)
-        {
-            unsafe { wait_wake_dispatcher_set(self) };
-        }
-        if !self
+    ) -> u32 {
+        let should_queue = match self
             .file_completion
             .should_queue_completion_packet(file_id, status, completed_inline, operation_suppressed)
-            .unwrap_or(false)
         {
-            return;
+            Ok(should_queue) => should_queue,
+            Err(status) => return status,
+        };
+        if !should_queue {
+            return nt_fs::STATUS_SUCCESS;
         }
         if let Some(binding) = self.file_completion.binding(file_id) {
-            let _ = self.post_io_completion_packet(
+            return self.post_io_completion_packet(
                 binding.port_id,
                 nt_io_completion::CompletionPacket {
                     key_context: binding.key_context,
@@ -10438,6 +10459,30 @@ impl ExecNtHandler {
                 },
             );
         }
+        nt_fs::STATUS_SUCCESS
+    }
+
+    pub(crate) fn post_file_completion(
+        &mut self,
+        file_id: u64,
+        apc_context: u64,
+        status: u32,
+        information: u64,
+        completed_inline: bool,
+        operation_suppressed: bool,
+    ) -> u32 {
+        let signal_status = self.signal_file_completion(file_id, status);
+        if signal_status != nt_fs::STATUS_SUCCESS {
+            return signal_status;
+        }
+        self.post_file_completion_packet(
+            file_id,
+            apc_context,
+            status,
+            information,
+            completed_inline,
+            operation_suppressed,
+        )
     }
 
     pub(crate) fn queue_file_user_apc(
@@ -10491,6 +10536,15 @@ impl ExecNtHandler {
         }
     }
 
+    pub(crate) fn file_apc_target_gone(&self, tid: u64) -> bool {
+        let Ok(tid) = nt_process::ThreadId::try_from(tid) else {
+            return true;
+        };
+        self.pm
+            .thread(tid)
+            .is_none_or(|thread| thread.state == nt_process::ThreadState::Terminated)
+    }
+
     pub(crate) fn complete_terminal_file_io(
         &mut self,
         file_id: u64,
@@ -10514,7 +10568,7 @@ impl ExecNtHandler {
             let _ = self.write_current_iosb(iosb, status, information);
         }
         if file_id != 0 {
-            self.post_file_completion(
+            let _ = self.post_file_completion(
                 file_id,
                 apc_context,
                 status,
@@ -10744,7 +10798,7 @@ impl ExecNtHandler {
             &input,
             &mut output,
         ) {
-            Ok((driver_status, completed, _)) => {
+            Ok((driver_status, completed, _, _)) => {
                 information = completed;
                 driver_status as u32
             }
@@ -10779,138 +10833,24 @@ impl ExecNtHandler {
         status
     }
 
-    unsafe fn cancel_retained_file_irps(
-        &mut self,
-        device_id: u64,
-        file_id: u64,
-        requestor_tid: u64,
-    ) -> u64 {
-        let resolved_device_id = if device_id != 0 {
-            device_id
-        } else {
-            self.file_completion.device_id(file_id).unwrap_or(0)
-        };
-        if resolved_device_id == 0 || file_id == 0 {
-            return 0;
-        }
-        match driver_launch::cancel_pending_file_irps(
-            resolved_device_id,
-            file_id,
-            requestor_tid,
-        ) {
-            Ok(cancelled) => {
-                let trace = PIPE_RETAINED_CANCEL_TRACE_N.fetch_add(1, Ordering::Relaxed);
-                if trace < 64 || cancelled != 0 {
-                    print_str(b"[pipe-cancel-retained] #");
-                    print_u64(trace);
-                    print_str(b" dev=");
-                    print_u64(resolved_device_id);
-                    print_str(b" fid=0x");
-                    print_hex(file_id as u32);
-                    print_str(b" irps=");
-                    print_u64(cancelled);
-                    print_str(b"\n");
-                }
-                cancelled
+    unsafe fn abandon_pipe_irp(&mut self, irp_id: u64) {
+        let status = driver_launch::abandon_pending_irp(irp_id);
+        let trace = PIPE_RETAINED_CANCEL_TRACE_N.fetch_add(1, Ordering::Relaxed);
+        if trace < 64 || status.is_err() {
+            print_str(b"[pipe-abandon-irp] #");
+            print_u64(trace);
+            print_str(b" irp=0x");
+            print_hex_u64(irp_id);
+            if let Err(status) = status {
+                print_str(b" status=0x");
+                print_hex(status);
             }
-            Err(status) => {
-                let trace = PIPE_RETAINED_CANCEL_TRACE_N.fetch_add(1, Ordering::Relaxed);
-                if trace < 64 {
-                    print_str(b"[pipe-cancel-retained] #");
-                    print_u64(trace);
-                    print_str(b" dev=");
-                    print_u64(resolved_device_id);
-                    print_str(b" fid=0x");
-                    print_hex(file_id as u32);
-                    print_str(b" status=0x");
-                    print_hex(status);
-                    print_str(b"\n");
-                }
-                0
-            }
+            print_str(b"\n");
         }
-    }
-
-    unsafe fn complete_cancelled_pipe_waiter(&mut self, waiter: nt_io_manager::PipeWaiter) {
-        let _ = self.cancel_retained_file_irps(waiter.device_id, waiter.file_id, waiter.tid);
-        let mut status = STATUS_CANCELLED;
-        let mut information = 0u64;
-        let apc_status = self.queue_file_user_apc(
-            waiter.tid,
-            waiter.apc_routine,
-            waiter.apc_context,
-            waiter.iosb_va,
-        );
-        if apc_status != nt_fs::STATUS_SUCCESS {
-            status = apc_status;
-            information = 0;
-        }
-        if waiter.iosb_va != 0 {
-            let _ = self.write_current_iosb(waiter.iosb_va, status, information);
-        }
-        self.post_file_completion(
-            waiter.file_id,
-            waiter.apc_context,
-            status,
-            information,
-            false,
-            waiter.completion_port_suppressed,
-        );
-        if waiter.event_obj_idx != u64::MAX {
-            let _ = self.signal_event_index(waiter.event_obj_idx as usize);
-        }
-        if waiter.reply_cap != 0 {
-            set_reply_mr(15, waiter.resume_ip);
-            set_reply_mr(16, waiter.resume_sp);
-            set_reply_mr(17, waiter.resume_flags);
-            client_reply_on(waiter.reply_cap, 18, status as u64, 0, 0, 0);
-            release_reply_pool_cap(waiter.reply_cap);
-            thread_wait_state_clear_badge_ready(self, waiter.badge);
-        }
-        self.release_file_reference(waiter.file_id);
-    }
-
-    unsafe fn complete_cancelled_pipe_listen(&mut self, listen: nt_io_manager::AsyncListen) {
-        let _ = self.cancel_retained_file_irps(
-            listen.device_id,
-            listen.server_file_id,
-            listen.tid,
-        );
-        let mut status = STATUS_CANCELLED;
-        let mut information = 0u64;
-        let apc_status = self.queue_file_user_apc(
-            listen.tid,
-            listen.apc_routine,
-            listen.apc_context,
-            listen.iosb_va,
-        );
-        if apc_status != nt_fs::STATUS_SUCCESS {
-            status = apc_status;
-            information = 0;
-        }
-        if listen.iosb_va != 0 {
-            let _ = self.write_current_iosb(listen.iosb_va, status, information);
-        }
-        self.post_file_completion(
-            listen.server_file_id,
-            listen.apc_context,
-            status,
-            information,
-            false,
-            listen.completion_port_suppressed,
-        );
-        if listen.event_obj_idx != u64::MAX {
-            let _ = self.signal_event_index(listen.event_obj_idx as usize);
-        }
-        self.release_file_reference(listen.server_file_id);
     }
 
     unsafe fn abandon_terminating_pipe_waiter(&mut self, waiter: nt_io_manager::PipeWaiter) {
-        if waiter.reply_cap == 0 {
-            self.complete_cancelled_pipe_waiter(waiter);
-            return;
-        }
-        let _ = self.cancel_retained_file_irps(waiter.device_id, waiter.file_id, waiter.tid);
+        self.abandon_pipe_irp(waiter.irp_id);
         release_reply_pool_cap(waiter.reply_cap);
         thread_wait_state_clear_badge_ready(self, waiter.badge);
         self.release_file_reference(waiter.file_id);
@@ -10938,26 +10878,66 @@ impl ExecNtHandler {
 
     unsafe fn cancel_pipe_io_for_file_id(&mut self, file_id: u64) -> usize {
         let tid = self.current_tid;
-        let mut cancelled = 0usize;
-        cancelled += (&mut *core::ptr::addr_of_mut!(PIPE_WAITERS)).cancel_thread_file_with(
-            tid,
-            file_id,
-            |waiter| self.complete_cancelled_pipe_waiter(waiter),
-        );
-        cancelled += (&mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS)).cancel_thread_file_with(
-            tid,
-            file_id,
-            |listen| self.complete_cancelled_pipe_listen(listen),
-        );
+        let waiters: Vec<_> = (&*core::ptr::addr_of!(PIPE_WAITERS))
+            .drain_all()
+            .filter_map(|(_, waiter)| {
+                (waiter.delivery_state == 0 && waiter.tid == tid && waiter.file_id == file_id)
+                    .then_some(waiter.irp_id)
+            })
+            .collect();
+        let listens: Vec<_> = (&*core::ptr::addr_of!(PIPE_ASYNC_LISTENS))
+            .drain_all()
+            .filter_map(|(_, listen)| {
+                (listen.delivery_state == 0
+                    && listen.tid == tid
+                    && listen.server_file_id == file_id)
+                    .then_some(listen.irp_id)
+            })
+            .collect();
+        let mut cancelled = 0;
+        for irp_id in waiters.into_iter().chain(listens) {
+            if driver_launch::request_cancel_irp(irp_id).is_ok() {
+                cancelled += 1;
+            }
+        }
+        self.pipe_write_redrive = cancelled != 0;
         cancelled
     }
 
     pub(crate) unsafe fn cancel_pipe_io_for_thread_teardown(&mut self, tid: u64) -> usize {
-        let mut cancelled = 0usize;
-        cancelled += (&mut *core::ptr::addr_of_mut!(PIPE_WAITERS))
-            .cancel_thread_with(tid, |waiter| self.abandon_terminating_pipe_waiter(waiter));
-        cancelled += (&mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS))
-            .cancel_thread_with(tid, |listen| self.complete_cancelled_pipe_listen(listen));
+        let waiters: Vec<_> = (&*core::ptr::addr_of!(PIPE_WAITERS))
+            .drain_all()
+            .filter(|(_, waiter)| waiter.tid == tid)
+            .collect();
+        let listens: Vec<_> = (&*core::ptr::addr_of!(PIPE_ASYNC_LISTENS))
+            .drain_all()
+            .filter_map(|(_, listen)| {
+                (listen.delivery_state == 0 && listen.tid == tid).then_some(listen.irp_id)
+            })
+            .collect();
+        let mut cancelled = 0;
+        let mut redrive = false;
+        for (slot, waiter) in waiters {
+            if waiter.delivery_state != 0 {
+                redrive = true;
+            } else if waiter.reply_cap == 0 {
+                if driver_launch::request_cancel_irp(waiter.irp_id).is_ok() {
+                    cancelled += 1;
+                }
+            } else if (&mut *core::ptr::addr_of_mut!(PIPE_WAITERS))
+                .complete_exact(slot, waiter.irp_id)
+                .is_some()
+            {
+                self.abandon_terminating_pipe_waiter(waiter);
+                cancelled += 1;
+            }
+        }
+        for irp_id in listens {
+            if driver_launch::request_cancel_irp(irp_id).is_ok() {
+                cancelled += 1;
+            }
+        }
+        self.pipe_write_redrive = redrive || cancelled != 0;
         cancelled
     }
 
@@ -17988,8 +17968,9 @@ impl ExecNtHandler {
         fsctl: u64,
         input: &[u8],
         output: &mut [u8],
-    ) -> Result<(i32, u64, u64), u32> {
-        let (status, information) = driver_launch::dispatch_irp_to_device_result(
+    ) -> Result<(i32, u64, u64, u64), u32> {
+        let (status, information, pending_irp_id) =
+            driver_launch::dispatch_irp_to_device_result_exact(
             route.device_id,
             major,
             fsctl,
@@ -17999,7 +17980,12 @@ impl ExecNtHandler {
             output,
         )?;
         NPFS_ROUTED_IRPS.fetch_add(1, Ordering::Relaxed);
-        Ok((status, information, route.file_id))
+        Ok((
+            status,
+            information,
+            route.file_id,
+            pending_irp_id.map(|irp_id| irp_id.raw()).unwrap_or(0),
+        ))
     }
 
     /// Resolve a process-local typed file handle to npfs's FILE_OBJECT context.
@@ -22350,6 +22336,7 @@ impl ExecNtHandler {
                 let is_pipe_transceive = (fsctl as u32) == FSCTL_PIPE_TRANSCEIVE;
                 let mut transceive_file_retained = false;
                 let mut transceive_pending_async = false;
+                let mut pending_endpoint_irp_id = 0u64;
                 let mut pipe_wait_trace_name: Option<alloc::vec::Vec<u16>> = None;
                 let mut pipe_wait_trace_hash = 0u64;
                 let mut pipe_wait_trace_armed = false;
@@ -22486,9 +22473,7 @@ impl ExecNtHandler {
                                 true
                             };
                             let waiter_capacity = if sync_reply_capacity {
-                                let waiter_table = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
-                                !waiter_table.parked_on_dir(route.file_id, false)
-                                    && waiter_table.ensure_capacity()
+                                reserve_pipe_waiter(route.file_id, false)
                             } else {
                                 false
                             };
@@ -22512,10 +22497,11 @@ impl ExecNtHandler {
                                     &input,
                                     &mut output,
                                 ) {
-                                    Ok((st, completed, _)) => {
+                                    Ok((st, completed, _, pending_irp_id)) => {
                                         routed_endpoint_fsctl = true;
                                         status = st as u64;
                                         information = completed;
+                                        pending_endpoint_irp_id = pending_irp_id;
                                         if completed != 0 && args[8] != 0 {
                                             let copy_len = (completed as usize).min(output.len());
                                             self.xas_write_buf(args[8], &output[..copy_len]);
@@ -22548,6 +22534,7 @@ impl ExecNtHandler {
                     if synchronous {
                         self.pipe_park_device_id = route_device_id;
                         self.pipe_park_fid = fid;
+                        self.pipe_park_irp_id = pending_endpoint_irp_id;
                         self.pipe_park_buffer_va = args[8];
                         self.pipe_park_buffer_len = nt_ulong_arg(args[9]);
                         self.pipe_park_iosb_va = iosb;
@@ -22560,6 +22547,8 @@ impl ExecNtHandler {
                         let waiter = nt_io_manager::PipeWaiter {
                             device_id: route_device_id,
                             file_id: fid,
+                            irp_id: pending_endpoint_irp_id,
+                            delivery_state: 0,
                             pi: self.pi as u32,
                             tid: self.current_tid,
                             badge: self.current_badge,
@@ -22583,6 +22572,7 @@ impl ExecNtHandler {
                         {
                             transceive_pending_async = true;
                         } else {
+                            self.abandon_pipe_irp(pending_endpoint_irp_id);
                             status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES as u64;
                         }
                     }
@@ -22607,11 +22597,13 @@ impl ExecNtHandler {
                     } else {
                         self.file_completion.retain_file(fid)
                     };
-                    if retain_status.is_ok()
-                        && table
-                            .arm(nt_io_manager::AsyncListen {
+                    let old_capacity = table.capacity();
+                    let armed = retain_status.is_ok().then(|| {
+                        table.arm(nt_io_manager::AsyncListen {
                                 device_id: route_device_id,
                                 server_file_id: fid,
+                                irp_id: pending_endpoint_irp_id,
+                                delivery_state: 0,
                                 event_obj_idx,
                                 pi: self.pi as u32,
                                 tid: self.current_tid,
@@ -22624,8 +22616,11 @@ impl ExecNtHandler {
                                 // client connect completes ONLY the matching-name listen.
                                 name_hash: listen_name_hash,
                             })
-                            .is_some()
-                    {
+                    }).flatten();
+                    if armed.is_some() && table.capacity() != old_capacity {
+                        crate::mark_durable_table_growth_dirty();
+                    }
+                    if armed.is_some() {
                         crate::PIPE_LISTEN_ARMED_COUNT.fetch_add(1, Ordering::Relaxed);
                         let connected_before_listen = crate::pipe_server_preconnected_take(fid);
                         if connected_before_listen {
@@ -22656,6 +22651,7 @@ impl ExecNtHandler {
                         // Overlapped: DON'T write the PENDING IOSB now — it's filled on completion.
                         self.pipe_listen_fid = fid;
                     } else {
+                        self.abandon_pipe_irp(pending_endpoint_irp_id);
                         if !already_armed && retain_status.is_ok() {
                             self.release_file_reference(fid);
                         }
@@ -27007,7 +27003,7 @@ impl ExecNtHandler {
                         &[],
                         &mut *routed_output,
                     ) {
-                        Ok((driver_status, completed, _)) => {
+                        Ok((driver_status, completed, _, _)) => {
                             information = completed;
                             driver_status as u32
                         }
@@ -28155,6 +28151,7 @@ impl ExecNtHandler {
                 let mut completion_file_id = 0u64;
                 let mut pending_write_device_id = 0u64;
                 let mut pending_write_fid = 0u64;
+                let mut pending_write_irp_id = 0u64;
                 let mut async_file_retained = false;
                 let mut io_request_prepared = false;
                 let mut status = if !iosb_ok {
@@ -28205,48 +28202,15 @@ impl ExecNtHandler {
                                             .file_completion
                                             .is_synchronous(file_id)
                                             .unwrap_or(true);
-                                        // ★★ PER-DIRECTION PIPE PARKING — MEASURED, GATED OFF (Phase 4).
-                                        //
-                                        // The direction-BLIND predicate makes a connection half-duplex: an
-                                        // already-pending READ refuses this WRITE with
-                                        // STATUS_INSUFFICIENT_RESOURCES. That is a silent functional degrade,
-                                        // and it is the EXACT reason the LSA self-RPC's 48-byte `LsarOpenPolicy`
-                                        // RESPONSE is lost, so `LsaOpenPolicy` never returns to samsrv —
-                                        // rpcrt4's ncacn_np server keeps a read pending on the connection while
-                                        // `RPCRT4_worker_thread` writes the response on the SAME connection. The
-                                        // re-drive already completes the two from separate per-direction stashes
-                                        // (`take_completed_write` / `take_completed_read`), so allowing one
-                                        // pending read AND one pending write per connection is well-formed
-                                        // (`PipeWaiterTable::parked_on_dir`, host-tested).
-                                        //
-                                        // MEASURED WITH IT ON, one foreground boot: the response writes SUCCEED
-                                        // (status=0 info=48, repeatedly), `SamIConnect-null-root-miss` goes
-                                        // 1 -> 0, `sam-setup-keys` 2 -> 36, `sam-mount-opens` 1 -> 2, and lsass
-                                        // reaches `NtCreateNamedPipeFile(\samr)` — i.e. `SamIConnect` succeeds
-                                        // and samsrv publishes its own RPC endpoint. It is a REAL advance.
-                                        //
-                                        // It was gated OFF for one batch on the reading that the boot then
-                                        // "spends its whole budget cycling that self-RPC" and loses the desktop
-                                        // paint to the 45 s no-progress watchdog. That reading was WRONG: the
-                                        // budget was being eaten by an HPET interrupt storm in the executive's
-                                        // own delay timer (2,745,189 deliveries that woke nothing in one boot),
-                                        // which the self-RPC was merely the first thing to arm. See
-                                        // `LSA_WORKER_ROUTE_ENABLED` and `exec_delay_timer_disarms`. With the
-                                        // timer fixed the paint is deterministic (768/768 over six consecutive
-                                        // boots) and this is ON.
-                                        const PIPE_FULL_DUPLEX_PARK: bool = true;
+                                        // Named pipes are full duplex: one read and one write may be pending on
+                                        // the same connection, each owned by its distinct canonical IRP.
                                         let sync_reply_capacity = if synchronous {
                                             wait_reply_pool_has_free()
                                         } else {
                                             true
                                         };
                                         let waiter_capacity = if sync_reply_capacity {
-                                            let waiter_table =
-                                                &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
-                                            !waiter_table.parked_on_dir(file_id, true)
-                                                && (PIPE_FULL_DUPLEX_PARK
-                                                    || !waiter_table.parked_on(file_id))
-                                                && waiter_table.ensure_capacity()
+                                            reserve_pipe_waiter(file_id, true)
                                         } else {
                                             false
                                         };
@@ -28268,13 +28232,19 @@ impl ExecNtHandler {
                                                     &payload,
                                                     &mut output,
                                                 ) {
-                                                    Ok((driver_status, completed, _)) => {
+                                                    Ok((
+                                                        driver_status,
+                                                        completed,
+                                                        _,
+                                                        pending_irp_id,
+                                                    )) => {
                                                         routed = true;
                                                         information = completed;
                                                         if driver_status as u32 == 0x0000_0103 {
                                                             pending_write_device_id =
                                                                 route.device_id;
                                                             pending_write_fid = file_id;
+                                                            pending_write_irp_id = pending_irp_id;
                                                         }
                                                         driver_status as u32
                                                     }
@@ -28310,6 +28280,7 @@ impl ExecNtHandler {
                     if synchronous {
                         self.pipe_park_device_id = pending_write_device_id;
                         self.pipe_park_fid = pending_write_fid;
+                        self.pipe_park_irp_id = pending_write_irp_id;
                         self.pipe_park_buffer_va = 0;
                         self.pipe_park_buffer_len = 0;
                         self.pipe_park_iosb_va = iosb;
@@ -28323,6 +28294,8 @@ impl ExecNtHandler {
                         let waiter = nt_io_manager::PipeWaiter {
                             device_id: pending_write_device_id,
                             file_id: pending_write_fid,
+                            irp_id: pending_write_irp_id,
+                            delivery_state: 0,
                             pi: self.pi as u32,
                             tid: self.current_tid,
                             badge: self.current_badge,
@@ -28344,6 +28317,7 @@ impl ExecNtHandler {
                             .park(waiter)
                             .is_none()
                         {
+                            self.abandon_pipe_irp(pending_write_irp_id);
                             if async_file_retained {
                                 self.release_file_reference(pending_write_fid);
                             }
@@ -28367,7 +28341,7 @@ impl ExecNtHandler {
                 // have immediate-wait semantics; STATUS_PENDING must leave every event unsignalled.
                 if routed && status != 0x0000_0103 {
                     if status & 0xC000_0000 != 0xC000_0000 {
-                        self.post_file_completion(
+                        let _ = self.post_file_completion(
                             completion_file_id,
                             apc_context,
                             status,
@@ -28525,6 +28499,7 @@ impl ExecNtHandler {
                 let mut routed = false;
                 let mut pending_read_device_id = 0u64;
                 let mut pending_read_fid = 0u64; // BATCH 33: npfs fid if the read went PENDING → park
+                let mut pending_read_irp_id = 0u64;
                 let mut completion_file_id = 0u64;
                 let mut async_file_retained = false;
                 let mut npfs_route_status = 0xFFFF_FFFEu32;
@@ -28684,21 +28659,14 @@ impl ExecNtHandler {
                                             .file_completion
                                             .is_synchronous(file_id)
                                             .unwrap_or(true);
-                                        // Per-direction (see `PIPE_FULL_DUPLEX_PARK` at the NtWriteFile
-                                        // pre-check, which carries the full rationale + measurements). ON.
-                                        const PIPE_FULL_DUPLEX_PARK: bool = true;
+                                        // A read conflicts only with another active read on this connection.
                                         let sync_reply_capacity = if synchronous {
                                             wait_reply_pool_has_free()
                                         } else {
                                             true
                                         };
                                         let waiter_capacity = if sync_reply_capacity {
-                                            let waiter_table =
-                                                &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
-                                            !waiter_table.parked_on_dir(file_id, false)
-                                                && (PIPE_FULL_DUPLEX_PARK
-                                                    || !waiter_table.parked_on(file_id))
-                                                && waiter_table.ensure_capacity()
+                                            reserve_pipe_waiter(file_id, false)
                                         } else {
                                             false
                                         };
@@ -28719,7 +28687,12 @@ impl ExecNtHandler {
                                                     &[],
                                                     &mut output,
                                                 ) {
-                                                    Ok((driver_status, completed, _)) => {
+                                                    Ok((
+                                                        driver_status,
+                                                        completed,
+                                                        _,
+                                                        pending_irp_id,
+                                                    )) => {
                                                         routed = true;
                                                         information = completed;
                                                         let copy_len =
@@ -28778,6 +28751,7 @@ impl ExecNtHandler {
                                                             pending_read_device_id =
                                                                 route.device_id;
                                                             pending_read_fid = file_id;
+                                                            pending_read_irp_id = pending_irp_id;
                                                         }
                                                         driver_status as u32
                                                     }
@@ -28813,6 +28787,7 @@ impl ExecNtHandler {
                     if synchronous {
                         self.pipe_park_device_id = pending_read_device_id;
                         self.pipe_park_fid = pending_read_fid;
+                        self.pipe_park_irp_id = pending_read_irp_id;
                         self.pipe_park_buffer_va = buffer;
                         self.pipe_park_buffer_len = len as u32;
                         self.pipe_park_iosb_va = iosb;
@@ -28825,6 +28800,8 @@ impl ExecNtHandler {
                         let waiter = nt_io_manager::PipeWaiter {
                             device_id: pending_read_device_id,
                             file_id: pending_read_fid,
+                            irp_id: pending_read_irp_id,
+                            delivery_state: 0,
                             pi: self.pi as u32,
                             tid: self.current_tid,
                             badge: self.current_badge,
@@ -28844,6 +28821,7 @@ impl ExecNtHandler {
                         };
                         let parked = (&mut *core::ptr::addr_of_mut!(PIPE_WAITERS)).park(waiter);
                         if parked.is_none() {
+                            self.abandon_pipe_irp(pending_read_irp_id);
                             if async_file_retained {
                                 self.release_file_reference(pending_read_fid);
                             }
@@ -28863,7 +28841,7 @@ impl ExecNtHandler {
                 }
                 if routed && status != 0x0000_0103 {
                     if status & 0xC000_0000 != 0xC000_0000 {
-                        self.post_file_completion(
+                        let _ = self.post_file_completion(
                             completion_file_id,
                             apc_context,
                             status,
@@ -29111,7 +29089,7 @@ impl ExecNtHandler {
                                 &payload[..8],
                                 &mut output,
                             ) {
-                                Ok((driver_status, completed, _)) => {
+                                Ok((driver_status, completed, _, _)) => {
                                     information = completed;
                                     driver_status as u32
                                 }
@@ -29238,7 +29216,7 @@ impl ExecNtHandler {
                                 &[],
                                 &mut output,
                             ) {
-                                Ok((driver_status, completed, _)) => {
+                                Ok((driver_status, completed, _, _)) => {
                                     routed = true;
                                     information = completed;
                                     driver_status as u32

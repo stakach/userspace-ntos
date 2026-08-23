@@ -15,7 +15,7 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use nt_status::NtStatus;
-use nt_types::{NtPath, ObjectId};
+use nt_types::{ClientId, NtPath, ObjectId};
 
 mod cancel;
 mod close;
@@ -71,8 +71,11 @@ pub use pipe::{
     PipeWaiter, PipeWaiterTable, FILE_PIPE_BYTE_STREAM_MODE, FILE_PIPE_BYTE_STREAM_TYPE,
     FILE_PIPE_CLIENT_END, FILE_PIPE_COMPLETE_OPERATION, FILE_PIPE_FULL_DUPLEX, FILE_PIPE_INBOUND,
     FILE_PIPE_MESSAGE_MODE, FILE_PIPE_MESSAGE_TYPE, FILE_PIPE_OUTBOUND, FILE_PIPE_QUEUE_OPERATION,
-    FILE_PIPE_SERVER_END, STATUS_INSTANCE_NOT_AVAILABLE, STATUS_INVALID_PIPE_STATE,
-    STATUS_PIPE_BUSY, STATUS_PIPE_CONNECTED, STATUS_PIPE_DISCONNECTED, STATUS_PIPE_LISTENING,
+    FILE_PIPE_SERVER_END, IO_DELIVERY_APC_PUBLISHED, IO_DELIVERY_BUFFER_PUBLISHED,
+    IO_DELIVERY_EVENT_PUBLISHED, IO_DELIVERY_FILE_PUBLISHED, IO_DELIVERY_IOCP_PUBLISHED,
+    IO_DELIVERY_IOSB_PUBLISHED, IO_DELIVERY_REPLY_CLAIMED, IO_DELIVERY_REPLY_PUBLISHED,
+    STATUS_INSTANCE_NOT_AVAILABLE, STATUS_INVALID_PIPE_STATE, STATUS_PIPE_BUSY,
+    STATUS_PIPE_CONNECTED, STATUS_PIPE_DISCONNECTED, STATUS_PIPE_LISTENING,
     STATUS_PIPE_NOT_AVAILABLE,
 };
 pub use retained_completion::{RetainedCompletion, RetainedCompletionError, RetainedIrpCompletion};
@@ -107,6 +110,11 @@ pub struct IoManager<P> {
     files: GenStore<FileId, FileRecord>,
     irps: GenStore<IrpId, IrpRecord>,
     completed_irps: VecDeque<IrpId>,
+    abandoned_irps: Vec<IrpId>,
+    cancel_dispatch_retries: Vec<IrpId>,
+    rejected_completion_acks: Vec<(usize, IrpId)>,
+    deferred_file_close_retries: Vec<FileId>,
+    disconnected_client_retries: Vec<ClientId>,
     port: P,
     backends: Vec<Box<dyn DriverDispatchBackend>>,
 }
@@ -120,6 +128,11 @@ impl<P> IoManager<P> {
             files: GenStore::new(),
             irps: GenStore::new(),
             completed_irps: VecDeque::new(),
+            abandoned_irps: Vec::new(),
+            cancel_dispatch_retries: Vec::new(),
+            rejected_completion_acks: Vec::new(),
+            deferred_file_close_retries: Vec::new(),
+            disconnected_client_retries: Vec::new(),
             port,
             backends: Vec::new(),
         }
@@ -2031,6 +2044,18 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_pending_irp_is_cancelled_and_reclaimed_without_delivery() {
+        let mut mock = MockDriverBackend::new();
+        mock.set_force_pending(true);
+        let (mut om, client, irp) = pending_read(mock);
+        om.abandon_irp_delivery(client, irp).unwrap();
+        assert_eq!(om.irp(irp).unwrap().state, IrpState::CancelRequested);
+        assert_eq!(om.pump(), 1);
+        assert!(om.irp(irp).is_none());
+        assert!(om.next_completed_irp().is_none());
+    }
+
+    #[test]
     fn cancel_other_client_denied() {
         let mut mock = MockDriverBackend::new();
         mock.set_force_pending(true);
@@ -2137,8 +2162,12 @@ mod tests {
         irp_id: Option<IrpId>,
         output: std::vec::Vec<u8>,
         completion_ready: bool,
+        completion_status: NtStatus,
         fail_ack: bool,
         acknowledgements: usize,
+        defer_completion_until_cancel: bool,
+        cancel_failures_remaining: usize,
+        cancel_attempts: usize,
     }
 
     struct RetainedOutputBackend {
@@ -2153,12 +2182,23 @@ mod tests {
         ) -> Result<DispatchOutcome, NtStatus> {
             let mut state = self.state.borrow_mut();
             state.irp_id = Some(irp.irp_id);
-            state.completion_ready = true;
+            state.completion_ready = !state.defer_completion_until_cancel;
             Ok(DispatchOutcome::Pending)
         }
 
-        fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> {
-            Err(NtStatus::NOT_SUPPORTED)
+        fn cancel_irp(&mut self, irp_id: IrpId) -> Result<(), NtStatus> {
+            let mut state = self.state.borrow_mut();
+            if state.irp_id != Some(irp_id) {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            state.cancel_attempts += 1;
+            if state.cancel_failures_remaining != 0 {
+                state.cancel_failures_remaining -= 1;
+                return Err(NtStatus::DEVICE_NOT_READY);
+            }
+            state.completion_status = NtStatus::CANCELLED;
+            state.completion_ready = true;
+            Ok(())
         }
 
         fn poll_completion(&mut self) -> Option<DriverCompletion> {
@@ -2169,7 +2209,7 @@ mod tests {
             state.completion_ready = false;
             Some(DriverCompletion {
                 irp_id: state.irp_id?,
-                status: NtStatus::SUCCESS,
+                status: state.completion_status,
                 information: state.output.len() as u64,
             })
         }
@@ -2209,6 +2249,7 @@ mod tests {
     fn retained_output_is_exact_and_ack_failure_is_retryable() {
         let state = std::rc::Rc::new(std::cell::RefCell::new(RetainedOutputState {
             output: b"done".to_vec(),
+            completion_status: NtStatus::SUCCESS,
             ..RetainedOutputState::default()
         }));
         let mut om = io();
@@ -2283,6 +2324,218 @@ mod tests {
         assert_eq!(
             om.copy_completed_irp_output(irp_id, 0, &mut output),
             Err(NtStatus::INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
+    fn rejected_backend_completion_ack_is_retried() {
+        let state = std::rc::Rc::new(std::cell::RefCell::new(RetainedOutputState {
+            completion_status: NtStatus::PENDING,
+            fail_ack: true,
+            ..RetainedOutputState::default()
+        }));
+        let mut om = io();
+        let client = om.register_client();
+        let driver = om
+            .create_driver(
+                &path("\\Driver\\RejectedCompletion"),
+                Box::new(RetainedOutputBackend {
+                    state: state.clone(),
+                }),
+            )
+            .unwrap();
+        let mut buffer = [];
+        let irp_id = match om
+            .build_and_dispatch_external_to_driver(
+                client,
+                driver,
+                None,
+                0,
+                0,
+                major::IRP_MJ_READ,
+                IoParameters::Read(ReadWriteParameters {
+                    length: 0,
+                    key: 0,
+                    offset: 0,
+                }),
+                0,
+                0,
+                &mut buffer,
+            )
+            .unwrap()
+        {
+            ExternalDispatchResult::Pending { irp_id } => irp_id,
+            other => panic!("expected pending request, got {other:?}"),
+        };
+
+        assert_eq!(om.pump(), 0);
+        assert_eq!(state.borrow().irp_id, Some(irp_id));
+        state.borrow_mut().fail_ack = false;
+        assert_eq!(om.pump(), 1);
+        assert_eq!(state.borrow().acknowledgements, 1);
+        assert_eq!(state.borrow().irp_id, None);
+    }
+
+    #[test]
+    fn failed_cancel_dispatch_is_retried_until_terminal_completion() {
+        let state = std::rc::Rc::new(std::cell::RefCell::new(RetainedOutputState {
+            defer_completion_until_cancel: true,
+            cancel_failures_remaining: 1,
+            ..RetainedOutputState::default()
+        }));
+        let mut om = io();
+        let client = om.register_client();
+        let driver = om
+            .create_driver(
+                &path("\\Driver\\CancelRetry"),
+                Box::new(RetainedOutputBackend {
+                    state: state.clone(),
+                }),
+            )
+            .unwrap();
+        let mut buffer = [];
+        let irp_id = match om
+            .build_and_dispatch_external_to_driver(
+                client,
+                driver,
+                None,
+                0,
+                0,
+                major::IRP_MJ_READ,
+                IoParameters::Read(ReadWriteParameters {
+                    length: 0,
+                    key: 0,
+                    offset: 0,
+                }),
+                0,
+                0,
+                &mut buffer,
+            )
+            .unwrap()
+        {
+            ExternalDispatchResult::Pending { irp_id } => irp_id,
+            other => panic!("expected pending request, got {other:?}"),
+        };
+
+        om.cancel(client, irp_id).unwrap();
+        assert_eq!(state.borrow().cancel_attempts, 1);
+        assert_eq!(om.pump(), 2, "retry dispatch plus terminal publication");
+        assert_eq!(state.borrow().cancel_attempts, 2);
+        assert_eq!(
+            om.completed_irp(irp_id).unwrap().status,
+            NtStatus::CANCELLED
+        );
+        om.acknowledge_completed_irp(irp_id).unwrap();
+    }
+
+    #[derive(Default)]
+    struct LifecycleDispatchState {
+        majors: std::vec::Vec<u8>,
+        reject_first_close: bool,
+        close_attempts: usize,
+        accepted_closes: usize,
+    }
+
+    struct LifecycleDispatchBackend {
+        state: std::rc::Rc<std::cell::RefCell<LifecycleDispatchState>>,
+    }
+
+    impl DriverDispatchBackend for LifecycleDispatchBackend {
+        fn dispatch_irp(
+            &mut self,
+            _ctx: DispatchContext<'_>,
+            irp: &IrpProjection,
+        ) -> Result<DispatchOutcome, NtStatus> {
+            let mut state = self.state.borrow_mut();
+            state.majors.push(irp.major);
+            if irp.major == major::IRP_MJ_CLOSE {
+                state.close_attempts += 1;
+                if state.reject_first_close && state.close_attempts == 1 {
+                    return Err(NtStatus::DEVICE_NOT_READY);
+                }
+                state.accepted_closes += 1;
+            }
+            Ok(DispatchOutcome::Completed {
+                status: NtStatus::SUCCESS,
+                information: 0,
+            })
+        }
+
+        fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> {
+            Err(NtStatus::NOT_SUPPORTED)
+        }
+    }
+
+    fn lifecycle_device(
+        state: std::rc::Rc<std::cell::RefCell<LifecycleDispatchState>>,
+    ) -> (IoManager<MockObjectPort>, ClientId, HandleValue, FileId) {
+        let mut om = io();
+        let client = om.register_client();
+        let driver = om
+            .create_driver(
+                &path("\\Driver\\Lifecycle"),
+                Box::new(LifecycleDispatchBackend { state }),
+            )
+            .unwrap();
+        om.create_device(
+            driver,
+            Some(&path("\\Device\\Lifecycle")),
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        )
+        .unwrap();
+        let handle = om
+            .open(
+                client,
+                &path("\\Device\\Lifecycle"),
+                AccessMask::GENERIC_READ,
+                ShareAccess::empty(),
+                CreateOptions::empty(),
+                0,
+            )
+            .unwrap();
+        let file_id = om
+            .reference_open_file(client, handle, AccessMask::GENERIC_READ)
+            .unwrap()
+            .0;
+        (om, client, handle, file_id)
+    }
+
+    #[test]
+    fn rejected_close_dispatch_retries_before_releasing_file() {
+        let state = std::rc::Rc::new(std::cell::RefCell::new(LifecycleDispatchState {
+            reject_first_close: true,
+            ..LifecycleDispatchState::default()
+        }));
+        let (mut om, client, handle, file_id) = lifecycle_device(state.clone());
+        om.close(client, handle).unwrap();
+        let file = om.file(file_id).expect("rejected close retains file");
+        assert_eq!(file.state, FileState::ClosePending);
+        assert!(!file.close_dispatched);
+        assert_eq!(state.borrow().accepted_closes, 0);
+
+        assert_eq!(om.pump(), 1);
+        assert!(om.file(file_id).is_none());
+        let state = state.borrow();
+        assert_eq!(state.close_attempts, 2);
+        assert_eq!(state.accepted_closes, 1);
+    }
+
+    #[test]
+    fn disconnect_dispatches_cleanup_then_close_before_retiring_client() {
+        let state = std::rc::Rc::new(std::cell::RefCell::new(LifecycleDispatchState::default()));
+        let (mut om, client, _handle, file_id) = lifecycle_device(state.clone());
+        om.disconnect_client(client).unwrap();
+        assert!(om.file(file_id).is_none());
+        assert_eq!(
+            state.borrow().majors,
+            std::vec![
+                major::IRP_MJ_CREATE,
+                major::IRP_MJ_CLEANUP,
+                major::IRP_MJ_CLOSE
+            ]
         );
     }
 
