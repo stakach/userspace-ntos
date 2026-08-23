@@ -25,6 +25,42 @@ pub const FILE_IO_COMPLETION_NOTIFICATION_VALID_FLAGS: u32 = FILE_SKIP_COMPLETIO
     | FILE_SKIP_SET_EVENT_ON_HANDLE
     | FILE_SKIP_SET_USER_EVENT_ON_FAST_IO;
 
+/// FILE_OBJECT I/O mode derived from the mutually-exclusive synchronous create options. Alertable
+/// and non-alertable synchronous Files share the same serialization lock but differ when a waiter
+/// is interrupted by a user APC.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FileIoMode {
+    #[default]
+    Asynchronous,
+    SynchronousAlertable,
+    SynchronousNonAlertable,
+}
+
+impl FileIoMode {
+    pub const fn is_synchronous(self) -> bool {
+        !matches!(self, Self::Asynchronous)
+    }
+
+    pub const fn is_alertable(self) -> bool {
+        matches!(self, Self::SynchronousAlertable)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileIoAcquireResult {
+    /// Asynchronous Files do not use the FILE_OBJECT serialization lock.
+    Bypassed,
+    Acquired,
+    Contended {
+        alertable: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileIoRelease {
+    pub waiters: u32,
+}
+
 /// NT file I/O APIs let callers set the low bit of an overlapped event handle to suppress
 /// completion-port notification. The event object itself is still the handle with that bit cleared.
 pub const fn normalize_io_event_handle(handle: u64) -> Option<u64> {
@@ -73,7 +109,13 @@ struct FileCompletionEntry {
     references: u32,
     handle_references: u32,
     handle_publication_reserved: bool,
-    synchronous: bool,
+    io_mode: FileIoMode,
+    /// Thread owning the synchronous FILE_OBJECT Busy lock, or zero while unlocked.
+    lock_owner_tid: u64,
+    /// A promoted waiter owns Busy before it runs again. Its first acquisition consumes this grant;
+    /// a genuinely re-entrant I/O from the same thread still contends like NT's Busy exchange.
+    lock_grant_tid: u64,
+    lock_waiters: u32,
     signaled: bool,
     cleanup_sent: bool,
     notification_modes: u32,
@@ -97,7 +139,10 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
                 references: 0,
                 handle_references: 0,
                 handle_publication_reserved: false,
-                synchronous: false,
+                io_mode: FileIoMode::Asynchronous,
+                lock_owner_tid: 0,
+                lock_grant_tid: 0,
+                lock_waiters: 0,
                 signaled: false,
                 cleanup_sent: false,
                 notification_modes: 0,
@@ -118,12 +163,29 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
         device_id: u64,
         synchronous: bool,
     ) -> Result<(), u32> {
+        self.insert_file_with_mode(
+            file_id,
+            device_id,
+            if synchronous {
+                FileIoMode::SynchronousNonAlertable
+            } else {
+                FileIoMode::Asynchronous
+            },
+        )
+    }
+
+    pub fn insert_file_with_mode(
+        &mut self,
+        file_id: u64,
+        device_id: u64,
+        io_mode: FileIoMode,
+    ) -> Result<(), u32> {
         if file_id == 0 || device_id == 0 {
             return Err(STATUS_INVALID_HANDLE);
         }
         if let Some(entry) = self.entry_mut(file_id) {
             if entry.device_id != device_id
-                || entry.synchronous != synchronous
+                || entry.io_mode != io_mode
                 || entry.cleanup_sent
                 || entry.handle_publication_reserved
             {
@@ -150,7 +212,10 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
             references: 1,
             handle_references: 1,
             handle_publication_reserved: false,
-            synchronous,
+            io_mode,
+            lock_owner_tid: 0,
+            lock_grant_tid: 0,
+            lock_waiters: 0,
             signaled: true,
             cleanup_sent: false,
             notification_modes: 0,
@@ -167,6 +232,23 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
         file_id: u64,
         device_id: u64,
         synchronous: bool,
+    ) -> Result<(), u32> {
+        self.reserve_file_handle_publication_with_mode(
+            file_id,
+            device_id,
+            if synchronous {
+                FileIoMode::SynchronousNonAlertable
+            } else {
+                FileIoMode::Asynchronous
+            },
+        )
+    }
+
+    pub fn reserve_file_handle_publication_with_mode(
+        &mut self,
+        file_id: u64,
+        device_id: u64,
+        io_mode: FileIoMode,
     ) -> Result<(), u32> {
         if file_id == 0 || device_id == 0 {
             return Err(STATUS_INVALID_HANDLE);
@@ -185,7 +267,10 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
             references: 1,
             handle_references: 0,
             handle_publication_reserved: true,
-            synchronous,
+            io_mode,
+            lock_owner_tid: 0,
+            lock_grant_tid: 0,
+            lock_waiters: 0,
             signaled: true,
             cleanup_sent: false,
             notification_modes: 0,
@@ -284,7 +369,10 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
 
     pub fn can_associate(&self, file_id: u64) -> Result<(), u32> {
         let entry = self.entry(file_id).ok_or(STATUS_INVALID_HANDLE)?;
-        if entry.synchronous || entry.binding.is_some() || entry.handle_publication_reserved {
+        if entry.io_mode.is_synchronous()
+            || entry.binding.is_some()
+            || entry.handle_publication_reserved
+        {
             return Err(STATUS_INVALID_PARAMETER);
         }
         Ok(())
@@ -296,7 +384,7 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
 
     pub fn set_notification_modes(&mut self, file_id: u64, flags: u32) -> Result<u32, u32> {
         let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
-        if entry.synchronous && flags != 0 {
+        if entry.io_mode.is_synchronous() && flags != 0 {
             return Err(STATUS_INVALID_PARAMETER);
         }
         entry.notification_modes |= flags & FILE_IO_COMPLETION_NOTIFICATION_VALID_FLAGS;
@@ -311,7 +399,111 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
 
     pub fn is_synchronous(&self, file_id: u64) -> Result<bool, u32> {
         self.entry(file_id)
-            .map(|entry| entry.synchronous)
+            .map(|entry| entry.io_mode.is_synchronous())
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    pub fn io_mode(&self, file_id: u64) -> Result<FileIoMode, u32> {
+        self.entry(file_id)
+            .map(|entry| entry.io_mode)
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    /// Acquire the synchronous FILE_OBJECT Busy lock. Contention records one executive-owned
+    /// waiter; the caller must either enqueue that waiter or immediately call `cancel_io_waiter`.
+    pub fn begin_io(&mut self, file_id: u64, tid: u64) -> Result<FileIoAcquireResult, u32> {
+        if tid == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if !entry.io_mode.is_synchronous() {
+            return Ok(FileIoAcquireResult::Bypassed);
+        }
+        if entry.lock_owner_tid == 0 {
+            entry.lock_owner_tid = tid;
+            return Ok(FileIoAcquireResult::Acquired);
+        }
+        if entry.lock_owner_tid == tid && entry.lock_grant_tid == tid {
+            entry.lock_grant_tid = 0;
+            return Ok(FileIoAcquireResult::Acquired);
+        }
+        entry.lock_waiters = entry
+            .lock_waiters
+            .checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        Ok(FileIoAcquireResult::Contended {
+            alertable: entry.io_mode.is_alertable(),
+        })
+    }
+
+    /// Undo a contention count when the executive could not publish or no longer needs a waiter.
+    pub fn cancel_io_waiter(&mut self, file_id: u64) -> Result<u32, u32> {
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if entry.lock_waiters == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        entry.lock_waiters -= 1;
+        Ok(entry.lock_waiters)
+    }
+
+    /// Transfer an unlocked synchronous File to one exact FIFO waiter before waking it. The grant
+    /// prevents a racing new caller from stealing Busy before the promoted syscall runs again.
+    pub fn promote_io_waiter(&mut self, file_id: u64, tid: u64) -> Result<u32, u32> {
+        if tid == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if !entry.io_mode.is_synchronous()
+            || entry.lock_owner_tid != 0
+            || entry.lock_grant_tid != 0
+            || entry.lock_waiters == 0
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        entry.lock_waiters -= 1;
+        entry.lock_owner_tid = tid;
+        entry.lock_grant_tid = tid;
+        Ok(entry.lock_waiters)
+    }
+
+    /// Release a completed synchronous operation. The executive uses the returned waiter count to
+    /// promote exactly one FIFO acquisition owner before making that thread runnable.
+    pub fn release_io(&mut self, file_id: u64, tid: u64) -> Result<FileIoRelease, u32> {
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if !entry.io_mode.is_synchronous()
+            || entry.lock_owner_tid != tid
+            || entry.lock_grant_tid != 0
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        entry.lock_owner_tid = 0;
+        Ok(FileIoRelease {
+            waiters: entry.lock_waiters,
+        })
+    }
+
+    /// Drop a promoted owner whose thread terminated before consuming its grant.
+    pub fn cancel_promoted_io(&mut self, file_id: u64, tid: u64) -> Result<FileIoRelease, u32> {
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if entry.lock_owner_tid != tid || entry.lock_grant_tid != tid {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        entry.lock_owner_tid = 0;
+        entry.lock_grant_tid = 0;
+        Ok(FileIoRelease {
+            waiters: entry.lock_waiters,
+        })
+    }
+
+    pub fn io_lock_owner(&self, file_id: u64) -> Result<Option<u64>, u32> {
+        self.entry(file_id)
+            .map(|entry| (entry.lock_owner_tid != 0).then_some(entry.lock_owner_tid))
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    pub fn io_waiter_count(&self, file_id: u64) -> Result<u32, u32> {
+        self.entry(file_id)
+            .map(|entry| entry.lock_waiters)
             .ok_or(STATUS_INVALID_HANDLE)
     }
 
@@ -390,6 +582,13 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
         cleanup_required: bool,
     ) -> FileReferenceRelease {
         let close_required = entry.references == 0;
+        assert!(
+            !close_required
+                || (entry.lock_owner_tid == 0
+                    && entry.lock_grant_tid == 0
+                    && entry.lock_waiters == 0),
+            "last File reference released while synchronous I/O still owns it"
+        );
         let release = FileReferenceRelease {
             cleanup_required,
             close_required,
@@ -1217,6 +1416,102 @@ mod tests {
         assert_eq!(files.set_signaled(10, true), Ok(()));
         assert_eq!(files.is_signaled(10), Ok(true));
         assert_eq!(files.set_signaled(20, false), Err(STATUS_INVALID_HANDLE));
+    }
+
+    #[test]
+    fn synchronous_file_mode_preserves_alertability() {
+        let mut files = FileCompletionTable::<3>::new();
+        files
+            .insert_file_with_mode(10, 77, FileIoMode::Asynchronous)
+            .unwrap();
+        files
+            .insert_file_with_mode(20, 77, FileIoMode::SynchronousAlertable)
+            .unwrap();
+        files
+            .insert_file_with_mode(30, 77, FileIoMode::SynchronousNonAlertable)
+            .unwrap();
+
+        assert_eq!(files.io_mode(10), Ok(FileIoMode::Asynchronous));
+        assert_eq!(files.is_synchronous(10), Ok(false));
+        assert_eq!(files.io_mode(20), Ok(FileIoMode::SynchronousAlertable));
+        assert_eq!(files.is_synchronous(20), Ok(true));
+        assert_eq!(files.io_mode(30), Ok(FileIoMode::SynchronousNonAlertable));
+    }
+
+    #[test]
+    fn synchronous_file_serializes_and_promotes_exactly_one_waiter() {
+        let mut files = FileCompletionTable::<1>::new();
+        files
+            .insert_file_with_mode(10, 77, FileIoMode::SynchronousAlertable)
+            .unwrap();
+
+        assert_eq!(files.begin_io(10, 100), Ok(FileIoAcquireResult::Acquired));
+        assert_eq!(files.io_lock_owner(10), Ok(Some(100)));
+        assert_eq!(
+            files.begin_io(10, 200),
+            Ok(FileIoAcquireResult::Contended { alertable: true })
+        );
+        assert_eq!(
+            files.begin_io(10, 300),
+            Ok(FileIoAcquireResult::Contended { alertable: true })
+        );
+        assert_eq!(files.io_waiter_count(10), Ok(2));
+
+        assert_eq!(files.release_io(10, 100), Ok(FileIoRelease { waiters: 2 }));
+        assert_eq!(files.promote_io_waiter(10, 200), Ok(1));
+        assert_eq!(files.io_lock_owner(10), Ok(Some(200)));
+        assert_eq!(files.begin_io(10, 200), Ok(FileIoAcquireResult::Acquired));
+        // A second operation from the same thread is not confused with the consumed promotion.
+        assert_eq!(
+            files.begin_io(10, 200),
+            Ok(FileIoAcquireResult::Contended { alertable: true })
+        );
+        assert_eq!(files.cancel_io_waiter(10), Ok(1));
+        assert_eq!(files.release_io(10, 200), Ok(FileIoRelease { waiters: 1 }));
+        assert_eq!(files.promote_io_waiter(10, 300), Ok(0));
+        assert_eq!(files.begin_io(10, 300), Ok(FileIoAcquireResult::Acquired));
+        assert_eq!(files.release_io(10, 300), Ok(FileIoRelease { waiters: 0 }));
+        assert_eq!(files.io_lock_owner(10), Ok(None));
+    }
+
+    #[test]
+    fn asynchronous_file_bypasses_serialization() {
+        let mut files = FileCompletionTable::<1>::new();
+        files.insert_file(10, 77, false).unwrap();
+        assert_eq!(files.begin_io(10, 100), Ok(FileIoAcquireResult::Bypassed));
+        assert_eq!(files.begin_io(10, 200), Ok(FileIoAcquireResult::Bypassed));
+        assert_eq!(files.io_lock_owner(10), Ok(None));
+        assert_eq!(files.io_waiter_count(10), Ok(0));
+        assert_eq!(files.release_io(10, 100), Err(STATUS_INVALID_PARAMETER));
+    }
+
+    #[test]
+    fn cancelled_waiter_and_unconsumed_promotion_are_generation_exact() {
+        let mut files = FileCompletionTable::<1>::new();
+        files
+            .insert_file_with_mode(10, 77, FileIoMode::SynchronousNonAlertable)
+            .unwrap();
+        files.begin_io(10, 100).unwrap();
+        assert_eq!(
+            files.begin_io(10, 200),
+            Ok(FileIoAcquireResult::Contended { alertable: false })
+        );
+        assert_eq!(files.cancel_io_waiter(10), Ok(0));
+        assert_eq!(files.cancel_io_waiter(10), Err(STATUS_INVALID_PARAMETER));
+        assert_eq!(files.release_io(10, 100), Ok(FileIoRelease { waiters: 0 }));
+
+        files.begin_io(10, 300).unwrap();
+        files.begin_io(10, 400).unwrap();
+        files.release_io(10, 300).unwrap();
+        files.promote_io_waiter(10, 400).unwrap();
+        assert_eq!(
+            files.cancel_promoted_io(10, 300),
+            Err(STATUS_INVALID_PARAMETER)
+        );
+        assert_eq!(
+            files.cancel_promoted_io(10, 400),
+            Ok(FileIoRelease { waiters: 0 })
+        );
     }
 
     #[test]

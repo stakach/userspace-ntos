@@ -10494,3 +10494,33 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     File/device boundary, and delete both remaining compatibility wait tables. Replace the explicit
     16 KiB hosted control-buffer ceiling with a growable or banked transport before claiming
     arbitrary NT control-buffer lengths.
+
+    Synchronous File state-model checkpoint (2026-08-23): `nt-io-completion` no longer collapses
+    the FILE_OBJECT create mode into one boolean. `FileIoMode` preserves asynchronous,
+    synchronous-alertable, and synchronous-nonalertable identity, while the fixed File entry owns
+    the reusable Busy-lock projection: exact owner thread, promoted-owner grant, and waiter count.
+    `begin_io` bypasses asynchronous Files, acquires an idle synchronous File, consumes exactly one
+    promoted grant, or records contention with the correct alertability. Exact cancel, promote,
+    release, and promoted-owner teardown APIs reject stale owners and prevent the final File
+    reference from disappearing while an operation or acquisition waiter still owns it. The
+    executive remains responsible for FIFO waiter identity and seL4 reply capabilities; transport
+    state has not leaked into the policy crate. Host tests cover both modes, multiple contenders,
+    same-thread re-entry after a consumed grant, cancelled contention, promoted-thread teardown,
+    asynchronous bypass, and last-reference invariants (`cargo test -p nt-io-completion`, `31/31`).
+
+    Review adjustment: this is the tested state primitive, not a claim that syscall serialization
+    is wired. The executive must next preserve the full pre-dispatch operation reference while a
+    contender sleeps, clear only the caller-supplied event before acquisition, clear the shared File
+    signal only after acquisition, transfer a promoted owner before waking it, and retain the lock
+    through terminal completion. Alertable acquisition must deliver an already queued or newly
+    queued user APC without dispatching an IRP; alert during an already-pending synchronous IRP must
+    cancel and drain that exact IRP before returning its terminal status. `NtCancelIoFile` remains
+    outside the File lock and must drain current-thread matches.
+
+    Last-handle cleanup is part of the same ordering problem. ReactOS acquires the FILE_OBJECT lock
+    before `IRP_MJ_CLEANUP`; the current hosted close path dispatches cleanup immediately. Queue
+    cleanup as a lifecycle acquisition behind already-started and pre-dispatch-waiting operations,
+    retaining the canonical File until promotion, and do not invoke the hosted manager's cleanup
+    transition early. Because `FSCTL_PIPE_LISTEN` currently bypasses the generic synchronous-File
+    decision, serialization cannot be closed until LISTEN moves to `PendingFileIo`; root WAIT joins
+    only after it has a canonical hosted File.
