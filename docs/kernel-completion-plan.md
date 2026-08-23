@@ -10358,3 +10358,42 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     outside the generic terminal publisher. Migrate LISTEN after those data paths, then move root
     `FSCTL_PIPE_WAIT` behind a real hosted File/device request. Delete each legacy waiter field and
     delivery branch as its final consumer moves; do not keep compatibility fallback paths.
+
+    Pending WRITE generic-owner checkpoint (2026-08-23): routed `NtWriteFile` now reserves generic
+    pending-I/O capacity and, for a synchronous File, reply ownership before dispatch. It retains the
+    canonical File, clears its signal state, and transfers every valid `STATUS_PENDING` result with
+    the exact nonzero IrpId into `PendingFileIo`. WRITE records deliberately have no output-copy
+    surface: they retain only IOSB, explicit event or synchronous File signaling, APC-xor-IOCP,
+    optional synchronous reply, backend ACK, cancellation, and final File-reference ownership.
+    Multiple writes may remain pending on one File because identity is the canonical IrpId rather
+    than a direction-limited endpoint slot. A driver that returns `STATUS_PENDING` without an IrpId
+    now fails closed instead of leaving an unowned request or parked caller.
+
+    Immediate and deferred routed WRITE completion share the same publication order: IOSB, event or
+    File signal, then APC xor IOCP. APC plus a completion-port-bound File is rejected before dispatch,
+    and the reusable completion policy now suppresses completion-port packets when ApcContext is
+    null, matching the NT packet contract. Endpoint queue progress remains a narrow trigger that
+    drains exact completed peer READ/TRANSCEIVE/LISTEN IRPs; it owns no caller-visible completion.
+    The old WRITE entries in `PipeWaiterTable`, `is_write`, `parked_on_dir`, `pipe_park_is_write`,
+    the direction-specific reservation rule, and all specialized WRITE delivery branches are
+    deleted. Generic current-File cancellation and thread teardown now cancel or abandon the exact
+    WRITE IrpId before releasing its retained File, so no terminated VSpace is used for copyout.
+
+    Host validation is green for `cargo fmt --all`, `cargo test -p nt-io-manager` (`171/171`),
+    `cargo test -p nt-io-completion` (`26/26`), the freestanding executive check, and `git diff
+    --check`. Serialized desktop proof `.tmp/run-desktop-20260823-192843.log` is accepted: routed
+    NPFS writes and peer-read wakeups carry the live RPC workload, Explorer completes 669 api0
+    callbacks with zero callback failures, paint reaches 5 BeginPaint, 20 EndPaint, 187 direct GDI
+    returns, and 135 batch flushes carrying 184 records. All 786,432 framebuffer pixels are
+    non-background with at least 32 colors; `293/293` checks pass and the sentinel is emitted. The
+    live writes completed inline, so this run proves the common immediate publisher, endpoint
+    progress, full-duplex RPC behavior, and desktop regression but does not claim a deferred-WRITE
+    occurrence. Exact deferred publication is covered by the reusable manager tests and freestanding
+    integration.
+
+    Review adjustment: specialized WRITE ownership is gone. Migrate plain READ to `PendingFileIo`
+    next, preserving output-copy retry and overflow-warning semantics while removing its fields and
+    branches from `PipeWaiterTable`; then migrate TRANSCEIVE using the same publisher. The remaining
+    endpoint trigger should only discover exact hosted completions. After both data paths are generic,
+    migrate LISTEN, then replace the executive-modeled root `FSCTL_PIPE_WAIT` with a real hosted
+    File/device request and delete its name-wait compatibility machinery.

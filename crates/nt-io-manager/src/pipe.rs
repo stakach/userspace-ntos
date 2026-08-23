@@ -785,13 +785,11 @@ pub struct PipeWaiter {
     /// `true` if this waiter parked on FSCTL_PIPE_TRANSCEIVE (must re-read then
     /// return via the FSCTL output path), `false` for a plain NtReadFile.
     pub is_transceive: bool,
-    /// `true` for a pending NtWriteFile. Write completions carry no read buffer.
-    pub is_write: bool,
 }
 
 const PIPE_TABLE_DEFAULT_INITIAL_RESERVE: usize = 16;
 
-/// Reset-safe table of parked pipe reads/writes.
+/// Reset-safe table of parked pipe reads/transceives.
 ///
 /// The first reservation size is not a hard NT limit. Real service startup can legitimately have many
 /// RPC servers and driver control pipes with pending reads at once, so the table grows on demand.
@@ -999,28 +997,6 @@ impl PipeWaiterTable {
         self.slots
             .iter()
             .any(|s| s.is_some_and(|w| w.file_id == file_id && w.delivery_state == 0))
-    }
-
-    /// Whether `file_id` already has a parked waiter **in this DIRECTION** (`is_write`).
-    ///
-    /// ★ Why direction matters. `parked_on` alone says "this connection already has an outstanding
-    /// operation", and using it to gate a new park makes a connection strictly half-duplex. That is
-    /// wrong for the one shape every rpcrt4 ncacn_np SERVER has: `RPCRT4_io_thread` keeps a READ
-    /// pending on the connection for the next PDU while `RPCRT4_worker_thread` writes the RESPONSE
-    /// on the SAME connection. Refusing the write there is not a hang but a silent functional
-    /// degrade — the caller gets `STATUS_INSUFFICIENT_RESOURCES` for an I/O that should merely have
-    /// completed later. That is precisely how the LSA self-RPC lost its 48-byte `LsarOpenPolicy`
-    /// RESPONSE, so `LsaOpenPolicy` never returned to samsrv.
-    ///
-    /// One pending read AND one pending write per connection is exactly what the completion broker
-    /// supports: `pipe_write_redrive` completes each waiter by its distinct canonical IRP id, so
-    /// the two never collide.
-    pub fn parked_on_dir(&self, file_id: u64, is_write: bool) -> bool {
-        self.slots.iter().any(|s| {
-            s.is_some_and(|w| {
-                w.file_id == file_id && w.is_write == is_write && w.delivery_state == 0
-            })
-        })
     }
 }
 
@@ -1889,7 +1865,6 @@ mod tests {
             resume_sp: 0x4000 + file_id,
             resume_flags: 0x202,
             is_transceive: false,
-            is_write: false,
         }
     }
 
@@ -1956,12 +1931,11 @@ mod tests {
         t.mark_delivery_exact(first_slot, first.irp_id, IO_DELIVERY_EVENT_PUBLISHED)
             .unwrap();
         assert!(!t.parked_on(0xAA));
-        assert!(!t.parked_on_dir(0xAA, false));
 
         let mut second = wtr(0xAA, 3, 7);
         second.irp_id += 1;
         let second_slot = t.park(second).unwrap();
-        assert!(t.parked_on_dir(0xAA, false));
+        assert!(t.parked_on(0xAA));
         assert_eq!(t.len(), 2);
         let mut delivered_first = first;
         delivered_first.delivery_state = IO_DELIVERY_EVENT_PUBLISHED;
@@ -2127,15 +2101,12 @@ mod tests {
         first.canonical_file_id = 0x1_0001;
         let mut second = wtr(0xCCB, 3, 7);
         second.canonical_file_id = 0x1_0002;
-        second.is_write = true;
         t.park(first).unwrap();
         t.park(second).unwrap();
 
-        assert!(t.parked_on_dir(0xCCB, false));
-        assert!(t.parked_on_dir(0xCCB, true));
+        assert!(t.parked_on(0xCCB));
         assert_eq!(t.cancel_thread_file_with(7, 0x1_0001, |_| {}), 1);
-        assert!(!t.parked_on_dir(0xCCB, false));
-        assert!(t.parked_on_dir(0xCCB, true));
+        assert!(t.parked_on(0xCCB));
     }
 
     #[test]
@@ -3322,41 +3293,15 @@ mod tests {
     }
 
     #[test]
-    fn pipe_waiter_parked_on_dir_is_full_duplex_per_connection() {
-        // ★ THE rpcrt4 ncacn_np SERVER SHAPE. `RPCRT4_io_thread` keeps a READ pending on the
-        // connection while `RPCRT4_worker_thread` writes the RESPONSE on the SAME connection. The
-        // executive gates a park on "does this connection already have one of these outstanding?" —
-        // which must be asked PER DIRECTION, or the write is refused with
-        // STATUS_INSUFFICIENT_RESOURCES and the response is silently lost (the wall that stopped
-        // `LsaOpenPolicy` from returning).
+    fn pipe_waiter_active_read_key_reopens_after_exact_completion() {
         let mut t = PipeWaiterTable::new();
-        let mut read = wtr(0xAA, 4, 26);
-        read.is_write = false;
+        let read = wtr(0xAA, 4, 26);
         t.park(read).unwrap();
-
-        // Same connection, same direction: already outstanding.
-        assert!(t.parked_on_dir(0xAA, false));
-        // Same connection, OTHER direction: free — this is the case `parked_on` got wrong.
-        assert!(!t.parked_on_dir(0xAA, true));
-        // The direction-blind predicate cannot tell the two apart.
         assert!(t.parked_on(0xAA));
-
-        let mut write = wtr(0xAA, 4, 25);
-        write.is_write = true;
-        t.park(write).unwrap();
-        assert!(t.parked_on_dir(0xAA, true));
-        assert!(t.parked_on_dir(0xAA, false));
-        assert_eq!(t.len(), 2, "one read + one write on ONE connection");
-
-        // A different connection is unaffected in both directions.
-        assert!(!t.parked_on_dir(0xBB, false));
-        assert!(!t.parked_on_dir(0xBB, true));
-
-        // Completing the write frees only the write direction.
-        let (slot, _) = t.drain_all().find(|(_, w)| w.is_write).unwrap();
+        assert!(!t.parked_on(0xBB));
+        let (slot, _) = t.drain_all().next().unwrap();
         complete_waiter(&mut t, slot).unwrap();
-        assert!(!t.parked_on_dir(0xAA, true));
-        assert!(t.parked_on_dir(0xAA, false), "the pending read survives");
+        assert!(!t.parked_on(0xAA));
     }
 
     #[test]

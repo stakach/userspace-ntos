@@ -342,12 +342,13 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
     pub fn should_queue_completion_packet(
         &self,
         file_id: u64,
+        apc_context: u64,
         status: u32,
         completed_inline: bool,
         operation_suppressed: bool,
     ) -> Result<bool, u32> {
         let entry = self.entry(file_id).ok_or(STATUS_INVALID_HANDLE)?;
-        if operation_suppressed {
+        if apc_context == 0 || operation_suppressed {
             return Ok(false);
         }
         if completed_inline
@@ -1228,19 +1229,23 @@ mod tests {
         assert_eq!(files.complete_file(10, STATUS_SUCCESS), Ok(false));
         assert_eq!(files.is_signaled(10), Ok(false));
         assert_eq!(
-            files.should_queue_completion_packet(10, STATUS_SUCCESS, true, false),
+            files.should_queue_completion_packet(10, 1, STATUS_SUCCESS, true, false),
             Ok(false)
         );
         assert_eq!(
-            files.should_queue_completion_packet(10, STATUS_SUCCESS, false, false),
+            files.should_queue_completion_packet(10, 1, STATUS_SUCCESS, false, false),
             Ok(true)
         );
         assert_eq!(
-            files.should_queue_completion_packet(10, STATUS_TIMEOUT, true, false),
+            files.should_queue_completion_packet(10, 1, STATUS_TIMEOUT, true, false),
             Ok(true)
         );
         assert_eq!(
-            files.should_queue_completion_packet(10, STATUS_TIMEOUT, true, true),
+            files.should_queue_completion_packet(10, 1, STATUS_TIMEOUT, true, true),
+            Ok(false)
+        );
+        assert_eq!(
+            files.should_queue_completion_packet(10, 0, STATUS_TIMEOUT, false, false),
             Ok(false)
         );
 

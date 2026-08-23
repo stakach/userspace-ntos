@@ -2831,13 +2831,13 @@ static KEYED_RELEASE_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 
 // ─── BATCH 33: pipe-pending completion (park a pending pipe read, re-drive on peer write) ─────────
 /// The parked-pipe-read table (host-tested `nt_io_manager::PipeWaiterTable`). A caller whose npfs
-/// pipe read / FSCTL_PIPE_LISTEN / TRANSCEIVE returned STATUS_PENDING is parked here — its seL4 reply
+/// pipe read / FSCTL_PIPE_TRANSCEIVE returned STATUS_PENDING is parked here — its seL4 reply
 /// cap withheld (stolen into a pool like the event waiters), keyed by the reading end's npfs file-id
 /// — and re-driven when the peer writes. The single-threaded executive owns all mutation.
 ///
 /// This starts with a small default bootstrap reservation and grows like the async listen table.
 /// There is no tiny global NT limit on pending named-pipe IRPs: service startup, RPC servers, and
-/// driver control paths can legitimately accumulate more parked reads/writes than the old 16-slot
+/// driver control paths can legitimately accumulate more parked reads/transceives than the old 16-slot
 /// bring-up table.
 /// A refusal now means real allocation failure or reply-cap exhaustion, not "another service came up".
 static mut PIPE_WAITERS: nt_io_manager::PipeWaiterTable = nt_io_manager::PipeWaiterTable::new();
@@ -2845,7 +2845,7 @@ static mut PIPE_WAITERS: nt_io_manager::PipeWaiterTable = nt_io_manager::PipeWai
 /// canonical File/IRP generations through user publication and backend acknowledgement.
 static mut PENDING_FILE_IO: nt_io_manager::PendingFileIoTable =
     nt_io_manager::PendingFileIoTable::new();
-/// Times a pipe read/write park was refused after a pending-capable IRP route wanted to retain it. A
+/// Times a pipe read/transceive park was refused after a pending-capable IRP route wanted to retain it. A
 /// refusal is a functional degrade (the caller gets `STATUS_INSUFFICIENT_RESOURCES` for an I/O that
 /// should have completed later), so this must stay 0.
 pub(crate) static PIPE_WAITERS_REFUSED: AtomicU64 = AtomicU64::new(0);
@@ -21259,8 +21259,8 @@ struct ExecNtHandler {
     /// synchronous File object must wait for terminal completion.
     pending_file_io_transfer: Option<nt_io_manager::PendingFileIo>,
     pending_file_io_wait: bool,
-    /// BATCH 33 — pipe-pending completion edge. Set by NtReadFile / NtFsControlFile(FSCTL_PIPE_LISTEN
-    /// / TRANSCEIVE) when the npfs pipe returns STATUS_PENDING: the LOOP must PARK this caller
+    /// BATCH 33 — pipe-pending completion edge. Set by NtReadFile or
+    /// NtFsControlFile(FSCTL_PIPE_TRANSCEIVE) when npfs returns STATUS_PENDING: the LOOP must PARK this caller
     /// (steal its reply cap into the PipeWaiterTable keyed by the reading end's npfs file-id, rotate
     /// REPLY_MAIN to a fresh pool object) instead of returning PENDING, and re-drive it when the peer
     /// writes. `pipe_park_file_id` is the canonical FileId and `pipe_park_fid` is the reading end's
@@ -21279,7 +21279,6 @@ struct ExecNtHandler {
     pipe_park_completion_port_suppressed: bool,
     pipe_park_event_obj_idx: u64,
     pipe_park_transceive: bool,
-    pipe_park_is_write: bool,
     /// ★ Dbgk TARGET-SIDE BLOCKING, SYSCALL flavour. Set by a debug-event post issued from a
     /// SYSCALL arm (`dbgk_module_load` — `DbgkMapViewOfSection`, which NT queues with flags 0 and
     /// therefore BLOCKS the mapping thread on the continue). The handler cannot park: the reply-cap
@@ -21288,10 +21287,9 @@ struct ExecNtHandler {
     /// WITHOUT replying. `false` = no block requested — the plain-boot value, since the poster
     /// returns on its first line with no debug object alive.
     dbgk_block_request: bool,
-    /// BATCH 33 — set by NtWriteFile when a write completes into npfs (non-PENDING): the LOOP must
-    /// re-drive EVERY parked pipe read (re-issue each against npfs; npfs's own FCB pairing decides
-    /// which reader now has bytes) and wake the satisfied ones. `false` = no re-drive requested.
-    pipe_write_redrive: bool,
+    /// An npfs endpoint transition may have completed another retained read/transceive/listen IRP.
+    /// The loop drains those exact driver completions; this latch never owns their publication.
+    pipe_endpoint_progress: bool,
     /// BATCH 34 — the async ncacn_np SERVER completion edge. rpcrt4's ncacn_np server does NOT block
     /// on a plain pipe read; it posts an OVERLAPPED `NtFsControlFile(FSCTL_PIPE_LISTEN)` (which returns
     /// STATUS_PENDING when no client is connected yet) with an EVENT handle for completion, then parks
@@ -21634,6 +21632,7 @@ impl ExecFileCompletion {
     fn should_queue_completion_packet(
         &self,
         file_id: u64,
+        apc_context: u64,
         status: u32,
         completed_inline: bool,
         operation_suppressed: bool,
@@ -21642,6 +21641,7 @@ impl ExecFileCompletion {
         unsafe {
             (&*self.table).should_queue_completion_packet(
                 file_id,
+                apc_context,
                 status,
                 completed_inline,
                 operation_suppressed,

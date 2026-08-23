@@ -8957,7 +8957,6 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_pipe_completion_port_suppressed = false;
             let mut park_pipe_event_obj_idx: u64 = u64::MAX;
             let mut park_pipe_transceive = false;
-            let mut park_pipe_is_write = false;
             let mut park_pipe_name_wait_root_handle: u64 = 0;
             let mut park_pipe_name_wait_hash: u64 = 0;
             let mut park_pipe_name_wait_iosb_va: u64 = 0;
@@ -9074,9 +9073,8 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.pipe_park_completion_port_suppressed = false;
                 nt_handler.pipe_park_event_obj_idx = u64::MAX;
                 nt_handler.pipe_park_transceive = false;
-                nt_handler.pipe_park_is_write = false;
                 nt_handler.dbgk_block_request = false;
-                nt_handler.pipe_write_redrive = false;
+                nt_handler.pipe_endpoint_progress = false;
                 nt_handler.pipe_listen_fid = 0;
                 nt_handler.pipe_listen_event_handle = 0;
                 nt_handler.pipe_listen_iosb_va = 0;
@@ -9752,7 +9750,7 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 // BATCH 33: latch a pipe-pending park request (the reply-cap steal happens at the reply
                 // site where resume_ip/sp/flags are known). Re-drive any parked pipe reads on a peer
-                // write (done HERE, before the writer's own reply — npfs already queued the bytes).
+                // endpoint progress before replying to the current caller.
                 if nt_handler.dbgk_block_request {
                     park_dbgk_reporter = true;
                 }
@@ -9769,7 +9767,6 @@ pub(crate) unsafe fn service_sec_image(
                         nt_handler.pipe_park_completion_port_suppressed;
                     park_pipe_event_obj_idx = nt_handler.pipe_park_event_obj_idx;
                     park_pipe_transceive = nt_handler.pipe_park_transceive;
-                    park_pipe_is_write = nt_handler.pipe_park_is_write;
                 }
                 if nt_handler.pipe_name_wait_hash != 0 {
                     park_pipe_name_wait_root_handle = nt_handler.pipe_name_wait_root_handle;
@@ -9805,7 +9802,7 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" waiter(s) on available pipe\n");
                     }
                 }
-                if nt_handler.pipe_write_redrive
+                if nt_handler.pipe_endpoint_progress
                     || hosted_io_progress != 0
                     || PIPE_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel)
                 {
@@ -16040,7 +16037,6 @@ pub(crate) unsafe fn service_sec_image(
                     park_pipe_completion_port_suppressed,
                     park_pipe_event_obj_idx,
                     park_pipe_transceive,
-                    park_pipe_is_write,
                     resume_ip,
                     sp,
                     flags,
@@ -22874,7 +22870,6 @@ unsafe fn pipe_wait_park(
     completion_port_suppressed: bool,
     event_obj_idx: u64,
     is_transceive: bool,
-    is_write: bool,
     resume_ip: u64,
     sp: u64,
     flags: u64,
@@ -22910,7 +22905,6 @@ unsafe fn pipe_wait_park(
         resume_sp: sp,
         resume_flags: flags,
         is_transceive,
-        is_write,
     });
     if parked.is_none() {
         PIPE_WAITERS_REFUSED.fetch_add(1, Ordering::Relaxed);
@@ -23094,6 +23088,9 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             completed.major,
         ) {
             panic!("pending File completion identity mismatch");
+        }
+        if pending.major == nt_io_abi::major::IRP_MJ_WRITE {
+            nt_handler.pipe_endpoint_progress = true;
         }
 
         let (sb, ss, smv, hmv, imv, scratch_base) =
@@ -23480,12 +23477,10 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         // BATCH 37/I4: a pending READ/TRANSCEIVE is completed only by the IRP npfs retained. A second
         // read here manufactures another data-queue entry and can make the next SCM
         // `TransactNamedPipe` fail with the legitimate `STATUS_PIPE_BUSY` precondition.
-        let Some((status, completed, output)) =
-            driver_launch::copy_completed_irp(
-                w.irp_id,
-                !w.is_write
-                    && delivery_state & nt_io_manager::IO_DELIVERY_BUFFER_PUBLISHED == 0,
-            )
+        let Some((status, completed, output)) = driver_launch::copy_completed_irp(
+            w.irp_id,
+            delivery_state & nt_io_manager::IO_DELIVERY_BUFFER_PUBLISHED == 0,
+        )
         else {
             if driver_launch::completed_irp_copy_requires_retry(w.irp_id) {
                 PIPE_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
@@ -23515,8 +23510,7 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         // the remainder). Gating the copyout on `status == 0` left the reader's buffer zeroed on
         // overflow, so rpcrt4's RPCRT4_ValidateCommonHeader saw an all-zero header and failed. Only a
         // hard error / PENDING leaves the buffer untouched.
-        if !w.is_write
-            && (status == 0 || status == 0x8000_0005)
+        if (status == 0 || status == 0x8000_0005)
             && copy_len != 0
             && w.buffer_va != 0
         {
@@ -23560,9 +23554,7 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 }
             }
         }
-            if !w.is_write
-                && copy_len >= 16
-                && PIPE_REDRIVE_RPC_TRACE_COUNT.load(Ordering::Relaxed) < 96
+            if copy_len >= 16 && PIPE_REDRIVE_RPC_TRACE_COUNT.load(Ordering::Relaxed) < 96
             {
                 let pdu = driver_launch::dcerpc_pdu_view_from_slice(&output[..copy_len]);
                 if pdu.is_some()
@@ -23759,7 +23751,7 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             print_str(b"\n");
         }
     }
-    // Restore the writer's active-mirror context + handler identity.
+    // Restore the active caller's mirror context and handler identity.
     restore_redrive_mirrors!();
     nt_handler.loop_ctx = saved_ctx;
     woken

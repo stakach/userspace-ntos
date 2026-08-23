@@ -159,7 +159,11 @@ impl PendingFileIoTable {
     /// Insert one exact pending owner. A canonical IRP may have only one delivery owner.
     pub fn park(&mut self, pending: PendingFileIo) -> Option<usize> {
         let create_valid = match pending.operation {
-            PendingFileIoOperation::Transfer => !crate::is_create_major(pending.major),
+            PendingFileIoOperation::Transfer => {
+                !crate::is_create_major(pending.major)
+                    && (pending.major != nt_io_abi::major::IRP_MJ_WRITE
+                        || (pending.output_va == 0 && pending.output_len == 0))
+            }
             PendingFileIoOperation::Create(create) => {
                 crate::is_create_major(pending.major)
                     && create.handle_va != 0
@@ -533,6 +537,67 @@ mod tests {
         request.apc_routine = 0;
         request.publish_iocp = true;
         assert!(table.park(request).is_some());
+    }
+
+    #[test]
+    fn pending_write_has_no_output_surface_and_requires_terminal_notifications() {
+        let mut table = PendingFileIoTable::new();
+        let mut request = pending(1, 2, 7);
+        request.major = nt_io_abi::major::IRP_MJ_WRITE;
+        request.output_va = 0;
+        request.output_len = 0;
+        request.apc_routine = 0;
+        request.publish_iocp = true;
+        request.signal_file = true;
+        request.event_obj_idx = u64::MAX;
+        request.reply_cap = 0;
+        request.reply_required = false;
+        let slot = table.park(request).unwrap();
+
+        assert_eq!(table.get(slot).unwrap().output_offset, 0);
+        assert!(!table.completion_surfaces_published_exact(slot, 2));
+        for flag in [
+            IO_DELIVERY_IOSB_PUBLISHED,
+            IO_DELIVERY_FILE_PUBLISHED,
+            IO_DELIVERY_IOCP_PUBLISHED,
+        ] {
+            table.mark_delivery_exact(slot, 2, flag).unwrap();
+        }
+        assert!(table.completion_surfaces_published_exact(slot, 2));
+        table.mark_backend_acked_exact(slot, 2).unwrap();
+        let finished = table.finish_exact(slot, 2).unwrap();
+        assert_eq!(finished.file_id, request.file_id);
+        assert_eq!(finished.irp_id, request.irp_id);
+        assert_eq!(finished.major, nt_io_abi::major::IRP_MJ_WRITE);
+    }
+
+    #[test]
+    fn pending_write_rejects_an_output_copy_surface() {
+        let mut table = PendingFileIoTable::new();
+        let mut request = pending(1, 2, 7);
+        request.major = nt_io_abi::major::IRP_MJ_WRITE;
+        assert!(table.park(request).is_none());
+
+        request.output_va = 0;
+        request.output_len = 0;
+        assert!(table.park(request).is_some());
+    }
+
+    #[test]
+    fn distinct_pending_writes_can_share_one_file_object() {
+        let mut table = PendingFileIoTable::new();
+        let mut first = pending(1, 2, 7);
+        first.major = nt_io_abi::major::IRP_MJ_WRITE;
+        first.output_va = 0;
+        first.output_len = 0;
+        let mut second = first;
+        second.irp_id = 3;
+        second.tid = 8;
+
+        assert!(table.park(first).is_some());
+        assert!(table.park(second).is_some());
+        assert_eq!(table.len(), 2);
+        assert!(table.matches_completion_exact(0, 2, 1, 7, nt_io_abi::major::IRP_MJ_WRITE));
     }
 
     #[test]

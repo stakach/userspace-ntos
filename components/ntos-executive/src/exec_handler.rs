@@ -109,9 +109,9 @@ fn pipe_wait_timeout(request: &nt_io_manager::PipeWaitRequest) -> PendingWaitTim
     }
 }
 
-unsafe fn reserve_pipe_waiter(file_id: u64, is_write: bool) -> bool {
+unsafe fn reserve_pipe_waiter(file_id: u64) -> bool {
     let waiters = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
-    if waiters.parked_on_dir(file_id, is_write) {
+    if waiters.parked_on(file_id) {
         return false;
     }
     let old_capacity = waiters.capacity();
@@ -2734,9 +2734,8 @@ impl ExecNtHandler {
         write_field!(pipe_park_completion_port_suppressed, false);
         write_field!(pipe_park_event_obj_idx, u64::MAX);
         write_field!(pipe_park_transceive, false);
-        write_field!(pipe_park_is_write, false);
         write_field!(dbgk_block_request, false);
-        write_field!(pipe_write_redrive, false);
+        write_field!(pipe_endpoint_progress, false);
         write_field!(pipe_listen_fid, 0);
         write_field!(pipe_listen_event_handle, 0);
         write_field!(pipe_listen_iosb_va, 0);
@@ -10502,7 +10501,13 @@ impl ExecNtHandler {
     ) -> u32 {
         let should_queue = match self
             .file_completion
-            .should_queue_completion_packet(file_id, status, completed_inline, operation_suppressed)
+            .should_queue_completion_packet(
+                file_id,
+                apc_context,
+                status,
+                completed_inline,
+                operation_suppressed,
+            )
         {
             Ok(should_queue) => should_queue,
             Err(status) => return status,
@@ -10681,7 +10686,7 @@ impl ExecNtHandler {
             let _ = driver_launch::release_hosted_file(file_id);
             // CLEANUP/CLOSE may complete retained reads in the FSD. Run the same generic completion
             // drain used after writes so their waiters observe the terminal driver result promptly.
-            self.pipe_write_redrive = true;
+            self.pipe_endpoint_progress = true;
         }
         if let Some(port_id) = release.port_id {
             let _ = self.io_completion_ports.release(port_id);
@@ -11016,7 +11021,7 @@ impl ExecNtHandler {
                 cancelled += 1;
             }
         }
-        self.pipe_write_redrive = cancelled != 0;
+        self.pipe_endpoint_progress = cancelled != 0;
         cancelled
     }
 
@@ -11098,7 +11103,7 @@ impl ExecNtHandler {
                 cancelled += 1;
             }
         }
-        self.pipe_write_redrive = redrive || cancelled != 0;
+        self.pipe_endpoint_progress = redrive || cancelled != 0;
         cancelled + self.abandon_pending_file_io_for_thread(tid)
     }
 
@@ -22861,7 +22866,7 @@ impl ExecNtHandler {
                                 true
                             };
                             let waiter_capacity = if sync_reply_capacity {
-                                reserve_pipe_waiter(route.fs_context, false)
+                                reserve_pipe_waiter(route.fs_context)
                             } else {
                                 false
                             };
@@ -23032,7 +23037,6 @@ impl ExecNtHandler {
                             resume_sp: 0,
                             resume_flags: 0,
                             is_transceive: true,
-                            is_write: false,
                         };
                         if (&mut *core::ptr::addr_of_mut!(PIPE_WAITERS))
                             .park(waiter)
@@ -23180,7 +23184,7 @@ impl ExecNtHandler {
                     && ((status as u32) == STATUS_PENDING
                         || (status as u32) & 0xC000_0000 != 0xC000_0000)
                 {
-                    self.pipe_write_redrive = true;
+                    self.pipe_endpoint_progress = true;
                 }
                 status as u32
             },
@@ -28628,6 +28632,12 @@ impl ExecNtHandler {
                 let key_value = u32::from_le_bytes(key_bytes);
                 let mut iosb_probe = [0u8; 16];
                 let iosb_ok = iosb != 0 && self.xas_read(iosb, &mut iosb_probe);
+                let apc_completion_conflict = self
+                    .npfs_write_file_route_for(fh)
+                    .ok()
+                    .is_some_and(|route| {
+                        apc_routine != 0 && self.file_completion.binding(route.file_id).is_some()
+                    });
                 let transport_capacity = (driver_launch::FSD_ARG_FRAMES * 0x1000) as usize;
                 // The writable overlay is served IN-PROCESS from the volume and never crosses the
                 // isolated-FSD argument window, so it is not bounded by it (see the matching note
@@ -28664,24 +28674,24 @@ impl ExecNtHandler {
                 let mut routed = false;
                 let mut completion_file_id = 0u64;
                 let mut routed_fs_context = 0u64;
-                let mut pending_write_fid = 0u64;
-                let mut pending_write_fs_context = 0u64;
                 let mut pending_write_irp_id = 0u64;
-                let mut async_file_retained = false;
-                let mut io_request_prepared = false;
+                let mut file_retained = false;
+                let mut operation_started = false;
                 let mut status = if !iosb_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
                 } else if len > write_capacity {
                     0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
                 } else if !payload_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
+                } else if apc_completion_conflict {
+                    STATUS_INVALID_PARAMETER
                 } else {
                     match self.prepare_io_event_for_request(event) {
                         Err(event_status) => event_status,
                         Ok(event_index) => {
-                            io_request_prepared = true;
                             completion_event_index = event_index;
                             if self.boot_status_handle_access(fh).is_ok() {
+                                operation_started = true;
                                 match self.boot_status_write_file(fh, buffer, len, byte_offset) {
                                     Ok(written) => {
                                         information = written;
@@ -28690,6 +28700,7 @@ impl ExecNtHandler {
                                     Err(status) => status,
                                 }
                             } else if let Some(file_id) = overlay_file {
+                                operation_started = true;
                                 // ★ THE WRITABLE FILESYSTEM OVERLAY: a real write of the caller's real bytes.
                                 // `ByteOffset == NULL` (or the FILE_USE_FILE_POINTER_POSITION sentinel) uses and
                                 // advances the file object's own position, exactly like an FSD.
@@ -28718,28 +28729,42 @@ impl ExecNtHandler {
                                             .file_completion
                                             .is_synchronous(file_id)
                                             .unwrap_or(true);
-                                        // Named pipes are full duplex: one read and one write may be pending on
-                                        // the same connection, each owned by its distinct canonical IRP.
                                         let sync_reply_capacity = if synchronous {
-                                            wait_reply_pool_has_free()
+                                            REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0
+                                                && wait_reply_pool_has_free()
                                         } else {
                                             true
                                         };
-                                        let waiter_capacity = if sync_reply_capacity {
-                                            reserve_pipe_waiter(route.fs_context, true)
+                                        let owner_capacity = if sync_reply_capacity {
+                                            reserve_pending_file_io()
                                         } else {
                                             false
                                         };
-                                        let prepared = if !waiter_capacity || !sync_reply_capacity {
+                                        let prepared = if !owner_capacity || !sync_reply_capacity {
                                             Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
                                         } else {
-                                            self.file_completion.retain_file(file_id).map(|()| {
-                                                async_file_retained = true;
-                                            })
+                                            match self.file_completion.retain_file(file_id) {
+                                                Err(status) => Err(status),
+                                                Ok(()) => {
+                                                    file_retained = true;
+                                                    match self
+                                                        .file_completion
+                                                        .set_signaled(file_id, false)
+                                                    {
+                                                        Ok(()) => Ok(()),
+                                                        Err(status) => {
+                                                            self.release_file_reference(file_id);
+                                                            file_retained = false;
+                                                            Err(status)
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         };
                                         match prepared {
                                             Err(status) => status,
                                             Ok(()) => {
+                                                operation_started = true;
                                                 let mut output = [];
                                                 match self.dispatch_hosted_file_irp_for(
                                                     route,
@@ -28755,12 +28780,7 @@ impl ExecNtHandler {
                                                     )) => {
                                                         routed = true;
                                                         information = completed;
-                                                        if driver_status as u32 == 0x0000_0103 {
-                                                            pending_write_fid = file_id;
-                                                            pending_write_fs_context =
-                                                                route.fs_context;
-                                                            pending_write_irp_id = pending_irp_id;
-                                                        }
+                                                        pending_write_irp_id = pending_irp_id;
                                                         driver_status as u32
                                                     }
                                                     Err(route_status) => route_status,
@@ -28773,10 +28793,11 @@ impl ExecNtHandler {
                         }
                     }
                 };
-                if async_file_retained && pending_write_fid == 0 {
-                    self.release_file_reference(completion_file_id);
+                if routed && status == STATUS_PENDING && pending_write_irp_id == 0 {
+                    status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
+                    information = 0;
                 }
-                if io_request_prepared && pending_write_fid == 0 && status != 0x0000_0103 {
+                if operation_started && !routed && status != STATUS_PENDING {
                     let apc_status =
                         self.queue_file_user_apc(self.current_tid, apc_routine, apc_context, iosb);
                     if apc_status != nt_fs::STATUS_SUCCESS {
@@ -28784,95 +28805,69 @@ impl ExecNtHandler {
                         information = 0;
                     }
                 }
-                if pending_write_fid != 0 {
-                    let _ = self.file_completion.set_signaled(pending_write_fid, false);
+                if routed && status == STATUS_PENDING {
                     let synchronous = self
                         .file_completion
-                        .is_synchronous(pending_write_fid)
+                        .is_synchronous(completion_file_id)
                         .unwrap_or(true);
                     let event_obj_idx =
                         completion_event_index.map_or(u64::MAX, |index| index as u64);
-                    if synchronous {
-                        self.pipe_park_file_id = pending_write_fid;
-                        self.pipe_park_fid = pending_write_fs_context;
-                        self.pipe_park_irp_id = pending_write_irp_id;
-                        self.pipe_park_buffer_va = 0;
-                        self.pipe_park_buffer_len = 0;
-                        self.pipe_park_iosb_va = iosb;
-                        self.pipe_park_apc_routine = apc_routine;
-                        self.pipe_park_apc_context = apc_context;
-                        self.pipe_park_completion_port_suppressed = completion_port_suppressed;
-                        self.pipe_park_event_obj_idx = event_obj_idx;
-                        self.pipe_park_transceive = false;
-                        self.pipe_park_is_write = true;
-                    } else {
-                        let waiter = nt_io_manager::PipeWaiter {
-                            canonical_file_id: pending_write_fid,
-                            file_id: pending_write_fs_context,
-                            name_hash: crate::pipe_fid_name_hash(pending_write_fs_context),
-                            irp_id: pending_write_irp_id,
-                            delivery_state: 0,
-                            pi: self.pi as u32,
-                            tid: self.current_tid,
-                            badge: self.current_badge,
-                            buffer_va: 0,
-                            buffer_len: 0,
-                            iosb_va: iosb,
-                            apc_routine,
-                            apc_context,
-                            completion_port_suppressed,
-                            event_obj_idx,
-                            reply_cap: 0,
-                            resume_ip: 0,
-                            resume_sp: 0,
-                            resume_flags: 0,
-                            is_transceive: false,
-                            is_write: true,
-                        };
-                        if (&mut *core::ptr::addr_of_mut!(PIPE_WAITERS))
-                            .park(waiter)
-                            .is_none()
-                        {
-                            self.abandon_pipe_irp(pending_write_irp_id);
-                            if async_file_retained {
-                                self.release_file_reference(pending_write_fid);
-                            }
-                            // A park refusal is a functional degrade: this write would have completed
-                            // on the peer's read, and instead fails.
-                            if crate::PIPE_WAITERS_REFUSED.fetch_add(1, Ordering::Relaxed) < 8 {
-                                print_str(b"[pipe-park] refused async WRITE -> STATUS_INSUFFICIENT_RESOURCES fid=0x");
-                                print_hex(pending_write_fid as u32);
-                                print_str(b"\n");
-                            }
-                            status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
-                            pending_write_fid = 0;
-                        }
-                    }
+                    self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
+                        file_id: completion_file_id,
+                        irp_id: pending_write_irp_id,
+                        major: major::IRP_MJ_WRITE,
+                        operation: nt_io_manager::PendingFileIoOperation::Transfer,
+                        delivery_state: 0,
+                        pi: self.pi as u32,
+                        tid: self.current_tid,
+                        badge: self.current_badge,
+                        output_va: 0,
+                        output_len: 0,
+                        output_offset: 0,
+                        iosb_va: iosb,
+                        apc_routine,
+                        apc_context,
+                        completion_port_suppressed,
+                        signal_file: synchronous || event_obj_idx == u64::MAX,
+                        publish_iocp: apc_routine == 0,
+                        event_obj_idx,
+                        reply_cap: 0,
+                        reply_required: false,
+                        resume_ip: 0,
+                        resume_sp: 0,
+                        resume_flags: 0,
+                    });
+                    self.pending_file_io_wait = synchronous;
                 }
-                if iosb_ok && pending_write_fid == 0 {
+                let event_obj_idx = completion_event_index.map_or(u64::MAX, |index| index as u64);
+                let terminal_file_owned = file_retained && status != STATUS_PENDING;
+                if terminal_file_owned {
+                    self.complete_terminal_file_io(
+                        completion_file_id,
+                        event_obj_idx,
+                        self.current_tid,
+                        apc_routine,
+                        apc_context,
+                        iosb,
+                        status,
+                        information,
+                        true,
+                        completion_port_suppressed,
+                    );
+                } else if iosb_ok && status != STATUS_PENDING {
                     self.xas_write_buf(iosb, &status.to_le_bytes());
                     self.xas_write_buf(iosb + 8, &information.to_le_bytes());
                 }
-                // A synchronous completion signals a valid real event. Legacy opaque events already
-                // have immediate-wait semantics; STATUS_PENDING must leave every event unsignalled.
-                if routed && status != 0x0000_0103 {
-                    if status & 0xC000_0000 != 0xC000_0000 {
-                        let _ = self.post_file_completion(
-                            completion_file_id,
-                            apc_context,
-                            status,
-                            information,
-                            true,
-                            completion_port_suppressed,
-                        );
-                    }
-                    // BATCH 33: the bytes are now queued in npfs on the PEER end. Ask the loop to
-                    // re-drive every parked pipe read — npfs's FCB pairing wakes the peer's reader.
-                    if status & 0xC000_0000 != 0xC000_0000 {
-                        self.pipe_write_redrive = true;
-                    }
+                if file_retained && status != STATUS_PENDING {
+                    self.release_file_reference(completion_file_id);
                 }
-                if status != 0x0000_0103 {
+                // A dispatched write may have queued bytes or freed peer queue capacity even when
+                // its own IRP remains pending. The service loop uses this only as an endpoint
+                // progress trigger; generic pending File I/O owns WRITE completion publication.
+                if routed && (status as i32) >= 0 {
+                    self.pipe_endpoint_progress = true;
+                }
+                if operation_started && !terminal_file_owned && status != STATUS_PENDING {
                     if let Some(index) = completion_event_index {
                         let _ = self.signal_event_index(index);
                         self.io_signal_event = index as i64;
@@ -29181,7 +29176,7 @@ impl ExecNtHandler {
                                             true
                                         };
                                         let waiter_capacity = if sync_reply_capacity {
-                                            reserve_pipe_waiter(route.fs_context, false)
+                                            reserve_pipe_waiter(route.fs_context)
                                         } else {
                                             false
                                         };
@@ -29332,7 +29327,6 @@ impl ExecNtHandler {
                             resume_sp: 0,
                             resume_flags: 0,
                             is_transceive: false,
-                            is_write: false,
                         };
                         let parked = (&mut *core::ptr::addr_of_mut!(PIPE_WAITERS)).park(waiter);
                         if parked.is_none() {
@@ -29365,7 +29359,7 @@ impl ExecNtHandler {
                             completion_port_suppressed,
                         );
                     }
-                    self.pipe_write_redrive = true;
+                    self.pipe_endpoint_progress = true;
                 }
                 if status != 0x0000_0103 {
                     if let Some(index) = completion_event_index {
