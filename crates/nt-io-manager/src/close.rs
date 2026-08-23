@@ -23,6 +23,43 @@ enum LifecycleDispatch {
 }
 
 impl<P: ObjectManagerPort> IoManager<P> {
+    /// Release the final host-owned handle to a canonical File. Integration
+    /// hosts use this when their process handle table is outside the Object
+    /// Manager port. CLEANUP is issued once, CLOSE waits for every IRP ACK, and
+    /// the File record remains live across pending or retryable lifecycle work.
+    pub fn release_external_file(
+        &mut self,
+        client: ClientId,
+        file_id: FileId,
+    ) -> Result<(), NtStatus> {
+        let state = {
+            let file = self.file(file_id).ok_or(NtStatus::INVALID_HANDLE)?;
+            if file.client_id != client {
+                return Err(NtStatus::INVALID_HANDLE);
+            }
+            file.state
+        };
+        match state {
+            FileState::Allocated | FileState::Closed => return self.release_file_record(file_id),
+            FileState::CreateIrpDispatched => return Err(NtStatus::PENDING),
+            FileState::Open => {
+                let file = self.file_mut(file_id).expect("validated external File");
+                file.transition(FileState::CleanupPending);
+                file.close_deferred = true;
+            }
+            FileState::CleanupPending | FileState::CleanupComplete => {
+                self.file_mut(file_id)
+                    .expect("validated external File")
+                    .close_deferred = true;
+            }
+            FileState::ClosePending => {}
+        }
+        if self.finish_deferred_file_close(file_id).is_err() {
+            self.schedule_deferred_file_close(file_id);
+        }
+        Ok(())
+    }
+
     /// Dispatch `IRP_MJ_CLEANUP`. A pending cleanup retains its file reference;
     /// acknowledgement advances the file to `CleanupComplete`.
     pub fn cleanup(&mut self, client: ClientId, handle: HandleValue) -> Result<(), NtStatus> {
@@ -200,6 +237,10 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .driver_id;
         let mut irp = IrpRecord::new(client, device_id, Some(file_id), major);
         irp.driver_id = driver_id;
+        irp.user_data = self
+            .file(file_id)
+            .and_then(|file| file.driver_context)
+            .unwrap_or(0);
         let mut stack = IoStackLocation::new(major, device_id, Some(file_id));
         stack.parameters = parameters;
         irp.stack.push(stack);

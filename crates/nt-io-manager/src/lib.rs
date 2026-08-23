@@ -516,7 +516,7 @@ impl<P> IoManager<P> {
     // --- IRPs --------------------------------------------------------------
 
     /// Allocate an IRP record, assigning + returning its id.
-    pub fn allocate_irp(&mut self, record: IrpRecord) -> Result<IrpId, NtStatus> {
+    pub fn allocate_irp(&mut self, mut record: IrpRecord) -> Result<IrpId, NtStatus> {
         if let Some(file_id) = record.file_id {
             let file = self.files.get(file_id).ok_or(NtStatus::INVALID_HANDLE)?;
             let file_driver = self
@@ -536,6 +536,9 @@ impl<P> IoManager<P> {
                 || !valid_state
             {
                 return Err(NtStatus::INVALID_PARAMETER);
+            }
+            if record.major != nt_io_abi::major::IRP_MJ_CREATE {
+                record.user_data = file.driver_context.unwrap_or(0);
             }
             let file = self.files.get_mut(file_id).expect("validated file");
             file.outstanding_irp_refs = file
@@ -1201,7 +1204,8 @@ mod tests {
             d.dispatch_irp(ctx(&mut buf), &create()).unwrap(),
             DispatchOutcome::Completed {
                 status: NtStatus::SUCCESS,
-                information: 0
+                information: 0,
+                file_context: None,
             }
         );
         d.set_create_status(NtStatus::ACCESS_DENIED);
@@ -1233,7 +1237,8 @@ mod tests {
             out,
             DispatchOutcome::Completed {
                 status: NtStatus::SUCCESS,
-                information: 5
+                information: 5,
+                file_context: None,
             }
         );
         assert_eq!(&buf[..5], b"hello");
@@ -1259,7 +1264,8 @@ mod tests {
             out,
             DispatchOutcome::Completed {
                 status: NtStatus::SUCCESS,
-                information: 8
+                information: 8,
+                file_context: None,
             }
         );
         assert_eq!(d.written(), b"payload!");
@@ -1282,7 +1288,8 @@ mod tests {
             .unwrap(),
             DispatchOutcome::Completed {
                 status: NtStatus::SUCCESS,
-                information: 8
+                information: 8,
+                file_context: None,
             }
         );
         d.set_ioctl(IoctlBehavior::Status(NtStatus::NOT_SUPPORTED));
@@ -1316,7 +1323,8 @@ mod tests {
             d.complete_pending(irp, NtStatus::SUCCESS, 42).unwrap(),
             DispatchOutcome::Completed {
                 status: NtStatus::SUCCESS,
-                information: 42
+                information: 42,
+                file_context: None,
             }
         );
         assert!(!d.is_pending(irp));
@@ -1618,6 +1626,7 @@ mod tests {
         seen: std::rc::Rc<std::cell::RefCell<std::vec::Vec<RecordedDispatch>>>,
         status: NtStatus,
         information: u64,
+        file_context: Option<u64>,
         output: std::vec::Vec<u8>,
     }
 
@@ -1645,6 +1654,7 @@ mod tests {
             Ok(DispatchOutcome::Completed {
                 status: self.status,
                 information: self.information,
+                file_context: self.file_context,
             })
         }
 
@@ -1668,6 +1678,7 @@ mod tests {
             seen: seen.clone(),
             status,
             information,
+            file_context: None,
             output: output.to_vec(),
         }));
         let target = DispatchTarget::DriverPeer(DriverPeerId(idx as u64));
@@ -1723,6 +1734,7 @@ mod tests {
             ExternalDispatchResult::Completed {
                 status: warning,
                 information: 3,
+                file_context: None,
             }
         );
         assert_eq!(&buf[..3], b"out");
@@ -1779,6 +1791,7 @@ mod tests {
             ExternalDispatchResult::Completed {
                 status: NtStatus::SUCCESS,
                 information: 4,
+                file_context: None,
             }
         );
         assert_eq!(&buf, b"pong");
@@ -1790,6 +1803,106 @@ mod tests {
         assert_eq!(seen[0].user_data, 0x1234);
         assert_eq!(seen[0].requestor_tid, 88);
         assert_eq!((seen[0].input_len, seen[0].output_len), (4, 4));
+    }
+
+    #[test]
+    fn external_file_keeps_one_canonical_identity_from_create_through_close() {
+        let mut om = io();
+        let client = ClientId(66);
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(std::vec::Vec::new()));
+        let backend = RecordingBackend {
+            seen: seen.clone(),
+            status: NtStatus::SUCCESS,
+            information: 0,
+            file_context: Some(0xCCB0),
+            output: std::vec::Vec::new(),
+        };
+        let driver = om
+            .create_driver(&path("\\Driver\\ExternalFile"), Box::new(backend))
+            .unwrap();
+        let device = om
+            .create_device(
+                driver,
+                Some(&path("\\Device\\ExternalFile0")),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let file_id = om
+            .allocate_external_file(
+                client,
+                device,
+                AccessMask::GENERIC_READ,
+                ShareAccess::READ,
+                CreateOptions::empty(),
+                Some(path("\\Device\\ExternalFile0\\name")),
+            )
+            .unwrap();
+        assert_eq!(om.file(file_id).unwrap().state, FileState::Allocated);
+
+        let mut empty = [];
+        let create = om
+            .build_and_dispatch_external_to_device(
+                client,
+                device,
+                Some(file_id),
+                0xDEAD,
+                77,
+                major::IRP_MJ_CREATE,
+                IoParameters::Create(CreateParameters::default()),
+                0,
+                0,
+                &mut empty,
+            )
+            .unwrap();
+        assert_eq!(
+            create,
+            ExternalDispatchResult::Completed {
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: Some(0xCCB0),
+            }
+        );
+        assert_eq!(om.external_file_context(client, file_id), Ok(Some(0xCCB0)));
+
+        let mut data = [0u8; 1];
+        om.build_and_dispatch_external_to_device(
+            client,
+            device,
+            Some(file_id),
+            0xBAD0,
+            78,
+            major::IRP_MJ_READ,
+            IoParameters::Read(ReadWriteParameters {
+                length: 1,
+                key: 0,
+                offset: 0,
+            }),
+            0,
+            1,
+            &mut data,
+        )
+        .unwrap();
+        om.release_external_file(client, file_id).unwrap();
+        assert!(om.file(file_id).is_none());
+
+        let seen = seen.borrow();
+        assert_eq!(
+            seen.iter()
+                .map(|entry| entry.major)
+                .collect::<std::vec::Vec<_>>(),
+            [
+                major::IRP_MJ_CREATE,
+                major::IRP_MJ_READ,
+                major::IRP_MJ_CLEANUP,
+                major::IRP_MJ_CLOSE,
+            ]
+        );
+        assert!(seen.iter().all(|entry| entry.file_id == Some(file_id)));
+        assert_eq!(seen[0].user_data, 0);
+        assert!(seen[1..].iter().all(|entry| entry.user_data == 0xCCB0));
     }
 
     #[test]
@@ -1876,6 +1989,7 @@ mod tests {
             irp_id: irp,
             status: NtStatus::SUCCESS,
             information: 1,
+            file_context: None,
         };
         assert!(!om.publish_driver_completion(other, completion));
         assert!(!om.publish_driver_completion(
@@ -1939,6 +2053,7 @@ mod tests {
                 Ok(DispatchOutcome::Completed {
                     status: NtStatus::SUCCESS,
                     information: 0,
+                    file_context: None,
                 })
             }
         }
@@ -1948,6 +2063,7 @@ mod tests {
                 irp_id,
                 status: NtStatus::CANCELLED,
                 information: 0,
+                file_context: None,
             });
             Ok(())
         }
@@ -2023,6 +2139,7 @@ mod tests {
                 requestor_tid: 0,
                 status: NtStatus::SUCCESS,
                 information: 4,
+                file_context: None,
             })
         );
         om.acknowledge_completed_irp(irp).unwrap();
@@ -2211,6 +2328,7 @@ mod tests {
                 irp_id: state.irp_id?,
                 status: state.completion_status,
                 information: state.output.len() as u64,
+                file_context: None,
             })
         }
 
@@ -2458,6 +2576,7 @@ mod tests {
             Ok(DispatchOutcome::Completed {
                 status: NtStatus::SUCCESS,
                 information: 0,
+                file_context: None,
             })
         }
 

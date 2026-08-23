@@ -218,6 +218,8 @@ pub struct IrpRecord {
     pub state: IrpState,
     pub status: NtStatus,
     pub information: u64,
+    /// Driver-owned context captured by the terminal CREATE result.
+    pub completion_file_context: Option<u64>,
     pub stack: Vec<IoStackLocation>,
     pub current_location: u8,
     pub buffer: Option<IoBufferRef>,
@@ -247,6 +249,7 @@ impl IrpRecord {
             state: IrpState::Allocated,
             status: NtStatus::PENDING,
             information: 0,
+            completion_file_context: None,
             stack: Vec::new(),
             current_location: 0,
             buffer: None,

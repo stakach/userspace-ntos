@@ -452,6 +452,7 @@ impl DriverDispatchBackend for DriverHostBackend {
             } => DispatchOutcome::Completed {
                 status: NtStatus(status),
                 information,
+                file_context: None,
             },
             DispatchResult::Pending => DispatchOutcome::Pending,
             DispatchResult::Failed { status } => DispatchOutcome::Failed {

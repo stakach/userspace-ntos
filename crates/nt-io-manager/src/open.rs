@@ -390,6 +390,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             Ok(DispatchOutcome::Completed {
                 status,
                 information,
+                file_context,
             }) if status.is_success() => {
                 if let Some(irp) = self.irp_mut(irp_id) {
                     irp.transition(IrpState::Completing);
@@ -397,7 +398,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
                     irp.status = status;
                     irp.information = information;
                 }
-                self.file_mut(file_id).unwrap().transition(FileState::Open);
+                let file = self.file_mut(file_id).unwrap();
+                file.driver_context = file_context;
+                file.transition(FileState::Open);
                 self.free_irp(irp_id);
                 Ok(handle)
             }

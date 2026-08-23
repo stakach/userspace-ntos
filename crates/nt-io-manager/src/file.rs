@@ -106,6 +106,10 @@ pub struct FileRecord {
     pub flags: FileFlags,
     pub related_file: Option<FileId>,
     pub file_name: Option<NtPath>,
+    /// Mutable driver-owned `FILE_OBJECT.FsContext` payload. Canonical identity
+    /// is always `id`; drivers may share, replace, tag, clear, or leave this
+    /// value null.
+    pub driver_context: Option<u64>,
     pub state: FileState,
     /// IRPs whose canonical records still reference this file, including
     /// terminal completions that have not yet been acknowledged by their owner.
@@ -141,6 +145,7 @@ impl FileRecord {
             flags: FileFlags::empty(),
             related_file: None,
             file_name,
+            driver_context: None,
             state: FileState::Allocated,
             outstanding_irp_refs: 0,
             close_deferred: false,

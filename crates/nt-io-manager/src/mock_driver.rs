@@ -153,6 +153,7 @@ impl DriverDispatchBackend for MockDriverBackend {
                     irp_id: irp.irp_id,
                     status,
                     information,
+                    file_context: None,
                 });
             }
             return Ok(DispatchOutcome::Pending);
@@ -170,6 +171,7 @@ impl DriverDispatchBackend for MockDriverBackend {
                 DispatchOutcome::Completed {
                     status: NtStatus::SUCCESS,
                     information: n,
+                    file_context: None,
                 }
             }
 
@@ -186,6 +188,7 @@ impl DriverDispatchBackend for MockDriverBackend {
                 DispatchOutcome::Completed {
                     status: NtStatus::SUCCESS,
                     information: n as u64,
+                    file_context: None,
                 }
             }
 
@@ -211,6 +214,7 @@ impl DriverDispatchBackend for MockDriverBackend {
                         DispatchOutcome::Completed {
                             status: NtStatus::SUCCESS,
                             information: n as u64,
+                            file_context: None,
                         }
                     }
                     IoctlBehavior::Status(status) => DispatchOutcome::from_status(status, 0),
@@ -221,6 +225,7 @@ impl DriverDispatchBackend for MockDriverBackend {
                 DispatchOutcome::Completed {
                     status: NtStatus::SUCCESS,
                     information: 0,
+                    file_context: None,
                 }
             }
 
@@ -245,6 +250,7 @@ impl DriverDispatchBackend for MockDriverBackend {
                         irp_id,
                         status: NtStatus::CANCELLED,
                         information: 0,
+                        file_context: None,
                     });
                 }
                 Ok(())

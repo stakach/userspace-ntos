@@ -271,6 +271,7 @@ impl DriverPeerTransport for MockDriverPeer {
                     irp_id: IrpId(request.irp_id),
                     status,
                     information,
+                    file_context: None,
                 });
             }
             return DispatchOutcome::Pending;
@@ -284,6 +285,7 @@ impl DriverPeerTransport for MockDriverPeer {
                 DispatchOutcome::Completed {
                     status: NtStatus::SUCCESS,
                     information: n as u64,
+                    file_context: None,
                 }
             }
             major::IRP_MJ_WRITE => {
@@ -293,6 +295,7 @@ impl DriverPeerTransport for MockDriverPeer {
                 DispatchOutcome::Completed {
                     status: NtStatus::SUCCESS,
                     information: n as u64,
+                    file_context: None,
                 }
             }
             major::IRP_MJ_DEVICE_CONTROL | major::IRP_MJ_INTERNAL_DEVICE_CONTROL => {
@@ -324,12 +327,14 @@ impl DriverPeerTransport for MockDriverPeer {
                 DispatchOutcome::Completed {
                     status: NtStatus::SUCCESS,
                     information: n as u64,
+                    file_context: None,
                 }
             }
             major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE | major::IRP_MJ_FLUSH_BUFFERS => {
                 DispatchOutcome::Completed {
                     status: NtStatus::SUCCESS,
                     information: 0,
+                    file_context: None,
                 }
             }
             _ => DispatchOutcome::Failed {
@@ -349,6 +354,7 @@ impl DriverPeerTransport for MockDriverPeer {
                 irp_id,
                 status: NtStatus::CANCELLED,
                 information: 0,
+                file_context: None,
             });
         }
     }

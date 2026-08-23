@@ -50,6 +50,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
                     irp_id: id,
                     status: NtStatus::DEVICE_NOT_CONNECTED,
                     information: 0,
+                    file_context: None,
                 },
             ));
         }

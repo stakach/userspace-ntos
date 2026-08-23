@@ -259,6 +259,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             Ok(DispatchOutcome::Completed {
                 status,
                 information,
+                ..
             }) if status.is_success() => {
                 if let Some(irp) = self.irp_mut(irp_id) {
                     irp.transition(IrpState::Completing);

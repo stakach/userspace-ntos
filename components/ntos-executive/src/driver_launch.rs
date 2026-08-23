@@ -1720,6 +1720,13 @@ unsafe fn poll_hosted_completion(instance: usize) -> Option<nt_io_manager::Drive
             irp_id: IrpId(canonical_irp_id),
             status: nt_status::NtStatus(completion.status as i32),
             information: completion.information,
+            file_context: if entry.major == major::IRP_MJ_CREATE
+                || entry.major == major::IRP_MJ_CREATE_NAMED_PIPE
+            {
+                Some(entry.fid)
+            } else {
+                None
+            },
         });
     }
 }
@@ -29309,7 +29316,7 @@ impl DriverDispatchBackend for HostedDriverBackend {
                         &input,
                         &mut ctx.system_buffer[..output_len],
                     ) {
-                        Ok(Some((status, information))) => Some((status, information, false)),
+                        Ok(Some((status, information))) => Some((status, information, 0, false)),
                         Ok(None) => dispatch_irp_for_instance(
                             self.instance,
                             irp.major as u64,
@@ -29323,8 +29330,10 @@ impl DriverDispatchBackend for HostedDriverBackend {
                             &input,
                             &mut ctx.system_buffer[..output_len],
                         )
-                        .map(|(status, information)| (status, information, true)),
-                        Err(status) => Some((status.raw(), 0, false)),
+                        .map(|(status, information, file_context)| {
+                            (status, information, file_context, true)
+                        }),
+                        Err(status) => Some((status.raw(), 0, 0, false)),
                     }
                 } else {
                     None
@@ -29343,16 +29352,25 @@ impl DriverDispatchBackend for HostedDriverBackend {
                     &input,
                     &mut ctx.system_buffer[..output_len],
                 )
-                .map(|(status, information)| (status, information, true))
+                .map(|(status, information, file_context)| {
+                    (status, information, file_context, true)
+                })
             }
         };
         match result {
-            Some((status, _, true)) if status as u32 == STATUS_PENDING => {
+            Some((status, _, _, true)) if status as u32 == STATUS_PENDING => {
                 Ok(DispatchOutcome::Pending)
             }
-            Some((status, information, _)) => Ok(DispatchOutcome::Completed {
+            Some((status, information, file_context, _)) => Ok(DispatchOutcome::Completed {
                 status: nt_status::NtStatus(status),
                 information,
+                file_context: if irp.major == major::IRP_MJ_CREATE
+                    || irp.major == major::IRP_MJ_CREATE_NAMED_PIPE
+                {
+                    Some(file_context)
+                } else {
+                    None
+                },
             }),
             None => Ok(DispatchOutcome::Failed {
                 status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
@@ -29363,7 +29381,7 @@ impl DriverDispatchBackend for HostedDriverBackend {
     fn cancel_irp(&mut self, irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
         let storage_instance = hosted_completion_storage_instance(self.instance);
         let mut output = [];
-        let (status, _) = unsafe {
+        let (status, _, _) = unsafe {
             dispatch_irp_for_instance(
                 storage_instance,
                 FSD_DISPATCH_CANCEL_IRP,
@@ -29397,7 +29415,7 @@ impl DriverDispatchBackend for HostedDriverBackend {
         output: &mut [u8],
     ) -> Result<usize, nt_status::NtStatus> {
         let storage_instance = hosted_completion_storage_instance(self.instance);
-        let (status, information) = unsafe {
+        let (status, information, _) = unsafe {
             dispatch_irp_for_instance(
                 storage_instance,
                 FSD_DISPATCH_COPY_COMPLETION,
@@ -29422,7 +29440,7 @@ impl DriverDispatchBackend for HostedDriverBackend {
     fn acknowledge_completion(&mut self, irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
         let storage_instance = hosted_completion_storage_instance(self.instance);
         let mut output = [];
-        let (status, _) = unsafe {
+        let (status, _, _) = unsafe {
             dispatch_irp_for_instance(
                 storage_instance,
                 FSD_DISPATCH_ACK_COMPLETION,
@@ -29464,6 +29482,7 @@ impl DriverDispatchBackend for HostedRootBusBackend {
             Ok(DispatchOutcome::Completed {
                 status: nt_status::NtStatus::SUCCESS,
                 information: 0,
+                file_context: None,
             })
         } else {
             Ok(DispatchOutcome::Failed {
@@ -29618,6 +29637,7 @@ fn dispatch_external_irp_to_driver_record_result(
         ExternalDispatchResult::Completed {
             status,
             information,
+            ..
         } => {
             let copy_len = (information as usize)
                 .min(out.len())
@@ -29685,6 +29705,7 @@ fn dispatch_external_irp_to_device_record_result_exact(
         ExternalDispatchResult::Completed {
             status,
             information,
+            ..
         } => {
             let copy_len = (information as usize)
                 .min(out.len())
@@ -36160,7 +36181,7 @@ pub(crate) unsafe fn start_hosted_device(
         return Ok(());
     }
     let mut out = [];
-    let (status, _) = dispatch_irp_for_instance(
+    let (status, _, _) = dispatch_irp_for_instance(
         binding.instance,
         IRP_MJ_PNP,
         IRP_MN_START_DEVICE,
@@ -36217,7 +36238,7 @@ unsafe fn dispatch_hosted_device_interrupt_once(
     }
 
     let mut out = [];
-    let (status, info) = dispatch_irp_for_instance(
+    let (status, info, _) = dispatch_irp_for_instance(
         binding.instance,
         FSD_DISPATCH_INTERRUPT,
         tokens.vector as u64,
@@ -36592,7 +36613,7 @@ unsafe fn dispatch_irp_for_instance(
     requestor_tid: u64,
     in_data: &[u8],
     out: &mut [u8],
-) -> Option<(i32, u64)> {
+) -> Option<(i32, u64, u64)> {
     let dependent_inst = instance(inst)?;
     if !dependent_inst.ready {
         return None;
@@ -36604,7 +36625,7 @@ unsafe fn dispatch_irp_for_instance(
     let mut provider_binding = None;
     if let Some(route) = hosted_provider_dispatch_route_for_instance(inst) {
         if !route.add_device_ready() {
-            return Some((STATUS_INVALID_DEVICE_REQUEST, 0));
+            return Some((STATUS_INVALID_DEVICE_REQUEST, 0, 0));
         }
         let binding = hosted_device_binding_by_device_object(device_object)
             .or_else(|| hosted_device_binding_by_device_id(dependent_inst.device_id))?;
@@ -36758,7 +36779,7 @@ unsafe fn dispatch_irp_for_instance(
         if dispatch_index != inst {
             register_instance_ready(inst, false);
         }
-        return Some((0xC000_0001u32 as i32, 0)); // STATUS_UNSUCCESSFUL
+        return Some((0xC000_0001u32 as i32, 0, 0)); // STATUS_UNSUCCESSFUL
     }
     let d = instance(dispatch_index).unwrap_or(d);
     let sh = d.exec_shared_va;
@@ -36766,6 +36787,10 @@ unsafe fn dispatch_irp_for_instance(
     let st = pr.status;
     // IoStatus.Information is at SH_REQ_INFO(0x78); the pump doesn't touch it.
     let info = read_volatile((sh + SH_REQ_INFO) as *const u64);
+    // CREATE publishes the driver-mutated FsContext before any deferred hosted
+    // work can reuse the transport. It is payload attached to canonical FileId,
+    // never the cross-domain identity itself.
+    let file_context = read_volatile((sh + SH_REQ_FILEID) as *const u64);
     // Copy the driver's projected output bytes back out.
     let outlen = (info as usize).min(out.len());
     for i in 0..outlen {
@@ -36782,7 +36807,7 @@ unsafe fn dispatch_irp_for_instance(
     if let Some(binding) = provider_binding {
         import_provider_device_dispatch_state(binding, dependent_inst.exec_shared_va, sh);
     }
-    Some((st, info))
+    Some((st, info, file_context))
 }
 
 /// Route one IRP to a launched driver by its canonical driver route id.

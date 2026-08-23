@@ -32,6 +32,7 @@ pub struct CompletedIrp {
     pub requestor_tid: u64,
     pub status: NtStatus,
     pub information: u64,
+    pub file_context: Option<u64>,
 }
 
 impl<P: ObjectManagerPort> IoManager<P> {
@@ -215,6 +216,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         }
         irp.status = completion.status;
         irp.information = completion.information;
+        irp.completion_file_context = completion.file_context;
         if completion.status == NtStatus::CANCELLED {
             irp.cancel = CancelState::Cancelled;
         }
@@ -312,6 +314,14 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .expect("validated completed IRP disappeared after backend acknowledgement");
 
         if let Some(file_id) = completed.file_id {
+            if completed.major == major::IRP_MJ_CREATE && completed.status.is_success() {
+                if let Some(file) = self.file_mut(file_id) {
+                    if file.state == crate::FileState::CreateIrpDispatched {
+                        file.driver_context = completed.file_context;
+                        file.transition(crate::FileState::Open);
+                    }
+                }
+            }
             if completed.major == major::IRP_MJ_CLEANUP {
                 if let Some(file) = self.file_mut(file_id) {
                     if file.state == crate::FileState::CleanupPending {
@@ -362,6 +372,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             requestor_tid: irp.requestor_tid,
             status: irp.status,
             information: irp.information,
+            file_context: irp.completion_file_context,
         })
     }
 }

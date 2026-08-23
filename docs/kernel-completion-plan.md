@@ -10060,17 +10060,36 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and compiler-barrier contract rather than an SMP CAS lock. The accepted serialized rerun below
     crosses this point and satisfies the complete desktop gate.
 
-    Review adjustment: the next ownership step is the canonical File boundary. Add a host-tested
-    live `(DeviceId, driver FsContext) -> FileId` binding, allocate the File record before CREATE,
-    bind the returned FsContext only after the driver accepts the open, carry that FileId on every
-    subsequent IRP including CLEANUP/CLOSE, and fail `STATUS_INVALID_HANDLE` when no exact binding
-    exists. Then delete `npfs_last_file_id` and raw lifecycle routing. After this boundary is green,
+    Review adjustment: the next ownership step is the canonical File boundary. ReactOS source
+    review rejects the earlier proposed `(DeviceId, FsContext) -> FileId` key: FastFat and NTFS put
+    a shared FCB in `FsContext` and a per-open CCB in `FsContext2`, while NPFS may tag or clear both
+    fields during cleanup. Allocate the canonical File record before CREATE and bind its
+    generation-protected `FileId` to one stable component-local `FILE_OBJECT` allocation before the
+    driver runs. Carry that same `FileId` on every subsequent IRP including CLEANUP/CLOSE; keep
+    `FsContext`/`FsContext2` as mutable driver-owned payload and fail `STATUS_INVALID_HANDLE` when
+    the exact File record or component binding is absent. Then delete `npfs_last_file_id` and raw
+    lifecycle routing. After this boundary is green,
     run the serialized desktop proof and continue to the real multi-stack `IoCompleteRequest`
     unwinder, completion-control invocation, pending propagation, and
     `STATUS_MORE_PROCESSING_REQUIRED`. Production handle teardown must call this exact manager
     lifecycle and delete `FileCompletionTable::finish_release` plus raw
     `dispatch_file_lifecycle_irp`. Faulted hosted-instance teardown must also explicitly quarantine
     or reclaim every raw owner before the manager uses faulted-backend ACK bypass.
+
+    Canonical File crate-first checkpoint (2026-08-23): `nt-io-manager` can now allocate a
+    host-owned File record before CREATE when the integration host owns its own process handle table.
+    Synchronous and asynchronous driver completions carry an optional driver-owned File context as
+    payload, the successful CREATE records that payload and advances the canonical File to `Open`,
+    and every later IRP derives its backend context from the File record instead of trusting an
+    independent caller cookie. Final external-handle release uses the existing manager lifecycle to
+    issue exact FileId-bearing CLEANUP and CLOSE, retain the record across pending/retryable work,
+    and retire it only after IRP references drain. Host coverage proves one generation-protected
+    FileId across CREATE, ordinary I/O, CLEANUP, and CLOSE while the supplied noncanonical cookie is
+    ignored. Validation is green for `cargo fmt --all`, `cargo test -p nt-io-manager` (`149/149`),
+    and the freestanding executive check. Review adjustment: this is the host-tested foundation, not
+    production boot proof. Next change the component `FILE_OBJECT` registry from FsContext keys to
+    FileId keys, migrate all three production NPFS CREATE paths and their process handles, and only
+    then delete `npfs_last_file_id` plus raw lifecycle dispatch.
 
     Serialized ownership/work-order retry (2026-08-23):
     `.tmp/run-desktop-20260823-152912.log` is rejected, but it crossed the former NDIS scatter/gather

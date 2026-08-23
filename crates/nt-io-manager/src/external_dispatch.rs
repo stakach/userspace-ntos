@@ -7,9 +7,10 @@
 //! transport-local file cookie in `user_data`.
 
 use nt_status::NtStatus;
-use nt_types::ClientId;
+use nt_types::{AccessMask, ClientId, NtPath, ObjectId};
 
 use crate::dispatch::{DispatchContext, DispatchOutcome, IrpProjection};
+use crate::file::{CreateOptions, FileRecord, FileState, ShareAccess};
 use crate::irp::{BufferAccess, IoBufferRef, IoParameters, IoStackLocation, IrpRecord, IrpState};
 use crate::{DeviceId, DriverId, FileId, IoManager, IrpId};
 
@@ -18,11 +19,57 @@ use crate::{DeviceId, DriverId, FileId, IoManager, IrpId};
 /// the integration host acknowledges that completion.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ExternalDispatchResult {
-    Completed { status: NtStatus, information: u64 },
-    Pending { irp_id: IrpId },
+    Completed {
+        status: NtStatus,
+        information: u64,
+        file_context: Option<u64>,
+    },
+    Pending {
+        irp_id: IrpId,
+    },
 }
 
 impl<P> IoManager<P> {
+    /// Allocate a canonical File owned by an integration host whose process
+    /// handles live outside the I/O Manager's Object Manager port. The record
+    /// exists before CREATE and its `FileId` is the only cross-domain identity.
+    pub fn allocate_external_file(
+        &mut self,
+        client: ClientId,
+        device_id: DeviceId,
+        desired_access: AccessMask,
+        share_access: ShareAccess,
+        create_options: CreateOptions,
+        file_name: Option<NtPath>,
+    ) -> Result<FileId, NtStatus> {
+        if self.device(device_id).is_none() {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(self.add_file(FileRecord::new(
+            ObjectId::NULL,
+            client,
+            device_id,
+            desired_access,
+            share_access,
+            create_options,
+            file_name,
+        )))
+    }
+
+    /// Return the mutable driver-owned context attached to a live canonical
+    /// File. A null context is valid and remains distinct from File identity.
+    pub fn external_file_context(
+        &self,
+        client: ClientId,
+        file_id: FileId,
+    ) -> Result<Option<u64>, NtStatus> {
+        let file = self.file(file_id).ok_or(NtStatus::INVALID_HANDLE)?;
+        if file.client_id != client || !file.state.is_open() {
+            return Err(NtStatus::INVALID_HANDLE);
+        }
+        Ok(file.driver_context)
+    }
+
     /// Build one IRP for `device_id`, route it through the owning driver's
     /// dispatch table, and return either its synchronous result or the canonical
     /// id retained for asynchronous completion.
@@ -112,6 +159,21 @@ impl<P> IoManager<P> {
             return Err(NtStatus::INVALID_PARAMETER);
         }
 
+        let user_data = if let Some(file_id) = file_id {
+            let file = self.file(file_id).ok_or(NtStatus::INVALID_HANDLE)?;
+            if file.client_id != client
+                || (device_id != DeviceId::NULL && file.device_id != device_id)
+            {
+                return Err(NtStatus::INVALID_HANDLE);
+            }
+            if major == nt_io_abi::major::IRP_MJ_CREATE {
+                0
+            } else {
+                file.driver_context.unwrap_or(0)
+            }
+        } else {
+            user_data
+        };
         let mut irp = IrpRecord::new(client, device_id, file_id, major);
         irp.driver_id = driver_id;
         irp.user_data = user_data;
@@ -128,6 +190,13 @@ impl<P> IoManager<P> {
             access: BufferAccess::ReadWrite,
         });
         let irp_id = self.allocate_irp(irp)?;
+        if major == nt_io_abi::major::IRP_MJ_CREATE {
+            if let Some(file_id) = file_id {
+                self.file_mut(file_id)
+                    .expect("CREATE File disappeared after IRP allocation")
+                    .transition(FileState::CreateIrpDispatched);
+            }
+        }
         self.irp_mut(irp_id)
             .expect("just allocated")
             .transition(IrpState::Initialized);
@@ -206,6 +275,10 @@ impl<P> IoManager<P> {
         irp_id: IrpId,
         outcome: Result<DispatchOutcome, NtStatus>,
     ) -> ExternalDispatchResult {
+        let (major, file_id) = self
+            .irp(irp_id)
+            .map(|irp| (irp.major, irp.file_id))
+            .unwrap_or((u8::MAX, None));
         if self
             .irp(irp_id)
             .map(|irp| irp.state != IrpState::Dispatched)
@@ -217,6 +290,7 @@ impl<P> IoManager<P> {
             Ok(DispatchOutcome::Completed {
                 status,
                 information,
+                file_context,
             }) => {
                 if let Some(irp) = self.irp_mut(irp_id) {
                     irp.status = status;
@@ -225,9 +299,21 @@ impl<P> IoManager<P> {
                     irp.transition(IrpState::Completed);
                 }
                 self.free_irp(irp_id);
+                if major == nt_io_abi::major::IRP_MJ_CREATE {
+                    if let Some(file_id) = file_id {
+                        if status.is_success() {
+                            let file = self.file_mut(file_id).expect("CREATE File disappeared");
+                            file.driver_context = file_context;
+                            file.transition(FileState::Open);
+                        } else if let Some(file) = self.file_mut(file_id) {
+                            file.transition(FileState::Closed);
+                        }
+                    }
+                }
                 ExternalDispatchResult::Completed {
                     status,
                     information,
+                    file_context,
                 }
             }
             Ok(DispatchOutcome::Failed { status }) | Err(status) => {
@@ -236,9 +322,17 @@ impl<P> IoManager<P> {
                     irp.transition(IrpState::Failed);
                 }
                 self.free_irp(irp_id);
+                if major == nt_io_abi::major::IRP_MJ_CREATE {
+                    if let Some(file_id) = file_id {
+                        if let Some(file) = self.file_mut(file_id) {
+                            file.transition(FileState::Closed);
+                        }
+                    }
+                }
                 ExternalDispatchResult::Completed {
                     status,
                     information: 0,
+                    file_context: None,
                 }
             }
             Ok(DispatchOutcome::Pending) => {

@@ -120,7 +120,13 @@ impl IrpProjection {
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum DispatchOutcome {
     /// Finished synchronously with a final status + `IoStatus.Information`.
-    Completed { status: NtStatus, information: u64 },
+    Completed {
+        status: NtStatus,
+        information: u64,
+        /// Driver-owned `FILE_OBJECT` context captured after CREATE. This is
+        /// mutable payload, not canonical file identity.
+        file_context: Option<u64>,
+    },
     /// Accepted as pending; a final completion arrives later.
     Pending,
     /// Rejected up front with a failure status.
@@ -135,6 +141,7 @@ impl DispatchOutcome {
             DispatchOutcome::Completed {
                 status,
                 information,
+                file_context: None,
             }
         } else {
             DispatchOutcome::Failed { status }
@@ -149,6 +156,8 @@ pub struct DriverCompletion {
     pub irp_id: IrpId,
     pub status: NtStatus,
     pub information: u64,
+    /// Final driver-owned context for a pending CREATE completion.
+    pub file_context: Option<u64>,
 }
 
 /// A driver dispatch backend (spec §15.1). Pluggable: the mock backend for
