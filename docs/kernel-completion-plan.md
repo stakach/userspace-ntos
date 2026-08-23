@@ -10279,3 +10279,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     progress triggers. Root `FSCTL_PIPE_WAIT` remains executive-modeled rather than an NPFS-owned
     pending IRP and must move behind the real hosted File/device boundary; do not treat its current
     name-wait table as the final kernel design.
+
+    Pending CREATE manager-semantics checkpoint (2026-08-23): terminal CREATE publication now
+    applies the canonical File lifecycle before the retained backend completion is acknowledged.
+    A successful CREATE publishes its driver-owned FsContext and makes an un-abandoned File `Open`,
+    so a completion consumer can resolve the real File and publish a process handle while ACK is
+    still retryable. A failed CREATE becomes `Closed` at the same semantic boundary. If cancellation
+    loses to a successful CREATE, the File remains `ClosePending` but retains the returned context,
+    allowing exact deferred CLOSE dispatch after the CREATE IRP reference drains. Backend ACK no
+    longer mutates successful CREATE state; it only reclaims the retained completion/IRP and drives
+    deferred lifecycle work.
+
+    Host validation is green for `cargo fmt --all`, `cargo test -p nt-io-manager` (`165/165`), and
+    `git diff --check`. Review adjustment: this fixes the manager ordering prerequisite only; the
+    executive still discards a pending CREATE IrpId in `npfs_create_file`. Next add one CREATE
+    operation variant to the generic pending File-I/O owner, reserve all handle/provider publication
+    capacity before dispatch, park the synchronous create/open syscall reply, and publish the handle,
+    IOSB, and provider endpoint metadata from the terminal completion before ACK. Failure,
+    cancellation, thread teardown, or publication failure must release the unhandled canonical File
+    through its exact lifecycle. Do not introduce a CREATE-specific wait table.

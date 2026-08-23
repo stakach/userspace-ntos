@@ -204,24 +204,44 @@ impl<P: ObjectManagerPort> IoManager<P> {
         if completion.status == NtStatus::PENDING {
             return false;
         }
-        let irp = match self.irp_mut(completion.irp_id) {
-            Some(irp) => irp,
-            None => return false,
+        let (major, file_id) = {
+            let irp = match self.irp_mut(completion.irp_id) {
+                Some(irp) => irp,
+                None => return false,
+            };
+            if !matches!(
+                irp.state,
+                IrpState::Dispatched | IrpState::Pending | IrpState::CancelRequested
+            ) {
+                return false;
+            }
+            irp.status = completion.status;
+            irp.information = completion.information;
+            irp.completion_file_context = completion.file_context;
+            if completion.status == NtStatus::CANCELLED {
+                irp.cancel = CancelState::Cancelled;
+            }
+            if !irp.transition(IrpState::Completing) || !irp.transition(IrpState::Completed) {
+                return false;
+            }
+            (irp.major, irp.file_id)
         };
-        if !matches!(
-            irp.state,
-            IrpState::Dispatched | IrpState::Pending | IrpState::CancelRequested
-        ) {
-            return false;
-        }
-        irp.status = completion.status;
-        irp.information = completion.information;
-        irp.completion_file_context = completion.file_context;
-        if completion.status == NtStatus::CANCELLED {
-            irp.cancel = CancelState::Cancelled;
-        }
-        if !irp.transition(IrpState::Completing) || !irp.transition(IrpState::Completed) {
-            return false;
+
+        // Terminal CREATE publication, rather than transport acknowledgement, makes the File
+        // usable. Completion consumers must be able to publish the new handle before ACK releases
+        // the retained driver payload. A cancelled owner can lose the race to a successful CREATE;
+        // preserve that driver's context while leaving its File on the deferred-close path.
+        if crate::is_create_major(major) {
+            if let Some(file) = file_id.and_then(|file_id| self.file_mut(file_id)) {
+                if completion.status.is_success() {
+                    file.driver_context = completion.file_context;
+                    if file.state == crate::FileState::CreateIrpDispatched {
+                        file.transition(crate::FileState::Open);
+                    }
+                } else if file.state == crate::FileState::CreateIrpDispatched {
+                    file.transition(crate::FileState::Closed);
+                }
+            }
         }
         self.completed_irps.push_back(completion.irp_id);
         true
@@ -314,14 +334,6 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .expect("validated completed IRP disappeared after backend acknowledgement");
 
         if let Some(file_id) = completed.file_id {
-            if crate::is_create_major(completed.major) && completed.status.is_success() {
-                if let Some(file) = self.file_mut(file_id) {
-                    if file.state == crate::FileState::CreateIrpDispatched {
-                        file.driver_context = completed.file_context;
-                        file.transition(crate::FileState::Open);
-                    }
-                }
-            }
             if completed.major == major::IRP_MJ_CLEANUP {
                 if let Some(file) = self.file_mut(file_id) {
                     if file.state == crate::FileState::CleanupPending {

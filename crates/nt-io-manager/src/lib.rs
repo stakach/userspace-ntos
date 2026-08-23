@@ -2163,6 +2163,30 @@ mod tests {
         }
     }
 
+    struct CompletingCreateBackend;
+
+    impl DriverDispatchBackend for CompletingCreateBackend {
+        fn dispatch_irp(
+            &mut self,
+            _ctx: DispatchContext<'_>,
+            irp: &IrpProjection,
+        ) -> Result<DispatchOutcome, NtStatus> {
+            if is_create_major(irp.major) {
+                Ok(DispatchOutcome::Pending)
+            } else {
+                Ok(DispatchOutcome::Completed {
+                    status: NtStatus::SUCCESS,
+                    information: 0,
+                    file_context: None,
+                })
+            }
+        }
+
+        fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn pending_create_is_cancelled_and_retained_until_ack() {
         let mut om = io();
@@ -2196,6 +2220,120 @@ mod tests {
         om.acknowledge_completed_irp(irp).unwrap();
         assert!(om.file(file_id).is_none());
         assert_eq!(om.port().retained_reference_count(), 0);
+    }
+
+    fn pending_external_create() -> (IoManager<MockObjectPort>, ClientId, DriverId, FileId, IrpId) {
+        let mut om = io();
+        let client = om.register_client();
+        let driver = om
+            .create_driver(
+                &path("\\Driver\\CompletingCreate"),
+                Box::new(CompletingCreateBackend),
+            )
+            .unwrap();
+        let device = om
+            .create_device(
+                driver,
+                Some(&path("\\Device\\CompletingCreate0")),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let file_id = om
+            .allocate_external_file(
+                client,
+                device,
+                AccessMask::GENERIC_READ,
+                ShareAccess::READ,
+                CreateOptions::empty(),
+                None,
+            )
+            .unwrap();
+        let pending = om
+            .build_and_dispatch_external_to_device(
+                client,
+                device,
+                Some(file_id),
+                0,
+                81,
+                major::IRP_MJ_CREATE,
+                IoParameters::Create(CreateParameters::default()),
+                0,
+                0,
+                &mut [],
+            )
+            .unwrap();
+        let irp_id = match pending {
+            ExternalDispatchResult::Pending { irp_id } => irp_id,
+            other => panic!("expected pending create, got {other:?}"),
+        };
+        (om, client, driver, file_id, irp_id)
+    }
+
+    #[test]
+    fn pending_create_publishes_open_file_and_context_before_ack() {
+        let (mut om, _client, driver, file_id, irp_id) = pending_external_create();
+
+        assert!(om.publish_driver_completion(
+            driver,
+            DriverCompletion {
+                irp_id,
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: Some(0xCAFE),
+            }
+        ));
+        let file = om.file(file_id).unwrap();
+        assert_eq!(file.state, FileState::Open);
+        assert_eq!(file.driver_context, Some(0xCAFE));
+        assert_eq!(om.completed_irp(irp_id).unwrap().file_context, Some(0xCAFE));
+
+        om.acknowledge_completed_irp(irp_id).unwrap();
+        assert_eq!(om.file(file_id).unwrap().state, FileState::Open);
+    }
+
+    #[test]
+    fn pending_failed_create_closes_before_ack_and_retires_on_release() {
+        let (mut om, client, driver, file_id, irp_id) = pending_external_create();
+
+        assert!(om.publish_driver_completion(
+            driver,
+            DriverCompletion {
+                irp_id,
+                status: NtStatus::ACCESS_DENIED,
+                information: 0,
+                file_context: None,
+            }
+        ));
+        assert_eq!(om.file(file_id).unwrap().state, FileState::Closed);
+        om.acknowledge_completed_irp(irp_id).unwrap();
+        om.release_external_file(client, file_id).unwrap();
+        assert!(om.file(file_id).is_none());
+    }
+
+    #[test]
+    fn released_pending_create_that_completes_successfully_closes_with_context() {
+        let (mut om, client, driver, file_id, irp_id) = pending_external_create();
+
+        om.release_external_file(client, file_id).unwrap();
+        assert_eq!(om.file(file_id).unwrap().state, FileState::ClosePending);
+        assert!(om.publish_driver_completion(
+            driver,
+            DriverCompletion {
+                irp_id,
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: Some(0xBEEF),
+            }
+        ));
+        let file = om.file(file_id).unwrap();
+        assert_eq!(file.state, FileState::ClosePending);
+        assert_eq!(file.driver_context, Some(0xBEEF));
+
+        om.acknowledge_completed_irp(irp_id).unwrap();
+        assert!(om.file(file_id).is_none());
     }
 
     #[test]
