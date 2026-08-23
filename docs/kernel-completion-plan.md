@@ -10790,12 +10790,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     at the existing 212-warning baseline. New tests prove zero-output LISTEN event plus IOCP
     publication, APC/IOCP exclusivity, multiple exact rearm generations on one File, and synchronous
     File signal, Busy release, and reply obligations before ACK. The removal deletes 1,020 lines net
-    from specialized completion machinery. A serialized desktop boot remains the integration gate
-    before this checkpoint is considered on-target complete.
+    from specialized completion machinery. Serialized desktop proof
+    `.tmp/run-desktop-20260824-070946.log` is accepted for the exact integrated tree. The boot issues
+    34 real pending `FSCTL_PIPE_LISTEN` requests through the generic owner, dynamically launches
+    genuine userinit and Explorer, and completes 669 real api0 callbacks with zero callback failures.
+    Explorer reaches 5 BeginPaint, 20 EndPaint, 187 direct GDI returns, and 135 batch flushes carrying
+    184 records. All 786,432 framebuffer pixels are non-background with at least 32 colors; all
+    `293/293` checks pass and the sentinel is emitted.
 
-    Review adjustment: LISTEN completion ownership and synchronous File ordering are closed at the
-    implementation and focused-test boundary. The immediate integration check must prove genuine RPC
-    server LISTEN events and Explorer desktop rendering through the generic owner. Once accepted,
-    route root `FSCTL_PIPE_WAIT` through a canonical hosted NPFS root File/device request and remove
-    `PipeNameWaiterTable` plus the executive name-wait path. The growable or banked control-buffer
+    Review adjustment: LISTEN completion ownership, synchronous File ordering, and on-target desktop
+    integration are closed. Next route root `FSCTL_PIPE_WAIT` through a canonical hosted NPFS root
+    File/device request and remove `PipeNameWaiterTable` plus the entire executive name-wait park,
+    timeout, wake, cancellation, census, and handler-latch path. Preserve native timeout semantics,
+    the caller's IOSB/event completion surfaces, root-handle cleanup, and exact provider-name
+    correlation in the I/O Manager/provider boundary. The growable or banked control-buffer
     transport remains after root WAIT; the explicit 16 KiB ceiling must not survive that step.
