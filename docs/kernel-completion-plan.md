@@ -10572,3 +10572,44 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     interrupts an already-pending synchronous IRP cancels and drains that exact IRP, last-handle
     cleanup queues behind the same File lock, and `NtCancelIoFile` drains all matching current-thread
     IRPs. Implement those lifecycle owners before migrating specialized LISTEN and root WAIT.
+
+    Exact `NtCancelIoFile` drain checkpoint (2026-08-23): cancellation selection now belongs to the
+    canonical I/O Manager rather than executive scans of `PendingFileIo` and `AsyncListen`. One
+    allocation-free manager operation validates the caller's exact generation-protected File, finds
+    every live IRP issued by the current thread for that File, and requests cancellation without
+    redispatching records already in `CancelRequested`. Other threads and other File generations are
+    untouched. A normal terminal completion may win the cancellation race, and completed records
+    remain part of the drain until their original delivery owner publishes every surface, consumes
+    the backend acknowledgement, and removes the canonical IRP.
+
+    The executive owns a separate generation-exact drain continuation only when matching IRPs exist.
+    It preflights the reply capability and growable waiter slot before cancellation, retains the
+    canonical File while parked, and redrives generic and LISTEN completion owners before testing the
+    manager's exact File/thread drain state. The drain does not acquire the synchronous File Busy
+    lock. Native calls resume with the single status word; UnknownSyscall calls restore the complete
+    18-MR frame. The final cancellation IOSB write is best effort, matching ReactOS's guarded write,
+    so a late user unmap cannot strand a completed drain. Dead-thread teardown removes the drain
+    reply owner and retained File reference without stealing the original IRPs' cancellation or ACK
+    ownership. The old executive per-table cancellation scans have been deleted.
+
+    Focused validation is green for `cargo fmt --all -- --check`, `nt-io-manager` (`176/176`),
+    `nt-io-completion` (`31/31`), the freestanding executive check, and `git diff --check`. Manager
+    tests cover multiple exact matches, isolation from another thread and another File, normal
+    completion winning the race, terminal records remaining visible until every exact ACK, invalid
+    thread identity, foreign-client rejection, no-match behavior, reservation generations, duplicate
+    continuation owners, idempotent reply transfer, and teardown. Serialized desktop proof
+    `.tmp/run-desktop-20260823-223425.log` is accepted for the exact integrated tree: genuine
+    userinit and Explorer launch complete, Explorer performs 665 real api0 callbacks with zero
+    callback failures, paint reaches 2 BeginPaint, 20 EndPaint, 185 direct GDI returns, and 131 batch
+    flushes carrying 171 records. All 786,432 framebuffer pixels are non-background with at least 32
+    colors; all `293/293` checks pass and the sentinel is emitted. This workload issued no live
+    `NtCancelIoFile`, so the boot is regression proof while exact cancellation/drain semantics remain
+    proven by the focused manager tests rather than overstated as production exercise.
+
+    Review adjustment: `NtCancelIoFile` is closed at the canonical selection/drain boundary. Continue
+    the synchronous File lifecycle with newly queued APC cancellation of an alertable acquisition
+    waiter, APC interruption of an already-pending synchronous IRP through exact cancel-and-drain,
+    and last-handle CLEANUP queued behind the same FIFO. Then migrate `FSCTL_PIPE_LISTEN` into
+    `PendingFileIo`, route root `FSCTL_PIPE_WAIT` through its canonical hosted File/device boundary,
+    delete both compatibility wait tables, and replace the explicit 16 KiB hosted control-buffer
+    limit with growable or banked transport.

@@ -149,6 +149,17 @@ unsafe fn reserve_synchronous_file_waiter() -> bool {
     reserved
 }
 
+unsafe fn reserve_file_irp_drain_waiter(
+) -> Option<nt_io_manager::PendingFileIrpDrainReservation> {
+    let waiters = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS);
+    let old_capacity = waiters.allocation_capacity();
+    let reservation = waiters.reserve();
+    if reservation.is_some() && waiters.allocation_capacity() != old_capacity {
+        crate::mark_durable_table_growth_dirty();
+    }
+    reservation
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct HostedFileRoute {
     /// Canonical generation-protected File identity.
@@ -2762,6 +2773,7 @@ impl ExecNtHandler {
         write_field!(pending_file_io_wait, false);
         write_field!(pending_file_io_reservation, None);
         write_field!(pending_synchronous_file_wait, None);
+        write_field!(pending_file_irp_drain, None);
         write_field!(dbgk_block_request, false);
         write_field!(pipe_endpoint_progress, false);
         write_field!(pipe_listen_fid, 0);
@@ -11055,50 +11067,6 @@ impl ExecNtHandler {
         }
     }
 
-    unsafe fn cancel_pending_listen_for_file_id(&mut self, file_id: u64) -> usize {
-        let tid = self.current_tid;
-        let listens: Vec<_> = (&*core::ptr::addr_of!(PIPE_ASYNC_LISTENS))
-            .drain_all()
-            .filter_map(|(_, listen)| {
-                (listen.delivery_state == 0
-                    && listen.tid == tid
-                    && listen.canonical_file_id == file_id)
-                    .then_some(listen.irp_id)
-            })
-            .collect();
-        let mut cancelled = 0;
-        for irp_id in listens {
-            if driver_launch::request_cancel_irp(irp_id).is_ok() {
-                cancelled += 1;
-            }
-        }
-        self.pipe_endpoint_progress = cancelled != 0;
-        cancelled
-    }
-
-    unsafe fn cancel_pending_file_io_for_file_id(&mut self, file_id: u64) -> usize {
-        let irps: Vec<_> = (&*core::ptr::addr_of!(PENDING_FILE_IO))
-            .drain_all()
-            .filter_map(|(_, pending)| {
-                (pending.delivery_state == 0
-                    && pending.tid == self.current_tid
-                    && pending.file_id == file_id)
-                    .then_some(pending.irp_id)
-            })
-            .collect();
-        let mut cancelled = 0;
-        for irp_id in irps {
-            if driver_launch::request_cancel_irp(irp_id).is_ok() {
-                cancelled += 1;
-            }
-        }
-        if cancelled != 0 {
-            crate::service_sec_image::FILE_IO_DELIVERY_RETRY_PENDING
-                .store(true, Ordering::Release);
-        }
-        cancelled
-    }
-
     unsafe fn abandon_pending_file_io_for_thread(&mut self, tid: u64) -> usize {
         let mut transfers = Vec::new();
         (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
@@ -11159,6 +11127,20 @@ impl ExecNtHandler {
         waiters.len()
     }
 
+    unsafe fn abandon_file_irp_drain_waiters_for_thread(&mut self, tid: u64) -> usize {
+        let mut waiters = Vec::new();
+        (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
+            .take_thread_with(tid, |waiter| waiters.push(waiter));
+        for waiter in waiters.iter().copied() {
+            if waiter.reply_cap != 0 {
+                release_reply_pool_cap(waiter.reply_cap);
+            }
+            thread_wait_state_clear_badge_ready(self, waiter.badge);
+            self.release_file_reference(waiter.file_id);
+        }
+        waiters.len()
+    }
+
     pub(crate) unsafe fn cancel_file_io_for_thread_teardown(&mut self, tid: u64) -> usize {
         let listens: Vec<_> = (&*core::ptr::addr_of!(PIPE_ASYNC_LISTENS))
             .drain_all()
@@ -11176,6 +11158,7 @@ impl ExecNtHandler {
         cancelled
             + self.abandon_pending_file_io_for_thread(tid)
             + self.abandon_synchronous_file_waiters_for_thread(tid)
+            + self.abandon_file_irp_drain_waiters_for_thread(tid)
     }
 
     unsafe fn cancel_pipe_name_waits_for_root_handle(&mut self, root_handle: u64) -> usize {
@@ -11196,17 +11179,81 @@ impl ExecNtHandler {
             Ok(target) => target,
             Err(status) => return status,
         };
-        let mut cancelled = file_id
-            .map(|file_id| self.cancel_pending_listen_for_file_id(file_id))
-            .unwrap_or(0);
+        let mut matched = 0usize;
+        let mut terminal = 0usize;
         if let Some(file_id) = file_id {
-            cancelled += self.cancel_pending_file_io_for_file_id(file_id);
+            let initial = driver_launch::file_thread_io_drain_state(file_id, self.current_tid);
+            matched = initial.total;
+            terminal = initial.terminal_unacknowledged;
+            // The common case requires no continuation resource and cannot fail due to reply-pool
+            // pressure merely because no I/O exists to drain.
+            if !initial.is_drained() {
+                if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free() {
+                    return STATUS_INSUFFICIENT_RESOURCES;
+                }
+                let Some(reservation) = reserve_file_irp_drain_waiter() else {
+                    return STATUS_INSUFFICIENT_RESOURCES;
+                };
+                if let Err(status) = self.file_completion.retain_file(file_id) {
+                    assert!(
+                        (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
+                            .cancel_reservation(reservation)
+                    );
+                    return status;
+                }
+                let state = match driver_launch::cancel_file_thread_io(file_id, self.current_tid) {
+                    Ok(state) => state,
+                    Err(status) => {
+                        assert!(
+                            (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
+                                .cancel_reservation(reservation)
+                        );
+                        self.release_file_reference(file_id);
+                        return status;
+                    }
+                };
+                matched = state.total;
+                terminal = state.terminal_unacknowledged;
+                if state.is_drained() {
+                    assert!(
+                        (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
+                            .cancel_reservation(reservation)
+                    );
+                    self.release_file_reference(file_id);
+                } else {
+                    // Cancellation may have completed inside the manager pump. Force both exact
+                    // owners to publish and ACK before the drain continuation can wake.
+                    crate::service_sec_image::FILE_IO_DELIVERY_RETRY_PENDING
+                        .store(true, Ordering::Release);
+                    self.pipe_endpoint_progress = true;
+                    self.pending_file_irp_drain = Some((
+                        nt_io_manager::PendingFileIrpDrain {
+                            file_id,
+                            pi: self.pi as u32,
+                            tid: self.current_tid,
+                            badge: self.current_badge,
+                            iosb_va: iosb,
+                            native_call_transport: self.current_native_call_transport,
+                            resume_ip: self.current_resume_ip,
+                            resume_sp: self.current_sp,
+                            resume_flags: self.current_flags,
+                            ..nt_io_manager::PendingFileIrpDrain::default()
+                        },
+                        reservation,
+                    ));
+                }
+            }
         }
+        let mut cancelled = matched;
         if is_npfs_root {
             cancelled += self.cancel_pipe_name_waits_for_root_handle(file_handle);
         }
-        self.xas_write_buf(iosb, &0u32.to_le_bytes());
-        self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
+        if self.pending_file_irp_drain.is_none() {
+            // ReactOS treats this final write as best effort and still returns success if another
+            // thread invalidated the probed IOSB while cancellation drained.
+            let _ = self.xas_try_write_buf(iosb, &0u32.to_le_bytes());
+            let _ = self.xas_try_write_buf(iosb + 8, &0u64.to_le_bytes());
+        }
         let trace = NT_CANCEL_IO_FILE_TRACE_N.fetch_add(1, Ordering::Relaxed);
         if trace < 32 || cancelled != 0 {
             print_str(b"[nt-cancel-io-file] #");
@@ -11223,9 +11270,17 @@ impl ExecNtHandler {
             print_hex(file_id.unwrap_or(0) as u32);
             print_str(b" cancelled=");
             print_u64(cancelled as u64);
+            print_str(b" terminal=");
+            print_u64(terminal as u64);
+            print_str(b" parked=");
+            print_u64(self.pending_file_irp_drain.is_some() as u64);
             print_str(b"\n");
         }
-        0
+        if self.pending_file_irp_drain.is_some() {
+            STATUS_PENDING
+        } else {
+            0
+        }
     }
     /// ★ CROSS-VSPACE `NtCreateThread` — a genuine ADDITIONAL thread inside a FOREIGN process
     /// (`RtlCreateUserThread(ProcessHandle != NtCurrentProcess)`; `DbgUiIssueRemoteBreakin`'s

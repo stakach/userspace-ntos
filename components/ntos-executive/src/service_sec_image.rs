@@ -8949,6 +8949,10 @@ pub(crate) unsafe fn service_sec_image(
                 bool,
                 nt_io_manager::PendingFileIoReservation,
             )> = None;
+            let mut transfer_file_irp_drain: Option<(
+                nt_io_manager::PendingFileIrpDrain,
+                nt_io_manager::PendingFileIrpDrainReservation,
+            )> = None;
             let mut synchronous_file_wait_parked = false;
             let mut park_pipe_name_wait_root_handle: u64 = 0;
             let mut park_pipe_name_wait_hash: u64 = 0;
@@ -9066,6 +9070,10 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.pending_file_io_transfer = None;
                 nt_handler.pending_file_io_wait = false;
                 nt_handler.pending_synchronous_file_wait = None;
+                assert!(
+                    nt_handler.pending_file_irp_drain.is_none(),
+                    "previous syscall leaked a File IRP drain reservation"
+                );
                 nt_handler.dbgk_block_request = false;
                 nt_handler.pipe_endpoint_progress = false;
                 nt_handler.pipe_listen_fid = 0;
@@ -9794,6 +9802,15 @@ pub(crate) unsafe fn service_sec_image(
                         result = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES as u64;
                     }
                 }
+                if let Some((mut pending, reservation)) =
+                    nt_handler.pending_file_irp_drain.take()
+                {
+                    pending.reply_mrs = syscall_reply_context.regs;
+                    pending.resume_ip = resume_ip;
+                    pending.resume_sp = sp;
+                    pending.resume_flags = flags;
+                    transfer_file_irp_drain = Some((pending, reservation));
+                }
                 if let Some(stale_grant) = nt_handler.active_synchronous_file_retry.take() {
                     let _ = nt_handler
                         .file_completion
@@ -9871,6 +9888,10 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" listen(s)\n");
                     }
                 }
+                // Cancellation drains are ordered after the original IRP owners. A waiter becomes
+                // runnable only once generic/LISTEN publication has ACKed and removed every exact
+                // manager IRP for its File and requestor thread.
+                let _ = file_irp_drain_redrive_all(&mut nt_handler);
                 // The hosted-exe lane reserved a spawn after validating the owner-local file ->
                 // section -> process transition in `exe_images`. The remaining per-image policy is
                 // the address-space descriptor; handle publication and ProcessManager wiring are
@@ -16069,6 +16090,33 @@ pub(crate) unsafe fn service_sec_image(
                     m3 = nm3;
                     continue;
                 }
+            }
+            if let Some((pending, reservation)) = transfer_file_irp_drain.take() {
+                file_irp_drain_transfer(pending, reservation);
+                trace_indefinite_wait_park(
+                    &nt_handler,
+                    badge,
+                    live_top_badges(&nt_handler),
+                    crash_parked,
+                    wait_parked,
+                );
+                mark_wait_parked!(pi, resume_ip);
+                // Cancellation can complete inside the handler's manager pump. Redrive every
+                // original owner unconditionally before testing the separate drain owner.
+                let _ = driver_launch::pump_hosted_io_completions();
+                let _ = pending_file_io_redrive_all(&mut nt_handler);
+                let _ = pipe_listen_redrive_all(&mut nt_handler);
+                let _ = file_irp_drain_redrive_all(&mut nt_handler);
+                pin_durable_table_growth_if_dirty(&mut heap_mark);
+                let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                badge = nb;
+                mi = nmi;
+                m0 = nm0;
+                m1 = nm1;
+                m2 = nm2;
+                m3 = nm3;
+                continue;
             }
             if park_pipe_name_wait_hash != 0 && reply_main != 0 {
                 let park_pipe_name_wait_deadline_100ns = park_pipe_name_wait_timeout
@@ -22956,6 +23004,27 @@ unsafe fn pending_file_io_transfer(
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
 }
 
+unsafe fn file_irp_drain_transfer(
+    mut pending: nt_io_manager::PendingFileIrpDrain,
+    reservation: nt_io_manager::PendingFileIrpDrainReservation,
+) {
+    let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    assert_ne!(stolen, 0, "File IRP drain reply cap disappeared after preflight");
+    let (fresh_index, fresh) = wait_reply_pool_find_free()
+        .expect("File IRP drain reply-pool claim disappeared after preflight");
+    pending.reply_cap = stolen;
+    if !pending.native_call_transport {
+        pending.reply_mrs[15] = pending.resume_ip;
+        pending.reply_mrs[16] = pending.resume_sp;
+        pending.reply_mrs[17] = pending.resume_flags;
+    }
+    (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
+        .park_reserved(reservation, pending)
+        .expect("reserved File IRP drain owner rejected its exact continuation");
+    wait_reply_pool_mark_used(fresh_index);
+    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+}
+
 unsafe fn pipe_name_wait_park(
     root_handle: u64,
     name_hash: u64,
@@ -23527,6 +23596,95 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     restore_file_io_mirrors!();
     nt_handler.loop_ctx = saved_ctx;
     delivered
+}
+
+/// Resume `NtCancelIoFile` only after every canonical IRP selected for its exact File/thread pair
+/// has published through its original owner and been acknowledged. The cancellation syscall's own
+/// IOSB is best effort, matching NT's guarded final write; a late invalidation cannot wedge drain.
+unsafe fn file_irp_drain_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
+    if (&*core::ptr::addr_of!(PENDING_FILE_IRP_DRAINS)).is_empty() {
+        return 0;
+    }
+    let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
+    let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
+    let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
+    let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
+    let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
+    let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
+    let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+    let saved_pi = nt_handler.pi;
+    let saved_ctx = nt_handler.loop_ctx.take();
+    let mut resumed = 0u64;
+    let mut cursor = 0usize;
+    while let Some((slot, pending)) =
+        (&*core::ptr::addr_of!(PENDING_FILE_IRP_DRAINS)).next_from(cursor)
+    {
+        cursor = slot + 1;
+        if !driver_launch::file_thread_io_drain_state(pending.file_id, pending.tid).is_drained() {
+            continue;
+        }
+
+        let (sb, ss, smv, hmv, imv, scratch_base) =
+            mirror_ctx_for(pending.badge, pending.pi as usize);
+        ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
+        ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
+        ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
+        ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
+        ACTIVE_IMAGE_MIRROR.store(imv, Ordering::Relaxed);
+        ACTIVE_CLIENT_PI.store(pending.pi as u64, Ordering::Relaxed);
+        ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
+        nt_handler.pi = pending.pi as usize;
+
+        let mut delivery_state = pending.delivery_state;
+        if delivery_state & nt_io_manager::FILE_IRP_DRAIN_IOSB_PUBLISHED == 0 {
+            let _ = nt_handler.xas_try_write_buf(pending.iosb_va, &0u32.to_le_bytes());
+            let _ = nt_handler.xas_try_write_buf(pending.iosb_va + 8, &0u64.to_le_bytes());
+            delivery_state = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
+                .mark_iosb_published_exact(slot, pending.file_id, pending.tid)
+                .expect("File IRP drain IOSB owner disappeared");
+        }
+        if delivery_state & nt_io_manager::FILE_IRP_DRAIN_REPLY_PUBLISHED == 0 {
+            let cap = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
+                .claim_reply_cap_exact(slot, pending.file_id, pending.tid)
+                .expect("File IRP drain reply owner disappeared")
+                .expect("File IRP drain reply claimed without publication");
+            if pending.native_call_transport {
+                let _ = client_reply_on(cap, 1, 0, 0, 0, 0);
+            } else {
+                for index in 4..pending.reply_mrs.len() {
+                    set_reply_mr(index, pending.reply_mrs[index]);
+                }
+                let _ = client_reply_on(
+                    cap,
+                    18,
+                    0,
+                    pending.reply_mrs[1],
+                    pending.reply_mrs[2],
+                    pending.reply_mrs[3],
+                );
+            }
+            release_reply_pool_cap(cap);
+            thread_wait_state_clear_badge_ready(nt_handler, pending.badge);
+            (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
+                .mark_reply_published_exact(slot, pending.file_id, pending.tid)
+                .expect("File IRP drain reply publication owner disappeared");
+        }
+        let finished = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
+            .finish_exact(slot, pending.file_id, pending.tid)
+            .expect("completed File IRP drain owner did not retire");
+        nt_handler.release_file_reference(finished.file_id);
+        resumed += 1;
+    }
+    ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
+    ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
+    ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
+    ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
+    ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
+    ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
+    ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
+    nt_handler.pi = saved_pi;
+    nt_handler.loop_ctx = saved_ctx;
+    resumed
 }
 
 /// BATCH 34 — complete the pending async server `FSCTL_PIPE_LISTEN` for `server_fid` after a client

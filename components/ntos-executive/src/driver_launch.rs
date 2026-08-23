@@ -29315,6 +29315,44 @@ pub(crate) unsafe fn request_cancel_irp(irp_id: u64) -> Result<(), u32> {
     Ok(())
 }
 
+/// Request cancellation of the current thread's exact canonical File IRPs and return the manager's
+/// post-pump drain state. Caller-visible completion remains owned by each IRP's delivery record.
+pub(crate) unsafe fn cancel_file_thread_io(
+    file_id: u64,
+    requestor_tid: u64,
+) -> Result<nt_io_manager::FileThreadIrpDrainState, u32> {
+    if file_id == 0 {
+        return Err(STATUS_INVALID_PARAMETER as u32);
+    }
+    let io = io_manager_mut();
+    io.cancel_file_thread_io(
+        ClientId(IO_MANAGER_COMPONENT_ID),
+        FileId(file_id),
+        requestor_tid,
+    )
+    .map_err(|status| status.raw() as u32)?;
+    io.pump();
+    Ok(io.file_thread_io_drain_state(
+        ClientId(IO_MANAGER_COMPONENT_ID),
+        FileId(file_id),
+        requestor_tid,
+    ))
+}
+
+pub(crate) fn file_thread_io_drain_state(
+    file_id: u64,
+    requestor_tid: u64,
+) -> nt_io_manager::FileThreadIrpDrainState {
+    if file_id == 0 || requestor_tid == 0 {
+        return nt_io_manager::FileThreadIrpDrainState::default();
+    }
+    io_manager_mut().file_thread_io_drain_state(
+        ClientId(IO_MANAGER_COMPONENT_ID),
+        FileId(file_id),
+        requestor_tid,
+    )
+}
+
 pub(crate) fn pump_hosted_io_completions() -> usize {
     io_manager_mut().pump()
 }

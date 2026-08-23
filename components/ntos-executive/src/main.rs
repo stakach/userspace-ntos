@@ -2837,6 +2837,10 @@ static mut PENDING_FILE_IO: nt_io_manager::PendingFileIoTable =
 /// table owns lock policy; this table owns FIFO continuation identity and the retained route.
 static mut SYNCHRONOUS_FILE_WAITERS: nt_io_manager::SynchronousFileWaitTable =
     nt_io_manager::SynchronousFileWaitTable::new();
+/// Parked `NtCancelIoFile` callers waiting for the I/O Manager to retire every exact current-thread
+/// IRP after its original completion owner has published surfaces and acknowledged the backend.
+static mut PENDING_FILE_IRP_DRAINS: nt_io_manager::PendingFileIrpDrainTable =
+    nt_io_manager::PendingFileIrpDrainTable::new();
 /// A pending backend request could not transfer into its already-reserved generic owner. This is a
 /// fail-closed allocation/reply-cap path, never a compatibility fallback, and must remain zero.
 static PENDING_FILE_IO_TRANSFER_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -16001,6 +16005,7 @@ fn hosted_io_owner_tables_reset() -> bool {
         (&mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS)).reset()
             && (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO)).reset()
             && (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS)).reset()
+            && (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS)).reset()
     }
 }
 
@@ -21249,6 +21254,12 @@ struct ExecNtHandler {
     pending_file_io_reservation: Option<nt_io_manager::PendingFileIoReservation>,
     /// Contended synchronous File acquisition transferred into the FIFO owner at the reply site.
     pending_synchronous_file_wait: Option<nt_io_manager::SynchronousFileWaiter>,
+    /// `NtCancelIoFile` continuation reserved before cancellation and transferred into its drain
+    /// table only at the reply-capability park site.
+    pending_file_irp_drain: Option<(
+        nt_io_manager::PendingFileIrpDrain,
+        nt_io_manager::PendingFileIrpDrainReservation,
+    )>,
     /// ★ Dbgk TARGET-SIDE BLOCKING, SYSCALL flavour. Set by a debug-event post issued from a
     /// SYSCALL arm (`dbgk_module_load` — `DbgkMapViewOfSection`, which NT queues with flags 0 and
     /// therefore BLOCKS the mapping thread on the continue). The handler cannot park: the reply-cap

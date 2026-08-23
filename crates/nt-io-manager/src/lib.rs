@@ -18,6 +18,7 @@ use nt_status::NtStatus;
 use nt_types::{ClientId, NtPath, ObjectId};
 
 mod cancel;
+mod cancel_wait;
 mod close;
 mod complete;
 mod device;
@@ -42,6 +43,11 @@ mod store;
 mod synchronous_io;
 mod wdm_x64;
 
+pub use cancel::FileThreadIrpDrainState;
+pub use cancel_wait::{
+    PendingFileIrpDrain, PendingFileIrpDrainReservation, PendingFileIrpDrainTable,
+    FILE_IRP_DRAIN_IOSB_PUBLISHED, FILE_IRP_DRAIN_REPLY_CLAIMED, FILE_IRP_DRAIN_REPLY_PUBLISHED,
+};
 pub use complete::CompletedIrp;
 pub use device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
 pub use dispatch::{
@@ -2450,6 +2456,129 @@ mod tests {
         assert_eq!(om.next_completed_irp().unwrap().status, NtStatus::CANCELLED);
         om.acknowledge_completed_irp(irp).unwrap();
         assert!(om.irp(irp).is_none());
+    }
+
+    #[test]
+    fn cancel_file_thread_io_targets_exact_thread_and_drains_after_ack() {
+        let mut mock = MockDriverBackend::new();
+        mock.set_force_pending(true);
+        let (mut om, client, handle) = open_device_with(mock, AccessMask::GENERIC_READ);
+        let mut out = [0u8; 1];
+        assert_eq!(om.read(client, handle, 0, &mut out), Err(NtStatus::PENDING));
+        assert_eq!(om.read(client, handle, 1, &mut out), Err(NtStatus::PENDING));
+        assert_eq!(om.read(client, handle, 2, &mut out), Err(NtStatus::PENDING));
+        let first_file = om
+            .reference_open_file(client, handle, AccessMask::GENERIC_READ)
+            .unwrap()
+            .0;
+        let first_device = om.file(first_file).unwrap().device_id;
+        let driver = om.device(first_device).unwrap().driver_id;
+        let _second_device = om
+            .create_device(
+                driver,
+                Some(&path("\\Device\\Test1")),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let second_handle = om
+            .open(
+                client,
+                &path("\\Device\\Test1"),
+                AccessMask::GENERIC_READ,
+                ShareAccess::empty(),
+                CreateOptions::empty(),
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            om.read(client, second_handle, 0, &mut out),
+            Err(NtStatus::PENDING)
+        );
+        let irps = om.pending_irps();
+        let file_id = om.irp(irps[0]).unwrap().file_id.unwrap();
+        assert_eq!(file_id, first_file);
+        om.irp_mut(irps[0]).unwrap().requestor_tid = 100;
+        om.irp_mut(irps[1]).unwrap().requestor_tid = 100;
+        om.irp_mut(irps[2]).unwrap().requestor_tid = 200;
+        om.irp_mut(irps[3]).unwrap().requestor_tid = 100;
+        assert_ne!(om.irp(irps[3]).unwrap().file_id, Some(file_id));
+
+        let state = om.cancel_file_thread_io(client, file_id, 100).unwrap();
+        assert_eq!(state.total, 2);
+        assert_eq!(state.cancel_requested, 2);
+        assert_eq!(state.terminal_unacknowledged, 0);
+        assert_eq!(om.irp(irps[0]).unwrap().state, IrpState::CancelRequested);
+        assert_eq!(om.irp(irps[1]).unwrap().state, IrpState::CancelRequested);
+        assert_eq!(om.irp(irps[2]).unwrap().state, IrpState::Pending);
+        assert_eq!(om.irp(irps[3]).unwrap().state, IrpState::Pending);
+
+        assert_eq!(om.pump(), 2);
+        let state = om.file_thread_io_drain_state(client, file_id, 100);
+        assert_eq!(state.total, 2);
+        assert_eq!(state.cancel_requested, 0);
+        assert_eq!(state.terminal_unacknowledged, 2);
+        assert!([irps[0], irps[1]].contains(&om.next_completed_irp().unwrap().id));
+        om.acknowledge_completed_irp(irps[0]).unwrap();
+        assert!(!om
+            .file_thread_io_drain_state(client, file_id, 100)
+            .is_drained());
+        om.acknowledge_completed_irp(irps[1]).unwrap();
+        assert!(om
+            .file_thread_io_drain_state(client, file_id, 100)
+            .is_drained());
+        assert_eq!(om.irp(irps[2]).unwrap().state, IrpState::Pending);
+        assert_eq!(om.irp(irps[3]).unwrap().state, IrpState::Pending);
+    }
+
+    #[test]
+    fn cancel_file_thread_io_waits_for_normal_completion_ack() {
+        let mut mock = MockDriverBackend::new();
+        mock.set_force_pending(true);
+        mock.set_pending_completion(NtStatus::SUCCESS, 1);
+        let (mut om, client, irp) = pending_read(mock);
+        let file_id = om.irp(irp).unwrap().file_id.unwrap();
+        om.irp_mut(irp).unwrap().requestor_tid = 100;
+        assert_eq!(om.pump(), 1);
+        assert_eq!(om.irp(irp).unwrap().state, IrpState::Completed);
+
+        let state = om.cancel_file_thread_io(client, file_id, 100).unwrap();
+        assert_eq!(state.total, 1);
+        assert_eq!(state.cancel_requested, 0);
+        assert_eq!(state.terminal_unacknowledged, 1);
+        assert!(!state.is_drained());
+        assert_eq!(om.irp(irp).unwrap().status, NtStatus::SUCCESS);
+        om.acknowledge_completed_irp(irp).unwrap();
+        assert!(om
+            .file_thread_io_drain_state(client, file_id, 100)
+            .is_drained());
+    }
+
+    #[test]
+    fn cancel_file_thread_io_validates_identity_before_side_effects() {
+        let mut mock = MockDriverBackend::new();
+        mock.set_force_pending(true);
+        let (mut om, client, irp) = pending_read(mock);
+        let file_id = om.irp(irp).unwrap().file_id.unwrap();
+        om.irp_mut(irp).unwrap().requestor_tid = 100;
+        let other = om.register_client();
+
+        assert_eq!(
+            om.cancel_file_thread_io(client, file_id, 0),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        assert_eq!(
+            om.cancel_file_thread_io(other, file_id, 100),
+            Err(NtStatus::INVALID_HANDLE)
+        );
+        assert_eq!(om.irp(irp).unwrap().state, IrpState::Pending);
+        assert!(om
+            .cancel_file_thread_io(client, file_id, 200)
+            .unwrap()
+            .is_drained());
+        assert_eq!(om.irp(irp).unwrap().state, IrpState::Pending);
     }
 
     #[test]

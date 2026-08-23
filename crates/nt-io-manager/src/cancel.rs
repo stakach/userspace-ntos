@@ -10,9 +10,95 @@ use nt_types::ClientId;
 
 use crate::irp::{CancelState, IrpState};
 use crate::object_port::ObjectManagerPort;
-use crate::{DriverId, IoManager, IrpId};
+use crate::{DriverId, FileId, IoManager, IrpId};
+
+/// Canonical state of one thread's IRPs for one exact File generation. Terminal records remain in
+/// the drain until their completion owner acknowledges them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileThreadIrpDrainState {
+    pub total: usize,
+    pub cancel_requested: usize,
+    pub terminal_unacknowledged: usize,
+}
+
+impl FileThreadIrpDrainState {
+    pub const fn is_drained(self) -> bool {
+        self.total == 0
+    }
+}
 
 impl<P: ObjectManagerPort> IoManager<P> {
+    /// Request cancellation of every IRP issued by `requestor_tid` for one exact File. This is the
+    /// canonical `NtCancelIoFile` selection rule: other threads and other File generations are not
+    /// affected. Terminal, unacknowledged IRPs are counted but do not receive another cancellation
+    /// request, allowing the caller to drain through final completion publication and ACK.
+    pub fn cancel_file_thread_io(
+        &mut self,
+        client: ClientId,
+        file_id: FileId,
+        requestor_tid: u64,
+    ) -> Result<FileThreadIrpDrainState, NtStatus> {
+        if requestor_tid == 0 {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let file = self.file(file_id).ok_or(NtStatus::INVALID_HANDLE)?;
+        if file.client_id != client {
+            return Err(NtStatus::INVALID_HANDLE);
+        }
+        // Validate every target before the first state transition. Iteratively finding one Pending
+        // record avoids a per-syscall allocation; CancelRequested records already own their retry.
+        for (_, irp) in self.irps.iter().filter(|(_, irp)| {
+            irp.client_id == client
+                && irp.file_id == Some(file_id)
+                && irp.requestor_tid == requestor_tid
+                && matches!(irp.state, IrpState::Pending | IrpState::CancelRequested)
+        }) {
+            self.driver_backend_index(irp.driver_id)
+                .filter(|index| *index < self.backends.len())
+                .ok_or(NtStatus::INVALID_PARAMETER)?;
+        }
+        loop {
+            let next = {
+                self.irps.iter().find_map(|(irp_id, irp)| {
+                    (irp.client_id == client
+                        && irp.file_id == Some(file_id)
+                        && irp.requestor_tid == requestor_tid
+                        && irp.state == IrpState::Pending)
+                        .then_some(irp_id)
+                })
+            };
+            let Some(irp_id) = next else {
+                break;
+            };
+            self.cancel(client, irp_id)?;
+        }
+        Ok(self.file_thread_io_drain_state(client, file_id, requestor_tid))
+    }
+
+    /// Whether an exact current-thread File IRP still exists. Completed IRPs remain visible until
+    /// their owner acknowledges terminal delivery, which is the drain boundary required by
+    /// `NtCancelIoFile`.
+    pub fn file_thread_io_drain_state(
+        &self,
+        client: ClientId,
+        file_id: FileId,
+        requestor_tid: u64,
+    ) -> FileThreadIrpDrainState {
+        let mut state = FileThreadIrpDrainState::default();
+        for (_, irp) in self.irps.iter() {
+            if irp.client_id != client
+                || irp.file_id != Some(file_id)
+                || irp.requestor_tid != requestor_tid
+            {
+                continue;
+            }
+            state.total += 1;
+            state.cancel_requested += usize::from(irp.state == IrpState::CancelRequested);
+            state.terminal_unacknowledged += usize::from(irp.state.is_final());
+        }
+        state
+    }
+
     /// Request cancellation of an in-flight IRP owned by `client`. Unknown or
     /// already-terminal requests are successful no-ops; a different owner is
     /// denied.
