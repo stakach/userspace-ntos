@@ -136,7 +136,7 @@ pub struct IoManager<P> {
     files: GenStore<FileId, FileRecord>,
     irps: GenStore<IrpId, IrpRecord>,
     completed_irps: VecDeque<IrpId>,
-    abandoned_irps: Vec<IrpId>,
+    manager_owned_irps: Vec<IrpId>,
     cancel_dispatch_retries: Vec<IrpId>,
     rejected_completion_acks: Vec<(usize, IrpId)>,
     deferred_file_close_retries: Vec<FileId>,
@@ -154,7 +154,7 @@ impl<P> IoManager<P> {
             files: GenStore::new(),
             irps: GenStore::new(),
             completed_irps: VecDeque::new(),
-            abandoned_irps: Vec::new(),
+            manager_owned_irps: Vec::new(),
             cancel_dispatch_retries: Vec::new(),
             rejected_completion_acks: Vec::new(),
             deferred_file_close_retries: Vec::new(),
@@ -2973,6 +2973,13 @@ mod tests {
         reject_first_close: bool,
         close_attempts: usize,
         accepted_closes: usize,
+        pending_lifecycle: bool,
+        completion_ready: bool,
+        pending_irps: std::collections::VecDeque<IrpId>,
+        published_irp: Option<IrpId>,
+        fail_acknowledgements: usize,
+        acknowledgements: usize,
+        cancel_attempts: usize,
     }
 
     struct LifecycleDispatchBackend {
@@ -2994,6 +3001,12 @@ mod tests {
                 }
                 state.accepted_closes += 1;
             }
+            if state.pending_lifecycle
+                && matches!(irp.major, major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE)
+            {
+                state.pending_irps.push_back(irp.irp_id);
+                return Ok(DispatchOutcome::Pending);
+            }
             Ok(DispatchOutcome::Completed {
                 status: NtStatus::SUCCESS,
                 information: 0,
@@ -3002,7 +3015,38 @@ mod tests {
         }
 
         fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> {
+            self.state.borrow_mut().cancel_attempts += 1;
             Err(NtStatus::NOT_SUPPORTED)
+        }
+
+        fn poll_completion(&mut self) -> Option<DriverCompletion> {
+            let mut state = self.state.borrow_mut();
+            if !state.completion_ready || state.published_irp.is_some() {
+                return None;
+            }
+            let irp_id = state.pending_irps.pop_front()?;
+            state.completion_ready = false;
+            state.published_irp = Some(irp_id);
+            Some(DriverCompletion {
+                irp_id,
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: None,
+            })
+        }
+
+        fn acknowledge_completion(&mut self, irp_id: IrpId) -> Result<(), NtStatus> {
+            let mut state = self.state.borrow_mut();
+            if state.published_irp != Some(irp_id) {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            if state.fail_acknowledgements != 0 {
+                state.fail_acknowledgements -= 1;
+                return Err(NtStatus::DEVICE_NOT_READY);
+            }
+            state.published_irp = None;
+            state.acknowledgements += 1;
+            Ok(())
         }
     }
 
@@ -3061,6 +3105,79 @@ mod tests {
         let state = state.borrow();
         assert_eq!(state.close_attempts, 2);
         assert_eq!(state.accepted_closes, 1);
+    }
+
+    #[test]
+    fn pending_external_lifecycle_completes_without_cancellation() {
+        let state = std::rc::Rc::new(std::cell::RefCell::new(LifecycleDispatchState {
+            pending_lifecycle: true,
+            ..LifecycleDispatchState::default()
+        }));
+        let (mut om, client, _handle, file_id) = lifecycle_device(state.clone());
+
+        om.release_external_file(client, file_id).unwrap();
+        assert_eq!(om.file(file_id).unwrap().state, FileState::CleanupPending);
+        assert_eq!(om.pending_irps().len(), 1);
+        assert_eq!(state.borrow().cancel_attempts, 0);
+
+        state.borrow_mut().completion_ready = true;
+        assert_eq!(om.pump(), 1);
+        assert_eq!(om.file(file_id).unwrap().state, FileState::ClosePending);
+        assert_eq!(om.pending_irps().len(), 1);
+        assert!(om.next_completed_irp().is_none());
+        assert_eq!(state.borrow().acknowledgements, 1);
+        assert_eq!(state.borrow().cancel_attempts, 0);
+
+        state.borrow_mut().completion_ready = true;
+        assert_eq!(om.pump(), 1);
+        assert!(om.file(file_id).is_none());
+        assert_eq!(om.irp_count(), 0);
+        assert!(om.next_completed_irp().is_none());
+        let state = state.borrow();
+        assert_eq!(state.acknowledgements, 2);
+        assert_eq!(state.cancel_attempts, 0);
+        assert_eq!(
+            state.majors,
+            std::vec![
+                major::IRP_MJ_CREATE,
+                major::IRP_MJ_CLEANUP,
+                major::IRP_MJ_CLOSE
+            ]
+        );
+    }
+
+    #[test]
+    fn pending_lifecycle_ack_failure_preserves_exact_owner_for_retry() {
+        let state = std::rc::Rc::new(std::cell::RefCell::new(LifecycleDispatchState {
+            pending_lifecycle: true,
+            fail_acknowledgements: 1,
+            ..LifecycleDispatchState::default()
+        }));
+        let (mut om, client, _handle, file_id) = lifecycle_device(state.clone());
+
+        om.release_external_file(client, file_id).unwrap();
+        let cleanup_irp = om.pending_irps()[0];
+        state.borrow_mut().completion_ready = true;
+        assert_eq!(om.pump(), 1);
+        assert_eq!(
+            om.completed_irp(cleanup_irp).unwrap().major,
+            major::IRP_MJ_CLEANUP
+        );
+        assert_eq!(om.file(file_id).unwrap().state, FileState::CleanupPending);
+        assert_eq!(state.borrow().acknowledgements, 0);
+        assert_eq!(state.borrow().cancel_attempts, 0);
+
+        assert_eq!(om.pump(), 0);
+        assert!(om.irp(cleanup_irp).is_none());
+        assert_eq!(om.file(file_id).unwrap().state, FileState::ClosePending);
+        assert_eq!(state.borrow().acknowledgements, 1);
+        assert_eq!(state.borrow().cancel_attempts, 0);
+
+        state.borrow_mut().completion_ready = true;
+        assert_eq!(om.pump(), 1);
+        assert!(om.file(file_id).is_none());
+        assert_eq!(state.borrow().acknowledgements, 2);
+        assert_eq!(state.borrow().cancel_attempts, 0);
     }
 
     #[test]

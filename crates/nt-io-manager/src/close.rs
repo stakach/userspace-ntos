@@ -19,7 +19,7 @@ use crate::{FileId, IoManager, IrpId};
 
 enum LifecycleDispatch {
     Completed(Result<u64, NtStatus>),
-    Pending(IrpId),
+    Pending,
 }
 
 impl<P: ObjectManagerPort> IoManager<P> {
@@ -107,7 +107,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 file.transition(FileState::CleanupComplete);
                 result.map(|_| ())
             }
-            Ok(LifecycleDispatch::Pending(_)) => {
+            Ok(LifecycleDispatch::Pending) => {
                 self.file_mut(file_id)
                     .expect("pending cleanup keeps file live")
                     .cleanup_dispatched = true;
@@ -162,11 +162,10 @@ impl<P: ObjectManagerPort> IoManager<P> {
                         file.cleanup_dispatched = true;
                         file.transition(FileState::CleanupComplete);
                     }
-                    LifecycleDispatch::Pending(irp_id) => {
+                    LifecycleDispatch::Pending => {
                         self.file_mut(file_id)
                             .expect("pending cleanup keeps file live")
                             .cleanup_dispatched = true;
-                        self.abandon_irp_delivery(client, irp_id)?;
                         return Ok(());
                     }
                 }
@@ -218,13 +217,12 @@ impl<P: ObjectManagerPort> IoManager<P> {
                     .expect("close keeps file live")
                     .close_dispatched = true;
             }
-            LifecycleDispatch::Pending(irp_id) => {
+            LifecycleDispatch::Pending => {
                 let file = self
                     .file_mut(file_id)
                     .expect("pending close keeps file live");
                 file.close_dispatched = true;
                 file.close_deferred = true;
-                self.abandon_irp_delivery(client, irp_id)?;
                 return Ok(());
             }
         }
@@ -252,6 +250,10 @@ impl<P: ObjectManagerPort> IoManager<P> {
         major: u8,
         parameters: IoParameters,
     ) -> Result<LifecycleDispatch, NtStatus> {
+        // Lifecycle completions have no external delivery consumer. Reserve
+        // manager ownership before crossing the driver boundary so a pending
+        // result can never be stranded by a later allocation failure.
+        self.reserve_manager_owned_irp_slot()?;
         let driver_id = self
             .device(device_id)
             .ok_or(NtStatus::INVALID_PARAMETER)?
@@ -279,7 +281,8 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .irp(irp_id)
             .is_none_or(|irp| irp.state != IrpState::Dispatched)
         {
-            return Ok(LifecycleDispatch::Pending(irp_id));
+            self.claim_manager_owned_irp(client, irp_id)?;
+            return Ok(LifecycleDispatch::Pending);
         }
 
         match outcome {
@@ -289,7 +292,8 @@ impl<P: ObjectManagerPort> IoManager<P> {
             }
             Ok(outcome @ DispatchOutcome::Pending) => {
                 let _ = self.complete_sync(irp_id, Ok(outcome));
-                Ok(LifecycleDispatch::Pending(irp_id))
+                self.claim_manager_owned_irp(client, irp_id)?;
+                Ok(LifecycleDispatch::Pending)
             }
             Ok(outcome) => {
                 let result = self.complete_sync(irp_id, Ok(outcome));
@@ -332,6 +336,12 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .map(|(id, _)| id)
             .collect();
         for id in irps {
+            if self
+                .irp(id)
+                .is_some_and(|irp| matches!(irp.major, major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE))
+            {
+                continue;
+            }
             self.abandon_irp_delivery(client, id)?;
         }
         let files: Vec<FileId> = self

@@ -145,6 +145,20 @@ impl<P: ObjectManagerPort> IoManager<P> {
         client: ClientId,
         irp_id: IrpId,
     ) -> Result<(), NtStatus> {
+        self.claim_manager_owned_irp(client, irp_id)?;
+        self.cancel(client, irp_id)?;
+        self.reap_manager_owned_completions();
+        Ok(())
+    }
+
+    /// Transfer terminal-delivery ownership for one exact IRP to the manager.
+    /// This does not request cancellation; lifecycle IRPs use it so pending
+    /// CLEANUP/CLOSE work can finish normally without a user-facing consumer.
+    pub(crate) fn claim_manager_owned_irp(
+        &mut self,
+        client: ClientId,
+        irp_id: IrpId,
+    ) -> Result<(), NtStatus> {
         let owner = match self.irp(irp_id) {
             Some(irp) => irp.client_id,
             None => return Ok(()),
@@ -152,12 +166,19 @@ impl<P: ObjectManagerPort> IoManager<P> {
         if owner != client {
             return Err(NtStatus::ACCESS_DENIED);
         }
-        if !self.abandoned_irps.contains(&irp_id) {
-            self.abandoned_irps.push(irp_id);
+        if !self.manager_owned_irps.contains(&irp_id) {
+            self.manager_owned_irps
+                .try_reserve(1)
+                .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+            self.manager_owned_irps.push(irp_id);
         }
-        self.cancel(client, irp_id)?;
-        self.reap_abandoned_completions();
         Ok(())
+    }
+
+    pub(crate) fn reserve_manager_owned_irp_slot(&mut self) -> Result<(), NtStatus> {
+        self.manager_owned_irps
+            .try_reserve(1)
+            .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)
     }
 
     fn driver_backend_index(&self, driver_id: DriverId) -> Option<usize> {

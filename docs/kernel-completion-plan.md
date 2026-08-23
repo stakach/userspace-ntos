@@ -10613,3 +10613,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `PendingFileIo`, route root `FSCTL_PIPE_WAIT` through its canonical hosted File/device boundary,
     delete both compatibility wait tables, and replace the explicit 16 KiB hosted control-buffer
     limit with growable or banked transport.
+
+    Lifecycle completion-ownership prerequisite (2026-08-23): pending `IRP_MJ_CLEANUP` and
+    `IRP_MJ_CLOSE` no longer enter the abandoned-consumer cancellation path. The I/O Manager now
+    distinguishes terminal results that it owns from the reason it assumed ownership: an abandoned
+    ordinary request is still cancelled and then ACKed, while an accepted lifecycle request is
+    allowed to complete normally and is internally ACKed exactly once. Lifecycle dispatch reserves
+    the growable ownership slot before crossing the driver boundary, so a pending result cannot be
+    stranded by a post-dispatch allocation failure. The reaper walks the live owner set in place
+    rather than cloning it, preserves an exact terminal IRP when the backend rejects an ACK, and can
+    advance pending CLEANUP into pending CLOSE during the same ownership pass. Client disconnect no
+    longer reclassifies an already manager-owned lifecycle IRP as abandoned or requests its
+    cancellation. Pending CREATE rollback remains an abandoned-consumer path because no handle was
+    published and that exact create request must be cancelled and drained.
+
+    Focused `nt-io-manager` validation is green at `178/178`. New retained-backend tests prove
+    `CREATE -> pending CLEANUP -> pending CLOSE`, zero lifecycle cancel calls, no user-visible
+    completion leakage after successful ACK, canonical File retention through both pending stages,
+    final File retirement only after CLOSE ACK, and exact retry after a rejected CLEANUP ACK. This is
+    a prerequisite correction, not the last-handle ordering claim: the executive still dispatches
+    CLEANUP before acquiring the synchronous File Busy owner.
+
+    Review adjustment: keep the existing lifecycle order. First make newly queued APCs remove only
+    alertable pre-dispatch acquisition waiters. Then make APC interruption of one already-pending
+    synchronous request cancel that exact `IrpId`, wait non-alertably for its real terminal result,
+    and deliver the APC with that status. Finally transfer the last handle reference into a cleanup
+    owner and place CLEANUP behind ordinary operations in the same File FIFO; lifecycle IRPs can now
+    pend there without being cancelled by the manager. LISTEN, root WAIT, and the control-buffer
+    transport cleanup remain after those three owners are complete.

@@ -37,7 +37,7 @@ pub struct CompletedIrp {
 
 impl<P: ObjectManagerPort> IoManager<P> {
     /// Drain every driver backend's ready completions. Deliverable records are
-    /// published in arrival order; explicitly abandoned records are ACKed and
+    /// published in arrival order; manager-owned records are ACKed and
     /// reclaimed after their terminal result arrives.
     pub fn pump(&mut self) -> usize {
         let mut progress = self.retry_cancel_dispatches()
@@ -62,7 +62,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             }
         }
         progress += self.detect_driver_faults();
-        self.reap_abandoned_completions();
+        self.reap_manager_owned_completions();
         progress += self.retry_disconnected_clients();
         progress
     }
@@ -348,22 +348,19 @@ impl<P: ObjectManagerPort> IoManager<P> {
         Ok(completed)
     }
 
-    pub(crate) fn reap_abandoned_completions(&mut self) {
-        let abandoned = self.abandoned_irps.clone();
-        for irp_id in abandoned {
+    pub(crate) fn reap_manager_owned_completions(&mut self) {
+        let mut index = 0;
+        while index < self.manager_owned_irps.len() {
+            let irp_id = self.manager_owned_irps[index];
             let terminal = self
                 .irp(irp_id)
                 .is_none_or(|irp| irp.state == IrpState::Completed);
             if terminal
                 && (self.irp(irp_id).is_none() || self.acknowledge_completed_irp(irp_id).is_ok())
             {
-                if let Some(index) = self
-                    .abandoned_irps
-                    .iter()
-                    .position(|candidate| *candidate == irp_id)
-                {
-                    self.abandoned_irps.swap_remove(index);
-                }
+                self.manager_owned_irps.swap_remove(index);
+            } else {
+                index += 1;
             }
         }
     }
