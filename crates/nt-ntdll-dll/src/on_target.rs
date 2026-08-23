@@ -4492,6 +4492,7 @@ unsafe fn native_syscall8(
             "mov [rsp+0x38], rax",
             "mov rax, [{req} + 0x30]",          // a8
             "mov [rsp+0x40], rax",
+            "2:",
             "mov r10, [{req} + 0x00]",          // MR0 = SSN
             "mov r9,  [{req} + 0x08]",          // MR2 = a1
             "mov r15, [{req} + 0x10]",          // MR3 = a2
@@ -4500,10 +4501,14 @@ unsafe fn native_syscall8(
             "mov esi, 0x04E54006",              // rsi = (0x4E54<<12)|6 = label 0x4E54, length 6
             "mov rdx, -1",                      // rdx = SysCall
             "syscall",
+            "movabs rax, {retry_reply}",
+            "cmp r10, rax",
+            "je 2b",
             "add rsp, 0x48",
             "mov {status}, r10",                // reply MR0 = NTSTATUS (IPC return ABI: r10)
             req = in(reg) req.as_ptr(),
             status = out(reg) status,
+            retry_reply = const nt_ntdll::abi::NT_NATIVE_RETRY_REPLY,
             out("rax") _, out("rcx") _, out("r11") _, out("r8") _, out("r9") _,
             out("r10") _, out("rsi") _, out("rdi") _, out("rdx") _, out("r15") _,
         );
@@ -4562,6 +4567,7 @@ unsafe fn native_map_view(a1: u64, a2: u64, a3: u64, a4: u64, tail: [u64; 6]) ->
             "mov [rsp+0x48], rax",
             "mov rax, [{req} + 0x40]", // tail[5] (a10)
             "mov [rsp+0x50], rax",
+            "2:",
             "mov r10, [{req} + 0x00]", // MR0 = SSN
             "mov r9,  [{req} + 0x08]", // MR2 = a1
             "mov r15, [{req} + 0x10]", // MR3 = a2
@@ -4570,10 +4576,14 @@ unsafe fn native_map_view(a1: u64, a2: u64, a3: u64, a4: u64, tail: [u64; 6]) ->
             "mov esi, 0x04E54006",     // rsi = (0x4E54<<12)|6
             "mov rdx, -1",             // rdx = SysCall
             "syscall",
+            "movabs rax, {retry_reply}",
+            "cmp r10, rax",
+            "je 2b",
             "add rsp, 0x58",
             "mov {status}, r10",
             req = in(reg) req.as_ptr(),
             status = out(reg) status,
+            retry_reply = const nt_ntdll::abi::NT_NATIVE_RETRY_REPLY,
             out("rax") _, out("rcx") _, out("r11") _, out("r8") _, out("r9") _,
             out("r10") _, out("rsi") _, out("rdi") _, out("rdx") _, out("r15") _,
         );
@@ -4629,6 +4639,7 @@ unsafe fn native_secure_connect_port(a1: u64, a2: u64, a3: u64, a4: u64, tail: [
             "mov [rsp+0x40], rax",
             "mov rax, [{req} + 0x38]", // tail[4] (a9 = ConnectionInformationLength)
             "mov [rsp+0x48], rax",
+            "2:",
             "mov r10, [{req} + 0x00]", // MR0 = SSN
             "mov r9,  [{req} + 0x08]", // MR2 = a1
             "mov r15, [{req} + 0x10]", // MR3 = a2
@@ -4637,10 +4648,14 @@ unsafe fn native_secure_connect_port(a1: u64, a2: u64, a3: u64, a4: u64, tail: [
             "mov esi, 0x04E54006",     // rsi = (0x4E54<<12)|6
             "mov rdx, -1",             // rdx = SysCall
             "syscall",
+            "movabs rax, {retry_reply}",
+            "cmp r10, rax",
+            "je 2b",
             "add rsp, 0x58",
             "mov {status}, r10",
             req = in(reg) req.as_ptr(),
             status = out(reg) status,
+            retry_reply = const nt_ntdll::abi::NT_NATIVE_RETRY_REPLY,
             out("rax") _, out("rcx") _, out("r11") _, out("r8") _, out("r9") _,
             out("r10") _, out("rsi") _, out("rdi") _, out("rdx") _, out("r15") _,
         );

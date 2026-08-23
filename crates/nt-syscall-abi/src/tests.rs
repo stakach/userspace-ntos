@@ -252,3 +252,9 @@ fn native_worker_ipc_buffers_are_distinct() {
         }
     }
 }
+
+#[test]
+fn native_retry_reply_cannot_alias_an_ntstatus() {
+    assert!(NT_NATIVE_RETRY_REPLY > u32::MAX as u64);
+    assert_ne!(NT_NATIVE_RETRY_REPLY >> 32, 0);
+}

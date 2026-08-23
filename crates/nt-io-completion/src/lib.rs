@@ -37,6 +37,27 @@ pub enum FileIoMode {
 }
 
 impl FileIoMode {
+    pub const fn from_create_flags(
+        alertable: bool,
+        nonalertable: bool,
+        synchronize_access: bool,
+    ) -> Result<Self, u32> {
+        if alertable && nonalertable {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if !alertable && !nonalertable {
+            return Ok(Self::Asynchronous);
+        }
+        if !synchronize_access {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok(if alertable {
+            Self::SynchronousAlertable
+        } else {
+            Self::SynchronousNonAlertable
+        })
+    }
+
     pub const fn is_synchronous(self) -> bool {
         !matches!(self, Self::Asynchronous)
     }
@@ -1436,6 +1457,26 @@ mod tests {
         assert_eq!(files.io_mode(20), Ok(FileIoMode::SynchronousAlertable));
         assert_eq!(files.is_synchronous(20), Ok(true));
         assert_eq!(files.io_mode(30), Ok(FileIoMode::SynchronousNonAlertable));
+        assert_eq!(
+            FileIoMode::from_create_flags(true, false, true),
+            Ok(FileIoMode::SynchronousAlertable)
+        );
+        assert_eq!(
+            FileIoMode::from_create_flags(false, true, true),
+            Ok(FileIoMode::SynchronousNonAlertable)
+        );
+        assert_eq!(
+            FileIoMode::from_create_flags(false, false, false),
+            Ok(FileIoMode::Asynchronous)
+        );
+        assert_eq!(
+            FileIoMode::from_create_flags(true, true, true),
+            Err(STATUS_INVALID_PARAMETER)
+        );
+        assert_eq!(
+            FileIoMode::from_create_flags(true, false, false),
+            Err(STATUS_INVALID_PARAMETER)
+        );
     }
 
     #[test]

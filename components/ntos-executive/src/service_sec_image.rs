@@ -8944,7 +8944,12 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_io_completion_apc_out: u64 = 0;
             let mut park_io_completion_iosb_out: u64 = 0;
             let mut park_io_completion_deadline: Option<u64> = None;
-            let mut transfer_pending_file_io: Option<(nt_io_manager::PendingFileIo, bool)> = None;
+            let mut transfer_pending_file_io: Option<(
+                nt_io_manager::PendingFileIo,
+                bool,
+                nt_io_manager::PendingFileIoReservation,
+            )> = None;
+            let mut synchronous_file_wait_parked = false;
             let mut park_pipe_name_wait_root_handle: u64 = 0;
             let mut park_pipe_name_wait_hash: u64 = 0;
             let mut park_pipe_name_wait_iosb_va: u64 = 0;
@@ -8976,6 +8981,12 @@ pub(crate) unsafe fn service_sec_image(
             nt_handler.current_resume_ip = resume_ip;
             nt_handler.current_sp = sp;
             nt_handler.current_flags = flags;
+            nt_handler.current_service_number = m0 as u32;
+            nt_handler.current_native_call_transport = native_call_transport;
+            nt_handler.current_synchronous_file_lock = 0;
+            nt_handler.active_synchronous_file_retry =
+                (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
+                    .take_promoted(pi as u32, current_tid, badge, m0 as u32);
             // SEAM: if this SSN is in the real service table, dispatch it through the NT syscall
             // dispatcher -> real handler; otherwise fall through to the broker match. The x64 native
             // ABI passes args in r10(=rcx),rdx,r8,r9 then the stack; here we forward the register
@@ -9048,8 +9059,13 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.io_completion_timeout = PendingWaitTimeout::none();
                 nt_handler.io_completion_wake = None;
                 nt_handler.io_signal_event = -1;
+                assert!(
+                    nt_handler.pending_file_io_reservation.is_none(),
+                    "previous syscall leaked a pending File owner reservation"
+                );
                 nt_handler.pending_file_io_transfer = None;
                 nt_handler.pending_file_io_wait = false;
+                nt_handler.pending_synchronous_file_wait = None;
                 nt_handler.dbgk_block_request = false;
                 nt_handler.pipe_endpoint_progress = false;
                 nt_handler.pipe_listen_fid = 0;
@@ -9711,10 +9727,92 @@ pub(crate) unsafe fn service_sec_image(
                     let _ = wait_wake_dispatcher_set(&mut nt_handler);
                 }
                 if nt_handler.pending_file_io_transfer.is_some() {
-                    transfer_pending_file_io = nt_handler
+                    if nt_handler.current_synchronous_file_lock != 0 {
+                        let pending = nt_handler
+                            .pending_file_io_transfer
+                            .as_mut()
+                            .expect("pending File lock owner disappeared");
+                        assert_eq!(pending.file_id, nt_handler.current_synchronous_file_lock);
+                        pending.sync_lock_owner_tid = nt_handler.current_tid;
+                        nt_handler.current_synchronous_file_lock = 0;
+                    }
+                    let mut pending = nt_handler
                         .pending_file_io_transfer
                         .take()
-                        .map(|pending| (pending, nt_handler.pending_file_io_wait));
+                        .expect("pending File transfer disappeared");
+                    if nt_handler.pending_file_io_wait {
+                        pending.native_call_transport = native_call_transport;
+                        if !native_call_transport {
+                            pending.reply_mrs = syscall_reply_context.regs;
+                        }
+                    }
+                    let reservation = nt_handler
+                        .pending_file_io_reservation
+                        .take()
+                        .expect("pending File IRP has no pre-dispatch owner reservation");
+                    transfer_pending_file_io = Some((
+                        pending,
+                        nt_handler.pending_file_io_wait,
+                        reservation,
+                    ));
+                } else if let Some(reservation) =
+                    nt_handler.pending_file_io_reservation.take()
+                {
+                    assert!(
+                        (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                            .cancel_reservation(reservation),
+                        "unused pending File reservation became stale"
+                    );
+                }
+                if let Some(mut waiter) = nt_handler.pending_synchronous_file_wait.take() {
+                    // Publish the exact FIFO owner before any post-dispatch completion can release
+                    // the current Busy owner and inspect the policy waiter count.
+                    if waiter.native_call_transport {
+                        waiter.reply_mrs[0] = waiter.service_number as u64;
+                        waiter.reply_mrs[1] = sp;
+                        waiter.reply_mrs[2] = argv[0];
+                        waiter.reply_mrs[3] = argv[1];
+                        waiter.reply_mrs[4] = argv[2];
+                        waiter.reply_mrs[5] = argv[3];
+                    } else {
+                        waiter.reply_mrs = syscall_reply_context.regs;
+                    }
+                    if synchronous_file_wait_park(waiter) {
+                        synchronous_file_wait_parked = true;
+                        trace_indefinite_wait_park(
+                            &nt_handler,
+                            badge,
+                            live_top_badges(&nt_handler),
+                            crash_parked,
+                            wait_parked,
+                        );
+                        mark_wait_parked!(pi, resume_ip);
+                    } else {
+                        PENDING_FILE_IO_TRANSFER_FAILURES.fetch_add(1, Ordering::Relaxed);
+                        let _ = nt_handler.file_completion.cancel_io_waiter(waiter.file_id);
+                        nt_handler.release_file_reference(waiter.file_id);
+                        result = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES as u64;
+                    }
+                }
+                if let Some(stale_grant) = nt_handler.active_synchronous_file_retry.take() {
+                    let _ = nt_handler
+                        .file_completion
+                        .cancel_promoted_io(stale_grant.file_id, stale_grant.tid);
+                    nt_handler.release_file_reference(stale_grant.file_id);
+                    let _ = synchronous_file_wake_next(&mut nt_handler, stale_grant.file_id);
+                }
+                if nt_handler.current_synchronous_file_lock != 0 {
+                    let file_id = core::mem::replace(
+                        &mut nt_handler.current_synchronous_file_lock,
+                        0,
+                    );
+                    let owner_tid = nt_handler.current_tid;
+                    let _ = synchronous_file_release_and_wake(
+                        &mut nt_handler,
+                        file_id,
+                        owner_tid,
+                    );
+                    nt_handler.release_file_reference(file_id);
                 }
                 if nt_handler.user_timer_rearm_requested {
                     delay_timer_rearm(delay_queue);
@@ -15918,56 +16016,58 @@ pub(crate) unsafe fn service_sec_image(
                     result = 0xC000_009A;
                 }
             }
+            // A contended synchronous File has referenced its canonical route but has not created
+            // an IRP. Transfer the live syscall reply into the FIFO acquisition owner.
+            if synchronous_file_wait_parked {
+                pin_durable_table_growth_if_dirty(&mut heap_mark);
+                let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                badge = nb;
+                mi = nmi;
+                m0 = nm0;
+                m1 = nm1;
+                m2 = nm2;
+                m3 = nm3;
+                continue;
+            }
             // Transfer each general pending File IRP before the specialized endpoint waiters.
             // Synchronous APIs/Files transfer the live reply cap and wait; asynchronous Files keep
             // the caller's STATUS_PENDING reply and transfer only their terminal delivery owner.
-            if let Some((pending, wait_for_completion)) = transfer_pending_file_io.take() {
-                if pending_file_io_transfer(
+            if let Some((pending, wait_for_completion, reservation)) =
+                transfer_pending_file_io.take()
+            {
+                pending_file_io_transfer(
                     pending,
                     wait_for_completion,
+                    reservation,
                     resume_ip,
                     sp,
                     flags,
-                ) {
-                    // The manager may already hold the terminal result (for example a completion
-                    // published during the post-dispatch pump before reply ownership moved here).
-                    let delivered = pending_file_io_redrive_all(&mut nt_handler);
-                    if wait_for_completion && delivered == 0 {
-                        trace_indefinite_wait_park(
-                            &nt_handler,
-                            badge,
-                            live_top_badges(&nt_handler),
-                            crash_parked,
-                            wait_parked,
-                        );
-                        mark_wait_parked!(pi, resume_ip);
-                    }
-                    if wait_for_completion {
-                        pin_durable_table_growth_if_dirty(&mut heap_mark);
-                        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                        let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
-                        badge = nb;
-                        mi = nmi;
-                        m0 = nm0;
-                        m1 = nm1;
-                        m2 = nm2;
-                        m3 = nm3;
-                        continue;
-                    }
-                } else {
-                    PENDING_FILE_IO_TRANSFER_FAILURES.fetch_add(1, Ordering::Relaxed);
-                    let _ = driver_launch::abandon_pending_irp(pending.irp_id);
-                    result = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES as u64;
-                    if let nt_io_manager::PendingFileIoOperation::Create(create) = pending.operation
-                    {
-                        let _ = nt_handler.xas_try_write_buf(create.handle_va, &0u64.to_le_bytes());
-                        nt_handler.release_unpublished_hosted_create(pending);
-                    } else {
-                        nt_handler.release_file_reference(pending.file_id);
-                    }
-                    if pending.iosb_va != 0 {
-                        let _ = nt_handler.write_current_iosb(pending.iosb_va, result as u32, 0);
-                    }
+                );
+                if wait_for_completion {
+                    trace_indefinite_wait_park(
+                        &nt_handler,
+                        badge,
+                        live_top_badges(&nt_handler),
+                        crash_parked,
+                        wait_parked,
+                    );
+                    mark_wait_parked!(pi, resume_ip);
+                }
+                // The manager may already hold the terminal result (for example a completion
+                // published during the post-dispatch pump before reply ownership moved here).
+                let _ = pending_file_io_redrive_all(&mut nt_handler);
+                if wait_for_completion {
+                    pin_durable_table_growth_if_dirty(&mut heap_mark);
+                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                    badge = nb;
+                    mi = nmi;
+                    m0 = nm0;
+                    m1 = nm1;
+                    m2 = nm2;
+                    m3 = nm3;
+                    continue;
                 }
             }
             if park_pipe_name_wait_hash != 0 && reply_main != 0 {
@@ -22707,22 +22807,9 @@ unsafe fn lsa_deliver_reply(nt_handler: &mut ExecNtHandler, replymsg: u64) -> bo
 
 /// Transfer one general File syscall into its exact pending-IRP delivery owner. Synchronous
 /// operations also move the live syscall reply into that owner; asynchronous operations do not.
-unsafe fn pending_file_io_transfer(
-    mut pending: nt_io_manager::PendingFileIo,
-    wait_for_completion: bool,
-    resume_ip: u64,
-    sp: u64,
-    flags: u64,
+unsafe fn synchronous_file_wait_park(
+    mut waiter: nt_io_manager::SynchronousFileWaiter,
 ) -> bool {
-    if !wait_for_completion {
-        let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
-        let old_capacity = table.capacity();
-        let parked = table.park(pending).is_some();
-        if parked && table.capacity() != old_capacity {
-            mark_durable_table_growth_dirty();
-        }
-        return parked;
-    }
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     if stolen == 0 {
         return false;
@@ -22730,14 +22817,10 @@ unsafe fn pending_file_io_transfer(
     let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
         return false;
     };
-    pending.reply_cap = stolen;
-    pending.reply_required = true;
-    pending.resume_ip = resume_ip;
-    pending.resume_sp = sp;
-    pending.resume_flags = flags;
-    let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
+    waiter.reply_cap = stolen;
+    let table = &mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS);
     let old_capacity = table.capacity();
-    if table.park(pending).is_none() {
+    if table.park(waiter).is_none() {
         return false;
     }
     if table.capacity() != old_capacity {
@@ -22746,6 +22829,131 @@ unsafe fn pending_file_io_transfer(
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
     true
+}
+
+pub(crate) unsafe fn synchronous_file_wake_next(
+    nt_handler: &mut ExecNtHandler,
+    file_id: u64,
+) -> bool {
+    let mut handled = false;
+    loop {
+        let table = &mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS);
+        let Some((slot, waiter)) = table.oldest_waiting_for_file(file_id) else {
+            return handled;
+        };
+        nt_handler
+            .file_completion
+            .promote_io_waiter(file_id, waiter.tid)
+            .expect("synchronous File waiter count lost its FIFO owner");
+        let promoted = table
+            .promote_exact(slot, file_id, waiter.tid)
+            .expect("synchronous File FIFO promotion lost exact waiter");
+        let replied = if promoted.native_call_transport {
+            set_reply_mr(4, promoted.reply_mrs[4]);
+            set_reply_mr(5, promoted.reply_mrs[5]);
+            client_reply_on(
+                promoted.reply_cap,
+                6,
+                nt_syscall_abi::NT_NATIVE_RETRY_REPLY,
+                promoted.reply_mrs[1],
+                promoted.reply_mrs[2],
+                promoted.reply_mrs[3],
+            )
+        } else {
+            for index in 4..15 {
+                set_reply_mr(index, promoted.reply_mrs[index]);
+            }
+            set_reply_mr(15, promoted.retry_ip);
+            set_reply_mr(16, promoted.resume_sp);
+            set_reply_mr(17, promoted.resume_flags);
+            client_reply_on(
+                promoted.reply_cap,
+                18,
+                promoted.service_number as u64,
+                promoted.reply_mrs[1],
+                promoted.reply_mrs[2],
+                promoted.reply_mrs[3],
+            )
+        };
+        release_reply_pool_cap(promoted.reply_cap);
+        handled = true;
+        if replied {
+            thread_wait_state_clear_badge_ready(nt_handler, promoted.badge);
+            table
+                .mark_retry_replied_exact(slot, file_id, promoted.tid)
+                .expect("promoted synchronous File reply owner disappeared");
+            return true;
+        }
+
+        table
+            .take_exact(slot, file_id, promoted.tid)
+            .expect("failed synchronous File reply lost its promoted owner");
+        let release = nt_handler
+            .file_completion
+            .cancel_promoted_io(file_id, promoted.tid)
+            .expect("failed synchronous File reply lost its policy grant");
+        nt_handler.release_file_reference(file_id);
+        if release.waiters == 0 {
+            return true;
+        }
+    }
+}
+
+pub(crate) unsafe fn synchronous_file_release_and_wake(
+    nt_handler: &mut ExecNtHandler,
+    file_id: u64,
+    owner_tid: u64,
+) -> bool {
+    let release = nt_handler
+        .file_completion
+        .release_io(file_id, owner_tid)
+        .expect("synchronous File lock released by a stale owner");
+    if release.waiters == 0 {
+        false
+    } else {
+        assert!(
+            synchronous_file_wake_next(nt_handler, file_id),
+            "synchronous File waiter count has no FIFO owner"
+        );
+        true
+    }
+}
+
+unsafe fn pending_file_io_transfer(
+    mut pending: nt_io_manager::PendingFileIo,
+    wait_for_completion: bool,
+    reservation: nt_io_manager::PendingFileIoReservation,
+    resume_ip: u64,
+    sp: u64,
+    flags: u64,
+) {
+    if !wait_for_completion {
+        let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
+        table
+            .park_reserved(reservation, pending)
+            .expect("pre-dispatch pending File reservation rejected its exact IRP");
+        return;
+    }
+    let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    assert_ne!(stolen, 0, "pending File reply cap disappeared after preflight");
+    let (fresh_index, fresh) =
+        wait_reply_pool_find_free().expect("pending File reply-pool claim disappeared after preflight");
+    pending.reply_cap = stolen;
+    pending.reply_required = true;
+    pending.resume_ip = resume_ip;
+    pending.resume_sp = sp;
+    pending.resume_flags = flags;
+    if !pending.native_call_transport {
+        pending.reply_mrs[15] = resume_ip;
+        pending.reply_mrs[16] = sp;
+        pending.reply_mrs[17] = flags;
+    }
+    let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
+    table
+        .park_reserved(reservation, pending)
+        .expect("pre-dispatch pending File reservation rejected its synchronous IRP");
+    wait_reply_pool_mark_used(fresh_index);
+    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
 }
 
 unsafe fn pipe_name_wait_park(
@@ -23219,6 +23427,23 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 .expect("pending File IOCP owner disappeared");
         }
 
+        if pending.sync_lock_owner_tid != 0
+            && delivery_state & nt_io_manager::IO_DELIVERY_FILE_LOCK_RELEASED == 0
+        {
+            let _ = synchronous_file_release_and_wake(
+                nt_handler,
+                pending.file_id,
+                pending.sync_lock_owner_tid,
+            );
+            delivery_state = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                .mark_delivery_exact(
+                    slot,
+                    pending.irp_id,
+                    nt_io_manager::IO_DELIVERY_FILE_LOCK_RELEASED,
+                )
+                .expect("pending File lock-release owner disappeared");
+        }
+
         if pending.reply_required
             && delivery_state & nt_io_manager::IO_DELIVERY_REPLY_PUBLISHED == 0
         {
@@ -23226,10 +23451,23 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 .claim_reply_cap_exact(slot, pending.irp_id)
                 .expect("pending File reply owner disappeared")
                 .expect("pending File reply cap was claimed without publication");
-            set_reply_mr(15, pending.resume_ip);
-            set_reply_mr(16, pending.resume_sp);
-            set_reply_mr(17, pending.resume_flags);
-            let _ = client_reply_on(cap, 18, terminal_status as u64, 0, 0, 0);
+            if pending.native_call_transport {
+                let _ = client_reply_on(cap, 1, terminal_status as u64, 0, 0, 0);
+            } else {
+                let mut index = 4;
+                while index < pending.reply_mrs.len() {
+                    set_reply_mr(index, pending.reply_mrs[index]);
+                    index += 1;
+                }
+                let _ = client_reply_on(
+                    cap,
+                    18,
+                    terminal_status as u64,
+                    pending.reply_mrs[1],
+                    pending.reply_mrs[2],
+                    pending.reply_mrs[3],
+                );
+            }
             release_reply_pool_cap(cap);
             thread_wait_state_clear_badge_ready(nt_handler, pending.badge);
             (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))

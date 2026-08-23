@@ -39,6 +39,7 @@ mod projection;
 mod read_write;
 mod retained_completion;
 mod store;
+mod synchronous_io;
 mod wdm_x64;
 
 pub use complete::CompletedIrp;
@@ -64,11 +65,12 @@ pub use irp::{
 pub use mock_driver::{IoctlBehavior, MockDriverBackend};
 pub use object_port::{MockObjectPort, ObjectManagerPort};
 pub use pending_io::{
-    PendingFileCreate, PendingFileIo, PendingFileIoOperation, PendingFileIoTable,
-    IO_DELIVERY_APC_PUBLISHED, IO_DELIVERY_BACKEND_ACKED, IO_DELIVERY_BUFFER_PUBLISHED,
-    IO_DELIVERY_CREATE_COMMITTED, IO_DELIVERY_EVENT_PUBLISHED, IO_DELIVERY_FILE_PUBLISHED,
-    IO_DELIVERY_HANDLE_PUBLISHED, IO_DELIVERY_IOCP_PUBLISHED, IO_DELIVERY_IOSB_PUBLISHED,
-    IO_DELIVERY_REPLY_CLAIMED, IO_DELIVERY_REPLY_PUBLISHED,
+    PendingFileCreate, PendingFileIo, PendingFileIoOperation, PendingFileIoReservation,
+    PendingFileIoTable, IO_DELIVERY_APC_PUBLISHED, IO_DELIVERY_BACKEND_ACKED,
+    IO_DELIVERY_BUFFER_PUBLISHED, IO_DELIVERY_CREATE_COMMITTED, IO_DELIVERY_EVENT_PUBLISHED,
+    IO_DELIVERY_FILE_LOCK_RELEASED, IO_DELIVERY_FILE_PUBLISHED, IO_DELIVERY_HANDLE_PUBLISHED,
+    IO_DELIVERY_IOCP_PUBLISHED, IO_DELIVERY_IOSB_PUBLISHED, IO_DELIVERY_REPLY_CLAIMED,
+    IO_DELIVERY_REPLY_PUBLISHED,
 };
 pub use pipe::{
     decode_pipe_wait_name, decode_pipe_wait_request, pipe_endpoint_end, pipe_endpoint_file_id,
@@ -85,6 +87,9 @@ pub use pipe::{
 };
 pub use retained_completion::{RetainedCompletion, RetainedCompletionError, RetainedIrpCompletion};
 pub use store::{GenStore, IoId};
+pub use synchronous_io::{
+    SynchronousFileWaitState, SynchronousFileWaitTable, SynchronousFileWaiter,
+};
 pub use wdm_x64::{
     write_wdm_device_object, write_wdm_driver_object, write_wdm_file_object,
     write_wdm_io_stack_location, write_wdm_irp, write_wdm_open_device_projection,

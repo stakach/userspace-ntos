@@ -69,6 +69,10 @@ pub const ALPC_SSN_BASE: u32 = 0x1000;
 /// wire layout (MR0=SSN, MR1=rsp, MR2..5=args; reply MR0=NTSTATUS).
 pub const NT_NATIVE_SYSCALL_LABEL: u64 = 0x4E54;
 
+/// Private executive-to-ntdll reply marker requesting that a parked native seL4-Call syscall be
+/// reissued with the restored request MRs. It is deliberately outside the 32-bit NTSTATUS domain.
+pub const NT_NATIVE_RETRY_REPLY: u64 = 0x4E54_5254_5259_0001;
+
 /// TEB VA used by the SEC_IMAGE hosted-process main thread.
 ///
 /// Native syscall stubs read this value through the standard x64 `gs:[0x30]` TEB self pointer.

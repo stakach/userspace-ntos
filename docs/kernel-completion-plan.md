@@ -10524,3 +10524,51 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     transition early. Because `FSCTL_PIPE_LISTEN` currently bypasses the generic synchronous-File
     decision, serialization cannot be closed until LISTEN moves to `PendingFileIo`; root WAIT joins
     only after it has a canonical hosted File.
+
+    Synchronous File executive-wiring checkpoint (2026-08-23): create/open now validates the two
+    synchronous create options exactly, including the required `SYNCHRONIZE` access, and publishes
+    the resulting three-way mode on the canonical File. Routed read, write, flush, query/set
+    information, device-control, and ordinary file-system-control calls retain that File before
+    acquisition. Contenders preserve the resolved device, FsContext, granted access, syscall
+    identity, thread, and reply capability in a growable FIFO owner, so a concurrently closed
+    process handle cannot invalidate the promoted retry. The Busy lock transfers to one exact FIFO
+    waiter and is held across a pending IRP until output, IOSB, event/File signal, APC-or-IOCP, and
+    synchronous reply publication are terminal. Failure paths release both the lock and retained
+    File reference exactly once. Dead-thread teardown removes only the departed consumer's reply and
+    memory-notification surfaces, requests cancellation, and preserves the canonical pending owner
+    until terminal redrive releases Busy, acknowledges the backend IRP, and drops the retained File
+    reference.
+
+    Review found and closed the remaining publication and replay races before accepting this
+    checkpoint. The executive publishes the reply/FIFO owner immediately after dispatch, before a
+    completion pump can observe the policy waiter count. Every generic pending IRP consumes a
+    generation-exact owner-slot reservation made before dispatch; unused reservations are cancelled,
+    so re-entrant work cannot steal capacity and no failure path unlocks Busy while an IRP remains
+    active. Wait state is published before exact redrive, not inferred from an aggregate completion
+    count. A dead consumer whose cancellation completes inside the cancellation request explicitly
+    schedules terminal redrive.
+
+    Delayed replies are transport-exact. UnknownSyscall acquisition retry and terminal pending-I/O
+    completion restore the complete 18-MR frame, including explicit retry or post-syscall
+    IP/SP/flags. Native seL4-Call acquisition retry uses a private 64-bit marker outside the NTSTATUS
+    range and replays the original six-word request; terminal native completion replies with MR0
+    only. Generated Nt stubs and the three custom wide-argument native callers loop only on that
+    marker. Alertable pre-dispatch APC return leaves the operation IOSB untouched for ordinary
+    routed FSCTL as well as the other generic operations.
+
+    Reviewed host validation is green for `nt-io-completion` (`31/31`), `nt-io-manager`
+    (`169/169`), `nt-syscall-abi` (`16/16`), and `nt-ntdll` (`709/709`); the freestanding executive
+    check passes. The PE ntdll build and loader compatibility gate also pass with all 219 Nt stubs
+    and 219 Zw aliases exported and all native stubs preserving their required registers. Review
+    found no remaining blocker in this synchronous File slice. Serialized desktop proof
+    `.tmp/run-desktop-20260823-220816.log` is accepted for the exact integrated tree: userinit and
+    Explorer launch dynamically, Explorer completes 665 real api0 callbacks with zero callback
+    failures, and paint reaches 2 BeginPaint, 20 EndPaint, 185 direct GDI returns, and 131 batch
+    flushes carrying 171 records. All 786,432 framebuffer pixels are non-background with at least
+    32 colors; all `293/293` checks pass and the sentinel is emitted.
+
+    Review adjustment: ordinary synchronous File dispatch is wired, but the state transition is
+    not complete until newly queued APCs can remove an alertable acquisition waiter, an APC that
+    interrupts an already-pending synchronous IRP cancels and drains that exact IRP, last-handle
+    cleanup queues behind the same File lock, and `NtCancelIoFile` drains all matching current-thread
+    IRPs. Implement those lifecycle owners before migrating specialized LISTEN and root WAIT.

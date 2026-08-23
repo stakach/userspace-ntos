@@ -18,6 +18,7 @@ pub const IO_DELIVERY_REPLY_PUBLISHED: u16 = 1 << 7;
 pub const IO_DELIVERY_BACKEND_ACKED: u16 = 1 << 8;
 pub const IO_DELIVERY_CREATE_COMMITTED: u16 = 1 << 9;
 pub const IO_DELIVERY_HANDLE_PUBLISHED: u16 = 1 << 10;
+pub const IO_DELIVERY_FILE_LOCK_RELEASED: u16 = 1 << 11;
 
 const IO_DELIVERY_PUBLIC_FLAGS: u16 = IO_DELIVERY_BUFFER_PUBLISHED
     | IO_DELIVERY_IOSB_PUBLISHED
@@ -25,6 +26,7 @@ const IO_DELIVERY_PUBLIC_FLAGS: u16 = IO_DELIVERY_BUFFER_PUBLISHED
     | IO_DELIVERY_FILE_PUBLISHED
     | IO_DELIVERY_IOCP_PUBLISHED
     | IO_DELIVERY_EVENT_PUBLISHED;
+const IO_DELIVERY_MARKABLE_FLAGS: u16 = IO_DELIVERY_PUBLIC_FLAGS | IO_DELIVERY_FILE_LOCK_RELEASED;
 
 /// State needed to turn one successful terminal CREATE into a process-visible handle. The provider
 /// context is opaque to the generic owner; the executive interprets it only after resolving the
@@ -33,7 +35,6 @@ const IO_DELIVERY_PUBLIC_FLAGS: u16 = IO_DELIVERY_BUFFER_PUBLISHED
 pub struct PendingFileCreate {
     pub handle_va: u64,
     pub desired_access: u32,
-    pub synchronous: bool,
     pub provider_context: u64,
     pub reservation_pid: u32,
     pub reserved_handle: u32,
@@ -68,7 +69,13 @@ pub struct PendingFileIo {
     /// Owning process index, thread id, and hosted fault badge.
     pub pi: u32,
     pub tid: u64,
+    /// Thread owning the synchronous FILE_OBJECT lock until terminal delivery. Zero for an
+    /// asynchronous File or an always-synchronous API waiting on its own completion owner.
+    pub sync_lock_owner_tid: u64,
     pub badge: u64,
+    /// The initiating thread is gone, but the canonical IRP owner must remain until terminal
+    /// completion so its synchronous File lock and retained reference are released in order.
+    pub consumer_abandoned: bool,
     /// Optional caller output buffer and its byte capacity.
     pub output_va: u64,
     pub output_len: u32,
@@ -91,6 +98,10 @@ pub struct PendingFileIo {
     pub reply_cap: u64,
     /// Whether this record owns a parked synchronous syscall reply.
     pub reply_required: bool,
+    /// Whether the parked caller used the native seL4-Call transport. Native calls need only a
+    /// terminal MR0 reply; UnknownSyscall replies must restore the complete captured register frame.
+    pub native_call_transport: bool,
+    pub reply_mrs: [u64; 18],
     /// Native-syscall resume context restored before replying to a synchronous request.
     pub resume_ip: u64,
     pub resume_sp: u64,
@@ -99,10 +110,20 @@ pub struct PendingFileIo {
 
 const DEFAULT_INITIAL_RESERVE: usize = 16;
 
+/// Generation-exact claim on one table slot. Dispatch code reserves before creating an IRP and
+/// commits that exact claim afterward, so re-entrant work cannot consume the promised owner slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingFileIoReservation {
+    slot: usize,
+    generation: u64,
+}
+
 /// Reset-safe, growable table of generic pending File I/O delivery owners.
 #[derive(Clone, Debug)]
 pub struct PendingFileIoTable {
     slots: Vec<Option<PendingFileIo>>,
+    reservations: Vec<u64>,
+    next_reservation_generation: u64,
     initial_reserve: usize,
 }
 
@@ -120,18 +141,30 @@ impl PendingFileIoTable {
     pub const fn with_initial_reserve(initial_reserve: usize) -> Self {
         Self {
             slots: Vec::new(),
+            reservations: Vec::new(),
+            next_reservation_generation: 1,
             initial_reserve,
         }
     }
 
     fn grow_reservation(&mut self) -> bool {
+        let reserve = if self.slots.capacity() == 0 {
+            self.initial_reserve.max(1)
+        } else {
+            1
+        };
         if self.slots.len() == self.slots.capacity() {
-            let reserve = if self.slots.capacity() == 0 {
+            if self.slots.try_reserve(reserve).is_err() {
+                return false;
+            }
+        }
+        if self.reservations.len() == self.reservations.capacity() {
+            let reserve = if self.reservations.capacity() == 0 {
                 self.initial_reserve.max(1)
             } else {
                 1
             };
-            if self.slots.try_reserve(reserve).is_err() {
+            if self.reservations.try_reserve(reserve).is_err() {
                 return false;
             }
         }
@@ -141,25 +174,23 @@ impl PendingFileIoTable {
     /// Clear stale records and reserve bootstrap storage before an allocator watermark is taken.
     pub fn reset(&mut self) -> bool {
         self.slots.clear();
+        self.reservations.clear();
         if self.slots.capacity() < self.initial_reserve {
             let additional = self.initial_reserve - self.slots.capacity();
             if self.slots.try_reserve(additional).is_err() {
                 return false;
             }
         }
+        if self.reservations.capacity() < self.initial_reserve {
+            let additional = self.initial_reserve - self.reservations.capacity();
+            if self.reservations.try_reserve(additional).is_err() {
+                return false;
+            }
+        }
         true
     }
 
-    /// Ensure the next pending IRP can transfer ownership without allocating after dispatch.
-    pub fn ensure_capacity(&mut self) -> bool {
-        if self.slots.iter().any(Option::is_none) || self.slots.len() < self.slots.capacity() {
-            return true;
-        }
-        self.grow_reservation()
-    }
-
-    /// Insert one exact pending owner. A canonical IRP may have only one delivery owner.
-    pub fn park(&mut self, pending: PendingFileIo) -> Option<usize> {
+    fn pending_is_valid(&self, pending: PendingFileIo) -> bool {
         let create_valid = match pending.operation {
             PendingFileIoOperation::Transfer => {
                 !crate::is_create_major(pending.major)
@@ -188,24 +219,86 @@ impl PendingFileIoTable {
             pending.major,
             nt_io_abi::major::IRP_MJ_DEVICE_CONTROL | nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL
         ) || pending.control_code == 0;
-        if pending.file_id == 0
-            || pending.irp_id == 0
-            || !create_valid
-            || !control_valid
-            || pending.delivery_state != 0
-            || pending.output_offset != 0
-            || (pending.output_len != 0 && pending.output_va == 0)
-            || (pending.apc_routine != 0 && pending.publish_iocp)
-            || pending.reply_required != (pending.reply_cap != 0)
-            || self
+        pending.file_id != 0
+            && pending.irp_id != 0
+            && create_valid
+            && control_valid
+            && pending.delivery_state == 0
+            && pending.output_offset == 0
+            && (pending.sync_lock_owner_tid == 0 || pending.sync_lock_owner_tid == pending.tid)
+            && (!matches!(pending.operation, PendingFileIoOperation::Create(_))
+                || pending.sync_lock_owner_tid == 0)
+            && (!pending.consumer_abandoned
+                || matches!(pending.operation, PendingFileIoOperation::Transfer))
+            && (pending.output_len == 0 || pending.output_va != 0)
+            && (pending.apc_routine == 0 || !pending.publish_iocp)
+            && pending.reply_required == (pending.reply_cap != 0)
+            && !self
                 .slots
                 .iter()
                 .any(|slot| slot.is_some_and(|record| record.irp_id == pending.irp_id))
+    }
+
+    /// Claim one exact owner slot before dispatching an IRP.
+    pub fn reserve(&mut self) -> Option<PendingFileIoReservation> {
+        let slot = self
+            .slots
+            .iter()
+            .zip(self.reservations.iter())
+            .position(|(slot, reservation)| slot.is_none() && *reservation == 0)
+            .or_else(|| {
+                self.grow_reservation().then(|| {
+                    self.slots.push(None);
+                    self.reservations.push(0);
+                    self.slots.len() - 1
+                })
+            })?;
+        let generation = self.next_reservation_generation.max(1);
+        self.next_reservation_generation = generation.wrapping_add(1).max(1);
+        self.reservations[slot] = generation;
+        Some(PendingFileIoReservation { slot, generation })
+    }
+
+    pub fn cancel_reservation(&mut self, reservation: PendingFileIoReservation) -> bool {
+        let Some(generation) = self.reservations.get_mut(reservation.slot) else {
+            return false;
+        };
+        if *generation != reservation.generation || self.slots[reservation.slot].is_some() {
+            return false;
+        }
+        *generation = 0;
+        true
+    }
+
+    /// Commit one owner into its exact pre-dispatch claim.
+    pub fn park_reserved(
+        &mut self,
+        reservation: PendingFileIoReservation,
+        pending: PendingFileIo,
+    ) -> Option<usize> {
+        if self.reservations.get(reservation.slot).copied() != Some(reservation.generation)
+            || self.slots.get(reservation.slot)?.is_some()
+            || !self.pending_is_valid(pending)
         {
             return None;
         }
-        for (index, slot) in self.slots.iter_mut().enumerate() {
-            if slot.is_none() {
+        self.slots[reservation.slot] = Some(pending);
+        self.reservations[reservation.slot] = 0;
+        Some(reservation.slot)
+    }
+
+    /// Insert one exact pending owner. A canonical IRP may have only one delivery owner.
+    pub fn park(&mut self, pending: PendingFileIo) -> Option<usize> {
+        if !self.pending_is_valid(pending) {
+            return None;
+        }
+        for (index, (slot, reservation)) in self
+            .slots
+            .iter_mut()
+            .zip(self.reservations.iter())
+            .enumerate()
+        {
+            if slot.is_none() && *reservation == 0 {
                 *slot = Some(pending);
                 return Some(index);
             }
@@ -214,6 +307,7 @@ impl PendingFileIoTable {
             return None;
         }
         self.slots.push(Some(pending));
+        self.reservations.push(0);
         Some(self.slots.len() - 1)
     }
 
@@ -223,14 +317,24 @@ impl PendingFileIoTable {
 
     pub fn is_empty(&self) -> bool {
         self.slots.iter().all(Option::is_none)
+            && self.reservations.iter().all(|generation| *generation == 0)
     }
 
     pub fn capacity(&self) -> usize {
         self.slots.capacity()
     }
 
+    pub fn allocation_capacity(&self) -> (usize, usize) {
+        (self.slots.capacity(), self.reservations.capacity())
+    }
+
     pub fn has_capacity(&self) -> bool {
-        self.slots.iter().any(Option::is_none) || self.slots.len() < self.slots.capacity()
+        self.slots
+            .iter()
+            .zip(self.reservations.iter())
+            .any(|(slot, reservation)| slot.is_none() && *reservation == 0)
+            || (self.slots.len() < self.slots.capacity()
+                && self.reservations.len() < self.reservations.capacity())
     }
 
     pub fn has_thread(&self, tid: u64) -> bool {
@@ -291,6 +395,9 @@ impl PendingFileIoTable {
         }
         if pending.reply_required {
             required |= IO_DELIVERY_REPLY_CLAIMED | IO_DELIVERY_REPLY_PUBLISHED;
+        }
+        if pending.sync_lock_owner_tid != 0 {
+            required |= IO_DELIVERY_FILE_LOCK_RELEASED;
         }
         required
     }
@@ -371,8 +478,8 @@ impl PendingFileIoTable {
 
     pub fn mark_delivery_exact(&mut self, slot: usize, irp_id: u64, flag: u16) -> Option<u16> {
         if flag.count_ones() != 1
-            || flag & IO_DELIVERY_PUBLIC_FLAGS == 0
-            || flag & !IO_DELIVERY_PUBLIC_FLAGS != 0
+            || flag & IO_DELIVERY_MARKABLE_FLAGS == 0
+            || flag & !IO_DELIVERY_MARKABLE_FLAGS != 0
         {
             return None;
         }
@@ -451,6 +558,61 @@ impl PendingFileIoTable {
         Some(pending.delivery_state)
     }
 
+    /// Detach the dead thread's user-visible surfaces without retiring the exact IRP owner. The
+    /// caller releases any transferred reply cap and requests cancellation; terminal redrive still
+    /// owns backend ACK, Busy release, and the retained File reference.
+    pub fn abandon_thread_transfers_with<F>(&mut self, tid: u64, mut abandon: F) -> usize
+    where
+        F: FnMut(PendingFileIo),
+    {
+        let mut count = 0;
+        for pending in self.slots.iter_mut().flatten() {
+            if pending.tid != tid
+                || pending.consumer_abandoned
+                || !matches!(pending.operation, PendingFileIoOperation::Transfer)
+            {
+                continue;
+            }
+            let original = *pending;
+            pending.consumer_abandoned = true;
+            pending.output_va = 0;
+            pending.output_len = 0;
+            pending.output_offset = 0;
+            pending.iosb_va = 0;
+            pending.apc_routine = 0;
+            pending.apc_context = 0;
+            pending.signal_file = false;
+            pending.publish_iocp = false;
+            pending.event_obj_idx = u64::MAX;
+            pending.reply_cap = 0;
+            pending.reply_required = false;
+            pending.native_call_transport = false;
+            pending.reply_mrs = [0; 18];
+            pending.resume_ip = 0;
+            pending.resume_sp = 0;
+            pending.resume_flags = 0;
+            abandon(original);
+            count += 1;
+        }
+        count
+    }
+
+    pub fn take_thread_creates_with<F>(&mut self, tid: u64, mut take: F) -> usize
+    where
+        F: FnMut(PendingFileIo),
+    {
+        let mut count = 0;
+        for slot in self.slots.iter_mut() {
+            if slot.is_some_and(|pending| {
+                pending.tid == tid && matches!(pending.operation, PendingFileIoOperation::Create(_))
+            }) {
+                take(slot.take().unwrap());
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// Remove every request owned by a terminating thread. The caller must release any reply cap,
     /// request cancellation/abandonment, and release the retained File reference.
     pub fn take_thread_with<F>(&mut self, tid: u64, mut take: F) -> usize
@@ -485,7 +647,9 @@ mod tests {
             operation: PendingFileIoOperation::Transfer,
             pi: 3,
             tid,
+            sync_lock_owner_tid: 0,
             badge: 9,
+            consumer_abandoned: false,
             output_va: 0x1000,
             output_len: 64,
             output_offset: 0,
@@ -498,6 +662,8 @@ mod tests {
             event_obj_idx: 7,
             reply_cap: 0x50,
             reply_required: true,
+            native_call_transport: false,
+            reply_mrs: [0; 18],
             resume_ip: 0x5000,
             resume_sp: 0x6000,
             resume_flags: 0x202,
@@ -517,6 +683,25 @@ mod tests {
         }
         assert_eq!(table.len(), initial_capacity + 3);
         assert!(table.capacity() >= table.len());
+    }
+
+    #[test]
+    fn predispatch_reservation_cannot_be_stolen_and_is_generation_exact() {
+        let mut table = PendingFileIoTable::with_initial_reserve(1);
+        let reservation = table.reserve().unwrap();
+        let competing_slot = table.park(pending(10, 100, 7)).unwrap();
+        assert_ne!(competing_slot, reservation.slot);
+        assert_eq!(
+            table
+                .park_reserved(reservation, pending(20, 200, 8))
+                .unwrap(),
+            reservation.slot
+        );
+        assert!(!table.cancel_reservation(reservation));
+
+        let cancelled = table.reserve().unwrap();
+        assert!(table.cancel_reservation(cancelled));
+        assert!(!table.cancel_reservation(cancelled));
     }
 
     #[test]
@@ -665,6 +850,7 @@ mod tests {
         request.apc_routine = 0;
         request.publish_iocp = true;
         request.signal_file = true;
+        request.sync_lock_owner_tid = request.tid;
         let slot = table.park(request).unwrap();
 
         table.advance_output_exact(slot, 2, 8, 8).unwrap();
@@ -679,6 +865,10 @@ mod tests {
         assert!(!table.completion_surfaces_published_exact(slot, 2));
         assert_eq!(table.claim_reply_cap_exact(slot, 2), Some(Some(0x50)));
         table.mark_reply_published_exact(slot, 2).unwrap();
+        assert!(!table.completion_surfaces_published_exact(slot, 2));
+        table
+            .mark_delivery_exact(slot, 2, IO_DELIVERY_FILE_LOCK_RELEASED)
+            .unwrap();
         assert!(table.completion_surfaces_published_exact(slot, 2));
     }
 
@@ -794,6 +984,36 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_synchronous_transfer_retains_terminal_lock_owner_only() {
+        let mut table = PendingFileIoTable::new();
+        let mut request = pending(1, 2, 7);
+        request.sync_lock_owner_tid = 7;
+        request.reply_required = true;
+        request.reply_cap = 0x50;
+        request.resume_ip = 0x1000;
+        request.resume_sp = 0x2000;
+        request.resume_flags = 0x202;
+        let slot = table.park(request).unwrap();
+        let mut detached = None;
+        assert_eq!(
+            table.abandon_thread_transfers_with(7, |pending| detached = Some(pending)),
+            1
+        );
+        assert_eq!(detached.unwrap().reply_cap, 0x50);
+        let owner = table.get(slot).unwrap();
+        assert!(owner.consumer_abandoned);
+        assert_eq!(owner.reply_cap, 0);
+        assert!(!owner.reply_required);
+        assert!(!table.completion_surfaces_published_exact(slot, 2));
+        table
+            .mark_delivery_exact(slot, 2, IO_DELIVERY_FILE_LOCK_RELEASED)
+            .unwrap();
+        assert!(table.completion_surfaces_published_exact(slot, 2));
+        table.mark_backend_acked_exact(slot, 2).unwrap();
+        assert!(table.finish_exact(slot, 2).is_some());
+    }
+
+    #[test]
     fn completion_identity_includes_file_thread_and_major() {
         let mut table = PendingFileIoTable::new();
         let request = pending(1, 2, 7);
@@ -881,7 +1101,6 @@ mod tests {
         request.operation = PendingFileIoOperation::Create(PendingFileCreate {
             handle_va: 0x7000,
             desired_access: 0x12019F,
-            synchronous: true,
             provider_context: 0xAABB,
             reservation_pid: 4,
             reserved_handle: 0x44,
@@ -925,7 +1144,6 @@ mod tests {
         request.operation = PendingFileIoOperation::Create(PendingFileCreate {
             handle_va: 0x7000,
             desired_access: 0,
-            synchronous: false,
             provider_context: 0xAABB,
             reservation_pid: 4,
             reserved_handle: 0x44,

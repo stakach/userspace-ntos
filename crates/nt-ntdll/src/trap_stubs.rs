@@ -106,12 +106,16 @@ macro_rules! generate_trap_stubs {
                     "lea r8, [rsp + 24]",               // MR1 = caller rsp
                     "mov r9, rcx",                      // MR2 = arg1 (rcx)
                     "mov r15, rdx",                     // MR3 = arg2 (rdx)
+                    "5:",
                     concat!("mov r10d, ", stringify!($ssn)), // MR0 = SSN
                     "mov edi, 6",                       // rdi = CT_FAULT cap slot
                     // rsi = msginfo = (NT_NATIVE_SYSCALL_LABEL<<12) | length(6) = 0x4E54_6006.
                     "mov esi, 0x04E54006",              // rsi = (0x4E54<<12)|6 = label 0x4E54, len 6
                     "mov rdx, -1",                      // rdx = SysCall (native seL4 Call)
                     "syscall",                          // native seL4 Call → executive Recv/Reply
+                    "movabs rax, {retry_reply}",
+                    "cmp r10, rax",
+                    "je 5b",
                     // Reply: MR0 (r10) = NTSTATUS. Restore every nonvolatile register before the
                     // Windows caller resumes, then move the status to the C return register.
                     "pop r15",
@@ -123,6 +127,7 @@ macro_rules! generate_trap_stubs {
                     pe_main_teb = const nt_syscall_abi::NT_NATIVE_PE_MAIN_TEB_VA,
                     main_ipc_buffer = const nt_syscall_abi::NT_NATIVE_MAIN_IPC_BUFFER_VA,
                     worker_ipc_delta = const nt_syscall_abi::NT_NATIVE_WORKER_IPC_BUFFER_DELTA,
+                    retry_reply = const nt_syscall_abi::NT_NATIVE_RETRY_REPLY,
                 );
             }
         )*

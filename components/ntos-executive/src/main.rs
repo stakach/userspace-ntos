@@ -2833,6 +2833,10 @@ static KEYED_RELEASE_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 /// and backend acknowledgement, independent of the provider that owns the request.
 static mut PENDING_FILE_IO: nt_io_manager::PendingFileIoTable =
     nt_io_manager::PendingFileIoTable::new();
+/// Syscalls that have referenced a synchronous File but are waiting for its Busy owner. The File
+/// table owns lock policy; this table owns FIFO continuation identity and the retained route.
+static mut SYNCHRONOUS_FILE_WAITERS: nt_io_manager::SynchronousFileWaitTable =
+    nt_io_manager::SynchronousFileWaitTable::new();
 /// A pending backend request could not transfer into its already-reserved generic owner. This is a
 /// fail-closed allocation/reply-cap path, never a compatibility fallback, and must remain zero.
 static PENDING_FILE_IO_TRANSFER_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -15996,6 +16000,7 @@ fn hosted_io_owner_tables_reset() -> bool {
     unsafe {
         (&mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS)).reset()
             && (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO)).reset()
+            && (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS)).reset()
     }
 }
 
@@ -21131,6 +21136,14 @@ struct ExecNtHandler {
     current_resume_ip: u64,
     current_sp: u64,
     current_flags: u64,
+    /// Exact native service number for synchronous File retry grants.
+    current_service_number: u32,
+    /// Whether the current service arrived as our ntdll's native seL4-Call request.
+    current_native_call_transport: bool,
+    /// Promoted acquisition whose retained route replaces process-handle lookup on retry.
+    active_synchronous_file_retry: Option<nt_io_manager::SynchronousFileWaiter>,
+    /// File lock acquired by this call; inline completion releases it at the dispatch boundary.
+    current_synchronous_file_lock: u64,
     user_apc_redirected: bool,
     context_continue_redirected: bool,
     post_action: ExecPostAction,
@@ -21232,6 +21245,10 @@ struct ExecNtHandler {
     /// synchronous File object must wait for terminal completion.
     pending_file_io_transfer: Option<nt_io_manager::PendingFileIo>,
     pending_file_io_wait: bool,
+    /// Exact pre-dispatch owner claim consumed only if the driver returns a pending IRP.
+    pending_file_io_reservation: Option<nt_io_manager::PendingFileIoReservation>,
+    /// Contended synchronous File acquisition transferred into the FIFO owner at the reply site.
+    pending_synchronous_file_wait: Option<nt_io_manager::SynchronousFileWaiter>,
     /// ★ Dbgk TARGET-SIDE BLOCKING, SYSCALL flavour. Set by a debug-event post issued from a
     /// SYSCALL arm (`dbgk_module_load` — `DbgkMapViewOfSection`, which NT queues with flags 0 and
     /// therefore BLOCKS the mapping thread on the continue). The handler cannot park: the reply-cap
@@ -21479,11 +21496,12 @@ impl ExecFileCompletion {
         &mut self,
         file_id: u64,
         device_id: u64,
-        synchronous: bool,
+        io_mode: nt_io_completion::FileIoMode,
     ) -> Result<(), u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe {
-            (&mut *self.table).reserve_file_handle_publication(file_id, device_id, synchronous)
+            (&mut *self.table)
+                .reserve_file_handle_publication_with_mode(file_id, device_id, io_mode)
         }
     }
 
@@ -21555,6 +21573,48 @@ impl ExecFileCompletion {
     fn is_synchronous(&self, file_id: u64) -> Result<bool, u32> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).is_synchronous(file_id) }
+    }
+
+    fn io_mode(&self, file_id: u64) -> Result<nt_io_completion::FileIoMode, u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).io_mode(file_id) }
+    }
+
+    fn begin_io(
+        &mut self,
+        file_id: u64,
+        tid: u64,
+    ) -> Result<nt_io_completion::FileIoAcquireResult, u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).begin_io(file_id, tid) }
+    }
+
+    fn cancel_io_waiter(&mut self, file_id: u64) -> Result<u32, u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).cancel_io_waiter(file_id) }
+    }
+
+    fn promote_io_waiter(&mut self, file_id: u64, tid: u64) -> Result<u32, u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).promote_io_waiter(file_id, tid) }
+    }
+
+    fn release_io(
+        &mut self,
+        file_id: u64,
+        tid: u64,
+    ) -> Result<nt_io_completion::FileIoRelease, u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).release_io(file_id, tid) }
+    }
+
+    fn cancel_promoted_io(
+        &mut self,
+        file_id: u64,
+        tid: u64,
+    ) -> Result<nt_io_completion::FileIoRelease, u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).cancel_promoted_io(file_id, tid) }
     }
 
     fn device_id(&self, file_id: u64) -> Result<u64, u32> {
