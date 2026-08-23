@@ -10641,3 +10641,40 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     owner and place CLEANUP behind ordinary operations in the same File FIFO; lifecycle IRPs can now
     pend there without being cancelled by the manager. LISTEN, root WAIT, and the control-buffer
     transport cleanup remain after those three owners are complete.
+
+    Alertable File-acquisition APC checkpoint (2026-08-23): a queued user APC can now remove an
+    alertable syscall that is parked before IRP dispatch on a contended synchronous File. The FIFO
+    owner preserves both the replay instruction and the real post-syscall continuation; APC delivery
+    restores the latter, so the undispatched operation is not retried. Selection is allocation-free
+    and exact by thread, slot, File generation, and `Waiting` state. Non-alertable waiters remain
+    parked, while a `Promoted` owner is deliberately ineligible because the File-lock wake and Busy
+    grant have already won that race.
+
+    APC context staging is now factored below the current-syscall reply latch. The service loop can
+    temporarily install the target process/thread mirrors, stage `KiUserApcDispatcher` with
+    `STATUS_USER_APC`, consume the queued APC, and restore the unrelated outer caller without
+    suppressing its reply. Successful interruption removes the exact FIFO row, decrements the File
+    policy waiter count, releases the pre-dispatch File reference, replies to the stolen capability
+    with the length-zero redirect shape, and clears the target wait state. All real user-APC
+    producers participate: `NtQueueApcThread`, timer expiry, and File-completion APC queueing. A
+    reconciliation immediately after reply-cap/FIFO transfer closes the queue-before-park and
+    queue-during-transfer windows; the loop still takes the no-reply receive branch after an
+    immediate interruption, so the replacement main Reply object cannot reply twice.
+
+    Focused `nt-io-manager` validation is green at `179/179`; the new policy test proves exact
+    alertable selection/removal, non-alertable exclusion, promoted-owner exclusion, preserved FIFO
+    ordering, and the distinct post-syscall resume address. The freestanding executive check passes
+    with only the existing warning set. Serialized desktop proof
+    `.tmp/run-desktop-20260823-225642.log` is accepted for the integrated tree: genuine Explorer
+    reaches 5 BeginPaint, 20 EndPaint, 187 direct GDI returns, and 135 batch flushes carrying 184
+    records; all 786,432 framebuffer pixels are non-background with at least 32 colors, all `293/293`
+    checks pass, and the sentinel is emitted. This workload queued no user APC, so it is regression
+    proof rather than production exercise of the new interruption edge.
+
+    Review adjustment: the pre-dispatch APC owner is complete at the implementation and focused-test
+    boundary. Next add one exact interruption bit to a synchronous `PendingFileIo`, select and cancel
+    only its `IrpId`, and keep the caller parked non-alertably until normal completion publication and
+    backend ACK finish. Whichever terminal result wins must be placed in the APC's saved context;
+    neither `STATUS_USER_APC` nor `STATUS_CANCELLED` may be synthesized. Last-handle CLEANUP remains
+    the following FIFO owner, then LISTEN/root WAIT/control-buffer cleanup proceeds in the recorded
+    order.

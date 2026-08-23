@@ -7421,10 +7421,12 @@ impl ExecNtHandler {
             .filter(|&tcb| tcb > 1)
     }
 
-    pub(crate) unsafe fn try_deliver_current_user_apc(&mut self) -> Result<bool, u32> {
+    pub(crate) unsafe fn stage_current_user_apc(
+        &mut self,
+        return_status: u32,
+    ) -> Result<bool, u32> {
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
         const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
-        const STATUS_USER_APC: u32 = 0x0000_00C0;
 
         let current_tid = match u32::try_from(self.current_tid) {
             Ok(tid) => tid,
@@ -7464,7 +7466,7 @@ impl ExecNtHandler {
             self.current_resume_ip,
             self.current_sp,
             self.current_flags,
-            STATUS_USER_APC as u64,
+            return_status as u64,
             apc.routine,
             apc.normal_context,
             apc.system_argument1,
@@ -7487,7 +7489,6 @@ impl ExecNtHandler {
             return Err(STATUS_UNSUCCESSFUL);
         }
         let _ = self.pm.take_user_apc(current_tid);
-        self.user_apc_redirected = true;
 
         let trace = USER_APC_DELIVERY_TRACE_N.fetch_add(1, Ordering::Relaxed);
         if trace < 16 {
@@ -7504,6 +7505,16 @@ impl ExecNtHandler {
             print_str(b"\n");
         }
         Ok(true)
+    }
+
+    pub(crate) unsafe fn try_deliver_current_user_apc(&mut self) -> Result<bool, u32> {
+        const STATUS_USER_APC: u32 = 0x0000_00C0;
+
+        let delivered = self.stage_current_user_apc(STATUS_USER_APC)?;
+        if delivered {
+            self.user_apc_redirected = true;
+        }
+        Ok(delivered)
     }
 
     fn resolve_user_thread_for_context(
@@ -10602,6 +10613,12 @@ impl ExecNtHandler {
                     print_hex_u64(iosb);
                     print_str(b"\n");
                 }
+                let _ = unsafe {
+                    crate::service_sec_image::reconcile_user_apc_file_acquisition_wait(
+                        self,
+                        target_tid as u64,
+                    )
+                };
                 nt_fs::STATUS_SUCCESS
             }
             Err(status) => {
@@ -18756,6 +18773,7 @@ impl ExecNtHandler {
                         alertable,
                         self.current_native_call_transport,
                         retry_ip,
+                        self.current_resume_ip,
                         self.current_sp,
                         self.current_flags,
                     ),
@@ -20026,6 +20044,13 @@ impl ExecNtHandler {
                     print_hex(status);
                     print_str(b"\n");
                 }
+                if status == nt_fs::STATUS_SUCCESS {
+                    let _ = unsafe {
+                        crate::service_sec_image::reconcile_user_apc_file_acquisition_wait(
+                            self, apc_tid,
+                        )
+                    };
+                }
             }
         }
         if fired != 0 {
@@ -21280,6 +21305,12 @@ impl ExecNtHandler {
                         print_str(b" routine=0x");
                         print_hex_u64(apc.routine);
                         print_str(b"\n");
+                        let _ = unsafe {
+                            crate::service_sec_image::reconcile_user_apc_file_acquisition_wait(
+                                self,
+                                target_tid as u64,
+                            )
+                        };
                         0
                     }
                     Err(status) => status,

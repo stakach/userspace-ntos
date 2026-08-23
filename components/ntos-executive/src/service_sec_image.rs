@@ -9787,14 +9787,21 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     if synchronous_file_wait_park(waiter) {
                         synchronous_file_wait_parked = true;
-                        trace_indefinite_wait_park(
-                            &nt_handler,
-                            badge,
-                            live_top_badges(&nt_handler),
-                            crash_parked,
-                            wait_parked,
+                        let waiter_tid = nt_handler.current_tid;
+                        let apc_interrupted = reconcile_user_apc_file_acquisition_wait(
+                            &mut nt_handler,
+                            waiter_tid,
                         );
-                        mark_wait_parked!(pi, resume_ip);
+                        if !apc_interrupted {
+                            trace_indefinite_wait_park(
+                                &nt_handler,
+                                badge,
+                                live_top_badges(&nt_handler),
+                                crash_parked,
+                                wait_parked,
+                            );
+                            mark_wait_parked!(pi, resume_ip);
+                        }
                     } else {
                         PENDING_FILE_IO_TRANSFER_FAILURES.fetch_add(1, Ordering::Relaxed);
                         let _ = nt_handler.file_completion.cancel_io_waiter(waiter.file_id);
@@ -22850,6 +22857,96 @@ unsafe fn lsa_deliver_reply(nt_handler: &mut ExecNtHandler, replymsg: u64) -> bo
     );
     thread_wait_state_clear_badge_ready(nt_handler, cli_badge);
     lsa_clear_client_context();
+    true
+}
+
+/// Redirect one alertable pre-dispatch File acquisition waiter when its target
+/// thread has a queued user APC.
+pub(crate) unsafe fn reconcile_user_apc_file_acquisition_wait(
+    nt_handler: &mut ExecNtHandler,
+    tid: u64,
+) -> bool {
+    const STATUS_USER_APC: u32 = 0x0000_00C0;
+
+    let Some((slot, waiter)) = (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS))
+        .alertable_waiting_for_thread(tid)
+    else {
+        return false;
+    };
+    let Ok(target_tid) = nt_process::ThreadId::try_from(tid) else {
+        return false;
+    };
+    if nt_handler.pm.peek_user_apc(target_tid).is_none() || waiter.pi as usize >= MAX_PI {
+        return false;
+    }
+
+    let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
+    let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
+    let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
+    let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
+    let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
+    let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
+    let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+    let saved_w32_client_pi = W32_CLIENT_PI.load(Ordering::Relaxed);
+    let saved_pi = nt_handler.pi;
+    let saved_tid = nt_handler.current_tid;
+    let saved_badge = nt_handler.current_badge;
+    let saved_resume_ip = nt_handler.current_resume_ip;
+    let saved_sp = nt_handler.current_sp;
+    let saved_flags = nt_handler.current_flags;
+    let saved_ctx = nt_handler.loop_ctx.take();
+
+    let target_pi = waiter.pi as usize;
+    let (sb, ss, smv, hmv, imv, scratch_base) = mirror_ctx_for(waiter.badge, target_pi);
+    ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
+    ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
+    ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
+    ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
+    ACTIVE_IMAGE_MIRROR.store(imv, Ordering::Relaxed);
+    ACTIVE_CLIENT_PI.store(waiter.pi as u64, Ordering::Relaxed);
+    ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
+    W32_CLIENT_PI.store(waiter.pi as u64, Ordering::Relaxed);
+    nt_handler.pi = target_pi;
+    nt_handler.current_tid = waiter.tid;
+    nt_handler.current_badge = waiter.badge;
+    nt_handler.current_resume_ip = waiter.resume_ip;
+    nt_handler.current_sp = waiter.resume_sp;
+    nt_handler.current_flags = waiter.resume_flags;
+
+    let staged = nt_handler.stage_current_user_apc(STATUS_USER_APC) == Ok(true);
+
+    ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
+    ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
+    ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
+    ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
+    ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
+    ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
+    ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
+    W32_CLIENT_PI.store(saved_w32_client_pi, Ordering::Relaxed);
+    nt_handler.pi = saved_pi;
+    nt_handler.current_tid = saved_tid;
+    nt_handler.current_badge = saved_badge;
+    nt_handler.current_resume_ip = saved_resume_ip;
+    nt_handler.current_sp = saved_sp;
+    nt_handler.current_flags = saved_flags;
+    nt_handler.loop_ctx = saved_ctx;
+
+    if !staged {
+        return false;
+    }
+
+    let removed = (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
+        .take_alertable_waiting_exact(slot, waiter.file_id, waiter.tid)
+        .expect("staged File-wait APC lost its exact FIFO owner");
+    nt_handler
+        .file_completion
+        .cancel_io_waiter(removed.file_id)
+        .expect("staged File-wait APC lost its policy waiter");
+    nt_handler.release_file_reference(removed.file_id);
+    let _ = client_reply_on(removed.reply_cap, 0, 0, 0, 0, 0);
+    release_reply_pool_cap(removed.reply_cap);
+    thread_wait_state_clear_badge_ready(nt_handler, removed.badge);
+    bump_progress();
     true
 }
 

@@ -29,6 +29,9 @@ pub struct SynchronousFileWaiter {
     pub reply_cap: u64,
     /// Address of the x64 `syscall` instruction used to replay the captured native call.
     pub retry_ip: u64,
+    /// Address immediately after the syscall. APC interruption returns through
+    /// this continuation without replaying an operation that never dispatched.
+    pub resume_ip: u64,
     pub resume_sp: u64,
     pub resume_flags: u64,
     /// Complete native IPC register frame. The executive snapshots it before parking so replay
@@ -53,6 +56,7 @@ impl SynchronousFileWaiter {
         alertable: bool,
         native_call_transport: bool,
         retry_ip: u64,
+        resume_ip: u64,
         resume_sp: u64,
         resume_flags: u64,
     ) -> Self {
@@ -70,6 +74,7 @@ impl SynchronousFileWaiter {
             native_call_transport,
             reply_cap: 0,
             retry_ip,
+            resume_ip,
             resume_sp,
             resume_flags,
             reply_mrs: [0; 18],
@@ -199,6 +204,38 @@ impl SynchronousFileWaitTable {
             .min_by_key(|(_, waiter)| waiter.sequence)
     }
 
+    /// Resolve the exact pre-dispatch File acquisition wait that a queued user
+    /// APC may interrupt. A promoted record already owns Busy, so the File-lock
+    /// wake wins and it is deliberately excluded.
+    pub fn alertable_waiting_for_thread(&self, tid: u64) -> Option<(usize, SynchronousFileWaiter)> {
+        self.slots.iter().enumerate().find_map(|(slot, waiter)| {
+            waiter
+                .filter(|waiter| {
+                    waiter.tid == tid
+                        && waiter.alertable
+                        && waiter.state == SynchronousFileWaitState::Waiting
+                })
+                .map(|waiter| (slot, waiter))
+        })
+    }
+
+    pub fn take_alertable_waiting_exact(
+        &mut self,
+        slot: usize,
+        file_id: u64,
+        tid: u64,
+    ) -> Option<SynchronousFileWaiter> {
+        let waiter = self.slots.get(slot)?.as_ref()?;
+        if waiter.file_id != file_id
+            || waiter.tid != tid
+            || !waiter.alertable
+            || waiter.state != SynchronousFileWaitState::Waiting
+        {
+            return None;
+        }
+        self.slots.get_mut(slot)?.take()
+    }
+
     /// Mark one exact FIFO waiter as the promoted Busy owner. Reply ownership remains on the
     /// record until the executive has made the retry visible.
     pub fn promote_exact(
@@ -301,6 +338,7 @@ mod tests {
             native_call_transport: false,
             reply_cap,
             retry_ip: 0x1000,
+            resume_ip: 0x1002,
             resume_sp: 0x2000,
             resume_flags: 0x202,
             reply_mrs: [0; 18],
@@ -380,5 +418,36 @@ mod tests {
         assert_eq!(table.take_thread_with(2, |waiter| taken.push(waiter)), 1);
         assert_eq!(taken[0].state, SynchronousFileWaitState::Promoted);
         assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn user_apc_selects_only_an_alertable_waiting_owner() {
+        let mut table = SynchronousFileWaitTable::new();
+        let mut alertable = waiter(10, 1, 101);
+        alertable.alertable = true;
+        let alertable_slot = table.park(alertable).unwrap();
+        table.park(waiter(20, 2, 102)).unwrap();
+        let mut promoted = waiter(30, 3, 103);
+        promoted.alertable = true;
+        let promoted_slot = table.park(promoted).unwrap();
+        table.promote_exact(promoted_slot, 30, 3).unwrap();
+
+        assert!(table.alertable_waiting_for_thread(2).is_none());
+        assert!(table.alertable_waiting_for_thread(3).is_none());
+        let (slot, selected) = table.alertable_waiting_for_thread(1).unwrap();
+        assert_eq!(slot, alertable_slot);
+        assert_eq!(selected.resume_ip, 0x1002);
+        assert!(table
+            .take_alertable_waiting_exact(slot, selected.file_id + 1, selected.tid)
+            .is_none());
+        assert_eq!(
+            table
+                .take_alertable_waiting_exact(slot, selected.file_id, selected.tid)
+                .unwrap(),
+            selected
+        );
+        assert_eq!(table.len(), 2);
+        assert_eq!(table.oldest_waiting_for_file(20).unwrap().1.tid, 2);
+        assert!(table.alertable_waiting_for_thread(3).is_none());
     }
 }
