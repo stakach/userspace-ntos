@@ -75,6 +75,8 @@ statuses! {
     SUCCESS = 0x0000_0000u32;
     /// The operation is pending / asynchronous.
     PENDING = 0x0000_0103u32;
+    /// A completion routine retained ownership of the IRP and stopped unwinding.
+    MORE_PROCESSING_REQUIRED = 0xC000_0016u32;
     /// The object name was not found.
     OBJECT_NAME_NOT_FOUND = 0xC000_0034u32;
     /// An object with that name already exists.

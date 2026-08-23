@@ -254,12 +254,11 @@ behaviour. Companion to the Object Manager notes; see `references/nt-io-manager-
 - **Projection builders** (`IoManager::project_driver` / `project_device` /
   `project_file`) derive the wire projections from the canonical records.
 - **Support-routine plan** (`DriverHostRoutine` + `MvpStatus`): a machine-readable
-  encoding of the §20 table — the `Io*` routine names, their v0.1 MVP status
-  (`RequiredInternal` / `ThroughPeerProtocol` / `DriverHostLater` / `SingleStackStub`
-  / `Deferred` / `Partial` / `Optional`), and the `export_name` a future
-  `nt-compat-exports` crate will provide. Planned now, not yet callable by real
-  drivers, so the Driver Host spec can build on this I/O Manager without redesigning
-  IRP ownership.
+  encoding of the §20 table: canonical manager routines, component-local WDM helpers,
+  WDK inline helpers, authenticated provider-boundary calls, and the remaining partial
+  cancellation surface. The status table describes the live hosted-driver runtime;
+  stack access, completion registration, `IoCallDriver`, and `IoCompleteRequest` are no
+  longer future or single-stack placeholders.
 - Architecture write-up: `docs/architecture/nt-io-manager.md`.
 
 This completes the NT I/O Manager spec milestones (1-9): the full driver model —

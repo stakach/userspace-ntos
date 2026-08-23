@@ -332,8 +332,6 @@ pub const SH_RESOURCE_MMIO_MAPPED_LEN: u64 = 0x3D0; // out: last MmMapIoSpace le
 pub const SH_RESOURCE_INTERRUPT_OBJECT: u64 = 0x3D8; // out: PKINTERRUPT projection
 pub const SH_RESOURCE_INTERRUPT_ROUTINE: u64 = 0x3E0; // out: connected ISR routine
 pub const SH_RESOURCE_INTERRUPT_CONTEXT: u64 = 0x3E8; // out: connected ISR context
-pub const SH_ROOT_PDO_FORWARDED_MINOR: u64 = 0x3F0; // out: lower PDO PnP minor forwarded
-pub const SH_ROOT_PDO_FORWARDED_STATUS: u64 = 0x3F8; // out: lower PDO completion status
 pub const SH_DMA_COMMON_VA: u64 = 0x400; // in: component VA for the granted common buffer
 pub const SH_DMA_COMMON_LEN: u64 = 0x408; // in: granted common-buffer length
 pub const SH_DMA_COMMON_LOGICAL: u64 = 0x410; // in: granted device logical address / IOVA
@@ -612,6 +610,7 @@ pub const FSD_SERVICE_KE_CANCEL_TIMER_LABEL: u64 = 0x77D;
 pub const FSD_SERVICE_PULL_IRP_INPUT_LABEL: u64 = 0x77E;
 pub const FSD_SERVICE_PULL_IRP_OUTPUT_LABEL: u64 = 0x77F;
 pub const FSD_SERVICE_PUSH_IRP_OUTPUT_LABEL: u64 = 0x780;
+pub const FSD_SERVICE_ROOT_PDO_PNP_LABEL: u64 = 0x781;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_INTERRUPT: u64 = u64::MAX - 0x773;
@@ -644,6 +643,7 @@ pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
             | FSD_SERVICE_PULL_IRP_INPUT_LABEL
             | FSD_SERVICE_PULL_IRP_OUTPUT_LABEL
             | FSD_SERVICE_PUSH_IRP_OUTPUT_LABEL
+            | FSD_SERVICE_ROOT_PDO_PNP_LABEL
     )
 }
 
@@ -688,12 +688,13 @@ const HOSTED_IRP_COMPLETED_CANCEL: u64 = 14;
 const HOSTED_IRP_PUBLISHED: u64 = 15;
 const HOSTED_IRP_COPYING: u64 = 16;
 const HOSTED_IRP_COMPLETING_DEFERRED: u64 = 17;
+/// A completion routine stopped an unwind while the originating dispatch is still on-stack.
+const HOSTED_IRP_STOPPED_DISPATCH: u64 = 18;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PendingIrp {
     irp: u64,
-    iosl: u64,
     file_object: u64,
     data: u64,
     aux_data: u64,
@@ -1230,6 +1231,41 @@ fn hosted_irp_state_with_kind(state: u64, kind: u64) -> u64 {
     (state & !HOSTED_IRP_STATE_MASK) | kind
 }
 
+fn completion_owner_phase(kind: u64) -> Option<nt_io_manager::CompletionOwnerPhase> {
+    use nt_io_manager::CompletionOwnerPhase;
+    match kind {
+        HOSTED_IRP_DISPATCHING => Some(CompletionOwnerPhase::Dispatching),
+        HOSTED_IRP_STOPPED_DISPATCH => Some(CompletionOwnerPhase::StoppedDispatch),
+        HOSTED_IRP_PENDING => Some(CompletionOwnerPhase::Pending),
+        HOSTED_IRP_CANCEL_ROUTINE => Some(CompletionOwnerPhase::CancelRoutine),
+        HOSTED_IRP_COMPLETING_DISPATCH => Some(CompletionOwnerPhase::CompletingDispatch),
+        HOSTED_IRP_COMPLETING_PENDING => Some(CompletionOwnerPhase::CompletingPending),
+        HOSTED_IRP_COMPLETING_CANCEL => Some(CompletionOwnerPhase::CompletingCancel),
+        HOSTED_IRP_COMPLETED_DISPATCH => Some(CompletionOwnerPhase::CompletedDispatch),
+        HOSTED_IRP_READY => Some(CompletionOwnerPhase::Ready),
+        HOSTED_IRP_COMPLETED_CANCEL => Some(CompletionOwnerPhase::CompletedCancel),
+        HOSTED_IRP_COMPLETING_DEFERRED => Some(CompletionOwnerPhase::CompletingDeferred),
+        _ => None,
+    }
+}
+
+fn completion_owner_kind(phase: nt_io_manager::CompletionOwnerPhase) -> u64 {
+    use nt_io_manager::CompletionOwnerPhase;
+    match phase {
+        CompletionOwnerPhase::Dispatching => HOSTED_IRP_DISPATCHING,
+        CompletionOwnerPhase::StoppedDispatch => HOSTED_IRP_STOPPED_DISPATCH,
+        CompletionOwnerPhase::Pending => HOSTED_IRP_PENDING,
+        CompletionOwnerPhase::CancelRoutine => HOSTED_IRP_CANCEL_ROUTINE,
+        CompletionOwnerPhase::CompletingDispatch => HOSTED_IRP_COMPLETING_DISPATCH,
+        CompletionOwnerPhase::CompletingPending => HOSTED_IRP_COMPLETING_PENDING,
+        CompletionOwnerPhase::CompletingCancel => HOSTED_IRP_COMPLETING_CANCEL,
+        CompletionOwnerPhase::CompletedDispatch => HOSTED_IRP_COMPLETED_DISPATCH,
+        CompletionOwnerPhase::Ready => HOSTED_IRP_READY,
+        CompletionOwnerPhase::CompletedCancel => HOSTED_IRP_COMPLETED_CANCEL,
+        CompletionOwnerPhase::CompletingDeferred => HOSTED_IRP_COMPLETING_DEFERRED,
+    }
+}
+
 fn next_hosted_irp_generation(state: u64) -> u64 {
     let mut generation = (state & !HOSTED_IRP_STATE_MASK).wrapping_add(HOSTED_IRP_GENERATION_STEP);
     if generation == 0 {
@@ -1274,7 +1310,15 @@ struct PendingIrpCompletionTarget {
     major: u8,
 }
 
-unsafe fn claim_pending_irp_completion(irp: u64) -> Option<(u64, u64, PendingIrpCompletionTarget)> {
+#[derive(Clone, Copy)]
+struct PendingIrpCompletionClaim {
+    node: u64,
+    completing_state: u64,
+    owner_claim: nt_io_manager::CompletionOwnerClaim,
+    target: PendingIrpCompletionTarget,
+}
+
+unsafe fn claim_pending_irp_completion(irp: u64) -> Option<PendingIrpCompletionClaim> {
     let mut node = (&*pending_irp_head(FSD_DATA_VADDR).cast::<AtomicU64>()).load(Ordering::Acquire);
     let mut steps = 0u64;
     while node != 0 && steps < POOL_FREE_LIST_MAX {
@@ -1283,10 +1327,9 @@ unsafe fn claim_pending_irp_completion(irp: u64) -> Option<(u64, u64, PendingIrp
         }
         let state = pending_irp_owner_state(node).load(Ordering::Acquire);
         let kind = hosted_irp_state_kind(state);
-        if matches!(
-            kind,
-            HOSTED_IRP_DISPATCHING | HOSTED_IRP_PENDING | HOSTED_IRP_CANCEL_ROUTINE
-        ) {
+        if let Some(owner_claim) = completion_owner_phase(kind)
+            .and_then(nt_io_manager::CompletionOwnerClaim::begin)
+        {
             // The raw IRP identity and completion projection remain immutable while the owner is
             // active. Match the raw IRP before claiming the lifecycle word; the generation-bearing
             // CAS below proves that the inspected projection was not recycled before the claim.
@@ -1296,24 +1339,18 @@ unsafe fn claim_pending_irp_completion(irp: u64) -> Option<(u64, u64, PendingIrp
                 steps += 1;
                 continue;
             }
-            let completing = hosted_irp_state_with_kind(
-                state,
-                match kind {
-                    HOSTED_IRP_DISPATCHING => HOSTED_IRP_COMPLETING_DISPATCH,
-                    HOSTED_IRP_PENDING => HOSTED_IRP_COMPLETING_PENDING,
-                    HOSTED_IRP_CANCEL_ROUTINE => HOSTED_IRP_COMPLETING_CANCEL,
-                    _ => unreachable!(),
-                },
-            );
+            let completing =
+                hosted_irp_state_with_kind(state, completion_owner_kind(owner_claim.claimed()));
             if pending_irp_owner_state(node)
                 .compare_exchange(state, completing, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 let entry = pending_irp_entry_address(node);
-                return Some((
+                return Some(PendingIrpCompletionClaim {
                     node,
-                    completing,
-                    PendingIrpCompletionTarget {
+                    completing_state: completing,
+                    owner_claim,
+                    target: PendingIrpCompletionTarget {
                         data: read_volatile(
                             (entry + core::mem::offset_of!(PendingIrp, data) as u64) as *const u64,
                         ),
@@ -1330,7 +1367,7 @@ unsafe fn claim_pending_irp_completion(irp: u64) -> Option<(u64, u64, PendingIrp
                             (entry + core::mem::offset_of!(PendingIrp, major) as u64) as *const u8,
                         ),
                     },
-                ));
+                });
             }
             continue;
         }
@@ -1338,6 +1375,75 @@ unsafe fn claim_pending_irp_completion(irp: u64) -> Option<(u64, u64, PendingIrp
         steps += 1;
     }
     None
+}
+
+unsafe fn pending_irp_raw_identity_exists(irp: u64) -> bool {
+    let mut node = (&*pending_irp_head(FSD_DATA_VADDR).cast::<AtomicU64>()).load(Ordering::Acquire);
+    let mut steps = 0u64;
+    while node != 0 && steps < POOL_FREE_LIST_MAX {
+        if !pending_irp_node_valid(node) {
+            return false;
+        }
+        let kind = hosted_irp_state_kind(pending_irp_owner_state(node).load(Ordering::Acquire));
+        if kind != HOSTED_IRP_TOMBSTONE
+            && pending_irp_raw_irp(node).load(Ordering::Relaxed) == irp
+        {
+            return true;
+        }
+        node = read_volatile(node as *const u64);
+        steps += 1;
+    }
+    false
+}
+
+unsafe fn release_pending_irp_completion_claim(
+    claim: PendingIrpCompletionClaim,
+    release: nt_io_manager::CompletionClaimRelease,
+) {
+    let active = hosted_irp_state_with_kind(
+        claim.completing_state,
+        completion_owner_kind(claim.owner_claim.release(release, false)),
+    );
+    if pending_irp_owner_state(claim.node)
+        .compare_exchange(
+            claim.completing_state,
+            active,
+            Ordering::Release,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        return;
+    }
+
+    // A dispatch or cancel caller may transfer ownership while this worker is unwinding. Once it
+    // publishes DEFERRED that caller has returned, so both a stopped unwind and a failed attempt
+    // must leave the graph with the ordinary asynchronous owner.
+    let deferred =
+        hosted_irp_state_with_kind(claim.completing_state, HOSTED_IRP_COMPLETING_DEFERRED);
+    let handed_off = hosted_irp_state_with_kind(
+        claim.completing_state,
+        completion_owner_kind(claim.owner_claim.release(release, true)),
+    );
+    pending_irp_owner_state(claim.node)
+        .compare_exchange(
+            deferred,
+            handed_off,
+            Ordering::Release,
+            Ordering::Acquire,
+        )
+        .expect("hosted IRP completion claim lost its caller handoff");
+}
+
+unsafe fn restore_pending_irp_completion_claim(claim: PendingIrpCompletionClaim) {
+    release_pending_irp_completion_claim(
+        claim,
+        nt_io_manager::CompletionClaimRelease::Restore,
+    );
+}
+
+unsafe fn park_pending_irp_completion_claim(claim: PendingIrpCompletionClaim) {
+    release_pending_irp_completion_claim(claim, nt_io_manager::CompletionClaimRelease::Stop);
 }
 
 unsafe fn tombstone_pending_irp_owner(node: u64, consuming_state: u64) {
@@ -1379,7 +1485,6 @@ unsafe fn release_pending_irp_graph_component(entry: PendingIrp) {
         entry.create_access_state,
         entry.create_security_context,
         entry.pnp_resource_list,
-        entry.iosl,
         entry.irp,
         if entry.owns_fo { entry.file_object } else { 0 },
     ];
@@ -6821,6 +6926,7 @@ unsafe fn irp_next_stack_location(irp: u64) -> u64 {
 const WDM_X64_IRP_CURRENT_LOCATION_OFFSET: u64 = 0x43;
 const WDM_X64_IRP_STACK_COUNT_OFFSET: u64 = 0x42;
 const WDM_X64_IRP_IO_STATUS_STATUS_OFFSET: u64 = 0x30;
+const WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET: u64 = 0x38;
 const WDM_X64_IRP_PENDING_RETURNED_OFFSET: u64 = 0x41;
 const WDM_X64_IRP_CANCEL_OFFSET: u64 = 0x44;
 const WDM_X64_IRP_CANCEL_IRQL_OFFSET: u64 = 0x45;
@@ -6832,8 +6938,8 @@ const WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET: u64 = 0x28;
 const WDM_X64_IO_STACK_COMPLETION_ROUTINE_OFFSET: u64 = 0x38;
 const WDM_X64_IO_STACK_CONTEXT_OFFSET: u64 = 0x40;
 const WDM_X64_IO_STACK_COPY_TO_NEXT_BYTES: u64 = WDM_X64_IO_STACK_COMPLETION_ROUTINE_OFFSET;
-const WDM_X64_SL_INVOKE_ON_SUCCESS: u8 = 0x40;
-const WDM_X64_SL_INVOKE_ON_ERROR: u8 = 0x80;
+const WDM_X64_SL_PENDING_RETURNED: u8 = 0x01;
+const WDM_X64_SL_ERROR_RETURNED: u8 = 0x02;
 
 const WDM_X64_IO_TYPE_IRP: u16 = 6;
 const IO_TYPE_CSQ_IRP_CONTEXT: u32 = 1;
@@ -6926,7 +7032,7 @@ extern "win64" fn s_io_allocate_irp(stack_size: u8, _charge_quota: u8) -> u64 {
         core::ptr::write_bytes(irp as *mut u8, 0, total as usize);
         let stack_base = irp + WDM_X64_IRP_SIZE as u64;
         write_unaligned(irp as *mut u16, WDM_X64_IO_TYPE_IRP);
-        write_unaligned((irp + 2) as *mut u16, WDM_X64_IRP_SIZE as u16);
+        write_unaligned((irp + 2) as *mut u16, total as u16);
         write_unaligned(
             (irp + WDM_X64_IRP_STACK_COUNT_OFFSET) as *mut u8,
             stack_size,
@@ -6959,16 +7065,100 @@ extern "win64" fn s_io_build_device_io_control_request(
     output_buffer: u64,
     output_buffer_length: u32,
     internal_device_io_control: u8,
-    _event: u64,
+    event: u64,
     io_status_block: u64,
 ) -> u64 {
-    let irp = s_io_allocate_irp(1, 0);
+    if device_object == 0 {
+        return 0;
+    }
+    let stack_size = unsafe {
+        component_pool_allocation_capacity(device_object)
+            .filter(|capacity| *capacity >= 0x50)
+            .map(|_| read_unaligned((device_object + 0x4c) as *const u8).max(1))
+            .unwrap_or(1)
+    };
+    let irp = s_io_allocate_irp(stack_size, 0);
     if irp == 0 {
         return 0;
     }
     unsafe {
+        let method = io_control_code & 3;
+        let mut system_buffer = 0u64;
+        let mut user_buffer = 0u64;
+        let mut mdl = 0u64;
+        let mut flags = 0u32;
+        let type3_input_buffer;
+        match method {
+            ioctl::METHOD_BUFFERED => {
+                let length = input_buffer_length.max(output_buffer_length) as u64;
+                if length != 0 {
+                    system_buffer = pool_alloc_zeroed(length);
+                    if system_buffer == 0 {
+                        pool_free(irp);
+                        return 0;
+                    }
+                    if input_buffer != 0 && input_buffer_length != 0 {
+                        core::ptr::copy_nonoverlapping(
+                            input_buffer as *const u8,
+                            system_buffer as *mut u8,
+                            input_buffer_length as usize,
+                        );
+                    }
+                    flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER;
+                    if output_buffer != 0 {
+                        flags |= IRP_INPUT_OPERATION;
+                    }
+                    user_buffer = output_buffer;
+                }
+                type3_input_buffer = 0;
+            }
+            ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT => {
+                if input_buffer != 0 && input_buffer_length != 0 {
+                    system_buffer = pool_alloc(input_buffer_length as u64);
+                    if system_buffer == 0 {
+                        pool_free(irp);
+                        return 0;
+                    }
+                    core::ptr::copy_nonoverlapping(
+                        input_buffer as *const u8,
+                        system_buffer as *mut u8,
+                        input_buffer_length as usize,
+                    );
+                    flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER;
+                }
+                if output_buffer != 0 && output_buffer_length != 0 {
+                    mdl = s_io_allocate_mdl(
+                        output_buffer,
+                        output_buffer_length,
+                        0,
+                        0,
+                        irp,
+                    );
+                    if mdl == 0 {
+                        if system_buffer != 0 {
+                            pool_free(system_buffer);
+                        }
+                        pool_free(irp);
+                        return 0;
+                    }
+                }
+                type3_input_buffer = 0;
+            }
+            ioctl::METHOD_NEITHER => {
+                user_buffer = output_buffer;
+                type3_input_buffer = input_buffer;
+            }
+            _ => unreachable!(),
+        }
+
         let stack = irp_next_stack_location(irp);
         if stack == 0 {
+            if mdl != 0 {
+                s_io_free_mdl(mdl);
+            }
+            if system_buffer != 0 {
+                pool_free(system_buffer);
+            }
             pool_free(irp);
             return 0;
         }
@@ -6990,26 +7180,28 @@ extern "win64" fn s_io_build_device_io_control_request(
                     output_buffer_length,
                     input_buffer_length,
                     io_control_code,
-                    type3_input_buffer: input_buffer,
+                    type3_input_buffer,
                 },
             },
         )
         .is_err()
         {
+            if mdl != 0 {
+                s_io_free_mdl(mdl);
+            }
+            if system_buffer != 0 {
+                pool_free(system_buffer);
+            }
             pool_free(irp);
             return 0;
         }
-        let system_buffer = if input_buffer != 0 {
-            input_buffer
-        } else {
-            output_buffer
-        };
+        write_unaligned((irp + 0x08) as *mut u64, mdl);
+        write_unaligned((irp + 0x10) as *mut u32, flags);
         write_unaligned((irp + 0x18) as *mut u64, system_buffer);
-        write_unaligned((irp + 0x38) as *mut u64, 0);
-        if io_status_block != 0 {
-            write_unaligned(io_status_block as *mut i32, STATUS_SUCCESS);
-            write_unaligned((io_status_block + 8) as *mut u64, 0);
-        }
+        write_unaligned((irp + 0x48) as *mut u64, io_status_block);
+        write_unaligned((irp + 0x50) as *mut u64, event);
+        write_unaligned((irp + 0x70) as *mut u64, user_buffer);
+        write_unaligned((irp + 0xa8) as *mut u64, s_current_process());
     }
     irp
 }
@@ -7310,52 +7502,73 @@ extern "win64" fn s_io_csq_remove_next_irp(csq: u64, peek_context: u64) -> u64 {
 /// `NTSTATUS IofCallDriver(PDEVICE_OBJECT, PIRP)`.
 extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
     unsafe {
-        let mut next = 0;
-        let mut previous_location = 0u8;
-        let mut current_location_after_forward = 0u8;
-        let mut forwarded_minor = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64);
-        if irp != 0 {
-            let current_location =
-                read_unaligned((irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *const u8);
-            if current_location == 0 {
-                return 0xC000_0010u32 as i32; // STATUS_INVALID_DEVICE_REQUEST
-            }
-            previous_location = current_location;
-            current_location_after_forward = current_location - 1;
-            write_unaligned(
-                (irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *mut u8,
-                current_location_after_forward,
-            );
-            next = irp_next_stack_location(irp);
-            if next != 0 {
-                write_unaligned((irp + 0xb8) as *mut u64, next);
-                write_unaligned(
-                    (next + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *mut u64,
-                    device,
-                );
-                forwarded_minor =
-                    read_unaligned((next + WDM_X64_IO_STACK_MINOR_OFFSET) as *const u8) as u64;
-            }
-        }
-        let expected_pdo = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
-        let status = if expected_pdo == 0 {
-            0
-        } else if device == expected_pdo {
-            write_volatile(
-                (FSD_SHARED_VADDR + SH_ROOT_PDO_FORWARDED_MINOR) as *mut u64,
-                forwarded_minor,
-            );
-            0
-        } else {
-            0xC000_0010u32 as i32 // STATUS_INVALID_DEVICE_REQUEST
+        let Some((_, previous_location, _)) = validate_hosted_irp_packet(irp) else {
+            return 0xC000_0010u32 as i32; // STATUS_INVALID_DEVICE_REQUEST
         };
-        write_volatile(
-            (FSD_SHARED_VADDR + SH_ROOT_PDO_FORWARDED_STATUS) as *mut i32,
-            status,
+        if previous_location <= 1 || device == 0 {
+            return 0xC000_0010u32 as i32;
+        }
+        let current_location_after_forward = previous_location - 1;
+        let next = irp_next_stack_location(irp);
+        write_unaligned(
+            (irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *mut u8,
+            current_location_after_forward,
         );
+        write_unaligned((irp + 0xb8) as *mut u64, next);
+        write_unaligned(
+            (next + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *mut u64,
+            device,
+        );
+        let forwarded_minor =
+            read_unaligned((next + WDM_X64_IO_STACK_MINOR_OFFSET) as *const u8) as u64;
+        let major = read_unaligned(next as *const u8) as u64;
+
+        let driver_object = component_pool_allocation_capacity(device)
+            .filter(|capacity| *capacity >= 0x50)
+            .map(|_| read_unaligned((device + 0x08) as *const u64))
+            .unwrap_or(0);
+        if driver_object != 0 {
+            if !major::is_valid_major(major as u8)
+                || component_pool_allocation_capacity(driver_object)
+                    .is_none_or(|capacity| capacity < WDM_X64_DRIVER_OBJECT_SIZE as u64)
+            {
+                return 0xC000_0010u32 as i32;
+            }
+            let handler = read_unaligned(
+                (driver_object + WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET as u64 + major * 8)
+                    as *const u64,
+            );
+            if handler == 0 {
+                return 0xC000_0010u32 as i32;
+            }
+            trace_wdm_forward_call(
+                device,
+                irp,
+                previous_location,
+                current_location_after_forward,
+                next,
+                forwarded_minor,
+                STATUS_PENDING as i32,
+            );
+            let dispatch: extern "win64" fn(u64, u64) -> i32 =
+                core::mem::transmute(handler as *const ());
+            return dispatch(device, irp);
+        }
+
+        let status = if major == IRP_MJ_PNP {
+            let (_, result, _, _, _) = call_on4(
+                (FSD_SERVICE_ROOT_PDO_PNP_LABEL << 12) | 2,
+                device,
+                forwarded_minor,
+                0,
+                0,
+            );
+            result as u32 as i32
+        } else {
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST.raw()
+        };
         trace_wdm_forward_call(
             device,
-            expected_pdo,
             irp,
             previous_location,
             current_location_after_forward,
@@ -7363,22 +7576,21 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
             forwarded_minor,
             status,
         );
-        if irp != 0 {
-            write_unaligned(
-                (irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *mut i32,
-                status,
-            );
-            if next != 0 {
-                complete_forwarded_stack_location(irp, next, status);
-            }
-        }
+        write_unaligned(
+            (irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *mut i32,
+            status,
+        );
+        write_unaligned(
+            (irp + WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET) as *mut u64,
+            0,
+        );
+        s_io_complete_request(irp, 0);
         status
     }
 }
 
 unsafe fn trace_wdm_forward_call(
     device: u64,
-    expected_pdo: u64,
     irp: u64,
     previous_location: u8,
     current_location: u8,
@@ -7386,9 +7598,6 @@ unsafe fn trace_wdm_forward_call(
     minor: u64,
     status: i32,
 ) {
-    if expected_pdo == 0 {
-        return;
-    }
     if WDM_FORWARD_CALL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= WDM_FORWARD_TRACE_CAP {
         return;
     }
@@ -7409,8 +7618,6 @@ unsafe fn trace_wdm_forward_call(
     };
     print_str(b"[wdm-forward] dev=");
     print_hex64(device);
-    print_str(b" expected=");
-    print_hex64(expected_pdo);
     print_str(b" irp=");
     print_hex64(irp);
     print_str(b" loc=");
@@ -7432,58 +7639,164 @@ unsafe fn trace_wdm_forward_call(
     print_str(b"\n");
 }
 
-unsafe fn complete_forwarded_stack_location(irp: u64, stack: u64, status: i32) {
-    let completion =
-        read_unaligned((stack + WDM_X64_IO_STACK_COMPLETION_ROUTINE_OFFSET) as *const u64);
-    if completion == 0 {
-        return;
-    }
-    let control = read_unaligned((stack + WDM_X64_IO_STACK_CONTROL_OFFSET) as *const u8);
-    let invoke = if status >= 0 {
-        (control & WDM_X64_SL_INVOKE_ON_SUCCESS) != 0
-    } else {
-        (control & WDM_X64_SL_INVOKE_ON_ERROR) != 0
-    };
-    let context = read_unaligned((stack + WDM_X64_IO_STACK_CONTEXT_OFFSET) as *const u64);
-    if !invoke {
-        trace_wdm_forward_completion(
-            irp, stack, status, completion, control, false, 0, 0, context,
-        );
-        return;
-    }
-
-    let current_location = read_unaligned((irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *const u8);
-    let stack_count = read_unaligned((irp + WDM_X64_IRP_STACK_COUNT_OFFSET) as *const u8);
-    let next_location = current_location.saturating_add(1);
-    let next_stack = stack + WDM_X64_IO_STACK_LOCATION_SIZE as u64;
-    write_unaligned(
-        (irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *mut u8,
-        next_location,
-    );
-    write_unaligned((irp + 0xb8) as *mut u64, next_stack);
-
-    let device_object = if next_location <= stack_count {
-        read_unaligned((next_stack + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *const u64)
-    } else {
-        0
-    };
-    trace_wdm_forward_completion(
-        irp,
-        stack,
-        status,
-        completion,
-        control,
-        true,
-        next_stack,
-        device_object,
-        context,
-    );
-    let routine: extern "win64" fn(u64, u64, u64) -> i32 =
-        core::mem::transmute(completion as *const ());
-    let _ = routine(device_object, irp, context);
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum HostedIrpUnwindOutcome {
+    Terminal,
+    MoreProcessingRequired,
 }
 
-unsafe fn trace_wdm_forward_completion(
+unsafe fn validate_hosted_irp_packet(irp: u64) -> Option<(u8, u8, u64)> {
+    let capacity = component_pool_allocation_capacity(irp)?;
+    if capacity < WDM_X64_IRP_SIZE as u64
+        || read_unaligned(irp as *const u16) != WDM_X64_IO_TYPE_IRP
+    {
+        return None;
+    }
+    let packet_size = read_unaligned((irp + 2) as *const u16) as u64;
+    let stack_count = read_unaligned((irp + WDM_X64_IRP_STACK_COUNT_OFFSET) as *const u8);
+    let current_location =
+        read_unaligned((irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *const u8);
+    let required = (WDM_X64_IRP_SIZE as u64).checked_add(
+        (stack_count as u64).checked_mul(WDM_X64_IO_STACK_LOCATION_SIZE as u64)?,
+    )?;
+    let terminal_location = stack_count.checked_add(1)?;
+    if stack_count == 0
+        || current_location == 0
+        || current_location > terminal_location
+        || packet_size < required
+        || packet_size > capacity
+    {
+        return None;
+    }
+    let expected_stack = (irp + WDM_X64_IRP_SIZE as u64).checked_add(
+        (current_location as u64 - 1).checked_mul(WDM_X64_IO_STACK_LOCATION_SIZE as u64)?,
+    )?;
+    (irp_current_stack_location(irp) == expected_stack).then_some((
+        stack_count,
+        current_location,
+        expected_stack,
+    ))
+}
+
+unsafe fn clear_completed_stack_location(stack: u64) {
+    write_unaligned((stack + 0x01) as *mut u8, 0);
+    write_unaligned((stack + 0x02) as *mut u8, 0);
+    let control = read_unaligned((stack + WDM_X64_IO_STACK_CONTROL_OFFSET) as *const u8);
+    write_unaligned(
+        (stack + WDM_X64_IO_STACK_CONTROL_OFFSET) as *mut u8,
+        control & WDM_X64_SL_ERROR_RETURNED,
+    );
+    write_unaligned((stack + 0x08) as *mut u64, 0);
+    write_unaligned((stack + 0x10) as *mut u64, 0);
+    write_unaligned((stack + 0x18) as *mut u64, 0);
+    write_unaligned((stack + 0x30) as *mut u64, 0);
+}
+
+/// Run the native bottom-to-top completion walk. The raw cursor is advanced before every callback,
+/// and no IRP field is touched after a routine returns `STATUS_MORE_PROCESSING_REQUIRED`.
+unsafe fn unwind_hosted_irp(irp: u64) -> Result<HostedIrpUnwindOutcome, ()> {
+    let (stack_count, current_location, mut stack) = validate_hosted_irp_packet(irp).ok_or(())?;
+    let mut cursor = nt_io_manager::CompletionUnwindCursor::new(stack_count, current_location)
+        .map_err(|_| ())?;
+    let last_stack = irp + WDM_X64_IRP_SIZE as u64;
+    let mut error_code = if read_unaligned(
+        (last_stack + WDM_X64_IO_STACK_CONTROL_OFFSET) as *const u8,
+    ) & WDM_X64_SL_ERROR_RETURNED
+        != 0
+    {
+        read_unaligned((last_stack + 0x20) as *const i32)
+    } else {
+        STATUS_SUCCESS
+    };
+
+    while !cursor.is_terminal() {
+        let status = read_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *const i32);
+        if status < 0 && status != error_code {
+            error_code = status;
+            let current_control =
+                read_unaligned((stack + WDM_X64_IO_STACK_CONTROL_OFFSET) as *const u8);
+            write_unaligned(
+                (stack + WDM_X64_IO_STACK_CONTROL_OFFSET) as *mut u8,
+                current_control | WDM_X64_SL_ERROR_RETURNED,
+            );
+            write_unaligned((last_stack + 0x20) as *mut i32, error_code);
+            let last_control = read_unaligned(
+                (last_stack + WDM_X64_IO_STACK_CONTROL_OFFSET) as *const u8,
+            );
+            write_unaligned(
+                (last_stack + WDM_X64_IO_STACK_CONTROL_OFFSET) as *mut u8,
+                last_control | WDM_X64_SL_ERROR_RETURNED,
+            );
+        }
+
+        let control = read_unaligned((stack + WDM_X64_IO_STACK_CONTROL_OFFSET) as *const u8);
+        let completion = read_unaligned(
+            (stack + WDM_X64_IO_STACK_COMPLETION_ROUTINE_OFFSET) as *const u64,
+        );
+        let context = read_unaligned((stack + WDM_X64_IO_STACK_CONTEXT_OFFSET) as *const u64);
+        let cancelled = read_unaligned((irp + WDM_X64_IRP_CANCEL_OFFSET) as *const u8) != 0;
+        let frame = cursor
+            .next_frame(
+                nt_io_manager::StackControl::from_bits_retain(control),
+                completion != 0,
+                nt_status::NtStatus(status),
+                cancelled,
+            )
+            .map_err(|_| ())?
+            .ok_or(())?;
+
+        write_unaligned(
+            (irp + WDM_X64_IRP_PENDING_RETURNED_OFFSET) as *mut u8,
+            frame.pending_returned as u8,
+        );
+        let next_stack = stack + WDM_X64_IO_STACK_LOCATION_SIZE as u64;
+        write_unaligned(
+            (irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *mut u8,
+            frame.next_location,
+        );
+        write_unaligned((irp + 0xb8) as *mut u64, next_stack);
+
+        let device_object = if frame.completion_device_location.is_some() {
+            read_unaligned((next_stack + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *const u64)
+        } else {
+            0
+        };
+        clear_completed_stack_location(stack);
+        if frame.propagate_pending {
+            let upper_control =
+                read_unaligned((next_stack + WDM_X64_IO_STACK_CONTROL_OFFSET) as *const u8);
+            write_unaligned(
+                (next_stack + WDM_X64_IO_STACK_CONTROL_OFFSET) as *mut u8,
+                upper_control | WDM_X64_SL_PENDING_RETURNED,
+            );
+        }
+        trace_wdm_completion(
+            irp,
+            stack,
+            status,
+            completion,
+            control,
+            frame.invoke_routine,
+            next_stack,
+            device_object,
+            context,
+        );
+        if frame.invoke_routine {
+            let routine: extern "win64" fn(u64, u64, u64) -> i32 =
+                core::mem::transmute(completion as *const ());
+            let disposition = nt_io_manager::CompletionRoutineDisposition::from_status(
+                nt_status::NtStatus(routine(device_object, irp, context)),
+            );
+            if disposition == nt_io_manager::CompletionRoutineDisposition::Stop {
+                return Ok(HostedIrpUnwindOutcome::MoreProcessingRequired);
+            }
+        }
+        stack = next_stack;
+    }
+    Ok(HostedIrpUnwindOutcome::Terminal)
+}
+
+unsafe fn trace_wdm_completion(
     irp: u64,
     stack: u64,
     status: i32,
@@ -7497,7 +7810,7 @@ unsafe fn trace_wdm_forward_completion(
     if WDM_FORWARD_COMPLETION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= WDM_FORWARD_TRACE_CAP {
         return;
     }
-    print_str(b"[wdm-forward-complete] irp=");
+    print_str(b"[wdm-complete] irp=");
     print_hex64(irp);
     print_str(b" stack=");
     print_hex64(stack);
@@ -9234,19 +9547,63 @@ extern "win64" fn s_io_register_file_system(_dev: u64) {
     }
 }
 
-/// `void IoCompleteRequest(PIRP, CCHAR)`. Synchronous requests are reclaimed by `run_irp` after the
-/// dispatch routine returns. A later peer operation can complete an older pending pipe IRP from
-/// npfs's deferred list; reclaim that retained request graph here instead of leaking it forever.
+unsafe fn finish_driver_local_irp(irp: u64) {
+    let status = read_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *const i32);
+    let information =
+        read_unaligned((irp + WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET) as *const u64);
+    let user_iosb = read_unaligned((irp + 0x48) as *const u64);
+    let user_event = read_unaligned((irp + 0x50) as *const u64);
+    if user_iosb != 0 {
+        write_unaligned(user_iosb as *mut i32, status);
+        write_unaligned((user_iosb + 8) as *mut u64, information);
+    }
+    if user_event != 0 {
+        let _ = s_ke_set_event(user_event, 0, 0);
+    }
+
+    let flags = read_unaligned((irp + 0x10) as *const u32);
+    let system_buffer = read_unaligned((irp + 0x18) as *const u64);
+    let user_buffer = read_unaligned((irp + 0x70) as *const u64);
+    let mdl = read_unaligned((irp + 0x08) as *const u64);
+    if flags & (IRP_BUFFERED_IO | IRP_INPUT_OPERATION)
+        == (IRP_BUFFERED_IO | IRP_INPUT_OPERATION)
+        && system_buffer != 0
+        && user_buffer != 0
+        && status as u32 != 0x8000_0016 // STATUS_VERIFY_REQUIRED
+        && (status as u32 >> 30) != 3
+    {
+        let copy_len = component_pool_allocation_capacity(system_buffer)
+            .map(|capacity| information.min(capacity))
+            .unwrap_or(0);
+        if copy_len != 0 {
+            core::ptr::copy_nonoverlapping(
+                system_buffer as *const u8,
+                user_buffer as *mut u8,
+                copy_len as usize,
+            );
+        }
+    }
+    if flags & IRP_DEALLOCATE_BUFFER != 0
+        && system_buffer != 0
+        && component_pool_allocation_capacity(system_buffer).is_some()
+    {
+        pool_free(system_buffer);
+    }
+    if mdl != 0 && component_pool_allocation_capacity(mdl).is_some() {
+        s_io_free_mdl(mdl);
+    }
+    pool_free(irp);
+}
+
+/// `void IoCompleteRequest(PIRP, CCHAR)`. Every raw WDM IRP uses the same native completion-stack
+/// walk. Requestor IRPs publish through their exact retained owner only after the walk reaches the
+/// top; driver-local IRPs use normal IOSB/event delivery and are then reclaimed.
 extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
     unsafe {
-        let Some((node, completing_state, target)) = claim_pending_irp_completion(irp) else {
-            if PEER_COMPLETION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8 {
-                print_str(b"[fsd-peer-complete] IRP=");
-                print_hex64(irp);
-                print_str(b" has no claimable owner\n");
-            }
-            return;
-        };
+        let claim = claim_pending_irp_completion(irp);
+        if claim.is_none() && pending_irp_raw_identity_exists(irp) {
+            panic!("IoCompleteRequest attempted to complete an owned IRP twice");
+        }
         let active_seq = FSD_ACTIVE_DISPATCH_SEQ.load(Ordering::Relaxed);
         if active_seq >= 128 && FSD_ACTIVE_COMPLETE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16
         {
@@ -9278,15 +9635,53 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
                 print_str(b"\n");
             }
         }
-        if component_pool_allocation_capacity(irp)
-            .is_none_or(|capacity| capacity < WDM_X64_IRP_SIZE as u64)
-        {
-            panic!("IoCompleteRequest received an invalid hosted IRP");
+        if validate_hosted_irp_packet(irp).is_none() {
+            if let Some(claim) = claim {
+                restore_pending_irp_completion_claim(claim);
+            }
+            panic!("IoCompleteRequest received an invalid hosted IRP stack");
         }
-        let status = read_unaligned((irp + 0x30) as *const u32);
-        if status == STATUS_PENDING {
+        if read_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *const u32)
+            == STATUS_PENDING
+        {
+            if let Some(claim) = claim {
+                restore_pending_irp_completion_claim(claim);
+            }
             panic!("IoCompleteRequest cannot complete an IRP with STATUS_PENDING");
         }
+        if read_unaligned((irp + WDM_X64_IRP_CANCEL_ROUTINE_OFFSET) as *const u64) != 0 {
+            if let Some(claim) = claim {
+                restore_pending_irp_completion_claim(claim);
+            }
+            panic!("IoCompleteRequest received an IRP with a live cancel routine");
+        }
+        match unwind_hosted_irp(irp) {
+            Ok(HostedIrpUnwindOutcome::MoreProcessingRequired) => {
+                if let Some(claim) = claim {
+                    park_pending_irp_completion_claim(claim);
+                }
+                return;
+            }
+            Ok(HostedIrpUnwindOutcome::Terminal) => {}
+            Err(()) => {
+                if let Some(claim) = claim {
+                    restore_pending_irp_completion_claim(claim);
+                }
+                panic!("IoCompleteRequest received an invalid hosted IRP stack");
+            }
+        }
+        if read_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *const u32)
+            == STATUS_PENDING
+        {
+            panic!("completion routine left a terminal IRP with STATUS_PENDING");
+        }
+        let Some(claim) = claim else {
+            finish_driver_local_irp(irp);
+            return;
+        };
+        let node = claim.node;
+        let target = claim.target;
+        let status = read_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *const u32);
         let information = read_unaligned((irp + 0x38) as *const u64);
         // A completing pending READ carries the peer's just-written payload in its IRP buffer. Retain
         // those bytes under the canonical IRP id so the executive delivers them to the exact waiter.
@@ -9344,58 +9739,10 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
                 as *mut nt_io_manager::RetainedIrpCompletion,
             completion,
         );
-        let completing_kind = hosted_irp_state_kind(completing_state);
-        match completing_kind {
-            HOSTED_IRP_COMPLETING_DISPATCH => {
-                let completed =
-                    hosted_irp_state_with_kind(completing_state, HOSTED_IRP_COMPLETED_DISPATCH);
-                if pending_irp_owner_state(node)
-                    .compare_exchange(
-                        completing_state,
-                        completed,
-                        Ordering::Release,
-                        Ordering::Acquire,
-                    )
-                    .is_err()
-                {
-                    let deferred = hosted_irp_state_with_kind(
-                        completing_state,
-                        HOSTED_IRP_COMPLETING_DEFERRED,
-                    );
-                    let ready = hosted_irp_state_with_kind(completing_state, HOSTED_IRP_READY);
-                    pending_irp_owner_state(node)
-                        .compare_exchange(deferred, ready, Ordering::Release, Ordering::Acquire)
-                        .expect("hosted inline completion lost its post-dispatch handoff");
-                }
-            }
-            HOSTED_IRP_COMPLETING_PENDING => pending_irp_owner_state(node).store(
-                hosted_irp_state_with_kind(completing_state, HOSTED_IRP_READY),
-                Ordering::Release,
-            ),
-            HOSTED_IRP_COMPLETING_CANCEL => {
-                let completed =
-                    hosted_irp_state_with_kind(completing_state, HOSTED_IRP_COMPLETED_CANCEL);
-                if pending_irp_owner_state(node)
-                    .compare_exchange(
-                        completing_state,
-                        completed,
-                        Ordering::Release,
-                        Ordering::Acquire,
-                    )
-                    .is_err()
-                {
-                    let deferred = hosted_irp_state_with_kind(
-                        completing_state,
-                        HOSTED_IRP_COMPLETING_DEFERRED,
-                    );
-                    let ready = hosted_irp_state_with_kind(completing_state, HOSTED_IRP_READY);
-                    pending_irp_owner_state(node)
-                        .compare_exchange(deferred, ready, Ordering::Release, Ordering::Acquire)
-                        .expect("hosted cancel completion lost its caller handoff");
-                }
-            }
-            _ => unreachable!(),
-        }
+        release_pending_irp_completion_claim(
+            claim,
+            nt_io_manager::CompletionClaimRelease::Terminal,
+        );
         if PEER_COMPLETION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8 {
             print_str(b"[fsd-peer-complete] major=");
             print_u64(target.major as u64);
@@ -26480,8 +26827,8 @@ extern "win64" fn s_hosted_provider_callback_gate_body(
 ///
 /// x64 layouts (references/nt5 io.h): FILE_OBJECT { DeviceObject@8, FsContext@0x18, FsContext2@0x20,
 /// RelatedFileObject@0x40, FileName(UNICODE_STRING)@0x58 }. IRP { MdlAddress@0x08, Flags@0x10,
-/// AssociatedIrp.SystemBuffer@0x18, IoStatus@0x30, CurrentLocation (CCHAR)@0x42,
-/// StackCount@0x43, UserBuffer@0x70,
+/// AssociatedIrp.SystemBuffer@0x18, IoStatus@0x30, StackCount@0x42,
+/// CurrentLocation@0x43, UserBuffer@0x70,
 /// Tail.Overlay.CurrentStackLocation@0xb8 }. IO_STACK_LOCATION { Major@0, Minor@1, Parameters(union)
 /// @0x08, DeviceObject@0x28, FileObject@0x30 }.
 unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
@@ -26723,24 +27070,27 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     // Read/Write: Length@+0x08. QueryFile/SetFile: Length@+0x08, FileInformationClass@+0x10.
     // FS/DeviceControl: OutputBufferLength@+0x08, InputBufferLength@+0x10, IoControlCode@+0x18,
     // Type3InputBuffer@+0x20. `Irp->UserBuffer` carries the output buffer.
-    let iosl_len = if major == IRP_MJ_PNP {
-        WDM_X64_IO_STACK_LOCATION_SIZE as u64 * 2
+    let stack_count = if devobj != 0
+        && component_pool_allocation_capacity(devobj).is_some_and(|capacity| capacity >= 0x50)
+    {
+        read_unaligned((devobj + 0x4c) as *const u8).max(1)
     } else {
-        WDM_X64_IO_STACK_LOCATION_SIZE as u64
+        1
     };
-    let iosl = pool_alloc(iosl_len);
-    if iosl == 0 {
+    let iosl_len = (stack_count as u64).saturating_mul(WDM_X64_IO_STACK_LOCATION_SIZE as u64);
+    let irp_packet_len = (WDM_X64_IRP_SIZE as u64).saturating_add(iosl_len);
+    let irp = pool_alloc(irp_packet_len);
+    if irp == 0 {
         pool_free_request_buffers(data, aux_data, mdl);
         if owns_fo {
             pool_free(fo);
         }
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
     }
-    let current_iosl = if major == IRP_MJ_PNP {
-        iosl + WDM_X64_IO_STACK_LOCATION_SIZE as u64
-    } else {
-        iosl
-    };
+    core::ptr::write_bytes(irp as *mut u8, 0, irp_packet_len as usize);
+    let iosl = irp + WDM_X64_IRP_SIZE as u64;
+    let current_iosl = iosl
+        + (stack_count as u64 - 1).saturating_mul(WDM_X64_IO_STACK_LOCATION_SIZE as u64);
     let mut pnp_resource_list = 0u64;
     let mut create_security_context = 0u64;
     let mut create_access_state = 0u64;
@@ -26759,7 +27109,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             // (create-named-pipe only) the NAMED_PIPE_CREATE_PARAMETERS. Build valid blocks from the pool.
             create_security_context = pool_alloc(0x20); // IO_SECURITY_CONTEXT
             if create_security_context == 0 {
-                pool_free(iosl);
+                pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
                     pool_free(fo);
@@ -26769,7 +27119,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             create_access_state = pool_alloc(0x80); // ACCESS_STATE
             if create_access_state == 0 {
                 pool_free_irp_auxiliary_graph(0, create_security_context, 0, 0);
-                pool_free(iosl);
+                pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
                     pool_free(fo);
@@ -26811,7 +27161,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                         create_access_state,
                         0,
                     );
-                    pool_free(iosl);
+                    pool_free(irp);
                     pool_free_request_buffers(data, aux_data, mdl);
                     if owns_fo {
                         pool_free(fo);
@@ -26838,7 +27188,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                         create_access_state,
                         0,
                     );
-                    pool_free(iosl);
+                    pool_free(irp);
                     pool_free_request_buffers(data, aux_data, mdl);
                     if owns_fo {
                         pool_free(fo);
@@ -26887,7 +27237,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 let pnp_resource_capacity = (inlen + 7) & !7;
                 pnp_resource_list = pool_alloc(pnp_resource_capacity);
                 if pnp_resource_list == 0 {
-                    pool_free(iosl);
+                    pool_free(irp);
                     pool_free_request_buffers(data, aux_data, mdl);
                     if owns_fo {
                         pool_free(fo);
@@ -26932,7 +27282,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             create_access_state,
             create_parameters,
         );
-        pool_free(iosl);
+        pool_free(irp);
         pool_free_request_buffers(data, aux_data, mdl);
         if owns_fo {
             pool_free(fo);
@@ -26943,35 +27293,18 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     // IRP. Both buffered-I/O views refer to request-owned storage. Writes/sets arrive through
     // `inlen`; reads reserve `outlen` and are streamed back through the transfer bank after
     // completion.
-    let irp = pool_alloc(WDM_X64_IRP_SIZE as u64);
-    if irp == 0 {
-        if pnp_resource_list != 0 {
-            pool_free(pnp_resource_list);
-        }
-        pool_free_irp_auxiliary_graph(
-            0,
-            create_security_context,
-            create_access_state,
-            create_parameters,
-        );
-        pool_free(iosl);
-        pool_free_request_buffers(data, aux_data, mdl);
-        if owns_fo {
-            pool_free(fo);
-        }
-        return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
-    }
     let irp_bytes = core::slice::from_raw_parts_mut(irp as *mut u8, WDM_X64_IRP_SIZE);
     if write_wdm_irp(
         irp_bytes,
         WdmIrpInit {
+            packet_size: irp_packet_len as u16,
             mdl_address: mdl,
             flags: irp_flags,
             system_buffer,
             user_buffer,
             thread: s_current_process(),
-            stack_count: if major == IRP_MJ_PNP { 2 } else { 1 },
-            current_location: if major == IRP_MJ_PNP { 2 } else { 1 },
+            stack_count,
+            current_location: stack_count,
             current_stack_location: current_iosl,
         },
     )
@@ -26987,7 +27320,6 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             create_access_state,
             create_parameters,
         );
-        pool_free(iosl);
         pool_free_request_buffers(data, aux_data, mdl);
         if owns_fo {
             pool_free(fo);
@@ -27005,7 +27337,6 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     };
     let initial_owner = PendingIrp {
         irp,
-        iosl,
         file_object: fo,
         data,
         aux_data,
@@ -27109,7 +27440,9 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         let state = pending_irp_owner_state(owner_node).load(Ordering::Acquire);
         if matches!(
             hosted_irp_state_kind(state),
-            HOSTED_IRP_DISPATCHING | HOSTED_IRP_COMPLETED_DISPATCH
+            HOSTED_IRP_DISPATCHING
+                | HOSTED_IRP_COMPLETED_DISPATCH
+                | HOSTED_IRP_STOPPED_DISPATCH
         ) {
             let abandoned = hosted_irp_state_with_kind(state, HOSTED_IRP_ABANDONED);
             if pending_irp_owner_state(owner_node)
@@ -27161,6 +27494,27 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 }
                 break (ret, irp_information, None, Some(next));
             }
+            HOSTED_IRP_STOPPED_DISPATCH => {
+                // A completion routine retained the advanced raw cursor but did not complete it
+                // again before the originating dispatch returned. Transfer the graph to the
+                // asynchronous owner irrespective of the lower driver's immediate return status.
+                let pending_phase = nt_io_manager::CompletionOwnerPhase::StoppedDispatch
+                    .dispatch_handoff()
+                    .expect("stopped completion has no dispatch handoff");
+                let pending =
+                    hosted_irp_state_with_kind(state, completion_owner_kind(pending_phase));
+                if pending_irp_owner_state(owner_node)
+                    .compare_exchange(state, pending, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+                return (STATUS_PENDING as i32, 0);
+            }
+            HOSTED_IRP_PENDING => {
+                // Completion stopped after the dispatch had already transferred ownership.
+                return (STATUS_PENDING as i32, 0);
+            }
             HOSTED_IRP_COMPLETED_DISPATCH => {
                 let consuming = hosted_irp_state_with_kind(state, HOSTED_IRP_CONSUMING);
                 if pending_irp_owner_state(owner_node)
@@ -27187,7 +27541,11 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 // Completion is still capturing on another hosted worker. Transfer ownership at
                 // this final return edge; the completer will publish READY and this actor will not
                 // touch the graph again.
-                let deferred = hosted_irp_state_with_kind(state, HOSTED_IRP_COMPLETING_DEFERRED);
+                let deferred_phase = nt_io_manager::CompletionOwnerPhase::CompletingDispatch
+                    .dispatch_handoff()
+                    .expect("in-flight completion has no dispatch handoff");
+                let deferred =
+                    hosted_irp_state_with_kind(state, completion_owner_kind(deferred_phase));
                 if pending_irp_owner_state(owner_node)
                     .compare_exchange(state, deferred, Ordering::AcqRel, Ordering::Acquire)
                     .is_err()
@@ -30693,6 +31051,32 @@ fn hosted_root_pdo_device_id(pdo_object: u64) -> Option<u64> {
         .map(|slot| slot.device_id)
 }
 
+pub(crate) fn service_hosted_root_pdo_pnp(
+    ch: &crate::spawn_hosts::PumpChannel,
+    pdo_object: u64,
+    minor: u8,
+    active_reply_cap: u64,
+) -> i32 {
+    let Some((instance, _)) = instance_for_pump_channel(ch, active_reply_cap) else {
+        return nt_status::NtStatus::INVALID_PARAMETER.raw();
+    };
+    let authorized = unsafe {
+        hosted_device_bindings()
+            .is_some_and(|bindings| {
+                bindings.iter().any(|binding| {
+                    binding.used
+                        && hosted_completion_storage_instance(binding.instance) == instance
+                        && binding.pdo_object == pdo_object
+                })
+            })
+            && hosted_root_pdo_device_id(pdo_object).is_some()
+    };
+    if !authorized {
+        return nt_status::NtStatus::ACCESS_DENIED.raw();
+    }
+    unsafe { hosted_root_bus_mut().dispatch_pnp(pdo_object, minor) }
+}
+
 fn register_hosted_root_pdo_binding(
     pdo_object: u64,
     device_id: u64,
@@ -31345,14 +31729,6 @@ unsafe fn restore_hosted_device_resource_state(
 }
 
 unsafe fn copy_provider_dispatch_side_effects(dst_sh: u64, src_sh: u64) {
-    write_volatile(
-        (dst_sh + SH_ROOT_PDO_FORWARDED_MINOR) as *mut u64,
-        read_volatile((src_sh + SH_ROOT_PDO_FORWARDED_MINOR) as *const u64),
-    );
-    write_volatile(
-        (dst_sh + SH_ROOT_PDO_FORWARDED_STATUS) as *mut i32,
-        read_volatile((src_sh + SH_ROOT_PDO_FORWARDED_STATUS) as *const i32),
-    );
     write_volatile(
         (dst_sh + SH_DEVICE_INTERFACE_LINK_LEN) as *mut u16,
         read_volatile((src_sh + SH_DEVICE_INTERFACE_LINK_LEN) as *const u16),
@@ -36760,11 +37136,6 @@ pub(crate) unsafe fn start_hosted_device(
     if resource_list.is_empty() {
         clear_hosted_resource_projection(binding, sh);
     }
-    write_volatile((sh + SH_ROOT_PDO_FORWARDED_MINOR) as *mut u64, u64::MAX);
-    write_volatile(
-        (sh + SH_ROOT_PDO_FORWARDED_STATUS) as *mut i32,
-        0xC000_0010u32 as i32,
-    );
     clear_shared_device_interface_state_at(sh);
     let video_initialized = read_volatile((sh + SH_VIDEO_PORT_INITIALIZED) as *const u32) != 0;
     let video_find_adapter = read_volatile((sh + SH_VIDEO_HW_FIND_ADAPTER) as *const u64);
@@ -36786,11 +37157,6 @@ pub(crate) unsafe fn start_hosted_device(
     if video_initialized {
         let root_status =
             hosted_root_bus_mut().dispatch_pnp(binding.pdo_object, IRP_MN_START_DEVICE as u8);
-        write_volatile(
-            (sh + SH_ROOT_PDO_FORWARDED_MINOR) as *mut u64,
-            IRP_MN_START_DEVICE,
-        );
-        write_volatile((sh + SH_ROOT_PDO_FORWARDED_STATUS) as *mut i32, root_status);
         nt_status::NtStatus(root_status).to_result()?;
         let video_status = dispatch_video_find_adapter_for_instance(binding.instance, inst)?;
         let again = read_volatile((sh + SH_VIDEO_FIND_ADAPTER_AGAIN) as *const u8);
@@ -36831,14 +37197,6 @@ pub(crate) unsafe fn start_hosted_device(
     record_hosted_resource_usage(binding, sh)?;
     nt_status::NtStatus(status).to_result()?;
     apply_hosted_device_interface_state(sh)?;
-
-    let forwarded_minor = read_volatile((sh + SH_ROOT_PDO_FORWARDED_MINOR) as *const u64);
-    let forwarded_status = read_volatile((sh + SH_ROOT_PDO_FORWARDED_STATUS) as *const i32);
-    if forwarded_minor <= u8::MAX as u64 && forwarded_status == 0 {
-        let root_status =
-            hosted_root_bus_mut().dispatch_pnp(binding.pdo_object, forwarded_minor as u8);
-        nt_status::NtStatus(root_status).to_result()?;
-    }
     refresh_hosted_device_resource_state(binding, sh);
     Ok(())
 }

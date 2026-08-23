@@ -24,6 +24,7 @@ pub const WDM_X64_IO_TYPE_FILE: i16 = 5;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WdmLayoutError {
     BufferTooSmall,
+    InvalidField,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -63,6 +64,8 @@ pub struct WdmOpenDeviceProjectionInit {
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct WdmIrpInit {
+    /// Total bytes in the contiguous IRP plus stack-location packet.
+    pub packet_size: u16,
     pub mdl_address: u64,
     pub flags: u32,
     pub system_buffer: u64,
@@ -214,7 +217,23 @@ pub fn write_wdm_open_device_projection(
 
 pub fn write_wdm_irp(bytes: &mut [u8], init: WdmIrpInit) -> Result<(), WdmLayoutError> {
     require(bytes, WDM_X64_IRP_SIZE)?;
+    let required_packet_size = WDM_X64_IRP_SIZE
+        .checked_add(init.stack_count as usize * WDM_X64_IO_STACK_LOCATION_SIZE)
+        .ok_or(WdmLayoutError::InvalidField)?;
+    let terminal_location = init
+        .stack_count
+        .checked_add(1)
+        .ok_or(WdmLayoutError::InvalidField)?;
+    if init.stack_count == 0
+        || init.current_location == 0
+        || init.current_location > terminal_location
+        || (init.packet_size as usize) < required_packet_size
+    {
+        return Err(WdmLayoutError::InvalidField);
+    }
     zero(bytes);
+    put_u16(bytes, 0x00, 6);
+    put_u16(bytes, 0x02, init.packet_size);
     put_u64(bytes, 0x08, init.mdl_address);
     put_u32(bytes, 0x10, init.flags);
     put_u64(bytes, 0x18, init.system_buffer);

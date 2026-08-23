@@ -127,6 +127,7 @@ bitflags::bitflags! {
         const INVOKE_ON_ERROR = 0x80;
         const INVOKE_ON_CANCEL = 0x20;
         const PENDING_RETURNED = 0x01;
+        const ERROR_RETURNED = 0x02;
     }
 }
 

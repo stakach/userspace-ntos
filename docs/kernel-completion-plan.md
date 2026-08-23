@@ -10889,3 +10889,59 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     driver-local IRPs, and `STATUS_MORE_PROCESSING_REQUIRED` in a host-tested I/O Manager model,
     then wire the component graph to that model and delete the current single-stack finalization
     machinery it replaces. Do not introduce a second completion path or a driver-specific unwind.
+
+    Native multi-stack completion checkpoint (2026-08-24): every hosted raw WDM request is now one
+    contiguous, correctly sized `IRP + StackCount * IO_STACK_LOCATION` packet. `StackCount` comes
+    from the target `DEVICE_OBJECT`; `IRP.Type`, full packet `Size`, `CurrentLocation`, and
+    `CurrentStackLocation` are validated together before dispatch or completion. `IofCallDriver`
+    advances the native cursor, installs the lower `DeviceObject`, and invokes the target
+    `MajorFunction`. A driverless lower device crosses a typed, instance-authenticated root-PDO PnP
+    service boundary; no major other than PnP is inferred or silently routed there.
+
+    `IoCompleteRequest` now performs the ReactOS/NT bottom-to-top walk. It advances the raw cursor
+    before each callback, propagates `PendingReturned`, preserves `SL_ERROR_RETURNED`, selects
+    completion routines using success/error/cancel controls, clears completed stack locations, and
+    passes the next upper stack's `DeviceObject`. `STATUS_MORE_PROCESSING_REQUIRED` stops without
+    touching the potentially freed packet and retains the already-advanced cursor for a later exact
+    completion. Driver-local IRPs built by `IoBuildDeviceIoControlRequest` use real buffered,
+    direct, or neither-I/O layouts, deliver their IOSB/event, copy buffered output under the NT
+    completion rules, and reclaim buffer/MDL/IRP ownership only at terminal unwind.
+
+    Retained request ownership is modeled separately from the raw cursor. Inline completion,
+    dispatch-return handoff, asynchronous completion, cancel-routine completion, stopped unwind,
+    and a caller/completer race resolve through one generation-preserving state transition. The old
+    PnP forwarded-minor/status cells and manual post-dispatch pseudo-unwind were deleted. The real
+    NDIS StartDevice sequence now forwards to the authenticated PDO, invokes the NDIS completion
+    routine, stops on `STATUS_MORE_PROCESSING_REQUIRED`, and later resumes the same raw IRP through
+    its upper frame instead of relying on a provider-specific finalizer.
+
+    Focused validation is green for `nt-io-manager` (`179/179`) and `nt-status` (`4/4`), including
+    exact NDIS inline-stop/resume, asynchronous stopped-dispatch handoff, deferred caller races,
+    completion-control filtering, pending propagation, and malformed packet rejection. The
+    freestanding executive check and release build/staging path pass at the existing 212-warning
+    baseline. Serialized desktop proof `.tmp/run-desktop-20260824-085846.log` is accepted for the
+    integrated tree: the root-PDO forward returns success, genuine userinit and Explorer launch,
+    Explorer completes 665 real api0 callbacks with zero callback failures, and paint reaches 2
+    BeginPaint, 20 EndPaint, 185 direct GDI returns, and 131 batch flushes carrying 171 records. The
+    final quiescent filesystem snapshot commits generation 5, all 786,432 framebuffer pixels are
+    non-background with at least 32 colors, all `293/293` checks pass, and the sentinel is emitted.
+
+    The immediately preceding run `.tmp/run-desktop-20260824-085029.log` reached the same real
+    Explorer idle frontier but faulted once while CRC-reading a live writable-filesystem payload at
+    the final quiescent snapshot. The exact retry passed, heap use was lower than earlier accepted
+    runs, and the snapshot traversal contains no raw slice construction, so this is recorded as an
+    unresolved lifetime/corruption risk rather than attributed to capacity or papered over. Audit
+    found one independent real hole: a final-process reclaim can dirty persistent mapped-section
+    data and take a no-reply `continue` before the common writable-filesystem dirty state advances
+    `heap_mark`; the next iteration may reclaim that live allocation. Factor durable-state pinning
+    into a common post-action finalizer and run it on every early receive/continue edge before using
+    another allocator rewind.
+
+    Review adjustment: the native multi-stack completion checkpoint is closed. Next make device
+    stacks canonical across component domains: preserve exact `DriverId`, `DeviceId`, provider
+    instance, and stack location at every hop; derive `IrpProjection` from the current native stack;
+    make `IoGetRelatedDeviceObject` resolve the top attached device; and scope all raw compatibility
+    pointers, including root PDO identities, by hosted domain/instance instead of global address.
+    Fold or delete the older `nt-kernel-exec::CompletionTracker` once no production path uses it.
+    First, close the common durable-state finalizer hole above and add a repeated snapshot/mutation
+    regression so a transient allocator scope cannot invalidate persistent filesystem ownership.

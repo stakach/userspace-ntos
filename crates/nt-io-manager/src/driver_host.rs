@@ -1,10 +1,4 @@
-//! Driver Host readiness: the support-routine plan (spec §20).
-//!
-//! The names + MVP status of the I/O Manager-compatible support routines a future
-//! Driver Host runtime will provide, as a **machine-readable plan** — planned now
-//! so the Driver Host spec can build on this I/O Manager without redesigning IRP
-//! ownership, but not yet callable by real drivers. The export names feed a future
-//! `nt-compat-exports` crate.
+//! Machine-readable status of the hosted WDM I/O support surface (spec §20).
 
 /// An I/O Manager-compatible driver support routine (WDK `Io*` name).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -27,20 +21,16 @@ pub enum DriverHostRoutine {
 /// The v0.1 MVP implementation status of a support routine (spec §20).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum MvpStatus {
-    /// Implemented internally by the I/O Manager today (e.g. `IoCreateDevice`).
-    RequiredInternal,
-    /// Realised through the driver-peer protocol (e.g. `IoCompleteRequest`).
-    ThroughPeerProtocol,
-    /// Provided by the Driver Host runtime later (stack-location accessors).
-    DriverHostLater,
-    /// A single-device-stack stub for now (`IoCallDriver`).
-    SingleStackStub,
-    /// Deferred (`IoSetCompletionRoutine`).
-    Deferred,
+    /// Owned by the canonical I/O Manager and Object Manager.
+    Canonical,
+    /// Implemented by the component-local WDM projection runtime.
+    HostedRuntime,
+    /// WDK inline helper operating on the projected IRP layout.
+    InlineWdm,
+    /// Crosses the authenticated hosted-provider boundary.
+    ProviderBoundary,
     /// Partially available (`IoCancelIrp`).
     Partial,
-    /// Optional for the MVP (`IoDeleteSymbolicLink`).
-    Optional,
 }
 
 impl DriverHostRoutine {
@@ -81,19 +71,19 @@ impl DriverHostRoutine {
         }
     }
 
-    /// The v0.1 MVP status (spec §20).
+    /// Current implementation boundary (spec §20).
     pub fn mvp_status(self) -> MvpStatus {
         use DriverHostRoutine::*;
         match self {
-            IoCreateDevice | IoDeleteDevice | IoCreateSymbolicLink => MvpStatus::RequiredInternal,
-            IoDeleteSymbolicLink => MvpStatus::Optional,
-            IoCompleteRequest | IoMarkIrpPending => MvpStatus::ThroughPeerProtocol,
+            IoCreateDevice | IoDeleteDevice | IoCreateSymbolicLink | IoDeleteSymbolicLink => {
+                MvpStatus::Canonical
+            }
+            IoCompleteRequest | IoCallDriver => MvpStatus::ProviderBoundary,
+            IoMarkIrpPending | IoSetCompletionRoutine => MvpStatus::InlineWdm,
             IoGetCurrentIrpStackLocation
             | IoGetNextIrpStackLocation
             | IoCopyCurrentIrpStackLocationToNext
-            | IoSkipCurrentIrpStackLocation => MvpStatus::DriverHostLater,
-            IoCallDriver => MvpStatus::SingleStackStub,
-            IoSetCompletionRoutine => MvpStatus::Deferred,
+            | IoSkipCurrentIrpStackLocation => MvpStatus::HostedRuntime,
             IoCancelIrp => MvpStatus::Partial,
         }
     }

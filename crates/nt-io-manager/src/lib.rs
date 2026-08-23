@@ -23,6 +23,7 @@ mod cancel_wait;
 mod cleanup_wait;
 mod close;
 mod complete;
+mod completion_unwind;
 mod device;
 mod device_control;
 mod dispatch;
@@ -55,6 +56,11 @@ pub use cleanup_wait::{
     PendingFileCleanupWait, PendingFileCleanupWaitReservation, PendingFileCleanupWaitTable,
 };
 pub use complete::CompletedIrp;
+pub use completion_unwind::{
+    CompletionClaimRelease, CompletionOwnerClaim, CompletionOwnerPhase,
+    CompletionRoutineDisposition, CompletionUnwindCursor, CompletionUnwindError,
+    CompletionUnwindFrame,
+};
 pub use device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
 pub use dispatch::{
     DispatchContext, DispatchOutcome, DriverCompletion, DriverDispatchBackend, IrpProjection,
@@ -3777,6 +3783,7 @@ mod tests {
         write_wdm_irp(
             &mut irp,
             WdmIrpInit {
+                packet_size: (WDM_X64_IRP_SIZE + WDM_X64_IO_STACK_LOCATION_SIZE) as u16,
                 mdl_address: 0xAAAA,
                 flags: 0x55AA,
                 system_buffer: 0x1111,
@@ -3788,6 +3795,11 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(le_u16(&irp, 0x00), 6);
+        assert_eq!(
+            le_u16(&irp, 0x02),
+            (WDM_X64_IRP_SIZE + WDM_X64_IO_STACK_LOCATION_SIZE) as u16
+        );
         assert_eq!(le_u64(&irp, 0x08), 0xAAAA);
         assert_eq!(le_u32(&irp, 0x10), 0x55AA);
         assert_eq!(le_u64(&irp, 0x18), 0x1111);
@@ -3796,6 +3808,19 @@ mod tests {
         assert_eq!(le_u64(&irp, 0x70), 0x2222);
         assert_eq!(le_u64(&irp, 0xa8), 0x4444);
         assert_eq!(le_u64(&irp, 0xb8), 0x3333);
+
+        assert_eq!(
+            write_wdm_irp(
+                &mut irp,
+                WdmIrpInit {
+                    packet_size: WDM_X64_IRP_SIZE as u16,
+                    stack_count: 1,
+                    current_location: 1,
+                    ..WdmIrpInit::default()
+                },
+            ),
+            Err(WdmLayoutError::InvalidField)
+        );
 
         let mut stack = [0xCC; WDM_X64_IO_STACK_LOCATION_SIZE];
         write_wdm_io_stack_location(
@@ -3902,15 +3927,15 @@ mod tests {
         // The §20 status table.
         assert_eq!(
             DriverHostRoutine::IoCreateDevice.mvp_status(),
-            MvpStatus::RequiredInternal
+            MvpStatus::Canonical
         );
         assert_eq!(
             DriverHostRoutine::IoCompleteRequest.mvp_status(),
-            MvpStatus::ThroughPeerProtocol
+            MvpStatus::ProviderBoundary
         );
         assert_eq!(
             DriverHostRoutine::IoCallDriver.mvp_status(),
-            MvpStatus::SingleStackStub
+            MvpStatus::ProviderBoundary
         );
         assert_eq!(
             DriverHostRoutine::IoCancelIrp.mvp_status(),
