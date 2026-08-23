@@ -601,6 +601,80 @@ mod tests {
     }
 
     #[test]
+    fn pending_read_with_event_requires_output_iosb_event_and_iocp() {
+        let mut table = PendingFileIoTable::new();
+        let mut request = pending(1, 2, 7);
+        request.major = nt_io_abi::major::IRP_MJ_READ;
+        request.apc_routine = 0;
+        request.publish_iocp = true;
+        request.reply_cap = 0;
+        request.reply_required = false;
+        request.signal_file = false;
+        let slot = table.park(request).unwrap();
+
+        table.advance_output_exact(slot, 2, 32, 32).unwrap();
+        for flag in [
+            IO_DELIVERY_IOSB_PUBLISHED,
+            IO_DELIVERY_EVENT_PUBLISHED,
+            IO_DELIVERY_IOCP_PUBLISHED,
+        ] {
+            table.mark_delivery_exact(slot, 2, flag).unwrap();
+        }
+        assert!(table.completion_surfaces_published_exact(slot, 2));
+        table.mark_backend_acked_exact(slot, 2).unwrap();
+        assert_eq!(
+            table.finish_exact(slot, 2).unwrap().major,
+            nt_io_abi::major::IRP_MJ_READ
+        );
+    }
+
+    #[test]
+    fn distinct_pending_reads_can_share_one_file_and_signal_it_without_an_event() {
+        let mut table = PendingFileIoTable::new();
+        let mut first = pending(1, 2, 7);
+        first.major = nt_io_abi::major::IRP_MJ_READ;
+        first.apc_routine = 0;
+        first.publish_iocp = true;
+        first.reply_cap = 0;
+        first.reply_required = false;
+        first.event_obj_idx = u64::MAX;
+        first.signal_file = true;
+        let mut second = first;
+        second.irp_id = 3;
+        second.tid = 8;
+
+        assert!(table.park(first).is_some());
+        assert!(table.park(second).is_some());
+        assert_eq!(table.len(), 2);
+        assert!(table.matches_completion_exact(1, 3, 1, 8, nt_io_abi::major::IRP_MJ_READ));
+    }
+
+    #[test]
+    fn synchronous_pending_read_requires_file_event_and_reply_publication() {
+        let mut table = PendingFileIoTable::new();
+        let mut request = pending(1, 2, 7);
+        request.major = nt_io_abi::major::IRP_MJ_READ;
+        request.apc_routine = 0;
+        request.publish_iocp = true;
+        request.signal_file = true;
+        let slot = table.park(request).unwrap();
+
+        table.advance_output_exact(slot, 2, 8, 8).unwrap();
+        for flag in [
+            IO_DELIVERY_IOSB_PUBLISHED,
+            IO_DELIVERY_EVENT_PUBLISHED,
+            IO_DELIVERY_FILE_PUBLISHED,
+            IO_DELIVERY_IOCP_PUBLISHED,
+        ] {
+            table.mark_delivery_exact(slot, 2, flag).unwrap();
+        }
+        assert!(!table.completion_surfaces_published_exact(slot, 2));
+        assert_eq!(table.claim_reply_cap_exact(slot, 2), Some(Some(0x50)));
+        table.mark_reply_published_exact(slot, 2).unwrap();
+        assert!(table.completion_surfaces_published_exact(slot, 2));
+    }
+
+    #[test]
     fn pending_file_io_delivery_progress_is_generation_exact() {
         let mut table = PendingFileIoTable::new();
         let request = pending(1, 2, 7);

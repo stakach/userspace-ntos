@@ -10397,3 +10397,50 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     endpoint trigger should only discover exact hosted completions. After both data paths are generic,
     migrate LISTEN, then replace the executive-modeled root `FSCTL_PIPE_WAIT` with a real hosted
     File/device request and delete its name-wait compatibility machinery.
+
+    Pending READ generic-owner checkpoint (2026-08-23): routed `NtReadFile` now reserves generic
+    pending-I/O capacity and, for a synchronous File, reply ownership before dispatch. It retains
+    the canonical File, clears its signal state, and transfers every valid `STATUS_PENDING` result
+    with the exact nonzero IrpId into `PendingFileIo`. READ records carry the bounded output target,
+    IOSB, explicit event or conditional File signaling, APC-xor-IOCP delivery, optional synchronous
+    reply, backend ACK, cancellation, and final File-reference ownership. Multiple reads may remain
+    pending on one File because identity is the canonical IrpId rather than an endpoint slot. A
+    driver that returns `STATUS_PENDING` without an IrpId fails closed instead of leaving an
+    unowned request or parked caller.
+
+    The reusable completion policy now states the NT status contract directly. Success and warning
+    statuses publish completion surfaces; buffered warnings such as `STATUS_BUFFER_OVERFLOW` copy
+    their partial output. `STATUS_VERIFY_REQUIRED` publishes completion but does not copy output,
+    and an inline hard error leaves the caller's output, IOSB, event, APC, and completion port
+    untouched. A hard error delivered after an operation returned pending is still a terminal
+    completion and publishes normally. APC plus a completion-port-bound File is rejected before
+    event reset or driver dispatch. Immediate and deferred READs use the common ordering: output,
+    IOSB, explicit event, conditional File signal, APC xor IOCP, synchronous reply, then backend
+    ACK. READ completion remains a narrow endpoint-progress trigger so peer WRITE quota can advance.
+
+    Provider diagnostics no longer keep a second completion owner. After each retained READ chunk
+    is copied, the generic publisher resolves the driver's current FsContext from the canonical File
+    and feeds the existing DCE/RPC reassembler and LSA attribution counters. The old plain-READ
+    `PipeWaiter` entries, per-endpoint read exclusion, synchronous and asynchronous delivery
+    branches, `is_transceive` discriminator, `pipe_park_transceive` latch, and duplicate terminal
+    completion wrapper are deleted. `PipeWaiterTable` now has only one temporary consumer:
+    `FSCTL_PIPE_TRANSCEIVE`.
+
+    Host validation is green for `cargo fmt --all`, `cargo test -p nt-io-manager` (`174/174`),
+    `cargo test -p nt-io-completion` (`27/27`), the freestanding executive check, and `git diff
+    --check`. Serialized desktop proof `.tmp/run-desktop-20260823-194943.log` is accepted: the live
+    workload records 32 generic exact `IRP_MJ_READ` completions, including partial
+    `STATUS_BUFFER_OVERFLOW` fragments and successful complete fragments, with no specialized
+    `[pipe-park]` activation and zero pipe-waiter refusals. Userinit and Explorer launch dynamically;
+    Explorer completes 669 api0 callbacks with zero callback failures, paint reaches 5 BeginPaint,
+    20 EndPaint, 187 direct GDI returns, and 135 batch flushes carrying 184 records. All 786,432
+    framebuffer pixels are non-background with at least 32 colors; `293/293` checks pass and the
+    sentinel is emitted.
+
+    Review adjustment: specialized plain READ ownership is gone and the live boot exercises its
+    replacement. Migrate `FSCTL_PIPE_TRANSCEIVE` to `PendingFileIo` next, preserving its input
+    dispatch and endpoint-progress trigger while deleting `PipeWaiter`, `PipeWaiterTable`, their
+    reply-cap park path, and all transceive redrive code. Then migrate LISTEN to the same exact
+    terminal owner. Finally route root `FSCTL_PIPE_WAIT` through the real hosted File/device boundary
+    and remove the executive name-wait compatibility machinery; no legacy fallback remains after
+    each owner moves.

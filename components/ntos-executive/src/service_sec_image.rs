@@ -8956,7 +8956,6 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_pipe_apc_context: u64 = 0;
             let mut park_pipe_completion_port_suppressed = false;
             let mut park_pipe_event_obj_idx: u64 = u64::MAX;
-            let mut park_pipe_transceive = false;
             let mut park_pipe_name_wait_root_handle: u64 = 0;
             let mut park_pipe_name_wait_hash: u64 = 0;
             let mut park_pipe_name_wait_iosb_va: u64 = 0;
@@ -9072,7 +9071,6 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.pipe_park_apc_context = 0;
                 nt_handler.pipe_park_completion_port_suppressed = false;
                 nt_handler.pipe_park_event_obj_idx = u64::MAX;
-                nt_handler.pipe_park_transceive = false;
                 nt_handler.dbgk_block_request = false;
                 nt_handler.pipe_endpoint_progress = false;
                 nt_handler.pipe_listen_fid = 0;
@@ -9748,8 +9746,8 @@ pub(crate) unsafe fn service_sec_image(
                     park_lpc_receive_ctx = nt_handler.lpc_receive_park_ctx;
                     park_lpc_receive_listen_only = nt_handler.lpc_receive_park_listen_only;
                 }
-                // BATCH 33: latch a pipe-pending park request (the reply-cap steal happens at the reply
-                // site where resume_ip/sp/flags are known). Re-drive any parked pipe reads on a peer
+                // BATCH 33: latch a pending transceive (the reply-cap steal happens at the reply
+                // site where resume_ip/sp/flags are known). Re-drive exact retained transceives on
                 // endpoint progress before replying to the current caller.
                 if nt_handler.dbgk_block_request {
                     park_dbgk_reporter = true;
@@ -9766,7 +9764,6 @@ pub(crate) unsafe fn service_sec_image(
                     park_pipe_completion_port_suppressed =
                         nt_handler.pipe_park_completion_port_suppressed;
                     park_pipe_event_obj_idx = nt_handler.pipe_park_event_obj_idx;
-                    park_pipe_transceive = nt_handler.pipe_park_transceive;
                 }
                 if nt_handler.pipe_name_wait_hash != 0 {
                     park_pipe_name_wait_root_handle = nt_handler.pipe_name_wait_root_handle;
@@ -9811,7 +9808,7 @@ pub(crate) unsafe fn service_sec_image(
                     if woken != 0 && PIPE_REDRIVE_TRACE_COUNT.load(Ordering::Relaxed) <= 20 {
                         print_str(b"[pipe-redrive] peer write woke ");
                         print_u64(woken);
-                        print_str(b" parked reader(s)\n");
+                        print_str(b" parked transceive(s)\n");
                     }
                     if listens != 0 {
                         print_str(b"[pipe-listen] exact completion redrive delivered ");
@@ -16015,8 +16012,8 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
             }
-            // BATCH 33 — PIPE-PENDING PARK: a real npfs pipe read / TRANSCEIVE returned STATUS_PENDING
-            // (no data yet). Steal this caller's reply cap into the PipeWaiterTable keyed by the reading
+            // BATCH 33 — PIPE-PENDING PARK: a real npfs TRANSCEIVE returned STATUS_PENDING
+            // (no response yet). Steal this caller's reply cap into the PipeWaiterTable keyed by the
             // end fid (rotate REPLY_MAIN to a fresh pool object), recv the next event WITHOUT replying —
             // the caller stays blocked in-kernel. A later peer write re-drives it (pipe_redrive_all).
             // Pool/table exhaustion returns STATUS_INSUFFICIENT_RESOURCES; returning PENDING without
@@ -16036,7 +16033,6 @@ pub(crate) unsafe fn service_sec_image(
                     park_pipe_apc_context,
                     park_pipe_completion_port_suppressed,
                     park_pipe_event_obj_idx,
-                    park_pipe_transceive,
                     resume_ip,
                     sp,
                     flags,
@@ -16045,7 +16041,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_u64(badge);
                     print_str(b" fid=0x");
                     print_hex(park_pipe_fid as u32);
-                    print_str(b" -> PARK reader (re-driven on peer write)\n");
+                    print_str(b" -> PARK transceive (re-driven on peer write)\n");
                     trace_indefinite_wait_park(
                         &nt_handler,
                         badge,
@@ -22849,10 +22845,10 @@ unsafe fn pending_file_io_transfer(
     true
 }
 
-/// BATCH 33 — PARK a caller whose npfs pipe read returned STATUS_PENDING. Mirrors the event
+/// BATCH 33 — PARK a caller whose npfs pipe transceive returned STATUS_PENDING. Mirrors the event
 /// `wait_park_multi` reply-cap steal EXACTLY (steal the active REPLY_MAIN, rotate a fresh pool object
 /// into REPLY_MAIN so the next recv binds a new object), but records the wait in the PipeWaiterTable
-/// keyed by the reading end's npfs file-id instead of an obj_ns event index. Returns true on success;
+/// keyed by the endpoint's npfs file-id instead of an obj_ns event index. Returns true on success;
 /// false if the reply pool is unavailable or the growable waiter table cannot allocate the record. The
 /// stolen cap resumes the blocked thread when the peer writes (`pipe_redrive_all`).
 unsafe fn pipe_wait_park(
@@ -22869,7 +22865,6 @@ unsafe fn pipe_wait_park(
     apc_context: u64,
     completion_port_suppressed: bool,
     event_obj_idx: u64,
-    is_transceive: bool,
     resume_ip: u64,
     sp: u64,
     flags: u64,
@@ -22904,7 +22899,6 @@ unsafe fn pipe_wait_park(
         resume_ip,
         resume_sp: sp,
         resume_flags: flags,
-        is_transceive,
     });
     if parked.is_none() {
         PIPE_WAITERS_REFUSED.fetch_add(1, Ordering::Relaxed);
@@ -23089,7 +23083,10 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         ) {
             panic!("pending File completion identity mismatch");
         }
-        if pending.major == nt_io_abi::major::IRP_MJ_WRITE {
+        if matches!(
+            pending.major,
+            nt_io_abi::major::IRP_MJ_READ | nt_io_abi::major::IRP_MJ_WRITE
+        ) {
             nt_handler.pipe_endpoint_progress = true;
         }
 
@@ -23207,7 +23204,7 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             && pending.output_len != 0
             && delivery_state & nt_io_manager::IO_DELIVERY_BUFFER_PUBLISHED == 0
         {
-            let delivery_len = if terminal_status & 0xC000_0000 == 0xC000_0000 {
+            let delivery_len = if !nt_io_completion::file_io_status_copies_output(terminal_status) {
                 0
             } else {
                 u32::try_from(terminal_information)
@@ -23240,6 +23237,16 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 ) {
                     copy_failed = true;
                     break;
+                }
+                if pending.major == nt_io_abi::major::IRP_MJ_READ {
+                    nt_handler.observe_completed_npfs_read(
+                        pending.file_id,
+                        pending.badge,
+                        terminal_status,
+                        terminal_information,
+                        &work[..copied],
+                        offset == 0,
+                    );
                 }
                 offset = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
                     .advance_output_exact(
@@ -23439,7 +23446,7 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     delivered
 }
 
-/// BATCH 33 — finalize parked pipe I/O after a peer operation. Pending pipe IRPs stay owned by npfs:
+/// BATCH 33 — finalize parked transceives after a peer operation. Pending pipe IRPs stay owned by npfs:
 /// when a peer write satisfies one, npfs completes the retained IRP through `IoCompleteRequest` and
 /// the driver bridge retains the exact completion payload under its canonical IRP id. This redrive
 /// step consumes those exact completions, copies results through the waiter's own VSpace mirrors, signals its
@@ -23474,7 +23481,7 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     let snapshot: alloc::vec::Vec<(usize, nt_io_manager::PipeWaiter)> = table.drain_all().collect();
     for (slot, w) in snapshot {
         let mut delivery_state = w.delivery_state;
-        // BATCH 37/I4: a pending READ/TRANSCEIVE is completed only by the IRP npfs retained. A second
+        // BATCH 37/I4: a pending TRANSCEIVE is completed only by the IRP npfs retained. A second
         // read here manufactures another data-queue entry and can make the next SCM
         // `TransactNamedPipe` fail with the legitimate `STATUS_PIPE_BUSY` precondition.
         let Some((status, completed, output)) = driver_launch::copy_completed_irp(

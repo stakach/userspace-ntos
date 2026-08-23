@@ -735,8 +735,8 @@ fn valid_completion_mode(mode: u32) -> bool {
 // completion broker and probes those exact ids; `complete` frees only the slots
 // whose terminal completion was delivered.
 
-/// One parked pipe read awaiting peer data. All fields are the executive-side
-/// context needed to complete the read when data arrives: the owning device id,
+/// One parked `FSCTL_PIPE_TRANSCEIVE` awaiting peer data. All fields are the executive-side
+/// context needed to complete the request when data arrives: the owning device id,
 /// exact canonical IRP, the canonical FileId used for completion bookkeeping,
 /// the owning process index + thread id (whose VSpace/stack-mirror the bytes land in), the
 /// user `buffer`/`iosb` VAs, the buffer length, the seL4 reply cap held for the
@@ -747,7 +747,7 @@ fn valid_completion_mode(mode: u32) -> bool {
 pub struct PipeWaiter {
     /// Generation-protected I/O Manager File identity used for cancellation and completion.
     pub canonical_file_id: u64,
-    /// npfs `FsContext` of the READING end this waiter is blocked on (the slot key).
+    /// npfs `FsContext` of the endpoint this transceive is blocked on (the slot key).
     pub file_id: u64,
     /// Stable pipe-name correlation captured while the open is live.
     pub name_hash: u64,
@@ -761,7 +761,7 @@ pub struct PipeWaiter {
     pub tid: u64,
     /// The caller's fault-EP badge (which per-thread reply/mirror context to restore).
     pub badge: u64,
-    /// User buffer VA the read data must be copied into.
+    /// User output-buffer VA the response data must be copied into.
     pub buffer_va: u64,
     /// User buffer capacity (bytes).
     pub buffer_len: u32,
@@ -782,17 +782,14 @@ pub struct PipeWaiter {
     pub resume_ip: u64,
     pub resume_sp: u64,
     pub resume_flags: u64,
-    /// `true` if this waiter parked on FSCTL_PIPE_TRANSCEIVE (must re-read then
-    /// return via the FSCTL output path), `false` for a plain NtReadFile.
-    pub is_transceive: bool,
 }
 
 const PIPE_TABLE_DEFAULT_INITIAL_RESERVE: usize = 16;
 
-/// Reset-safe table of parked pipe reads/transceives.
+/// Reset-safe table of parked pipe transceive requests.
 ///
 /// The first reservation size is not a hard NT limit. Real service startup can legitimately have many
-/// RPC servers and driver control pipes with pending reads at once, so the table grows on demand.
+/// RPC clients and driver control pipes with pending transceives at once, so the table grows on demand.
 /// Parking fails only if allocation for the next waiter record fails.
 #[derive(Clone, Debug)]
 pub struct PipeWaiterTable {
@@ -1864,7 +1861,6 @@ mod tests {
             resume_ip: 0x3000 + file_id,
             resume_sp: 0x4000 + file_id,
             resume_flags: 0x202,
-            is_transceive: false,
         }
     }
 

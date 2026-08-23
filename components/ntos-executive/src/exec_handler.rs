@@ -712,7 +712,7 @@ fn trace_scm_worker_read_io(
     route_status: u32,
     route_fid: u64,
     routed: bool,
-    pending_read_fid: u64,
+    pending_file_id: u64,
     status: u32,
     information: u64,
 ) {
@@ -786,8 +786,8 @@ fn trace_scm_worker_read_io(
     print_hex(route_fid as u32);
     print_str(b" routed=");
     print_u64(routed as u64);
-    print_str(b" pending_fid=0x");
-    print_hex(pending_read_fid as u32);
+    print_str(b" pending_file=0x");
+    print_hex(pending_file_id as u32);
     print_str(b" status=0x");
     print_hex(status);
     print_str(b" info=");
@@ -2733,7 +2733,6 @@ impl ExecNtHandler {
         write_field!(pipe_park_apc_context, 0);
         write_field!(pipe_park_completion_port_suppressed, false);
         write_field!(pipe_park_event_obj_idx, u64::MAX);
-        write_field!(pipe_park_transceive, false);
         write_field!(dbgk_block_request, false);
         write_field!(pipe_endpoint_progress, false);
         write_field!(pipe_listen_fid, 0);
@@ -10529,29 +10528,6 @@ impl ExecNtHandler {
         nt_fs::STATUS_SUCCESS
     }
 
-    pub(crate) fn post_file_completion(
-        &mut self,
-        file_id: u64,
-        apc_context: u64,
-        status: u32,
-        information: u64,
-        completed_inline: bool,
-        operation_suppressed: bool,
-    ) -> u32 {
-        let signal_status = self.signal_file_completion(file_id, status);
-        if signal_status != nt_fs::STATUS_SUCCESS {
-            return signal_status;
-        }
-        self.post_file_completion_packet(
-            file_id,
-            apc_context,
-            status,
-            information,
-            completed_inline,
-            operation_suppressed,
-        )
-    }
-
     pub(crate) fn queue_file_user_apc(
         &mut self,
         tid: u64,
@@ -10612,6 +10588,51 @@ impl ExecNtHandler {
             .is_none_or(|thread| thread.state == nt_process::ThreadState::Terminated)
     }
 
+    pub(crate) fn observe_completed_npfs_read(
+        &self,
+        file_id: u64,
+        badge: u64,
+        status: u32,
+        information: u64,
+        output: &[u8],
+        first_chunk: bool,
+    ) {
+        let Some((_, fs_context)) = driver_launch::hosted_file_route(file_id) else {
+            return;
+        };
+        unsafe {
+            driver_launch::trace_dcerpc_read_reassembly_from_slice(
+                fs_context,
+                status,
+                information,
+                output,
+            );
+        }
+        if !first_chunk
+            || !self.current_process_is_lsass()
+            || output.first() != Some(&5)
+            || crate::pipe_fid_name_hash(fs_context) != lsarpc_pipe_name_hash()
+        {
+            return;
+        }
+
+        let pdu_type = output.get(2).copied().unwrap_or(0xFF) as u64;
+        if self
+            .hosted_thread_role_for_badge(badge)
+            .is_some_and(|role| role.is_lsa_rpc_worker())
+        {
+            LSA_WORKER_PDU_READS.fetch_add(1, Ordering::Relaxed);
+            let _ = LSA_WORKER_FIRST_PDU_TYPE.compare_exchange(
+                0xFF,
+                pdu_type,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        } else {
+            LSA_SELF_RPC_CLIENT_READS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn complete_terminal_file_io(
         &mut self,
         file_id: u64,
@@ -10625,6 +10646,9 @@ impl ExecNtHandler {
         completed_inline: bool,
         completion_port_suppressed: bool,
     ) {
+        if !nt_io_completion::file_io_status_publishes_completion(status, completed_inline) {
+            return;
+        }
         unsafe {
             let _ = self.write_current_iosb(iosb, status, information);
         }
@@ -23014,7 +23038,6 @@ impl ExecNtHandler {
                         self.pipe_park_apc_context = args[3];
                         self.pipe_park_completion_port_suppressed = completion_port_suppressed;
                         self.pipe_park_event_obj_idx = event_obj_idx;
-                        self.pipe_park_transceive = true;
                     } else {
                         let waiter = nt_io_manager::PipeWaiter {
                             canonical_file_id: fid,
@@ -23036,7 +23059,6 @@ impl ExecNtHandler {
                             resume_ip: 0,
                             resume_sp: 0,
                             resume_flags: 0,
-                            is_transceive: true,
                         };
                         if (&mut *core::ptr::addr_of_mut!(PIPE_WAITERS))
                             .park(waiter)
@@ -28841,9 +28863,16 @@ impl ExecNtHandler {
                 }
                 let event_obj_idx = completion_event_index.map_or(u64::MAX, |index| index as u64);
                 let terminal_file_owned = file_retained && status != STATUS_PENDING;
-                if terminal_file_owned {
+                let publish_terminal = operation_started
+                    && status != STATUS_PENDING
+                    && nt_io_completion::file_io_status_publishes_completion(status, true);
+                if publish_terminal {
                     self.complete_terminal_file_io(
-                        completion_file_id,
+                        if terminal_file_owned {
+                            completion_file_id
+                        } else {
+                            0
+                        },
                         event_obj_idx,
                         self.current_tid,
                         apc_routine,
@@ -28986,6 +29015,12 @@ impl ExecNtHandler {
                 let disk_file = self.disk_file_for(fh);
                 let mut iosb_probe = [0u8; 16];
                 let iosb_ok = iosb != 0 && self.xas_read(iosb, &mut iosb_probe);
+                let apc_completion_conflict = self
+                    .npfs_read_file_route_for(fh)
+                    .ok()
+                    .is_some_and(|route| {
+                        apc_routine != 0 && self.file_completion.binding(route.file_id).is_some()
+                    });
                 let transport_capacity = (driver_launch::FSD_ARG_FRAMES * 0x1000) as usize;
                 // ★ THE WRITABLE OVERLAY IS NOT ON THE FSD TRANSPORT. `transport_capacity` is the
                 // isolated-FSD argument window (4 frames = 16 KiB); an overlay read is served
@@ -29007,16 +29042,14 @@ impl ExecNtHandler {
                 let mut output = alloc::vec![0u8; output_capacity];
                 let mut information = 0u64;
                 let mut routed = false;
-                let mut pending_read_fid = 0u64; // BATCH 33: npfs fid if the read went PENDING → park
-                let mut pending_read_fs_context = 0u64;
                 let mut pending_read_irp_id = 0u64;
                 let mut completion_file_id = 0u64;
-                let mut async_file_retained = false;
+                let mut file_retained = false;
                 let mut npfs_route_status = 0xFFFF_FFFEu32;
                 let mut npfs_route_fid = 0u64;
                 let mut completion_event_index = None;
                 let mut completion_event_trace = Ok(None);
-                let mut io_request_prepared = false;
+                let mut operation_started = false;
                 let mut status = if !iosb_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
                 } else if !matches!(disk_file, Ok(Some(_)))
@@ -29030,6 +29063,8 @@ impl ExecNtHandler {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
                 } else if let Err(handle_status) = disk_file {
                     handle_status
+                } else if apc_completion_conflict {
+                    STATUS_INVALID_PARAMETER
                 } else {
                     match self.prepare_io_event_for_request(event) {
                         Err(event_status) => {
@@ -29037,12 +29072,12 @@ impl ExecNtHandler {
                             event_status
                         }
                         Ok(event_index) => {
-                            io_request_prepared = true;
                             completion_event_trace = Ok(event_index);
                             completion_event_index = event_index;
                             if let Some((first_cluster, file_size, object_id)) =
                                 disk_file.unwrap_or(None)
                             {
+                                operation_started = true;
                                 if len == 0 {
                                     nt_fs::STATUS_SUCCESS
                                 } else {
@@ -29110,6 +29145,7 @@ impl ExecNtHandler {
                                     }
                                 }
                             } else if let Some(file_id) = overlay_file {
+                                operation_started = true;
                                 // ★ THE WRITABLE FILESYSTEM OVERLAY: read back what was really written.
                                 let mut explicit = None;
                                 let mut bad_offset = false;
@@ -29147,6 +29183,7 @@ impl ExecNtHandler {
                                     }
                                 }
                             } else if self.boot_status_handle_access(fh).is_ok() {
+                                operation_started = true;
                                 match self.boot_status_read_file(fh, buffer, len, byte_offset) {
                                     Ok(read) => {
                                         information = read;
@@ -29169,27 +29206,42 @@ impl ExecNtHandler {
                                             .file_completion
                                             .is_synchronous(file_id)
                                             .unwrap_or(true);
-                                        // A read conflicts only with another active read on this connection.
                                         let sync_reply_capacity = if synchronous {
-                                            wait_reply_pool_has_free()
+                                            REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0
+                                                && wait_reply_pool_has_free()
                                         } else {
                                             true
                                         };
-                                        let waiter_capacity = if sync_reply_capacity {
-                                            reserve_pipe_waiter(route.fs_context)
+                                        let owner_capacity = if sync_reply_capacity {
+                                            reserve_pending_file_io()
                                         } else {
                                             false
                                         };
-                                        let prepared = if !waiter_capacity || !sync_reply_capacity {
+                                        let prepared = if !owner_capacity || !sync_reply_capacity {
                                             Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
                                         } else {
-                                            self.file_completion.retain_file(file_id).map(|()| {
-                                                async_file_retained = true;
-                                            })
+                                            match self.file_completion.retain_file(file_id) {
+                                                Err(status) => Err(status),
+                                                Ok(()) => {
+                                                    file_retained = true;
+                                                    match self
+                                                        .file_completion
+                                                        .set_signaled(file_id, false)
+                                                    {
+                                                        Ok(()) => Ok(()),
+                                                        Err(status) => {
+                                                            self.release_file_reference(file_id);
+                                                            file_retained = false;
+                                                            Err(status)
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         };
                                         match prepared {
                                             Err(status) => status,
                                             Ok(()) => {
+                                                operation_started = true;
                                                 match self.dispatch_hosted_file_irp_for(
                                                     route,
                                                     major::IRP_MJ_READ as u64,
@@ -29204,65 +29256,39 @@ impl ExecNtHandler {
                                                     )) => {
                                                         routed = true;
                                                         information = completed;
+                                                        pending_read_irp_id = pending_irp_id;
+                                                        let mut driver_status = driver_status as u32;
                                                         let copy_len =
                                                             (completed as usize).min(output.len());
-                                                        if driver_status as u32 != 0x0000_0103
-                                                            && copy_len != 0
+                                                        if driver_status != STATUS_PENDING
+                                                            && nt_io_completion::file_io_status_copies_output(
+                                                                driver_status,
+                                                            )
                                                         {
-                                                            self.xas_write_buf(
+                                                            if completed > output.len() as u64 {
+                                                                driver_status =
+                                                                    STATUS_INVALID_BUFFER_SIZE;
+                                                                information = 0;
+                                                            } else if copy_len != 0
+                                                                && self.xas_try_write_buf(
                                                                 buffer,
                                                                 &output[..copy_len],
-                                                            );
-                                                            // LSA self-RPC: a PDU delivered SYNCHRONOUSLY (npfs had
-                                                            // the peer's message already queued). Same attribution as
-                                                            // the parked-read re-drive path.
-                                                            if self.current_process_is_lsass()
-                                                                && output.first() == Some(&5)
-                                                                && crate::pipe_fid_name_hash(
-                                                                    route.fs_context,
-                                                                ) == lsarpc_pipe_name_hash()
-                                                            {
-                                                                let pdu_type = output
-                                                                    .get(2)
-                                                                    .copied()
-                                                                    .unwrap_or(0xFF)
-                                                                    as u64;
-                                                                if self
-                                                                    .hosted_thread_role_for_badge(
-                                                                        self.current_badge,
-                                                                    )
-                                                                    .is_some_and(|role| {
-                                                                        role.is_lsa_rpc_worker()
-                                                                    })
-                                                                {
-                                                                    LSA_WORKER_PDU_READS.fetch_add(
-                                                                        1,
-                                                                        Ordering::Relaxed,
-                                                                    );
-                                                                    let _ =
-                                                                        LSA_WORKER_FIRST_PDU_TYPE
-                                                                            .compare_exchange(
-                                                                                0xFF,
-                                                                                pdu_type,
-                                                                                Ordering::Relaxed,
-                                                                                Ordering::Relaxed,
-                                                                            );
-                                                                } else {
-                                                                    LSA_SELF_RPC_CLIENT_READS
-                                                                        .fetch_add(
-                                                                            1,
-                                                                            Ordering::Relaxed,
-                                                                        );
-                                                                }
+                                                            ) {
+                                                                self.observe_completed_npfs_read(
+                                                                    file_id,
+                                                                    self.current_badge,
+                                                                    driver_status,
+                                                                    completed,
+                                                                    &output[..copy_len],
+                                                                    true,
+                                                                );
+                                                            } else if copy_len != 0 {
+                                                                driver_status =
+                                                                    STATUS_ACCESS_VIOLATION;
+                                                                information = 0;
                                                             }
                                                         }
-                                                        if driver_status as u32 == 0x0000_0103 {
-                                                            pending_read_fid = file_id;
-                                                            pending_read_fs_context =
-                                                                route.fs_context;
-                                                            pending_read_irp_id = pending_irp_id;
-                                                        }
-                                                        driver_status as u32
+                                                        driver_status
                                                     }
                                                     Err(route_status) => route_status,
                                                 }
@@ -29274,98 +29300,72 @@ impl ExecNtHandler {
                         }
                     }
                 };
-                if async_file_retained && pending_read_fid == 0 {
-                    self.release_file_reference(completion_file_id);
+                if routed && status == STATUS_PENDING && pending_read_irp_id == 0 {
+                    status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
+                    information = 0;
                 }
-                if io_request_prepared && pending_read_fid == 0 && status != 0x0000_0103 {
-                    let apc_status =
-                        self.queue_file_user_apc(self.current_tid, apc_routine, apc_context, iosb);
-                    if apc_status != nt_fs::STATUS_SUCCESS {
-                        status = apc_status;
-                        information = 0;
-                    }
-                }
-                if pending_read_fid != 0 {
-                    let _ = self.file_completion.set_signaled(pending_read_fid, false);
+                if routed && status == STATUS_PENDING {
                     let synchronous = self
                         .file_completion
-                        .is_synchronous(pending_read_fid)
+                        .is_synchronous(completion_file_id)
                         .unwrap_or(true);
                     let event_obj_idx =
                         completion_event_index.map_or(u64::MAX, |index| index as u64);
-                    if synchronous {
-                        self.pipe_park_file_id = pending_read_fid;
-                        self.pipe_park_fid = pending_read_fs_context;
-                        self.pipe_park_irp_id = pending_read_irp_id;
-                        self.pipe_park_buffer_va = buffer;
-                        self.pipe_park_buffer_len = len as u32;
-                        self.pipe_park_iosb_va = iosb;
-                        self.pipe_park_apc_routine = apc_routine;
-                        self.pipe_park_apc_context = apc_context;
-                        self.pipe_park_completion_port_suppressed = completion_port_suppressed;
-                        self.pipe_park_event_obj_idx = event_obj_idx;
-                        self.pipe_park_transceive = false;
-                    } else {
-                        let waiter = nt_io_manager::PipeWaiter {
-                            canonical_file_id: pending_read_fid,
-                            file_id: pending_read_fs_context,
-                            name_hash: crate::pipe_fid_name_hash(pending_read_fs_context),
-                            irp_id: pending_read_irp_id,
-                            delivery_state: 0,
-                            pi: self.pi as u32,
-                            tid: self.current_tid,
-                            badge: self.current_badge,
-                            buffer_va: buffer,
-                            buffer_len: len as u32,
-                            iosb_va: iosb,
-                            apc_routine,
-                            apc_context,
-                            completion_port_suppressed,
-                            event_obj_idx,
-                            reply_cap: 0,
-                            resume_ip: 0,
-                            resume_sp: 0,
-                            resume_flags: 0,
-                            is_transceive: false,
-                        };
-                        let parked = (&mut *core::ptr::addr_of_mut!(PIPE_WAITERS)).park(waiter);
-                        if parked.is_none() {
-                            self.abandon_pipe_irp(pending_read_irp_id);
-                            if async_file_retained {
-                                self.release_file_reference(pending_read_fid);
-                            }
-                            if crate::PIPE_WAITERS_REFUSED.fetch_add(1, Ordering::Relaxed) < 8 {
-                                print_str(b"[pipe-park] refused async READ -> STATUS_INSUFFICIENT_RESOURCES fid=0x");
-                                print_hex(pending_read_fid as u32);
-                                print_str(b"\n");
-                            }
-                            status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
-                            pending_read_fid = 0;
-                        }
-                    }
+                    self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
+                        file_id: completion_file_id,
+                        irp_id: pending_read_irp_id,
+                        major: major::IRP_MJ_READ,
+                        operation: nt_io_manager::PendingFileIoOperation::Transfer,
+                        delivery_state: 0,
+                        pi: self.pi as u32,
+                        tid: self.current_tid,
+                        badge: self.current_badge,
+                        output_va: buffer,
+                        output_len: len as u32,
+                        output_offset: 0,
+                        iosb_va: iosb,
+                        apc_routine,
+                        apc_context,
+                        completion_port_suppressed,
+                        signal_file: synchronous || event_obj_idx == u64::MAX,
+                        publish_iocp: apc_routine == 0,
+                        event_obj_idx,
+                        reply_cap: 0,
+                        reply_required: false,
+                        resume_ip: 0,
+                        resume_sp: 0,
+                        resume_flags: 0,
+                    });
+                    self.pending_file_io_wait = synchronous;
                 }
-                if iosb_ok && pending_read_fid == 0 {
-                    self.xas_write_buf(iosb, &status.to_le_bytes());
-                    self.xas_write_buf(iosb + 8, &information.to_le_bytes());
+                let event_obj_idx = completion_event_index.map_or(u64::MAX, |index| index as u64);
+                let terminal_file_owned = file_retained && status != STATUS_PENDING;
+                if operation_started && status != STATUS_PENDING {
+                    self.complete_terminal_file_io(
+                        if terminal_file_owned {
+                            completion_file_id
+                        } else {
+                            0
+                        },
+                        event_obj_idx,
+                        self.current_tid,
+                        apc_routine,
+                        apc_context,
+                        iosb,
+                        status,
+                        information,
+                        true,
+                        completion_port_suppressed,
+                    );
                 }
-                if routed && status != 0x0000_0103 {
-                    if status & 0xC000_0000 != 0xC000_0000 {
-                        let _ = self.post_file_completion(
-                            completion_file_id,
-                            apc_context,
-                            status,
-                            information,
-                            true,
-                            completion_port_suppressed,
-                        );
-                    }
+                if file_retained && status != STATUS_PENDING {
+                    self.release_file_reference(completion_file_id);
+                }
+                if routed
+                    && status != STATUS_PENDING
+                    && nt_io_completion::file_io_status_copies_output(status)
+                {
                     self.pipe_endpoint_progress = true;
-                }
-                if status != 0x0000_0103 {
-                    if let Some(index) = completion_event_index {
-                        let _ = self.signal_event_index(index);
-                        self.io_signal_event = index as i64;
-                    }
                 }
                 trace_named_pipe_io(
                     self.pi,
@@ -29402,7 +29402,11 @@ impl ExecNtHandler {
                         npfs_route_status,
                         npfs_route_fid,
                         routed,
-                        pending_read_fid,
+                        if status == STATUS_PENDING {
+                            completion_file_id
+                        } else {
+                            0
+                        },
                         status,
                         information,
                     );

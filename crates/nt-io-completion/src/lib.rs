@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
 pub const STATUS_TIMEOUT: u32 = 0x0000_0102;
 pub const STATUS_PENDING: u32 = 0x0000_0103;
+pub const STATUS_VERIFY_REQUIRED: u32 = 0x8000_0016;
 pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 pub const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
@@ -37,6 +38,18 @@ pub const fn normalize_io_event_handle(handle: u64) -> Option<u64> {
 
 pub const fn io_event_suppresses_completion_port(handle: u64) -> bool {
     handle & 1 != 0
+}
+
+/// Whether a returned I/O status owns caller-visible completion publication. Warnings are terminal
+/// completions, but an error returned inline leaves the IOSB, event, APC, and completion port alone.
+/// An error delivered after the operation returned pending is still a real completion.
+pub const fn file_io_status_publishes_completion(status: u32, completed_inline: bool) -> bool {
+    status & 0xC000_0000 != 0xC000_0000 || !completed_inline
+}
+
+/// Buffered output is copied for success and warning statuses, but never for an NT error.
+pub const fn file_io_status_copies_output(status: u32) -> bool {
+    status != STATUS_VERIFY_REQUIRED && status & 0xC000_0000 != 0xC000_0000
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -839,6 +852,28 @@ mod tests {
     use super::*;
 
     type Ports = CompletionPortTable<2, 2, 16>;
+
+    #[test]
+    fn completion_publication_distinguishes_inline_errors_from_deferred_errors() {
+        assert!(file_io_status_copies_output(STATUS_SUCCESS));
+        assert!(file_io_status_copies_output(0x8000_0005));
+        assert!(!file_io_status_copies_output(STATUS_VERIFY_REQUIRED));
+        assert!(!file_io_status_copies_output(STATUS_INVALID_PARAMETER));
+        assert!(file_io_status_publishes_completion(STATUS_SUCCESS, true));
+        assert!(file_io_status_publishes_completion(0x8000_0005, true));
+        assert!(file_io_status_publishes_completion(
+            STATUS_VERIFY_REQUIRED,
+            true
+        ));
+        assert!(!file_io_status_publishes_completion(
+            STATUS_INVALID_PARAMETER,
+            true
+        ));
+        assert!(file_io_status_publishes_completion(
+            STATUS_INVALID_PARAMETER,
+            false
+        ));
+    }
 
     fn packet(value: u64) -> CompletionPacket {
         CompletionPacket {

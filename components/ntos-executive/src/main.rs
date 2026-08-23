@@ -2830,26 +2830,26 @@ static KEYED_RELEASE_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static KEYED_RELEASE_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 
 // ─── BATCH 33: pipe-pending completion (park a pending pipe read, re-drive on peer write) ─────────
-/// The parked-pipe-read table (host-tested `nt_io_manager::PipeWaiterTable`). A caller whose npfs
-/// pipe read / FSCTL_PIPE_TRANSCEIVE returned STATUS_PENDING is parked here — its seL4 reply
+/// The pending-transceive table (host-tested `nt_io_manager::PipeWaiterTable`). A caller whose npfs
+/// `FSCTL_PIPE_TRANSCEIVE` returned STATUS_PENDING is parked here — its seL4 reply
 /// cap withheld (stolen into a pool like the event waiters), keyed by the reading end's npfs file-id
 /// — and re-driven when the peer writes. The single-threaded executive owns all mutation.
 ///
 /// This starts with a small default bootstrap reservation and grows like the async listen table.
 /// There is no tiny global NT limit on pending named-pipe IRPs: service startup, RPC servers, and
-/// driver control paths can legitimately accumulate more parked reads/transceives than the old 16-slot
+/// driver control paths can legitimately accumulate more transceives than the old 16-slot
 /// bring-up table.
 /// A refusal now means real allocation failure or reply-cap exhaustion, not "another service came up".
 static mut PIPE_WAITERS: nt_io_manager::PipeWaiterTable = nt_io_manager::PipeWaiterTable::new();
-/// Pending File-bound IRPs not owned by a pipe endpoint progress operation. Records retain exact
-/// canonical File/IRP generations through user publication and backend acknowledgement.
+/// Pending File-bound IRPs retain exact canonical File/IRP generations through user publication
+/// and backend acknowledgement, independent of the provider that owns the request.
 static mut PENDING_FILE_IO: nt_io_manager::PendingFileIoTable =
     nt_io_manager::PendingFileIoTable::new();
-/// Times a pipe read/transceive park was refused after a pending-capable IRP route wanted to retain it. A
+/// Times a pipe transceive park was refused after a pending-capable IRP route wanted to retain it. A
 /// refusal is a functional degrade (the caller gets `STATUS_INSUFFICIENT_RESOURCES` for an I/O that
 /// should have completed later), so this must stay 0.
 pub(crate) static PIPE_WAITERS_REFUSED: AtomicU64 = AtomicU64::new(0);
-/// Proof/diagnostic counters (specs + boot log): pipe reads parked, and woken by a peer write.
+/// Proof/diagnostic counters (specs + boot log): transceives parked and completed.
 static PIPE_WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static PIPE_WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 static PIPE_REDRIVE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -21259,13 +21259,13 @@ struct ExecNtHandler {
     /// synchronous File object must wait for terminal completion.
     pending_file_io_transfer: Option<nt_io_manager::PendingFileIo>,
     pending_file_io_wait: bool,
-    /// BATCH 33 — pipe-pending completion edge. Set by NtReadFile or
-    /// NtFsControlFile(FSCTL_PIPE_TRANSCEIVE) when npfs returns STATUS_PENDING: the LOOP must PARK this caller
+    /// BATCH 33 — pipe-pending completion edge. Set by
+    /// NtFsControlFile(FSCTL_PIPE_TRANSCEIVE) when npfs returns STATUS_PENDING: the loop must park this caller
     /// (steal its reply cap into the PipeWaiterTable keyed by the reading end's npfs file-id, rotate
     /// REPLY_MAIN to a fresh pool object) instead of returning PENDING, and re-drive it when the peer
     /// writes. `pipe_park_file_id` is the canonical FileId and `pipe_park_fid` is the reading end's
     /// npfs `FsContext` (0 = no park request). The rest is the completion context the re-drive
-    /// needs (user buffer/IOSB VAs + capacity + transceive flag).
+    /// needs (user buffer/IOSB VAs + capacity).
     /// Reset each dispatch (group-A signal, like `io_signal_event`).
     /// Canonical generation-protected FileId retained for completion ownership.
     pipe_park_file_id: u64,
@@ -21278,7 +21278,6 @@ struct ExecNtHandler {
     pipe_park_apc_context: u64,
     pipe_park_completion_port_suppressed: bool,
     pipe_park_event_obj_idx: u64,
-    pipe_park_transceive: bool,
     /// ★ Dbgk TARGET-SIDE BLOCKING, SYSCALL flavour. Set by a debug-event post issued from a
     /// SYSCALL arm (`dbgk_module_load` — `DbgkMapViewOfSection`, which NT queues with flags 0 and
     /// therefore BLOCKS the mapping thread on the continue). The handler cannot park: the reply-cap
