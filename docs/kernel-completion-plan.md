@@ -10249,3 +10249,33 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     migrate the always-synchronous query/set-information APIs next, then device control and ordinary
     FSCTL. Once those owners are green, fold the specialized transceive/listen records onto the same
     terminal publisher while retaining only their endpoint-specific progress triggers.
+
+    General pending File-syscall migration checkpoint (2026-08-23): routed
+    `NtQueryInformationFile` and `NtSetInformationFile` now use the same pre-dispatch capacity,
+    canonical File reference, exact IrpId, terminal output/IOSB publication, and synchronous reply
+    owner as Flush. They wait for terminal completion even when the File was opened asynchronously,
+    matching the NT local-event path without exposing that private event or publishing APC/IOCP.
+    `NtDeviceIoControlFile` and ordinary routed `NtFsControlFile` now distinguish synchronous and
+    asynchronous File objects at the service-loop handoff: synchronous operations transfer the live
+    syscall reply and wait; asynchronous operations return `STATUS_PENDING` while the exact record
+    retains all later output, IOSB, explicit-event/File, APC-xor-IOCP, ACK, cancellation, and File
+    lifetime ownership. APC plus an associated completion port fails before dispatch. Immediate
+    terminal delivery now follows the same ordering as retained delivery: output, IOSB, explicit
+    event and/or File signal, then APC xor IOCP. The generic routed-File helpers no longer carry NPFS
+    names, and the NPFS routing gate increments only for the dynamically resolved NamedPipe device.
+
+    Host validation is green for `cargo fmt --all`, `cargo test -p nt-io-manager` (`162/162`), the
+    freestanding executive check, and `git diff --check`. Serialized desktop proof
+    `.tmp/run-desktop-20260823-181432.log` is accepted: all `293/293` checks pass, Explorer completes
+    669 api0 callbacks with zero callback failures, and all 786,432 framebuffer pixels are
+    non-background with at least 32 colors before the sentinel. The run exercises routed
+    FilePipeInformation synchronously and the existing pending LISTEN/TRANSCEIVE owners; it does not
+    happen to produce a pending query, set, device-control, or ordinary-FSCTL result, so the live
+    proof for those new generic branches remains the common state-machine tests plus the full boot
+    regression gate. Review adjustment after auditing every exact hosted-IRP dispatch callsite: the
+    remaining owners are pending CREATE and the specialized pipe read/write/transceive/listen
+    records. Next preserve CREATE's exact IrpId through handle/FILE_OBJECT publication, then reuse
+    the common terminal publisher from the specialized records while retaining only their endpoint
+    progress triggers. Root `FSCTL_PIPE_WAIT` remains executive-modeled rather than an NPFS-owned
+    pending IRP and must move behind the real hosted File/device boundary; do not treat its current
+    name-wait table as the final kernel design.

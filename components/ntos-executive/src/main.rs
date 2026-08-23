@@ -21218,9 +21218,11 @@ struct ExecNtHandler {
     /// A synchronous file-I/O completion requested signaling this real executive event. The loop
     /// consumes it after dispatch so it can also wake reply-cap parked waiters.
     io_signal_event: i64,
-    /// A pending general File IRP whose syscall must wait for terminal completion. The service loop
-    /// attaches the live reply cap and transfers the completed record into `PENDING_FILE_IO`.
-    pending_file_io_park: Option<nt_io_manager::PendingFileIo>,
+    /// A pending general File IRP transferred into `PENDING_FILE_IO` after dispatch. The service
+    /// loop attaches the live reply cap only when `pending_file_io_wait` says the native API or
+    /// synchronous File object must wait for terminal completion.
+    pending_file_io_transfer: Option<nt_io_manager::PendingFileIo>,
+    pending_file_io_wait: bool,
     /// BATCH 33 — pipe-pending completion edge. Set by NtReadFile / NtFsControlFile(FSCTL_PIPE_LISTEN
     /// / TRANSCEIVE) when the npfs pipe returns STATUS_PENDING: the LOOP must PARK this caller
     /// (steal its reply cap into the PipeWaiterTable keyed by the reading end's npfs file-id, rotate

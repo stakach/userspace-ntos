@@ -134,6 +134,8 @@ impl PendingFileIoTable {
             || pending.irp_id == 0
             || pending.delivery_state != 0
             || pending.output_offset != 0
+            || (pending.output_len != 0 && pending.output_va == 0)
+            || (pending.apc_routine != 0 && pending.publish_iocp)
             || pending.reply_required != (pending.reply_cap != 0)
             || self
                 .slots
@@ -408,6 +410,25 @@ mod tests {
         assert!(table.park(pending(1, 0, 7)).is_none());
         assert!(table.park(pending(1, 2, 7)).is_some());
         assert!(table.park(pending(3, 2, 8)).is_none());
+    }
+
+    #[test]
+    fn pending_file_io_rejects_inconsistent_async_surfaces() {
+        let mut table = PendingFileIoTable::new();
+        let mut request = pending(1, 2, 7);
+        request.output_va = 0;
+        assert!(table.park(request).is_none());
+
+        let mut request = pending(1, 3, 7);
+        request.publish_iocp = true;
+        assert!(table.park(request).is_none());
+
+        let mut request = pending(1, 4, 7);
+        request.reply_cap = 0;
+        request.reply_required = false;
+        request.apc_routine = 0;
+        request.publish_iocp = true;
+        assert!(table.park(request).is_some());
     }
 
     #[test]

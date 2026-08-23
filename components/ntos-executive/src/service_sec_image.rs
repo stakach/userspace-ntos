@@ -8942,7 +8942,7 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_io_completion_apc_out: u64 = 0;
             let mut park_io_completion_iosb_out: u64 = 0;
             let mut park_io_completion_deadline: Option<u64> = None;
-            let mut park_pending_file_io: Option<nt_io_manager::PendingFileIo> = None;
+            let mut transfer_pending_file_io: Option<(nt_io_manager::PendingFileIo, bool)> = None;
             // BATCH 33 — pipe-pending park request latched from the handler (0 = none). Consumed at the
             // reply site (the reply-cap steal needs resume_ip/sp/flags, known there).
             let mut park_pipe_file_id: u64 = 0;
@@ -9060,7 +9060,8 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.io_completion_timeout = PendingWaitTimeout::none();
                 nt_handler.io_completion_wake = None;
                 nt_handler.io_signal_event = -1;
-                nt_handler.pending_file_io_park = None;
+                nt_handler.pending_file_io_transfer = None;
+                nt_handler.pending_file_io_wait = false;
                 nt_handler.pipe_park_file_id = 0;
                 nt_handler.pipe_park_fid = 0;
                 nt_handler.pipe_park_irp_id = 0;
@@ -9733,8 +9734,11 @@ pub(crate) unsafe fn service_sec_image(
                 if nt_handler.io_signal_event >= 0 {
                     let _ = wait_wake_dispatcher_set(&mut nt_handler);
                 }
-                if nt_handler.pending_file_io_park.is_some() {
-                    park_pending_file_io = nt_handler.pending_file_io_park.take();
+                if nt_handler.pending_file_io_transfer.is_some() {
+                    transfer_pending_file_io = nt_handler
+                        .pending_file_io_transfer
+                        .take()
+                        .map(|pending| (pending, nt_handler.pending_file_io_wait));
                 }
                 if nt_handler.user_timer_rearm_requested {
                     delay_timer_rearm(delay_queue);
@@ -15962,15 +15966,21 @@ pub(crate) unsafe fn service_sec_image(
                     result = 0xC000_009A;
                 }
             }
-            // A synchronous general File API waits on its exact canonical IRP even when the File
-            // object itself was opened asynchronously. Transfer this reply before the specialized
-            // endpoint waiters so every non-pipe-major completion uses one broker.
-            if let Some(pending) = park_pending_file_io.take() {
-                if pending_file_io_park(pending, resume_ip, sp, flags) {
+            // Transfer each general pending File IRP before the specialized endpoint waiters.
+            // Synchronous APIs/Files transfer the live reply cap and wait; asynchronous Files keep
+            // the caller's STATUS_PENDING reply and transfer only their terminal delivery owner.
+            if let Some((pending, wait_for_completion)) = transfer_pending_file_io.take() {
+                if pending_file_io_transfer(
+                    pending,
+                    wait_for_completion,
+                    resume_ip,
+                    sp,
+                    flags,
+                ) {
                     // The manager may already hold the terminal result (for example a completion
                     // published during the post-dispatch pump before reply ownership moved here).
                     let delivered = pending_file_io_redrive_all(&mut nt_handler);
-                    if delivered == 0 {
+                    if wait_for_completion && delivered == 0 {
                         trace_indefinite_wait_park(
                             &nt_handler,
                             badge,
@@ -15980,22 +15990,25 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
-                    pin_durable_table_growth_if_dirty(&mut heap_mark);
-                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
-                    badge = nb;
-                    mi = nmi;
-                    m0 = nm0;
-                    m1 = nm1;
-                    m2 = nm2;
-                    m3 = nm3;
-                    continue;
-                }
-                let _ = driver_launch::abandon_pending_irp(pending.irp_id);
-                nt_handler.release_file_reference(pending.file_id);
-                result = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES as u64;
-                if pending.iosb_va != 0 {
-                    let _ = nt_handler.write_current_iosb(pending.iosb_va, result as u32, 0);
+                    if wait_for_completion {
+                        pin_durable_table_growth_if_dirty(&mut heap_mark);
+                        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                        let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                        badge = nb;
+                        mi = nmi;
+                        m0 = nm0;
+                        m1 = nm1;
+                        m2 = nm2;
+                        m3 = nm3;
+                        continue;
+                    }
+                } else {
+                    let _ = driver_launch::abandon_pending_irp(pending.irp_id);
+                    nt_handler.release_file_reference(pending.file_id);
+                    result = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES as u64;
+                    if pending.iosb_va != 0 {
+                        let _ = nt_handler.write_current_iosb(pending.iosb_va, result as u32, 0);
+                    }
                 }
             }
             // BATCH 33 — PIPE-PENDING PARK: a real npfs pipe read / TRANSCEIVE returned STATUS_PENDING
@@ -22790,13 +22803,24 @@ unsafe fn lsa_deliver_reply(nt_handler: &mut ExecNtHandler, replymsg: u64) -> bo
     true
 }
 
-/// Transfer a synchronous general File syscall's reply into its exact pending-IRP delivery owner.
-unsafe fn pending_file_io_park(
+/// Transfer one general File syscall into its exact pending-IRP delivery owner. Synchronous
+/// operations also move the live syscall reply into that owner; asynchronous operations do not.
+unsafe fn pending_file_io_transfer(
     mut pending: nt_io_manager::PendingFileIo,
+    wait_for_completion: bool,
     resume_ip: u64,
     sp: u64,
     flags: u64,
 ) -> bool {
+    if !wait_for_completion {
+        let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
+        let old_capacity = table.capacity();
+        let parked = table.park(pending).is_some();
+        if parked && table.capacity() != old_capacity {
+            mark_durable_table_growth_dirty();
+        }
+        return parked;
+    }
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     if stolen == 0 {
         return false;

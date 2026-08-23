@@ -133,7 +133,7 @@ unsafe fn reserve_pending_file_io() -> bool {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct NpfsFileRoute {
+pub(crate) struct HostedFileRoute {
     /// Canonical generation-protected File identity.
     file_id: u64,
     device_id: u64,
@@ -2702,7 +2702,8 @@ impl ExecNtHandler {
         write_field!(io_completion_timeout, PendingWaitTimeout::none());
         write_field!(io_completion_wake, None);
         write_field!(io_signal_event, -1);
-        write_field!(pending_file_io_park, None);
+        write_field!(pending_file_io_transfer, None);
+        write_field!(pending_file_io_wait, false);
         write_field!(pipe_park_file_id, 0);
         write_field!(pipe_park_fid, 0);
         write_field!(pipe_park_irp_id, 0);
@@ -10575,17 +10576,26 @@ impl ExecNtHandler {
         completed_inline: bool,
         completion_port_suppressed: bool,
     ) {
-        let apc_status = self.queue_file_user_apc(tid, apc_routine, apc_context, iosb);
-        let (status, information) = if apc_status == nt_fs::STATUS_SUCCESS {
-            (status, information)
-        } else {
-            (apc_status, 0)
-        };
         unsafe {
             let _ = self.write_current_iosb(iosb, status, information);
         }
-        if file_id != 0 {
-            let _ = self.post_file_completion(
+        if event_obj_idx != u64::MAX {
+            let _ = self.signal_event_index(event_obj_idx as usize);
+            self.io_signal_event = event_obj_idx as i64;
+        }
+        let signal_file = file_id != 0
+            && (event_obj_idx == u64::MAX
+                || self
+                    .file_completion
+                    .is_synchronous(file_id)
+                    .unwrap_or(false));
+        if signal_file {
+            let _ = self.signal_file_completion(file_id, status);
+        }
+        if apc_routine != 0 {
+            let _ = self.queue_file_user_apc(tid, apc_routine, apc_context, iosb);
+        } else if file_id != 0 {
+            let _ = self.post_file_completion_packet(
                 file_id,
                 apc_context,
                 status,
@@ -10593,10 +10603,6 @@ impl ExecNtHandler {
                 completed_inline,
                 completion_port_suppressed,
             );
-        }
-        if event_obj_idx != u64::MAX {
-            let _ = self.signal_event_index(event_obj_idx as usize);
-            self.io_signal_event = event_obj_idx as i64;
         }
     }
 
@@ -10725,7 +10731,7 @@ impl ExecNtHandler {
                 return STATUS_INVALID_HANDLE;
             }
         };
-        let route = match self.npfs_file_route_for(args[0]) {
+        let route = match self.hosted_file_route_for(args[0]) {
             Some(route) => route,
             None => match self.pm.lookup_handle(pid, handle) {
             Some(nt_process::HandleObject::DiskFile { .. })
@@ -10746,6 +10752,17 @@ impl ExecNtHandler {
             }
             },
         };
+        let synchronous_file = match self.file_completion.is_synchronous(route.file_id) {
+            Ok(synchronous) => synchronous,
+            Err(status) => {
+                self.write_current_iosb(iosb, status, 0);
+                return status;
+            }
+        };
+        if args[2] != 0 && self.file_completion.binding(route.file_id).is_some() {
+            self.write_current_iosb(iosb, STATUS_INVALID_PARAMETER, 0);
+            return STATUS_INVALID_PARAMETER;
+        }
 
         let required_access = nt_io_abi::ioctl::access(ioctl);
         if required_access & nt_io_abi::ioctl::FILE_READ_ACCESS != 0
@@ -10782,34 +10799,92 @@ impl ExecNtHandler {
                 return event_status;
             }
         };
+        if !reserve_pending_file_io()
+            || (synchronous_file
+                && (REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
+                    || !wait_reply_pool_has_free()))
+        {
+            self.write_current_iosb(iosb, STATUS_INSUFFICIENT_RESOURCES, 0);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        if let Err(status) = self.file_completion.retain_file(route.file_id) {
+            self.write_current_iosb(iosb, status, 0);
+            return status;
+        }
+        if let Err(status) = self.file_completion.set_signaled(route.file_id, false) {
+            self.release_file_reference(route.file_id);
+            self.write_current_iosb(iosb, status, 0);
+            return status;
+        }
 
         let mut information = 0u64;
-        let mut status = match self.npfs_route_raw_for(
+        let mut pending_irp_id = 0u64;
+        let mut status = match self.dispatch_hosted_file_irp_for(
             route,
             major::IRP_MJ_DEVICE_CONTROL as u64,
             ioctl as u64,
             &input,
             &mut output,
         ) {
-            Ok((driver_status, completed, _)) => {
+            Ok((driver_status, completed, irp_id)) => {
                 information = completed;
+                pending_irp_id = irp_id;
                 driver_status as u32
             }
             Err(route_status) => route_status,
         };
-        if information != 0 && args[8] != 0 {
-            let copy_len = (information as usize).min(output.len());
-            if copy_len != 0 && !self.xas_try_write_buf(args[8], &output[..copy_len]) {
-                status = STATUS_ACCESS_VIOLATION;
+        if status == STATUS_PENDING {
+            if pending_irp_id == 0 {
+                status = STATUS_INSUFFICIENT_RESOURCES;
                 information = 0;
+                self.complete_terminal_file_io(
+                    route.file_id,
+                    event_obj_idx,
+                    self.current_tid,
+                    args[2],
+                    args[3],
+                    iosb,
+                    status,
+                    information,
+                    false,
+                    completion_port_suppressed,
+                );
+                self.release_file_reference(route.file_id);
+            } else {
+                self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
+                    file_id: route.file_id,
+                    irp_id: pending_irp_id,
+                    major: major::IRP_MJ_DEVICE_CONTROL,
+                    delivery_state: 0,
+                    pi: self.pi as u32,
+                    tid: self.current_tid,
+                    badge: self.current_badge,
+                    output_va: args[8],
+                    output_len: raw_output_len as u32,
+                    output_offset: 0,
+                    iosb_va: iosb,
+                    apc_routine: args[2],
+                    apc_context: args[3],
+                    completion_port_suppressed,
+                    signal_file: synchronous_file || event_obj_idx == u64::MAX,
+                    publish_iocp: args[2] == 0,
+                    event_obj_idx,
+                    reply_cap: 0,
+                    reply_required: false,
+                    resume_ip: 0,
+                    resume_sp: 0,
+                    resume_flags: 0,
+                });
+                self.pending_file_io_wait = synchronous_file;
             }
-        }
-
-        self.write_current_iosb(iosb, status, information);
-        if route.file_id != 0 && status == STATUS_PENDING {
-            let _ = self.file_completion.set_signaled(route.file_id, false);
-        }
-        if route.file_id != 0 && status != STATUS_PENDING {
+        } else {
+            if information != 0 && args[8] != 0 {
+                let copy_len = (information as usize).min(output.len());
+                if copy_len != 0 && !self.xas_try_write_buf(args[8], &output[..copy_len]) {
+                    status = STATUS_ACCESS_VIOLATION;
+                    information = 0;
+                }
+            }
             self.complete_terminal_file_io(
                 route.file_id,
                 event_obj_idx,
@@ -10822,6 +10897,7 @@ impl ExecNtHandler {
                 true,
                 completion_port_suppressed,
             );
+            self.release_file_reference(route.file_id);
         }
         status
     }
@@ -18013,9 +18089,9 @@ impl ExecNtHandler {
     }
 
     /// Route an endpoint IRP through the device that owned the handle's FILE_OBJECT.
-    pub(crate) unsafe fn npfs_route_raw_for(
+    pub(crate) unsafe fn dispatch_hosted_file_irp_for(
         &mut self,
-        route: NpfsFileRoute,
+        route: HostedFileRoute,
         major: u64,
         fsctl: u64,
         input: &[u8],
@@ -18030,7 +18106,9 @@ impl ExecNtHandler {
             input,
             output,
         )?;
-        NPFS_ROUTED_IRPS.fetch_add(1, Ordering::Relaxed);
+        if driver_launch::device_id_by_name("\\Device\\NamedPipe") == Some(route.device_id) {
+            NPFS_ROUTED_IRPS.fetch_add(1, Ordering::Relaxed);
+        }
         Ok((
             status,
             information,
@@ -18039,14 +18117,14 @@ impl ExecNtHandler {
     }
 
     /// Resolve a process-local typed file handle to its canonical hosted File identity.
-    pub(crate) fn npfs_file_id_for(&self, handle: u64) -> u64 {
-        self.npfs_file_route_for(handle)
+    pub(crate) fn hosted_file_id_for(&self, handle: u64) -> u64 {
+        self.hosted_file_route_for(handle)
             .map(|route| route.file_id)
             .unwrap_or(0)
     }
 
-    /// Resolve a process-local typed file handle to its NPFS file and owning device route.
-    pub(crate) fn npfs_file_route_for(&self, handle: u64) -> Option<NpfsFileRoute> {
+    /// Resolve a process-local routed File handle to its canonical File and owning device.
+    pub(crate) fn hosted_file_route_for(&self, handle: u64) -> Option<HostedFileRoute> {
         let Some(pid) = self.pm_pid_for_pi(self.pi) else {
             return None;
         };
@@ -18060,7 +18138,7 @@ impl ExecNtHandler {
         if process_device_id != device_id {
             return None;
         }
-        Some(NpfsFileRoute {
+        Some(HostedFileRoute {
             file_id,
             device_id,
             fs_context,
@@ -18068,7 +18146,7 @@ impl ExecNtHandler {
     }
 
     /// Resolve a typed pipe handle and enforce the write access granted at create/open time.
-    pub(crate) fn npfs_write_file_route_for(&self, handle: u64) -> Result<NpfsFileRoute, u32> {
+    pub(crate) fn npfs_write_file_route_for(&self, handle: u64) -> Result<HostedFileRoute, u32> {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
         const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
         const FILE_WRITE_DATA: u32 = 0x0000_0002;
@@ -18078,7 +18156,7 @@ impl ExecNtHandler {
 
         let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
         let route = self
-            .npfs_file_route_for(handle)
+            .hosted_file_route_for(handle)
             .ok_or(STATUS_INVALID_HANDLE)?;
         let access = self
             .pm
@@ -18094,7 +18172,7 @@ impl ExecNtHandler {
     /// write-data access for named pipes (append-data is deliberately excluded because that bit is
     /// `FILE_CREATE_PIPE_INSTANCE` in the pipe namespace). Generic access is retained in our handle
     /// table, so accept the generic write/all grants until object creation performs generic mapping.
-    pub(crate) fn npfs_flush_file_route_for(&self, handle: u64) -> Result<NpfsFileRoute, u32> {
+    pub(crate) fn npfs_flush_file_route_for(&self, handle: u64) -> Result<HostedFileRoute, u32> {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
         const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
         const FILE_WRITE_DATA: u32 = 0x0000_0002;
@@ -18103,7 +18181,7 @@ impl ExecNtHandler {
 
         let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
         let route = self
-            .npfs_file_route_for(handle)
+            .hosted_file_route_for(handle)
             .ok_or(STATUS_INVALID_HANDLE)?;
         let access = self
             .pm
@@ -18116,7 +18194,7 @@ impl ExecNtHandler {
     }
 
     /// Resolve a typed pipe handle and enforce read access granted at create/open time.
-    pub(crate) fn npfs_read_file_route_for(&self, handle: u64) -> Result<NpfsFileRoute, u32> {
+    pub(crate) fn npfs_read_file_route_for(&self, handle: u64) -> Result<HostedFileRoute, u32> {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
         const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
         const FILE_READ_DATA: u32 = 0x0000_0001;
@@ -18125,7 +18203,7 @@ impl ExecNtHandler {
 
         let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
         let route = self
-            .npfs_file_route_for(handle)
+            .hosted_file_route_for(handle)
             .ok_or(STATUS_INVALID_HANDLE)?;
         let access = self
             .pm
@@ -22414,20 +22492,23 @@ impl ExecNtHandler {
                 let is_pipe_listen = (fsctl as u32) == FSCTL_PIPE_LISTEN;
                 let raw_input_len = nt_ulong_arg(args[7]) as usize;
                 let raw_output_len = nt_ulong_arg(args[9]) as usize;
-                let file_route = self.npfs_file_route_for(args[0]);
+                let file_route = self.hosted_file_route_for(args[0]);
                 let fid = file_route.map(|route| route.file_id).unwrap_or(0);
                 let fs_context = file_route.map(|route| route.fs_context).unwrap_or(0);
                 let is_pipe_wait = (fsctl as u32) == FSCTL_PIPE_WAIT;
                 let is_pipe_transceive = (fsctl as u32) == FSCTL_PIPE_TRANSCEIVE;
                 let mut transceive_file_retained = false;
                 let mut transceive_pending_async = false;
+                let mut ordinary_file_retained = false;
+                let mut ordinary_synchronous_file = false;
+                let mut ordinary_pending = false;
                 let mut pending_endpoint_irp_id = 0u64;
                 let mut pipe_wait_trace_name: Option<alloc::vec::Vec<u16>> = None;
                 let mut pipe_wait_trace_hash = 0u64;
                 let mut pipe_wait_trace_armed = false;
                 let mut pipe_wait_trace_available = false;
                 let mut pipe_wait_trace_known = false;
-                let mut routed_endpoint_fsctl = false;
+                let mut routed_hosted_fsctl = false;
                 if is_pipe_wait && self.is_npfs_root_handle(args[0]) {
                     const PIPE_WAIT_INPUT_CAP: usize = 0x1_000c;
                     if !driver_launch::npfs_ready() {
@@ -22569,13 +22650,49 @@ impl ExecNtHandler {
                                     transceive_file_retained = true;
                                 })
                             }
-                        } else {
+                        } else if is_pipe_listen {
                             Ok(())
+                        } else {
+                            match self.file_completion.is_synchronous(route.file_id) {
+                                Err(status) => Err(status),
+                                Ok(synchronous) => {
+                                    ordinary_synchronous_file = synchronous;
+                                    if args[2] != 0
+                                        && self.file_completion.binding(route.file_id).is_some()
+                                    {
+                                        Err(STATUS_INVALID_PARAMETER)
+                                    } else if !reserve_pending_file_io()
+                                        || (synchronous
+                                            && (REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
+                                                || !wait_reply_pool_has_free()))
+                                    {
+                                        Err(STATUS_INSUFFICIENT_RESOURCES)
+                                    } else {
+                                        match self.file_completion.retain_file(route.file_id) {
+                                            Err(status) => Err(status),
+                                            Ok(()) => {
+                                                ordinary_file_retained = true;
+                                                match self
+                                                    .file_completion
+                                                    .set_signaled(route.file_id, false)
+                                                {
+                                                    Ok(()) => Ok(()),
+                                                    Err(status) => {
+                                                        self.release_file_reference(route.file_id);
+                                                        ordinary_file_retained = false;
+                                                        Err(status)
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         };
                         match prepared {
                             Err(preparation_status) => status = preparation_status as u64,
                             Ok(()) => {
-                                match self.npfs_route_raw_for(
+                                match self.dispatch_hosted_file_irp_for(
                                     route,
                                     0xd,
                                     fsctl,
@@ -22583,13 +22700,22 @@ impl ExecNtHandler {
                                     &mut output,
                                 ) {
                                     Ok((st, completed, pending_irp_id)) => {
-                                        routed_endpoint_fsctl = true;
+                                        routed_hosted_fsctl = true;
                                         status = st as u64;
                                         information = completed;
                                         pending_endpoint_irp_id = pending_irp_id;
-                                        if completed != 0 && args[8] != 0 {
+                                        if st as u32 != STATUS_PENDING
+                                            && completed != 0
+                                            && args[8] != 0
+                                        {
                                             let copy_len = (completed as usize).min(output.len());
-                                            self.xas_write_buf(args[8], &output[..copy_len]);
+                                            if !self.xas_try_write_buf(
+                                                args[8],
+                                                &output[..copy_len],
+                                            ) {
+                                                status = STATUS_ACCESS_VIOLATION as u64;
+                                                information = 0;
+                                            }
                                         }
                                     }
                                     Err(route_status) => status = route_status as u64,
@@ -22599,6 +22725,39 @@ impl ExecNtHandler {
                     }
                 } else {
                     status = STATUS_INVALID_HANDLE as u64;
+                }
+                if ordinary_file_retained && (status as u32) == STATUS_PENDING {
+                    if pending_endpoint_irp_id == 0 {
+                        status = STATUS_INSUFFICIENT_RESOURCES as u64;
+                        information = 0;
+                    } else {
+                        self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
+                            file_id: fid,
+                            irp_id: pending_endpoint_irp_id,
+                            major: major::IRP_MJ_FILE_SYSTEM_CONTROL,
+                            delivery_state: 0,
+                            pi: self.pi as u32,
+                            tid: self.current_tid,
+                            badge: self.current_badge,
+                            output_va: args[8],
+                            output_len: raw_output_len.min(0x4000) as u32,
+                            output_offset: 0,
+                            iosb_va: iosb,
+                            apc_routine: args[2],
+                            apc_context: args[3],
+                            completion_port_suppressed,
+                            signal_file: ordinary_synchronous_file || event_obj_idx == u64::MAX,
+                            publish_iocp: args[2] == 0,
+                            event_obj_idx,
+                            reply_cap: 0,
+                            reply_required: false,
+                            resume_ip: 0,
+                            resume_sp: 0,
+                            resume_flags: 0,
+                        });
+                        self.pending_file_io_wait = ordinary_synchronous_file;
+                        ordinary_pending = true;
+                    }
                 }
                 if transceive_file_retained && status as u32 != STATUS_PENDING {
                     self.release_file_reference(fid);
@@ -22763,11 +22922,12 @@ impl ExecNtHandler {
                     && self.pipe_listen_fid == 0
                     && self.pipe_name_wait_hash == 0
                     && !transceive_pending_async
+                    && !ordinary_pending
                 {
                     self.xas_write_buf(iosb, &(status as u32).to_le_bytes());
                     self.xas_write_buf(iosb + 8, &information.to_le_bytes());
                 }
-                if routed_endpoint_fsctl
+                if routed_hosted_fsctl
                     && (status as u32) != STATUS_PENDING
                     && self.pipe_park_fid == 0
                     && self.pipe_listen_fid == 0
@@ -22785,6 +22945,9 @@ impl ExecNtHandler {
                         true,
                         completion_port_suppressed,
                     );
+                }
+                if ordinary_file_retained && !ordinary_pending {
+                    self.release_file_reference(fid);
                 }
                 // A TRANSCEIVE writes the request before reading the reply. Even when the read half
                 // pends, that request may satisfy the peer's parked read, so re-drive readers for both
@@ -27047,7 +27210,7 @@ impl ExecNtHandler {
                     {
                         return nt_syscall::STATUS_ACCESS_VIOLATION;
                     }
-                    let file_id = self.npfs_file_id_for(args[0]);
+                    let file_id = self.hosted_file_id_for(args[0]);
                     if file_id == 0 {
                         return nt_fs::STATUS_INVALID_HANDLE;
                     }
@@ -27067,7 +27230,7 @@ impl ExecNtHandler {
                     }
                     return nt_fs::STATUS_SUCCESS;
                 }
-                if let Some(route) = self.npfs_file_route_for(args[0]) {
+                if let Some(route) = self.hosted_file_route_for(args[0]) {
                     if iosb == 0 || output == 0 {
                         return nt_syscall::STATUS_ACCESS_VIOLATION;
                     }
@@ -27087,34 +27250,103 @@ impl ExecNtHandler {
                     );
                     routed_output.fill(0);
 
+                    let file_id = route.file_id;
+                    let synchronous_file = match self.file_completion.is_synchronous(file_id) {
+                        Ok(synchronous) => synchronous,
+                        Err(status) => return status,
+                    };
+                    if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
+                        || !wait_reply_pool_has_free()
+                        || !reserve_pending_file_io()
+                    {
+                        return nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
+                    }
+                    if let Err(status) = self.file_completion.retain_file(file_id) {
+                        return status;
+                    }
+                    if self.file_completion.set_signaled(file_id, false).is_err() {
+                        self.release_file_reference(file_id);
+                        return nt_fs::STATUS_INVALID_HANDLE;
+                    }
+
                     let mut information = 0u64;
-                    let status = match self.npfs_route_raw_for(
+                    let mut pending_irp_id = 0u64;
+                    let mut status = match self.dispatch_hosted_file_irp_for(
                         route,
                         major::IRP_MJ_QUERY_INFORMATION as u64,
                         class as u64,
                         &[],
                         &mut *routed_output,
                     ) {
-                        Ok((driver_status, completed, _)) => {
+                        Ok((driver_status, completed, irp_id)) => {
                             information = completed;
+                            pending_irp_id = irp_id;
                             driver_status as u32
                         }
                         Err(route_status) => route_status,
                     };
 
-                    let copy_len = information
-                        .min(length as u64)
-                        .min(routed_output.len() as u64)
-                        as usize;
-                    if copy_len != 0 && !self.xas_try_write_buf(output, &routed_output[..copy_len])
-                    {
-                        return nt_syscall::STATUS_ACCESS_VIOLATION;
-                    }
-                    let mut iosb_bytes = [0u8; 16];
-                    iosb_bytes[..4].copy_from_slice(&status.to_le_bytes());
-                    iosb_bytes[8..16].copy_from_slice(&information.to_le_bytes());
-                    if !self.xas_try_write_buf(iosb, &iosb_bytes) {
-                        return nt_syscall::STATUS_ACCESS_VIOLATION;
+                    if status == STATUS_PENDING {
+                        if pending_irp_id == 0 {
+                            status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
+                            information = 0;
+                            if synchronous_file {
+                                let _ = self.signal_file_completion(file_id, status);
+                            }
+                            self.release_file_reference(file_id);
+                            let mut iosb_bytes = [0u8; 16];
+                            iosb_bytes[..4].copy_from_slice(&status.to_le_bytes());
+                            if !self.xas_try_write_buf(iosb, &iosb_bytes) {
+                                status = nt_syscall::STATUS_ACCESS_VIOLATION;
+                            }
+                        } else {
+                            self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
+                                file_id,
+                                irp_id: pending_irp_id,
+                                major: major::IRP_MJ_QUERY_INFORMATION,
+                                delivery_state: 0,
+                                pi: self.pi as u32,
+                                tid: self.current_tid,
+                                badge: self.current_badge,
+                                output_va: output,
+                                output_len: output_capacity as u32,
+                                output_offset: 0,
+                                iosb_va: iosb,
+                                apc_routine: 0,
+                                apc_context: 0,
+                                completion_port_suppressed: true,
+                                signal_file: synchronous_file,
+                                publish_iocp: false,
+                                event_obj_idx: u64::MAX,
+                                reply_cap: 0,
+                                reply_required: false,
+                                resume_ip: 0,
+                                resume_sp: 0,
+                                resume_flags: 0,
+                            });
+                            self.pending_file_io_wait = true;
+                        }
+                    } else {
+                        let copy_len = information
+                            .min(length as u64)
+                            .min(routed_output.len() as u64)
+                            as usize;
+                        if copy_len != 0
+                            && !self.xas_try_write_buf(output, &routed_output[..copy_len])
+                        {
+                            status = nt_syscall::STATUS_ACCESS_VIOLATION;
+                            information = 0;
+                        }
+                        let mut iosb_bytes = [0u8; 16];
+                        iosb_bytes[..4].copy_from_slice(&status.to_le_bytes());
+                        iosb_bytes[8..16].copy_from_slice(&information.to_le_bytes());
+                        if !self.xas_try_write_buf(iosb, &iosb_bytes) {
+                            status = nt_syscall::STATUS_ACCESS_VIOLATION;
+                        }
+                        if synchronous_file {
+                            let _ = self.signal_file_completion(file_id, status);
+                        }
+                        self.release_file_reference(file_id);
                     }
                     if NT_QUERY_INFORMATION_FILE_NPFS_TRACE_N.fetch_add(1, Ordering::Relaxed) < 32 {
                         print_str(b"[nt-query-info-file-npfs] pi=");
@@ -28348,7 +28580,7 @@ impl ExecNtHandler {
                                             Err(status) => status,
                                             Ok(()) => {
                                                 let mut output = [];
-                                                match self.npfs_route_raw_for(
+                                                match self.dispatch_hosted_file_irp_for(
                                                     route,
                                                     major::IRP_MJ_WRITE as u64,
                                                     0,
@@ -28802,7 +29034,7 @@ impl ExecNtHandler {
                                         match prepared {
                                             Err(status) => status,
                                             Ok(()) => {
-                                                match self.npfs_route_raw_for(
+                                                match self.dispatch_hosted_file_irp_for(
                                                     route,
                                                     major::IRP_MJ_READ as u64,
                                                     0,
@@ -29195,7 +29427,7 @@ impl ExecNtHandler {
                 }
                 let status = match information_class {
                     23 => {
-                        let route = self.npfs_file_route_for(args[0]);
+                        let route = self.hosted_file_route_for(args[0]);
                         if length < 8 {
                             0xC000_0004 // STATUS_INFO_LENGTH_MISMATCH
                         } else if args[2] == 0 || !payload_ok {
@@ -29203,20 +29435,86 @@ impl ExecNtHandler {
                         } else if route.is_none() {
                             0xC000_0008 // STATUS_INVALID_HANDLE
                         } else {
+                            let route = route.unwrap();
+                            let file_id = route.file_id;
+                            let synchronous_file = match self.file_completion.is_synchronous(file_id)
+                            {
+                                Ok(synchronous) => synchronous,
+                                Err(status) => return status,
+                            };
+                            if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
+                                || !wait_reply_pool_has_free()
+                                || !reserve_pending_file_io()
+                            {
+                                return nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
+                            }
+                            if let Err(status) = self.file_completion.retain_file(file_id) {
+                                return status;
+                            }
+                            if self.file_completion.set_signaled(file_id, false).is_err() {
+                                self.release_file_reference(file_id);
+                                return nt_fs::STATUS_INVALID_HANDLE;
+                            }
                             let mut output = [];
-                            match self.npfs_route_raw_for(
-                                route.unwrap(),
+                            let mut pending_irp_id = 0u64;
+                            let mut status = match self.dispatch_hosted_file_irp_for(
+                                route,
                                 major::IRP_MJ_SET_INFORMATION as u64,
                                 information_class as u64,
                                 &payload[..8],
                                 &mut output,
                             ) {
-                                Ok((driver_status, completed, _)) => {
+                                Ok((driver_status, completed, irp_id)) => {
                                     information = completed;
+                                    pending_irp_id = irp_id;
                                     driver_status as u32
                                 }
                                 Err(route_status) => route_status,
+                            };
+                            if status == STATUS_PENDING {
+                                if pending_irp_id == 0 {
+                                    status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
+                                    information = 0;
+                                    if synchronous_file {
+                                        let _ = self.signal_file_completion(file_id, status);
+                                    }
+                                    self.release_file_reference(file_id);
+                                } else {
+                                    self.pending_file_io_transfer =
+                                        Some(nt_io_manager::PendingFileIo {
+                                            file_id,
+                                            irp_id: pending_irp_id,
+                                            major: major::IRP_MJ_SET_INFORMATION,
+                                            delivery_state: 0,
+                                            pi: self.pi as u32,
+                                            tid: self.current_tid,
+                                            badge: self.current_badge,
+                                            output_va: 0,
+                                            output_len: 0,
+                                            output_offset: 0,
+                                            iosb_va: iosb,
+                                            apc_routine: 0,
+                                            apc_context: 0,
+                                            completion_port_suppressed: true,
+                                            signal_file: synchronous_file,
+                                            publish_iocp: false,
+                                            event_obj_idx: u64::MAX,
+                                            reply_cap: 0,
+                                            reply_required: false,
+                                            resume_ip: 0,
+                                            resume_sp: 0,
+                                            resume_flags: 0,
+                                        });
+                                    self.pending_file_io_wait = true;
+                                    return STATUS_PENDING;
+                                }
+                            } else {
+                                if synchronous_file {
+                                    let _ = self.signal_file_completion(file_id, status);
+                                }
+                                self.release_file_reference(file_id);
                             }
+                            status
                         }
                     }
                     30 => {
@@ -29226,7 +29524,7 @@ impl ExecNtHandler {
                         } else if args[2] == 0 || !payload_ok {
                             0xC000_0005 // STATUS_ACCESS_VIOLATION
                         } else {
-                            let file_id = self.npfs_file_id_for(args[0]);
+                            let file_id = self.hosted_file_id_for(args[0]);
                             if file_id == 0 {
                                 0xC000_0008 // STATUS_INVALID_HANDLE
                             } else if let Err(status) = self.file_completion.can_associate(file_id)
@@ -29277,7 +29575,7 @@ impl ExecNtHandler {
                         } else if args[2] == 0 || !payload_ok {
                             0xC000_0005 // STATUS_ACCESS_VIOLATION
                         } else {
-                            let file_id = self.npfs_file_id_for(args[0]);
+                            let file_id = self.hosted_file_id_for(args[0]);
                             if file_id == 0 {
                                 0xC000_0008 // STATUS_INVALID_HANDLE
                             } else {
@@ -29352,7 +29650,7 @@ impl ExecNtHandler {
                                 Ok(()) => {
                                     let _ = self.file_completion.set_signaled(file_id, false);
                                     let mut output = [];
-                                    match self.npfs_route_raw_for(
+                                    match self.dispatch_hosted_file_irp_for(
                                         route,
                                         major::IRP_MJ_FLUSH_BUFFERS as u64,
                                         0,
@@ -29384,7 +29682,7 @@ impl ExecNtHandler {
                         status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
                         information = 0;
                     } else {
-                        self.pending_file_io_park = Some(nt_io_manager::PendingFileIo {
+                        self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
                             file_id,
                             irp_id: pending_irp_id,
                             major: major::IRP_MJ_FLUSH_BUFFERS,
@@ -29408,6 +29706,7 @@ impl ExecNtHandler {
                             resume_sp: 0,
                             resume_flags: 0,
                         });
+                        self.pending_file_io_wait = true;
                     }
                 }
                 if iosb_ok && status != STATUS_PENDING {
