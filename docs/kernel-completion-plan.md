@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-08-23
+Last updated: 2026-08-24
 
 ## Objective
 
@@ -10852,3 +10852,40 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the explicit `HOSTED_FSCTL_BUFFER_CAP` and fixed shared argument-window assumption with a
     growable or banked control-buffer transport. No filesystem/device control path may reject a
     valid NT request merely because its input or output exceeds 16 KiB.
+
+    Banked hosted control-buffer checkpoint (2026-08-24): the four-page cross-address-space ARG
+    window is now a transfer bank, not an NT request-size limit. Each hosted dispatch installs an
+    exact, nesting-safe active transfer frame keyed by component channel and canonical `IrpId`.
+    Authenticated component service calls pull input, pull an initial direct second buffer, and push
+    output through monotonic checked cursors in bank-sized chunks. The driver component allocates the
+    complete request-owned WDM buffers from its pool, keeps them live through pending completion,
+    and streams terminal output before reclaiming the IRP graph. No raw executive buffer pointer is
+    published to a component.
+
+    The old `HOSTED_FSCTL_BUFFER_CAP`, completed-read byte cap, eager ARG copy/truncation, and the I/O
+    Manager's unrelated 64 KiB policy limit are deleted. The syscall, external-backend, hosted
+    driver, VideoPort `StartIo`, and retained-completion paths now accept every length representable
+    by NT's `ULONG` fields and report allocation failure as `STATUS_INSUFFICIENT_RESOURCES` instead
+    of fabricating an invalid-buffer result. Buffered, direct, and neither layouts remain distinct;
+    in particular, `METHOD_IN_DIRECT` preserves the caller's second-buffer contents for driver read
+    access before returning any completed bytes. Component `FILE_OBJECT.FileName` storage also moved
+    out of the ephemeral bank into request-owned component memory.
+
+    Focused validation is green for `nt-io-manager` (`170/170`), including a 74,565-byte round trip
+    through all four IOCTL methods, explicit `METHOD_IN_DIRECT` seed visibility, ordered bank-cursor
+    rejection tests, and `git diff --check`. The freestanding release executive builds and stages at
+    the existing 212-warning baseline. Serialized desktop proof
+    `.tmp/run-desktop-20260824-080531.log` is accepted for the exact integrated tree: hosted driver
+    traffic crosses the no-fallback bank service path with zero pump walls and zero file-transfer
+    failures; genuine userinit and Explorer launch; Explorer completes 666 real api0 callbacks with
+    zero callback failures; paint reaches 5 BeginPaint, 20 EndPaint, 185 direct GDI returns, and 131
+    batch flushes carrying 171 records. All 786,432 framebuffer pixels are non-background with at
+    least 32 colors, all `293/293` checks pass, and the sentinel is emitted.
+
+    Review adjustment: the fixed control-buffer ceiling is closed. Canonical File/IRP ownership,
+    generic pending publication, cancellation/ACK lifetime, and arbitrary ULONG-sized hosted buffer
+    transport are now in place, so the next I/O ownership step is the real multi-stack
+    `IoCompleteRequest` unwinder. Implement completion-control invocation, pending propagation,
+    driver-local IRPs, and `STATUS_MORE_PROCESSING_REQUIRED` in a host-tested I/O Manager model,
+    then wire the component graph to that model and delete the current single-stack finalization
+    machinery it replaces. Do not introduce a second completion path or a driver-specific unwind.

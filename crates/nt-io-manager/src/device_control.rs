@@ -80,7 +80,13 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 sysbuf.resize(input.len().max(output.len()), 0);
                 sysbuf[..input.len()].copy_from_slice(input);
             }
-            ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT => {
+            ioctl::METHOD_IN_DIRECT => {
+                sysbuf.extend_from_slice(input);
+                // METHOD_IN_DIRECT grants the driver read access to the second buffer, so preserve
+                // its caller-supplied contents before dispatch.
+                direct.extend_from_slice(output);
+            }
+            ioctl::METHOD_OUT_DIRECT => {
                 sysbuf.extend_from_slice(input);
                 direct.resize(output.len(), 0);
             }

@@ -48,9 +48,8 @@ use nt_hosted_runtime::{
     NdisProtocolCharacteristicsLayoutError, DC21X4_ADAPTER_CURRENT_INTERRUPT_MASK_OFFSET_X64,
     DC21X4_ADAPTER_CURRENT_RBD_OFFSET_X64, DC21X4_ADAPTER_FLAGS_OFFSET_X64,
     DC21X4_ADAPTER_HEAD_RBD_OFFSET_X64, DC21X4_ADAPTER_INTERRUPT_STATUS_OFFSET_X64,
-    DC21X4_ADAPTER_TAIL_RBD_OFFSET_X64,
-    HOSTED_PROVIDER_EXPORT_ARG_CAP, HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN,
-    NDIS_MINIPORT_BLOCK_ETH_DB_OFFSET_X64,
+    DC21X4_ADAPTER_TAIL_RBD_OFFSET_X64, HOSTED_PROVIDER_EXPORT_ARG_CAP,
+    HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN, NDIS_MINIPORT_BLOCK_ETH_DB_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_ETH_RX_COMPLETE_HANDLER_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_ETH_RX_INDICATE_HANDLER_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_MINIPORT_ADAPTER_CONTEXT_OFFSET_X64,
@@ -69,15 +68,15 @@ use nt_hosted_runtime::{
 use nt_io_abi::{ioctl, major};
 use nt_io_manager::{
     write_wdm_driver_object, write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
-    CreateOptions, DeviceCharacteristics, DeviceControlParameters, DeviceFlags, DeviceType,
-    DispatchContext, DispatchOutcome, DispatchTarget, DriverDispatchBackend, DriverId,
-    DriverPeerId, ExternalDispatchResult, FileId, InformationParameters, IoManager, IoParameters,
-    IrpId, IrpProjection, MajorFunctionTable, ObjectManagerPort, ReadWriteParameters, ShareAccess,
-    WdmDriverObjectInit, WdmFileObjectInit, WdmIoStackLocationInit, WdmIoStackParameters, WdmIrpInit,
-    WDM_X64_DRIVER_EXTENSION_OFFSET, WDM_X64_DRIVER_EXTENSION_SIZE,
-    WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET,
-    WDM_X64_FILE_OBJECT_SIZE, WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_FILE,
-    WDM_X64_IRP_SIZE,
+    BankedTransferCursor, CreateOptions, DeviceCharacteristics, DeviceControlParameters,
+    DeviceFlags, DeviceType, DispatchContext, DispatchOutcome, DispatchTarget,
+    DriverDispatchBackend, DriverId, DriverPeerId, ExternalDispatchResult, FileId,
+    InformationParameters, IoManager, IoParameters, IrpId, IrpProjection, MajorFunctionTable,
+    ObjectManagerPort, ReadWriteParameters, ShareAccess, WdmDriverObjectInit, WdmFileObjectInit,
+    WdmIoStackLocationInit, WdmIoStackParameters, WdmIrpInit, WDM_X64_DRIVER_EXTENSION_OFFSET,
+    WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET,
+    WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET, WDM_X64_FILE_OBJECT_SIZE,
+    WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
 };
 use nt_kernel_exec::{
     classify_dispatcher_wait_timeout, init_ksemaphore, kevent, ksemaphore_read_state,
@@ -99,10 +98,10 @@ use nt_video_miniport::{
 
 // Pure, driver-agnostic ntoskrnl byte/string primitives shared with the Subsystem (win32k) class.
 use crate::ntoskrnl_shared::{
-    s_ex_query_depth_slist, s_exp_interlocked_pop_entry_slist,
-    s_exp_interlocked_push_entry_slist, s_ke_query_performance_counter, s_memcpy, s_memmove,
-    s_memset, s_rtl_compare_memory, s_rtl_integer_to_unicode_string,
-    s_rtl_unicode_string_to_integer, s_rtl_upcase_unicode_char, s_wcsicmp, s_wcslen,
+    s_ex_query_depth_slist, s_exp_interlocked_pop_entry_slist, s_exp_interlocked_push_entry_slist,
+    s_ke_query_performance_counter, s_memcpy, s_memmove, s_memset, s_rtl_compare_memory,
+    s_rtl_integer_to_unicode_string, s_rtl_unicode_string_to_integer, s_rtl_upcase_unicode_char,
+    s_wcsicmp, s_wcslen,
 };
 
 use crate::*;
@@ -221,11 +220,12 @@ pub const FSD_SHARED_FRAMES: u64 = (FSD_ARG_VADDR - FSD_SHARED_VADDR) / 0x1000;
 const _: () = assert!(FSD_SHARED_FRAMES > 0);
 const _: () = assert!(FSD_SHARED_VADDR + FSD_SHARED_FRAMES * 0x1000 <= FSD_ARG_VADDR);
 
-/// The cross-AS ARG-MARSHAL frame(s): mapped RW in BOTH the executive and the FSD component. The
-/// executive copies an IRP's system-buffer here; the FSD's MajorFunction handler reads/writes it in
-/// its own context; the executive copies out-params back to the caller on reply. 4 pages = 16 KiB.
+/// The cross-AS ARG-MARSHAL bank: mapped RW in both the executive and the driver component. Variable
+/// length IRP buffers are streamed through this bank into request-owned component pool allocations;
+/// its four-page size is a chunk size, never a maximum NT request size.
 pub const FSD_ARG_VADDR: u64 = 0x0000_0100_0F3A_0000;
 pub const FSD_ARG_FRAMES: u64 = 4;
+const FSD_ARG_BYTES: u64 = FSD_ARG_FRAMES * 0x1000;
 const STATUS_INVALID_BUFFER_SIZE: u32 = 0xC000_0206;
 const _: () = assert!(FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000 <= FSD_STACK_VADDR);
 
@@ -502,9 +502,7 @@ pub const SH_REQ_STATUS: u64 = 0x70; // out: IoStatus.Status (i32)
 pub const SH_REQ_REQUESTOR_TID: u64 = 0x74; // in: requesting NT thread id (u32)
 pub const SH_REQ_INFO: u64 = 0x78; // in: backend instance; out: IoStatus.Information (u64)
 pub const SH_REQ_OWNER_INSTANCE: u64 = SH_REQ_INFO;
-const _: () = assert!(
-    SH_SYMLINK_TARGET_BUF + SH_CAPTURED_PATH_BYTES as u64 <= SH_REQ_IRP_ID
-);
+const _: () = assert!(SH_SYMLINK_TARGET_BUF + SH_CAPTURED_PATH_BYTES as u64 <= SH_REQ_IRP_ID);
 const _: () = assert!(SH_REQ_CANONICAL_FILE_ID + 8 <= SH_RESOURCE_MMIO_PHYS);
 
 const WDM_X64_DRIVER_EXTENSION_ADD_DEVICE_OFFSET: u64 = 0x08;
@@ -611,6 +609,9 @@ pub const FSD_SERVICE_PROVIDER_EXPORT_LABEL: u64 = 0x77A;
 pub const FSD_SERVICE_PROVIDER_CALLBACK_LABEL: u64 = 0x77B;
 pub const FSD_SERVICE_KE_SET_TIMER_LABEL: u64 = 0x77C;
 pub const FSD_SERVICE_KE_CANCEL_TIMER_LABEL: u64 = 0x77D;
+pub const FSD_SERVICE_PULL_IRP_INPUT_LABEL: u64 = 0x77E;
+pub const FSD_SERVICE_PULL_IRP_OUTPUT_LABEL: u64 = 0x77F;
+pub const FSD_SERVICE_PUSH_IRP_OUTPUT_LABEL: u64 = 0x780;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_INTERRUPT: u64 = u64::MAX - 0x773;
@@ -640,6 +641,9 @@ pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
             | FSD_SERVICE_PROVIDER_CALLBACK_LABEL
             | FSD_SERVICE_KE_SET_TIMER_LABEL
             | FSD_SERVICE_KE_CANCEL_TIMER_LABEL
+            | FSD_SERVICE_PULL_IRP_INPUT_LABEL
+            | FSD_SERVICE_PULL_IRP_OUTPUT_LABEL
+            | FSD_SERVICE_PUSH_IRP_OUTPUT_LABEL
     )
 }
 
@@ -1019,13 +1023,60 @@ unsafe fn trace_hosted_hal_translate_bus_address(
     print_str(b"\n");
 }
 
-unsafe fn pool_copy_from_arg(dst: u64, len: u64) {
-    let mut index = 0u64;
-    while index < len {
-        let byte = read_volatile((FSD_ARG_VADDR + index) as *const u8);
-        write_volatile((dst + index) as *mut u8, byte);
-        index += 1;
+unsafe fn pool_pull_request_bytes(
+    service_label: u64,
+    transfer_id: u64,
+    dst: u64,
+    len: u64,
+) -> bool {
+    let mut offset = 0u64;
+    while offset < len {
+        let chunk = (len - offset).min(FSD_ARG_BYTES);
+        let (_, status, _, _, _) =
+            call_on4((service_label << 12) | 3, transfer_id, offset, chunk, 0);
+        if status as u32 as i32 != STATUS_SUCCESS {
+            return false;
+        }
+        let mut index = 0u64;
+        while index < chunk {
+            let byte = read_volatile((FSD_ARG_VADDR + index) as *const u8);
+            write_volatile((dst + offset + index) as *mut u8, byte);
+            index += 1;
+        }
+        offset += chunk;
     }
+    true
+}
+
+unsafe fn pool_push_request_bytes(
+    transfer_id: u64,
+    src: u64,
+    source_offset: u64,
+    destination_offset: u64,
+    len: u64,
+) -> bool {
+    let mut copied = 0u64;
+    while copied < len {
+        let chunk = (len - copied).min(FSD_ARG_BYTES);
+        let mut index = 0u64;
+        while index < chunk {
+            let byte = read_volatile((src + source_offset + copied + index) as *const u8);
+            write_volatile((FSD_ARG_VADDR + index) as *mut u8, byte);
+            index += 1;
+        }
+        let (_, status, _, _, _) = call_on4(
+            (FSD_SERVICE_PUSH_IRP_OUTPUT_LABEL << 12) | 3,
+            transfer_id,
+            destination_offset + copied,
+            chunk,
+            0,
+        );
+        if status as u32 as i32 != STATUS_SUCCESS {
+            return false;
+        }
+        copied += chunk;
+    }
+    true
 }
 
 unsafe fn pool_free_request_buffers(data: u64, aux_data: u64, mdl: u64) {
@@ -1103,8 +1154,6 @@ unsafe fn allocate_nonpaged_mdl(virtual_address: u64, length: u64) -> u64 {
 // is in the retained read IRP and the inbound queue is drained; a fresh read would find nothing.
 // Completion is therefore recorded in the canonical pending-IRP owner node. Its buffers are
 // reclaimed only after the executive consumes the result through the mirrored component pool.
-const COMPLETED_READ_BYTE_CAP: usize = (FSD_ARG_FRAMES as usize) * 0x1000;
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PendingIrpNode {
@@ -1225,9 +1274,7 @@ struct PendingIrpCompletionTarget {
     major: u8,
 }
 
-unsafe fn claim_pending_irp_completion(
-    irp: u64,
-) -> Option<(u64, u64, PendingIrpCompletionTarget)> {
+unsafe fn claim_pending_irp_completion(irp: u64) -> Option<(u64, u64, PendingIrpCompletionTarget)> {
     let mut node = (&*pending_irp_head(FSD_DATA_VADDR).cast::<AtomicU64>()).load(Ordering::Acquire);
     let mut steps = 0u64;
     while node != 0 && steps < POOL_FREE_LIST_MAX {
@@ -1275,7 +1322,8 @@ unsafe fn claim_pending_irp_completion(
                                 as *const u64,
                         ),
                         completion_source_kind: read_volatile(
-                            (entry + core::mem::offset_of!(PendingIrp, completion_source_kind) as u64)
+                            (entry
+                                + core::mem::offset_of!(PendingIrp, completion_source_kind) as u64)
                                 as *const u8,
                         ),
                         major: read_volatile(
@@ -1408,8 +1456,7 @@ unsafe fn insert_pending_irp(canonical_irp_id: u64, entry: PendingIrp) -> Option
             break;
         }
     }
-    pending_irp_owner_state(node)
-        .store(generation | HOSTED_IRP_DISPATCHING, Ordering::Release);
+    pending_irp_owner_state(node).store(generation | HOSTED_IRP_DISPATCHING, Ordering::Release);
     Some(node)
 }
 
@@ -1493,8 +1540,7 @@ unsafe fn cancel_pending_irp(canonical_irp_id: u64) -> bool {
                 break;
             }
             HOSTED_IRP_COMPLETING_CANCEL => {
-                let deferred =
-                    hosted_irp_state_with_kind(state, HOSTED_IRP_COMPLETING_DEFERRED);
+                let deferred = hosted_irp_state_with_kind(state, HOSTED_IRP_COMPLETING_DEFERRED);
                 if pending_irp_owner_state(target.node)
                     .compare_exchange(state, deferred, Ordering::AcqRel, Ordering::Acquire)
                     .is_err()
@@ -1527,7 +1573,7 @@ unsafe fn copy_pending_irp_completion(
     offset: u64,
     capacity: u64,
 ) -> (i32, u64) {
-    if canonical_irp_id == 0 || capacity > COMPLETED_READ_BYTE_CAP as u64 {
+    if canonical_irp_id == 0 {
         return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
     }
     let mut node = (&*pending_irp_head(FSD_DATA_VADDR).cast::<AtomicU64>()).load(Ordering::Acquire);
@@ -1558,22 +1604,19 @@ unsafe fn copy_pending_irp_completion(
                 .is_some_and(|end| end <= completion.length as u64);
             let source = completion.source.checked_add(offset);
             let source_valid = capacity == 0
-                || component_pool_allocation_capacity(completion.source)
-                    .is_some_and(|available| {
-                        offset
-                            .checked_add(capacity)
-                            .is_some_and(|end| end <= available)
-                    });
+                || component_pool_allocation_capacity(completion.source).is_some_and(|available| {
+                    offset
+                        .checked_add(capacity)
+                        .is_some_and(|end| end <= available)
+                });
             if !valid_range || !source_valid {
                 pending_irp_owner_state(node).store(state, Ordering::Release);
                 return (0xC000_000Du32 as i32, 0);
             }
             if let Some(source) = source {
-                let mut index = 0u64;
-                while index < capacity {
-                    let byte = read_volatile((source + index) as *const u8);
-                    write_volatile((FSD_ARG_VADDR + index) as *mut u8, byte);
-                    index += 1;
+                if !pool_push_request_bytes(canonical_irp_id, source, 0, 0, capacity) {
+                    pending_irp_owner_state(node).store(state, Ordering::Release);
+                    return (0xC000_0001u32 as i32, 0); // STATUS_UNSUCCESSFUL
                 }
             }
             pending_irp_owner_state(node).store(state, Ordering::Release);
@@ -1612,8 +1655,8 @@ unsafe fn acknowledge_pending_irp_completion(canonical_irp_id: u64) -> bool {
                 .completion
                 .completed()
                 .expect("published hosted IRP owner has no completion payload");
-            let create_failed = matches!(entry.major as u64, 0 | 1)
-                && (completion.status as i32).is_negative();
+            let create_failed =
+                matches!(entry.major as u64, 0 | 1) && (completion.status as i32).is_negative();
             if !entry.owns_fo
                 && (entry.major as u64 == IRP_MJ_CLOSE || create_failed)
                 && entry.canonical_file_id != 0
@@ -1632,8 +1675,7 @@ unsafe fn acknowledge_pending_irp_completion(canonical_irp_id: u64) -> bool {
 
 unsafe fn pending_irp_node_exec_va(win: ExecVaWindow, node: u64) -> Option<u64> {
     let table_start = FSD_DATA_VADDR + FSD_PENDING_IRPS_OFF;
-    let table_bytes =
-        core::mem::size_of::<PendingIrpNode>() as u64 * FSD_PENDING_IRP_CAP as u64;
+    let table_bytes = core::mem::size_of::<PendingIrpNode>() as u64 * FSD_PENDING_IRP_CAP as u64;
     if node >= table_start
         && node.checked_add(core::mem::size_of::<PendingIrpNode>() as u64)?
             <= table_start.checked_add(table_bytes)?
@@ -1732,8 +1774,7 @@ unsafe fn poll_hosted_completion(instance: usize) -> Option<nt_io_manager::Drive
                 major::IRP_MJ_CREATE
                     | major::IRP_MJ_CREATE_NAMED_PIPE
                     | major::IRP_MJ_CREATE_MAILSLOT
-            )
-            {
+            ) {
                 Some(entry.fid)
             } else {
                 None
@@ -3169,10 +3210,7 @@ unsafe fn hosted_instance_pool_allocation_is_free_unlocked(
     Some(false)
 }
 
-unsafe fn release_hosted_instance_pool_allocation_if_live(
-    inst: DriverInstance,
-    p: u64,
-) -> bool {
+unsafe fn release_hosted_instance_pool_allocation_if_live(inst: DriverInstance, p: u64) -> bool {
     if p == 0 {
         return true;
     }
@@ -6387,9 +6425,7 @@ extern "win64" fn s_io_get_device_property(
         let resource_identity_active = hosted_resource_identity_active();
         let resource_property = matches!(
             property,
-            DEVICE_PROPERTY_LEGACY_BUS_TYPE
-                | DEVICE_PROPERTY_BUS_NUMBER
-                | DEVICE_PROPERTY_ADDRESS
+            DEVICE_PROPERTY_LEGACY_BUS_TYPE | DEVICE_PROPERTY_BUS_NUMBER | DEVICE_PROPERTY_ADDRESS
         );
         if !hosted_pdo_known(pdo) && !(resource_identity_active && resource_property) {
             if result_len != 0 {
@@ -9261,9 +9297,7 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
         // original buffered-I/O allocation while completing a queued read.
         let sysbuf = read_unaligned((irp + 0x18) as *const u64);
         let irp_flags = read_unaligned((irp + 0x10) as *const u32);
-        let length = information
-            .min(target.output_capacity)
-            .min(COMPLETED_READ_BYTE_CAP as u64) as usize;
+        let length = information.min(target.output_capacity).min(u32::MAX as u64) as usize;
         let source = if length == 0 {
             0
         } else if target.completion_source_kind == COMPLETION_SOURCE_REQUEST_DATA {
@@ -9290,7 +9324,11 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
         if completion
             .complete(
                 sequence,
-                if completion_valid { status } else { 0xC000_0005 },
+                if completion_valid {
+                    status
+                } else {
+                    0xC000_0005
+                },
                 if completion_valid { information } else { 0 },
                 if completion_valid { source } else { 0 },
                 if reclaim_valid { reclaim } else { 0 },
@@ -9302,18 +9340,15 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
             panic!("hosted driver completed the same retained IRP twice");
         }
         write_volatile(
-            (pending_irp_entry_address(node)
-                + core::mem::offset_of!(PendingIrp, completion) as u64)
+            (pending_irp_entry_address(node) + core::mem::offset_of!(PendingIrp, completion) as u64)
                 as *mut nt_io_manager::RetainedIrpCompletion,
             completion,
         );
         let completing_kind = hosted_irp_state_kind(completing_state);
         match completing_kind {
             HOSTED_IRP_COMPLETING_DISPATCH => {
-                let completed = hosted_irp_state_with_kind(
-                    completing_state,
-                    HOSTED_IRP_COMPLETED_DISPATCH,
-                );
+                let completed =
+                    hosted_irp_state_with_kind(completing_state, HOSTED_IRP_COMPLETED_DISPATCH);
                 if pending_irp_owner_state(node)
                     .compare_exchange(
                         completing_state,
@@ -10481,24 +10516,20 @@ pub(crate) unsafe fn hosted_driver_timer_wake_due(_now_100ns: u64) -> u64 {
                 expiry.timer_ptr,
                 0x40,
             );
-            let exec_timer = component_to_exec_va_for_instance(
-                instance_index,
-                inst,
-                expiry.timer_ptr,
-                0x40,
-            )
-            .or_else(|| {
-                runtime.and_then(|worker| {
-                    hosted_worker_component_to_exec_va(worker, expiry.timer_ptr, 0x40)
-                })
-            });
+            let exec_timer =
+                component_to_exec_va_for_instance(instance_index, inst, expiry.timer_ptr, 0x40)
+                    .or_else(|| {
+                        runtime.and_then(|worker| {
+                            hosted_worker_component_to_exec_va(worker, expiry.timer_ptr, 0x40)
+                        })
+                    });
             let Some(exec_timer) = exec_timer else {
                 continue;
             };
             write_unaligned((exec_timer + 4) as *mut i32, 1);
             delivered = delivered.saturating_add(1);
-            delivered = delivered
-                .saturating_add(wake_hosted_driver_waiters_for_instance(instance_index));
+            delivered =
+                delivered.saturating_add(wake_hosted_driver_waiters_for_instance(instance_index));
 
             if let Some(dpc) = expiry.dpc_ptr {
                 let mut no_output = [];
@@ -12690,17 +12721,19 @@ unsafe fn hosted_io_model_state_for_port_mut(
     if port > u16::MAX as u64 || width == 0 {
         return None;
     }
-    hosted_device_resource_states_mut().iter_mut().find_map(|state| {
-        let end = port.checked_add(width)?;
-        let base = state.io_port_base;
-        let len = state.evidence.resource_io_port_len;
-        let limit = base.checked_add(len)?;
-        if state.evidence.resource_io_port_cap != 0 && port >= base && end <= limit {
-            Some((state, port - base))
-        } else {
-            None
-        }
-    })
+    hosted_device_resource_states_mut()
+        .iter_mut()
+        .find_map(|state| {
+            let end = port.checked_add(width)?;
+            let base = state.io_port_base;
+            let len = state.evidence.resource_io_port_len;
+            let limit = base.checked_add(len)?;
+            if state.evidence.resource_io_port_cap != 0 && port >= base && end <= limit {
+                Some((state, port - base))
+            } else {
+                None
+            }
+        })
 }
 
 pub(crate) unsafe fn hosted_io_model_read_u32(port: u64, value: u32) -> u32 {
@@ -13094,9 +13127,7 @@ extern "win64" fn s_video_port_map_memory(
             }
         } else {
             match hosted_video_memory_caller_va(physical_address, requested_len as u64) {
-                Some(caller_va) => {
-                    caller_va
-                }
+                Some(caller_va) => caller_va,
                 None => 0,
             }
         };
@@ -14173,8 +14204,7 @@ static HOSTED_PROVIDER_PACKET_ARRAY_EXPORT_REQUESTS: AtomicU64 = AtomicU64::new(
 static HOSTED_PROVIDER_PACKET_ARRAY_EXPORT_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
-static HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_PACKET_REQUESTS: AtomicU64 =
-    AtomicU64::new(0);
+static HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_PACKET_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_PACKET_COMPLETIONS: AtomicU64 =
     AtomicU64::new(0);
 static HOSTED_PROVIDER_PROTOCOL_RECEIVE_REQUESTS: AtomicU64 = AtomicU64::new(0);
@@ -14193,8 +14223,7 @@ const HOSTED_WORK_QUEUE_CAPACITY_TRACE_CAP: u64 = 8;
 static HOSTED_COMPONENT_PUMP_DEPTH: AtomicU64 = AtomicU64::new(0);
 static HOSTED_WORK_QUEUE_DRAIN_ACTIVE: AtomicU64 = AtomicU64::new(0);
 const HOSTED_PROVIDER_TRACE_CAP: u64 = 24;
-static mut HOSTED_PROVIDER_POINTER_ALLOCATIONS: Option<Vec<HostedProviderPointerAllocation>> =
-    None;
+static mut HOSTED_PROVIDER_POINTER_ALLOCATIONS: Option<Vec<HostedProviderPointerAllocation>> = None;
 static HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 static mut HOSTED_PROVIDER_NDIS_PACKET_SHADOWS: Option<Vec<HostedProviderNdisPacketShadow>> = None;
 static HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS: AtomicU64 = AtomicU64::new(0);
@@ -14204,9 +14233,8 @@ static mut HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOWS: Option<
     Vec<HostedProviderMiniportInterruptShadow>,
 > = None;
 static HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_REJECTIONS: AtomicU64 = AtomicU64::new(0);
-static mut HOSTED_PROVIDER_MINIPORT_TIMER_SHADOWS: Option<
-    Vec<HostedProviderMiniportTimerShadow>,
-> = None;
+static mut HOSTED_PROVIDER_MINIPORT_TIMER_SHADOWS: Option<Vec<HostedProviderMiniportTimerShadow>> =
+    None;
 static HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 static mut HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOWS: Option<Vec<HostedProviderNdisWorkItemShadow>> =
     None;
@@ -14258,8 +14286,7 @@ unsafe fn hosted_provider_singletons() -> Option<&'static Vec<HostedProviderSing
     (&*core::ptr::addr_of!(HOSTED_PROVIDER_SINGLETONS)).as_ref()
 }
 
-unsafe fn hosted_provider_callback_records_mut(
-) -> &'static mut Vec<HostedProviderCallbackRecord> {
+unsafe fn hosted_provider_callback_records_mut() -> &'static mut Vec<HostedProviderCallbackRecord> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_PROVIDER_CALLBACK_RECORDS);
     if slot.is_none() {
         *slot = Some(Vec::new());
@@ -14576,43 +14603,44 @@ pub(crate) fn hosted_provider_sharing_evidence() -> HostedProviderSharingEvidenc
     unsafe {
         let summaries = hosted_provider_summaries();
         if let Some(summaries) = summaries {
-        for summary in summaries {
-            evidence.primary_services = evidence
-                .primary_services
-                .saturating_add(summary.primary_count);
-            evidence.primary_service_image_bytes = evidence
-                .primary_service_image_bytes
-                .saturating_add(summary.primary_image_bytes);
-            evidence.private_dependencies = evidence
-                .private_dependencies
-                .saturating_add(summary.private_count);
-            evidence.private_dependency_image_bytes = evidence
-                .private_dependency_image_bytes
-                .saturating_add(summary.private_image_bytes);
-            if summary.primary_count != 0 && summary.private_count != 0 {
-                evidence.private_dependencies_with_primary_provider = evidence
-                    .private_dependencies_with_primary_provider
+            for summary in summaries {
+                evidence.primary_services = evidence
+                    .primary_services
+                    .saturating_add(summary.primary_count);
+                evidence.primary_service_image_bytes = evidence
+                    .primary_service_image_bytes
+                    .saturating_add(summary.primary_image_bytes);
+                evidence.private_dependencies = evidence
+                    .private_dependencies
                     .saturating_add(summary.private_count);
-                evidence.unique_primary_provider_matches =
-                    evidence.unique_primary_provider_matches.saturating_add(1);
-                if summary.first_private_instance != 0
-                    && (evidence.first_private_dependency_with_primary_instance == 0
-                        || summary.first_private_instance
-                            < evidence.first_private_dependency_with_primary_instance)
-                {
-                    evidence.first_private_dependency_with_primary_instance =
-                        summary.first_private_instance;
+                evidence.private_dependency_image_bytes = evidence
+                    .private_dependency_image_bytes
+                    .saturating_add(summary.private_image_bytes);
+                if summary.primary_count != 0 && summary.private_count != 0 {
+                    evidence.private_dependencies_with_primary_provider = evidence
+                        .private_dependencies_with_primary_provider
+                        .saturating_add(summary.private_count);
+                    evidence.unique_primary_provider_matches =
+                        evidence.unique_primary_provider_matches.saturating_add(1);
+                    if summary.first_private_instance != 0
+                        && (evidence.first_private_dependency_with_primary_instance == 0
+                            || summary.first_private_instance
+                                < evidence.first_private_dependency_with_primary_instance)
+                    {
+                        evidence.first_private_dependency_with_primary_instance =
+                            summary.first_private_instance;
+                    }
+                }
+                if summary.private_count > 1 {
+                    evidence.duplicate_private_dependencies = evidence
+                        .duplicate_private_dependencies
+                        .saturating_add(summary.private_count);
                 }
             }
-            if summary.private_count > 1 {
-                evidence.duplicate_private_dependencies = evidence
-                    .duplicate_private_dependencies
-                    .saturating_add(summary.private_count);
-            }
-        }
         }
         if let Some(singletons) = hosted_provider_singletons() {
-            evidence.singleton_providers = singletons.iter().filter(|record| record.present).count() as u64;
+            evidence.singleton_providers =
+                singletons.iter().filter(|record| record.present).count() as u64;
         }
     }
     evidence.provider_domain_bindings = HOSTED_PROVIDER_DOMAIN_BINDINGS.load(Ordering::Relaxed);
@@ -15573,9 +15601,8 @@ unsafe fn abort_provider_export_marshal_before_dispatch(state: &ProviderMarshalS
 
 unsafe fn abort_provider_export_marshal_after_possible_dispatch(state: &ProviderMarshalState) {
     if state.pointer_allocation_dependent_component_va != 0 {
-        let provider_component_va = read_unaligned(
-            state.pointer_allocation_provider_output_exec_va as *const u64,
-        );
+        let provider_component_va =
+            read_unaligned(state.pointer_allocation_provider_output_exec_va as *const u64);
         if let Some(record) = take_hosted_provider_pointer_allocation(
             state.pointer_allocation_dependent_instance,
             state.pointer_allocation_dependent_component_va,
@@ -17572,9 +17599,12 @@ unsafe fn complete_provider_network_address(
         );
         return;
     };
-    let Some(dependent_buffer_exec) =
-        component_to_exec_va_for_instance(dependent_instance, dependent_inst, dependent_buffer, bytes)
-    else {
+    let Some(dependent_buffer_exec) = component_to_exec_va_for_instance(
+        dependent_instance,
+        dependent_inst,
+        dependent_buffer,
+        bytes,
+    ) else {
         hosted_instance_pool_free(dependent_inst, dependent_buffer);
         write_provider_ndis_status(state, STATUS_INVALID_PARAMETER);
         write_unaligned(
@@ -17784,7 +17814,8 @@ unsafe fn complete_provider_ndis_buffer_allocation(
         provider_data_component_va: state.ndis_buffer_out_provider_data_component_va,
         bytes: state.ndis_buffer_out_bytes,
         provider_component_owned_by_bridge: true,
-        provider_data_component_owned_by_bridge: state.ndis_buffer_out_provider_data_owned_by_bridge,
+        provider_data_component_owned_by_bridge: state
+            .ndis_buffer_out_provider_data_owned_by_bridge,
         dependent_component_owned_by_bridge: true,
         dependent_data_component_owned_by_bridge: false,
     }) {
@@ -18349,7 +18380,11 @@ unsafe fn hosted_provider_miniport_timer_shadow(
         HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_INVALID_PARAMETER);
     };
-    copy_bytes(provider_exec_va, dependent_exec_va, NDIS_MINIPORT_TIMER_LEN_X64);
+    copy_bytes(
+        provider_exec_va,
+        dependent_exec_va,
+        NDIS_MINIPORT_TIMER_LEN_X64,
+    );
     Ok((
         shadow.provider_component_va,
         dependent_exec_va,
@@ -18360,7 +18395,8 @@ unsafe fn hosted_provider_miniport_timer_shadow(
 unsafe fn clear_hosted_provider_miniport_timer_shadows_for_instance(instance_index: usize) {
     for record in hosted_provider_miniport_timer_shadows_mut().iter_mut() {
         if record.present
-            && (record.provider_instance == instance_index || record.dependent_instance == instance_index)
+            && (record.provider_instance == instance_index
+                || record.dependent_instance == instance_index)
         {
             if let Some(provider_inst) = instance(record.provider_instance) {
                 hosted_instance_pool_free(provider_inst, record.provider_component_va);
@@ -18486,12 +18522,10 @@ unsafe fn hosted_provider_ndis_work_item_shadow(
         HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_INVALID_PARAMETER);
     };
-    let dependent_context = read_unaligned(
-        (dependent_exec_va + NDIS_WORK_ITEM_CONTEXT_OFFSET_X64) as *const u64,
-    );
-    let dependent_routine = read_unaligned(
-        (dependent_exec_va + NDIS_WORK_ITEM_ROUTINE_OFFSET_X64) as *const u64,
-    );
+    let dependent_context =
+        read_unaligned((dependent_exec_va + NDIS_WORK_ITEM_CONTEXT_OFFSET_X64) as *const u64);
+    let dependent_routine =
+        read_unaligned((dependent_exec_va + NDIS_WORK_ITEM_ROUTINE_OFFSET_X64) as *const u64);
     if dependent_routine == 0 {
         HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_INVALID_PARAMETER);
@@ -19654,14 +19688,15 @@ unsafe fn provider_marshal_miniport_timer(
     arg_value: u64,
     allow_create: bool,
 ) -> Result<u64, i32> {
-    let (provider_arg, dependent_exec_va, provider_exec_va) = hosted_provider_miniport_timer_shadow(
-        provider_instance,
-        provider_inst,
-        dependent_index,
-        dependent_inst,
-        arg_value,
-        allow_create,
-    )?;
+    let (provider_arg, dependent_exec_va, provider_exec_va) =
+        hosted_provider_miniport_timer_shadow(
+            provider_instance,
+            provider_inst,
+            dependent_index,
+            dependent_inst,
+            arg_value,
+            allow_create,
+        )?;
     provider_marshal_add_copyout(
         state,
         dependent_exec_va,
@@ -20072,7 +20107,8 @@ unsafe fn provider_marshal_owned_allocation(
     if arg_value == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    let Some(record) = hosted_provider_pointer_allocation(dependent_index, arg_value, length) else {
+    let Some(record) = hosted_provider_pointer_allocation(dependent_index, arg_value, length)
+    else {
         return Err(STATUS_INVALID_PARAMETER);
     };
     if record.provider_instance != provider_instance || record.provider_component_va == 0 {
@@ -20317,10 +20353,14 @@ unsafe fn provider_marshal_unicode_string_from_source(
         if ch == 0 {
             break;
         }
-        source_bytes = source_bytes.checked_add(2).ok_or(STATUS_INVALID_PARAMETER)?;
+        source_bytes = source_bytes
+            .checked_add(2)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
     }
 
-    let source_total = source_bytes.checked_add(2).ok_or(STATUS_INVALID_PARAMETER)?;
+    let source_total = source_bytes
+        .checked_add(2)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
     let Some(source_exec) = component_to_exec_va_for_instance(
         dependent_index,
         dependent_inst,
@@ -21110,9 +21150,8 @@ unsafe fn complete_provider_export_marshal(
 ) {
     let mut success = provider_export_result_success(policy, *result);
     if state.pointer_allocation_dependent_component_va != 0 {
-        let provider_component_va = read_unaligned(
-            state.pointer_allocation_provider_output_exec_va as *const u64,
-        );
+        let provider_component_va =
+            read_unaligned(state.pointer_allocation_provider_output_exec_va as *const u64);
         let provider_pointer_valid = provider_component_va != 0
             && hosted_pool_allocation_exec_va(
                 provider_inst.exec_pool_va,
@@ -21396,8 +21435,9 @@ unsafe fn project_provider_resource_state(
     provider_inst: DriverInstance,
     provider_shared: u64,
 ) -> Result<(), i32> {
-    let state = hosted_device_resource_state_by_device_id(binding.device_id)
-        .unwrap_or_else(|| read_hosted_device_resource_state_from_shared(binding, dependent_shared));
+    let state = hosted_device_resource_state_by_device_id(binding.device_id).unwrap_or_else(|| {
+        read_hosted_device_resource_state_from_shared(binding, dependent_shared)
+    });
     if state.driver_id != binding.driver_id || state.instance != binding.instance {
         return Err(STATUS_INVALID_DEVICE_REQUEST);
     }
@@ -21506,7 +21546,8 @@ unsafe fn copy_provider_dma_state_to_bound_dependent(
     }
     copy_provider_dma_projection_fields(dependent_shared, provider_shared);
     copy_provider_dma_allocation_records(dependent_shared, provider_shared);
-    replay_hosted_dma_allocation_records(binding, dependent_shared).map_err(|status| status.raw())?;
+    replay_hosted_dma_allocation_records(binding, dependent_shared)
+        .map_err(|status| status.raw())?;
     refresh_hosted_device_resource_state(binding, dependent_shared);
     Ok(())
 }
@@ -21783,10 +21824,12 @@ unsafe fn trace_provider_io_port_range_export(
 
     let requested_start = original_args[initial_index] & u32::MAX as u64;
     let requested_len = original_args[length_index] & u32::MAX as u64;
-    let dependent_out = read_provider_arg_u64(dependent_index, dependent_inst, original_args[out_index])
-        .unwrap_or(u64::MAX);
-    let provider_out = read_provider_arg_u64(provider_index, provider_inst, marshalled_args[out_index])
-        .unwrap_or(u64::MAX);
+    let dependent_out =
+        read_provider_arg_u64(dependent_index, dependent_inst, original_args[out_index])
+            .unwrap_or(u64::MAX);
+    let provider_out =
+        read_provider_arg_u64(provider_index, provider_inst, marshalled_args[out_index])
+            .unwrap_or(u64::MAX);
     let dependent_sh = dependent_inst.exec_shared_va;
     let provider_sh = provider_inst.exec_shared_va;
     let dependent_grant_start =
@@ -23890,7 +23933,12 @@ unsafe fn service_ndis_work_item_callback(
         record,
         dependent_inst,
         exec_code_va,
-        [shadow.dependent_component_va, shadow.dependent_context, 0, 0],
+        [
+            shadow.dependent_component_va,
+            shadow.dependent_context,
+            0,
+            0,
+        ],
         [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
     )
 }
@@ -24222,16 +24270,18 @@ pub(crate) unsafe fn service_hosted_provider_callback(
                     }
                     _ => Err(STATUS_NOT_SUPPORTED),
                 },
-                HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT_TIMER => service_ndis_miniport_timer_callback(
-                    provider_instance,
-                    record,
-                    dependent_inst,
-                    exec_code_va,
-                    arg0,
-                    arg1,
-                    arg2,
-                    arg3,
-                ),
+                HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT_TIMER => {
+                    service_ndis_miniport_timer_callback(
+                        provider_instance,
+                        record,
+                        dependent_inst,
+                        exec_code_va,
+                        arg0,
+                        arg1,
+                        arg2,
+                        arg3,
+                    )
+                }
                 HOSTED_PROVIDER_CALLBACK_KIND_NDIS_WORK_ITEM => service_ndis_work_item_callback(
                     provider_instance,
                     record,
@@ -25527,9 +25577,9 @@ pub fn fsd_export_addr(dll: &str, name: &str) -> Option<u64> {
     if initialize_fsd_export_registry() {
         // SAFETY: single-threaded; initialization is complete and the registry is read-only.
         unsafe {
-        if let Some(va) = (*core::ptr::addr_of!(FSD_EXPORTS)).lookup(name) {
-            return Some(va);
-        }
+            if let Some(va) = (*core::ptr::addr_of!(FSD_EXPORTS)).lookup(name) {
+                return Some(va);
+            }
         }
     }
     unsafe {
@@ -25712,7 +25762,11 @@ unsafe fn component_dispatch_video_initialize() -> (i32, u64) {
     }
 }
 
-unsafe fn component_dispatch_video_win32k_callbacks(inlen: u64, outlen: u64) -> (i32, u64) {
+unsafe fn component_dispatch_video_win32k_callbacks(
+    buffer: u64,
+    inlen: u64,
+    outlen: u64,
+) -> (i32, u64) {
     if inlen < 16 {
         return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
     }
@@ -25722,19 +25776,19 @@ unsafe fn component_dispatch_video_win32k_callbacks(inlen: u64, outlen: u64) -> 
             VIDEO_WIN32K_CALLBACKS_SIZE_X64 as u64,
         );
     }
-    let phys_disp = read_unaligned(FSD_ARG_VADDR as *const u64);
-    let callout = read_unaligned((FSD_ARG_VADDR + 8) as *const u64);
+    let phys_disp = read_unaligned(buffer as *const u64);
+    let callout = read_unaligned((buffer + 8) as *const u64);
     let video_device_object = read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64);
     let mut index = 0u64;
     while index < VIDEO_WIN32K_CALLBACKS_SIZE_X64 as u64 {
-        write_volatile((FSD_ARG_VADDR + index) as *mut u8, 0);
+        write_volatile((buffer + index) as *mut u8, 0);
         index += 1;
     }
-    write_unaligned(FSD_ARG_VADDR as *mut u64, phys_disp);
-    write_unaligned((FSD_ARG_VADDR + 8) as *mut u64, callout);
-    write_unaligned((FSD_ARG_VADDR + 16) as *mut u32, 0);
-    write_unaligned((FSD_ARG_VADDR + 24) as *mut u64, video_device_object);
-    write_unaligned((FSD_ARG_VADDR + 32) as *mut u32, 0);
+    write_unaligned(buffer as *mut u64, phys_disp);
+    write_unaligned((buffer + 8) as *mut u64, callout);
+    write_unaligned((buffer + 16) as *mut u32, 0);
+    write_unaligned((buffer + 24) as *mut u64, video_device_object);
+    write_unaligned((buffer + 32) as *mut u32, 0);
     (0, VIDEO_WIN32K_CALLBACKS_SIZE_X64 as u64)
 }
 
@@ -25764,43 +25818,62 @@ unsafe fn component_dispatch_video_start_io() -> (i32, u64) {
     if ioctl > u32::MAX as u64 || inlen > u32::MAX as u64 || outlen > u32::MAX as u64 {
         return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
     }
-    match ioctl as u32 {
-        IOCTL_VIDEO_INIT_WIN32K_CALLBACKS => {
-            return component_dispatch_video_win32k_callbacks(inlen, outlen);
-        }
-        _ => {}
+    let transfer_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_IRP_ID) as *const u64);
+    let buffer = pool_alloc_zeroed(inlen.max(outlen).max(1));
+    if buffer == 0 {
+        return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
+    }
+    if inlen != 0
+        && !pool_pull_request_bytes(FSD_SERVICE_PULL_IRP_INPUT_LABEL, transfer_id, buffer, inlen)
+    {
+        pool_free(buffer);
+        return (STATUS_UNSUCCESSFUL, 0);
     }
 
-    let mut status_raw = [0u8; VIDEO_STATUS_BLOCK_X64_SIZE];
-    if write_video_status_block_x64(&mut status_raw, 0, 0).is_err() {
-        return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
-    }
-    let mut vrp_raw = [0u8; VIDEO_REQUEST_PACKET_X64_SIZE];
-    let packet = VideoRequestPacketX64::buffered(
-        ioctl as u32,
-        status_raw.as_mut_ptr() as u64,
-        FSD_ARG_VADDR,
-        inlen as u32,
-        outlen as u32,
-    );
-    if packet.write(&mut vrp_raw).is_err() {
-        return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
-    }
-    let start: extern "win64" fn(u64, u64) -> u8 = core::mem::transmute(start_io as *const ());
-    let _accepted = start(hw_extension, vrp_raw.as_mut_ptr() as u64);
-    let calls = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_START_IO_CALLS) as *const u64);
-    write_volatile(
-        (FSD_SHARED_VADDR + SH_VIDEO_HW_START_IO_CALLS) as *mut u64,
-        calls.saturating_add(1),
-    );
-    let status_block = match VideoStatusBlockX64::parse(&status_raw) {
-        Ok(status_block) => status_block,
-        Err(_) => return (0xC000_000Du32 as i32, 0), // STATUS_INVALID_PARAMETER
+    let result = if ioctl as u32 == IOCTL_VIDEO_INIT_WIN32K_CALLBACKS {
+        component_dispatch_video_win32k_callbacks(buffer, inlen, outlen)
+    } else {
+        let mut status_raw = [0u8; VIDEO_STATUS_BLOCK_X64_SIZE];
+        if write_video_status_block_x64(&mut status_raw, 0, 0).is_err() {
+            pool_free(buffer);
+            return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
+        }
+        let mut vrp_raw = [0u8; VIDEO_REQUEST_PACKET_X64_SIZE];
+        let packet = VideoRequestPacketX64::buffered(
+            ioctl as u32,
+            status_raw.as_mut_ptr() as u64,
+            buffer,
+            inlen as u32,
+            outlen as u32,
+        );
+        if packet.write(&mut vrp_raw).is_err() {
+            pool_free(buffer);
+            return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
+        }
+        let start: extern "win64" fn(u64, u64) -> u8 = core::mem::transmute(start_io as *const ());
+        let _accepted = start(hw_extension, vrp_raw.as_mut_ptr() as u64);
+        let calls = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_START_IO_CALLS) as *const u64);
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_VIDEO_HW_START_IO_CALLS) as *mut u64,
+            calls.saturating_add(1),
+        );
+        match VideoStatusBlockX64::parse(&status_raw) {
+            Ok(status_block) => (
+                video_port_forwarded_status(status_block.status as u32),
+                status_block.information,
+            ),
+            Err(_) => (0xC000_000Du32 as i32, 0), // STATUS_INVALID_PARAMETER
+        }
     };
-    (
-        video_port_forwarded_status(status_block.status as u32),
-        status_block.information,
-    )
+
+    let copy_len = result.1.min(outlen);
+    let result = if copy_len != 0 && !pool_push_request_bytes(transfer_id, buffer, 0, 0, copy_len) {
+        (STATUS_UNSUCCESSFUL, 0)
+    } else {
+        result
+    };
+    pool_free(buffer);
+    result
 }
 
 unsafe fn component_dispatch_provider_export() -> (i32, u64) {
@@ -26401,8 +26474,9 @@ extern "win64" fn s_hosted_provider_callback_gate_body(
 }
 
 /// Build a real IRP + IO_STACK_LOCATION + FILE_OBJECT and invoke the FSD's
-/// `MajorFunction[major]` handler. The pipe/file name (UTF-16) rides in the ARG frame ([SH_REQ_INLEN]
-/// bytes); the FILE_OBJECT's FileName points at it. Returns (status, information).
+/// `MajorFunction[major]` handler. Variable request bytes arrive through the shared transfer bank;
+/// the FILE_OBJECT and IRP point only at request-owned pool allocations. Returns (status,
+/// information).
 ///
 /// x64 layouts (references/nt5 io.h): FILE_OBJECT { DeviceObject@8, FsContext@0x18, FsContext2@0x20,
 /// RelatedFileObject@0x40, FileName(UNICODE_STRING)@0x58 }. IRP { MdlAddress@0x08, Flags@0x10,
@@ -26419,15 +26493,21 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     let canonical_irp_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_IRP_ID) as *const u64);
     let canonical_file_id =
         read_volatile((FSD_SHARED_VADDR + SH_REQ_CANONICAL_FILE_ID) as *const u64);
-    let owner_instance =
-        read_volatile((FSD_SHARED_VADDR + SH_REQ_OWNER_INSTANCE) as *const u64);
+    let owner_instance = read_volatile((FSD_SHARED_VADDR + SH_REQ_OWNER_INSTANCE) as *const u64);
 
     let file_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
     let requestor_tid =
         read_volatile((FSD_SHARED_VADDR + SH_REQ_REQUESTOR_TID) as *const u32) as u64;
-    let is_create = matches!(major as u8, major::IRP_MJ_CREATE
-        | major::IRP_MJ_CREATE_NAMED_PIPE
-        | major::IRP_MJ_CREATE_MAILSLOT);
+    let is_create = matches!(
+        major as u8,
+        major::IRP_MJ_CREATE | major::IRP_MJ_CREATE_NAMED_PIPE | major::IRP_MJ_CREATE_MAILSLOT
+    );
+    if inlen > u32::MAX as u64
+        || outlen > u32::MAX as u64
+        || is_create && inlen > (u16::MAX as u64).saturating_sub(2)
+    {
+        return (STATUS_INVALID_BUFFER_SIZE as i32, 0);
+    }
     if is_create && canonical_file_id == 0 {
         return (0xC000_0008u32 as i32, 0); // STATUS_INVALID_HANDLE
     }
@@ -26467,10 +26547,18 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     if owns_fo && !fo_reserve_new_slot() {
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
     }
+    let fo_allocation_len = if owns_fo {
+        match (WDM_X64_FILE_OBJECT_SIZE as u64).checked_add(inlen.saturating_add(2)) {
+            Some(length) => length,
+            None => return (0xC000_009Au32 as i32, 0),
+        }
+    } else {
+        WDM_X64_FILE_OBJECT_SIZE as u64
+    };
     let fo = if !uses_file_object {
         0
     } else if owns_fo {
-        pool_alloc(WDM_X64_FILE_OBJECT_SIZE as u64)
+        pool_alloc(fo_allocation_len)
     } else {
         existing
     };
@@ -26486,7 +26574,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 fs_context: file_id,
                 file_name_len: inlen as u16,
                 file_name_max_len: (inlen + 2) as u16,
-                file_name_buffer: FSD_ARG_VADDR,
+                file_name_buffer: fo + WDM_X64_FILE_OBJECT_SIZE as u64,
             },
         )
         .is_err()
@@ -26544,8 +26632,46 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     } else {
         data
     };
-    if inlen != 0 {
-        pool_copy_from_arg(input_data, inlen);
+    if inlen != 0
+        && !pool_pull_request_bytes(
+            FSD_SERVICE_PULL_IRP_INPUT_LABEL,
+            canonical_irp_id,
+            input_data,
+            inlen,
+        )
+    {
+        pool_free_request_buffers(data, aux_data, 0);
+        if owns_fo {
+            pool_free(fo);
+        }
+        return (0xC000_0001u32 as i32, 0); // STATUS_UNSUCCESSFUL
+    }
+    if owns_fo {
+        let file_name = fo + WDM_X64_FILE_OBJECT_SIZE as u64;
+        let mut index = 0u64;
+        while index < inlen {
+            write_volatile(
+                (file_name + index) as *mut u8,
+                read_volatile((input_data + index) as *const u8),
+            );
+            index += 1;
+        }
+        write_unaligned((file_name + inlen) as *mut u16, 0);
+    }
+    if control_method == Some(ioctl::METHOD_IN_DIRECT)
+        && outlen != 0
+        && !pool_pull_request_bytes(
+            FSD_SERVICE_PULL_IRP_OUTPUT_LABEL,
+            canonical_irp_id,
+            data,
+            outlen,
+        )
+    {
+        pool_free_request_buffers(data, aux_data, 0);
+        if owns_fo {
+            pool_free(fo);
+        }
+        return (0xC000_0001u32 as i32, 0); // STATUS_UNSUCCESSFUL
     }
     let mut mdl = 0u64;
     if matches!(
@@ -26620,9 +26746,14 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     let mut create_access_state = 0u64;
     let mut create_parameters = 0u64;
     let stack_parameters = match major {
-        major if matches!(major as u8, major::IRP_MJ_CREATE
-            | major::IRP_MJ_CREATE_NAMED_PIPE
-            | major::IRP_MJ_CREATE_MAILSLOT) => {
+        major
+            if matches!(
+                major as u8,
+                major::IRP_MJ_CREATE
+                    | major::IRP_MJ_CREATE_NAMED_PIPE
+                    | major::IRP_MJ_CREATE_MAILSLOT
+            ) =>
+        {
             // IRP_MJ_CREATE (client open) / IRP_MJ_CREATE_NAMED_PIPE (server create). The FSD derefs
             // SecurityContext->{AccessState,DesiredAccess}, Options (disposition<<24), ShareAccess, and
             // (create-named-pipe only) the NAMED_PIPE_CREATE_PARAMETERS. Build valid blocks from the pool.
@@ -26651,25 +26782,22 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 (create_security_context + 0x08) as *mut u64,
                 create_access_state,
             );
-            write_unaligned(
-                (create_security_context + 0x10) as *mut u32,
-                0x001F_01FF,
-            );
-                                                                 // Options: Disposition in the high byte, CreateOptions in the low 24.
-                                                                 // BATCH 37: CREATE_NAMED_PIPE must use FILE_OPEN_IF (3), NOT FILE_CREATE (2) — this is
-                                                                 // exactly what Win32 CreateNamedPipe / NtCreateNamedPipeFile pass (kernel32 npipe.c:393).
-                                                                 // npfs's NpCreateExistingNamedPipe (create.c:594) returns STATUS_ACCESS_DENIED for a 2nd+
-                                                                 // instance opened with FILE_CREATE, while FILE_OPEN_IF opens-or-creates for both the new
-                                                                 // FCB (NpCreateNewNamedPipe accepts anything but FILE_OPEN) AND every subsequent instance.
-                                                                 // With FILE_CREATE the SCM listener's post-accept `rpcrt4_conn_create_pipe` re-create
-                                                                 // (2nd \ntsvcs instance) failed → its re-listen failed → the rpcrt4 server thread entered
-                                                                 // shutdown and called rpcrt4_conn_close_read on the just-handed-off connection, setting
-                                                                 // conn->read_closed=1, so the per-connection worker's rpcrt4_conn_np_read skipped NtReadFile
-                                                                 // and the bind was never read. Client opens (major 0) still use FILE_OPEN (1).
+            write_unaligned((create_security_context + 0x10) as *mut u32, 0x001F_01FF);
+            // Options: Disposition in the high byte, CreateOptions in the low 24.
+            // BATCH 37: CREATE_NAMED_PIPE must use FILE_OPEN_IF (3), NOT FILE_CREATE (2) — this is
+            // exactly what Win32 CreateNamedPipe / NtCreateNamedPipeFile pass (kernel32 npipe.c:393).
+            // npfs's NpCreateExistingNamedPipe (create.c:594) returns STATUS_ACCESS_DENIED for a 2nd+
+            // instance opened with FILE_CREATE, while FILE_OPEN_IF opens-or-creates for both the new
+            // FCB (NpCreateNewNamedPipe accepts anything but FILE_OPEN) AND every subsequent instance.
+            // With FILE_CREATE the SCM listener's post-accept `rpcrt4_conn_create_pipe` re-create
+            // (2nd \ntsvcs instance) failed → its re-listen failed → the rpcrt4 server thread entered
+            // shutdown and called rpcrt4_conn_close_read on the just-handed-off connection, setting
+            // conn->read_closed=1, so the per-connection worker's rpcrt4_conn_np_read skipped NtReadFile
+            // and the bind was never read. Client opens (major 0) still use FILE_OPEN (1).
             let disposition: u32 = match major as u8 {
                 major::IRP_MJ_CREATE_NAMED_PIPE => 3, // FILE_OPEN_IF
-                major::IRP_MJ_CREATE_MAILSLOT => 2,  // FILE_CREATE
-                _ => 1,                              // FILE_OPEN
+                major::IRP_MJ_CREATE_MAILSLOT => 2,   // FILE_CREATE
+                _ => 1,                               // FILE_OPEN
             };
             let named_pipe_parameters = if major as u8 == major::IRP_MJ_CREATE_NAMED_PIPE {
                 // NAMED_PIPE_CREATE_PARAMETERS (0x28 bytes): NamedPipeType@0, ReadMode@4, CompletionMode@8,
@@ -26697,10 +26825,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 write_unaligned((create_parameters + 0x0c) as *mut u32, 0xFF); // MaximumInstances
                 write_unaligned((create_parameters + 0x10) as *mut u32, 0x1000); // InboundQuota
                 write_unaligned((create_parameters + 0x14) as *mut u32, 0x1000); // OutboundQuota
-                write_unaligned(
-                    (create_parameters + 0x18) as *mut i64,
-                    -50_000_000i64,
-                ); // DefaultTimeout = -5s (relative)
+                write_unaligned((create_parameters + 0x18) as *mut i64, -50_000_000i64); // DefaultTimeout = -5s (relative)
                 write_unaligned((create_parameters + 0x20) as *mut u8, 1); // TimeoutSpecified
                 Some(create_parameters)
             } else if major as u8 == major::IRP_MJ_CREATE_MAILSLOT {
@@ -26772,7 +26897,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 zero(pnp_resource_list, pnp_resource_capacity);
                 let mut index = 0u64;
                 while index < inlen {
-                    let byte = read_volatile((FSD_ARG_VADDR + index) as *const u8);
+                    let byte = read_volatile((input_data + index) as *const u8);
                     write_volatile((pnp_resource_list + index) as *mut u8, byte);
                     index += 1;
                 }
@@ -26816,7 +26941,8 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     }
 
     // IRP. Both buffered-I/O views refer to request-owned storage. Writes/sets arrive through
-    // `inlen`; reads reserve `outlen` and are copied back to the ARG transport after completion.
+    // `inlen`; reads reserve `outlen` and are streamed back through the transfer bank after
+    // completion.
     let irp = pool_alloc(WDM_X64_IRP_SIZE as u64);
     if irp == 0 {
         if pnp_resource_list != 0 {
@@ -27007,12 +27133,12 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     };
     write_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *mut u64, fsctx);
     write_volatile(
-        (pending_irp_entry_address(owner_node)
-            + core::mem::offset_of!(PendingIrp, fid) as u64) as *mut u64,
+        (pending_irp_entry_address(owner_node) + core::mem::offset_of!(PendingIrp, fid) as u64)
+            as *mut u64,
         if file_id != 0 { file_id } else { fsctx },
     );
 
-    let (st, info, retained_completion, consuming_state) = loop {
+    let (mut st, mut info, retained_completion, consuming_state) = loop {
         let state = pending_irp_owner_state(owner_node).load(Ordering::Acquire);
         match hosted_irp_state_kind(state) {
             HOSTED_IRP_DISPATCHING => {
@@ -27061,8 +27187,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 // Completion is still capturing on another hosted worker. Transfer ownership at
                 // this final return edge; the completer will publish READY and this actor will not
                 // touch the graph again.
-                let deferred =
-                    hosted_irp_state_with_kind(state, HOSTED_IRP_COMPLETING_DEFERRED);
+                let deferred = hosted_irp_state_with_kind(state, HOSTED_IRP_COMPLETING_DEFERRED);
                 if pending_irp_owner_state(owner_node)
                     .compare_exchange(state, deferred, Ordering::AcqRel, Ordering::Acquire)
                     .is_err()
@@ -27121,11 +27246,9 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 .map(|completion| completion.source)
                 .filter(|source| *source != 0)
                 .unwrap_or(data);
-            let mut index = 0u64;
-            while index < copy_len {
-                let byte = read_volatile((source + index) as *const u8);
-                write_volatile((FSD_ARG_VADDR + index) as *mut u8, byte);
-                index += 1;
+            if copy_len != 0 && !pool_push_request_bytes(canonical_irp_id, source, 0, 0, copy_len) {
+                st = 0xC000_0001u32 as i32; // STATUS_UNSUCCESSFUL
+                info = 0;
             }
         }
         let completed = read_volatile(pending_irp_entry_address(owner_node) as *const PendingIrp);
@@ -28618,7 +28741,7 @@ unsafe fn load_driver_reserved(
                     .map(|writer| writer.next_index())
                     .unwrap_or(0),
             )
-    };
+        };
 
     // 4. Build the FSD-class descriptor + spawn the isolated component.
     let fault_ep = make_object(OBJ_ENDPOINT);
@@ -29348,21 +29471,14 @@ fn copy_completed_external_irp_by_id(
     io.pump();
     let completion = io.completed_irp(irp_id)?;
     let length = if with_output {
-        usize::try_from(completion.information)
-            .ok()?
-            .min(COMPLETED_READ_BYTE_CAP)
+        usize::try_from(completion.information).ok()?
     } else {
         0
     };
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(length).ok()?;
     bytes.resize(length, 0);
-    if length != 0
-        && io
-            .copy_completed_irp_output(irp_id, 0, &mut bytes)
-            .ok()?
-            != length
-    {
+    if length != 0 && io.copy_completed_irp_output(irp_id, 0, &mut bytes).ok()? != length {
         return None;
     }
     Some((completion, bytes))
@@ -29372,8 +29488,7 @@ pub(crate) unsafe fn copy_completed_irp(
     irp_id: u64,
     with_output: bool,
 ) -> Option<(u32, u64, Vec<u8>)> {
-    let (completion, bytes) =
-        copy_completed_external_irp_by_id(IrpId(irp_id), with_output)?;
+    let (completion, bytes) = copy_completed_external_irp_by_id(IrpId(irp_id), with_output)?;
     Some((
         completion.status.raw() as u32,
         completion.information,
@@ -29572,6 +29687,16 @@ fn projection_buffer_extents(irp: &IrpProjection, cap: usize) -> (usize, usize) 
     }
 }
 
+fn projection_uses_separate_output(irp: &IrpProjection) -> bool {
+    matches!(
+        irp.parameters,
+        IoParameters::DeviceControl(_) | IoParameters::InternalDeviceControl(_)
+    ) && matches!(
+        ioctl::method(projection_fsctl(irp) as u32),
+        ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT | ioctl::METHOD_NEITHER
+    )
+}
+
 impl DriverDispatchBackend for HostedDriverBackend {
     fn dispatch_irp(
         &mut self,
@@ -29579,6 +29704,12 @@ impl DriverDispatchBackend for HostedDriverBackend {
         irp: &IrpProjection,
     ) -> Result<DispatchOutcome, nt_status::NtStatus> {
         let (input_len, output_len) = projection_buffer_extents(irp, ctx.system_buffer.len());
+        let separate_output = projection_uses_separate_output(irp) && output_len != 0;
+        let output_offset = if separate_output { input_len } else { 0 };
+        let output_end = match output_offset.checked_add(output_len) {
+            Some(end) if end <= ctx.system_buffer.len() => end,
+            _ => return Err(nt_status::NtStatus::INVALID_PARAMETER),
+        };
         let input = Vec::from(&ctx.system_buffer[..input_len]);
         let fsctl = projection_fsctl(irp);
         let binding = hosted_device_binding_by_device_id(irp.device_id.raw());
@@ -29598,7 +29729,7 @@ impl DriverDispatchBackend for HostedDriverBackend {
                         fsctl,
                         irp.user_data,
                         &input,
-                        &mut ctx.system_buffer[..output_len],
+                        &mut ctx.system_buffer[output_offset..output_end],
                     ) {
                         Ok(Some((status, information))) => Some((status, information, 0, false)),
                         Ok(None) => dispatch_irp_for_instance(
@@ -29612,7 +29743,7 @@ impl DriverDispatchBackend for HostedDriverBackend {
                             irp.user_data,
                             irp.requestor_tid,
                             &input,
-                            &mut ctx.system_buffer[..output_len],
+                            &mut ctx.system_buffer[output_offset..output_end],
                         )
                         .map(|(status, information, file_context)| {
                             (status, information, file_context, true)
@@ -29634,7 +29765,7 @@ impl DriverDispatchBackend for HostedDriverBackend {
                     irp.user_data,
                     irp.requestor_tid,
                     &input,
-                    &mut ctx.system_buffer[..output_len],
+                    &mut ctx.system_buffer[output_offset..output_end],
                 )
                 .map(|(status, information, file_context)| {
                     (status, information, file_context, true)
@@ -29649,8 +29780,8 @@ impl DriverDispatchBackend for HostedDriverBackend {
                 status: nt_status::NtStatus(status),
                 information,
                 file_context: if irp.major == major::IRP_MJ_CREATE
-                || irp.major == major::IRP_MJ_CREATE_NAMED_PIPE
-                || irp.major == major::IRP_MJ_CREATE_MAILSLOT
+                    || irp.major == major::IRP_MJ_CREATE_NAMED_PIPE
+                    || irp.major == major::IRP_MJ_CREATE_MAILSLOT
                 {
                     Some(file_context)
                 } else {
@@ -29812,11 +29943,8 @@ fn external_dispatch_buffer_lengths(
     input_len: usize,
     output_len: usize,
 ) -> Result<(u32, u32, usize), u32> {
-    let transport_capacity = (FSD_ARG_FRAMES * 0x1000) as usize;
-    if input_len > transport_capacity {
-        return Err(STATUS_INVALID_BUFFER_SIZE);
-    }
-    let output_len = output_len.min(transport_capacity);
+    let input_len = u32::try_from(input_len).map_err(|_| STATUS_INVALID_BUFFER_SIZE)? as usize;
+    let output_len = u32::try_from(output_len).map_err(|_| STATUS_INVALID_BUFFER_SIZE)? as usize;
     Ok((
         external_len(input_len),
         external_len(output_len),
@@ -29839,9 +29967,7 @@ fn external_irp_parameters(
     output_len: u32,
 ) -> Option<IoParameters> {
     match major {
-        major::IRP_MJ_CREATE
-        | major::IRP_MJ_CREATE_NAMED_PIPE
-        | major::IRP_MJ_CREATE_MAILSLOT => {
+        major::IRP_MJ_CREATE | major::IRP_MJ_CREATE_NAMED_PIPE | major::IRP_MJ_CREATE_MAILSLOT => {
             Some(IoParameters::Create(Default::default()))
         }
         major::IRP_MJ_CLEANUP => Some(IoParameters::Cleanup),
@@ -29904,9 +30030,28 @@ fn dispatch_external_irp_to_device_record_result_exact(
         external_dispatch_buffer_lengths(in_data.len(), out.len())?;
     let params = external_irp_parameters(major, fsctl, input_len, output_len)
         .ok_or(STATUS_INVALID_PARAMETER as u32)?;
+    let separate_output = matches!(
+        control_transfer_method(major as u64, fsctl),
+        Some(ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT | ioctl::METHOD_NEITHER)
+    ) && !out.is_empty();
+    let output_offset = if separate_output { in_data.len() } else { 0 };
+    let system_buffer_len = if separate_output {
+        in_data
+            .len()
+            .checked_add(out.len())
+            .ok_or(STATUS_INVALID_BUFFER_SIZE)?
+    } else {
+        system_buffer_len
+    };
     let mut system_buffer = Vec::new();
+    system_buffer
+        .try_reserve_exact(system_buffer_len)
+        .map_err(|_| 0xC000_009Au32)?; // STATUS_INSUFFICIENT_RESOURCES
     system_buffer.resize(system_buffer_len, 0);
     system_buffer[..in_data.len()].copy_from_slice(in_data);
+    if separate_output {
+        system_buffer[output_offset..output_offset + out.len()].copy_from_slice(out);
+    }
     let result = io_manager_mut()
         .build_and_dispatch_external_to_device(
             ClientId(IO_MANAGER_COMPONENT_ID),
@@ -29930,7 +30075,8 @@ fn dispatch_external_irp_to_device_record_result_exact(
             let copy_len = (information as usize)
                 .min(out.len())
                 .min(system_buffer.len());
-            out[..copy_len].copy_from_slice(&system_buffer[..copy_len]);
+            out[..copy_len]
+                .copy_from_slice(&system_buffer[output_offset..output_offset + copy_len]);
             Ok((status.raw(), information, None, file_context))
         }
         ExternalDispatchResult::Pending { irp_id } => {
@@ -30582,9 +30728,7 @@ fn hosted_root_pdo_identity_status(error: nt_root_bus::RootBusPdoError) -> nt_st
         | nt_root_bus::RootBusPdoError::EmptyInstanceId
         | nt_root_bus::RootBusPdoError::EmptyHardwareIds
         | nt_root_bus::RootBusPdoError::EmptyHardwareId
-        | nt_root_bus::RootBusPdoError::EmptyCompatibleId => {
-            nt_status::NtStatus::INVALID_PARAMETER
-        }
+        | nt_root_bus::RootBusPdoError::EmptyCompatibleId => nt_status::NtStatus::INVALID_PARAMETER,
     }
 }
 
@@ -31392,9 +31536,11 @@ unsafe fn observe_hosted_dc21x4_descriptor_ring(
         evidence.failures = evidence.failures.saturating_add(1);
         return evidence;
     }
-    if hosted_dma_manager_mut()
-        .decode_owner_logical(hosted_dma_owner(binding), ring_logical, descriptor_bytes as u64)
-        != Ok(ring_component_va)
+    if hosted_dma_manager_mut().decode_owner_logical(
+        hosted_dma_owner(binding),
+        ring_logical,
+        descriptor_bytes as u64,
+    ) != Ok(ring_component_va)
     {
         evidence.failures = evidence.failures.saturating_add(1);
         return evidence;
@@ -32080,7 +32226,8 @@ unsafe fn write_hosted_e1000_rx_stimulus_frame(
 }
 
 unsafe fn hosted_dc21x4_adapter_context(binding: HostedDeviceBinding) -> Option<u64> {
-    let mirror = hosted_provider_ndis_miniport_block_mirror_by_dependent_instance(binding.instance)?;
+    let mirror =
+        hosted_provider_ndis_miniport_block_mirror_by_dependent_instance(binding.instance)?;
     let dependent_inst = instance(binding.instance)?;
     let block_exec = component_to_exec_va_for_instance(
         binding.instance,
@@ -32122,12 +32269,14 @@ unsafe fn hosted_dc21x4_current_rbd_index(
         DC21X4_ADAPTER_TAIL_RBD_OFFSET_X64 - DC21X4_ADAPTER_CURRENT_RBD_OFFSET_X64 + 8,
     )?;
     let current_rbd = read_unaligned(fields_exec as *const u64);
-    let head_rbd =
-        read_unaligned((fields_exec + DC21X4_ADAPTER_HEAD_RBD_OFFSET_X64
-            - DC21X4_ADAPTER_CURRENT_RBD_OFFSET_X64) as *const u64);
-    let tail_rbd =
-        read_unaligned((fields_exec + DC21X4_ADAPTER_TAIL_RBD_OFFSET_X64
-            - DC21X4_ADAPTER_CURRENT_RBD_OFFSET_X64) as *const u64);
+    let head_rbd = read_unaligned(
+        (fields_exec + DC21X4_ADAPTER_HEAD_RBD_OFFSET_X64 - DC21X4_ADAPTER_CURRENT_RBD_OFFSET_X64)
+            as *const u64,
+    );
+    let tail_rbd = read_unaligned(
+        (fields_exec + DC21X4_ADAPTER_TAIL_RBD_OFFSET_X64 - DC21X4_ADAPTER_CURRENT_RBD_OFFSET_X64)
+            as *const u64,
+    );
     if current_rbd == 0 || head_rbd == 0 || tail_rbd == 0 || head_rbd != ring_component_va {
         return None;
     }
@@ -32252,8 +32401,11 @@ unsafe fn complete_hosted_dc21x4_rx_descriptor(
     {
         return Ok(false);
     }
-    let (buffer_backing_va, range_kind) = hosted_dma_manager_mut()
-        .decode_owner_logical_with_kind(hosted_dma_owner(binding), address, buffer_len)?;
+    let (buffer_backing_va, range_kind) = hosted_dma_manager_mut().decode_owner_logical_with_kind(
+        hosted_dma_owner(binding),
+        address,
+        buffer_len,
+    )?;
     if range_kind != DmaLogicalRangeKind::CommonBuffer {
         return Ok(false);
     }
@@ -32269,9 +32421,11 @@ unsafe fn complete_hosted_dc21x4_rx_descriptor(
         HOSTED_DC21X4_RX_PAYLOAD_LEN,
         stimulus_config,
     );
-    if hosted_dma_manager_mut()
-        .decode_owner_logical(hosted_dma_owner(binding), ring_logical, ring.len() as u64)
-        != Ok(ring_component_va)
+    if hosted_dma_manager_mut().decode_owner_logical(
+        hosted_dma_owner(binding),
+        ring_logical,
+        ring.len() as u64,
+    ) != Ok(ring_component_va)
     {
         return Err(DmaError::LogicalViolation);
     }
@@ -32361,9 +32515,11 @@ unsafe fn drive_hosted_dc21x4_tx_descriptors(
     }
     let descriptor_count = (ring_len as usize / DC_DESCRIPTOR_LEN).min(DC_TRANSMIT_DESCRIPTORS);
     if descriptor_count == 0
-        || hosted_dma_manager_mut()
-            .decode_owner_logical(hosted_dma_owner(binding), ring_logical, ring_len)
-            != Ok(ring_component_va)
+        || hosted_dma_manager_mut().decode_owner_logical(
+            hosted_dma_owner(binding),
+            ring_logical,
+            ring_len,
+        ) != Ok(ring_component_va)
     {
         report.failures = report.failures.saturating_add(1);
         return report;
@@ -32382,8 +32538,7 @@ unsafe fn drive_hosted_dc21x4_tx_descriptors(
                 ((control & DC_TBD_CONTROL_LENGTH_MASK_2) >> DC_TBD_CONTROL_LENGTH_2_SHIFT) as u64;
             let mut mapped = false;
             if address1 != 0 && len1 != 0 {
-                report.tx_descriptor_candidates =
-                    report.tx_descriptor_candidates.saturating_add(1);
+                report.tx_descriptor_candidates = report.tx_descriptor_candidates.saturating_add(1);
                 report.tx_last_candidate_address = address1;
                 report.tx_last_candidate_len = len1;
                 report.tx_last_candidate_status = status as u64;
@@ -33020,6 +33175,72 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
 
 /// The live-driver instance table (indexed by [`DriverComponent::instance`]).
 static mut DRIVER_INSTANCES: Option<Vec<DriverInstance>> = None;
+
+#[derive(Clone, Copy)]
+struct ActiveHostedIrpTransfer {
+    shared_va: u64,
+    transfer_id: u64,
+    input: u64,
+    output: u64,
+    input_cursor: BankedTransferCursor,
+    output_seed_cursor: BankedTransferCursor,
+    output_cursor: BankedTransferCursor,
+}
+
+static mut ACTIVE_HOSTED_IRP_TRANSFERS: Option<Vec<ActiveHostedIrpTransfer>> = None;
+
+struct ActiveHostedIrpTransferGuard {
+    depth: usize,
+}
+
+impl Drop for ActiveHostedIrpTransferGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let transfers = (*core::ptr::addr_of_mut!(ACTIVE_HOSTED_IRP_TRANSFERS))
+                .as_mut()
+                .expect("active hosted IRP transfer stack disappeared");
+            assert_eq!(transfers.len(), self.depth + 1);
+            transfers.pop();
+        }
+    }
+}
+
+unsafe fn enter_active_hosted_irp_transfer(
+    shared_va: u64,
+    transfer_id: u64,
+    input: &[u8],
+    output: &mut [u8],
+) -> Option<ActiveHostedIrpTransferGuard> {
+    let slot = &mut *core::ptr::addr_of_mut!(ACTIVE_HOSTED_IRP_TRANSFERS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    let transfers = slot.as_mut().unwrap();
+    let depth = transfers.len();
+    if transfers.len() == transfers.capacity() {
+        transfers.try_reserve(1).ok()?;
+        crate::mark_durable_table_growth_dirty();
+    }
+    transfers.push(ActiveHostedIrpTransfer {
+        shared_va,
+        transfer_id,
+        input: input.as_ptr() as u64,
+        output: output.as_mut_ptr() as u64,
+        input_cursor: BankedTransferCursor::new(input.len() as u64),
+        output_seed_cursor: BankedTransferCursor::new(output.len() as u64),
+        output_cursor: BankedTransferCursor::new(output.len() as u64),
+    });
+    Some(ActiveHostedIrpTransferGuard { depth })
+}
+
+unsafe fn active_hosted_irp_transfer_mut(
+    shared_va: u64,
+    transfer_id: u64,
+) -> Option<&'static mut ActiveHostedIrpTransfer> {
+    let transfers = (*core::ptr::addr_of_mut!(ACTIVE_HOSTED_IRP_TRANSFERS)).as_mut()?;
+    let active = transfers.last_mut()?;
+    (active.shared_va == shared_va && active.transfer_id == transfer_id).then_some(active)
+}
 
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
@@ -33877,6 +34098,96 @@ fn instance_for_pump_channel(
         return None;
     }
     Some((instance, inst))
+}
+
+fn service_hosted_irp_bank_pull(
+    ch: &crate::spawn_hosts::PumpChannel,
+    transfer_id: u64,
+    offset: u64,
+    length: u64,
+    active_reply_cap: u64,
+    from_output: bool,
+) -> i32 {
+    let Some((_instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    if inst.exec_arg_va == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    unsafe {
+        let Some(active) = active_hosted_irp_transfer_mut(ch.shared_va, transfer_id) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let (cursor, source) = if from_output {
+            (&mut active.output_seed_cursor, active.output)
+        } else {
+            (&mut active.input_cursor, active.input)
+        };
+        let Some(source_address) = source.checked_add(offset) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let range = match cursor.claim(offset, length, FSD_ARG_BYTES) {
+            Ok(range) => range,
+            Err(_) => return STATUS_INVALID_PARAMETER,
+        };
+        if length != 0 {
+            debug_assert_eq!(range.start as u64, offset);
+            copy_bytes(inst.exec_arg_va, source_address, length);
+        }
+    }
+    STATUS_SUCCESS
+}
+
+pub(crate) fn service_hosted_irp_input_pull(
+    ch: &crate::spawn_hosts::PumpChannel,
+    transfer_id: u64,
+    offset: u64,
+    length: u64,
+    active_reply_cap: u64,
+) -> i32 {
+    service_hosted_irp_bank_pull(ch, transfer_id, offset, length, active_reply_cap, false)
+}
+
+pub(crate) fn service_hosted_irp_output_pull(
+    ch: &crate::spawn_hosts::PumpChannel,
+    transfer_id: u64,
+    offset: u64,
+    length: u64,
+    active_reply_cap: u64,
+) -> i32 {
+    service_hosted_irp_bank_pull(ch, transfer_id, offset, length, active_reply_cap, true)
+}
+
+pub(crate) fn service_hosted_irp_output_push(
+    ch: &crate::spawn_hosts::PumpChannel,
+    transfer_id: u64,
+    offset: u64,
+    length: u64,
+    active_reply_cap: u64,
+) -> i32 {
+    let Some((_instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    if inst.exec_arg_va == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    unsafe {
+        let Some(active) = active_hosted_irp_transfer_mut(ch.shared_va, transfer_id) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let Some(destination_address) = active.output.checked_add(offset) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let range = match active.output_cursor.claim(offset, length, FSD_ARG_BYTES) {
+            Ok(range) => range,
+            Err(_) => return STATUS_INVALID_PARAMETER,
+        };
+        if length != 0 {
+            debug_assert_eq!(range.start as u64, offset);
+            copy_bytes(destination_address, inst.exec_arg_va, length);
+        }
+    }
+    STATUS_SUCCESS
 }
 
 unsafe fn hosted_pdo_known_at(sh: u64, pdo: u64) -> bool {
@@ -36320,25 +36631,12 @@ unsafe fn dispatch_video_start_io_for_instance(
     if !hosted_instance_video_port_initialized(inst) {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
-    let transport_capacity = (FSD_ARG_FRAMES * 0x1000) as usize;
-    if ioctl > u32::MAX as u64
-        || in_data.len() > u32::MAX as usize
-        || out.len() > u32::MAX as usize
-        || in_data.len() > transport_capacity
-        || out.len() > transport_capacity
+    if ioctl > u32::MAX as u64 || in_data.len() > u32::MAX as usize || out.len() > u32::MAX as usize
     {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
     let sh = inst.exec_shared_va;
-    let arg = inst.exec_arg_va;
     let inlen = in_data.len();
-    for i in 0..inlen {
-        write_volatile((arg + i as u64) as *mut u8, in_data[i]);
-    }
-    let transfer_len = inlen.max(out.len());
-    for i in inlen..transfer_len {
-        write_volatile((arg + i as u64) as *mut u8, 0);
-    }
     write_volatile((sh + SH_DEVOBJ) as *mut u64, device_object);
     write_volatile((sh + SH_REQ_MAJOR) as *mut u64, FSD_DISPATCH_VIDEO_START_IO);
     write_volatile((sh + SH_REQ_MINOR) as *mut u64, 0);
@@ -36346,6 +36644,7 @@ unsafe fn dispatch_video_start_io_for_instance(
     write_volatile((sh + SH_REQ_INLEN) as *mut u64, inlen as u64);
     write_volatile((sh + SH_REQ_OUTLEN) as *mut u64, out.len() as u64);
     write_volatile((sh + SH_REQ_FILEID) as *mut u64, file_id);
+    write_volatile((sh + SH_REQ_IRP_ID) as *mut u64, 0);
     write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
     write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
 
@@ -36374,16 +36673,15 @@ unsafe fn dispatch_video_start_io_for_instance(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
+    let transfer_guard = enter_active_hosted_irp_transfer(sh, 0, in_data, out)
+        .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     let pr = hosted_component_pump(&ch);
+    drop(transfer_guard);
     if !pr.completed {
         register_instance_ready(index, false);
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
     }
     let info = read_volatile((sh + SH_REQ_INFO) as *const u64);
-    let copy_len = (info as usize).min(out.len());
-    for i in 0..copy_len {
-        out[i] = read_volatile((arg + i as u64) as *const u8);
-    }
     Ok((pr.status, info))
 }
 
@@ -36921,9 +37219,9 @@ pub(crate) fn print_active_driver_dispatch_for_deadman() {
 /// Route one IRP to launched driver `inst`: fill the shared request fields, drive its dispatch loop
 /// (a plain Send wakes it; it runs `MajorFunction[major]` in its own context; a fault mid-IRP lands
 /// on its fault EP → demand-map + resume), then read back the completion. Returns `(status,
-/// information)`. `major` is an `IRP_MJ_*`; `in_data` is copied into the instance's ARG frame and
-/// then projected into the WDM transfer-method fields by the component-side IRP builder; `out`
-/// receives the driver's output. Returns `None` if `inst` isn't ready.
+/// information)`. `major` is an `IRP_MJ_*`; the component-side IRP builder streams `in_data`
+/// through the shared bank into request-owned WDM buffers and streams completed bytes back to
+/// `out`. Returns `None` if `inst` isn't ready.
 ///
 /// This is the private component transport engine. Public callers route through driver/device ids.
 unsafe fn dispatch_irp_for_instance(
@@ -36939,6 +37237,9 @@ unsafe fn dispatch_irp_for_instance(
     in_data: &[u8],
     out: &mut [u8],
 ) -> Option<(i32, u64, u64)> {
+    if in_data.len() > u32::MAX as usize || out.len() > u32::MAX as usize {
+        return Some((STATUS_INVALID_BUFFER_SIZE as i32, 0, 0));
+    }
     let dependent_inst = instance(inst)?;
     if !dependent_inst.ready {
         return None;
@@ -36950,44 +37251,40 @@ unsafe fn dispatch_irp_for_instance(
     let mut provider_binding = None;
     if major != FSD_DISPATCH_TIMER_DPC {
         if let Some(route) = hosted_provider_dispatch_route_for_instance(inst) {
-        if !route.add_device_ready() {
-            return Some((STATUS_INVALID_DEVICE_REQUEST, 0, 0));
-        }
-        let binding = hosted_device_binding_by_device_object(device_object)
-            .or_else(|| hosted_device_binding_by_device_id(dependent_inst.device_id))?;
-        let provider_inst = instance(route.provider_instance)?;
-        if provider_inst.fault_ep == 0 || provider_inst.pml4 == 0 || provider_inst.reply_cap == 0 {
-            return None;
-        }
-        project_provider_device_dispatch_state(
-            binding,
-            dependent_inst.exec_shared_va,
-            provider_inst,
-            provider_inst.exec_shared_va,
-        )
-        .ok()?;
-        dispatch_index = route.provider_instance;
-        d = provider_inst;
-        sh = provider_inst.exec_shared_va;
-        driver_object = route.provider_driver_object;
-        provider_binding = Some(binding);
+            if !route.add_device_ready() {
+                return Some((STATUS_INVALID_DEVICE_REQUEST, 0, 0));
+            }
+            let binding = hosted_device_binding_by_device_object(device_object)
+                .or_else(|| hosted_device_binding_by_device_id(dependent_inst.device_id))?;
+            let provider_inst = instance(route.provider_instance)?;
+            if provider_inst.fault_ep == 0
+                || provider_inst.pml4 == 0
+                || provider_inst.reply_cap == 0
+            {
+                return None;
+            }
+            project_provider_device_dispatch_state(
+                binding,
+                dependent_inst.exec_shared_va,
+                provider_inst,
+                provider_inst.exec_shared_va,
+            )
+            .ok()?;
+            dispatch_index = route.provider_instance;
+            d = provider_inst;
+            sh = provider_inst.exec_shared_va;
+            driver_object = route.provider_driver_object;
+            provider_binding = Some(binding);
         }
     }
     let ep = d.fault_ep;
     let pml4 = d.pml4;
-    // Copy input into the instance's ARG frame (mapped RW in both AS); the component-side builder
-    // moves it into SystemBuffer, Type3InputBuffer, or the read/write buffer as required.
-    let arg = d.exec_arg_va;
-    let inlen = in_data.len().min((FSD_ARG_FRAMES * 0x1000) as usize);
-    for i in 0..inlen {
-        write_volatile((arg + i as u64) as *mut u8, in_data[i]);
-    }
     write_volatile((sh + SH_DRVOBJ) as *mut u64, driver_object);
     write_volatile((sh + SH_DEVOBJ) as *mut u64, device_object);
     write_volatile((sh + SH_REQ_MAJOR) as *mut u64, major);
     write_volatile((sh + SH_REQ_MINOR) as *mut u64, minor);
     write_volatile((sh + SH_REQ_FSCTL) as *mut u64, fsctl);
-    write_volatile((sh + SH_REQ_INLEN) as *mut u64, inlen as u64);
+    write_volatile((sh + SH_REQ_INLEN) as *mut u64, in_data.len() as u64);
     write_volatile((sh + SH_REQ_OUTLEN) as *mut u64, out.len() as u64);
     write_volatile((sh + SH_REQ_FILEID) as *mut u64, file_id);
     write_volatile((sh + SH_REQ_IRP_ID) as *mut u64, canonical_irp_id);
@@ -36996,7 +37293,10 @@ unsafe fn dispatch_irp_for_instance(
         canonical_file_id,
     );
     write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
-    write_volatile((sh + SH_REQ_REQUESTOR_TID) as *mut u32, requestor_tid as u32);
+    write_volatile(
+        (sh + SH_REQ_REQUESTOR_TID) as *mut u32,
+        requestor_tid as u32,
+    );
     write_volatile((sh + SH_REQ_OWNER_INSTANCE) as *mut u64, inst as u64);
     write_volatile((sh + SH_ACTIVE_IRP) as *mut u64, 0);
     write_volatile((sh + SH_ACTIVE_IOSL) as *mut u64, 0);
@@ -37068,7 +37368,12 @@ unsafe fn dispatch_irp_for_instance(
         print_u64(out.len() as u64);
         print_str(b"\n");
     }
+    let Some(transfer_guard) = enter_active_hosted_irp_transfer(sh, canonical_irp_id, in_data, out)
+    else {
+        return Some((0xC000_009Au32 as i32, 0, 0)); // STATUS_INSUFFICIENT_RESOURCES
+    };
     let pr = hosted_component_pump(&ch);
+    drop(transfer_guard);
     FSD_ACTIVE_DISPATCH_SEQ.store(0, Ordering::Relaxed);
     if trace_dispatch {
         print_str(b"[fsd-svc] EXIT inst=");
@@ -37110,7 +37415,6 @@ unsafe fn dispatch_irp_for_instance(
     }
     let d = instance(dispatch_index).unwrap_or(d);
     let sh = d.exec_shared_va;
-    let arg = d.exec_arg_va;
     let st = pr.status;
     // IoStatus.Information is at SH_REQ_INFO(0x78); the pump doesn't touch it.
     let info = read_volatile((sh + SH_REQ_INFO) as *const u64);
@@ -37118,11 +37422,6 @@ unsafe fn dispatch_irp_for_instance(
     // work can reuse the transport. It is payload attached to canonical FileId,
     // never the cross-domain identity itself.
     let file_context = read_volatile((sh + SH_REQ_FILEID) as *const u64);
-    // Copy the driver's projected output bytes back out.
-    let outlen = (info as usize).min(out.len());
-    for i in 0..outlen {
-        out[i] = read_volatile((arg + i as u64) as *const u8);
-    }
     if let Err(status) = drain_hosted_work_queues_at_passive_level() {
         // The drain retires the instance that owns the failed worker. Its failure is independent
         // of this IRP's already-committed result: rewriting STATUS_PENDING here would orphan the
@@ -37274,12 +37573,12 @@ pub(crate) unsafe fn npfs_dispatch_irp_exact(
     out: &mut [u8],
 ) -> Option<(i32, u64, u64)> {
     dispatch_hosted_file_irp_result_exact(file_id, major, fsctl, 0, in_data, out)
-    .ok()
-    .map(|(status, information, irp_id, _)| {
-        (
-            status,
-            information,
-            irp_id.map(|irp_id| irp_id.raw()).unwrap_or(0),
-        )
-    })
+        .ok()
+        .map(|(status, information, irp_id, _)| {
+            (
+                status,
+                information,
+                irp_id.map(|irp_id| irp_id.raw()).unwrap_or(0),
+            )
+        })
 }

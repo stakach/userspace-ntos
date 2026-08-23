@@ -90,6 +90,15 @@ const GUID_DEVICE_ENUMERATED_BYTES: [u8; 16] = [
     0x0a, 0x40, 0x3a, 0xcb, 0xf0, 0x46, 0xd0, 0x11, 0xb0, 0x8f, 0x00, 0x60, 0x97, 0x13, 0x05, 0x3f,
 ];
 
+fn try_zeroed_transfer_buffer(len: usize) -> Result<alloc::vec::Vec<u8>, u32> {
+    let mut bytes = alloc::vec::Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    bytes.resize(len, 0);
+    Ok(bytes)
+}
+
 fn io_control_access_granted(granted: u32, control_code: u32) -> bool {
     const FILE_READ_DATA: u32 = 0x0000_0001;
     const FILE_WRITE_DATA: u32 = 0x0000_0002;
@@ -130,8 +139,7 @@ unsafe fn reserve_synchronous_file_waiter() -> bool {
     reserved
 }
 
-unsafe fn reserve_file_irp_drain_waiter(
-) -> Option<nt_io_manager::PendingFileIrpDrainReservation> {
+unsafe fn reserve_file_irp_drain_waiter() -> Option<nt_io_manager::PendingFileIrpDrainReservation> {
     let waiters = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS);
     let old_capacity = waiters.allocation_capacity();
     let reservation = waiters.reserve();
@@ -141,8 +149,8 @@ unsafe fn reserve_file_irp_drain_waiter(
     reservation
 }
 
-unsafe fn reserve_file_cleanup_waiter(
-) -> Option<nt_io_manager::PendingFileCleanupWaitReservation> {
+unsafe fn reserve_file_cleanup_waiter() -> Option<nt_io_manager::PendingFileCleanupWaitReservation>
+{
     let waiters = &mut *core::ptr::addr_of_mut!(PENDING_FILE_CLEANUP_WAITS);
     let old_capacity = waiters.allocation_capacity();
     let reservation = waiters.reserve();
@@ -2793,10 +2801,7 @@ impl ExecNtHandler {
         write_field!(process_mechanisms, ExecProcessMechanisms::reset());
         write_field!(hosted_images, hosted_images);
         write_field!(process_vspaces, zeroed_process_slot_u64_vec());
-        write_field!(
-            temporary_process_slots,
-            zeroed_temporary_process_slot_vec()
-        );
+        write_field!(temporary_process_slots, zeroed_temporary_process_slot_vec());
         write_field!(thread_mechanisms, ExecThreadMechanisms::reset());
         write_field!(pool_used, zeroed_process_slot_u64_vec());
         write_field!(pool_suspended, zeroed_process_slot_u64_vec());
@@ -4458,10 +4463,10 @@ impl ExecNtHandler {
             if status == 0 && bit != 0 {
                 EXPLORER_SHELL_COM_CLASS_OPEN_MASK.fetch_or(bit, Ordering::Relaxed);
             }
-                        return Some(status);
+            return Some(status);
         }
 
-                Some(0xC000_0034)
+        Some(0xC000_0034)
     }
 
     /// Bounded trace of a registry MISS in winlogon's post-profile window: which key, which value.
@@ -4701,9 +4706,8 @@ impl ExecNtHandler {
 
     fn refresh_boot_hive_checkpoint_from_path(&mut self, hive_sel: u32, file_path: &str) -> bool {
         let mount_path = hive_mount(hive_sel);
-        let log_bytes =
-            unsafe { crate::writable_fs::hive_log_bytes_owned_if_mounted(file_path) }
-                .unwrap_or_default();
+        let log_bytes = unsafe { crate::writable_fs::hive_log_bytes_owned_if_mounted(file_path) }
+            .unwrap_or_default();
         let Some(bytes) = (unsafe { crate::writable_fs::file_bytes_if_mounted(file_path) }) else {
             if log_bytes.is_empty() {
                 return false;
@@ -10503,16 +10507,13 @@ impl ExecNtHandler {
         completed_inline: bool,
         operation_suppressed: bool,
     ) -> u32 {
-        let should_queue = match self
-            .file_completion
-            .should_queue_completion_packet(
-                file_id,
-                apc_context,
-                status,
-                completed_inline,
-                operation_suppressed,
-            )
-        {
+        let should_queue = match self.file_completion.should_queue_completion_packet(
+            file_id,
+            apc_context,
+            status,
+            completed_inline,
+            operation_suppressed,
+        ) {
             Ok(should_queue) => should_queue,
             Err(status) => return status,
         };
@@ -10567,10 +10568,7 @@ impl ExecNtHandler {
                     print_str(b"\n");
                 }
                 let _ = unsafe {
-                    crate::service_sec_image::reconcile_user_apc_file_wait(
-                        self,
-                        target_tid as u64,
-                    )
+                    crate::service_sec_image::reconcile_user_apc_file_wait(self, target_tid as u64)
                 };
                 nt_fs::STATUS_SUCCESS
             }
@@ -10801,8 +10799,6 @@ impl ExecNtHandler {
     }
 
     unsafe fn nt_device_io_control_file_service(&mut self, args: &[u64]) -> u32 {
-        const DEVICE_CONTROL_BUFFER_CAP: usize = 0x4000;
-
         let iosb = args[4];
         if iosb == 0 || !self.probe_user_output(iosb, 16) {
             return STATUS_ACCESS_VIOLATION;
@@ -10811,10 +10807,6 @@ impl ExecNtHandler {
         let ioctl = nt_ulong_arg(args[5]);
         let raw_input_len = nt_ulong_arg(args[7]) as usize;
         let raw_output_len = nt_ulong_arg(args[9]) as usize;
-        if raw_input_len > DEVICE_CONTROL_BUFFER_CAP || raw_output_len > DEVICE_CONTROL_BUFFER_CAP {
-            self.write_current_iosb(iosb, STATUS_INVALID_BUFFER_SIZE, 0);
-            return STATUS_INVALID_BUFFER_SIZE;
-        }
         if raw_input_len != 0 && args[6] == 0 {
             self.write_current_iosb(iosb, STATUS_ACCESS_VIOLATION, 0);
             return STATUS_ACCESS_VIOLATION;
@@ -10842,21 +10834,21 @@ impl ExecNtHandler {
                 .pm_pid_for_pi(self.pi)
                 .and_then(|pid| self.pm.lookup_handle(pid, handle))
             {
-            Some(nt_process::HandleObject::DiskFile { .. })
-            | Some(nt_process::HandleObject::Directory { .. })
-            | Some(nt_process::HandleObject::OverlayFile(_))
-            | Some(nt_process::HandleObject::BootStatusFile) => {
-                self.write_current_iosb(iosb, STATUS_INVALID_DEVICE_REQUEST, 0);
-                return STATUS_INVALID_DEVICE_REQUEST;
-            }
-            Some(_) => {
-                self.write_current_iosb(iosb, STATUS_OBJECT_TYPE_MISMATCH, 0);
-                return STATUS_OBJECT_TYPE_MISMATCH;
-            }
-            None => {
-                self.write_current_iosb(iosb, STATUS_INVALID_HANDLE, 0);
-                return STATUS_INVALID_HANDLE;
-            }
+                Some(nt_process::HandleObject::DiskFile { .. })
+                | Some(nt_process::HandleObject::Directory { .. })
+                | Some(nt_process::HandleObject::OverlayFile(_))
+                | Some(nt_process::HandleObject::BootStatusFile) => {
+                    self.write_current_iosb(iosb, STATUS_INVALID_DEVICE_REQUEST, 0);
+                    return STATUS_INVALID_DEVICE_REQUEST;
+                }
+                Some(_) => {
+                    self.write_current_iosb(iosb, STATUS_OBJECT_TYPE_MISMATCH, 0);
+                    return STATUS_OBJECT_TYPE_MISMATCH;
+                }
+                None => {
+                    self.write_current_iosb(iosb, STATUS_INVALID_HANDLE, 0);
+                    return STATUS_INVALID_HANDLE;
+                }
             },
         };
         let synchronous_file = match self.file_completion.is_synchronous(route.file_id) {
@@ -10876,13 +10868,31 @@ impl ExecNtHandler {
             return STATUS_ACCESS_DENIED;
         }
 
-        let mut input = alloc::vec![0u8; raw_input_len];
+        let mut input = match try_zeroed_transfer_buffer(raw_input_len) {
+            Ok(input) => input,
+            Err(status) => {
+                self.write_current_iosb(iosb, status, 0);
+                return status;
+            }
+        };
         if raw_input_len != 0 && !self.xas_read(args[6], &mut input) {
             self.write_current_iosb(iosb, STATUS_ACCESS_VIOLATION, 0);
             return STATUS_ACCESS_VIOLATION;
         }
-        let mut output = alloc::vec![0u8; raw_output_len];
-        if raw_output_len != 0 && !self.probe_user_output(args[8], raw_output_len) {
+        let mut output = match try_zeroed_transfer_buffer(raw_output_len) {
+            Ok(output) => output,
+            Err(status) => {
+                self.write_current_iosb(iosb, status, 0);
+                return status;
+            }
+        };
+        let output_valid = raw_output_len == 0
+            || if nt_io_abi::ioctl::method(ioctl) == nt_io_abi::ioctl::METHOD_IN_DIRECT {
+                self.xas_read(args[8], &mut output)
+            } else {
+                self.probe_user_output(args[8], raw_output_len)
+            };
+        if !output_valid {
             self.write_current_iosb(iosb, STATUS_ACCESS_VIOLATION, 0);
             return STATUS_ACCESS_VIOLATION;
         }
@@ -10899,8 +10909,7 @@ impl ExecNtHandler {
         };
         if !self.reserve_pending_file_io_owner()
             || (synchronous_file
-                && (REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
-                    || !wait_reply_pool_has_free()))
+                && (REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free()))
         {
             self.write_current_iosb(iosb, STATUS_INSUFFICIENT_RESOURCES, 0);
             return STATUS_INSUFFICIENT_RESOURCES;
@@ -10994,9 +11003,7 @@ impl ExecNtHandler {
                 if copy_len > output.len() {
                     status = STATUS_INVALID_BUFFER_SIZE;
                     information = 0;
-                } else if copy_len != 0
-                    && !self.xas_try_write_buf(args[8], &output[..copy_len])
-                {
+                } else if copy_len != 0 && !self.xas_try_write_buf(args[8], &output[..copy_len]) {
                     status = STATUS_ACCESS_VIOLATION;
                     information = 0;
                 }
@@ -11030,8 +11037,7 @@ impl ExecNtHandler {
             thread_wait_state_clear_badge_ready(self, pending.badge);
         }
         if !transfers.is_empty() {
-            crate::service_sec_image::FILE_IO_DELIVERY_RETRY_PENDING
-                .store(true, Ordering::Release);
+            crate::service_sec_image::FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
         }
 
         let mut creates = Vec::new();
@@ -11067,10 +11073,8 @@ impl ExecNtHandler {
                     self.file_completion
                         .cancel_promoted_io(waiter.file_id, waiter.tid)
                         .expect("teardown lost promoted synchronous File owner");
-                    let _ = crate::service_sec_image::synchronous_file_wake_next(
-                        self,
-                        waiter.file_id,
-                    );
+                    let _ =
+                        crate::service_sec_image::synchronous_file_wake_next(self, waiter.file_id);
                 }
             }
             self.release_file_reference(waiter.file_id);
@@ -11140,19 +11144,15 @@ impl ExecNtHandler {
                     return STATUS_INSUFFICIENT_RESOURCES;
                 };
                 if let Err(status) = self.file_completion.retain_file(file_id) {
-                    assert!(
-                        (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
-                            .cancel_reservation(reservation)
-                    );
+                    assert!((&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
+                        .cancel_reservation(reservation));
                     return status;
                 }
                 let state = match driver_launch::cancel_file_thread_io(file_id, self.current_tid) {
                     Ok(state) => state,
                     Err(status) => {
-                        assert!(
-                            (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
-                                .cancel_reservation(reservation)
-                        );
+                        assert!((&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
+                            .cancel_reservation(reservation));
                         self.release_file_reference(file_id);
                         return status;
                     }
@@ -11160,10 +11160,8 @@ impl ExecNtHandler {
                 matched = state.total;
                 terminal = state.terminal_unacknowledged;
                 if state.is_drained() {
-                    assert!(
-                        (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
-                            .cancel_reservation(reservation)
-                    );
+                    assert!((&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
+                        .cancel_reservation(reservation));
                     self.release_file_reference(file_id);
                 } else {
                     // Cancellation may have completed inside the manager pump. Force both exact
@@ -12569,9 +12567,8 @@ impl ExecNtHandler {
                     handle,
                     THREAD_QUERY_INFORMATION,
                 )?;
-                let pending = unsafe {
-                    (&*core::ptr::addr_of!(PENDING_FILE_IO)).has_thread(tid as u64)
-                };
+                let pending =
+                    unsafe { (&*core::ptr::addr_of!(PENDING_FILE_IO)).has_thread(tid as u64) };
                 output[..4].copy_from_slice(&(pending as u32).to_le_bytes());
                 4
             }
@@ -17486,12 +17483,12 @@ impl ExecNtHandler {
                 let wrote_prefix =
                     self.write_current_user_buf_bounded_at(va, 0, &header, limit, use_xas_write)
                         && self.write_current_user_utf16le_bounded_at(
-                        va,
-                        0x14,
-                        name,
-                        limit,
-                        use_xas_write,
-                    );
+                            va,
+                            0x14,
+                            name,
+                            limit,
+                            use_xas_write,
+                        );
                 if !wrote_prefix {
                     return false;
                 }
@@ -18184,8 +18181,10 @@ impl ExecNtHandler {
         let device_id = driver_launch::device_id_by_name("\\Device\\NamedPipe")
             .ok_or(STATUS_DEVICE_NOT_READY)?;
         let server = major == major::IRP_MJ_CREATE_NAMED_PIPE;
-        if !matches!(major, major::IRP_MJ_CREATE | major::IRP_MJ_CREATE_NAMED_PIPE)
-            || !self.reserve_pending_file_io_owner()
+        if !matches!(
+            major,
+            major::IRP_MJ_CREATE | major::IRP_MJ_CREATE_NAMED_PIPE
+        ) || !self.reserve_pending_file_io_owner()
             || REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
             || !wait_reply_pool_has_free()
             || (provider_context != 0 && !crate::reserve_pipe_create_metadata(server))
@@ -18499,9 +18498,7 @@ impl ExecNtHandler {
             return;
         }
         let _ = self.pm.cancel_reserved_handle(reservation);
-        let _ = self
-            .file_completion
-            .cancel_reserved_file_handle(file_id);
+        let _ = self.file_completion.cancel_reserved_file_handle(file_id);
         let _ = driver_launch::release_hosted_file(file_id);
     }
 
@@ -18527,9 +18524,7 @@ impl ExecNtHandler {
         reservation: nt_process::HandleReservation,
     ) {
         let _ = self.pm.cancel_reserved_handle(reservation);
-        let _ = self
-            .file_completion
-            .cancel_reserved_file_handle(file_id);
+        let _ = self.file_completion.cancel_reserved_file_handle(file_id);
     }
 
     /// Route an endpoint IRP through the device that owned the handle's FILE_OBJECT.
@@ -18547,9 +18542,9 @@ impl ExecNtHandler {
                 major,
                 fsctl,
                 self.current_tid,
-            input,
-            output,
-        )?;
+                input,
+                output,
+            )?;
         if driver_launch::device_id_by_name("\\Device\\NamedPipe") == Some(route.device_id) {
             NPFS_ROUTED_IRPS.fetch_add(1, Ordering::Relaxed);
         }
@@ -18584,7 +18579,10 @@ impl ExecNtHandler {
         let Some(pid) = self.pm_pid_for_pi(self.pi) else {
             return None;
         };
-        let (file_id, process_device_id) = match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
+        let (file_id, process_device_id) = match self
+            .pm
+            .lookup_handle(pid, handle as nt_process::Handle)
+        {
             Some(nt_process::HandleObject::RoutedFile { file_id, device_id }) if file_id != 0 => {
                 (file_id, device_id)
             }
@@ -18611,8 +18609,7 @@ impl ExecNtHandler {
             }
         }
         let pid = self.pm_pid_for_pi(self.pi)?;
-        self.pm
-            .handle_access(pid, handle as nt_process::Handle)
+        self.pm.handle_access(pid, handle as nt_process::Handle)
     }
 
     /// Retain and acquire a routed File before clearing its shared completion signal. `Ok(false)`
@@ -18648,7 +18645,10 @@ impl ExecNtHandler {
             self.file_completion.retain_file(route.file_id)?;
         }
 
-        match self.file_completion.begin_io(route.file_id, self.current_tid) {
+        match self
+            .file_completion
+            .begin_io(route.file_id, self.current_tid)
+        {
             Ok(nt_io_completion::FileIoAcquireResult::Acquired) => {
                 assert_eq!(
                     self.current_synchronous_file_lock, 0,
@@ -18687,8 +18687,8 @@ impl ExecNtHandler {
                     }
                     ip
                 };
-                self.pending_synchronous_file_wait = Some(
-                    nt_io_manager::SynchronousFileWaiter::waiting(
+                self.pending_synchronous_file_wait =
+                    Some(nt_io_manager::SynchronousFileWaiter::waiting(
                         route.file_id,
                         route.device_id,
                         route.fs_context,
@@ -18704,8 +18704,7 @@ impl ExecNtHandler {
                         self.current_resume_ip,
                         self.current_sp,
                         self.current_flags,
-                    ),
-                );
+                    ));
                 Ok(false)
             }
             Ok(nt_io_completion::FileIoAcquireResult::Bypassed) => {
@@ -21170,7 +21169,8 @@ impl ExecNtHandler {
                         }
                     }
                 }
-                if !closed && unsafe { crate::win32k_subsystem::close_user_object_handle(args[0]) } {
+                if !closed && unsafe { crate::win32k_subsystem::close_user_object_handle(args[0]) }
+                {
                     closed_user_object = true;
                     PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
                 }
@@ -21884,14 +21884,14 @@ impl ExecNtHandler {
                     }
                     let status = self.mint_registry_key(target, desired_access, args[0]);
                     if status != 0 {
-                                                return status;
+                        return status;
                     }
                     let disp_ptr = args[6];
                     if disp_ptr != 0 {
                         self.xas_write_buf(disp_ptr, &REG_OPENED_EXISTING_KEY.to_le_bytes());
                     }
                     bump_progress();
-                                        return 0;
+                    return 0;
                 }
                 if canon == r"\registry" {
                     return 0xC000_0022; // STATUS_ACCESS_DENIED
@@ -21901,7 +21901,7 @@ impl ExecNtHandler {
                     .map(|(parent, _)| if parent.is_empty() { r"\" } else { parent })
                     .unwrap_or(r"\");
                 if !crate::probe_seg!(2, self.registry_path_exists(parent)) {
-                                        return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
+                    return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
                 }
                 // Disposition/storage split: explicit overlay handles keep their overlay identity,
                 // and path-discovered volatile overlay keys shadow mounted hives. Nonvolatile
@@ -21911,13 +21911,15 @@ impl ExecNtHandler {
                 let create_options = nt_ulong_arg(args[5]);
                 let create_volatile = create_options & 0x1 != 0;
                 let root_is_overlay = root_target.and_then(overlay_key_idx).is_some();
-                let overlay_existing = crate::probe_seg!(3, if root_is_overlay {
-                    self.overlay.find(&canon)
-                } else {
-                    self.registry_overlay_index_for_canon_path(&canon)
-                });
-                let mutable_existing =
-                    crate::probe_seg!(4, self.mutable_hives.resolve_key(&full));
+                let overlay_existing = crate::probe_seg!(
+                    3,
+                    if root_is_overlay {
+                        self.overlay.find(&canon)
+                    } else {
+                        self.registry_overlay_index_for_canon_path(&canon)
+                    }
+                );
+                let mutable_existing = crate::probe_seg!(4, self.mutable_hives.resolve_key(&full));
                 let base_existing = crate::probe_seg!(
                     5,
                     if mutable_existing.is_none() && !self.mutable_hive_owns_path(&full) {
@@ -21936,7 +21938,7 @@ impl ExecNtHandler {
                         args[0],
                     );
                     if status != 0 {
-                                                return status;
+                        return status;
                     }
                     if self.current_process_is_winlogon()
                         && is_profile_list_sid_key_canon(&canon)
@@ -21951,13 +21953,13 @@ impl ExecNtHandler {
                         self.xas_write_buf(disp_ptr, &REG_OPENED_EXISTING_KEY.to_le_bytes());
                     }
                     bump_progress();
-                                        return 0;
+                    return 0;
                 }
                 if let Some(mutable_key) = mutable_existing {
                     let status =
                         self.mint_mutable_registry_key(mutable_key, desired_access, args[0]);
                     if status != 0 {
-                                                return status;
+                        return status;
                     }
                     if self.current_process_is_winlogon()
                         && is_profile_list_sid_key_canon(&canon)
@@ -21972,12 +21974,12 @@ impl ExecNtHandler {
                         self.xas_write_buf(disp_ptr, &REG_OPENED_EXISTING_KEY.to_le_bytes());
                     }
                     bump_progress();
-                                        return 0;
+                    return 0;
                 }
                 if let Some(base_key) = base_existing {
                     let status = self.mint_registry_key(base_key, desired_access, args[0]);
                     if status != 0 {
-                                                return status;
+                        return status;
                     }
                     if self.current_process_is_winlogon()
                         && is_profile_list_sid_key_canon(&canon)
@@ -21992,13 +21994,16 @@ impl ExecNtHandler {
                         self.xas_write_buf(disp_ptr, &REG_OPENED_EXISTING_KEY.to_le_bytes());
                     }
                     bump_progress();
-                                        return 0;
+                    return 0;
                 }
-                let mutable_parent = crate::probe_seg!(6, if create_volatile || root_is_overlay {
-                    None
-                } else {
-                    self.mutable_hives.resolve_key(parent)
-                });
+                let mutable_parent = crate::probe_seg!(
+                    6,
+                    if create_volatile || root_is_overlay {
+                        None
+                    } else {
+                        self.mutable_hives.resolve_key(parent)
+                    }
+                );
                 if let Some(mutable_parent) = mutable_parent {
                     let canon_len = canon.len();
                     let leaf = full.rsplit('\\').next().unwrap_or("");
@@ -22125,14 +22130,14 @@ impl ExecNtHandler {
                         self.mint_mutable_registry_key(mutable_key, desired_access, args[0])
                     );
                     if status != 0 {
-                                                return status;
+                        return status;
                     }
                     let disp_ptr = args[6];
                     if disp_ptr != 0 {
                         self.xas_write_buf(disp_ptr, &REG_CREATED_NEW_KEY.to_le_bytes());
                     }
                     bump_progress();
-                                        return 0;
+                    return 0;
                 }
                 if self.overlay.len() >= OVERLAY_KEY_MAX as usize {
                     return 0xC000_009A;
@@ -22346,7 +22351,7 @@ impl ExecNtHandler {
                 };
                 if existing_matches {
                     bump_progress();
-                                        return 0;
+                    return 0;
                 }
                 // The account-domain SID lsasrv mints in `LsapCreateRandomDomainSid` and persists as
                 // the `PolAcDmS` policy attribute's DEFAULT value. Record its length + SID header so
@@ -22401,7 +22406,7 @@ impl ExecNtHandler {
                 };
                 if let Some(mutable_key) = mutable_target {
                     let Some(value_type) = nt_hive_core::RegistryValueType::from_u32(ty) else {
-                                                return 0xC000_000D;
+                        return 0xC000_000D;
                     };
                     let copy_source =
                         self.registry_value_copy_source_for_user_data(data_ptr, data_size, ty);
@@ -22424,7 +22429,7 @@ impl ExecNtHandler {
                                 value_type,
                                 source,
                             ) {
-                                                                return status;
+                                return status;
                             }
                             true
                         } else {
@@ -22434,7 +22439,7 @@ impl ExecNtHandler {
                             self.mark_mutable_hives_dirty_for_services_order_change(
                                 services_order_may_change,
                             );
-                                                        return 0;
+                            return 0;
                         }
                     }
                     let value_data = match data_view {
@@ -22454,15 +22459,15 @@ impl ExecNtHandler {
                         value_type,
                         &value_data,
                     ) {
-                                                return status;
+                        return status;
                     }
                     self.mark_mutable_hives_dirty_for_services_order_change(
                         services_order_may_change,
                     );
-                                        return 0;
+                    return 0;
                 }
                 let Some(staged) = data_view else {
-                                        return 0xC000_009A;
+                    return 0xC000_009A;
                 };
                 let durable_name = match core::str::from_utf8(&name_scratch[..name_len]) {
                     Ok(name) => alloc::string::String::from(name),
@@ -22486,11 +22491,11 @@ impl ExecNtHandler {
                     .overlay
                     .set_value_from_slice(oidx, durable_name, ty, staged)
                 {
-                                        return 0xC000_0008;
+                    return 0xC000_0008;
                 }
                 self.overlay_dirty = true;
                 bump_progress();
-                                0 // STATUS_SUCCESS
+                0 // STATUS_SUCCESS
             },
             // `NtFlushKey(IN HANDLE KeyHandle)` — `references/reactos/ntoskrnl/config/ntapi.c:1085`.
             // NT references the key object by handle with no access mask, rejects deleted KCBs, then
@@ -22711,7 +22716,7 @@ impl ExecNtHandler {
                 let output_length = nt_ulong_arg(args[4]) as usize;
                 let key_path = self.registry_target_path(key);
                 let Some(name) = self.registry_subkey_by_index(key, idx) else {
-                                        trace_winlogon_post_lsa_registry(
+                    trace_winlogon_post_lsa_registry(
                         self,
                         b"enum-key",
                         key_path.as_deref(),
@@ -22761,7 +22766,7 @@ impl ExecNtHandler {
                     smss_copyout(args[5], &total_bytes); // *ResultLength (stack local)
                 }
                 if output_length < info.len() {
-                                        trace_winlogon_post_lsa_registry(
+                    trace_winlogon_post_lsa_registry(
                         self,
                         b"enum-key",
                         key_path.as_deref(),
@@ -22774,7 +22779,7 @@ impl ExecNtHandler {
                 }
                 self.xas_write_buf(args[3], &info); // KeyInformation (heap buffer)
                 bump_progress();
-                                trace_winlogon_post_lsa_registry(
+                trace_winlogon_post_lsa_registry(
                     self,
                     b"enum-key",
                     key_path.as_deref(),
@@ -22977,12 +22982,6 @@ impl ExecNtHandler {
                         return nt_fs::STATUS_INVALID_DEVICE_REQUEST;
                     }
                 }
-                const HOSTED_FSCTL_BUFFER_CAP: usize = 0x4000;
-                if raw_input_len > HOSTED_FSCTL_BUFFER_CAP
-                    || raw_output_len > HOSTED_FSCTL_BUFFER_CAP
-                {
-                    return STATUS_INVALID_BUFFER_SIZE;
-                }
                 if file_route.is_some()
                     && ((raw_input_len != 0 && args[6] == 0)
                         || (raw_output_len != 0
@@ -23020,11 +23019,24 @@ impl ExecNtHandler {
                 if let Some(route) = file_route {
                     let input_len = raw_input_len;
                     let output_len = raw_output_len;
-                    let mut input = alloc::vec![0u8; input_len];
-                    let mut output = alloc::vec![0u8; output_len];
+                    let mut input = match try_zeroed_transfer_buffer(input_len) {
+                        Ok(input) => input,
+                        Err(status) => return status,
+                    };
+                    let mut output = match try_zeroed_transfer_buffer(output_len) {
+                        Ok(output) => output,
+                        Err(status) => return status,
+                    };
                     let input_ok =
                         input_len == 0 || (args[6] != 0 && self.xas_read(args[6], &mut input));
-                    let output_ok = output_len == 0 || self.probe_user_output(args[8], output_len);
+                    let output_ok = output_len == 0
+                        || if nt_io_abi::ioctl::method(fsctl as u32)
+                            == nt_io_abi::ioctl::METHOD_IN_DIRECT
+                        {
+                            self.xas_read(args[8], &mut output)
+                        } else {
+                            self.probe_user_output(args[8], output_len)
+                        };
                     if !input_ok || !output_ok {
                         status = STATUS_ACCESS_VIOLATION as u64;
                     } else {
@@ -23066,10 +23078,8 @@ impl ExecNtHandler {
                                                 status = STATUS_INVALID_BUFFER_SIZE as u64;
                                                 information = 0;
                                             } else if copy_len != 0
-                                                && !self.xas_try_write_buf(
-                                                    args[8],
-                                                    &output[..copy_len],
-                                                )
+                                                && !self
+                                                    .xas_try_write_buf(args[8], &output[..copy_len])
                                             {
                                                 status = STATUS_ACCESS_VIOLATION as u64;
                                                 information = 0;
@@ -23143,8 +23153,7 @@ impl ExecNtHandler {
                     && fid != 0
                     && fs_context != 0
                 {
-                    let connected_before_listen =
-                        crate::pipe_server_preconnected_take(fs_context);
+                    let connected_before_listen = crate::pipe_server_preconnected_take(fs_context);
                     if connected_before_listen {
                         self.pipe_endpoint_progress = true;
                     }
@@ -23418,7 +23427,7 @@ impl ExecNtHandler {
                         0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND — smss uses defaults
                     })
                 };
-                                query_status
+                query_status
             },
             // NtQuerySystemInformation(Class[R10]=args[0], Buffer[RDX]=args[1], Len[R8]=args[2],
             // *RetLen[R9]=args[3]). Fixed class layouts and size policy live in nt-syscall; this
@@ -27507,13 +27516,11 @@ impl ExecNtHandler {
                         return nt_syscall::STATUS_ACCESS_VIOLATION;
                     }
 
-                    let transport_capacity = (driver_launch::FSD_ARG_FRAMES * 0x1000) as usize;
-                    let output_capacity = length.min(transport_capacity);
-                    let routed_output = core::slice::from_raw_parts_mut(
-                        core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
-                        output_capacity,
-                    );
-                    routed_output.fill(0);
+                    let mut routed_output = match try_zeroed_transfer_buffer(length) {
+                        Ok(output) => output,
+                        Err(status) => return status,
+                    };
+                    let output_capacity = routed_output.len();
 
                     let file_id = route.file_id;
                     let synchronous_file = match self.file_completion.is_synchronous(file_id) {
@@ -27547,7 +27554,7 @@ impl ExecNtHandler {
                         major::IRP_MJ_QUERY_INFORMATION as u64,
                         class as u64,
                         &[],
-                        &mut *routed_output,
+                        &mut routed_output,
                     ) {
                         Ok((driver_status, completed, irp_id)) => {
                             information = completed;
@@ -28682,9 +28689,9 @@ impl ExecNtHandler {
             // NtWriteFile captured args: FileHandle=args[0], Event=args[1], ApcRoutine=args[2],
             // ApcContext=args[3], *IoStatusBlock=args[4], Buffer=args[5], Length=args[6],
             // ByteOffset=args[7], Key=args[8]. Route typed named-pipe handles through isolated npfs
-            // with the caller's actual bytes. The shared FSD transport is four pages, so reject an
-            // over-sized request rather than silently truncating it. Driver status + Information are
-            // returned verbatim.
+            // with the caller's actual bytes. Hosted drivers receive the full ULONG-sized buffer
+            // through the banked component transport. Driver status + Information are returned
+            // verbatim.
             NativeService::NtWriteFile => unsafe {
                 let iosb = args[4];
                 let buffer = args[5];
@@ -28706,28 +28713,29 @@ impl ExecNtHandler {
                 let key_value = u32::from_le_bytes(key_bytes);
                 let mut iosb_probe = [0u8; 16];
                 let iosb_ok = iosb != 0 && self.xas_read(iosb, &mut iosb_probe);
-                let apc_completion_conflict = self
-                    .npfs_write_file_route_for(fh)
-                    .ok()
-                    .is_some_and(|route| {
-                        apc_routine != 0 && self.file_completion.binding(route.file_id).is_some()
-                    });
-                let transport_capacity = (driver_launch::FSD_ARG_FRAMES * 0x1000) as usize;
-                // The writable overlay is served IN-PROCESS from the volume and never crosses the
-                // isolated-FSD argument window, so it is not bounded by it (see the matching note
-                // on `NtReadFile`). It gets a copy-chunk-sized staging bound instead — exactly the
-                // 64 KiB buffer `kernel32!CopyLoop` allocates.
+                let apc_completion_conflict =
+                    self.npfs_write_file_route_for(fh)
+                        .ok()
+                        .is_some_and(|route| {
+                            apc_routine != 0
+                                && self.file_completion.binding(route.file_id).is_some()
+                        });
+                // The writable overlay keeps its existing copy-loop staging bound. Hosted drivers
+                // stream arbitrary ULONG-sized requests through their per-instance transfer bank.
                 const OVERLAY_IO_CAP: usize = 64 * 1024;
                 let overlay_file = self.overlay_file_id_for(fh);
                 let write_capacity = if overlay_file.is_some() {
                     OVERLAY_IO_CAP
                 } else {
-                    transport_capacity
+                    len
                 };
                 let mut payload = if overlay_file.is_some() {
                     alloc::vec::Vec::new()
                 } else {
-                    alloc::vec![0u8; len.min(write_capacity)]
+                    match try_zeroed_transfer_buffer(len) {
+                        Ok(payload) => payload,
+                        Err(status) => return status,
+                    }
                 };
                 let payload_ok = if len == 0 {
                     true
@@ -29079,31 +29087,24 @@ impl ExecNtHandler {
                 let disk_file = self.disk_file_for(fh);
                 let mut iosb_probe = [0u8; 16];
                 let iosb_ok = iosb != 0 && self.xas_read(iosb, &mut iosb_probe);
-                let apc_completion_conflict = self
-                    .npfs_read_file_route_for(fh)
-                    .ok()
-                    .is_some_and(|route| {
+                let apc_completion_conflict =
+                    self.npfs_read_file_route_for(fh).ok().is_some_and(|route| {
                         apc_routine != 0 && self.file_completion.binding(route.file_id).is_some()
                     });
-                let transport_capacity = (driver_launch::FSD_ARG_FRAMES * 0x1000) as usize;
-                // ★ THE WRITABLE OVERLAY IS NOT ON THE FSD TRANSPORT. `transport_capacity` is the
-                // isolated-FSD argument window (4 frames = 16 KiB); an overlay read is served
-                // in-process from the volume into its OWN buffer and never crosses it, so it must
-                // not inherit that cap — and it needs no `output` staging buffer at all.
-                // MEASURED (batch 58): `kernel32!CopyLoop` allocates a **64 KiB** copy buffer and
-                // issues `NtReadFile(len = 0x10000)`, which this arm refused with
-                // STATUS_INVALID_BUFFER_SIZE => `GetLastError() == 1784` (ERROR_INVALID_USER_BUFFER)
-                // — the wall `CopyDirectory` hit at `userenv/directory.c:148` after creating the
-                // whole destination tree and opening BOTH files.
+                // Disk and overlay reads copy directly to user memory. Hosted drivers get a full
+                // request-sized destination which the component fills through the banked transport.
                 let overlay_file = self.overlay_file_id_for(fh);
                 const OVERLAY_IO_CAP: usize = 64 * 1024;
                 let output_capacity = if matches!(disk_file, Ok(Some(_))) || overlay_file.is_some()
                 {
                     0
                 } else {
-                    len.min(transport_capacity)
+                    len
                 };
-                let mut output = alloc::vec![0u8; output_capacity];
+                let mut output = match try_zeroed_transfer_buffer(output_capacity) {
+                    Ok(output) => output,
+                    Err(status) => return status,
+                };
                 let mut information = 0u64;
                 let mut routed = false;
                 let mut pending_read_irp_id = 0u64;
@@ -29116,11 +29117,6 @@ impl ExecNtHandler {
                 let mut operation_started = false;
                 let mut status = if !iosb_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
-                } else if !matches!(disk_file, Ok(Some(_)))
-                    && overlay_file.is_none()
-                    && len > transport_capacity
-                {
-                    0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
                 } else if overlay_file.is_some() && len > OVERLAY_IO_CAP {
                     0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
                 } else if len != 0 && buffer == 0 {
@@ -29327,7 +29323,8 @@ impl ExecNtHandler {
                                                         routed = true;
                                                         information = completed;
                                                         pending_read_irp_id = pending_irp_id;
-                                                        let mut driver_status = driver_status as u32;
+                                                        let mut driver_status =
+                                                            driver_status as u32;
                                                         let copy_len =
                                                             (completed as usize).min(output.len());
                                                         if driver_status != STATUS_PENDING
@@ -29672,11 +29669,11 @@ impl ExecNtHandler {
                         } else {
                             let route = route.unwrap();
                             let file_id = route.file_id;
-                            let synchronous_file = match self.file_completion.is_synchronous(file_id)
-                            {
-                                Ok(synchronous) => synchronous,
-                                Err(status) => return status,
-                            };
+                            let synchronous_file =
+                                match self.file_completion.is_synchronous(file_id) {
+                                    Ok(synchronous) => synchronous,
+                                    Err(status) => return status,
+                                };
                             if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
                                 || !wait_reply_pool_has_free()
                                 || !self.reserve_pending_file_io_owner()
@@ -29687,11 +29684,7 @@ impl ExecNtHandler {
                                 Some(access) => access,
                                 None => return nt_fs::STATUS_INVALID_HANDLE,
                             };
-                            match self.prepare_hosted_file_io(
-                                route,
-                                args[0],
-                                granted_access,
-                            ) {
+                            match self.prepare_hosted_file_io(route, args[0], granted_access) {
                                 Ok(true) => {}
                                 Ok(false) => return STATUS_PENDING,
                                 Err(status) => return status,
@@ -29884,10 +29877,8 @@ impl ExecNtHandler {
                         Ok(route) => {
                             npfs_route_status = nt_fs::STATUS_SUCCESS;
                             file_id = route.file_id;
-                            synchronous_file = self
-                                .file_completion
-                                .is_synchronous(file_id)
-                                .unwrap_or(true);
+                            synchronous_file =
+                                self.file_completion.is_synchronous(file_id).unwrap_or(true);
                             let prepared = if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
                                 || !wait_reply_pool_has_free()
                                 || !self.reserve_pending_file_io_owner()

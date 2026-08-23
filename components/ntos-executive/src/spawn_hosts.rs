@@ -1969,6 +1969,30 @@ unsafe fn component_pump_loop(
             );
             pump_reply_recv_into!(ch, *reply_cap, msg, 1, previous as u64);
             continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PULL_IRP_INPUT_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let status = crate::driver_launch::service_hosted_irp_input_pull(
+                ch, msg.m0, msg.m1, msg.m2, *reply_cap,
+            );
+            pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PULL_IRP_OUTPUT_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let status = crate::driver_launch::service_hosted_irp_output_pull(
+                ch, msg.m0, msg.m1, msg.m2, *reply_cap,
+            );
+            pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PUSH_IRP_OUTPUT_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let status = crate::driver_launch::service_hosted_irp_output_push(
+                ch, msg.m0, msg.m1, msg.m2, *reply_cap,
+            );
+            pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
+            continue;
         } else if label == crate::driver_launch::FSD_SERVICE_KE_PULSE_EVENT_LABEL
             && ch.caps.kind == ReqKind::Irp
         {

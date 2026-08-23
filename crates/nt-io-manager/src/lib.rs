@@ -17,6 +17,7 @@ use alloc::vec::Vec;
 use nt_status::NtStatus;
 use nt_types::{ClientId, NtPath, ObjectId};
 
+mod banked_transfer;
 mod cancel;
 mod cancel_wait;
 mod cleanup_wait;
@@ -44,6 +45,7 @@ mod store;
 mod synchronous_io;
 mod wdm_x64;
 
+pub use banked_transfer::{BankedTransferCursor, BankedTransferError};
 pub use cancel::FileThreadIrpDrainState;
 pub use cancel_wait::{
     PendingFileIrpDrain, PendingFileIrpDrainReservation, PendingFileIrpDrainTable,
@@ -1531,15 +1533,13 @@ mod tests {
 
     // --- Read / write / device-control (Milestone 6) -----------------------
 
-    fn open_device_with(
-        mock: MockDriverBackend,
+    fn open_device_with_backend(
+        backend: Box<dyn DriverDispatchBackend>,
         access: AccessMask,
     ) -> (IoManager<MockObjectPort>, ClientId, HandleValue) {
         let mut om = io();
         let client = om.register_client();
-        let driver = om
-            .create_driver(&path("\\Driver\\Test"), Box::new(mock))
-            .unwrap();
+        let driver = om.create_driver(&path("\\Driver\\Test"), backend).unwrap();
         om.create_device(
             driver,
             Some(&path("\\Device\\Test0")),
@@ -1560,6 +1560,13 @@ mod tests {
             )
             .unwrap();
         (om, client, handle)
+    }
+
+    fn open_device_with(
+        mock: MockDriverBackend,
+        access: AccessMask,
+    ) -> (IoManager<MockObjectPort>, ClientId, HandleValue) {
+        open_device_with_backend(Box::new(mock), access)
     }
 
     fn any_ioctl(function: u32, method: u32) -> u32 {
@@ -1601,6 +1608,92 @@ mod tests {
             .device_control(client, handle, code, b"ping", &mut out)
             .unwrap();
         assert_eq!(&out[..n as usize], b"ping");
+    }
+
+    #[test]
+    fn every_ioctl_method_exceeds_the_old_sixty_four_kibibyte_policy_limit() {
+        let (mut om, client, handle) = open_device_with(
+            MockDriverBackend::new(),
+            AccessMask::GENERIC_READ | AccessMask::GENERIC_WRITE,
+        );
+        let length = 0x1_2345;
+        let input = std::vec![0x5a; length];
+        for method in [
+            ioctl::METHOD_BUFFERED,
+            ioctl::METHOD_IN_DIRECT,
+            ioctl::METHOD_OUT_DIRECT,
+            ioctl::METHOD_NEITHER,
+        ] {
+            let mut output = std::vec![0; length];
+            let code = any_ioctl(0x810 + method, method);
+            let n = om
+                .device_control(client, handle, code, &input, &mut output)
+                .unwrap();
+            assert_eq!(n, length as u64);
+            assert_eq!(output, input);
+        }
+    }
+
+    struct InDirectSeedBackend;
+
+    impl DriverDispatchBackend for InDirectSeedBackend {
+        fn dispatch_irp(
+            &mut self,
+            mut ctx: DispatchContext<'_>,
+            irp: &IrpProjection,
+        ) -> Result<DispatchOutcome, NtStatus> {
+            if matches!(
+                irp.major,
+                major::IRP_MJ_CREATE | major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE
+            ) {
+                return Ok(DispatchOutcome::Completed {
+                    status: NtStatus::SUCCESS,
+                    information: 0,
+                    file_context: None,
+                });
+            }
+            let method = match &irp.parameters {
+                IoParameters::DeviceControl(parameters) => ioctl::method(parameters.ioctl_code),
+                _ => {
+                    return Ok(DispatchOutcome::Failed {
+                        status: NtStatus::INVALID_DEVICE_REQUEST,
+                    })
+                }
+            };
+            let Some(direct) = ctx.direct_buffer.as_deref_mut() else {
+                return Ok(DispatchOutcome::Failed {
+                    status: NtStatus::INVALID_PARAMETER,
+                });
+            };
+            if method != ioctl::METHOD_IN_DIRECT || direct != b"seed" {
+                return Ok(DispatchOutcome::Failed {
+                    status: NtStatus::INVALID_PARAMETER,
+                });
+            }
+            direct.copy_from_slice(b"seen");
+            Ok(DispatchOutcome::Completed {
+                status: NtStatus::SUCCESS,
+                information: direct.len() as u64,
+                file_context: None,
+            })
+        }
+
+        fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> {
+            Err(NtStatus::INVALID_PARAMETER)
+        }
+    }
+
+    #[test]
+    fn method_in_direct_preserves_the_callers_second_buffer_for_driver_reads() {
+        let (mut om, client, handle) =
+            open_device_with_backend(Box::new(InDirectSeedBackend), AccessMask::GENERIC_READ);
+        let code = any_ioctl(0x814, ioctl::METHOD_IN_DIRECT);
+        let mut output = *b"seed";
+        let n = om
+            .device_control(client, handle, code, b"control", &mut output)
+            .unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(&output, b"seen");
     }
 
     #[test]

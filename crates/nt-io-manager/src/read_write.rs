@@ -20,16 +20,11 @@ use crate::irp::{
 use crate::object_port::ObjectManagerPort;
 use crate::{DeviceId, FileId, IoManager, IrpId};
 
-/// The largest single buffered transfer v0.1 accepts.
-pub(crate) const MAX_TRANSFER: usize = 64 * 1024;
-
-/// Validate a requested transfer length (spec §14.1, buffer bounds).
+/// Validate that a requested transfer can be represented by the NT `ULONG` length fields.
 pub(crate) fn validate_transfer(len: usize) -> Result<(), NtStatus> {
-    if len > MAX_TRANSFER {
-        Err(NtStatus::INVALID_PARAMETER)
-    } else {
-        Ok(())
-    }
+    u32::try_from(len)
+        .map(|_| ())
+        .map_err(|_| NtStatus::INVALID_PARAMETER)
 }
 
 impl<P: ObjectManagerPort> IoManager<P> {
