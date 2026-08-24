@@ -9,7 +9,7 @@
 
 use nt_status::NtStatus;
 
-use crate::irp::{IoBufferRef, IoParameters, IrpRecord};
+use crate::irp::{IoBufferRef, IoParameters, IrpRecord, StackControl, StackFlags};
 use crate::{DeviceId, DriverId, FileId, IrpId};
 use nt_types::ClientId;
 
@@ -85,10 +85,15 @@ impl<'a> DispatchContext<'a> {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct IrpProjection {
     pub irp_id: IrpId,
+    pub driver_id: DriverId,
     pub device_id: DeviceId,
     pub file_id: Option<FileId>,
+    pub stack_location: u8,
+    pub stack_count: u8,
     pub major: u8,
     pub minor: u8,
+    pub flags: StackFlags,
+    pub control: StackControl,
     pub parameters: IoParameters,
     pub buffer: Option<IoBufferRef>,
     pub user_data: u64,
@@ -96,23 +101,28 @@ pub struct IrpProjection {
 }
 
 impl IrpProjection {
-    /// Project the canonical IRP (using its current stack location's parameters).
-    pub fn from_record(record: &IrpRecord) -> Self {
-        let (minor, parameters) = record
-            .current_stack()
-            .map(|s| (s.minor, s.parameters.clone()))
-            .unwrap_or((record.minor, IoParameters::Unsupported));
-        Self {
+    /// Project only the active stack location. Origin fields never override a driver's current
+    /// view, and an invalid cursor is rejected rather than synthesized from mixed fields.
+    pub fn from_record(record: &IrpRecord) -> Result<Self, NtStatus> {
+        let stack = record.current_stack().ok_or(NtStatus::INVALID_PARAMETER)?;
+        let stack_count =
+            u8::try_from(record.stack.len()).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+        Ok(Self {
             irp_id: record.id,
-            device_id: record.device_id,
-            file_id: record.file_id,
-            major: record.major,
-            minor,
-            parameters,
+            driver_id: stack.driver_id,
+            device_id: stack.device_id,
+            file_id: stack.file_id,
+            stack_location: record.current_location,
+            stack_count,
+            major: stack.major,
+            minor: stack.minor,
+            flags: stack.flags,
+            control: stack.control,
+            parameters: stack.parameters.clone(),
             buffer: record.buffer,
             user_data: record.user_data,
             requestor_tid: record.requestor_tid,
-        }
+        })
     }
 }
 

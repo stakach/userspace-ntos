@@ -11,7 +11,7 @@ use nt_types::{AccessMask, ClientId, NtPath, ObjectId};
 
 use crate::dispatch::{DispatchContext, DispatchOutcome, IrpProjection};
 use crate::file::{CreateOptions, FileRecord, FileState, ShareAccess};
-use crate::irp::{BufferAccess, IoBufferRef, IoParameters, IoStackLocation, IrpRecord, IrpState};
+use crate::irp::{BufferAccess, IoBufferRef, IoParameters, IrpState};
 use crate::{DeviceId, DriverId, FileId, IoManager, IrpId};
 
 /// Result of dispatching an externally constructed IRP. A pending request stays
@@ -161,6 +161,9 @@ impl<P> IoManager<P> {
 
         let user_data = if let Some(file_id) = file_id {
             let file = self.file(file_id).ok_or(NtStatus::INVALID_HANDLE)?;
+            if device_id == DeviceId::NULL {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
             if file.client_id != client
                 || (device_id != DeviceId::NULL && file.device_id != device_id)
             {
@@ -174,13 +177,10 @@ impl<P> IoManager<P> {
         } else {
             user_data
         };
-        let mut irp = IrpRecord::new(client, device_id, file_id, major);
-        irp.driver_id = driver_id;
+        let mut irp =
+            self.build_irp_record(client, driver_id, device_id, file_id, major, params)?;
         irp.user_data = user_data;
         irp.requestor_tid = requestor_tid;
-        let mut sl = IoStackLocation::new(major, device_id, file_id);
-        sl.parameters = params;
-        irp.stack.push(sl);
         irp.buffer = Some(IoBufferRef {
             buffer_id: 0,
             offset: 0,
@@ -203,7 +203,12 @@ impl<P> IoManager<P> {
         self.irp_mut(irp_id)
             .expect("just allocated")
             .transition(IrpState::Dispatched);
-        let outcome = self.dispatch_to_driver(driver_id, irp_id, system_buffer);
+        let current_driver_id = self
+            .irp(irp_id)
+            .and_then(|irp| irp.current_stack())
+            .map(|stack| stack.driver_id)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        let outcome = self.dispatch_to_driver(current_driver_id, irp_id, system_buffer);
         Ok(self.complete_external_dispatch(irp_id, outcome))
     }
 
@@ -232,10 +237,14 @@ impl<P> IoManager<P> {
         type3_input_buffer: Option<&mut [u8]>,
         user_buffer: Option<&mut [u8]>,
     ) -> Result<DispatchOutcome, NtStatus> {
-        let (major_fn, client) = {
+        let (major_fn, client, current_driver_id) = {
             let irp = self.irp(irp_id).ok_or(NtStatus::INVALID_PARAMETER)?;
-            (irp.major, irp.client_id)
+            let stack = irp.current_stack().ok_or(NtStatus::INVALID_PARAMETER)?;
+            (stack.major, irp.client_id, stack.driver_id)
         };
+        if driver_id != current_driver_id {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         let target = self
             .driver(driver_id)
             .ok_or(NtStatus::INVALID_PARAMETER)?
@@ -252,7 +261,7 @@ impl<P> IoManager<P> {
                 status: NtStatus::INVALID_DEVICE_REQUEST,
             });
         };
-        let proj = IrpProjection::from_record(self.irp(irp_id).expect("checked above"));
+        let proj = IrpProjection::from_record(self.irp(irp_id).expect("checked above"))?;
         let backend = self
             .backends
             .get_mut(idx)
@@ -277,7 +286,7 @@ impl<P> IoManager<P> {
     ) -> ExternalDispatchResult {
         let (major, file_id) = self
             .irp(irp_id)
-            .map(|irp| (irp.major, irp.file_id))
+            .map(|irp| (irp.origin_major, irp.file_id))
             .unwrap_or((u8::MAX, None));
         if self
             .irp(irp_id)

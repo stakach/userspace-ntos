@@ -18,7 +18,7 @@ use crate::driver::{
     MajorFunctionTable, MockDispatchId,
 };
 use crate::file::{CreateOptions, FileRecord, FileState, ShareAccess};
-use crate::irp::{CreateParameters, IoParameters, IoStackLocation, IrpRecord, IrpState};
+use crate::irp::{CreateParameters, IoParameters, IrpState};
 use crate::object_port::ObjectManagerPort;
 use crate::{DeviceId, DriverId, FileId, IoManager, IrpId};
 
@@ -296,7 +296,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         let device_id = self
             .find_device_by_object(device_object)
             .ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?;
-        let driver_id = self
+        let origin_driver_id = self
             .device(device_id)
             .ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?
             .driver_id;
@@ -340,16 +340,26 @@ impl<P: ObjectManagerPort> IoManager<P> {
         }
 
         // 4. Build + dispatch IRP_MJ_CREATE.
-        let mut irp = IrpRecord::new(client, device_id, Some(file_id), major::IRP_MJ_CREATE);
-        irp.driver_id = driver_id;
-        let mut sl = IoStackLocation::new(major::IRP_MJ_CREATE, device_id, Some(file_id));
-        sl.parameters = IoParameters::Create(CreateParameters {
-            desired_access,
-            share_access,
-            create_options,
-            create_disposition,
-        });
-        irp.stack.push(sl);
+        let irp = match self.build_irp_record(
+            client,
+            origin_driver_id,
+            device_id,
+            Some(file_id),
+            major::IRP_MJ_CREATE,
+            IoParameters::Create(CreateParameters {
+                desired_access,
+                share_access,
+                create_options,
+                create_disposition,
+            }),
+        ) {
+            Ok(irp) => irp,
+            Err(status) => {
+                let _ = self.port.close_handle(client, handle);
+                self.release_file_record(file_id)?;
+                return Err(status);
+            }
+        };
         let irp_id = match self.allocate_irp(irp) {
             Ok(id) => id,
             Err(status) => {
@@ -448,14 +458,12 @@ impl<P: ObjectManagerPort> IoManager<P> {
         irp_id: IrpId,
         system_buffer: &mut [u8],
     ) -> Result<DispatchOutcome, NtStatus> {
-        let device_id = {
+        let driver_id = {
             let irp = self.irp(irp_id).ok_or(NtStatus::INVALID_PARAMETER)?;
-            irp.device_id
+            irp.current_stack()
+                .ok_or(NtStatus::INVALID_PARAMETER)?
+                .driver_id
         };
-        let driver_id = self
-            .device(device_id)
-            .ok_or(NtStatus::INVALID_PARAMETER)?
-            .driver_id;
         self.dispatch_to_driver(driver_id, irp_id, system_buffer)
     }
 

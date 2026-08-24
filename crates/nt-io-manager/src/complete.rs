@@ -24,10 +24,14 @@ use crate::{DeviceId, DriverId, FileId, IoManager, IrpId};
 pub struct CompletedIrp {
     pub id: IrpId,
     pub client_id: ClientId,
+    /// Immutable request-origin identities.
     pub driver_id: DriverId,
     pub file_id: Option<FileId>,
     pub device_id: DeviceId,
     pub major: u8,
+    /// Exact backend/device that owned terminal completion and retained output.
+    pub completion_driver_id: DriverId,
+    pub completion_device_id: DeviceId,
     pub user_data: u64,
     pub requestor_tid: u64,
     pub status: NtStatus,
@@ -90,7 +94,13 @@ impl<P: ObjectManagerPort> IoManager<P> {
         while index < self.cancel_dispatch_retries.len() {
             let irp_id = self.cancel_dispatch_retries[index];
             let (state, driver_id) = match self.irp(irp_id) {
-                Some(irp) => (irp.state, irp.driver_id),
+                Some(irp) => match irp.current_stack() {
+                    Some(stack) => (irp.state, stack.driver_id),
+                    None => {
+                        self.cancel_dispatch_retries.swap_remove(index);
+                        continue;
+                    }
+                },
                 None => {
                     self.cancel_dispatch_retries.swap_remove(index);
                     continue;
@@ -173,7 +183,11 @@ impl<P: ObjectManagerPort> IoManager<P> {
     ) -> bool {
         if self
             .irp(completion.irp_id)
-            .map(|irp| irp.driver_id != driver_id)
+            .map(|irp| {
+                irp.current_stack()
+                    .map(|stack| stack.driver_id != driver_id)
+                    .unwrap_or(true)
+            })
             .unwrap_or(true)
         {
             return false;
@@ -187,7 +201,10 @@ impl<P: ObjectManagerPort> IoManager<P> {
         completion: DriverCompletion,
     ) -> bool {
         let driver_id = match self.irp(completion.irp_id) {
-            Some(irp) => irp.driver_id,
+            Some(irp) => match irp.current_stack() {
+                Some(stack) => stack.driver_id,
+                None => return false,
+            },
             None => return false,
         };
         if self
@@ -224,7 +241,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             if !irp.transition(IrpState::Completing) || !irp.transition(IrpState::Completed) {
                 return false;
             }
-            (irp.major, irp.file_id)
+            (irp.origin_major, irp.file_id)
         };
 
         // Terminal CREATE publication, rather than transport acknowledgement, makes the File
@@ -275,7 +292,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
             (
-                irp.driver_id,
+                irp.current_stack()
+                    .ok_or(NtStatus::INVALID_PARAMETER)?
+                    .driver_id,
                 usize::try_from(irp.information).map_err(|_| NtStatus::INVALID_PARAMETER)?,
                 irp.buffer
                     .map(|buffer| buffer.output_len as usize)
@@ -322,7 +341,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .completed_irp_snapshot(irp_id)
             .ok_or(NtStatus::INVALID_PARAMETER)?;
         let backend_index = self
-            .driver(completed.driver_id)
+            .driver(completed.completion_driver_id)
             .map(|driver| driver.backend.0 as usize)
             .filter(|index| *index < self.backends.len())
             .ok_or(NtStatus::INVALID_PARAMETER)?;
@@ -373,10 +392,12 @@ impl<P: ObjectManagerPort> IoManager<P> {
         Some(CompletedIrp {
             id: irp.id,
             client_id: irp.client_id,
-            driver_id: irp.driver_id,
+            driver_id: irp.origin_driver_id,
             file_id: irp.file_id,
-            device_id: irp.device_id,
-            major: irp.major,
+            device_id: irp.origin_device_id,
+            major: irp.origin_major,
+            completion_driver_id: irp.current_stack()?.driver_id,
+            completion_device_id: irp.current_stack()?.device_id,
             user_data: irp.user_data,
             requestor_tid: irp.requestor_tid,
             status: irp.status,

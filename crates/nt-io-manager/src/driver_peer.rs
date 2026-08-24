@@ -103,8 +103,9 @@ fn build_dispatch_request(
         abi_size: core::mem::size_of::<IrpDispatchRequest>() as u16,
         major: irp.major,
         minor: irp.minor,
-        flags: 0,
+        flags: irp.flags.bits() as u32 | ((irp.control.bits() as u32) << 8),
         irp_id: irp.irp_id.0,
+        driver_id: irp.driver_id.0,
         device_id: irp.device_id.0,
         file_id: irp.file_id.map(|f| f.0).unwrap_or(0),
         buffer_id: irp.buffer.map(|b| b.buffer_id).unwrap_or(0),
@@ -121,8 +122,8 @@ fn build_dispatch_request(
         ioctl_code,
         parameter_offset: 0,
         parameter_len: 0,
-        _reserved: 0,
-        _reserved2: 0,
+        stack_location: irp.stack_location as u32,
+        stack_count: irp.stack_count as u32,
     })
 }
 

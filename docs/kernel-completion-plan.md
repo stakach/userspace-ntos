@@ -10993,3 +10993,58 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     success fallbacks, the singular per-driver device fields, and the aliased shared request slot.
     Finally move remaining component harnesses to the canonical unwinder and remove the unused
     `nt-kernel-exec::CompletionTracker`; do not retain it as a parallel completion model.
+
+    Canonical I/O Manager device-stack identity checkpoint (2026-08-24): the host-tested I/O
+    Manager now represents immutable request origin separately from mutable current-stack
+    ownership. Every `IO_STACK_LOCATION` carries its exact `DriverId`, `DeviceId`, File identity,
+    major/minor, flags, control, and parameters. `IrpProjection` is fallible and is derived solely
+    from the active location; it never combines a stale origin header with current parameters and
+    rejects an invalid cursor instead of synthesizing an `Unsupported` view.
+
+    File requests resolve File to its canonical base device and then to the live top attached
+    device. Open, read, write, flush, device/filesystem control, cleanup, close, and external-device
+    requests all use one strict builder that snapshots the complete top-to-bottom device stack.
+    Explicit driver-only requests retain a one-location NULL-device form. Allocation verifies the
+    exact origin driver, complete attachment chain, terminal lower device, File identity, and
+    origin/current major-minor pair. The old one-location builders and stale cached-top fallback are
+    deleted. A lower handoff can advance only when the calling driver owns the current frame and the
+    supplied next frame matches the precomputed lower driver/device/File identity; wrong callers,
+    skipped frames, mixed identities, and truncated stacks fail without moving the cursor.
+
+    Cancellation, cancel retry, completion authentication, retained-output selection, backend
+    acknowledgement, and driver-fault selection now use the current stack owner. Completed records
+    keep the immutable origin for caller-visible correlation and record the exact terminal
+    driver/device separately for backend lifetime operations. Component dispatch ABI version 3
+    carries the exact current `driver_id`, `device_id`, stack index/count, and packed stack
+    Flags/Control rather than reserved words.
+
+    Focused validation is green for `nt-io-manager` (`182/182`) and `nt-io-abi` (`5/5`). Tests prove
+    a three-driver stack routes every File and external operation to the live top, rejects truncated
+    and header-mixed stack packets, permits only two exact lower handoffs, and gives the terminal
+    lower driver exclusive cancellation, completion, retained output, and acknowledgement
+    authority. The freestanding release executive build/staging path passes at the existing
+    212-warning baseline. Serialized desktop proof `.tmp/run-desktop-20260824-181207.log` is accepted
+    for the exact integrated tree: snapshot generation 5 commits 822,114 bytes; the guarded message
+    preflight accounts for all 18 calls (`14 + 0 + 4`); genuine userinit and Explorer launch; and
+    Explorer completes 669 real api0 callbacks with zero callback failures. Paint reaches 5
+    BeginPaint, 20 EndPaint, 187 direct GDI returns, and 135 batch flushes carrying 184 records. All
+    786,432 framebuffer pixels are non-background with at least 32 colors, all `293/293` checks
+    pass, and the sentinel is emitted.
+
+    Review adjustment: the crate-first canonical stack model is closed. The next checkpoint is its
+    component-domain integration. Introduce a stable `HostedDomainId` and canonical provider
+    instance/cookie, then make all compatibility pointers resolve through `(domain, address)` to
+    `DriverId`/`DeviceId`. Carry those identities plus the active stack index in one authenticated
+    dispatch/completion envelope and implement executive `IoGetRelatedDeviceObject` through File to
+    canonical device to current top-of-stack. Delete each superseded global raw-pointer route,
+    direct raw root-PDO path, partial-known attach success, singular per-driver device field, and
+    shared request-slot alias in the same checkpoint; no compatibility fallback may remain.
+
+    After that boundary is live, migrate the standalone hal, power, PnP, async, MMIO, and DMA
+    component harnesses to `CompletionOwnerClaim` plus `CompletionUnwindCursor`, including their
+    direct attach/lower-call shims. Reconcile the separate `driver-host-direg` and `nt-driver-host`
+    completion paths so production has one authority. Only then delete
+    `nt-kernel-exec::CompletionTracker`, its runtime field/APIs/tests/exports, and the legacy device
+    stack and dispatcher documentation. Compatibility catalog status must reflect the provider that
+    actually binds an implementation; do not mark generic-loader imports implemented merely because
+    the executive's registration-driven resolver can serve them.

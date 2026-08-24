@@ -134,6 +134,7 @@ bitflags::bitflags! {
 /// One I/O stack location (spec §13.3) — the per-driver view of an IRP.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct IoStackLocation {
+    pub driver_id: DriverId,
     pub major: u8,
     pub minor: u8,
     pub flags: StackFlags,
@@ -145,8 +146,14 @@ pub struct IoStackLocation {
 
 impl IoStackLocation {
     /// A stack location for `major` targeting `device_id`.
-    pub fn new(major: u8, device_id: DeviceId, file_id: Option<FileId>) -> Self {
+    pub fn new(
+        driver_id: DriverId,
+        major: u8,
+        device_id: DeviceId,
+        file_id: Option<FileId>,
+    ) -> Self {
         Self {
+            driver_id,
             major,
             minor: 0,
             flags: StackFlags::empty(),
@@ -209,13 +216,15 @@ impl IrpState {
 pub struct IrpRecord {
     pub id: IrpId,
     pub client_id: ClientId,
-    /// Driver that owns the dispatched IRP. This remains meaningful for
-    /// driver-level requests that do not target a device object.
-    pub driver_id: DriverId,
+    /// Immutable driver identity at the request origin. For device requests this is the driver
+    /// that owns `origin_device_id`; driver-directed requests use their explicit target.
+    pub origin_driver_id: DriverId,
     pub file_id: Option<FileId>,
-    pub device_id: DeviceId,
-    pub major: u8,
-    pub minor: u8,
+    /// Immutable device identity at the request origin. The current target lives in the active
+    /// stack location and may differ when an attached filter is above this device.
+    pub origin_device_id: DeviceId,
+    pub origin_major: u8,
+    pub origin_minor: u8,
     pub state: IrpState,
     pub status: NtStatus,
     pub information: u64,
@@ -242,11 +251,11 @@ impl IrpRecord {
         Self {
             id: IrpId::NULL,
             client_id,
-            driver_id: DriverId::NULL,
+            origin_driver_id: DriverId::NULL,
             file_id,
-            device_id,
-            major,
-            minor: 0,
+            origin_device_id: device_id,
+            origin_major: major,
+            origin_minor: 0,
             state: IrpState::Allocated,
             status: NtStatus::PENDING,
             information: 0,
@@ -274,5 +283,36 @@ impl IrpRecord {
     /// The current (top-of-stack) I/O stack location, if any.
     pub fn current_stack(&self) -> Option<&IoStackLocation> {
         self.stack.get(self.current_location as usize)
+    }
+
+    /// Publish the next lower stack location and advance ownership. The caller must own the current
+    /// frame, while the supplied frame must preserve the precomputed lower driver/device/File
+    /// identity. Stale, skipped, or cross-stack forwarding is rejected without changing the cursor.
+    pub fn handoff_to_next_stack(
+        &mut self,
+        caller: DriverId,
+        next_stack: IoStackLocation,
+    ) -> Result<&IoStackLocation, NtStatus> {
+        let current = self.current_stack().ok_or(NtStatus::INVALID_PARAMETER)?;
+        if current.driver_id != caller {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let next = self
+            .current_location
+            .checked_add(1)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        let expected = self
+            .stack
+            .get(next as usize)
+            .ok_or(NtStatus::INVALID_DEVICE_REQUEST)?;
+        if next_stack.driver_id != expected.driver_id
+            || next_stack.device_id != expected.device_id
+            || next_stack.file_id != expected.file_id
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        self.stack[next as usize] = next_stack;
+        self.current_location = next;
+        self.current_stack().ok_or(NtStatus::INVALID_PARAMETER)
     }
 }

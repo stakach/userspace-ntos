@@ -13,10 +13,7 @@ use nt_status::NtStatus;
 use nt_types::{AccessMask, ClientId, HandleValue, ObjectId};
 
 use crate::dispatch::DispatchOutcome;
-use crate::irp::{
-    BufferAccess, IoBufferRef, IoParameters, IoStackLocation, IrpRecord, IrpState,
-    ReadWriteParameters,
-};
+use crate::irp::{BufferAccess, IoBufferRef, IoParameters, IrpState, ReadWriteParameters};
 use crate::object_port::ObjectManagerPort;
 use crate::{DeviceId, FileId, IoManager, IrpId};
 
@@ -195,11 +192,8 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .device(device_id)
             .ok_or(NtStatus::INVALID_PARAMETER)?
             .driver_id;
-        let mut irp = IrpRecord::new(client, device_id, file_id, major);
-        irp.driver_id = driver_id;
-        let mut sl = IoStackLocation::new(major, device_id, file_id);
-        sl.parameters = params;
-        irp.stack.push(sl);
+        let mut irp =
+            self.build_irp_record(client, driver_id, device_id, file_id, major, params)?;
         let buffer_len = [
             system_buffer.len(),
             direct_buffer.as_ref().map(|b| b.len()).unwrap_or(0),
@@ -225,8 +219,14 @@ impl<P: ObjectManagerPort> IoManager<P> {
         self.irp_mut(irp_id)
             .unwrap()
             .transition(IrpState::Dispatched);
+        let current_driver_id = self
+            .irp(irp_id)
+            .ok_or(NtStatus::INVALID_PARAMETER)?
+            .current_stack()
+            .ok_or(NtStatus::INVALID_PARAMETER)?
+            .driver_id;
         let outcome = self.dispatch_to_driver_with_transfer_buffers(
-            driver_id,
+            current_driver_id,
             irp_id,
             system_buffer,
             direct_buffer,

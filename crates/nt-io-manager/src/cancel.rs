@@ -53,9 +53,13 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 && irp.requestor_tid == requestor_tid
                 && matches!(irp.state, IrpState::Pending | IrpState::CancelRequested)
         }) {
-            self.driver_backend_index(irp.driver_id)
-                .filter(|index| *index < self.backends.len())
-                .ok_or(NtStatus::INVALID_PARAMETER)?;
+            self.driver_backend_index(
+                irp.current_stack()
+                    .ok_or(NtStatus::INVALID_PARAMETER)?
+                    .driver_id,
+            )
+            .filter(|index| *index < self.backends.len())
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
         }
         loop {
             let next = {
@@ -104,7 +108,13 @@ impl<P: ObjectManagerPort> IoManager<P> {
     /// denied.
     pub fn cancel(&mut self, client: ClientId, irp_id: IrpId) -> Result<(), NtStatus> {
         let (state, driver_id, owner) = match self.irp(irp_id) {
-            Some(irp) => (irp.state, irp.driver_id, irp.client_id),
+            Some(irp) => (
+                irp.state,
+                irp.current_stack()
+                    .ok_or(NtStatus::INVALID_PARAMETER)?
+                    .driver_id,
+                irp.client_id,
+            ),
             None => return Ok(()),
         };
         if owner != client {

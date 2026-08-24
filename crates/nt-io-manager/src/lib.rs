@@ -331,6 +331,126 @@ impl<P> IoManager<P> {
             .map(|(id, _)| id)
     }
 
+    /// Resolve the current top attached device for one canonical device identity.
+    pub fn top_of_device_stack(&self, device: DeviceId) -> Result<DeviceId, NtStatus> {
+        let top = self
+            .device(device)
+            .ok_or(NtStatus::INVALID_PARAMETER)?
+            .top_of_stack;
+        let top_record = self.device(top).ok_or(NtStatus::INVALID_PARAMETER)?;
+        if top_record.delete_pending {
+            return Err(NtStatus::DELETE_PENDING);
+        }
+        Ok(top)
+    }
+
+    /// NT `IoGetRelatedDeviceObject`: resolve a File to its canonical device and then to the live
+    /// top of that attachment stack.
+    pub fn related_device_for_file(&self, file: FileId) -> Result<DeviceId, NtStatus> {
+        let device = self.file(file).ok_or(NtStatus::INVALID_HANDLE)?.device_id;
+        self.top_of_device_stack(device)
+    }
+
+    /// Snapshot the live device stack from its current top down to the lowest attached device.
+    /// Every location carries its own driver identity; later topology changes cannot retarget an
+    /// already allocated IRP.
+    fn snapshot_device_stack(
+        &self,
+        origin: DeviceId,
+        file: Option<FileId>,
+        major: u8,
+        parameters: &IoParameters,
+    ) -> Result<Vec<IoStackLocation>, NtStatus> {
+        let mut current = self.top_of_device_stack(origin)?;
+        let mut stack = Vec::new();
+        let stack_size = self
+            .device(current)
+            .ok_or(NtStatus::INVALID_PARAMETER)?
+            .stack_size as usize;
+        stack
+            .try_reserve(stack_size)
+            .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+        loop {
+            if stack.len() >= u8::MAX as usize {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            let device = self.device(current).ok_or(NtStatus::INVALID_PARAMETER)?;
+            if device.delete_pending {
+                return Err(NtStatus::DELETE_PENDING);
+            }
+            let mut location = IoStackLocation::new(device.driver_id, major, current, file);
+            if stack.is_empty() {
+                location.parameters = parameters.clone();
+            }
+            stack.push(location);
+            let Some(lower) = device.attached_to else {
+                break;
+            };
+            if stack.iter().any(|location| location.device_id == lower) {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            current = lower;
+        }
+        if !stack.iter().any(|location| location.device_id == origin) {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(stack)
+    }
+
+    /// Build one canonical IRP with immutable origin identity and a full current device-stack
+    /// snapshot. `DeviceId::NULL` is reserved for explicit driver-directed requests.
+    pub(crate) fn build_irp_record(
+        &self,
+        client: ClientId,
+        driver: DriverId,
+        device: DeviceId,
+        file: Option<FileId>,
+        major: u8,
+        parameters: IoParameters,
+    ) -> Result<IrpRecord, NtStatus> {
+        if self.driver(driver).is_none() {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let stack = if device == DeviceId::NULL {
+            let mut location = IoStackLocation::new(driver, major, DeviceId::NULL, file);
+            location.parameters = parameters;
+            let mut stack = Vec::new();
+            stack
+                .try_reserve(1)
+                .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+            stack.push(location);
+            stack
+        } else {
+            let origin_driver = self
+                .device(device)
+                .ok_or(NtStatus::INVALID_PARAMETER)?
+                .driver_id;
+            if origin_driver != driver {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            self.snapshot_device_stack(device, file, major, &parameters)?
+        };
+        if stack.is_empty() {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let mut irp = IrpRecord::new(client, device, file, major);
+        irp.origin_driver_id = driver;
+        irp.stack = stack;
+        Ok(irp)
+    }
+
+    /// Publish an authenticated next lower stack frame and transfer current ownership to it.
+    pub fn handoff_irp_to_next_stack(
+        &mut self,
+        irp: IrpId,
+        caller: DriverId,
+        next_stack: IoStackLocation,
+    ) -> Result<(DriverId, DeviceId), NtStatus> {
+        let irp = self.irp_mut(irp).ok_or(NtStatus::INVALID_PARAMETER)?;
+        let next = irp.handoff_to_next_stack(caller, next_stack)?;
+        Ok((next.driver_id, next.device_id))
+    }
+
     /// The devices owned by a driver (empty for an unknown driver).
     pub fn devices_of(&self, driver: DriverId) -> &[DeviceId] {
         self.drivers
@@ -355,13 +475,10 @@ impl<P> IoManager<P> {
             None => return Err(NtStatus::INVALID_PARAMETER),
         };
         let lower = match self.device(target) {
-            Some(device) if !device.delete_pending => {
-                if self.device(device.top_of_stack).is_some() {
-                    device.top_of_stack
-                } else {
-                    target
-                }
-            }
+            Some(device) if !device.delete_pending => self
+                .device(device.top_of_stack)
+                .map(|_| device.top_of_stack)
+                .ok_or(NtStatus::INVALID_PARAMETER)?,
             Some(_) => return Err(NtStatus::DELETE_PENDING),
             None => return Err(NtStatus::INVALID_PARAMETER),
         };
@@ -553,6 +670,66 @@ impl<P> IoManager<P> {
 
     /// Allocate an IRP record, assigning + returning its id.
     pub fn allocate_irp(&mut self, mut record: IrpRecord) -> Result<IrpId, NtStatus> {
+        if record.origin_driver_id == DriverId::NULL {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        if record.origin_device_id != DeviceId::NULL {
+            let origin_driver = self
+                .devices
+                .get(record.origin_device_id)
+                .ok_or(NtStatus::INVALID_PARAMETER)?
+                .driver_id;
+            if record.origin_driver_id != origin_driver {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            if record.current_location != 0 {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            let mut expected = self.top_of_device_stack(record.origin_device_id)?;
+            let mut contains_origin = false;
+            for (index, location) in record.stack.iter().enumerate() {
+                let device = self.device(expected).ok_or(NtStatus::INVALID_PARAMETER)?;
+                if location.driver_id != device.driver_id
+                    || location.device_id != expected
+                    || location.file_id != record.file_id
+                {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                }
+                contains_origin |= expected == record.origin_device_id;
+                match device.attached_to {
+                    Some(lower) => expected = lower,
+                    None if index + 1 == record.stack.len() => break,
+                    None => return Err(NtStatus::INVALID_PARAMETER),
+                }
+            }
+            if record.stack.is_empty()
+                || !contains_origin
+                || record.stack.last().map(|location| location.device_id) != Some(expected)
+                || record.stack[0].major != record.origin_major
+                || record.stack[0].minor != record.origin_minor
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+        } else if record.origin_driver_id != DriverId::NULL
+            && self.driver(record.origin_driver_id).is_none()
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        } else if record.origin_driver_id != DriverId::NULL
+            && (record.current_location != 0
+                || record.stack.len() != 1
+                || record.stack[0].driver_id != record.origin_driver_id
+                || record.stack[0].device_id != DeviceId::NULL
+                || record.stack[0].file_id != record.file_id
+                || record.stack[0].major != record.origin_major
+                || record.stack[0].minor != record.origin_minor)
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        if let Some(current) = record.current_stack() {
+            if current.file_id != record.file_id {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+        }
         if let Some(file_id) = record.file_id {
             let file = self.files.get(file_id).ok_or(NtStatus::INVALID_HANDLE)?;
             let file_driver = self
@@ -560,20 +737,21 @@ impl<P> IoManager<P> {
                 .get(file.device_id)
                 .ok_or(NtStatus::INVALID_PARAMETER)?
                 .driver_id;
-            let valid_state = match record.major {
+            let valid_state = match record.origin_major {
                 major if is_create_major(major) => file.state == FileState::Allocated,
                 nt_io_abi::major::IRP_MJ_CLEANUP => file.state == FileState::CleanupPending,
                 nt_io_abi::major::IRP_MJ_CLOSE => file.state == FileState::ClosePending,
                 _ => file.state == FileState::Open,
             };
             if file.client_id != record.client_id
-                || file_driver != record.driver_id
-                || (record.device_id != DeviceId::NULL && file.device_id != record.device_id)
+                || file_driver != record.origin_driver_id
+                || (record.origin_device_id != DeviceId::NULL
+                    && file.device_id != record.origin_device_id)
                 || !valid_state
             {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
-            if !is_create_major(record.major) {
+            if !is_create_major(record.origin_major) {
                 record.user_data = file.driver_context.unwrap_or(0);
             }
             let file = self.files.get_mut(file_id).expect("validated file");
@@ -969,9 +1147,17 @@ mod tests {
         let mut om = io();
         let drv = a_driver(&mut om);
         let dev = a_device(&mut om, drv);
-        let iid = om
-            .allocate_irp(IrpRecord::new(ClientId(1), dev, None, major::IRP_MJ_CREATE))
+        let record = om
+            .build_irp_record(
+                ClientId(1),
+                drv,
+                dev,
+                None,
+                major::IRP_MJ_CREATE,
+                IoParameters::Unsupported,
+            )
             .unwrap();
+        let iid = om.allocate_irp(record).unwrap();
 
         let irp = om.irp_mut(iid).unwrap();
         assert_eq!(irp.state, IrpState::Allocated);
@@ -991,9 +1177,17 @@ mod tests {
         let mut om = io();
         let drv = a_driver(&mut om);
         let dev = a_device(&mut om, drv);
-        let iid = om
-            .allocate_irp(IrpRecord::new(ClientId(1), dev, None, major::IRP_MJ_READ))
+        let record = om
+            .build_irp_record(
+                ClientId(1),
+                drv,
+                dev,
+                None,
+                major::IRP_MJ_READ,
+                IoParameters::Unsupported,
+            )
             .unwrap();
+        let iid = om.allocate_irp(record).unwrap();
         let irp = om.irp_mut(iid).unwrap();
         assert!(irp.transition(IrpState::Initialized));
         assert!(irp.transition(IrpState::Dispatched));
@@ -1211,10 +1405,15 @@ mod tests {
     fn projection(major: u8, parameters: IoParameters) -> IrpProjection {
         IrpProjection {
             irp_id: IrpId::new(1, 1),
+            driver_id: DriverId::new(1, 1),
             device_id: DeviceId::new(1, 1),
             file_id: None,
+            stack_location: 0,
+            stack_count: 1,
             major,
             minor: 0,
+            flags: StackFlags::empty(),
+            control: StackControl::empty(),
             parameters,
             buffer: None,
             user_data: 0,
@@ -1224,6 +1423,45 @@ mod tests {
 
     fn ctx<'a>(buf: &'a mut [u8]) -> DispatchContext<'a> {
         DispatchContext::new(DriverId::NULL, ClientId(1), buf)
+    }
+
+    #[test]
+    fn irp_projection_uses_only_the_current_stack_location() {
+        let origin_driver = DriverId::new(1, 1);
+        let current_driver = DriverId::new(2, 1);
+        let origin_device = DeviceId::new(1, 1);
+        let current_device = DeviceId::new(2, 1);
+        let mut record = IrpRecord::new(ClientId(7), origin_device, None, major::IRP_MJ_READ);
+        record.id = IrpId::new(3, 1);
+        record.origin_driver_id = origin_driver;
+        record.origin_minor = 0xee;
+        let mut current =
+            IoStackLocation::new(current_driver, major::IRP_MJ_WRITE, current_device, None);
+        current.minor = 9;
+        current.flags = StackFlags::CASE_SENSITIVE;
+        current.control = StackControl::INVOKE_ON_ERROR;
+        current.parameters = IoParameters::Write(ReadWriteParameters {
+            length: 17,
+            key: 4,
+            offset: 0x1234,
+        });
+        record.stack.push(current.clone());
+
+        let projection = IrpProjection::from_record(&record).unwrap();
+        assert_eq!(projection.driver_id, current_driver);
+        assert_eq!(projection.device_id, current_device);
+        assert_eq!(projection.major, major::IRP_MJ_WRITE);
+        assert_eq!(projection.minor, 9);
+        assert_eq!(projection.flags, StackFlags::CASE_SENSITIVE);
+        assert_eq!(projection.control, StackControl::INVOKE_ON_ERROR);
+        assert_eq!(projection.parameters, current.parameters);
+        assert_eq!((projection.stack_location, projection.stack_count), (0, 1));
+
+        record.current_location = 1;
+        assert_eq!(
+            IrpProjection::from_record(&record),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
     }
 
     #[test]
@@ -1737,9 +1975,12 @@ mod tests {
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct RecordedDispatch {
         driver_id: DriverId,
+        projection_driver_id: DriverId,
         client_id: ClientId,
         device_id: DeviceId,
         file_id: Option<FileId>,
+        stack_location: u8,
+        stack_count: u8,
         major: u8,
         user_data: u64,
         requestor_tid: u64,
@@ -1765,9 +2006,12 @@ mod tests {
         ) -> Result<DispatchOutcome, NtStatus> {
             self.seen.borrow_mut().push(RecordedDispatch {
                 driver_id: ctx.driver_id,
+                projection_driver_id: irp.driver_id,
                 client_id: ctx.client_id,
                 device_id: irp.device_id,
                 file_id: irp.file_id,
+                stack_location: irp.stack_location,
+                stack_count: irp.stack_count,
                 major: irp.major,
                 user_data: irp.user_data,
                 requestor_tid: irp.requestor_tid,
@@ -1818,6 +2062,77 @@ mod tests {
             dispatch,
         ));
         (driver, seen)
+    }
+
+    #[derive(Default)]
+    struct PendingStackState {
+        seen: std::vec::Vec<(DriverId, DeviceId, u8, u8, IrpId)>,
+        cancelled: std::vec::Vec<IrpId>,
+        acknowledged: std::vec::Vec<IrpId>,
+        ready: std::vec::Vec<DriverCompletion>,
+    }
+
+    struct PendingStackBackend {
+        state: std::rc::Rc<std::cell::RefCell<PendingStackState>>,
+    }
+
+    impl DriverDispatchBackend for PendingStackBackend {
+        fn dispatch_irp(
+            &mut self,
+            ctx: DispatchContext<'_>,
+            irp: &IrpProjection,
+        ) -> Result<DispatchOutcome, NtStatus> {
+            assert_eq!(ctx.driver_id, irp.driver_id);
+            self.state.borrow_mut().seen.push((
+                irp.driver_id,
+                irp.device_id,
+                irp.stack_location,
+                irp.stack_count,
+                irp.irp_id,
+            ));
+            Ok(DispatchOutcome::Pending)
+        }
+
+        fn cancel_irp(&mut self, irp_id: IrpId) -> Result<(), NtStatus> {
+            let mut state = self.state.borrow_mut();
+            state.cancelled.push(irp_id);
+            state.ready.push(DriverCompletion {
+                irp_id,
+                status: NtStatus::CANCELLED,
+                information: 0,
+                file_context: None,
+            });
+            Ok(())
+        }
+
+        fn poll_completion(&mut self) -> Option<DriverCompletion> {
+            self.state.borrow_mut().ready.pop()
+        }
+
+        fn acknowledge_completion(&mut self, irp_id: IrpId) -> Result<(), NtStatus> {
+            self.state.borrow_mut().acknowledged.push(irp_id);
+            Ok(())
+        }
+    }
+
+    fn pending_stack_driver(
+        om: &mut IoManager<MockObjectPort>,
+        driver_path: &str,
+    ) -> (DriverId, std::rc::Rc<std::cell::RefCell<PendingStackState>>) {
+        let state = std::rc::Rc::new(std::cell::RefCell::new(PendingStackState::default()));
+        let backend = om.register_backend(Box::new(PendingStackBackend {
+            state: state.clone(),
+        }));
+        let target = DispatchTarget::DriverPeer(DriverPeerId(backend as u64));
+        let mut dispatch = MajorFunctionTable::new();
+        dispatch.set_all(target);
+        let driver = om.register_driver(DriverRecord::new(
+            ObjectId::NULL,
+            path(driver_path),
+            DriverBackendId(backend as u64),
+            dispatch,
+        ));
+        (driver, state)
     }
 
     #[test]
@@ -1872,9 +2187,12 @@ mod tests {
             seen[0],
             RecordedDispatch {
                 driver_id: driver,
+                projection_driver_id: driver,
                 client_id: ClientId(44),
                 device_id: device,
                 file_id: None,
+                stack_location: 0,
+                stack_count: 1,
                 major: major::IRP_MJ_SET_INFORMATION,
                 user_data: 0xABCD,
                 requestor_tid: 77,
@@ -1884,6 +2202,278 @@ mod tests {
                 buffer: b"input".to_vec(),
             }
         );
+    }
+
+    #[test]
+    fn attached_stack_routes_file_and_external_requests_to_the_live_top() {
+        let mut om = io();
+        let (lower_driver, lower_seen) =
+            external_recording_driver(&mut om, "\\Driver\\StackLower", NtStatus::SUCCESS, 0, &[]);
+        let (middle_driver, middle_seen) =
+            external_recording_driver(&mut om, "\\Driver\\StackMiddle", NtStatus::SUCCESS, 0, &[]);
+        let (top_driver, top_seen) =
+            external_recording_driver(&mut om, "\\Driver\\StackTop", NtStatus::SUCCESS, 0, &[]);
+        let lower = om
+            .create_device(
+                lower_driver,
+                Some(&path("\\Device\\StackLower")),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let middle = om
+            .create_device(
+                middle_driver,
+                None,
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let top = om
+            .create_device(
+                top_driver,
+                None,
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let client = om.register_client();
+        let handle = om
+            .open(
+                client,
+                &path("\\Device\\StackLower"),
+                AccessMask::GENERIC_READ | AccessMask::GENERIC_WRITE,
+                ShareAccess::READ | ShareAccess::WRITE,
+                CreateOptions::empty(),
+                0,
+            )
+            .unwrap();
+        let file = om
+            .reference_open_file(client, handle, AccessMask::empty())
+            .unwrap()
+            .0;
+        assert_eq!(om.related_device_for_file(file), Ok(lower));
+
+        assert_eq!(om.attach_device_to_stack(middle, lower), Ok(lower));
+        assert_eq!(om.attach_device_to_stack(top, lower), Ok(middle));
+        assert_eq!(om.related_device_for_file(file), Ok(top));
+        assert_eq!(om.top_of_device_stack(lower), Ok(top));
+
+        let mut truncated = om
+            .build_irp_record(
+                client,
+                lower_driver,
+                lower,
+                None,
+                major::IRP_MJ_READ,
+                IoParameters::Unsupported,
+            )
+            .unwrap();
+        assert_eq!(truncated.stack.pop().unwrap().device_id, lower);
+        assert_eq!(om.allocate_irp(truncated), Err(NtStatus::INVALID_PARAMETER));
+        let mut mixed_origin = om
+            .build_irp_record(
+                client,
+                lower_driver,
+                lower,
+                None,
+                major::IRP_MJ_READ,
+                IoParameters::Unsupported,
+            )
+            .unwrap();
+        mixed_origin.stack[0].major = major::IRP_MJ_WRITE;
+        assert_eq!(
+            om.allocate_irp(mixed_origin),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+
+        let mut read = [0u8; 4];
+        assert_eq!(om.read(client, handle, 0, &mut read), Ok(0));
+        assert_eq!(om.write(client, handle, 0, b"data"), Ok(0));
+        assert_eq!(om.flush(client, handle), Ok(()));
+        let mut external = [];
+        assert_eq!(
+            om.build_and_dispatch_external_to_device(
+                client,
+                lower,
+                None,
+                0,
+                42,
+                major::IRP_MJ_SET_INFORMATION,
+                IoParameters::SetInformation(InformationParameters {
+                    info_class: 4,
+                    length: 0,
+                }),
+                0,
+                0,
+                &mut external,
+            ),
+            Ok(ExternalDispatchResult::Completed {
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: None,
+            })
+        );
+        assert_eq!(om.close(client, handle), Ok(()));
+
+        assert_eq!(lower_seen.borrow().len(), 1);
+        assert_eq!(lower_seen.borrow()[0].major, major::IRP_MJ_CREATE);
+        assert!(middle_seen.borrow().is_empty());
+        let top_seen = top_seen.borrow();
+        let majors: std::vec::Vec<u8> = top_seen.iter().map(|entry| entry.major).collect();
+        assert_eq!(
+            majors,
+            [
+                major::IRP_MJ_READ,
+                major::IRP_MJ_WRITE,
+                major::IRP_MJ_FLUSH_BUFFERS,
+                major::IRP_MJ_SET_INFORMATION,
+                major::IRP_MJ_CLEANUP,
+                major::IRP_MJ_CLOSE,
+            ]
+        );
+        assert!(top_seen.iter().all(|entry| {
+            entry.driver_id == top_driver
+                && entry.projection_driver_id == top_driver
+                && entry.device_id == top
+                && entry.stack_location == 0
+                && entry.stack_count == 3
+        }));
+    }
+
+    #[test]
+    fn lower_stack_owner_exclusively_completes_cancels_and_acknowledges() {
+        let mut om = io();
+        let (lower_driver, lower_state) = pending_stack_driver(&mut om, "\\Driver\\AsyncLower");
+        let (middle_driver, middle_state) = pending_stack_driver(&mut om, "\\Driver\\AsyncMiddle");
+        let (top_driver, top_state) = pending_stack_driver(&mut om, "\\Driver\\AsyncTop");
+        let lower = om
+            .create_device(
+                lower_driver,
+                Some(&path("\\Device\\AsyncLower")),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let middle = om
+            .create_device(
+                middle_driver,
+                None,
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let top = om
+            .create_device(
+                top_driver,
+                None,
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        assert_eq!(om.attach_device_to_stack(middle, lower), Ok(lower));
+        assert_eq!(om.attach_device_to_stack(top, lower), Ok(middle));
+        let client = om.register_client();
+        let mut buffer = [0u8; 4];
+        let result = om
+            .build_and_dispatch_external_to_device(
+                client,
+                lower,
+                None,
+                0,
+                99,
+                major::IRP_MJ_DEVICE_CONTROL,
+                IoParameters::DeviceControl(DeviceControlParameters {
+                    ioctl_code: 0x222000,
+                    input_len: 4,
+                    output_len: 4,
+                }),
+                4,
+                4,
+                &mut buffer,
+            )
+            .unwrap();
+        let irp = match result {
+            ExternalDispatchResult::Pending { irp_id } => irp_id,
+            other => panic!("expected pending stack request, got {other:?}"),
+        };
+        assert_eq!(top_state.borrow().seen[0], (top_driver, top, 0, 3, irp));
+
+        let middle_frame =
+            IoStackLocation::new(middle_driver, major::IRP_MJ_DEVICE_CONTROL, middle, None);
+        assert_eq!(
+            om.handoff_irp_to_next_stack(irp, lower_driver, middle_frame.clone()),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        let skipped_frame =
+            IoStackLocation::new(lower_driver, major::IRP_MJ_DEVICE_CONTROL, lower, None);
+        assert_eq!(
+            om.handoff_irp_to_next_stack(irp, top_driver, skipped_frame),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        let mismatched_frame =
+            IoStackLocation::new(top_driver, major::IRP_MJ_DEVICE_CONTROL, middle, None);
+        assert_eq!(
+            om.handoff_irp_to_next_stack(irp, top_driver, mismatched_frame),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        assert_eq!(
+            om.handoff_irp_to_next_stack(irp, top_driver, middle_frame),
+            Ok((middle_driver, middle))
+        );
+        let lower_frame =
+            IoStackLocation::new(lower_driver, major::IRP_MJ_DEVICE_CONTROL, lower, None);
+        assert_eq!(
+            om.handoff_irp_to_next_stack(irp, middle_driver, lower_frame),
+            Ok((lower_driver, lower))
+        );
+        assert_eq!(
+            IrpProjection::from_record(om.irp(irp).unwrap())
+                .map(|projection| (projection.stack_location, projection.stack_count)),
+            Ok((2, 3))
+        );
+        assert_eq!(
+            om.dispatch_to_driver(lower_driver, irp, &mut buffer),
+            Ok(DispatchOutcome::Pending)
+        );
+        assert_eq!(
+            lower_state.borrow().seen[0],
+            (lower_driver, lower, 2, 3, irp)
+        );
+
+        om.cancel(client, irp).unwrap();
+        assert_eq!(lower_state.borrow().cancelled, [irp]);
+        assert!(middle_state.borrow().cancelled.is_empty());
+        assert!(top_state.borrow().cancelled.is_empty());
+        assert_eq!(om.pump(), 1);
+        let completed = om.completed_irp(irp).unwrap();
+        assert_eq!(
+            (completed.driver_id, completed.device_id),
+            (lower_driver, lower)
+        );
+        assert_eq!(
+            (
+                completed.completion_driver_id,
+                completed.completion_device_id
+            ),
+            (lower_driver, lower)
+        );
+        om.acknowledge_completed_irp(irp).unwrap();
+        assert_eq!(lower_state.borrow().acknowledged, [irp]);
+        assert!(middle_state.borrow().acknowledged.is_empty());
+        assert!(top_state.borrow().acknowledged.is_empty());
     }
 
     #[test]
@@ -2165,7 +2755,7 @@ mod tests {
         };
         let irp = om.irp(irp_id).unwrap();
         assert_eq!(irp.state, IrpState::Pending);
-        assert_eq!(irp.driver_id, driver);
+        assert_eq!(irp.origin_driver_id, driver);
         assert_eq!((irp.user_data, irp.requestor_tid), (0xCAFE, 99));
 
         om.cancel(client, irp_id).unwrap();
@@ -2181,7 +2771,7 @@ mod tests {
         let mut mock = MockDriverBackend::new();
         mock.set_force_pending(true);
         let (mut om, _client, irp) = pending_read(mock);
-        let owner = om.irp(irp).unwrap().driver_id;
+        let owner = om.irp(irp).unwrap().current_stack().unwrap().driver_id;
         let other = om
             .create_driver(
                 &path("\\Driver\\OtherCompletionSource"),
@@ -2530,10 +3120,12 @@ mod tests {
             Some(CompletedIrp {
                 id: irp,
                 client_id: om.irp(irp).unwrap().client_id,
-                driver_id: om.irp(irp).unwrap().driver_id,
+                driver_id: om.irp(irp).unwrap().origin_driver_id,
                 file_id: om.irp(irp).unwrap().file_id,
-                device_id: om.irp(irp).unwrap().device_id,
+                device_id: om.irp(irp).unwrap().origin_device_id,
                 major: major::IRP_MJ_READ,
+                completion_driver_id: om.irp(irp).unwrap().current_stack().unwrap().driver_id,
+                completion_device_id: om.irp(irp).unwrap().current_stack().unwrap().device_id,
                 user_data: 0,
                 requestor_tid: 0,
                 status: NtStatus::SUCCESS,

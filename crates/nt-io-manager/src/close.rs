@@ -13,7 +13,7 @@ use nt_types::{AccessMask, ClientId, HandleValue};
 
 use crate::dispatch::DispatchOutcome;
 use crate::file::FileState;
-use crate::irp::{IoParameters, IoStackLocation, IrpRecord, IrpState};
+use crate::irp::{IoParameters, IrpState};
 use crate::object_port::ObjectManagerPort;
 use crate::{FileId, IoManager, IrpId};
 
@@ -49,7 +49,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
                     .irps
                     .iter()
                     .find(|(_, irp)| {
-                        irp.file_id == Some(file_id) && crate::is_create_major(irp.major)
+                        irp.file_id == Some(file_id) && crate::is_create_major(irp.origin_major)
                     })
                     .map(|(irp_id, _)| irp_id);
                 let file = self.file_mut(file_id).expect("validated external File");
@@ -265,15 +265,18 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .device(device_id)
             .ok_or(NtStatus::INVALID_PARAMETER)?
             .driver_id;
-        let mut irp = IrpRecord::new(client, device_id, Some(file_id), major);
-        irp.driver_id = driver_id;
+        let mut irp = self.build_irp_record(
+            client,
+            driver_id,
+            device_id,
+            Some(file_id),
+            major,
+            parameters,
+        )?;
         irp.user_data = self
             .file(file_id)
             .and_then(|file| file.driver_context)
             .unwrap_or(0);
-        let mut stack = IoStackLocation::new(major, device_id, Some(file_id));
-        stack.parameters = parameters;
-        irp.stack.push(stack);
         let irp_id = self.allocate_irp(irp)?;
         self.irp_mut(irp_id)
             .expect("just allocated")
@@ -283,7 +286,13 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .transition(IrpState::Dispatched);
 
         let mut empty: [u8; 0] = [];
-        let outcome = self.dispatch_to_driver(driver_id, irp_id, &mut empty);
+        let current_driver_id = self
+            .irp(irp_id)
+            .ok_or(NtStatus::INVALID_PARAMETER)?
+            .current_stack()
+            .ok_or(NtStatus::INVALID_PARAMETER)?
+            .driver_id;
+        let outcome = self.dispatch_to_driver(current_driver_id, irp_id, &mut empty);
         if self
             .irp(irp_id)
             .is_none_or(|irp| irp.state != IrpState::Dispatched)
@@ -343,10 +352,12 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .map(|(id, _)| id)
             .collect();
         for id in irps {
-            if self
-                .irp(id)
-                .is_some_and(|irp| matches!(irp.major, major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE))
-            {
+            if self.irp(id).is_some_and(|irp| {
+                matches!(
+                    irp.origin_major,
+                    major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE
+                )
+            }) {
                 continue;
             }
             self.abandon_irp_delivery(client, id)?;

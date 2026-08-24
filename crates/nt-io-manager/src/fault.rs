@@ -34,7 +34,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .irps
             .iter()
             .filter(|(_, i)| {
-                i.driver_id == driver
+                i.current_stack()
+                    .map(|stack| stack.driver_id == driver)
+                    .unwrap_or(false)
                     && matches!(
                         i.state,
                         IrpState::Dispatched | IrpState::Pending | IrpState::CancelRequested

@@ -24,7 +24,7 @@ pub use wire::{
 };
 
 /// ABI version of this wire contract; bumped on any incompatible change.
-pub const IO_ABI_VERSION: u32 = 2;
+pub const IO_ABI_VERSION: u32 = 3;
 
 /// Generation bits in an I/O id (spec §9: high 24 gen / low 40 slot).
 pub const IO_ID_GEN_BITS: u32 = 24;
@@ -175,5 +175,21 @@ mod tests {
         let bytes = bytemuck::bytes_of(&req);
         let back: IoOpenRequest = bytemuck::pod_read_unaligned(bytes);
         assert_eq!(req, back);
+
+        let irp = IrpDispatchRequest {
+            abi_size: core::mem::size_of::<IrpDispatchRequest>() as u16,
+            major: major::IRP_MJ_PNP,
+            minor: 7,
+            flags: 0x82_01,
+            irp_id: 0x100,
+            driver_id: 0x200,
+            device_id: 0x300,
+            stack_location: 1,
+            stack_count: 3,
+            ..Default::default()
+        };
+        let bytes = bytemuck::bytes_of(&irp);
+        let back: IrpDispatchRequest = bytemuck::pod_read_unaligned(bytes);
+        assert_eq!(irp, back);
     }
 }
