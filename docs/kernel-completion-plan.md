@@ -11060,6 +11060,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `IoGetRelatedDeviceObject` through the canonical File/device stack before deleting the old
     shared-slot and partial-attach machinery.
 
+    Hosted peer-envelope ABI foundation (2026-08-24): I/O ABI version 4 extends the fixed
+    `IrpDispatchRequest` packet with target domain/cookie and optional provider domain/cookie. The
+    existing canonical IRP/Driver/Device/File ids, active stack index/count, and packed
+    Flags/Control now travel in the same 144-byte pointer-free packet. `DriverPeerBackend` requires
+    an explicit non-null target identity and rejects incomplete provider routes; it has no default
+    domain. The isolated `ntos-driver-host` peer rejects structurally malformed routes, while its
+    I/O side allocates the route from the canonical manager rather than a fixture constant. Tests
+    inspect the emitted packet and prove exact target/provider identities. Validation is green for
+    `nt-io-manager` (`185/185`), `nt-io-abi` (`5/5`), and a freestanding release check of the
+    standalone driver-host component.
+
+    Review adjustment: the reusable peer ABI is closed, but the production executive still uses a
+    separate scattered request layout and therefore does not yet satisfy this checkpoint. Move the
+    same typed packet into the hosted component data window, bind each reusable instance slot to a
+    fresh manager-owned domain generation, and validate the packet's effective dispatch domain
+    against `instance_for_pump_channel`. Remove the `SH_REQ_OWNER_INSTANCE == SH_REQ_INFO` alias in
+    that change. Only after that should raw device/PDO/File projections migrate to the domain
+    registry.
+
     After that boundary is live, migrate the standalone hal, power, PnP, async, MMIO, and DMA
     component harnesses to `CompletionOwnerClaim` plus `CompletionUnwindCursor`, including their
     direct attach/lower-call shims. Reconcile the separate `driver-host-direg` and `nt-driver-host`

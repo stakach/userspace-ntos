@@ -811,6 +811,18 @@ mod tests {
         IoManager::new(MockObjectPort::new())
     }
 
+    fn peer_backend(
+        om: &mut IoManager<MockObjectPort>,
+        control: &MockPeerControl,
+    ) -> (DriverPeerBackend<MockDriverPeer>, HostedDomainIdentity) {
+        let domain = om.register_hosted_domain();
+        let identity = om.hosted_domain_identity(domain).unwrap();
+        (
+            DriverPeerBackend::new(control.transport(), identity, None).unwrap(),
+            identity,
+        )
+    }
+
     fn a_driver(om: &mut IoManager<MockObjectPort>) -> DriverId {
         om.register_driver(DriverRecord::new(
             ObjectId::NULL,
@@ -3984,14 +3996,17 @@ mod tests {
     fn peer_device(
         control: &MockPeerControl,
         access: AccessMask,
-    ) -> (IoManager<MockObjectPort>, ClientId, HandleValue) {
+    ) -> (
+        IoManager<MockObjectPort>,
+        ClientId,
+        HandleValue,
+        HostedDomainIdentity,
+    ) {
         let mut om = io();
         let client = om.register_client();
+        let (backend, identity) = peer_backend(&mut om, control);
         let driver = om
-            .create_driver_peer(
-                &path("\\Driver\\Peer"),
-                Box::new(DriverPeerBackend::new(control.transport())),
-            )
+            .create_driver_peer(&path("\\Driver\\Peer"), Box::new(backend))
             .unwrap();
         om.create_device(
             driver,
@@ -4012,13 +4027,73 @@ mod tests {
                 0,
             )
             .unwrap();
-        (om, client, handle)
+        (om, client, handle, identity)
+    }
+
+    #[test]
+    fn peer_dispatch_route_is_complete_and_rejects_invalid_identities() {
+        let control = MockPeerControl::new();
+        assert!(matches!(
+            DriverPeerBackend::new(
+                control.transport(),
+                HostedDomainIdentity {
+                    domain_id: HostedDomainId::NULL,
+                    cookie: 1,
+                },
+                None,
+            ),
+            Err(NtStatus::INVALID_PARAMETER)
+        ));
+        assert!(matches!(
+            DriverPeerBackend::new(
+                control.transport(),
+                HostedDomainIdentity {
+                    domain_id: HostedDomainId::new(1, 1),
+                    cookie: 1,
+                },
+                Some(HostedProviderIdentity {
+                    domain_id: HostedDomainId::new(1, 2),
+                    cookie: 0,
+                }),
+            ),
+            Err(NtStatus::INVALID_PARAMETER)
+        ));
+
+        let mut om = io();
+        let client = om.register_client();
+        let target_domain = om.register_hosted_domain();
+        let provider_domain = om.register_hosted_domain();
+        om.set_hosted_domain_provider(target_domain, provider_domain, 0x55aa)
+            .unwrap();
+        let target = om.hosted_domain_identity(target_domain).unwrap();
+        let provider = om.hosted_provider_identity(target_domain).unwrap();
+        let backend = DriverPeerBackend::new(control.transport(), target, Some(provider)).unwrap();
+        let driver = om
+            .create_driver_peer(&path("\\Driver\\PeerRoute"), Box::new(backend))
+            .unwrap();
+        om.create_device(
+            driver,
+            Some(&path("\\Device\\PeerRoute")),
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        )
+        .unwrap();
+        open_read(&mut om, client, "\\Device\\PeerRoute").unwrap();
+
+        let request = control.last_request().unwrap();
+        assert_eq!(request.target_domain_id, target.domain_id.raw());
+        assert_eq!(request.target_domain_cookie, target.cookie);
+        assert_eq!(request.provider_domain_id, provider.domain_id.raw());
+        assert_eq!(request.provider_cookie, provider.cookie);
+        assert!(request.has_well_formed_domain_route());
     }
 
     #[test]
     fn peer_sync_read_write_ioctl() {
         let ctrl = MockPeerControl::new();
-        let (mut om, client, handle) =
+        let (mut om, client, handle, identity) =
             peer_device(&ctrl, AccessMask::GENERIC_READ | AccessMask::GENERIC_WRITE);
 
         // write -> read loopback through the peer protocol
@@ -4036,12 +4111,20 @@ mod tests {
             .unwrap();
         assert_eq!(&io_out[..n as usize], b"ping");
         assert_eq!(om.irp_count(), 0);
+        let request = ctrl.last_request().unwrap();
+        assert_eq!(request.target_domain_id, identity.domain_id.raw());
+        assert_eq!(request.target_domain_cookie, identity.cookie);
+        assert_eq!(
+            (request.provider_domain_id, request.provider_cookie),
+            (0, 0)
+        );
+        assert!(request.has_well_formed_domain_route());
     }
 
     #[test]
     fn peer_direct_and_neither_ioctls_round_trip_split_buffers() {
         let ctrl = MockPeerControl::new();
-        let (mut om, client, handle) =
+        let (mut om, client, handle, _identity) =
             peer_device(&ctrl, AccessMask::GENERIC_READ | AccessMask::GENERIC_WRITE);
         for method in [
             ioctl::METHOD_IN_DIRECT,
@@ -4064,11 +4147,9 @@ mod tests {
         ctrl.set_create_status(NtStatus::ACCESS_DENIED);
         let mut om = io();
         let client = om.register_client();
+        let (backend, _identity) = peer_backend(&mut om, &ctrl);
         let driver = om
-            .create_driver_peer(
-                &path("\\Driver\\Peer"),
-                Box::new(DriverPeerBackend::new(ctrl.transport())),
-            )
+            .create_driver_peer(&path("\\Driver\\Peer"), Box::new(backend))
             .unwrap();
         om.create_device(
             driver,
@@ -4093,7 +4174,7 @@ mod tests {
             let ctrl = MockPeerControl::new();
             ctrl.set_force_pending(true);
             ctrl.set_pending_completion(NtStatus::SUCCESS, 4);
-            let (mut om, client, handle) = peer_device(&ctrl, AccessMask::GENERIC_READ);
+            let (mut om, client, handle, _identity) = peer_device(&ctrl, AccessMask::GENERIC_READ);
             let mut out = [0u8; 8];
             assert_eq!(om.read(client, handle, 0, &mut out), Err(NtStatus::PENDING));
             let irp = om.pending_irps()[0];
@@ -4106,7 +4187,7 @@ mod tests {
         {
             let ctrl = MockPeerControl::new();
             ctrl.set_force_pending(true);
-            let (mut om, client, handle) = peer_device(&ctrl, AccessMask::GENERIC_READ);
+            let (mut om, client, handle, _identity) = peer_device(&ctrl, AccessMask::GENERIC_READ);
             let mut out = [0u8; 8];
             let _ = om.read(client, handle, 0, &mut out);
             let irp = om.pending_irps()[0];
@@ -4126,11 +4207,9 @@ mod tests {
         let client = om.register_client();
 
         // A peer driver + device.
+        let (backend, _identity) = peer_backend(&mut om, &peer);
         let pdrv = om
-            .create_driver_peer(
-                &path("\\Driver\\Peer"),
-                Box::new(DriverPeerBackend::new(peer.transport())),
-            )
+            .create_driver_peer(&path("\\Driver\\Peer"), Box::new(backend))
             .unwrap();
         let pdev = om
             .create_device(

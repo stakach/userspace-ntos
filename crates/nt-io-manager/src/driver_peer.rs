@@ -18,7 +18,7 @@ use nt_status::NtStatus;
 use crate::dispatch::{
     DispatchContext, DispatchOutcome, DriverCompletion, DriverDispatchBackend, IrpProjection,
 };
-use crate::IrpId;
+use crate::{HostedDomainIdentity, HostedProviderIdentity, IrpId};
 
 /// The transport to a driver peer: dispatch/cancel, poll reverse-ring
 /// completions, report faults (spec §16.1–16.2).
@@ -73,6 +73,8 @@ fn segment(cursor: &mut u32, len: usize) -> Result<(u32, u32), NtStatus> {
 fn build_dispatch_request(
     irp: &IrpProjection,
     ctx: &DispatchContext<'_>,
+    target: HostedDomainIdentity,
+    provider: Option<HostedProviderIdentity>,
 ) -> Result<IrpDispatchRequest, NtStatus> {
     let mut cursor = u32::try_from(core::mem::size_of::<IrpDispatchRequest>())
         .map_err(|_| NtStatus::INVALID_PARAMETER)?;
@@ -104,6 +106,12 @@ fn build_dispatch_request(
         major: irp.major,
         minor: irp.minor,
         flags: irp.flags.bits() as u32 | ((irp.control.bits() as u32) << 8),
+        target_domain_id: target.domain_id.raw(),
+        target_domain_cookie: target.cookie,
+        provider_domain_id: provider
+            .map(|identity| identity.domain_id.raw())
+            .unwrap_or(0),
+        provider_cookie: provider.map(|identity| identity.cookie).unwrap_or(0),
         irp_id: irp.irp_id.0,
         driver_id: irp.driver_id.0,
         device_id: irp.device_id.0,
@@ -130,11 +138,27 @@ fn build_dispatch_request(
 /// A `DriverDispatchBackend` that dispatches to an isolated driver peer over `T`.
 pub struct DriverPeerBackend<T> {
     transport: T,
+    target: HostedDomainIdentity,
+    provider: Option<HostedProviderIdentity>,
 }
 
 impl<T: DriverPeerTransport> DriverPeerBackend<T> {
-    pub fn new(transport: T) -> Self {
-        Self { transport }
+    pub fn new(
+        transport: T,
+        target: HostedDomainIdentity,
+        provider: Option<HostedProviderIdentity>,
+    ) -> Result<Self, NtStatus> {
+        if target.domain_id.is_null() || target.cookie == 0 {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        if provider.is_some_and(|identity| identity.domain_id.is_null() || identity.cookie == 0) {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(Self {
+            transport,
+            target,
+            provider,
+        })
     }
     pub fn transport(&self) -> &T {
         &self.transport
@@ -155,7 +179,7 @@ impl<T: DriverPeerTransport> DriverDispatchBackend for DriverPeerBackend<T> {
                 status: NtStatus::DEVICE_NOT_CONNECTED,
             });
         }
-        let request = build_dispatch_request(irp, &ctx)?;
+        let request = build_dispatch_request(irp, &ctx, self.target, self.provider)?;
         Ok(self.transport.dispatch(
             &request,
             PeerTransferBuffers {
@@ -196,6 +220,7 @@ struct PeerState {
     faulted: bool,
     written: Vec<u8>,
     ready: Vec<DriverCompletion>,
+    last_request: Option<IrpDispatchRequest>,
 }
 
 /// A shared handle to a mock peer's configuration + observed state.
@@ -240,6 +265,9 @@ impl MockPeerControl {
     pub fn written(&self) -> Vec<u8> {
         self.state.borrow().written.clone()
     }
+    pub fn last_request(&self) -> Option<IrpDispatchRequest> {
+        self.state.borrow().last_request
+    }
 }
 
 /// A mock driver-peer transport, obtained from [`MockPeerControl::transport`].
@@ -254,9 +282,15 @@ impl DriverPeerTransport for MockDriverPeer {
         mut buffers: PeerTransferBuffers<'_>,
     ) -> DispatchOutcome {
         let mut s = self.state.borrow_mut();
+        s.last_request = Some(*request);
         if s.faulted {
             return DispatchOutcome::Failed {
                 status: NtStatus::DEVICE_NOT_CONNECTED,
+            };
+        }
+        if !request.has_well_formed_domain_route() {
+            return DispatchOutcome::Failed {
+                status: NtStatus::INVALID_PARAMETER,
             };
         }
         let is_data = matches!(

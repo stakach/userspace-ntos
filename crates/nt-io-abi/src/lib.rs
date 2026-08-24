@@ -24,7 +24,7 @@ pub use wire::{
 };
 
 /// ABI version of this wire contract; bumped on any incompatible change.
-pub const IO_ABI_VERSION: u32 = 3;
+pub const IO_ABI_VERSION: u32 = 4;
 
 /// Generation bits in an I/O id (spec §9: high 24 gen / low 40 slot).
 pub const IO_ID_GEN_BITS: u32 = 24;
@@ -186,6 +186,10 @@ mod tests {
             major: major::IRP_MJ_PNP,
             minor: 7,
             flags: 0x82_01,
+            target_domain_id: HostedDomainId::new(2, 4).raw(),
+            target_domain_cookie: 0x44,
+            provider_domain_id: HostedDomainId::new(3, 5).raw(),
+            provider_cookie: 0x55,
             irp_id: 0x100,
             driver_id: 0x200,
             device_id: 0x300,

@@ -88,6 +88,10 @@ pub struct IrpDispatchRequest {
     pub major: u8,
     pub minor: u8,
     pub flags: u32,
+    pub target_domain_id: u64,
+    pub target_domain_cookie: u64,
+    pub provider_domain_id: u64,
+    pub provider_cookie: u64,
     pub irp_id: u64,
     pub driver_id: u64,
     pub device_id: u64,
@@ -108,6 +112,16 @@ pub struct IrpDispatchRequest {
     pub parameter_len: u32,
     pub stack_location: u32,
     pub stack_count: u32,
+}
+
+impl IrpDispatchRequest {
+    /// Structural validation only. The receiving kernel service must additionally compare these
+    /// identities with the server-owned transport channel and its live domain registry.
+    pub const fn has_well_formed_domain_route(&self) -> bool {
+        self.target_domain_id != 0
+            && self.target_domain_cookie != 0
+            && ((self.provider_domain_id == 0) == (self.provider_cookie == 0))
+    }
 }
 
 /// A generic I/O completion (spec §19). Mirrors the SURT CQE fields: `status` is
@@ -133,7 +147,7 @@ const _: () = {
     assert!(size_of::<IoDeviceControlRequest>() == 56);
     assert!(size_of::<IoFileRequest>() == 16);
     assert!(size_of::<IoCancelRequest>() == 16);
-    assert!(size_of::<IrpDispatchRequest>() == 112);
+    assert!(size_of::<IrpDispatchRequest>() == 144);
     assert!(size_of::<IoReply>() == 32);
     assert!(align_of::<IoReadWriteRequest>() == 8);
     assert!(align_of::<IrpDispatchRequest>() == 8);
