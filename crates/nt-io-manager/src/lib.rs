@@ -33,6 +33,7 @@ mod driver_peer;
 mod external_dispatch;
 mod fault;
 mod file;
+mod hosted_domain;
 mod irp;
 mod mock_driver;
 mod object_port;
@@ -75,6 +76,7 @@ pub use driver_peer::{
 };
 pub use external_dispatch::ExternalDispatchResult;
 pub use file::{CreateOptions, FileFlags, FileRecord, FileState, ShareAccess};
+pub use hosted_domain::{HostedDomainIdentity, HostedDomainRecord, HostedProviderIdentity};
 pub use irp::{
     BufferAccess, CancelState, CreateParameters, DeviceControlParameters, InformationParameters,
     IoBufferRef, IoParameters, IoStackLocation, IrpRecord, IrpState, ReadWriteParameters,
@@ -123,7 +125,7 @@ pub use object_port::ObjectManagerLibraryPort;
 // Re-export the canonical id types + Driver Host projections from one place.
 pub use nt_io_abi::{
     DeviceId, DeviceObjectProjection, DriverId, DriverObjectProjection, FileId,
-    FileObjectProjection, IoRequestId, IrpId,
+    FileObjectProjection, HostedDomainId, IoRequestId, IrpId,
 };
 
 #[inline]
@@ -145,6 +147,7 @@ pub struct IoManager<P> {
     devices: GenStore<DeviceId, DeviceRecord>,
     files: GenStore<FileId, FileRecord>,
     irps: GenStore<IrpId, IrpRecord>,
+    hosted_domains: GenStore<HostedDomainId, HostedDomainRecord>,
     completed_irps: VecDeque<IrpId>,
     manager_owned_irps: Vec<IrpId>,
     cancel_dispatch_retries: Vec<IrpId>,
@@ -163,6 +166,7 @@ impl<P> IoManager<P> {
             devices: GenStore::new(),
             files: GenStore::new(),
             irps: GenStore::new(),
+            hosted_domains: GenStore::new(),
             completed_irps: VecDeque::new(),
             manager_owned_irps: Vec::new(),
             cancel_dispatch_retries: Vec::new(),

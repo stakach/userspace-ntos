@@ -108,6 +108,10 @@ io_id! {
     IrpId
 }
 io_id! {
+    /// Generation-protected identity for one isolated hosted-driver address domain.
+    HostedDomainId
+}
+io_id! {
     /// A client-facing I/O request id (correlates a submission + completion).
     IoRequestId
 }
@@ -125,6 +129,7 @@ mod tests {
         assert_eq!(id.slot(), 0x00FF_1234_5678 & SLOT_MASK);
         assert!(!id.is_null());
         assert!(DeviceId::NULL.is_null());
+        assert!(HostedDomainId::NULL.is_null());
         // Distinct newtypes with the same bit pattern are not interchangeable.
         assert_eq!(DriverId::new(3, 7).raw(), FileId::new(3, 7).raw());
     }

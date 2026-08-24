@@ -8,7 +8,7 @@
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
-use nt_io_abi::{DeviceId, DriverId, FileId, IoRequestId, IrpId, IO_ID_GEN_BITS};
+use nt_io_abi::{DeviceId, DriverId, FileId, HostedDomainId, IoRequestId, IrpId, IO_ID_GEN_BITS};
 
 const GEN_MASK: u32 = (1u32 << IO_ID_GEN_BITS) - 1;
 
@@ -48,7 +48,14 @@ macro_rules! impl_io_id {
     };
 }
 
-impl_io_id!(DriverId, DeviceId, FileId, IrpId, IoRequestId);
+impl_io_id!(
+    DriverId,
+    DeviceId,
+    FileId,
+    IrpId,
+    HostedDomainId,
+    IoRequestId
+);
 
 struct Slot<T> {
     generation: u32,

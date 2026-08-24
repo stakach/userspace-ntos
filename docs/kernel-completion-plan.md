@@ -11040,6 +11040,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     direct raw root-PDO path, partial-known attach success, singular per-driver device field, and
     shared request-slot alias in the same checkpoint; no compatibility fallback may remain.
 
+    Hosted-domain identity foundation (2026-08-24): `nt-io-abi` now defines a fixed-width,
+    generation-protected `HostedDomainId`, and the canonical I/O Manager owns the corresponding
+    lifetime registry. Each live domain has an independent freshness cookie and one-to-one
+    `(domain, address)` bindings for canonical Driver, Device, and File ids. Identical WDM pointer
+    values may exist in different address spaces without collision. Zero addresses, unknown or
+    stale canonical ids, stale domain generations, address/id rebinding, missing providers, zero
+    provider cookies, and removed provider domains all fail closed. Provider-domain ids and provider
+    export cookies remain separate identities rather than overloading an executive instance index
+    or client-supplied badge. Focused validation is green for `nt-io-manager` (`184/184`) and
+    `nt-io-abi` (`5/5`).
+
+    Review adjustment: the crate-owned domain lifetime and pointer registry is closed. The next
+    slice is the fixed hosted-I/O envelope and its authenticated transport binding. Bump the ABI in
+    lockstep, carry target domain/cookie, provider domain/cookie, canonical IRP/Driver/Device/File
+    ids, and active stack index/count as one packet, and verify it against the server-owned pump
+    channel before dispatch. Do not derive authority from reusable instance indices or accept an
+    envelope-selected domain. Then replace the executive's global raw binding lookups and implement
+    `IoGetRelatedDeviceObject` through the canonical File/device stack before deleting the old
+    shared-slot and partial-attach machinery.
+
     After that boundary is live, migrate the standalone hal, power, PnP, async, MMIO, and DMA
     component harnesses to `CompletionOwnerClaim` plus `CompletionUnwindCursor`, including their
     direct attach/lower-call shims. Reconcile the separate `driver-host-direg` and `nt-driver-host`
