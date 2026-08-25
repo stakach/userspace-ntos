@@ -3,7 +3,8 @@
 //! Encodes each call into the [`nt_config_abi`] wire form, hands it to a pluggable
 //! [`Backend`] (SURT rings on the kernel; in-process in tests), and decodes the
 //! [`CmReply`]. Supports path-addressed keys plus DWORD and raw typed values. Mirrors
-//! `nt-object-client`.
+//! `nt-object-client`, with semantic devnode property queries that preserve required
+//! output length across the shared-frame transport.
 
 #![no_std]
 
@@ -12,7 +13,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use nt_config_abi::{
-    opcode, CmEnumerateKeyRequest, CmKeyRequest, CmRawValueRequest, CmReply, CmValueRequest,
+    opcode, CmDevicePropertyRequest, CmEnumerateKeyRequest, CmKeyRequest, CmRawValueRequest,
+    CmReply, CmValueRequest, CM_ABI_VERSION, CM_MAX_INSTANCE_UNITS,
 };
 
 /// A pluggable transport: send `opcode` + `in_buf`, receive a `CmReply` (+ optional
@@ -22,6 +24,13 @@ pub trait Backend {
 }
 
 const STATUS_SUCCESS: i32 = 0;
+const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct QueryError {
+    pub status: i32,
+    pub required_len: usize,
+}
 
 fn utf16_bytes(s: &str) -> Vec<u8> {
     let mut v = Vec::with_capacity(s.len() * 2);
@@ -128,6 +137,69 @@ impl<B: Backend> ConfigClient<B> {
         }
     }
 
+    /// Query a legacy device property by stable devnode instance path. Errors retain the exact
+    /// required length so native `IoGetDeviceProperty` callers can report and retry correctly.
+    pub fn query_device_property(
+        &mut self,
+        instance: &str,
+        property: u32,
+        out: &mut [u8],
+    ) -> Result<usize, QueryError> {
+        let instance_bytes = utf16_bytes(instance);
+        if instance_bytes.is_empty()
+            || instance_bytes.len() > CM_MAX_INSTANCE_UNITS * 2
+            || instance.chars().any(|ch| ch == '\0')
+        {
+            return Err(QueryError {
+                status: STATUS_INVALID_PARAMETER,
+                required_len: 0,
+            });
+        }
+        let Ok(output_capacity) = u32::try_from(out.len()) else {
+            return Err(QueryError {
+                status: STATUS_INVALID_PARAMETER,
+                required_len: 0,
+            });
+        };
+        let header_size = core::mem::size_of::<CmDevicePropertyRequest>();
+        let header = CmDevicePropertyRequest {
+            abi_size: header_size as u16,
+            abi_version: CM_ABI_VERSION,
+            property,
+            output_capacity,
+            instance_offset: header_size as u32,
+            instance_len_bytes: instance_bytes.len() as u32,
+        };
+        let mut request = Vec::with_capacity(header_size + instance_bytes.len());
+        request.extend_from_slice(header.as_bytes());
+        request.extend_from_slice(&instance_bytes);
+
+        // SURT copies `information` bytes from its shared reply frame even on failure. Keep that
+        // transport behavior away from the caller and publish bytes only after semantic success.
+        let mut reply_bytes = Vec::new();
+        reply_bytes.resize(out.len(), 0);
+        let response = self.backend.call(
+            opcode::CM_OP_QUERY_DEVICE_PROPERTY,
+            &request,
+            &mut reply_bytes,
+        );
+        if response.status != STATUS_SUCCESS {
+            return Err(QueryError {
+                status: response.status,
+                required_len: response.information as usize,
+            });
+        }
+        let written = response.information as usize;
+        if written > out.len() || written > reply_bytes.len() {
+            return Err(QueryError {
+                status: STATUS_INVALID_PARAMETER,
+                required_len: written,
+            });
+        }
+        out[..written].copy_from_slice(&reply_bytes[..written]);
+        Ok(written)
+    }
+
     fn key_op(&mut self, op: u16, path: &str) -> CmReply {
         let path_bytes = utf16_bytes(path);
         let hdr = CmKeyRequest {
@@ -216,13 +288,29 @@ mod tests {
     use alloc::format;
     use alloc::string::String;
     use nt_config_manager::{
-        encode_sz, ConfigManager, SERVICE_AUTO_START, SERVICE_WIN32_SHARE_PROCESS,
+        device_property, encode_sz, ConfigManager, ENUM_PATH, SERVICE_AUTO_START,
+        SERVICE_WIN32_SHARE_PROCESS,
     };
     use nt_config_server::CmServer;
 
     /// In-process backend: dispatch straight into the server (no ring).
     struct Direct {
         server: CmServer,
+    }
+
+    /// Model the integrated service: dispatch into a whole page even when the final caller's slice
+    /// is smaller, then copy completion bytes exactly as `RingChannel` does.
+    struct Framed {
+        server: CmServer,
+    }
+    impl Backend for Framed {
+        fn call(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8]) -> CmReply {
+            let mut frame = [0u8; 4096];
+            let reply = self.server.dispatch(opcode, in_buf, &mut frame);
+            let copy_len = core::cmp::min(reply.information as usize, out_buf.len());
+            out_buf[..copy_len].copy_from_slice(&frame[..copy_len]);
+            reply
+        }
     }
     impl Backend for Direct {
         fn call(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8]) -> CmReply {
@@ -333,5 +421,95 @@ mod tests {
         assert!(c
             .query_dword(r"\Registry\Machine\Empty", "Missing")
             .is_err());
+    }
+
+    fn device_property_server() -> CmServer {
+        let mut cm = ConfigManager::new();
+        let instance = r"PCI\VEN_8086&DEV_100E\0001";
+        let key = cm
+            .registry_mut()
+            .create_key(&format!(r"{}\{}", ENUM_PATH, instance));
+        cm.registry_mut()
+            .set_string(key, "PdoName", r"\Device\NTPNP_PCI0001");
+        cm.registry_mut()
+            .set_string(key, "FriendlyName", "Intel Test Adapter");
+        CmServer::with_config(cm)
+    }
+
+    #[test]
+    fn device_property_query_roundtrip_preserves_semantics() {
+        let mut client = client_with_server(device_property_server());
+        let mut out = [0u8; 128];
+        let written = client
+            .query_device_property(
+                r"pci\ven_8086&dev_100e\0001",
+                device_property::FRIENDLY_NAME,
+                &mut out,
+            )
+            .unwrap();
+        let expected = encode_sz("Intel Test Adapter");
+        assert_eq!(written, expected.len());
+        assert_eq!(&out[..written], expected.as_slice());
+
+        let external = client
+            .query_device_property(
+                r"PCI\VEN_8086&DEV_100E\0001",
+                device_property::BUS_NUMBER,
+                &mut out,
+            )
+            .unwrap_err();
+        assert_eq!(external.status, 0xC000_00BBu32 as i32);
+        assert_eq!(external.required_len, 0);
+
+        let invalid = client
+            .query_device_property(r"PCI\VEN_8086&DEV_100E\0001", 23, &mut out)
+            .unwrap_err();
+        assert_eq!(invalid.status, STATUS_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn device_property_query_honors_final_slice_capacity() {
+        let mut client = ConfigClient::new(Framed {
+            server: device_property_server(),
+        });
+        let mut out = [0xa5; 2];
+        let error = client
+            .query_device_property(
+                r"PCI\VEN_8086&DEV_100E\0001",
+                device_property::FRIENDLY_NAME,
+                &mut out,
+            )
+            .unwrap_err();
+        assert_eq!(error.status, 0xC000_0023u32 as i32);
+        assert_eq!(error.required_len, encode_sz("Intel Test Adapter").len());
+        assert_eq!(out, [0xa5; 2]);
+    }
+
+    #[test]
+    fn device_property_query_rejects_invalid_client_paths() {
+        let mut client = client_with_server(device_property_server());
+        let mut out = [0u8; 8];
+        assert_eq!(
+            client
+                .query_device_property("", device_property::FRIENDLY_NAME, &mut out)
+                .unwrap_err()
+                .status,
+            STATUS_INVALID_PARAMETER
+        );
+        assert_eq!(
+            client
+                .query_device_property("PCI\0DEVICE", device_property::FRIENDLY_NAME, &mut out)
+                .unwrap_err()
+                .status,
+            STATUS_INVALID_PARAMETER
+        );
+        let oversized = "A".repeat(CM_MAX_INSTANCE_UNITS + 1);
+        assert_eq!(
+            client
+                .query_device_property(&oversized, device_property::FRIENDLY_NAME, &mut out)
+                .unwrap_err()
+                .status,
+            STATUS_INVALID_PARAMETER
+        );
     }
 }

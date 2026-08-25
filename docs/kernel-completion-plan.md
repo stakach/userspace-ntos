@@ -11359,6 +11359,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Interface registration/state can follow as separate semantic operations only after this query
     transport is proven.
 
+    Config Manager device-property transport checkpoint (2026-08-26): the isolated Configuration
+    Manager now exposes a fixed-layout, versioned `QUERY_DEVICE_PROPERTY` operation keyed only by a
+    bounded UTF-16 stable instance path. The server requires the exact envelope size and range,
+    strict UTF-16 without embedded NULs, and the semantic property-source classification. Invalid
+    ordinals return `STATUS_INVALID_PARAMETER`; valid PnP/resource-owned ordinals return
+    `STATUS_NOT_SUPPORTED`; absent devnodes or Configuration values return
+    `STATUS_OBJECT_NAME_NOT_FOUND`. Success copies the exact native property bytes.
+
+    The request carries the caller's actual output capacity because the isolated server maps a full
+    4 KiB reply frame. The server compares both capacities, reports the exact required count through
+    `STATUS_BUFFER_TOO_SMALL`, and never partially writes. The client preserves that count in a
+    typed error and stages replies privately so SURT completion copying cannot modify the native
+    caller buffer on failure. Focused validation is green for `nt-config-abi` (`1/1`),
+    `nt-config-server` (`3/3`), and `nt-config-client` (`9/9`), including a full-page framed backend
+    with a two-byte final caller slice.
+
+    Review adjustment: semantic property transport is complete but is not yet the driver boundary.
+    Next add one authenticated hosted-device service operation for `IoGetDeviceProperty`. Derive the
+    caller domain/cookie from its pump channel, resolve the raw PDO projection to its exact canonical
+    `DeviceId`, derive the stable Enum instance path from the RootBus devnode, and use this Config
+    Manager client operation for Configuration-owned ordinals. PnP/resource-owned ordinals must be
+    served only from exact canonical bus/resource state. Once live, delete the component-local
+    DriverKey snapshot, unknown-PDO/shared-resource exception, and hard-coded property switch.
+    Register-interface and set-interface-state remain one later coupled migration because their
+    Config Manager and Object Manager updates require a two-authority commit.
+
     After that boundary is live, migrate the standalone hal, power, PnP, async, MMIO, and DMA
     component harnesses to `CompletionOwnerClaim` plus `CompletionUnwindCursor`, including their
     direct attach/lower-call shims. Reconcile the separate `driver-host-direg` and `nt-driver-host`
