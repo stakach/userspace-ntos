@@ -8267,6 +8267,14 @@ extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -
 
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
+const RTL_REGISTRY_HANDLE: u32 = 0x4000_0000;
+const RTL_QUERY_REGISTRY_SUBKEY: u32 = 0x0000_0001;
+const RTL_QUERY_REGISTRY_REQUIRED: u32 = 0x0000_0004;
+const RTL_QUERY_REGISTRY_NOVALUE: u32 = 0x0000_0008;
+const RTL_QUERY_REGISTRY_DIRECT: u32 = 0x0000_0020;
+const RTL_QUERY_REGISTRY_TABLE_SIZE: u64 = 56;
+const REG_NONE: u32 = 0;
+const REG_DWORD: u32 = 4;
 const WIN32K_REG_HANDLE_BASE: u64 = 0x5A5A_1000;
 static WIN32K_VIDEO_REG_QUERY_TRACE: AtomicU64 = AtomicU64::new(0);
 
@@ -8456,6 +8464,25 @@ unsafe fn read_unicode_string_ascii_lower(ustr: u64) -> Option<Vec<u8>> {
     Some(out)
 }
 
+unsafe fn read_wide_cstr_ascii_lower(ptr: u64) -> Option<Vec<u8>> {
+    if ptr == 0 {
+        return None;
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(64).ok()?;
+    for index in 0..256usize {
+        let unit = read_unaligned((ptr + index as u64 * 2) as *const u16);
+        if unit == 0 {
+            return Some(out);
+        }
+        if unit > 0x7f {
+            return None;
+        }
+        out.push((unit as u8).to_ascii_lowercase());
+    }
+    None
+}
+
 unsafe fn object_attributes_name_ascii_lower(obj_attr: u64) -> Option<Vec<u8>> {
     if obj_attr == 0 {
         return None;
@@ -8619,6 +8646,157 @@ extern "win64" fn s_zw_query_value_key(
     }
 }
 
+fn win32k_registry_value_owned(
+    target: Win32kRegHandleTarget,
+    name: &[u8],
+) -> Option<(u32, Vec<u8>)> {
+    match target {
+        Win32kRegHandleTarget::Empty => None,
+        Win32kRegHandleTarget::VideoDeviceMap => unsafe {
+            crate::video_device::query_video_device_map_value_owned(name).ok()
+        },
+        Win32kRegHandleTarget::SystemHive { key } => {
+            let hive = system_hive_regf()?;
+            let name = unsafe { core::str::from_utf8_unchecked(name) };
+            hive.value(key, name)
+        }
+    }
+}
+
+unsafe fn rtl_query_registry_dispatch(
+    flags: u32,
+    query_routine: u64,
+    name_ptr: u64,
+    entry_context: u64,
+    value_type: u32,
+    data: &[u8],
+    context: u64,
+) -> i32 {
+    if flags & RTL_QUERY_REGISTRY_DIRECT != 0 {
+        if entry_context == 0 {
+            return STATUS_ACCESS_VIOLATION_I32;
+        }
+        return match value_type {
+            REG_DWORD if data.len() == 4 => {
+                write_unaligned(
+                    entry_context as *mut u32,
+                    u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+                );
+                0
+            }
+            _ => STATUS_INVALID_PARAMETER_I32,
+        };
+    }
+    if query_routine == 0 {
+        return 0;
+    }
+    let routine: extern "win64" fn(u64, u32, u64, u32, u64, u64) -> i32 =
+        core::mem::transmute(query_routine as *const ());
+    routine(
+        name_ptr,
+        value_type,
+        data.as_ptr() as u64,
+        data.len() as u32,
+        context,
+        entry_context,
+    )
+}
+
+/// `NTSTATUS RtlQueryRegistryValues(...)` over the same live registry targets as ZwOpenKey and
+/// ZwQueryValueKey. win32k uses HANDLE + DIRECT tables for display configuration; callback entries
+/// are also dispatched against the live value bytes. Unsupported traversal flags fail explicitly.
+extern "win64" fn s_rtl_query_registry_values(
+    relative_to: u32,
+    path: u64,
+    query_table: u64,
+    context: u64,
+    _environment: u64,
+) -> i32 {
+    if query_table == 0 {
+        return STATUS_INVALID_PARAMETER_I32;
+    }
+    if relative_to & RTL_REGISTRY_HANDLE == 0 {
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+    let Some(target) = lookup_win32k_reg_handle(path) else {
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    };
+
+    unsafe {
+        for index in 0..64u64 {
+            let entry = query_table + index * RTL_QUERY_REGISTRY_TABLE_SIZE;
+            let query_routine = read_unaligned(entry as *const u64);
+            let flags = read_unaligned((entry + 8) as *const u32);
+            let name_ptr = read_unaligned((entry + 16) as *const u64);
+            let entry_context = read_unaligned((entry + 24) as *const u64);
+            let default_type = read_unaligned((entry + 32) as *const u32);
+            let default_data = read_unaligned((entry + 40) as *const u64);
+            let default_length = read_unaligned((entry + 48) as *const u32);
+
+            if query_routine == 0
+                && flags & (RTL_QUERY_REGISTRY_SUBKEY | RTL_QUERY_REGISTRY_DIRECT) == 0
+            {
+                return 0;
+            }
+            if flags & RTL_QUERY_REGISTRY_SUBKEY != 0
+                || (flags & RTL_QUERY_REGISTRY_DIRECT != 0
+                    && (name_ptr == 0 || query_routine != 0))
+            {
+                return STATUS_INVALID_PARAMETER_I32;
+            }
+            if flags & RTL_QUERY_REGISTRY_NOVALUE != 0 {
+                let status = rtl_query_registry_dispatch(
+                    flags,
+                    query_routine,
+                    0,
+                    entry_context,
+                    REG_NONE,
+                    &[],
+                    context,
+                );
+                if status < 0 {
+                    return status;
+                }
+                continue;
+            }
+            let Some(name) = read_wide_cstr_ascii_lower(name_ptr) else {
+                return STATUS_INVALID_PARAMETER_I32;
+            };
+            let value = win32k_registry_value_owned(target, &name);
+            let status = if let Some((value_type, data)) = value {
+                rtl_query_registry_dispatch(
+                    flags,
+                    query_routine,
+                    name_ptr,
+                    entry_context,
+                    value_type,
+                    &data,
+                    context,
+                )
+            } else if default_type != REG_NONE && default_data != 0 && default_length != 0 {
+                let data = core::slice::from_raw_parts(default_data as *const u8, default_length as usize);
+                rtl_query_registry_dispatch(
+                    flags,
+                    query_routine,
+                    name_ptr,
+                    entry_context,
+                    default_type,
+                    data,
+                    context,
+                )
+            } else if flags & RTL_QUERY_REGISTRY_REQUIRED != 0 {
+                STATUS_OBJECT_NAME_NOT_FOUND
+            } else {
+                0
+            };
+            if status < 0 {
+                return status;
+            }
+        }
+    }
+    STATUS_INVALID_PARAMETER_I32
+}
+
 /// `NTSTATUS IoGetDeviceObjectPointer(PUNICODE_STRING, ACCESS_MASK, PFILE_OBJECT*, PDEVICE_OBJECT*)`.
 extern "win64" fn s_io_get_device_object_pointer(
     name: u64,
@@ -8736,6 +8914,38 @@ pub(crate) unsafe fn service_video_device_io_control() -> u32 {
     };
     if status != 0 {
         bytes_returned = 0;
+    } else if ioctl == nt_video_miniport::IOCTL_VIDEO_QUERY_CURRENT_MODE as u64
+        && bytes_returned as usize >= nt_video_miniport::VIDEO_MODE_INFORMATION_SIZE
+    {
+        let output = core::slice::from_raw_parts(
+            (sh + VIDEO_IOCTL_OUT_BUF) as *const u8,
+            bytes_returned as usize,
+        );
+        if let Ok(mode) = nt_video_miniport::parse_video_mode_information(output) {
+            let _ = crate::publish_active_framebuffer_mode(mode);
+        }
+    } else if ioctl == nt_video_miniport::IOCTL_VIDEO_SET_CURRENT_MODE as u64 {
+        let mut current_mode_bytes = 0u32;
+        let query_status = crate::video_device::video_device_io_control(
+            hdev,
+            nt_video_miniport::IOCTL_VIDEO_QUERY_CURRENT_MODE as u64,
+            0,
+            0,
+            sh + VIDEO_IOCTL_OUT_BUF,
+            nt_video_miniport::VIDEO_MODE_INFORMATION_SIZE as u64,
+            &mut current_mode_bytes,
+        );
+        if query_status == 0
+            && current_mode_bytes as usize >= nt_video_miniport::VIDEO_MODE_INFORMATION_SIZE
+        {
+            let output = core::slice::from_raw_parts(
+                (sh + VIDEO_IOCTL_OUT_BUF) as *const u8,
+                current_mode_bytes as usize,
+            );
+            if let Ok(mode) = nt_video_miniport::parse_video_mode_information(output) {
+                let _ = crate::publish_active_framebuffer_mode(mode);
+            }
+        }
     }
     write_volatile((sh + VIDEO_IOCTL_STATUS) as *mut u32, status);
     write_volatile(
@@ -9465,6 +9675,10 @@ fn register_trampolines() -> bool {
     reg.bind("NtOpenKey", s_zw_open_key as usize as u64);
     reg.bind("ZwQueryValueKey", s_zw_query_value_key as usize as u64);
     reg.bind("NtQueryValueKey", s_zw_query_value_key as usize as u64);
+    reg.bind(
+        "RtlQueryRegistryValues",
+        s_rtl_query_registry_values as usize as u64,
+    );
     reg.bind("ZwOpenThreadToken", s_zw_open_thread_token as usize as u64);
     reg.bind("NtOpenThreadToken", s_zw_open_thread_token as usize as u64);
     reg.bind(

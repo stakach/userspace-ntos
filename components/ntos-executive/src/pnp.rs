@@ -21,12 +21,24 @@ use alloc::vec::Vec;
 
 use crate::*;
 use nt_pnp::{
-    assign_resources_with_granted_mmio, assign_root_bus_resources, assignment_to_cm_list,
-    enumerate_bus, PciDevice, ResourceAssignment, RootBusResourceCatalog, RootBusResourceProfile,
+    assign_resources, assign_root_bus_resources, assignment_to_cm_list, enumerate_bus,
+    pci_boot_resources, pci_resource_requirements, pci_resource_requirements_filtered,
+    root_bus_resource_requirements, PciDevice, PciInterruptAssignment, ResourceAssignment,
+    ResourceView, RootBusResourceCatalog, RootBusResourceProfile,
     ASSIGNMENT_CM_LIST_MAX_SIZE, ROOT_DMA_TEST_RESOURCE_PROFILE,
 };
 
 static mut ROOT_BUS_RESOURCE_CATALOG: Option<RootBusResourceCatalog> = None;
+static mut PCI_CONFIG_IO_CAP: u64 = 0;
+
+#[derive(Copy, Clone)]
+pub(crate) struct PciInterruptLineProgramming {
+    bus: u8,
+    dev: u8,
+    func: u8,
+    previous_line: u8,
+    assigned_line: u8,
+}
 
 /// Enumerate PCI bus 0 through `nt-pnp` using the executive's port-I/O config access. The reader
 /// closures drive `pci_read32`/`pci_write32` (0xCF8/0xCFC via `pci_io`); the writer is used by
@@ -34,6 +46,7 @@ static mut ROOT_BUS_RESOURCE_CATALOG: Option<RootBusResourceCatalog> = None;
 /// space. Returns every enumerated function on bus 0 (vendor/device/class, decoded BAR base+SIZE,
 /// IRQ line/pin) — the same bus walk the executive did inline, now the PnP Manager's job.
 pub(crate) unsafe fn enumerate_pci_bus0(pci_io: u64) -> alloc::vec::Vec<PciDevice> {
+    PCI_CONFIG_IO_CAP = pci_io;
     enumerate_bus(
         0,
         |dev, func, off| pci_read32(pci_io, 0, dev, func, off),
@@ -41,17 +54,149 @@ pub(crate) unsafe fn enumerate_pci_bus0(pci_io: u64) -> alloc::vec::Vec<PciDevic
     )
 }
 
+/// Program the platform-selected INTx line into PCI configuration space immediately before START.
+/// The returned record makes the write transactional with the remaining device-start operation.
+pub(crate) unsafe fn program_pci_interrupt_line(
+    device: &PciDevice,
+    assigned_line: u32,
+) -> Result<Option<PciInterruptLineProgramming>, nt_status::NtStatus> {
+    if device.irq_pin == 0 {
+        return if assigned_line == 0 {
+            Ok(None)
+        } else {
+            Err(nt_status::NtStatus::INVALID_PARAMETER)
+        };
+    }
+    let assigned_line = u8::try_from(assigned_line)
+        .ok()
+        .filter(|line| *line != u8::MAX)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    if PCI_CONFIG_IO_CAP == 0 {
+        print_str(b"[pnp] PCI InterruptLine program rejected: configuration authority absent\n");
+        return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+    }
+    let interrupt = pci_read32(
+        PCI_CONFIG_IO_CAP,
+        device.bus,
+        device.dev,
+        device.func,
+        0x3c,
+    );
+    let previous_line = interrupt as u8;
+    if previous_line != device.irq_line {
+        print_str(b"[pnp] PCI InterruptLine program rejected: stale snapshot current=");
+        print_u64(previous_line as u64);
+        print_str(b" enumerated=");
+        print_u64(device.irq_line as u64);
+        print_str(b" assigned=");
+        print_u64(assigned_line as u64);
+        print_str(b"\n");
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    if previous_line != assigned_line {
+        pci_write32(
+            PCI_CONFIG_IO_CAP,
+            device.bus,
+            device.dev,
+            device.func,
+            0x3c,
+            (interrupt & !0xff) | assigned_line as u32,
+        );
+        if pci_read32(
+            PCI_CONFIG_IO_CAP,
+            device.bus,
+            device.dev,
+            device.func,
+            0x3c,
+        ) as u8
+            != assigned_line
+        {
+            print_str(b"[pnp] PCI InterruptLine write did not latch bus=");
+            print_u64(device.bus as u64);
+            print_str(b" dev=");
+            print_u64(device.dev as u64);
+            print_str(b" func=");
+            print_u64(device.func as u64);
+            print_str(b" assigned=");
+            print_u64(assigned_line as u64);
+            print_str(b"\n");
+            pci_write32(
+                PCI_CONFIG_IO_CAP,
+                device.bus,
+                device.dev,
+                device.func,
+                0x3c,
+                interrupt,
+            );
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+    }
+    Ok(Some(PciInterruptLineProgramming {
+        bus: device.bus,
+        dev: device.dev,
+        func: device.func,
+        previous_line,
+        assigned_line,
+    }))
+}
+
+pub(crate) unsafe fn restore_pci_interrupt_line(
+    programming: PciInterruptLineProgramming,
+) -> bool {
+    if PCI_CONFIG_IO_CAP == 0 || programming.previous_line == programming.assigned_line {
+        return PCI_CONFIG_IO_CAP != 0;
+    }
+    let interrupt = pci_read32(
+        PCI_CONFIG_IO_CAP,
+        programming.bus,
+        programming.dev,
+        programming.func,
+        0x3c,
+    );
+    if interrupt as u8 != programming.assigned_line {
+        return false;
+    }
+    pci_write32(
+        PCI_CONFIG_IO_CAP,
+        programming.bus,
+        programming.dev,
+        programming.func,
+        0x3c,
+        (interrupt & !0xff) | programming.previous_line as u32,
+    );
+    pci_read32(
+        PCI_CONFIG_IO_CAP,
+        programming.bus,
+        programming.dev,
+        programming.func,
+        0x3c,
+    ) as u8
+        == programming.previous_line
+}
+
 /// The PCI function and raw/translated START resource bytes selected for one registry devnode.
 pub(crate) struct DevnodePciResourceGrant {
     pub device: PciDevice,
     pub assignment: ResourceAssignment,
+    pub resource_requirements: Vec<u8>,
     pub raw_resource_list: Vec<u8>,
     pub translated_resource_list: Vec<u8>,
+}
+
+/// Immutable PCI bus publications prepared before the function driver's `AddDevice` runs.
+pub(crate) struct DevnodePciBusResources {
+    pub device: PciDevice,
+    pub resource_requirements: Vec<u8>,
+    pub raw_boot_resources: Vec<u8>,
+    pub translated_boot_resources: Vec<u8>,
 }
 
 /// The root-bus profile and raw/translated START resource bytes selected for one registry devnode.
 pub(crate) struct DevnodeRootResourceGrant {
     pub assignment: ResourceAssignment,
+    pub resource_requirements: Vec<u8>,
+    pub raw_boot_resources: Vec<u8>,
+    pub translated_boot_resources: Vec<u8>,
     pub raw_resource_list: Vec<u8>,
     pub translated_resource_list: Vec<u8>,
 }
@@ -91,54 +236,56 @@ pub(crate) fn register_root_bus_resource_profile(profile: RootBusResourceProfile
     }
 }
 
-/// Build the physical START resources for an already-selected PCI function.
-pub(crate) fn build_devnode_pci_resource_grant(
+/// Build the bus-owned BootResources and initial requirements before `AddDevice`.
+pub(crate) fn build_devnode_pci_bus_resources(
     device: &PciDevice,
-    int_vector: u32,
-    int_latched: bool,
+    boot_interrupt: Option<PciInterruptAssignment>,
+) -> Option<DevnodePciBusResources> {
+    let resource_requirements = pci_resource_requirements(device).ok()??;
+    let boot_resources = pci_boot_resources(device, boot_interrupt).ok()??;
+    Some(DevnodePciBusResources {
+        device: device.clone(),
+        resource_requirements,
+        raw_boot_resources: boot_resources.raw,
+        translated_boot_resources: boot_resources.translated,
+    })
+}
+
+/// Build the final raw/translated START resources after the function stack has filtered its bus
+/// requirements and the platform resource providers have selected a route.
+pub(crate) fn build_devnode_pci_resource_grant(
+    bus_resources: DevnodePciBusResources,
+    interrupt: Option<PciInterruptAssignment>,
     dma_len: u64,
-    granted_mmio_len: u32,
 ) -> Option<DevnodePciResourceGrant> {
-    let assignment = assign_resources_with_granted_mmio(
-        device,
-        int_vector,
-        int_latched,
-        /*affinity=*/ 1,
-        dma_len,
-        granted_mmio_len,
-    )?;
+    let assignment = assign_resources(&bus_resources.device, interrupt, dma_len)
+        .ok()??;
+    let resource_requirements =
+        pci_resource_requirements_filtered(&bus_resources.device, interrupt.is_some()).ok()??;
     let mut translated_resource_list = vec![0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
     let n = assignment_to_cm_list(
         &mut translated_resource_list,
         nt_pnp::INTERFACE_TYPE_PCI_BUS,
-        device.bus as u32,
+        bus_resources.device.bus as u32,
         &assignment,
-        assignment.mmio_phys,
-        assignment.mmio_len as u32,
-    )?;
+        ResourceView::Translated,
+    )
+    .ok()?;
     translated_resource_list.truncate(n);
-    let raw_assignment = ResourceAssignment {
-        int_vector: if assignment.int_vector != 0 && device.irq_line != u8::MAX {
-            device.irq_line as u32
-        } else {
-            0
-        },
-        int_affinity: 0,
-        ..assignment
-    };
     let mut raw_resource_list = vec![0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
     let raw_len = assignment_to_cm_list(
         &mut raw_resource_list,
         nt_pnp::INTERFACE_TYPE_PCI_BUS,
-        device.bus as u32,
-        &raw_assignment,
-        raw_assignment.mmio_phys,
-        raw_assignment.mmio_len as u32,
-    )?;
+        bus_resources.device.bus as u32,
+        &assignment,
+        ResourceView::Raw,
+    )
+    .ok()?;
     raw_resource_list.truncate(raw_len);
     Some(DevnodePciResourceGrant {
-        device: device.clone(),
+        device: bus_resources.device,
         assignment,
+        resource_requirements,
         raw_resource_list,
         translated_resource_list,
     })
@@ -153,14 +300,13 @@ pub(crate) fn assign_devnode_root_dma_resources<H, C>(
     int_vector: u32,
     int_latched: bool,
     dma_len: u64,
-    granted_mmio_len: u32,
 ) -> Option<DevnodeRootResourceGrant>
 where
     H: AsRef<str>,
     C: AsRef<str>,
 {
     let profile = root_bus_resource_profile_for_devnode(instance_id, hardware_ids, compatible_ids)?;
-    let mut assignment = assign_root_bus_resources(
+    let assignment = assign_root_bus_resources(
         instance_id,
         hardware_ids,
         compatible_ids,
@@ -170,24 +316,33 @@ where
         /*affinity=*/ 1,
         dma_len,
     )?;
-    let mmio_len = assignment.mmio_len.min(granted_mmio_len as u64);
-    if mmio_len == 0 || mmio_len > u32::MAX as u64 {
-        return None;
-    }
-    assignment.mmio_len = mmio_len;
+    let resource_requirements = root_bus_resource_requirements(&profile).ok()?;
     let mut translated_resource_list = vec![0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
     let n = assignment_to_cm_list(
         &mut translated_resource_list,
         nt_pnp::INTERFACE_TYPE_PNP_BUS,
         0,
         &assignment,
-        assignment.mmio_phys,
-        assignment.mmio_len as u32,
-    )?;
+        ResourceView::Translated,
+    )
+    .ok()?;
     translated_resource_list.truncate(n);
+    let mut raw_resource_list = vec![0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
+    let raw_len = assignment_to_cm_list(
+        &mut raw_resource_list,
+        nt_pnp::INTERFACE_TYPE_PNP_BUS,
+        0,
+        &assignment,
+        ResourceView::Raw,
+    )
+    .ok()?;
+    raw_resource_list.truncate(raw_len);
     Some(DevnodeRootResourceGrant {
         assignment,
-        raw_resource_list: translated_resource_list.clone(),
+        resource_requirements,
+        raw_boot_resources: raw_resource_list.clone(),
+        translated_boot_resources: translated_resource_list.clone(),
+        raw_resource_list,
         translated_resource_list,
     })
 }

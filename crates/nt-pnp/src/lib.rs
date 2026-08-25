@@ -29,18 +29,23 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 pub use nt_cm_resources::{
-    InterruptDescriptor, MemoryDescriptor, PortDescriptor, CM_RESOURCE_INTERRUPT_LATCHED,
-    CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE, CM_RESOURCE_MEMORY_READ_WRITE, CM_RESOURCE_PORT_BAR,
-    CM_RESOURCE_PORT_IO, CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE, INTERFACE_TYPE_PCI_BUS,
-    INTERFACE_TYPE_PNP_BUS, MEMORY_INTERRUPT_LIST_SIZE, MEMORY_LIST_SIZE,
-    MEMORY_PORT_INTERRUPT_LIST_SIZE, MEMORY_PORT_LIST_SIZE, PORT_INTERRUPT_LIST_SIZE,
-    PORT_LIST_SIZE,
+    CmResourceDescriptor, InterruptDescriptor, IoAddressRequirement, IoInterruptRequirement,
+    IoResourceRequirement, MemoryDescriptor, PortDescriptor, CM_RESOURCE_INTERRUPT_LATCHED,
+    CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE, CM_RESOURCE_MEMORY_BAR, CM_RESOURCE_MEMORY_PREFETCHABLE,
+    CM_RESOURCE_MEMORY_READ_WRITE, CM_RESOURCE_PORT_16_BIT_DECODE, CM_RESOURCE_PORT_BAR,
+    CM_RESOURCE_PORT_IO, CM_RESOURCE_PORT_POSITIVE_DECODE, CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+    CM_RESOURCE_SHARE_SHARED, INTERFACE_TYPE_PCI_BUS, INTERFACE_TYPE_PNP_BUS,
+    IO_RESOURCE_ALTERNATIVE, IO_RESOURCE_PREFERRED, IO_RESOURCE_REQUIRED,
+    MEMORY_INTERRUPT_LIST_SIZE, MEMORY_LIST_SIZE, MEMORY_PORT_INTERRUPT_LIST_SIZE,
+    MEMORY_PORT_LIST_SIZE, PORT_INTERRUPT_LIST_SIZE, PORT_LIST_SIZE,
 };
 
 /// PCI configuration-space register offsets (byte offsets, dword-aligned).
 pub const PCI_CFG_VENDOR_DEVICE: u8 = 0x00;
 pub const PCI_CFG_COMMAND_STATUS: u8 = 0x04;
 pub const PCI_CFG_CLASS_REV: u8 = 0x08;
+/// Cache-line/latency/header/BIST dword. Header type is byte 0x0e (bits 16..23).
+pub const PCI_CFG_HEADER: u8 = 0x0C;
 /// BAR0..BAR5 live at 0x10, 0x14, … 0x24.
 pub const PCI_CFG_BAR0: u8 = 0x10;
 /// Interrupt line (low byte) + interrupt pin (second byte) at 0x3C.
@@ -52,9 +57,17 @@ pub const PCI_NUM_BARS: usize = 6;
 /// BAR low-bit decode (PCI spec §6.2.5.1).
 const BAR_IO_SPACE: u32 = 0x1; // bit0: 1 = I/O space, 0 = memory space
 const BAR_TYPE_MASK: u32 = 0x6; // bits[2:1]: memory BAR type
+const BAR_TYPE_20BIT: u32 = 0x2; // bits[2:1] == 01b => below-1MiB memory BAR
 const BAR_TYPE_64BIT: u32 = 0x4; // bits[2:1] == 10b => 64-bit memory BAR
+const BAR_PREFETCHABLE: u32 = 0x8;
 const BAR_MEM_ADDR_MASK: u32 = 0xFFFF_FFF0; // memory BAR base = value & ~0xF
 const BAR_IO_ADDR_MASK: u32 = 0xFFFF_FFFC; // I/O BAR base = value & ~0x3
+const PCI_COMMAND_IO_SPACE: u16 = 0x0001;
+const PCI_COMMAND_MEMORY_SPACE: u16 = 0x0002;
+const PCI_HEADER_TYPE_MASK: u8 = 0x7f;
+const PCI_HEADER_TYPE_DEVICE: u8 = 0;
+const PCI_HEADER_TYPE_BRIDGE: u8 = 1;
+const PCI_HEADER_TYPE_CARDBUS: u8 = 2;
 
 /// PCI device class codes (the high byte of the class-code dword).
 pub const PCI_CLASS_STORAGE: u8 = 0x01;
@@ -70,10 +83,14 @@ pub struct Bar {
     pub is_io: bool,
     /// True = 64-bit memory BAR (consumes this BAR + the next one).
     pub is_64bit: bool,
+    /// True when a memory BAR advertises prefetchable memory.
+    pub prefetchable: bool,
     /// The decoded base address (flag bits masked off).
     pub base: u64,
     /// The region SIZE in bytes, computed by the write-all-ones probe. `0` = BAR unimplemented.
     pub size: u64,
+    /// Highest address the BAR's native decode width can represent.
+    pub maximum_address: u64,
 }
 
 impl Bar {
@@ -121,13 +138,18 @@ impl PciDevice {
     pub fn first_io_bar(&self) -> Option<&Bar> {
         self.bars.iter().find(|b| b.is_io && b.is_assigned())
     }
+
+    /// Native `PCI_SLOT_NUMBER.AsULONG` (`DeviceNumber:5`, then `FunctionNumber:3`).
+    pub fn slot_number(&self) -> u32 {
+        self.dev as u32 | ((self.func as u32) << 5)
+    }
 }
 
 /// Decode a BAR and probe its size. `read(off)` reads a config dword; `write(off, v)` writes one.
 /// Follows the canonical PCI algorithm: save the BAR, write all-ones, read back the mask, restore
 /// the BAR, then `size = (~mask & addr_mask) + 1`. Returns the decoded [`Bar`] (size 0 if the BAR
 /// is unimplemented — reads back 0 after the all-ones write).
-fn probe_bar<R, W>(index: u8, read: &R, write: &W) -> Bar
+fn probe_bar<R, W>(index: u8, paired_slot_available: bool, read: &R, write: &W) -> Bar
 where
     R: Fn(u8) -> u32,
     W: Fn(u8, u32),
@@ -135,35 +157,79 @@ where
     let off = PCI_CFG_BAR0 + index * 4;
     let orig = read(off);
     let is_io = orig & BAR_IO_SPACE != 0;
-    let is_64bit = !is_io && (orig & BAR_TYPE_MASK) == BAR_TYPE_64BIT;
+    let memory_type = orig & BAR_TYPE_MASK;
+    let is_64bit = !is_io && memory_type == BAR_TYPE_64BIT;
+    let prefetchable = !is_io && orig & BAR_PREFETCHABLE != 0;
     let addr_mask = if is_io {
         BAR_IO_ADDR_MASK
     } else {
         BAR_MEM_ADDR_MASK
     };
-    // Write all-ones and read back the decoded address mask, then restore.
+    if is_64bit && !paired_slot_available {
+        return Bar {
+            index,
+            is_io,
+            is_64bit,
+            prefetchable,
+            base: 0,
+            size: 0,
+            maximum_address: u64::MAX,
+        };
+    }
+    let orig_high = if is_64bit { read(off + 4) } else { 0 };
+    // A 64-bit BAR must be probed and restored as one register pair.
     write(off, 0xFFFF_FFFF);
-    let probed = read(off) & addr_mask;
+    if is_64bit {
+        write(off + 4, 0xFFFF_FFFF);
+    }
+    let probed_low = read(off) & addr_mask;
+    let probed_high = if is_64bit { read(off + 4) } else { 0 };
+    if is_64bit {
+        write(off + 4, orig_high);
+    }
     write(off, orig);
-    let size = if probed == 0 {
-        0
+
+    let (base, size_mask, maximum_address) = if is_io {
+        (
+            (orig & BAR_IO_ADDR_MASK) as u64,
+            probed_low as u64,
+            u32::MAX as u64,
+        )
+    } else if memory_type == BAR_TYPE_64BIT {
+        (
+            ((orig_high as u64) << 32) | (orig & BAR_MEM_ADDR_MASK) as u64,
+            ((probed_high as u64) << 32) | probed_low as u64,
+            u64::MAX,
+        )
+    } else if memory_type == 0 || memory_type == BAR_TYPE_20BIT {
+        (
+            (orig & BAR_MEM_ADDR_MASK) as u64,
+            probed_low as u64,
+            if memory_type == BAR_TYPE_20BIT {
+                0x000F_FFFF
+            } else {
+                u32::MAX as u64
+            },
+        )
     } else {
-        // `probed` already has the flag bits masked off, so the size is `~probed + 1` (the value
-        // of the lowest set bit of the decoded mask). Negation stays in u32 so a 32-bit BAR of
-        // size 0x2_0000 gives ~0xFFFE_0000 + 1 = 0x2_0000.
-        (!probed) as u64 + 1
+        // 0b11 is reserved by PCI and cannot become an authoritative resource constraint.
+        (0, 0, 0)
     };
-    let base = if is_io {
-        (orig & BAR_IO_ADDR_MASK) as u64
+    let size = if size_mask == 0 {
+        0
+    } else if is_64bit {
+        (!size_mask).wrapping_add(1)
     } else {
-        (orig & BAR_MEM_ADDR_MASK) as u64
+        (!(size_mask as u32)).wrapping_add(1) as u64
     };
     Bar {
         index,
         is_io,
         is_64bit,
+        prefetchable,
         base,
         size,
+        maximum_address,
     }
 }
 
@@ -183,19 +249,38 @@ where
     }
     let device = (vd >> 16) as u16;
     let class = read(PCI_CFG_CLASS_REV) >> 8;
+    let header_type = ((read(PCI_CFG_HEADER) >> 16) & 0xff) as u8 & PCI_HEADER_TYPE_MASK;
+    let bar_count = match header_type {
+        PCI_HEADER_TYPE_DEVICE => 6u8,
+        PCI_HEADER_TYPE_BRIDGE => 2u8,
+        PCI_HEADER_TYPE_CARDBUS => 1u8,
+        _ => 0u8,
+    };
     let intr = read(PCI_CFG_INTERRUPT);
     let irq_line = (intr & 0xFF) as u8;
     let irq_pin = ((intr >> 8) & 0xFF) as u8;
     let mut bars = Vec::new();
+    let command = read(PCI_CFG_COMMAND_STATUS) as u16;
+    if bar_count != 0 {
+        // Preserve command bits while writing zero to the W1C status half. Decode must be disabled
+        // while a BAR contains the all-ones sizing value.
+        write(
+            PCI_CFG_COMMAND_STATUS,
+            (command & !(PCI_COMMAND_IO_SPACE | PCI_COMMAND_MEMORY_SPACE)) as u32,
+        );
+    }
     let mut i = 0u8;
-    while (i as usize) < PCI_NUM_BARS {
-        let bar = probe_bar(i, &read, &write);
+    while i < bar_count {
+        let bar = probe_bar(i, i + 1 < bar_count, &read, &write);
         // A 64-bit memory BAR consumes the next BAR slot for its high dword; skip it.
         let step = if bar.is_64bit { 2 } else { 1 };
         if bar.is_present() {
             bars.push(bar);
         }
         i += step;
+    }
+    if bar_count != 0 {
+        write(PCI_CFG_COMMAND_STATUS, command as u32);
     }
     Some(PciDevice {
         bus,
@@ -468,30 +553,93 @@ where
     None
 }
 
-/// The resource assignment PnP produces for a device: which memory/port BARs + interrupt (+ optional
-/// DMA common-buffer) the driver is granted. This is the abstract grant the executive turns into
-/// minted caps; [`assignment_to_cm_list`] encodes it as the `CM_RESOURCE_LIST` the driver reads.
+/// Selects the bus-relative or translated side of one PnP resource assignment.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ResourceView {
+    Raw,
+    Translated,
+}
+
+/// The complete ordered resource assignment PnP produces for a device.
+///
+/// The raw and translated vectors have identical descriptor kinds at every index. Keeping both
+/// sides explicit prevents the executive from reconstructing bus resources from translated values
+/// after platform arbitration.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResourceAssignment {
-    /// The device MMIO physical base (the BAR base), or zero for I/O-only PCI functions.
-    pub mmio_phys: u64,
-    /// The MMIO window length (rounded up to whole pages by the broker when minting frame caps), or
-    /// zero for I/O-only PCI functions.
-    pub mmio_len: u64,
-    /// The device I/O port base, if the PCI function exposes a port BAR.
-    pub io_port_base: u64,
-    /// The device I/O port range length. `0` means no port resource is granted.
-    pub io_port_len: u32,
-    /// Flags for the port resource descriptor. `0` when no port resource is granted.
-    pub io_port_flags: u16,
-    /// The interrupt vector/level assigned to the device (translated form).
-    pub int_vector: u32,
-    /// True = latched (edge/MSI), false = level-sensitive.
-    pub int_latched: bool,
-    /// The interrupt affinity mask (CPU set).
-    pub int_affinity: u64,
+    raw: Vec<CmResourceDescriptor>,
+    translated: Vec<CmResourceDescriptor>,
     /// The DMA common-buffer length in bytes (`0` = no DMA resource).
     pub dma_len: u64,
+}
+
+impl ResourceAssignment {
+    fn new(
+        raw: Vec<CmResourceDescriptor>,
+        translated: Vec<CmResourceDescriptor>,
+        dma_len: u64,
+    ) -> Result<Self, ResourceRequirementsError> {
+        if raw.is_empty() || raw.len() != translated.len() {
+            return Err(ResourceRequirementsError::MissingInterruptTranslation);
+        }
+        for (raw, translated) in raw.iter().zip(&translated) {
+            let valid_pair = match (*raw, *translated) {
+                (CmResourceDescriptor::Memory(raw), CmResourceDescriptor::Memory(translated)) => {
+                    raw.length != 0 && raw.length == translated.length
+                }
+                (CmResourceDescriptor::Port(raw), CmResourceDescriptor::Port(translated)) => {
+                    raw.length != 0 && raw.length == translated.length
+                }
+                (CmResourceDescriptor::Interrupt(_), CmResourceDescriptor::Interrupt(_)) => true,
+                _ => false,
+            };
+            if !valid_pair {
+                return Err(ResourceRequirementsError::MissingInterruptTranslation);
+            }
+        }
+        Ok(Self {
+            raw,
+            translated,
+            dma_len,
+        })
+    }
+
+    pub fn resources(&self, view: ResourceView) -> &[CmResourceDescriptor] {
+        match view {
+            ResourceView::Raw => &self.raw,
+            ResourceView::Translated => &self.translated,
+        }
+    }
+
+    pub fn memory_resources(
+        &self,
+        view: ResourceView,
+    ) -> impl Iterator<Item = MemoryDescriptor> + '_ {
+        self.resources(view)
+            .iter()
+            .filter_map(|resource| match resource {
+                CmResourceDescriptor::Memory(memory) => Some(*memory),
+                _ => None,
+            })
+    }
+
+    pub fn port_resources(&self, view: ResourceView) -> impl Iterator<Item = PortDescriptor> + '_ {
+        self.resources(view)
+            .iter()
+            .filter_map(|resource| match resource {
+                CmResourceDescriptor::Port(port) => Some(*port),
+                _ => None,
+            })
+    }
+
+    pub fn interrupt_resource(&self, view: ResourceView) -> Option<InterruptDescriptor> {
+        self.resources(view)
+            .iter()
+            .find_map(|resource| match resource {
+                CmResourceDescriptor::Interrupt(interrupt) => Some(*interrupt),
+                _ => None,
+            })
+    }
 }
 
 /// A root-bus resource profile describes synthetic hardware enumerated by the native root bus.
@@ -502,6 +650,8 @@ pub struct RootBusResourceProfile {
     pub device_id: &'static str,
     pub mmio_phys: u64,
     pub mmio_len: u64,
+    pub interrupt_vector: u32,
+    pub interrupt_latched: bool,
 }
 
 /// The DMA PnP proof device's root-bus register bank. The test driver reads a 4 KiB MMIO range
@@ -511,7 +661,344 @@ pub const ROOT_DMA_TEST_RESOURCE_PROFILE: RootBusResourceProfile = RootBusResour
     device_id: r"ROOT\USERSPACE_NTOS_DMA",
     mmio_phys: 0x1000_0000,
     mmio_len: 0x1000,
+    interrupt_vector: 5,
+    interrupt_latched: false,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceRequirementsError {
+    UnassignedBar,
+    UnsupportedBarLength,
+    AddressOverflow,
+    OutOfMemory,
+    MissingInterruptTranslation,
+    InvalidInterruptPin,
+    EncodeCm(nt_cm_resources::CmResourceListError),
+    Encode(nt_cm_resources::IoResourceRequirementsError),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PciBootResources {
+    pub raw: Vec<u8>,
+    pub translated: Vec<u8>,
+}
+
+/// One interrupt route selected by the platform interrupt provider after requirements filtering.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PciInterruptAssignment {
+    /// Bus-relative interrupt level selected by the platform router.
+    pub bus_level: u32,
+    /// System vector after platform translation.
+    pub vector: u32,
+    pub latched: bool,
+    pub affinity: u64,
+}
+
+/// Firmware/platform-owned INTx link routing for functions on one PCI bus.
+///
+/// Direct children use the standard PCI swizzle `(slot + pin - 1) mod 4`. The table contents are
+/// supplied by the platform provider; this type does not embed a machine or device identity.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PciIntxRoutingTable {
+    pub bus: u8,
+    pub link_vectors: [Option<u32>; 4],
+}
+
+impl PciIntxRoutingTable {
+    pub const fn new(bus: u8, link_vectors: [Option<u32>; 4]) -> Self {
+        Self { bus, link_vectors }
+    }
+
+    pub fn route(&self, device: &PciDevice) -> Option<u32> {
+        if device.bus != self.bus || !(1..=4).contains(&device.irq_pin) {
+            return None;
+        }
+        let link = (device.dev as usize + device.irq_pin as usize - 1) & 3;
+        self.link_vectors[link]
+    }
+}
+
+fn memory_bar_flags(bar: &Bar) -> u16 {
+    CM_RESOURCE_MEMORY_READ_WRITE
+        | CM_RESOURCE_MEMORY_BAR
+        | if bar.prefetchable {
+            CM_RESOURCE_MEMORY_PREFETCHABLE
+        } else {
+            0
+        }
+}
+
+fn port_bar_flags() -> u16 {
+    CM_RESOURCE_PORT_IO
+        | CM_RESOURCE_PORT_16_BIT_DECODE
+        | CM_RESOURCE_PORT_POSITIVE_DECODE
+        | CM_RESOURCE_PORT_BAR
+}
+
+/// Build the bus-relative and translated boot-resource snapshots for one PCI function.
+///
+/// BAR addresses use identity translation on the current x86 platform. Interrupt routing is kept
+/// distinct: the raw list contains the PCI line with all-processor affinity, while the translated
+/// list contains the vector and affinity selected by the interrupt broker.
+pub fn pci_boot_resources(
+    device: &PciDevice,
+    translated_interrupt: Option<PciInterruptAssignment>,
+) -> Result<Option<PciBootResources>, ResourceRequirementsError> {
+    if device.irq_pin > 4 {
+        return Err(ResourceRequirementsError::InvalidInterruptPin);
+    }
+    let has_raw_interrupt = device.irq_pin != 0 && !matches!(device.irq_line, 0 | u8::MAX);
+    if (device.irq_pin == 0 && translated_interrupt.is_some())
+        || has_raw_interrupt != translated_interrupt.is_some()
+    {
+        return Err(ResourceRequirementsError::MissingInterruptTranslation);
+    }
+    let descriptor_count = device
+        .bars
+        .iter()
+        .filter(|bar| bar.is_present())
+        .count()
+        .saturating_add(has_raw_interrupt as usize);
+    if descriptor_count == 0 {
+        return Ok(None);
+    }
+    let mut raw_descriptors = Vec::new();
+    let mut translated_descriptors = Vec::new();
+    raw_descriptors
+        .try_reserve_exact(descriptor_count)
+        .map_err(|_| ResourceRequirementsError::OutOfMemory)?;
+    translated_descriptors
+        .try_reserve_exact(descriptor_count)
+        .map_err(|_| ResourceRequirementsError::OutOfMemory)?;
+    for bar in device.bars.iter().filter(|bar| bar.is_present()) {
+        if !bar.is_assigned() {
+            return Err(ResourceRequirementsError::UnassignedBar);
+        }
+        let length =
+            u32::try_from(bar.size).map_err(|_| ResourceRequirementsError::UnsupportedBarLength)?;
+        let descriptor = if bar.is_io {
+            CmResourceDescriptor::Port(PortDescriptor {
+                start: bar.base,
+                length,
+                flags: port_bar_flags(),
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            })
+        } else {
+            CmResourceDescriptor::Memory(MemoryDescriptor {
+                start: bar.base,
+                length,
+                flags: memory_bar_flags(bar),
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            })
+        };
+        raw_descriptors.push(descriptor);
+        translated_descriptors.push(descriptor);
+    }
+    if has_raw_interrupt {
+        raw_descriptors.push(CmResourceDescriptor::Interrupt(InterruptDescriptor {
+            level: device.irq_line as u32,
+            vector: device.irq_line as u32,
+            affinity: u64::MAX,
+            flags: CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE,
+            share: CM_RESOURCE_SHARE_SHARED,
+        }));
+        let translated = translated_interrupt.unwrap();
+        translated_descriptors.push(CmResourceDescriptor::Interrupt(InterruptDescriptor {
+            level: translated.vector,
+            vector: translated.vector,
+            affinity: translated.affinity,
+            flags: if translated.latched {
+                CM_RESOURCE_INTERRUPT_LATCHED
+            } else {
+                CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE
+            },
+            share: CM_RESOURCE_SHARE_SHARED,
+        }));
+    }
+    let size = nt_cm_resources::cm_resource_list_size(descriptor_count)
+        .ok_or(ResourceRequirementsError::AddressOverflow)?;
+    let mut raw = Vec::new();
+    raw.try_reserve_exact(size)
+        .map_err(|_| ResourceRequirementsError::OutOfMemory)?;
+    raw.resize(size, 0);
+    nt_cm_resources::build_cm_resource_list(
+        &mut raw,
+        INTERFACE_TYPE_PCI_BUS,
+        device.bus as u32,
+        &raw_descriptors,
+    )
+    .map_err(ResourceRequirementsError::EncodeCm)?;
+    let mut translated = Vec::new();
+    translated
+        .try_reserve_exact(size)
+        .map_err(|_| ResourceRequirementsError::OutOfMemory)?;
+    translated.resize(size, 0);
+    nt_cm_resources::build_cm_resource_list(
+        &mut translated,
+        INTERFACE_TYPE_PCI_BUS,
+        device.bus as u32,
+        &translated_descriptors,
+    )
+    .map_err(ResourceRequirementsError::EncodeCm)?;
+    Ok(Some(PciBootResources { raw, translated }))
+}
+
+fn encode_resource_requirements(
+    interface_type: i32,
+    bus_number: u32,
+    slot_number: u32,
+    descriptors: &[IoResourceRequirement],
+) -> Result<Option<Vec<u8>>, ResourceRequirementsError> {
+    if descriptors.is_empty() {
+        return Ok(None);
+    }
+    let size = nt_cm_resources::io_resource_requirements_list_size(descriptors.len())
+        .ok_or(ResourceRequirementsError::AddressOverflow)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .map_err(|_| ResourceRequirementsError::OutOfMemory)?;
+    bytes.resize(size, 0);
+    nt_cm_resources::build_io_resource_requirements_list(
+        &mut bytes,
+        interface_type,
+        bus_number,
+        slot_number,
+        descriptors,
+    )
+    .map_err(ResourceRequirementsError::Encode)?;
+    Ok(Some(bytes))
+}
+
+fn fixed_address_requirement(bar: &Bar) -> Result<IoAddressRequirement, ResourceRequirementsError> {
+    if !bar.is_assigned() {
+        return Err(ResourceRequirementsError::UnassignedBar);
+    }
+    let length =
+        u32::try_from(bar.size).map_err(|_| ResourceRequirementsError::UnsupportedBarLength)?;
+    let maximum = bar
+        .base
+        .checked_add(bar.size - 1)
+        .ok_or(ResourceRequirementsError::AddressOverflow)?;
+    if bar.is_io && maximum > u16::MAX as u64 {
+        return Err(ResourceRequirementsError::UnsupportedBarLength);
+    }
+    Ok(IoAddressRequirement {
+        option: IO_RESOURCE_REQUIRED,
+        share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+        flags: if bar.is_io {
+            CM_RESOURCE_PORT_IO
+                | CM_RESOURCE_PORT_16_BIT_DECODE
+                | CM_RESOURCE_PORT_POSITIVE_DECODE
+                | CM_RESOURCE_PORT_BAR
+        } else {
+            memory_bar_flags(bar)
+        },
+        length,
+        // This implementation advertises only the placement the capability broker can mint.
+        alignment: 1,
+        minimum: bar.base,
+        maximum,
+    })
+}
+
+/// Build the exact bus-owned requirements for one enumerated PCI function.
+///
+/// Every implemented BAR is represented. Until the resource arbiter can reprogram BARs and mint a
+/// replacement capability set, the only advertised placement is the current one. An interrupt pin
+/// remains a shared, level-sensitive bus-routing requirement over the native PCI vector range.
+pub fn pci_resource_requirements(
+    device: &PciDevice,
+) -> Result<Option<Vec<u8>>, ResourceRequirementsError> {
+    pci_resource_requirements_filtered(device, device.irq_pin != 0)
+}
+
+/// Apply the function-stack interrupt filter to the bus-owned PCI requirements. BAR requirements
+/// remain immutable; only the interrupt requirement may be removed by a stack that does not
+/// register an interrupt service routine.
+pub fn pci_resource_requirements_filtered(
+    device: &PciDevice,
+    include_interrupt: bool,
+) -> Result<Option<Vec<u8>>, ResourceRequirementsError> {
+    if device.irq_pin > 4 {
+        return Err(ResourceRequirementsError::InvalidInterruptPin);
+    }
+    if include_interrupt && device.irq_pin == 0 {
+        return Err(ResourceRequirementsError::MissingInterruptTranslation);
+    }
+    let mut descriptors = Vec::new();
+    descriptors
+        .try_reserve(device.bars.len().saturating_add(1))
+        .map_err(|_| ResourceRequirementsError::OutOfMemory)?;
+    for bar in device.bars.iter().filter(|bar| bar.is_present()) {
+        let address = fixed_address_requirement(bar)?;
+        descriptors.push(if bar.is_io {
+            IoResourceRequirement::Port(address)
+        } else {
+            IoResourceRequirement::Memory(address)
+        });
+    }
+    if include_interrupt {
+        descriptors.push(IoResourceRequirement::Interrupt(IoInterruptRequirement {
+            option: IO_RESOURCE_REQUIRED,
+            share: CM_RESOURCE_SHARE_SHARED,
+            flags: CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE,
+            minimum_vector: 0,
+            maximum_vector: 0xff,
+            affinity_policy: 0,
+            priority_policy: 0,
+            targeted_processors: 0,
+        }));
+    }
+    encode_resource_requirements(
+        INTERFACE_TYPE_PCI_BUS,
+        device.bus as u32,
+        device.slot_number(),
+        &descriptors,
+    )
+}
+
+/// Build the immutable requirements published by a broker-backed root-bus profile.
+pub fn root_bus_resource_requirements(
+    profile: &RootBusResourceProfile,
+) -> Result<Vec<u8>, ResourceRequirementsError> {
+    if profile.mmio_phys == 0 || profile.mmio_len == 0 || profile.interrupt_vector == 0 {
+        return Err(ResourceRequirementsError::UnassignedBar);
+    }
+    let length = u32::try_from(profile.mmio_len)
+        .map_err(|_| ResourceRequirementsError::UnsupportedBarLength)?;
+    let maximum = profile
+        .mmio_phys
+        .checked_add(profile.mmio_len - 1)
+        .ok_or(ResourceRequirementsError::AddressOverflow)?;
+    let descriptors = [
+        IoResourceRequirement::Memory(IoAddressRequirement {
+            option: IO_RESOURCE_REQUIRED,
+            share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            flags: CM_RESOURCE_MEMORY_READ_WRITE,
+            length,
+            alignment: 1,
+            minimum: profile.mmio_phys,
+            maximum,
+        }),
+        IoResourceRequirement::Interrupt(IoInterruptRequirement {
+            option: IO_RESOURCE_REQUIRED,
+            share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            flags: if profile.interrupt_latched {
+                CM_RESOURCE_INTERRUPT_LATCHED
+            } else {
+                CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE
+            },
+            minimum_vector: profile.interrupt_vector,
+            maximum_vector: profile.interrupt_vector,
+            affinity_policy: 0,
+            priority_policy: 0,
+            targeted_processors: 0,
+        }),
+    ];
+    encode_resource_requirements(INTERFACE_TYPE_PNP_BUS, 0, 0, &descriptors)?
+        .ok_or(ResourceRequirementsError::UnassignedBar)
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RootBusResourceCatalogError {
@@ -548,7 +1035,7 @@ impl RootBusResourceCatalog {
         if profile.device_id.is_empty() {
             return Err(RootBusResourceCatalogError::EmptyDeviceId);
         }
-        if profile.mmio_phys == 0 || profile.mmio_len == 0 {
+        if profile.mmio_phys == 0 || profile.mmio_len == 0 || profile.interrupt_vector == 0 {
             return Err(RootBusResourceCatalogError::EmptyResource);
         }
         if self
@@ -632,175 +1119,144 @@ where
     if !devnode_matches_root_bus_profile(instance_id, hardware_ids, compatible_ids, profile)
         || profile.mmio_phys == 0
         || profile.mmio_len == 0
-        || int_vector == 0
+        || int_vector != profile.interrupt_vector
+        || int_latched != profile.interrupt_latched
     {
         return None;
     }
-    Some(ResourceAssignment {
-        mmio_phys: profile.mmio_phys,
-        mmio_len: profile.mmio_len,
-        io_port_base: 0,
-        io_port_len: 0,
-        io_port_flags: 0,
-        int_vector,
-        int_latched,
-        int_affinity,
-        dma_len,
-    })
-}
-
-fn legacy_pci_io_port_range(device: &PciDevice) -> Option<(u64, u32, u16)> {
-    // QEMU's std VGA/Bochs display adapter exposes the framebuffer as a PCI memory BAR but its
-    // Bochs DISPI control registers are the legacy 0x1CE/0x1CF I/O ports, not a PCI BAR.
-    if device.vendor == 0x1234
-        && device.device == 0x1111
-        && device.base_class() == PCI_CLASS_DISPLAY
-    {
-        Some((0x01CE, 2, CM_RESOURCE_PORT_IO))
-    } else {
-        None
-    }
-}
-
-/// Assign resources to a device bound to `class`, from its enumerated BARs, optional legacy port
-/// resources, and optional IRQ. `int_vector` is the translated interrupt vector the executive has
-/// arranged for this device; `0` means the bus assigned no interrupt. `dma_len` is the common-buffer
-/// size the driver needs (`0` for none). Returns `None` if the device exposes no memory or port
-/// resource.
-pub fn assign_resources(
-    device: &PciDevice,
-    int_vector: u32,
-    int_latched: bool,
-    int_affinity: u64,
-    dma_len: u64,
-) -> Option<ResourceAssignment> {
-    let mem_bar = device.first_memory_bar();
-    let (io_port_base, io_port_len, io_port_flags) = match device.first_io_bar() {
-        Some(port_bar) => {
-            if port_bar.size > u32::MAX as u64 {
-                return None;
-            }
-            (
-                port_bar.base,
-                port_bar.size as u32,
-                CM_RESOURCE_PORT_IO | CM_RESOURCE_PORT_BAR,
-            )
-        }
-        None => legacy_pci_io_port_range(device).unwrap_or((0, 0, 0)),
-    };
-    if mem_bar.is_none() && io_port_len == 0 {
-        return None;
-    }
-    let (mmio_phys, mmio_len) = mem_bar.map(|bar| (bar.base, bar.size)).unwrap_or((0, 0));
-    Some(ResourceAssignment {
-        mmio_phys,
-        mmio_len,
-        io_port_base,
-        io_port_len,
-        io_port_flags,
-        int_vector,
-        int_latched,
-        int_affinity,
-        dma_len,
-    })
-}
-
-/// Assign resources, then constrain the memory descriptor to the MMIO span the executive can
-/// actually grant. If the memory BAR cannot be granted but an I/O BAR is available, the returned
-/// assignment falls back to port resources only. Drivers such as dc21x4 accept either a memory or
-/// port CSR window, and NT's resource arbiter can choose the translated resource set it starts.
-pub fn assign_resources_with_granted_mmio(
-    device: &PciDevice,
-    int_vector: u32,
-    int_latched: bool,
-    int_affinity: u64,
-    dma_len: u64,
-    granted_mmio_len: u32,
-) -> Option<ResourceAssignment> {
-    let mut assignment = assign_resources(device, int_vector, int_latched, int_affinity, dma_len)?;
-    if assignment.mmio_len != 0 {
-        if granted_mmio_len == 0 {
-            if assignment.io_port_len == 0 {
-                return None;
-            }
-            assignment.mmio_phys = 0;
-            assignment.mmio_len = 0;
-        } else {
-            let mmio_len = assignment.mmio_len.min(granted_mmio_len as u64);
-            if mmio_len == 0 || mmio_len > u32::MAX as u64 {
-                return None;
-            }
-            assignment.mmio_len = mmio_len;
-        }
-    }
-    Some(assignment)
-}
-
-/// The largest `CM_RESOURCE_LIST` this crate currently emits for one device.
-pub const ASSIGNMENT_CM_LIST_MAX_SIZE: usize = MEMORY_PORT_INTERRUPT_LIST_SIZE;
-
-/// Encode a [`ResourceAssignment`] as the `CM_RESOURCE_LIST` a WDK driver reads at
-/// `IRP_MN_START_DEVICE`. `memory_start` is written into `u.Memory.Start` when the assignment has a
-/// memory resource; callers should pass the translated physical address for real WDM drivers that
-/// call `MmMapIoSpace`. The list contains exactly the assigned memory/port and optional interrupt
-/// descriptors. Returns the byte length written.
-pub fn assignment_to_cm_list(
-    buf: &mut [u8],
-    interface_type: i32,
-    bus_number: u32,
-    assign: &ResourceAssignment,
-    memory_start: u64,
-    mmio_len: u32,
-) -> Option<usize> {
-    let mem = (assign.mmio_len != 0 && mmio_len != 0).then_some(MemoryDescriptor {
-        start: memory_start,
-        length: mmio_len,
+    let length = u32::try_from(profile.mmio_len).ok()?;
+    let memory = CmResourceDescriptor::Memory(MemoryDescriptor {
+        start: profile.mmio_phys,
+        length,
         flags: CM_RESOURCE_MEMORY_READ_WRITE,
         share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
     });
-    let port = (assign.io_port_len != 0).then_some(PortDescriptor {
-        start: assign.io_port_base,
-        length: assign.io_port_len,
-        flags: assign.io_port_flags,
-        share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
-    });
-    let int = (assign.int_vector != 0).then_some(InterruptDescriptor {
-        level: assign.int_vector,
-        vector: assign.int_vector,
-        affinity: assign.int_affinity,
-        flags: if assign.int_latched {
+    let raw_interrupt = CmResourceDescriptor::Interrupt(InterruptDescriptor {
+        level: int_vector,
+        vector: int_vector,
+        affinity: u64::MAX,
+        flags: if int_latched {
             CM_RESOURCE_INTERRUPT_LATCHED
         } else {
             CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE
         },
         share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
     });
-    match (mem, port, int) {
-        (Some(mem), Some(port), Some(int)) => nt_cm_resources::build_memory_port_interrupt_list(
-            buf,
-            interface_type,
-            bus_number,
-            mem,
-            port,
-            int,
-        ),
-        (Some(mem), Some(port), None) => {
-            nt_cm_resources::build_memory_port_list(buf, interface_type, bus_number, mem, port)
-        }
-        (Some(mem), None, Some(int)) => {
-            nt_cm_resources::build_memory_interrupt_list(buf, interface_type, bus_number, mem, int)
-        }
-        (Some(mem), None, None) => {
-            nt_cm_resources::build_memory_list(buf, interface_type, bus_number, mem)
-        }
-        (None, Some(port), Some(int)) => {
-            nt_cm_resources::build_port_interrupt_list(buf, interface_type, bus_number, port, int)
-        }
-        (None, Some(port), None) => {
-            nt_cm_resources::build_port_list(buf, interface_type, bus_number, port)
-        }
-        (None, None, _) => None,
+    let translated_interrupt = CmResourceDescriptor::Interrupt(InterruptDescriptor {
+        level: int_vector,
+        vector: int_vector,
+        affinity: int_affinity,
+        flags: if int_latched {
+            CM_RESOURCE_INTERRUPT_LATCHED
+        } else {
+            CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE
+        },
+        share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+    });
+    ResourceAssignment::new(
+        alloc::vec![memory, raw_interrupt],
+        alloc::vec![memory, translated_interrupt],
+        dma_len,
+    )
+    .ok()
+}
+
+/// Assign resources to a device from its enumerated BARs and optional IRQ. `int_vector` is the
+/// translated interrupt vector the executive has
+/// arranged for this device; `0` means the bus assigned no interrupt. `dma_len` is the common-buffer
+/// size the driver needs (`0` for none). Returns `None` if the device exposes no memory or port
+/// resource.
+pub fn assign_resources(
+    device: &PciDevice,
+    interrupt: Option<PciInterruptAssignment>,
+    dma_len: u64,
+) -> Result<Option<ResourceAssignment>, ResourceRequirementsError> {
+    if device.irq_pin > 4 || (device.irq_pin == 0 && interrupt.is_some()) {
+        return Err(ResourceRequirementsError::InvalidInterruptPin);
     }
+    if device
+        .bars
+        .iter()
+        .any(|bar| bar.is_present() && !bar.is_assigned())
+    {
+        return Err(ResourceRequirementsError::UnassignedBar);
+    }
+    let address_count = device.bars.iter().filter(|bar| bar.is_present()).count();
+    if address_count == 0 {
+        return Ok(None);
+    }
+    let count = address_count.saturating_add(interrupt.is_some() as usize);
+    let mut raw = Vec::new();
+    let mut translated = Vec::new();
+    raw.try_reserve_exact(count)
+        .map_err(|_| ResourceRequirementsError::OutOfMemory)?;
+    translated
+        .try_reserve_exact(count)
+        .map_err(|_| ResourceRequirementsError::OutOfMemory)?;
+    for bar in device.bars.iter().filter(|bar| bar.is_present()) {
+        let length =
+            u32::try_from(bar.size).map_err(|_| ResourceRequirementsError::UnsupportedBarLength)?;
+        let descriptor = if bar.is_io {
+            let end = bar
+                .base
+                .checked_add(bar.size - 1)
+                .ok_or(ResourceRequirementsError::AddressOverflow)?;
+            if end > u16::MAX as u64 {
+                return Err(ResourceRequirementsError::UnsupportedBarLength);
+            }
+            CmResourceDescriptor::Port(PortDescriptor {
+                start: bar.base,
+                length,
+                flags: port_bar_flags(),
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            })
+        } else {
+            CmResourceDescriptor::Memory(MemoryDescriptor {
+                start: bar.base,
+                length,
+                flags: memory_bar_flags(bar),
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            })
+        };
+        raw.push(descriptor);
+        translated.push(descriptor);
+    }
+    if let Some(interrupt) = interrupt {
+        raw.push(CmResourceDescriptor::Interrupt(InterruptDescriptor {
+            level: interrupt.bus_level,
+            vector: interrupt.bus_level,
+            affinity: u64::MAX,
+            flags: CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE,
+            share: CM_RESOURCE_SHARE_SHARED,
+        }));
+        translated.push(CmResourceDescriptor::Interrupt(InterruptDescriptor {
+            level: interrupt.vector,
+            vector: interrupt.vector,
+            affinity: interrupt.affinity,
+            flags: if interrupt.latched {
+                CM_RESOURCE_INTERRUPT_LATCHED
+            } else {
+                CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE
+            },
+            share: CM_RESOURCE_SHARE_SHARED,
+        }));
+    }
+    ResourceAssignment::new(raw, translated, dma_len).map(Some)
+}
+
+/// The largest `CM_RESOURCE_LIST` this crate currently emits for one device.
+pub const ASSIGNMENT_CM_LIST_MAX_SIZE: usize = 20 + (PCI_NUM_BARS + 1) * 20;
+
+/// Encode a [`ResourceAssignment`] as the `CM_RESOURCE_LIST` a WDK driver reads at
+/// `IRP_MN_START_DEVICE`. The selected side preserves the bus descriptor order exactly.
+pub fn assignment_to_cm_list(
+    buf: &mut [u8],
+    interface_type: i32,
+    bus_number: u32,
+    assign: &ResourceAssignment,
+    view: ResourceView,
+) -> Result<usize, nt_cm_resources::CmResourceListError> {
+    nt_cm_resources::build_cm_resource_list(buf, interface_type, bus_number, assign.resources(view))
 }
 
 #[cfg(test)]
@@ -808,6 +1264,15 @@ mod tests {
     use super::*;
     use alloc::vec;
     use core::cell::RefCell;
+
+    fn interrupt(vector: u32, latched: bool, affinity: u64) -> Option<PciInterruptAssignment> {
+        Some(PciInterruptAssignment {
+            bus_level: vector,
+            vector,
+            latched,
+            affinity,
+        })
+    }
 
     /// A mock PCI config space: a map of `(dev, func, off) -> dword`, with the size-probe protocol
     /// implemented (an all-ones write to a BAR latches the size mask; reading back returns it; any
@@ -826,7 +1291,13 @@ mod tests {
                 .iter()
                 .find(|(k, _)| *k == (dev, func, off))
                 .map(|(_, v)| *v)
-                .unwrap_or(0xFFFF_FFFF)
+                .unwrap_or_else(|| {
+                    if off == PCI_CFG_HEADER || off == PCI_CFG_COMMAND_STATUS {
+                        0
+                    } else {
+                        0xFFFF_FFFF
+                    }
+                })
         }
         fn set(&self, dev: u8, func: u8, off: u8, v: u32) {
             let mut r = self.regs.borrow_mut();
@@ -864,6 +1335,7 @@ mod tests {
     fn nic_mock() -> MockConfig {
         let regs = vec![
             ((3, 0, PCI_CFG_VENDOR_DEVICE), 0x100E_8086),
+            ((3, 0, PCI_CFG_COMMAND_STATUS), 0xABCD_0007),
             ((3, 0, PCI_CFG_CLASS_REV), 0x0200_0000), // class 0x020000 in the high 24 bits
             ((3, 0, PCI_CFG_BAR0), 0xFEBC_0000),      // 32-bit mem BAR base
             ((3, 0, PCI_CFG_BAR0 + 4), 0xC001),       // I/O BAR base
@@ -911,6 +1383,215 @@ mod tests {
         let _ = enumerate_function(0, 3, 0, |o| m.read(3, 0, o), |o, v| m.write(3, 0, o, v));
         // The BAR must be restored to its original value after the size probe.
         assert_eq!(m.get(3, 0, PCI_CFG_BAR0), 0xFEBC_0000);
+        // Only command bits are restored. The status half is written as zero so W1C status bits
+        // cannot be cleared by the sizing transaction.
+        assert_eq!(m.get(3, 0, PCI_CFG_COMMAND_STATUS), 0x0000_0007);
+    }
+
+    #[test]
+    fn bridge_header_probes_only_its_two_bar_slots() {
+        let regs = vec![
+            ((8, 0, PCI_CFG_VENDOR_DEVICE), 0x5678_1234),
+            ((8, 0, PCI_CFG_CLASS_REV), 0x0604_0000),
+            (
+                (8, 0, PCI_CFG_HEADER),
+                (PCI_HEADER_TYPE_BRIDGE as u32) << 16,
+            ),
+            ((8, 0, PCI_CFG_BAR0), 0x9000_0000),
+            ((8, 0, PCI_CFG_BAR0 + 8), 0xA000_0000),
+            ((8, 0, PCI_CFG_INTERRUPT), 0),
+        ];
+        let m = MockConfig {
+            regs: RefCell::new(regs),
+            bar_masks: vec![
+                ((8, 0, PCI_CFG_BAR0), 0xFFFF_F000),
+                // This is a bridge-bus-number register, not BAR2. A six-BAR probe would publish it.
+                ((8, 0, PCI_CFG_BAR0 + 8), 0xFFFF_F000),
+            ],
+        };
+        let device =
+            enumerate_function(0, 8, 0, |o| m.read(8, 0, o), |o, v| m.write(8, 0, o, v)).unwrap();
+        assert_eq!(device.bars.len(), 1);
+        assert_eq!(device.bars[0].index, 0);
+        assert_eq!(m.get(8, 0, PCI_CFG_BAR0 + 8), 0xA000_0000);
+    }
+
+    #[test]
+    fn unpaired_64_bit_bar_does_not_probe_expansion_rom() {
+        let bar5 = PCI_CFG_BAR0 + 5 * 4;
+        let expansion_rom = bar5 + 4;
+        let regs = vec![
+            ((9, 0, PCI_CFG_VENDOR_DEVICE), 0x5678_1234),
+            ((9, 0, PCI_CFG_CLASS_REV), 0x0200_0000),
+            ((9, 0, bar5), 0xD000_0004),
+            ((9, 0, expansion_rom), 0xE000_0001),
+            ((9, 0, PCI_CFG_INTERRUPT), 0),
+        ];
+        let m = MockConfig {
+            regs: RefCell::new(regs),
+            bar_masks: vec![
+                ((9, 0, bar5), 0xFFFF_F004),
+                ((9, 0, expansion_rom), 0xFFFF_F800),
+            ],
+        };
+        let device =
+            enumerate_function(0, 9, 0, |o| m.read(9, 0, o), |o, v| m.write(9, 0, o, v)).unwrap();
+        assert!(device.bars.iter().all(|bar| bar.index != 5));
+        assert_eq!(m.get(9, 0, expansion_rom), 0xE000_0001);
+    }
+
+    #[test]
+    fn probes_and_restores_complete_prefetchable_64_bit_bar() {
+        let regs = vec![
+            ((6, 0, PCI_CFG_VENDOR_DEVICE), 0x5678_1234),
+            ((6, 0, PCI_CFG_CLASS_REV), 0x0200_0000),
+            ((6, 0, PCI_CFG_BAR0), 0x4000_000c),
+            ((6, 0, PCI_CFG_BAR0 + 4), 0x0000_0001),
+            ((6, 0, PCI_CFG_INTERRUPT), 0),
+        ];
+        let m = MockConfig {
+            regs: RefCell::new(regs),
+            bar_masks: vec![
+                ((6, 0, PCI_CFG_BAR0), 0xffe0_000c),
+                ((6, 0, PCI_CFG_BAR0 + 4), 0xffff_ffff),
+            ],
+        };
+        let device =
+            enumerate_function(0, 6, 0, |o| m.read(6, 0, o), |o, v| m.write(6, 0, o, v)).unwrap();
+        assert_eq!(device.bars.len(), 1);
+        let bar = device.first_memory_bar().unwrap();
+        assert!(bar.is_64bit);
+        assert!(bar.prefetchable);
+        assert_eq!(bar.base, 0x1_4000_0000);
+        assert_eq!(bar.size, 0x20_0000);
+        assert_eq!(bar.maximum_address, u64::MAX);
+        assert_eq!(m.get(6, 0, PCI_CFG_BAR0), 0x4000_000c);
+        assert_eq!(m.get(6, 0, PCI_CFG_BAR0 + 4), 1);
+    }
+
+    #[test]
+    fn pci_bus_publishes_all_bar_and_interrupt_requirements() {
+        let m = nic_mock();
+        let device =
+            enumerate_function(0, 3, 0, |o| m.read(3, 0, o), |o, v| m.write(3, 0, o, v)).unwrap();
+        let bytes = pci_resource_requirements(&device).unwrap().unwrap();
+        assert_eq!(bytes.len(), 40 + 3 * 32);
+        assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 136);
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 5);
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(bytes[36..40].try_into().unwrap()), 3);
+
+        assert_eq!(bytes[40], IO_RESOURCE_REQUIRED);
+        assert_eq!(bytes[41], nt_cm_resources::CM_RESOURCE_TYPE_MEMORY);
+        assert_eq!(
+            u32::from_le_bytes(bytes[48..52].try_into().unwrap()),
+            0x2_0000
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[56..64].try_into().unwrap()),
+            0xfebc_0000
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[64..72].try_into().unwrap()),
+            0xfebd_ffff
+        );
+
+        assert_eq!(bytes[73], nt_cm_resources::CM_RESOURCE_TYPE_PORT);
+        assert_eq!(
+            u64::from_le_bytes(bytes[88..96].try_into().unwrap()),
+            0xc000
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[96..104].try_into().unwrap()),
+            0xc03f
+        );
+
+        assert_eq!(bytes[105], nt_cm_resources::CM_RESOURCE_TYPE_INTERRUPT);
+        assert_eq!(bytes[106], CM_RESOURCE_SHARE_SHARED);
+        assert_eq!(u32::from_le_bytes(bytes[112..116].try_into().unwrap()), 0);
+        assert_eq!(
+            u32::from_le_bytes(bytes[116..120].try_into().unwrap()),
+            0xff
+        );
+    }
+
+    #[test]
+    fn pci_boot_resources_preserve_bar_order_flags_and_interrupt_translation() {
+        let m = nic_mock();
+        let device =
+            enumerate_function(0, 3, 0, |o| m.read(3, 0, o), |o, v| m.write(3, 0, o, v)).unwrap();
+        let resources = pci_boot_resources(&device, interrupt(5, true, 0x3))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resources.raw.len(), 80);
+        assert_eq!(resources.translated.len(), 80);
+        for bytes in [&resources.raw, &resources.translated] {
+            assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 5);
+            assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 0);
+            assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 3);
+            assert_eq!(bytes[20], nt_cm_resources::CM_RESOURCE_TYPE_MEMORY);
+            assert_eq!(bytes[40], nt_cm_resources::CM_RESOURCE_TYPE_PORT);
+            assert_eq!(bytes[60], nt_cm_resources::CM_RESOURCE_TYPE_INTERRUPT);
+            assert_eq!(
+                u16::from_le_bytes(bytes[22..24].try_into().unwrap()),
+                CM_RESOURCE_MEMORY_READ_WRITE | CM_RESOURCE_MEMORY_BAR
+            );
+            assert_eq!(
+                u16::from_le_bytes(bytes[42..44].try_into().unwrap()),
+                port_bar_flags()
+            );
+            assert_eq!(bytes[61], CM_RESOURCE_SHARE_SHARED);
+        }
+        assert_eq!(
+            u32::from_le_bytes(resources.raw[64..68].try_into().unwrap()),
+            11
+        );
+        assert_eq!(
+            u32::from_le_bytes(resources.raw[68..72].try_into().unwrap()),
+            11
+        );
+        assert_eq!(
+            u64::from_le_bytes(resources.raw[72..80].try_into().unwrap()),
+            u64::MAX
+        );
+        assert_eq!(
+            u16::from_le_bytes(resources.raw[62..64].try_into().unwrap()),
+            CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE
+        );
+        assert_eq!(
+            u32::from_le_bytes(resources.translated[64..68].try_into().unwrap()),
+            5
+        );
+        assert_eq!(
+            u32::from_le_bytes(resources.translated[68..72].try_into().unwrap()),
+            5
+        );
+        assert_eq!(
+            u64::from_le_bytes(resources.translated[72..80].try_into().unwrap()),
+            0x3
+        );
+        assert_eq!(
+            u16::from_le_bytes(resources.translated[62..64].try_into().unwrap()),
+            CM_RESOURCE_INTERRUPT_LATCHED
+        );
+    }
+
+    #[test]
+    fn root_profile_publishes_fixed_bus_requirements() {
+        let bytes = root_bus_resource_requirements(&ROOT_DMA_TEST_RESOURCE_PROFILE).unwrap();
+        assert_eq!(bytes.len(), 104);
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 15);
+        assert_eq!(u32::from_le_bytes(bytes[36..40].try_into().unwrap()), 2);
+        assert_eq!(bytes[41], nt_cm_resources::CM_RESOURCE_TYPE_MEMORY);
+        assert_eq!(
+            u64::from_le_bytes(bytes[56..64].try_into().unwrap()),
+            0x1000_0000
+        );
+        assert_eq!(bytes[73], nt_cm_resources::CM_RESOURCE_TYPE_INTERRUPT);
+        assert_eq!(u32::from_le_bytes(bytes[80..84].try_into().unwrap()), 5);
+        assert_eq!(u32::from_le_bytes(bytes[84..88].try_into().unwrap()), 5);
     }
 
     #[test]
@@ -972,8 +1653,10 @@ mod tests {
                     index: 0,
                     is_io: false,
                     is_64bit: false,
+                    prefetchable: false,
                     base: 0xFEBC_0000,
                     size: 0x2_0000,
+                    maximum_address: u32::MAX as u64,
                 }],
             },
         ];
@@ -1023,8 +1706,10 @@ mod tests {
                     index: 0,
                     is_io: false,
                     is_64bit: false,
+                    prefetchable: false,
                     base: 0xFEBC_0000,
                     size: 0x2_0000,
+                    maximum_address: u32::MAX as u64,
                 }],
             },
             PciDevice {
@@ -1040,8 +1725,10 @@ mod tests {
                     index: 0,
                     is_io: false,
                     is_64bit: false,
+                    prefetchable: false,
                     base: 0xFEBA_0000,
                     size: 0x2_0000,
+                    maximum_address: u32::MAX as u64,
                 }],
             },
         ];
@@ -1141,17 +1828,31 @@ mod tests {
             &[r"PCI\CC_020000"],
         )
         .unwrap();
-        let assign = assign_resources(nic, 5, true, 1, 0x1000).unwrap();
-        assert_eq!(assign.mmio_phys, 0xFEBC_0000);
-        assert_eq!(assign.mmio_len, 0x2_0000);
-        assert_eq!(assign.io_port_base, 0xC000);
-        assert_eq!(assign.io_port_len, 0x40);
+        let assign = assign_resources(nic, interrupt(5, true, 1), 0x1000)
+            .unwrap()
+            .unwrap();
+        let memory = assign
+            .memory_resources(ResourceView::Translated)
+            .next()
+            .unwrap();
+        let port = assign
+            .port_resources(ResourceView::Translated)
+            .next()
+            .unwrap();
+        let interrupt = assign.interrupt_resource(ResourceView::Translated).unwrap();
+        assert_eq!(memory.start, 0xFEBC_0000);
+        assert_eq!(memory.length, 0x2_0000);
+        assert_eq!(port.start, 0xC000);
+        assert_eq!(port.length, 0x40);
         assert_eq!(
-            assign.io_port_flags,
-            CM_RESOURCE_PORT_IO | CM_RESOURCE_PORT_BAR
+            port.flags,
+            CM_RESOURCE_PORT_IO
+                | CM_RESOURCE_PORT_16_BIT_DECODE
+                | CM_RESOURCE_PORT_POSITIVE_DECODE
+                | CM_RESOURCE_PORT_BAR
         );
-        assert_eq!(assign.int_vector, 5);
-        assert!(assign.int_latched);
+        assert_eq!(interrupt.vector, 5);
+        assert_eq!(interrupt.flags, CM_RESOURCE_INTERRUPT_LATCHED);
         assert_eq!(assign.dma_len, 0x1000);
 
         // The resource list names the caller-supplied translated memory address, the port BAR, and
@@ -1163,8 +1864,7 @@ mod tests {
             INTERFACE_TYPE_PCI_BUS,
             0,
             &assign,
-            memory_start,
-            0x2_0000,
+            ResourceView::Translated,
         )
         .unwrap();
         assert_eq!(n, MEMORY_PORT_INTERRUPT_LIST_SIZE);
@@ -1173,33 +1873,19 @@ mod tests {
         assert_eq!(mem.length, 0x2_0000);
         assert_eq!(port.start, 0xC000);
         assert_eq!(port.length, 0x40);
-        assert_eq!(port.flags, CM_RESOURCE_PORT_IO | CM_RESOURCE_PORT_BAR);
+        assert_eq!(
+            port.flags,
+            assign
+                .port_resources(ResourceView::Translated)
+                .next()
+                .unwrap()
+                .flags
+        );
+        assert_eq!(port.share, CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE);
+        assert_eq!(int.share, CM_RESOURCE_SHARE_SHARED);
         assert_eq!(int.vector, 5);
         assert_eq!(int.flags, CM_RESOURCE_INTERRUPT_LATCHED);
         assert_eq!(int.affinity, 1);
-    }
-
-    #[test]
-    fn falls_back_to_io_bar_when_mmio_cannot_be_granted() {
-        let m = nic_mock();
-        let dev =
-            enumerate_function(0, 3, 0, |o| m.read(3, 0, o), |o, v| m.write(3, 0, o, v)).unwrap();
-        assert!(dev.first_memory_bar().is_some());
-        assert!(dev.first_io_bar().is_some());
-
-        let assign = assign_resources_with_granted_mmio(&dev, 11, false, 1, 0x1000, 0).unwrap();
-        assert_eq!(assign.mmio_phys, 0);
-        assert_eq!(assign.mmio_len, 0);
-        assert_eq!(assign.io_port_base, 0xC000);
-        assert_eq!(assign.io_port_len, 0x40);
-
-        let mut buf = [0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
-        let n = assignment_to_cm_list(&mut buf, INTERFACE_TYPE_PCI_BUS, 0, &assign, 0, 0).unwrap();
-        assert_eq!(n, PORT_INTERRUPT_LIST_SIZE);
-        let (port, int) = nt_cm_resources::decode_port_interrupt_list(&buf).unwrap();
-        assert_eq!(port.start, 0xC000);
-        assert_eq!(port.length, 0x40);
-        assert_eq!(int.vector, 11);
     }
 
     #[test]
@@ -1213,65 +1899,35 @@ mod tests {
         ];
         let m = MockConfig {
             regs: RefCell::new(regs),
-            bar_masks: vec![
-                ((4, 0, PCI_CFG_BAR0), 0xFFFF_FF81),
-                ((4, 0, PCI_CFG_BAR0 + 4), 0xFFFE_0000),
-            ],
+            bar_masks: vec![((4, 0, PCI_CFG_BAR0), 0xFFFF_FF81)],
         };
         let dev =
             enumerate_function(0, 4, 0, |o| m.read(4, 0, o), |o, v| m.write(4, 0, o, v)).unwrap();
-        assert!(dev.bars.iter().any(|bar| !bar.is_io
-            && bar.is_present()
-            && !bar.is_assigned()
-            && bar.size == 0x2_0000));
         assert!(dev.first_memory_bar().is_none());
-        let assign = assign_resources(&dev, 10, false, 1, 0x1000).unwrap();
-        assert_eq!(assign.mmio_phys, 0);
-        assert_eq!(assign.mmio_len, 0);
-        assert_eq!(assign.io_port_base, 0x6000);
-        assert_eq!(assign.io_port_len, 0x80);
+        let assign = assign_resources(&dev, interrupt(10, false, 1), 0x1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(assign.memory_resources(ResourceView::Translated).count(), 0);
+        let assigned_port = assign
+            .port_resources(ResourceView::Translated)
+            .next()
+            .unwrap();
+        assert_eq!(assigned_port.start, 0x6000);
+        assert_eq!(assigned_port.length, 0x80);
         assert_eq!(
-            assign.io_port_flags,
-            CM_RESOURCE_PORT_IO | CM_RESOURCE_PORT_BAR
+            assigned_port.flags,
+            CM_RESOURCE_PORT_IO
+                | CM_RESOURCE_PORT_16_BIT_DECODE
+                | CM_RESOURCE_PORT_POSITIVE_DECODE
+                | CM_RESOURCE_PORT_BAR
         );
-        assert_eq!(assign.int_vector, 10);
-        assert!(!assign.int_latched);
+        let assigned_interrupt = assign.interrupt_resource(ResourceView::Translated).unwrap();
+        assert_eq!(assigned_interrupt.vector, 10);
+        assert_eq!(
+            assigned_interrupt.flags,
+            CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE
+        );
         assert_eq!(assign.dma_len, 0x1000);
-
-        let mut buf = [0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
-        let n = assignment_to_cm_list(&mut buf, INTERFACE_TYPE_PCI_BUS, 0, &assign, 0, 0).unwrap();
-        assert_eq!(n, PORT_INTERRUPT_LIST_SIZE);
-        let (port, int) = nt_cm_resources::decode_port_interrupt_list(&buf).unwrap();
-        assert_eq!(port.start, 0x6000);
-        assert_eq!(port.length, 0x80);
-        assert_eq!(port.flags, CM_RESOURCE_PORT_IO | CM_RESOURCE_PORT_BAR);
-        assert_eq!(int.vector, 10);
-        assert_eq!(int.flags, CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE);
-        assert_eq!(int.affinity, 1);
-    }
-
-    #[test]
-    fn bochs_display_gets_legacy_dispi_ports_without_interrupt() {
-        let regs = vec![
-            ((1, 0, PCI_CFG_VENDOR_DEVICE), 0x1111_1234),
-            ((1, 0, PCI_CFG_CLASS_REV), 0x0300_0000),
-            ((1, 0, PCI_CFG_BAR0), 0xE000_0000),
-            ((1, 0, PCI_CFG_INTERRUPT), 0x0000_00FF),
-        ];
-        let m = MockConfig {
-            regs: RefCell::new(regs),
-            bar_masks: vec![((1, 0, PCI_CFG_BAR0), 0xFF00_0000)],
-        };
-        let dev =
-            enumerate_function(0, 1, 0, |o| m.read(1, 0, o), |o, v| m.write(1, 0, o, v)).unwrap();
-        let assign = assign_resources(&dev, 0, false, 1, 0).unwrap();
-        assert_eq!(assign.mmio_phys, 0xE000_0000);
-        assert_eq!(assign.mmio_len, 0x0100_0000);
-        assert_eq!(assign.io_port_base, 0x01CE);
-        assert_eq!(assign.io_port_len, 2);
-        assert_eq!(assign.io_port_flags, CM_RESOURCE_PORT_IO);
-        assert_eq!(assign.int_vector, 0);
-        assert_eq!(assign.dma_len, 0);
 
         let mut buf = [0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
         let n = assignment_to_cm_list(
@@ -1279,16 +1935,180 @@ mod tests {
             INTERFACE_TYPE_PCI_BUS,
             0,
             &assign,
-            assign.mmio_phys,
-            0x1000,
+            ResourceView::Translated,
         )
         .unwrap();
-        assert_eq!(n, MEMORY_PORT_LIST_SIZE);
+        assert_eq!(n, PORT_INTERRUPT_LIST_SIZE);
+        let (port, int) = nt_cm_resources::decode_port_interrupt_list(&buf).unwrap();
+        assert_eq!(port.start, 0x6000);
+        assert_eq!(port.length, 0x80);
+        assert_eq!(port.flags, assigned_port.flags);
+        assert_eq!(int.vector, 10);
+        assert_eq!(int.flags, CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE);
+        assert_eq!(int.affinity, 1);
+    }
+
+    #[test]
+    fn assignment_preserves_multiple_bars_and_rejects_unassigned_resources() {
+        let base = PciDevice {
+            bus: 0,
+            dev: 7,
+            func: 0,
+            vendor: 0x1234,
+            device: 0x5678,
+            class: 0x020000,
+            irq_line: 10,
+            irq_pin: 1,
+            bars: vec![],
+        };
+        let memory = Bar {
+            index: 0,
+            is_io: false,
+            is_64bit: false,
+            prefetchable: false,
+            base: 0x8000_0000,
+            size: 0x1000,
+            maximum_address: u32::MAX as u64,
+        };
+        let port = Bar {
+            index: 2,
+            is_io: true,
+            is_64bit: false,
+            prefetchable: false,
+            base: 0x300,
+            size: 0x20,
+            maximum_address: u32::MAX as u64,
+        };
+
+        let mut unassigned = base.clone();
+        unassigned.bars.push(Bar { base: 0, ..memory });
+        assert_eq!(
+            assign_resources(&unassigned, interrupt(10, false, 1), 0),
+            Err(ResourceRequirementsError::UnassignedBar)
+        );
+
+        let mut two_memory = base.clone();
+        two_memory.bars.push(memory);
+        two_memory.bars.push(Bar {
+            index: 1,
+            base: 0x8001_0000,
+            ..memory
+        });
+        let two_memory = assign_resources(&two_memory, interrupt(10, false, 1), 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            two_memory
+                .memory_resources(ResourceView::Translated)
+                .map(|memory| memory.start)
+                .collect::<Vec<_>>(),
+            alloc::vec![0x8000_0000, 0x8001_0000]
+        );
+
+        let mut two_ports = base;
+        two_ports.bars.push(port);
+        two_ports.bars.push(Bar {
+            index: 3,
+            base: 0x340,
+            ..port
+        });
+        let two_ports = assign_resources(&two_ports, interrupt(10, false, 1), 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            two_ports
+                .port_resources(ResourceView::Translated)
+                .map(|port| port.start)
+                .collect::<Vec<_>>(),
+            alloc::vec![0x300, 0x340]
+        );
+        let mut bytes = [0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
+        let written = assignment_to_cm_list(
+            &mut bytes,
+            INTERFACE_TYPE_PCI_BUS,
+            0,
+            &two_ports,
+            ResourceView::Translated,
+        )
+        .unwrap();
+        assert_eq!(written, 80);
+        assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 3);
+        assert_eq!(bytes[20], nt_cm_resources::CM_RESOURCE_TYPE_PORT);
+        assert_eq!(bytes[40], nt_cm_resources::CM_RESOURCE_TYPE_PORT);
+        assert_eq!(bytes[60], nt_cm_resources::CM_RESOURCE_TYPE_INTERRUPT);
+    }
+
+    #[test]
+    fn platform_routes_line_less_display_without_inventing_dispi_resources() {
+        let regs = vec![
+            ((1, 0, PCI_CFG_VENDOR_DEVICE), 0x1111_1234),
+            ((1, 0, PCI_CFG_CLASS_REV), 0x0300_0000),
+            ((1, 0, PCI_CFG_BAR0), 0xE000_0000),
+            ((1, 0, PCI_CFG_INTERRUPT), 0x0000_01FF),
+        ];
+        let m = MockConfig {
+            regs: RefCell::new(regs),
+            bar_masks: vec![((1, 0, PCI_CFG_BAR0), 0xFF00_0000)],
+        };
+        let dev =
+            enumerate_function(0, 1, 0, |o| m.read(1, 0, o), |o, v| m.write(1, 0, o, v)).unwrap();
+        let routes = PciIntxRoutingTable::new(0, [Some(16), Some(17), Some(18), Some(19)]);
+        let vector = routes.route(&dev).unwrap();
+        assert_eq!(vector, 17);
+        let assign = assign_resources(&dev, interrupt(vector, false, 1), 0)
+            .unwrap()
+            .unwrap();
+        let memory = assign
+            .memory_resources(ResourceView::Translated)
+            .next()
+            .unwrap();
+        assert_eq!(memory.start, 0xE000_0000);
+        assert_eq!(memory.length, 0x0100_0000);
+        assert_eq!(assign.port_resources(ResourceView::Translated).count(), 0);
+        assert_eq!(
+            assign
+                .interrupt_resource(ResourceView::Translated)
+                .unwrap()
+                .vector,
+            17
+        );
+        assert_eq!(assign.dma_len, 0);
+
+        let boot = pci_boot_resources(&dev, None).unwrap().unwrap();
+        for bytes in [&boot.raw, &boot.translated] {
+            assert_eq!(bytes.len(), MEMORY_LIST_SIZE);
+            assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 1);
+            assert_eq!(bytes[20], nt_cm_resources::CM_RESOURCE_TYPE_MEMORY);
+        }
+
+        let mut buf = [0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
+        let n = assignment_to_cm_list(
+            &mut buf,
+            INTERFACE_TYPE_PCI_BUS,
+            0,
+            &assign,
+            ResourceView::Translated,
+        )
+        .unwrap();
+        assert_eq!(n, MEMORY_INTERRUPT_LIST_SIZE);
         assert_eq!(u32::from_le_bytes(buf[16..20].try_into().unwrap()), 2);
         assert_eq!(buf[20], nt_cm_resources::CM_RESOURCE_TYPE_MEMORY);
-        assert_eq!(buf[40], nt_cm_resources::CM_RESOURCE_TYPE_PORT);
-        assert_eq!(u64::from_le_bytes(buf[44..52].try_into().unwrap()), 0x01CE);
-        assert_eq!(u32::from_le_bytes(buf[52..56].try_into().unwrap()), 2);
+        assert_eq!(buf[40], nt_cm_resources::CM_RESOURCE_TYPE_INTERRUPT);
+        assert_eq!(u32::from_le_bytes(buf[44..48].try_into().unwrap()), 17);
+        let requirements = pci_resource_requirements(&dev).unwrap().unwrap();
+        assert_eq!(
+            u32::from_le_bytes(requirements[36..40].try_into().unwrap()),
+            2
+        );
+        assert!(!requirements
+            .windows(8)
+            .any(|window| window == 0x01ceu64.to_le_bytes()));
+        let filtered = pci_resource_requirements_filtered(&dev, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(filtered[36..40].try_into().unwrap()), 2);
+        assert_eq!(filtered[41], nt_cm_resources::CM_RESOURCE_TYPE_MEMORY);
+        assert_eq!(filtered[73], nt_cm_resources::CM_RESOURCE_TYPE_INTERRUPT);
     }
 
     #[test]
@@ -1323,14 +2143,24 @@ mod tests {
             0x1000,
         )
         .expect("root-bus DMA resources");
-        assert_eq!(assignment.mmio_phys, 0x1000_0000);
-        assert_eq!(assignment.mmio_len, 0x1000);
-        assert_eq!(assignment.io_port_base, 0);
-        assert_eq!(assignment.io_port_len, 0);
-        assert_eq!(assignment.io_port_flags, 0);
-        assert_eq!(assignment.int_vector, 5);
-        assert!(!assignment.int_latched);
-        assert_eq!(assignment.int_affinity, 1);
+        let memory = assignment
+            .memory_resources(ResourceView::Translated)
+            .next()
+            .unwrap();
+        assert_eq!(memory.start, 0x1000_0000);
+        assert_eq!(memory.length, 0x1000);
+        assert_eq!(memory.flags, CM_RESOURCE_MEMORY_READ_WRITE);
+        assert_eq!(
+            assignment.port_resources(ResourceView::Translated).count(),
+            0
+        );
+        let interrupt = assignment
+            .interrupt_resource(ResourceView::Translated)
+            .unwrap();
+        assert_eq!(interrupt.vector, 5);
+        assert_eq!(interrupt.flags, CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE);
+        assert_eq!(interrupt.affinity, 1);
+        assert_eq!(interrupt.share, CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE);
         assert_eq!(assignment.dma_len, 0x1000);
     }
 
@@ -1363,6 +2193,8 @@ mod tests {
             device_id: r"ROOT\USERSPACE_NTOS_SECOND",
             mmio_phys: 0x1001_0000,
             mmio_len: 0x2000,
+            interrupt_vector: 7,
+            interrupt_latched: false,
         };
         let mut catalog = RootBusResourceCatalog::new();
         catalog.register(ROOT_DMA_TEST_RESOURCE_PROFILE).unwrap();
@@ -1387,6 +2219,8 @@ mod tests {
                 device_id: "",
                 mmio_phys: 0x1000,
                 mmio_len: 0x1000,
+                interrupt_vector: 5,
+                interrupt_latched: false,
             }),
             Err(RootBusResourceCatalogError::EmptyDeviceId),
         );
@@ -1395,6 +2229,8 @@ mod tests {
                 device_id: r"ROOT\ZERO",
                 mmio_phys: 0,
                 mmio_len: 0x1000,
+                interrupt_vector: 5,
+                interrupt_latched: false,
             }),
             Err(RootBusResourceCatalogError::EmptyResource),
         );
@@ -1404,6 +2240,8 @@ mod tests {
                 device_id: r"root\userspace_ntos_dma",
                 mmio_phys: 0x2000_0000,
                 mmio_len: 0x1000,
+                interrupt_vector: 9,
+                interrupt_latched: true,
             }),
             Err(RootBusResourceCatalogError::DuplicateDeviceId),
         );
@@ -1425,6 +2263,8 @@ mod tests {
             enumerate_function(0, 5, 0, |o| m.read(5, 0, o), |o, v| m.write(5, 0, o, v)).unwrap();
         assert!(dev.first_memory_bar().is_none());
         assert!(dev.first_io_bar().is_none());
-        assert!(assign_resources(&dev, 5, true, 1, 0).is_none());
+        assert!(assign_resources(&dev, interrupt(5, true, 1), 0)
+            .unwrap()
+            .is_none());
     }
 }

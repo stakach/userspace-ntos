@@ -46,7 +46,7 @@ pub const GUID_BUS_TYPE_INTERNAL: [u8; 16] = [
 ];
 
 pub const INTERFACE_TYPE_PCI_BUS: u32 = 5;
-pub const INTERFACE_TYPE_PNP_BUS: u32 = 16;
+pub const INTERFACE_TYPE_PNP_BUS: u32 = 15;
 pub const DEVICE_ADDRESS_UNAVAILABLE: u32 = u32::MAX;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,8 +98,12 @@ pub struct PdoProperties {
     pub bus_information: Option<PnpBusInformation>,
     pub capabilities: Option<PdoCapabilities>,
     pub removal_policy: Option<DeviceRemovalPolicy>,
+    pub boot_resources_raw: PropertyBlobState,
     pub boot_resources_translated: PropertyBlobState,
+    /// Initial requirements returned by the bus before the function stack is built.
     pub resource_requirements: PropertyBlobState,
+    /// Requirements after `IRP_MN_FILTER_RESOURCE_REQUIREMENTS` has traversed the function stack.
+    pub filtered_resource_requirements: PropertyBlobState,
     pub allocated_resources_raw: PropertyBlobState,
     pub allocated_resources_translated: PropertyBlobState,
 }
@@ -108,6 +112,7 @@ impl PdoProperties {
     pub fn enumerated(
         bus_information: PnpBusInformation,
         capabilities: PdoCapabilities,
+        boot_resources_raw: PropertyBlobState,
         boot_resources_translated: PropertyBlobState,
         resource_requirements: PropertyBlobState,
     ) -> Self {
@@ -116,8 +121,10 @@ impl PdoProperties {
             bus_information: Some(bus_information),
             capabilities: Some(capabilities),
             removal_policy: Some(removal_policy),
+            boot_resources_raw,
             boot_resources_translated,
             resource_requirements,
+            filtered_resource_requirements: PropertyBlobState::Unqueried,
             allocated_resources_raw: PropertyBlobState::Unqueried,
             allocated_resources_translated: PropertyBlobState::Unqueried,
         }
@@ -127,6 +134,7 @@ impl PdoProperties {
         self.bus_information == other.bus_information
             && self.capabilities == other.capabilities
             && self.removal_policy == other.removal_policy
+            && self.boot_resources_raw == other.boot_resources_raw
             && self.boot_resources_translated == other.boot_resources_translated
             && self.resource_requirements == other.resource_requirements
     }
@@ -408,6 +416,32 @@ impl PnpManager {
         Ok(())
     }
 
+    pub fn commit_filtered_resource_requirements(
+        &mut self,
+        pdo_object_id: u64,
+        filtered: Vec<u8>,
+    ) -> Result<(), PnpError> {
+        let devnode = self
+            .devnodes
+            .iter_mut()
+            .find(|devnode| {
+                devnode.pdo_object_id == pdo_object_id
+                    && devnode.pdo_properties.is_some()
+                    && devnode.state != DeviceState::Removed
+            })
+            .ok_or(PnpError::StaleId)?;
+        devnode
+            .pdo_properties
+            .as_mut()
+            .unwrap()
+            .filtered_resource_requirements = if filtered.is_empty() {
+            PropertyBlobState::KnownNone
+        } else {
+            PropertyBlobState::Present(filtered)
+        };
+        Ok(())
+    }
+
     pub fn clear_resource_assignment(&mut self, pdo_object_id: u64) -> Result<(), PnpError> {
         let devnode = self
             .devnodes
@@ -421,6 +455,7 @@ impl PnpManager {
         let properties = devnode.pdo_properties.as_mut().unwrap();
         properties.allocated_resources_raw = PropertyBlobState::Unqueried;
         properties.allocated_resources_translated = PropertyBlobState::Unqueried;
+        properties.filtered_resource_requirements = PropertyBlobState::Unqueried;
         Ok(())
     }
 
@@ -469,7 +504,12 @@ impl PnpManager {
                 .removal_policy
                 .map(|policy| PnpDevicePropertyValue::U32(policy as u32))
                 .ok_or(PnpPropertyError::ObjectNameNotFound),
-            20 => property_blob_value(&properties.resource_requirements),
+            20 => match &properties.filtered_resource_requirements {
+                PropertyBlobState::Unqueried => {
+                    property_blob_value(&properties.resource_requirements)
+                }
+                filtered => property_blob_value(filtered),
+            },
             21 => property_blob_value(&properties.allocated_resources_raw),
             _ => Err(PnpPropertyError::InvalidProperty),
         }
@@ -587,6 +627,7 @@ mod tests {
                 surprise_removal_ok: false,
                 address: (3 << 16) | 1,
             },
+            PropertyBlobState::Present(vec![9, 8]),
             PropertyBlobState::Present(vec![1, 2, 3]),
             PropertyBlobState::KnownNone,
         )
@@ -630,6 +671,12 @@ mod tests {
             p.query_device_property(pdo, 20),
             Ok(PnpDevicePropertyValue::Bytes(&[]))
         );
+        p.commit_filtered_resource_requirements(pdo, vec![0x44, 0x55])
+            .unwrap();
+        assert_eq!(
+            p.query_device_property(pdo, 20),
+            Ok(PnpDevicePropertyValue::Bytes(&[0x44, 0x55]))
+        );
         assert_eq!(
             p.query_device_property(pdo, 21),
             Err(PnpPropertyError::DeviceNotReady)
@@ -672,6 +719,13 @@ mod tests {
         conflicting.capabilities.as_mut().unwrap().address = 7;
         assert_eq!(
             p.register_enumerated_pdo(r"PCI\VEN_1234&DEV_5678\0001", pdo, conflicting),
+            Err(PnpError::ConflictingPdo)
+        );
+
+        let mut conflicting_raw = pci_properties();
+        conflicting_raw.boot_resources_raw = PropertyBlobState::Present(vec![7]);
+        assert_eq!(
+            p.register_enumerated_pdo(r"PCI\VEN_1234&DEV_5678\0001", pdo, conflicting_raw,),
             Err(PnpError::ConflictingPdo)
         );
         assert_eq!(

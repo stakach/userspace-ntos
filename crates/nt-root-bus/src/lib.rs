@@ -89,6 +89,42 @@ impl DeviceCapabilities {
     }
 }
 
+/// One successful bus resource query result. A failed or unissued query is not representable as a
+/// PDO publication.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BusResourceState {
+    KnownNone,
+    Present(Vec<u8>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PdoResourcePublication {
+    pub raw_boot_resources: BusResourceState,
+    pub resource_requirements: BusResourceState,
+}
+
+impl PdoResourcePublication {
+    pub fn none() -> Self {
+        Self {
+            raw_boot_resources: BusResourceState::KnownNone,
+            resource_requirements: BusResourceState::KnownNone,
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        fn state_is_valid(state: &BusResourceState) -> bool {
+            !matches!(state, BusResourceState::Present(bytes) if bytes.is_empty())
+        }
+        state_is_valid(&self.raw_boot_resources) && state_is_valid(&self.resource_requirements)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BusResourceQuery<'a> {
+    KnownNone,
+    Present(&'a [u8]),
+}
+
 /// A physical device object the root bus created for one devnode.
 #[derive(Clone, Debug)]
 pub struct Pdo {
@@ -104,6 +140,8 @@ pub struct Pdo {
     pub instance_id: String,
     /// `IRP_MN_QUERY_CAPABILITIES`.
     pub capabilities: DeviceCapabilities,
+    /// Immutable master snapshots returned by the bus resource queries.
+    pub resource_publication: PdoResourcePublication,
     /// Whether the bus has started this PDO (set by `IRP_MN_START_DEVICE` reaching the bottom of
     /// the device stack, cleared by `IRP_MN_REMOVE_DEVICE`).
     pub started: bool,
@@ -146,11 +184,14 @@ pub enum RootBusPdoError {
     EmptyHardwareId,
     /// One compatible-ID entry is empty.
     EmptyCompatibleId,
+    /// A successful resource query was marked present with an empty native byte image.
+    EmptyResourcePublication,
 }
 
 /// `NTSTATUS` the PDO's PnP dispatch returns.
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_NO_SUCH_DEVICE: i32 = 0xC000_000Eu32 as i32;
+const STATUS_NOT_SUPPORTED: i32 = 0xC000_00BBu32 as i32;
 
 /// `IRP_MN_START_DEVICE` — the bus PDO's start minor.
 pub const IRP_MN_START_DEVICE: u8 = 0x00;
@@ -232,6 +273,30 @@ impl RootBus {
         H: AsRef<str>,
         C: AsRef<str>,
     {
+        self.try_create_pdo_with_resource_publication(
+            canonical_id,
+            device_id,
+            hardware_ids,
+            compatible_ids,
+            instance_id,
+            PdoResourcePublication::none(),
+        )
+    }
+
+    /// Publish a canonical PDO together with the exact successful bus resource-query snapshots.
+    pub fn try_create_pdo_with_resource_publication<H, C>(
+        &mut self,
+        canonical_id: DeviceId,
+        device_id: &str,
+        hardware_ids: &[H],
+        compatible_ids: &[C],
+        instance_id: &str,
+        resource_publication: PdoResourcePublication,
+    ) -> Result<DeviceId, RootBusPdoError>
+    where
+        H: AsRef<str>,
+        C: AsRef<str>,
+    {
         Self::validate_pdo_identity(
             canonical_id,
             device_id,
@@ -239,6 +304,9 @@ impl RootBus {
             compatible_ids,
             instance_id,
         )?;
+        if !resource_publication.is_valid() {
+            return Err(RootBusPdoError::EmptyResourcePublication);
+        }
         if self.pdo(canonical_id).is_some() {
             return Err(RootBusPdoError::DuplicateCanonicalDeviceId);
         }
@@ -255,6 +323,7 @@ impl RootBus {
             compatible_ids: compatible_ids.iter().map(|s| s.as_ref().into()).collect(),
             instance_id: instance_id.into(),
             capabilities: DeviceCapabilities::root_default(),
+            resource_publication,
             started: false,
         });
         Ok(canonical_id)
@@ -376,6 +445,27 @@ impl RootBus {
         self.pdo(canonical_id).map(|p| &p.capabilities)
     }
 
+    /// Answer `IRP_MN_QUERY_RESOURCES` from the bus-owned master snapshot.
+    pub fn query_resources(&self, canonical_id: DeviceId) -> Option<BusResourceQuery<'_>> {
+        let pdo = self.pdo(canonical_id)?;
+        Some(match &pdo.resource_publication.raw_boot_resources {
+            BusResourceState::KnownNone => BusResourceQuery::KnownNone,
+            BusResourceState::Present(bytes) => BusResourceQuery::Present(bytes),
+        })
+    }
+
+    /// Answer `IRP_MN_QUERY_RESOURCE_REQUIREMENTS` from the bus-owned master snapshot.
+    pub fn query_resource_requirements(
+        &self,
+        canonical_id: DeviceId,
+    ) -> Option<BusResourceQuery<'_>> {
+        let pdo = self.pdo(canonical_id)?;
+        Some(match &pdo.resource_publication.resource_requirements {
+            BusResourceState::KnownNone => BusResourceQuery::KnownNone,
+            BusResourceState::Present(bytes) => BusResourceQuery::Present(bytes),
+        })
+    }
+
     /// Answer `IRP_MN_QUERY_DEVICE_RELATIONS(BusRelations)`: the object IDs of every child PDO the
     /// bus has enumerated — the root of the device tree reporting its children.
     pub fn query_device_relations(&self) -> Vec<DeviceId> {
@@ -405,7 +495,7 @@ impl RootBus {
             | IRP_MN_CANCEL_STOP_DEVICE
             | IRP_MN_QUERY_REMOVE_DEVICE
             | IRP_MN_CANCEL_REMOVE_DEVICE => {}
-            _ => {}
+            _ => return STATUS_NOT_SUPPORTED,
         }
         STATUS_SUCCESS
     }
@@ -499,6 +589,51 @@ mod tests {
     }
 
     #[test]
+    fn resource_queries_preserve_successful_none_and_present() {
+        let mut resource_bus = RootBus::new();
+        let empty: [&str; 0] = [];
+        resource_bus
+            .try_create_pdo_with_resource_publication(
+                PRIMARY_PDO,
+                r"ROOT\RESOURCEFUL",
+                &[r"ROOT\RESOURCEFUL"],
+                &empty,
+                "0001",
+                PdoResourcePublication {
+                    raw_boot_resources: BusResourceState::Present(alloc::vec![1, 2, 3]),
+                    resource_requirements: BusResourceState::Present(alloc::vec![4, 5, 6, 7]),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            resource_bus.query_resources(PRIMARY_PDO),
+            Some(BusResourceQuery::Present(&[1, 2, 3]))
+        );
+        assert_eq!(
+            resource_bus.query_resource_requirements(PRIMARY_PDO),
+            Some(BusResourceQuery::Present(&[4, 5, 6, 7]))
+        );
+        assert_eq!(
+            bus().query_resource_requirements(PRIMARY_PDO),
+            Some(BusResourceQuery::KnownNone)
+        );
+        assert_eq!(
+            resource_bus.try_create_pdo_with_resource_publication(
+                DeviceId::new(1, 2),
+                r"ROOT\EMPTY",
+                &[r"ROOT\EMPTY"],
+                &empty,
+                "0001",
+                PdoResourcePublication {
+                    raw_boot_resources: BusResourceState::KnownNone,
+                    resource_requirements: BusResourceState::Present(alloc::vec![]),
+                },
+            ),
+            Err(RootBusPdoError::EmptyResourcePublication)
+        );
+    }
+
+    #[test]
     fn unknown_pdo_returns_none() {
         let b = bus();
         assert!(b
@@ -534,6 +669,7 @@ mod tests {
         assert_eq!(b.dispatch_pnp(PRIMARY_PDO, IRP_MN_REMOVE_DEVICE), 0);
         assert!(!b.pdo_started(PRIMARY_PDO));
         assert_ne!(b.dispatch_pnp(DeviceId::new(1, 99), IRP_MN_START_DEVICE), 0);
+        assert_eq!(b.dispatch_pnp(PRIMARY_PDO, 0x0b), STATUS_NOT_SUPPORTED);
     }
 
     #[test]

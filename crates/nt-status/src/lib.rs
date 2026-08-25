@@ -87,6 +87,8 @@ statuses! {
     INVALID_HANDLE = 0xC000_0008u32;
     /// A parameter was invalid.
     INVALID_PARAMETER = 0xC000_000Du32;
+    /// The requested address range conflicts with an existing resource assignment.
+    CONFLICTING_ADDRESSES = 0xC000_0018u32;
     /// Access was denied.
     ACCESS_DENIED = 0xC000_0022u32;
     /// Insufficient resources (out of slots/memory).

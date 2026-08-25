@@ -1,8 +1,10 @@
-//! # `nt-cm-resources` — `CM_RESOURCE_LIST` encoding for PnP `START_DEVICE`
+//! # `nt-cm-resources` — native NT resource-list encoding
 //!
 //! Encodes the WDK `CM_RESOURCE_LIST` variable-length layout (spec: NT PnP Manager,
 //! Milestone 12, §7.1, §13.3) that a function driver reads from
 //! `Parameters.StartDevice.AllocatedResourcesTranslated` during `IRP_MN_START_DEVICE`.
+//! It also encodes the bus-owned `IO_RESOURCE_REQUIREMENTS_LIST` returned by
+//! `IRP_MN_QUERY_RESOURCE_REQUIREMENTS` before allocation.
 //! The layout is `#pragma pack(4)` — a `CM_PARTIAL_RESOURCE_DESCRIPTOR` is 20 bytes.
 //! `no_std`, no allocation, no raw pointers in the encoded bytes; the caller copies
 //! the result into driver-visible memory.
@@ -38,10 +40,14 @@ pub const CM_RESOURCE_INTERRUPT_LATCHED: u16 = 1;
 
 /// Memory `Flags` bits.
 pub const CM_RESOURCE_MEMORY_READ_WRITE: u16 = 0;
+pub const CM_RESOURCE_MEMORY_PREFETCHABLE: u16 = 0x0004;
+pub const CM_RESOURCE_MEMORY_BAR: u16 = 0x0080;
 
 /// Port `Flags` bits.
 pub const CM_RESOURCE_PORT_MEMORY: u16 = 0;
 pub const CM_RESOURCE_PORT_IO: u16 = 1;
+pub const CM_RESOURCE_PORT_16_BIT_DECODE: u16 = 0x0010;
+pub const CM_RESOURCE_PORT_POSITIVE_DECODE: u16 = 0x0020;
 pub const CM_RESOURCE_PORT_BAR: u16 = 0x0100;
 
 /// `ShareDisposition` values.
@@ -53,7 +59,7 @@ pub const CM_RESOURCE_SHARE_SHARED: u8 = 3;
 /// `InterfaceType` values used by the hosted buses.
 pub const INTERFACE_TYPE_INTERNAL: i32 = 0;
 pub const INTERFACE_TYPE_PCI_BUS: i32 = 5;
-pub const INTERFACE_TYPE_PNP_BUS: i32 = 16;
+pub const INTERFACE_TYPE_PNP_BUS: i32 = 15;
 
 /// Size of one `CM_PARTIAL_RESOURCE_DESCRIPTOR` (WDK `#pragma pack(4)`).
 pub const PARTIAL_DESCRIPTOR_SIZE: usize = 20;
@@ -70,6 +76,68 @@ pub const PORT_LIST_SIZE: usize = 40;
 /// Total encoded size of a one-port + one-interrupt `CM_RESOURCE_LIST`.
 pub const PORT_INTERRUPT_LIST_SIZE: usize = 60;
 
+/// `IO_RESOURCE_DESCRIPTOR.Option` values.
+pub const IO_RESOURCE_REQUIRED: u8 = 0;
+pub const IO_RESOURCE_PREFERRED: u8 = 0x01;
+pub const IO_RESOURCE_DEFAULT: u8 = 0x02;
+pub const IO_RESOURCE_ALTERNATIVE: u8 = 0x08;
+
+/// Fixed portion of `IO_RESOURCE_REQUIREMENTS_LIST` before its first alternative list.
+pub const IO_RESOURCE_REQUIREMENTS_FIXED_SIZE: usize = 32;
+/// Native size of one `IO_RESOURCE_LIST` header before its descriptors.
+pub const IO_RESOURCE_LIST_HEADER_SIZE: usize = 8;
+/// Offset of the first `IO_RESOURCE_LIST.Descriptors` array.
+pub const IO_RESOURCE_REQUIREMENTS_HEADER_SIZE: usize =
+    IO_RESOURCE_REQUIREMENTS_FIXED_SIZE + IO_RESOURCE_LIST_HEADER_SIZE;
+/// Native size of one `IO_RESOURCE_DESCRIPTOR` on NT x64.
+pub const IO_RESOURCE_DESCRIPTOR_SIZE: usize = 32;
+
+/// One memory or port constraint in an `IO_RESOURCE_REQUIREMENTS_LIST`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct IoAddressRequirement {
+    pub option: u8,
+    pub share: u8,
+    pub flags: u16,
+    pub length: u32,
+    pub alignment: u32,
+    pub minimum: u64,
+    pub maximum: u64,
+}
+
+/// One interrupt constraint in an `IO_RESOURCE_REQUIREMENTS_LIST`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct IoInterruptRequirement {
+    pub option: u8,
+    pub share: u8,
+    pub flags: u16,
+    pub minimum_vector: u32,
+    pub maximum_vector: u32,
+    pub affinity_policy: u32,
+    pub priority_policy: u32,
+    pub targeted_processors: u64,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum IoResourceRequirement {
+    Memory(IoAddressRequirement),
+    Port(IoAddressRequirement),
+    Interrupt(IoInterruptRequirement),
+}
+
+/// One complete, mutually exclusive resource configuration.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct IoResourceAlternative<'a> {
+    pub descriptors: &'a [IoResourceRequirement],
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum IoResourceRequirementsError {
+    Empty,
+    InvalidDescriptor,
+    SizeOverflow,
+    BufferTooSmall { required: usize },
+}
+
 fn w32(buf: &mut [u8], off: usize, v: u32) {
     buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
@@ -80,8 +148,173 @@ fn w64(buf: &mut [u8], off: usize, v: u64) {
     buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
 
+fn io_option_is_valid(option: u8) -> bool {
+    option & !(IO_RESOURCE_PREFERRED | IO_RESOURCE_DEFAULT | IO_RESOURCE_ALTERNATIVE) == 0
+}
+
+fn address_requirement_is_valid(requirement: IoAddressRequirement) -> bool {
+    if !io_option_is_valid(requirement.option)
+        || requirement.length == 0
+        || requirement.alignment == 0
+        || requirement.maximum < requirement.minimum
+    {
+        return false;
+    }
+    requirement
+        .maximum
+        .checked_sub(requirement.minimum)
+        .and_then(|span| span.checked_add(1))
+        .is_some_and(|span| span >= requirement.length as u64)
+}
+
+/// Required native byte size for one alternative list containing `descriptor_count` descriptors.
+pub fn io_resource_requirements_list_size(descriptor_count: usize) -> Option<usize> {
+    IO_RESOURCE_REQUIREMENTS_HEADER_SIZE
+        .checked_add(descriptor_count.checked_mul(IO_RESOURCE_DESCRIPTOR_SIZE)?)
+}
+
+/// Required native byte size for all complete alternative lists.
+pub fn io_resource_requirements_lists_size(
+    alternatives: &[IoResourceAlternative<'_>],
+) -> Option<usize> {
+    let mut size = IO_RESOURCE_REQUIREMENTS_FIXED_SIZE;
+    for alternative in alternatives {
+        size = size.checked_add(IO_RESOURCE_LIST_HEADER_SIZE)?;
+        size = size.checked_add(
+            alternative
+                .descriptors
+                .len()
+                .checked_mul(IO_RESOURCE_DESCRIPTOR_SIZE)?,
+        )?;
+    }
+    Some(size)
+}
+
+/// Encode one bus-owned `IO_RESOURCE_REQUIREMENTS_LIST` alternative.
+///
+/// The caller supplies constraints in native descriptor order. Validation and the capacity check
+/// complete before the output buffer is modified.
+pub fn build_io_resource_requirements_list(
+    buf: &mut [u8],
+    interface_type: i32,
+    bus_number: u32,
+    slot_number: u32,
+    requirements: &[IoResourceRequirement],
+) -> Result<usize, IoResourceRequirementsError> {
+    build_io_resource_requirements_lists(
+        buf,
+        interface_type,
+        bus_number,
+        slot_number,
+        &[IoResourceAlternative {
+            descriptors: requirements,
+        }],
+    )
+}
+
+/// Encode one or more complete, mutually exclusive bus resource configurations.
+pub fn build_io_resource_requirements_lists(
+    buf: &mut [u8],
+    interface_type: i32,
+    bus_number: u32,
+    slot_number: u32,
+    alternatives: &[IoResourceAlternative<'_>],
+) -> Result<usize, IoResourceRequirementsError> {
+    if alternatives.is_empty() || alternatives.iter().any(|list| list.descriptors.is_empty()) {
+        return Err(IoResourceRequirementsError::Empty);
+    }
+    if alternatives.len() > u32::MAX as usize
+        || alternatives
+            .iter()
+            .any(|list| list.descriptors.len() > u32::MAX as usize)
+    {
+        return Err(IoResourceRequirementsError::SizeOverflow);
+    }
+    for alternative in alternatives {
+        for requirement in alternative.descriptors {
+            let valid = match *requirement {
+                IoResourceRequirement::Memory(address) | IoResourceRequirement::Port(address) => {
+                    address_requirement_is_valid(address)
+                }
+                IoResourceRequirement::Interrupt(interrupt) => {
+                    io_option_is_valid(interrupt.option)
+                        && interrupt.minimum_vector <= interrupt.maximum_vector
+                }
+            };
+            if !valid {
+                return Err(IoResourceRequirementsError::InvalidDescriptor);
+            }
+        }
+    }
+    let total_size = io_resource_requirements_lists_size(alternatives)
+        .ok_or(IoResourceRequirementsError::SizeOverflow)?;
+    if total_size > u32::MAX as usize {
+        return Err(IoResourceRequirementsError::SizeOverflow);
+    }
+    if buf.len() < total_size {
+        return Err(IoResourceRequirementsError::BufferTooSmall {
+            required: total_size,
+        });
+    }
+
+    buf[..total_size].fill(0);
+    w32(buf, 0, total_size as u32);
+    w32(buf, 4, interface_type as u32);
+    w32(buf, 8, bus_number);
+    w32(buf, 12, slot_number);
+    w32(buf, 28, alternatives.len() as u32);
+
+    let mut list_offset = IO_RESOURCE_REQUIREMENTS_FIXED_SIZE;
+    for alternative in alternatives {
+        w16(buf, list_offset, 1);
+        w16(buf, list_offset + 2, 1);
+        w32(buf, list_offset + 4, alternative.descriptors.len() as u32);
+        let descriptor_base = list_offset + IO_RESOURCE_LIST_HEADER_SIZE;
+        for (index, requirement) in alternative.descriptors.iter().copied().enumerate() {
+            let offset = descriptor_base + index * IO_RESOURCE_DESCRIPTOR_SIZE;
+            match requirement {
+                IoResourceRequirement::Memory(address) => {
+                    write_io_address_requirement(buf, offset, CM_RESOURCE_TYPE_MEMORY, address)
+                }
+                IoResourceRequirement::Port(address) => {
+                    write_io_address_requirement(buf, offset, CM_RESOURCE_TYPE_PORT, address)
+                }
+                IoResourceRequirement::Interrupt(interrupt) => {
+                    buf[offset] = interrupt.option;
+                    buf[offset + 1] = CM_RESOURCE_TYPE_INTERRUPT;
+                    buf[offset + 2] = interrupt.share;
+                    w16(buf, offset + 4, interrupt.flags);
+                    w32(buf, offset + 8, interrupt.minimum_vector);
+                    w32(buf, offset + 12, interrupt.maximum_vector);
+                    w32(buf, offset + 16, interrupt.affinity_policy);
+                    w32(buf, offset + 20, interrupt.priority_policy);
+                    w64(buf, offset + 24, interrupt.targeted_processors);
+                }
+            }
+        }
+        list_offset = descriptor_base + alternative.descriptors.len() * IO_RESOURCE_DESCRIPTOR_SIZE;
+    }
+    Ok(total_size)
+}
+
+fn write_io_address_requirement(
+    buf: &mut [u8],
+    offset: usize,
+    resource_type: u8,
+    requirement: IoAddressRequirement,
+) {
+    buf[offset] = requirement.option;
+    buf[offset + 1] = resource_type;
+    buf[offset + 2] = requirement.share;
+    w16(buf, offset + 4, requirement.flags);
+    w32(buf, offset + 8, requirement.length);
+    w32(buf, offset + 12, requirement.alignment);
+    w64(buf, offset + 16, requirement.minimum);
+    w64(buf, offset + 24, requirement.maximum);
+}
+
 /// The parameters for a memory descriptor.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct MemoryDescriptor {
     pub start: u64,
     pub length: u32,
@@ -90,7 +323,7 @@ pub struct MemoryDescriptor {
 }
 
 /// The parameters for an I/O port descriptor.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PortDescriptor {
     pub start: u64,
     pub length: u32,
@@ -99,13 +332,92 @@ pub struct PortDescriptor {
 }
 
 /// The parameters for an interrupt descriptor (translated form).
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct InterruptDescriptor {
     pub level: u32,
     pub vector: u32,
     pub affinity: u64,
     pub flags: u16,
     pub share: u8,
+}
+
+/// One native `CM_PARTIAL_RESOURCE_DESCRIPTOR` supported by the generic encoder.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CmResourceDescriptor {
+    Memory(MemoryDescriptor),
+    Port(PortDescriptor),
+    Interrupt(InterruptDescriptor),
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CmResourceListError {
+    Empty,
+    InvalidDescriptor,
+    SizeOverflow,
+    BufferTooSmall { required: usize },
+}
+
+/// Required native byte size for one full resource descriptor containing `count` partial
+/// descriptors.
+pub fn cm_resource_list_size(count: usize) -> Option<usize> {
+    20usize.checked_add(count.checked_mul(PARTIAL_DESCRIPTOR_SIZE)?)
+}
+
+/// Encode one arbitrary ordered `CM_RESOURCE_LIST`.
+///
+/// Validation and the capacity check complete before `buf` is modified.
+pub fn build_cm_resource_list(
+    buf: &mut [u8],
+    interface_type: i32,
+    bus_number: u32,
+    descriptors: &[CmResourceDescriptor],
+) -> Result<usize, CmResourceListError> {
+    if descriptors.is_empty() {
+        return Err(CmResourceListError::Empty);
+    }
+    if descriptors.len() > u32::MAX as usize {
+        return Err(CmResourceListError::SizeOverflow);
+    }
+    for descriptor in descriptors {
+        let valid = match descriptor {
+            CmResourceDescriptor::Memory(memory) => {
+                memory.length != 0 && memory.start.checked_add(memory.length as u64 - 1).is_some()
+            }
+            CmResourceDescriptor::Port(port) => {
+                port.length != 0 && port.start.checked_add(port.length as u64 - 1).is_some()
+            }
+            // IRQ/vector zero is a valid raw bus interrupt. There is no empty interrupt
+            // descriptor encoding analogous to a zero-length address descriptor.
+            CmResourceDescriptor::Interrupt(_) => true,
+        };
+        if !valid {
+            return Err(CmResourceListError::InvalidDescriptor);
+        }
+    }
+    let required =
+        cm_resource_list_size(descriptors.len()).ok_or(CmResourceListError::SizeOverflow)?;
+    if buf.len() < required {
+        return Err(CmResourceListError::BufferTooSmall { required });
+    }
+    build_list_header(
+        buf,
+        required,
+        interface_type,
+        bus_number,
+        descriptors.len() as u32,
+    )
+    .ok_or(CmResourceListError::BufferTooSmall { required })?;
+    for (index, descriptor) in descriptors.iter().copied().enumerate() {
+        let offset = 20 + index * PARTIAL_DESCRIPTOR_SIZE;
+        match descriptor {
+            CmResourceDescriptor::Memory(memory) => write_memory_descriptor(buf, offset, memory),
+            CmResourceDescriptor::Port(port) => write_port_descriptor(buf, offset, port),
+            CmResourceDescriptor::Interrupt(interrupt) => {
+                write_interrupt_descriptor(buf, offset, interrupt)
+            }
+        }
+    }
+    Ok(required)
 }
 
 fn build_list_header(
@@ -387,6 +699,200 @@ pub fn decode_port_interrupt_list(buf: &[u8]) -> Option<(PortDescriptor, Interru
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generic_cm_list_preserves_descriptor_order_and_irq_zero() {
+        let descriptors = [
+            CmResourceDescriptor::Port(PortDescriptor {
+                start: 0x6040,
+                length: 0x40,
+                flags: CM_RESOURCE_PORT_IO | CM_RESOURCE_PORT_BAR,
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            }),
+            CmResourceDescriptor::Memory(MemoryDescriptor {
+                start: 0x1_4000_0000,
+                length: 0x20_0000,
+                flags: CM_RESOURCE_MEMORY_READ_WRITE | CM_RESOURCE_MEMORY_PREFETCHABLE,
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            }),
+            CmResourceDescriptor::Interrupt(InterruptDescriptor {
+                level: 0,
+                vector: 0,
+                affinity: u64::MAX,
+                flags: CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE,
+                share: CM_RESOURCE_SHARE_SHARED,
+            }),
+        ];
+        let mut bytes = [0xcc; 81];
+        let written =
+            build_cm_resource_list(&mut bytes, INTERFACE_TYPE_PCI_BUS, 3, &descriptors).unwrap();
+
+        assert_eq!(written, 80);
+        assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 5);
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 3);
+        assert_eq!(bytes[20], CM_RESOURCE_TYPE_PORT);
+        assert_eq!(bytes[40], CM_RESOURCE_TYPE_MEMORY);
+        assert_eq!(bytes[60], CM_RESOURCE_TYPE_INTERRUPT);
+        assert_eq!(u64::from_le_bytes(bytes[64..72].try_into().unwrap()), 0);
+        assert_eq!(
+            u64::from_le_bytes(bytes[72..80].try_into().unwrap()),
+            u64::MAX
+        );
+        assert_eq!(bytes[80], 0xcc);
+    }
+
+    #[test]
+    fn generic_cm_list_validation_is_all_or_nothing() {
+        let invalid = [CmResourceDescriptor::Memory(MemoryDescriptor {
+            start: 0x1000,
+            length: 0,
+            flags: CM_RESOURCE_MEMORY_READ_WRITE,
+            share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+        })];
+        let mut bytes = [0xa5; 40];
+        assert_eq!(
+            build_cm_resource_list(&mut bytes, INTERFACE_TYPE_INTERNAL, 0, &invalid),
+            Err(CmResourceListError::InvalidDescriptor)
+        );
+        assert!(bytes.iter().all(|byte| *byte == 0xa5));
+
+        let valid = [CmResourceDescriptor::Interrupt(InterruptDescriptor {
+            level: 5,
+            vector: 5,
+            affinity: 1,
+            flags: CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE,
+            share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+        })];
+        let mut short = [0x5a; 39];
+        assert_eq!(
+            build_cm_resource_list(&mut short, INTERFACE_TYPE_INTERNAL, 0, &valid),
+            Err(CmResourceListError::BufferTooSmall { required: 40 })
+        );
+        assert!(short.iter().all(|byte| *byte == 0x5a));
+    }
+
+    #[test]
+    fn encodes_native_io_resource_requirement_alternatives() {
+        let first = [IoResourceRequirement::Memory(IoAddressRequirement {
+            option: IO_RESOURCE_PREFERRED,
+            share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            flags: CM_RESOURCE_MEMORY_READ_WRITE | CM_RESOURCE_MEMORY_PREFETCHABLE,
+            length: 0x2000,
+            alignment: 1,
+            minimum: 0x1_0000_0000,
+            maximum: 0x1_0000_1fff,
+        })];
+        let second = [
+            IoResourceRequirement::Port(IoAddressRequirement {
+                option: IO_RESOURCE_REQUIRED,
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+                flags: CM_RESOURCE_PORT_IO,
+                length: 0x20,
+                alignment: 0x20,
+                minimum: 0x300,
+                maximum: 0x3ff,
+            }),
+            IoResourceRequirement::Interrupt(IoInterruptRequirement {
+                option: IO_RESOURCE_ALTERNATIVE,
+                share: CM_RESOURCE_SHARE_SHARED,
+                flags: CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE,
+                minimum_vector: 3,
+                maximum_vector: 15,
+                affinity_policy: 2,
+                priority_policy: 1,
+                targeted_processors: 0x5,
+            }),
+        ];
+        let alternatives = [
+            IoResourceAlternative {
+                descriptors: &first,
+            },
+            IoResourceAlternative {
+                descriptors: &second,
+            },
+        ];
+        let expected = 32 + (8 + 32) + (8 + 64);
+        let mut bytes = [0xcc; 160];
+        let written = build_io_resource_requirements_lists(
+            &mut bytes,
+            INTERFACE_TYPE_PCI_BUS,
+            2,
+            3 | (1 << 5),
+            &alternatives,
+        )
+        .unwrap();
+        assert_eq!(written, expected);
+        assert_eq!(
+            u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            expected as u32
+        );
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 5);
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 35);
+        assert_eq!(u32::from_le_bytes(bytes[28..32].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(bytes[36..40].try_into().unwrap()), 1);
+        assert_eq!(bytes[40], IO_RESOURCE_PREFERRED);
+        assert_eq!(bytes[41], CM_RESOURCE_TYPE_MEMORY);
+        assert_eq!(
+            u64::from_le_bytes(bytes[56..64].try_into().unwrap()),
+            0x1_0000_0000
+        );
+        let second_list = 72;
+        assert_eq!(
+            u32::from_le_bytes(bytes[second_list + 4..second_list + 8].try_into().unwrap()),
+            2
+        );
+        assert_eq!(bytes[second_list + 9], CM_RESOURCE_TYPE_PORT);
+        assert_eq!(bytes[second_list + 40], IO_RESOURCE_ALTERNATIVE);
+        assert_eq!(bytes[second_list + 41], CM_RESOURCE_TYPE_INTERRUPT);
+        assert_eq!(
+            u64::from_le_bytes(
+                bytes[second_list + 64..second_list + 72]
+                    .try_into()
+                    .unwrap()
+            ),
+            5
+        );
+        assert_eq!(bytes[written], 0xcc);
+    }
+
+    #[test]
+    fn requirements_validation_is_all_or_nothing() {
+        let invalid = [IoResourceRequirement::Memory(IoAddressRequirement {
+            option: IO_RESOURCE_REQUIRED,
+            share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            flags: 0,
+            length: 0x1000,
+            alignment: 0,
+            minimum: 0x2000,
+            maximum: 0x2fff,
+        })];
+        let mut bytes = [0xa5; 72];
+        assert_eq!(
+            build_io_resource_requirements_list(&mut bytes, INTERFACE_TYPE_PNP_BUS, 0, 0, &invalid,),
+            Err(IoResourceRequirementsError::InvalidDescriptor)
+        );
+        assert!(bytes.iter().all(|byte| *byte == 0xa5));
+
+        let valid = [IoResourceRequirement::Interrupt(IoInterruptRequirement {
+            option: IO_RESOURCE_REQUIRED,
+            share: CM_RESOURCE_SHARE_SHARED,
+            flags: 0,
+            minimum_vector: 0,
+            maximum_vector: 0xff,
+            affinity_policy: 0,
+            priority_policy: 0,
+            targeted_processors: 0,
+        })];
+        let mut short = [0x5a; 71];
+        assert_eq!(
+            build_io_resource_requirements_list(&mut short, INTERFACE_TYPE_PCI_BUS, 0, 0, &valid,),
+            Err(IoResourceRequirementsError::BufferTooSmall { required: 72 })
+        );
+        assert!(short.iter().all(|byte| *byte == 0x5a));
+    }
 
     #[test]
     fn encodes_and_round_trips() {

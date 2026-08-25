@@ -11419,12 +11419,45 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     hosted-domain generation cookie rather than its publication cookie, and the four-word property
     reply now advertises all four words instead of truncating the transfer token and chunk length.
 
-    Review adjustment: the next unit is a real bus `IO_RESOURCE_REQUIREMENTS_LIST`
-    query/publication path; resourceful PDOs continue to report `STATUS_DEVICE_NOT_READY` rather
-    than inventing requirements. Then move the PnP authority behind reusable ABI/client/server
-    crates, migrate standalone `pnp-svc` off its private protocol, and only then couple interface
-    registration/state with Object Manager link publication. Do not reintroduce executive-local
-    property fallbacks.
+    Complete device-resource authority checkpoint (2026-08-26, accepted): resourceful PDOs now
+    publish a real bus-derived `IO_RESOURCE_REQUIREMENTS_LIST`; allocation selects from those
+    alternatives and commits distinct raw and translated `CM_RESOURCE_LIST` assignments in one
+    resource-manager transaction. Replacement is atomic, so a conflicting or malformed assignment
+    preserves the previous live owner state. The hosted grant publishes one release/acquire vector
+    bank only after every external mapping and capability is staged. Each record carries the
+    resource kind, BAR index, share disposition, CM/PCI flags, raw and translated starts, length,
+    component mapping, and device-scoped capability. No root/private authority cap crosses the
+    boundary and the old scalar MMIO/I/O cells and fallback cap route are deleted.
+
+    Every production consumer now walks that same validated bank: `MmMapIoSpace`,
+    `MmUnmapIoSpace`, `HalTranslateBusAddress`, PCI BAR config-space reads, VideoPort range
+    verification and direct port I/O, provider MMIO/I/O publication, hardware port faults, and NIC
+    device models. Bochs therefore receives both BAR0 framebuffer memory and BAR2 register memory
+    without fabricating legacy port `0x1ce`. Device-scoped mapping-cap bookkeeping is revoked during
+    teardown, and child CNodes reserve separate I/O capability slots rather than overloading one
+    scalar port capability.
+
+    Focused validation is green for `nt-resource-manager` (`13/13`), `nt-pnp` (`24/24`),
+    `nt-cm-resources` (`11/11`), `nt-pnp-manager` (`9/9`), and `nt-root-bus` (`13/13`). The display
+    integration also replaces the zero-success `RtlQueryRegistryValues` import with a live,
+    handle-authenticated registry query for win32k, seeds the generated bochs Device0 display
+    settings, parses the miniport's real `VIDEO_MODE_INFORMATION`, and publishes the actual current
+    framebuffer geometry. `nt-video-miniport` is green at `23/23` and the generated-hive binary at
+    `12/12`. Serialized desktop proof `.tmp/run-desktop-20260826-094838.log` observes the miniport's
+    `800x600`, 3,200-byte-stride mode, paints 103,493 non-desktop login-dialog pixels, launches the
+    genuine Explorer shell, and passes all `293/293` executive gates with the sentinel emitted.
+
+    Review adjustment: requirements and hosted resource-vector authority are closed. Next normalize
+    framebuffer ownership so rust-micro publishes one full PCI BAR authority containing the GOP
+    scanout and the executive derives boot and runtime mappings from that authority; this must allow
+    mode changes without treating the boot framebuffer extent as the device BAR. Then close repeated
+    hosted-PnP context alias replacement and exact domain teardown so rebind/unload cannot retain a
+    stale projection. After those lifetime fixes, move PnP authority behind reusable
+    ABI/client/server crates, migrate standalone `pnp-svc` off its private protocol, and only then
+    couple interface registration/state with Object Manager link publication. Keep BOOTBOOT limited
+    to the small rust-micro/rootserver handoff plus initrd-hosted NT personalities; do not solve
+    payload pressure by growing a monolithic boot image. Do not reintroduce executive-local resource
+    or property fallbacks.
 
     After that boundary is live, migrate the standalone hal, power, PnP, async, MMIO, and DMA
     component harnesses to `CompletionOwnerClaim` plus `CompletionUnwindCursor`, including their

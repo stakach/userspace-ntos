@@ -22,7 +22,7 @@ const _: () = assert!(HOSTED_ROOT_SEED_VA_BASE & 0x1F_FFFF == 0);
 const _: () =
     assert!(HOSTED_ROOT_SEED_VA_BASE + HOSTED_RESOURCE_WINDOW_STRIDE <= HOSTED_ROOT_SEED_VA_LIMIT);
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct HostedPnpResourceVaAllocator {
     component_slots: u64,
     root_seed_slots: u64,
@@ -95,23 +95,39 @@ fn hosted_window_span_va(base: u64, limit: u64, slot: u64, slots: u64) -> Option
     (end <= limit).then_some(va)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
+pub(crate) struct HostedPnpPciMemoryWindow {
+    pub(crate) bar_index: u8,
+    pub(crate) phys: u64,
+    pub(crate) len: u64,
+    pub(crate) frame_base: u64,
+    pub(crate) pages: u64,
+    pub(crate) map_pages: u64,
+    pub(crate) va: u64,
+    pub(crate) seed_va: u64,
+    pub(crate) root_alias_caps: Vec<u64>,
+}
+
+impl HostedPnpPciMemoryWindow {
+    pub(crate) fn mapped_len(&self) -> u64 {
+        self.len.min(self.map_pages.saturating_mul(0x1000))
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct HostedPnpPciResourceWindow {
     pub(crate) bus: u8,
     pub(crate) dev: u8,
     pub(crate) func: u8,
-    pub(crate) mmio_phys: u64,
-    pub(crate) mmio_frame_base: u64,
-    pub(crate) mmio_pages: u64,
-    pub(crate) mmio_map_pages: u64,
-    pub(crate) mmio_va: u64,
-    pub(crate) mmio_seed_va: u64,
+    pub(crate) memory: Vec<HostedPnpPciMemoryWindow>,
+    pub(crate) interrupt_routed: bool,
     pub(crate) interrupt_vector: u32,
     pub(crate) interrupt_latched: bool,
     pub(crate) dma_frame_base: u64,
     pub(crate) dma_pages: u64,
     pub(crate) dma_va: u64,
     pub(crate) dma_seed_va: u64,
+    pub(crate) dma_root_alias_caps: Vec<u64>,
     pub(crate) dma_logical: u64,
     pub(crate) dma_len: u64,
 }
@@ -122,35 +138,34 @@ impl HostedPnpPciResourceWindow {
         bus: u8,
         dev: u8,
         func: u8,
-        mmio_phys: u64,
-        mmio_frame_base: u64,
-        mmio_pages: u64,
-        mmio_map_pages: u64,
-        mmio_va: u64,
-        mmio_seed_va: u64,
+        memory: Vec<HostedPnpPciMemoryWindow>,
+        interrupt_routed: bool,
         interrupt_vector: u32,
         interrupt_latched: bool,
         dma_frame_base: u64,
         dma_pages: u64,
         dma_va: u64,
         dma_seed_va: u64,
+        dma_root_alias_caps: Vec<u64>,
         dma_logical: u64,
         dma_len: u64,
     ) -> Option<Self> {
-        let has_mmio = mmio_phys != 0
-            || mmio_frame_base != 0
-            || mmio_pages != 0
-            || mmio_map_pages != 0
-            || mmio_va != 0
-            || mmio_seed_va != 0;
-        if has_mmio
-            && (mmio_phys == 0
-                || mmio_frame_base == 0
-                || mmio_pages == 0
-                || mmio_map_pages == 0
-                || mmio_va == 0
-                || mmio_seed_va == 0
-                || mmio_map_pages > mmio_pages)
+        if memory.len() > nt_pnp::PCI_NUM_BARS
+            || memory.iter().enumerate().any(|(index, window)| {
+                window.bar_index as usize >= nt_pnp::PCI_NUM_BARS
+                    || memory[..index]
+                        .iter()
+                        .any(|previous| previous.bar_index == window.bar_index)
+                    || window.phys == 0
+                    || window.len == 0
+                    || window.frame_base == 0
+                    || window.pages == 0
+                    || window.map_pages == 0
+                    || window.map_pages > window.pages
+                    || window.va == 0
+                    || window.seed_va == 0
+                    || window.root_alias_caps.len() != window.map_pages as usize
+            })
         {
             return None;
         }
@@ -168,6 +183,8 @@ impl HostedPnpPciResourceWindow {
                     || dma_seed_va == 0
                     || dma_logical == 0
                     || dma_len == 0))
+            || (has_dma && dma_root_alias_caps.len() != dma_pages as usize)
+            || (!has_dma && !dma_root_alias_caps.is_empty())
         {
             return None;
         }
@@ -175,18 +192,15 @@ impl HostedPnpPciResourceWindow {
             bus,
             dev,
             func,
-            mmio_phys,
-            mmio_frame_base,
-            mmio_pages,
-            mmio_map_pages,
-            mmio_va,
-            mmio_seed_va,
+            memory,
+            interrupt_routed,
             interrupt_vector,
             interrupt_latched,
             dma_frame_base,
             dma_pages,
             dma_va,
             dma_seed_va,
+            dma_root_alias_caps,
             dma_logical,
             dma_len,
         })
@@ -196,14 +210,13 @@ impl HostedPnpPciResourceWindow {
         self.bus == device.bus && self.dev == device.dev && self.func == device.func
     }
 
-    pub(crate) fn granted_mmio_len(&self) -> u32 {
-        self.mmio_pages.saturating_mul(0x1000).min(u32::MAX as u64) as u32
-    }
-
-    pub(crate) fn mapped_mmio_len(&self) -> u32 {
-        self.mmio_map_pages
-            .saturating_mul(0x1000)
-            .min(u32::MAX as u64) as u32
+    pub(crate) fn memory_window(
+        &self,
+        bar_index: u8,
+    ) -> Option<&HostedPnpPciMemoryWindow> {
+        self.memory
+            .iter()
+            .find(|window| window.bar_index == bar_index)
     }
 
     pub(crate) fn dma_grant_valid(&self) -> bool {
@@ -280,9 +293,6 @@ impl HostedPnpRootResourceWindow {
         self.device_id.eq_ignore_ascii_case(profile.device_id)
     }
 
-    pub(crate) fn granted_mmio_len(&self) -> u32 {
-        self.mmio_pages.saturating_mul(0x1000).min(u32::MAX as u64) as u32
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -495,11 +505,28 @@ pub(crate) unsafe fn start_owned_driver_service_devnodes(
     }
 }
 
-unsafe fn current_hosted_devnode_pdo_properties<H, C>(
+pub(crate) enum PreparedHostedResourcePlan {
+    Pci {
+        bus_resources: DevnodePciBusResources,
+        window: HostedPnpPciResourceWindow,
+    },
+    Root {
+        grant: DevnodeRootResourceGrant,
+        window: HostedPnpRootResourceWindow,
+    },
+    None,
+}
+
+struct PreparedHostedDevnode {
+    pdo_description: driver_launch::HostedPdoDescription,
+    resource_plan: PreparedHostedResourcePlan,
+}
+
+unsafe fn prepare_current_hosted_devnode<H, C>(
     instance_id: &str,
     hardware_ids: &[H],
     compatible_ids: &[C],
-) -> Result<nt_pnp_manager::PdoProperties, nt_status::NtStatus>
+) -> Result<PreparedHostedDevnode, nt_status::NtStatus>
 where
     H: AsRef<str>,
     C: AsRef<str>,
@@ -524,29 +551,46 @@ where
             .iter()
             .find(|window| window.matches(device))
             .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        let grant = build_devnode_pci_resource_grant(
-            device,
-            window.interrupt_vector,
-            window.interrupt_latched,
-            window.dma_len,
-            window.granted_mmio_len(),
-        )
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        return Ok(nt_pnp_manager::PdoProperties::enumerated(
-            nt_pnp_manager::PnpBusInformation {
+        let firmware_routed = device.irq_pin != 0 && !matches!(device.irq_line, 0 | u8::MAX);
+        let boot_interrupt = firmware_routed.then_some(nt_pnp::PciInterruptAssignment {
+            bus_level: device.irq_line as u32,
+            vector: window.interrupt_vector,
+            latched: window.interrupt_latched,
+            affinity: 1,
+        });
+        let bus_resources = build_devnode_pci_bus_resources(device, boot_interrupt)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        let resource_publication = nt_root_bus::PdoResourcePublication {
+            raw_boot_resources: nt_root_bus::BusResourceState::Present(
+                bus_resources.raw_boot_resources.clone(),
+            ),
+            resource_requirements: nt_root_bus::BusResourceState::Present(
+                bus_resources.resource_requirements.clone(),
+            ),
+        };
+        return Ok(PreparedHostedDevnode {
+            pdo_description: driver_launch::HostedPdoDescription {
+                bus_information: nt_pnp_manager::PnpBusInformation {
                 bus_type_guid: nt_pnp_manager::GUID_BUS_TYPE_PCI,
                 legacy_bus_type: nt_pnp_manager::INTERFACE_TYPE_PCI_BUS,
                 bus_number: device.bus as u32,
             },
-            nt_pnp_manager::PdoCapabilities {
+                capabilities: nt_pnp_manager::PdoCapabilities {
                 removable: false,
                 eject_supported: false,
                 surprise_removal_ok: false,
                 address: ((device.dev as u32) << 16) | device.func as u32,
+                },
+                resource_publication,
+                translated_boot_resources: nt_pnp_manager::PropertyBlobState::Present(
+                    bus_resources.translated_boot_resources.clone(),
+                ),
             },
-            nt_pnp_manager::PropertyBlobState::Present(grant.translated_resource_list),
-            nt_pnp_manager::PropertyBlobState::Unqueried,
-        ));
+            resource_plan: PreparedHostedResourcePlan::Pci {
+                bus_resources,
+                window: window.clone(),
+            },
+        });
     }
 
     if let Some(profile) =
@@ -563,41 +607,59 @@ where
             window.interrupt_vector,
             window.interrupt_latched,
             window.dma_len,
-            window.granted_mmio_len(),
         )
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        return Ok(nt_pnp_manager::PdoProperties::enumerated(
-            nt_pnp_manager::PnpBusInformation {
+        let resource_publication = nt_root_bus::PdoResourcePublication {
+            raw_boot_resources: nt_root_bus::BusResourceState::Present(
+                grant.raw_boot_resources.clone(),
+            ),
+            resource_requirements: nt_root_bus::BusResourceState::Present(
+                grant.resource_requirements.clone(),
+            ),
+        };
+        return Ok(PreparedHostedDevnode {
+            pdo_description: driver_launch::HostedPdoDescription {
+                bus_information: nt_pnp_manager::PnpBusInformation {
                 bus_type_guid: nt_pnp_manager::GUID_BUS_TYPE_INTERNAL,
                 legacy_bus_type: nt_pnp_manager::INTERFACE_TYPE_PNP_BUS,
                 bus_number: 0,
             },
-            nt_pnp_manager::PdoCapabilities {
+                capabilities: nt_pnp_manager::PdoCapabilities {
                 removable: false,
                 eject_supported: false,
                 surprise_removal_ok: false,
                 address: nt_pnp_manager::DEVICE_ADDRESS_UNAVAILABLE,
+                },
+                resource_publication,
+                translated_boot_resources: nt_pnp_manager::PropertyBlobState::Present(
+                    grant.translated_boot_resources.clone(),
+                ),
             },
-            nt_pnp_manager::PropertyBlobState::Present(grant.translated_resource_list),
-            nt_pnp_manager::PropertyBlobState::Unqueried,
-        ));
+            resource_plan: PreparedHostedResourcePlan::Root {
+                grant,
+                window: *window,
+            },
+        });
     }
 
-    Ok(nt_pnp_manager::PdoProperties::enumerated(
-        nt_pnp_manager::PnpBusInformation {
+    Ok(PreparedHostedDevnode {
+        pdo_description: driver_launch::HostedPdoDescription {
+            bus_information: nt_pnp_manager::PnpBusInformation {
             bus_type_guid: nt_pnp_manager::GUID_BUS_TYPE_INTERNAL,
             legacy_bus_type: nt_pnp_manager::INTERFACE_TYPE_PNP_BUS,
             bus_number: 0,
         },
-        nt_pnp_manager::PdoCapabilities {
+            capabilities: nt_pnp_manager::PdoCapabilities {
             removable: false,
             eject_supported: false,
             surprise_removal_ok: false,
             address: nt_pnp_manager::DEVICE_ADDRESS_UNAVAILABLE,
+            },
+            resource_publication: nt_root_bus::PdoResourcePublication::none(),
+            translated_boot_resources: nt_pnp_manager::PropertyBlobState::KnownNone,
         },
-        nt_pnp_manager::PropertyBlobState::KnownNone,
-        nt_pnp_manager::PropertyBlobState::KnownNone,
-    ))
+        resource_plan: PreparedHostedResourcePlan::None,
+    })
 }
 
 unsafe fn start_one_devnode<H, C>(
@@ -612,15 +674,20 @@ unsafe fn start_one_devnode<H, C>(
     C: AsRef<str>,
 {
     report.attempted += 1;
-    let pdo_properties = match current_hosted_devnode_pdo_properties(
+    let prepared = match prepare_current_hosted_devnode(
         devnode.instance_id,
         devnode.hardware_ids,
         devnode.compatible_ids,
     ) {
-        Ok(properties) => properties,
+        Ok(prepared) => prepared,
         Err(status) => {
             remember_error(report, status);
-            print_add_device_failure(options.trace, service_name, devnode.instance_id, status);
+            print_resource_preparation_failure(
+                options.trace,
+                service_name,
+                devnode.instance_id,
+                status,
+            );
             return;
         }
     };
@@ -632,17 +699,15 @@ unsafe fn start_one_devnode<H, C>(
         devnode.instance_id,
         devnode.hardware_ids,
         devnode.compatible_ids,
-        pdo_properties,
+        prepared.pdo_description,
     ) {
         Ok(device_id) => {
             report.add_device = true;
             report.add_device_count += 1;
             print_add_device_success(options.trace, service_name, devnode.instance_id, device_id);
-            let start_status = match grant_current_hosted_devnode_resources(
+            let start_status = match grant_prepared_hosted_devnode_resources(
                 device_id,
-                devnode.instance_id,
-                devnode.hardware_ids,
-                devnode.compatible_ids,
+                prepared.resource_plan,
             ) {
                 Ok(Some(grant)) => {
                     print_hosted_devnode_grant(
@@ -662,6 +727,35 @@ unsafe fn start_one_devnode<H, C>(
                                 &grant.translated_resource_list,
                             );
                             if status.is_err() {
+                                if !restore_hosted_devnode_interrupt_line(&grant) {
+                                    print_str(b"[driver-launch] PCI InterruptLine rollback failed device_id=");
+                                    print_u64(device_id);
+                                    print_str(b"\n");
+                                }
+                                driver_launch::rollback_hosted_device_start(device_id);
+                            }
+                            status
+                        }
+                        Err(status) => {
+                            if !restore_hosted_devnode_interrupt_line(&grant) {
+                                print_str(b"[driver-launch] PCI InterruptLine rollback failed device_id=");
+                                print_u64(device_id);
+                                print_str(b"\n");
+                            }
+                            driver_launch::rollback_hosted_device_start(device_id);
+                            Err(status)
+                        }
+                    }
+                }
+                Ok(None) => {
+                    match driver_launch::commit_hosted_device_resource_assignment(
+                        device_id,
+                        &[],
+                        &[],
+                    ) {
+                        Ok(()) => {
+                            let status = driver_launch::start_hosted_device(device_id, &[], &[]);
+                            if status.is_err() {
                                 driver_launch::rollback_hosted_device_start(device_id);
                             }
                             status
@@ -671,10 +765,6 @@ unsafe fn start_one_devnode<H, C>(
                             Err(status)
                         }
                     }
-                }
-                Ok(None) => {
-                    driver_launch::rollback_hosted_device_start(device_id);
-                    Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
                 }
                 Err(status) => {
                     driver_launch::rollback_hosted_device_start(device_id);
@@ -737,34 +827,12 @@ unsafe fn start_one_devnode<H, C>(
     }
 }
 
-unsafe fn grant_current_hosted_devnode_resources<H, C>(
+unsafe fn grant_prepared_hosted_devnode_resources(
     device_id: u64,
-    instance_id: &str,
-    hardware_refs: &[H],
-    compatible_refs: &[C],
+    plan: PreparedHostedResourcePlan,
 ) -> Result<Option<HostedDevnodeGrant>, nt_status::NtStatus>
-where
-    H: AsRef<str>,
-    C: AsRef<str>,
 {
-    let devices = (*core::ptr::addr_of!(HOSTED_PNP_PCI_DEVICES))
-        .as_ref()
-        .ok_or(STATUS_DEVICE_NOT_READY)?;
-    let pci_windows = (*core::ptr::addr_of!(HOSTED_PNP_PCI_WINDOWS))
-        .as_ref()
-        .ok_or(STATUS_DEVICE_NOT_READY)?;
-    let root_windows = (*core::ptr::addr_of!(HOSTED_PNP_ROOT_WINDOWS))
-        .as_ref()
-        .ok_or(STATUS_DEVICE_NOT_READY)?;
-    grant_hosted_devnode_resources(
-        device_id,
-        instance_id,
-        hardware_refs,
-        compatible_refs,
-        devices.as_slice(),
-        pci_windows.as_slice(),
-        root_windows.as_slice(),
-    )
+    grant_hosted_devnode_resources(device_id, plan)
 }
 
 fn remember_error(report: &mut HostedPnpStartReport, status: nt_status::NtStatus) {
@@ -1042,6 +1110,31 @@ fn print_add_device_failure(
         }
         HostedPnpStartTrace::DemandStart => b"[driver-launch] demand AddDevice failed status=0x",
         HostedPnpStartTrace::BootService => b"[driver-launch] AddDevice failed status=0x",
+    });
+    print_hex(status.raw() as u32);
+    print_str(b" service=");
+    print_str(service_name.as_bytes());
+    print_str(b" devnode=");
+    print_str(instance_id.as_bytes());
+    print_str(b"\n");
+}
+
+fn print_resource_preparation_failure(
+    trace: HostedPnpStartTrace,
+    service_name: &str,
+    instance_id: &str,
+    status: nt_status::NtStatus,
+) {
+    print_str(match trace {
+        HostedPnpStartTrace::HardwareProof => {
+            b"[driver-launch] generic hardware bus resource publication failed status=0x"
+        }
+        HostedPnpStartTrace::DemandStart => {
+            b"[driver-launch] demand bus resource publication failed status=0x"
+        }
+        HostedPnpStartTrace::BootService => {
+            b"[driver-launch] bus resource publication failed status=0x"
+        }
     });
     print_hex(status.raw() as u32);
     print_str(b" service=");

@@ -566,6 +566,49 @@ pub struct VideoModeSpec {
     pub bits_per_plane: u32,
 }
 
+impl VideoModeSpec {
+    pub fn framebuffer_bytes(self) -> Option<u64> {
+        (self.stride as u64).checked_mul(self.height as u64)
+    }
+}
+
+/// Decode the x64 `VIDEO_MODE_INFORMATION` returned by a real miniport. The structure is composed
+/// entirely of 32-bit fields, so its wire layout is identical on x86 and x64.
+pub fn parse_video_mode_information(input: &[u8]) -> Result<VideoModeSpec, VideoMiniportError> {
+    require_input(input, VIDEO_MODE_INFORMATION_SIZE)?;
+    if read_u32(input, 0) as usize != VIDEO_MODE_INFORMATION_SIZE {
+        return Err(VideoMiniportError::InvalidRegistration);
+    }
+    let mode = VideoModeSpec {
+        width: read_u32(input, 8),
+        height: read_u32(input, 12),
+        stride: read_u32(input, 16),
+        bits_per_plane: read_u32(input, 24),
+    };
+    let planes = read_u32(input, 20);
+    let bytes_per_pixel = mode
+        .bits_per_plane
+        .checked_add(7)
+        .map(|bits| bits / 8)
+        .ok_or(VideoMiniportError::UnsupportedMode)?;
+    let minimum_stride = mode
+        .width
+        .checked_mul(planes)
+        .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
+        .ok_or(VideoMiniportError::UnsupportedMode)?;
+    if mode.width == 0
+        || mode.height == 0
+        || planes == 0
+        || mode.bits_per_plane == 0
+        || bytes_per_pixel == 0
+        || mode.stride < minimum_stride
+        || mode.framebuffer_bytes().is_none()
+    {
+        return Err(VideoMiniportError::UnsupportedMode);
+    }
+    Ok(mode)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FramebufferMapping {
     pub virtual_address: u64,
@@ -1567,6 +1610,42 @@ mod tests {
         );
         assert_eq!(u32_at(&out, 68), 1280);
         assert_eq!(u32_at(&out, 72), 800);
+    }
+
+    #[test]
+    fn parses_video_mode_information_from_wire_layout() {
+        let mut out = [0u8; VIDEO_MODE_INFORMATION_SIZE];
+        miniport()
+            .dispatch_io_control(IOCTL_VIDEO_QUERY_CURRENT_MODE, &[], &mut out)
+            .unwrap();
+
+        assert_eq!(
+            parse_video_mode_information(&out),
+            Ok(VideoModeSpec {
+                width: 1280,
+                height: 800,
+                stride: 5120,
+                bits_per_plane: 32,
+            })
+        );
+        assert_eq!(
+            parse_video_mode_information(&out[..VIDEO_MODE_INFORMATION_SIZE - 1]),
+            Err(VideoMiniportError::BufferTooSmall {
+                needed: VIDEO_MODE_INFORMATION_SIZE
+            })
+        );
+
+        write_u32(&mut out, 0, (VIDEO_MODE_INFORMATION_SIZE - 4) as u32);
+        assert_eq!(
+            parse_video_mode_information(&out),
+            Err(VideoMiniportError::InvalidRegistration)
+        );
+        write_u32(&mut out, 0, VIDEO_MODE_INFORMATION_SIZE as u32);
+        write_u32(&mut out, 16, 1280);
+        assert_eq!(
+            parse_video_mode_information(&out),
+            Err(VideoMiniportError::UnsupportedMode)
+        );
     }
 
     #[test]

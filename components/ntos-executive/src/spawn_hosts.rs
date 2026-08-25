@@ -68,7 +68,6 @@ pub(crate) struct GrantedCaps {
     pub irq_ntfn: Option<u64>,
     pub result_ntfn: Option<u64>,
     pub fault_ep: Option<u64>,
-    pub io_port: Option<u64>,
 }
 
 // =============================================================================================
@@ -608,10 +607,6 @@ pub(crate) unsafe fn spawn_component(d: &ComponentDescriptor) -> SpawnedComponen
         let error = cnode_copy_at_r(cnode, CT_FAULT, c);
         component_expect(b"cnode-fault-copy", c, error);
     }
-    if let Some(c) = d.granted.io_port {
-        let error = cnode_copy_at_r(cnode, CT_IO_PORT, c);
-        component_expect(b"cnode-ioport-copy", c, error);
-    }
     trace_component_spawn_stage(b"cspace-ready", cnode, raw);
     // TCB.
     let tcb = component_alloc_slot(b"tcb-slot");
@@ -749,7 +744,6 @@ pub(crate) unsafe fn spawn_isr(
             irq_ntfn: Some(irq_cap),
             result_ntfn: Some(result_cap),
             fault_ep: None,
-            io_port: None,
         },
         prio,
         gs_base: None,
@@ -951,7 +945,6 @@ pub(crate) unsafe fn spawn_storage_host(
             irq_ntfn: None,
             result_ntfn: Some(result_cap),
             fault_ep: Some(fault_ep),
-            io_port: None,
         },
         prio,
         gs_base: None,

@@ -97,6 +97,31 @@ struct DisplayMiniportInstall {
     vga_compatible: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GeneratedDisplayMode {
+    bits_per_pel: u32,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+}
+
+impl GeneratedDisplayMode {
+    const DEFAULT: Self = Self {
+        bits_per_pel: 32,
+        width: 1024,
+        height: 768,
+        refresh_hz: 60,
+    };
+
+    fn validate(self) -> Self {
+        assert!(
+            self.bits_per_pel != 0 && self.width != 0 && self.height != 0 && self.refresh_hz != 0,
+            "generated display mode fields must be nonzero"
+        );
+        self
+    }
+}
+
 fn utf16le_sz(s: &str) -> Vec<u8> {
     let mut bytes = Vec::new();
     for unit in s.encode_utf16().chain(core::iter::once(0)) {
@@ -390,6 +415,38 @@ fn generated_network_adapters_from_env() -> Vec<GeneratedNetworkAdapter> {
             panic!("NTOS_GENERATED_NETWORK_ADAPTERS must be valid UTF-8")
         }
     }
+}
+
+fn generated_display_mode_from_env() -> GeneratedDisplayMode {
+    fn read(name: &str, default: u32) -> u32 {
+        match std::env::var(name) {
+            Ok(value) => value
+                .parse::<u32>()
+                .unwrap_or_else(|_| panic!("{name} must be a positive 32-bit integer")),
+            Err(std::env::VarError::NotPresent) => default,
+            Err(std::env::VarError::NotUnicode(_)) => panic!("{name} must be valid UTF-8"),
+        }
+    }
+
+    GeneratedDisplayMode {
+        bits_per_pel: read(
+            "NTOS_GENERATED_DISPLAY_BITS_PER_PEL",
+            GeneratedDisplayMode::DEFAULT.bits_per_pel,
+        ),
+        width: read(
+            "NTOS_GENERATED_DISPLAY_WIDTH",
+            GeneratedDisplayMode::DEFAULT.width,
+        ),
+        height: read(
+            "NTOS_GENERATED_DISPLAY_HEIGHT",
+            GeneratedDisplayMode::DEFAULT.height,
+        ),
+        refresh_hz: read(
+            "NTOS_GENERATED_DISPLAY_REFRESH_HZ",
+            GeneratedDisplayMode::DEFAULT.refresh_hz,
+        ),
+    }
+    .validate()
 }
 
 fn install_generated_network_adapter(hive: &mut Hive, adapter: &GeneratedNetworkAdapter) {
@@ -800,7 +857,11 @@ fn bochs_display_install_from_staged_inf() -> Result<DisplayMiniportInstall, Str
     display_install_from_inf(&inf)
 }
 
-fn install_display_miniport(hive: &mut Hive, install: &DisplayMiniportInstall) {
+fn install_display_miniport(
+    hive: &mut Hive,
+    install: &DisplayMiniportInstall,
+    mode: GeneratedDisplayMode,
+) {
     let service = hive.create_key(&format!(r"ControlSet001\Services\{}", install.service_name));
     hive.set_value(
         service,
@@ -913,9 +974,25 @@ fn install_display_miniport(hive: &mut Hive, install: &DisplayMiniportInstall) {
         utf16le_sz(&install.device_desc),
     );
     hive.set_dword(device, "VgaCompatible", install.vga_compatible);
+    for (name, value) in [
+        ("DefaultSettings.BitsPerPel", mode.bits_per_pel),
+        ("DefaultSettings.XResolution", mode.width),
+        ("DefaultSettings.YResolution", mode.height),
+        ("DefaultSettings.VRefresh", mode.refresh_hz),
+        ("DefaultSettings.Flags", 0),
+        ("DefaultSettings.XPanning", 0),
+        ("DefaultSettings.YPanning", 0),
+        ("DefaultSettings.Orientation", 0),
+        ("DefaultSettings.FixedOutput", 0),
+    ] {
+        hive.set_dword(device, name, value);
+    }
 }
 
-fn build_hive_with_network_adapters(network_adapters: Vec<GeneratedNetworkAdapter>) -> Hive {
+fn build_hive_with_configuration(
+    network_adapters: Vec<GeneratedNetworkAdapter>,
+    display_mode: GeneratedDisplayMode,
+) -> Hive {
     let mut hive = Hive::new(HiveKind::System);
     // A recognizable marker the executive reads back: ...\NtosTest\Answer = REG_DWORD 42.
     let key = hive.create_key(r"ControlSet001\Services\NtosTest");
@@ -980,9 +1057,14 @@ fn build_hive_with_network_adapters(network_adapters: Vec<GeneratedNetworkAdapte
 
     let bochs = bochs_display_install_from_staged_inf()
         .expect("staged ReactOS bochsmp.inf must describe the display miniport");
-    install_display_miniport(&mut hive, &bochs);
+    install_display_miniport(&mut hive, &bochs, display_mode.validate());
 
     hive
+}
+
+#[cfg(test)]
+fn build_hive_with_network_adapters(network_adapters: Vec<GeneratedNetworkAdapter>) -> Hive {
+    build_hive_with_configuration(network_adapters, GeneratedDisplayMode::DEFAULT)
 }
 
 #[cfg(test)]
@@ -994,7 +1076,10 @@ fn main() {
     let out = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "hive.dat".to_string());
-    let hive = build_hive_with_network_adapters(generated_network_adapters_from_env());
+    let hive = build_hive_with_configuration(
+        generated_network_adapters_from_env(),
+        generated_display_mode_from_env(),
+    );
     let bytes = encode_image(&hive);
     std::fs::write(&out, &bytes).expect("write hive image");
     eprintln!("gen_hive: wrote {} ({} bytes)", out, bytes.len());
@@ -1531,6 +1616,50 @@ mod tests {
             ))
         );
         assert_eq!(hive.query_dword(device0, "VgaCompatible"), Some(0));
+        for (name, value) in [
+            ("DefaultSettings.BitsPerPel", 32),
+            ("DefaultSettings.XResolution", 1024),
+            ("DefaultSettings.YResolution", 768),
+            ("DefaultSettings.VRefresh", 60),
+            ("DefaultSettings.Flags", 0),
+            ("DefaultSettings.XPanning", 0),
+            ("DefaultSettings.YPanning", 0),
+            ("DefaultSettings.Orientation", 0),
+            ("DefaultSettings.FixedOutput", 0),
+        ] {
+            assert_eq!(hive.query_dword(device0, name), Some(value));
+        }
+    }
+
+    #[test]
+    fn generated_hive_display_defaults_are_image_configuration() {
+        let mode = GeneratedDisplayMode {
+            bits_per_pel: 16,
+            width: 800,
+            height: 600,
+            refresh_hz: 75,
+        };
+        let hive = build_hive_with_configuration(generated_e1000_adapters(1), mode);
+        let device0 = hive
+            .open_key(r"ControlSet001\Services\bochsmp\Device0")
+            .expect("display Device0");
+
+        assert_eq!(
+            hive.query_dword(device0, "DefaultSettings.BitsPerPel"),
+            Some(mode.bits_per_pel)
+        );
+        assert_eq!(
+            hive.query_dword(device0, "DefaultSettings.XResolution"),
+            Some(mode.width)
+        );
+        assert_eq!(
+            hive.query_dword(device0, "DefaultSettings.YResolution"),
+            Some(mode.height)
+        );
+        assert_eq!(
+            hive.query_dword(device0, "DefaultSettings.VRefresh"),
+            Some(mode.refresh_hz)
+        );
     }
 
     #[test]
