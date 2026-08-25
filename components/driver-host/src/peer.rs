@@ -59,7 +59,10 @@ unsafe fn handle(total_len: usize) -> (NtStatus, u64) {
     // in the shared data frame at REQ_DATA_VADDR.
     let header = unsafe { core::slice::from_raw_parts(REQ_DATA_VADDR as *const u8, hdr) };
     let req: IrpDispatchRequest = bytemuck::pod_read_unaligned(header);
-    if req.abi_size as usize != hdr || !req.has_well_formed_domain_route() {
+    if req.abi_version != nt_io_abi::IO_ABI_VERSION as u16
+        || req.abi_size as usize != hdr
+        || !req.has_well_formed_domain_route()
+    {
         return (NtStatus::INVALID_PARAMETER, 0);
     }
 

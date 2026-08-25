@@ -12,7 +12,7 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
-use nt_io_abi::{ioctl, major, IrpDispatchRequest};
+use nt_io_abi::{ioctl, major, IrpDispatchRequest, IO_ABI_VERSION};
 use nt_status::NtStatus;
 
 use crate::dispatch::{
@@ -102,10 +102,13 @@ fn build_dispatch_request(
         _ => (0, 0, 0),
     };
     Ok(IrpDispatchRequest {
+        abi_version: IO_ABI_VERSION as u16,
         abi_size: core::mem::size_of::<IrpDispatchRequest>() as u16,
         major: irp.major,
         minor: irp.minor,
+        _reserved0: 0,
         flags: irp.flags.bits() as u32 | ((irp.control.bits() as u32) << 8),
+        _reserved1: 0,
         target_domain_id: target.domain_id.raw(),
         target_domain_cookie: target.cookie,
         provider_domain_id: provider
@@ -288,7 +291,10 @@ impl DriverPeerTransport for MockDriverPeer {
                 status: NtStatus::DEVICE_NOT_CONNECTED,
             };
         }
-        if !request.has_well_formed_domain_route() {
+        if request.abi_version != IO_ABI_VERSION as u16
+            || request.abi_size as usize != core::mem::size_of::<IrpDispatchRequest>()
+            || !request.has_well_formed_domain_route()
+        {
             return DispatchOutcome::Failed {
                 status: NtStatus::INVALID_PARAMETER,
             };

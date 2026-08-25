@@ -11063,7 +11063,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Hosted peer-envelope ABI foundation (2026-08-24): I/O ABI version 4 extends the fixed
     `IrpDispatchRequest` packet with target domain/cookie and optional provider domain/cookie. The
     existing canonical IRP/Driver/Device/File ids, active stack index/count, and packed
-    Flags/Control now travel in the same 144-byte pointer-free packet. `DriverPeerBackend` requires
+    Flags/Control now travel in the same 152-byte pointer-free packet. `DriverPeerBackend` requires
     an explicit non-null target identity and rejects incomplete provider routes; it has no default
     domain. The isolated `ntos-driver-host` peer rejects structurally malformed routes, while its
     I/O side allocates the route from the canonical manager rather than a fixture constant. Tests
@@ -11078,6 +11078,43 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     against `instance_for_pump_channel`. Remove the `SH_REQ_OWNER_INSTANCE == SH_REQ_INFO` alias in
     that change. Only after that should raw device/PDO/File projections migrate to the domain
     registry.
+
+    Hosted executive domain-envelope checkpoint (2026-08-24): every reusable driver-instance slot
+    now receives a fresh I/O Manager `HostedDomainId` generation and cookie before component
+    creation. `DriverComponent` and `DriverInstance` carry that identity, teardown unregisters it
+    before slot reuse, and provider routes publish and clear exact dependent/provider domain-cookie
+    relationships in the canonical registry. Pending hosted completions are owned and selected by
+    stable domain id rather than a reusable instance index.
+
+    Production hosted IRPs now use the same ABI v4 packet in a dedicated component data-window
+    page. The executive writes exact domain/provider, canonical IRP/Driver/Device/File, current
+    stack index/count, Flags/Control, lengths, and control-code fields as one 152-byte request. The
+    component requires exact ABI version/size, validates the stack cursor, and builds the WDM IRP at
+    that exact current location. The pure WDM writer now projects `IO_STACK_LOCATION.Flags` and
+    `Control` instead of zeroing them. Before waking the component, the executive compares the
+    packet's effective dispatch domain with the server-owned pump channel resolved by shared VA,
+    fault endpoint, PML4, and active reply cap. The old
+    `SH_REQ_OWNER_INSTANCE == SH_REQ_INFO` alias and shared canonical IRP/File identity slots are
+    deleted; `SH_REQ_INFO` is output-only, while non-IRP cancel/copy/ack selectors use one explicit
+    control id.
+
+    Focused `nt-io-manager` (`185/185`) and `nt-io-abi` (`5/5`) tests pass, as do the standalone
+    driver-host release check and the freestanding executive release check at the existing
+    212-warning baseline. Serialized desktop proof
+    `.tmp/run-desktop-20260824-domain-envelope.log` is accepted for the integrated tree: snapshot
+    generation 5 commits 822,600 bytes; all 18 message preflights are classified (`14 + 0 + 4`);
+    genuine userinit and Explorer launch; Explorer completes 669 real api0 callbacks with zero
+    callback failures; and paint reaches 5 BeginPaint, 20 EndPaint, 187 direct GDI returns, and 135
+    batch flushes carrying 184 records. All 786,432 framebuffer pixels are non-background with at
+    least 32 colors, all `293/293` checks pass, and the sentinel is emitted.
+
+    Review adjustment: stable instance/domain lifetime, the typed production envelope, active stack
+    projection, pending-completion ownership, and channel authentication are closed. Next make the
+    registry authoritative for local WDM projections: bind every Driver/FDO/PDO/File address in its
+    actual dependent or provider domain; key root-bus state by canonical DeviceId; and replace
+    `hosted_device_binding_by_*`, singular instance devices, and in-flight raw PDO tests with
+    `(HostedDomainId,address)` resolution. Implement canonical `IoGetRelatedDeviceObject` in that
+    slice, then delete partial-known attach/detach behavior and the direct raw root-PDO path.
 
     After that boundary is live, migrate the standalone hal, power, PnP, async, MMIO, and DMA
     component harnesses to `CompletionOwnerClaim` plus `CompletionUnwindCursor`, including their

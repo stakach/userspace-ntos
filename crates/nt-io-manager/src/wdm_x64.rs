@@ -122,6 +122,8 @@ impl Default for WdmIoStackParameters {
 pub struct WdmIoStackLocationInit {
     pub major: u8,
     pub minor: u8,
+    pub flags: u8,
+    pub control: u8,
     pub device_object: u64,
     pub file_object: u64,
     pub parameters: WdmIoStackParameters,
@@ -253,6 +255,8 @@ pub fn write_wdm_io_stack_location(
     zero(bytes);
     put_u8(bytes, 0x00, init.major);
     put_u8(bytes, 0x01, init.minor);
+    put_u8(bytes, 0x02, init.flags);
+    put_u8(bytes, 0x03, init.control);
     put_u64(bytes, 0x28, init.device_object);
     put_u64(bytes, 0x30, init.file_object);
     match init.parameters {

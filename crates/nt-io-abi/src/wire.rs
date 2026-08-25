@@ -84,10 +84,13 @@ pub struct IoCancelRequest {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 pub struct IrpDispatchRequest {
+    pub abi_version: u16,
     pub abi_size: u16,
     pub major: u8,
     pub minor: u8,
+    pub _reserved0: u16,
     pub flags: u32,
+    pub _reserved1: u32,
     pub target_domain_id: u64,
     pub target_domain_cookie: u64,
     pub provider_domain_id: u64,
@@ -147,7 +150,7 @@ const _: () = {
     assert!(size_of::<IoDeviceControlRequest>() == 56);
     assert!(size_of::<IoFileRequest>() == 16);
     assert!(size_of::<IoCancelRequest>() == 16);
-    assert!(size_of::<IrpDispatchRequest>() == 144);
+    assert!(size_of::<IrpDispatchRequest>() == 152);
     assert!(size_of::<IoReply>() == 32);
     assert!(align_of::<IoReadWriteRequest>() == 8);
     assert!(align_of::<IrpDispatchRequest>() == 8);

@@ -182,6 +182,7 @@ mod tests {
         assert_eq!(req, back);
 
         let irp = IrpDispatchRequest {
+            abi_version: IO_ABI_VERSION as u16,
             abi_size: core::mem::size_of::<IrpDispatchRequest>() as u16,
             major: major::IRP_MJ_PNP,
             minor: 7,

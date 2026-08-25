@@ -4503,6 +4503,8 @@ mod tests {
             WdmIoStackLocationInit {
                 major: major::IRP_MJ_DEVICE_CONTROL,
                 minor: 2,
+                flags: 0x81,
+                control: 0x42,
                 device_object: 0x4444,
                 file_object: 0x5555,
                 parameters: WdmIoStackParameters::DeviceControl {
@@ -4516,6 +4518,8 @@ mod tests {
         .unwrap();
         assert_eq!(stack[0x00], major::IRP_MJ_DEVICE_CONTROL);
         assert_eq!(stack[0x01], 2);
+        assert_eq!(stack[0x02], 0x81);
+        assert_eq!(stack[0x03], 0x42);
         assert_eq!(le_u32(&stack, 0x08), 0x10);
         assert_eq!(le_u32(&stack, 0x10), 0x20);
         assert_eq!(le_u32(&stack, 0x18), 0x333000);
@@ -4528,6 +4532,8 @@ mod tests {
             WdmIoStackLocationInit {
                 major: major::IRP_MJ_QUERY_INFORMATION,
                 minor: 0,
+                flags: 0,
+                control: 0,
                 device_object: 0x4444,
                 file_object: 0x5555,
                 parameters: WdmIoStackParameters::QueryInformation {
@@ -4548,6 +4554,8 @@ mod tests {
             WdmIoStackLocationInit {
                 major: major::IRP_MJ_CREATE_NAMED_PIPE,
                 minor: 0,
+                flags: 0,
+                control: 0,
                 device_object: 0x4444,
                 file_object: 0x5555,
                 parameters: WdmIoStackParameters::Create {
@@ -4571,6 +4579,8 @@ mod tests {
             WdmIoStackLocationInit {
                 major: major::IRP_MJ_PNP,
                 minor: 0,
+                flags: 0,
+                control: 0,
                 device_object: 0x4444,
                 file_object: 0,
                 parameters: WdmIoStackParameters::PnpStartDevice {

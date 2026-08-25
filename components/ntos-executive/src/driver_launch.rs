@@ -65,7 +65,7 @@ use nt_hosted_runtime::{
     NDIS_MINIPORT_BLOCK_TD_COMPLETE_HANDLER_OFFSET_X64, NDIS_MINIPORT_INTERRUPT_LEN_X64,
     NDIS_MINIPORT_TIMER_LEN_X64, NDIS_PROTOCOL_CHARACTERISTICS_NAME_OFFSET_X64,
 };
-use nt_io_abi::{ioctl, major};
+use nt_io_abi::{ioctl, major, IrpDispatchRequest, IO_ABI_VERSION};
 use nt_io_manager::{
     write_wdm_driver_object, write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
     BankedTransferCursor, CreateOptions, DeviceCharacteristics, DeviceControlParameters,
@@ -208,8 +208,13 @@ const FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_VA: u64 =
 const FSD_DATA_SE_EXPORTS_CELL_VA: u64 = FSD_DATA_VADDR + FSD_DATA_SE_EXPORTS_CELL_OFF;
 const FSD_DATA_SE_EXPORTS_STRUCT_VA: u64 = FSD_DATA_VADDR + FSD_DATA_SE_EXPORTS_STRUCT_OFF;
 const FSD_DATA_SE_SID_POOL_VA: u64 = FSD_DATA_VADDR + FSD_DATA_SE_SID_POOL_OFF;
+const FSD_DATA_IRP_DISPATCH_REQUEST_OFF: u64 = 0x1000;
 const _: () =
     assert!(FSD_DATA_SE_SID_POOL_OFF + nt_security::se_exports::SID_POOL_SIZE as u64 <= 0x1000);
+const _: () = assert!(
+    FSD_DATA_IRP_DISPATCH_REQUEST_OFF + core::mem::size_of::<IrpDispatchRequest>() as u64
+        <= 0x2000
+);
 const FSD_HOSTED_SYSTEM_RANGE_START: u64 = FSD_CODE_VA;
 
 /// Shared handoff arena (executive ↔ host): entry rva in, verdict + MajorFunction table + device
@@ -320,8 +325,7 @@ pub const SH_DEVICE_NAME_BUF: u64 = 0x90; // out: UTF-16LE path capture
 pub const SH_SYMLINK_LINK_BUF: u64 = 0x190; // out: UTF-16LE path capture
 pub const SH_SYMLINK_TARGET_BUF: u64 = 0x290; // out: UTF-16LE path capture
 pub const SH_CAPTURED_PATH_BYTES: usize = 0x100;
-pub const SH_REQ_IRP_ID: u64 = 0x390; // in: canonical generation-protected IrpId
-pub const SH_REQ_CANONICAL_FILE_ID: u64 = 0x398; // in: canonical FileId, never FsContext
+pub const SH_REQ_CONTROL_ID: u64 = 0x390; // in: exact IrpId for cancel/copy/ack control selectors
 pub const SH_RESOURCE_MMIO_PHYS: u64 = 0x3A0; // in: granted physical BAR base for MmMapIoSpace
 pub const SH_RESOURCE_MMIO_LEN: u64 = 0x3A8; // in: granted physical BAR/resource length
 pub const SH_RESOURCE_MMIO_VA: u64 = 0x3B0; // in: component VA for the mapped BAR
@@ -498,10 +502,10 @@ pub const SH_REQ_OUTLEN: u64 = 0x60; // in:  output buffer length (u64)
 pub const SH_REQ_FILEID: u64 = 0x68; // in/out: opaque FILE_OBJECT id (u64)
 pub const SH_REQ_STATUS: u64 = 0x70; // out: IoStatus.Status (i32)
 pub const SH_REQ_REQUESTOR_TID: u64 = 0x74; // in: requesting NT thread id (u32)
-pub const SH_REQ_INFO: u64 = 0x78; // in: backend instance; out: IoStatus.Information (u64)
-pub const SH_REQ_OWNER_INSTANCE: u64 = SH_REQ_INFO;
-const _: () = assert!(SH_SYMLINK_TARGET_BUF + SH_CAPTURED_PATH_BYTES as u64 <= SH_REQ_IRP_ID);
-const _: () = assert!(SH_REQ_CANONICAL_FILE_ID + 8 <= SH_RESOURCE_MMIO_PHYS);
+pub const SH_REQ_INFO: u64 = 0x78; // out: IoStatus.Information (u64)
+const _: () =
+    assert!(SH_SYMLINK_TARGET_BUF + SH_CAPTURED_PATH_BYTES as u64 <= SH_REQ_CONTROL_ID);
+const _: () = assert!(SH_REQ_CONTROL_ID + 8 <= SH_RESOURCE_MMIO_PHYS);
 
 const WDM_X64_DRIVER_EXTENSION_ADD_DEVICE_OFFSET: u64 = 0x08;
 
@@ -707,9 +711,9 @@ struct PendingIrp {
     /// Canonical I/O Manager identities. These are transport ids, never driver
     /// pointers or FsContext cookies, and stay attached through completion ACK.
     canonical_file_id: u64,
-    /// Executive backend instance that originated this request. Provider domains can host owners
-    /// for several dependent drivers, so completion polling filters on this route identity.
-    owner_instance: u64,
+    /// Stable hosted domain that originated this request. Provider domains can host owners for
+    /// several dependent drivers, so completion polling never filters on a reusable instance slot.
+    owner_domain_id: u64,
     /// The npfs `FsContext` (opaque file id) this IRP was issued on, captured at ISSUE time.
     /// ★ Must NOT be re-read from `FILE_OBJECT->FsContext` at completion time: npfs NULLs that
     /// field through `NpSetFileObject(fo, NULL, NULL, …)` when a pipe end disconnects
@@ -1803,8 +1807,12 @@ fn hosted_completion_storage_instance(instance: usize) -> usize {
     }
 }
 
-unsafe fn poll_hosted_completion(instance: usize) -> Option<nt_io_manager::DriverCompletion> {
-    let storage_instance = hosted_completion_storage_instance(instance);
+unsafe fn poll_hosted_completion(instance_index: usize) -> Option<nt_io_manager::DriverCompletion> {
+    let owner_domain_id = instance(instance_index)?.hosted_domain_id;
+    if owner_domain_id == 0 {
+        return None;
+    }
+    let storage_instance = hosted_completion_storage_instance(instance_index);
     let win = ExecVaWindow::try_for_instance(storage_instance)?;
     let head = (win.data_va + FSD_PENDING_IRP_HEAD_OFF) as *const AtomicU64;
     loop {
@@ -1838,7 +1846,7 @@ unsafe fn poll_hosted_completion(instance: usize) -> Option<nt_io_manager::Drive
             let entry = read_volatile(pending_irp_entry_address(node_exec) as *const PendingIrp);
             let completion = entry.completion.completed();
             pending_irp_owner_state(node_exec).store(ready_state, Ordering::Release);
-            if canonical_irp_id != 0 && entry.owner_instance == instance as u64 {
+            if canonical_irp_id != 0 && entry.owner_domain_id == owner_domain_id {
                 if let Some(completion) = completion {
                     if best
                         .as_ref()
@@ -7174,6 +7182,8 @@ extern "win64" fn s_io_build_device_io_control_request(
             WdmIoStackLocationInit {
                 major,
                 minor: 0,
+                flags: 0,
+                control: 0,
                 device_object,
                 file_object: 0,
                 parameters: WdmIoStackParameters::DeviceControl {
@@ -10890,6 +10900,7 @@ pub(crate) unsafe fn hosted_driver_timer_wake_due(_now_100ns: u64) -> u64 {
                     dpc,
                     expiry.timer_ptr,
                     0,
+                    None,
                     &[],
                     &mut no_output,
                 );
@@ -15601,6 +15612,16 @@ unsafe fn clear_hosted_provider_dispatch_routes_for_instance(instance_index: usi
             && (route.dependent_instance == instance_index
                 || route.provider_instance == instance_index)
         {
+            if let (Some(dependent), Some(provider)) = (
+                instance(route.dependent_instance),
+                instance(route.provider_instance),
+            ) {
+                let _ = io_manager_mut().clear_hosted_domain_provider(
+                    nt_io_manager::HostedDomainId(dependent.hosted_domain_id),
+                    nt_io_manager::HostedDomainId(provider.hosted_domain_id),
+                    route.provider_domain_cookie,
+                );
+            }
             clear_driver_object_extensions_for_driver_object(route.provider_driver_object);
             *route = HostedProviderDispatchRoute::empty();
         }
@@ -15677,6 +15698,19 @@ unsafe fn register_hosted_provider_driver_object_shadow(
     {
         return Err(STATUS_INVALID_PARAMETER);
     }
+    let Some(provider_inst) = instance(provider_instance) else {
+        return Err(STATUS_DEVICE_NOT_READY);
+    };
+    if dependent_inst.hosted_domain_id == 0 || provider_inst.hosted_domain_id == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    io_manager_mut()
+        .set_hosted_domain_provider(
+            nt_io_manager::HostedDomainId(dependent_inst.hosted_domain_id),
+            nt_io_manager::HostedDomainId(provider_inst.hosted_domain_id),
+            provider_domain_cookie,
+        )
+        .map_err(nt_status::NtStatus::raw)?;
     if let Some(routes) = hosted_provider_dispatch_routes() {
         if let Some((index, route)) = routes.iter().copied().enumerate().find(|(_, route)| {
             route.used
@@ -15689,9 +15723,6 @@ unsafe fn register_hosted_provider_driver_object_shadow(
             }
         }
     }
-    let Some(provider_inst) = instance(provider_instance) else {
-        return Err(STATUS_DEVICE_NOT_READY);
-    };
     let Some(provider_driver_object) =
         hosted_instance_pool_alloc(provider_inst, WDM_X64_DRIVER_OBJECT_SIZE as u64)
     else {
@@ -26165,7 +26196,7 @@ unsafe fn component_dispatch_video_start_io() -> (i32, u64) {
     if ioctl > u32::MAX as u64 || inlen > u32::MAX as u64 || outlen > u32::MAX as u64 {
         return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
     }
-    let transfer_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_IRP_ID) as *const u64);
+    let transfer_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_CONTROL_ID) as *const u64);
     let buffer = pool_alloc_zeroed(inlen.max(outlen).max(1));
     if buffer == 0 {
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
@@ -26446,7 +26477,7 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
         return (0, (claimed != 0) as u64);
     }
     if major == FSD_DISPATCH_CANCEL_IRP {
-        let canonical_irp_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_IRP_ID) as *const u64);
+        let canonical_irp_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_CONTROL_ID) as *const u64);
         return if cancel_pending_irp(canonical_irp_id) {
             (0, 1)
         } else {
@@ -26454,13 +26485,13 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
         };
     }
     if major == FSD_DISPATCH_COPY_COMPLETION {
-        let canonical_irp_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_IRP_ID) as *const u64);
+        let canonical_irp_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_CONTROL_ID) as *const u64);
         let offset = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
         let capacity = read_volatile((FSD_SHARED_VADDR + SH_REQ_OUTLEN) as *const u64);
         return copy_pending_irp_completion(canonical_irp_id, offset, capacity);
     }
     if major == FSD_DISPATCH_ACK_COMPLETION {
-        let canonical_irp_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_IRP_ID) as *const u64);
+        let canonical_irp_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_CONTROL_ID) as *const u64);
         return if acknowledge_pending_irp_completion(canonical_irp_id) {
             (0, 0)
         } else {
@@ -26833,14 +26864,27 @@ extern "win64" fn s_hosted_provider_callback_gate_body(
 /// @0x08, DeviceObject@0x28, FileObject@0x30 }.
 unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     let devobj = read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64);
-    let minor = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64);
-    let inlen = read_volatile((FSD_SHARED_VADDR + SH_REQ_INLEN) as *const u64);
-    let outlen = read_volatile((FSD_SHARED_VADDR + SH_REQ_OUTLEN) as *const u64);
-    let fsctl = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
-    let canonical_irp_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_IRP_ID) as *const u64);
-    let canonical_file_id =
-        read_volatile((FSD_SHARED_VADDR + SH_REQ_CANONICAL_FILE_ID) as *const u64);
-    let owner_instance = read_volatile((FSD_SHARED_VADDR + SH_REQ_OWNER_INSTANCE) as *const u64);
+    let request = read_volatile(
+        (FSD_DATA_VADDR + FSD_DATA_IRP_DISPATCH_REQUEST_OFF) as *const IrpDispatchRequest,
+    );
+    if request.abi_version != IO_ABI_VERSION as u16
+        || request.abi_size as usize != core::mem::size_of::<IrpDispatchRequest>()
+        || !request.has_well_formed_domain_route()
+        || request.major as u64 != major
+        || request.stack_count == 0
+        || request.stack_location >= request.stack_count
+        || request.stack_count > u8::MAX as u32
+        || request.flags & !0xffff != 0
+    {
+        return (STATUS_INVALID_PARAMETER, 0);
+    }
+    let minor = request.minor as u64;
+    let inlen = request.input_len as u64;
+    let outlen = request.output_len as u64;
+    let fsctl = request.ioctl_code as u64;
+    let canonical_irp_id = request.irp_id;
+    let canonical_file_id = request.file_id;
+    let owner_domain_id = request.target_domain_id;
 
     let file_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
     let requestor_tid =
@@ -27070,13 +27114,8 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     // Read/Write: Length@+0x08. QueryFile/SetFile: Length@+0x08, FileInformationClass@+0x10.
     // FS/DeviceControl: OutputBufferLength@+0x08, InputBufferLength@+0x10, IoControlCode@+0x18,
     // Type3InputBuffer@+0x20. `Irp->UserBuffer` carries the output buffer.
-    let stack_count = if devobj != 0
-        && component_pool_allocation_capacity(devobj).is_some_and(|capacity| capacity >= 0x50)
-    {
-        read_unaligned((devobj + 0x4c) as *const u8).max(1)
-    } else {
-        1
-    };
+    let stack_count = request.stack_count as u8;
+    let current_location = stack_count - request.stack_location as u8;
     let iosl_len = (stack_count as u64).saturating_mul(WDM_X64_IO_STACK_LOCATION_SIZE as u64);
     let irp_packet_len = (WDM_X64_IRP_SIZE as u64).saturating_add(iosl_len);
     let irp = pool_alloc(irp_packet_len);
@@ -27090,7 +27129,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     core::ptr::write_bytes(irp as *mut u8, 0, irp_packet_len as usize);
     let iosl = irp + WDM_X64_IRP_SIZE as u64;
     let current_iosl = iosl
-        + (stack_count as u64 - 1).saturating_mul(WDM_X64_IO_STACK_LOCATION_SIZE as u64);
+        + (current_location as u64 - 1).saturating_mul(WDM_X64_IO_STACK_LOCATION_SIZE as u64);
     let mut pnp_resource_list = 0u64;
     let mut create_security_context = 0u64;
     let mut create_access_state = 0u64;
@@ -27266,6 +27305,8 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         WdmIoStackLocationInit {
             major: major as u8,
             minor: minor as u8,
+            flags: request.flags as u8,
+            control: (request.flags >> 8) as u8,
             device_object: devobj,
             file_object: fo,
             parameters: stack_parameters,
@@ -27304,7 +27345,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             user_buffer,
             thread: s_current_process(),
             stack_count,
-            current_location: stack_count,
+            current_location,
             current_stack_location: current_iosl,
         },
     )
@@ -27347,7 +27388,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         create_access_state,
         create_parameters,
         canonical_file_id,
-        owner_instance,
+        owner_domain_id,
         fid: file_id,
         requestor_tid,
         major: major as u8,
@@ -27743,6 +27784,10 @@ pub(crate) struct DriverComponent {
     pub thunk_next: u64,
     /// This driver's instance index in [`DRIVER_INSTANCES`].
     pub instance: usize,
+    /// Generation-protected identity of this component's isolated pointer address space.
+    pub hosted_domain_id: u64,
+    /// Freshness cookie paired with `hosted_domain_id` in authenticated dispatch envelopes.
+    pub hosted_domain_cookie: u64,
     /// Canonical executive/I/O route id for this driver binding.
     pub driver_id: u64,
     /// Canonical executive/I/O route id for this driver's named control device, if any.
@@ -29307,6 +29352,11 @@ unsafe fn load_driver_reserved(
     }
 
     let driver_id = register_io_driver(driver_object_path, instance)?;
+    let domain = crate::driver_launch::instance(instance)?;
+    if domain.hosted_domain_id == 0 || domain.hosted_domain_cookie == 0 {
+        destroy_registered_driver(driver_id);
+        return None;
+    }
     let dc = DriverComponent {
         pml4,
         fault_ep,
@@ -29339,6 +29389,8 @@ unsafe fn load_driver_reserved(
         thunk_len,
         thunk_next,
         instance,
+        hosted_domain_id: domain.hosted_domain_id,
+        hosted_domain_cookie: domain.hosted_domain_cookie,
         driver_id,
         device_id: 0,
         tcb,
@@ -30055,6 +30107,48 @@ fn projection_uses_separate_output(irp: &IrpProjection) -> bool {
     )
 }
 
+fn hosted_irp_dispatch_request(
+    instance_index: usize,
+    irp: &IrpProjection,
+    input_len: usize,
+    output_len: usize,
+) -> Result<IrpDispatchRequest, nt_status::NtStatus> {
+    let target = instance(instance_index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    if target.hosted_domain_id == 0
+        || target.hosted_domain_cookie == 0
+        || target.driver_id != irp.driver_id.raw()
+    {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    Ok(IrpDispatchRequest {
+        abi_version: IO_ABI_VERSION as u16,
+        abi_size: core::mem::size_of::<IrpDispatchRequest>() as u16,
+        major: irp.major,
+        minor: irp.minor,
+        flags: irp.flags.bits() as u32 | ((irp.control.bits() as u32) << 8),
+        target_domain_id: target.hosted_domain_id,
+        target_domain_cookie: target.hosted_domain_cookie,
+        irp_id: irp.irp_id.raw(),
+        driver_id: irp.driver_id.raw(),
+        device_id: irp.device_id.raw(),
+        file_id: irp.file_id.map(FileId::raw).unwrap_or(0),
+        buffer_id: irp.buffer.map(|buffer| buffer.buffer_id).unwrap_or(0),
+        buffer_len: u32::try_from(input_len.max(output_len))
+            .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?,
+        input_len: u32::try_from(input_len)
+            .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?,
+        output_len: u32::try_from(output_len)
+            .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?,
+        ioctl_code: u32::try_from(projection_fsctl(irp))
+            .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?,
+        stack_location: u32::try_from(irp.stack_location)
+            .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?,
+        stack_count: u32::try_from(irp.stack_count)
+            .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?,
+        ..IrpDispatchRequest::default()
+    })
+}
+
 impl DriverDispatchBackend for HostedDriverBackend {
     fn dispatch_irp(
         &mut self,
@@ -30070,6 +30164,7 @@ impl DriverDispatchBackend for HostedDriverBackend {
         };
         let input = Vec::from(&ctx.system_buffer[..input_len]);
         let fsctl = projection_fsctl(irp);
+        let request = hosted_irp_dispatch_request(self.instance, irp, input_len, output_len)?;
         let binding = hosted_device_binding_by_device_id(irp.device_id.raw());
         let device_object = binding
             .map(|binding| binding.device_object)
@@ -30100,6 +30195,7 @@ impl DriverDispatchBackend for HostedDriverBackend {
                             fsctl,
                             irp.user_data,
                             irp.requestor_tid,
+                            Some(request),
                             &input,
                             &mut ctx.system_buffer[output_offset..output_end],
                         )
@@ -30122,6 +30218,7 @@ impl DriverDispatchBackend for HostedDriverBackend {
                     fsctl,
                     irp.user_data,
                     irp.requestor_tid,
+                    Some(request),
                     &input,
                     &mut ctx.system_buffer[output_offset..output_end],
                 )
@@ -30166,6 +30263,7 @@ impl DriverDispatchBackend for HostedDriverBackend {
                 0,
                 0,
                 0,
+                None,
                 &[],
                 &mut output,
             )
@@ -30200,6 +30298,7 @@ impl DriverDispatchBackend for HostedDriverBackend {
                 offset,
                 0,
                 0,
+                None,
                 &[],
                 output,
             )
@@ -30225,6 +30324,7 @@ impl DriverDispatchBackend for HostedDriverBackend {
                 0,
                 0,
                 0,
+                None,
                 &[],
                 &mut output,
             )
@@ -33504,6 +33604,8 @@ pub(crate) struct DriverInstance {
     pub sched_context: u64,
     pub map_cap_bank: crate::spawn_hosts::ComponentMapCapBank,
     pub reply_cap: u64,
+    pub hosted_domain_id: u64,
+    pub hosted_domain_cookie: u64,
     pub driver_id: u64,
     pub device_id: u64,
     pub driver_object: u64,
@@ -33539,6 +33641,8 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     sched_context: 0,
     map_cap_bank: crate::spawn_hosts::ComponentMapCapBank { owner: 0, count: 0 },
     reply_cap: 0,
+    hosted_domain_id: 0,
+    hosted_domain_cookie: 0,
     driver_id: 0,
     device_id: 0,
     driver_object: 0,
@@ -33996,9 +34100,13 @@ fn reserve_instance_slot() -> Option<usize> {
     };
     if let Some(index) = reusable {
         clear_instance_exec_mappings(index);
+        let domain_id = io_manager_mut().register_hosted_domain();
+        let domain = io_manager_mut().hosted_domain_identity(domain_id)?;
         let table = unsafe { driver_instances_mut() };
         table[index] = DriverInstance {
             used: true,
+            hosted_domain_id: domain.domain_id.raw(),
+            hosted_domain_cookie: domain.cookie,
             ..EMPTY_INSTANCE
         };
         unsafe {
@@ -34010,8 +34118,12 @@ fn reserve_instance_slot() -> Option<usize> {
     let table = unsafe { driver_instances_mut() };
     let index = table.len();
     ExecVaWindow::try_for_instance(index)?;
+    let domain_id = io_manager_mut().register_hosted_domain();
+    let domain = io_manager_mut().hosted_domain_identity(domain_id)?;
     table.push(DriverInstance {
         used: true,
+        hosted_domain_id: domain.domain_id.raw(),
+        hosted_domain_cookie: domain.cookie,
         ..EMPTY_INSTANCE
     });
     unsafe {
@@ -34190,9 +34302,13 @@ fn register_instance_transport(i: usize, inst: DriverInstance) {
     while t.len() <= i {
         t.push(EMPTY_INSTANCE);
     }
+    let hosted_domain_id = t[i].hosted_domain_id;
+    let hosted_domain_cookie = t[i].hosted_domain_cookie;
     t[i] = DriverInstance {
         ready: false,
         used: true,
+        hosted_domain_id,
+        hosted_domain_cookie,
         ..inst
     };
 }
@@ -34228,6 +34344,8 @@ fn register_instance(dc: &DriverComponent) {
         sched_context: dc.sched_context,
         map_cap_bank: dc.map_cap_bank,
         reply_cap: dc.reply_cap,
+        hosted_domain_id: dc.hosted_domain_id,
+        hosted_domain_cookie: dc.hosted_domain_cookie,
         driver_id: dc.driver_id,
         device_id: dc.device_id,
         driver_object: dc.drvobj,
@@ -34317,6 +34435,7 @@ fn clear_instance(i: usize) {
             clear_driver_object_extensions_for_driver_object(inst.driver_object);
         }
     }
+    let domain_id = instance(i).map(|inst| inst.hosted_domain_id).unwrap_or(0);
     let t = unsafe { driver_instances_mut() };
     if i < t.len() {
         let sh = t[i].exec_shared_va;
@@ -34335,6 +34454,16 @@ fn clear_instance(i: usize) {
         t[i] = EMPTY_INSTANCE;
     } else {
         clear_instance_exec_mappings(i);
+    }
+    if domain_id != 0 {
+        let removed = io_manager_mut().unregister_hosted_domain(nt_io_manager::HostedDomainId(
+            domain_id,
+        ));
+        if !removed {
+            print_str(b"[driver-launch] hosted domain teardown rejected id=0x");
+            print_hex64(domain_id);
+            print_str(b"\n");
+        }
     }
 }
 
@@ -37020,7 +37149,7 @@ unsafe fn dispatch_video_start_io_for_instance(
     write_volatile((sh + SH_REQ_INLEN) as *mut u64, inlen as u64);
     write_volatile((sh + SH_REQ_OUTLEN) as *mut u64, out.len() as u64);
     write_volatile((sh + SH_REQ_FILEID) as *mut u64, file_id);
-    write_volatile((sh + SH_REQ_IRP_ID) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_CONTROL_ID) as *mut u64, 0);
     write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
     write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
 
@@ -37180,6 +37309,27 @@ pub(crate) unsafe fn start_hosted_device(
         return Ok(());
     }
     let mut out = [];
+    let target = instance(binding.instance).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    let stack_count = io_manager_mut()
+        .device(nt_io_manager::DeviceId(binding.device_id))
+        .map(|device| device.stack_size as u32)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let request = IrpDispatchRequest {
+        abi_version: IO_ABI_VERSION as u16,
+        abi_size: core::mem::size_of::<IrpDispatchRequest>() as u16,
+        major: major::IRP_MJ_PNP,
+        minor: IRP_MN_START_DEVICE as u8,
+        target_domain_id: target.hosted_domain_id,
+        target_domain_cookie: target.hosted_domain_cookie,
+        driver_id: binding.driver_id,
+        device_id: binding.device_id,
+        buffer_len: u32::try_from(resource_list.len())
+            .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?,
+        input_len: u32::try_from(resource_list.len())
+            .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?,
+        stack_count,
+        ..IrpDispatchRequest::default()
+    };
     let (status, _, _) = dispatch_irp_for_instance(
         binding.instance,
         IRP_MJ_PNP,
@@ -37190,6 +37340,7 @@ pub(crate) unsafe fn start_hosted_device(
         0,
         binding.pdo_object,
         0,
+        Some(request),
         resource_list,
         &mut out,
     )
@@ -37239,6 +37390,7 @@ unsafe fn dispatch_hosted_device_interrupt_once(
         0,
         tokens.interrupt_id,
         0,
+        None,
         &[],
         &mut out,
     )
@@ -37592,6 +37744,7 @@ unsafe fn dispatch_irp_for_instance(
     fsctl: u64,
     file_id: u64,
     requestor_tid: u64,
+    mut dispatch_request: Option<IrpDispatchRequest>,
     in_data: &[u8],
     out: &mut [u8],
 ) -> Option<(i32, u64, u64)> {
@@ -37607,6 +37760,7 @@ unsafe fn dispatch_irp_for_instance(
     let mut sh = d.exec_shared_va;
     let mut driver_object = d.driver_object;
     let mut provider_binding = None;
+    let mut provider_route = None;
     if major != FSD_DISPATCH_TIMER_DPC {
         if let Some(route) = hosted_provider_dispatch_route_for_instance(inst) {
             if !route.add_device_ready() {
@@ -37633,6 +37787,7 @@ unsafe fn dispatch_irp_for_instance(
             sh = provider_inst.exec_shared_va;
             driver_object = route.provider_driver_object;
             provider_binding = Some(binding);
+            provider_route = Some(route);
         }
     }
     let ep = d.fault_ep;
@@ -37645,17 +37800,46 @@ unsafe fn dispatch_irp_for_instance(
     write_volatile((sh + SH_REQ_INLEN) as *mut u64, in_data.len() as u64);
     write_volatile((sh + SH_REQ_OUTLEN) as *mut u64, out.len() as u64);
     write_volatile((sh + SH_REQ_FILEID) as *mut u64, file_id);
-    write_volatile((sh + SH_REQ_IRP_ID) as *mut u64, canonical_irp_id);
-    write_volatile(
-        (sh + SH_REQ_CANONICAL_FILE_ID) as *mut u64,
-        canonical_file_id,
-    );
+    write_volatile((sh + SH_REQ_CONTROL_ID) as *mut u64, canonical_irp_id);
     write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
     write_volatile(
         (sh + SH_REQ_REQUESTOR_TID) as *mut u32,
         requestor_tid as u32,
     );
-    write_volatile((sh + SH_REQ_OWNER_INSTANCE) as *mut u64, inst as u64);
+    if let Some(request) = dispatch_request.as_mut() {
+        if request.abi_version != IO_ABI_VERSION as u16
+            || request.abi_size as usize != core::mem::size_of::<IrpDispatchRequest>()
+            || request.irp_id != canonical_irp_id
+            || request.file_id != canonical_file_id
+            || request.driver_id == 0
+            || request.driver_id != dependent_inst.driver_id
+            || request.major as u64 != major
+            || request.minor as u64 != minor
+            || request.input_len as usize != in_data.len()
+            || request.output_len as usize != out.len()
+            || request.stack_count == 0
+            || request.stack_location >= request.stack_count
+        {
+            return Some((STATUS_INVALID_PARAMETER, 0, 0));
+        }
+        if let Some(route) = provider_route {
+            request.provider_domain_id = d.hosted_domain_id;
+            request.provider_cookie = route.provider_domain_cookie;
+        }
+        if !request.has_well_formed_domain_route() {
+            return Some((STATUS_INVALID_PARAMETER, 0, 0));
+        }
+        let Some(data_va) = ExecVaWindow::try_for_instance(dispatch_index).map(|win| win.data_va)
+        else {
+            return Some((STATUS_INVALID_PARAMETER, 0, 0));
+        };
+        write_volatile(
+            (data_va + FSD_DATA_IRP_DISPATCH_REQUEST_OFF) as *mut IrpDispatchRequest,
+            *request,
+        );
+    } else if major <= u8::MAX as u64 && major::is_valid_major(major as u8) {
+        return Some((STATUS_INVALID_PARAMETER, 0, 0));
+    }
     write_volatile((sh + SH_ACTIVE_IRP) as *mut u64, 0);
     write_volatile((sh + SH_ACTIVE_IOSL) as *mut u64, 0);
     write_volatile((sh + SH_ACTIVE_DATA) as *mut u64, 0);
@@ -37693,6 +37877,38 @@ unsafe fn dispatch_irp_for_instance(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
+    if let Some(request) = dispatch_request {
+        let channel = instance_for_pump_channel(&ch, ch.reply_cap);
+        let route_matches = match provider_route {
+            Some(route) => {
+                request.provider_domain_id == d.hosted_domain_id
+                    && request.provider_cookie == route.provider_domain_cookie
+                    && route.provider_instance == dispatch_index
+            }
+            None => {
+                request.provider_domain_id == 0
+                    && request.provider_cookie == 0
+                    && dispatch_index == inst
+            }
+        };
+        if request.target_domain_id != dependent_inst.hosted_domain_id
+            || request.target_domain_cookie != dependent_inst.hosted_domain_cookie
+            || !route_matches
+            || !matches!(
+                channel,
+                Some((channel_index, channel_inst))
+                    if channel_index == dispatch_index
+                        && channel_inst.hosted_domain_id
+                            == if request.provider_domain_id != 0 {
+                                request.provider_domain_id
+                            } else {
+                                request.target_domain_id
+                            }
+            )
+        {
+            return Some((STATUS_INVALID_PARAMETER, 0, 0));
+        }
+    }
     let bugchecks_before = FSD_BUGCHECKS.load(Ordering::Relaxed);
     // DIAGNOSTIC (bounded): an IRP dispatch is the one place the executive blocks on a hosted
     // component, so an `ENTER` with no matching `EXIT` is the signature of a driver that never

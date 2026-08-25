@@ -184,6 +184,24 @@ impl<P> IoManager<P> {
         })
     }
 
+    /// Clear one exact provider link. A stale teardown cannot erase a replacement route.
+    pub fn clear_hosted_domain_provider(
+        &mut self,
+        domain: HostedDomainId,
+        provider: HostedDomainId,
+        provider_cookie: u64,
+    ) -> bool {
+        let Some(domain) = self.hosted_domains.get_mut(domain) else {
+            return false;
+        };
+        if domain.provider_domain_id != provider || domain.provider_cookie != provider_cookie {
+            return false;
+        }
+        domain.provider_domain_id = HostedDomainId::NULL;
+        domain.provider_cookie = 0;
+        true
+    }
+
     pub fn bind_hosted_driver_address(
         &mut self,
         domain: HostedDomainId,
@@ -451,6 +469,12 @@ mod tests {
         let identity = io.hosted_provider_identity(dependent).unwrap();
         assert_eq!(identity.domain_id, provider);
         assert_eq!(identity.cookie, 0x55aa);
+        assert!(!io.clear_hosted_domain_provider(dependent, provider, 0x55ab));
+        assert_eq!(io.hosted_provider_identity(dependent), Some(identity));
+        assert!(io.clear_hosted_domain_provider(dependent, provider, 0x55aa));
+        assert_eq!(io.hosted_provider_identity(dependent), None);
+        io.set_hosted_domain_provider(dependent, provider, 0x55aa)
+            .unwrap();
         assert!(io.unregister_hosted_domain(provider));
         assert_eq!(io.hosted_provider_identity(dependent), None);
         assert_eq!(
