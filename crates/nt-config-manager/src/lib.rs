@@ -22,7 +22,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
-pub use property::{device_property, devprop_type, DevPropKey, PropertyBag, PropertyValue};
+pub use property::{
+    device_property, devprop_type, DevPropKey, DevicePropertySource, PropertyBag, PropertyValue,
+};
 pub use registry::{
     encode_multi_sz, encode_sz, Registry, RegistryKeyId, RegistryValue, RegistryValueType,
 };
@@ -1161,66 +1163,120 @@ impl ConfigManager {
     /// are indexed on demand. Bus and resource properties intentionally remain owned by the PnP
     /// and resource managers rather than being synthesized from registry metadata.
     pub fn device_property_bytes(&mut self, instance_id: &str, property: u32) -> Option<Vec<u8>> {
+        if device_property::source(property) != DevicePropertySource::Configuration {
+            return None;
+        }
         let devnode_id = self
             .devnode(instance_id)
             .map(|devnode| devnode.id)
             .or_else(|| self.index_registry_devnode(instance_id))?;
         let devnode = self.devnode_by_id(devnode_id)?;
-        if let Some(value) = devnode.properties.get_legacy(property) {
-            return Some(value.data.clone());
-        }
+        let enum_key = devnode.enum_key;
         match property {
-            device_property::HARDWARE_ID => (!devnode.hardware_ids.is_empty()).then(|| {
-                let values: Vec<&str> = devnode.hardware_ids.iter().map(String::as_str).collect();
-                encode_multi_sz(&values)
-            }),
-            device_property::COMPATIBLE_IDS => (!devnode.compatible_ids.is_empty()).then(|| {
-                let values: Vec<&str> = devnode.compatible_ids.iter().map(String::as_str).collect();
-                encode_multi_sz(&values)
-            }),
-            device_property::DRIVER_KEY_NAME => devnode.driver_key.as_deref().map(encode_sz),
             device_property::PHYSICAL_DEVICE_OBJECT_NAME => {
                 devnode.pdo_name.as_deref().map(encode_sz)
             }
             device_property::ENUMERATOR_NAME => instance_id
-                .split('\\')
-                .next()
+                .split_once('\\')
+                .map(|(enumerator, _)| enumerator)
                 .filter(|enumerator| !enumerator.is_empty())
                 .map(encode_sz),
-            device_property::DEVICE_DESCRIPTION => {
-                self.registry_property_bytes(devnode.enum_key, "DeviceDesc")
+            _ => {
+                if let Some(value) = devnode.properties.get_legacy(property) {
+                    return valid_legacy_override(property, value).then(|| value.data.clone());
+                }
+                match property {
+                    device_property::DEVICE_DESCRIPTION => {
+                        self.registry_property_bytes(enum_key, "DeviceDesc", RegistryValueType::Sz)
+                    }
+                    device_property::HARDWARE_ID => self.registry_property_bytes(
+                        enum_key,
+                        "HardwareID",
+                        RegistryValueType::MultiSz,
+                    ),
+                    device_property::COMPATIBLE_IDS => self.registry_property_bytes(
+                        enum_key,
+                        "CompatibleIDs",
+                        RegistryValueType::MultiSz,
+                    ),
+                    device_property::BOOT_CONFIGURATION => self
+                        .registry
+                        .open_subkey(enum_key, "LogConf")
+                        .and_then(|key| {
+                            self.registry_property_bytes(
+                                key,
+                                "BootConfig",
+                                RegistryValueType::ResourceList,
+                            )
+                        }),
+                    device_property::CLASS_NAME => {
+                        self.registry_property_bytes(enum_key, "Class", RegistryValueType::Sz)
+                    }
+                    device_property::CLASS_GUID => {
+                        self.registry_property_bytes(enum_key, "ClassGUID", RegistryValueType::Sz)
+                    }
+                    device_property::DRIVER_KEY_NAME => {
+                        self.registry_property_bytes(enum_key, "Driver", RegistryValueType::Sz)
+                    }
+                    device_property::MANUFACTURER => {
+                        self.registry_property_bytes(enum_key, "Mfg", RegistryValueType::Sz)
+                    }
+                    device_property::FRIENDLY_NAME => self.registry_property_bytes(
+                        enum_key,
+                        "FriendlyName",
+                        RegistryValueType::Sz,
+                    ),
+                    device_property::LOCATION_INFORMATION => self.registry_property_bytes(
+                        enum_key,
+                        "LocationInformation",
+                        RegistryValueType::Sz,
+                    ),
+                    device_property::UI_NUMBER => {
+                        self.registry_property_bytes(enum_key, "UINumber", RegistryValueType::Dword)
+                    }
+                    device_property::INSTALL_STATE => {
+                        let flags = match self.registry.query_value(enum_key, "ConfigFlags") {
+                            None => 0,
+                            Some(value)
+                                if value.value_type == RegistryValueType::Dword
+                                    && valid_registry_property_data(value) =>
+                            {
+                                u32::from_le_bytes([
+                                    value.data[0],
+                                    value.data[1],
+                                    value.data[2],
+                                    value.data[3],
+                                ])
+                            }
+                            Some(_) => return None,
+                        };
+                        let state = if flags & 0x40 != 0 {
+                            2u32
+                        } else if flags & 0x20 != 0 {
+                            1u32
+                        } else {
+                            0u32
+                        };
+                        Some(state.to_le_bytes().to_vec())
+                    }
+                    device_property::CONTAINER_ID => {
+                        self.registry_property_bytes(enum_key, "ContainerID", RegistryValueType::Sz)
+                    }
+                    _ => None,
+                }
             }
-            device_property::BOOT_CONFIGURATION => {
-                self.registry_property_bytes(devnode.enum_key, "BootConfig")
-            }
-            device_property::CLASS_NAME => self.registry_property_bytes(devnode.enum_key, "Class"),
-            device_property::CLASS_GUID => {
-                self.registry_property_bytes(devnode.enum_key, "ClassGUID")
-            }
-            device_property::MANUFACTURER => self.registry_property_bytes(devnode.enum_key, "Mfg"),
-            device_property::FRIENDLY_NAME => {
-                self.registry_property_bytes(devnode.enum_key, "FriendlyName")
-            }
-            device_property::LOCATION_INFORMATION => {
-                self.registry_property_bytes(devnode.enum_key, "LocationInformation")
-            }
-            device_property::UI_NUMBER => {
-                self.registry_property_bytes(devnode.enum_key, "UINumber")
-            }
-            device_property::INSTALL_STATE => {
-                self.registry_property_bytes(devnode.enum_key, "ConfigFlags")
-            }
-            device_property::CONTAINER_ID => {
-                self.registry_property_bytes(devnode.enum_key, "ContainerID")
-            }
-            _ => None,
         }
     }
 
-    fn registry_property_bytes(&self, key: RegistryKeyId, value_name: &str) -> Option<Vec<u8>> {
-        self.registry
-            .query_value(key, value_name)
-            .map(|value| value.data.clone())
+    fn registry_property_bytes(
+        &self,
+        key: RegistryKeyId,
+        value_name: &str,
+        expected_type: RegistryValueType,
+    ) -> Option<Vec<u8>> {
+        let value = self.registry.query_value(key, value_name)?;
+        (value.value_type == expected_type && valid_registry_property_data(value))
+            .then(|| value.data.clone())
     }
 
     pub fn devnode(&self, instance_id: &str) -> Option<&DevnodeRecord> {
@@ -1501,6 +1557,52 @@ impl ConfigManager {
             }
             _ => None,
         }
+    }
+}
+
+fn valid_utf16_sz(data: &[u8]) -> bool {
+    data.len() >= 2 && data.len() % 2 == 0 && data[data.len() - 2..] == [0, 0]
+}
+
+fn valid_utf16_multi_sz(data: &[u8]) -> bool {
+    data.len() >= 4 && data.len() % 2 == 0 && data[data.len() - 4..] == [0, 0, 0, 0]
+}
+
+fn valid_registry_property_data(value: &RegistryValue) -> bool {
+    match value.value_type {
+        RegistryValueType::Sz => valid_utf16_sz(&value.data),
+        RegistryValueType::MultiSz => valid_utf16_multi_sz(&value.data),
+        RegistryValueType::Dword => value.data.len() == 4,
+        RegistryValueType::ResourceList => true,
+        _ => false,
+    }
+}
+
+fn valid_legacy_override(property: u32, value: &PropertyValue) -> bool {
+    match property {
+        device_property::DEVICE_DESCRIPTION
+        | device_property::CLASS_NAME
+        | device_property::CLASS_GUID
+        | device_property::DRIVER_KEY_NAME
+        | device_property::MANUFACTURER
+        | device_property::FRIENDLY_NAME
+        | device_property::LOCATION_INFORMATION
+        | device_property::CONTAINER_ID => {
+            value.prop_type == devprop_type::STRING && valid_utf16_sz(&value.data)
+        }
+        device_property::HARDWARE_ID | device_property::COMPATIBLE_IDS => {
+            value.prop_type == devprop_type::STRING_LIST && valid_utf16_multi_sz(&value.data)
+        }
+        device_property::BOOT_CONFIGURATION => value.prop_type == devprop_type::BINARY,
+        device_property::UI_NUMBER => {
+            value.prop_type == devprop_type::UINT32 && value.data.len() == 4
+        }
+        device_property::INSTALL_STATE => {
+            value.prop_type == devprop_type::UINT32
+                && value.data.len() == 4
+                && value.as_uint32().is_some_and(|state| state <= 3)
+        }
+        _ => false,
     }
 }
 
@@ -3116,15 +3218,48 @@ mod tests {
 
     #[test]
     fn legacy_device_property_ordinals_match_nt() {
-        assert_eq!(device_property::DRIVER_KEY_NAME, 7);
-        assert_eq!(device_property::FRIENDLY_NAME, 9);
-        assert_eq!(device_property::PHYSICAL_DEVICE_OBJECT_NAME, 11);
-        assert_eq!(device_property::LEGACY_BUS_TYPE, 13);
-        assert_eq!(device_property::BUS_NUMBER, 14);
-        assert_eq!(device_property::ENUMERATOR_NAME, 15);
-        assert_eq!(device_property::ADDRESS, 16);
-        assert_eq!(device_property::ALLOCATED_RESOURCES, 21);
-        assert_eq!(device_property::CONTAINER_ID, 22);
+        assert_eq!(
+            [
+                device_property::DEVICE_DESCRIPTION,
+                device_property::HARDWARE_ID,
+                device_property::COMPATIBLE_IDS,
+                device_property::BOOT_CONFIGURATION,
+                device_property::BOOT_CONFIGURATION_TRANSLATED,
+                device_property::CLASS_NAME,
+                device_property::CLASS_GUID,
+                device_property::DRIVER_KEY_NAME,
+                device_property::MANUFACTURER,
+                device_property::FRIENDLY_NAME,
+                device_property::LOCATION_INFORMATION,
+                device_property::PHYSICAL_DEVICE_OBJECT_NAME,
+                device_property::BUS_TYPE_GUID,
+                device_property::LEGACY_BUS_TYPE,
+                device_property::BUS_NUMBER,
+                device_property::ENUMERATOR_NAME,
+                device_property::ADDRESS,
+                device_property::UI_NUMBER,
+                device_property::INSTALL_STATE,
+                device_property::REMOVAL_POLICY,
+                device_property::RESOURCE_REQUIREMENTS,
+                device_property::ALLOCATED_RESOURCES,
+                device_property::CONTAINER_ID,
+            ],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,]
+        );
+
+        for property in [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 15, 17, 18, 22] {
+            assert_eq!(
+                device_property::source(property),
+                DevicePropertySource::Configuration
+            );
+        }
+        for property in [4, 12, 13, 14, 16, 19, 20, 21] {
+            assert_eq!(
+                device_property::source(property),
+                DevicePropertySource::External
+            );
+        }
+        assert_eq!(device_property::source(23), DevicePropertySource::Invalid);
     }
 
     #[test]
@@ -3140,22 +3275,49 @@ mod tests {
             "Driver",
             r"{4D36E972-E325-11CE-BFC1-08002BE10318}\0000",
         );
+        cm.registry_mut()
+            .set_string(key, "DeviceDesc", "Intel Ethernet Controller");
         cm.registry_mut().set_string(key, "Class", "Net");
         cm.registry_mut()
+            .set_string(key, "ClassGUID", "{4D36E972-E325-11CE-BFC1-08002BE10318}");
+        cm.registry_mut().set_string(key, "Mfg", "Intel");
+        cm.registry_mut()
             .set_string(key, "FriendlyName", "Intel Test Adapter");
+        cm.registry_mut()
+            .set_string(key, "LocationInformation", "PCI bus 0, device 3");
+        cm.registry_mut()
+            .set_string(key, "ContainerID", "{01234567-89AB-CDEF-0123-456789ABCDEF}");
+        cm.registry_mut().set_dword(key, "UINumber", 7);
         cm.registry_mut().set_value(
             key,
             "HardwareID",
             RegistryValueType::MultiSz,
             encode_multi_sz(&[r"PCI\VEN_8086&DEV_100E", r"PCI\VEN_8086"]),
         );
+        cm.registry_mut().set_value(
+            key,
+            "CompatibleIDs",
+            RegistryValueType::MultiSz,
+            encode_multi_sz(&[r"PCI\VEN_8086&CC_020000"]),
+        );
+        cm.registry_mut().set_value(
+            key,
+            "BootConfig",
+            RegistryValueType::ResourceList,
+            alloc::vec![0xff],
+        );
         assert!(cm.devnode(instance).is_none());
 
+        let lower_instance = instance.to_ascii_lowercase();
         assert_eq!(
-            cm.device_property_bytes(instance, device_property::DRIVER_KEY_NAME),
+            cm.device_property_bytes(&lower_instance, device_property::DRIVER_KEY_NAME),
             Some(encode_sz(r"{4D36E972-E325-11CE-BFC1-08002BE10318}\0000"))
         );
         let devnode = cm.devnode(instance).unwrap().id;
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::DEVICE_DESCRIPTION),
+            Some(encode_sz("Intel Ethernet Controller"))
+        );
         assert_eq!(
             cm.device_property_bytes(instance, device_property::HARDWARE_ID),
             Some(encode_multi_sz(&[
@@ -3164,12 +3326,120 @@ mod tests {
             ]))
         );
         assert_eq!(
+            cm.device_property_bytes(instance, device_property::COMPATIBLE_IDS),
+            Some(encode_multi_sz(&[r"PCI\VEN_8086&CC_020000"]))
+        );
+        assert_eq!(
             cm.device_property_bytes(instance, device_property::ENUMERATOR_NAME),
             Some(encode_sz("PCI"))
         );
         assert_eq!(
+            cm.device_property_bytes(instance, device_property::PHYSICAL_DEVICE_OBJECT_NAME),
+            Some(encode_sz(r"\Device\NTPNP_PCI0001"))
+        );
+        assert_eq!(
             cm.device_property_bytes(instance, device_property::FRIENDLY_NAME),
             Some(encode_sz("Intel Test Adapter"))
+        );
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::CLASS_NAME),
+            Some(encode_sz("Net"))
+        );
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::CLASS_GUID),
+            Some(encode_sz("{4D36E972-E325-11CE-BFC1-08002BE10318}"))
+        );
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::MANUFACTURER),
+            Some(encode_sz("Intel"))
+        );
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::LOCATION_INFORMATION),
+            Some(encode_sz("PCI bus 0, device 3"))
+        );
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::CONTAINER_ID),
+            Some(encode_sz("{01234567-89AB-CDEF-0123-456789ABCDEF}"))
+        );
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::UI_NUMBER),
+            Some(7u32.to_le_bytes().to_vec())
+        );
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::INSTALL_STATE),
+            Some(0u32.to_le_bytes().to_vec())
+        );
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::BOOT_CONFIGURATION),
+            None
+        );
+
+        let log_conf = cm.registry_mut().create_subkey(key, "LogConf");
+        cm.registry_mut().set_value(
+            log_conf,
+            "BootConfig",
+            RegistryValueType::ResourceList,
+            alloc::vec![1, 2, 3, 4],
+        );
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::BOOT_CONFIGURATION),
+            Some(alloc::vec![1, 2, 3, 4])
+        );
+
+        cm.registry_mut().set_string(
+            key,
+            "Driver",
+            r"{4D36E972-E325-11CE-BFC1-08002BE10318}\0001",
+        );
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::DRIVER_KEY_NAME),
+            Some(encode_sz(r"{4D36E972-E325-11CE-BFC1-08002BE10318}\0001"))
+        );
+        assert!(cm.registry_mut().delete_value(key, "Driver"));
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::DRIVER_KEY_NAME),
+            None
+        );
+        assert!(cm.registry_mut().delete_value(key, "HardwareID"));
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::HARDWARE_ID),
+            None
+        );
+        cm.registry_mut()
+            .set_string(key, "HardwareID", r"PCI\VEN_8086&DEV_100E");
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::HARDWARE_ID),
+            None
+        );
+
+        cm.registry_mut()
+            .set_dword(key, "FriendlyName", 0xfeed_beef);
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::FRIENDLY_NAME),
+            None
+        );
+        cm.registry_mut()
+            .set_string(key, "FriendlyName", "Registry Adapter");
+        assert!(cm.set_legacy_property(
+            devnode,
+            device_property::FRIENDLY_NAME,
+            PropertyValue::uint32(1)
+        ));
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::FRIENDLY_NAME),
+            None
+        );
+        assert!(cm.set_legacy_property(
+            devnode,
+            device_property::FRIENDLY_NAME,
+            PropertyValue {
+                prop_type: devprop_type::STRING,
+                data: alloc::vec![b'A', 0],
+            }
+        ));
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::FRIENDLY_NAME),
+            None
         );
 
         assert!(cm.set_legacy_property(
@@ -3181,12 +3451,80 @@ mod tests {
             cm.device_property_bytes(instance, device_property::FRIENDLY_NAME),
             Some(encode_sz("Override Adapter"))
         );
+        assert!(cm.set_legacy_property(
+            devnode,
+            device_property::PHYSICAL_DEVICE_OBJECT_NAME,
+            PropertyValue::string(r"\Device\ForgedPdo")
+        ));
+        assert!(cm.set_legacy_property(
+            devnode,
+            device_property::ENUMERATOR_NAME,
+            PropertyValue::string("FORGED")
+        ));
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::PHYSICAL_DEVICE_OBJECT_NAME),
+            Some(encode_sz(r"\Device\NTPNP_PCI0001"))
+        );
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::ENUMERATOR_NAME),
+            Some(encode_sz("PCI"))
+        );
+        assert!(cm.set_legacy_property(
+            devnode,
+            device_property::BUS_NUMBER,
+            PropertyValue::uint32(42)
+        ));
         assert_eq!(
             cm.device_property_bytes(instance, device_property::LEGACY_BUS_TYPE),
             None
         );
         assert_eq!(
-            cm.device_property_bytes(instance, device_property::ADDRESS),
+            cm.device_property_bytes(instance, device_property::BUS_NUMBER),
+            None
+        );
+        assert_eq!(cm.device_property_bytes(instance, 23), None);
+
+        cm.registry_mut()
+            .set_string(key, "ConfigFlags", "not-a-dword");
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::INSTALL_STATE),
+            None
+        );
+        cm.registry_mut().set_dword(key, "ConfigFlags", 0x20);
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::INSTALL_STATE),
+            Some(1u32.to_le_bytes().to_vec())
+        );
+        cm.registry_mut().set_dword(key, "ConfigFlags", 0x60);
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::INSTALL_STATE),
+            Some(2u32.to_le_bytes().to_vec())
+        );
+        assert!(cm.set_legacy_property(
+            devnode,
+            device_property::INSTALL_STATE,
+            PropertyValue::uint32(4)
+        ));
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::INSTALL_STATE),
+            None
+        );
+        assert!(cm.set_legacy_property(
+            devnode,
+            device_property::INSTALL_STATE,
+            PropertyValue::uint32(3)
+        ));
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::INSTALL_STATE),
+            Some(3u32.to_le_bytes().to_vec())
+        );
+
+        let flat_instance = "ROOTONLY";
+        let flat_key = cm.registry_mut().create_key(&devnode_path(flat_instance));
+        cm.registry_mut()
+            .set_string(flat_key, "PdoName", r"\Device\FlatPdo");
+        assert_eq!(
+            cm.device_property_bytes(flat_instance, device_property::ENUMERATOR_NAME),
             None
         );
         assert_eq!(

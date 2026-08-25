@@ -11311,12 +11311,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
 
     Config Manager legacy-property query checkpoint (2026-08-26): a stable devnode instance path
     can now query native `IoGetDeviceProperty` byte payloads without a server-local DevnodeId.
-    Imported Enum keys are indexed lazily. Per-devnode PropertyBag values override the underlying
-    Enum data; hardware/compatible IDs retain `REG_MULTI_SZ`, strings retain UTF-16LE `REG_SZ`, and
-    driver key, PDO name, and enumerator are derived from the indexed devnode. Legacy bus type, bus
-    number, address, translated boot resources, requirements, and allocated resources deliberately
-    return no Config Manager value because their authority remains PnP/resource state. Focused
-    `nt-config-manager` validation is green at `28/28`.
+    Imported Enum keys are indexed lazily. Valid typed per-devnode PropertyBag values override the
+    corresponding live Enum values; malformed overrides fail closed. Hardware/compatible IDs retain
+    `REG_MULTI_SZ`, strings retain UTF-16LE `REG_SZ`, and the PDO name and enumerator are dynamic
+    devnode identity rather than overrideable metadata. Legacy bus type, bus number, address,
+    translated boot resources, requirements, and allocated resources deliberately return no Config
+    Manager value because their authority remains PnP/resource state. Focused `nt-config-manager`
+    validation is green at `28/28`.
 
     Review adjustment: property policy and lazy indexing are ready for transport. Add the bounded
     Config Manager ABI/client/server query operation next, preserving required byte length on
@@ -11337,6 +11338,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     full canonical completion owner `(IrpId, DriverId, DeviceId)` plus target/provider domain
     generations; cookie validation alone does not make the current IrpId-only cancel/copy/ACK
     selectors authoritative.
+
+    Config Manager property-authority correction checkpoint (2026-08-26): the legacy property
+    surface now classifies every NT ordinal as Configuration-owned, externally owned, or invalid
+    before consulting any per-devnode data. PnP/resource properties therefore cannot be injected
+    through a PropertyBag. PDO name and enumerator come only from stable devnode identity. Valid
+    typed PropertyBag overrides fail closed when malformed; otherwise every registry-backed value
+    is read live from the Enum key with its exact `REG_SZ`, `REG_MULTI_SZ`, `REG_DWORD`, or
+    `REG_RESOURCE_LIST` type. `BootConfig` is accepted only from the `LogConf` subkey. Install state
+    maps `ConfigFlags` reinstall/failed bits to the native state values, distinguishes an absent
+    value from a present malformed value, and permits an explicit typed FinishInstall state.
+    Focused `nt-config-manager` validation remains green at `28/28`, now covering all ordinals,
+    case-insensitive lazy import, live mutation/deletion, type failures, identity override attempts,
+    external-property injection, and malformed enumerator paths.
+
+    Review adjustment: the semantic authority is now strict enough to expose. The next unit is the
+    bounded Config Manager ABI/client/server property query keyed by stable instance path. Its wire
+    response must preserve the required byte count on `STATUS_BUFFER_TOO_SMALL`, distinguish an
+    invalid ordinal from a valid externally owned ordinal, and never expose internal `DevnodeId`s.
+    Interface registration/state can follow as separate semantic operations only after this query
+    transport is proven.
 
     After that boundary is live, migrate the standalone hal, power, PnP, async, MMIO, and DMA
     component harnesses to `CompletionOwnerClaim` plus `CompletionUnwindCursor`, including their

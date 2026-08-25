@@ -4,8 +4,17 @@
 
 use alloc::vec::Vec;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DevicePropertySource {
+    Configuration,
+    External,
+    Invalid,
+}
+
 /// Legacy `DEVICE_REGISTRY_PROPERTY` ordinals (spec §11.3, WDM `IoGetDeviceProperty`).
 pub mod device_property {
+    use super::DevicePropertySource;
+
     pub const DEVICE_DESCRIPTION: u32 = 0;
     pub const HARDWARE_ID: u32 = 1;
     pub const COMPATIBLE_IDS: u32 = 2;
@@ -29,6 +38,35 @@ pub mod device_property {
     pub const RESOURCE_REQUIREMENTS: u32 = 20;
     pub const ALLOCATED_RESOURCES: u32 = 21;
     pub const CONTAINER_ID: u32 = 22;
+
+    pub const fn source(property: u32) -> DevicePropertySource {
+        match property {
+            DEVICE_DESCRIPTION
+            | HARDWARE_ID
+            | COMPATIBLE_IDS
+            | BOOT_CONFIGURATION
+            | CLASS_NAME
+            | CLASS_GUID
+            | DRIVER_KEY_NAME
+            | MANUFACTURER
+            | FRIENDLY_NAME
+            | LOCATION_INFORMATION
+            | PHYSICAL_DEVICE_OBJECT_NAME
+            | ENUMERATOR_NAME
+            | UI_NUMBER
+            | INSTALL_STATE
+            | CONTAINER_ID => DevicePropertySource::Configuration,
+            BOOT_CONFIGURATION_TRANSLATED
+            | BUS_TYPE_GUID
+            | LEGACY_BUS_TYPE
+            | BUS_NUMBER
+            | ADDRESS
+            | REMOVAL_POLICY
+            | RESOURCE_REQUIREMENTS
+            | ALLOCATED_RESOURCES => DevicePropertySource::External,
+            _ => DevicePropertySource::Invalid,
+        }
+    }
 }
 
 /// `DEVPROPTYPE` values (spec §11.4).
