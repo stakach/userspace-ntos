@@ -15603,6 +15603,18 @@ unsafe fn hosted_provider_dispatch_route_for_wrapper(
         })
 }
 
+fn clear_hosted_provider_domain_link(
+    dependent: DriverInstance,
+    provider: DriverInstance,
+    provider_cookie: u64,
+) {
+    let _ = io_manager_mut().clear_hosted_domain_provider(
+        nt_io_manager::HostedDomainId(dependent.hosted_domain_id),
+        nt_io_manager::HostedDomainId(provider.hosted_domain_id),
+        provider_cookie,
+    );
+}
+
 unsafe fn clear_hosted_provider_dispatch_routes_for_instance(instance_index: usize) {
     let Some(routes) = (*core::ptr::addr_of_mut!(HOSTED_PROVIDER_DISPATCH_ROUTES)).as_mut() else {
         return;
@@ -15616,9 +15628,14 @@ unsafe fn clear_hosted_provider_dispatch_routes_for_instance(instance_index: usi
                 instance(route.dependent_instance),
                 instance(route.provider_instance),
             ) {
-                let _ = io_manager_mut().clear_hosted_domain_provider(
-                    nt_io_manager::HostedDomainId(dependent.hosted_domain_id),
+                let _ = io_manager_mut().unbind_hosted_driver_address(
                     nt_io_manager::HostedDomainId(provider.hosted_domain_id),
+                    route.provider_driver_object,
+                    DriverId(dependent.driver_id),
+                );
+                clear_hosted_provider_domain_link(
+                    dependent,
+                    provider,
                     route.provider_domain_cookie,
                 );
             }
@@ -15719,19 +15736,36 @@ unsafe fn register_hosted_provider_driver_object_shadow(
                 && route.dependent_driver_object == dependent_driver_object
         }) {
             if route.provider_driver_object != 0 {
-                return Ok(index);
+                return io_manager_mut()
+                    .bind_hosted_driver_address(
+                        nt_io_manager::HostedDomainId(provider_inst.hosted_domain_id),
+                        route.provider_driver_object,
+                        DriverId(dependent_inst.driver_id),
+                    )
+                    .map(|()| index)
+                    .map_err(nt_status::NtStatus::raw);
             }
         }
     }
     let Some(provider_driver_object) =
         hosted_instance_pool_alloc(provider_inst, WDM_X64_DRIVER_OBJECT_SIZE as u64)
     else {
+        clear_hosted_provider_domain_link(
+            dependent_inst,
+            provider_inst,
+            provider_domain_cookie,
+        );
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
     let Some(provider_driver_extension) =
         hosted_instance_pool_alloc(provider_inst, WDM_X64_DRIVER_EXTENSION_SIZE as u64)
     else {
         hosted_instance_pool_free(provider_inst, provider_driver_object);
+        clear_hosted_provider_domain_link(
+            dependent_inst,
+            provider_inst,
+            provider_domain_cookie,
+        );
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
     if let Err(status) = initialize_provider_driver_object_shadow_for_instance(
@@ -15742,7 +15776,27 @@ unsafe fn register_hosted_provider_driver_object_shadow(
     ) {
         hosted_instance_pool_free(provider_inst, provider_driver_extension);
         hosted_instance_pool_free(provider_inst, provider_driver_object);
+        clear_hosted_provider_domain_link(
+            dependent_inst,
+            provider_inst,
+            provider_domain_cookie,
+        );
         return Err(status);
+    }
+    if let Err(status) = io_manager_mut().bind_hosted_driver_address(
+        nt_io_manager::HostedDomainId(provider_inst.hosted_domain_id),
+        provider_driver_object,
+        DriverId(dependent_inst.driver_id),
+    ) {
+        clear_driver_object_extensions_for_driver_object(provider_driver_object);
+        hosted_instance_pool_free(provider_inst, provider_driver_extension);
+        hosted_instance_pool_free(provider_inst, provider_driver_object);
+        clear_hosted_provider_domain_link(
+            dependent_inst,
+            provider_inst,
+            provider_domain_cookie,
+        );
+        return Err(status.raw());
     }
     let routes = hosted_provider_dispatch_routes_mut();
     let route = HostedProviderDispatchRoute {
@@ -29354,7 +29408,20 @@ unsafe fn load_driver_reserved(
     let driver_id = register_io_driver(driver_object_path, instance)?;
     let domain = crate::driver_launch::instance(instance)?;
     if domain.hosted_domain_id == 0 || domain.hosted_domain_cookie == 0 {
-        destroy_registered_driver(driver_id);
+        destroy_registered_driver(domain.hosted_domain_id, drvobj, driver_id);
+        return None;
+    }
+    if let Err(status) = io_manager_mut().bind_hosted_driver_address(
+        nt_io_manager::HostedDomainId(domain.hosted_domain_id),
+        drvobj,
+        DriverId(driver_id),
+    ) {
+        print_str(b"[driver-launch] hosted DriverObject publish failed status=0x");
+        print_hex(status.raw() as u32);
+        print_str(b" for ");
+        print_str(driver_object_path.as_bytes());
+        print_str(b"\n");
+        destroy_registered_driver(domain.hosted_domain_id, drvobj, driver_id);
         return None;
     }
     let dc = DriverComponent {
@@ -29409,7 +29476,7 @@ unsafe fn load_driver_reserved(
             print_str(driver_object_path.as_bytes());
             print_str(b"\n");
             clear_driver_object_extensions_for_driver_object(drvobj);
-            destroy_registered_driver(driver_id);
+            destroy_registered_driver(domain.hosted_domain_id, drvobj, driver_id);
             return None;
         }
     };
@@ -29421,7 +29488,7 @@ unsafe fn load_driver_reserved(
         print_str(driver_object_path.as_bytes());
         print_str(b"\n");
         clear_driver_object_extensions_for_driver_object(drvobj);
-        destroy_registered_driver(driver_id);
+        destroy_registered_driver(domain.hosted_domain_id, drvobj, driver_id);
         return None;
     }
     // Record the live instance and publish canonical driver/device route ids for callers.
@@ -30682,8 +30749,13 @@ unsafe fn apply_hosted_device_interface_state(sh: u64) -> Result<(), nt_status::
     }
 }
 
-fn destroy_registered_driver(driver_id: u64) {
+fn destroy_registered_driver(domain_id: u64, driver_object: u64, driver_id: u64) {
     let _ = io_manager_mut().destroy_driver(DriverId(driver_id));
+    let _ = io_manager_mut().unbind_hosted_driver_address(
+        nt_io_manager::HostedDomainId(domain_id),
+        driver_object,
+        DriverId(driver_id),
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -35830,10 +35902,21 @@ fn instance_by_device_object(device_object: u64) -> Option<(usize, DriverInstanc
     })
 }
 
-fn destroy_registered_driver_after_unload(driver_id: u64) -> Result<(), nt_status::NtStatus> {
+fn destroy_registered_driver_after_unload(
+    inst: DriverInstance,
+    driver_id: u64,
+) -> Result<(), nt_status::NtStatus> {
     io_manager_mut()
         .destroy_driver(DriverId(driver_id))
-        .map(|_| ())
+        .map(|_| ())?;
+    if !io_manager_mut().unbind_hosted_driver_address(
+        nt_io_manager::HostedDomainId(inst.hosted_domain_id),
+        inst.driver_object,
+        DriverId(driver_id),
+    ) {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    Ok(())
 }
 
 unsafe fn dispatch_driver_unload_for_instance(
@@ -37487,7 +37570,7 @@ pub(crate) unsafe fn unload_driver_by_name(
     if inst.tcb != 0 {
         let _ = crate::tcb_suspend_r(inst.tcb);
     }
-    destroy_registered_driver_after_unload(driver_id)?;
+    destroy_registered_driver_after_unload(inst, driver_id)?;
     clear_instance(index);
     Ok(())
 }

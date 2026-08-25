@@ -11150,6 +11150,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     sources of identity. Component-local device-property/interface helpers must move behind that
     authenticated boundary; their in-flight shared-slot tests are not acceptable domain evidence.
 
+    Hosted DriverObject projection checkpoint (2026-08-24): every successfully loaded hosted
+    driver now binds its component-local `DRIVER_OBJECT` address to the canonical `DriverId` in the
+    component's generation-protected domain before it can be published as ready. Callable-provider
+    shadows bind the same canonical driver in the provider domain. Existing shadow reuse verifies
+    the exact registry mapping; allocation, initialization, or binding failure clears the dependent
+    provider route and frees the shadow. Driver load rollback, provider-route teardown, and normal
+    unload all exact-unbind before the domain can be reused. The freestanding executive release
+    check remains green at the existing 212-warning baseline.
+
+    Review adjustment: canonical DriverObject publication is closed. Continue with DeviceObject
+    publication using the actual AddDevice execution domain, which may be the provider rather than
+    the dependent driver. Store that projection domain explicitly, bind both the FDO and root PDO,
+    and make authenticated server-side lookup resolve the registry before deleting global address
+    scans. A component WDM export without an authenticated pump context must not guess its domain.
+
     After that boundary is live, migrate the standalone hal, power, PnP, async, MMIO, and DMA
     component harnesses to `CompletionOwnerClaim` plus `CompletionUnwindCursor`, including their
     direct attach/lower-call shims. Reconcile the separate `driver-host-direg` and `nt-driver-host`
