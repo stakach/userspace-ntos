@@ -11309,6 +11309,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     interface-result slots, provider side-effect copying, and raw PDO exceptions only as each
     replacement becomes live.
 
+    Hosted provider-cookie authentication checkpoint (2026-08-26): an I/O Manager dependent
+    domain can now link to a provider only when the supplied cookie exactly matches the live
+    generation-protected provider record. A merely nonzero cookie is rejected before the dependent
+    record changes. Provider identity lookup therefore cannot echo caller-invented freshness data,
+    and exact clear plus provider-domain retirement continue to fail closed. Focused
+    `nt-io-manager` validation is green at `186/186`, including the peer dispatch route updated to
+    use the registry-issued provider cookie.
+
+    Review adjustment: hosted-domain identity is now suitable as an authentication input for the
+    device-service and control-selector envelopes. The next selector tranche must still carry the
+    full canonical completion owner `(IrpId, DriverId, DeviceId)` plus target/provider domain
+    generations; cookie validation alone does not make the current IrpId-only cancel/copy/ACK
+    selectors authoritative.
+
     After that boundary is live, migrate the standalone hal, power, PnP, async, MMIO, and DMA
     component harnesses to `CompletionOwnerClaim` plus `CompletionUnwindCursor`, including their
     direct attach/lower-call shims. Reconcile the separate `driver-host-direg` and `nt-driver-host`

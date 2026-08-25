@@ -166,7 +166,12 @@ impl<P> IoManager<P> {
         provider: HostedDomainId,
         provider_cookie: u64,
     ) -> Result<(), NtStatus> {
-        if provider_cookie == 0 || self.hosted_domains.get(provider).is_none() {
+        let live_provider_cookie = self
+            .hosted_domains
+            .get(provider)
+            .map(|provider| provider.cookie)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        if provider_cookie == 0 || provider_cookie != live_provider_cookie {
             return Err(NtStatus::INVALID_PARAMETER);
         }
         let domain = self
@@ -489,10 +494,15 @@ mod tests {
             .0;
         let dependent = io.register_hosted_domain();
         let provider = io.register_hosted_domain();
+        let provider_cookie = io.hosted_domain_identity(provider).unwrap().cookie;
 
         assert_eq!(io.hosted_provider_identity(dependent), None);
         assert_eq!(
             io.set_hosted_domain_provider(dependent, provider, 0),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        assert_eq!(
+            io.set_hosted_domain_provider(dependent, provider, provider_cookie.wrapping_add(1)),
             Err(NtStatus::INVALID_PARAMETER)
         );
 
@@ -537,21 +547,25 @@ mod tests {
         assert_eq!(io.hosted_file_by_address(dependent, 0x5000), None);
         assert_eq!(io.bind_hosted_file_address(dependent, 0x5008, file), Ok(()));
 
-        io.set_hosted_domain_provider(dependent, provider, 0x55aa)
+        io.set_hosted_domain_provider(dependent, provider, provider_cookie)
             .unwrap();
         let identity = io.hosted_provider_identity(dependent).unwrap();
         assert_eq!(identity.domain_id, provider);
-        assert_eq!(identity.cookie, 0x55aa);
-        assert!(!io.clear_hosted_domain_provider(dependent, provider, 0x55ab));
+        assert_eq!(identity.cookie, provider_cookie);
+        assert!(!io.clear_hosted_domain_provider(
+            dependent,
+            provider,
+            provider_cookie.wrapping_add(1)
+        ));
         assert_eq!(io.hosted_provider_identity(dependent), Some(identity));
-        assert!(io.clear_hosted_domain_provider(dependent, provider, 0x55aa));
+        assert!(io.clear_hosted_domain_provider(dependent, provider, provider_cookie));
         assert_eq!(io.hosted_provider_identity(dependent), None);
-        io.set_hosted_domain_provider(dependent, provider, 0x55aa)
+        io.set_hosted_domain_provider(dependent, provider, provider_cookie)
             .unwrap();
         assert!(io.unregister_hosted_domain(provider));
         assert_eq!(io.hosted_provider_identity(dependent), None);
         assert_eq!(
-            io.set_hosted_domain_provider(dependent, provider, 0x55aa),
+            io.set_hosted_domain_provider(dependent, provider, provider_cookie),
             Err(NtStatus::INVALID_PARAMETER)
         );
     }

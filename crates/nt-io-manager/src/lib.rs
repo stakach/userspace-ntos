@@ -4106,7 +4106,8 @@ mod tests {
         let client = om.register_client();
         let target_domain = om.register_hosted_domain();
         let provider_domain = om.register_hosted_domain();
-        om.set_hosted_domain_provider(target_domain, provider_domain, 0x55aa)
+        let provider_cookie = om.hosted_domain_identity(provider_domain).unwrap().cookie;
+        om.set_hosted_domain_provider(target_domain, provider_domain, provider_cookie)
             .unwrap();
         let target = om.hosted_domain_identity(target_domain).unwrap();
         let provider = om.hosted_provider_identity(target_domain).unwrap();
