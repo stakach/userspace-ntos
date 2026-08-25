@@ -1157,6 +1157,72 @@ impl ConfigManager {
         self.devnode_by_id(devnode)?.properties.get_legacy(property)
     }
 
+    /// Resolve one legacy `IoGetDeviceProperty` value by stable instance path. Imported Enum keys
+    /// are indexed on demand. Bus and resource properties intentionally remain owned by the PnP
+    /// and resource managers rather than being synthesized from registry metadata.
+    pub fn device_property_bytes(&mut self, instance_id: &str, property: u32) -> Option<Vec<u8>> {
+        let devnode_id = self
+            .devnode(instance_id)
+            .map(|devnode| devnode.id)
+            .or_else(|| self.index_registry_devnode(instance_id))?;
+        let devnode = self.devnode_by_id(devnode_id)?;
+        if let Some(value) = devnode.properties.get_legacy(property) {
+            return Some(value.data.clone());
+        }
+        match property {
+            device_property::HARDWARE_ID => (!devnode.hardware_ids.is_empty()).then(|| {
+                let values: Vec<&str> = devnode.hardware_ids.iter().map(String::as_str).collect();
+                encode_multi_sz(&values)
+            }),
+            device_property::COMPATIBLE_IDS => (!devnode.compatible_ids.is_empty()).then(|| {
+                let values: Vec<&str> = devnode.compatible_ids.iter().map(String::as_str).collect();
+                encode_multi_sz(&values)
+            }),
+            device_property::DRIVER_KEY_NAME => devnode.driver_key.as_deref().map(encode_sz),
+            device_property::PHYSICAL_DEVICE_OBJECT_NAME => {
+                devnode.pdo_name.as_deref().map(encode_sz)
+            }
+            device_property::ENUMERATOR_NAME => instance_id
+                .split('\\')
+                .next()
+                .filter(|enumerator| !enumerator.is_empty())
+                .map(encode_sz),
+            device_property::DEVICE_DESCRIPTION => {
+                self.registry_property_bytes(devnode.enum_key, "DeviceDesc")
+            }
+            device_property::BOOT_CONFIGURATION => {
+                self.registry_property_bytes(devnode.enum_key, "BootConfig")
+            }
+            device_property::CLASS_NAME => self.registry_property_bytes(devnode.enum_key, "Class"),
+            device_property::CLASS_GUID => {
+                self.registry_property_bytes(devnode.enum_key, "ClassGUID")
+            }
+            device_property::MANUFACTURER => self.registry_property_bytes(devnode.enum_key, "Mfg"),
+            device_property::FRIENDLY_NAME => {
+                self.registry_property_bytes(devnode.enum_key, "FriendlyName")
+            }
+            device_property::LOCATION_INFORMATION => {
+                self.registry_property_bytes(devnode.enum_key, "LocationInformation")
+            }
+            device_property::UI_NUMBER => {
+                self.registry_property_bytes(devnode.enum_key, "UINumber")
+            }
+            device_property::INSTALL_STATE => {
+                self.registry_property_bytes(devnode.enum_key, "ConfigFlags")
+            }
+            device_property::CONTAINER_ID => {
+                self.registry_property_bytes(devnode.enum_key, "ContainerID")
+            }
+            _ => None,
+        }
+    }
+
+    fn registry_property_bytes(&self, key: RegistryKeyId, value_name: &str) -> Option<Vec<u8>> {
+        self.registry
+            .query_value(key, value_name)
+            .map(|value| value.data.clone())
+    }
+
     pub fn devnode(&self, instance_id: &str) -> Option<&DevnodeRecord> {
         self.devnodes
             .iter()
@@ -3059,6 +3125,74 @@ mod tests {
         assert_eq!(device_property::ADDRESS, 16);
         assert_eq!(device_property::ALLOCATED_RESOURCES, 21);
         assert_eq!(device_property::CONTAINER_ID, 22);
+    }
+
+    #[test]
+    fn device_property_query_lazily_indexes_enum_and_preserves_authority() {
+        let mut cm = ConfigManager::new();
+        let instance = r"PCI\VEN_8086&DEV_100E\3&11583659&0&18";
+        let key = cm.registry_mut().create_key(&devnode_path(instance));
+        cm.registry_mut().set_string(key, "Service", "E1000");
+        cm.registry_mut()
+            .set_string(key, "PdoName", r"\Device\NTPNP_PCI0001");
+        cm.registry_mut().set_string(
+            key,
+            "Driver",
+            r"{4D36E972-E325-11CE-BFC1-08002BE10318}\0000",
+        );
+        cm.registry_mut().set_string(key, "Class", "Net");
+        cm.registry_mut()
+            .set_string(key, "FriendlyName", "Intel Test Adapter");
+        cm.registry_mut().set_value(
+            key,
+            "HardwareID",
+            RegistryValueType::MultiSz,
+            encode_multi_sz(&[r"PCI\VEN_8086&DEV_100E", r"PCI\VEN_8086"]),
+        );
+        assert!(cm.devnode(instance).is_none());
+
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::DRIVER_KEY_NAME),
+            Some(encode_sz(r"{4D36E972-E325-11CE-BFC1-08002BE10318}\0000"))
+        );
+        let devnode = cm.devnode(instance).unwrap().id;
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::HARDWARE_ID),
+            Some(encode_multi_sz(&[
+                r"PCI\VEN_8086&DEV_100E",
+                r"PCI\VEN_8086"
+            ]))
+        );
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::ENUMERATOR_NAME),
+            Some(encode_sz("PCI"))
+        );
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::FRIENDLY_NAME),
+            Some(encode_sz("Intel Test Adapter"))
+        );
+
+        assert!(cm.set_legacy_property(
+            devnode,
+            device_property::FRIENDLY_NAME,
+            PropertyValue::string("Override Adapter")
+        ));
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::FRIENDLY_NAME),
+            Some(encode_sz("Override Adapter"))
+        );
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::LEGACY_BUS_TYPE),
+            None
+        );
+        assert_eq!(
+            cm.device_property_bytes(instance, device_property::ADDRESS),
+            None
+        );
+        assert_eq!(
+            cm.device_property_bytes(r"PCI\MISSING\0000", device_property::CLASS_NAME),
+            None
+        );
     }
 
     #[test]

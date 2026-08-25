@@ -11309,6 +11309,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     interface-result slots, provider side-effect copying, and raw PDO exceptions only as each
     replacement becomes live.
 
+    Config Manager legacy-property query checkpoint (2026-08-26): a stable devnode instance path
+    can now query native `IoGetDeviceProperty` byte payloads without a server-local DevnodeId.
+    Imported Enum keys are indexed lazily. Per-devnode PropertyBag values override the underlying
+    Enum data; hardware/compatible IDs retain `REG_MULTI_SZ`, strings retain UTF-16LE `REG_SZ`, and
+    driver key, PDO name, and enumerator are derived from the indexed devnode. Legacy bus type, bus
+    number, address, translated boot resources, requirements, and allocated resources deliberately
+    return no Config Manager value because their authority remains PnP/resource state. Focused
+    `nt-config-manager` validation is green at `28/28`.
+
+    Review adjustment: property policy and lazy indexing are ready for transport. Add the bounded
+    Config Manager ABI/client/server query operation next, preserving required byte length on
+    `STATUS_BUFFER_TOO_SMALL`; then add interface registration/state operations over the same stable
+    instance-path boundary. The hosted-device pump must consume those semantic operations rather
+    than reaching into an executive-local Config Manager copy.
+
     Hosted provider-cookie authentication checkpoint (2026-08-26): an I/O Manager dependent
     domain can now link to a provider only when the supplied cookie exactly matches the live
     generation-protected provider record. A merely nonzero cookie is rejected before the dependent
