@@ -253,7 +253,7 @@ pub mod snapshot {
                     let reference = r.str16().ok_or(DecodeError::Truncated)?;
                     let enabled = r.u8().ok_or(DecodeError::Truncated)? != 0;
                     if let Some(dn) = cm.devnode(&instance).map(|d| d.id) {
-                        cm.register_interface(dn, &guid, &reference, enabled);
+                        let _ = cm.register_interface(dn, &guid, &reference, enabled);
                     }
                 }
                 REC_LEGACY_PROPERTY => {

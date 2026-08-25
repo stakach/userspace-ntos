@@ -8,8 +8,8 @@ fn fixture() -> ConfigManager {
     let mut cm = ConfigManager::new();
     let d0 = cm.register_devnode(r"Root\Test\0000", Some("Svc"), None, &[], &[]);
     let d1 = cm.register_devnode(r"Root\Test\0001", Some("Svc"), None, &[], &[]);
-    cm.register_interface(d0, GUID, "", true); // enabled
-    let i1 = cm.register_interface(d1, GUID, "", true);
+    cm.register_interface(d0, GUID, "", true).unwrap(); // enabled
+    let i1 = cm.register_interface(d1, GUID, "", true).unwrap();
     cm.set_interface_state(i1, false); // disabled
     cm
 }

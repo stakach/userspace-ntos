@@ -77,7 +77,7 @@ fn run() {
         &[r"ROOT\KMDF_INTERFACE_TEST"],
         &[r"ROOT\USERSPLACE_NTOS_INTERFACE_TEST"],
     );
-    let iface = cm.register_interface(dn, IFACE_GUID, "", true);
+    let iface = cm.register_interface(dn, IFACE_GUID, "", true).unwrap();
 
     // --- Service registration + DriverEntry RegistryPath (spec §9) ------------
     check(

@@ -93,6 +93,7 @@ pub struct Completion {
 pub enum WdfRuntimeError {
     Object(WdfObjectError),
     Request(WdfRequestError),
+    InvalidParameter,
     /// No driver has been created yet / no such init record / no default queue.
     InvalidState,
 }
@@ -844,7 +845,9 @@ impl WdfRuntime {
             .device_devnode(device)
             .ok_or(WdfRuntimeError::InvalidState)?;
         // Interfaces are enabled by default once the device starts (KMDF connects on D0/start).
-        self.config.register_interface(dn, guid, reference, true);
+        self.config
+            .register_interface(dn, guid, reference, true)
+            .map_err(|_| WdfRuntimeError::InvalidParameter)?;
         Ok(())
     }
     /// `WdfDeviceSetDeviceInterfaceState` — enable/disable all of the device's interfaces of a

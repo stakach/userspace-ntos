@@ -9,14 +9,26 @@ pub mod device_property {
     pub const DEVICE_DESCRIPTION: u32 = 0;
     pub const HARDWARE_ID: u32 = 1;
     pub const COMPATIBLE_IDS: u32 = 2;
-    pub const CLASS_NAME: u32 = 7;
-    pub const CLASS_GUID: u32 = 8;
-    pub const DRIVER_KEY_NAME: u32 = 9;
-    pub const MANUFACTURER: u32 = 10;
-    pub const FRIENDLY_NAME: u32 = 12;
-    pub const LOCATION_INFORMATION: u32 = 13;
-    pub const PHYSICAL_DEVICE_OBJECT_NAME: u32 = 14;
-    pub const ENUMERATOR_NAME: u32 = 24;
+    pub const BOOT_CONFIGURATION: u32 = 3;
+    pub const BOOT_CONFIGURATION_TRANSLATED: u32 = 4;
+    pub const CLASS_NAME: u32 = 5;
+    pub const CLASS_GUID: u32 = 6;
+    pub const DRIVER_KEY_NAME: u32 = 7;
+    pub const MANUFACTURER: u32 = 8;
+    pub const FRIENDLY_NAME: u32 = 9;
+    pub const LOCATION_INFORMATION: u32 = 10;
+    pub const PHYSICAL_DEVICE_OBJECT_NAME: u32 = 11;
+    pub const BUS_TYPE_GUID: u32 = 12;
+    pub const LEGACY_BUS_TYPE: u32 = 13;
+    pub const BUS_NUMBER: u32 = 14;
+    pub const ENUMERATOR_NAME: u32 = 15;
+    pub const ADDRESS: u32 = 16;
+    pub const UI_NUMBER: u32 = 17;
+    pub const INSTALL_STATE: u32 = 18;
+    pub const REMOVAL_POLICY: u32 = 19;
+    pub const RESOURCE_REQUIREMENTS: u32 = 20;
+    pub const ALLOCATED_RESOURCES: u32 = 21;
+    pub const CONTAINER_ID: u32 = 22;
 }
 
 /// `DEVPROPTYPE` values (spec §11.4).

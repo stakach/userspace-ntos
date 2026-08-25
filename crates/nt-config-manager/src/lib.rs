@@ -525,6 +525,13 @@ pub struct InterfaceRecord {
     pub symbolic_link: String,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum InterfaceRegistrationError {
+    UnknownDevnode,
+    InvalidGuid,
+    InvalidReference,
+}
+
 /// The Configuration Manager: the registry + the service/devnode/interface indices.
 pub struct ConfigManager {
     registry: Registry,
@@ -1201,17 +1208,35 @@ impl ConfigManager {
         guid: &str,
         reference: &str,
         enabled_on_start: bool,
-    ) -> InterfaceId {
-        // Register under Control\DeviceClasses\<Guid>.
-        let class_key = self.registry.create_key(&device_class_path(guid));
-        let _ = class_key;
+    ) -> Result<InterfaceId, InterfaceRegistrationError> {
         let instance = self
             .devnodes
             .iter()
-            .find(|d| d.id == devnode)
-            .map(|d| d.instance_id.clone())
-            .unwrap_or_default();
+            .find(|record| record.id == devnode)
+            .map(|record| record.instance_id.clone())
+            .ok_or(InterfaceRegistrationError::UnknownDevnode)?;
+        if guid_text_to_memory_bytes(guid).is_none() {
+            return Err(InterfaceRegistrationError::InvalidGuid);
+        }
+        if reference.contains(['\\', '/']) {
+            return Err(InterfaceRegistrationError::InvalidReference);
+        }
+        if let Some(existing) = self.interfaces.iter().find(|interface| {
+            interface.devnode == devnode
+                && interface.guid.eq_ignore_ascii_case(guid)
+                && interface.reference.eq_ignore_ascii_case(reference)
+        }) {
+            return Ok(existing.id);
+        }
         let symbolic_link = build_symbolic_link(guid, &instance, reference);
+        materialize_interface_registry(
+            &mut self.registry,
+            guid,
+            &instance,
+            reference,
+            &symbolic_link,
+            enabled_on_start,
+        );
         let id = self.alloc_id();
         self.interfaces.push(InterfaceRecord {
             id,
@@ -1221,20 +1246,63 @@ impl ConfigManager {
             enabled: enabled_on_start,
             symbolic_link,
         });
-        id
+        Ok(id)
     }
 
     /// `IoSetDeviceInterfaceState` — enable/disable an interface (spec §11.3).
     pub fn set_interface_state(&mut self, id: InterfaceId, enabled: bool) -> bool {
-        if let Some(i) = self.interfaces.iter_mut().find(|i| i.id == id) {
-            i.enabled = enabled;
-            true
-        } else {
-            false
-        }
+        let Some(index) = self
+            .interfaces
+            .iter()
+            .position(|interface| interface.id == id)
+        else {
+            return false;
+        };
+        self.set_interface_state_at(index, enabled);
+        true
     }
     pub fn interface(&self, id: InterfaceId) -> Option<&InterfaceRecord> {
         self.interfaces.iter().find(|i| i.id == id)
+    }
+    pub fn interface_by_symbolic_link(&self, symbolic_link: &str) -> Option<&InterfaceRecord> {
+        self.interfaces
+            .iter()
+            .find(|interface| interface.symbolic_link.eq_ignore_ascii_case(symbolic_link))
+    }
+    pub fn set_interface_state_by_symbolic_link(
+        &mut self,
+        symbolic_link: &str,
+        enabled: bool,
+    ) -> bool {
+        let Some(index) = self
+            .interfaces
+            .iter()
+            .position(|interface| interface.symbolic_link.eq_ignore_ascii_case(symbolic_link))
+        else {
+            return false;
+        };
+        self.set_interface_state_at(index, enabled);
+        true
+    }
+
+    fn set_interface_state_at(&mut self, index: usize, enabled: bool) {
+        let interface = &self.interfaces[index];
+        let Some(instance) = self
+            .devnodes
+            .iter()
+            .find(|devnode| devnode.id == interface.devnode)
+            .map(|devnode| devnode.instance_id.as_str())
+        else {
+            return;
+        };
+        materialize_interface_linked_state(
+            &mut self.registry,
+            &interface.guid,
+            instance,
+            &interface.reference,
+            enabled,
+        );
+        self.interfaces[index].enabled = enabled;
     }
 
     // --- iteration (for persistence snapshots, spec §9) -----------------------
@@ -1389,19 +1457,75 @@ fn device_class_path(guid: &str) -> String {
     p
 }
 
-/// The device-interface symbolic link name (spec §11.2): `\??\<guid>#<instance>#<ref>`.
-fn build_symbolic_link(guid: &str, instance: &str, reference: &str) -> String {
-    let mut s = String::from(r"\??\");
-    // NT mangles the instance's backslashes to '#'.
-    let mangled: String = instance
+fn mangled_device_instance(instance: &str) -> String {
+    instance
         .chars()
         .map(|c| if c == '\\' { '#' } else { c })
-        .collect();
-    s.push_str(guid);
+        .collect()
+}
+
+fn interface_registry_path(guid: &str, instance: &str) -> String {
+    let mut path = device_class_path(guid);
+    path.push_str(r"\##?#");
+    path.push_str(&mangled_device_instance(instance));
+    path.push('#');
+    path.push_str(guid);
+    path
+}
+
+fn interface_reference_registry_path(guid: &str, instance: &str, reference: &str) -> String {
+    let mut path = interface_registry_path(guid, instance);
+    path.push_str(r"\#");
+    path.push_str(reference);
+    path
+}
+
+fn materialize_interface_linked_state(
+    registry: &mut Registry,
+    guid: &str,
+    instance: &str,
+    reference: &str,
+    enabled: bool,
+) {
+    let mut control_path = interface_reference_registry_path(guid, instance, reference);
+    control_path.push_str(r"\Control");
+    if enabled {
+        let control = registry.create_key(&control_path);
+        registry.set_volatile(control, true);
+        registry.set_dword(control, "Linked", 1);
+    } else if let Some(control) = registry.open_key(&control_path) {
+        registry.delete_key(control, true);
+    }
+}
+
+fn materialize_interface_registry(
+    registry: &mut Registry,
+    guid: &str,
+    instance: &str,
+    reference: &str,
+    symbolic_link: &str,
+    enabled: bool,
+) {
+    registry.create_key(&device_class_path(guid));
+    let interface = registry.create_key(&interface_registry_path(guid, instance));
+    registry.set_string(interface, "DeviceInstance", instance);
+    let reference_key = registry.create_key(&interface_reference_registry_path(
+        guid, instance, reference,
+    ));
+    let mut registry_link = String::from(symbolic_link);
+    registry_link.replace_range(1..2, "\\");
+    registry.set_string(reference_key, "SymbolicLink", &registry_link);
+    materialize_interface_linked_state(registry, guid, instance, reference, enabled);
+}
+
+/// The device-interface symbolic link name: `\??\<mangled-instance>#{GUID}\reference`.
+fn build_symbolic_link(guid: &str, instance: &str, reference: &str) -> String {
+    let mut s = String::from(r"\??\");
+    s.push_str(&mangled_device_instance(instance));
     s.push('#');
-    s.push_str(&mangled);
+    s.push_str(guid);
     if !reference.is_empty() {
-        s.push('#');
+        s.push('\\');
         s.push_str(reference);
     }
     s
@@ -1535,6 +1659,8 @@ fn group_order_rank(group: Option<&str>, group_order: &[String]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use alloc::format;
+
     use super::*;
 
     #[test]
@@ -2861,16 +2987,78 @@ mod tests {
         let mut cm = ConfigManager::new();
         let dn = cm.register_devnode(r"ROOT\X\0000", Some("Svc"), None, &[], &[]);
         let guid = "{9A7B0B24-6E57-4C51-AD3C-6D9F5F0E0001}";
-        let iface = cm.register_interface(dn, guid, "", true);
+        let iface = cm.register_interface(dn, guid, "", true).unwrap();
         let rec = cm.interface(iface).unwrap();
         assert!(rec.enabled);
-        assert!(rec.symbolic_link.starts_with(r"\??\"));
-        assert!(rec.symbolic_link.contains("ROOT#X#0000"));
+        assert_eq!(rec.symbolic_link, format!(r"\??\ROOT#X#0000#{guid}"));
+        assert_eq!(
+            cm.register_interface(dn, &guid.to_ascii_lowercase(), "", false),
+            Ok(iface)
+        );
+        assert_eq!(cm.interfaces().len(), 1);
         // Enabled-only enumeration.
         assert_eq!(cm.interfaces_by_guid(guid, true).len(), 1);
-        cm.set_interface_state(iface, false);
+        assert!(cm.set_interface_state_by_symbolic_link(
+            &format!(r"\??\root#x#0000#{}", guid.to_ascii_lowercase()),
+            false
+        ));
         assert_eq!(cm.interfaces_by_guid(guid, true).len(), 0);
         assert_eq!(cm.interfaces_by_guid(guid, false).len(), 1);
+        let interface_key = format!(
+            r"{}\{}\##?#ROOT#X#0000#{}\#",
+            DEVICE_CLASSES_PATH, guid, guid
+        );
+        let key = cm.registry().open_key(&interface_key).unwrap();
+        assert_eq!(
+            cm.registry().query_string(key, "SymbolicLink").as_deref(),
+            Some(format!(r"\\?\ROOT#X#0000#{guid}").as_str())
+        );
+        assert!(cm
+            .registry()
+            .open_key(&format!(r"{interface_key}\Control"))
+            .is_none());
+        assert!(cm.set_interface_state(iface, true));
+        let control = cm
+            .registry()
+            .open_key(&format!(r"{interface_key}\Control"))
+            .unwrap();
+        assert_eq!(cm.registry().query_dword(control, "Linked"), Some(1));
+
+        let referenced = cm.register_interface(dn, guid, "Port0", false).unwrap();
+        assert_eq!(
+            cm.interface(referenced).unwrap().symbolic_link,
+            format!(r"\??\ROOT#X#0000#{guid}\Port0")
+        );
+        assert_eq!(
+            cm.interface_by_symbolic_link(&format!(r"\??\root#x#0000#{guid}\port0"))
+                .map(|interface| interface.id),
+            Some(referenced)
+        );
+        assert_eq!(
+            cm.register_interface(u64::MAX, guid, "", false),
+            Err(InterfaceRegistrationError::UnknownDevnode)
+        );
+        assert_eq!(
+            cm.register_interface(dn, "not-a-guid", "", false),
+            Err(InterfaceRegistrationError::InvalidGuid)
+        );
+        assert_eq!(
+            cm.register_interface(dn, guid, r"bad\reference", false),
+            Err(InterfaceRegistrationError::InvalidReference)
+        );
+    }
+
+    #[test]
+    fn legacy_device_property_ordinals_match_nt() {
+        assert_eq!(device_property::DRIVER_KEY_NAME, 7);
+        assert_eq!(device_property::FRIENDLY_NAME, 9);
+        assert_eq!(device_property::PHYSICAL_DEVICE_OBJECT_NAME, 11);
+        assert_eq!(device_property::LEGACY_BUS_TYPE, 13);
+        assert_eq!(device_property::BUS_NUMBER, 14);
+        assert_eq!(device_property::ENUMERATOR_NAME, 15);
+        assert_eq!(device_property::ADDRESS, 16);
+        assert_eq!(device_property::ALLOCATED_RESOURCES, 21);
+        assert_eq!(device_property::CONTAINER_ID, 22);
     }
 
     #[test]
@@ -2964,9 +3152,11 @@ mod tests {
         );
         let guid = "{9A7B0B24-6E57-4C51-AD3C-6D9F5F0E0001}";
         let guid_bytes = guid_text_to_memory_bytes(guid).unwrap();
-        cm.register_interface(dn1, guid, "", true);
-        let disabled = cm.register_interface(dn2, guid, "disabled", false);
-        let other = cm.register_interface(dn2, "{9A7B0B24-6E57-4C51-AD3C-6D9F5F0E0002}", "", true);
+        cm.register_interface(dn1, guid, "", true).unwrap();
+        let disabled = cm.register_interface(dn2, guid, "disabled", false).unwrap();
+        let other = cm
+            .register_interface(dn2, "{9A7B0B24-6E57-4C51-AD3C-6D9F5F0E0002}", "", true)
+            .unwrap();
         assert!(cm.interface(disabled).is_some());
         assert!(cm.interface(other).is_some());
 

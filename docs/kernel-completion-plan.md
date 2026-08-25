@@ -11282,6 +11282,33 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     teardown transaction runs first. Keep these separate from the component-service authentication
     slice rather than hiding either lifetime problem in that protocol change.
 
+    Config Manager device-interface authority checkpoint (2026-08-26): the legacy
+    `DEVICE_REGISTRY_PROPERTY` constants now match the NT ordinals through ContainerId instead of
+    drifting after CompatibleIDs. Interface registration is checked: stale devnodes, malformed
+    GUIDs, and path-bearing reference strings fail; a case-insensitive repeat of the same
+    `(devnode, GUID, reference)` reuses one `InterfaceId`. Symbolic links now use the NT/ReactOS
+    `\??\<mangled-instance>#{GUID}\reference` form. Registration materializes the canonical
+    `Control\DeviceClasses` class, instance, and reference keys with `DeviceInstance` and
+    `SymbolicLink` values, while enable/disable creates or removes the volatile `Control\Linked`
+    state. Link lookup and state transitions are case-insensitive, ready for the component service
+    to address the authority by the native symbolic-link string.
+
+    Validation is green for `nt-config-manager` (`27/27`), `nt-config-store` (`8/8`),
+    `nt-setupapi` (`6/6`), and `nt-wdf-runtime` (`8/8`), plus the freestanding release check of the
+    Configuration Manager component.
+
+    Review adjustment: the component-local interface table must not move into another executive
+    table. Next add semantic Configuration Manager wire operations keyed by stable devnode instance
+    path for property query, interface registration, and interface state; imported Enum devnodes
+    must be indexed lazily. The authenticated hosted-device pump service can then derive the
+    canonical DeviceId/domain from its channel and delegate those operations. Bus/resource
+    properties remain PnP/resource-manager owned. Add a canonical DeviceId-keyed shutdown registry
+    and real shutdown IRP delivery before claiming shutdown registration. Fully dynamic
+    `IoDeleteDevice` also requires binding control DeviceObjects by moving `IoCreateDevice` through
+    the same canonical service transaction. Delete the component interface table, shared
+    interface-result slots, provider side-effect copying, and raw PDO exceptions only as each
+    replacement becomes live.
+
     After that boundary is live, migrate the standalone hal, power, PnP, async, MMIO, and DMA
     component harnesses to `CompletionOwnerClaim` plus `CompletionUnwindCursor`, including their
     direct attach/lower-call shims. Reconcile the separate `driver-host-direg` and `nt-driver-host`

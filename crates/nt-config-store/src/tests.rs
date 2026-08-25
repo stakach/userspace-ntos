@@ -38,7 +38,8 @@ fn fixture() -> ConfigManager {
         &[r"Root\KmdfInterfaceRegistryTest"],
         &[r"Root\USERSPLACE"],
     );
-    cm.register_interface(dn, "{9a7b0b24-6e57-4c51-ad3c-6d9f5f0e0001}", "", true);
+    cm.register_interface(dn, "{9a7b0b24-6e57-4c51-ad3c-6d9f5f0e0001}", "", true)
+        .unwrap();
     cm.set_legacy_property(
         dn,
         device_property::FRIENDLY_NAME,
