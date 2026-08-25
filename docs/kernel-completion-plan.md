@@ -11116,6 +11116,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `(HostedDomainId,address)` resolution. Implement canonical `IoGetRelatedDeviceObject` in that
     slice, then delete partial-known attach/detach behavior and the direct raw root-PDO path.
 
+    Hosted projection exact-unbind checkpoint (2026-08-24): the canonical hosted-domain registry
+    now has an exact inverse for each DriverObject, DeviceObject, and FileObject projection. Removal
+    requires the same live domain, address, and canonical id that created the binding; a stale
+    teardown cannot erase a replacement object that reused either side of the mapping. Successful
+    removal permits intentional pointer reuse inside a long-lived component domain. Focused
+    validation remains green for `nt-io-manager` (`185/185`) and `nt-io-abi` (`5/5`).
+
+    Review adjustment: individual object lifetime can now be migrated without leaking registry
+    entries or relying on whole-domain teardown. Continue by publishing the actual projection domain
+    for every hosted Driver/FDO/PDO, resolving all raw lookup sites with that domain, and invoking
+    exact unbind before canonical object destruction. Root-bus state should then move to canonical
+    DeviceId keys rather than duplicating raw PDO identity.
+
     After that boundary is live, migrate the standalone hal, power, PnP, async, MMIO, and DMA
     component harnesses to `CompletionOwnerClaim` plus `CompletionUnwindCursor`, including their
     direct attach/lower-call shims. Reconcile the separate `driver-host-direg` and `nt-driver-host`

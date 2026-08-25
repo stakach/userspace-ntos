@@ -118,6 +118,17 @@ fn address_of<I: Copy + Eq>(bindings: &[HostedPointerBinding<I>], id: I) -> Opti
         .map(|binding| binding.address)
 }
 
+fn unbind<I: Copy + Eq>(bindings: &mut Vec<HostedPointerBinding<I>>, address: u64, id: I) -> bool {
+    let Some(index) = bindings
+        .iter()
+        .position(|binding| binding.address == address && binding.id == id)
+    else {
+        return false;
+    };
+    bindings.swap_remove(index);
+    true
+}
+
 impl<P> IoManager<P> {
     /// Allocate a fresh hosted address-domain identity. Its cookie is the same generation-protected
     /// value carried independently in authenticated dispatch envelopes.
@@ -260,6 +271,46 @@ impl<P> IoManager<P> {
             address,
             file,
         )
+    }
+
+    /// Remove one exact hosted DriverObject projection. Stale teardown cannot erase a replacement
+    /// binding that reuses either the address or canonical id.
+    pub fn unbind_hosted_driver_address(
+        &mut self,
+        domain: HostedDomainId,
+        address: u64,
+        driver: DriverId,
+    ) -> bool {
+        let Some(domain) = self.hosted_domains.get_mut(domain) else {
+            return false;
+        };
+        unbind(&mut domain.drivers, address, driver)
+    }
+
+    /// Remove one exact hosted DeviceObject projection.
+    pub fn unbind_hosted_device_address(
+        &mut self,
+        domain: HostedDomainId,
+        address: u64,
+        device: DeviceId,
+    ) -> bool {
+        let Some(domain) = self.hosted_domains.get_mut(domain) else {
+            return false;
+        };
+        unbind(&mut domain.devices, address, device)
+    }
+
+    /// Remove one exact hosted FileObject projection.
+    pub fn unbind_hosted_file_address(
+        &mut self,
+        domain: HostedDomainId,
+        address: u64,
+        file: FileId,
+    ) -> bool {
+        let Some(domain) = self.hosted_domains.get_mut(domain) else {
+            return false;
+        };
+        unbind(&mut domain.files, address, file)
     }
 
     pub fn hosted_driver_by_address(
@@ -463,6 +514,28 @@ mod tests {
         );
         assert_eq!(io.bind_hosted_file_address(dependent, 0x5000, file), Ok(()));
         assert_eq!(io.hosted_file_by_address(dependent, 0x5000), Some(file));
+
+        assert!(!io.unbind_hosted_driver_address(dependent, 0x2000, other_driver));
+        assert_eq!(io.hosted_driver_by_address(dependent, 0x2000), Some(driver));
+        assert!(io.unbind_hosted_driver_address(dependent, 0x2000, driver));
+        assert_eq!(io.hosted_driver_by_address(dependent, 0x2000), None);
+        assert_eq!(
+            io.bind_hosted_driver_address(dependent, 0x2000, other_driver),
+            Ok(())
+        );
+
+        assert!(!io.unbind_hosted_device_address(dependent, 0x4008, device));
+        assert!(io.unbind_hosted_device_address(dependent, 0x4000, device));
+        assert_eq!(io.hosted_device_by_address(dependent, 0x4000), None);
+        assert_eq!(
+            io.bind_hosted_device_address(dependent, 0x4008, device),
+            Ok(())
+        );
+
+        assert!(!io.unbind_hosted_file_address(dependent, 0x5008, file));
+        assert!(io.unbind_hosted_file_address(dependent, 0x5000, file));
+        assert_eq!(io.hosted_file_by_address(dependent, 0x5000), None);
+        assert_eq!(io.bind_hosted_file_address(dependent, 0x5008, file), Ok(()));
 
         io.set_hosted_domain_provider(dependent, provider, 0x55aa)
             .unwrap();
