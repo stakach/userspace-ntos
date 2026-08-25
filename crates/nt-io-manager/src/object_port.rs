@@ -190,6 +190,9 @@ impl ObjectManagerPort for MockObjectPort {
         name: &NtPath,
         _owner_local_id: u64,
     ) -> Result<ObjectId, NtStatus> {
+        if self.drivers.iter().any(|(path, _)| path == name) {
+            return Err(NtStatus::OBJECT_NAME_COLLISION);
+        }
         let id = self.new_object();
         self.drivers.push((name.clone(), id));
         Ok(id)

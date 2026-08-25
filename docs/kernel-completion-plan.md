@@ -11266,10 +11266,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     migrate component harnesses to `CompletionOwnerClaim` plus `CompletionUnwindCursor` before
     deleting `nt-kernel-exec::CompletionTracker`.
 
-    Two smaller lifetime debts stay explicit during that work. Failed Object Manager publication
-    of a new DriverObject must unregister the backend allocated by `nt-io-manager::open`, and a
-    callable provider must not unload while dependent projection bindings remain live unless an
-    exact dependent teardown transaction runs first.
+    Driver publication rollback checkpoint (2026-08-26): both explicit-table and major-list driver
+    installers now retain the backend itself until Object Manager DriverObject publication
+    succeeds. They target the next stable registry index while building the provisional
+    DriverRecord and append the backend only after namespace publication commits. A collision drops
+    the unpublished backend with no registry mutation. The mock Object Manager now enforces the real
+    port's duplicate Driver name collision, and focused failures cover both explicit-table and
+    major-list installers while proving driver and backend counts return to their pre-call values.
+    `nt-io-manager` validation is green at `186/186`.
+
+    Review adjustment: failed-publication ownership is closed. Successful driver unload still needs
+    a generation-protected backend retirement design; the current append-only index registry cannot
+    remove an arbitrary live slot without risking stale index aliasing. A callable provider must
+    also refuse unload while dependent projection bindings remain live unless an exact dependent
+    teardown transaction runs first. Keep these separate from the component-service authentication
+    slice rather than hiding either lifetime problem in that protocol change.
 
     After that boundary is live, migrate the standalone hal, power, PnP, async, MMIO, and DMA
     component harnesses to `CompletionOwnerClaim` plus `CompletionUnwindCursor`, including their

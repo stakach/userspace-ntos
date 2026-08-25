@@ -873,6 +873,49 @@ mod tests {
     }
 
     #[test]
+    fn failed_driver_publication_rolls_back_record_and_backend() {
+        let mut om = io();
+        om.create_driver(
+            &path("\\Driver\\Collision"),
+            Box::new(MockDriverBackend::new()),
+        )
+        .unwrap();
+        assert_eq!(om.driver_count(), 1);
+        assert_eq!(om.backends.len(), 1);
+
+        assert_eq!(
+            om.create_driver_peer(
+                &path("\\Driver\\Collision"),
+                Box::new(MockDriverBackend::new()),
+            ),
+            Err(NtStatus::OBJECT_NAME_COLLISION)
+        );
+        assert_eq!(om.driver_count(), 1);
+        assert_eq!(om.backends.len(), 1);
+
+        assert_eq!(
+            om.create_driver_peer_with_major_table(
+                &path("\\Driver\\Collision"),
+                Box::new(MockDriverBackend::new()),
+                MajorFunctionTable::new(),
+            ),
+            Err(NtStatus::OBJECT_NAME_COLLISION)
+        );
+        assert_eq!(om.driver_count(), 1);
+        assert_eq!(om.backends.len(), 1);
+
+        let next = om
+            .create_driver(
+                &path("\\Driver\\AfterCollision"),
+                Box::new(MockDriverBackend::new()),
+            )
+            .unwrap();
+        assert_eq!(om.driver(next).unwrap().backend, DriverBackendId(1));
+        assert_eq!(om.driver_count(), 2);
+        assert_eq!(om.backends.len(), 2);
+    }
+
+    #[test]
     fn driver_device_records_resolve_by_object_id_and_name() {
         let mut om = io();
         let drv = a_driver(&mut om);

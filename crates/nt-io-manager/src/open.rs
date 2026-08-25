@@ -140,18 +140,26 @@ impl<P: ObjectManagerPort> IoManager<P> {
         kind: DriverInstallKind,
         mut table: MajorFunctionTable,
     ) -> Result<DriverId, NtStatus> {
-        let idx = self.register_backend(backend);
+        let idx = self.backends.len();
         let target = match kind {
             DriverInstallKind::Mock => DispatchTarget::Mock(MockDispatchId(idx as u64)),
             DriverInstallKind::Kernel => DispatchTarget::Kernel(DriverBackendId(idx as u64)),
             DriverInstallKind::Peer => DispatchTarget::DriverPeer(DriverPeerId(idx as u64)),
         };
         table.retarget(target);
-        self.install_driver_record_with_dispatch(
+        let result = self.install_driver_record_with_dispatch(
             name,
             DriverBackendId(idx as u64),
             MajorFunctionTable::boxed_from(table),
-        )
+        );
+        if result.is_ok() {
+            let registered = self.register_backend(backend);
+            assert_eq!(
+                registered, idx,
+                "backend registry changed during publication"
+            );
+        }
+        result
     }
 
     fn install_driver_with_majors_kind(
@@ -161,14 +169,23 @@ impl<P: ObjectManagerPort> IoManager<P> {
         kind: DriverInstallKind,
         majors: &[u8],
     ) -> Result<DriverId, NtStatus> {
-        let idx = self.register_backend(backend);
+        let idx = self.backends.len();
         let target = match kind {
             DriverInstallKind::Mock => DispatchTarget::Mock(MockDispatchId(idx as u64)),
             DriverInstallKind::Kernel => DispatchTarget::Kernel(DriverBackendId(idx as u64)),
             DriverInstallKind::Peer => DispatchTarget::DriverPeer(DriverPeerId(idx as u64)),
         };
         let table = MajorFunctionTable::boxed_with_majors(majors, target);
-        self.install_driver_record_with_dispatch(name, DriverBackendId(idx as u64), table)
+        let result =
+            self.install_driver_record_with_dispatch(name, DriverBackendId(idx as u64), table);
+        if result.is_ok() {
+            let registered = self.register_backend(backend);
+            assert_eq!(
+                registered, idx,
+                "backend registry changed during publication"
+            );
+        }
+        result
     }
 
     fn install_driver_record_with_dispatch(
