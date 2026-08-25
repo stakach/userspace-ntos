@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-08-24
+Last updated: 2026-08-26
 
 ## Objective
 
@@ -11227,6 +11227,49 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     call AddDevice with that exact pointer. Add a rollback selector that detaches and frees
     transaction-created FDO/PDO projections on every later failure. Once this is live,
     `HostedRootPdoBinding` has no remaining ownership role and must be deleted.
+
+    Canonical-first root-PDO transaction checkpoint (2026-08-26): AddDevice no longer begins from
+    a component-local pointer or a second executive identity table. The executive resolves or
+    creates the canonical RootBus devnode first, asks the authenticated target/provider component
+    to allocate a driverless PDO projection, binds that address to the canonical `DeviceId` in the
+    exact hosted domain, and passes that exact PDO to the real AddDevice entry point. Existing
+    bus-owned projections may be reused only when the canonical PDO is unattached and no live FDO
+    binding owns them. `HostedRootPdoBinding`, its raw-address registration path, and the unscoped
+    `hosted_root_pdo_device_id` helper are deleted, leaving the I/O Manager registry as the sole
+    projection authority. RootBus devnode identity matching is ASCII case-insensitive while still
+    requiring exact hardware/compatible-ID cardinality and ordering.
+
+    AddDevice is now an explicit two-stage transaction. The component records the pre-call
+    `DriverObject->DeviceObject` head and returns the actual status and FDO projection even when the
+    call fails. Executive rollback asks the component to verify that saved list boundary, detach the
+    returned FDO, and delete every DeviceObject created after it, so a driver that creates multiple
+    objects cannot leak a partial stack. A `created_here` ownership token controls whether rollback
+    also unbinds and deletes the PDO projection; persistent bus-owned PDOs survive failed retries.
+    Canonical FDO creation, stack attachment, exact projection binding, registry-identity transfer,
+    and instance publication occur in that order, with inverse cleanup on every later error.
+
+    Focused validation is green for `nt-root-bus` (`12/12`) and the freestanding executive release
+    check. Serialized desktop proof `.tmp/run-desktop-20260826-005434.log` closes the integrated
+    checkpoint: all three configured PnP drivers complete AddDevice and StartDevice; the PCI
+    provider completes `42/42` exports with zero rejection; the writable snapshot commits
+    generation 5 with 822,600 bytes; genuine userinit and Explorer launch; Explorer completes 668
+    real api0 callbacks with zero callback failures; paint reaches 5 BeginPaint, 20 EndPaint, 187
+    direct GDI returns, and 135 batch flushes carrying 184 records. All 786,432 framebuffer pixels
+    are non-background with at least 32 colors, all `293/293` checks pass, and the sentinel is
+    emitted.
+
+    Review adjustment: singular root-PDO ownership and transactional AddDevice rollback are closed.
+    Next move component-local `IoDeleteDevice`, `IoGetDeviceProperty`,
+    `IoRegisterDeviceInterface`, and shutdown registration behind an authenticated service
+    boundary. Then carry canonical identity through cancel/copy/ack/interrupt selectors and delete
+    the `dispatch_request == None` raw-address lookup, remove partial-known attach success, and
+    migrate component harnesses to `CompletionOwnerClaim` plus `CompletionUnwindCursor` before
+    deleting `nt-kernel-exec::CompletionTracker`.
+
+    Two smaller lifetime debts stay explicit during that work. Failed Object Manager publication
+    of a new DriverObject must unregister the backend allocated by `nt-io-manager::open`, and a
+    callable provider must not unload while dependent projection bindings remain live unless an
+    exact dependent teardown transaction runs first.
 
     After that boundary is live, migrate the standalone hal, power, PnP, async, MMIO, and DMA
     component harnesses to `CompletionOwnerClaim` plus `CompletionUnwindCursor`, including their

@@ -273,8 +273,9 @@ impl RootBus {
             .find(|pdo| pdo.canonical_id == canonical_id)
     }
 
-    /// Resolve an already-enumerated devnode by its stable PnP identity. Reuse is accepted only
-    /// when every hardware and compatible ID still matches the original enumeration exactly.
+    /// Resolve an already-enumerated devnode by its stable PnP identity. PnP IDs are compared like
+    /// registry key identities (ASCII case-insensitive); reuse still requires the original list
+    /// cardinality and ordering.
     pub fn resolve_pdo_identity<H, C>(
         &self,
         device_id: &str,
@@ -294,11 +295,10 @@ impl RootBus {
             compatible_ids,
             instance_id,
         )?;
-        let Some(pdo) = self
-            .pdos
-            .iter()
-            .find(|pdo| pdo.device_id == device_id && pdo.instance_id == instance_id)
-        else {
+        let Some(pdo) = self.pdos.iter().find(|pdo| {
+            pdo.device_id.eq_ignore_ascii_case(device_id)
+                && pdo.instance_id.eq_ignore_ascii_case(instance_id)
+        }) else {
             return Ok(None);
         };
         let hardware_matches = pdo.hardware_ids.len() == hardware_ids.len()
@@ -306,13 +306,13 @@ impl RootBus {
                 .hardware_ids
                 .iter()
                 .zip(hardware_ids)
-                .all(|(existing, requested)| existing == requested.as_ref());
+                .all(|(existing, requested)| existing.eq_ignore_ascii_case(requested.as_ref()));
         let compatible_matches = pdo.compatible_ids.len() == compatible_ids.len()
             && pdo
                 .compatible_ids
                 .iter()
                 .zip(compatible_ids)
-                .all(|(existing, requested)| existing == requested.as_ref());
+                .all(|(existing, requested)| existing.eq_ignore_ascii_case(requested.as_ref()));
         if !hardware_matches || !compatible_matches {
             return Err(RootBusPdoError::ConflictingDevnodeIdentity);
         }
@@ -631,6 +631,15 @@ mod tests {
                 r"PCI\VEN_8086&DEV_100E",
                 &[r"PCI\VEN_8086&DEV_100E", r"PCI\VEN_8086"],
                 &[r"PCI\CC_020000"],
+                "3&11583659&0&18",
+            ),
+            Ok(Some(canonical))
+        );
+        assert_eq!(
+            b.resolve_pdo_identity(
+                r"pci\ven_8086&dev_100e",
+                &[r"pci\ven_8086&dev_100e", r"pci\ven_8086"],
+                &[r"pci\cc_020000"],
                 "3&11583659&0&18",
             ),
             Ok(Some(canonical))
