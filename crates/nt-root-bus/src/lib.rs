@@ -116,6 +116,10 @@ pub enum RootBusPdoError {
     NullCanonicalDeviceId,
     /// The bus already owns this canonical PDO identity.
     DuplicateCanonicalDeviceId,
+    /// The bus already owns the same DeviceID/InstanceID under another canonical PDO.
+    DuplicateDevnodeIdentity,
+    /// The same DeviceID/InstanceID was presented with different hardware or compatible IDs.
+    ConflictingDevnodeIdentity,
     /// `BusQueryDeviceID` would be empty.
     EmptyDeviceId,
     /// `BusQueryInstanceID` would be empty.
@@ -222,6 +226,12 @@ impl RootBus {
         if self.pdo(canonical_id).is_some() {
             return Err(RootBusPdoError::DuplicateCanonicalDeviceId);
         }
+        if self
+            .resolve_pdo_identity(device_id, hardware_ids, compatible_ids, instance_id)?
+            .is_some()
+        {
+            return Err(RootBusPdoError::DuplicateDevnodeIdentity);
+        }
         self.pdos.push(Pdo {
             canonical_id,
             device_id: device_id.into(),
@@ -261,6 +271,52 @@ impl RootBus {
         self.pdos
             .iter()
             .find(|pdo| pdo.canonical_id == canonical_id)
+    }
+
+    /// Resolve an already-enumerated devnode by its stable PnP identity. Reuse is accepted only
+    /// when every hardware and compatible ID still matches the original enumeration exactly.
+    pub fn resolve_pdo_identity<H, C>(
+        &self,
+        device_id: &str,
+        hardware_ids: &[H],
+        compatible_ids: &[C],
+        instance_id: &str,
+    ) -> Result<Option<DeviceId>, RootBusPdoError>
+    where
+        H: AsRef<str>,
+        C: AsRef<str>,
+    {
+        // Use a non-null proof identity to share the same material validation as publication.
+        Self::validate_pdo_identity(
+            DeviceId::new(1, 1),
+            device_id,
+            hardware_ids,
+            compatible_ids,
+            instance_id,
+        )?;
+        let Some(pdo) = self
+            .pdos
+            .iter()
+            .find(|pdo| pdo.device_id == device_id && pdo.instance_id == instance_id)
+        else {
+            return Ok(None);
+        };
+        let hardware_matches = pdo.hardware_ids.len() == hardware_ids.len()
+            && pdo
+                .hardware_ids
+                .iter()
+                .zip(hardware_ids)
+                .all(|(existing, requested)| existing == requested.as_ref());
+        let compatible_matches = pdo.compatible_ids.len() == compatible_ids.len()
+            && pdo
+                .compatible_ids
+                .iter()
+                .zip(compatible_ids)
+                .all(|(existing, requested)| existing == requested.as_ref());
+        if !hardware_matches || !compatible_matches {
+            return Err(RootBusPdoError::ConflictingDevnodeIdentity);
+        }
+        Ok(Some(pdo.canonical_id))
     }
 
     /// Remove one exact canonical PDO from the bus.
@@ -555,5 +611,72 @@ mod tests {
         assert!(b.remove_pdo(PRIMARY_PDO));
         assert!(!b.remove_pdo(PRIMARY_PDO));
         assert!(b.is_empty());
+    }
+
+    #[test]
+    fn stable_devnode_identity_resolves_only_exact_metadata() {
+        let mut b = RootBus::new();
+        let canonical = DeviceId::new(3, 7);
+        b.try_create_pdo(
+            canonical,
+            r"PCI\VEN_8086&DEV_100E",
+            &[r"PCI\VEN_8086&DEV_100E", r"PCI\VEN_8086"],
+            &[r"PCI\CC_020000"],
+            "3&11583659&0&18",
+        )
+        .unwrap();
+
+        assert_eq!(
+            b.resolve_pdo_identity(
+                r"PCI\VEN_8086&DEV_100E",
+                &[r"PCI\VEN_8086&DEV_100E", r"PCI\VEN_8086"],
+                &[r"PCI\CC_020000"],
+                "3&11583659&0&18",
+            ),
+            Ok(Some(canonical))
+        );
+        assert_eq!(
+            b.resolve_pdo_identity(
+                r"PCI\VEN_8086&DEV_100E",
+                &[r"PCI\VEN_8086&DEV_100E"],
+                &[r"PCI\CC_020000"],
+                "3&11583659&0&18",
+            ),
+            Err(RootBusPdoError::ConflictingDevnodeIdentity)
+        );
+        assert_eq!(
+            b.resolve_pdo_identity(
+                r"PCI\VEN_8086&DEV_100E",
+                &[r"PCI\VEN_8086&DEV_100E", r"PCI\VEN_8086"],
+                &[r"PCI\CC_020000", r"PCI\CC_02"],
+                "3&11583659&0&18",
+            ),
+            Err(RootBusPdoError::ConflictingDevnodeIdentity)
+        );
+        assert_eq!(
+            b.resolve_pdo_identity(
+                r"PCI\VEN_1234&DEV_1111",
+                &[r"PCI\VEN_1234&DEV_1111"],
+                &[] as &[&str],
+                "3&11583659&0&08",
+            ),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn duplicate_devnode_cannot_receive_a_second_canonical_pdo() {
+        let mut b = bus();
+        assert_eq!(
+            b.try_create_pdo(
+                DeviceId::new(3, 8),
+                r"ROOT\KMDF_LOADER_COMPAT_TEST",
+                &[r"ROOT\KMDF_LOADER_COMPAT_TEST"],
+                &[r"ROOT\USERSPACE_NTOS_TEST_DEVICE"],
+                "0001",
+            ),
+            Err(RootBusPdoError::DuplicateDevnodeIdentity)
+        );
+        assert_eq!(b.len(), 1);
     }
 }

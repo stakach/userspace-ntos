@@ -11214,6 +11214,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     cancel/copy/ack/interrupt selectors and delete their `dispatch_request == None` raw-address
     lookup. Only then is the hosted Driver/Device projection migration complete.
 
+    Stable root-devnode identity foundation (2026-08-26): `nt-root-bus` can now resolve an existing
+    PDO by its stable `(DeviceID, InstanceID)` pair before any compatibility projection exists.
+    Reuse requires the hardware-ID and compatible-ID lists to match the original enumeration
+    exactly and in order; conflicting metadata fails closed. A second canonical DeviceId cannot be
+    published for an already enumerated devnode. Focused host validation is green for
+    `nt-root-bus` (`12/12`).
+
+    Review adjustment: the pure bus key is ready. The immediate executive step is now explicit:
+    create or resolve that canonical devnode first, allocate a PDO projection through the
+    authenticated target/provider component, bind it in the hosted-domain registry, and only then
+    call AddDevice with that exact pointer. Add a rollback selector that detaches and frees
+    transaction-created FDO/PDO projections on every later failure. Once this is live,
+    `HostedRootPdoBinding` has no remaining ownership role and must be deleted.
+
     After that boundary is live, migrate the standalone hal, power, PnP, async, MMIO, and DMA
     component harnesses to `CompletionOwnerClaim` plus `CompletionUnwindCursor`, including their
     direct attach/lower-call shims. Reconcile the separate `driver-host-direg` and `nt-driver-host`
