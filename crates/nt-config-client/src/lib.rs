@@ -13,8 +13,9 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use nt_config_abi::{
-    opcode, CmDevicePropertyRequest, CmEnumerateKeyRequest, CmKeyRequest, CmRawValueRequest,
-    CmReply, CmValueRequest, CM_ABI_VERSION, CM_MAX_INSTANCE_UNITS,
+    device_property_transfer, opcode, CmDevicePropertyRequest, CmEnumerateKeyRequest, CmKeyRequest,
+    CmRawValueRequest, CmReply, CmValueRequest, CM_ABI_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES,
+    CM_MAX_INSTANCE_UNITS,
 };
 
 /// A pluggable transport: send `opcode` + `in_buf`, receive a `CmReply` (+ optional
@@ -25,6 +26,7 @@ pub trait Backend {
 
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
+const STATUS_INSUFFICIENT_RESOURCES: i32 = 0xC000_009Au32 as i32;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct QueryError {
@@ -161,43 +163,169 @@ impl<B: Backend> ConfigClient<B> {
                 required_len: 0,
             });
         };
+        let mut offset = 0usize;
+        let mut total = None;
+        let mut token = 0u64;
+        let mut staged = Vec::new();
+        let mut reply_bytes = [0u8; CM_DEVICE_PROPERTY_CHUNK_BYTES];
+        loop {
+            let chunk_capacity = core::cmp::min(
+                out.len().saturating_sub(offset),
+                CM_DEVICE_PROPERTY_CHUNK_BYTES,
+            );
+            let operation = if token == 0 {
+                device_property_transfer::BEGIN
+            } else {
+                device_property_transfer::PULL
+            };
+            let response = match self.device_property_call(
+                &instance_bytes,
+                property,
+                output_capacity,
+                operation,
+                token,
+                offset as u32,
+                chunk_capacity as u32,
+                &mut reply_bytes[..chunk_capacity],
+            ) {
+                Ok(response) => response,
+                Err(error) => {
+                    self.abort_device_property(&instance_bytes, property, output_capacity, token);
+                    return Err(error);
+                }
+            };
+            let required_len = match usize::try_from(response.detail0) {
+                Ok(required_len) => required_len,
+                Err(_) => {
+                    self.abort_device_property(&instance_bytes, property, output_capacity, token);
+                    return Err(QueryError {
+                        status: STATUS_INVALID_PARAMETER,
+                        required_len: 0,
+                    });
+                }
+            };
+            if response.status != STATUS_SUCCESS {
+                self.abort_device_property(&instance_bytes, property, output_capacity, token);
+                return Err(QueryError {
+                    status: response.status,
+                    required_len,
+                });
+            }
+            let written = response.information as usize;
+            let reply_token_valid = if token == 0 {
+                (written == required_len && response.detail1 == 0)
+                    || (written < required_len && response.detail1 != 0)
+            } else {
+                response.detail1 == token
+            };
+            if !reply_token_valid
+                || total.is_some_and(|expected| expected != required_len)
+                || required_len > out.len()
+                || written > chunk_capacity
+                || offset
+                    .checked_add(written)
+                    .is_none_or(|end| end > required_len)
+                || (offset < required_len && written == 0)
+            {
+                self.abort_device_property(
+                    &instance_bytes,
+                    property,
+                    output_capacity,
+                    if token == 0 { response.detail1 } else { token },
+                );
+                return Err(QueryError {
+                    status: STATUS_INVALID_PARAMETER,
+                    required_len,
+                });
+            }
+            if total.is_none() {
+                if staged.try_reserve_exact(required_len).is_err() {
+                    self.abort_device_property(
+                        &instance_bytes,
+                        property,
+                        output_capacity,
+                        response.detail1,
+                    );
+                    return Err(QueryError {
+                        status: STATUS_INSUFFICIENT_RESOURCES,
+                        required_len,
+                    });
+                }
+                staged.resize(required_len, 0);
+            }
+            total = Some(required_len);
+            staged[offset..offset + written].copy_from_slice(&reply_bytes[..written]);
+            offset += written;
+            if offset == required_len {
+                out[..required_len].copy_from_slice(&staged[..required_len]);
+                return Ok(required_len);
+            }
+            if token == 0 {
+                token = response.detail1;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn device_property_call(
+        &mut self,
+        instance_bytes: &[u8],
+        property: u32,
+        output_capacity: u32,
+        operation: u16,
+        transfer_token: u64,
+        value_offset: u32,
+        chunk_capacity: u32,
+        reply_bytes: &mut [u8],
+    ) -> Result<CmReply, QueryError> {
         let header_size = core::mem::size_of::<CmDevicePropertyRequest>();
         let header = CmDevicePropertyRequest {
             abi_size: header_size as u16,
             abi_version: CM_ABI_VERSION,
+            operation,
+            _reserved: 0,
             property,
             output_capacity,
+            value_offset,
+            chunk_capacity,
             instance_offset: header_size as u32,
             instance_len_bytes: instance_bytes.len() as u32,
+            transfer_token,
         };
-        let mut request = Vec::with_capacity(header_size + instance_bytes.len());
+        let mut request = Vec::new();
+        request
+            .try_reserve_exact(header_size.saturating_add(instance_bytes.len()))
+            .map_err(|_| QueryError {
+                status: STATUS_INSUFFICIENT_RESOURCES,
+                required_len: 0,
+            })?;
         request.extend_from_slice(header.as_bytes());
-        request.extend_from_slice(&instance_bytes);
+        request.extend_from_slice(instance_bytes);
+        Ok(self
+            .backend
+            .call(opcode::CM_OP_QUERY_DEVICE_PROPERTY, &request, reply_bytes))
+    }
 
-        // SURT copies `information` bytes from its shared reply frame even on failure. Keep that
-        // transport behavior away from the caller and publish bytes only after semantic success.
-        let mut reply_bytes = Vec::new();
-        reply_bytes.resize(out.len(), 0);
-        let response = self.backend.call(
-            opcode::CM_OP_QUERY_DEVICE_PROPERTY,
-            &request,
-            &mut reply_bytes,
+    fn abort_device_property(
+        &mut self,
+        instance_bytes: &[u8],
+        property: u32,
+        output_capacity: u32,
+        transfer_token: u64,
+    ) {
+        if transfer_token == 0 {
+            return;
+        }
+        let _ = self.device_property_call(
+            instance_bytes,
+            property,
+            output_capacity,
+            device_property_transfer::ABORT,
+            transfer_token,
+            0,
+            0,
+            &mut [],
         );
-        if response.status != STATUS_SUCCESS {
-            return Err(QueryError {
-                status: response.status,
-                required_len: response.information as usize,
-            });
-        }
-        let written = response.information as usize;
-        if written > out.len() || written > reply_bytes.len() {
-            return Err(QueryError {
-                status: STATUS_INVALID_PARAMETER,
-                required_len: written,
-            });
-        }
-        out[..written].copy_from_slice(&reply_bytes[..written]);
-        Ok(written)
     }
 
     fn key_op(&mut self, op: u16, path: &str) -> CmReply {
@@ -287,9 +415,10 @@ mod tests {
     use super::*;
     use alloc::format;
     use alloc::string::String;
+    use alloc::vec;
     use nt_config_manager::{
-        device_property, encode_sz, ConfigManager, ENUM_PATH, SERVICE_AUTO_START,
-        SERVICE_WIN32_SHARE_PROCESS,
+        device_property, encode_sz, ConfigManager, RegistryValueType, ENUM_PATH,
+        SERVICE_AUTO_START, SERVICE_WIN32_SHARE_PROCESS,
     };
     use nt_config_server::CmServer;
 
@@ -483,6 +612,38 @@ mod tests {
         assert_eq!(error.status, 0xC000_0023u32 as i32);
         assert_eq!(error.required_len, encode_sz("Intel Test Adapter").len());
         assert_eq!(out, [0xa5; 2]);
+    }
+
+    #[test]
+    fn device_property_query_reassembles_multiple_reply_frames() {
+        let mut cm = ConfigManager::new();
+        let key = cm
+            .registry_mut()
+            .create_key(&format!(r"{}\{}", ENUM_PATH, r"PCI\VEN_8086&DEV_100E\0001"));
+        let mut expected = vec![0u8; CM_DEVICE_PROPERTY_CHUNK_BYTES * 2 + 132];
+        let content_len = expected.len() - 4;
+        for pair in expected[..content_len].chunks_exact_mut(2) {
+            pair.copy_from_slice(&u16::from(b'A').to_le_bytes());
+        }
+        assert!(cm.registry_mut().set_value(
+            key,
+            "HardwareID",
+            RegistryValueType::MultiSz,
+            expected.clone(),
+        ));
+        let mut client = ConfigClient::new(Framed {
+            server: CmServer::with_config(cm),
+        });
+        let mut out = vec![0xa5; expected.len()];
+        assert_eq!(
+            client.query_device_property(
+                r"PCI\VEN_8086&DEV_100E\0001",
+                device_property::HARDWARE_ID,
+                &mut out,
+            ),
+            Ok(expected.len())
+        );
+        assert_eq!(out, expected);
     }
 
     #[test]

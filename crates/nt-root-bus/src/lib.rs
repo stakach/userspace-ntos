@@ -109,6 +109,22 @@ pub struct Pdo {
     pub started: bool,
 }
 
+impl Pdo {
+    /// Stable `Enum\<DeviceID>\<InstanceID>` identity used at Configuration Manager boundaries.
+    pub fn enum_instance_path(&self) -> String {
+        let mut path = String::with_capacity(
+            self.device_id
+                .len()
+                .saturating_add(1)
+                .saturating_add(self.instance_id.len()),
+        );
+        path.push_str(&self.device_id);
+        path.push('\\');
+        path.push_str(&self.instance_id);
+        path
+    }
+}
+
 /// Invalid identity material for a root-bus PDO.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RootBusPdoError {
@@ -604,6 +620,7 @@ mod tests {
         let pdo = b.pdo(PRIMARY_PDO).unwrap();
         assert_eq!(pdo.hardware_ids, alloc::vec![String::from(r"ROOT\A")]);
         assert!(pdo.compatible_ids.is_empty());
+        assert_eq!(pdo.enum_instance_path(), r"ROOT\A\0001");
         assert_eq!(
             b.try_create_pdo(PRIMARY_PDO, r"ROOT\B", &[r"ROOT\B"], &empty, "0002"),
             Err(RootBusPdoError::DuplicateCanonicalDeviceId)

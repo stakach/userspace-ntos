@@ -11385,6 +11385,47 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Register-interface and set-interface-state remain one later coupled migration because their
     Config Manager and Object Manager updates require a two-authority commit.
 
+    Authenticated device-property boundary checkpoint (2026-08-26, accepted):
+    `IoGetDeviceProperty` no longer reads a component-local property switch or accepts an
+    unauthenticated PDO address. The hosted-device service resolves the exact live domain
+    generation and cookie, maps the caller's PDO projection to its canonical RootBus `DeviceId`,
+    and dispatches Configuration-owned ordinals through the isolated Configuration Manager. Both
+    the Configuration Manager and driver-facing protocols now bank values larger than one reply
+    frame from one immutable snapshot, reject skipped/replayed banks and stale owners, allocate the
+    exact required length, leave native caller buffers untouched until full success, retire
+    abandoned transfers on domain teardown, and never reuse wrapped transfer tokens.
+
+    PnP property-authority checkpoint (2026-08-26, accepted): production now
+    publishes canonical PDO bus information, capabilities, removal policy, and translated boot
+    resources before invoking `AddDevice`. PCI values come from the enumerated `PciDevice`; root
+    children use `GUID_BUS_TYPE_INTERNAL`, `PNPBus`, bus zero, and an unavailable address. External
+    property ordinals are served only by the PDO-keyed PnP Manager, never by
+    `HostedDeviceBinding`, resource evidence rows, or shared-page resource cells. Resource grants
+    commit distinct raw and translated `CM_RESOURCE_LIST` snapshots before `START_DEVICE`; the WDM
+    stack receives distinct native pointers, and a failed publication or start clears the PnP
+    assignment and revokes the hosted grant. Configuration/resource-list and transfer validation is
+    green for `nt-config-abi` (`1/1`), `nt-config-server` (`4/4`), `nt-config-client` (`10/10`),
+    `nt-cm-resources` (`7/7`), `nt-pnp` (`18/18`), `nt-pnp-manager` (`9/9`), and
+    `nt-io-manager` (`190/190`); the freestanding executive check remains at the existing 212
+    warnings.
+
+    The serialized desktop gate is accepted in
+    `.tmp/run-desktop-20260826-025130.log`: all `293/293` executive-to-isolated-service checks pass,
+    Explorer produces `786432/786432` non-background pixels with at least 32 unique colours, E1000
+    completes `AddDevice` and `START_DEVICE`, and provider publication completes `47/47` exports
+    with zero rejection. Its real `IoGetDeviceProperty` calls return an 88-byte bus GUID,
+    `LegacyBusType=5`, `BusNumber=0`, and `Address=0x30000`. Integration exposed and corrected two
+    boundary bugs without adding a fallback: provider sharing now authenticates with the provider's
+    hosted-domain generation cookie rather than its publication cookie, and the four-word property
+    reply now advertises all four words instead of truncating the transfer token and chunk length.
+
+    Review adjustment: the next unit is a real bus `IO_RESOURCE_REQUIREMENTS_LIST`
+    query/publication path; resourceful PDOs continue to report `STATUS_DEVICE_NOT_READY` rather
+    than inventing requirements. Then move the PnP authority behind reusable ABI/client/server
+    crates, migrate standalone `pnp-svc` off its private protocol, and only then couple interface
+    registration/state with Object Manager link publication. Do not reintroduce executive-local
+    property fallbacks.
+
     After that boundary is live, migrate the standalone hal, power, PnP, async, MMIO, and DMA
     component harnesses to `CompletionOwnerClaim` plus `CompletionUnwindCursor`, including their
     direct attach/lower-call shims. Reconcile the separate `driver-host-direg` and `nt-driver-host`

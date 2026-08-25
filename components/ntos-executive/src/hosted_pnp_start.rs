@@ -495,6 +495,111 @@ pub(crate) unsafe fn start_owned_driver_service_devnodes(
     }
 }
 
+unsafe fn current_hosted_devnode_pdo_properties<H, C>(
+    instance_id: &str,
+    hardware_ids: &[H],
+    compatible_ids: &[C],
+) -> Result<nt_pnp_manager::PdoProperties, nt_status::NtStatus>
+where
+    H: AsRef<str>,
+    C: AsRef<str>,
+{
+    let devices = (*core::ptr::addr_of!(HOSTED_PNP_PCI_DEVICES))
+        .as_ref()
+        .ok_or(STATUS_DEVICE_NOT_READY)?;
+    let pci_windows = (*core::ptr::addr_of!(HOSTED_PNP_PCI_WINDOWS))
+        .as_ref()
+        .ok_or(STATUS_DEVICE_NOT_READY)?;
+    let root_windows = (*core::ptr::addr_of!(HOSTED_PNP_ROOT_WINDOWS))
+        .as_ref()
+        .ok_or(STATUS_DEVICE_NOT_READY)?;
+
+    if let Some(device) = nt_pnp::find_pci_device_for_devnode(
+        devices,
+        instance_id,
+        hardware_ids,
+        compatible_ids,
+    ) {
+        let window = pci_windows
+            .iter()
+            .find(|window| window.matches(device))
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        let grant = build_devnode_pci_resource_grant(
+            device,
+            window.interrupt_vector,
+            window.interrupt_latched,
+            window.dma_len,
+            window.granted_mmio_len(),
+        )
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        return Ok(nt_pnp_manager::PdoProperties::enumerated(
+            nt_pnp_manager::PnpBusInformation {
+                bus_type_guid: nt_pnp_manager::GUID_BUS_TYPE_PCI,
+                legacy_bus_type: nt_pnp_manager::INTERFACE_TYPE_PCI_BUS,
+                bus_number: device.bus as u32,
+            },
+            nt_pnp_manager::PdoCapabilities {
+                removable: false,
+                eject_supported: false,
+                surprise_removal_ok: false,
+                address: ((device.dev as u32) << 16) | device.func as u32,
+            },
+            nt_pnp_manager::PropertyBlobState::Present(grant.translated_resource_list),
+            nt_pnp_manager::PropertyBlobState::Unqueried,
+        ));
+    }
+
+    if let Some(profile) =
+        root_bus_resource_profile_for_devnode(instance_id, hardware_ids, compatible_ids)
+    {
+        let window = root_windows
+            .iter()
+            .find(|window| window.matches_profile(&profile))
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        let grant = assign_devnode_root_dma_resources(
+            instance_id,
+            hardware_ids,
+            compatible_ids,
+            window.interrupt_vector,
+            window.interrupt_latched,
+            window.dma_len,
+            window.granted_mmio_len(),
+        )
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        return Ok(nt_pnp_manager::PdoProperties::enumerated(
+            nt_pnp_manager::PnpBusInformation {
+                bus_type_guid: nt_pnp_manager::GUID_BUS_TYPE_INTERNAL,
+                legacy_bus_type: nt_pnp_manager::INTERFACE_TYPE_PNP_BUS,
+                bus_number: 0,
+            },
+            nt_pnp_manager::PdoCapabilities {
+                removable: false,
+                eject_supported: false,
+                surprise_removal_ok: false,
+                address: nt_pnp_manager::DEVICE_ADDRESS_UNAVAILABLE,
+            },
+            nt_pnp_manager::PropertyBlobState::Present(grant.translated_resource_list),
+            nt_pnp_manager::PropertyBlobState::Unqueried,
+        ));
+    }
+
+    Ok(nt_pnp_manager::PdoProperties::enumerated(
+        nt_pnp_manager::PnpBusInformation {
+            bus_type_guid: nt_pnp_manager::GUID_BUS_TYPE_INTERNAL,
+            legacy_bus_type: nt_pnp_manager::INTERFACE_TYPE_PNP_BUS,
+            bus_number: 0,
+        },
+        nt_pnp_manager::PdoCapabilities {
+            removable: false,
+            eject_supported: false,
+            surprise_removal_ok: false,
+            address: nt_pnp_manager::DEVICE_ADDRESS_UNAVAILABLE,
+        },
+        nt_pnp_manager::PropertyBlobState::KnownNone,
+        nt_pnp_manager::PropertyBlobState::KnownNone,
+    ))
+}
+
 unsafe fn start_one_devnode<H, C>(
     dc: &driver_launch::DriverComponent,
     service_name: &str,
@@ -507,6 +612,18 @@ unsafe fn start_one_devnode<H, C>(
     C: AsRef<str>,
 {
     report.attempted += 1;
+    let pdo_properties = match current_hosted_devnode_pdo_properties(
+        devnode.instance_id,
+        devnode.hardware_ids,
+        devnode.compatible_ids,
+    ) {
+        Ok(properties) => properties,
+        Err(status) => {
+            remember_error(report, status);
+            print_add_device_failure(options.trace, service_name, devnode.instance_id, status);
+            return;
+        }
+    };
     match driver_launch::call_add_device_for_driver(
         dc.driver_id,
         class_guid,
@@ -515,6 +632,7 @@ unsafe fn start_one_devnode<H, C>(
         devnode.instance_id,
         devnode.hardware_ids,
         devnode.compatible_ids,
+        pdo_properties,
     ) {
         Ok(device_id) => {
             report.add_device = true;
@@ -532,10 +650,34 @@ unsafe fn start_one_devnode<H, C>(
                         devnode.instance_id.as_bytes(),
                         &grant,
                     );
-                    driver_launch::start_hosted_device(device_id, &grant.resource_list)
+                    match driver_launch::commit_hosted_device_resource_assignment(
+                        device_id,
+                        &grant.raw_resource_list,
+                        &grant.translated_resource_list,
+                    ) {
+                        Ok(()) => {
+                            let status = driver_launch::start_hosted_device(
+                                device_id,
+                                &grant.raw_resource_list,
+                                &grant.translated_resource_list,
+                            );
+                            if status.is_err() {
+                                driver_launch::rollback_hosted_device_start(device_id);
+                            }
+                            status
+                        }
+                        Err(status) => {
+                            driver_launch::rollback_hosted_device_start(device_id);
+                            Err(status)
+                        }
+                    }
                 }
-                Ok(None) => Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+                Ok(None) => {
+                    driver_launch::rollback_hosted_device_start(device_id);
+                    Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+                }
                 Err(status) => {
+                    driver_launch::rollback_hosted_device_start(device_id);
                     print_resource_grant_failure(
                         options.trace,
                         service_name,

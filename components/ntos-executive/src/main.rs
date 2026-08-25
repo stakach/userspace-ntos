@@ -13620,7 +13620,8 @@ enum HostedDevnodeGrantKind {
 
 struct HostedDevnodeGrant {
     kind: HostedDevnodeGrantKind,
-    resource_list: alloc::vec::Vec<u8>,
+    raw_resource_list: alloc::vec::Vec<u8>,
+    translated_resource_list: alloc::vec::Vec<u8>,
     mmio_phys: u64,
     mmio_len: u64,
     io_port_base: u64,
@@ -13754,7 +13755,8 @@ where
                 dev: grant.device.dev,
                 func: grant.device.func,
             },
-            resource_list: grant.resource_list,
+            raw_resource_list: grant.raw_resource_list,
+            translated_resource_list: grant.translated_resource_list,
             mmio_phys: grant.assignment.mmio_phys,
             mmio_len,
             io_port_base: grant.assignment.io_port_base,
@@ -13818,7 +13820,8 @@ where
         )?;
         return Ok(Some(HostedDevnodeGrant {
             kind: HostedDevnodeGrantKind::RootBus,
-            resource_list: grant.resource_list,
+            raw_resource_list: grant.raw_resource_list,
+            translated_resource_list: grant.translated_resource_list,
             mmio_phys: grant.assignment.mmio_phys,
             mmio_len,
             io_port_base: 0,
@@ -14774,6 +14777,20 @@ pub(crate) unsafe fn config_manager_query_value(
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
     client.query_value(key_path, name, out)
+}
+
+pub(crate) unsafe fn config_manager_query_device_property(
+    instance: &str,
+    property: u32,
+    out: &mut [u8],
+) -> Result<usize, nt_config_client::QueryError> {
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(nt_config_client::QueryError {
+            status: CONFIG_STATUS_DEVICE_NOT_READY,
+            required_len: 0,
+        })?;
+    client.query_device_property(instance, property, out)
 }
 
 /// The I/O Manager transport wrapper (carries the extra `flags` + a u64 `information`).

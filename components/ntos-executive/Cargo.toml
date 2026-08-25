@@ -70,6 +70,7 @@ nt-root-bus = { path = "../../crates/nt-root-bus" }
 # PnP resource-assignment policy — PCI enum + BAR-size probe + CM_RESOURCE_LIST build. The
 # executive-side broker (pnp.rs) mints the caps this policy's resource list describes.
 nt-pnp = { path = "../../crates/nt-pnp" }
+nt-pnp-manager = { path = "../../crates/nt-pnp-manager" }
 # PE loader — load + map + relocate a real Windows .sys binary in the isolated host.
 nt-pe-loader = { path = "../../crates/nt-pe-loader" }
 # Process Manager — real EPROCESS/ETHREAD + per-process handle tables + lifecycle. The live

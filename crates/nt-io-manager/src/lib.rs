@@ -26,6 +26,7 @@ mod complete;
 mod completion_unwind;
 mod device;
 mod device_control;
+mod device_property_transfer;
 mod dispatch;
 mod driver;
 mod driver_host;
@@ -63,6 +64,10 @@ pub use completion_unwind::{
     CompletionUnwindFrame,
 };
 pub use device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
+pub use device_property_transfer::{
+    HostedDevicePropertyOwner, HostedDevicePropertyPull, HostedDevicePropertyTransferError,
+    HostedDevicePropertyTransferTable,
+};
 pub use dispatch::{
     DispatchContext, DispatchOutcome, DriverCompletion, DriverDispatchBackend, IrpProjection,
 };

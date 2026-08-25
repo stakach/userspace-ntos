@@ -36,6 +36,139 @@ pub const NO_RESOURCES: ResourceAssignment = ResourceAssignment {
     int_latched: false,
 };
 
+/// Native GUID bytes (`GUID` fields in little-endian memory order) for the buses currently
+/// enumerated by the production broker.
+pub const GUID_BUS_TYPE_PCI: [u8; 16] = [
+    0xb0, 0xdf, 0xeb, 0xc8, 0x10, 0xb5, 0xd0, 0x11, 0x80, 0xe5, 0x00, 0xa0, 0xc9, 0x25, 0x42, 0xe3,
+];
+pub const GUID_BUS_TYPE_INTERNAL: [u8; 16] = [
+    0x73, 0xea, 0x30, 0x15, 0x6b, 0x08, 0xd1, 0x11, 0xa0, 0x9f, 0x00, 0xc0, 0x4f, 0xc3, 0x40, 0xb1,
+];
+
+pub const INTERFACE_TYPE_PCI_BUS: u32 = 5;
+pub const INTERFACE_TYPE_PNP_BUS: u32 = 16;
+pub const DEVICE_ADDRESS_UNAVAILABLE: u32 = u32::MAX;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PnpBusInformation {
+    pub bus_type_guid: [u8; 16],
+    pub legacy_bus_type: u32,
+    pub bus_number: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PdoCapabilities {
+    pub removable: bool,
+    pub eject_supported: bool,
+    pub surprise_removal_ok: bool,
+    pub address: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum DeviceRemovalPolicy {
+    ExpectNoRemoval = 1,
+    ExpectOrderlyRemoval = 2,
+    ExpectSurpriseRemoval = 3,
+}
+
+impl DeviceRemovalPolicy {
+    pub fn from_capabilities(capabilities: &PdoCapabilities) -> Self {
+        if !capabilities.removable {
+            Self::ExpectNoRemoval
+        } else if capabilities.eject_supported && !capabilities.surprise_removal_ok {
+            Self::ExpectOrderlyRemoval
+        } else {
+            Self::ExpectSurpriseRemoval
+        }
+    }
+}
+
+/// PnP must distinguish a bus query that has not run from a successful query that returned no
+/// descriptors. Both differ from a present native variable-length structure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PropertyBlobState {
+    Unqueried,
+    KnownNone,
+    Present(Vec<u8>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PdoProperties {
+    pub bus_information: Option<PnpBusInformation>,
+    pub capabilities: Option<PdoCapabilities>,
+    pub removal_policy: Option<DeviceRemovalPolicy>,
+    pub boot_resources_translated: PropertyBlobState,
+    pub resource_requirements: PropertyBlobState,
+    pub allocated_resources_raw: PropertyBlobState,
+    pub allocated_resources_translated: PropertyBlobState,
+}
+
+impl PdoProperties {
+    pub fn enumerated(
+        bus_information: PnpBusInformation,
+        capabilities: PdoCapabilities,
+        boot_resources_translated: PropertyBlobState,
+        resource_requirements: PropertyBlobState,
+    ) -> Self {
+        let removal_policy = DeviceRemovalPolicy::from_capabilities(&capabilities);
+        Self {
+            bus_information: Some(bus_information),
+            capabilities: Some(capabilities),
+            removal_policy: Some(removal_policy),
+            boot_resources_translated,
+            resource_requirements,
+            allocated_resources_raw: PropertyBlobState::Unqueried,
+            allocated_resources_translated: PropertyBlobState::Unqueried,
+        }
+    }
+
+    fn immutable_identity_eq(&self, other: &Self) -> bool {
+        self.bus_information == other.bus_information
+            && self.capabilities == other.capabilities
+            && self.removal_policy == other.removal_policy
+            && self.boot_resources_translated == other.boot_resources_translated
+            && self.resource_requirements == other.resource_requirements
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PnpDevicePropertyValue<'a> {
+    Bytes(&'a [u8]),
+    U32(u32),
+    Guid([u8; 16]),
+}
+
+impl PnpDevicePropertyValue<'_> {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+            Self::U32(_) => 4,
+            Self::Guid(_) => 16,
+        }
+    }
+
+    pub fn copy_to(&self, out: &mut [u8]) -> bool {
+        if out.len() != self.len() {
+            return false;
+        }
+        match self {
+            Self::Bytes(bytes) => out.copy_from_slice(bytes),
+            Self::U32(value) => out.copy_from_slice(&value.to_le_bytes()),
+            Self::Guid(guid) => out.copy_from_slice(guid),
+        }
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PnpPropertyError {
+    StalePdo,
+    InvalidProperty,
+    ObjectNameNotFound,
+    DeviceNotReady,
+}
+
 /// The MMIO interrupt resource shape used by unit tests.
 #[cfg(test)]
 const MMIO_INTERRUPT_TEST_RESOURCES: ResourceAssignment = ResourceAssignment {
@@ -54,6 +187,9 @@ pub enum PnpError {
     InvalidTransition,
     /// The devnode ID is unknown or refers to a removed (stale) devnode.
     StaleId,
+    InvalidIdentity,
+    ConflictingPdo,
+    InsufficientResources,
 }
 
 struct Devnode {
@@ -66,6 +202,7 @@ struct Devnode {
     fdo_object_id: u64,
     driver_id: u64,
     resources: ResourceAssignment,
+    pdo_properties: Option<PdoProperties>,
 }
 
 /// Whether the v0.1 state machine permits `from -> to` (spec §8.2/§8.3). `Failed` is
@@ -142,6 +279,7 @@ impl PnpManager {
             fdo_object_id: 0,
             driver_id: 0,
             resources,
+            pdo_properties: None,
         });
         id
     }
@@ -169,6 +307,172 @@ impl PnpManager {
         pdo_object_id: u64,
     ) -> u64 {
         self.create_service_bound_devnode(instance_id, service, pdo_object_id, NO_RESOURCES)
+    }
+
+    /// Publish the immutable bus/capability state owned by one enumerated canonical PDO before a
+    /// function driver's `AddDevice` is allowed to run. Re-publication is idempotent only for the
+    /// exact same devnode identity and property record.
+    pub fn register_enumerated_pdo(
+        &mut self,
+        instance_id: &str,
+        pdo_object_id: u64,
+        properties: PdoProperties,
+    ) -> Result<u64, PnpError> {
+        if instance_id.is_empty() || pdo_object_id == 0 {
+            return Err(PnpError::InvalidIdentity);
+        }
+        if let Some(existing) = self
+            .devnodes
+            .iter()
+            .find(|devnode| devnode.pdo_object_id == pdo_object_id)
+        {
+            return if existing
+                .instance_id
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case(instance_id))
+                && existing
+                    .pdo_properties
+                    .as_ref()
+                    .is_some_and(|current| current.immutable_identity_eq(&properties))
+            {
+                Ok(existing.id)
+            } else {
+                Err(PnpError::ConflictingPdo)
+            };
+        }
+        let id = self.next_id;
+        let generation = self.next_gen;
+        let Some(next_id) = self.next_id.checked_add(1) else {
+            return Err(PnpError::InsufficientResources);
+        };
+        let Some(next_gen) = self.next_gen.checked_add(1) else {
+            return Err(PnpError::InsufficientResources);
+        };
+        self.devnodes
+            .try_reserve(1)
+            .map_err(|_| PnpError::InsufficientResources)?;
+        self.devnodes.push(Devnode {
+            id,
+            generation,
+            instance_id: Some(instance_id.to_string()),
+            service: None,
+            state: DeviceState::Enumerated,
+            pdo_object_id,
+            fdo_object_id: 0,
+            driver_id: 0,
+            resources: NO_RESOURCES,
+            pdo_properties: Some(properties),
+        });
+        self.next_id = next_id;
+        self.next_gen = next_gen;
+        Ok(id)
+    }
+
+    pub fn devnode_for_pdo(&self, pdo_object_id: u64) -> Option<u64> {
+        self.devnodes
+            .iter()
+            .find(|devnode| {
+                devnode.pdo_object_id == pdo_object_id
+                    && devnode.pdo_properties.is_some()
+                    && devnode.state != DeviceState::Removed
+            })
+            .map(|devnode| devnode.id)
+    }
+
+    pub fn commit_resource_assignment(
+        &mut self,
+        pdo_object_id: u64,
+        raw: Vec<u8>,
+        translated: Vec<u8>,
+    ) -> Result<(), PnpError> {
+        let devnode = self
+            .devnodes
+            .iter_mut()
+            .find(|devnode| {
+                devnode.pdo_object_id == pdo_object_id
+                    && devnode.pdo_properties.is_some()
+                    && devnode.state != DeviceState::Removed
+            })
+            .ok_or(PnpError::StaleId)?;
+        let properties = devnode.pdo_properties.as_mut().unwrap();
+        properties.allocated_resources_raw = if raw.is_empty() {
+            PropertyBlobState::KnownNone
+        } else {
+            PropertyBlobState::Present(raw)
+        };
+        properties.allocated_resources_translated = if translated.is_empty() {
+            PropertyBlobState::KnownNone
+        } else {
+            PropertyBlobState::Present(translated)
+        };
+        Ok(())
+    }
+
+    pub fn clear_resource_assignment(&mut self, pdo_object_id: u64) -> Result<(), PnpError> {
+        let devnode = self
+            .devnodes
+            .iter_mut()
+            .find(|devnode| {
+                devnode.pdo_object_id == pdo_object_id
+                    && devnode.pdo_properties.is_some()
+                    && devnode.state != DeviceState::Removed
+            })
+            .ok_or(PnpError::StaleId)?;
+        let properties = devnode.pdo_properties.as_mut().unwrap();
+        properties.allocated_resources_raw = PropertyBlobState::Unqueried;
+        properties.allocated_resources_translated = PropertyBlobState::Unqueried;
+        Ok(())
+    }
+
+    /// Query one PnP/resource-owned `DEVICE_REGISTRY_PROPERTY` by canonical PDO identity.
+    pub fn query_device_property(
+        &self,
+        pdo_object_id: u64,
+        property: u32,
+    ) -> Result<PnpDevicePropertyValue<'_>, PnpPropertyError> {
+        let devnode = self
+            .devnodes
+            .iter()
+            .find(|devnode| {
+                devnode.pdo_object_id == pdo_object_id
+                    && devnode.pdo_properties.is_some()
+                    && devnode.state != DeviceState::Removed
+            })
+            .ok_or(PnpPropertyError::StalePdo)?;
+        let properties = devnode.pdo_properties.as_ref().unwrap();
+        match property {
+            4 => property_blob_value(&properties.boot_resources_translated),
+            12 => properties
+                .bus_information
+                .as_ref()
+                .map(|bus| PnpDevicePropertyValue::Guid(bus.bus_type_guid))
+                .ok_or(PnpPropertyError::ObjectNameNotFound),
+            13 => properties
+                .bus_information
+                .as_ref()
+                .filter(|bus| bus.legacy_bus_type != u32::MAX)
+                .map(|bus| PnpDevicePropertyValue::U32(bus.legacy_bus_type))
+                .ok_or(PnpPropertyError::ObjectNameNotFound),
+            14 => properties
+                .bus_information
+                .as_ref()
+                .filter(|bus| bus.bus_number & 0x8000_0000 == 0)
+                .map(|bus| PnpDevicePropertyValue::U32(bus.bus_number))
+                .ok_or(PnpPropertyError::ObjectNameNotFound),
+            16 => properties
+                .capabilities
+                .as_ref()
+                .filter(|capabilities| capabilities.address != DEVICE_ADDRESS_UNAVAILABLE)
+                .map(|capabilities| PnpDevicePropertyValue::U32(capabilities.address))
+                .ok_or(PnpPropertyError::ObjectNameNotFound),
+            19 => properties
+                .removal_policy
+                .map(|policy| PnpDevicePropertyValue::U32(policy as u32))
+                .ok_or(PnpPropertyError::ObjectNameNotFound),
+            20 => property_blob_value(&properties.resource_requirements),
+            21 => property_blob_value(&properties.allocated_resources_raw),
+            _ => Err(PnpPropertyError::InvalidProperty),
+        }
     }
 
     pub fn state(&self, id: u64) -> Option<DeviceState> {
@@ -245,6 +549,16 @@ impl PnpManager {
     }
 }
 
+fn property_blob_value(
+    state: &PropertyBlobState,
+) -> Result<PnpDevicePropertyValue<'_>, PnpPropertyError> {
+    match state {
+        PropertyBlobState::Unqueried => Err(PnpPropertyError::DeviceNotReady),
+        PropertyBlobState::KnownNone => Ok(PnpDevicePropertyValue::Bytes(&[])),
+        PropertyBlobState::Present(bytes) => Ok(PnpDevicePropertyValue::Bytes(bytes)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +572,130 @@ mod tests {
             pdo_object_id,
             MMIO_INTERRUPT_TEST_RESOURCES,
         )
+    }
+
+    fn pci_properties() -> PdoProperties {
+        PdoProperties::enumerated(
+            PnpBusInformation {
+                bus_type_guid: GUID_BUS_TYPE_PCI,
+                legacy_bus_type: INTERFACE_TYPE_PCI_BUS,
+                bus_number: 2,
+            },
+            PdoCapabilities {
+                removable: false,
+                eject_supported: false,
+                surprise_removal_ok: false,
+                address: (3 << 16) | 1,
+            },
+            PropertyBlobState::Present(vec![1, 2, 3]),
+            PropertyBlobState::KnownNone,
+        )
+    }
+
+    #[test]
+    fn canonical_pdo_properties_exist_before_add_device_and_assignment() {
+        let mut p = PnpManager::new();
+        let pdo = 0x1234;
+        let id = p
+            .register_enumerated_pdo(r"PCI\VEN_1234&DEV_5678\0001", pdo, pci_properties())
+            .unwrap();
+        assert_eq!(p.devnode_for_pdo(pdo), Some(id));
+        assert_eq!(
+            p.query_device_property(pdo, 12),
+            Ok(PnpDevicePropertyValue::Guid(GUID_BUS_TYPE_PCI))
+        );
+        assert_eq!(
+            p.query_device_property(pdo, 13),
+            Ok(PnpDevicePropertyValue::U32(INTERFACE_TYPE_PCI_BUS))
+        );
+        assert_eq!(
+            p.query_device_property(pdo, 14),
+            Ok(PnpDevicePropertyValue::U32(2))
+        );
+        assert_eq!(
+            p.query_device_property(pdo, 16),
+            Ok(PnpDevicePropertyValue::U32((3 << 16) | 1))
+        );
+        assert_eq!(
+            p.query_device_property(pdo, 19),
+            Ok(PnpDevicePropertyValue::U32(
+                DeviceRemovalPolicy::ExpectNoRemoval as u32
+            ))
+        );
+        assert_eq!(
+            p.query_device_property(pdo, 4),
+            Ok(PnpDevicePropertyValue::Bytes(&[1, 2, 3]))
+        );
+        assert_eq!(
+            p.query_device_property(pdo, 20),
+            Ok(PnpDevicePropertyValue::Bytes(&[]))
+        );
+        assert_eq!(
+            p.query_device_property(pdo, 21),
+            Err(PnpPropertyError::DeviceNotReady)
+        );
+
+        p.commit_resource_assignment(pdo, vec![4, 5], vec![6, 7])
+            .unwrap();
+        assert_eq!(
+            p.query_device_property(pdo, 21),
+            Ok(PnpDevicePropertyValue::Bytes(&[4, 5]))
+        );
+        assert_eq!(
+            p.register_enumerated_pdo(r"PCI\VEN_1234&DEV_5678\0001", pdo, pci_properties(),),
+            Ok(id)
+        );
+        assert_eq!(
+            p.query_device_property(pdo, 21),
+            Ok(PnpDevicePropertyValue::Bytes(&[4, 5]))
+        );
+        p.clear_resource_assignment(pdo).unwrap();
+        assert_eq!(
+            p.query_device_property(pdo, 21),
+            Err(PnpPropertyError::DeviceNotReady)
+        );
+    }
+
+    #[test]
+    fn canonical_pdo_republication_is_exact_and_removal_policy_is_derived() {
+        let mut p = PnpManager::new();
+        let pdo = 0x1234;
+        let properties = pci_properties();
+        let id = p
+            .register_enumerated_pdo(r"PCI\VEN_1234&DEV_5678\0001", pdo, properties.clone())
+            .unwrap();
+        assert_eq!(
+            p.register_enumerated_pdo(r"pci\ven_1234&dev_5678\0001", pdo, properties.clone()),
+            Ok(id)
+        );
+        let mut conflicting = properties;
+        conflicting.capabilities.as_mut().unwrap().address = 7;
+        assert_eq!(
+            p.register_enumerated_pdo(r"PCI\VEN_1234&DEV_5678\0001", pdo, conflicting),
+            Err(PnpError::ConflictingPdo)
+        );
+        assert_eq!(
+            p.register_enumerated_pdo("", 1, pci_properties()),
+            Err(PnpError::InvalidIdentity)
+        );
+        assert_eq!(
+            DeviceRemovalPolicy::from_capabilities(&PdoCapabilities {
+                removable: true,
+                eject_supported: true,
+                surprise_removal_ok: false,
+                address: 0,
+            }),
+            DeviceRemovalPolicy::ExpectOrderlyRemoval
+        );
+        assert_eq!(
+            DeviceRemovalPolicy::from_capabilities(&PdoCapabilities {
+                removable: true,
+                eject_supported: false,
+                surprise_removal_ok: true,
+                address: 0,
+            }),
+            DeviceRemovalPolicy::ExpectSurpriseRemoval
+        );
     }
 
     #[test]

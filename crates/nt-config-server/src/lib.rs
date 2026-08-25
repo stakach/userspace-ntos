@@ -14,8 +14,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use nt_config_abi::{
-    opcode, read_utf16, CmDevicePropertyRequest, CmEnumerateKeyRequest, CmKeyRequest,
-    CmRawValueRequest, CmReply, CmValueRequest, CM_ABI_VERSION, CM_MAX_INSTANCE_UNITS,
+    device_property_transfer, opcode, read_utf16, CmDevicePropertyRequest, CmEnumerateKeyRequest,
+    CmKeyRequest, CmRawValueRequest, CmReply, CmValueRequest, CM_ABI_VERSION,
+    CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_MAX_INSTANCE_UNITS,
 };
 use nt_config_manager::{device_property, ConfigManager, DevicePropertySource, RegistryValueType};
 
@@ -25,6 +26,7 @@ const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
 const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
 const STATUS_NO_MORE_ENTRIES: i32 = 0x8000_001Au32 as i32;
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
+const STATUS_INSUFFICIENT_RESOURCES: i32 = 0xC000_009Au32 as i32;
 const STATUS_INVALID_SYSTEM_SERVICE: i32 = 0xC000_001Cu32 as i32;
 const STATUS_NOT_SUPPORTED: i32 = 0xC000_00BBu32 as i32;
 
@@ -61,9 +63,20 @@ fn request_slice(buf: &[u8], offset: u32, len_bytes: u32) -> Option<&[u8]> {
     }
 }
 
+struct DevicePropertySnapshot {
+    token: u64,
+    instance: String,
+    property: u32,
+    output_capacity: u32,
+    value: Vec<u8>,
+    offset: usize,
+}
+
 /// The Configuration Manager service: the registry authority + the wire dispatcher.
 pub struct CmServer {
     cm: ConfigManager,
+    device_property_snapshot: Option<DevicePropertySnapshot>,
+    next_device_property_token: u64,
 }
 
 impl Default for CmServer {
@@ -76,12 +89,18 @@ impl CmServer {
     pub fn new() -> Self {
         Self {
             cm: ConfigManager::new(),
+            device_property_snapshot: None,
+            next_device_property_token: 1,
         }
     }
 
     /// Build a server around an already-seeded Configuration Manager.
     pub fn with_config(cm: ConfigManager) -> Self {
-        Self { cm }
+        Self {
+            cm,
+            device_property_snapshot: None,
+            next_device_property_token: 1,
+        }
     }
 
     /// Direct read access to the registry authority.
@@ -256,6 +275,7 @@ impl CmServer {
         let header_size = core::mem::size_of::<CmDevicePropertyRequest>();
         if req.abi_size as usize != header_size
             || req.abi_version != CM_ABI_VERSION
+            || req._reserved != 0
             || req.instance_offset as usize != header_size
             || req.instance_len_bytes == 0
             || req.instance_len_bytes % 2 != 0
@@ -285,16 +305,103 @@ impl CmServer {
             DevicePropertySource::External => return reply(STATUS_NOT_SUPPORTED, 0),
             DevicePropertySource::Configuration => {}
         }
-        let Some(value) = self.cm.device_property_bytes(&instance, req.property) else {
-            return reply(STATUS_OBJECT_NAME_NOT_FOUND, 0);
-        };
-        let needed = value.len();
-        let capacity = core::cmp::min(req.output_capacity as usize, out_buf.len());
-        if capacity < needed {
-            return reply_with_info(STATUS_BUFFER_TOO_SMALL, needed as u32, 0, 0);
+        let chunk_capacity = req.chunk_capacity as usize;
+        if chunk_capacity > CM_DEVICE_PROPERTY_CHUNK_BYTES
+            || chunk_capacity > out_buf.len()
+            || req.chunk_capacity > req.output_capacity
+        {
+            return reply(STATUS_INVALID_PARAMETER, 0);
         }
-        out_buf[..needed].copy_from_slice(&value);
-        reply_with_info(STATUS_SUCCESS, needed as u32, 0, 0)
+        match req.operation {
+            device_property_transfer::BEGIN => {
+                if req.transfer_token != 0
+                    || req.value_offset != 0
+                    || (req.chunk_capacity == 0 && req.output_capacity != 0)
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let Some(value) = self.cm.device_property_bytes(&instance, req.property) else {
+                    return reply(STATUS_OBJECT_NAME_NOT_FOUND, 0);
+                };
+                let needed = value.len();
+                let Ok(needed_u32) = u32::try_from(needed) else {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                };
+                self.device_property_snapshot = None;
+                if req.output_capacity < needed_u32 {
+                    return reply_with_info(STATUS_BUFFER_TOO_SMALL, 0, needed as u64, 0);
+                }
+                let written = core::cmp::min(needed, chunk_capacity);
+                out_buf[..written].copy_from_slice(&value[..written]);
+                if written == needed {
+                    return reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, 0);
+                }
+                let token = self.next_device_property_token;
+                if token == 0 {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                }
+                self.next_device_property_token = token.checked_add(1).unwrap_or(0);
+                self.device_property_snapshot = Some(DevicePropertySnapshot {
+                    token,
+                    instance,
+                    property: req.property,
+                    output_capacity: req.output_capacity,
+                    value,
+                    offset: written,
+                });
+                reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, token)
+            }
+            device_property_transfer::PULL => {
+                if req.transfer_token == 0 || req.chunk_capacity == 0 {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let Some(snapshot) = self.device_property_snapshot.as_mut() else {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                };
+                if snapshot.token != req.transfer_token
+                    || snapshot.instance != instance
+                    || snapshot.property != req.property
+                    || snapshot.output_capacity != req.output_capacity
+                    || snapshot.offset != req.value_offset as usize
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let needed = snapshot.value.len();
+                let written = core::cmp::min(needed - snapshot.offset, chunk_capacity);
+                let end = snapshot.offset + written;
+                out_buf[..written].copy_from_slice(&snapshot.value[snapshot.offset..end]);
+                snapshot.offset = end;
+                if end == needed {
+                    self.device_property_snapshot = None;
+                }
+                reply_with_info(
+                    STATUS_SUCCESS,
+                    written as u32,
+                    needed as u64,
+                    req.transfer_token,
+                )
+            }
+            device_property_transfer::ABORT => {
+                if req.transfer_token == 0
+                    || req.value_offset != 0
+                    || req.chunk_capacity != 0
+                    || self
+                        .device_property_snapshot
+                        .as_ref()
+                        .is_none_or(|snapshot| {
+                            snapshot.token != req.transfer_token
+                                || snapshot.instance != instance
+                                || snapshot.property != req.property
+                                || snapshot.output_capacity != req.output_capacity
+                        })
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                self.device_property_snapshot = None;
+                reply(STATUS_SUCCESS, 0)
+            }
+            _ => reply(STATUS_INVALID_PARAMETER, 0),
+        }
     }
 }
 
@@ -304,28 +411,58 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::*;
-    use nt_config_abi::{CmDevicePropertyRequest, CM_ABI_VERSION};
+    use nt_config_abi::{device_property_transfer, CmDevicePropertyRequest, CM_ABI_VERSION};
     use nt_config_manager::{encode_sz, ENUM_PATH};
 
     const INSTANCE: &str = r"PCI\VEN_8086&DEV_100E\0001";
 
     fn request(instance: &str, property: u32, output_capacity: u32) -> Vec<u8> {
-        let mut instance_bytes = Vec::new();
-        for unit in instance.encode_utf16() {
-            instance_bytes.extend_from_slice(&unit.to_le_bytes());
-        }
+        let instance_bytes = utf16(instance);
         request_with_bytes(&instance_bytes, property, output_capacity)
     }
 
+    fn utf16(value: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for unit in value.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes
+    }
+
     fn request_with_bytes(instance_bytes: &[u8], property: u32, output_capacity: u32) -> Vec<u8> {
+        request_bank(
+            instance_bytes,
+            property,
+            output_capacity,
+            device_property_transfer::BEGIN,
+            0,
+            0,
+            core::cmp::min(output_capacity, CM_DEVICE_PROPERTY_CHUNK_BYTES as u32),
+        )
+    }
+
+    fn request_bank(
+        instance_bytes: &[u8],
+        property: u32,
+        output_capacity: u32,
+        operation: u16,
+        transfer_token: u64,
+        value_offset: u32,
+        chunk_capacity: u32,
+    ) -> Vec<u8> {
         let header_size = core::mem::size_of::<CmDevicePropertyRequest>();
         let header = CmDevicePropertyRequest {
             abi_size: header_size as u16,
             abi_version: CM_ABI_VERSION,
+            operation,
+            _reserved: 0,
             property,
             output_capacity,
+            value_offset,
+            chunk_capacity,
             instance_offset: header_size as u32,
             instance_len_bytes: instance_bytes.len() as u32,
+            transfer_token,
         };
         let mut bytes = Vec::from(header.as_bytes());
         bytes.extend_from_slice(instance_bytes);
@@ -360,6 +497,8 @@ mod tests {
         );
         assert_eq!(response.status, STATUS_SUCCESS);
         assert_eq!(response.information as usize, expected.len());
+        assert_eq!(response.detail0 as usize, expected.len());
+        assert_eq!(response.detail1, 0);
         assert_eq!(&out[..expected.len()], expected.as_slice());
 
         let small_request = request(INSTANCE, device_property::FRIENDLY_NAME, 2);
@@ -370,7 +509,8 @@ mod tests {
             &mut out,
         );
         assert_eq!(response.status, STATUS_BUFFER_TOO_SMALL);
-        assert_eq!(response.information as usize, expected.len());
+        assert_eq!(response.information, 0);
+        assert_eq!(response.detail0 as usize, expected.len());
         assert!(out.iter().all(|byte| *byte == 0xa5));
 
         let framed_request = request(INSTANCE, device_property::FRIENDLY_NAME, 4096);
@@ -380,8 +520,8 @@ mod tests {
             &framed_request,
             &mut out,
         );
-        assert_eq!(response.status, STATUS_BUFFER_TOO_SMALL);
-        assert_eq!(response.information as usize, expected.len());
+        assert_eq!(response.status, STATUS_INVALID_PARAMETER);
+        assert_eq!(response.information, 0);
         assert_eq!(out, [0xa5; 2]);
     }
 
@@ -493,5 +633,101 @@ mod tests {
                 .status,
             STATUS_INVALID_PARAMETER
         );
+
+        for mutate in [
+            |header: &mut CmDevicePropertyRequest| header._reserved = 1,
+            |header: &mut CmDevicePropertyRequest| header.operation = 0,
+            |header: &mut CmDevicePropertyRequest| header.transfer_token = 1,
+            |header: &mut CmDevicePropertyRequest| header.value_offset = 1,
+            |header: &mut CmDevicePropertyRequest| {
+                header.chunk_capacity = CM_DEVICE_PROPERTY_CHUNK_BYTES as u32 + 1
+            },
+        ] {
+            let mut malformed = valid.clone();
+            let mut header = CmDevicePropertyRequest::from_bytes(&malformed).unwrap();
+            mutate(&mut header);
+            malformed[..core::mem::size_of::<CmDevicePropertyRequest>()]
+                .copy_from_slice(header.as_bytes());
+            assert_eq!(
+                server()
+                    .dispatch(opcode::CM_OP_QUERY_DEVICE_PROPERTY, &malformed, &mut out)
+                    .status,
+                STATUS_INVALID_PARAMETER
+            );
+        }
+    }
+
+    #[test]
+    fn device_property_banks_are_one_immutable_snapshot() {
+        let mut server = server();
+        let original = "A".repeat(3000);
+        let replacement = "B".repeat(3000);
+        let key = server
+            .config_mut()
+            .registry_mut()
+            .create_key(&alloc::format!(r"{}\{}", ENUM_PATH, INSTANCE));
+        server
+            .config_mut()
+            .registry_mut()
+            .set_string(key, "FriendlyName", &original);
+        let expected = encode_sz(&original);
+        let instance_bytes = utf16(INSTANCE);
+        let mut first = [0xa5; CM_DEVICE_PROPERTY_CHUNK_BYTES];
+        let begin = server.dispatch(
+            opcode::CM_OP_QUERY_DEVICE_PROPERTY,
+            &request_bank(
+                &instance_bytes,
+                device_property::FRIENDLY_NAME,
+                expected.len() as u32,
+                device_property_transfer::BEGIN,
+                0,
+                0,
+                CM_DEVICE_PROPERTY_CHUNK_BYTES as u32,
+            ),
+            &mut first,
+        );
+        assert_eq!(begin.status, STATUS_SUCCESS);
+        assert_ne!(begin.detail1, 0);
+        assert_eq!(begin.information as usize, first.len());
+
+        server
+            .config_mut()
+            .registry_mut()
+            .set_string(key, "FriendlyName", &replacement);
+        let tail_len = expected.len() - first.len();
+        let mut tail = vec![0xa5; tail_len];
+        let pull = server.dispatch(
+            opcode::CM_OP_QUERY_DEVICE_PROPERTY,
+            &request_bank(
+                &instance_bytes,
+                device_property::FRIENDLY_NAME,
+                expected.len() as u32,
+                device_property_transfer::PULL,
+                begin.detail1,
+                first.len() as u32,
+                tail_len as u32,
+            ),
+            &mut tail,
+        );
+        assert_eq!(pull.status, STATUS_SUCCESS);
+        assert_eq!(pull.detail1, begin.detail1);
+        let mut assembled = Vec::from(first);
+        assembled.extend_from_slice(&tail);
+        assert_eq!(assembled, expected);
+
+        let stale = server.dispatch(
+            opcode::CM_OP_QUERY_DEVICE_PROPERTY,
+            &request_bank(
+                &instance_bytes,
+                device_property::FRIENDLY_NAME,
+                expected.len() as u32,
+                device_property_transfer::PULL,
+                begin.detail1,
+                expected.len() as u32,
+                1,
+            ),
+            &mut [0u8; 1],
+        );
+        assert_eq!(stale.status, STATUS_INVALID_PARAMETER);
     }
 }

@@ -50,8 +50,10 @@ pub const CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE: u8 = 1;
 pub const CM_RESOURCE_SHARE_DRIVER_EXCLUSIVE: u8 = 2;
 pub const CM_RESOURCE_SHARE_SHARED: u8 = 3;
 
-/// `InterfaceType`.
+/// `InterfaceType` values used by the hosted buses.
 pub const INTERFACE_TYPE_INTERNAL: i32 = 0;
+pub const INTERFACE_TYPE_PCI_BUS: i32 = 5;
+pub const INTERFACE_TYPE_PNP_BUS: i32 = 16;
 
 /// Size of one `CM_PARTIAL_RESOURCE_DESCRIPTOR` (WDK `#pragma pack(4)`).
 pub const PARTIAL_DESCRIPTOR_SIZE: usize = 20;
@@ -106,7 +108,13 @@ pub struct InterruptDescriptor {
     pub share: u8,
 }
 
-fn build_list_header(buf: &mut [u8], total_size: usize, bus_number: u32, count: u32) -> Option<()> {
+fn build_list_header(
+    buf: &mut [u8],
+    total_size: usize,
+    interface_type: i32,
+    bus_number: u32,
+    count: u32,
+) -> Option<()> {
     if buf.len() < total_size {
         return None;
     }
@@ -114,7 +122,7 @@ fn build_list_header(buf: &mut [u8], total_size: usize, bus_number: u32, count: 
         *b = 0;
     }
     w32(buf, 0, 1);
-    w32(buf, 4, INTERFACE_TYPE_INTERNAL as u32);
+    w32(buf, 4, interface_type as u32);
     w32(buf, 8, bus_number);
     w16(buf, 12, 1);
     w16(buf, 14, 1);
@@ -148,8 +156,13 @@ fn write_interrupt_descriptor(buf: &mut [u8], offset: usize, int: InterruptDescr
 }
 
 /// Encode a `CM_RESOURCE_LIST` with a single memory descriptor into `buf`.
-pub fn build_memory_list(buf: &mut [u8], bus_number: u32, mem: MemoryDescriptor) -> Option<usize> {
-    build_list_header(buf, MEMORY_LIST_SIZE, bus_number, 1)?;
+pub fn build_memory_list(
+    buf: &mut [u8],
+    interface_type: i32,
+    bus_number: u32,
+    mem: MemoryDescriptor,
+) -> Option<usize> {
+    build_list_header(buf, MEMORY_LIST_SIZE, interface_type, bus_number, 1)?;
     write_memory_descriptor(buf, 20, mem);
     Some(MEMORY_LIST_SIZE)
 }
@@ -157,11 +170,12 @@ pub fn build_memory_list(buf: &mut [u8], bus_number: u32, mem: MemoryDescriptor)
 /// Encode a `CM_RESOURCE_LIST` with memory + port descriptors into `buf`.
 pub fn build_memory_port_list(
     buf: &mut [u8],
+    interface_type: i32,
     bus_number: u32,
     mem: MemoryDescriptor,
     port: PortDescriptor,
 ) -> Option<usize> {
-    build_list_header(buf, MEMORY_PORT_LIST_SIZE, bus_number, 2)?;
+    build_list_header(buf, MEMORY_PORT_LIST_SIZE, interface_type, bus_number, 2)?;
     write_memory_descriptor(buf, 20, mem);
     write_port_descriptor(buf, 40, port);
     Some(MEMORY_PORT_LIST_SIZE)
@@ -172,11 +186,18 @@ pub fn build_memory_port_list(
 /// the number of bytes written, or `None` if the buffer is too small.
 pub fn build_memory_interrupt_list(
     buf: &mut [u8],
+    interface_type: i32,
     bus_number: u32,
     mem: MemoryDescriptor,
     int: InterruptDescriptor,
 ) -> Option<usize> {
-    build_list_header(buf, MEMORY_INTERRUPT_LIST_SIZE, bus_number, 2)?;
+    build_list_header(
+        buf,
+        MEMORY_INTERRUPT_LIST_SIZE,
+        interface_type,
+        bus_number,
+        2,
+    )?;
     write_memory_descriptor(buf, 20, mem);
     write_interrupt_descriptor(buf, 40, int);
     Some(MEMORY_INTERRUPT_LIST_SIZE)
@@ -186,12 +207,19 @@ pub fn build_memory_interrupt_list(
 /// `buf` (which must be at least [`MEMORY_PORT_INTERRUPT_LIST_SIZE`] bytes).
 pub fn build_memory_port_interrupt_list(
     buf: &mut [u8],
+    interface_type: i32,
     bus_number: u32,
     mem: MemoryDescriptor,
     port: PortDescriptor,
     int: InterruptDescriptor,
 ) -> Option<usize> {
-    build_list_header(buf, MEMORY_PORT_INTERRUPT_LIST_SIZE, bus_number, 3)?;
+    build_list_header(
+        buf,
+        MEMORY_PORT_INTERRUPT_LIST_SIZE,
+        interface_type,
+        bus_number,
+        3,
+    )?;
     write_memory_descriptor(buf, 20, mem);
     write_port_descriptor(buf, 40, port);
     write_interrupt_descriptor(buf, 60, int);
@@ -199,8 +227,13 @@ pub fn build_memory_port_interrupt_list(
 }
 
 /// Encode a `CM_RESOURCE_LIST` with a single I/O-port descriptor into `buf`.
-pub fn build_port_list(buf: &mut [u8], bus_number: u32, port: PortDescriptor) -> Option<usize> {
-    build_list_header(buf, PORT_LIST_SIZE, bus_number, 1)?;
+pub fn build_port_list(
+    buf: &mut [u8],
+    interface_type: i32,
+    bus_number: u32,
+    port: PortDescriptor,
+) -> Option<usize> {
+    build_list_header(buf, PORT_LIST_SIZE, interface_type, bus_number, 1)?;
     write_port_descriptor(buf, 20, port);
     Some(PORT_LIST_SIZE)
 }
@@ -208,11 +241,12 @@ pub fn build_port_list(buf: &mut [u8], bus_number: u32, port: PortDescriptor) ->
 /// Encode a `CM_RESOURCE_LIST` with port + interrupt descriptors into `buf`.
 pub fn build_port_interrupt_list(
     buf: &mut [u8],
+    interface_type: i32,
     bus_number: u32,
     port: PortDescriptor,
     int: InterruptDescriptor,
 ) -> Option<usize> {
-    build_list_header(buf, PORT_INTERRUPT_LIST_SIZE, bus_number, 2)?;
+    build_list_header(buf, PORT_INTERRUPT_LIST_SIZE, interface_type, bus_number, 2)?;
     write_port_descriptor(buf, 20, port);
     write_interrupt_descriptor(buf, 40, int);
     Some(PORT_INTERRUPT_LIST_SIZE)
@@ -359,6 +393,7 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = build_memory_interrupt_list(
             &mut buf,
+            INTERFACE_TYPE_INTERNAL,
             0,
             MemoryDescriptor {
                 start: 0x1000_0000,
@@ -390,6 +425,7 @@ mod tests {
         let mut buf = [0xCCu8; MEMORY_LIST_SIZE];
         let n = build_memory_list(
             &mut buf,
+            INTERFACE_TYPE_INTERNAL,
             2,
             MemoryDescriptor {
                 start: 0xE000_0000,
@@ -416,6 +452,7 @@ mod tests {
         let mut buf = [0xCCu8; MEMORY_PORT_LIST_SIZE];
         let n = build_memory_port_list(
             &mut buf,
+            INTERFACE_TYPE_INTERNAL,
             0,
             MemoryDescriptor {
                 start: 0xE000_0000,
@@ -444,6 +481,7 @@ mod tests {
         let mut buf = [0u8; MEMORY_PORT_INTERRUPT_LIST_SIZE];
         let n = build_memory_port_interrupt_list(
             &mut buf,
+            INTERFACE_TYPE_INTERNAL,
             0,
             MemoryDescriptor {
                 start: 0xFEBC_0000,
@@ -483,6 +521,7 @@ mod tests {
         let mut buf = [0u8; PORT_INTERRUPT_LIST_SIZE];
         let n = build_port_interrupt_list(
             &mut buf,
+            INTERFACE_TYPE_INTERNAL,
             0,
             PortDescriptor {
                 start: 0x6000,
@@ -517,6 +556,7 @@ mod tests {
         let mut buf = [0u8; 60];
         build_memory_interrupt_list(
             &mut buf,
+            INTERFACE_TYPE_INTERNAL,
             7,
             MemoryDescriptor {
                 start: 0xDEAD_BEEF,
@@ -560,6 +600,7 @@ mod tests {
         let mut small = [0u8; 32];
         assert!(build_memory_interrupt_list(
             &mut small,
+            INTERFACE_TYPE_INTERNAL,
             0,
             MemoryDescriptor {
                 start: 0,
@@ -579,6 +620,7 @@ mod tests {
         assert!(decode_memory_interrupt_list(&small).is_none());
         assert!(build_memory_port_interrupt_list(
             &mut small,
+            INTERFACE_TYPE_INTERNAL,
             0,
             MemoryDescriptor {
                 start: 0,
@@ -604,6 +646,7 @@ mod tests {
         assert!(decode_memory_port_interrupt_list(&small).is_none());
         assert!(build_port_interrupt_list(
             &mut small,
+            INTERFACE_TYPE_INTERNAL,
             0,
             PortDescriptor {
                 start: 0,

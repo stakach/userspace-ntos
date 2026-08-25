@@ -31,9 +31,10 @@ use alloc::vec::Vec;
 pub use nt_cm_resources::{
     InterruptDescriptor, MemoryDescriptor, PortDescriptor, CM_RESOURCE_INTERRUPT_LATCHED,
     CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE, CM_RESOURCE_MEMORY_READ_WRITE, CM_RESOURCE_PORT_BAR,
-    CM_RESOURCE_PORT_IO, CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE, MEMORY_INTERRUPT_LIST_SIZE,
-    MEMORY_LIST_SIZE, MEMORY_PORT_INTERRUPT_LIST_SIZE, MEMORY_PORT_LIST_SIZE,
-    PORT_INTERRUPT_LIST_SIZE, PORT_LIST_SIZE,
+    CM_RESOURCE_PORT_IO, CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE, INTERFACE_TYPE_PCI_BUS,
+    INTERFACE_TYPE_PNP_BUS, MEMORY_INTERRUPT_LIST_SIZE, MEMORY_LIST_SIZE,
+    MEMORY_PORT_INTERRUPT_LIST_SIZE, MEMORY_PORT_LIST_SIZE, PORT_INTERRUPT_LIST_SIZE,
+    PORT_LIST_SIZE,
 };
 
 /// PCI configuration-space register offsets (byte offsets, dword-aligned).
@@ -745,6 +746,7 @@ pub const ASSIGNMENT_CM_LIST_MAX_SIZE: usize = MEMORY_PORT_INTERRUPT_LIST_SIZE;
 /// descriptors. Returns the byte length written.
 pub fn assignment_to_cm_list(
     buf: &mut [u8],
+    interface_type: i32,
     bus_number: u32,
     assign: &ResourceAssignment,
     memory_start: u64,
@@ -774,20 +776,29 @@ pub fn assignment_to_cm_list(
         share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
     });
     match (mem, port, int) {
-        (Some(mem), Some(port), Some(int)) => {
-            nt_cm_resources::build_memory_port_interrupt_list(buf, bus_number, mem, port, int)
-        }
+        (Some(mem), Some(port), Some(int)) => nt_cm_resources::build_memory_port_interrupt_list(
+            buf,
+            interface_type,
+            bus_number,
+            mem,
+            port,
+            int,
+        ),
         (Some(mem), Some(port), None) => {
-            nt_cm_resources::build_memory_port_list(buf, bus_number, mem, port)
+            nt_cm_resources::build_memory_port_list(buf, interface_type, bus_number, mem, port)
         }
         (Some(mem), None, Some(int)) => {
-            nt_cm_resources::build_memory_interrupt_list(buf, bus_number, mem, int)
+            nt_cm_resources::build_memory_interrupt_list(buf, interface_type, bus_number, mem, int)
         }
-        (Some(mem), None, None) => nt_cm_resources::build_memory_list(buf, bus_number, mem),
+        (Some(mem), None, None) => {
+            nt_cm_resources::build_memory_list(buf, interface_type, bus_number, mem)
+        }
         (None, Some(port), Some(int)) => {
-            nt_cm_resources::build_port_interrupt_list(buf, bus_number, port, int)
+            nt_cm_resources::build_port_interrupt_list(buf, interface_type, bus_number, port, int)
         }
-        (None, Some(port), None) => nt_cm_resources::build_port_list(buf, bus_number, port),
+        (None, Some(port), None) => {
+            nt_cm_resources::build_port_list(buf, interface_type, bus_number, port)
+        }
         (None, None, _) => None,
     }
 }
@@ -1147,7 +1158,15 @@ mod tests {
         // the translated vector.
         let mut buf = [0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
         let memory_start = 0xFEBC_0000u64;
-        let n = assignment_to_cm_list(&mut buf, 0, &assign, memory_start, 0x2_0000).unwrap();
+        let n = assignment_to_cm_list(
+            &mut buf,
+            INTERFACE_TYPE_PCI_BUS,
+            0,
+            &assign,
+            memory_start,
+            0x2_0000,
+        )
+        .unwrap();
         assert_eq!(n, MEMORY_PORT_INTERRUPT_LIST_SIZE);
         let (mem, port, int) = nt_cm_resources::decode_memory_port_interrupt_list(&buf).unwrap();
         assert_eq!(mem.start, memory_start);
@@ -1175,7 +1194,7 @@ mod tests {
         assert_eq!(assign.io_port_len, 0x40);
 
         let mut buf = [0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
-        let n = assignment_to_cm_list(&mut buf, 0, &assign, 0, 0).unwrap();
+        let n = assignment_to_cm_list(&mut buf, INTERFACE_TYPE_PCI_BUS, 0, &assign, 0, 0).unwrap();
         assert_eq!(n, PORT_INTERRUPT_LIST_SIZE);
         let (port, int) = nt_cm_resources::decode_port_interrupt_list(&buf).unwrap();
         assert_eq!(port.start, 0xC000);
@@ -1220,7 +1239,7 @@ mod tests {
         assert_eq!(assign.dma_len, 0x1000);
 
         let mut buf = [0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
-        let n = assignment_to_cm_list(&mut buf, 0, &assign, 0, 0).unwrap();
+        let n = assignment_to_cm_list(&mut buf, INTERFACE_TYPE_PCI_BUS, 0, &assign, 0, 0).unwrap();
         assert_eq!(n, PORT_INTERRUPT_LIST_SIZE);
         let (port, int) = nt_cm_resources::decode_port_interrupt_list(&buf).unwrap();
         assert_eq!(port.start, 0x6000);
@@ -1255,7 +1274,15 @@ mod tests {
         assert_eq!(assign.dma_len, 0);
 
         let mut buf = [0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
-        let n = assignment_to_cm_list(&mut buf, 0, &assign, assign.mmio_phys, 0x1000).unwrap();
+        let n = assignment_to_cm_list(
+            &mut buf,
+            INTERFACE_TYPE_PCI_BUS,
+            0,
+            &assign,
+            assign.mmio_phys,
+            0x1000,
+        )
+        .unwrap();
         assert_eq!(n, MEMORY_PORT_LIST_SIZE);
         assert_eq!(u32::from_le_bytes(buf[16..20].try_into().unwrap()), 2);
         assert_eq!(buf[20], nt_cm_resources::CM_RESOURCE_TYPE_MEMORY);

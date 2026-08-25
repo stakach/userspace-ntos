@@ -336,6 +336,21 @@ impl<P> IoManager<P> {
         self.device(id).map(|_| id)
     }
 
+    /// Resolve a hosted DeviceObject projection only when the generation-bearing domain id and
+    /// the independently carried cookie both identify the current live address space.
+    pub fn hosted_device_by_identity(
+        &self,
+        identity: HostedDomainIdentity,
+        address: u64,
+    ) -> Option<DeviceId> {
+        let record = self.hosted_domains.get(identity.domain_id)?;
+        if identity.cookie == 0 || record.cookie != identity.cookie {
+            return None;
+        }
+        let id = resolve(&record.devices, address)?;
+        self.device(id).map(|_| id)
+    }
+
     pub fn hosted_file_by_address(&self, domain: HostedDomainId, address: u64) -> Option<FileId> {
         let id = resolve(&self.hosted_domains.get(domain)?.files, address)?;
         self.file(id).map(|_| id)
@@ -367,8 +382,8 @@ mod tests {
     use nt_types::{AccessMask, NtPath};
 
     use crate::{
-        CreateOptions, DeviceCharacteristics, DeviceFlags, DeviceType, IoManager,
-        MockDriverBackend, MockObjectPort, ShareAccess,
+        CreateOptions, DeviceCharacteristics, DeviceFlags, DeviceType, HostedDomainIdentity,
+        IoManager, MockDriverBackend, MockObjectPort, ShareAccess,
     };
 
     fn path(value: &str) -> NtPath {
@@ -438,11 +453,40 @@ mod tests {
             io.hosted_device_by_address(second, shared_address + 8),
             Some(second_device)
         );
+        let first_identity = io.hosted_domain_identity(first).unwrap();
+        assert_eq!(
+            io.hosted_device_by_identity(first_identity, shared_address + 8),
+            Some(first_device)
+        );
+        assert_eq!(
+            io.hosted_device_by_identity(
+                HostedDomainIdentity {
+                    cookie: first_identity.cookie.wrapping_add(1),
+                    ..first_identity
+                },
+                shared_address + 8,
+            ),
+            None
+        );
+        assert_eq!(
+            io.hosted_device_by_identity(
+                HostedDomainIdentity {
+                    cookie: 0,
+                    ..first_identity
+                },
+                shared_address + 8,
+            ),
+            None
+        );
 
         let stale = first;
         let stale_cookie = io.hosted_domain(stale).unwrap().cookie();
         assert!(io.unregister_hosted_domain(stale));
         assert_eq!(io.hosted_driver_by_address(stale, shared_address), None);
+        assert_eq!(
+            io.hosted_device_by_identity(first_identity, shared_address + 8),
+            None
+        );
         let replacement = io.register_hosted_domain();
         assert_eq!(replacement.slot(), stale.slot());
         assert_ne!(replacement.generation(), stale.generation());

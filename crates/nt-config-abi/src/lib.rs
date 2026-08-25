@@ -11,8 +11,10 @@
 /// The Configuration Manager's SURT opcode range.
 pub const CM_OPCODE_MIN: u16 = 0x2100;
 pub const CM_OPCODE_MAX: u16 = 0x21ff;
-pub const CM_ABI_VERSION: u16 = 1;
+pub const CM_ABI_VERSION: u16 = 2;
 pub const CM_MAX_INSTANCE_UNITS: usize = 512;
+/// Maximum property payload carried by one SURT completion frame.
+pub const CM_DEVICE_PROPERTY_CHUNK_BYTES: usize = 4096;
 
 pub mod opcode {
     pub const CM_OP_PING: u16 = 0x2100;
@@ -32,6 +34,14 @@ pub mod opcode {
     pub const CM_OP_ENUMERATE_KEY: u16 = 0x2130;
     /// Query one legacy device property by stable devnode instance path.
     pub const CM_OP_QUERY_DEVICE_PROPERTY: u16 = 0x2140;
+}
+
+/// Operation carried by [`CmDevicePropertyRequest::operation`]. Property values are immutable for
+/// the lifetime of one begin/pull sequence; abort releases an incomplete snapshot.
+pub mod device_property_transfer {
+    pub const BEGIN: u16 = 1;
+    pub const PULL: u16 = 2;
+    pub const ABORT: u16 = 3;
 }
 
 /// The reply every Configuration Manager op returns (field-for-field over `SurtCqe`).
@@ -96,18 +106,23 @@ pub struct CmRawValueRequest {
     pub data_len_bytes: u32,
 }
 
-/// `query_device_property`: a stable devnode instance path followed by the caller's real output
-/// capacity. The capacity is carried explicitly because an isolated server sees the whole shared
-/// reply frame rather than the caller's final slice.
+/// `query_device_property`: a stable devnode instance path plus one bank of the caller's logical
+/// output. The logical capacity is separate from the chunk capacity because an isolated server
+/// sees one shared reply frame rather than the caller's final buffer.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CmDevicePropertyRequest {
     pub abi_size: u16,
     pub abi_version: u16,
+    pub operation: u16,
+    pub _reserved: u16,
     pub property: u32,
     pub output_capacity: u32,
+    pub value_offset: u32,
+    pub chunk_capacity: u32,
     pub instance_offset: u32,
     pub instance_len_bytes: u32,
+    pub transfer_token: u64,
 }
 
 macro_rules! wire {
@@ -161,21 +176,27 @@ mod tests {
     fn device_property_request_has_stable_wire_layout() {
         assert_eq!(opcode::CM_OP_QUERY_DEVICE_PROPERTY, 0x2140);
         assert!((CM_OPCODE_MIN..=CM_OPCODE_MAX).contains(&opcode::CM_OP_QUERY_DEVICE_PROPERTY));
-        assert_eq!(core::mem::size_of::<CmDevicePropertyRequest>(), 20);
+        assert_eq!(core::mem::size_of::<CmDevicePropertyRequest>(), 40);
 
         let request = CmDevicePropertyRequest {
-            abi_size: 20,
+            abi_size: 40,
             abi_version: CM_ABI_VERSION,
+            operation: device_property_transfer::PULL,
+            _reserved: 0,
             property: 0x1122_3344,
             output_capacity: 0x5566_7788,
-            instance_offset: 20,
+            value_offset: 0x99aa_bbcc,
+            chunk_capacity: 0xddee_ff00,
+            instance_offset: 40,
             instance_len_bytes: 0x99aa_bbcc,
+            transfer_token: 0x1122_3344_5566_7788,
         };
         assert_eq!(
             request.as_bytes(),
             &[
-                20, 0, 1, 0, 0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 20, 0, 0, 0, 0xcc,
-                0xbb, 0xaa, 0x99,
+                40, 0, 2, 0, 2, 0, 0, 0, 0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 0xcc,
+                0xbb, 0xaa, 0x99, 0x00, 0xff, 0xee, 0xdd, 40, 0, 0, 0, 0xcc, 0xbb, 0xaa, 0x99,
+                0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
             ]
         );
         assert_eq!(

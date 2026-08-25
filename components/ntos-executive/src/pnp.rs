@@ -41,17 +41,19 @@ pub(crate) unsafe fn enumerate_pci_bus0(pci_io: u64) -> alloc::vec::Vec<PciDevic
     )
 }
 
-/// The PCI function and translated START resource bytes selected for one registry devnode.
+/// The PCI function and raw/translated START resource bytes selected for one registry devnode.
 pub(crate) struct DevnodePciResourceGrant {
     pub device: PciDevice,
     pub assignment: ResourceAssignment,
-    pub resource_list: Vec<u8>,
+    pub raw_resource_list: Vec<u8>,
+    pub translated_resource_list: Vec<u8>,
 }
 
-/// The root-bus profile and translated START resource bytes selected for one registry devnode.
+/// The root-bus profile and raw/translated START resource bytes selected for one registry devnode.
 pub(crate) struct DevnodeRootResourceGrant {
     pub assignment: ResourceAssignment,
-    pub resource_list: Vec<u8>,
+    pub raw_resource_list: Vec<u8>,
+    pub translated_resource_list: Vec<u8>,
 }
 
 pub(crate) fn root_bus_resource_profile_for_devnode<H, C>(
@@ -105,19 +107,40 @@ pub(crate) fn build_devnode_pci_resource_grant(
         dma_len,
         granted_mmio_len,
     )?;
-    let mut resource_list = vec![0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
+    let mut translated_resource_list = vec![0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
     let n = assignment_to_cm_list(
-        &mut resource_list,
+        &mut translated_resource_list,
+        nt_pnp::INTERFACE_TYPE_PCI_BUS,
         device.bus as u32,
         &assignment,
         assignment.mmio_phys,
         assignment.mmio_len as u32,
     )?;
-    resource_list.truncate(n);
+    translated_resource_list.truncate(n);
+    let raw_assignment = ResourceAssignment {
+        int_vector: if assignment.int_vector != 0 && device.irq_line != u8::MAX {
+            device.irq_line as u32
+        } else {
+            0
+        },
+        int_affinity: 0,
+        ..assignment
+    };
+    let mut raw_resource_list = vec![0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
+    let raw_len = assignment_to_cm_list(
+        &mut raw_resource_list,
+        nt_pnp::INTERFACE_TYPE_PCI_BUS,
+        device.bus as u32,
+        &raw_assignment,
+        raw_assignment.mmio_phys,
+        raw_assignment.mmio_len as u32,
+    )?;
+    raw_resource_list.truncate(raw_len);
     Some(DevnodePciResourceGrant {
         device: device.clone(),
         assignment,
-        resource_list,
+        raw_resource_list,
+        translated_resource_list,
     })
 }
 
@@ -152,17 +175,19 @@ where
         return None;
     }
     assignment.mmio_len = mmio_len;
-    let mut resource_list = vec![0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
+    let mut translated_resource_list = vec![0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
     let n = assignment_to_cm_list(
-        &mut resource_list,
+        &mut translated_resource_list,
+        nt_pnp::INTERFACE_TYPE_PNP_BUS,
         0,
         &assignment,
         assignment.mmio_phys,
         assignment.mmio_len as u32,
     )?;
-    resource_list.truncate(n);
+    translated_resource_list.truncate(n);
     Some(DevnodeRootResourceGrant {
         assignment,
-        resource_list,
+        raw_resource_list: translated_resource_list.clone(),
+        translated_resource_list,
     })
 }

@@ -2004,6 +2004,29 @@ unsafe fn component_pump_loop(
             );
             pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
             continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_DEVICE_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, required_len, transfer_token, chunk_len) =
+                crate::driver_launch::service_hosted_device(
+                ch,
+                msg.m0,
+                msg.m1,
+                msg.m2,
+                msg.m3,
+                    *reply_cap,
+                );
+            pump_reply_recv4_into!(
+                ch,
+                *reply_cap,
+                msg,
+                4,
+                status as u32 as u64,
+                required_len,
+                transfer_token,
+                chunk_len
+            );
+            continue;
         } else if label == crate::driver_launch::FSD_SERVICE_KE_PULSE_EVENT_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
