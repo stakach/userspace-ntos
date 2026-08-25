@@ -27,6 +27,7 @@ nt-config-manager = { path = "../../crates/nt-config-manager" }
 nt-pnp-manager = { path = "../../crates/nt-pnp-manager" }
 nt-pnp-abi = { path = "../../crates/nt-pnp-abi" }
 nt-root-bus = { path = "../../crates/nt-root-bus" }
+nt-io-abi = { path = "../../crates/nt-io-abi" }
 
 [profile.release]
 panic = "abort"

@@ -18,6 +18,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use nt_io_abi::DeviceId;
 
 /// The ID class an `IRP_MN_QUERY_ID` requests (`BusQueryId`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,8 +92,8 @@ impl DeviceCapabilities {
 /// A physical device object the root bus created for one devnode.
 #[derive(Clone, Debug)]
 pub struct Pdo {
-    /// The device-object identity the PnP Manager tracks (the PDO handle).
-    pub object_id: u64,
+    /// The canonical I/O Manager identity of this PDO.
+    pub canonical_id: DeviceId,
     /// `BusQueryDeviceID`.
     pub device_id: String,
     /// `BusQueryHardwareIDs`.
@@ -111,8 +112,10 @@ pub struct Pdo {
 /// Invalid identity material for a root-bus PDO.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RootBusPdoError {
-    /// The caller did not supply a PDO object identity.
-    ZeroObjectId,
+    /// The caller did not supply a canonical PDO identity.
+    NullCanonicalDeviceId,
+    /// The bus already owns this canonical PDO identity.
+    DuplicateCanonicalDeviceId,
     /// `BusQueryDeviceID` would be empty.
     EmptyDeviceId,
     /// `BusQueryInstanceID` would be empty.
@@ -160,7 +163,7 @@ impl RootBus {
 
     /// Validate the identity a real PnP root PDO will publish through `IRP_MN_QUERY_ID`.
     pub fn validate_pdo_identity<H, C>(
-        object_id: u64,
+        canonical_id: DeviceId,
         device_id: &str,
         hardware_ids: &[H],
         compatible_ids: &[C],
@@ -170,8 +173,8 @@ impl RootBus {
         H: AsRef<str>,
         C: AsRef<str>,
     {
-        if object_id == 0 {
-            return Err(RootBusPdoError::ZeroObjectId);
+        if canonical_id.is_null() {
+            return Err(RootBusPdoError::NullCanonicalDeviceId);
         }
         if device_id.is_empty() {
             return Err(RootBusPdoError::EmptyDeviceId);
@@ -199,48 +202,28 @@ impl RootBus {
     /// directly when constructing intentionally minimal fixtures.
     pub fn try_create_pdo<H, C>(
         &mut self,
-        object_id: u64,
+        canonical_id: DeviceId,
         device_id: &str,
         hardware_ids: &[H],
         compatible_ids: &[C],
         instance_id: &str,
-    ) -> Result<u64, RootBusPdoError>
+    ) -> Result<DeviceId, RootBusPdoError>
     where
         H: AsRef<str>,
         C: AsRef<str>,
     {
         Self::validate_pdo_identity(
-            object_id,
+            canonical_id,
             device_id,
             hardware_ids,
             compatible_ids,
             instance_id,
         )?;
-        Ok(self.create_pdo(
-            object_id,
-            device_id,
-            hardware_ids,
-            compatible_ids,
-            instance_id,
-        ))
-    }
-
-    /// Enumerate a child: create a PDO with the given identity + default capabilities. Returns the
-    /// PDO's `object_id`.
-    pub fn create_pdo<H, C>(
-        &mut self,
-        object_id: u64,
-        device_id: &str,
-        hardware_ids: &[H],
-        compatible_ids: &[C],
-        instance_id: &str,
-    ) -> u64
-    where
-        H: AsRef<str>,
-        C: AsRef<str>,
-    {
+        if self.pdo(canonical_id).is_some() {
+            return Err(RootBusPdoError::DuplicateCanonicalDeviceId);
+        }
         self.pdos.push(Pdo {
-            object_id,
+            canonical_id,
             device_id: device_id.into(),
             hardware_ids: hardware_ids.iter().map(|s| s.as_ref().into()).collect(),
             compatible_ids: compatible_ids.iter().map(|s| s.as_ref().into()).collect(),
@@ -248,12 +231,49 @@ impl RootBus {
             capabilities: DeviceCapabilities::root_default(),
             started: false,
         });
-        object_id
+        Ok(canonical_id)
     }
 
-    /// The PDO with `object_id`, if the bus enumerated it.
-    pub fn pdo(&self, object_id: u64) -> Option<&Pdo> {
-        self.pdos.iter().find(|p| p.object_id == object_id)
+    /// Enumerate a child with a canonical I/O Manager identity and default capabilities.
+    pub fn create_pdo<H, C>(
+        &mut self,
+        canonical_id: DeviceId,
+        device_id: &str,
+        hardware_ids: &[H],
+        compatible_ids: &[C],
+        instance_id: &str,
+    ) -> Result<DeviceId, RootBusPdoError>
+    where
+        H: AsRef<str>,
+        C: AsRef<str>,
+    {
+        self.try_create_pdo(
+            canonical_id,
+            device_id,
+            hardware_ids,
+            compatible_ids,
+            instance_id,
+        )
+    }
+
+    /// The PDO with `canonical_id`, if the bus enumerated it.
+    pub fn pdo(&self, canonical_id: DeviceId) -> Option<&Pdo> {
+        self.pdos
+            .iter()
+            .find(|pdo| pdo.canonical_id == canonical_id)
+    }
+
+    /// Remove one exact canonical PDO from the bus.
+    pub fn remove_pdo(&mut self, canonical_id: DeviceId) -> bool {
+        let Some(index) = self
+            .pdos
+            .iter()
+            .position(|pdo| pdo.canonical_id == canonical_id)
+        else {
+            return false;
+        };
+        self.pdos.swap_remove(index);
+        true
     }
 
     /// Number of enumerated children.
@@ -269,8 +289,8 @@ impl RootBus {
     /// Answer `IRP_MN_QUERY_ID` for a PDO: a wide (UTF-16) buffer. `DeviceId`/`InstanceId` is one
     /// NUL-terminated string; `HardwareIds`/`CompatibleIds` is a double-NUL-terminated multi-SZ.
     /// Returns `None` if the PDO is unknown.
-    pub fn query_id(&self, object_id: u64, kind: BusQueryId) -> Option<Vec<u16>> {
-        let pdo = self.pdo(object_id)?;
+    pub fn query_id(&self, canonical_id: DeviceId, kind: BusQueryId) -> Option<Vec<u16>> {
+        let pdo = self.pdo(canonical_id)?;
         Some(match kind {
             BusQueryId::DeviceId => wide_z(&pdo.device_id),
             BusQueryId::InstanceId => wide_z(&pdo.instance_id),
@@ -280,21 +300,25 @@ impl RootBus {
     }
 
     /// Answer `IRP_MN_QUERY_CAPABILITIES` for a PDO.
-    pub fn query_capabilities(&self, object_id: u64) -> Option<&DeviceCapabilities> {
-        self.pdo(object_id).map(|p| &p.capabilities)
+    pub fn query_capabilities(&self, canonical_id: DeviceId) -> Option<&DeviceCapabilities> {
+        self.pdo(canonical_id).map(|p| &p.capabilities)
     }
 
     /// Answer `IRP_MN_QUERY_DEVICE_RELATIONS(BusRelations)`: the object IDs of every child PDO the
     /// bus has enumerated — the root of the device tree reporting its children.
-    pub fn query_device_relations(&self) -> Vec<u64> {
-        self.pdos.iter().map(|p| p.object_id).collect()
+    pub fn query_device_relations(&self) -> Vec<DeviceId> {
+        self.pdos.iter().map(|p| p.canonical_id).collect()
     }
 
     /// The PDO's PnP dispatch — the bottom of the device stack. A function driver's framework PnP
     /// handler forwards `IRP_MN_START_DEVICE` / `IRP_MN_REMOVE_DEVICE` down to here; the bus starts
     /// or stops the PDO and completes the IRP. Returns the `NTSTATUS`.
-    pub fn dispatch_pnp(&mut self, object_id: u64, minor: u8) -> i32 {
-        let Some(pdo) = self.pdos.iter_mut().find(|p| p.object_id == object_id) else {
+    pub fn dispatch_pnp(&mut self, canonical_id: DeviceId, minor: u8) -> i32 {
+        let Some(pdo) = self
+            .pdos
+            .iter_mut()
+            .find(|pdo| pdo.canonical_id == canonical_id)
+        else {
             return STATUS_NO_SUCH_DEVICE;
         };
         match minor {
@@ -315,8 +339,8 @@ impl RootBus {
     }
 
     /// Whether the bus has started this PDO.
-    pub fn pdo_started(&self, object_id: u64) -> bool {
-        self.pdo(object_id).map(|p| p.started).unwrap_or(false)
+    pub fn pdo_started(&self, canonical_id: DeviceId) -> bool {
+        self.pdo(canonical_id).map(|p| p.started).unwrap_or(false)
     }
 }
 
@@ -355,22 +379,25 @@ fn multi_sz(items: &[String]) -> Vec<u16> {
 mod tests {
     use super::*;
 
+    const PRIMARY_PDO: DeviceId = DeviceId::new(1, 1);
+
     fn bus() -> RootBus {
         let mut b = RootBus::new();
         b.create_pdo(
-            0xFED0_0000,
+            PRIMARY_PDO,
             r"ROOT\KMDF_LOADER_COMPAT_TEST",
             &[r"ROOT\KMDF_LOADER_COMPAT_TEST"],
             &[r"ROOT\USERSPACE_NTOS_TEST_DEVICE"],
             "0001",
-        );
+        )
+        .unwrap();
         b
     }
 
     #[test]
     fn device_id_is_nul_terminated_wide() {
         let b = bus();
-        let id = b.query_id(0xFED0_0000, BusQueryId::DeviceId).unwrap();
+        let id = b.query_id(PRIMARY_PDO, BusQueryId::DeviceId).unwrap();
         assert_eq!(*id.last().unwrap(), 0);
         let s = String::from_utf16(&id[..id.len() - 1]).unwrap();
         assert_eq!(s, r"ROOT\KMDF_LOADER_COMPAT_TEST");
@@ -379,7 +406,7 @@ mod tests {
     #[test]
     fn hardware_ids_are_double_nul_multi_sz() {
         let b = bus();
-        let m = b.query_id(0xFED0_0000, BusQueryId::HardwareIds).unwrap();
+        let m = b.query_id(PRIMARY_PDO, BusQueryId::HardwareIds).unwrap();
         // one entry -> "<id>\0\0"
         assert_eq!(m[m.len() - 1], 0);
         assert_eq!(m[m.len() - 2], 0);
@@ -390,9 +417,9 @@ mod tests {
     #[test]
     fn instance_id_and_caps() {
         let b = bus();
-        let inst = b.query_id(0xFED0_0000, BusQueryId::InstanceId).unwrap();
+        let inst = b.query_id(PRIMARY_PDO, BusQueryId::InstanceId).unwrap();
         assert_eq!(String::from_utf16(&inst[..inst.len() - 1]).unwrap(), "0001");
-        let caps = b.query_capabilities(0xFED0_0000).unwrap();
+        let caps = b.query_capabilities(PRIMARY_PDO).unwrap();
         assert_eq!(caps.version, 1);
         assert_eq!(caps.device_state[0], 1); // S0 -> D0
         assert_eq!(caps.device_state[5], 4); // S5 -> D3
@@ -402,54 +429,62 @@ mod tests {
     #[test]
     fn unknown_pdo_returns_none() {
         let b = bus();
-        assert!(b.query_id(0xDEAD, BusQueryId::DeviceId).is_none());
-        assert!(b.query_capabilities(0xDEAD).is_none());
+        assert!(b
+            .query_id(DeviceId::new(1, 99), BusQueryId::DeviceId)
+            .is_none());
+        assert!(b.query_capabilities(DeviceId::new(1, 99)).is_none());
     }
 
     #[test]
     fn bus_relations_lists_all_children() {
         let mut b = RootBus::new();
         let empty: [&str; 0] = [];
-        b.create_pdo(0x1000, r"ROOT\A", &[r"ROOT\A"], &empty, "0001");
-        b.create_pdo(0x2000, r"ROOT\B", &[r"ROOT\B"], &empty, "0001");
-        b.create_pdo(0x3000, r"ROOT\C", &[r"ROOT\C"], &empty, "0001");
+        let a = DeviceId::new(1, 1);
+        let b_id = DeviceId::new(1, 2);
+        let c = DeviceId::new(1, 3);
+        b.create_pdo(a, r"ROOT\A", &[r"ROOT\A"], &empty, "0001")
+            .unwrap();
+        b.create_pdo(b_id, r"ROOT\B", &[r"ROOT\B"], &empty, "0001")
+            .unwrap();
+        b.create_pdo(c, r"ROOT\C", &[r"ROOT\C"], &empty, "0001")
+            .unwrap();
         let rel = b.query_device_relations();
-        assert_eq!(rel, alloc::vec![0x1000, 0x2000, 0x3000]);
+        assert_eq!(rel, alloc::vec![a, b_id, c]);
         assert_eq!(b.len(), 3);
     }
 
     #[test]
     fn pdo_start_remove_dispatch() {
         let mut b = bus();
-        assert!(!b.pdo_started(0xFED0_0000));
-        assert_eq!(b.dispatch_pnp(0xFED0_0000, IRP_MN_START_DEVICE), 0);
-        assert!(b.pdo_started(0xFED0_0000));
-        assert_eq!(b.dispatch_pnp(0xFED0_0000, IRP_MN_REMOVE_DEVICE), 0);
-        assert!(!b.pdo_started(0xFED0_0000));
-        assert_ne!(b.dispatch_pnp(0xDEAD, IRP_MN_START_DEVICE), 0); // unknown PDO
+        assert!(!b.pdo_started(PRIMARY_PDO));
+        assert_eq!(b.dispatch_pnp(PRIMARY_PDO, IRP_MN_START_DEVICE), 0);
+        assert!(b.pdo_started(PRIMARY_PDO));
+        assert_eq!(b.dispatch_pnp(PRIMARY_PDO, IRP_MN_REMOVE_DEVICE), 0);
+        assert!(!b.pdo_started(PRIMARY_PDO));
+        assert_ne!(b.dispatch_pnp(DeviceId::new(1, 99), IRP_MN_START_DEVICE), 0);
     }
 
     #[test]
     fn pdo_stop_and_surprise_dispatch() {
         let mut b = bus();
-        b.dispatch_pnp(0xFED0_0000, IRP_MN_START_DEVICE);
+        b.dispatch_pnp(PRIMARY_PDO, IRP_MN_START_DEVICE);
         // query-stop + cancel-stop are pure negotiation: still started.
-        assert_eq!(b.dispatch_pnp(0xFED0_0000, IRP_MN_QUERY_STOP_DEVICE), 0);
-        assert_eq!(b.dispatch_pnp(0xFED0_0000, IRP_MN_CANCEL_STOP_DEVICE), 0);
-        assert!(b.pdo_started(0xFED0_0000));
+        assert_eq!(b.dispatch_pnp(PRIMARY_PDO, IRP_MN_QUERY_STOP_DEVICE), 0);
+        assert_eq!(b.dispatch_pnp(PRIMARY_PDO, IRP_MN_CANCEL_STOP_DEVICE), 0);
+        assert!(b.pdo_started(PRIMARY_PDO));
         // stop quiesces; restart resumes.
-        assert_eq!(b.dispatch_pnp(0xFED0_0000, IRP_MN_STOP_DEVICE), 0);
-        assert!(!b.pdo_started(0xFED0_0000));
-        b.dispatch_pnp(0xFED0_0000, IRP_MN_START_DEVICE);
-        assert!(b.pdo_started(0xFED0_0000));
+        assert_eq!(b.dispatch_pnp(PRIMARY_PDO, IRP_MN_STOP_DEVICE), 0);
+        assert!(!b.pdo_started(PRIMARY_PDO));
+        b.dispatch_pnp(PRIMARY_PDO, IRP_MN_START_DEVICE);
+        assert!(b.pdo_started(PRIMARY_PDO));
         // query-remove + cancel-remove are pure negotiation: still started.
-        b.dispatch_pnp(0xFED0_0000, IRP_MN_START_DEVICE);
-        assert_eq!(b.dispatch_pnp(0xFED0_0000, IRP_MN_QUERY_REMOVE_DEVICE), 0);
-        assert_eq!(b.dispatch_pnp(0xFED0_0000, IRP_MN_CANCEL_REMOVE_DEVICE), 0);
-        assert!(b.pdo_started(0xFED0_0000));
+        b.dispatch_pnp(PRIMARY_PDO, IRP_MN_START_DEVICE);
+        assert_eq!(b.dispatch_pnp(PRIMARY_PDO, IRP_MN_QUERY_REMOVE_DEVICE), 0);
+        assert_eq!(b.dispatch_pnp(PRIMARY_PDO, IRP_MN_CANCEL_REMOVE_DEVICE), 0);
+        assert!(b.pdo_started(PRIMARY_PDO));
         // surprise removal quiesces.
-        assert_eq!(b.dispatch_pnp(0xFED0_0000, IRP_MN_SURPRISE_REMOVAL), 0);
-        assert!(!b.pdo_started(0xFED0_0000));
+        assert_eq!(b.dispatch_pnp(PRIMARY_PDO, IRP_MN_SURPRISE_REMOVAL), 0);
+        assert!(!b.pdo_started(PRIMARY_PDO));
     }
 
     #[test]
@@ -474,27 +509,27 @@ mod tests {
         let mut b = RootBus::new();
 
         assert_eq!(
-            b.try_create_pdo(0, r"ROOT\A", &[r"ROOT\A"], &empty, "0001"),
-            Err(RootBusPdoError::ZeroObjectId)
+            b.try_create_pdo(DeviceId::NULL, r"ROOT\A", &[r"ROOT\A"], &empty, "0001"),
+            Err(RootBusPdoError::NullCanonicalDeviceId)
         );
         assert_eq!(
-            b.try_create_pdo(0x1000, "", &[r"ROOT\A"], &empty, "0001"),
+            b.try_create_pdo(PRIMARY_PDO, "", &[r"ROOT\A"], &empty, "0001"),
             Err(RootBusPdoError::EmptyDeviceId)
         );
         assert_eq!(
-            b.try_create_pdo(0x1000, r"ROOT\A", &[r"ROOT\A"], &empty, ""),
+            b.try_create_pdo(PRIMARY_PDO, r"ROOT\A", &[r"ROOT\A"], &empty, ""),
             Err(RootBusPdoError::EmptyInstanceId)
         );
         assert_eq!(
-            b.try_create_pdo(0x1000, r"ROOT\A", &empty, &empty, "0001"),
+            b.try_create_pdo(PRIMARY_PDO, r"ROOT\A", &empty, &empty, "0001"),
             Err(RootBusPdoError::EmptyHardwareIds)
         );
         assert_eq!(
-            b.try_create_pdo(0x1000, r"ROOT\A", &[""], &empty, "0001"),
+            b.try_create_pdo(PRIMARY_PDO, r"ROOT\A", &[""], &empty, "0001"),
             Err(RootBusPdoError::EmptyHardwareId)
         );
         assert_eq!(
-            b.try_create_pdo(0x1000, r"ROOT\A", &[r"ROOT\A"], &[""], "0001"),
+            b.try_create_pdo(PRIMARY_PDO, r"ROOT\A", &[r"ROOT\A"], &[""], "0001"),
             Err(RootBusPdoError::EmptyCompatibleId)
         );
 
@@ -506,12 +541,19 @@ mod tests {
         let mut b = RootBus::new();
         let empty: [&str; 0] = [];
         assert_eq!(
-            b.try_create_pdo(0x1000, r"ROOT\A", &[r"ROOT\A"], &empty, "0001"),
-            Ok(0x1000)
+            b.try_create_pdo(PRIMARY_PDO, r"ROOT\A", &[r"ROOT\A"], &empty, "0001"),
+            Ok(PRIMARY_PDO)
         );
         assert_eq!(b.len(), 1);
-        let pdo = b.pdo(0x1000).unwrap();
+        let pdo = b.pdo(PRIMARY_PDO).unwrap();
         assert_eq!(pdo.hardware_ids, alloc::vec![String::from(r"ROOT\A")]);
         assert!(pdo.compatible_ids.is_empty());
+        assert_eq!(
+            b.try_create_pdo(PRIMARY_PDO, r"ROOT\B", &[r"ROOT\B"], &empty, "0002"),
+            Err(RootBusPdoError::DuplicateCanonicalDeviceId)
+        );
+        assert!(b.remove_pdo(PRIMARY_PDO));
+        assert!(!b.remove_pdo(PRIMARY_PDO));
+        assert!(b.is_empty());
     }
 }

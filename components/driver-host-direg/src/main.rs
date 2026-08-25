@@ -35,6 +35,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use nt_config_manager::DevPropKey;
+use nt_io_abi::DeviceId;
 use nt_pnp_abi::{DeviceState, IRP_MJ_PNP, IRP_MN_REMOVE_DEVICE, IRP_MN_START_DEVICE};
 use nt_pnp_manager::{PnpManager, NO_RESOURCES};
 use nt_root_bus::{BusQueryId, RootBus};
@@ -61,6 +62,7 @@ const COMPATIBLE_ID: &str = r"ROOT\USERSPACE_NTOS_TEST_DEVICE";
 const INSTANCE_ID: &str = "0000";
 /// The `object_id` the PnP Manager + root bus use for this devnode's PDO.
 const PDO_OBJECT_ID: u64 = 0xFED1_0000;
+const PDO_CANONICAL_ID: DeviceId = DeviceId::new(1, 1);
 
 const IOCTL_PING: u32 = 0x0022_2200;
 const IOCTL_GET_CONFIG: u32 = 0x0022_2204;
@@ -193,7 +195,7 @@ const STATUS_PENDING: i32 = 0x0000_0103;
 unsafe fn io_call_driver(device: u64, irp: u64) -> i32 {
     if device == PDO_OBJECT_ID {
         let minor = core::ptr::read_unaligned((irp + IRP_MINOR) as *const u8);
-        let st = root_bus().dispatch_pnp(PDO_OBJECT_ID, minor);
+        let st = root_bus().dispatch_pnp(PDO_CANONICAL_ID, minor);
         return complete_irp(irp, st);
     }
     let drv = DRV_OBJECT.load(Ordering::Relaxed);
@@ -478,21 +480,22 @@ unsafe fn run() {
         PDO_OBJECT_ID,
         NO_RESOURCES,
     );
-    root_bus().create_pdo(
-        PDO_OBJECT_ID,
+    let root_pdo = root_bus().create_pdo(
+        PDO_CANONICAL_ID,
         DEVICE_ID,
         &[DEVICE_ID],
         &[COMPATIBLE_ID],
         INSTANCE_ID,
     );
+    check(b"root_bus_canonical_pdo_created", root_pdo == Ok(PDO_CANONICAL_ID));
     trace(b"pnp_pdo_create + pnp_stack_create");
     let query_id_ok = root_bus()
-        .query_id(PDO_OBJECT_ID, BusQueryId::DeviceId)
+        .query_id(PDO_CANONICAL_ID, BusQueryId::DeviceId)
         .map(|w| wide_is(&w, DEVICE_ID))
         .unwrap_or(false);
     check(b"root_bus_query_id_device", query_id_ok);
     let caps_ok = root_bus()
-        .query_capabilities(PDO_OBJECT_ID)
+        .query_capabilities(PDO_CANONICAL_ID)
         .map(|c| c.version == 1 && c.device_state[0] == 1)
         .unwrap_or(false);
     check(b"root_bus_query_capabilities", caps_ok);
@@ -593,7 +596,7 @@ unsafe fn run() {
         b"start_device_irp_dispatched_through_stack",
         start_status == STATUS_SUCCESS
             && irp_status(start_irp) == STATUS_SUCCESS
-            && root_bus().pdo_started(PDO_OBJECT_ID),
+            && root_bus().pdo_started(PDO_CANONICAL_ID),
     );
     check(
         b"prepare_hardware_and_d0_entry",
@@ -677,7 +680,7 @@ unsafe fn run() {
         b"remove_device_irp_dispatched_through_stack",
         remove_status == STATUS_SUCCESS
             && irp_status(remove_irp) == STATUS_SUCCESS
-            && !root_bus().pdo_started(PDO_OBJECT_ID),
+            && !root_bus().pdo_started(PDO_CANONICAL_ID),
     );
     nt_wdf_kmdf::wdf().set_device_interface_state(device, IFACE_GUID, false);
     let iface_disabled = nt_wdf_kmdf::wdf()

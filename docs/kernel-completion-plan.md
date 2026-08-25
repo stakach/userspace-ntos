@@ -11129,6 +11129,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     exact unbind before canonical object destruction. Root-bus state should then move to canonical
     DeviceId keys rather than duplicating raw PDO identity.
 
+    Canonical root-bus identity checkpoint (2026-08-24): `nt-root-bus` no longer accepts a WDM
+    pointer-shaped `u64` as PDO identity. Every PDO, query, relation, started-state transition, and
+    PnP dispatch is keyed by the generation-protected I/O Manager `DeviceId`. Null and duplicate
+    canonical ids fail closed, and exact removal supports registration rollback. The standalone PnP
+    and device-interface/registry harnesses now keep their local fake `DEVICE_OBJECT` addresses
+    separate from canonical bus ids. The executive creates the canonical root PDO first and passes
+    that id through RootBus registration, start-state evidence, video start, and authenticated
+    lower-PnP service dispatch; failed bus or projection publication removes the bus record and
+    destroys the manager device.
+
+    Validation is green for `nt-root-bus` (`10/10`), `nt-io-manager` (`185/185`), and `nt-io-abi`
+    (`5/5`). Both standalone driver harnesses pass freestanding checks, and the executive passes its
+    freestanding release check at the existing 212-warning baseline.
+
+    Review adjustment: root-bus internal state is canonical, but the executive still has a
+    transitional raw PDO projection table. Next bind the returned PDO and FDO addresses in the
+    actual AddDevice execution domain, make the authenticated pump resolve them through
+    `(HostedDomainId,address)`, and then delete `HostedRootPdoBinding` rather than retaining two
+    sources of identity. Component-local device-property/interface helpers must move behind that
+    authenticated boundary; their in-flight shared-slot tests are not acceptable domain evidence.
+
     After that boundary is live, migrate the standalone hal, power, PnP, async, MMIO, and DMA
     component harnesses to `CompletionOwnerClaim` plus `CompletionUnwindCursor`, including their
     direct attach/lower-call shims. Reconcile the separate `driver-host-direg` and `nt-driver-host`

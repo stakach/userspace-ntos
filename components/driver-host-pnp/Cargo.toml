@@ -38,6 +38,7 @@ nt-config-manager = { path = "../../crates/nt-config-manager" }
 nt-um-abi = { path = "../../crates/nt-um-abi" }
 nt-driver-supervisor = { path = "../../crates/nt-driver-supervisor" }
 nt-root-bus = { path = "../../crates/nt-root-bus" }
+nt-io-abi = { path = "../../crates/nt-io-abi" }
 
 [profile.release]
 panic = "abort"

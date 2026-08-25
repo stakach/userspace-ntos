@@ -9,3 +9,6 @@ authors.workspace = true
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
+
+[dependencies]
+nt-io-abi = { workspace = true }

@@ -34,6 +34,7 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 use nt_cm_resources::{InterruptDescriptor, MemoryDescriptor};
 use nt_config_manager::ConfigManager;
+use nt_io_abi::DeviceId;
 use nt_kernel_exec::{CompleteResult, EventKind, FakeClock, KernelExecRuntime};
 use nt_pnp_abi::{
     DeviceState, IRP_MJ_PNP, IRP_MN_CANCEL_REMOVE_DEVICE, IRP_MN_CANCEL_STOP_DEVICE,
@@ -86,6 +87,7 @@ const INSTANCE_PATH: &str = r"ROOT\USERSPACE_NTOS_PNP_MMIO\0001";
 const CLASS_GUID: &str = "{4d36e97d-e325-11ce-bfc1-08002be10318}";
 /// The `object_id` the PnP Manager + root bus use for the primary devnode's PDO.
 const PDO_OBJECT_ID: u64 = 0xFED0_0000;
+const PDO_CANONICAL_ID: DeviceId = DeviceId::new(1, 1);
 
 const fn mmio_resources(mem_start: u64, vector: u32) -> ResourceAssignment {
     ResourceAssignment {
@@ -107,6 +109,7 @@ struct Fixture {
     instance_id: &'static str,
     image_path: &'static str,
     pdo_object_id: u64,
+    canonical_device_id: DeviceId,
     resources: ResourceAssignment,
 }
 
@@ -122,6 +125,7 @@ const FIXTURES: &[Fixture] = &[
         instance_id: INSTANCE_ID,
         image_path: r"\SystemRoot\system32\drivers\PnpMmioInterruptTest.sys",
         pdo_object_id: PDO_OBJECT_ID,
+        canonical_device_id: PDO_CANONICAL_ID,
         resources: mmio_resources(0x1000_0000, 5),
     },
     Fixture {
@@ -132,6 +136,7 @@ const FIXTURES: &[Fixture] = &[
         instance_id: "0001",
         image_path: r"\SystemRoot\system32\drivers\PowerPnpMmioTest.sys",
         pdo_object_id: 0xFED0_1000,
+        canonical_device_id: DeviceId::new(1, 2),
         resources: mmio_resources(0x2000_0000, 6),
     },
     Fixture {
@@ -142,6 +147,7 @@ const FIXTURES: &[Fixture] = &[
         instance_id: "0001",
         image_path: r"\SystemRoot\system32\drivers\KmdfInterfaceRegistryTest.sys",
         pdo_object_id: 0xFED0_2000,
+        canonical_device_id: DeviceId::new(1, 3),
         resources: NO_RESOURCES,
     },
     Fixture {
@@ -152,6 +158,7 @@ const FIXTURES: &[Fixture] = &[
         instance_id: "0001",
         image_path: r"\SystemRoot\system32\drivers\DmaPnpPowerTest.sys",
         pdo_object_id: 0xFED0_3000,
+        canonical_device_id: DeviceId::new(1, 4),
         resources: NO_RESOURCES,
     },
     Fixture {
@@ -162,6 +169,7 @@ const FIXTURES: &[Fixture] = &[
         instance_id: "0001",
         image_path: r"\SystemRoot\system32\drivers\KmdfLoaderCompatTest.sys",
         pdo_object_id: 0xFED0_4000,
+        canonical_device_id: DeviceId::new(1, 5),
         resources: NO_RESOURCES,
     },
 ];
@@ -271,6 +279,7 @@ struct DhState {
     pdo: u64,              // the root-bus PDO device object (bottom of the stack)
     pnp_minor: u8,         // the PnP minor of the IRP currently in flight
     pdo_object_id: u64,    // the root-bus PDO identity for this device
+    canonical_device_id: DeviceId,
     device_owner_id: u64,  // the ResourceManager owner id for this device
     code_base: u64,        // the VA the driver image is mapped at
     int_resource_id: u64,  // the ResourceManager interrupt-resource id for this device
@@ -294,6 +303,7 @@ impl DhState {
             pdo: 0,
             pnp_minor: 0,
             pdo_object_id: 0,
+            canonical_device_id: DeviceId::NULL,
             device_owner_id: 0,
             code_base: 0,
             int_resource_id: INT_RESOURCE_ID,
@@ -397,7 +407,7 @@ extern "win64" fn ntos_iof_call_driver(device: u64, irp: u64) -> i32 {
     unsafe {
         let status = if device != 0 && device == dh().pdo {
             // Bottom of the stack: the synthetic root bus handles this PnP minor for this device.
-            root_bus().dispatch_pnp(dh().pdo_object_id, dh().pnp_minor)
+            root_bus().dispatch_pnp(dh().canonical_device_id, dh().pnp_minor)
         } else {
             0
         };
@@ -872,6 +882,7 @@ unsafe fn bind_secondary(fx: &Fixture, pnp_devnode: u64, base: u64) -> bool {
     CURRENT.store(1, Ordering::Relaxed);
     let d = dh();
     d.pdo_object_id = fx.pdo_object_id;
+    d.canonical_device_id = fx.canonical_device_id;
     d.device_owner_id = 20;
     d.code_base = base;
     d.device_object = 0;
@@ -978,7 +989,7 @@ unsafe fn bind_secondary(fx: &Fixture, pnp_devnode: u64, base: u64) -> bool {
     let started = start_status == 0
         && dh().mmio_base != 0
         && dh().interrupt_id != 0
-        && root_bus().pdo_started(fx.pdo_object_id);
+        && root_bus().pdo_started(fx.canonical_device_id);
     if started {
         let _ = pnp().transition(pnp_devnode, DeviceState::Started);
     }
@@ -1015,6 +1026,7 @@ unsafe fn bind_kmdf(fx: &Fixture, pnp_devnode: u64, cfg_devnode: u64, base: u64)
     CURRENT.store(2, Ordering::Relaxed);
     let d = dh();
     d.pdo_object_id = fx.pdo_object_id;
+    d.canonical_device_id = fx.canonical_device_id;
     d.device_owner_id = 30;
     d.code_base = base;
     d.device_object = 0;
@@ -1108,7 +1120,7 @@ unsafe fn bind_kmdf(fx: &Fixture, pnp_devnode: u64, cfg_devnode: u64, base: u64)
     let started = start_status == 0
         && KMDF_PREPARE_HW.load(Ordering::Relaxed)
         && KMDF_D0_ENTRY.load(Ordering::Relaxed)
-        && root_bus().pdo_started(fx.pdo_object_id);
+        && root_bus().pdo_started(fx.canonical_device_id);
     if started {
         let _ = pnp().transition(pnp_devnode, DeviceState::Started);
     }
@@ -1185,13 +1197,14 @@ unsafe fn run() {
             &[fx.device_id],
             &[fx.compatible_id],
         );
-        root_bus().create_pdo(
-            fx.pdo_object_id,
+        let root_pdo = root_bus().create_pdo(
+            fx.canonical_device_id,
             fx.device_id,
             &[fx.device_id],
             &[fx.compatible_id],
             fx.instance_id,
         );
+        check(b"root_bus_canonical_pdo_created", root_pdo == Ok(fx.canonical_device_id));
         cfg_devnodes.push(dn);
     }
     trace(b"pnp_devnode_create (x N) + pnp_devnode_registry_materialize");
@@ -1276,6 +1289,7 @@ unsafe fn run() {
     // The primary binds in device slot 0 (mapped at CODE_VADDR, PDO FIXTURES[0], owner 10).
     CURRENT.store(0, Ordering::Relaxed);
     dh().pdo_object_id = FIXTURES[0].pdo_object_id;
+    dh().canonical_device_id = FIXTURES[0].canonical_device_id;
     dh().device_owner_id = DEVICE_OBJECT_ID;
     dh().code_base = CODE_VADDR;
 
@@ -1355,18 +1369,18 @@ unsafe fn run() {
     // The PnP Manager queries the PDO's identity before binding a function driver (QUERY_ID +
     // QUERY_CAPABILITIES answered by the synthetic root bus).
     let device_id_ok = root_bus()
-        .query_id(PDO_OBJECT_ID, BusQueryId::DeviceId)
+        .query_id(PDO_CANONICAL_ID, BusQueryId::DeviceId)
         .map(|w| wide_is(&w, DEVICE_ID))
         .unwrap_or(false);
     check(b"root_bus_query_id_device", device_id_ok);
     let hwids_ok = root_bus()
-        .query_id(PDO_OBJECT_ID, BusQueryId::HardwareIds)
+        .query_id(PDO_CANONICAL_ID, BusQueryId::HardwareIds)
         .map(|w| wide_is_multisz_first(&w, DEVICE_ID))
         .unwrap_or(false);
     check(b"root_bus_query_id_hardware", hwids_ok);
     trace(b"pnp_query_id");
     let caps_ok = root_bus()
-        .query_capabilities(PDO_OBJECT_ID)
+        .query_capabilities(PDO_CANONICAL_ID)
         .map(|c| c.version == 1 && c.device_state[0] == 1 && c.surprise_removal_ok)
         .unwrap_or(false);
     check(b"root_bus_query_capabilities", caps_ok);
@@ -1437,7 +1451,7 @@ unsafe fn run() {
     // The START IRP travelled FDO -> PDO: the driver forwarded it down and the root-bus PDO started.
     check(
         b"start_device_irp_reached_pdo",
-        root_bus().pdo_started(PDO_OBJECT_ID),
+        root_bus().pdo_started(PDO_CANONICAL_ID),
     );
     check(
         b"devnode_started",
@@ -1530,7 +1544,7 @@ unsafe fn run() {
         b"cancel_remove_keeps_device_started",
         cancel_rm_status == 0
             && pnp().state(devnode) == Some(DeviceState::Started)
-            && root_bus().pdo_started(PDO_OBJECT_ID)
+            && root_bus().pdo_started(PDO_CANONICAL_ID)
             && st == 0
             && id == 0x4d4d_494f,
     );
@@ -1546,7 +1560,7 @@ unsafe fn run() {
         b"stop_device_quiesces",
         stop_status == 0
             && pnp().state(devnode) == Some(DeviceState::Stopped)
-            && !root_bus().pdo_started(PDO_OBJECT_ID),
+            && !root_bus().pdo_started(PDO_CANONICAL_ID),
     );
 
     // --- Restart: a fresh START IRP resumes the stopped device --------------------------------
@@ -1564,7 +1578,7 @@ unsafe fn run() {
         b"restart_after_stop_resumes",
         restart_status == 0
             && pnp().state(devnode) == Some(DeviceState::Started)
-            && root_bus().pdo_started(PDO_OBJECT_ID)
+            && root_bus().pdo_started(PDO_CANONICAL_ID)
             && st == 0
             && id == 0x4d4d_494f,
     );
@@ -1588,7 +1602,7 @@ unsafe fn run() {
     // The REMOVE IRP travelled FDO -> PDO: the root-bus PDO is stopped.
     check(
         b"remove_device_irp_reached_pdo",
-        !root_bus().pdo_started(PDO_OBJECT_ID),
+        !root_bus().pdo_started(PDO_CANONICAL_ID),
     );
     check(
         b"devnode_removed",
@@ -1606,7 +1620,7 @@ unsafe fn run() {
     let kdrv = KMDF_DRV_OBJECT.load(Ordering::Relaxed);
     let kfdo = nt_wdf_kmdf::device();
     let kdevnode = pnp_devnodes[2];
-    let kpdo = FIXTURES[2].pdo_object_id;
+    let kpdo = FIXTURES[2].canonical_device_id;
 
     // --- KMDF IOCTL smoke: present_ioctl -> the driver's EvtIoDeviceControl via the shared runtime.
     trace(b"kmdf_ioctl_smoke (PING / GET_CONFIG / GET_GREETING / ECHO)");

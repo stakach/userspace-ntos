@@ -30690,6 +30690,7 @@ fn destroy_registered_driver(driver_id: u64) {
 struct HostedDeviceBinding {
     driver_id: u64,
     device_id: u64,
+    pdo_device_id: u64,
     instance: usize,
     device_object: u64,
     pdo_object: u64,
@@ -30700,6 +30701,7 @@ struct HostedDeviceBinding {
 const EMPTY_HOSTED_DEVICE_BINDING: HostedDeviceBinding = HostedDeviceBinding {
     driver_id: 0,
     device_id: 0,
+    pdo_device_id: 0,
     instance: 0,
     device_object: 0,
     pdo_object: 0,
@@ -31174,7 +31176,10 @@ pub(crate) fn service_hosted_root_pdo_pnp(
     if !authorized {
         return nt_status::NtStatus::ACCESS_DENIED.raw();
     }
-    unsafe { hosted_root_bus_mut().dispatch_pnp(pdo_object, minor) }
+    let Some(device_id) = hosted_root_pdo_device_id(pdo_object) else {
+        return nt_status::NtStatus::ACCESS_DENIED.raw();
+    };
+    unsafe { hosted_root_bus_mut().dispatch_pnp(nt_io_manager::DeviceId(device_id), minor) }
 }
 
 fn register_hosted_root_pdo_binding(
@@ -31207,7 +31212,8 @@ fn register_hosted_root_pdo_binding(
 
 fn hosted_root_pdo_identity_status(error: nt_root_bus::RootBusPdoError) -> nt_status::NtStatus {
     match error {
-        nt_root_bus::RootBusPdoError::ZeroObjectId
+        nt_root_bus::RootBusPdoError::NullCanonicalDeviceId
+        | nt_root_bus::RootBusPdoError::DuplicateCanonicalDeviceId
         | nt_root_bus::RootBusPdoError::EmptyDeviceId
         | nt_root_bus::RootBusPdoError::EmptyInstanceId
         | nt_root_bus::RootBusPdoError::EmptyHardwareIds
@@ -31227,14 +31233,6 @@ where
     C: AsRef<str>,
 {
     let (device_id, instance_id) = nt_root_bus::split_enum_instance_path(instance_path);
-    nt_root_bus::RootBus::validate_pdo_identity(
-        pdo_object,
-        device_id,
-        hardware_ids,
-        compatible_ids,
-        instance_id,
-    )
-    .map_err(hosted_root_pdo_identity_status)?;
     if let Some(device_id) = hosted_root_pdo_device_id(pdo_object) {
         return Ok(device_id);
     }
@@ -31247,25 +31245,28 @@ where
         DeviceFlags::BUFFERED_IO,
         0,
     )?;
+    if let Err(error) = hosted_root_bus_mut().try_create_pdo(
+        pdo_device_id,
+        device_id,
+        hardware_ids,
+        compatible_ids,
+        instance_id,
+    ) {
+        let _ = io_manager_mut().destroy_device(pdo_device_id);
+        return Err(hosted_root_pdo_identity_status(error));
+    }
     if let Err(status) = register_hosted_root_pdo_binding(pdo_object, pdo_device_id.raw()) {
+        let _ = hosted_root_bus_mut().remove_pdo(pdo_device_id);
         let _ = io_manager_mut().destroy_device(pdo_device_id);
         return Err(status);
     }
-    hosted_root_bus_mut()
-        .try_create_pdo(
-            pdo_object,
-            device_id,
-            hardware_ids,
-            compatible_ids,
-            instance_id,
-        )
-        .map_err(hosted_root_pdo_identity_status)?;
     Ok(pdo_device_id.raw())
 }
 
 fn register_hosted_device_binding(
     driver_id: u64,
     device_id: u64,
+    pdo_device_id: u64,
     instance: usize,
     device_object: u64,
     pdo_object: u64,
@@ -31283,6 +31284,7 @@ fn register_hosted_device_binding(
         *slot = HostedDeviceBinding {
             driver_id,
             device_id,
+            pdo_device_id,
             instance,
             device_object,
             pdo_object,
@@ -31300,6 +31302,7 @@ fn register_hosted_device_binding(
         *slot = HostedDeviceBinding {
             driver_id,
             device_id,
+            pdo_device_id,
             instance,
             device_object,
             pdo_object,
@@ -31311,6 +31314,7 @@ fn register_hosted_device_binding(
     bindings.push(HostedDeviceBinding {
         driver_id,
         device_id,
+        pdo_device_id,
         instance,
         device_object,
         pdo_object,
@@ -31360,7 +31364,7 @@ unsafe fn read_hosted_hardware_evidence_from_shared(
     let root_pdo_started = unsafe {
         (*core::ptr::addr_of!(HOSTED_ROOT_BUS))
             .as_ref()
-            .map(|bus| bus.pdo_started(binding.pdo_object))
+            .map(|bus| bus.pdo_started(nt_io_manager::DeviceId(binding.pdo_device_id)))
             .unwrap_or(false)
     };
     unsafe {
@@ -33484,7 +33488,7 @@ pub(crate) fn hosted_hardware_evidence(device_id: u64) -> Option<HostedHardwareE
     evidence.root_pdo_started = unsafe {
         (*core::ptr::addr_of!(HOSTED_ROOT_BUS))
             .as_ref()
-            .map(|bus| bus.pdo_started(binding.pdo_object))
+            .map(|bus| bus.pdo_started(nt_io_manager::DeviceId(binding.pdo_device_id)))
             .unwrap_or(false)
     };
     if let Some((_, inst)) = instance_by_driver_id(binding.driver_id) {
@@ -36250,6 +36254,7 @@ where
     if let Err(status) = register_hosted_device_binding(
         driver_id,
         device_id.raw(),
+        pdo_device_id,
         index,
         add_device.fdo_object,
         add_device.pdo_object,
@@ -37284,8 +37289,10 @@ pub(crate) unsafe fn start_hosted_device(
         print_str(b"\n");
     }
     if video_initialized {
-        let root_status =
-            hosted_root_bus_mut().dispatch_pnp(binding.pdo_object, IRP_MN_START_DEVICE as u8);
+        let root_status = hosted_root_bus_mut().dispatch_pnp(
+            nt_io_manager::DeviceId(binding.pdo_device_id),
+            IRP_MN_START_DEVICE as u8,
+        );
         nt_status::NtStatus(root_status).to_result()?;
         let video_status = dispatch_video_find_adapter_for_instance(binding.instance, inst)?;
         let again = read_volatile((sh + SH_VIDEO_FIND_ADAPTER_AGAIN) as *const u8);
