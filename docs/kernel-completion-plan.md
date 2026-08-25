@@ -11165,6 +11165,55 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and make authenticated server-side lookup resolve the registry before deleting global address
     scans. A component WDM export without an authenticated pump context must not guess its domain.
 
+    DriverEntry lifecycle and hosted DeviceObject-domain checkpoint (2026-08-26): canonical driver
+    publication now follows NT lifecycle ordering. The I/O Manager `DriverId` and `\Driver` object
+    are created before the isolated component can run `DriverEntry`; the reserved instance retains
+    that id while its transport state is installed. This lets NDIS bind an E1000 DriverObject shadow
+    in the provider domain during `NdisInitializeWrapper` without depending on scheduler timing.
+    The component-local primary DriverObject address is bound only after the driver publishes that
+    projection. `clear_instance` now owns ordered rollback: device projections and provider shadows
+    are cleared first, the primary projection is exact-unbound, the canonical driver and owned
+    devices are destroyed, component mechanisms are released, and only then is the hosted domain
+    generation retired. Normal unload clears the already-destroyed canonical id before entering the
+    common teardown path.
+
+    Hosted AddDevice state now records both the dependent driver instance and the instance/domain
+    in which the WDM PDO/FDO projections actually live. The latter is the callable provider for a
+    provider-backed driver and the dependent driver otherwise. Root PDO and FDO addresses bind to
+    canonical `DeviceId`s in that domain. Authenticated lower-PnP service resolves its pump channel,
+    domain, raw PDO projection, canonical root-bus id, and owning FDO binding as one exact tuple.
+    Typed IRP dispatch begins with the packet's canonical DeviceId and requires the driver,
+    dependent instance, provider instance/domain, and raw DeviceObject projection all to agree; it
+    no longer selects typed requests by a global raw address scan. FDO teardown exact-unbinds its
+    projection before reuse.
+
+    The freestanding executive release check is green at the existing 212-warning baseline.
+    Serialized desktop proof `.tmp/run-desktop-20260826-002336.log` restores the hardware and shell
+    frontiers together: three of three configured PnP drivers complete AddDevice and StartDevice;
+    the PCI provider domain completes `42/42` gated exports and aggregate provider accounting is
+    `47/47` with zero rejections; interrupt, DPC, DMA descriptor, receive, MMIO, I/O-port, and video
+    evidence all pass. The writable snapshot commits generation 5 with 821,820 bytes. Genuine
+    userinit and Explorer launch, Explorer performs 487 real api0 callbacks with zero callback
+    failures, and paint reaches 1 BeginPaint, 14 EndPaint, 88 direct GDI returns, and 66 batch
+    flushes carrying 91 records. All 786,432 framebuffer pixels are non-background with at least 32
+    colors, all `293/293` checks pass, and the sentinel is emitted.
+
+    Review adjustment: the authenticated DeviceObject lookup path is live, but root-PDO lifetime is
+    not closed. `HostedRootPdoBinding` remains a transitional second table and currently has no
+    exact domain teardown. Root registration still begins from a guest pointer rather than the
+    stable devnode identity, so AddDevice failure/retry or provider unload can retain stale bus,
+    canonical PDO, and projection rows. Reorder this path next: resolve or create the canonical root
+    PDO by normalized devnode instance path before dispatch, create a domain-owned WDM projection,
+    and carry an ownership token that rolls back only transaction-created projection/FDO state.
+    Add exact root projection removal during domain teardown, validate reused devnode metadata, and
+    then delete `HostedRootPdoBinding` and the unscoped `hosted_root_pdo_device_id` helper.
+
+    After root-PDO ownership is singular, move component-local `IoDeleteDevice`,
+    `IoGetDeviceProperty`, `IoRegisterDeviceInterface`, and shutdown registration behind an
+    authenticated component service boundary. Carry canonical device identity into the remaining
+    cancel/copy/ack/interrupt selectors and delete their `dispatch_request == None` raw-address
+    lookup. Only then is the hosted Driver/Device projection migration complete.
+
     After that boundary is live, migrate the standalone hal, power, PnP, async, MMIO, and DMA
     component harnesses to `CompletionOwnerClaim` plus `CompletionUnwindCursor`, including their
     direct attach/lower-call shims. Reconcile the separate `driver-host-direg` and `nt-driver-host`

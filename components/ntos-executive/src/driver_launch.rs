@@ -29200,6 +29200,16 @@ unsafe fn load_driver_reserved(
             )
         };
 
+    // NT publishes the canonical driver object before DriverEntry can run. Reserve that identity
+    // before resuming the component so imports serviced during DriverEntry can project it into a
+    // provider domain without relying on component scheduling order.
+    let domain = crate::driver_launch::instance(instance)?;
+    if domain.hosted_domain_id == 0 || domain.hosted_domain_cookie == 0 {
+        return None;
+    }
+    let driver_id = register_io_driver(driver_object_path, instance)?;
+    driver_instances_mut()[instance].driver_id = driver_id;
+
     // 4. Build the FSD-class descriptor + spawn the isolated component.
     let fault_ep = make_object(OBJ_ENDPOINT);
     print_str(b"[driver-launch] spawn-fsd begin inst=");
@@ -29373,7 +29383,7 @@ unsafe fn load_driver_reserved(
     print_str(b"\n");
 
     if !finished || de_status != 0 {
-        print_str(b"[driver-launch] DriverEntry failed; refusing to register ");
+        print_str(b"[driver-launch] DriverEntry failed; removing ");
         print_str(driver_object_path.as_bytes());
         print_str(b"\n");
         clear_driver_object_extensions_for_driver_object(drvobj);
@@ -29387,7 +29397,10 @@ unsafe fn load_driver_reserved(
             image_len,
         );
         if planned_images.primary_offset == 0 && planned_images.dependencies.is_empty() {
-            let singleton_image_frames = frames_for_image_len(image_len as u64)?;
+            let Some(singleton_image_frames) = frames_for_image_len(image_len as u64) else {
+                clear_driver_object_extensions_for_driver_object(drvobj);
+                return None;
+            };
             if !register_hosted_provider_singleton(
                 provider,
                 instance,
@@ -29405,12 +29418,6 @@ unsafe fn load_driver_reserved(
         }
     }
 
-    let driver_id = register_io_driver(driver_object_path, instance)?;
-    let domain = crate::driver_launch::instance(instance)?;
-    if domain.hosted_domain_id == 0 || domain.hosted_domain_cookie == 0 {
-        destroy_registered_driver(domain.hosted_domain_id, drvobj, driver_id);
-        return None;
-    }
     if let Err(status) = io_manager_mut().bind_hosted_driver_address(
         nt_io_manager::HostedDomainId(domain.hosted_domain_id),
         drvobj,
@@ -29421,9 +29428,9 @@ unsafe fn load_driver_reserved(
         print_str(b" for ");
         print_str(driver_object_path.as_bytes());
         print_str(b"\n");
-        destroy_registered_driver(domain.hosted_domain_id, drvobj, driver_id);
         return None;
     }
+    driver_instances_mut()[instance].driver_object = drvobj;
     let dc = DriverComponent {
         pml4,
         fault_ep,
@@ -29476,7 +29483,6 @@ unsafe fn load_driver_reserved(
             print_str(driver_object_path.as_bytes());
             print_str(b"\n");
             clear_driver_object_extensions_for_driver_object(drvobj);
-            destroy_registered_driver(domain.hosted_domain_id, drvobj, driver_id);
             return None;
         }
     };
@@ -29488,7 +29494,6 @@ unsafe fn load_driver_reserved(
         print_str(driver_object_path.as_bytes());
         print_str(b"\n");
         clear_driver_object_extensions_for_driver_object(drvobj);
-        destroy_registered_driver(domain.hosted_domain_id, drvobj, driver_id);
         return None;
     }
     // Record the live instance and publish canonical driver/device route ids for callers.
@@ -30749,21 +30754,14 @@ unsafe fn apply_hosted_device_interface_state(sh: u64) -> Result<(), nt_status::
     }
 }
 
-fn destroy_registered_driver(domain_id: u64, driver_object: u64, driver_id: u64) {
-    let _ = io_manager_mut().destroy_driver(DriverId(driver_id));
-    let _ = io_manager_mut().unbind_hosted_driver_address(
-        nt_io_manager::HostedDomainId(domain_id),
-        driver_object,
-        DriverId(driver_id),
-    );
-}
-
 #[derive(Clone, Copy)]
 struct HostedDeviceBinding {
     driver_id: u64,
     device_id: u64,
     pdo_device_id: u64,
     instance: usize,
+    projection_instance: usize,
+    projection_domain_id: u64,
     device_object: u64,
     pdo_object: u64,
     registry_identity_id: HostedRegistryIdentityId,
@@ -30775,6 +30773,8 @@ const EMPTY_HOSTED_DEVICE_BINDING: HostedDeviceBinding = HostedDeviceBinding {
     device_id: 0,
     pdo_device_id: 0,
     instance: 0,
+    projection_instance: 0,
+    projection_domain_id: 0,
     device_object: 0,
     pdo_object: 0,
     registry_identity_id: INVALID_HOSTED_REGISTRY_IDENTITY_ID,
@@ -30783,6 +30783,7 @@ const EMPTY_HOSTED_DEVICE_BINDING: HostedDeviceBinding = HostedDeviceBinding {
 
 #[derive(Clone, Copy)]
 struct HostedRootPdoBinding {
+    projection_domain_id: u64,
     pdo_object: u64,
     device_id: u64,
     used: bool,
@@ -31216,13 +31217,43 @@ unsafe fn clear_hosted_resource_projection(binding: HostedDeviceBinding, sh: u64
     clear_dma_allocation_records(sh);
 }
 
-fn hosted_root_pdo_device_id(pdo_object: u64) -> Option<u64> {
+fn hosted_root_pdo_device_id_in_domain(
+    projection_domain_id: u64,
+    pdo_object: u64,
+) -> Option<u64> {
+    if projection_domain_id == 0 || pdo_object == 0 {
+        return None;
+    }
+    let canonical = io_manager_mut().hosted_device_by_address(
+        nt_io_manager::HostedDomainId(projection_domain_id),
+        pdo_object,
+    )?;
     let bindings = unsafe { hosted_root_pdo_bindings()? };
-    bindings
+    let device_id = bindings
         .iter()
         .copied()
-        .find(|slot| slot.used && slot.pdo_object == pdo_object)
-        .map(|slot| slot.device_id)
+        .find(|slot| {
+            slot.used
+                && slot.projection_domain_id == projection_domain_id
+                && slot.pdo_object == pdo_object
+                && slot.device_id == canonical.raw()
+        })?
+        .device_id;
+    unsafe { hosted_root_bus_mut().pdo(nt_io_manager::DeviceId(device_id))? };
+    Some(device_id)
+}
+
+fn hosted_root_pdo_device_id(pdo_object: u64) -> Option<u64> {
+    let bindings = unsafe { hosted_root_pdo_bindings()? };
+    let mut matches = bindings
+        .iter()
+        .copied()
+        .filter(|slot| slot.used && slot.pdo_object == pdo_object);
+    let binding = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    hosted_root_pdo_device_id_in_domain(binding.projection_domain_id, pdo_object)
 }
 
 pub(crate) fn service_hosted_root_pdo_pnp(
@@ -31231,43 +31262,57 @@ pub(crate) fn service_hosted_root_pdo_pnp(
     minor: u8,
     active_reply_cap: u64,
 ) -> i32 {
-    let Some((instance, _)) = instance_for_pump_channel(ch, active_reply_cap) else {
+    let Some((instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
         return nt_status::NtStatus::INVALID_PARAMETER.raw();
+    };
+    let Some(device_id) = hosted_root_pdo_device_id_in_domain(inst.hosted_domain_id, pdo_object)
+    else {
+        return nt_status::NtStatus::ACCESS_DENIED.raw();
     };
     let authorized = unsafe {
         hosted_device_bindings()
             .is_some_and(|bindings| {
                 bindings.iter().any(|binding| {
                     binding.used
-                        && hosted_completion_storage_instance(binding.instance) == instance
+                        && binding.projection_instance == instance
+                        && binding.projection_domain_id == inst.hosted_domain_id
                         && binding.pdo_object == pdo_object
+                        && binding.pdo_device_id == device_id
                 })
             })
-            && hosted_root_pdo_device_id(pdo_object).is_some()
     };
     if !authorized {
         return nt_status::NtStatus::ACCESS_DENIED.raw();
     }
-    let Some(device_id) = hosted_root_pdo_device_id(pdo_object) else {
-        return nt_status::NtStatus::ACCESS_DENIED.raw();
-    };
     unsafe { hosted_root_bus_mut().dispatch_pnp(nt_io_manager::DeviceId(device_id), minor) }
 }
 
 fn register_hosted_root_pdo_binding(
+    projection_domain_id: u64,
     pdo_object: u64,
     device_id: u64,
 ) -> Result<(), nt_status::NtStatus> {
+    if projection_domain_id == 0 || pdo_object == 0 || device_id == 0 {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
     let bindings = unsafe { hosted_root_pdo_bindings_mut() };
-    if let Some(slot) = bindings
-        .iter_mut()
-        .find(|slot| slot.used && slot.pdo_object == pdo_object)
-    {
-        slot.device_id = device_id;
-        return Ok(());
+    if let Some(slot) = bindings.iter().find(|slot| {
+        slot.used
+            && slot.projection_domain_id == projection_domain_id
+            && (slot.pdo_object == pdo_object || slot.device_id == device_id)
+    }) {
+        return if slot.projection_domain_id == projection_domain_id
+            && slot.pdo_object == pdo_object
+            && slot.device_id == device_id
+        {
+            Ok(())
+        } else {
+            Err(nt_status::NtStatus::OBJECT_NAME_COLLISION)
+        };
     }
     if let Some(slot) = bindings.iter_mut().find(|slot| !slot.used) {
         *slot = HostedRootPdoBinding {
+            projection_domain_id,
             pdo_object,
             device_id,
             used: true,
@@ -31275,6 +31320,7 @@ fn register_hosted_root_pdo_binding(
         return Ok(());
     }
     bindings.push(HostedRootPdoBinding {
+        projection_domain_id,
         pdo_object,
         device_id,
         used: true,
@@ -31295,6 +31341,7 @@ fn hosted_root_pdo_identity_status(error: nt_root_bus::RootBusPdoError) -> nt_st
 }
 
 unsafe fn register_hosted_root_pdo<H, C>(
+    projection_domain_id: u64,
     pdo_object: u64,
     instance_path: &str,
     hardware_ids: &[H],
@@ -31305,7 +31352,9 @@ where
     C: AsRef<str>,
 {
     let (device_id, instance_id) = nt_root_bus::split_enum_instance_path(instance_path);
-    if let Some(device_id) = hosted_root_pdo_device_id(pdo_object) {
+    if let Some(device_id) =
+        hosted_root_pdo_device_id_in_domain(projection_domain_id, pdo_object)
+    {
         return Ok(device_id);
     }
     let root_driver_id = hosted_root_bus_driver_id()?;
@@ -31327,7 +31376,25 @@ where
         let _ = io_manager_mut().destroy_device(pdo_device_id);
         return Err(hosted_root_pdo_identity_status(error));
     }
-    if let Err(status) = register_hosted_root_pdo_binding(pdo_object, pdo_device_id.raw()) {
+    if let Err(status) = io_manager_mut().bind_hosted_device_address(
+        nt_io_manager::HostedDomainId(projection_domain_id),
+        pdo_object,
+        pdo_device_id,
+    ) {
+        let _ = hosted_root_bus_mut().remove_pdo(pdo_device_id);
+        let _ = io_manager_mut().destroy_device(pdo_device_id);
+        return Err(status);
+    }
+    if let Err(status) = register_hosted_root_pdo_binding(
+        projection_domain_id,
+        pdo_object,
+        pdo_device_id.raw(),
+    ) {
+        let _ = io_manager_mut().unbind_hosted_device_address(
+            nt_io_manager::HostedDomainId(projection_domain_id),
+            pdo_object,
+            pdo_device_id,
+        );
         let _ = hosted_root_bus_mut().remove_pdo(pdo_device_id);
         let _ = io_manager_mut().destroy_device(pdo_device_id);
         return Err(status);
@@ -31340,35 +31407,62 @@ fn register_hosted_device_binding(
     device_id: u64,
     pdo_device_id: u64,
     instance: usize,
+    projection_instance: usize,
+    projection_domain_id: u64,
     device_object: u64,
     pdo_object: u64,
     registry_identity_id: HostedRegistryIdentityId,
 ) -> Result<(), nt_status::NtStatus> {
-    if device_id == 0 || device_object == 0 {
-        return Ok(());
+    if driver_id == 0
+        || device_id == 0
+        || pdo_device_id == 0
+        || projection_domain_id == 0
+        || device_object == 0
+        || pdo_object == 0
+    {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
     let bindings = unsafe { hosted_device_bindings_mut() };
-    if let Some(slot) = bindings
-        .iter_mut()
-        .find(|slot| slot.used && slot.device_id == device_id)
-    {
-        let old_identity_id = slot.registry_identity_id;
-        *slot = HostedDeviceBinding {
-            driver_id,
-            device_id,
-            pdo_device_id,
-            instance,
-            device_object,
-            pdo_object,
-            registry_identity_id,
-            used: true,
+    if let Some(slot) = bindings.iter().find(|slot| {
+        slot.used
+            && (slot.device_id == device_id
+                || (slot.projection_domain_id == projection_domain_id
+                    && slot.device_object == device_object))
+    }) {
+        return if slot.driver_id == driver_id
+            && slot.device_id == device_id
+            && slot.pdo_device_id == pdo_device_id
+            && slot.instance == instance
+            && slot.projection_instance == projection_instance
+            && slot.projection_domain_id == projection_domain_id
+            && slot.device_object == device_object
+            && slot.pdo_object == pdo_object
+            && slot.registry_identity_id == registry_identity_id
+        {
+            Ok(())
+        } else {
+            Err(nt_status::NtStatus::OBJECT_NAME_COLLISION)
         };
-        if old_identity_id != registry_identity_id {
-            unsafe {
-                release_hosted_registry_identity(old_identity_id);
-            }
-        }
-        return Ok(());
+    }
+    if io_manager_mut().hosted_device_by_address(
+        nt_io_manager::HostedDomainId(projection_domain_id),
+        pdo_object,
+    ) != Some(nt_io_manager::DeviceId(pdo_device_id))
+    {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    io_manager_mut().bind_hosted_device_address(
+        nt_io_manager::HostedDomainId(projection_domain_id),
+        device_object,
+        nt_io_manager::DeviceId(device_id),
+    )?;
+    if let Err(_) = bindings.try_reserve(1) {
+        let _ = io_manager_mut().unbind_hosted_device_address(
+            nt_io_manager::HostedDomainId(projection_domain_id),
+            device_object,
+            nt_io_manager::DeviceId(device_id),
+        );
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     }
     if let Some(slot) = bindings.iter_mut().find(|slot| !slot.used) {
         *slot = HostedDeviceBinding {
@@ -31376,6 +31470,8 @@ fn register_hosted_device_binding(
             device_id,
             pdo_device_id,
             instance,
+            projection_instance,
+            projection_domain_id,
             device_object,
             pdo_object,
             registry_identity_id,
@@ -31388,6 +31484,8 @@ fn register_hosted_device_binding(
         device_id,
         pdo_device_id,
         instance,
+        projection_instance,
+        projection_domain_id,
         device_object,
         pdo_object,
         registry_identity_id,
@@ -33593,6 +33691,11 @@ fn clear_hosted_device_binding_by_device_id(device_id: u64) {
         .find(|slot| slot.used && slot.device_id == device_id)
     {
         let identity_id = slot.registry_identity_id;
+        let _ = io_manager_mut().unbind_hosted_device_address(
+            nt_io_manager::HostedDomainId(slot.projection_domain_id),
+            slot.device_object,
+            nt_io_manager::DeviceId(slot.device_id),
+        );
         unsafe {
             revoke_hosted_device_resources(*slot);
             release_hosted_registry_identity(identity_id);
@@ -33607,8 +33710,13 @@ fn clear_hosted_device_bindings_for_instance(instance: usize) {
         return;
     };
     for slot in bindings.iter_mut() {
-        if slot.used && slot.instance == instance {
+        if slot.used && (slot.instance == instance || slot.projection_instance == instance) {
             let identity_id = slot.registry_identity_id;
+            let _ = io_manager_mut().unbind_hosted_device_address(
+                nt_io_manager::HostedDomainId(slot.projection_domain_id),
+                slot.device_object,
+                nt_io_manager::DeviceId(slot.device_id),
+            );
             unsafe {
                 revoke_hosted_device_resources(*slot);
                 release_hosted_registry_identity(identity_id);
@@ -34380,11 +34488,13 @@ fn register_instance_transport(i: usize, inst: DriverInstance) {
     }
     let hosted_domain_id = t[i].hosted_domain_id;
     let hosted_domain_cookie = t[i].hosted_domain_cookie;
+    let driver_id = t[i].driver_id;
     t[i] = DriverInstance {
         ready: false,
         used: true,
         hosted_domain_id,
         hosted_domain_cookie,
+        driver_id,
         ..inst
     };
 }
@@ -34506,12 +34616,31 @@ fn clear_instance(i: usize) {
         clear_hosted_provider_dispatch_routes_for_instance(i);
         clear_hosted_provider_singletons_for_instance(i);
     }
-    if let Some(inst) = instance(i) {
+    let inst = instance(i);
+    if let Some(inst) = inst {
         unsafe {
             clear_driver_object_extensions_for_driver_object(inst.driver_object);
         }
     }
-    let domain_id = instance(i).map(|inst| inst.hosted_domain_id).unwrap_or(0);
+    if let Some(inst) = inst {
+        if inst.driver_id != 0 {
+            if inst.driver_object != 0 {
+                let _ = io_manager_mut().unbind_hosted_driver_address(
+                    nt_io_manager::HostedDomainId(inst.hosted_domain_id),
+                    inst.driver_object,
+                    DriverId(inst.driver_id),
+                );
+            }
+            if let Err(status) = io_manager_mut().destroy_driver(DriverId(inst.driver_id)) {
+                print_str(b"[driver-launch] canonical driver teardown failed id=");
+                print_u64(inst.driver_id);
+                print_str(b" status=0x");
+                print_hex(status.raw() as u32);
+                print_str(b"\n");
+            }
+        }
+    }
+    let domain_id = inst.map(|inst| inst.hosted_domain_id).unwrap_or(0);
     let t = unsafe { driver_instances_mut() };
     if i < t.len() {
         let sh = t[i].exec_shared_va;
@@ -35906,9 +36035,6 @@ fn destroy_registered_driver_after_unload(
     inst: DriverInstance,
     driver_id: u64,
 ) -> Result<(), nt_status::NtStatus> {
-    io_manager_mut()
-        .destroy_driver(DriverId(driver_id))
-        .map(|_| ())?;
     if !io_manager_mut().unbind_hosted_driver_address(
         nt_io_manager::HostedDomainId(inst.hosted_domain_id),
         inst.driver_object,
@@ -35916,7 +36042,9 @@ fn destroy_registered_driver_after_unload(
     ) {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
-    Ok(())
+    io_manager_mut()
+        .destroy_driver(DriverId(driver_id))
+        .map(|_| ())
 }
 
 unsafe fn dispatch_driver_unload_for_instance(
@@ -36232,14 +36360,21 @@ where
 {
     let (index, inst) =
         instance_by_driver_id(driver_id).ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    let provider_route = hosted_provider_dispatch_route_for_instance(index);
+    let projection_instance = provider_route
+        .map(|route| route.provider_instance)
+        .unwrap_or(index);
+    let projection_inst =
+        instance(projection_instance).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    if projection_inst.hosted_domain_id == 0 {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
     let registry_identity =
         build_hosted_registry_identity(class_guid, driver_key, linkage_export, instance_path)?;
     let registry_identity_id = allocate_hosted_registry_identity(registry_identity)?;
     publish_shared_registry_identity_at(inst.exec_shared_va, &registry_identity)?;
-    let provider_add_device_shared =
-        hosted_provider_dispatch_route_for_instance(index).and_then(|route| {
-            instance(route.provider_instance).map(|provider| provider.exec_shared_va)
-        });
+    let provider_add_device_shared = provider_route
+        .and_then(|route| instance(route.provider_instance).map(|provider| provider.exec_shared_va));
     if let Some(provider_shared) = provider_add_device_shared {
         if let Err(status) =
             publish_shared_registry_identity_at(provider_shared, &registry_identity)
@@ -36296,6 +36431,7 @@ where
         None => None,
     };
     let pdo_device_id = match register_hosted_root_pdo(
+        projection_inst.hosted_domain_id,
         add_device.pdo_object,
         instance_path,
         hardware_ids,
@@ -36339,6 +36475,8 @@ where
         device_id.raw(),
         pdo_device_id,
         index,
+        projection_instance,
+        projection_inst.hosted_domain_id,
         add_device.fdo_object,
         add_device.pdo_object,
         registry_identity_id,
@@ -37571,6 +37709,7 @@ pub(crate) unsafe fn unload_driver_by_name(
         let _ = crate::tcb_suspend_r(inst.tcb);
     }
     destroy_registered_driver_after_unload(inst, driver_id)?;
+    driver_instances_mut()[index].driver_id = 0;
     clear_instance(index);
     Ok(())
 }
@@ -37856,9 +37995,22 @@ unsafe fn dispatch_irp_for_instance(
             if !route.add_device_ready() {
                 return Some((STATUS_INVALID_DEVICE_REQUEST, 0, 0));
             }
-            let binding = hosted_device_binding_by_device_object(device_object)
-                .or_else(|| hosted_device_binding_by_device_id(dependent_inst.device_id))?;
             let provider_inst = instance(route.provider_instance)?;
+            let binding = if let Some(request) = dispatch_request.as_ref() {
+                let binding = hosted_device_binding_by_device_id(request.device_id)?;
+                if binding.driver_id != request.driver_id
+                    || binding.instance != inst
+                    || binding.projection_instance != route.provider_instance
+                    || binding.projection_domain_id != provider_inst.hosted_domain_id
+                    || binding.device_object != device_object
+                {
+                    return Some((STATUS_INVALID_PARAMETER, 0, 0));
+                }
+                binding
+            } else {
+                hosted_device_binding_by_device_object(device_object)
+                    .or_else(|| hosted_device_binding_by_device_id(dependent_inst.device_id))?
+            };
             if provider_inst.fault_ep == 0
                 || provider_inst.pml4 == 0
                 || provider_inst.reply_cap == 0
