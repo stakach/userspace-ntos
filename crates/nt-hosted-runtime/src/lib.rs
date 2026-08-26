@@ -168,7 +168,7 @@ impl HostedThunkSlotKey {
         target: u64,
         discriminator: u64,
     ) -> Option<Self> {
-        if purpose == 0 || target == 0 {
+        if purpose == 0 || target == 0 && discriminator == 0 {
             return None;
         }
         Some(Self {
@@ -240,7 +240,16 @@ impl<const N: usize> HostedThunkSlotRegistry<N> {
         &mut self,
         key: HostedThunkSlotKey,
     ) -> Result<HostedThunkReservation, HostedThunkSlotError> {
-        for (index, slot) in self.slots.iter().copied().enumerate() {
+        self.reserve_with_limit(key, N)
+    }
+
+    pub fn reserve_with_limit(
+        &mut self,
+        key: HostedThunkSlotKey,
+        limit: usize,
+    ) -> Result<HostedThunkReservation, HostedThunkSlotError> {
+        let limit = limit.min(N);
+        for (index, slot) in self.slots[..limit].iter().copied().enumerate() {
             if slot.key != Some(key) {
                 continue;
             }
@@ -259,8 +268,7 @@ impl<const N: usize> HostedThunkSlotRegistry<N> {
                 HostedThunkSlotState::Free => Err(HostedThunkSlotError::InvalidToken),
             };
         }
-        let Some(index) = self
-            .slots
+        let Some(index) = self.slots[..limit]
             .iter()
             .position(|slot| slot.state == HostedThunkSlotState::Free)
         else {
@@ -284,6 +292,13 @@ impl<const N: usize> HostedThunkSlotRegistry<N> {
             index: index as u16,
             generation,
         }))
+    }
+
+    pub fn available_with_limit(&self, limit: usize) -> usize {
+        self.slots[..limit.min(N)]
+            .iter()
+            .filter(|slot| slot.state == HostedThunkSlotState::Free)
+            .count()
     }
 
     pub fn commit(

@@ -11861,3 +11861,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     reserve before planning or encoding, abort on every pre-publication failure, parent callback rows
     to the exact slot token, and retire live slots only behind the dependency/instance dispatch fence.
     Do not enable live raw-address reuse merely because the registry token generation changed.
+
+    Executive thunk reservation checkpoint (2026-08-26, implementation green): each hosted driver
+    instance now carries the tested generation-bearing registry for the dynamic suffix of its thunk
+    page; load-time IAT slots remain an immutable prefix. Provider import, internal-provider import,
+    and reverse-callback emission reserve an exact-owner key before planning or encoding. Existing
+    live keys return the established code address, while planning, callback-row allocation, and
+    encoding failures abort the unpublished reservation and leave the slot reusable with a fresh
+    generation. Final `register_instance` preserves reservations created by real provider calls made
+    during `DriverEntry` instead of replacing their allocator state with the load-time prefix.
+
+    Callback rows now carry their exact thunk token/key and a monotonic nonzero callback cookie.
+    Construction rows are invisible to dispatch, reusable vector slots do not reuse callback
+    identity, and publication is coupled to thunk commit. Callback lookup scans for the exact cookie
+    and revalidates both domain generations plus the live dependency. The former monotonic
+    `thunk_next` runtime allocator and vector-index callback cookies are removed. Focused runtime
+    tests remain green at `61/61`; the freestanding executive release check remains green at the
+    established 212-warning baseline and `git diff --check` is clean.
+
+    Review adjustment: unpublished slot leaks and stale callback-cookie aliasing are closed, but
+    published callback slot reclamation is intentionally still disabled. Dependency retirement alone
+    does not prove that NDIS discarded every raw callback pointer. Timer, work-item, characteristics,
+    and miniport-mirror transactions must parent their callback registrations and invoke each real
+    compensating unregister/cancel operation before moving those live slots through `Retiring` to
+    `Free`. Broad callback-row tombstoning may reject stale dispatch, but it is not quiescence proof
+    and must not authorize raw-address reuse.

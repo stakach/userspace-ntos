@@ -45,7 +45,9 @@ use nt_hosted_runtime::{
     HostedProviderExportResultSemantics, HostedProviderExportSideEffect,
     HostedProviderImportBinding, HostedProviderImportBindingError, HostedProviderImportThunkError,
     HostedProviderImportThunkPlan, HostedProviderObjectOwner, HostedProviderReleaseProgress,
-    NdisMiniportCharacteristicsLayoutError, NdisProtocolCharacteristicsLayoutError,
+    HostedThunkReservation, HostedThunkSlotKey, HostedThunkSlotRegistry, HostedThunkSlotToken,
+    NdisMiniportCharacteristicsLayoutError,
+    NdisProtocolCharacteristicsLayoutError,
     DC21X4_ADAPTER_CURRENT_INTERRUPT_MASK_OFFSET_X64, DC21X4_ADAPTER_CURRENT_RBD_OFFSET_X64,
     DC21X4_ADAPTER_FLAGS_OFFSET_X64, DC21X4_ADAPTER_HEAD_RBD_OFFSET_X64,
     DC21X4_ADAPTER_INTERRUPT_STATUS_OFFSET_X64, DC21X4_ADAPTER_TAIL_RBD_OFFSET_X64,
@@ -14274,6 +14276,11 @@ const MAX_RAW_IMPORT_DESCRIPTORS: u32 = 256;
 const MAX_LOADED_EXPORT_NAMES: u32 = 1024;
 const HOSTED_EXECUTABLE_THUNK_FRAMES: u64 = 1;
 const HOSTED_EXECUTABLE_THUNK_TABLE_LEN: u64 = HOSTED_EXECUTABLE_THUNK_FRAMES * 0x1000;
+const HOSTED_EXECUTABLE_THUNK_SLOT_COUNT: usize =
+    (HOSTED_EXECUTABLE_THUNK_TABLE_LEN / HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN) as usize;
+const HOSTED_THUNK_PURPOSE_PROVIDER_IMPORT: u8 = 1;
+const HOSTED_THUNK_PURPOSE_PROVIDER_INTERNAL_IMPORT: u8 = 2;
+const HOSTED_THUNK_PURPOSE_PROVIDER_CALLBACK: u8 = 3;
 
 #[derive(Clone, Copy)]
 struct LoadedDependencyImage {
@@ -14986,6 +14993,10 @@ struct HostedProviderInternalMarshalPolicyRecord {
 #[derive(Clone, Copy)]
 struct HostedProviderCallbackRecord {
     present: bool,
+    construction_state: HostedProviderConstructionState,
+    callback_cookie: u64,
+    thunk_token: HostedThunkSlotToken,
+    thunk_key: HostedThunkSlotKey,
     provider_instance: usize,
     dependent_instance: usize,
     provider_domain: HostedDomainIdentity,
@@ -15126,6 +15137,7 @@ static HOSTED_PROVIDER_EXPORT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_EXPORT_FRAME_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_PROVIDER_EXPORT_FRAME_TRACE_CAP: u64 = 16;
 static mut HOSTED_PROVIDER_CALLBACK_RECORDS: Option<Vec<HostedProviderCallbackRecord>> = None;
+static HOSTED_PROVIDER_CALLBACK_NEXT_COOKIE: AtomicU64 = AtomicU64::new(1);
 static HOSTED_PROVIDER_CALLBACK_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_PACKET_ARRAY_EXPORT_REQUESTS: AtomicU64 = AtomicU64::new(0);
@@ -16137,7 +16149,9 @@ unsafe fn instance_executable_thunk_available(instance_index: usize) -> u64 {
         return 0;
     }
     let slots = inst.thunk_len / HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN;
-    slots.saturating_sub(inst.thunk_next)
+    let dynamic_slots = slots.saturating_sub(inst.thunk_next);
+    inst.thunk_slots
+        .available_with_limit(dynamic_slots.min(usize::MAX as u64) as usize) as u64
 }
 
 fn hosted_provider_domain_dependency_is_live(dependency: HostedProviderDomainDependency) -> bool {
@@ -16362,7 +16376,9 @@ unsafe fn register_hosted_provider_callback_record(
     target: u64,
     callback_offset: u64,
     callback_kind: u8,
-) -> Option<u64> {
+    thunk_token: HostedThunkSlotToken,
+    thunk_key: HostedThunkSlotKey,
+) -> Option<(usize, u64)> {
     let dependency =
         hosted_provider_domain_dependency_for_pair(provider_instance, dependent_instance)?;
     let dependent_inst = instance(dependent_instance)?;
@@ -16376,9 +16392,23 @@ unsafe fn register_hosted_provider_callback_record(
         return None;
     }
     let records = hosted_provider_callback_records_mut();
-    let cookie = (records.len() as u64).checked_add(1)?;
-    records.push(HostedProviderCallbackRecord {
+    let index = if let Some(index) = records.iter().position(|record| !record.present) {
+        index
+    } else {
+        records.try_reserve(1).ok()?;
+        records.len()
+    };
+    let cookie = HOSTED_PROVIDER_CALLBACK_NEXT_COOKIE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cookie| {
+            cookie.checked_add(1).filter(|next| *next != 0)
+        })
+        .ok()?;
+    let record = HostedProviderCallbackRecord {
         present: true,
+        construction_state: HostedProviderConstructionState::Constructing,
+        callback_cookie: cookie,
+        thunk_token,
+        thunk_key,
         provider_instance,
         dependent_instance,
         provider_domain: dependency.provider_domain,
@@ -16387,22 +16417,83 @@ unsafe fn register_hosted_provider_callback_record(
         target,
         callback_offset,
         callback_kind,
-    });
-    Some(cookie)
+    };
+    if index == records.len() {
+        records.push(record);
+    } else {
+        records[index] = record;
+    }
+    Some((index, cookie))
+}
+
+unsafe fn finish_hosted_provider_callback_record(
+    index: usize,
+    callback_cookie: u64,
+    thunk_token: HostedThunkSlotToken,
+    thunk_key: HostedThunkSlotKey,
+) -> bool {
+    let Some(record) = hosted_provider_callback_records_mut().get_mut(index) else {
+        return false;
+    };
+    if !record.present
+        || record.construction_state != HostedProviderConstructionState::Constructing
+        || record.callback_cookie != callback_cookie
+        || record.thunk_token != thunk_token
+        || record.thunk_key != thunk_key
+    {
+        return false;
+    }
+    record.construction_state = HostedProviderConstructionState::Published;
+    true
+}
+
+unsafe fn abort_hosted_provider_callback_record(
+    index: usize,
+    callback_cookie: u64,
+    thunk_token: HostedThunkSlotToken,
+    thunk_key: HostedThunkSlotKey,
+) {
+    if let Some(record) = hosted_provider_callback_records_mut().get_mut(index) {
+        if record.present
+            && matches!(
+                record.construction_state,
+                HostedProviderConstructionState::Constructing
+                    | HostedProviderConstructionState::Published
+            )
+            && record.callback_cookie == callback_cookie
+            && record.thunk_token == thunk_token
+            && record.thunk_key == thunk_key
+        {
+            record.present = false;
+        }
+    }
+}
+
+unsafe fn hosted_provider_callback_record_for_thunk(
+    thunk_token: HostedThunkSlotToken,
+    thunk_key: HostedThunkSlotKey,
+) -> Option<HostedProviderCallbackRecord> {
+    hosted_provider_callback_records()?
+        .iter()
+        .copied()
+        .find(|record| {
+            record.present
+                && record.construction_state == HostedProviderConstructionState::Published
+                && record.thunk_token == thunk_token
+                && record.thunk_key == thunk_key
+        })
 }
 
 unsafe fn hosted_provider_callback_record(cookie: u64) -> Option<HostedProviderCallbackRecord> {
     if cookie == 0 {
         return None;
     }
-    let index = cookie.checked_sub(1)?;
-    if index > usize::MAX as u64 {
-        return None;
-    }
     let record = hosted_provider_callback_records()?
-        .get(index as usize)
-        .copied()?;
+        .iter()
+        .copied()
+        .find(|record| record.present && record.callback_cookie == cookie)?;
     if !record.present
+        || record.construction_state != HostedProviderConstructionState::Published
         || instance(record.provider_instance).and_then(instance_domain_identity)
             != Some(record.provider_domain)
         || instance(record.dependent_instance).and_then(instance_domain_identity)
@@ -21187,26 +21278,49 @@ unsafe fn provider_marshal_emit_import_thunk_for_instance(
     if export_plan.provider_publication_cookie != expected_provider_publication_cookie {
         return Err(STATUS_INVALID_PARAMETER);
     }
+    let Some((_, singleton)) =
+        find_hosted_provider_singleton_by_cookie(expected_provider_publication_cookie)
+    else {
+        return Err(STATUS_DEVICE_NOT_READY);
+    };
+    let owner = hosted_provider_object_owner_for_pair(singleton.instance, dependent_instance)
+        .ok_or(STATUS_DEVICE_NOT_READY)?;
+    let key = HostedThunkSlotKey::new(
+        owner,
+        HOSTED_THUNK_PURPOSE_PROVIDER_IMPORT,
+        export_plan.provider_export_rva,
+        expected_provider_publication_cookie,
+    )
+    .ok_or(STATUS_INVALID_PARAMETER)?;
     let Some(dependent_inst) = instance(dependent_instance) else {
         return Err(STATUS_DEVICE_NOT_READY);
     };
-    let Some((exec_va, _run_va, thunk_index)) =
-        allocate_instance_executable_thunk(dependent_instance)
-    else {
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
-    };
-    let thunk = plan_hosted_provider_import_thunk(
+    let reservation = reserve_instance_executable_thunk(dependent_instance, key)?;
+    if reservation.existing {
+        return Ok(reservation.run_va);
+    }
+    let thunk = match plan_hosted_provider_import_thunk(
         dependent_inst.run_thunk_va,
         dependent_inst.thunk_len,
-        thunk_index,
+        reservation.thunk_index,
         export_plan,
-    )
-    .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    ) {
+        Ok(thunk) => thunk,
+        Err(_) => {
+            abort_instance_executable_thunk(dependent_instance, reservation);
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+    };
     let slot = core::slice::from_raw_parts_mut(
-        exec_va as *mut u8,
+        reservation.exec_va as *mut u8,
         HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN as usize,
     );
-    encode_hosted_provider_import_thunk(thunk, slot).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    if encode_hosted_provider_import_thunk(thunk, slot).is_err()
+        || !commit_instance_executable_thunk(dependent_instance, reservation)
+    {
+        abort_instance_executable_thunk(dependent_instance, reservation);
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
     Ok(thunk.thunk_va)
 }
 
@@ -21323,26 +21437,44 @@ unsafe fn provider_marshal_emit_internal_import_thunk_for_instance(
         }
         Err(_) => return Err(STATUS_INVALID_PARAMETER),
     };
+    let owner = hosted_provider_object_owner_for_pair(singleton.instance, dependent_instance)
+        .ok_or(STATUS_DEVICE_NOT_READY)?;
+    let key = HostedThunkSlotKey::new(
+        owner,
+        HOSTED_THUNK_PURPOSE_PROVIDER_INTERNAL_IMPORT,
+        provider_target_component_va,
+        provider_rva,
+    )
+    .ok_or(STATUS_INVALID_PARAMETER)?;
     let Some(dependent_inst) = instance(dependent_instance) else {
         return Err(STATUS_DEVICE_NOT_READY);
     };
-    let Some((exec_va, _run_va, thunk_index)) =
-        allocate_instance_executable_thunk(dependent_instance)
-    else {
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
-    };
-    let thunk = plan_hosted_provider_import_thunk(
+    let reservation = reserve_instance_executable_thunk(dependent_instance, key)?;
+    if reservation.existing {
+        return Ok(reservation.run_va);
+    }
+    let thunk = match plan_hosted_provider_import_thunk(
         dependent_inst.run_thunk_va,
         dependent_inst.thunk_len,
-        thunk_index,
+        reservation.thunk_index,
         plan,
-    )
-    .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    ) {
+        Ok(thunk) => thunk,
+        Err(_) => {
+            abort_instance_executable_thunk(dependent_instance, reservation);
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+    };
     let slot = core::slice::from_raw_parts_mut(
-        exec_va as *mut u8,
+        reservation.exec_va as *mut u8,
         HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN as usize,
     );
-    encode_hosted_provider_import_thunk(thunk, slot).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    if encode_hosted_provider_import_thunk(thunk, slot).is_err()
+        || !commit_instance_executable_thunk(dependent_instance, reservation)
+    {
+        abort_instance_executable_thunk(dependent_instance, reservation);
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
     Ok(thunk.thunk_va)
 }
 
@@ -21907,32 +22039,73 @@ unsafe fn provider_marshal_emit_callback_thunk(
     callback_offset: u64,
     callback_kind: u8,
 ) -> Result<u64, i32> {
-    let Some((exec_va, run_va, thunk_index)) =
-        allocate_instance_executable_thunk(provider_instance)
-    else {
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
-    };
-    let Some(callback_cookie) = register_hosted_provider_callback_record(
+    let owner = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
+        .ok_or(STATUS_DEVICE_NOT_READY)?;
+    let discriminator = callback_offset ^ ((callback_kind as u64) << 56);
+    let key = HostedThunkSlotKey::new(
+        owner,
+        HOSTED_THUNK_PURPOSE_PROVIDER_CALLBACK,
+        target,
+        discriminator,
+    )
+    .ok_or(STATUS_INVALID_PARAMETER)?;
+    let reservation = reserve_instance_executable_thunk(provider_instance, key)?;
+    if reservation.existing {
+        let Some(record) = hosted_provider_callback_record_for_thunk(reservation.token, key) else {
+            return Err(STATUS_DEVICE_NOT_READY);
+        };
+        return if record.target == target
+            && record.callback_offset == callback_offset
+            && record.callback_kind == callback_kind
+            && hosted_provider_callback_record(record.callback_cookie).is_some()
+        {
+            Ok(reservation.run_va)
+        } else {
+            Err(STATUS_DEVICE_NOT_READY)
+        };
+    }
+    let Some((record_index, callback_cookie)) = register_hosted_provider_callback_record(
         provider_instance,
         dependent_instance,
         target,
         callback_offset,
         callback_kind,
+        reservation.token,
+        key,
     ) else {
+        abort_instance_executable_thunk(provider_instance, reservation);
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
     let thunk = HostedProviderCallbackThunkPlan {
-        thunk_va: run_va,
-        thunk_offset: thunk_index.saturating_mul(HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN),
+        thunk_va: reservation.run_va,
+        thunk_offset: reservation
+            .thunk_index
+            .saturating_mul(HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN),
         callback_gate: hosted_provider_callback_gate_va(),
         callback_cookie,
     };
     let slot = core::slice::from_raw_parts_mut(
-        exec_va as *mut u8,
+        reservation.exec_va as *mut u8,
         HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN as usize,
     );
-    encode_hosted_provider_callback_thunk(thunk, slot)
-        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    if encode_hosted_provider_callback_thunk(thunk, slot).is_err()
+        || !finish_hosted_provider_callback_record(
+            record_index,
+            callback_cookie,
+            reservation.token,
+            key,
+        )
+        || !commit_instance_executable_thunk(provider_instance, reservation)
+    {
+        abort_hosted_provider_callback_record(
+            record_index,
+            callback_cookie,
+            reservation.token,
+            key,
+        );
+        abort_instance_executable_thunk(provider_instance, reservation);
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
     Ok(thunk.thunk_va)
 }
 
@@ -22416,9 +22589,6 @@ unsafe fn provider_marshal_miniport_timer_function(
 ) -> Result<u64, i32> {
     if target == 0 {
         return Err(STATUS_INVALID_PARAMETER);
-    }
-    if instance_executable_thunk_available(provider_instance) == 0 {
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
     provider_marshal_emit_callback_thunk(
         provider_instance,
@@ -36967,6 +37137,7 @@ pub(crate) struct DriverInstance {
     pub exec_thunk_va: u64,
     pub run_thunk_va: u64,
     pub thunk_len: u64,
+    thunk_slots: HostedThunkSlotRegistry<HOSTED_EXECUTABLE_THUNK_SLOT_COUNT>,
     pub thunk_next: u64,
     pub tcb: u64,
     pub cnode: u64,
@@ -37004,6 +37175,7 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     exec_thunk_va: 0,
     run_thunk_va: 0,
     thunk_len: 0,
+    thunk_slots: HostedThunkSlotRegistry::new(),
     thunk_next: 0,
     tcb: 0,
     cnode: 0,
@@ -37689,6 +37861,7 @@ fn register_instance(dc: &DriverComponent) {
     while t.len() <= dc.instance {
         t.push(EMPTY_INSTANCE);
     }
+    let thunk_slots = t[dc.instance].thunk_slots;
     t[dc.instance] = DriverInstance {
         fault_ep: dc.fault_ep,
         pml4: dc.pml4,
@@ -37707,6 +37880,7 @@ fn register_instance(dc: &DriverComponent) {
         exec_thunk_va: dc.exec_thunk_va,
         run_thunk_va: dc.run_thunk_va,
         thunk_len: dc.thunk_len,
+        thunk_slots,
         thunk_next: dc.thunk_next,
         tcb: dc.tcb,
         cnode: dc.cnode,
@@ -37730,26 +37904,109 @@ fn register_instance(dc: &DriverComponent) {
     };
 }
 
-#[allow(dead_code)]
-unsafe fn allocate_instance_executable_thunk(instance: usize) -> Option<(u64, u64, u64)> {
+#[derive(Clone, Copy)]
+struct HostedExecutableThunkReservation {
+    token: HostedThunkSlotToken,
+    key: HostedThunkSlotKey,
+    exec_va: u64,
+    run_va: u64,
+    thunk_index: u64,
+    existing: bool,
+}
+
+unsafe fn reserve_instance_executable_thunk(
+    instance: usize,
+    key: HostedThunkSlotKey,
+) -> Result<HostedExecutableThunkReservation, i32> {
     let table = driver_instances_mut();
-    let inst = table.get_mut(instance)?;
+    let Some(inst) = table.get_mut(instance) else {
+        return Err(STATUS_DEVICE_NOT_READY);
+    };
     if !inst.used || inst.exec_thunk_va == 0 || inst.run_thunk_va == 0 || inst.thunk_len == 0 {
-        return None;
+        return Err(STATUS_DEVICE_NOT_READY);
     }
-    let thunk_offset = inst
+    let total_slots = inst.thunk_len / HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN;
+    let dynamic_slots = total_slots
+        .checked_sub(inst.thunk_next)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let reservation = inst
+        .thunk_slots
+        .reserve_with_limit(
+            key,
+            dynamic_slots.min(HOSTED_EXECUTABLE_THUNK_SLOT_COUNT as u64) as usize,
+        )
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    let (token, existing) = match reservation {
+        HostedThunkReservation::Existing(token) => (token, true),
+        HostedThunkReservation::Reserved(token) => (token, false),
+    };
+    let thunk_index = inst
         .thunk_next
-        .checked_mul(HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN)?;
-    let thunk_end = thunk_offset.checked_add(HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN)?;
+        .checked_add(token.index as u64)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let thunk_offset = thunk_index
+        .checked_mul(HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let thunk_end = thunk_offset
+        .checked_add(HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
     if thunk_end > inst.thunk_len {
-        return None;
+        if !existing {
+            let _ = inst.thunk_slots.abort(token, key);
+        }
+        return Err(STATUS_INVALID_PARAMETER);
     }
-    let thunk_index = inst.thunk_next;
-    let exec_va = inst.exec_thunk_va.checked_add(thunk_offset)?;
-    let run_va = inst.run_thunk_va.checked_add(thunk_offset)?;
-    let next = inst.thunk_next.checked_add(1)?;
-    inst.thunk_next = next;
-    Some((exec_va, run_va, thunk_index))
+    let Some(exec_va) = inst.exec_thunk_va.checked_add(thunk_offset) else {
+        if !existing {
+            let _ = inst.thunk_slots.abort(token, key);
+        }
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let Some(run_va) = inst.run_thunk_va.checked_add(thunk_offset) else {
+        if !existing {
+            let _ = inst.thunk_slots.abort(token, key);
+        }
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    Ok(HostedExecutableThunkReservation {
+        token,
+        key,
+        exec_va,
+        run_va,
+        thunk_index,
+        existing,
+    })
+}
+
+unsafe fn commit_instance_executable_thunk(
+    instance_index: usize,
+    reservation: HostedExecutableThunkReservation,
+) -> bool {
+    if reservation.existing {
+        return instance(instance_index).is_some_and(|inst| {
+            inst.thunk_slots
+                .is_live(reservation.token, reservation.key)
+        });
+    }
+    driver_instances_mut()
+        .get_mut(instance_index)
+        .is_some_and(|inst| {
+            inst.thunk_slots
+                .commit(reservation.token, reservation.key)
+                .is_ok()
+        })
+}
+
+unsafe fn abort_instance_executable_thunk(
+    instance: usize,
+    reservation: HostedExecutableThunkReservation,
+) {
+    if reservation.existing {
+        return;
+    }
+    if let Some(inst) = driver_instances_mut().get_mut(instance) {
+        let _ = inst.thunk_slots.abort(reservation.token, reservation.key);
+    }
 }
 
 pub(crate) fn driver_object_id(driver_id: u64) -> u64 {
