@@ -11459,6 +11459,38 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     payload pressure by growing a monolithic boot image. Do not reintroduce executive-local resource
     or property fallbacks.
 
+    Full framebuffer BAR authority checkpoint (2026-08-26, accepted): rust-micro no longer filters
+    a PCI memory BAR merely because it contains BOOTBOOT's GOP scanout, and no longer appends a
+    second power-of-two framebuffer untyped. The probed BAR list is the only physical authority;
+    BOOTBOOT's trailing BootInfo fields are geometry only. A microkernel invariant requires each
+    nonempty scanout range to belong to exactly one published device untyped. On the executive side,
+    Phase 0 finds that unique containing interval, retypes the full aperture once into one contiguous
+    cap run, maps the full aperture, and retains it for both win32k and the hosted PnP grant. The old
+    partial `min(boot_pages, requested_pages)` reuse is deleted. Active mode bounds use aperture
+    capacity after the scanout offset, while paint/readback continues to use the real current mode.
+
+    Serialized proof `.tmp/run-desktop-20260826-100236.log` publishes one Bochs BAR0 authority at
+    `0x80000000 bits=24`, observes BOOTBOOT's initial 3 MiB scanout at offset zero, maps all 4,096
+    frames into win32k, and grants the same 16 MiB resource to bochsmp. The miniport selects its real
+    `800x600` mode, the login dialog contains 103,493 non-desktop pixels, genuine Explorer chrome is
+    painted, and all `293/293` gates pass. The rust-micro freestanding check with
+    `spec,extern-rootserver` and the executive release check are green.
+
+    Review adjustment: framebuffer ownership is closed. Next replace the three independently
+    replaceable hosted-PnP context globals with one generation-owned context registry. Separate
+    clonable resource descriptions from non-clonable cap/map/IOMMU ownership, acquire an exact
+    context lease for every prepared device grant, publish replacements transactionally, and retire
+    old aliases and VA ranges only after the last matching-generation lease drains. Carry full
+    `HostedDomainIdentity` into bindings, provider routes, paging rows, and resource-map-cap rows;
+    reject provider unload while dependent projection leases remain, and retain teardown-pending
+    records when an exact revoke/unbind fails. PnP assignment/start state and the video route must be
+    invalidated in the same ordered device teardown before domain retirement.
+
+    Track one separate rust-micro correctness item after this lifetime tranche: device-frame mapping
+    cache attributes are still marked TODO in `rust-micro/src/untyped.rs`. Define and prove the x86
+    MMIO/device-memory cache policy rather than relying on comments that describe all device frames
+    as uncacheable.
+
     After that boundary is live, migrate the standalone hal, power, PnP, async, MMIO, and DMA
     component harnesses to `CompletionOwnerClaim` plus `CompletionUnwindCursor`, including their
     direct attach/lower-call shims. Reconcile the separate `driver-host-direg` and `nt-driver-host`

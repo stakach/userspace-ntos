@@ -12048,10 +12048,9 @@ pub const FRAMEBUF_LOAD_FRAMES: u64 = 8;
 /// ZwSetSystemInformation, then resolves KbdLayerDescriptor from its export directory.
 pub const KEYBOARD_LAYOUT_VA: u64 = 0x0000_0100_08A0_0000;
 pub const KEYBOARD_LAYOUT_LOAD_FRAMES: u64 = 8;
-/// The BOOTBOOT framebuffer (Phase-0a fb device frames) mapped into win32k's VSpace, RW. The
-/// executive video-device boundary returns this VA for `IOCTL_VIDEO_MAP_VIDEO_MEMORY`, so the
-/// display driver writes pixels straight to the real framebuffer.
-/// The size and mode are discovered from BootInfo in Phase 0a and carried in `DisplayRegistrySpec`.
+/// The complete display PCI BAR mapped into win32k's VSpace, RW. The executive video-device
+/// boundary returns an offset in this aperture for `IOCTL_VIDEO_MAP_VIDEO_MEMORY`; BOOTBOOT's
+/// framebuffer fields describe the initial scanout geometry only.
 pub const WIN32K_FB_VA: u64 = 0x0000_0100_0900_0000;
 
 /// Record the loaded display DLL info selected from the SYSTEM hive. Some ReactOS display DLLs have

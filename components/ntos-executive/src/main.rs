@@ -4141,7 +4141,7 @@ unsafe fn verify_logon_dialog_framebuffer() -> bool {
     let mut non_desktop = 0u64;
     let mut colors = [0u32; 16];
     let mut color_count = 0usize;
-    let fb = FB_VADDR as *const u32;
+    let fb = framebuffer_scanout_va() as *const u32;
     let stride_pixels = scanline / 4;
     for y in top..bottom {
         for x in left..right {
@@ -5077,7 +5077,7 @@ unsafe fn explorer_framebuffer_final_readback() -> ExplorerFramebufferReadback {
     };
 
     let stride_pixels = scanline / 4;
-    let fb = FB_VADDR as *const u32;
+    let fb = framebuffer_scanout_va() as *const u32;
     let mut non_bg = 0u64;
     let mut min_x = width;
     let mut min_y = height;
@@ -13896,7 +13896,7 @@ unsafe fn grant_hosted_devnode_resources(
                 map_pages: mapped.map_pages,
                 video_memory_caller_va: if grant.device.base_class()
                     == nt_pnp::PCI_CLASS_DISPLAY
-                    && translated.start == FB_PADDR.load(Ordering::Relaxed)
+                    && translated.start == FB_BAR_PADDR.load(Ordering::Relaxed)
                 {
                     win32k_subsystem::WIN32K_FB_VA
                 } else {
@@ -18805,7 +18805,7 @@ fn hosted_pci_eager_mmio_map_pages(
     grant: &HostedPciMemoryGrant,
 ) -> u64 {
     if device.base_class() == nt_pnp::PCI_CLASS_DISPLAY
-        && grant.phys == FB_PADDR.load(Ordering::Relaxed)
+        && grant.phys == FB_BAR_PADDR.load(Ordering::Relaxed)
     {
         grant
             .pages
@@ -18985,7 +18985,7 @@ unsafe fn claim_hosted_pci_memory_grants(
         .filter(|bar| bar.is_present() && !bar.is_io)
     {
         let requested_pages = bar.size.div_ceil(0x1000).max(1);
-        let run = existing_boot_framebuffer_cap_run(bar.base, requested_pages)
+        let run = existing_boot_framebuffer_bar_cap_run(bar.base, requested_pages)
             .or_else(|| claim_device_frame_caps(bi, bar.base, requested_pages))?;
         grants.push(HostedPciMemoryGrant {
             bar_index: bar.index,
@@ -24564,17 +24564,17 @@ pub(crate) static WINLOGON_GDI_MAPPED: AtomicU64 = AtomicU64::new(0);
 /// GDI client too.
 pub(crate) static USERINIT_GDI_MAPPED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_GDI_MAPPED: AtomicU64 = AtomicU64::new(0);
-/// The BOOTBOOT framebuffer's frame-cap base + count (set in Phase 0a's `claim_device_pages`), so the
-/// win32k bring-up can copy_cap + map the SAME physical fb frames into win32k's VSpace at WIN32K_FB_VA
-/// (the display DLL's IOCTL_VIDEO_MAP_VIDEO_MEMORY reports that VA so GDI writes pixels to the real fb).
-static FB_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
-static FB_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
-static FB_PADDR: AtomicU64 = AtomicU64::new(0);
+/// Complete PCI memory-BAR authority containing the BOOTBOOT scanout. Phase 0 retypes this BAR once;
+/// win32k and the hosted video miniport receive aliases of this same cap run.
+static FB_BAR_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
+static FB_BAR_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
+static FB_BAR_PADDR: AtomicU64 = AtomicU64::new(0);
+/// Byte offset of BOOTBOOT's scanout view from `FB_BAR_PADDR`.
+static FB_SCANOUT_BAR_OFFSET: AtomicU64 = AtomicU64::new(0);
 static FB_WIDTH: AtomicU64 = AtomicU64::new(0);
 static FB_HEIGHT: AtomicU64 = AtomicU64::new(0);
 static FB_SCANLINE: AtomicU64 = AtomicU64::new(0);
 static FB_SIZE_BYTES: AtomicU64 = AtomicU64::new(0);
-static FB_BITS_PER_PLANE: AtomicU64 = AtomicU64::new(0);
 /// Latest validated `IOCTL_VIDEO_QUERY_CURRENT_MODE` reply. The zero size denotes that the display
 /// stack has not published a current mode yet, in which case the boot GOP geometry remains active.
 static ACTIVE_FB_WIDTH: AtomicU64 = AtomicU64::new(0);
@@ -24584,17 +24584,17 @@ static ACTIVE_FB_SIZE_BYTES: AtomicU64 = AtomicU64::new(0);
 /// The authentic desktop background COLORREF that win32k's WC_DESKTOP class paints. Final dialog
 /// and Explorer readback compare against it without mutating the framebuffer under observation.
 const FB_DESKTOP_BG: u32 = 0x003a_6ea5;
-/// The executive's Phase-0a framebuffer window (also read back after the desktop-graphics init to
-/// confirm GDI/display-driver pixels landed).
+/// The executive's Phase-0a display BAR window. Readback begins at `FB_SCANOUT_BAR_OFFSET`.
 const FB_VADDR: u64 = 0x0000_0200_0000_0000;
 
 pub(crate) fn publish_active_framebuffer_mode(mode: nt_video_miniport::VideoModeSpec) -> bool {
     let Some(size_bytes) = mode.framebuffer_bytes() else {
         return false;
     };
-    let mapped_bytes = FB_SIZE_BYTES
+    let mapped_bytes = FB_BAR_FRAME_COUNT
         .load(Ordering::Acquire)
-        .min(FB_FRAME_COUNT.load(Ordering::Acquire).saturating_mul(0x1000));
+        .saturating_mul(0x1000)
+        .saturating_sub(FB_SCANOUT_BAR_OFFSET.load(Ordering::Acquire));
     let minimum_scanline = (mode.width as u64).saturating_mul(4);
     if mode.bits_per_plane != 32
         || mode.width == 0
@@ -24623,6 +24623,10 @@ pub(crate) fn publish_active_framebuffer_mode(mode: nt_video_miniport::VideoMode
     print_u64(size_bytes);
     print_str(b"\n");
     true
+}
+
+fn framebuffer_scanout_va() -> u64 {
+    FB_VADDR.saturating_add(FB_SCANOUT_BAR_OFFSET.load(Ordering::Acquire))
 }
 
 fn active_framebuffer_geometry() -> Option<(u64, u64, u64, u64)> {
@@ -25208,16 +25212,58 @@ struct DeviceFrameCapRun {
     pages: u64,
 }
 
-fn existing_boot_framebuffer_cap_run(
+fn existing_boot_framebuffer_bar_cap_run(
     paddr: u64,
     requested_pages: u64,
 ) -> Option<DeviceFrameCapRun> {
-    if requested_pages == 0 || FB_PADDR.load(Ordering::Relaxed) != paddr {
+    if requested_pages == 0 || FB_BAR_PADDR.load(Ordering::Relaxed) != paddr {
         return None;
     }
-    let base = FB_FRAME_BASE.load(Ordering::Relaxed);
-    let pages = FB_FRAME_COUNT.load(Ordering::Relaxed).min(requested_pages);
-    (base != 0 && pages != 0).then_some(DeviceFrameCapRun { base, pages })
+    let base = FB_BAR_FRAME_BASE.load(Ordering::Relaxed);
+    let available_pages = FB_BAR_FRAME_COUNT.load(Ordering::Relaxed);
+    (base != 0 && available_pages >= requested_pages).then_some(DeviceFrameCapRun {
+        base,
+        pages: requested_pages,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct DeviceUntypedRegion {
+    paddr: u64,
+    pages: u64,
+}
+
+fn unique_device_untyped_containing(
+    bi: &BootInfo,
+    paddr: u64,
+    length: u64,
+) -> Option<DeviceUntypedRegion> {
+    let range_end = paddr.checked_add(length)?;
+    if length == 0 || paddr & 0xFFF != 0 {
+        return None;
+    }
+    let count = bi.untyped.end.checked_sub(bi.untyped.start)?;
+    let mut result = None;
+    for index in 0..count {
+        let descriptor = bi.untyped_list[index as usize];
+        if descriptor.is_device != 1 || !(12..64).contains(&descriptor.size_bits) {
+            continue;
+        }
+        let size = 1u64.checked_shl(descriptor.size_bits as u32)?;
+        let Some(end) = descriptor.paddr.checked_add(size) else {
+            continue;
+        };
+        if paddr >= descriptor.paddr && range_end <= end {
+            if result.is_some() {
+                return None;
+            }
+            result = Some(DeviceUntypedRegion {
+                paddr: descriptor.paddr,
+                pages: size / 0x1000,
+            });
+        }
+    }
+    result
 }
 
 /// Claim BAR frame caps without mapping them into the executive. The hosted-driver resource broker
@@ -26425,12 +26471,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         }
     }
 
-    // --- Phase 0a: the BOOTBOOT linear framebuffer. The kernel publishes its
-    // geometry in BootInfo and hands its physical memory over as the LAST device
-    // untyped (is_device=1, paddr == fb_paddr). Map every framebuffer frame into
-    // our VSpace, write a recognizable pattern, and read pixels back — proving the
-    // display path a win32k display driver will later drive. Headless QEMU
-    // won't SHOW the pixels, but the map+write+readback proves the mapping is real.
+    // --- Phase 0a: BOOTBOOT publishes scanout geometry only. Physical authority is the unique
+    // PCI BAR device untyped containing that scanout. Retype and map the complete BAR once so later
+    // mode changes and hosted grants cannot outrun a partial boot-mode cap set.
     {
         let fb_paddr = bi.fb_paddr;
         let fb_w = bi.fb_width as u64;
@@ -26456,6 +26499,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         // Geometry sanity: a real framebuffer with 32-bpp pixels — nonzero
         // dimensions, pitch at least width*4, and size covering height*pitch.
         let geometry_ok = fb_paddr != 0
+            && fb_paddr & 0xFFF == 0
             && fb_w != 0
             && fb_h != 0
             && fb_scan >= fb_w * 4
@@ -26464,13 +26508,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
         let mut map_ok = false;
         let mut pattern_ok = false;
-        if geometry_ok {
-            // The framebuffer window: a fresh, unused PML4 slot (PML4[4]) so it
-            // can't collide with the executive's existing user mappings (which
-            // sprawl through PML4[2]). We build the whole paging chain — PDPT, PD,
-            // and one leaf page table per 2 MiB slice — into our own VSpace.
-            const FB_VADDR: u64 = 0x0000_0200_0000_0000;
-            let n_pages = (fb_size + 0xFFF) / 0x1000;
+        if let Some(region) = geometry_ok
+            .then(|| unique_device_untyped_containing(bi, fb_paddr, fb_size))
+            .flatten()
+        {
+            let scanout_offset = fb_paddr - region.paddr;
+            let bar_size = region.pages.saturating_mul(0x1000);
+            print_str(b"[framebuffer-authority] bar=0x");
+            print_hex((region.paddr >> 32) as u32);
+            print_hex(region.paddr as u32);
+            print_str(b" bytes=");
+            print_u64(bar_size);
+            print_str(b" scanout-offset=");
+            print_u64(scanout_offset);
+            print_str(b"\n");
 
             let pdpt = alloc_slot();
             let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
@@ -26483,8 +26534,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 FB_VADDR,
                 CAP_INIT_THREAD_VSPACE,
             );
-            // One leaf page table per 2 MiB slice the window spans.
-            let win_end = FB_VADDR + fb_size;
+            let win_end = FB_VADDR.saturating_add(bar_size);
             let mut pt_va = FB_VADDR & !0x1F_FFFFu64; // round down to 2 MiB
             while pt_va < win_end {
                 let pt = alloc_slot();
@@ -26494,37 +26544,44 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 pt_va += 0x20_0000;
             }
 
-            // Retype + map every framebuffer frame from its device untyped.
-            // claim_device_pages finds the untyped whose paddr == fb_paddr and
-            // hands out consecutive frames fb_paddr + i*4K at FB_VADDR + i*4K.
-            let base_slot = claim_device_pages(bi, fb_paddr, FB_VADDR, n_pages);
-            map_ok = base_slot != 0;
-            // Retain the fb frame-cap base + count so the win32k bring-up can map the SAME physical
-            // frames into win32k's VSpace (the display DLL draws pixels there -> the real framebuffer).
-            FB_FRAME_BASE.store(base_slot, Ordering::Relaxed);
-            FB_FRAME_COUNT.store(n_pages, Ordering::Relaxed);
-            FB_PADDR.store(fb_paddr, Ordering::Relaxed);
-            FB_WIDTH.store(fb_w, Ordering::Relaxed);
-            FB_HEIGHT.store(fb_h, Ordering::Relaxed);
-            FB_SCANLINE.store(fb_scan, Ordering::Relaxed);
-            FB_SIZE_BYTES.store(fb_size, Ordering::Relaxed);
-            FB_BITS_PER_PLANE.store(32, Ordering::Relaxed);
+            let run = claim_device_frame_caps(bi, region.paddr, region.pages);
+            if let Some(run) = run {
+                map_ok = true;
+                let mut page = 0u64;
+                while page < run.pages {
+                    if page_map(
+                        run.base + page,
+                        FB_VADDR + page * 0x1000,
+                        RW_NX,
+                        CAP_INIT_THREAD_VSPACE,
+                    ) != 0
+                    {
+                        map_ok = false;
+                        break;
+                    }
+                    page += 1;
+                }
+                if map_ok {
+                    FB_BAR_FRAME_BASE.store(run.base, Ordering::Relaxed);
+                    FB_BAR_PADDR.store(region.paddr, Ordering::Relaxed);
+                    FB_SCANOUT_BAR_OFFSET.store(scanout_offset, Ordering::Relaxed);
+                    FB_WIDTH.store(fb_w, Ordering::Relaxed);
+                    FB_HEIGHT.store(fb_h, Ordering::Relaxed);
+                    FB_SCANLINE.store(fb_scan, Ordering::Relaxed);
+                    FB_SIZE_BYTES.store(fb_size, Ordering::Relaxed);
+                    FB_BAR_FRAME_COUNT.store(run.pages, Ordering::Release);
+                }
+            }
             check(b"exec_framebuffer_map", map_ok, &mut passed);
 
             if map_ok {
-                // Write a recognizable test pattern. Fill the first scanline solid
-                // magenta, drop a green marker in the last pixel of the last page
-                // (proves the far end of the mapping is live), then read them back.
                 const MAGENTA: u32 = 0x00FF_00FF;
                 const GREEN: u32 = 0x0000_FF00;
-                let fb = FB_VADDR as *mut u32;
-                // Fill the WHOLE framebuffer magenta (not just line 0) so that a later GDI/display
-                // draw (the desktop-graphics init) is reliably detectable by a readback anywhere.
+                let fb = framebuffer_scanout_va() as *mut u32;
                 let total_px = (fb_size / 4) as usize;
                 for x in 0..total_px {
                     core::ptr::write_volatile(fb.add(x), MAGENTA);
                 }
-                // Last fully-addressable pixel in the framebuffer.
                 let last_px = total_px - 1;
                 core::ptr::write_volatile(fb.add(last_px), GREEN);
 

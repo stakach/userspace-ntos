@@ -5410,10 +5410,11 @@ fn system32_driver_path(driver_leaf: &[u8], out: &mut [u8]) -> Option<usize> {
     Some(len)
 }
 
-unsafe fn map_bootboot_framebuffer_into_win32k(host_pml4: u64) {
-    // Map the BOOTBOOT framebuffer (Phase-0a fb device frames) into win32k at WIN32K_FB_VA, RW.
-    let base = FB_FRAME_BASE.load(Ordering::Relaxed);
-    let count = FB_FRAME_COUNT.load(Ordering::Relaxed);
+unsafe fn map_display_bar_into_win32k(host_pml4: u64) {
+    // Map the full Phase-0 display BAR cap run into win32k. BOOTBOOT's framebuffer fields describe
+    // only the current scanout view inside this aperture.
+    let base = FB_BAR_FRAME_BASE.load(Ordering::Relaxed);
+    let count = FB_BAR_FRAME_COUNT.load(Ordering::Relaxed);
     if base != 0 && count != 0 {
         for p in 0..(count + 511) / 512 {
             let pt = alloc_slot();
@@ -5433,7 +5434,7 @@ unsafe fn map_bootboot_framebuffer_into_win32k(host_pml4: u64) {
                 host_pml4,
             );
         }
-        print_str(b"[win32k-svc] mapped BOOTBOOT framebuffer into win32k: ");
+        print_str(b"[win32k-svc] mapped display BAR into win32k: ");
         print_u64(count);
         print_str(b" frames @ WIN32K_FB_VA=0x");
         print_hex((win32k_subsystem::WIN32K_FB_VA >> 32) as u32);
@@ -5442,8 +5443,8 @@ unsafe fn map_bootboot_framebuffer_into_win32k(host_pml4: u64) {
     }
 }
 
-/// Host the display driver selected by SYSTEM hive service metadata into win32k's VSpace + map the
-/// BOOTBOOT framebuffer into win32k. win32k loads the display DLL dynamically via
+/// Host the display driver selected by SYSTEM hive service metadata into win32k's VSpace and map
+/// the owning display BAR. win32k loads the display DLL dynamically via
 /// ZwSetSystemInformation when it enables the display device, so the executive preloads the selected
 /// DLL and records its registry/device metadata for the narrow win32k import bridge.
 pub(crate) unsafe fn load_display_driver(
@@ -5488,7 +5489,7 @@ pub(crate) unsafe fn load_display_driver(
         }
         None => print_str(b"[win32k-svc] display DLL load failed\n"),
     }
-    map_bootboot_framebuffer_into_win32k(host_pml4);
+    map_display_bar_into_win32k(host_pml4);
 }
 
 /// Host the keyboard layout DLL selected by the registry into win32k's VSpace. win32k loads keyboard
