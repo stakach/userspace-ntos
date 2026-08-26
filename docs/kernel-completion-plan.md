@@ -12053,3 +12053,35 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     teardown as quiescence proof. With one-shot work-item ownership implemented and its desktop
     integration accepted, the next callback-lifetime step is the generic PnP query/cancel/stop/remove
     transaction and adapter-exact mirror identity needed to provide that real retirement fence.
+
+    Generation-exact PnP transaction checkpoint (2026-08-26, crate green): `nt-pnp-manager` now
+    owns atomic canonical function-stack publication and rollback, couples raw/translated resource
+    assignment to `DeviceStackBuilt -> ResourcesAssigned`, and issues opaque generation-bearing
+    tokens for each synchronous lifecycle IRP. Only the exact live token can publish a returned
+    completion. A missing outer return retains the in-flight row and blocks every raw transition,
+    resource rollback, or later PnP dispatch, so a transport fault cannot be reinterpreted as a
+    driver veto or successful retirement.
+
+    Query-stop and query-remove publish their pending state before dispatch and retain a private
+    accepted/vetoed disposition after return. STOP or orderly REMOVE requires acceptance; CANCEL is
+    valid after either acceptance or veto because another stack may have vetoed a global operation.
+    Direct `Started -> REMOVE` is rejected: forced removal must return from SURPRISE_REMOVAL first.
+    STOP, CANCEL, and SURPRISE advance on any returned status as required by the NT must-not-fail
+    contract, while START failure enters `Failed` and can proceed only to removal. A returned REMOVE
+    remains `RemovePending` and publishes a separate exact finalization token; only successful
+    external interface/resource/stack/object teardown may consume that token, clear the devnode's
+    mutable ownership, and publish `Removed`.
+    Focused validation is green at `14/14`, covering stale completion tokens, overlapping and
+    indeterminate dispatches, veto/cancel ordering, stop/restart, orderly removal, surprise removal,
+    and exact stack/resource rollback.
+
+    Review adjustment: do not wire these tokens around the executive's old raw START helper. That
+    helper can collapse a hosted pump fault wall into returned `STATUS_UNSUCCESSFUL`, and although
+    its component IRP builder can retain `STATUS_PENDING`, the caller has no canonical completion
+    identity. The next slice must carry typed PnP minor and START resource extents through
+    `nt-io-manager::IoParameters`, dispatch against the canonical FDO stack, and retain the PnP token
+    beside the exact canonical `IrpId` until a genuine terminal backend completion arrives. A driver
+    fault synthesized by I/O-manager fault recovery is transport-indeterminate for PnP retirement,
+    not an outer-stack return. Then replace the old START constructor, wire query/cancel/stop/remove
+    through the same path, and retire the standalone `pnp-svc` atomic START/REMOVE transition
+    shortcut instead of layering the new transaction model over it.

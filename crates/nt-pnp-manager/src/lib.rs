@@ -197,7 +197,68 @@ pub enum PnpError {
     StaleId,
     InvalidIdentity,
     ConflictingPdo,
+    ConflictingStack,
+    DispatchInFlight,
+    StaleDispatch,
     InsufficientResources,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PnpMinor {
+    StartDevice,
+    QueryRemoveDevice,
+    RemoveDevice,
+    CancelRemoveDevice,
+    StopDevice,
+    QueryStopDevice,
+    CancelStopDevice,
+    SurpriseRemoval,
+}
+
+impl PnpMinor {
+    pub const fn raw(self) -> u8 {
+        match self {
+            Self::StartDevice => nt_pnp_abi::IRP_MN_START_DEVICE,
+            Self::QueryRemoveDevice => nt_pnp_abi::IRP_MN_QUERY_REMOVE_DEVICE,
+            Self::RemoveDevice => nt_pnp_abi::IRP_MN_REMOVE_DEVICE,
+            Self::CancelRemoveDevice => nt_pnp_abi::IRP_MN_CANCEL_REMOVE_DEVICE,
+            Self::StopDevice => nt_pnp_abi::IRP_MN_STOP_DEVICE,
+            Self::QueryStopDevice => nt_pnp_abi::IRP_MN_QUERY_STOP_DEVICE,
+            Self::CancelStopDevice => nt_pnp_abi::IRP_MN_CANCEL_STOP_DEVICE,
+            Self::SurpriseRemoval => nt_pnp_abi::IRP_MN_SURPRISE_REMOVAL,
+        }
+    }
+}
+
+/// Exact ownership of one synchronous PnP IRP while it is outside the manager.
+///
+/// The fields are private so only the manager that began the dispatch can validate and complete it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PnpDispatchToken {
+    devnode_id: u64,
+    devnode_generation: u64,
+    dispatch_generation: u64,
+    minor: PnpMinor,
+}
+
+/// Exact authority to publish `Removed` after the returned REMOVE IRP's external teardown commits.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PnpRemovalToken {
+    devnode_id: u64,
+    devnode_generation: u64,
+    remove_dispatch_generation: u64,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct PendingPnpDispatch {
+    generation: u64,
+    minor: PnpMinor,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct PnpNegotiation {
+    minor: PnpMinor,
+    accepted: bool,
 }
 
 struct Devnode {
@@ -211,6 +272,9 @@ struct Devnode {
     driver_id: u64,
     resources: ResourceAssignment,
     pdo_properties: Option<PdoProperties>,
+    pending_dispatch: Option<PendingPnpDispatch>,
+    negotiation: Option<PnpNegotiation>,
+    remove_ready: Option<u64>,
 }
 
 /// Whether the v0.1 state machine permits `from -> to` (spec §8.2/§8.3). `Failed` is
@@ -229,16 +293,17 @@ pub fn can_transition(from: DeviceState, to: DeviceState) -> bool {
             | (DeviceStackBuilt, ResourcesAssigned)
             | (ResourcesAssigned, StartIrpSent)
             | (StartIrpSent, Started)
+            | (ResourcesAssigned, DeviceStackBuilt) // assignment rollback
             // Started -> stop / remove paths.
             | (Started, QueryStopPending)
             | (Started, QueryRemovePending)
-            | (Started, RemovePending)
             | (QueryStopPending, Stopped)
             | (QueryStopPending, Started) // cancel-stop
             | (Stopped, StartIrpSent) // restart
+            | (Stopped, RemovePending)
+            | (Failed, RemovePending)
             | (QueryRemovePending, RemovePending)
             | (QueryRemovePending, Started) // cancel-remove
-            | (RemovePending, Removed)
     )
 }
 
@@ -248,6 +313,7 @@ pub struct PnpManager {
     devnodes: Vec<Devnode>,
     next_id: u64,
     next_gen: u64,
+    next_dispatch_gen: u64,
 }
 
 impl PnpManager {
@@ -255,6 +321,7 @@ impl PnpManager {
         Self {
             next_id: 1,
             next_gen: 1,
+            next_dispatch_gen: 1,
             ..Default::default()
         }
     }
@@ -288,6 +355,9 @@ impl PnpManager {
             driver_id: 0,
             resources,
             pdo_properties: None,
+            pending_dispatch: None,
+            negotiation: None,
+            remove_ready: None,
         });
         id
     }
@@ -370,6 +440,9 @@ impl PnpManager {
             driver_id: 0,
             resources: NO_RESOURCES,
             pdo_properties: Some(properties),
+            pending_dispatch: None,
+            negotiation: None,
+            remove_ready: None,
         });
         self.next_id = next_id;
         self.next_gen = next_gen;
@@ -385,6 +458,91 @@ impl PnpManager {
                     && devnode.state != DeviceState::Removed
             })
             .map(|devnode| devnode.id)
+    }
+
+    /// Publish a successfully built function stack as one atomic lifecycle step.
+    ///
+    /// AddDevice execution and canonical I/O-manager attachment happen outside this crate. Their
+    /// identities become authoritative here only after both have completed.
+    pub fn commit_device_stack(
+        &mut self,
+        pdo_object_id: u64,
+        fdo_object_id: u64,
+        driver_id: u64,
+    ) -> Result<u64, PnpError> {
+        if pdo_object_id == 0 || fdo_object_id == 0 || driver_id == 0 {
+            return Err(PnpError::InvalidIdentity);
+        }
+        let devnode = self
+            .devnodes
+            .iter_mut()
+            .find(|devnode| {
+                devnode.pdo_object_id == pdo_object_id && devnode.pdo_properties.is_some()
+            })
+            .ok_or(PnpError::StaleId)?;
+        if devnode.state == DeviceState::Removed {
+            return Err(PnpError::StaleId);
+        }
+        if devnode.fdo_object_id != 0 || devnode.driver_id != 0 {
+            return if devnode.fdo_object_id == fdo_object_id
+                && devnode.driver_id == driver_id
+                && matches!(
+                    devnode.state,
+                    DeviceState::DeviceStackBuilt
+                        | DeviceState::ResourcesAssigned
+                        | DeviceState::StartIrpSent
+                        | DeviceState::Started
+                        | DeviceState::QueryStopPending
+                        | DeviceState::Stopped
+                        | DeviceState::QueryRemovePending
+                        | DeviceState::RemovePending
+                ) {
+                Ok(devnode.id)
+            } else {
+                Err(PnpError::ConflictingStack)
+            };
+        }
+        if devnode.state != DeviceState::Enumerated
+            || devnode.pending_dispatch.is_some()
+            || devnode.negotiation.is_some()
+            || devnode.remove_ready.is_some()
+        {
+            return Err(PnpError::InvalidTransition);
+        }
+        devnode.fdo_object_id = fdo_object_id;
+        devnode.driver_id = driver_id;
+        devnode.state = DeviceState::DeviceStackBuilt;
+        Ok(devnode.id)
+    }
+
+    /// Roll back a stack that never became externally visible to PnP clients.
+    pub fn rollback_device_stack(
+        &mut self,
+        pdo_object_id: u64,
+        fdo_object_id: u64,
+        driver_id: u64,
+    ) -> Result<(), PnpError> {
+        let devnode = self
+            .devnodes
+            .iter_mut()
+            .find(|devnode| {
+                devnode.pdo_object_id == pdo_object_id && devnode.pdo_properties.is_some()
+            })
+            .ok_or(PnpError::StaleId)?;
+        if devnode.state != DeviceState::DeviceStackBuilt
+            || devnode.pending_dispatch.is_some()
+            || devnode.negotiation.is_some()
+            || devnode.remove_ready.is_some()
+        {
+            return Err(PnpError::InvalidTransition);
+        }
+        if devnode.fdo_object_id != fdo_object_id || devnode.driver_id != driver_id {
+            return Err(PnpError::ConflictingStack);
+        }
+        devnode.fdo_object_id = 0;
+        devnode.driver_id = 0;
+        devnode.state = DeviceState::Enumerated;
+        Ok(())
     }
 
     pub fn commit_resource_assignment(
@@ -403,16 +561,35 @@ impl PnpManager {
             })
             .ok_or(PnpError::StaleId)?;
         let properties = devnode.pdo_properties.as_mut().unwrap();
-        properties.allocated_resources_raw = if raw.is_empty() {
+        let raw = if raw.is_empty() {
             PropertyBlobState::KnownNone
         } else {
             PropertyBlobState::Present(raw)
         };
-        properties.allocated_resources_translated = if translated.is_empty() {
+        let translated = if translated.is_empty() {
             PropertyBlobState::KnownNone
         } else {
             PropertyBlobState::Present(translated)
         };
+        if devnode.state == DeviceState::ResourcesAssigned {
+            return if properties.allocated_resources_raw == raw
+                && properties.allocated_resources_translated == translated
+            {
+                Ok(())
+            } else {
+                Err(PnpError::InvalidTransition)
+            };
+        }
+        if devnode.state != DeviceState::DeviceStackBuilt
+            || devnode.pending_dispatch.is_some()
+            || devnode.negotiation.is_some()
+            || devnode.remove_ready.is_some()
+        {
+            return Err(PnpError::InvalidTransition);
+        }
+        properties.allocated_resources_raw = raw;
+        properties.allocated_resources_translated = translated;
+        devnode.state = DeviceState::ResourcesAssigned;
         Ok(())
     }
 
@@ -452,11 +629,241 @@ impl PnpManager {
                     && devnode.state != DeviceState::Removed
             })
             .ok_or(PnpError::StaleId)?;
+        if devnode.pending_dispatch.is_some()
+            || devnode.negotiation.is_some()
+            || devnode.remove_ready.is_some()
+        {
+            return Err(PnpError::DispatchInFlight);
+        }
+        if devnode.state == DeviceState::DeviceStackBuilt {
+            return Ok(());
+        }
+        if devnode.state != DeviceState::ResourcesAssigned {
+            return Err(PnpError::InvalidTransition);
+        }
         let properties = devnode.pdo_properties.as_mut().unwrap();
         properties.allocated_resources_raw = PropertyBlobState::Unqueried;
         properties.allocated_resources_translated = PropertyBlobState::Unqueried;
         properties.filtered_resource_requirements = PropertyBlobState::Unqueried;
+        devnode.state = DeviceState::DeviceStackBuilt;
         Ok(())
+    }
+
+    /// Begin one synchronous PnP dispatch and return its exact completion authority.
+    pub fn begin_pnp_dispatch(
+        &mut self,
+        pdo_object_id: u64,
+        minor: PnpMinor,
+    ) -> Result<PnpDispatchToken, PnpError> {
+        let dispatch_generation = self.next_dispatch_gen;
+        let next_dispatch_generation = dispatch_generation
+            .checked_add(1)
+            .ok_or(PnpError::InsufficientResources)?;
+        let devnode = self
+            .devnodes
+            .iter_mut()
+            .find(|devnode| {
+                devnode.pdo_object_id == pdo_object_id && devnode.pdo_properties.is_some()
+            })
+            .ok_or(PnpError::StaleId)?;
+        if devnode.state == DeviceState::Removed {
+            return Err(PnpError::StaleId);
+        }
+        if devnode.pending_dispatch.is_some() || devnode.remove_ready.is_some() {
+            return Err(PnpError::DispatchInFlight);
+        }
+        let prior_state = devnode.state;
+        let allowed = match minor {
+            PnpMinor::StartDevice => matches!(
+                prior_state,
+                DeviceState::ResourcesAssigned | DeviceState::Stopped
+            ),
+            PnpMinor::QueryStopDevice | PnpMinor::QueryRemoveDevice => {
+                prior_state == DeviceState::Started
+            }
+            PnpMinor::StopDevice => {
+                prior_state == DeviceState::QueryStopPending
+                    && devnode.negotiation
+                        == Some(PnpNegotiation {
+                            minor: PnpMinor::QueryStopDevice,
+                            accepted: true,
+                        })
+            }
+            PnpMinor::CancelStopDevice => {
+                prior_state == DeviceState::QueryStopPending
+                    && devnode
+                        .negotiation
+                        .is_some_and(|negotiation| negotiation.minor == PnpMinor::QueryStopDevice)
+            }
+            PnpMinor::CancelRemoveDevice => {
+                prior_state == DeviceState::QueryRemovePending
+                    && devnode
+                        .negotiation
+                        .is_some_and(|negotiation| negotiation.minor == PnpMinor::QueryRemoveDevice)
+            }
+            PnpMinor::RemoveDevice => {
+                matches!(
+                    prior_state,
+                    DeviceState::Stopped | DeviceState::RemovePending | DeviceState::Failed
+                ) || (prior_state == DeviceState::QueryRemovePending
+                    && devnode.negotiation
+                        == Some(PnpNegotiation {
+                            minor: PnpMinor::QueryRemoveDevice,
+                            accepted: true,
+                        }))
+            }
+            PnpMinor::SurpriseRemoval => {
+                matches!(
+                    prior_state,
+                    DeviceState::Started
+                        | DeviceState::Stopped
+                        | DeviceState::QueryStopPending
+                        | DeviceState::QueryRemovePending
+                        | DeviceState::Failed
+                )
+            }
+        };
+        if !allowed {
+            return Err(PnpError::InvalidTransition);
+        }
+        match minor {
+            PnpMinor::StartDevice => devnode.state = DeviceState::StartIrpSent,
+            PnpMinor::QueryStopDevice => devnode.state = DeviceState::QueryStopPending,
+            PnpMinor::QueryRemoveDevice => devnode.state = DeviceState::QueryRemovePending,
+            PnpMinor::RemoveDevice | PnpMinor::SurpriseRemoval => {
+                devnode.state = DeviceState::RemovePending
+            }
+            _ => {}
+        }
+        if minor == PnpMinor::SurpriseRemoval {
+            devnode.negotiation = None;
+        }
+        devnode.pending_dispatch = Some(PendingPnpDispatch {
+            generation: dispatch_generation,
+            minor,
+        });
+        self.next_dispatch_gen = next_dispatch_generation;
+        Ok(PnpDispatchToken {
+            devnode_id: devnode.id,
+            devnode_generation: devnode.generation,
+            dispatch_generation,
+            minor,
+        })
+    }
+
+    /// Complete a synchronous PnP IRP that returned from the whole device stack.
+    ///
+    /// STOP, REMOVE, CANCEL, and SURPRISE requests cannot be failed by a conforming driver, so any
+    /// returned completion advances their lifecycle even if the driver supplied a failure status.
+    /// An absent return must not call this method; the pending record then remains as a retirement
+    /// barrier.
+    pub fn complete_pnp_dispatch(
+        &mut self,
+        token: PnpDispatchToken,
+        status_success: bool,
+    ) -> Result<DeviceState, PnpError> {
+        let devnode = self
+            .find_mut(token.devnode_id)
+            .ok_or(PnpError::StaleDispatch)?;
+        let pending = devnode.pending_dispatch.ok_or(PnpError::StaleDispatch)?;
+        if devnode.generation != token.devnode_generation
+            || pending.generation != token.dispatch_generation
+            || pending.minor != token.minor
+        {
+            return Err(PnpError::StaleDispatch);
+        }
+        devnode.state = match pending.minor {
+            PnpMinor::StartDevice => {
+                if status_success {
+                    DeviceState::Started
+                } else {
+                    DeviceState::Failed
+                }
+            }
+            PnpMinor::QueryStopDevice => {
+                devnode.negotiation = Some(PnpNegotiation {
+                    minor: pending.minor,
+                    accepted: status_success,
+                });
+                DeviceState::QueryStopPending
+            }
+            PnpMinor::StopDevice => DeviceState::Stopped,
+            PnpMinor::CancelStopDevice => DeviceState::Started,
+            PnpMinor::QueryRemoveDevice => {
+                devnode.negotiation = Some(PnpNegotiation {
+                    minor: pending.minor,
+                    accepted: status_success,
+                });
+                DeviceState::QueryRemovePending
+            }
+            PnpMinor::CancelRemoveDevice => DeviceState::Started,
+            PnpMinor::RemoveDevice => {
+                devnode.remove_ready = Some(pending.generation);
+                DeviceState::RemovePending
+            }
+            PnpMinor::SurpriseRemoval => DeviceState::RemovePending,
+        };
+        if !matches!(
+            pending.minor,
+            PnpMinor::QueryStopDevice | PnpMinor::QueryRemoveDevice
+        ) {
+            devnode.negotiation = None;
+        }
+        devnode.pending_dispatch = None;
+        Ok(devnode.state)
+    }
+
+    /// Obtain the authority created by a returned REMOVE IRP. This is retryable while external
+    /// teardown remains incomplete and does not itself mutate the devnode.
+    pub fn removal_token(&self, pdo_object_id: u64) -> Result<PnpRemovalToken, PnpError> {
+        let devnode = self
+            .devnodes
+            .iter()
+            .find(|devnode| {
+                devnode.pdo_object_id == pdo_object_id && devnode.pdo_properties.is_some()
+            })
+            .ok_or(PnpError::StaleId)?;
+        if devnode.state != DeviceState::RemovePending || devnode.pending_dispatch.is_some() {
+            return Err(PnpError::InvalidTransition);
+        }
+        Ok(PnpRemovalToken {
+            devnode_id: devnode.id,
+            devnode_generation: devnode.generation,
+            remove_dispatch_generation: devnode.remove_ready.ok_or(PnpError::InvalidTransition)?,
+        })
+    }
+
+    /// Publish `Removed` only after all external interface, resource, stack, and object teardown
+    /// governed by the exact returned REMOVE dispatch has committed.
+    pub fn finish_remove(&mut self, token: PnpRemovalToken) -> Result<(), PnpError> {
+        let devnode = self
+            .find_mut(token.devnode_id)
+            .ok_or(PnpError::StaleDispatch)?;
+        if devnode.generation != token.devnode_generation
+            || devnode.state != DeviceState::RemovePending
+            || devnode.pending_dispatch.is_some()
+            || devnode.remove_ready != Some(token.remove_dispatch_generation)
+        {
+            return Err(PnpError::StaleDispatch);
+        }
+        let properties = devnode
+            .pdo_properties
+            .as_mut()
+            .ok_or(PnpError::StaleDispatch)?;
+        properties.allocated_resources_raw = PropertyBlobState::Unqueried;
+        properties.allocated_resources_translated = PropertyBlobState::Unqueried;
+        properties.filtered_resource_requirements = PropertyBlobState::Unqueried;
+        devnode.fdo_object_id = 0;
+        devnode.driver_id = 0;
+        devnode.negotiation = None;
+        devnode.remove_ready = None;
+        devnode.state = DeviceState::Removed;
+        Ok(())
+    }
+
+    pub fn pnp_dispatch_in_flight(&self, id: u64) -> bool {
+        self.find(id)
+            .is_some_and(|devnode| devnode.pending_dispatch.is_some())
     }
 
     /// Query one PnP/resource-owned `DEVICE_REGISTRY_PROPERTY` by canonical PDO identity.
@@ -570,6 +977,9 @@ impl PnpManager {
         if d.state == DeviceState::Removed {
             return Err(PnpError::StaleId);
         }
+        if d.pending_dispatch.is_some() || d.negotiation.is_some() || d.remove_ready.is_some() {
+            return Err(PnpError::DispatchInFlight);
+        }
         if !can_transition(d.state, to) {
             return Err(PnpError::InvalidTransition);
         }
@@ -682,6 +1092,7 @@ mod tests {
             Err(PnpPropertyError::DeviceNotReady)
         );
 
+        p.commit_device_stack(pdo, 0x5678, 0x9abc).unwrap();
         p.commit_resource_assignment(pdo, vec![4, 5], vec![6, 7])
             .unwrap();
         assert_eq!(
@@ -701,6 +1112,7 @@ mod tests {
             p.query_device_property(pdo, 21),
             Err(PnpPropertyError::DeviceNotReady)
         );
+        assert_eq!(p.state(id), Some(DeviceStackBuilt));
     }
 
     #[test]
@@ -866,23 +1278,235 @@ mod tests {
     #[test]
     fn remove_then_stale() {
         let mut p = PnpManager::new();
-        let id = create_mmio_test_devnode(&mut p, 0);
-        for s in [
-            DriverLoaded,
-            AddDeviceCalled,
-            DeviceStackBuilt,
-            ResourcesAssigned,
-            StartIrpSent,
-            Started,
-            RemovePending,
-            Removed,
-        ] {
-            p.transition(id, s).unwrap();
-        }
+        let pdo = 0x9000;
+        let id = assigned_pci_devnode(&mut p, pdo);
+        let start = p.begin_pnp_dispatch(pdo, PnpMinor::StartDevice).unwrap();
+        p.complete_pnp_dispatch(start, true).unwrap();
+        let query = p
+            .begin_pnp_dispatch(pdo, PnpMinor::QueryRemoveDevice)
+            .unwrap();
+        p.complete_pnp_dispatch(query, true).unwrap();
+        let remove = p.begin_pnp_dispatch(pdo, PnpMinor::RemoveDevice).unwrap();
+        assert_eq!(p.complete_pnp_dispatch(remove, false), Ok(RemovePending));
+        let token = p.removal_token(pdo).unwrap();
+        p.finish_remove(token).unwrap();
         assert_eq!(p.state(id), Some(Removed));
         assert!(!p.is_live(id));
         assert!(!p.mapping_allowed(id));
         // Any further transition on a removed devnode is stale.
         assert_eq!(p.transition(id, Started), Err(PnpError::StaleId));
+    }
+
+    fn assigned_pci_devnode(p: &mut PnpManager, pdo: u64) -> u64 {
+        let id = p
+            .register_enumerated_pdo(r"PCI\VEN_1234&DEV_5678\0001", pdo, pci_properties())
+            .unwrap();
+        assert_eq!(p.commit_device_stack(pdo, pdo + 1, 0x55), Ok(id));
+        p.commit_resource_assignment(pdo, vec![1], vec![2]).unwrap();
+        id
+    }
+
+    #[test]
+    fn canonical_stack_and_resource_publication_is_exact_and_reversible() {
+        let mut p = PnpManager::new();
+        let pdo = 0x4000;
+        let id = p
+            .register_enumerated_pdo(r"PCI\VEN_1234&DEV_5678\0001", pdo, pci_properties())
+            .unwrap();
+        assert_eq!(p.commit_device_stack(pdo, 0x4001, 0x55), Ok(id));
+        assert_eq!(p.state(id), Some(DeviceStackBuilt));
+        assert_eq!(p.fdo(id), Some(0x4001));
+        assert_eq!(p.commit_device_stack(pdo, 0x4001, 0x55), Ok(id));
+        assert_eq!(
+            p.commit_device_stack(pdo, 0x4002, 0x55),
+            Err(PnpError::ConflictingStack)
+        );
+
+        p.commit_resource_assignment(pdo, vec![1], vec![2]).unwrap();
+        assert_eq!(p.state(id), Some(ResourcesAssigned));
+        assert_eq!(p.commit_resource_assignment(pdo, vec![1], vec![2]), Ok(()));
+        assert_eq!(
+            p.commit_resource_assignment(pdo, vec![3], vec![2]),
+            Err(PnpError::InvalidTransition)
+        );
+        p.clear_resource_assignment(pdo).unwrap();
+        assert_eq!(p.state(id), Some(DeviceStackBuilt));
+        p.rollback_device_stack(pdo, 0x4001, 0x55).unwrap();
+        assert_eq!(p.state(id), Some(Enumerated));
+        assert_eq!(p.fdo(id), Some(0));
+    }
+
+    #[test]
+    fn start_dispatch_requires_an_exact_return() {
+        let mut p = PnpManager::new();
+        let pdo = 0x5000;
+        let id = assigned_pci_devnode(&mut p, pdo);
+        let token = p.begin_pnp_dispatch(pdo, PnpMinor::StartDevice).unwrap();
+        let duplicate = PnpDispatchToken {
+            devnode_id: token.devnode_id,
+            devnode_generation: token.devnode_generation,
+            dispatch_generation: token.dispatch_generation,
+            minor: token.minor,
+        };
+        assert_eq!(p.state(id), Some(StartIrpSent));
+        assert!(p.pnp_dispatch_in_flight(id));
+        assert_eq!(p.transition(id, Failed), Err(PnpError::DispatchInFlight));
+        assert_eq!(
+            p.begin_pnp_dispatch(pdo, PnpMinor::StartDevice),
+            Err(PnpError::DispatchInFlight)
+        );
+        assert_eq!(p.complete_pnp_dispatch(token, true), Ok(Started));
+        assert_eq!(
+            p.complete_pnp_dispatch(duplicate, true),
+            Err(PnpError::StaleDispatch)
+        );
+        assert!(!p.pnp_dispatch_in_flight(id));
+
+        let mut failed = PnpManager::new();
+        let failed_id = assigned_pci_devnode(&mut failed, pdo);
+        let token = failed
+            .begin_pnp_dispatch(pdo, PnpMinor::StartDevice)
+            .unwrap();
+        assert_eq!(failed.complete_pnp_dispatch(token, false), Ok(Failed));
+        assert!(!failed.mapping_allowed(failed_id));
+        let remove = failed
+            .begin_pnp_dispatch(pdo, PnpMinor::RemoveDevice)
+            .unwrap();
+        assert_eq!(
+            failed.complete_pnp_dispatch(remove, false),
+            Ok(RemovePending)
+        );
+        let removal = failed.removal_token(pdo).unwrap();
+        failed.finish_remove(removal).unwrap();
+
+        let mut indeterminate = PnpManager::new();
+        let indeterminate_id = assigned_pci_devnode(&mut indeterminate, pdo);
+        let _lost = indeterminate
+            .begin_pnp_dispatch(pdo, PnpMinor::StartDevice)
+            .unwrap();
+        assert_eq!(indeterminate.state(indeterminate_id), Some(StartIrpSent));
+        assert!(indeterminate.pnp_dispatch_in_flight(indeterminate_id));
+        assert_eq!(
+            indeterminate.begin_pnp_dispatch(pdo, PnpMinor::RemoveDevice),
+            Err(PnpError::DispatchInFlight)
+        );
+    }
+
+    #[test]
+    fn stop_and_remove_negotiation_requires_cancel_or_commit() {
+        let mut p = PnpManager::new();
+        let pdo = 0x6000;
+        let id = assigned_pci_devnode(&mut p, pdo);
+        let start = p.begin_pnp_dispatch(pdo, PnpMinor::StartDevice).unwrap();
+        p.complete_pnp_dispatch(start, true).unwrap();
+        assert_eq!(
+            p.begin_pnp_dispatch(pdo, PnpMinor::RemoveDevice),
+            Err(PnpError::InvalidTransition)
+        );
+
+        let query_stop = p
+            .begin_pnp_dispatch(pdo, PnpMinor::QueryStopDevice)
+            .unwrap();
+        assert_eq!(p.state(id), Some(QueryStopPending));
+        p.complete_pnp_dispatch(query_stop, false).unwrap();
+        assert_eq!(
+            p.begin_pnp_dispatch(pdo, PnpMinor::StopDevice),
+            Err(PnpError::InvalidTransition)
+        );
+        let cancel_stop = p
+            .begin_pnp_dispatch(pdo, PnpMinor::CancelStopDevice)
+            .unwrap();
+        assert_eq!(p.complete_pnp_dispatch(cancel_stop, false), Ok(Started));
+
+        let query_stop = p
+            .begin_pnp_dispatch(pdo, PnpMinor::QueryStopDevice)
+            .unwrap();
+        p.complete_pnp_dispatch(query_stop, true).unwrap();
+        let stop = p.begin_pnp_dispatch(pdo, PnpMinor::StopDevice).unwrap();
+        assert_eq!(p.complete_pnp_dispatch(stop, false), Ok(Stopped));
+        assert!(!p.mapping_allowed(id));
+
+        let restart = p.begin_pnp_dispatch(pdo, PnpMinor::StartDevice).unwrap();
+        p.complete_pnp_dispatch(restart, true).unwrap();
+        let query_remove = p
+            .begin_pnp_dispatch(pdo, PnpMinor::QueryRemoveDevice)
+            .unwrap();
+        p.complete_pnp_dispatch(query_remove, false).unwrap();
+        assert_eq!(
+            p.begin_pnp_dispatch(pdo, PnpMinor::RemoveDevice),
+            Err(PnpError::InvalidTransition)
+        );
+        let cancel_remove = p
+            .begin_pnp_dispatch(pdo, PnpMinor::CancelRemoveDevice)
+            .unwrap();
+        assert_eq!(p.complete_pnp_dispatch(cancel_remove, false), Ok(Started));
+
+        let query_remove = p
+            .begin_pnp_dispatch(pdo, PnpMinor::QueryRemoveDevice)
+            .unwrap();
+        p.complete_pnp_dispatch(query_remove, true).unwrap();
+        let remove = p.begin_pnp_dispatch(pdo, PnpMinor::RemoveDevice).unwrap();
+        assert_eq!(p.complete_pnp_dispatch(remove, false), Ok(RemovePending));
+        let removal = p.removal_token(pdo).unwrap();
+        p.finish_remove(removal).unwrap();
+        assert!(!p.is_live(id));
+    }
+
+    #[test]
+    fn surprise_removal_is_a_returned_barrier_before_final_remove() {
+        let mut p = PnpManager::new();
+        let pdo = 0x7000;
+        let id = assigned_pci_devnode(&mut p, pdo);
+        let start = p.begin_pnp_dispatch(pdo, PnpMinor::StartDevice).unwrap();
+        p.complete_pnp_dispatch(start, true).unwrap();
+        let surprise = p
+            .begin_pnp_dispatch(pdo, PnpMinor::SurpriseRemoval)
+            .unwrap();
+        assert_eq!(p.state(id), Some(RemovePending));
+        assert_eq!(p.complete_pnp_dispatch(surprise, false), Ok(RemovePending));
+        let remove = p.begin_pnp_dispatch(pdo, PnpMinor::RemoveDevice).unwrap();
+        assert_eq!(p.complete_pnp_dispatch(remove, false), Ok(RemovePending));
+        assert_eq!(
+            p.begin_pnp_dispatch(pdo, PnpMinor::RemoveDevice),
+            Err(PnpError::DispatchInFlight)
+        );
+        let removal = p.removal_token(pdo).unwrap();
+        p.finish_remove(removal).unwrap();
+    }
+
+    #[test]
+    fn indeterminate_stop_and_remove_dispatches_remain_barriers() {
+        let mut stopping = PnpManager::new();
+        let pdo = 0x8000;
+        let id = assigned_pci_devnode(&mut stopping, pdo);
+        let start = stopping
+            .begin_pnp_dispatch(pdo, PnpMinor::StartDevice)
+            .unwrap();
+        stopping.complete_pnp_dispatch(start, true).unwrap();
+        let query = stopping
+            .begin_pnp_dispatch(pdo, PnpMinor::QueryStopDevice)
+            .unwrap();
+        stopping.complete_pnp_dispatch(query, true).unwrap();
+        let _lost_stop = stopping
+            .begin_pnp_dispatch(pdo, PnpMinor::StopDevice)
+            .unwrap();
+        assert_eq!(stopping.state(id), Some(QueryStopPending));
+        assert!(stopping.pnp_dispatch_in_flight(id));
+
+        let mut removing = PnpManager::new();
+        let id = assigned_pci_devnode(&mut removing, pdo);
+        let start = removing
+            .begin_pnp_dispatch(pdo, PnpMinor::StartDevice)
+            .unwrap();
+        removing.complete_pnp_dispatch(start, true).unwrap();
+        let surprise = removing
+            .begin_pnp_dispatch(pdo, PnpMinor::SurpriseRemoval)
+            .unwrap();
+        removing.complete_pnp_dispatch(surprise, true).unwrap();
+        let _lost_remove = removing
+            .begin_pnp_dispatch(pdo, PnpMinor::RemoveDevice)
+            .unwrap();
+        assert_eq!(removing.state(id), Some(RemovePending));
+        assert!(removing.pnp_dispatch_in_flight(id));
     }
 }
