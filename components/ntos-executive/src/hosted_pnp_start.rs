@@ -99,6 +99,86 @@ pub(crate) struct HostedPnpStartReport {
     pub(crate) first_indeterminate: u32,
 }
 
+impl HostedPnpStartReport {
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.driver_ready_for_pnp |= other.driver_ready_for_pnp;
+        self.add_device |= other.add_device;
+        self.start_ok |= other.start_ok;
+        self.resource_granted |= other.resource_granted;
+        self.mmio_mapped |= other.mmio_mapped;
+        self.interrupt_connected |= other.interrupt_connected;
+        self.interrupt_delivered |= other.interrupt_delivered;
+        self.interrupt_acknowledged |= other.interrupt_acknowledged;
+        self.dpc_delivered |= other.dpc_delivered;
+        self.dma_adapter |= other.dma_adapter;
+        self.dma_common |= other.dma_common;
+        self.dma_packet_descriptors |= other.dma_packet_descriptors;
+        self.io_port_out32 |= other.io_port_out32;
+        self.root_started |= other.root_started;
+        self.video_route_published |= other.video_route_published;
+        macro_rules! add {
+            ($($field:ident),+ $(,)?) => {
+                $(self.$field = self.$field.saturating_add(other.$field);)+
+            };
+        }
+        add!(
+            attempted,
+            terminal,
+            add_device_count,
+            started,
+            failed,
+            pending,
+            pending_observed,
+            indeterminate,
+            resource_granted_count,
+            mmio_mapped_count,
+            interrupt_connected_count,
+            interrupt_delivered_count,
+            interrupt_acknowledged_count,
+            dpc_delivered_count,
+            dma_adapter_count,
+            dma_common_count,
+            dma_packet_descriptor_count,
+            dma_packet_descriptor_common_count,
+            dma_packet_descriptor_mapping_count,
+            dma_packet_descriptor_completed_mapping_count,
+            dma_device_tx_completion_count,
+            dma_device_rx_completion_count,
+            dma_device_interrupt_cause_count,
+            dma_device_model_failure_count,
+            dma_tx_window_observation_count,
+            dma_tx_window_enabled_count,
+            dma_tx_window_ring_ready_count,
+            dma_tx_window_posted_count,
+            dma_tx_window_idle_count,
+            dma_tx_descriptor_candidate_count,
+            dma_tx_descriptor_map_candidate_count,
+            dma_tx_descriptor_done_seen_count,
+            io_port_out32_count,
+            root_started_count,
+            video_route_attempted_count,
+            video_route_published_count,
+        );
+        if other.dma_tx_descriptor_candidate_count != 0
+            || other.dma_tx_descriptor_done_seen_count != 0
+        {
+            self.dma_tx_last_candidate_address = other.dma_tx_last_candidate_address;
+            self.dma_tx_last_candidate_len = other.dma_tx_last_candidate_len;
+            self.dma_tx_last_candidate_status = other.dma_tx_last_candidate_status;
+        }
+        if other.dma_tx_window_observation_count != 0 {
+            self.dma_tx_last_head = other.dma_tx_last_head;
+            self.dma_tx_last_tail = other.dma_tx_last_tail;
+        }
+        if self.first_error == 0 {
+            self.first_error = other.first_error;
+        }
+        if self.first_indeterminate == 0 {
+            self.first_indeterminate = other.first_indeterminate;
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HostedPnpStartBatchFailure {
     pub(crate) status: nt_status::NtStatus,
@@ -146,7 +226,28 @@ impl OwnedHostedPnpStartBatch {
         &self.spec.driver_object_path
     }
 
+    pub(crate) fn report(&self) -> HostedPnpStartReport {
+        self.report
+    }
+
+    pub(crate) fn needs_completion_redrive(&self) -> bool {
+        matches!(
+            self.coordinator.phase(),
+            nt_driver_start::BatchPhase::Ready | nt_driver_start::BatchPhase::Awaiting { .. }
+        )
+    }
+
     pub(crate) unsafe fn drive(&mut self) -> OwnedHostedPnpStartProgress {
+        self.drive_inner(true)
+    }
+
+    /// Resume after the caller has pumped the shared hosted-I/O completion plane once.
+    /// Walking several pending batches must not repump that global plane once per row.
+    pub(crate) unsafe fn drive_after_completion_pump(&mut self) -> OwnedHostedPnpStartProgress {
+        self.drive_inner(false)
+    }
+
+    unsafe fn drive_inner(&mut self, pump_before_observe: bool) -> OwnedHostedPnpStartProgress {
         loop {
             match self.coordinator.phase() {
                 nt_driver_start::BatchPhase::Complete => {
@@ -165,7 +266,7 @@ impl OwnedHostedPnpStartBatch {
                     irp_id,
                 } => {
                     let devnode = &self.spec.devnodes[devnode_index];
-                    match observe_canonical_start(irp_id, false) {
+                    match observe_canonical_start(irp_id, false, pump_before_observe) {
                         CanonicalStartDisposition::Terminal { status, .. } => {
                             assert_eq!(self.report.pending, 1, "START pending count lost ownership");
                             self.report.pending -= 1;
@@ -322,57 +423,6 @@ struct HostedPnpDevnodeStart<'a, H, C> {
     linkage_export: Option<&'a str>,
     hardware_ids: &'a [H],
     compatible_ids: &'a [C],
-}
-
-pub(crate) unsafe fn start_inline_driver_service_devnodes(
-    dc: &driver_launch::DriverComponent,
-    spec: &InlineDriverLaunchSpec,
-    plan: &InlineDriverLaunchPlan,
-    options: HostedPnpStartOptions,
-) -> HostedPnpStartReport {
-    let mut report = HostedPnpStartReport {
-        driver_ready_for_pnp: (dc.verdict & V_ENTERED) != 0
-            && (dc.add_device != 0
-                || driver_launch::hosted_driver_video_port_initialized(dc.driver_id)),
-        ..HostedPnpStartReport::default()
-    };
-    let class_guid = if spec.class_guid_present {
-        Some(spec.class_guid.as_str())
-    } else {
-        None
-    };
-    for devnode in plan.devnodes_for(spec) {
-        let hardware_refs = plan.hardware_ids_for(devnode);
-        let compatible_refs = plan.compatible_ids_for(devnode);
-        let driver_key = if devnode.driver_key_present {
-            Some(devnode.driver_key.as_str())
-        } else {
-            None
-        };
-        let linkage_export = if devnode.linkage_export_present {
-            Some(devnode.linkage_export.as_str())
-        } else {
-            None
-        };
-        let progress = start_one_devnode(
-            dc.driver_id,
-            spec.service_name.as_str(),
-            class_guid,
-            HostedPnpDevnodeStart {
-                instance_id: devnode.instance_id.as_str(),
-                driver_key,
-                linkage_export,
-                hardware_ids: hardware_refs,
-                compatible_ids: compatible_refs,
-            },
-            options,
-            &mut report,
-        );
-        if !matches!(progress, HostedPnpDevnodeProgress::Terminal { status } if status.is_success()) {
-            break;
-        }
-    }
-    report
 }
 
 fn finalize_batch(
@@ -841,7 +891,7 @@ unsafe fn canonical_start_status(
             }
         }
         Ok(driver_launch::HostedPnpStartOutcome::Pending { irp_id }) => {
-            observe_canonical_start(irp_id, true)
+            observe_canonical_start(irp_id, true, true)
         }
         Ok(driver_launch::HostedPnpStartOutcome::Indeterminate {
             transport_status,
@@ -851,7 +901,7 @@ unsafe fn canonical_start_status(
             waited: false,
         },
         Ok(driver_launch::HostedPnpStartOutcome::RepairRequired { irp_id, .. }) => {
-            observe_canonical_start(irp_id, false)
+            observe_canonical_start(irp_id, false, true)
         }
         Err(failure) if failure.rollback_safe => CanonicalStartDisposition::Terminal {
             status: rollback_pre_dispatch_start(
@@ -868,8 +918,14 @@ unsafe fn canonical_start_status(
     }
 }
 
-unsafe fn observe_canonical_start(irp_id: u64, driver_pending: bool) -> CanonicalStartDisposition {
-    driver_launch::pump_hosted_io_completions();
+unsafe fn observe_canonical_start(
+    irp_id: u64,
+    driver_pending: bool,
+    pump_before_observe: bool,
+) -> CanonicalStartDisposition {
+    if pump_before_observe {
+        driver_launch::pump_hosted_io_completions();
+    }
     match driver_launch::observe_hosted_pnp_start(irp_id) {
         Ok(driver_launch::HostedPnpStartObservation::Terminal { driver_status }) => {
             CanonicalStartDisposition::Terminal {

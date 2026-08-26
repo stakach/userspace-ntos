@@ -5205,7 +5205,8 @@ pub(crate) unsafe fn service_sec_image(
     pe: &nt_pe_loader::PeFile,
     scratch_base: u64,
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
-) -> (u64, u64, u64, u64, u64, u64) {
+    driver_starts: DriverStartBootstrap,
+) -> (u64, u64, u64, u64, u64, u64, BootDriverStartReports) {
     let live_service = ntdll.is_some();
     loader_trace_clear();
     reset_deferred_user_callback_returns();
@@ -5427,6 +5428,7 @@ pub(crate) unsafe fn service_sec_image(
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
     let mut nt_handler = reset_exec_nt_handler(
         exe_image_catalog as *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
+        driver_starts,
     );
     if live_service {
         print_str(b"[sec-init] handler-ready\n");
@@ -5520,6 +5522,9 @@ pub(crate) unsafe fn service_sec_image(
     }
     if !win32k_subsystem::initialize_export_registry() {
         panic!("win32k export registry allocation failed");
+    }
+    if pending_driver_start_redrive_needed(&nt_handler) {
+        let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
     }
     // Heap high-water mark taken AFTER all persistent state (the service table + the
     // pre-reserved process handle tables, SEC_IMAGE process scratch, TP worker window resources,
@@ -5815,6 +5820,9 @@ pub(crate) unsafe fn service_sec_image(
     // STATIC because the win32k dispatch arm's nested pump ticks it too (see `w32_census_enter`).
     CENSUS_LAST_DUMP.store(last_progress_t, Ordering::Relaxed);
     loop {
+        if pending_driver_start_redrive_needed(&nt_handler) {
+            let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
+        }
         if ntdll.is_some() {
             let started = crate::disk_census_ticks();
             publish_kuser_clocks();
@@ -9946,8 +9954,8 @@ pub(crate) unsafe fn service_sec_image(
                 if nt_handler.dbgk_block_request {
                     park_dbgk_reporter = true;
                 }
-                let hosted_io_progress = driver_launch::pump_hosted_io_completions();
-                let _ = pending_driver_load_redrive_all(&mut nt_handler);
+                let hosted_io_progress =
+                    pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
                 if hosted_io_progress != 0
                     || FILE_IO_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel)
                 {
@@ -16204,8 +16212,7 @@ pub(crate) unsafe fn service_sec_image(
                     wait_parked,
                 );
                 mark_wait_parked!(pi, resume_ip);
-                driver_launch::pump_hosted_io_completions();
-                let _ = pending_driver_load_redrive_all(&mut nt_handler);
+                let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
                 let _ = finalize_service_loop_durable_state(
                     &mut nt_handler,
                     &mut heap_mark,
@@ -16309,7 +16316,7 @@ pub(crate) unsafe fn service_sec_image(
                 mark_wait_parked!(pi, resume_ip);
                 // Cancellation can complete inside the handler's manager pump. Redrive every
                 // original owner unconditionally before testing the separate drain owner.
-                let _ = driver_launch::pump_hosted_io_completions();
+                let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
                 let _ = pending_file_io_redrive_all(&mut nt_handler);
                 let _ = file_cleanup_redrive_all(&mut nt_handler);
                 let _ = file_irp_drain_redrive_all(&mut nt_handler);
@@ -20420,6 +20427,7 @@ pub(crate) unsafe fn service_sec_image(
     PM_EXEC_LINK_OK.store(link_ok, Ordering::Relaxed);
     // Report the primary process's own fault stats regardless of which process stopped the loop.
     // The live path's primary is SMSS; the early SEC_IMAGE proof uses a dynamic diagnostic process.
+    let boot_driver_start_reports = pending_driver_start_reports_snapshot(&nt_handler);
     (
         verdict,
         procs[primary_pi].faults,
@@ -20427,6 +20435,7 @@ pub(crate) unsafe fn service_sec_image(
         stop,
         procs[primary_pi].ntfaults,
         stop_ssn,
+        boot_driver_start_reports,
     )
 }
 
@@ -23390,13 +23399,15 @@ unsafe fn pending_driver_load_transfer(
         .pending_driver_loads
         .publish(
             reservation,
-            PendingNtLoadDriver {
+            PendingDriverStart {
                 batch,
-                tid: nt_handler.current_tid,
-                badge: nt_handler.current_badge,
-                reply_cap: stolen,
-                native_call_transport,
-                reply_mrs,
+                owner: PendingDriverStartOwner::Native(NativeDriverStartReply {
+                    tid: nt_handler.current_tid,
+                    badge: nt_handler.current_badge,
+                    reply_cap: stolen,
+                    native_call_transport,
+                    reply_mrs,
+                }),
             },
         )
         .expect("reserved driver-load continuation rejected its exact batch");
@@ -23407,24 +23418,20 @@ unsafe fn pending_driver_load_transfer(
 
 unsafe fn pending_driver_load_reply(
     nt_handler: &mut ExecNtHandler,
-    pending: &mut PendingNtLoadDriver,
+    pending: &mut PendingDriverStart,
     status: u32,
 ) {
-    let cap = core::mem::replace(&mut pending.reply_cap, 0);
-    if cap == 0 {
+    let PendingDriverStartOwner::Native(reply) =
+        core::mem::replace(&mut pending.owner, PendingDriverStartOwner::Detached)
+    else {
         return;
-    }
-    let native_call_transport = pending.native_call_transport;
-    let reply_mrs = pending.reply_mrs;
-    let badge = pending.badge;
-    pending.tid = 0;
-    pending.badge = 0;
+    };
     pending_driver_load_reply_owner(
         nt_handler,
-        cap,
-        native_call_transport,
-        reply_mrs,
-        badge,
+        reply.reply_cap,
+        reply.native_call_transport,
+        reply.reply_mrs,
+        reply.badge,
         status,
     );
 }
@@ -23463,7 +23470,7 @@ unsafe fn pending_driver_load_redrive_all(nt_handler: &mut ExecNtHandler) -> u64
             let Some(pending) = nt_handler.pending_driver_loads.get_mut(slot) else {
                 continue;
             };
-            pending.batch.drive()
+            pending.batch.drive_after_completion_pump()
         };
         match progress {
             OwnedHostedPnpStartProgress::AwaitingCompletion => {}
@@ -23476,37 +23483,57 @@ unsafe fn pending_driver_load_redrive_all(nt_handler: &mut ExecNtHandler) -> u64
                     Ok(_) => nt_status::NtStatus::SUCCESS.raw() as u32,
                     Err(failure) => failure.status.raw() as u32,
                 };
-                pending_driver_load_reply(nt_handler, &mut pending, status);
+                match &pending.owner {
+                    PendingDriverStartOwner::Boot { target, .. } => nt_handler
+                        .boot_driver_start_reports
+                        .merge(*target, pending.batch.report()),
+                    PendingDriverStartOwner::Native(_) => {
+                        pending_driver_load_reply(nt_handler, &mut pending, status)
+                    }
+                    PendingDriverStartOwner::Detached => {}
+                }
                 completed += 1;
             }
             OwnedHostedPnpStartProgress::OwnershipLost(failure) => {
                 let status = failure.status.raw() as u32;
-                let reply_owner = {
+                let mut boot_report = None;
+                let native_reply = {
                     let Some(pending) = nt_handler.pending_driver_loads.get_mut(slot) else {
                         continue;
                     };
-                    let cap = core::mem::replace(&mut pending.reply_cap, 0);
-                    if cap == 0 {
-                        None
-                    } else {
-                        let owner = (
-                            cap,
-                            pending.native_call_transport,
-                            pending.reply_mrs,
-                            pending.badge,
-                        );
-                        pending.tid = 0;
-                        pending.badge = 0;
-                        Some(owner)
+                    match &mut pending.owner {
+                        PendingDriverStartOwner::Boot {
+                            target,
+                            report_published,
+                        } => {
+                            if !*report_published {
+                                boot_report = Some((*target, pending.batch.report()));
+                                *report_published = true;
+                            }
+                            None
+                        }
+                        PendingDriverStartOwner::Native(_) => {
+                            let PendingDriverStartOwner::Native(reply) = core::mem::replace(
+                                &mut pending.owner,
+                                PendingDriverStartOwner::Detached,
+                            ) else {
+                                unreachable!()
+                            };
+                            Some(reply)
+                        }
+                        PendingDriverStartOwner::Detached => None,
                     }
                 };
-                if let Some((cap, native, reply_mrs, badge)) = reply_owner {
+                if let Some((target, report)) = boot_report {
+                    nt_handler.boot_driver_start_reports.merge(target, report);
+                }
+                if let Some(reply) = native_reply {
                     pending_driver_load_reply_owner(
                         nt_handler,
-                        cap,
-                        native,
-                        reply_mrs,
-                        badge,
+                        reply.reply_cap,
+                        reply.native_call_transport,
+                        reply.reply_mrs,
+                        reply.badge,
                         status,
                     );
                     completed += 1;
@@ -23515,6 +23542,45 @@ unsafe fn pending_driver_load_redrive_all(nt_handler: &mut ExecNtHandler) -> u64
         }
     }
     completed
+}
+
+unsafe fn pump_hosted_io_and_redrive_driver_starts(nt_handler: &mut ExecNtHandler) -> u64 {
+    let pumped = driver_launch::pump_hosted_io_completions() as u64;
+    pumped.saturating_add(pending_driver_load_redrive_all(nt_handler))
+}
+
+fn pending_driver_start_redrive_needed(nt_handler: &ExecNtHandler) -> bool {
+    nt_handler
+        .pending_driver_loads
+        .occupied_slots()
+        .any(|slot| {
+            nt_handler
+                .pending_driver_loads
+                .get(slot)
+                .is_some_and(|pending| pending.batch.needs_completion_redrive())
+        })
+}
+
+fn pending_driver_start_reports_snapshot(
+    nt_handler: &ExecNtHandler,
+) -> BootDriverStartReports {
+    let mut reports = nt_handler.boot_driver_start_reports;
+    for slot in nt_handler.pending_driver_loads.occupied_slots() {
+        let Some(pending) = nt_handler.pending_driver_loads.get(slot) else {
+            continue;
+        };
+        let PendingDriverStartOwner::Boot {
+            target,
+            report_published,
+        } = &pending.owner
+        else {
+            continue;
+        };
+        if !*report_published {
+            reports.merge(*target, pending.batch.report());
+        }
+    }
+    reports
 }
 
 pub(crate) unsafe fn pending_driver_load_abandon_thread(
@@ -23526,10 +23592,19 @@ pub(crate) unsafe fn pending_driver_load_abandon_thread(
         let Some(pending) = nt_handler.pending_driver_loads.get_mut(slot) else {
             continue;
         };
-        if pending.tid != tid || pending.reply_cap == 0 {
+        let PendingDriverStartOwner::Native(reply) = &pending.owner else {
+            continue;
+        };
+        if reply.tid != tid || reply.reply_cap == 0 {
             continue;
         }
-        let cap = core::mem::replace(&mut pending.reply_cap, 0);
+        let PendingDriverStartOwner::Native(reply) = core::mem::replace(
+            &mut pending.owner,
+            PendingDriverStartOwner::Detached,
+        ) else {
+            unreachable!()
+        };
+        let cap = reply.reply_cap;
         let deleted = cnode_delete_r(cap);
         let retyped = if deleted == 0 {
             untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
@@ -23539,9 +23614,7 @@ pub(crate) unsafe fn pending_driver_load_abandon_thread(
         if deleted == 0 && retyped == 0 {
             release_reply_pool_cap(cap);
         }
-        thread_wait_state_clear_badge(pending.badge);
-        pending.tid = 0;
-        pending.badge = 0;
+        thread_wait_state_clear_badge(reply.badge);
         abandoned += 1;
     }
     abandoned

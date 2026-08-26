@@ -18564,6 +18564,67 @@ impl InlineDriverLaunchPlan {
     }
 }
 
+fn try_owned_inline_string(value: &str) -> Option<alloc::string::String> {
+    let mut owned = alloc::string::String::new();
+    owned.try_reserve_exact(value.len()).ok()?;
+    owned.push_str(value);
+    Some(owned)
+}
+
+fn owned_driver_launch_spec_from_inline(
+    spec: &InlineDriverLaunchSpec,
+    plan: &InlineDriverLaunchPlan,
+) -> Option<DriverServiceLaunchSpec> {
+    let inline_devnodes = plan.devnodes_for(spec);
+    let mut devnodes = alloc::vec::Vec::new();
+    devnodes.try_reserve_exact(inline_devnodes.len()).ok()?;
+    for devnode in inline_devnodes {
+        let copy_ids = |ids: &[InlinePlanString]| {
+            let mut copied = alloc::vec::Vec::new();
+            copied.try_reserve_exact(ids.len()).ok()?;
+            for id in ids {
+                copied.push(try_owned_inline_string(id.as_str())?);
+            }
+            Some(copied)
+        };
+        devnodes.push(DriverServiceDevnodeSpec {
+            instance_id: try_owned_inline_string(devnode.instance_id.as_str())?,
+            pdo_name: if devnode.pdo_name_present {
+                Some(try_owned_inline_string(devnode.pdo_name.as_str())?)
+            } else {
+                None
+            },
+            driver_key: if devnode.driver_key_present {
+                Some(try_owned_inline_string(devnode.driver_key.as_str())?)
+            } else {
+                None
+            },
+            linkage_export: if devnode.linkage_export_present {
+                Some(try_owned_inline_string(devnode.linkage_export.as_str())?)
+            } else {
+                None
+            },
+            hardware_ids: copy_ids(plan.hardware_ids_for(devnode))?,
+            compatible_ids: copy_ids(plan.compatible_ids_for(devnode))?,
+        });
+    }
+    let mut image_path = alloc::vec::Vec::new();
+    image_path.try_reserve_exact(spec.image_path.len).ok()?;
+    image_path.extend_from_slice(spec.image_path.as_bytes());
+    Some(DriverServiceLaunchSpec {
+        service_name: try_owned_inline_string(spec.service_name.as_str())?,
+        class_guid: if spec.class_guid_present {
+            Some(try_owned_inline_string(spec.class_guid.as_str())?)
+        } else {
+            None
+        },
+        driver_object_path: try_owned_inline_string(spec.driver_object_path.as_str())?,
+        image_path,
+        class: spec.class,
+        devnodes,
+    })
+}
+
 #[derive(Clone, Copy, Default)]
 struct InlineDriverLaunchPlanShape {
     specs: usize,
@@ -21490,7 +21551,8 @@ struct ExecNtHandler {
     /// DriverEntry/AddDevice/START side effects, and the service loop attaches the live syscall
     /// Reply object only when an exact START IRP remains pending.
     pending_driver_loads:
-        nt_driver_start::PendingDriverStartTable<PendingNtLoadDriver>,
+        nt_driver_start::PendingDriverStartTable<PendingDriverStart>,
+    boot_driver_start_reports: BootDriverStartReports,
     pending_driver_load_transfer: Option<(
         OwnedHostedPnpStartBatch,
         nt_driver_start::Reservation,
@@ -21634,13 +21696,328 @@ struct ExecNtHandler {
 
 const PENDING_DRIVER_LOAD_INITIAL_CAPACITY: usize = 8;
 
-struct PendingNtLoadDriver {
-    batch: OwnedHostedPnpStartBatch,
+#[derive(Clone, Copy)]
+struct BootDriverStartReportTarget {
+    trace: HostedPnpStartTrace,
+    pci: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct BootDriverStartReports {
+    boot_service: HostedPnpStartReport,
+    hardware_proof: HostedPnpStartReport,
+    hardware_pci: HostedPnpStartReport,
+}
+
+impl BootDriverStartReports {
+    fn merge(&mut self, target: BootDriverStartReportTarget, report: HostedPnpStartReport) {
+        match target.trace {
+            HostedPnpStartTrace::BootService => self.boot_service.merge(report),
+            HostedPnpStartTrace::HardwareProof => {
+                self.hardware_proof.merge(report);
+                if target.pci {
+                    self.hardware_pci.merge(report);
+                }
+            }
+            HostedPnpStartTrace::DemandStart => {
+                panic!("demand START cannot publish into a boot report")
+            }
+        }
+    }
+}
+
+struct DriverStartBootstrap {
+    pending: nt_driver_start::PendingDriverStartTable<PendingDriverStart>,
+    reports: BootDriverStartReports,
+}
+
+impl DriverStartBootstrap {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            pending: nt_driver_start::PendingDriverStartTable::with_capacity(capacity),
+            reports: BootDriverStartReports::default(),
+        }
+    }
+}
+
+unsafe fn launch_boot_driver_service(
+    fs: &Fat32,
+    spec: &InlineDriverLaunchSpec,
+    plan: &InlineDriverLaunchPlan,
+    options: HostedPnpStartOptions,
+    driver_starts: &mut DriverStartBootstrap,
+) -> Option<(driver_launch::DriverComponent, HostedPnpStartReport)> {
+    let target = BootDriverStartReportTarget {
+        trace: options.trace,
+        pci: inline_launch_spec_has_pci_devnode(plan.devnodes_for(spec)),
+    };
+    let prepared_start = if spec.class == driver_launch::DriverClass::Device
+        && spec.devnode_count != 0
+    {
+        let owned = match owned_driver_launch_spec_from_inline(spec, plan) {
+            Some(owned) => owned,
+            None => {
+                print_str(b"[driver-launch] boot START ownership allocation failed service=");
+                print_str(spec.service_name.as_bytes());
+                print_str(b"\n");
+                return None;
+            }
+        };
+        let reservation = match driver_starts.pending.reserve() {
+            Ok(reservation) => reservation,
+            Err(_) => {
+                print_str(b"[driver-launch] boot START continuation reserve failed service=");
+                print_str(spec.service_name.as_bytes());
+                print_str(b"\n");
+                return None;
+            }
+        };
+        Some((owned, reservation))
+    } else {
+        None
+    };
+    let Some(dc) = load_driver(
+        fs,
+        spec.image_path.as_bytes(),
+        spec.class,
+        spec.driver_object_path.as_str(),
+    ) else {
+        if let Some((_, reservation)) = prepared_start {
+            driver_starts
+                .pending
+                .cancel(reservation)
+                .expect("failed boot driver load lost its START reservation");
+        }
+        return None;
+    };
+    let Some((owned, reservation)) = prepared_start else {
+        return Some((dc, HostedPnpStartReport::default()));
+    };
+    let mut batch = OwnedHostedPnpStartBatch::new(&dc, owned, options);
+    let report = match batch.drive() {
+        OwnedHostedPnpStartProgress::Complete(_) => {
+            driver_starts
+                .pending
+                .cancel(reservation)
+                .expect("synchronous boot START lost its continuation reservation");
+            driver_starts.reports.merge(target, batch.report());
+            batch.report()
+        }
+        OwnedHostedPnpStartProgress::AwaitingCompletion => {
+            let report = batch.report();
+            driver_starts
+                .pending
+                .publish(
+                    reservation,
+                    PendingDriverStart {
+                        batch,
+                        owner: PendingDriverStartOwner::Boot {
+                            target,
+                            report_published: false,
+                        },
+                    },
+                )
+                .expect("pending boot START rejected its pre-reserved owner");
+            report
+        }
+        OwnedHostedPnpStartProgress::OwnershipLost(_) => {
+            let report = batch.report();
+            driver_starts.reports.merge(target, batch.report());
+            driver_starts
+                .pending
+                .publish(
+                    reservation,
+                    PendingDriverStart {
+                        batch,
+                        owner: PendingDriverStartOwner::Boot {
+                            target,
+                            report_published: true,
+                        },
+                    },
+                )
+                .expect("indeterminate boot START rejected its barrier owner");
+            report
+        }
+    };
+    Some((dc, report))
+}
+
+fn report_deferred_generic_hardware_checks(
+    report: HostedPnpStartReport,
+    pci_report: HostedPnpStartReport,
+    registry_selected: bool,
+    selected: u64,
+    root_selected: u64,
+    pci_registry_selected: bool,
+    pci_selected: u64,
+    provider: driver_launch::HostedProviderSharingEvidence,
+    passed: &mut u64,
+) {
+    print_str(b"[driver-launch] final config PnP summary selected=");
+    print_u64(selected);
+    print_str(b" attempted=");
+    print_u64(report.attempted);
+    print_str(b" add=");
+    print_u64(report.add_device_count);
+    print_str(b" started=");
+    print_u64(report.started);
+    print_str(b" terminal/failed/pending/pending-observed/indeterminate=");
+    print_u64(report.terminal);
+    print_str(b"/");
+    print_u64(report.failed);
+    print_str(b"/");
+    print_u64(report.pending);
+    print_str(b"/");
+    print_u64(report.pending_observed);
+    print_str(b"/");
+    print_u64(report.indeterminate);
+    print_str(b" first_error=0x");
+    print_hex(report.first_error);
+    print_str(b" first_indeterminate=0x");
+    print_hex(report.first_indeterminate);
+    print_str(b" pci_selected/attempted/started=");
+    print_u64(pci_selected);
+    print_str(b"/");
+    print_u64(pci_report.attempted);
+    print_str(b"/");
+    print_u64(pci_report.started);
+    print_str(b" root_selected/started=");
+    print_u64(root_selected);
+    print_str(b"/");
+    print_u64(report.root_started_count);
+    print_str(b"\n");
+
+    check(
+        b"exec_generic_hw_registry_selected",
+        registry_selected
+            && report.driver_ready_for_pnp
+            && report.add_device
+            && report.attempted == selected
+            && report.add_device_count == selected,
+        passed,
+    );
+    check(
+        b"exec_generic_pnp_starts_terminal",
+        report.attempted != 0
+            && report.terminal == report.attempted
+            && report.started + report.failed == report.terminal
+            && report.pending == 0
+            && report.indeterminate == 0
+            && report.first_indeterminate == 0,
+        passed,
+    );
+    check(
+        b"exec_generic_hw_mmio_interrupt_dma",
+        report.resource_granted
+            && report.mmio_mapped
+            && report.interrupt_connected
+            && report.dma_adapter
+            && report.dma_common,
+        passed,
+    );
+    check(
+        b"exec_generic_hw_root_pdo_started",
+        root_selected != 0
+            && report.root_started_count == root_selected
+            && report.start_ok
+            && report.root_started,
+        passed,
+    );
+    check(
+        b"exec_generic_pci_registry_selected",
+        pci_registry_selected && pci_selected != 0,
+        passed,
+    );
+    check(
+        b"exec_generic_pci_provider_domain_serviced",
+        provider.provider_domain_bindings != 0
+            && provider.provider_export_requests != 0
+            && provider.provider_export_completions != 0
+            && provider.provider_export_rejections == 0,
+        passed,
+    );
+    let legacy_receive_ok = provider.provider_protocol_receive_requests != 0
+        && provider.provider_protocol_receive_requests
+            == provider.provider_protocol_receive_completions
+        && provider.provider_protocol_receive_complete_requests != 0
+        && provider.provider_protocol_receive_complete_requests
+            == provider.provider_protocol_receive_complete_completions;
+    let packet_receive_ok = provider.provider_protocol_receive_packet_requests != 0
+        && provider.provider_protocol_receive_packet_requests
+            == provider.provider_protocol_receive_packet_completions;
+    let packet_array_receive_ok = provider.provider_packet_array_export_requests != 0
+        && provider.provider_packet_array_export_requests
+            == provider.provider_packet_array_export_completions
+        && ((provider.provider_packet_array_protocol_receive_packet_requests != 0
+            && provider.provider_packet_array_protocol_receive_packet_requests
+                == provider.provider_packet_array_protocol_receive_packet_completions)
+            || (provider.provider_packet_array_protocol_receive_requests != 0
+                && provider.provider_packet_array_protocol_receive_requests
+                    == provider.provider_packet_array_protocol_receive_completions));
+    check(
+        b"exec_provider_ndis_receive_indicated",
+        legacy_receive_ok || packet_receive_ok || packet_array_receive_ok,
+        passed,
+    );
+    check(
+        b"exec_generic_pci_add_device_reached",
+        pci_report.add_device
+            && pci_selected != 0
+            && pci_report.add_device_count == pci_selected,
+        passed,
+    );
+    check(
+        b"exec_generic_pci_resource_accessed",
+        pci_registry_selected
+            && (pci_report.mmio_mapped
+                || pci_report.io_port_out32
+                || pci_report.interrupt_delivered
+                || pci_report.dma_common
+                || pci_report.dma_packet_descriptors
+                || pci_report.dma_device_tx_completion_count != 0
+                || pci_report.dma_device_rx_completion_count != 0
+                || pci_report.dma_device_interrupt_cause_count != 0),
+        passed,
+    );
+    check(
+        b"exec_generic_hw_interrupt_delivered",
+        report.interrupt_connected
+            && report.interrupt_delivered
+            && report.interrupt_acknowledged,
+        passed,
+    );
+    check(
+        b"exec_generic_hw_dpc_delivered",
+        report.interrupt_delivered && report.dpc_delivered,
+        passed,
+    );
+    check(
+        b"exec_generic_hw_dma_packet_descriptors",
+        report.dma_common && report.dma_packet_descriptors,
+        passed,
+    );
+}
+
+struct NativeDriverStartReply {
     tid: u64,
     badge: u64,
     reply_cap: u64,
     native_call_transport: bool,
     reply_mrs: [u64; 18],
+}
+
+enum PendingDriverStartOwner {
+    Native(NativeDriverStartReply),
+    Boot {
+        target: BootDriverStartReportTarget,
+        report_published: bool,
+    },
+    Detached,
+}
+
+struct PendingDriverStart {
+    batch: OwnedHostedPnpStartBatch,
+    owner: PendingDriverStartOwner,
 }
 
 static mut EXEC_NT_HANDLER_WORK: core::mem::MaybeUninit<ExecNtHandler> =
@@ -21649,12 +22026,13 @@ static mut EXEC_NT_HANDLER_WORK: core::mem::MaybeUninit<ExecNtHandler> =
 #[inline(never)]
 unsafe fn reset_exec_nt_handler(
     hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
+    driver_starts: DriverStartBootstrap,
 ) -> &'static mut ExecNtHandler {
     let slot = core::ptr::addr_of_mut!(EXEC_NT_HANDLER_WORK) as *mut ExecNtHandler;
     // SAFETY: `service_sec_image` is serialized and owns the returned exclusive borrow until the
     // service loop exits. Reinitializing this slot intentionally leaks the previous bump-heap-backed
     // contents, matching the rest of the rootserver bootstrap allocator model.
-    ExecNtHandler::initialize_in(slot, hosted_images)
+    ExecNtHandler::initialize_in(slot, hosted_images, driver_starts)
 }
 
 type ExecIoCompletionPortTable = nt_io_completion::CompletionPortTable<TP_WORKER_PI_COUNT, 8, 64>;
@@ -26375,7 +26753,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         );
         let _ = tcb_resume(spawn.main_tcb);
         if ensure_executive_paging(BOOT_SEC_IMAGE_SCRATCH_BASE) {
-            let (v, f, _, _, _, _) = service_sec_image(
+            let (v, f, _, _, _, _, _) = service_sec_image(
                 si_fault,
                 spawn.pml4,
                 spawn.main_tcb,
@@ -26383,6 +26761,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 &pe,
                 BOOT_SEC_IMAGE_SCRATCH_BASE,
                 None,
+                DriverStartBootstrap::with_capacity(PENDING_DRIVER_LOAD_INITIAL_CAPACITY),
             );
             let _ = tcb_suspend_r(spawn.main_tcb);
             si_verdict = v;
@@ -28360,6 +28739,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let system_boot_driver_plan = system_hive_boot_driver_launch_plan();
     let config_pnp_plan = config_hive_boot_system_pnp_driver_launch_plan();
     let config_demand_pnp_plan = config_hive_demand_pnp_driver_launch_plan();
+    let boot_device_service_count = system_boot_driver_plan
+        .as_slice()
+        .iter()
+        .chain(config_pnp_plan.as_slice())
+        .filter(|spec| {
+            spec.class == driver_launch::DriverClass::Device && spec.devnode_count != 0
+        })
+        .count();
+    let mut driver_start_bootstrap = DriverStartBootstrap::with_capacity(
+        PENDING_DRIVER_LOAD_INITIAL_CAPACITY.saturating_add(boot_device_service_count),
+    );
     let scm_service_selection = system_hive_service_selection_report();
     print_str(b"[scm-select] auto-win32 count=");
     print_u64(scm_service_selection.auto_win32_count);
@@ -28519,25 +28909,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // publishes, not by a compiled-in service or image name.
     if let Some(fs) = exec_fs() {
         let mut named_pipe_provider = None;
-        let mut generic_hw_granted = false;
-        let mut generic_hw_mmio_mapped = false;
-        let mut generic_hw_interrupt_connected = false;
-        let mut generic_hw_dma_adapter = false;
-        let mut generic_hw_dma_common = false;
-        let mut generic_hw_io_out32 = false;
-        let mut generic_hw_root_started = false;
-        let mut generic_hw_video_route_published = false;
-        let mut generic_hw_attempted = 0u64;
-        let mut generic_hw_started = 0u64;
-        let mut generic_hw_video_route_attempted = 0u64;
-        let mut generic_hw_video_route_published_count = 0u64;
-        let mut generic_hw_first_error = 0u32;
-        let mut generic_hw_terminal = 0u64;
-        let mut generic_hw_failed = 0u64;
-        let mut generic_hw_pending = 0u64;
-        let mut generic_hw_pending_observed = 0u64;
-        let mut generic_hw_indeterminate = 0u64;
-        let mut generic_hw_first_indeterminate = 0u32;
         for spec in system_boot_driver_plan.as_slice() {
             let spec_devnodes = system_boot_driver_plan.devnodes_for(spec);
             if driver_launch::driver_id_by_name(spec.driver_object_path.as_str()).is_some() {
@@ -28559,46 +28930,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 }
             }
             print_str(b"\n");
-            if let Some(dc) = load_driver(
+            if let Some((dc, _)) = launch_boot_driver_service(
                 &fs,
-                spec.image_path.as_bytes(),
-                spec.class,
-                spec.driver_object_path.as_str(),
+                spec,
+                system_boot_driver_plan,
+                HostedPnpStartOptions::boot_service(),
+                &mut driver_start_bootstrap,
             ) {
-                if spec.class == driver_launch::DriverClass::Device {
-                    let start_report = start_inline_driver_service_devnodes(
-                        &dc,
-                        spec,
-                        system_boot_driver_plan,
-                        HostedPnpStartOptions::boot_service(),
-                    );
-                    generic_hw_granted |= start_report.resource_granted;
-                    generic_hw_mmio_mapped |= start_report.mmio_mapped;
-                    generic_hw_interrupt_connected |= start_report.interrupt_connected;
-                    generic_hw_dma_adapter |= start_report.dma_adapter;
-                    generic_hw_dma_common |= start_report.dma_common;
-                    generic_hw_io_out32 |= start_report.io_port_out32;
-                    generic_hw_root_started |= start_report.root_started;
-                    generic_hw_video_route_published |= start_report.video_route_published;
-                    generic_hw_attempted += start_report.attempted;
-                    generic_hw_terminal += start_report.terminal;
-                    generic_hw_started += start_report.started;
-                    generic_hw_failed += start_report.failed;
-                    generic_hw_pending += start_report.pending;
-                    generic_hw_pending_observed += start_report.pending_observed;
-                    generic_hw_indeterminate += start_report.indeterminate;
-                    generic_hw_video_route_attempted += start_report.video_route_attempted_count;
-                    generic_hw_video_route_published_count +=
-                        start_report.video_route_published_count;
-                    if generic_hw_first_error == 0 && start_report.first_error != 0 {
-                        generic_hw_first_error = start_report.first_error;
-                    }
-                    if generic_hw_first_indeterminate == 0
-                        && start_report.first_indeterminate != 0
-                    {
-                        generic_hw_first_indeterminate = start_report.first_indeterminate;
-                    }
-                }
                 let device_path =
                     captured_utf16le_ascii_path(&dc.device_name_utf16, dc.device_name_len);
                 if device_path.as_deref() == Some("\\Device\\NamedPipe") {
@@ -28618,45 +28956,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_str(spec.service_name.as_bytes());
                 print_str(b" load failed\n");
             }
-        }
-        if generic_hw_granted {
-            print_str(b"[driver-launch] generic hardware summary attempted=");
-            print_u64(generic_hw_attempted);
-            print_str(b" started=");
-            print_u64(generic_hw_started);
-            print_str(b" terminal/failed/pending/pending-observed/indeterminate=");
-            print_u64(generic_hw_terminal);
-            print_str(b"/");
-            print_u64(generic_hw_failed);
-            print_str(b"/");
-            print_u64(generic_hw_pending);
-            print_str(b"/");
-            print_u64(generic_hw_pending_observed);
-            print_str(b"/");
-            print_u64(generic_hw_indeterminate);
-            print_str(b" first_error=0x");
-            print_hex(generic_hw_first_error);
-            print_str(b" first_indeterminate=0x");
-            print_hex(generic_hw_first_indeterminate);
-            print_str(b" mmio=");
-            print_u64(generic_hw_mmio_mapped as u64);
-            print_str(b" int=");
-            print_u64(generic_hw_interrupt_connected as u64);
-            print_str(b" dma_adapter=");
-            print_u64(generic_hw_dma_adapter as u64);
-            print_str(b" dma_common=");
-            print_u64(generic_hw_dma_common as u64);
-            print_str(b" io_out32=");
-            print_u64(generic_hw_io_out32 as u64);
-            print_str(b" root_started=");
-            print_u64(generic_hw_root_started as u64);
-            print_str(b" video_route=");
-            print_u64(generic_hw_video_route_published as u64);
-            print_str(b" video_route_attempted=");
-            print_u64(generic_hw_video_route_attempted);
-            print_str(b" video_route_published=");
-            print_u64(generic_hw_video_route_published_count);
-            print_str(b"\n");
         }
         if let Some((dc, driver_object_path)) = named_pipe_provider {
             publish_npfs_io_objects(&mut *c, &dc, driver_object_path.as_str(), &mut passed);
@@ -29425,6 +29724,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut generic_hw_first_indeterminate = 0u32;
     let mut generic_root_attempted = 0u64;
     let mut generic_root_started = 0u64;
+    let mut generic_root_selected = 0u64;
     let mut generic_pci_registry_selected = false;
     let mut generic_pci_provider_domain_bound = false;
     let mut generic_pci_add_device = false;
@@ -29437,7 +29737,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut generic_pci_started = 0u64;
     let mut generic_pci_resource_accessed = false;
     let mut generic_pci_first_error = 0u32;
-    let config_pnp_launch_plans = [config_pnp_plan, config_demand_pnp_plan];
+    // The demand plan participates in resource discovery above, but only NtLoadDriver may execute
+    // its DriverEntry/AddDevice/START policy.
+    let config_pnp_launch_plans = [config_pnp_plan];
     if config_pnp_launch_plans
         .iter()
         .any(|plan| !plan.as_slice().is_empty())
@@ -29454,6 +29756,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     generic_pci_registry_selected |= spec_has_pci_devnode;
                     if spec_has_pci_devnode {
                         generic_pci_selected += spec_devnodes;
+                    } else {
+                        generic_root_selected += spec_devnodes;
                     }
                     print_str(b"[driver-launch] launching PnP service ");
                     print_str(proof_pnp_spec.service_name.as_bytes());
@@ -29465,19 +29769,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_u64(proof_pnp_spec.devnode_count as u64);
                     print_str(b"\n");
 
-                    if let Some(dc) = load_driver(
+                    let provider_before = driver_launch::hosted_provider_sharing_evidence();
+                    if let Some((_dc, start_report)) = launch_boot_driver_service(
                         &fs,
-                        proof_pnp_spec.image_path.as_bytes(),
-                        proof_pnp_spec.class,
-                        proof_pnp_spec.driver_object_path.as_str(),
+                        proof_pnp_spec,
+                        proof_pnp_plan,
+                        HostedPnpStartOptions::hardware_proof(),
+                        &mut driver_start_bootstrap,
                     ) {
-                        let provider_before = driver_launch::hosted_provider_sharing_evidence();
-                        let start_report = start_inline_driver_service_devnodes(
-                            &dc,
-                            proof_pnp_spec,
-                            proof_pnp_plan,
-                            HostedPnpStartOptions::hardware_proof(),
-                        );
                         let provider_after = driver_launch::hosted_provider_sharing_evidence();
                         generic_hw_driver_loaded |= start_report.driver_ready_for_pnp;
                         generic_hw_add_device |= start_report.add_device;
@@ -29634,7 +29933,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     } else {
         print_str(b"[driver-launch] config hive has no installed PnP driver binding\n");
     }
-    if generic_hw_selected != 0 {
+    let generic_hw_gates_deferred = generic_hw_pending != 0 || generic_hw_indeterminate != 0;
+    if !generic_hw_gates_deferred && generic_hw_selected != 0 {
         print_str(b"[driver-launch] config PnP hardware summary selected=");
         print_u64(generic_hw_selected);
         print_str(b" attempted=");
@@ -29734,10 +30034,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_str(b"\n");
     }
     let provider_sharing = driver_launch::hosted_provider_sharing_evidence();
-    if provider_sharing.primary_services != 0
+    if !generic_hw_gates_deferred
+        && (provider_sharing.primary_services != 0
         || provider_sharing.private_dependencies != 0
         || provider_sharing.singleton_providers != 0
-        || provider_sharing.provider_domain_bindings != 0
+        || provider_sharing.provider_domain_bindings != 0)
     {
         print_str(b"[driver-launch] hosted provider sharing primary=");
         print_u64(provider_sharing.primary_services);
@@ -29801,15 +30102,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_u64(provider_sharing.singleton_conflicts);
         print_str(b"\n");
     }
-    check(
-        b"exec_generic_hw_registry_selected",
-        generic_hw_registry_selected
+    if !generic_hw_gates_deferred {
+        check(
+            b"exec_generic_hw_registry_selected",
+            generic_hw_registry_selected
             && generic_hw_driver_loaded
             && generic_hw_add_device
             && generic_hw_attempted == generic_hw_selected
             && generic_hw_add_device_count == generic_hw_selected,
-        &mut passed,
-    );
+            &mut passed,
+        );
     check(
         b"exec_generic_pnp_starts_terminal",
         generic_hw_attempted != 0
@@ -29899,11 +30201,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         generic_hw_interrupt_delivered && generic_hw_dpc_delivered,
         &mut passed,
     );
-    check(
-        b"exec_generic_hw_dma_packet_descriptors",
-        generic_hw_dma_common && generic_hw_dma_packet_descriptors,
-        &mut passed,
-    );
+        check(
+            b"exec_generic_hw_dma_packet_descriptors",
+            generic_hw_dma_common && generic_hw_dma_packet_descriptors,
+            &mut passed,
+        );
+    }
 
     // --- P3 ReactOS-binary pipeline: the storage host read a REAL, redistributable (GPL)
     // ReactOS x64 smss.exe off the disk into the file buffer. Parse it through the REAL
@@ -30115,7 +30418,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // substituting so smss's ntdll pages (incl. OUR LdrpInitialize .text) fault in
                     // from OUR DLL's bytes; otherwise the real ntdll (fallback).
                     print_str(b"[diag-smss] entering service loop\n");
-                    let (heap_verdict, sfaults, sfirst, sstop, ntfaults, sssn) = service_sec_image(
+                    let (
+                        heap_verdict,
+                        sfaults,
+                        sfirst,
+                        sstop,
+                        ntfaults,
+                        sssn,
+                        final_driver_start_reports,
+                    ) = service_sec_image(
                         si_fault,
                         spawn.pml4,
                         spawn.main_tcb,
@@ -30123,7 +30434,49 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         &pe,
                         SCRATCH_BASE,
                         Some((NTDLL_BASE, smss_ntdll_pe)),
+                        driver_start_bootstrap,
                     );
+                    let final_hardware = final_driver_start_reports.hardware_proof;
+                    let final_boot = final_driver_start_reports.boot_service;
+                    print_str(b"[driver-launch] final boot STARTs attempted/terminal/pending/indeterminate=");
+                    print_u64(final_boot.attempted);
+                    print_str(b"/");
+                    print_u64(final_boot.terminal);
+                    print_str(b"/");
+                    print_u64(final_boot.pending);
+                    print_str(b"/");
+                    print_u64(final_boot.indeterminate);
+                    print_str(b" config=");
+                    print_u64(final_hardware.attempted);
+                    print_str(b"/");
+                    print_u64(final_hardware.terminal);
+                    print_str(b"/");
+                    print_u64(final_hardware.pending);
+                    print_str(b"/");
+                    print_u64(final_hardware.indeterminate);
+                    print_str(b"\n");
+                    check(
+                        b"exec_boot_pnp_starts_terminal",
+                        final_boot.terminal == final_boot.attempted
+                            && final_boot.started + final_boot.failed == final_boot.terminal
+                            && final_boot.pending == 0
+                            && final_boot.indeterminate == 0
+                            && final_boot.first_indeterminate == 0,
+                        &mut passed,
+                    );
+                    if generic_hw_gates_deferred {
+                        report_deferred_generic_hardware_checks(
+                            final_hardware,
+                            final_driver_start_reports.hardware_pci,
+                            generic_hw_registry_selected,
+                            generic_hw_selected,
+                            generic_root_selected,
+                            generic_pci_registry_selected,
+                            generic_pci_selected,
+                            driver_launch::hosted_provider_sharing_evidence(),
+                            &mut passed,
+                        );
+                    }
                     print_str(b"[ntos-exec] LIVE ReactOS smss+env: faulted ");
                     print_u64(sfaults);
                     print_str(b" page(s) (");

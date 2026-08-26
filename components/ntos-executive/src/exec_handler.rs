@@ -2521,6 +2521,7 @@ impl ExecNtHandler {
     pub(crate) unsafe fn initialize_in(
         slot: *mut ExecNtHandler,
         hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
+        driver_starts: DriverStartBootstrap,
     ) -> &'static mut Self {
         // SAFETY: HIVEBUF is a fixed, executive-lifetime mapping the storage host filled from
         // ::ROSSYS.HIV; REAL_HIVE_SIZE is its reported byte length (0 if unstaged → None).
@@ -2769,12 +2770,8 @@ impl ExecNtHandler {
         write_field!(pending_file_io_transfer, None);
         write_field!(pending_file_io_wait, false);
         write_field!(pending_file_io_reservation, None);
-        write_field!(
-            pending_driver_loads,
-            nt_driver_start::PendingDriverStartTable::with_capacity(
-                PENDING_DRIVER_LOAD_INITIAL_CAPACITY,
-            )
-        );
+        write_field!(pending_driver_loads, driver_starts.pending);
+        write_field!(boot_driver_start_reports, driver_starts.reports);
         write_field!(pending_driver_load_transfer, None);
         write_field!(pending_synchronous_file_wait, None);
         write_field!(pending_file_cleanup_wait, None);
@@ -5755,13 +5752,9 @@ impl ExecNtHandler {
                     self.pending_driver_loads
                         .publish(
                             reservation,
-                            PendingNtLoadDriver {
+                            PendingDriverStart {
                                 batch,
-                                tid: 0,
-                                badge: 0,
-                                reply_cap: 0,
-                                native_call_transport: true,
-                                reply_mrs: [0; 18],
+                                owner: PendingDriverStartOwner::Detached,
                             },
                         )
                         .expect("lost driver START ownership could not publish its barrier");

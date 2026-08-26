@@ -2565,6 +2565,38 @@ calls `IoCompleteRequest`, exercise at least two devnodes, and prove one termina
 resumed boot progression. Then continue with exact I/O Manager delete admission and the
 query/cancel/stop/remove removal journal.
 
+B3 replyless boot-start continuation checkpoint (2026-08-26, implementation green): boot/system
+device launch now owns the same `OwnedHostedPnpStartBatch` and generation-exact pending table used by
+native `NtLoadDriver`, but with an explicit replyless boot owner instead of a fabricated syscall
+Reply capability. The already-selected inline launch record is copied fallibly into exact owned
+service/devnode metadata and a table slot is reserved before DriverEntry, AddDevice, or START can
+run. A synchronous batch cancels that reservation; pending and ownership-loss paths publish the
+exact batch, canonical IRP cursor, cohort, and PCI-report identity. Independent services may
+continue, while later devnodes within one service cannot pass their unfinished predecessor.
+
+The pre-reserved table and completed reports move into `ExecNtHandler` before the service-loop heap
+checkpoint. The executive pumps once before SMSS resumes and once at each real receive-loop event
+while a resumable row exists; walking multiple rows uses a no-repump observer so completion import is
+O(events + batches), not one global completion pump per batch. Completion merges one replacement
+batch report, publishes terminal START evidence/video routing, and removes the row. An ownership-loss
+row remains an unload barrier. The old non-resumable inline START adapter has been deleted.
+
+Demand-start policy is no longer violated by the B3 bootstrap proof: the demand plan still
+participates in resource-context discovery, but only boot/system plans execute before user mode and
+only `NtLoadDriver` may execute demand DriverEntry/AddDevice/START. Hardware gates defer when the
+preboot snapshot contains pending or indeterminate ownership and then consume the final post-service
+snapshot; a new `exec_boot_pnp_starts_terminal` gate exposes any unfinished replyless boot batch.
+Focused validation is green at `nt-driver-start` `5/5`, `nt-pnp-manager` `14/14`, and
+`nt-io-manager` `195/195`. The freestanding executive check is back at the established 212-warning
+baseline, formatting and `git diff --check` are clean.
+
+Review adjustment: run the serialized desktop gate before accepting this handoff. It must retain
+the three real canonical hardware STARTs, exact bochsmp route publication, provider-domain network
+traffic, genuine Explorer paint, the new boot terminal gate, and the sentinel. After acceptance,
+add a separate two-devnode WDM fixture whose START returns `STATUS_PENDING` and completes from a
+real timer/DPC through `IoCompleteRequest`; keep it separate from the existing DMA/PnP fixture so
+synchronous and asynchronous lifecycle coverage remain independently diagnosable.
+
 ### A. SCM-Controlled Service Startup
 
 - `[x]` A0: Inventory the current SCM/service startup path and mark the static boundaries still in
