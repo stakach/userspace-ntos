@@ -1044,6 +1044,81 @@ fn import_regf_key_into_hive(
     Ok(())
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BootSystemHiveOrigin {
+    InstalledRegf,
+    PersistedCore,
+    PersistedRegf,
+    PersistedJournalOnly,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BootSystemHiveComposeError {
+    InstalledImport(RegfHiveImportError),
+    PersistedFormat,
+    PersistedCore(nt_hive_core::HiveDecodeError),
+    PersistedRegfInvalid,
+    PersistedRegfImport(RegfHiveImportError),
+    PersistedLog(nt_hive_core::HiveLogReplayError),
+    GeneratedOverlay(nt_hive_core::HiveDecodeError),
+    Compose(nt_hive_core::HiveOverlayError),
+}
+
+pub struct ComposedBootSystemHive {
+    pub hive: Hive,
+    pub origin: BootSystemHiveOrigin,
+    pub replayed_sequence: u64,
+}
+
+/// Construct the one boot SYSTEM authority from persistence, installed media, and setup overlay.
+///
+/// Installed REGF is the first-boot base and the baseline for a valid journal-only checkpoint. A
+/// present primary is decoded according to its declared magic and never falls through to installed
+/// media after corruption. A journal without a primary remains persisted state, not absence.
+pub fn compose_boot_system_hive(
+    installed: &RegfHive<'_>,
+    persisted_primary: Option<&[u8]>,
+    persisted_log: &[u8],
+    generated_overlay_image: &[u8],
+) -> Result<ComposedBootSystemHive, BootSystemHiveComposeError> {
+    let (mut base, origin) = match persisted_primary {
+        Some(bytes) if bytes.starts_with(&nt_hive_core::HIVE_IMAGE_MAGIC) => (
+            nt_hive_core::decode_image(bytes).map_err(BootSystemHiveComposeError::PersistedCore)?,
+            BootSystemHiveOrigin::PersistedCore,
+        ),
+        Some(bytes) if bytes.starts_with(b"regf") => {
+            let persisted =
+                RegfHive::new(bytes).ok_or(BootSystemHiveComposeError::PersistedRegfInvalid)?;
+            let (hive, _) = try_import_regf_into_hive(&persisted, HiveKind::System)
+                .map_err(BootSystemHiveComposeError::PersistedRegfImport)?;
+            (hive, BootSystemHiveOrigin::PersistedRegf)
+        }
+        Some(_) => return Err(BootSystemHiveComposeError::PersistedFormat),
+        None if !persisted_log.is_empty() => {
+            let (hive, _) = try_import_regf_into_hive(installed, HiveKind::System)
+                .map_err(BootSystemHiveComposeError::InstalledImport)?;
+            (hive, BootSystemHiveOrigin::PersistedJournalOnly)
+        }
+        None => {
+            let (hive, _) = try_import_regf_into_hive(installed, HiveKind::System)
+                .map_err(BootSystemHiveComposeError::InstalledImport)?;
+            (hive, BootSystemHiveOrigin::InstalledRegf)
+        }
+    };
+    let base_sequence = base.sequence;
+    let replayed_sequence = nt_hive_core::try_replay_log(&mut base, persisted_log, base_sequence)
+        .map_err(BootSystemHiveComposeError::PersistedLog)?;
+    let generated = nt_hive_core::decode_image(generated_overlay_image)
+        .map_err(BootSystemHiveComposeError::GeneratedOverlay)?;
+    let hive = nt_hive_core::compose_system_hive_overlay(&base, &generated)
+        .map_err(BootSystemHiveComposeError::Compose)?;
+    Ok(ComposedBootSystemHive {
+        hive,
+        origin,
+        replayed_sequence,
+    })
+}
+
 /// Import counts for a control-set snapshot loaded into Configuration Manager state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ControlSetImportCounts {
@@ -1409,6 +1484,7 @@ mod tests {
         const ENUM_PCI: u32 = 0xb80;
         const ENUM_DEVICE: u32 = 0xc00;
         const ENUM_INSTANCE: u32 = 0xc80;
+        const SELECT: u32 = 0x1100;
 
         const ROOT_LIST: u32 = 0x380;
         const CS_LIST: u32 = 0x3c0;
@@ -1418,6 +1494,7 @@ mod tests {
         const ENUM_LIST: u32 = 0xd00;
         const ENUM_PCI_LIST: u32 = 0xd40;
         const ENUM_DEVICE_LIST: u32 = 0xd80;
+        const SELECT_VALUE_LIST: u32 = 0x1180;
 
         const NPFS_VALUE_LIST: u32 = 0x480;
         const VK_IMAGE: u32 = 0x500;
@@ -1438,6 +1515,7 @@ mod tests {
         const ENUM_SERVICE_DATA: u32 = 0xf80;
         const ENUM_PDO_DATA: u32 = 0x1000;
         const ENUM_HWID_DATA: u32 = 0x1080;
+        const VK_CURRENT: u32 = 0x1200;
 
         let mut data = vec![0u8; 0x3000];
         data[..4].copy_from_slice(b"regf");
@@ -1445,6 +1523,7 @@ mod tests {
 
         write_nk(&mut data, ROOT, u32::MAX, b"SYSTEM");
         write_nk(&mut data, CONTROL_SET, ROOT, b"ControlSet001");
+        write_nk(&mut data, SELECT, ROOT, b"Select");
         write_nk(&mut data, SERVICES, CONTROL_SET, b"Services");
         write_nk(&mut data, NPFS, SERVICES, b"Npfs");
         write_nk(&mut data, PARAMETERS, NPFS, b"Parameters");
@@ -1460,7 +1539,7 @@ mod tests {
         write_nk(&mut data, ENUM_DEVICE, ENUM_PCI, b"VEN_8086&DEV_100E");
         write_nk(&mut data, ENUM_INSTANCE, ENUM_DEVICE, b"3&11583659&0&18");
 
-        write_subkey_list(&mut data, ROOT_LIST, &[CONTROL_SET]);
+        write_subkey_list(&mut data, ROOT_LIST, &[CONTROL_SET, SELECT]);
         write_subkey_list(&mut data, CS_LIST, &[SERVICES, CONTROL, ENUM]);
         write_subkey_list(&mut data, SERVICES_LIST, &[NPFS]);
         write_subkey_list(&mut data, NPFS_LIST, &[PARAMETERS]);
@@ -1476,6 +1555,10 @@ mod tests {
         set_nk_subkeys(&mut data, ENUM, ENUM_LIST);
         set_nk_subkeys(&mut data, ENUM_PCI, ENUM_PCI_LIST);
         set_nk_subkeys(&mut data, ENUM_DEVICE, ENUM_DEVICE_LIST);
+
+        write_value_list(&mut data, SELECT_VALUE_LIST, &[VK_CURRENT]);
+        set_nk_values(&mut data, SELECT, SELECT_VALUE_LIST, 1);
+        write_vk_inline_dword(&mut data, VK_CURRENT, b"Current", 1);
 
         write_value_list(
             &mut data,
@@ -1725,8 +1808,8 @@ mod tests {
         assert_eq!(
             stats,
             RegfHiveImportStats {
-                keys: 11,
-                values: 9,
+                keys: 12,
+                values: 10,
                 classes: 0,
                 security_descriptors: 0,
             }
@@ -2349,6 +2432,108 @@ mod tests {
             auto_win32.first().map(|service| service.process_kind),
             Some(nt_config_manager::Win32ServiceProcessKind::Own)
         );
+    }
+
+    fn generated_overlay_image() -> Vec<u8> {
+        let mut generated = Hive::new(HiveKind::System);
+        let select = generated.create_key("Select");
+        generated.set_dword(select, "Current", 1);
+        generated.create_key("ControlSet001");
+        let service = generated.create_key(r"ControlSet001\Services\GeneratedDriver");
+        generated.set_dword(service, "Start", nt_config_manager::SERVICE_SYSTEM_START);
+        nt_hive_core::encode_image(&generated)
+    }
+
+    #[test]
+    fn boot_system_composition_replays_persistence_and_rebases_the_generated_overlay() {
+        let installed_bytes = services_test_hive();
+        let installed = RegfHive::new(&installed_bytes).expect("installed REGF");
+
+        let mut persisted = Hive::new(HiveKind::System);
+        let select = persisted.create_key("Select");
+        persisted.set_dword(select, "Current", 2);
+        let inactive = persisted.create_key(r"ControlSet001\Services\Inactive");
+        persisted.set_dword(inactive, "Sentinel", 1);
+        let active = persisted.create_key(r"ControlSet002\Services\Persistent");
+        persisted.set_dword(active, "Primary", 2);
+        let base_sequence = persisted.sequence;
+        let primary = nt_hive_core::encode_image(&persisted);
+        let log = nt_hive_core::encode_log_record(
+            &nt_hive_core::HiveLogOp::SetValue {
+                path: r"ControlSet002\Services\Persistent",
+                name: "Journal",
+                value_type: RegistryValueType::Dword,
+                data: &3u32.to_le_bytes(),
+            },
+            base_sequence + 1,
+        );
+
+        let composed =
+            compose_boot_system_hive(&installed, Some(&primary), &log, &generated_overlay_image())
+                .expect("compose persisted SYSTEM");
+        assert_eq!(composed.origin, BootSystemHiveOrigin::PersistedCore);
+        assert_eq!(composed.replayed_sequence, base_sequence + 1);
+        assert_eq!(
+            composed.hive.current_control_set().unwrap().as_str(),
+            "ControlSet002"
+        );
+        let active = composed
+            .hive
+            .open_key(r"ControlSet002\Services\Persistent")
+            .unwrap();
+        assert_eq!(composed.hive.query_dword(active, "Primary"), Some(2));
+        assert_eq!(composed.hive.query_dword(active, "Journal"), Some(3));
+        assert!(composed
+            .hive
+            .open_key(r"ControlSet002\Services\GeneratedDriver")
+            .is_some());
+        let inactive = composed
+            .hive
+            .open_key(r"ControlSet001\Services\Inactive")
+            .unwrap();
+        assert_eq!(composed.hive.query_dword(inactive, "Sentinel"), Some(1));
+        assert!(composed
+            .hive
+            .open_key(r"ControlSet001\Services\GeneratedDriver")
+            .is_none());
+        assert_eq!(composed.hive.dirty_count(), 0);
+    }
+
+    #[test]
+    fn boot_system_composition_never_falls_back_after_persisted_corruption() {
+        let installed_bytes = services_test_hive();
+        let installed = RegfHive::new(&installed_bytes).expect("installed REGF");
+        let mut persisted = Hive::new(HiveKind::System);
+        let select = persisted.create_key("Select");
+        persisted.set_dword(select, "Current", 1);
+        persisted.create_key("ControlSet001");
+        let mut primary = nt_hive_core::encode_image(&persisted);
+        let last = primary.len() - 1;
+        primary[last] ^= 0xff;
+
+        assert!(matches!(
+            compose_boot_system_hive(&installed, Some(&primary), &[], &generated_overlay_image()),
+            Err(BootSystemHiveComposeError::PersistedCore(
+                nt_hive_core::HiveDecodeError::BadChecksum
+            ))
+        ));
+    }
+
+    #[test]
+    fn boot_system_composition_uses_installed_regf_only_when_persistence_is_absent() {
+        let installed_bytes = services_test_hive();
+        let installed = RegfHive::new(&installed_bytes).expect("installed REGF");
+        let composed = compose_boot_system_hive(&installed, None, &[], &generated_overlay_image())
+            .expect("first-boot composition");
+        assert_eq!(composed.origin, BootSystemHiveOrigin::InstalledRegf);
+        assert!(composed
+            .hive
+            .open_key(r"ControlSet001\Services\Npfs")
+            .is_some());
+        assert!(composed
+            .hive
+            .open_key(r"ControlSet001\Services\GeneratedDriver")
+            .is_some());
     }
 
     #[test]

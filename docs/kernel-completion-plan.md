@@ -12778,3 +12778,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     selected base; publish exactly one complete image to isolated CM before launch-plan selection;
     and remove the generated-only mount and direct REGF semantic importer. Persisted corruption is
     an error, not permission to fall back to the installed hive.
+
+    Composed boot-SYSTEM primitive (2026-08-26, crate accepted): `nt-hive-regf` now constructs one
+    SYSTEM hive from an explicitly classified source: installed REGF for a genuinely absent first
+    boot, installed REGF plus a persisted journal-only checkpoint, a persisted REGF primary, or a
+    persisted core primary. A present primary is dispatched by declared magic and corruption never
+    falls through to installed media. The selected base is replayed first and then receives the
+    generated SYSTEM overlay through selected-control-set rebasing.
+
+    `nt-hive-core::try_replay_log` validates every complete persisted record, including header and
+    payload checksums, operation, payload shape, and registry value type. A physically incomplete
+    final record remains the defined torn-write recovery case; complete corruption is an error.
+    Core image decoding also rejects unknown registry value types rather than coercing them to
+    `REG_BINARY`.
+
+    Tests prove persisted `ControlSet002` primary and journal values survive, generated
+    `ControlSet001` content appears only under selected `ControlSet002`, inactive `ControlSet001`
+    remains unchanged, the result is clean, corrupt persisted core state cannot use the valid
+    installed fixture, and the absence path imports installed REGF exactly as the base. Focused
+    validation is green at `nt-hive-core` `76/76` and `nt-hive-regf` `23/23`.
+
+    Review adjustment: the primitive is closed; integration remains open. Replace the early writable
+    snapshot boolean with typed absent/restored/error classification before provisioning can mask a
+    missing SYSTEM checkpoint. Publish the composed encoded image as the first and only isolated CM
+    generation before launch-plan selection, then delete the split generated/direct-REGF semantic
+    manager paths and their unknown-type fallback copier.

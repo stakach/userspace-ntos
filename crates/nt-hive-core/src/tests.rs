@@ -1781,6 +1781,37 @@ fn log_replay_idempotent_and_torn() {
 }
 
 #[test]
+fn strict_log_replay_rejects_torn_or_corrupt_persistence() {
+    let record = encode_log_record(
+        &HiveLogOp::SetValue {
+            path: r"ControlSet001\X",
+            name: "N",
+            value_type: RegistryValueType::Dword,
+            data: &5u32.to_le_bytes(),
+        },
+        1,
+    );
+    let mut complete = Hive::new(HiveKind::System);
+    assert_eq!(try_replay_log(&mut complete, &record, 0), Ok(1));
+    let key = complete.open_key(r"ControlSet001\X").unwrap();
+    assert_eq!(complete.query_dword(key, "N"), Some(5));
+
+    let mut torn = Hive::new(HiveKind::System);
+    assert_eq!(
+        try_replay_log(&mut torn, &record[..record.len() - 1], 0),
+        Ok(0)
+    );
+    assert!(torn.open_key(r"ControlSet001\X").is_none());
+
+    let mut bad_magic = record.clone();
+    bad_magic[0] ^= 0xff;
+    assert_eq!(
+        try_replay_log(&mut Hive::new(HiveKind::System), &bad_magic, 0),
+        Err(HiveLogReplayError::BadMagic)
+    );
+}
+
+#[test]
 fn fault_on_image_write_preserves_previous() {
     // The second image write faults → the previous image + log survive (spec §18.1).
     let mut mgr = HiveManager::new(FaultInjectionHiveIoProvider::new().fail_image_write_after(2));

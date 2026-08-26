@@ -3,7 +3,8 @@
 //! The registry expressed as NT **hives** (spec: NT Hive Manager + Configuration Manager Hive
 //! I/O Provider): a [`Hive`] is a cell arena of [`hive::KeyCell`]s + [`hive::ValueCell`]s
 //! addressed by a stable [`CellId`] (never a raw pointer). A [`HiveMountTable`] resolves a full
-//! NT registry path to a mounted hive + a relative path, applying the `CurrentControlSet` alias.
+//! NT registry path to a mounted hive + a relative path, applying that SYSTEM generation's
+//! validated `CurrentControlSet` alias.
 //! Hives persist through a versioned, checksummed **image** + an append-only **log** (replayed
 //! on boot) behind a pluggable [`HiveIoProvider`] (Memory / FaultInjection / filesystem-backed
 //! providers), with
@@ -45,8 +46,8 @@ pub use reactos_registration::{
 pub use codec::{
     decode_image, encode_image, encode_log_record, encoded_image_len, image_len_if_valid,
     image_root_subkey_count_if_valid, image_value_len_if_valid, replay_log, try_encode_image,
-    try_encode_subtree_image, HiveDecodeError, HiveEncodeError, HiveLogOp, HiveSubtreeEncodeError,
-    HIVE_IMAGE_MAGIC,
+    try_encode_subtree_image, try_replay_log, HiveDecodeError, HiveEncodeError, HiveLogOp,
+    HiveLogReplayError, HiveSubtreeEncodeError, HIVE_IMAGE_MAGIC,
 };
 pub use config_import::{
     import_control_set_class_into_config_manager, import_control_set_enum_into_config_manager,

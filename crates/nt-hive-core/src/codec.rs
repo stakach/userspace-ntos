@@ -32,6 +32,19 @@ pub enum HiveDecodeError {
     BadChecksum,
     Truncated,
     UnsupportedSchema,
+    UnsupportedValueType(u32),
+}
+
+/// Why strict replay of a persisted hive journal failed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HiveLogReplayError {
+    BadMagic,
+    BadChecksum,
+    Truncated,
+    UnsupportedHeader,
+    UnsupportedOperation(u16),
+    UnsupportedValueType(u32),
+    InvalidPayload,
 }
 
 /// Why encoding a hive image failed.
@@ -460,7 +473,7 @@ pub fn decode_image(bytes: &[u8]) -> Result<Hive, HiveDecodeError> {
                     parent_key,
                     name,
                     value_type: RegistryValueType::from_u32(ty)
-                        .unwrap_or(RegistryValueType::Binary),
+                        .ok_or(HiveDecodeError::UnsupportedValueType(ty))?,
                     data_blob,
                     last_write_sequence: seq,
                 });
@@ -910,6 +923,92 @@ pub fn replay_log(hive: &mut Hive, bytes: &[u8], base: u64) -> u64 {
     last
 }
 
+/// Replay a persisted journal, rejecting any complete malformed record or payload.
+///
+/// An incomplete final record is the accepted torn-write recovery case and is ignored. Unlike
+/// [`replay_log`], complete bad magic, checksums, headers, operations, types, or payloads are errors.
+pub fn try_replay_log(hive: &mut Hive, bytes: &[u8], base: u64) -> Result<u64, HiveLogReplayError> {
+    let mut r = Reader::new(bytes);
+    let mut last = base;
+    while !r.is_empty() {
+        if r.remaining() < LOG_HEADER_LEN {
+            break;
+        }
+        let start = bytes.len() - r.remaining();
+        let magic = r.blob_fixed::<4>().ok_or(HiveLogReplayError::Truncated)?;
+        if magic != LOG_MAGIC {
+            return Err(HiveLogReplayError::BadMagic);
+        }
+        let header_size = r.u16().ok_or(HiveLogReplayError::Truncated)?;
+        let op = r.u16().ok_or(HiveLogReplayError::Truncated)?;
+        let sequence = r.u64().ok_or(HiveLogReplayError::Truncated)?;
+        let payload_len = r.u32().ok_or(HiveLogReplayError::Truncated)? as usize;
+        let payload_crc = r.u32().ok_or(HiveLogReplayError::Truncated)?;
+        let record_crc = r.u32().ok_or(HiveLogReplayError::Truncated)?;
+        if header_size as usize != LOG_HEADER_LEN {
+            return Err(HiveLogReplayError::UnsupportedHeader);
+        }
+        let header = bytes
+            .get(start..start + LOG_HEADER_LEN)
+            .ok_or(HiveLogReplayError::Truncated)?;
+        if crc32c(&header[..LOG_HEADER_LEN - 4]) != record_crc {
+            return Err(HiveLogReplayError::BadChecksum);
+        }
+        let Some(payload) = r.take_slice(payload_len) else {
+            break;
+        };
+        if crc32c(payload) != payload_crc {
+            return Err(HiveLogReplayError::BadChecksum);
+        }
+        validate_log_payload(op, payload)?;
+        if sequence > last {
+            apply_log(hive, op, payload);
+            last = sequence;
+        }
+    }
+    Ok(last)
+}
+
+fn validate_log_payload(op: u16, payload: &[u8]) -> Result<(), HiveLogReplayError> {
+    let mut r = Reader::new(payload);
+    match op {
+        OP_CREATE_KEY | OP_DELETE_KEY => {
+            r.str16().ok_or(HiveLogReplayError::InvalidPayload)?;
+        }
+        OP_SET_VALUE => {
+            r.str16().ok_or(HiveLogReplayError::InvalidPayload)?;
+            r.str16().ok_or(HiveLogReplayError::InvalidPayload)?;
+            let value_type = r.u32().ok_or(HiveLogReplayError::InvalidPayload)?;
+            RegistryValueType::from_u32(value_type)
+                .ok_or(HiveLogReplayError::UnsupportedValueType(value_type))?;
+            r.blob().ok_or(HiveLogReplayError::InvalidPayload)?;
+        }
+        OP_DELETE_VALUE => {
+            r.str16().ok_or(HiveLogReplayError::InvalidPayload)?;
+            r.str16().ok_or(HiveLogReplayError::InvalidPayload)?;
+        }
+        OP_SET_KEY_CLASS => {
+            r.str16().ok_or(HiveLogReplayError::InvalidPayload)?;
+            match r.u8().ok_or(HiveLogReplayError::InvalidPayload)? {
+                0 => {}
+                1 => {
+                    r.str16().ok_or(HiveLogReplayError::InvalidPayload)?;
+                }
+                _ => return Err(HiveLogReplayError::InvalidPayload),
+            }
+        }
+        OP_SET_KEY_SECURITY_DESCRIPTOR => {
+            r.str16().ok_or(HiveLogReplayError::InvalidPayload)?;
+            r.blob().ok_or(HiveLogReplayError::InvalidPayload)?;
+        }
+        _ => return Err(HiveLogReplayError::UnsupportedOperation(op)),
+    }
+    if !r.is_empty() {
+        return Err(HiveLogReplayError::InvalidPayload);
+    }
+    Ok(())
+}
+
 fn apply_log(hive: &mut Hive, op: u16, payload: &[u8]) {
     let mut r = Reader::new(payload);
     match op {
@@ -923,8 +1022,9 @@ fn apply_log(hive: &mut Hive, op: u16, payload: &[u8]) {
                 (r.str16(), r.str16(), r.u32(), r.blob())
             {
                 let key = hive.create_key(&path);
-                let vt = RegistryValueType::from_u32(ty).unwrap_or(RegistryValueType::Binary);
-                hive.set_value(key, &name, vt, data);
+                if let Some(value_type) = RegistryValueType::from_u32(ty) {
+                    hive.set_value(key, &name, value_type, data);
+                }
             }
         }
         OP_DELETE_VALUE => {
