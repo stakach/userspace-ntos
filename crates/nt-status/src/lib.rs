@@ -97,6 +97,8 @@ statuses! {
     OBJECT_TYPE_MISMATCH = 0xC000_0024u32;
     /// The object is being deleted.
     DELETE_PENDING = 0xC000_0056u32;
+    /// The device or hosted domain still owns live state and cannot be retired.
+    DEVICE_BUSY = 0x8000_0011u32;
     /// The requested operation is not implemented.
     NOT_IMPLEMENTED = 0xC000_0002u32;
     /// The request is not supported.

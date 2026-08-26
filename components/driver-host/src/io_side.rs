@@ -238,11 +238,7 @@ pub unsafe extern "C" fn io_side_entry() -> ! {
         Err(_) => park(),
     };
     let mut io = IoManager::new(port);
-    let domain = io.register_hosted_domain();
-    let identity = match io.hosted_domain_identity(domain) {
-        Some(identity) => identity,
-        None => park(),
-    };
+    let identity = io.register_hosted_domain();
     let backend = match DriverPeerBackend::new(transport, identity, None) {
         Ok(backend) => backend,
         Err(_) => park(),

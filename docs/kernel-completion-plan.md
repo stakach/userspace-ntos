@@ -11649,6 +11649,38 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the CPU's exact active user thread and covered by a stress test so a stale user-entry owner can
     never suspend the executive or another domain.
 
+    Exact provider publication and domain-lifetime checkpoint (2026-08-26, accepted locally):
+    provider export-publication tokens are now named and used only for singleton image/export,
+    marshal-policy, and thunk selection. Provider routes retain separate exact dependent and
+    provider `HostedDomainIdentity` values, and IRP envelopes carry the provider domain id and its
+    real generation cookie rather than the publication token. Callback records retain both exact
+    domain identities and the publication generation, validate a live route and executable target
+    at creation, revalidate both current instances and the provider channel before dispatch, and
+    are tombstoned with their exact route. Dynamic internal marshal-policy rows are likewise owned
+    by the singleton's exact domain generation and are retired with that publication.
+
+    The I/O Manager now returns the complete identity when registering a hosted domain, exposes
+    only exact-generation DriverObject, DeviceObject, and FileObject projection APIs, rejects domain
+    retirement while any projection or inbound/outbound provider link remains, and refuses provider
+    unload while dependent leases exist. Provider-link acquisition distinguishes a newly created
+    lease from an idempotent replay so allocation rollback cannot erase another route's ownership;
+    one dependent domain cannot acquire conflicting provider routes. Route retirement becomes
+    non-dispatchable before teardown and retains its row for exact retry. `clear_instance` is now
+    fallible, counts failed device-binding retirement, keeps the instance/domain/mechanism on any
+    failed exact cleanup, and destroys canonical driver records only after device/resource and
+    provider projections have been withdrawn. Driver unload propagates that result instead of
+    reporting success after partial cleanup.
+
+    Local validation is green for `nt-status` at `4/4`, `nt-io-manager` at `190/190`,
+    `nt-hosted-runtime` at `53/53`, the freestanding driver-host check, formatting and diff checks,
+    and the executive check at the established 212-warning baseline. Review adjustment: run one
+    serialized desktop proof before accepting this checkpoint. Then finish the remaining
+    failure-retaining provider shadow/allocation cleanup and implement the ordered PnP removal
+    transaction, including query/cancel/remove IRPs, interface and video-route withdrawal, exact
+    resource revocation, FDO/PDO detach and destruction, RootBus PDO removal, DriverUnload, and
+    final hosted-domain retirement. Keep the rust-micro device-memory cache-policy and SMP
+    fault-owner correctness items visible alongside that work.
+
     After that boundary is live, migrate the standalone hal, power, PnP, async, MMIO, and DMA
     component harnesses to `CompletionOwnerClaim` plus `CompletionUnwindCursor`, including their
     direct attach/lower-call shims. Reconcile the separate `driver-host-direg` and `nt-driver-host`

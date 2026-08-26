@@ -820,8 +820,7 @@ mod tests {
         om: &mut IoManager<MockObjectPort>,
         control: &MockPeerControl,
     ) -> (DriverPeerBackend<MockDriverPeer>, HostedDomainIdentity) {
-        let domain = om.register_hosted_domain();
-        let identity = om.hosted_domain_identity(domain).unwrap();
+        let identity = om.register_hosted_domain();
         (
             DriverPeerBackend::new(control.transport(), identity, None).unwrap(),
             identity,
@@ -4109,13 +4108,10 @@ mod tests {
 
         let mut om = io();
         let client = om.register_client();
-        let target_domain = om.register_hosted_domain();
-        let provider_domain = om.register_hosted_domain();
-        let provider_cookie = om.hosted_domain_identity(provider_domain).unwrap().cookie;
-        om.set_hosted_domain_provider(target_domain, provider_domain, provider_cookie)
-            .unwrap();
-        let target = om.hosted_domain_identity(target_domain).unwrap();
-        let provider = om.hosted_provider_identity(target_domain).unwrap();
+        let target = om.register_hosted_domain();
+        let provider = om.register_hosted_domain();
+        om.set_hosted_domain_provider(target, provider).unwrap();
+        let provider = om.hosted_provider_identity(target).unwrap();
         let backend = DriverPeerBackend::new(control.transport(), target, Some(provider)).unwrap();
         let driver = om
             .create_driver_peer(&path("\\Driver\\PeerRoute"), Box::new(backend))

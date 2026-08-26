@@ -14430,6 +14430,7 @@ struct HostedProviderSingleton {
     present: bool,
     provider: HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
     instance: usize,
+    owner_domain: HostedDomainIdentity,
     exec_va: u64,
     run_va: u64,
     image_offset: u64,
@@ -14438,7 +14439,7 @@ struct HostedProviderSingleton {
     pool_base: u64,
     pool_frames: u64,
     export_call_gate: u64,
-    provider_domain_cookie: u64,
+    provider_publication_cookie: u64,
 }
 
 impl HostedProviderSingleton {
@@ -14447,6 +14448,10 @@ impl HostedProviderSingleton {
             present: false,
             provider: HostedAscii::empty(),
             instance: 0,
+            owner_domain: HostedDomainIdentity {
+                domain_id: nt_io_manager::HostedDomainId::NULL,
+                cookie: 0,
+            },
             exec_va: 0,
             run_va: 0,
             image_offset: 0,
@@ -14455,7 +14460,7 @@ impl HostedProviderSingleton {
             pool_base: 0,
             pool_frames: 0,
             export_call_gate: 0,
-            provider_domain_cookie: 0,
+            provider_publication_cookie: 0,
         }
     }
 }
@@ -14556,9 +14561,13 @@ const NDIS_DEVICE_PROPERTY_TRANSLATED_RESOURCES: u8 = 5;
 #[derive(Clone, Copy)]
 struct HostedProviderDispatchRoute {
     used: bool,
+    retiring: bool,
     dependent_instance: usize,
     provider_instance: usize,
-    provider_domain_cookie: u64,
+    dependent_domain: HostedDomainIdentity,
+    provider_domain: HostedDomainIdentity,
+    provider_publication_cookie: u64,
+    dependent_driver_id: u64,
     dependent_driver_object: u64,
     provider_driver_object: u64,
     provider_driver_extension: u64,
@@ -14570,9 +14579,19 @@ impl HostedProviderDispatchRoute {
     const fn empty() -> Self {
         Self {
             used: false,
+            retiring: false,
             dependent_instance: 0,
             provider_instance: 0,
-            provider_domain_cookie: 0,
+            dependent_domain: HostedDomainIdentity {
+                domain_id: nt_io_manager::HostedDomainId::NULL,
+                cookie: 0,
+            },
+            provider_domain: HostedDomainIdentity {
+                domain_id: nt_io_manager::HostedDomainId::NULL,
+                cookie: 0,
+            },
+            provider_publication_cookie: 0,
+            dependent_driver_id: 0,
             dependent_driver_object: 0,
             provider_driver_object: 0,
             provider_driver_extension: 0,
@@ -14583,8 +14602,14 @@ impl HostedProviderDispatchRoute {
 
     fn add_device_ready(self) -> bool {
         self.used
+            && !self.retiring
             && self.provider_instance != self.dependent_instance
-            && self.provider_domain_cookie != 0
+            && self.dependent_domain.domain_id != nt_io_manager::HostedDomainId::NULL
+            && self.dependent_domain.cookie != 0
+            && self.provider_domain.domain_id != nt_io_manager::HostedDomainId::NULL
+            && self.provider_domain.cookie != 0
+            && self.provider_publication_cookie != 0
+            && self.dependent_driver_id != 0
             && self.provider_driver_object != 0
             && self.provider_add_device != 0
     }
@@ -14916,7 +14941,8 @@ impl HostedProviderNdisMiniportBlockMirror {
 #[derive(Clone, Copy)]
 struct HostedProviderInternalMarshalPolicyRecord {
     present: bool,
-    provider_domain_cookie: u64,
+    provider_domain: HostedDomainIdentity,
+    provider_publication_cookie: u64,
     provider_rva: u64,
     policy: HostedProviderExportMarshalPolicy,
 }
@@ -14926,6 +14952,9 @@ struct HostedProviderCallbackRecord {
     present: bool,
     provider_instance: usize,
     dependent_instance: usize,
+    provider_domain: HostedDomainIdentity,
+    dependent_domain: HostedDomainIdentity,
+    provider_publication_cookie: u64,
     target: u64,
     callback_offset: u64,
     callback_kind: u8,
@@ -15254,7 +15283,11 @@ unsafe fn find_hosted_provider_singleton(
 ) -> Option<(usize, HostedProviderSingleton)> {
     let singletons = hosted_provider_singletons()?;
     for (index, singleton) in singletons.iter().copied().enumerate() {
-        if singleton.present && hosted_ascii_eq_ignore_case(&singleton.provider, provider) {
+        if singleton.present
+            && hosted_ascii_eq_ignore_case(&singleton.provider, provider)
+            && instance(singleton.instance).and_then(instance_domain_identity)
+                == Some(singleton.owner_domain)
+        {
             return Some((index, singleton));
         }
     }
@@ -15262,32 +15295,56 @@ unsafe fn find_hosted_provider_singleton(
 }
 
 unsafe fn find_hosted_provider_singleton_by_cookie(
-    provider_domain_cookie: u64,
+    provider_publication_cookie: u64,
 ) -> Option<(usize, HostedProviderSingleton)> {
-    if provider_domain_cookie == 0 {
+    if provider_publication_cookie == 0 {
         return None;
     }
     let singletons = hosted_provider_singletons()?;
     for (index, singleton) in singletons.iter().copied().enumerate() {
-        if singleton.present && singleton.provider_domain_cookie == provider_domain_cookie {
+        if singleton.present
+            && singleton.provider_publication_cookie == provider_publication_cookie
+            && instance(singleton.instance).and_then(instance_domain_identity)
+                == Some(singleton.owner_domain)
+        {
             return Some((index, singleton));
         }
     }
     None
 }
 
-unsafe fn clear_hosted_provider_singletons_for_instance(instance: usize) {
+unsafe fn clear_hosted_provider_singletons_for_instance(instance: usize) -> u64 {
     let singletons = hosted_provider_singletons_mut();
+    let mut failures = 0u64;
     for singleton in singletons.iter_mut() {
         if singleton.present && singleton.instance == instance {
-            *singleton = HostedProviderSingleton::empty();
+            let has_live_route = hosted_provider_dispatch_routes()
+                .map(|routes| {
+                    routes.iter().any(|route| {
+                        route.used
+                            && route.provider_domain == singleton.owner_domain
+                            && route.provider_publication_cookie
+                                == singleton.provider_publication_cookie
+                    })
+                })
+                .unwrap_or(false);
+            if has_live_route {
+                failures += 1;
+            } else {
+                clear_hosted_provider_internal_marshal_policies(
+                    singleton.owner_domain,
+                    singleton.provider_publication_cookie,
+                );
+                *singleton = HostedProviderSingleton::empty();
+            }
         }
     }
+    failures
 }
 
 unsafe fn register_hosted_provider_singleton(
     provider: HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
-    instance: usize,
+    instance_index: usize,
     exec_va: u64,
     run_va: u64,
     image_offset: u64,
@@ -15305,12 +15362,16 @@ unsafe fn register_hosted_provider_singleton(
         print_str(b"\n");
         return false;
     }
+    let Some(owner_domain) = instance(instance_index).and_then(instance_domain_identity) else {
+        return false;
+    };
 
     if let Some((_index, existing)) = find_hosted_provider_singleton(&provider) {
         if existing.image_offset == image_offset
             && existing.image_len == image_len
             && existing.image_frames == image_frames
-            && existing.instance == instance
+            && existing.instance == instance_index
+            && existing.owner_domain == owner_domain
             && existing.pool_base == pool_base
             && existing.pool_frames == pool_frames
         {
@@ -15324,7 +15385,7 @@ unsafe fn register_hosted_provider_singleton(
     }
 
     let singletons = hosted_provider_singletons_mut();
-    let Some(provider_domain_cookie) = (singletons.len() as u64).checked_add(1) else {
+    let Some(provider_publication_cookie) = (singletons.len() as u64).checked_add(1) else {
         HOSTED_PROVIDER_SINGLETON_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
         print_str(b"[driver-launch] provider singleton cookie exhausted before ");
         print_str(provider.as_bytes());
@@ -15339,7 +15400,8 @@ unsafe fn register_hosted_provider_singleton(
     singletons.push(HostedProviderSingleton {
         present: true,
         provider,
-        instance,
+        instance: instance_index,
+        owner_domain,
         exec_va,
         run_va,
         image_offset,
@@ -15348,7 +15410,7 @@ unsafe fn register_hosted_provider_singleton(
         pool_base,
         pool_frames,
         export_call_gate,
-        provider_domain_cookie,
+        provider_publication_cookie,
     });
     print_str(b"[driver-launch] provider singleton published ");
     print_str(provider.as_bytes());
@@ -15357,7 +15419,7 @@ unsafe fn register_hosted_provider_singleton(
     print_str(b" pool-frames=");
     print_u64(pool_frames);
     print_str(b" cookie=");
-    print_u64(provider_domain_cookie);
+    print_u64(provider_publication_cookie);
     if export_call_gate != 0 {
         print_str(b" export-gate=0x");
         print_hex((export_call_gate >> 32) as u32);
@@ -15557,7 +15619,7 @@ fn hosted_provider_domain_descriptor(
         pool_base: singleton.pool_base,
         pool_frames: singleton.pool_frames,
         export_call_gate: singleton.export_call_gate,
-        provider_domain_cookie: singleton.provider_domain_cookie,
+        provider_publication_cookie: singleton.provider_publication_cookie,
     }
 }
 
@@ -15652,7 +15714,7 @@ fn print_hosted_provider_callback_name(record: HostedProviderCallbackRecord) {
 unsafe fn trace_hosted_provider_export(
     phase: &[u8],
     provider: &HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
-    provider_domain_cookie: u64,
+    provider_publication_cookie: u64,
     provider_export_rva: u64,
     args: &[u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
     result: u64,
@@ -15667,7 +15729,7 @@ unsafe fn trace_hosted_provider_export(
     print_str(b" provider=");
     print_str(provider.as_bytes());
     print_str(b" cookie=");
-    print_u64(provider_domain_cookie);
+    print_u64(provider_publication_cookie);
     print_str(b" rva=0x");
     print_hex(provider_export_rva as u32);
     print_str(b" args=");
@@ -15692,7 +15754,7 @@ unsafe fn trace_hosted_provider_export(
 
 unsafe fn trace_hosted_provider_export_rejection(
     provider: &HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
-    provider_domain_cookie: u64,
+    provider_publication_cookie: u64,
     provider_export_rva: u64,
     status: i32,
     stage: &[u8],
@@ -15704,7 +15766,7 @@ unsafe fn trace_hosted_provider_export_rejection(
     print_str(b"[provider-export-reject] provider=");
     print_str(provider.as_bytes());
     print_str(b" cookie=");
-    print_u64(provider_domain_cookie);
+    print_u64(provider_publication_cookie);
     print_str(b" rva=0x");
     print_hex(provider_export_rva as u32);
     print_str(b" stage=");
@@ -15926,12 +15988,29 @@ unsafe fn register_hosted_provider_callback_record(
     callback_offset: u64,
     callback_kind: u8,
 ) -> Option<u64> {
+    let (_, route) = hosted_provider_dispatch_route_for_pair(
+        provider_instance,
+        dependent_instance,
+    )?;
+    let dependent_inst = instance(dependent_instance)?;
+    let image_frames = if dependent_inst.image_frames == 0 {
+        FSD_IMAGE_FRAMES
+    } else {
+        dependent_inst.image_frames
+    };
+    let image_end = FSD_CODE_VA.checked_add(image_frames.checked_mul(0x1000)?)?;
+    if target < FSD_CODE_VA || target >= image_end {
+        return None;
+    }
     let records = hosted_provider_callback_records_mut();
     let cookie = (records.len() as u64).checked_add(1)?;
     records.push(HostedProviderCallbackRecord {
         present: true,
         provider_instance,
         dependent_instance,
+        provider_domain: route.provider_domain,
+        dependent_domain: route.dependent_domain,
+        provider_publication_cookie: route.provider_publication_cookie,
         target,
         callback_offset,
         callback_kind,
@@ -15950,7 +16029,36 @@ unsafe fn hosted_provider_callback_record(cookie: u64) -> Option<HostedProviderC
     let record = hosted_provider_callback_records()?
         .get(index as usize)
         .copied()?;
-    record.present.then_some(record)
+    if !record.present
+        || instance(record.provider_instance).and_then(instance_domain_identity)
+            != Some(record.provider_domain)
+        || instance(record.dependent_instance).and_then(instance_domain_identity)
+            != Some(record.dependent_domain)
+    {
+        return None;
+    }
+    let (_, route) = hosted_provider_dispatch_route_for_pair(
+        record.provider_instance,
+        record.dependent_instance,
+    )?;
+    (route.provider_domain == record.provider_domain
+        && route.dependent_domain == record.dependent_domain
+        && route.provider_publication_cookie == record.provider_publication_cookie)
+        .then_some(record)
+}
+
+unsafe fn clear_hosted_provider_callback_records_for_route(
+    route: HostedProviderDispatchRoute,
+) {
+    for record in hosted_provider_callback_records_mut().iter_mut() {
+        if record.present
+            && record.provider_domain == route.provider_domain
+            && record.dependent_domain == route.dependent_domain
+            && record.provider_publication_cookie == route.provider_publication_cookie
+        {
+            record.present = false;
+        }
+    }
 }
 
 unsafe fn hosted_provider_dispatch_routes_mut() -> &'static mut Vec<HostedProviderDispatchRoute> {
@@ -15965,11 +16073,34 @@ unsafe fn hosted_provider_dispatch_routes() -> Option<&'static Vec<HostedProvide
     (*core::ptr::addr_of!(HOSTED_PROVIDER_DISPATCH_ROUTES)).as_ref()
 }
 
+fn hosted_provider_dispatch_route_is_live(route: HostedProviderDispatchRoute) -> bool {
+    if !route.used || route.retiring {
+        return false;
+    }
+    let dependent_live = instance(route.dependent_instance).and_then(instance_domain_identity);
+    let provider_live = instance(route.provider_instance).and_then(instance_domain_identity);
+    if dependent_live != Some(route.dependent_domain)
+        || provider_live != Some(route.provider_domain)
+        || io_manager_mut().hosted_provider_identity(route.dependent_domain)
+            != Some(route.provider_domain)
+    {
+        return false;
+    }
+    unsafe {
+        matches!(
+            find_hosted_provider_singleton_by_cookie(route.provider_publication_cookie),
+            Some((_, singleton))
+                if singleton.instance == route.provider_instance
+                    && singleton.owner_domain == route.provider_domain
+        )
+    }
+}
+
 unsafe fn hosted_provider_dispatch_route(index: usize) -> Option<HostedProviderDispatchRoute> {
     hosted_provider_dispatch_routes()?
         .get(index)
         .copied()
-        .filter(|route| route.used)
+        .filter(|route| hosted_provider_dispatch_route_is_live(*route))
 }
 
 unsafe fn hosted_provider_dispatch_route_for_instance(
@@ -15978,7 +16109,10 @@ unsafe fn hosted_provider_dispatch_route_for_instance(
     hosted_provider_dispatch_routes()?
         .iter()
         .copied()
-        .find(|route| route.used && route.dependent_instance == dependent_instance)
+        .find(|route| {
+            route.dependent_instance == dependent_instance
+                && hosted_provider_dispatch_route_is_live(*route)
+        })
 }
 
 unsafe fn hosted_provider_dispatch_route_for_pair(
@@ -15990,9 +16124,9 @@ unsafe fn hosted_provider_dispatch_route_for_pair(
         .copied()
         .enumerate()
         .find(|(_, route)| {
-            route.used
-                && route.provider_instance == provider_instance
+            route.provider_instance == provider_instance
                 && route.dependent_instance == dependent_instance
+                && hosted_provider_dispatch_route_is_live(*route)
         })
 }
 
@@ -16008,47 +16142,88 @@ unsafe fn hosted_provider_dispatch_route_for_wrapper(
         .copied()
         .enumerate()
         .find(|(_, route)| {
-            route.used
-                && route.provider_instance == provider_instance
+            route.provider_instance == provider_instance
                 && route.provider_wrapper_handle == provider_wrapper_handle
+                && hosted_provider_dispatch_route_is_live(*route)
         })
 }
 
 fn clear_hosted_provider_domain_link(
-    dependent: DriverInstance,
-    provider: DriverInstance,
-) {
-    let _ = io_manager_mut().clear_hosted_domain_provider(
-        nt_io_manager::HostedDomainId(dependent.hosted_domain_id),
-        nt_io_manager::HostedDomainId(provider.hosted_domain_id),
-        provider.hosted_domain_cookie,
-    );
+    dependent: HostedDomainIdentity,
+    provider: HostedDomainIdentity,
+) -> Result<(), nt_status::NtStatus> {
+    match io_manager_mut().hosted_provider_identity(dependent) {
+        Some(link) if link == provider => io_manager_mut()
+            .clear_hosted_domain_provider(dependent, provider),
+        None => Ok(()),
+        Some(_) => Err(nt_status::NtStatus::INVALID_PARAMETER),
+    }
 }
 
-unsafe fn clear_hosted_provider_dispatch_routes_for_instance(instance_index: usize) {
+unsafe fn teardown_hosted_provider_dispatch_route(
+    route: HostedProviderDispatchRoute,
+) -> Result<(), nt_status::NtStatus> {
+    let provider_inst = instance(route.provider_instance)
+        .filter(|inst| instance_domain_identity(*inst) == Some(route.provider_domain))
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let driver_binding = io_manager_mut()
+        .hosted_driver_by_identity(route.provider_domain, route.provider_driver_object);
+    match driver_binding {
+        Some(driver) if driver == DriverId(route.dependent_driver_id) => {
+        }
+        None => {}
+        Some(_) => return Err(nt_status::NtStatus::INVALID_PARAMETER),
+    }
+    match io_manager_mut().hosted_provider_identity(route.dependent_domain) {
+        Some(provider) if provider == route.provider_domain => {}
+        None => {}
+        Some(_) => return Err(nt_status::NtStatus::INVALID_PARAMETER),
+    }
+    if let Some(driver) = driver_binding {
+        if !io_manager_mut().unbind_hosted_driver_identity(
+            route.provider_domain,
+            route.provider_driver_object,
+            driver,
+        ) {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+    }
+    clear_hosted_provider_domain_link(route.dependent_domain, route.provider_domain)?;
+    clear_hosted_provider_callback_records_for_route(route);
+    clear_driver_object_extensions_for_driver_object(route.provider_driver_object);
+    if !release_hosted_instance_pool_allocation_if_live(
+        provider_inst,
+        route.provider_driver_extension,
+    ) || !release_hosted_instance_pool_allocation_if_live(
+        provider_inst,
+        route.provider_driver_object,
+    ) {
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    }
+    Ok(())
+}
+
+unsafe fn clear_hosted_provider_dispatch_routes_for_instance(instance_index: usize) -> u64 {
     let Some(routes) = (*core::ptr::addr_of_mut!(HOSTED_PROVIDER_DISPATCH_ROUTES)).as_mut() else {
-        return;
+        return 0;
     };
-    for route in routes.iter_mut() {
+    let mut failures = 0u64;
+    for index in 0..routes.len() {
+        let route = routes[index];
         if route.used
             && (route.dependent_instance == instance_index
                 || route.provider_instance == instance_index)
         {
-            if let (Some(dependent), Some(provider)) = (
-                instance(route.dependent_instance),
-                instance(route.provider_instance),
-            ) {
-                let _ = io_manager_mut().unbind_hosted_driver_address(
-                    nt_io_manager::HostedDomainId(provider.hosted_domain_id),
-                    route.provider_driver_object,
-                    DriverId(dependent.driver_id),
-                );
-                clear_hosted_provider_domain_link(dependent, provider);
+            routes[index].retiring = true;
+            let route = routes[index];
+            if teardown_hosted_provider_dispatch_route(route).is_ok() {
+                routes[index] = HostedProviderDispatchRoute::empty();
+            } else {
+                failures += 1;
             }
-            clear_driver_object_extensions_for_driver_object(route.provider_driver_object);
-            *route = HostedProviderDispatchRoute::empty();
         }
     }
+    failures
 }
 
 unsafe fn initialize_provider_driver_object_shadow_for_instance(
@@ -16103,12 +16278,12 @@ unsafe fn initialize_provider_driver_object_shadow_for_instance(
 
 unsafe fn register_hosted_provider_driver_object_shadow(
     provider_instance: usize,
-    provider_domain_cookie: u64,
+    provider_publication_cookie: u64,
     dependent_instance: usize,
     dependent_inst: DriverInstance,
     dependent_driver_object: u64,
 ) -> Result<usize, i32> {
-    if dependent_driver_object == 0 || provider_domain_cookie == 0 {
+    if dependent_driver_object == 0 || provider_publication_cookie == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
     if component_to_exec_va_for_instance(
@@ -16124,50 +16299,65 @@ unsafe fn register_hosted_provider_driver_object_shadow(
     let Some(provider_inst) = instance(provider_instance) else {
         return Err(STATUS_DEVICE_NOT_READY);
     };
-    if dependent_inst.hosted_domain_id == 0
-        || dependent_inst.hosted_domain_cookie == 0
-        || provider_inst.hosted_domain_id == 0
-        || provider_inst.hosted_domain_cookie == 0
-    {
+    let Some(dependent_domain) = instance_domain_identity(dependent_inst) else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let Some(provider_domain) = instance_domain_identity(provider_inst) else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let Some((_, singleton)) =
+        find_hosted_provider_singleton_by_cookie(provider_publication_cookie)
+    else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    if singleton.instance != provider_instance || singleton.owner_domain != provider_domain {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    io_manager_mut()
-        .set_hosted_domain_provider(
-            nt_io_manager::HostedDomainId(dependent_inst.hosted_domain_id),
-            nt_io_manager::HostedDomainId(provider_inst.hosted_domain_id),
-            provider_inst.hosted_domain_cookie,
-        )
-        .map_err(nt_status::NtStatus::raw)?;
     if let Some(routes) = hosted_provider_dispatch_routes() {
-        if let Some((index, route)) = routes.iter().copied().enumerate().find(|(_, route)| {
-            route.used
+        if let Some((index, route)) = routes
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, route)| route.used && route.dependent_domain == dependent_domain)
+        {
+            if hosted_provider_dispatch_route_is_live(route)
                 && route.provider_instance == provider_instance
                 && route.dependent_instance == dependent_instance
+                && route.provider_domain == provider_domain
+                && route.provider_publication_cookie == provider_publication_cookie
                 && route.dependent_driver_object == dependent_driver_object
-        }) {
-            if route.provider_driver_object != 0 {
+                && route.dependent_driver_id == dependent_inst.driver_id
+                && route.provider_driver_object != 0
+            {
                 return io_manager_mut()
-                    .bind_hosted_driver_address(
-                        nt_io_manager::HostedDomainId(provider_inst.hosted_domain_id),
+                    .bind_hosted_driver_identity(
+                        provider_domain,
                         route.provider_driver_object,
                         DriverId(dependent_inst.driver_id),
                     )
                     .map(|()| index)
                     .map_err(nt_status::NtStatus::raw);
             }
+            return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION.raw());
         }
+    }
+    let provider_link_created = io_manager_mut()
+        .set_hosted_domain_provider(dependent_domain, provider_domain)
+        .map_err(nt_status::NtStatus::raw)?;
+    if !provider_link_created {
+        return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION.raw());
     }
     let Some(provider_driver_object) =
         hosted_instance_pool_alloc(provider_inst, WDM_X64_DRIVER_OBJECT_SIZE as u64)
     else {
-        clear_hosted_provider_domain_link(dependent_inst, provider_inst);
+        let _ = clear_hosted_provider_domain_link(dependent_domain, provider_domain);
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
     let Some(provider_driver_extension) =
         hosted_instance_pool_alloc(provider_inst, WDM_X64_DRIVER_EXTENSION_SIZE as u64)
     else {
         hosted_instance_pool_free(provider_inst, provider_driver_object);
-        clear_hosted_provider_domain_link(dependent_inst, provider_inst);
+        let _ = clear_hosted_provider_domain_link(dependent_domain, provider_domain);
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
     if let Err(status) = initialize_provider_driver_object_shadow_for_instance(
@@ -16178,26 +16368,30 @@ unsafe fn register_hosted_provider_driver_object_shadow(
     ) {
         hosted_instance_pool_free(provider_inst, provider_driver_extension);
         hosted_instance_pool_free(provider_inst, provider_driver_object);
-        clear_hosted_provider_domain_link(dependent_inst, provider_inst);
+        let _ = clear_hosted_provider_domain_link(dependent_domain, provider_domain);
         return Err(status);
     }
-    if let Err(status) = io_manager_mut().bind_hosted_driver_address(
-        nt_io_manager::HostedDomainId(provider_inst.hosted_domain_id),
+    if let Err(status) = io_manager_mut().bind_hosted_driver_identity(
+        provider_domain,
         provider_driver_object,
         DriverId(dependent_inst.driver_id),
     ) {
         clear_driver_object_extensions_for_driver_object(provider_driver_object);
         hosted_instance_pool_free(provider_inst, provider_driver_extension);
         hosted_instance_pool_free(provider_inst, provider_driver_object);
-        clear_hosted_provider_domain_link(dependent_inst, provider_inst);
+        let _ = clear_hosted_provider_domain_link(dependent_domain, provider_domain);
         return Err(status.raw());
     }
     let routes = hosted_provider_dispatch_routes_mut();
     let route = HostedProviderDispatchRoute {
         used: true,
+        retiring: false,
         dependent_instance,
         provider_instance,
-        provider_domain_cookie,
+        dependent_domain,
+        provider_domain,
+        provider_publication_cookie,
+        dependent_driver_id: dependent_inst.driver_id,
         dependent_driver_object,
         provider_driver_object,
         provider_driver_extension,
@@ -19425,13 +19619,13 @@ unsafe fn provider_marshal_emit_import_thunk_for_instance(
     dependent_instance: usize,
     provider: &str,
     export_name: &str,
-    expected_provider_domain_cookie: u64,
+    expected_provider_publication_cookie: u64,
 ) -> Result<u64, i32> {
     let Some(export_plan) = lookup_hosted_provider_singleton_export_plan(provider, export_name)
     else {
         return Err(STATUS_OBJECT_NAME_NOT_FOUND);
     };
-    if export_plan.provider_domain_cookie != expected_provider_domain_cookie {
+    if export_plan.provider_publication_cookie != expected_provider_publication_cookie {
         return Err(STATUS_INVALID_PARAMETER);
     }
     let Some(dependent_inst) = instance(dependent_instance) else {
@@ -19458,17 +19652,22 @@ unsafe fn provider_marshal_emit_import_thunk_for_instance(
 }
 
 unsafe fn register_hosted_provider_internal_marshal_policy(
-    provider_domain_cookie: u64,
+    provider_domain: HostedDomainIdentity,
+    provider_publication_cookie: u64,
     provider_rva: u64,
     policy: HostedProviderExportMarshalPolicy,
 ) -> bool {
-    if provider_domain_cookie == 0 {
+    if provider_domain.domain_id == nt_io_manager::HostedDomainId::NULL
+        || provider_domain.cookie == 0
+        || provider_publication_cookie == 0
+    {
         return false;
     }
     let records = hosted_provider_internal_marshal_policies_mut();
     for record in records.iter_mut() {
         if record.present
-            && record.provider_domain_cookie == provider_domain_cookie
+            && record.provider_domain == provider_domain
+            && record.provider_publication_cookie == provider_publication_cookie
             && record.provider_rva == provider_rva
         {
             return record.policy == policy;
@@ -19476,7 +19675,8 @@ unsafe fn register_hosted_provider_internal_marshal_policy(
     }
     records.push(HostedProviderInternalMarshalPolicyRecord {
         present: true,
-        provider_domain_cookie,
+        provider_domain,
+        provider_publication_cookie,
         provider_rva,
         policy,
     });
@@ -19484,10 +19684,13 @@ unsafe fn register_hosted_provider_internal_marshal_policy(
 }
 
 unsafe fn hosted_provider_internal_rva_marshal_policy(
-    provider_domain_cookie: u64,
+    singleton: HostedProviderSingleton,
     provider_rva: u64,
 ) -> Option<HostedProviderExportMarshalPolicy> {
-    if provider_domain_cookie == 0 {
+    if singleton.provider_publication_cookie == 0
+        || instance(singleton.instance).and_then(instance_domain_identity)
+            != Some(singleton.owner_domain)
+    {
         return None;
     }
     let Some(records) = hosted_provider_internal_marshal_policies() else {
@@ -19495,7 +19698,8 @@ unsafe fn hosted_provider_internal_rva_marshal_policy(
     };
     for record in records.iter().copied() {
         if record.present
-            && record.provider_domain_cookie == provider_domain_cookie
+            && record.provider_domain == singleton.owner_domain
+            && record.provider_publication_cookie == singleton.provider_publication_cookie
             && record.provider_rva == provider_rva
         {
             return Some(record.policy);
@@ -19504,12 +19708,26 @@ unsafe fn hosted_provider_internal_rva_marshal_policy(
     None
 }
 
+unsafe fn clear_hosted_provider_internal_marshal_policies(
+    provider_domain: HostedDomainIdentity,
+    provider_publication_cookie: u64,
+) {
+    for record in hosted_provider_internal_marshal_policies_mut().iter_mut() {
+        if record.present
+            && record.provider_domain == provider_domain
+            && record.provider_publication_cookie == provider_publication_cookie
+        {
+            record.present = false;
+        }
+    }
+}
+
 unsafe fn provider_marshal_emit_internal_import_thunk_for_instance(
     dependent_instance: usize,
     provider: &str,
     internal_name: &str,
     provider_target_component_va: u64,
-    expected_provider_domain_cookie: u64,
+    expected_provider_publication_cookie: u64,
 ) -> Result<u64, i32> {
     let Some(policy) = hosted_provider_internal_marshal_policy(provider, internal_name) else {
         return Err(STATUS_NOT_SUPPORTED);
@@ -19521,7 +19739,7 @@ unsafe fn provider_marshal_emit_internal_import_thunk_for_instance(
     let Some((_singleton_index, singleton)) = find_hosted_provider_singleton(&provider_name) else {
         return Err(STATUS_OBJECT_NAME_NOT_FOUND);
     };
-    if singleton.provider_domain_cookie != expected_provider_domain_cookie {
+    if singleton.provider_publication_cookie != expected_provider_publication_cookie {
         return Err(STATUS_INVALID_PARAMETER);
     }
     let Some(provider_rva) = provider_target_component_va.checked_sub(singleton.run_va) else {
@@ -19531,7 +19749,8 @@ unsafe fn provider_marshal_emit_internal_import_thunk_for_instance(
         return Err(STATUS_INVALID_PARAMETER);
     }
     if !register_hosted_provider_internal_marshal_policy(
-        singleton.provider_domain_cookie,
+        singleton.owner_domain,
+        singleton.provider_publication_cookie,
         provider_rva,
         policy,
     ) {
@@ -19873,7 +20092,7 @@ unsafe fn refresh_hosted_provider_ndis_miniport_block_mirrors_for_pair(
 unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
     provider_instance: usize,
     provider_inst: DriverInstance,
-    provider_domain_cookie: u64,
+    provider_publication_cookie: u64,
     dependent_instance: usize,
     dependent_inst: DriverInstance,
     provider_component_va: u64,
@@ -19928,7 +20147,7 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
                 dependent_instance,
                 "ndis.sys",
                 $export,
-                provider_domain_cookie,
+                provider_publication_cookie,
             ) {
                 Ok(thunk) => thunk,
                 Err(status) => {
@@ -19944,7 +20163,7 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
         "ndis.sys",
         "MiniIndicateReceivePacket",
         packet_indicate_target,
-        provider_domain_cookie,
+        provider_publication_cookie,
     ) {
         Ok(thunk) => thunk,
         Err(status) => {
@@ -19988,7 +20207,7 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
 unsafe fn ensure_hosted_provider_ndis_miniport_block_mirror(
     provider_instance: usize,
     provider_inst: DriverInstance,
-    provider_domain_cookie: u64,
+    provider_publication_cookie: u64,
     dependent_instance: usize,
     dependent_inst: DriverInstance,
     provider_component_va: u64,
@@ -20004,7 +20223,7 @@ unsafe fn ensure_hosted_provider_ndis_miniport_block_mirror(
     allocate_hosted_provider_ndis_miniport_block_mirror(
         provider_instance,
         provider_inst,
-        provider_domain_cookie,
+        provider_publication_cookie,
         dependent_instance,
         dependent_inst,
         provider_component_va,
@@ -21082,14 +21301,14 @@ unsafe fn provider_marshal_ndis_buffer(
 unsafe fn provider_marshal_driver_object_shadow(
     state: &mut ProviderMarshalState,
     provider_instance: usize,
-    provider_domain_cookie: u64,
+    provider_publication_cookie: u64,
     dependent_index: usize,
     dependent_inst: DriverInstance,
     arg_value: u64,
 ) -> Result<u64, i32> {
     let route_index = register_hosted_provider_driver_object_shadow(
         provider_instance,
-        provider_domain_cookie,
+        provider_publication_cookie,
         dependent_index,
         dependent_inst,
         arg_value,
@@ -21434,7 +21653,7 @@ unsafe fn provider_marshal_protocol_characteristics(
 unsafe fn prepare_provider_export_marshal(
     policy: HostedProviderExportMarshalPolicy,
     provider_instance: usize,
-    provider_domain_cookie: u64,
+    provider_publication_cookie: u64,
     dependent_index: usize,
     dependent_inst: DriverInstance,
     provider_shared: u64,
@@ -21461,7 +21680,7 @@ unsafe fn prepare_provider_export_marshal(
                     provider_marshal_driver_object_shadow(
                         &mut state,
                         provider_instance,
-                        provider_domain_cookie,
+                        provider_publication_cookie,
                         dependent_index,
                         dependent_inst,
                         arg,
@@ -22726,7 +22945,7 @@ unsafe fn hosted_component_pump(
 pub(crate) unsafe fn service_hosted_provider_export(
     dependent_channel: &crate::spawn_hosts::PumpChannel,
     provider_export_rva: u64,
-    provider_domain_cookie: u64,
+    provider_publication_cookie: u64,
     arg0: u64,
     arg1: u64,
 ) -> u64 {
@@ -22736,7 +22955,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
     let caller_rsp =
         read_volatile((dependent_channel.shared_va + SH_PROVIDER_EXPORT_CALLER_RSP) as *const u64);
     let Some((_singleton_index, singleton)) =
-        find_hosted_provider_singleton_by_cookie(provider_domain_cookie)
+        find_hosted_provider_singleton_by_cookie(provider_publication_cookie)
     else {
         return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
     };
@@ -22748,7 +22967,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
         provider_export_rva,
     )
     .or_else(|| {
-        hosted_provider_internal_rva_marshal_policy(provider_domain_cookie, provider_export_rva)
+        hosted_provider_internal_rva_marshal_policy(singleton, provider_export_rva)
     }) else {
         return hosted_provider_export_failure(STATUS_NOT_SUPPORTED);
     };
@@ -22827,7 +23046,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
     trace_hosted_provider_export(
         b"enter",
         &singleton.provider,
-        provider_domain_cookie,
+        provider_publication_cookie,
         provider_export_rva,
         &args,
         0,
@@ -22840,7 +23059,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
     let marshal_state = match prepare_provider_export_marshal(
         policy,
         singleton.instance,
-        singleton.provider_domain_cookie,
+        singleton.provider_publication_cookie,
         dependent_index,
         dependent_inst,
         provider_shared,
@@ -22850,7 +23069,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
         Err(status) => {
             trace_hosted_provider_export_rejection(
                 &singleton.provider,
-                provider_domain_cookie,
+                provider_publication_cookie,
                 provider_export_rva,
                 status,
                 b"marshal",
@@ -22868,7 +23087,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
         ) {
             trace_hosted_provider_export_rejection(
                 &singleton.provider,
-                provider_domain_cookie,
+                provider_publication_cookie,
                 provider_export_rva,
                 status,
                 b"resource",
@@ -22879,7 +23098,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
     } else if marshal_state.resource_projection_required {
         trace_hosted_provider_export_rejection(
             &singleton.provider,
-            provider_domain_cookie,
+            provider_publication_cookie,
             provider_export_rva,
             STATUS_INVALID_DEVICE_REQUEST,
             b"resource-required",
@@ -22954,7 +23173,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
             print_str(b"[provider-export] incomplete provider=");
             print_str(singleton.provider.as_bytes());
             print_str(b" cookie=");
-            print_u64(provider_domain_cookie);
+            print_u64(provider_publication_cookie);
             print_str(b" rva=0x");
             print_hex(provider_export_rva as u32);
             print_str(b" status=0x");
@@ -22976,7 +23195,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
         register_instance_ready(singleton.instance, false);
         trace_hosted_provider_export_rejection(
             &singleton.provider,
-            provider_domain_cookie,
+            provider_publication_cookie,
             provider_export_rva,
             STATUS_UNSUCCESSFUL,
             b"pump",
@@ -22994,7 +23213,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
         result,
     ) {
         print_str(b"[driver-import] provider side effect failed cookie=");
-        print_u64(provider_domain_cookie);
+        print_u64(provider_publication_cookie);
         print_str(b" status=0x");
         print_hex(status as u32);
         print_str(b"\n");
@@ -23085,7 +23304,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
     trace_hosted_provider_export(
         b"done",
         &singleton.provider,
-        provider_domain_cookie,
+        provider_publication_cookie,
         provider_export_rva,
         &args,
         result,
@@ -23099,7 +23318,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
     );
     if DEBUG_TRACE && HOSTED_PROVIDER_EXPORT_COMPLETIONS.load(Ordering::Relaxed) <= 8 {
         print_str(b"[driver-import] provider-domain export dispatched cookie=");
-        print_u64(provider_domain_cookie);
+        print_u64(provider_publication_cookie);
         print_str(b" rva=0x");
         print_hex(provider_export_rva as u32);
         print_str(b" result=0x");
@@ -23513,7 +23732,7 @@ unsafe fn service_ndis_initialize_callback(
     let miniport_block_mirror = ensure_hosted_provider_ndis_miniport_block_mirror(
         provider_instance,
         provider_inst,
-        route.provider_domain_cookie,
+        route.provider_publication_cookie,
         record.dependent_instance,
         dependent_inst,
         provider_stack[0],
@@ -24802,7 +25021,11 @@ pub(crate) unsafe fn service_hosted_provider_callback(
     let Some(dependent_inst) = instance(record.dependent_instance) else {
         return hosted_provider_callback_failure(STATUS_DEVICE_NOT_READY);
     };
+    let provider_channel_domain = hosted_domain_identity_for_pml4(provider_channel.pml4);
     if record.provider_instance != provider_instance
+        || provider_channel_domain != Some(record.provider_domain)
+        || instance_domain_identity(provider_inst) != Some(record.provider_domain)
+        || instance_domain_identity(dependent_inst) != Some(record.dependent_domain)
         || record.target == 0
         || record.callback_offset == 0
         || (record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT
@@ -27262,7 +27485,7 @@ fn hosted_provider_callback_gate_va() -> u64 {
 #[no_mangle]
 extern "win64" fn s_hosted_provider_export_gate_body(
     provider_export_rva: u64,
-    provider_domain_cookie: u64,
+    provider_publication_cookie: u64,
     arg0: u64,
     arg1: u64,
     arg2: u64,
@@ -27294,7 +27517,7 @@ extern "win64" fn s_hosted_provider_export_gate_body(
         let (_label, mut result, _, _, _) = call_on4(
             (FSD_SERVICE_PROVIDER_EXPORT_LABEL << 12) | 4,
             provider_export_rva,
-            provider_domain_cookie,
+            provider_publication_cookie,
             arg0,
             arg1,
         );
@@ -29459,7 +29682,7 @@ pub(crate) unsafe fn load_driver(
 
     let loaded = load_driver_reserved(fs, path, driver_object_path, instance);
     if loaded.is_none() {
-        clear_instance(instance);
+        let _ = clear_instance(instance);
     }
     loaded
 }
@@ -29914,8 +30137,8 @@ unsafe fn load_driver_reserved(
         }
     }
 
-    if let Err(status) = io_manager_mut().bind_hosted_driver_address(
-        nt_io_manager::HostedDomainId(domain.hosted_domain_id),
+    if let Err(status) = io_manager_mut().bind_hosted_driver_identity(
+        instance_domain_identity(domain)?,
         drvobj,
         DriverId(driver_id),
     ) {
@@ -34937,8 +35160,9 @@ fn clear_hosted_device_binding_by_device_id(device_id: u64) {
     }
 }
 
-fn clear_hosted_device_bindings_for_instance(instance: usize) {
+fn clear_hosted_device_bindings_for_instance(instance: usize) -> u64 {
     let mut index = 0usize;
+    let mut failures = 0u64;
     loop {
         let binding = unsafe {
             (*core::ptr::addr_of!(HOSTED_DEVICE_BINDINGS))
@@ -34951,16 +35175,20 @@ fn clear_hosted_device_bindings_for_instance(instance: usize) {
         };
         if binding.used
             && (binding.instance == instance || binding.projection_instance == instance)
-            && teardown_hosted_device_binding(binding)
         {
-            unsafe {
-                (*core::ptr::addr_of_mut!(HOSTED_DEVICE_BINDINGS))
-                    .as_mut()
-                    .unwrap()[index] = EMPTY_HOSTED_DEVICE_BINDING;
+            if teardown_hosted_device_binding(binding) {
+                unsafe {
+                    (*core::ptr::addr_of_mut!(HOSTED_DEVICE_BINDINGS))
+                        .as_mut()
+                        .unwrap()[index] = EMPTY_HOSTED_DEVICE_BINDING;
+                }
+            } else {
+                failures += 1;
             }
         }
         index += 1;
     }
+    failures
 }
 
 pub(crate) fn device_object_id(device_id: u64) -> u64 {
@@ -35521,8 +35749,7 @@ fn reserve_instance_slot() -> Option<usize> {
     };
     if let Some(index) = reusable {
         clear_instance_exec_mappings(index);
-        let domain_id = io_manager_mut().register_hosted_domain();
-        let domain = io_manager_mut().hosted_domain_identity(domain_id)?;
+        let domain = io_manager_mut().register_hosted_domain();
         let table = unsafe { driver_instances_mut() };
         table[index] = DriverInstance {
             used: true,
@@ -35539,8 +35766,7 @@ fn reserve_instance_slot() -> Option<usize> {
     let table = unsafe { driver_instances_mut() };
     let index = table.len();
     ExecVaWindow::try_for_instance(index)?;
-    let domain_id = io_manager_mut().register_hosted_domain();
-    let domain = io_manager_mut().hosted_domain_identity(domain_id)?;
+    let domain = io_manager_mut().register_hosted_domain();
     table.push(DriverInstance {
         used: true,
         hosted_domain_id: domain.domain_id.raw(),
@@ -35821,7 +36047,8 @@ pub(crate) struct HostedVideoRouteInfo {
     pub(crate) device_path: Vec<u8>,
 }
 
-fn clear_instance(i: usize) {
+fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
+    let mut teardown_blocked = false;
     let retiring_domain = instance(i).and_then(|inst| {
         (inst.hosted_domain_id != 0 && inst.hosted_domain_cookie != 0).then_some(
             HostedDomainIdentity {
@@ -35841,6 +36068,7 @@ fn clear_instance(i: usize) {
     if let Some(domain) = retiring_domain {
         let failures = unsafe { clear_hosted_resource_map_caps_for_instance(i, domain) };
         if failures != 0 {
+            teardown_blocked = true;
             print_str(b"[driver-launch] hosted resource map release failed inst=");
             print_u64(i as u64);
             print_str(b" failures=");
@@ -35848,10 +36076,19 @@ fn clear_instance(i: usize) {
             print_str(b"\n");
         }
     }
-    clear_hosted_device_bindings_for_instance(i);
+    let device_binding_failures = clear_hosted_device_bindings_for_instance(i);
+    if device_binding_failures != 0 {
+        teardown_blocked = true;
+        print_str(b"[driver-launch] hosted device binding release failed inst=");
+        print_u64(i as u64);
+        print_str(b" failures=");
+        print_u64(device_binding_failures);
+        print_str(b"\n");
+    }
     unsafe {
         let pointer_failures = clear_hosted_provider_pointer_allocations_for_instance(i);
         if pointer_failures != 0 {
+            teardown_blocked = true;
             print_str(b"[driver-launch] provider pointer allocation release failed inst=");
             print_u64(i as u64);
             print_str(b" failures=");
@@ -35863,8 +36100,18 @@ fn clear_instance(i: usize) {
         clear_hosted_provider_miniport_timer_shadows_for_instance(i);
         clear_hosted_provider_ndis_work_item_shadows_for_instance(i);
         clear_hosted_provider_ndis_miniport_block_mirrors_for_instance(i);
-        clear_hosted_provider_dispatch_routes_for_instance(i);
-        clear_hosted_provider_singletons_for_instance(i);
+        let route_failures = clear_hosted_provider_dispatch_routes_for_instance(i);
+        let singleton_failures = clear_hosted_provider_singletons_for_instance(i);
+        if route_failures != 0 || singleton_failures != 0 {
+            teardown_blocked = true;
+            print_str(b"[driver-launch] provider route retirement blocked inst=");
+            print_u64(i as u64);
+            print_str(b" routes=");
+            print_u64(route_failures);
+            print_str(b" singletons=");
+            print_u64(singleton_failures);
+            print_str(b"\n");
+        }
     }
     let inst = instance(i);
     if let Some(inst) = inst {
@@ -35874,23 +36121,51 @@ fn clear_instance(i: usize) {
     }
     if let Some(inst) = inst {
         if inst.driver_id != 0 {
+            let Some(domain) = instance_domain_identity(inst) else {
+                return Err(nt_status::NtStatus::INVALID_PARAMETER);
+            };
             if inst.driver_object != 0 {
-                let _ = io_manager_mut().unbind_hosted_driver_address(
-                    nt_io_manager::HostedDomainId(inst.hosted_domain_id),
-                    inst.driver_object,
-                    DriverId(inst.driver_id),
-                );
+                match io_manager_mut().hosted_driver_by_identity(domain, inst.driver_object) {
+                    Some(driver) if driver == DriverId(inst.driver_id) => {
+                        if !io_manager_mut().unbind_hosted_driver_identity(
+                            domain,
+                            inst.driver_object,
+                            driver,
+                        ) {
+                            teardown_blocked = true;
+                        }
+                    }
+                    None => {}
+                    Some(_) => teardown_blocked = true,
+                }
             }
-            if let Err(status) = io_manager_mut().destroy_driver(DriverId(inst.driver_id)) {
-                print_str(b"[driver-launch] canonical driver teardown failed id=");
-                print_u64(inst.driver_id);
-                print_str(b" status=0x");
-                print_hex(status.raw() as u32);
-                print_str(b"\n");
+            if !teardown_blocked
+                && io_manager_mut().driver(DriverId(inst.driver_id)).is_some()
+            {
+                if let Err(status) = io_manager_mut().destroy_driver(DriverId(inst.driver_id)) {
+                    print_str(b"[driver-launch] canonical driver teardown failed id=");
+                    print_u64(inst.driver_id);
+                    print_str(b" status=0x");
+                    print_hex(status.raw() as u32);
+                    print_str(b"\n");
+                    teardown_blocked = true;
+                }
             }
         }
     }
-    let domain_id = inst.map(|inst| inst.hosted_domain_id).unwrap_or(0);
+    if teardown_blocked {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    if let Some(domain) = retiring_domain {
+        if let Err(status) = io_manager_mut().unregister_hosted_domain(domain) {
+            print_str(b"[driver-launch] hosted domain teardown rejected id=0x");
+            print_hex64(domain.domain_id.raw());
+            print_str(b" status=0x");
+            print_hex(status.raw() as u32);
+            print_str(b"\n");
+            return Err(status);
+        }
+    }
     let t = unsafe { driver_instances_mut() };
     if i < t.len() {
         let sh = t[i].exec_shared_va;
@@ -35910,15 +36185,7 @@ fn clear_instance(i: usize) {
     } else {
         clear_instance_exec_mappings(i);
     }
-    if domain_id != 0 {
-        let removed =
-            io_manager_mut().unregister_hosted_domain(nt_io_manager::HostedDomainId(domain_id));
-        if !removed {
-            print_str(b"[driver-launch] hosted domain teardown rejected id=0x");
-            print_hex64(domain_id);
-            print_str(b"\n");
-        }
-    }
+    Ok(())
 }
 
 /// Mark instance `i` ready for IRP dispatch (used when readiness ≠ npfs's "has a devobj" rule, e.g.
@@ -37317,22 +37584,6 @@ fn instance_by_device_object(device_object: u64) -> Option<(usize, DriverInstanc
     t.iter().copied().enumerate().find(|(_, entry)| {
         entry.used && entry.device_object != 0 && entry.device_object == device_object
     })
-}
-
-fn destroy_registered_driver_after_unload(
-    inst: DriverInstance,
-    driver_id: u64,
-) -> Result<(), nt_status::NtStatus> {
-    if !io_manager_mut().unbind_hosted_driver_address(
-        nt_io_manager::HostedDomainId(inst.hosted_domain_id),
-        inst.driver_object,
-        DriverId(driver_id),
-    ) {
-        return Err(nt_status::NtStatus::INVALID_PARAMETER);
-    }
-    io_manager_mut()
-        .destroy_driver(DriverId(driver_id))
-        .map(|_| ())
 }
 
 unsafe fn dispatch_driver_unload_for_instance(
@@ -39481,6 +39732,9 @@ pub(crate) unsafe fn unload_driver_by_name(
     if inst.driver_unload == 0 {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
+    let domain =
+        instance_domain_identity(inst).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    io_manager_mut().can_unload_hosted_provider(domain)?;
 
     {
         let io = io_manager_mut();
@@ -39497,10 +39751,7 @@ pub(crate) unsafe fn unload_driver_by_name(
     if inst.tcb != 0 {
         let _ = crate::tcb_suspend_r(inst.tcb);
     }
-    destroy_registered_driver_after_unload(inst, driver_id)?;
-    driver_instances_mut()[index].driver_id = 0;
-    clear_instance(index);
-    Ok(())
+    clear_instance(index)
 }
 
 pub(crate) fn device_id_by_name(path: &str) -> Option<u64> {
@@ -39785,10 +40036,12 @@ unsafe fn dispatch_irp_for_instance(
                 return Some((STATUS_INVALID_DEVICE_REQUEST, 0, 0));
             }
             let provider_inst = instance(route.provider_instance)?;
-            let provider_domain = HostedDomainIdentity {
-                domain_id: nt_io_manager::HostedDomainId(provider_inst.hosted_domain_id),
-                cookie: provider_inst.hosted_domain_cookie,
-            };
+            let provider_domain = instance_domain_identity(provider_inst)?;
+            if provider_domain != route.provider_domain
+                || instance_domain_identity(dependent_inst) != Some(route.dependent_domain)
+            {
+                return Some((STATUS_INVALID_PARAMETER, 0, 0));
+            }
             let binding = if let Some(request) = dispatch_request.as_ref() {
                 let binding = hosted_device_binding_by_device_id(request.device_id)?;
                 if binding.driver_id != request.driver_id
@@ -39858,8 +40111,8 @@ unsafe fn dispatch_irp_for_instance(
             return Some((STATUS_INVALID_PARAMETER, 0, 0));
         }
         if let Some(route) = provider_route {
-            request.provider_domain_id = d.hosted_domain_id;
-            request.provider_cookie = route.provider_domain_cookie;
+            request.provider_domain_id = route.provider_domain.domain_id.raw();
+            request.provider_cookie = route.provider_domain.cookie;
         }
         if !request.has_well_formed_domain_route() {
             return Some((STATUS_INVALID_PARAMETER, 0, 0));
@@ -39916,8 +40169,10 @@ unsafe fn dispatch_irp_for_instance(
         let channel = instance_for_pump_channel(&ch, ch.reply_cap);
         let route_matches = match provider_route {
             Some(route) => {
-                request.provider_domain_id == d.hosted_domain_id
-                    && request.provider_cookie == route.provider_domain_cookie
+                request.target_domain_id == route.dependent_domain.domain_id.raw()
+                    && request.target_domain_cookie == route.dependent_domain.cookie
+                    && request.provider_domain_id == route.provider_domain.domain_id.raw()
+                    && request.provider_cookie == route.provider_domain.cookie
                     && route.provider_instance == dispatch_index
             }
             None => {
@@ -39933,12 +40188,22 @@ unsafe fn dispatch_irp_for_instance(
                 channel,
                 Some((channel_index, channel_inst))
                     if channel_index == dispatch_index
-                        && channel_inst.hosted_domain_id
-                            == if request.provider_domain_id != 0 {
-                                request.provider_domain_id
+                        && instance_domain_identity(channel_inst)
+                            == Some(if request.provider_domain_id != 0 {
+                                HostedDomainIdentity {
+                                    domain_id: nt_io_manager::HostedDomainId(
+                                        request.provider_domain_id,
+                                    ),
+                                    cookie: request.provider_cookie,
+                                }
                             } else {
-                                request.target_domain_id
-                            }
+                                HostedDomainIdentity {
+                                    domain_id: nt_io_manager::HostedDomainId(
+                                        request.target_domain_id,
+                                    ),
+                                    cookie: request.target_domain_cookie,
+                                }
+                            })
             )
         {
             return Some((STATUS_INVALID_PARAMETER, 0, 0));

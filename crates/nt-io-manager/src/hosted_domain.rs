@@ -32,18 +32,13 @@ impl Default for HostedDomainIdentity {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HostedProviderIdentity {
-    pub domain_id: HostedDomainId,
-    pub cookie: u64,
-}
+pub type HostedProviderIdentity = HostedDomainIdentity;
 
 /// Canonical bindings owned by one isolated hosted-driver address space.
 #[derive(Clone, Debug)]
 pub struct HostedDomainRecord {
     cookie: u64,
-    provider_domain_id: HostedDomainId,
-    provider_cookie: u64,
+    provider: Option<HostedDomainIdentity>,
     drivers: Vec<HostedPointerBinding<DriverId>>,
     devices: Vec<HostedPointerBinding<DeviceId>>,
     files: Vec<HostedPointerBinding<FileId>>,
@@ -53,8 +48,7 @@ impl HostedDomainRecord {
     fn new() -> Self {
         Self {
             cookie: 0,
-            provider_domain_id: HostedDomainId::NULL,
-            provider_cookie: 0,
+            provider: None,
             drivers: Vec::new(),
             devices: Vec::new(),
             files: Vec::new(),
@@ -65,12 +59,8 @@ impl HostedDomainRecord {
         self.cookie
     }
 
-    pub fn provider_domain_id(&self) -> HostedDomainId {
-        self.provider_domain_id
-    }
-
-    pub fn provider_cookie(&self) -> u64 {
-        self.provider_cookie
+    pub fn provider_identity(&self) -> Option<HostedDomainIdentity> {
+        self.provider
     }
 
     pub fn driver_binding_count(&self) -> usize {
@@ -142,19 +132,46 @@ fn unbind<I: Copy + Eq>(bindings: &mut Vec<HostedPointerBinding<I>>, address: u6
 impl<P> IoManager<P> {
     /// Allocate a fresh hosted address-domain identity. Its cookie is the same generation-protected
     /// value carried independently in authenticated dispatch envelopes.
-    pub fn register_hosted_domain(&mut self) -> HostedDomainId {
+    pub fn register_hosted_domain(&mut self) -> HostedDomainIdentity {
         let id = self.hosted_domains.insert(HostedDomainRecord::new());
         let record = self
             .hosted_domains
             .get_mut(id)
             .expect("just inserted domain");
         record.cookie = id.raw();
-        id
+        HostedDomainIdentity {
+            domain_id: id,
+            cookie: record.cookie,
+        }
     }
 
-    /// Remove a hosted domain. Reuse of its slot receives a new generation and cookie.
-    pub fn unregister_hosted_domain(&mut self, domain: HostedDomainId) -> bool {
-        self.hosted_domains.remove(domain).is_some()
+    /// Remove one exact, empty hosted domain. Reuse of its slot receives a new generation and
+    /// cookie. Pointer projections and provider links are leases and must be released first.
+    pub fn unregister_hosted_domain(
+        &mut self,
+        identity: HostedDomainIdentity,
+    ) -> Result<(), NtStatus> {
+        let record = self
+            .hosted_domains
+            .get(identity.domain_id)
+            .filter(|record| identity.cookie != 0 && record.cookie == identity.cookie)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        let has_inbound_provider_link = self
+            .hosted_domains
+            .iter()
+            .any(|(_, dependent)| dependent.provider == Some(identity));
+        if !record.drivers.is_empty()
+            || !record.devices.is_empty()
+            || !record.files.is_empty()
+            || record.provider.is_some()
+            || has_inbound_provider_link
+        {
+            return Err(NtStatus::DEVICE_BUSY);
+        }
+        self.hosted_domains
+            .remove(identity.domain_id)
+            .map(|_| ())
+            .ok_or(NtStatus::INVALID_PARAMETER)
     }
 
     pub fn hosted_domain(&self, domain: HostedDomainId) -> Option<&HostedDomainRecord> {
@@ -169,83 +186,106 @@ impl<P> IoManager<P> {
         })
     }
 
-    /// Route a dependent domain through one exact live provider domain.
+    /// Route a dependent domain through one exact live provider domain. Returns `true` only when
+    /// this call created the lease; an identical replay returns `false`.
     pub fn set_hosted_domain_provider(
         &mut self,
-        domain: HostedDomainId,
-        provider: HostedDomainId,
-        provider_cookie: u64,
-    ) -> Result<(), NtStatus> {
-        let live_provider_cookie = self
-            .hosted_domains
-            .get(provider)
-            .map(|provider| provider.cookie)
-            .ok_or(NtStatus::INVALID_PARAMETER)?;
-        if provider_cookie == 0 || provider_cookie != live_provider_cookie {
+        dependent: HostedDomainIdentity,
+        provider: HostedDomainIdentity,
+    ) -> Result<bool, NtStatus> {
+        if dependent == provider {
             return Err(NtStatus::INVALID_PARAMETER);
         }
-        let domain = self
-            .hosted_domains
-            .get_mut(domain)
+        self.hosted_domains
+            .get(provider.domain_id)
+            .filter(|record| provider.cookie != 0 && record.cookie == provider.cookie)
             .ok_or(NtStatus::INVALID_PARAMETER)?;
-        domain.provider_domain_id = provider;
-        domain.provider_cookie = provider_cookie;
-        Ok(())
+        let dependent_record = self
+            .hosted_domains
+            .get_mut(dependent.domain_id)
+            .filter(|record| dependent.cookie != 0 && record.cookie == dependent.cookie)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        match dependent_record.provider {
+            None => {
+                dependent_record.provider = Some(provider);
+                Ok(true)
+            }
+            Some(existing) if existing == provider => Ok(false),
+            Some(_) => Err(NtStatus::OBJECT_NAME_COLLISION),
+        }
     }
 
     /// Resolve the exact provider domain and generation cookie for a dependent domain.
     pub fn hosted_provider_identity(
         &self,
-        domain: HostedDomainId,
+        dependent: HostedDomainIdentity,
     ) -> Option<HostedProviderIdentity> {
-        let dependent = self.hosted_domains.get(domain)?;
-        let provider_domain_id = dependent.provider_domain_id;
-        if provider_domain_id == HostedDomainId::NULL || dependent.provider_cookie == 0 {
-            return None;
-        }
-        self.hosted_domains.get(provider_domain_id)?;
-        Some(HostedProviderIdentity {
-            domain_id: provider_domain_id,
-            cookie: dependent.provider_cookie,
-        })
+        let dependent = self
+            .hosted_domains
+            .get(dependent.domain_id)
+            .filter(|record| dependent.cookie != 0 && record.cookie == dependent.cookie)?;
+        let provider = dependent.provider?;
+        self.hosted_domains
+            .get(provider.domain_id)
+            .filter(|record| provider.cookie != 0 && record.cookie == provider.cookie)?;
+        Some(provider)
     }
 
     /// Clear one exact provider link. A stale teardown cannot erase a replacement route.
     pub fn clear_hosted_domain_provider(
         &mut self,
-        domain: HostedDomainId,
-        provider: HostedDomainId,
-        provider_cookie: u64,
-    ) -> bool {
-        let Some(domain) = self.hosted_domains.get_mut(domain) else {
-            return false;
-        };
-        if domain.provider_domain_id != provider || domain.provider_cookie != provider_cookie {
-            return false;
+        dependent: HostedDomainIdentity,
+        provider: HostedDomainIdentity,
+    ) -> Result<(), NtStatus> {
+        let dependent_record = self
+            .hosted_domains
+            .get_mut(dependent.domain_id)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        if dependent.cookie == 0
+            || dependent_record.cookie != dependent.cookie
+            || dependent_record.provider != Some(provider)
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
         }
-        domain.provider_domain_id = HostedDomainId::NULL;
-        domain.provider_cookie = 0;
-        true
+        dependent_record.provider = None;
+        Ok(())
     }
 
-    pub fn bind_hosted_driver_address(
+    /// Refuse provider unload while any exact dependent-domain lease remains.
+    pub fn can_unload_hosted_provider(
+        &self,
+        provider: HostedDomainIdentity,
+    ) -> Result<(), NtStatus> {
+        self.hosted_domains
+            .get(provider.domain_id)
+            .filter(|record| provider.cookie != 0 && record.cookie == provider.cookie)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        if self
+            .hosted_domains
+            .iter()
+            .any(|(_, dependent)| dependent.provider == Some(provider))
+        {
+            Err(NtStatus::DEVICE_BUSY)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn bind_hosted_driver_identity(
         &mut self,
-        domain: HostedDomainId,
+        identity: HostedDomainIdentity,
         address: u64,
         driver: DriverId,
     ) -> Result<(), NtStatus> {
         if self.driver(driver).is_none() {
             return Err(NtStatus::INVALID_PARAMETER);
         }
-        bind(
-            &mut self
-                .hosted_domains
-                .get_mut(domain)
-                .ok_or(NtStatus::INVALID_PARAMETER)?
-                .drivers,
-            address,
-            driver,
-        )
+        let domain = self
+            .hosted_domains
+            .get_mut(identity.domain_id)
+            .filter(|domain| identity.cookie != 0 && domain.cookie == identity.cookie)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        bind(&mut domain.drivers, address, driver)
     }
 
     /// Bind a hosted DeviceObject projection only when both independently carried pieces of the
@@ -267,37 +307,37 @@ impl<P> IoManager<P> {
         bind(&mut domain.devices, address, device)
     }
 
-    pub fn bind_hosted_file_address(
+    pub fn bind_hosted_file_identity(
         &mut self,
-        domain: HostedDomainId,
+        identity: HostedDomainIdentity,
         address: u64,
         file: FileId,
     ) -> Result<(), NtStatus> {
         if self.file(file).is_none() {
             return Err(NtStatus::INVALID_HANDLE);
         }
-        bind(
-            &mut self
-                .hosted_domains
-                .get_mut(domain)
-                .ok_or(NtStatus::INVALID_PARAMETER)?
-                .files,
-            address,
-            file,
-        )
+        let domain = self
+            .hosted_domains
+            .get_mut(identity.domain_id)
+            .filter(|domain| identity.cookie != 0 && domain.cookie == identity.cookie)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        bind(&mut domain.files, address, file)
     }
 
     /// Remove one exact hosted DriverObject projection. Stale teardown cannot erase a replacement
     /// binding that reuses either the address or canonical id.
-    pub fn unbind_hosted_driver_address(
+    pub fn unbind_hosted_driver_identity(
         &mut self,
-        domain: HostedDomainId,
+        identity: HostedDomainIdentity,
         address: u64,
         driver: DriverId,
     ) -> bool {
-        let Some(domain) = self.hosted_domains.get_mut(domain) else {
+        let Some(domain) = self.hosted_domains.get_mut(identity.domain_id) else {
             return false;
         };
+        if identity.cookie == 0 || domain.cookie != identity.cookie {
+            return false;
+        }
         unbind(&mut domain.drivers, address, driver)
     }
 
@@ -318,24 +358,31 @@ impl<P> IoManager<P> {
     }
 
     /// Remove one exact hosted FileObject projection.
-    pub fn unbind_hosted_file_address(
+    pub fn unbind_hosted_file_identity(
         &mut self,
-        domain: HostedDomainId,
+        identity: HostedDomainIdentity,
         address: u64,
         file: FileId,
     ) -> bool {
-        let Some(domain) = self.hosted_domains.get_mut(domain) else {
+        let Some(domain) = self.hosted_domains.get_mut(identity.domain_id) else {
             return false;
         };
+        if identity.cookie == 0 || domain.cookie != identity.cookie {
+            return false;
+        }
         unbind(&mut domain.files, address, file)
     }
 
-    pub fn hosted_driver_by_address(
+    pub fn hosted_driver_by_identity(
         &self,
-        domain: HostedDomainId,
+        identity: HostedDomainIdentity,
         address: u64,
     ) -> Option<DriverId> {
-        let id = resolve(&self.hosted_domains.get(domain)?.drivers, address)?;
+        let record = self.hosted_domains.get(identity.domain_id)?;
+        if identity.cookie == 0 || record.cookie != identity.cookie {
+            return None;
+        }
+        let id = resolve(&record.drivers, address)?;
         self.driver(id).map(|_| id)
     }
 
@@ -354,14 +401,30 @@ impl<P> IoManager<P> {
         self.device(id).map(|_| id)
     }
 
-    pub fn hosted_file_by_address(&self, domain: HostedDomainId, address: u64) -> Option<FileId> {
-        let id = resolve(&self.hosted_domains.get(domain)?.files, address)?;
+    pub fn hosted_file_by_identity(
+        &self,
+        identity: HostedDomainIdentity,
+        address: u64,
+    ) -> Option<FileId> {
+        let record = self.hosted_domains.get(identity.domain_id)?;
+        if identity.cookie == 0 || record.cookie != identity.cookie {
+            return None;
+        }
+        let id = resolve(&record.files, address)?;
         self.file(id).map(|_| id)
     }
 
-    pub fn hosted_driver_address(&self, domain: HostedDomainId, driver: DriverId) -> Option<u64> {
+    pub fn hosted_driver_address_by_identity(
+        &self,
+        identity: HostedDomainIdentity,
+        driver: DriverId,
+    ) -> Option<u64> {
         self.driver(driver)?;
-        address_of(&self.hosted_domains.get(domain)?.drivers, driver)
+        let record = self.hosted_domains.get(identity.domain_id)?;
+        if identity.cookie == 0 || record.cookie != identity.cookie {
+            return None;
+        }
+        address_of(&record.drivers, driver)
     }
 
     /// Resolve the address of one canonical device only in the exact live domain generation.
@@ -378,9 +441,17 @@ impl<P> IoManager<P> {
         address_of(&record.devices, device)
     }
 
-    pub fn hosted_file_address(&self, domain: HostedDomainId, file: FileId) -> Option<u64> {
+    pub fn hosted_file_address_by_identity(
+        &self,
+        identity: HostedDomainIdentity,
+        file: FileId,
+    ) -> Option<u64> {
         self.file(file)?;
-        address_of(&self.hosted_domains.get(domain)?.files, file)
+        let record = self.hosted_domains.get(identity.domain_id)?;
+        if identity.cookie == 0 || record.cookie != identity.cookie {
+            return None;
+        }
+        address_of(&record.files, file)
     }
 }
 
@@ -437,14 +508,12 @@ mod tests {
                 0,
             )
             .unwrap();
-        let first = io.register_hosted_domain();
-        let second = io.register_hosted_domain();
-        let first_identity = io.hosted_domain_identity(first).unwrap();
-        let second_identity = io.hosted_domain_identity(second).unwrap();
+        let first_identity = io.register_hosted_domain();
+        let second_identity = io.register_hosted_domain();
         let shared_address = 0x1000_0080;
-        io.bind_hosted_driver_address(first, shared_address, first_driver)
+        io.bind_hosted_driver_identity(first_identity, shared_address, first_driver)
             .unwrap();
-        io.bind_hosted_driver_address(second, shared_address, second_driver)
+        io.bind_hosted_driver_identity(second_identity, shared_address, second_driver)
             .unwrap();
         io.bind_hosted_device_identity(first_identity, shared_address + 8, first_device)
             .unwrap();
@@ -452,11 +521,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            io.hosted_driver_by_address(first, shared_address),
+            io.hosted_driver_by_identity(first_identity, shared_address),
             Some(first_driver)
         );
         assert_eq!(
-            io.hosted_driver_by_address(second, shared_address),
+            io.hosted_driver_by_identity(second_identity, shared_address),
             Some(second_driver)
         );
         assert_eq!(
@@ -492,20 +561,30 @@ mod tests {
             None
         );
 
-        let stale = first;
-        let stale_cookie = io.hosted_domain(stale).unwrap().cookie();
-        assert!(io.unregister_hosted_domain(stale));
-        assert_eq!(io.hosted_driver_by_address(stale, shared_address), None);
+        let stale = first_identity;
+        let stale_cookie = stale.cookie;
+        assert_eq!(
+            io.unregister_hosted_domain(stale),
+            Err(NtStatus::DEVICE_BUSY)
+        );
+        assert!(io.unbind_hosted_driver_identity(stale, shared_address, first_driver));
+        assert!(io.unbind_hosted_device_identity(stale, shared_address + 8, first_device));
+        assert_eq!(io.unregister_hosted_domain(stale), Ok(()));
+        assert_eq!(io.hosted_driver_by_identity(stale, shared_address), None);
         assert_eq!(
             io.hosted_device_by_identity(first_identity, shared_address + 8),
             None
         );
         let replacement = io.register_hosted_domain();
-        assert_eq!(replacement.slot(), stale.slot());
-        assert_ne!(replacement.generation(), stale.generation());
+        assert_eq!(replacement.domain_id.slot(), stale.domain_id.slot());
         assert_ne!(
-            io.hosted_domain(replacement).unwrap().cookie(),
-            stale_cookie
+            replacement.domain_id.generation(),
+            stale.domain_id.generation()
+        );
+        assert_ne!(replacement.cookie, stale_cookie);
+        assert_eq!(
+            io.unregister_hosted_domain(stale),
+            Err(NtStatus::INVALID_PARAMETER)
         );
     }
 
@@ -549,46 +628,68 @@ mod tests {
             .reference_open_file(client, handle, AccessMask::empty())
             .unwrap()
             .0;
-        let dependent = io.register_hosted_domain();
-        let dependent_identity = io.hosted_domain_identity(dependent).unwrap();
-        let provider = io.register_hosted_domain();
-        let provider_cookie = io.hosted_domain_identity(provider).unwrap().cookie;
+        let dependent_identity = io.register_hosted_domain();
+        let provider_identity = io.register_hosted_domain();
 
-        assert_eq!(io.hosted_provider_identity(dependent), None);
+        assert_eq!(io.hosted_provider_identity(dependent_identity), None);
         assert_eq!(
-            io.set_hosted_domain_provider(dependent, provider, 0),
+            io.set_hosted_domain_provider(
+                dependent_identity,
+                HostedDomainIdentity {
+                    cookie: 0,
+                    ..provider_identity
+                }
+            ),
             Err(NtStatus::INVALID_PARAMETER)
         );
         assert_eq!(
-            io.set_hosted_domain_provider(dependent, provider, provider_cookie.wrapping_add(1)),
+            io.set_hosted_domain_provider(
+                dependent_identity,
+                HostedDomainIdentity {
+                    cookie: provider_identity.cookie.wrapping_add(1),
+                    ..provider_identity
+                }
+            ),
             Err(NtStatus::INVALID_PARAMETER)
         );
 
         assert_eq!(
-            io.bind_hosted_driver_address(dependent, 0x2000, driver),
+            io.bind_hosted_driver_identity(dependent_identity, 0x2000, driver),
             Ok(())
         );
         assert_eq!(
-            io.bind_hosted_driver_address(dependent, 0x2000, other_driver),
+            io.bind_hosted_driver_identity(dependent_identity, 0x2000, other_driver),
             Err(NtStatus::OBJECT_NAME_COLLISION)
         );
         assert_eq!(
-            io.bind_hosted_driver_address(dependent, 0x3000, driver),
+            io.bind_hosted_driver_identity(dependent_identity, 0x3000, driver),
             Err(NtStatus::OBJECT_NAME_COLLISION)
         );
         assert_eq!(
             io.bind_hosted_device_identity(dependent_identity, 0x4000, device),
             Ok(())
         );
-        assert_eq!(io.bind_hosted_file_address(dependent, 0x5000, file), Ok(()));
-        assert_eq!(io.hosted_file_by_address(dependent, 0x5000), Some(file));
-
-        assert!(!io.unbind_hosted_driver_address(dependent, 0x2000, other_driver));
-        assert_eq!(io.hosted_driver_by_address(dependent, 0x2000), Some(driver));
-        assert!(io.unbind_hosted_driver_address(dependent, 0x2000, driver));
-        assert_eq!(io.hosted_driver_by_address(dependent, 0x2000), None);
         assert_eq!(
-            io.bind_hosted_driver_address(dependent, 0x2000, other_driver),
+            io.bind_hosted_file_identity(dependent_identity, 0x5000, file),
+            Ok(())
+        );
+        assert_eq!(
+            io.hosted_file_by_identity(dependent_identity, 0x5000),
+            Some(file)
+        );
+
+        assert!(!io.unbind_hosted_driver_identity(dependent_identity, 0x2000, other_driver));
+        assert_eq!(
+            io.hosted_driver_by_identity(dependent_identity, 0x2000),
+            Some(driver)
+        );
+        assert!(io.unbind_hosted_driver_identity(dependent_identity, 0x2000, driver));
+        assert_eq!(
+            io.hosted_driver_by_identity(dependent_identity, 0x2000),
+            None
+        );
+        assert_eq!(
+            io.bind_hosted_driver_identity(dependent_identity, 0x2000, other_driver),
             Ok(())
         );
 
@@ -624,30 +725,55 @@ mod tests {
             Ok(())
         );
 
-        assert!(!io.unbind_hosted_file_address(dependent, 0x5008, file));
-        assert!(io.unbind_hosted_file_address(dependent, 0x5000, file));
-        assert_eq!(io.hosted_file_by_address(dependent, 0x5000), None);
-        assert_eq!(io.bind_hosted_file_address(dependent, 0x5008, file), Ok(()));
-
-        io.set_hosted_domain_provider(dependent, provider, provider_cookie)
-            .unwrap();
-        let identity = io.hosted_provider_identity(dependent).unwrap();
-        assert_eq!(identity.domain_id, provider);
-        assert_eq!(identity.cookie, provider_cookie);
-        assert!(!io.clear_hosted_domain_provider(
-            dependent,
-            provider,
-            provider_cookie.wrapping_add(1)
-        ));
-        assert_eq!(io.hosted_provider_identity(dependent), Some(identity));
-        assert!(io.clear_hosted_domain_provider(dependent, provider, provider_cookie));
-        assert_eq!(io.hosted_provider_identity(dependent), None);
-        io.set_hosted_domain_provider(dependent, provider, provider_cookie)
-            .unwrap();
-        assert!(io.unregister_hosted_domain(provider));
-        assert_eq!(io.hosted_provider_identity(dependent), None);
+        assert!(!io.unbind_hosted_file_identity(dependent_identity, 0x5008, file));
+        assert!(io.unbind_hosted_file_identity(dependent_identity, 0x5000, file));
+        assert_eq!(io.hosted_file_by_identity(dependent_identity, 0x5000), None);
         assert_eq!(
-            io.set_hosted_domain_provider(dependent, provider, provider_cookie),
+            io.bind_hosted_file_identity(dependent_identity, 0x5008, file),
+            Ok(())
+        );
+
+        assert_eq!(
+            io.set_hosted_domain_provider(dependent_identity, provider_identity),
+            Ok(true)
+        );
+        assert_eq!(
+            io.set_hosted_domain_provider(dependent_identity, provider_identity),
+            Ok(false)
+        );
+        assert_eq!(
+            io.hosted_provider_identity(dependent_identity),
+            Some(provider_identity)
+        );
+        assert_eq!(
+            io.clear_hosted_domain_provider(
+                dependent_identity,
+                HostedDomainIdentity {
+                    cookie: provider_identity.cookie.wrapping_add(1),
+                    ..provider_identity
+                }
+            ),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        assert_eq!(
+            io.hosted_provider_identity(dependent_identity),
+            Some(provider_identity)
+        );
+        assert_eq!(
+            io.can_unload_hosted_provider(provider_identity),
+            Err(NtStatus::DEVICE_BUSY)
+        );
+        assert_eq!(
+            io.unregister_hosted_domain(provider_identity),
+            Err(NtStatus::DEVICE_BUSY)
+        );
+        io.clear_hosted_domain_provider(dependent_identity, provider_identity)
+            .unwrap();
+        assert_eq!(io.hosted_provider_identity(dependent_identity), None);
+        assert_eq!(io.can_unload_hosted_provider(provider_identity), Ok(()));
+        assert_eq!(io.unregister_hosted_domain(provider_identity), Ok(()));
+        assert_eq!(
+            io.set_hosted_domain_provider(dependent_identity, provider_identity),
             Err(NtStatus::INVALID_PARAMETER)
         );
     }
