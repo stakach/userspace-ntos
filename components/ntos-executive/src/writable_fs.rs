@@ -957,39 +957,99 @@ pub(crate) unsafe fn writable_fs() -> Option<&'static mut nt_fs::FileSystem> {
     slot.as_mut()
 }
 
-/// Mount an already-persisted writable-volume snapshot during executive initialization, before hosted
-/// processes can read or mutate boot hives. A missing snapshot leaves the normal lazy first-boot mount
-/// path intact.
+pub(crate) enum BootSystemPersistence {
+    Absent,
+    Restored(RestoredBootSystem),
+}
+
+pub(crate) struct RestoredBootSystem {
+    pub(crate) snapshot_generation: u64,
+    pub(crate) snapshot_bytes: usize,
+    pub(crate) primary: Option<alloc::vec::Vec<u8>>,
+    pub(crate) log: alloc::vec::Vec<u8>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BootSystemRestoreError {
+    OverlayDisabled,
+    MountBlocked,
+    GeometryUnavailable,
+    Snapshot(u32),
+    SystemStateMissing,
+    PrimaryRead,
+    LogRead,
+}
+
+fn owned_file_before_publish(
+    fs: &nt_fs::FileSystem,
+    path: &str,
+    read_error: BootSystemRestoreError,
+) -> Result<Option<alloc::vec::Vec<u8>>, BootSystemRestoreError> {
+    let Some(expected_len) = fs.file_len(path) else {
+        return Ok(None);
+    };
+    let bytes = fs.file_bytes_owned(path).ok_or(read_error)?;
+    if bytes.len() as u64 != expected_len {
+        return Err(read_error);
+    }
+    Ok(Some(bytes))
+}
+
+/// Restore and classify persisted SYSTEM state before publishing or provisioning the writable FS.
+///
+/// `Absent` means the snapshot reserve was readable and both slots were genuinely empty. A restored
+/// volume must contain a SYSTEM primary or non-empty SYSTEM journal. All other states fail closed.
 ///
 /// # Safety
-/// Single-threaded executive initialization; installs the global writable volume when a snapshot exists.
-pub(crate) unsafe fn mount_restored_snapshot_for_boot() -> bool {
+/// Single-threaded early boot, after the executable FAT volume is mounted and before hosted code.
+pub(crate) unsafe fn restore_boot_system_persistence(
+) -> Result<BootSystemPersistence, BootSystemRestoreError> {
     if !WRITABLE_OVERLAY_MOUNTED {
-        return false;
+        return Err(BootSystemRestoreError::OverlayDisabled);
     }
     if WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.load(Ordering::Acquire) {
-        return false;
+        return Err(BootSystemRestoreError::MountBlocked);
     }
     if (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_some() {
-        return snapshot_restore_seen();
+        return Err(BootSystemRestoreError::MountBlocked);
     }
     if !snapshot_reserve_available() {
-        return false;
+        return Err(BootSystemRestoreError::GeometryUnavailable);
     }
     match restore_snapshot_volume_once() {
         Ok(Some((fs, generation, bytes))) => {
+            let primary = owned_file_before_publish(
+                &fs,
+                CONFIG_SYSTEM_HIVE_PATH,
+                BootSystemRestoreError::PrimaryRead,
+            )?;
+            let log_path = alloc::format!("{}.LOG", CONFIG_SYSTEM_HIVE_PATH);
+            let log = owned_file_before_publish(
+                &fs,
+                &log_path,
+                BootSystemRestoreError::LogRead,
+            )?
+            .unwrap_or_default();
+            if primary.is_none() && log.is_empty() {
+                return Err(BootSystemRestoreError::SystemStateMissing);
+            }
             let nodes = fs.node_count();
             note_restored_snapshot(generation, bytes, nodes);
             install_writable_fs(fs, true);
-            true
+            Ok(BootSystemPersistence::Restored(RestoredBootSystem {
+                snapshot_generation: generation,
+                snapshot_bytes: bytes,
+                primary,
+                log,
+            }))
         }
-        Ok(None) => false,
+        Ok(None) => Ok(BootSystemPersistence::Absent),
         Err(status) => {
             WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
             print_str(b"[writable-fs-snapshot] refusing writable mount after restore status=0x");
             print_hex(status);
             print_str(b"\n");
-            false
+            Err(BootSystemRestoreError::Snapshot(status))
         }
     }
 }

@@ -12803,3 +12803,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     missing SYSTEM checkpoint. Publish the composed encoded image as the first and only isolated CM
     generation before launch-plan selection, then delete the split generated/direct-REGF semantic
     manager paths and their unknown-type fallback copier.
+
+    Composed boot-SYSTEM integration (2026-08-26, implementation green): early boot now classifies
+    persistence as genuinely absent, restored, or a typed error before writable-volume publication
+    can provision a missing file. A restored snapshot must expose a readable SYSTEM primary or a
+    non-empty SYSTEM journal; corrupt, unreadable, geometrically unavailable, or structurally
+    incomplete persisted state stops boot instead of selecting installed media. Journal-only state
+    replays over installed REGF, while a persisted core or REGF primary is authoritative without
+    requiring an installed SYSTEM image.
+
+    Startup composes persistence and the generated hardware/setup overlay into one validated core
+    image before mounting isolated CM. The executive mutable SYSTEM mount and every local semantic
+    launch-plan reader decode that same image. SYSTEM is excluded from the later raw checkpoint
+    refresh, the generated-only CM cache and raw REGF PnP scan are deleted, and Device-class boot
+    planning no longer duplicates drivers retained by the PnP binding plan. The old REGF-to-semantic
+    ConfigManager copier is removed; REGF crosses only the lossless hive import boundary.
+
+    Services enumeration and order-cache invalidation now derive their physical path from the
+    selected SYSTEM mount rather than comparing against a numbered control set. The remaining
+    win32k raw SYSTEM alias also resolves `Select\\Current` dynamically, removing the last fixed
+    production `ControlSet001` identity found by the integration review. Focused validation is green
+    at `nt-hive-core` `76/76`, `nt-hive-regf` `23/23`, and the freestanding executive release check
+    remains at the established 212-warning baseline.
+
+    Review adjustment: keep the integration checkpoint open until a serialized desktop run proves
+    the composed first-boot and launch-plan path. On acceptance, migrate remaining raw SYSTEM REGF
+    consumers (including win32k, timezone/NLS, and display readers) to the live CM/mutable-hive
+    authority. Then replace local re-decoding of the composed image with generation-bound CM query
+    APIs before introducing journalled mutation leases; the encoded boot image is a handoff artifact,
+    not a second mutable owner.

@@ -8390,17 +8390,17 @@ fn is_video_device_map_key(path: &[u8]) -> bool {
     reg_ascii_eq(registry_path_tail(path), b"hardware\\devicemap\\video")
 }
 
-fn system_hive_relative_path(path: &[u8]) -> Option<Vec<u8>> {
+fn system_hive_relative_path(hive: &RegfHive<'_>, path: &[u8]) -> Option<Vec<u8>> {
     let mut tail = registry_path_tail(path);
     tail = strip_ascii_prefix(tail, b"system\\")?;
+    let selected = hive.current_control_set_name().ok()?;
+    let alias = selected.as_bytes();
     if reg_ascii_eq(tail, b"currentcontrolset") {
-        let alias = b"controlset001";
         let mut out = Vec::new();
         out.try_reserve_exact(alias.len()).ok()?;
         out.extend_from_slice(alias);
         Some(out)
     } else if let Some(rest) = strip_ascii_prefix(tail, b"currentcontrolset\\") {
-        let alias = b"controlset001";
         let len = alias.len().checked_add(1)?.checked_add(rest.len())?;
         let mut out = Vec::new();
         out.try_reserve_exact(len).ok()?;
@@ -8418,7 +8418,7 @@ fn system_hive_relative_path(path: &[u8]) -> Option<Vec<u8>> {
 
 fn system_hive_key_from_path(path: &[u8]) -> Option<u32> {
     let hive = system_hive_regf()?;
-    let rel = system_hive_relative_path(path)?;
+    let rel = system_hive_relative_path(&hive, path)?;
     let rel_str = unsafe { core::str::from_utf8_unchecked(&rel) };
     hive.open_key(rel_str)
 }

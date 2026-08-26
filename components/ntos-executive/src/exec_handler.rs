@@ -66,9 +66,6 @@ const EXCEPTION_RECORD_ADDRESS_OFFSET: usize = 0x10;
 const EXCEPTION_RECORD_PARAMETERS_OFFSET: usize = 0x18;
 const EXCEPTION_RECORD_INFORMATION_OFFSET: usize = 0x20;
 const EXCEPTION_MAXIMUM_PARAMETERS: u32 = 15;
-const REGISTRY_SERVICES_CANON: &str = r"\registry\machine\system\controlset001\services";
-const REGISTRY_SERVICE_GROUP_ORDER_CANON: &str =
-    r"\registry\machine\system\controlset001\control\servicegrouporder";
 const BOOT_HIVE_FLUSH_POST_CHECKPOINT_HEADROOM: usize = 0x18_0000;
 const PNP_EVENT_BLOCK_INSTALL_DEVICE_OFFSET: usize = 48;
 const PNP_EVENT_CATEGORY_DEVICE_INSTALL: u32 = 4;
@@ -2570,15 +2567,17 @@ impl ExecNtHandler {
             }
         };
         let mut mutable_hives = nt_hive_core::MutableHiveSet::new();
-        if let Some(ref regf) = hive {
-            mount_mutable_regf_hive(
-                &mut mutable_hives,
-                HIVE_SEL_SYSTEM,
+        let boot_system_image = unsafe { boot_system_hive_image_bytes() }
+            .expect("composed boot SYSTEM image was prepared before handler initialization");
+        let boot_system_hive = nt_hive_core::decode_image(boot_system_image)
+            .expect("prepared boot SYSTEM image remains valid");
+        mutable_hives
+            .mount(
                 hive_mount(HIVE_SEL_SYSTEM),
-                regf,
+                HIVE_SEL_SYSTEM,
+                boot_system_hive,
             )
-            .expect("mount imported SYSTEM hive");
-        }
+            .expect("mount composed boot SYSTEM hive");
         if let Some(ref regf) = software_hive {
             mount_mutable_regf_hive(
                 &mut mutable_hives,
@@ -2854,7 +2853,7 @@ impl ExecNtHandler {
                 let _ = handler.pm.replace_process_primary_token(pid, Some(token));
             }
         }
-        if unsafe { crate::writable_fs::mount_restored_snapshot_for_boot() } {
+        if crate::writable_fs::snapshot_restore_seen() {
             handler.refresh_boot_hive_checkpoints_from_writable_config();
         }
         handler.refresh_process_manager_gates();
@@ -4857,7 +4856,6 @@ impl ExecNtHandler {
         self.boot_hive_checkpoints_refreshed = true;
         let mut mounted = false;
         for (hive_sel, file_path) in [
-            (HIVE_SEL_SYSTEM, crate::writable_fs::CONFIG_SYSTEM_HIVE_PATH),
             (
                 HIVE_SEL_SOFTWARE,
                 crate::writable_fs::CONFIG_SOFTWARE_HIVE_PATH,
@@ -6261,7 +6259,7 @@ impl ExecNtHandler {
             return false;
         }
         self.mark_mutable_hives_dirty_for_services_order_change(
-            Self::registry_services_order_value_write_may_reorder(full_path),
+            self.registry_services_order_value_write_may_reorder(full_path),
         );
         true
     }
@@ -6959,7 +6957,7 @@ impl ExecNtHandler {
         let path = self.registry_target_path(target);
         if path
             .as_deref()
-            .is_some_and(Self::is_system_services_registry_path)
+            .is_some_and(|path| self.is_system_services_registry_path(path))
         {
             return self.registry_ordered_service_subkey_by_index(requested_index);
         }
@@ -7051,15 +7049,20 @@ impl ExecNtHandler {
         None
     }
 
-    fn is_system_services_registry_path(path: &str) -> bool {
-        nt_hive_core::canon_path(path) == REGISTRY_SERVICES_CANON
+    fn system_services_registry_canon(&self) -> alloc::string::String {
+        self.overlay_canon(nt_config_manager::SERVICES_PATH)
     }
 
-    fn registry_services_descendant_depth_from_canon(canon: &str) -> Option<usize> {
-        if canon == REGISTRY_SERVICES_CANON {
+    fn is_system_services_registry_path(&self, path: &str) -> bool {
+        nt_hive_core::canon_path(path) == self.system_services_registry_canon()
+    }
+
+    fn registry_services_descendant_depth_from_canon(&self, canon: &str) -> Option<usize> {
+        let services = self.system_services_registry_canon();
+        if canon == services {
             return Some(0);
         }
-        let rest = canon.strip_prefix(REGISTRY_SERVICES_CANON)?;
+        let rest = canon.strip_prefix(&services)?;
         let rest = rest.strip_prefix('\\')?;
         if rest.is_empty() {
             return None;
@@ -7067,19 +7070,19 @@ impl ExecNtHandler {
         Some(rest.split('\\').filter(|part| !part.is_empty()).count())
     }
 
-    fn registry_services_order_key_membership_may_change(path: &str) -> bool {
+    fn registry_services_order_key_membership_may_change(&self, path: &str) -> bool {
         let canon = nt_hive_core::canon_path(path);
         matches!(
-            Self::registry_services_descendant_depth_from_canon(&canon),
+            self.registry_services_descendant_depth_from_canon(&canon),
             Some(1)
         )
     }
 
-    fn registry_services_order_value_write_may_reorder(path: &str) -> bool {
+    fn registry_services_order_value_write_may_reorder(&self, path: &str) -> bool {
         let canon = nt_hive_core::canon_path(path);
-        canon == REGISTRY_SERVICE_GROUP_ORDER_CANON
+        canon == self.overlay_canon(nt_config_manager::SERVICE_GROUP_ORDER_PATH)
             || matches!(
-                Self::registry_services_descendant_depth_from_canon(&canon),
+                self.registry_services_descendant_depth_from_canon(&canon),
                 Some(1)
             )
     }
@@ -15133,31 +15136,9 @@ impl ExecNtHandler {
     }
 
     fn pnp_config_manager_snapshot() -> Option<nt_config_manager::ConfigManager> {
-        let config_cache_bytes = CONFIG_HIVE_IMAGE_CACHE_BYTES.load(Ordering::Relaxed);
-        let mut storage = None;
-        if config_cache_bytes != 0 {
-            trace_setup_provision_phase(b"pnp-snapshot-config-begin", config_cache_bytes);
-            storage = config_hive_config_manager();
-            trace_setup_provision_phase(
-                b"pnp-snapshot-config-end",
-                storage
-                    .as_ref()
-                    .map(|cm| cm.devnode_count() as u64)
-                    .unwrap_or(u64::MAX),
-            );
-            if storage.as_ref().is_some_and(|cm| cm.devnode_count() != 0) {
-                return storage;
-            }
-        }
-
-        let system_has_enum = system_hive_has_pnp_enum_devnodes();
-        trace_setup_provision_phase(b"pnp-snapshot-system-enum", system_has_enum as u64);
-        trace_setup_provision_phase(b"pnp-snapshot-system-begin", system_has_enum as u64);
-        let system = if system_has_enum {
-            system_hive_config_manager()
-        } else {
-            None
-        };
+        let image_bytes = BOOT_SYSTEM_HIVE_IMAGE_BYTES.load(Ordering::Acquire);
+        trace_setup_provision_phase(b"pnp-snapshot-system-begin", image_bytes);
+        let system = boot_system_config_manager();
         trace_setup_provision_phase(
             b"pnp-snapshot-system-end",
             system
@@ -15165,25 +15146,7 @@ impl ExecNtHandler {
                 .map(|cm| cm.devnode_count() as u64)
                 .unwrap_or(u64::MAX),
         );
-        if system.as_ref().is_some_and(|cm| cm.devnode_count() != 0) {
-            return system;
-        }
-        if storage.is_some() {
-            return storage.or(system);
-        }
-        trace_setup_provision_phase(b"pnp-snapshot-config-begin", config_cache_bytes);
-        storage = config_hive_config_manager();
-        trace_setup_provision_phase(
-            b"pnp-snapshot-config-end",
-            storage
-                .as_ref()
-                .map(|cm| cm.devnode_count() as u64)
-                .unwrap_or(u64::MAX),
-        );
-        if storage.as_ref().is_some_and(|cm| cm.devnode_count() != 0) {
-            return storage;
-        }
-        storage.or(system)
+        system
     }
 
     fn pnp_is_root_instance(instance: &str) -> bool {
@@ -22254,7 +22217,7 @@ impl ExecNtHandler {
                     crate::probe_seg!(
                         8,
                         self.mark_mutable_hives_dirty_for_services_order_change(
-                            Self::registry_services_order_key_membership_may_change(canon),
+                            self.registry_services_order_key_membership_may_change(canon),
                         )
                     );
                     // Provenance counters for the LSA/SAM gate specs: keys created by lsasrv's
@@ -22488,7 +22451,9 @@ impl ExecNtHandler {
                         .unwrap_or("")
                 });
                 let services_order_may_change = key_path_for_counters
-                    .is_some_and(Self::registry_services_order_value_write_may_reorder);
+                    .is_some_and(|path| {
+                        self.registry_services_order_value_write_may_reorder(path)
+                    });
                 let mutable_target = if overlay_key_idx(key).is_none() && existing_overlay.is_none()
                 {
                     self.mutable_registry_key(key)
@@ -22760,7 +22725,9 @@ impl ExecNtHandler {
                 if let Some(mutable_key) = self.mutable_registry_key(key) {
                     let services_order_may_change = key_path
                         .as_deref()
-                        .is_some_and(Self::registry_services_order_key_membership_may_change);
+                        .is_some_and(|path| {
+                            self.registry_services_order_key_membership_may_change(path)
+                        });
                     match self.journal_delete_mutable_key(mutable_key) {
                         Ok(()) => {
                             if let Some(path) = key_path.as_deref() {
@@ -22799,7 +22766,9 @@ impl ExecNtHandler {
                     let services_order_may_change = self
                         .registry_target_path(key)
                         .as_deref()
-                        .is_some_and(Self::registry_services_order_value_write_may_reorder);
+                        .is_some_and(|path| {
+                            self.registry_services_order_value_write_may_reorder(path)
+                        });
                     if let Err(status) = self.journal_delete_mutable_value(mutable_key, &name) {
                         return status;
                     }

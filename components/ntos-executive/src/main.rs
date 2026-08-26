@@ -18130,54 +18130,6 @@ fn system_hive_regf() -> Option<RegfHive<'static>> {
     RegfHive::new(bytes)
 }
 
-const SYSTEM_HIVE_PNP_ENUM_SCAN_MAX_DEPTH: usize = 32;
-
-fn system_hive_has_pnp_enum_devnodes() -> bool {
-    let Some(hive) = system_hive_regf() else {
-        return false;
-    };
-    let Ok(selected) = hive.current_control_set_name() else {
-        return false;
-    };
-    let mut enum_path = selected;
-    enum_path.push_str("\\Enum");
-    let Some(enum_key) = hive.open_key(&enum_path) else {
-        return false;
-    };
-    let mut visited = Vec::new();
-    system_hive_regf_key_has_pnp_devnode(&hive, enum_key, 0, &mut visited)
-}
-
-fn system_hive_regf_key_has_pnp_devnode(
-    hive: &RegfHive<'_>,
-    key: KeyRef,
-    depth: usize,
-    visited: &mut Vec<KeyRef>,
-) -> bool {
-    if depth > SYSTEM_HIVE_PNP_ENUM_SCAN_MAX_DEPTH || visited.iter().any(|seen| *seen == key) {
-        return false;
-    }
-    if hive.value_exists(key, "Service")
-        || hive.value_exists(key, "PdoName")
-        || hive.value_exists(key, "Driver")
-        || hive.value_exists(key, "HardwareID")
-        || hive.value_exists(key, "CompatibleIDs")
-    {
-        return true;
-    }
-    visited.push(key);
-    let found = if depth < SYSTEM_HIVE_PNP_ENUM_SCAN_MAX_DEPTH {
-        hive.subkeys_raw(key).into_iter().any(|(_, child)| {
-            !visited.iter().any(|seen| *seen == child)
-                && system_hive_regf_key_has_pnp_devnode(hive, child, depth + 1, visited)
-        })
-    } else {
-        false
-    };
-    let _ = visited.pop();
-    found
-}
-
 unsafe fn storage_config_hive_image_bytes() -> Option<&'static [u8]> {
     let hive_size =
         core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x18) as *const u32) as usize;
@@ -18190,33 +18142,70 @@ unsafe fn storage_config_hive_image_bytes() -> Option<&'static [u8]> {
     ))
 }
 
-unsafe fn cached_config_hive_image_bytes() -> Option<&'static [u8]> {
-    (*core::ptr::addr_of!(CONFIG_HIVE_IMAGE_CACHE)).as_deref()
+unsafe fn boot_system_hive_image_bytes() -> Option<&'static [u8]> {
+    (*core::ptr::addr_of!(BOOT_SYSTEM_HIVE_IMAGE)).as_deref()
 }
 
-unsafe fn cache_config_hive_image_from_storage() -> bool {
-    let Some(bytes) = storage_config_hive_image_bytes() else {
-        CONFIG_HIVE_IMAGE_CACHE_BYTES.store(0, Ordering::Relaxed);
-        return false;
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum BootSystemImageError {
+    GeneratedOverlayMissing,
+    Restore(writable_fs::BootSystemRestoreError),
+    Compose(nt_hive_regf::BootSystemHiveComposeError),
+    Selection(nt_hive_core::CurrentControlSetError),
+    Encode(nt_hive_core::HiveEncodeError),
+}
+
+struct BootSystemImageReport {
+    origin: nt_hive_regf::BootSystemHiveOrigin,
+    snapshot_generation: u64,
+    snapshot_bytes: u64,
+    replayed_sequence: u64,
+    selected_control_set: u32,
+    image_bytes: u64,
+}
+
+unsafe fn prepare_boot_system_hive_image(
+) -> Result<BootSystemImageReport, BootSystemImageError> {
+    let generated = storage_config_hive_image_bytes()
+        .ok_or(BootSystemImageError::GeneratedOverlayMissing)?;
+    let persistence = writable_fs::restore_boot_system_persistence()
+        .map_err(BootSystemImageError::Restore)?;
+    let mut snapshot_generation = 0;
+    let mut snapshot_bytes = 0;
+    let (primary, log) = match persistence {
+        writable_fs::BootSystemPersistence::Absent => (None, Vec::new()),
+        writable_fs::BootSystemPersistence::Restored(restored) => {
+            snapshot_generation = restored.snapshot_generation;
+            snapshot_bytes = restored.snapshot_bytes as u64;
+            (restored.primary, restored.log)
+        }
     };
-    if nt_hive_core::decode_image(bytes).is_err() {
-        CONFIG_HIVE_IMAGE_CACHE_BYTES.store(0, Ordering::Relaxed);
-        return false;
-    }
-    let mut cached = Vec::new();
-    if cached.try_reserve_exact(bytes.len()).is_err() {
-        CONFIG_HIVE_IMAGE_CACHE_BYTES.store(0, Ordering::Relaxed);
-        return false;
-    }
-    cached.extend_from_slice(bytes);
-    let len = cached.len();
-    *core::ptr::addr_of_mut!(CONFIG_HIVE_IMAGE_CACHE) = Some(cached);
-    CONFIG_HIVE_IMAGE_CACHE_BYTES.store(len as u64, Ordering::Relaxed);
-    true
-}
-
-unsafe fn config_hive_image_bytes() -> Option<&'static [u8]> {
-    cached_config_hive_image_bytes().or_else(|| storage_config_hive_image_bytes())
+    let installed = system_hive_regf();
+    let composed = nt_hive_regf::compose_boot_system_hive(
+        installed.as_ref(),
+        primary.as_deref(),
+        &log,
+        generated,
+    )
+    .map_err(BootSystemImageError::Compose)?;
+    let selected_control_set = composed
+        .hive
+        .current_control_set()
+        .map_err(BootSystemImageError::Selection)?
+        .number();
+    let image = nt_hive_core::try_encode_image(&composed.hive)
+        .map_err(BootSystemImageError::Encode)?;
+    let image_bytes = image.len() as u64;
+    *core::ptr::addr_of_mut!(BOOT_SYSTEM_HIVE_IMAGE) = Some(image);
+    BOOT_SYSTEM_HIVE_IMAGE_BYTES.store(image_bytes, Ordering::Release);
+    Ok(BootSystemImageReport {
+        origin: composed.origin,
+        snapshot_generation,
+        snapshot_bytes,
+        replayed_sequence: composed.replayed_sequence,
+        selected_control_set,
+        image_bytes,
+    })
 }
 
 struct ConfigHiveDriverLaunchSpec {
@@ -19521,9 +19510,7 @@ fn current_driver_host_can_boot_launch(
             .load_order_group
             .as_deref()
             .is_some_and(|group| group.eq_ignore_ascii_case(FILE_SYSTEM_LOAD_ORDER_GROUP)),
-        Some(DriverServiceClass::Device) => {
-            cm.service_has_devnodes(&service.name) || cm.is_boot_system_legacy_driver(service)
-        }
+        Some(DriverServiceClass::Device) => cm.is_boot_system_legacy_driver(service),
         None => false,
     }
 }
@@ -19832,8 +19819,8 @@ fn inline_driver_launch_spec_from_pnp_binding(
     (spec.devnode_count != 0).then_some(spec)
 }
 
-fn config_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
-    let hive_bytes = unsafe { config_hive_image_bytes()? };
+fn boot_system_config_manager() -> Option<nt_config_manager::ConfigManager> {
+    let hive_bytes = unsafe { boot_system_hive_image_bytes()? };
     let hive = nt_hive_core::decode_image(hive_bytes).ok()?;
     let selected = hive.current_control_set().ok()?;
     let mut cm = nt_config_manager::ConfigManager::new();
@@ -19881,7 +19868,7 @@ fn mount_live_config_manager_config_hive() -> LiveConfigManagerMountReport {
     let heap_mark = allocator::mark();
     let mut report = LiveConfigManagerMountReport::default();
     {
-        if let Some(image) = unsafe { config_hive_image_bytes() } {
+        if let Some(image) = unsafe { boot_system_hive_image_bytes() } {
             report.bytes = image.len() as u64;
             unsafe {
                 if let Some(client) = CONFIG_CLIENT_PTR.as_mut() {
@@ -19904,11 +19891,14 @@ fn mount_live_config_manager_config_hive() -> LiveConfigManagerMountReport {
 }
 
 fn config_hive_boot_system_driver_launch_spec() -> Option<ConfigHiveDriverLaunchSpec> {
-    let cm = config_hive_config_manager()?;
+    let cm = boot_system_config_manager()?;
     let service = cm
         .boot_system_driver_candidates()
         .into_iter()
-        .find(|service| service.driver_service_class() == Some(DriverServiceClass::FileSystem))?;
+        .find(|service| {
+            service.driver_service_class() == Some(DriverServiceClass::FileSystem)
+                && !current_driver_host_can_boot_launch(&cm, service)
+        })?;
     let (image_path, class) =
         driver_launch_spec_from_service_metadata(&service, SERVICE_SYSTEM_START)?;
     let driver_object_path = service.driver_object_path()?;
@@ -19934,7 +19924,7 @@ fn config_hive_pnp_driver_bindings_for_start(
 fn count_config_hive_pnp_driver_launch_shape(start_type: u32) -> InlineDriverLaunchPlanShape {
     let heap_mark = allocator::mark();
     let mut shape = InlineDriverLaunchPlanShape::default();
-    if let Some(cm) = config_hive_config_manager() {
+    if let Some(cm) = boot_system_config_manager() {
         for binding in config_hive_pnp_driver_bindings_for_start(&cm, start_type) {
             if let Some(header_string_bytes) =
                 inline_driver_launch_spec_header_shape_from_service_metadata(
@@ -19981,7 +19971,7 @@ fn config_hive_pnp_driver_launch_plan_for_start(
         return plan;
     }
     let heap_mark = allocator::mark();
-    if let Some(cm) = config_hive_config_manager() {
+    if let Some(cm) = boot_system_config_manager() {
         for binding in config_hive_pnp_driver_bindings_for_start(&cm, start_type) {
             if inline_driver_launch_spec_header_shape_from_service_metadata(
                 &binding.service,
@@ -20044,27 +20034,6 @@ fn config_hive_demand_pnp_driver_launch_plan() -> &'static InlineDriverLaunchPla
     )
 }
 
-fn system_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
-    let hive = system_hive_regf()?;
-    let selected = hive.current_control_set_name().ok()?;
-    let mut cm = nt_config_manager::ConfigManager::new();
-    let counts = nt_hive_regf::import_control_set_boot_config_into_config_manager(
-        &hive,
-        &mut cm,
-        &selected,
-    );
-    if counts.services == 0 {
-        return None;
-    }
-    let _ = nt_hive_regf::import_control_set_network_into_config_manager(
-        &hive,
-        &mut cm,
-        &selected,
-    );
-    let _ = nt_hive_core::seed_reactos_network_setup_in_config_manager(&mut cm);
-    Some(cm)
-}
-
 fn win32_service_process_kind_code(kind: nt_config_manager::Win32ServiceProcessKind) -> u8 {
     match kind {
         nt_config_manager::Win32ServiceProcessKind::Own => WIN32_SERVICE_PROCESS_KIND_OWN,
@@ -20115,7 +20084,7 @@ fn copy_driver_service_selection(
 fn system_hive_service_selection_report() -> InlineServiceSelectionReport {
     let heap_mark = allocator::mark();
     let mut report = InlineServiceSelectionReport::empty();
-    if let Some(cm) = system_hive_config_manager() {
+    if let Some(cm) = boot_system_config_manager() {
         let auto_win32 = cm.auto_start_win32_service_launch_specs();
         report.auto_win32_count = auto_win32.len() as u64;
         if let Some(spec) = auto_win32.first() {
@@ -20164,7 +20133,7 @@ fn system_hive_service_selection_report() -> InlineServiceSelectionReport {
 fn count_system_hive_boot_driver_launch_shape() -> InlineDriverLaunchPlanShape {
     let heap_mark = allocator::mark();
     let mut shape = InlineDriverLaunchPlanShape::default();
-    if let Some(cm) = system_hive_config_manager() {
+    if let Some(cm) = boot_system_config_manager() {
         for service in cm.boot_system_driver_candidates() {
             if !current_driver_host_can_boot_launch(&cm, &service) {
                 continue;
@@ -20207,7 +20176,7 @@ fn system_hive_boot_driver_launch_plan() -> &'static InlineDriverLaunchPlan {
         return plan;
     }
     let heap_mark = allocator::mark();
-    if let Some(cm) = system_hive_config_manager() {
+    if let Some(cm) = boot_system_config_manager() {
         for service in cm.boot_system_driver_candidates() {
             if !current_driver_host_can_boot_launch(&cm, &service) {
                 continue;
@@ -24431,8 +24400,8 @@ static NLS_CASE_SIZE: AtomicU64 = AtomicU64::new(0);
 /// The frame-cap base + byte size of the real SYSTEM hive the storage host read into HIVEBUF.
 static HIVEBUF_START: AtomicU64 = AtomicU64::new(0);
 static REAL_HIVE_SIZE: AtomicU64 = AtomicU64::new(0);
-static mut CONFIG_HIVE_IMAGE_CACHE: Option<Vec<u8>> = None;
-pub(crate) static CONFIG_HIVE_IMAGE_CACHE_BYTES: AtomicU64 = AtomicU64::new(0);
+static mut BOOT_SYSTEM_HIVE_IMAGE: Option<Vec<u8>> = None;
+pub(crate) static BOOT_SYSTEM_HIVE_IMAGE_BYTES: AtomicU64 = AtomicU64::new(0);
 /// The frame-cap base + byte size of the real SECURITY / SAM hives the storage host read BY PATH
 /// off `\reactos\system32\config\{security,sam}` into SECHIVEBUF / SAMHIVEBUF.
 pub(crate) static SECHIVEBUF_START: AtomicU64 = AtomicU64::new(0);
@@ -27832,17 +27801,32 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     check(b"exec_cm_hive_answer_42", false, &mut passed);
                 }
             }
-            let cached_hive = cache_config_hive_image_from_storage();
-            print_str(b"[cm-hive-cache] generated SYSTEM hive cached=");
-            print_u64(cached_hive as u64);
-            print_str(b" bytes=");
-            print_u64(CONFIG_HIVE_IMAGE_CACHE_BYTES.load(Ordering::Relaxed));
-            print_str(b"\n");
         }
     }
 
+    let boot_system = prepare_boot_system_hive_image()
+        .expect("restore and compose the boot SYSTEM authority");
+    print_str(b"[cm-compose] origin=");
+    print_str(match boot_system.origin {
+        nt_hive_regf::BootSystemHiveOrigin::InstalledRegf => b"installed-regf",
+        nt_hive_regf::BootSystemHiveOrigin::PersistedCore => b"persisted-core",
+        nt_hive_regf::BootSystemHiveOrigin::PersistedRegf => b"persisted-regf",
+        nt_hive_regf::BootSystemHiveOrigin::PersistedJournalOnly => b"persisted-journal-only",
+    });
+    print_str(b" snapshot-generation=");
+    print_u64(boot_system.snapshot_generation);
+    print_str(b" snapshot-bytes=");
+    print_u64(boot_system.snapshot_bytes);
+    print_str(b" replayed-sequence=");
+    print_u64(boot_system.replayed_sequence);
+    print_str(b" selected=");
+    print_u64(boot_system.selected_control_set as u64);
+    print_str(b" image-bytes=");
+    print_u64(boot_system.image_bytes);
+    print_str(b"\n");
+
     let live_cm_mount = mount_live_config_manager_config_hive();
-    print_str(b"[cm-mount] live Config Manager generated SYSTEM hive bytes=");
+    print_str(b"[cm-mount] live Config Manager composed SYSTEM hive bytes=");
     print_u64(live_cm_mount.bytes);
     print_str(b" generation=");
     print_u64(live_cm_mount.generation);

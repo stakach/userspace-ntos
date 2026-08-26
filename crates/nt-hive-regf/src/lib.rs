@@ -27,10 +27,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use nt_config_manager::{
-    ConfigManager, Registry, RegistryKeyId, RegistryValueType, CONTROL_CLASS_PATH,
-    CONTROL_NETWORK_PATH, ENUM_PATH, SERVICES_PATH, SERVICE_GROUP_ORDER_PATH,
-};
+use nt_config_manager::RegistryValueType;
 use nt_hive_core::{CellId, Hive, HiveKind};
 
 const HBIN_BASE: usize = 0x1000;
@@ -1054,6 +1051,7 @@ pub enum BootSystemHiveOrigin {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BootSystemHiveComposeError {
+    InstalledMissing,
     InstalledImport(RegfHiveImportError),
     PersistedFormat,
     PersistedCore(nt_hive_core::HiveDecodeError),
@@ -1076,7 +1074,7 @@ pub struct ComposedBootSystemHive {
 /// present primary is decoded according to its declared magic and never falls through to installed
 /// media after corruption. A journal without a primary remains persisted state, not absence.
 pub fn compose_boot_system_hive(
-    installed: &RegfHive<'_>,
+    installed: Option<&RegfHive<'_>>,
     persisted_primary: Option<&[u8]>,
     persisted_log: &[u8],
     generated_overlay_image: &[u8],
@@ -1095,11 +1093,13 @@ pub fn compose_boot_system_hive(
         }
         Some(_) => return Err(BootSystemHiveComposeError::PersistedFormat),
         None if !persisted_log.is_empty() => {
+            let installed = installed.ok_or(BootSystemHiveComposeError::InstalledMissing)?;
             let (hive, _) = try_import_regf_into_hive(installed, HiveKind::System)
                 .map_err(BootSystemHiveComposeError::InstalledImport)?;
             (hive, BootSystemHiveOrigin::PersistedJournalOnly)
         }
         None => {
+            let installed = installed.ok_or(BootSystemHiveComposeError::InstalledMissing)?;
             let (hive, _) = try_import_regf_into_hive(installed, HiveKind::System)
                 .map_err(BootSystemHiveComposeError::InstalledImport)?;
             (hive, BootSystemHiveOrigin::InstalledRegf)
@@ -1119,170 +1119,6 @@ pub fn compose_boot_system_hive(
     })
 }
 
-/// Import counts for a control-set snapshot loaded into Configuration Manager state.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ControlSetImportCounts {
-    pub services: usize,
-    pub enum_devnodes: usize,
-    pub class_keys: usize,
-    pub service_group_order_values: usize,
-}
-
-/// Import the control-set state needed to select boot/system drivers from a read-only REGF hive.
-pub fn import_control_set_boot_config_into_config_manager(
-    hive: &RegfHive<'_>,
-    cm: &mut ConfigManager,
-    control_set: &str,
-) -> ControlSetImportCounts {
-    ControlSetImportCounts {
-        services: import_control_set_services_into_config_manager(hive, cm, control_set),
-        enum_devnodes: import_control_set_enum_into_config_manager(hive, cm, control_set),
-        class_keys: import_control_set_class_into_config_manager(hive, cm, control_set),
-        service_group_order_values: import_control_set_service_group_order_into_config_manager(
-            hive,
-            cm,
-            control_set,
-        ),
-    }
-}
-
-/// Import `ControlSetXXX\Services` from a read-only REGF hive into
-/// `\Registry\Machine\System\CurrentControlSet\Services`.
-pub fn import_control_set_services_into_config_manager(
-    hive: &RegfHive<'_>,
-    cm: &mut ConfigManager,
-    control_set: &str,
-) -> usize {
-    let mut src_services_path = String::from(control_set);
-    src_services_path.push_str("\\Services");
-    let Some(src_services) = hive.open_key(&src_services_path) else {
-        return 0;
-    };
-    let dst_services = cm.registry_mut().create_key(SERVICES_PATH);
-    let service_names = hive.subkeys_raw(src_services);
-    let count = service_names.len();
-    for (name, src_service) in service_names {
-        let dst_service = cm.registry_mut().create_subkey(dst_services, &name);
-        import_regf_key(hive, src_service, cm.registry_mut(), dst_service);
-    }
-    count
-}
-
-/// Import `ControlSetXXX\Enum` from a read-only REGF hive into
-/// `\Registry\Machine\System\CurrentControlSet\Enum`, then index devnode records from the imported
-/// registry keys.
-pub fn import_control_set_enum_into_config_manager(
-    hive: &RegfHive<'_>,
-    cm: &mut ConfigManager,
-    control_set: &str,
-) -> usize {
-    let mut src_enum_path = String::from(control_set);
-    src_enum_path.push_str("\\Enum");
-    let Some(src_enum) = hive.open_key(&src_enum_path) else {
-        return 0;
-    };
-    let dst_enum = cm.registry_mut().create_key(ENUM_PATH);
-    import_regf_key(hive, src_enum, cm.registry_mut(), dst_enum);
-    cm.index_registry_devnodes()
-}
-
-/// Import `ControlSetXXX\Control\Class` from a read-only REGF hive into
-/// `\Registry\Machine\System\CurrentControlSet\Control\Class`.
-pub fn import_control_set_class_into_config_manager(
-    hive: &RegfHive<'_>,
-    cm: &mut ConfigManager,
-    control_set: &str,
-) -> usize {
-    let mut src_path = String::from(control_set);
-    src_path.push_str("\\Control\\Class");
-    let Some(src_class) = hive.open_key(&src_path) else {
-        return 0;
-    };
-    let dst_class = cm.registry_mut().create_key(CONTROL_CLASS_PATH);
-    let class_names = hive.subkeys_raw(src_class);
-    let count = class_names.len();
-    for (name, src_child) in class_names {
-        let dst_child = cm.registry_mut().create_subkey(dst_class, &name);
-        import_regf_key(hive, src_child, cm.registry_mut(), dst_child);
-    }
-    count
-}
-
-/// Import `ControlSetXXX\Control\Network` from a read-only REGF hive into
-/// `\Registry\Machine\System\CurrentControlSet\Control\Network`.
-pub fn import_control_set_network_into_config_manager(
-    hive: &RegfHive<'_>,
-    cm: &mut ConfigManager,
-    control_set: &str,
-) -> usize {
-    let mut src_path = String::from(control_set);
-    src_path.push_str("\\Control\\Network");
-    let Some(src_network) = hive.open_key(&src_path) else {
-        return 0;
-    };
-    let dst_network = cm.registry_mut().create_key(CONTROL_NETWORK_PATH);
-    let class_names = hive.subkeys_raw(src_network);
-    let count = class_names.len();
-    for (name, src_child) in class_names {
-        let dst_child = cm.registry_mut().create_subkey(dst_network, &name);
-        import_regf_key(hive, src_child, cm.registry_mut(), dst_child);
-    }
-    count
-}
-
-/// Import `ControlSetXXX\Control\ServiceGroupOrder` from a read-only REGF hive into
-/// `\Registry\Machine\System\CurrentControlSet\Control\ServiceGroupOrder`.
-pub fn import_control_set_service_group_order_into_config_manager(
-    hive: &RegfHive<'_>,
-    cm: &mut ConfigManager,
-    control_set: &str,
-) -> usize {
-    let mut src_path = String::from(control_set);
-    src_path.push_str("\\Control\\ServiceGroupOrder");
-    let Some(src_key) = hive.open_key(&src_path) else {
-        return 0;
-    };
-    let value_count = hive.values(src_key).len();
-    let dst_key = cm.registry_mut().create_key(SERVICE_GROUP_ORDER_PATH);
-    import_regf_key(hive, src_key, cm.registry_mut(), dst_key);
-    value_count
-}
-
-fn import_regf_key(hive: &RegfHive<'_>, src: KeyRef, dst: &mut Registry, dst_key: RegistryKeyId) {
-    let mut visited = Vec::new();
-    import_regf_key_inner(hive, src, dst, dst_key, 0, &mut visited);
-}
-
-fn import_regf_key_inner(
-    hive: &RegfHive<'_>,
-    src: KeyRef,
-    dst: &mut Registry,
-    dst_key: RegistryKeyId,
-    depth: usize,
-    visited: &mut Vec<KeyRef>,
-) {
-    if depth > CONFIG_IMPORT_MAX_DEPTH || visited.iter().any(|key| *key == src) {
-        return;
-    }
-    visited.push(src);
-    let mut index = 0usize;
-    while let Some((value_name, raw_type, data)) = hive.value_by_index(src, index) {
-        let value_type = RegistryValueType::from_u32(raw_type).unwrap_or(RegistryValueType::Binary);
-        let _ = dst.set_value(dst_key, &value_name, value_type, data);
-        index += 1;
-    }
-    if depth < CONFIG_IMPORT_MAX_DEPTH {
-        for (child_name, src_child) in hive.subkeys_raw(src) {
-            if visited.iter().any(|key| *key == src_child) {
-                continue;
-            }
-            let dst_child = dst.create_subkey(dst_key, &child_name);
-            import_regf_key_inner(hive, src_child, dst, dst_child, depth + 1, visited);
-        }
-    }
-    let _ = visited.pop();
-}
-
 /// Fold a path component for case-insensitive comparison.
 fn fold(s: &str) -> String {
     let mut out = String::new();
@@ -1297,6 +1133,7 @@ fn fold(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nt_config_manager::ConfigManager;
 
     fn write_u16(data: &mut [u8], offset: usize, value: u16) {
         data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
@@ -1749,52 +1586,17 @@ mod tests {
                 utf16le_sz(r"system32\drivers\npfs.sys").len()
             ))
         );
-
-        let mut cm = ConfigManager::new();
-        assert_eq!(
-            import_control_set_services_into_config_manager(&hive, &mut cm, "ControlSet001"),
-            1
-        );
-        let svc = cm.service_metadata("npfs").expect("imported service");
-        assert_eq!(svc.name, "Npfs");
-        assert_eq!(
-            svc.image_path.as_deref(),
-            Some(r"system32\drivers\npfs.sys")
-        );
-        assert_eq!(
-            svc.driver_service_class(),
-            Some(nt_config_manager::DriverServiceClass::FileSystem)
-        );
-        let drivers = cm.boot_system_driver_candidates();
-        assert_eq!(drivers.len(), 1);
-        assert_eq!(drivers[0].name, "Npfs");
-
-        let answer = cm
-            .registry()
-            .open_key(r"\Registry\Machine\System\CurrentControlSet\Services\Npfs\Parameters")
-            .and_then(|key| cm.registry().query_dword(key, "Answer"));
-        assert_eq!(answer, Some(42));
     }
 
     #[test]
-    fn config_manager_import_skips_cyclic_regf_subtrees() {
+    fn lossless_import_rejects_malformed_subkey_graphs() {
         let mut data = services_test_hive();
         write_subkey_list(&mut data, 0x440, &[0x300, 0x240]);
         let hive = RegfHive::new(&data).expect("valid test hive");
-
-        let mut cm = ConfigManager::new();
         assert_eq!(
-            import_control_set_services_into_config_manager(&hive, &mut cm, "ControlSet001"),
-            1
+            try_import_regf_into_hive(&hive, HiveKind::System).err(),
+            Some(RegfHiveImportError::InvalidSubkeyList)
         );
-        assert!(cm
-            .registry()
-            .open_key(r"\Registry\Machine\System\CurrentControlSet\Services\Npfs\Parameters")
-            .is_some());
-        assert!(cm
-            .registry()
-            .open_key(r"\Registry\Machine\System\CurrentControlSet\Services\Npfs\Npfs")
-            .is_none());
     }
 
     #[test]
@@ -2150,19 +1952,34 @@ mod tests {
     #[test]
     fn imports_boot_config_into_config_manager() {
         let data = services_test_hive();
-        let hive = RegfHive::new(&data).expect("valid test hive");
+        let source = RegfHive::new(&data).expect("valid test hive");
+        let (hive, _) =
+            try_import_regf_into_hive(&source, HiveKind::System).expect("lossless import");
+        let selected = hive.current_control_set().expect("selected control set");
         let mut cm = ConfigManager::new();
-        let counts =
-            import_control_set_boot_config_into_config_manager(&hive, &mut cm, "ControlSet001");
-
         assert_eq!(
-            counts,
-            ControlSetImportCounts {
-                services: 1,
-                enum_devnodes: 1,
-                class_keys: 0,
-                service_group_order_values: 1,
-            }
+            nt_hive_core::import_control_set_services_into_config_manager(
+                &hive,
+                &mut cm,
+                selected.as_str(),
+            ),
+            1
+        );
+        assert_eq!(
+            nt_hive_core::import_control_set_enum_into_config_manager(
+                &hive,
+                &mut cm,
+                selected.as_str(),
+            ),
+            1
+        );
+        assert_eq!(
+            nt_hive_core::import_control_set_service_group_order_into_config_manager(
+                &hive,
+                &mut cm,
+                selected.as_str(),
+            ),
+            1
         );
         assert_eq!(
             cm.service_group_order(),
@@ -2356,12 +2173,22 @@ mod tests {
             .current_control_set_name()
             .expect("staged SYSTEM hive must select an existing control set");
         assert_eq!(selected, "ControlSet001");
+        let (hive, _) =
+            try_import_regf_into_hive(&hive, HiveKind::System).expect("lossless SYSTEM import");
         let mut cm = ConfigManager::new();
-        let counts = import_control_set_boot_config_into_config_manager(&hive, &mut cm, &selected);
-        assert!(counts.services > 0, "expected imported service keys");
-        eprintln!("imported Enum devnodes: {}", counts.enum_devnodes);
+        let services = nt_hive_core::import_control_set_services_into_config_manager(
+            &hive, &mut cm, &selected,
+        );
+        let enum_devnodes =
+            nt_hive_core::import_control_set_enum_into_config_manager(&hive, &mut cm, &selected);
+        let service_group_order_values =
+            nt_hive_core::import_control_set_service_group_order_into_config_manager(
+                &hive, &mut cm, &selected,
+            );
+        assert!(services > 0, "expected imported service keys");
+        eprintln!("imported Enum devnodes: {enum_devnodes}");
         assert!(
-            counts.service_group_order_values > 0,
+            service_group_order_values > 0,
             "expected ServiceGroupOrder values"
         );
         assert!(
@@ -2468,9 +2295,13 @@ mod tests {
             base_sequence + 1,
         );
 
-        let composed =
-            compose_boot_system_hive(&installed, Some(&primary), &log, &generated_overlay_image())
-                .expect("compose persisted SYSTEM");
+        let composed = compose_boot_system_hive(
+            Some(&installed),
+            Some(&primary),
+            &log,
+            &generated_overlay_image(),
+        )
+        .expect("compose persisted SYSTEM");
         assert_eq!(composed.origin, BootSystemHiveOrigin::PersistedCore);
         assert_eq!(composed.replayed_sequence, base_sequence + 1);
         assert_eq!(
@@ -2512,7 +2343,12 @@ mod tests {
         primary[last] ^= 0xff;
 
         assert!(matches!(
-            compose_boot_system_hive(&installed, Some(&primary), &[], &generated_overlay_image()),
+            compose_boot_system_hive(
+                Some(&installed),
+                Some(&primary),
+                &[],
+                &generated_overlay_image(),
+            ),
             Err(BootSystemHiveComposeError::PersistedCore(
                 nt_hive_core::HiveDecodeError::BadChecksum
             ))
@@ -2523,8 +2359,9 @@ mod tests {
     fn boot_system_composition_uses_installed_regf_only_when_persistence_is_absent() {
         let installed_bytes = services_test_hive();
         let installed = RegfHive::new(&installed_bytes).expect("installed REGF");
-        let composed = compose_boot_system_hive(&installed, None, &[], &generated_overlay_image())
-            .expect("first-boot composition");
+        let composed =
+            compose_boot_system_hive(Some(&installed), None, &[], &generated_overlay_image())
+                .expect("first-boot composition");
         assert_eq!(composed.origin, BootSystemHiveOrigin::InstalledRegf);
         assert!(composed
             .hive
