@@ -133,6 +133,39 @@ impl ParkedSyscallReply {
         self.registers[15]
     }
 
+    /// Saved user stack pointer for a hosted UnknownSyscall continuation.
+    pub const fn resume_sp(self) -> u64 {
+        self.registers[16]
+    }
+
+    /// Saved user flags for a hosted UnknownSyscall continuation.
+    pub const fn resume_flags(self) -> u64 {
+        self.registers[17]
+    }
+
+    /// Return a new continuation with debugger-edited resume coordinates.
+    ///
+    /// Native seL4-Call continuations have no hosted fault register file, so edits are ignored.
+    pub const fn with_resume_context(
+        mut self,
+        resume_ip: Option<u64>,
+        resume_sp: Option<u64>,
+        resume_flags: Option<u64>,
+    ) -> Self {
+        if !self.native_call {
+            if let Some(value) = resume_ip {
+                self.registers[15] = value;
+            }
+            if let Some(value) = resume_sp {
+                self.registers[16] = value;
+            }
+            if let Some(value) = resume_flags {
+                self.registers[17] = value;
+            }
+        }
+        self
+    }
+
     /// Produce the exact reply register file with only RAX/MR0 replaced by the terminal NTSTATUS.
     pub const fn registers_with_status(self, status: u64) -> [u64; 18] {
         let mut registers = self.registers;

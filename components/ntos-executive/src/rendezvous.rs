@@ -7,6 +7,15 @@ use crate::*;
 static RENDEZVOUS_TIMER_TICKS_ABSORBED: AtomicU64 = AtomicU64::new(0);
 static CSR_API_RDV_TRACE: AtomicU64 = AtomicU64::new(0);
 
+/// Dedicated SM/CSR worker threads always use our native seL4-Call ntdll transport.
+unsafe fn reply_native_rendezvous(reply: u64, status: u64) -> bool {
+    reply_parked_syscall(
+        reply,
+        nt_syscall_abi::ParkedSyscallReply::native_call(),
+        status,
+    )
+}
+
 unsafe fn rendezvous_recv_full_r12(
     ep: u64,
     reply: u64,
@@ -834,10 +843,7 @@ pub(crate) unsafe fn sm_rendezvous(
             print_str(b"/");
             print_u64(connector_tid);
             print_str(b"\n");
-            set_reply_mr(15, 0);
-            set_reply_mr(16, SM_RECV_SP.load(Ordering::Relaxed));
-            set_reply_mr(17, SM_RECV_FLAGS.load(Ordering::Relaxed));
-            client_reply_on(reply, 18, 0, 0, 0, SM_RECV_RDX.load(Ordering::Relaxed));
+            reply_native_rendezvous(reply, 0);
             rendezvous_recv_full_r12(ep, reply, b"[sm-rdv]")
         } else {
             rendezvous_recv_full_r12(ep, reply, b"[sm-rdv]")
@@ -934,9 +940,7 @@ pub(crate) unsafe fn sm_rendezvous(
         if label == 2 {
             // A real Nt* syscall from SmpApiLoop.
             let ssn = m0;
-            let resume_ip = m2;
             let sp = get_recv_mr(16);
-            let flags = get_recv_mr(17);
             let rdx = m3;
             let mut result = 0u64;
             let mut stop_rdv = false;
@@ -1044,8 +1048,6 @@ pub(crate) unsafe fn sm_rendezvous(
                             // reply. It re-blocks on this NtReplyWaitReceivePort until the next connect.
                             SM_RECVMSG.store(recvmsg, Ordering::Relaxed);
                             SM_RECVPORT.store(port, Ordering::Relaxed);
-                            SM_RECV_SP.store(sp, Ordering::Relaxed);
-                            SM_RECV_FLAGS.store(flags, Ordering::Relaxed);
                             SM_RECV_RDX.store(rdx, Ordering::Relaxed);
                             SM_RECEIVE_PARKED.store(1, Ordering::Relaxed);
                             stop_rdv = true;
@@ -1140,10 +1142,7 @@ pub(crate) unsafe fn sm_rendezvous(
             if stop_rdv {
                 break;
             }
-            set_reply_mr(15, resume_ip);
-            set_reply_mr(16, sp);
-            set_reply_mr(17, flags);
-            client_reply_on(reply, 18, result, 0, 0, rdx);
+            reply_native_rendezvous(reply, result);
             let (_b, nmi, nm0, nm1, nm2, nm3) = rendezvous_recv_full_r12(ep, reply, b"[sm-rdv]");
             mi = nmi;
             m0 = nm0;
@@ -1260,10 +1259,7 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
     if context_out != 0 {
         sm_stack_write(context_out, received.port_context);
     }
-    set_reply_mr(15, 0);
-    set_reply_mr(16, SM_RECV_SP.load(Ordering::Relaxed));
-    set_reply_mr(17, SM_RECV_FLAGS.load(Ordering::Relaxed));
-    client_reply_on(reply, 18, 0, 0, 0, 0);
+    reply_native_rendezvous(reply, 0);
 
     let mut fill_idx = 0;
     let (_badge, mut mi, mut m0, mut m1, mut m2, mut m3) =
@@ -1317,7 +1313,6 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
             2 => {
                 let ssn = m0;
                 let sp = get_recv_mr(16);
-                let flags = get_recv_mr(17);
                 let rdx = m3;
                 let mut result = 0u64;
                 print_str(b"[sm-api] worker SSN=");
@@ -1471,8 +1466,6 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
                         }
                         SM_RECVMSG.store(get_recv_mr(8), Ordering::Relaxed);
                         SM_RECVPORT.store(get_recv_mr(9), Ordering::Relaxed);
-                        SM_RECV_SP.store(sp, Ordering::Relaxed);
-                        SM_RECV_FLAGS.store(flags, Ordering::Relaxed);
                         SM_RECV_RDX.store(rdx, Ordering::Relaxed);
                         SM_RECEIVE_PARKED.store(1, Ordering::Relaxed);
                         print_str(b"[sm-api] real SmpApiLoop reply completed\n");
@@ -1485,10 +1478,7 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
                         return false;
                     }
                 }
-                set_reply_mr(15, 0);
-                set_reply_mr(16, sp);
-                set_reply_mr(17, flags);
-                client_reply_on(reply, 18, result, 0, 0, rdx);
+                reply_native_rendezvous(reply, result);
             }
             0 => {
                 print_str(b"[csr-api] empty label while draining worker -> ack and continue\n");
@@ -1636,10 +1626,7 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
     print_u64(request_len as u64);
     print_str(b" to real CsrApiRequestThread\n");
 
-    set_reply_mr(15, 0);
-    set_reply_mr(16, CSR_API_RECV_SP.load(Ordering::Relaxed));
-    set_reply_mr(17, CSR_API_RECV_FLAGS.load(Ordering::Relaxed));
-    client_reply_on(reply, 18, 0, 0, 0, CSR_API_RECV_RDX.load(Ordering::Relaxed));
+    reply_native_rendezvous(reply, 0);
 
     let mut fill_idx = 0;
     let (_badge, mut mi, mut m0, mut m1, mut m2, mut m3) =
@@ -1720,7 +1707,6 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                 let ssn = m0;
                 let resume_ip = m2;
                 let sp = get_recv_mr(16);
-                let flags = get_recv_mr(17);
                 let rdx = m3;
                 let mut result = 0u64;
                 match ssn {
@@ -2085,8 +2071,6 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                         }
                         CSR_API_RECVMSG.store(recv_msg, Ordering::Relaxed);
                         CSR_API_RECVPORT.store(get_recv_mr(9), Ordering::Relaxed);
-                        CSR_API_RECV_SP.store(sp, Ordering::Relaxed);
-                        CSR_API_RECV_FLAGS.store(flags, Ordering::Relaxed);
                         CSR_API_RECV_RDX.store(rdx, Ordering::Relaxed);
                         CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
                         if reply_len == 0 {
@@ -2131,10 +2115,7 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                         return false;
                     }
                 }
-                set_reply_mr(15, resume_ip);
-                set_reply_mr(16, sp);
-                set_reply_mr(17, flags);
-                client_reply_on(reply, 18, result, 0, 0, rdx);
+                reply_native_rendezvous(reply, result);
             }
             label => {
                 print_str(b"[csr-api] unexpected worker label=");
@@ -2316,8 +2297,6 @@ pub(crate) unsafe fn csr_sb_startup(
             2 if m0 == SSN_REPLY_WAIT_RECV => {
                 CSR_SB_RECVMSG.store(get_recv_mr(8), Ordering::Relaxed);
                 CSR_SB_RECVPORT.store(get_recv_mr(9), Ordering::Relaxed);
-                CSR_SB_RECV_SP.store(get_recv_mr(16), Ordering::Relaxed);
-                CSR_SB_RECV_FLAGS.store(get_recv_mr(17), Ordering::Relaxed);
                 CSR_SB_RECV_RDX.store(m3, Ordering::Relaxed);
                 CSR_SB_RECEIVE_PARKED.store(1, Ordering::Relaxed);
                 print_str(b"[csr-sb] real worker parked on NtReplyWaitReceivePort\n");
@@ -3330,10 +3309,7 @@ unsafe fn csr_sb_accept_connection(
     csr_sb_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST);
     csr_sb_stack_write(recvmsg + 0x08, smss_pid);
     csr_sb_stack_write(recvmsg + 0x10, smss_tid);
-    set_reply_mr(15, 0);
-    set_reply_mr(16, CSR_SB_RECV_SP.load(Ordering::Relaxed));
-    set_reply_mr(17, CSR_SB_RECV_FLAGS.load(Ordering::Relaxed));
-    client_reply_on(reply, 18, 0, 0, 0, CSR_SB_RECV_RDX.load(Ordering::Relaxed));
+    reply_native_rendezvous(reply, 0);
 
     let mut client_handle = 0;
     let mut fill_idx = 0;
@@ -3388,8 +3364,6 @@ unsafe fn csr_sb_accept_connection(
             }
             2 => {
                 let ssn = m0;
-                let sp = get_recv_mr(16);
-                let flags = get_recv_mr(17);
                 let rdx = m3;
                 match ssn {
                     SSN_ACCEPT_CONNECT => {
@@ -3410,8 +3384,6 @@ unsafe fn csr_sb_accept_connection(
                     SSN_REPLY_WAIT_RECV => {
                         CSR_SB_RECVMSG.store(get_recv_mr(8), Ordering::Relaxed);
                         CSR_SB_RECVPORT.store(get_recv_mr(9), Ordering::Relaxed);
-                        CSR_SB_RECV_SP.store(sp, Ordering::Relaxed);
-                        CSR_SB_RECV_FLAGS.store(flags, Ordering::Relaxed);
                         CSR_SB_RECV_RDX.store(rdx, Ordering::Relaxed);
                         CSR_SB_RECEIVE_PARKED.store(1, Ordering::Relaxed);
                         print_str(
@@ -3426,10 +3398,7 @@ unsafe fn csr_sb_accept_connection(
                         return 0;
                     }
                 }
-                set_reply_mr(15, 0);
-                set_reply_mr(16, sp);
-                set_reply_mr(17, flags);
-                client_reply_on(reply, 18, 0, 0, 0, rdx);
+                reply_native_rendezvous(reply, 0);
             }
             _ => return 0,
         }
@@ -3546,10 +3515,7 @@ unsafe fn csr_sb_api_request_rendezvous(
     if context_out != 0 {
         csr_sb_stack_write(context_out, received.port_context);
     }
-    set_reply_mr(15, 0);
-    set_reply_mr(16, CSR_SB_RECV_SP.load(Ordering::Relaxed));
-    set_reply_mr(17, CSR_SB_RECV_FLAGS.load(Ordering::Relaxed));
-    client_reply_on(reply, 18, 0, 0, 0, 0);
+    reply_native_rendezvous(reply, 0);
 
     let mut fill_idx = 0;
     let (_badge, mut mi, mut m0, mut m1, mut m2, mut m3) =
@@ -3605,7 +3571,6 @@ unsafe fn csr_sb_api_request_rendezvous(
             2 => {
                 let ssn = m0;
                 let sp = get_recv_mr(16);
-                let flags = get_recv_mr(17);
                 let rdx = m3;
                 let mut result = 0u64;
                 print_str(b"[csr-sb-api] worker SSN=");
@@ -3782,8 +3747,6 @@ unsafe fn csr_sb_api_request_rendezvous(
                         }
                         CSR_SB_RECVMSG.store(get_recv_mr(8), Ordering::Relaxed);
                         CSR_SB_RECVPORT.store(get_recv_mr(9), Ordering::Relaxed);
-                        CSR_SB_RECV_SP.store(sp, Ordering::Relaxed);
-                        CSR_SB_RECV_FLAGS.store(flags, Ordering::Relaxed);
                         CSR_SB_RECV_RDX.store(rdx, Ordering::Relaxed);
                         CSR_SB_RECEIVE_PARKED.store(1, Ordering::Relaxed);
                         print_str(b"[csr-sb-api] real SbpCreateSession reply completed\n");
@@ -3796,10 +3759,7 @@ unsafe fn csr_sb_api_request_rendezvous(
                         return false;
                     }
                 }
-                set_reply_mr(15, 0);
-                set_reply_mr(16, sp);
-                set_reply_mr(17, flags);
-                client_reply_on(reply, 18, result, 0, 0, rdx);
+                reply_native_rendezvous(reply, result);
             }
             _ => return false,
         }
@@ -3885,10 +3845,7 @@ pub(crate) unsafe fn csr_rendezvous(
                 recvmsg + 0x10,
                 hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi),
             );
-            set_reply_mr(15, 0);
-            set_reply_mr(16, CSR_API_RECV_SP.load(Ordering::Relaxed));
-            set_reply_mr(17, CSR_API_RECV_FLAGS.load(Ordering::Relaxed));
-            client_reply_on(reply, 18, 0, 0, 0, CSR_API_RECV_RDX.load(Ordering::Relaxed));
+            reply_native_rendezvous(reply, 0);
             rendezvous_recv_full_r12(ep, reply, b"[csr-rdv]")
         } else {
             rendezvous_recv_full_r12(ep, reply, b"[csr-rdv]")
@@ -3983,9 +3940,7 @@ pub(crate) unsafe fn csr_rendezvous(
         }
         if label == 2 {
             let ssn = m0;
-            let resume_ip = m2;
             let sp = get_recv_mr(16);
-            let flags = get_recv_mr(17);
             let rdx = m3;
             let mut result = 0u64;
             match ssn {
@@ -4114,8 +4069,6 @@ pub(crate) unsafe fn csr_rendezvous(
                             // No pending connection (the re-park receive): leave the thread PARKED.
                             CSR_API_RECVMSG.store(recvmsg, Ordering::Relaxed);
                             CSR_API_RECVPORT.store(port, Ordering::Relaxed);
-                            CSR_API_RECV_SP.store(sp, Ordering::Relaxed);
-                            CSR_API_RECV_FLAGS.store(flags, Ordering::Relaxed);
                             CSR_API_RECV_RDX.store(rdx, Ordering::Relaxed);
                             CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
                             print_str(b"[csr-rdv] real API worker parked on NtReplyWaitReceivePort port=0x");
@@ -4159,10 +4112,7 @@ pub(crate) unsafe fn csr_rendezvous(
                     break;
                 }
             }
-            set_reply_mr(15, resume_ip);
-            set_reply_mr(16, sp);
-            set_reply_mr(17, flags);
-            client_reply_on(reply, 18, result, 0, 0, rdx);
+            reply_native_rendezvous(reply, result);
             let (_b, nmi, nm0, nm1, nm2, nm3) = rendezvous_recv_full_r12(ep, reply, b"[csr-rdv]");
             mi = nmi;
             m0 = nm0;

@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-08-26
+Last updated: 2026-08-27
 
 ## Objective
 
@@ -13068,3 +13068,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     to the shared full-register value, deleting redundant reply arrays/triples where possible. Then
     consolidate immutable snapshot-bank server mechanics before beginning CM mutation leases and
     the explicit win32k CM transport.
+
+    Global parked-continuation audit (2026-08-27, implementation green): GUI message waiters now
+    retain the complete `ParkedSyscallReply` captured at the original `NtUserGetMessage` call and use
+    its resume accessors only while temporarily restoring the win32k client context. Debug-event
+    reporter blocks retain a complete syscall continuation separately from the three-register
+    `UserException` reply shape; debugger context edits replace only RIP/RSP/RFLAGS inside that
+    snapshot. Deferred out-of-order `NtCallbackReturn` ownership likewise retains the complete
+    callback-return syscall snapshot while its length-zero release remains deliberately owned by the
+    callback stack's already-restored TCB context.
+
+    Dynamic CSR and LSA rendezvous now retain complete server and client syscall replies and overlay
+    only terminal status on wake. Their former RIP/RSP/RFLAGS records and partial 18-word reply
+    helpers are deleted. The separate SM, CSR API, and CSR SB bootstrap workers are proven native
+    seL4-Call clients (`native: true` at every spawn), so their parked receives now use the shared
+    one-word native reply helper; obsolete saved SP/RFLAGS cells are deleted, while RDX remains only
+    where it is the real `PortContext` output address.
+
+    The closing scan classifies File continuations as complete rather than lossy. Pending File I/O,
+    cleanup, and cancel-drain owners already retain all 18 hosted registers plus the native transport
+    discriminator. Synchronous FILE_OBJECT acquisition additionally retains the original request MRs
+    and retry IP because promotion replays an operation that never dispatched; those fields are
+    required request state, not a partial terminal reply. Pending driver starts now use
+    `ParkedSyscallReply` directly, and the last immediate error path no longer borrows ambient MRs.
+    Syscall ABI tests cover debugger-edited resume coordinates without changing any other register.
+
+    Review adjustment: the no-ambient-MR correctness audit is closed. Next consolidate the repeated
+    immutable snapshot-bank server mechanics, including the equivalent complete File reply arrays
+    where doing so does not erase synchronous retry request state. Then begin CM-owned SYSTEM
+    mutation leases/journalling and route win32k registry calls through an explicit CM transport.

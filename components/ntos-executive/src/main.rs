@@ -3344,8 +3344,6 @@ static REPLY_SMLOOP_SLOT: AtomicU64 = AtomicU64::new(0);
 static SM_RECEIVE_PARKED: AtomicU64 = AtomicU64::new(0);
 static SM_RECVMSG: AtomicU64 = AtomicU64::new(0);
 static SM_RECVPORT: AtomicU64 = AtomicU64::new(0);
-static SM_RECV_SP: AtomicU64 = AtomicU64::new(0);
-static SM_RECV_FLAGS: AtomicU64 = AtomicU64::new(0);
 static SM_RECV_RDX: AtomicU64 = AtomicU64::new(0);
 /// Set once the SM_FILL_SCRATCH_BASE page table is created (lazily, in the first rendezvous).
 static SM_FILL_PT_DONE: AtomicU64 = AtomicU64::new(0);
@@ -3364,14 +3362,10 @@ static REPLY_CSR_SB_SLOT: AtomicU64 = AtomicU64::new(0);
 static CSR_API_RECEIVE_PARKED: AtomicU64 = AtomicU64::new(0);
 static CSR_API_RECVMSG: AtomicU64 = AtomicU64::new(0);
 static CSR_API_RECVPORT: AtomicU64 = AtomicU64::new(0);
-static CSR_API_RECV_SP: AtomicU64 = AtomicU64::new(0);
-static CSR_API_RECV_FLAGS: AtomicU64 = AtomicU64::new(0);
 static CSR_API_RECV_RDX: AtomicU64 = AtomicU64::new(0);
 static CSR_SB_RECEIVE_PARKED: AtomicU64 = AtomicU64::new(0);
 static CSR_SB_RECVMSG: AtomicU64 = AtomicU64::new(0);
 static CSR_SB_RECVPORT: AtomicU64 = AtomicU64::new(0);
-static CSR_SB_RECV_SP: AtomicU64 = AtomicU64::new(0);
-static CSR_SB_RECV_FLAGS: AtomicU64 = AtomicU64::new(0);
 static CSR_SB_RECV_RDX: AtomicU64 = AtomicU64::new(0);
 /// Set once the CSR_FILL_SCRATCH_BASE page table is created (lazily, in the first rendezvous).
 static CSR_FILL_PT_DONE: AtomicU64 = AtomicU64::new(0);
@@ -16582,6 +16576,7 @@ unsafe fn dbgk_reporter_park(
     pi: usize,
     tid: u64,
     badge: u64,
+    syscall_reply: nt_syscall_abi::ParkedSyscallReply,
     resume_ip: u64,
     sp: u64,
     flags: u64,
@@ -16600,6 +16595,7 @@ unsafe fn dbgk_reporter_park(
         pi: pi as u32,
         tid,
         badge,
+        syscall_reply,
         resume_ip,
         resume_sp: sp,
         resume_flags: flags,
@@ -16630,10 +16626,7 @@ unsafe fn dbgk_reporter_resume(
     }
     match block.kind {
         DBGK_BLOCK_SYSCALL => {
-            set_reply_mr(15, block.resume_ip);
-            set_reply_mr(16, block.resume_sp);
-            set_reply_mr(17, block.resume_flags);
-            client_reply_on(block.reply_cap, 18, block.resume_status, 0, 0, 0);
+            reply_parked_syscall(block.reply_cap, block.syscall_reply, block.resume_status);
         }
         DBGK_BLOCK_USER_EXCEPTION => {
             client_reply_on(
@@ -21755,8 +21748,7 @@ struct NativeDriverStartReply {
     tid: u64,
     badge: u64,
     reply_cap: u64,
-    native_call_transport: bool,
-    reply_mrs: [u64; 18],
+    reply: nt_syscall_abi::ParkedSyscallReply,
 }
 
 enum PendingDriverStartOwner {

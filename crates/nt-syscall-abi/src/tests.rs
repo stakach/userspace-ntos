@@ -272,6 +272,28 @@ fn parked_unknown_syscall_reply_preserves_every_non_status_register() {
 }
 
 #[test]
+fn debugger_resume_edits_preserve_the_parked_register_file() {
+    let original = core::array::from_fn(|index| 0x2000 + index as u64);
+    let parked = ParkedSyscallReply::unknown_syscall(original, 1, 2, 3).with_resume_context(
+        Some(0xaaaa),
+        None,
+        Some(0xcccc),
+    );
+    let resumed = parked.registers_with_status(0x55);
+
+    assert_eq!(resumed[0], 0x55);
+    assert_eq!(&resumed[1..15], &original[1..15]);
+    assert_eq!(&resumed[15..], &[0xaaaa, 2, 0xcccc]);
+
+    let native = ParkedSyscallReply::native_call().with_resume_context(
+        Some(0xaaaa),
+        Some(0xbbbb),
+        Some(0xcccc),
+    );
+    assert_eq!(native, ParkedSyscallReply::native_call());
+}
+
+#[test]
 fn parked_native_call_uses_a_one_word_reply() {
     let parked = ParkedSyscallReply::native_call();
     let resumed = parked.registers_with_status(0xc000_0001);

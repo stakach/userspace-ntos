@@ -254,9 +254,7 @@ struct GuiMessageWaiter {
     filter_max: u64,
     caller_sp: u64,
     reply_cap: u64,
-    resume_ip: u64,
-    resume_sp: u64,
-    resume_flags: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
 }
 
 impl GuiMessageWaiter {
@@ -272,9 +270,7 @@ impl GuiMessageWaiter {
         filter_max: 0,
         caller_sp: 0,
         reply_cap: 0,
-        resume_ip: 0,
-        resume_sp: 0,
-        resume_flags: 0,
+        reply: nt_syscall_abi::ParkedSyscallReply::native_call(),
     };
 }
 
@@ -485,9 +481,7 @@ struct DeferredCallbackReturn {
     result_pointer: u64,
     result_length: u64,
     callback_status: u64,
-    resume_ip: u64,
-    resume_sp: u64,
-    resume_flags: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
     reply_cap: u64,
 }
 
@@ -500,9 +494,7 @@ impl DeferredCallbackReturn {
         result_pointer: 0,
         result_length: 0,
         callback_status: 0,
-        resume_ip: 0,
-        resume_sp: 0,
-        resume_flags: 0,
+        reply: nt_syscall_abi::ParkedSyscallReply::native_call(),
         reply_cap: 0,
     };
 
@@ -627,9 +619,7 @@ unsafe fn defer_user_callback_return(
     result_pointer: u64,
     result_length: u64,
     callback_status: u64,
-    resume_ip: u64,
-    resume_sp: u64,
-    resume_flags: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
 ) -> bool {
     let table = &mut *core::ptr::addr_of_mut!(DEFERRED_CALLBACK_RETURNS);
     let Some(slot) = (0..DEFERRED_CALLBACK_RETURN_N).find(|&index| !table[index].used) else {
@@ -648,9 +638,7 @@ unsafe fn defer_user_callback_return(
         result_pointer,
         result_length,
         callback_status,
-        resume_ip,
-        resume_sp,
-        resume_flags,
+        reply,
         reply_cap,
     };
     let count = USER_CALLBACK_DEFERRED_RETURNS_PARKED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -897,9 +885,9 @@ unsafe fn drain_deferred_user_callback_returns(
             deferred.result_pointer,
             deferred.result_length,
             deferred.callback_status,
-            deferred.resume_ip,
-            deferred.resume_sp,
-            deferred.resume_flags,
+            deferred.reply.resume_ip(),
+            deferred.reply.resume_sp(),
+            deferred.reply.resume_flags(),
         );
         let mut effects_ok;
         if let Some(completion) = completion {
@@ -5730,8 +5718,18 @@ pub(crate) unsafe fn service_sec_image(
     // debugger that never continues still lets the boot reach the gate.
     macro_rules! dbgk_block_and_park {
         ($pi:expr, $kind:expr, $ip:expr, $sp:expr, $flags:expr) => {{
-            let __blocked =
-                nt_handler.dbgk_block_reporter($pi, 0, badge, $kind, 0, $ip, $sp, $flags, 0);
+            let __blocked = nt_handler.dbgk_block_reporter(
+                $pi,
+                0,
+                badge,
+                $kind,
+                0,
+                nt_syscall_abi::ParkedSyscallReply::native_call(),
+                $ip,
+                $sp,
+                $flags,
+                0,
+            );
             if __blocked {
                 print_str(b"[dbgk] reporter BLOCKED on continue (fault kind=");
                 print_u64($kind as u64);
@@ -8703,9 +8701,7 @@ pub(crate) unsafe fn service_sec_image(
                             get_recv_mr(9),
                             m3,
                             get_recv_mr(7),
-                            resume_ip,
-                            sp,
-                            flags,
+                            parked_syscall_reply,
                         ) {
                             procs[pi].faults = faults;
                             procs[pi].first = first;
@@ -8725,7 +8721,7 @@ pub(crate) unsafe fn service_sec_image(
                             b"[user-callback] unable to defer out-of-order NtCallbackReturn -> STATUS_INSUFFICIENT_RESOURCES\n",
                         );
                         let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                        client_reply_on(reply_main, 18, 0xC000_009A, m1, 0, m3);
+                        reply_parked_syscall(reply_main, parked_syscall_reply, 0xC000_009A);
                         let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, reply_main);
                         badge = nb;
                         mi = nmi;
@@ -8863,9 +8859,7 @@ pub(crate) unsafe fn service_sec_image(
                     get_recv_mr(8),
                     get_recv_mr(9),
                     m3,
-                    resume_ip,
-                    sp,
-                    flags,
+                    parked_syscall_reply,
                 ) {
                     procs[pi].faults = faults;
                     procs[pi].first = first;
@@ -8913,7 +8907,7 @@ pub(crate) unsafe fn service_sec_image(
                 if replymsg != 0 {
                     let _ = lsa_deliver_reply(&mut nt_handler, replymsg);
                 }
-                if lsa_server_park(badge, pi, recvmsg, ctx_out, resume_ip, sp, flags) {
+                if lsa_server_park(badge, pi, recvmsg, ctx_out, parked_syscall_reply) {
                     let delivered_waiting_client = lsa_try_deliver_pending_connect(&mut nt_handler)
                         || lsa_try_deliver_pending_request(&mut nt_handler);
                     if delivered_waiting_client {
@@ -8993,9 +8987,7 @@ pub(crate) unsafe fn service_sec_image(
                         replymsg,
                         0,
                         0,
-                        resume_ip,
-                        sp,
-                        flags,
+                        parked_syscall_reply,
                     ) {
                         lsa_store_request_payload(
                             api_number,
@@ -9051,9 +9043,7 @@ pub(crate) unsafe fn service_sec_image(
                     badge,
                     pi,
                     current_tid,
-                    resume_ip,
-                    sp,
-                    flags,
+                    parked_syscall_reply,
                 ) {
                     CsrDynamicRoute::NotRouted => {}
                     CsrDynamicRoute::ClientParked => {
@@ -9141,8 +9131,7 @@ pub(crate) unsafe fn service_sec_image(
             let mut transfer_pending_driver_load: Option<(
                 OwnedHostedPnpStartBatch,
                 nt_driver_start::Reservation,
-                bool,
-                [u64; 18],
+                nt_syscall_abi::ParkedSyscallReply,
             )> = None;
             let mut transfer_file_irp_drain: Option<(
                 nt_io_manager::PendingFileIrpDrain,
@@ -9875,8 +9864,7 @@ pub(crate) unsafe fn service_sec_image(
                     transfer_pending_driver_load = Some((
                         batch,
                         reservation,
-                        native_call_transport,
-                        syscall_reply_context.regs,
+                        parked_syscall_reply,
                     ));
                 }
                 if let Some(mut waiter) = nt_handler.pending_synchronous_file_wait.take() {
@@ -10105,9 +10093,7 @@ pub(crate) unsafe fn service_sec_image(
                             out_ptr,
                             conn_info_ptr,
                             conn_info_len as u64,
-                            resume_ip,
-                            sp,
-                            flags,
+                            parked_syscall_reply,
                         ) {
                             lsa_store_connect_payload(&conn_info[..conn_info_len]);
                             let delivered = lsa_try_deliver_pending_connect(&mut nt_handler);
@@ -10118,7 +10104,7 @@ pub(crate) unsafe fn service_sec_image(
                                 LSA_CLI_KIND.store(0, Ordering::Relaxed);
                                 LSA_PENDING_CONN.store(0, Ordering::Relaxed);
                                 lsa_clear_client_context();
-                                lsa_wake(cap, 0xC000_0001, resume_ip, sp, flags);
+                                lsa_wake(cap, 0xC000_0001, parked_syscall_reply);
                             } else {
                                 print_str(b"[lsa-rdv] pi=");
                                 print_u64(pi as u64);
@@ -15741,9 +15727,7 @@ pub(crate) unsafe fn service_sec_image(
                         gui_message_wait_filter_min,
                         gui_message_wait_filter_max,
                         gui_message_wait_caller_sp,
-                        resume_ip,
-                        sp,
-                        flags,
+                        parked_syscall_reply,
                     )
                 {
                     let mut local_event_signals = 0u64;
@@ -16199,18 +16183,14 @@ pub(crate) unsafe fn service_sec_image(
             }
             // Demand driver loads retain the exact START cursor and live syscall reply until every
             // devnode is terminal. Publication precedes Reply-object rotation.
-            if let Some((batch, reservation, native_call_transport, reply_mrs)) =
+            if let Some((batch, reservation, reply)) =
                 transfer_pending_driver_load.take()
             {
                 pending_driver_load_transfer(
                     &mut nt_handler,
                     batch,
                     reservation,
-                    native_call_transport,
-                    reply_mrs,
-                    resume_ip,
-                    sp,
-                    flags,
+                    reply,
                 );
                 trace_indefinite_wait_park(
                     &nt_handler,
@@ -16357,6 +16337,7 @@ pub(crate) unsafe fn service_sec_image(
                     badge,
                     nt_process::dbgk::DBGK_BLOCK_SYSCALL,
                     0,
+                    parked_syscall_reply,
                     resume_ip,
                     sp,
                     flags,
@@ -18684,6 +18665,7 @@ pub(crate) unsafe fn service_sec_image(
                             0,
                             dbgk::DBGK_BLOCK_VM_FAULT,
                             reply_a,
+                            nt_syscall_abi::ParkedSyscallReply::native_call(),
                             f1_m0,
                             0,
                             0,
@@ -18835,6 +18817,7 @@ pub(crate) unsafe fn service_sec_image(
                                     0,
                                     dbgk::DBGK_BLOCK_DEBUG_EXCEPTION,
                                     reply_hw,
+                                    nt_syscall_abi::ParkedSyscallReply::native_call(),
                                     f2hw_m0,
                                     f2hw_m2,
                                     f2hw_m3,
@@ -18962,6 +18945,7 @@ pub(crate) unsafe fn service_sec_image(
                             0,
                             dbgk::DBGK_BLOCK_DEBUG_EXCEPTION,
                             reply_b,
+                            nt_syscall_abi::ParkedSyscallReply::native_call(),
                             f2_m0,
                             0,
                             0,
@@ -19069,6 +19053,7 @@ pub(crate) unsafe fn service_sec_image(
                                 0,
                                 dbgk::DBGK_BLOCK_DEBUG_EXCEPTION,
                                 reply_step,
+                                nt_syscall_abi::ParkedSyscallReply::native_call(),
                                 f2s_m0,
                                 0,
                                 0,
@@ -19157,13 +19142,19 @@ pub(crate) unsafe fn service_sec_image(
                             break;
                         }
                         // ═══ FAULT 3 — UnknownSyscall: the SYSCALL flavour ═══════════════
-                        let (_fb, f3_mi, f3_m0, _f3m1, f3_m2, _f3m3) =
+                        let (_fb, f3_mi, f3_m0, f3_m1, f3_m2, f3_m3) =
                             recv_full_r12(client_ep, reply_c);
                         // The service loop's own derivation: for an UnknownSyscall the resume IP is
                         // RCX (MR2) — the address `syscall` pushed — NOT the message's FaultIP slot.
                         let f3_ip = f3_m2;
                         let f3_sp = get_recv_mr(16);
                         let f3_flags = get_recv_mr(17);
+                        let f3_reply = nt_syscall_abi::ParkedSyscallReply::unknown_syscall(
+                            SyscallReplyContext::capture(f3_m0, f3_m1, f3_m2, f3_m3).regs,
+                            f3_ip,
+                            f3_sp,
+                            f3_flags,
+                        );
                         dbgk_blk_trace(b"f3", f3_mi, f3_m0, 0, marker_t());
                         if no_progress2
                             && cont2 == 0
@@ -19195,6 +19186,7 @@ pub(crate) unsafe fn service_sec_image(
                             0,
                             dbgk::DBGK_BLOCK_SYSCALL,
                             reply_c,
+                            f3_reply,
                             f3_ip,
                             f3_sp,
                             f3_flags,
@@ -19257,6 +19249,7 @@ pub(crate) unsafe fn service_sec_image(
                             0,
                             dbgk::DBGK_BLOCK_USER_EXCEPTION,
                             reply_d,
+                            nt_syscall_abi::ParkedSyscallReply::native_call(),
                             f4_m0,
                             f4_m1,
                             f4_m2,
@@ -19440,6 +19433,7 @@ pub(crate) unsafe fn service_sec_image(
                         0,
                         dbgk::DBGK_BLOCK_VM_FAULT,
                         reply_spare,
+                        nt_syscall_abi::ParkedSyscallReply::native_call(),
                         0x1000,
                         0,
                         0,
@@ -20026,6 +20020,7 @@ pub(crate) unsafe fn service_sec_image(
                                     0,
                                     dbgk::DBGK_BLOCK_DEBUG_EXCEPTION,
                                     reply_a,
+                                    nt_syscall_abi::ParkedSyscallReply::native_call(),
                                     f1_m0,
                                     0,
                                     0,
@@ -21607,9 +21602,7 @@ unsafe fn gui_message_wait_park(
     filter_min: u64,
     filter_max: u64,
     caller_sp: u64,
-    resume_ip: u64,
-    sp: u64,
-    flags: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
 ) -> bool {
     if queue_event_body == 0 || msg_ptr == 0 {
         return false;
@@ -21638,9 +21631,7 @@ unsafe fn gui_message_wait_park(
             filter_max,
             caller_sp,
             reply_cap: stolen,
-            resume_ip,
-            resume_sp: sp,
-            resume_flags: flags,
+            reply,
         };
     }
     wait_reply_pool_mark_used(fresh_index);
@@ -21723,9 +21714,9 @@ unsafe fn gui_message_wait_redrive_event(
         nt_handler.pi = pi;
         nt_handler.current_tid = waiter.tid;
         nt_handler.current_badge = waiter.badge;
-        nt_handler.current_resume_ip = waiter.resume_ip;
-        nt_handler.current_sp = waiter.resume_sp;
-        nt_handler.current_flags = waiter.resume_flags;
+        nt_handler.current_resume_ip = waiter.reply.resume_ip();
+        nt_handler.current_sp = waiter.reply.resume_sp();
+        nt_handler.current_flags = waiter.reply.resume_flags();
 
         let peb_mirror = hosted_peb_mirror_for_pi(pi);
         let client_teb = nt_handler
@@ -21843,10 +21834,7 @@ unsafe fn gui_message_wait_redrive_event(
         );
         let status = if copy_ok { get.0 } else { u64::MAX };
         win32k_subsystem::event_body_consume(event_body);
-        set_reply_mr(15, waiter.resume_ip);
-        set_reply_mr(16, waiter.resume_sp);
-        set_reply_mr(17, waiter.resume_flags);
-        client_reply_on(waiter.reply_cap, 18, status, 0, 0, 0);
+        reply_parked_syscall(waiter.reply_cap, waiter.reply, status);
         release_reply_pool_cap(waiter.reply_cap);
         thread_wait_state_clear_badge_ready(nt_handler, waiter.badge);
         gui_message_waiter_clear_slot(slot, waiter.reply_cap);
@@ -22030,17 +22018,13 @@ struct CsrDynamicApiWorker {
     reply_cap: u64,
     recvmsg: u64,
     ctx_out: u64,
-    ip: u64,
-    sp: u64,
-    flags: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
     in_flight_kind: u64,
     client_cap: u64,
     client_badge: u64,
     client_pi: u64,
-    client_reply: u64,
-    client_ip: u64,
-    client_sp: u64,
-    client_flags: u64,
+    client_reply_va: u64,
+    client_reply: nt_syscall_abi::ParkedSyscallReply,
     api_number: u64,
     delivered_recvmsg: u64,
 }
@@ -22054,17 +22038,13 @@ impl CsrDynamicApiWorker {
             reply_cap: 0,
             recvmsg: 0,
             ctx_out: 0,
-            ip: 0,
-            sp: 0,
-            flags: 0,
+            reply: nt_syscall_abi::ParkedSyscallReply::native_call(),
             in_flight_kind: CSR_DYNAMIC_KIND_NONE,
             client_cap: 0,
             client_badge: CSR_DYNAMIC_CONTEXT_UNSET,
             client_pi: CSR_DYNAMIC_CONTEXT_UNSET,
-            client_reply: 0,
-            client_ip: 0,
-            client_sp: 0,
-            client_flags: 0,
+            client_reply_va: 0,
+            client_reply: nt_syscall_abi::ParkedSyscallReply::native_call(),
             api_number: u64::MAX,
             delivered_recvmsg: 0,
         }
@@ -22083,10 +22063,8 @@ impl CsrDynamicApiWorker {
         self.client_cap = 0;
         self.client_badge = CSR_DYNAMIC_CONTEXT_UNSET;
         self.client_pi = CSR_DYNAMIC_CONTEXT_UNSET;
-        self.client_reply = 0;
-        self.client_ip = 0;
-        self.client_sp = 0;
-        self.client_flags = 0;
+        self.client_reply_va = 0;
+        self.client_reply = nt_syscall_abi::ParkedSyscallReply::native_call();
         self.api_number = u64::MAX;
         self.delivered_recvmsg = 0;
     }
@@ -22136,11 +22114,12 @@ unsafe fn csr_dynamic_with_peer<R>(
     out
 }
 
-unsafe fn csr_dynamic_wake(cap: u64, status: u64, ip: u64, sp: u64, flags: u64) {
-    set_reply_mr(15, ip);
-    set_reply_mr(16, sp);
-    set_reply_mr(17, flags);
-    client_reply_on(cap, 18, status, 0, 0, 0);
+unsafe fn csr_dynamic_wake(
+    cap: u64,
+    status: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
+) {
+    reply_parked_syscall(cap, reply, status);
     release_reply_pool_cap(cap);
 }
 
@@ -22168,9 +22147,7 @@ unsafe fn csr_dynamic_worker_park(
     tid: u64,
     recvmsg: u64,
     ctx_out: u64,
-    ip: u64,
-    sp: u64,
-    flags: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
 ) -> bool {
     let Some(cap) = steal_main_reply() else {
         return false;
@@ -22206,9 +22183,7 @@ unsafe fn csr_dynamic_worker_park(
         reply_cap: cap,
         recvmsg,
         ctx_out,
-        ip,
-        sp,
-        flags,
+        reply,
         ..CsrDynamicApiWorker::empty()
     };
     true
@@ -22229,9 +22204,7 @@ unsafe fn csr_dynamic_deliver_request(
     client_badge: u64,
     client_pi: usize,
     client_tid: u64,
-    client_ip: u64,
-    client_sp: u64,
-    client_flags: u64,
+    client_reply: nt_syscall_abi::ParkedSyscallReply,
 ) -> CsrDynamicRoute {
     let table = csr_dynamic_workers_mut();
     let Some(index) = (0..TP_WORKER_SLOT_COUNT).find(|&index| table[index].is_parked()) else {
@@ -22283,7 +22256,7 @@ unsafe fn csr_dynamic_deliver_request(
             ok
         });
     if !delivered {
-        csr_dynamic_wake(client_cap, 0xC000_0001, client_ip, client_sp, client_flags);
+        csr_dynamic_wake(client_cap, 0xC000_0001, client_reply);
         return CsrDynamicRoute::Consumed;
     }
     table[index].reply_cap = 0;
@@ -22291,13 +22264,11 @@ unsafe fn csr_dynamic_deliver_request(
     table[index].client_cap = client_cap;
     table[index].client_badge = client_badge;
     table[index].client_pi = client_pi as u64;
-    table[index].client_reply = reply_va;
-    table[index].client_ip = client_ip;
-    table[index].client_sp = client_sp;
-    table[index].client_flags = client_flags;
+    table[index].client_reply_va = reply_va;
+    table[index].client_reply = client_reply;
     table[index].api_number = api_number;
     table[index].delivered_recvmsg = worker.recvmsg;
-    csr_dynamic_wake(worker.reply_cap, 0, worker.ip, worker.sp, worker.flags);
+    csr_dynamic_wake(worker.reply_cap, 0, worker.reply);
     thread_wait_state_clear_badge_ready(nt_handler, worker.badge);
     print_str(b"[csr-api-dyn] delivered ApiNumber=0x");
     print_hex(api_number as u32);
@@ -22349,19 +22320,13 @@ unsafe fn csr_dynamic_finish_request_reply(
         let client_pi = worker.client_pi as usize;
         let copy_ok =
             csr_dynamic_with_peer(nt_handler, worker.client_badge, client_pi, |handler| {
-                handler.xas_try_write_buf(worker.client_reply, &reply[..reply_len])
+                handler.xas_try_write_buf(worker.client_reply_va, &reply[..reply_len])
             });
         if !copy_ok {
             status = 0xC000_0005;
         }
     }
-    csr_dynamic_wake(
-        worker.client_cap,
-        status,
-        worker.client_ip,
-        worker.client_sp,
-        worker.client_flags,
-    );
+    csr_dynamic_wake(worker.client_cap, status, worker.client_reply);
     thread_wait_state_clear_badge_ready(nt_handler, worker.client_badge);
     if status == 0 {
         CSR_MSGS.fetch_add(1, Ordering::Relaxed);
@@ -22393,9 +22358,7 @@ unsafe fn csr_dynamic_reply_wait_receive(
     recvmsg: u64,
     port: u64,
     ctx_out: u64,
-    ip: u64,
-    sp: u64,
-    flags: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
 ) -> bool {
     let table = csr_dynamic_workers_mut();
     let existing = (0..TP_WORKER_SLOT_COUNT).find(|&index| table[index].badge == badge);
@@ -22406,7 +22369,7 @@ unsafe fn csr_dynamic_reply_wait_receive(
             table[index].clear_client();
         }
     }
-    if !csr_dynamic_worker_park(badge, pi, tid, recvmsg, ctx_out, ip, sp, flags) {
+    if !csr_dynamic_worker_park(badge, pi, tid, recvmsg, ctx_out, reply) {
         return false;
     }
     print_str(b"[csr-api-dyn] worker badge=");
@@ -22442,9 +22405,8 @@ static LSA_SRV_PI: AtomicU64 = AtomicU64::new(LSA_CONTEXT_UNSET);
 static LSA_SRV_RECVMSG: AtomicU64 = AtomicU64::new(0);
 /// `RDX` — `PVOID *PortContext` (the server reads back the `LSAP_LOGON_CONTEXT` here).
 static LSA_SRV_CTXOUT: AtomicU64 = AtomicU64::new(0);
-static LSA_SRV_IP: AtomicU64 = AtomicU64::new(0);
-static LSA_SRV_SP: AtomicU64 = AtomicU64::new(0);
-static LSA_SRV_FLAGS: AtomicU64 = AtomicU64::new(0);
+static mut LSA_SRV_REPLY: nt_syscall_abi::ParkedSyscallReply =
+    nt_syscall_abi::ParkedSyscallReply::native_call();
 
 /// The LSA client (winlogon) blocked in `NtConnectPort` (kind 1) or `NtRequestWaitReplyPort` (kind 2)
 /// while the real server runs its half of the exchange.
@@ -22457,9 +22419,8 @@ static LSA_CLI_OUT: AtomicU64 = AtomicU64::new(0);
 /// connect only: the client's `ConnectionInformation` buffer + its length (copied back after accept).
 static LSA_CLI_CONNINFO: AtomicU64 = AtomicU64::new(0);
 static LSA_CLI_CONNINFO_LEN: AtomicU64 = AtomicU64::new(0);
-static LSA_CLI_IP: AtomicU64 = AtomicU64::new(0);
-static LSA_CLI_SP: AtomicU64 = AtomicU64::new(0);
-static LSA_CLI_FLAGS: AtomicU64 = AtomicU64::new(0);
+static mut LSA_CLI_REPLY: nt_syscall_abi::ParkedSyscallReply =
+    nt_syscall_abi::ParkedSyscallReply::native_call();
 static LSA_CLI_TID: AtomicU64 = AtomicU64::new(0);
 static LSA_CLI_REQUEST_API: AtomicU64 = AtomicU64::new(u64::MAX);
 static LSA_CLI_REQUEST_LEN: AtomicU64 = AtomicU64::new(0);
@@ -22473,15 +22434,22 @@ unsafe fn lsa_steal_main_reply() -> Option<u64> {
     steal_main_reply()
 }
 
-/// Resume a thread blocked on a stolen reply cap: restore its native-syscall resume context
-/// (RCX/RSP/RFLAGS in MR15/16/17) and return `status` in MR0, matching generic pending File I/O
-/// and event wakes.
-unsafe fn lsa_wake(cap: u64, status: u64, ip: u64, sp: u64, flags: u64) {
-    set_reply_mr(15, ip);
-    set_reply_mr(16, sp);
-    set_reply_mr(17, flags);
-    client_reply_on(cap, 18, status, 0, 0, 0);
+/// Resume a thread blocked on a stolen reply cap with its complete retained syscall register file.
+unsafe fn lsa_wake(
+    cap: u64,
+    status: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
+) {
+    reply_parked_syscall(cap, reply, status);
     release_reply_pool_cap(cap);
+}
+
+unsafe fn lsa_server_reply() -> nt_syscall_abi::ParkedSyscallReply {
+    *core::ptr::addr_of!(LSA_SRV_REPLY)
+}
+
+unsafe fn lsa_client_reply() -> nt_syscall_abi::ParkedSyscallReply {
+    *core::ptr::addr_of!(LSA_CLI_REPLY)
 }
 
 /// Run `body` with the executive's cross-address-space copy context pointed at `badge`/`pi`'s VSpace
@@ -22538,15 +22506,14 @@ fn lsa_recorded_pi(cell: &AtomicU64) -> Option<usize> {
     }
 }
 
-fn lsa_clear_client_context() {
+unsafe fn lsa_clear_client_context() {
     LSA_CLI_BADGE.store(LSA_CONTEXT_UNSET, Ordering::Relaxed);
     LSA_CLI_PI.store(LSA_CONTEXT_UNSET, Ordering::Relaxed);
     LSA_CLI_OUT.store(0, Ordering::Relaxed);
     LSA_CLI_CONNINFO.store(0, Ordering::Relaxed);
     LSA_CLI_CONNINFO_LEN.store(0, Ordering::Relaxed);
-    LSA_CLI_IP.store(0, Ordering::Relaxed);
-    LSA_CLI_SP.store(0, Ordering::Relaxed);
-    LSA_CLI_FLAGS.store(0, Ordering::Relaxed);
+    *core::ptr::addr_of_mut!(LSA_CLI_REPLY) =
+        nt_syscall_abi::ParkedSyscallReply::native_call();
     LSA_CLI_TID.store(0, Ordering::Relaxed);
     LSA_CLI_REQUEST_API.store(u64::MAX, Ordering::Relaxed);
     LSA_CLI_REQUEST_LEN.store(0, Ordering::Relaxed);
@@ -22561,9 +22528,7 @@ unsafe fn lsa_server_park(
     pi: usize,
     recvmsg: u64,
     ctx_out: u64,
-    ip: u64,
-    sp: u64,
-    flags: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
 ) -> bool {
     let Some(cap) = lsa_steal_main_reply() else {
         return false;
@@ -22572,9 +22537,7 @@ unsafe fn lsa_server_park(
     LSA_SRV_PI.store(pi as u64, Ordering::Relaxed);
     LSA_SRV_RECVMSG.store(recvmsg, Ordering::Relaxed);
     LSA_SRV_CTXOUT.store(ctx_out, Ordering::Relaxed);
-    LSA_SRV_IP.store(ip, Ordering::Relaxed);
-    LSA_SRV_SP.store(sp, Ordering::Relaxed);
-    LSA_SRV_FLAGS.store(flags, Ordering::Relaxed);
+    *core::ptr::addr_of_mut!(LSA_SRV_REPLY) = reply;
     LSA_SRV_REPLY_CAP.store(cap, Ordering::Relaxed);
     LSA_SRV_LIVE_BADGE.store(badge, Ordering::Relaxed);
     LSA_SERVER_PARKS.fetch_add(1, Ordering::Relaxed);
@@ -22596,13 +22559,7 @@ unsafe fn lsa_release_client_on_server_wall(nt_handler: &mut ExecNtHandler, ssn:
     print_u64(ssn);
     print_str(b" with a client blocked -> releasing the client with STATUS_UNSUCCESSFUL\n");
     let badge = LSA_CLI_BADGE.load(Ordering::Relaxed);
-    lsa_wake(
-        cap,
-        0xC000_0001,
-        LSA_CLI_IP.load(Ordering::Relaxed),
-        LSA_CLI_SP.load(Ordering::Relaxed),
-        LSA_CLI_FLAGS.load(Ordering::Relaxed),
-    );
+    lsa_wake(cap, 0xC000_0001, lsa_client_reply());
     if badge != LSA_CONTEXT_UNSET {
         thread_wait_state_clear_badge_ready(nt_handler, badge);
     }
@@ -22657,9 +22614,7 @@ unsafe fn lsa_server_deliver(
     lsa_wake(
         cap,
         0, // STATUS_SUCCESS from NtReplyWaitReceivePort
-        LSA_SRV_IP.load(Ordering::Relaxed),
-        LSA_SRV_SP.load(Ordering::Relaxed),
-        LSA_SRV_FLAGS.load(Ordering::Relaxed),
+        lsa_server_reply(),
     );
     thread_wait_state_clear_badge_ready(nt_handler, badge);
     true
@@ -22675,9 +22630,7 @@ unsafe fn lsa_client_park(
     out: u64,
     conninfo: u64,
     conninfo_len: u64,
-    ip: u64,
-    sp: u64,
-    flags: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
 ) -> bool {
     let Some(cap) = lsa_steal_main_reply() else {
         return false;
@@ -22689,9 +22642,7 @@ unsafe fn lsa_client_park(
     LSA_CLI_OUT.store(out, Ordering::Relaxed);
     LSA_CLI_CONNINFO.store(conninfo, Ordering::Relaxed);
     LSA_CLI_CONNINFO_LEN.store(conninfo_len, Ordering::Relaxed);
-    LSA_CLI_IP.store(ip, Ordering::Relaxed);
-    LSA_CLI_SP.store(sp, Ordering::Relaxed);
-    LSA_CLI_FLAGS.store(flags, Ordering::Relaxed);
+    *core::ptr::addr_of_mut!(LSA_CLI_REPLY) = reply;
     LSA_CLI_REPLY_CAP.store(cap, Ordering::Relaxed);
     true
 }
@@ -22931,13 +22882,7 @@ unsafe fn lsa_complete_connect(
     LSA_CLI_REPLY_CAP.store(0, Ordering::Relaxed);
     LSA_CLI_KIND.store(0, Ordering::Relaxed);
     LSA_PENDING_CONN.store(0, Ordering::Relaxed);
-    lsa_wake(
-        cap,
-        status,
-        LSA_CLI_IP.load(Ordering::Relaxed),
-        LSA_CLI_SP.load(Ordering::Relaxed),
-        LSA_CLI_FLAGS.load(Ordering::Relaxed),
-    );
+    lsa_wake(cap, status, lsa_client_reply());
     thread_wait_state_clear_badge_ready(nt_handler, cli_badge);
     lsa_clear_client_context();
     true
@@ -23022,9 +22967,7 @@ unsafe fn lsa_deliver_reply(nt_handler: &mut ExecNtHandler, replymsg: u64) -> bo
     lsa_wake(
         cap,
         0, // NtRequestWaitReplyPort itself succeeded; the API status rides in the message
-        LSA_CLI_IP.load(Ordering::Relaxed),
-        LSA_CLI_SP.load(Ordering::Relaxed),
-        LSA_CLI_FLAGS.load(Ordering::Relaxed),
+        lsa_client_reply(),
     );
     thread_wait_state_clear_badge_ready(nt_handler, cli_badge);
     lsa_clear_client_context();
@@ -23386,21 +23329,12 @@ unsafe fn pending_driver_load_transfer(
     nt_handler: &mut ExecNtHandler,
     batch: OwnedHostedPnpStartBatch,
     reservation: nt_driver_start::Reservation,
-    native_call_transport: bool,
-    mut reply_mrs: [u64; 18],
-    resume_ip: u64,
-    sp: u64,
-    flags: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
 ) {
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     assert_ne!(stolen, 0, "pending driver-load Reply object disappeared after preflight");
     let (fresh_index, fresh) = wait_reply_pool_find_free()
         .expect("pending driver-load Reply-pool claim disappeared after preflight");
-    if !native_call_transport {
-        reply_mrs[15] = resume_ip;
-        reply_mrs[16] = sp;
-        reply_mrs[17] = flags;
-    }
     nt_handler
         .pending_driver_loads
         .publish(
@@ -23411,8 +23345,7 @@ unsafe fn pending_driver_load_transfer(
                     tid: nt_handler.current_tid,
                     badge: nt_handler.current_badge,
                     reply_cap: stolen,
-                    native_call_transport,
-                    reply_mrs,
+                    reply,
                 }),
             },
         )
@@ -23435,8 +23368,7 @@ unsafe fn pending_driver_load_reply(
     pending_driver_load_reply_owner(
         nt_handler,
         reply.reply_cap,
-        reply.native_call_transport,
-        reply.reply_mrs,
+        reply.reply,
         reply.badge,
         status,
     );
@@ -23445,26 +23377,11 @@ unsafe fn pending_driver_load_reply(
 unsafe fn pending_driver_load_reply_owner(
     nt_handler: &mut ExecNtHandler,
     cap: u64,
-    native_call_transport: bool,
-    reply_mrs: [u64; 18],
+    reply: nt_syscall_abi::ParkedSyscallReply,
     badge: u64,
     status: u32,
 ) {
-    if native_call_transport {
-        let _ = client_reply_on(cap, 1, status as u64, 0, 0, 0);
-    } else {
-        for index in 4..reply_mrs.len() {
-            set_reply_mr(index, reply_mrs[index]);
-        }
-        let _ = client_reply_on(
-            cap,
-            18,
-            status as u64,
-            reply_mrs[1],
-            reply_mrs[2],
-            reply_mrs[3],
-        );
-    }
+    let _ = reply_parked_syscall(cap, reply, status as u64);
     release_reply_pool_cap(cap);
     thread_wait_state_clear_badge_ready(nt_handler, badge);
 }
@@ -23537,8 +23454,7 @@ unsafe fn pending_driver_load_redrive_all(nt_handler: &mut ExecNtHandler) -> u64
                     pending_driver_load_reply_owner(
                         nt_handler,
                         reply.reply_cap,
-                        reply.native_call_transport,
-                        reply.reply_mrs,
+                        reply.reply,
                         reply.badge,
                         status,
                     );

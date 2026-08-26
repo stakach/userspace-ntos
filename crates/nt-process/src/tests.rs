@@ -3061,6 +3061,12 @@ fn reporter(kind: u8, tid: ThreadId, cap: u64) -> dbgk::ReporterBlock {
         pi: 7,
         tid: tid as u64,
         badge: 0,
+        syscall_reply: nt_syscall_abi::ParkedSyscallReply::unknown_syscall(
+            [0; 18],
+            0x7FFE_1000,
+            0x1_0000,
+            0x202,
+        ),
         resume_ip: 0x7FFE_1000,
         resume_sp: 0x1_0000,
         resume_flags: 0x202,

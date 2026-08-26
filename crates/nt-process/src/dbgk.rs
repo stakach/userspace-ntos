@@ -386,7 +386,7 @@ impl DbgKmMessage {
 /// the lifecycle posts, which NT also queues without a waiting reporter).
 pub const DBGK_BLOCK_NONE: u8 = 0;
 /// The reporter blocked inside a **syscall** (seL4 `UnknownSyscall` fault). Resuming it replies with
-/// the syscall reply shape: the return status in MR0 (RAX) plus MR15/16/17 = FaultIP/SP/FLAGS.
+/// the complete syscall reply register file with only MR0/RAX replaced by the return status.
 pub const DBGK_BLOCK_SYSCALL: u8 = 1;
 /// The reporter blocked at a **UserException** fault (`#UD`/`#GP`/a CPU exception the executive's
 /// fault loop classified at label 3). Resuming it replies with the UserException shape — length 3,
@@ -421,11 +421,13 @@ pub struct ReporterBlock {
     pub tid: u64,
     /// The reporter's fault-endpoint badge (its identity in the host's service multiplex).
     pub badge: u64,
-    /// Resume `FaultIP` — for a syscall block, the instruction after the `syscall`.
+    /// Complete hosted syscall continuation. Ignored for the fault flavours.
+    pub syscall_reply: nt_syscall_abi::ParkedSyscallReply,
+    /// Resume `FaultIP` for a UserException block. Ignored for syscall and retry-only faults.
     pub resume_ip: u64,
-    /// Resume stack pointer.
+    /// Resume stack pointer for a UserException block.
     pub resume_sp: u64,
-    /// Resume RFLAGS.
+    /// Resume RFLAGS for a UserException block.
     pub resume_flags: u64,
     /// The status a **syscall**-flavoured reporter returns when it is resumed (what the syscall
     /// would have returned had it never blocked). Ignored for the fault flavours.
@@ -770,14 +772,21 @@ impl DebugObject {
             let Some(mut block) = event.reporter.filter(|block| block.is_blocked()) else {
                 continue;
             };
-            if let Some(ip) = resume_ip {
-                block.resume_ip = ip;
-            }
-            if let Some(sp) = resume_sp {
-                block.resume_sp = sp;
-            }
-            if let Some(flags) = resume_flags {
-                block.resume_flags = flags;
+            if block.kind == DBGK_BLOCK_SYSCALL {
+                block.syscall_reply =
+                    block
+                        .syscall_reply
+                        .with_resume_context(resume_ip, resume_sp, resume_flags);
+            } else {
+                if let Some(ip) = resume_ip {
+                    block.resume_ip = ip;
+                }
+                if let Some(sp) = resume_sp {
+                    block.resume_sp = sp;
+                }
+                if let Some(flags) = resume_flags {
+                    block.resume_flags = flags;
+                }
             }
             event.reporter = Some(block);
             return true;
