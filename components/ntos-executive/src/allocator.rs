@@ -113,6 +113,12 @@ pub struct TransientAllocScope {
     active: bool,
 }
 
+/// Temporarily preserve durable allocation routing inside an outer transient scope.
+pub struct DurableAllocScope {
+    previous_transient_depth: usize,
+    active: bool,
+}
+
 impl Drop for AllocContext {
     fn drop(&mut self) {
         OOM_CONTEXT.store(self.previous, Ordering::Relaxed);
@@ -138,6 +144,14 @@ impl Drop for TransientAllocScope {
         unsafe {
             write_word(TRANSIENT_CTR, self.previous_mark);
             write_word(TRANSIENT_DEPTH, self.previous_depth);
+        }
+    }
+}
+
+impl Drop for DurableAllocScope {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe { write_word(TRANSIENT_DEPTH, self.previous_transient_depth) };
         }
     }
 }
@@ -176,6 +190,26 @@ pub fn enter_transient() -> TransientAllocScope {
     TransientAllocScope {
         previous_mark,
         previous_depth,
+        active,
+    }
+}
+
+/// Route allocations to durable storage while an outer transient scope remains live.
+///
+/// This is for publication operations, such as minting a handle after transient name lookup. The
+/// returned guard must not outlive the surrounding transient guard.
+pub fn enter_durable() -> DurableAllocScope {
+    let active = transient_heap_size() != 0;
+    let previous_transient_depth = if active {
+        unsafe { read_word(TRANSIENT_DEPTH) }
+    } else {
+        0
+    };
+    if active {
+        unsafe { write_word(TRANSIENT_DEPTH, 0) };
+    }
+    DurableAllocScope {
+        previous_transient_depth,
         active,
     }
 }

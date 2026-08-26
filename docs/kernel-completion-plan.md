@@ -13618,3 +13618,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     keeping their subsequent hive/overlay writes durable. Then inventory the remaining root-level
     rewind and dirty-mark machinery; delete each legacy path only after every allocation it protected
     has an explicit durable or scoped-transient owner.
+
+    Registry capture scope migration (2026-08-27, accepted): `NtCreateKey` and `NtSetValueKey` no
+    longer own manual allocator marks. Object-attribute names, canonical paths, value names, and
+    lookup-only strings live in lexical transient scopes, are copied into bounded stack buffers, and
+    are dropped before hive mutations, overlay insertion, security-descriptor capture, or mutation
+    record construction. Existing-key fast paths use an explicit nested durable-routing guard while
+    their transient lookup strings remain live, so handle-table growth cannot inherit scratch
+    lifetime. Early errors now reclaim their capture allocations at lexical exit rather than waiting
+    for the next service-loop rewind.
+
+    Serialized acceptance `.tmp/run-headless-registry-scratch-scopes-20260827.log` exercised the
+    complete first-boot registry workload: CM committed 2,534 SYSTEM transactions with zero rejected
+    commits or projection failures; LSA/SAM creation, ProfileList materialisation, user-hive load,
+    userinit, and Explorer passed. Explorer painted 480,000/480,000 pixels with at least 32 colors,
+    all `295/295` gates passed, and the sentinel matched. Final durable allocation was 14,838,808 B
+    with 6,132,584 B reusable, and scratch returned to zero.
+
+    Review adjustment: every syscall-local manual mark is deleted. The only remaining
+    `mark`/`reset_to` pair is the root service-loop compatibility boundary, together with its durable
+    dirty/publication finalizer. Keep it until the remaining unscoped per-dispatch allocations have
+    been classified and migrated; removing it now would convert temporary query/capture vectors into
+    leaks. Add scratch high-water accounting, then migrate pure copyout encoders and other
+    non-escaping helpers in bounded groups. Retire each corresponding dirty-mark branch only when no
+    durable publication relies on the compatibility boundary.

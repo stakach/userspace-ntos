@@ -22410,7 +22410,7 @@ impl ExecNtHandler {
                         Err(status) => return status,
                     }
                 };
-                let transient_mark = allocator::mark();
+                let transient_scope = allocator::enter_transient();
                 let name = crate::probe_seg!(0, self.read_registry_objattr_name(oa));
                 // Resolve the full NT path: predefined HKLM root, absolute, or overlay-relative.
                 let full: Option<alloc::string::String> = if root_target == Some(MACHINE_ROOT_KEY) {
@@ -22456,7 +22456,10 @@ impl ExecNtHandler {
                     if target == USER_ROOT_KEY {
                         USER_ROOT_OPENED.fetch_add(1, Ordering::Relaxed);
                     }
-                    let status = self.mint_registry_key(target, desired_access, args[0]);
+                    let status = {
+                        let _durable = allocator::enter_durable();
+                        self.mint_registry_key(target, desired_access, args[0])
+                    };
                     if status != 0 {
                         return status;
                     }
@@ -22506,11 +22509,14 @@ impl ExecNtHandler {
                     || mutable_existing.is_some()
                     || base_existing.is_some();
                 if let Some(oidx) = overlay_existing {
-                    let status = self.mint_registry_key(
-                        OVERLAY_KEY_TAG | (oidx as u32),
-                        desired_access,
-                        args[0],
-                    );
+                    let status = {
+                        let _durable = allocator::enter_durable();
+                        self.mint_registry_key(
+                            OVERLAY_KEY_TAG | (oidx as u32),
+                            desired_access,
+                            args[0],
+                        )
+                    };
                     if status != 0 {
                         return status;
                     }
@@ -22530,8 +22536,10 @@ impl ExecNtHandler {
                     return 0;
                 }
                 if let Some(mutable_key) = mutable_existing {
-                    let status =
-                        self.mint_mutable_registry_key(mutable_key, desired_access, args[0]);
+                    let status = {
+                        let _durable = allocator::enter_durable();
+                        self.mint_mutable_registry_key(mutable_key, desired_access, args[0])
+                    };
                     if status != 0 {
                         return status;
                     }
@@ -22551,7 +22559,10 @@ impl ExecNtHandler {
                     return 0;
                 }
                 if let Some(base_key) = base_existing {
-                    let status = self.mint_registry_key(base_key, desired_access, args[0]);
+                    let status = {
+                        let _durable = allocator::enter_durable();
+                        self.mint_registry_key(base_key, desired_access, args[0])
+                    };
                     if status != 0 {
                         return status;
                     }
@@ -22610,7 +22621,7 @@ impl ExecNtHandler {
                     drop(full);
                     drop(name);
                     drop(class_name);
-                    allocator::reset_to(transient_mark);
+                    drop(transient_scope);
                     let canon = match core::str::from_utf8(&canon_scratch[..canon_len]) {
                         Ok(path) => path,
                         Err(_) => return 0xC000_0033,
@@ -22757,7 +22768,7 @@ impl ExecNtHandler {
                 drop(canon);
                 drop(full);
                 drop(name);
-                allocator::reset_to(transient_mark);
+                drop(transient_scope);
                 let durable_canon = match core::str::from_utf8(&canon_scratch[..canon_len]) {
                     Ok(path) => alloc::string::String::from(path),
                     Err(_) => return 0xC000_0033, // STATUS_OBJECT_NAME_INVALID
@@ -22848,7 +22859,7 @@ impl ExecNtHandler {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
-                let transient_mark = allocator::mark();
+                let transient_scope = allocator::enter_transient();
                 let name = self.read_registry_ustr_name(args[1]);
                 let ty = nt_ulong_arg(args[3]); // R9 = Type
                 let data_ptr = args[4];
@@ -23004,7 +23015,7 @@ impl ExecNtHandler {
                     }
                 }
                 drop(name);
-                allocator::reset_to(transient_mark);
+                drop(transient_scope);
 
                 let durable_name = match core::str::from_utf8(&name_scratch[..name_len]) {
                     Ok(name) => name,
