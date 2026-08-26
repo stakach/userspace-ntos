@@ -139,12 +139,12 @@ pub enum DispatchOutcome {
     },
     /// Accepted as pending; a final completion arrives later.
     Pending,
-    /// Rejected up front with a failure status.
+    /// Finished synchronously with a terminal failure status and no information payload.
     Failed { status: NtStatus },
 }
 
 impl DispatchOutcome {
-    /// Map an `NtStatus` to a synchronous outcome: success → `Completed`, error →
+    /// Map an `NtStatus` to a synchronous terminal outcome: success → `Completed`, error →
     /// `Failed`.
     pub fn from_status(status: NtStatus, information: u64) -> Self {
         if status.is_success() {

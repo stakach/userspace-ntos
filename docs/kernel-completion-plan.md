@@ -12160,3 +12160,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `Pending`, and a hosted pump wall or handler abort must produce `Indeterminate`. Only after that
     boundary is live may the executive replace its raw START helper and retain token plus IRP across
     asynchronous completion.
+
+    Canonical PnP completion-identity checkpoint (2026-08-26, crate green): every PnP manager
+    dispatch now requires a nonzero canonical `IrpId` value and stores it in both the private pending
+    record and opaque generation-bearing token. Completion presents the observed canonical identity
+    separately and must match the pending record and token before any lifecycle state, negotiation,
+    or removal authority changes. Zero identity, a forged token identity, and a mismatched observed
+    completion are rejected without consuming the genuine pending transaction. Focused validation
+    remains green at `nt-pnp-manager` `14/14` and `nt-io-manager` `195/195`; the freestanding
+    executive check remains at the established 212-warning baseline.
+
+    The I/O-manager adapter also now classifies the generic backend's synchronous terminal-failure
+    variant as a genuine outer return. Existing mock, isolated-peer, and hosted backends use that
+    variant for real returned failure statuses; treating it as indeterminate would permanently block
+    legitimate START failures and QUERY vetoes. Unsupported PnP routes are already rejected during
+    preparation, while a backend transport `Err` remains indeterminate.
+
+    Review adjustment: implement the hosted PnP-specific transport result next without changing
+    ordinary file-I/O semantics. Pre-pump setup refusal is `NotDispatched`; a completed dispatch-label
+    call is `Returned` (with returned `STATUS_PENDING` becoming canonical `Pending`); an incomplete
+    pump or guarded component abort is `Indeterminate`. Until the manager owns exact abort/rollback
+    authority, any `NotDispatched` observed after token acquisition must retain the transaction as a
+    conservative barrier rather than fabricate a completion.

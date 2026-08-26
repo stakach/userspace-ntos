@@ -248,10 +248,14 @@ impl<P> IoManager<P> {
                 }
             }
             DispatchOutcome::Failed { status } => {
-                self.mark_external_pnp_indeterminate(irp_id);
-                ExternalPnpDispatchResult::Indeterminate {
-                    irp_id,
-                    transport_status: status,
+                if let Some(irp) = self.irp_mut(irp_id) {
+                    irp.status = status;
+                    irp.transition(IrpState::Failed);
+                }
+                self.free_irp(irp_id);
+                ExternalPnpDispatchResult::Returned {
+                    status,
+                    information: 0,
                 }
             }
             DispatchOutcome::Pending => {

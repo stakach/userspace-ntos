@@ -1848,6 +1848,24 @@ mod tests {
         }
     }
 
+    struct ReturnedFailurePnpBackend;
+
+    impl DriverDispatchBackend for ReturnedFailurePnpBackend {
+        fn dispatch_irp(
+            &mut self,
+            _ctx: DispatchContext<'_>,
+            _irp: &IrpProjection,
+        ) -> Result<DispatchOutcome, NtStatus> {
+            Ok(DispatchOutcome::Failed {
+                status: NtStatus::ACCESS_DENIED,
+            })
+        }
+
+        fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> {
+            Err(NtStatus::NOT_SUPPORTED)
+        }
+    }
+
     struct PendingPnpBackend {
         ready: std::rc::Rc<std::cell::RefCell<std::vec::Vec<DriverCompletion>>>,
     }
@@ -2006,6 +2024,22 @@ mod tests {
         );
         assert!(returned_io.irp(returned_id).is_none());
         assert_eq!(seen.borrow()[0].device_id, function);
+
+        let mut failed_io = io();
+        let (client, root, _, _) =
+            pnp_test_stack(&mut failed_io, Box::new(ReturnedFailurePnpBackend));
+        let prepared = failed_io
+            .prepare_external_pnp_to_device(client, root, 0, parameters, &[])
+            .unwrap();
+        let failed_id = prepared.irp_id();
+        assert_eq!(
+            failed_io.dispatch_prepared_external_pnp(prepared),
+            ExternalPnpDispatchResult::Returned {
+                status: NtStatus::ACCESS_DENIED,
+                information: 0,
+            }
+        );
+        assert!(failed_io.irp(failed_id).is_none());
 
         let mut pending_io = io();
         let pending_ready = std::rc::Rc::new(std::cell::RefCell::new(std::vec::Vec::new()));
