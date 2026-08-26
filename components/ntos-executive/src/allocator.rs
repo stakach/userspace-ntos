@@ -73,9 +73,10 @@ const MAPPED_HEAP_BYTES: usize =
     COMPONENT_LOCAL_WORD_BASE + (COMPONENT_LOCAL_WORDS - 1) * size_of::<usize>();
 const TRANSIENT_CTR: usize = HEAP_BASE + 64; // bytes consumed downward from the mapped heap end
 const TRANSIENT_DEPTH: usize = HEAP_BASE + 72; // nested transient allocation scopes
+const TRANSIENT_HIGH_WATER: usize = HEAP_BASE + 80; // peak transient bytes consumed
 const DATA: usize = HEAP_BASE + 128; // allocations start past allocator/local metadata
 const _: () = assert!(MAPPED_HEAP_BYTES + size_of::<usize>() <= TRANSIENT_CTR);
-const _: () = assert!(TRANSIENT_DEPTH + size_of::<usize>() <= DATA);
+const _: () = assert!(TRANSIENT_HIGH_WATER + size_of::<usize>() <= DATA);
 const WORD: usize = size_of::<usize>();
 const ALLOC_GRANULE: usize = align_of::<usize>();
 const FREE_NODE_SIZE: usize = WORD * 2; // { size, next } stored inside the freed block
@@ -612,7 +613,13 @@ impl Bump {
             );
             return null_mut();
         }
-        unsafe { write_word(TRANSIENT_CTR, mapped_heap_end() - start) };
+        let consumed = mapped_heap_end() - start;
+        unsafe {
+            write_word(TRANSIENT_CTR, consumed);
+            if consumed > read_word(TRANSIENT_HIGH_WATER) {
+                write_word(TRANSIENT_HIGH_WATER, consumed);
+            }
+        }
         start as *mut u8
     }
 }
@@ -768,6 +775,7 @@ pub struct HeapUsage {
     pub top_reusable: usize,
     pub durable_capacity: usize,
     pub transient_used: usize,
+    pub transient_high_water: usize,
     pub transient_capacity: usize,
 }
 
@@ -798,6 +806,7 @@ pub fn usage() -> HeapUsage {
         top_reusable,
         durable_capacity: durable_heap_capacity(),
         transient_used: unsafe { read_word(TRANSIENT_CTR) },
+        transient_high_water: unsafe { read_word(TRANSIENT_HIGH_WATER) },
         transient_capacity: transient_heap_size(),
     }
 }

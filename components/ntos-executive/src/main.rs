@@ -7564,6 +7564,8 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
     print_str(b" scratch=");
     print_u64(heap.transient_used as u64);
     print_str(b"/");
+    print_u64(heap.transient_high_water as u64);
+    print_str(b"/");
     print_u64(heap.transient_capacity as u64);
     print_str(b" timer=");
     print_u64(TIMER_TICKS_SEEN.load(Ordering::Relaxed));
@@ -7728,6 +7730,8 @@ pub(crate) fn print_census_counters(tag: &[u8]) {
     print_u64(heap.durable_capacity as u64);
     print_str(b" scratch=");
     print_u64(heap.transient_used as u64);
+    print_str(b"/");
+    print_u64(heap.transient_high_water as u64);
     print_str(b"/");
     print_u64(heap.transient_capacity as u64);
     print_str(b" ucb-redirects=");
@@ -9905,6 +9909,8 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64((heap.top_reusable as u64) >> 10);
     print_str(b"KiB exec-scratch=");
     print_u64((heap.transient_used as u64) >> 10);
+    print_str(b"KiB/");
+    print_u64((heap.transient_high_water as u64) >> 10);
     print_str(b"KiB/");
     print_u64((heap.transient_capacity as u64) >> 10);
     print_str(b"KiB pinned-root-caps=");
@@ -32045,6 +32051,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_u64(heap.durable_capacity as u64);
     print_str(b" scratch=");
     print_u64(heap.transient_used as u64);
+    print_str(b"/");
+    print_u64(heap.transient_high_water as u64);
     print_str(b"/");
     print_u64(heap.transient_capacity as u64);
     print_str(b"\n");

@@ -13642,3 +13642,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     leaks. Add scratch high-water accounting, then migrate pure copyout encoders and other
     non-escaping helpers in bounded groups. Retire each corresponding dirty-mark branch only when no
     durable publication relies on the compatibility boundary.
+
+    Scratch high-water observability (2026-08-27, accepted): the root allocator now retains a
+    monotonic peak for its downward-growing transient lane while continuing to report current use
+    independently. Periodic, detailed, pool, and final censuses expose
+    `current/high-water/capacity`; spawned components still report a zero-capacity lane and keep
+    their complete declared heaps durable.
+
+    Serialized acceptance `.tmp/run-headless-scratch-high-water-20260827.log` passed all `295/295`
+    gates, painted all 480,000 framebuffer pixels with at least 32 colors, and matched the sentinel.
+    Final scratch occupancy was zero; the full boot's peak was 278,112 B of 4,194,304 B (6.6%).
+    Durable allocation finished at 14,808,456 B with 6,162,936 B reusable. The measured transient
+    headroom is ample, so do not resize either lane. Continue converting copy-only native query
+    encoders to lexical scratch scopes, with persistent caches, async request state, handle tables,
+    and completion records explicitly kept durable.
