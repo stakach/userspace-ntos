@@ -11985,3 +11985,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     real `KeCancelTimer` plus DPC quiescence, release one-shot work-item ownership after its callback
     returns, and bind miniport-block mirror retirement to the adapter's real Halt/Stop/Remove
     sequence. Only then may those parent rows release their final thunk leases.
+
+    Callback-parent desktop integration checkpoint (2026-08-26, target regression repaired): the
+    first serialized desktop run exposed an ordering error in miniport-block mirror construction.
+    Each acquired binding was stored in the durable construction row before the matching thunk
+    address assignment completed, so the final snapshot retained all 11 leases but still had a zero
+    `set_complete_thunk`; publication correctly failed and rolled the unfinished parent back. The
+    transaction now assigns each address before publishing its matching binding, and exact-releases
+    the newest acquisition if construction-row storage fails.
+
+    The corrected serialized run
+    `.tmp/run-desktop-callback-parent-lifetimes-fixed-20260826.log` publishes the mirror, completes
+    real E1000 `Initialize` and `START_DEVICE`, and passes provider-domain service, NDIS receive, and
+    DMA descriptor gates. Explorer again paints all `480000/480000` pixels with at least 32
+    non-background colours and the sentinel fires. The aggregate was `292/293` only because the
+    schedule-sensitive userinit ScrollBar `NtUserGetClassInfo` observation did not occur in that
+    run (`0/0/0`); no callback failure or shell failure accompanied it. Keep the all-gates desktop
+    confirmation open rather than weakening this observation gate. The release link is green at the
+    212-warning baseline and `component_pump_loop` remains bounded at `0x18d8` bytes.

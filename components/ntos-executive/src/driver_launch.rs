@@ -22572,7 +22572,7 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
     };
 
     macro_rules! retain_or_rollback {
-        ($emit:expr) => {
+        ($field:ident, $emit:expr) => {
             match $emit {
                 Ok(thunk) => {
                     let binding = thunk.binding;
@@ -22583,16 +22583,17 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
                         );
                         return Err(STATUS_INSUFFICIENT_RESOURCES);
                     };
+                    mirror.$field = run_va;
                     if !store_hosted_provider_ndis_miniport_block_mirror_construction(
                         construction_index,
                         mirror,
                     ) {
+                        let _ = release_instance_executable_thunk_binding(binding, true);
                         rollback_hosted_provider_ndis_miniport_block_mirror_construction(
                             construction_index,
                         );
                         return Err(STATUS_DEVICE_NOT_READY);
                     }
-                    run_va
                 }
                 Err(status) => {
                     rollback_hosted_provider_ndis_miniport_block_mirror_construction(
@@ -22604,7 +22605,8 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
         };
     }
 
-    mirror.packet_indicate_thunk = retain_or_rollback!(
+    retain_or_rollback!(
+        packet_indicate_thunk,
         provider_marshal_emit_internal_import_thunk_for_instance(
             dependent_instance,
             "ndis.sys",
@@ -22613,7 +22615,8 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
             provider_publication_cookie,
         )
     );
-    mirror.send_complete_thunk = retain_or_rollback!(
+    retain_or_rollback!(
+        send_complete_thunk,
         provider_marshal_emit_import_thunk_for_instance(
             dependent_instance,
             "ndis.sys",
@@ -22621,7 +22624,8 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
             provider_publication_cookie,
         )
     );
-    mirror.send_resources_thunk = retain_or_rollback!(
+    retain_or_rollback!(
+        send_resources_thunk,
         provider_marshal_emit_import_thunk_for_instance(
             dependent_instance,
             "ndis.sys",
@@ -22629,7 +22633,8 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
             provider_publication_cookie,
         )
     );
-    mirror.reset_complete_thunk = retain_or_rollback!(
+    retain_or_rollback!(
+        reset_complete_thunk,
         provider_marshal_emit_import_thunk_for_instance(
             dependent_instance,
             "ndis.sys",
@@ -22637,7 +22642,8 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
             provider_publication_cookie,
         )
     );
-    mirror.eth_rx_indicate_thunk = retain_or_rollback!(
+    retain_or_rollback!(
+        eth_rx_indicate_thunk,
         provider_marshal_emit_import_thunk_for_instance(
             dependent_instance,
             "ndis.sys",
@@ -22645,7 +22651,8 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
             provider_publication_cookie,
         )
     );
-    mirror.eth_rx_complete_thunk = retain_or_rollback!(
+    retain_or_rollback!(
+        eth_rx_complete_thunk,
         provider_marshal_emit_import_thunk_for_instance(
             dependent_instance,
             "ndis.sys",
@@ -22653,13 +22660,17 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
             provider_publication_cookie,
         )
     );
-    mirror.status_thunk = retain_or_rollback!(provider_marshal_emit_import_thunk_for_instance(
-        dependent_instance,
-        "ndis.sys",
-        "NdisMIndicateStatus",
-        provider_publication_cookie,
-    ));
-    mirror.status_complete_thunk = retain_or_rollback!(
+    retain_or_rollback!(
+        status_thunk,
+        provider_marshal_emit_import_thunk_for_instance(
+            dependent_instance,
+            "ndis.sys",
+            "NdisMIndicateStatus",
+            provider_publication_cookie,
+        )
+    );
+    retain_or_rollback!(
+        status_complete_thunk,
         provider_marshal_emit_import_thunk_for_instance(
             dependent_instance,
             "ndis.sys",
@@ -22667,7 +22678,8 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
             provider_publication_cookie,
         )
     );
-    mirror.td_complete_thunk = retain_or_rollback!(
+    retain_or_rollback!(
+        td_complete_thunk,
         provider_marshal_emit_import_thunk_for_instance(
             dependent_instance,
             "ndis.sys",
@@ -22675,7 +22687,8 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
             provider_publication_cookie,
         )
     );
-    mirror.query_complete_thunk = retain_or_rollback!(
+    retain_or_rollback!(
+        query_complete_thunk,
         provider_marshal_emit_import_thunk_for_instance(
             dependent_instance,
             "ndis.sys",
@@ -22683,7 +22696,8 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
             provider_publication_cookie,
         )
     );
-    mirror.set_complete_thunk = retain_or_rollback!(
+    retain_or_rollback!(
+        set_complete_thunk,
         provider_marshal_emit_import_thunk_for_instance(
             dependent_instance,
             "ndis.sys",
