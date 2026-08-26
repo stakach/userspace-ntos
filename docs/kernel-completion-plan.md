@@ -13704,3 +13704,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     not broad-scope any arm that mints handles, grows namespace or cache tables, journals CM
     mutations, queues asynchronous state, or parks. Prefer short scratch capture phases followed by
     explicit durable publication, and leave already bounded stack captures unchanged.
+
+    Registry value deletion capture split (2026-08-27, accepted): `NtDeleteValueKey` now captures
+    and validates the caller's Unicode value name in a lexical transient scope, performs its
+    existence check through the borrow-only `registry_value_with` visitor, and copies the bounded
+    name to stack storage. The scope ends before overlay tombstone insertion, SYSTEM mutation
+    construction, non-SYSTEM journal encoding, or services-order invalidation. `NtDeleteKey` was
+    deliberately left unchanged because it takes only a handle; every path it allocates belongs to
+    the durable mutation and journal phase rather than caller capture.
+
+    Serialized acceptance `.tmp/run-headless-delete-value-capture-scope-retry-20260827.log` passed
+    all `295/295` gates, loaded the real user hive, launched userinit and Explorer, and painted all
+    480,000 framebuffer pixels with at least 32 colors. Scratch returned to zero with the unchanged
+    278,112 B peak. Final durable allocation was 14,808,152 B with 6,163,240 B reusable. An earlier
+    identical run reached the complete desktop but missed only the schedule-sensitive scrollbar
+    class-info observation; its CM counters showed zero value deletions, and the clean retry
+    restored that observation without a code change.
+
+    Review adjustment: continue with named Object Manager create/open paths. Their Unicode object
+    names are temporary, but namespace entries, reference counts, and process handles are durable.
+    Introduce a reusable bounded capture representation where it removes repetition, release its
+    transient owner before resolving or creating namespace state, and keep all rollback paths
+    transactional.

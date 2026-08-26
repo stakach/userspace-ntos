@@ -23280,34 +23280,58 @@ impl ExecNtHandler {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
+                let transient_scope = allocator::enter_transient();
                 let name = self.read_registry_ustr_name(args[1]);
-                if self.registry_value(key, &name).is_none() {
+                if self.registry_value_with(key, &name, |_, _| ()).is_none() {
                     return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
                 }
-                if let Some(index) = self.registry_overlay_index(key) {
-                    if !self.overlay.delete_value(index, &name) {
+                let mut name_scratch = [0u8; 1024];
+                let name_len = name.len();
+                if name_len > name_scratch.len() {
+                    return 0xC000_0033; // STATUS_OBJECT_NAME_INVALID
+                }
+                name_scratch[..name_len].copy_from_slice(name.as_bytes());
+                let overlay_index = self.registry_overlay_index(key);
+                let mutable_key = overlay_index
+                    .is_none()
+                    .then(|| self.mutable_registry_key(key))
+                    .flatten();
+                let services_order_may_change = mutable_key.is_some_and(|_| {
+                    self.registry_target_path(key)
+                        .as_deref()
+                        .is_some_and(|path| {
+                            self.registry_services_order_value_write_may_reorder(path)
+                        })
+                });
+                drop(name);
+                drop(transient_scope);
+                let name = match core::str::from_utf8(&name_scratch[..name_len]) {
+                    Ok(name) => name,
+                    Err(_) => return 0xC000_0033,
+                };
+                if let Some(index) = overlay_index {
+                    if !self.overlay.delete_value(index, name) {
                         return 0xC000_0008;
                     }
                     self.overlay_dirty = true;
                     bump_progress();
                     return 0;
                 }
-                if let Some(mutable_key) = self.mutable_registry_key(key) {
-                    let key_path = self.registry_target_path(key);
-                    let services_order_may_change = key_path.as_deref().is_some_and(|path| {
-                        self.registry_services_order_value_write_may_reorder(path)
-                    });
+                if let Some(mutable_key) = mutable_key {
                     let mutation_status = if mutable_key.hive == HIVE_SEL_SYSTEM {
-                        let Some(path) = key_path else {
+                        let Some(path) = self.mutable_key_path(mutable_key) else {
                             return STATUS_INVALID_HANDLE;
                         };
                         self.commit_and_project_system_mutations(
-                            &[OwnedSystemHiveMutation::DeleteValue { path, name }],
+                            &[OwnedSystemHiveMutation::DeleteValue {
+                                path,
+                                name: name.into(),
+                            }],
                             SystemHiveMutationOrigin::Runtime,
                         )
                         .map(|_| ())
                     } else {
-                        self.journal_delete_mutable_value(mutable_key, &name)
+                        self.journal_delete_mutable_value(mutable_key, name)
                     };
                     if let Err(status) = mutation_status {
                         return status;
