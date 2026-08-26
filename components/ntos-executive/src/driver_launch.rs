@@ -30214,6 +30214,12 @@ unsafe fn hosted_resource_map_caps_mut() -> &'static mut Vec<HostedResourceMapCa
     slot.as_mut().unwrap()
 }
 
+unsafe fn reserve_hosted_resource_map_caps(additional: usize) -> Result<(), nt_status::NtStatus> {
+    hosted_resource_map_caps_mut()
+        .try_reserve_exact(additional)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)
+}
+
 unsafe fn record_hosted_resource_map_cap(instance: usize, device_id: u64, cap: u64) {
     if cap == 0 {
         return;
@@ -30236,9 +30242,10 @@ unsafe fn clear_hosted_resource_map_caps(instance: usize, device_id: Option<u64>
         if caps[index].instance == instance
             && device_id.is_none_or(|device_id| caps[index].device_id == device_id)
         {
-            let mapping = caps.remove(index);
-            if mapping.cap != 0 && cnode_delete_recycle_r(mapping.cap) != 0 {
+            if caps[index].cap != 0 && cnode_delete_recycle_r(caps[index].cap) != 0 {
                 failures += 1;
+            } else {
+                caps.remove(index);
             }
         }
     }
@@ -30723,8 +30730,7 @@ fn hosted_irp_dispatch_request(
         buffer_id: irp.buffer.map(|buffer| buffer.buffer_id).unwrap_or(0),
         buffer_len: u32::try_from(input_len.max(output_len))
             .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?,
-        input_len: u32::try_from(input_len)
-            .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?,
+        input_len: u32::try_from(input_len).map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?,
         output_len: u32::try_from(output_len)
             .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?,
         ioctl_code: u32::try_from(projection_fsctl(irp))
@@ -31466,6 +31472,7 @@ struct HostedDeviceResourceState {
     video_memory_len: u64,
     video_memory_caller_va: u64,
     post_bind_rx_pending: bool,
+    pnp_context_lease: Option<nt_pnp_context::ContextLeaseIdentity>,
     evidence: HostedHardwareEvidence,
 }
 
@@ -31555,8 +31562,7 @@ unsafe fn hosted_device_resource_states() -> Option<&'static Vec<HostedDeviceRes
     (*core::ptr::addr_of!(HOSTED_DEVICE_RESOURCE_STATES)).as_ref()
 }
 
-unsafe fn hosted_device_property_transfers_mut(
-) -> &'static mut HostedDevicePropertyTransferTable {
+unsafe fn hosted_device_property_transfers_mut() -> &'static mut HostedDevicePropertyTransferTable {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DEVICE_PROPERTY_TRANSFERS);
     if slot.is_none() {
         *slot = Some(HostedDevicePropertyTransferTable::new());
@@ -31573,9 +31579,59 @@ unsafe fn hosted_device_resource_state_by_device_id(
         .find(|state| state.device_id != 0 && state.device_id == device_id)
 }
 
-fn hosted_state_address_resources(
-    state: &HostedDeviceResourceState,
-) -> &[SharedAddressResource] {
+unsafe fn install_pending_hosted_pnp_context_lease(
+    binding: HostedDeviceBinding,
+    bus_identity: HostedBusIdentity,
+    lease: nt_pnp_context::ContextLeaseIdentity,
+) -> Result<(), nt_status::NtStatus> {
+    let state = HostedDeviceResourceState {
+        device_id: binding.device_id,
+        driver_id: binding.driver_id,
+        instance: binding.instance,
+        pdo_object: binding.pdo_object,
+        interface_type: bus_identity.interface_type,
+        bus_number: bus_identity.bus_number,
+        address: bus_identity.address,
+        pci_vendor_device: (bus_identity.pci_device_id as u32) << 16
+            | bus_identity.pci_vendor_id as u32,
+        pci_class_rev: (bus_identity.pci_class & 0x00FF_FFFF) << 8,
+        pci_irq: bus_identity.pci_irq_line as u32 | ((bus_identity.pci_irq_pin as u32) << 8),
+        pnp_context_lease: Some(lease),
+        ..HostedDeviceResourceState::default()
+    };
+    let states = hosted_device_resource_states_mut();
+    if states
+        .iter()
+        .any(|current| current.device_id == binding.device_id)
+    {
+        return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
+    }
+    states
+        .try_reserve(1)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    states.push(state);
+    Ok(())
+}
+
+unsafe fn stage_hosted_address_resources(
+    device_id: u64,
+    resources: &[SharedAddressResource],
+) -> Result<(), nt_status::NtStatus> {
+    if resources.len() > SH_RESOURCE_ADDRESS_RECORD_CAPACITY as usize {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let state = hosted_device_resource_states_mut()
+        .iter_mut()
+        .find(|state| state.device_id == device_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    state.address_resource_count = resources.len() as u8;
+    state.address_resources =
+        [SharedAddressResource::default(); SH_RESOURCE_ADDRESS_RECORD_CAPACITY as usize];
+    state.address_resources[..resources.len()].copy_from_slice(resources);
+    Ok(())
+}
+
+fn hosted_state_address_resources(state: &HostedDeviceResourceState) -> &[SharedAddressResource] {
     &state.address_resources[..state.address_resource_count as usize]
 }
 
@@ -31606,7 +31662,6 @@ unsafe fn snapshot_shared_address_resources(
     Some((count as u8, resources))
 }
 
-
 unsafe fn retire_hosted_io_port_cap(cap: u64) -> Result<(), nt_status::NtStatus> {
     if cap == 0 {
         return Ok(());
@@ -31620,9 +31675,7 @@ unsafe fn retire_hosted_io_port_cap(cap: u64) -> Result<(), nt_status::NtStatus>
     Ok(())
 }
 
-unsafe fn remove_hosted_device_resource_state(
-    device_id: u64,
-) -> Result<(), nt_status::NtStatus> {
+unsafe fn retire_hosted_device_port_caps(device_id: u64) -> Result<(), nt_status::NtStatus> {
     let states = hosted_device_resource_states_mut();
     let Some(index) = states
         .iter()
@@ -31631,7 +31684,9 @@ unsafe fn remove_hosted_device_resource_state(
         return Ok(());
     };
     let state = states[index];
-    for resource in hosted_state_address_resources(&state) {
+    let mut resource_index = 0usize;
+    while resource_index < state.address_resource_count as usize {
+        let resource = state.address_resources[resource_index];
         let cap = resource.broker_va_or_root_cap;
         if resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT
             && cap != 0
@@ -31644,6 +31699,25 @@ unsafe fn remove_hosted_device_resource_state(
         {
             retire_hosted_io_port_cap(cap)?;
         }
+        if resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT {
+            states[index].address_resources[resource_index].broker_va_or_root_cap = 0;
+        }
+        resource_index += 1;
+    }
+    Ok(())
+}
+
+unsafe fn remove_hosted_device_resource_state(device_id: u64) -> Result<(), nt_status::NtStatus> {
+    let states = hosted_device_resource_states_mut();
+    let Some(index) = states
+        .iter()
+        .position(|state| state.device_id != 0 && state.device_id == device_id)
+    else {
+        return Ok(());
+    };
+    if let Some(lease) = states[index].pnp_context_lease {
+        crate::release_hosted_pnp_context_lease(lease)?;
+        states[index].pnp_context_lease = None;
     }
     states.remove(index);
     Ok(())
@@ -31731,21 +31805,10 @@ fn video_port_status(status: u32) -> Result<(), nt_status::NtStatus> {
     }
 }
 
-unsafe fn revoke_hosted_device_resources(
-    binding: HostedDeviceBinding,
-) -> Result<(), nt_status::NtStatus> {
-    // Hardware authority is withdrawn before the canonical range becomes assignable again.
-    remove_hosted_device_resource_state(binding.device_id)?;
-    let _ = hosted_resource_manager_mut().revoke_owner(hosted_resource_owner(binding));
-    let _ = hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
-    Ok(())
-}
-
 unsafe fn clear_hosted_resource_projection(
     binding: HostedDeviceBinding,
     sh: u64,
 ) -> Result<(), nt_status::NtStatus> {
-    revoke_hosted_device_resources(binding)?;
     if let Some((instance, inst)) = instance_by_driver_id(binding.driver_id) {
         let failures = clear_hosted_resource_map_caps_for_device(instance, binding.device_id);
         if failures != 0 {
@@ -31754,18 +31817,33 @@ unsafe fn clear_hosted_resource_projection(
             print_str(b" failures=");
             print_u64(failures);
             print_str(b"\n");
+            return Err(nt_status::NtStatus::UNSUCCESSFUL);
         }
         if inst.cnode != 0 {
-            let mut slot = 0;
-            while slot < crate::CT_IO_PORT_CAPACITY {
-                let _ = crate::cnode_delete_in_cnode_r(
-                    inst.cnode,
-                    crate::CT_IO_PORT_BASE + slot,
-                );
-                slot += 1;
+            if let Some(state) = hosted_device_resource_state_by_device_id(binding.device_id) {
+                let mut resource_index = 0usize;
+                while resource_index < state.address_resource_count as usize {
+                    let resource = state.address_resources[resource_index];
+                    if resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT && resource.component_cap != 0
+                    {
+                        if crate::cnode_delete_in_cnode_r(inst.cnode, resource.component_cap) != 0 {
+                            return Err(nt_status::NtStatus::UNSUCCESSFUL);
+                        }
+                        if let Some(current) = hosted_device_resource_states_mut()
+                            .iter_mut()
+                            .find(|current| current.device_id == binding.device_id)
+                        {
+                            current.address_resources[resource_index].component_cap = 0;
+                        }
+                    }
+                    resource_index += 1;
+                }
             }
         }
     }
+    retire_hosted_device_port_caps(binding.device_id)?;
+    let _ = hosted_resource_manager_mut().revoke_owner(hosted_resource_owner(binding));
+    let _ = hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
     clear_shared_address_resources(sh);
     write_volatile((sh + SH_RESOURCE_PDO_OBJECT) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_VECTOR) as *mut u32, 0);
@@ -31808,6 +31886,7 @@ unsafe fn clear_hosted_resource_projection(
     write_volatile((sh + SH_DMA_ALLOCATED_LOGICAL) as *mut u64, 0);
     write_volatile((sh + SH_DMA_FREED_LOGICAL) as *mut u64, 0);
     clear_dma_allocation_records(sh);
+    remove_hosted_device_resource_state(binding.device_id)?;
     Ok(())
 }
 
@@ -31839,17 +31918,13 @@ pub(crate) fn service_hosted_root_pdo_pnp(
     minor: u8,
     active_reply_cap: u64,
 ) -> i32 {
-    let (instance, inst, device_id) = match authenticated_hosted_root_pdo(
-        ch,
-        pdo_object,
-        active_reply_cap,
-    ) {
+    let (instance, inst, device_id) =
+        match authenticated_hosted_root_pdo(ch, pdo_object, active_reply_cap) {
         Ok(resolved) => resolved,
         Err(status) => return status.raw(),
     };
     let authorized = unsafe {
-        hosted_device_bindings()
-            .is_some_and(|bindings| {
+        hosted_device_bindings().is_some_and(|bindings| {
                 bindings.iter().any(|binding| {
                     binding.used
                         && binding.projection_instance == instance
@@ -31908,8 +31983,8 @@ unsafe fn config_device_property_snapshot(
     instance_path: &str,
     property: u32,
 ) -> Result<Vec<u8>, nt_config_client::QueryError> {
-    let required = match crate::config_manager_query_device_property(instance_path, property, &mut [])
-    {
+    let required =
+        match crate::config_manager_query_device_property(instance_path, property, &mut []) {
         Ok(0) => return Ok(Vec::new()),
         Ok(_) => {
             return Err(nt_config_client::QueryError {
@@ -31979,7 +32054,9 @@ pub(crate) fn service_hosted_device(
             claim_hosted_supplemental_port_range(binding, inst, ch.shared_va, arg2, arg3)
         };
         return (
-            status.map(|()| STATUS_SUCCESS).unwrap_or_else(|error| error.raw()),
+            status
+                .map(|()| STATUS_SUCCESS)
+                .unwrap_or_else(|error| error.raw()),
             0,
             0,
             0,
@@ -32526,6 +32603,7 @@ unsafe fn read_hosted_device_resource_state_from_shared(
         post_bind_rx_pending: previous_state
             .map(|state| state.post_bind_rx_pending)
             .unwrap_or(false),
+        pnp_context_lease: previous_state.and_then(|state| state.pnp_context_lease),
         evidence,
     }
 }
@@ -32640,10 +32718,7 @@ unsafe fn claim_hosted_supplemental_port_range(
         return Ok(());
     }
 
-    let Some(last) = start
-        .checked_add(length)
-        .and_then(|end| end.checked_sub(1))
-    else {
+    let Some(last) = start.checked_add(length).and_then(|end| end.checked_sub(1)) else {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     };
     if length == 0 || start > u16::MAX as u64 || last > u16::MAX as u64 {
@@ -32669,8 +32744,7 @@ unsafe fn claim_hosted_supplemental_port_range(
         ..crate::CT_IO_PORT_BASE + crate::CT_IO_PORT_CAPACITY)
         .find(|slot| {
             !used_slots.iter().any(|resource| {
-                resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT
-                    && resource.component_cap == *slot
+                resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT && resource.component_cap == *slot
             })
         })
     else {
@@ -33047,14 +33121,16 @@ pub(crate) unsafe fn hosted_io_port_fault_grant(
     let (instance, inst) = instance_by_shared_va(shared_va)?;
     let pdo_object = read_volatile((shared_va + SH_RESOURCE_PDO_OBJECT) as *const u64);
     let states = hosted_device_resource_states()?;
-    let state = states.iter().copied().find(|state| state.instance == instance
-        && state.pdo_object == pdo_object
-        && {
-        hosted_state_address_resources(state).iter().any(|resource| {
+    let state = states.iter().copied().find(|state| {
+        state.instance == instance && state.pdo_object == pdo_object && {
+            hosted_state_address_resources(state)
+                .iter()
+                .any(|resource| {
             resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT
                 && resource.broker_va_or_root_cap != 0
                 && io_port_in_range(port, resource.translated_start, resource.len)
         })
+        }
     })?;
     let resource = hosted_state_address_resources(&state)
         .iter()
@@ -33711,10 +33787,7 @@ unsafe fn hosted_mmio_write_u32(state: HostedDeviceResourceState, offset: u64, v
     if resource.broker_va_or_root_cap == 0 || end > resource.map_len {
         return false;
     }
-    write_volatile(
-        (resource.broker_va_or_root_cap + offset) as *mut u32,
-        value,
-    );
+    write_volatile((resource.broker_va_or_root_cap + offset) as *mut u32, value);
     true
 }
 
@@ -34679,48 +34752,75 @@ pub(crate) fn hosted_hardware_evidence(device_id: u64) -> Option<HostedHardwareE
     Some(evidence)
 }
 
+fn teardown_hosted_device_binding(binding: HostedDeviceBinding) -> bool {
+    let resource_state_exists =
+        unsafe { hosted_device_resource_state_by_device_id(binding.device_id).is_some() };
+    if resource_state_exists {
+        let Some((_, inst)) = instance_by_driver_id(binding.driver_id) else {
+            return false;
+        };
+        if unsafe { clear_hosted_resource_projection(binding, inst.exec_shared_va) }.is_err() {
+            return false;
+        }
+    }
+    if !io_manager_mut().unbind_hosted_device_address(
+        nt_io_manager::HostedDomainId(binding.projection_domain_id),
+        binding.device_object,
+        nt_io_manager::DeviceId(binding.device_id),
+    ) {
+        return false;
+    }
+    unsafe { release_hosted_registry_identity(binding.registry_identity_id) };
+    true
+}
+
 fn clear_hosted_device_binding_by_device_id(device_id: u64) {
-    let Some(bindings) = (unsafe { (*core::ptr::addr_of_mut!(HOSTED_DEVICE_BINDINGS)).as_mut() })
+    let Some(index) = (unsafe { (*core::ptr::addr_of!(HOSTED_DEVICE_BINDINGS)).as_ref() })
+        .and_then(|bindings| {
+            bindings
+                .iter()
+                .position(|slot| slot.used && slot.device_id == device_id)
+        })
     else {
         return;
     };
-    if let Some(slot) = bindings
-        .iter_mut()
-        .find(|slot| slot.used && slot.device_id == device_id)
-    {
-        let identity_id = slot.registry_identity_id;
-        let _ = io_manager_mut().unbind_hosted_device_address(
-            nt_io_manager::HostedDomainId(slot.projection_domain_id),
-            slot.device_object,
-            nt_io_manager::DeviceId(slot.device_id),
-        );
+    let binding = unsafe {
+        (*core::ptr::addr_of!(HOSTED_DEVICE_BINDINGS))
+            .as_ref()
+            .unwrap()[index]
+    };
+    if teardown_hosted_device_binding(binding) {
         unsafe {
-            let _ = revoke_hosted_device_resources(*slot);
-            release_hosted_registry_identity(identity_id);
+            (*core::ptr::addr_of_mut!(HOSTED_DEVICE_BINDINGS))
+                .as_mut()
+                .unwrap()[index] = EMPTY_HOSTED_DEVICE_BINDING;
         }
-        *slot = EMPTY_HOSTED_DEVICE_BINDING;
     }
 }
 
 fn clear_hosted_device_bindings_for_instance(instance: usize) {
-    let Some(bindings) = (unsafe { (*core::ptr::addr_of_mut!(HOSTED_DEVICE_BINDINGS)).as_mut() })
-    else {
-        return;
+    let mut index = 0usize;
+    loop {
+        let binding = unsafe {
+            (*core::ptr::addr_of!(HOSTED_DEVICE_BINDINGS))
+                .as_ref()
+                .and_then(|bindings| bindings.get(index))
+                .copied()
     };
-    for slot in bindings.iter_mut() {
-        if slot.used && (slot.instance == instance || slot.projection_instance == instance) {
-            let identity_id = slot.registry_identity_id;
-            let _ = io_manager_mut().unbind_hosted_device_address(
-                nt_io_manager::HostedDomainId(slot.projection_domain_id),
-                slot.device_object,
-                nt_io_manager::DeviceId(slot.device_id),
-            );
+        let Some(binding) = binding else {
+            break;
+        };
+        if binding.used
+            && (binding.instance == instance || binding.projection_instance == instance)
+            && teardown_hosted_device_binding(binding)
+        {
             unsafe {
-                let _ = revoke_hosted_device_resources(*slot);
-                release_hosted_registry_identity(identity_id);
+                (*core::ptr::addr_of_mut!(HOSTED_DEVICE_BINDINGS))
+                    .as_mut()
+                    .unwrap()[index] = EMPTY_HOSTED_DEVICE_BINDING;
             }
-            *slot = EMPTY_HOSTED_DEVICE_BINDING;
         }
+        index += 1;
     }
 }
 
@@ -35669,9 +35769,8 @@ fn clear_instance(i: usize) {
         clear_instance_exec_mappings(i);
     }
     if domain_id != 0 {
-        let removed = io_manager_mut().unregister_hosted_domain(nt_io_manager::HostedDomainId(
-            domain_id,
-        ));
+        let removed =
+            io_manager_mut().unregister_hosted_domain(nt_io_manager::HostedDomainId(domain_id));
         if !removed {
             print_str(b"[driver-launch] hosted domain teardown rejected id=0x");
             print_hex64(domain_id);
@@ -37243,10 +37342,7 @@ unsafe fn dispatch_video_add_device_for_instance(
     object_number: u32,
     pdo_object: u64,
 ) -> Result<AddDeviceDispatchResult, nt_status::NtStatus> {
-    if inst.driver_object == 0
-        || pdo_object == 0
-        || !hosted_instance_video_port_initialized(inst)
-    {
+    if inst.driver_object == 0 || pdo_object == 0 || !hosted_instance_video_port_initialized(inst) {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
 
@@ -37571,9 +37667,7 @@ where
             nt_pnp_manager::PnpError::InsufficientResources => {
                 nt_status::NtStatus::INSUFFICIENT_RESOURCES
             }
-            nt_pnp_manager::PnpError::ConflictingPdo => {
-                nt_status::NtStatus::OBJECT_NAME_COLLISION
-            }
+            nt_pnp_manager::PnpError::ConflictingPdo => nt_status::NtStatus::OBJECT_NAME_COLLISION,
             nt_pnp_manager::PnpError::InvalidIdentity
             | nt_pnp_manager::PnpError::InvalidTransition
             | nt_pnp_manager::PnpError::StaleId => nt_status::NtStatus::INVALID_PARAMETER,
@@ -37603,9 +37697,11 @@ where
         }
         None => {
             let pdo_object = create_hosted_root_pdo_projection(projection_instance)?;
-            if let Err(status) =
-                io_manager_mut().bind_hosted_device_address(projection_domain, pdo_object, pdo_device)
-            {
+            if let Err(status) = io_manager_mut().bind_hosted_device_address(
+                projection_domain,
+                pdo_object,
+                pdo_device,
+            ) {
                 let _ = rollback_hosted_add_device_projection(
                     projection_instance,
                     0,
@@ -37619,8 +37715,9 @@ where
         }
     };
 
-    let provider_add_device_shared = provider_route
-        .and_then(|route| instance(route.provider_instance).map(|provider| provider.exec_shared_va));
+    let provider_add_device_shared = provider_route.and_then(|route| {
+        instance(route.provider_instance).map(|provider| provider.exec_shared_va)
+    });
     let mut registry_identity_id = INVALID_HOSTED_REGISTRY_IDENTITY_ID;
     let mut add_device = None;
     let mut fdo_device_id = None;
@@ -37656,9 +37753,9 @@ where
             }
         }
         let fdo_name = match add_device.fdo_name.as_ref() {
-            Some(name) => Some(
-                parse_nt_path(name.as_str()).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?,
-            ),
+            Some(name) => {
+                Some(parse_nt_path(name.as_str()).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?)
+            }
             None => None,
         };
         let device_type = if hosted_instance_video_port_initialized(inst) {
@@ -37677,9 +37774,7 @@ where
         fdo_device_id = Some(device_id);
         io_manager_mut().attach_device_to_stack(device_id, pdo_device)?;
         canonical_fdo_attached = true;
-        if !driver_instances()
-            .is_some_and(|table| index < table.len() && table[index].used)
-        {
+        if !driver_instances().is_some_and(|table| index < table.len() && table[index].used) {
             return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
         }
         register_hosted_device_binding(
@@ -37784,23 +37879,17 @@ unsafe fn rollback_staged_hosted_resource_grant(
     inst: DriverInstance,
     issued_port_caps: &mut Vec<u64>,
 ) {
-    if inst.cnode != 0 {
-        let mut slot = 0;
-        while slot < crate::CT_IO_PORT_CAPACITY {
-            let _ = crate::cnode_delete_in_cnode_r(inst.cnode, crate::CT_IO_PORT_BASE + slot);
-            slot += 1;
-        }
+    let _ = instance_index;
+    issued_port_caps.clear();
+    if let Err(status) = clear_hosted_resource_projection(binding, inst.exec_shared_va) {
+        print_str(b"[driver-launch] staged resource rollback retained status=0x");
+        print_hex(status.raw() as u32);
+        print_str(b" device_id=");
+        print_u64(binding.device_id);
+        print_str(b"\n");
     }
-    for cap in issued_port_caps.drain(..).rev() {
-        let _ = retire_hosted_io_port_cap(cap);
-    }
-    let _ = clear_hosted_resource_map_caps_for_device(instance_index, binding.device_id);
-    let _ = hosted_resource_manager_mut().revoke_owner(hosted_resource_owner(binding));
-    let _ = hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
-    clear_shared_address_resources(inst.exec_shared_va);
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn grant_hosted_device_resources(
     device_id: u64,
@@ -37817,6 +37906,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     dma_pages: u64,
     dma_logical: u64,
     dma_len: u64,
+    pnp_context_lease: nt_pnp_context::ContextLeaseIdentity,
 ) -> Result<(), nt_status::NtStatus> {
     if memory.len() + ports.len() > SH_RESOURCE_ADDRESS_RECORD_CAPACITY as usize
         || memory.is_empty() && ports.is_empty()
@@ -37911,9 +38001,6 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
 
-    clear_hosted_resource_projection(binding, inst.exec_shared_va)?;
-    trace_hosted_resource_grant(b"begin", device_id, 0, 0);
-
     let mut issued_port_caps = Vec::new();
     issued_port_caps
         .try_reserve_exact(ports.len())
@@ -37922,6 +38009,21 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     resources
         .try_reserve_exact(memory.len() + ports.len())
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    let mut assignments = Vec::new();
+    assignments
+        .try_reserve_exact(memory.len() + ports.len() + usize::from(interrupt_vector != 0))
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    let map_cap_count = memory
+        .iter()
+        .try_fold(0u64, |count, grant| count.checked_add(grant.map_pages))
+        .and_then(|count| count.checked_add(if has_dma { dma_pages } else { 0 }))
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    reserve_hosted_resource_map_caps(map_cap_count)?;
+
+    clear_hosted_resource_projection(binding, inst.exec_shared_va)?;
+    install_pending_hosted_pnp_context_lease(binding, bus_identity, pnp_context_lease)?;
+    trace_hosted_resource_grant(b"begin", device_id, 0, 0);
 
     for (resource_index, grant) in memory.iter().enumerate() {
         let mapped_len = grant.length.min(grant.map_pages.saturating_mul(0x1000));
@@ -38005,6 +38107,15 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             broker_va_or_root_cap: grant.broker_va,
             component_cap: 0,
         });
+        if let Err(status) = stage_hosted_address_resources(binding.device_id, &resources) {
+            rollback_staged_hosted_resource_grant(
+                binding,
+                instance_index,
+                inst,
+                &mut issued_port_caps,
+            );
+            return Err(status);
+        }
         trace_hosted_resource_grant(
             b"memory-done",
             device_id,
@@ -38114,20 +38225,33 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             broker_va_or_root_cap: cap,
             component_cap: component_slot,
         });
+        if let Err(status) = stage_hosted_address_resources(binding.device_id, &resources) {
+            rollback_staged_hosted_resource_grant(
+                binding,
+                instance_index,
+                inst,
+                &mut issued_port_caps,
+            );
+            return Err(status);
+        }
     }
     resources.sort_unstable_by_key(|resource| resource.bar_index);
 
-    let mut assignments = Vec::new();
-    assignments
-        .try_reserve_exact(resources.len() + usize::from(interrupt_vector != 0))
-        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     for resource in &resources {
         let resource_id = if resource.kind == SH_RESOURCE_ADDRESS_KIND_MEMORY {
             hosted_mmio_resource_id(device_id, resource.bar_index)
         } else {
             hosted_io_port_resource_id(device_id, resource.bar_index)
-        }
-        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+        };
+        let Some(resource_id) = resource_id else {
+            rollback_staged_hosted_resource_grant(
+                binding,
+                instance_index,
+                inst,
+                &mut issued_port_caps,
+            );
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        };
         assignments.push(nt_hal_abi::HalResourceDescriptor {
             kind: if resource.kind == SH_RESOURCE_ADDRESS_KIND_MEMORY {
                 nt_hal_abi::RES_KIND_MEMORY
@@ -38158,6 +38282,15 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         });
     }
     if interrupt_vector != 0 {
+        let Some(resource_id) = hosted_interrupt_resource_id(device_id) else {
+            rollback_staged_hosted_resource_grant(
+                binding,
+                instance_index,
+                inst,
+                &mut issued_port_caps,
+            );
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        };
         let (arg0, arg1) = nt_hal_abi::HalResourceDescriptor::interrupt_args(
             interrupt_vector,
             interrupt_vector.min(0xF) as u8,
@@ -38175,8 +38308,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             } else {
                 nt_hal_abi::SHARE_EXCLUSIVE
             },
-            resource_id: hosted_interrupt_resource_id(device_id)
-                .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?,
+            resource_id,
             arg0,
             arg1,
             ..Default::default()
@@ -38185,29 +38317,22 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     if let Err(error) = hosted_resource_manager_mut()
         .replace_owner_assignments(hosted_resource_owner(binding), &assignments)
     {
-        rollback_staged_hosted_resource_grant(
-            binding,
-            instance_index,
-            inst,
-            &mut issued_port_caps,
-        );
+        rollback_staged_hosted_resource_grant(binding, instance_index, inst, &mut issued_port_caps);
         return Err(hosted_hal_status(error));
     }
 
     let sh = inst.exec_shared_va;
     if !publish_shared_address_resources(sh, &resources) {
-        rollback_staged_hosted_resource_grant(
-            binding,
-            instance_index,
-            inst,
-            &mut issued_port_caps,
-        );
+        rollback_staged_hosted_resource_grant(binding, instance_index, inst, &mut issued_port_caps);
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
 
     write_volatile((sh + SH_RESOURCE_IO_PORT_OUT32_FAULTS) as *mut u64, 0);
     clear_shared_io_port_evidence_at(sh);
-    write_volatile((sh + SH_RESOURCE_PDO_OBJECT) as *mut u64, binding.pdo_object);
+    write_volatile(
+        (sh + SH_RESOURCE_PDO_OBJECT) as *mut u64,
+        binding.pdo_object,
+    );
     write_volatile(
         (sh + SH_RESOURCE_INTERRUPT_VECTOR) as *mut u32,
         interrupt_vector,
@@ -38296,9 +38421,18 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         state.dma_broker_va = dma_broker_va;
         state.dma_frame_base = dma_frame_base;
         state.dma_pages = dma_pages;
+        state.pnp_context_lease = Some(pnp_context_lease);
+    } else {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     trace_hosted_resource_grant(b"done", device_id, 0, 0);
     Ok(())
+}
+
+pub(crate) fn hosted_pnp_context_lease_for_device(
+    device_id: u64,
+) -> Option<nt_pnp_context::ContextLeaseIdentity> {
+    unsafe { hosted_device_resource_state_by_device_id(device_id)?.pnp_context_lease }
 }
 
 unsafe fn replay_hosted_dma_allocation_records(
@@ -38860,9 +38994,7 @@ pub(crate) unsafe fn commit_hosted_device_resource_assignment(
             nt_pnp_manager::PnpError::InsufficientResources => {
                 nt_status::NtStatus::INSUFFICIENT_RESOURCES
             }
-            nt_pnp_manager::PnpError::ConflictingPdo => {
-                nt_status::NtStatus::OBJECT_NAME_COLLISION
-            }
+            nt_pnp_manager::PnpError::ConflictingPdo => nt_status::NtStatus::OBJECT_NAME_COLLISION,
             nt_pnp_manager::PnpError::InvalidIdentity
             | nt_pnp_manager::PnpError::InvalidTransition
             | nt_pnp_manager::PnpError::StaleId => nt_status::NtStatus::INVALID_PARAMETER,
@@ -38882,9 +39014,7 @@ pub(crate) unsafe fn commit_hosted_filtered_resource_requirements(
             nt_pnp_manager::PnpError::InsufficientResources => {
                 nt_status::NtStatus::INSUFFICIENT_RESOURCES
             }
-            nt_pnp_manager::PnpError::ConflictingPdo => {
-                nt_status::NtStatus::OBJECT_NAME_COLLISION
-            }
+            nt_pnp_manager::PnpError::ConflictingPdo => nt_status::NtStatus::OBJECT_NAME_COLLISION,
             nt_pnp_manager::PnpError::InvalidIdentity
             | nt_pnp_manager::PnpError::InvalidTransition
             | nt_pnp_manager::PnpError::StaleId => nt_status::NtStatus::INVALID_PARAMETER,
@@ -38987,8 +39117,8 @@ pub(crate) unsafe fn start_hosted_device(
         .len()
         .checked_add(translated_resource_list.len())
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    let total_len_u32 = u32::try_from(total_len)
-        .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+    let total_len_u32 =
+        u32::try_from(total_len).map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
     let mut resource_lists = Vec::new();
     resource_lists
         .try_reserve_exact(total_len)

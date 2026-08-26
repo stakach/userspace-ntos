@@ -66,6 +66,126 @@ pub enum LeaseError {
     UnknownLease,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotError {
+    InvalidRange,
+    InsufficientResources,
+    UnknownReservation,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SlotReservation {
+    first: u64,
+    count: NonZeroU64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SlotReleaseError {
+    error: SlotError,
+    reservation: SlotReservation,
+}
+
+impl SlotReleaseError {
+    pub const fn error(&self) -> SlotError {
+        self.error
+    }
+
+    pub fn into_reservation(self) -> SlotReservation {
+        self.reservation
+    }
+}
+
+impl SlotReservation {
+    pub const fn first(&self) -> u64 {
+        self.first
+    }
+
+    pub const fn count(&self) -> u64 {
+        self.count.get()
+    }
+}
+
+pub struct SlotAllocator {
+    occupied: Vec<bool>,
+    limit: u64,
+}
+
+impl SlotAllocator {
+    pub const fn new(limit: u64) -> Self {
+        Self {
+            occupied: Vec::new(),
+            limit,
+        }
+    }
+
+    pub fn allocate(&mut self, count: u64) -> Result<SlotReservation, SlotError> {
+        let count = NonZeroU64::new(count).ok_or(SlotError::InvalidRange)?;
+        if count.get() > self.limit || count.get() > usize::MAX as u64 {
+            return Err(SlotError::InvalidRange);
+        }
+        let count_usize = count.get() as usize;
+        let mut first = 0usize;
+        while first
+            .checked_add(count_usize)
+            .is_some_and(|end| end <= self.occupied.len())
+        {
+            if self.occupied[first..first + count_usize]
+                .iter()
+                .all(|occupied| !occupied)
+            {
+                self.occupied[first..first + count_usize].fill(true);
+                return Ok(SlotReservation {
+                    first: first as u64,
+                    count,
+                });
+            }
+            first += 1;
+        }
+
+        let first = self.occupied.len() as u64;
+        let end = first
+            .checked_add(count.get())
+            .ok_or(SlotError::InvalidRange)?;
+        if end > self.limit {
+            return Err(SlotError::InsufficientResources);
+        }
+        self.occupied
+            .try_reserve(count_usize)
+            .map_err(|_| SlotError::InsufficientResources)?;
+        self.occupied.resize(end as usize, true);
+        Ok(SlotReservation { first, count })
+    }
+
+    pub fn release(&mut self, reservation: SlotReservation) -> Result<(), SlotReleaseError> {
+        let invalid = |reservation| SlotReleaseError {
+            error: SlotError::UnknownReservation,
+            reservation,
+        };
+        let Ok(first) = usize::try_from(reservation.first) else {
+            return Err(invalid(reservation));
+        };
+        let Ok(count) = usize::try_from(reservation.count.get()) else {
+            return Err(invalid(reservation));
+        };
+        let Some(end) = first.checked_add(count) else {
+            return Err(invalid(reservation));
+        };
+        if end > self.occupied.len() || !self.occupied[first..end].iter().all(|occupied| *occupied)
+        {
+            return Err(invalid(reservation));
+        }
+        self.occupied[first..end].fill(false);
+        while self.occupied.last() == Some(&false) {
+            self.occupied.pop();
+        }
+        Ok(())
+    }
+
+    pub fn occupied_slots(&self) -> usize {
+        self.occupied.iter().filter(|occupied| **occupied).count()
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum PublishError<T> {
     IdExhausted(T),
@@ -344,5 +464,40 @@ mod tests {
         assert_eq!(registry.release(lease_1), Ok(Some("owner-1")));
         assert_eq!(registry.retired_contexts(), 0);
         assert_eq!(registry.active_description(), Some(&3));
+    }
+
+    #[test]
+    fn slots_are_not_reused_until_exact_reservation_release() {
+        let mut allocator = SlotAllocator::new(4);
+        let first = allocator.allocate(2).unwrap();
+        let second = allocator.allocate(2).unwrap();
+        assert_eq!(first.first(), 0);
+        assert_eq!(second.first(), 2);
+        assert_eq!(allocator.allocate(1), Err(SlotError::InsufficientResources));
+
+        allocator.release(first).unwrap();
+        let replacement = allocator.allocate(2).unwrap();
+        assert_eq!(replacement.first(), 0);
+        assert_eq!(allocator.occupied_slots(), 4);
+    }
+
+    #[test]
+    fn invalid_slot_release_preserves_other_reservations() {
+        let mut allocator = SlotAllocator::new(4);
+        let first = allocator.allocate(1).unwrap();
+        let duplicate = SlotReservation {
+            first: first.first(),
+            count: NonZeroU64::new(first.count()).unwrap(),
+        };
+        let second = allocator.allocate(1).unwrap();
+        allocator.release(first).unwrap();
+        let error = allocator.release(duplicate).unwrap_err();
+        assert_eq!(error.error(), SlotError::UnknownReservation);
+        let duplicate = error.into_reservation();
+        assert_eq!(duplicate.first(), 0);
+        assert_eq!(duplicate.count(), 1);
+        assert_eq!(allocator.occupied_slots(), 1);
+        assert_eq!(second.first(), 1);
+        assert_eq!(allocator.allocate(1).unwrap().first(), 0);
     }
 }

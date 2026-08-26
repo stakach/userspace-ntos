@@ -11505,6 +11505,47 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     it only after device projection/resource revoke succeeds. PCI BAR and DMA source frame runs
     remain bus-grant authority and must never be retired by the context owner.
 
+    Hosted-PnP executive context lifetime checkpoint (2026-08-26, accepted): the three
+    independently replaceable PCI-device, PCI-window, and root-window globals and their monotonic
+    VA cursors are deleted. One `HostedPnpContextAuthority` now publishes the immutable description
+    and non-clonable owner atomically. The owner contains only executive-created root-seed aliases,
+    synthetic root frames, and reusable component/root-seed/DMA-logical VA reservations; PCI BAR,
+    framebuffer, and DMA source runs remain borrowed bus-grant authority. Failed immediate unmap,
+    cap deletion, or slot release keeps the exact record owned for a later retirement retry rather
+    than losing or reusing it.
+
+    Every PCI or root device preparation acquires one non-clonable context lease and moves its exact
+    identity into `HostedDeviceResourceState` only after all ordinary allocations are reserved and
+    before the first external resource is staged. Preparation, `AddDevice`, and grant failures now
+    propagate lease-release failures. Successful grant settlement verifies that the canonical state
+    retained the same lease generation. Teardown removes component mappings and child I/O caps,
+    retires broker caps and manager/DMA ownership, clears the shared resource projection, and only
+    then releases the context lease; any failed exact cleanup keeps the state and lease available
+    for retry. Root-device proof lookup is also lease-relative, so a replaced context cannot redirect
+    a live device to the current generation's window.
+
+    Focused validation is green for `nt-pnp-context` at `9/9`, including reusable VA slots and a
+    duplicate-release test that returns the rejected reservation without freeing its live neighbor.
+    The freestanding executive release check remains at the established 212-warning baseline and
+    `git diff --check` is clean. Serialized proof
+    `.tmp/run-desktop-20260826-103655.log` reaches genuine Explorer chrome and passes all `293/293`
+    gates. After the final grant-control-flow cleanup,
+    `.tmp/run-desktop-20260826-104849.log` again completes E1000/root/Bochs `AddDevice` and
+    `START_DEVICE`, real Explorer callbacks, full chrome paint, and the sentinel; its three failures
+    are the independent Dbgk remote-breakin timing pair plus the VSpace cleanup check. A subsequent
+    run in `.tmp/run-desktop-20260826-105108.log` reaches the same shell/resource frontier but exposes
+    a separate quiescence writable-snapshot `corrupt` result followed by an unhandled VM-selftest
+    fault. Those nondeterministic quiescence failures remain open and are not hidden or waived by
+    this checkpoint.
+
+    Review adjustment: the hosted-PnP context registry and per-resource-state lease tranche is
+    closed. Full domain teardown is not. Next carry complete `HostedDomainIdentity` values through
+    bindings, provider routes, paging records, and resource-map-cap records; reject provider unload
+    while dependent projection leases remain; and invalidate PnP assignment/start state plus the
+    video route in the same ordered teardown before retiring the domain. Retain the binding when any
+    exact unbind or revoke fails. In parallel with that lifetime work, diagnose the Dbgk/VSpace and
+    writable-snapshot quiescence races as real kernel bugs rather than weakening the desktop gate.
+
     Track one separate rust-micro correctness item after this lifetime tranche: device-frame mapping
     cache attributes are still marked TODO in `rust-micro/src/untyped.rs`. Define and prove the x86
     MMIO/device-memory cache policy rather than relying on comments that describe all device frames
