@@ -12892,3 +12892,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     plan discovery from local composed-image re-decodes to generation-bearing CM APIs. Win32k's
     registry imports require an executive-routed or separately granted CM transport; do not replace
     them with another copied raw hive.
+
+    Live SYSTEM reader desktop acceptance (2026-08-26, accepted): serialized proof
+    `.tmp/run-desktop-live-system-readers-20260826.log` mounts the same 275,868-byte composed SYSTEM
+    image at isolated-CM generation 1, selects and loads the hosted `kbdus.dll` keyboard layout, and
+    retains the registry-selected display/miniport path. All five PnP starts reach terminal success,
+    including both genuine pending completions, with no failed, pending, or indeterminate rows.
+    Genuine userinit and Explorer launch, Explorer paints all `480000/480000` framebuffer pixels
+    with at least 32 non-background colours, all `293/293` checks pass, and the sentinel fires.
+
+    Review adjustment: the executive locale/timezone/display reader cut is closed. The next boundary
+    is CM-owned launch-plan enumeration: add an immutable, generation-bearing plan snapshot for
+    boot/system services and PnP bindings, consume it instead of constructing local ConfigManager
+    instances from `BOOT_SYSTEM_HIVE_IMAGE`, and delete those re-decode helpers and plan caches.
