@@ -132,13 +132,19 @@ impl<K> SnapshotBank<K> {
 pub(crate) struct SnapshotPool<K> {
     snapshots: Vec<Snapshot<K>>,
     tokens: TokenSequence,
+    max_snapshots: usize,
+    max_retained_bytes: usize,
+    retained_bytes: usize,
 }
 
 impl<K> SnapshotPool<K> {
-    pub(crate) const fn new() -> Self {
+    pub(crate) const fn with_limits(max_snapshots: usize, max_retained_bytes: usize) -> Self {
         Self {
             snapshots: Vec::new(),
             tokens: TokenSequence::new(),
+            max_snapshots,
+            max_retained_bytes,
+            retained_bytes: 0,
         }
     }
 
@@ -158,6 +164,15 @@ impl<K> SnapshotPool<K> {
                 token: 0,
             });
         }
+        let retained = value.capacity();
+        if self.snapshots.len() >= self.max_snapshots
+            || self
+                .retained_bytes
+                .checked_add(retained)
+                .is_none_or(|total| total > self.max_retained_bytes)
+        {
+            return None;
+        }
         self.snapshots.try_reserve(1).ok()?;
         let token = self.tokens.take()?;
         self.snapshots.push(Snapshot {
@@ -166,6 +181,7 @@ impl<K> SnapshotPool<K> {
             value,
             offset: written,
         });
+        self.retained_bytes += retained;
         Some(SnapshotChunk {
             written,
             needed,
@@ -192,7 +208,8 @@ impl<K> SnapshotPool<K> {
         let written = copy_chunk(&snapshot.value, snapshot.offset, capacity, out);
         snapshot.offset += written;
         if snapshot.offset == needed {
-            self.snapshots.swap_remove(index);
+            let completed = self.snapshots.swap_remove(index);
+            self.retained_bytes -= completed.value.capacity();
         }
         Some(SnapshotChunk {
             written,
@@ -207,7 +224,8 @@ impl<K> SnapshotPool<K> {
         }) else {
             return false;
         };
-        self.snapshots.swap_remove(index);
+        let aborted = self.snapshots.swap_remove(index);
+        self.retained_bytes -= aborted.value.capacity();
         true
     }
 }
@@ -256,7 +274,7 @@ mod tests {
 
     #[test]
     fn pool_keeps_independent_snapshots_live() {
-        let mut pool = SnapshotPool::new();
+        let mut pool = SnapshotPool::with_limits(2, usize::MAX);
         let first = pool.begin(1, vec![1, 2], 1, &mut [0; 1]).unwrap();
         let second = pool.begin(2, vec![3, 4], 1, &mut [0; 1]).unwrap();
         let mut tail = [0];
@@ -265,5 +283,46 @@ mod tests {
             .is_some());
         assert_eq!(tail, [4]);
         assert!(pool.abort(first.token, |key| *key == 1));
+    }
+
+    #[test]
+    fn pool_rejects_excess_readers_without_invalidating_live_tokens() {
+        let mut pool = SnapshotPool::with_limits(2, usize::MAX);
+        let first = pool.begin(1, vec![1, 2], 1, &mut [0; 1]).unwrap();
+        let second = pool.begin(2, vec![3, 4], 1, &mut [0; 1]).unwrap();
+        assert!(pool.begin(3, vec![5, 6], 1, &mut [0; 1]).is_none());
+
+        let mut first_tail = [0];
+        assert!(pool
+            .pull(first.token, 1, 1, &mut first_tail, |key| *key == 1)
+            .is_some());
+        assert_eq!(first_tail, [2]);
+
+        let third = pool.begin(3, vec![5, 6], 1, &mut [0; 1]).unwrap();
+        assert!(pool.abort(second.token, |key| *key == 2));
+        assert!(pool.abort(third.token, |key| *key == 3));
+    }
+
+    #[test]
+    fn pool_reclaims_retained_byte_budget_on_completion_and_abort() {
+        let retained = vec![1, 2].capacity();
+        let mut pool = SnapshotPool::with_limits(usize::MAX, retained);
+        let first = pool.begin(1, vec![1, 2], 1, &mut [0; 1]).unwrap();
+        assert!(pool.begin(2, vec![3, 4], 1, &mut [0; 1]).is_none());
+        assert!(pool
+            .pull(first.token, 1, 1, &mut [0; 1], |key| *key == 1)
+            .is_some());
+
+        let second = pool.begin(2, vec![3, 4], 1, &mut [0; 1]).unwrap();
+        assert!(pool.abort(second.token, |key| *key == 2));
+        assert!(pool.begin(3, vec![5, 6], 1, &mut [0; 1]).is_some());
+    }
+
+    #[test]
+    fn complete_first_chunk_does_not_consume_pool_capacity() {
+        let mut pool = SnapshotPool::with_limits(0, 0);
+        let complete = pool.begin(1, vec![1, 2], 2, &mut [0; 2]).unwrap();
+        assert_eq!(complete.token, 0);
+        assert_eq!(complete.written, 2);
     }
 }

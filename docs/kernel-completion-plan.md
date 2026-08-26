@@ -13575,3 +13575,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and allocator-accounting validations are closed. Next bound outstanding CM hive-key transfer
     snapshots without invalidating valid concurrent readers. Then split durable and per-dispatch
     executive allocation so transient capture/encoding buffers cannot fragment durable headroom.
+
+    Bounded CM hive-key readers (2026-08-27, accepted): the shared concurrent-reader
+    `SnapshotPool` now enforces both a retained-transfer count and actual retained `Vec` capacity.
+    CM admits at most 32 outstanding hive-key readers and 8 MiB of retained snapshot storage within
+    its independent 16 MiB service profile. A complete first-frame response never enters the pool.
+    Normal completion and exact `ABORT` return both budgets; a rejected `BEGIN` returns
+    `STATUS_INSUFFICIENT_RESOURCES` without retiring, reusing, or otherwise changing any live token.
+    The pool tests cover count and byte pressure, completion/abort reclamation, and allocation-free
+    first-frame replies. A dispatcher-level test fills every reader slot, rejects the next request,
+    and then successfully pulls an older token. `nt-config-server` passes `20/20`; the freestanding
+    executive check passes at the established 212-warning baseline.
+
+    Review adjustment: no wire-level limit or client fallback is required; pressure is an explicit
+    CM admission result and existing readers retain their immutable generation. Next split durable
+    executive ownership from per-dispatch scratch allocation. Inventory temporary allocations and
+    their longest valid lifetime first, then introduce scoped rewind only where no value escapes the
+    dispatch boundary. Do not move parked continuations, handle/object state, mounted hives, file
+    storage, or callback payloads into rewindable storage.

@@ -50,6 +50,11 @@ use nt_hive_core::{
     HiveTransaction, ReactOsNetworkAdapterBinding,
 };
 
+/// CM admits multiple immutable key readers, but abandoned transfers must not retain an unbounded
+/// share of the isolated service heap. Admission failure never retires an existing reader.
+const MAX_OUTSTANDING_HIVE_KEY_SNAPSHOTS: usize = 32;
+const MAX_RETAINED_HIVE_KEY_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
+
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
 const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
@@ -629,7 +634,10 @@ impl CmServer {
             hive_imports: Vec::new(),
             next_hive_import_token: 1,
             system_mutation_leases: MutationLeaseBank::new(),
-            hive_key_snapshots: SnapshotPool::new(),
+            hive_key_snapshots: SnapshotPool::with_limits(
+                MAX_OUTSTANDING_HIVE_KEY_SNAPSHOTS,
+                MAX_RETAINED_HIVE_KEY_SNAPSHOT_BYTES,
+            ),
             driver_launch_plan_snapshots: SnapshotBank::new(),
             win32_service_launch_plan_snapshots: SnapshotBank::new(),
             pnp_query_snapshots: SnapshotBank::new(),
@@ -647,7 +655,10 @@ impl CmServer {
             hive_imports: Vec::new(),
             next_hive_import_token: 1,
             system_mutation_leases: MutationLeaseBank::new(),
-            hive_key_snapshots: SnapshotPool::new(),
+            hive_key_snapshots: SnapshotPool::with_limits(
+                MAX_OUTSTANDING_HIVE_KEY_SNAPSHOTS,
+                MAX_RETAINED_HIVE_KEY_SNAPSHOT_BYTES,
+            ),
             driver_launch_plan_snapshots: SnapshotBank::new(),
             win32_service_launch_plan_snapshots: SnapshotBank::new(),
             pnp_query_snapshots: SnapshotBank::new(),
@@ -2680,6 +2691,51 @@ mod tests {
         let mounted = server.system_hive.as_ref().unwrap();
         assert_eq!(mounted.generation, 2);
         assert_eq!(mounted.current_control_set.as_str(), "ControlSet002");
+    }
+
+    #[test]
+    fn hive_key_snapshot_admission_preserves_existing_readers() {
+        let path = r"\Registry\Machine\System\CurrentControlSet\Services\Stable";
+        let mut hive = selected_system_hive(1);
+        let key = hive.create_key(r"ControlSet001\Services\Stable");
+        assert!(hive.set_value(
+            key,
+            "Payload",
+            nt_hive_core::RegistryValueType::Binary,
+            vec![0x5a; CM_HIVE_KEY_CHUNK_BYTES + 1],
+        ));
+        hive.finish_clean_import();
+
+        let mut server = CmServer::new();
+        assert_eq!(publish_hive(&mut server, &encode_image(&hive)), 1);
+        let mut tokens = Vec::new();
+        for _ in 0..MAX_OUTSTANDING_HIVE_KEY_SNAPSHOTS {
+            let mut out = [0u8; 64];
+            let begin = server.dispatch(
+                opcode::CM_OP_QUERY_HIVE_KEY,
+                &hive_key_request(path, hive_key_transfer::BEGIN, 0, 0, 64),
+                &mut out,
+            );
+            assert_eq!(begin.status, STATUS_SUCCESS);
+            assert_ne!(begin.detail1, 0);
+            tokens.push(begin.detail1);
+        }
+
+        let rejected = server.dispatch(
+            opcode::CM_OP_QUERY_HIVE_KEY,
+            &hive_key_request(path, hive_key_transfer::BEGIN, 0, 0, 64),
+            &mut [0u8; 64],
+        );
+        assert_eq!(rejected.status, STATUS_INSUFFICIENT_RESOURCES);
+
+        let first = tokens[0];
+        let pulled = server.dispatch(
+            opcode::CM_OP_QUERY_HIVE_KEY,
+            &hive_key_request(path, hive_key_transfer::PULL, first, 64, 64),
+            &mut [0u8; 64],
+        );
+        assert_eq!(pulled.status, STATUS_SUCCESS);
+        assert_eq!(pulled.detail1, first);
     }
 
     #[test]
