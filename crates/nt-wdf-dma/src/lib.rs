@@ -395,7 +395,7 @@ mod tests {
     use super::*;
 
     fn owner() -> DmaOwner {
-        DmaOwner::new(1, 10)
+        DmaOwner::new(1, 100, 10)
     }
 
     #[test]

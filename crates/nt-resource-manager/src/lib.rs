@@ -25,13 +25,15 @@ use nt_hal_abi::{
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ResourceOwner {
     pub driver_host_id: u64,
+    pub driver_host_cookie: u64,
     pub device_object_id: u64,
 }
 
 impl ResourceOwner {
-    pub fn new(driver_host_id: u64, device_object_id: u64) -> Self {
+    pub fn new(driver_host_id: u64, driver_host_cookie: u64, device_object_id: u64) -> Self {
         Self {
             driver_host_id,
+            driver_host_cookie,
             device_object_id,
         }
     }
@@ -891,27 +893,6 @@ impl ResourceManager {
             interrupts,
         )
     }
-
-    /// Driver Host fault / unload cleanup (spec §15.1): revoke every mapping and
-    /// disconnect every interrupt owned by `driver_host_id`. Returns
-    /// `(mappings_revoked, interrupts_disconnected)`.
-    pub fn revoke_host(&mut self, driver_host_id: u64) -> (usize, usize) {
-        let mut maps = 0;
-        for m in self.mappings.iter_mut() {
-            if m.owner.driver_host_id == driver_host_id && m.valid {
-                m.valid = false;
-                maps += 1;
-            }
-        }
-        let mut ints = 0;
-        for c in self.connected.iter_mut() {
-            if c.owner.driver_host_id == driver_host_id && c.connected {
-                c.connected = false;
-                ints += 1;
-            }
-        }
-        (maps, ints)
-    }
 }
 
 #[cfg(test)]
@@ -919,7 +900,7 @@ mod tests {
     use super::*;
 
     fn rm() -> (ResourceManager, ResourceOwner) {
-        let owner = ResourceOwner::new(1, 10);
+        let owner = ResourceOwner::new(1, 100, 10);
         (ResourceManager::with_mmio_test_fixture(owner), owner)
     }
 
@@ -945,7 +926,7 @@ mod tests {
             rm.map_io_space(owner, 0x1000_0000, 0x2000, 0),
             Err(HalError::OutOfRange)
         );
-        let other = ResourceOwner::new(2, 20);
+        let other = ResourceOwner::new(2, 200, 20);
         assert_eq!(
             rm.map_io_space(other, 0x1000_0000, 0x1000, 0),
             Err(HalError::WrongOwner)
@@ -990,7 +971,7 @@ mod tests {
     #[test]
     fn connect_wrong_owner_rejected() {
         let (mut rm, _owner) = rm();
-        let other = ResourceOwner::new(2, 20);
+        let other = ResourceOwner::new(2, 200, 20);
         assert_eq!(
             rm.connect_interrupt(other, 200, 0, 0),
             Err(HalError::WrongOwner)
@@ -1000,7 +981,7 @@ mod tests {
     #[test]
     fn port_claims_are_exact_idempotent_and_conflict_checked() {
         let (mut rm, owner) = rm();
-        let other = ResourceOwner::new(2, 20);
+        let other = ResourceOwner::new(2, 200, 20);
         assert_eq!(rm.claim_port(owner, 300, 0x1ce, 2), Ok(()));
         assert_eq!(rm.claim_port(owner, 300, 0x1ce, 2), Ok(()));
         assert_eq!(
@@ -1026,7 +1007,7 @@ mod tests {
     fn reassigned_memory_resource_revokes_stale_mapping() {
         let (mut rm, old_owner) = rm();
         let mapping = rm.map_io_space(old_owner, 0x1000_0000, 0x1000, 0).unwrap();
-        let new_owner = ResourceOwner::new(3, 30);
+        let new_owner = ResourceOwner::new(3, 300, 30);
 
         rm.assign_memory(
             new_owner,
@@ -1056,7 +1037,7 @@ mod tests {
     fn reassigned_interrupt_resource_disconnects_stale_isr() {
         let (mut rm, old_owner) = rm();
         let old_interrupt = rm.connect_interrupt(old_owner, 200, 0xAA, 0xBB).unwrap();
-        let new_owner = ResourceOwner::new(4, 40);
+        let new_owner = ResourceOwner::new(4, 400, 40);
 
         rm.assign_interrupt(
             new_owner,
@@ -1104,14 +1085,23 @@ mod tests {
     }
 
     #[test]
-    fn revoke_host_cleans_up() {
+    fn stale_generation_cannot_access_or_revoke_live_resources() {
         let (mut rm, owner) = rm();
-        let g = rm.map_io_space(owner, 0x1000_0000, 0x1000, 0).unwrap();
-        rm.connect_interrupt(owner, 200, 1, 2).unwrap();
-        let (maps, ints) = rm.revoke_host(owner.driver_host_id);
-        assert_eq!((maps, ints), (1, 1));
-        assert!(!rm.mapping_valid(g.mapping_id));
-        assert!(rm.inject_vector(5).is_none());
+        let mapping = rm.map_io_space(owner, 0x1000_0000, 0x1000, 0).unwrap();
+        let interrupt = rm.connect_interrupt(owner, 200, 1, 2).unwrap();
+        let stale = ResourceOwner::new(
+            owner.driver_host_id,
+            owner.driver_host_cookie - 1,
+            owner.device_object_id,
+        );
+
+        assert_eq!(
+            rm.map_io_space(stale, 0x1000_0000, 0x1000, 0),
+            Err(HalError::WrongOwner)
+        );
+        assert_eq!(rm.revoke_owner(stale), (0, 0, 0, 0, 0));
+        assert!(rm.mapping_valid(mapping.mapping_id));
+        assert!(rm.inject_interrupt(interrupt).is_some());
     }
 
     fn batch_memory(id: u64, raw: u64, translated: u64, length: u64) -> HalResourceDescriptor {
@@ -1147,7 +1137,7 @@ mod tests {
 
     #[test]
     fn batch_replaces_complete_multi_resource_assignment() {
-        let owner = ResourceOwner::new(7, 70);
+        let owner = ResourceOwner::new(7, 700, 70);
         let mut rm = ResourceManager::new();
         let descriptors = [
             batch_memory(0x710, 0x1000_0000, 0x2000_0000, 0x2000),
@@ -1205,7 +1195,7 @@ mod tests {
 
     #[test]
     fn exact_batch_replay_preserves_mapping_and_interrupt_ids() {
-        let owner = ResourceOwner::new(8, 80);
+        let owner = ResourceOwner::new(8, 800, 80);
         let mut rm = ResourceManager::new();
         let descriptors = [
             batch_memory(0x910, 0x7000_0000, 0x8000_0000, 0x1000),

@@ -22,9 +22,9 @@ use surt_sel4::{drain_blocking, Sel4Notify};
 
 use crate::{
     ep_send_one, print_str, yield_now, CODE_FRAMES, CODE_VADDR, COMP_RING_VADDR, CT_CODE_BASE,
-    CT_N_COMP, CT_N_SUB, CT_PML4, CT_RESULT, DEVICE_OBJECT_ID, DRIVER_HOST_ID, ENV, INT_RESOURCE_ID,
-    INT_VECTOR, MEM_RESOURCE_ID, REP_DATA_VADDR, REQ_DATA_VADDR, RING_LEN, STATE_VADDR,
-    SUB_RING_VADDR,
+    CT_N_COMP, CT_N_SUB, CT_PML4, CT_RESULT, DEVICE_OBJECT_ID, DRIVER_HOST_COOKIE, DRIVER_HOST_ID,
+    ENV, INT_RESOURCE_ID, INT_VECTOR, MEM_RESOURCE_ID, REP_DATA_VADDR, REQ_DATA_VADDR, RING_LEN,
+    STATE_VADDR, SUB_RING_VADDR,
 };
 
 static PNP_SYS: &[u8] =
@@ -75,7 +75,7 @@ fn st() -> &'static mut HostState {
 }
 
 fn owner() -> ResourceOwner {
-    ResourceOwner::new(DRIVER_HOST_ID, DEVICE_OBJECT_ID)
+    ResourceOwner::new(DRIVER_HOST_ID, DRIVER_HOST_COOKIE, DEVICE_OBJECT_ID)
 }
 
 #[repr(C, align(16))]
@@ -483,6 +483,7 @@ unsafe fn build_resource_list() -> u64 {
     let slice = core::slice::from_raw_parts_mut(buf as *mut u8, 64);
     let _ = nt_cm_resources::build_memory_interrupt_list(
         slice,
+        0,
         0,
         MemoryDescriptor {
             start: st().res_mem_start,

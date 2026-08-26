@@ -31558,6 +31558,7 @@ const HOSTED_INTERRUPT_RESOURCE_KIND: u64 = 0x30;
 const HOSTED_SUPPLEMENTAL_IO_PORT_RESOURCE_KIND: u64 = 0x31;
 const PLATFORM_RESOURCE_OWNER: ResourceOwner = ResourceOwner {
     driver_host_id: u64::MAX,
+    driver_host_cookie: u64::MAX,
     device_object_id: u64::MAX,
 };
 const PLATFORM_PCI_CONFIG_PORT_RESOURCE_ID: u64 = u64::MAX;
@@ -31590,11 +31591,19 @@ fn hosted_supplemental_io_port_resource_id(device_id: u64) -> Option<u64> {
 }
 
 fn hosted_resource_owner(binding: HostedDeviceBinding) -> ResourceOwner {
-    ResourceOwner::new(binding.driver_id, binding.device_id)
+    ResourceOwner::new(
+        binding.projection_domain.domain_id.raw(),
+        binding.projection_domain.cookie,
+        binding.device_id,
+    )
 }
 
 fn hosted_dma_owner(binding: HostedDeviceBinding) -> DmaOwner {
-    DmaOwner::new(binding.driver_id, binding.device_id)
+    DmaOwner::new(
+        binding.projection_domain.domain_id.raw(),
+        binding.projection_domain.cookie,
+        binding.device_id,
+    )
 }
 
 unsafe fn hosted_device_bindings_mut() -> &'static mut Vec<HostedDeviceBinding> {

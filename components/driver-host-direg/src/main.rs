@@ -351,7 +351,7 @@ unsafe fn run_ioctl(device: u64, ioctl: u32, input: &[u8], out_cap: u64) -> (i32
 unsafe fn run() {
     PNP = Some(PnpManager::new());
     ROOT_BUS = Some(RootBus::new());
-    nt_wdf_kmdf::init();
+    nt_wdf_kmdf::init(1, 1);
 
     // --- Seed the Configuration Manager fixture (spec §21 / RE §9) ------------
     {

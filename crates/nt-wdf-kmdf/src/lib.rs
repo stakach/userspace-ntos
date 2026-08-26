@@ -917,10 +917,10 @@ extern "win64" fn ntos_wcslen(s: *const u16) -> u64 {
 // --- public API for the consuming seL4 driver-host component -----------------
 
 /// Create the shared WDF runtime + install the 444-entry function table. Call once at startup.
-pub fn init() {
+pub fn init(driver_host_id: u64, driver_host_cookie: u64) {
     // SAFETY: single-threaded root task; called once before any driver runs.
     unsafe {
-        WDF = Some(WdfRuntime::new());
+        WDF = Some(WdfRuntime::new(driver_host_id, driver_host_cookie));
         install_function_table();
     }
 }
@@ -956,11 +956,11 @@ const UMDF2_IDX_REQUEST_RETRIEVE_OUTPUT_BUFFER: usize = 169;
 
 /// Ensure the shared runtime exists and install the shared WDF thunks at their UMDF v2
 /// table indices. Call once before hosting a UMDF v2 driver.
-pub fn umdf2_prepare() {
+pub fn umdf2_prepare(driver_host_id: u64, driver_host_cookie: u64) {
     // SAFETY: single-threaded root task; called once before any UMDF driver runs.
     unsafe {
         if (*core::ptr::addr_of!(WDF)).is_none() {
-            WDF = Some(WdfRuntime::new());
+            WDF = Some(WdfRuntime::new(driver_host_id, driver_host_cookie));
         }
         let t = &mut *core::ptr::addr_of_mut!(UMDF2_FUNCTIONS);
         let mut set = |idx: usize, fp: u64| t[idx] = fp;

@@ -190,7 +190,7 @@ unsafe fn run() {
     // Publish the WDF function table + globals into the driver's image (what a UMDF v2
     // host does in lieu of the driver calling WdfVersionBind). Must happen while .data
     // is still writable — i.e. before W^X seals the image.
-    nt_wdf_kmdf::umdf2_prepare();
+    nt_wdf_kmdf::umdf2_prepare(1, 1);
     core::ptr::write_unaligned(
         (CODE_VADDR + WDF_FUNCTIONS_GLOBAL_RVA) as *mut u64,
         nt_wdf_kmdf::umdf2_functions_ptr(),

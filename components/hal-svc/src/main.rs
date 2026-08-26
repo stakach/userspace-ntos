@@ -66,6 +66,7 @@ pub const CODE_FRAMES: u64 = 8;
 /// Fixture identity, agreed by both children (the service knows the single Driver
 /// Host's owner; a real system would establish it at registration).
 pub const DRIVER_HOST_ID: u64 = 1;
+pub const DRIVER_HOST_COOKIE: u64 = 1;
 pub const DEVICE_OBJECT_ID: u64 = 10;
 pub const INT_RESOURCE_ID: u64 = 200;
 pub const INT_VECTOR: u32 = 5;

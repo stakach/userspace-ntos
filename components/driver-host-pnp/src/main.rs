@@ -175,6 +175,7 @@ const FIXTURES: &[Fixture] = &[
 ];
 
 const DRIVER_HOST_ID: u64 = 1;
+const DRIVER_HOST_COOKIE: u64 = 1;
 const DEVICE_OBJECT_ID: u64 = 10;
 const INT_VECTOR: u32 = 5;
 const INT_RESOURCE_ID: u64 = 200;
@@ -260,7 +261,11 @@ fn trace(event: &[u8]) {
 }
 
 fn owner() -> ResourceOwner {
-    ResourceOwner::new(DRIVER_HOST_ID, dh().device_owner_id)
+    ResourceOwner::new(
+        DRIVER_HOST_ID,
+        DRIVER_HOST_COOKIE,
+        dh().device_owner_id,
+    )
 }
 
 struct DhState {
@@ -854,6 +859,7 @@ unsafe fn build_resource_list(devnode: u64) -> u64 {
     let _ = nt_cm_resources::build_memory_interrupt_list(
         slice,
         0,
+        0,
         MemoryDescriptor {
             start: res.mem_start,
             length: res.mem_length,
@@ -1174,7 +1180,7 @@ unsafe fn run() {
     ROOT_BUS = Some(RootBus::new());
     // The shared WDF runtime owns the single Configuration Manager (see cfg()); init it once here so
     // the WDM device-tree enumeration + the KMDF WDF registry path use the same service/devnode DB.
-    nt_wdf_kmdf::init();
+    nt_wdf_kmdf::init(DRIVER_HOST_ID, DRIVER_HOST_COOKIE);
 
     // --- ResolveService: seed the boot service database + the root-enumerated device tree -------
     // Register a service key + an Enum\ devnode per fixture, and have the ROOT bus create a child

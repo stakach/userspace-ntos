@@ -1086,7 +1086,7 @@ unsafe fn run_workitem() {
 }
 
 unsafe fn run() {
-    WDF = Some(WdfRuntime::new());
+    WDF = Some(WdfRuntime::new(1, 1));
     // Seed the identity register.
     core::ptr::write_unaligned(core::ptr::addr_of_mut!(MMIO) as *mut u32, KMDF_MAGIC);
     install_function_table();

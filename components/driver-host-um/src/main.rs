@@ -249,7 +249,7 @@ unsafe fn host_umdf_driver() -> u32 {
         }
     }
     pe.seed_security_cookie(base);
-    nt_wdf_kmdf::umdf2_prepare();
+    nt_wdf_kmdf::umdf2_prepare(1, 1);
     core::ptr::write_unaligned((base + 0x7538) as *mut u64, nt_wdf_kmdf::umdf2_functions_ptr());
     core::ptr::write_unaligned((base + 0x7548) as *mut u64, nt_wdf_kmdf::umdf2_globals_ptr());
 

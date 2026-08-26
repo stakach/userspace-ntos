@@ -49,6 +49,7 @@ const STATUS_PENDING: i32 = 0x0000_0103;
 const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 
 const DRIVER_HOST_ID: u64 = 1;
+const DRIVER_HOST_COOKIE: u64 = 1;
 const DEVICE_OBJECT_ID: u64 = 10;
 const SERVICE_NAME: &str = "DmaPnpPowerTest";
 const INSTANCE_PATH: &str = r"ROOT\USERSPACE_NTOS_DMA\0001";
@@ -155,10 +156,10 @@ unsafe fn mdl() -> &'static mut MdlRegistry {
 }
 
 fn owner() -> ResourceOwner {
-    ResourceOwner::new(DRIVER_HOST_ID, DEVICE_OBJECT_ID)
+    ResourceOwner::new(DRIVER_HOST_ID, DRIVER_HOST_COOKIE, DEVICE_OBJECT_ID)
 }
 fn dma_owner() -> DmaOwner {
-    DmaOwner::new(DRIVER_HOST_ID, DEVICE_OBJECT_ID)
+    DmaOwner::new(DRIVER_HOST_ID, DRIVER_HOST_COOKIE, DEVICE_OBJECT_ID)
 }
 
 struct DhState {
@@ -976,6 +977,7 @@ unsafe fn build_resource_list(devnode: u64) -> u64 {
     let slice = core::slice::from_raw_parts_mut(buf as *mut u8, 64);
     let _ = nt_cm_resources::build_memory_interrupt_list(
         slice,
+        0,
         0,
         MemoryDescriptor {
             start: res.mem_start,

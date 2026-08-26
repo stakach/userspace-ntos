@@ -64,6 +64,7 @@ pub const CODE_FRAMES: u64 = 8;
 
 /// Hosted proof identity, agreed by both children.
 pub const DRIVER_HOST_ID: u64 = 1;
+pub const DRIVER_HOST_COOKIE: u64 = 1;
 pub const DEVICE_OBJECT_ID: u64 = 10;
 pub const INT_RESOURCE_ID: u64 = 200;
 pub const MEM_RESOURCE_ID: u64 = 100;

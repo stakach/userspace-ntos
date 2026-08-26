@@ -122,6 +122,8 @@ struct WorkItemRec {
 
 /// The canonical WDF runtime state for one Driver Host.
 pub struct WdfRuntime {
+    driver_host_id: u64,
+    driver_host_cookie: u64,
     objects: WdfObjectTable,
     driver: Option<WdfHandle>,
     driver_object: u64,
@@ -143,15 +145,11 @@ pub struct WdfRuntime {
     wdfstrings: BTreeMap<u64, alloc::string::String>,
 }
 
-impl Default for WdfRuntime {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl WdfRuntime {
-    pub fn new() -> Self {
+    pub fn new(driver_host_id: u64, driver_host_cookie: u64) -> Self {
         Self {
+            driver_host_id,
+            driver_host_cookie,
             objects: WdfObjectTable::new(),
             driver: None,
             driver_object: 0,
@@ -193,8 +191,8 @@ impl WdfRuntime {
     }
 
     /// A DMA owner token derived from a device handle (one adapter domain per device).
-    fn dma_owner(device: WdfHandle) -> DmaOwner {
-        DmaOwner::new(1, device.0)
+    fn dma_owner(&self, device: WdfHandle) -> DmaOwner {
+        DmaOwner::new(self.driver_host_id, self.driver_host_cookie, device.0)
     }
 
     // --- WdfDriverCreate (§10) ------------------------------------------------
@@ -585,7 +583,7 @@ impl WdfRuntime {
         self.objects.validate(device, WdfObjectType::Device)?;
         let enabler = self.objects.create(WdfObjectType::Memory, Some(device))?;
         self.dma
-            .create_enabler(enabler.0, Self::dma_owner(device), profile, maximum_length);
+            .create_enabler(enabler.0, self.dma_owner(device), profile, maximum_length);
         Ok(enabler)
     }
     pub fn dma_enabler_maximum_length(&self, enabler: WdfHandle) -> Option<u64> {
@@ -953,7 +951,7 @@ impl WdfRuntime {
     ) -> Result<Vec<PendingCallback>, WdfRuntimeError> {
         // If a device is going away, revoke its DMA domain (common buffers + adapters).
         if self.devices.contains_key(&handle.0) {
-            self.dma.revoke_owner(Self::dma_owner(handle));
+            self.dma.revoke_owner(self.dma_owner(handle));
         }
         let pending = self.objects.delete(handle)?;
         self.devices.remove(&handle.0);
@@ -1010,7 +1008,7 @@ mod tests {
     /// complete.
     #[test]
     fn vertical_slice() {
-        let mut rt = WdfRuntime::new();
+        let mut rt = WdfRuntime::new(1, 100);
         let driver = rt.create_driver(0xD000, 0xADDE).unwrap();
         assert_eq!(rt.driver(), Some(driver));
         assert_eq!(rt.evt_device_add(), 0xADDE);
@@ -1067,7 +1065,7 @@ mod tests {
 
     #[test]
     fn sequential_queue_serializes_ioctls() {
-        let mut rt = WdfRuntime::new();
+        let mut rt = WdfRuntime::new(1, 100);
         rt.create_driver(1, 0).unwrap();
         let init = rt.add_device(0);
         let device = rt.create_device(init, 0xFD0).unwrap();
@@ -1086,7 +1084,7 @@ mod tests {
 
     #[test]
     fn power_managed_queue_holds_until_d0() {
-        let mut rt = WdfRuntime::new();
+        let mut rt = WdfRuntime::new(1, 100);
         rt.create_driver(1, 0).unwrap();
         let init = rt.add_device(0);
         rt.set_init_pnp_callbacks(
@@ -1111,7 +1109,7 @@ mod tests {
 
     #[test]
     fn interrupt_isr_dpc_flow() {
-        let mut rt = WdfRuntime::new();
+        let mut rt = WdfRuntime::new(1, 100);
         rt.create_driver(1, 0).unwrap();
         let init = rt.add_device(0);
         let device = rt.create_device(init, 0xFD0).unwrap();
@@ -1136,7 +1134,7 @@ mod tests {
 
     #[test]
     fn dma_enabler_common_buffer() {
-        let mut rt = WdfRuntime::new();
+        let mut rt = WdfRuntime::new(1, 100);
         rt.create_driver(1, 0).unwrap();
         let init = rt.add_device(0);
         let device = rt.create_device(init, 0xFD0).unwrap();
@@ -1151,7 +1149,7 @@ mod tests {
 
     #[test]
     fn timer_and_workitem() {
-        let mut rt = WdfRuntime::new();
+        let mut rt = WdfRuntime::new(1, 100);
         rt.create_driver(1, 0).unwrap();
         let init = rt.add_device(0);
         let device = rt.create_device(init, 0xFD0).unwrap();
@@ -1174,7 +1172,7 @@ mod tests {
     #[test]
     fn registry_interface_property_flow() {
         use nt_config_manager::{device_property, PropertyValue, RegistryValueType};
-        let mut rt = WdfRuntime::new();
+        let mut rt = WdfRuntime::new(1, 100);
         // The Driver Host seeds the fixture + binds the service (spec §19).
         rt.config_mut()
             .register_service("Svc", "svc.sys", None, None, 3, 1);
@@ -1249,7 +1247,7 @@ mod tests {
 
     #[test]
     fn delete_device_cascades_to_queue() {
-        let mut rt = WdfRuntime::new();
+        let mut rt = WdfRuntime::new(1, 100);
         let driver = rt.create_driver(1, 0).unwrap();
         let init = rt.add_device(0);
         let device = rt.create_device(init, 0xFD0).unwrap();

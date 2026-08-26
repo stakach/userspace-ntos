@@ -17,13 +17,15 @@ use alloc::vec::Vec;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct DmaOwner {
     pub driver_host_id: u64,
+    pub driver_host_cookie: u64,
     pub devnode_id: u64,
 }
 
 impl DmaOwner {
-    pub fn new(driver_host_id: u64, devnode_id: u64) -> Self {
+    pub fn new(driver_host_id: u64, driver_host_cookie: u64, devnode_id: u64) -> Self {
         Self {
             driver_host_id,
+            driver_host_cookie,
             devnode_id,
         }
     }
@@ -803,7 +805,7 @@ mod tests {
     use super::*;
 
     fn owner() -> DmaOwner {
-        DmaOwner::new(1, 10)
+        DmaOwner::new(1, 100, 10)
     }
 
     #[test]
@@ -870,7 +872,7 @@ mod tests {
     fn logical_addresses_are_scoped_to_dma_owner() {
         let mut d = DmaManager::new();
         let owner_a = owner();
-        let owner_b = DmaOwner::new(1, 11);
+        let owner_b = DmaOwner::new(1, 100, 11);
         let adapter_a = d.register_adapter(owner_a, true, 4096, true);
         let adapter_b = d.register_adapter(owner_b, true, 4096, true);
 
@@ -907,7 +909,7 @@ mod tests {
             Ok((1024, DmaLogicalRangeKind::TransferMapping))
         );
         assert_eq!(
-            d.decode_owner_logical_with_kind(DmaOwner::new(1, 12), 0x3200, 16),
+            d.decode_owner_logical_with_kind(DmaOwner::new(1, 100, 12), 0x3200, 16),
             Err(DmaError::LogicalViolation)
         );
     }
@@ -938,7 +940,7 @@ mod tests {
     fn adapter_ownership_and_limits() {
         let mut d = DmaManager::new();
         let a = d.register_adapter(owner(), true, 4096, true);
-        let other = DmaOwner::new(2, 20);
+        let other = DmaOwner::new(2, 200, 20);
         assert_eq!(
             d.alloc_common_buffer(other, a, 4096, 0),
             Err(DmaError::WrongOwner)
@@ -947,6 +949,31 @@ mod tests {
         assert_eq!(
             d.alloc_common_buffer(owner(), a, 8192, 0),
             Err(DmaError::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn stale_generation_cannot_access_or_revoke_live_dma() {
+        let mut d = DmaManager::new();
+        let live = owner();
+        let stale = DmaOwner::new(
+            live.driver_host_id,
+            live.driver_host_cookie - 1,
+            live.devnode_id,
+        );
+        let adapter = d.register_adapter(live, true, 4096, true);
+        let buffer = d
+            .alloc_common_buffer(live, adapter, 4096, 0x1_0000)
+            .unwrap();
+
+        assert_eq!(
+            d.alloc_common_buffer(stale, adapter, 4096, 0x2_0000),
+            Err(DmaError::WrongOwner)
+        );
+        assert_eq!(d.revoke_owner(stale), (0, 0));
+        assert_eq!(
+            d.decode_owner_logical(live, buffer.logical_base, 16),
+            Ok(0x1_0000)
         );
     }
 
@@ -979,7 +1006,7 @@ mod tests {
     fn registered_transfer_mapping_rejects_overlap_and_bad_owner() {
         let mut d = DmaManager::new();
         let owner_a = owner();
-        let owner_b = DmaOwner::new(2, 20);
+        let owner_b = DmaOwner::new(2, 200, 20);
         let adapter_a = d.register_adapter(owner_a, true, 4096, true);
         let adapter_b = d.register_adapter(owner_b, true, 4096, true);
         d.register_common_buffer_at(owner_a, adapter_a, 0x1000, 4096, 0x2_0000)
@@ -1020,7 +1047,7 @@ mod tests {
     fn free_mapping_for_owner_validates_owner() {
         let mut d = DmaManager::new();
         let owner_a = owner();
-        let owner_b = DmaOwner::new(2, 20);
+        let owner_b = DmaOwner::new(2, 200, 20);
         let adapter = d.register_adapter(owner_a, true, 4096, true);
         let m = d
             .register_mapping_at(owner_a, adapter, 0x3000, 0x6_0000, 512)

@@ -11616,6 +11616,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Manager and DMA owners with the same generation and reject cross-generation access/revocation;
     provider route/callback/unload lifetime and ordered PnP removal remain after that boundary.
 
+    Exact Resource Manager and DMA owner checkpoint (2026-08-26, accepted locally):
+    `ResourceOwner` and `DmaOwner` now include the registered driver-host generation cookie in
+    addition to the host/domain id and device id. The executive constructs both owners from the
+    exact `HostedDeviceBinding::projection_domain`, so every assignment, MMIO map, interrupt,
+    adapter, common buffer, transfer mapping, decode, and owner revocation is generation-scoped.
+    The generation-blind `ResourceManager::revoke_host(driver_host_id)` API was deleted. The WDF
+    runtime now requires its host id and generation at construction and derives per-device DMA
+    owners from that supplied identity instead of an internal fixed host id. New manager tests
+    prove that a stale generation cannot access or revoke live resource or DMA state.
+
+    Local validation is green for `nt-resource-manager` at `13/13`, `nt-dma-manager` at `21/21`,
+    `nt-wdf-dma` at `3/3`, `nt-wdf-runtime` at `8/8`, the x86-64 freestanding shared KMDF check,
+    all 11 affected freestanding proof components, formatting and diff checks, and the executive
+    check at the established 212-warning baseline. The component sweep also repaired four stale
+    `build_memory_interrupt_list` calls by supplying their explicit root-bus number. A serialized
+    desktop gate remains required. Review adjustment: after that proof, split provider publication
+    tokens from exact provider/dependent domain identities, generation-own callback/import records,
+    and make provider unload and domain unregister checked before starting ordered PnP removal.
+
     Track one separate rust-micro correctness item after this lifetime tranche: device-frame mapping
     cache attributes are still marked TODO in `rust-micro/src/untyped.rs`. Define and prove the x86
     MMIO/device-memory cache policy rather than relying on comments that describe all device frames

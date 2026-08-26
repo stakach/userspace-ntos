@@ -42,6 +42,7 @@ const STATUS_PENDING: i32 = 0x0000_0103;
 
 /// The driver's fixture identity (matches `with_mmio_test_fixture`).
 const DRIVER_HOST_ID: u64 = 1;
+const DRIVER_HOST_COOKIE: u64 = 1;
 const DEVICE_OBJECT_ID: u64 = 10;
 const INT_VECTOR: u32 = 5;
 const INT_RESOURCE_ID: u64 = 200;
@@ -109,7 +110,7 @@ unsafe fn sim() -> &'static mut SimDevice {
 }
 
 fn owner() -> ResourceOwner {
-    ResourceOwner::new(DRIVER_HOST_ID, DEVICE_OBJECT_ID)
+    ResourceOwner::new(DRIVER_HOST_ID, DRIVER_HOST_COOKIE, DEVICE_OBJECT_ID)
 }
 
 struct DhState {

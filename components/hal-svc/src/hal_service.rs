@@ -16,12 +16,12 @@ use surt_sel4::surt_core::{Consumer, Producer};
 use surt_sel4::{drain_blocking, Sel4Notify};
 
 use crate::{
-    yield_now, COMP_RING_VADDR, CT_N_COMP, CT_N_SUB, DEVICE_OBJECT_ID, DRIVER_HOST_ID, ENV,
-    HAL_MMIO_VADDR, RING_LEN, STATE_VADDR, SUB_RING_VADDR,
+    yield_now, COMP_RING_VADDR, CT_N_COMP, CT_N_SUB, DEVICE_OBJECT_ID, DRIVER_HOST_COOKIE,
+    DRIVER_HOST_ID, ENV, HAL_MMIO_VADDR, RING_LEN, STATE_VADDR, SUB_RING_VADDR,
 };
 
 fn owner() -> ResourceOwner {
-    ResourceOwner::new(DRIVER_HOST_ID, DEVICE_OBJECT_ID)
+    ResourceOwner::new(DRIVER_HOST_ID, DRIVER_HOST_COOKIE, DEVICE_OBJECT_ID)
 }
 
 /// The canonical Resource Manager, stored on the RW state page (the child's `.bss`
