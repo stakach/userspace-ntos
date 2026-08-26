@@ -12852,3 +12852,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     that declaration, so the complete image remains atomic without charging every service or adding
     a hive-size fallback. The freestanding executive check is again green at 212 warnings. Rerun the
     serialized desktop gate.
+
+    Composed boot-SYSTEM desktop acceptance (2026-08-26, accepted): serialized proof
+    `.tmp/run-desktop-composed-system-resource-rerun-20260826.log` classifies the empty persistence
+    reserve as genuinely absent, imports the installed ReactOS REGF, rebases the generated hardware
+    overlay onto selected control set 1, and publishes exactly one 275,868-byte composed image to
+    isolated CM at generation 1 with `STATUS_SUCCESS`.
+
+    All five registry-selected PnP devices reach terminal success, including two genuine pending
+    START completions, with no failed, pending, or indeterminate rows. Genuine userinit and Explorer
+    launch through the shell path; Explorer redirects 668 real user callbacks, installs 18 client
+    WndProcs, and paints all `480000/480000` pixels of the miniport-selected `800x600` framebuffer
+    with at least 32 non-background colours. All `293/293` executive checks pass and the QEMU
+    sentinel fires.
+
+    Review adjustment: the composed publication checkpoint is closed. Next remove the encoded-image
+    re-decode paths and raw installed-REGF SYSTEM readers. Add generation-bound isolated-CM queries
+    for boot driver/service/PnP selection and key/value snapshots, route win32k and executive
+    timezone/NLS/display reads through the live mounted authority, and delete their raw REGF helpers
+    in the same accepted cuts. Only after all readers share the live generation should SYSTEM
+    mutation leases and journal ownership move behind CM.
