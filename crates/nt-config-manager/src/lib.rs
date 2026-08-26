@@ -160,6 +160,17 @@ pub struct DriverServiceLaunchSpec {
     pub tag: Option<u32>,
 }
 
+/// One live driver-service selection together with every registry-bound devnode.
+///
+/// This is the semantic Configuration Manager result consumed by `NtLoadDriver` and the PnP
+/// device-action owner. The registry remains authoritative; callers obtain this through
+/// [`ConfigManager::driver_service_binding`], which refreshes the Enum index before selection.
+#[derive(Clone, Debug)]
+pub struct DriverServiceBinding {
+    pub service: DriverServiceLaunchSpec,
+    pub devnodes: Vec<DevnodeRecord>,
+}
+
 /// The start action implied by a service key's `Type` metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServiceStartSpec {
@@ -986,19 +997,8 @@ impl ConfigManager {
                 encode_multi_sz(compatible_ids),
             );
         }
-        let id = self.alloc_id();
-        self.devnodes.push(DevnodeRecord {
-            id,
-            instance_id: instance_id.into(),
-            service: service.map(Into::into),
-            pdo_name: pdo_name.map(Into::into),
-            driver_key: None,
-            hardware_ids: hardware_ids.iter().map(|s| (*s).into()).collect(),
-            compatible_ids: compatible_ids.iter().map(|s| (*s).into()).collect(),
-            enum_key,
-            properties: PropertyBag::default(),
-        });
-        id
+        self.refresh_registry_devnode_key(instance_id, enum_key)
+            .expect("newly registered devnode metadata was not indexable")
     }
 
     /// Index one already-existing `Enum\<InstanceId>` key as a devnode record.
@@ -1020,6 +1020,130 @@ impl ConfigManager {
             return 0;
         };
         self.index_registry_devnodes_from_key(enum_root, String::new())
+    }
+
+    /// Refresh the complete semantic devnode index from the current registry tree.
+    ///
+    /// Existing devnode identities and property bags are retained when their instance still
+    /// exists, while registry fields are replaced atomically from the current Enum key. Records
+    /// whose keys were deleted or no longer contain devnode metadata are removed together with
+    /// interfaces that referenced them.
+    pub fn refresh_registry_devnodes(&mut self) -> usize {
+        let Some(enum_root) = self.registry.open_key(ENUM_PATH) else {
+            self.devnodes.clear();
+            self.interfaces.clear();
+            return 0;
+        };
+        let mut keys = Vec::new();
+        self.collect_registry_devnode_keys(enum_root, String::new(), &mut keys);
+        let mut live_instances = Vec::new();
+        for (instance_id, enum_key) in keys {
+            if self
+                .refresh_registry_devnode_key(&instance_id, enum_key)
+                .is_some()
+            {
+                live_instances.push(instance_id);
+            }
+        }
+        let mut retained_instances: Vec<String> = Vec::new();
+        self.devnodes.retain(|devnode| {
+            let live = live_instances
+                .iter()
+                .any(|instance| instance.eq_ignore_ascii_case(&devnode.instance_id));
+            let duplicate = retained_instances
+                .iter()
+                .any(|instance| instance.eq_ignore_ascii_case(&devnode.instance_id));
+            if live && !duplicate {
+                retained_instances.push(devnode.instance_id.clone());
+                true
+            } else {
+                false
+            }
+        });
+        let live_ids: Vec<DevnodeId> = self.devnodes.iter().map(|devnode| devnode.id).collect();
+        self.interfaces
+            .retain(|interface| live_ids.contains(&interface.devnode));
+        self.devnodes.len()
+    }
+
+    fn collect_registry_devnode_keys(
+        &self,
+        key: RegistryKeyId,
+        instance_id: String,
+        out: &mut Vec<(String, RegistryKeyId)>,
+    ) {
+        if !instance_id.is_empty() {
+            out.push((instance_id.clone(), key));
+        }
+        for child_name in self.registry.enum_subkeys(key) {
+            let Some(child_key) = self.registry.open_subkey(key, &child_name) else {
+                continue;
+            };
+            let child_instance = if instance_id.is_empty() {
+                child_name
+            } else {
+                let mut child_instance = instance_id.clone();
+                child_instance.push('\\');
+                child_instance.push_str(&child_name);
+                child_instance
+            };
+            self.collect_registry_devnode_keys(child_key, child_instance, out);
+        }
+    }
+
+    fn refresh_registry_devnode_key(
+        &mut self,
+        instance_id: &str,
+        enum_key: RegistryKeyId,
+    ) -> Option<DevnodeId> {
+        let service = self.registry.query_string(enum_key, "Service");
+        let pdo_name = self.registry.query_string(enum_key, "PdoName");
+        let driver_key = self.registry.query_string(enum_key, "Driver");
+        let hardware_ids = self
+            .registry
+            .query_multi_string(enum_key, "HardwareID")
+            .unwrap_or_default();
+        let compatible_ids = self
+            .registry
+            .query_multi_string(enum_key, "CompatibleIDs")
+            .unwrap_or_default();
+        if service.is_none()
+            && pdo_name.is_none()
+            && driver_key.is_none()
+            && hardware_ids.is_empty()
+            && compatible_ids.is_empty()
+        {
+            return None;
+        }
+
+        if let Some(existing) = self
+            .devnodes
+            .iter_mut()
+            .find(|devnode| devnode.instance_id.eq_ignore_ascii_case(instance_id))
+        {
+            existing.instance_id = instance_id.into();
+            existing.service = service;
+            existing.pdo_name = pdo_name;
+            existing.driver_key = driver_key;
+            existing.hardware_ids = hardware_ids;
+            existing.compatible_ids = compatible_ids;
+            existing.enum_key = enum_key;
+            return Some(existing.id);
+        }
+
+        let id = self.alloc_id();
+        self.devnodes.push(DevnodeRecord {
+            id,
+            instance_id: instance_id.into(),
+            service,
+            pdo_name,
+            driver_key,
+            hardware_ids,
+            compatible_ids,
+            enum_key,
+            properties: PropertyBag::default(),
+        });
+        Some(id)
     }
 
     fn index_registry_devnodes_from_key(
@@ -1091,6 +1215,20 @@ impl ConfigManager {
             properties: PropertyBag::default(),
         });
         Some(id)
+    }
+
+    /// Resolve one driver service and its complete current Enum binding from the live registry.
+    pub fn driver_service_binding(&mut self, service_name: &str) -> Option<DriverServiceBinding> {
+        self.refresh_registry_devnodes();
+        let ServiceStartSpec::Driver(service) = self.service_start_spec(service_name)? else {
+            return None;
+        };
+        let devnodes = self
+            .devnodes_for_service(&service.service_name)
+            .into_iter()
+            .cloned()
+            .collect();
+        Some(DriverServiceBinding { service, devnodes })
     }
 
     fn devnode_mut(&mut self, id: DevnodeId) -> Option<&mut DevnodeRecord> {
@@ -2982,6 +3120,79 @@ mod tests {
         assert_eq!(
             bindings[0].devnodes[0].instance_id,
             r"PCI\VEN_1234&DEV_1111\3&11583659&0&08"
+        );
+    }
+
+    #[test]
+    fn live_driver_binding_refreshes_changed_and_deleted_enum_records() {
+        let mut cm = ConfigManager::new();
+        cm.register_typed_service(
+            "Pending",
+            r"system32\drivers\pending.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            Some("{4D36E97D-E325-11CE-BFC1-08002BE10318}"),
+            SERVICE_DEMAND_START,
+            1,
+        );
+        let first = r"ROOT\PENDING\0001";
+        let second = r"ROOT\PENDING\0002";
+        let first_key = cm.registry_mut().create_key(&devnode_path(first));
+        cm.registry_mut()
+            .set_string(first_key, "Service", "Pending");
+        cm.registry_mut()
+            .set_string(first_key, "PdoName", r"\Device\RootPending1");
+        cm.registry_mut().set_value(
+            first_key,
+            "HardwareID",
+            RegistryValueType::MultiSz,
+            encode_multi_sz(&[r"ROOT\PENDING"]),
+        );
+        let second_key = cm.registry_mut().create_key(&devnode_path(second));
+        cm.registry_mut()
+            .set_string(second_key, "Service", "Pending");
+        cm.registry_mut()
+            .set_string(second_key, "PdoName", r"\Device\RootPending2");
+
+        let initial = cm.driver_service_binding("pending").unwrap();
+        assert_eq!(initial.service.service_name, "Pending");
+        assert_eq!(initial.devnodes.len(), 2);
+        let first_id = initial.devnodes[0].id;
+        assert_eq!(
+            cm.register_devnode(
+                first,
+                Some("Pending"),
+                Some(r"\Device\RootPending1"),
+                &[r"ROOT\PENDING"],
+                &[],
+            ),
+            first_id
+        );
+        assert_eq!(
+            cm.driver_service_binding("Pending").unwrap().devnodes.len(),
+            2
+        );
+
+        cm.registry_mut()
+            .set_string(first_key, "PdoName", r"\Device\RootPendingChanged");
+        cm.registry_mut().set_value(
+            first_key,
+            "CompatibleIDs",
+            RegistryValueType::MultiSz,
+            encode_multi_sz(&[r"ROOT\PENDING_COMPAT"]),
+        );
+        assert!(cm.registry_mut().delete_key(second_key, true));
+
+        let refreshed = cm.driver_service_binding("Pending").unwrap();
+        assert_eq!(refreshed.devnodes.len(), 1);
+        assert_eq!(refreshed.devnodes[0].id, first_id);
+        assert_eq!(
+            refreshed.devnodes[0].pdo_name.as_deref(),
+            Some(r"\Device\RootPendingChanged")
+        );
+        assert_eq!(
+            refreshed.devnodes[0].compatible_ids,
+            alloc::vec![String::from(r"ROOT\PENDING_COMPAT")]
         );
     }
 

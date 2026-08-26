@@ -14,11 +14,17 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use nt_config_abi::{
-    device_property_transfer, opcode, read_utf16, CmDevicePropertyRequest, CmEnumerateKeyRequest,
-    CmKeyRequest, CmRawValueRequest, CmReply, CmValueRequest, CM_ABI_VERSION,
-    CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_MAX_INSTANCE_UNITS,
+    device_property_transfer, driver_service_class, driver_service_transfer, opcode, read_utf16,
+    CmDevicePropertyRequest, CmDriverServiceRequest, CmEnumerateKeyRequest, CmKeyRequest,
+    CmRawValueRequest, CmReply, CmValueRequest, CM_ABI_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES,
+    CM_DRIVER_SERVICE_CHUNK_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES,
+    CM_DRIVER_SERVICE_SNAPSHOT_MAGIC, CM_DRIVER_SERVICE_SNAPSHOT_VERSION, CM_MAX_INSTANCE_UNITS,
+    CM_MAX_SERVICE_UNITS, CM_OPTIONAL_STRING_ABSENT,
 };
-use nt_config_manager::{device_property, ConfigManager, DevicePropertySource, RegistryValueType};
+use nt_config_manager::{
+    device_property, ConfigManager, DevicePropertySource, DriverServiceBinding, DriverServiceClass,
+    RegistryValueType,
+};
 
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
@@ -63,6 +69,67 @@ fn request_slice(buf: &[u8], offset: u32, len_bytes: u32) -> Option<&[u8]> {
     }
 }
 
+fn push_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_string(out: &mut Vec<u8>, value: &str) -> Option<()> {
+    push_u32(out, u32::try_from(value.len()).ok()?);
+    out.extend_from_slice(value.as_bytes());
+    Some(())
+}
+
+fn push_optional_string(out: &mut Vec<u8>, value: Option<&str>) -> Option<()> {
+    match value {
+        Some(value) => push_string(out, value),
+        None => {
+            push_u32(out, CM_OPTIONAL_STRING_ABSENT);
+            Some(())
+        }
+    }
+}
+
+fn encode_driver_service_binding(
+    cm: &ConfigManager,
+    binding: &DriverServiceBinding,
+) -> Option<Vec<u8>> {
+    let class = match binding.service.class {
+        DriverServiceClass::Device => driver_service_class::DEVICE,
+        DriverServiceClass::FileSystem => driver_service_class::FILE_SYSTEM,
+    };
+    let mut out = Vec::new();
+    push_u32(&mut out, CM_DRIVER_SERVICE_SNAPSHOT_MAGIC);
+    push_u16(&mut out, CM_DRIVER_SERVICE_SNAPSHOT_VERSION);
+    push_u16(&mut out, class);
+    push_u32(&mut out, binding.service.start_type);
+    push_u32(&mut out, u32::try_from(binding.devnodes.len()).ok()?);
+    debug_assert_eq!(out.len(), CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES);
+    push_string(&mut out, &binding.service.service_name)?;
+    push_string(&mut out, &binding.service.image_path)?;
+    push_string(&mut out, &binding.service.driver_object_path)?;
+    push_optional_string(&mut out, binding.service.class_guid.as_deref())?;
+    for devnode in &binding.devnodes {
+        push_string(&mut out, &devnode.instance_id)?;
+        push_optional_string(&mut out, devnode.pdo_name.as_deref())?;
+        push_optional_string(&mut out, devnode.driver_key.as_deref())?;
+        let linkage_export = cm.devnode_linkage_export(devnode);
+        push_optional_string(&mut out, linkage_export.as_deref())?;
+        push_u32(&mut out, u32::try_from(devnode.hardware_ids.len()).ok()?);
+        for id in &devnode.hardware_ids {
+            push_string(&mut out, id)?;
+        }
+        push_u32(&mut out, u32::try_from(devnode.compatible_ids.len()).ok()?);
+        for id in &devnode.compatible_ids {
+            push_string(&mut out, id)?;
+        }
+    }
+    Some(out)
+}
+
 struct DevicePropertySnapshot {
     token: u64,
     instance: String,
@@ -72,11 +139,20 @@ struct DevicePropertySnapshot {
     offset: usize,
 }
 
+struct DriverServiceSnapshot {
+    token: u64,
+    service: String,
+    value: Vec<u8>,
+    offset: usize,
+}
+
 /// The Configuration Manager service: the registry authority + the wire dispatcher.
 pub struct CmServer {
     cm: ConfigManager,
     device_property_snapshot: Option<DevicePropertySnapshot>,
     next_device_property_token: u64,
+    driver_service_snapshot: Option<DriverServiceSnapshot>,
+    next_driver_service_token: u64,
 }
 
 impl Default for CmServer {
@@ -91,6 +167,8 @@ impl CmServer {
             cm: ConfigManager::new(),
             device_property_snapshot: None,
             next_device_property_token: 1,
+            driver_service_snapshot: None,
+            next_driver_service_token: 1,
         }
     }
 
@@ -100,6 +178,8 @@ impl CmServer {
             cm,
             device_property_snapshot: None,
             next_device_property_token: 1,
+            driver_service_snapshot: None,
+            next_driver_service_token: 1,
         }
     }
 
@@ -126,6 +206,7 @@ impl CmServer {
             opcode::CM_OP_QUERY_VALUE => self.op_query_value(in_buf, out_buf),
             opcode::CM_OP_ENUMERATE_KEY => self.op_enumerate_key(in_buf, out_buf),
             opcode::CM_OP_QUERY_DEVICE_PROPERTY => self.op_query_device_property(in_buf, out_buf),
+            opcode::CM_OP_QUERY_DRIVER_SERVICE => self.op_query_driver_service(in_buf, out_buf),
             _ => reply(STATUS_INVALID_SYSTEM_SERVICE, 0),
         }
     }
@@ -403,6 +484,125 @@ impl CmServer {
             _ => reply(STATUS_INVALID_PARAMETER, 0),
         }
     }
+
+    fn op_query_driver_service(&mut self, buf: &[u8], out_buf: &mut [u8]) -> CmReply {
+        let Some(req) = CmDriverServiceRequest::from_bytes(buf) else {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        };
+        let header_size = core::mem::size_of::<CmDriverServiceRequest>();
+        if req.abi_size as usize != header_size
+            || req.abi_version != CM_ABI_VERSION
+            || req._reserved != 0
+            || req.service_offset as usize != header_size
+            || req.service_len_bytes == 0
+            || req.service_len_bytes % 2 != 0
+            || req.service_len_bytes as usize > CM_MAX_SERVICE_UNITS * 2
+            || (req.service_offset as usize).checked_add(req.service_len_bytes as usize)
+                != Some(buf.len())
+        {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        }
+        let chunk_capacity = req.chunk_capacity as usize;
+        if chunk_capacity > CM_DRIVER_SERVICE_CHUNK_BYTES || chunk_capacity > out_buf.len() {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        }
+
+        let mut units = [0u16; CM_MAX_SERVICE_UNITS];
+        let Some(unit_count) =
+            read_utf16(buf, req.service_offset, req.service_len_bytes, &mut units)
+        else {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        };
+        let units = &units[..unit_count];
+        if units.contains(&0) {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        }
+        let Ok(service) = String::from_utf16(units) else {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        };
+
+        match req.operation {
+            driver_service_transfer::BEGIN => {
+                if req.transfer_token != 0 || req.value_offset != 0 || req.chunk_capacity == 0 {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let Some(binding) = self.cm.driver_service_binding(&service) else {
+                    return reply(STATUS_OBJECT_NAME_NOT_FOUND, 0);
+                };
+                let Some(value) = encode_driver_service_binding(&self.cm, &binding) else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                };
+                let needed = value.len();
+                let Ok(needed_u32) = u32::try_from(needed) else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                };
+                self.driver_service_snapshot = None;
+                let written = core::cmp::min(needed, chunk_capacity);
+                out_buf[..written].copy_from_slice(&value[..written]);
+                if written == needed {
+                    return reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, 0);
+                }
+                let token = self.next_driver_service_token;
+                if token == 0 {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                }
+                self.next_driver_service_token = token.checked_add(1).unwrap_or(0);
+                self.driver_service_snapshot = Some(DriverServiceSnapshot {
+                    token,
+                    service,
+                    value,
+                    offset: written,
+                });
+                reply_with_info(STATUS_SUCCESS, written as u32, needed_u32 as u64, token)
+            }
+            driver_service_transfer::PULL => {
+                if req.transfer_token == 0 || req.chunk_capacity == 0 {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let Some(snapshot) = self.driver_service_snapshot.as_mut() else {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                };
+                if snapshot.token != req.transfer_token
+                    || !snapshot.service.eq_ignore_ascii_case(&service)
+                    || snapshot.offset != req.value_offset as usize
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let needed = snapshot.value.len();
+                let written = core::cmp::min(needed - snapshot.offset, chunk_capacity);
+                let end = snapshot.offset + written;
+                out_buf[..written].copy_from_slice(&snapshot.value[snapshot.offset..end]);
+                snapshot.offset = end;
+                if end == needed {
+                    self.driver_service_snapshot = None;
+                }
+                reply_with_info(
+                    STATUS_SUCCESS,
+                    written as u32,
+                    needed as u64,
+                    req.transfer_token,
+                )
+            }
+            driver_service_transfer::ABORT => {
+                if req.transfer_token == 0
+                    || req.value_offset != 0
+                    || req.chunk_capacity != 0
+                    || self
+                        .driver_service_snapshot
+                        .as_ref()
+                        .is_none_or(|snapshot| {
+                            snapshot.token != req.transfer_token
+                                || !snapshot.service.eq_ignore_ascii_case(&service)
+                        })
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                self.driver_service_snapshot = None;
+                reply(STATUS_SUCCESS, 0)
+            }
+            _ => reply(STATUS_INVALID_PARAMETER, 0),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -411,8 +611,11 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::*;
-    use nt_config_abi::{device_property_transfer, CmDevicePropertyRequest, CM_ABI_VERSION};
-    use nt_config_manager::{encode_sz, ENUM_PATH};
+    use nt_config_abi::{
+        device_property_transfer, driver_service_transfer, CmDevicePropertyRequest,
+        CmDriverServiceRequest, CM_ABI_VERSION,
+    };
+    use nt_config_manager::{encode_sz, ENUM_PATH, SERVICES_PATH, SERVICE_DEMAND_START};
 
     const INSTANCE: &str = r"PCI\VEN_8086&DEV_100E\0001";
 
@@ -466,6 +669,31 @@ mod tests {
         };
         let mut bytes = Vec::from(header.as_bytes());
         bytes.extend_from_slice(instance_bytes);
+        bytes
+    }
+
+    fn driver_request(
+        service: &str,
+        operation: u16,
+        transfer_token: u64,
+        value_offset: u32,
+        chunk_capacity: u32,
+    ) -> Vec<u8> {
+        let service_bytes = utf16(service);
+        let header_size = core::mem::size_of::<CmDriverServiceRequest>();
+        let header = CmDriverServiceRequest {
+            abi_size: header_size as u16,
+            abi_version: CM_ABI_VERSION,
+            operation,
+            _reserved: 0,
+            value_offset,
+            chunk_capacity,
+            service_offset: header_size as u32,
+            service_len_bytes: service_bytes.len() as u32,
+            transfer_token,
+        };
+        let mut bytes = Vec::from(header.as_bytes());
+        bytes.extend_from_slice(&service_bytes);
         bytes
     }
 
@@ -729,5 +957,88 @@ mod tests {
             &mut [0u8; 1],
         );
         assert_eq!(stale.status, STATUS_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn driver_service_banks_are_one_live_immutable_snapshot() {
+        let mut cm = ConfigManager::new();
+        cm.register_service(
+            "Pending",
+            r"system32\drivers\pending.sys",
+            None,
+            None,
+            SERVICE_DEMAND_START,
+            1,
+        );
+        for index in 0..72 {
+            let instance = alloc::format!(r"ROOT\PENDING\{index:04}");
+            let hardware = alloc::format!(r"ROOT\PENDING_{index:04}_{}", "H".repeat(64));
+            cm.register_devnode(&instance, Some("Pending"), None, &[hardware.as_str()], &[]);
+        }
+        let mut server = CmServer::with_config(cm);
+        let expected_binding = server
+            .config_mut()
+            .driver_service_binding("Pending")
+            .unwrap();
+        let expected = encode_driver_service_binding(server.config(), &expected_binding).unwrap();
+        assert!(expected.len() > CM_DRIVER_SERVICE_CHUNK_BYTES);
+
+        let mut first = [0xa5; CM_DRIVER_SERVICE_CHUNK_BYTES];
+        let begin = server.dispatch(
+            opcode::CM_OP_QUERY_DRIVER_SERVICE,
+            &driver_request(
+                "pending",
+                driver_service_transfer::BEGIN,
+                0,
+                0,
+                CM_DRIVER_SERVICE_CHUNK_BYTES as u32,
+            ),
+            &mut first,
+        );
+        assert_eq!(begin.status, STATUS_SUCCESS);
+        assert_eq!(begin.detail0 as usize, expected.len());
+        assert_ne!(begin.detail1, 0);
+
+        let service_key = server
+            .config()
+            .registry()
+            .open_key(&alloc::format!(r"{}\Pending", SERVICES_PATH))
+            .unwrap();
+        server.config_mut().registry_mut().set_string(
+            service_key,
+            "ImagePath",
+            r"system32\drivers\replacement.sys",
+        );
+
+        let mut assembled = Vec::from(first);
+        assembled.truncate(begin.information as usize);
+        while assembled.len() < expected.len() {
+            let remaining = expected.len() - assembled.len();
+            let bank_len = core::cmp::min(remaining, CM_DRIVER_SERVICE_CHUNK_BYTES);
+            let mut bank = vec![0xa5; bank_len];
+            let pull = server.dispatch(
+                opcode::CM_OP_QUERY_DRIVER_SERVICE,
+                &driver_request(
+                    "Pending",
+                    driver_service_transfer::PULL,
+                    begin.detail1,
+                    assembled.len() as u32,
+                    bank_len as u32,
+                ),
+                &mut bank,
+            );
+            assert_eq!(pull.status, STATUS_SUCCESS);
+            assembled.extend_from_slice(&bank[..pull.information as usize]);
+        }
+        assert_eq!(assembled, expected);
+        assert_eq!(
+            server
+                .config_mut()
+                .driver_service_binding("Pending")
+                .unwrap()
+                .service
+                .image_path,
+            r"system32\drivers\replacement.sys"
+        );
     }
 }

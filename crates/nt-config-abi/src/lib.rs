@@ -15,6 +15,14 @@ pub const CM_ABI_VERSION: u16 = 2;
 pub const CM_MAX_INSTANCE_UNITS: usize = 512;
 /// Maximum property payload carried by one SURT completion frame.
 pub const CM_DEVICE_PROPERTY_CHUNK_BYTES: usize = 4096;
+/// Maximum service-name units accepted by one semantic driver-binding request.
+pub const CM_MAX_SERVICE_UNITS: usize = 512;
+/// Maximum payload carried by one driver-binding completion frame.
+pub const CM_DRIVER_SERVICE_CHUNK_BYTES: usize = 4096;
+pub const CM_DRIVER_SERVICE_SNAPSHOT_MAGIC: u32 = 0x4453_4D43; // `CMSD`
+pub const CM_DRIVER_SERVICE_SNAPSHOT_VERSION: u16 = 1;
+pub const CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES: usize = 16;
+pub const CM_OPTIONAL_STRING_ABSENT: u32 = u32::MAX;
 
 pub mod opcode {
     pub const CM_OP_PING: u16 = 0x2100;
@@ -34,6 +42,8 @@ pub mod opcode {
     pub const CM_OP_ENUMERATE_KEY: u16 = 0x2130;
     /// Query one legacy device property by stable devnode instance path.
     pub const CM_OP_QUERY_DEVICE_PROPERTY: u16 = 0x2140;
+    /// Resolve one live driver service and all registry-bound devnodes.
+    pub const CM_OP_QUERY_DRIVER_SERVICE: u16 = 0x2141;
 }
 
 /// Operation carried by [`CmDevicePropertyRequest::operation`]. Property values are immutable for
@@ -42,6 +52,19 @@ pub mod device_property_transfer {
     pub const BEGIN: u16 = 1;
     pub const PULL: u16 = 2;
     pub const ABORT: u16 = 3;
+}
+
+/// Operation carried by [`CmDriverServiceRequest::operation`].
+pub mod driver_service_transfer {
+    pub const BEGIN: u16 = 1;
+    pub const PULL: u16 = 2;
+    pub const ABORT: u16 = 3;
+}
+
+/// Values encoded in the driver-binding snapshot header's `class` field.
+pub mod driver_service_class {
+    pub const DEVICE: u16 = 1;
+    pub const FILE_SYSTEM: u16 = 2;
 }
 
 /// The reply every Configuration Manager op returns (field-for-field over `SurtCqe`).
@@ -125,6 +148,21 @@ pub struct CmDevicePropertyRequest {
     pub transfer_token: u64,
 }
 
+/// `query_driver_service`: one service name plus an immutable snapshot-bank cursor.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmDriverServiceRequest {
+    pub abi_size: u16,
+    pub abi_version: u16,
+    pub operation: u16,
+    pub _reserved: u16,
+    pub value_offset: u32,
+    pub chunk_capacity: u32,
+    pub service_offset: u32,
+    pub service_len_bytes: u32,
+    pub transfer_token: u64,
+}
+
 macro_rules! wire {
     ($t:ty) => {
         impl $t {
@@ -154,6 +192,7 @@ wire!(CmEnumerateKeyRequest);
 wire!(CmValueRequest);
 wire!(CmRawValueRequest);
 wire!(CmDevicePropertyRequest);
+wire!(CmDriverServiceRequest);
 
 /// Decode a UTF-16LE slice of `buf` (at `offset`, `len_bytes` long) into a `str`
 /// via the caller's scratch — returns the u16 units. Used by the server.
@@ -201,6 +240,36 @@ mod tests {
         );
         assert_eq!(
             CmDevicePropertyRequest::from_bytes(request.as_bytes()),
+            Some(request)
+        );
+    }
+
+    #[test]
+    fn driver_service_request_has_stable_wire_layout() {
+        assert_eq!(opcode::CM_OP_QUERY_DRIVER_SERVICE, 0x2141);
+        assert!((CM_OPCODE_MIN..=CM_OPCODE_MAX).contains(&opcode::CM_OP_QUERY_DRIVER_SERVICE));
+        assert_eq!(core::mem::size_of::<CmDriverServiceRequest>(), 32);
+
+        let request = CmDriverServiceRequest {
+            abi_size: 32,
+            abi_version: CM_ABI_VERSION,
+            operation: driver_service_transfer::PULL,
+            _reserved: 0,
+            value_offset: 0x1122_3344,
+            chunk_capacity: 0x5566_7788,
+            service_offset: 32,
+            service_len_bytes: 0x99aa_bbcc,
+            transfer_token: 0x1122_3344_5566_7788,
+        };
+        assert_eq!(
+            request.as_bytes(),
+            &[
+                32, 0, 2, 0, 2, 0, 0, 0, 0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 32, 0, 0,
+                0, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+            ]
+        );
+        assert_eq!(
+            CmDriverServiceRequest::from_bytes(request.as_bytes()),
             Some(request)
         );
     }

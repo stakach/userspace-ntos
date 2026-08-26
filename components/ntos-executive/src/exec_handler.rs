@@ -5676,11 +5676,12 @@ impl ExecNtHandler {
             Ok(service) => service,
             Err(status) => return status,
         };
-        let Some(spec) = system_hive_driver_service_launch_spec(
+        let spec = match live_config_driver_service_launch_spec(
             &service,
             nt_config_manager::SERVICE_DEMAND_START,
-        ) else {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
+        ) {
+            Ok(spec) => spec,
+            Err(status) => return status as u32,
         };
         if driver_launch::driver_id_by_name(&spec.driver_object_path).is_some() {
             return STATUS_IMAGE_ALREADY_LOADED;
@@ -5768,7 +5769,6 @@ impl ExecNtHandler {
 
     unsafe fn nt_unload_driver(&mut self, service_name_ustr: u64) -> u32 {
         const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
-        const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 
         if !self.current_token_has_privilege(nt_security::SE_LOAD_DRIVER) {
             return STATUS_PRIVILEGE_NOT_HELD;
@@ -5781,11 +5781,12 @@ impl ExecNtHandler {
             Ok(service) => service,
             Err(status) => return status,
         };
-        let Some(driver_object_path) = system_hive_driver_service_object_path(
+        let driver_object_path = match live_config_driver_service_launch_spec(
             &service,
             nt_config_manager::SERVICE_DEMAND_START,
-        ) else {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
+        ) {
+            Ok(spec) => spec.driver_object_path,
+            Err(status) => return status as u32,
         };
         for slot in 0..self.pending_driver_loads.slot_count() {
             if self

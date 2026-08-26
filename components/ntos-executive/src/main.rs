@@ -15055,6 +15055,15 @@ pub(crate) unsafe fn config_manager_query_device_property(
     client.query_device_property(instance, property, out)
 }
 
+pub(crate) unsafe fn config_manager_query_driver_service(
+    service: &str,
+) -> Result<nt_config_client::DriverServiceBinding, i32> {
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    client.query_driver_service(service)
+}
+
 /// The I/O Manager transport wrapper (carries the extra `flags` + a u64 `information`).
 struct IoChan<'a>(RingChannel<'a>);
 impl nt_io_client::Backend for IoChan<'_> {
@@ -19507,40 +19516,38 @@ fn current_driver_host_can_boot_launch(
     }
 }
 
-fn owned_driver_launch_spec_from_config_driver_spec(
-    service: nt_config_manager::DriverServiceLaunchSpec,
+fn owned_driver_launch_spec_from_live_config_binding(
+    binding: nt_config_client::DriverServiceBinding,
     max_start: u32,
-    devnodes: alloc::vec::Vec<DriverServiceDevnodeSpec>,
 ) -> Option<DriverServiceLaunchSpec> {
-    let (image_path, class) = driver_launch_spec_from_config_driver_spec(&service, max_start)?;
-    let driver_object_path = service.driver_object_path;
-    let service_name = service.service_name;
-    let class_guid = service.class_guid;
+    if binding.start_type > max_start || binding.start_type >= SERVICE_DISABLED {
+        return None;
+    }
+    let image_path = registry_ascii_path(&binding.image_path)?;
+    let class = match binding.class {
+        nt_config_client::DriverServiceClass::Device => driver_launch::DriverClass::Device,
+        nt_config_client::DriverServiceClass::FileSystem => driver_launch::DriverClass::Fsd,
+    };
+    let devnodes = binding
+        .devnodes
+        .into_iter()
+        .map(|devnode| DriverServiceDevnodeSpec {
+            instance_id: devnode.instance_id,
+            pdo_name: devnode.pdo_name,
+            driver_key: devnode.driver_key,
+            linkage_export: devnode.linkage_export,
+            hardware_ids: devnode.hardware_ids,
+            compatible_ids: devnode.compatible_ids,
+        })
+        .collect();
     Some(DriverServiceLaunchSpec {
-        service_name,
-        class_guid,
-        driver_object_path,
+        service_name: binding.service_name,
+        class_guid: binding.class_guid,
+        driver_object_path: binding.driver_object_path,
         image_path,
         class,
         devnodes,
     })
-}
-
-fn driver_service_devnode_specs(
-    cm: &nt_config_manager::ConfigManager,
-    service_name: &str,
-) -> alloc::vec::Vec<DriverServiceDevnodeSpec> {
-    cm.devnodes_for_service(service_name)
-        .into_iter()
-        .map(|devnode| DriverServiceDevnodeSpec {
-            instance_id: devnode.instance_id.clone(),
-            pdo_name: devnode.pdo_name.clone(),
-            driver_key: devnode.driver_key.clone(),
-            linkage_export: cm.devnode_linkage_export(devnode),
-            hardware_ids: devnode.hardware_ids.clone(),
-            compatible_ids: devnode.compatible_ids.clone(),
-        })
-        .collect()
 }
 
 #[derive(Clone, Copy, Default)]
@@ -20253,34 +20260,13 @@ fn system_hive_boot_driver_launch_plan() -> &'static InlineDriverLaunchPlan {
     plan
 }
 
-pub(crate) fn system_hive_driver_service_launch_spec(
+pub(crate) unsafe fn live_config_driver_service_launch_spec(
     service_name: &str,
     max_start: u32,
-) -> Option<DriverServiceLaunchSpec> {
-    let cm = system_hive_config_manager()?;
-    let nt_config_manager::ServiceStartSpec::Driver(service) =
-        cm.service_start_spec(service_name)?
-    else {
-        return None;
-    };
-    let devnodes = driver_service_devnode_specs(&cm, service_name);
-    owned_driver_launch_spec_from_config_driver_spec(service, max_start, devnodes)
-}
-
-pub(crate) fn system_hive_driver_service_object_path(
-    service_name: &str,
-    max_start: u32,
-) -> Option<alloc::string::String> {
-    let cm = system_hive_config_manager()?;
-    let nt_config_manager::ServiceStartSpec::Driver(service) =
-        cm.service_start_spec(service_name)?
-    else {
-        return None;
-    };
-    if service.start_type > max_start || service.start_type >= SERVICE_DISABLED {
-        return None;
-    };
-    Some(service.driver_object_path)
+) -> Result<DriverServiceLaunchSpec, i32> {
+    let binding = config_manager_query_driver_service(service_name)?;
+    owned_driver_launch_spec_from_live_config_binding(binding, max_start)
+        .ok_or(0xC000_0034u32 as i32)
 }
 
 fn registry_ascii_hex_digit(b: u8) -> bool {

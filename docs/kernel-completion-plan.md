@@ -12513,3 +12513,60 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     manager. Preserve the two distinct NT owners: enumerated present-device action uses replyless
     kernel `IopLoadDriver`, and an explicit native request retains its caller reply. Do not add a
     service-name exclusion, a duplicate boot cohort, or a fallback to static image metadata.
+
+    Live Configuration Manager authority review (2026-08-26): source audit found three views that
+    must converge, not merely two. `NtLoadDriver` and `NtUnloadDriver` currently reparse the
+    immutable real SYSTEM REGF; native registry syscalls mutate `ExecNtHandler::mutable_hives`; and
+    hosted PnP/property consumers reach an isolated `CmServer` initially seeded from the generated
+    CONFIG image. `ConfigManager::service_metadata` already rereads registry state on every query,
+    but its devnode side index must be refreshed for late Enum mutations. The accepted native reply
+    continuation is already correct and remains untouched: an awaiting explicit load retains its
+    exact caller reply as `PendingDriverStartOwner::Native`, while kernel present-device action stays
+    replyless.
+
+    Implement the next slice crate-first. Add one live semantic driver-binding query to the
+    Configuration Manager ABI/client/server, returning registry-selected driver launch metadata and
+    every bound devnode through a versioned BEGIN/PULL/ABORT immutable snapshot transfer. The
+    transfer must support payloads larger than the 4096-byte shared reply frame and must not impose a
+    device-count policy ceiling. Refresh the registry-derived devnode index before selection, with
+    replacement/removal semantics for changed or deleted Enum records. Then move native load and
+    unload to that exact live query and delete the immutable `system_hive_driver_service_*` helpers;
+    no fallback is permitted.
+
+    Review adjustment: semantic lookup alone does not yet make native SCM registry writes live.
+    Close the authority boundary by routing mounted SYSTEM Services/Enum mutations to the same
+    CM-owned registry, or by moving the mounted persistent SYSTEM hive behind `CmServer`; do not
+    dual-write. Only after that convergence should a later bus/devnode publication install a
+    DEMAND_START binding, issue ordinary kernel device action, and separately prove a genuine native
+    `NtLoadDriver` caller parks across asynchronous START and receives exactly one terminal reply.
+    PendingStartTest's timer-DPC path is sufficient for this proof. Worker-origin DPC activation and
+    scheduler-quiescent transactional unload remain explicit later prerequisites before accepting a
+    worker-completing driver or lifecycle removal.
+
+    Live semantic driver-binding checkpoint (2026-08-26, implementation green): Configuration
+    Manager now resolves one registry-live driver launch specification together with every current
+    service-bound devnode. Before selection it refreshes the complete Enum-derived semantic index,
+    preserves stable IDs/property bags for surviving instances, replaces changed Service/PdoName/
+    Driver/ID metadata, removes deleted or unshaped records and their interfaces, and makes repeated
+    `register_devnode` calls idempotent instead of duplicating the index.
+
+    `nt-config-abi`, `nt-config-server`, and `nt-config-client` expose this result through a
+    versioned BEGIN/PULL/ABORT immutable snapshot. The encoding has no devnode-count ceiling and the
+    client reassembles payloads across any number of 4096-byte SURT reply frames before strict,
+    trailing-byte-free decoding. Tests cover a live ImagePath mutation, a devnode created after
+    server construction, 73 dynamically returned devnodes, a payload larger than one reply frame,
+    and snapshot immutability across a mid-transfer registry mutation. Focused validation is green
+    at `nt-config-abi` `2/2`, `nt-config-client` `11/11`, `nt-config-manager` `29/29`, and
+    `nt-config-server` `5/5`.
+
+    Native `NtLoadDriver` and `NtUnloadDriver` now query only that isolated live semantic authority;
+    the immutable SYSTEM launch/object lookup helpers and their dead owned-devnode converter are
+    removed. Existing explicit-load reservation, parked caller reply, asynchronous redrive, detached
+    barrier, and replyless PnP ownership are unchanged. The freestanding executive check remains
+    green at the established 212-warning baseline and `git diff --check` is clean.
+
+    Review adjustment: keep this checkpoint provisional until a serialized desktop run proves that
+    the enlarged CM protocol and new native lookup do not regress boot. Then converge native mounted
+    SYSTEM Services/Enum mutations with the CM-owned registry without dual-write, and add typed
+    historical seed versus live devnode publication/change generations before wiring runtime device
+    action.
