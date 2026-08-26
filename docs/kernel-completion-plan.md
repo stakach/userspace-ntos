@@ -11653,19 +11653,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     provider export-publication tokens are now named and used only for singleton image/export,
     marshal-policy, and thunk selection. Provider routes retain separate exact dependent and
     provider `HostedDomainIdentity` values, and IRP envelopes carry the provider domain id and its
-    real generation cookie rather than the publication token. Callback records retain both exact
-    domain identities and the publication generation, validate a live route and executable target
-    at creation, revalidate both current instances and the provider channel before dispatch, and
-    are tombstoned with their exact route. Dynamic internal marshal-policy rows are likewise owned
-    by the singleton's exact domain generation and are retired with that publication.
+    real generation cookie rather than the publication token. One exact domain-dependency lease is
+    acquired on the first provider export and retained for the dependent instance lifetime, so
+    protocol callbacks that precede a miniport DriverObject route and later dispatch routes share
+    the same unload authority. Callback records retain both exact domain identities and the
+    publication generation, validate that live dependency plus an executable target at creation,
+    revalidate both current instances and the provider channel before dispatch, and are tombstoned
+    with their exact dependency. Dynamic internal marshal-policy rows are likewise owned by the
+    singleton's exact domain generation and are retired with that publication.
 
     The I/O Manager now returns the complete identity when registering a hosted domain, exposes
     only exact-generation DriverObject, DeviceObject, and FileObject projection APIs, rejects domain
     retirement while any projection or inbound/outbound provider link remains, and refuses provider
     unload while dependent leases exist. Provider-link acquisition distinguishes a newly created
-    lease from an idempotent replay so allocation rollback cannot erase another route's ownership;
-    one dependent domain cannot acquire conflicting provider routes. Route retirement becomes
-    non-dispatchable before teardown and retains its row for exact retry. `clear_instance` is now
+    lease from an idempotent replay, while route-allocation rollback cannot erase the instance-owned
+    dependency; one dependent domain cannot acquire conflicting providers or dispatch routes. Route
+    retirement becomes non-dispatchable before teardown and retains its row for exact retry.
+    `clear_instance` is now
     fallible, counts failed device-binding retirement, keeps the instance/domain/mechanism on any
     failed exact cleanup, and destroys canonical driver records only after device/resource and
     provider projections have been withdrawn. Driver unload propagates that result instead of
@@ -11673,8 +11677,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
 
     Local validation is green for `nt-status` at `4/4`, `nt-io-manager` at `190/190`,
     `nt-hosted-runtime` at `53/53`, the freestanding driver-host check, formatting and diff checks,
-    and the executive check at the established 212-warning baseline. Review adjustment: run one
-    serialized desktop proof before accepting this checkpoint. Then finish the remaining
+    and the executive check at the established 212-warning baseline. The first serialized proof,
+    `.tmp/run-desktop-exact-provider-lifetime-20260826.log`, reached genuine Explorer and painted all
+    `480000/480000` pixels, but correctly failed at `292/293`: binding every callback to a miniport
+    dispatch route rejected TCP/IP's earlier real `NdisRegisterProtocol` marshal and therefore the
+    NDIS receive-indication gate. That overconstraint is removed in favour of the instance-owned
+    domain dependency described above. Review adjustment: rerun one serialized desktop proof and
+    require all `293/293` gates before accepting this checkpoint. Then finish the remaining
     failure-retaining provider shadow/allocation cleanup and implement the ordered PnP removal
     transaction, including query/cancel/remove IRPs, interface and video-route withdrawal, exact
     resource revocation, FDO/PDO detach and destruction, RootBus PDO removal, DriverUnload, and
