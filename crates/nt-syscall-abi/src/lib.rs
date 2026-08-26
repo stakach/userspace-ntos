@@ -85,6 +85,12 @@ pub struct ParkedSyscallReply {
     registers: [u64; Self::UNKNOWN_SYSCALL_REGISTER_COUNT],
 }
 
+impl Default for ParkedSyscallReply {
+    fn default() -> Self {
+        Self::native_call()
+    }
+}
+
 impl ParkedSyscallReply {
     /// Number of register words in rust-micro's x86-64 UnknownSyscall reply ABI.
     pub const UNKNOWN_SYSCALL_REGISTER_COUNT: usize = 18;

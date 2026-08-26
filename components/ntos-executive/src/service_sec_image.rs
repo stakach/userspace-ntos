@@ -15875,9 +15875,7 @@ pub(crate) unsafe fn service_sec_image(
                     park_io_completion_apc_out,
                     park_io_completion_iosb_out,
                     park_io_completion_deadline.unwrap_or(u64::MAX),
-                    resume_ip,
-                    sp,
-                    flags,
+                    parked_syscall_reply,
                 ) {
                     delay_timer_rearm_after_park(
                         delay_queue,
@@ -15925,9 +15923,7 @@ pub(crate) unsafe fn service_sec_image(
                     delay_queue,
                     deadline,
                     reply_main,
-                    resume_ip,
-                    sp,
-                    flags,
+                    parked_syscall_reply,
                     delay_tid,
                     badge,
                 ) {
@@ -15955,9 +15951,7 @@ pub(crate) unsafe fn service_sec_image(
                     result = 0xC000_009A;
                 } else if keyed_release_wait_park(
                     park_keyed_release_wait_key,
-                    resume_ip,
-                    sp,
-                    flags,
+                    parked_syscall_reply,
                     nt_handler.current_tid,
                     park_keyed_release_wait_deadline,
                 ) {
@@ -16006,9 +16000,7 @@ pub(crate) unsafe fn service_sec_image(
                     result = 0xC000_009A;
                 } else if keyed_wait_park(
                     park_keyed_wait_key,
-                    resume_ip,
-                    sp,
-                    flags,
+                    parked_syscall_reply,
                     nt_handler.current_tid,
                     park_keyed_wait_deadline,
                 ) {
@@ -21901,9 +21893,7 @@ unsafe fn io_completion_park(
     apc_context_out: u64,
     io_status_block_out: u64,
     deadline_100ns: u64,
-    resume_ip: u64,
-    sp: u64,
-    flags: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
 ) -> bool {
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     if stolen == 0 {
@@ -21919,9 +21909,7 @@ unsafe fn io_completion_park(
     waiter.port_id = port_id;
     waiter.process_index = nt_handler.pi as u8;
     waiter.reply_cap = stolen;
-    waiter.resume_ip = resume_ip;
-    waiter.resume_sp = sp;
-    waiter.resume_flags = flags;
+    waiter.reply = reply;
     waiter.thread_id = nt_handler.current_tid;
     waiter.badge = nt_handler.current_badge;
     waiter.key_context_out = key_context_out;
@@ -22001,16 +21989,10 @@ unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
     nt_handler.pi = saved_pi;
     nt_handler.loop_ctx = saved_ctx;
 
-    set_reply_mr(15, waiter.resume_ip);
-    set_reply_mr(16, waiter.resume_sp);
-    set_reply_mr(17, waiter.resume_flags);
-    client_reply_on(
+    reply_parked_syscall(
         waiter.reply_cap,
-        18,
+        waiter.reply,
         if copied { 0 } else { 0xC000_0005 },
-        0,
-        0,
-        0,
     );
     release_reply_pool_cap(waiter.reply_cap);
     thread_wait_state_clear_badge_ready(nt_handler, waiter.badge);

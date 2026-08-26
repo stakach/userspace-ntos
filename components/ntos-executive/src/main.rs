@@ -2698,9 +2698,7 @@ struct KeyedWaiterRecord {
     reply_cap: u64,
     tid: u64,
     deadline: u64,
-    resume_ip: u64,
-    resume_sp: u64,
-    resume_flags: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
 }
 
 impl KeyedWaiterRecord {
@@ -2710,9 +2708,7 @@ impl KeyedWaiterRecord {
             reply_cap: 0,
             tid: 0,
             deadline: u64::MAX,
-            resume_ip: 0,
-            resume_sp: 0,
-            resume_flags: 0,
+            reply: nt_syscall_abi::ParkedSyscallReply::native_call(),
         }
     }
 
@@ -15969,9 +15965,7 @@ unsafe fn delay_park(
     queue: &mut nt_delay_execution::Queue,
     deadline_100ns: u64,
     reply_cap: u64,
-    resume_ip: u64,
-    sp: u64,
-    flags: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
     thread_id: u64,
     badge: u64,
 ) -> bool {
@@ -15985,9 +15979,7 @@ unsafe fn delay_park(
         deadline_100ns,
         sequence: 0,
         reply_cap,
-        resume_ip,
-        resume_sp: sp,
-        resume_flags: flags,
+        reply,
         thread_id,
         badge,
     };
@@ -16020,11 +16012,8 @@ unsafe fn delay_wake_due(
         let other_started = disk_census_ticks();
         DELAY_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
         DELAY_WAKE_LAST_BADGE.store(waiter.badge, Ordering::Relaxed);
-        set_reply_mr(15, waiter.resume_ip);
-        set_reply_mr(16, waiter.resume_sp);
-        set_reply_mr(17, waiter.resume_flags);
         let reply_started = disk_census_ticks();
-        client_reply_on(waiter.reply_cap, 18, 0, 0, 0, 0);
+        reply_parked_syscall(waiter.reply_cap, waiter.reply, 0);
         let reply_done = disk_census_ticks();
         DELAY_WAKE_REPLY_TICKS.fetch_add(reply_done.wrapping_sub(reply_started), Ordering::Relaxed);
         release_reply_pool_cap(waiter.reply_cap);
@@ -16061,16 +16050,10 @@ unsafe fn io_completion_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
             print_u64(now);
             print_str(b"\n");
         }
-        set_reply_mr(15, waiter.resume_ip);
-        set_reply_mr(16, waiter.resume_sp);
-        set_reply_mr(17, waiter.resume_flags);
-        client_reply_on(
+        reply_parked_syscall(
             waiter.reply_cap,
-            18,
+            waiter.reply,
             nt_io_completion::STATUS_TIMEOUT as u64,
-            0,
-            0,
-            0,
         );
         release_reply_pool_cap(waiter.reply_cap);
         thread_wait_state_clear_badge_ready(handler, waiter.badge);
@@ -16757,9 +16740,7 @@ fn keyed_wait_clear_slot(slot: usize) {
 /// user pointer instead of an executive event index.
 unsafe fn keyed_wait_park(
     key: u64,
-    resume_ip: u64,
-    sp: u64,
-    flags: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
     tid: u64,
     deadline: Option<u64>,
 ) -> bool {
@@ -16776,9 +16757,7 @@ unsafe fn keyed_wait_park(
         reply_cap: stolen,
         tid,
         deadline: deadline.unwrap_or(u64::MAX),
-        resume_ip,
-        resume_sp: sp,
-        resume_flags: flags,
+        reply,
     }) {
         return false;
     }
@@ -16802,10 +16781,7 @@ unsafe fn keyed_wait_wake_one(handler: &mut ExecNtHandler, key: u64, status: u64
         keyed_wait_clear_slot(slot);
         return false;
     }
-    set_reply_mr(15, record.resume_ip);
-    set_reply_mr(16, record.resume_sp);
-    set_reply_mr(17, record.resume_flags);
-    client_reply_on(cap, 18, status, 0, 0, 0);
+    reply_parked_syscall(cap, record.reply, status);
     release_reply_pool_cap(cap);
     thread_wait_state_clear_tid_ready(handler, record.tid);
     keyed_wait_clear_slot(slot);
@@ -16823,9 +16799,7 @@ fn keyed_release_wait_clear_slot(slot: usize) {
 /// `NtWaitForKeyedEvent` on the same raw key wakes this parked releaser and itself returns success.
 unsafe fn keyed_release_wait_park(
     key: u64,
-    resume_ip: u64,
-    sp: u64,
-    flags: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
     tid: u64,
     deadline: Option<u64>,
 ) -> bool {
@@ -16842,9 +16816,7 @@ unsafe fn keyed_release_wait_park(
         reply_cap: stolen,
         tid,
         deadline: deadline.unwrap_or(u64::MAX),
-        resume_ip,
-        resume_sp: sp,
-        resume_flags: flags,
+        reply,
     }) {
         return false;
     }
@@ -16868,10 +16840,7 @@ unsafe fn keyed_release_wake_one(handler: &mut ExecNtHandler, key: u64, status: 
         keyed_release_wait_clear_slot(slot);
         return false;
     }
-    set_reply_mr(15, record.resume_ip);
-    set_reply_mr(16, record.resume_sp);
-    set_reply_mr(17, record.resume_flags);
-    client_reply_on(cap, 18, status, 0, 0, 0);
+    reply_parked_syscall(cap, record.reply, status);
     release_reply_pool_cap(cap);
     thread_wait_state_clear_tid_ready(handler, record.tid);
     keyed_release_wait_clear_slot(slot);
@@ -16890,10 +16859,7 @@ unsafe fn keyed_wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
         }
         let cap = record.reply_cap;
         if cap != 0 {
-            set_reply_mr(15, record.resume_ip);
-            set_reply_mr(16, record.resume_sp);
-            set_reply_mr(17, record.resume_flags);
-            client_reply_on(cap, 18, 0x102, 0, 0, 0);
+            reply_parked_syscall(cap, record.reply, 0x102);
             release_reply_pool_cap(cap);
             thread_wait_state_clear_tid_ready(handler, record.tid);
             woken += 1;
@@ -16914,10 +16880,7 @@ unsafe fn keyed_release_wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> 
         }
         let cap = record.reply_cap;
         if cap != 0 {
-            set_reply_mr(15, record.resume_ip);
-            set_reply_mr(16, record.resume_sp);
-            set_reply_mr(17, record.resume_flags);
-            client_reply_on(cap, 18, 0x102, 0, 0, 0);
+            reply_parked_syscall(cap, record.reply, 0x102);
             release_reply_pool_cap(cap);
             thread_wait_state_clear_tid_ready(handler, record.tid);
             woken += 1;
@@ -31248,9 +31211,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             deadline_100ns: 1500,
             sequence: 0,
             reply_cap: 1,
-            resume_ip: 0,
-            resume_sp: 0,
-            resume_flags: 0,
+            reply: nt_syscall_abi::ParkedSyscallReply::native_call(),
             thread_id: 7,
             badge: 3,
         };
@@ -31270,9 +31231,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             deadline_100ns,
             sequence: 0,
             reply_cap: 1,
-            resume_ip: 0,
-            resume_sp: 0,
-            resume_flags: 0,
+            reply: nt_syscall_abi::ParkedSyscallReply::native_call(),
             thread_id,
             badge,
         };

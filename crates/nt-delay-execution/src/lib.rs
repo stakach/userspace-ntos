@@ -86,9 +86,7 @@ pub struct Waiter {
     pub deadline_100ns: u64,
     pub sequence: u64,
     pub reply_cap: u64,
-    pub resume_ip: u64,
-    pub resume_sp: u64,
-    pub resume_flags: u64,
+    pub reply: nt_syscall_abi::ParkedSyscallReply,
     pub thread_id: u64,
     pub badge: u64,
 }
@@ -212,9 +210,12 @@ mod tests {
             deadline_100ns: deadline,
             sequence: 99,
             reply_cap: thread_id + 100,
-            resume_ip: 1,
-            resume_sp: 2,
-            resume_flags: 3,
+            reply: nt_syscall_abi::ParkedSyscallReply::unknown_syscall(
+                [0; nt_syscall_abi::ParkedSyscallReply::UNKNOWN_SYSCALL_REGISTER_COUNT],
+                1,
+                2,
+                3,
+            ),
             thread_id,
             badge: thread_id + 10,
         }

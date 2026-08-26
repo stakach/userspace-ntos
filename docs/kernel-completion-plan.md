@@ -13030,3 +13030,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     keyed-event, delay, and I/O-completion waiter records and migrate any remaining partial register
     continuations to the same ABI type before snapshot-bank consolidation; no parked syscall may
     depend on ambient IPC-buffer contents.
+
+    Sibling waiter continuation migration (2026-08-27, implementation green): the serialized CM
+    acceptance run passed the former retained-pipe frontier, then stalled with LSA active while
+    timeout-driven completion-port workers repeatedly parked and resumed. The audit found that
+    `NtRemoveIoCompletion`, `NtDelayExecution`, and both sides of the keyed-event rendezvous still
+    retained only RIP/RSP/RFLAGS and emitted partial 18-word fault replies.
+
+    Delay and completion-port waiter crates now own the shared `ParkedSyscallReply` value directly;
+    keyed waiter records do the same. Direct wakes and timeout wakes all use the one staging helper,
+    preserving the complete hosted register file while retaining the one-word native seL4-Call
+    reply shape. The deleted resume triples have no compatibility path. Focused tests are green at
+    delay `10/10`, I/O completion `33/33`, and syscall ABI `18/18`; the freestanding executive check
+    remains green at 212 warnings.
+
+    Review adjustment: rerun serialized desktop acceptance. If the LSA/userinit frontier clears,
+    finish the global reply-cap continuation audit before snapshot-bank consolidation: GUI message
+    waits, debug reporter blocks, synchronous/pending File continuations, and LPC/CSR rendezvous
+    records must either retain a complete immutable fault reply or prove that they never outlive the
+    authoritative receive context. No 18-word wake may source register words from ambient IPC state.
