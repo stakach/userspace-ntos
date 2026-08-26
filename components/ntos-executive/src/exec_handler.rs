@@ -23330,6 +23330,7 @@ impl ExecNtHandler {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
+                let _transient = allocator::enter_transient();
                 let use_xas_write = self.pi >= 2;
                 let index = nt_ulong_arg(args[1]) as usize;
                 let info_class = nt_ulong_arg(args[2]) as u64;
@@ -23898,6 +23899,7 @@ impl ExecNtHandler {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
+                let _transient = allocator::enter_transient();
                 let output_length = nt_ulong_arg(args[4]) as usize;
                 let info_class = nt_ulong_arg(args[2]) as u64;
                 if args[5] == 0 || !self.probe_user_output(args[5], 4) {
@@ -26691,6 +26693,7 @@ impl ExecNtHandler {
                 if security_information & !QUERY_MASK != 0 {
                     return 0xC000_000D;
                 }
+                let _transient = allocator::enter_transient();
                 let mut required_access = 0;
                 if security_information
                     & (nt_security::OWNER_SECURITY_INFORMATION

@@ -13670,3 +13670,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     file queries from broad scratch guards: those paths can park, publish pending IRPs, queue APCs,
     and complete IOCP state. Split their synchronous capture/encode buffers from their publication
     phase before migrating them.
+
+    Value/security query capture scopes (2026-08-27, accepted): `NtQueryValueKey`,
+    `NtEnumerateValueKey`, and `NtQuerySecurityObject` now route their captured Unicode names,
+    canonical paths, and generated descriptor buffers through lexical scratch. Registry value-copy
+    provenance remains a durable, bounded table containing only value identity and caller-address
+    metadata; no scratch pointer is published. Its preallocated `Vec` also retains the durable arena
+    on growth because allocator reallocation follows the original allocation rather than the active
+    scope.
+
+    Serialized acceptance `.tmp/run-headless-value-security-query-scopes-20260827.log` passed all
+    `295/295` gates. The exercised path includes live LSA/SAM policy and account validation,
+    ProfileList/user-hive reads, userinit selection, Explorer shell COM values, security queries,
+    and the complete 480,000-pixel shell framebuffer. Scratch returned to zero and peak usage stayed
+    278,112 B of 4,194,304 B. Next split synchronous directory-file capture/encoding from APC,
+    pending-IRP, event, and IOCP publication before moving its temporary entry vectors to scratch.
