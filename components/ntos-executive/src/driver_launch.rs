@@ -11292,6 +11292,11 @@ extern "win64" fn s_ke_initialize_dpc(dpc: u64, routine: u64, deferred_context: 
         if dpc == 0 {
             return;
         }
+        // Every hosted component owns a software-DPC queue, including
+        // resource-free and legacy drivers that never receive a hardware
+        // resource projection. KeInitializeDpc is the authoritative point at
+        // which that queue first becomes required.
+        ensure_dpc_queue_projection(FSD_SHARED_VADDR);
         core::ptr::write_bytes(dpc as *mut u8, 0, KDPC_SIZE as usize);
         write_unaligned((dpc + KDPC_DEFERRED_ROUTINE_OFFSET) as *mut u64, routine);
         write_unaligned(

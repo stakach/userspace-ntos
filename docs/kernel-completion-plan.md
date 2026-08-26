@@ -12477,3 +12477,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     transaction plan with live Configuration Manager authority for a later demand-start devnode and
     a genuine native `NtLoadDriver` reply owner; do not exclude the fixture from ordinary PnP device
     action or add a second static load policy.
+
+    First integration review (2026-08-26):
+    `.tmp/run-desktop-pending-start-20260826.log` reached genuine Explorer chrome, painted all
+    `480000/480000` pixels with at least 32 non-background colours, and emitted the sentinel, but
+    correctly failed the three new generic PnP gates at `293/296`. The first fixture devnode returned
+    real `STATUS_PENDING`; its timer activation later entered instance 8 and returned
+    `STATUS_INSUFFICIENT_RESOURCES` because the component KDPC queue capacity was still zero. The
+    same failure was visible on an existing NPFS timer. Queue initialization had been coupled to
+    hardware resource projection, so a resource-free driver never received it. `KeInitializeDpc`
+    now ensures its component's software-DPC queue independently of resource assignment. This is a
+    kernel mechanism correction, not a fixture exception. Repeat the serialized acceptance run and
+    require both devnodes to complete before closing the checkpoint.
