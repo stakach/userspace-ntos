@@ -2463,6 +2463,18 @@ freestanding executive check are green at the established 212-warning baseline. 
 validation is the next gate and must prove bochsmp START through the canonical transaction, route
 publication, genuine Explorer paint, and no retained indeterminate PnP row.
 
+Serialized validation (2026-08-26, accepted): the first committed-state run
+`.tmp/run-desktop-canonical-video-pnp-20260826.log` completed the real bochsmp START and video-route
+publication, launched userinit and Explorer, painted all `480000/480000` framebuffer pixels with at
+least 32 non-background colours, and emitted the sentinel. Its only miss was the known
+schedule-sensitive ScrollBar class-info observation (`0/0/0`), with zero callback or shell failure.
+The clean confirmation `.tmp/run-desktop-canonical-video-pnp-confirm-20260826.log` repeats bochsmp
+START at `STATUS_SUCCESS`, reports the registry-selected hardware batch as
+`selected=3 attempted=3 add=3 started=3 first_error=STATUS_SUCCESS`, publishes the exact hosted video
+route, passes the ScrollBar observation, renders the full Explorer framebuffer, passes all `293/293`
+executive gates, and emits the sentinel. No pending or indeterminate START remained in the batch.
+The explicit video START authority is closed.
+
 Review adjustment: once that run is accepted, preserve asynchronous START as a first-class boot
 disposition. The current `canonical_start_status` adapter incorrectly flattens `Pending` into
 `STATUS_PENDING` failure and `Indeterminate` into a terminal driver error; demand `NtLoadDriver`
