@@ -2412,7 +2412,7 @@ Serialized desktop validation is the next gate. The explicit videoprt startup re
 must be replaced with a real canonical PnP backend; genuinely asynchronous boot START completion
 also needs to feed the boot start report instead of being reported as an immediate terminal error.
 
-B3 durable service-loop ownership checkpoint (2026-08-26, local green): the first serialized run
+B3 durable service-loop ownership checkpoint (2026-08-26, accepted): the first serialized run
 of canonical non-video START reached the real Explorer desktop and returned genuine success from
 the E1000, DMA test, and bochsmp PnP paths, but the run is rejected because the quiescence writable
 snapshot reported `corrupt` and the subsequent section-writeback selftest reached `memcmp` through
@@ -2426,8 +2426,14 @@ completion queue growth and the hosted PnP transaction registry explicitly publi
 signals. Failed writable checkpoints retain their dirty/commit requirement so a later barrier
 cannot silently consume the failure and rewind live state. Focused validation is green at
 `nt-io-manager` `195/195`, the freestanding executive check remains at the established 212-warning
-baseline, and `git diff --check` is clean. A fresh serialized desktop run is required before this
-checkpoint is accepted.
+baseline, and `git diff --check` is clean.
+
+Serialized proof `.tmp/run-desktop-durable-rewind-20260826.log` commits writable generations 1
+through 5, including the formerly corrupt 128-node quiescence image (`822600` bytes), and passes the
+mapped-section writeback and write-copy/image COW selftests. Real E1000, DMA test, and bochsmp
+startup remain green; genuine userinit and Explorer launch, Explorer redirects 665 real api0
+callbacks, and the shell paints all `480000/480000` framebuffer pixels with at least 32
+non-background colours. The run passes all `293/293` executive gates and emits the sentinel.
 
 Review adjustment: if the serialized run still exposes writable-volume damage, add an
 allocation-free typed MemFs invariant validator at the first failed checkpoint and make the
