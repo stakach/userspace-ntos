@@ -108,7 +108,11 @@ impl<P: ObjectManagerPort> IoManager<P> {
                     if self.backends[idx].acknowledge_completion(irp_id).is_ok() {
                         progress += 1;
                     } else if !self.rejected_completion_acks.contains(&(idx, irp_id)) {
+                        let capacity = self.rejected_completion_acks.capacity();
                         self.rejected_completion_acks.push((idx, irp_id));
+                        if self.rejected_completion_acks.capacity() != capacity {
+                            self.mark_durable_storage_dirty();
+                        }
                     }
                 }
             }
@@ -209,7 +213,11 @@ impl<P: ObjectManagerPort> IoManager<P> {
 
     pub(crate) fn schedule_deferred_file_close(&mut self, file_id: FileId) {
         if !self.deferred_file_close_retries.contains(&file_id) {
+            let capacity = self.deferred_file_close_retries.capacity();
             self.deferred_file_close_retries.push(file_id);
+            if self.deferred_file_close_retries.capacity() != capacity {
+                self.mark_durable_storage_dirty();
+            }
         }
     }
 
@@ -329,7 +337,11 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 }
             }
         }
+        let capacity = self.completed_irps.capacity();
         self.completed_irps.push_back(completion.irp_id);
+        if self.completed_irps.capacity() != capacity {
+            self.mark_durable_storage_dirty();
+        }
         true
     }
 

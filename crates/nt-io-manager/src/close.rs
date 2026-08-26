@@ -399,7 +399,11 @@ impl<P: ObjectManagerPort> IoManager<P> {
             }
         }
         if !self.disconnected_client_retries.contains(&client) {
+            let capacity = self.disconnected_client_retries.capacity();
             self.disconnected_client_retries.push(client);
+            if self.disconnected_client_retries.capacity() != capacity {
+                self.mark_durable_storage_dirty();
+            }
         }
         self.pump();
         Ok(())

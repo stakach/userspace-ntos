@@ -135,7 +135,11 @@ impl<P: ObjectManagerPort> IoManager<P> {
         }
         if self.backends[idx].cancel_irp(irp_id).is_err() {
             if !self.cancel_dispatch_retries.contains(&irp_id) {
+                let capacity = self.cancel_dispatch_retries.capacity();
                 self.cancel_dispatch_retries.push(irp_id);
+                if self.cancel_dispatch_retries.capacity() != capacity {
+                    self.mark_durable_storage_dirty();
+                }
             }
         } else if let Some(index) = self
             .cancel_dispatch_retries
@@ -208,9 +212,14 @@ impl<P: ObjectManagerPort> IoManager<P> {
     }
 
     pub(crate) fn reserve_manager_owned_irp_slot(&mut self) -> Result<(), NtStatus> {
+        let capacity = self.manager_owned_irps.capacity();
         self.manager_owned_irps
             .try_reserve(1)
-            .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)
+            .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+        if self.manager_owned_irps.capacity() != capacity {
+            self.mark_durable_storage_dirty();
+        }
+        Ok(())
     }
 
     fn driver_backend_index(&self, driver_id: DriverId) -> Option<usize> {
