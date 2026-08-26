@@ -15,15 +15,17 @@ use alloc::vec::Vec;
 
 use nt_config_abi::{
     device_property_transfer, driver_service_class, driver_service_transfer, hive_import_transfer,
-    hive_key_transfer, hive_mount, opcode, CmDevicePropertyRequest, CmDriverServiceRequest,
-    CmEnumerateKeyRequest, CmHiveImportRequest, CmHiveKeyRequest, CmKeyRequest, CmRawValueRequest,
-    CmReply, CmValueRequest, CM_ABI_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES,
-    CM_DRIVER_SERVICE_CHUNK_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES,
-    CM_DRIVER_SERVICE_SNAPSHOT_MAGIC, CM_DRIVER_SERVICE_SNAPSHOT_VERSION,
-    CM_HIVE_IMPORT_CHUNK_BYTES, CM_HIVE_KEY_CHUNK_BYTES, CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES,
-    CM_HIVE_KEY_SNAPSHOT_MAGIC, CM_HIVE_KEY_SNAPSHOT_VERSION, CM_MAX_HIVE_PATH_UNITS,
+    hive_key_transfer, hive_mount, launch_plan_kind, launch_plan_transfer, opcode,
+    CmDevicePropertyRequest, CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveImportRequest,
+    CmHiveKeyRequest, CmKeyRequest, CmLaunchPlanRequest, CmRawValueRequest, CmReply,
+    CmValueRequest, CM_ABI_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_DRIVER_SERVICE_CHUNK_BYTES,
+    CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_MAGIC,
+    CM_DRIVER_SERVICE_SNAPSHOT_VERSION, CM_HIVE_IMPORT_CHUNK_BYTES, CM_HIVE_KEY_CHUNK_BYTES,
+    CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES, CM_HIVE_KEY_SNAPSHOT_MAGIC, CM_HIVE_KEY_SNAPSHOT_VERSION,
+    CM_LAUNCH_PLAN_CHUNK_BYTES, CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES,
+    CM_LAUNCH_PLAN_SNAPSHOT_MAGIC, CM_LAUNCH_PLAN_SNAPSHOT_VERSION, CM_MAX_HIVE_PATH_UNITS,
     CM_MAX_INSTANCE_UNITS, CM_MAX_SERVICE_UNITS, CM_OPTIONAL_BLOB_ABSENT,
-    CM_OPTIONAL_STRING_ABSENT,
+    CM_OPTIONAL_STRING_ABSENT, CM_OPTIONAL_U32_ABSENT,
 };
 
 /// A pluggable transport: send `opcode` + `in_buf`, receive a `CmReply` (+ optional
@@ -66,7 +68,17 @@ pub struct DriverServiceBinding {
     pub class_guid: Option<String>,
     pub class: DriverServiceClass,
     pub start_type: u32,
+    pub error_control: Option<u32>,
+    pub load_order_group: Option<String>,
+    pub tag: Option<u32>,
     pub devnodes: Vec<DriverServiceDevnode>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DriverLaunchPlanSnapshot {
+    pub mount_generation: u64,
+    pub plan_kind: u16,
+    pub bindings: Vec<DriverServiceBinding>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,6 +131,11 @@ impl<'a> SnapshotReader<'a> {
 
     fn u64(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    fn optional_u32(&mut self) -> Option<Option<u32>> {
+        let value = self.u32()?;
+        Some((value != CM_OPTIONAL_U32_ABSENT).then_some(value))
     }
 
     fn string_with_len(&mut self, len: u32) -> Option<String> {
@@ -228,6 +245,9 @@ fn decode_driver_service_binding(bytes: &[u8]) -> Option<DriverServiceBinding> {
     let image_path = reader.string()?;
     let driver_object_path = reader.string()?;
     let class_guid = reader.optional_string()?;
+    let error_control = reader.optional_u32()?;
+    let load_order_group = reader.optional_string()?;
+    let tag = reader.optional_u32()?;
     let mut devnodes = Vec::new();
     devnodes.try_reserve_exact(devnode_count).ok()?;
     for _ in 0..devnode_count {
@@ -263,7 +283,48 @@ fn decode_driver_service_binding(bytes: &[u8]) -> Option<DriverServiceBinding> {
         class_guid,
         class,
         start_type,
+        error_control,
+        load_order_group,
+        tag,
         devnodes,
+    })
+}
+
+fn decode_driver_launch_plan(bytes: &[u8]) -> Option<DriverLaunchPlanSnapshot> {
+    if bytes.len() < CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES {
+        return None;
+    }
+    let mut reader = SnapshotReader::new(bytes);
+    if reader.u32()? != CM_LAUNCH_PLAN_SNAPSHOT_MAGIC
+        || reader.u16()? != CM_LAUNCH_PLAN_SNAPSHOT_VERSION
+    {
+        return None;
+    }
+    let plan_kind = reader.u16()?;
+    if !matches!(
+        plan_kind,
+        launch_plan_kind::BOOT_SYSTEM_DRIVERS | launch_plan_kind::DEMAND_DRIVERS
+    ) {
+        return None;
+    }
+    let mount_generation = reader.u64()?;
+    if mount_generation == 0 {
+        return None;
+    }
+    let binding_count = usize::try_from(reader.u32()?).ok()?;
+    if reader.u32()? != 0 {
+        return None;
+    }
+    let mut bindings = Vec::new();
+    bindings.try_reserve_exact(binding_count).ok()?;
+    for _ in 0..binding_count {
+        let encoded = reader.blob()?;
+        bindings.push(decode_driver_service_binding(&encoded)?);
+    }
+    reader.finished().then_some(DriverLaunchPlanSnapshot {
+        mount_generation,
+        plan_kind,
+        bindings,
     })
 }
 
@@ -727,6 +788,84 @@ impl<B: Backend> ConfigClient<B> {
         }
     }
 
+    /// Read one complete ordered driver plan from the current mounted SYSTEM generation.
+    pub fn query_driver_launch_plan(
+        &mut self,
+        plan_kind: u16,
+    ) -> Result<DriverLaunchPlanSnapshot, i32> {
+        if !matches!(
+            plan_kind,
+            launch_plan_kind::BOOT_SYSTEM_DRIVERS | launch_plan_kind::DEMAND_DRIVERS
+        ) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let mut value = Vec::new();
+        let mut expected_total = None;
+        let mut token = 0u64;
+        let mut reply_bytes = [0u8; CM_LAUNCH_PLAN_CHUNK_BYTES];
+        loop {
+            let operation = if token == 0 {
+                launch_plan_transfer::BEGIN
+            } else {
+                launch_plan_transfer::PULL
+            };
+            let offset = value.len();
+            let response = match self.launch_plan_call(
+                plan_kind,
+                operation,
+                token,
+                u32::try_from(offset).map_err(|_| STATUS_INVALID_PARAMETER)?,
+                CM_LAUNCH_PLAN_CHUNK_BYTES as u32,
+                &mut reply_bytes,
+            ) {
+                Ok(response) => response,
+                Err(status) => {
+                    self.abort_launch_plan(plan_kind, token);
+                    return Err(status);
+                }
+            };
+            if response.status != STATUS_SUCCESS {
+                self.abort_launch_plan(plan_kind, token);
+                return Err(response.status);
+            }
+            let total = usize::try_from(response.detail0).map_err(|_| STATUS_INVALID_PARAMETER)?;
+            let written = response.information as usize;
+            let reply_token_valid = if token == 0 {
+                (written == total && response.detail1 == 0)
+                    || (written < total && response.detail1 != 0)
+            } else {
+                response.detail1 == token
+            };
+            if total < CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES
+                || expected_total.is_some_and(|expected| expected != total)
+                || !reply_token_valid
+                || written > reply_bytes.len()
+                || offset.checked_add(written).is_none_or(|end| end > total)
+                || (offset < total && written == 0)
+            {
+                self.abort_launch_plan(
+                    plan_kind,
+                    if token == 0 { response.detail1 } else { token },
+                );
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            if expected_total.is_none() {
+                if value.try_reserve_exact(total).is_err() {
+                    self.abort_launch_plan(plan_kind, response.detail1);
+                    return Err(STATUS_INSUFFICIENT_RESOURCES);
+                }
+                expected_total = Some(total);
+            }
+            value.extend_from_slice(&reply_bytes[..written]);
+            if value.len() == total {
+                return decode_driver_launch_plan(&value).ok_or(STATUS_INVALID_PARAMETER);
+            }
+            if token == 0 {
+                token = response.detail1;
+            }
+        }
+    }
+
     fn driver_service_call(
         &mut self,
         service_bytes: &[u8],
@@ -866,6 +1005,46 @@ impl<B: Backend> ConfigClient<B> {
         let _ = self.hive_key_call(
             path_bytes,
             hive_key_transfer::ABORT,
+            transfer_token,
+            0,
+            0,
+            &mut [],
+        );
+    }
+
+    fn launch_plan_call(
+        &mut self,
+        plan_kind: u16,
+        operation: u16,
+        transfer_token: u64,
+        value_offset: u32,
+        chunk_capacity: u32,
+        reply_bytes: &mut [u8],
+    ) -> Result<CmReply, i32> {
+        let header_size = core::mem::size_of::<CmLaunchPlanRequest>();
+        let request = CmLaunchPlanRequest {
+            abi_size: header_size as u16,
+            abi_version: CM_ABI_VERSION,
+            operation,
+            plan_kind,
+            value_offset,
+            chunk_capacity,
+            transfer_token,
+        };
+        Ok(self.backend.call(
+            opcode::CM_OP_QUERY_LAUNCH_PLAN,
+            request.as_bytes(),
+            reply_bytes,
+        ))
+    }
+
+    fn abort_launch_plan(&mut self, plan_kind: u16, transfer_token: u64) {
+        if transfer_token == 0 {
+            return;
+        }
+        let _ = self.launch_plan_call(
+            plan_kind,
+            launch_plan_transfer::ABORT,
             transfer_token,
             0,
             0,
@@ -1025,7 +1204,8 @@ mod tests {
     use alloc::vec;
     use nt_config_manager::{
         device_property, encode_sz, ConfigManager, RegistryValueType, ENUM_PATH,
-        SERVICE_AUTO_START, SERVICE_WIN32_SHARE_PROCESS,
+        SERVICE_AUTO_START, SERVICE_BOOT_START, SERVICE_DEMAND_START, SERVICE_FILE_SYSTEM_DRIVER,
+        SERVICE_KERNEL_DRIVER, SERVICE_SYSTEM_START, SERVICE_WIN32_SHARE_PROCESS,
     };
     use nt_config_server::CmServer;
     use nt_hive_core::{encode_image, Hive, HiveKind};
@@ -1124,6 +1304,98 @@ mod tests {
             .unwrap();
         assert_eq!(selected.mount_generation, snapshot.mount_generation);
         assert_eq!(selected.values, snapshot.values);
+    }
+
+    #[test]
+    fn mounted_system_driver_plans_are_ordered_generation_bound_snapshots() {
+        let mut hive = Hive::new(HiveKind::System);
+        let select = hive.create_key("Select");
+        hive.set_dword(select, "Current", 1);
+        for (name, image, service_type, start) in [
+            (
+                "BootDevice",
+                r"system32\drivers\bootdev.sys",
+                SERVICE_KERNEL_DRIVER,
+                SERVICE_BOOT_START,
+            ),
+            (
+                "SystemFsd",
+                r"system32\drivers\systemfs.sys",
+                SERVICE_FILE_SYSTEM_DRIVER,
+                SERVICE_SYSTEM_START,
+            ),
+            (
+                "DemandDevice",
+                r"system32\drivers\demand.sys",
+                SERVICE_KERNEL_DRIVER,
+                SERVICE_DEMAND_START,
+            ),
+        ] {
+            let service = hive.create_key(&format!(r"ControlSet001\Services\{name}"));
+            hive.set_dword(service, "Type", service_type);
+            hive.set_dword(service, "Start", start);
+            assert!(hive.set_value(
+                service,
+                "ImagePath",
+                nt_hive_core::RegistryValueType::ExpandSz,
+                encode_sz(image),
+            ));
+            hive.set_dword(service, "ErrorControl", 1);
+            hive.set_dword(service, "Tag", start + 7);
+            assert!(hive.set_value(
+                service,
+                "Group",
+                nt_hive_core::RegistryValueType::Sz,
+                encode_sz(if start == SERVICE_SYSTEM_START {
+                    "File System"
+                } else {
+                    "Base"
+                }),
+            ));
+        }
+        for (instance, service) in [
+            (r"ROOT\BOOTDEV\0000", "BootDevice"),
+            (r"ROOT\DEMAND\0000", "DemandDevice"),
+        ] {
+            let devnode = hive.create_key(&format!(r"ControlSet001\Enum\{instance}"));
+            assert!(hive.set_value(
+                devnode,
+                "Service",
+                nt_hive_core::RegistryValueType::Sz,
+                encode_sz(service),
+            ));
+        }
+        hive.finish_clean_import();
+
+        let mut client = ConfigClient::new(Framed {
+            server: CmServer::new(),
+        });
+        assert_eq!(client.import_system_hive(&encode_image(&hive)), Ok(1));
+        let boot = client
+            .query_driver_launch_plan(launch_plan_kind::BOOT_SYSTEM_DRIVERS)
+            .expect("boot driver plan");
+        assert_eq!(boot.mount_generation, 1);
+        assert_eq!(boot.plan_kind, launch_plan_kind::BOOT_SYSTEM_DRIVERS);
+        assert_eq!(boot.bindings.len(), 2);
+        assert_eq!(boot.bindings[0].service_name, "BootDevice");
+        assert_eq!(boot.bindings[0].error_control, Some(1));
+        assert_eq!(boot.bindings[0].load_order_group.as_deref(), Some("Base"));
+        assert_eq!(boot.bindings[0].tag, Some(7));
+        assert_eq!(boot.bindings[0].devnodes.len(), 1);
+        assert_eq!(boot.bindings[1].service_name, "SystemFsd");
+        assert_eq!(boot.bindings[1].class, DriverServiceClass::FileSystem);
+        assert_eq!(
+            boot.bindings[1].load_order_group.as_deref(),
+            Some("File System")
+        );
+
+        let demand = client
+            .query_driver_launch_plan(launch_plan_kind::DEMAND_DRIVERS)
+            .expect("demand driver plan");
+        assert_eq!(demand.mount_generation, 1);
+        assert_eq!(demand.bindings.len(), 1);
+        assert_eq!(demand.bindings[0].service_name, "DemandDevice");
+        assert_eq!(demand.bindings[0].devnodes.len(), 1);
     }
 
     #[test]

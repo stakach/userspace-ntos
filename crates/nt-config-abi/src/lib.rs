@@ -20,7 +20,7 @@ pub const CM_MAX_SERVICE_UNITS: usize = 512;
 /// Maximum payload carried by one driver-binding completion frame.
 pub const CM_DRIVER_SERVICE_CHUNK_BYTES: usize = 4096;
 pub const CM_DRIVER_SERVICE_SNAPSHOT_MAGIC: u32 = 0x4453_4D43; // `CMSD`
-pub const CM_DRIVER_SERVICE_SNAPSHOT_VERSION: u16 = 1;
+pub const CM_DRIVER_SERVICE_SNAPSHOT_VERSION: u16 = 2;
 pub const CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES: usize = 16;
 /// Maximum payload carried by one SYSTEM-hive import request frame.
 pub const CM_HIVE_IMPORT_CHUNK_BYTES: usize = 4064;
@@ -30,8 +30,14 @@ pub const CM_HIVE_KEY_SNAPSHOT_MAGIC: u32 = 0x4B48_4D43; // `CMHK`
 pub const CM_HIVE_KEY_SNAPSHOT_VERSION: u16 = 1;
 pub const CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES: usize = 24;
 pub const CM_MAX_HIVE_PATH_UNITS: usize = 512;
+/// Maximum payload carried by one immutable driver launch-plan completion frame.
+pub const CM_LAUNCH_PLAN_CHUNK_BYTES: usize = 4096;
+pub const CM_LAUNCH_PLAN_SNAPSHOT_MAGIC: u32 = 0x504C_4D43; // `CMLP`
+pub const CM_LAUNCH_PLAN_SNAPSHOT_VERSION: u16 = 1;
+pub const CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES: usize = 24;
 pub const CM_OPTIONAL_STRING_ABSENT: u32 = u32::MAX;
 pub const CM_OPTIONAL_BLOB_ABSENT: u32 = u32::MAX;
+pub const CM_OPTIONAL_U32_ABSENT: u32 = u32::MAX;
 
 pub mod opcode {
     pub const CM_OP_PING: u16 = 0x2100;
@@ -57,6 +63,8 @@ pub mod opcode {
     pub const CM_OP_IMPORT_HIVE: u16 = 0x2150;
     /// Return one immutable, complete mounted-hive key snapshot.
     pub const CM_OP_QUERY_HIVE_KEY: u16 = 0x2151;
+    /// Return one immutable, generation-bound ordered driver launch plan.
+    pub const CM_OP_QUERY_LAUNCH_PLAN: u16 = 0x2152;
 }
 
 /// Operation carried by [`CmDevicePropertyRequest::operation`]. Property values are immutable for
@@ -87,6 +95,19 @@ pub mod hive_key_transfer {
     pub const BEGIN: u16 = 1;
     pub const PULL: u16 = 2;
     pub const ABORT: u16 = 3;
+}
+
+/// Operation carried by [`CmLaunchPlanRequest::operation`].
+pub mod launch_plan_transfer {
+    pub const BEGIN: u16 = 1;
+    pub const PULL: u16 = 2;
+    pub const ABORT: u16 = 3;
+}
+
+/// Ordered driver plan selected from the live SYSTEM generation.
+pub mod launch_plan_kind {
+    pub const BOOT_SYSTEM_DRIVERS: u16 = 1;
+    pub const DEMAND_DRIVERS: u16 = 2;
 }
 
 /// Mount identifiers carried by mounted-hive operations.
@@ -228,6 +249,19 @@ pub struct CmHiveKeyRequest {
     pub transfer_token: u64,
 }
 
+/// `query_launch_plan`: a plan kind plus an immutable snapshot-bank cursor.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmLaunchPlanRequest {
+    pub abi_size: u16,
+    pub abi_version: u16,
+    pub operation: u16,
+    pub plan_kind: u16,
+    pub value_offset: u32,
+    pub chunk_capacity: u32,
+    pub transfer_token: u64,
+}
+
 macro_rules! wire {
     ($t:ty) => {
         impl $t {
@@ -260,6 +294,7 @@ wire!(CmDevicePropertyRequest);
 wire!(CmDriverServiceRequest);
 wire!(CmHiveImportRequest);
 wire!(CmHiveKeyRequest);
+wire!(CmLaunchPlanRequest);
 
 /// Decode a UTF-16LE slice of `buf` (at `offset`, `len_bytes` long) into a `str`
 /// via the caller's scratch — returns the u16 units. Used by the server.
@@ -345,6 +380,7 @@ mod tests {
     fn mounted_hive_requests_have_stable_wire_layout() {
         assert_eq!(opcode::CM_OP_IMPORT_HIVE, 0x2150);
         assert_eq!(opcode::CM_OP_QUERY_HIVE_KEY, 0x2151);
+        assert_eq!(opcode::CM_OP_QUERY_LAUNCH_PLAN, 0x2152);
         assert_eq!(core::mem::size_of::<CmHiveImportRequest>(), 32);
         assert_eq!(core::mem::size_of::<CmHiveKeyRequest>(), 32);
 
@@ -376,5 +412,17 @@ mod tests {
             transfer_token: 0x1122_3344_5566_7788,
         };
         assert_eq!(CmHiveKeyRequest::from_bytes(query.as_bytes()), Some(query));
+
+        let plan = CmLaunchPlanRequest {
+            abi_size: 24,
+            abi_version: CM_ABI_VERSION,
+            operation: launch_plan_transfer::PULL,
+            plan_kind: launch_plan_kind::BOOT_SYSTEM_DRIVERS,
+            value_offset: 0x1122_3344,
+            chunk_capacity: 0x5566_7788,
+            transfer_token: 0x1122_3344_5566_7788,
+        };
+        assert_eq!(core::mem::size_of::<CmLaunchPlanRequest>(), 24);
+        assert_eq!(CmLaunchPlanRequest::from_bytes(plan.as_bytes()), Some(plan));
     }
 }

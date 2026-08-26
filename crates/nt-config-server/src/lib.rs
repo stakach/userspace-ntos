@@ -15,19 +15,21 @@ use alloc::vec::Vec;
 
 use nt_config_abi::{
     device_property_transfer, driver_service_class, driver_service_transfer, hive_import_transfer,
-    hive_key_transfer, hive_mount, opcode, read_utf16, CmDevicePropertyRequest,
-    CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveImportRequest, CmHiveKeyRequest,
-    CmKeyRequest, CmRawValueRequest, CmReply, CmValueRequest, CM_ABI_VERSION,
-    CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_DRIVER_SERVICE_CHUNK_BYTES,
+    hive_key_transfer, hive_mount, launch_plan_kind, launch_plan_transfer, opcode, read_utf16,
+    CmDevicePropertyRequest, CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveImportRequest,
+    CmHiveKeyRequest, CmKeyRequest, CmLaunchPlanRequest, CmRawValueRequest, CmReply,
+    CmValueRequest, CM_ABI_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_DRIVER_SERVICE_CHUNK_BYTES,
     CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_MAGIC,
     CM_DRIVER_SERVICE_SNAPSHOT_VERSION, CM_HIVE_IMPORT_CHUNK_BYTES, CM_HIVE_KEY_CHUNK_BYTES,
     CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES, CM_HIVE_KEY_SNAPSHOT_MAGIC, CM_HIVE_KEY_SNAPSHOT_VERSION,
-    CM_MAX_HIVE_PATH_UNITS, CM_MAX_INSTANCE_UNITS, CM_MAX_SERVICE_UNITS, CM_OPTIONAL_BLOB_ABSENT,
-    CM_OPTIONAL_STRING_ABSENT,
+    CM_LAUNCH_PLAN_CHUNK_BYTES, CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES,
+    CM_LAUNCH_PLAN_SNAPSHOT_MAGIC, CM_LAUNCH_PLAN_SNAPSHOT_VERSION, CM_MAX_HIVE_PATH_UNITS,
+    CM_MAX_INSTANCE_UNITS, CM_MAX_SERVICE_UNITS, CM_OPTIONAL_BLOB_ABSENT,
+    CM_OPTIONAL_STRING_ABSENT, CM_OPTIONAL_U32_ABSENT,
 };
 use nt_config_manager::{
     device_property, ConfigManager, DevicePropertySource, DriverServiceBinding, DriverServiceClass,
-    RegistryValueType,
+    RegistryValueType, SERVICE_BOOT_START, SERVICE_DEMAND_START, SERVICE_SYSTEM_START,
 };
 use nt_hive_core::{decode_image, CurrentControlSet, Hive, HiveKind};
 
@@ -114,6 +116,10 @@ fn push_optional_blob(out: &mut Vec<u8>, value: Option<&[u8]>) -> Option<()> {
             Some(())
         }
     }
+}
+
+fn push_optional_u32(out: &mut Vec<u8>, value: Option<u32>) {
+    push_u32(out, value.unwrap_or(CM_OPTIONAL_U32_ABSENT));
 }
 
 fn system_hive_relative_path(
@@ -228,6 +234,9 @@ fn encode_driver_service_binding(
     push_string(&mut out, &binding.service.image_path)?;
     push_string(&mut out, &binding.service.driver_object_path)?;
     push_optional_string(&mut out, binding.service.class_guid.as_deref())?;
+    push_optional_u32(&mut out, binding.service.error_control);
+    push_optional_string(&mut out, binding.service.load_order_group.as_deref())?;
+    push_optional_u32(&mut out, binding.service.tag);
     for devnode in &binding.devnodes {
         push_string(&mut out, &devnode.instance_id)?;
         push_optional_string(&mut out, devnode.pdo_name.as_deref())?;
@@ -242,6 +251,27 @@ fn encode_driver_service_binding(
         for id in &devnode.compatible_ids {
             push_string(&mut out, id)?;
         }
+    }
+    Some(out)
+}
+
+fn encode_driver_launch_plan(
+    cm: &ConfigManager,
+    generation: u64,
+    plan_kind: u16,
+    bindings: &[DriverServiceBinding],
+) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    push_u32(&mut out, CM_LAUNCH_PLAN_SNAPSHOT_MAGIC);
+    push_u16(&mut out, CM_LAUNCH_PLAN_SNAPSHOT_VERSION);
+    push_u16(&mut out, plan_kind);
+    out.extend_from_slice(&generation.to_le_bytes());
+    push_u32(&mut out, u32::try_from(bindings.len()).ok()?);
+    push_u32(&mut out, 0);
+    debug_assert_eq!(out.len(), CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES);
+    for binding in bindings {
+        let encoded = encode_driver_service_binding(cm, binding)?;
+        push_blob(&mut out, &encoded)?;
     }
     Some(out)
 }
@@ -277,6 +307,13 @@ struct HiveKeySnapshot {
     offset: usize,
 }
 
+struct DriverLaunchPlanSnapshot {
+    token: u64,
+    plan_kind: u16,
+    value: Vec<u8>,
+    offset: usize,
+}
+
 struct MountedSystemHive {
     hive: Hive,
     generation: u64,
@@ -295,6 +332,8 @@ pub struct CmServer {
     next_hive_import_token: u64,
     hive_key_snapshots: Vec<HiveKeySnapshot>,
     next_hive_key_token: u64,
+    driver_launch_plan_snapshot: Option<DriverLaunchPlanSnapshot>,
+    next_driver_launch_plan_token: u64,
 }
 
 impl Default for CmServer {
@@ -316,6 +355,8 @@ impl CmServer {
             next_hive_import_token: 1,
             hive_key_snapshots: Vec::new(),
             next_hive_key_token: 1,
+            driver_launch_plan_snapshot: None,
+            next_driver_launch_plan_token: 1,
         }
     }
 
@@ -332,6 +373,8 @@ impl CmServer {
             next_hive_import_token: 1,
             hive_key_snapshots: Vec::new(),
             next_hive_key_token: 1,
+            driver_launch_plan_snapshot: None,
+            next_driver_launch_plan_token: 1,
         }
     }
 
@@ -361,6 +404,7 @@ impl CmServer {
             opcode::CM_OP_QUERY_DRIVER_SERVICE => self.op_query_driver_service(in_buf, out_buf),
             opcode::CM_OP_IMPORT_HIVE => self.op_import_hive(in_buf),
             opcode::CM_OP_QUERY_HIVE_KEY => self.op_query_hive_key(in_buf, out_buf),
+            opcode::CM_OP_QUERY_LAUNCH_PLAN => self.op_query_launch_plan(in_buf, out_buf),
             _ => reply(STATUS_INVALID_SYSTEM_SERVICE, 0),
         }
     }
@@ -1028,6 +1072,118 @@ impl CmServer {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 };
                 self.hive_key_snapshots.swap_remove(index);
+                reply(STATUS_SUCCESS, 0)
+            }
+            _ => reply(STATUS_INVALID_PARAMETER, 0),
+        }
+    }
+
+    fn op_query_launch_plan(&mut self, buf: &[u8], out_buf: &mut [u8]) -> CmReply {
+        let Some(req) = CmLaunchPlanRequest::from_bytes(buf) else {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        };
+        let header_size = core::mem::size_of::<CmLaunchPlanRequest>();
+        if req.abi_size as usize != header_size
+            || req.abi_version != CM_ABI_VERSION
+            || buf.len() != header_size
+            || req.chunk_capacity as usize > CM_LAUNCH_PLAN_CHUNK_BYTES
+            || req.chunk_capacity as usize > out_buf.len()
+            || !matches!(
+                req.plan_kind,
+                launch_plan_kind::BOOT_SYSTEM_DRIVERS | launch_plan_kind::DEMAND_DRIVERS
+            )
+        {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        }
+
+        match req.operation {
+            launch_plan_transfer::BEGIN => {
+                if req.transfer_token != 0 || req.value_offset != 0 || req.chunk_capacity == 0 {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let Some(generation) = self.system_hive.as_ref().map(|mounted| mounted.generation)
+                else {
+                    return reply(STATUS_DEVICE_NOT_READY, 0);
+                };
+                let starts: &[u32] = match req.plan_kind {
+                    launch_plan_kind::BOOT_SYSTEM_DRIVERS => {
+                        &[SERVICE_BOOT_START, SERVICE_SYSTEM_START]
+                    }
+                    launch_plan_kind::DEMAND_DRIVERS => &[SERVICE_DEMAND_START],
+                    _ => return reply(STATUS_INVALID_PARAMETER, 0),
+                };
+                let bindings = self.cm.driver_service_bindings_by_start(starts);
+                let Some(value) =
+                    encode_driver_launch_plan(&self.cm, generation, req.plan_kind, &bindings)
+                else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                };
+                let needed = value.len();
+                let written = core::cmp::min(needed, req.chunk_capacity as usize);
+                out_buf[..written].copy_from_slice(&value[..written]);
+                self.driver_launch_plan_snapshot = None;
+                if written == needed {
+                    return reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, 0);
+                }
+                let token = self.next_driver_launch_plan_token;
+                let Some(next_token) = token.checked_add(1) else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                };
+                if token == 0 {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                }
+                self.next_driver_launch_plan_token = next_token;
+                self.driver_launch_plan_snapshot = Some(DriverLaunchPlanSnapshot {
+                    token,
+                    plan_kind: req.plan_kind,
+                    value,
+                    offset: written,
+                });
+                reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, token)
+            }
+            launch_plan_transfer::PULL => {
+                if req.transfer_token == 0 || req.chunk_capacity == 0 {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let Some(snapshot) = self.driver_launch_plan_snapshot.as_mut() else {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                };
+                if snapshot.token != req.transfer_token
+                    || snapshot.plan_kind != req.plan_kind
+                    || snapshot.offset != req.value_offset as usize
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let needed = snapshot.value.len();
+                let written = core::cmp::min(needed - snapshot.offset, req.chunk_capacity as usize);
+                let end = snapshot.offset + written;
+                out_buf[..written].copy_from_slice(&snapshot.value[snapshot.offset..end]);
+                snapshot.offset = end;
+                if end == needed {
+                    self.driver_launch_plan_snapshot = None;
+                }
+                reply_with_info(
+                    STATUS_SUCCESS,
+                    written as u32,
+                    needed as u64,
+                    req.transfer_token,
+                )
+            }
+            launch_plan_transfer::ABORT => {
+                if req.transfer_token == 0
+                    || req.value_offset != 0
+                    || req.chunk_capacity != 0
+                    || self
+                        .driver_launch_plan_snapshot
+                        .as_ref()
+                        .is_none_or(|snapshot| {
+                            snapshot.token != req.transfer_token
+                                || snapshot.plan_kind != req.plan_kind
+                        })
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                self.driver_launch_plan_snapshot = None;
                 reply(STATUS_SUCCESS, 0)
             }
             _ => reply(STATUS_INVALID_PARAMETER, 0),

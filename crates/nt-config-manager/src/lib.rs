@@ -892,6 +892,25 @@ impl ConfigManager {
             .collect()
     }
 
+    /// Ordered driver launch metadata plus the complete live devnode binding for each service.
+    pub fn driver_service_bindings_by_start(
+        &mut self,
+        start_types: &[u32],
+    ) -> Vec<DriverServiceBinding> {
+        self.refresh_registry_devnodes();
+        self.driver_service_launch_specs_by_start(start_types)
+            .into_iter()
+            .map(|service| {
+                let devnodes = self
+                    .devnodes_for_service(&service.service_name)
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                DriverServiceBinding { service, devnodes }
+            })
+            .collect()
+    }
+
     /// Registry-declared drivers that SCM or `NtLoadDriver` may demand-start.
     pub fn demand_start_driver_candidates(&self) -> Vec<ServiceMetadata> {
         self.service_candidates_by_start_and_type(&[SERVICE_DEMAND_START], SERVICE_DRIVER_TYPE_MASK)

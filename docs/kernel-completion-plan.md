@@ -12905,3 +12905,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     is CM-owned launch-plan enumeration: add an immutable, generation-bearing plan snapshot for
     boot/system services and PnP bindings, consume it instead of constructing local ConfigManager
     instances from `BOOT_SYSTEM_HIVE_IMAGE`, and delete those re-decode helpers and plan caches.
+
+    CM launch-plan transport (2026-08-26, crate accepted): isolated CM now selects the ordered
+    boot/system or demand-start driver set from its mounted SYSTEM generation and streams one
+    immutable snapshot through a tokenized BEGIN/PULL/ABORT transfer. Each entry uses the same
+    semantic driver-binding format as point queries and carries service identity, image/object
+    paths, class, start type, error control, load-order group, tag, class GUID, and the complete
+    registry-bound devnode set. The client rejects zero/malformed generations, changing total
+    lengths, invalid plan kinds, inconsistent tokens, truncated entries, and trailing bytes.
+
+    Focused validation is green at `nt-config-abi` `3/3`, `nt-config-manager` `29/29`,
+    `nt-config-server` `9/9`, and `nt-config-client` `14/14`. Tests prove boot/system and demand
+    selection, registry order, mount generation, service ordering metadata, filesystem class, and
+    devnode bindings survive the service boundary.
+
+    Review adjustment: the transport primitive is closed; executive ownership migration remains
+    open. Query and generation-check these snapshots once during startup, project the existing PnP
+    and hosted-driver inline launch plans from them, and delete `boot_system_config_manager` plus
+    every plan-time decode of `BOOT_SYSTEM_HIVE_IMAGE`. Runtime PnP operations that still require a
+    mutable semantic manager must move to CM queries rather than preserving that local decoder.
