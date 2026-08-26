@@ -16,7 +16,8 @@
 //!   name @0x4C (ASCII if flags@0x02 & 0x20, else UTF-16LE).
 //! * **`vk`** (value): name-length @0x02, data-length @0x04 (top bit set = ≤4 B data inlined in
 //!   the data-offset field), data-offset @0x08, type @0x0C, flags @0x10 (bit0 = ASCII name).
-//! * **`sk`** (security): descriptor-length @0x10, self-relative descriptor bytes @0x14.
+//! * **`sk`** (security): descriptor-length @0x10, self-relative descriptor bytes @0x14. ReactOS
+//!   `mkhive` also emits an explicit zero-length descriptor for hives created without root security.
 //! * **subkey lists**: `lf`/`lh` = count then (offset,hint) pairs; `li` = count then offsets;
 //!   `ri` = count then offsets to *other* subkey lists.
 
@@ -300,7 +301,10 @@ impl<'a> RegfHive<'a> {
             .ok_or(RegfHiveImportError::InvalidSecurityDescriptor)?;
         let descriptor_len =
             u32le(security, 0x10).ok_or(RegfHiveImportError::InvalidSecurityDescriptor)? as usize;
-        if descriptor_len < 20 {
+        // A non-empty self-relative security descriptor contains at least the 20-byte relative
+        // header. A zero-length payload is also a valid on-disk state: ReactOS mkhive emits one
+        // for the SECURITY hive whose root is created with a null descriptor.
+        if descriptor_len != 0 && descriptor_len < 20 {
             return Err(RegfHiveImportError::InvalidSecurityDescriptor);
         }
         let descriptor = security
@@ -1867,6 +1871,15 @@ mod tests {
             try_import_regf_into_hive(&source, HiveKind::System).err(),
             Some(RegfHiveImportError::InvalidSecurityDescriptor)
         );
+
+        let (mut empty_security, _) = metadata_test_hive();
+        write_u32(&mut empty_security, security_body + 0x10, 0);
+        let source = RegfHive::new(&empty_security).unwrap();
+        assert_eq!(source.key_security_descriptor(ROOT), Ok(Some(&[][..])));
+        let (hive, stats) = try_import_regf_into_hive(&source, HiveKind::Security)
+            .expect("ReactOS mkhive zero-length root descriptor");
+        assert_eq!(stats.security_descriptors, 2);
+        assert_eq!(hive.key_security_descriptor(hive.root()), Some(&[][..]));
 
         let (mut short_security, _) = metadata_test_hive();
         write_u32(&mut short_security, security_body + 0x10, 19);

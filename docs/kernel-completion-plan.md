@@ -12702,8 +12702,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     including shared SK cells. Full-hive and selected-subtree imports apply root and descendant
     metadata to `nt-hive-core`; subtree-root metadata survives image encode/decode, and a valid
     import remains a clean sequence-zero baseline. Zero class length and `HCELL_NIL` security are
-    the only absent forms. Advertised NIL, free, out-of-range, truncated, odd, invalid-UTF-16, bad
-    signature, undersized, or overflowing metadata fails the complete import.
+    the only absent forms. An allocated SK with zero descriptor bytes remains distinct and is
+    preserved: ReactOS `mkhive` deliberately emits this state for a hive root created without a
+    security descriptor. Non-empty descriptors shorter than the 20-byte self-relative header, and
+    advertised NIL, free, out-of-range, truncated, odd, invalid-UTF-16, bad-signature, or
+    overflowing metadata fail the complete import.
 
     The same review removed adjacent partial-import behavior. VK inline/external lengths must fit
     their allocated cells exactly, all twelve supported NT registry value types remain exact,
@@ -12716,7 +12719,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Focused `nt-hive-regf` validation is green at `20/20`, including full/subtree shared-security
     metadata, core image roundtrip, malformed metadata/value/topology rejection, and all supported
     value types. The freestanding executive release check remains green at the established
-    212-warning baseline. Review adjustment: the persistent base is now metadata-complete. Next
-    replace the generic hive mount's fixed `CurrentControlSet` alias and remaining executive direct
-    readers with the validated per-mount identity, then perform the single composed CM publication
-    and delete the generated-only import.
+    212-warning baseline. The first serialized desktop acceptance attempt reached executive hive
+    construction and correctly exposed the valid zero-length SECURITY root SK case; host-side import
+    of the five exact hives extracted from that boot image then proved SYSTEM, SOFTWARE, SAM, and
+    DEFAULT already imported successfully and isolated the correction to SECURITY. The focused suite
+    remains `20/20` after adding that format regression. Review adjustment: rerun the serialized
+    desktop acceptance before closing this checkpoint. Then replace the generic hive mount's fixed
+    `CurrentControlSet` alias and remaining executive direct readers with the validated per-mount
+    identity, perform the single composed CM publication, and delete the generated-only import.
