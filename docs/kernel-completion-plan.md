@@ -11820,3 +11820,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     interrupt, timer, work-item, and miniport-mirror construction. Executable thunk slots and callback
     rows still require generation-bearing exact-owner retirement and reuse before those callback-rich
     constructors can be closed.
+
+    Provider publication capacity correction (2026-08-26, implementation green): singleton
+    publication now reserves its registry capacity before making the row visible. Domain-dependency
+    acquisition likewise chooses or reserves the exact executive row before publishing the canonical
+    I/O-Manager provider link, so allocation failure cannot leave provider authority with no matching
+    retirement record. The freestanding executive release check remains green at the established
+    212-warning baseline and `git diff --check` is clean.

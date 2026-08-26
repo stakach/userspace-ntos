@@ -15545,6 +15545,10 @@ unsafe fn register_hosted_provider_singleton(
     } else {
         0
     };
+    if singletons.try_reserve(1).is_err() {
+        HOSTED_PROVIDER_SINGLETON_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
     singletons.push(HostedProviderSingleton {
         present: true,
         provider,
@@ -16227,6 +16231,13 @@ unsafe fn ensure_hosted_provider_domain_dependency(
             };
         }
     }
+    let dependencies = hosted_provider_domain_dependencies_mut();
+    let vacant_index = dependencies.iter().position(|slot| !slot.present);
+    if vacant_index.is_none() {
+        dependencies
+            .try_reserve(1)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    }
     let created = io_manager_mut()
         .set_hosted_domain_provider(dependent_domain, provider_domain)
         .map_err(nt_status::NtStatus::raw)?;
@@ -16243,9 +16254,8 @@ unsafe fn ensure_hosted_provider_domain_dependency(
         provider_domain,
         provider_publication_cookie,
     };
-    let dependencies = hosted_provider_domain_dependencies_mut();
-    if let Some(slot) = dependencies.iter_mut().find(|slot| !slot.present) {
-        *slot = dependency;
+    if let Some(index) = vacant_index {
+        dependencies[index] = dependency;
     } else {
         dependencies.push(dependency);
     }
