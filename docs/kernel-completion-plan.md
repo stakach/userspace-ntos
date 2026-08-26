@@ -12003,3 +12003,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     run (`0/0/0`); no callback failure or shell failure accompanied it. Keep the all-gates desktop
     confirmation open rather than weakening this observation gate. The release link is green at the
     212-warning baseline and `component_pump_loop` remains bounded at `0x18d8` bytes.
+
+    All-gates confirmation (2026-08-26, accepted): the clean serialized rerun
+    `.tmp/run-desktop-callback-parent-lifetimes-confirm-20260826.log` repeats real miniport-mirror
+    publication, E1000 `START_DEVICE`, provider-domain NDIS receive, and DMA descriptor success.
+    Explorer paints `480000/480000` pixels with at least 32 non-background colours, all `293/293`
+    executive gates pass, and the sentinel fires. The integration checkpoint is closed without
+    weakening or removing the schedule-sensitive ScrollBar observation.
