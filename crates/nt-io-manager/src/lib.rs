@@ -70,6 +70,7 @@ pub use device_property_transfer::{
 };
 pub use dispatch::{
     DispatchContext, DispatchOutcome, DriverCompletion, DriverDispatchBackend, IrpProjection,
+    PnpBackendDispatch,
 };
 pub use driver::{
     DeviceList, DispatchTarget, DriverBackendId, DriverFlags, DriverPeerId, DriverRecord,
@@ -1848,6 +1849,32 @@ mod tests {
         }
     }
 
+    struct NotDispatchedPnpBackend;
+
+    impl DriverDispatchBackend for NotDispatchedPnpBackend {
+        fn dispatch_irp(
+            &mut self,
+            _ctx: DispatchContext<'_>,
+            _irp: &IrpProjection,
+        ) -> Result<DispatchOutcome, NtStatus> {
+            panic!("canonical PnP dispatch bypassed the specialized backend method")
+        }
+
+        fn dispatch_pnp_irp(
+            &mut self,
+            _ctx: DispatchContext<'_>,
+            _irp: &IrpProjection,
+        ) -> PnpBackendDispatch {
+            PnpBackendDispatch::NotDispatched {
+                status: NtStatus::DEVICE_NOT_CONNECTED,
+            }
+        }
+
+        fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> {
+            Err(NtStatus::NOT_SUPPORTED)
+        }
+    }
+
     struct ReturnedFailurePnpBackend;
 
     impl DriverDispatchBackend for ReturnedFailurePnpBackend {
@@ -2084,6 +2111,25 @@ mod tests {
         );
         assert_eq!(indeterminate_io.fault_driver(function_driver), 0);
         assert!(indeterminate_io.completed_irp(indeterminate_id).is_none());
+
+        let mut not_dispatched_io = io();
+        let (client, root, _, _) =
+            pnp_test_stack(&mut not_dispatched_io, Box::new(NotDispatchedPnpBackend));
+        let prepared = not_dispatched_io
+            .prepare_external_pnp_to_device(client, root, 0, parameters, &[])
+            .unwrap();
+        let not_dispatched_id = prepared.irp_id();
+        assert_eq!(
+            not_dispatched_io.dispatch_prepared_external_pnp(prepared),
+            ExternalPnpDispatchResult::Indeterminate {
+                irp_id: not_dispatched_id,
+                transport_status: NtStatus::DEVICE_NOT_CONNECTED,
+            }
+        );
+        assert_eq!(
+            not_dispatched_io.irp(not_dispatched_id).unwrap().state,
+            IrpState::Indeterminate
+        );
     }
 
     #[test]

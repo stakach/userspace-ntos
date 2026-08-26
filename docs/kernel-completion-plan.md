@@ -12182,3 +12182,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     pump or guarded component abort is `Indeterminate`. Until the manager owns exact abort/rollback
     authority, any `NotDispatched` observed after token acquisition must retain the transaction as a
     conservative barrier rather than fabricate a completion.
+
+    Exact hosted PnP transport checkpoint (2026-08-26, implementation green): the I/O-manager
+    backend trait now has a PnP-only result surface that distinguishes `NotDispatched`, `Returned`,
+    `Pending`, and `Indeterminate` without changing ordinary file-I/O dispatch semantics. Canonical
+    PnP calls use that specialized method; generic mock and isolated-peer backends adapt their real
+    synchronous results, while a transport `Err` remains indeterminate. A post-authority
+    `NotDispatched` is conservatively retained in the canonical indeterminate IRP state because the
+    lifecycle manager does not yet expose pre-entry abort authority.
+
+    The executive's hosted component call is now split into an exact transport engine and the old
+    optional-tuple compatibility adapter. Every pre-pump refusal is classified as `NotDispatched`;
+    only a completed dispatch-label call publishes `Returned`; a pump wall or guarded driver abort
+    publishes `Indeterminate`. Existing non-PnP callers remain on the compatibility adapter. The
+    hosted PnP override calls the exact engine directly, converts only a real returned
+    `STATUS_PENDING` to canonical pending ownership, avoids the generic input `Vec` copy, derives the
+    component's lower-PDO token from the exact device binding, and explicitly refuses the video
+    CREATE/IOCTL shortcut as a PnP stack.
+
+    Focused `nt-io-manager` validation remains green at `195/195`; the freestanding executive check
+    remains green at the established 212-warning baseline and `git diff --check` is clean. Review
+    adjustment: the raw START helper is now ready for retirement on non-video stacks. Add the
+    executive transaction registry and File-less PnP completion drain, then replace START with
+    prepare -> bind token -> exact dispatch. Retain token plus canonical IRP across pending or
+    indeterminate outcomes. Video remains on its explicit old startup path until a real videoprt PnP
+    backend exists; do not route video through the generic control adapter.

@@ -170,6 +170,19 @@ pub struct DriverCompletion {
     pub file_context: Option<u64>,
 }
 
+/// Exact entry/result classification for one canonical PnP stack dispatch.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum PnpBackendDispatch {
+    /// The backend proved that no device-stack handler was entered.
+    NotDispatched { status: NtStatus },
+    /// The outer device-stack call returned a terminal status.
+    Returned { status: NtStatus, information: u64 },
+    /// The outer device-stack call returned `STATUS_PENDING`.
+    Pending,
+    /// Entry may have occurred, but no trustworthy outer return was observed.
+    Indeterminate { transport_status: NtStatus },
+}
+
 /// A driver dispatch backend (spec §15.1). Pluggable: the mock backend for
 /// tests/bring-up, or a SURT driver-peer backend for an isolated Driver Host.
 pub trait DriverDispatchBackend {
@@ -179,6 +192,44 @@ pub trait DriverDispatchBackend {
         ctx: DispatchContext<'_>,
         irp: &IrpProjection,
     ) -> Result<DispatchOutcome, NtStatus>;
+
+    /// Dispatch a canonical PnP IRP while preserving transport-entry evidence. Generic backends
+    /// use their ordinary synchronous contract; hosted transports override this method so a pump
+    /// wall cannot be collapsed into a returned driver status.
+    fn dispatch_pnp_irp(
+        &mut self,
+        ctx: DispatchContext<'_>,
+        irp: &IrpProjection,
+    ) -> PnpBackendDispatch {
+        if irp.major != nt_io_abi::major::IRP_MJ_PNP {
+            return PnpBackendDispatch::NotDispatched {
+                status: NtStatus::INVALID_PARAMETER,
+            };
+        }
+        match self.dispatch_irp(ctx, irp) {
+            Ok(DispatchOutcome::Completed {
+                status: NtStatus::PENDING,
+                ..
+            })
+            | Ok(DispatchOutcome::Failed {
+                status: NtStatus::PENDING,
+            })
+            | Ok(DispatchOutcome::Pending) => PnpBackendDispatch::Pending,
+            Ok(DispatchOutcome::Completed {
+                status,
+                information,
+                ..
+            }) => PnpBackendDispatch::Returned {
+                status,
+                information,
+            },
+            Ok(DispatchOutcome::Failed { status }) => PnpBackendDispatch::Returned {
+                status,
+                information: 0,
+            },
+            Err(transport_status) => PnpBackendDispatch::Indeterminate { transport_status },
+        }
+    }
 
     /// Request cancellation of a (typically pending) IRP owned by this backend.
     fn cancel_irp(&mut self, irp_id: IrpId) -> Result<(), NtStatus>;

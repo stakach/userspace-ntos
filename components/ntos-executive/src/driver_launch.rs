@@ -77,8 +77,8 @@ use nt_io_manager::{
     DriverDispatchBackend, DriverId, DriverPeerId, ExternalDispatchResult, FileId,
     HostedDevicePropertyOwner, HostedDevicePropertyTransferError,
     HostedDevicePropertyTransferTable, HostedDomainIdentity, InformationParameters, IoManager,
-    IoParameters, IrpId, IrpProjection, MajorFunctionTable, ObjectManagerPort, ReadWriteParameters,
-    ShareAccess, WdmDriverObjectInit, WdmFileObjectInit, WdmIoStackLocationInit,
+    IoParameters, IrpId, IrpProjection, MajorFunctionTable, ObjectManagerPort, PnpBackendDispatch,
+    ReadWriteParameters, ShareAccess, WdmDriverObjectInit, WdmFileObjectInit, WdmIoStackLocationInit,
     WdmIoStackParameters, WdmIrpInit, WDM_X64_DRIVER_EXTENSION_OFFSET,
     WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET,
     WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET, WDM_X64_FILE_OBJECT_SIZE,
@@ -34156,6 +34156,21 @@ struct HostedDriverBackend {
     instance: usize,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum HostedIrpTransportResult {
+    NotDispatched {
+        status: nt_status::NtStatus,
+    },
+    Returned {
+        status: nt_status::NtStatus,
+        information: u64,
+        file_context: u64,
+    },
+    Indeterminate {
+        transport_status: nt_status::NtStatus,
+    },
+}
+
 fn projection_fsctl(irp: &IrpProjection) -> u64 {
     match &irp.parameters {
         IoParameters::DeviceControl(p) | IoParameters::InternalDeviceControl(p) => {
@@ -34343,6 +34358,85 @@ impl DriverDispatchBackend for HostedDriverBackend {
             None => Ok(DispatchOutcome::Failed {
                 status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
             }),
+        }
+    }
+
+    fn dispatch_pnp_irp(
+        &mut self,
+        ctx: DispatchContext<'_>,
+        irp: &IrpProjection,
+    ) -> PnpBackendDispatch {
+        if irp.major != major::IRP_MJ_PNP || irp.file_id.is_some() {
+            return PnpBackendDispatch::NotDispatched {
+                status: nt_status::NtStatus::INVALID_PARAMETER,
+            };
+        }
+        let (input_len, output_len) = projection_buffer_extents(irp, ctx.system_buffer.len());
+        if output_len != 0 || input_len != ctx.system_buffer.len() {
+            return PnpBackendDispatch::NotDispatched {
+                status: nt_status::NtStatus::INVALID_PARAMETER,
+            };
+        }
+        let request = match hosted_irp_dispatch_request(self.instance, irp, input_len, output_len) {
+            Ok(request) => request,
+            Err(status) => return PnpBackendDispatch::NotDispatched { status },
+        };
+        let Some(binding) = hosted_device_binding_by_device_id(irp.device_id.raw()) else {
+            return PnpBackendDispatch::NotDispatched {
+                status: nt_status::NtStatus::INVALID_PARAMETER,
+            };
+        };
+        let Some(binding_instance) = instance(binding.instance) else {
+            return PnpBackendDispatch::NotDispatched {
+                status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+            };
+        };
+        // Video devices still use the explicit videoprt startup path. The generic video
+        // CREATE/IOCTL adapter does not constitute a PnP stack and must not synthesize a return.
+        if unsafe { hosted_instance_video_port_initialized(binding_instance) } {
+            return PnpBackendDispatch::NotDispatched {
+                status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            };
+        }
+        let mut output = [];
+        let result = unsafe {
+            dispatch_irp_for_instance_exact(
+                self.instance,
+                irp.major as u64,
+                irp.minor as u64,
+                binding.device_object,
+                irp.irp_id.raw(),
+                0,
+                projection_fsctl(irp),
+                binding.pdo_object,
+                irp.requestor_tid,
+                Some(request),
+                ctx.system_buffer,
+                &mut output,
+            )
+        };
+        match result {
+            None => PnpBackendDispatch::NotDispatched {
+                status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+            },
+            Some(HostedIrpTransportResult::NotDispatched { status }) => {
+                PnpBackendDispatch::NotDispatched { status }
+            }
+            Some(HostedIrpTransportResult::Returned {
+                status: nt_status::NtStatus::PENDING,
+                ..
+            }) => PnpBackendDispatch::Pending,
+            Some(HostedIrpTransportResult::Returned {
+                status,
+                information,
+                ..
+            }) => PnpBackendDispatch::Returned {
+                status,
+                information,
+            },
+            Some(HostedIrpTransportResult::Indeterminate { transport_status }) => {
+                PnpBackendDispatch::Indeterminate { transport_status }
+            }
         }
     }
 
@@ -43432,13 +43526,13 @@ pub(crate) fn print_active_driver_dispatch_for_deadman() {
 
 /// Route one IRP to launched driver `inst`: fill the shared request fields, drive its dispatch loop
 /// (a plain Send wakes it; it runs `MajorFunction[major]` in its own context; a fault mid-IRP lands
-/// on its fault EP → demand-map + resume), then read back the completion. Returns `(status,
-/// information)`. `major` is an `IRP_MJ_*`; the component-side IRP builder streams `in_data`
-/// through the shared bank into request-owned WDM buffers and streams completed bytes back to
-/// `out`. Returns `None` if `inst` isn't ready.
+/// on its fault EP → demand-map + resume), then read back the exact transport result. `major` is
+/// an `IRP_MJ_*`; the component-side IRP builder streams `in_data` through the shared bank into
+/// request-owned WDM buffers and streams completed bytes back to `out`. Returns `None` if `inst`
+/// isn't available.
 ///
 /// This is the private component transport engine. Public callers route through driver/device ids.
-unsafe fn dispatch_irp_for_instance(
+unsafe fn dispatch_irp_for_instance_exact(
     inst: usize,
     major: u64,
     minor: u64,
@@ -43451,9 +43545,11 @@ unsafe fn dispatch_irp_for_instance(
     mut dispatch_request: Option<IrpDispatchRequest>,
     in_data: &[u8],
     out: &mut [u8],
-) -> Option<(i32, u64, u64)> {
+) -> Option<HostedIrpTransportResult> {
     if in_data.len() > u32::MAX as usize || out.len() > u32::MAX as usize {
-        return Some((STATUS_INVALID_BUFFER_SIZE as i32, 0, 0));
+        return Some(HostedIrpTransportResult::NotDispatched {
+            status: nt_status::NtStatus(STATUS_INVALID_BUFFER_SIZE as i32),
+        });
     }
     let dependent_inst = instance(inst)?;
     if !dependent_inst.ready {
@@ -43468,14 +43564,18 @@ unsafe fn dispatch_irp_for_instance(
     if major != FSD_DISPATCH_TIMER_DPC {
         if let Some(route) = hosted_provider_dispatch_route_for_instance(inst) {
             if !route.add_device_ready() {
-                return Some((STATUS_INVALID_DEVICE_REQUEST, 0, 0));
+                return Some(HostedIrpTransportResult::NotDispatched {
+                    status: nt_status::NtStatus(STATUS_INVALID_DEVICE_REQUEST),
+                });
             }
             let provider_inst = instance(route.provider_instance)?;
             let provider_domain = instance_domain_identity(provider_inst)?;
             if provider_domain != route.provider_domain
                 || instance_domain_identity(dependent_inst) != Some(route.dependent_domain)
             {
-                return Some((STATUS_INVALID_PARAMETER, 0, 0));
+                return Some(HostedIrpTransportResult::NotDispatched {
+                    status: nt_status::NtStatus(STATUS_INVALID_PARAMETER),
+                });
             }
             let binding = if let Some(request) = dispatch_request.as_ref() {
                 let binding = hosted_device_binding_by_device_id(request.device_id)?;
@@ -43485,7 +43585,9 @@ unsafe fn dispatch_irp_for_instance(
                     || binding.projection_domain != provider_domain
                     || binding.device_object != device_object
                 {
-                    return Some((STATUS_INVALID_PARAMETER, 0, 0));
+                    return Some(HostedIrpTransportResult::NotDispatched {
+                        status: nt_status::NtStatus(STATUS_INVALID_PARAMETER),
+                    });
                 }
                 binding
             } else {
@@ -43543,25 +43645,33 @@ unsafe fn dispatch_irp_for_instance(
             || request.stack_count == 0
             || request.stack_location >= request.stack_count
         {
-            return Some((STATUS_INVALID_PARAMETER, 0, 0));
+            return Some(HostedIrpTransportResult::NotDispatched {
+                status: nt_status::NtStatus(STATUS_INVALID_PARAMETER),
+            });
         }
         if let Some(route) = provider_route {
             request.provider_domain_id = route.provider_domain.domain_id.raw();
             request.provider_cookie = route.provider_domain.cookie;
         }
         if !request.has_well_formed_domain_route() {
-            return Some((STATUS_INVALID_PARAMETER, 0, 0));
+            return Some(HostedIrpTransportResult::NotDispatched {
+                status: nt_status::NtStatus(STATUS_INVALID_PARAMETER),
+            });
         }
         let Some(data_va) = ExecVaWindow::try_for_instance(dispatch_index).map(|win| win.data_va)
         else {
-            return Some((STATUS_INVALID_PARAMETER, 0, 0));
+            return Some(HostedIrpTransportResult::NotDispatched {
+                status: nt_status::NtStatus(STATUS_INVALID_PARAMETER),
+            });
         };
         write_volatile(
             (data_va + FSD_DATA_IRP_DISPATCH_REQUEST_OFF) as *mut IrpDispatchRequest,
             *request,
         );
     } else if major <= u8::MAX as u64 && major::is_valid_major(major as u8) {
-        return Some((STATUS_INVALID_PARAMETER, 0, 0));
+        return Some(HostedIrpTransportResult::NotDispatched {
+            status: nt_status::NtStatus(STATUS_INVALID_PARAMETER),
+        });
     }
     write_volatile((sh + SH_ACTIVE_IRP) as *mut u64, 0);
     write_volatile((sh + SH_ACTIVE_IOSL) as *mut u64, 0);
@@ -43641,7 +43751,9 @@ unsafe fn dispatch_irp_for_instance(
                             })
             )
         {
-            return Some((STATUS_INVALID_PARAMETER, 0, 0));
+            return Some(HostedIrpTransportResult::NotDispatched {
+                status: nt_status::NtStatus(STATUS_INVALID_PARAMETER),
+            });
         }
     }
     let bugchecks_before = FSD_BUGCHECKS.load(Ordering::Relaxed);
@@ -43679,7 +43791,9 @@ unsafe fn dispatch_irp_for_instance(
     }
     let Some(transfer_guard) = enter_active_hosted_irp_transfer(sh, canonical_irp_id, in_data, out)
     else {
-        return Some((0xC000_009Au32 as i32, 0, 0)); // STATUS_INSUFFICIENT_RESOURCES
+        return Some(HostedIrpTransportResult::NotDispatched {
+            status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+        });
     };
     let pr = hosted_component_pump(&ch);
     drop(transfer_guard);
@@ -43699,7 +43813,8 @@ unsafe fn dispatch_irp_for_instance(
     }
     // Attribute any bugcheck the component raised to THIS instance — the executive is the only side
     // that knows which hosted component it just drove.
-    if FSD_BUGCHECKS.load(Ordering::Relaxed) != bugchecks_before {
+    let guarded_abort = FSD_BUGCHECKS.load(Ordering::Relaxed) != bugchecks_before;
+    if guarded_abort {
         FSD_BUGCHECK_INSTANCE.store(dispatch_index as u64 + 1, Ordering::Relaxed);
         print_str(b"[fsd-bugcheck] raised by hosted driver instance=");
         print_u64(dispatch_index as u64);
@@ -43720,7 +43835,9 @@ unsafe fn dispatch_irp_for_instance(
         if dispatch_index != inst {
             register_instance_ready(inst, false);
         }
-        return Some((0xC000_0001u32 as i32, 0, 0)); // STATUS_UNSUCCESSFUL
+        return Some(HostedIrpTransportResult::Indeterminate {
+            transport_status: nt_status::NtStatus::UNSUCCESSFUL,
+        });
     }
     let d = instance(dispatch_index).unwrap_or(d);
     let sh = d.exec_shared_va;
@@ -43742,7 +43859,60 @@ unsafe fn dispatch_irp_for_instance(
     if let Some(binding) = provider_binding {
         import_provider_device_dispatch_state(binding, dependent_inst.exec_shared_va, sh);
     }
-    Some((st, info, file_context))
+    if guarded_abort {
+        Some(HostedIrpTransportResult::Indeterminate {
+            transport_status: nt_status::NtStatus::UNSUCCESSFUL,
+        })
+    } else {
+        Some(HostedIrpTransportResult::Returned {
+            status: nt_status::NtStatus(st),
+            information: info,
+            file_context,
+        })
+    }
+}
+
+/// Compatibility adapter for non-PnP callers that still consume the historical optional tuple.
+/// Exact transport provenance is intentionally available only through
+/// [`dispatch_irp_for_instance_exact`].
+unsafe fn dispatch_irp_for_instance(
+    inst: usize,
+    major: u64,
+    minor: u64,
+    device_object: u64,
+    canonical_irp_id: u64,
+    canonical_file_id: u64,
+    fsctl: u64,
+    file_id: u64,
+    requestor_tid: u64,
+    dispatch_request: Option<IrpDispatchRequest>,
+    in_data: &[u8],
+    out: &mut [u8],
+) -> Option<(i32, u64, u64)> {
+    match dispatch_irp_for_instance_exact(
+        inst,
+        major,
+        minor,
+        device_object,
+        canonical_irp_id,
+        canonical_file_id,
+        fsctl,
+        file_id,
+        requestor_tid,
+        dispatch_request,
+        in_data,
+        out,
+    )? {
+        HostedIrpTransportResult::NotDispatched { status } => Some((status.raw(), 0, 0)),
+        HostedIrpTransportResult::Returned {
+            status,
+            information,
+            file_context,
+        } => Some((status.raw(), information, file_context)),
+        HostedIrpTransportResult::Indeterminate { transport_status } => {
+            Some((transport_status.raw(), 0, 0))
+        }
+    }
 }
 
 /// Allocate the canonical File before a hosted driver sees CREATE. Process

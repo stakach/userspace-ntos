@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use nt_status::NtStatus;
 use nt_types::{AccessMask, ClientId, NtPath, ObjectId};
 
-use crate::dispatch::{DispatchContext, DispatchOutcome, IrpProjection};
+use crate::dispatch::{DispatchContext, DispatchOutcome, IrpProjection, PnpBackendDispatch};
 use crate::file::{CreateOptions, FileRecord, FileState, ShareAccess};
 use crate::irp::{BufferAccess, IoBufferRef, IoParameters, IrpState, PnpParameters};
 use crate::{DeviceId, DriverId, FileId, IoManager, IrpId};
@@ -214,14 +214,7 @@ impl<P> IoManager<P> {
                 };
             }
         };
-        let outcome = self.dispatch_to_driver(current_driver_id, irp_id, &mut prepared.payload);
-        if let Err(transport_status) = outcome {
-            self.mark_external_pnp_indeterminate(irp_id);
-            return ExternalPnpDispatchResult::Indeterminate {
-                irp_id,
-                transport_status,
-            };
-        }
+        let outcome = self.dispatch_pnp_to_driver(current_driver_id, irp_id, &mut prepared.payload);
         if self
             .irp(irp_id)
             .map(|irp| irp.state != IrpState::Dispatched)
@@ -229,11 +222,10 @@ impl<P> IoManager<P> {
         {
             return ExternalPnpDispatchResult::Pending { irp_id };
         }
-        match outcome.expect("transport error handled above") {
-            DispatchOutcome::Completed {
+        match outcome {
+            PnpBackendDispatch::Returned {
                 status,
                 information,
-                ..
             } => {
                 if let Some(irp) = self.irp_mut(irp_id) {
                     irp.status = status;
@@ -247,23 +239,26 @@ impl<P> IoManager<P> {
                     information,
                 }
             }
-            DispatchOutcome::Failed { status } => {
-                if let Some(irp) = self.irp_mut(irp_id) {
-                    irp.status = status;
-                    irp.transition(IrpState::Failed);
-                }
-                self.free_irp(irp_id);
-                ExternalPnpDispatchResult::Returned {
-                    status,
-                    information: 0,
-                }
-            }
-            DispatchOutcome::Pending => {
+            PnpBackendDispatch::Pending => {
                 if let Some(irp) = self.irp_mut(irp_id) {
                     irp.status = NtStatus::PENDING;
                     irp.transition(IrpState::Pending);
                 }
                 ExternalPnpDispatchResult::Pending { irp_id }
+            }
+            PnpBackendDispatch::NotDispatched { status } => {
+                self.mark_external_pnp_indeterminate(irp_id);
+                ExternalPnpDispatchResult::Indeterminate {
+                    irp_id,
+                    transport_status: status,
+                }
+            }
+            PnpBackendDispatch::Indeterminate { transport_status } => {
+                self.mark_external_pnp_indeterminate(irp_id);
+                ExternalPnpDispatchResult::Indeterminate {
+                    irp_id,
+                    transport_status,
+                }
             }
         }
     }
@@ -490,6 +485,70 @@ impl<P> IoManager<P> {
             None,
             None,
             None,
+        )
+    }
+
+    fn dispatch_pnp_to_driver(
+        &mut self,
+        driver_id: DriverId,
+        irp_id: IrpId,
+        system_buffer: &mut [u8],
+    ) -> PnpBackendDispatch {
+        let (client, current_driver_id) = match self.irp(irp_id).and_then(|irp| {
+            irp.current_stack()
+                .map(|stack| (irp.client_id, stack.driver_id, stack.major))
+        }) {
+            Some((client, current_driver_id, nt_io_abi::major::IRP_MJ_PNP)) => {
+                (client, current_driver_id)
+            }
+            _ => {
+                return PnpBackendDispatch::NotDispatched {
+                    status: NtStatus::INVALID_PARAMETER,
+                };
+            }
+        };
+        if driver_id != current_driver_id {
+            return PnpBackendDispatch::NotDispatched {
+                status: NtStatus::INVALID_PARAMETER,
+            };
+        }
+        let target = match self.driver(driver_id) {
+            Some(driver) => driver.dispatch.get(nt_io_abi::major::IRP_MJ_PNP),
+            None => {
+                return PnpBackendDispatch::NotDispatched {
+                    status: NtStatus::INVALID_PARAMETER,
+                };
+            }
+        };
+        let backend_index = target
+            .mock_id()
+            .map(|id| id.0 as usize)
+            .or_else(|| target.kernel_id().map(|id| id.0 as usize))
+            .or_else(|| target.driver_peer_id().map(|id| id.0 as usize));
+        let Some(backend_index) = backend_index else {
+            return PnpBackendDispatch::NotDispatched {
+                status: NtStatus::INVALID_DEVICE_REQUEST,
+            };
+        };
+        let projection = match self
+            .irp(irp_id)
+            .and_then(|irp| IrpProjection::from_record(irp).ok())
+        {
+            Some(projection) => projection,
+            None => {
+                return PnpBackendDispatch::NotDispatched {
+                    status: NtStatus::INVALID_PARAMETER,
+                };
+            }
+        };
+        let Some(backend) = self.backends.get_mut(backend_index) else {
+            return PnpBackendDispatch::NotDispatched {
+                status: NtStatus::INVALID_PARAMETER,
+            };
+        };
+        backend.dispatch_pnp_irp(
+            DispatchContext::new(driver_id, client, system_buffer),
+            &projection,
         )
     }
 
