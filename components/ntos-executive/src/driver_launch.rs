@@ -14557,6 +14557,7 @@ impl HostedProviderDomainDependency {
 enum HostedProviderConstructionState {
     Constructing,
     RollingBack,
+    CompensationRequired,
     Published,
 }
 
@@ -14651,6 +14652,7 @@ struct ProviderMarshalState {
     miniport_interrupt_provider_instance: usize,
     miniport_interrupt_provider_component_va: u64,
     miniport_interrupt_free_on_success: bool,
+    miniport_interrupt_construction_index: usize,
     ndis_route_index: usize,
     ndis_initialize_wrapper_handle_exec_va: u64,
     ndis_status_provider_exec_va: u64,
@@ -14726,6 +14728,7 @@ impl ProviderMarshalState {
             miniport_interrupt_provider_instance: usize::MAX,
             miniport_interrupt_provider_component_va: 0,
             miniport_interrupt_free_on_success: false,
+            miniport_interrupt_construction_index: usize::MAX,
             ndis_route_index: usize::MAX,
             ndis_initialize_wrapper_handle_exec_va: 0,
             ndis_status_provider_exec_va: 0,
@@ -14844,11 +14847,13 @@ impl HostedProviderNdisBufferShadow {
 #[derive(Clone, Copy)]
 struct HostedProviderMiniportInterruptShadow {
     present: bool,
+    construction_state: HostedProviderConstructionState,
     owner: HostedProviderObjectOwner,
     provider_instance: usize,
     dependent_instance: usize,
     dependent_component_va: u64,
     provider_component_va: u64,
+    provider_component_owned_by_bridge: bool,
     bytes: u64,
 }
 
@@ -14856,11 +14861,13 @@ impl HostedProviderMiniportInterruptShadow {
     const fn empty() -> Self {
         Self {
             present: false,
+            construction_state: HostedProviderConstructionState::Published,
             owner: EMPTY_HOSTED_PROVIDER_OBJECT_OWNER,
             provider_instance: 0,
             dependent_instance: 0,
             dependent_component_va: 0,
             provider_component_va: 0,
+            provider_component_owned_by_bridge: false,
             bytes: 0,
         }
     }
@@ -16892,7 +16899,7 @@ unsafe fn register_hosted_provider_driver_object_shadow(
             if !exact {
                 return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION.raw());
             }
-            if route.construction_state == HostedProviderConstructionState::Constructing {
+            if route.construction_state != HostedProviderConstructionState::RollingBack {
                 return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
             }
             let routes = hosted_provider_dispatch_routes_mut();
@@ -17256,15 +17263,20 @@ unsafe fn release_hosted_provider_pointer_allocation_by_dependent(
 }
 
 unsafe fn abort_provider_export_marshal_before_dispatch(state: &ProviderMarshalState) {
-    if state.pointer_allocation_dependent_component_va == 0 {
-        return;
-    }
-    if !release_hosted_provider_pointer_allocation_by_dependent(
-        state.pointer_allocation_dependent_instance,
-        state.pointer_allocation_dependent_component_va,
-        0,
-    ) {
+    if state.pointer_allocation_dependent_component_va != 0
+        && !release_hosted_provider_pointer_allocation_by_dependent(
+            state.pointer_allocation_dependent_instance,
+            state.pointer_allocation_dependent_component_va,
+            0,
+        )
+    {
         HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+    }
+    if state.miniport_interrupt_construction_index != usize::MAX {
+        retain_or_clear_failed_hosted_provider_miniport_interrupt_construction(
+            state.miniport_interrupt_construction_index,
+            STATUS_DEVICE_NOT_READY,
+        );
     }
 }
 
@@ -17298,6 +17310,39 @@ unsafe fn abort_provider_export_marshal_after_possible_dispatch(state: &Provider
             )
         {
             HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if state.miniport_interrupt_construction_index != usize::MAX {
+        retain_indeterminate_hosted_provider_miniport_interrupt_construction(
+            state.miniport_interrupt_construction_index,
+        );
+    }
+}
+
+struct ProviderMarshalPreparationGuard {
+    state: *const ProviderMarshalState,
+    armed: bool,
+}
+
+impl ProviderMarshalPreparationGuard {
+    fn new(state: &ProviderMarshalState) -> Self {
+        Self {
+            state: state as *const ProviderMarshalState,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProviderMarshalPreparationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            unsafe {
+                abort_provider_export_marshal_before_dispatch(&*self.state);
+            }
         }
     }
 }
@@ -17841,7 +17886,7 @@ unsafe fn reserve_hosted_provider_ndis_packet_construction(
         {
             return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION.raw());
         }
-        if record.construction_state == HostedProviderConstructionState::Constructing {
+        if record.construction_state != HostedProviderConstructionState::RollingBack {
             return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
         }
         if !release_hosted_provider_ndis_packet_shadow_record(&mut records[index]) {
@@ -17960,7 +18005,7 @@ unsafe fn reserve_hosted_provider_ndis_buffer_construction(
         {
             return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION.raw());
         }
-        if record.construction_state == HostedProviderConstructionState::Constructing {
+        if record.construction_state != HostedProviderConstructionState::RollingBack {
             return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
         }
         if !release_hosted_provider_ndis_buffer_shadow_record(&mut records[index]) {
@@ -20386,6 +20431,7 @@ unsafe fn find_hosted_provider_miniport_interrupt_shadow(
     };
     for (index, record) in records.iter().copied().enumerate() {
         if record.present
+            && record.construction_state == HostedProviderConstructionState::Published
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
             && hosted_provider_object_owner_is_live(
@@ -20406,14 +20452,70 @@ unsafe fn allocate_hosted_provider_miniport_interrupt_shadow(
     provider_inst: DriverInstance,
     dependent_instance: usize,
     dependent_component_va: u64,
-) -> Result<HostedProviderMiniportInterruptShadow, i32> {
+) -> Result<(usize, HostedProviderMiniportInterruptShadow), i32> {
     let owner = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
         .ok_or(STATUS_DEVICE_NOT_READY)?;
+    if dependent_component_va == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let skeleton = HostedProviderMiniportInterruptShadow {
+        present: true,
+        construction_state: HostedProviderConstructionState::Constructing,
+        owner,
+        provider_instance,
+        dependent_instance,
+        dependent_component_va,
+        provider_component_va: 0,
+        provider_component_owned_by_bridge: false,
+        bytes: NDIS_MINIPORT_INTERRUPT_LEN_X64,
+    };
+    let construction_index = {
+        let records = hosted_provider_miniport_interrupt_shadows_mut();
+        if let Some((index, record)) = records.iter().copied().enumerate().find(|(_, record)| {
+            record.present
+                && record.provider_instance == provider_instance
+                && record.dependent_instance == dependent_instance
+                && record.dependent_component_va == dependent_component_va
+        }) {
+            if record.owner != owner
+                || record.construction_state == HostedProviderConstructionState::Published
+            {
+                return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION.raw());
+            }
+            if record.construction_state != HostedProviderConstructionState::RollingBack {
+                return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
+            }
+            if !release_hosted_provider_miniport_interrupt_shadow_record(&mut records[index]) {
+                return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
+            }
+            records[index] = skeleton;
+            index
+        } else if let Some(index) = records.iter().position(|record| !record.present) {
+            records[index] = skeleton;
+            index
+        } else {
+            records
+                .try_reserve(1)
+                .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+            records.push(skeleton);
+            records.len() - 1
+        }
+    };
     let Some(provider_component_va) =
         hosted_instance_pool_alloc(provider_inst, NDIS_MINIPORT_INTERRUPT_LEN_X64)
     else {
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
+        return Err(
+            retain_or_clear_failed_hosted_provider_miniport_interrupt_construction(
+                construction_index,
+                STATUS_INSUFFICIENT_RESOURCES,
+            ),
+        );
     };
+    {
+        let record = &mut hosted_provider_miniport_interrupt_shadows_mut()[construction_index];
+        record.provider_component_va = provider_component_va;
+        record.provider_component_owned_by_bridge = true;
+    }
     if component_to_exec_va_for_instance(
         provider_instance,
         provider_inst,
@@ -20422,28 +20524,92 @@ unsafe fn allocate_hosted_provider_miniport_interrupt_shadow(
     )
     .is_none()
     {
-        hosted_instance_pool_free(provider_inst, provider_component_va);
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(
+            retain_or_clear_failed_hosted_provider_miniport_interrupt_construction(
+                construction_index,
+                STATUS_INVALID_PARAMETER,
+            ),
+        );
     }
+    Ok((
+        construction_index,
+        hosted_provider_miniport_interrupt_shadows_mut()[construction_index],
+    ))
+}
 
-    let shadow = HostedProviderMiniportInterruptShadow {
-        present: true,
-        owner,
-        provider_instance,
-        dependent_instance,
-        dependent_component_va,
-        provider_component_va,
-        bytes: NDIS_MINIPORT_INTERRUPT_LEN_X64,
-    };
+unsafe fn release_hosted_provider_miniport_interrupt_shadow_record(
+    record: &mut HostedProviderMiniportInterruptShadow,
+) -> bool {
+    if !record.present
+        || record.construction_state == HostedProviderConstructionState::CompensationRequired
+        || !hosted_provider_object_owner_is_current(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+        )
+    {
+        return false;
+    }
+    if record.provider_component_owned_by_bridge {
+        if !release_hosted_provider_owned_pool_allocation(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+            record.provider_instance,
+            record.provider_component_va,
+        ) {
+            return false;
+        }
+        record.provider_component_owned_by_bridge = false;
+    }
+    true
+}
+
+unsafe fn retain_or_clear_failed_hosted_provider_miniport_interrupt_construction(
+    index: usize,
+    status: i32,
+) -> i32 {
     let records = hosted_provider_miniport_interrupt_shadows_mut();
-    for record in records.iter_mut() {
-        if !record.present {
-            *record = shadow;
-            return Ok(shadow);
+    if let Some(record) = records.get_mut(index) {
+        record.construction_state = HostedProviderConstructionState::RollingBack;
+    }
+    if records
+        .get_mut(index)
+        .is_some_and(|record| release_hosted_provider_miniport_interrupt_shadow_record(record))
+    {
+        records[index] = HostedProviderMiniportInterruptShadow::empty();
+    }
+    status
+}
+
+unsafe fn retain_indeterminate_hosted_provider_miniport_interrupt_construction(index: usize) {
+    if let Some(record) = hosted_provider_miniport_interrupt_shadows_mut().get_mut(index) {
+        if record.present
+            && record.construction_state == HostedProviderConstructionState::Constructing
+        {
+            record.construction_state = HostedProviderConstructionState::CompensationRequired;
         }
     }
-    records.push(shadow);
-    Ok(shadow)
+}
+
+unsafe fn finish_hosted_provider_miniport_interrupt_construction(index: usize) -> bool {
+    let Some(record) = hosted_provider_miniport_interrupt_shadows_mut().get_mut(index) else {
+        return false;
+    };
+    if !record.present
+        || record.construction_state != HostedProviderConstructionState::Constructing
+        || record.provider_component_va == 0
+        || !record.provider_component_owned_by_bridge
+        || !hosted_provider_object_owner_is_live(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+        )
+    {
+        return false;
+    }
+    record.construction_state = HostedProviderConstructionState::Published;
+    true
 }
 
 unsafe fn hosted_provider_miniport_interrupt_shadow(
@@ -20453,7 +20619,7 @@ unsafe fn hosted_provider_miniport_interrupt_shadow(
     dependent_inst: DriverInstance,
     dependent_component_va: u64,
     allow_create: bool,
-) -> Result<(u64, u64, u64), i32> {
+) -> Result<(u64, u64, u64, Option<usize>), i32> {
     let Some(dependent_exec_va) = component_to_exec_va_for_instance(
         dependent_instance,
         dependent_inst,
@@ -20462,18 +20628,21 @@ unsafe fn hosted_provider_miniport_interrupt_shadow(
     ) else {
         return Err(STATUS_INVALID_PARAMETER);
     };
-    let shadow = match find_hosted_provider_miniport_interrupt_shadow(
+    let (shadow, construction_index) = match find_hosted_provider_miniport_interrupt_shadow(
         provider_instance,
         dependent_instance,
         dependent_component_va,
     ) {
-        Some((_index, shadow)) => shadow,
-        None if allow_create => allocate_hosted_provider_miniport_interrupt_shadow(
-            provider_instance,
-            provider_inst,
-            dependent_instance,
-            dependent_component_va,
-        )?,
+        Some((_index, shadow)) => (shadow, None),
+        None if allow_create => {
+            let (index, shadow) = allocate_hosted_provider_miniport_interrupt_shadow(
+                provider_instance,
+                provider_inst,
+                dependent_instance,
+                dependent_component_va,
+            )?;
+            (shadow, Some(index))
+        }
         None => {
             HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
             return Err(STATUS_INVALID_PARAMETER);
@@ -20501,6 +20670,7 @@ unsafe fn hosted_provider_miniport_interrupt_shadow(
         shadow.provider_component_va,
         dependent_exec_va,
         provider_exec_va,
+        construction_index,
     ))
 }
 
@@ -20510,6 +20680,7 @@ unsafe fn free_hosted_provider_miniport_interrupt_shadow(
 ) -> bool {
     for record in hosted_provider_miniport_interrupt_shadows_mut().iter_mut() {
         if record.present
+            && record.construction_state == HostedProviderConstructionState::Published
             && record.provider_instance == provider_instance
             && record.provider_component_va == provider_component_va
             && hosted_provider_object_owner_is_live(
@@ -20518,13 +20689,7 @@ unsafe fn free_hosted_provider_miniport_interrupt_shadow(
                 record.dependent_instance,
             )
         {
-            if !release_hosted_provider_owned_pool_allocation(
-                record.owner,
-                record.provider_instance,
-                record.dependent_instance,
-                record.provider_instance,
-                record.provider_component_va,
-            ) {
+            if !release_hosted_provider_miniport_interrupt_shadow_record(record) {
                 return false;
             }
             *record = HostedProviderMiniportInterruptShadow::empty();
@@ -20553,13 +20718,8 @@ unsafe fn clear_hosted_provider_miniport_interrupt_shadows_for_instance(
             record.dependent_instance,
             instance_index,
             domain,
-        ) || !release_hosted_provider_owned_pool_allocation(
-            record.owner,
-            record.provider_instance,
-            record.dependent_instance,
-            record.provider_instance,
-            record.provider_component_va,
-        ) {
+        ) || !release_hosted_provider_miniport_interrupt_shadow_record(record)
+        {
             failures += 1;
         } else {
             *record = HostedProviderMiniportInterruptShadow::empty();
@@ -22196,7 +22356,7 @@ unsafe fn provider_marshal_miniport_interrupt(
     arg_value: u64,
     free_on_success: bool,
 ) -> Result<u64, i32> {
-    let (provider_arg, dependent_exec_va, provider_exec_va) =
+    let (provider_arg, dependent_exec_va, provider_exec_va, construction_index) =
         hosted_provider_miniport_interrupt_shadow(
             provider_instance,
             provider_inst,
@@ -22205,6 +22365,7 @@ unsafe fn provider_marshal_miniport_interrupt(
             arg_value,
             !free_on_success,
         )?;
+    state.miniport_interrupt_construction_index = construction_index.unwrap_or(usize::MAX);
     provider_marshal_add_copyout(
         state,
         dependent_exec_va,
@@ -23179,6 +23340,7 @@ unsafe fn prepare_provider_export_marshal(
         return Err(STATUS_INVALID_PARAMETER);
     }
     let mut state = ProviderMarshalState::empty();
+    let mut preparation_guard = ProviderMarshalPreparationGuard::new(&state);
     let mut index = 0usize;
     while index < policy.argument_count as usize {
         let arg = args[index];
@@ -23703,6 +23865,7 @@ unsafe fn prepare_provider_export_marshal(
         state.resource_projection_required = true;
         state.dma_state_copyback = true;
     }
+    preparation_guard.disarm();
     Ok(state)
 }
 
@@ -23751,6 +23914,24 @@ unsafe fn complete_provider_export_marshal(
                 *result = STATUS_INVALID_PARAMETER as u32 as u64;
                 success = false;
             }
+        }
+    }
+    if state.miniport_interrupt_construction_index != usize::MAX {
+        if success {
+            if !finish_hosted_provider_miniport_interrupt_construction(
+                state.miniport_interrupt_construction_index,
+            ) {
+                retain_indeterminate_hosted_provider_miniport_interrupt_construction(
+                    state.miniport_interrupt_construction_index,
+                );
+                *result = STATUS_DEVICE_NOT_READY as u32 as u64;
+                success = false;
+            }
+        } else {
+            retain_or_clear_failed_hosted_provider_miniport_interrupt_construction(
+                state.miniport_interrupt_construction_index,
+                *result as i32,
+            );
         }
     }
     let mut index = 0usize;

@@ -11827,3 +11827,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     I/O-Manager provider link, so allocation failure cannot leave provider authority with no matching
     retirement record. The freestanding executive release check remains green at the established
     212-warning baseline and `git diff --check` is clean.
+
+    Provider miniport-interrupt construction checkpoint (2026-08-26, implementation green):
+    `NdisMRegisterInterrupt` now reserves an exact-owner, non-visible construction row before its
+    provider-side interrupt storage is allocated. Marshal state owns that row across argument
+    preparation, resource projection, and provider dispatch. Preparation or projection failure and
+    a returned provider failure enter `RollingBack`, clear only a successful pool release, and retain
+    failed cleanup for retry. A successful provider return is the only transition to `Published`;
+    normal lookup and deregistration reject every other state.
+
+    The marshal preparation function now has an unwind guard, so any later argument failure invokes
+    the same pre-dispatch cleanup instead of losing construction state when no `ProviderMarshalState`
+    is returned to the caller. An incomplete provider pump is not treated as proof that registration
+    failed: its row becomes `CompensationRequired`, remains allocated and non-dispatchable, and blocks
+    instance retirement until a real provider compensation path can resolve it. This deliberately
+    removes the unsafe raw-free fallback for ambiguous provider ownership. The freestanding executive
+    release check remains green at the established 212-warning baseline and `git diff --check` is
+    clean. Timer and work-item construction remain coupled to the open generation-safe callback-thunk
+    work; provider-returned packet/buffer compensation remains open as recorded above.
