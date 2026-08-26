@@ -12762,3 +12762,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Then perform the single composed persistent-SYSTEM publication and delete the generated-only CM
     import plus the old direct REGF-to-semantic-ConfigManager copier in the same cut; neither may
     remain as a fallback authority.
+
+    Per-mount SYSTEM selection desktop acceptance (2026-08-26, accepted): serialized proof
+    `.tmp/run-desktop-per-mount-ccs-20260826.log` retains the real boot path after deletion of the
+    global alias. The isolated CM mount succeeds at generation 1; every configured PnP device
+    reaches terminal success, including both genuine pending START completions, with no failed,
+    pending, or indeterminate rows. Genuine userinit and Explorer reach the shell. Explorer paints
+    all `480000/480000` pixels of the miniport-selected `800x600` framebuffer with at least 32
+    non-background colours, `exec_explorer_shell_chrome_painted` passes, all `296/296` executive
+    checks pass, and the sentinel fires.
+
+    Review adjustment: the per-mount selection checkpoint is closed. Begin the composed authority
+    cut now: select the replayed persistent SYSTEM primary when it exists, otherwise import the
+    installed REGF only for a genuinely absent first boot; compose the generated overlay onto that
+    selected base; publish exactly one complete image to isolated CM before launch-plan selection;
+    and remove the generated-only mount and direct REGF semantic importer. Persisted corruption is
+    an error, not permission to fall back to the installed hive.
