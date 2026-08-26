@@ -6,12 +6,14 @@
 //! the caller supplies the target id, optional canonical file id, and any
 //! transport-local file cookie in `user_data`.
 
+use alloc::vec::Vec;
+
 use nt_status::NtStatus;
 use nt_types::{AccessMask, ClientId, NtPath, ObjectId};
 
 use crate::dispatch::{DispatchContext, DispatchOutcome, IrpProjection};
 use crate::file::{CreateOptions, FileRecord, FileState, ShareAccess};
-use crate::irp::{BufferAccess, IoBufferRef, IoParameters, IrpState};
+use crate::irp::{BufferAccess, IoBufferRef, IoParameters, IrpState, PnpParameters};
 use crate::{DeviceId, DriverId, FileId, IoManager, IrpId};
 
 /// Result of dispatching an externally constructed IRP. A pending request stays
@@ -29,7 +31,250 @@ pub enum ExternalDispatchResult {
     },
 }
 
+/// Exclusive ownership of one fully prepared, but not yet dispatched, canonical PnP IRP.
+///
+/// The payload is copied into this owner so acquiring external PnP lifecycle authority cannot be
+/// followed by a buffer allocation or extent failure. The token is deliberately non-`Clone`.
+pub struct PreparedExternalPnpIrp {
+    irp_id: IrpId,
+    payload: Vec<u8>,
+}
+
+impl PreparedExternalPnpIrp {
+    pub fn irp_id(&self) -> IrpId {
+        self.irp_id
+    }
+}
+
+/// Exact outcome of entering a prepared canonical PnP request.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ExternalPnpDispatchResult {
+    /// The outer device-stack call returned a terminal status.
+    Returned { status: NtStatus, information: u64 },
+    /// The outer device-stack call returned `STATUS_PENDING`; the canonical IRP remains owned by
+    /// the I/O manager until a genuine terminal completion is acknowledged.
+    Pending { irp_id: IrpId },
+    /// Backend entry did not produce a trustworthy outer return. The canonical IRP is retained as
+    /// a teardown barrier and must not be interpreted as a driver veto or completion.
+    Indeterminate {
+        irp_id: IrpId,
+        transport_status: NtStatus,
+    },
+}
+
 impl<P> IoManager<P> {
+    /// Prepare one File-less PnP request against a canonical PDO and snapshot its complete attached
+    /// stack. All allocation, payload copying, projection validation, and backend-route validation
+    /// happens here, before an external lifecycle manager acquires dispatch authority.
+    pub fn prepare_external_pnp_to_device(
+        &mut self,
+        client: ClientId,
+        pdo_device_id: DeviceId,
+        requestor_tid: u64,
+        parameters: PnpParameters,
+        payload: &[u8],
+    ) -> Result<PreparedExternalPnpIrp, NtStatus> {
+        let expected_len = parameters.input_len() as usize;
+        if payload.len() != expected_len {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let origin = self
+            .device(pdo_device_id)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        if origin.delete_pending {
+            return Err(NtStatus::DELETE_PENDING);
+        }
+        let origin_driver_id = origin.driver_id;
+
+        let mut owned_payload = Vec::new();
+        owned_payload
+            .try_reserve_exact(payload.len())
+            .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+        owned_payload.extend_from_slice(payload);
+
+        let mut irp = self.build_irp_record(
+            client,
+            origin_driver_id,
+            pdo_device_id,
+            None,
+            nt_io_abi::major::IRP_MJ_PNP,
+            IoParameters::Pnp(parameters),
+        )?;
+        irp.requestor_tid = requestor_tid;
+        irp.buffer = Some(IoBufferRef {
+            buffer_id: 0,
+            offset: 0,
+            len: expected_len as u32,
+            input_len: expected_len as u32,
+            output_len: 0,
+            access: BufferAccess::ReadWrite,
+        });
+        let irp_id = self.allocate_irp(irp)?;
+        let prepared = (|| {
+            let record = self.irp(irp_id).ok_or(NtStatus::INVALID_PARAMETER)?;
+            IrpProjection::from_record(record)?;
+            let current_driver_id = record
+                .current_stack()
+                .map(|stack| stack.driver_id)
+                .ok_or(NtStatus::INVALID_PARAMETER)?;
+            let target = self
+                .driver(current_driver_id)
+                .ok_or(NtStatus::INVALID_PARAMETER)?
+                .dispatch
+                .get(nt_io_abi::major::IRP_MJ_PNP);
+            let backend_index = target
+                .mock_id()
+                .map(|id| id.0 as usize)
+                .or_else(|| target.kernel_id().map(|id| id.0 as usize))
+                .or_else(|| target.driver_peer_id().map(|id| id.0 as usize));
+            let backend_index = backend_index.ok_or(NtStatus::INVALID_DEVICE_REQUEST)?;
+            if backend_index >= self.backends.len() {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            Ok(())
+        })();
+        if let Err(status) = prepared {
+            self.free_irp(irp_id);
+            return Err(status);
+        }
+        if !self
+            .irp_mut(irp_id)
+            .expect("validated prepared PnP IRP disappeared")
+            .transition(IrpState::Initialized)
+        {
+            self.free_irp(irp_id);
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(PreparedExternalPnpIrp {
+            irp_id,
+            payload: owned_payload,
+        })
+    }
+
+    /// Discard an exact prepared PnP IRP when external lifecycle authority could not be acquired.
+    pub fn discard_prepared_external_pnp(
+        &mut self,
+        prepared: PreparedExternalPnpIrp,
+    ) -> Result<(), NtStatus> {
+        let irp = self
+            .irp_mut(prepared.irp_id)
+            .filter(|irp| {
+                irp.origin_major == nt_io_abi::major::IRP_MJ_PNP
+                    && irp.state == IrpState::Initialized
+            })
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        if !irp.transition(IrpState::Failed) {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        self.free_irp(prepared.irp_id)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        Ok(())
+    }
+
+    /// Enter an exact prepared PnP IRP. This consumes the preparation token and performs no payload
+    /// allocation. Any violated invariant or backend transport error retains the IRP as
+    /// `Indeterminate`; only a genuine synchronous return reclaims it here.
+    pub fn dispatch_prepared_external_pnp(
+        &mut self,
+        mut prepared: PreparedExternalPnpIrp,
+    ) -> ExternalPnpDispatchResult {
+        let irp_id = prepared.irp_id;
+        let valid = self.irp(irp_id).is_some_and(|irp| {
+            irp.origin_major == nt_io_abi::major::IRP_MJ_PNP
+                && irp.state == IrpState::Initialized
+                && irp.file_id.is_none()
+                && irp.buffer.is_some_and(|buffer| {
+                    buffer.input_len as usize == prepared.payload.len()
+                        && buffer.output_len == 0
+                        && buffer.len as usize == prepared.payload.len()
+                })
+        });
+        if !valid
+            || !self
+                .irp_mut(irp_id)
+                .is_some_and(|irp| irp.transition(IrpState::Dispatched))
+        {
+            self.mark_external_pnp_indeterminate(irp_id);
+            return ExternalPnpDispatchResult::Indeterminate {
+                irp_id,
+                transport_status: NtStatus::INVALID_PARAMETER,
+            };
+        }
+        let current_driver_id = match self
+            .irp(irp_id)
+            .and_then(|irp| irp.current_stack())
+            .map(|stack| stack.driver_id)
+        {
+            Some(driver_id) => driver_id,
+            None => {
+                self.mark_external_pnp_indeterminate(irp_id);
+                return ExternalPnpDispatchResult::Indeterminate {
+                    irp_id,
+                    transport_status: NtStatus::INVALID_PARAMETER,
+                };
+            }
+        };
+        let outcome = self.dispatch_to_driver(current_driver_id, irp_id, &mut prepared.payload);
+        if let Err(transport_status) = outcome {
+            self.mark_external_pnp_indeterminate(irp_id);
+            return ExternalPnpDispatchResult::Indeterminate {
+                irp_id,
+                transport_status,
+            };
+        }
+        if self
+            .irp(irp_id)
+            .map(|irp| irp.state != IrpState::Dispatched)
+            .unwrap_or(true)
+        {
+            return ExternalPnpDispatchResult::Pending { irp_id };
+        }
+        match outcome.expect("transport error handled above") {
+            DispatchOutcome::Completed {
+                status,
+                information,
+                ..
+            } => {
+                if let Some(irp) = self.irp_mut(irp_id) {
+                    irp.status = status;
+                    irp.information = information;
+                    irp.transition(IrpState::Completing);
+                    irp.transition(IrpState::Completed);
+                }
+                self.free_irp(irp_id);
+                ExternalPnpDispatchResult::Returned {
+                    status,
+                    information,
+                }
+            }
+            DispatchOutcome::Failed { status } => {
+                self.mark_external_pnp_indeterminate(irp_id);
+                ExternalPnpDispatchResult::Indeterminate {
+                    irp_id,
+                    transport_status: status,
+                }
+            }
+            DispatchOutcome::Pending => {
+                if let Some(irp) = self.irp_mut(irp_id) {
+                    irp.status = NtStatus::PENDING;
+                    irp.transition(IrpState::Pending);
+                }
+                ExternalPnpDispatchResult::Pending { irp_id }
+            }
+        }
+    }
+
+    fn mark_external_pnp_indeterminate(&mut self, irp_id: IrpId) {
+        if let Some(irp) = self.irp_mut(irp_id) {
+            if irp.state == IrpState::Initialized {
+                irp.transition(IrpState::Dispatched);
+            }
+            if irp.state == IrpState::Dispatched {
+                irp.transition(IrpState::Indeterminate);
+            }
+        }
+    }
+
     /// Allocate a canonical File owned by an integration host whose process
     /// handles live outside the I/O Manager's Object Manager port. The record
     /// exists before CREATE and its `FileId` is the only cross-domain identity.

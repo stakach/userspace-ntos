@@ -79,13 +79,15 @@ pub use driver_host::{DriverHostRoutine, MvpStatus};
 pub use driver_peer::{
     DriverPeerBackend, DriverPeerTransport, MockDriverPeer, MockPeerControl, PeerTransferBuffers,
 };
-pub use external_dispatch::ExternalDispatchResult;
+pub use external_dispatch::{
+    ExternalDispatchResult, ExternalPnpDispatchResult, PreparedExternalPnpIrp,
+};
 pub use file::{CreateOptions, FileFlags, FileRecord, FileState, ShareAccess};
 pub use hosted_domain::{HostedDomainIdentity, HostedDomainRecord, HostedProviderIdentity};
 pub use irp::{
     BufferAccess, CancelState, CreateParameters, DeviceControlParameters, InformationParameters,
-    IoBufferRef, IoParameters, IoStackLocation, IrpRecord, IrpState, PnpParameters,
-    PnpStartParameters, ReadWriteParameters, StackControl, StackFlags,
+    IoBufferRef, IoParameters, IoStackLocation, IrpCompletionOrigin, IrpRecord, IrpState,
+    PnpParameters, PnpStartParameters, ReadWriteParameters, StackControl, StackFlags,
 };
 pub use mock_driver::{IoctlBehavior, MockDriverBackend};
 pub use object_port::{MockObjectPort, ObjectManagerPort};
@@ -1830,6 +1832,226 @@ mod tests {
         );
     }
 
+    struct IndeterminatePnpBackend;
+
+    impl DriverDispatchBackend for IndeterminatePnpBackend {
+        fn dispatch_irp(
+            &mut self,
+            _ctx: DispatchContext<'_>,
+            _irp: &IrpProjection,
+        ) -> Result<DispatchOutcome, NtStatus> {
+            Err(NtStatus::DEVICE_NOT_CONNECTED)
+        }
+
+        fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> {
+            Err(NtStatus::NOT_SUPPORTED)
+        }
+    }
+
+    struct PendingPnpBackend {
+        ready: std::rc::Rc<std::cell::RefCell<std::vec::Vec<DriverCompletion>>>,
+    }
+
+    impl DriverDispatchBackend for PendingPnpBackend {
+        fn dispatch_irp(
+            &mut self,
+            _ctx: DispatchContext<'_>,
+            irp: &IrpProjection,
+        ) -> Result<DispatchOutcome, NtStatus> {
+            self.ready.borrow_mut().push(DriverCompletion {
+                irp_id: irp.irp_id,
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: None,
+            });
+            Ok(DispatchOutcome::Pending)
+        }
+
+        fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> {
+            Err(NtStatus::NOT_SUPPORTED)
+        }
+
+        fn poll_completion(&mut self) -> Option<DriverCompletion> {
+            self.ready.borrow_mut().pop()
+        }
+    }
+
+    fn pnp_test_stack(
+        io: &mut IoManager<MockObjectPort>,
+        function_backend: Box<dyn DriverDispatchBackend>,
+    ) -> (ClientId, DeviceId, DriverId, DeviceId) {
+        let client = io.register_client();
+        let root_driver = io
+            .create_driver(
+                &path("\\Driver\\PnpRoot"),
+                Box::new(MockDriverBackend::new()),
+            )
+            .unwrap();
+        let root = io
+            .create_device(
+                root_driver,
+                None,
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::empty(),
+                0,
+            )
+            .unwrap();
+        let backend = io.register_backend(function_backend);
+        let mut dispatch = MajorFunctionTable::new();
+        dispatch.set_all(DispatchTarget::DriverPeer(DriverPeerId(backend as u64)));
+        let function_driver = io.register_driver(DriverRecord::new(
+            ObjectId::NULL,
+            path("\\Driver\\PnpFunction"),
+            DriverBackendId(backend as u64),
+            dispatch,
+        ));
+        let function = io
+            .create_device(
+                function_driver,
+                None,
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::empty(),
+                0,
+            )
+            .unwrap();
+        io.attach_device_to_stack(function, root).unwrap();
+        (client, root, function_driver, function)
+    }
+
+    #[test]
+    fn prepared_pnp_owns_payload_routes_from_pdo_and_discards_exactly() {
+        let mut io = io();
+        let (client, root, function_driver, function) =
+            pnp_test_stack(&mut io, Box::new(MockDriverBackend::new()));
+        let parameters = PnpParameters::start(2, 2).unwrap();
+        let before = io.irp_count();
+        assert!(matches!(
+            io.prepare_external_pnp_to_device(client, root, 41, parameters, &[1, 2, 3]),
+            Err(NtStatus::INVALID_PARAMETER)
+        ));
+        assert_eq!(io.irp_count(), before);
+
+        let unsupported_driver = io
+            .create_driver(
+                &path("\\Driver\\UnsupportedPnp"),
+                Box::new(MockDriverBackend::new()),
+            )
+            .unwrap();
+        let unsupported_device = io
+            .create_device(
+                unsupported_driver,
+                None,
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::empty(),
+                0,
+            )
+            .unwrap();
+        assert!(matches!(
+            io.prepare_external_pnp_to_device(
+                client,
+                unsupported_device,
+                0,
+                parameters,
+                &[1, 2, 3, 4]
+            ),
+            Err(NtStatus::INVALID_DEVICE_REQUEST)
+        ));
+        assert_eq!(io.irp_count(), before);
+
+        let prepared = io
+            .prepare_external_pnp_to_device(client, root, 41, parameters, &[1, 2, 3, 4])
+            .unwrap();
+        let irp_id = prepared.irp_id();
+        let irp = io.irp(irp_id).unwrap();
+        assert_eq!(irp.state, IrpState::Initialized);
+        assert_eq!(irp.origin_device_id, root);
+        assert_eq!(irp.current_stack().unwrap().device_id, function);
+        assert_eq!(irp.current_stack().unwrap().driver_id, function_driver);
+        assert_eq!(irp.origin_minor, nt_pnp_abi::IRP_MN_START_DEVICE);
+        assert_eq!(irp.requestor_tid, 41);
+        io.discard_prepared_external_pnp(prepared).unwrap();
+        assert!(io.irp(irp_id).is_none());
+        assert_eq!(io.irp_count(), before);
+    }
+
+    #[test]
+    fn prepared_pnp_preserves_return_pending_and_indeterminate_outcomes() {
+        let parameters = PnpParameters::lifecycle(nt_pnp_abi::IRP_MN_QUERY_STOP_DEVICE).unwrap();
+
+        let mut returned_io = io();
+        let warning = NtStatus(0x8000_0005u32 as i32);
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(std::vec::Vec::new()));
+        let returned_backend = RecordingBackend {
+            seen: seen.clone(),
+            status: warning,
+            information: 7,
+            file_context: None,
+            output: std::vec::Vec::new(),
+        };
+        let (client, root, _, function) =
+            pnp_test_stack(&mut returned_io, Box::new(returned_backend));
+        let prepared = returned_io
+            .prepare_external_pnp_to_device(client, root, 0, parameters, &[])
+            .unwrap();
+        let returned_id = prepared.irp_id();
+        assert_eq!(
+            returned_io.dispatch_prepared_external_pnp(prepared),
+            ExternalPnpDispatchResult::Returned {
+                status: warning,
+                information: 7,
+            }
+        );
+        assert!(returned_io.irp(returned_id).is_none());
+        assert_eq!(seen.borrow()[0].device_id, function);
+
+        let mut pending_io = io();
+        let pending_ready = std::rc::Rc::new(std::cell::RefCell::new(std::vec::Vec::new()));
+        let (client, root, _, _) = pnp_test_stack(
+            &mut pending_io,
+            Box::new(PendingPnpBackend {
+                ready: pending_ready,
+            }),
+        );
+        let prepared = pending_io
+            .prepare_external_pnp_to_device(client, root, 0, parameters, &[])
+            .unwrap();
+        let pending_id = prepared.irp_id();
+        assert_eq!(
+            pending_io.dispatch_prepared_external_pnp(prepared),
+            ExternalPnpDispatchResult::Pending { irp_id: pending_id }
+        );
+        assert_eq!(pending_io.irp(pending_id).unwrap().state, IrpState::Pending);
+        assert_eq!(pending_io.pump(), 1);
+        let completion = pending_io.completed_irp(pending_id).unwrap();
+        assert_eq!(completion.minor, nt_pnp_abi::IRP_MN_QUERY_STOP_DEVICE);
+        assert_eq!(completion.completion_origin, IrpCompletionOrigin::Driver);
+        pending_io.acknowledge_completed_irp(pending_id).unwrap();
+
+        let mut indeterminate_io = io();
+        let (client, root, function_driver, _) =
+            pnp_test_stack(&mut indeterminate_io, Box::new(IndeterminatePnpBackend));
+        let prepared = indeterminate_io
+            .prepare_external_pnp_to_device(client, root, 0, parameters, &[])
+            .unwrap();
+        let indeterminate_id = prepared.irp_id();
+        assert_eq!(
+            indeterminate_io.dispatch_prepared_external_pnp(prepared),
+            ExternalPnpDispatchResult::Indeterminate {
+                irp_id: indeterminate_id,
+                transport_status: NtStatus::DEVICE_NOT_CONNECTED,
+            }
+        );
+        assert_eq!(
+            indeterminate_io.irp(indeterminate_id).unwrap().state,
+            IrpState::Indeterminate
+        );
+        assert_eq!(indeterminate_io.fault_driver(function_driver), 0);
+        assert!(indeterminate_io.completed_irp(indeterminate_id).is_none());
+    }
+
     #[test]
     fn peer_pnp_wire_request_preserves_start_split() {
         let control = MockPeerControl::new();
@@ -3356,6 +3578,7 @@ mod tests {
                 file_id: om.irp(irp).unwrap().file_id,
                 device_id: om.irp(irp).unwrap().origin_device_id,
                 major: major::IRP_MJ_READ,
+                minor: 0,
                 completion_driver_id: om.irp(irp).unwrap().current_stack().unwrap().driver_id,
                 completion_device_id: om.irp(irp).unwrap().current_stack().unwrap().device_id,
                 user_data: 0,
@@ -3363,6 +3586,7 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 4,
                 file_context: None,
+                completion_origin: IrpCompletionOrigin::Driver,
             })
         );
         om.acknowledge_completed_irp(irp).unwrap();
@@ -4482,6 +4706,10 @@ mod tests {
         assert_eq!(
             om.next_completed_irp().unwrap().status,
             NtStatus::DEVICE_NOT_CONNECTED
+        );
+        assert_eq!(
+            om.next_completed_irp().unwrap().completion_origin,
+            IrpCompletionOrigin::TransportFault
         );
         assert!(om.pending_irps().is_empty());
         assert!(om.device(pdev).unwrap().delete_pending);

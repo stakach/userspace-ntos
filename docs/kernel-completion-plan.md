@@ -12137,3 +12137,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     final completion. Do not let a local preparation failure strand a manager dispatch token, and
     do not reinterpret a hosted transport wall or I/O-manager fault synthesis as an outer-stack
     return.
+
+    Two-phase canonical PnP dispatch checkpoint (2026-08-26, crate green): `nt-io-manager` now
+    prepares a File-less canonical PnP IRP against the PDO, snapshots its complete attached stack,
+    owns the exact payload, validates the active projection, and requires a concrete in-range PnP
+    backend before returning a non-cloneable preparation token. This completes all fallible local
+    setup before the PnP manager grants lifecycle dispatch authority. A failed token acquisition can
+    therefore discard only the exact still-initialized IRP without entering a driver.
+
+    Dispatch consumes the preparation token and preserves a genuine synchronous outer return,
+    `STATUS_PENDING`, and a missing trustworthy return as distinct results. An indeterminate request
+    enters a permanent canonical barrier state instead of being freed or converted into a driver
+    failure. Pending completion records now carry the exact PnP minor and explicit `Driver` versus
+    `TransportFault` provenance; synthesized peer-fault completions can no longer advance a PnP
+    lifecycle transaction. Focused `nt-io-manager` validation is green at `195/195`, the
+    freestanding executive check remains green at the established 212-warning baseline, and `git
+    diff --check` is clean.
+
+    Review adjustment: bind the prepared canonical `IrpId` into the generation-bearing PnP manager
+    dispatch token next. Then give the hosted PnP backend an exact entry/result adapter: a real
+    dispatch-label return may produce `Returned`, a real `STATUS_PENDING` return may produce
+    `Pending`, and a hosted pump wall or handler abort must produce `Indeterminate`. Only after that
+    boundary is live may the executive replace its raw START helper and retain token plus IRP across
+    asynchronous completion.

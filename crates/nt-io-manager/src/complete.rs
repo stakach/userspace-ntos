@@ -14,7 +14,7 @@ use nt_status::NtStatus;
 use nt_types::ClientId;
 
 use crate::dispatch::DriverCompletion;
-use crate::irp::{CancelState, IrpState};
+use crate::irp::{CancelState, IrpCompletionOrigin, IrpState};
 use crate::object_port::ObjectManagerPort;
 use crate::{DeviceId, DriverId, FileId, IoManager, IrpId};
 
@@ -29,6 +29,7 @@ pub struct CompletedIrp {
     pub file_id: Option<FileId>,
     pub device_id: DeviceId,
     pub major: u8,
+    pub minor: u8,
     /// Exact backend/device that owned terminal completion and retained output.
     pub completion_driver_id: DriverId,
     pub completion_device_id: DeviceId,
@@ -37,6 +38,7 @@ pub struct CompletedIrp {
     pub status: NtStatus,
     pub information: u64,
     pub file_context: Option<u64>,
+    pub completion_origin: IrpCompletionOrigin,
 }
 
 impl<P: ObjectManagerPort> IoManager<P> {
@@ -192,7 +194,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         {
             return false;
         }
-        self.publish_verified_completion(completion)
+        self.publish_verified_completion(completion, IrpCompletionOrigin::Driver)
     }
 
     fn publish_backend_completion(
@@ -214,10 +216,30 @@ impl<P: ObjectManagerPort> IoManager<P> {
         {
             return false;
         }
-        self.publish_verified_completion(completion)
+        self.publish_verified_completion(completion, IrpCompletionOrigin::Driver)
     }
 
-    fn publish_verified_completion(&mut self, completion: DriverCompletion) -> bool {
+    pub(crate) fn publish_transport_fault_completion(
+        &mut self,
+        driver_id: DriverId,
+        completion: DriverCompletion,
+    ) -> bool {
+        if self
+            .irp(completion.irp_id)
+            .and_then(|irp| irp.current_stack())
+            .map(|stack| stack.driver_id != driver_id)
+            .unwrap_or(true)
+        {
+            return false;
+        }
+        self.publish_verified_completion(completion, IrpCompletionOrigin::TransportFault)
+    }
+
+    fn publish_verified_completion(
+        &mut self,
+        completion: DriverCompletion,
+        origin: IrpCompletionOrigin,
+    ) -> bool {
         if completion.status == NtStatus::PENDING {
             return false;
         }
@@ -235,6 +257,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             irp.status = completion.status;
             irp.information = completion.information;
             irp.completion_file_context = completion.file_context;
+            irp.completion_origin = Some(origin);
             if completion.status == NtStatus::CANCELLED {
                 irp.cancel = CancelState::Cancelled;
             }
@@ -396,6 +419,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             file_id: irp.file_id,
             device_id: irp.origin_device_id,
             major: irp.origin_major,
+            minor: irp.origin_minor,
             completion_driver_id: irp.current_stack()?.driver_id,
             completion_device_id: irp.current_stack()?.device_id,
             user_data: irp.user_data,
@@ -403,6 +427,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             status: irp.status,
             information: irp.information,
             file_context: irp.completion_file_context,
+            completion_origin: irp.completion_origin?,
         })
     }
 }

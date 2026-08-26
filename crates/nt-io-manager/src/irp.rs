@@ -240,6 +240,9 @@ pub enum IrpState {
     Queued,
     Dispatched,
     Pending,
+    /// Backend entry occurred, but the I/O manager could not observe a trustworthy outer return.
+    /// The canonical identity remains live as a teardown barrier and accepts no later completion.
+    Indeterminate,
     CancelRequested,
     Completing,
     Completed,
@@ -257,7 +260,10 @@ impl IrpState {
             (Allocated, Initialized)
                 | (Initialized, Queued | Dispatched | Cancelled | Failed)
                 | (Queued, Dispatched | Cancelled | Failed)
-                | (Dispatched, Pending | Completing | Cancelled | Failed)
+                | (
+                    Dispatched,
+                    Pending | Indeterminate | Completing | Cancelled | Failed
+                )
                 | (
                     Pending,
                     CancelRequested | Completing | Completed | Cancelled | Failed
@@ -275,6 +281,15 @@ impl IrpState {
             IrpState::Completed | IrpState::Cancelled | IrpState::Failed | IrpState::Freed
         )
     }
+}
+
+/// Provenance of an asynchronous terminal result retained by the I/O manager.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum IrpCompletionOrigin {
+    /// The owning driver backend published a genuine terminal completion.
+    Driver,
+    /// The I/O manager synthesized failure after losing the driver transport.
+    TransportFault,
 }
 
 /// Canonical I/O Manager IRP record (spec §13.1). Lives only in the I/O Manager;
@@ -296,6 +311,7 @@ pub struct IrpRecord {
     pub information: u64,
     /// Driver-owned context captured by the terminal CREATE result.
     pub completion_file_context: Option<u64>,
+    pub completion_origin: Option<IrpCompletionOrigin>,
     pub stack: Vec<IoStackLocation>,
     pub current_location: u8,
     pub buffer: Option<IoBufferRef>,
@@ -326,6 +342,7 @@ impl IrpRecord {
             status: NtStatus::PENDING,
             information: 0,
             completion_file_context: None,
+            completion_origin: None,
             stack: Vec::new(),
             current_location: 0,
             buffer: None,

@@ -46,7 +46,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .collect();
         let mut published = 0;
         for id in irps {
-            published += usize::from(self.publish_driver_completion(
+            published += usize::from(self.publish_transport_fault_completion(
                 driver,
                 DriverCompletion {
                     irp_id: id,
