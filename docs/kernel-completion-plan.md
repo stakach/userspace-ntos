@@ -12727,3 +12727,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     desktop acceptance before closing this checkpoint. Then replace the generic hive mount's fixed
     `CurrentControlSet` alias and remaining executive direct readers with the validated per-mount
     identity, perform the single composed CM publication, and delete the generated-only import.
+
+    Lossless REGF desktop acceptance (2026-08-26, accepted): serialized proof
+    `.tmp/run-desktop-regf-metadata-rerun-20260826.log` imports all five genuine ReactOS boot hives,
+    mounts the generated SYSTEM image at isolated-CM generation 1, and completes all five configured
+    PnP STARTs with two genuine pending completions and no failed, pending, or indeterminate rows.
+    Genuine userinit and Explorer reach the shell; Explorer paints all `480000/480000` pixels of the
+    `800x600` framebuffer with at least 32 non-background colours. All `296/296` executive gates pass
+    and the QEMU sentinel fires. Review adjustment: the REGF metadata prerequisite is closed. The
+    next cut is the validated per-mount `CurrentControlSet` identity; remove the global fixed alias
+    and update its callers in the same accepted change.
