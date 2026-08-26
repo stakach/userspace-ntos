@@ -28081,20 +28081,6 @@ impl ExecNtHandler {
                     Err(status) => return status,
                 };
 
-                let mut entry_count = 0usize;
-                fat_visit_directory(&fs, first_cluster, |_, _first_cluster| {
-                    entry_count = entry_count.saturating_add(1);
-                    true
-                });
-                let mut entries = alloc::vec::Vec::new();
-                if entries.try_reserve_exact(entry_count).is_err() {
-                    return STATUS_INSUFFICIENT_RESOURCES;
-                }
-                fat_visit_directory(&fs, first_cluster, |entry, _first_cluster| {
-                    entries.push(entry);
-                    true
-                });
-
                 let scratch_len = length.min(DIR_QUERY_SCRATCH_CAP);
                 let encoded = core::slice::from_raw_parts_mut(
                     core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
@@ -28102,6 +28088,20 @@ impl ExecNtHandler {
                 );
                 encoded.fill(0);
                 let result = {
+                    let _transient = allocator::enter_transient();
+                    let mut entry_count = 0usize;
+                    fat_visit_directory(&fs, first_cluster, |_, _first_cluster| {
+                        entry_count = entry_count.saturating_add(1);
+                        true
+                    });
+                    let mut entries = alloc::vec::Vec::new();
+                    if entries.try_reserve_exact(entry_count).is_err() {
+                        return STATUS_INSUFFICIENT_RESOURCES;
+                    }
+                    fat_visit_directory(&fs, first_cluster, |entry, _first_cluster| {
+                        entries.push(entry);
+                        true
+                    });
                     let directory = match self.directory_opens.get_mut(object_id) {
                         Ok(directory) => directory,
                         Err(status) => return status,

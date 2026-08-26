@@ -13685,3 +13685,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and the complete 480,000-pixel shell framebuffer. Scratch returned to zero and peak usage stayed
     278,112 B of 4,194,304 B. Next split synchronous directory-file capture/encoding from APC,
     pending-IRP, event, and IOCP publication before moving its temporary entry vectors to scratch.
+
+    Directory-file capture/publication split (2026-08-27, accepted): the read-only FAT branch of
+    `NtQueryDirectoryFile` now owns immutable directory-entry collection and synchronous `nt-fs`
+    encoding inside a lexical transient scope. Only the scalar query result and the fixed
+    `OVERLAY_WRITE_SCRATCH` output survive that scope. Caller copyout, APC enqueue, event signaling,
+    and waiter wake remain outside scratch, so no pending or completion state can inherit transient
+    lifetime. Writable-overlay directory enumeration already uses fixed storage and needed no heap
+    migration.
+
+    Serialized acceptance `.tmp/run-headless-directory-file-capture-scope-20260827.log` passed all
+    `295/295` gates, including writable-overlay directory queries, profile materialisation and copy,
+    user-hive load, userinit, Explorer, and the complete framebuffer. Scratch returned to zero with
+    the unchanged 278,112 B peak. Final durable allocation was 14,810,848 B with 6,160,544 B
+    reusable.
+
+    Review adjustment: next inventory capture helpers in create, open, and delete operations. Do
+    not broad-scope any arm that mints handles, grows namespace or cache tables, journals CM
+    mutations, queues asynchronous state, or parks. Prefer short scratch capture phases followed by
+    explicit durable publication, and leave already bounded stack captures unchanged.
