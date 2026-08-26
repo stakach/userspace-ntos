@@ -2503,6 +2503,15 @@ dispatch closes the completion-before-caller race without monopolising the execu
 Focused validation is green at `nt-io-manager` `195/195`, `nt-pnp-manager` `14/14`, the freestanding
 executive check is back at the established 212-warning baseline, and `git diff --check` is clean.
 
+Serialized validation (2026-08-26, accepted): the committed-state run
+`.tmp/run-desktop-pnp-start-integrity-20260826.log` completes real E1000, DMA-test, and bochsmp
+STARTs through the canonical transaction and reports
+`terminal/failed/pending/pending-observed/indeterminate=3/0/0/0/0`, with both first-error fields at
+`STATUS_SUCCESS`. The bochsmp route publishes only after its returned START and exact resource
+evidence. Genuine userinit and Explorer launch, Explorer executes 665 real api0 callbacks, and the
+shell paints all `480000/480000` framebuffer pixels with at least 32 non-background colours. All
+`294/294` executive gates pass and the sentinel fires. QEMU was stopped only after the sentinel.
+
 Review adjustment: asynchronous demand start is not complete yet. An outstanding START currently
 remains loaded and returns the intermediate `STATUS_PENDING` result instead of illegally unloading,
 but NT `NtLoadDriver` semantics require one terminal reply. Replace the batch-local loop with a
