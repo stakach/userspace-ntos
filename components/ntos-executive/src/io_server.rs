@@ -34,7 +34,10 @@ fn park() -> ! {
 
 #[no_mangle]
 #[link_section = ".text.io_server_entry"]
-pub unsafe extern "C" fn io_server_entry() -> ! {
+pub unsafe extern "C" fn io_server_entry(heap_frames: u64) -> ! {
+    if !unsafe { allocator::initialize_mapped_heap(heap_frames) } {
+        park();
+    }
     let mut submissions = match Consumer::<SurtSqe>::attach(SUB_RING_VADDR as *mut u8, RING_LEN) {
         Ok(c) => c,
         Err(_) => park(),

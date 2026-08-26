@@ -39,22 +39,21 @@ use nt_hosted_runtime::{
     hosted_provider_has_export_marshal_policies, hosted_provider_internal_marshal_policy,
     ndis_miniport_characteristics_layout, ndis_protocol_characteristics_layout,
     plan_hosted_driver_image, plan_hosted_provider_import_binding,
-    plan_hosted_provider_import_thunk, HostedDriverImagePlanError, HostedProviderArgumentMarshal,
+    plan_hosted_provider_import_thunk, HostedDriverImagePlanError, HostedOneShotCallbackError,
+    HostedOneShotCallbackState, HostedOneShotCallbackToken, HostedProviderArgumentMarshal,
     HostedProviderCallbackThunkPlan, HostedProviderDomainDescriptor, HostedProviderDomainError,
     HostedProviderDomainStatus, HostedProviderExportCallPlan, HostedProviderExportMarshalPolicy,
     HostedProviderExportResultSemantics, HostedProviderExportSideEffect,
     HostedProviderImportBinding, HostedProviderImportBindingError, HostedProviderImportThunkError,
     HostedProviderImportThunkPlan, HostedProviderObjectOwner, HostedProviderReleaseProgress,
-    HostedOneShotCallbackError, HostedOneShotCallbackState, HostedOneShotCallbackToken,
     HostedThunkLeaseRelease, HostedThunkReservation, HostedThunkSlotKey, HostedThunkSlotRegistry,
     HostedThunkSlotToken, NdisMiniportCharacteristicsLayoutError,
-    NdisProtocolCharacteristicsLayoutError,
-    DC21X4_ADAPTER_CURRENT_INTERRUPT_MASK_OFFSET_X64, DC21X4_ADAPTER_CURRENT_RBD_OFFSET_X64,
-    DC21X4_ADAPTER_FLAGS_OFFSET_X64, DC21X4_ADAPTER_HEAD_RBD_OFFSET_X64,
-    DC21X4_ADAPTER_INTERRUPT_STATUS_OFFSET_X64, DC21X4_ADAPTER_TAIL_RBD_OFFSET_X64,
-    HOSTED_PROVIDER_EXPORT_ARG_CAP, HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN,
-    NDIS_MINIPORT_CHARACTERISTICS_CALLBACK_CAP,
-    NDIS_MINIPORT_BLOCK_ETH_DB_OFFSET_X64, NDIS_MINIPORT_BLOCK_ETH_RX_COMPLETE_HANDLER_OFFSET_X64,
+    NdisProtocolCharacteristicsLayoutError, DC21X4_ADAPTER_CURRENT_INTERRUPT_MASK_OFFSET_X64,
+    DC21X4_ADAPTER_CURRENT_RBD_OFFSET_X64, DC21X4_ADAPTER_FLAGS_OFFSET_X64,
+    DC21X4_ADAPTER_HEAD_RBD_OFFSET_X64, DC21X4_ADAPTER_INTERRUPT_STATUS_OFFSET_X64,
+    DC21X4_ADAPTER_TAIL_RBD_OFFSET_X64, HOSTED_PROVIDER_EXPORT_ARG_CAP,
+    HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN, NDIS_MINIPORT_BLOCK_ETH_DB_OFFSET_X64,
+    NDIS_MINIPORT_BLOCK_ETH_RX_COMPLETE_HANDLER_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_ETH_RX_INDICATE_HANDLER_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_MINIPORT_ADAPTER_CONTEXT_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_MINIPORT_NAME_OFFSET_X64,
@@ -66,8 +65,9 @@ use nt_hosted_runtime::{
     NDIS_MINIPORT_BLOCK_SET_COMPLETE_HANDLER_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_STATUS_COMPLETE_HANDLER_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_STATUS_HANDLER_OFFSET_X64,
-    NDIS_MINIPORT_BLOCK_TD_COMPLETE_HANDLER_OFFSET_X64, NDIS_MINIPORT_INTERRUPT_LEN_X64,
-    NDIS_MINIPORT_TIMER_LEN_X64, NDIS_PROTOCOL_CHARACTERISTICS_NAME_OFFSET_X64,
+    NDIS_MINIPORT_BLOCK_TD_COMPLETE_HANDLER_OFFSET_X64, NDIS_MINIPORT_CHARACTERISTICS_CALLBACK_CAP,
+    NDIS_MINIPORT_INTERRUPT_LEN_X64, NDIS_MINIPORT_TIMER_LEN_X64,
+    NDIS_PROTOCOL_CHARACTERISTICS_NAME_OFFSET_X64,
 };
 use nt_io_abi::{ioctl, major, IrpDispatchRequest, IO_ABI_VERSION};
 use nt_io_manager::{
@@ -75,12 +75,11 @@ use nt_io_manager::{
     BankedTransferCursor, CreateOptions, DeviceCharacteristics, DeviceControlParameters,
     DeviceFlags, DeviceType, DispatchContext, DispatchOutcome, DispatchTarget,
     DriverDispatchBackend, DriverId, DriverPeerId, ExternalDispatchResult,
-    ExternalPnpDispatchResult, FileId,
-    HostedDevicePropertyOwner, HostedDevicePropertyTransferError,
-    HostedDevicePropertyTransferTable, HostedDomainIdentity, InformationParameters, IoManager,
-    IoParameters, IrpCompletionOrigin, IrpId, IrpProjection, MajorFunctionTable,
-    ObjectManagerPort, PnpBackendDispatch, PnpParameters, ReadWriteParameters, ShareAccess,
-    WdmDriverObjectInit, WdmFileObjectInit, WdmIoStackLocationInit,
+    ExternalPnpDispatchResult, FileId, FileState, HostedDevicePropertyOwner,
+    HostedDevicePropertyTransferError, HostedDevicePropertyTransferTable, HostedDomainIdentity,
+    InformationParameters, IoManager, IoParameters, IrpCompletionOrigin, IrpId, IrpProjection,
+    MajorFunctionTable, ObjectManagerPort, PnpBackendDispatch, PnpParameters, ReadWriteParameters,
+    ShareAccess, WdmDriverObjectInit, WdmFileObjectInit, WdmIoStackLocationInit,
     WdmIoStackParameters, WdmIrpInit, WDM_X64_DRIVER_EXTENSION_OFFSET,
     WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET,
     WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET, WDM_X64_FILE_OBJECT_SIZE,
@@ -15021,8 +15020,7 @@ struct HostedProviderCallbackParent {
     dependent_instance: usize,
     kind: u8,
     provider_handle: u64,
-    bindings: [Option<HostedExecutableThunkBinding>;
-        NDIS_MINIPORT_CHARACTERISTICS_CALLBACK_CAP],
+    bindings: [Option<HostedExecutableThunkBinding>; NDIS_MINIPORT_CHARACTERISTICS_CALLBACK_CAP],
     binding_count: usize,
 }
 
@@ -15426,8 +15424,7 @@ unsafe fn hosted_provider_callback_records() -> Option<&'static Vec<HostedProvid
     (&*core::ptr::addr_of!(HOSTED_PROVIDER_CALLBACK_RECORDS)).as_ref()
 }
 
-unsafe fn hosted_provider_callback_parents_mut(
-) -> &'static mut Vec<HostedProviderCallbackParent> {
+unsafe fn hosted_provider_callback_parents_mut() -> &'static mut Vec<HostedProviderCallbackParent> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_PROVIDER_CALLBACK_PARENTS);
     if slot.is_none() {
         *slot = Some(Vec::new());
@@ -15435,8 +15432,7 @@ unsafe fn hosted_provider_callback_parents_mut(
     slot.as_mut().unwrap()
 }
 
-unsafe fn hosted_provider_callback_parents(
-) -> Option<&'static Vec<HostedProviderCallbackParent>> {
+unsafe fn hosted_provider_callback_parents() -> Option<&'static Vec<HostedProviderCallbackParent>> {
     (&*core::ptr::addr_of!(HOSTED_PROVIDER_CALLBACK_PARENTS)).as_ref()
 }
 
@@ -16789,10 +16785,7 @@ unsafe fn retain_indeterminate_hosted_provider_callback_parent(index: usize) {
     }
 }
 
-unsafe fn retain_hosted_provider_callback_parent_compensation(
-    index: usize,
-    provider_handle: u64,
-) {
+unsafe fn retain_hosted_provider_callback_parent_compensation(index: usize, provider_handle: u64) {
     if let Some(parent) = hosted_provider_callback_parents_mut().get_mut(index) {
         if parent.present
             && parent.construction_state == HostedProviderConstructionState::Constructing
@@ -16878,7 +16871,8 @@ unsafe fn clear_hosted_provider_callback_parents_for_instance(
     let parent_count = hosted_provider_callback_parents().map_or(0, Vec::len);
     let mut failures = 0u64;
     for index in 0..parent_count {
-        let Some(parent) = hosted_provider_callback_parents().and_then(|rows| rows.get(index)) else {
+        let Some(parent) = hosted_provider_callback_parents().and_then(|rows| rows.get(index))
+        else {
             continue;
         };
         if !parent.present
@@ -16951,9 +16945,9 @@ unsafe fn hosted_provider_callback_records_reference_route(
     hosted_provider_callback_records().is_some_and(|records| {
         records.iter().any(|record| {
             record.present
-            && record.provider_domain == route.provider_domain
-            && record.dependent_domain == route.dependent_domain
-            && record.provider_publication_cookie == route.provider_publication_cookie
+                && record.provider_domain == route.provider_domain
+                && record.dependent_domain == route.dependent_domain
+                && record.provider_publication_cookie == route.provider_publication_cookie
         })
     })
 }
@@ -17077,9 +17071,9 @@ unsafe fn hosted_provider_callback_records_reference_dependency(
     hosted_provider_callback_records().is_some_and(|records| {
         records.iter().any(|record| {
             record.present
-            && record.provider_domain == dependency.provider_domain
-            && record.dependent_domain == dependency.dependent_domain
-            && record.provider_publication_cookie == dependency.provider_publication_cookie
+                && record.provider_domain == dependency.provider_domain
+                && record.dependent_domain == dependency.dependent_domain
+                && record.provider_publication_cookie == dependency.provider_publication_cookie
         })
     })
 }
@@ -21584,18 +21578,20 @@ unsafe fn clear_hosted_provider_miniport_timer_shadows_for_instance(
         }
         if record.callback_binding.is_some()
             || !hosted_provider_object_owner_matches_instance(
-            record.owner,
-            record.provider_instance,
-            record.dependent_instance,
-            instance_index,
-            domain,
-        ) || !release_hosted_provider_owned_pool_allocation(
-            record.owner,
-            record.provider_instance,
-            record.dependent_instance,
-            record.provider_instance,
-            record.provider_component_va,
-        ) {
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+                instance_index,
+                domain,
+            )
+            || !release_hosted_provider_owned_pool_allocation(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+                record.provider_instance,
+                record.provider_component_va,
+            )
+        {
             failures += 1;
         } else {
             *record = HostedProviderMiniportTimerShadow::empty();
@@ -21787,13 +21783,16 @@ unsafe fn hosted_provider_ndis_work_item_shadow(
     if !shadow.preparing.is_empty() {
         return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
     }
-    let schedule_token = shadow.schedule_state.begin_schedule().map_err(|error| match error {
-        HostedOneShotCallbackError::Busy => nt_status::NtStatus::DEVICE_BUSY.raw(),
-        HostedOneShotCallbackError::GenerationExhausted => STATUS_INSUFFICIENT_RESOURCES,
-        HostedOneShotCallbackError::Indeterminate
-        | HostedOneShotCallbackError::InvalidToken
-        | HostedOneShotCallbackError::InvalidTransition => STATUS_DEVICE_NOT_READY,
-    })?;
+    let schedule_token = shadow
+        .schedule_state
+        .begin_schedule()
+        .map_err(|error| match error {
+            HostedOneShotCallbackError::Busy => nt_status::NtStatus::DEVICE_BUSY.raw(),
+            HostedOneShotCallbackError::GenerationExhausted => STATUS_INSUFFICIENT_RESOURCES,
+            HostedOneShotCallbackError::Indeterminate
+            | HostedOneShotCallbackError::InvalidToken
+            | HostedOneShotCallbackError::InvalidTransition => STATUS_DEVICE_NOT_READY,
+        })?;
     if !store_hosted_provider_ndis_work_item_shadow(index, shadow) {
         if constructing {
             rollback_hosted_provider_ndis_work_item_construction(index);
@@ -21895,7 +21894,8 @@ unsafe fn rollback_hosted_provider_ndis_work_item_construction(index: usize) {
         return;
     }
     record.construction_state = HostedProviderConstructionState::RollingBack;
-    if !record.queued.is_empty() || !record.active.is_empty() || !record.schedule_state.can_retire() {
+    if !record.queued.is_empty() || !record.active.is_empty() || !record.schedule_state.can_retire()
+    {
         record.construction_state = HostedProviderConstructionState::CompensationRequired;
         return;
     }
@@ -21933,7 +21933,12 @@ unsafe fn retain_indeterminate_hosted_provider_ndis_work_item_schedule(
     token: HostedOneShotCallbackToken,
 ) {
     if let Some(record) = hosted_provider_ndis_work_item_shadows_mut().get_mut(index) {
-        if record.present && record.schedule_state.mark_schedule_indeterminate(token).is_ok() {
+        if record.present
+            && record
+                .schedule_state
+                .mark_schedule_indeterminate(token)
+                .is_ok()
+        {
             record.construction_state = HostedProviderConstructionState::CompensationRequired;
         }
     }
@@ -22009,18 +22014,20 @@ unsafe fn clear_hosted_provider_ndis_work_item_shadows_for_instance(
             || !record.active.is_empty()
             || !record.schedule_state.can_retire()
             || !hosted_provider_object_owner_matches_instance(
-            record.owner,
-            record.provider_instance,
-            record.dependent_instance,
-            instance_index,
-            domain,
-        ) || !release_hosted_provider_owned_pool_allocation(
-            record.owner,
-            record.provider_instance,
-            record.dependent_instance,
-            record.provider_instance,
-            record.provider_component_va,
-        ) {
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+                instance_index,
+                domain,
+            )
+            || !release_hosted_provider_owned_pool_allocation(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+                record.provider_instance,
+                record.provider_component_va,
+            )
+        {
             failures += 1;
         } else {
             *record = HostedProviderNdisWorkItemShadow::empty();
@@ -22095,7 +22102,8 @@ unsafe fn observe_hosted_provider_ndis_work_item_callback(
 unsafe fn mark_hosted_provider_ndis_work_item_dispatch_indeterminate(
     dispatch: HostedProviderNdisWorkItemDispatch,
 ) {
-    if let Some(record) = hosted_provider_ndis_work_item_shadows_mut().get_mut(dispatch.shadow_index)
+    if let Some(record) =
+        hosted_provider_ndis_work_item_shadows_mut().get_mut(dispatch.shadow_index)
     {
         if record.present
             && record.active.token == Some(dispatch.token)
@@ -22806,8 +22814,7 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
     let owner = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
         .ok_or(STATUS_DEVICE_NOT_READY)?;
     let mirror_records = hosted_provider_ndis_miniport_block_mirrors_mut();
-    if mirror_records.iter().all(|record| record.present)
-        && mirror_records.try_reserve(1).is_err()
+    if mirror_records.iter().all(|record| record.present) && mirror_records.try_reserve(1).is_err()
     {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
@@ -22856,8 +22863,7 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
         dependent_component_va,
         ..HostedProviderNdisMiniportBlockMirror::empty()
     };
-    let Some(construction_index) =
-        reserve_hosted_provider_ndis_miniport_block_mirror(mirror)
+    let Some(construction_index) = reserve_hosted_provider_ndis_miniport_block_mirror(mirror)
     else {
         hosted_instance_pool_free(dependent_inst, dependent_component_va);
         return Err(STATUS_INSUFFICIENT_RESOURCES);
@@ -23079,18 +23085,20 @@ unsafe fn clear_hosted_provider_ndis_miniport_block_mirrors_for_instance(
             .iter()
             .any(Option::is_some)
             || !hosted_provider_object_owner_matches_instance(
-            record.owner,
-            record.provider_instance,
-            record.dependent_instance,
-            instance_index,
-            domain,
-        ) || !release_hosted_provider_owned_pool_allocation(
-            record.owner,
-            record.provider_instance,
-            record.dependent_instance,
-            record.dependent_instance,
-            record.dependent_component_va,
-        ) {
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+                instance_index,
+                domain,
+            )
+            || !release_hosted_provider_owned_pool_allocation(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+                record.dependent_instance,
+                record.dependent_component_va,
+            )
+        {
             failures += 1;
         } else {
             *record = HostedProviderNdisMiniportBlockMirror::empty();
@@ -23711,8 +23719,8 @@ unsafe fn provider_marshal_miniport_timer_function(
     if target == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    let Some(record) = hosted_provider_miniport_timer_shadows_mut()
-        .get_mut(state.miniport_timer_shadow_index)
+    let Some(record) =
+        hosted_provider_miniport_timer_shadows_mut().get_mut(state.miniport_timer_shadow_index)
     else {
         return Err(STATUS_INVALID_PARAMETER);
     };
@@ -23757,12 +23765,12 @@ unsafe fn provider_marshal_ndis_work_item(
 ) -> Result<u64, i32> {
     let (provider_component_va, construction_index, constructing, schedule_token) =
         hosted_provider_ndis_work_item_shadow(
-        provider_instance,
-        provider_inst,
-        dependent_index,
-        dependent_inst,
-        arg_value,
-    )?;
+            provider_instance,
+            provider_inst,
+            dependent_index,
+            dependent_inst,
+            arg_value,
+        )?;
     state.ndis_work_item_construction_index = construction_index;
     state.ndis_work_item_schedule_token = Some(schedule_token);
     state.ndis_work_item_parent_constructing = constructing;
@@ -26796,9 +26804,9 @@ unsafe fn drain_hosted_work_queue_for_instance(
             [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
         ) {
             Ok(_) => {
-                if ndis_work_dispatch
-                    .is_some_and(|dispatch| !complete_hosted_provider_ndis_work_item_dispatch(dispatch))
-                {
+                if ndis_work_dispatch.is_some_and(|dispatch| {
+                    !complete_hosted_provider_ndis_work_item_dispatch(dispatch)
+                }) {
                     register_instance_ready(instance_index, false);
                     write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, saved_irql);
                     return Err(STATUS_DEVICE_NOT_READY);
@@ -28236,7 +28244,8 @@ unsafe fn service_ndis_work_item_callback(
         HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_INVALID_PARAMETER);
     };
-    if shadow.dependent_instance != record.dependent_instance || shadow.dependent_component_va == 0 {
+    if shadow.dependent_instance != record.dependent_instance || shadow.dependent_component_va == 0
+    {
         HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_INVALID_PARAMETER);
     }
@@ -30287,7 +30296,10 @@ unsafe fn component_dispatch_provider_callback_wait_request() {
 /// Runs in the isolated component's VSpace (executive image mapped RWX-shared).
 #[no_mangle]
 #[link_section = ".text.fsd_component_entry"]
-pub unsafe extern "C" fn fsd_component_entry() -> ! {
+pub unsafe extern "C" fn fsd_component_entry(heap_frames: u64) -> ! {
+    if !unsafe { allocator::initialize_mapped_heap(heap_frames) } {
+        park();
+    }
     let entry_rva = read_volatile((FSD_SHARED_VADDR + SH_ENTRY_RVA) as *const u64) as u32;
     print_str(b"[fsd-host] START DriverEntry rva=0x");
     print_hex(entry_rva);
@@ -33754,8 +33766,7 @@ unsafe fn hosted_resource_map_caps_mut() -> &'static mut Vec<HostedResourceMapCa
 unsafe fn reserve_hosted_resource_map_caps(additional: usize) -> Result<(), nt_status::NtStatus> {
     let caps = hosted_resource_map_caps_mut();
     let old_capacity = caps.capacity();
-    caps
-        .try_reserve_exact(additional)
+    caps.try_reserve_exact(additional)
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     if caps.capacity() != old_capacity {
         crate::mark_durable_table_growth_dirty();
@@ -34036,11 +34047,14 @@ fn io_manager_mut() -> &'static mut ExecutiveIoManager {
 }
 
 fn pump_io_manager(io: &mut ExecutiveIoManager) -> usize {
-    let report = io.pump_with_report();
-    if report.storage_grew {
-        crate::mark_durable_table_growth_dirty();
-    }
-    report.progress
+    io.pump_with_report().progress
+}
+
+/// Consume the manager's complete durable-allocation signal. Unlike the pump
+/// report, this includes canonical driver/device/File/IRP/domain records and
+/// their record-owned heap data regardless of which operation created them.
+pub(crate) fn take_io_manager_durable_storage_dirty() -> bool {
+    io_manager_mut().take_durable_storage_dirty()
 }
 
 fn copy_completed_external_irp_by_id(
@@ -34200,7 +34214,15 @@ unsafe fn drain_hosted_pnp_completions() -> usize {
     let mut progress = 0usize;
     let mut index = 0usize;
     while index < hosted_pnp_transactions_mut().len() {
-        let (irp_id, phase, minor, binding, origin_driver_id, completion_driver_id, completion_device_id) = {
+        let (
+            irp_id,
+            phase,
+            minor,
+            binding,
+            origin_driver_id,
+            completion_driver_id,
+            completion_device_id,
+        ) = {
             let transaction = &hosted_pnp_transactions_mut()[index];
             (
                 transaction.irp_id,
@@ -34223,8 +34245,7 @@ unsafe fn drain_hosted_pnp_completions() -> usize {
                     && completion.client_id == ClientId(IO_MANAGER_COMPONENT_ID)
                     && completion.file_id.is_none()
                     && completion.driver_id == origin_driver_id
-                    && completion.device_id
-                        == nt_io_manager::DeviceId(binding.pdo_device_id)
+                    && completion.device_id == nt_io_manager::DeviceId(binding.pdo_device_id)
                     && completion.major == major::IRP_MJ_PNP
                     && completion.minor == minor.raw()
                     && completion.completion_driver_id == completion_driver_id
@@ -34339,13 +34360,11 @@ pub(crate) unsafe fn observe_hosted_pnp_start(
                     .expect("terminal hosted PnP START has no driver status"),
             })
         }
-        HostedPnpTransactionPhase::Indeterminate => {
-            Ok(HostedPnpStartObservation::Indeterminate {
-                transport_status: transactions[index]
-                    .barrier_status
-                    .expect("indeterminate hosted PnP START has no barrier status"),
-            })
-        }
+        HostedPnpTransactionPhase::Indeterminate => Ok(HostedPnpStartObservation::Indeterminate {
+            transport_status: transactions[index]
+                .barrier_status
+                .expect("indeterminate hosted PnP START has no barrier status"),
+        }),
         HostedPnpTransactionPhase::Prepared
         | HostedPnpTransactionPhase::Dispatching
         | HostedPnpTransactionPhase::AwaitingCompletion
@@ -35382,7 +35401,9 @@ struct HostedPnpTransaction {
 pub(crate) enum HostedPnpStartOutcome {
     Started,
     Failed(nt_status::NtStatus),
-    Pending { irp_id: u64 },
+    Pending {
+        irp_id: u64,
+    },
     Indeterminate {
         irp_id: u64,
         transport_status: nt_status::NtStatus,
@@ -35837,9 +35858,7 @@ unsafe fn complete_hosted_pnp_lifecycle(
         .map_err(hosted_pnp_status)
 }
 
-unsafe fn finish_hosted_start_publication(
-    irp_id: IrpId,
-) -> Result<(), nt_status::NtStatus> {
+unsafe fn finish_hosted_start_publication(irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
     let transaction = hosted_pnp_transactions_mut()
         .iter()
         .find(|transaction| transaction.irp_id == irp_id)
@@ -36158,16 +36177,16 @@ fn hosted_pnp_status(error: nt_pnp_manager::PnpError) -> nt_status::NtStatus {
         nt_pnp_manager::PnpError::InsufficientResources => {
             nt_status::NtStatus::INSUFFICIENT_RESOURCES
         }
-        nt_pnp_manager::PnpError::ConflictingPdo
-        | nt_pnp_manager::PnpError::ConflictingStack => {
+        nt_pnp_manager::PnpError::ConflictingPdo | nt_pnp_manager::PnpError::ConflictingStack => {
             nt_status::NtStatus::OBJECT_NAME_COLLISION
         }
         nt_pnp_manager::PnpError::DispatchInFlight => nt_status::NtStatus::DEVICE_BUSY,
         nt_pnp_manager::PnpError::StaleId | nt_pnp_manager::PnpError::StaleDispatch => {
             nt_status::NtStatus::INVALID_DEVICE_REQUEST
         }
-        nt_pnp_manager::PnpError::InvalidIdentity
-        | nt_pnp_manager::PnpError::InvalidTransition => nt_status::NtStatus::INVALID_PARAMETER,
+        nt_pnp_manager::PnpError::InvalidIdentity | nt_pnp_manager::PnpError::InvalidTransition => {
+            nt_status::NtStatus::INVALID_PARAMETER
+        }
     }
 }
 
@@ -39193,8 +39212,9 @@ static mut DRIVER_INSTANCES: Option<Vec<DriverInstance>> = None;
 /// a small, copyable routing snapshot used throughout nested provider dispatch; embedding the fixed
 /// slot ledger there makes every snapshot copy the entire thunk arena's lifetime state onto the
 /// root-task stack.
-static mut DRIVER_INSTANCE_THUNK_SLOTS:
-    Option<Vec<HostedThunkSlotRegistry<HOSTED_EXECUTABLE_THUNK_SLOT_COUNT>>> = None;
+static mut DRIVER_INSTANCE_THUNK_SLOTS: Option<
+    Vec<HostedThunkSlotRegistry<HOSTED_EXECUTABLE_THUNK_SLOT_COUNT>>,
+> = None;
 
 #[derive(Clone, Copy)]
 struct ActiveHostedIrpTransfer {
@@ -39455,8 +39475,7 @@ unsafe fn hosted_driver_timer_queue_mut(
     (&mut queues[instance], grew)
 }
 
-unsafe fn hosted_driver_dpc_activations_mut(
-) -> &'static mut Vec<HostedDriverDpcActivation> {
+unsafe fn hosted_driver_dpc_activations_mut() -> &'static mut Vec<HostedDriverDpcActivation> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DRIVER_DPC_ACTIVATIONS);
     if slot.is_none() {
         *slot = Some(Vec::new());
@@ -40074,9 +40093,7 @@ unsafe fn commit_instance_executable_thunk(
         return instance(instance_index).is_some()
             && driver_instance_thunk_slots()
                 .and_then(|registries| registries.get(instance_index))
-                .is_some_and(|registry| {
-                    registry.is_live(reservation.token, reservation.key)
-                });
+                .is_some_and(|registry| registry.is_live(reservation.token, reservation.key));
     }
     instance(instance_index).is_some()
         && ensure_driver_instance_thunk_slots(instance_index)
@@ -44681,6 +44698,18 @@ pub(crate) fn hosted_file_exists(file_id: u64) -> bool {
     io_manager_mut().file(FileId(file_id)).is_some()
 }
 
+fn hosted_file_state_code(state: FileState) -> u64 {
+    match state {
+        FileState::Allocated => 1,
+        FileState::CreateIrpDispatched => 2,
+        FileState::Open => 3,
+        FileState::CleanupPending => 4,
+        FileState::CleanupComplete => 5,
+        FileState::ClosePending => 6,
+        FileState::Closed => 7,
+    }
+}
+
 /// Dispatch one IRP through a canonical File. The manager derives the mutable
 /// FsContext payload from that File record and attaches the exact FileId to the
 /// IRP; callers cannot supply an independent identity cookie.
@@ -44714,9 +44743,46 @@ pub(crate) unsafe fn dispatch_hosted_file_irp_result_exact(
 /// Begin canonical CLEANUP/CLOSE after the executive's final process handle
 /// reference is gone. Retry and pending completion remain manager-owned.
 pub(crate) fn release_hosted_file(file_id: u64) -> Result<(), u32> {
-    io_manager_mut()
+    release_hosted_file_with_provenance(file_id, b"final-handle")
+}
+
+/// Abandon a canonical File whose process-handle publication never committed.
+/// This shares the manager state machine with final-handle release, but remains
+/// a distinct integration boundary so a rollback cannot masquerade as CLEANUP.
+pub(crate) fn abandon_unpublished_hosted_file(file_id: u64) -> Result<(), u32> {
+    release_hosted_file_with_provenance(file_id, b"unpublished")
+}
+
+fn release_hosted_file_with_provenance(file_id: u64, provenance: &[u8]) -> Result<(), u32> {
+    let io = io_manager_mut();
+    let before = io.file(FileId(file_id)).map(|file| {
+        (
+            hosted_file_state_code(file.state),
+            file.outstanding_irp_refs as u64,
+            file.close_deferred,
+        )
+    });
+    print_str(b"[hosted-file-release] owner=");
+    print_str(provenance);
+    print_str(b" file=0x");
+    print_hex64(file_id);
+    if let Some((state, refs, deferred)) = before {
+        print_str(b" state=");
+        print_hex64(state);
+        print_str(b" irp-refs=");
+        print_hex64(refs);
+        print_str(b" deferred=");
+        print_hex64(deferred as u64);
+    } else {
+        print_str(b" state=missing");
+    }
+    let result = io
         .release_external_file(ClientId(IO_MANAGER_COMPONENT_ID), FileId(file_id))
-        .map_err(|status| status.raw() as u32)
+        .map_err(|status| status.raw() as u32);
+    print_str(b" status=0x");
+    print_hex64(result.as_ref().err().copied().unwrap_or(0) as u64);
+    print_str(b"\n");
+    result
 }
 
 fn hosted_device_ready_for_dispatch(device_id: u64) -> bool {

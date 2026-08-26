@@ -166,17 +166,8 @@ unsafe fn gdi_uservm_mapped_rows() -> &'static [AtomicU64] {
     (&*core::ptr::addr_of!(GDI_USERVM_CLIENT_MAPPED_FRAMES)).as_slice()
 }
 
-pub(crate) fn win32k_client_process_row_stats() -> (
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    u64,
-) {
+pub(crate) fn win32k_client_process_row_stats(
+) -> (usize, usize, usize, usize, usize, usize, usize, usize, u64) {
     unsafe {
         let cap_rows = &*core::ptr::addr_of!(WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI);
         let heap_rows = &*core::ptr::addr_of!(WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES);
@@ -324,9 +315,7 @@ pub(crate) fn acquire_win32k_message_stage() -> Option<nt_user_callback::Dispatc
     }
 }
 
-pub(crate) fn release_win32k_message_stage(
-    stage: nt_user_callback::DispatchOutputStage,
-) -> bool {
+pub(crate) fn release_win32k_message_stage(stage: nt_user_callback::DispatchOutputStage) -> bool {
     let Some(offset) = stage
         .provider_pointer
         .checked_sub(win32k_subsystem::WIN32K_MESSAGE_STAGE_BASE)

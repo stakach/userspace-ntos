@@ -157,9 +157,9 @@ pub const CM_SUB_VADDR: u64 = 0x0000_0100_1054_0000;
 pub const CM_COMP_VADDR: u64 = 0x0000_0100_1055_0000;
 pub const CM_REQ_VADDR: u64 = 0x0000_0100_1056_0000;
 pub const CM_REP_VADDR: u64 = 0x0000_0100_1057_0000;
-/// CM atomically owns the encoded SYSTEM image, decoded hive, and semantic indexes during mount.
-/// Other isolated services retain the default 512 KiB profile.
-pub const CONFIG_MANAGER_SERVICE_HEAP_FRAMES: u64 = 1024;
+/// CM atomically owns the encoded SYSTEM image, decoded hive, semantic indexes, and runtime
+/// transaction snapshots. Other isolated services retain the default 512 KiB profile.
+pub const CONFIG_MANAGER_SERVICE_HEAP_FRAMES: u64 = allocator::HEAP_FRAMES;
 const _: () = assert!(CONFIG_MANAGER_SERVICE_HEAP_FRAMES <= allocator::HEAP_FRAMES);
 // A THIRD ring set — the executive's side of the I/O Manager service.
 pub const IO_SUB_VADDR: u64 = 0x0000_0100_1058_0000;
@@ -2196,6 +2196,7 @@ static ROOT_CSPACE_START: AtomicU64 = AtomicU64::new(0);
 const ROOT_SLOT_RECYCLE_CAP: usize = 32768;
 const ROOT_SLOT_TRACK_CAP: usize = 1 << 19;
 const ROOT_SLOT_LIVE_WORDS: usize = ROOT_SLOT_TRACK_CAP / 64;
+const ROOT_RETYPE_FAN_OUT_LIMIT: u64 = 256;
 static mut ROOT_SLOT_RECYCLE: [u64; ROOT_SLOT_RECYCLE_CAP] = [0; ROOT_SLOT_RECYCLE_CAP];
 static ROOT_SLOT_RECYCLE_N: AtomicU64 = AtomicU64::new(0);
 static ROOT_SLOT_RECYCLE_HW: AtomicU64 = AtomicU64::new(0);
@@ -2203,6 +2204,13 @@ static ROOT_SLOT_RECYCLE_REUSED: AtomicU64 = AtomicU64::new(0);
 static ROOT_SLOT_RECYCLE_DROPPED: AtomicU64 = AtomicU64::new(0);
 static ROOT_SLOT_RECYCLE_CORRUPT: AtomicU64 = AtomicU64::new(0);
 static mut ROOT_SLOT_LIVE_BITS: [u64; ROOT_SLOT_LIVE_WORDS] = [0; ROOT_SLOT_LIVE_WORDS];
+/// Root-CNode slots whose caps back the executive's own address space. These are lifetime-owned by
+/// the rootserver and must never enter a transient teardown path.
+static mut ROOT_SLOT_PINNED_BITS: [u64; ROOT_SLOT_LIVE_WORDS] = [0; ROOT_SLOT_LIVE_WORDS];
+static ROOT_SLOT_PINNED_COUNT: AtomicU64 = AtomicU64::new(0);
+static ROOT_SLOT_PIN_DELETE_REFUSALS: AtomicU64 = AtomicU64::new(0);
+static ROOT_SLOT_PIN_UNMAP_REFUSALS: AtomicU64 = AtomicU64::new(0);
+static ROOT_SLOT_PIN_MOVE_REFUSALS: AtomicU64 = AtomicU64::new(0);
 static mut ROOT_SLOT_RETYPE_BYTES: [u32; ROOT_SLOT_TRACK_CAP] = [0; ROOT_SLOT_TRACK_CAP];
 static IMAGE_FRAMES_START: AtomicU64 = AtomicU64::new(0);
 static IMAGE_FRAMES_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -4560,6 +4568,7 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
     unsafe { winlogon_profile_copied_spec(passed) };
     get_message_guard_spec(passed);
     vspace_asid_unmap_spec(passed);
+    root_cap_ownership_spec(passed);
     mapped_section_writeback_spec(passed);
     mapped_section_writecopy_cow_spec(passed);
     image_writecopy_cow_spec(passed);
@@ -5586,8 +5595,8 @@ unsafe fn lsarpc_connection_worker_spec(passed: &mut u64) {
 /// `CopyLoop` 64 KiB buffer (`userenv` `directory.c:148 Error: 1450`), and it looked exactly like an
 /// exhausted frame budget while the boot Untyped was 64 % free.
 ///
-/// The proof is the commit → decommit → RE-COMMIT self-test, not the absence of a symptom: with
-/// `VSPACE_ASIDS = false` the re-map bit cannot be set, because the leaf PTE is still occupied.
+/// The proof is the commit → decommit → RE-COMMIT self-test, not the absence of a symptom: without
+/// an assigned ASID the re-map bit cannot be set, because the leaf PTE is still occupied.
 fn vspace_asid_unmap_spec(passed: &mut u64) {
     let proof = VM_UNMAP_SELFTEST.load(Ordering::Relaxed);
     let assigned = ASID_ASSIGNED.load(Ordering::Relaxed);
@@ -5607,15 +5616,39 @@ fn vspace_asid_unmap_spec(passed: &mut u64) {
     print_str(b"\n");
     check(
         b"exec_vspace_asid_unmap_clears_pte",
-        VSPACE_ASIDS
-            // Every hosted process VSpace really took an ASID out of the initial pool …
-            && assigned >= 5
+        // Every hosted process VSpace really took an ASID out of the initial pool …
+        assigned >= 5
             && assign_fails == 0
             // … the full commit/decommit/re-commit cycle passed on the REAL path …
             && proof == VM_UNMAP_SELFTEST_ALL
             // … and across the whole boot no private map was refused and no unmap errored.
             && map_fails == 0
             && unmap_fails == 0,
+        passed,
+    );
+}
+
+fn root_cap_ownership_spec(passed: &mut u64) {
+    let pinned = ROOT_SLOT_PINNED_COUNT.load(Ordering::Relaxed);
+    let delete_refusals = ROOT_SLOT_PIN_DELETE_REFUSALS.load(Ordering::Relaxed);
+    let unmap_refusals = ROOT_SLOT_PIN_UNMAP_REFUSALS.load(Ordering::Relaxed);
+    let move_refusals = ROOT_SLOT_PIN_MOVE_REFUSALS.load(Ordering::Relaxed);
+    let required_heap_pts = allocator::HEAP_FRAMES.div_ceil(512);
+    print_str(b"[cap-owner] pinned-root-slots=");
+    print_u64(pinned);
+    print_str(b" delete-refusals=");
+    print_u64(delete_refusals);
+    print_str(b" unmap-refusals=");
+    print_u64(unmap_refusals);
+    print_str(b" move-refusals=");
+    print_u64(move_refusals);
+    print_str(b"\n");
+    check(
+        b"exec_root_vspace_caps_lifetime_owned",
+        pinned >= allocator::HEAP_FRAMES + required_heap_pts + 1
+            && delete_refusals == 0
+            && unmap_refusals == 0
+            && move_refusals == 0,
         passed,
     );
 }
@@ -6548,6 +6581,22 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
     let boot_checkpoint_failures = REG_FLUSH_KEY_BOOT_HIVE_FAILURES.load(Ordering::Relaxed);
     let active_name = ACTIVE_COMPUTER_NAME_KEY_CREATED.load(Ordering::Relaxed);
     let new_clients = LSA_RPC_NEW_CLIENT_REQUESTS.load(Ordering::Relaxed);
+    let cm_runtime_commits = CM_RUNTIME_SYSTEM_MUTATION_COMMITS.load(Ordering::Relaxed);
+    let cm_runtime_rejections = CM_RUNTIME_SYSTEM_MUTATION_REJECTIONS.load(Ordering::Relaxed);
+    let cm_runtime_projection_failures =
+        CM_RUNTIME_SYSTEM_PROJECTION_FAILURES.load(Ordering::Relaxed);
+    let cm_runtime_create_keys = CM_RUNTIME_SYSTEM_CREATE_KEYS.load(Ordering::Relaxed);
+    let cm_runtime_set_values = CM_RUNTIME_SYSTEM_SET_VALUES.load(Ordering::Relaxed);
+    let cm_runtime_delete_values = CM_RUNTIME_SYSTEM_DELETE_VALUES.load(Ordering::Relaxed);
+    let cm_runtime_delete_keys = CM_RUNTIME_SYSTEM_DELETE_KEYS.load(Ordering::Relaxed);
+    let cm_runtime_set_classes = CM_RUNTIME_SYSTEM_SET_CLASSES.load(Ordering::Relaxed);
+    let cm_runtime_set_security = CM_RUNTIME_SYSTEM_SET_SECURITY.load(Ordering::Relaxed);
+    let cm_runtime_ops = cm_runtime_create_keys
+        + cm_runtime_set_values
+        + cm_runtime_delete_values
+        + cm_runtime_delete_keys
+        + cm_runtime_set_classes
+        + cm_runtime_set_security;
     let restored_checkpoint = crate::writable_fs::snapshot_restore_seen()
         && boot_checkpoints >= 1
         && boot_checkpoint_bytes > 0;
@@ -6578,6 +6627,34 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
     print_str(
         b"
 ",
+    );
+    print_str(b"[cm-runtime] SYSTEM generation=");
+    print_u64(LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire));
+    print_str(b" commits=");
+    print_u64(cm_runtime_commits);
+    print_str(b" rejected=");
+    print_u64(cm_runtime_rejections);
+    print_str(b" projection-failures=");
+    print_u64(cm_runtime_projection_failures);
+    print_str(b" ops create/set/delete-value/delete-key/class/security=");
+    print_u64(cm_runtime_create_keys);
+    print_str(b"/");
+    print_u64(cm_runtime_set_values);
+    print_str(b"/");
+    print_u64(cm_runtime_delete_values);
+    print_str(b"/");
+    print_u64(cm_runtime_delete_keys);
+    print_str(b"/");
+    print_u64(cm_runtime_set_classes);
+    print_str(b"/");
+    print_u64(cm_runtime_set_security);
+    print_str(b"\n");
+    check(
+        b"exec_cm_runtime_system_mutations_atomic",
+        cm_runtime_rejections == 0
+            && cm_runtime_projection_failures == 0
+            && (cm_runtime_commits == 0 || cm_runtime_ops >= cm_runtime_commits),
+        passed,
     );
     // (1) `NtFlushKey` is a REAL serviced system service, not an unhandled SSN: it is registered in
     //     the live NT service table at the `sysfuncs.lst`-derived SSN 83 with its one-argument
@@ -7458,7 +7535,14 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
     print_str(b" faults=");
     print_u64(DEMAND_FAULTS.load(Ordering::Relaxed));
     print_str(b" heap=");
-    print_u64(allocator::mark() as u64);
+    let heap = allocator::usage();
+    print_u64(heap.bump as u64);
+    print_str(b"/");
+    print_u64(heap.allocated as u64);
+    print_str(b" reusable=");
+    print_u64(heap.reusable as u64);
+    print_str(b"/");
+    print_u64(heap.largest_reusable as u64);
     print_str(b" timer=");
     print_u64(TIMER_TICKS_SEEN.load(Ordering::Relaxed));
     print_str(b"/");
@@ -7614,7 +7698,10 @@ pub(crate) fn print_census_counters(tag: &[u8]) {
     print_str(b" demand-faults=");
     print_u64(DEMAND_FAULTS.load(Ordering::Relaxed));
     print_str(b" heap=");
-    print_u64(allocator::mark() as u64);
+    let heap = allocator::usage();
+    print_u64(heap.bump as u64);
+    print_str(b"/");
+    print_u64(heap.allocated as u64);
     print_str(b"/");
     print_u64(allocator::HEAP_FRAMES * 0x1000);
     print_str(b" ucb-redirects=");
@@ -7984,6 +8071,37 @@ unsafe fn root_slot_clear_live(slot: u64) -> bool {
     true
 }
 
+unsafe fn root_slot_is_pinned(slot: u64) -> bool {
+    let Some((word, bit)) = root_slot_bit(slot) else {
+        return false;
+    };
+    let pinned = core::ptr::addr_of!(ROOT_SLOT_PINNED_BITS) as *const u64;
+    core::ptr::read(pinned.add(word)) & bit != 0
+}
+
+unsafe fn root_slot_pin(slot: u64) {
+    let Some((word, bit)) = root_slot_bit(slot) else {
+        panic!("attempted to pin a cap outside the root slot tracker");
+    };
+    let pinned = core::ptr::addr_of_mut!(ROOT_SLOT_PINNED_BITS) as *mut u64;
+    let old = core::ptr::read(pinned.add(word));
+    if old & bit == 0 {
+        core::ptr::write(pinned.add(word), old | bit);
+        ROOT_SLOT_PINNED_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+unsafe fn root_slot_pin_run(base: u64, count: u64) {
+    let end = base
+        .checked_add(count)
+        .expect("pinned root cap run overflow");
+    let mut slot = base;
+    while slot < end {
+        root_slot_pin(slot);
+        slot += 1;
+    }
+}
+
 unsafe fn root_slot_remove_recycled(slot: u64) -> bool {
     let n = root_slot_recycle_count();
     let stack = core::ptr::addr_of_mut!(ROOT_SLOT_RECYCLE) as *mut u64;
@@ -8064,6 +8182,14 @@ fn try_recycled_root_slot() -> Option<u64> {
 }
 
 unsafe fn recycle_deleted_root_slot(slot: u64) {
+    if root_slot_is_pinned(slot) {
+        ROOT_SLOT_PIN_DELETE_REFUSALS.fetch_add(1, Ordering::Relaxed);
+        print_str(b"[cap-owner] refused recycle of pinned root slot=0x");
+        print_hex((slot >> 32) as u32);
+        print_hex(slot as u32);
+        print_str(b"\n");
+        return;
+    }
     if !root_slot_clear_live(slot) {
         return;
     }
@@ -9739,11 +9865,26 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_str(b"KiB ut-released=");
     print_u64(UT_RETYPE_RELEASED_BYTES.load(Ordering::Relaxed) >> 10);
     print_str(b"KiB exec-heap=");
-    print_u64((allocator::mark() as u64) >> 10);
+    let heap = allocator::usage();
+    print_u64((heap.bump as u64) >> 10);
     print_str(b"KiB/");
     print_u64((allocator::HEAP_FRAMES * 0x1000) >> 10);
-    print_str(b"KiB exec-heap-free=");
-    print_u64((allocator::remaining() as u64) >> 10);
+    print_str(b"KiB exec-heap-live=");
+    print_u64((heap.allocated as u64) >> 10);
+    print_str(b"KiB exec-heap-reusable=");
+    print_u64((heap.reusable as u64) >> 10);
+    print_str(b"KiB exec-heap-largest=");
+    print_u64((heap.largest_reusable as u64) >> 10);
+    print_str(b"KiB exec-heap-top=");
+    print_u64((heap.top_reusable as u64) >> 10);
+    print_str(b"KiB pinned-root-caps=");
+    print_u64(ROOT_SLOT_PINNED_COUNT.load(Ordering::Relaxed));
+    print_str(b" pin-delete-refusals=");
+    print_u64(ROOT_SLOT_PIN_DELETE_REFUSALS.load(Ordering::Relaxed));
+    print_str(b" pin-unmap-refusals=");
+    print_u64(ROOT_SLOT_PIN_UNMAP_REFUSALS.load(Ordering::Relaxed));
+    print_str(b" pin-move-refusals=");
+    print_u64(ROOT_SLOT_PIN_MOVE_REFUSALS.load(Ordering::Relaxed));
     print_str(b"KiB retypes=");
     print_u64(UT_RETYPE_CALLS.load(Ordering::Relaxed));
     print_str(b" ut-fails=");
@@ -10315,7 +10456,25 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
 /// `page_unmap` is a `SYS_SEND`, so a REFUSED unmap is invisible — and an unmap that does not clear
 /// the leaf PTE turns into a `seL4_DeleteFirst` on the NEXT map at that VA, i.e. a phantom
 /// "out of memory". This is the SYS_CALL form; the label comes back so the failure is countable.
+///
+/// Permanent root mappings are owner-pinned at creation. Teardown code is allowed to retain their
+/// cptr as data, but must never detach the mapping through that cptr; guarding only CNode_Delete is
+/// too late because X86PageUnmap already cleared the leaf PTE.
+#[track_caller]
 pub(crate) unsafe fn page_unmap_r(frame: u64) -> u64 {
+    if root_slot_is_pinned(frame) {
+        let caller = core::panic::Location::caller();
+        ROOT_SLOT_PIN_UNMAP_REFUSALS.fetch_add(1, Ordering::Relaxed);
+        print_str(b"[cap-owner] refused unmap of pinned root slot=0x");
+        print_hex((frame >> 32) as u32);
+        print_hex(frame as u32);
+        print_str(b" caller=");
+        print_str(caller.file().as_bytes());
+        print_str(b":");
+        print_u64(caller.line() as u64);
+        print_str(b"\n");
+        return u64::MAX;
+    }
     let reply: u64;
     core::arch::asm!(
         "syscall",
@@ -10350,30 +10509,23 @@ pub(crate) static VM_UNMAP_FAILS: AtomicU64 = AtomicU64::new(0);
 // `vm_map_private_page` reported as `STATUS_INSUFFICIENT_RESOURCES`, i.e. a PHANTOM out-of-memory
 // (winlogon's `CopyLoop` 64 KiB buffer → `userenv` `Error: 1450`). The fix is the piece seL4 always
 // expected the root task to do: assign each process VSpace an ASID out of the initial pool.
-/// Ship switch for the ASID assignment, so the BYPASS experiment is one constant: `false` restores
-/// the pre-batch-59 behaviour (every process VSpace `asid == 0`, every unmap a silent no-op) and
-/// `userenv`'s `Error: 1450` comes straight back.
-pub(crate) const VSPACE_ASIDS: bool = true;
 /// `seL4_CapInitThreadASIDPool` — canonical root-CSpace slot 6 (see `rootserver::rs_set`).
 pub(crate) const CAP_INIT_ASID_POOL: u64 = 6;
 /// `InvocationLabel::X86ASIDPoolAssign`.
-pub(crate) const LBL_X86_ASID_POOL_ASSIGN: u64 = 56;
+pub(crate) const EXEC_LBL_X86_ASID_POOL_ASSIGN: u64 = 56;
 /// VSpaces that were given a real ASID, and assignments that came back with an error label.
 pub(crate) static ASID_ASSIGNED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static ASID_ASSIGN_FAILS: AtomicU64 = AtomicU64::new(0);
 /// Assign `pml4` (a root-CNode slot holding a freshly retyped PML4) the next ASID from the initial
 /// pool, so `Page::Unmap` / cap deletion can find this VSpace and really clear its PTEs. Legacy
 /// (non-extraCaps) ABI: the vspace's root-CNode slot index rides in `a2`. Returns the error label.
-pub(crate) unsafe fn vspace_assign_asid(pml4: u64) -> u64 {
-    if !VSPACE_ASIDS {
-        return 0;
-    }
+pub(crate) unsafe fn executive_vspace_assign_asid_raw(pml4: u64) -> u64 {
     let reply: u64;
     core::arch::asm!(
         "syscall",
         inout("rdx") SYS_CALL as u64 => _,
         inout("rdi") CAP_INIT_ASID_POOL => _,
-        inout("rsi") LBL_X86_ASID_POOL_ASSIGN << 12 => reply,
+        inout("rsi") EXEC_LBL_X86_ASID_POOL_ASSIGN << 12 => reply,
         inout("r10") pml4 => _,
         inout("r8") 0u64 => _,
         inout("r9") 0u64 => _,
@@ -10394,6 +10546,26 @@ pub(crate) unsafe fn vspace_assign_asid(pml4: u64) -> u64 {
         print_str(b"\n");
     }
     label
+}
+
+/// Assign the ASID required by every VSpace before its first paging or frame map.
+///
+/// Continuing after this fails would let mapped frame caps record ASID zero. Their eventual unmap
+/// could then target no address space (or, in a buggy kernel, the rootserver address space), so an
+/// address space without an ASID is not a usable degraded mode.
+pub(crate) unsafe fn require_vspace_asid(pml4: u64, owner: &[u8]) {
+    let error = executive_vspace_assign_asid_raw(pml4);
+    if error != 0 {
+        print_str(b"[asid] required assignment failed owner=");
+        print_str(owner);
+        print_str(b" pml4=0x");
+        print_hex((pml4 >> 32) as u32);
+        print_hex(pml4 as u32);
+        print_str(b" error=");
+        print_u64(error);
+        print_str(b"\n");
+        panic!("required VSpace ASID assignment failed");
+    }
 }
 
 // --- THE CLIENT TEB TAIL IS SERVER-WRITABLE, SO ITS INVARIANTS MUST BE RE-ASSERTED ---------------
@@ -13313,7 +13485,21 @@ unsafe fn cnode_mint_r(cnode: u64, dest: u64, src: u64, badge: u64) -> u64 {
     label
 }
 const LBL_CNODE_MOVE: u64 = 27;
+#[track_caller]
 unsafe fn cnode_move_root_to_cnode_r(dest_cnode: u64, dest_index: u64, src_root_slot: u64) -> u64 {
+    if root_slot_is_pinned(src_root_slot) {
+        let caller = core::panic::Location::caller();
+        ROOT_SLOT_PIN_MOVE_REFUSALS.fetch_add(1, Ordering::Relaxed);
+        print_str(b"[cap-owner] refused move of pinned root slot=0x");
+        print_hex((src_root_slot >> 32) as u32);
+        print_hex(src_root_slot as u32);
+        print_str(b" caller=");
+        print_str(caller.file().as_bytes());
+        print_str(b":");
+        print_u64(caller.line() as u64);
+        print_str(b"\n");
+        return u64::MAX;
+    }
     let reply: u64;
     core::arch::asm!(
         "syscall",
@@ -14250,7 +14436,21 @@ unsafe fn tcb_suspend_r(tcb: u64) -> u64 {
 /// `CNodeDelete` slot `idx` under the caller's ROOT CNode. Same legacy invocation shape as
 /// `copy_cap_r`/`cnode_copy` (index in a2=r10, msginfo length 0 → the kernel defaults depth to
 /// WORD_BITS, which resolves a direct root-CNode slot). Returns the error label (0 = success).
+#[track_caller]
 unsafe fn cnode_delete_r(idx: u64) -> u64 {
+    if root_slot_is_pinned(idx) {
+        let caller = core::panic::Location::caller();
+        ROOT_SLOT_PIN_DELETE_REFUSALS.fetch_add(1, Ordering::Relaxed);
+        print_str(b"[cap-owner] refused delete of pinned root slot=0x");
+        print_hex((idx >> 32) as u32);
+        print_hex(idx as u32);
+        print_str(b" caller=");
+        print_str(caller.file().as_bytes());
+        print_str(b":");
+        print_u64(caller.line() as u64);
+        print_str(b"\n");
+        return u64::MAX;
+    }
     let reply: u64;
     core::arch::asm!(
         "syscall",
@@ -14286,6 +14486,7 @@ pub(crate) unsafe fn cnode_delete_in_cnode_r(cnode: u64, idx: u64) -> u64 {
     reply >> 12
 }
 
+#[track_caller]
 pub(crate) unsafe fn cnode_delete_recycle_r(idx: u64) -> u64 {
     let label = cnode_delete_r(idx);
     if label == 0 {
@@ -14410,7 +14611,7 @@ unsafe fn attach_sched_context(tcb: u64) -> Result<u64, u64> {
 /// sysarg, device MMIO, driver code/arena) at `WORK_CLUSTER_BASE` in `pml4`. The cluster used to
 /// piggyback the image's 2 MiB PT; now that the working VAs moved high (out of the 64 MiB ELF
 /// reserve) it needs its own PT in every executive-image VSpace and in the executive's own.
-unsafe fn map_required_page_table(pml4: u64, base: u64, stage: &[u8]) {
+unsafe fn map_required_page_table(pml4: u64, base: u64, stage: &[u8]) -> u64 {
     let pt = alloc_slot();
     let retype = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
     if retype != 0 {
@@ -14444,6 +14645,10 @@ unsafe fn map_required_page_table(pml4: u64, base: u64, stage: &[u8]) {
         print_str(b"\n");
         panic!("required page-table map failed");
     }
+    if pml4 == CAP_INIT_THREAD_VSPACE {
+        root_slot_pin(pt);
+    }
+    pt
 }
 
 unsafe fn map_required_paging_struct(
@@ -14562,15 +14767,56 @@ pub(crate) unsafe fn map_image_skeleton(pml4: u64, img_count: u64) {
 /// it), then maps all HEAP_FRAMES at the relocated `HEAP_BASE`.
 unsafe fn map_own_heap() {
     map_heap_pts(CAP_INIT_THREAD_VSPACE, allocator::HEAP_FRAMES);
-    for i in 0..allocator::HEAP_FRAMES {
-        let f = alloc_slot();
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
-        let _ = page_map(
-            f,
-            allocator::HEAP_BASE as u64 + i * 0x1000,
-            RW_NX,
-            CAP_INIT_THREAD_VSPACE,
+    let Some(frame_base) = try_alloc_slot_run(allocator::HEAP_FRAMES) else {
+        panic!("required executive heap cap run allocation failed");
+    };
+    let mut retyped = 0u64;
+    while retyped < allocator::HEAP_FRAMES {
+        let batch = (allocator::HEAP_FRAMES - retyped).min(ROOT_RETYPE_FAN_OUT_LIMIT);
+        let error = untyped_retype_r(
+            CAP_INIT_UNTYPED,
+            OBJ_X86_4K_PAGE,
+            PAGING_BITS,
+            batch as u32,
+            frame_base + retyped,
         );
+        if error != 0 {
+            print_str(b"[paging] retype executive-heap-frame-run failed base=0x");
+            print_hex((frame_base >> 32) as u32);
+            print_hex(frame_base as u32);
+            print_str(b" index=");
+            print_u64(retyped);
+            print_str(b" batch=");
+            print_u64(batch);
+            print_str(b" error=");
+            print_u64(error);
+            print_str(b"\n");
+            panic!("required executive heap frame retype failed");
+        }
+        retyped += batch;
+    }
+    root_slot_pin_run(frame_base, allocator::HEAP_FRAMES);
+    for i in 0..allocator::HEAP_FRAMES {
+        let f = frame_base + i;
+        let va = allocator::HEAP_BASE as u64 + i * 0x1000;
+        let map = page_map_r(f, va, RW_NX, CAP_INIT_THREAD_VSPACE);
+        if map != 0 {
+            let _ = cnode_delete_recycle_r(f);
+            print_str(b"[paging] map executive-heap-page failed frame=0x");
+            print_hex((f >> 32) as u32);
+            print_hex(f as u32);
+            print_str(b" va=0x");
+            print_hex((va >> 32) as u32);
+            print_hex(va as u32);
+            print_str(b" error=");
+            print_u64(map);
+            print_str(b"\n");
+            panic!("required executive heap page map failed");
+        }
+        // The initial rootserver has no external pager. Touch every page while the mapping
+        // operation and cap are still in scope so a bad kernel mapping cannot survive until a
+        // late allocator memcpy and appear as an unserviceable user fault.
+        core::ptr::write_volatile(va as *mut u8, 0);
     }
 }
 
@@ -14581,7 +14827,11 @@ unsafe fn build_service_vspace(sub: u64, comp: u64, req: u64, rep: u64, heap_fra
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
     let pml4 = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    let retype = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    if retype != 0 {
+        panic!("required service VSpace retype failed");
+    }
+    require_vspace_asid(pml4, b"isolated-service");
     map_image_skeleton(pml4, img_count);
     map_heap_pts(pml4, heap_frames);
     for i in 0..img_count {
@@ -14617,7 +14867,7 @@ const KERNEL_SERVICE_PRIORITY: u64 = 200;
 
 /// Spawn one isolated service component at `entry`, seeded with `seeds`.
 unsafe fn spawn_service(
-    entry: unsafe extern "C" fn() -> !,
+    entry: unsafe extern "C" fn(u64) -> !,
     seeds: &[(u64, u64)],
     sub: u64,
     comp: u64,
@@ -14656,7 +14906,7 @@ unsafe fn spawn_service(
         0,
     );
     let stack_top = STACK_BASE + STACK_FRAMES * 0x1000 - 16;
-    let _ = tcb_write_registers(tcb, entry as u64, stack_top, 0);
+    let _ = tcb_write_registers(tcb, entry as u64, stack_top, heap_frames);
     let _ = tcb_set_priority(tcb, KERNEL_SERVICE_PRIORITY);
     if let Err(e_sc) = attach_sched_context(tcb) {
         print_str(b"[thread-life] service SC attach failed tcb=0x");
@@ -18179,6 +18429,12 @@ unsafe fn boot_system_hive_image_bytes() -> Option<&'static [u8]> {
     (*core::ptr::addr_of!(BOOT_SYSTEM_HIVE_IMAGE)).as_deref()
 }
 
+/// Transfer the composed boot image into the live native-service handler after isolated CM has
+/// imported it. The encoded buffer is transport state, not a third SYSTEM authority.
+unsafe fn take_boot_system_hive_image() -> Option<Vec<u8>> {
+    (*core::ptr::addr_of_mut!(BOOT_SYSTEM_HIVE_IMAGE)).take()
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum BootSystemImageError {
     GeneratedOverlayMissing,
@@ -20673,6 +20929,19 @@ pub(crate) static REG_FLUSH_KEY_BOOT_HIVE_CHECKPOINTS: AtomicU64 = AtomicU64::ne
 pub(crate) static REG_FLUSH_KEY_BOOT_HIVE_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Failed attempts to checkpoint a boot-mounted hive during `NtFlushKey` or lazy-writer compaction.
 pub(crate) static REG_FLUSH_KEY_BOOT_HIVE_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// Runtime `HKLM\SYSTEM` transactions accepted by isolated CM before the executive projected the
+/// same records into its durable hive journal. Boot/setup batches are deliberately excluded.
+pub(crate) static CM_RUNTIME_SYSTEM_MUTATION_COMMITS: AtomicU64 = AtomicU64::new(0);
+/// Runtime SYSTEM transactions rejected by CM before any executive projection was attempted.
+pub(crate) static CM_RUNTIME_SYSTEM_MUTATION_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+/// Accepted runtime SYSTEM transactions whose durable executive projection failed.
+pub(crate) static CM_RUNTIME_SYSTEM_PROJECTION_FAILURES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CM_RUNTIME_SYSTEM_CREATE_KEYS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CM_RUNTIME_SYSTEM_SET_VALUES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CM_RUNTIME_SYSTEM_DELETE_VALUES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CM_RUNTIME_SYSTEM_DELETE_KEYS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CM_RUNTIME_SYSTEM_SET_CLASSES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CM_RUNTIME_SYSTEM_SET_SECURITY: AtomicU64 = AtomicU64::new(0);
 /// `NtSaveKey` calls and outcomes. Success is limited to mounted hive roots that can be written to a
 /// writable overlay FILE_OBJECT. Mutable hive roots use the live `nt-hive-core` image so saved state
 /// reflects the Configuration Manager write authority rather than borrowed boot media.
@@ -23403,7 +23672,11 @@ unsafe fn spawn_user_thread(
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
     let pml4 = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    let retype = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    if retype != 0 {
+        panic!("required isolated user VSpace retype failed");
+    }
+    require_vspace_asid(pml4, b"isolated-user-thread");
     map_image_skeleton(pml4, img_count);
     map_user_alloc_pt(pml4);
     for i in 0..img_count {
@@ -24195,6 +24468,7 @@ static NLS_CASE_SIZE: AtomicU64 = AtomicU64::new(0);
 static HIVEBUF_START: AtomicU64 = AtomicU64::new(0);
 static REAL_HIVE_SIZE: AtomicU64 = AtomicU64::new(0);
 static mut BOOT_SYSTEM_HIVE_IMAGE: Option<Vec<u8>> = None;
+static BOOT_SYSTEM_HIVE_IMAGE_RELEASED_BYTES: AtomicU64 = AtomicU64::new(0);
 /// The frame-cap base + byte size of the real SECURITY / SAM hives the storage host read BY PATH
 /// off `\reactos\system32\config\{security,sam}` into SECHIVEBUF / SAMHIVEBUF.
 pub(crate) static SECHIVEBUF_START: AtomicU64 = AtomicU64::new(0);
@@ -25311,7 +25585,7 @@ fn park() -> ! {
 /// `entry` seeded with cap copies, and return the executive-side [`RingChannel`] to
 /// drive it. Adding a service is now one call + wrapping the channel in its client.
 unsafe fn stand_up_service(
-    entry: unsafe extern "C" fn() -> !,
+    entry: unsafe extern "C" fn(u64) -> !,
     sub_v: u64,
     comp_v: u64,
     req_v: u64,
@@ -31723,12 +31997,19 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // the nested modal message pump (blocked on credential input a headless host can't supply).
     check_logon_dialog_gates(&mut passed);
 
-    // Bump-heap occupancy at the gate. The writable volume + the CM overlay pin the mark past
-    // their allocations, so this is the boot's real, permanent high-water mark against the cap —
-    // the number to watch whenever a hosted process starts moving bulk data (a profile copy, a
-    // hive load) through the executive.
-    print_str(b"[heap] executive bump: used=");
-    print_u64(allocator::mark() as u64);
+    // Report both the address-space watermark and actual reusable storage. Durable objects can sit
+    // above dropped allocations, so the bump alone is not a live-memory or headroom measurement.
+    let heap = allocator::usage();
+    print_str(b"[heap] executive bump: watermark=");
+    print_u64(heap.bump as u64);
+    print_str(b" allocated=");
+    print_u64(heap.allocated as u64);
+    print_str(b" reusable=");
+    print_u64(heap.reusable as u64);
+    print_str(b" largest=");
+    print_u64(heap.largest_reusable as u64);
+    print_str(b" top=");
+    print_u64(heap.top_reusable as u64);
     print_str(b" cap=");
     print_u64(allocator::HEAP_FRAMES * 0x1000);
     print_str(b"\n");

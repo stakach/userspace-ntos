@@ -8,7 +8,10 @@ use crate::*;
 
 #[no_mangle]
 #[link_section = ".text.isr_entry"]
-pub unsafe extern "C" fn isr_entry() -> ! {
+pub unsafe extern "C" fn isr_entry(heap_frames: u64) -> ! {
+    if !unsafe { allocator::initialize_mapped_heap(heap_frames) } {
+        park();
+    }
     // Block on the IRQ notification — the kernel signals it when the real hardware
     // interrupt fires (the IRQ-handler cap the executive issued is bound to it).
     let _ = ep_recv(CT_IRQ_NTFN);

@@ -1,8 +1,8 @@
 //! `service_sec_image` — the per-process SEC_IMAGE demand-fault service loop.
 //! Extracted verbatim from `main.rs` (pure reorg; no logic change).
 #![allow(clippy::all)]
-use crate::*;
 use crate::exec_handler::HostedCreatePublication;
+use crate::*;
 
 pub(crate) static FILE_IO_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
 static FILE_IO_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -119,8 +119,7 @@ static mut SERVICE_EXE_IMAGE_CATALOG_WORK: nt_exe_image::OwnedHostedImageCatalog
 static mut SERVICE_HOSTED_LOADED_IMAGES_WORK: HostedLoadedImageTable =
     HostedLoadedImageTable::new();
 static mut SERVICE_GENERIC_SECTIONS_WORK: GenericSectionTable = GenericSectionTable::new();
-static mut SERVICE_DELAY_QUEUE_WORK: nt_delay_execution::Queue =
-    nt_delay_execution::Queue::new();
+static mut SERVICE_DELAY_QUEUE_WORK: nt_delay_execution::Queue = nt_delay_execution::Queue::new();
 static SERVICE_DELAY_DRAIN_HANDLER: AtomicU64 = AtomicU64::new(0);
 static SERVICE_DELAY_DRAIN_QUEUE: AtomicU64 = AtomicU64::new(0);
 static SERVICE_DELAY_NESTED_DRAINS: AtomicU64 = AtomicU64::new(0);
@@ -1041,10 +1040,7 @@ unsafe fn pending_hosted_fault_endpoint_sender(
     None
 }
 
-unsafe fn defer_quiesce_for_pending_hosted_ipc(
-    nt_handler: &ExecNtHandler,
-    site: &[u8],
-) -> bool {
+unsafe fn defer_quiesce_for_pending_hosted_ipc(nt_handler: &ExecNtHandler, site: &[u8]) -> bool {
     let Some((pi, thread, head, tail)) = pending_hosted_fault_endpoint_sender(nt_handler) else {
         return false;
     };
@@ -1442,6 +1438,9 @@ fn finalize_service_loop_durable_state(
     if take_object_namespace_growth_dirty() {
         pin_durable_heap_mark(heap_mark);
     }
+    if driver_launch::take_io_manager_durable_storage_dirty() {
+        pin_durable_heap_mark(heap_mark);
+    }
     pin_durable_table_growth_if_dirty(heap_mark);
     pin_generic_section_growth_if_dirty(heap_mark);
     if nt_handler.hive_mounts_dirty {
@@ -1452,9 +1451,8 @@ fn finalize_service_loop_durable_state(
 
     let writable_fs_mount_dirty = crate::writable_fs::take_mount_dirty();
     let writable_fs_runtime_dirty = crate::writable_fs::take_runtime_dirty();
-    let writable_fs_touched = nt_handler.writable_fs_dirty
-        || writable_fs_mount_dirty
-        || writable_fs_runtime_dirty;
+    let writable_fs_touched =
+        nt_handler.writable_fs_dirty || writable_fs_mount_dirty || writable_fs_runtime_dirty;
     let mut checkpoint_status = nt_fs::STATUS_SUCCESS;
     if writable_fs_touched {
         let _alloc_scope = allocator::enter_scope(b"service-loop-writable-fs");
@@ -1468,17 +1466,22 @@ fn finalize_service_loop_durable_state(
         }
         if nt_handler.writable_fs_commit_required {
             let checkpoint_mark = allocator::mark();
-            checkpoint_status = {
-                let _alloc_ctx =
-                    allocator::enter_context(allocator::ALLOC_CTX_WRITABLE_SNAPSHOT);
+            let checkpoint_result = {
+                let _alloc_ctx = allocator::enter_context(allocator::ALLOC_CTX_WRITABLE_SNAPSHOT);
                 unsafe { crate::writable_fs::checkpoint_dirty_volume() }
             };
             unsafe { allocator::reset_to(checkpoint_mark) };
+            checkpoint_status = checkpoint_result.err().unwrap_or(nt_fs::STATUS_SUCCESS);
             if checkpoint_status != nt_fs::STATUS_SUCCESS {
                 print_str(b"[writable-fs-snapshot] service-loop checkpoint status=0x");
                 print_hex(checkpoint_status);
                 print_str(b"\n");
             } else {
+                if checkpoint_result == Ok(true)
+                    && unsafe { crate::writable_fs::compact_unreferenced_blobs() }
+                {
+                    pin_durable_heap_mark(heap_mark);
+                }
                 nt_handler.complete_committed_mutable_hive_journal_snapshot(b"service-loop");
             }
         }
@@ -1535,12 +1538,16 @@ fn checkpoint_boot_hives_at_quiesce(nt_handler: &mut ExecNtHandler) -> u32 {
         print_str(b"\n");
     }
     let snapshot_mark = allocator::mark();
-    let snapshot_status = {
+    let snapshot_result = {
         let _alloc_ctx = allocator::enter_context(allocator::ALLOC_CTX_WRITABLE_SNAPSHOT);
         unsafe { crate::writable_fs::checkpoint_dirty_volume() }
     };
     unsafe { allocator::reset_to(snapshot_mark) };
+    let snapshot_status = snapshot_result.err().unwrap_or(nt_fs::STATUS_SUCCESS);
     if snapshot_status == nt_fs::STATUS_SUCCESS {
+        if snapshot_result == Ok(true) {
+            let _ = unsafe { crate::writable_fs::compact_unreferenced_blobs() };
+        }
         nt_handler.complete_committed_mutable_hive_journal_snapshot(b"quiesce");
     } else {
         print_str(b"[writable-fs-snapshot] quiesce checkpoint status=0x");
@@ -1941,9 +1948,7 @@ unsafe fn service_private_guard_page_fault(
 #[inline(never)]
 unsafe fn reset_service_delay_queue_work() -> Option<&'static mut nt_delay_execution::Queue> {
     let queue = &mut *core::ptr::addr_of_mut!(SERVICE_DELAY_QUEUE_WORK);
-    queue
-        .reset(DELAY_WAITER_INITIAL_RESERVE)
-        .then_some(queue)
+    queue.reset(DELAY_WAITER_INITIAL_RESERVE).then_some(queue)
 }
 
 pub(crate) fn service_delay_queue_stats() -> (usize, usize, usize, u64, u64) {
@@ -1983,8 +1988,8 @@ fn service_watchdog_record_crash_parked(mask: u64) {
 
 pub(crate) unsafe fn rearm_registered_delay_timer() -> bool {
     let handler_ptr = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
-    let queue_ptr = SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire)
-        as *mut nt_delay_execution::Queue;
+    let queue_ptr =
+        SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire) as *mut nt_delay_execution::Queue;
     if handler_ptr.is_null() || queue_ptr.is_null() || !delay_timer_init() {
         return false;
     }
@@ -2009,8 +2014,8 @@ pub(crate) unsafe fn drain_nested_pump_timer_delivery() -> bool {
         return false;
     }
     let handler_ptr = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
-    let queue_ptr = SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire)
-        as *mut nt_delay_execution::Queue;
+    let queue_ptr =
+        SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire) as *mut nt_delay_execution::Queue;
     if handler_ptr.is_null() || queue_ptr.is_null() {
         return false;
     }
@@ -2689,7 +2694,8 @@ unsafe fn pre_user_shell_frontier_pending(
     wait_parked: u64,
     reason: &[u8],
 ) -> bool {
-    if USERINIT_SPAWNED.load(Ordering::Relaxed) != 0 || SERVICES_SPAWNED.load(Ordering::Relaxed) == 0
+    if USERINIT_SPAWNED.load(Ordering::Relaxed) != 0
+        || SERVICES_SPAWNED.load(Ordering::Relaxed) == 0
     {
         return false;
     }
@@ -5423,8 +5429,7 @@ pub(crate) unsafe fn service_sec_image(
         print_str(b"[sec-init] handler-ready\n");
     }
     nt_handler.register_main_thread_tcb(primary_pi, main_tcb);
-    let delay_queue =
-        reset_service_delay_queue_work().expect("delay wait queue allocation failed");
+    let delay_queue = reset_service_delay_queue_work().expect("delay wait queue allocation failed");
     register_service_delay_drain_context(&mut nt_handler, delay_queue);
     // Boot drivers can publish timer deadlines before the service loop owns its
     // delay queue. Registration is the first point at which those deadlines can
@@ -5463,7 +5468,8 @@ pub(crate) unsafe fn service_sec_image(
     // Slots are EPROCESS-linked via the handler-owned process mechanism lookup. smss is live from
     // the initial recv; later hosted processes claim their pid on the native create-process path and
     // fill pml4/scratch/img_end when the service loop constructs their seL4 mechanism.
-    let procs = reset_service_procs_work(MAX_PI).expect("service process scratch allocation failed");
+    let procs =
+        reset_service_procs_work(MAX_PI).expect("service process scratch allocation failed");
     for (i, p) in procs.iter_mut().enumerate() {
         p.pid = nt_handler
             .pm_pid_for_pi(i)
@@ -5532,6 +5538,10 @@ pub(crate) unsafe fn service_sec_image(
     // must survive the per-syscall reset: after such a mutating syscall the loop advances this mark
     // past the new allocations.
     let mut heap_mark = allocator::mark();
+    // I/O Manager construction and boot/PnP publication happened below this watermark. Start a new
+    // acquisition epoch so the first syscall cannot pin unrelated transient work for state that the
+    // baseline already covers.
+    let _ = driver_launch::take_io_manager_durable_storage_dirty();
     VM_FREE_FRAME_N = 0;
     if live_service {
         let resume_error = tcb_resume_r(main_tcb);
@@ -5744,10 +5754,7 @@ pub(crate) unsafe fn service_sec_image(
                 procs[$pi].ntfaults = ntfaults;
                 pfilled[$pi] = *filled_pages;
                 mark_wait_parked!($pi, $ip);
-                let _ = finalize_service_loop_durable_state(
-                    &mut nt_handler,
-                    &mut heap_mark,
-                );
+                let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                 let (nb, nmi, nm0, nm1, nm2, nm3) =
                     recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                 badge = nb;
@@ -7106,10 +7113,7 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
                     mark_wait_parked!(pi, m0);
-                    let _ = finalize_service_loop_durable_state(
-                        &mut nt_handler,
-                        &mut heap_mark,
-                    );
+                    let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
@@ -7150,7 +7154,8 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" addr=0x");
                     print_hex(addr as u32);
                     print_str(b" -> PARK thread (its own unrecoverable fault); boot continues\n");
-                    if is_wl_worker && WINLOGON_MAIN_EVENT_WAIT_PARKED.load(Ordering::Relaxed) != 0
+                    if is_wl_worker
+                        && WINLOGON_MAIN_EVENT_WAIT_PARKED.load(Ordering::Relaxed) != 0
                         && !pre_user_shell_frontier_pending(
                             &nt_handler,
                             crash_parked,
@@ -7167,10 +7172,7 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
                     // Recv the next event WITHOUT replying to the listener (it stays blocked).
-                    let _ = finalize_service_loop_durable_state(
-                        &mut nt_handler,
-                        &mut heap_mark,
-                    );
+                    let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
@@ -7542,10 +7544,7 @@ pub(crate) unsafe fn service_sec_image(
                 procs[pi].first = first;
                 procs[pi].ntfaults = ntfaults;
                 pfilled[pi] = *filled_pages;
-                let _ = finalize_service_loop_durable_state(
-                    &mut nt_handler,
-                    &mut heap_mark,
-                );
+                let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
                 badge = nb;
                 mi = nmi;
@@ -7860,10 +7859,7 @@ pub(crate) unsafe fn service_sec_image(
                         stop = m0;
                         break;
                     }
-                    let _ = finalize_service_loop_durable_state(
-                        &mut nt_handler,
-                        &mut heap_mark,
-                    );
+                    let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
@@ -8014,8 +8010,7 @@ pub(crate) unsafe fn service_sec_image(
                         image_fault_plan.map_protection,
                     ) || clean_writecopy_shareable);
                 let cached = if shareable { dll_cache_get(bpage) } else { 0 };
-                let shared_mapping_registered =
-                    shared_image_mapping_contains(pi as u64, bpage);
+                let shared_mapping_registered = shared_image_mapping_contains(pi as u64, bpage);
                 let shareable_mapping_registered = shareable && shared_mapping_registered;
                 if !is_fault_page && !shareable && !forward_policy.private_neighbours {
                     SEC_IMAGE_PRIVATE_PREFETCH_SKIPS.fetch_add(1, Ordering::Relaxed);
@@ -8177,8 +8172,7 @@ pub(crate) unsafe fn service_sec_image(
                         // table cannot record it, do not leave a scratch-mapped frame without a
                         // reclaim path; surface the resource wall to the caller instead.
                         if !dll_cache_put(bpage, f) {
-                            let insert_failures =
-                                DLL_CACHE_INSERT_FAILURES.load(Ordering::Relaxed);
+                            let insert_failures = DLL_CACHE_INSERT_FAILURES.load(Ordering::Relaxed);
                             let duplicate = DLL_CACHE_DUPLICATE_INSERTS.load(Ordering::Relaxed);
                             if insert_failures + duplicate <= 16 {
                                 let (records, capacity) = dll_cache_stats();
@@ -8866,10 +8860,7 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
                     mark_wait_parked!(pi, m0);
-                    let _ = finalize_service_loop_durable_state(
-                        &mut nt_handler,
-                        &mut heap_mark,
-                    );
+                    let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -8928,10 +8919,7 @@ pub(crate) unsafe fn service_sec_image(
                     if !delivered_waiting_client {
                         mark_wait_parked!(pi, m0);
                     }
-                    let _ = finalize_service_loop_durable_state(
-                        &mut nt_handler,
-                        &mut heap_mark,
-                    );
+                    let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -9008,10 +8996,8 @@ pub(crate) unsafe fn service_sec_image(
                         procs[pi].ntfaults = ntfaults;
                         pfilled[pi] = *filled_pages;
                         mark_wait_parked!(pi, resume_ip);
-                        let _ = finalize_service_loop_durable_state(
-                            &mut nt_handler,
-                            &mut heap_mark,
-                        );
+                        let _ =
+                            finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                         let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                         let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                         badge = nb;
@@ -9052,10 +9038,8 @@ pub(crate) unsafe fn service_sec_image(
                         procs[pi].ntfaults = ntfaults;
                         pfilled[pi] = *filled_pages;
                         mark_wait_parked!(pi, resume_ip);
-                        let _ = finalize_service_loop_durable_state(
-                            &mut nt_handler,
-                            &mut heap_mark,
-                        );
+                        let _ =
+                            finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                         let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                         let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                         badge = nb;
@@ -9171,9 +9155,10 @@ pub(crate) unsafe fn service_sec_image(
             nt_handler.current_service_number = m0 as u32;
             nt_handler.current_native_call_transport = native_call_transport;
             nt_handler.current_synchronous_file_lock = 0;
-            nt_handler.active_synchronous_file_retry =
-                (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
-                    .take_promoted(pi as u32, current_tid, badge, m0 as u32);
+            nt_handler.active_synchronous_file_retry = (&mut *core::ptr::addr_of_mut!(
+                SYNCHRONOUS_FILE_WAITERS
+            ))
+                .take_promoted(pi as u32, current_tid, badge, m0 as u32);
             // SEAM: if this SSN is in the real service table, dispatch it through the NT syscall
             // dispatcher -> real handler; otherwise fall through to the broker match. The x64 native
             // ABI passes args in r10(=rcx),rdx,r8,r9 then the stack; here we forward the register
@@ -9546,7 +9531,8 @@ pub(crate) unsafe fn service_sec_image(
                         result = 0xC000_0001;
                     }
                     ExecPostAction::TerminateCurrentThread { tid } => {
-                        let trace_index = THREAD_TERM_ROOT_TCB_TRACE.fetch_add(1, Ordering::Relaxed);
+                        let trace_index =
+                            THREAD_TERM_ROOT_TCB_TRACE.fetch_add(1, Ordering::Relaxed);
                         if trace_index < 8 {
                             crate::win32k_glue::trace_hosted_tcb_debug_state(
                                 b"thread-term-root-before",
@@ -9812,7 +9798,8 @@ pub(crate) unsafe fn service_sec_image(
                     park_io_completion_key_out = nt_handler.io_completion_key_out;
                     park_io_completion_apc_out = nt_handler.io_completion_apc_out;
                     park_io_completion_iosb_out = nt_handler.io_completion_iosb_out;
-                    park_io_completion_deadline = nt_handler.io_completion_timeout.deadline_at_park();
+                    park_io_completion_deadline =
+                        nt_handler.io_completion_timeout.deadline_at_park();
                 }
                 if nt_handler.io_completion_wake.is_some() {
                     let _ = unsafe { io_completion_deliver(&mut nt_handler) };
@@ -9844,28 +9831,17 @@ pub(crate) unsafe fn service_sec_image(
                         .pending_file_io_reservation
                         .take()
                         .expect("pending File IRP has no pre-dispatch owner reservation");
-                    transfer_pending_file_io = Some((
-                        pending,
-                        nt_handler.pending_file_io_wait,
-                        reservation,
-                    ));
-                } else if let Some(reservation) =
-                    nt_handler.pending_file_io_reservation.take()
-                {
+                    transfer_pending_file_io =
+                        Some((pending, nt_handler.pending_file_io_wait, reservation));
+                } else if let Some(reservation) = nt_handler.pending_file_io_reservation.take() {
                     assert!(
                         (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
                             .cancel_reservation(reservation),
                         "unused pending File reservation became stale"
                     );
                 }
-                if let Some((batch, reservation)) =
-                    nt_handler.pending_driver_load_transfer.take()
-                {
-                    transfer_pending_driver_load = Some((
-                        batch,
-                        reservation,
-                        parked_syscall_reply,
-                    ));
+                if let Some((batch, reservation)) = nt_handler.pending_driver_load_transfer.take() {
+                    transfer_pending_driver_load = Some((batch, reservation, parked_syscall_reply));
                 }
                 if let Some(mut waiter) = nt_handler.pending_synchronous_file_wait.take() {
                     // Publish the exact FIFO owner before any post-dispatch completion can release
@@ -9902,18 +9878,14 @@ pub(crate) unsafe fn service_sec_image(
                         result = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES as u64;
                     }
                 }
-                if let Some((mut pending, reservation)) =
-                    nt_handler.pending_file_irp_drain.take()
-                {
+                if let Some((mut pending, reservation)) = nt_handler.pending_file_irp_drain.take() {
                     pending.reply_mrs = syscall_reply_context.regs;
                     pending.resume_ip = resume_ip;
                     pending.resume_sp = sp;
                     pending.resume_flags = flags;
                     transfer_file_irp_drain = Some((pending, reservation));
                 }
-                if let Some((file_id, reservation)) =
-                    nt_handler.pending_file_cleanup_wait.take()
-                {
+                if let Some((file_id, reservation)) = nt_handler.pending_file_cleanup_wait.take() {
                     let mut pending = nt_io_manager::PendingFileCleanupWait {
                         file_id,
                         pi: pi as u32,
@@ -9938,16 +9910,10 @@ pub(crate) unsafe fn service_sec_image(
                     let _ = synchronous_file_wake_next(&mut nt_handler, stale_grant.file_id);
                 }
                 if nt_handler.current_synchronous_file_lock != 0 {
-                    let file_id = core::mem::replace(
-                        &mut nt_handler.current_synchronous_file_lock,
-                        0,
-                    );
+                    let file_id =
+                        core::mem::replace(&mut nt_handler.current_synchronous_file_lock, 0);
                     let owner_tid = nt_handler.current_tid;
-                    let _ = synchronous_file_release_and_wake(
-                        &mut nt_handler,
-                        file_id,
-                        owner_tid,
-                    );
+                    let _ = synchronous_file_release_and_wake(&mut nt_handler, file_id, owner_tid);
                     nt_handler.release_file_reference(file_id);
                 }
                 if nt_handler.user_timer_rearm_requested {
@@ -9962,8 +9928,7 @@ pub(crate) unsafe fn service_sec_image(
                 if nt_handler.dbgk_block_request {
                     park_dbgk_reporter = true;
                 }
-                let hosted_io_progress =
-                    pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
+                let hosted_io_progress = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
                 if hosted_io_progress != 0
                     || FILE_IO_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel)
                 {
@@ -14831,15 +14796,11 @@ pub(crate) unsafe fn service_sec_image(
                         && (m0 == 0x1006 || m0 == 0x1001)
                         && a0 != 0
                         && r.1
-                        && message_output_stage.and_then(|stage| {
-                            win32k_glue::published_win32k_output_length(stage)
-                        }) == Some(WIN32K_MSG_BYTES as u32)
+                        && message_output_stage
+                            .and_then(|stage| win32k_glue::published_win32k_output_length(stage))
+                            == Some(WIN32K_MSG_BYTES as u32)
                     {
-                        let msg_ptr = if msg_returns_to_client {
-                            d_a0
-                        } else {
-                            a0
-                        };
+                        let msg_ptr = if msg_returns_to_client { d_a0 } else { a0 };
                         let hwnd = if msg_returns_to_client {
                             core::ptr::read_unaligned(msg_ptr as *const u64)
                         } else {
@@ -14976,11 +14937,7 @@ pub(crate) unsafe fn service_sec_image(
                     && m0 != nt_user_callback::NTUSER_DISPATCH_MESSAGE_SSN
                 {
                     let staged_msg = msg_returns_to_client && message_output_stage.is_some();
-                    let msg_ptr = if staged_msg {
-                        d_a0
-                    } else {
-                        a0
-                    };
+                    let msg_ptr = if staged_msg { d_a0 } else { a0 };
                     let hwnd = if msg_ptr != 0 {
                         if staged_msg {
                             core::ptr::read_unaligned(msg_ptr as *const u64)
@@ -15429,10 +15386,7 @@ pub(crate) unsafe fn service_sec_image(
                     } else if explorer_chrome_pending {
                         print_str(b"[quiesce] winlogon milestone parked; deferring gate until Explorer reaches shell chrome paint\n");
                     }
-                    let _ = finalize_service_loop_durable_state(
-                        &mut nt_handler,
-                        &mut heap_mark,
-                    );
+                    let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
@@ -15491,10 +15445,7 @@ pub(crate) unsafe fn service_sec_image(
                         stop = m0;
                         break;
                     }
-                    let _ = finalize_service_loop_durable_state(
-                        &mut nt_handler,
-                        &mut heap_mark,
-                    );
+                    let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
@@ -15516,10 +15467,7 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
                     mark_wait_parked!(pi, m0);
-                    let _ = finalize_service_loop_durable_state(
-                        &mut nt_handler,
-                        &mut heap_mark,
-                    );
+                    let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
@@ -15573,10 +15521,7 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
                     mark_wait_parked!(pi, m0);
-                    let _ = finalize_service_loop_durable_state(
-                        &mut nt_handler,
-                        &mut heap_mark,
-                    );
+                    let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
@@ -15608,10 +15553,7 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].first = first;
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
-                    let _ = finalize_service_loop_durable_state(
-                        &mut nt_handler,
-                        &mut heap_mark,
-                    );
+                    let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
@@ -15689,10 +15631,7 @@ pub(crate) unsafe fn service_sec_image(
                         stop = resume_ip;
                         break;
                     }
-                    let _ = finalize_service_loop_durable_state(
-                        &mut nt_handler,
-                        &mut heap_mark,
-                    );
+                    let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                     let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
@@ -15763,10 +15702,8 @@ pub(crate) unsafe fn service_sec_image(
                         pi as u32,
                         badge,
                     ) {
-                        let _ = finalize_service_loop_durable_state(
-                            &mut nt_handler,
-                            &mut heap_mark,
-                        );
+                        let _ =
+                            finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                         let received =
                             recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                         badge = received.0;
@@ -15785,10 +15722,7 @@ pub(crate) unsafe fn service_sec_image(
                         wait_parked,
                     );
                     mark_wait_parked!(pi, resume_ip);
-                    let _ = finalize_service_loop_durable_state(
-                        &mut nt_handler,
-                        &mut heap_mark,
-                    );
+                    let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                     let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
@@ -15833,10 +15767,7 @@ pub(crate) unsafe fn service_sec_image(
                         wait_parked,
                     );
                     mark_wait_parked!(pi, resume_ip);
-                    let _ = finalize_service_loop_durable_state(
-                        &mut nt_handler,
-                        &mut heap_mark,
-                    );
+                    let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                     let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
@@ -15881,10 +15812,7 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
-                    let _ = finalize_service_loop_durable_state(
-                        &mut nt_handler,
-                        &mut heap_mark,
-                    );
+                    let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                     let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
@@ -15911,10 +15839,7 @@ pub(crate) unsafe fn service_sec_image(
                     delay_tid,
                     badge,
                 ) {
-                    let _ = finalize_service_loop_durable_state(
-                        &mut nt_handler,
-                        &mut heap_mark,
-                    );
+                    let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let received = recv_full_r12(fault_ep, new_reply);
                     badge = received.0;
@@ -15957,10 +15882,7 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
-                    let _ = finalize_service_loop_durable_state(
-                        &mut nt_handler,
-                        &mut heap_mark,
-                    );
+                    let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let received = recv_full_r12(fault_ep, new_reply);
                     badge = received.0;
@@ -16006,10 +15928,7 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
-                    let _ = finalize_service_loop_durable_state(
-                        &mut nt_handler,
-                        &mut heap_mark,
-                    );
+                    let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let received = recv_full_r12(fault_ep, new_reply);
                     badge = received.0;
@@ -16087,10 +16006,7 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
-                    let _ = finalize_service_loop_durable_state(
-                        &mut nt_handler,
-                        &mut heap_mark,
-                    );
+                    let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -16146,10 +16062,7 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
-                    let _ = finalize_service_loop_durable_state(
-                        &mut nt_handler,
-                        &mut heap_mark,
-                    );
+                    let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -16167,10 +16080,7 @@ pub(crate) unsafe fn service_sec_image(
             // A contended synchronous File has referenced its canonical route but has not created
             // an IRP. Transfer the live syscall reply into the FIFO acquisition owner.
             if synchronous_file_wait_parked {
-                let _ = finalize_service_loop_durable_state(
-                    &mut nt_handler,
-                    &mut heap_mark,
-                );
+                let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                 let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                 badge = nb;
@@ -16183,15 +16093,8 @@ pub(crate) unsafe fn service_sec_image(
             }
             // Demand driver loads retain the exact START cursor and live syscall reply until every
             // devnode is terminal. Publication precedes Reply-object rotation.
-            if let Some((batch, reservation, reply)) =
-                transfer_pending_driver_load.take()
-            {
-                pending_driver_load_transfer(
-                    &mut nt_handler,
-                    batch,
-                    reservation,
-                    reply,
-                );
+            if let Some((batch, reservation, reply)) = transfer_pending_driver_load.take() {
+                pending_driver_load_transfer(&mut nt_handler, batch, reservation, reply);
                 trace_indefinite_wait_park(
                     &nt_handler,
                     badge,
@@ -16201,10 +16104,7 @@ pub(crate) unsafe fn service_sec_image(
                 );
                 mark_wait_parked!(pi, resume_ip);
                 let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
-                let _ = finalize_service_loop_durable_state(
-                    &mut nt_handler,
-                    &mut heap_mark,
-                );
+                let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                 let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                 badge = nb;
@@ -16248,10 +16148,7 @@ pub(crate) unsafe fn service_sec_image(
                 let _ = pending_file_io_redrive_all(&mut nt_handler);
                 let _ = file_cleanup_redrive_all(&mut nt_handler);
                 if wait_for_completion {
-                    let _ = finalize_service_loop_durable_state(
-                        &mut nt_handler,
-                        &mut heap_mark,
-                    );
+                    let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -16277,10 +16174,7 @@ pub(crate) unsafe fn service_sec_image(
                     // continuation publication. Redrive after ownership is visible so that edge
                     // completes the exact parked `NtClose` instead of waiting for another event.
                     let _ = file_cleanup_redrive_all(&mut nt_handler);
-                    let _ = finalize_service_loop_durable_state(
-                        &mut nt_handler,
-                        &mut heap_mark,
-                    );
+                    let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -16308,10 +16202,7 @@ pub(crate) unsafe fn service_sec_image(
                 let _ = pending_file_io_redrive_all(&mut nt_handler);
                 let _ = file_cleanup_redrive_all(&mut nt_handler);
                 let _ = file_irp_drain_redrive_all(&mut nt_handler);
-                let _ = finalize_service_loop_durable_state(
-                    &mut nt_handler,
-                    &mut heap_mark,
-                );
+                let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                 let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                 badge = nb;
@@ -16352,10 +16243,7 @@ pub(crate) unsafe fn service_sec_image(
                     // so it counts toward the all-parked quiesce exactly like every other wait —
                     // the boot still reaches the gate if the debugger never continues.
                     mark_wait_parked!(pi, resume_ip);
-                    let _ = finalize_service_loop_durable_state(
-                        &mut nt_handler,
-                        &mut heap_mark,
-                    );
+                    let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -19631,6 +19519,7 @@ pub(crate) unsafe fn service_sec_image(
             // (PEB/DESKINFO live in the dedicated env band), plus the WORK_CLUSTER PT that holds the
             // bounded thread-slot windows the remote thread's stack/TEB/IPC/trampoline land in.
             let target_pml4 = make!(OBJ_X86_PML4, PAGING_BITS);
+            require_vspace_asid(target_pml4, b"dbgk-breakin-target");
             map_image_skeleton(target_pml4, 1);
             map_hosted_client_env_pt(target_pml4);
             map_tp_worker_target_lane_pts(target_pml4);
@@ -22114,11 +22003,7 @@ unsafe fn csr_dynamic_with_peer<R>(
     out
 }
 
-unsafe fn csr_dynamic_wake(
-    cap: u64,
-    status: u64,
-    reply: nt_syscall_abi::ParkedSyscallReply,
-) {
+unsafe fn csr_dynamic_wake(cap: u64, status: u64, reply: nt_syscall_abi::ParkedSyscallReply) {
     reply_parked_syscall(cap, reply, status);
     release_reply_pool_cap(cap);
 }
@@ -22435,11 +22320,7 @@ unsafe fn lsa_steal_main_reply() -> Option<u64> {
 }
 
 /// Resume a thread blocked on a stolen reply cap with its complete retained syscall register file.
-unsafe fn lsa_wake(
-    cap: u64,
-    status: u64,
-    reply: nt_syscall_abi::ParkedSyscallReply,
-) {
+unsafe fn lsa_wake(cap: u64, status: u64, reply: nt_syscall_abi::ParkedSyscallReply) {
     reply_parked_syscall(cap, reply, status);
     release_reply_pool_cap(cap);
 }
@@ -22512,8 +22393,7 @@ unsafe fn lsa_clear_client_context() {
     LSA_CLI_OUT.store(0, Ordering::Relaxed);
     LSA_CLI_CONNINFO.store(0, Ordering::Relaxed);
     LSA_CLI_CONNINFO_LEN.store(0, Ordering::Relaxed);
-    *core::ptr::addr_of_mut!(LSA_CLI_REPLY) =
-        nt_syscall_abi::ParkedSyscallReply::native_call();
+    *core::ptr::addr_of_mut!(LSA_CLI_REPLY) = nt_syscall_abi::ParkedSyscallReply::native_call();
     LSA_CLI_TID.store(0, Ordering::Relaxed);
     LSA_CLI_REQUEST_API.store(u64::MAX, Ordering::Relaxed);
     LSA_CLI_REQUEST_LEN.store(0, Ordering::Relaxed);
@@ -22982,8 +22862,8 @@ unsafe fn reconcile_user_apc_file_acquisition_wait(
 ) -> bool {
     const STATUS_USER_APC: u32 = 0x0000_00C0;
 
-    let Some((slot, waiter)) = (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS))
-        .alertable_waiting_for_thread(tid)
+    let Some((slot, waiter)) =
+        (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).alertable_waiting_for_thread(tid)
     else {
         return false;
     };
@@ -23074,8 +22954,8 @@ pub(crate) unsafe fn reconcile_user_apc_file_wait(
     if reconcile_user_apc_file_acquisition_wait(nt_handler, tid) {
         return true;
     }
-    let Some((slot, pending)) = (&*core::ptr::addr_of!(PENDING_FILE_IO))
-        .user_apc_interrupt_candidate(tid)
+    let Some((slot, pending)) =
+        (&*core::ptr::addr_of!(PENDING_FILE_IO)).user_apc_interrupt_candidate(tid)
     else {
         return false;
     };
@@ -23097,12 +22977,7 @@ pub(crate) unsafe fn reconcile_user_apc_file_wait(
         return false;
     }
     (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
-        .mark_user_apc_interrupt_requested_exact(
-            slot,
-            pending.irp_id,
-            pending.file_id,
-            pending.tid,
-        )
+        .mark_user_apc_interrupt_requested_exact(slot, pending.irp_id, pending.file_id, pending.tid)
         .expect("APC interruption candidate lost its exact pending File owner");
 
     match driver_launch::cancel_irp_if_pending(pending.irp_id) {
@@ -23121,9 +22996,7 @@ pub(crate) unsafe fn reconcile_user_apc_file_wait(
 
 /// Transfer one general File syscall into its exact pending-IRP delivery owner. Synchronous
 /// operations also move the live syscall reply into that owner; asynchronous operations do not.
-unsafe fn synchronous_file_wait_park(
-    mut waiter: nt_io_manager::SynchronousFileWaiter,
-) -> bool {
+unsafe fn synchronous_file_wait_park(mut waiter: nt_io_manager::SynchronousFileWaiter) -> bool {
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     if stolen == 0 {
         return false;
@@ -23249,15 +23122,17 @@ pub(crate) unsafe fn start_file_cleanup(nt_handler: &mut ExecNtHandler, file_id:
         .file_completion
         .mark_cleanup_lifecycle_started(file_id)
         .expect("File cleanup started without its Busy/reference owner");
-    if first_start {
-        // FsContext is mutable driver payload, so retire the auxiliary endpoint
-        // indices only once cleanup actually owns its place behind ordinary I/O.
-        if let Some((_, fs_context)) = driver_launch::hosted_file_route(file_id) {
-            let server_context = nt_io_manager::pipe_server_file_id_for_endpoint(fs_context)
-                .unwrap_or(fs_context);
-            crate::pipe_server_preconnected_forget(server_context);
-            crate::pipe_fid_name_forget(fs_context);
-        }
+    if !first_start {
+        return;
+    }
+
+    // FsContext is mutable driver payload, so retire the auxiliary endpoint
+    // indices only once cleanup actually owns its place behind ordinary I/O.
+    if let Some((_, fs_context)) = driver_launch::hosted_file_route(file_id) {
+        let server_context =
+            nt_io_manager::pipe_server_file_id_for_endpoint(fs_context).unwrap_or(fs_context);
+        crate::pipe_server_preconnected_forget(server_context);
+        crate::pipe_fid_name_forget(fs_context);
     }
     driver_launch::release_hosted_file(file_id)
         .expect("canonical File cleanup was rejected before driver acceptance");
@@ -23332,7 +23207,10 @@ unsafe fn pending_driver_load_transfer(
     reply: nt_syscall_abi::ParkedSyscallReply,
 ) {
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-    assert_ne!(stolen, 0, "pending driver-load Reply object disappeared after preflight");
+    assert_ne!(
+        stolen, 0,
+        "pending driver-load Reply object disappeared after preflight"
+    );
     let (fresh_index, fresh) = wait_reply_pool_find_free()
         .expect("pending driver-load Reply-pool claim disappeared after preflight");
     nt_handler
@@ -23486,9 +23364,7 @@ fn pending_driver_start_redrive_needed(nt_handler: &ExecNtHandler) -> bool {
         })
 }
 
-fn pending_driver_start_reports_snapshot(
-    nt_handler: &ExecNtHandler,
-) -> BootDriverStartReports {
+fn pending_driver_start_reports_snapshot(nt_handler: &ExecNtHandler) -> BootDriverStartReports {
     let mut reports = nt_handler.boot_driver_start_reports;
     for slot in nt_handler.pending_driver_loads.occupied_slots() {
         let Some(pending) = nt_handler.pending_driver_loads.get(slot) else {
@@ -23523,10 +23399,9 @@ pub(crate) unsafe fn pending_driver_load_abandon_thread(
         if reply.tid != tid || reply.reply_cap == 0 {
             continue;
         }
-        let PendingDriverStartOwner::Native(reply) = core::mem::replace(
-            &mut pending.owner,
-            PendingDriverStartOwner::Detached,
-        ) else {
+        let PendingDriverStartOwner::Native(reply) =
+            core::mem::replace(&mut pending.owner, PendingDriverStartOwner::Detached)
+        else {
             unreachable!()
         };
         let cap = reply.reply_cap;
@@ -23561,9 +23436,12 @@ unsafe fn pending_file_io_transfer(
         return;
     }
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-    assert_ne!(stolen, 0, "pending File reply cap disappeared after preflight");
-    let (fresh_index, fresh) =
-        wait_reply_pool_find_free().expect("pending File reply-pool claim disappeared after preflight");
+    assert_ne!(
+        stolen, 0,
+        "pending File reply cap disappeared after preflight"
+    );
+    let (fresh_index, fresh) = wait_reply_pool_find_free()
+        .expect("pending File reply-pool claim disappeared after preflight");
     pending.reply_cap = stolen;
     pending.reply_required = true;
     pending.resume_ip = resume_ip;
@@ -23587,7 +23465,10 @@ unsafe fn file_irp_drain_transfer(
     reservation: nt_io_manager::PendingFileIrpDrainReservation,
 ) {
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-    assert_ne!(stolen, 0, "File IRP drain reply cap disappeared after preflight");
+    assert_ne!(
+        stolen, 0,
+        "File IRP drain reply cap disappeared after preflight"
+    );
     let (fresh_index, fresh) = wait_reply_pool_find_free()
         .expect("File IRP drain reply-pool claim disappeared after preflight");
     pending.reply_cap = stolen;
@@ -23619,7 +23500,10 @@ unsafe fn file_cleanup_wait_transfer(
         return false;
     }
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-    assert_ne!(stolen, 0, "File cleanup reply cap disappeared after preflight");
+    assert_ne!(
+        stolen, 0,
+        "File cleanup reply cap disappeared after preflight"
+    );
     let (fresh_index, fresh) = wait_reply_pool_find_free()
         .expect("File cleanup reply-pool claim disappeared after preflight");
     pending.reply_cap = stolen;
@@ -23751,8 +23635,7 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             if delivery_state & nt_io_manager::IO_DELIVERY_CREATE_COMMITTED == 0 {
                 let reservation = ExecNtHandler::pending_create_reservation(create);
                 let publication = if (completed.status as i32) < 0 {
-                    nt_handler
-                        .cancel_hosted_create_publication(pending.file_id, reservation);
+                    nt_handler.cancel_hosted_create_publication(pending.file_id, reservation);
                     HostedCreatePublication {
                         status: completed.status,
                         information: completed.information,
@@ -23772,10 +23655,8 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                     ) {
                         Ok(publication) => publication,
                         Err(status) => {
-                            nt_handler.cancel_hosted_create_publication(
-                                pending.file_id,
-                                reservation,
-                            );
+                            nt_handler
+                                .cancel_hosted_create_publication(pending.file_id, reservation);
                             HostedCreatePublication {
                                 status,
                                 information: 0,
@@ -23811,7 +23692,8 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             terminal_status = create.status;
             terminal_information = create.information;
             if delivery_state & nt_io_manager::IO_DELIVERY_HANDLE_PUBLISHED == 0 {
-                if !nt_handler.xas_try_write_buf(create.handle_va, &create.handle_value.to_le_bytes())
+                if !nt_handler
+                    .xas_try_write_buf(create.handle_va, &create.handle_value.to_le_bytes())
                 {
                     FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
                     restore_file_io_mirrors!();
@@ -23860,10 +23742,8 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                         break;
                     }
                 };
-                if !nt_handler.xas_try_write_buf(
-                    pending.output_va + offset as u64,
-                    &work[..copied],
-                ) {
+                if !nt_handler.xas_try_write_buf(pending.output_va + offset as u64, &work[..copied])
+                {
                     copy_failed = true;
                     break;
                 }
@@ -23878,12 +23758,7 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                     );
                 }
                 offset = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
-                    .advance_output_exact(
-                        slot,
-                        pending.irp_id,
-                        copied as u32,
-                        delivery_len,
-                    )
+                    .advance_output_exact(slot, pending.irp_id, copied as u32, delivery_len)
                     .expect("pending File output progress lost");
             }
             if delivery_len == 0 {
@@ -23902,14 +23777,10 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 .delivery_state;
         }
 
-        if pending.iosb_va != 0
-            && delivery_state & nt_io_manager::IO_DELIVERY_IOSB_PUBLISHED == 0
-        {
+        if pending.iosb_va != 0 && delivery_state & nt_io_manager::IO_DELIVERY_IOSB_PUBLISHED == 0 {
             if !nt_handler.xas_try_write_buf(pending.iosb_va, &terminal_status.to_le_bytes())
-                || !nt_handler.xas_try_write_buf(
-                    pending.iosb_va + 8,
-                    &terminal_information.to_le_bytes(),
-                )
+                || !nt_handler
+                    .xas_try_write_buf(pending.iosb_va + 8, &terminal_information.to_le_bytes())
             {
                 FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
                 restore_file_io_mirrors!();
@@ -23927,7 +23798,11 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         if pending.event_obj_idx != u64::MAX
             && delivery_state & nt_io_manager::IO_DELIVERY_EVENT_PUBLISHED == 0
         {
-            if nt_handler.events.set_existing(pending.event_obj_idx).is_none() {
+            if nt_handler
+                .events
+                .set_existing(pending.event_obj_idx)
+                .is_none()
+            {
                 FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
                 restore_file_io_mirrors!();
                 continue;
@@ -23941,9 +23816,7 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 )
                 .expect("pending File event owner disappeared");
         }
-        if pending.signal_file
-            && delivery_state & nt_io_manager::IO_DELIVERY_FILE_PUBLISHED == 0
-        {
+        if pending.signal_file && delivery_state & nt_io_manager::IO_DELIVERY_FILE_PUBLISHED == 0 {
             if nt_handler.signal_file_completion(pending.file_id, terminal_status)
                 != nt_fs::STATUS_SUCCESS
             {

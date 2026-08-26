@@ -24,8 +24,8 @@ use nt_pnp::{
     assign_resources, assign_root_bus_resources, assignment_to_cm_list, enumerate_bus,
     pci_boot_resources, pci_resource_requirements, pci_resource_requirements_filtered,
     root_bus_resource_requirements, PciDevice, PciInterruptAssignment, ResourceAssignment,
-    ResourceView, RootBusResourceCatalog, RootBusResourceProfile,
-    ASSIGNMENT_CM_LIST_MAX_SIZE, ROOT_DMA_TEST_RESOURCE_PROFILE,
+    ResourceView, RootBusResourceCatalog, RootBusResourceProfile, ASSIGNMENT_CM_LIST_MAX_SIZE,
+    ROOT_DMA_TEST_RESOURCE_PROFILE,
 };
 
 static mut ROOT_BUS_RESOURCE_CATALOG: Option<RootBusResourceCatalog> = None;
@@ -75,13 +75,7 @@ pub(crate) unsafe fn program_pci_interrupt_line(
         print_str(b"[pnp] PCI InterruptLine program rejected: configuration authority absent\n");
         return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
     }
-    let interrupt = pci_read32(
-        PCI_CONFIG_IO_CAP,
-        device.bus,
-        device.dev,
-        device.func,
-        0x3c,
-    );
+    let interrupt = pci_read32(PCI_CONFIG_IO_CAP, device.bus, device.dev, device.func, 0x3c);
     let previous_line = interrupt as u8;
     if previous_line != device.irq_line {
         print_str(b"[pnp] PCI InterruptLine program rejected: stale snapshot current=");
@@ -102,13 +96,7 @@ pub(crate) unsafe fn program_pci_interrupt_line(
             0x3c,
             (interrupt & !0xff) | assigned_line as u32,
         );
-        if pci_read32(
-            PCI_CONFIG_IO_CAP,
-            device.bus,
-            device.dev,
-            device.func,
-            0x3c,
-        ) as u8
+        if pci_read32(PCI_CONFIG_IO_CAP, device.bus, device.dev, device.func, 0x3c) as u8
             != assigned_line
         {
             print_str(b"[pnp] PCI InterruptLine write did not latch bus=");
@@ -140,9 +128,7 @@ pub(crate) unsafe fn program_pci_interrupt_line(
     }))
 }
 
-pub(crate) unsafe fn restore_pci_interrupt_line(
-    programming: PciInterruptLineProgramming,
-) -> bool {
+pub(crate) unsafe fn restore_pci_interrupt_line(programming: PciInterruptLineProgramming) -> bool {
     if PCI_CONFIG_IO_CAP == 0 || programming.previous_line == programming.assigned_line {
         return PCI_CONFIG_IO_CAP != 0;
     }
@@ -258,8 +244,7 @@ pub(crate) fn build_devnode_pci_resource_grant(
     interrupt: Option<PciInterruptAssignment>,
     dma_len: u64,
 ) -> Option<DevnodePciResourceGrant> {
-    let assignment = assign_resources(&bus_resources.device, interrupt, dma_len)
-        .ok()??;
+    let assignment = assign_resources(&bus_resources.device, interrupt, dma_len).ok()??;
     let resource_requirements =
         pci_resource_requirements_filtered(&bus_resources.device, interrupt.is_some()).ok()??;
     let mut translated_resource_list = vec![0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];

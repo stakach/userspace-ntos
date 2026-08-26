@@ -86,16 +86,7 @@ unsafe fn checked_spawn_object_retype(slot: u64, object_type: u64, bits: u32, st
 
 #[inline]
 unsafe fn checked_spawn_asid(pml4: u64) {
-    let error = vspace_assign_asid(pml4);
-    if error != 0 {
-        print_str(b"[spawn-asid] assign failed pml4=0x");
-        print_hex((pml4 >> 32) as u32);
-        print_hex(pml4 as u32);
-        print_str(b" error=");
-        print_u64(error);
-        print_str(b"\n");
-        panic!("spawn asid assignment failed");
-    }
+    require_vspace_asid(pml4, b"hosted-sec-image");
 }
 
 #[inline]
@@ -524,7 +515,7 @@ pub(crate) unsafe fn spawn_pe_thread(
     // `Page::Unmap` cannot find this vspace (`pml4_paddr_for_asid(0)` == "none") and every unmap of
     // this process's pages silently leaves the leaf PTE live — which surfaces much later as a
     // `seL4_DeleteFirst` phantom out-of-memory on the next commit at that VA. See `vspace_assign_asid`.
-    let _ = vspace_assign_asid(pml4);
+    require_vspace_asid(pml4, b"isolated-pe-thread");
     let pdpt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
     let pd = alloc_slot();

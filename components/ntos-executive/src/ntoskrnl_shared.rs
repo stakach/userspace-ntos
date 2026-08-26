@@ -109,9 +109,8 @@ pub extern "win64" fn s_rtl_integer_to_unicode_string(value: u32, base: u32, dst
     };
     let bytes = unit_count * 2;
     unsafe {
-        let maximum = core::ptr::read_unaligned(
-            (dst + UNICODE_STRING_MAXIMUM_LENGTH) as *const u16,
-        ) as usize;
+        let maximum =
+            core::ptr::read_unaligned((dst + UNICODE_STRING_MAXIMUM_LENGTH) as *const u16) as usize;
         let buffer = core::ptr::read_unaligned((dst + UNICODE_STRING_BUFFER) as *const u64);
         if bytes > maximum {
             return STATUS_BUFFER_TOO_SMALL;

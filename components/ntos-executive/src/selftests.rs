@@ -355,6 +355,7 @@ pub(crate) unsafe fn dbgk_client_spawn(
     };
     let pml4 = push(alloc_slot());
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    require_vspace_asid(pml4, b"dbgk-client-selftest");
     let pdpt = push(alloc_slot());
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
     let pd = push(alloc_slot());
@@ -457,6 +458,7 @@ pub(crate) unsafe fn xview_spawn(
     };
     let pml4 = push(alloc_slot());
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    require_vspace_asid(pml4, b"xview-selftest");
     let pdpt = push(alloc_slot());
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
     let pd = push(alloc_slot());

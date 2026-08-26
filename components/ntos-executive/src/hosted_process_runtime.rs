@@ -4,8 +4,8 @@
 //! address bands below preserve the current boot layout, but callers no longer pass image-specific
 //! `HostedProcessRuntime` constants around as identity.
 #![allow(clippy::all)]
-use alloc::vec::Vec;
 use crate::*;
+use alloc::vec::Vec;
 use nt_hosted_runtime::{DynamicRuntimeArena, ProcessRuntimeLayout};
 
 #[derive(Clone, Copy)]

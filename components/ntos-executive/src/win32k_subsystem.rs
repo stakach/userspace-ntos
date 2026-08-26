@@ -41,10 +41,10 @@ use nt_compat_exports::{
 
 // Pure, driver-agnostic ntoskrnl byte/string primitives shared with the FSD class.
 use crate::ntoskrnl_shared::{
-    s_ex_query_depth_slist, s_exp_interlocked_pop_entry_slist,
-    s_exp_interlocked_push_entry_slist, s_ke_query_performance_counter, s_memcpy, s_memmove,
-    s_memset, s_rtl_compare_memory, s_rtl_integer_to_unicode_string, s_rtl_time_to_time_fields,
-    s_rtl_unicode_string_to_integer, s_wcslen,
+    s_ex_query_depth_slist, s_exp_interlocked_pop_entry_slist, s_exp_interlocked_push_entry_slist,
+    s_ke_query_performance_counter, s_memcpy, s_memmove, s_memset, s_rtl_compare_memory,
+    s_rtl_integer_to_unicode_string, s_rtl_time_to_time_fields, s_rtl_unicode_string_to_integer,
+    s_wcslen,
 };
 
 use crate::*;
@@ -150,8 +150,7 @@ pub const WIN32K_MESSAGE_STAGE_SLOT_BYTES: u64 = 64;
 pub const WIN32K_MESSAGE_STAGE_SLOTS: u64 = 0x1000 / WIN32K_MESSAGE_STAGE_SLOT_BYTES;
 pub const WIN32K_MESSAGE_STAGE_OUTPUT_LENGTH_OFFSET: u64 = 56;
 const _: () = assert!(
-    WIN32K_MESSAGE_STAGE_BASE
-        + WIN32K_MESSAGE_STAGE_SLOTS * WIN32K_MESSAGE_STAGE_SLOT_BYTES
+    WIN32K_MESSAGE_STAGE_BASE + WIN32K_MESSAGE_STAGE_SLOTS * WIN32K_MESSAGE_STAGE_SLOT_BYTES
         == WIN32K_ARG_VADDR + WIN32K_ARG_FRAMES * 0x1000
 );
 const _: () = assert!(WIN32K_MESSAGE_STAGE_SLOTS <= u64::BITS as u64);
@@ -159,9 +158,8 @@ const _: () = assert!(
     WIN32K_MESSAGE_STAGE_OUTPUT_LENGTH_OFFSET
         >= nt_user_callback::DISPATCH_MESSAGE_OUTPUT_BYTES as u64
 );
-const _: () = assert!(
-    WIN32K_MESSAGE_STAGE_OUTPUT_LENGTH_OFFSET + 8 <= WIN32K_MESSAGE_STAGE_SLOT_BYTES
-);
+const _: () =
+    assert!(WIN32K_MESSAGE_STAGE_OUTPUT_LENGTH_OFFSET + 8 <= WIN32K_MESSAGE_STAGE_SLOT_BYTES);
 /// Dedicated cross-address-space video-control window. `EngDeviceIoControl` runs in the win32k
 /// component, but hosted miniport IRPs are executive-owned; this window carries bounded METHOD_BUFFERED
 /// input/output bytes without reusing the live syscall ARG frame or the user-callback shared page.
@@ -5482,11 +5480,7 @@ unsafe fn process_context_object_or_allocate(
     Some(object)
 }
 
-unsafe fn thread_context_object_or_allocate(
-    index: usize,
-    supplied: u64,
-    size: u64,
-) -> Option<u64> {
+unsafe fn thread_context_object_or_allocate(index: usize, supplied: u64, size: u64) -> Option<u64> {
     let existing = thread_ctx_ethread(index);
     if existing != 0 {
         return Some(existing);
@@ -5619,11 +5613,12 @@ unsafe fn current_w32thread() -> u64 {
         .unwrap_or(0)
 }
 
-static mut WIN32K_EXECUTIVE_RESOURCES: Option<nt_kernel_exec::executive_sync::ExecutiveResourceStore> =
-    None;
+static mut WIN32K_EXECUTIVE_RESOURCES: Option<
+    nt_kernel_exec::executive_sync::ExecutiveResourceStore,
+> = None;
 
-fn executive_resources_mut(
-) -> &'static mut nt_kernel_exec::executive_sync::ExecutiveResourceStore {
+fn executive_resources_mut() -> &'static mut nt_kernel_exec::executive_sync::ExecutiveResourceStore
+{
     unsafe {
         let slot = &mut *core::ptr::addr_of_mut!(WIN32K_EXECUTIVE_RESOURCES);
         if slot.is_none() {
@@ -5678,8 +5673,7 @@ fn reject_resource_sync(
                         as u64) as *const u32,
             );
             let active_entries = read_unaligned(
-                (resource
-                    + nt_kernel_exec::executive_sync::eresource_layout::ACTIVE_ENTRIES as u64)
+                (resource + nt_kernel_exec::executive_sync::eresource_layout::ACTIVE_ENTRIES as u64)
                     as *const u32,
             );
             print_str(b" native-owner=0x");
@@ -5761,9 +5755,7 @@ fn acquire_resource_lite(
     operation: &'static [u8],
 ) -> u8 {
     let thread = unsafe { current_ethread() };
-    match unsafe {
-        executive_resources_mut().acquire(resource as *mut u8, thread, mode)
-    } {
+    match unsafe { executive_resources_mut().acquire(resource as *mut u8, thread, mode) } {
         Ok(nt_kernel_exec::executive_sync::AcquireResult::Acquired) => 1,
         Ok(nt_kernel_exec::executive_sync::AcquireResult::WouldBlock) if !wait => 0,
         Ok(nt_kernel_exec::executive_sync::AcquireResult::WouldBlock) => reject_resource_sync(
@@ -5799,9 +5791,7 @@ extern "win64" fn s_ex_acquire_resource_shared_lite(resource: u64, wait: u8) -> 
 /// `VOID ExReleaseResourceLite(PERESOURCE Resource)`.
 extern "win64" fn s_ex_release_resource_lite(resource: u64) {
     let thread = unsafe { current_ethread() };
-    if let Err(error) =
-        unsafe { executive_resources_mut().release(resource as *mut u8, thread) }
-    {
+    if let Err(error) = unsafe { executive_resources_mut().release(resource as *mut u8, thread) } {
         reject_resource_sync(b"ExReleaseResourceLite", error, resource, thread);
     }
 }
@@ -5825,21 +5815,18 @@ extern "win64" fn s_ex_is_resource_acquired_shared_lite(resource: u64) -> u32 {
     let thread = unsafe { current_ethread() };
     match executive_resources_mut().acquired_count(resource, thread) {
         Ok(count) => count,
-        Err(error) => reject_resource_sync(
-            b"ExIsResourceAcquiredSharedLite",
-            error,
-            resource,
-            thread,
-        ),
+        Err(error) => {
+            reject_resource_sync(b"ExIsResourceAcquiredSharedLite", error, resource, thread)
+        }
     }
 }
 
 /// `VOID KeEnterCriticalRegion(VOID)`.
 extern "win64" fn s_ke_enter_critical_region() {
     let thread = unsafe { current_ethread() };
-    if let Err(error) = unsafe {
-        nt_kernel_exec::executive_sync::enter_critical_region(thread as *mut u8)
-    } {
+    if let Err(error) =
+        unsafe { nt_kernel_exec::executive_sync::enter_critical_region(thread as *mut u8) }
+    {
         reject_executive_sync(b"KeEnterCriticalRegion", error);
     }
 }
@@ -5847,9 +5834,9 @@ extern "win64" fn s_ke_enter_critical_region() {
 /// `VOID KeLeaveCriticalRegion(VOID)`.
 extern "win64" fn s_ke_leave_critical_region() {
     let thread = unsafe { current_ethread() };
-    if let Err(error) = unsafe {
-        nt_kernel_exec::executive_sync::leave_critical_region(thread as *mut u8)
-    } {
+    if let Err(error) =
+        unsafe { nt_kernel_exec::executive_sync::leave_critical_region(thread as *mut u8) }
+    {
         reject_executive_sync(b"KeLeaveCriticalRegion", error);
     }
 }
@@ -5857,9 +5844,9 @@ extern "win64" fn s_ke_leave_critical_region() {
 /// `VOID KeEnterGuardedRegion(VOID)`.
 extern "win64" fn s_ke_enter_guarded_region() {
     let thread = unsafe { current_ethread() };
-    if let Err(error) = unsafe {
-        nt_kernel_exec::executive_sync::enter_guarded_region(thread as *mut u8)
-    } {
+    if let Err(error) =
+        unsafe { nt_kernel_exec::executive_sync::enter_guarded_region(thread as *mut u8) }
+    {
         reject_executive_sync(b"KeEnterGuardedRegion", error);
     }
 }
@@ -5867,9 +5854,9 @@ extern "win64" fn s_ke_enter_guarded_region() {
 /// `VOID KeLeaveGuardedRegion(VOID)`.
 extern "win64" fn s_ke_leave_guarded_region() {
     let thread = unsafe { current_ethread() };
-    if let Err(error) = unsafe {
-        nt_kernel_exec::executive_sync::leave_guarded_region(thread as *mut u8)
-    } {
+    if let Err(error) =
+        unsafe { nt_kernel_exec::executive_sync::leave_guarded_region(thread as *mut u8) }
+    {
         reject_executive_sync(b"KeLeaveGuardedRegion", error);
     }
 }
@@ -6535,9 +6522,7 @@ unsafe fn restore_current_context_for_user_callback_resume_inner(
         }
         return false;
     };
-    if process_ctx_pi(process_index) != pi as u64
-        || thread_ctx_pi(thread_index) != pi as u64
-    {
+    if process_ctx_pi(process_index) != pi as u64 || thread_ctx_pi(thread_index) != pi as u64 {
         let n = WIN32K_CALLBACK_RESUME_CONTEXT_FAILURES.fetch_add(1, Ordering::Relaxed);
         if n < 16 {
             print_str(b"[win32k-context] ERROR: callback resume pi mismatch pi=");
@@ -6684,15 +6669,18 @@ unsafe fn ensure_process_context(
     if eprocess == 0 {
         return None;
     }
-    commit_process_ctx_record(index, Win32kProcessContextRecord {
-        pid,
-        pi: pi as u64,
-        eprocess,
-        w32process: 0,
-        client_peb,
-        token_authentication_id: 0,
-        primary_token: 0,
-    });
+    commit_process_ctx_record(
+        index,
+        Win32kProcessContextRecord {
+            pid,
+            pi: pi as u64,
+            eprocess,
+            w32process: 0,
+            client_peb,
+            token_authentication_id: 0,
+            primary_token: 0,
+        },
+    );
     initialize_eprocess_body(eprocess, pid, client_peb);
     Some(index)
 }
@@ -6733,15 +6721,18 @@ unsafe fn ensure_thread_context(
     if ethread == 0 {
         return None;
     }
-    commit_thread_ctx_record(index, Win32kThreadContextRecord {
-        tid,
-        pid,
-        pi: pi as u64,
-        teb,
-        callout_teb: 0,
-        ethread,
-        w32thread: 0,
-    });
+    commit_thread_ctx_record(
+        index,
+        Win32kThreadContextRecord {
+            tid,
+            pid,
+            pi: pi as u64,
+            teb,
+            callout_teb: 0,
+            ethread,
+            w32thread: 0,
+        },
+    );
     Some(index)
 }
 
@@ -7526,10 +7517,7 @@ extern "win64" fn s_rtl_format_current_user_key_path(key_path: *mut u8) -> i32 {
         }
         write_unaligned((buffer + bytes as u64) as *mut u16, 0);
         write_unaligned(key_path as *mut u16, bytes as u16);
-        write_unaligned(
-            (key_path as *mut u16).add(1),
-            allocation_bytes as u16,
-        );
+        write_unaligned((key_path as *mut u16).add(1), allocation_bytes as u16);
         write_unaligned(key_path.add(8) as *mut u64, buffer);
     }
     0
@@ -7762,7 +7750,10 @@ extern "win64" fn s_rtl_ansi_string_to_unicode_string(
         if source_len != 0 && source_buffer == 0 {
             return STATUS_ACCESS_VIOLATION_I32;
         }
-        let Some(required) = source_len.checked_add(1).and_then(|units| units.checked_mul(2)) else {
+        let Some(required) = source_len
+            .checked_add(1)
+            .and_then(|units| units.checked_mul(2))
+        else {
             return STATUS_INVALID_PARAMETER_2;
         };
         if required > u16::MAX as usize {
@@ -7893,10 +7884,7 @@ extern "win64" fn s_rtl_unicode_string_to_ansi_string(
             return STATUS_ACCESS_VIOLATION_I32;
         }
         let state = win32k_nls_state();
-        let wide_table = nls_unicode_to_byte_table(
-            NLS_ANSI_VADDR,
-            state.ansi_wide_byte_offset,
-        );
+        let wide_table = nls_unicode_to_byte_table(NLS_ANSI_VADDR, state.ansi_wide_byte_offset);
         let input: &[u16] = if source_units == 0 {
             &[]
         } else {
@@ -8739,8 +8727,7 @@ extern "win64" fn s_rtl_query_registry_values(
                 return 0;
             }
             if flags & RTL_QUERY_REGISTRY_SUBKEY != 0
-                || (flags & RTL_QUERY_REGISTRY_DIRECT != 0
-                    && (name_ptr == 0 || query_routine != 0))
+                || (flags & RTL_QUERY_REGISTRY_DIRECT != 0 && (name_ptr == 0 || query_routine != 0))
             {
                 return STATUS_INVALID_PARAMETER_I32;
             }
@@ -8774,7 +8761,8 @@ extern "win64" fn s_rtl_query_registry_values(
                     context,
                 )
             } else if default_type != REG_NONE && default_data != 0 && default_length != 0 {
-                let data = core::slice::from_raw_parts(default_data as *const u8, default_length as usize);
+                let data =
+                    core::slice::from_raw_parts(default_data as *const u8, default_length as usize);
                 rtl_query_registry_dispatch(
                     flags,
                     query_routine,
@@ -9570,10 +9558,7 @@ fn register_trampolines() -> bool {
         "RtlUnicodeToMultiByteSize",
         s_rtl_unicode_to_multibyte_size as usize as u64,
     );
-    reg.bind(
-        "RtlOemToUnicodeN",
-        s_rtl_oem_to_unicode_n as usize as u64,
-    );
+    reg.bind("RtlOemToUnicodeN", s_rtl_oem_to_unicode_n as usize as u64);
     reg.bind(
         "RtlUpcaseUnicodeChar",
         s_rtl_upcase_unicode_char as usize as u64,
@@ -9640,10 +9625,7 @@ fn register_trampolines() -> bool {
         "ExpInterlockedPopEntrySList",
         s_exp_interlocked_pop_entry_slist as usize as u64,
     );
-    reg.bind(
-        "ExQueryDepthSList",
-        s_ex_query_depth_slist as usize as u64,
-    );
+    reg.bind("ExQueryDepthSList", s_ex_query_depth_slist as usize as u64);
     // --- batch 3: Zw virtual-memory / registry / file (canned; see backlog) ---
     reg.bind(
         "ZwAllocateVirtualMemory",
@@ -10223,10 +10205,7 @@ unsafe fn reject_win32k_nls(reason: &[u8]) -> bool {
 
 unsafe fn validate_and_publish_win32k_nls(nls_sizes: [usize; 3]) -> bool {
     let [ansi_size, oem_size, case_size] = nls_sizes;
-    if ansi_size == 0
-        || ansi_size & 1 != 0
-        || ansi_size as u64 > NLS_ANSI_FRAMES * 0x1000
-    {
+    if ansi_size == 0 || ansi_size & 1 != 0 || ansi_size as u64 > NLS_ANSI_FRAMES * 0x1000 {
         return reject_win32k_nls(b"invalid c_1252.nls size");
     }
     if oem_size == 0 || oem_size & 1 != 0 || oem_size as u64 > NLS_OEM_FRAMES * 0x1000 {
@@ -10284,7 +10263,10 @@ unsafe fn validate_and_publish_win32k_nls(nls_sizes: [usize; 3]) -> bool {
         upper_case_index: case_layout.upper_index as u32,
         upper_case_len: case_layout.upper_len as u32,
     };
-    write_volatile(WIN32K_NLS_MB_TAG_VA as *mut u8, ansi_layout.dbcs_code_page as u8);
+    write_volatile(
+        WIN32K_NLS_MB_TAG_VA as *mut u8,
+        ansi_layout.dbcs_code_page as u8,
+    );
     write_unaligned(WIN32K_NLS_STATE_VA as *mut Win32kNlsState, state);
     print_str(b"[win32k-nls] validated CP1252/CP437/l_intl tables\n");
     true
@@ -10470,7 +10452,10 @@ pub(crate) unsafe fn pool_alloc_export(size: u64) -> u64 {
 
 #[no_mangle]
 #[link_section = ".text.win32k_subsystem_entry"]
-pub unsafe extern "C" fn win32k_subsystem_entry() -> ! {
+pub unsafe extern "C" fn win32k_subsystem_entry(heap_frames: u64) -> ! {
+    if !unsafe { allocator::initialize_mapped_heap(heap_frames) } {
+        park();
+    }
     // NOW RUNS ON THE SHARED HARNESS (Phase B, Step 4b). The DriverEntry preamble (build DRIVER_OBJECT
     // + RegistryPath from win32k's OWN pool, mark V_ENTERED, call DriverEntry, record verdict/status),
     // the `post_driver_entry` hook, and the persistent send_done→recv_req→dispatch→writeback loop are

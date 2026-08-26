@@ -14,7 +14,10 @@ use crate::*;
 
 #[no_mangle]
 #[link_section = ".text.storage_host_entry"]
-pub unsafe extern "C" fn storage_host_entry() -> ! {
+pub unsafe extern "C" fn storage_host_entry(heap_frames: u64) -> ! {
+    if !unsafe { allocator::initialize_mapped_heap(heap_frames) } {
+        park();
+    }
     // The executive left the DMA frame's physical address in the shared word — this host has
     // no X86PageGetAddress path of its own (least privilege).
     let dma_paddr = core::ptr::read_volatile(STORAGE_SHARED_VADDR as *const u64);

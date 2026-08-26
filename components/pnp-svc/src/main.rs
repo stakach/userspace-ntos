@@ -172,6 +172,9 @@ unsafe fn build_component_vspace(sub: u64, comp: u64, req: u64, rep: u64, with_d
 
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    if vspace_assign_asid(pml4) != 0 {
+        panic!("PnP service VSpace ASID assignment failed");
+    }
     let pdpt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
     let pd = alloc_slot();

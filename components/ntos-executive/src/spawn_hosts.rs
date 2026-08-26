@@ -149,7 +149,7 @@ pub(crate) struct HostCaps {
 /// (which frames/VAs/rights/caps). [`spawn_component`] turns it into the seL4 MECHANISM.
 pub(crate) struct ComponentDescriptor<'a> {
     /// The component's entry point (a raw executive fn — the hosted-PE trampolines live in the image).
-    pub entry: unsafe extern "C" fn() -> !,
+    pub entry: unsafe extern "C" fn(u64) -> !,
     /// The executive image mapping (base = `IMAGE_BASE`, count = `IMAGE_FRAMES_COUNT`); its rights
     /// differ per host (RO / RWX / W^X). The image skeleton (pdpt/pd/image PTs/cluster PT) is
     /// always built.
@@ -265,11 +265,29 @@ fn component_heap_pt_count(frames: u64) -> u64 {
     frames.div_ceil(512).max(1)
 }
 
+fn component_allocator_heap_frames(d: &ComponentDescriptor) -> u64 {
+    let mut frames = 0u64;
+    for region in d.regions {
+        if region.base_va != allocator::HEAP_BASE as u64 || region.count == 0 {
+            continue;
+        }
+        assert_eq!(
+            frames, 0,
+            "component declares multiple allocator heap regions"
+        );
+        frames = region.count;
+    }
+    assert!(frames <= allocator::HEAP_FRAMES);
+    assert_eq!(d.map_heap_pt, frames != 0);
+    frames
+}
+
 #[inline]
 fn component_descriptor_map_cap_count(d: &ComponentDescriptor, img_count: u64) -> u64 {
     let image_skeleton_caps = 2 + component_heap_pt_count(img_count) + 1;
-    let heap_caps = if d.map_heap_pt {
-        component_heap_pt_count(allocator::DEFAULT_SERVICE_HEAP_FRAMES)
+    let heap_frames = component_allocator_heap_frames(d);
+    let heap_caps = if heap_frames != 0 {
+        component_heap_pt_count(heap_frames)
     } else {
         0
     };
@@ -515,26 +533,16 @@ unsafe fn component_map_image_skeleton(pml4: u64, img_count: u64, bank: &mut Com
 pub(crate) unsafe fn spawn_component(d: &ComponentDescriptor) -> SpawnedComponent {
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
+    let heap_frames = component_allocator_heap_frames(d);
     trace_component_spawn_stage(b"enter", d.entry as u64, img_count);
     let mut map_cap_bank =
         component_map_cap_bank_create(component_descriptor_map_cap_count(d, img_count));
     let pml4 = component_alloc_slot(b"pml4-slot");
     component_retype(b"pml4-retype", OBJ_X86_PML4, PAGING_BITS, pml4);
-    let asid_error = vspace_assign_asid(pml4);
-    if asid_error != 0 {
-        print_str(b"[component-spawn] VSpace ASID assign failed pml4=0x");
-        print_hex(pml4 as u32);
-        print_str(b" error=");
-        print_u64(asid_error);
-        print_str(b"\n");
-    }
+    require_vspace_asid(pml4, b"isolated-component");
     component_map_image_skeleton(pml4, img_count, &mut map_cap_bank);
-    if d.map_heap_pt {
-        component_map_heap_pts(
-            pml4,
-            allocator::DEFAULT_SERVICE_HEAP_FRAMES,
-            &mut map_cap_bank,
-        );
+    if heap_frames != 0 {
+        component_map_heap_pts(pml4, heap_frames, &mut map_cap_bank);
     }
     trace_component_spawn_stage(b"vspace-ready", pml4, map_cap_bank.count);
     if d.lazy_image {
@@ -627,7 +635,7 @@ pub(crate) unsafe fn spawn_component(d: &ComponentDescriptor) -> SpawnedComponen
     component_expect(b"tcb-set-ipcbuf", tcb, error);
     component_map_cap_bank_store(&mut map_cap_bank, ipcbuf);
     let stack_top = d.stack_base + d.stack_frames * 0x1000 - 16;
-    let error = tcb_write_registers_r(tcb, d.entry as u64, stack_top, 0);
+    let error = tcb_write_registers_r(tcb, d.entry as u64, stack_top, heap_frames);
     component_expect(b"tcb-write-registers", tcb, error);
     let _ = tcb_set_priority(tcb, d.prio);
     if let Some(gs) = d.gs_base {
@@ -730,7 +738,7 @@ unsafe fn map_region(pml4: u64, r: &Region, bank: &mut ComponentMapCapBank) {
 /// notification — least privilege. Its thread (`isr_entry`) blocks on the IRQ
 /// notification and, when the real interrupt fires, signals the result notification.
 pub(crate) unsafe fn spawn_isr(
-    entry: unsafe extern "C" fn() -> !,
+    entry: unsafe extern "C" fn(u64) -> !,
     irq_cap: u64,
     result_cap: u64,
     prio: u64,
@@ -762,7 +770,7 @@ pub(crate) unsafe fn spawn_isr(
 /// access. `shared` carries `dma_paddr` in (@0), the verdict + INITRD info out, and the generated
 /// hive on page 1.
 pub(crate) unsafe fn spawn_storage_host(
-    entry: unsafe extern "C" fn() -> !,
+    entry: unsafe extern "C" fn(u64) -> !,
     result_cap: u64,
     fault_ep: u64,
     prio: u64,
@@ -2006,12 +2014,7 @@ unsafe fn component_pump_loop(
         {
             let (status, required_len, transfer_token, chunk_len) =
                 crate::driver_launch::service_hosted_device(
-                ch,
-                msg.m0,
-                msg.m1,
-                msg.m2,
-                msg.m3,
-                    *reply_cap,
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, *reply_cap,
                 );
             pump_reply_recv4_into!(
                 ch,

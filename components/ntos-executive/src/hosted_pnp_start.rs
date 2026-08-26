@@ -211,8 +211,7 @@ impl OwnedHostedPnpStartBatch {
                     || driver_launch::hosted_driver_video_port_initialized(dc.driver_id)),
             ..HostedPnpStartReport::default()
         };
-        let coordinator =
-            nt_driver_start::DriverStartBatch::new(dc.driver_id, spec.devnodes.len());
+        let coordinator = nt_driver_start::DriverStartBatch::new(dc.driver_id, spec.devnodes.len());
         Self {
             spec,
             options,
@@ -268,7 +267,10 @@ impl OwnedHostedPnpStartBatch {
                     let devnode = &self.spec.devnodes[devnode_index];
                     match observe_canonical_start(irp_id, false, pump_before_observe) {
                         CanonicalStartDisposition::Terminal { status, .. } => {
-                            assert_eq!(self.report.pending, 1, "START pending count lost ownership");
+                            assert_eq!(
+                                self.report.pending, 1,
+                                "START pending count lost ownership"
+                            );
                             self.report.pending -= 1;
                             self.coordinator
                                 .observe_terminal(irp_id)
@@ -290,16 +292,14 @@ impl OwnedHostedPnpStartBatch {
                             }
                         }
                         CanonicalStartDisposition::Indeterminate {
-                            transport_status,
-                            ..
+                            transport_status, ..
                         } => {
-                            assert_eq!(self.report.pending, 1, "START pending count lost ownership");
-                            self.report.pending -= 1;
-                            record_start_indeterminate(
-                                &mut self.report,
-                                transport_status,
-                                false,
+                            assert_eq!(
+                                self.report.pending, 1,
+                                "START pending count lost ownership"
                             );
+                            self.report.pending -= 1;
+                            record_start_indeterminate(&mut self.report, transport_status, false);
                             print_start_indeterminate(
                                 self.options.trace,
                                 &self.spec.service_name,
@@ -312,16 +312,14 @@ impl OwnedHostedPnpStartBatch {
                             self.pending_device_id = 0;
                         }
                         CanonicalStartDisposition::OwnershipLost {
-                            transport_status,
-                            ..
+                            transport_status, ..
                         } => {
-                            assert_eq!(self.report.pending, 1, "START pending count lost ownership");
-                            self.report.pending -= 1;
-                            record_start_indeterminate(
-                                &mut self.report,
-                                transport_status,
-                                false,
+                            assert_eq!(
+                                self.report.pending, 1,
+                                "START pending count lost ownership"
                             );
+                            self.report.pending -= 1;
+                            record_start_indeterminate(&mut self.report, transport_status, false);
                             print_start_indeterminate(
                                 self.options.trace,
                                 &self.spec.service_name,
@@ -329,10 +327,7 @@ impl OwnedHostedPnpStartBatch {
                                 transport_status,
                             );
                             self.coordinator
-                                .lose_ownership(
-                                    irp_id,
-                                    transport_status.raw() as u32,
-                                )
+                                .lose_ownership(irp_id, transport_status.raw() as u32)
                                 .expect("lost START ownership did not match exact IRP");
                         }
                         CanonicalStartDisposition::Pending { .. } => {
@@ -372,9 +367,7 @@ impl OwnedHostedPnpStartBatch {
                             }
                         }
                         HostedPnpDevnodeProgress::Pending {
-                            device_id,
-                            irp_id,
-                            ..
+                            device_id, irp_id, ..
                         } => {
                             self.coordinator
                                 .dispatch_pending(token, irp_id)
@@ -717,64 +710,62 @@ where
             report.add_device = true;
             report.add_device_count += 1;
             print_add_device_success(options.trace, service_name, devnode.instance_id, device_id);
-            let start_status = match grant_prepared_hosted_devnode_resources(
-                device_id,
-                resource_plan,
-            ) {
-                Ok(Some(grant)) => {
-                    print_hosted_devnode_grant(
-                        service_name.as_bytes(),
-                        devnode.instance_id.as_bytes(),
-                        &grant,
-                    );
-                    match driver_launch::commit_hosted_device_resource_assignment(
-                        device_id,
-                        &grant.raw_resource_list,
-                        &grant.translated_resource_list,
-                    ) {
-                        Ok(()) => canonical_start_status(
+            let start_status =
+                match grant_prepared_hosted_devnode_resources(device_id, resource_plan) {
+                    Ok(Some(grant)) => {
+                        print_hosted_devnode_grant(
+                            service_name.as_bytes(),
+                            devnode.instance_id.as_bytes(),
+                            &grant,
+                        );
+                        match driver_launch::commit_hosted_device_resource_assignment(
                             device_id,
                             &grant.raw_resource_list,
                             &grant.translated_resource_list,
-                            grant.pci_interrupt_line,
-                        ),
-                        Err(status) => CanonicalStartDisposition::Terminal {
-                            status: rollback_pre_dispatch_start(
+                        ) {
+                            Ok(()) => canonical_start_status(
                                 device_id,
+                                &grant.raw_resource_list,
+                                &grant.translated_resource_list,
                                 grant.pci_interrupt_line,
-                                status,
                             ),
+                            Err(status) => CanonicalStartDisposition::Terminal {
+                                status: rollback_pre_dispatch_start(
+                                    device_id,
+                                    grant.pci_interrupt_line,
+                                    status,
+                                ),
+                                waited: false,
+                            },
+                        }
+                    }
+                    Ok(None) => {
+                        match driver_launch::commit_hosted_device_resource_assignment(
+                            device_id,
+                            &[],
+                            &[],
+                        ) {
+                            Ok(()) => canonical_start_status(device_id, &[], &[], None),
+                            Err(status) => CanonicalStartDisposition::Terminal {
+                                status: rollback_pre_dispatch_start(device_id, None, status),
+                                waited: false,
+                            },
+                        }
+                    }
+                    Err(status) => {
+                        let status = rollback_pre_dispatch_start(device_id, None, status);
+                        print_resource_grant_failure(
+                            options.trace,
+                            service_name,
+                            devnode.instance_id,
+                            status,
+                        );
+                        CanonicalStartDisposition::Terminal {
+                            status,
                             waited: false,
-                        },
+                        }
                     }
-                }
-                Ok(None) => {
-                    match driver_launch::commit_hosted_device_resource_assignment(
-                        device_id,
-                        &[],
-                        &[],
-                    ) {
-                        Ok(()) => canonical_start_status(device_id, &[], &[], None),
-                        Err(status) => CanonicalStartDisposition::Terminal {
-                            status: rollback_pre_dispatch_start(device_id, None, status),
-                            waited: false,
-                        },
-                    }
-                }
-                Err(status) => {
-                    let status = rollback_pre_dispatch_start(device_id, None, status);
-                    print_resource_grant_failure(
-                        options.trace,
-                        service_name,
-                        devnode.instance_id,
-                        status,
-                    );
-                    CanonicalStartDisposition::Terminal {
-                        status,
-                        waited: false,
-                    }
-                }
-            };
+                };
             match start_status {
                 CanonicalStartDisposition::Terminal { status, waited } => {
                     finish_started_devnode(
@@ -806,11 +797,7 @@ where
                     transport_status,
                     observed_driver_pending,
                 } => {
-                    record_start_indeterminate(
-                        report,
-                        transport_status,
-                        observed_driver_pending,
-                    );
+                    record_start_indeterminate(report, transport_status, observed_driver_pending);
                     print_start_indeterminate(
                         options.trace,
                         service_name,
@@ -829,10 +816,7 @@ where
                     report.pending += 1;
                     report.pending_observed += driver_pending as u64;
                     print_start_pending(options.trace, service_name, devnode.instance_id);
-                    HostedPnpDevnodeProgress::Pending {
-                        device_id,
-                        irp_id,
-                    }
+                    HostedPnpDevnodeProgress::Pending { device_id, irp_id }
                 }
             }
         }
@@ -894,8 +878,7 @@ unsafe fn canonical_start_status(
             observe_canonical_start(irp_id, true, true)
         }
         Ok(driver_launch::HostedPnpStartOutcome::Indeterminate {
-            transport_status,
-            ..
+            transport_status, ..
         }) => CanonicalStartDisposition::Indeterminate {
             transport_status,
             waited: false,
@@ -904,11 +887,7 @@ unsafe fn canonical_start_status(
             observe_canonical_start(irp_id, false, true)
         }
         Err(failure) if failure.rollback_safe => CanonicalStartDisposition::Terminal {
-            status: rollback_pre_dispatch_start(
-                device_id,
-                pci_interrupt_line,
-                failure.status,
-            ),
+            status: rollback_pre_dispatch_start(device_id, pci_interrupt_line, failure.status),
             waited: false,
         },
         Err(failure) => CanonicalStartDisposition::Terminal {
@@ -986,10 +965,7 @@ fn remember_error(report: &mut HostedPnpStartReport, status: nt_status::NtStatus
     }
 }
 
-fn record_terminal_start_failure(
-    report: &mut HostedPnpStartReport,
-    status: nt_status::NtStatus,
-) {
+fn record_terminal_start_failure(report: &mut HostedPnpStartReport, status: nt_status::NtStatus) {
     report.terminal += 1;
     report.failed += 1;
     remember_error(report, status);
@@ -1028,13 +1004,7 @@ unsafe fn finish_started_devnode(
     let status_raw = status.raw() as u32;
     print_start_status(options.trace, service_name, instance_id, status_raw);
     if options.inject_test_interrupt && status.is_success() {
-        inject_proof_interrupt(
-            device_id,
-            options.trace,
-            service_name,
-            instance_id,
-            report,
-        );
+        inject_proof_interrupt(device_id, options.trace, service_name, instance_id, report);
     }
     collect_hardware_evidence(
         device_id,
@@ -1439,9 +1409,7 @@ fn print_start_indeterminate(
         HostedPnpStartTrace::DemandStart => {
             b"[driver-launch] demand StartDevice indeterminate service="
         }
-        HostedPnpStartTrace::BootService => {
-            b"[driver-launch] StartDevice indeterminate service="
-        }
+        HostedPnpStartTrace::BootService => b"[driver-launch] StartDevice indeterminate service=",
     });
     print_str(service_name.as_bytes());
     print_str(b" devnode=");
@@ -1451,18 +1419,12 @@ fn print_start_indeterminate(
     print_str(b"\n");
 }
 
-fn print_start_pending(
-    trace: HostedPnpStartTrace,
-    service_name: &str,
-    instance_id: &str,
-) {
+fn print_start_pending(trace: HostedPnpStartTrace, service_name: &str, instance_id: &str) {
     print_str(match trace {
         HostedPnpStartTrace::HardwareProof => {
             b"[driver-launch] generic hardware StartDevice pending service="
         }
-        HostedPnpStartTrace::DemandStart => {
-            b"[driver-launch] demand StartDevice pending service="
-        }
+        HostedPnpStartTrace::DemandStart => b"[driver-launch] demand StartDevice pending service=",
         HostedPnpStartTrace::BootService => b"[driver-launch] StartDevice pending service=",
     });
     print_str(service_name.as_bytes());

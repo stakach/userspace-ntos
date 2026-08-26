@@ -6,7 +6,8 @@
 //! of the **RW heap region** the broker maps at [`HEAP_BASE`]; allocations start
 //! past them. Each component has its own heap frames at the same vaddr, and each
 //! is single-threaded, so no locks are needed. The retype-zeroed heap gives empty
-//! metadata, so there is no init step.
+//! metadata. Spawned components must publish the number of mapped heap frames
+//! before their first allocation; the initial executive retains the full arena.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem::{align_of, size_of};
@@ -57,8 +58,10 @@ const FREE_HEAD: usize = HEAP_BASE + 8; // 8-byte address of the first free-list
 /// Component-local metadata words available to modules that cannot use mutable image statics.
 pub const COMPONENT_LOCAL_WORD_BASE: usize = HEAP_BASE + 16;
 pub const COMPONENT_LOCAL_WORDS: usize = 6;
+const MAPPED_HEAP_BYTES: usize =
+    COMPONENT_LOCAL_WORD_BASE + (COMPONENT_LOCAL_WORDS - 1) * size_of::<usize>();
 const DATA: usize = HEAP_BASE + 64; // allocations start past allocator/local metadata
-const END: usize = HEAP_BASE + HEAP_SIZE;
+const _: () = assert!(MAPPED_HEAP_BYTES + size_of::<usize>() <= DATA);
 const WORD: usize = size_of::<usize>();
 const ALLOC_GRANULE: usize = align_of::<usize>();
 const FREE_NODE_SIZE: usize = WORD * 2; // { size, next } stored inside the freed block
@@ -160,7 +163,7 @@ fn report_oom(size: usize, align: usize, cur: usize, start: usize, requested_end
     debug_bytes(b" requested-end=");
     debug_usize(requested_end);
     debug_bytes(b" cap=");
-    debug_usize(HEAP_SIZE);
+    debug_usize(heap_size());
     let context = OOM_CONTEXT.load(Ordering::Relaxed);
     if context != 0 {
         debug_bytes(b" ctx=");
@@ -193,6 +196,45 @@ unsafe fn write_word(addr: usize, value: usize) {
     unsafe { write_volatile(addr as *mut usize, value) };
 }
 
+/// Publish the heap mapping installed by the component broker.
+///
+/// This must be the first operation performed by a spawned executive-image component. A zero
+/// frame count is valid for components that never map or use the global heap. The initial
+/// executive does not call this function and therefore retains [`HEAP_FRAMES`].
+pub unsafe fn initialize_mapped_heap(frames: u64) -> bool {
+    if frames == 0 {
+        return true;
+    }
+    if frames > HEAP_FRAMES
+        || unsafe { read_word(CTR) } != 0
+        || unsafe { read_word(FREE_HEAD) } != 0
+    {
+        return false;
+    }
+    let bytes = frames as usize * 0x1000;
+    let current = unsafe { read_word(MAPPED_HEAP_BYTES) };
+    if current != 0 && current != bytes {
+        return false;
+    }
+    unsafe { write_word(MAPPED_HEAP_BYTES, bytes) };
+    true
+}
+
+#[inline]
+fn heap_size() -> usize {
+    let configured = unsafe { read_word(MAPPED_HEAP_BYTES) };
+    if configured == 0 {
+        HEAP_SIZE
+    } else {
+        configured.min(HEAP_SIZE)
+    }
+}
+
+#[inline]
+fn heap_end() -> usize {
+    HEAP_BASE + heap_size()
+}
+
 unsafe fn free_node_size(node: usize) -> usize {
     unsafe { read_word(node) }
 }
@@ -209,7 +251,9 @@ unsafe fn set_free_node(node: usize, size: usize, next: usize) {
 }
 
 unsafe fn insert_free_block(start: usize, size: usize) {
-    if size < FREE_NODE_SIZE || start < DATA || start.checked_add(size).is_none_or(|end| end > END)
+    if size < FREE_NODE_SIZE
+        || start < DATA
+        || start.checked_add(size).is_none_or(|end| end > heap_end())
     {
         return;
     }
@@ -402,7 +446,7 @@ unsafe impl GlobalAlloc for Bump {
         };
         let requested_end = start.saturating_add(layout.size());
         let end = match start.checked_add(size) {
-            Some(e) if e <= END => e,
+            Some(e) if e <= heap_end() => e,
             _ => {
                 report_oom(
                     layout.size(),
@@ -469,7 +513,8 @@ unsafe impl GlobalAlloc for Bump {
             None => return null_mut(),
         };
         let cur_end = DATA + unsafe { read_word(CTR) };
-        if start >= DATA && old_end <= END && old_end == cur_end {
+        let heap_end = heap_end();
+        if start >= DATA && old_end <= heap_end && old_end == cur_end {
             let Some(new_end) = start.checked_add(new_block_size) else {
                 report_oom(
                     new_size,
@@ -480,7 +525,7 @@ unsafe impl GlobalAlloc for Bump {
                 );
                 return null_mut();
             };
-            if new_end <= END {
+            if new_end <= heap_end {
                 unsafe { write_word(CTR, new_end - DATA) };
                 return ptr;
             }
@@ -526,15 +571,72 @@ pub fn mark() -> usize {
 
 /// Bytes still available above the current bump mark.
 pub fn remaining() -> usize {
-    HEAP_SIZE.saturating_sub(mark())
+    heap_size()
+        .saturating_sub(DATA - HEAP_BASE)
+        .saturating_sub(mark())
 }
+
+#[derive(Copy, Clone)]
+pub struct HeapUsage {
+    pub bump: usize,
+    pub allocated: usize,
+    pub reusable: usize,
+    pub largest_reusable: usize,
+    pub top_reusable: usize,
+}
+
+/// Snapshot bump occupancy and reusable free-list storage.
+///
+/// `bump` is an address-space watermark, not live allocation bytes. Dropped allocations below a
+/// later durable object remain reusable through the free list even when they cannot lower it.
+pub fn usage() -> HeapUsage {
+    let bump = mark();
+    let top_reusable = remaining();
+    let mut free_bytes = 0usize;
+    let mut largest_free = 0usize;
+    let mut node = unsafe { read_word(FREE_HEAD) };
+    let mut guard = 0usize;
+    let max_nodes = heap_size() / FREE_NODE_SIZE;
+    while node != 0 && guard < max_nodes {
+        let size = unsafe { free_node_size(node) };
+        free_bytes = free_bytes.saturating_add(size);
+        largest_free = largest_free.max(size);
+        node = unsafe { free_node_next(node) };
+        guard += 1;
+    }
+    HeapUsage {
+        bump,
+        allocated: bump.saturating_sub(free_bytes),
+        reusable: top_reusable.saturating_add(free_bytes),
+        largest_reusable: top_reusable.max(largest_free),
+        top_reusable,
+    }
+}
+
+const fn rewind_target(requested: usize, current: usize, capacity: usize) -> usize {
+    let target = if requested < current {
+        requested
+    } else {
+        current
+    };
+    if target < capacity {
+        target
+    } else {
+        capacity
+    }
+}
+
+const _: () = assert!(rewind_target(12, 8, 16) == 8);
+const _: () = assert!(rewind_target(4, 8, 16) == 4);
+const _: () = assert!(rewind_target(20, 24, 16) == 16);
 
 /// Rewind the bump counter to a [`mark`], reclaiming everything allocated since.
 ///
 /// # Safety
 /// All allocations made after `m` must be dead (unreferenced) at this point.
 pub unsafe fn reset_to(m: usize) {
-    let bounded = m.min(HEAP_SIZE - (DATA - HEAP_BASE));
+    let current = unsafe { read_word(CTR) };
+    let bounded = rewind_target(m, current, heap_size().saturating_sub(DATA - HEAP_BASE));
     unsafe {
         write_word(CTR, bounded);
         trim_free_list_to(DATA + bounded);

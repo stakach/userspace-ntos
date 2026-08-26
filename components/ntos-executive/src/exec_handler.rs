@@ -331,7 +331,7 @@ fn reset_setup_provision_trace() {
     SETUP_PROVISION_TRACE_N.store(0, Ordering::Relaxed);
 }
 
-struct ExecJournalReactOsSetupSeedTarget<'a> {
+struct ExecJournalNonSystemSetupSeedTarget<'a> {
     handler: &'a mut ExecNtHandler,
     created_keys: u32,
     changed_values: u32,
@@ -339,7 +339,7 @@ struct ExecJournalReactOsSetupSeedTarget<'a> {
     last_status: u32,
 }
 
-impl<'a> ExecJournalReactOsSetupSeedTarget<'a> {
+impl<'a> ExecJournalNonSystemSetupSeedTarget<'a> {
     fn new(handler: &'a mut ExecNtHandler) -> Self {
         Self {
             handler,
@@ -358,10 +358,21 @@ impl<'a> ExecJournalReactOsSetupSeedTarget<'a> {
         self.failed = true;
         self.last_status = status;
     }
+
+    fn owns_non_system_path(&self, path: &str) -> bool {
+        self.handler
+            .mutable_hives
+            .resolve_path(path)
+            .is_some_and(|(hive, _)| hive != HIVE_SEL_SYSTEM)
+    }
 }
 
-impl nt_hive_core::ReactOsSetupSeedTarget for ExecJournalReactOsSetupSeedTarget<'_> {
+impl nt_hive_core::ReactOsSetupSeedTarget for ExecJournalNonSystemSetupSeedTarget<'_> {
     fn create_key(&mut self, path: &str) -> bool {
+        if !self.owns_non_system_path(path) {
+            self.note_failure(STATUS_INVALID_HANDLE);
+            return false;
+        }
         let existed = self.handler.mutable_registry_key_by_path(path).is_some();
         match self
             .handler
@@ -387,6 +398,10 @@ impl nt_hive_core::ReactOsSetupSeedTarget for ExecJournalReactOsSetupSeedTarget<
         value_type: nt_hive_core::RegistryValueType,
         data: alloc::vec::Vec<u8>,
     ) -> bool {
+        if !self.owns_non_system_path(path) {
+            self.note_failure(STATUS_INVALID_HANDLE);
+            return false;
+        }
         if self.value_matches(path, name, value_type, &data) {
             return false;
         }
@@ -416,10 +431,12 @@ impl nt_hive_core::ReactOsSetupSeedTarget for ExecJournalReactOsSetupSeedTarget<
     }
 
     fn has_value(&self, path: &str, name: &str) -> bool {
-        self.handler
-            .mutable_registry_key_by_path(path)
-            .and_then(|key| self.handler.mutable_hives.query_value(key, name))
-            .is_some()
+        self.owns_non_system_path(path)
+            && self
+                .handler
+                .mutable_registry_key_by_path(path)
+                .and_then(|key| self.handler.mutable_hives.query_value(key, name))
+                .is_some()
     }
 
     fn value_matches(
@@ -429,10 +446,12 @@ impl nt_hive_core::ReactOsSetupSeedTarget for ExecJournalReactOsSetupSeedTarget<
         value_type: nt_hive_core::RegistryValueType,
         data: &[u8],
     ) -> bool {
-        self.handler
-            .mutable_registry_key_by_path(path)
-            .and_then(|key| self.handler.mutable_hives.query_value(key, name))
-            .is_some_and(|(ty, existing)| ty == value_type && existing == data)
+        self.owns_non_system_path(path)
+            && self
+                .handler
+                .mutable_registry_key_by_path(path)
+                .and_then(|key| self.handler.mutable_hives.query_value(key, name))
+                .is_some_and(|(ty, existing)| ty == value_type && existing == data)
     }
 
     fn query_value(
@@ -440,6 +459,9 @@ impl nt_hive_core::ReactOsSetupSeedTarget for ExecJournalReactOsSetupSeedTarget<
         path: &str,
         name: &str,
     ) -> Option<(nt_hive_core::RegistryValueType, alloc::vec::Vec<u8>)> {
+        if !self.owns_non_system_path(path) {
+            return None;
+        }
         self.handler
             .mutable_registry_key_by_path(path)
             .and_then(|key| self.handler.mutable_hives.query_value(key, name))
@@ -457,6 +479,27 @@ enum OwnedSystemHiveMutation {
         value_type: nt_hive_core::RegistryValueType,
         data: alloc::vec::Vec<u8>,
     },
+    DeleteValue {
+        path: alloc::string::String,
+        name: alloc::string::String,
+    },
+    DeleteKey {
+        path: alloc::string::String,
+    },
+    SetKeyClass {
+        path: alloc::string::String,
+        class_name: Option<alloc::string::String>,
+    },
+    SetKeySecurity {
+        path: alloc::string::String,
+        descriptor: alloc::vec::Vec<u8>,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum SystemHiveMutationOrigin {
+    Setup,
+    Runtime,
 }
 
 impl OwnedSystemHiveMutation {
@@ -474,6 +517,19 @@ impl OwnedSystemHiveMutation {
                 value_type: *value_type as u32,
                 data,
             },
+            Self::DeleteValue { path, name } => {
+                nt_config_client::SystemHiveMutation::DeleteValue { path, name }
+            }
+            Self::DeleteKey { path } => nt_config_client::SystemHiveMutation::DeleteKey { path },
+            Self::SetKeyClass { path, class_name } => {
+                nt_config_client::SystemHiveMutation::SetKeyClass {
+                    path,
+                    class_name: class_name.as_deref(),
+                }
+            }
+            Self::SetKeySecurity { path, descriptor } => {
+                nt_config_client::SystemHiveMutation::SetKeySecurity { path, descriptor }
+            }
         }
     }
 }
@@ -505,19 +561,22 @@ impl<'a> CollectSystemSetupSeedTarget<'a> {
         path: &str,
         name: &str,
     ) -> Option<(nt_hive_core::RegistryValueType, &[u8])> {
-        self.mutations.iter().rev().find_map(|mutation| match mutation {
-            OwnedSystemHiveMutation::SetValue {
-                path: pending_path,
-                name: pending_name,
-                value_type,
-                data,
-            } if pending_path.eq_ignore_ascii_case(path)
-                && pending_name.eq_ignore_ascii_case(name) =>
-            {
-                Some((*value_type, data.as_slice()))
-            }
-            _ => None,
-        })
+        self.mutations
+            .iter()
+            .rev()
+            .find_map(|mutation| match mutation {
+                OwnedSystemHiveMutation::SetValue {
+                    path: pending_path,
+                    name: pending_name,
+                    value_type,
+                    data,
+                } if pending_path.eq_ignore_ascii_case(path)
+                    && pending_name.eq_ignore_ascii_case(name) =>
+                {
+                    Some((*value_type, data.as_slice()))
+                }
+                _ => None,
+            })
     }
 }
 
@@ -2728,7 +2787,15 @@ impl ExecNtHandler {
             }
         };
         let mut mutable_hives = nt_hive_core::MutableHiveSet::new();
-        if let Some(boot_system_image) = unsafe { boot_system_hive_image_bytes() } {
+        let owned_boot_system_image = if require_boot_system {
+            unsafe { take_boot_system_hive_image() }
+        } else {
+            None
+        };
+        let boot_system_image = owned_boot_system_image
+            .as_deref()
+            .or_else(|| unsafe { boot_system_hive_image_bytes() });
+        if let Some(boot_system_image) = boot_system_image {
             let boot_system_hive = nt_hive_core::decode_image(boot_system_image)
                 .expect("prepared boot SYSTEM image remains valid");
             mutable_hives
@@ -2740,6 +2807,13 @@ impl ExecNtHandler {
                 .expect("mount composed boot SYSTEM hive");
         } else if require_boot_system {
             panic!("live hosted-process service requires the composed boot SYSTEM image");
+        }
+        if let Some(image) = owned_boot_system_image {
+            BOOT_SYSTEM_HIVE_IMAGE_RELEASED_BYTES.store(image.len() as u64, Ordering::Relaxed);
+            print_str(b"[cm-hive] released composed SYSTEM transport bytes=");
+            print_u64(image.len() as u64);
+            print_str(b"\n");
+            drop(image);
         }
         if let Some(ref regf) = software_hive {
             mount_mutable_regf_hive(
@@ -3209,73 +3283,51 @@ impl ExecNtHandler {
             })
         };
         let setup_type_changed = !matches("SetupType", REG_DWORD, &setup_type);
-        let setup_in_progress_changed = !matches(
-            "SystemSetupInProgress",
-            REG_DWORD,
-            &setup_in_progress,
-        );
+        let setup_in_progress_changed =
+            !matches("SystemSetupInProgress", REG_DWORD, &setup_in_progress);
         let cmd_line_changed = !matches("CmdLine", REG_SZ, &cmd_line);
         let mut mutations = alloc::vec::Vec::new();
         if setup_type_changed {
-            mutations.push(nt_config_client::SystemHiveMutation::SetValue {
-                path: SETUP_KEY,
-                name: "SetupType",
-                value_type: REG_DWORD,
-                data: &setup_type,
+            mutations.push(OwnedSystemHiveMutation::SetValue {
+                path: SETUP_KEY.into(),
+                name: "SetupType".into(),
+                value_type: nt_hive_core::RegistryValueType::Dword,
+                data: setup_type.to_vec(),
             });
         }
         if setup_in_progress_changed {
-            mutations.push(nt_config_client::SystemHiveMutation::SetValue {
-                path: SETUP_KEY,
-                name: "SystemSetupInProgress",
-                value_type: REG_DWORD,
-                data: &setup_in_progress,
+            mutations.push(OwnedSystemHiveMutation::SetValue {
+                path: SETUP_KEY.into(),
+                name: "SystemSetupInProgress".into(),
+                value_type: nt_hive_core::RegistryValueType::Dword,
+                data: setup_in_progress.to_vec(),
             });
         }
         if cmd_line_changed {
-            mutations.push(nt_config_client::SystemHiveMutation::SetValue {
-                path: SETUP_KEY,
-                name: "CmdLine",
-                value_type: REG_SZ,
-                data: &cmd_line,
+            mutations.push(OwnedSystemHiveMutation::SetValue {
+                path: SETUP_KEY.into(),
+                name: "CmdLine".into(),
+                value_type: nt_hive_core::RegistryValueType::Sz,
+                data: cmd_line,
             });
         }
         if mutations.is_empty() {
             print_str(b"[setup-state] HKLM\\SYSTEM\\Setup already in normal installed state\n");
             return;
         }
-        let generation = match unsafe {
-            crate::config_manager_commit_system_hive_mutations(&mutations)
-        } {
+        let generation = match self
+            .commit_and_project_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)
+        {
             Ok(generation) => generation,
             Err(status) => {
-                print_str(b"[setup-state] CM-owned HKLM\\SYSTEM\\Setup commit failed status=0x");
-                print_hex(status as u32);
+                print_str(
+                    b"[setup-state] CM-owned HKLM\\SYSTEM\\Setup commit/projection failed status=0x",
+                );
+                print_hex(status);
                 print_str(b"\n");
                 return;
             }
         };
-        for (changed, name, value_type, data) in [
-            (setup_type_changed, "SetupType", REG_DWORD, setup_type.as_slice()),
-            (
-                setup_in_progress_changed,
-                "SystemSetupInProgress",
-                REG_DWORD,
-                setup_in_progress.as_slice(),
-            ),
-            (cmd_line_changed, "CmdLine", REG_SZ, cmd_line.as_slice()),
-        ] {
-            if changed
-                && self
-                    .ensure_mutable_registry_value_by_path(SETUP_KEY, name, value_type, data)
-                    .is_none()
-            {
-                print_str(b"[setup-state] committed CM generation ");
-                print_u64(generation);
-                print_str(b" could not be projected into the durable SYSTEM hive\n");
-                return;
-            }
-        }
         if setup_type_changed || setup_in_progress_changed || cmd_line_changed {
             print_str(
                 b"[setup-state] HKLM\\SYSTEM\\Setup normal installed boot values committed through CM generation ",
@@ -3292,33 +3344,100 @@ impl ExecNtHandler {
             && SAM_SETUP_KEYS_CREATED.load(Ordering::Relaxed) == 0
     }
 
-    fn commit_and_project_system_setup_mutations(
+    fn commit_and_project_system_mutations(
         &mut self,
         mutations: &[OwnedSystemHiveMutation],
+        origin: SystemHiveMutationOrigin,
     ) -> Result<u64, u32> {
         let client_mutations: alloc::vec::Vec<_> = mutations
             .iter()
             .map(OwnedSystemHiveMutation::as_client_mutation)
             .collect();
-        let generation = unsafe {
-            crate::config_manager_commit_system_hive_mutations(&client_mutations)
-        }
-        .map_err(|status| status as u32)?;
-        for mutation in mutations {
-            match mutation {
-                OwnedSystemHiveMutation::CreateKey { path } => {
-                    self.ensure_mutable_registry_key_by_path_journaled(path)?;
+        let generation =
+            match unsafe { crate::config_manager_commit_system_hive_mutations(&client_mutations) }
+                .map_err(|status| status as u32)
+            {
+                Ok(generation) => generation,
+                Err(status) => {
+                    if matches!(origin, SystemHiveMutationOrigin::Runtime) {
+                        CM_RUNTIME_SYSTEM_MUTATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Err(status);
                 }
-                OwnedSystemHiveMutation::SetValue {
-                    path,
-                    name,
-                    value_type,
-                    data,
-                } => {
-                    let key = self.ensure_mutable_registry_key_by_path_journaled(path)?;
-                    self.journal_set_mutable_value(key, name, *value_type, data)?;
+            };
+        if matches!(origin, SystemHiveMutationOrigin::Runtime) {
+            CM_RUNTIME_SYSTEM_MUTATION_COMMITS.fetch_add(1, Ordering::Relaxed);
+            for mutation in mutations {
+                match mutation {
+                    OwnedSystemHiveMutation::CreateKey { .. } => {
+                        CM_RUNTIME_SYSTEM_CREATE_KEYS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    OwnedSystemHiveMutation::SetValue { .. } => {
+                        CM_RUNTIME_SYSTEM_SET_VALUES.fetch_add(1, Ordering::Relaxed);
+                    }
+                    OwnedSystemHiveMutation::DeleteValue { .. } => {
+                        CM_RUNTIME_SYSTEM_DELETE_VALUES.fetch_add(1, Ordering::Relaxed);
+                    }
+                    OwnedSystemHiveMutation::DeleteKey { .. } => {
+                        CM_RUNTIME_SYSTEM_DELETE_KEYS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    OwnedSystemHiveMutation::SetKeyClass { .. } => {
+                        CM_RUNTIME_SYSTEM_SET_CLASSES.fetch_add(1, Ordering::Relaxed);
+                    }
+                    OwnedSystemHiveMutation::SetKeySecurity { .. } => {
+                        CM_RUNTIME_SYSTEM_SET_SECURITY.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
+        }
+        let projection = (|| {
+            for mutation in mutations {
+                match mutation {
+                    OwnedSystemHiveMutation::CreateKey { path } => {
+                        self.ensure_mutable_registry_key_by_path_journaled(path)?;
+                    }
+                    OwnedSystemHiveMutation::SetValue {
+                        path,
+                        name,
+                        value_type,
+                        data,
+                    } => {
+                        let key = self.ensure_mutable_registry_key_by_path_journaled(path)?;
+                        self.journal_set_mutable_value(key, name, *value_type, data)?;
+                    }
+                    OwnedSystemHiveMutation::DeleteValue { path, name } => {
+                        let key = self
+                            .mutable_registry_key_by_path(path)
+                            .ok_or(STATUS_INVALID_HANDLE)?;
+                        self.journal_delete_mutable_value(key, name)?;
+                    }
+                    OwnedSystemHiveMutation::DeleteKey { path } => {
+                        let key = self
+                            .mutable_registry_key_by_path(path)
+                            .ok_or(STATUS_INVALID_HANDLE)?;
+                        self.journal_delete_mutable_key(key)?;
+                    }
+                    OwnedSystemHiveMutation::SetKeyClass { path, class_name } => {
+                        let key = self
+                            .mutable_registry_key_by_path(path)
+                            .ok_or(STATUS_INVALID_HANDLE)?;
+                        self.journal_set_mutable_key_class(key, class_name.as_deref())?;
+                    }
+                    OwnedSystemHiveMutation::SetKeySecurity { path, descriptor } => {
+                        let key = self
+                            .mutable_registry_key_by_path(path)
+                            .ok_or(STATUS_INVALID_HANDLE)?;
+                        self.journal_set_mutable_key_security_descriptor(key, descriptor)?;
+                    }
+                }
+            }
+            Ok::<(), u32>(())
+        })();
+        if let Err(status) = projection {
+            if matches!(origin, SystemHiveMutationOrigin::Runtime) {
+                CM_RUNTIME_SYSTEM_PROJECTION_FAILURES.fetch_add(1, Ordering::Relaxed);
+            }
+            return Err(status);
         }
         Ok(generation)
     }
@@ -3346,10 +3465,7 @@ impl ExecNtHandler {
             let mut stats = nt_hive_core::seed_reactos_network_setup_into_target(&mut target);
             trace_setup_provision_phase(b"network-seed-core-end", stats.total_values() as u64);
             if let Some(plan) = network_adapters.as_ref() {
-                trace_setup_provision_phase(
-                    b"network-bindings-begin",
-                    plan.adapters.len() as u64,
-                );
+                trace_setup_provision_phase(b"network-bindings-begin", plan.adapters.len() as u64);
                 let adapters: Vec<_> = plan
                     .adapters
                     .iter()
@@ -3364,10 +3480,7 @@ impl ExecNtHandler {
                         component_id: adapter.component_id.clone(),
                     })
                     .collect();
-                trace_setup_provision_phase(
-                    b"network-bindings-seed-begin",
-                    adapters.len() as u64,
-                );
+                trace_setup_provision_phase(b"network-bindings-seed-begin", adapters.len() as u64);
                 nt_hive_core::seed_reactos_network_adapter_bindings_into_target(
                     &mut target,
                     &adapters,
@@ -3398,7 +3511,9 @@ impl ExecNtHandler {
             print_str(b"[network-setup] SYSTEM mutation collection rejected a non-SYSTEM path\n");
             return;
         }
-        let generation = match self.commit_and_project_system_setup_mutations(&mutations) {
+        let generation = match self
+            .commit_and_project_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)
+        {
             Ok(generation) => generation,
             Err(status) => {
                 print_str(b"[network-setup] CM-owned SYSTEM commit/projection failed status=0x");
@@ -3435,7 +3550,7 @@ impl ExecNtHandler {
     /// ReactOS `.rgs` setup output into the mounted mutable SOFTWARE hive.
     fn provision_reactos_explorer_shell_com_classes(&mut self) {
         let (mask, changed, failed, last_status) = {
-            let mut target = ExecJournalReactOsSetupSeedTarget::new(self);
+            let mut target = ExecJournalNonSystemSetupSeedTarget::new(self);
             trace_setup_provision_phase(b"shell-com-seed-enter", 0);
             let mask = nt_hive_core::seed_reactos_explorer_shell_com_classes_into_target(
                 &mut target,
@@ -3495,7 +3610,9 @@ impl ExecNtHandler {
             print_str(b"[print-setup] SYSTEM mutation collection rejected a non-SYSTEM path\n");
             return;
         }
-        let generation = match self.commit_and_project_system_setup_mutations(&mutations) {
+        let generation = match self
+            .commit_and_project_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)
+        {
             Ok(generation) => generation,
             Err(status) => {
                 print_str(b"[print-setup] CM-owned SYSTEM commit/projection failed status=0x");
@@ -3526,7 +3643,7 @@ impl ExecNtHandler {
     /// `RegCopyTreeW`/`UpdateUsersShellFolderSettings` path runs through ordinary registry syscalls.
     fn provision_default_user_shell_folders(&mut self) {
         let (stats, changed, failed, last_status) = {
-            let mut target = ExecJournalReactOsSetupSeedTarget::new(self);
+            let mut target = ExecJournalNonSystemSetupSeedTarget::new(self);
             let stats = nt_hive_core::seed_reactos_user_profile_shell_folders_into_target(
                 &mut target,
                 r"\Registry\User\.Default",
@@ -3775,10 +3892,7 @@ impl ExecNtHandler {
                 b"locale-system-default-end",
                 system_default_changed as u64,
             );
-            trace_setup_provision_phase(
-                b"locale-install-language-begin",
-                system_locale_len as u64,
-            );
+            trace_setup_provision_phase(b"locale-install-language-begin", system_locale_len as u64);
             let install_language_changed = nt_hive_core::ReactOsSetupSeedTarget::set_value(
                 &mut target,
                 NLS_LANGUAGE,
@@ -3800,7 +3914,9 @@ impl ExecNtHandler {
         let system_generation = if mutations.is_empty() {
             None
         } else {
-            match self.commit_and_project_system_setup_mutations(&mutations) {
+            match self
+                .commit_and_project_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)
+            {
                 Ok(generation) => {
                     self.mark_mutable_hives_dirty_preserving_services_order();
                     Some(generation)
@@ -6389,7 +6505,18 @@ impl ExecNtHandler {
             return Err(0xC000_0008);
         }
         if let Some(key) = self.mutable_registry_key(target) {
-            self.journal_set_mutable_key_security_descriptor(key, descriptor)?;
+            if key.hive == HIVE_SEL_SYSTEM {
+                let path = self.mutable_key_path(key).ok_or(STATUS_INVALID_HANDLE)?;
+                self.commit_and_project_system_mutations(
+                    &[OwnedSystemHiveMutation::SetKeySecurity {
+                        path,
+                        descriptor: descriptor.to_vec(),
+                    }],
+                    SystemHiveMutationOrigin::Runtime,
+                )?;
+            } else {
+                self.journal_set_mutable_key_security_descriptor(key, descriptor)?;
+            }
             self.mark_mutable_hives_dirty_preserving_services_order();
             return Ok(());
         }
@@ -6540,6 +6667,9 @@ impl ExecNtHandler {
         let Some(key) = self.mutable_registry_key_by_path(full_path) else {
             return false;
         };
+        if key.hive == HIVE_SEL_SYSTEM {
+            return false;
+        }
         let Some(value_type) = nt_hive_core::RegistryValueType::from_u32(ty) else {
             return false;
         };
@@ -6679,6 +6809,29 @@ impl ExecNtHandler {
         let len = utf16le_ascii_z(ascii, &mut data).ok_or(STATUS_INVALID_PARAMETER)?;
         if self.mutable_registry_key_by_path(&path).is_none() {
             return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+        }
+        if !user_profile {
+            let value_type = nt_hive_core::RegistryValueType::Sz;
+            if self
+                .mutable_registry_key_by_path(&path)
+                .and_then(|key| self.mutable_hives.query_value(key, value_name))
+                .is_some_and(|(existing_type, existing)| {
+                    existing_type == value_type && existing == &data[..len]
+                })
+            {
+                return Ok(());
+            }
+            self.commit_and_project_system_mutations(
+                &[OwnedSystemHiveMutation::SetValue {
+                    path,
+                    name: value_name.into(),
+                    value_type,
+                    data: data[..len].to_vec(),
+                }],
+                SystemHiveMutationOrigin::Runtime,
+            )?;
+            self.mark_mutable_hives_dirty_preserving_services_order();
+            return Ok(());
         }
         self.ensure_mutable_registry_value_by_path(&path, value_name, REG_SZ, &data[..len])
             .map(|_| ())
@@ -18662,7 +18815,7 @@ impl ExecNtHandler {
             io_mode,
         ) {
             let _ = self.pm.cancel_reserved_handle(reservation);
-            let _ = driver_launch::release_hosted_file(canonical_file_id);
+            let _ = driver_launch::abandon_unpublished_hosted_file(canonical_file_id);
             return Err(status);
         }
         let mut in_bytes = alloc::vec::Vec::with_capacity(name16.len() * 2);
@@ -18685,7 +18838,7 @@ impl ExecNtHandler {
                 let _ = self
                     .file_completion
                     .cancel_reserved_file_handle(canonical_file_id);
-                let _ = driver_launch::release_hosted_file(canonical_file_id);
+                let _ = driver_launch::abandon_unpublished_hosted_file(canonical_file_id);
                 return Err(status);
             }
         };
@@ -18742,7 +18895,7 @@ impl ExecNtHandler {
             let _ = self
                 .file_completion
                 .cancel_reserved_file_handle(canonical_file_id);
-            let _ = driver_launch::release_hosted_file(canonical_file_id);
+            let _ = driver_launch::abandon_unpublished_hosted_file(canonical_file_id);
             return Ok(HostedCreateDispatch::Completed {
                 status: status as u32,
                 information,
@@ -18950,7 +19103,7 @@ impl ExecNtHandler {
         }
         let _ = self.pm.cancel_reserved_handle(reservation);
         let _ = self.file_completion.cancel_reserved_file_handle(file_id);
-        let _ = driver_launch::release_hosted_file(file_id);
+        let _ = driver_launch::abandon_unpublished_hosted_file(file_id);
     }
 
     pub(crate) fn release_unpublished_hosted_create(
@@ -22517,27 +22670,59 @@ impl ExecNtHandler {
                     } else {
                         None
                     };
-                    let mutable_key = match crate::probe_seg!(
-                        7,
-                        self.journal_create_mutable_subkey(mutable_parent, leaf)
-                    ) {
-                        Ok(key) => key,
-                        Err(status) => return status,
+                    let mutable_key = if mutable_parent.hive == HIVE_SEL_SYSTEM {
+                        let mut mutations =
+                            alloc::vec![OwnedSystemHiveMutation::CreateKey { path: canon.into() }];
+                        if class_present {
+                            mutations.push(OwnedSystemHiveMutation::SetKeyClass {
+                                path: canon.into(),
+                                class_name: class_name.map(alloc::string::String::from),
+                            });
+                        }
+                        if let Some(descriptor) = initial_security.as_deref() {
+                            mutations.push(OwnedSystemHiveMutation::SetKeySecurity {
+                                path: canon.into(),
+                                descriptor: descriptor.to_vec(),
+                            });
+                        }
+                        if let Err(status) = crate::probe_seg!(
+                            7,
+                            self.commit_and_project_system_mutations(
+                                &mutations,
+                                SystemHiveMutationOrigin::Runtime,
+                            )
+                        ) {
+                            return status;
+                        }
+                        match self.mutable_registry_key_by_path(canon) {
+                            Some(key) => key,
+                            None => return STATUS_INVALID_HANDLE,
+                        }
+                    } else {
+                        let mutable_key = match crate::probe_seg!(
+                            7,
+                            self.journal_create_mutable_subkey(mutable_parent, leaf)
+                        ) {
+                            Ok(key) => key,
+                            Err(status) => return status,
+                        };
+                        if class_present {
+                            if let Err(status) =
+                                self.journal_set_mutable_key_class(mutable_key, class_name)
+                            {
+                                return status;
+                            }
+                        }
+                        if let Some(descriptor) = initial_security.as_deref() {
+                            if let Err(status) = self.journal_set_mutable_key_security_descriptor(
+                                mutable_key,
+                                descriptor,
+                            ) {
+                                return status;
+                            }
+                        }
+                        mutable_key
                     };
-                    if class_present {
-                        if let Err(status) =
-                            self.journal_set_mutable_key_class(mutable_key, class_name)
-                        {
-                            return status;
-                        }
-                    }
-                    if let Some(descriptor) = initial_security.as_deref() {
-                        if let Err(status) = self
-                            .journal_set_mutable_key_security_descriptor(mutable_key, descriptor)
-                        {
-                            return status;
-                        }
-                    }
                     crate::probe_seg!(
                         8,
                         self.mark_mutable_hives_dirty_for_services_order_change(
@@ -22858,6 +23043,37 @@ impl ExecNtHandler {
                     let Some(value_type) = nt_hive_core::RegistryValueType::from_u32(ty) else {
                         return 0xC000_000D;
                     };
+                    if mutable_key.hive == HIVE_SEL_SYSTEM {
+                        let value_data = match data_view {
+                            Some(data) => data.to_vec(),
+                            None => match self.read_user_data_vec(
+                                data_ptr,
+                                data_size,
+                                REG_VALUE_SCRATCH_CAP,
+                            ) {
+                                Ok(data) => data,
+                                Err(status) => return status,
+                            },
+                        };
+                        let Some(path) = self.mutable_key_path(mutable_key) else {
+                            return STATUS_INVALID_HANDLE;
+                        };
+                        if let Err(status) = self.commit_and_project_system_mutations(
+                            &[OwnedSystemHiveMutation::SetValue {
+                                path,
+                                name: durable_name.into(),
+                                value_type,
+                                data: value_data,
+                            }],
+                            SystemHiveMutationOrigin::Runtime,
+                        ) {
+                            return status;
+                        }
+                        self.mark_mutable_hives_dirty_for_services_order_change(
+                            services_order_may_change,
+                        );
+                        return 0;
+                    }
                     let copy_source =
                         self.registry_value_copy_source_for_user_data(data_ptr, data_size, ty);
                     if let Some(source) = copy_source {
@@ -23048,7 +23264,19 @@ impl ExecNtHandler {
                     let services_order_may_change = key_path.as_deref().is_some_and(|path| {
                         self.registry_services_order_key_membership_may_change(path)
                     });
-                    match self.journal_delete_mutable_key(mutable_key) {
+                    let mutation_status = if mutable_key.hive == HIVE_SEL_SYSTEM {
+                        let Some(path) = key_path.clone() else {
+                            return STATUS_INVALID_HANDLE;
+                        };
+                        self.commit_and_project_system_mutations(
+                            &[OwnedSystemHiveMutation::DeleteKey { path }],
+                            SystemHiveMutationOrigin::Runtime,
+                        )
+                        .map(|_| ())
+                    } else {
+                        self.journal_delete_mutable_key(mutable_key)
+                    };
+                    match mutation_status {
                         Ok(()) => {
                             if let Some(path) = key_path.as_deref() {
                                 if self.overlay.detach_subtree(path) != 0 {
@@ -23083,13 +23311,23 @@ impl ExecNtHandler {
                     return 0;
                 }
                 if let Some(mutable_key) = self.mutable_registry_key(key) {
-                    let services_order_may_change = self
-                        .registry_target_path(key)
-                        .as_deref()
-                        .is_some_and(|path| {
-                            self.registry_services_order_value_write_may_reorder(path)
-                        });
-                    if let Err(status) = self.journal_delete_mutable_value(mutable_key, &name) {
+                    let key_path = self.registry_target_path(key);
+                    let services_order_may_change = key_path.as_deref().is_some_and(|path| {
+                        self.registry_services_order_value_write_may_reorder(path)
+                    });
+                    let mutation_status = if mutable_key.hive == HIVE_SEL_SYSTEM {
+                        let Some(path) = key_path else {
+                            return STATUS_INVALID_HANDLE;
+                        };
+                        self.commit_and_project_system_mutations(
+                            &[OwnedSystemHiveMutation::DeleteValue { path, name }],
+                            SystemHiveMutationOrigin::Runtime,
+                        )
+                        .map(|_| ())
+                    } else {
+                        self.journal_delete_mutable_value(mutable_key, &name)
+                    };
+                    if let Err(status) = mutation_status {
                         return status;
                     }
                     self.mark_mutable_hives_dirty_for_services_order_change(

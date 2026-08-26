@@ -161,7 +161,8 @@ pub(crate) fn regf_len_on(fs: &nt_fs::FileSystem, path: &str) -> usize {
 
 fn hive_image_ok(bytes: &[u8]) -> bool {
     if is_core_hive_image(bytes) {
-        return nt_hive_core::image_root_subkey_count_if_valid(bytes).is_ok_and(|subkeys| subkeys > 0);
+        return nt_hive_core::image_root_subkey_count_if_valid(bytes)
+            .is_ok_and(|subkeys| subkeys > 0);
     }
     if is_regf_hive_image(bytes) {
         return RegfHive::new(bytes).is_some_and(|hive| !hive.subkeys(hive.root()).is_empty());
@@ -200,7 +201,10 @@ pub(crate) fn hive_image_value_len_on(
     if is_core_hive_image(bytes) {
         return nt_hive_core::image_value_len_if_valid(bytes, key_path, value_name).unwrap_or(0);
     }
-    if let Some(regf) = is_regf_hive_image(bytes).then(|| RegfHive::new(bytes)).flatten() {
+    if let Some(regf) = is_regf_hive_image(bytes)
+        .then(|| RegfHive::new(bytes))
+        .flatten()
+    {
         return regf
             .open_key(key_path)
             .and_then(|key| regf.value(key, value_name))
@@ -377,6 +381,10 @@ pub(crate) static WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION: AtomicU64 = AtomicU64:
 pub(crate) static WRITABLE_FS_SNAPSHOT_COMMIT_BYTES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WRITABLE_FS_SNAPSHOT_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WRITABLE_FS_SNAPSHOT_WRITE_SECTORS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WRITABLE_FS_BLOB_COMPACTIONS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WRITABLE_FS_BLOBS_RECLAIMED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WRITABLE_FS_BLOB_BYTES_RECLAIMED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WRITABLE_FS_BLOB_COMPACTION_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// Statistics — every one of these is a REAL operation that went through the `Zw*` surface.
 pub(crate) static OVERLAY_CREATES: AtomicU64 = AtomicU64::new(0);
@@ -560,7 +568,11 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
             let byte_start = sector_index * sector_size;
             let byte_end = byte_start + chunk_sectors * sector_size;
             let tfd = unsafe {
-                crate::fs_loader::fat_write_sectors(&self.fat, absolute, &data[byte_start..byte_end])
+                crate::fs_loader::fat_write_sectors(
+                    &self.fat,
+                    absolute,
+                    &data[byte_start..byte_end],
+                )
             };
             if tfd & 0x89 != 0 {
                 return Err(nt_fs::SnapshotBlockStoreError::Io);
@@ -710,9 +722,11 @@ unsafe fn checkpoint_volume_snapshot() -> Result<(u64, usize), u32> {
     }
 }
 
-pub(crate) unsafe fn checkpoint_dirty_volume() -> u32 {
+/// Commit pending volume bytes. `Ok(true)` means a new durable snapshot was published, while
+/// `Ok(false)` means the volume was already clean.
+pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
     if !WRITABLE_FS_SNAPSHOT_DIRTY.swap(false, Ordering::AcqRel) {
-        return nt_fs::STATUS_SUCCESS;
+        return Ok(false);
     }
     match checkpoint_volume_snapshot() {
         Ok((generation, bytes)) => {
@@ -724,7 +738,7 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> u32 {
             print_str(b" bytes=");
             print_u64(bytes as u64);
             print_str(b"\n");
-            nt_fs::STATUS_SUCCESS
+            Ok(true)
         }
         Err(status) => {
             WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
@@ -732,7 +746,49 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> u32 {
             print_str(b"[writable-fs-snapshot] dirty checkpoint retained after status=0x");
             print_hex(status);
             print_str(b"\n");
-            status
+            Err(status)
+        }
+    }
+}
+
+/// Reclaim immutable blob payloads made unreachable by truncate, replace, or unlink.
+///
+/// The caller must run this after resetting snapshot scratch and preserve the allocator mark when
+/// this returns `true`, because the compacted extent index becomes durable mounted-volume state.
+pub(crate) unsafe fn compact_unreferenced_blobs() -> bool {
+    let Some(fs) = (*core::ptr::addr_of_mut!(EXEC_WRITABLE_FS)).as_mut() else {
+        return false;
+    };
+    match fs.compact_volume_blobs() {
+        Ok(result) => {
+            let reclaimed_blobs = result.reclaimed_blobs();
+            let reclaimed_bytes = result.reclaimed_bytes();
+            if reclaimed_blobs == 0 {
+                return false;
+            }
+            WRITABLE_FS_BLOB_COMPACTIONS.fetch_add(1, Ordering::Relaxed);
+            WRITABLE_FS_BLOBS_RECLAIMED.fetch_add(reclaimed_blobs as u64, Ordering::Relaxed);
+            WRITABLE_FS_BLOB_BYTES_RECLAIMED.fetch_add(reclaimed_bytes as u64, Ordering::Relaxed);
+            print_str(b"[writable-fs] compacted blobs=");
+            print_u64(result.blobs_before as u64);
+            print_str(b"->");
+            print_u64(result.blobs_after as u64);
+            print_str(b" bytes=");
+            print_u64(result.bytes_before as u64);
+            print_str(b"->");
+            print_u64(result.bytes_after as u64);
+            print_str(b"\n");
+            true
+        }
+        Err(err) => {
+            WRITABLE_FS_BLOB_COMPACTION_FAILURES.fetch_add(1, Ordering::Relaxed);
+            print_str(b"[writable-fs] blob compaction failed err=");
+            print_str(match err {
+                nt_fs::MemFsBlobCompactError::CorruptExtent => b"corrupt-extent",
+                nt_fs::MemFsBlobCompactError::OutOfMemory => b"out-of-memory",
+            });
+            print_str(b"\n");
+            false
         }
     }
 }
@@ -1024,12 +1080,8 @@ pub(crate) unsafe fn restore_boot_system_persistence(
                 BootSystemRestoreError::PrimaryRead,
             )?;
             let log_path = alloc::format!("{}.LOG", CONFIG_SYSTEM_HIVE_PATH);
-            let log = owned_file_before_publish(
-                &fs,
-                &log_path,
-                BootSystemRestoreError::LogRead,
-            )?
-            .unwrap_or_default();
+            let log = owned_file_before_publish(&fs, &log_path, BootSystemRestoreError::LogRead)?
+                .unwrap_or_default();
             if primary.is_none() && log.is_empty() {
                 return Err(BootSystemRestoreError::SystemStateMissing);
             }
@@ -1921,7 +1973,7 @@ unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
                 let hive_len = hive.len();
                 match fs.provision_file_owned(DEFAULT_USER_NTUSER_DAT, hive) {
                     Ok(()) => {
-                    stats.files += 1;
+                        stats.files += 1;
                         stats.bytes += hive_len as u64;
                         NTUSER_DAT_PROVISIONED.store(hive_len as u64, Ordering::Relaxed);
                     }
@@ -1930,8 +1982,12 @@ unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
                     }
                 }
             }
-            Some(_) => print_str(b"[profile-source] setup HKU\\.DEFAULT image invalid -> no ntuser.dat\n"),
-            None => print_str(b"[profile-source] setup HKU\\.DEFAULT image absent -> no ntuser.dat\n"),
+            Some(_) => {
+                print_str(b"[profile-source] setup HKU\\.DEFAULT image invalid -> no ntuser.dat\n")
+            }
+            None => {
+                print_str(b"[profile-source] setup HKU\\.DEFAULT image absent -> no ntuser.dat\n")
+            }
         }
         PROFILE_SOURCE_DIRS.store(stats.dirs, Ordering::Relaxed);
         PROFILE_SOURCE_FILES.store(stats.files, Ordering::Relaxed);

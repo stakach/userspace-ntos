@@ -136,10 +136,7 @@ fn disk_census_record(started: Option<u64>, sectors: u64) {
     let Some(started) = started else { return };
     AHCI_CMDS.fetch_add(1, Ordering::Relaxed);
     AHCI_SECTORS.fetch_add(sectors, Ordering::Relaxed);
-    AHCI_TICKS.fetch_add(
-        disk_census_ticks().wrapping_sub(started),
-        Ordering::Relaxed,
-    );
+    AHCI_TICKS.fetch_add(disk_census_ticks().wrapping_sub(started), Ordering::Relaxed);
 }
 
 unsafe fn fat_cache_invalidate(fs: &Fat32) {
@@ -364,8 +361,7 @@ unsafe fn system32_cache_build(fs: &Fat32) -> bool {
     if reactos_attr & 0x10 == 0 {
         return false;
     }
-    let Some((system32_cluster, _, system32_attr)) =
-        dir_find_lfn(fs, reactos_cluster, b"system32")
+    let Some((system32_cluster, _, system32_attr)) = dir_find_lfn(fs, reactos_cluster, b"system32")
     else {
         return false;
     };
@@ -409,10 +405,7 @@ unsafe fn system32_cache_build(fs: &Fat32) -> bool {
 }
 
 unsafe fn system32_cache_lookup(fs: &Fat32, leaf: &[u8]) -> Option<(u32, u32, u8)> {
-    if leaf.is_empty()
-        || leaf.len() > SYSTEM32_CACHE_NAME_CAP
-        || component_has_separator(leaf)
-    {
+    if leaf.is_empty() || leaf.len() > SYSTEM32_CACHE_NAME_CAP || component_has_separator(leaf) {
         return None;
     }
     if system32_cache_state_read(SYSTEM32_CACHE_STATE_READY) == 0 {
@@ -456,9 +449,7 @@ pub(crate) unsafe fn system32_cache_slot_reserve_hint(fs: &Fat32) -> Option<usiz
 fn system32_leaf_from_volume_path(path: &[u8]) -> Option<&[u8]> {
     const PREFIX: &[u8] = b"reactos\\system32\\";
     const ALT_PREFIX: &[u8] = b"reactos/system32/";
-    let leaf = if path.len() > PREFIX.len()
-        && path[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
-    {
+    let leaf = if path.len() > PREFIX.len() && path[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
         &path[PREFIX.len()..]
     } else if path.len() > ALT_PREFIX.len()
         && path[..ALT_PREFIX.len()].eq_ignore_ascii_case(ALT_PREFIX)
@@ -599,8 +590,7 @@ pub(crate) unsafe fn fat_read_file(
                 .min(remaining_bytes.div_ceil(fs.bps))
                 .min(AHCI_MAX_SECTORS_PER_READ)
                 .max(1);
-            let Some(p) =
-                fat_read_sectors_checked(fs, fat_cluster_sector(fs, cl) + s, sectors)
+            let Some(p) = fat_read_sectors_checked(fs, fat_cluster_sector(fs, cl) + s, sectors)
             else {
                 return written;
             };
@@ -661,8 +651,7 @@ pub(crate) unsafe fn fat_read_file_range(
                 continue;
             }
             let start = within_cluster.saturating_sub(sector_start) as usize;
-            let Some(data) =
-                fat_read_sector_checked(fs, fat_cluster_sector(fs, cluster) + sector)
+            let Some(data) = fat_read_sector_checked(fs, fat_cluster_sector(fs, cluster) + sector)
             else {
                 return written;
             };
