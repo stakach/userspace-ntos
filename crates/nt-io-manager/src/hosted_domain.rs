@@ -22,6 +22,15 @@ pub struct HostedDomainIdentity {
     pub cookie: u64,
 }
 
+impl Default for HostedDomainIdentity {
+    fn default() -> Self {
+        Self {
+            domain_id: HostedDomainId::NULL,
+            cookie: 0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostedProviderIdentity {
     pub domain_id: HostedDomainId,
@@ -238,24 +247,23 @@ impl<P> IoManager<P> {
         )
     }
 
-    pub fn bind_hosted_device_address(
+    /// Bind a hosted DeviceObject projection only when both independently carried pieces of the
+    /// address-space identity still name the live domain generation.
+    pub fn bind_hosted_device_identity(
         &mut self,
-        domain: HostedDomainId,
+        identity: HostedDomainIdentity,
         address: u64,
         device: DeviceId,
     ) -> Result<(), NtStatus> {
         if self.device(device).is_none() {
             return Err(NtStatus::INVALID_PARAMETER);
         }
-        bind(
-            &mut self
-                .hosted_domains
-                .get_mut(domain)
-                .ok_or(NtStatus::INVALID_PARAMETER)?
-                .devices,
-            address,
-            device,
-        )
+        let domain = self
+            .hosted_domains
+            .get_mut(identity.domain_id)
+            .filter(|domain| identity.cookie != 0 && domain.cookie == identity.cookie)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        bind(&mut domain.devices, address, device)
     }
 
     pub fn bind_hosted_file_address(
@@ -292,16 +300,19 @@ impl<P> IoManager<P> {
         unbind(&mut domain.drivers, address, driver)
     }
 
-    /// Remove one exact hosted DeviceObject projection.
-    pub fn unbind_hosted_device_address(
+    /// Remove one hosted DeviceObject projection only from the exact live domain generation.
+    pub fn unbind_hosted_device_identity(
         &mut self,
-        domain: HostedDomainId,
+        identity: HostedDomainIdentity,
         address: u64,
         device: DeviceId,
     ) -> bool {
-        let Some(domain) = self.hosted_domains.get_mut(domain) else {
+        let Some(domain) = self.hosted_domains.get_mut(identity.domain_id) else {
             return false;
         };
+        if identity.cookie == 0 || domain.cookie != identity.cookie {
+            return false;
+        }
         unbind(&mut domain.devices, address, device)
     }
 
@@ -325,15 +336,6 @@ impl<P> IoManager<P> {
     ) -> Option<DriverId> {
         let id = resolve(&self.hosted_domains.get(domain)?.drivers, address)?;
         self.driver(id).map(|_| id)
-    }
-
-    pub fn hosted_device_by_address(
-        &self,
-        domain: HostedDomainId,
-        address: u64,
-    ) -> Option<DeviceId> {
-        let id = resolve(&self.hosted_domains.get(domain)?.devices, address)?;
-        self.device(id).map(|_| id)
     }
 
     /// Resolve a hosted DeviceObject projection only when the generation-bearing domain id and
@@ -361,9 +363,18 @@ impl<P> IoManager<P> {
         address_of(&self.hosted_domains.get(domain)?.drivers, driver)
     }
 
-    pub fn hosted_device_address(&self, domain: HostedDomainId, device: DeviceId) -> Option<u64> {
+    /// Resolve the address of one canonical device only in the exact live domain generation.
+    pub fn hosted_device_address_by_identity(
+        &self,
+        identity: HostedDomainIdentity,
+        device: DeviceId,
+    ) -> Option<u64> {
         self.device(device)?;
-        address_of(&self.hosted_domains.get(domain)?.devices, device)
+        let record = self.hosted_domains.get(identity.domain_id)?;
+        if identity.cookie == 0 || record.cookie != identity.cookie {
+            return None;
+        }
+        address_of(&record.devices, device)
     }
 
     pub fn hosted_file_address(&self, domain: HostedDomainId, file: FileId) -> Option<u64> {
@@ -427,14 +438,16 @@ mod tests {
             .unwrap();
         let first = io.register_hosted_domain();
         let second = io.register_hosted_domain();
+        let first_identity = io.hosted_domain_identity(first).unwrap();
+        let second_identity = io.hosted_domain_identity(second).unwrap();
         let shared_address = 0x1000_0080;
         io.bind_hosted_driver_address(first, shared_address, first_driver)
             .unwrap();
         io.bind_hosted_driver_address(second, shared_address, second_driver)
             .unwrap();
-        io.bind_hosted_device_address(first, shared_address + 8, first_device)
+        io.bind_hosted_device_identity(first_identity, shared_address + 8, first_device)
             .unwrap();
-        io.bind_hosted_device_address(second, shared_address + 8, second_device)
+        io.bind_hosted_device_identity(second_identity, shared_address + 8, second_device)
             .unwrap();
 
         assert_eq!(
@@ -446,14 +459,13 @@ mod tests {
             Some(second_driver)
         );
         assert_eq!(
-            io.hosted_device_by_address(first, shared_address + 8),
+            io.hosted_device_by_identity(first_identity, shared_address + 8),
             Some(first_device)
         );
         assert_eq!(
-            io.hosted_device_by_address(second, shared_address + 8),
+            io.hosted_device_by_identity(second_identity, shared_address + 8),
             Some(second_device)
         );
-        let first_identity = io.hosted_domain_identity(first).unwrap();
         assert_eq!(
             io.hosted_device_by_identity(first_identity, shared_address + 8),
             Some(first_device)
@@ -537,6 +549,7 @@ mod tests {
             .unwrap()
             .0;
         let dependent = io.register_hosted_domain();
+        let dependent_identity = io.hosted_domain_identity(dependent).unwrap();
         let provider = io.register_hosted_domain();
         let provider_cookie = io.hosted_domain_identity(provider).unwrap().cookie;
 
@@ -563,7 +576,7 @@ mod tests {
             Err(NtStatus::OBJECT_NAME_COLLISION)
         );
         assert_eq!(
-            io.bind_hosted_device_address(dependent, 0x4000, device),
+            io.bind_hosted_device_identity(dependent_identity, 0x4000, device),
             Ok(())
         );
         assert_eq!(io.bind_hosted_file_address(dependent, 0x5000, file), Ok(()));
@@ -578,11 +591,35 @@ mod tests {
             Ok(())
         );
 
-        assert!(!io.unbind_hosted_device_address(dependent, 0x4008, device));
-        assert!(io.unbind_hosted_device_address(dependent, 0x4000, device));
-        assert_eq!(io.hosted_device_by_address(dependent, 0x4000), None);
+        let stale_cookie = HostedDomainIdentity {
+            cookie: dependent_identity.cookie.wrapping_add(1),
+            ..dependent_identity
+        };
         assert_eq!(
-            io.bind_hosted_device_address(dependent, 0x4008, device),
+            io.bind_hosted_device_identity(stale_cookie, 0x4008, device),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        assert!(!io.unbind_hosted_device_identity(stale_cookie, 0x4000, device));
+        assert_eq!(
+            io.hosted_device_by_identity(dependent_identity, 0x4000),
+            Some(device)
+        );
+        assert_eq!(
+            io.hosted_device_address_by_identity(dependent_identity, device),
+            Some(0x4000)
+        );
+        assert_eq!(
+            io.hosted_device_address_by_identity(stale_cookie, device),
+            None
+        );
+        assert!(!io.unbind_hosted_device_identity(dependent_identity, 0x4008, device));
+        assert!(io.unbind_hosted_device_identity(dependent_identity, 0x4000, device));
+        assert_eq!(
+            io.hosted_device_by_identity(dependent_identity, 0x4000),
+            None
+        );
+        assert_eq!(
+            io.bind_hosted_device_identity(dependent_identity, 0x4008, device),
             Ok(())
         );
 

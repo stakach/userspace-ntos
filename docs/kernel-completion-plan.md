@@ -11546,6 +11546,39 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     exact unbind or revoke fails. In parallel with that lifetime work, diagnose the Dbgk/VSpace and
     writable-snapshot quiescence races as real kernel bugs rather than weakening the desktop gate.
 
+    Exact hosted-device projection identity checkpoint (2026-08-26, accepted locally): every live
+    `HostedDeviceBinding` and `HostedDeviceResourceState` now carries the complete
+    `HostedDomainIdentity`, including its generation cookie. AddDevice registration, PDO/FDO
+    resolution, device-property and supplemental-resource service authorization, provider dispatch,
+    grant staging, rollback, and resource teardown all require that exact identity. Resource mapping
+    cap records are keyed by instance, exact domain generation, and canonical device id; instance and
+    device cleanup can no longer delete caps belonging to a recycled instance/domain slot. The I/O
+    Manager now exposes only identity-authenticated device bind, resolve, reverse-resolve, and unbind
+    operations. AddDevice reserves its binding and resource-state capacity before publishing the FDO,
+    and rejects any replacement row that still owns a PnP context lease. The old scalar-domain device
+    projection API is deleted rather than retained as a bypass.
+
+    Focused validation is green for `nt-io-manager` at `190/190`, including wrong-cookie bind,
+    reverse lookup, and unbind rejection while the exact live projection remains intact. The
+    freestanding executive check remains at the established 212-warning baseline, `cargo fmt` is
+    clean for the changed crate, and `git diff --check` is clean. A fresh serialized desktop gate is
+    still required after this checkpoint; the last accepted Explorer/resource proofs remain the
+    preceding runs recorded above.
+
+    Review adjustment: full lifetime teardown remains open and is now ordered explicitly. First key
+    hosted paging rows by exact domain identity plus PML4, extend persistent IRP/resource/DMA owners
+    with the same generation, and make each release exact. Next split provider export-publication
+    cookies from provider/dependent domain identities, make callback/import records generation-owned,
+    reject provider unload while dependent routes or projections remain, and retire stale thunk
+    records before an instance slot can be reused. Then implement one failure-retaining PnP removal
+    transaction: advance the canonical PnP state machine, dispatch query/cancel/remove IRPs, withdraw
+    device interfaces and the exact video route, revoke resources, detach and destroy the FDO,
+    unbind and delete both exact FDO and PDO projections, remove the RootBus PDO, and only then run
+    DriverUnload and retire the hosted domain. Domain unregister must become checked and fallible;
+    `clear_instance` must not blank the instance, mechanism, or identity while any exact cleanup is
+    incomplete. Add lifecycle tests for veto, retry, surprise removal, provider dependency refusal,
+    interface/DeviceMap withdrawal, and zero retained ownership after successful removal.
+
     Track one separate rust-micro correctness item after this lifetime tranche: device-frame mapping
     cache attributes are still marked TODO in `rust-micro/src/untyped.rs`. Define and prove the x86
     MMIO/device-memory cache policy rather than relying on comments that describe all device frames

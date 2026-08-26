@@ -30101,6 +30101,7 @@ static mut HOSTED_PAGING_MAPPINGS: Option<Vec<HostedPagingMapping>> = None;
 #[derive(Clone, Copy)]
 struct HostedResourceMapCap {
     instance: usize,
+    domain: HostedDomainIdentity,
     device_id: u64,
     cap: u64,
 }
@@ -30220,18 +30221,28 @@ unsafe fn reserve_hosted_resource_map_caps(additional: usize) -> Result<(), nt_s
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)
 }
 
-unsafe fn record_hosted_resource_map_cap(instance: usize, device_id: u64, cap: u64) {
+unsafe fn record_hosted_resource_map_cap(
+    instance: usize,
+    domain: HostedDomainIdentity,
+    device_id: u64,
+    cap: u64,
+) {
     if cap == 0 {
         return;
     }
     hosted_resource_map_caps_mut().push(HostedResourceMapCap {
         instance,
+        domain,
         device_id,
         cap,
     });
 }
 
-unsafe fn clear_hosted_resource_map_caps(instance: usize, device_id: Option<u64>) -> u64 {
+unsafe fn clear_hosted_resource_map_caps(
+    instance: usize,
+    domain: HostedDomainIdentity,
+    device_id: Option<u64>,
+) -> u64 {
     let Some(caps) = (*core::ptr::addr_of_mut!(HOSTED_RESOURCE_MAP_CAPS)).as_mut() else {
         return 0;
     };
@@ -30240,6 +30251,7 @@ unsafe fn clear_hosted_resource_map_caps(instance: usize, device_id: Option<u64>
     while index != 0 {
         index -= 1;
         if caps[index].instance == instance
+            && caps[index].domain == domain
             && device_id.is_none_or(|device_id| caps[index].device_id == device_id)
         {
             if caps[index].cap != 0 && cnode_delete_recycle_r(caps[index].cap) != 0 {
@@ -30252,15 +30264,22 @@ unsafe fn clear_hosted_resource_map_caps(instance: usize, device_id: Option<u64>
     failures
 }
 
-unsafe fn clear_hosted_resource_map_caps_for_instance(instance: usize) -> u64 {
-    clear_hosted_resource_map_caps(instance, None)
+unsafe fn clear_hosted_resource_map_caps_for_instance(
+    instance: usize,
+    domain: HostedDomainIdentity,
+) -> u64 {
+    clear_hosted_resource_map_caps(instance, domain, None)
 }
 
-unsafe fn clear_hosted_resource_map_caps_for_device(instance: usize, device_id: u64) -> u64 {
+unsafe fn clear_hosted_resource_map_caps_for_device(
+    instance: usize,
+    domain: HostedDomainIdentity,
+    device_id: u64,
+) -> u64 {
     if device_id == 0 {
         return 0;
     }
-    clear_hosted_resource_map_caps(instance, Some(device_id))
+    clear_hosted_resource_map_caps(instance, domain, Some(device_id))
 }
 
 /// Ensure the paging hierarchy covering `page` exists in a hosted driver's `pml4`.
@@ -31283,7 +31302,7 @@ struct HostedDeviceBinding {
     pdo_device_id: u64,
     instance: usize,
     projection_instance: usize,
-    projection_domain_id: u64,
+    projection_domain: HostedDomainIdentity,
     device_object: u64,
     pdo_object: u64,
     registry_identity_id: HostedRegistryIdentityId,
@@ -31296,7 +31315,10 @@ const EMPTY_HOSTED_DEVICE_BINDING: HostedDeviceBinding = HostedDeviceBinding {
     pdo_device_id: 0,
     instance: 0,
     projection_instance: 0,
-    projection_domain_id: 0,
+    projection_domain: HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId::NULL,
+        cookie: 0,
+    },
     device_object: 0,
     pdo_object: 0,
     registry_identity_id: INVALID_HOSTED_REGISTRY_IDENTITY_ID,
@@ -31453,6 +31475,7 @@ struct HostedDeviceResourceState {
     device_id: u64,
     driver_id: u64,
     instance: usize,
+    projection_domain: HostedDomainIdentity,
     pdo_object: u64,
     address_resource_count: u8,
     address_resources: [SharedAddressResource; SH_RESOURCE_ADDRESS_RECORD_CAPACITY as usize],
@@ -31573,10 +31596,15 @@ unsafe fn hosted_device_property_transfers_mut() -> &'static mut HostedDevicePro
 unsafe fn hosted_device_resource_state_by_device_id(
     device_id: u64,
 ) -> Option<HostedDeviceResourceState> {
+    let binding = hosted_device_binding_by_device_id(device_id)?;
     hosted_device_resource_states()?
         .iter()
         .copied()
-        .find(|state| state.device_id != 0 && state.device_id == device_id)
+        .find(|state| {
+            state.device_id != 0
+                && state.device_id == device_id
+                && state.projection_domain == binding.projection_domain
+        })
 }
 
 unsafe fn install_pending_hosted_pnp_context_lease(
@@ -31588,6 +31616,7 @@ unsafe fn install_pending_hosted_pnp_context_lease(
         device_id: binding.device_id,
         driver_id: binding.driver_id,
         instance: binding.instance,
+        projection_domain: binding.projection_domain,
         pdo_object: binding.pdo_object,
         interface_type: bus_identity.interface_type,
         bus_number: bus_identity.bus_number,
@@ -31614,7 +31643,7 @@ unsafe fn install_pending_hosted_pnp_context_lease(
 }
 
 unsafe fn stage_hosted_address_resources(
-    device_id: u64,
+    binding: HostedDeviceBinding,
     resources: &[SharedAddressResource],
 ) -> Result<(), nt_status::NtStatus> {
     if resources.len() > SH_RESOURCE_ADDRESS_RECORD_CAPACITY as usize {
@@ -31622,7 +31651,10 @@ unsafe fn stage_hosted_address_resources(
     }
     let state = hosted_device_resource_states_mut()
         .iter_mut()
-        .find(|state| state.device_id == device_id)
+        .find(|state| {
+            state.device_id == binding.device_id
+                && state.projection_domain == binding.projection_domain
+        })
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     state.address_resource_count = resources.len() as u8;
     state.address_resources =
@@ -31675,11 +31707,17 @@ unsafe fn retire_hosted_io_port_cap(cap: u64) -> Result<(), nt_status::NtStatus>
     Ok(())
 }
 
-unsafe fn retire_hosted_device_port_caps(device_id: u64) -> Result<(), nt_status::NtStatus> {
+unsafe fn retire_hosted_device_port_caps(
+    binding: HostedDeviceBinding,
+) -> Result<(), nt_status::NtStatus> {
     let states = hosted_device_resource_states_mut();
     let Some(index) = states
         .iter()
-        .position(|state| state.device_id != 0 && state.device_id == device_id)
+        .position(|state| {
+            state.device_id != 0
+                && state.device_id == binding.device_id
+                && state.projection_domain == binding.projection_domain
+        })
     else {
         return Ok(());
     };
@@ -31707,11 +31745,17 @@ unsafe fn retire_hosted_device_port_caps(device_id: u64) -> Result<(), nt_status
     Ok(())
 }
 
-unsafe fn remove_hosted_device_resource_state(device_id: u64) -> Result<(), nt_status::NtStatus> {
+unsafe fn remove_hosted_device_resource_state(
+    binding: HostedDeviceBinding,
+) -> Result<(), nt_status::NtStatus> {
     let states = hosted_device_resource_states_mut();
     let Some(index) = states
         .iter()
-        .position(|state| state.device_id != 0 && state.device_id == device_id)
+        .position(|state| {
+            state.device_id != 0
+                && state.device_id == binding.device_id
+                && state.projection_domain == binding.projection_domain
+        })
     else {
         return Ok(());
     };
@@ -31810,7 +31854,11 @@ unsafe fn clear_hosted_resource_projection(
     sh: u64,
 ) -> Result<(), nt_status::NtStatus> {
     if let Some((instance, inst)) = instance_by_driver_id(binding.driver_id) {
-        let failures = clear_hosted_resource_map_caps_for_device(instance, binding.device_id);
+        let failures = clear_hosted_resource_map_caps_for_device(
+            instance,
+            binding.projection_domain,
+            binding.device_id,
+        );
         if failures != 0 {
             print_str(b"[driver-launch] hosted resource map release failed inst=");
             print_u64(instance as u64);
@@ -31831,7 +31879,10 @@ unsafe fn clear_hosted_resource_projection(
                         }
                         if let Some(current) = hosted_device_resource_states_mut()
                             .iter_mut()
-                            .find(|current| current.device_id == binding.device_id)
+                            .find(|current| {
+                                current.device_id == binding.device_id
+                                    && current.projection_domain == binding.projection_domain
+                            })
                         {
                             current.address_resources[resource_index].component_cap = 0;
                         }
@@ -31841,7 +31892,7 @@ unsafe fn clear_hosted_resource_projection(
             }
         }
     }
-    retire_hosted_device_port_caps(binding.device_id)?;
+    retire_hosted_device_port_caps(binding)?;
     let _ = hosted_resource_manager_mut().revoke_owner(hosted_resource_owner(binding));
     let _ = hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
     clear_shared_address_resources(sh);
@@ -31886,7 +31937,7 @@ unsafe fn clear_hosted_resource_projection(
     write_volatile((sh + SH_DMA_ALLOCATED_LOGICAL) as *mut u64, 0);
     write_volatile((sh + SH_DMA_FREED_LOGICAL) as *mut u64, 0);
     clear_dma_allocation_records(sh);
-    remove_hosted_device_resource_state(binding.device_id)?;
+    remove_hosted_device_resource_state(binding)?;
     Ok(())
 }
 
@@ -31923,12 +31974,16 @@ pub(crate) fn service_hosted_root_pdo_pnp(
         Ok(resolved) => resolved,
         Err(status) => return status.raw(),
     };
+    let identity = HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId(inst.hosted_domain_id),
+        cookie: inst.hosted_domain_cookie,
+    };
     let authorized = unsafe {
         hosted_device_bindings().is_some_and(|bindings| {
                 bindings.iter().any(|binding| {
                     binding.used
                         && binding.projection_instance == instance
-                        && binding.projection_domain_id == inst.hosted_domain_id
+                        && binding.projection_domain == identity
                         && binding.pdo_object == pdo_object
                         && binding.pdo_device_id == device_id.raw()
                 })
@@ -32041,8 +32096,12 @@ pub(crate) fn service_hosted_device(
         let Some(binding) = hosted_device_binding_by_pdo_object(pdo_object) else {
             return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
         };
+        let projection_domain = HostedDomainIdentity {
+            domain_id: nt_io_manager::HostedDomainId(inst.hosted_domain_id),
+            cookie: inst.hosted_domain_cookie,
+        };
         if binding.projection_instance != projection_instance
-            || binding.projection_domain_id != inst.hosted_domain_id
+            || binding.projection_domain != projection_domain
             || binding.pdo_device_id != pdo_device_id.raw()
             || unsafe {
                 read_volatile((ch.shared_va + SH_RESOURCE_PDO_OBJECT) as *const u64) != pdo_object
@@ -32255,15 +32314,18 @@ fn register_hosted_device_binding(
     pdo_device_id: u64,
     instance: usize,
     projection_instance: usize,
-    projection_domain_id: u64,
+    projection_domain: HostedDomainIdentity,
     device_object: u64,
     pdo_object: u64,
     registry_identity_id: HostedRegistryIdentityId,
+    bus_information: &nt_pnp_manager::PnpBusInformation,
+    pdo_address: u32,
 ) -> Result<(), nt_status::NtStatus> {
     if driver_id == 0
         || device_id == 0
         || pdo_device_id == 0
-        || projection_domain_id == 0
+        || projection_domain.domain_id == nt_io_manager::HostedDomainId::NULL
+        || projection_domain.cookie == 0
         || device_object == 0
         || pdo_object == 0
     {
@@ -32273,7 +32335,7 @@ fn register_hosted_device_binding(
     if let Some(slot) = bindings.iter().find(|slot| {
         slot.used
             && (slot.device_id == device_id
-                || (slot.projection_domain_id == projection_domain_id
+                || (slot.projection_domain == projection_domain
                     && slot.device_object == device_object))
     }) {
         let exact = slot.driver_id == driver_id
@@ -32281,14 +32343,15 @@ fn register_hosted_device_binding(
             && slot.pdo_device_id == pdo_device_id
             && slot.instance == instance
             && slot.projection_instance == projection_instance
-            && slot.projection_domain_id == projection_domain_id
+            && slot.projection_domain == projection_domain
             && slot.device_object == device_object
             && slot.pdo_object == pdo_object
             && slot.registry_identity_id == registry_identity_id;
-        let domain = nt_io_manager::HostedDomainId(projection_domain_id);
-        let projections_live = io_manager_mut().hosted_device_by_address(domain, pdo_object)
+        let projections_live = io_manager_mut()
+            .hosted_device_by_identity(projection_domain, pdo_object)
             == Some(nt_io_manager::DeviceId(pdo_device_id))
-            && io_manager_mut().hosted_device_by_address(domain, device_object)
+            && io_manager_mut()
+                .hosted_device_by_identity(projection_domain, device_object)
                 == Some(nt_io_manager::DeviceId(device_id));
         return if exact && projections_live {
             Ok(())
@@ -32296,19 +32359,38 @@ fn register_hosted_device_binding(
             Err(nt_status::NtStatus::OBJECT_NAME_COLLISION)
         };
     }
-    if io_manager_mut().hosted_device_by_address(
-        nt_io_manager::HostedDomainId(projection_domain_id),
-        pdo_object,
-    ) != Some(nt_io_manager::DeviceId(pdo_device_id))
+    if io_manager_mut().hosted_domain_identity(projection_domain.domain_id)
+        != Some(projection_domain)
+        || io_manager_mut().hosted_device_by_identity(projection_domain, pdo_object)
+            != Some(nt_io_manager::DeviceId(pdo_device_id))
     {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
+    let resource_state_slot = {
+        let states = unsafe { hosted_device_resource_states_mut() };
+        if let Some(index) = states
+            .iter()
+            .position(|state| state.device_id == device_id)
+        {
+            if states[index].projection_domain != projection_domain
+                || states[index].pnp_context_lease.is_some()
+            {
+                return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
+            }
+            Some(index)
+        } else {
+            states
+                .try_reserve(1)
+                .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+            None
+        }
+    };
     let free_slot = bindings.iter().position(|slot| !slot.used);
     if free_slot.is_none() && bindings.try_reserve(1).is_err() {
         return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     }
-    io_manager_mut().bind_hosted_device_address(
-        nt_io_manager::HostedDomainId(projection_domain_id),
+    io_manager_mut().bind_hosted_device_identity(
+        projection_domain,
         device_object,
         nt_io_manager::DeviceId(device_id),
     )?;
@@ -32318,7 +32400,7 @@ fn register_hosted_device_binding(
         pdo_device_id,
         instance,
         projection_instance,
-        projection_domain_id,
+        projection_domain,
         device_object,
         pdo_object,
         registry_identity_id,
@@ -32328,6 +32410,14 @@ fn register_hosted_device_binding(
         bindings[free_slot] = binding;
     } else {
         bindings.push(binding);
+    }
+    unsafe {
+        publish_hosted_device_identity_state(
+            binding,
+            bus_information,
+            pdo_address,
+            resource_state_slot,
+        );
     }
     Ok(())
 }
@@ -32572,11 +32662,12 @@ unsafe fn read_hosted_device_resource_state_from_shared(
         evidence.resource_io_port_cap = port.broker_va_or_root_cap;
         evidence.resource_io_port_component_cap = port.component_cap;
     }
-        HostedDeviceResourceState {
+    HostedDeviceResourceState {
         device_id: binding.device_id,
         driver_id: binding.driver_id,
-            instance: binding.instance,
-            pdo_object: read_volatile((sh + SH_RESOURCE_PDO_OBJECT) as *const u64),
+        instance: binding.instance,
+        projection_domain: binding.projection_domain,
+        pdo_object: read_volatile((sh + SH_RESOURCE_PDO_OBJECT) as *const u64),
         address_resource_count,
         address_resources,
         interrupt_affinity: read_volatile((sh + SH_RESOURCE_INTERRUPT_AFFINITY) as *const u64),
@@ -32586,9 +32677,9 @@ unsafe fn read_hosted_device_resource_state_from_shared(
         pci_vendor_device: read_volatile((sh + SH_RESOURCE_PCI_VENDOR_DEVICE) as *const u32),
         pci_class_rev: read_volatile((sh + SH_RESOURCE_PCI_CLASS_REV) as *const u32),
         pci_irq: read_volatile((sh + SH_RESOURCE_PCI_IRQ) as *const u32),
-            io_port_supplemental: previous_state
-                .map(|state| state.io_port_supplemental)
-                .unwrap_or(false),
+        io_port_supplemental: previous_state
+            .map(|state| state.io_port_supplemental)
+            .unwrap_or(false),
         io_port_model_status: previous_state
             .map(|state| state.io_port_model_status)
             .unwrap_or(0),
@@ -32613,7 +32704,11 @@ unsafe fn refresh_hosted_device_resource_state(binding: HostedDeviceBinding, sh:
     let states = hosted_device_resource_states_mut();
     if let Some(index) = states
         .iter()
-        .position(|slot| slot.device_id != 0 && slot.device_id == binding.device_id)
+        .position(|slot| {
+            slot.device_id != 0
+                && slot.device_id == binding.device_id
+                && slot.projection_domain == binding.projection_domain
+        })
     {
         states[index] = state;
     } else {
@@ -33005,11 +33100,13 @@ unsafe fn publish_hosted_device_identity_state(
     binding: HostedDeviceBinding,
     bus_information: &nt_pnp_manager::PnpBusInformation,
     address: u32,
+    resource_state_slot: Option<usize>,
 ) {
     let state = HostedDeviceResourceState {
         device_id: binding.device_id,
         driver_id: binding.driver_id,
         instance: binding.instance,
+        projection_domain: binding.projection_domain,
         pdo_object: binding.pdo_object,
         interface_type: bus_information.legacy_bus_type,
         bus_number: bus_information.bus_number,
@@ -33017,11 +33114,8 @@ unsafe fn publish_hosted_device_identity_state(
         ..HostedDeviceResourceState::default()
     };
     let states = hosted_device_resource_states_mut();
-    if let Some(existing) = states
-        .iter_mut()
-        .find(|existing| existing.device_id == binding.device_id)
-    {
-        *existing = state;
+    if let Some(index) = resource_state_slot {
+        states[index] = state;
     } else {
         states.push(state);
     }
@@ -34763,8 +34857,8 @@ fn teardown_hosted_device_binding(binding: HostedDeviceBinding) -> bool {
             return false;
         }
     }
-    if !io_manager_mut().unbind_hosted_device_address(
-        nt_io_manager::HostedDomainId(binding.projection_domain_id),
+    if !io_manager_mut().unbind_hosted_device_identity(
+        binding.projection_domain,
         binding.device_object,
         nt_io_manager::DeviceId(binding.device_id),
     ) {
@@ -35683,21 +35777,24 @@ pub(crate) struct HostedVideoRouteInfo {
 }
 
 fn clear_instance(i: usize) {
-    if let Some(inst) = instance(i) {
-        if inst.hosted_domain_id != 0 && inst.hosted_domain_cookie != 0 {
-            unsafe {
-                hosted_device_property_transfers_mut().remove_domain(HostedDomainIdentity {
-                    domain_id: nt_io_manager::HostedDomainId(inst.hosted_domain_id),
-                    cookie: inst.hosted_domain_cookie,
-                });
-            }
+    let retiring_domain = instance(i).and_then(|inst| {
+        (inst.hosted_domain_id != 0 && inst.hosted_domain_cookie != 0).then_some(
+            HostedDomainIdentity {
+                domain_id: nt_io_manager::HostedDomainId(inst.hosted_domain_id),
+                cookie: inst.hosted_domain_cookie,
+            },
+        )
+    });
+    if let Some(domain) = retiring_domain {
+        unsafe {
+            hosted_device_property_transfers_mut().remove_domain(domain);
         }
     }
     clear_hosted_driver_waits_for_instance(i);
     clear_hosted_driver_timers_for_instance(i);
     clear_hosted_driver_threads_for_instance(i);
-    unsafe {
-        let failures = clear_hosted_resource_map_caps_for_instance(i);
+    if let Some(domain) = retiring_domain {
+        let failures = unsafe { clear_hosted_resource_map_caps_for_instance(i, domain) };
         if failures != 0 {
             print_str(b"[driver-launch] hosted resource map release failed inst=");
             print_u64(i as u64);
@@ -37562,7 +37659,7 @@ unsafe fn dispatch_add_device_for_instance(
 
 unsafe fn rollback_uncommitted_add_device(
     projection_instance: usize,
-    projection_domain_id: u64,
+    projection_domain: HostedDomainIdentity,
     pdo_device_id: u64,
     pdo_object: u64,
     add_device: Option<&AddDeviceDispatchResult>,
@@ -37594,8 +37691,8 @@ unsafe fn rollback_uncommitted_add_device(
         }
     }
     if pdo_projection_created
-        && !io_manager_mut().unbind_hosted_device_address(
-            nt_io_manager::HostedDomainId(projection_domain_id),
+        && !io_manager_mut().unbind_hosted_device_identity(
+            projection_domain,
             pdo_object,
             nt_io_manager::DeviceId(pdo_device_id),
         )
@@ -37634,7 +37731,7 @@ where
         .unwrap_or(index);
     let projection_inst =
         instance(projection_instance).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-    if projection_inst.hosted_domain_id == 0 {
+    if projection_inst.hosted_domain_id == 0 || projection_inst.hosted_domain_cookie == 0 {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
     let registry_identity =
@@ -37672,20 +37769,29 @@ where
             | nt_pnp_manager::PnpError::InvalidTransition
             | nt_pnp_manager::PnpError::StaleId => nt_status::NtStatus::INVALID_PARAMETER,
         })?;
-    let projection_domain = nt_io_manager::HostedDomainId(projection_inst.hosted_domain_id);
+    let projection_domain = HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId(projection_inst.hosted_domain_id),
+        cookie: projection_inst.hosted_domain_cookie,
+    };
+    if io_manager_mut().hosted_domain_identity(projection_domain.domain_id)
+        != Some(projection_domain)
+    {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
     let root_is_unattached = io_manager_mut()
         .device(pdo_device)
         .is_some_and(|device| device.top_of_stack == pdo_device && !device.delete_pending);
     if !root_is_unattached {
         return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
     }
-    let existing_pdo_object = io_manager_mut().hosted_device_address(projection_domain, pdo_device);
+    let existing_pdo_object = io_manager_mut()
+        .hosted_device_address_by_identity(projection_domain, pdo_device);
     let (pdo_object, pdo_projection_created) = match existing_pdo_object {
         Some(pdo_object) => {
             let binding_live = hosted_device_bindings().is_some_and(|bindings| {
                 bindings.iter().any(|binding| {
                     binding.used
-                        && binding.projection_domain_id == projection_inst.hosted_domain_id
+                        && binding.projection_domain == projection_domain
                         && binding.pdo_device_id == pdo_device_id
                         && binding.pdo_object == pdo_object
                 })
@@ -37697,7 +37803,7 @@ where
         }
         None => {
             let pdo_object = create_hosted_root_pdo_projection(projection_instance)?;
-            if let Err(status) = io_manager_mut().bind_hosted_device_address(
+            if let Err(status) = io_manager_mut().bind_hosted_device_identity(
                 projection_domain,
                 pdo_object,
                 pdo_device,
@@ -37783,14 +37889,13 @@ where
             pdo_device_id,
             index,
             projection_instance,
-            projection_inst.hosted_domain_id,
+            projection_domain,
             add_device.fdo_object,
             pdo_object,
             registry_identity_id,
+            &bus_information,
+            pdo_address,
         )?;
-        let binding = hosted_device_binding_by_device_id(device_id.raw())
-            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        publish_hosted_device_identity_state(binding, &bus_information, pdo_address);
 
         let table = driver_instances_mut();
         table[index].device_id = device_id.raw();
@@ -37820,7 +37925,7 @@ where
             }
             if let Err(cleanup_status) = rollback_uncommitted_add_device(
                 projection_instance,
-                projection_inst.hosted_domain_id,
+                projection_domain,
                 pdo_device_id,
                 pdo_object,
                 add_device.as_ref(),
@@ -38090,7 +38195,12 @@ pub(crate) unsafe fn grant_hosted_device_resources(
                 );
                 return Err(nt_status::NtStatus::UNSUCCESSFUL);
             }
-            record_hosted_resource_map_cap(instance_index, device_id, map_cap);
+            record_hosted_resource_map_cap(
+                instance_index,
+                binding.projection_domain,
+                device_id,
+                map_cap,
+            );
             page += 1;
         }
         resources.push(SharedAddressResource {
@@ -38107,7 +38217,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             broker_va_or_root_cap: grant.broker_va,
             component_cap: 0,
         });
-        if let Err(status) = stage_hosted_address_resources(binding.device_id, &resources) {
+        if let Err(status) = stage_hosted_address_resources(binding, &resources) {
             rollback_staged_hosted_resource_grant(
                 binding,
                 instance_index,
@@ -38180,7 +38290,12 @@ pub(crate) unsafe fn grant_hosted_device_resources(
                 );
                 return Err(nt_status::NtStatus::UNSUCCESSFUL);
             }
-            record_hosted_resource_map_cap(instance_index, device_id, map_cap);
+            record_hosted_resource_map_cap(
+                instance_index,
+                binding.projection_domain,
+                device_id,
+                map_cap,
+            );
             page += 1;
         }
         dma_adapter_id = hosted_dma_manager_mut().register_adapter(
@@ -38225,7 +38340,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             broker_va_or_root_cap: cap,
             component_cap: component_slot,
         });
-        if let Err(status) = stage_hosted_address_resources(binding.device_id, &resources) {
+        if let Err(status) = stage_hosted_address_resources(binding, &resources) {
             rollback_staged_hosted_resource_grant(
                 binding,
                 instance_index,
@@ -39579,12 +39694,16 @@ unsafe fn dispatch_irp_for_instance(
                 return Some((STATUS_INVALID_DEVICE_REQUEST, 0, 0));
             }
             let provider_inst = instance(route.provider_instance)?;
+            let provider_domain = HostedDomainIdentity {
+                domain_id: nt_io_manager::HostedDomainId(provider_inst.hosted_domain_id),
+                cookie: provider_inst.hosted_domain_cookie,
+            };
             let binding = if let Some(request) = dispatch_request.as_ref() {
                 let binding = hosted_device_binding_by_device_id(request.device_id)?;
                 if binding.driver_id != request.driver_id
                     || binding.instance != inst
                     || binding.projection_instance != route.provider_instance
-                    || binding.projection_domain_id != provider_inst.hosted_domain_id
+                    || binding.projection_domain != provider_domain
                     || binding.device_object != device_object
                 {
                     return Some((STATUS_INVALID_PARAMETER, 0, 0));
