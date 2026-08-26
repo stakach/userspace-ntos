@@ -57,7 +57,7 @@ pub use cancel_wait::{
 pub use cleanup_wait::{
     PendingFileCleanupWait, PendingFileCleanupWaitReservation, PendingFileCleanupWaitTable,
 };
-pub use complete::CompletedIrp;
+pub use complete::{CompletedIrp, IoPumpReport};
 pub use completion_unwind::{
     CompletionClaimRelease, CompletionOwnerClaim, CompletionOwnerPhase,
     CompletionRoutineDisposition, CompletionUnwindCursor, CompletionUnwindError,
@@ -3646,7 +3646,14 @@ mod tests {
         mock.set_pending_completion(NtStatus::SUCCESS, 4);
         let (mut om, _client, irp) = pending_read(mock);
         assert_eq!(om.pending_irps().len(), 1);
-        assert_eq!(om.pump(), 1); // driver's completion is delivered
+        assert_eq!(
+            om.pump_with_report(),
+            IoPumpReport {
+                progress: 1,
+                storage_grew: true,
+            }
+        ); // driver's completion is delivered and its retained queue grows
+        assert_eq!(om.pump_with_report(), IoPumpReport::default());
         assert!(om.pending_irps().is_empty());
         assert_eq!(om.irp(irp).unwrap().state, IrpState::Completed);
         assert_eq!(

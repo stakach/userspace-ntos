@@ -41,11 +41,57 @@ pub struct CompletedIrp {
     pub completion_origin: IrpCompletionOrigin,
 }
 
+/// Result of one completion-engine pump.
+///
+/// `storage_grew` reports manager-owned queue capacity growth. Embedders that place the I/O
+/// Manager in a rewindable arena must retain those allocations before the next rewind, even when
+/// the pump did not publish a caller-visible completion.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct IoPumpReport {
+    pub progress: usize,
+    pub storage_grew: bool,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+struct PumpStorageCapacity {
+    completed_irps: usize,
+    manager_owned_irps: usize,
+    cancel_dispatch_retries: usize,
+    rejected_completion_acks: usize,
+    deferred_file_close_retries: usize,
+    disconnected_client_retries: usize,
+}
+
 impl<P: ObjectManagerPort> IoManager<P> {
+    fn pump_storage_capacity(&self) -> PumpStorageCapacity {
+        PumpStorageCapacity {
+            completed_irps: self.completed_irps.capacity(),
+            manager_owned_irps: self.manager_owned_irps.capacity(),
+            cancel_dispatch_retries: self.cancel_dispatch_retries.capacity(),
+            rejected_completion_acks: self.rejected_completion_acks.capacity(),
+            deferred_file_close_retries: self.deferred_file_close_retries.capacity(),
+            disconnected_client_retries: self.disconnected_client_retries.capacity(),
+        }
+    }
+
     /// Drain every driver backend's ready completions. Deliverable records are
     /// published in arrival order; manager-owned records are ACKed and
     /// reclaimed after their terminal result arrives.
     pub fn pump(&mut self) -> usize {
+        self.pump_with_report().progress
+    }
+
+    /// Drain ready completions and report whether manager-owned queue storage grew.
+    pub fn pump_with_report(&mut self) -> IoPumpReport {
+        let storage_before = self.pump_storage_capacity();
+        let progress = self.pump_inner();
+        IoPumpReport {
+            progress,
+            storage_grew: self.pump_storage_capacity() != storage_before,
+        }
+    }
+
+    fn pump_inner(&mut self) -> usize {
         let mut progress = self.retry_cancel_dispatches()
             + self.retry_rejected_completion_acks()
             + self.retry_deferred_file_closes();

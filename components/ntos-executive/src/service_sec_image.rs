@@ -1495,7 +1495,14 @@ fn finalize_service_loop_durable_state(
             }
         }
     }
-    nt_handler.writable_fs_commit_required = false;
+    if checkpoint_status == nt_fs::STATUS_SUCCESS {
+        nt_handler.writable_fs_commit_required = false;
+    } else {
+        // A failed checkpoint did not discharge the durable write. Keep both signals live so the
+        // next ownership barrier retries it and the rewind boundary refuses to reclaim its storage.
+        nt_handler.writable_fs_dirty = true;
+        nt_handler.writable_fs_commit_required = true;
+    }
 
     if take_shared_image_mapping_dirty()
         || take_dll_cache_dirty()
@@ -5651,6 +5658,7 @@ pub(crate) unsafe fn service_sec_image(
                 stop = $ip as u64;
                 break;
             }
+            let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
             let (nb, nmi, nm0, nm1, nm2, nm3) =
                 recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
             badge = nb;
@@ -5728,7 +5736,10 @@ pub(crate) unsafe fn service_sec_image(
                 procs[$pi].ntfaults = ntfaults;
                 pfilled[$pi] = *filled_pages;
                 mark_wait_parked!($pi, $ip);
-                pin_durable_table_growth_if_dirty(&mut heap_mark);
+                let _ = finalize_service_loop_durable_state(
+                    &mut nt_handler,
+                    &mut heap_mark,
+                );
                 let (nb, nmi, nm0, nm1, nm2, nm3) =
                     recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                 badge = nb;
@@ -6023,6 +6034,15 @@ pub(crate) unsafe fn service_sec_image(
                     break;
                 }
             }
+            let timer_durable_status =
+                finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
+            if timer_durable_status != nt_fs::STATUS_SUCCESS {
+                print_str(b"[service-loop] timer checkpoint failure=0x");
+                print_hex(timer_durable_status);
+                print_str(b"\n");
+                stop = timer_durable_status as u64;
+                break;
+            }
             let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
             badge = received.0;
             mi = received.1;
@@ -6042,8 +6062,21 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b"\n");
             }
         }
-        // SAFETY: every allocation made past `heap_mark` belongs to the previous iteration's
-        // syscall service and is dead now (its Vec/String were dropped at the loop-body's end).
+        // The rewind boundary is the final authority: every durable owner published by the prior
+        // iteration must advance `heap_mark` here, regardless of which reply/park path received this
+        // message. Receive-edge finalizers preserve commit-before-block behavior, but this check is
+        // what makes an omitted edge unable to turn live kernel storage into transient memory.
+        let rewind_durable_status =
+            finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
+        if rewind_durable_status != nt_fs::STATUS_SUCCESS {
+            print_str(b"[service-loop] refusing allocator rewind after durable-state failure=0x");
+            print_hex(rewind_durable_status);
+            print_str(b"\n");
+            stop = rewind_durable_status as u64;
+            break;
+        }
+        // SAFETY: the finalizer above retained every allocation that entered durable state; all
+        // remaining allocations past `heap_mark` belong to the previous dispatch and are dead.
         unsafe { allocator::reset_to(heap_mark) };
         iters += 1;
         // `iters` is diagnostic only. A real NT kernel does not stop a runnable hosted process set at a
@@ -7025,7 +7058,10 @@ pub(crate) unsafe fn service_sec_image(
                             procs[pi].first = first;
                             procs[pi].ntfaults = ntfaults;
                             pfilled[pi] = *filled_pages;
-                            pin_durable_table_growth_if_dirty(&mut heap_mark);
+                            let _ = finalize_service_loop_durable_state(
+                                &mut nt_handler,
+                                &mut heap_mark,
+                            );
                             let (nb, nmi, nm0, nm1, nm2, nm3) =
                                 reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
                             trace_stack_growth_reply(pi, badge, nb, nmi, nm0, nm1, nm2, nm3);
@@ -7054,7 +7090,10 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
                     mark_wait_parked!(pi, m0);
-                    pin_durable_table_growth_if_dirty(&mut heap_mark);
+                    let _ = finalize_service_loop_durable_state(
+                        &mut nt_handler,
+                        &mut heap_mark,
+                    );
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
@@ -7112,6 +7151,10 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
                     // Recv the next event WITHOUT replying to the listener (it stays blocked).
+                    let _ = finalize_service_loop_durable_state(
+                        &mut nt_handler,
+                        &mut heap_mark,
+                    );
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
@@ -7274,7 +7317,10 @@ pub(crate) unsafe fn service_sec_image(
                             procs[pi].first = first;
                             procs[pi].ntfaults = ntfaults;
                             pfilled[pi] = *filled_pages;
-                            pin_durable_table_growth_if_dirty(&mut heap_mark);
+                            let _ = finalize_service_loop_durable_state(
+                                &mut nt_handler,
+                                &mut heap_mark,
+                            );
                             let (nb, nmi, nm0, nm1, nm2, nm3) =
                                 reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
                             trace_stack_growth_reply(pi, badge, nb, nmi, nm0, nm1, nm2, nm3);
@@ -7383,7 +7429,10 @@ pub(crate) unsafe fn service_sec_image(
                             procs[pi].first = first;
                             procs[pi].ntfaults = ntfaults;
                             pfilled[pi] = *filled_pages;
-                            pin_durable_table_growth_if_dirty(&mut heap_mark);
+                            let _ = finalize_service_loop_durable_state(
+                                &mut nt_handler,
+                                &mut heap_mark,
+                            );
                             let (nb, nmi, nm0, nm1, nm2, nm3) =
                                 reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
                             badge = nb;
@@ -7477,7 +7526,10 @@ pub(crate) unsafe fn service_sec_image(
                 procs[pi].first = first;
                 procs[pi].ntfaults = ntfaults;
                 pfilled[pi] = *filled_pages;
-                pin_durable_table_growth_if_dirty(&mut heap_mark);
+                let _ = finalize_service_loop_durable_state(
+                    &mut nt_handler,
+                    &mut heap_mark,
+                );
                 let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
                 badge = nb;
                 mi = nmi;
@@ -7792,6 +7844,10 @@ pub(crate) unsafe fn service_sec_image(
                         stop = m0;
                         break;
                     }
+                    let _ = finalize_service_loop_durable_state(
+                        &mut nt_handler,
+                        &mut heap_mark,
+                    );
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
@@ -8250,17 +8306,9 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 bi += 1;
             }
-            // Image faults bypass the native-syscall reply tail below. Shared RX DLL pages can still
-            // grow the loop-owned shared-image mapping table and the shared DLL source-frame cache in
-            // this branch, so pin that durable metadata before the next loop-top heap reset.
-            if take_shared_image_mapping_dirty()
-                || take_dll_cache_dirty()
-                || take_service_dll_arena_paging_dirty()
-                || take_service_dll_pe_store_dirty()
-            {
-                pin_durable_heap_mark(&mut heap_mark);
-            }
-            pin_durable_table_growth_if_dirty(&mut heap_mark);
+            // Image faults bypass the native-syscall reply tail below, but can grow several durable
+            // mapping/cache authorities. Apply the same ownership barrier as every other receive.
+            let _ = finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
             if allocation_failed {
                 if image_protect_failed {
                     park_and_log!(pi, b"image-protect", m0, addr);
@@ -8796,7 +8844,10 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
                     mark_wait_parked!(pi, m0);
-                    pin_durable_table_growth_if_dirty(&mut heap_mark);
+                    let _ = finalize_service_loop_durable_state(
+                        &mut nt_handler,
+                        &mut heap_mark,
+                    );
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -8855,7 +8906,10 @@ pub(crate) unsafe fn service_sec_image(
                     if !delivered_waiting_client {
                         mark_wait_parked!(pi, m0);
                     }
-                    pin_durable_table_growth_if_dirty(&mut heap_mark);
+                    let _ = finalize_service_loop_durable_state(
+                        &mut nt_handler,
+                        &mut heap_mark,
+                    );
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -8934,7 +8988,10 @@ pub(crate) unsafe fn service_sec_image(
                         procs[pi].ntfaults = ntfaults;
                         pfilled[pi] = *filled_pages;
                         mark_wait_parked!(pi, resume_ip);
-                        pin_durable_table_growth_if_dirty(&mut heap_mark);
+                        let _ = finalize_service_loop_durable_state(
+                            &mut nt_handler,
+                            &mut heap_mark,
+                        );
                         let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                         let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                         badge = nb;
@@ -8977,7 +9034,10 @@ pub(crate) unsafe fn service_sec_image(
                         procs[pi].ntfaults = ntfaults;
                         pfilled[pi] = *filled_pages;
                         mark_wait_parked!(pi, resume_ip);
-                        pin_durable_table_growth_if_dirty(&mut heap_mark);
+                        let _ = finalize_service_loop_durable_state(
+                            &mut nt_handler,
+                            &mut heap_mark,
+                        );
                         let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                         let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                         badge = nb;
@@ -10026,7 +10086,10 @@ pub(crate) unsafe fn service_sec_image(
                             if LSA_CLI_REPLY_CAP.load(Ordering::Relaxed) != 0 {
                                 mark_wait_parked!(pi, resume_ip);
                             }
-                            pin_durable_table_growth_if_dirty(&mut heap_mark);
+                            let _ = finalize_service_loop_durable_state(
+                                &mut nt_handler,
+                                &mut heap_mark,
+                            );
                             let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                             let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                             badge = nb;
@@ -15331,6 +15394,10 @@ pub(crate) unsafe fn service_sec_image(
                     } else if explorer_chrome_pending {
                         print_str(b"[quiesce] winlogon milestone parked; deferring gate until Explorer reaches shell chrome paint\n");
                     }
+                    let _ = finalize_service_loop_durable_state(
+                        &mut nt_handler,
+                        &mut heap_mark,
+                    );
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
@@ -15389,6 +15456,10 @@ pub(crate) unsafe fn service_sec_image(
                         stop = m0;
                         break;
                     }
+                    let _ = finalize_service_loop_durable_state(
+                        &mut nt_handler,
+                        &mut heap_mark,
+                    );
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
@@ -15410,7 +15481,10 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
                     mark_wait_parked!(pi, m0);
-                    pin_durable_table_growth_if_dirty(&mut heap_mark);
+                    let _ = finalize_service_loop_durable_state(
+                        &mut nt_handler,
+                        &mut heap_mark,
+                    );
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
@@ -15464,7 +15538,10 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
                     mark_wait_parked!(pi, m0);
-                    pin_durable_table_growth_if_dirty(&mut heap_mark);
+                    let _ = finalize_service_loop_durable_state(
+                        &mut nt_handler,
+                        &mut heap_mark,
+                    );
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
@@ -15496,6 +15573,10 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].first = first;
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
+                    let _ = finalize_service_loop_durable_state(
+                        &mut nt_handler,
+                        &mut heap_mark,
+                    );
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
@@ -15573,6 +15654,10 @@ pub(crate) unsafe fn service_sec_image(
                         stop = resume_ip;
                         break;
                     }
+                    let _ = finalize_service_loop_durable_state(
+                        &mut nt_handler,
+                        &mut heap_mark,
+                    );
                     let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
@@ -15645,6 +15730,10 @@ pub(crate) unsafe fn service_sec_image(
                         pi as u32,
                         badge,
                     ) {
+                        let _ = finalize_service_loop_durable_state(
+                            &mut nt_handler,
+                            &mut heap_mark,
+                        );
                         let received =
                             recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                         badge = received.0;
@@ -15663,7 +15752,10 @@ pub(crate) unsafe fn service_sec_image(
                         wait_parked,
                     );
                     mark_wait_parked!(pi, resume_ip);
-                    pin_durable_table_growth_if_dirty(&mut heap_mark);
+                    let _ = finalize_service_loop_durable_state(
+                        &mut nt_handler,
+                        &mut heap_mark,
+                    );
                     let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
@@ -15708,7 +15800,10 @@ pub(crate) unsafe fn service_sec_image(
                         wait_parked,
                     );
                     mark_wait_parked!(pi, resume_ip);
-                    pin_durable_table_growth_if_dirty(&mut heap_mark);
+                    let _ = finalize_service_loop_durable_state(
+                        &mut nt_handler,
+                        &mut heap_mark,
+                    );
                     let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
@@ -15755,7 +15850,10 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
-                    pin_durable_table_growth_if_dirty(&mut heap_mark);
+                    let _ = finalize_service_loop_durable_state(
+                        &mut nt_handler,
+                        &mut heap_mark,
+                    );
                     let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
@@ -15784,6 +15882,10 @@ pub(crate) unsafe fn service_sec_image(
                     delay_tid,
                     badge,
                 ) {
+                    let _ = finalize_service_loop_durable_state(
+                        &mut nt_handler,
+                        &mut heap_mark,
+                    );
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let received = recv_full_r12(fault_ep, new_reply);
                     badge = received.0;
@@ -15828,7 +15930,10 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
-                    pin_durable_table_growth_if_dirty(&mut heap_mark);
+                    let _ = finalize_service_loop_durable_state(
+                        &mut nt_handler,
+                        &mut heap_mark,
+                    );
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let received = recv_full_r12(fault_ep, new_reply);
                     badge = received.0;
@@ -15876,7 +15981,10 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
-                    pin_durable_table_growth_if_dirty(&mut heap_mark);
+                    let _ = finalize_service_loop_durable_state(
+                        &mut nt_handler,
+                        &mut heap_mark,
+                    );
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let received = recv_full_r12(fault_ep, new_reply);
                     badge = received.0;
@@ -15956,7 +16064,10 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
-                    pin_durable_table_growth_if_dirty(&mut heap_mark);
+                    let _ = finalize_service_loop_durable_state(
+                        &mut nt_handler,
+                        &mut heap_mark,
+                    );
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -16014,7 +16125,10 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
-                    pin_durable_table_growth_if_dirty(&mut heap_mark);
+                    let _ = finalize_service_loop_durable_state(
+                        &mut nt_handler,
+                        &mut heap_mark,
+                    );
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -16032,7 +16146,10 @@ pub(crate) unsafe fn service_sec_image(
             // A contended synchronous File has referenced its canonical route but has not created
             // an IRP. Transfer the live syscall reply into the FIFO acquisition owner.
             if synchronous_file_wait_parked {
-                pin_durable_table_growth_if_dirty(&mut heap_mark);
+                let _ = finalize_service_loop_durable_state(
+                    &mut nt_handler,
+                    &mut heap_mark,
+                );
                 let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                 badge = nb;
@@ -16076,7 +16193,10 @@ pub(crate) unsafe fn service_sec_image(
                 let _ = pending_file_io_redrive_all(&mut nt_handler);
                 let _ = file_cleanup_redrive_all(&mut nt_handler);
                 if wait_for_completion {
-                    pin_durable_table_growth_if_dirty(&mut heap_mark);
+                    let _ = finalize_service_loop_durable_state(
+                        &mut nt_handler,
+                        &mut heap_mark,
+                    );
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -16102,7 +16222,10 @@ pub(crate) unsafe fn service_sec_image(
                     // continuation publication. Redrive after ownership is visible so that edge
                     // completes the exact parked `NtClose` instead of waiting for another event.
                     let _ = file_cleanup_redrive_all(&mut nt_handler);
-                    pin_durable_table_growth_if_dirty(&mut heap_mark);
+                    let _ = finalize_service_loop_durable_state(
+                        &mut nt_handler,
+                        &mut heap_mark,
+                    );
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -16130,7 +16253,10 @@ pub(crate) unsafe fn service_sec_image(
                 let _ = pending_file_io_redrive_all(&mut nt_handler);
                 let _ = file_cleanup_redrive_all(&mut nt_handler);
                 let _ = file_irp_drain_redrive_all(&mut nt_handler);
-                pin_durable_table_growth_if_dirty(&mut heap_mark);
+                let _ = finalize_service_loop_durable_state(
+                    &mut nt_handler,
+                    &mut heap_mark,
+                );
                 let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                 badge = nb;
@@ -16170,7 +16296,10 @@ pub(crate) unsafe fn service_sec_image(
                     // so it counts toward the all-parked quiesce exactly like every other wait —
                     // the boot still reaches the gate if the debugger never continues.
                     mark_wait_parked!(pi, resume_ip);
-                    pin_durable_table_growth_if_dirty(&mut heap_mark);
+                    let _ = finalize_service_loop_durable_state(
+                        &mut nt_handler,
+                        &mut heap_mark,
+                    );
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -16202,6 +16331,11 @@ pub(crate) unsafe fn service_sec_image(
             // yet resumed the caller. A transition seen here is the executive's own handler; a
             // transition that only ever shows at tag 0 happened while the CLIENT was running.
             crate::teb_tail_watch(pi, 3, m0, badge);
+            let tail_durable_status =
+                finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
+            if tail_durable_status != nt_fs::STATUS_SUCCESS {
+                result = tail_durable_status as u64;
+            }
             let redirected_user_control =
                 redirected_user_callback || redirected_user_apc || redirected_context_continue;
             let (nb, nmi, nm0, nm1, nm2, nm3) = if reply_main == 0 {

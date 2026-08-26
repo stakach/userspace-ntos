@@ -33959,12 +33959,20 @@ fn io_manager_mut() -> &'static mut ExecutiveIoManager {
     }
 }
 
+fn pump_io_manager(io: &mut ExecutiveIoManager) -> usize {
+    let report = io.pump_with_report();
+    if report.storage_grew {
+        crate::mark_durable_table_growth_dirty();
+    }
+    report.progress
+}
+
 fn copy_completed_external_irp_by_id(
     irp_id: IrpId,
     with_output: bool,
 ) -> Option<(nt_io_manager::CompletedIrp, Vec<u8>)> {
     let io = io_manager_mut();
-    io.pump();
+    pump_io_manager(io);
     let completion = io.completed_irp(irp_id)?;
     let length = if with_output {
         usize::try_from(completion.information).ok()?
@@ -34009,7 +34017,7 @@ pub(crate) unsafe fn completed_irp_exact(irp_id: u64) -> Option<HostedCompletedI
         return None;
     }
     let io = io_manager_mut();
-    io.pump();
+    pump_io_manager(io);
     let completion = io.completed_irp(IrpId(irp_id))?;
     Some(HostedCompletedIrp {
         file_id: completion.file_id?.raw(),
@@ -34031,7 +34039,7 @@ pub(crate) unsafe fn copy_completed_irp_output_exact(
         return Err(STATUS_INVALID_PARAMETER as u32);
     }
     let io = io_manager_mut();
-    io.pump();
+    pump_io_manager(io);
     io.copy_completed_irp_output(IrpId(irp_id), offset, output)
         .map_err(|status| status.raw() as u32)
 }
@@ -34041,7 +34049,7 @@ pub(crate) unsafe fn completed_irp_copy_requires_retry(irp_id: u64) -> bool {
         return false;
     }
     let io = io_manager_mut();
-    io.pump();
+    pump_io_manager(io);
     io.irp(IrpId(irp_id))
         .is_some_and(|irp| irp.state == nt_io_manager::IrpState::Completed)
 }
@@ -34051,7 +34059,7 @@ pub(crate) unsafe fn acknowledge_completed_irp(irp_id: u64) -> Result<(), u32> {
         return Err(STATUS_INVALID_PARAMETER as u32);
     }
     let io = io_manager_mut();
-    io.pump();
+    pump_io_manager(io);
     io.acknowledge_completed_irp(IrpId(irp_id))
         .map(|_| ())
         .map_err(|status| status.raw() as u32)
@@ -34065,7 +34073,7 @@ pub(crate) unsafe fn cancel_irp_if_pending(irp_id: u64) -> Result<bool, u32> {
     let selected = io
         .cancel_if_pending(ClientId(IO_MANAGER_COMPONENT_ID), IrpId(irp_id))
         .map_err(|status| status.raw() as u32)?;
-    io.pump();
+    pump_io_manager(io);
     Ok(selected)
 }
 
@@ -34085,7 +34093,7 @@ pub(crate) unsafe fn cancel_file_thread_io(
         requestor_tid,
     )
     .map_err(|status| status.raw() as u32)?;
-    io.pump();
+    pump_io_manager(io);
     Ok(io.file_thread_io_drain_state(
         ClientId(IO_MANAGER_COMPONENT_ID),
         FileId(file_id),
@@ -34108,7 +34116,7 @@ pub(crate) fn file_thread_io_drain_state(
 }
 
 pub(crate) fn pump_hosted_io_completions() -> usize {
-    let pumped = io_manager_mut().pump();
+    let pumped = pump_io_manager(io_manager_mut());
     pumped.saturating_add(unsafe { drain_hosted_pnp_completions() })
 }
 
@@ -34217,7 +34225,7 @@ pub(crate) unsafe fn abandon_pending_irp(irp_id: u64) -> Result<(), u32> {
     let io = io_manager_mut();
     io.abandon_irp_delivery(ClientId(IO_MANAGER_COMPONENT_ID), IrpId(irp_id))
         .map_err(|status| status.raw() as u32)?;
-    io.pump();
+    pump_io_manager(io);
     Ok(())
 }
 
@@ -35531,9 +35539,13 @@ unsafe fn reserve_hosted_pnp_transaction(
     {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
+    let capacity = transactions.capacity();
     transactions
         .try_reserve(1)
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    if transactions.capacity() != capacity {
+        crate::mark_durable_table_growth_dirty();
+    }
     transactions.push(transaction);
     Ok(())
 }

@@ -2412,6 +2412,31 @@ Serialized desktop validation is the next gate. The explicit videoprt startup re
 must be replaced with a real canonical PnP backend; genuinely asynchronous boot START completion
 also needs to feed the boot start report instead of being reported as an immediate terminal error.
 
+B3 durable service-loop ownership checkpoint (2026-08-26, local green): the first serialized run
+of canonical non-video START reached the real Explorer desktop and returned genuine success from
+the E1000, DMA test, and bochsmp PnP paths, but the run is rejected because the quiescence writable
+snapshot reported `corrupt` and the subsequent section-writeback selftest reached `memcmp` through
+an invalid retained `Vec` pointer. The root cause is an executive arena-lifetime violation, not a
+PnP status failure: the service loop finalized durable state before its post-dispatch I/O completion
+pump, redrives, and process/thread publication, then rewound the allocator at the next iteration.
+
+The loop now runs the complete durable-state finalizer after post-dispatch work, before every
+post-handler receive, and as the final authority immediately before allocator rewind. Manager-owned
+completion queue growth and the hosted PnP transaction registry explicitly publish durable-growth
+signals. Failed writable checkpoints retain their dirty/commit requirement so a later barrier
+cannot silently consume the failure and rewind live state. Focused validation is green at
+`nt-io-manager` `195/195`, the freestanding executive check remains at the established 212-warning
+baseline, and `git diff --check` is clean. A fresh serialized desktop run is required before this
+checkpoint is accepted.
+
+Review adjustment: if the serialized run still exposes writable-volume damage, add an
+allocation-free typed MemFs invariant validator at the first failed checkpoint and make the
+remaining partial-failure mutation paths (`write_at`, `append_at_end`, `append_file_by_path`, and
+`set_file_data`) transactionally reserve before publication. Independently, extend I/O Manager
+durable-allocation reporting beyond its completion queues to GenStore growth and record-owned heap
+storage before relying on it for removal transactions. These are mechanism fixes; do not mask a
+corrupt snapshot, drop dirty state, or add a boot recovery fallback.
+
 ### A. SCM-Controlled Service Startup
 
 - `[x]` A0: Inventory the current SCM/service startup path and mark the static boundaries still in
