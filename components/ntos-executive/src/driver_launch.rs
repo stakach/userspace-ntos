@@ -33669,8 +33669,12 @@ unsafe fn ensure_hosted_paging_level(
         return false;
     }
 
+    let old_capacity = mappings.capacity();
     if mappings.try_reserve(1).is_err() {
         return false;
+    }
+    if mappings.capacity() != old_capacity {
+        crate::mark_durable_table_growth_dirty();
     }
 
     let cap = alloc_slot();
@@ -33748,9 +33752,15 @@ unsafe fn hosted_resource_map_caps_mut() -> &'static mut Vec<HostedResourceMapCa
 }
 
 unsafe fn reserve_hosted_resource_map_caps(additional: usize) -> Result<(), nt_status::NtStatus> {
-    hosted_resource_map_caps_mut()
+    let caps = hosted_resource_map_caps_mut();
+    let old_capacity = caps.capacity();
+    caps
         .try_reserve_exact(additional)
-        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    if caps.capacity() != old_capacity {
+        crate::mark_durable_table_growth_dirty();
+    }
+    Ok(())
 }
 
 unsafe fn record_hosted_resource_map_cap(

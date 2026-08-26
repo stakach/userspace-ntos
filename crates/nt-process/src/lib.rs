@@ -2304,6 +2304,10 @@ impl ProcessManager {
         if thread.impersonation.is_some() {
             return Err(STATUS_INVALID_PARAMETER);
         }
+        let default_security = &nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..];
+        if thread.security_descriptor.capacity() < default_security.len() {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
         thread.start_address = start_address;
         thread.win32_start_address = start_address;
         thread.parameter = 0;
@@ -2324,7 +2328,10 @@ impl ProcessManager {
         thread.priority = base_priority;
         thread.base_priority = base_priority;
         thread.ideal_processor = 0;
-        thread.security_descriptor = Vec::from(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..]);
+        thread.security_descriptor.clear();
+        thread
+            .security_descriptor
+            .extend_from_slice(default_security);
         thread.break_on_termination = false;
         thread.disable_boost = false;
         thread.hide_from_debugger = false;

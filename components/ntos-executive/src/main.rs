@@ -14084,6 +14084,7 @@ unsafe fn exec_paging_prepare_mark(key: u64, page: u64, level: &[u8]) -> bool {
     if entries.iter().any(|entry| *entry == key) {
         return true;
     }
+    let old_capacity = entries.capacity();
     if entries.try_reserve(1).is_err() {
         print_str(b"[exec-paging] seen-set allocation failed ");
         print_str(level);
@@ -14095,6 +14096,9 @@ unsafe fn exec_paging_prepare_mark(key: u64, page: u64, level: &[u8]) -> bool {
         print_hex(key as u32);
         print_str(b"\n");
         return false;
+    }
+    if entries.capacity() != old_capacity {
+        mark_durable_table_growth_dirty();
     }
     true
 }
@@ -15101,6 +15105,24 @@ pub(crate) unsafe fn config_manager_query_system_hive_key(
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
     Ok(snapshot)
+}
+
+pub(crate) unsafe fn config_manager_commit_system_hive_mutations(
+    mutations: &[nt_config_client::SystemHiveMutation<'_>],
+) -> Result<u64, i32> {
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if expected_generation == 0 {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    let generation = client.mutate_system_hive(expected_generation, mutations)?;
+    if generation != expected_generation.checked_add(1).unwrap_or(0) {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.store(generation, Ordering::Release);
+    Ok(generation)
 }
 
 /// The I/O Manager transport wrapper (carries the extra `flags` + a u64 `information`).

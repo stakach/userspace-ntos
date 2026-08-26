@@ -3027,45 +3027,99 @@ impl ExecNtHandler {
         const REG_SZ: u32 = 1;
         const REG_DWORD: u32 = 4;
         const SETUP_KEY: &str = r"\Registry\Machine\System\Setup";
-        if self.resolve_key(SETUP_KEY).is_none() {
-            print_str(
-                b"[setup-state] HKLM\\SYSTEM\\Setup absent -> normal-boot state not provisioned\n",
-            );
-            return;
-        }
         let setup_type = 0u32.to_le_bytes();
         let setup_in_progress = 0u32.to_le_bytes();
         let cmd_line = registry_sz_bytes("");
-        let Some(setup_type_changed) = self.ensure_mutable_registry_value_by_path(
-            SETUP_KEY,
-            "SetupType",
-            REG_DWORD,
-            &setup_type,
-        ) else {
-            print_str(b"[setup-state] HKLM\\SYSTEM\\Setup mutable write failed\n");
-            return;
+        let snapshot = match unsafe { crate::config_manager_query_system_hive_key(SETUP_KEY) } {
+            Ok(snapshot) => snapshot,
+            Err(status) => {
+                print_str(b"[setup-state] CM-owned HKLM\\SYSTEM\\Setup query failed status=0x");
+                print_hex(status as u32);
+                print_str(b"\n");
+                return;
+            }
         };
-        let Some(setup_in_progress_changed) = self.ensure_mutable_registry_value_by_path(
-            SETUP_KEY,
+        let matches = |name: &str, value_type: u32, data: &[u8]| {
+            snapshot.values.iter().any(|value| {
+                value.name.eq_ignore_ascii_case(name)
+                    && value.value_type == value_type
+                    && value.data == data
+            })
+        };
+        let setup_type_changed = !matches("SetupType", REG_DWORD, &setup_type);
+        let setup_in_progress_changed = !matches(
             "SystemSetupInProgress",
             REG_DWORD,
             &setup_in_progress,
-        ) else {
-            print_str(b"[setup-state] HKLM\\SYSTEM\\Setup mutable write failed\n");
+        );
+        let cmd_line_changed = !matches("CmdLine", REG_SZ, &cmd_line);
+        let mut mutations = alloc::vec::Vec::new();
+        if setup_type_changed {
+            mutations.push(nt_config_client::SystemHiveMutation::SetValue {
+                path: SETUP_KEY,
+                name: "SetupType",
+                value_type: REG_DWORD,
+                data: &setup_type,
+            });
+        }
+        if setup_in_progress_changed {
+            mutations.push(nt_config_client::SystemHiveMutation::SetValue {
+                path: SETUP_KEY,
+                name: "SystemSetupInProgress",
+                value_type: REG_DWORD,
+                data: &setup_in_progress,
+            });
+        }
+        if cmd_line_changed {
+            mutations.push(nt_config_client::SystemHiveMutation::SetValue {
+                path: SETUP_KEY,
+                name: "CmdLine",
+                value_type: REG_SZ,
+                data: &cmd_line,
+            });
+        }
+        if mutations.is_empty() {
+            print_str(b"[setup-state] HKLM\\SYSTEM\\Setup already in normal installed state\n");
             return;
+        }
+        let generation = match unsafe {
+            crate::config_manager_commit_system_hive_mutations(&mutations)
+        } {
+            Ok(generation) => generation,
+            Err(status) => {
+                print_str(b"[setup-state] CM-owned HKLM\\SYSTEM\\Setup commit failed status=0x");
+                print_hex(status as u32);
+                print_str(b"\n");
+                return;
+            }
         };
-        let Some(cmd_line_changed) =
-            self.ensure_mutable_registry_value_by_path(SETUP_KEY, "CmdLine", REG_SZ, &cmd_line)
-        else {
-            print_str(b"[setup-state] HKLM\\SYSTEM\\Setup mutable write failed\n");
-            return;
-        };
+        for (changed, name, value_type, data) in [
+            (setup_type_changed, "SetupType", REG_DWORD, setup_type.as_slice()),
+            (
+                setup_in_progress_changed,
+                "SystemSetupInProgress",
+                REG_DWORD,
+                setup_in_progress.as_slice(),
+            ),
+            (cmd_line_changed, "CmdLine", REG_SZ, cmd_line.as_slice()),
+        ] {
+            if changed
+                && self
+                    .ensure_mutable_registry_value_by_path(SETUP_KEY, name, value_type, data)
+                    .is_none()
+            {
+                print_str(b"[setup-state] committed CM generation ");
+                print_u64(generation);
+                print_str(b" could not be projected into the durable SYSTEM hive\n");
+                return;
+            }
+        }
         if setup_type_changed || setup_in_progress_changed || cmd_line_changed {
             print_str(
-                b"[setup-state] HKLM\\SYSTEM\\Setup normal installed boot values provisioned in mutable hive\n",
+                b"[setup-state] HKLM\\SYSTEM\\Setup normal installed boot values committed through CM generation ",
             );
-        } else {
-            print_str(b"[setup-state] HKLM\\SYSTEM\\Setup already in normal installed state\n");
+            print_u64(generation);
+            print_str(b" and projected into the durable hive\n");
         }
     }
 
@@ -5568,6 +5622,7 @@ impl ExecNtHandler {
                 print_ascii_str(&file_name);
                 print_str(b"\n");
             }
+            drop(log_bytes);
             root_subkeys = hive.subkey_count(hive.root()) as u64;
             if self.mutable_hives.mount(&full, hive_sel, hive).is_err() {
                 USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
@@ -5581,7 +5636,7 @@ impl ExecNtHandler {
             }
             NT_LOAD_KEY_CORE_HIVE_MOUNTED.fetch_add(1, Ordering::Relaxed);
         }
-        self.mark_mutable_hives_dirty();
+        self.mark_mutable_hives_dirty_preserving_services_order();
         self.hive_mounts.push(HiveMount {
             sel: hive_sel,
             canon,
@@ -5945,7 +6000,7 @@ impl ExecNtHandler {
             USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
         }
         if self.mutable_hives.unmount(&mount.mount).is_some() {
-            self.mark_mutable_hives_dirty();
+            self.mark_mutable_hives_dirty_preserving_services_order();
         }
         let mut mutable_handles_invalidated = 0usize;
         for entry in self.mutable_key_handles.iter_mut() {

@@ -1536,6 +1536,7 @@ fn reclaimed_runtime_thread_can_be_reused_only_after_handle_close() {
     let handle = pm
         .insert_handle(pid, HandleObject::Thread(worker), 0x1f_ffff)
         .unwrap();
+    let security_buffer = pm.thread(worker).unwrap().security_descriptor.as_ptr();
 
     pm.terminate_thread(worker, 0x1234).unwrap();
     assert_eq!(
@@ -1551,6 +1552,11 @@ fn reclaimed_runtime_thread_can_be_reused_only_after_handle_close() {
     assert_eq!(thread.exit_status, None);
     assert_eq!(thread.suspend_count, 1);
     assert_eq!(thread.teb_base, 0);
+    assert_eq!(thread.security_descriptor.as_ptr(), security_buffer);
+    assert_eq!(
+        thread.security_descriptor,
+        nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR
+    );
     assert!(!pm.can_reclaim_thread(worker));
 }
 

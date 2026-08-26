@@ -13150,3 +13150,35 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     backing. Update the live generation after each commit and remove direct-first SYSTEM setup
     mutation paths as their batches migrate. Non-SYSTEM hives stay on their current owned journal
     path until CM supports those mounts.
+
+    Executive CM-first Setup mutation batch (2026-08-27, accepted): normal
+    installed-boot provisioning now snapshots `HKLM\SYSTEM\Setup` through isolated CM, builds only
+    the required `SetupType`, `SystemSetupInProgress`, and `CmdLine` changes, and commits that batch
+    against the live generation. Only a successful CM commit advances the executive's generation
+    and permits the identical records to be projected into the durable writable SYSTEM journal.
+    The direct-first mutation path is deleted; an already-normal Setup key remains a no-op.
+
+    The first serialized acceptance attempt exposed two allocator-lifetime violations in adjacent
+    runtime infrastructure. Hosted paging hierarchy and resource-cap vectors now mark every real
+    capacity growth as durable before the service-loop allocator rewinds. Reclaimed ETHREAD reset
+    no longer replaces its security-descriptor `Vec`; it restores the default descriptor inside
+    the preallocated buffer and refuses reuse if that invariant cannot be satisfied. The focused
+    `nt-process` regression asserts the buffer address is stable across terminate/close/reuse.
+
+    The decisive failure was the global executive paging seen-set growing from 256 to 512 entries
+    while RPCSS was being published. Its old buffer was released without advancing the durable
+    service-loop heap barrier and overlapped LSASS's already-published 20 KiB handle table. All
+    paging seen-set capacity growth now marks the durable table state, so the rewind cannot recycle
+    storage still owned by live paging or process state. The temporary address/free-list probes used
+    to prove the alias were removed after validation.
+
+    Serialized acceptance is green. The freestanding executive check completed, all 107
+    `nt-process` tests passed, and `./run.sh --desktop` committed Setup through CM generation 2. The
+    run mounted the profile twice around a real `NtUnloadKey`, checkpointed and restored 185424
+    bytes, launched genuine userinit and Explorer processes, and reported 480000/480000 non-background
+    framebuffer pixels with at least 32 distinct colors. All 293 executive checks passed and the
+    microtest sentinel matched. No failed gate or LSASS invalid-handle event remained in the proof
+    log `.tmp/run-desktop-exec-paging-durable-20260827.log`.
+
+    Review adjustment: migrate the remaining executive SYSTEM setup batches to the same CM-first
+    helper and remove their direct-first paths before beginning the explicit win32k CM transport.
