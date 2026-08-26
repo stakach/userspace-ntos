@@ -91,6 +91,7 @@ use nt_hive_core::{
 use nt_hive_regf::{try_import_regf_into_hive, KeyRef, RegfHive};
 use nt_io_abi::wire::IoReply;
 use nt_io_client::IoClient;
+use nt_io_manager::{CreateOptions, CreateParameters, ShareAccess};
 use nt_kernel_exec::{EventKind, EventStore, IrqlState, WaitResult};
 use nt_lpc_abi::LpcReply;
 use nt_lpc_client::LpcClient;
@@ -29128,9 +29129,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         .ok()
                     })
                     .and_then(|file_id| {
-                        match driver_launch::dispatch_hosted_file_irp_result_exact(
-                            file_id, 1, /* IRP_MJ_CREATE_NAMED_PIPE */
-                            0, 0, &name16, &mut out,
+                        match driver_launch::dispatch_hosted_file_create_irp_result_exact(
+                            file_id,
+                            1, /* IRP_MJ_CREATE_NAMED_PIPE */
+                            0,
+                            CreateParameters {
+                                desired_access: AccessMask::from_bits_retain(0x001f_01ff),
+                                share_access: ShareAccess::from_bits_retain(3),
+                                create_options: CreateOptions::empty(),
+                                create_disposition: 3, /* FILE_OPEN_IF */
+                                file_attributes: 0,
+                                ea_length: 0,
+                            },
+                            &name16,
+                            &mut out,
                         ) {
                             Ok((status, information, _, context)) => {
                                 Some((status, information, file_id, context.unwrap_or(0)))
@@ -29174,9 +29186,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             .ok()
                         })
                         .and_then(|file_id| {
-                            match driver_launch::dispatch_hosted_file_irp_result_exact(
-                                file_id, 0, /* IRP_MJ_CREATE */
-                                0, 0, &name16, &mut cout,
+                            match driver_launch::dispatch_hosted_file_create_irp_result_exact(
+                                file_id,
+                                0, /* IRP_MJ_CREATE */
+                                0,
+                                CreateParameters {
+                                    desired_access: AccessMask::from_bits_retain(0x001f_01ff),
+                                    share_access: ShareAccess::from_bits_retain(3),
+                                    create_options: CreateOptions::empty(),
+                                    create_disposition: 1, /* FILE_OPEN */
+                                    file_attributes: 0,
+                                    ea_length: 0,
+                                },
+                                &name16,
+                                &mut cout,
                             ) {
                                 Ok((status, information, _, context)) => {
                                     Some((status, information, file_id, context.unwrap_or(0)))

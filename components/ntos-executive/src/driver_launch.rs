@@ -72,7 +72,8 @@ use nt_hosted_runtime::{
 use nt_io_abi::{ioctl, major, IrpDispatchRequest, IO_ABI_VERSION};
 use nt_io_manager::{
     write_wdm_driver_object, write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
-    BankedTransferCursor, CreateOptions, DeviceCharacteristics, DeviceControlParameters,
+    BankedTransferCursor, CreateOptions, CreateParameters, DeviceCharacteristics,
+    DeviceControlParameters,
     DeviceFlags, DeviceType, DispatchContext, DispatchOutcome, DispatchTarget,
     DriverDispatchBackend, DriverId, DriverPeerId, ExternalDispatchResult,
     ExternalPnpDispatchResult, FileId, FileState, HostedDevicePropertyOwner,
@@ -30919,9 +30920,30 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         major as u8,
         major::IRP_MJ_CREATE | major::IRP_MJ_CREATE_NAMED_PIPE | major::IRP_MJ_CREATE_MAILSLOT
     );
+    let create_ea_len = request.create_ea_length as u64;
+    let create_file_name_len = if is_create {
+        match inlen.checked_sub(create_ea_len) {
+            Some(length) => length,
+            None => return (STATUS_INVALID_PARAMETER, 0),
+        }
+    } else {
+        0
+    };
     if inlen > u32::MAX as u64
         || outlen > u32::MAX as u64
-        || is_create && inlen > (u16::MAX as u64).saturating_sub(2)
+        || is_create && create_file_name_len > (u16::MAX as u64).saturating_sub(2)
+        || is_create
+            && (request.create_share_access > u16::MAX as u32
+                || request.create_file_attributes > u16::MAX as u32
+                || request.create_disposition > 5
+                || request.create_options & 0xff00_0000 != 0)
+        || !is_create
+            && (request.create_desired_access != 0
+                || request.create_share_access != 0
+                || request.create_disposition != 0
+                || request.create_options != 0
+                || request.create_file_attributes != 0
+                || request.create_ea_length != 0)
     {
         return (STATUS_INVALID_BUFFER_SIZE as i32, 0);
     }
@@ -30965,7 +30987,9 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
     }
     let fo_allocation_len = if owns_fo {
-        match (WDM_X64_FILE_OBJECT_SIZE as u64).checked_add(inlen.saturating_add(2)) {
+        match (WDM_X64_FILE_OBJECT_SIZE as u64)
+            .checked_add(create_file_name_len.saturating_add(2))
+        {
             Some(length) => length,
             None => return (0xC000_009Au32 as i32, 0),
         }
@@ -30989,8 +31013,8 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             WdmFileObjectInit {
                 device_object: devobj,
                 fs_context: file_id,
-                file_name_len: inlen as u16,
-                file_name_max_len: (inlen + 2) as u16,
+                file_name_len: create_file_name_len as u16,
+                file_name_max_len: (create_file_name_len + 2) as u16,
                 file_name_buffer: fo + WDM_X64_FILE_OBJECT_SIZE as u64,
             },
         )
@@ -31063,17 +31087,36 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         }
         return (0xC000_0001u32 as i32, 0); // STATUS_UNSUCCESSFUL
     }
+    // CREATE's transfer payload is `[FILE_OBJECT name][EA chain]`, but WDM exposes only the EA
+    // chain through AssociatedIrp.SystemBuffer. Give that field its own allocation base so
+    // IRP_DEALLOCATE_BUFFER and retained-completion reclamation never attempt to free an interior
+    // pointer into the transport allocation.
+    if is_create && create_ea_len != 0 {
+        aux_data = pool_alloc_zeroed(create_ea_len);
+        if aux_data == 0 {
+            pool_free_request_buffers(data, 0, 0);
+            if owns_fo {
+                pool_free(fo);
+            }
+            return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
+        }
+        core::ptr::copy_nonoverlapping(
+            (input_data + create_file_name_len) as *const u8,
+            aux_data as *mut u8,
+            create_ea_len as usize,
+        );
+    }
     if owns_fo {
         let file_name = fo + WDM_X64_FILE_OBJECT_SIZE as u64;
         let mut index = 0u64;
-        while index < inlen {
+        while index < create_file_name_len {
             write_volatile(
                 (file_name + index) as *mut u8,
                 read_volatile((input_data + index) as *const u8),
             );
             index += 1;
         }
-        write_unaligned((file_name + inlen) as *mut u16, 0);
+        write_unaligned((file_name + create_file_name_len) as *mut u16, 0);
     }
     if control_method == Some(ioctl::METHOD_IN_DIRECT)
         && outlen != 0
@@ -31131,6 +31174,16 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             if outlen != 0 { data } else { 0 },
             if inlen != 0 { input_data } else { 0 },
             0,
+        ),
+        _ if is_create => (
+            aux_data,
+            0,
+            0,
+            if create_ea_len != 0 {
+                IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER
+            } else {
+                0
+            },
         ),
         _ => (data, data, data, 0),
     };
@@ -31197,23 +31250,10 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 (create_security_context + 0x08) as *mut u64,
                 create_access_state,
             );
-            write_unaligned((create_security_context + 0x10) as *mut u32, 0x001F_01FF);
-            // Options: Disposition in the high byte, CreateOptions in the low 24.
-            // BATCH 37: CREATE_NAMED_PIPE must use FILE_OPEN_IF (3), NOT FILE_CREATE (2) — this is
-            // exactly what Win32 CreateNamedPipe / NtCreateNamedPipeFile pass (kernel32 npipe.c:393).
-            // npfs's NpCreateExistingNamedPipe (create.c:594) returns STATUS_ACCESS_DENIED for a 2nd+
-            // instance opened with FILE_CREATE, while FILE_OPEN_IF opens-or-creates for both the new
-            // FCB (NpCreateNewNamedPipe accepts anything but FILE_OPEN) AND every subsequent instance.
-            // With FILE_CREATE the SCM listener's post-accept `rpcrt4_conn_create_pipe` re-create
-            // (2nd \ntsvcs instance) failed → its re-listen failed → the rpcrt4 server thread entered
-            // shutdown and called rpcrt4_conn_close_read on the just-handed-off connection, setting
-            // conn->read_closed=1, so the per-connection worker's rpcrt4_conn_np_read skipped NtReadFile
-            // and the bind was never read. Client opens (major 0) still use FILE_OPEN (1).
-            let disposition: u32 = match major as u8 {
-                major::IRP_MJ_CREATE_NAMED_PIPE => 3, // FILE_OPEN_IF
-                major::IRP_MJ_CREATE_MAILSLOT => 2,   // FILE_CREATE
-                _ => 1,                               // FILE_OPEN
-            };
+            write_unaligned(
+                (create_security_context + 0x10) as *mut u32,
+                request.create_desired_access,
+            );
             let named_pipe_parameters = if major as u8 == major::IRP_MJ_CREATE_NAMED_PIPE {
                 // NAMED_PIPE_CREATE_PARAMETERS (0x28 bytes): NamedPipeType@0, ReadMode@4, CompletionMode@8,
                 // MaximumInstances@0xc, InboundQuota@0x10, OutboundQuota@0x14, DefaultTimeout@0x18 (LI, must
@@ -31270,8 +31310,11 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             };
             WdmIoStackParameters::Create {
                 security_context: create_security_context,
-                options: disposition << 24,
-                share_access: 3,
+                options: (request.create_disposition << 24)
+                    | (request.create_options & 0x00ff_ffff),
+                file_attributes: request.create_file_attributes as u16,
+                share_access: request.create_share_access as u16,
+                ea_length: request.create_ea_length,
                 named_pipe_parameters,
             }
         }
@@ -34517,6 +34560,30 @@ fn hosted_irp_dispatch_request(
             .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?,
         ioctl_code: u32::try_from(projection_fsctl(irp))
             .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?,
+        create_desired_access: match &irp.parameters {
+            IoParameters::Create(parameters) => parameters.desired_access.bits(),
+            _ => 0,
+        },
+        create_share_access: match &irp.parameters {
+            IoParameters::Create(parameters) => parameters.share_access.bits(),
+            _ => 0,
+        },
+        create_disposition: match &irp.parameters {
+            IoParameters::Create(parameters) => parameters.create_disposition,
+            _ => 0,
+        },
+        create_options: match &irp.parameters {
+            IoParameters::Create(parameters) => parameters.create_options.bits(),
+            _ => 0,
+        },
+        create_file_attributes: match &irp.parameters {
+            IoParameters::Create(parameters) => parameters.file_attributes,
+            _ => 0,
+        },
+        create_ea_length: match &irp.parameters {
+            IoParameters::Create(parameters) => parameters.ea_length,
+            _ => 0,
+        },
         parameter_offset,
         parameter_len,
         stack_location: u32::try_from(irp.stack_location)
@@ -34884,10 +34951,11 @@ fn external_irp_parameters(
     fsctl: u64,
     input_len: u32,
     output_len: u32,
+    create: Option<CreateParameters>,
 ) -> Option<IoParameters> {
     match major {
         major::IRP_MJ_CREATE | major::IRP_MJ_CREATE_NAMED_PIPE | major::IRP_MJ_CREATE_MAILSLOT => {
-            Some(IoParameters::Create(Default::default()))
+            Some(IoParameters::Create(create.unwrap_or_default()))
         }
         major::IRP_MJ_CLEANUP => Some(IoParameters::Cleanup),
         major::IRP_MJ_CLOSE => Some(IoParameters::Close),
@@ -34943,11 +35011,12 @@ fn dispatch_external_irp_to_device_record_result_exact(
     requestor_tid: u64,
     in_data: &[u8],
     out: &mut [u8],
+    create: Option<CreateParameters>,
 ) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
     let major = external_major(major).ok_or(STATUS_INVALID_PARAMETER as u32)?;
     let (input_len, output_len, system_buffer_len) =
         external_dispatch_buffer_lengths(in_data.len(), out.len())?;
-    let params = external_irp_parameters(major, fsctl, input_len, output_len)
+    let params = external_irp_parameters(major, fsctl, input_len, output_len, create)
         .ok_or(STATUS_INVALID_PARAMETER as u32)?;
     let separate_output = matches!(
         control_transfer_method(major as u64, fsctl),
@@ -44737,6 +44806,45 @@ pub(crate) unsafe fn dispatch_hosted_file_irp_result_exact(
         requestor_tid,
         in_data,
         out,
+        None,
+    )
+}
+
+/// Dispatch a CREATE whose input buffer contains the UTF-16 FILE_OBJECT name followed by the
+/// validated EA chain. The typed parameters keep those extents distinct across the driver-domain
+/// transport even though they share one canonical transfer owner.
+pub(crate) unsafe fn dispatch_hosted_file_create_irp_result_exact(
+    file_id: u64,
+    major: u8,
+    requestor_tid: u64,
+    parameters: CreateParameters,
+    in_data: &[u8],
+    out: &mut [u8],
+) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
+    if !matches!(
+        major,
+        major::IRP_MJ_CREATE | major::IRP_MJ_CREATE_NAMED_PIPE | major::IRP_MJ_CREATE_MAILSLOT
+    ) || parameters.ea_length as usize > in_data.len()
+    {
+        return Err(STATUS_INVALID_PARAMETER as u32);
+    }
+    let canonical_file_id = FileId(file_id);
+    let device_id = io_manager_mut()
+        .file(canonical_file_id)
+        .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID))
+        .map(|file| file.device_id.raw())
+        .ok_or(STATUS_INVALID_HANDLE as u32)?;
+    require_hosted_device_ready_for_dispatch(device_id)?;
+    dispatch_external_irp_to_device_record_result_exact(
+        device_id,
+        Some(canonical_file_id),
+        major as u64,
+        0,
+        0,
+        requestor_tid,
+        in_data,
+        out,
+        Some(parameters),
     )
 }
 

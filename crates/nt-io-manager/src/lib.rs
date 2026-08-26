@@ -31,6 +31,7 @@ mod dispatch;
 mod driver;
 mod driver_host;
 mod driver_peer;
+mod ea;
 mod external_dispatch;
 mod fault;
 mod file;
@@ -80,6 +81,7 @@ pub use driver_host::{DriverHostRoutine, MvpStatus};
 pub use driver_peer::{
     DriverPeerBackend, DriverPeerTransport, MockDriverPeer, MockPeerControl, PeerTransferBuffers,
 };
+pub use ea::{validate_ea_buffer, EaValidationError};
 pub use external_dispatch::{
     ExternalDispatchResult, ExternalPnpDispatchResult, PreparedExternalPnpIrp,
 };
@@ -4774,6 +4776,15 @@ mod tests {
         assert_eq!(request.target_domain_cookie, target.cookie);
         assert_eq!(request.provider_domain_id, provider.domain_id.raw());
         assert_eq!(request.provider_cookie, provider.cookie);
+        assert_eq!(
+            request.create_desired_access,
+            AccessMask::GENERIC_READ.bits()
+        );
+        assert_eq!(request.create_share_access, ShareAccess::READ.bits());
+        assert_eq!(request.create_disposition, 0);
+        assert_eq!(request.create_options, 0);
+        assert_eq!(request.create_file_attributes, 0);
+        assert_eq!(request.create_ea_length, 0);
         assert!(request.has_well_formed_domain_route());
     }
 
@@ -5258,7 +5269,9 @@ mod tests {
                 parameters: WdmIoStackParameters::Create {
                     security_context: 0x7777,
                     options: 3 << 24,
+                    file_attributes: 0x20,
                     share_access: 3,
+                    ea_length: 0x18,
                     named_pipe_parameters: Some(0x8888),
                 },
             },
@@ -5266,7 +5279,9 @@ mod tests {
         .unwrap();
         assert_eq!(le_u64(&stack, 0x08), 0x7777);
         assert_eq!(le_u32(&stack, 0x10), 3 << 24);
+        assert_eq!(le_u16(&stack, 0x18), 0x20);
         assert_eq!(le_u16(&stack, 0x1a), 3);
+        assert_eq!(le_u32(&stack, 0x1c), 0x18);
         assert_eq!(le_u64(&stack, 0x20), 0x8888);
         assert_eq!(le_u64(&stack, 0x28), 0x4444);
         assert_eq!(le_u64(&stack, 0x30), 0x5555);

@@ -368,6 +368,8 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 share_access,
                 create_options,
                 create_disposition,
+                file_attributes: 0,
+                ea_length: 0,
             }),
         ) {
             Ok(irp) => irp,

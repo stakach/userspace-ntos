@@ -94,23 +94,63 @@ fn build_dispatch_request(
         &mut cursor,
         ctx.user_buffer.as_ref().map(|b| b.len()).unwrap_or(0),
     )?;
-    let (ioctl_code, input_len, output_len, parameter_offset, parameter_len) = match &irp.parameters
-    {
+    let (
+        ioctl_code,
+        input_len,
+        output_len,
+        create_desired_access,
+        create_share_access,
+        create_disposition,
+        create_options,
+        create_file_attributes,
+        create_ea_length,
+        parameter_offset,
+        parameter_len,
+    ) = match &irp.parameters {
         crate::irp::IoParameters::DeviceControl(p)
-        | crate::irp::IoParameters::InternalDeviceControl(p) => {
-            (p.ioctl_code, p.input_len, p.output_len, 0, 0)
-        }
+        | crate::irp::IoParameters::InternalDeviceControl(p) => (
+            p.ioctl_code,
+            p.input_len,
+            p.output_len,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ),
+        crate::irp::IoParameters::Create(p) => (
+            0,
+            u32::try_from(ctx.system_buffer.len()).map_err(|_| NtStatus::INVALID_PARAMETER)?,
+            0,
+            p.desired_access.bits(),
+            p.share_access.bits(),
+            p.create_disposition,
+            p.create_options.bits(),
+            p.file_attributes,
+            p.ea_length,
+            0,
+            0,
+        ),
         crate::irp::IoParameters::Pnp(p) => match p.start {
             Some(start) => (
                 0,
                 p.input_len(),
                 0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
                 start.raw_resource_list_len,
                 start.translated_resource_list_len,
             ),
-            None => (0, 0, 0, 0, 0),
+            None => (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
         },
-        _ => (0, 0, 0, 0, 0),
+        _ => (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
     };
     Ok(IrpDispatchRequest {
         abi_version: IO_ABI_VERSION as u16,
@@ -142,6 +182,12 @@ fn build_dispatch_request(
         input_len,
         output_len,
         ioctl_code,
+        create_desired_access,
+        create_share_access,
+        create_disposition,
+        create_options,
+        create_file_attributes,
+        create_ea_length,
         parameter_offset,
         parameter_len,
         stack_location: irp.stack_location as u32,

@@ -83,7 +83,9 @@ pub enum WdmIoStackParameters {
     Create {
         security_context: u64,
         options: u32,
+        file_attributes: u16,
         share_access: u16,
+        ea_length: u32,
         named_pipe_parameters: Option<u64>,
     },
     Read {
@@ -264,12 +266,16 @@ pub fn write_wdm_io_stack_location(
         WdmIoStackParameters::Create {
             security_context,
             options,
+            file_attributes,
             share_access,
+            ea_length,
             named_pipe_parameters,
         } => {
             put_u64(bytes, 0x08, security_context);
             put_u32(bytes, 0x10, options);
+            put_u16(bytes, 0x18, file_attributes);
             put_u16(bytes, 0x1a, share_access);
+            put_u32(bytes, 0x1c, ea_length);
             if let Some(parameters) = named_pipe_parameters {
                 put_u64(bytes, 0x20, parameters);
             }

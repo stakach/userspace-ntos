@@ -13804,3 +13804,37 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     event state, completion-port packets, cache entries, and process handles remain durable. Remove
     each legacy capture allocation only after its last consumer is explicit; do not wrap a complete
     potentially parking file syscall in a scratch scope.
+
+    File create/open capture and canonical CREATE transport (2026-08-27, accepted): `NtOpenFile`,
+    `NtCreateFile`, and `NtCreateNamedPipeFile` now capture the complete caller
+    `OBJECT_ATTRIBUTES` and `UNICODE_STRING` once into a fixed 1,024-unit representation, validate
+    the x64 structure size and attribute mask, and reuse that immutable name throughout routing.
+    The old allocating pipe-leaf decoder and repeated `NtOpenFile` object-name reads are gone.
+    `NtCreateFile` probes its output surfaces, captures and validates optional allocation size and
+    `FILE_FULL_EA_INFORMATION`, and returns the exact malformed-EA offset through the IOSB.
+
+    CREATE is now a typed I/O Manager/provider contract rather than receiver-side synthesis. I/O
+    ABI version 5 carries desired access, share access, disposition, options, file attributes, and
+    EA length; the WDM projection writes those values into `IO_SECURITY_CONTEXT` and
+    `IO_STACK_LOCATION.Parameters.Create`. The provider splits the canonical transfer into the
+    FILE_OBJECT name and a separately owned EA `SystemBuffer`, so `IRP_DEALLOCATE_BUFFER` always
+    names an allocation base. The hardcoded all-access/share/disposition projection was deleted.
+    Executive NPFS proofs also issue explicit typed server/client CREATEs; the first acceptance run
+    correctly exposed their stale zero-parameter producer, which was fixed at that producer without
+    adding a receiver fallback.
+
+    Focused `nt-io-abi` validation passes `5/5`, `nt-io-manager` passes `200/200`, and the
+    freestanding executive release check remains green at the established 212-warning baseline.
+    Final serialized acceptance
+    `.tmp/run-headless-file-create-capture-ea-final-20260827.log` passed all `295/295` gates,
+    including real NPFS create/connect, two pending flush completions, call-bound per-request
+    completion identity, userinit, Explorer, and all 480,000 framebuffer pixels with at least 32
+    colors. Scratch returned to zero with the unchanged 278,112 B peak. Final durable allocation was
+    14,828,152 B with 6,143,240 B reusable.
+
+    Review adjustment: caller capture and provider CREATE parameters are closed, but file
+    `OBJECT_ATTRIBUTES.RootDirectory` is only captured, not yet resolved. Next make file opens
+    resolve relative names through the canonical process handle/object namespace, then replace the
+    remaining allocating `writable_path` and `volume_path` helpers with bounded `*_into` forms.
+    Preserve the current phase boundary: path resolution is synchronous, while canonical Files,
+    IRPs, pending CREATE publication, APC/event/IOCP state, and process handles remain durable.

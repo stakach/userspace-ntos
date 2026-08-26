@@ -45,6 +45,10 @@ pub struct CreateParameters {
     pub share_access: ShareAccess,
     pub create_options: CreateOptions,
     pub create_disposition: u32,
+    pub file_attributes: u32,
+    /// Bytes of `FILE_FULL_EA_INFORMATION` at the tail of the CREATE input buffer. Any preceding
+    /// input bytes are the canonical FILE_OBJECT name used by an isolated WDM provider.
+    pub ea_length: u32,
 }
 
 /// `IRP_MJ_READ` / `IRP_MJ_WRITE` parameters.
