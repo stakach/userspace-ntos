@@ -57,6 +57,32 @@ pub enum MemFsSnapshotError {
     OutOfMemory,
 }
 
+/// Failures while reclaiming immutable file-data blobs that are no longer referenced by a file.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MemFsBlobCompactError {
+    CorruptExtent,
+    OutOfMemory,
+}
+
+/// Immutable blob storage before and after a successful compaction.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemFsBlobCompaction {
+    pub blobs_before: usize,
+    pub blobs_after: usize,
+    pub bytes_before: usize,
+    pub bytes_after: usize,
+}
+
+impl MemFsBlobCompaction {
+    pub fn reclaimed_blobs(self) -> usize {
+        self.blobs_before.saturating_sub(self.blobs_after)
+    }
+
+    pub fn reclaimed_bytes(self) -> usize {
+        self.bytes_before.saturating_sub(self.bytes_after)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct FileExtent {
     blob: usize,
@@ -458,6 +484,92 @@ impl MemFs {
             children: Vec::new(),
         }));
         fs
+    }
+
+    /// Remove immutable data blobs that no live file extent references.
+    ///
+    /// All allocation and extent validation happens before publication. An allocation failure or
+    /// corrupt extent therefore leaves both the blob arena and every file unchanged.
+    pub fn compact_blobs(&mut self) -> Result<MemFsBlobCompaction, MemFsBlobCompactError> {
+        const UNUSED: usize = usize::MAX;
+        const REFERENCED: usize = usize::MAX - 1;
+
+        let blobs_before = self.blobs.len();
+        let bytes_before = self.blobs.iter().map(Vec::len).sum();
+        let mut remap = Vec::new();
+        remap
+            .try_reserve_exact(blobs_before)
+            .map_err(|_| MemFsBlobCompactError::OutOfMemory)?;
+        remap.resize(blobs_before, UNUSED);
+
+        for node in self.nodes.iter().flatten() {
+            let FileData::Extents(extents) = &node.data else {
+                continue;
+            };
+            for extent in extents {
+                if extent.blob == ZERO_EXTENT_BLOB || extent.len == 0 {
+                    continue;
+                }
+                let blob = self
+                    .blobs
+                    .get(extent.blob)
+                    .ok_or(MemFsBlobCompactError::CorruptExtent)?;
+                let end = extent
+                    .offset
+                    .checked_add(extent.len)
+                    .ok_or(MemFsBlobCompactError::CorruptExtent)?;
+                if end > blob.len() {
+                    return Err(MemFsBlobCompactError::CorruptExtent);
+                }
+                remap[extent.blob] = REFERENCED;
+            }
+        }
+
+        let mut blobs_after = 0usize;
+        for mapped in &mut remap {
+            if *mapped == REFERENCED {
+                *mapped = blobs_after;
+                blobs_after += 1;
+            }
+        }
+        if blobs_after == blobs_before {
+            return Ok(MemFsBlobCompaction {
+                blobs_before,
+                blobs_after,
+                bytes_before,
+                bytes_after: bytes_before,
+            });
+        }
+        let mut compacted = Vec::new();
+        compacted
+            .try_reserve_exact(blobs_after)
+            .map_err(|_| MemFsBlobCompactError::OutOfMemory)?;
+
+        let old_blobs = core::mem::take(&mut self.blobs);
+        for (old_index, blob) in old_blobs.into_iter().enumerate() {
+            if remap[old_index] != UNUSED {
+                compacted.push(blob);
+            }
+        }
+        let bytes_after = compacted.iter().map(Vec::len).sum();
+        self.blobs = compacted;
+        for node in self.nodes.iter_mut().flatten() {
+            let FileData::Extents(extents) = &mut node.data else {
+                continue;
+            };
+            for extent in extents {
+                if extent.blob != ZERO_EXTENT_BLOB && extent.len != 0 {
+                    extent.blob = remap[extent.blob];
+                }
+            }
+        }
+
+        Ok(MemFsBlobCompaction {
+            blobs_before,
+            blobs_after,
+            bytes_before,
+            bytes_after,
+        })
     }
 
     /// The default fixture tree (spec §12.2): `\Windows\System32\Config\{SYSTEM,SOFTWARE,…}` +
@@ -2375,6 +2487,11 @@ impl FileSystem {
     /// included.
     pub fn export_volume_snapshot(&self) -> Result<Vec<u8>, MemFsSnapshotError> {
         self.volume.to_snapshot()
+    }
+
+    /// Reclaim immutable file-data blobs made unreachable by truncate, replace, or unlink.
+    pub fn compact_volume_blobs(&mut self) -> Result<MemFsBlobCompaction, MemFsBlobCompactError> {
+        self.volume.compact_blobs()
     }
 
     /// Commit the durable volume tree to a block-backed snapshot store without allocating the full

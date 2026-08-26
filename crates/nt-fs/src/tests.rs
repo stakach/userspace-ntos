@@ -638,6 +638,60 @@ fn copied_file_chunks_share_provisioned_source_until_modified() {
 }
 
 #[test]
+fn compact_volume_blobs_reclaims_only_unreferenced_storage() {
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_file(r"\??\C:\Temp\live.log", b"header"));
+    assert_eq!(
+        fs.append_file_by_path(r"\??\C:\Temp\live.log", b"-record"),
+        (STATUS_SUCCESS, 7)
+    );
+    assert!(fs.provision_file(r"\??\C:\Temp\replaced.bin", b"obsolete-payload"));
+
+    let replaced = fs.zw_create_file(
+        r"\??\C:\Temp\replaced.bin",
+        FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(replaced.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.replace_file_data_owned(replaced.handle, b"replacement".to_vec()),
+        STATUS_SUCCESS
+    );
+    fs.zw_close(replaced.handle);
+
+    let snapshot_before = fs.export_volume_snapshot().unwrap();
+    assert_eq!(fs.unique_data_blobs(), 3);
+    let result = fs.compact_volume_blobs().unwrap();
+    assert_eq!(
+        result,
+        MemFsBlobCompaction {
+            blobs_before: 3,
+            blobs_after: 2,
+            bytes_before: 6 + 7 + 16,
+            bytes_after: 6 + 7,
+        }
+    );
+    assert_eq!(result.reclaimed_blobs(), 1);
+    assert_eq!(result.reclaimed_bytes(), 16);
+    assert_eq!(
+        fs.file_bytes_owned(r"\??\C:\Temp\live.log").as_deref(),
+        Some(&b"header-record"[..])
+    );
+    assert_eq!(
+        fs.file_bytes(r"\??\C:\Temp\replaced.bin"),
+        Some(&b"replacement"[..])
+    );
+    assert_eq!(fs.export_volume_snapshot().unwrap(), snapshot_before);
+
+    let second = fs.compact_volume_blobs().unwrap();
+    assert_eq!(second.reclaimed_blobs(), 0);
+    assert_eq!(second.reclaimed_bytes(), 0);
+}
+
+#[test]
 fn directory_rejects_data_ops() {
     let mut fs = FileSystem::new(MemFs::with_fixture());
     let h = fs
