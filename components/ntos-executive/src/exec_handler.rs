@@ -102,6 +102,26 @@ impl CapturedNamedObjectAttributes {
     }
 }
 
+struct CapturedIoCompletionObjectAttributes {
+    attributes: u32,
+    name_len: usize,
+    name: [u16; EXEC_IO_COMPLETION_NAME_UNITS],
+}
+
+impl CapturedIoCompletionObjectAttributes {
+    const fn anonymous() -> Self {
+        Self {
+            attributes: 0,
+            name_len: 0,
+            name: [0; EXEC_IO_COMPLETION_NAME_UNITS],
+        }
+    }
+
+    fn name(&self) -> &[u16] {
+        &self.name[..self.name_len]
+    }
+}
+
 fn try_zeroed_transfer_buffer(len: usize) -> Result<alloc::vec::Vec<u8>, u32> {
     let mut bytes = alloc::vec::Vec::new();
     bytes
@@ -18516,6 +18536,66 @@ impl ExecNtHandler {
         })
     }
 
+    unsafe fn capture_io_completion_object_attributes(
+        &self,
+        oa_va: u64,
+    ) -> Result<CapturedIoCompletionObjectAttributes, u32> {
+        const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
+
+        if oa_va == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let mut oa = [0u8; 0x30];
+        if !self.xas_read(oa_va, &mut oa) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        if u32::from_le_bytes(oa[0..4].try_into().unwrap()) != 0x30 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let attributes = u32::from_le_bytes(oa[24..28].try_into().unwrap());
+        let object_name = u64::from_le_bytes(oa[16..24].try_into().unwrap());
+        if object_name == 0 {
+            return Ok(CapturedIoCompletionObjectAttributes {
+                attributes,
+                ..CapturedIoCompletionObjectAttributes::anonymous()
+            });
+        }
+
+        let mut ustr = [0u8; 16];
+        if !self.xas_read(object_name, &mut ustr) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let byte_len = u16::from_le_bytes(ustr[0..2].try_into().unwrap()) as usize;
+        let maximum_len = u16::from_le_bytes(ustr[2..4].try_into().unwrap()) as usize;
+        let buffer = u64::from_le_bytes(ustr[8..16].try_into().unwrap());
+        if byte_len & 1 != 0 || byte_len > maximum_len {
+            return Err(STATUS_OBJECT_NAME_INVALID);
+        }
+        let name_len = byte_len / 2;
+        if name_len > EXEC_IO_COMPLETION_NAME_UNITS {
+            return Err(nt_io_completion::STATUS_NAME_TOO_LONG);
+        }
+        let mut captured = CapturedIoCompletionObjectAttributes {
+            attributes,
+            ..CapturedIoCompletionObjectAttributes::anonymous()
+        };
+        captured.name_len = name_len;
+        if name_len == 0 {
+            return Ok(captured);
+        }
+        if buffer == 0 {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        for index in 0..name_len {
+            let mut word = [0u8; 2];
+            if !self.xas_read(buffer + (index * 2) as u64, &mut word) {
+                return Err(STATUS_ACCESS_VIOLATION);
+            }
+            captured.name[index] = u16::from_le_bytes(word);
+        }
+        Ok(captured)
+    }
+
     unsafe fn read_unicode_string16(&self, ustr_va: u64) -> Result<alloc::vec::Vec<u16>, u32> {
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
         const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
@@ -28551,19 +28631,13 @@ impl ExecNtHandler {
                 if out_handle == 0 || !self.xas_read(out_handle, &mut output_probe) {
                     return STATUS_ACCESS_VIOLATION;
                 }
-                let mut oa_header = [0u8; 32];
-                if oa != 0 && !self.xas_read(oa, &mut oa_header) {
-                    return STATUS_ACCESS_VIOLATION;
-                }
-                let attributes = if oa == 0 {
-                    0
+                let captured = if oa == 0 {
+                    CapturedIoCompletionObjectAttributes::anonymous()
                 } else {
-                    u32::from_le_bytes(oa_header[24..28].try_into().unwrap())
-                };
-                let name = if oa == 0 {
-                    alloc::vec::Vec::new()
-                } else {
-                    self.read_objattr_name_pe(oa)
+                    match self.capture_io_completion_object_attributes(oa) {
+                        Ok(captured) => captured,
+                        Err(status) => return status,
+                    }
                 };
                 if !NT_CREATE_IO_COMPLETION_TRACED.swap(true, Ordering::Relaxed) {
                     print_str(b"[nt-create-io-completion] pi=");
@@ -28573,11 +28647,11 @@ impl ExecNtHandler {
                     print_str(b" oa=0x");
                     print_hex(oa as u32);
                     print_str(b" attrs=0x");
-                    print_hex(attributes);
+                    print_hex(captured.attributes);
                     print_str(b" concurrency=");
                     print_u64(concurrency as u64);
                     print_str(b" name=\"");
-                    for &unit in name.iter().take(64) {
+                    for &unit in captured.name().iter().take(64) {
                         debug_put_char(if (0x20..0x7f).contains(&unit) {
                             unit as u8
                         } else {
@@ -28587,9 +28661,9 @@ impl ExecNtHandler {
                     print_str(b"\"\n");
                 }
                 let created = match self.io_completion_ports.create(
-                    &name,
+                    captured.name(),
                     concurrency,
-                    attributes & 0x40 != 0,
+                    captured.attributes & 0x40 != 0,
                 ) {
                     Ok(created) => created,
                     Err(status) => return status,
@@ -28628,20 +28702,20 @@ impl ExecNtHandler {
                 let desired_access = nt_ulong_arg(args[1]);
                 let oa = args[2];
                 let mut output_probe = [0u8; 8];
-                let mut oa_header = [0u8; 32];
-                if out_handle == 0
-                    || !self.xas_read(out_handle, &mut output_probe)
-                    || oa == 0
-                    || !self.xas_read(oa, &mut oa_header)
-                {
+                if out_handle == 0 || !self.xas_read(out_handle, &mut output_probe) {
                     return STATUS_ACCESS_VIOLATION;
                 }
-                let attributes = u32::from_le_bytes(oa_header[24..28].try_into().unwrap());
-                let name = self.read_objattr_name_pe(oa);
-                let object_id = match self
-                    .io_completion_ports
-                    .open(&name, attributes & OBJ_CASE_INSENSITIVE != 0)
-                {
+                if oa == 0 {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                let captured = match self.capture_io_completion_object_attributes(oa) {
+                    Ok(captured) => captured,
+                    Err(status) => return status,
+                };
+                let object_id = match self.io_completion_ports.open(
+                    captured.name(),
+                    captured.attributes & OBJ_CASE_INSENSITIVE != 0,
+                ) {
                     Ok(id) => id,
                     Err(status) => return status,
                 };

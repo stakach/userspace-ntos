@@ -13748,3 +13748,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and process-handle minting next. Inspect the `nt-io-completion` ownership contract before
     changing the executive call sites. Then inventory file create/open capture paths without placing
     pending IRPs, parked continuations, APCs, events, or IOCP completion records in transient scope.
+
+    I/O completion object-attribute capture (2026-08-27, accepted): `NtCreateIoCompletion` and
+    `NtOpenIoCompletion` no longer allocate a temporary name `Vec` or treat an unreadable name as an
+    anonymous object. A fixed `CapturedIoCompletionObjectAttributes` validates the complete
+    `OBJECT_ATTRIBUTES` and `UNICODE_STRING`, copies at most the crate table's 64 UTF-16 units, and
+    reports access violations, malformed names, and over-capacity names distinctly. The capture is
+    consumed synchronously; the fixed port table owns its copied durable name, and process-handle
+    minting plus reference rollback remain outside caller-memory capture. A null create remains an
+    anonymous completion port, while a null open now returns NT's `STATUS_INVALID_PARAMETER`.
+
+    Focused `nt-io-completion` acceptance passed all 33 tests. Serialized acceptance
+    `.tmp/run-headless-io-completion-stack-capture-20260827.log` passed all `295/295` gates after
+    exercising four live completion ports, blocking removers, direct packet wakes, RPC/thread-pool
+    traffic, real userinit and Explorer, and the complete framebuffer. Scratch returned to zero at
+    the unchanged 278,112 B peak. Final durable allocation was 14,828,848 B with 6,142,544 B
+    reusable.
+
+    Review adjustment: capture lifetime is closed, but named completion ports still maintain a
+    private name table rather than participating in the shared Object Manager namespace. Correct
+    that ownership before file create/open work: the Object Manager must resolve absolute and
+    `RootDirectory`-relative paths, enforce cross-type collisions, and own named-object unlinking;
+    `nt-io-completion` should own only port reference/concurrency/packet state. Delete the private
+    port-name machinery once the shared namespace path is accepted. Then resume the file capture and
+    publication inventory.

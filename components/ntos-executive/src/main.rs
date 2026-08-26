@@ -22109,7 +22109,9 @@ unsafe fn reset_exec_nt_handler(
     ExecNtHandler::initialize_in(slot, hosted_images, driver_starts, require_boot_system)
 }
 
-type ExecIoCompletionPortTable = nt_io_completion::CompletionPortTable<TP_WORKER_PI_COUNT, 8, 64>;
+const EXEC_IO_COMPLETION_NAME_UNITS: usize = 64;
+type ExecIoCompletionPortTable =
+    nt_io_completion::CompletionPortTable<TP_WORKER_PI_COUNT, 8, EXEC_IO_COMPLETION_NAME_UNITS>;
 type ExecFileCompletionTable = nt_io_completion::FileCompletionTable<128>;
 type ExecProcessMechanismTable = nt_user_host::ProcessMechanismTable<MAX_PI>;
 type ExecThreadMechanismTable = nt_user_host::ThreadMechanismTable<MAX_PI, PM_RUNTIME_THREAD_SLOTS>;
