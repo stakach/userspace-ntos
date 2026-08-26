@@ -16,6 +16,7 @@ struct HostedPointerBinding<I> {
     id: I,
 }
 
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostedDomainIdentity {
     pub domain_id: HostedDomainId,

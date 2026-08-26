@@ -736,9 +736,10 @@ struct PendingIrp {
     /// Canonical I/O Manager identities. These are transport ids, never driver
     /// pointers or FsContext cookies, and stay attached through completion ACK.
     canonical_file_id: u64,
-    /// Stable hosted domain that originated this request. Provider domains can host owners for
-    /// several dependent drivers, so completion polling never filters on a reusable instance slot.
-    owner_domain_id: u64,
+    /// Exact hosted domain generation that originated this request. Provider domains can host
+    /// owners for several dependent drivers, so completion polling never filters on a reusable
+    /// instance slot or a generationless domain id.
+    owner_domain: HostedDomainIdentity,
     /// The npfs `FsContext` (opaque file id) this IRP was issued on, captured at ISSUE time.
     /// ★ Must NOT be re-read from `FILE_OBJECT->FsContext` at completion time: npfs NULLs that
     /// field through `NpSetFileObject(fo, NULL, NULL, …)` when a pipe end disconnects
@@ -1833,10 +1834,7 @@ fn hosted_completion_storage_instance(instance: usize) -> usize {
 }
 
 unsafe fn poll_hosted_completion(instance_index: usize) -> Option<nt_io_manager::DriverCompletion> {
-    let owner_domain_id = instance(instance_index)?.hosted_domain_id;
-    if owner_domain_id == 0 {
-        return None;
-    }
+    let owner_domain = instance_domain_identity(instance(instance_index)?)?;
     let storage_instance = hosted_completion_storage_instance(instance_index);
     let win = ExecVaWindow::try_for_instance(storage_instance)?;
     let head = (win.data_va + FSD_PENDING_IRP_HEAD_OFF) as *const AtomicU64;
@@ -1871,7 +1869,7 @@ unsafe fn poll_hosted_completion(instance_index: usize) -> Option<nt_io_manager:
             let entry = read_volatile(pending_irp_entry_address(node_exec) as *const PendingIrp);
             let completion = entry.completion.completed();
             pending_irp_owner_state(node_exec).store(ready_state, Ordering::Release);
-            if canonical_irp_id != 0 && entry.owner_domain_id == owner_domain_id {
+            if canonical_irp_id != 0 && entry.owner_domain == owner_domain {
                 if let Some(completion) = completion {
                     if best
                         .as_ref()
@@ -27389,7 +27387,10 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     let fsctl = request.ioctl_code as u64;
     let canonical_irp_id = request.irp_id;
     let canonical_file_id = request.file_id;
-    let owner_domain_id = request.target_domain_id;
+    let owner_domain = HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId(request.target_domain_id),
+        cookie: request.target_domain_cookie,
+    };
 
     let file_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
     let requestor_tid =
@@ -27937,7 +27938,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         create_access_state,
         create_parameters,
         canonical_file_id,
-        owner_domain_id,
+        owner_domain,
         fid: file_id,
         requestor_tid,
         major: major as u8,
