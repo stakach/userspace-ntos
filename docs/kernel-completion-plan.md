@@ -12945,3 +12945,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     generation-bearing CM service-plan and PnP topology query APIs, migrate those callers, then
     delete `boot_system_config_manager`, its image-size marker, and every remaining semantic import
     from `BOOT_SYSTEM_HIVE_IMAGE` in one checkpoint.
+
+    CM Win32 service-plan migration (2026-08-26, implementation green): isolated CM now selects
+    ordered auto-start and demand-start Win32 services from the live SYSTEM generation and streams
+    normalized process launches. Each entry carries service and executable identity, normalized NT
+    image path, complete command line, own/shared process kind, interactive flag, account/display
+    metadata, and dependencies. Invalid or unlaunchable image paths do not cross the boundary as
+    executable plans.
+
+    The executive generation-checks one snapshot of each kind and derives its SCM selection proof
+    from them; it no longer rebuilds a local manager for any startup driver or Win32 service
+    selection. The shared client transfer validates length/token continuity for both driver and
+    service plans. Focused validation remains green at ABI `3/3`, server `9/9`, and client `14/14`,
+    with the service round trip covered in the mounted-SYSTEM plan test. The freestanding executive
+    release check remains at 212 warnings.
+
+    Review adjustment: startup semantic selection is closed. The sole caller retaining
+    `boot_system_config_manager` is the runtime PnP syscall surface. Replace its repeated snapshots
+    with generation-bearing CM topology/property/interface queries, preserving executive-owned
+    runtime status and wait/event state. Then delete the decoder and image-size marker before the
+    next desktop acceptance run.

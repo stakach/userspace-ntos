@@ -35,6 +35,9 @@ pub const CM_LAUNCH_PLAN_CHUNK_BYTES: usize = 4096;
 pub const CM_LAUNCH_PLAN_SNAPSHOT_MAGIC: u32 = 0x504C_4D43; // `CMLP`
 pub const CM_LAUNCH_PLAN_SNAPSHOT_VERSION: u16 = 1;
 pub const CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES: usize = 24;
+pub const CM_WIN32_SERVICE_PLAN_SNAPSHOT_MAGIC: u32 = 0x5053_4D43; // `CMSP`
+pub const CM_WIN32_SERVICE_PLAN_SNAPSHOT_VERSION: u16 = 1;
+pub const CM_WIN32_SERVICE_PLAN_SNAPSHOT_HEADER_BYTES: usize = 24;
 pub const CM_OPTIONAL_STRING_ABSENT: u32 = u32::MAX;
 pub const CM_OPTIONAL_BLOB_ABSENT: u32 = u32::MAX;
 pub const CM_OPTIONAL_U32_ABSENT: u32 = u32::MAX;
@@ -65,6 +68,8 @@ pub mod opcode {
     pub const CM_OP_QUERY_HIVE_KEY: u16 = 0x2151;
     /// Return one immutable, generation-bound ordered driver launch plan.
     pub const CM_OP_QUERY_LAUNCH_PLAN: u16 = 0x2152;
+    /// Return one immutable, generation-bound ordered Win32 service launch plan.
+    pub const CM_OP_QUERY_WIN32_SERVICE_PLAN: u16 = 0x2153;
 }
 
 /// Operation carried by [`CmDevicePropertyRequest::operation`]. Property values are immutable for
@@ -108,6 +113,17 @@ pub mod launch_plan_transfer {
 pub mod launch_plan_kind {
     pub const BOOT_SYSTEM_DRIVERS: u16 = 1;
     pub const DEMAND_DRIVERS: u16 = 2;
+}
+
+/// Ordered Win32 service process plan selected from the live SYSTEM generation.
+pub mod win32_service_plan_kind {
+    pub const AUTO_START: u16 = 1;
+    pub const DEMAND_START: u16 = 2;
+}
+
+pub mod win32_service_process_kind {
+    pub const OWN: u16 = 1;
+    pub const SHARED: u16 = 2;
 }
 
 /// Mount identifiers carried by mounted-hive operations.
@@ -381,6 +397,7 @@ mod tests {
         assert_eq!(opcode::CM_OP_IMPORT_HIVE, 0x2150);
         assert_eq!(opcode::CM_OP_QUERY_HIVE_KEY, 0x2151);
         assert_eq!(opcode::CM_OP_QUERY_LAUNCH_PLAN, 0x2152);
+        assert_eq!(opcode::CM_OP_QUERY_WIN32_SERVICE_PLAN, 0x2153);
         assert_eq!(core::mem::size_of::<CmHiveImportRequest>(), 32);
         assert_eq!(core::mem::size_of::<CmHiveKeyRequest>(), 32);
 

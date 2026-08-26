@@ -16,16 +16,18 @@ use alloc::vec::Vec;
 use nt_config_abi::{
     device_property_transfer, driver_service_class, driver_service_transfer, hive_import_transfer,
     hive_key_transfer, hive_mount, launch_plan_kind, launch_plan_transfer, opcode,
-    CmDevicePropertyRequest, CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveImportRequest,
-    CmHiveKeyRequest, CmKeyRequest, CmLaunchPlanRequest, CmRawValueRequest, CmReply,
-    CmValueRequest, CM_ABI_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_DRIVER_SERVICE_CHUNK_BYTES,
+    win32_service_plan_kind, win32_service_process_kind, CmDevicePropertyRequest,
+    CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveImportRequest, CmHiveKeyRequest,
+    CmKeyRequest, CmLaunchPlanRequest, CmRawValueRequest, CmReply, CmValueRequest, CM_ABI_VERSION,
+    CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_DRIVER_SERVICE_CHUNK_BYTES,
     CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_MAGIC,
     CM_DRIVER_SERVICE_SNAPSHOT_VERSION, CM_HIVE_IMPORT_CHUNK_BYTES, CM_HIVE_KEY_CHUNK_BYTES,
     CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES, CM_HIVE_KEY_SNAPSHOT_MAGIC, CM_HIVE_KEY_SNAPSHOT_VERSION,
     CM_LAUNCH_PLAN_CHUNK_BYTES, CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES,
     CM_LAUNCH_PLAN_SNAPSHOT_MAGIC, CM_LAUNCH_PLAN_SNAPSHOT_VERSION, CM_MAX_HIVE_PATH_UNITS,
     CM_MAX_INSTANCE_UNITS, CM_MAX_SERVICE_UNITS, CM_OPTIONAL_BLOB_ABSENT,
-    CM_OPTIONAL_STRING_ABSENT, CM_OPTIONAL_U32_ABSENT,
+    CM_OPTIONAL_STRING_ABSENT, CM_OPTIONAL_U32_ABSENT, CM_WIN32_SERVICE_PLAN_SNAPSHOT_HEADER_BYTES,
+    CM_WIN32_SERVICE_PLAN_SNAPSHOT_MAGIC, CM_WIN32_SERVICE_PLAN_SNAPSHOT_VERSION,
 };
 
 /// A pluggable transport: send `opcode` + `in_buf`, receive a `CmReply` (+ optional
@@ -79,6 +81,32 @@ pub struct DriverLaunchPlanSnapshot {
     pub mount_generation: u64,
     pub plan_kind: u16,
     pub bindings: Vec<DriverServiceBinding>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Win32ServiceProcessKind {
+    Own,
+    Shared,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Win32ServiceProcessLaunch {
+    pub service_name: String,
+    pub executable_path: String,
+    pub nt_image_path: String,
+    pub command_line: String,
+    pub process_kind: Win32ServiceProcessKind,
+    pub interactive: bool,
+    pub account_name: Option<String>,
+    pub display_name: Option<String>,
+    pub dependencies: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Win32ServiceLaunchPlanSnapshot {
+    pub mount_generation: u64,
+    pub plan_kind: u16,
+    pub launches: Vec<Win32ServiceProcessLaunch>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -325,6 +353,75 @@ fn decode_driver_launch_plan(bytes: &[u8]) -> Option<DriverLaunchPlanSnapshot> {
         mount_generation,
         plan_kind,
         bindings,
+    })
+}
+
+fn decode_win32_service_launch_plan(bytes: &[u8]) -> Option<Win32ServiceLaunchPlanSnapshot> {
+    if bytes.len() < CM_WIN32_SERVICE_PLAN_SNAPSHOT_HEADER_BYTES {
+        return None;
+    }
+    let mut reader = SnapshotReader::new(bytes);
+    if reader.u32()? != CM_WIN32_SERVICE_PLAN_SNAPSHOT_MAGIC
+        || reader.u16()? != CM_WIN32_SERVICE_PLAN_SNAPSHOT_VERSION
+    {
+        return None;
+    }
+    let plan_kind = reader.u16()?;
+    if !matches!(
+        plan_kind,
+        win32_service_plan_kind::AUTO_START | win32_service_plan_kind::DEMAND_START
+    ) {
+        return None;
+    }
+    let mount_generation = reader.u64()?;
+    if mount_generation == 0 {
+        return None;
+    }
+    let launch_count = usize::try_from(reader.u32()?).ok()?;
+    if reader.u32()? != 0 {
+        return None;
+    }
+    let mut launches = Vec::new();
+    launches.try_reserve_exact(launch_count).ok()?;
+    for _ in 0..launch_count {
+        let service_name = reader.string()?;
+        let executable_path = reader.string()?;
+        let nt_image_path = reader.string()?;
+        let command_line = reader.string()?;
+        let process_kind = match reader.u16()? {
+            win32_service_process_kind::OWN => Win32ServiceProcessKind::Own,
+            win32_service_process_kind::SHARED => Win32ServiceProcessKind::Shared,
+            _ => return None,
+        };
+        let interactive = match reader.u16()? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        let account_name = reader.optional_string()?;
+        let display_name = reader.optional_string()?;
+        let dependency_count = usize::try_from(reader.u32()?).ok()?;
+        let mut dependencies = Vec::new();
+        dependencies.try_reserve_exact(dependency_count).ok()?;
+        for _ in 0..dependency_count {
+            dependencies.push(reader.string()?);
+        }
+        launches.push(Win32ServiceProcessLaunch {
+            service_name,
+            executable_path,
+            nt_image_path,
+            command_line,
+            process_kind,
+            interactive,
+            account_name,
+            display_name,
+            dependencies,
+        });
+    }
+    reader.finished().then_some(Win32ServiceLaunchPlanSnapshot {
+        mount_generation,
+        plan_kind,
+        launches,
     })
 }
 
@@ -799,6 +896,38 @@ impl<B: Backend> ConfigClient<B> {
         ) {
             return Err(STATUS_INVALID_PARAMETER);
         }
+        let value = self.query_launch_plan_bytes(
+            opcode::CM_OP_QUERY_LAUNCH_PLAN,
+            plan_kind,
+            CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES,
+        )?;
+        decode_driver_launch_plan(&value).ok_or(STATUS_INVALID_PARAMETER)
+    }
+
+    pub fn query_win32_service_launch_plan(
+        &mut self,
+        plan_kind: u16,
+    ) -> Result<Win32ServiceLaunchPlanSnapshot, i32> {
+        if !matches!(
+            plan_kind,
+            win32_service_plan_kind::AUTO_START | win32_service_plan_kind::DEMAND_START
+        ) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let value = self.query_launch_plan_bytes(
+            opcode::CM_OP_QUERY_WIN32_SERVICE_PLAN,
+            plan_kind,
+            CM_WIN32_SERVICE_PLAN_SNAPSHOT_HEADER_BYTES,
+        )?;
+        decode_win32_service_launch_plan(&value).ok_or(STATUS_INVALID_PARAMETER)
+    }
+
+    fn query_launch_plan_bytes(
+        &mut self,
+        query_opcode: u16,
+        plan_kind: u16,
+        minimum_bytes: usize,
+    ) -> Result<Vec<u8>, i32> {
         let mut value = Vec::new();
         let mut expected_total = None;
         let mut token = 0u64;
@@ -811,6 +940,7 @@ impl<B: Backend> ConfigClient<B> {
             };
             let offset = value.len();
             let response = match self.launch_plan_call(
+                query_opcode,
                 plan_kind,
                 operation,
                 token,
@@ -820,12 +950,12 @@ impl<B: Backend> ConfigClient<B> {
             ) {
                 Ok(response) => response,
                 Err(status) => {
-                    self.abort_launch_plan(plan_kind, token);
+                    self.abort_launch_plan(query_opcode, plan_kind, token);
                     return Err(status);
                 }
             };
             if response.status != STATUS_SUCCESS {
-                self.abort_launch_plan(plan_kind, token);
+                self.abort_launch_plan(query_opcode, plan_kind, token);
                 return Err(response.status);
             }
             let total = usize::try_from(response.detail0).map_err(|_| STATUS_INVALID_PARAMETER)?;
@@ -836,7 +966,7 @@ impl<B: Backend> ConfigClient<B> {
             } else {
                 response.detail1 == token
             };
-            if total < CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES
+            if total < minimum_bytes
                 || expected_total.is_some_and(|expected| expected != total)
                 || !reply_token_valid
                 || written > reply_bytes.len()
@@ -844,6 +974,7 @@ impl<B: Backend> ConfigClient<B> {
                 || (offset < total && written == 0)
             {
                 self.abort_launch_plan(
+                    query_opcode,
                     plan_kind,
                     if token == 0 { response.detail1 } else { token },
                 );
@@ -851,14 +982,14 @@ impl<B: Backend> ConfigClient<B> {
             }
             if expected_total.is_none() {
                 if value.try_reserve_exact(total).is_err() {
-                    self.abort_launch_plan(plan_kind, response.detail1);
+                    self.abort_launch_plan(query_opcode, plan_kind, response.detail1);
                     return Err(STATUS_INSUFFICIENT_RESOURCES);
                 }
                 expected_total = Some(total);
             }
             value.extend_from_slice(&reply_bytes[..written]);
             if value.len() == total {
-                return decode_driver_launch_plan(&value).ok_or(STATUS_INVALID_PARAMETER);
+                return Ok(value);
             }
             if token == 0 {
                 token = response.detail1;
@@ -1014,6 +1145,7 @@ impl<B: Backend> ConfigClient<B> {
 
     fn launch_plan_call(
         &mut self,
+        query_opcode: u16,
         plan_kind: u16,
         operation: u16,
         transfer_token: u64,
@@ -1031,18 +1163,17 @@ impl<B: Backend> ConfigClient<B> {
             chunk_capacity,
             transfer_token,
         };
-        Ok(self.backend.call(
-            opcode::CM_OP_QUERY_LAUNCH_PLAN,
-            request.as_bytes(),
-            reply_bytes,
-        ))
+        Ok(self
+            .backend
+            .call(query_opcode, request.as_bytes(), reply_bytes))
     }
 
-    fn abort_launch_plan(&mut self, plan_kind: u16, transfer_token: u64) {
+    fn abort_launch_plan(&mut self, query_opcode: u16, plan_kind: u16, transfer_token: u64) {
         if transfer_token == 0 {
             return;
         }
         let _ = self.launch_plan_call(
+            query_opcode,
             plan_kind,
             launch_plan_transfer::ABORT,
             transfer_token,
@@ -1205,7 +1336,8 @@ mod tests {
     use nt_config_manager::{
         device_property, encode_sz, ConfigManager, RegistryValueType, ENUM_PATH,
         SERVICE_AUTO_START, SERVICE_BOOT_START, SERVICE_DEMAND_START, SERVICE_FILE_SYSTEM_DRIVER,
-        SERVICE_KERNEL_DRIVER, SERVICE_SYSTEM_START, SERVICE_WIN32_SHARE_PROCESS,
+        SERVICE_INTERACTIVE_PROCESS, SERVICE_KERNEL_DRIVER, SERVICE_SYSTEM_START,
+        SERVICE_WIN32_OWN_PROCESS, SERVICE_WIN32_SHARE_PROCESS,
     };
     use nt_config_server::CmServer;
     use nt_hive_core::{encode_image, Hive, HiveKind};
@@ -1365,6 +1497,30 @@ mod tests {
                 encode_sz(service),
             ));
         }
+        for (name, image, service_type, start) in [
+            (
+                "AutoShared",
+                r"%SystemRoot%\system32\svchost.exe -k netsvcs",
+                SERVICE_WIN32_SHARE_PROCESS,
+                SERVICE_AUTO_START,
+            ),
+            (
+                "DemandOwn",
+                r"system32\demand.exe /service",
+                SERVICE_WIN32_OWN_PROCESS | SERVICE_INTERACTIVE_PROCESS,
+                SERVICE_DEMAND_START,
+            ),
+        ] {
+            let service = hive.create_key(&format!(r"ControlSet001\Services\{name}"));
+            hive.set_dword(service, "Type", service_type);
+            hive.set_dword(service, "Start", start);
+            assert!(hive.set_value(
+                service,
+                "ImagePath",
+                nt_hive_core::RegistryValueType::ExpandSz,
+                encode_sz(image),
+            ));
+        }
         hive.finish_clean_import();
 
         let mut client = ConfigClient::new(Framed {
@@ -1396,6 +1552,29 @@ mod tests {
         assert_eq!(demand.bindings.len(), 1);
         assert_eq!(demand.bindings[0].service_name, "DemandDevice");
         assert_eq!(demand.bindings[0].devnodes.len(), 1);
+
+        let auto_services = client
+            .query_win32_service_launch_plan(win32_service_plan_kind::AUTO_START)
+            .expect("auto-start service plan");
+        assert_eq!(auto_services.mount_generation, 1);
+        assert_eq!(auto_services.launches.len(), 1);
+        assert_eq!(auto_services.launches[0].service_name, "AutoShared");
+        assert_eq!(
+            auto_services.launches[0].nt_image_path,
+            r"\SystemRoot\system32\svchost.exe"
+        );
+        assert_eq!(
+            auto_services.launches[0].process_kind,
+            Win32ServiceProcessKind::Shared
+        );
+
+        let demand_services = client
+            .query_win32_service_launch_plan(win32_service_plan_kind::DEMAND_START)
+            .expect("demand-start service plan");
+        assert_eq!(demand_services.mount_generation, 1);
+        assert_eq!(demand_services.launches.len(), 1);
+        assert_eq!(demand_services.launches[0].service_name, "DemandOwn");
+        assert!(demand_services.launches[0].interactive);
     }
 
     #[test]

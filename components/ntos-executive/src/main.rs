@@ -15051,6 +15051,23 @@ pub(crate) unsafe fn config_manager_query_driver_launch_plan(
     Ok(snapshot)
 }
 
+unsafe fn config_manager_query_win32_service_launch_plan(
+    plan_kind: u16,
+) -> Result<nt_config_client::Win32ServiceLaunchPlanSnapshot, i32> {
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if expected_generation == 0 {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    let snapshot = client.query_win32_service_launch_plan(plan_kind)?;
+    if snapshot.mount_generation != expected_generation {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    Ok(snapshot)
+}
+
 pub(crate) unsafe fn config_manager_query_system_hive_key(
     path: &str,
 ) -> Result<nt_config_client::HiveKeySnapshot, i32> {
@@ -19928,10 +19945,10 @@ fn config_hive_demand_pnp_driver_launch_plan(
     )
 }
 
-fn win32_service_process_kind_code(kind: nt_config_manager::Win32ServiceProcessKind) -> u8 {
+fn win32_service_process_kind_code(kind: nt_config_client::Win32ServiceProcessKind) -> u8 {
     match kind {
-        nt_config_manager::Win32ServiceProcessKind::Own => WIN32_SERVICE_PROCESS_KIND_OWN,
-        nt_config_manager::Win32ServiceProcessKind::Shared => WIN32_SERVICE_PROCESS_KIND_SHARED,
+        nt_config_client::Win32ServiceProcessKind::Own => WIN32_SERVICE_PROCESS_KIND_OWN,
+        nt_config_client::Win32ServiceProcessKind::Shared => WIN32_SERVICE_PROCESS_KIND_SHARED,
     }
 }
 
@@ -19944,7 +19961,7 @@ fn win32_service_process_kind_label(kind: u8) -> &'static [u8] {
 }
 
 fn copy_win32_service_launch_selection(
-    spec: &nt_config_manager::Win32ServiceLaunchSpec,
+    spec: &nt_config_client::Win32ServiceProcessLaunch,
     name: &mut InlineAscii<BOOT_DRIVER_SERVICE_NAME_MAX>,
     image_path: &mut InlineAscii<BOOT_DRIVER_IMAGE_PATH_MAX>,
     nt_image_path: &mut InlineAscii<BOOT_DRIVER_IMAGE_PATH_MAX>,
@@ -19952,13 +19969,10 @@ fn copy_win32_service_launch_selection(
     process_kind: &mut u8,
     interactive: &mut bool,
 ) -> bool {
-    let Ok(process_launch) = spec.process_launch() else {
-        return false;
-    };
     if !name.set_str(&spec.service_name)
-        || !image_path.set_str(&spec.image_path)
-        || !nt_image_path.set_str(&process_launch.nt_image_path)
-        || !command_line.set_str(&process_launch.command_line)
+        || !image_path.set_str(&spec.executable_path)
+        || !nt_image_path.set_str(&spec.nt_image_path)
+        || !command_line.set_str(&spec.command_line)
     {
         return false;
     }
@@ -19976,38 +19990,34 @@ fn copy_driver_service_selection(
 }
 
 fn system_hive_service_selection_report(
+    auto_win32: &nt_config_client::Win32ServiceLaunchPlanSnapshot,
+    demand_win32: &nt_config_client::Win32ServiceLaunchPlanSnapshot,
     demand_drivers: &nt_config_client::DriverLaunchPlanSnapshot,
 ) -> InlineServiceSelectionReport {
-    let heap_mark = allocator::mark();
     let mut report = InlineServiceSelectionReport::empty();
-    if let Some(cm) = boot_system_config_manager() {
-        let auto_win32 = cm.auto_start_win32_service_launch_specs();
-        report.auto_win32_count = auto_win32.len() as u64;
-        if let Some(spec) = auto_win32.first() {
-            let _ = copy_win32_service_launch_selection(
-                spec,
-                &mut report.auto_win32_name,
-                &mut report.auto_win32_image_path,
-                &mut report.auto_win32_nt_image_path,
-                &mut report.auto_win32_command_line,
-                &mut report.auto_win32_process_kind,
-                &mut report.auto_win32_interactive,
-            );
-        }
-
-        let demand_win32 = cm.demand_start_win32_service_launch_specs();
-        report.demand_win32_count = demand_win32.len() as u64;
-        if let Some(spec) = demand_win32.first() {
-            let _ = copy_win32_service_launch_selection(
-                spec,
-                &mut report.demand_win32_name,
-                &mut report.demand_win32_image_path,
-                &mut report.demand_win32_nt_image_path,
-                &mut report.demand_win32_command_line,
-                &mut report.demand_win32_process_kind,
-                &mut report.demand_win32_interactive,
-            );
-        }
+    report.auto_win32_count = auto_win32.launches.len() as u64;
+    if let Some(spec) = auto_win32.launches.first() {
+        let _ = copy_win32_service_launch_selection(
+            spec,
+            &mut report.auto_win32_name,
+            &mut report.auto_win32_image_path,
+            &mut report.auto_win32_nt_image_path,
+            &mut report.auto_win32_command_line,
+            &mut report.auto_win32_process_kind,
+            &mut report.auto_win32_interactive,
+        );
+    }
+    report.demand_win32_count = demand_win32.launches.len() as u64;
+    if let Some(spec) = demand_win32.launches.first() {
+        let _ = copy_win32_service_launch_selection(
+            spec,
+            &mut report.demand_win32_name,
+            &mut report.demand_win32_image_path,
+            &mut report.demand_win32_nt_image_path,
+            &mut report.demand_win32_command_line,
+            &mut report.demand_win32_process_kind,
+            &mut report.demand_win32_interactive,
+        );
     }
     report.demand_driver_count = demand_drivers.bindings.len() as u64;
     if let Some(service) = demand_drivers.bindings.first() {
@@ -20020,7 +20030,6 @@ fn system_hive_service_selection_report(
             .demand_driver_object_path
             .set_str(&service.driver_object_path);
     }
-    unsafe { allocator::reset_to(heap_mark) };
     report
 }
 
@@ -28549,6 +28558,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let demand_driver_snapshot =
         config_manager_query_driver_launch_plan(nt_config_abi::launch_plan_kind::DEMAND_DRIVERS)
             .expect("query live demand driver launch plan");
+    let auto_win32_service_snapshot = config_manager_query_win32_service_launch_plan(
+        nt_config_abi::win32_service_plan_kind::AUTO_START,
+    )
+    .expect("query live auto-start Win32 service launch plan");
+    let demand_win32_service_snapshot = config_manager_query_win32_service_launch_plan(
+        nt_config_abi::win32_service_plan_kind::DEMAND_START,
+    )
+    .expect("query live demand-start Win32 service launch plan");
     let proof_driver_spec = config_hive_boot_system_driver_launch_spec(&boot_driver_snapshot);
     let system_boot_driver_plan = system_hive_boot_driver_launch_plan(&boot_driver_snapshot);
     let config_pnp_plan = config_hive_boot_system_pnp_driver_launch_plan(&boot_driver_snapshot);
@@ -28563,7 +28580,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut driver_start_bootstrap = DriverStartBootstrap::with_capacity(
         PENDING_DRIVER_LOAD_INITIAL_CAPACITY.saturating_add(replyless_device_service_count),
     );
-    let scm_service_selection = system_hive_service_selection_report(&demand_driver_snapshot);
+    let scm_service_selection = system_hive_service_selection_report(
+        &auto_win32_service_snapshot,
+        &demand_win32_service_snapshot,
+        &demand_driver_snapshot,
+    );
     print_str(b"[scm-select] auto-win32 count=");
     print_u64(scm_service_selection.auto_win32_count);
     print_str(b" first=");
