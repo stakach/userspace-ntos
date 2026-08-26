@@ -74,11 +74,13 @@ use nt_io_manager::{
     write_wdm_driver_object, write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
     BankedTransferCursor, CreateOptions, DeviceCharacteristics, DeviceControlParameters,
     DeviceFlags, DeviceType, DispatchContext, DispatchOutcome, DispatchTarget,
-    DriverDispatchBackend, DriverId, DriverPeerId, ExternalDispatchResult, FileId,
+    DriverDispatchBackend, DriverId, DriverPeerId, ExternalDispatchResult,
+    ExternalPnpDispatchResult, FileId,
     HostedDevicePropertyOwner, HostedDevicePropertyTransferError,
     HostedDevicePropertyTransferTable, HostedDomainIdentity, InformationParameters, IoManager,
-    IoParameters, IrpId, IrpProjection, MajorFunctionTable, ObjectManagerPort, PnpBackendDispatch,
-    ReadWriteParameters, ShareAccess, WdmDriverObjectInit, WdmFileObjectInit, WdmIoStackLocationInit,
+    IoParameters, IrpCompletionOrigin, IrpId, IrpProjection, MajorFunctionTable,
+    ObjectManagerPort, PnpBackendDispatch, PnpParameters, ReadWriteParameters, ShareAccess,
+    WdmDriverObjectInit, WdmFileObjectInit, WdmIoStackLocationInit,
     WdmIoStackParameters, WdmIrpInit, WDM_X64_DRIVER_EXTENSION_OFFSET,
     WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET,
     WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET, WDM_X64_FILE_OBJECT_SIZE,
@@ -34106,7 +34108,106 @@ pub(crate) fn file_thread_io_drain_state(
 }
 
 pub(crate) fn pump_hosted_io_completions() -> usize {
-    io_manager_mut().pump()
+    let pumped = io_manager_mut().pump();
+    pumped.saturating_add(unsafe { drain_hosted_pnp_completions() })
+}
+
+unsafe fn drain_hosted_pnp_completions() -> usize {
+    let mut progress = 0usize;
+    let mut index = 0usize;
+    while index < hosted_pnp_transactions_mut().len() {
+        let (irp_id, phase, minor, binding, origin_driver_id, completion_driver_id, completion_device_id) = {
+            let transaction = &hosted_pnp_transactions_mut()[index];
+            (
+                transaction.irp_id,
+                transaction.phase,
+                transaction.minor,
+                transaction.binding,
+                transaction.origin_driver_id,
+                transaction.completion_driver_id,
+                transaction.completion_device_id,
+            )
+        };
+        match phase {
+            HostedPnpTransactionPhase::Dispatching
+            | HostedPnpTransactionPhase::AwaitingCompletion => {
+                let Some(completion) = io_manager_mut().completed_irp(irp_id) else {
+                    index += 1;
+                    continue;
+                };
+                let identity_valid = completion.id == irp_id
+                    && completion.client_id == ClientId(IO_MANAGER_COMPONENT_ID)
+                    && completion.file_id.is_none()
+                    && completion.driver_id == origin_driver_id
+                    && completion.device_id
+                        == nt_io_manager::DeviceId(binding.pdo_device_id)
+                    && completion.major == major::IRP_MJ_PNP
+                    && completion.minor == minor.raw()
+                    && completion.completion_driver_id == completion_driver_id
+                    && completion.completion_device_id == completion_device_id
+                    && completion.user_data == 0
+                    && completion.requestor_tid == 0;
+                if !identity_valid || completion.completion_origin != IrpCompletionOrigin::Driver {
+                    let _ = set_hosted_pnp_transaction_phase(
+                        irp_id,
+                        HostedPnpTransactionPhase::Indeterminate,
+                        completion.status,
+                    );
+                    progress = progress.saturating_add(1);
+                    index += 1;
+                    continue;
+                }
+                if complete_hosted_pnp_lifecycle(irp_id, completion.status).is_err() {
+                    let _ = set_hosted_pnp_transaction_phase(
+                        irp_id,
+                        HostedPnpTransactionPhase::Indeterminate,
+                        completion.status,
+                    );
+                    progress = progress.saturating_add(1);
+                    index += 1;
+                    continue;
+                }
+                let _ = set_hosted_pnp_transaction_phase(
+                    irp_id,
+                    HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck,
+                    completion.status,
+                );
+                progress = progress.saturating_add(1);
+                continue;
+            }
+            HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck => {
+                if io_manager_mut().acknowledge_completed_irp(irp_id).is_err() {
+                    index += 1;
+                    continue;
+                }
+                if minor == nt_pnp_manager::PnpMinor::StartDevice {
+                    if finish_hosted_start_publication(irp_id).is_err() {
+                        let _ = set_hosted_pnp_transaction_phase_only(
+                            irp_id,
+                            HostedPnpTransactionPhase::PostStartRepair,
+                        );
+                        progress = progress.saturating_add(1);
+                        index += 1;
+                        continue;
+                    }
+                }
+                remove_hosted_pnp_transaction(irp_id);
+                progress = progress.saturating_add(1);
+            }
+            HostedPnpTransactionPhase::PostStartRepair => {
+                if finish_hosted_start_publication(irp_id).is_ok() {
+                    remove_hosted_pnp_transaction(irp_id);
+                    progress = progress.saturating_add(1);
+                } else {
+                    index += 1;
+                }
+            }
+            HostedPnpTransactionPhase::Prepared | HostedPnpTransactionPhase::Indeterminate => {
+                index += 1;
+            }
+        }
+    }
+    progress
 }
 
 pub(crate) unsafe fn abandon_pending_irp(irp_id: u64) -> Result<(), u32> {
@@ -35073,6 +35174,7 @@ struct HostedDeviceResourceState {
     video_memory_len: u64,
     video_memory_caller_va: u64,
     post_bind_rx_pending: bool,
+    pci_interrupt_line: Option<crate::pnp::PciInterruptLineProgramming>,
     pnp_context_lease: Option<nt_pnp_context::ContextLeaseIdentity>,
     evidence: HostedHardwareEvidence,
 }
@@ -35092,7 +35194,52 @@ static mut HOSTED_DMA_MANAGER: Option<HostedDmaManager> = None;
 static mut HOSTED_MDL_REGISTRY: Option<MdlRegistry> = None;
 static mut HOSTED_DEVICE_RESOURCE_STATES: Option<Vec<HostedDeviceResourceState>> = None;
 static mut HOSTED_DEVICE_PROPERTY_TRANSFERS: Option<HostedDevicePropertyTransferTable> = None;
+static mut HOSTED_PNP_TRANSACTIONS: Option<Vec<HostedPnpTransaction>> = None;
 static mut HOSTED_DRIVER_DEVICE_POWER_STATE: u32 = 1; // PowerDeviceD0
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum HostedPnpTransactionPhase {
+    Prepared,
+    Dispatching,
+    AwaitingCompletion,
+    LifecycleCommittedAwaitingAck,
+    PostStartRepair,
+    Indeterminate,
+}
+
+struct HostedPnpTransaction {
+    binding: HostedDeviceBinding,
+    irp_id: IrpId,
+    minor: nt_pnp_manager::PnpMinor,
+    origin_driver_id: DriverId,
+    completion_driver_id: DriverId,
+    completion_device_id: nt_io_manager::DeviceId,
+    token: Option<nt_pnp_manager::PnpDispatchToken>,
+    phase: HostedPnpTransactionPhase,
+    terminal_status: nt_status::NtStatus,
+    pci_interrupt_line: Option<crate::pnp::PciInterruptLineProgramming>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HostedPnpStartOutcome {
+    Started,
+    Failed(nt_status::NtStatus),
+    Pending { irp_id: u64 },
+    Indeterminate {
+        irp_id: u64,
+        transport_status: nt_status::NtStatus,
+    },
+    RepairRequired {
+        driver_status: nt_status::NtStatus,
+        repair_status: nt_status::NtStatus,
+    },
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostedPnpStartFailure {
+    pub status: nt_status::NtStatus,
+    pub rollback_safe: bool,
+}
 
 const HOSTED_MMIO_RESOURCE_KIND_BASE: u64 = 0x10;
 const HOSTED_IO_PORT_RESOURCE_KIND_BASE: u64 = 0x20;
@@ -35362,6 +35509,145 @@ unsafe fn hosted_pnp_manager_mut() -> &'static mut nt_pnp_manager::PnpManager {
         *slot = Some(nt_pnp_manager::PnpManager::new());
     }
     slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_pnp_transactions_mut() -> &'static mut Vec<HostedPnpTransaction> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_PNP_TRANSACTIONS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn reserve_hosted_pnp_transaction(
+    transaction: HostedPnpTransaction,
+) -> Result<(), nt_status::NtStatus> {
+    let transactions = hosted_pnp_transactions_mut();
+    if transaction.irp_id.raw() == 0
+        || transactions.iter().any(|current| {
+            current.irp_id == transaction.irp_id
+                || current.binding.device_id == transaction.binding.device_id
+        })
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    transactions
+        .try_reserve(1)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    transactions.push(transaction);
+    Ok(())
+}
+
+unsafe fn remove_hosted_pnp_transaction(irp_id: IrpId) -> bool {
+    let transactions = hosted_pnp_transactions_mut();
+    let Some(index) = transactions
+        .iter()
+        .position(|transaction| transaction.irp_id == irp_id)
+    else {
+        return false;
+    };
+    transactions.remove(index);
+    true
+}
+
+unsafe fn set_hosted_pnp_transaction_token(
+    irp_id: IrpId,
+    token: nt_pnp_manager::PnpDispatchToken,
+) -> Result<(), nt_status::NtStatus> {
+    let transaction = hosted_pnp_transactions_mut()
+        .iter_mut()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if transaction.phase != HostedPnpTransactionPhase::Prepared || transaction.token.is_some() {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    transaction.token = Some(token);
+    transaction.phase = HostedPnpTransactionPhase::Dispatching;
+    Ok(())
+}
+
+unsafe fn set_hosted_pnp_transaction_phase(
+    irp_id: IrpId,
+    phase: HostedPnpTransactionPhase,
+    terminal_status: nt_status::NtStatus,
+) -> Result<(), nt_status::NtStatus> {
+    let transaction = hosted_pnp_transactions_mut()
+        .iter_mut()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    transaction.phase = phase;
+    transaction.terminal_status = terminal_status;
+    Ok(())
+}
+
+unsafe fn set_hosted_pnp_transaction_phase_only(
+    irp_id: IrpId,
+    phase: HostedPnpTransactionPhase,
+) -> Result<(), nt_status::NtStatus> {
+    let transaction = hosted_pnp_transactions_mut()
+        .iter_mut()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    transaction.phase = phase;
+    Ok(())
+}
+
+unsafe fn complete_hosted_pnp_lifecycle(
+    irp_id: IrpId,
+    status: nt_status::NtStatus,
+) -> Result<(), nt_status::NtStatus> {
+    let transactions = hosted_pnp_transactions_mut();
+    let transaction = transactions
+        .iter()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let token = transaction
+        .token
+        .as_ref()
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    hosted_pnp_manager_mut()
+        .complete_pnp_dispatch(token, irp_id.raw(), status.is_success())
+        .map(|_| ())
+        .map_err(hosted_pnp_status)
+}
+
+unsafe fn finish_hosted_start_publication(
+    irp_id: IrpId,
+) -> Result<(), nt_status::NtStatus> {
+    let transactions = hosted_pnp_transactions_mut();
+    let transaction = transactions
+        .iter()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let binding = transaction.binding;
+    let terminal_status = transaction.terminal_status;
+    let pci_interrupt_line = transaction.pci_interrupt_line;
+    let sh = instance_by_driver_id(binding.driver_id)
+        .map(|(_, instance)| instance.exec_shared_va)
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+
+    let mut first_error = None;
+    if let Some(state) = hosted_device_resource_states_mut()
+        .iter_mut()
+        .find(|state| {
+            state.device_id == binding.device_id
+                && state.projection_domain == binding.projection_domain
+        })
+    {
+        state.pci_interrupt_line = pci_interrupt_line;
+    } else {
+        first_error = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    if let Err(status) = record_hosted_resource_usage(binding, sh) {
+        first_error.get_or_insert(status);
+    }
+    if terminal_status.is_success() {
+        if let Err(status) = apply_hosted_device_interface_state(sh) {
+            first_error.get_or_insert(status);
+        }
+    }
+    refresh_hosted_device_resource_state(binding, sh);
+    first_error.map_or(Ok(()), Err)
 }
 
 unsafe fn hosted_resource_manager_mut() -> &'static mut ResourceManager {
@@ -36290,6 +36576,7 @@ unsafe fn read_hosted_device_resource_state_from_shared(
         post_bind_rx_pending: previous_state
             .map(|state| state.post_bind_rx_pending)
             .unwrap_or(false),
+        pci_interrupt_line: previous_state.and_then(|state| state.pci_interrupt_line),
         pnp_context_lease: previous_state.and_then(|state| state.pnp_context_lease),
         evidence,
     }
@@ -38652,6 +38939,21 @@ struct ActiveHostedIrpTransfer {
 }
 
 static mut ACTIVE_HOSTED_IRP_TRANSFERS: Option<Vec<ActiveHostedIrpTransfer>> = None;
+
+unsafe fn reserve_active_hosted_irp_transfer_slot() -> Result<(), nt_status::NtStatus> {
+    let slot = &mut *core::ptr::addr_of_mut!(ACTIVE_HOSTED_IRP_TRANSFERS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    let transfers = slot.as_mut().unwrap();
+    if transfers.len() == transfers.capacity() {
+        transfers
+            .try_reserve(1)
+            .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+        crate::mark_durable_table_growth_dirty();
+    }
+    Ok(())
+}
 
 struct ActiveHostedIrpTransferGuard {
     depth: usize,
@@ -43008,28 +43310,26 @@ pub(crate) unsafe fn commit_hosted_filtered_resource_requirements(
         .map_err(hosted_pnp_status)
 }
 
-pub(crate) unsafe fn rollback_hosted_device_start(device_id: u64) {
-    let Some(binding) = hosted_device_binding_by_device_id(device_id) else {
-        return;
-    };
-    let _ = hosted_pnp_manager_mut().clear_resource_assignment(binding.pdo_device_id);
+pub(crate) unsafe fn rollback_hosted_device_start(
+    device_id: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let binding = hosted_device_binding_by_device_id(device_id)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    hosted_pnp_manager_mut()
+        .clear_resource_assignment(binding.pdo_device_id)
+        .map_err(hosted_pnp_status)?;
     if let Some((_, inst)) = instance_by_driver_id(binding.driver_id) {
-        if let Err(status) = clear_hosted_resource_projection(binding, inst.exec_shared_va) {
-            print_str(b"[driver-launch] resource rollback failed status=0x");
-            print_hex(status.raw() as u32);
-            print_str(b" device_id=");
-            print_u64(device_id);
-            print_str(b"\n");
-        }
+        clear_hosted_resource_projection(binding, inst.exec_shared_va)?;
     }
+    Ok(())
 }
 
-/// Send `IRP_MN_START_DEVICE` to a hosted FDO. The raw and translated slices are distinct native
-/// `CM_RESOURCE_LIST` byte images; two empty slices represent a no-resource devnode.
-pub(crate) unsafe fn start_hosted_device(
+/// Preserve the existing explicit videoprt startup until videoprt has a canonical PnP backend.
+pub(crate) unsafe fn start_hosted_video_device(
     device_id: u64,
     raw_resource_list: &[u8],
     translated_resource_list: &[u8],
+    pci_interrupt_line: Option<crate::pnp::PciInterruptLineProgramming>,
 ) -> Result<(), nt_status::NtStatus> {
     if raw_resource_list.is_empty() != translated_resource_list.is_empty() {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
@@ -43063,91 +43363,202 @@ pub(crate) unsafe fn start_hosted_device(
         print_hex64(video_start_io);
         print_str(b"\n");
     }
-    if video_initialized {
-        let root_status = hosted_root_bus_mut().dispatch_pnp(
-            nt_io_manager::DeviceId(binding.pdo_device_id),
-            IRP_MN_START_DEVICE as u8,
-        );
-        nt_status::NtStatus(root_status).to_result()?;
-        let video_status = dispatch_video_find_adapter_for_instance(binding.instance, inst)?;
-        let again = read_volatile((sh + SH_VIDEO_FIND_ADAPTER_AGAIN) as *const u8);
-        if video_status != VP_NO_ERROR || again != 0 {
-            print_str(b"[driver-launch] hosted video FindAdapter returned device_id=");
-            print_u64(device_id);
-            print_str(b" status=0x");
-            print_hex(video_status);
-            print_str(b" calls=");
-            print_u64(read_volatile(
-                (sh + SH_VIDEO_FIND_ADAPTER_CALLS) as *const u64,
-            ));
-            print_str(b" again=");
-            print_u64(again as u64);
-            print_str(b"\n");
-        }
-        record_hosted_resource_usage(binding, sh)?;
-        video_port_status(video_status)?;
-        apply_hosted_device_interface_state(sh)?;
-        refresh_hosted_device_resource_state(binding, sh);
-        return Ok(());
+    if !video_initialized {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
-    let mut out = [];
-    let target = instance(binding.instance).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-    let stack_count = io_manager_mut()
-        .device(nt_io_manager::DeviceId(binding.device_id))
-        .map(|device| device.stack_size as u32)
-        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let root_status = hosted_root_bus_mut().dispatch_pnp(
+        nt_io_manager::DeviceId(binding.pdo_device_id),
+        IRP_MN_START_DEVICE as u8,
+    );
+    nt_status::NtStatus(root_status).to_result()?;
+    let video_status = dispatch_video_find_adapter_for_instance(binding.instance, inst)?;
+    let again = read_volatile((sh + SH_VIDEO_FIND_ADAPTER_AGAIN) as *const u8);
+    if video_status != VP_NO_ERROR || again != 0 {
+        print_str(b"[driver-launch] hosted video FindAdapter returned device_id=");
+        print_u64(device_id);
+        print_str(b" status=0x");
+        print_hex(video_status);
+        print_str(b" calls=");
+        print_u64(read_volatile(
+            (sh + SH_VIDEO_FIND_ADAPTER_CALLS) as *const u64,
+        ));
+        print_str(b" again=");
+        print_u64(again as u64);
+        print_str(b"\n");
+    }
+    record_hosted_resource_usage(binding, sh)?;
+    video_port_status(video_status)?;
+    apply_hosted_device_interface_state(sh)?;
+    if let Some(state) = hosted_device_resource_states_mut()
+        .iter_mut()
+        .find(|state| state.device_id == binding.device_id)
+    {
+        state.pci_interrupt_line = pci_interrupt_line;
+    }
+    refresh_hosted_device_resource_state(binding, sh);
+    Ok(())
+}
+
+/// Send a canonical `IRP_MN_START_DEVICE` through the complete non-video FDO stack.
+pub(crate) unsafe fn start_hosted_device_canonical(
+    device_id: u64,
+    raw_resource_list: &[u8],
+    translated_resource_list: &[u8],
+    pci_interrupt_line: Option<crate::pnp::PciInterruptLineProgramming>,
+) -> Result<HostedPnpStartOutcome, HostedPnpStartFailure> {
+    let local_failure = |status| HostedPnpStartFailure {
+        status,
+        rollback_safe: true,
+    };
+    if raw_resource_list.is_empty() != translated_resource_list.is_empty() {
+        return Err(local_failure(nt_status::NtStatus::INVALID_PARAMETER));
+    }
+    let binding = hosted_device_binding_by_device_id(device_id)
+        .ok_or_else(|| local_failure(nt_status::NtStatus::INVALID_PARAMETER))?;
+    let (_, inst) = instance_by_driver_id(binding.driver_id)
+        .ok_or_else(|| local_failure(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND))?;
+    if !inst.ready {
+        return Err(local_failure(nt_status::NtStatus(0xC000_00A3u32 as i32)));
+    }
+    if hosted_instance_video_port_initialized(inst) {
+        return Err(local_failure(nt_status::NtStatus::INVALID_DEVICE_REQUEST));
+    }
+    let sh = inst.exec_shared_va;
+    if raw_resource_list.is_empty() {
+        restore_hosted_device_resource_state(binding, sh, false).map_err(local_failure)?;
+    }
+    clear_shared_device_interface_state_at(sh);
+
     let raw_len = u32::try_from(raw_resource_list.len())
-        .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+        .map_err(|_| local_failure(nt_status::NtStatus::INVALID_PARAMETER))?;
     let translated_len = u32::try_from(translated_resource_list.len())
-        .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+        .map_err(|_| local_failure(nt_status::NtStatus::INVALID_PARAMETER))?;
+    let parameters = PnpParameters::start(raw_len, translated_len).map_err(local_failure)?;
     let total_len = raw_resource_list
         .len()
         .checked_add(translated_resource_list.len())
-        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    let total_len_u32 =
-        u32::try_from(total_len).map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
-    let mut resource_lists = Vec::new();
-    resource_lists
+        .ok_or_else(|| local_failure(nt_status::NtStatus::INVALID_PARAMETER))?;
+    let mut payload = Vec::new();
+    payload
         .try_reserve_exact(total_len)
-        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    resource_lists.extend_from_slice(raw_resource_list);
-    resource_lists.extend_from_slice(translated_resource_list);
-    let request = IrpDispatchRequest {
-        abi_version: IO_ABI_VERSION as u16,
-        abi_size: core::mem::size_of::<IrpDispatchRequest>() as u16,
-        major: major::IRP_MJ_PNP,
-        minor: IRP_MN_START_DEVICE as u8,
-        target_domain_id: target.hosted_domain_id,
-        target_domain_cookie: target.hosted_domain_cookie,
-        driver_id: binding.driver_id,
-        device_id: binding.device_id,
-        buffer_len: total_len_u32,
-        input_len: total_len_u32,
-        parameter_offset: raw_len,
-        parameter_len: translated_len,
-        stack_count,
-        ..IrpDispatchRequest::default()
+        .map_err(|_| local_failure(nt_status::NtStatus::INSUFFICIENT_RESOURCES))?;
+    payload.extend_from_slice(raw_resource_list);
+    payload.extend_from_slice(translated_resource_list);
+
+    let prepared = io_manager_mut()
+        .prepare_external_pnp_owned_to_device(
+            ClientId(IO_MANAGER_COMPONENT_ID),
+            nt_io_manager::DeviceId(binding.pdo_device_id),
+            0,
+            parameters,
+            payload,
+        )
+        .map_err(local_failure)?;
+    let irp_id = prepared.irp_id();
+    let (origin_driver_id, completion_driver_id, completion_device_id) = {
+        let irp = io_manager_mut()
+            .irp(irp_id)
+            .expect("prepared hosted PnP IRP disappeared before dispatch");
+        let current = irp
+            .current_stack()
+            .expect("prepared hosted PnP IRP lost its captured device stack");
+        (irp.origin_driver_id, current.driver_id, current.device_id)
     };
-    let (status, _, _) = dispatch_irp_for_instance(
-        binding.instance,
-        IRP_MJ_PNP,
-        IRP_MN_START_DEVICE,
-        binding.device_object,
-        0,
-        0,
-        0,
-        binding.pdo_object,
-        0,
-        Some(request),
-        &resource_lists,
-        &mut out,
-    )
-    .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-    record_hosted_resource_usage(binding, sh)?;
-    nt_status::NtStatus(status).to_result()?;
-    apply_hosted_device_interface_state(sh)?;
-    refresh_hosted_device_resource_state(binding, sh);
-    Ok(())
+    if let Err(status) = reserve_active_hosted_irp_transfer_slot() {
+        let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
+        return Err(local_failure(status));
+    }
+    let transaction = HostedPnpTransaction {
+        binding,
+        irp_id,
+        minor: nt_pnp_manager::PnpMinor::StartDevice,
+        origin_driver_id,
+        completion_driver_id,
+        completion_device_id,
+        token: None,
+        phase: HostedPnpTransactionPhase::Prepared,
+        terminal_status: nt_status::NtStatus::NOT_SUPPORTED,
+        pci_interrupt_line,
+    };
+    if let Err(status) = reserve_hosted_pnp_transaction(transaction) {
+        let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
+        return Err(local_failure(status));
+    }
+    let token = match hosted_pnp_manager_mut().begin_pnp_dispatch(
+        binding.pdo_device_id,
+        nt_pnp_manager::PnpMinor::StartDevice,
+        irp_id.raw(),
+    ) {
+        Ok(token) => token,
+        Err(error) => {
+            let status = hosted_pnp_status(error);
+            let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
+            remove_hosted_pnp_transaction(irp_id);
+            return Err(HostedPnpStartFailure {
+                status,
+                rollback_safe: false,
+            });
+        }
+    };
+    set_hosted_pnp_transaction_token(irp_id, token)
+        .expect("reserved hosted PnP transaction disappeared before dispatch");
+
+    match io_manager_mut().dispatch_prepared_external_pnp(prepared) {
+        ExternalPnpDispatchResult::Returned { status, .. } => {
+            if let Err(transport_status) = complete_hosted_pnp_lifecycle(irp_id, status) {
+                let _ = set_hosted_pnp_transaction_phase(
+                    irp_id,
+                    HostedPnpTransactionPhase::Indeterminate,
+                    status,
+                );
+                return Ok(HostedPnpStartOutcome::Indeterminate {
+                    irp_id: irp_id.raw(),
+                    transport_status,
+                });
+            }
+            let _ = set_hosted_pnp_transaction_phase(
+                irp_id,
+                HostedPnpTransactionPhase::PostStartRepair,
+                status,
+            );
+            if let Err(repair_status) = finish_hosted_start_publication(irp_id) {
+                return Ok(HostedPnpStartOutcome::RepairRequired {
+                    driver_status: status,
+                    repair_status,
+                });
+            }
+            remove_hosted_pnp_transaction(irp_id);
+            if status.is_success() {
+                Ok(HostedPnpStartOutcome::Started)
+            } else {
+                Ok(HostedPnpStartOutcome::Failed(status))
+            }
+        }
+        ExternalPnpDispatchResult::Pending { irp_id } => {
+            let _ = set_hosted_pnp_transaction_phase(
+                irp_id,
+                HostedPnpTransactionPhase::AwaitingCompletion,
+                nt_status::NtStatus::PENDING,
+            );
+            Ok(HostedPnpStartOutcome::Pending {
+                irp_id: irp_id.raw(),
+            })
+        }
+        ExternalPnpDispatchResult::Indeterminate {
+            irp_id,
+            transport_status,
+        } => {
+            let _ = set_hosted_pnp_transaction_phase(
+                irp_id,
+                HostedPnpTransactionPhase::Indeterminate,
+                transport_status,
+            );
+            Ok(HostedPnpStartOutcome::Indeterminate {
+                irp_id: irp_id.raw(),
+                transport_status,
+            })
+        }
+    }
 }
 
 /// Deliver one interrupt to a hosted device through its connected generic resource grant.

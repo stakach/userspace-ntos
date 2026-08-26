@@ -2395,6 +2395,23 @@ with scheduler/reply handoff and ordinary pipe/RPC completion semantics so the a
 post-LSA clients resume naturally; do not add executable-order, profile, userinit, explorer, or
 notification-package fallbacks.
 
+B3 canonical PnP transaction checkpoint (2026-08-26): non-video hosted `IRP_MN_START_DEVICE`
+requests now enter the canonical I/O Manager device stack as File-less PnP IRPs targeted at the
+registry-bound PDO. The executive retains an exact transaction record containing the PnP Manager
+lifecycle token, canonical IRP identity, captured origin/current stack identities, resource owner,
+and post-start publication state. Synchronous driver returns commit the lifecycle once and reclaim
+the IRP immediately; genuine `STATUS_PENDING` retains the IRP until a driver-origin completion is
+validated, commits the same lifecycle token once, and only then acknowledges the backend
+completion. Missing or untrustworthy transport returns stay `Indeterminate` and retain both the
+canonical IRP and lifecycle token as teardown barriers. Pre-dispatch allocation and projection
+failures remain rollback-safe, while no path clears resources after lifecycle authority has been
+acquired. Local validation is green for `cargo fmt --all`, `cargo test -p nt-pnp-manager`,
+`cargo test -p nt-io-manager`, executive `cargo check --manifest-path
+components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+Serialized desktop validation is the next gate. The explicit videoprt startup remains isolated and
+must be replaced with a real canonical PnP backend; genuinely asynchronous boot START completion
+also needs to feed the boot start report instead of being reported as an immediate terminal error.
+
 ### A. SCM-Controlled Service Startup
 
 - `[x]` A0: Inventory the current SCM/service startup path and mark the static boundaries still in
@@ -2685,10 +2702,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    candidates under a reclaimable heap mark, reserves persistent plan storage, and then fills the
    plan under a second reclaimable mark so Config Manager scratch state is still released. The
    remaining per-service devnode/ID/path inline capture bounds have been removed from that launch
-  boundary by reserving a persistent plan-owned string byte arena and passing plan-owned ID slices
-  through PnP/start paths. The display path now uses the hosted videoprt miniport route as the sole
-  live `\Device\Video<N>` and DeviceMap owner; the old boot-framebuffer-backed route fallback has
-  been removed.
+   boundary by reserving a persistent plan-owned string byte arena and passing plan-owned ID slices
+   through PnP/start paths. The display path now uses the hosted videoprt miniport route as the sole
+   live `\Device\Video<N>` and DeviceMap owner; the old boot-framebuffer-backed route fallback has
+  been removed. Non-video START now uses one canonical I/O Manager PnP IRP plus a retained lifecycle
+  transaction, preserves exact returned/pending/indeterminate outcomes, validates driver-origin
+  pending completions before committing lifecycle state, and limits resource rollback to failures
+  before the PnP token exists. Next, prove this transaction through the serialized desktop run,
+  replace the isolated videoprt startup with a canonical backend, then reuse the same transaction
+  machinery for query-stop/cancel-stop/stop/query-remove/cancel-remove/surprise/remove.
 2. A3/A4 for Win32 service starts is closed for the current frontier. SCM-owned service metadata now
    produces typed
    `Win32ServiceLaunchSpec` and `ServiceStartSpec::{Win32, Driver}` records, the hosted executable

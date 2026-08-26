@@ -450,32 +450,34 @@ unsafe fn start_one_devnode<H, C>(
                         &grant.translated_resource_list,
                     ) {
                         Ok(()) => {
-                            let status = driver_launch::start_hosted_device(
-                                device_id,
-                                &grant.raw_resource_list,
-                                &grant.translated_resource_list,
-                            );
-                            if status.is_err() {
-                                if !restore_hosted_devnode_interrupt_line(&grant) {
-                                    print_str(b"[driver-launch] PCI InterruptLine rollback failed device_id=");
-                                    print_u64(device_id);
-                                    print_str(b"\n");
+                            if driver_launch::hosted_device_video_port_initialized(device_id) {
+                                match driver_launch::start_hosted_video_device(
+                                    device_id,
+                                    &grant.raw_resource_list,
+                                    &grant.translated_resource_list,
+                                    grant.pci_interrupt_line,
+                                ) {
+                                    Ok(()) => Ok(()),
+                                    Err(status) => Err(rollback_pre_dispatch_start(
+                                        device_id,
+                                        grant.pci_interrupt_line,
+                                        status,
+                                    )),
                                 }
-                                driver_launch::rollback_hosted_device_start(device_id);
+                            } else {
+                                canonical_start_status(
+                                    device_id,
+                                    &grant.raw_resource_list,
+                                    &grant.translated_resource_list,
+                                    grant.pci_interrupt_line,
+                                )
                             }
-                            status
                         }
-                        Err(status) => {
-                            if !restore_hosted_devnode_interrupt_line(&grant) {
-                                print_str(
-                                    b"[driver-launch] PCI InterruptLine rollback failed device_id=",
-                                );
-                                print_u64(device_id);
-                                print_str(b"\n");
-                            }
-                            driver_launch::rollback_hosted_device_start(device_id);
-                            Err(status)
-                        }
+                        Err(status) => Err(rollback_pre_dispatch_start(
+                            device_id,
+                            grant.pci_interrupt_line,
+                            status,
+                        )),
                     }
                 }
                 Ok(None) => {
@@ -485,20 +487,29 @@ unsafe fn start_one_devnode<H, C>(
                         &[],
                     ) {
                         Ok(()) => {
-                            let status = driver_launch::start_hosted_device(device_id, &[], &[]);
-                            if status.is_err() {
-                                driver_launch::rollback_hosted_device_start(device_id);
+                            if driver_launch::hosted_device_video_port_initialized(device_id) {
+                                match driver_launch::start_hosted_video_device(
+                                    device_id,
+                                    &[],
+                                    &[],
+                                    None,
+                                ) {
+                                    Ok(()) => Ok(()),
+                                    Err(status) => Err(rollback_pre_dispatch_start(
+                                        device_id, None, status,
+                                    )),
+                                }
+                            } else {
+                                canonical_start_status(device_id, &[], &[], None)
                             }
-                            status
                         }
                         Err(status) => {
-                            driver_launch::rollback_hosted_device_start(device_id);
-                            Err(status)
+                            Err(rollback_pre_dispatch_start(device_id, None, status))
                         }
                     }
                 }
                 Err(status) => {
-                    driver_launch::rollback_hosted_device_start(device_id);
+                    let status = rollback_pre_dispatch_start(device_id, None, status);
                     print_resource_grant_failure(
                         options.trace,
                         service_name,
@@ -560,6 +571,64 @@ unsafe fn start_one_devnode<H, C>(
             print_add_device_failure(options.trace, service_name, devnode.instance_id, status);
         }
     }
+}
+
+unsafe fn canonical_start_status(
+    device_id: u64,
+    raw_resource_list: &[u8],
+    translated_resource_list: &[u8],
+    pci_interrupt_line: Option<crate::pnp::PciInterruptLineProgramming>,
+) -> Result<(), nt_status::NtStatus> {
+    match driver_launch::start_hosted_device_canonical(
+        device_id,
+        raw_resource_list,
+        translated_resource_list,
+        pci_interrupt_line,
+    ) {
+        Ok(driver_launch::HostedPnpStartOutcome::Started) => Ok(()),
+        Ok(driver_launch::HostedPnpStartOutcome::Failed(status)) => Err(status),
+        Ok(driver_launch::HostedPnpStartOutcome::Pending { .. }) => {
+            Err(nt_status::NtStatus::PENDING)
+        }
+        Ok(driver_launch::HostedPnpStartOutcome::Indeterminate {
+            transport_status,
+            ..
+        }) => Err(transport_status),
+        Ok(driver_launch::HostedPnpStartOutcome::RepairRequired {
+            driver_status,
+            repair_status,
+        }) => Err(if driver_status.is_success() {
+            repair_status
+        } else {
+            driver_status
+        }),
+        Err(failure) if failure.rollback_safe => Err(rollback_pre_dispatch_start(
+            device_id,
+            pci_interrupt_line,
+            failure.status,
+        )),
+        Err(failure) => Err(failure.status),
+    }
+}
+
+unsafe fn rollback_pre_dispatch_start(
+    device_id: u64,
+    pci_interrupt_line: Option<crate::pnp::PciInterruptLineProgramming>,
+    original_status: nt_status::NtStatus,
+) -> nt_status::NtStatus {
+    if let Err(status) = driver_launch::rollback_hosted_device_start(device_id) {
+        return status;
+    }
+    if pci_interrupt_line
+        .map(|programming| crate::pnp::restore_pci_interrupt_line(programming))
+        .is_some_and(|restored| !restored)
+    {
+        print_str(b"[driver-launch] PCI InterruptLine rollback failed device_id=");
+        print_u64(device_id);
+        print_str(b"\n");
+        return nt_status::NtStatus::UNSUCCESSFUL;
+    }
+    original_status
 }
 
 unsafe fn grant_prepared_hosted_devnode_resources(

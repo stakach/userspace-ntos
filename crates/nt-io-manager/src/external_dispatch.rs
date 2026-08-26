@@ -78,6 +78,34 @@ impl<P> IoManager<P> {
         if payload.len() != expected_len {
             return Err(NtStatus::INVALID_PARAMETER);
         }
+        let mut owned_payload = Vec::new();
+        owned_payload
+            .try_reserve_exact(payload.len())
+            .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+        owned_payload.extend_from_slice(payload);
+        self.prepare_external_pnp_owned_to_device(
+            client,
+            pdo_device_id,
+            requestor_tid,
+            parameters,
+            owned_payload,
+        )
+    }
+
+    /// Prepare a PnP request from an already-owned exact payload. This avoids a second allocation
+    /// when an integration host must first concatenate native START resource-list images.
+    pub fn prepare_external_pnp_owned_to_device(
+        &mut self,
+        client: ClientId,
+        pdo_device_id: DeviceId,
+        requestor_tid: u64,
+        parameters: PnpParameters,
+        owned_payload: Vec<u8>,
+    ) -> Result<PreparedExternalPnpIrp, NtStatus> {
+        let expected_len = parameters.input_len() as usize;
+        if owned_payload.len() != expected_len {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         let origin = self
             .device(pdo_device_id)
             .ok_or(NtStatus::INVALID_PARAMETER)?;
@@ -85,12 +113,6 @@ impl<P> IoManager<P> {
             return Err(NtStatus::DELETE_PENDING);
         }
         let origin_driver_id = origin.driver_id;
-
-        let mut owned_payload = Vec::new();
-        owned_payload
-            .try_reserve_exact(payload.len())
-            .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
-        owned_payload.extend_from_slice(payload);
 
         let mut irp = self.build_irp_record(
             client,

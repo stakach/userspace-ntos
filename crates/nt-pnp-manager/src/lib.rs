@@ -767,7 +767,7 @@ impl PnpManager {
     /// barrier.
     pub fn complete_pnp_dispatch(
         &mut self,
-        token: PnpDispatchToken,
+        token: &PnpDispatchToken,
         completed_canonical_irp_id: u64,
         status_success: bool,
     ) -> Result<DeviceState, PnpError> {
@@ -1301,7 +1301,7 @@ mod tests {
 
     fn complete_pnp(
         p: &mut PnpManager,
-        token: PnpDispatchToken,
+        token: &PnpDispatchToken,
         status_success: bool,
     ) -> Result<DeviceState, PnpError> {
         let completed_canonical_irp_id = token.canonical_irp_id;
@@ -1314,11 +1314,11 @@ mod tests {
         let pdo = 0x9000;
         let id = assigned_pci_devnode(&mut p, pdo);
         let start = begin_pnp(&mut p, pdo, PnpMinor::StartDevice).unwrap();
-        complete_pnp(&mut p, start, true).unwrap();
+        complete_pnp(&mut p, &start, true).unwrap();
         let query = begin_pnp(&mut p, pdo, PnpMinor::QueryRemoveDevice).unwrap();
-        complete_pnp(&mut p, query, true).unwrap();
+        complete_pnp(&mut p, &query, true).unwrap();
         let remove = begin_pnp(&mut p, pdo, PnpMinor::RemoveDevice).unwrap();
-        assert_eq!(complete_pnp(&mut p, remove, false), Ok(RemovePending));
+        assert_eq!(complete_pnp(&mut p, &remove, false), Ok(RemovePending));
         let token = p.removal_token(pdo).unwrap();
         p.finish_remove(token).unwrap();
         assert_eq!(p.state(id), Some(Removed));
@@ -1376,6 +1376,9 @@ mod tests {
             p.begin_pnp_dispatch(pdo, PnpMinor::StartDevice, 0),
             Err(PnpError::InvalidIdentity)
         );
+        assert_eq!(p.state(id), Some(ResourcesAssigned));
+        assert!(!p.pnp_dispatch_in_flight(id));
+        assert_eq!(p.next_dispatch_gen, 1);
         let token = begin_pnp(&mut p, pdo, PnpMinor::StartDevice).unwrap();
         let duplicate = PnpDispatchToken {
             devnode_id: token.devnode_id,
@@ -1406,16 +1409,16 @@ mod tests {
             Err(PnpError::DispatchInFlight)
         );
         assert_eq!(
-            p.complete_pnp_dispatch(observed_mismatch, token.canonical_irp_id + 1, true),
+            p.complete_pnp_dispatch(&observed_mismatch, token.canonical_irp_id + 1, true),
             Err(PnpError::StaleDispatch)
         );
         assert_eq!(
-            complete_pnp(&mut p, wrong_irp, true),
+            complete_pnp(&mut p, &wrong_irp, true),
             Err(PnpError::StaleDispatch)
         );
-        assert_eq!(complete_pnp(&mut p, token, true), Ok(Started));
+        assert_eq!(complete_pnp(&mut p, &token, true), Ok(Started));
         assert_eq!(
-            complete_pnp(&mut p, duplicate, true),
+            complete_pnp(&mut p, &duplicate, true),
             Err(PnpError::StaleDispatch)
         );
         assert!(!p.pnp_dispatch_in_flight(id));
@@ -1423,10 +1426,10 @@ mod tests {
         let mut failed = PnpManager::new();
         let failed_id = assigned_pci_devnode(&mut failed, pdo);
         let token = begin_pnp(&mut failed, pdo, PnpMinor::StartDevice).unwrap();
-        assert_eq!(complete_pnp(&mut failed, token, false), Ok(Failed));
+        assert_eq!(complete_pnp(&mut failed, &token, false), Ok(Failed));
         assert!(!failed.mapping_allowed(failed_id));
         let remove = begin_pnp(&mut failed, pdo, PnpMinor::RemoveDevice).unwrap();
-        assert_eq!(complete_pnp(&mut failed, remove, false), Ok(RemovePending));
+        assert_eq!(complete_pnp(&mut failed, &remove, false), Ok(RemovePending));
         let removal = failed.removal_token(pdo).unwrap();
         failed.finish_remove(removal).unwrap();
 
@@ -1447,7 +1450,7 @@ mod tests {
         let pdo = 0x6000;
         let id = assigned_pci_devnode(&mut p, pdo);
         let start = begin_pnp(&mut p, pdo, PnpMinor::StartDevice).unwrap();
-        complete_pnp(&mut p, start, true).unwrap();
+        complete_pnp(&mut p, &start, true).unwrap();
         assert_eq!(
             begin_pnp(&mut p, pdo, PnpMinor::RemoveDevice),
             Err(PnpError::InvalidTransition)
@@ -1455,35 +1458,35 @@ mod tests {
 
         let query_stop = begin_pnp(&mut p, pdo, PnpMinor::QueryStopDevice).unwrap();
         assert_eq!(p.state(id), Some(QueryStopPending));
-        complete_pnp(&mut p, query_stop, false).unwrap();
+        complete_pnp(&mut p, &query_stop, false).unwrap();
         assert_eq!(
             begin_pnp(&mut p, pdo, PnpMinor::StopDevice),
             Err(PnpError::InvalidTransition)
         );
         let cancel_stop = begin_pnp(&mut p, pdo, PnpMinor::CancelStopDevice).unwrap();
-        assert_eq!(complete_pnp(&mut p, cancel_stop, false), Ok(Started));
+        assert_eq!(complete_pnp(&mut p, &cancel_stop, false), Ok(Started));
 
         let query_stop = begin_pnp(&mut p, pdo, PnpMinor::QueryStopDevice).unwrap();
-        complete_pnp(&mut p, query_stop, true).unwrap();
+        complete_pnp(&mut p, &query_stop, true).unwrap();
         let stop = begin_pnp(&mut p, pdo, PnpMinor::StopDevice).unwrap();
-        assert_eq!(complete_pnp(&mut p, stop, false), Ok(Stopped));
+        assert_eq!(complete_pnp(&mut p, &stop, false), Ok(Stopped));
         assert!(!p.mapping_allowed(id));
 
         let restart = begin_pnp(&mut p, pdo, PnpMinor::StartDevice).unwrap();
-        complete_pnp(&mut p, restart, true).unwrap();
+        complete_pnp(&mut p, &restart, true).unwrap();
         let query_remove = begin_pnp(&mut p, pdo, PnpMinor::QueryRemoveDevice).unwrap();
-        complete_pnp(&mut p, query_remove, false).unwrap();
+        complete_pnp(&mut p, &query_remove, false).unwrap();
         assert_eq!(
             begin_pnp(&mut p, pdo, PnpMinor::RemoveDevice),
             Err(PnpError::InvalidTransition)
         );
         let cancel_remove = begin_pnp(&mut p, pdo, PnpMinor::CancelRemoveDevice).unwrap();
-        assert_eq!(complete_pnp(&mut p, cancel_remove, false), Ok(Started));
+        assert_eq!(complete_pnp(&mut p, &cancel_remove, false), Ok(Started));
 
         let query_remove = begin_pnp(&mut p, pdo, PnpMinor::QueryRemoveDevice).unwrap();
-        complete_pnp(&mut p, query_remove, true).unwrap();
+        complete_pnp(&mut p, &query_remove, true).unwrap();
         let remove = begin_pnp(&mut p, pdo, PnpMinor::RemoveDevice).unwrap();
-        assert_eq!(complete_pnp(&mut p, remove, false), Ok(RemovePending));
+        assert_eq!(complete_pnp(&mut p, &remove, false), Ok(RemovePending));
         let removal = p.removal_token(pdo).unwrap();
         p.finish_remove(removal).unwrap();
         assert!(!p.is_live(id));
@@ -1495,12 +1498,12 @@ mod tests {
         let pdo = 0x7000;
         let id = assigned_pci_devnode(&mut p, pdo);
         let start = begin_pnp(&mut p, pdo, PnpMinor::StartDevice).unwrap();
-        complete_pnp(&mut p, start, true).unwrap();
+        complete_pnp(&mut p, &start, true).unwrap();
         let surprise = begin_pnp(&mut p, pdo, PnpMinor::SurpriseRemoval).unwrap();
         assert_eq!(p.state(id), Some(RemovePending));
-        assert_eq!(complete_pnp(&mut p, surprise, false), Ok(RemovePending));
+        assert_eq!(complete_pnp(&mut p, &surprise, false), Ok(RemovePending));
         let remove = begin_pnp(&mut p, pdo, PnpMinor::RemoveDevice).unwrap();
-        assert_eq!(complete_pnp(&mut p, remove, false), Ok(RemovePending));
+        assert_eq!(complete_pnp(&mut p, &remove, false), Ok(RemovePending));
         assert_eq!(
             begin_pnp(&mut p, pdo, PnpMinor::RemoveDevice),
             Err(PnpError::DispatchInFlight)
@@ -1515,9 +1518,9 @@ mod tests {
         let pdo = 0x8000;
         let id = assigned_pci_devnode(&mut stopping, pdo);
         let start = begin_pnp(&mut stopping, pdo, PnpMinor::StartDevice).unwrap();
-        complete_pnp(&mut stopping, start, true).unwrap();
+        complete_pnp(&mut stopping, &start, true).unwrap();
         let query = begin_pnp(&mut stopping, pdo, PnpMinor::QueryStopDevice).unwrap();
-        complete_pnp(&mut stopping, query, true).unwrap();
+        complete_pnp(&mut stopping, &query, true).unwrap();
         let _lost_stop = begin_pnp(&mut stopping, pdo, PnpMinor::StopDevice).unwrap();
         assert_eq!(stopping.state(id), Some(QueryStopPending));
         assert!(stopping.pnp_dispatch_in_flight(id));
@@ -1525,9 +1528,9 @@ mod tests {
         let mut removing = PnpManager::new();
         let id = assigned_pci_devnode(&mut removing, pdo);
         let start = begin_pnp(&mut removing, pdo, PnpMinor::StartDevice).unwrap();
-        complete_pnp(&mut removing, start, true).unwrap();
+        complete_pnp(&mut removing, &start, true).unwrap();
         let surprise = begin_pnp(&mut removing, pdo, PnpMinor::SurpriseRemoval).unwrap();
-        complete_pnp(&mut removing, surprise, true).unwrap();
+        complete_pnp(&mut removing, &surprise, true).unwrap();
         let _lost_remove = begin_pnp(&mut removing, pdo, PnpMinor::RemoveDevice).unwrap();
         assert_eq!(removing.state(id), Some(RemovePending));
         assert!(removing.pnp_dispatch_in_flight(id));

@@ -13667,13 +13667,6 @@ struct HostedDevnodeGrant {
     dma_len: u64,
 }
 
-unsafe fn restore_hosted_devnode_interrupt_line(grant: &HostedDevnodeGrant) -> bool {
-    grant
-        .pci_interrupt_line
-        .map(|programming| restore_pci_interrupt_line(programming))
-        .unwrap_or(true)
-}
-
 fn hosted_pci_grant_error(
     device_id: u64,
     stage: &[u8],
