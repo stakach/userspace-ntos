@@ -7561,6 +7561,10 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
     print_u64(heap.reusable as u64);
     print_str(b"/");
     print_u64(heap.largest_reusable as u64);
+    print_str(b" scratch=");
+    print_u64(heap.transient_used as u64);
+    print_str(b"/");
+    print_u64(heap.transient_capacity as u64);
     print_str(b" timer=");
     print_u64(TIMER_TICKS_SEEN.load(Ordering::Relaxed));
     print_str(b"/");
@@ -7721,7 +7725,11 @@ pub(crate) fn print_census_counters(tag: &[u8]) {
     print_str(b"/");
     print_u64(heap.allocated as u64);
     print_str(b"/");
-    print_u64(allocator::HEAP_FRAMES * 0x1000);
+    print_u64(heap.durable_capacity as u64);
+    print_str(b" scratch=");
+    print_u64(heap.transient_used as u64);
+    print_str(b"/");
+    print_u64(heap.transient_capacity as u64);
     print_str(b" ucb-redirects=");
     print_u64(redirects);
     print_str(b" ucb-returns=");
@@ -9886,7 +9894,7 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     let heap = allocator::usage();
     print_u64((heap.bump as u64) >> 10);
     print_str(b"KiB/");
-    print_u64((allocator::HEAP_FRAMES * 0x1000) >> 10);
+    print_u64((heap.durable_capacity as u64) >> 10);
     print_str(b"KiB exec-heap-live=");
     print_u64((heap.allocated as u64) >> 10);
     print_str(b"KiB exec-heap-reusable=");
@@ -9895,6 +9903,10 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64((heap.largest_reusable as u64) >> 10);
     print_str(b"KiB exec-heap-top=");
     print_u64((heap.top_reusable as u64) >> 10);
+    print_str(b"KiB exec-scratch=");
+    print_u64((heap.transient_used as u64) >> 10);
+    print_str(b"KiB/");
+    print_u64((heap.transient_capacity as u64) >> 10);
     print_str(b"KiB pinned-root-caps=");
     print_u64(ROOT_SLOT_PINNED_COUNT.load(Ordering::Relaxed));
     print_str(b" pin-delete-refusals=");
@@ -20034,10 +20046,10 @@ struct LiveConfigManagerMountReport {
 }
 
 fn mount_live_config_manager_config_hive() -> LiveConfigManagerMountReport {
-    let heap_mark = allocator::mark();
     let mut report = LiveConfigManagerMountReport::default();
     LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.store(0, Ordering::Release);
     {
+        let _transient = allocator::enter_transient();
         if let Some(image) = unsafe { boot_system_hive_image_bytes() } {
             report.bytes = image.len() as u64;
             unsafe {
@@ -20060,7 +20072,6 @@ fn mount_live_config_manager_config_hive() -> LiveConfigManagerMountReport {
             report.unavailable = true;
         }
     }
-    unsafe { allocator::reset_to(heap_mark) };
     report
 }
 
@@ -32030,8 +32041,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_u64(heap.largest_reusable as u64);
     print_str(b" top=");
     print_u64(heap.top_reusable as u64);
-    print_str(b" cap=");
-    print_u64(allocator::HEAP_FRAMES * 0x1000);
+    print_str(b" durable-cap=");
+    print_u64(heap.durable_capacity as u64);
+    print_str(b" scratch=");
+    print_u64(heap.transient_used as u64);
+    print_str(b"/");
+    print_u64(heap.transient_capacity as u64);
     print_str(b"\n");
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);

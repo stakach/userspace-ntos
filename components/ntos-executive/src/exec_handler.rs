@@ -24180,6 +24180,7 @@ impl ExecNtHandler {
                     }
 
                     let copy_length = len.min(required_length);
+                    let _transient = crate::allocator::enter_transient();
                     let mut output = alloc::vec![0u8; copy_length];
                     let status = match encode_system_module_information(&mut output, snapshot) {
                         Ok(_) => 0,

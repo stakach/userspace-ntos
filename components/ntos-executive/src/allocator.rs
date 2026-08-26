@@ -58,6 +58,12 @@ pub const HEAP_FRAMES: u64 = 6144;
 pub const DEFAULT_SERVICE_HEAP_FRAMES: u64 = 128;
 
 const HEAP_SIZE: usize = (HEAP_FRAMES as usize) * 0x1000;
+/// Root-executive-only transient lane. It shares the existing heap mapping but grows downward from
+/// its top, so dispatch-local buffers can never fragment durable objects growing upward below it.
+/// Spawned components retain their complete declared heap as durable storage.
+pub const EXECUTIVE_TRANSIENT_HEAP_FRAMES: u64 = 1024;
+const EXECUTIVE_TRANSIENT_HEAP_SIZE: usize = (EXECUTIVE_TRANSIENT_HEAP_FRAMES as usize) * 0x1000;
+const _: () = assert!(EXECUTIVE_TRANSIENT_HEAP_FRAMES < HEAP_FRAMES);
 const CTR: usize = HEAP_BASE; // 8-byte bump offset, in the RW heap
 const FREE_HEAD: usize = HEAP_BASE + 8; // 8-byte address of the first free-list node
 /// Component-local metadata words available to modules that cannot use mutable image statics.
@@ -65,8 +71,11 @@ pub const COMPONENT_LOCAL_WORD_BASE: usize = HEAP_BASE + 16;
 pub const COMPONENT_LOCAL_WORDS: usize = 6;
 const MAPPED_HEAP_BYTES: usize =
     COMPONENT_LOCAL_WORD_BASE + (COMPONENT_LOCAL_WORDS - 1) * size_of::<usize>();
-const DATA: usize = HEAP_BASE + 64; // allocations start past allocator/local metadata
-const _: () = assert!(MAPPED_HEAP_BYTES + size_of::<usize>() <= DATA);
+const TRANSIENT_CTR: usize = HEAP_BASE + 64; // bytes consumed downward from the mapped heap end
+const TRANSIENT_DEPTH: usize = HEAP_BASE + 72; // nested transient allocation scopes
+const DATA: usize = HEAP_BASE + 128; // allocations start past allocator/local metadata
+const _: () = assert!(MAPPED_HEAP_BYTES + size_of::<usize>() <= TRANSIENT_CTR);
+const _: () = assert!(TRANSIENT_DEPTH + size_of::<usize>() <= DATA);
 const WORD: usize = size_of::<usize>();
 const ALLOC_GRANULE: usize = align_of::<usize>();
 const FREE_NODE_SIZE: usize = WORD * 2; // { size, next } stored inside the freed block
@@ -93,6 +102,17 @@ pub struct AllocScope {
     previous_len: usize,
 }
 
+/// Scoped routing of global allocations into the root executive's rewindable transient lane.
+///
+/// The guard is deliberately not exposed as a mark/reset pair: nested scopes rewind in LIFO order,
+/// and values allocated while it is live must be dropped before the guard. Durable objects must not
+/// be created inside this scope.
+pub struct TransientAllocScope {
+    previous_mark: usize,
+    previous_depth: usize,
+    active: bool,
+}
+
 impl Drop for AllocContext {
     fn drop(&mut self) {
         OOM_CONTEXT.store(self.previous, Ordering::Relaxed);
@@ -103,6 +123,22 @@ impl Drop for AllocScope {
     fn drop(&mut self) {
         OOM_SCOPE_PTR.store(self.previous_ptr, Ordering::Relaxed);
         OOM_SCOPE_LEN.store(self.previous_len, Ordering::Relaxed);
+    }
+}
+
+impl Drop for TransientAllocScope {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        debug_assert_eq!(
+            unsafe { read_word(TRANSIENT_DEPTH) },
+            self.previous_depth + 1
+        );
+        unsafe {
+            write_word(TRANSIENT_CTR, self.previous_mark);
+            write_word(TRANSIENT_DEPTH, self.previous_depth);
+        }
     }
 }
 
@@ -117,6 +153,30 @@ pub fn enter_scope(scope: &'static [u8]) -> AllocScope {
     AllocScope {
         previous_ptr,
         previous_len,
+    }
+}
+
+/// Route allocations to the root executive's transient lane until the returned guard is dropped.
+/// Spawned services have no transient lane and continue using their declared durable heap.
+pub fn enter_transient() -> TransientAllocScope {
+    let active = transient_heap_size() != 0;
+    let previous_mark = if active {
+        unsafe { read_word(TRANSIENT_CTR) }
+    } else {
+        0
+    };
+    let previous_depth = if active {
+        unsafe { read_word(TRANSIENT_DEPTH) }
+    } else {
+        0
+    };
+    if active {
+        unsafe { write_word(TRANSIENT_DEPTH, previous_depth + 1) };
+    }
+    TransientAllocScope {
+        previous_mark,
+        previous_depth,
+        active,
     }
 }
 
@@ -236,8 +296,39 @@ fn heap_size() -> usize {
 }
 
 #[inline]
-fn heap_end() -> usize {
+fn mapped_heap_end() -> usize {
     HEAP_BASE + heap_size()
+}
+
+#[inline]
+fn transient_heap_size() -> usize {
+    // A zero configured size identifies the initial/root executive. Every spawned component must
+    // publish its mapped size before allocating and retains that complete profile as durable heap.
+    if unsafe { read_word(MAPPED_HEAP_BYTES) } == 0 {
+        EXECUTIVE_TRANSIENT_HEAP_SIZE.min(heap_size())
+    } else {
+        0
+    }
+}
+
+#[inline]
+fn transient_heap_start() -> usize {
+    mapped_heap_end() - transient_heap_size()
+}
+
+#[inline]
+fn durable_heap_end() -> usize {
+    transient_heap_start()
+}
+
+#[inline]
+fn durable_heap_capacity() -> usize {
+    durable_heap_end().saturating_sub(DATA)
+}
+
+#[inline]
+fn is_transient_pointer(ptr: usize) -> bool {
+    transient_heap_size() != 0 && ptr >= transient_heap_start() && ptr < mapped_heap_end()
 }
 
 unsafe fn free_node_size(node: usize) -> usize {
@@ -258,7 +349,9 @@ unsafe fn set_free_node(node: usize, size: usize, next: usize) {
 unsafe fn insert_free_block(start: usize, size: usize) {
     if size < FREE_NODE_SIZE
         || start < DATA
-        || start.checked_add(size).is_none_or(|end| end > heap_end())
+        || start
+            .checked_add(size)
+            .is_none_or(|end| end > durable_heap_end())
     {
         return;
     }
@@ -421,11 +514,8 @@ unsafe fn grow_in_place_from_adjacent_free(start: usize, old_size: usize, new_si
     false
 }
 
-// SAFETY: single-threaded per component; allocator metadata lives in the component-local RW heap
-// and is accessed only by this allocator. Free blocks are returned to the list only through
-// `dealloc`/`realloc` for dead allocations, and alignment is applied to each returned pointer.
-unsafe impl GlobalAlloc for Bump {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+impl Bump {
+    unsafe fn alloc_durable(&self, layout: Layout) -> *mut u8 {
         let Some(size) = block_size(layout.size()) else {
             report_oom(
                 layout.size(),
@@ -451,7 +541,7 @@ unsafe impl GlobalAlloc for Bump {
         };
         let requested_end = start.saturating_add(layout.size());
         let end = match start.checked_add(size) {
-            Some(e) if e <= heap_end() => e,
+            Some(e) if e <= durable_heap_end() => e,
             _ => {
                 report_oom(
                     layout.size(),
@@ -467,11 +557,52 @@ unsafe impl GlobalAlloc for Bump {
         start as *mut u8
     }
 
+    unsafe fn alloc_transient(&self, layout: Layout) -> *mut u8 {
+        let Some(size) = block_size(layout.size()) else {
+            return null_mut();
+        };
+        let used = unsafe { read_word(TRANSIENT_CTR) };
+        let top = mapped_heap_end().saturating_sub(used);
+        let Some(unrounded) = top.checked_sub(size) else {
+            report_oom(layout.size(), layout.align(), used, 0, usize::MAX);
+            return null_mut();
+        };
+        let start = unrounded & !(layout.align().max(ALLOC_GRANULE) - 1);
+        if start < transient_heap_start() {
+            report_oom(
+                layout.size(),
+                layout.align(),
+                used,
+                start.saturating_sub(transient_heap_start()),
+                transient_heap_size(),
+            );
+            return null_mut();
+        }
+        unsafe { write_word(TRANSIENT_CTR, mapped_heap_end() - start) };
+        start as *mut u8
+    }
+}
+
+// SAFETY: single-threaded per component; allocator metadata lives in the component-local RW heap
+// and is accessed only by this allocator. Free blocks are returned to the list only through
+// `dealloc`/`realloc` for dead allocations, and alignment is applied to each returned pointer.
+unsafe impl GlobalAlloc for Bump {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if transient_heap_size() != 0 && unsafe { read_word(TRANSIENT_DEPTH) } != 0 {
+            unsafe { self.alloc_transient(layout) }
+        } else {
+            unsafe { self.alloc_durable(layout) }
+        }
+    }
+
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if ptr.is_null() || layout.size() == 0 {
             return;
         }
         let start = ptr as usize;
+        if is_transient_pointer(start) {
+            return;
+        }
         let Some(size) = block_size(layout.size()) else {
             return;
         };
@@ -495,6 +626,19 @@ unsafe impl GlobalAlloc for Bump {
 
         let start = ptr as usize;
         let old_size = old_layout.size();
+        if is_transient_pointer(start) {
+            if new_size <= old_size {
+                return ptr;
+            }
+            let Ok(new_layout) = Layout::from_size_align(new_size, old_layout.align()) else {
+                return null_mut();
+            };
+            let new_ptr = unsafe { self.alloc_transient(new_layout) };
+            if !new_ptr.is_null() {
+                unsafe { copy_nonoverlapping(ptr, new_ptr, old_size) };
+            }
+            return new_ptr;
+        }
         let Some(old_block_size) = block_size(old_size) else {
             return null_mut();
         };
@@ -518,8 +662,8 @@ unsafe impl GlobalAlloc for Bump {
             None => return null_mut(),
         };
         let cur_end = DATA + unsafe { read_word(CTR) };
-        let heap_end = heap_end();
-        if start >= DATA && old_end <= heap_end && old_end == cur_end {
+        let durable_heap_end = durable_heap_end();
+        if start >= DATA && old_end <= durable_heap_end && old_end == cur_end {
             let Some(new_end) = start.checked_add(new_block_size) else {
                 report_oom(
                     new_size,
@@ -530,7 +674,7 @@ unsafe impl GlobalAlloc for Bump {
                 );
                 return null_mut();
             };
-            if new_end <= heap_end {
+            if new_end <= durable_heap_end {
                 unsafe { write_word(CTR, new_end - DATA) };
                 return ptr;
             }
@@ -551,7 +695,9 @@ unsafe impl GlobalAlloc for Bump {
         let Ok(new_layout) = Layout::from_size_align(new_size, old_layout.align()) else {
             return null_mut();
         };
-        let new_ptr = unsafe { self.alloc(new_layout) };
+        // Reallocation preserves the original allocation's arena even when a transient scope is
+        // active. Growing a durable Vec in a transient scope must not make it rewindable.
+        let new_ptr = unsafe { self.alloc_durable(new_layout) };
         if !new_ptr.is_null() {
             unsafe { copy_nonoverlapping(ptr, new_ptr, old_size.min(new_size)) };
             unsafe { self.dealloc(ptr, old_layout) };
@@ -576,9 +722,7 @@ pub fn mark() -> usize {
 
 /// Bytes still available above the current bump mark.
 pub fn remaining() -> usize {
-    heap_size()
-        .saturating_sub(DATA - HEAP_BASE)
-        .saturating_sub(mark())
+    durable_heap_capacity().saturating_sub(mark())
 }
 
 #[derive(Copy, Clone)]
@@ -588,6 +732,9 @@ pub struct HeapUsage {
     pub reusable: usize,
     pub largest_reusable: usize,
     pub top_reusable: usize,
+    pub durable_capacity: usize,
+    pub transient_used: usize,
+    pub transient_capacity: usize,
 }
 
 /// Snapshot bump occupancy and reusable free-list storage.
@@ -601,7 +748,7 @@ pub fn usage() -> HeapUsage {
     let mut largest_free = 0usize;
     let mut node = unsafe { read_word(FREE_HEAD) };
     let mut guard = 0usize;
-    let max_nodes = heap_size() / FREE_NODE_SIZE;
+    let max_nodes = durable_heap_capacity() / FREE_NODE_SIZE;
     while node != 0 && guard < max_nodes {
         let size = unsafe { free_node_size(node) };
         free_bytes = free_bytes.saturating_add(size);
@@ -615,6 +762,9 @@ pub fn usage() -> HeapUsage {
         reusable: top_reusable.saturating_add(free_bytes),
         largest_reusable: top_reusable.max(largest_free),
         top_reusable,
+        durable_capacity: durable_heap_capacity(),
+        transient_used: unsafe { read_word(TRANSIENT_CTR) },
+        transient_capacity: transient_heap_size(),
     }
 }
 
@@ -641,7 +791,7 @@ const _: () = assert!(rewind_target(20, 24, 16) == 16);
 /// All allocations made after `m` must be dead (unreferenced) at this point.
 pub unsafe fn reset_to(m: usize) {
     let current = unsafe { read_word(CTR) };
-    let bounded = rewind_target(m, current, heap_size().saturating_sub(DATA - HEAP_BASE));
+    let bounded = rewind_target(m, current, durable_heap_capacity());
     unsafe {
         write_word(CTR, bounded);
         trim_free_list_to(DATA + bounded);

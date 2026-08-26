@@ -13593,3 +13593,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     their longest valid lifetime first, then introduce scoped rewind only where no value escapes the
     dispatch boundary. Do not move parked continuations, handle/object state, mounted hives, file
     storage, or callback payloads into rewindable storage.
+
+    Executive durable/transient allocator split (2026-08-27, foundation accepted): the existing
+    24 MiB root-executive mapping now contains disjoint arenas instead of one interleaved address
+    range. Durable storage grows upward through the coalescing allocator in a 20 MiB lane; scoped
+    per-dispatch storage grows downward in a 4 MiB lane and rewinds in LIFO order. Spawned services
+    retain their complete declared heap as durable storage. `realloc` preserves the source arena,
+    so growing a durable vector while a scratch scope is active cannot silently make it rewindable.
+    Individual scratch frees are intentionally ignored and the enclosing scope is the sole owner of
+    reclamation. Runtime census reports each capacity and current scratch use separately.
+
+    The first migration covers only regions whose former explicit `mark`/`reset_to` contract already
+    proved that no value escapes: one-shot CM SYSTEM import request buffers, streaming writable-volume
+    checkpoint temporaries, and `SystemModuleInformation` copyout encoding. Full-hive primary images,
+    mounted filesystem replacements, parked continuations, and every durable table remain in the
+    durable lane. Serialized acceptance `.tmp/run-headless-executive-scratch-arena-20260827.log`
+    checkpointed the dirty SOFTWARE, SYSTEM, and SAM primaries, committed writable generation 5
+    (1,692,366 B), painted 480,000/480,000 Explorer pixels with at least 32 colors, passed `295/295`,
+    and matched the sentinel. Final durable allocation was 14,854,760 B of 20,971,392 B with
+    6,116,632 B reusable; scratch returned to exactly 0 of 4,194,304 B.
+
+    Review adjustment: the physical split and first non-escaping migrations are accepted. Continue
+    by replacing the two registry capture `mark`/`reset_to` regions with lexical scratch scopes while
+    keeping their subsequent hive/overlay writes durable. Then inventory the remaining root-level
+    rewind and dirty-mark machinery; delete each legacy path only after every allocation it protected
+    has an explicit durable or scoped-transient owner.

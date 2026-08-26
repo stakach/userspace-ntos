@@ -1465,12 +1465,11 @@ fn finalize_service_loop_durable_state(
             pin_durable_heap_mark(heap_mark);
         }
         if nt_handler.writable_fs_commit_required {
-            let checkpoint_mark = allocator::mark();
             let checkpoint_result = {
+                let _transient = allocator::enter_transient();
                 let _alloc_ctx = allocator::enter_context(allocator::ALLOC_CTX_WRITABLE_SNAPSHOT);
                 unsafe { crate::writable_fs::checkpoint_dirty_volume() }
             };
-            unsafe { allocator::reset_to(checkpoint_mark) };
             checkpoint_status = checkpoint_result.err().unwrap_or(nt_fs::STATUS_SUCCESS);
             if checkpoint_status != nt_fs::STATUS_SUCCESS {
                 print_str(b"[writable-fs-snapshot] service-loop checkpoint status=0x");
@@ -1534,12 +1533,11 @@ fn checkpoint_boot_hives_at_quiesce(nt_handler: &mut ExecNtHandler) -> u32 {
         print_u64(dirty_cells as u64);
         print_str(b"\n");
     }
-    let snapshot_mark = allocator::mark();
     let snapshot_result = {
+        let _transient = allocator::enter_transient();
         let _alloc_ctx = allocator::enter_context(allocator::ALLOC_CTX_WRITABLE_SNAPSHOT);
         unsafe { crate::writable_fs::checkpoint_dirty_volume() }
     };
-    unsafe { allocator::reset_to(snapshot_mark) };
     let snapshot_status = snapshot_result.err().unwrap_or(nt_fs::STATUS_SUCCESS);
     if snapshot_status == nt_fs::STATUS_SUCCESS {
         if snapshot_result == Ok(true) {
