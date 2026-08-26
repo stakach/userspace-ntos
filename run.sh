@@ -3,7 +3,7 @@
 # ReactOS user-space stack: BOOTBOOT -> rust-micro (seL4-style microkernel) ->
 # smss -> csrss -> winlogon -> win32k -> a PAINTED Windows desktop.
 #
-#   ./run.sh              # headless serial gate; prints SUCCESS on the desktop-paint PASS marker
+#   ./run.sh              # headless serial gate; requires the complete Explorer shell proof
 #   ./run.sh --desktop    # boot with a QEMU window so you SEE the painted desktop
 #   ./run.sh --debug      # forward QEMU int/cpu_reset tracing (triple-fault hunts)
 #
@@ -211,7 +211,7 @@ if [ "$GRAPHICS" = 1 ]; then
 fi
 
 say "[5/5] booting QEMU (headless serial gate)..."
-say "      Success = the executive prints 'PASS exec_win32k_desktop_painted'."
+say "      Success = every executive check passes and Explorer shell chrome reaches the framebuffer."
 say "      Tip: ./run.sh --desktop to SEE the painted ReactOS desktop in a window."
 # run_specs execs QEMU; the kernel signals the result through isa-debug-exit:
 #   host exit 3 = kernel qemu_exit(0) = PASS ((0<<1|1)<<1|1),  255 = panic.
@@ -226,14 +226,24 @@ fi
 rc=$?
 set -e
 echo
-if grep -q 'PASS exec_win32k_desktop_painted' "$RUN_LOG" \
-   && ! grep -q 'FAIL exec_win32k_desktop_painted' "$RUN_LOG" \
+summary="$(sed -n \
+  's/.*\[ntos-exec summary: \([0-9][0-9]*\)\/\([0-9][0-9]*\) executive->isolated-service checks passed\].*/\1 \2/p' \
+  "$RUN_LOG" | tail -n 1)"
+passed=""
+total=""
+read -r passed total <<< "$summary"
+if grep -q 'PASS exec_explorer_shell_chrome_painted' "$RUN_LOG" \
+   && ! grep -q 'FAIL exec_explorer_shell_chrome_painted' "$RUN_LOG" \
+   && ! grep -q '^  FAIL ' "$RUN_LOG" \
+   && grep -q '\[microtest sentinel matched -- exiting QEMU\]' "$RUN_LOG" \
+   && [ -n "$passed" ] \
+   && [ "$passed" = "$total" ] \
    && { [ "$rc" = 1 ] || [ "$rc" = 3 ] || [ "$rc" = 0 ]; }; then
-  say "SUCCESS — the ReactOS stack booted and the win32k desktop painted (0x003a6ea5)."
+  say "SUCCESS — the ReactOS stack booted and Explorer painted the complete shell ($passed/$total checks)."
   say "         Log: $RUN_LOG"
   say "         Run ./run.sh --desktop to view it."
   exit 0
 fi
-err "FAILED — QEMU exited $rc without the desktop-paint PASS marker (255 = kernel panic)."
+err "FAILED — QEMU exited $rc without the complete Explorer shell proof (255 = kernel panic)."
 err "         Log: $RUN_LOG"
 exit 1

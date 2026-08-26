@@ -11649,7 +11649,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the CPU's exact active user thread and covered by a stress test so a stale user-entry owner can
     never suspend the executive or another domain.
 
-    Exact provider publication and domain-lifetime checkpoint (2026-08-26, accepted locally):
+    Exact provider publication and domain-lifetime checkpoint (2026-08-26, accepted):
     provider export-publication tokens are now named and used only for singleton image/export,
     marshal-policy, and thunk selection. Provider routes retain separate exact dependent and
     provider `HostedDomainIdentity` values, and IRP envelopes carry the provider domain id and its
@@ -11682,13 +11682,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `480000/480000` pixels, but correctly failed at `292/293`: binding every callback to a miniport
     dispatch route rejected TCP/IP's earlier real `NdisRegisterProtocol` marshal and therefore the
     NDIS receive-indication gate. That overconstraint is removed in favour of the instance-owned
-    domain dependency described above. Review adjustment: rerun one serialized desktop proof and
-    require all `293/293` gates before accepting this checkpoint. Then finish the remaining
-    failure-retaining provider shadow/allocation cleanup and implement the ordered PnP removal
-    transaction, including query/cancel/remove IRPs, interface and video-route withdrawal, exact
-    resource revocation, FDO/PDO detach and destruction, RootBus PDO removal, DriverUnload, and
-    final hosted-domain retirement. Keep the rust-micro device-memory cache-policy and SMP
-    fault-owner correctness items visible alongside that work.
+    domain dependency described above. The accepted serialized proof
+    `.tmp/run-desktop-exact-provider-lifetime-success-20260826.log` reaches genuine userinit and
+    Explorer, passes `exec_provider_ndis_receive_indicated`, paints all `480000/480000` pixels of the
+    miniport-selected `800x600` shell with at least 32 non-background colours, passes all `293/293`
+    executive gates, and emits the sentinel. The run also exposed a stale outer-launcher assertion:
+    `run.sh` still required the deleted framebuffer-mutating `exec_win32k_desktop_painted` probe even
+    though the stronger Explorer framebuffer proof replaced it. The launcher now requires the
+    Explorer chrome gate, no failed executive checks, an equal passed/total summary, the sentinel,
+    and an accepted QEMU exit status.
+
+    Review adjustment: the provider publication and domain-lifetime checkpoint is closed. Next
+    finish the remaining failure-retaining provider shadow/allocation cleanup and implement the
+    ordered PnP removal transaction, including query/cancel/remove IRPs, interface and video-route
+    withdrawal, exact resource revocation, FDO/PDO detach and destruction, RootBus PDO removal,
+    DriverUnload, and final hosted-domain retirement. Keep the rust-micro device-memory cache-policy
+    and SMP fault-owner correctness items visible alongside that work.
 
     Provider proof blocker correction (2026-08-26): the first retry after introducing the
     instance-owned dependency did not expose a provider-transport failure. Symbolization and
@@ -11696,7 +11705,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the dependency registry. The recursive frame eventually wrote 32 bytes below the executive's
     mapped root stack, into the deliberate guard page, at `0x1000052ee12`. The recursion is removed;
     the executive again passes its freestanding release check at the established 212-warning
-    baseline. A serialized desktop retry is still required before accepting the provider checkpoint.
+    baseline. The accepted serialized retry is recorded in the provider checkpoint above.
 
     The same investigation corrected the earlier SMP evidence: both recorded `tcb=1` RIPs are in
     executable root-task text, including the older `nt_fs::directory::query_directory_by_index`
