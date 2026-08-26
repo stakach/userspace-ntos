@@ -37160,6 +37160,10 @@ pub(crate) struct DriverInstance {
     pub used: bool,
 }
 
+// Routing snapshots are copied across re-entrant provider dispatch. Keep lifetime ledgers and other
+// arena-sized state behind separately-owned stores so one pump level cannot consume the root stack.
+const _: () = assert!(core::mem::size_of::<DriverInstance>() <= 0x200);
+
 const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     fault_ep: 0,
     pml4: 0,

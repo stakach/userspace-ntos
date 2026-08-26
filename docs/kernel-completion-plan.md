@@ -11887,8 +11887,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `Free`. Broad callback-row tombstoning may reject stale dispatch, but it is not quiescence proof
     and must not authorize raw-address reuse.
 
-    Executive thunk-ledger stack correction (2026-08-26, implementation green; serialized proof
-    pending): the first desktop run after generation-safe thunk wiring reached real E1000
+    Executive thunk-ledger stack correction (2026-08-26, accepted): the first desktop run after
+    generation-safe thunk wiring reached real E1000
     `AddDevice` and `START_DEVICE`, then faulted the executive root task on the guard page at the
     compiler stack probe for `spawn_hosts::component_pump_loop`. Symbolization and disassembly show
     this was not a rust-micro fault-owner mismatch: embedding the fixed thunk-slot ledger inside the
@@ -11904,10 +11904,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `reserve_instance_executable_thunk`, and `clear_instance` remain small frames as well. Focused
     `nt-hosted-runtime` validation is green at `61/61`, the freestanding executive check remains at
     the established 212-warning baseline, formatting and diff checks are clean, and the release ELF
-    links successfully.
+    links successfully. Serialized desktop proof
+    `.tmp/run-desktop-20260826-142247.log` passes the real provider NDIS receive gate, reaches genuine
+    Explorer, paints all `480000/480000` pixels of the miniport-selected `800x600` shell with at
+    least 32 non-background colours, passes all `293/293` executive gates, and emits the sentinel.
+    A compile-time `DriverInstance` size ceiling now prevents arena-sized lifetime state from being
+    embedded in this hot copyable routing snapshot again.
 
-    Review adjustment: rerun the serialized desktop proof before accepting the executive thunk
-    checkpoint. If green, continue with callback-parented timer/work-item/characteristics/mirror
-    construction and real compensating unregister/cancel operations. Keep the independent
-    architecture-owned per-CPU `{TcbId, lifecycle_generation}` entry token and device-frame cache
-    policy work open; this stack fault does not close either rust-micro item.
+    Review adjustment: continue with callback-parented timer/work-item/characteristics/mirror
+    construction and real compensating unregister/cancel operations. Before those parents share a
+    deduplicated executable address, add explicit thunk-binding lease counts: an existing live key
+    must acquire a lease, a non-final release must leave the slot live, and only the final published
+    lease may enter `Retiring`. Keep the independent architecture-owned per-CPU
+    `{TcbId, lifecycle_generation}` entry token and device-frame cache policy work open; this stack
+    fault does not close either rust-micro item.
