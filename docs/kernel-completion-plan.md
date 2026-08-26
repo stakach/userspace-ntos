@@ -11918,3 +11918,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     lease may enter `Retiring`. Keep the independent architecture-owned per-CPU
     `{TcbId, lifecycle_generation}` entry token and device-frame cache policy work open; this stack
     fault does not close either rust-micro item.
+
+    Thunk binding lease checkpoint (2026-08-26, runtime crate green; executive parent transfer
+    pending): the generation-safe slot registry now distinguishes address deduplication from
+    ownership. A new reservation begins with one lease, resolving an exact live key acquires another
+    lease with checked overflow, and a non-final release leaves the slot live. Only the final release
+    atomically removes dispatch eligibility and moves the slot to `Retiring`; exact-owner quiescence
+    is still required before `Free`. Abort remains restricted to a single unpublished reservation,
+    and stale releases cannot mutate a reused slot. Focused validation is green at `63/63`, including
+    multi-owner release ordering, stale-token release, and lease-overflow tests.
+
+    Review adjustment: executive `Existing` success paths must now transfer the acquired lease into
+    an explicit durable binding, while every failure after acquisition must release it. Add bounded
+    binding storage to marshal construction for callback-rich temporary arguments, then transfer
+    successful bindings into the timer, work-item, characteristics, and miniport-mirror parents.
+    Import thunk bindings need their own idempotent parent identity so replaying one IAT resolution
+    does not acquire an unbounded number of leases. Do not begin final retirement until the relevant
+    real NDIS compensation plus exact dependency dispatch quiescence proves the raw pointer dead.

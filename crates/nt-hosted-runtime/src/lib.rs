@@ -185,6 +185,7 @@ pub struct HostedThunkSlot {
     pub state: HostedThunkSlotState,
     pub generation: u64,
     pub key: Option<HostedThunkSlotKey>,
+    pub leases: u32,
 }
 
 impl HostedThunkSlot {
@@ -193,6 +194,7 @@ impl HostedThunkSlot {
             state: HostedThunkSlotState::Free,
             generation: 0,
             key: None,
+            leases: 0,
         }
     }
 }
@@ -204,20 +206,29 @@ pub enum HostedThunkReservation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostedThunkLeaseRelease {
+    Retained { remaining: u32 },
+    RetirementRequired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostedThunkSlotError {
     Full,
     Busy,
     InvalidToken,
     GenerationExhausted,
+    LeaseExhausted,
     OwnerNotQuiesced,
 }
 
 /// Allocation state for executable thunk slots.
 ///
-/// Aborted reservations may be reused immediately because their address was never published.
-/// Live slots must pass through `Retiring` and may only return to `Free` after their exact owner is
-/// non-dispatchable and quiesced. The generation rejects stale registry tokens; the quiescence
-/// requirement protects stale raw code pointers, which cannot carry that generation themselves.
+/// Aborted reservations may be reused immediately because their address was never published. Each
+/// successful lookup of an existing live key acquires another lease. Releasing a non-final lease
+/// leaves the slot live; releasing the final lease moves it to `Retiring`. Retiring slots may only
+/// return to `Free` after their exact owner is non-dispatchable and quiesced. The generation rejects
+/// stale registry tokens; the quiescence requirement protects stale raw code pointers, which cannot
+/// carry that generation themselves.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostedThunkSlotRegistry<const N: usize> {
     slots: [HostedThunkSlot; N],
@@ -261,7 +272,14 @@ impl<const N: usize> HostedThunkSlotRegistry<N> {
                 generation: slot.generation,
             };
             return match slot.state {
-                HostedThunkSlotState::Live => Ok(HostedThunkReservation::Existing(token)),
+                HostedThunkSlotState::Live => {
+                    let leases = slot
+                        .leases
+                        .checked_add(1)
+                        .ok_or(HostedThunkSlotError::LeaseExhausted)?;
+                    self.slots[index].leases = leases;
+                    Ok(HostedThunkReservation::Existing(token))
+                }
                 HostedThunkSlotState::Reserved | HostedThunkSlotState::Retiring => {
                     Err(HostedThunkSlotError::Busy)
                 }
@@ -287,6 +305,7 @@ impl<const N: usize> HostedThunkSlotRegistry<N> {
             state: HostedThunkSlotState::Reserved,
             generation,
             key: Some(key),
+            leases: 1,
         };
         Ok(HostedThunkReservation::Reserved(HostedThunkSlotToken {
             index: index as u16,
@@ -307,7 +326,7 @@ impl<const N: usize> HostedThunkSlotRegistry<N> {
         key: HostedThunkSlotKey,
     ) -> Result<(), HostedThunkSlotError> {
         let slot = self.slot_mut(token, key)?;
-        if slot.state != HostedThunkSlotState::Reserved {
+        if slot.state != HostedThunkSlotState::Reserved || slot.leases != 1 {
             return Err(HostedThunkSlotError::InvalidToken);
         }
         slot.state = HostedThunkSlotState::Live;
@@ -320,25 +339,33 @@ impl<const N: usize> HostedThunkSlotRegistry<N> {
         key: HostedThunkSlotKey,
     ) -> Result<(), HostedThunkSlotError> {
         let slot = self.slot_mut(token, key)?;
-        if slot.state != HostedThunkSlotState::Reserved {
+        if slot.state != HostedThunkSlotState::Reserved || slot.leases != 1 {
             return Err(HostedThunkSlotError::InvalidToken);
         }
         slot.state = HostedThunkSlotState::Free;
         slot.key = None;
+        slot.leases = 0;
         Ok(())
     }
 
-    pub fn begin_retire(
+    pub fn release(
         &mut self,
         token: HostedThunkSlotToken,
         key: HostedThunkSlotKey,
-    ) -> Result<(), HostedThunkSlotError> {
+    ) -> Result<HostedThunkLeaseRelease, HostedThunkSlotError> {
         let slot = self.slot_mut(token, key)?;
-        if slot.state != HostedThunkSlotState::Live {
+        if slot.state != HostedThunkSlotState::Live || slot.leases == 0 {
             return Err(HostedThunkSlotError::InvalidToken);
         }
+        if slot.leases > 1 {
+            slot.leases -= 1;
+            return Ok(HostedThunkLeaseRelease::Retained {
+                remaining: slot.leases,
+            });
+        }
+        slot.leases = 0;
         slot.state = HostedThunkSlotState::Retiring;
-        Ok(())
+        Ok(HostedThunkLeaseRelease::RetirementRequired)
     }
 
     pub fn finish_retire(
@@ -351,7 +378,7 @@ impl<const N: usize> HostedThunkSlotRegistry<N> {
             return Err(HostedThunkSlotError::OwnerNotQuiesced);
         }
         let slot = self.slot_mut(token, key)?;
-        if slot.state != HostedThunkSlotState::Retiring {
+        if slot.state != HostedThunkSlotState::Retiring || slot.leases != 0 {
             return Err(HostedThunkSlotError::InvalidToken);
         }
         slot.state = HostedThunkSlotState::Free;
@@ -361,7 +388,7 @@ impl<const N: usize> HostedThunkSlotRegistry<N> {
 
     pub fn is_live(&self, token: HostedThunkSlotToken, key: HostedThunkSlotKey) -> bool {
         self.slot(token, key)
-            .is_some_and(|slot| slot.state == HostedThunkSlotState::Live)
+            .is_some_and(|slot| slot.state == HostedThunkSlotState::Live && slot.leases != 0)
     }
 
     fn slot(
@@ -2982,7 +3009,18 @@ mod tests {
             registry.reserve(key),
             Ok(HostedThunkReservation::Existing(token))
         );
+        assert_eq!(registry.slots()[0].leases, 2);
         assert_eq!(registry.slots()[1].state, HostedThunkSlotState::Free);
+        assert_eq!(
+            registry.release(token, key),
+            Ok(HostedThunkLeaseRelease::Retained { remaining: 1 })
+        );
+        assert!(registry.is_live(token, key));
+        assert_eq!(
+            registry.release(token, key),
+            Ok(HostedThunkLeaseRelease::RetirementRequired)
+        );
+        assert!(!registry.is_live(token, key));
     }
 
     #[test]
@@ -2993,7 +3031,10 @@ mod tests {
             panic!("first reservation unexpectedly reused a live thunk");
         };
         registry.commit(first, first_key).unwrap();
-        registry.begin_retire(first, first_key).unwrap();
+        assert_eq!(
+            registry.release(first, first_key),
+            Ok(HostedThunkLeaseRelease::RetirementRequired)
+        );
         assert_eq!(
             registry.finish_retire(first, first_key, false),
             Err(HostedThunkSlotError::OwnerNotQuiesced)
@@ -3011,6 +3052,45 @@ mod tests {
         };
         assert_eq!(first.index, second.index);
         assert_ne!(first.generation, second.generation);
+    }
+
+    #[test]
+    fn thunk_slot_release_rejects_stale_tokens_without_mutation() {
+        let mut registry = HostedThunkSlotRegistry::<1>::new();
+        let key = thunk_slot_key(0x4500);
+        let HostedThunkReservation::Reserved(first) = registry.reserve(key).unwrap() else {
+            panic!("first reservation unexpectedly reused a live thunk");
+        };
+        registry.abort(first, key).unwrap();
+        let HostedThunkReservation::Reserved(second) = registry.reserve(key).unwrap() else {
+            panic!("second reservation unexpectedly reused a live thunk");
+        };
+        registry.commit(second, key).unwrap();
+
+        assert_eq!(
+            registry.release(first, key),
+            Err(HostedThunkSlotError::InvalidToken)
+        );
+        assert_eq!(registry.slots()[0].leases, 1);
+        assert!(registry.is_live(second, key));
+    }
+
+    #[test]
+    fn thunk_slot_lease_overflow_does_not_mutate_the_live_slot() {
+        let mut registry = HostedThunkSlotRegistry::<1>::new();
+        let key = thunk_slot_key(0x4800);
+        let HostedThunkReservation::Reserved(token) = registry.reserve(key).unwrap() else {
+            panic!("first reservation unexpectedly reused a live thunk");
+        };
+        registry.commit(token, key).unwrap();
+        registry.slots[0].leases = u32::MAX;
+
+        assert_eq!(
+            registry.reserve(key),
+            Err(HostedThunkSlotError::LeaseExhausted)
+        );
+        assert_eq!(registry.slots()[0].leases, u32::MAX);
+        assert!(registry.is_live(token, key));
     }
 
     #[test]
