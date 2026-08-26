@@ -11592,10 +11592,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the hosted-domain table.
 
     Local validation is green for `cargo fmt --all -- --check`, `git diff --check`, and the
-    freestanding executive check at the established 212-warning baseline. A serialized desktop gate
-    remains required for this paging checkpoint. Review adjustment: next extend persistent IRP,
-    Resource Manager, and DMA ownership with the exact domain generation; then repair provider route,
-    callback, and unload lifetime before starting the ordered PnP removal transaction.
+    freestanding executive check at the established 212-warning baseline. Serialized proof
+    `.tmp/run-desktop-exact-paging-20260826.log` reaches genuine Explorer, paints all
+    `480000/480000` shell pixels with at least 32 non-background colours, reports zero hosted paging
+    owner collisions, mapping failures, VSpace unmap failures, or pool corruption, passes all
+    `293/293` gates, and emits the sentinel. Review adjustment: next extend persistent IRP, Resource
+    Manager, and DMA ownership with the exact domain generation; then repair provider route, callback,
+    and unload lifetime before starting the ordered PnP removal transaction.
 
     Track one separate rust-micro correctness item after this lifetime tranche: device-frame mapping
     cache attributes are still marked TODO in `rust-micro/src/untyped.rs`. Define and prove the x86
