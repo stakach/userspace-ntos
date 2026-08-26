@@ -52,6 +52,7 @@ use nt_hosted_runtime::{
     DC21X4_ADAPTER_FLAGS_OFFSET_X64, DC21X4_ADAPTER_HEAD_RBD_OFFSET_X64,
     DC21X4_ADAPTER_INTERRUPT_STATUS_OFFSET_X64, DC21X4_ADAPTER_TAIL_RBD_OFFSET_X64,
     HOSTED_PROVIDER_EXPORT_ARG_CAP, HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN,
+    NDIS_MINIPORT_CHARACTERISTICS_CALLBACK_CAP,
     NDIS_MINIPORT_BLOCK_ETH_DB_OFFSET_X64, NDIS_MINIPORT_BLOCK_ETH_RX_COMPLETE_HANDLER_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_ETH_RX_INDICATE_HANDLER_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_MINIPORT_ADAPTER_CONTEXT_OFFSET_X64,
@@ -14663,6 +14664,9 @@ struct ProviderMarshalState {
     miniport_timer_construction_index: usize,
     miniport_timer_shadow_index: usize,
     ndis_work_item_construction_index: usize,
+    callback_parent_construction_index: usize,
+    callback_parent_handle_exec_va: u64,
+    callback_parent_input_provider_handle: u64,
     ndis_route_index: usize,
     ndis_initialize_wrapper_handle_exec_va: u64,
     ndis_status_provider_exec_va: u64,
@@ -14742,6 +14746,9 @@ impl ProviderMarshalState {
             miniport_timer_construction_index: usize::MAX,
             miniport_timer_shadow_index: usize::MAX,
             ndis_work_item_construction_index: usize::MAX,
+            callback_parent_construction_index: usize::MAX,
+            callback_parent_handle_exec_va: 0,
+            callback_parent_input_provider_handle: 0,
             ndis_route_index: usize::MAX,
             ndis_initialize_wrapper_handle_exec_va: 0,
             ndis_status_provider_exec_va: 0,
@@ -14930,7 +14937,38 @@ struct HostedExecutableThunkBinding {
 struct HostedExecutableThunkAddress {
     run_va: u64,
     binding: HostedExecutableThunkBinding,
-    existing: bool,
+}
+
+const HOSTED_PROVIDER_CALLBACK_PARENT_KIND_MINIPORT: u8 = 1;
+const HOSTED_PROVIDER_CALLBACK_PARENT_KIND_PROTOCOL: u8 = 2;
+
+struct HostedProviderCallbackParent {
+    present: bool,
+    construction_state: HostedProviderConstructionState,
+    owner: HostedProviderObjectOwner,
+    provider_instance: usize,
+    dependent_instance: usize,
+    kind: u8,
+    provider_handle: u64,
+    bindings: [Option<HostedExecutableThunkBinding>;
+        NDIS_MINIPORT_CHARACTERISTICS_CALLBACK_CAP],
+    binding_count: usize,
+}
+
+impl HostedProviderCallbackParent {
+    const fn empty() -> Self {
+        Self {
+            present: false,
+            construction_state: HostedProviderConstructionState::Published,
+            owner: EMPTY_HOSTED_PROVIDER_OBJECT_OWNER,
+            provider_instance: 0,
+            dependent_instance: 0,
+            kind: 0,
+            provider_handle: 0,
+            bindings: [None; NDIS_MINIPORT_CHARACTERISTICS_CALLBACK_CAP],
+            binding_count: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -15185,6 +15223,7 @@ static HOSTED_PROVIDER_EXPORT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_EXPORT_FRAME_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_PROVIDER_EXPORT_FRAME_TRACE_CAP: u64 = 16;
 static mut HOSTED_PROVIDER_CALLBACK_RECORDS: Option<Vec<HostedProviderCallbackRecord>> = None;
+static mut HOSTED_PROVIDER_CALLBACK_PARENTS: Option<Vec<HostedProviderCallbackParent>> = None;
 static HOSTED_PROVIDER_CALLBACK_NEXT_COOKIE: AtomicU64 = AtomicU64::new(1);
 static HOSTED_PROVIDER_CALLBACK_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
@@ -15285,6 +15324,20 @@ unsafe fn hosted_provider_callback_records_mut() -> &'static mut Vec<HostedProvi
 
 unsafe fn hosted_provider_callback_records() -> Option<&'static Vec<HostedProviderCallbackRecord>> {
     (&*core::ptr::addr_of!(HOSTED_PROVIDER_CALLBACK_RECORDS)).as_ref()
+}
+
+unsafe fn hosted_provider_callback_parents_mut(
+) -> &'static mut Vec<HostedProviderCallbackParent> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_PROVIDER_CALLBACK_PARENTS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_provider_callback_parents(
+) -> Option<&'static Vec<HostedProviderCallbackParent>> {
+    (&*core::ptr::addr_of!(HOSTED_PROVIDER_CALLBACK_PARENTS)).as_ref()
 }
 
 unsafe fn hosted_provider_domain_dependencies_mut(
@@ -16189,23 +16242,6 @@ fn record_provider_protocol_receive_completion(record: HostedProviderCallbackRec
     }
 }
 
-unsafe fn instance_executable_thunk_available(instance_index: usize) -> u64 {
-    let Some(inst) = instance(instance_index) else {
-        return 0;
-    };
-    if !inst.used || inst.thunk_len == 0 {
-        return 0;
-    }
-    let slots = inst.thunk_len / HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN;
-    let dynamic_slots = slots.saturating_sub(inst.thunk_next);
-    driver_instance_thunk_slots()
-        .and_then(|registries| registries.get(instance_index))
-        .map(|registry| {
-            registry.available_with_limit(dynamic_slots.min(usize::MAX as u64) as usize) as u64
-        })
-        .unwrap_or(0)
-}
-
 fn hosted_provider_domain_dependency_is_live(dependency: HostedProviderDomainDependency) -> bool {
     !dependency.retiring && hosted_provider_domain_dependency_is_current(dependency)
 }
@@ -16549,6 +16585,231 @@ unsafe fn retire_hosted_provider_callback_record_for_thunk(
         }
     }
     matched
+}
+
+unsafe fn reserve_hosted_provider_callback_parent(
+    provider_instance: usize,
+    dependent_instance: usize,
+    kind: u8,
+) -> Result<usize, i32> {
+    if !matches!(
+        kind,
+        HOSTED_PROVIDER_CALLBACK_PARENT_KIND_MINIPORT
+            | HOSTED_PROVIDER_CALLBACK_PARENT_KIND_PROTOCOL
+    ) {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let owner = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
+        .ok_or(STATUS_DEVICE_NOT_READY)?;
+    let parents = hosted_provider_callback_parents_mut();
+    let index = if let Some(index) = parents.iter().position(|parent| !parent.present) {
+        index
+    } else {
+        parents
+            .try_reserve(1)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        parents.len()
+    };
+    let parent = HostedProviderCallbackParent {
+        present: true,
+        construction_state: HostedProviderConstructionState::Constructing,
+        owner,
+        provider_instance,
+        dependent_instance,
+        kind,
+        provider_handle: 0,
+        bindings: [None; NDIS_MINIPORT_CHARACTERISTICS_CALLBACK_CAP],
+        binding_count: 0,
+    };
+    if index == parents.len() {
+        parents.push(parent);
+    } else {
+        parents[index] = parent;
+    }
+    Ok(index)
+}
+
+unsafe fn retain_hosted_provider_callback_parent_binding(
+    index: usize,
+    binding: HostedExecutableThunkBinding,
+) -> bool {
+    let Some(parent) = hosted_provider_callback_parents_mut().get_mut(index) else {
+        return false;
+    };
+    if !parent.present
+        || parent.construction_state != HostedProviderConstructionState::Constructing
+        || binding.instance_index != parent.provider_instance
+        || parent.binding_count >= parent.bindings.len()
+    {
+        return false;
+    }
+    parent.bindings[parent.binding_count] = Some(binding);
+    parent.binding_count += 1;
+    true
+}
+
+unsafe fn rollback_hosted_provider_callback_parent(index: usize) {
+    let Some(parent) = hosted_provider_callback_parents_mut().get_mut(index) else {
+        return;
+    };
+    if !parent.present
+        || !matches!(
+            parent.construction_state,
+            HostedProviderConstructionState::Constructing
+                | HostedProviderConstructionState::RollingBack
+        )
+    {
+        return;
+    }
+    parent.construction_state = HostedProviderConstructionState::RollingBack;
+    let mut failed = false;
+    let mut binding_index = 0usize;
+    while binding_index < parent.binding_count {
+        if let Some(binding) = parent.bindings[binding_index] {
+            if release_instance_executable_thunk_binding(binding, true) {
+                parent.bindings[binding_index] = None;
+            } else {
+                failed = true;
+            }
+        }
+        binding_index += 1;
+    }
+    if !failed {
+        *parent = HostedProviderCallbackParent::empty();
+    }
+}
+
+unsafe fn retain_indeterminate_hosted_provider_callback_parent(index: usize) {
+    if let Some(parent) = hosted_provider_callback_parents_mut().get_mut(index) {
+        if parent.present
+            && parent.construction_state == HostedProviderConstructionState::Constructing
+        {
+            parent.construction_state = HostedProviderConstructionState::CompensationRequired;
+        }
+    }
+}
+
+unsafe fn retain_hosted_provider_callback_parent_compensation(
+    index: usize,
+    provider_handle: u64,
+) {
+    if let Some(parent) = hosted_provider_callback_parents_mut().get_mut(index) {
+        if parent.present
+            && parent.construction_state == HostedProviderConstructionState::Constructing
+        {
+            parent.provider_handle = provider_handle;
+            parent.construction_state = HostedProviderConstructionState::CompensationRequired;
+        }
+    }
+}
+
+unsafe fn finish_hosted_provider_callback_parent(index: usize, provider_handle: u64) -> bool {
+    let parents = hosted_provider_callback_parents_mut();
+    let Some(parent) = parents.get(index) else {
+        return false;
+    };
+    if !parent.present
+        || parent.construction_state != HostedProviderConstructionState::Constructing
+        || provider_handle == 0
+        || parent.binding_count == 0
+        || parent.bindings[..parent.binding_count]
+            .iter()
+            .any(Option::is_none)
+        || !hosted_provider_object_owner_is_live(
+            parent.owner,
+            parent.provider_instance,
+            parent.dependent_instance,
+        )
+    {
+        return false;
+    }
+    if parents.iter().enumerate().any(|(other_index, other)| {
+        other_index != index
+            && other.present
+            && other.construction_state == HostedProviderConstructionState::Published
+            && other.provider_instance == parent.provider_instance
+            && other.dependent_instance == parent.dependent_instance
+            && other.kind == parent.kind
+            && other.provider_handle == provider_handle
+    }) {
+        return false;
+    }
+    let parent = &mut parents[index];
+    parent.provider_handle = provider_handle;
+    parent.construction_state = HostedProviderConstructionState::Published;
+    true
+}
+
+unsafe fn retire_hosted_provider_callback_parent_by_handle(
+    provider_instance: usize,
+    dependent_instance: usize,
+    kind: u8,
+    provider_handle: u64,
+) -> bool {
+    let Some(parents) = (*core::ptr::addr_of_mut!(HOSTED_PROVIDER_CALLBACK_PARENTS)).as_mut()
+    else {
+        return true;
+    };
+    let Some(index) = parents.iter().position(|parent| {
+        parent.present
+            && matches!(
+                parent.construction_state,
+                HostedProviderConstructionState::Published
+                    | HostedProviderConstructionState::CompensationRequired
+            )
+            && parent.provider_instance == provider_instance
+            && parent.dependent_instance == dependent_instance
+            && parent.kind == kind
+            && parent.provider_handle == provider_handle
+    }) else {
+        return true;
+    };
+    parents[index].construction_state = HostedProviderConstructionState::RollingBack;
+    rollback_hosted_provider_callback_parent(index);
+    hosted_provider_callback_parents()
+        .and_then(|parents| parents.get(index))
+        .is_none_or(|parent| !parent.present)
+}
+
+unsafe fn clear_hosted_provider_callback_parents_for_instance(
+    instance_index: usize,
+    domain: HostedDomainIdentity,
+) -> u64 {
+    let parent_count = hosted_provider_callback_parents().map_or(0, Vec::len);
+    let mut failures = 0u64;
+    for index in 0..parent_count {
+        let Some(parent) = hosted_provider_callback_parents().and_then(|rows| rows.get(index)) else {
+            continue;
+        };
+        if !parent.present
+            || parent.provider_instance != instance_index
+                && parent.dependent_instance != instance_index
+        {
+            continue;
+        }
+        if !hosted_provider_object_owner_matches_instance(
+            parent.owner,
+            parent.provider_instance,
+            parent.dependent_instance,
+            instance_index,
+            domain,
+        ) || !matches!(
+            parent.construction_state,
+            HostedProviderConstructionState::Constructing
+                | HostedProviderConstructionState::RollingBack
+        ) {
+            failures += 1;
+            continue;
+        }
+        rollback_hosted_provider_callback_parent(index);
+        if hosted_provider_callback_parents()
+            .and_then(|rows| rows.get(index))
+            .is_some_and(|parent| parent.present)
+        {
+            failures += 1;
+        }
+    }
+    failures
 }
 
 unsafe fn hosted_provider_callback_record(cookie: u64) -> Option<HostedProviderCallbackRecord> {
@@ -17456,6 +17717,9 @@ unsafe fn abort_provider_export_marshal_before_dispatch(state: &ProviderMarshalS
             state.ndis_work_item_construction_index,
         );
     }
+    if state.callback_parent_construction_index != usize::MAX {
+        rollback_hosted_provider_callback_parent(state.callback_parent_construction_index);
+    }
 }
 
 unsafe fn abort_provider_export_marshal_after_possible_dispatch(state: &ProviderMarshalState) {
@@ -17503,6 +17767,11 @@ unsafe fn abort_provider_export_marshal_after_possible_dispatch(state: &Provider
     if state.ndis_work_item_construction_index != usize::MAX {
         retain_indeterminate_hosted_provider_ndis_work_item_construction(
             state.ndis_work_item_construction_index,
+        );
+    }
+    if state.callback_parent_construction_index != usize::MAX {
+        retain_indeterminate_hosted_provider_callback_parent(
+            state.callback_parent_construction_index,
         );
     }
 }
@@ -21143,7 +21412,7 @@ unsafe fn rollback_hosted_provider_miniport_timer_construction(index: usize) {
     if binding_released && allocation_released {
         *record = HostedProviderMiniportTimerShadow::empty();
     } else {
-        record.construction_state = HostedProviderConstructionState::CompensationRequired;
+        record.construction_state = HostedProviderConstructionState::RollingBack;
     }
 }
 
@@ -21182,6 +21451,22 @@ unsafe fn clear_hosted_provider_miniport_timer_shadows_for_instance(
     instance_index: usize,
     domain: HostedDomainIdentity,
 ) -> u64 {
+    let record_count = hosted_provider_miniport_timer_shadows_mut().len();
+    for index in 0..record_count {
+        if hosted_provider_miniport_timer_shadows()
+            .and_then(|records| records.get(index))
+            .is_some_and(|record| {
+                record.present
+                    && matches!(
+                        record.construction_state,
+                        HostedProviderConstructionState::Constructing
+                            | HostedProviderConstructionState::RollingBack
+                    )
+            })
+        {
+            rollback_hosted_provider_miniport_timer_construction(index);
+        }
+    }
     let mut failures = 0u64;
     for record in hosted_provider_miniport_timer_shadows_mut().iter_mut() {
         if !record.present
@@ -21493,7 +21778,7 @@ unsafe fn rollback_hosted_provider_ndis_work_item_construction(index: usize) {
     if binding_released && allocation_released {
         *record = HostedProviderNdisWorkItemShadow::empty();
     } else {
-        record.construction_state = HostedProviderConstructionState::CompensationRequired;
+        record.construction_state = HostedProviderConstructionState::RollingBack;
     }
 }
 
@@ -21532,6 +21817,22 @@ unsafe fn clear_hosted_provider_ndis_work_item_shadows_for_instance(
     instance_index: usize,
     domain: HostedDomainIdentity,
 ) -> u64 {
+    let record_count = hosted_provider_ndis_work_item_shadows_mut().len();
+    for index in 0..record_count {
+        if hosted_provider_ndis_work_item_shadows()
+            .and_then(|records| records.get(index))
+            .is_some_and(|record| {
+                record.present
+                    && matches!(
+                        record.construction_state,
+                        HostedProviderConstructionState::Constructing
+                            | HostedProviderConstructionState::RollingBack
+                    )
+            })
+        {
+            rollback_hosted_provider_ndis_work_item_construction(index);
+        }
+    }
     let mut failures = 0u64;
     for record in hosted_provider_ndis_work_item_shadows_mut().iter_mut() {
         if !record.present
@@ -22033,7 +22334,7 @@ unsafe fn rollback_hosted_provider_ndis_miniport_block_mirror_construction(index
         }
     }
     if release_failed {
-        record.construction_state = HostedProviderConstructionState::CompensationRequired;
+        record.construction_state = HostedProviderConstructionState::RollingBack;
     } else {
         *record = HostedProviderNdisMiniportBlockMirror::empty();
     }
@@ -22444,6 +22745,22 @@ unsafe fn clear_hosted_provider_ndis_miniport_block_mirrors_for_instance(
     instance_index: usize,
     domain: HostedDomainIdentity,
 ) -> u64 {
+    let record_count = hosted_provider_ndis_miniport_block_mirrors_mut().len();
+    for index in 0..record_count {
+        if hosted_provider_ndis_miniport_block_mirrors()
+            .and_then(|records| records.get(index))
+            .is_some_and(|record| {
+                record.present
+                    && matches!(
+                        record.construction_state,
+                        HostedProviderConstructionState::Constructing
+                            | HostedProviderConstructionState::RollingBack
+                    )
+            })
+        {
+            rollback_hosted_provider_ndis_miniport_block_mirror_construction(index);
+        }
+    }
     let mut failures = 0u64;
     for record in hosted_provider_ndis_miniport_block_mirrors_mut().iter_mut() {
         if !record.present
@@ -22481,6 +22798,10 @@ unsafe fn hosted_provider_lifetime_records_reference_instance(instance_index: us
         provider_instance == instance_index || dependent_instance == instance_index
     };
     hosted_provider_domain_dependencies().is_some_and(|records| {
+        records.iter().any(|record| {
+            record.present && references(record.provider_instance, record.dependent_instance)
+        })
+    }) || hosted_provider_callback_parents().is_some_and(|records| {
         records.iter().any(|record| {
             record.present && references(record.provider_instance, record.dependent_instance)
         })
@@ -22596,30 +22917,6 @@ unsafe fn provider_marshal_emit_callback_thunk(
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
     Ok(reservation.address(provider_instance))
-}
-
-unsafe fn provider_marshal_resolve_callback_record_thunk(
-    provider_instance: usize,
-    dependent_instance: usize,
-    target: u64,
-    callback_offset: u64,
-    callback_kind: u8,
-) -> Result<u64, i32> {
-    let thunk = provider_marshal_emit_callback_thunk(
-        provider_instance,
-        dependent_instance,
-        target,
-        callback_offset,
-        callback_kind,
-    )?;
-    if thunk.existing {
-        // This path still has one conservative callback-record owner rather than a durable parent
-        // transaction. Drop the lookup acquisition so replay cannot inflate the slot lease count.
-        if !release_instance_executable_thunk_binding(thunk.binding, false) {
-            return Err(STATUS_DEVICE_NOT_READY);
-        }
-    }
-    Ok(thunk.run_va)
 }
 
 fn provider_marshal_align8(value: u64) -> Option<u64> {
@@ -23922,17 +24219,19 @@ unsafe fn provider_marshal_miniport_characteristics(
         }
         callback_index += 1;
     }
-    if callback_count > 0 && callback_count > instance_executable_thunk_available(provider_instance)
-    {
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
-    }
-
     let Some((provider_component_va, provider_exec_va)) =
         provider_marshal_alloc(state, provider_shared, layout.required_len)
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
     copy_bytes(provider_exec_va, dependent_exec_va, layout.required_len);
+    if callback_count != 0 {
+        state.callback_parent_construction_index = reserve_hosted_provider_callback_parent(
+            provider_instance,
+            dependent_index,
+            HOSTED_PROVIDER_CALLBACK_PARENT_KIND_MINIPORT,
+        )?;
+    }
 
     callback_index = 0;
     while callback_index < layout.callback_count as usize {
@@ -23941,14 +24240,21 @@ unsafe fn provider_marshal_miniport_characteristics(
         };
         let target = read_unaligned((dependent_exec_va + offset) as *const u64);
         if target != 0 {
-            let thunk_va = provider_marshal_resolve_callback_record_thunk(
+            let thunk = provider_marshal_emit_callback_thunk(
                 provider_instance,
                 dependent_index,
                 target,
                 offset,
                 HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT,
             )?;
-            write_unaligned((provider_exec_va + offset) as *mut u64, thunk_va);
+            if !retain_hosted_provider_callback_parent_binding(
+                state.callback_parent_construction_index,
+                thunk.binding,
+            ) {
+                let _ = release_instance_executable_thunk_binding(thunk.binding, true);
+                return Err(STATUS_INSUFFICIENT_RESOURCES);
+            }
+            write_unaligned((provider_exec_va + offset) as *mut u64, thunk.run_va);
         }
         callback_index += 1;
     }
@@ -24003,11 +24309,6 @@ unsafe fn provider_marshal_protocol_characteristics(
         }
         callback_index += 1;
     }
-    if callback_count > 0 && callback_count > instance_executable_thunk_available(provider_instance)
-    {
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
-    }
-
     let Some((provider_component_va, provider_exec_va)) =
         provider_marshal_alloc(state, provider_shared, layout.required_len)
     else {
@@ -24023,6 +24324,13 @@ unsafe fn provider_marshal_protocol_characteristics(
         provider_exec_va + NDIS_PROTOCOL_CHARACTERISTICS_NAME_OFFSET_X64,
         dependent_exec_va + NDIS_PROTOCOL_CHARACTERISTICS_NAME_OFFSET_X64,
     )?;
+    if callback_count != 0 {
+        state.callback_parent_construction_index = reserve_hosted_provider_callback_parent(
+            provider_instance,
+            dependent_index,
+            HOSTED_PROVIDER_CALLBACK_PARENT_KIND_PROTOCOL,
+        )?;
+    }
 
     callback_index = 0;
     while callback_index < layout.callback_count as usize {
@@ -24031,14 +24339,21 @@ unsafe fn provider_marshal_protocol_characteristics(
         };
         let target = read_unaligned((dependent_exec_va + offset) as *const u64);
         if target != 0 {
-            let thunk_va = provider_marshal_resolve_callback_record_thunk(
+            let thunk = provider_marshal_emit_callback_thunk(
                 provider_instance,
                 dependent_index,
                 target,
                 offset,
                 HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL,
             )?;
-            write_unaligned((provider_exec_va + offset) as *mut u64, thunk_va);
+            if !retain_hosted_provider_callback_parent_binding(
+                state.callback_parent_construction_index,
+                thunk.binding,
+            ) {
+                let _ = release_instance_executable_thunk_binding(thunk.binding, true);
+                return Err(STATUS_INSUFFICIENT_RESOURCES);
+            }
+            write_unaligned((provider_exec_va + offset) as *mut u64, thunk.run_va);
         }
         callback_index += 1;
     }
@@ -24069,7 +24384,17 @@ unsafe fn prepare_provider_export_marshal(
             HostedProviderArgumentMarshal::Scalar
             | HostedProviderArgumentMarshal::CallerContext => arg,
             HostedProviderArgumentMarshal::ProviderHandle => {
-                provider_marshal_provider_handle(provider_instance, dependent_index, arg)?
+                let provider_handle =
+                    provider_marshal_provider_handle(provider_instance, dependent_index, arg)?;
+                if matches!(
+                    policy.side_effect,
+                    HostedProviderExportSideEffect::NdisMiniportRegistration
+                        | HostedProviderExportSideEffect::NdisTerminateWrapper
+                        | HostedProviderExportSideEffect::NdisProtocolDeregistration
+                ) {
+                    state.callback_parent_input_provider_handle = provider_handle;
+                }
+                provider_handle
             }
             HostedProviderArgumentMarshal::CallerInDriverObject => {
                 if policy.side_effect == HostedProviderExportSideEffect::NdisInitializeWrapper {
@@ -24133,6 +24458,15 @@ unsafe fn prepare_provider_export_marshal(
                     )
                 {
                     state.ndis_initialize_wrapper_handle_exec_va =
+                        provider_shared + (provider_arg - FSD_SHARED_VADDR);
+                }
+                if policy.side_effect == HostedProviderExportSideEffect::NdisProtocolRegistration
+                    && matches!(
+                        policy.args[index],
+                        HostedProviderArgumentMarshal::CallerOutHandle
+                    )
+                {
+                    state.callback_parent_handle_exec_va =
                         provider_shared + (provider_arg - FSD_SHARED_VADDR);
                 }
                 provider_arg
@@ -24697,6 +25031,51 @@ unsafe fn complete_provider_export_marshal(
             );
         }
     }
+    if state.callback_parent_construction_index != usize::MAX {
+        let (registration_succeeded, provider_handle) = match policy.side_effect {
+            HostedProviderExportSideEffect::NdisMiniportRegistration => (
+                success && state.callback_parent_input_provider_handle != 0,
+                state.callback_parent_input_provider_handle,
+            ),
+            HostedProviderExportSideEffect::NdisProtocolRegistration => {
+                let status = if state.ndis_status_provider_exec_va == 0 {
+                    STATUS_DEVICE_NOT_READY
+                } else {
+                    read_unaligned(state.ndis_status_provider_exec_va as *const i32)
+                };
+                let handle = if state.callback_parent_handle_exec_va == 0 {
+                    0
+                } else {
+                    read_unaligned(state.callback_parent_handle_exec_va as *const u64)
+                };
+                (status == STATUS_SUCCESS && handle != 0, handle)
+            }
+            _ => (false, 0),
+        };
+        if registration_succeeded {
+            if !finish_hosted_provider_callback_parent(
+                state.callback_parent_construction_index,
+                provider_handle,
+            ) {
+                retain_hosted_provider_callback_parent_compensation(
+                    state.callback_parent_construction_index,
+                    provider_handle,
+                );
+                if policy.side_effect == HostedProviderExportSideEffect::NdisProtocolRegistration
+                    && state.ndis_status_provider_exec_va != 0
+                {
+                    write_unaligned(
+                        state.ndis_status_provider_exec_va as *mut i32,
+                        STATUS_DEVICE_NOT_READY,
+                    );
+                }
+                *result = STATUS_DEVICE_NOT_READY as u32 as u64;
+                success = false;
+            }
+        } else {
+            rollback_hosted_provider_callback_parent(state.callback_parent_construction_index);
+        }
+    }
     let mut index = 0usize;
     while index < state.copyout_count {
         let copyout = state.copyouts[index];
@@ -24778,6 +25157,7 @@ unsafe fn complete_provider_export_side_effects(
     policy: HostedProviderExportMarshalPolicy,
     state: &ProviderMarshalState,
     provider_instance: usize,
+    dependent_instance: usize,
     args: &[u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
     result: u64,
 ) -> Result<(), i32> {
@@ -24797,6 +25177,18 @@ unsafe fn complete_provider_export_side_effects(
             }
             set_hosted_provider_route_wrapper(state.ndis_route_index, provider_wrapper_handle)
         }
+        HostedProviderExportSideEffect::NdisTerminateWrapper => {
+            if retire_hosted_provider_callback_parent_by_handle(
+                provider_instance,
+                dependent_instance,
+                HOSTED_PROVIDER_CALLBACK_PARENT_KIND_MINIPORT,
+                state.callback_parent_input_provider_handle,
+            ) {
+                Ok(())
+            } else {
+                Err(STATUS_DEVICE_NOT_READY)
+            }
+        }
         HostedProviderExportSideEffect::NdisMiniportRegistration => {
             if result != STATUS_SUCCESS as u64 {
                 return Ok(());
@@ -24805,6 +25197,25 @@ unsafe fn complete_provider_export_side_effects(
         }
         HostedProviderExportSideEffect::NdisMiniportAttributes => {
             complete_hosted_provider_miniport_attributes(provider_instance, args[0])
+        }
+        HostedProviderExportSideEffect::NdisProtocolRegistration => Ok(()),
+        HostedProviderExportSideEffect::NdisProtocolDeregistration => {
+            if state.ndis_status_provider_exec_va == 0
+                || read_unaligned(state.ndis_status_provider_exec_va as *const i32)
+                    != STATUS_SUCCESS
+            {
+                return Ok(());
+            }
+            if retire_hosted_provider_callback_parent_by_handle(
+                provider_instance,
+                dependent_instance,
+                HOSTED_PROVIDER_CALLBACK_PARENT_KIND_PROTOCOL,
+                state.callback_parent_input_provider_handle,
+            ) {
+                Ok(())
+            } else {
+                Err(STATUS_DEVICE_NOT_READY)
+            }
         }
         HostedProviderExportSideEffect::NdisScatterGatherDmaInitialization => Ok(()),
         HostedProviderExportSideEffect::NdisMiniportInterruptDeregistration => Ok(()),
@@ -25694,6 +26105,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
         policy,
         &marshal_state,
         singleton.instance,
+        dependent_index,
         &args,
         result,
     ) {
@@ -25706,6 +26118,14 @@ pub(crate) unsafe fn service_hosted_provider_export(
             && result == STATUS_SUCCESS as u64
         {
             result = status as u32 as u64;
+        }
+        if policy.side_effect == HostedProviderExportSideEffect::NdisProtocolDeregistration
+            && marshal_state.ndis_status_provider_exec_va != 0
+        {
+            write_unaligned(
+                marshal_state.ndis_status_provider_exec_va as *mut i32,
+                status,
+            );
         }
     }
     complete_provider_dma_state(
@@ -38561,7 +38981,6 @@ impl HostedExecutableThunkReservation {
                 token: self.token,
                 key: self.key,
             },
-            existing: self.existing,
         }
     }
 }
@@ -38771,6 +39190,7 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
             let mut route_failures = 0u64;
             let mut dependency_failures = 0u64;
             let mut singleton_failures = 0u64;
+            shadow_failures += clear_hosted_provider_callback_parents_for_instance(i, domain);
             shadow_failures += clear_hosted_provider_pointer_allocations_for_instance(i, domain);
             shadow_failures += clear_hosted_provider_ndis_shadows_for_instance(i, domain);
             shadow_failures +=

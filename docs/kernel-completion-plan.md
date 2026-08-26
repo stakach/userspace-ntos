@@ -11962,3 +11962,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     protocol characteristics still use one conservative callback-record lease per exact key, with
     idempotent replay dropping its temporary lookup acquisition; convert those registrations to
     durable parent batches before enabling any successful-parent thunk retirement.
+
+    Characteristics callback-parent checkpoint (2026-08-26, implementation green): miniport and
+    protocol characteristics now reserve a separate heap-backed parent row before emitting their
+    first callback thunk. Every emitted exact binding transfers into that row; preparation or
+    returned registration failure exact-rolls the batch back, an incomplete provider pump retains
+    `CompensationRequired`, and successful registration publishes only with the provider's real
+    handle. Miniport batches bind to the existing wrapper handle and retire only after real
+    `NdisTerminateWrapper`. Protocol batches consume NDIS's provider-written status plus returned
+    protocol handle and retire only after a successful `NdisDeregisterProtocol`; the void x64 return
+    is not misinterpreted as registration status.
+
+    `nt-hosted-runtime` now classifies wrapper termination and protocol register/deregister as
+    explicit side effects, with focused policy validation green at `64/64`. Parent-batch cleanup is
+    resumable after local release failure, while indeterminate provider ownership remains blocked.
+    Callback-count admission no longer incorrectly requires every callback to consume a free slot;
+    exact live keys acquire leases and deduplicate through the registry. The freestanding executive
+    check remains green at the established 212-warning baseline and `git diff --check` is clean.
+
+    Review adjustment: characteristics registration and its real compensators are closed. The next
+    callback-lifetime frontier is successful timer/work-item/mirror retirement: wire timer state to
+    real `KeCancelTimer` plus DPC quiescence, release one-shot work-item ownership after its callback
+    returns, and bind miniport-block mirror retirement to the adapter's real Halt/Stop/Remove
+    sequence. Only then may those parent rows release their final thunk leases.

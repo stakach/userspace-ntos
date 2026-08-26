@@ -713,8 +713,11 @@ pub enum HostedProviderArgumentMarshal {
 pub enum HostedProviderExportSideEffect {
     None,
     NdisInitializeWrapper,
+    NdisTerminateWrapper,
     NdisMiniportRegistration,
     NdisMiniportAttributes,
+    NdisProtocolRegistration,
+    NdisProtocolDeregistration,
     NdisScatterGatherDmaInitialization,
     NdisMiniportInterruptDeregistration,
     NdisPacketFree,
@@ -1013,7 +1016,11 @@ pub fn hosted_provider_export_marshal_policy(
             ProviderHandle,
         ]),
         "NdisScheduleWorkItem" => export_policy(&[CallerInOutNdisWorkItem]),
-        "NdisTerminateWrapper" => void_export_policy(&[ProviderHandle, Scalar]),
+        "NdisTerminateWrapper" => export_policy_with_effect_and_result(
+            &[ProviderHandle, Scalar],
+            HostedProviderExportSideEffect::NdisTerminateWrapper,
+            HostedProviderExportResultSemantics::Void,
+        ),
         "NdisReadPciSlotInformation" => export_policy(&[
             ProviderHandle,
             Scalar,
@@ -1154,7 +1161,11 @@ pub fn hosted_provider_export_marshal_policy(
             void_export_policy(&[ProviderHandle, CallerInOutPacket, Scalar, Scalar])
         }
         "NdisRequest" => void_export_policy(&[CallerOutStatus, ProviderHandle, CallerInOutRequest]),
-        "NdisDeregisterProtocol" => void_export_policy(&[CallerOutStatus, ProviderHandle]),
+        "NdisDeregisterProtocol" => export_policy_with_effect_and_result(
+            &[CallerOutStatus, ProviderHandle],
+            HostedProviderExportSideEffect::NdisProtocolDeregistration,
+            HostedProviderExportResultSemantics::Void,
+        ),
         "NdisOpenAdapter" => void_export_policy(&[
             CallerOutStatus,
             CallerOutStatus,
@@ -1173,12 +1184,16 @@ pub fn hosted_provider_export_marshal_policy(
             CallerInAnsiString,
         ]),
         "NdisCloseAdapter" => void_export_policy(&[CallerOutStatus, ProviderHandle]),
-        "NdisRegisterProtocol" => void_export_policy(&[
-            CallerOutStatus,
-            CallerOutHandle,
-            CallerInProtocolCharacteristics { length_arg: 3 },
-            Scalar,
-        ]),
+        "NdisRegisterProtocol" => export_policy_with_effect_and_result(
+            &[
+                CallerOutStatus,
+                CallerOutHandle,
+                CallerInProtocolCharacteristics { length_arg: 3 },
+                Scalar,
+            ],
+            HostedProviderExportSideEffect::NdisProtocolRegistration,
+            HostedProviderExportResultSemantics::Void,
+        ),
         "NdisFreePacket" => export_policy_with_effect_and_result(
             &[CallerInOutPacket],
             HostedProviderExportSideEffect::NdisPacketFree,
@@ -2382,6 +2397,31 @@ mod tests {
         ] {
             let policy = hosted_provider_export_marshal_policy("ndis.sys", export)
                 .unwrap_or_else(|| panic!("missing policy for {}", export));
+            assert_eq!(
+                policy.result_semantics,
+                HostedProviderExportResultSemantics::Void
+            );
+        }
+    }
+
+    #[test]
+    fn ndis_registration_lifetime_policies_have_real_compensating_side_effects() {
+        for (export, effect) in [
+            (
+                "NdisTerminateWrapper",
+                HostedProviderExportSideEffect::NdisTerminateWrapper,
+            ),
+            (
+                "NdisRegisterProtocol",
+                HostedProviderExportSideEffect::NdisProtocolRegistration,
+            ),
+            (
+                "NdisDeregisterProtocol",
+                HostedProviderExportSideEffect::NdisProtocolDeregistration,
+            ),
+        ] {
+            let policy = hosted_provider_export_marshal_policy("ndis.sys", export).unwrap();
+            assert_eq!(policy.side_effect, effect);
             assert_eq!(
                 policy.result_semantics,
                 HostedProviderExportResultSemantics::Void
