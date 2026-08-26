@@ -11616,7 +11616,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Manager and DMA owners with the same generation and reject cross-generation access/revocation;
     provider route/callback/unload lifetime and ordered PnP removal remain after that boundary.
 
-    Exact Resource Manager and DMA owner checkpoint (2026-08-26, accepted locally):
+    Exact Resource Manager and DMA owner checkpoint (2026-08-26, accepted):
     `ResourceOwner` and `DmaOwner` now include the registered driver-host generation cookie in
     addition to the host/domain id and device id. The executive constructs both owners from the
     exact `HostedDeviceBinding::projection_domain`, so every assignment, MMIO map, interrupt,
@@ -11630,15 +11630,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `nt-wdf-dma` at `3/3`, `nt-wdf-runtime` at `8/8`, the x86-64 freestanding shared KMDF check,
     all 11 affected freestanding proof components, formatting and diff checks, and the executive
     check at the established 212-warning baseline. The component sweep also repaired four stale
-    `build_memory_interrupt_list` calls by supplying their explicit root-bus number. A serialized
-    desktop gate remains required. Review adjustment: after that proof, split provider publication
-    tokens from exact provider/dependent domain identities, generation-own callback/import records,
-    and make provider unload and domain unregister checked before starting ordered PnP removal.
+    `build_memory_interrupt_list` calls by supplying their explicit root-bus number. Serialized
+    proof `.tmp/run-desktop-exact-resource-dma-owner-retry-20260826.log` reaches genuine Explorer,
+    paints all `480000/480000` pixels with at least 32 non-background colours, reports zero VSpace
+    unmap failures and zero pool corruption, passes all `293/293` executive gates, and emits the
+    sentinel. Review adjustment: next split provider publication tokens from exact
+    provider/dependent domain identities, generation-own callback/import records, and make provider
+    unload and domain unregister checked before starting ordered PnP removal.
 
-    Track one separate rust-micro correctness item after this lifetime tranche: device-frame mapping
-    cache attributes are still marked TODO in `rust-micro/src/untyped.rs`. Define and prove the x86
-    MMIO/device-memory cache policy rather than relying on comments that describe all device frames
-    as uncacheable.
+    Track two separate rust-micro correctness items after this lifetime tranche. First,
+    device-frame mapping cache attributes are still marked TODO in `rust-micro/src/untyped.rs`;
+    define and prove the x86 MMIO/device-memory cache policy rather than relying on comments that
+    describe all device frames as uncacheable. Second, the first serialized owner proof
+    `.tmp/run-desktop-exact-resource-dma-owner-20260826.log` exposed a non-reproduced SMP fault-entry
+    anomaly after genuine Explorer launch: a late kbswitch load fault was attributed to root-task
+    `tcb=1`, with a recorded RIP in the executive image's non-code region, and suspended the root
+    task without reaching the gate. The clean retry passed, but fault ownership must be derived from
+    the CPU's exact active user thread and covered by a stress test so a stale user-entry owner can
+    never suspend the executive or another domain.
 
     After that boundary is live, migrate the standalone hal, power, PnP, async, MMIO, and DMA
     component harnesses to `CompletionOwnerClaim` plus `CompletionUnwindCursor`, including their
