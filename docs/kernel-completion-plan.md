@@ -11792,3 +11792,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     The freestanding executive release check remains green at the established 212-warning baseline
     and `git diff --check` is clean. Packet/MDL, scatter/gather, interrupt, timer, work-item,
     miniport-mirror, and executable-thunk construction transactions remain open.
+
+    Provider packet/MDL projection construction checkpoint (2026-08-26, implementation green;
+    serialized proof pending): provider routes, packet projections, and MDL projections now share an
+    explicit `Constructing` / `RollingBack` / `Published` lifecycle. Normal lookup accepts only a
+    published row, an active same-key construction returns `DEVICE_BUSY`, and only an exact-owner
+    rolling-back row can be drained and reused. Both directions of the packet and MDL projection
+    bridge reserve a durable row before their first bridge allocation, attach each allocation as it
+    is acquired, and retain the row when release cannot complete.
+
+    Packet construction begins before the provider MDL chain is walked and remains private through
+    buffer-chain and initial scatter/gather synchronization. The packet row temporarily owns only
+    the child MDL rows created by that construction; a failed later step exact-releases those child
+    rows, while publication drops the temporary construction leases without changing the now-valid
+    independent MDL shadows. New SG storage is recorded before its guest pointer is published, and
+    removal or replacement leaves the prior pointer valid if old-storage release fails. Instance
+    teardown drains constructing and rolling-back rows as well as published shadows. The
+    freestanding executive release check remains green at the established 212-warning baseline and
+    `git diff --check` is clean.
+
+    Review adjustment: the ordinary two-way packet/MDL projection constructors and their initial SG
+    publication are closed. Provider-returned `NdisAllocatePacket` / `NdisAllocateBuffer` completion
+    remains open because rollback must issue the allocator's real compensating NDIS operation rather
+    than reinterpret provider-owned objects as raw pool allocations. Packet resynchronization that
+    creates new MDL shadows also needs a short-lived transaction around an already-published packet.
+    Next make provider pre-dispatch marshal state own those allocation transactions, then convert
+    interrupt, timer, work-item, and miniport-mirror construction. Executable thunk slots and callback
+    rows still require generation-bearing exact-owner retirement and reuse before those callback-rich
+    constructors can be closed.

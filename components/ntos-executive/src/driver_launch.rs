@@ -14553,10 +14553,17 @@ impl HostedProviderDomainDependency {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HostedProviderConstructionState {
+    Constructing,
+    RollingBack,
+    Published,
+}
+
 #[derive(Clone, Copy)]
 struct HostedProviderDispatchRoute {
     used: bool,
-    constructing: bool,
+    construction_state: HostedProviderConstructionState,
     retiring: bool,
     owner: HostedProviderObjectOwner,
     release_progress: HostedProviderReleaseProgress,
@@ -14577,7 +14584,7 @@ impl HostedProviderDispatchRoute {
     const fn empty() -> Self {
         Self {
             used: false,
-            constructing: false,
+            construction_state: HostedProviderConstructionState::Published,
             retiring: false,
             owner: EMPTY_HOSTED_PROVIDER_OBJECT_OWNER,
             release_progress: HostedProviderReleaseProgress::new(0),
@@ -14603,7 +14610,7 @@ impl HostedProviderDispatchRoute {
 
     fn add_device_ready(self) -> bool {
         self.used
-            && !self.constructing
+            && self.construction_state == HostedProviderConstructionState::Published
             && !self.retiring
             && self.provider_instance != self.dependent_instance
             && self.dependent_domain.domain_id != nt_io_manager::HostedDomainId::NULL
@@ -14757,6 +14764,7 @@ impl ProviderMarshalState {
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct HostedProviderNdisPacketShadow {
     present: bool,
+    construction_state: HostedProviderConstructionState,
     owner: HostedProviderObjectOwner,
     provider_instance: usize,
     dependent_instance: usize,
@@ -14768,12 +14776,15 @@ struct HostedProviderNdisPacketShadow {
     dependent_sg_component_va: u64,
     provider_sg_component_va: u64,
     dependent_sg_component_owned_by_bridge: bool,
+    construction_buffer_component_vas: [u64; NDIS_PACKET_BUFFER_CHAIN_MAX as usize],
+    construction_buffer_count: u8,
 }
 
 impl HostedProviderNdisPacketShadow {
     const fn empty() -> Self {
         Self {
             present: false,
+            construction_state: HostedProviderConstructionState::Published,
             owner: EMPTY_HOSTED_PROVIDER_OBJECT_OWNER,
             provider_instance: 0,
             dependent_instance: 0,
@@ -14785,6 +14796,8 @@ impl HostedProviderNdisPacketShadow {
             dependent_sg_component_va: 0,
             provider_sg_component_va: 0,
             dependent_sg_component_owned_by_bridge: false,
+            construction_buffer_component_vas: [0; NDIS_PACKET_BUFFER_CHAIN_MAX as usize],
+            construction_buffer_count: 0,
         }
     }
 }
@@ -14792,6 +14805,7 @@ impl HostedProviderNdisPacketShadow {
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct HostedProviderNdisBufferShadow {
     present: bool,
+    construction_state: HostedProviderConstructionState,
     owner: HostedProviderObjectOwner,
     provider_instance: usize,
     dependent_instance: usize,
@@ -14810,6 +14824,7 @@ impl HostedProviderNdisBufferShadow {
     const fn empty() -> Self {
         Self {
             present: false,
+            construction_state: HostedProviderConstructionState::Published,
             owner: EMPTY_HOSTED_PROVIDER_OBJECT_OWNER,
             provider_instance: 0,
             dependent_instance: 0,
@@ -16413,7 +16428,10 @@ unsafe fn hosted_provider_dispatch_routes() -> Option<&'static Vec<HostedProvide
 }
 
 fn hosted_provider_dispatch_route_is_live(route: HostedProviderDispatchRoute) -> bool {
-    if !route.used || route.constructing || route.retiring {
+    if !route.used
+        || route.construction_state != HostedProviderConstructionState::Published
+        || route.retiring
+    {
         return false;
     }
     let dependent_live = instance(route.dependent_instance).and_then(instance_domain_identity);
@@ -16603,7 +16621,13 @@ unsafe fn release_hosted_provider_dispatch_route_allocations(
 unsafe fn abort_hosted_provider_dispatch_route_construction(
     route: &mut HostedProviderDispatchRoute,
 ) -> bool {
-    if !route.used || !route.constructing {
+    if !route.used
+        || !matches!(
+            route.construction_state,
+            HostedProviderConstructionState::Constructing
+                | HostedProviderConstructionState::RollingBack
+        )
+    {
         return false;
     }
     if route.provider_driver_object != 0 {
@@ -16632,6 +16656,9 @@ unsafe fn retain_or_clear_failed_hosted_provider_dispatch_route(
     status: i32,
 ) -> i32 {
     let routes = hosted_provider_dispatch_routes_mut();
+    if let Some(route) = routes.get_mut(route_index) {
+        route.construction_state = HostedProviderConstructionState::RollingBack;
+    }
     if routes
         .get_mut(route_index)
         .is_some_and(|route| abort_hosted_provider_dispatch_route_construction(route))
@@ -16645,7 +16672,7 @@ unsafe fn teardown_hosted_provider_dispatch_route(
     route: &mut HostedProviderDispatchRoute,
 ) -> Result<(), nt_status::NtStatus> {
     if !route.used
-        || route.constructing
+        || route.construction_state != HostedProviderConstructionState::Published
         || !route.retiring
         || !route.owner.pair_matches(
             route.provider_domain.domain_id.raw(),
@@ -16710,7 +16737,7 @@ unsafe fn clear_hosted_provider_dispatch_routes_for_instance(
             && (route.dependent_instance == instance_index
                 || route.provider_instance == instance_index)
         {
-            if route.constructing {
+            if route.construction_state != HostedProviderConstructionState::Published {
                 if !hosted_provider_object_owner_matches_instance(
                     route.owner,
                     route.provider_instance,
@@ -16851,9 +16878,12 @@ unsafe fn register_hosted_provider_driver_object_shadow(
             && route.provider_publication_cookie == provider_publication_cookie
             && route.dependent_driver_object == dependent_driver_object
             && route.dependent_driver_id == dependent_inst.driver_id;
-        if route.constructing {
+        if route.construction_state != HostedProviderConstructionState::Published {
             if !exact {
                 return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION.raw());
+            }
+            if route.construction_state == HostedProviderConstructionState::Constructing {
+                return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
             }
             let routes = hosted_provider_dispatch_routes_mut();
             if !abort_hosted_provider_dispatch_route_construction(&mut routes[index]) {
@@ -16878,7 +16908,7 @@ unsafe fn register_hosted_provider_driver_object_shadow(
     }
     let route = HostedProviderDispatchRoute {
         used: true,
-        constructing: true,
+        construction_state: HostedProviderConstructionState::Constructing,
         retiring: false,
         owner,
         release_progress: HostedProviderReleaseProgress::new(0),
@@ -16956,12 +16986,12 @@ unsafe fn register_hosted_provider_driver_object_shadow(
     }
     let published = {
         let route = &mut hosted_provider_dispatch_routes_mut()[route_index];
-        if route.constructing
+        if route.construction_state == HostedProviderConstructionState::Constructing
             && route.owner == owner
             && route.provider_driver_object == provider_driver_object
             && route.provider_driver_extension == provider_driver_extension
         {
-            route.constructing = false;
+            route.construction_state = HostedProviderConstructionState::Published;
             true
         } else {
             false
@@ -17349,6 +17379,7 @@ unsafe fn find_hosted_provider_ndis_packet_shadow_by_dependent(
     };
     for (index, record) in records.iter().copied().enumerate() {
         if record.present
+            && record.construction_state == HostedProviderConstructionState::Published
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
             && hosted_provider_object_owner_is_live(
@@ -17377,6 +17408,7 @@ unsafe fn find_hosted_provider_ndis_packet_shadow_by_provider_for_dependent(
     };
     for (index, record) in records.iter().copied().enumerate() {
         if record.present
+            && record.construction_state == HostedProviderConstructionState::Published
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
             && hosted_provider_object_owner_is_live(
@@ -17393,6 +17425,7 @@ unsafe fn find_hosted_provider_ndis_packet_shadow_by_provider_for_dependent(
 }
 
 unsafe fn update_hosted_provider_ndis_packet_sg_shadow(
+    owner: HostedProviderObjectOwner,
     provider_instance: usize,
     dependent_instance: usize,
     dependent_component_va: u64,
@@ -17403,6 +17436,7 @@ unsafe fn update_hosted_provider_ndis_packet_sg_shadow(
     let records = hosted_provider_ndis_packet_shadows_mut();
     for record in records.iter_mut() {
         if record.present
+            && record.owner == owner
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
             && hosted_provider_object_owner_is_live(
@@ -17449,6 +17483,29 @@ unsafe fn release_hosted_provider_ndis_packet_shadow_record(
         return false;
     }
     let mut complete = true;
+    let child_count = record.construction_buffer_count as usize;
+    for index in 0..child_count {
+        let dependent_component_va = record.construction_buffer_component_vas[index];
+        if dependent_component_va == 0 {
+            continue;
+        }
+        if release_hosted_provider_ndis_buffer_shadow_by_dependent_exact(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+            dependent_component_va,
+        ) {
+            record.construction_buffer_component_vas[index] = 0;
+        } else {
+            complete = false;
+        }
+    }
+    if record.construction_buffer_component_vas[..child_count]
+        .iter()
+        .all(|component_va| *component_va == 0)
+    {
+        record.construction_buffer_count = 0;
+    }
     if record.dependent_component_owned_by_bridge {
         if instance(record.dependent_instance).is_some_and(|inst| {
             release_hosted_instance_pool_allocation_if_live(inst, record.dependent_component_va)
@@ -17524,6 +17581,7 @@ unsafe fn release_hosted_provider_ndis_packet_shadow_by_dependent(
     let records = hosted_provider_ndis_packet_shadows_mut();
     for record in records.iter_mut() {
         if record.present
+            && record.construction_state == HostedProviderConstructionState::Published
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
             && hosted_provider_object_owner_is_live(
@@ -17557,6 +17615,7 @@ unsafe fn find_hosted_provider_ndis_buffer_shadow_by_dependent(
     };
     for (index, record) in records.iter().copied().enumerate() {
         if record.present
+            && record.construction_state == HostedProviderConstructionState::Published
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
             && hosted_provider_object_owner_is_live(
@@ -17585,6 +17644,7 @@ unsafe fn find_hosted_provider_ndis_buffer_shadow_by_provider_for_dependent(
     };
     for (index, record) in records.iter().copied().enumerate() {
         if record.present
+            && record.construction_state == HostedProviderConstructionState::Published
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
             && hosted_provider_object_owner_is_live(
@@ -17620,6 +17680,7 @@ unsafe fn provider_receive_buffer_exec_va(
     };
     for shadow in records.iter().copied() {
         if shadow.present
+            && shadow.construction_state == HostedProviderConstructionState::Published
             && shadow.provider_instance == provider_instance
             && hosted_provider_object_owner_is_live(
                 shadow.owner,
@@ -17706,6 +17767,253 @@ unsafe fn release_hosted_provider_ndis_buffer_shadow_record(
         dependent_data_component_va
     );
     complete
+}
+
+unsafe fn release_hosted_provider_ndis_buffer_shadow_by_dependent_exact(
+    owner: HostedProviderObjectOwner,
+    provider_instance: usize,
+    dependent_instance: usize,
+    dependent_component_va: u64,
+) -> bool {
+    if dependent_component_va == 0 {
+        return false;
+    }
+    let records = hosted_provider_ndis_buffer_shadows_mut();
+    for record in records.iter_mut() {
+        if record.present
+            && record.owner == owner
+            && record.provider_instance == provider_instance
+            && record.dependent_instance == dependent_instance
+            && record.dependent_component_va == dependent_component_va
+        {
+            if !release_hosted_provider_ndis_buffer_shadow_record(record) {
+                return false;
+            }
+            *record = HostedProviderNdisBufferShadow::empty();
+            return true;
+        }
+    }
+    false
+}
+
+unsafe fn reserve_hosted_provider_ndis_packet_construction(
+    mut shadow: HostedProviderNdisPacketShadow,
+) -> Result<usize, i32> {
+    if shadow.provider_instance == shadow.dependent_instance
+        || shadow.provider_component_va == 0 && shadow.dependent_component_va == 0
+        || shadow.bytes < NDIS_PACKET_MIN_LEN_X64
+        || shadow.bytes > NDIS_PACKET_MAX_SHADOW_LEN_X64
+        || !hosted_provider_object_owner_is_live(
+            shadow.owner,
+            shadow.provider_instance,
+            shadow.dependent_instance,
+        )
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    shadow.present = true;
+    shadow.construction_state = HostedProviderConstructionState::Constructing;
+    let records = hosted_provider_ndis_packet_shadows_mut();
+    for index in 0..records.len() {
+        let record = records[index];
+        let key_collision = record.present
+            && record.provider_instance == shadow.provider_instance
+            && record.dependent_instance == shadow.dependent_instance
+            && ((shadow.provider_component_va != 0
+                && record.provider_component_va == shadow.provider_component_va)
+                || (shadow.dependent_component_va != 0
+                    && record.dependent_component_va == shadow.dependent_component_va));
+        if !key_collision {
+            continue;
+        }
+        if record.owner != shadow.owner
+            || record.construction_state == HostedProviderConstructionState::Published
+        {
+            return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION.raw());
+        }
+        if record.construction_state == HostedProviderConstructionState::Constructing {
+            return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
+        }
+        if !release_hosted_provider_ndis_packet_shadow_record(&mut records[index]) {
+            return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
+        }
+        records[index] = shadow;
+        return Ok(index);
+    }
+    if let Some(index) = records.iter().position(|record| !record.present) {
+        records[index] = shadow;
+        return Ok(index);
+    }
+    records
+        .try_reserve(1)
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    records.push(shadow);
+    Ok(records.len() - 1)
+}
+
+unsafe fn hosted_provider_ndis_packet_construction_mut(
+    index: usize,
+    owner: HostedProviderObjectOwner,
+) -> Option<&'static mut HostedProviderNdisPacketShadow> {
+    hosted_provider_ndis_packet_shadows_mut()
+        .get_mut(index)
+        .filter(|record| {
+            record.present
+                && record.construction_state == HostedProviderConstructionState::Constructing
+                && record.owner == owner
+        })
+}
+
+unsafe fn attach_hosted_provider_ndis_packet_construction_buffer(
+    index: usize,
+    owner: HostedProviderObjectOwner,
+    dependent_component_va: u64,
+) -> bool {
+    let Some(record) = hosted_provider_ndis_packet_construction_mut(index, owner) else {
+        return false;
+    };
+    if dependent_component_va == 0
+        || record.construction_buffer_count as usize
+            >= record.construction_buffer_component_vas.len()
+    {
+        return false;
+    }
+    let child_index = record.construction_buffer_count as usize;
+    record.construction_buffer_component_vas[child_index] = dependent_component_va;
+    record.construction_buffer_count += 1;
+    true
+}
+
+unsafe fn retain_or_clear_failed_hosted_provider_ndis_packet_construction(
+    index: usize,
+    status: i32,
+) -> i32 {
+    let records = hosted_provider_ndis_packet_shadows_mut();
+    if let Some(record) = records.get_mut(index) {
+        record.construction_state = HostedProviderConstructionState::RollingBack;
+    }
+    if records
+        .get_mut(index)
+        .is_some_and(|record| release_hosted_provider_ndis_packet_shadow_record(record))
+    {
+        records[index] = HostedProviderNdisPacketShadow::empty();
+    }
+    status
+}
+
+unsafe fn finish_hosted_provider_ndis_packet_construction(
+    index: usize,
+    owner: HostedProviderObjectOwner,
+) -> Option<HostedProviderNdisPacketShadow> {
+    let record = hosted_provider_ndis_packet_construction_mut(index, owner)?;
+    if record.provider_component_va == 0 || record.dependent_component_va == 0 {
+        return None;
+    }
+    record.construction_buffer_component_vas = [0; NDIS_PACKET_BUFFER_CHAIN_MAX as usize];
+    record.construction_buffer_count = 0;
+    record.construction_state = HostedProviderConstructionState::Published;
+    Some(*record)
+}
+
+unsafe fn reserve_hosted_provider_ndis_buffer_construction(
+    mut shadow: HostedProviderNdisBufferShadow,
+) -> Result<usize, i32> {
+    if shadow.provider_instance == shadow.dependent_instance
+        || shadow.provider_component_va == 0 && shadow.dependent_component_va == 0
+        || shadow.bytes == 0
+        || shadow.bytes > u32::MAX as u64
+        || !hosted_provider_object_owner_is_live(
+            shadow.owner,
+            shadow.provider_instance,
+            shadow.dependent_instance,
+        )
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    shadow.present = true;
+    shadow.construction_state = HostedProviderConstructionState::Constructing;
+    let records = hosted_provider_ndis_buffer_shadows_mut();
+    for index in 0..records.len() {
+        let record = records[index];
+        let key_collision = record.present
+            && record.provider_instance == shadow.provider_instance
+            && record.dependent_instance == shadow.dependent_instance
+            && ((shadow.provider_component_va != 0
+                && record.provider_component_va == shadow.provider_component_va)
+                || (shadow.dependent_component_va != 0
+                    && record.dependent_component_va == shadow.dependent_component_va));
+        if !key_collision {
+            continue;
+        }
+        if record.owner != shadow.owner
+            || record.construction_state == HostedProviderConstructionState::Published
+        {
+            return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION.raw());
+        }
+        if record.construction_state == HostedProviderConstructionState::Constructing {
+            return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
+        }
+        if !release_hosted_provider_ndis_buffer_shadow_record(&mut records[index]) {
+            return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
+        }
+        records[index] = shadow;
+        return Ok(index);
+    }
+    if let Some(index) = records.iter().position(|record| !record.present) {
+        records[index] = shadow;
+        return Ok(index);
+    }
+    records
+        .try_reserve(1)
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    records.push(shadow);
+    Ok(records.len() - 1)
+}
+
+unsafe fn hosted_provider_ndis_buffer_construction_mut(
+    index: usize,
+    owner: HostedProviderObjectOwner,
+) -> Option<&'static mut HostedProviderNdisBufferShadow> {
+    hosted_provider_ndis_buffer_shadows_mut()
+        .get_mut(index)
+        .filter(|record| {
+            record.present
+                && record.construction_state == HostedProviderConstructionState::Constructing
+                && record.owner == owner
+        })
+}
+
+unsafe fn retain_or_clear_failed_hosted_provider_ndis_buffer_construction(
+    index: usize,
+    status: i32,
+) -> i32 {
+    let records = hosted_provider_ndis_buffer_shadows_mut();
+    if let Some(record) = records.get_mut(index) {
+        record.construction_state = HostedProviderConstructionState::RollingBack;
+    }
+    if records
+        .get_mut(index)
+        .is_some_and(|record| release_hosted_provider_ndis_buffer_shadow_record(record))
+    {
+        records[index] = HostedProviderNdisBufferShadow::empty();
+    }
+    status
+}
+
+unsafe fn finish_hosted_provider_ndis_buffer_construction(
+    index: usize,
+    owner: HostedProviderObjectOwner,
+) -> Option<HostedProviderNdisBufferShadow> {
+    let record = hosted_provider_ndis_buffer_construction_mut(index, owner)?;
+    if record.provider_component_va == 0
+        || record.dependent_component_va == 0
+        || record.provider_data_component_va == 0
+        || record.dependent_data_component_va == 0
+    {
+        return None;
+    }
+    record.construction_state = HostedProviderConstructionState::Published;
+    Some(*record)
 }
 
 unsafe fn register_hosted_provider_ndis_buffer_shadow(
@@ -17854,7 +18162,7 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_dependent_from_provider(
     dependent_instance: usize,
     dependent_inst: DriverInstance,
     provider_component_va: u64,
-) -> Result<HostedProviderNdisBufferShadow, i32> {
+) -> Result<(HostedProviderNdisBufferShadow, bool), i32> {
     let owner = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
         .ok_or(STATUS_DEVICE_NOT_READY)?;
     if let Some((_index, shadow)) =
@@ -17864,7 +18172,7 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_dependent_from_provider(
             provider_component_va,
         )
     {
-        return Ok(shadow);
+        return Ok((shadow, false));
     }
     let Some(provider_mdl_exec) = component_to_exec_va_for_instance(
         provider_instance,
@@ -17899,19 +18207,63 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_dependent_from_provider(
         HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_INVALID_PARAMETER);
     };
+    let construction_index =
+        reserve_hosted_provider_ndis_buffer_construction(HostedProviderNdisBufferShadow {
+            present: true,
+            construction_state: HostedProviderConstructionState::Constructing,
+            owner,
+            provider_instance,
+            dependent_instance,
+            dependent_component_va: 0,
+            provider_component_va,
+            dependent_data_component_va: if dma_data_exec.is_some() {
+                provider_data_component_va
+            } else {
+                0
+            },
+            provider_data_component_va,
+            bytes,
+            provider_component_owned_by_bridge: false,
+            provider_data_component_owned_by_bridge: false,
+            dependent_component_owned_by_bridge: false,
+            dependent_data_component_owned_by_bridge: false,
+        })?;
     let Some(dependent_component_va) =
         hosted_instance_pool_alloc(dependent_inst, nt_mdl::MDL_SIZE as u64)
     else {
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
+        return Err(
+            retain_or_clear_failed_hosted_provider_ndis_buffer_construction(
+                construction_index,
+                STATUS_INSUFFICIENT_RESOURCES,
+            ),
+        );
     };
+    {
+        let Some(record) = hosted_provider_ndis_buffer_construction_mut(construction_index, owner)
+        else {
+            return Err(STATUS_DEVICE_NOT_READY);
+        };
+        record.dependent_component_va = dependent_component_va;
+        record.dependent_component_owned_by_bridge = true;
+    }
     let (dependent_data_component_va, dependent_data_owned_by_bridge) = if dma_data_exec.is_some() {
         (provider_data_component_va, false)
     } else {
         let Some(dependent_data_component_va) = hosted_instance_pool_alloc(dependent_inst, bytes)
         else {
-            hosted_instance_pool_free(dependent_inst, dependent_component_va);
-            return Err(STATUS_INSUFFICIENT_RESOURCES);
+            return Err(
+                retain_or_clear_failed_hosted_provider_ndis_buffer_construction(
+                    construction_index,
+                    STATUS_INSUFFICIENT_RESOURCES,
+                ),
+            );
         };
+        let Some(record) = hosted_provider_ndis_buffer_construction_mut(construction_index, owner)
+        else {
+            return Err(STATUS_DEVICE_NOT_READY);
+        };
+        record.dependent_data_component_va = dependent_data_component_va;
+        record.dependent_data_component_owned_by_bridge = true;
         (dependent_data_component_va, true)
     };
     let Some(dependent_mdl_exec) = component_to_exec_va_for_instance(
@@ -17920,12 +18272,13 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_dependent_from_provider(
         dependent_component_va,
         nt_mdl::MDL_SIZE as u64,
     ) else {
-        if dependent_data_owned_by_bridge {
-            hosted_instance_pool_free(dependent_inst, dependent_data_component_va);
-        }
-        hosted_instance_pool_free(dependent_inst, dependent_component_va);
         HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(
+            retain_or_clear_failed_hosted_provider_ndis_buffer_construction(
+                construction_index,
+                STATUS_INVALID_PARAMETER,
+            ),
+        );
     };
     if dependent_data_owned_by_bridge {
         let Some(dependent_data_exec) = component_to_exec_va_for_instance(
@@ -17934,37 +18287,25 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_dependent_from_provider(
             dependent_data_component_va,
             bytes,
         ) else {
-            hosted_instance_pool_free(dependent_inst, dependent_data_component_va);
-            hosted_instance_pool_free(dependent_inst, dependent_component_va);
             HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-            return Err(STATUS_INVALID_PARAMETER);
+            return Err(
+                retain_or_clear_failed_hosted_provider_ndis_buffer_construction(
+                    construction_index,
+                    STATUS_INVALID_PARAMETER,
+                ),
+            );
         };
         copy_bytes(dependent_data_exec, provider_data_exec, bytes);
     }
     write_ndis_mdl(dependent_mdl_exec, dependent_data_component_va, bytes, 0);
-    let shadow = HostedProviderNdisBufferShadow {
-        present: true,
-        owner,
-        provider_instance,
-        dependent_instance,
-        dependent_component_va,
-        provider_component_va,
-        dependent_data_component_va,
-        provider_data_component_va,
-        bytes,
-        provider_component_owned_by_bridge: false,
-        provider_data_component_owned_by_bridge: false,
-        dependent_component_owned_by_bridge: true,
-        dependent_data_component_owned_by_bridge: dependent_data_owned_by_bridge,
-    };
-    if !register_hosted_provider_ndis_buffer_shadow(shadow) {
-        if dependent_data_owned_by_bridge {
-            hosted_instance_pool_free(dependent_inst, dependent_data_component_va);
-        }
-        hosted_instance_pool_free(dependent_inst, dependent_component_va);
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
-    }
-    Ok(shadow)
+    finish_hosted_provider_ndis_buffer_construction(construction_index, owner)
+        .map(|shadow| (shadow, true))
+        .ok_or_else(|| {
+            retain_or_clear_failed_hosted_provider_ndis_buffer_construction(
+                construction_index,
+                STATUS_DEVICE_NOT_READY,
+            )
+        })
 }
 
 unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_provider_from_dependent(
@@ -17973,7 +18314,7 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_provider_from_dependent(
     dependent_instance: usize,
     dependent_inst: DriverInstance,
     dependent_component_va: u64,
-) -> Result<HostedProviderNdisBufferShadow, i32> {
+) -> Result<(HostedProviderNdisBufferShadow, bool), i32> {
     let owner = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
         .ok_or(STATUS_DEVICE_NOT_READY)?;
     if let Some((_index, shadow)) = find_hosted_provider_ndis_buffer_shadow_by_dependent(
@@ -17981,7 +18322,7 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_provider_from_dependent(
         dependent_instance,
         dependent_component_va,
     ) {
-        return Ok(shadow);
+        return Ok((shadow, false));
     }
     let Some(dependent_mdl_exec) = component_to_exec_va_for_instance(
         dependent_instance,
@@ -18016,19 +18357,63 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_provider_from_dependent(
         HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_INVALID_PARAMETER);
     };
+    let construction_index =
+        reserve_hosted_provider_ndis_buffer_construction(HostedProviderNdisBufferShadow {
+            present: true,
+            construction_state: HostedProviderConstructionState::Constructing,
+            owner,
+            provider_instance,
+            dependent_instance,
+            dependent_component_va,
+            provider_component_va: 0,
+            dependent_data_component_va,
+            provider_data_component_va: if dma_data_exec.is_some() {
+                dependent_data_component_va
+            } else {
+                0
+            },
+            bytes,
+            provider_component_owned_by_bridge: false,
+            provider_data_component_owned_by_bridge: false,
+            dependent_component_owned_by_bridge: false,
+            dependent_data_component_owned_by_bridge: false,
+        })?;
     let Some(provider_component_va) =
         hosted_instance_pool_alloc(provider_inst, nt_mdl::MDL_SIZE as u64)
     else {
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
+        return Err(
+            retain_or_clear_failed_hosted_provider_ndis_buffer_construction(
+                construction_index,
+                STATUS_INSUFFICIENT_RESOURCES,
+            ),
+        );
     };
+    {
+        let Some(record) = hosted_provider_ndis_buffer_construction_mut(construction_index, owner)
+        else {
+            return Err(STATUS_DEVICE_NOT_READY);
+        };
+        record.provider_component_va = provider_component_va;
+        record.provider_component_owned_by_bridge = true;
+    }
     let (provider_data_component_va, provider_data_owned_by_bridge) = if dma_data_exec.is_some() {
         (dependent_data_component_va, false)
     } else {
         let Some(provider_data_component_va) = hosted_instance_pool_alloc(provider_inst, bytes)
         else {
-            hosted_instance_pool_free(provider_inst, provider_component_va);
-            return Err(STATUS_INSUFFICIENT_RESOURCES);
+            return Err(
+                retain_or_clear_failed_hosted_provider_ndis_buffer_construction(
+                    construction_index,
+                    STATUS_INSUFFICIENT_RESOURCES,
+                ),
+            );
         };
+        let Some(record) = hosted_provider_ndis_buffer_construction_mut(construction_index, owner)
+        else {
+            return Err(STATUS_DEVICE_NOT_READY);
+        };
+        record.provider_data_component_va = provider_data_component_va;
+        record.provider_data_component_owned_by_bridge = true;
         (provider_data_component_va, true)
     };
     let Some(provider_mdl_exec) = component_to_exec_va_for_instance(
@@ -18037,12 +18422,13 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_provider_from_dependent(
         provider_component_va,
         nt_mdl::MDL_SIZE as u64,
     ) else {
-        if provider_data_owned_by_bridge {
-            hosted_instance_pool_free(provider_inst, provider_data_component_va);
-        }
-        hosted_instance_pool_free(provider_inst, provider_component_va);
         HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(
+            retain_or_clear_failed_hosted_provider_ndis_buffer_construction(
+                construction_index,
+                STATUS_INVALID_PARAMETER,
+            ),
+        );
     };
     if provider_data_owned_by_bridge {
         let Some(provider_data_exec) = component_to_exec_va_for_instance(
@@ -18051,37 +18437,25 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_provider_from_dependent(
             provider_data_component_va,
             bytes,
         ) else {
-            hosted_instance_pool_free(provider_inst, provider_data_component_va);
-            hosted_instance_pool_free(provider_inst, provider_component_va);
             HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-            return Err(STATUS_INVALID_PARAMETER);
+            return Err(
+                retain_or_clear_failed_hosted_provider_ndis_buffer_construction(
+                    construction_index,
+                    STATUS_INVALID_PARAMETER,
+                ),
+            );
         };
         copy_bytes(provider_data_exec, dependent_data_exec, bytes);
     }
     write_ndis_mdl(provider_mdl_exec, provider_data_component_va, bytes, 0);
-    let shadow = HostedProviderNdisBufferShadow {
-        present: true,
-        owner,
-        provider_instance,
-        dependent_instance,
-        dependent_component_va,
-        provider_component_va,
-        dependent_data_component_va,
-        provider_data_component_va,
-        bytes,
-        provider_component_owned_by_bridge: true,
-        provider_data_component_owned_by_bridge: provider_data_owned_by_bridge,
-        dependent_component_owned_by_bridge: false,
-        dependent_data_component_owned_by_bridge: false,
-    };
-    if !register_hosted_provider_ndis_buffer_shadow(shadow) {
-        if provider_data_owned_by_bridge {
-            hosted_instance_pool_free(provider_inst, provider_data_component_va);
-        }
-        hosted_instance_pool_free(provider_inst, provider_component_va);
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
-    }
-    Ok(shadow)
+    finish_hosted_provider_ndis_buffer_construction(construction_index, owner)
+        .map(|shadow| (shadow, true))
+        .ok_or_else(|| {
+            retain_or_clear_failed_hosted_provider_ndis_buffer_construction(
+                construction_index,
+                STATUS_DEVICE_NOT_READY,
+            )
+        })
 }
 
 unsafe fn ensure_hosted_provider_ndis_packet_shadow_for_dependent_from_provider(
@@ -18125,6 +18499,25 @@ unsafe fn ensure_hosted_provider_ndis_packet_shadow_for_dependent_from_provider(
         return Err(STATUS_INVALID_PARAMETER);
     };
 
+    let construction_index =
+        reserve_hosted_provider_ndis_packet_construction(HostedProviderNdisPacketShadow {
+            present: true,
+            construction_state: HostedProviderConstructionState::Constructing,
+            owner,
+            provider_instance,
+            dependent_instance,
+            dependent_component_va: 0,
+            provider_component_va,
+            bytes: packet_bytes,
+            provider_component_owned_by_bridge: false,
+            dependent_component_owned_by_bridge: false,
+            dependent_sg_component_va: 0,
+            provider_sg_component_va: 0,
+            dependent_sg_component_owned_by_bridge: false,
+            construction_buffer_component_vas: [0; NDIS_PACKET_BUFFER_CHAIN_MAX as usize],
+            construction_buffer_count: 0,
+        })?;
+
     let provider_head =
         read_unaligned((provider_packet_exec + NDIS_PACKET_PRIVATE_HEAD_OFFSET_X64) as *const u64);
     let provider_tail =
@@ -18135,7 +18528,12 @@ unsafe fn ensure_hosted_provider_ndis_packet_shadow_for_dependent_from_provider(
     while current != 0 {
         if depth >= NDIS_PACKET_BUFFER_CHAIN_MAX {
             HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-            return Err(STATUS_INVALID_PARAMETER);
+            return Err(
+                retain_or_clear_failed_hosted_provider_ndis_packet_construction(
+                    construction_index,
+                    STATUS_INVALID_PARAMETER,
+                ),
+            );
         }
         let Some(provider_mdl_exec) = component_to_exec_va_for_instance(
             provider_instance,
@@ -18144,57 +18542,97 @@ unsafe fn ensure_hosted_provider_ndis_packet_shadow_for_dependent_from_provider(
             nt_mdl::MDL_SIZE as u64,
         ) else {
             HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-            return Err(STATUS_INVALID_PARAMETER);
+            return Err(
+                retain_or_clear_failed_hosted_provider_ndis_packet_construction(
+                    construction_index,
+                    STATUS_INVALID_PARAMETER,
+                ),
+            );
         };
-        ensure_hosted_provider_ndis_buffer_shadow_for_dependent_from_provider(
-            provider_instance,
-            provider_inst,
-            dependent_instance,
-            dependent_inst,
-            current,
-        )?;
+        let (buffer_shadow, created) =
+            ensure_hosted_provider_ndis_buffer_shadow_for_dependent_from_provider(
+                provider_instance,
+                provider_inst,
+                dependent_instance,
+                dependent_inst,
+                current,
+            )
+            .map_err(|status| {
+                retain_or_clear_failed_hosted_provider_ndis_packet_construction(
+                    construction_index,
+                    status,
+                )
+            })?;
+        if created
+            && !attach_hosted_provider_ndis_packet_construction_buffer(
+                construction_index,
+                owner,
+                buffer_shadow.dependent_component_va,
+            )
+        {
+            return Err(
+                retain_or_clear_failed_hosted_provider_ndis_packet_construction(
+                    construction_index,
+                    STATUS_INSUFFICIENT_RESOURCES,
+                ),
+            );
+        }
         last_provider = current;
         current = read_unaligned((provider_mdl_exec + nt_mdl::MDL_OFF_NEXT) as *const u64);
         depth += 1;
     }
     if provider_tail != 0 && provider_tail != last_provider {
         HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(
+            retain_or_clear_failed_hosted_provider_ndis_packet_construction(
+                construction_index,
+                STATUS_INVALID_PARAMETER,
+            ),
+        );
     }
 
     let Some(dependent_component_va) = hosted_instance_pool_alloc(dependent_inst, packet_bytes)
     else {
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
+        return Err(
+            retain_or_clear_failed_hosted_provider_ndis_packet_construction(
+                construction_index,
+                STATUS_INSUFFICIENT_RESOURCES,
+            ),
+        );
     };
+    {
+        let Some(record) = hosted_provider_ndis_packet_construction_mut(construction_index, owner)
+        else {
+            return Err(STATUS_DEVICE_NOT_READY);
+        };
+        record.dependent_component_va = dependent_component_va;
+        record.dependent_component_owned_by_bridge = true;
+    }
     let Some(dependent_packet_exec) = component_to_exec_va_for_instance(
         dependent_instance,
         dependent_inst,
         dependent_component_va,
         packet_bytes,
     ) else {
-        hosted_instance_pool_free(dependent_inst, dependent_component_va);
         HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(
+            retain_or_clear_failed_hosted_provider_ndis_packet_construction(
+                construction_index,
+                STATUS_INVALID_PARAMETER,
+            ),
+        );
     };
     copy_bytes(dependent_packet_exec, provider_packet_exec, packet_bytes);
-    let shadow = HostedProviderNdisPacketShadow {
-        present: true,
-        owner,
-        provider_instance,
-        dependent_instance,
-        dependent_component_va,
-        provider_component_va,
-        bytes: packet_bytes,
-        provider_component_owned_by_bridge: false,
-        dependent_component_owned_by_bridge: true,
-        dependent_sg_component_va: 0,
-        provider_sg_component_va: 0,
-        dependent_sg_component_owned_by_bridge: false,
+    let Some(shadow) =
+        hosted_provider_ndis_packet_construction_mut(construction_index, owner).copied()
+    else {
+        return Err(
+            retain_or_clear_failed_hosted_provider_ndis_packet_construction(
+                construction_index,
+                STATUS_DEVICE_NOT_READY,
+            ),
+        );
     };
-    if !register_hosted_provider_ndis_packet_shadow(shadow) {
-        hosted_instance_pool_free(dependent_inst, dependent_component_va);
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
-    }
     if let Err(status) = sync_ndis_packet_shadow_to_dependent(
         provider_instance,
         provider_inst,
@@ -18202,16 +18640,19 @@ unsafe fn ensure_hosted_provider_ndis_packet_shadow_for_dependent_from_provider(
         dependent_inst,
         shadow,
     ) {
-        if !release_hosted_provider_ndis_packet_shadow_by_dependent(
-            provider_instance,
-            dependent_instance,
-            dependent_component_va,
-        ) {
-            HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-        }
-        return Err(status);
+        return Err(
+            retain_or_clear_failed_hosted_provider_ndis_packet_construction(
+                construction_index,
+                status,
+            ),
+        );
     }
-    Ok(shadow)
+    finish_hosted_provider_ndis_packet_construction(construction_index, owner).ok_or_else(|| {
+        retain_or_clear_failed_hosted_provider_ndis_packet_construction(
+            construction_index,
+            STATUS_DEVICE_NOT_READY,
+        )
+    })
 }
 
 unsafe fn ensure_hosted_provider_ndis_packet_shadow_for_provider_from_dependent(
@@ -18253,57 +18694,88 @@ unsafe fn ensure_hosted_provider_ndis_packet_shadow_for_provider_from_dependent(
         HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_INVALID_PARAMETER);
     };
+    let construction_index =
+        reserve_hosted_provider_ndis_packet_construction(HostedProviderNdisPacketShadow {
+            present: true,
+            construction_state: HostedProviderConstructionState::Constructing,
+            owner,
+            provider_instance,
+            dependent_instance,
+            dependent_component_va,
+            provider_component_va: 0,
+            bytes: packet_bytes,
+            provider_component_owned_by_bridge: false,
+            dependent_component_owned_by_bridge: false,
+            dependent_sg_component_va: 0,
+            provider_sg_component_va: 0,
+            dependent_sg_component_owned_by_bridge: false,
+            construction_buffer_component_vas: [0; NDIS_PACKET_BUFFER_CHAIN_MAX as usize],
+            construction_buffer_count: 0,
+        })?;
     let Some(provider_component_va) = hosted_instance_pool_alloc(provider_inst, packet_bytes)
     else {
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
+        return Err(
+            retain_or_clear_failed_hosted_provider_ndis_packet_construction(
+                construction_index,
+                STATUS_INSUFFICIENT_RESOURCES,
+            ),
+        );
     };
+    {
+        let Some(record) = hosted_provider_ndis_packet_construction_mut(construction_index, owner)
+        else {
+            return Err(STATUS_DEVICE_NOT_READY);
+        };
+        record.provider_component_va = provider_component_va;
+        record.provider_component_owned_by_bridge = true;
+    }
     let Some(provider_packet_exec) = component_to_exec_va_for_instance(
         provider_instance,
         provider_inst,
         provider_component_va,
         packet_bytes,
     ) else {
-        hosted_instance_pool_free(provider_inst, provider_component_va);
         HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(
+            retain_or_clear_failed_hosted_provider_ndis_packet_construction(
+                construction_index,
+                STATUS_INVALID_PARAMETER,
+            ),
+        );
     };
     copy_bytes(provider_packet_exec, dependent_packet_exec, packet_bytes);
-    let shadow = HostedProviderNdisPacketShadow {
-        present: true,
-        owner,
-        provider_instance,
-        dependent_instance,
-        dependent_component_va,
-        provider_component_va,
-        bytes: packet_bytes,
-        provider_component_owned_by_bridge: true,
-        dependent_component_owned_by_bridge: false,
-        dependent_sg_component_va: 0,
-        provider_sg_component_va: 0,
-        dependent_sg_component_owned_by_bridge: false,
+    let Some(shadow) =
+        hosted_provider_ndis_packet_construction_mut(construction_index, owner).copied()
+    else {
+        return Err(
+            retain_or_clear_failed_hosted_provider_ndis_packet_construction(
+                construction_index,
+                STATUS_DEVICE_NOT_READY,
+            ),
+        );
     };
-    if !register_hosted_provider_ndis_packet_shadow(shadow) {
-        hosted_instance_pool_free(provider_inst, provider_component_va);
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
-    }
-    if let Err(status) = sync_ndis_packet_shadow_to_provider(
+    if let Err(status) = sync_ndis_packet_shadow_to_provider_with_construction(
         provider_instance,
         provider_inst,
         dependent_instance,
         dependent_inst,
         shadow,
         translate_buffers,
+        Some((construction_index, owner)),
     ) {
-        if !release_hosted_provider_ndis_packet_shadow_by_dependent(
-            provider_instance,
-            dependent_instance,
-            dependent_component_va,
-        ) {
-            HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-        }
-        return Err(status);
+        return Err(
+            retain_or_clear_failed_hosted_provider_ndis_packet_construction(
+                construction_index,
+                status,
+            ),
+        );
     }
-    Ok(shadow)
+    finish_hosted_provider_ndis_packet_construction(construction_index, owner).ok_or_else(|| {
+        retain_or_clear_failed_hosted_provider_ndis_packet_construction(
+            construction_index,
+            STATUS_DEVICE_NOT_READY,
+        )
+    })
 }
 
 unsafe fn sync_ndis_buffer_shadow_to_provider(
@@ -18548,6 +19020,17 @@ unsafe fn sync_ndis_packet_sg_to_dependent(
         .ok_or(STATUS_INVALID_PARAMETER)?;
     let provider_sg = read_unaligned(provider_cell as *const u64);
     if provider_sg == 0 {
+        if !update_hosted_provider_ndis_packet_sg_shadow(
+            shadow.owner,
+            provider_instance,
+            dependent_instance,
+            shadow.dependent_component_va,
+            0,
+            0,
+            false,
+        ) {
+            return Err(STATUS_DEVICE_NOT_READY);
+        }
         write_unaligned(dependent_cell as *mut u64, 0);
         return Ok(());
     }
@@ -18576,8 +19059,8 @@ unsafe fn sync_ndis_packet_sg_to_dependent(
         return Err(STATUS_INVALID_PARAMETER);
     };
     copy_bytes(dependent_sg_exec, provider_sg_exec, HOSTED_SG_LIST_SIZE_ONE);
-    write_unaligned(dependent_cell as *mut u64, dependent_sg);
     if !update_hosted_provider_ndis_packet_sg_shadow(
+        shadow.owner,
         provider_instance,
         dependent_instance,
         shadow.dependent_component_va,
@@ -18590,6 +19073,7 @@ unsafe fn sync_ndis_packet_sg_to_dependent(
         }
         return Err(STATUS_INVALID_PARAMETER);
     }
+    write_unaligned(dependent_cell as *mut u64, dependent_sg);
     Ok(())
 }
 
@@ -18679,13 +19163,13 @@ unsafe fn provider_ndis_buffer_for_dependent(
     dependent_instance: usize,
     dependent_inst: DriverInstance,
     dependent_component_va: u64,
-) -> Result<HostedProviderNdisBufferShadow, i32> {
+) -> Result<(HostedProviderNdisBufferShadow, bool), i32> {
     if let Some((_index, shadow)) = find_hosted_provider_ndis_buffer_shadow_by_dependent(
         provider_instance,
         dependent_instance,
         dependent_component_va,
     ) {
-        return Ok(shadow);
+        return Ok((shadow, false));
     }
     ensure_hosted_provider_ndis_buffer_shadow_for_provider_from_dependent(
         provider_instance,
@@ -18703,6 +19187,7 @@ unsafe fn provider_marshal_sync_packet_buffers(
     dependent_inst: DriverInstance,
     dependent_packet_exec: u64,
     provider_packet_exec: u64,
+    packet_construction: Option<(usize, HostedProviderObjectOwner)>,
 ) -> Result<(), i32> {
     let dependent_head =
         read_unaligned((dependent_packet_exec + NDIS_PACKET_PRIVATE_HEAD_OFFSET_X64) as *const u64);
@@ -18720,13 +19205,22 @@ unsafe fn provider_marshal_sync_packet_buffers(
         return Ok(());
     }
 
-    let head_shadow = provider_ndis_buffer_for_dependent(
+    let (head_shadow, head_created) = provider_ndis_buffer_for_dependent(
         provider_instance,
         provider_inst,
         dependent_instance,
         dependent_inst,
         dependent_head,
     )?;
+    if let (true, Some((construction_index, owner))) = (head_created, packet_construction) {
+        if !attach_hosted_provider_ndis_packet_construction_buffer(
+            construction_index,
+            owner,
+            head_shadow.dependent_component_va,
+        ) {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+    }
     let mut current = dependent_head;
     let mut last_dependent = 0u64;
     let mut depth = 0u64;
@@ -18734,13 +19228,22 @@ unsafe fn provider_marshal_sync_packet_buffers(
         if depth >= NDIS_PACKET_BUFFER_CHAIN_MAX {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let shadow = provider_ndis_buffer_for_dependent(
+        let (shadow, created) = provider_ndis_buffer_for_dependent(
             provider_instance,
             provider_inst,
             dependent_instance,
             dependent_inst,
             current,
         )?;
+        if let (true, Some((construction_index, owner))) = (created, packet_construction) {
+            if !attach_hosted_provider_ndis_packet_construction_buffer(
+                construction_index,
+                owner,
+                shadow.dependent_component_va,
+            ) {
+                return Err(STATUS_INSUFFICIENT_RESOURCES);
+            }
+        }
         let Some(dependent_mdl_exec) = component_to_exec_va_for_instance(
             dependent_instance,
             dependent_inst,
@@ -18761,6 +19264,7 @@ unsafe fn provider_marshal_sync_packet_buffers(
                 dependent_inst,
                 dependent_next,
             )?
+            .0
             .provider_component_va
         };
         sync_ndis_buffer_shadow_to_provider(
@@ -18778,13 +19282,22 @@ unsafe fn provider_marshal_sync_packet_buffers(
     if dependent_tail != 0 && dependent_tail != last_dependent {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    let tail_shadow = provider_ndis_buffer_for_dependent(
+    let (tail_shadow, tail_created) = provider_ndis_buffer_for_dependent(
         provider_instance,
         provider_inst,
         dependent_instance,
         dependent_inst,
         last_dependent,
     )?;
+    if let (true, Some((construction_index, owner))) = (tail_created, packet_construction) {
+        if !attach_hosted_provider_ndis_packet_construction_buffer(
+            construction_index,
+            owner,
+            tail_shadow.dependent_component_va,
+        ) {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+    }
     write_unaligned(
         (provider_packet_exec + NDIS_PACKET_PRIVATE_HEAD_OFFSET_X64) as *mut u64,
         head_shadow.provider_component_va,
@@ -18796,13 +19309,14 @@ unsafe fn provider_marshal_sync_packet_buffers(
     Ok(())
 }
 
-unsafe fn sync_ndis_packet_shadow_to_provider(
+unsafe fn sync_ndis_packet_shadow_to_provider_with_construction(
     provider_instance: usize,
     provider_inst: DriverInstance,
     dependent_instance: usize,
     dependent_inst: DriverInstance,
     shadow: HostedProviderNdisPacketShadow,
     translate_buffers: bool,
+    packet_construction: Option<(usize, HostedProviderObjectOwner)>,
 ) -> Result<(), i32> {
     let Some(dependent_packet_exec) = component_to_exec_va_for_instance(
         dependent_instance,
@@ -18836,9 +19350,29 @@ unsafe fn sync_ndis_packet_shadow_to_provider(
             dependent_inst,
             dependent_packet_exec,
             provider_packet_exec,
+            packet_construction,
         )?;
     }
     Ok(())
+}
+
+unsafe fn sync_ndis_packet_shadow_to_provider(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    dependent_instance: usize,
+    dependent_inst: DriverInstance,
+    shadow: HostedProviderNdisPacketShadow,
+    translate_buffers: bool,
+) -> Result<(), i32> {
+    sync_ndis_packet_shadow_to_provider_with_construction(
+        provider_instance,
+        provider_inst,
+        dependent_instance,
+        dependent_inst,
+        shadow,
+        translate_buffers,
+        None,
+    )
 }
 
 unsafe fn provider_marshal_ndis_packet(
@@ -19463,6 +19997,7 @@ unsafe fn complete_provider_ndis_packet_allocation(
     copy_bytes(dependent_packet_exec, provider_packet_exec, packet_bytes);
     if !register_hosted_provider_ndis_packet_shadow(HostedProviderNdisPacketShadow {
         present: true,
+        construction_state: HostedProviderConstructionState::Published,
         owner,
         provider_instance,
         dependent_instance,
@@ -19474,6 +20009,8 @@ unsafe fn complete_provider_ndis_packet_allocation(
         dependent_sg_component_va: 0,
         provider_sg_component_va: 0,
         dependent_sg_component_owned_by_bridge: false,
+        construction_buffer_component_vas: [0; NDIS_PACKET_BUFFER_CHAIN_MAX as usize],
+        construction_buffer_count: 0,
     }) {
         hosted_instance_pool_free(dependent_inst, dependent_packet);
         write_provider_ndis_status(state, STATUS_INSUFFICIENT_RESOURCES);
@@ -19590,6 +20127,7 @@ unsafe fn complete_provider_ndis_buffer_allocation(
     );
     if !register_hosted_provider_ndis_buffer_shadow(HostedProviderNdisBufferShadow {
         present: true,
+        construction_state: HostedProviderConstructionState::Published,
         owner,
         provider_instance,
         dependent_instance,
