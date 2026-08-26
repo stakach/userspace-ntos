@@ -10,9 +10,9 @@
 //! the overlay wins; anything absent falls through to the base hive. Writes land only here.
 //!
 //! Keys are addressed by a **canonical NT path** ([`canon_path`]): components split on `\`, empty
-//! components dropped, each lowercased. The caller applies the `CurrentControlSet` alias
-//! ([`crate::apply_ccs_alias`]) *before* canonicalizing so a write to `CurrentControlSet\…` and a
-//! later read via `ControlSet001\…` land on the same overlay key.
+//! components dropped, each lowercased. A mounted SYSTEM hive resolves its generation-specific
+//! `CurrentControlSet` identity before canonicalization, so alias and physical paths land on the
+//! same overlay key.
 //!
 //! `no_std` + `alloc`. Pure model (no I/O, no pointers) → host-testable; the executive keeps one
 //! instance alive across its per-syscall bump-heap reset by pre-reserving its capacity and pinning
@@ -35,8 +35,8 @@ fn fold(s: &str) -> String {
 }
 
 /// Canonicalize an NT registry path for overlay comparison: split on `\`, drop empty components,
-/// lowercase each, rejoin with a leading `\`. The `CurrentControlSet` alias is applied by the
-/// caller (via [`crate::apply_ccs_alias`]) *before* this, so reads and writes land on one key.
+/// lowercase each, rejoin with a leading `\`. Mount-owned namespace aliases must be resolved before
+/// this representation-only operation.
 pub fn canon_path(path: &str) -> String {
     let mut out = String::new();
     for comp in path.split('\\').filter(|c| !c.is_empty()) {

@@ -2136,7 +2136,11 @@ fn seed_time_zone(hive: Option<&RegfHive<'_>>) -> nt_kernel_exec::timezone::Time
     let Some(hive) = hive else {
         return information;
     };
-    let Some(key) = hive.open_key("ControlSet001\\Control\\TimeZoneInformation") else {
+    let Ok(mut key_path) = hive.current_control_set_name() else {
+        return information;
+    };
+    key_path.push_str("\\Control\\TimeZoneInformation");
+    let Some(key) = hive.open_key(&key_path) else {
         return information;
     };
     for (name, field) in [
@@ -2572,7 +2576,8 @@ impl ExecNtHandler {
                 HIVE_SEL_SYSTEM,
                 hive_mount(HIVE_SEL_SYSTEM),
                 regf,
-            );
+            )
+            .expect("mount imported SYSTEM hive");
         }
         if let Some(ref regf) = software_hive {
             mount_mutable_regf_hive(
@@ -2580,7 +2585,8 @@ impl ExecNtHandler {
                 HIVE_SEL_SOFTWARE,
                 hive_mount(HIVE_SEL_SOFTWARE),
                 regf,
-            );
+            )
+            .expect("mount imported SOFTWARE hive");
         }
         if let Some(ref regf) = security_hive {
             mount_mutable_regf_hive(
@@ -2588,7 +2594,8 @@ impl ExecNtHandler {
                 HIVE_SEL_SECURITY,
                 hive_mount(HIVE_SEL_SECURITY),
                 regf,
-            );
+            )
+            .expect("mount imported SECURITY hive");
         }
         if let Some(ref regf) = sam_hive {
             mount_mutable_regf_hive(
@@ -2596,7 +2603,8 @@ impl ExecNtHandler {
                 HIVE_SEL_SAM,
                 hive_mount(HIVE_SEL_SAM),
                 regf,
-            );
+            )
+            .expect("mount imported SAM hive");
         }
         // ★ THE `\Registry\User` MOUNT TABLE. `\Registry\User\.Default` is the genuine
         // `config\default` (`$$$PROTO.HIV`) the storage host read BY PATH into DEFHIVEBUF, mounted
@@ -2612,7 +2620,8 @@ impl ExecNtHandler {
                     HIVE_SEL_USER_DEFAULT,
                     hive_mount(HIVE_SEL_USER_DEFAULT),
                     &hive,
-                );
+                )
+                .expect("mount imported default user hive");
                 hive_mounts.push(HiveMount {
                     sel: HIVE_SEL_USER_DEFAULT,
                     canon: alloc::string::String::from(r"\registry\user\.default"),
@@ -3650,10 +3659,21 @@ impl ExecNtHandler {
         }
         Ok(target)
     }
-    /// Canonical overlay path for a full NT key path (CurrentControlSet alias applied), matching
-    /// `resolve_key`'s view so an overlay write and a later base-hive read agree on one key.
+    /// Canonical physical path for a full NT key path, matching the selected identity stored on
+    /// its mutable hive mount so overlay and borrowed-hive views agree on one key.
     pub(crate) fn overlay_canon(&self, full: &str) -> alloc::string::String {
-        nt_hive_core::canon_path(&apply_ccs_alias(full))
+        let physical = self
+            .mutable_hives
+            .resolve_path(full)
+            .map(|(hive, relative)| {
+                let mut path = self
+                    .hive_mount_path(hive)
+                    .expect("mounted hive selector has a namespace path");
+                path.push_str(&relative);
+                path
+            })
+            .unwrap_or_else(|| alloc::string::String::from(full));
+        nt_hive_core::canon_path(&physical)
     }
 
     /// The mounted base hive a non-virtual `KeyRef` belongs to, plus its in-hive cell offset. The
@@ -4751,7 +4771,16 @@ impl ExecNtHandler {
             let base_sequence = hive.sequence;
             let last_sequence = nt_hive_core::replay_log(&mut hive, &log_bytes, base_sequence);
             let root_subkeys = hive.subkey_count(hive.root()) as u64;
-            self.mutable_hives.mount(mount_path, hive_sel, hive);
+            if self
+                .mutable_hives
+                .mount(mount_path, hive_sel, hive)
+                .is_err()
+            {
+                print_str(b"[cm-restore] boot hive checkpoint rejected invalid SYSTEM selection ");
+                print_ascii_str(file_path);
+                print_str(b"\n");
+                return false;
+            }
             self.mutable_hives.clear_hive_dirty(hive_sel);
             if hive_sel == HIVE_SEL_USER_DEFAULT {
                 self.ensure_user_default_mutable_mount_only();
@@ -4775,7 +4804,14 @@ impl ExecNtHandler {
         }
         if let Some(regf) = RegfHive::new(bytes) {
             let root_subkeys = regf.subkeys(regf.root()).len() as u64;
-            mount_mutable_regf_hive(&mut self.mutable_hives, hive_sel, mount_path, &regf);
+            if mount_mutable_regf_hive(&mut self.mutable_hives, hive_sel, mount_path, &regf)
+                .is_err()
+            {
+                print_str(b"[cm-restore] boot regf checkpoint rejected ");
+                print_ascii_str(file_path);
+                print_str(b"\n");
+                return false;
+            }
             let base_sequence = self
                 .mutable_hives
                 .hive(hive_sel)
@@ -5535,10 +5571,16 @@ impl ExecNtHandler {
                 print_str(b"\n");
             }
             root_subkeys = hive.subkey_count(hive.root()) as u64;
-            self.mutable_hives.mount(&full, hive_sel, hive);
+            if self.mutable_hives.mount(&full, hive_sel, hive).is_err() {
+                USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
+                return STATUS_REGISTRY_CORRUPT;
+            }
             self.mutable_hives.clear_hive_dirty(hive_sel);
         } else if let Some(hive) = core_hive {
-            self.mutable_hives.mount(&full, hive_sel, hive);
+            if self.mutable_hives.mount(&full, hive_sel, hive).is_err() {
+                USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
+                return STATUS_REGISTRY_CORRUPT;
+            }
             NT_LOAD_KEY_CORE_HIVE_MOUNTED.fetch_add(1, Ordering::Relaxed);
         }
         self.mark_mutable_hives_dirty();
@@ -5651,23 +5693,37 @@ impl ExecNtHandler {
         Ok(path)
     }
 
-    fn driver_service_name_from_registry_path(path: &str) -> Result<alloc::string::String, u32> {
+    fn driver_service_name_from_registry_path(
+        &self,
+        path: &str,
+    ) -> Result<alloc::string::String, u32> {
         const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
         const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
         const STATUS_OBJECT_PATH_SYNTAX_BAD: u32 = 0xC000_003B;
 
-        let comps: alloc::vec::Vec<&str> = path.split('\\').filter(|c| !c.is_empty()).collect();
-        if comps.len() != 6
-            || !comps[0].eq_ignore_ascii_case("Registry")
-            || !comps[1].eq_ignore_ascii_case("Machine")
-            || !comps[2].eq_ignore_ascii_case("System")
-            || !(comps[3].eq_ignore_ascii_case("CurrentControlSet")
-                || comps[3].eq_ignore_ascii_case("ControlSet001"))
-            || !comps[4].eq_ignore_ascii_case("Services")
+        let (hive_id, relative_path) = self
+            .mutable_hives
+            .resolve_path(path)
+            .ok_or(STATUS_OBJECT_PATH_SYNTAX_BAD)?;
+        if hive_id != HIVE_SEL_SYSTEM {
+            return Err(STATUS_OBJECT_PATH_SYNTAX_BAD);
+        }
+        let selected = self
+            .mutable_hives
+            .hive(HIVE_SEL_SYSTEM)
+            .and_then(|hive| hive.current_control_set().ok())
+            .ok_or(STATUS_OBJECT_PATH_SYNTAX_BAD)?;
+        let comps: alloc::vec::Vec<&str> = relative_path
+            .split('\\')
+            .filter(|component| !component.is_empty())
+            .collect();
+        if comps.len() != 3
+            || !comps[0].eq_ignore_ascii_case(selected.as_str())
+            || !comps[1].eq_ignore_ascii_case("Services")
         {
             return Err(STATUS_OBJECT_PATH_SYNTAX_BAD);
         }
-        let service = comps[5];
+        let service = comps[2];
         if service.is_empty() {
             return Err(STATUS_INVALID_PARAMETER);
         }
@@ -5697,7 +5753,7 @@ impl ExecNtHandler {
             Ok(path) => path,
             Err(status) => return status,
         };
-        let service = match Self::driver_service_name_from_registry_path(&service_path) {
+        let service = match self.driver_service_name_from_registry_path(&service_path) {
             Ok(service) => service,
             Err(status) => return status,
         };
@@ -5802,7 +5858,7 @@ impl ExecNtHandler {
             Ok(path) => path,
             Err(status) => return status,
         };
-        let service = match Self::driver_service_name_from_registry_path(&service_path) {
+        let service = match self.driver_service_name_from_registry_path(&service_path) {
             Ok(service) => service,
             Err(status) => return status,
         };
@@ -7088,7 +7144,10 @@ impl ExecNtHandler {
     fn hive_service_group_order(
         hive: &nt_hive_core::Hive,
     ) -> alloc::vec::Vec<alloc::string::String> {
-        let mut path = alloc::string::String::from(nt_hive_core::CURRENT_CONTROL_SET_TARGET);
+        let selected = hive
+            .current_control_set()
+            .expect("mounted SYSTEM hive has a validated selected control set");
+        let mut path = alloc::string::String::from(selected.as_str());
         path.push_str("\\Control\\ServiceGroupOrder");
         let Some(key) = hive.open_key(&path) else {
             return alloc::vec::Vec::new();
@@ -20174,12 +20233,12 @@ impl ExecNtHandler {
         }
         self.obj_insert(parent, leaf, kind, target, permanent)
     }
-    /// Resolve a full NT key path (`\Registry\Machine\System\…`) to a key node in the SYSTEM hive:
-    /// apply the CurrentControlSet alias (the hive has ControlSet001, not the kernel-synthesized
-    /// CurrentControlSet symlink) + strip the hive's mount prefix.
+    /// Resolve a full NT key path to its borrowed REGF key. Namespace aliases come only from the
+    /// generation-specific identity already stored on the matching mutable hive mount.
     pub(crate) fn resolve_key(&self, full_path: &str) -> Option<KeyRef> {
-        let aliased = apply_ccs_alias(full_path);
-        let comps: alloc::vec::Vec<&str> = aliased.split('\\').filter(|c| !c.is_empty()).collect();
+        let physical = self.overlay_canon(full_path);
+        let comps: alloc::vec::Vec<&str> =
+            physical.split('\\').filter(|c| !c.is_empty()).collect();
         // ★ `\Registry\User\…` — the per-user hive namespace, served by the mount table so every
         // generic consumer of `resolve_key` (path-exists, value/subkey reads, `NtCreateKey`'s
         // parent check, the overlay's base-hive fall-through) composes with a loaded hive for free.
@@ -20187,7 +20246,7 @@ impl ExecNtHandler {
             && comps[0].eq_ignore_ascii_case("Registry")
             && comps[1].eq_ignore_ascii_case("User")
         {
-            return self.resolve_user_key(&aliased);
+            return self.resolve_user_key(&physical);
         }
         if comps.len() < 3
             || !comps[0].eq_ignore_ascii_case("Registry")

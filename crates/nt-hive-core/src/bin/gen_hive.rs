@@ -17,12 +17,15 @@ use nt_hive_core::{
     import_control_set_services_into_config_manager,
     seed_reactos_network_bindings_from_config_manager_into_target,
     seed_reactos_network_setup_into_target, CellId, Hive, HiveKind, ReactOsSetupSeedTarget,
-    RegistryValueType, CURRENT_CONTROL_SET_TARGET,
+    RegistryValueType,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 const NET_CLASS_GUID: &str = "{4D36E972-E325-11CE-BFC1-08002BE10318}";
+/// Source namespace of the generated additive overlay. Composition rebases this selected subtree
+/// onto the persistent SYSTEM hive's independently selected control set.
+const GENERATED_OVERLAY_CONTROL_SET: &str = "ControlSet001";
 const E1000_DRIVER_KEY: &str = r"{4D36E972-E325-11CE-BFC1-08002BE10318}\0000";
 const E1000_INSTANCE_ID: &str = r"PCI\VEN_8086&DEV_100E\3&11583659&0&18";
 const E1000_EXPORT_NAME: &str = r"\Device\E1000_0000";
@@ -531,12 +534,20 @@ fn install_generated_network_adapters(hive: &mut Hive, adapters: &[GeneratedNetw
 
 fn import_generated_hive_config_manager(hive: &Hive) -> ConfigManager {
     let mut cm = ConfigManager::new();
+    let _ = import_control_set_services_into_config_manager(
+        hive,
+        &mut cm,
+        GENERATED_OVERLAY_CONTROL_SET,
+    );
     let _ =
-        import_control_set_services_into_config_manager(hive, &mut cm, CURRENT_CONTROL_SET_TARGET);
-    let _ = import_control_set_enum_into_config_manager(hive, &mut cm, CURRENT_CONTROL_SET_TARGET);
-    let _ = import_control_set_class_into_config_manager(hive, &mut cm, CURRENT_CONTROL_SET_TARGET);
+        import_control_set_enum_into_config_manager(hive, &mut cm, GENERATED_OVERLAY_CONTROL_SET);
     let _ =
-        import_control_set_network_into_config_manager(hive, &mut cm, CURRENT_CONTROL_SET_TARGET);
+        import_control_set_class_into_config_manager(hive, &mut cm, GENERATED_OVERLAY_CONTROL_SET);
+    let _ = import_control_set_network_into_config_manager(
+        hive,
+        &mut cm,
+        GENERATED_OVERLAY_CONTROL_SET,
+    );
     cm
 }
 
@@ -1580,7 +1591,7 @@ mod tests {
             nt_hive_core::import_control_set_services_into_config_manager(
                 &hive,
                 &mut cm,
-                nt_hive_core::CURRENT_CONTROL_SET_TARGET
+                GENERATED_OVERLAY_CONTROL_SET
             ),
             0
         );
@@ -1588,7 +1599,7 @@ mod tests {
             nt_hive_core::import_control_set_service_group_order_into_config_manager(
                 &hive,
                 &mut cm,
-                nt_hive_core::CURRENT_CONTROL_SET_TARGET
+                GENERATED_OVERLAY_CONTROL_SET
             ),
             1
         );

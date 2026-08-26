@@ -2,8 +2,8 @@
 //!
 //! A [`Hive`] is a cell arena — [`KeyCell`]s and [`ValueCell`]s addressed by a stable
 //! [`CellId`], never a raw pointer. Registry operations navigate the arena by relative path.
-//! The [`HiveMountTable`] resolves a full NT registry path to a mounted hive + a relative path,
-//! applying the `CurrentControlSet` alias (spec §8).
+//! The [`HiveMountTable`] resolves a full NT registry path to a mounted hive + a relative path. A
+//! SYSTEM mount carries its validated, generation-specific `CurrentControlSet` identity (spec §8).
 
 use alloc::rc::Rc;
 use alloc::string::String;
@@ -97,6 +97,15 @@ impl CurrentControlSet {
 
     pub fn as_str(&self) -> &str {
         &self.name
+    }
+
+    /// Resolve an in-hive relative path against this selected control-set identity.
+    ///
+    /// Only an immediate first `CurrentControlSet` component is an alias. A component with the
+    /// same name deeper in the tree is an ordinary key name and remains unchanged.
+    pub fn resolve_relative_path(&self, relative_path: &str) -> String {
+        apply_mount_current_control_set_alias(relative_path, Some(self))
+            .expect("selected control-set identity is present")
     }
 }
 
@@ -892,57 +901,88 @@ pub type HiveId = u32;
 
 /// The `\Registry\Machine\System` hive path — the v0.1 required hive (spec §6.1).
 pub const SYSTEM_HIVE_PATH: &str = r"\Registry\Machine\System";
-/// The live control set the `CurrentControlSet` alias resolves to (spec §8).
-pub const CURRENT_CONTROL_SET_TARGET: &str = "ControlSet001";
+
+struct HiveMountEntry {
+    root: String,
+    hive: HiveId,
+    current_control_set: Option<CurrentControlSet>,
+}
 
 /// The hive mount table + `CurrentControlSet` alias resolver (spec §6.2, §8).
 #[derive(Default)]
 pub struct HiveMountTable {
-    mounts: Vec<(String, HiveId)>, // (root path, hive) — longest match wins
+    mounts: Vec<HiveMountEntry>, // longest root match wins
 }
 
 impl HiveMountTable {
     pub fn new() -> Self {
         Self { mounts: Vec::new() }
     }
+
+    /// Mount a hive without namespace aliases.
     pub fn mount(&mut self, root_path: &str, hive: HiveId) {
         self.mounts
-            .retain(|(p, _)| !p.eq_ignore_ascii_case(root_path));
-        self.mounts.push((root_path.into(), hive));
+            .retain(|entry| !entry.root.eq_ignore_ascii_case(root_path));
+        self.mounts.push(HiveMountEntry {
+            root: root_path.into(),
+            hive,
+            current_control_set: None,
+        });
+    }
+
+    /// Mount a SYSTEM hive with the selection identity derived from that exact hive generation.
+    pub fn mount_with_current_control_set(
+        &mut self,
+        root_path: &str,
+        hive: HiveId,
+        current_control_set: CurrentControlSet,
+    ) {
+        self.mounts
+            .retain(|entry| !entry.root.eq_ignore_ascii_case(root_path));
+        self.mounts.push(HiveMountEntry {
+            root: root_path.into(),
+            hive,
+            current_control_set: Some(current_control_set),
+        });
     }
 
     pub fn unmount(&mut self, root_path: &str) -> Option<HiveId> {
         let index = self
             .mounts
             .iter()
-            .position(|(path, _)| path.eq_ignore_ascii_case(root_path))?;
-        Some(self.mounts.remove(index).1)
+            .position(|entry| entry.root.eq_ignore_ascii_case(root_path))?;
+        Some(self.mounts.remove(index).hive)
     }
 
-    /// Resolve a full NT registry path to `(HiveId, relative_path)` (spec §6.2), applying the
-    /// `CurrentControlSet` → `ControlSet001` alias (spec §8) before matching.
+    /// Resolve a full NT registry path to `(HiveId, relative_path)` (spec §6.2).
+    ///
+    /// The owning mount is selected first. Only then may that mount's validated SYSTEM identity
+    /// replace an immediate `CurrentControlSet` component below its root.
     pub fn resolve(&self, full_path: &str) -> Option<(HiveId, String)> {
-        let aliased = apply_ccs_alias(full_path);
         // Longest matching mount root wins.
-        let mut best: Option<(&str, HiveId)> = None;
-        for (root, hive) in &self.mounts {
-            if path_starts_with(&aliased, root)
-                && best.map(|(b, _)| root.len() > b.len()).unwrap_or(true)
+        let mut best: Option<&HiveMountEntry> = None;
+        for entry in &self.mounts {
+            if path_starts_with(full_path, &entry.root)
+                && best
+                    .map(|current| entry.root.len() > current.root.len())
+                    .unwrap_or(true)
             {
-                best = Some((root.as_str(), *hive));
+                best = Some(entry);
             }
         }
-        let (root, hive) = best?;
-        let rel = &aliased[root.len()..];
-        Some((hive, rel.into()))
+        let entry = best?;
+        let relative = &full_path[entry.root.len()..];
+        Some((
+            entry.hive,
+            apply_mount_current_control_set_alias(relative, entry.current_control_set.as_ref())?,
+        ))
     }
 
     /// True if a mounted hive owns this full NT registry path, whether or not the key exists.
     pub fn owns_path(&self, full_path: &str) -> bool {
-        let aliased = apply_ccs_alias(full_path);
         self.mounts
             .iter()
-            .any(|(root, _)| path_starts_with(&aliased, root))
+            .any(|entry| path_starts_with(full_path, &entry.root))
     }
 }
 
@@ -1098,12 +1138,32 @@ impl MutableHiveSet {
         }
     }
 
-    pub fn mount(&mut self, root_path: &str, hive_id: HiveId, hive: Hive) {
-        self.mounts.mount(root_path, hive_id);
+    /// Mount or replace a mutable hive atomically at the namespace level.
+    ///
+    /// A SYSTEM hive at the standard SYSTEM root must publish its own strict `Select\Current`
+    /// identity. Validation occurs before either the mount record or owned hive is replaced.
+    pub fn mount(
+        &mut self,
+        root_path: &str,
+        hive_id: HiveId,
+        hive: Hive,
+    ) -> Result<(), CurrentControlSetError> {
+        let current_control_set = if root_path.eq_ignore_ascii_case(SYSTEM_HIVE_PATH) {
+            Some(hive.current_control_set()?)
+        } else {
+            None
+        };
+        if let Some(current_control_set) = current_control_set {
+            self.mounts
+                .mount_with_current_control_set(root_path, hive_id, current_control_set);
+        } else {
+            self.mounts.mount(root_path, hive_id);
+        }
         match self.hives.iter().position(|(id, _)| *id == hive_id) {
             Some(index) => self.hives[index] = (hive_id, hive),
             None => self.hives.push((hive_id, hive)),
         }
+        Ok(())
     }
 
     pub fn unmount(&mut self, root_path: &str) -> Option<Hive> {
@@ -1135,8 +1195,13 @@ impl MutableHiveSet {
         true
     }
 
+    /// Resolve namespace ownership and aliases without requiring the referenced key to exist.
+    pub fn resolve_path(&self, full_path: &str) -> Option<(HiveId, String)> {
+        self.mounts.resolve(full_path)
+    }
+
     pub fn resolve_key(&self, full_path: &str) -> Option<ResolvedHiveKey> {
-        let (hive_id, rel_path) = self.mounts.resolve(full_path)?;
+        let (hive_id, rel_path) = self.resolve_path(full_path)?;
         let hive = self.hive(hive_id)?;
         Some(ResolvedHiveKey {
             hive: hive_id,
@@ -1283,18 +1348,24 @@ impl MutableHiveSet {
     }
 }
 
-/// Replace a `CurrentControlSet` path component with the live control set (spec §8).
-pub fn apply_ccs_alias(path: &str) -> String {
+fn apply_mount_current_control_set_alias(
+    relative_path: &str,
+    current_control_set: Option<&CurrentControlSet>,
+) -> Option<String> {
     let mut out = String::new();
-    for comp in path.split('\\').filter(|c| !c.is_empty()) {
+    for (index, comp) in relative_path
+        .split('\\')
+        .filter(|component| !component.is_empty())
+        .enumerate()
+    {
         out.push('\\');
-        if comp.eq_ignore_ascii_case("CurrentControlSet") {
-            out.push_str(CURRENT_CONTROL_SET_TARGET);
+        if index == 0 && comp.eq_ignore_ascii_case("CurrentControlSet") {
+            out.push_str(current_control_set?.as_str());
         } else {
             out.push_str(comp);
         }
     }
-    out
+    Some(out)
 }
 
 /// Case-insensitive path-prefix test on `\`-delimited components.

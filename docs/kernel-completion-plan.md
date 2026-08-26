@@ -12737,3 +12737,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and the QEMU sentinel fires. Review adjustment: the REGF metadata prerequisite is closed. The
     next cut is the validated per-mount `CurrentControlSet` identity; remove the global fixed alias
     and update its callers in the same accepted change.
+
+    Per-mount SYSTEM selection checkpoint (2026-08-26, implementation green): the mutable hive
+    namespace now derives and stores `CurrentControlSet` identity from the exact SYSTEM generation
+    before publishing a mount. A missing, malformed, zero, or dangling `Select\\Current` rejects
+    mount and replacement atomically; an unselected non-SYSTEM mount has no control-set alias.
+    Longest-prefix mount ownership is decided before alias resolution, and only the immediate first
+    component below the SYSTEM root can be rewritten. The global `CURRENT_CONTROL_SET_TARGET` and
+    path-wide `apply_ccs_alias` machinery are deleted.
+
+    Executive timezone, NLS language, keyboard-layout DLL, display-service, PnP Enum, semantic
+    Config Manager, service-group order, borrowed REGF, overlay, and generated-hive diagnostic
+    paths now consume the selected identity from their mounted or source hive. `NtLoadDriver` and
+    `NtUnloadDriver` validate the caller's service path against the selected mounted SYSTEM
+    generation, so a path naming an inactive numbered control set cannot silently load metadata
+    from the active set. Component production code contains no fixed `ControlSet001`; the remaining
+    occurrences are explicit fixtures or the generated overlay's declared source namespace.
+
+    Focused validation is green at `nt-hive-core` `75/75` and `nt-hive-regf` `20/20`. Both
+    freestanding configuration-manager and executive release checks pass, with the executive at
+    its established 212-warning baseline; workspace formatting and `git diff --check` are clean.
+    Review adjustment: keep this checkpoint open until the serialized desktop gate proves the
+    dynamically selected namespace retains all PnP, userinit, Explorer chrome, and sentinel gates.
+    Then perform the single composed persistent-SYSTEM publication and delete the generated-only CM
+    import plus the old direct REGF-to-semantic-ConfigManager copier in the same cut; neither may
+    remain as a fallback authority.

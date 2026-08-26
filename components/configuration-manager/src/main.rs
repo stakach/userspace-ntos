@@ -219,7 +219,17 @@ fn run() {
     use nt_hive_core::{HiveKind, HiveLogOp, HiveManager, HiveMountTable, MemoryHiveIoProvider, RegistryValueType as HRegType};
     // Mount table resolves CurrentControlSet through the SYSTEM hive (spec §8).
     let mut mounts = HiveMountTable::new();
-    mounts.mount(nt_hive_core::SYSTEM_HIVE_PATH, 1);
+    let mut mounted_system = nt_hive_core::Hive::new(HiveKind::System);
+    let select = mounted_system.create_key("Select");
+    mounted_system.set_dword(select, "Current", 1);
+    mounted_system.create_key("ControlSet001");
+    mounts.mount_with_current_control_set(
+        nt_hive_core::SYSTEM_HIVE_PATH,
+        1,
+        mounted_system
+            .current_control_set()
+            .expect("valid SYSTEM selection"),
+    );
     let resolved = mounts.resolve(r"\Registry\Machine\System\CurrentControlSet\Services\Foo");
     check(
         b"hive_mount_resolves_currentcontrolset",

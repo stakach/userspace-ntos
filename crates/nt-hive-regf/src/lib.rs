@@ -89,6 +89,14 @@ pub enum RegfHiveImportError {
     OutOfMemory,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RegfCurrentControlSetError {
+    SelectKeyMissing,
+    CurrentValueMissing,
+    CurrentValueInvalid,
+    TargetKeyMissing,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct RegfHiveCellCounts {
     keys: usize,
@@ -157,6 +165,30 @@ impl<'a> RegfHive<'a> {
     /// The raw `regf` image this read-only hive navigates.
     pub fn bytes(&self) -> &'a [u8] {
         self.data
+    }
+
+    /// Resolve `Select\Current` from this on-disk SYSTEM hive without a default.
+    pub fn current_control_set_name(&self) -> Result<String, RegfCurrentControlSetError> {
+        let select = self
+            .open_key("Select")
+            .ok_or(RegfCurrentControlSetError::SelectKeyMissing)?;
+        let (value_type, data) = self
+            .value(select, "Current")
+            .ok_or(RegfCurrentControlSetError::CurrentValueMissing)?;
+        if value_type != RegistryValueType::Dword as u32
+            || data.len() != core::mem::size_of::<u32>()
+        {
+            return Err(RegfCurrentControlSetError::CurrentValueInvalid);
+        }
+        let number = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        if number == 0 {
+            return Err(RegfCurrentControlSetError::CurrentValueInvalid);
+        }
+        let name = alloc::format!("ControlSet{number:03}");
+        if self.open_key(&name).is_none() {
+            return Err(RegfCurrentControlSetError::TargetKeyMissing);
+        }
+        Ok(name)
     }
 
     /// The cell body (after the 4-byte signed size) at a hbin-relative `offset`, bounds-checked.
@@ -2136,7 +2168,9 @@ mod tests {
         );
 
         let mut hives = nt_hive_core::MutableHiveSet::new();
-        hives.mount(r"\Registry\Machine\System", 0, hive);
+        hives
+            .mount(r"\Registry\Machine\System", 0, hive)
+            .expect("mount selected SYSTEM hive");
         let known_dlls = hives
             .resolve_key(
                 r"\registry\machine\system\currentcontrolset\control\session manager\KnownDlls",
@@ -2166,7 +2200,9 @@ mod tests {
         assert!(stats.values > 0, "expected imported SYSTEM hive values");
 
         let mut hives = nt_hive_core::MutableHiveSet::new();
-        hives.mount(r"\Registry\Machine\System", 0, hive);
+        hives
+            .mount(r"\Registry\Machine\System", 0, hive)
+            .expect("mount selected SYSTEM hive");
         let nls_language = hives
             .resolve_key(r"\Registry\Machine\System\CurrentControlSet\Control\Nls\Language")
             .expect("Nls\\Language key must resolve through the mutable SYSTEM hive mount");
@@ -2233,9 +2269,12 @@ mod tests {
             return;
         };
         let hive = RegfHive::new(&bytes).expect("the staged `config\\system` must be a regf hive");
+        let selected = hive
+            .current_control_set_name()
+            .expect("staged SYSTEM hive must select an existing control set");
+        assert_eq!(selected, "ControlSet001");
         let mut cm = ConfigManager::new();
-        let counts =
-            import_control_set_boot_config_into_config_manager(&hive, &mut cm, "ControlSet001");
+        let counts = import_control_set_boot_config_into_config_manager(&hive, &mut cm, &selected);
         assert!(counts.services > 0, "expected imported service keys");
         eprintln!("imported Enum devnodes: {}", counts.enum_devnodes);
         assert!(

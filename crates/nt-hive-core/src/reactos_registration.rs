@@ -1690,6 +1690,14 @@ mod tests {
     use super::*;
     use crate::{Hive, HiveKind, MutableHiveSet};
 
+    fn mountable_system_hive() -> Hive {
+        let mut hive = Hive::new(HiveKind::System);
+        let select = hive.create_key("Select");
+        hive.set_dword(select, "Current", 1);
+        hive.create_key("ControlSet001");
+        hive
+    }
+
     fn value_bytes<'a>(overlay: &'a RegistryOverlay, key: &str, value: &str) -> (u32, &'a [u8]) {
         let idx = overlay.find(&canon_path(key)).expect("seeded key");
         overlay.value(idx, value).expect("seeded value")
@@ -1818,11 +1826,13 @@ mod tests {
     #[test]
     fn seeds_explorer_shell_com_classes_into_mutable_software_hive() {
         let mut hives = MutableHiveSet::new();
-        hives.mount(
-            r"\Registry\Machine\Software",
-            2,
-            Hive::new(HiveKind::Software),
-        );
+        hives
+            .mount(
+                r"\Registry\Machine\Software",
+                2,
+                Hive::new(HiveKind::Software),
+            )
+            .unwrap();
 
         let mask = seed_reactos_explorer_shell_com_classes_in_mutable_hives(
             &mut hives,
@@ -1875,7 +1885,9 @@ mod tests {
     #[test]
     fn seeds_default_user_shell_folders_into_mutable_user_hive() {
         let mut hives = MutableHiveSet::new();
-        hives.mount(r"\Registry\User\.Default", 5, Hive::new(HiveKind::Default));
+        hives
+            .mount(r"\Registry\User\.Default", 5, Hive::new(HiveKind::Default))
+            .unwrap();
 
         let stats = seed_reactos_default_user_shell_folders_in_mutable_hives(
             &mut hives,
@@ -1938,7 +1950,9 @@ mod tests {
     #[test]
     fn seeds_reactos_print_setup_into_mutable_system_hive() {
         let mut hives = MutableHiveSet::new();
-        hives.mount(r"\Registry\Machine\System", 1, Hive::new(HiveKind::System));
+        hives
+            .mount(r"\Registry\Machine\System", 1, mountable_system_hive())
+            .unwrap();
 
         let stats = seed_reactos_print_setup_in_mutable_hives(&mut hives);
         assert_eq!(
@@ -1989,7 +2003,9 @@ mod tests {
     #[test]
     fn seeds_reactos_network_setup_into_mutable_system_hive() {
         let mut hives = MutableHiveSet::new();
-        hives.mount(r"\Registry\Machine\System", 1, Hive::new(HiveKind::System));
+        hives
+            .mount(r"\Registry\Machine\System", 1, mountable_system_hive())
+            .unwrap();
 
         let stats = seed_reactos_network_setup_in_mutable_hives(&mut hives);
         assert_eq!(
@@ -2390,7 +2406,9 @@ mod tests {
     fn seeds_reactos_network_bindings_from_config_manager_into_mutable_system_hive() {
         let cm = config_manager_with_two_e1000_nics();
         let mut hives = MutableHiveSet::new();
-        hives.mount(r"\Registry\Machine\System", 1, Hive::new(HiveKind::System));
+        hives
+            .mount(r"\Registry\Machine\System", 1, mountable_system_hive())
+            .unwrap();
 
         let mut stats = {
             let mut target = MutableHiveRgsSeedTarget { hives: &mut hives };

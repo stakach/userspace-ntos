@@ -87,10 +87,10 @@ use nt_config_manager::{
     DriverServiceClass, SERVICE_DEMAND_START, SERVICE_DISABLED, SERVICE_SYSTEM_START,
 };
 use nt_hive_core::{
-    apply_ccs_alias, HiveKind, MutableHiveSet, RegistryValueCopyProvenance,
-    RegistryValueCopyProvenanceTable, ResolvedHiveKey, ResolvedHiveValue,
+    HiveKind, MutableHiveSet, RegistryValueCopyProvenance, RegistryValueCopyProvenanceTable,
+    ResolvedHiveKey, ResolvedHiveValue,
 };
-use nt_hive_regf::{import_regf_into_hive, KeyRef, RegfHive};
+use nt_hive_regf::{try_import_regf_into_hive, KeyRef, RegfHive};
 use nt_io_abi::wire::IoReply;
 use nt_io_client::IoClient;
 use nt_kernel_exec::{EventKind, EventStore, IrqlState, WaitResult};
@@ -17937,9 +17937,18 @@ pub(crate) fn mount_mutable_regf_hive(
     sel: u32,
     mount_path: &str,
     regf: &RegfHive<'_>,
-) {
-    let (hive, _stats) = import_regf_into_hive(regf, hive_kind_for_selector(sel));
-    mutable_hives.mount(mount_path, sel, hive);
+) -> Result<(), MutableRegfHiveMountError> {
+    let (hive, _stats) = try_import_regf_into_hive(regf, hive_kind_for_selector(sel))
+        .map_err(MutableRegfHiveMountError::Import)?;
+    mutable_hives
+        .mount(mount_path, sel, hive)
+        .map_err(MutableRegfHiveMountError::Mount)
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MutableRegfHiveMountError {
+    Import(nt_hive_regf::RegfHiveImportError),
+    Mount(nt_hive_core::CurrentControlSetError),
 }
 
 /// ── `NtLoadKey` / `NtUnloadKey` — the run-time hive mounts ────────────────────────────────────
@@ -18127,7 +18136,10 @@ fn system_hive_has_pnp_enum_devnodes() -> bool {
     let Some(hive) = system_hive_regf() else {
         return false;
     };
-    let mut enum_path = alloc::string::String::from(nt_hive_core::CURRENT_CONTROL_SET_TARGET);
+    let Ok(selected) = hive.current_control_set_name() else {
+        return false;
+    };
+    let mut enum_path = selected;
     enum_path.push_str("\\Enum");
     let Some(enum_key) = hive.open_key(&enum_path) else {
         return false;
@@ -19823,11 +19835,12 @@ fn inline_driver_launch_spec_from_pnp_binding(
 fn config_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
     let hive_bytes = unsafe { config_hive_image_bytes()? };
     let hive = nt_hive_core::decode_image(hive_bytes).ok()?;
+    let selected = hive.current_control_set().ok()?;
     let mut cm = nt_config_manager::ConfigManager::new();
     if nt_hive_core::import_control_set_services_into_config_manager(
         &hive,
         &mut cm,
-        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+        selected.as_str(),
     ) == 0
     {
         return None;
@@ -19835,22 +19848,22 @@ fn config_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
     let _ = nt_hive_core::import_control_set_service_group_order_into_config_manager(
         &hive,
         &mut cm,
-        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+        selected.as_str(),
     );
     let _ = nt_hive_core::import_control_set_enum_into_config_manager(
         &hive,
         &mut cm,
-        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+        selected.as_str(),
     );
     let _ = nt_hive_core::import_control_set_class_into_config_manager(
         &hive,
         &mut cm,
-        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+        selected.as_str(),
     );
     let _ = nt_hive_core::import_control_set_network_into_config_manager(
         &hive,
         &mut cm,
-        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+        selected.as_str(),
     );
     let _ = nt_hive_core::seed_reactos_network_setup_in_config_manager(&mut cm);
     Some(cm)
@@ -20033,11 +20046,12 @@ fn config_hive_demand_pnp_driver_launch_plan() -> &'static InlineDriverLaunchPla
 
 fn system_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
     let hive = system_hive_regf()?;
+    let selected = hive.current_control_set_name().ok()?;
     let mut cm = nt_config_manager::ConfigManager::new();
     let counts = nt_hive_regf::import_control_set_boot_config_into_config_manager(
         &hive,
         &mut cm,
-        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+        &selected,
     );
     if counts.services == 0 {
         return None;
@@ -20045,7 +20059,7 @@ fn system_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
     let _ = nt_hive_regf::import_control_set_network_into_config_manager(
         &hive,
         &mut cm,
-        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+        &selected,
     );
     let _ = nt_hive_core::seed_reactos_network_setup_in_config_manager(&mut cm);
     Some(cm)
@@ -20295,7 +20309,9 @@ fn default_hive_keyboard_layout_id(out: &mut [u8]) -> Option<usize> {
 
 fn system_hive_nls_keyboard_layout_id(out: &mut [u8]) -> Option<usize> {
     let hive = system_hive_regf()?;
-    let key = hive.open_key("ControlSet001\\Control\\Nls\\Language")?;
+    let mut key_path = hive.current_control_set_name().ok()?;
+    key_path.push_str("\\Control\\Nls\\Language");
+    let key = hive.open_key(&key_path)?;
     let value = hive.value(key, "Default")?;
     registry_layout_id_from_value(&value.1, out)
 }
@@ -20320,7 +20336,8 @@ fn system_hive_keyboard_layout_file(layout_id: &[u8], out: &mut [u8]) -> Option<
         return None;
     }
     let hive = system_hive_regf()?;
-    let mut key_path = alloc::string::String::from("ControlSet001\\Control\\Keyboard Layouts\\");
+    let mut key_path = hive.current_control_set_name().ok()?;
+    key_path.push_str("\\Control\\Keyboard Layouts\\");
     for &b in layout_id {
         key_path.push(b as char);
     }
@@ -20460,7 +20477,9 @@ fn system_hive_display_driver_spec() -> Option<&'static SystemHiveDisplayDriverS
         return unsafe { (&*core::ptr::addr_of!(SYSTEM_HIVE_DISPLAY_DRIVER_SPEC)).as_ref() };
     }
     let hive = system_hive_regf()?;
-    let services = hive.open_key("ControlSet001\\Services")?;
+    let mut services_path = hive.current_control_set_name().ok()?;
+    services_path.push_str("\\Services");
+    let services = hive.open_key(&services_path)?;
     for (service_name, service_key) in hive.subkeys(services) {
         let Some(device_key) = hive.open_key_from(service_key, "Device0") else {
             continue;
@@ -20669,14 +20688,22 @@ fn is_keyboard_layout_key(path: &str) -> bool {
     };
     tail.len() == 5
         && tail[0].eq_ignore_ascii_case("System")
-        && (tail[1].eq_ignore_ascii_case("CurrentControlSet")
-            || tail[1].eq_ignore_ascii_case("ControlSet001"))
+        && is_numbered_control_set_component(tail[1])
         && tail[2].eq_ignore_ascii_case("Control")
         && tail[3].eq_ignore_ascii_case("Keyboard Layouts")
         && tail[4].len() == 8
         && tail[4]
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b.to_ascii_lowercase()))
+}
+
+fn is_numbered_control_set_component(component: &str) -> bool {
+    let bytes = component.as_bytes();
+    bytes.len() == b"ControlSet000".len()
+        && bytes[..b"ControlSet".len()].eq_ignore_ascii_case(b"ControlSet")
+        && bytes[b"ControlSet".len()..]
+            .iter()
+            .all(u8::is_ascii_digit)
 }
 /// True if `comps` (backslash-split, no `\Registry\Machine` prefix) name the Winlogon key
 /// `Software\Microsoft\Windows NT\CurrentVersion\Winlogon`. Matched EXACTLY (5 components, in order)
@@ -27788,10 +27815,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_u64(hive_size as u64);
                     print_str(b" bytes)\n");
                     check(b"exec_cm_hive_decoded", true, &mut passed);
-                    let answer = hive
-                        .open_key("ControlSet001\\Services\\NtosTest")
-                        .and_then(|k| hive.query_dword(k, "Answer"));
-                    print_str(b"[ntos-exec] hive ControlSet001\\Services\\NtosTest\\Answer = ");
+                    let answer = hive.current_control_set().ok().and_then(|selected| {
+                        let mut path = alloc::string::String::from(selected.as_str());
+                        path.push_str("\\Services\\NtosTest");
+                        hive.open_key(&path)
+                            .and_then(|key| hive.query_dword(key, "Answer"))
+                    });
+                    print_str(b"[ntos-exec] selected SYSTEM Services\\NtosTest\\Answer = ");
                     print_u64(answer.unwrap_or(0) as u64);
                     print_str(b"\n");
                     check(b"exec_cm_hive_answer_42", answer == Some(42), &mut passed);

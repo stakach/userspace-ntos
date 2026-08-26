@@ -5,6 +5,14 @@ use alloc::vec::Vec;
 
 use crate::hive::{Cell, KeyCell, ValueCell};
 
+fn mountable_system_hive() -> Hive {
+    let mut hive = Hive::new(HiveKind::System);
+    let select = hive.create_key("Select");
+    hive.set_dword(select, "Current", 1);
+    hive.create_key("ControlSet001");
+    hive
+}
+
 #[test]
 fn hive_create_open_set_query() {
     let mut h = Hive::new(HiveKind::System);
@@ -455,32 +463,71 @@ fn hive_delete_key_removes_only_leaf_keys() {
 #[test]
 fn mount_table_currentcontrolset_resolver() {
     let mut mt = HiveMountTable::new();
-    mt.mount(SYSTEM_HIVE_PATH, 1);
+    let mut system = mountable_system_hive();
+    system.create_key(r"ControlSet002\Services");
+    let select = system.open_key("Select").unwrap();
+    system.set_dword(select, "Current", 2);
+    mt.mount_with_current_control_set(SYSTEM_HIVE_PATH, 1, system.current_control_set().unwrap());
     mt.mount(r"\Registry\Machine\Software", 2);
-    // Services path resolves through CurrentControlSet → ControlSet001 (spec §8, M2 success).
+    // Services resolves through the selected identity carried by this exact mount generation.
     let (hive, rel) = mt
         .resolve(r"\Registry\Machine\System\CurrentControlSet\Services\Foo")
         .unwrap();
     assert_eq!(hive, 1);
-    assert_eq!(rel, r"\ControlSet001\Services\Foo");
+    assert_eq!(rel, r"\ControlSet002\Services\Foo");
+    assert_eq!(
+        mt.resolve(r"\Registry\Machine\System\Other\CurrentControlSet\Foo")
+            .unwrap()
+            .1,
+        r"\Other\CurrentControlSet\Foo"
+    );
     // Longest-mount-root wins.
     assert_eq!(mt.resolve(r"\Registry\Machine\Software\X").unwrap().0, 2);
     assert!(mt.owns_path(r"\Registry\Machine\Software\Missing"));
     // Unmounted path → None.
     assert!(mt.resolve(r"\Registry\User\Foo").is_none());
     assert!(!mt.owns_path(r"\Registry\User\Foo"));
+
+    let mut unselected = HiveMountTable::new();
+    unselected.mount(SYSTEM_HIVE_PATH, 7);
+    assert!(unselected.owns_path(r"\Registry\Machine\System\CurrentControlSet\Services"));
+    assert!(unselected
+        .resolve(r"\Registry\Machine\System\CurrentControlSet\Services")
+        .is_none());
+}
+
+#[test]
+fn mutable_hive_set_rejects_invalid_system_replacement_atomically() {
+    let mut selected = mountable_system_hive();
+    selected.create_key(r"ControlSet001\Services\Live");
+    let mut set = MutableHiveSet::new();
+    set.mount(SYSTEM_HIVE_PATH, 1, selected).unwrap();
+
+    let invalid = Hive::new(HiveKind::System);
+    assert_eq!(
+        set.mount(SYSTEM_HIVE_PATH, 1, invalid),
+        Err(CurrentControlSetError::SelectKeyMissing)
+    );
+    assert!(set
+        .resolve_key(r"\Registry\Machine\System\CurrentControlSet\Services\Live")
+        .is_some());
+    assert_eq!(
+        set.hive(1).unwrap().current_control_set().unwrap().number(),
+        1
+    );
 }
 
 #[test]
 fn mutable_hive_set_resolves_mutates_and_unmounts_hives() {
-    let mut system = Hive::new(HiveKind::System);
+    let mut system = mountable_system_hive();
     system.create_key(r"ControlSet001\Services");
     let mut software = Hive::new(HiveKind::Software);
     software.create_key(r"Microsoft");
 
     let mut set = MutableHiveSet::new();
-    set.mount(SYSTEM_HIVE_PATH, 1, system);
-    set.mount(r"\Registry\Machine\Software", 2, software);
+    set.mount(SYSTEM_HIVE_PATH, 1, system).unwrap();
+    set.mount(r"\Registry\Machine\Software", 2, software)
+        .unwrap();
     assert!(set.clear_hive_dirty(1));
     assert_eq!(set.hive(1).unwrap().dirty_count(), 0);
 
@@ -645,10 +692,10 @@ fn same_hive_value_copy_shares_payload_until_replacement() {
 
 #[test]
 fn mutable_hive_set_replaces_mounted_value() {
-    let mut system = Hive::new(HiveKind::System);
+    let mut system = mountable_system_hive();
     system.create_key(r"ControlSet001\Services");
     let mut set = MutableHiveSet::new();
-    set.mount(SYSTEM_HIVE_PATH, 1, system);
+    set.mount(SYSTEM_HIVE_PATH, 1, system).unwrap();
     let key = set
         .create_key(r"\Registry\Machine\System\CurrentControlSet\Services\Large")
         .expect("large key");
@@ -661,7 +708,7 @@ fn mutable_hive_set_replaces_mounted_value() {
 
 #[test]
 fn mutable_hive_set_cross_hive_copy_shares_payload_until_replacement() {
-    let mut system = Hive::new(HiveKind::System);
+    let mut system = mountable_system_hive();
     let system_key = system.create_key(r"ControlSet001\Setup");
     let mut large = alloc::vec::Vec::new();
     large.resize(128 * 1024, 0x42);
@@ -674,8 +721,9 @@ fn mutable_hive_set_cross_hive_copy_shares_payload_until_replacement() {
     software.create_key(r"Microsoft\SetupCopy");
 
     let mut set = MutableHiveSet::new();
-    set.mount(SYSTEM_HIVE_PATH, 1, system);
-    set.mount(r"\Registry\Machine\Software", 2, software);
+    set.mount(SYSTEM_HIVE_PATH, 1, system).unwrap();
+    set.mount(r"\Registry\Machine\Software", 2, software)
+        .unwrap();
     let source_key = set
         .resolve_key(r"\Registry\Machine\System\CurrentControlSet\Setup")
         .expect("source key");
@@ -1346,9 +1394,16 @@ struct LiveApplySetupSeedTarget {
 
 impl LiveApplySetupSeedTarget {
     fn new(kind: HiveKind) -> Self {
+        let mut hive = Hive::new(kind);
+        if kind == HiveKind::System {
+            let select = hive.create_key("Select");
+            hive.set_dword(select, "Current", 1);
+            hive.create_key("ControlSet001");
+            hive.finish_clean_import();
+        }
         Self {
             provider: Some(MemoryHiveIoProvider::new()),
-            hive: Hive::new(kind),
+            hive,
         }
     }
 
@@ -1369,12 +1424,8 @@ impl LiveApplySetupSeedTarget {
         changed
     }
 
-    fn system_rel_path(path: &str) -> String {
-        let aliased = apply_ccs_alias(path);
-        let components: Vec<&str> = aliased
-            .split('\\')
-            .filter(|part| !part.is_empty())
-            .collect();
+    fn system_rel_path(&self, path: &str) -> String {
+        let components: Vec<&str> = path.split('\\').filter(|part| !part.is_empty()).collect();
         let start = if components.len() >= 3
             && components[0].eq_ignore_ascii_case("Registry")
             && components[1].eq_ignore_ascii_case("Machine")
@@ -1384,20 +1435,17 @@ impl LiveApplySetupSeedTarget {
         } else {
             0
         };
-        let mut out = String::new();
-        for component in components[start..].iter().copied() {
-            if !out.is_empty() {
-                out.push('\\');
-            }
-            out.push_str(component);
-        }
-        out
+        let relative = components[start..].join("\\");
+        self.hive
+            .current_control_set()
+            .expect("mounted SYSTEM test hive selection")
+            .resolve_relative_path(&relative)
     }
 }
 
 impl ReactOsSetupSeedTarget for LiveApplySetupSeedTarget {
     fn create_key(&mut self, path: &str) -> bool {
-        let path = Self::system_rel_path(path);
+        let path = self.system_rel_path(path);
         self.with_manager(|manager, hive| {
             manager
                 .mutate_with_live_apply(hive, HiveLogOp::CreateKey { path: &path }, |hive| {
@@ -1418,7 +1466,7 @@ impl ReactOsSetupSeedTarget for LiveApplySetupSeedTarget {
         if self.value_matches(path, name, value_type, &data) {
             return false;
         }
-        let path = Self::system_rel_path(path);
+        let path = self.system_rel_path(path);
         self.with_manager(|manager, hive| {
             let key = hive.create_key(&path);
             let live_data = data.clone();
@@ -1438,7 +1486,7 @@ impl ReactOsSetupSeedTarget for LiveApplySetupSeedTarget {
     }
 
     fn has_value(&self, path: &str, name: &str) -> bool {
-        let path = Self::system_rel_path(path);
+        let path = self.system_rel_path(path);
         self.hive
             .open_key(&path)
             .and_then(|key| self.hive.query_value(key, name))
@@ -1452,7 +1500,7 @@ impl ReactOsSetupSeedTarget for LiveApplySetupSeedTarget {
         value_type: RegistryValueType,
         data: &[u8],
     ) -> bool {
-        let path = Self::system_rel_path(path);
+        let path = self.system_rel_path(path);
         self.hive
             .open_key(&path)
             .and_then(|key| self.hive.query_value(key, name))
