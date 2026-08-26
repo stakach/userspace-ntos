@@ -12593,3 +12593,29 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Services-order cache in the same accepted cut. SOFTWARE, SECURITY, SAM, user hives, and volatile
     state remain separately owned until their own mount migration; no path may have overlapping live
     owners.
+
+    Mounted SYSTEM-hive transport foundation (2026-08-26, crate accepted): `nt-config-abi`,
+    `nt-config-client`, and `nt-config-server` now support tokenized BEGIN/PUSH/COMMIT/ABORT import
+    of a complete `nt-hive-core` SYSTEM image. COMMIT validates the image and hive kind before one
+    atomic mount replacement; a corrupt or wrong-kind image leaves the previous generation intact.
+    Multiple imports may be staged concurrently without sharing assembly state.
+
+    The same boundary provides immutable, generation-labelled key snapshots streamed over any
+    number of reply frames. A snapshot includes key class and security descriptor plus every
+    immediate subkey/class and value type/data, so moving a reader no longer loses NT hive metadata
+    or imposes a frame-sized data ceiling. Focused validation is green at `nt-config-abi` `3/3`,
+    `nt-config-client` `13/13`, and `nt-config-server` `7/7`, including interleaved import tokens,
+    corrupt-import atomicity, a multi-frame hive, a 9 KiB value, a 5 KiB security descriptor,
+    73 subkeys, and a read snapshot retained across mount replacement.
+
+    Generated CONFIG mount integration (2026-08-26, implementation green): executive startup no
+    longer snapshots the generated CONFIG semantic tree and recreates it key by key through CM
+    create/set calls. It imports the complete generated SYSTEM hive image in one atomic operation
+    and gates success on a nonzero returned mount generation. The freestanding release check is
+    green at the established 212-warning baseline and `git diff --check` is clean.
+
+    Review adjustment: this removes the old key-by-key seed machinery, but it is not yet persistent
+    SYSTEM authority convergence. Accept the integration only after the serialized desktop gate.
+    Then construct one boot image from the replayed persistent SYSTEM hive plus the generated
+    configuration overlay, hand that image to CM once, and migrate direct SYSTEM readers before
+    introducing journalled mutation leases. Do not retain the generated-only mount as a fallback.
