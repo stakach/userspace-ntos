@@ -23,6 +23,7 @@ const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_NO_SUCH_DEVICE: u32 = 0xC000_000E;
 const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
+const STATUS_NO_MORE_ENTRIES: u32 = 0x8000_001A;
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
@@ -2132,9 +2133,9 @@ fn seed_time_zone(
     use nt_kernel_exec::timezone::{TimeZoneInformation, TimeZoneRegistryField};
 
     let mut information = TimeZoneInformation::default();
-    let Some(key) = hives.resolve_key(
-        r"\Registry\Machine\System\CurrentControlSet\Control\TimeZoneInformation",
-    ) else {
+    let Some(key) = hives
+        .resolve_key(r"\Registry\Machine\System\CurrentControlSet\Control\TimeZoneInformation")
+    else {
         return information;
     };
     for (name, field) in [
@@ -3079,7 +3080,7 @@ impl ExecNtHandler {
         // Early executive self-tests construct a handler before the storage-backed hives are mounted.
         // The installed-boot network seed belongs only to the real SYSTEM hive path.
         self.hive.as_ref()?;
-        Self::pnp_config_manager_snapshot()
+        boot_system_config_manager()
     }
 
     /// Seed ReactOS network setup state that `hivesys.inf`, `nettcpip.inf`, and `afd_reg.inf`
@@ -5530,9 +5531,9 @@ impl ExecNtHandler {
                 }
                 Err(
                     nt_hive_regf::RegfHiveImportError::InvalidClass
-                        | nt_hive_regf::RegfHiveImportError::InvalidSecurityDescriptor
-                        | nt_hive_regf::RegfHiveImportError::UnsupportedValueType(_)
-                        | nt_hive_regf::RegfHiveImportError::DepthLimitOrCycle,
+                    | nt_hive_regf::RegfHiveImportError::InvalidSecurityDescriptor
+                    | nt_hive_regf::RegfHiveImportError::UnsupportedValueType(_)
+                    | nt_hive_regf::RegfHiveImportError::DepthLimitOrCycle,
                 ) => {
                     USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
                     print_str(b"[cm-load] NtLoadKey: mutable import metadata corrupt bytes=");
@@ -5766,25 +5767,24 @@ impl ExecNtHandler {
             return STATUS_IMAGE_ALREADY_LOADED;
         }
 
-        let start_reservation = if spec.class == driver_launch::DriverClass::Device
-            && !spec.devnodes.is_empty()
-        {
-            if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free() {
-                return STATUS_INSUFFICIENT_RESOURCES;
-            }
-            let old_capacity = self.pending_driver_loads.allocation_capacity();
-            match self.pending_driver_loads.reserve() {
-                Ok(reservation) => {
-                    if self.pending_driver_loads.allocation_capacity() != old_capacity {
-                        crate::mark_durable_table_growth_dirty();
-                    }
-                    Some(reservation)
+        let start_reservation =
+            if spec.class == driver_launch::DriverClass::Device && !spec.devnodes.is_empty() {
+                if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free() {
+                    return STATUS_INSUFFICIENT_RESOURCES;
                 }
-                Err(_) => return STATUS_INSUFFICIENT_RESOURCES,
-            }
-        } else {
-            None
-        };
+                let old_capacity = self.pending_driver_loads.allocation_capacity();
+                match self.pending_driver_loads.reserve() {
+                    Ok(reservation) => {
+                        if self.pending_driver_loads.allocation_capacity() != old_capacity {
+                            crate::mark_durable_table_growth_dirty();
+                        }
+                        Some(reservation)
+                    }
+                    Err(_) => return STATUS_INSUFFICIENT_RESOURCES,
+                }
+            } else {
+                None
+            };
 
         let Some(fs) = exec_fs() else {
             if let Some(reservation) = start_reservation {
@@ -5805,11 +5805,8 @@ impl ExecNtHandler {
             return STATUS_UNSUCCESSFUL;
         };
         if let Some(reservation) = start_reservation {
-            let mut batch = OwnedHostedPnpStartBatch::new(
-                &dc,
-                spec,
-                HostedPnpStartOptions::demand_start(),
-            );
+            let mut batch =
+                OwnedHostedPnpStartBatch::new(&dc, spec, HostedPnpStartOptions::demand_start());
             match batch.drive() {
                 OwnedHostedPnpStartProgress::AwaitingCompletion => {
                     self.pending_driver_load_transfer = Some((batch, reservation));
@@ -5821,9 +5818,8 @@ impl ExecNtHandler {
                         .expect("synchronous driver START lost its continuation reservation");
                     if let Err(failure) = result {
                         if !failure.teardown_blocked {
-                            let _ = driver_launch::unload_driver_by_name(
-                                batch.driver_object_path(),
-                            );
+                            let _ =
+                                driver_launch::unload_driver_by_name(batch.driver_object_path());
                         }
                         return failure.status.raw() as u32;
                     }
@@ -5868,16 +5864,12 @@ impl ExecNtHandler {
             Err(status) => return status as u32,
         };
         for slot in 0..self.pending_driver_loads.slot_count() {
-            if self
-                .pending_driver_loads
-                .get(slot)
-                .is_some_and(|pending| {
-                    pending
-                        .batch
-                        .driver_object_path()
-                        .eq_ignore_ascii_case(&driver_object_path)
-                })
-            {
+            if self.pending_driver_loads.get(slot).is_some_and(|pending| {
+                pending
+                    .batch
+                    .driver_object_path()
+                    .eq_ignore_ascii_case(&driver_object_path)
+            }) {
                 return nt_status::NtStatus::DEVICE_BUSY.raw() as u32;
             }
         }
@@ -15135,26 +15127,27 @@ impl ExecNtHandler {
             .is_some_and(|token| token.has_privilege(name))
     }
 
-    fn pnp_config_manager_snapshot() -> Option<nt_config_manager::ConfigManager> {
-        let image_bytes = BOOT_SYSTEM_HIVE_IMAGE_BYTES.load(Ordering::Acquire);
-        trace_setup_provision_phase(b"pnp-snapshot-system-begin", image_bytes);
-        let system = boot_system_config_manager();
-        trace_setup_provision_phase(
-            b"pnp-snapshot-system-end",
-            system
-                .as_ref()
-                .map(|cm| cm.devnode_count() as u64)
-                .unwrap_or(u64::MAX),
-        );
-        system
+    fn pnp_query(
+        query_kind: u16,
+        selector: u32,
+        instance: &str,
+        auxiliary: &[u8],
+    ) -> Result<nt_config_client::PnpQuerySnapshot, u32> {
+        unsafe { config_manager_query_pnp(query_kind, selector, instance, auxiliary) }
+            .map_err(|status| status as u32)
     }
 
-    fn pnp_is_root_instance(instance: &str) -> bool {
-        instance.eq_ignore_ascii_case(nt_config_manager::PNP_ROOT_DEVICE_INSTANCE)
-    }
-
-    fn pnp_devnode_exists(cm: &nt_config_manager::ConfigManager, instance: &str) -> bool {
-        cm.pnp_device_exists(instance)
+    fn pnp_device_exists(instance: &str) -> Result<bool, u32> {
+        match Self::pnp_query(
+            nt_config_abi::pnp_query_kind::DEVICE_EXISTS,
+            0,
+            instance,
+            &[],
+        ) {
+            Ok(_) => Ok(true),
+            Err(STATUS_NO_SUCH_DEVICE) => Ok(false),
+            Err(status) => Err(status),
+        }
     }
 
     fn pnp_append_utf16_z(out: &mut alloc::vec::Vec<u8>, s: &str) {
@@ -15233,24 +15226,28 @@ impl ExecNtHandler {
             return STATUS_PRIVILEGE_NOT_HELD;
         }
 
-        let Some(cm) = Self::pnp_config_manager_snapshot() else {
-            let Ok(object) = self.pnp_event_wait_object() else {
-                return STATUS_DEVICE_NOT_READY;
-            };
-            self.wait_park_event = object.raw() as i64;
-            self.wait_timeout = PendingWaitTimeout::none();
-            return 0x102;
-        };
-        let Some(devnode) = cm.devnodes().get(self.pnp_event_cursor) else {
-            let Ok(object) = self.pnp_event_wait_object() else {
-                return STATUS_DEVICE_NOT_READY;
-            };
-            self.wait_park_event = object.raw() as i64;
-            self.wait_timeout = PendingWaitTimeout::none();
-            return 0x102;
+        let instance = match Self::pnp_query(
+            nt_config_abi::pnp_query_kind::ENUMERATE_DEVNODE,
+            self.pnp_event_cursor.min(u32::MAX as usize) as u32,
+            "",
+            &[],
+        ) {
+            Ok(snapshot) if snapshot.strings.len() == 1 && snapshot.payload.is_empty() => {
+                snapshot.strings.into_iter().next().unwrap()
+            }
+            Err(STATUS_NO_MORE_ENTRIES) => {
+                let Ok(object) = self.pnp_event_wait_object() else {
+                    return STATUS_DEVICE_NOT_READY;
+                };
+                self.wait_park_event = object.raw() as i64;
+                self.wait_timeout = PendingWaitTimeout::none();
+                return 0x102;
+            }
+            Err(status) => return status,
+            _ => return STATUS_INVALID_PARAMETER,
         };
 
-        let event = Self::pnp_encode_device_install_event(&devnode.instance_id);
+        let event = Self::pnp_encode_device_install_event(&instance);
         if buffer_size < event.len() {
             return STATUS_BUFFER_TOO_SMALL;
         }
@@ -15310,9 +15307,10 @@ impl ExecNtHandler {
             Ok(instance) => instance,
             Err(status) => return status,
         };
-        match Self::pnp_config_manager_snapshot() {
-            Some(cm) if Self::pnp_devnode_exists(&cm, &instance) => 0,
-            _ => STATUS_NO_SUCH_DEVICE,
+        match Self::pnp_device_exists(&instance) {
+            Ok(true) => 0,
+            Ok(false) => STATUS_NO_SUCH_DEVICE,
+            Err(status) => status,
         }
     }
 
@@ -15324,9 +15322,10 @@ impl ExecNtHandler {
             Ok(instance) => instance,
             Err(status) => return status,
         };
-        match Self::pnp_config_manager_snapshot() {
-            Some(cm) if Self::pnp_devnode_exists(&cm, &instance) => 0,
-            _ => STATUS_NO_SUCH_DEVICE,
+        match Self::pnp_device_exists(&instance) {
+            Ok(true) => 0,
+            Ok(false) => STATUS_NO_SUCH_DEVICE,
+            Err(status) => status,
         }
     }
 
@@ -15335,8 +15334,15 @@ impl ExecNtHandler {
             return STATUS_INVALID_PARAMETER;
         }
         self.pnp_event_cursor = self.pnp_event_cursor.saturating_add(1);
-        if let Some(cm) = Self::pnp_config_manager_snapshot() {
-            if self.pnp_event_cursor < cm.devnode_count() && self.pnp_notify_event != 0 {
+        if Self::pnp_query(
+            nt_config_abi::pnp_query_kind::ENUMERATE_DEVNODE,
+            self.pnp_event_cursor.min(u32::MAX as usize) as u32,
+            "",
+            &[],
+        )
+        .is_ok()
+        {
+            if self.pnp_notify_event != 0 {
                 let _ = self.events.set_existing(self.pnp_notify_event);
                 unsafe { wait_wake_dispatcher_set(self) };
             }
@@ -15390,15 +15396,15 @@ impl ExecNtHandler {
         if filter_guid == 0 || !self.xas_read(filter_guid, &mut guid) {
             return STATUS_ACCESS_VIOLATION;
         }
-        let Some(cm) = Self::pnp_config_manager_snapshot() else {
-            return STATUS_NO_SUCH_DEVICE;
-        };
-        if !Self::pnp_devnode_exists(&cm, &instance) {
-            return STATUS_NO_SUCH_DEVICE;
-        }
-
-        let Some(links) = cm.pnp_enabled_interface_links_by_guid_bytes(&guid, &instance) else {
-            return STATUS_NO_SUCH_DEVICE;
+        let links = match Self::pnp_query(
+            nt_config_abi::pnp_query_kind::INTERFACE_LINKS,
+            0,
+            &instance,
+            &guid,
+        ) {
+            Ok(snapshot) if snapshot.payload.is_empty() => snapshot.strings,
+            Ok(_) => return STATUS_INVALID_PARAMETER,
+            Err(status) => return status,
         };
         let mut list = alloc::vec::Vec::new();
         for link in links {
@@ -15437,15 +15443,19 @@ impl ExecNtHandler {
             Ok(size) => size as usize,
             Err(status) => return status,
         };
-        let Some(cm) = Self::pnp_config_manager_snapshot() else {
-            return STATUS_NO_SUCH_DEVICE;
-        };
-        if !Self::pnp_devnode_exists(&cm, &instance) {
-            return STATUS_NO_SUCH_DEVICE;
-        }
-        let Some(data) = cm.pnp_dynamic_property_bytes(&instance, property) else {
-            let _ = self.xas_write_u32(buffer + 32, 0);
-            return STATUS_OBJECT_NAME_NOT_FOUND;
+        let data = match Self::pnp_query(
+            nt_config_abi::pnp_query_kind::DYNAMIC_PROPERTY,
+            property,
+            &instance,
+            &[],
+        ) {
+            Ok(snapshot) if snapshot.strings.is_empty() => snapshot.payload,
+            Ok(_) => return STATUS_INVALID_PARAMETER,
+            Err(STATUS_OBJECT_NAME_NOT_FOUND) => {
+                let _ = self.xas_write_u32(buffer + 32, 0);
+                return STATUS_OBJECT_NAME_NOT_FOUND;
+            }
+            Err(status) => return status,
         };
         self.pnp_write_sized_output(buffer + 32, output, output_size, &data)
     }
@@ -15478,14 +15488,17 @@ impl ExecNtHandler {
             Ok(size) => size as usize,
             Err(status) => return status,
         };
-        let Some(cm) = Self::pnp_config_manager_snapshot() else {
-            return STATUS_NO_SUCH_DEVICE;
-        };
-        if !Self::pnp_devnode_exists(&cm, &instance) {
-            return STATUS_NO_SUCH_DEVICE;
-        }
-        let Some(related) = cm.pnp_related_device(&instance, relation) else {
-            return STATUS_NO_SUCH_DEVICE;
+        let related = match Self::pnp_query(
+            nt_config_abi::pnp_query_kind::RELATED_DEVICE,
+            relation,
+            &instance,
+            &[],
+        ) {
+            Ok(snapshot) if snapshot.strings.len() == 1 && snapshot.payload.is_empty() => {
+                snapshot.strings.into_iter().next().unwrap()
+            }
+            Ok(_) => return STATUS_INVALID_PARAMETER,
+            Err(status) => return status,
         };
         let mut data = alloc::vec::Vec::new();
         append_utf16le(&mut data, &related);
@@ -15585,11 +15598,10 @@ impl ExecNtHandler {
             Ok(operation) => operation,
             Err(status) => return status,
         };
-        let Some(cm) = Self::pnp_config_manager_snapshot() else {
-            return STATUS_NO_SUCH_DEVICE;
-        };
-        if !Self::pnp_devnode_exists(&cm, &instance) {
-            return STATUS_NO_SUCH_DEVICE;
+        match Self::pnp_device_exists(&instance) {
+            Ok(true) => {}
+            Ok(false) => return STATUS_NO_SUCH_DEVICE,
+            Err(status) => return status,
         }
         match operation {
             PNP_GET_DEVICE_STATUS => {
@@ -15635,11 +15647,17 @@ impl ExecNtHandler {
             Ok(instance) => instance,
             Err(status) => return status,
         };
-        let Some(cm) = Self::pnp_config_manager_snapshot() else {
-            return STATUS_NO_SUCH_DEVICE;
-        };
-        let Some(depth) = cm.pnp_device_depth(&instance) else {
-            return STATUS_NO_SUCH_DEVICE;
+        let depth = match Self::pnp_query(
+            nt_config_abi::pnp_query_kind::DEVICE_DEPTH,
+            0,
+            &instance,
+            &[],
+        ) {
+            Ok(snapshot) if snapshot.strings.is_empty() && snapshot.payload.len() == 4 => {
+                u32::from_le_bytes(snapshot.payload.try_into().unwrap())
+            }
+            Ok(_) => return STATUS_INVALID_PARAMETER,
+            Err(status) => return status,
         };
         if !self.xas_write_u32(buffer + 16, depth) {
             return STATUS_ACCESS_VIOLATION;
@@ -15670,20 +15688,25 @@ impl ExecNtHandler {
         if relations > PNP_BUS_RELATIONS {
             return STATUS_INVALID_PARAMETER;
         }
-        let Some(cm) = Self::pnp_config_manager_snapshot() else {
-            return STATUS_NO_SUCH_DEVICE;
-        };
-
-        let data = if relations == PNP_BUS_RELATIONS && Self::pnp_is_root_instance(&instance) {
-            let Some(ids) = cm.pnp_bus_relation_instances(&instance) else {
-                return STATUS_NO_SUCH_DEVICE;
-            };
-            Self::pnp_encode_multi_sz_from_strings(&ids)
-        } else {
-            if !Self::pnp_devnode_exists(&cm, &instance) {
-                return STATUS_NO_SUCH_DEVICE;
+        let data = if relations == PNP_BUS_RELATIONS {
+            match Self::pnp_query(
+                nt_config_abi::pnp_query_kind::BUS_RELATIONS,
+                0,
+                &instance,
+                &[],
+            ) {
+                Ok(snapshot) if snapshot.payload.is_empty() => {
+                    Self::pnp_encode_multi_sz_from_strings(&snapshot.strings)
+                }
+                Ok(_) => return STATUS_INVALID_PARAMETER,
+                Err(status) => return status,
             }
-            alloc::vec::Vec::new()
+        } else {
+            match Self::pnp_device_exists(&instance) {
+                Ok(true) => alloc::vec::Vec::new(),
+                Ok(false) => return STATUS_NO_SUCH_DEVICE,
+                Err(status) => return status,
+            }
         };
         self.pnp_write_sized_output(buffer + 20, output, output_size, &data)
     }
@@ -20200,8 +20223,7 @@ impl ExecNtHandler {
     /// generation-specific identity already stored on the matching mutable hive mount.
     pub(crate) fn resolve_key(&self, full_path: &str) -> Option<KeyRef> {
         let physical = self.overlay_canon(full_path);
-        let comps: alloc::vec::Vec<&str> =
-            physical.split('\\').filter(|c| !c.is_empty()).collect();
+        let comps: alloc::vec::Vec<&str> = physical.split('\\').filter(|c| !c.is_empty()).collect();
         // ★ `\Registry\User\…` — the per-user hive namespace, served by the mount table so every
         // generic consumer of `resolve_key` (path-exists, value/subkey reads, `NtCreateKey`'s
         // parent check, the overlay's base-hive fall-through) composes with a loaded hive for free.
@@ -22451,9 +22473,7 @@ impl ExecNtHandler {
                         .unwrap_or("")
                 });
                 let services_order_may_change = key_path_for_counters
-                    .is_some_and(|path| {
-                        self.registry_services_order_value_write_may_reorder(path)
-                    });
+                    .is_some_and(|path| self.registry_services_order_value_write_may_reorder(path));
                 let mutable_target = if overlay_key_idx(key).is_none() && existing_overlay.is_none()
                 {
                     self.mutable_registry_key(key)
@@ -22723,11 +22743,9 @@ impl ExecNtHandler {
                 }
                 let key_path = self.registry_target_path(key);
                 if let Some(mutable_key) = self.mutable_registry_key(key) {
-                    let services_order_may_change = key_path
-                        .as_deref()
-                        .is_some_and(|path| {
-                            self.registry_services_order_key_membership_may_change(path)
-                        });
+                    let services_order_may_change = key_path.as_deref().is_some_and(|path| {
+                        self.registry_services_order_key_membership_may_change(path)
+                    });
                     match self.journal_delete_mutable_key(mutable_key) {
                         Ok(()) => {
                             if let Some(path) = key_path.as_deref() {

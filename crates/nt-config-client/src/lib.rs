@@ -15,18 +15,20 @@ use alloc::vec::Vec;
 
 use nt_config_abi::{
     device_property_transfer, driver_service_class, driver_service_transfer, hive_import_transfer,
-    hive_key_transfer, hive_mount, launch_plan_kind, launch_plan_transfer, opcode,
-    win32_service_plan_kind, win32_service_process_kind, CmDevicePropertyRequest,
-    CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveImportRequest, CmHiveKeyRequest,
-    CmKeyRequest, CmLaunchPlanRequest, CmRawValueRequest, CmReply, CmValueRequest, CM_ABI_VERSION,
-    CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_DRIVER_SERVICE_CHUNK_BYTES,
-    CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_MAGIC,
-    CM_DRIVER_SERVICE_SNAPSHOT_VERSION, CM_HIVE_IMPORT_CHUNK_BYTES, CM_HIVE_KEY_CHUNK_BYTES,
-    CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES, CM_HIVE_KEY_SNAPSHOT_MAGIC, CM_HIVE_KEY_SNAPSHOT_VERSION,
-    CM_LAUNCH_PLAN_CHUNK_BYTES, CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES,
-    CM_LAUNCH_PLAN_SNAPSHOT_MAGIC, CM_LAUNCH_PLAN_SNAPSHOT_VERSION, CM_MAX_HIVE_PATH_UNITS,
-    CM_MAX_INSTANCE_UNITS, CM_MAX_SERVICE_UNITS, CM_OPTIONAL_BLOB_ABSENT,
-    CM_OPTIONAL_STRING_ABSENT, CM_OPTIONAL_U32_ABSENT, CM_WIN32_SERVICE_PLAN_SNAPSHOT_HEADER_BYTES,
+    hive_key_transfer, hive_mount, launch_plan_kind, launch_plan_transfer, opcode, pnp_query_kind,
+    pnp_query_transfer, win32_service_plan_kind, win32_service_process_kind,
+    CmDevicePropertyRequest, CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveImportRequest,
+    CmHiveKeyRequest, CmKeyRequest, CmLaunchPlanRequest, CmPnpQueryRequest, CmRawValueRequest,
+    CmReply, CmValueRequest, CM_ABI_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES,
+    CM_DRIVER_SERVICE_CHUNK_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES,
+    CM_DRIVER_SERVICE_SNAPSHOT_MAGIC, CM_DRIVER_SERVICE_SNAPSHOT_VERSION,
+    CM_HIVE_IMPORT_CHUNK_BYTES, CM_HIVE_KEY_CHUNK_BYTES, CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES,
+    CM_HIVE_KEY_SNAPSHOT_MAGIC, CM_HIVE_KEY_SNAPSHOT_VERSION, CM_LAUNCH_PLAN_CHUNK_BYTES,
+    CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES, CM_LAUNCH_PLAN_SNAPSHOT_MAGIC,
+    CM_LAUNCH_PLAN_SNAPSHOT_VERSION, CM_MAX_HIVE_PATH_UNITS, CM_MAX_INSTANCE_UNITS,
+    CM_MAX_PNP_AUX_BYTES, CM_MAX_SERVICE_UNITS, CM_OPTIONAL_BLOB_ABSENT, CM_OPTIONAL_STRING_ABSENT,
+    CM_OPTIONAL_U32_ABSENT, CM_PNP_QUERY_SNAPSHOT_HEADER_BYTES, CM_PNP_QUERY_SNAPSHOT_MAGIC,
+    CM_PNP_QUERY_SNAPSHOT_VERSION, CM_WIN32_SERVICE_PLAN_SNAPSHOT_HEADER_BYTES,
     CM_WIN32_SERVICE_PLAN_SNAPSHOT_MAGIC, CM_WIN32_SERVICE_PLAN_SNAPSHOT_VERSION,
 };
 
@@ -107,6 +109,14 @@ pub struct Win32ServiceLaunchPlanSnapshot {
     pub mount_generation: u64,
     pub plan_kind: u16,
     pub launches: Vec<Win32ServiceProcessLaunch>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PnpQuerySnapshot {
+    pub mount_generation: u64,
+    pub query_kind: u16,
+    pub strings: Vec<String>,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -422,6 +432,49 @@ fn decode_win32_service_launch_plan(bytes: &[u8]) -> Option<Win32ServiceLaunchPl
         mount_generation,
         plan_kind,
         launches,
+    })
+}
+
+fn decode_pnp_query_snapshot(bytes: &[u8]) -> Option<PnpQuerySnapshot> {
+    if bytes.len() < CM_PNP_QUERY_SNAPSHOT_HEADER_BYTES {
+        return None;
+    }
+    let mut reader = SnapshotReader::new(bytes);
+    if reader.u32()? != CM_PNP_QUERY_SNAPSHOT_MAGIC
+        || reader.u16()? != CM_PNP_QUERY_SNAPSHOT_VERSION
+    {
+        return None;
+    }
+    let query_kind = reader.u16()?;
+    if !matches!(
+        query_kind,
+        pnp_query_kind::DEVICE_EXISTS
+            | pnp_query_kind::ENUMERATE_DEVNODE
+            | pnp_query_kind::INTERFACE_LINKS
+            | pnp_query_kind::DYNAMIC_PROPERTY
+            | pnp_query_kind::RELATED_DEVICE
+            | pnp_query_kind::DEVICE_DEPTH
+            | pnp_query_kind::BUS_RELATIONS
+    ) {
+        return None;
+    }
+    let mount_generation = reader.u64()?;
+    if mount_generation == 0 {
+        return None;
+    }
+    let string_count = usize::try_from(reader.u32()?).ok()?;
+    let payload_bytes = usize::try_from(reader.u32()?).ok()?;
+    let mut strings = Vec::new();
+    strings.try_reserve_exact(string_count).ok()?;
+    for _ in 0..string_count {
+        strings.push(reader.string()?);
+    }
+    let payload = Vec::from(reader.take(payload_bytes)?);
+    reader.finished().then_some(PnpQuerySnapshot {
+        mount_generation,
+        query_kind,
+        strings,
+        payload,
     })
 }
 
@@ -922,6 +975,117 @@ impl<B: Backend> ConfigClient<B> {
         decode_win32_service_launch_plan(&value).ok_or(STATUS_INVALID_PARAMETER)
     }
 
+    pub fn query_pnp(
+        &mut self,
+        query_kind: u16,
+        selector: u32,
+        instance: &str,
+        auxiliary: &[u8],
+    ) -> Result<PnpQuerySnapshot, i32> {
+        let instance_valid = !instance.chars().any(|ch| ch == '\0')
+            && instance.encode_utf16().count() <= CM_MAX_INSTANCE_UNITS;
+        let shape_valid = match query_kind {
+            pnp_query_kind::ENUMERATE_DEVNODE => instance.is_empty() && auxiliary.is_empty(),
+            pnp_query_kind::INTERFACE_LINKS => {
+                !instance.is_empty() && selector == 0 && auxiliary.len() == 16
+            }
+            pnp_query_kind::DYNAMIC_PROPERTY | pnp_query_kind::RELATED_DEVICE => {
+                !instance.is_empty() && auxiliary.is_empty()
+            }
+            pnp_query_kind::DEVICE_EXISTS
+            | pnp_query_kind::DEVICE_DEPTH
+            | pnp_query_kind::BUS_RELATIONS => {
+                !instance.is_empty() && selector == 0 && auxiliary.is_empty()
+            }
+            _ => false,
+        };
+        if !instance_valid || !shape_valid || auxiliary.len() > CM_MAX_PNP_AUX_BYTES {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let instance_bytes = utf16_bytes(instance);
+        let mut value = Vec::new();
+        let mut expected_total = None;
+        let mut token = 0u64;
+        let mut reply_bytes = [0u8; CM_LAUNCH_PLAN_CHUNK_BYTES];
+        loop {
+            let operation = if token == 0 {
+                pnp_query_transfer::BEGIN
+            } else {
+                pnp_query_transfer::PULL
+            };
+            let offset = value.len();
+            let response = match self.pnp_query_call(
+                query_kind,
+                selector,
+                &instance_bytes,
+                auxiliary,
+                operation,
+                token,
+                u32::try_from(offset).map_err(|_| STATUS_INVALID_PARAMETER)?,
+                CM_LAUNCH_PLAN_CHUNK_BYTES as u32,
+                &mut reply_bytes,
+            ) {
+                Ok(response) => response,
+                Err(status) => {
+                    self.abort_pnp_query(query_kind, selector, &instance_bytes, auxiliary, token);
+                    return Err(status);
+                }
+            };
+            if response.status != STATUS_SUCCESS {
+                self.abort_pnp_query(query_kind, selector, &instance_bytes, auxiliary, token);
+                return Err(response.status);
+            }
+            let total = usize::try_from(response.detail0).map_err(|_| STATUS_INVALID_PARAMETER)?;
+            let written = response.information as usize;
+            let reply_token_valid = if token == 0 {
+                (written == total && response.detail1 == 0)
+                    || (written < total && response.detail1 != 0)
+            } else {
+                response.detail1 == token
+            };
+            if total < CM_PNP_QUERY_SNAPSHOT_HEADER_BYTES
+                || expected_total.is_some_and(|expected| expected != total)
+                || !reply_token_valid
+                || written > reply_bytes.len()
+                || offset.checked_add(written).is_none_or(|end| end > total)
+                || (offset < total && written == 0)
+            {
+                self.abort_pnp_query(
+                    query_kind,
+                    selector,
+                    &instance_bytes,
+                    auxiliary,
+                    if token == 0 { response.detail1 } else { token },
+                );
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            if expected_total.is_none() {
+                if value.try_reserve_exact(total).is_err() {
+                    self.abort_pnp_query(
+                        query_kind,
+                        selector,
+                        &instance_bytes,
+                        auxiliary,
+                        response.detail1,
+                    );
+                    return Err(STATUS_INSUFFICIENT_RESOURCES);
+                }
+                expected_total = Some(total);
+            }
+            value.extend_from_slice(&reply_bytes[..written]);
+            if value.len() == total {
+                let snapshot = decode_pnp_query_snapshot(&value).ok_or(STATUS_INVALID_PARAMETER)?;
+                if snapshot.query_kind != query_kind {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                return Ok(snapshot);
+            }
+            if token == 0 {
+                token = response.detail1;
+            }
+        }
+    }
+
     fn query_launch_plan_bytes(
         &mut self,
         query_opcode: u16,
@@ -1136,6 +1300,77 @@ impl<B: Backend> ConfigClient<B> {
         let _ = self.hive_key_call(
             path_bytes,
             hive_key_transfer::ABORT,
+            transfer_token,
+            0,
+            0,
+            &mut [],
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pnp_query_call(
+        &mut self,
+        query_kind: u16,
+        selector: u32,
+        instance_bytes: &[u8],
+        auxiliary: &[u8],
+        operation: u16,
+        transfer_token: u64,
+        value_offset: u32,
+        chunk_capacity: u32,
+        reply_bytes: &mut [u8],
+    ) -> Result<CmReply, i32> {
+        let header_size = core::mem::size_of::<CmPnpQueryRequest>();
+        let auxiliary_offset = header_size
+            .checked_add(instance_bytes.len())
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        let request_header = CmPnpQueryRequest {
+            abi_size: header_size as u16,
+            abi_version: CM_ABI_VERSION,
+            operation,
+            query_kind,
+            value_offset,
+            chunk_capacity,
+            selector,
+            instance_offset: header_size as u32,
+            instance_len_bytes: u32::try_from(instance_bytes.len())
+                .map_err(|_| STATUS_INVALID_PARAMETER)?,
+            auxiliary_offset: u32::try_from(auxiliary_offset)
+                .map_err(|_| STATUS_INVALID_PARAMETER)?,
+            auxiliary_len_bytes: u32::try_from(auxiliary.len())
+                .map_err(|_| STATUS_INVALID_PARAMETER)?,
+            _reserved: 0,
+            transfer_token,
+        };
+        let mut request = Vec::new();
+        request
+            .try_reserve_exact(auxiliary_offset.saturating_add(auxiliary.len()))
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        request.extend_from_slice(request_header.as_bytes());
+        request.extend_from_slice(instance_bytes);
+        request.extend_from_slice(auxiliary);
+        Ok(self
+            .backend
+            .call(opcode::CM_OP_QUERY_PNP, &request, reply_bytes))
+    }
+
+    fn abort_pnp_query(
+        &mut self,
+        query_kind: u16,
+        selector: u32,
+        instance_bytes: &[u8],
+        auxiliary: &[u8],
+        transfer_token: u64,
+    ) {
+        if transfer_token == 0 {
+            return;
+        }
+        let _ = self.pnp_query_call(
+            query_kind,
+            selector,
+            instance_bytes,
+            auxiliary,
+            pnp_query_transfer::ABORT,
             transfer_token,
             0,
             0,
@@ -1527,6 +1762,30 @@ mod tests {
             server: CmServer::new(),
         });
         assert_eq!(client.import_system_hive(&encode_image(&hive)), Ok(1));
+        let interface_guid = "{4d36e972-e325-11ce-bfc1-08002be10318}";
+        let interface_guid_bytes =
+            nt_config_manager::guid_text_to_memory_bytes(interface_guid).unwrap();
+        let boot_devnode = client
+            .backend
+            .server
+            .config()
+            .devnode(r"ROOT\BOOTDEV\0000")
+            .unwrap()
+            .id;
+        let interface = client
+            .backend
+            .server
+            .config_mut()
+            .register_interface(boot_devnode, interface_guid, "net", true)
+            .unwrap();
+        let expected_link = client
+            .backend
+            .server
+            .config()
+            .interface(interface)
+            .unwrap()
+            .symbolic_link
+            .clone();
         let boot = client
             .query_driver_launch_plan(launch_plan_kind::BOOT_SYSTEM_DRIVERS)
             .expect("boot driver plan");
@@ -1575,6 +1834,59 @@ mod tests {
         assert_eq!(demand_services.launches.len(), 1);
         assert_eq!(demand_services.launches[0].service_name, "DemandOwn");
         assert!(demand_services.launches[0].interactive);
+
+        let exists = client
+            .query_pnp(pnp_query_kind::DEVICE_EXISTS, 0, r"ROOT\BOOTDEV\0000", &[])
+            .expect("device exists");
+        assert_eq!(exists.mount_generation, 1);
+        assert!(exists.strings.is_empty() && exists.payload.is_empty());
+        let enumerated = client
+            .query_pnp(pnp_query_kind::ENUMERATE_DEVNODE, 0, "", &[])
+            .expect("enumerate devnode");
+        assert_eq!(enumerated.strings, vec![String::from(r"ROOT\BOOTDEV\0000")]);
+        let property = client
+            .query_pnp(
+                pnp_query_kind::DYNAMIC_PROPERTY,
+                nt_config_manager::pnp_property::ENUMERATOR_NAME,
+                r"ROOT\BOOTDEV\0000",
+                &[],
+            )
+            .expect("dynamic property");
+        assert_eq!(property.payload, encode_sz("ROOT"));
+        let parent = client
+            .query_pnp(
+                pnp_query_kind::RELATED_DEVICE,
+                nt_config_manager::pnp_relation::PARENT,
+                r"ROOT\BOOTDEV\0000",
+                &[],
+            )
+            .expect("parent relation");
+        assert_eq!(
+            parent.strings,
+            vec![String::from(nt_config_manager::PNP_ROOT_DEVICE_INSTANCE)]
+        );
+        let depth = client
+            .query_pnp(pnp_query_kind::DEVICE_DEPTH, 0, r"ROOT\BOOTDEV\0000", &[])
+            .expect("device depth");
+        assert_eq!(depth.payload, 1u32.to_le_bytes());
+        let relations = client
+            .query_pnp(
+                pnp_query_kind::BUS_RELATIONS,
+                0,
+                nt_config_manager::PNP_ROOT_DEVICE_INSTANCE,
+                &[],
+            )
+            .expect("root bus relations");
+        assert_eq!(relations.strings.len(), 2);
+        let interfaces = client
+            .query_pnp(
+                pnp_query_kind::INTERFACE_LINKS,
+                0,
+                r"ROOT\BOOTDEV\0000",
+                &interface_guid_bytes,
+            )
+            .expect("enabled interface links");
+        assert_eq!(interfaces.strings, vec![expected_link]);
     }
 
     #[test]

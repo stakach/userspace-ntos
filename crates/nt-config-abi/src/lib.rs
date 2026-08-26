@@ -38,6 +38,10 @@ pub const CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES: usize = 24;
 pub const CM_WIN32_SERVICE_PLAN_SNAPSHOT_MAGIC: u32 = 0x5053_4D43; // `CMSP`
 pub const CM_WIN32_SERVICE_PLAN_SNAPSHOT_VERSION: u16 = 1;
 pub const CM_WIN32_SERVICE_PLAN_SNAPSHOT_HEADER_BYTES: usize = 24;
+pub const CM_PNP_QUERY_SNAPSHOT_MAGIC: u32 = 0x5150_4D43; // `CMPQ`
+pub const CM_PNP_QUERY_SNAPSHOT_VERSION: u16 = 1;
+pub const CM_PNP_QUERY_SNAPSHOT_HEADER_BYTES: usize = 24;
+pub const CM_MAX_PNP_AUX_BYTES: usize = 16;
 pub const CM_OPTIONAL_STRING_ABSENT: u32 = u32::MAX;
 pub const CM_OPTIONAL_BLOB_ABSENT: u32 = u32::MAX;
 pub const CM_OPTIONAL_U32_ABSENT: u32 = u32::MAX;
@@ -70,6 +74,8 @@ pub mod opcode {
     pub const CM_OP_QUERY_LAUNCH_PLAN: u16 = 0x2152;
     /// Return one immutable, generation-bound ordered Win32 service launch plan.
     pub const CM_OP_QUERY_WIN32_SERVICE_PLAN: u16 = 0x2153;
+    /// Return one immutable, generation-bound semantic PnP query snapshot.
+    pub const CM_OP_QUERY_PNP: u16 = 0x2154;
 }
 
 /// Operation carried by [`CmDevicePropertyRequest::operation`]. Property values are immutable for
@@ -124,6 +130,22 @@ pub mod win32_service_plan_kind {
 pub mod win32_service_process_kind {
     pub const OWN: u16 = 1;
     pub const SHARED: u16 = 2;
+}
+
+pub mod pnp_query_transfer {
+    pub const BEGIN: u16 = 1;
+    pub const PULL: u16 = 2;
+    pub const ABORT: u16 = 3;
+}
+
+pub mod pnp_query_kind {
+    pub const DEVICE_EXISTS: u16 = 1;
+    pub const ENUMERATE_DEVNODE: u16 = 2;
+    pub const INTERFACE_LINKS: u16 = 3;
+    pub const DYNAMIC_PROPERTY: u16 = 4;
+    pub const RELATED_DEVICE: u16 = 5;
+    pub const DEVICE_DEPTH: u16 = 6;
+    pub const BUS_RELATIONS: u16 = 7;
 }
 
 /// Mount identifiers carried by mounted-hive operations.
@@ -278,6 +300,24 @@ pub struct CmLaunchPlanRequest {
     pub transfer_token: u64,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmPnpQueryRequest {
+    pub abi_size: u16,
+    pub abi_version: u16,
+    pub operation: u16,
+    pub query_kind: u16,
+    pub value_offset: u32,
+    pub chunk_capacity: u32,
+    pub selector: u32,
+    pub instance_offset: u32,
+    pub instance_len_bytes: u32,
+    pub auxiliary_offset: u32,
+    pub auxiliary_len_bytes: u32,
+    pub _reserved: u32,
+    pub transfer_token: u64,
+}
+
 macro_rules! wire {
     ($t:ty) => {
         impl $t {
@@ -311,6 +351,7 @@ wire!(CmDriverServiceRequest);
 wire!(CmHiveImportRequest);
 wire!(CmHiveKeyRequest);
 wire!(CmLaunchPlanRequest);
+wire!(CmPnpQueryRequest);
 
 /// Decode a UTF-16LE slice of `buf` (at `offset`, `len_bytes` long) into a `str`
 /// via the caller's scratch — returns the u16 units. Used by the server.
@@ -398,6 +439,7 @@ mod tests {
         assert_eq!(opcode::CM_OP_QUERY_HIVE_KEY, 0x2151);
         assert_eq!(opcode::CM_OP_QUERY_LAUNCH_PLAN, 0x2152);
         assert_eq!(opcode::CM_OP_QUERY_WIN32_SERVICE_PLAN, 0x2153);
+        assert_eq!(opcode::CM_OP_QUERY_PNP, 0x2154);
         assert_eq!(core::mem::size_of::<CmHiveImportRequest>(), 32);
         assert_eq!(core::mem::size_of::<CmHiveKeyRequest>(), 32);
 
@@ -441,5 +483,23 @@ mod tests {
         };
         assert_eq!(core::mem::size_of::<CmLaunchPlanRequest>(), 24);
         assert_eq!(CmLaunchPlanRequest::from_bytes(plan.as_bytes()), Some(plan));
+
+        let pnp = CmPnpQueryRequest {
+            abi_size: 48,
+            abi_version: CM_ABI_VERSION,
+            operation: pnp_query_transfer::BEGIN,
+            query_kind: pnp_query_kind::DEVICE_DEPTH,
+            value_offset: 0,
+            chunk_capacity: 4096,
+            selector: 0,
+            instance_offset: 48,
+            instance_len_bytes: 8,
+            auxiliary_offset: 56,
+            auxiliary_len_bytes: 16,
+            _reserved: 0,
+            transfer_token: 0,
+        };
+        assert_eq!(core::mem::size_of::<CmPnpQueryRequest>(), 48);
+        assert_eq!(CmPnpQueryRequest::from_bytes(pnp.as_bytes()), Some(pnp));
     }
 }

@@ -15068,6 +15068,26 @@ unsafe fn config_manager_query_win32_service_launch_plan(
     Ok(snapshot)
 }
 
+pub(crate) unsafe fn config_manager_query_pnp(
+    query_kind: u16,
+    selector: u32,
+    instance: &str,
+    auxiliary: &[u8],
+) -> Result<nt_config_client::PnpQuerySnapshot, i32> {
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if expected_generation == 0 {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    let snapshot = client.query_pnp(query_kind, selector, instance, auxiliary)?;
+    if snapshot.mount_generation != expected_generation {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    Ok(snapshot)
+}
+
 pub(crate) unsafe fn config_manager_query_system_hive_key(
     path: &str,
 ) -> Result<nt_config_client::HiveKeySnapshot, i32> {

@@ -12965,3 +12965,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     with generation-bearing CM topology/property/interface queries, preserving executive-owned
     runtime status and wait/event state. Then delete the decoder and image-size marker before the
     next desktop acceptance run.
+
+    Live CM PnP query migration (2026-08-26, implementation green): the CM ABI now exposes one
+    generation-bearing semantic PnP query envelope for device existence, ordered devnode
+    enumeration, enabled interface links, dynamic properties, parent/child/sibling relations,
+    device depth, and bus relations. Each BEGIN refreshes registry-backed devnodes, freezes the
+    result, and validates the complete query identity across PULL/ABORT. Missing devices remain
+    distinct from absent properties and end-of-enumeration.
+
+    `NtGetPlugPlayEvent` and every implemented `NtPlugPlayControl` class now query isolated CM.
+    The executive retains its user-buffer marshalling, privilege checks, dispatcher event/cursor,
+    and runtime status/problem overlay; it no longer reconstructs topology or interface state from
+    an image. The client round trip covers all query classes, including an enabled interface link,
+    and verifies the mounted generation. ABI `3/3`, server `9/9`, client `14/14`, and the
+    freestanding executive release check are green; the executive remains at 212 warnings.
+
+    Review adjustment: runtime PnP ownership is closed. Review found one non-PnP caller of the old
+    decoder: installed-network setup derives adapter/class/linkage materialization inputs from a
+    temporary semantic manager. Add a CM-owned generation-bearing network-adapter binding plan that
+    carries the resolved interface name, device/export names, class/linkage paths, description,
+    component id, and instance id. Consume that plan in the setup target, then delete
+    `boot_system_config_manager` and `BOOT_SYSTEM_HIVE_IMAGE_BYTES` before desktop acceptance.
