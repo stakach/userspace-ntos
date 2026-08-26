@@ -13726,3 +13726,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Introduce a reusable bounded capture representation where it removes repetition, release its
     transient owner before resolving or creating namespace state, and keep all rollback paths
     transactional.
+
+    Named Object Manager capture consolidation (2026-08-27, accepted): named Event, Timer,
+    Semaphore, Mutant, Directory, and SymbolicLink create/open paths now share one allocation-free
+    `CapturedNamedObjectAttributes` representation. It reads and validates
+    `OBJECT_ATTRIBUTES`/`UNICODE_STRING` once into fixed stack storage, canonicalizes the supported
+    ASCII path bytes, preserves anonymous-object semantics, and enforces absolute/relative root
+    rules before any namespace mutation. The old `Vec<u16>` plus `Vec<u8>` helper chain and its
+    repeated call-site machinery were deleted. Namespace insertion, dispatcher-object
+    initialization, process-handle minting, and rollback remain durable and transactional.
+    Symbolic-link target decoding is a short transient capture copied to fixed storage and released
+    before publication.
+
+    Serialized acceptance `.tmp/run-headless-named-object-stack-capture-20260827.log` passed all
+    `295/295` gates, including real named-object directory queries, profile/user-hive work, userinit,
+    Explorer, and the complete 480,000-pixel framebuffer with at least 32 colors. Scratch returned
+    to zero and its boot peak remained 278,112 B of 4,194,304 B. Final durable allocation was
+    14,829,424 B with 6,141,968 B reusable.
+
+    Review adjustment: separate named I/O completion port name capture from port-table create/open
+    and process-handle minting next. Inspect the `nt-io-completion` ownership contract before
+    changing the executive call sites. Then inventory file create/open capture paths without placing
+    pending IRPs, parked continuations, APCs, events, or IOCP completion records in transient scope.

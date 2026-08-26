@@ -83,10 +83,24 @@ const PNP_CONTROL_RELATIONS_LEN: usize = 32;
 const PNP_GET_DEVICE_STATUS: u32 = 0;
 const PNP_SET_DEVICE_STATUS: u32 = 1;
 const PNP_CLEAR_DEVICE_STATUS: u32 = 2;
+const NAMED_OBJECT_PATH_CAP: usize = 1024;
 const PNP_BUS_RELATIONS: u32 = 3;
 const GUID_DEVICE_ENUMERATED_BYTES: [u8; 16] = [
     0x0a, 0x40, 0x3a, 0xcb, 0xf0, 0x46, 0xd0, 0x11, 0xb0, 0x8f, 0x00, 0x60, 0x97, 0x13, 0x05, 0x3f,
 ];
+
+struct CapturedNamedObjectAttributes {
+    root: u64,
+    attributes: u32,
+    path_len: Option<usize>,
+    path: [u8; NAMED_OBJECT_PATH_CAP],
+}
+
+impl CapturedNamedObjectAttributes {
+    fn path(&self) -> Option<&[u8]> {
+        self.path_len.map(|len| &self.path[..len])
+    }
+}
 
 fn try_zeroed_transfer_buffer(len: usize) -> Result<alloc::vec::Vec<u8>, u32> {
     let mut bytes = alloc::vec::Vec::new();
@@ -18427,15 +18441,19 @@ impl ExecNtHandler {
         self.xas_try_write_buf(output, &network)
     }
 
-    /// Validate event OBJECT_ATTRIBUTES and return its root handle plus optional object name.
-    pub(crate) unsafe fn read_event_object_attributes(
+    /// Capture and validate the byte-oriented subset of named Object Manager attributes supported
+    /// by the compact namespace. Caller memory never escapes this fixed stack representation.
+    unsafe fn capture_named_object_attributes(
         &self,
         oa_va: u64,
-    ) -> Result<(u64, u32, Option<alloc::vec::Vec<u16>>), u32> {
+    ) -> Result<CapturedNamedObjectAttributes, u32> {
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
         const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
         const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
 
+        if oa_va == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
         let mut oa = [0u8; 0x30];
         if !self.xas_read(oa_va, &mut oa) {
             return Err(STATUS_ACCESS_VIOLATION);
@@ -18447,7 +18465,12 @@ impl ExecNtHandler {
         let object_name = u64::from_le_bytes(oa[16..24].try_into().unwrap());
         let attributes = u32::from_le_bytes(oa[24..28].try_into().unwrap());
         if object_name == 0 {
-            return Ok((root, attributes, None));
+            return Ok(CapturedNamedObjectAttributes {
+                root,
+                attributes,
+                path_len: None,
+                path: [0; NAMED_OBJECT_PATH_CAP],
+            });
         }
 
         let mut ustr = [0u8; 16];
@@ -18457,35 +18480,40 @@ impl ExecNtHandler {
         let length = u16::from_le_bytes(ustr[0..2].try_into().unwrap()) as usize;
         let maximum = u16::from_le_bytes(ustr[2..4].try_into().unwrap()) as usize;
         let buffer = u64::from_le_bytes(ustr[8..16].try_into().unwrap());
-        if length == 0 || length & 1 != 0 || length > maximum || length > 2048 || buffer == 0 {
+        if length == 0
+            || length & 1 != 0
+            || length > maximum
+            || length > NAMED_OBJECT_PATH_CAP * 2
+            || buffer == 0
+        {
             return Err(STATUS_OBJECT_NAME_INVALID);
         }
-        let mut bytes = alloc::vec![0u8; length];
-        if !self.xas_read(buffer, &mut bytes) {
+        let mut bytes = [0u8; NAMED_OBJECT_PATH_CAP * 2];
+        if !self.xas_read(buffer, &mut bytes[..length]) {
             return Err(STATUS_ACCESS_VIOLATION);
         }
-        let name = bytes
-            .chunks_exact(2)
-            .map(|word| u16::from_le_bytes([word[0], word[1]]))
-            .collect();
-        Ok((root, attributes, Some(name)))
-    }
-
-    unsafe fn read_named_object_path_attributes(
-        &self,
-        oa_va: u64,
-    ) -> Result<(u64, u32, alloc::vec::Vec<u8>), u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
-        if oa_va == 0 {
-            return Err(STATUS_INVALID_PARAMETER);
+        let path_len = length / 2;
+        let mut path = [0u8; NAMED_OBJECT_PATH_CAP];
+        for (index, word) in bytes[..length].chunks_exact(2).enumerate() {
+            let unit = u16::from_le_bytes([word[0], word[1]]);
+            if unit > 0x7f {
+                return Err(STATUS_OBJECT_NAME_INVALID);
+            }
+            path[index] = (unit as u8).to_ascii_lowercase();
         }
-        let (root, attributes, name16) = self.read_event_object_attributes(oa_va)?;
-        let Some(name16) = name16 else {
+        let mut components = path[..path_len].split(|&byte| byte == b'\\');
+        if path.first() == Some(&b'\\') {
+            components.next();
+        }
+        if components.any(|component| component.is_empty() || component.len() > OBJ_NAME_CAP) {
             return Err(STATUS_OBJECT_NAME_INVALID);
-        };
-        let path = Self::event_object_path(&name16)?;
-        Ok((root, attributes, path))
+        }
+        Ok(CapturedNamedObjectAttributes {
+            root,
+            attributes,
+            path_len: Some(path_len),
+            path,
+        })
     }
 
     unsafe fn read_unicode_string16(&self, ustr_va: u64) -> Result<alloc::vec::Vec<u16>, u32> {
@@ -18523,27 +18551,6 @@ impl ExecNtHandler {
                 DIRECTORY_TRAVERSE_ACCESS,
             ),
         }
-    }
-
-    /// Convert the byte-oriented subset supported by the compact object namespace without
-    /// truncating a full path to one leaf. Individual namespace entries are limited to 40 bytes.
-    fn event_object_path(name: &[u16]) -> Result<alloc::vec::Vec<u8>, u32> {
-        const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
-        let mut path = alloc::vec::Vec::with_capacity(name.len());
-        for &unit in name {
-            if unit > 0x7f {
-                return Err(STATUS_OBJECT_NAME_INVALID);
-            }
-            path.push((unit as u8).to_ascii_lowercase());
-        }
-        let mut components = path.split(|&byte| byte == b'\\');
-        if path.first() == Some(&b'\\') {
-            components.next();
-        }
-        if components.any(|component| component.is_empty() || component.len() > OBJ_NAME_CAP) {
-            return Err(STATUS_OBJECT_NAME_INVALID);
-        }
-        Ok(path)
     }
 
     /// Apply native OBJECT_ATTRIBUTES path rules: a null RootDirectory requires an absolute name,
@@ -25210,35 +25217,29 @@ impl ExecNtHandler {
                         );
                         return 0;
                     }
-                    let (root_dir, attributes, name16) = match self.read_event_object_attributes(oa)
-                    {
-                        Ok((root, attributes, Some(name))) => (root, attributes, name),
-                        Ok((_root, _attributes, None)) => {
-                            let Some(index) = self.obj_create_anon_event(auto_reset, init_state)
-                            else {
-                                return 0xC000_009A;
-                            };
-                            let Some(event_handle) =
-                                self.mint_event_handle(index, nt_ulong_arg(args[1]))
-                            else {
-                                self.rollback_new_event(index);
-                                return 0xC000_009A;
-                            };
-                            if !self.xas_write_u64(out, event_handle) {
-                                self.close_current_handle(event_handle);
-                                self.rollback_new_event(index);
-                                return 0xC000_0005; // STATUS_ACCESS_VIOLATION
-                            }
-                            return 0;
+                    let captured = match self.capture_named_object_attributes(oa) {
+                        Ok(captured) => captured,
+                        Err(status) => return status,
+                    };
+                    let Some(path) = captured.path() else {
+                        let Some(index) = self.obj_create_anon_event(auto_reset, init_state) else {
+                            return 0xC000_009A;
+                        };
+                        let Some(event_handle) =
+                            self.mint_event_handle(index, nt_ulong_arg(args[1]))
+                        else {
+                            self.rollback_new_event(index);
+                            return 0xC000_009A;
+                        };
+                        if !self.xas_write_u64(out, event_handle) {
+                            self.close_current_handle(event_handle);
+                            self.rollback_new_event(index);
+                            return 0xC000_0005; // STATUS_ACCESS_VIOLATION
                         }
-                        Err(status) => return status,
+                        return 0;
                     };
-                    let permanent = attributes & OBJ_PERMANENT != 0;
-                    let path = match Self::event_object_path(&name16) {
-                        Ok(path) => path,
-                        Err(status) => return status,
-                    };
-                    let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
+                    let permanent = captured.attributes & OBJ_PERMANENT != 0;
+                    let (root_idx, path) = match self.event_root_and_path(captured.root, path) {
                         Ok(resolved) => resolved,
                         Err(status) => return status,
                     };
@@ -25507,16 +25508,14 @@ impl ExecNtHandler {
                 if oa == 0 {
                     return 0xC000_000D; // STATUS_INVALID_PARAMETER
                 }
-                let (root_dir, name16) = match self.read_event_object_attributes(oa) {
-                    Ok((root, _attributes, Some(name))) => (root, name),
-                    Ok((_root, _attributes, None)) => return 0xC000_0033, // STATUS_OBJECT_NAME_INVALID
+                let captured = match self.capture_named_object_attributes(oa) {
+                    Ok(captured) => captured,
                     Err(status) => return status,
                 };
-                let path = match Self::event_object_path(&name16) {
-                    Ok(path) => path,
-                    Err(status) => return status,
+                let Some(path) = captured.path() else {
+                    return 0xC000_0033; // STATUS_OBJECT_NAME_INVALID
                 };
-                let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
+                let (root_idx, path) = match self.event_root_and_path(captured.root, path) {
                     Ok(resolved) => resolved,
                     Err(status) => return status,
                 };
@@ -25593,19 +25592,15 @@ impl ExecNtHandler {
                 if oa == 0 {
                     return create_anonymous(self).unwrap_or_else(|status| status);
                 }
-                let (root_dir, attributes, name16) = match self.read_event_object_attributes(oa) {
-                    Ok((root, attributes, Some(name))) => (root, attributes, name),
-                    Ok((_root, _attributes, None)) => {
-                        return create_anonymous(self).unwrap_or_else(|status| status);
-                    }
+                let captured = match self.capture_named_object_attributes(oa) {
+                    Ok(captured) => captured,
                     Err(status) => return status,
                 };
-                let permanent = attributes & OBJ_PERMANENT != 0;
-                let path = match Self::event_object_path(&name16) {
-                    Ok(path) => path,
-                    Err(status) => return status,
+                let Some(path) = captured.path() else {
+                    return create_anonymous(self).unwrap_or_else(|status| status);
                 };
-                let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
+                let permanent = captured.attributes & OBJ_PERMANENT != 0;
+                let (root_idx, path) = match self.event_root_and_path(captured.root, path) {
                     Ok(resolved) => resolved,
                     Err(status) => return status,
                 };
@@ -25667,16 +25662,14 @@ impl ExecNtHandler {
                 if oa == 0 {
                     return 0xC000_000D;
                 }
-                let (root_dir, name16) = match self.read_event_object_attributes(oa) {
-                    Ok((root, _attributes, Some(name))) => (root, name),
-                    Ok((_root, _attributes, None)) => return 0xC000_0033,
+                let captured = match self.capture_named_object_attributes(oa) {
+                    Ok(captured) => captured,
                     Err(status) => return status,
                 };
-                let path = match Self::event_object_path(&name16) {
-                    Ok(path) => path,
-                    Err(status) => return status,
+                let Some(path) = captured.path() else {
+                    return 0xC000_0033;
                 };
-                let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
+                let (root_idx, path) = match self.event_root_and_path(captured.root, path) {
                     Ok(resolved) => resolved,
                     Err(status) => return status,
                 };
@@ -25836,19 +25829,15 @@ impl ExecNtHandler {
                 if oa == 0 {
                     return create_anonymous(self).unwrap_or_else(|status| status);
                 }
-                let (root_dir, attributes, name16) = match self.read_event_object_attributes(oa) {
-                    Ok((root, attributes, Some(name))) => (root, attributes, name),
-                    Ok((_root, _attributes, None)) => {
-                        return create_anonymous(self).unwrap_or_else(|status| status);
-                    }
+                let captured = match self.capture_named_object_attributes(oa) {
+                    Ok(captured) => captured,
                     Err(status) => return status,
                 };
-                let permanent = attributes & OBJ_PERMANENT != 0;
-                let path = match Self::event_object_path(&name16) {
-                    Ok(path) => path,
-                    Err(status) => return status,
+                let Some(path) = captured.path() else {
+                    return create_anonymous(self).unwrap_or_else(|status| status);
                 };
-                let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
+                let permanent = captured.attributes & OBJ_PERMANENT != 0;
+                let (root_idx, path) = match self.event_root_and_path(captured.root, path) {
                     Ok(resolved) => resolved,
                     Err(status) => return status,
                 };
@@ -25903,16 +25892,14 @@ impl ExecNtHandler {
                 if oa == 0 {
                     return 0xC000_000D; // STATUS_INVALID_PARAMETER
                 }
-                let (root_dir, name16) = match self.read_event_object_attributes(oa) {
-                    Ok((root, _attributes, Some(name))) => (root, name),
-                    Ok((_root, _attributes, None)) => return 0xC000_0033,
+                let captured = match self.capture_named_object_attributes(oa) {
+                    Ok(captured) => captured,
                     Err(status) => return status,
                 };
-                let path = match Self::event_object_path(&name16) {
-                    Ok(path) => path,
-                    Err(status) => return status,
+                let Some(path) = captured.path() else {
+                    return 0xC000_0033;
                 };
-                let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
+                let (root_idx, path) = match self.event_root_and_path(captured.root, path) {
                     Ok(resolved) => resolved,
                     Err(status) => return status,
                 };
@@ -26037,19 +26024,15 @@ impl ExecNtHandler {
                 if oa == 0 {
                     return create_anonymous(self).unwrap_or_else(|status| status);
                 }
-                let (root_dir, attributes, name16) = match self.read_event_object_attributes(oa) {
-                    Ok((root, attributes, Some(name))) => (root, attributes, name),
-                    Ok((_root, _attributes, None)) => {
-                        return create_anonymous(self).unwrap_or_else(|status| status);
-                    }
+                let captured = match self.capture_named_object_attributes(oa) {
+                    Ok(captured) => captured,
                     Err(status) => return status,
                 };
-                let permanent = attributes & OBJ_PERMANENT != 0;
-                let path = match Self::event_object_path(&name16) {
-                    Ok(path) => path,
-                    Err(status) => return status,
+                let Some(path) = captured.path() else {
+                    return create_anonymous(self).unwrap_or_else(|status| status);
                 };
-                let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
+                let permanent = captured.attributes & OBJ_PERMANENT != 0;
+                let (root_idx, path) = match self.event_root_and_path(captured.root, path) {
                     Ok(resolved) => resolved,
                     Err(status) => return status,
                 };
@@ -26099,16 +26082,14 @@ impl ExecNtHandler {
                 if oa == 0 {
                     return 0xC000_000D; // STATUS_INVALID_PARAMETER
                 }
-                let (root_dir, name16) = match self.read_event_object_attributes(oa) {
-                    Ok((root, _attributes, Some(name))) => (root, name),
-                    Ok((_root, _attributes, None)) => return 0xC000_0033,
+                let captured = match self.capture_named_object_attributes(oa) {
+                    Ok(captured) => captured,
                     Err(status) => return status,
                 };
-                let path = match Self::event_object_path(&name16) {
-                    Ok(path) => path,
-                    Err(status) => return status,
+                let Some(path) = captured.path() else {
+                    return 0xC000_0033;
                 };
-                let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
+                let (root_idx, path) = match self.event_root_and_path(captured.root, path) {
                     Ok(resolved) => resolved,
                     Err(status) => return status,
                 };
@@ -27431,13 +27412,15 @@ impl ExecNtHandler {
                 if !self.probe_event_output(out, 8) {
                     return 0xC000_0005;
                 }
-                let (root_dir, attributes, path) = match self.read_named_object_path_attributes(oa)
-                {
-                    Ok(values) => values,
+                let captured = match self.capture_named_object_attributes(oa) {
+                    Ok(captured) => captured,
                     Err(status) => return status,
                 };
-                let permanent = attributes & OBJ_PERMANENT != 0;
-                let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
+                let Some(path) = captured.path() else {
+                    return 0xC000_0033;
+                };
+                let permanent = captured.attributes & OBJ_PERMANENT != 0;
+                let (root_idx, path) = match self.event_root_and_path(captured.root, path) {
                     Ok(resolved) => resolved,
                     Err(status) => return status,
                 };
@@ -27653,16 +27636,19 @@ impl ExecNtHandler {
                 if !self.probe_event_output(out, 8) {
                     return 0xC000_0005;
                 }
-                let (root_dir, attributes, path) = match self.read_named_object_path_attributes(oa)
-                {
-                    Ok(values) => values,
+                let captured = match self.capture_named_object_attributes(oa) {
+                    Ok(captured) => captured,
                     Err(status) => return status,
                 };
-                let permanent = attributes & OBJ_PERMANENT != 0;
-                let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
+                let Some(path) = captured.path() else {
+                    return 0xC000_0033;
+                };
+                let permanent = captured.attributes & OBJ_PERMANENT != 0;
+                let (root_idx, path) = match self.event_root_and_path(captured.root, path) {
                     Ok(resolved) => resolved,
                     Err(status) => return status,
                 };
+                let transient_scope = allocator::enter_transient();
                 let target16 = match self.read_unicode_string16(tgt) {
                     Ok(target) => target,
                     Err(status) => return status,
@@ -27676,6 +27662,8 @@ impl ExecNtHandler {
                     tbuf[tl] = w as u8;
                     tl += 1;
                 }
+                drop(target16);
+                drop(transient_scope);
                 match self.obj_resolve_open_link(path, root_idx) {
                     Some(index) if self.obj_ns[index].kind == OBJ_KIND_SYMBOLIC_LINK => {
                         let Some(handle) = self.mint_object_namespace_handle(index, desired_access)
@@ -27733,12 +27721,14 @@ impl ExecNtHandler {
                 if !self.probe_event_output(out, 8) {
                     return 0xC000_0005;
                 }
-                let (root_dir, _attributes, path) = match self.read_named_object_path_attributes(oa)
-                {
-                    Ok(values) => values,
+                let captured = match self.capture_named_object_attributes(oa) {
+                    Ok(captured) => captured,
                     Err(status) => return status,
                 };
-                let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
+                let Some(path) = captured.path() else {
+                    return 0xC000_0033;
+                };
+                let (root_idx, path) = match self.event_root_and_path(captured.root, path) {
                     Ok(resolved) => resolved,
                     Err(status) => return status,
                 };
