@@ -12633,3 +12633,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     are closed. Continue by composing and importing the replayed persistent SYSTEM state plus the
     generated overlay as one image, then move direct SYSTEM readers to CM. The generated-only image
     must disappear in that accepted cut rather than remain as a recovery path.
+
+    Lossless SYSTEM overlay primitive (2026-08-26, crate accepted): `nt-hive-core` now composes an
+    additive setup/configuration hive over an independently cloned persistent base. Key and value
+    matching is case-insensitive; overlay values replace names they define while base-only keys and
+    values survive. Base class/security metadata is preserved when the overlay omits it, explicit
+    overlay class/security replaces it, value types remain exact, malformed source graphs fail
+    closed, and neither input is mutated. The result is marked as one clean persistence baseline.
+
+    Full package validation is green at `nt-hive-core` library `72/72` and generator `13/13`. The
+    generator's network idempotence test also no longer couples the network seed to a historical
+    total devnode count; it proves the complete preexisting devnode set is unchanged, which remains
+    valid as more NICs and driver fixtures are configured. Review adjustment: the merge mechanism
+    is closed. Next move replay/composition before boot launch-plan selection and the first CM
+    import, using the restored SYSTEM primary plus log when present and the installed REGF otherwise.

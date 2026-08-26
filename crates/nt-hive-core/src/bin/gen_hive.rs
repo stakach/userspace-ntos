@@ -1797,9 +1797,11 @@ mod tests {
         let hive = decode_image(&bytes).expect("generated hive decodes");
         let mut cm = import_generated_hive_config_manager(&hive);
 
-        assert_eq!(cm.devnode_count(), 3);
+        let devnodes_before = cm.devnode_count();
+        assert!(devnodes_before >= 1);
         let stats = nt_hive_core::seed_reactos_network_setup_in_config_manager(&mut cm);
         assert_eq!(stats, nt_hive_core::ReactOsNetworkSetupSeedStats::default());
+        assert_eq!(cm.devnode_count(), devnodes_before);
 
         let tcpip_linkage = cm
             .registry()

@@ -184,6 +184,132 @@ fn hive_borrowed_indexed_enumeration_preserves_names_and_data() {
 }
 
 #[test]
+fn hive_overlay_composes_setup_state_without_losing_persistent_state() {
+    let mut persistent = Hive::new(HiveKind::System);
+    let services = persistent.create_key(r"ControlSet001\Services");
+    assert!(persistent.set_key_class(services, Some("Persistent services")));
+    let persistent_descriptor = b"persistent-security-descriptor";
+    assert!(persistent.set_key_security_descriptor(services, persistent_descriptor));
+    persistent.set_dword(services, "BaseOnly", 11);
+    persistent.set_dword(services, "ReplaceMe", 12);
+    let persistent_driver = persistent.create_key(r"ControlSet001\Services\DriverA");
+    persistent.set_dword(persistent_driver, "Start", 3);
+    persistent.finish_clean_import();
+
+    let mut overlay = Hive::new(HiveKind::System);
+    let overlay_services = overlay.create_key(r"controlset001\services");
+    overlay.set_dword(overlay_services, "replaceme", 42);
+    let overlay_driver = overlay.create_key(r"ControlSet001\Services\DriverB");
+    assert!(overlay.set_key_class(overlay_driver, Some("Overlay driver")));
+    let overlay_descriptor = b"overlay-security-descriptor";
+    assert!(overlay.set_key_security_descriptor(overlay_driver, overlay_descriptor));
+    overlay.set_value(
+        overlay_driver,
+        "ImagePath",
+        RegistryValueType::ExpandSz,
+        utf16le_sz(r"system32\driverb.sys"),
+    );
+    overlay.finish_clean_import();
+
+    let composed = compose_hive_overlay(&persistent, &overlay).expect("compose SYSTEM overlay");
+    let composed_services = composed
+        .open_key(r"ControlSet001\Services")
+        .expect("composed services");
+    assert_eq!(
+        composed.query_dword(composed_services, "BaseOnly"),
+        Some(11)
+    );
+    assert_eq!(
+        composed.query_dword(composed_services, "ReplaceMe"),
+        Some(42)
+    );
+    assert_eq!(
+        composed.key_class(composed_services),
+        Some("Persistent services")
+    );
+    assert_eq!(
+        composed.key_security_descriptor(composed_services),
+        Some(persistent_descriptor.as_slice())
+    );
+    assert_eq!(
+        composed.query_dword(
+            composed
+                .open_key(r"ControlSet001\Services\DriverA")
+                .expect("persistent driver"),
+            "Start"
+        ),
+        Some(3)
+    );
+    let composed_driver = composed
+        .open_key(r"ControlSet001\Services\DriverB")
+        .expect("overlay driver");
+    assert_eq!(composed.key_class(composed_driver), Some("Overlay driver"));
+    assert_eq!(
+        composed.key_security_descriptor(composed_driver),
+        Some(overlay_descriptor.as_slice())
+    );
+    assert_eq!(
+        composed
+            .query_value(composed_driver, "ImagePath")
+            .map(|(value_type, _)| value_type),
+        Some(RegistryValueType::ExpandSz)
+    );
+    assert_eq!(composed.sequence, 0);
+    assert_eq!(composed.generation, 0);
+    assert_eq!(composed.dirty_count(), 0);
+
+    assert_eq!(persistent.query_dword(services, "ReplaceMe"), Some(12));
+    assert!(persistent
+        .open_key(r"ControlSet001\Services\DriverB")
+        .is_none());
+    assert!(overlay.query_value(overlay_services, "BaseOnly").is_none());
+}
+
+#[test]
+fn hive_overlay_rejects_a_different_hive_kind_without_mutating_inputs() {
+    let mut system = Hive::new(HiveKind::System);
+    let system_key = system.create_key(r"ControlSet001\Services\Kept");
+    system.set_dword(system_key, "Start", 1);
+    system.finish_clean_import();
+
+    let mut software = Hive::new(HiveKind::Software);
+    software.create_key(r"Classes\WrongKind");
+    software.finish_clean_import();
+
+    assert!(matches!(
+        compose_hive_overlay(&system, &software),
+        Err(HiveOverlayError::KindMismatch)
+    ));
+    assert_eq!(system.query_dword(system_key, "Start"), Some(1));
+    assert!(software.open_key(r"Classes\WrongKind").is_some());
+}
+
+#[test]
+fn hive_overlay_rejects_a_cyclic_source_without_mutating_the_base() {
+    let mut base = Hive::new(HiveKind::System);
+    let base_key = base.create_key(r"ControlSet001\Services\Kept");
+    base.set_dword(base_key, "Start", 1);
+    base.finish_clean_import();
+
+    let mut overlay = Hive::new(HiveKind::System);
+    let loop_key = overlay.create_key(r"ControlSet001\Services\Loop");
+    if let Some(Cell::Key(key)) = overlay
+        .cells
+        .get_mut(loop_key.0 as usize)
+        .and_then(|cell| cell.as_mut())
+    {
+        key.subkeys.push(loop_key);
+    }
+
+    assert!(matches!(
+        compose_hive_overlay(&base, &overlay),
+        Err(HiveOverlayError::InvalidSource)
+    ));
+    assert_eq!(base.query_dword(base_key, "Start"), Some(1));
+    assert!(base.open_key(r"ControlSet001\Services\Loop").is_none());
+}
+
+#[test]
 fn hive_delete_key_removes_only_leaf_keys() {
     let mut h = Hive::new(HiveKind::Software);
     let parent = h.create_key(r"Classes\CLSID");

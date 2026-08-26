@@ -40,6 +40,7 @@ impl HiveKind {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct KeyCell {
     pub id: CellId,
     pub parent: Option<CellId>,
@@ -51,6 +52,7 @@ pub(crate) struct KeyCell {
     pub last_write_sequence: u64,
 }
 
+#[derive(Clone)]
 pub(crate) struct ValueCell {
     pub id: CellId,
     pub parent_key: CellId,
@@ -60,6 +62,7 @@ pub(crate) struct ValueCell {
     pub last_write_sequence: u64,
 }
 
+#[derive(Clone)]
 pub(crate) enum Cell {
     Key(KeyCell),
     Value(ValueCell),
@@ -71,7 +74,14 @@ pub enum DeleteKeyError {
     CannotDelete,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HiveOverlayError {
+    KindMismatch,
+    InvalidSource,
+}
+
 /// A mounted registry subtree as a cell arena (spec §6.1).
+#[derive(Clone)]
 pub struct Hive {
     pub(crate) cells: Vec<Option<Cell>>,
     pub(crate) value_blobs: Vec<Rc<Vec<u8>>>,
@@ -81,6 +91,92 @@ pub struct Hive {
     pub generation: u64,
     pub sequence: u64,
     pub(crate) clean_sequence: u64,
+}
+
+/// Compose an additive setup/configuration overlay onto an already-replayed hive.
+///
+/// Existing destination keys and values are matched case-insensitively. Values present in the
+/// overlay replace destination values of the same name; base-only keys, values, class names, and
+/// security descriptors remain intact. An overlay class or security descriptor replaces the
+/// corresponding destination metadata only when it is explicitly present. Neither input is
+/// modified, and the returned hive is a clean persistence baseline.
+pub fn compose_hive_overlay(base: &Hive, overlay: &Hive) -> Result<Hive, HiveOverlayError> {
+    if base.kind != overlay.kind {
+        return Err(HiveOverlayError::KindMismatch);
+    }
+
+    let mut composed = base.clone();
+    let mut pending = Vec::new();
+    let mut visited = Vec::new();
+    pending.push((overlay.root(), composed.root()));
+
+    while let Some((source_id, destination_id)) = pending.pop() {
+        if visited.iter().any(|visited_id| *visited_id == source_id) {
+            return Err(HiveOverlayError::InvalidSource);
+        }
+        visited.push(source_id);
+
+        let source = overlay
+            .key(source_id)
+            .ok_or(HiveOverlayError::InvalidSource)?;
+        let class_name = source.class_name.clone();
+        let security_descriptor = source.security_descriptor.clone();
+
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(source.values.len())
+            .map_err(|_| HiveOverlayError::InvalidSource)?;
+        for value_id in &source.values {
+            let value = overlay
+                .value(*value_id)
+                .ok_or(HiveOverlayError::InvalidSource)?;
+            if value.parent_key != source_id {
+                return Err(HiveOverlayError::InvalidSource);
+            }
+            let data = overlay
+                .value_data(value)
+                .ok_or(HiveOverlayError::InvalidSource)?;
+            values.push((value.name.clone(), value.value_type, data.to_vec()));
+        }
+
+        let mut children = Vec::new();
+        children
+            .try_reserve_exact(source.subkeys.len())
+            .map_err(|_| HiveOverlayError::InvalidSource)?;
+        for child_id in &source.subkeys {
+            let child = overlay
+                .key(*child_id)
+                .ok_or(HiveOverlayError::InvalidSource)?;
+            if child.parent != Some(source_id) || child.name.is_empty() || child.name.contains('\\')
+            {
+                return Err(HiveOverlayError::InvalidSource);
+            }
+            children.push((*child_id, child.name.clone()));
+        }
+
+        if let Some(class_name) = class_name.as_deref() {
+            if !composed.set_key_class(destination_id, Some(class_name)) {
+                return Err(HiveOverlayError::InvalidSource);
+            }
+        }
+        if let Some(descriptor) = security_descriptor.as_deref() {
+            if !composed.set_key_security_descriptor(destination_id, descriptor) {
+                return Err(HiveOverlayError::InvalidSource);
+            }
+        }
+        for (name, value_type, data) in values {
+            if !composed.set_value(destination_id, &name, value_type, data) {
+                return Err(HiveOverlayError::InvalidSource);
+            }
+        }
+        for (child_id, name) in children.into_iter().rev() {
+            let destination_child = composed.create_subkey(destination_id, &name);
+            pending.push((child_id, destination_child));
+        }
+    }
+
+    composed.finish_clean_import();
+    Ok(composed)
 }
 
 impl Hive {
