@@ -14982,6 +14982,7 @@ impl nt_config_client::Backend for CmChan<'_> {
 }
 
 static mut CONFIG_CLIENT_PTR: *mut ConfigClient<CmChan<'static>> = core::ptr::null_mut();
+static LIVE_CONFIG_MANAGER_SYSTEM_GENERATION: AtomicU64 = AtomicU64::new(0);
 const CONFIG_STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 
 unsafe fn install_config_manager_client(client: &mut ConfigClient<CmChan<'static>>) {
@@ -15068,6 +15069,23 @@ pub(crate) unsafe fn config_manager_query_driver_service(
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
     client.query_driver_service(service)
+}
+
+pub(crate) unsafe fn config_manager_query_system_hive_key(
+    path: &str,
+) -> Result<nt_config_client::HiveKeySnapshot, i32> {
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if expected_generation == 0 {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    let snapshot = client.query_system_hive_key(path)?;
+    if snapshot.mount_generation != expected_generation {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    Ok(snapshot)
 }
 
 /// The I/O Manager transport wrapper (carries the extra `flags` + a u64 `information`).
@@ -19873,13 +19891,18 @@ struct LiveConfigManagerMountReport {
 fn mount_live_config_manager_config_hive() -> LiveConfigManagerMountReport {
     let heap_mark = allocator::mark();
     let mut report = LiveConfigManagerMountReport::default();
+    LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.store(0, Ordering::Release);
     {
         if let Some(image) = unsafe { boot_system_hive_image_bytes() } {
             report.bytes = image.len() as u64;
             unsafe {
                 if let Some(client) = CONFIG_CLIENT_PTR.as_mut() {
                     match client.import_system_hive(image) {
-                        Ok(generation) => report.generation = generation,
+                        Ok(generation) => {
+                            report.generation = generation;
+                            LIVE_CONFIG_MANAGER_SYSTEM_GENERATION
+                                .store(generation, Ordering::Release);
+                        }
                         Err(status) => {
                             report.status = status;
                         }
@@ -20282,13 +20305,25 @@ fn default_hive_keyboard_layout_id(out: &mut [u8]) -> Option<usize> {
     registry_layout_id_from_value(&value.1, out)
 }
 
+fn live_system_hive_key(path: &str) -> Option<nt_config_client::HiveKeySnapshot> {
+    unsafe { config_manager_query_system_hive_key(path).ok() }
+}
+
+fn live_system_hive_value<'a>(
+    key: &'a nt_config_client::HiveKeySnapshot,
+    name: &str,
+) -> Option<&'a nt_config_client::HiveValueSnapshot> {
+    key.values
+        .iter()
+        .find(|value| value.name.eq_ignore_ascii_case(name))
+}
+
 fn system_hive_nls_keyboard_layout_id(out: &mut [u8]) -> Option<usize> {
-    let hive = system_hive_regf()?;
-    let mut key_path = hive.current_control_set_name().ok()?;
-    key_path.push_str("\\Control\\Nls\\Language");
-    let key = hive.open_key(&key_path)?;
-    let value = hive.value(key, "Default")?;
-    registry_layout_id_from_value(&value.1, out)
+    let key = live_system_hive_key(
+        r"\Registry\Machine\System\CurrentControlSet\Control\Nls\Language",
+    )?;
+    let value = live_system_hive_value(&key, "Default")?;
+    registry_layout_id_from_value(&value.data, out)
 }
 
 fn registry_keyboard_layout_id(out: &mut [u8]) -> Option<(usize, &'static [u8])> {
@@ -20310,15 +20345,15 @@ fn system_hive_keyboard_layout_file(layout_id: &[u8], out: &mut [u8]) -> Option<
     if layout_id.len() != 8 || !layout_id.iter().copied().all(registry_ascii_hex_digit) {
         return None;
     }
-    let hive = system_hive_regf()?;
-    let mut key_path = hive.current_control_set_name().ok()?;
-    key_path.push_str("\\Control\\Keyboard Layouts\\");
+    let mut key_path = alloc::string::String::from(
+        r"\Registry\Machine\System\CurrentControlSet\Control\Keyboard Layouts\",
+    );
     for &b in layout_id {
         key_path.push(b as char);
     }
-    let key = hive.open_key(&key_path)?;
-    let value = hive.value(key, "Layout File")?;
-    let n = registry_utf16_ascii(&value.1, out)?;
+    let key = live_system_hive_key(&key_path)?;
+    let value = live_system_hive_value(&key, "Layout File")?;
+    let n = registry_utf16_ascii(&value.data, out)?;
     if !registry_driver_leaf_is_safe(&out[..n]) {
         return None;
     }
@@ -20451,31 +20486,34 @@ fn system_hive_display_driver_spec() -> Option<&'static SystemHiveDisplayDriverS
     if SYSTEM_HIVE_DISPLAY_DRIVER_SPEC_READY.load(Ordering::Relaxed) != 0 {
         return unsafe { (&*core::ptr::addr_of!(SYSTEM_HIVE_DISPLAY_DRIVER_SPEC)).as_ref() };
     }
-    let hive = system_hive_regf()?;
-    let mut services_path = hive.current_control_set_name().ok()?;
-    services_path.push_str("\\Services");
-    let services = hive.open_key(&services_path)?;
-    for (service_name, service_key) in hive.subkeys(services) {
-        let Some(device_key) = hive.open_key_from(service_key, "Device0") else {
+    let services_path = nt_config_manager::SERVICES_PATH;
+    let services = live_system_hive_key(services_path)?;
+    for service in &services.subkeys {
+        let mut device_path = alloc::string::String::from(services_path);
+        device_path.push('\\');
+        device_path.push_str(&service.name);
+        device_path.push_str("\\Device0");
+        let Some(device_key) = live_system_hive_key(&device_path) else {
             continue;
         };
-        let Some(installed_value) = hive.value(device_key, "InstalledDisplayDrivers") else {
+        let Some(installed_value) = live_system_hive_value(&device_key, "InstalledDisplayDrivers")
+        else {
             continue;
         };
-        let Some(description_value) = hive.value(device_key, "Device Description") else {
+        let Some(description_value) = live_system_hive_value(&device_key, "Device Description")
+        else {
             continue;
         };
-        let Some(_vga_compatible) = hive
-            .value(device_key, "VgaCompatible")
-            .and_then(|(_, data)| registry_dword_from_bytes(&data))
+        let Some(_vga_compatible) = live_system_hive_value(&device_key, "VgaCompatible")
+            .and_then(|value| registry_dword_from_bytes(&value.data))
         else {
             continue;
         };
 
-        let Some(service_name) = registry_ascii_lower_vec(&service_name) else {
+        let Some(service_name) = registry_ascii_lower_vec(&service.name) else {
             continue;
         };
-        let Some(installed_display_driver) = registry_utf16_ascii_vec(&installed_value.1) else {
+        let Some(installed_display_driver) = registry_utf16_ascii_vec(&installed_value.data) else {
             continue;
         };
         let Some(display_driver_leaf) = registry_display_driver_leaf(&installed_display_driver)
@@ -20485,7 +20523,7 @@ fn system_hive_display_driver_spec() -> Option<&'static SystemHiveDisplayDriverS
         if unsafe { !crate::fs_loader::sys32_exists(&display_driver_leaf) } {
             continue;
         }
-        let Some(device_description) = registry_utf16_ascii_vec(&description_value.1) else {
+        let Some(device_description) = registry_utf16_ascii_vec(&description_value.data) else {
             continue;
         };
         if registry_build_display_service_paths(&service_name).is_none() {

@@ -2126,18 +2126,15 @@ unsafe fn ensure_boot_status_data() {
     }
 }
 
-fn seed_time_zone(hive: Option<&RegfHive<'_>>) -> nt_kernel_exec::timezone::TimeZoneInformation {
+fn seed_time_zone(
+    hives: &nt_hive_core::MutableHiveSet,
+) -> nt_kernel_exec::timezone::TimeZoneInformation {
     use nt_kernel_exec::timezone::{TimeZoneInformation, TimeZoneRegistryField};
 
     let mut information = TimeZoneInformation::default();
-    let Some(hive) = hive else {
-        return information;
-    };
-    let Ok(mut key_path) = hive.current_control_set_name() else {
-        return information;
-    };
-    key_path.push_str("\\Control\\TimeZoneInformation");
-    let Some(key) = hive.open_key(&key_path) else {
+    let Some(key) = hives.resolve_key(
+        r"\Registry\Machine\System\CurrentControlSet\Control\TimeZoneInformation",
+    ) else {
         return information;
     };
     for (name, field) in [
@@ -2149,8 +2146,8 @@ fn seed_time_zone(hive: Option<&RegfHive<'_>>) -> nt_kernel_exec::timezone::Time
         ("DaylightBias", TimeZoneRegistryField::DaylightBias),
         ("DaylightStart", TimeZoneRegistryField::DaylightStart),
     ] {
-        if let Some((value_type, data)) = hive.value(key, name) {
-            let _ = information.apply_registry_value(field, value_type, &data);
+        if let Some((value_type, data)) = hives.query_value(key, name) {
+            let _ = information.apply_registry_value(field, value_type as u32, data);
         }
     }
     information
@@ -2681,7 +2678,7 @@ impl ExecNtHandler {
             );
             print_str(b")\n");
         }
-        let time_zone_information = seed_time_zone(hive.as_ref());
+        let time_zone_information = seed_time_zone(&mutable_hives);
         unsafe { publish_time_zone(&time_zone_information, nt_system_time_100ns()) };
         let BootstrapProcessManagerSeed {
             pm,

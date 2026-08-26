@@ -12872,3 +12872,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     timezone/NLS/display reads through the live mounted authority, and delete their raw REGF helpers
     in the same accepted cuts. Only after all readers share the live generation should SYSTEM
     mutation leases and journal ownership move behind CM.
+
+    Live SYSTEM reader migration (2026-08-26, implementation green): the executive records the
+    isolated CM generation only after atomic mount succeeds. Its key-snapshot wrapper rejects an
+    unpublished or mismatched generation, so NLS language, keyboard-layout file, and display-service
+    discovery now stream immutable snapshots from the exact live SYSTEM mount instead of walking
+    installed REGF. Display enumeration obtains the Services snapshot and each candidate's Device0
+    snapshot through CM; selected-control-set aliasing therefore comes from CM's mounted identity.
+
+    Timezone initialization now reads `CurrentControlSet\\Control\\TimeZoneInformation` through the
+    composed mutable SYSTEM mount carried by the handler, preserving exact registry types while
+    removing another installed-hive reader. Focused CM validation remains green at server `9/9` and
+    client `13/13`; the freestanding executive check remains at the 212-warning baseline. Production
+    raw SYSTEM REGF use is now limited to first-boot composition and win32k's component-local Zw/Rtl
+    registry shim.
+
+    Review adjustment: keep this reader cut open until serialized desktop acceptance proves locale,
+    display-miniport selection, win32k initialization, and Explorer chrome. Then migrate boot/PnP
+    plan discovery from local composed-image re-decodes to generation-bearing CM APIs. Win32k's
+    registry imports require an executive-routed or separately granted CM transport; do not replace
+    them with another copied raw hive.
