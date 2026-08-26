@@ -21907,6 +21907,11 @@ fn report_deferred_generic_hardware_checks(
         passed,
     );
     check(
+        b"exec_generic_pnp_pending_starts_observed",
+        report.pending_observed >= 2,
+        passed,
+    );
+    check(
         b"exec_generic_hw_mmio_interrupt_dma",
         report.resource_granted
             && report.mmio_mapped
@@ -30122,6 +30127,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             && generic_hw_pending == 0
             && generic_hw_indeterminate == 0
             && generic_hw_first_indeterminate == 0,
+        &mut passed,
+    );
+    check(
+        b"exec_generic_pnp_pending_starts_observed",
+        generic_hw_pending_observed >= 2,
         &mut passed,
     );
     check(

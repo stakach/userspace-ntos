@@ -25,6 +25,10 @@ pub const NTOSKRNL: &[ExportDescriptor] = &[
     e("IoGetNextIrpStackLocation", Implemented, ""),
     e("IoSkipCurrentIrpStackLocation", Implemented, ""),
     e("IoCopyCurrentIrpStackLocationToNext", Implemented, ""),
+    e("IoCallDriver", Implemented, ""),
+    e("IofCallDriver", Implemented, ""),
+    e("IoAttachDeviceToDeviceStack", Implemented, ""),
+    e("IoDetachDevice", Implemented, ""),
     // --- Rtl string helpers ---
     e("RtlInitUnicodeString", Implemented, ""),
     e("RtlCopyUnicodeString", Implemented, ""),
@@ -67,6 +71,10 @@ pub const NTOSKRNL: &[ExportDescriptor] = &[
         Partial,
         "returns previous state; local only",
     ),
+    e("KeInitializeTimer", Implemented, ""),
+    e("KeCancelTimer", Implemented, ""),
+    e("KeSetTimer", Implemented, ""),
+    e("KeInitializeDpc", Implemented, ""),
     // --- IRQL (partial: simulated single-CPU level) ---
     e("KeGetCurrentIrql", Partial, "simulated single-CPU IRQL"),
     e(
@@ -106,9 +114,6 @@ pub const NTOSKRNL: &[ExportDescriptor] = &[
         TrapIfCalled,
         "IRP-building not modelled on the host; traps if called",
     ),
-    e("IoCallDriver", Unsupported, ""),
-    e("IoAttachDeviceToDeviceStack", Unsupported, ""),
-    e("IoDetachDevice", Unsupported, ""),
     e("PoCallDriver", Unsupported, ""),
     e("IoRegisterDeviceInterface", Unsupported, ""),
     e("IoSetDeviceInterfaceState", Unsupported, ""),

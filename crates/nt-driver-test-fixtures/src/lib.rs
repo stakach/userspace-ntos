@@ -267,6 +267,13 @@ pub fn pnp_mmio_interrupt_test_sys() -> &'static [u8] {
     include_bytes!("../fixtures/PnpMmioInterruptTest.sys")
 }
 
+/// The real MSVC-built `PendingStartTest.sys` WDM driver. Each AddDevice call
+/// creates an independent FDO whose START_DEVICE IRP is completed later by a
+/// one-shot kernel timer and KDPC.
+pub fn pending_start_test_sys() -> &'static [u8] {
+    include_bytes!("../fixtures/PendingStartTest.sys")
+}
+
 /// The real MSVC-built `PowerPnpMmioTest.sys` WDM driver (PnP + power D0/D3
 /// lifecycle via IRP_MJ_POWER), built by <https://github.com/stakach/ntdriver>.
 /// Used by the `driver-host-power` component + the Power Milestone 13 integration.
@@ -288,6 +295,12 @@ mod tests {
         let mut a = [0u8; 8];
         a.copy_from_slice(&b[o..o + 8]);
         u64::from_le_bytes(a)
+    }
+
+    fn contains_ascii(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
     }
 
     /// Given a section table entry, the file-raw offset of an RVA (walks the sections).
@@ -360,6 +373,33 @@ mod tests {
         );
         // The thunk array is NULL-terminated (2 imports → slot 2 is zero).
         assert_eq!(rd_u64(&b, iat0 + 2 * 8), 0, "IAT null terminator");
+    }
+
+    #[test]
+    fn pending_start_fixture_is_native_amd64_and_imports_real_timer_completion() {
+        let b = pending_start_test_sys();
+        assert_eq!(rd_u16(b, 0), 0x5A4D, "MZ magic");
+        let nt = rd_u32(b, 0x3c) as usize;
+        assert_eq!(rd_u32(b, nt), 0x0000_4550, "PE signature");
+        assert_eq!(rd_u16(b, nt + 4), 0x8664, "machine = AMD64");
+        let optional = nt + 24;
+        assert_eq!(rd_u16(b, optional), 0x020b, "PE32+");
+        assert_eq!(rd_u16(b, optional + 68), 1, "Subsystem = NATIVE");
+
+        for import in [
+            b"IoCreateDevice".as_slice(),
+            b"IoAttachDeviceToDeviceStack".as_slice(),
+            b"KeInitializeTimer".as_slice(),
+            b"KeInitializeDpc".as_slice(),
+            b"KeSetTimer".as_slice(),
+            b"IofCompleteRequest".as_slice(),
+        ] {
+            assert!(
+                contains_ascii(b, import),
+                "missing required WDM import {}",
+                core::str::from_utf8(import).unwrap()
+            );
+        }
     }
 
     #[test]

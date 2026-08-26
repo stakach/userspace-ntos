@@ -5437,6 +5437,10 @@ pub(crate) unsafe fn service_sec_image(
     let delay_queue =
         reset_service_delay_queue_work().expect("delay wait queue allocation failed");
     register_service_delay_drain_context(&mut nt_handler, delay_queue);
+    // Boot drivers can publish timer deadlines before the service loop owns its
+    // delay queue. Registration is the first point at which those deadlines can
+    // be armed on HPET, so do not wait for an unrelated later timer operation.
+    let _ = rearm_registered_delay_timer();
     if ntdll.is_some() {
         publish_kuser_clocks();
         let alias = kuser_page_alias_get(0);
@@ -5820,7 +5824,9 @@ pub(crate) unsafe fn service_sec_image(
     // STATIC because the win32k dispatch arm's nested pump ticks it too (see `w32_census_enter`).
     CENSUS_LAST_DUMP.store(last_progress_t, Ordering::Relaxed);
     loop {
-        if pending_driver_start_redrive_needed(&nt_handler) {
+        if pending_driver_start_redrive_needed(&nt_handler)
+            || driver_launch::hosted_driver_dpc_activation_pending()
+        {
             let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
         }
         if ntdll.is_some() {
@@ -5845,6 +5851,7 @@ pub(crate) unsafe fn service_sec_image(
             drained
         };
         if overdue_timed_wakes != 0 {
+            let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
             // Timer drains are scheduler bookkeeping, not forward progress by themselves. The
             // resumed waiter will bump PROGRESS_EPOCH if it performs real load/fill/event/paint
             // work; counting the wake itself can keep the boot alive forever on timeout churn.
@@ -6007,6 +6014,7 @@ pub(crate) unsafe fn service_sec_image(
         if pump_ticks != 0 {
             PUMP_TIMER_TICKS_DRAINED.fetch_add(pump_ticks, Ordering::Relaxed);
             delay_timer_interrupt(delay_queue, &mut nt_handler);
+            let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
         }
         if badge == DELAY_TIMER_BADGE {
             if delay_queue.len() != 0 && delay_queue.has_badge_other_than(badge) {
@@ -6028,6 +6036,7 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b"\n");
             }
             delay_timer_interrupt(delay_queue, &mut nt_handler);
+            let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
             // ★ THE DEADMAN'S TEETH. `watchdog_on_tick` (inside `recv_full_r12`) has already
             // raised a candidate; this is where the boot confirms it against the hosted-thread
             // census, then quiesces and runs the gate. Long runnable user-mode stretches are
@@ -23545,8 +23554,11 @@ unsafe fn pending_driver_load_redrive_all(nt_handler: &mut ExecNtHandler) -> u64
 }
 
 unsafe fn pump_hosted_io_and_redrive_driver_starts(nt_handler: &mut ExecNtHandler) -> u64 {
+    let activated = driver_launch::drain_hosted_driver_dpc_activations();
     let pumped = driver_launch::pump_hosted_io_completions() as u64;
-    pumped.saturating_add(pending_driver_load_redrive_all(nt_handler))
+    activated
+        .saturating_add(pumped)
+        .saturating_add(pending_driver_load_redrive_all(nt_handler))
 }
 
 fn pending_driver_start_redrive_needed(nt_handler: &ExecNtHandler) -> bool {

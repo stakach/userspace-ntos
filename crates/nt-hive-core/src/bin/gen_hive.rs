@@ -989,6 +989,65 @@ fn install_display_miniport(
     }
 }
 
+struct GeneratedRootPnpFixture<'a> {
+    service_name: &'a str,
+    image_path: &'a str,
+    start: u32,
+    hardware_id: &'a str,
+    compatible_ids: &'a [&'a str],
+    pdo_name_prefix: &'a str,
+    instance_count: u32,
+}
+
+fn install_root_pnp_fixture(hive: &mut Hive, fixture: GeneratedRootPnpFixture<'_>) {
+    let service = hive.create_key(&format!(r"ControlSet001\Services\{}", fixture.service_name));
+    hive.set_value(
+        service,
+        "ImagePath",
+        RegistryValueType::ExpandSz,
+        utf16le_sz(fixture.image_path),
+    );
+    hive.set_dword(service, "Type", SERVICE_KERNEL_DRIVER);
+    hive.set_dword(service, "Start", fixture.start);
+    hive.set_dword(service, "ErrorControl", 0x1);
+
+    for instance in 1..=fixture.instance_count {
+        let devnode = hive.create_key(&format!(
+            r"ControlSet001\Enum\{}\{:04}",
+            fixture.hardware_id, instance
+        ));
+        hive.set_value(
+            devnode,
+            "Service",
+            RegistryValueType::Sz,
+            utf16le_sz(fixture.service_name),
+        );
+        hive.set_value(
+            devnode,
+            "PdoName",
+            RegistryValueType::Sz,
+            utf16le_sz(&format!(
+                r"\Device\{}{:04}",
+                fixture.pdo_name_prefix, instance
+            )),
+        );
+        hive.set_value(
+            devnode,
+            "HardwareID",
+            RegistryValueType::MultiSz,
+            encode_multi_sz(&[fixture.hardware_id]),
+        );
+        if !fixture.compatible_ids.is_empty() {
+            hive.set_value(
+                devnode,
+                "CompatibleIDs",
+                RegistryValueType::MultiSz,
+                encode_multi_sz(fixture.compatible_ids),
+            );
+        }
+    }
+}
+
 fn build_hive_with_configuration(
     network_adapters: Vec<GeneratedNetworkAdapter>,
     display_mode: GeneratedDisplayMode,
@@ -1013,43 +1072,31 @@ fn build_hive_with_configuration(
     hive.set_dword(key, "Start", SERVICE_SYSTEM_START);
     hive.set_dword(key, "ErrorControl", 0x1);
 
-    // Device-driver hardware proof fixture. This is boot registry data, not executive policy:
-    // the kernel must discover it through the same service/devnode selectors used for real hives.
-    let key = hive.create_key(r"ControlSet001\Services\DmaPnpPowerTest");
-    hive.set_value(
-        key,
-        "ImagePath",
-        RegistryValueType::ExpandSz,
-        utf16le_sz(r"system32\drivers\DmaPnpPowerTest.sys"),
+    // Driver fixtures are registry data, not executive policy. The kernel discovers the same
+    // service/devnode records used for real hardware and imposes no per-driver instance ceiling.
+    install_root_pnp_fixture(
+        &mut hive,
+        GeneratedRootPnpFixture {
+            service_name: "DmaPnpPowerTest",
+            image_path: r"system32\drivers\DmaPnpPowerTest.sys",
+            start: SERVICE_SYSTEM_START,
+            hardware_id: r"ROOT\USERSPACE_NTOS_DMA",
+            compatible_ids: &[r"ROOT\USERSPACE_NTOS_TEST_DEVICE"],
+            pdo_name_prefix: "NTPNP_ROOT",
+            instance_count: 1,
+        },
     );
-    hive.set_dword(key, "Type", SERVICE_KERNEL_DRIVER);
-    hive.set_dword(key, "Start", SERVICE_SYSTEM_START);
-    hive.set_dword(key, "ErrorControl", 0x1);
-
-    let devnode = hive.create_key(r"ControlSet001\Enum\ROOT\USERSPACE_NTOS_DMA\0001");
-    hive.set_value(
-        devnode,
-        "Service",
-        RegistryValueType::Sz,
-        utf16le_sz("DmaPnpPowerTest"),
-    );
-    hive.set_value(
-        devnode,
-        "PdoName",
-        RegistryValueType::Sz,
-        utf16le_sz(r"\Device\NTPNP_ROOT0001"),
-    );
-    hive.set_value(
-        devnode,
-        "HardwareID",
-        RegistryValueType::MultiSz,
-        encode_multi_sz(&[r"ROOT\USERSPACE_NTOS_DMA"]),
-    );
-    hive.set_value(
-        devnode,
-        "CompatibleIDs",
-        RegistryValueType::MultiSz,
-        encode_multi_sz(&[r"ROOT\USERSPACE_NTOS_TEST_DEVICE"]),
+    install_root_pnp_fixture(
+        &mut hive,
+        GeneratedRootPnpFixture {
+            service_name: "PendingStartTest",
+            image_path: r"system32\drivers\PendingStartTest.sys",
+            start: SERVICE_SYSTEM_START,
+            hardware_id: r"ROOT\USERSPACE_NTOS_PENDING_START",
+            compatible_ids: &[],
+            pdo_name_prefix: "NTPNP_PENDING",
+            instance_count: 2,
+        },
     );
 
     install_generated_network_adapters(&mut hive, &network_adapters);
@@ -1132,6 +1179,62 @@ mod tests {
                 RegistryValueType::Sz,
                 utf16le_sz("DmaPnpPowerTest").as_slice()
             ))
+        );
+    }
+
+    #[test]
+    fn generated_hive_declares_two_pending_start_devnodes() {
+        let hive = build_hive();
+        let key = hive
+            .open_key(r"ControlSet001\Services\PendingStartTest")
+            .expect("service key");
+        assert_eq!(hive.query_dword(key, "Type"), Some(SERVICE_KERNEL_DRIVER));
+        assert_eq!(hive.query_dword(key, "Start"), Some(SERVICE_SYSTEM_START));
+        assert_eq!(
+            hive.query_value(key, "ImagePath"),
+            Some((
+                RegistryValueType::ExpandSz,
+                utf16le_sz(r"system32\drivers\PendingStartTest.sys").as_slice()
+            ))
+        );
+
+        for (instance, pdo_name) in [
+            ("0001", r"\Device\NTPNP_PENDING0001"),
+            ("0002", r"\Device\NTPNP_PENDING0002"),
+        ] {
+            let devnode = hive
+                .open_key(&format!(
+                    r"ControlSet001\Enum\ROOT\USERSPACE_NTOS_PENDING_START\{}",
+                    instance
+                ))
+                .expect("pending START devnode");
+            assert_eq!(
+                hive.query_value(devnode, "Service"),
+                Some((
+                    RegistryValueType::Sz,
+                    utf16le_sz("PendingStartTest").as_slice()
+                ))
+            );
+            assert_eq!(
+                hive.query_value(devnode, "PdoName"),
+                Some((RegistryValueType::Sz, utf16le_sz(pdo_name).as_slice()))
+            );
+        }
+
+        let cm = import_generated_hive_config_manager(&hive);
+        let bindings = cm.boot_system_pnp_driver_bindings();
+        let binding = bindings
+            .iter()
+            .find(|binding| binding.service.name == "PendingStartTest")
+            .expect("pending START service binding");
+        assert_eq!(binding.devnodes.len(), 2);
+        assert_eq!(
+            binding.devnodes[0].instance_id,
+            r"ROOT\USERSPACE_NTOS_PENDING_START\0001"
+        );
+        assert_eq!(
+            binding.devnodes[1].instance_id,
+            r"ROOT\USERSPACE_NTOS_PENDING_START\0002"
         );
     }
 

@@ -10920,7 +10920,7 @@ pub(crate) fn hosted_driver_timer_next_deadline() -> Option<u64> {
     }
 }
 
-pub(crate) unsafe fn hosted_driver_timer_wake_due(_now_100ns: u64) -> u64 {
+pub(crate) unsafe fn hosted_driver_timer_wake_due(now_100ns: u64) -> u64 {
     let queue_count = (*core::ptr::addr_of!(HOSTED_DRIVER_TIMERS))
         .as_ref()
         .map(Vec::len)
@@ -10931,7 +10931,7 @@ pub(crate) unsafe fn hosted_driver_timer_wake_due(_now_100ns: u64) -> u64 {
             let queues = (*core::ptr::addr_of_mut!(HOSTED_DRIVER_TIMERS))
                 .as_mut()
                 .unwrap();
-            queues[instance_index].run_due_expirations(&ExecutiveClock)
+            queues[instance_index].run_due_expirations_at(now_100ns)
         };
         if expirations.is_empty() {
             continue;
@@ -10961,22 +10961,80 @@ pub(crate) unsafe fn hosted_driver_timer_wake_due(_now_100ns: u64) -> u64 {
                 delivered.saturating_add(wake_hosted_driver_waiters_for_instance(instance_index));
 
             if let Some(dpc) = expiry.dpc_ptr {
-                let mut no_output = [];
-                let _ = dispatch_irp_for_instance(
-                    instance_index,
-                    FSD_DISPATCH_TIMER_DPC,
-                    0,
-                    0,
-                    0,
-                    0,
-                    dpc,
-                    expiry.timer_ptr,
-                    0,
-                    None,
-                    &[],
-                    &mut no_output,
-                );
+                let activations = hosted_driver_dpc_activations_mut();
+                if !activations
+                    .iter()
+                    .any(|queued| queued.instance == instance_index && queued.dpc_ptr == dpc)
+                {
+                    let old_capacity = activations.capacity();
+                    activations.push(HostedDriverDpcActivation {
+                        instance: instance_index,
+                        timer_ptr: expiry.timer_ptr,
+                        dpc_ptr: dpc,
+                    });
+                    if activations.capacity() != old_capacity {
+                        crate::mark_durable_table_growth_dirty();
+                    }
+                }
             }
+        }
+    }
+    if FSD_ACTIVE_DISPATCH_SEQ.load(Ordering::Acquire) == 0 {
+        delivered = delivered.saturating_add(drain_hosted_driver_dpc_activations());
+    }
+    delivered
+}
+
+pub(crate) fn hosted_driver_dpc_activation_pending() -> bool {
+    unsafe {
+        (*core::ptr::addr_of!(HOSTED_DRIVER_DPC_ACTIVATIONS))
+            .as_ref()
+            .is_some_and(|activations| !activations.is_empty())
+    }
+}
+
+/// Dispatch timer-DPC activations only after the current component has released
+/// its shared request bank. The snapshot budget prevents a periodic timer that
+/// re-arms during its own DPC from monopolising the executive; newly queued work
+/// runs at the next safe scheduler boundary.
+pub(crate) unsafe fn drain_hosted_driver_dpc_activations() -> u64 {
+    if FSD_ACTIVE_DISPATCH_SEQ.load(Ordering::Acquire) != 0 {
+        return 0;
+    }
+    let budget = (*core::ptr::addr_of!(HOSTED_DRIVER_DPC_ACTIVATIONS))
+        .as_ref()
+        .map(Vec::len)
+        .unwrap_or(0);
+    let mut delivered = 0u64;
+    for _ in 0..budget {
+        if FSD_ACTIVE_DISPATCH_SEQ.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        let activation = {
+            let activations = hosted_driver_dpc_activations_mut();
+            if activations.is_empty() {
+                break;
+            }
+            activations.remove(0)
+        };
+        let mut no_output = [];
+        if dispatch_irp_for_instance(
+            activation.instance,
+            FSD_DISPATCH_TIMER_DPC,
+            0,
+            0,
+            0,
+            0,
+            activation.dpc_ptr,
+            activation.timer_ptr,
+            0,
+            None,
+            &[],
+            &mut no_output,
+        )
+        .is_some_and(|(status, _, _)| status >= 0)
+        {
+            delivered = delivered.saturating_add(1);
         }
     }
     delivered
@@ -30305,6 +30363,12 @@ unsafe fn fsd_post_driver_entry(status: i32, drv: u64) {
 /// runs the driver's handler via [`run_irp`] in this component's context. Returns `(status, info)`.
 /// This is the EXACT body the retired inline `dispatch_loop` ran per request.
 unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
+    let result = fsd_dispatch_inner(req);
+    let _ = fsd_drain_queued_dpcs();
+    result
+}
+
+unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
     let major = req.sel;
     let request_drv = match read_volatile((FSD_SHARED_VADDR + SH_DRVOBJ) as *const u64) {
         0 => req.drv,
@@ -30345,7 +30409,6 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
         let isr: extern "win64" fn(u64, u64) -> u8 =
             core::mem::transmute(service_routine as *const ());
         let claimed = isr(interrupt_object, service_context);
-        let _ = fsd_drain_queued_dpcs();
         let deliveries =
             read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_DELIVERIES) as *const u64);
         write_volatile(
@@ -30396,12 +30459,10 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
             if routine == 0 {
                 return (STATUS_INVALID_PARAMETER, 0);
             }
-            let context = read_unaligned((dpc + KDPC_DEFERRED_CONTEXT_OFFSET) as *const u64);
-            let callback: extern "win64" fn(u64, u64, u64, u64) =
-                core::mem::transmute(routine as *const ());
-            let old_irql = hosted_raise_irql(DISPATCH_LEVEL);
-            callback(dpc, context, 0, 0);
-            hosted_lower_irql(old_irql);
+            let queued = read_unaligned((dpc + KDPC_QUEUED_OFFSET) as *const u8) != 0;
+            if !queued && s_ke_insert_queue_dpc(dpc, 0, 0) == 0 {
+                return (STATUS_INSUFFICIENT_RESOURCES, 0);
+            }
         }
         return (STATUS_SUCCESS, 0);
     }
@@ -39252,6 +39313,19 @@ static mut HOSTED_DRIVER_WAITERS: Option<Vec<HostedDriverRawWaiter>> = None;
 static mut HOSTED_DRIVER_REPLY_POOLS: Option<Vec<HostedDriverReplyPool>> = None;
 static mut HOSTED_DRIVER_TIMERS: Option<Vec<nt_kernel_exec::TimerQueue>> = None;
 
+#[derive(Clone, Copy)]
+struct HostedDriverDpcActivation {
+    instance: usize,
+    timer_ptr: u64,
+    dpc_ptr: u64,
+}
+
+/// Timer interrupts may arrive while the executive is nested inside a driver
+/// component pump. Activations wait here until no component owns its shared
+/// request bank; duplicate KDPC identities are suppressed exactly as
+/// KeInsertQueueDpc suppresses an already-queued KDPC.
+static mut HOSTED_DRIVER_DPC_ACTIVATIONS: Option<Vec<HostedDriverDpcActivation>> = None;
+
 struct ExecutiveClock;
 
 impl nt_kernel_exec::Clock for ExecutiveClock {
@@ -39364,6 +39438,15 @@ unsafe fn hosted_driver_timer_queue_mut(
     }
     let grew = queues.capacity() != old_capacity;
     (&mut queues[instance], grew)
+}
+
+unsafe fn hosted_driver_dpc_activations_mut(
+) -> &'static mut Vec<HostedDriverDpcActivation> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DRIVER_DPC_ACTIVATIONS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
 }
 
 unsafe fn hosted_driver_reply_pools_mut() -> &'static mut Vec<HostedDriverReplyPool> {
@@ -39557,6 +39640,11 @@ fn clear_hosted_driver_timers_for_instance(instance: usize) {
             if let Some(queue) = queues.get_mut(instance) {
                 queue.clear();
             }
+        }
+        if let Some(activations) =
+            (*core::ptr::addr_of_mut!(HOSTED_DRIVER_DPC_ACTIVATIONS)).as_mut()
+        {
+            activations.retain(|activation| activation.instance != instance);
         }
         let _ = crate::service_sec_image::rearm_registered_delay_timer();
     }
@@ -44377,6 +44465,12 @@ unsafe fn dispatch_irp_for_instance_exact(
             });
         }
     }
+    let Some(transfer_guard) = enter_active_hosted_irp_transfer(sh, canonical_irp_id, in_data, out)
+    else {
+        return Some(HostedIrpTransportResult::NotDispatched {
+            status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+        });
+    };
     let bugchecks_before = FSD_BUGCHECKS.load(Ordering::Relaxed);
     // DIAGNOSTIC (bounded): an IRP dispatch is the one place the executive blocks on a hosted
     // component, so an `ENTER` with no matching `EXIT` is the signature of a driver that never
@@ -44410,12 +44504,6 @@ unsafe fn dispatch_irp_for_instance_exact(
         print_u64(out.len() as u64);
         print_str(b"\n");
     }
-    let Some(transfer_guard) = enter_active_hosted_irp_transfer(sh, canonical_irp_id, in_data, out)
-    else {
-        return Some(HostedIrpTransportResult::NotDispatched {
-            status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
-        });
-    };
     let pr = hosted_component_pump(&ch);
     drop(transfer_guard);
     FSD_ACTIVE_DISPATCH_SEQ.store(0, Ordering::Relaxed);

@@ -91,7 +91,7 @@ pub fn render(a: &Analysis) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nt_driver_test_fixtures::{minimal_pe, pe_importing};
+    use nt_driver_test_fixtures::{minimal_pe, pe_importing, pending_start_test_sys};
 
     #[test]
     fn no_import_image_is_runnable() {
@@ -108,6 +108,22 @@ mod tests {
         assert_eq!(a.import_dlls, vec!["ntoskrnl.exe"]);
         assert_eq!(a.report.checks.len(), 2);
         assert!(a.runnable());
+    }
+
+    #[test]
+    fn real_pending_start_fixture_is_runnable() {
+        let analysis = analyze(pending_start_test_sys()).unwrap();
+        assert!(analysis.runnable(), "{}", render(&analysis));
+        assert!(analysis
+            .report
+            .checks
+            .iter()
+            .any(|check| check.name == "IofCompleteRequest"));
+        assert!(analysis
+            .report
+            .checks
+            .iter()
+            .any(|check| check.name == "KeSetTimer"));
     }
 
     #[test]

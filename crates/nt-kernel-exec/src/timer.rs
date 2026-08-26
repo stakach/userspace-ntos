@@ -218,17 +218,26 @@ impl TimerQueue {
     /// Expire all due timers: set their signaled state, reschedule periodic
     /// ones, and return both the timer and optional `KDPC` identities.
     pub fn run_due_expirations(&mut self, clock: &dyn Clock) -> Vec<TimerExpiry> {
-        let now = clock.now_100ns();
+        self.run_due_expirations_at(clock.now_100ns())
+    }
+
+    /// Expire all timers due at the caller's authoritative monotonic time.
+    ///
+    /// Interrupt controllers may deliver an edge at a deadline that rounds one
+    /// clock quantum ahead of a subsequent counter read. The interrupt owner
+    /// must be able to preserve that deadline rather than miss the expiry and
+    /// wait for an unrelated later interrupt.
+    pub fn run_due_expirations_at(&mut self, now_100ns: u64) -> Vec<TimerExpiry> {
         let mut fired = Vec::new();
         for t in self.timers.iter_mut() {
-            if t.active && t.due_mono <= now {
+            if t.active && t.due_mono <= now_100ns {
                 t.signaled = true;
                 fired.push(TimerExpiry {
                     timer_ptr: t.ptr,
                     dpc_ptr: t.dpc_ptr,
                 });
                 if t.period_100ns > 0 {
-                    t.due_mono = now + t.period_100ns; // periodic: reschedule
+                    t.due_mono = now_100ns + t.period_100ns; // periodic: reschedule
                 } else {
                     t.active = false;
                 }
@@ -344,6 +353,25 @@ mod tests {
         tq.clear();
         assert_eq!(tq.next_deadline(), None);
         assert_eq!(tq.active_count(), 0);
+    }
+
+    #[test]
+    fn authoritative_interrupt_time_expires_at_the_armed_boundary() {
+        let clk = FakeClock::new();
+        let mut tq = TimerQueue::new();
+        tq.set(0x700, -1_000, 0, Some(0xD1), &clk);
+
+        // The sampled clock is still one quantum behind, but the interrupt
+        // owner knows that the armed deadline produced this delivery.
+        assert!(tq.run_due_expirations(&clk).is_empty());
+        assert_eq!(
+            tq.run_due_expirations_at(1_000),
+            vec![TimerExpiry {
+                timer_ptr: 0x700,
+                dpc_ptr: Some(0xD1),
+            }]
+        );
+        assert!(tq.run_due_expirations_at(1_000).is_empty());
     }
 
     #[test]

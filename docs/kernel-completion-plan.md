@@ -12438,3 +12438,42 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     prepare -> bind token -> exact dispatch. Retain token plus canonical IRP across pending or
     indeterminate outcomes. Video remains on its explicit old startup path until a real videoprt PnP
     backend exists; do not route video through the generic control adapter.
+
+    Multi-devnode asynchronous START fixture and scheduler checkpoint (2026-08-26, implementation
+    green): the independently built `PendingStartTest.sys` WDM fixture now lives in the canonical
+    `stakach/ntdriver` source repository at commit `9a282e8`. Its WDK matrix build
+    `32954978061` is green and the vendored x64 Release image has SHA-256
+    `5ceafbaafd4e1c52b0bdbdfcf4ebf14c12275dad13e132ccbfe202f7da1913c4`. Each real AddDevice
+    call creates an unnamed, resource-free FDO with its own retained START IRP, KTIMER, and KDPC.
+    START first completes the lower PDO stack, then returns `STATUS_PENDING`; the one-shot timer DPC
+    atomically takes and completes that exact IRP. The generated SYSTEM hive installs one
+    SYSTEM_START service with two ordered root devnodes, and its Configuration Manager import test
+    proves that both devnodes belong to the same dynamic binding. `rust-micro` commit `21ce43a`
+    stages every fixture `.sys` dynamically rather than maintaining a kernel-adjacent filename list.
+
+    The executive timer path now consumes the interrupt owner's authoritative monotonic deadline,
+    arms deadlines that were published before service delay-context registration, and never enters
+    a component timer DPC while another component dispatch owns a shared request bank. Timer DPC
+    activations are dynamically queued by instance and KDPC identity, duplicate-suppressed, and
+    dispatched at the next quiescent scheduler boundary. Inside the component, timer activation now
+    uses the ordinary `KeInsertQueueDpc` queue; all software DPCs drain at the common post-dispatch
+    boundary at `DISPATCH_LEVEL`. This retires the private direct timer-callback behavior and also
+    gives ordinary software DPC insertions an autonomous dispatch boundary. Every direct,
+    coalesced, or overdue timer delivery now performs DPC activation, hosted completion publication,
+    and pending PnP batch redrive before the service loop blocks again. Active-dispatch diagnostics
+    are published only after exact transfer ownership is secured.
+
+    Focused validation is green: `nt-kernel-exec` `168/168`, the real fixture PE checks `6/6`, the
+    generated hive's two-devnode Configuration Manager binding, `nt-config-manager` `28/28`, the
+    delayed canonical PnP completion test, and `driver-import-report` `5/5`. The import capability
+    table now matches the already-real production bindings for timer/DPC and device-stack attach,
+    detach, call, and completion; the real image reports all 13 imports available and `runnable`.
+    The freestanding executive check remains green at the established 212-warning baseline.
+
+    Review adjustment: keep this checkpoint open until one serialized desktop run observes two
+    genuine `STATUS_PENDING` START returns, two driver-origin terminal completions in order, zero
+    pending/indeterminate rows at the boot report, the new generic pending-START gate, all existing
+    PnP/provider gates, real Explorer chrome, and the sentinel. After that proof, continue the
+    transaction plan with live Configuration Manager authority for a later demand-start devnode and
+    a genuine native `NtLoadDriver` reply owner; do not exclude the fixture from ordinary PnP device
+    action or add a second static load policy.

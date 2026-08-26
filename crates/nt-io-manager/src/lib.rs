@@ -1895,6 +1895,7 @@ mod tests {
 
     struct PendingPnpBackend {
         ready: std::rc::Rc<std::cell::RefCell<std::vec::Vec<DriverCompletion>>>,
+        release: std::rc::Rc<std::cell::Cell<bool>>,
     }
 
     impl DriverDispatchBackend for PendingPnpBackend {
@@ -1917,7 +1918,10 @@ mod tests {
         }
 
         fn poll_completion(&mut self) -> Option<DriverCompletion> {
-            self.ready.borrow_mut().pop()
+            self.release
+                .get()
+                .then(|| self.ready.borrow_mut().pop())
+                .flatten()
         }
     }
 
@@ -2070,10 +2074,12 @@ mod tests {
 
         let mut pending_io = io();
         let pending_ready = std::rc::Rc::new(std::cell::RefCell::new(std::vec::Vec::new()));
+        let pending_release = std::rc::Rc::new(std::cell::Cell::new(false));
         let (client, root, _, _) = pnp_test_stack(
             &mut pending_io,
             Box::new(PendingPnpBackend {
                 ready: pending_ready,
+                release: pending_release.clone(),
             }),
         );
         let prepared = pending_io
@@ -2085,6 +2091,9 @@ mod tests {
             ExternalPnpDispatchResult::Pending { irp_id: pending_id }
         );
         assert_eq!(pending_io.irp(pending_id).unwrap().state, IrpState::Pending);
+        assert_eq!(pending_io.pump(), 0, "completion is not ready before tick");
+        assert_eq!(pending_io.irp(pending_id).unwrap().state, IrpState::Pending);
+        pending_release.set(true);
         assert_eq!(pending_io.pump(), 1);
         let completion = pending_io.completed_irp(pending_id).unwrap();
         assert_eq!(completion.minor, nt_pnp_abi::IRP_MN_QUERY_STOP_DEVICE);
