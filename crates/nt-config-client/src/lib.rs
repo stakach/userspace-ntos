@@ -15,17 +15,19 @@ use alloc::vec::Vec;
 
 use nt_config_abi::{
     device_property_transfer, driver_service_class, driver_service_transfer, hive_import_transfer,
-    hive_key_transfer, hive_mount, launch_plan_kind, launch_plan_transfer, network_plan_kind,
-    opcode, pnp_query_kind, pnp_query_transfer, win32_service_plan_kind,
-    win32_service_process_kind, CmDevicePropertyRequest, CmDriverServiceRequest,
-    CmEnumerateKeyRequest, CmHiveImportRequest, CmHiveKeyRequest, CmKeyRequest,
+    hive_key_transfer, hive_mount, hive_mutation_flags, hive_mutation_kind, hive_mutation_transfer,
+    launch_plan_kind, launch_plan_transfer, network_plan_kind, opcode, pnp_query_kind,
+    pnp_query_transfer, win32_service_plan_kind, win32_service_process_kind,
+    CmDevicePropertyRequest, CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveImportRequest,
+    CmHiveKeyRequest, CmHiveMutationRecord, CmHiveMutationRequest, CmKeyRequest,
     CmLaunchPlanRequest, CmPnpQueryRequest, CmRawValueRequest, CmReply, CmValueRequest,
     CM_ABI_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_DRIVER_SERVICE_CHUNK_BYTES,
     CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_MAGIC,
     CM_DRIVER_SERVICE_SNAPSHOT_VERSION, CM_HIVE_IMPORT_CHUNK_BYTES, CM_HIVE_KEY_CHUNK_BYTES,
     CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES, CM_HIVE_KEY_SNAPSHOT_MAGIC, CM_HIVE_KEY_SNAPSHOT_VERSION,
-    CM_LAUNCH_PLAN_CHUNK_BYTES, CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES,
-    CM_LAUNCH_PLAN_SNAPSHOT_MAGIC, CM_LAUNCH_PLAN_SNAPSHOT_VERSION, CM_MAX_HIVE_PATH_UNITS,
+    CM_HIVE_MUTATION_CHUNK_BYTES, CM_HIVE_MUTATION_RECORD_HEADER_BYTES, CM_LAUNCH_PLAN_CHUNK_BYTES,
+    CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES, CM_LAUNCH_PLAN_SNAPSHOT_MAGIC,
+    CM_LAUNCH_PLAN_SNAPSHOT_VERSION, CM_MAX_HIVE_PATH_UNITS, CM_MAX_HIVE_VALUE_NAME_UNITS,
     CM_MAX_INSTANCE_UNITS, CM_MAX_PNP_AUX_BYTES, CM_MAX_SERVICE_UNITS,
     CM_NETWORK_PLAN_SNAPSHOT_HEADER_BYTES, CM_NETWORK_PLAN_SNAPSHOT_MAGIC,
     CM_NETWORK_PLAN_SNAPSHOT_VERSION, CM_OPTIONAL_BLOB_ABSENT, CM_OPTIONAL_STRING_ABSENT,
@@ -48,6 +50,35 @@ const STATUS_INSUFFICIENT_RESOURCES: i32 = 0xC000_009Au32 as i32;
 pub struct QueryError {
     pub status: i32,
     pub required_len: usize,
+}
+
+/// One operation in an atomic, generation-checked mutation of the CM-owned SYSTEM hive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SystemHiveMutation<'a> {
+    CreateKey {
+        path: &'a str,
+    },
+    SetValue {
+        path: &'a str,
+        name: &'a str,
+        value_type: u32,
+        data: &'a [u8],
+    },
+    DeleteValue {
+        path: &'a str,
+        name: &'a str,
+    },
+    DeleteKey {
+        path: &'a str,
+    },
+    SetKeyClass {
+        path: &'a str,
+        class_name: Option<&'a str>,
+    },
+    SetKeySecurity {
+        path: &'a str,
+        descriptor: &'a [u8],
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -545,6 +576,128 @@ fn utf16_bytes(s: &str) -> Vec<u8> {
     v
 }
 
+fn append_hive_mutation_record(
+    journal: &mut Vec<u8>,
+    kind: u16,
+    flags: u16,
+    value_type: u32,
+    path: &str,
+    name: &str,
+    data: &[u8],
+) -> Result<(), i32> {
+    let path = utf16_bytes(path);
+    let name = utf16_bytes(name);
+    if path.len() > CM_MAX_HIVE_PATH_UNITS * 2 || name.len() > CM_MAX_HIVE_VALUE_NAME_UNITS * 2 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let path_len_bytes = u32::try_from(path.len()).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let name_len_bytes = u32::try_from(name.len()).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let data_len_bytes = u32::try_from(data.len()).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let additional = CM_HIVE_MUTATION_RECORD_HEADER_BYTES
+        .checked_add(path.len())
+        .and_then(|len| len.checked_add(name.len()))
+        .and_then(|len| len.checked_add(data.len()))
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    journal
+        .try_reserve(additional)
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    let header = CmHiveMutationRecord {
+        kind,
+        flags,
+        value_type,
+        path_len_bytes,
+        name_len_bytes,
+        data_len_bytes,
+        _reserved: 0,
+    };
+    journal.extend_from_slice(header.as_bytes());
+    journal.extend_from_slice(&path);
+    journal.extend_from_slice(&name);
+    journal.extend_from_slice(data);
+    Ok(())
+}
+
+fn encode_hive_mutation_journal(mutations: &[SystemHiveMutation<'_>]) -> Result<Vec<u8>, i32> {
+    if mutations.is_empty() {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let mut journal = Vec::new();
+    for mutation in mutations {
+        match *mutation {
+            SystemHiveMutation::CreateKey { path } => append_hive_mutation_record(
+                &mut journal,
+                hive_mutation_kind::CREATE_KEY,
+                0,
+                0,
+                path,
+                "",
+                &[],
+            )?,
+            SystemHiveMutation::SetValue {
+                path,
+                name,
+                value_type,
+                data,
+            } => append_hive_mutation_record(
+                &mut journal,
+                hive_mutation_kind::SET_VALUE,
+                0,
+                value_type,
+                path,
+                name,
+                data,
+            )?,
+            SystemHiveMutation::DeleteValue { path, name } => append_hive_mutation_record(
+                &mut journal,
+                hive_mutation_kind::DELETE_VALUE,
+                0,
+                0,
+                path,
+                name,
+                &[],
+            )?,
+            SystemHiveMutation::DeleteKey { path } => append_hive_mutation_record(
+                &mut journal,
+                hive_mutation_kind::DELETE_KEY,
+                0,
+                0,
+                path,
+                "",
+                &[],
+            )?,
+            SystemHiveMutation::SetKeyClass { path, class_name } => {
+                let class_data = class_name.map(utf16_bytes);
+                append_hive_mutation_record(
+                    &mut journal,
+                    hive_mutation_kind::SET_KEY_CLASS,
+                    if class_name.is_some() {
+                        hive_mutation_flags::CLASS_PRESENT
+                    } else {
+                        0
+                    },
+                    0,
+                    path,
+                    "",
+                    class_data.as_deref().unwrap_or(&[]),
+                )?;
+            }
+            SystemHiveMutation::SetKeySecurity { path, descriptor } => {
+                append_hive_mutation_record(
+                    &mut journal,
+                    hive_mutation_kind::SET_KEY_SECURITY,
+                    0,
+                    0,
+                    path,
+                    "",
+                    descriptor,
+                )?;
+            }
+        }
+    }
+    u32::try_from(journal.len()).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    Ok(journal)
+}
+
 /// The ergonomic Configuration Manager client.
 pub struct ConfigClient<B> {
     backend: B,
@@ -912,6 +1065,98 @@ impl<B: Backend> ConfigClient<B> {
         };
         if commit.status != STATUS_SUCCESS || commit.detail0 == 0 || commit.detail1 != token {
             self.abort_hive_import(token, total_len);
+            return Err(if commit.status == STATUS_SUCCESS {
+                STATUS_INVALID_PARAMETER
+            } else {
+                commit.status
+            });
+        }
+        Ok(commit.detail0)
+    }
+
+    /// Atomically apply `mutations` to exactly `expected_generation` of CM's mounted SYSTEM hive.
+    /// The journal streams across as many request frames as required; no operation is visible until
+    /// the complete journal validates and commits.
+    pub fn mutate_system_hive(
+        &mut self,
+        expected_generation: u64,
+        mutations: &[SystemHiveMutation<'_>],
+    ) -> Result<u64, i32> {
+        if expected_generation == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let journal = encode_hive_mutation_journal(mutations)?;
+        let journal_len = u32::try_from(journal.len()).map_err(|_| STATUS_INVALID_PARAMETER)?;
+        let begin = self.hive_mutation_call(
+            hive_mutation_transfer::BEGIN,
+            0,
+            expected_generation,
+            0,
+            journal_len,
+            &[],
+        )?;
+        if begin.status != STATUS_SUCCESS
+            || begin.information != 0
+            || begin.detail0 != expected_generation
+            || begin.detail1 == 0
+        {
+            return Err(if begin.status == STATUS_SUCCESS {
+                STATUS_INVALID_PARAMETER
+            } else {
+                begin.status
+            });
+        }
+        let token = begin.detail1;
+        let mut offset = 0usize;
+        while offset < journal.len() {
+            let end = core::cmp::min(offset + CM_HIVE_MUTATION_CHUNK_BYTES, journal.len());
+            let response = match self.hive_mutation_call(
+                hive_mutation_transfer::APPEND,
+                token,
+                expected_generation,
+                offset as u32,
+                journal_len,
+                &journal[offset..end],
+            ) {
+                Ok(response) => response,
+                Err(status) => {
+                    self.abort_hive_mutation(token, expected_generation, journal_len);
+                    return Err(status);
+                }
+            };
+            if response.status != STATUS_SUCCESS
+                || response.information as usize != end - offset
+                || response.detail0 != expected_generation
+                || response.detail1 != token
+            {
+                self.abort_hive_mutation(token, expected_generation, journal_len);
+                return Err(if response.status == STATUS_SUCCESS {
+                    STATUS_INVALID_PARAMETER
+                } else {
+                    response.status
+                });
+            }
+            offset = end;
+        }
+        let commit = match self.hive_mutation_call(
+            hive_mutation_transfer::COMMIT,
+            token,
+            expected_generation,
+            journal_len,
+            journal_len,
+            &[],
+        ) {
+            Ok(response) => response,
+            Err(status) => {
+                self.abort_hive_mutation(token, expected_generation, journal_len);
+                return Err(status);
+            }
+        };
+        if commit.status != STATUS_SUCCESS
+            || commit.detail0 != expected_generation.saturating_add(1)
+            || commit.detail1 != token
+        {
+            self.abort_hive_mutation(token, expected_generation, journal_len);
             return Err(if commit.status == STATUS_SUCCESS {
                 STATUS_INVALID_PARAMETER
             } else {
@@ -1328,6 +1573,66 @@ impl<B: Backend> ConfigClient<B> {
         );
     }
 
+    fn hive_mutation_call(
+        &mut self,
+        operation: u16,
+        lease_token: u64,
+        expected_generation: u64,
+        journal_offset: u32,
+        journal_len_bytes: u32,
+        chunk: &[u8],
+    ) -> Result<CmReply, i32> {
+        if chunk.len() > CM_HIVE_MUTATION_CHUNK_BYTES {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let header_size = core::mem::size_of::<CmHiveMutationRequest>();
+        let chunk_offset = if chunk.is_empty() {
+            0
+        } else {
+            header_size as u32
+        };
+        let header = CmHiveMutationRequest {
+            abi_size: header_size as u16,
+            abi_version: CM_ABI_VERSION,
+            operation,
+            mount: hive_mount::SYSTEM,
+            journal_offset,
+            chunk_offset,
+            chunk_len_bytes: u32::try_from(chunk.len()).map_err(|_| STATUS_INVALID_PARAMETER)?,
+            journal_len_bytes,
+            expected_generation,
+            lease_token,
+        };
+        let mut request = Vec::new();
+        request
+            .try_reserve_exact(header_size.saturating_add(chunk.len()))
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        request.extend_from_slice(header.as_bytes());
+        request.extend_from_slice(chunk);
+        Ok(self
+            .backend
+            .call(opcode::CM_OP_MUTATE_SYSTEM_HIVE, &request, &mut []))
+    }
+
+    fn abort_hive_mutation(
+        &mut self,
+        lease_token: u64,
+        expected_generation: u64,
+        journal_len_bytes: u32,
+    ) {
+        if lease_token == 0 {
+            return;
+        }
+        let _ = self.hive_mutation_call(
+            hive_mutation_transfer::ABORT,
+            lease_token,
+            expected_generation,
+            0,
+            journal_len_bytes,
+            &[],
+        );
+    }
+
     fn hive_key_call(
         &mut self,
         path_bytes: &[u8],
@@ -1739,6 +2044,151 @@ mod tests {
             .unwrap();
         assert_eq!(selected.mount_generation, snapshot.mount_generation);
         assert_eq!(selected.values, snapshot.values);
+    }
+
+    #[test]
+    fn system_hive_mutation_is_streamed_atomic_and_rebuilds_semantic_views() {
+        const STATUS_REVISION_MISMATCH: i32 = 0xC000_0059u32 as i32;
+        const STATUS_CANNOT_DELETE: i32 = 0xC000_0121u32 as i32;
+        const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
+
+        let mut hive = Hive::new(HiveKind::System);
+        let select = hive.create_key("Select");
+        hive.set_dword(select, "Current", 1);
+        let existing = hive.create_key(r"ControlSet001\Services\Existing");
+        hive.set_dword(existing, "DeleteMe", 1);
+        hive.create_subkey(existing, "Child");
+        let obsolete = hive.create_key(r"ControlSet001\Services\Obsolete");
+        hive.set_dword(obsolete, "Value", 1);
+        hive.finish_clean_import();
+
+        let mut client = ConfigClient::new(Framed {
+            server: CmServer::new(),
+        });
+        assert_eq!(client.import_system_hive(&encode_image(&hive)), Ok(1));
+
+        let service_path = r"\Registry\Machine\System\CurrentControlSet\Services\DynamicService";
+        let existing_path = r"\Registry\Machine\System\CurrentControlSet\Services\Existing";
+        let obsolete_path = r"\Registry\Machine\System\CurrentControlSet\Services\Obsolete";
+        let image = encode_sz(r"system32\dynamic.exe /service");
+        let payload = vec![0x5a; CM_HIVE_MUTATION_CHUNK_BYTES * 2 + 37];
+        let security = vec![0xa5; 96];
+        let generation = client
+            .mutate_system_hive(
+                1,
+                &[
+                    SystemHiveMutation::CreateKey { path: service_path },
+                    SystemHiveMutation::SetValue {
+                        path: service_path,
+                        name: "Type",
+                        value_type: RegistryValueType::Dword as u32,
+                        data: &SERVICE_WIN32_OWN_PROCESS.to_le_bytes(),
+                    },
+                    SystemHiveMutation::SetValue {
+                        path: service_path,
+                        name: "Start",
+                        value_type: RegistryValueType::Dword as u32,
+                        data: &SERVICE_AUTO_START.to_le_bytes(),
+                    },
+                    SystemHiveMutation::SetValue {
+                        path: service_path,
+                        name: "ImagePath",
+                        value_type: RegistryValueType::ExpandSz as u32,
+                        data: &image,
+                    },
+                    SystemHiveMutation::SetValue {
+                        path: service_path,
+                        name: "Payload",
+                        value_type: RegistryValueType::Binary as u32,
+                        data: &payload,
+                    },
+                    SystemHiveMutation::SetKeyClass {
+                        path: service_path,
+                        class_name: Some("ServiceClass"),
+                    },
+                    SystemHiveMutation::SetKeySecurity {
+                        path: service_path,
+                        descriptor: &security,
+                    },
+                    SystemHiveMutation::DeleteValue {
+                        path: existing_path,
+                        name: "DeleteMe",
+                    },
+                    SystemHiveMutation::DeleteKey {
+                        path: obsolete_path,
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(generation, 2);
+
+        let snapshot = client.query_system_hive_key(service_path).unwrap();
+        assert_eq!(snapshot.mount_generation, 2);
+        assert_eq!(snapshot.class_name.as_deref(), Some("ServiceClass"));
+        assert_eq!(
+            snapshot.security_descriptor.as_deref(),
+            Some(security.as_slice())
+        );
+        assert_eq!(
+            snapshot
+                .values
+                .iter()
+                .find(|value| value.name == "Payload")
+                .map(|value| value.data.as_slice()),
+            Some(payload.as_slice())
+        );
+        assert!(client
+            .query_system_hive_key(existing_path)
+            .unwrap()
+            .values
+            .iter()
+            .all(|value| value.name != "DeleteMe"));
+        assert_eq!(
+            client.query_system_hive_key(obsolete_path),
+            Err(STATUS_OBJECT_NAME_NOT_FOUND)
+        );
+        let services = client
+            .query_win32_service_launch_plan(win32_service_plan_kind::AUTO_START)
+            .unwrap();
+        assert_eq!(services.mount_generation, 2);
+        assert_eq!(services.launches.len(), 1);
+        assert_eq!(services.launches[0].service_name, "DynamicService");
+
+        let rejected_path = r"\Registry\Machine\System\CurrentControlSet\Services\MustRemainAbsent";
+        assert_eq!(
+            client.mutate_system_hive(
+                2,
+                &[
+                    SystemHiveMutation::CreateKey {
+                        path: rejected_path,
+                    },
+                    SystemHiveMutation::DeleteKey {
+                        path: existing_path,
+                    },
+                ],
+            ),
+            Err(STATUS_CANNOT_DELETE)
+        );
+        assert_eq!(
+            client.query_system_hive_key(rejected_path),
+            Err(STATUS_OBJECT_NAME_NOT_FOUND)
+        );
+        assert_eq!(
+            client.mutate_system_hive(
+                1,
+                &[SystemHiveMutation::CreateKey {
+                    path: rejected_path,
+                }],
+            ),
+            Err(STATUS_REVISION_MISMATCH)
+        );
+        assert_eq!(
+            client
+                .query_system_hive_key(service_path)
+                .unwrap()
+                .mount_generation,
+            2
+        );
     }
 
     #[test]

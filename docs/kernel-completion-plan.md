@@ -13123,3 +13123,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     its writable hive only after CM commits the authoritative transaction. Keep explicit win32k CM
     transport after that mutation primitive exists, so win32k does not gain another temporary
     registry authority.
+
+    CM-owned SYSTEM mutation transaction primitive (2026-08-27, implementation green): the CM ABI
+    now exposes one writer-lease protocol over the live mounted SYSTEM generation. BEGIN requires
+    an exact nonzero generation and reserves the complete journal, APPEND accepts only the next
+    bounded frame, COMMIT consumes only a complete matching journal, and ABORT releases exactly the
+    matching lease. A successful replacement hive import invalidates an outstanding writer. The
+    journal has typed path-addressed records for key create/delete, typed value set/delete, class
+    metadata, and security descriptors; values and whole transactions stream across arbitrarily
+    many SURT frames instead of inheriting the shared frame's 4 KiB size.
+
+    Commit decodes the complete journal, applies it to a cloned hive, revalidates the selected
+    control set, rebuilds CM's semantic service/PnP indexes, and only then publishes the candidate
+    with one generation increment. A bad record, missing object, non-leaf delete, corrupt control
+    set, or stale generation leaves both the mounted hive and semantic indexes unchanged. The
+    client integration test crosses more than two request frames, verifies key/value/class/security
+    mutation and deletion, observes the newly committed Win32-service metadata through a
+    generation-2 launch plan, proves transaction-wide rollback, and rejects a stale generation-1
+    writer. CM ABI `4/4`, client `15/15`, and server `14/14` tests are green; the freestanding
+    executive check remains green at the 212-warning baseline.
+
+    Review adjustment: the host-tested transaction prerequisite is closed, but executive setup
+    writes still mutate its persistence projection first. Next collect each SYSTEM setup batch into
+    `SystemHiveMutation` records, commit it to isolated CM at the generation published by the prior
+    import, and only then journal the same committed records into the executive's writable hive
+    backing. Update the live generation after each commit and remove direct-first SYSTEM setup
+    mutation paths as their batches migrate. Non-SYSTEM hives stay on their current owned journal
+    path until CM supports those mounts.

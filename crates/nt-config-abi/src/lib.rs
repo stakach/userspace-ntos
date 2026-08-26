@@ -24,6 +24,10 @@ pub const CM_DRIVER_SERVICE_SNAPSHOT_VERSION: u16 = 2;
 pub const CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES: usize = 16;
 /// Maximum payload carried by one SYSTEM-hive import request frame.
 pub const CM_HIVE_IMPORT_CHUNK_BYTES: usize = 4064;
+/// Maximum journal payload carried by one mounted-hive mutation request frame.
+pub const CM_HIVE_MUTATION_CHUNK_BYTES: usize = 4056;
+pub const CM_HIVE_MUTATION_RECORD_HEADER_BYTES: usize = 24;
+pub const CM_MAX_HIVE_VALUE_NAME_UNITS: usize = 512;
 /// Maximum payload carried by one mounted-hive key snapshot completion frame.
 pub const CM_HIVE_KEY_CHUNK_BYTES: usize = 4096;
 pub const CM_HIVE_KEY_SNAPSHOT_MAGIC: u32 = 0x4B48_4D43; // `CMHK`
@@ -81,6 +85,8 @@ pub mod opcode {
     pub const CM_OP_QUERY_PNP: u16 = 0x2154;
     /// Return one immutable, generation-bound installed network-adapter binding plan.
     pub const CM_OP_QUERY_NETWORK_PLAN: u16 = 0x2155;
+    /// Apply one generation-checked atomic mutation journal to the mounted SYSTEM hive.
+    pub const CM_OP_MUTATE_SYSTEM_HIVE: u16 = 0x2156;
 }
 
 /// Operation carried by [`CmDevicePropertyRequest::operation`]. Property values are immutable for
@@ -111,6 +117,29 @@ pub mod hive_key_transfer {
     pub const BEGIN: u16 = 1;
     pub const PULL: u16 = 2;
     pub const ABORT: u16 = 3;
+}
+
+/// Operation carried by [`CmHiveMutationRequest::operation`].
+pub mod hive_mutation_transfer {
+    pub const BEGIN: u16 = 1;
+    pub const APPEND: u16 = 2;
+    pub const COMMIT: u16 = 3;
+    pub const ABORT: u16 = 4;
+}
+
+/// Operation encoded in one [`CmHiveMutationRecord`].
+pub mod hive_mutation_kind {
+    pub const CREATE_KEY: u16 = 1;
+    pub const SET_VALUE: u16 = 2;
+    pub const DELETE_VALUE: u16 = 3;
+    pub const DELETE_KEY: u16 = 4;
+    pub const SET_KEY_CLASS: u16 = 5;
+    pub const SET_KEY_SECURITY: u16 = 6;
+}
+
+pub mod hive_mutation_flags {
+    /// Distinguishes an explicitly present empty class from clearing the class metadata.
+    pub const CLASS_PRESENT: u16 = 1 << 0;
 }
 
 /// Operation carried by [`CmLaunchPlanRequest::operation`].
@@ -296,6 +325,38 @@ pub struct CmHiveKeyRequest {
     pub transfer_token: u64,
 }
 
+/// `mutate_system_hive`: a generation-checked journal upload. BEGIN acquires the sole writer lease
+/// and reserves `journal_len_bytes`; APPEND carries the next ordered chunk; COMMIT validates every
+/// record and atomically publishes one new generation; ABORT releases the lease.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmHiveMutationRequest {
+    pub abi_size: u16,
+    pub abi_version: u16,
+    pub operation: u16,
+    pub mount: u16,
+    pub journal_offset: u32,
+    pub chunk_offset: u32,
+    pub chunk_len_bytes: u32,
+    pub journal_len_bytes: u32,
+    pub expected_generation: u64,
+    pub lease_token: u64,
+}
+
+/// Header for one path-addressed operation in a SYSTEM mutation journal. Payload order is UTF-16LE
+/// path, UTF-16LE value/class name, then raw data. Lengths exclude terminators.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmHiveMutationRecord {
+    pub kind: u16,
+    pub flags: u16,
+    pub value_type: u32,
+    pub path_len_bytes: u32,
+    pub name_len_bytes: u32,
+    pub data_len_bytes: u32,
+    pub _reserved: u32,
+}
+
 /// `query_launch_plan`: a plan kind plus an immutable snapshot-bank cursor.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -359,6 +420,8 @@ wire!(CmDevicePropertyRequest);
 wire!(CmDriverServiceRequest);
 wire!(CmHiveImportRequest);
 wire!(CmHiveKeyRequest);
+wire!(CmHiveMutationRequest);
+wire!(CmHiveMutationRecord);
 wire!(CmLaunchPlanRequest);
 wire!(CmPnpQueryRequest);
 
@@ -511,5 +574,38 @@ mod tests {
         };
         assert_eq!(core::mem::size_of::<CmPnpQueryRequest>(), 48);
         assert_eq!(CmPnpQueryRequest::from_bytes(pnp.as_bytes()), Some(pnp));
+    }
+
+    #[test]
+    fn mounted_hive_mutation_has_stable_wire_layout() {
+        assert_eq!(opcode::CM_OP_MUTATE_SYSTEM_HIVE, 0x2156);
+        assert_eq!(core::mem::size_of::<CmHiveMutationRequest>(), 40);
+        assert_eq!(core::mem::size_of::<CmHiveMutationRecord>(), 24);
+        assert_eq!(CM_HIVE_MUTATION_RECORD_HEADER_BYTES, 24);
+
+        let request = CmHiveMutationRequest {
+            abi_size: 40,
+            abi_version: CM_ABI_VERSION,
+            operation: hive_mutation_transfer::APPEND,
+            mount: hive_mount::SYSTEM,
+            journal_offset: 0x1122_3344,
+            chunk_offset: 40,
+            chunk_len_bytes: 0x5566_7788,
+            journal_len_bytes: 0x99aa_bbcc,
+            expected_generation: 0x0102_0304_0506_0708,
+            lease_token: 0x1112_1314_1516_1718,
+        };
+        assert_eq!(
+            CmHiveMutationRequest::from_bytes(request.as_bytes()),
+            Some(request)
+        );
+        assert_eq!(
+            request.as_bytes(),
+            &[
+                40, 0, 2, 0, 2, 0, 1, 0, 0x44, 0x33, 0x22, 0x11, 40, 0, 0, 0, 0x88, 0x77, 0x66,
+                0x55, 0xcc, 0xbb, 0xaa, 0x99, 8, 7, 6, 5, 4, 3, 2, 1, 0x18, 0x17, 0x16, 0x15, 0x14,
+                0x13, 0x12, 0x11,
+            ]
+        );
     }
 }

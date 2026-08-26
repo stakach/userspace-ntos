@@ -10,24 +10,27 @@
 
 extern crate alloc;
 
+mod mutation;
 mod snapshot;
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use mutation::{decode_mutation_journal, HiveMutation, MutationLeaseBank, MutationLeaseError};
 use snapshot::{SnapshotBank, SnapshotChunk, SnapshotPool};
 
 use nt_config_abi::{
     device_property_transfer, driver_service_class, driver_service_transfer, hive_import_transfer,
-    hive_key_transfer, hive_mount, launch_plan_kind, launch_plan_transfer, network_plan_kind,
-    opcode, pnp_query_kind, pnp_query_transfer, read_utf16, win32_service_plan_kind,
-    win32_service_process_kind, CmDevicePropertyRequest, CmDriverServiceRequest,
-    CmEnumerateKeyRequest, CmHiveImportRequest, CmHiveKeyRequest, CmKeyRequest,
-    CmLaunchPlanRequest, CmPnpQueryRequest, CmRawValueRequest, CmReply, CmValueRequest,
-    CM_ABI_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_DRIVER_SERVICE_CHUNK_BYTES,
-    CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_MAGIC,
-    CM_DRIVER_SERVICE_SNAPSHOT_VERSION, CM_HIVE_IMPORT_CHUNK_BYTES, CM_HIVE_KEY_CHUNK_BYTES,
-    CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES, CM_HIVE_KEY_SNAPSHOT_MAGIC, CM_HIVE_KEY_SNAPSHOT_VERSION,
+    hive_key_transfer, hive_mount, hive_mutation_transfer, launch_plan_kind, launch_plan_transfer,
+    network_plan_kind, opcode, pnp_query_kind, pnp_query_transfer, read_utf16,
+    win32_service_plan_kind, win32_service_process_kind, CmDevicePropertyRequest,
+    CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveImportRequest, CmHiveKeyRequest,
+    CmHiveMutationRequest, CmKeyRequest, CmLaunchPlanRequest, CmPnpQueryRequest, CmRawValueRequest,
+    CmReply, CmValueRequest, CM_ABI_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES,
+    CM_DRIVER_SERVICE_CHUNK_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES,
+    CM_DRIVER_SERVICE_SNAPSHOT_MAGIC, CM_DRIVER_SERVICE_SNAPSHOT_VERSION,
+    CM_HIVE_IMPORT_CHUNK_BYTES, CM_HIVE_KEY_CHUNK_BYTES, CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES,
+    CM_HIVE_KEY_SNAPSHOT_MAGIC, CM_HIVE_KEY_SNAPSHOT_VERSION, CM_HIVE_MUTATION_CHUNK_BYTES,
     CM_LAUNCH_PLAN_CHUNK_BYTES, CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES,
     CM_LAUNCH_PLAN_SNAPSHOT_MAGIC, CM_LAUNCH_PLAN_SNAPSHOT_VERSION, CM_MAX_HIVE_PATH_UNITS,
     CM_MAX_INSTANCE_UNITS, CM_MAX_PNP_AUX_BYTES, CM_MAX_SERVICE_UNITS,
@@ -54,11 +57,14 @@ const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
 const STATUS_NO_MORE_ENTRIES: i32 = 0x8000_001Au32 as i32;
 const STATUS_NO_SUCH_DEVICE: i32 = 0xC000_000Eu32 as i32;
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
+const STATUS_REVISION_MISMATCH: i32 = 0xC000_0059u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES: i32 = 0xC000_009Au32 as i32;
 const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
+const STATUS_CANNOT_DELETE: i32 = 0xC000_0121u32 as i32;
 const STATUS_INVALID_SYSTEM_SERVICE: i32 = 0xC000_001Cu32 as i32;
 const STATUS_NOT_SUPPORTED: i32 = 0xC000_00BBu32 as i32;
 const STATUS_REGISTRY_CORRUPT: i32 = 0xC000_014Cu32 as i32;
+const STATUS_DEVICE_BUSY: i32 = 0x8000_0011u32 as i32;
 
 /// Max UTF-16 units in a decoded key path / value name.
 const MAX_NAME_UNITS: usize = 512;
@@ -203,6 +209,71 @@ fn config_manager_from_system_hive(
         current_control_set.as_str(),
     );
     cm
+}
+
+fn apply_system_hive_mutation(
+    hive: &mut Hive,
+    current_control_set: &CurrentControlSet,
+    mutation: HiveMutation,
+) -> Result<(), i32> {
+    let relative = |path: &str| {
+        system_hive_relative_path(path, current_control_set).ok_or(STATUS_INVALID_PARAMETER)
+    };
+    match mutation {
+        HiveMutation::CreateKey { path } => {
+            hive.create_key(&relative(&path)?);
+            Ok(())
+        }
+        HiveMutation::SetValue {
+            path,
+            name,
+            value_type,
+            data,
+        } => {
+            let value_type =
+                RegistryValueType::from_u32(value_type).ok_or(STATUS_INVALID_PARAMETER)?;
+            let key = hive
+                .open_key(&relative(&path)?)
+                .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+            hive.set_value(key, &name, value_type, data)
+                .then_some(())
+                .ok_or(STATUS_INVALID_PARAMETER)
+        }
+        HiveMutation::DeleteValue { path, name } => {
+            let key = hive
+                .open_key(&relative(&path)?)
+                .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+            hive.delete_value(key, &name)
+                .then_some(())
+                .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)
+        }
+        HiveMutation::DeleteKey { path } => {
+            let key = hive
+                .open_key(&relative(&path)?)
+                .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+            match hive.delete_key(key) {
+                Ok(()) => Ok(()),
+                Err(nt_hive_core::DeleteKeyError::NotFound) => Err(STATUS_OBJECT_NAME_NOT_FOUND),
+                Err(nt_hive_core::DeleteKeyError::CannotDelete) => Err(STATUS_CANNOT_DELETE),
+            }
+        }
+        HiveMutation::SetKeyClass { path, class_name } => {
+            let key = hive
+                .open_key(&relative(&path)?)
+                .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+            hive.set_key_class(key, class_name.as_deref())
+                .then_some(())
+                .ok_or(STATUS_INVALID_PARAMETER)
+        }
+        HiveMutation::SetKeySecurity { path, descriptor } => {
+            let key = hive
+                .open_key(&relative(&path)?)
+                .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+            hive.set_key_security_descriptor(key, &descriptor)
+                .then_some(())
+                .ok_or(STATUS_INVALID_PARAMETER)
+        }
+    }
 }
 
 fn encode_hive_key_snapshot(
@@ -426,6 +497,7 @@ pub struct CmServer {
     system_hive: Option<MountedSystemHive>,
     hive_imports: Vec<HiveImport>,
     next_hive_import_token: u64,
+    system_mutation_leases: MutationLeaseBank,
     hive_key_snapshots: SnapshotPool<HiveKeySnapshotKey>,
     driver_launch_plan_snapshots: SnapshotBank<u16>,
     win32_service_launch_plan_snapshots: SnapshotBank<u16>,
@@ -448,6 +520,7 @@ impl CmServer {
             system_hive: None,
             hive_imports: Vec::new(),
             next_hive_import_token: 1,
+            system_mutation_leases: MutationLeaseBank::new(),
             hive_key_snapshots: SnapshotPool::new(),
             driver_launch_plan_snapshots: SnapshotBank::new(),
             win32_service_launch_plan_snapshots: SnapshotBank::new(),
@@ -465,6 +538,7 @@ impl CmServer {
             system_hive: None,
             hive_imports: Vec::new(),
             next_hive_import_token: 1,
+            system_mutation_leases: MutationLeaseBank::new(),
             hive_key_snapshots: SnapshotPool::new(),
             driver_launch_plan_snapshots: SnapshotBank::new(),
             win32_service_launch_plan_snapshots: SnapshotBank::new(),
@@ -498,6 +572,7 @@ impl CmServer {
             opcode::CM_OP_QUERY_DEVICE_PROPERTY => self.op_query_device_property(in_buf, out_buf),
             opcode::CM_OP_QUERY_DRIVER_SERVICE => self.op_query_driver_service(in_buf, out_buf),
             opcode::CM_OP_IMPORT_HIVE => self.op_import_hive(in_buf),
+            opcode::CM_OP_MUTATE_SYSTEM_HIVE => self.op_mutate_system_hive(in_buf),
             opcode::CM_OP_QUERY_HIVE_KEY => self.op_query_hive_key(in_buf, out_buf),
             opcode::CM_OP_QUERY_LAUNCH_PLAN => self.op_query_launch_plan(in_buf, out_buf),
             opcode::CM_OP_QUERY_WIN32_SERVICE_PLAN => {
@@ -975,6 +1050,7 @@ impl CmServer {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
                 };
                 let cm = config_manager_from_system_hive(&hive, &current_control_set);
+                self.system_mutation_leases.invalidate();
                 self.cm = cm;
                 self.system_hive = Some(MountedSystemHive {
                     hive,
@@ -1004,6 +1080,169 @@ impl CmServer {
                 reply(STATUS_SUCCESS, 0)
             }
             _ => reply(STATUS_INVALID_PARAMETER, 0),
+        }
+    }
+
+    fn op_mutate_system_hive(&mut self, buf: &[u8]) -> CmReply {
+        let Some(req) = CmHiveMutationRequest::from_bytes(buf) else {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        };
+        let header_size = core::mem::size_of::<CmHiveMutationRequest>();
+        let Ok(journal_len) = usize::try_from(req.journal_len_bytes) else {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        };
+        let Ok(chunk_len) = usize::try_from(req.chunk_len_bytes) else {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        };
+        if req.abi_size as usize != header_size
+            || req.abi_version != CM_ABI_VERSION
+            || req.mount != hive_mount::SYSTEM
+            || chunk_len > CM_HIVE_MUTATION_CHUNK_BYTES
+        {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        }
+        let Some(current_generation) = self.system_hive.as_ref().map(|hive| hive.generation) else {
+            return reply(STATUS_DEVICE_NOT_READY, 0);
+        };
+
+        match req.operation {
+            hive_mutation_transfer::BEGIN => {
+                if req.lease_token != 0
+                    || req.expected_generation == 0
+                    || req.expected_generation != current_generation
+                    || req.journal_offset != 0
+                    || req.chunk_offset != 0
+                    || req.chunk_len_bytes != 0
+                    || buf.len() != header_size
+                {
+                    return reply(
+                        if req.expected_generation != 0
+                            && req.expected_generation != current_generation
+                        {
+                            STATUS_REVISION_MISMATCH
+                        } else {
+                            STATUS_INVALID_PARAMETER
+                        },
+                        current_generation,
+                    );
+                }
+                match self
+                    .system_mutation_leases
+                    .begin(current_generation, journal_len)
+                {
+                    Ok(token) => reply_with_info(STATUS_SUCCESS, 0, current_generation, token),
+                    Err(MutationLeaseError::Busy) => reply(STATUS_DEVICE_BUSY, current_generation),
+                    Err(MutationLeaseError::Exhausted) => {
+                        reply(STATUS_INSUFFICIENT_RESOURCES, current_generation)
+                    }
+                    Err(_) => reply(STATUS_INVALID_PARAMETER, current_generation),
+                }
+            }
+            hive_mutation_transfer::APPEND => {
+                if req.lease_token == 0
+                    || req.expected_generation == 0
+                    || req.chunk_offset as usize != header_size
+                    || chunk_len == 0
+                    || header_size.checked_add(chunk_len) != Some(buf.len())
+                {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                if req.expected_generation != current_generation {
+                    self.system_mutation_leases.invalidate();
+                    return reply(STATUS_REVISION_MISMATCH, current_generation);
+                }
+                let chunk = &buf[header_size..];
+                match self.system_mutation_leases.append(
+                    req.lease_token,
+                    req.expected_generation,
+                    journal_len,
+                    req.journal_offset as usize,
+                    chunk,
+                ) {
+                    Ok(()) => reply_with_info(
+                        STATUS_SUCCESS,
+                        chunk_len as u32,
+                        current_generation,
+                        req.lease_token,
+                    ),
+                    Err(_) => reply(STATUS_INVALID_PARAMETER, current_generation),
+                }
+            }
+            hive_mutation_transfer::COMMIT => {
+                if req.lease_token == 0
+                    || req.expected_generation == 0
+                    || req.journal_offset as usize != journal_len
+                    || req.chunk_offset != 0
+                    || req.chunk_len_bytes != 0
+                    || buf.len() != header_size
+                {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                if req.expected_generation != current_generation {
+                    self.system_mutation_leases.invalidate();
+                    return reply(STATUS_REVISION_MISMATCH, current_generation);
+                }
+                let journal = match self.system_mutation_leases.commit(
+                    req.lease_token,
+                    req.expected_generation,
+                    journal_len,
+                ) {
+                    Ok(journal) => journal,
+                    Err(MutationLeaseError::Incomplete) => {
+                        return reply(STATUS_INVALID_PARAMETER, current_generation);
+                    }
+                    Err(_) => return reply(STATUS_INVALID_PARAMETER, current_generation),
+                };
+                let Some(mutations) = decode_mutation_journal(&journal) else {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                };
+                let Some(next_generation) = current_generation.checked_add(1) else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, current_generation);
+                };
+                let (candidate, current_control_set) = {
+                    let mounted = self.system_hive.as_ref().unwrap();
+                    let mut candidate = mounted.hive.clone();
+                    for mutation in mutations {
+                        if let Err(status) = apply_system_hive_mutation(
+                            &mut candidate,
+                            &mounted.current_control_set,
+                            mutation,
+                        ) {
+                            return reply(status, current_generation);
+                        }
+                    }
+                    let Ok(current_control_set) = candidate.current_control_set() else {
+                        return reply(STATUS_REGISTRY_CORRUPT, current_generation);
+                    };
+                    (candidate, current_control_set)
+                };
+                let cm = config_manager_from_system_hive(&candidate, &current_control_set);
+                self.cm = cm;
+                self.system_hive = Some(MountedSystemHive {
+                    hive: candidate,
+                    generation: next_generation,
+                    current_control_set,
+                });
+                reply_with_info(STATUS_SUCCESS, 0, next_generation, req.lease_token)
+            }
+            hive_mutation_transfer::ABORT => {
+                if req.lease_token == 0
+                    || req.expected_generation == 0
+                    || req.journal_offset != 0
+                    || req.chunk_offset != 0
+                    || req.chunk_len_bytes != 0
+                    || buf.len() != header_size
+                    || !self.system_mutation_leases.abort(
+                        req.lease_token,
+                        req.expected_generation,
+                        journal_len,
+                    )
+                {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                reply(STATUS_SUCCESS, current_generation)
+            }
+            _ => reply(STATUS_INVALID_PARAMETER, current_generation),
         }
     }
 
