@@ -1,0 +1,11 @@
+[package]
+name = "nt-pnp-context"
+description = "Generation-owned PnP publication contexts with exact leases and deferred owner retirement. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

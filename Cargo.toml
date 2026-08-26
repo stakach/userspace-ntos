@@ -66,6 +66,7 @@ members = [
     "crates/nt-user-host",
     "crates/nt-power-manager",
     "crates/nt-pnp-manager",
+    "crates/nt-pnp-context",
     "crates/nt-root-bus",
     "crates/nt-um-abi",
     "crates/nt-driver-supervisor",
@@ -166,6 +167,7 @@ nt-syscall = { path = "crates/nt-syscall" }
 nt-user-host = { path = "crates/nt-user-host" }
 nt-power-manager = { path = "crates/nt-power-manager" }
 nt-pnp-manager = { path = "crates/nt-pnp-manager" }
+nt-pnp-context = { path = "crates/nt-pnp-context" }
 nt-root-bus = { path = "crates/nt-root-bus" }
 nt-um-abi = { path = "crates/nt-um-abi" }
 nt-driver-supervisor = { path = "crates/nt-driver-supervisor" }

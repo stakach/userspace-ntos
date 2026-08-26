@@ -11486,6 +11486,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     records when an exact revoke/unbind fails. PnP assignment/start state and the video route must be
     invalidated in the same ordered device teardown before domain retirement.
 
+    Hosted-PnP context lifetime foundation (2026-08-26, accepted): the new host-testable
+    `nt-pnp-context` crate owns the publication state machine independently of the executive and
+    seL4. It assigns nonzero monotonic context generations and globally unique lease tokens,
+    publishes replacements in one mutation, preserves and returns a failed candidate unchanged,
+    keeps replaced descriptions available to their exact outstanding leases, and returns each
+    retired owner exactly once after its final matching lease drains. A copied compact lease
+    identity cannot double-retire an owner or affect a replacement generation; the acquisition
+    object itself is non-clonable and must be consumed to enter persistent device state. Focused
+    validation is green at `7/7` tests, covering immediate and deferred retirement, out-of-order
+    generations, stale/duplicate release, retained retired descriptions, absent active state, and
+    transactional publication failure.
+
+    Review adjustment: this closes only the reusable lifecycle primitive. The executive wiring is
+    still open: replace its three globals with one registry value, split descriptor data from the
+    owner of executive seed aliases and synthetic root frames, reserve distinct VA spans across
+    live generations, transfer one exact lease into every successful resource state, and release
+    it only after device projection/resource revoke succeeds. PCI BAR and DMA source frame runs
+    remain bus-grant authority and must never be retired by the context owner.
+
     Track one separate rust-micro correctness item after this lifetime tranche: device-frame mapping
     cache attributes are still marked TODO in `rust-micro/src/untyped.rs`. Define and prove the x86
     MMIO/device-memory cache policy rather than relying on comments that describe all device frames

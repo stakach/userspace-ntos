@@ -1,0 +1,348 @@
+//! Generation-owned PnP publication contexts.
+//!
+//! A context description is ordinary clonable data. Its owner is deliberately
+//! opaque to this crate and is returned exactly once, after the context has
+//! been replaced and its last exact lease has drained.
+
+#![no_std]
+
+extern crate alloc;
+
+use alloc::vec::Vec;
+use core::num::NonZeroU64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextId(NonZeroU64);
+
+impl ContextId {
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextLeaseIdentity {
+    context: ContextId,
+    token: NonZeroU64,
+}
+
+impl ContextLeaseIdentity {
+    pub const fn context(self) -> ContextId {
+        self.context
+    }
+
+    pub const fn token(self) -> u64 {
+        self.token.get()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ContextLease(ContextLeaseIdentity);
+
+impl ContextLease {
+    pub const fn context(&self) -> ContextId {
+        self.0.context
+    }
+
+    pub const fn identity(&self) -> ContextLeaseIdentity {
+        self.0
+    }
+
+    pub const fn into_identity(self) -> ContextLeaseIdentity {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcquireError {
+    NoActiveContext,
+    IdExhausted,
+    InsufficientResources,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseError {
+    UnknownContext,
+    UnknownLease,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PublishError<T> {
+    IdExhausted(T),
+    InsufficientResources(T),
+}
+
+impl<T> PublishError<T> {
+    pub fn into_inner(self) -> T {
+        match self {
+            Self::IdExhausted(value) | Self::InsufficientResources(value) => value,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct PublishOutcome<O> {
+    pub context: ContextId,
+    pub retired_owner: Option<O>,
+}
+
+struct ContextRecord<D, O> {
+    id: ContextId,
+    description: D,
+    owner: O,
+    leases: Vec<NonZeroU64>,
+}
+
+impl<D, O> ContextRecord<D, O> {
+    fn contains(&self, lease: ContextLeaseIdentity) -> bool {
+        self.id == lease.context && self.leases.contains(&lease.token)
+    }
+}
+
+pub struct ContextRegistry<D, O> {
+    active: Option<ContextRecord<D, O>>,
+    retired: Vec<ContextRecord<D, O>>,
+    next_context_id: u64,
+    next_lease_token: u64,
+}
+
+impl<D, O> Default for ContextRegistry<D, O> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<D, O> ContextRegistry<D, O> {
+    pub const fn new() -> Self {
+        Self {
+            active: None,
+            retired: Vec::new(),
+            next_context_id: 1,
+            next_lease_token: 1,
+        }
+    }
+
+    pub fn active_id(&self) -> Option<ContextId> {
+        self.active.as_ref().map(|record| record.id)
+    }
+
+    pub fn active_description(&self) -> Option<&D> {
+        self.active.as_ref().map(|record| &record.description)
+    }
+
+    pub fn retired_contexts(&self) -> usize {
+        self.retired.len()
+    }
+
+    pub fn publish(
+        &mut self,
+        description: D,
+        owner: O,
+    ) -> Result<PublishOutcome<O>, PublishError<(D, O)>> {
+        let Some(raw_id) = NonZeroU64::new(self.next_context_id) else {
+            return Err(PublishError::IdExhausted((description, owner)));
+        };
+        let Some(next_id) = self.next_context_id.checked_add(1) else {
+            return Err(PublishError::IdExhausted((description, owner)));
+        };
+        let old_has_leases = self
+            .active
+            .as_ref()
+            .is_some_and(|record| !record.leases.is_empty());
+        if old_has_leases && self.retired.try_reserve(1).is_err() {
+            return Err(PublishError::InsufficientResources((description, owner)));
+        }
+
+        let id = ContextId(raw_id);
+        let replacement = ContextRecord {
+            id,
+            description,
+            owner,
+            leases: Vec::new(),
+        };
+        let old = self.active.replace(replacement);
+        self.next_context_id = next_id;
+        let retired_owner = match old {
+            Some(record) if record.leases.is_empty() => Some(record.owner),
+            Some(record) => {
+                self.retired.push(record);
+                None
+            }
+            None => None,
+        };
+        Ok(PublishOutcome {
+            context: id,
+            retired_owner,
+        })
+    }
+
+    pub fn acquire_active(&mut self) -> Result<ContextLease, AcquireError> {
+        let Some(token) = NonZeroU64::new(self.next_lease_token) else {
+            return Err(AcquireError::IdExhausted);
+        };
+        let Some(next_token) = self.next_lease_token.checked_add(1) else {
+            return Err(AcquireError::IdExhausted);
+        };
+        let active = self.active.as_mut().ok_or(AcquireError::NoActiveContext)?;
+        active
+            .leases
+            .try_reserve(1)
+            .map_err(|_| AcquireError::InsufficientResources)?;
+        active.leases.push(token);
+        self.next_lease_token = next_token;
+        Ok(ContextLease(ContextLeaseIdentity {
+            context: active.id,
+            token,
+        }))
+    }
+
+    pub fn description(&self, lease: &ContextLease) -> Result<&D, LeaseError> {
+        self.description_by_identity(lease.identity())
+    }
+
+    pub fn description_by_identity(&self, lease: ContextLeaseIdentity) -> Result<&D, LeaseError> {
+        let record = self
+            .record(lease.context)
+            .ok_or(LeaseError::UnknownContext)?;
+        record
+            .contains(lease)
+            .then_some(&record.description)
+            .ok_or(LeaseError::UnknownLease)
+    }
+
+    pub fn release(&mut self, lease: ContextLeaseIdentity) -> Result<Option<O>, LeaseError> {
+        if let Some(active) = self.active.as_mut() {
+            if active.id == lease.context {
+                remove_lease(active, lease)?;
+                return Ok(None);
+            }
+        }
+        let Some(index) = self
+            .retired
+            .iter()
+            .position(|record| record.id == lease.context)
+        else {
+            return Err(LeaseError::UnknownContext);
+        };
+        remove_lease(&mut self.retired[index], lease)?;
+        if self.retired[index].leases.is_empty() {
+            return Ok(Some(self.retired.remove(index).owner));
+        }
+        Ok(None)
+    }
+
+    fn record(&self, id: ContextId) -> Option<&ContextRecord<D, O>> {
+        self.active
+            .as_ref()
+            .filter(|record| record.id == id)
+            .or_else(|| self.retired.iter().find(|record| record.id == id))
+    }
+}
+
+fn remove_lease<D, O>(
+    record: &mut ContextRecord<D, O>,
+    lease: ContextLeaseIdentity,
+) -> Result<(), LeaseError> {
+    let Some(index) = record.leases.iter().position(|token| *token == lease.token) else {
+        return Err(LeaseError::UnknownLease);
+    };
+    record.leases.remove(index);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replacement_without_leases_returns_old_owner_immediately() {
+        let mut registry = ContextRegistry::new();
+        let first = registry.publish("first", 10).unwrap();
+        assert_eq!(first.retired_owner, None);
+
+        let second = registry.publish("second", 20).unwrap();
+        assert_eq!(second.retired_owner, Some(10));
+        assert_eq!(registry.active_description(), Some(&"second"));
+        assert_eq!(registry.retired_contexts(), 0);
+    }
+
+    #[test]
+    fn replacement_waits_for_last_exact_lease() {
+        let mut registry = ContextRegistry::new();
+        let first = registry.publish("first", 10).unwrap();
+        let lease_a = registry.acquire_active().unwrap().into_identity();
+        let lease_b = registry.acquire_active().unwrap().into_identity();
+
+        let second = registry.publish("second", 20).unwrap();
+        assert_ne!(first.context, second.context);
+        assert_eq!(second.retired_owner, None);
+        assert_eq!(registry.retired_contexts(), 1);
+        assert_eq!(registry.release(lease_a), Ok(None));
+        assert_eq!(registry.release(lease_b), Ok(Some(10)));
+        assert_eq!(registry.retired_contexts(), 0);
+    }
+
+    #[test]
+    fn stale_or_duplicate_release_cannot_touch_replacement() {
+        let mut registry = ContextRegistry::new();
+        registry.publish("first", 10).unwrap();
+        let stale = registry.acquire_active().unwrap().into_identity();
+        registry.publish("second", 20).unwrap();
+        let live = registry.acquire_active().unwrap().into_identity();
+
+        assert_eq!(registry.release(stale), Ok(Some(10)));
+        assert_eq!(registry.release(stale), Err(LeaseError::UnknownContext));
+        assert_eq!(registry.active_description(), Some(&"second"));
+        assert_eq!(registry.description_by_identity(live), Ok(&"second"));
+        assert_eq!(registry.release(live), Ok(None));
+    }
+
+    #[test]
+    fn leased_retired_description_remains_available() {
+        let mut registry = ContextRegistry::new();
+        registry.publish("first", 10).unwrap();
+        let lease = registry.acquire_active().unwrap();
+        registry.publish("second", 20).unwrap();
+
+        assert_eq!(registry.description(&lease), Ok(&"first"));
+        assert_eq!(registry.release(lease.into_identity()), Ok(Some(10)));
+    }
+
+    #[test]
+    fn no_active_context_is_reported() {
+        let mut registry: ContextRegistry<(), ()> = ContextRegistry::new();
+        assert_eq!(
+            registry.acquire_active(),
+            Err(AcquireError::NoActiveContext)
+        );
+    }
+
+    #[test]
+    fn failed_publication_preserves_active_context_and_candidate_owner() {
+        let mut registry = ContextRegistry::new();
+        let first = registry.publish("first", 10).unwrap();
+        registry.next_context_id = u64::MAX;
+
+        let error = registry.publish("candidate", 20).unwrap_err();
+        assert_eq!(error.into_inner(), ("candidate", 20));
+        assert_eq!(registry.active_id(), Some(first.context));
+        assert_eq!(registry.active_description(), Some(&"first"));
+        assert_eq!(registry.retired_contexts(), 0);
+    }
+
+    #[test]
+    fn ownership_is_returned_once_after_out_of_order_retirement() {
+        let mut registry = ContextRegistry::new();
+        registry.publish(1, "owner-1").unwrap();
+        let lease_1 = registry.acquire_active().unwrap().into_identity();
+        registry.publish(2, "owner-2").unwrap();
+        let lease_2 = registry.acquire_active().unwrap().into_identity();
+        registry.publish(3, "owner-3").unwrap();
+
+        assert_eq!(registry.retired_contexts(), 2);
+        assert_eq!(registry.release(lease_2), Ok(Some("owner-2")));
+        assert_eq!(registry.release(lease_1), Ok(Some("owner-1")));
+        assert_eq!(registry.retired_contexts(), 0);
+        assert_eq!(registry.active_description(), Some(&3));
+    }
+}
