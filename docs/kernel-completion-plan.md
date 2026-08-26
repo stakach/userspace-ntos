@@ -2544,16 +2544,26 @@ stops later devnodes; rollback/unload is still admitted only before AddDevice ow
 
 Focused validation is green at `nt-driver-start` `5/5`, `nt-pnp-manager` `14/14`, and
 `nt-io-manager` `195/195`; the freestanding executive check remains at the established 212-warning
-baseline. Serialized desktop validation is still required before accepting this checkpoint.
+baseline.
 
-Review adjustment: demand-start reply ownership is closed once that desktop run is accepted. The
-next mechanism is a resumable boot-driver launch phase using the same batch coordinator without a
-syscall Reply owner; boot launch currently precedes the ordinary receive loop and must stop and
-yield on an unfinished START rather than busy-wait or advance to another devnode. After boot and
-demand callers share the cursor semantics, add a real isolated driver fixture that returns
-`STATUS_PENDING` from START and later calls `IoCompleteRequest`, exercise at least two devnodes, and
-prove one terminal demand reply plus resumed boot progression. Then continue with exact I/O Manager
-delete admission and the query/cancel/stop/remove removal journal.
+Serialized validation (2026-08-26, accepted):
+`.tmp/run-desktop-demand-start-continuation-20260826.log` completes real E1000, DMA-test, and
+bochsmp STARTs through the canonical transaction and reports
+`terminal/failed/pending/pending-observed/indeterminate=3/0/0/0/0`, with both first-error fields at
+`STATUS_SUCCESS`. The bochsmp route publishes from its real terminal START. Genuine userinit and
+Explorer launch, Explorer completes 669 real api0 callback redirects without a callback failure,
+and the shell paints all `480000/480000` framebuffer pixels with at least 32 non-background
+colours. All `294/294` executive gates pass and the sentinel fires. QEMU was stopped only after the
+sentinel. The asynchronous demand-start reply-ownership checkpoint is accepted.
+
+Review adjustment: demand-start reply ownership is closed. The next mechanism is a resumable
+boot-driver launch phase using the same batch coordinator without a syscall Reply owner; boot launch
+currently precedes the ordinary receive loop and must stop and yield on an unfinished START rather
+than busy-wait or advance to another devnode. After boot and demand callers share the cursor
+semantics, add a real isolated driver fixture that returns `STATUS_PENDING` from START and later
+calls `IoCompleteRequest`, exercise at least two devnodes, and prove one terminal demand reply plus
+resumed boot progression. Then continue with exact I/O Manager delete admission and the
+query/cancel/stop/remove removal journal.
 
 ### A. SCM-Controlled Service Startup
 
