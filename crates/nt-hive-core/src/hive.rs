@@ -81,6 +81,30 @@ pub enum HiveOverlayError {
     InvalidControlSetSelection,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HiveValueBlobCompactError {
+    MissingBlob,
+    OutOfMemory,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HiveValueBlobCompaction {
+    pub blobs_before: usize,
+    pub blobs_after: usize,
+    pub bytes_before: usize,
+    pub bytes_after: usize,
+}
+
+impl HiveValueBlobCompaction {
+    pub fn reclaimed_blobs(self) -> usize {
+        self.blobs_before.saturating_sub(self.blobs_after)
+    }
+
+    pub fn reclaimed_bytes(self) -> usize {
+        self.bytes_before.saturating_sub(self.bytes_after)
+    }
+}
+
 /// The control set selected by a SYSTEM hive's `Select\\Current` value.
 ///
 /// Construction is private so callers cannot attach an unchecked alias identity to a hive mount.
@@ -471,6 +495,77 @@ impl Hive {
 
     pub fn reserve_value_blobs(&mut self, additional: usize) -> bool {
         self.value_blobs.try_reserve_exact(additional).is_ok()
+    }
+
+    /// Reclaim immutable value payloads no live value cell references.
+    ///
+    /// Stable [`CellId`]s, generation, mutation sequence, and dirty state are unchanged. The
+    /// complete remap and replacement blob arena are allocated and validated before publication,
+    /// so failure leaves the hive untouched. Borrowing rules prevent calling this while a
+    /// [`HiveTransaction`] is active; transaction rollback relies on append-only blob watermarks.
+    pub fn compact_value_blobs(
+        &mut self,
+    ) -> Result<HiveValueBlobCompaction, HiveValueBlobCompactError> {
+        const UNUSED: usize = usize::MAX;
+        const REFERENCED: usize = usize::MAX - 1;
+
+        let blobs_before = self.value_blobs.len();
+        let bytes_before = self.value_blobs.iter().map(|blob| blob.len()).sum();
+        let mut remap = Vec::new();
+        remap
+            .try_reserve_exact(blobs_before)
+            .map_err(|_| HiveValueBlobCompactError::OutOfMemory)?;
+        remap.resize(blobs_before, UNUSED);
+
+        for cell in self.cells.iter().flatten() {
+            let Cell::Value(value) = cell else {
+                continue;
+            };
+            let mapped = remap
+                .get_mut(value.data_blob)
+                .ok_or(HiveValueBlobCompactError::MissingBlob)?;
+            *mapped = REFERENCED;
+        }
+
+        let mut blobs_after = 0usize;
+        for mapped in &mut remap {
+            if *mapped == REFERENCED {
+                *mapped = blobs_after;
+                blobs_after += 1;
+            }
+        }
+        if blobs_after == blobs_before {
+            return Ok(HiveValueBlobCompaction {
+                blobs_before,
+                blobs_after,
+                bytes_before,
+                bytes_after: bytes_before,
+            });
+        }
+
+        let mut compacted = Vec::new();
+        compacted
+            .try_reserve_exact(blobs_after)
+            .map_err(|_| HiveValueBlobCompactError::OutOfMemory)?;
+        for (old_index, blob) in self.value_blobs.iter().enumerate() {
+            if remap[old_index] != UNUSED {
+                compacted.push(Rc::clone(blob));
+            }
+        }
+        let bytes_after = compacted.iter().map(|blob| blob.len()).sum();
+
+        for cell in self.cells.iter_mut().flatten() {
+            if let Cell::Value(value) = cell {
+                value.data_blob = remap[value.data_blob];
+            }
+        }
+        self.value_blobs = compacted;
+        Ok(HiveValueBlobCompaction {
+            blobs_before,
+            blobs_after,
+            bytes_before,
+            bytes_after,
+        })
     }
 
     fn alloc_id(&mut self) -> CellId {

@@ -770,6 +770,99 @@ fn same_hive_value_copy_shares_payload_until_replacement() {
 }
 
 #[test]
+fn compact_value_blobs_preserves_cells_sharing_and_encoded_image() {
+    let mut hive = Hive::new(HiveKind::System);
+    let key = hive.create_key(r"ControlSet001\Services\Compact");
+    assert!(hive.set_value(
+        key,
+        "Source",
+        RegistryValueType::Binary,
+        b"shared-payload".to_vec()
+    ));
+    let (source_id, _, _, _) = hive.value_ref_by_index(key, 0).unwrap();
+    assert!(hive.set_value_from_existing_value(
+        key,
+        "Shared",
+        RegistryValueType::Binary,
+        source_id
+    ));
+    assert!(hive.set_value(
+        key,
+        "Obsolete",
+        RegistryValueType::Binary,
+        b"obsolete-payload".to_vec()
+    ));
+    assert!(hive.set_value(
+        key,
+        "Obsolete",
+        RegistryValueType::Binary,
+        b"replacement-payload".to_vec()
+    ));
+    assert!(hive.delete_value(key, "Obsolete"));
+
+    let image_before = try_encode_image(&hive).unwrap();
+    let sequence_before = hive.sequence;
+    let generation_before = hive.generation;
+    let dirty_before = hive.dirty_count();
+    let cells_before = hive.cell_count();
+    let result = hive.compact_value_blobs().unwrap();
+    assert_eq!(result.blobs_before, 3);
+    assert_eq!(result.blobs_after, 1);
+    assert_eq!(result.reclaimed_blobs(), 2);
+    assert_eq!(result.reclaimed_bytes(), 35);
+    assert_eq!(hive.sequence, sequence_before);
+    assert_eq!(hive.generation, generation_before);
+    assert_eq!(hive.dirty_count(), dirty_before);
+    assert_eq!(hive.cell_count(), cells_before);
+    assert_eq!(try_encode_image(&hive).unwrap(), image_before);
+
+    let (source_after, _, _, source_data) = hive.value_ref_by_index(key, 0).unwrap();
+    let (_, _, _, shared_data) = hive.value_ref_by_index(key, 1).unwrap();
+    assert_eq!(source_after, source_id);
+    assert_eq!(source_data, b"shared-payload");
+    assert_eq!(shared_data, source_data);
+    assert_eq!(shared_data.as_ptr(), source_data.as_ptr());
+}
+
+#[test]
+fn compact_value_blobs_rejects_missing_payload_without_changes() {
+    let mut hive = Hive::new(HiveKind::System);
+    let key = hive.create_key(r"ControlSet001\Services\Corrupt");
+    assert!(hive.set_dword(key, "Start", 2));
+    let (value, _, _, _) = hive.value_ref_by_index(key, 0).unwrap();
+    let missing_blob = hive.value_blobs.len();
+    let Some(Cell::Value(value)) = hive.cells[value.0 as usize].as_mut() else {
+        panic!("value cell missing");
+    };
+    value.data_blob = missing_blob;
+    let cells_before = hive.cells.clone();
+    let blobs_before = hive.value_blobs.clone();
+
+    assert_eq!(
+        hive.compact_value_blobs(),
+        Err(HiveValueBlobCompactError::MissingBlob)
+    );
+    assert_eq!(hive.value_blobs.len(), blobs_before.len());
+    assert!(hive
+        .value_blobs
+        .iter()
+        .zip(&blobs_before)
+        .all(|(left, right)| Rc::ptr_eq(left, right)));
+    assert_eq!(hive.cells.len(), cells_before.len());
+    for (after, before) in hive.cells.iter().zip(&cells_before) {
+        match (after, before) {
+            (Some(Cell::Value(after)), Some(Cell::Value(before))) => {
+                assert_eq!(after.id, before.id);
+                assert_eq!(after.data_blob, before.data_blob);
+            }
+            (Some(Cell::Key(after)), Some(Cell::Key(before))) => assert_eq!(after.id, before.id),
+            (None, None) => {}
+            _ => panic!("cell kind changed"),
+        }
+    }
+}
+
+#[test]
 fn mutable_hive_set_replaces_mounted_value() {
     let mut system = mountable_system_hive();
     system.create_key(r"ControlSet001\Services");

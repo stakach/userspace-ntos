@@ -59,9 +59,9 @@ pub use config_import::{
 pub use hive::{
     compose_hive_overlay, compose_system_hive_overlay, CellId, CurrentControlSet,
     CurrentControlSetError, DeleteKeyError, Hive, HiveId, HiveKind, HiveMountTable,
-    HiveOverlayError, HiveTransaction, MutableHiveSet, RegistryValueCopyProvenance,
-    RegistryValueCopyProvenanceTable, RegistryValueType, ResolvedHiveKey, ResolvedHiveValue,
-    SYSTEM_HIVE_PATH,
+    HiveOverlayError, HiveTransaction, HiveValueBlobCompactError, HiveValueBlobCompaction,
+    MutableHiveSet, RegistryValueCopyProvenance, RegistryValueCopyProvenanceTable,
+    RegistryValueType, ResolvedHiveKey, ResolvedHiveValue, SYSTEM_HIVE_PATH,
 };
 pub use io::{
     FaultInjectionHiveIoProvider, FlushMode, HiveBootError, HiveFlushError, HiveIoError,
