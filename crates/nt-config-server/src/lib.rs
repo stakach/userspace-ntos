@@ -10,8 +10,12 @@
 
 extern crate alloc;
 
+mod snapshot;
+
 use alloc::string::String;
 use alloc::vec::Vec;
+
+use snapshot::{SnapshotBank, SnapshotChunk, SnapshotPool};
 
 use nt_config_abi::{
     device_property_transfer, driver_service_class, driver_service_transfer, hive_import_transfer,
@@ -70,6 +74,15 @@ fn reply_with_info(status: i32, information: u32, detail0: u64, detail1: u64) ->
         detail0,
         detail1,
     }
+}
+
+fn snapshot_reply(chunk: SnapshotChunk) -> CmReply {
+    reply_with_info(
+        STATUS_SUCCESS,
+        chunk.written as u32,
+        chunk.needed as u64,
+        chunk.token,
+    )
 }
 
 fn decode(buf: &[u8], offset: u32, len_bytes: u32) -> Option<String> {
@@ -374,20 +387,10 @@ fn encode_network_adapter_plan(
     Some(out)
 }
 
-struct DevicePropertySnapshot {
-    token: u64,
+struct DevicePropertySnapshotKey {
     instance: String,
     property: u32,
     output_capacity: u32,
-    value: Vec<u8>,
-    offset: usize,
-}
-
-struct DriverServiceSnapshot {
-    token: u64,
-    service: String,
-    value: Vec<u8>,
-    offset: usize,
 }
 
 struct HiveImport {
@@ -397,43 +400,16 @@ struct HiveImport {
     value: Vec<u8>,
 }
 
-struct HiveKeySnapshot {
-    token: u64,
+struct HiveKeySnapshotKey {
     mount: u16,
     path: String,
-    value: Vec<u8>,
-    offset: usize,
 }
 
-struct DriverLaunchPlanSnapshot {
-    token: u64,
-    plan_kind: u16,
-    value: Vec<u8>,
-    offset: usize,
-}
-
-struct Win32ServiceLaunchPlanSnapshot {
-    token: u64,
-    plan_kind: u16,
-    value: Vec<u8>,
-    offset: usize,
-}
-
-struct NetworkAdapterPlanSnapshot {
-    token: u64,
-    plan_kind: u16,
-    value: Vec<u8>,
-    offset: usize,
-}
-
-struct PnpQuerySnapshot {
-    token: u64,
+struct PnpQuerySnapshotKey {
     query_kind: u16,
     selector: u32,
     instance: String,
     auxiliary: Vec<u8>,
-    value: Vec<u8>,
-    offset: usize,
 }
 
 struct MountedSystemHive {
@@ -445,23 +421,16 @@ struct MountedSystemHive {
 /// The Configuration Manager service: the registry authority + the wire dispatcher.
 pub struct CmServer {
     cm: ConfigManager,
-    device_property_snapshot: Option<DevicePropertySnapshot>,
-    next_device_property_token: u64,
-    driver_service_snapshot: Option<DriverServiceSnapshot>,
-    next_driver_service_token: u64,
+    device_property_snapshots: SnapshotBank<DevicePropertySnapshotKey>,
+    driver_service_snapshots: SnapshotBank<String>,
     system_hive: Option<MountedSystemHive>,
     hive_imports: Vec<HiveImport>,
     next_hive_import_token: u64,
-    hive_key_snapshots: Vec<HiveKeySnapshot>,
-    next_hive_key_token: u64,
-    driver_launch_plan_snapshot: Option<DriverLaunchPlanSnapshot>,
-    next_driver_launch_plan_token: u64,
-    win32_service_launch_plan_snapshot: Option<Win32ServiceLaunchPlanSnapshot>,
-    next_win32_service_launch_plan_token: u64,
-    pnp_query_snapshot: Option<PnpQuerySnapshot>,
-    next_pnp_query_token: u64,
-    network_adapter_plan_snapshot: Option<NetworkAdapterPlanSnapshot>,
-    next_network_adapter_plan_token: u64,
+    hive_key_snapshots: SnapshotPool<HiveKeySnapshotKey>,
+    driver_launch_plan_snapshots: SnapshotBank<u16>,
+    win32_service_launch_plan_snapshots: SnapshotBank<u16>,
+    pnp_query_snapshots: SnapshotBank<PnpQuerySnapshotKey>,
+    network_adapter_plan_snapshots: SnapshotBank<u16>,
 }
 
 impl Default for CmServer {
@@ -474,23 +443,16 @@ impl CmServer {
     pub fn new() -> Self {
         Self {
             cm: ConfigManager::new(),
-            device_property_snapshot: None,
-            next_device_property_token: 1,
-            driver_service_snapshot: None,
-            next_driver_service_token: 1,
+            device_property_snapshots: SnapshotBank::new(),
+            driver_service_snapshots: SnapshotBank::new(),
             system_hive: None,
             hive_imports: Vec::new(),
             next_hive_import_token: 1,
-            hive_key_snapshots: Vec::new(),
-            next_hive_key_token: 1,
-            driver_launch_plan_snapshot: None,
-            next_driver_launch_plan_token: 1,
-            win32_service_launch_plan_snapshot: None,
-            next_win32_service_launch_plan_token: 1,
-            pnp_query_snapshot: None,
-            next_pnp_query_token: 1,
-            network_adapter_plan_snapshot: None,
-            next_network_adapter_plan_token: 1,
+            hive_key_snapshots: SnapshotPool::new(),
+            driver_launch_plan_snapshots: SnapshotBank::new(),
+            win32_service_launch_plan_snapshots: SnapshotBank::new(),
+            pnp_query_snapshots: SnapshotBank::new(),
+            network_adapter_plan_snapshots: SnapshotBank::new(),
         }
     }
 
@@ -498,23 +460,16 @@ impl CmServer {
     pub fn with_config(cm: ConfigManager) -> Self {
         Self {
             cm,
-            device_property_snapshot: None,
-            next_device_property_token: 1,
-            driver_service_snapshot: None,
-            next_driver_service_token: 1,
+            device_property_snapshots: SnapshotBank::new(),
+            driver_service_snapshots: SnapshotBank::new(),
             system_hive: None,
             hive_imports: Vec::new(),
             next_hive_import_token: 1,
-            hive_key_snapshots: Vec::new(),
-            next_hive_key_token: 1,
-            driver_launch_plan_snapshot: None,
-            next_driver_launch_plan_token: 1,
-            win32_service_launch_plan_snapshot: None,
-            next_win32_service_launch_plan_token: 1,
-            pnp_query_snapshot: None,
-            next_pnp_query_token: 1,
-            network_adapter_plan_snapshot: None,
-            next_network_adapter_plan_token: 1,
+            hive_key_snapshots: SnapshotPool::new(),
+            driver_launch_plan_snapshots: SnapshotBank::new(),
+            win32_service_launch_plan_snapshots: SnapshotBank::new(),
+            pnp_query_snapshots: SnapshotBank::new(),
+            network_adapter_plan_snapshots: SnapshotBank::new(),
         }
     }
 
@@ -751,77 +706,57 @@ impl CmServer {
                 let Ok(needed_u32) = u32::try_from(needed) else {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 };
-                self.device_property_snapshot = None;
+                self.device_property_snapshots.clear();
                 if req.output_capacity < needed_u32 {
                     return reply_with_info(STATUS_BUFFER_TOO_SMALL, 0, needed as u64, 0);
                 }
-                let written = core::cmp::min(needed, chunk_capacity);
-                out_buf[..written].copy_from_slice(&value[..written]);
-                if written == needed {
-                    return reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, 0);
-                }
-                let token = self.next_device_property_token;
-                if token == 0 {
-                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
-                }
-                self.next_device_property_token = token.checked_add(1).unwrap_or(0);
-                self.device_property_snapshot = Some(DevicePropertySnapshot {
-                    token,
-                    instance,
-                    property: req.property,
-                    output_capacity: req.output_capacity,
+                let Some(chunk) = self.device_property_snapshots.begin(
+                    DevicePropertySnapshotKey {
+                        instance,
+                        property: req.property,
+                        output_capacity: req.output_capacity,
+                    },
                     value,
-                    offset: written,
-                });
-                reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, token)
+                    chunk_capacity,
+                    out_buf,
+                ) else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                };
+                snapshot_reply(chunk)
             }
             device_property_transfer::PULL => {
                 if req.transfer_token == 0 || req.chunk_capacity == 0 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
-                let Some(snapshot) = self.device_property_snapshot.as_mut() else {
+                let Some(chunk) = self.device_property_snapshots.pull(
+                    req.transfer_token,
+                    req.value_offset as usize,
+                    chunk_capacity,
+                    out_buf,
+                    |key| {
+                        key.instance == instance
+                            && key.property == req.property
+                            && key.output_capacity == req.output_capacity
+                    },
+                ) else {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 };
-                if snapshot.token != req.transfer_token
-                    || snapshot.instance != instance
-                    || snapshot.property != req.property
-                    || snapshot.output_capacity != req.output_capacity
-                    || snapshot.offset != req.value_offset as usize
-                {
-                    return reply(STATUS_INVALID_PARAMETER, 0);
-                }
-                let needed = snapshot.value.len();
-                let written = core::cmp::min(needed - snapshot.offset, chunk_capacity);
-                let end = snapshot.offset + written;
-                out_buf[..written].copy_from_slice(&snapshot.value[snapshot.offset..end]);
-                snapshot.offset = end;
-                if end == needed {
-                    self.device_property_snapshot = None;
-                }
-                reply_with_info(
-                    STATUS_SUCCESS,
-                    written as u32,
-                    needed as u64,
-                    req.transfer_token,
-                )
+                snapshot_reply(chunk)
             }
             device_property_transfer::ABORT => {
                 if req.transfer_token == 0
                     || req.value_offset != 0
                     || req.chunk_capacity != 0
-                    || self
-                        .device_property_snapshot
-                        .as_ref()
-                        .is_none_or(|snapshot| {
-                            snapshot.token != req.transfer_token
-                                || snapshot.instance != instance
-                                || snapshot.property != req.property
-                                || snapshot.output_capacity != req.output_capacity
+                    || !self
+                        .device_property_snapshots
+                        .abort(req.transfer_token, |key| {
+                            key.instance == instance
+                                && key.property == req.property
+                                && key.output_capacity == req.output_capacity
                         })
                 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
-                self.device_property_snapshot = None;
                 reply(STATUS_SUCCESS, 0)
             }
             _ => reply(STATUS_INVALID_PARAMETER, 0),
@@ -879,68 +814,40 @@ impl CmServer {
                 let Ok(needed_u32) = u32::try_from(needed) else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
                 };
-                self.driver_service_snapshot = None;
-                let written = core::cmp::min(needed, chunk_capacity);
-                out_buf[..written].copy_from_slice(&value[..written]);
-                if written == needed {
-                    return reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, 0);
-                }
-                let token = self.next_driver_service_token;
-                if token == 0 {
+                let Some(chunk) =
+                    self.driver_service_snapshots
+                        .begin(service, value, chunk_capacity, out_buf)
+                else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
-                }
-                self.next_driver_service_token = token.checked_add(1).unwrap_or(0);
-                self.driver_service_snapshot = Some(DriverServiceSnapshot {
-                    token,
-                    service,
-                    value,
-                    offset: written,
-                });
-                reply_with_info(STATUS_SUCCESS, written as u32, needed_u32 as u64, token)
+                };
+                debug_assert_eq!(chunk.needed, needed_u32 as usize);
+                snapshot_reply(chunk)
             }
             driver_service_transfer::PULL => {
                 if req.transfer_token == 0 || req.chunk_capacity == 0 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
-                let Some(snapshot) = self.driver_service_snapshot.as_mut() else {
+                let Some(chunk) = self.driver_service_snapshots.pull(
+                    req.transfer_token,
+                    req.value_offset as usize,
+                    chunk_capacity,
+                    out_buf,
+                    |key| key.eq_ignore_ascii_case(&service),
+                ) else {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 };
-                if snapshot.token != req.transfer_token
-                    || !snapshot.service.eq_ignore_ascii_case(&service)
-                    || snapshot.offset != req.value_offset as usize
-                {
-                    return reply(STATUS_INVALID_PARAMETER, 0);
-                }
-                let needed = snapshot.value.len();
-                let written = core::cmp::min(needed - snapshot.offset, chunk_capacity);
-                let end = snapshot.offset + written;
-                out_buf[..written].copy_from_slice(&snapshot.value[snapshot.offset..end]);
-                snapshot.offset = end;
-                if end == needed {
-                    self.driver_service_snapshot = None;
-                }
-                reply_with_info(
-                    STATUS_SUCCESS,
-                    written as u32,
-                    needed as u64,
-                    req.transfer_token,
-                )
+                snapshot_reply(chunk)
             }
             driver_service_transfer::ABORT => {
                 if req.transfer_token == 0
                     || req.value_offset != 0
                     || req.chunk_capacity != 0
-                    || self
-                        .driver_service_snapshot
-                        .as_ref()
-                        .is_none_or(|snapshot| {
-                            snapshot.token != req.transfer_token
-                                || !snapshot.service.eq_ignore_ascii_case(&service)
-                        })
+                    || !self
+                        .driver_service_snapshots
+                        .abort(req.transfer_token, |key| key.eq_ignore_ascii_case(&service))
                 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
-                self.driver_service_snapshot = None;
                 reply(STATUS_SUCCESS, 0)
             }
             _ => reply(STATUS_INVALID_PARAMETER, 0),
@@ -1154,69 +1061,43 @@ impl CmServer {
                 ) else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
                 };
-                let needed = value.len();
-                let written = core::cmp::min(needed, req.chunk_capacity as usize);
-                out_buf[..written].copy_from_slice(&value[..written]);
-                if written == needed {
-                    return reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, 0);
-                }
-                let token = self.next_hive_key_token;
-                let Some(next_token) = token.checked_add(1) else {
+                let Some(chunk) = self.hive_key_snapshots.begin(
+                    HiveKeySnapshotKey {
+                        mount: req.mount,
+                        path,
+                    },
+                    value,
+                    req.chunk_capacity as usize,
+                    out_buf,
+                ) else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
                 };
-                if token == 0 || self.hive_key_snapshots.try_reserve(1).is_err() {
-                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
-                }
-                self.next_hive_key_token = next_token;
-                self.hive_key_snapshots.push(HiveKeySnapshot {
-                    token,
-                    mount: req.mount,
-                    path,
-                    value,
-                    offset: written,
-                });
-                reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, token)
+                snapshot_reply(chunk)
             }
             hive_key_transfer::PULL => {
                 if req.transfer_token == 0 || req.chunk_capacity == 0 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
-                let Some(index) = self.hive_key_snapshots.iter().position(|snapshot| {
-                    snapshot.token == req.transfer_token
-                        && snapshot.mount == req.mount
-                        && snapshot.path.eq_ignore_ascii_case(&path)
-                        && snapshot.offset == req.value_offset as usize
-                }) else {
+                let Some(chunk) = self.hive_key_snapshots.pull(
+                    req.transfer_token,
+                    req.value_offset as usize,
+                    req.chunk_capacity as usize,
+                    out_buf,
+                    |key| key.mount == req.mount && key.path.eq_ignore_ascii_case(&path),
+                ) else {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 };
-                let snapshot = &mut self.hive_key_snapshots[index];
-                let needed = snapshot.value.len();
-                let written = core::cmp::min(needed - snapshot.offset, req.chunk_capacity as usize);
-                let end = snapshot.offset + written;
-                out_buf[..written].copy_from_slice(&snapshot.value[snapshot.offset..end]);
-                snapshot.offset = end;
-                if end == needed {
-                    self.hive_key_snapshots.swap_remove(index);
-                }
-                reply_with_info(
-                    STATUS_SUCCESS,
-                    written as u32,
-                    needed as u64,
-                    req.transfer_token,
-                )
+                snapshot_reply(chunk)
             }
             hive_key_transfer::ABORT => {
                 if req.transfer_token == 0 || req.value_offset != 0 || req.chunk_capacity != 0 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
-                let Some(index) = self.hive_key_snapshots.iter().position(|snapshot| {
-                    snapshot.token == req.transfer_token
-                        && snapshot.mount == req.mount
-                        && snapshot.path.eq_ignore_ascii_case(&path)
-                }) else {
+                if !self.hive_key_snapshots.abort(req.transfer_token, |key| {
+                    key.mount == req.mount && key.path.eq_ignore_ascii_case(&path)
+                }) {
                     return reply(STATUS_INVALID_PARAMETER, 0);
-                };
-                self.hive_key_snapshots.swap_remove(index);
+                }
                 reply(STATUS_SUCCESS, 0)
             }
             _ => reply(STATUS_INVALID_PARAMETER, 0),
@@ -1263,72 +1144,41 @@ impl CmServer {
                 else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
                 };
-                let needed = value.len();
-                let written = core::cmp::min(needed, req.chunk_capacity as usize);
-                out_buf[..written].copy_from_slice(&value[..written]);
-                self.driver_launch_plan_snapshot = None;
-                if written == needed {
-                    return reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, 0);
-                }
-                let token = self.next_driver_launch_plan_token;
-                let Some(next_token) = token.checked_add(1) else {
+                let Some(chunk) = self.driver_launch_plan_snapshots.begin(
+                    req.plan_kind,
+                    value,
+                    req.chunk_capacity as usize,
+                    out_buf,
+                ) else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
                 };
-                if token == 0 {
-                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
-                }
-                self.next_driver_launch_plan_token = next_token;
-                self.driver_launch_plan_snapshot = Some(DriverLaunchPlanSnapshot {
-                    token,
-                    plan_kind: req.plan_kind,
-                    value,
-                    offset: written,
-                });
-                reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, token)
+                snapshot_reply(chunk)
             }
             launch_plan_transfer::PULL => {
                 if req.transfer_token == 0 || req.chunk_capacity == 0 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
-                let Some(snapshot) = self.driver_launch_plan_snapshot.as_mut() else {
+                let Some(chunk) = self.driver_launch_plan_snapshots.pull(
+                    req.transfer_token,
+                    req.value_offset as usize,
+                    req.chunk_capacity as usize,
+                    out_buf,
+                    |plan_kind| *plan_kind == req.plan_kind,
+                ) else {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 };
-                if snapshot.token != req.transfer_token
-                    || snapshot.plan_kind != req.plan_kind
-                    || snapshot.offset != req.value_offset as usize
-                {
-                    return reply(STATUS_INVALID_PARAMETER, 0);
-                }
-                let needed = snapshot.value.len();
-                let written = core::cmp::min(needed - snapshot.offset, req.chunk_capacity as usize);
-                let end = snapshot.offset + written;
-                out_buf[..written].copy_from_slice(&snapshot.value[snapshot.offset..end]);
-                snapshot.offset = end;
-                if end == needed {
-                    self.driver_launch_plan_snapshot = None;
-                }
-                reply_with_info(
-                    STATUS_SUCCESS,
-                    written as u32,
-                    needed as u64,
-                    req.transfer_token,
-                )
+                snapshot_reply(chunk)
             }
             launch_plan_transfer::ABORT => {
                 if req.transfer_token == 0
                     || req.value_offset != 0
                     || req.chunk_capacity != 0
-                    || self
-                        .driver_launch_plan_snapshot
-                        .as_ref()
-                        .is_none_or(|snapshot| {
-                            snapshot.token != req.transfer_token
-                                || snapshot.plan_kind != req.plan_kind
-                        })
+                    || !self
+                        .driver_launch_plan_snapshots
+                        .abort(req.transfer_token, |plan_kind| *plan_kind == req.plan_kind)
                 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
-                self.driver_launch_plan_snapshot = None;
                 reply(STATUS_SUCCESS, 0)
             }
             _ => reply(STATUS_INVALID_PARAMETER, 0),
@@ -1376,72 +1226,41 @@ impl CmServer {
                 else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
                 };
-                let needed = value.len();
-                let written = core::cmp::min(needed, req.chunk_capacity as usize);
-                out_buf[..written].copy_from_slice(&value[..written]);
-                self.win32_service_launch_plan_snapshot = None;
-                if written == needed {
-                    return reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, 0);
-                }
-                let token = self.next_win32_service_launch_plan_token;
-                let Some(next_token) = token.checked_add(1) else {
+                let Some(chunk) = self.win32_service_launch_plan_snapshots.begin(
+                    req.plan_kind,
+                    value,
+                    req.chunk_capacity as usize,
+                    out_buf,
+                ) else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
                 };
-                if token == 0 {
-                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
-                }
-                self.next_win32_service_launch_plan_token = next_token;
-                self.win32_service_launch_plan_snapshot = Some(Win32ServiceLaunchPlanSnapshot {
-                    token,
-                    plan_kind: req.plan_kind,
-                    value,
-                    offset: written,
-                });
-                reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, token)
+                snapshot_reply(chunk)
             }
             launch_plan_transfer::PULL => {
                 if req.transfer_token == 0 || req.chunk_capacity == 0 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
-                let Some(snapshot) = self.win32_service_launch_plan_snapshot.as_mut() else {
+                let Some(chunk) = self.win32_service_launch_plan_snapshots.pull(
+                    req.transfer_token,
+                    req.value_offset as usize,
+                    req.chunk_capacity as usize,
+                    out_buf,
+                    |plan_kind| *plan_kind == req.plan_kind,
+                ) else {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 };
-                if snapshot.token != req.transfer_token
-                    || snapshot.plan_kind != req.plan_kind
-                    || snapshot.offset != req.value_offset as usize
-                {
-                    return reply(STATUS_INVALID_PARAMETER, 0);
-                }
-                let needed = snapshot.value.len();
-                let written = core::cmp::min(needed - snapshot.offset, req.chunk_capacity as usize);
-                let end = snapshot.offset + written;
-                out_buf[..written].copy_from_slice(&snapshot.value[snapshot.offset..end]);
-                snapshot.offset = end;
-                if end == needed {
-                    self.win32_service_launch_plan_snapshot = None;
-                }
-                reply_with_info(
-                    STATUS_SUCCESS,
-                    written as u32,
-                    needed as u64,
-                    req.transfer_token,
-                )
+                snapshot_reply(chunk)
             }
             launch_plan_transfer::ABORT => {
                 if req.transfer_token == 0
                     || req.value_offset != 0
                     || req.chunk_capacity != 0
-                    || self
-                        .win32_service_launch_plan_snapshot
-                        .as_ref()
-                        .is_none_or(|snapshot| {
-                            snapshot.token != req.transfer_token
-                                || snapshot.plan_kind != req.plan_kind
-                        })
+                    || !self
+                        .win32_service_launch_plan_snapshots
+                        .abort(req.transfer_token, |plan_kind| *plan_kind == req.plan_kind)
                 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
-                self.win32_service_launch_plan_snapshot = None;
                 reply(STATUS_SUCCESS, 0)
             }
             _ => reply(STATUS_INVALID_PARAMETER, 0),
@@ -1481,72 +1300,41 @@ impl CmServer {
                 ) else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
                 };
-                let needed = value.len();
-                let written = core::cmp::min(needed, req.chunk_capacity as usize);
-                out_buf[..written].copy_from_slice(&value[..written]);
-                self.network_adapter_plan_snapshot = None;
-                if written == needed {
-                    return reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, 0);
-                }
-                let token = self.next_network_adapter_plan_token;
-                let Some(next_token) = token.checked_add(1) else {
+                let Some(chunk) = self.network_adapter_plan_snapshots.begin(
+                    req.plan_kind,
+                    value,
+                    req.chunk_capacity as usize,
+                    out_buf,
+                ) else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
                 };
-                if token == 0 {
-                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
-                }
-                self.next_network_adapter_plan_token = next_token;
-                self.network_adapter_plan_snapshot = Some(NetworkAdapterPlanSnapshot {
-                    token,
-                    plan_kind: req.plan_kind,
-                    value,
-                    offset: written,
-                });
-                reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, token)
+                snapshot_reply(chunk)
             }
             launch_plan_transfer::PULL => {
                 if req.transfer_token == 0 || req.chunk_capacity == 0 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
-                let Some(snapshot) = self.network_adapter_plan_snapshot.as_mut() else {
+                let Some(chunk) = self.network_adapter_plan_snapshots.pull(
+                    req.transfer_token,
+                    req.value_offset as usize,
+                    req.chunk_capacity as usize,
+                    out_buf,
+                    |plan_kind| *plan_kind == req.plan_kind,
+                ) else {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 };
-                if snapshot.token != req.transfer_token
-                    || snapshot.plan_kind != req.plan_kind
-                    || snapshot.offset != req.value_offset as usize
-                {
-                    return reply(STATUS_INVALID_PARAMETER, 0);
-                }
-                let needed = snapshot.value.len();
-                let written = core::cmp::min(needed - snapshot.offset, req.chunk_capacity as usize);
-                let end = snapshot.offset + written;
-                out_buf[..written].copy_from_slice(&snapshot.value[snapshot.offset..end]);
-                snapshot.offset = end;
-                if end == needed {
-                    self.network_adapter_plan_snapshot = None;
-                }
-                reply_with_info(
-                    STATUS_SUCCESS,
-                    written as u32,
-                    needed as u64,
-                    req.transfer_token,
-                )
+                snapshot_reply(chunk)
             }
             launch_plan_transfer::ABORT => {
                 if req.transfer_token == 0
                     || req.value_offset != 0
                     || req.chunk_capacity != 0
-                    || self
-                        .network_adapter_plan_snapshot
-                        .as_ref()
-                        .is_none_or(|snapshot| {
-                            snapshot.token != req.transfer_token
-                                || snapshot.plan_kind != req.plan_kind
-                        })
+                    || !self
+                        .network_adapter_plan_snapshots
+                        .abort(req.transfer_token, |plan_kind| *plan_kind == req.plan_kind)
                 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
-                self.network_adapter_plan_snapshot = None;
                 reply(STATUS_SUCCESS, 0)
             }
             _ => reply(STATUS_INVALID_PARAMETER, 0),
@@ -1696,78 +1484,54 @@ impl CmServer {
                 else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
                 };
-                let needed = value.len();
-                let written = core::cmp::min(needed, req.chunk_capacity as usize);
-                out_buf[..written].copy_from_slice(&value[..written]);
-                self.pnp_query_snapshot = None;
-                if written == needed {
-                    return reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, 0);
-                }
-                let token = self.next_pnp_query_token;
-                let Some(next_token) = token.checked_add(1) else {
+                let Some(chunk) = self.pnp_query_snapshots.begin(
+                    PnpQuerySnapshotKey {
+                        query_kind: req.query_kind,
+                        selector: req.selector,
+                        instance,
+                        auxiliary: auxiliary.to_vec(),
+                    },
+                    value,
+                    req.chunk_capacity as usize,
+                    out_buf,
+                ) else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
                 };
-                if token == 0 {
-                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
-                }
-                self.next_pnp_query_token = next_token;
-                self.pnp_query_snapshot = Some(PnpQuerySnapshot {
-                    token,
-                    query_kind: req.query_kind,
-                    selector: req.selector,
-                    instance,
-                    auxiliary: auxiliary.to_vec(),
-                    value,
-                    offset: written,
-                });
-                reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, token)
+                snapshot_reply(chunk)
             }
             pnp_query_transfer::PULL => {
                 if req.transfer_token == 0 || req.chunk_capacity == 0 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
-                let Some(snapshot) = self.pnp_query_snapshot.as_mut() else {
+                let Some(chunk) = self.pnp_query_snapshots.pull(
+                    req.transfer_token,
+                    req.value_offset as usize,
+                    req.chunk_capacity as usize,
+                    out_buf,
+                    |key| {
+                        key.query_kind == req.query_kind
+                            && key.selector == req.selector
+                            && key.instance == instance
+                            && key.auxiliary == auxiliary
+                    },
+                ) else {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 };
-                if snapshot.token != req.transfer_token
-                    || snapshot.query_kind != req.query_kind
-                    || snapshot.selector != req.selector
-                    || snapshot.instance != instance
-                    || snapshot.auxiliary != auxiliary
-                    || snapshot.offset != req.value_offset as usize
-                {
-                    return reply(STATUS_INVALID_PARAMETER, 0);
-                }
-                let needed = snapshot.value.len();
-                let written = core::cmp::min(needed - snapshot.offset, req.chunk_capacity as usize);
-                let end = snapshot.offset + written;
-                out_buf[..written].copy_from_slice(&snapshot.value[snapshot.offset..end]);
-                snapshot.offset = end;
-                if end == needed {
-                    self.pnp_query_snapshot = None;
-                }
-                reply_with_info(
-                    STATUS_SUCCESS,
-                    written as u32,
-                    needed as u64,
-                    req.transfer_token,
-                )
+                snapshot_reply(chunk)
             }
             pnp_query_transfer::ABORT => {
                 if req.transfer_token == 0
                     || req.value_offset != 0
                     || req.chunk_capacity != 0
-                    || self.pnp_query_snapshot.as_ref().is_none_or(|snapshot| {
-                        snapshot.token != req.transfer_token
-                            || snapshot.query_kind != req.query_kind
-                            || snapshot.selector != req.selector
-                            || snapshot.instance != instance
-                            || snapshot.auxiliary != auxiliary
+                    || !self.pnp_query_snapshots.abort(req.transfer_token, |key| {
+                        key.query_kind == req.query_kind
+                            && key.selector == req.selector
+                            && key.instance == instance
+                            && key.auxiliary == auxiliary
                     })
                 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
-                self.pnp_query_snapshot = None;
                 reply(STATUS_SUCCESS, 0)
             }
             _ => reply(STATUS_INVALID_PARAMETER, 0),

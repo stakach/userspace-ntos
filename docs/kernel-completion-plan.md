@@ -13097,3 +13097,29 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     immutable snapshot-bank server mechanics, including the equivalent complete File reply arrays
     where doing so does not erase synchronous retry request state. Then begin CM-owned SYSTEM
     mutation leases/journalling and route win32k registry calls through an explicit CM transport.
+
+    Isolated CM snapshot-bank consolidation (2026-08-27, implementation green): the seven
+    read-only chunked query protocols no longer each carry a private token/value/offset state
+    machine in the monolithic dispatcher. A private host-tested snapshot module now owns token
+    allocation, immutable byte ownership, strictly ordered chunk advancement, completion removal,
+    exact abort, and single-flight versus concurrent-reader storage. Device-property, driver-service,
+    driver-launch, Win32-service-launch, network-adapter, and PnP queries use single-flight banks;
+    hive-key queries retain their intentional concurrent-reader pool. Mutable hive imports remain a
+    separate upload transaction and were not forced through the immutable abstraction.
+
+    Request-shape validation, mounted-hive generation selection, semantic object lookup, and each
+    protocol's identity comparison remain visible in its service handler. In particular,
+    device-property output capacity remains token-bound, service and hive paths remain
+    case-insensitive, PnP selectors and auxiliary payloads remain exact, beginning a new
+    single-flight query invalidates its predecessor, and replacing the mounted SYSTEM hive cannot
+    change an in-flight hive-key snapshot. The extraction removes the duplicated snapshot structs
+    and per-protocol token counters from `CmServer` and reduces the dispatcher by more than 400
+    lines. CM ABI `3/3`, client `14/14`, manager `29/29`, and server `12/12` tests are green; the
+    freestanding executive check remains green at the established 212-warning baseline.
+
+    Review adjustment: immutable CM transfers are consolidated and closed. Next define CM-owned
+    SYSTEM mutation transactions with generation-checked leases and an append/commit/abort journal,
+    first in host-testable ABI/server/client code. The executive may project setup mutations into
+    its writable hive only after CM commits the authoritative transaction. Keep explicit win32k CM
+    transport after that mutation primitive exists, so win32k does not gain another temporary
+    registry authority.
