@@ -11690,6 +11690,38 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     final hosted-domain retirement. Keep the rust-micro device-memory cache-policy and SMP
     fault-owner correctness items visible alongside that work.
 
+    Provider proof blocker correction (2026-08-26): the first retry after introducing the
+    instance-owned dependency did not expose a provider-transport failure. Symbolization and
+    disassembly show that `ensure_hosted_provider_domain_dependency` called itself before examining
+    the dependency registry. The recursive frame eventually wrote 32 bytes below the executive's
+    mapped root stack, into the deliberate guard page, at `0x1000052ee12`. The recursion is removed;
+    the executive again passes its freestanding release check at the established 212-warning
+    baseline. A serialized desktop retry is still required before accepting the provider checkpoint.
+
+    The same investigation corrected the earlier SMP evidence: both recorded `tcb=1` RIPs are in
+    executable root-task text, including the older `nt_fs::directory::query_directory_by_index`
+    fault. Those runs therefore do not by themselves prove that a component frame was assigned to
+    the root TCB. Rust-micro nevertheless had a real defensive gap: user exceptions trusted
+    `active_user.or(current)` and could fall through to an unrelated scheduler-policy current.
+    User exception and syscall entry now validate the active/current candidate against the CPU's
+    live CR3, FS base, user GS base, and affinity, accept a slab recovery only when it is unique,
+    and reject ambiguous/no-match ownership without touching the unrelated current TCB. Focused
+    specs cover a stale current, one exact live match, ambiguous same-identity TCBs, and active-owner
+    disambiguation. Both scheduling-context unbind forms and domain reassignment now stall a remote
+    running target before mutation, and `remote_tcb_stall` treats a missing acknowledgement as fatal
+    instead of silently authorizing teardown. The serialized `spec,smp` image reports all internal
+    specs passed.
+
+    Review adjustment: this is defensive hardening, not the final SMP ownership model. CR3/FS/GS
+    cannot distinguish every same-address-space sibling and carries no slab-slot generation, while
+    PIT, LAPIC, generic IRQ, and IPI capture still consult scheduler ownership. Keep one explicit
+    rust-micro item open: publish an architecture-owned per-CPU `{TcbId, lifecycle_generation}`
+    token on every user return, capture it at every CPL3 syscall/exception/IRQ entry before policy
+    lookup, reject stale generations without fallback, and stress SC unbind, delete/reuse,
+    migration/domain changes, same-vspace siblings, and IRQ preemption on multiple CPUs. This sits
+    beside the still-open device-frame cache-policy work and does not block the corrected provider
+    desktop proof.
+
     After that boundary is live, migrate the standalone hal, power, PnP, async, MMIO, and DMA
     component harnesses to `CompletionOwnerClaim` plus `CompletionUnwindCursor`, including their
     direct attach/lower-call shims. Reconcile the separate `driver-host-direg` and `nt-driver-host`

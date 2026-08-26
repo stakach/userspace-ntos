@@ -16096,16 +16096,6 @@ unsafe fn ensure_hosted_provider_domain_dependency(
     if singleton.instance != provider_instance || singleton.owner_domain != provider_domain {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    let dependency = ensure_hosted_provider_domain_dependency(
-        provider_instance,
-        provider_publication_cookie,
-        dependent_instance,
-    )?;
-    if dependency.dependent_domain != dependent_domain
-        || dependency.provider_domain != provider_domain
-    {
-        return Err(STATUS_INVALID_PARAMETER);
-    }
     if let Some(dependencies) = hosted_provider_domain_dependencies() {
         if let Some(existing) = dependencies.iter().copied().find(|dependency| {
             dependency.present && dependency.dependent_domain == dependent_domain
