@@ -11935,3 +11935,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Import thunk bindings need their own idempotent parent identity so replaying one IAT resolution
     does not acquire an unbounded number of leases. Do not begin final retirement until the relevant
     real NDIS compensation plus exact dependency dispatch quiescence proves the raw pointer dead.
+
+    Executive callback-parent construction checkpoint (2026-08-26, implementation green): thunk
+    emission now returns the generation-bearing binding together with the executable address.
+    Miniport timer initialization reserves a non-dispatchable timer row before allocating provider
+    storage, attaches the callback binding before provider dispatch, publishes only after a completed
+    successful call, rolls back exact unpublished ownership on preparation/returned failure, and
+    retains `CompensationRequired` state after an indeterminate pump. Work-item scheduling uses the
+    same construction states; an established work item reuses its owned binding for the same routine
+    and rejects routine replacement because NDIS exposes no cancellation primitive for queued work.
+
+    Miniport-block mirror creation now reserves registry capacity before its first bridge allocation,
+    publishes a construction row before emitting thunks, and transfers all 11 internal/import thunk
+    leases into that row one by one. Partial construction exact-releases acquired leases and bridge
+    storage; failed release retains the row for compensation instead of losing ownership. Normal
+    timer, work-item, and mirror lookup rejects every non-published state. Instance teardown no longer
+    frees these parent records while any thunk binding remains. Route/dependency teardown also no
+    longer tombstones callback rows wholesale: it returns `DEVICE_BUSY` until exact parent retirement
+    removes the bindings. Callback dispatch now revalidates that the exact slot token/key is still
+    live, so the `Live -> Retiring` transition removes dispatch authority before address reuse.
+
+    The freestanding executive check remains green at the established 212-warning baseline and
+    `git diff --check` is clean. Review adjustment: successful timer and work-item bindings remain
+    intentionally unreclaimable until real `KeCancelTimer`/callback-completion evidence is wired;
+    mirror bindings remain until the adapter's real Stop/Remove/Halt path quiesces them. Miniport and
+    protocol characteristics still use one conservative callback-record lease per exact key, with
+    idempotent replay dropping its temporary lookup acquisition; convert those registrations to
+    durable parent batches before enabling any successful-parent thunk retirement.

@@ -45,8 +45,8 @@ use nt_hosted_runtime::{
     HostedProviderExportResultSemantics, HostedProviderExportSideEffect,
     HostedProviderImportBinding, HostedProviderImportBindingError, HostedProviderImportThunkError,
     HostedProviderImportThunkPlan, HostedProviderObjectOwner, HostedProviderReleaseProgress,
-    HostedThunkReservation, HostedThunkSlotKey, HostedThunkSlotRegistry, HostedThunkSlotToken,
-    NdisMiniportCharacteristicsLayoutError,
+    HostedThunkLeaseRelease, HostedThunkReservation, HostedThunkSlotKey, HostedThunkSlotRegistry,
+    HostedThunkSlotToken, NdisMiniportCharacteristicsLayoutError,
     NdisProtocolCharacteristicsLayoutError,
     DC21X4_ADAPTER_CURRENT_INTERRUPT_MASK_OFFSET_X64, DC21X4_ADAPTER_CURRENT_RBD_OFFSET_X64,
     DC21X4_ADAPTER_FLAGS_OFFSET_X64, DC21X4_ADAPTER_HEAD_RBD_OFFSET_X64,
@@ -14660,6 +14660,9 @@ struct ProviderMarshalState {
     miniport_interrupt_provider_component_va: u64,
     miniport_interrupt_free_on_success: bool,
     miniport_interrupt_construction_index: usize,
+    miniport_timer_construction_index: usize,
+    miniport_timer_shadow_index: usize,
+    ndis_work_item_construction_index: usize,
     ndis_route_index: usize,
     ndis_initialize_wrapper_handle_exec_va: u64,
     ndis_status_provider_exec_va: u64,
@@ -14736,6 +14739,9 @@ impl ProviderMarshalState {
             miniport_interrupt_provider_component_va: 0,
             miniport_interrupt_free_on_success: false,
             miniport_interrupt_construction_index: usize::MAX,
+            miniport_timer_construction_index: usize::MAX,
+            miniport_timer_shadow_index: usize::MAX,
+            ndis_work_item_construction_index: usize::MAX,
             ndis_route_index: usize::MAX,
             ndis_initialize_wrapper_handle_exec_va: 0,
             ndis_status_provider_exec_va: 0,
@@ -14883,11 +14889,15 @@ impl HostedProviderMiniportInterruptShadow {
 #[derive(Clone, Copy)]
 struct HostedProviderMiniportTimerShadow {
     present: bool,
+    construction_state: HostedProviderConstructionState,
     owner: HostedProviderObjectOwner,
     provider_instance: usize,
     dependent_instance: usize,
     dependent_component_va: u64,
     provider_component_va: u64,
+    callback_target: u64,
+    callback_thunk: u64,
+    callback_binding: Option<HostedExecutableThunkBinding>,
     bytes: u64,
 }
 
@@ -14895,19 +14905,38 @@ impl HostedProviderMiniportTimerShadow {
     const fn empty() -> Self {
         Self {
             present: false,
+            construction_state: HostedProviderConstructionState::Published,
             owner: EMPTY_HOSTED_PROVIDER_OBJECT_OWNER,
             provider_instance: 0,
             dependent_instance: 0,
             dependent_component_va: 0,
             provider_component_va: 0,
+            callback_target: 0,
+            callback_thunk: 0,
+            callback_binding: None,
             bytes: 0,
         }
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct HostedExecutableThunkBinding {
+    instance_index: usize,
+    token: HostedThunkSlotToken,
+    key: HostedThunkSlotKey,
+}
+
+#[derive(Clone, Copy)]
+struct HostedExecutableThunkAddress {
+    run_va: u64,
+    binding: HostedExecutableThunkBinding,
+    existing: bool,
+}
+
 #[derive(Clone, Copy)]
 struct HostedProviderNdisWorkItemShadow {
     present: bool,
+    construction_state: HostedProviderConstructionState,
     owner: HostedProviderObjectOwner,
     provider_instance: usize,
     dependent_instance: usize,
@@ -14916,6 +14945,7 @@ struct HostedProviderNdisWorkItemShadow {
     dependent_context: u64,
     dependent_routine: u64,
     provider_routine_thunk: u64,
+    provider_routine_binding: Option<HostedExecutableThunkBinding>,
     bytes: u64,
 }
 
@@ -14923,6 +14953,7 @@ impl HostedProviderNdisWorkItemShadow {
     const fn empty() -> Self {
         Self {
             present: false,
+            construction_state: HostedProviderConstructionState::Published,
             owner: EMPTY_HOSTED_PROVIDER_OBJECT_OWNER,
             provider_instance: 0,
             dependent_instance: 0,
@@ -14931,14 +14962,18 @@ impl HostedProviderNdisWorkItemShadow {
             dependent_context: 0,
             dependent_routine: 0,
             provider_routine_thunk: 0,
+            provider_routine_binding: None,
             bytes: 0,
         }
     }
 }
 
+const HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_THUNK_COUNT: usize = 11;
+
 #[derive(Clone, Copy)]
 struct HostedProviderNdisMiniportBlockMirror {
     present: bool,
+    construction_state: HostedProviderConstructionState,
     owner: HostedProviderObjectOwner,
     provider_instance: usize,
     dependent_instance: usize,
@@ -14955,12 +14990,16 @@ struct HostedProviderNdisMiniportBlockMirror {
     td_complete_thunk: u64,
     query_complete_thunk: u64,
     set_complete_thunk: u64,
+    thunk_bindings:
+        [Option<HostedExecutableThunkBinding>; HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_THUNK_COUNT],
+    thunk_binding_count: usize,
 }
 
 impl HostedProviderNdisMiniportBlockMirror {
     const fn empty() -> Self {
         Self {
             present: false,
+            construction_state: HostedProviderConstructionState::Published,
             owner: EMPTY_HOSTED_PROVIDER_OBJECT_OWNER,
             provider_instance: 0,
             dependent_instance: 0,
@@ -14977,7 +15016,16 @@ impl HostedProviderNdisMiniportBlockMirror {
             td_complete_thunk: 0,
             query_complete_thunk: 0,
             set_complete_thunk: 0,
+            thunk_bindings: [None; HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_THUNK_COUNT],
+            thunk_binding_count: 0,
         }
+    }
+
+    fn retain_thunk(&mut self, thunk: HostedExecutableThunkAddress) -> Option<u64> {
+        let slot = self.thunk_bindings.get_mut(self.thunk_binding_count)?;
+        *slot = Some(thunk.binding);
+        self.thunk_binding_count += 1;
+        Some(thunk.run_va)
     }
 }
 
@@ -16488,6 +16536,21 @@ unsafe fn hosted_provider_callback_record_for_thunk(
         })
 }
 
+unsafe fn retire_hosted_provider_callback_record_for_thunk(
+    thunk_token: HostedThunkSlotToken,
+    thunk_key: HostedThunkSlotKey,
+) -> bool {
+    let mut matched = false;
+    for record in hosted_provider_callback_records_mut().iter_mut() {
+        if record.present && record.thunk_token == thunk_token && record.thunk_key == thunk_key {
+            record.construction_state = HostedProviderConstructionState::RollingBack;
+            record.present = false;
+            matched = true;
+        }
+    }
+    matched
+}
+
 unsafe fn hosted_provider_callback_record(cookie: u64) -> Option<HostedProviderCallbackRecord> {
     if cookie == 0 {
         return None;
@@ -16505,6 +16568,12 @@ unsafe fn hosted_provider_callback_record(cookie: u64) -> Option<HostedProviderC
     {
         return None;
     }
+    if !driver_instance_thunk_slots()
+        .and_then(|registries| registries.get(record.provider_instance))
+        .is_some_and(|registry| registry.is_live(record.thunk_token, record.thunk_key))
+    {
+        return None;
+    }
     let dependency = hosted_provider_domain_dependency_for_pair(
         record.provider_instance,
         record.dependent_instance,
@@ -16515,16 +16584,17 @@ unsafe fn hosted_provider_callback_record(cookie: u64) -> Option<HostedProviderC
         .then_some(record)
 }
 
-unsafe fn clear_hosted_provider_callback_records_for_route(route: HostedProviderDispatchRoute) {
-    for record in hosted_provider_callback_records_mut().iter_mut() {
-        if record.present
+unsafe fn hosted_provider_callback_records_reference_route(
+    route: HostedProviderDispatchRoute,
+) -> bool {
+    hosted_provider_callback_records().is_some_and(|records| {
+        records.iter().any(|record| {
+            record.present
             && record.provider_domain == route.provider_domain
             && record.dependent_domain == route.dependent_domain
             && record.provider_publication_cookie == route.provider_publication_cookie
-        {
-            record.present = false;
-        }
-    }
+        })
+    })
 }
 
 unsafe fn hosted_provider_dispatch_routes_mut() -> &'static mut Vec<HostedProviderDispatchRoute> {
@@ -16640,18 +16710,17 @@ fn clear_hosted_provider_domain_link(
     }
 }
 
-unsafe fn clear_hosted_provider_callback_records_for_dependency(
+unsafe fn hosted_provider_callback_records_reference_dependency(
     dependency: HostedProviderDomainDependency,
-) {
-    for record in hosted_provider_callback_records_mut().iter_mut() {
-        if record.present
+) -> bool {
+    hosted_provider_callback_records().is_some_and(|records| {
+        records.iter().any(|record| {
+            record.present
             && record.provider_domain == dependency.provider_domain
             && record.dependent_domain == dependency.dependent_domain
             && record.provider_publication_cookie == dependency.provider_publication_cookie
-        {
-            record.present = false;
-        }
-    }
+        })
+    })
 }
 
 unsafe fn teardown_hosted_provider_domain_dependency(
@@ -16664,8 +16733,10 @@ unsafe fn teardown_hosted_provider_domain_dependency(
     {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
+    if hosted_provider_callback_records_reference_dependency(dependency) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     clear_hosted_provider_domain_link(dependency.dependent_domain, dependency.provider_domain)?;
-    clear_hosted_provider_callback_records_for_dependency(dependency);
     Ok(())
 }
 
@@ -16811,6 +16882,9 @@ unsafe fn teardown_hosted_provider_dispatch_route(
     {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
+    if hosted_provider_callback_records_reference_route(*route) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     let driver_binding = io_manager_mut()
         .hosted_driver_by_identity(route.provider_domain, route.provider_driver_object);
     match driver_binding {
@@ -16830,7 +16904,6 @@ unsafe fn teardown_hosted_provider_dispatch_route(
     if !release_hosted_provider_dispatch_route_allocations(route) {
         return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     }
-    clear_hosted_provider_callback_records_for_route(*route);
     clear_driver_object_extensions_for_driver_object(route.provider_driver_object);
     Ok(())
 }
@@ -17373,6 +17446,16 @@ unsafe fn abort_provider_export_marshal_before_dispatch(state: &ProviderMarshalS
             STATUS_DEVICE_NOT_READY,
         );
     }
+    if state.miniport_timer_construction_index != usize::MAX {
+        rollback_hosted_provider_miniport_timer_construction(
+            state.miniport_timer_construction_index,
+        );
+    }
+    if state.ndis_work_item_construction_index != usize::MAX {
+        rollback_hosted_provider_ndis_work_item_construction(
+            state.ndis_work_item_construction_index,
+        );
+    }
 }
 
 unsafe fn abort_provider_export_marshal_after_possible_dispatch(state: &ProviderMarshalState) {
@@ -17410,6 +17493,16 @@ unsafe fn abort_provider_export_marshal_after_possible_dispatch(state: &Provider
     if state.miniport_interrupt_construction_index != usize::MAX {
         retain_indeterminate_hosted_provider_miniport_interrupt_construction(
             state.miniport_interrupt_construction_index,
+        );
+    }
+    if state.miniport_timer_construction_index != usize::MAX {
+        retain_indeterminate_hosted_provider_miniport_timer_construction(
+            state.miniport_timer_construction_index,
+        );
+    }
+    if state.ndis_work_item_construction_index != usize::MAX {
+        retain_indeterminate_hosted_provider_ndis_work_item_construction(
+            state.ndis_work_item_construction_index,
         );
     }
 }
@@ -20836,6 +20929,7 @@ unsafe fn find_hosted_provider_miniport_timer_shadow(
     };
     for (index, record) in records.iter().copied().enumerate() {
         if record.present
+            && record.construction_state == HostedProviderConstructionState::Published
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
             && hosted_provider_object_owner_is_live(
@@ -20864,6 +20958,7 @@ unsafe fn find_hosted_provider_miniport_timer_shadow_by_provider(
     };
     for record in records.iter().copied() {
         if record.present
+            && record.construction_state == HostedProviderConstructionState::Published
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
             && hosted_provider_object_owner_is_live(
@@ -20898,9 +20993,13 @@ unsafe fn allocate_hosted_provider_miniport_timer_shadow(
     provider_inst: DriverInstance,
     dependent_instance: usize,
     dependent_component_va: u64,
-) -> Result<HostedProviderMiniportTimerShadow, i32> {
+) -> Result<(usize, HostedProviderMiniportTimerShadow), i32> {
     let owner = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
         .ok_or(STATUS_DEVICE_NOT_READY)?;
+    let records = hosted_provider_miniport_timer_shadows_mut();
+    if records.iter().all(|record| record.present) && records.try_reserve(1).is_err() {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
     let Some(provider_component_va) =
         hosted_instance_pool_alloc(provider_inst, NDIS_MINIPORT_TIMER_LEN_X64)
     else {
@@ -20920,22 +21019,26 @@ unsafe fn allocate_hosted_provider_miniport_timer_shadow(
 
     let shadow = HostedProviderMiniportTimerShadow {
         present: true,
+        construction_state: HostedProviderConstructionState::Constructing,
         owner,
         provider_instance,
         dependent_instance,
         dependent_component_va,
         provider_component_va,
+        callback_target: 0,
+        callback_thunk: 0,
+        callback_binding: None,
         bytes: NDIS_MINIPORT_TIMER_LEN_X64,
     };
     let records = hosted_provider_miniport_timer_shadows_mut();
-    for record in records.iter_mut() {
+    for (index, record) in records.iter_mut().enumerate() {
         if !record.present {
             *record = shadow;
-            return Ok(shadow);
+            return Ok((index, shadow));
         }
     }
     records.push(shadow);
-    Ok(shadow)
+    Ok((records.len() - 1, shadow))
 }
 
 unsafe fn hosted_provider_miniport_timer_shadow(
@@ -20945,7 +21048,7 @@ unsafe fn hosted_provider_miniport_timer_shadow(
     dependent_inst: DriverInstance,
     dependent_component_va: u64,
     allow_create: bool,
-) -> Result<(u64, u64, u64), i32> {
+) -> Result<(u64, u64, u64, usize, bool), i32> {
     let Some(dependent_exec_va) = component_to_exec_va_for_instance(
         dependent_instance,
         dependent_inst,
@@ -20954,18 +21057,21 @@ unsafe fn hosted_provider_miniport_timer_shadow(
     ) else {
         return Err(STATUS_INVALID_PARAMETER);
     };
-    let shadow = match find_hosted_provider_miniport_timer_shadow(
+    let (shadow_index, shadow, constructing) = match find_hosted_provider_miniport_timer_shadow(
         provider_instance,
         dependent_instance,
         dependent_component_va,
     ) {
-        Some((_index, shadow)) => shadow,
-        None if allow_create => allocate_hosted_provider_miniport_timer_shadow(
-            provider_instance,
-            provider_inst,
-            dependent_instance,
-            dependent_component_va,
-        )?,
+        Some((index, shadow)) => (index, shadow, false),
+        None if allow_create => {
+            let (index, shadow) = allocate_hosted_provider_miniport_timer_shadow(
+                provider_instance,
+                provider_inst,
+                dependent_instance,
+                dependent_component_va,
+            )?;
+            (index, shadow, true)
+        }
         None => {
             HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
             return Err(STATUS_INVALID_PARAMETER);
@@ -20993,7 +21099,83 @@ unsafe fn hosted_provider_miniport_timer_shadow(
         shadow.provider_component_va,
         dependent_exec_va,
         provider_exec_va,
+        shadow_index,
+        constructing,
     ))
+}
+
+unsafe fn rollback_hosted_provider_miniport_timer_construction(index: usize) {
+    let Some(record) = hosted_provider_miniport_timer_shadows_mut().get_mut(index) else {
+        return;
+    };
+    if !record.present
+        || !matches!(
+            record.construction_state,
+            HostedProviderConstructionState::Constructing
+                | HostedProviderConstructionState::RollingBack
+        )
+    {
+        return;
+    }
+    record.construction_state = HostedProviderConstructionState::RollingBack;
+    let binding_released = match record.callback_binding {
+        Some(binding) => {
+            if release_instance_executable_thunk_binding(binding, true) {
+                record.callback_binding = None;
+                true
+            } else {
+                false
+            }
+        }
+        None => true,
+    };
+    let allocation_released = record.provider_component_va == 0
+        || release_hosted_provider_owned_pool_allocation(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+            record.provider_instance,
+            record.provider_component_va,
+        );
+    if allocation_released {
+        record.provider_component_va = 0;
+    }
+    if binding_released && allocation_released {
+        *record = HostedProviderMiniportTimerShadow::empty();
+    } else {
+        record.construction_state = HostedProviderConstructionState::CompensationRequired;
+    }
+}
+
+unsafe fn retain_indeterminate_hosted_provider_miniport_timer_construction(index: usize) {
+    if let Some(record) = hosted_provider_miniport_timer_shadows_mut().get_mut(index) {
+        if record.present
+            && record.construction_state == HostedProviderConstructionState::Constructing
+        {
+            record.construction_state = HostedProviderConstructionState::CompensationRequired;
+        }
+    }
+}
+
+unsafe fn finish_hosted_provider_miniport_timer_construction(index: usize) -> bool {
+    let Some(record) = hosted_provider_miniport_timer_shadows_mut().get_mut(index) else {
+        return false;
+    };
+    if !record.present
+        || record.construction_state != HostedProviderConstructionState::Constructing
+        || record.callback_target == 0
+        || record.callback_thunk == 0
+        || record.callback_binding.is_none()
+        || !hosted_provider_object_owner_is_live(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+        )
+    {
+        return false;
+    }
+    record.construction_state = HostedProviderConstructionState::Published;
+    true
 }
 
 unsafe fn clear_hosted_provider_miniport_timer_shadows_for_instance(
@@ -21008,7 +21190,8 @@ unsafe fn clear_hosted_provider_miniport_timer_shadows_for_instance(
         {
             continue;
         }
-        if !hosted_provider_object_owner_matches_instance(
+        if record.callback_binding.is_some()
+            || !hosted_provider_object_owner_matches_instance(
             record.owner,
             record.provider_instance,
             record.dependent_instance,
@@ -21042,6 +21225,7 @@ unsafe fn find_hosted_provider_ndis_work_item_shadow(
     };
     for (index, record) in records.iter().copied().enumerate() {
         if record.present
+            && record.construction_state == HostedProviderConstructionState::Published
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
             && hosted_provider_object_owner_is_live(
@@ -21070,6 +21254,7 @@ unsafe fn find_hosted_provider_ndis_work_item_shadow_by_provider(
     };
     for record in records.iter().copied() {
         if record.present
+            && record.construction_state == HostedProviderConstructionState::Published
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
             && hosted_provider_object_owner_is_live(
@@ -21093,6 +21278,7 @@ unsafe fn store_hosted_provider_ndis_work_item_shadow(
         return false;
     };
     if !record.present
+        || record.construction_state != shadow.construction_state
         || record.owner != shadow.owner
         || record.provider_instance != shadow.provider_instance
         || record.dependent_instance != shadow.dependent_instance
@@ -21118,6 +21304,10 @@ unsafe fn allocate_hosted_provider_ndis_work_item_shadow(
 ) -> Result<(usize, HostedProviderNdisWorkItemShadow), i32> {
     let owner = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
         .ok_or(STATUS_DEVICE_NOT_READY)?;
+    let records = hosted_provider_ndis_work_item_shadows_mut();
+    if records.iter().all(|record| record.present) && records.try_reserve(1).is_err() {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
     let Some(provider_component_va) =
         hosted_instance_pool_alloc(provider_inst, NDIS_WORK_ITEM_LEN_X64)
     else {
@@ -21137,6 +21327,7 @@ unsafe fn allocate_hosted_provider_ndis_work_item_shadow(
 
     let shadow = HostedProviderNdisWorkItemShadow {
         present: true,
+        construction_state: HostedProviderConstructionState::Constructing,
         owner,
         provider_instance,
         dependent_instance,
@@ -21145,6 +21336,7 @@ unsafe fn allocate_hosted_provider_ndis_work_item_shadow(
         dependent_context: 0,
         dependent_routine: 0,
         provider_routine_thunk: 0,
+        provider_routine_binding: None,
         bytes: NDIS_WORK_ITEM_LEN_X64,
     };
     let records = hosted_provider_ndis_work_item_shadows_mut();
@@ -21164,7 +21356,7 @@ unsafe fn hosted_provider_ndis_work_item_shadow(
     dependent_instance: usize,
     dependent_inst: DriverInstance,
     dependent_component_va: u64,
-) -> Result<u64, i32> {
+) -> Result<(u64, usize, bool), i32> {
     let Some(dependent_exec_va) = component_to_exec_va_for_instance(
         dependent_instance,
         dependent_inst,
@@ -21182,35 +21374,61 @@ unsafe fn hosted_provider_ndis_work_item_shadow(
         HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_INVALID_PARAMETER);
     }
-    let (index, mut shadow) = match find_hosted_provider_ndis_work_item_shadow(
+    let (index, mut shadow, constructing) = match find_hosted_provider_ndis_work_item_shadow(
         provider_instance,
         dependent_instance,
         dependent_component_va,
     ) {
-        Some(found) => found,
-        None => allocate_hosted_provider_ndis_work_item_shadow(
-            provider_instance,
-            provider_inst,
-            dependent_instance,
-            dependent_component_va,
-        )?,
+        Some((index, shadow)) => (index, shadow, false),
+        None => {
+            let (index, shadow) = allocate_hosted_provider_ndis_work_item_shadow(
+                provider_instance,
+                provider_inst,
+                dependent_instance,
+                dependent_component_va,
+            )?;
+            (index, shadow, true)
+        }
     };
     if shadow.bytes < NDIS_WORK_ITEM_LEN_X64 {
         HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_INVALID_PARAMETER);
     }
-    if shadow.dependent_routine != dependent_routine || shadow.provider_routine_thunk == 0 {
-        shadow.provider_routine_thunk = provider_marshal_emit_callback_thunk(
+    if shadow.dependent_routine != dependent_routine && shadow.provider_routine_binding.is_some() {
+        // NDIS has no work-item cancellation primitive. Replacing the routine before the provider
+        // has completed the prior work would discard the only exact owner of its raw callback.
+        return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
+    }
+    let mut acquired_binding = None;
+    if shadow.provider_routine_binding.is_none() {
+        let thunk = match provider_marshal_emit_callback_thunk(
             provider_instance,
             dependent_instance,
             dependent_routine,
             NDIS_WORK_ITEM_ROUTINE_CALLBACK_OFFSET_X64,
             HOSTED_PROVIDER_CALLBACK_KIND_NDIS_WORK_ITEM,
-        )?;
+        ) {
+            Ok(thunk) => thunk,
+            Err(status) => {
+                if constructing {
+                    rollback_hosted_provider_ndis_work_item_construction(index);
+                }
+                return Err(status);
+            }
+        };
+        shadow.provider_routine_thunk = thunk.run_va;
+        shadow.provider_routine_binding = Some(thunk.binding);
+        acquired_binding = Some(thunk.binding);
         shadow.dependent_routine = dependent_routine;
     }
     shadow.dependent_context = dependent_context;
     if !store_hosted_provider_ndis_work_item_shadow(index, shadow) {
+        if let Some(binding) = acquired_binding {
+            let _ = release_instance_executable_thunk_binding(binding, true);
+        }
+        if constructing {
+            rollback_hosted_provider_ndis_work_item_construction(index);
+        }
         HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_DEVICE_NOT_READY);
     }
@@ -21233,7 +21451,81 @@ unsafe fn hosted_provider_ndis_work_item_shadow(
         (provider_exec_va + NDIS_WORK_ITEM_ROUTINE_OFFSET_X64) as *mut u64,
         shadow.provider_routine_thunk,
     );
-    Ok(shadow.provider_component_va)
+    Ok((shadow.provider_component_va, index, constructing))
+}
+
+unsafe fn rollback_hosted_provider_ndis_work_item_construction(index: usize) {
+    let Some(record) = hosted_provider_ndis_work_item_shadows_mut().get_mut(index) else {
+        return;
+    };
+    if !record.present
+        || !matches!(
+            record.construction_state,
+            HostedProviderConstructionState::Constructing
+                | HostedProviderConstructionState::RollingBack
+        )
+    {
+        return;
+    }
+    record.construction_state = HostedProviderConstructionState::RollingBack;
+    let binding_released = match record.provider_routine_binding {
+        Some(binding) => {
+            if release_instance_executable_thunk_binding(binding, true) {
+                record.provider_routine_binding = None;
+                true
+            } else {
+                false
+            }
+        }
+        None => true,
+    };
+    let allocation_released = record.provider_component_va == 0
+        || release_hosted_provider_owned_pool_allocation(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+            record.provider_instance,
+            record.provider_component_va,
+        );
+    if allocation_released {
+        record.provider_component_va = 0;
+    }
+    if binding_released && allocation_released {
+        *record = HostedProviderNdisWorkItemShadow::empty();
+    } else {
+        record.construction_state = HostedProviderConstructionState::CompensationRequired;
+    }
+}
+
+unsafe fn retain_indeterminate_hosted_provider_ndis_work_item_construction(index: usize) {
+    if let Some(record) = hosted_provider_ndis_work_item_shadows_mut().get_mut(index) {
+        if record.present
+            && record.construction_state == HostedProviderConstructionState::Constructing
+        {
+            record.construction_state = HostedProviderConstructionState::CompensationRequired;
+        }
+    }
+}
+
+unsafe fn finish_hosted_provider_ndis_work_item_construction(index: usize) -> bool {
+    let Some(record) = hosted_provider_ndis_work_item_shadows_mut().get_mut(index) else {
+        return false;
+    };
+    if !record.present
+        || record.construction_state != HostedProviderConstructionState::Constructing
+        || record.dependent_routine == 0
+        || record.provider_routine_thunk == 0
+        || record.provider_routine_binding.is_none()
+        || !hosted_provider_object_owner_is_live(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+        )
+    {
+        return false;
+    }
+    record.construction_state = HostedProviderConstructionState::Published;
+    true
 }
 
 unsafe fn clear_hosted_provider_ndis_work_item_shadows_for_instance(
@@ -21248,7 +21540,8 @@ unsafe fn clear_hosted_provider_ndis_work_item_shadows_for_instance(
         {
             continue;
         }
-        if !hosted_provider_object_owner_matches_instance(
+        if record.provider_routine_binding.is_some()
+            || !hosted_provider_object_owner_matches_instance(
             record.owner,
             record.provider_instance,
             record.dependent_instance,
@@ -21274,7 +21567,7 @@ unsafe fn provider_marshal_emit_import_thunk_for_instance(
     provider: &str,
     export_name: &str,
     expected_provider_publication_cookie: u64,
-) -> Result<u64, i32> {
+) -> Result<HostedExecutableThunkAddress, i32> {
     let Some(export_plan) = lookup_hosted_provider_singleton_export_plan(provider, export_name)
     else {
         return Err(STATUS_OBJECT_NAME_NOT_FOUND);
@@ -21301,7 +21594,7 @@ unsafe fn provider_marshal_emit_import_thunk_for_instance(
     };
     let reservation = reserve_instance_executable_thunk(dependent_instance, key)?;
     if reservation.existing {
-        return Ok(reservation.run_va);
+        return Ok(reservation.address(dependent_instance));
     }
     let thunk = match plan_hosted_provider_import_thunk(
         dependent_inst.run_thunk_va,
@@ -21325,7 +21618,7 @@ unsafe fn provider_marshal_emit_import_thunk_for_instance(
         abort_instance_executable_thunk(dependent_instance, reservation);
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
-    Ok(thunk.thunk_va)
+    Ok(reservation.address(dependent_instance))
 }
 
 unsafe fn register_hosted_provider_internal_marshal_policy(
@@ -21405,7 +21698,7 @@ unsafe fn provider_marshal_emit_internal_import_thunk_for_instance(
     internal_name: &str,
     provider_target_component_va: u64,
     expected_provider_publication_cookie: u64,
-) -> Result<u64, i32> {
+) -> Result<HostedExecutableThunkAddress, i32> {
     let Some(policy) = hosted_provider_internal_marshal_policy(provider, internal_name) else {
         return Err(STATUS_NOT_SUPPORTED);
     };
@@ -21455,7 +21748,7 @@ unsafe fn provider_marshal_emit_internal_import_thunk_for_instance(
     };
     let reservation = reserve_instance_executable_thunk(dependent_instance, key)?;
     if reservation.existing {
-        return Ok(reservation.run_va);
+        return Ok(reservation.address(dependent_instance));
     }
     let thunk = match plan_hosted_provider_import_thunk(
         dependent_inst.run_thunk_va,
@@ -21479,7 +21772,7 @@ unsafe fn provider_marshal_emit_internal_import_thunk_for_instance(
         abort_instance_executable_thunk(dependent_instance, reservation);
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
-    Ok(thunk.thunk_va)
+    Ok(reservation.address(dependent_instance))
 }
 
 unsafe fn hosted_provider_ndis_miniport_block_mirror_by_provider(
@@ -21495,6 +21788,7 @@ unsafe fn hosted_provider_ndis_miniport_block_mirror_by_provider(
     };
     for (index, record) in records.iter().copied().enumerate() {
         if record.present
+            && record.construction_state == HostedProviderConstructionState::Published
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
             && hosted_provider_object_owner_is_live(
@@ -21522,6 +21816,7 @@ unsafe fn hosted_provider_ndis_miniport_block_mirror_by_provider_component(
     };
     for record in records.iter().copied() {
         if record.present
+            && record.construction_state == HostedProviderConstructionState::Published
             && record.provider_instance == provider_instance
             && hosted_provider_object_owner_is_live(
                 record.owner,
@@ -21549,6 +21844,7 @@ unsafe fn hosted_provider_ndis_miniport_block_mirror_by_dependent(
     };
     for record in records.iter().copied() {
         if record.present
+            && record.construction_state == HostedProviderConstructionState::Published
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
             && hosted_provider_object_owner_is_live(
@@ -21572,6 +21868,7 @@ unsafe fn hosted_provider_ndis_miniport_block_mirror_by_dependent_instance(
     };
     for record in records.iter().copied() {
         if record.present
+            && record.construction_state == HostedProviderConstructionState::Published
             && record.dependent_instance == dependent_instance
             && hosted_provider_object_owner_is_live(
                 record.owner,
@@ -21618,40 +21915,128 @@ unsafe fn provider_marshal_provider_handle(
     Ok(mirror.provider_component_va)
 }
 
-unsafe fn register_hosted_provider_ndis_miniport_block_mirror(
+unsafe fn reserve_hosted_provider_ndis_miniport_block_mirror(
     mirror: HostedProviderNdisMiniportBlockMirror,
-) -> bool {
+) -> Option<usize> {
     if mirror.provider_component_va == 0
         || mirror.dependent_component_va == 0
         || mirror.provider_instance == mirror.dependent_instance
-        || mirror.packet_indicate_thunk == 0
-        || mirror.send_complete_thunk == 0
-        || mirror.send_resources_thunk == 0
-        || mirror.reset_complete_thunk == 0
-        || mirror.eth_rx_indicate_thunk == 0
-        || mirror.eth_rx_complete_thunk == 0
-        || mirror.status_thunk == 0
-        || mirror.status_complete_thunk == 0
-        || mirror.td_complete_thunk == 0
-        || mirror.query_complete_thunk == 0
-        || mirror.set_complete_thunk == 0
+        || mirror.construction_state != HostedProviderConstructionState::Constructing
+        || mirror.thunk_binding_count != 0
         || !hosted_provider_object_owner_is_live(
             mirror.owner,
             mirror.provider_instance,
             mirror.dependent_instance,
         )
     {
-        return false;
+        return None;
     }
     let records = hosted_provider_ndis_miniport_block_mirrors_mut();
-    for record in records.iter_mut() {
+    for (index, record) in records.iter_mut().enumerate() {
         if !record.present {
             *record = mirror;
-            return true;
+            return Some(index);
         }
     }
+    records.try_reserve(1).ok()?;
     records.push(mirror);
+    Some(records.len() - 1)
+}
+
+unsafe fn store_hosted_provider_ndis_miniport_block_mirror_construction(
+    index: usize,
+    mirror: HostedProviderNdisMiniportBlockMirror,
+) -> bool {
+    let Some(record) = hosted_provider_ndis_miniport_block_mirrors_mut().get_mut(index) else {
+        return false;
+    };
+    if !record.present
+        || record.construction_state != HostedProviderConstructionState::Constructing
+        || mirror.construction_state != HostedProviderConstructionState::Constructing
+        || record.owner != mirror.owner
+        || record.provider_instance != mirror.provider_instance
+        || record.dependent_instance != mirror.dependent_instance
+        || record.provider_component_va != mirror.provider_component_va
+        || record.dependent_component_va != mirror.dependent_component_va
+    {
+        return false;
+    }
+    *record = mirror;
     true
+}
+
+unsafe fn finish_hosted_provider_ndis_miniport_block_mirror_construction(index: usize) -> bool {
+    let Some(record) = hosted_provider_ndis_miniport_block_mirrors_mut().get_mut(index) else {
+        return false;
+    };
+    if !record.present
+        || record.construction_state != HostedProviderConstructionState::Constructing
+        || record.thunk_binding_count != HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_THUNK_COUNT
+        || record.thunk_bindings[..record.thunk_binding_count]
+            .iter()
+            .any(Option::is_none)
+        || record.packet_indicate_thunk == 0
+        || record.send_complete_thunk == 0
+        || record.send_resources_thunk == 0
+        || record.reset_complete_thunk == 0
+        || record.eth_rx_indicate_thunk == 0
+        || record.eth_rx_complete_thunk == 0
+        || record.status_thunk == 0
+        || record.status_complete_thunk == 0
+        || record.td_complete_thunk == 0
+        || record.query_complete_thunk == 0
+        || record.set_complete_thunk == 0
+    {
+        return false;
+    }
+    record.construction_state = HostedProviderConstructionState::Published;
+    true
+}
+
+unsafe fn rollback_hosted_provider_ndis_miniport_block_mirror_construction(index: usize) {
+    let Some(record) = hosted_provider_ndis_miniport_block_mirrors_mut().get_mut(index) else {
+        return;
+    };
+    if !record.present
+        || !matches!(
+            record.construction_state,
+            HostedProviderConstructionState::Constructing
+                | HostedProviderConstructionState::RollingBack
+        )
+    {
+        return;
+    }
+    record.construction_state = HostedProviderConstructionState::RollingBack;
+    let mut release_failed = false;
+    let mut index = 0usize;
+    while index < record.thunk_binding_count {
+        if let Some(binding) = record.thunk_bindings[index] {
+            if release_instance_executable_thunk_binding(binding, true) {
+                record.thunk_bindings[index] = None;
+            } else {
+                release_failed = true;
+            }
+        }
+        index += 1;
+    }
+    if record.dependent_component_va != 0 {
+        if release_hosted_provider_owned_pool_allocation(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+            record.dependent_instance,
+            record.dependent_component_va,
+        ) {
+            record.dependent_component_va = 0;
+        } else {
+            release_failed = true;
+        }
+    }
+    if release_failed {
+        record.construction_state = HostedProviderConstructionState::CompensationRequired;
+    } else {
+        *record = HostedProviderNdisMiniportBlockMirror::empty();
+    }
 }
 
 unsafe fn write_hosted_provider_ndis_miniport_block_mirror_cell(
@@ -21793,6 +22178,7 @@ unsafe fn refresh_hosted_provider_ndis_miniport_block_mirrors_for_pair(
     };
     for mirror in records.iter().copied() {
         if mirror.present
+            && mirror.construction_state == HostedProviderConstructionState::Published
             && mirror.provider_instance == provider_instance
             && mirror.dependent_instance == dependent_instance
             && hosted_provider_object_owner_is_live(
@@ -21826,6 +22212,12 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
 ) -> Result<HostedProviderNdisMiniportBlockMirror, i32> {
     let owner = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
         .ok_or(STATUS_DEVICE_NOT_READY)?;
+    let mirror_records = hosted_provider_ndis_miniport_block_mirrors_mut();
+    if mirror_records.iter().all(|record| record.present)
+        && mirror_records.try_reserve(1).is_err()
+    {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
     let Some(provider_exec) = component_to_exec_va_for_instance(
         provider_instance,
         provider_inst,
@@ -21863,6 +22255,7 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
 
     let mut mirror = HostedProviderNdisMiniportBlockMirror {
         present: true,
+        construction_state: HostedProviderConstructionState::Constructing,
         owner,
         provider_instance,
         dependent_instance,
@@ -21870,58 +22263,145 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
         dependent_component_va,
         ..HostedProviderNdisMiniportBlockMirror::empty()
     };
+    let Some(construction_index) =
+        reserve_hosted_provider_ndis_miniport_block_mirror(mirror)
+    else {
+        hosted_instance_pool_free(dependent_inst, dependent_component_va);
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
 
-    macro_rules! emit_or_free {
-        ($export:expr) => {
-            match provider_marshal_emit_import_thunk_for_instance(
-                dependent_instance,
-                "ndis.sys",
-                $export,
-                provider_publication_cookie,
-            ) {
-                Ok(thunk) => thunk,
+    macro_rules! retain_or_rollback {
+        ($emit:expr) => {
+            match $emit {
+                Ok(thunk) => {
+                    let binding = thunk.binding;
+                    let Some(run_va) = mirror.retain_thunk(thunk) else {
+                        let _ = release_instance_executable_thunk_binding(binding, true);
+                        rollback_hosted_provider_ndis_miniport_block_mirror_construction(
+                            construction_index,
+                        );
+                        return Err(STATUS_INSUFFICIENT_RESOURCES);
+                    };
+                    if !store_hosted_provider_ndis_miniport_block_mirror_construction(
+                        construction_index,
+                        mirror,
+                    ) {
+                        rollback_hosted_provider_ndis_miniport_block_mirror_construction(
+                            construction_index,
+                        );
+                        return Err(STATUS_DEVICE_NOT_READY);
+                    }
+                    run_va
+                }
                 Err(status) => {
-                    hosted_instance_pool_free(dependent_inst, dependent_component_va);
+                    rollback_hosted_provider_ndis_miniport_block_mirror_construction(
+                        construction_index,
+                    );
                     return Err(status);
                 }
             }
         };
     }
 
-    mirror.packet_indicate_thunk = match provider_marshal_emit_internal_import_thunk_for_instance(
+    mirror.packet_indicate_thunk = retain_or_rollback!(
+        provider_marshal_emit_internal_import_thunk_for_instance(
+            dependent_instance,
+            "ndis.sys",
+            "MiniIndicateReceivePacket",
+            packet_indicate_target,
+            provider_publication_cookie,
+        )
+    );
+    mirror.send_complete_thunk = retain_or_rollback!(
+        provider_marshal_emit_import_thunk_for_instance(
+            dependent_instance,
+            "ndis.sys",
+            "NdisMSendComplete",
+            provider_publication_cookie,
+        )
+    );
+    mirror.send_resources_thunk = retain_or_rollback!(
+        provider_marshal_emit_import_thunk_for_instance(
+            dependent_instance,
+            "ndis.sys",
+            "NdisMSendResourcesAvailable",
+            provider_publication_cookie,
+        )
+    );
+    mirror.reset_complete_thunk = retain_or_rollback!(
+        provider_marshal_emit_import_thunk_for_instance(
+            dependent_instance,
+            "ndis.sys",
+            "NdisMResetComplete",
+            provider_publication_cookie,
+        )
+    );
+    mirror.eth_rx_indicate_thunk = retain_or_rollback!(
+        provider_marshal_emit_import_thunk_for_instance(
+            dependent_instance,
+            "ndis.sys",
+            "EthFilterDprIndicateReceive",
+            provider_publication_cookie,
+        )
+    );
+    mirror.eth_rx_complete_thunk = retain_or_rollback!(
+        provider_marshal_emit_import_thunk_for_instance(
+            dependent_instance,
+            "ndis.sys",
+            "EthFilterDprIndicateReceiveComplete",
+            provider_publication_cookie,
+        )
+    );
+    mirror.status_thunk = retain_or_rollback!(provider_marshal_emit_import_thunk_for_instance(
         dependent_instance,
         "ndis.sys",
-        "MiniIndicateReceivePacket",
-        packet_indicate_target,
+        "NdisMIndicateStatus",
         provider_publication_cookie,
-    ) {
-        Ok(thunk) => thunk,
-        Err(status) => {
-            hosted_instance_pool_free(dependent_inst, dependent_component_va);
-            return Err(status);
-        }
-    };
-    mirror.send_complete_thunk = emit_or_free!("NdisMSendComplete");
-    mirror.send_resources_thunk = emit_or_free!("NdisMSendResourcesAvailable");
-    mirror.reset_complete_thunk = emit_or_free!("NdisMResetComplete");
-    mirror.eth_rx_indicate_thunk = emit_or_free!("EthFilterDprIndicateReceive");
-    mirror.eth_rx_complete_thunk = emit_or_free!("EthFilterDprIndicateReceiveComplete");
-    mirror.status_thunk = emit_or_free!("NdisMIndicateStatus");
-    mirror.status_complete_thunk = emit_or_free!("NdisMIndicateStatusComplete");
-    mirror.td_complete_thunk = emit_or_free!("NdisMTransferDataComplete");
-    mirror.query_complete_thunk = emit_or_free!("NdisMQueryInformationComplete");
-    mirror.set_complete_thunk = emit_or_free!("NdisMSetInformationComplete");
+    ));
+    mirror.status_complete_thunk = retain_or_rollback!(
+        provider_marshal_emit_import_thunk_for_instance(
+            dependent_instance,
+            "ndis.sys",
+            "NdisMIndicateStatusComplete",
+            provider_publication_cookie,
+        )
+    );
+    mirror.td_complete_thunk = retain_or_rollback!(
+        provider_marshal_emit_import_thunk_for_instance(
+            dependent_instance,
+            "ndis.sys",
+            "NdisMTransferDataComplete",
+            provider_publication_cookie,
+        )
+    );
+    mirror.query_complete_thunk = retain_or_rollback!(
+        provider_marshal_emit_import_thunk_for_instance(
+            dependent_instance,
+            "ndis.sys",
+            "NdisMQueryInformationComplete",
+            provider_publication_cookie,
+        )
+    );
+    mirror.set_complete_thunk = retain_or_rollback!(
+        provider_marshal_emit_import_thunk_for_instance(
+            dependent_instance,
+            "ndis.sys",
+            "NdisMSetInformationComplete",
+            provider_publication_cookie,
+        )
+    );
 
     if let Err(status) =
         refresh_hosted_provider_ndis_miniport_block_mirror(provider_inst, dependent_inst, mirror)
     {
-        hosted_instance_pool_free(dependent_inst, dependent_component_va);
+        rollback_hosted_provider_ndis_miniport_block_mirror_construction(construction_index);
         return Err(status);
     }
-    if !register_hosted_provider_ndis_miniport_block_mirror(mirror) {
-        hosted_instance_pool_free(dependent_inst, dependent_component_va);
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    if !finish_hosted_provider_ndis_miniport_block_mirror_construction(construction_index) {
+        rollback_hosted_provider_ndis_miniport_block_mirror_construction(construction_index);
+        return Err(STATUS_DEVICE_NOT_READY);
     }
+    mirror.construction_state = HostedProviderConstructionState::Published;
     print_str(b"[provider-ndis] miniport block mirror provider-inst=");
     print_u64(provider_instance as u64);
     print_str(b" dependent-inst=");
@@ -21972,7 +22452,10 @@ unsafe fn clear_hosted_provider_ndis_miniport_block_mirrors_for_instance(
         {
             continue;
         }
-        if !hosted_provider_object_owner_matches_instance(
+        if record.thunk_bindings[..record.thunk_binding_count]
+            .iter()
+            .any(Option::is_some)
+            || !hosted_provider_object_owner_matches_instance(
             record.owner,
             record.provider_instance,
             record.dependent_instance,
@@ -22042,7 +22525,7 @@ unsafe fn provider_marshal_emit_callback_thunk(
     target: u64,
     callback_offset: u64,
     callback_kind: u8,
-) -> Result<u64, i32> {
+) -> Result<HostedExecutableThunkAddress, i32> {
     let owner = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
         .ok_or(STATUS_DEVICE_NOT_READY)?;
     let discriminator = callback_offset ^ ((callback_kind as u64) << 56);
@@ -22056,6 +22539,7 @@ unsafe fn provider_marshal_emit_callback_thunk(
     let reservation = reserve_instance_executable_thunk(provider_instance, key)?;
     if reservation.existing {
         let Some(record) = hosted_provider_callback_record_for_thunk(reservation.token, key) else {
+            abort_instance_executable_thunk(provider_instance, reservation);
             return Err(STATUS_DEVICE_NOT_READY);
         };
         return if record.target == target
@@ -22063,8 +22547,9 @@ unsafe fn provider_marshal_emit_callback_thunk(
             && record.callback_kind == callback_kind
             && hosted_provider_callback_record(record.callback_cookie).is_some()
         {
-            Ok(reservation.run_va)
+            Ok(reservation.address(provider_instance))
         } else {
+            abort_instance_executable_thunk(provider_instance, reservation);
             Err(STATUS_DEVICE_NOT_READY)
         };
     }
@@ -22110,7 +22595,31 @@ unsafe fn provider_marshal_emit_callback_thunk(
         abort_instance_executable_thunk(provider_instance, reservation);
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
-    Ok(thunk.thunk_va)
+    Ok(reservation.address(provider_instance))
+}
+
+unsafe fn provider_marshal_resolve_callback_record_thunk(
+    provider_instance: usize,
+    dependent_instance: usize,
+    target: u64,
+    callback_offset: u64,
+    callback_kind: u8,
+) -> Result<u64, i32> {
+    let thunk = provider_marshal_emit_callback_thunk(
+        provider_instance,
+        dependent_instance,
+        target,
+        callback_offset,
+        callback_kind,
+    )?;
+    if thunk.existing {
+        // This path still has one conservative callback-record owner rather than a durable parent
+        // transaction. Drop the lookup acquisition so replay cannot inflate the slot lease count.
+        if !release_instance_executable_thunk_binding(thunk.binding, false) {
+            return Err(STATUS_DEVICE_NOT_READY);
+        }
+    }
+    Ok(thunk.run_va)
 }
 
 fn provider_marshal_align8(value: u64) -> Option<u64> {
@@ -22567,7 +23076,7 @@ unsafe fn provider_marshal_miniport_timer(
     arg_value: u64,
     allow_create: bool,
 ) -> Result<u64, i32> {
-    let (provider_arg, dependent_exec_va, provider_exec_va) =
+    let (provider_arg, dependent_exec_va, provider_exec_va, shadow_index, constructing) =
         hosted_provider_miniport_timer_shadow(
             provider_instance,
             provider_inst,
@@ -22576,6 +23085,10 @@ unsafe fn provider_marshal_miniport_timer(
             arg_value,
             allow_create,
         )?;
+    state.miniport_timer_shadow_index = shadow_index;
+    if constructing {
+        state.miniport_timer_construction_index = shadow_index;
+    }
     provider_marshal_add_copyout(
         state,
         dependent_exec_va,
@@ -22587,6 +23100,7 @@ unsafe fn provider_marshal_miniport_timer(
 }
 
 unsafe fn provider_marshal_miniport_timer_function(
+    state: &mut ProviderMarshalState,
     provider_instance: usize,
     dependent_index: usize,
     target: u64,
@@ -22594,29 +23108,62 @@ unsafe fn provider_marshal_miniport_timer_function(
     if target == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    provider_marshal_emit_callback_thunk(
+    let Some(record) = hosted_provider_miniport_timer_shadows_mut()
+        .get_mut(state.miniport_timer_shadow_index)
+    else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    if !record.present
+        || record.provider_instance != provider_instance
+        || record.dependent_instance != dependent_index
+        || !matches!(
+            record.construction_state,
+            HostedProviderConstructionState::Constructing
+                | HostedProviderConstructionState::Published
+        )
+    {
+        return Err(STATUS_DEVICE_NOT_READY);
+    }
+    if let Some(_binding) = record.callback_binding {
+        return if record.callback_target == target && record.callback_thunk != 0 {
+            Ok(record.callback_thunk)
+        } else {
+            Err(nt_status::NtStatus::DEVICE_BUSY.raw())
+        };
+    }
+    let thunk = provider_marshal_emit_callback_thunk(
         provider_instance,
         dependent_index,
         target,
         NDIS_MINIPORT_TIMER_FUNCTION_CALLBACK_OFFSET_X64,
         HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT_TIMER,
-    )
+    )?;
+    record.callback_target = target;
+    record.callback_thunk = thunk.run_va;
+    record.callback_binding = Some(thunk.binding);
+    Ok(thunk.run_va)
 }
 
 unsafe fn provider_marshal_ndis_work_item(
+    state: &mut ProviderMarshalState,
     provider_instance: usize,
     provider_inst: DriverInstance,
     dependent_index: usize,
     dependent_inst: DriverInstance,
     arg_value: u64,
 ) -> Result<u64, i32> {
-    hosted_provider_ndis_work_item_shadow(
+    let (provider_component_va, construction_index, constructing) =
+        hosted_provider_ndis_work_item_shadow(
         provider_instance,
         provider_inst,
         dependent_index,
         dependent_inst,
         arg_value,
-    )
+    )?;
+    if constructing {
+        state.ndis_work_item_construction_index = construction_index;
+    }
+    Ok(provider_component_va)
 }
 
 unsafe fn provider_marshal_fixed_output_pointer(
@@ -23394,7 +23941,7 @@ unsafe fn provider_marshal_miniport_characteristics(
         };
         let target = read_unaligned((dependent_exec_va + offset) as *const u64);
         if target != 0 {
-            let thunk_va = provider_marshal_emit_callback_thunk(
+            let thunk_va = provider_marshal_resolve_callback_record_thunk(
                 provider_instance,
                 dependent_index,
                 target,
@@ -23484,7 +24031,7 @@ unsafe fn provider_marshal_protocol_characteristics(
         };
         let target = read_unaligned((dependent_exec_va + offset) as *const u64);
         if target != 0 {
-            let thunk_va = provider_marshal_emit_callback_thunk(
+            let thunk_va = provider_marshal_resolve_callback_record_thunk(
                 provider_instance,
                 dependent_index,
                 target,
@@ -23896,13 +24443,19 @@ unsafe fn prepare_provider_export_marshal(
                 )?
             }
             HostedProviderArgumentMarshal::CallerInMiniportTimerFunction => {
-                provider_marshal_miniport_timer_function(provider_instance, dependent_index, arg)?
+                provider_marshal_miniport_timer_function(
+                    &mut state,
+                    provider_instance,
+                    dependent_index,
+                    arg,
+                )?
             }
             HostedProviderArgumentMarshal::CallerInOutNdisWorkItem => {
                 let Some(provider_inst) = instance(provider_instance) else {
                     return Err(STATUS_DEVICE_NOT_READY);
                 };
                 provider_marshal_ndis_work_item(
+                    &mut state,
                     provider_instance,
                     provider_inst,
                     dependent_index,
@@ -24105,6 +24658,42 @@ unsafe fn complete_provider_export_marshal(
             retain_or_clear_failed_hosted_provider_miniport_interrupt_construction(
                 state.miniport_interrupt_construction_index,
                 *result as i32,
+            );
+        }
+    }
+    if state.miniport_timer_construction_index != usize::MAX {
+        if success {
+            if !finish_hosted_provider_miniport_timer_construction(
+                state.miniport_timer_construction_index,
+            ) {
+                retain_indeterminate_hosted_provider_miniport_timer_construction(
+                    state.miniport_timer_construction_index,
+                );
+                *result = STATUS_DEVICE_NOT_READY as u32 as u64;
+                success = false;
+            }
+        } else {
+            // A returned failure proves the provider call is no longer executing and cannot retain
+            // an unpublished timer callback from a failed initialization.
+            rollback_hosted_provider_miniport_timer_construction(
+                state.miniport_timer_construction_index,
+            );
+        }
+    }
+    if state.ndis_work_item_construction_index != usize::MAX {
+        if success {
+            if !finish_hosted_provider_ndis_work_item_construction(
+                state.ndis_work_item_construction_index,
+            ) {
+                retain_indeterminate_hosted_provider_ndis_work_item_construction(
+                    state.ndis_work_item_construction_index,
+                );
+                *result = STATUS_DEVICE_NOT_READY as u32 as u64;
+                success = false;
+            }
+        } else {
+            rollback_hosted_provider_ndis_work_item_construction(
+                state.ndis_work_item_construction_index,
             );
         }
     }
@@ -37963,6 +38552,20 @@ struct HostedExecutableThunkReservation {
     existing: bool,
 }
 
+impl HostedExecutableThunkReservation {
+    fn address(self, instance_index: usize) -> HostedExecutableThunkAddress {
+        HostedExecutableThunkAddress {
+            run_va: self.run_va,
+            binding: HostedExecutableThunkBinding {
+                instance_index,
+                token: self.token,
+                key: self.key,
+            },
+            existing: self.existing,
+        }
+    }
+}
+
 unsafe fn reserve_instance_executable_thunk(
     instance_index: usize,
     key: HostedThunkSlotKey,
@@ -38049,11 +38652,40 @@ unsafe fn abort_instance_executable_thunk(
     reservation: HostedExecutableThunkReservation,
 ) {
     if reservation.existing {
+        if let Some(registry) = driver_instance_thunk_slots_mut().get_mut(instance_index) {
+            let _ = registry.release(reservation.token, reservation.key);
+        }
         return;
     }
     if instance(instance_index).is_some() {
         let _ = ensure_driver_instance_thunk_slots(instance_index)
             .abort(reservation.token, reservation.key);
+    }
+}
+
+unsafe fn release_instance_executable_thunk_binding(
+    binding: HostedExecutableThunkBinding,
+    owner_quiesced: bool,
+) -> bool {
+    let Some(registry) = driver_instance_thunk_slots_mut().get_mut(binding.instance_index) else {
+        return false;
+    };
+    match registry.release(binding.token, binding.key) {
+        Ok(HostedThunkLeaseRelease::Retained { .. }) => true,
+        Ok(HostedThunkLeaseRelease::RetirementRequired) => {
+            if !owner_quiesced {
+                return false;
+            }
+            if binding.key.purpose == HOSTED_THUNK_PURPOSE_PROVIDER_CALLBACK
+                && !retire_hosted_provider_callback_record_for_thunk(binding.token, binding.key)
+            {
+                return false;
+            }
+            registry
+                .finish_retire(binding.token, binding.key, true)
+                .is_ok()
+        }
+        Err(_) => false,
     }
 }
 
