@@ -12696,3 +12696,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     alias and remaining executive readers to the selected identity before publishing the composed
     live SYSTEM image; the compatibility `CURRENT_CONTROL_SET_TARGET` path is not accepted as final
     authority.
+
+    Lossless REGF import checkpoint (2026-08-26, crate accepted): `nt-hive-regf` now decodes NK
+    class references as strict UTF-16LE and SK cells as bounded self-relative security descriptors,
+    including shared SK cells. Full-hive and selected-subtree imports apply root and descendant
+    metadata to `nt-hive-core`; subtree-root metadata survives image encode/decode, and a valid
+    import remains a clean sequence-zero baseline. Zero class length and `HCELL_NIL` security are
+    the only absent forms. Advertised NIL, free, out-of-range, truncated, odd, invalid-UTF-16, bad
+    signature, undersized, or overflowing metadata fails the complete import.
+
+    The same review removed adjacent partial-import behavior. VK inline/external lengths must fit
+    their allocated cells exactly, all twelve supported NT registry value types remain exact,
+    unknown types fail explicitly instead of becoming `REG_BINARY`, and inconsistent subkey counts,
+    invalid parent links, repeated cells, cycles, or depth overflow abort without returning a
+    partial hive. The old `skipped_values` accounting and executive acceptance check are removed;
+    an invalid caller-provided subtree root remains distinguishable from corruption discovered
+    beneath a valid root.
+
+    Focused `nt-hive-regf` validation is green at `20/20`, including full/subtree shared-security
+    metadata, core image roundtrip, malformed metadata/value/topology rejection, and all supported
+    value types. The freestanding executive release check remains green at the established
+    212-warning baseline. Review adjustment: the persistent base is now metadata-complete. Next
+    replace the generic hive mount's fixed `CurrentControlSet` alias and remaining executive direct
+    readers with the validated per-mount identity, then perform the single composed CM publication
+    and delete the generated-only import.

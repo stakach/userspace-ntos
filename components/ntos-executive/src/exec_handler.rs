@@ -4595,14 +4595,20 @@ impl ExecNtHandler {
                     cell,
                     hive_kind_for_selector(hive_sel(key)),
                 ) {
-                    Ok((hive, stats)) => {
-                        if stats.skipped_values != 0 {
-                            return STATUS_REGISTRY_CORRUPT;
-                        }
-                        hive
-                    }
-                    Err(nt_hive_regf::RegfHiveImportError::InvalidKey) => {
+                    Ok((hive, _stats)) => hive,
+                    Err(nt_hive_regf::RegfHiveImportError::InvalidSourceKey) => {
                         return STATUS_INVALID_HANDLE;
+                    }
+                    Err(
+                        nt_hive_regf::RegfHiveImportError::InvalidKey
+                        | nt_hive_regf::RegfHiveImportError::InvalidSubkeyList
+                        | nt_hive_regf::RegfHiveImportError::InvalidValue
+                        | nt_hive_regf::RegfHiveImportError::InvalidClass
+                        | nt_hive_regf::RegfHiveImportError::InvalidSecurityDescriptor
+                        | nt_hive_regf::RegfHiveImportError::UnsupportedValueType(_)
+                        | nt_hive_regf::RegfHiveImportError::DepthLimitOrCycle,
+                    ) => {
+                        return STATUS_REGISTRY_CORRUPT;
                     }
                     Err(nt_hive_regf::RegfHiveImportError::OutOfMemory) => {
                         return STATUS_INSUFFICIENT_RESOURCES;
@@ -5474,9 +5480,28 @@ impl ExecNtHandler {
             };
             let (mut hive, _stats) = match imported {
                 Ok(imported) => imported,
-                Err(nt_hive_regf::RegfHiveImportError::InvalidKey) => {
+                Err(
+                    nt_hive_regf::RegfHiveImportError::InvalidSourceKey
+                    | nt_hive_regf::RegfHiveImportError::InvalidKey
+                    | nt_hive_regf::RegfHiveImportError::InvalidSubkeyList
+                    | nt_hive_regf::RegfHiveImportError::InvalidValue,
+                ) => {
                     USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
                     print_str(b"[cm-load] NtLoadKey: mutable import invalid root key bytes=");
+                    print_u64(len as u64);
+                    print_str(b" target=");
+                    print_ascii_str(&full);
+                    print_str(b"\n");
+                    return STATUS_REGISTRY_CORRUPT;
+                }
+                Err(
+                    nt_hive_regf::RegfHiveImportError::InvalidClass
+                        | nt_hive_regf::RegfHiveImportError::InvalidSecurityDescriptor
+                        | nt_hive_regf::RegfHiveImportError::UnsupportedValueType(_)
+                        | nt_hive_regf::RegfHiveImportError::DepthLimitOrCycle,
+                ) => {
+                    USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
+                    print_str(b"[cm-load] NtLoadKey: mutable import metadata corrupt bytes=");
                     print_u64(len as u64);
                     print_str(b" target=");
                     print_ascii_str(&full);

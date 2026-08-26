@@ -12,9 +12,11 @@
 //! * **Cell**: a signed `i32` size (negative = allocated/in-use) then the cell body; the body's
 //!   first 2 bytes are the type signature (`nk`/`vk`/`lf`/`lh`/`li`/`ri`/`sk`).
 //! * **`nk`** (key node): subkey-list offset @0x1C, value-count @0x24, value-list offset @0x28,
-//!   name-length @0x48, name @0x4C (ASCII if flags@0x02 & 0x20, else UTF-16LE).
+//!   security-cell offset @0x2C, class-cell offset @0x30, name-length @0x48, class-length @0x4A,
+//!   name @0x4C (ASCII if flags@0x02 & 0x20, else UTF-16LE).
 //! * **`vk`** (value): name-length @0x02, data-length @0x04 (top bit set = ≤4 B data inlined in
 //!   the data-offset field), data-offset @0x08, type @0x0C, flags @0x10 (bit0 = ASCII name).
+//! * **`sk`** (security): descriptor-length @0x10, self-relative descriptor bytes @0x14.
 //! * **subkey lists**: `lf`/`lh` = count then (offset,hint) pairs; `li` = count then offsets;
 //!   `ri` = count then offsets to *other* subkey lists.
 
@@ -32,6 +34,7 @@ use nt_hive_core::{CellId, Hive, HiveKind};
 
 const HBIN_BASE: usize = 0x1000;
 const CONFIG_IMPORT_MAX_DEPTH: usize = 256;
+const HCELL_NIL: u32 = u32::MAX;
 
 /// A parsed, read-only `regf` hive borrowing its raw bytes (no copy — the hive image is large and
 /// mapped once). Keys are referred to by their hbin-relative cell offset (`KeyRef`).
@@ -68,12 +71,20 @@ pub type KeyRef = u32;
 pub struct RegfHiveImportStats {
     pub keys: usize,
     pub values: usize,
-    pub skipped_values: usize,
+    pub classes: usize,
+    pub security_descriptors: usize,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RegfHiveImportError {
+    InvalidSourceKey,
     InvalidKey,
+    InvalidSubkeyList,
+    InvalidValue,
+    InvalidClass,
+    InvalidSecurityDescriptor,
+    UnsupportedValueType(u32),
+    DepthLimitOrCycle,
     OutOfMemory,
 }
 
@@ -155,11 +166,19 @@ impl<'a> RegfHive<'a> {
         self.data.get(fo + 4..fo + len)
     }
 
-    fn cell_body_len(&self, offset: u32) -> Option<usize> {
+    fn allocated_cell_body(&self, offset: u32) -> Option<&[u8]> {
         let fo = HBIN_BASE.checked_add(offset as usize)?;
         let size = i32le(self.data, fo)?;
-        let len = (size.unsigned_abs() as usize).max(4);
-        self.data.get(fo + 4..fo + len).map(|body| body.len())
+        if size >= 0 {
+            return None;
+        }
+        let len = size.unsigned_abs() as usize;
+        if len < 4 {
+            return None;
+        }
+        let body_start = fo.checked_add(4)?;
+        let cell_end = fo.checked_add(len)?;
+        self.data.get(body_start..cell_end)
     }
 
     /// A cell body given a *file* offset already past the size word is not needed — everything is
@@ -230,6 +249,66 @@ impl<'a> RegfHive<'a> {
         }
     }
 
+    /// Return the key's UTF-16 class name, if the NK advertises one.
+    pub fn key_class(&self, nk: KeyRef) -> Result<Option<String>, RegfHiveImportError> {
+        let b = self
+            .allocated_cell_body(nk)
+            .filter(|body| body.get(0..2) == Some(&b"nk"[..]))
+            .ok_or(RegfHiveImportError::InvalidKey)?;
+        let class_cell = u32le(b, 0x30).ok_or(RegfHiveImportError::InvalidKey)?;
+        let class_len = u16le(b, 0x4a).ok_or(RegfHiveImportError::InvalidKey)? as usize;
+        if class_len == 0 {
+            return Ok(None);
+        }
+        if class_cell == HCELL_NIL || class_len % 2 != 0 {
+            return Err(RegfHiveImportError::InvalidClass);
+        }
+        let raw = self
+            .allocated_cell_body(class_cell)
+            .and_then(|body| body.get(..class_len))
+            .ok_or(RegfHiveImportError::InvalidClass)?;
+        let unit_count = class_len / 2;
+        let mut class_name = String::new();
+        class_name
+            .try_reserve_exact(unit_count.saturating_mul(3))
+            .map_err(|_| RegfHiveImportError::OutOfMemory)?;
+        let units = raw
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
+        for character in core::char::decode_utf16(units) {
+            class_name.push(character.map_err(|_| RegfHiveImportError::InvalidClass)?);
+        }
+        Ok(Some(class_name))
+    }
+
+    /// Return the exact self-relative descriptor referenced by the key's SK cell.
+    pub fn key_security_descriptor(
+        &self,
+        nk: KeyRef,
+    ) -> Result<Option<&[u8]>, RegfHiveImportError> {
+        let b = self
+            .allocated_cell_body(nk)
+            .filter(|body| body.get(0..2) == Some(&b"nk"[..]))
+            .ok_or(RegfHiveImportError::InvalidKey)?;
+        let security_cell = u32le(b, 0x2c).ok_or(RegfHiveImportError::InvalidKey)?;
+        if security_cell == HCELL_NIL {
+            return Ok(None);
+        }
+        let security = self
+            .allocated_cell_body(security_cell)
+            .filter(|body| body.get(0..2) == Some(&b"sk"[..]))
+            .ok_or(RegfHiveImportError::InvalidSecurityDescriptor)?;
+        let descriptor_len =
+            u32le(security, 0x10).ok_or(RegfHiveImportError::InvalidSecurityDescriptor)? as usize;
+        if descriptor_len < 20 {
+            return Err(RegfHiveImportError::InvalidSecurityDescriptor);
+        }
+        let descriptor = security
+            .get(0x14..0x14usize.saturating_add(descriptor_len))
+            .ok_or(RegfHiveImportError::InvalidSecurityDescriptor)?;
+        Ok(Some(descriptor))
+    }
+
     /// Reconstruct a key's `\`-separated path relative to the hive root.
     ///
     /// The root itself is `""`. Malformed parent links, cycles, and paths deeper than 256 keys are
@@ -272,6 +351,50 @@ impl<'a> RegfHive<'a> {
         self.subkeys_named(nk, true)
     }
 
+    fn subkeys_raw_checked(
+        &self,
+        nk: KeyRef,
+    ) -> Result<Vec<(String, KeyRef)>, RegfHiveImportError> {
+        let body = self
+            .allocated_cell_body(nk)
+            .filter(|body| body.get(0..2) == Some(&b"nk"[..]))
+            .ok_or(RegfHiveImportError::InvalidKey)?;
+        let count = u32le(body, 0x14).ok_or(RegfHiveImportError::InvalidKey)? as usize;
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let list = u32le(body, 0x1c).ok_or(RegfHiveImportError::InvalidKey)?;
+        if list == 0 || list == HCELL_NIL {
+            return Err(RegfHiveImportError::InvalidSubkeyList);
+        }
+        let mut children = Vec::new();
+        children
+            .try_reserve_exact(count)
+            .map_err(|_| RegfHiveImportError::OutOfMemory)?;
+        for index in 0..count {
+            let mut remaining = index;
+            let (name, child) = self
+                .subkey_by_index_in_list(list, &mut remaining, 0, true)
+                .ok_or(RegfHiveImportError::InvalidSubkeyList)?;
+            let child_body = self
+                .allocated_cell_body(child)
+                .filter(|body| body.get(0..2) == Some(&b"nk"[..]))
+                .ok_or(RegfHiveImportError::InvalidKey)?;
+            if u32le(child_body, 0x10) != Some(nk) {
+                return Err(RegfHiveImportError::InvalidKey);
+            }
+            children.push((name, child));
+        }
+        let mut remaining = count;
+        if self
+            .subkey_by_index_in_list(list, &mut remaining, 0, true)
+            .is_some()
+        {
+            return Err(RegfHiveImportError::InvalidSubkeyList);
+        }
+        Ok(children)
+    }
+
     fn subkeys_named(&self, nk: KeyRef, raw_names: bool) -> Vec<(String, KeyRef)> {
         let mut out = Vec::new();
         let body = match self.cell_body(nk) {
@@ -302,16 +425,6 @@ impl<'a> RegfHive<'a> {
         };
         let mut remaining = index;
         self.subkey_by_index_in_list(list_off, &mut remaining, 0, false)
-    }
-
-    fn subkey_ref_by_index(&self, nk: KeyRef, index: usize) -> Option<KeyRef> {
-        let body = self.cell_body(nk)?;
-        let list_off = match u32le(body, 0x1c) {
-            Some(o) if o != 0 && o != u32::MAX => o,
-            _ => return None,
-        };
-        let mut remaining = index;
-        self.subkey_ref_by_index_in_list(list_off, &mut remaining, 0)
     }
 
     /// UTF-16 code units in the original-case immediate subkey name at `index`.
@@ -397,7 +510,7 @@ impl<'a> RegfHive<'a> {
         if depth > 8 {
             return None;
         }
-        let b = self.cell_body(list_off)?;
+        let b = self.allocated_cell_body(list_off)?;
         let sig = b.get(0..2)?;
         let count = u16le(b, 0x02)? as usize;
         match sig {
@@ -434,51 +547,6 @@ impl<'a> RegfHive<'a> {
                     let sub = u32le(b, 0x04 + i * 4)?;
                     if let Some(found) =
                         self.subkey_by_index_in_list(sub, remaining, depth + 1, raw_names)
-                    {
-                        return Some(found);
-                    }
-                }
-            }
-            _ => {}
-        }
-        None
-    }
-
-    fn subkey_ref_by_index_in_list(
-        &self,
-        list_off: u32,
-        remaining: &mut usize,
-        depth: u32,
-    ) -> Option<KeyRef> {
-        if depth > 8 {
-            return None;
-        }
-        let b = self.cell_body(list_off)?;
-        let sig = b.get(0..2)?;
-        let count = u16le(b, 0x02)? as usize;
-        match sig {
-            b"lf" | b"lh" => {
-                for i in 0..count {
-                    let off = u32le(b, 0x04 + i * 8)?;
-                    if *remaining == 0 {
-                        return Some(off);
-                    }
-                    *remaining -= 1;
-                }
-            }
-            b"li" => {
-                for i in 0..count {
-                    let off = u32le(b, 0x04 + i * 4)?;
-                    if *remaining == 0 {
-                        return Some(off);
-                    }
-                    *remaining -= 1;
-                }
-            }
-            b"ri" => {
-                for i in 0..count {
-                    let sub = u32le(b, 0x04 + i * 4)?;
-                    if let Some(found) = self.subkey_ref_by_index_in_list(sub, remaining, depth + 1)
                     {
                         return Some(found);
                     }
@@ -551,7 +619,7 @@ impl<'a> RegfHive<'a> {
     }
 
     fn value_cell_by_index(&self, nk: KeyRef, index: usize) -> Option<u32> {
-        let body = self.cell_body(nk)?;
+        let body = self.allocated_cell_body(nk)?;
         let count = u32le(body, 0x24)? as usize;
         if index >= count {
             return None;
@@ -560,7 +628,7 @@ impl<'a> RegfHive<'a> {
             Some(o) if o != 0 && o != u32::MAX => o,
             _ => return None,
         };
-        let list = self.cell_body(list_off)?;
+        let list = self.allocated_cell_body(list_off)?;
         u32le(list, index * 4)
     }
 
@@ -652,7 +720,7 @@ impl<'a> RegfHive<'a> {
 
     /// The original-case (unfolded) name of a value cell — for enumeration output.
     fn value_name_raw(&self, vk: u32) -> Option<String> {
-        let b = self.cell_body(vk)?;
+        let b = self.allocated_cell_body(vk)?;
         if b.get(0..2)? != b"vk" {
             return None;
         }
@@ -712,24 +780,30 @@ impl<'a> RegfHive<'a> {
     }
 
     fn value_data_view<'s>(&'s self, vk: u32) -> Option<ValueDataView<'s>> {
-        let b = self.cell_body(vk)?;
+        let b = self.allocated_cell_body(vk)?;
+        if b.get(0..2)? != b"vk" {
+            return None;
+        }
         let data_len_raw = u32le(b, 0x04)?;
         let data_off = u32le(b, 0x08)?;
         let reg_type = u32le(b, 0x0c)?;
         let inline = data_len_raw & 0x8000_0000 != 0;
         let len = (data_len_raw & 0x7fff_ffff) as usize;
         if inline {
+            if len > 4 {
+                return None;
+            }
             // Data (≤4 bytes) stored directly in the data-offset field.
             Some(ValueDataView::Inline {
                 ty: reg_type,
                 data: data_off.to_le_bytes(),
-                len: len.min(4),
+                len,
             })
         } else {
-            let db = self.cell_body(data_off)?;
+            let db = self.allocated_cell_body(data_off)?;
             Some(ValueDataView::Borrowed {
                 ty: reg_type,
-                data: db.get(..len.min(db.len()))?,
+                data: db.get(..len)?,
             })
         }
     }
@@ -739,16 +813,26 @@ impl<'a> RegfHive<'a> {
     }
 
     fn value_data_type_len(&self, vk: u32) -> Option<(u32, usize)> {
-        let b = self.cell_body(vk)?;
+        let b = self.allocated_cell_body(vk)?;
+        if b.get(0..2)? != b"vk" {
+            return None;
+        }
         let data_len_raw = u32le(b, 0x04)?;
         let data_off = u32le(b, 0x08)?;
         let reg_type = u32le(b, 0x0c)?;
         let inline = data_len_raw & 0x8000_0000 != 0;
         let len = (data_len_raw & 0x7fff_ffff) as usize;
         let len = if inline {
-            len.min(4)
+            if len > 4 {
+                return None;
+            }
+            len
         } else {
-            len.min(self.cell_body_len(data_off)?)
+            let cell_len = self.allocated_cell_body(data_off)?.len();
+            if len > cell_len {
+                return None;
+            }
+            len
         };
         Some((reg_type, len))
     }
@@ -757,8 +841,8 @@ impl<'a> RegfHive<'a> {
 /// Copy a real read-only `regf` image into the mutable Hive Manager arena.
 ///
 /// The returned hive is clean: import-time construction does not appear as dirty runtime state, and
-/// the first later `HiveManager::mutate` call owns sequence number 1. Malformed value records are
-/// counted and skipped, matching the read-only parser's fail-closed cell access.
+/// the first later `HiveManager::mutate` call owns sequence number 1. Malformed cells reject the
+/// complete import; no partial hive is published.
 pub fn try_import_regf_into_hive(
     source: &RegfHive<'_>,
     kind: HiveKind,
@@ -785,11 +869,15 @@ fn try_import_regf_key_into_hive(
     kind: HiveKind,
     reserve_live_mutation_headroom: bool,
 ) -> Result<(Hive, RegfHiveImportStats), RegfHiveImportError> {
-    if source.cell_body(source_key).and_then(|b| b.get(0..2)) != Some(&b"nk"[..]) {
-        return Err(RegfHiveImportError::InvalidKey);
+    if source
+        .allocated_cell_body(source_key)
+        .and_then(|b| b.get(0..2))
+        != Some(&b"nk"[..])
+    {
+        return Err(RegfHiveImportError::InvalidSourceKey);
     }
     let mut target = Hive::new(kind);
-    let counts = count_regf_key_cells(source, source_key, 0);
+    let counts = count_regf_key_cells(source, source_key, 0, &mut Vec::new())?;
     let imported_cells = counts.keys.saturating_add(counts.values);
     let live_cells = if reserve_live_mutation_headroom {
         imported_cells.saturating_add(live_mutation_cell_headroom(kind, imported_cells))
@@ -818,7 +906,15 @@ fn try_import_regf_key_into_hive(
         ..RegfHiveImportStats::default()
     };
     let root = target.root();
-    import_regf_key_into_hive(source, source_key, &mut target, root, &mut stats, 0);
+    import_regf_key_into_hive(
+        source,
+        source_key,
+        &mut target,
+        root,
+        &mut stats,
+        0,
+        &mut Vec::new(),
+    )?;
     target.finish_clean_import();
     Ok((target, stats))
 }
@@ -831,23 +927,29 @@ fn count_regf_key_cells(
     source: &RegfHive<'_>,
     source_key: KeyRef,
     depth: usize,
-) -> RegfHiveCellCounts {
-    if depth > 256 {
-        return RegfHiveCellCounts::default();
+    visited: &mut Vec<KeyRef>,
+) -> Result<RegfHiveCellCounts, RegfHiveImportError> {
+    if depth > CONFIG_IMPORT_MAX_DEPTH || visited.iter().any(|key| *key == source_key) {
+        return Err(RegfHiveImportError::DepthLimitOrCycle);
     }
+    let body = source
+        .allocated_cell_body(source_key)
+        .filter(|body| body.get(0..2) == Some(&b"nk"[..]))
+        .ok_or(RegfHiveImportError::InvalidKey)?;
+    visited
+        .try_reserve(1)
+        .map_err(|_| RegfHiveImportError::OutOfMemory)?;
+    visited.push(source_key);
     let mut counts = RegfHiveCellCounts {
         keys: 1,
-        values: source.value_count(source_key),
+        values: u32le(body, 0x24).ok_or(RegfHiveImportError::InvalidKey)? as usize,
     };
-    for index in 0.. {
-        let Some(source_child) = source.subkey_ref_by_index(source_key, index) else {
-            break;
-        };
-        let child = count_regf_key_cells(source, source_child, depth + 1);
+    for (_, source_child) in source.subkeys_raw_checked(source_key)? {
+        let child = count_regf_key_cells(source, source_child, depth + 1, visited)?;
         counts.keys = counts.keys.saturating_add(child.keys);
         counts.values = counts.values.saturating_add(child.values);
     }
-    counts
+    Ok(counts)
 }
 
 fn import_regf_key_into_hive(
@@ -857,27 +959,53 @@ fn import_regf_key_into_hive(
     target_key: CellId,
     stats: &mut RegfHiveImportStats,
     depth: usize,
-) {
-    if depth > 256 {
-        return;
+    visited: &mut Vec<KeyRef>,
+) -> Result<(), RegfHiveImportError> {
+    if depth > CONFIG_IMPORT_MAX_DEPTH || visited.iter().any(|key| *key == source_key) {
+        return Err(RegfHiveImportError::DepthLimitOrCycle);
+    }
+    visited
+        .try_reserve(1)
+        .map_err(|_| RegfHiveImportError::OutOfMemory)?;
+    visited.push(source_key);
+    if let Some(class_name) = source.key_class(source_key)? {
+        if !target.set_key_class(target_key, Some(&class_name)) {
+            return Err(RegfHiveImportError::InvalidKey);
+        }
+        stats.classes += 1;
+    }
+    if let Some(descriptor) = source.key_security_descriptor(source_key)? {
+        if !target.set_key_security_descriptor(target_key, descriptor) {
+            return Err(RegfHiveImportError::InvalidKey);
+        }
+        stats.security_descriptors += 1;
     }
     for index in 0..source.value_count(source_key) {
-        let Some((name, raw_type, data)) = source.value_by_index(source_key, index) else {
-            stats.skipped_values += 1;
-            continue;
-        };
-        let value_type = RegistryValueType::from_u32(raw_type).unwrap_or(RegistryValueType::Binary);
+        let (name, raw_type, data) = source
+            .value_by_index(source_key, index)
+            .ok_or(RegfHiveImportError::InvalidValue)?;
+        let value_type = RegistryValueType::from_u32(raw_type)
+            .ok_or(RegfHiveImportError::UnsupportedValueType(raw_type))?;
         if target.set_value(target_key, &name, value_type, data) {
             stats.values += 1;
         } else {
-            stats.skipped_values += 1;
+            return Err(RegfHiveImportError::InvalidValue);
         }
     }
-    for (child_name, source_child) in source.subkeys_raw(source_key) {
+    for (child_name, source_child) in source.subkeys_raw_checked(source_key)? {
         let target_child = target.create_subkey(target_key, &child_name);
         stats.keys += 1;
-        import_regf_key_into_hive(source, source_child, target, target_child, stats, depth + 1);
+        import_regf_key_into_hive(
+            source,
+            source_child,
+            target,
+            target_child,
+            stats,
+            depth + 1,
+            visited,
+        )?;
     }
+    Ok(())
 }
 
 /// Import counts for a control-set snapshot loaded into Configuration Manager state.
@@ -1074,6 +1202,8 @@ mod tests {
         data[body..body + 2].copy_from_slice(b"nk");
         write_u16(data, body + 0x02, 0x20); // compressed (single-byte) name
         write_u32(data, body + 0x10, parent);
+        write_u32(data, body + 0x2c, HCELL_NIL);
+        write_u32(data, body + 0x30, HCELL_NIL);
         write_u16(data, body + 0x48, name.len() as u16);
         data[body + 0x4c..body + 0x4c + name.len()].copy_from_slice(name);
     }
@@ -1091,6 +1221,9 @@ mod tests {
 
     fn set_nk_subkeys(data: &mut [u8], cell: u32, list: u32) {
         let body = HBIN_BASE + cell as usize + 4;
+        let list_body = HBIN_BASE + list as usize + 4;
+        let count = u16le(data, list_body + 0x02).unwrap_or(0) as u32;
+        write_u32(data, body + 0x14, count);
         write_u32(data, body + 0x1c, list);
     }
 
@@ -1115,6 +1248,29 @@ mod tests {
         data[offset + 4..offset + 4 + bytes.len()].copy_from_slice(bytes);
     }
 
+    fn set_nk_class(data: &mut [u8], cell: u32, class_cell: u32, class_len: usize) {
+        let body = HBIN_BASE + cell as usize + 4;
+        write_u32(data, body + 0x30, class_cell);
+        write_u16(data, body + 0x4a, class_len as u16);
+    }
+
+    fn set_nk_security(data: &mut [u8], cell: u32, security_cell: u32) {
+        let body = HBIN_BASE + cell as usize + 4;
+        write_u32(data, body + 0x2c, security_cell);
+    }
+
+    fn write_security_cell(data: &mut [u8], cell: u32, reference_count: u32, descriptor: &[u8]) {
+        let offset = HBIN_BASE + cell as usize;
+        data[offset..offset + 4].copy_from_slice(&(-0x80i32).to_le_bytes());
+        let body = offset + 4;
+        data[body..body + 2].copy_from_slice(b"sk");
+        write_u32(data, body + 0x04, cell);
+        write_u32(data, body + 0x08, cell);
+        write_u32(data, body + 0x0c, reference_count);
+        write_u32(data, body + 0x10, descriptor.len() as u32);
+        data[body + 0x14..body + 0x14 + descriptor.len()].copy_from_slice(descriptor);
+    }
+
     fn write_vk_data(data: &mut [u8], cell: u32, name: &[u8], value_type: u32, data_cell: u32) {
         let offset = HBIN_BASE + cell as usize;
         data[offset..offset + 4].copy_from_slice(&(-0x80i32).to_le_bytes());
@@ -1127,7 +1283,7 @@ mod tests {
         write_u16(data, body + 0x10, 1); // compressed ASCII value name
     }
 
-    fn write_vk_inline_dword(data: &mut [u8], cell: u32, name: &[u8], value: u32) {
+    fn write_vk_inline(data: &mut [u8], cell: u32, name: &[u8], value_type: u32, value: u32) {
         let offset = HBIN_BASE + cell as usize;
         data[offset..offset + 4].copy_from_slice(&(-0x80i32).to_le_bytes());
         let body = offset + 4;
@@ -1135,9 +1291,21 @@ mod tests {
         write_u16(data, body + 0x02, name.len() as u16);
         write_u32(data, body + 0x04, 0x8000_0004);
         write_u32(data, body + 0x08, value);
-        write_u32(data, body + 0x0c, RegistryValueType::Dword as u32);
+        write_u32(data, body + 0x0c, value_type);
         write_u16(data, body + 0x10, 1); // compressed ASCII value name
         data[body + 0x14..body + 0x14 + name.len()].copy_from_slice(name);
+    }
+
+    fn write_vk_inline_dword(data: &mut [u8], cell: u32, name: &[u8], value: u32) {
+        write_vk_inline(data, cell, name, RegistryValueType::Dword as u32, value);
+    }
+
+    fn utf16le(s: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        for unit in s.encode_utf16() {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+        out
     }
 
     fn utf16le_sz(s: &str) -> Vec<u8> {
@@ -1146,6 +1314,38 @@ mod tests {
             out.extend_from_slice(&unit.to_le_bytes());
         }
         out
+    }
+
+    fn metadata_test_hive() -> (Vec<u8>, Vec<u8>) {
+        const ROOT: u32 = 0x20;
+        const CHILD: u32 = 0xa0;
+        const ROOT_LIST: u32 = 0x120;
+        const ROOT_CLASS: u32 = 0x180;
+        const CHILD_CLASS: u32 = 0x200;
+        const SHARED_SECURITY: u32 = 0x280;
+
+        let mut data = vec![0u8; 0x2000];
+        data[..4].copy_from_slice(b"regf");
+        write_u32(&mut data, 0x24, ROOT);
+        write_nk(&mut data, ROOT, HCELL_NIL, b"SYSTEM");
+        write_nk(&mut data, CHILD, ROOT, b"Child");
+        write_subkey_list(&mut data, ROOT_LIST, &[CHILD]);
+        set_nk_subkeys(&mut data, ROOT, ROOT_LIST);
+
+        let root_class = utf16le("RootClass");
+        let child_class = utf16le("ChildClass");
+        write_data_cell(&mut data, ROOT_CLASS, &root_class);
+        write_data_cell(&mut data, CHILD_CLASS, &child_class);
+        set_nk_class(&mut data, ROOT, ROOT_CLASS, root_class.len());
+        set_nk_class(&mut data, CHILD, CHILD_CLASS, child_class.len());
+
+        let descriptor = vec![
+            1, 0, 0, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        write_security_cell(&mut data, SHARED_SECURITY, 2, &descriptor);
+        set_nk_security(&mut data, ROOT, SHARED_SECURITY);
+        set_nk_security(&mut data, CHILD, SHARED_SECURITY);
+        (data, descriptor)
     }
 
     fn path_test_hive() -> Vec<u8> {
@@ -1482,7 +1682,8 @@ mod tests {
     fn imports_regf_into_mutable_hive_authority() {
         let data = services_test_hive();
         let source = RegfHive::new(&data).expect("valid test hive");
-        let counts = count_regf_key_cells(&source, source.root(), 0);
+        let counts = count_regf_key_cells(&source, source.root(), 0, &mut Vec::new())
+            .expect("count valid REGF cells");
         let (mut hive, stats) = import_regf_into_hive(&source, HiveKind::System);
 
         assert_eq!(
@@ -1490,7 +1691,8 @@ mod tests {
             RegfHiveImportStats {
                 keys: 11,
                 values: 9,
-                skipped_values: 0,
+                classes: 0,
+                security_descriptors: 0,
             }
         );
         assert_eq!(counts.keys, stats.keys);
@@ -1546,6 +1748,206 @@ mod tests {
     }
 
     #[test]
+    fn regf_class_and_shared_security_metadata_survive_full_and_subtree_import() {
+        let (data, descriptor) = metadata_test_hive();
+        let source = RegfHive::new(&data).expect("metadata hive");
+        let child = source.open_key("Child").expect("child key");
+        assert_eq!(
+            source.key_class(source.root()),
+            Ok(Some("RootClass".into()))
+        );
+        assert_eq!(source.key_class(child), Ok(Some("ChildClass".into())));
+        assert_eq!(
+            source.key_security_descriptor(source.root()),
+            Ok(Some(descriptor.as_slice()))
+        );
+        assert_eq!(
+            source.key_security_descriptor(child),
+            Ok(Some(descriptor.as_slice()))
+        );
+
+        let (hive, stats) =
+            try_import_regf_into_hive(&source, HiveKind::System).expect("full metadata import");
+        assert_eq!(stats.keys, 2);
+        assert_eq!(stats.classes, 2);
+        assert_eq!(stats.security_descriptors, 2);
+        assert_eq!(hive.key_class(hive.root()), Some("RootClass"));
+        assert_eq!(
+            hive.key_security_descriptor(hive.root()),
+            Some(descriptor.as_slice())
+        );
+        let imported_child = hive.open_key("Child").expect("imported child");
+        assert_eq!(hive.key_class(imported_child), Some("ChildClass"));
+        assert_eq!(
+            hive.key_security_descriptor(imported_child),
+            Some(descriptor.as_slice())
+        );
+        assert_eq!(hive.sequence, 0);
+        assert_eq!(hive.generation, 0);
+        assert_eq!(hive.dirty_count(), 0);
+
+        let (subtree, subtree_stats) =
+            try_import_regf_subtree_into_hive(&source, child, HiveKind::System)
+                .expect("subtree metadata import");
+        assert_eq!(subtree_stats.classes, 1);
+        assert_eq!(subtree_stats.security_descriptors, 1);
+        assert_eq!(subtree.key_class(subtree.root()), Some("ChildClass"));
+        assert_eq!(
+            subtree.key_security_descriptor(subtree.root()),
+            Some(descriptor.as_slice())
+        );
+
+        let encoded = nt_hive_core::encode_image(&hive);
+        let decoded = nt_hive_core::decode_image(&encoded).expect("decode metadata hive");
+        let decoded_child = decoded.open_key("Child").expect("decoded child");
+        assert_eq!(decoded.key_class(decoded.root()), Some("RootClass"));
+        assert_eq!(decoded.key_class(decoded_child), Some("ChildClass"));
+        assert_eq!(
+            decoded.key_security_descriptor(decoded_child),
+            Some(descriptor.as_slice())
+        );
+    }
+
+    #[test]
+    fn regf_metadata_import_rejects_advertised_malformed_cells() {
+        const ROOT: u32 = 0x20;
+        const ROOT_CLASS: u32 = 0x180;
+        const SHARED_SECURITY: u32 = 0x280;
+
+        let (mut absent_class, _) = metadata_test_hive();
+        let root_body = HBIN_BASE + ROOT as usize + 4;
+        write_u16(&mut absent_class, root_body + 0x4a, 0);
+        write_u32(&mut absent_class, root_body + 0x30, 0xdead_beef);
+        let source = RegfHive::new(&absent_class).unwrap();
+        assert_eq!(source.key_class(ROOT), Ok(None));
+
+        let (mut nil_class, _) = metadata_test_hive();
+        write_u32(&mut nil_class, root_body + 0x30, HCELL_NIL);
+        let source = RegfHive::new(&nil_class).unwrap();
+        assert_eq!(
+            try_import_regf_into_hive(&source, HiveKind::System).err(),
+            Some(RegfHiveImportError::InvalidClass)
+        );
+
+        let (mut odd_class, _) = metadata_test_hive();
+        write_u16(&mut odd_class, root_body + 0x4a, 3);
+        let source = RegfHive::new(&odd_class).unwrap();
+        assert_eq!(
+            try_import_regf_into_hive(&source, HiveKind::System).err(),
+            Some(RegfHiveImportError::InvalidClass)
+        );
+
+        let (mut free_class, _) = metadata_test_hive();
+        let class_offset = HBIN_BASE + ROOT_CLASS as usize;
+        free_class[class_offset..class_offset + 4].copy_from_slice(&0x80i32.to_le_bytes());
+        let source = RegfHive::new(&free_class).unwrap();
+        assert_eq!(
+            try_import_regf_into_hive(&source, HiveKind::System).err(),
+            Some(RegfHiveImportError::InvalidClass)
+        );
+
+        let (mut invalid_utf16, _) = metadata_test_hive();
+        write_u16(&mut invalid_utf16, root_body + 0x4a, 2);
+        write_u16(
+            &mut invalid_utf16,
+            HBIN_BASE + ROOT_CLASS as usize + 4,
+            0xd800,
+        );
+        let source = RegfHive::new(&invalid_utf16).unwrap();
+        assert_eq!(
+            try_import_regf_into_hive(&source, HiveKind::System).err(),
+            Some(RegfHiveImportError::InvalidClass)
+        );
+
+        let (mut bad_security_signature, _) = metadata_test_hive();
+        let security_body = HBIN_BASE + SHARED_SECURITY as usize + 4;
+        bad_security_signature[security_body..security_body + 2].copy_from_slice(b"xx");
+        let source = RegfHive::new(&bad_security_signature).unwrap();
+        assert_eq!(
+            try_import_regf_into_hive(&source, HiveKind::System).err(),
+            Some(RegfHiveImportError::InvalidSecurityDescriptor)
+        );
+
+        let (mut short_security, _) = metadata_test_hive();
+        write_u32(&mut short_security, security_body + 0x10, 19);
+        let source = RegfHive::new(&short_security).unwrap();
+        assert_eq!(
+            try_import_regf_into_hive(&source, HiveKind::System).err(),
+            Some(RegfHiveImportError::InvalidSecurityDescriptor)
+        );
+
+        let (mut overflowing_security, _) = metadata_test_hive();
+        write_u32(&mut overflowing_security, security_body + 0x10, 0x1000);
+        let source = RegfHive::new(&overflowing_security).unwrap();
+        assert_eq!(
+            try_import_regf_into_hive(&source, HiveKind::System).err(),
+            Some(RegfHiveImportError::InvalidSecurityDescriptor)
+        );
+
+        let (mut mismatched_subkey_count, _) = metadata_test_hive();
+        write_u32(&mut mismatched_subkey_count, root_body + 0x14, 2);
+        let source = RegfHive::new(&mismatched_subkey_count).unwrap();
+        assert_eq!(
+            try_import_regf_into_hive(&source, HiveKind::System).err(),
+            Some(RegfHiveImportError::InvalidSubkeyList)
+        );
+    }
+
+    #[test]
+    fn regf_import_preserves_every_supported_value_type_and_rejects_unknown_types() {
+        const ROOT: u32 = 0x20;
+        const VALUE_LIST: u32 = 0xa0;
+        const FIRST_VALUE: u32 = 0x100;
+        let mut data = vec![0u8; 0x3000];
+        data[..4].copy_from_slice(b"regf");
+        write_u32(&mut data, 0x24, ROOT);
+        write_nk(&mut data, ROOT, HCELL_NIL, b"SYSTEM");
+        let values: Vec<u32> = (0..12).map(|index| FIRST_VALUE + index * 0x80).collect();
+        write_value_list(&mut data, VALUE_LIST, &values);
+        set_nk_values(&mut data, ROOT, VALUE_LIST, values.len());
+        for (raw_type, cell) in values.iter().copied().enumerate() {
+            let name = alloc::format!("Type{raw_type}");
+            write_vk_inline(
+                &mut data,
+                cell,
+                name.as_bytes(),
+                raw_type as u32,
+                raw_type as u32,
+            );
+        }
+        let source = RegfHive::new(&data).unwrap();
+        let (hive, stats) = try_import_regf_into_hive(&source, HiveKind::System).unwrap();
+        assert_eq!(stats.values, 12);
+        for raw_type in 0..12u32 {
+            let name = alloc::format!("Type{raw_type}");
+            assert_eq!(
+                hive.query_value(hive.root(), &name)
+                    .map(|(value_type, data)| (value_type, data.to_vec())),
+                Some((
+                    RegistryValueType::from_u32(raw_type).unwrap(),
+                    raw_type.to_le_bytes().to_vec()
+                ))
+            );
+        }
+
+        let first_value_body = HBIN_BASE + FIRST_VALUE as usize + 4;
+        write_u32(&mut data, first_value_body + 0x0c, 12);
+        let source = RegfHive::new(&data).unwrap();
+        assert_eq!(
+            try_import_regf_into_hive(&source, HiveKind::System).err(),
+            Some(RegfHiveImportError::UnsupportedValueType(12))
+        );
+
+        write_u32(&mut data, first_value_body + 0x0c, 0);
+        write_u32(&mut data, first_value_body + 0x04, 0x8000_0005);
+        let source = RegfHive::new(&data).unwrap();
+        assert_eq!(
+            try_import_regf_into_hive(&source, HiveKind::System).err(),
+            Some(RegfHiveImportError::InvalidValue)
+        );
+    }
+
+    #[test]
     fn imported_regf_hive_replays_sidecar_journal_from_clean_baseline() {
         let data = services_test_hive();
         let source = RegfHive::new(&data).expect("valid test hive");
@@ -1587,7 +1989,8 @@ mod tests {
             RegfHiveImportStats {
                 keys: 3,
                 values: 5,
-                skipped_values: 0,
+                classes: 0,
+                security_descriptors: 0,
             }
         );
         assert!(
@@ -1612,7 +2015,7 @@ mod tests {
 
         assert_eq!(
             try_import_regf_subtree_into_hive(&source, 0xDEAD_BEEF, HiveKind::System).err(),
-            Some(RegfHiveImportError::InvalidKey)
+            Some(RegfHiveImportError::InvalidSourceKey)
         );
     }
 
