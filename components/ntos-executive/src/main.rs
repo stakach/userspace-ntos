@@ -15088,6 +15088,22 @@ pub(crate) unsafe fn config_manager_query_pnp(
     Ok(snapshot)
 }
 
+pub(crate) unsafe fn config_manager_query_network_adapter_plan(
+) -> Result<nt_config_client::NetworkAdapterPlanSnapshot, i32> {
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if expected_generation == 0 {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    let snapshot = client.query_network_adapter_plan()?;
+    if snapshot.mount_generation != expected_generation {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    Ok(snapshot)
+}
+
 pub(crate) unsafe fn config_manager_query_system_hive_key(
     path: &str,
 ) -> Result<nt_config_client::HiveKeySnapshot, i32> {
@@ -18233,7 +18249,6 @@ unsafe fn prepare_boot_system_hive_image() -> Result<BootSystemImageReport, Boot
         nt_hive_core::try_encode_image(&composed.hive).map_err(BootSystemImageError::Encode)?;
     let image_bytes = image.len() as u64;
     *core::ptr::addr_of_mut!(BOOT_SYSTEM_HIVE_IMAGE) = Some(image);
-    BOOT_SYSTEM_HIVE_IMAGE_BYTES.store(image_bytes, Ordering::Release);
     Ok(BootSystemImageReport {
         origin: composed.origin,
         snapshot_generation,
@@ -19754,43 +19769,6 @@ fn inline_driver_launch_spec_from_live_binding(
     spec.devnode_start = start;
     spec.devnode_count = binding.devnodes.len();
     Some(spec)
-}
-
-fn boot_system_config_manager() -> Option<nt_config_manager::ConfigManager> {
-    let hive_bytes = unsafe { boot_system_hive_image_bytes()? };
-    let hive = nt_hive_core::decode_image(hive_bytes).ok()?;
-    let selected = hive.current_control_set().ok()?;
-    let mut cm = nt_config_manager::ConfigManager::new();
-    if nt_hive_core::import_control_set_services_into_config_manager(
-        &hive,
-        &mut cm,
-        selected.as_str(),
-    ) == 0
-    {
-        return None;
-    }
-    let _ = nt_hive_core::import_control_set_service_group_order_into_config_manager(
-        &hive,
-        &mut cm,
-        selected.as_str(),
-    );
-    let _ = nt_hive_core::import_control_set_enum_into_config_manager(
-        &hive,
-        &mut cm,
-        selected.as_str(),
-    );
-    let _ = nt_hive_core::import_control_set_class_into_config_manager(
-        &hive,
-        &mut cm,
-        selected.as_str(),
-    );
-    let _ = nt_hive_core::import_control_set_network_into_config_manager(
-        &hive,
-        &mut cm,
-        selected.as_str(),
-    );
-    let _ = nt_hive_core::seed_reactos_network_setup_in_config_manager(&mut cm);
-    Some(cm)
 }
 
 #[derive(Default)]
@@ -24238,7 +24216,6 @@ static NLS_CASE_SIZE: AtomicU64 = AtomicU64::new(0);
 static HIVEBUF_START: AtomicU64 = AtomicU64::new(0);
 static REAL_HIVE_SIZE: AtomicU64 = AtomicU64::new(0);
 static mut BOOT_SYSTEM_HIVE_IMAGE: Option<Vec<u8>> = None;
-pub(crate) static BOOT_SYSTEM_HIVE_IMAGE_BYTES: AtomicU64 = AtomicU64::new(0);
 /// The frame-cap base + byte size of the real SECURITY / SAM hives the storage host read BY PATH
 /// off `\reactos\system32\config\{security,sam}` into SECHIVEBUF / SAMHIVEBUF.
 pub(crate) static SECHIVEBUF_START: AtomicU64 = AtomicU64::new(0);

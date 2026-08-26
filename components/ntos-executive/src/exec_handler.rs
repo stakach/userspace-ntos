@@ -3076,24 +3076,21 @@ impl ExecNtHandler {
             && SAM_SETUP_KEYS_CREATED.load(Ordering::Relaxed) == 0
     }
 
-    fn network_setup_config_manager_snapshot(&self) -> Option<nt_config_manager::ConfigManager> {
-        // Early executive self-tests construct a handler before the storage-backed hives are mounted.
-        // The installed-boot network seed belongs only to the real SYSTEM hive path.
-        self.hive.as_ref()?;
-        boot_system_config_manager()
-    }
-
     /// Seed ReactOS network setup state that `hivesys.inf`, `nettcpip.inf`, and `afd_reg.inf`
     /// normally materialize. This publishes installed-boot service and TCPIP parameter metadata into
     /// the mounted mutable SYSTEM hive; registry consumers and Config Manager still perform ordinary
     /// opens, queries, ordering, and driver selection.
     fn provision_reactos_network_setup(&mut self) {
         trace_setup_provision_phase(b"network-snapshot-begin", 0);
-        let cm = self.network_setup_config_manager_snapshot();
+        let network_adapters = self.hive.as_ref().map(|_| {
+            unsafe { config_manager_query_network_adapter_plan() }
+                .expect("query live Config Manager network-adapter plan")
+        });
         trace_setup_provision_phase(
             b"network-snapshot-end",
-            cm.as_ref()
-                .map(|cm| cm.devnode_count() as u64)
+            network_adapters
+                .as_ref()
+                .map(|plan| plan.adapters.len() as u64)
                 .unwrap_or(u64::MAX),
         );
         let (stats, changed, failed, last_status) = {
@@ -3101,30 +3098,32 @@ impl ExecNtHandler {
             trace_setup_provision_phase(b"network-seed-core-begin", 0);
             let mut stats = nt_hive_core::seed_reactos_network_setup_into_target(&mut target);
             trace_setup_provision_phase(b"network-seed-core-end", stats.total_values() as u64);
-            if let Some(cm) = cm.as_ref() {
-                trace_setup_provision_phase(b"network-bindings-begin", cm.devnode_count() as u64);
-                trace_setup_provision_phase(b"network-bindings-boot-enum-begin", 0);
-                let mut bindings = cm.boot_system_pnp_driver_bindings();
+            if let Some(plan) = network_adapters.as_ref() {
                 trace_setup_provision_phase(
-                    b"network-bindings-boot-enum-end",
-                    bindings.len() as u64,
+                    b"network-bindings-begin",
+                    plan.adapters.len() as u64,
                 );
-                trace_setup_provision_phase(b"network-bindings-demand-enum-begin", 0);
-                let demand_bindings = cm.demand_start_pnp_driver_bindings();
-                trace_setup_provision_phase(
-                    b"network-bindings-demand-enum-end",
-                    demand_bindings.len() as u64,
-                );
-                bindings.extend(demand_bindings);
-                let binding_devnodes = bindings
+                let adapters: Vec<_> = plan
+                    .adapters
                     .iter()
-                    .map(|binding| binding.devnodes.len() as u64)
-                    .sum();
-                trace_setup_provision_phase(b"network-bindings-seed-begin", binding_devnodes);
-                nt_hive_core::seed_reactos_network_bindings_from_pnp_driver_bindings_into_target(
+                    .map(|adapter| nt_hive_core::ReactOsNetworkAdapterBinding {
+                        instance_id: adapter.instance_id.clone(),
+                        class_key_path: adapter.class_key_path.clone(),
+                        linkage_key_path: adapter.linkage_key_path.clone(),
+                        interface_name: adapter.interface_name.clone(),
+                        device_name: adapter.device_name.clone(),
+                        tcpip_export_name: adapter.tcpip_export_name.clone(),
+                        driver_desc: adapter.driver_desc.clone(),
+                        component_id: adapter.component_id.clone(),
+                    })
+                    .collect();
+                trace_setup_provision_phase(
+                    b"network-bindings-seed-begin",
+                    adapters.len() as u64,
+                );
+                nt_hive_core::seed_reactos_network_adapter_bindings_into_target(
                     &mut target,
-                    cm,
-                    bindings,
+                    &adapters,
                     &mut stats,
                 );
                 trace_setup_provision_phase(b"network-bindings-end", stats.total_values() as u64);

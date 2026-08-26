@@ -42,6 +42,9 @@ pub const CM_PNP_QUERY_SNAPSHOT_MAGIC: u32 = 0x5150_4D43; // `CMPQ`
 pub const CM_PNP_QUERY_SNAPSHOT_VERSION: u16 = 1;
 pub const CM_PNP_QUERY_SNAPSHOT_HEADER_BYTES: usize = 24;
 pub const CM_MAX_PNP_AUX_BYTES: usize = 16;
+pub const CM_NETWORK_PLAN_SNAPSHOT_MAGIC: u32 = 0x504E_4D43; // `CMNP`
+pub const CM_NETWORK_PLAN_SNAPSHOT_VERSION: u16 = 1;
+pub const CM_NETWORK_PLAN_SNAPSHOT_HEADER_BYTES: usize = 24;
 pub const CM_OPTIONAL_STRING_ABSENT: u32 = u32::MAX;
 pub const CM_OPTIONAL_BLOB_ABSENT: u32 = u32::MAX;
 pub const CM_OPTIONAL_U32_ABSENT: u32 = u32::MAX;
@@ -76,6 +79,8 @@ pub mod opcode {
     pub const CM_OP_QUERY_WIN32_SERVICE_PLAN: u16 = 0x2153;
     /// Return one immutable, generation-bound semantic PnP query snapshot.
     pub const CM_OP_QUERY_PNP: u16 = 0x2154;
+    /// Return one immutable, generation-bound installed network-adapter binding plan.
+    pub const CM_OP_QUERY_NETWORK_PLAN: u16 = 0x2155;
 }
 
 /// Operation carried by [`CmDevicePropertyRequest::operation`]. Property values are immutable for
@@ -146,6 +151,10 @@ pub mod pnp_query_kind {
     pub const RELATED_DEVICE: u16 = 5;
     pub const DEVICE_DEPTH: u16 = 6;
     pub const BUS_RELATIONS: u16 = 7;
+}
+
+pub mod network_plan_kind {
+    pub const ADAPTER_BINDINGS: u16 = 1;
 }
 
 /// Mount identifiers carried by mounted-hive operations.
@@ -440,6 +449,7 @@ mod tests {
         assert_eq!(opcode::CM_OP_QUERY_LAUNCH_PLAN, 0x2152);
         assert_eq!(opcode::CM_OP_QUERY_WIN32_SERVICE_PLAN, 0x2153);
         assert_eq!(opcode::CM_OP_QUERY_PNP, 0x2154);
+        assert_eq!(opcode::CM_OP_QUERY_NETWORK_PLAN, 0x2155);
         assert_eq!(core::mem::size_of::<CmHiveImportRequest>(), 32);
         assert_eq!(core::mem::size_of::<CmHiveKeyRequest>(), 32);
 

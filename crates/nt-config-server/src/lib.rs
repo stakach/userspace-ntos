@@ -15,18 +15,20 @@ use alloc::vec::Vec;
 
 use nt_config_abi::{
     device_property_transfer, driver_service_class, driver_service_transfer, hive_import_transfer,
-    hive_key_transfer, hive_mount, launch_plan_kind, launch_plan_transfer, opcode, pnp_query_kind,
-    pnp_query_transfer, read_utf16, win32_service_plan_kind, win32_service_process_kind,
-    CmDevicePropertyRequest, CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveImportRequest,
-    CmHiveKeyRequest, CmKeyRequest, CmLaunchPlanRequest, CmPnpQueryRequest, CmRawValueRequest,
-    CmReply, CmValueRequest, CM_ABI_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES,
-    CM_DRIVER_SERVICE_CHUNK_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES,
-    CM_DRIVER_SERVICE_SNAPSHOT_MAGIC, CM_DRIVER_SERVICE_SNAPSHOT_VERSION,
-    CM_HIVE_IMPORT_CHUNK_BYTES, CM_HIVE_KEY_CHUNK_BYTES, CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES,
-    CM_HIVE_KEY_SNAPSHOT_MAGIC, CM_HIVE_KEY_SNAPSHOT_VERSION, CM_LAUNCH_PLAN_CHUNK_BYTES,
-    CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES, CM_LAUNCH_PLAN_SNAPSHOT_MAGIC,
-    CM_LAUNCH_PLAN_SNAPSHOT_VERSION, CM_MAX_HIVE_PATH_UNITS, CM_MAX_INSTANCE_UNITS,
-    CM_MAX_PNP_AUX_BYTES, CM_MAX_SERVICE_UNITS, CM_OPTIONAL_BLOB_ABSENT, CM_OPTIONAL_STRING_ABSENT,
+    hive_key_transfer, hive_mount, launch_plan_kind, launch_plan_transfer, network_plan_kind,
+    opcode, pnp_query_kind, pnp_query_transfer, read_utf16, win32_service_plan_kind,
+    win32_service_process_kind, CmDevicePropertyRequest, CmDriverServiceRequest,
+    CmEnumerateKeyRequest, CmHiveImportRequest, CmHiveKeyRequest, CmKeyRequest,
+    CmLaunchPlanRequest, CmPnpQueryRequest, CmRawValueRequest, CmReply, CmValueRequest,
+    CM_ABI_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_DRIVER_SERVICE_CHUNK_BYTES,
+    CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_MAGIC,
+    CM_DRIVER_SERVICE_SNAPSHOT_VERSION, CM_HIVE_IMPORT_CHUNK_BYTES, CM_HIVE_KEY_CHUNK_BYTES,
+    CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES, CM_HIVE_KEY_SNAPSHOT_MAGIC, CM_HIVE_KEY_SNAPSHOT_VERSION,
+    CM_LAUNCH_PLAN_CHUNK_BYTES, CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES,
+    CM_LAUNCH_PLAN_SNAPSHOT_MAGIC, CM_LAUNCH_PLAN_SNAPSHOT_VERSION, CM_MAX_HIVE_PATH_UNITS,
+    CM_MAX_INSTANCE_UNITS, CM_MAX_PNP_AUX_BYTES, CM_MAX_SERVICE_UNITS,
+    CM_NETWORK_PLAN_SNAPSHOT_HEADER_BYTES, CM_NETWORK_PLAN_SNAPSHOT_MAGIC,
+    CM_NETWORK_PLAN_SNAPSHOT_VERSION, CM_OPTIONAL_BLOB_ABSENT, CM_OPTIONAL_STRING_ABSENT,
     CM_OPTIONAL_U32_ABSENT, CM_PNP_QUERY_SNAPSHOT_HEADER_BYTES, CM_PNP_QUERY_SNAPSHOT_MAGIC,
     CM_PNP_QUERY_SNAPSHOT_VERSION, CM_WIN32_SERVICE_PLAN_SNAPSHOT_HEADER_BYTES,
     CM_WIN32_SERVICE_PLAN_SNAPSHOT_MAGIC, CM_WIN32_SERVICE_PLAN_SNAPSHOT_VERSION,
@@ -36,7 +38,10 @@ use nt_config_manager::{
     RegistryValueType, Win32ServiceProcessKind, Win32ServiceProcessLaunch, SERVICE_BOOT_START,
     SERVICE_DEMAND_START, SERVICE_SYSTEM_START,
 };
-use nt_hive_core::{decode_image, CurrentControlSet, Hive, HiveKind};
+use nt_hive_core::{
+    collect_reactos_network_adapter_bindings, decode_image, CurrentControlSet, Hive, HiveKind,
+    ReactOsNetworkAdapterBinding,
+};
 
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
@@ -339,6 +344,36 @@ fn encode_pnp_query_snapshot(
     Some(out)
 }
 
+fn encode_network_adapter_plan(
+    generation: u64,
+    plan_kind: u16,
+    adapters: &[ReactOsNetworkAdapterBinding],
+) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    push_u32(&mut out, CM_NETWORK_PLAN_SNAPSHOT_MAGIC);
+    push_u16(&mut out, CM_NETWORK_PLAN_SNAPSHOT_VERSION);
+    push_u16(&mut out, plan_kind);
+    out.extend_from_slice(&generation.to_le_bytes());
+    push_u32(&mut out, u32::try_from(adapters.len()).ok()?);
+    push_u32(&mut out, 0);
+    debug_assert_eq!(out.len(), CM_NETWORK_PLAN_SNAPSHOT_HEADER_BYTES);
+    for adapter in adapters {
+        for value in [
+            &adapter.instance_id,
+            &adapter.class_key_path,
+            &adapter.linkage_key_path,
+            &adapter.interface_name,
+            &adapter.device_name,
+            &adapter.tcpip_export_name,
+            &adapter.driver_desc,
+            &adapter.component_id,
+        ] {
+            push_string(&mut out, value)?;
+        }
+    }
+    Some(out)
+}
+
 struct DevicePropertySnapshot {
     token: u64,
     instance: String,
@@ -384,6 +419,13 @@ struct Win32ServiceLaunchPlanSnapshot {
     offset: usize,
 }
 
+struct NetworkAdapterPlanSnapshot {
+    token: u64,
+    plan_kind: u16,
+    value: Vec<u8>,
+    offset: usize,
+}
+
 struct PnpQuerySnapshot {
     token: u64,
     query_kind: u16,
@@ -418,6 +460,8 @@ pub struct CmServer {
     next_win32_service_launch_plan_token: u64,
     pnp_query_snapshot: Option<PnpQuerySnapshot>,
     next_pnp_query_token: u64,
+    network_adapter_plan_snapshot: Option<NetworkAdapterPlanSnapshot>,
+    next_network_adapter_plan_token: u64,
 }
 
 impl Default for CmServer {
@@ -445,6 +489,8 @@ impl CmServer {
             next_win32_service_launch_plan_token: 1,
             pnp_query_snapshot: None,
             next_pnp_query_token: 1,
+            network_adapter_plan_snapshot: None,
+            next_network_adapter_plan_token: 1,
         }
     }
 
@@ -467,6 +513,8 @@ impl CmServer {
             next_win32_service_launch_plan_token: 1,
             pnp_query_snapshot: None,
             next_pnp_query_token: 1,
+            network_adapter_plan_snapshot: None,
+            next_network_adapter_plan_token: 1,
         }
     }
 
@@ -501,6 +549,7 @@ impl CmServer {
                 self.op_query_win32_service_plan(in_buf, out_buf)
             }
             opcode::CM_OP_QUERY_PNP => self.op_query_pnp(in_buf, out_buf),
+            opcode::CM_OP_QUERY_NETWORK_PLAN => self.op_query_network_plan(in_buf, out_buf),
             _ => reply(STATUS_INVALID_SYSTEM_SERVICE, 0),
         }
     }
@@ -1393,6 +1442,111 @@ impl CmServer {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
                 self.win32_service_launch_plan_snapshot = None;
+                reply(STATUS_SUCCESS, 0)
+            }
+            _ => reply(STATUS_INVALID_PARAMETER, 0),
+        }
+    }
+
+    fn op_query_network_plan(&mut self, buf: &[u8], out_buf: &mut [u8]) -> CmReply {
+        let Some(req) = CmLaunchPlanRequest::from_bytes(buf) else {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        };
+        let header_size = core::mem::size_of::<CmLaunchPlanRequest>();
+        if req.abi_size as usize != header_size
+            || req.abi_version != CM_ABI_VERSION
+            || buf.len() != header_size
+            || req.chunk_capacity as usize > CM_LAUNCH_PLAN_CHUNK_BYTES
+            || req.chunk_capacity as usize > out_buf.len()
+            || req.plan_kind != network_plan_kind::ADAPTER_BINDINGS
+        {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        }
+
+        match req.operation {
+            launch_plan_transfer::BEGIN => {
+                if req.transfer_token != 0 || req.value_offset != 0 || req.chunk_capacity == 0 {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let Some(generation) = self.system_hive.as_ref().map(|mounted| mounted.generation)
+                else {
+                    return reply(STATUS_DEVICE_NOT_READY, 0);
+                };
+                self.cm.refresh_registry_devnodes();
+                let adapters = collect_reactos_network_adapter_bindings(&self.cm);
+                let Some(value) = encode_network_adapter_plan(
+                    generation,
+                    network_plan_kind::ADAPTER_BINDINGS,
+                    &adapters,
+                ) else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                };
+                let needed = value.len();
+                let written = core::cmp::min(needed, req.chunk_capacity as usize);
+                out_buf[..written].copy_from_slice(&value[..written]);
+                self.network_adapter_plan_snapshot = None;
+                if written == needed {
+                    return reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, 0);
+                }
+                let token = self.next_network_adapter_plan_token;
+                let Some(next_token) = token.checked_add(1) else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                };
+                if token == 0 {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                }
+                self.next_network_adapter_plan_token = next_token;
+                self.network_adapter_plan_snapshot = Some(NetworkAdapterPlanSnapshot {
+                    token,
+                    plan_kind: req.plan_kind,
+                    value,
+                    offset: written,
+                });
+                reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, token)
+            }
+            launch_plan_transfer::PULL => {
+                if req.transfer_token == 0 || req.chunk_capacity == 0 {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let Some(snapshot) = self.network_adapter_plan_snapshot.as_mut() else {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                };
+                if snapshot.token != req.transfer_token
+                    || snapshot.plan_kind != req.plan_kind
+                    || snapshot.offset != req.value_offset as usize
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let needed = snapshot.value.len();
+                let written = core::cmp::min(needed - snapshot.offset, req.chunk_capacity as usize);
+                let end = snapshot.offset + written;
+                out_buf[..written].copy_from_slice(&snapshot.value[snapshot.offset..end]);
+                snapshot.offset = end;
+                if end == needed {
+                    self.network_adapter_plan_snapshot = None;
+                }
+                reply_with_info(
+                    STATUS_SUCCESS,
+                    written as u32,
+                    needed as u64,
+                    req.transfer_token,
+                )
+            }
+            launch_plan_transfer::ABORT => {
+                if req.transfer_token == 0
+                    || req.value_offset != 0
+                    || req.chunk_capacity != 0
+                    || self
+                        .network_adapter_plan_snapshot
+                        .as_ref()
+                        .is_none_or(|snapshot| {
+                            snapshot.token != req.transfer_token
+                                || snapshot.plan_kind != req.plan_kind
+                        })
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                self.network_adapter_plan_snapshot = None;
                 reply(STATUS_SUCCESS, 0)
             }
             _ => reply(STATUS_INVALID_PARAMETER, 0),

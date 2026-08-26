@@ -15,18 +15,20 @@ use alloc::vec::Vec;
 
 use nt_config_abi::{
     device_property_transfer, driver_service_class, driver_service_transfer, hive_import_transfer,
-    hive_key_transfer, hive_mount, launch_plan_kind, launch_plan_transfer, opcode, pnp_query_kind,
-    pnp_query_transfer, win32_service_plan_kind, win32_service_process_kind,
-    CmDevicePropertyRequest, CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveImportRequest,
-    CmHiveKeyRequest, CmKeyRequest, CmLaunchPlanRequest, CmPnpQueryRequest, CmRawValueRequest,
-    CmReply, CmValueRequest, CM_ABI_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES,
-    CM_DRIVER_SERVICE_CHUNK_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES,
-    CM_DRIVER_SERVICE_SNAPSHOT_MAGIC, CM_DRIVER_SERVICE_SNAPSHOT_VERSION,
-    CM_HIVE_IMPORT_CHUNK_BYTES, CM_HIVE_KEY_CHUNK_BYTES, CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES,
-    CM_HIVE_KEY_SNAPSHOT_MAGIC, CM_HIVE_KEY_SNAPSHOT_VERSION, CM_LAUNCH_PLAN_CHUNK_BYTES,
-    CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES, CM_LAUNCH_PLAN_SNAPSHOT_MAGIC,
-    CM_LAUNCH_PLAN_SNAPSHOT_VERSION, CM_MAX_HIVE_PATH_UNITS, CM_MAX_INSTANCE_UNITS,
-    CM_MAX_PNP_AUX_BYTES, CM_MAX_SERVICE_UNITS, CM_OPTIONAL_BLOB_ABSENT, CM_OPTIONAL_STRING_ABSENT,
+    hive_key_transfer, hive_mount, launch_plan_kind, launch_plan_transfer, network_plan_kind,
+    opcode, pnp_query_kind, pnp_query_transfer, win32_service_plan_kind,
+    win32_service_process_kind, CmDevicePropertyRequest, CmDriverServiceRequest,
+    CmEnumerateKeyRequest, CmHiveImportRequest, CmHiveKeyRequest, CmKeyRequest,
+    CmLaunchPlanRequest, CmPnpQueryRequest, CmRawValueRequest, CmReply, CmValueRequest,
+    CM_ABI_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_DRIVER_SERVICE_CHUNK_BYTES,
+    CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_MAGIC,
+    CM_DRIVER_SERVICE_SNAPSHOT_VERSION, CM_HIVE_IMPORT_CHUNK_BYTES, CM_HIVE_KEY_CHUNK_BYTES,
+    CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES, CM_HIVE_KEY_SNAPSHOT_MAGIC, CM_HIVE_KEY_SNAPSHOT_VERSION,
+    CM_LAUNCH_PLAN_CHUNK_BYTES, CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES,
+    CM_LAUNCH_PLAN_SNAPSHOT_MAGIC, CM_LAUNCH_PLAN_SNAPSHOT_VERSION, CM_MAX_HIVE_PATH_UNITS,
+    CM_MAX_INSTANCE_UNITS, CM_MAX_PNP_AUX_BYTES, CM_MAX_SERVICE_UNITS,
+    CM_NETWORK_PLAN_SNAPSHOT_HEADER_BYTES, CM_NETWORK_PLAN_SNAPSHOT_MAGIC,
+    CM_NETWORK_PLAN_SNAPSHOT_VERSION, CM_OPTIONAL_BLOB_ABSENT, CM_OPTIONAL_STRING_ABSENT,
     CM_OPTIONAL_U32_ABSENT, CM_PNP_QUERY_SNAPSHOT_HEADER_BYTES, CM_PNP_QUERY_SNAPSHOT_MAGIC,
     CM_PNP_QUERY_SNAPSHOT_VERSION, CM_WIN32_SERVICE_PLAN_SNAPSHOT_HEADER_BYTES,
     CM_WIN32_SERVICE_PLAN_SNAPSHOT_MAGIC, CM_WIN32_SERVICE_PLAN_SNAPSHOT_VERSION,
@@ -117,6 +119,24 @@ pub struct PnpQuerySnapshot {
     pub query_kind: u16,
     pub strings: Vec<String>,
     pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetworkAdapterBinding {
+    pub instance_id: String,
+    pub class_key_path: String,
+    pub linkage_key_path: String,
+    pub interface_name: String,
+    pub device_name: String,
+    pub tcpip_export_name: String,
+    pub driver_desc: String,
+    pub component_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetworkAdapterPlanSnapshot {
+    pub mount_generation: u64,
+    pub adapters: Vec<NetworkAdapterBinding>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -475,6 +495,45 @@ fn decode_pnp_query_snapshot(bytes: &[u8]) -> Option<PnpQuerySnapshot> {
         query_kind,
         strings,
         payload,
+    })
+}
+
+fn decode_network_adapter_plan(bytes: &[u8]) -> Option<NetworkAdapterPlanSnapshot> {
+    if bytes.len() < CM_NETWORK_PLAN_SNAPSHOT_HEADER_BYTES {
+        return None;
+    }
+    let mut reader = SnapshotReader::new(bytes);
+    if reader.u32()? != CM_NETWORK_PLAN_SNAPSHOT_MAGIC
+        || reader.u16()? != CM_NETWORK_PLAN_SNAPSHOT_VERSION
+        || reader.u16()? != network_plan_kind::ADAPTER_BINDINGS
+    {
+        return None;
+    }
+    let mount_generation = reader.u64()?;
+    if mount_generation == 0 {
+        return None;
+    }
+    let adapter_count = usize::try_from(reader.u32()?).ok()?;
+    if reader.u32()? != 0 {
+        return None;
+    }
+    let mut adapters = Vec::new();
+    adapters.try_reserve_exact(adapter_count).ok()?;
+    for _ in 0..adapter_count {
+        adapters.push(NetworkAdapterBinding {
+            instance_id: reader.string()?,
+            class_key_path: reader.string()?,
+            linkage_key_path: reader.string()?,
+            interface_name: reader.string()?,
+            device_name: reader.string()?,
+            tcpip_export_name: reader.string()?,
+            driver_desc: reader.string()?,
+            component_id: reader.string()?,
+        });
+    }
+    reader.finished().then_some(NetworkAdapterPlanSnapshot {
+        mount_generation,
+        adapters,
     })
 }
 
@@ -973,6 +1032,15 @@ impl<B: Backend> ConfigClient<B> {
             CM_WIN32_SERVICE_PLAN_SNAPSHOT_HEADER_BYTES,
         )?;
         decode_win32_service_launch_plan(&value).ok_or(STATUS_INVALID_PARAMETER)
+    }
+
+    pub fn query_network_adapter_plan(&mut self) -> Result<NetworkAdapterPlanSnapshot, i32> {
+        let value = self.query_launch_plan_bytes(
+            opcode::CM_OP_QUERY_NETWORK_PLAN,
+            network_plan_kind::ADAPTER_BINDINGS,
+            CM_NETWORK_PLAN_SNAPSHOT_HEADER_BYTES,
+        )?;
+        decode_network_adapter_plan(&value).ok_or(STATUS_INVALID_PARAMETER)
     }
 
     pub fn query_pnp(
@@ -1719,6 +1787,14 @@ mod tests {
                     "Base"
                 }),
             ));
+            if name == "BootDevice" {
+                assert!(hive.set_value(
+                    service,
+                    "ClassGUID",
+                    nt_hive_core::RegistryValueType::Sz,
+                    encode_sz("{4d36e972-e325-11ce-bfc1-08002be10318}"),
+                ));
+            }
         }
         for (instance, service) in [
             (r"ROOT\BOOTDEV\0000", "BootDevice"),
@@ -1730,6 +1806,24 @@ mod tests {
                 "Service",
                 nt_hive_core::RegistryValueType::Sz,
                 encode_sz(service),
+            ));
+            if service == "BootDevice" {
+                assert!(hive.set_value(
+                    devnode,
+                    "Driver",
+                    nt_hive_core::RegistryValueType::Sz,
+                    encode_sz(r"{4d36e972-e325-11ce-bfc1-08002be10318}\0001"),
+                ));
+            }
+        }
+        let net_class = hive
+            .create_key(r"ControlSet001\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}\0001");
+        for (name, value) in [("NetCfgInstanceId", "NIC_BOOT"), ("DriverDesc", "Boot NIC")] {
+            assert!(hive.set_value(
+                net_class,
+                name,
+                nt_hive_core::RegistryValueType::Sz,
+                encode_sz(value),
             ));
         }
         for (name, image, service_type, start) in [
@@ -1887,6 +1981,15 @@ mod tests {
             )
             .expect("enabled interface links");
         assert_eq!(interfaces.strings, vec![expected_link]);
+        let network = client
+            .query_network_adapter_plan()
+            .expect("network adapter plan");
+        assert_eq!(network.mount_generation, 1);
+        assert_eq!(network.adapters.len(), 1);
+        assert_eq!(network.adapters[0].instance_id, r"ROOT\BOOTDEV\0000");
+        assert_eq!(network.adapters[0].interface_name, "NIC_BOOT");
+        assert_eq!(network.adapters[0].device_name, r"\Device\NIC_BOOT");
+        assert_eq!(network.adapters[0].driver_desc, "Boot NIC");
     }
 
     #[test]

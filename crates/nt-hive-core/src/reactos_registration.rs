@@ -1106,15 +1106,15 @@ pub fn seed_reactos_network_setup_into_target<T: ReactOsSetupSeedTarget>(
 }
 
 #[derive(Clone, Debug)]
-struct ReactOsNetworkAdapterBinding {
-    instance_id: String,
-    class_key_path: String,
-    linkage_key_path: String,
-    interface_name: String,
-    device_name: String,
-    tcpip_export_name: String,
-    driver_desc: String,
-    component_id: String,
+pub struct ReactOsNetworkAdapterBinding {
+    pub instance_id: String,
+    pub class_key_path: String,
+    pub linkage_key_path: String,
+    pub interface_name: String,
+    pub device_name: String,
+    pub tcpip_export_name: String,
+    pub driver_desc: String,
+    pub component_id: String,
 }
 
 fn driver_key_is_net_class(driver_key: &str) -> bool {
@@ -1227,7 +1227,7 @@ fn network_driver_desc_for_binding(
         .unwrap_or_else(|| service.name.clone())
 }
 
-fn collect_reactos_network_adapter_bindings(
+pub fn collect_reactos_network_adapter_bindings(
     cm: &nt_config_manager::ConfigManager,
 ) -> Vec<ReactOsNetworkAdapterBinding> {
     let mut bindings = cm.boot_system_pnp_driver_bindings();
@@ -1303,7 +1303,7 @@ fn adapter_protocol_tcpip_parameters_path(interface_name: &str) -> String {
     )
 }
 
-fn seed_reactos_network_bindings_into_target<T: ReactOsSetupSeedTarget>(
+pub fn seed_reactos_network_adapter_bindings_into_target<T: ReactOsSetupSeedTarget>(
     target: &mut T,
     adapters: &[ReactOsNetworkAdapterBinding],
     stats: &mut ReactOsNetworkSetupSeedStats,
@@ -1476,7 +1476,7 @@ pub fn seed_reactos_network_bindings_from_config_manager_into_target<T: ReactOsS
     stats: &mut ReactOsNetworkSetupSeedStats,
 ) {
     let adapters = collect_reactos_network_adapter_bindings(cm);
-    seed_reactos_network_bindings_into_target(target, &adapters, stats);
+    seed_reactos_network_adapter_bindings_into_target(target, &adapters, stats);
 }
 
 /// Seed TCPIP/linkage/interface registry state from an already enumerated set of PnP driver
@@ -1494,7 +1494,7 @@ pub fn seed_reactos_network_bindings_from_pnp_driver_bindings_into_target<
     I: IntoIterator<Item = nt_config_manager::PnpDriverBinding>,
 {
     let adapters = collect_reactos_network_adapter_bindings_from_pnp_driver_bindings(cm, bindings);
-    seed_reactos_network_bindings_into_target(target, &adapters, stats);
+    seed_reactos_network_adapter_bindings_into_target(target, &adapters, stats);
 }
 
 pub fn seed_reactos_print_setup_into_target<T: ReactOsSetupSeedTarget>(
@@ -1666,7 +1666,7 @@ pub fn seed_reactos_network_setup_in_config_manager(
     let mut stats =
         seed_reactos_network_setup_into_target(&mut ConfigManagerSetupSeedTarget { cm });
     let adapters = collect_reactos_network_adapter_bindings(cm);
-    seed_reactos_network_bindings_into_target(
+    seed_reactos_network_adapter_bindings_into_target(
         &mut ConfigManagerSetupSeedTarget { cm },
         &adapters,
         &mut stats,

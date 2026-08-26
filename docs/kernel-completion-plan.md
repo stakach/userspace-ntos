@@ -12986,3 +12986,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     carries the resolved interface name, device/export names, class/linkage paths, description,
     component id, and instance id. Consume that plan in the setup target, then delete
     `boot_system_config_manager` and `BOOT_SYSTEM_HIVE_IMAGE_BYTES` before desktop acceptance.
+
+    Live CM network-adapter plan and decoder deletion (2026-08-26, implementation green): the
+    existing multi-NIC ReactOS registration resolver is now an explicit hive-core primitive. It
+    runs beside CM's refreshed semantic device/service/class/linkage state and publishes an
+    immutable generation-bearing adapter plan containing instance id, class/linkage key paths,
+    resolved interface identity, device and TCPIP export names, description, and component id.
+    The executive journals those resolved records into its mutable SYSTEM setup target without
+    reconstructing a semantic manager.
+
+    `boot_system_config_manager`, every direct semantic import from the encoded boot image, and the
+    `BOOT_SYSTEM_HIVE_IMAGE_BYTES` marker are deleted. The encoded image is now only the atomic
+    handoff into isolated CM and the one-time source for the executive's mutable SYSTEM mount; it is
+    never re-decoded for discovery or selection. Hive-core `76/76`, server `9/9`, client `14/14`,
+    and the freestanding executive release check are green at the 212-warning baseline. The client
+    test proves a real registry-declared network adapter resolves across the plan boundary.
+
+    Review adjustment: the CM read-ownership cut is complete in implementation. Run serialized
+    desktop acceptance and require generation-1 SYSTEM mount, registry-selected PnP terminal
+    success, network setup, genuine userinit/Explorer, shell chrome framebuffer proof, all executive
+    gates, and the sentinel. After acceptance, consolidate the repeated immutable-plan snapshot-bank
+    server mechanics, then begin CM-owned SYSTEM mutation leases/journalling and route win32k's
+    component-local registry calls through an explicit CM transport.
