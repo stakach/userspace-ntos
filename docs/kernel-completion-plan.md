@@ -12543,7 +12543,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     scheduler-quiescent transactional unload remain explicit later prerequisites before accepting a
     worker-completing driver or lifecycle removal.
 
-    Live semantic driver-binding checkpoint (2026-08-26, implementation green): Configuration
+    Live semantic driver-binding checkpoint (2026-08-26, accepted): Configuration
     Manager now resolves one registry-live driver launch specification together with every current
     service-bound devnode. Before selection it refreshes the complete Enum-derived semantic index,
     preserves stable IDs/property bags for surviving instances, replaces changed Service/PdoName/
@@ -12565,8 +12565,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     barrier, and replyless PnP ownership are unchanged. The freestanding executive check remains
     green at the established 212-warning baseline and `git diff --check` is clean.
 
-    Review adjustment: keep this checkpoint provisional until a serialized desktop run proves that
-    the enlarged CM protocol and new native lookup do not regress boot. Then converge native mounted
+    Serialized desktop proof `.tmp/run-desktop-live-cm-binding-20260826.log` selects, attempts, and
+    starts all five configured PnP devices, observes both genuine asynchronous START completions,
+    leaves zero failed, pending, or indeterminate starts, and keeps every generic PnP/provider gate
+    green. Genuine `userinit.exe` and Explorer reach the shell; Explorer paints all `480000/480000`
+    pixels of the miniport-selected `800x600` framebuffer with at least 32 non-background colours.
+    All `296/296` executive checks pass and the QEMU sentinel fires.
+
+    Review adjustment: the semantic live-binding checkpoint is closed. Next converge native mounted
     SYSTEM Services/Enum mutations with the CM-owned registry without dual-write, and add typed
     historical seed versus live devnode publication/change generations before wiring runtime device
     action.
