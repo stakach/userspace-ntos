@@ -11863,9 +11863,9 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Do not enable live raw-address reuse merely because the registry token generation changed.
 
     Executive thunk reservation checkpoint (2026-08-26, implementation green): each hosted driver
-    instance now carries the tested generation-bearing registry for the dynamic suffix of its thunk
-    page; load-time IAT slots remain an immutable prefix. Provider import, internal-provider import,
-    and reverse-callback emission reserve an exact-owner key before planning or encoding. Existing
+    instance now has a tested generation-bearing registry for the dynamic suffix of its thunk page;
+    load-time IAT slots remain an immutable prefix. Provider import, internal-provider import, and
+    reverse-callback emission reserve an exact-owner key before planning or encoding. Existing
     live keys return the established code address, while planning, callback-row allocation, and
     encoding failures abort the unpublished reservation and leave the slot reusable with a fresh
     generation. Final `register_instance` preserves reservations created by real provider calls made
@@ -11886,3 +11886,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     compensating unregister/cancel operation before moving those live slots through `Retiring` to
     `Free`. Broad callback-row tombstoning may reject stale dispatch, but it is not quiescence proof
     and must not authorize raw-address reuse.
+
+    Executive thunk-ledger stack correction (2026-08-26, implementation green; serialized proof
+    pending): the first desktop run after generation-safe thunk wiring reached real E1000
+    `AddDevice` and `START_DEVICE`, then faulted the executive root task on the guard page at the
+    compiler stack probe for `spawn_hosts::component_pump_loop`. Symbolization and disassembly show
+    this was not a rust-micro fault-owner mismatch: embedding the fixed thunk-slot ledger inside the
+    copyable `DriverInstance` routing snapshot inflated each re-entrant pump frame to `0x9ad8`
+    bytes.
+
+    The slot registries now live in a separate instance-indexed lifetime store. `DriverInstance`
+    remains a small copyable snapshot, dynamic slots survive the transport-to-final registration
+    transition without copying their ledger, and reserve/commit/abort access the one canonical
+    registry for the instance. Instance teardown now fails closed while any slot is reserved, live,
+    or retiring, so clearing a domain cannot discard a still-published raw callback address. The
+    rebuilt `component_pump_loop` frame is `0x1868` bytes; `register_instance_transport`,
+    `reserve_instance_executable_thunk`, and `clear_instance` remain small frames as well. Focused
+    `nt-hosted-runtime` validation is green at `61/61`, the freestanding executive check remains at
+    the established 212-warning baseline, formatting and diff checks are clean, and the release ELF
+    links successfully.
+
+    Review adjustment: rerun the serialized desktop proof before accepting the executive thunk
+    checkpoint. If green, continue with callback-parented timer/work-item/characteristics/mirror
+    construction and real compensating unregister/cancel operations. Keep the independent
+    architecture-owned per-CPU `{TcbId, lifecycle_generation}` entry token and device-frame cache
+    policy work open; this stack fault does not close either rust-micro item.

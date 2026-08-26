@@ -16150,8 +16150,12 @@ unsafe fn instance_executable_thunk_available(instance_index: usize) -> u64 {
     }
     let slots = inst.thunk_len / HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN;
     let dynamic_slots = slots.saturating_sub(inst.thunk_next);
-    inst.thunk_slots
-        .available_with_limit(dynamic_slots.min(usize::MAX as u64) as usize) as u64
+    driver_instance_thunk_slots()
+        .and_then(|registries| registries.get(instance_index))
+        .map(|registry| {
+            registry.available_with_limit(dynamic_slots.min(usize::MAX as u64) as usize) as u64
+        })
+        .unwrap_or(0)
 }
 
 fn hosted_provider_domain_dependency_is_live(dependency: HostedProviderDomainDependency) -> bool {
@@ -37137,7 +37141,6 @@ pub(crate) struct DriverInstance {
     pub exec_thunk_va: u64,
     pub run_thunk_va: u64,
     pub thunk_len: u64,
-    thunk_slots: HostedThunkSlotRegistry<HOSTED_EXECUTABLE_THUNK_SLOT_COUNT>,
     pub thunk_next: u64,
     pub tcb: u64,
     pub cnode: u64,
@@ -37175,7 +37178,6 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     exec_thunk_va: 0,
     run_thunk_va: 0,
     thunk_len: 0,
-    thunk_slots: HostedThunkSlotRegistry::new(),
     thunk_next: 0,
     tcb: 0,
     cnode: 0,
@@ -37197,6 +37199,13 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
 
 /// The live-driver instance table (indexed by [`DriverComponent::instance`]).
 static mut DRIVER_INSTANCES: Option<Vec<DriverInstance>> = None;
+
+/// Dynamic executable-thunk ownership is deliberately kept out of [`DriverInstance`]. That type is
+/// a small, copyable routing snapshot used throughout nested provider dispatch; embedding the fixed
+/// slot ledger there makes every snapshot copy the entire thunk arena's lifetime state onto the
+/// root-task stack.
+static mut DRIVER_INSTANCE_THUNK_SLOTS:
+    Option<Vec<HostedThunkSlotRegistry<HOSTED_EXECUTABLE_THUNK_SLOT_COUNT>>> = None;
 
 #[derive(Clone, Copy)]
 struct ActiveHostedIrpTransfer {
@@ -37337,6 +37346,41 @@ unsafe fn driver_instances_mut() -> &'static mut Vec<DriverInstance> {
 
 unsafe fn driver_instances() -> Option<&'static Vec<DriverInstance>> {
     (*core::ptr::addr_of!(DRIVER_INSTANCES)).as_ref()
+}
+
+unsafe fn driver_instance_thunk_slots_mut(
+) -> &'static mut Vec<HostedThunkSlotRegistry<HOSTED_EXECUTABLE_THUNK_SLOT_COUNT>> {
+    let slot = &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCE_THUNK_SLOTS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn driver_instance_thunk_slots(
+) -> Option<&'static Vec<HostedThunkSlotRegistry<HOSTED_EXECUTABLE_THUNK_SLOT_COUNT>>> {
+    (*core::ptr::addr_of!(DRIVER_INSTANCE_THUNK_SLOTS)).as_ref()
+}
+
+unsafe fn ensure_driver_instance_thunk_slots(
+    instance: usize,
+) -> &'static mut HostedThunkSlotRegistry<HOSTED_EXECUTABLE_THUNK_SLOT_COUNT> {
+    let registries = driver_instance_thunk_slots_mut();
+    while registries.len() <= instance {
+        registries.push(HostedThunkSlotRegistry::new());
+    }
+    &mut registries[instance]
+}
+
+unsafe fn driver_instance_thunk_slots_are_free(instance: usize) -> bool {
+    driver_instance_thunk_slots()
+        .and_then(|registries| registries.get(instance))
+        .is_none_or(|registry| {
+            registry
+                .slots()
+                .iter()
+                .all(|slot| slot.state == nt_hosted_runtime::HostedThunkSlotState::Free)
+        })
 }
 
 fn hosted_driver_thread_first_handle(instance: usize) -> u64 {
@@ -37853,6 +37897,9 @@ fn register_instance_transport(i: usize, inst: DriverInstance) {
         driver_id,
         ..inst
     };
+    unsafe {
+        ensure_driver_instance_thunk_slots(i);
+    }
 }
 
 fn register_instance(dc: &DriverComponent) {
@@ -37861,7 +37908,6 @@ fn register_instance(dc: &DriverComponent) {
     while t.len() <= dc.instance {
         t.push(EMPTY_INSTANCE);
     }
-    let thunk_slots = t[dc.instance].thunk_slots;
     t[dc.instance] = DriverInstance {
         fault_ep: dc.fault_ep,
         pml4: dc.pml4,
@@ -37880,7 +37926,6 @@ fn register_instance(dc: &DriverComponent) {
         exec_thunk_va: dc.exec_thunk_va,
         run_thunk_va: dc.run_thunk_va,
         thunk_len: dc.thunk_len,
-        thunk_slots,
         thunk_next: dc.thunk_next,
         tcb: dc.tcb,
         cnode: dc.cnode,
@@ -37915,11 +37960,10 @@ struct HostedExecutableThunkReservation {
 }
 
 unsafe fn reserve_instance_executable_thunk(
-    instance: usize,
+    instance_index: usize,
     key: HostedThunkSlotKey,
 ) -> Result<HostedExecutableThunkReservation, i32> {
-    let table = driver_instances_mut();
-    let Some(inst) = table.get_mut(instance) else {
+    let Some(inst) = instance(instance_index) else {
         return Err(STATUS_DEVICE_NOT_READY);
     };
     if !inst.used || inst.exec_thunk_va == 0 || inst.run_thunk_va == 0 || inst.thunk_len == 0 {
@@ -37929,8 +37973,8 @@ unsafe fn reserve_instance_executable_thunk(
     let dynamic_slots = total_slots
         .checked_sub(inst.thunk_next)
         .ok_or(STATUS_INVALID_PARAMETER)?;
-    let reservation = inst
-        .thunk_slots
+    let registry = ensure_driver_instance_thunk_slots(instance_index);
+    let reservation = registry
         .reserve_with_limit(
             key,
             dynamic_slots.min(HOSTED_EXECUTABLE_THUNK_SLOT_COUNT as u64) as usize,
@@ -37952,19 +37996,19 @@ unsafe fn reserve_instance_executable_thunk(
         .ok_or(STATUS_INVALID_PARAMETER)?;
     if thunk_end > inst.thunk_len {
         if !existing {
-            let _ = inst.thunk_slots.abort(token, key);
+            let _ = registry.abort(token, key);
         }
         return Err(STATUS_INVALID_PARAMETER);
     }
     let Some(exec_va) = inst.exec_thunk_va.checked_add(thunk_offset) else {
         if !existing {
-            let _ = inst.thunk_slots.abort(token, key);
+            let _ = registry.abort(token, key);
         }
         return Err(STATUS_INVALID_PARAMETER);
     };
     let Some(run_va) = inst.run_thunk_va.checked_add(thunk_offset) else {
         if !existing {
-            let _ = inst.thunk_slots.abort(token, key);
+            let _ = registry.abort(token, key);
         }
         return Err(STATUS_INVALID_PARAMETER);
     };
@@ -37983,29 +38027,29 @@ unsafe fn commit_instance_executable_thunk(
     reservation: HostedExecutableThunkReservation,
 ) -> bool {
     if reservation.existing {
-        return instance(instance_index).is_some_and(|inst| {
-            inst.thunk_slots
-                .is_live(reservation.token, reservation.key)
-        });
+        return instance(instance_index).is_some()
+            && driver_instance_thunk_slots()
+                .and_then(|registries| registries.get(instance_index))
+                .is_some_and(|registry| {
+                    registry.is_live(reservation.token, reservation.key)
+                });
     }
-    driver_instances_mut()
-        .get_mut(instance_index)
-        .is_some_and(|inst| {
-            inst.thunk_slots
-                .commit(reservation.token, reservation.key)
-                .is_ok()
-        })
+    instance(instance_index).is_some()
+        && ensure_driver_instance_thunk_slots(instance_index)
+            .commit(reservation.token, reservation.key)
+            .is_ok()
 }
 
 unsafe fn abort_instance_executable_thunk(
-    instance: usize,
+    instance_index: usize,
     reservation: HostedExecutableThunkReservation,
 ) {
     if reservation.existing {
         return;
     }
-    if let Some(inst) = driver_instances_mut().get_mut(instance) {
-        let _ = inst.thunk_slots.abort(reservation.token, reservation.key);
+    if instance(instance_index).is_some() {
+        let _ = ensure_driver_instance_thunk_slots(instance_index)
+            .abort(reservation.token, reservation.key);
     }
 }
 
@@ -38127,6 +38171,12 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
                 print_str(b"\n");
             }
         }
+    }
+    if unsafe { !driver_instance_thunk_slots_are_free(i) } {
+        teardown_blocked = true;
+        print_str(b"[driver-launch] executable thunk retirement blocked inst=");
+        print_u64(i as u64);
+        print_str(b" (published or in-progress raw callback address remains)\n");
     }
     let inst = instance(i);
     if let Some(inst) = inst {
