@@ -13656,3 +13656,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     headroom is ample, so do not resize either lane. Continue converting copy-only native query
     encoders to lexical scratch scopes, with persistent caches, async request state, handle tables,
     and completion records explicitly kept durable.
+
+    Synchronous query copyout scopes (2026-08-27, accepted): `NtQueryKey`, the encoding half of
+    `NtEnumerateKey`, and `NtQueryDirectoryObject` now allocate caller-copy strings, record lists,
+    and ABI buffers in lexical scratch scopes. `NtEnumerateKey` deliberately performs its
+    service-order lookup before entering scratch because that lookup may rebuild the persistent
+    service-order cache. The other two paths are non-parking and publish no kernel objects.
+
+    Serialized acceptance `.tmp/run-headless-query-copyout-scopes-20260827.log` passed all
+    `295/295` gates, including Services' named-object directory query, profile/user-hive registry
+    work, genuine userinit and Explorer launch, and a complete 480,000-pixel framebuffer. Scratch
+    returned to zero and its boot peak remained 278,112 B of 4,194,304 B. Review excludes hosted
+    file queries from broad scratch guards: those paths can park, publish pending IRPs, queue APCs,
+    and complete IOCP state. Split their synchronous capture/encode buffers from their publication
+    phase before migrating them.

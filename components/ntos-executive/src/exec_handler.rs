@@ -23399,6 +23399,9 @@ impl ExecNtHandler {
                     );
                     return 0x8000_001A; // STATUS_NO_MORE_ENTRIES
                 };
+                // Service-order enumeration may rebuild its persistent cache above. Everything
+                // below is a synchronous caller-copy encoder and must not survive this dispatch.
+                let _transient = allocator::enter_transient();
                 let class_name = self.registry_subkey_class(key, &name);
                 let name16: alloc::vec::Vec<u16> = name.encode_utf16().collect();
                 let name_bytes = name16.len() * 2;
@@ -23476,6 +23479,7 @@ impl ExecNtHandler {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
+                let _transient = allocator::enter_transient();
                 let use_xas_write = self.pi >= 2;
                 let stats = self.registry_key_stats(key);
                 let output_length = nt_ulong_arg(args[3]) as usize;
@@ -27482,6 +27486,7 @@ impl ExecNtHandler {
                     Ok(index) => index,
                     Err(status) => return status,
                 };
+                let _transient = allocator::enter_transient();
                 // Starting child ordinal: 0 on RestartScan, else the captured Context.
                 let mut start = if restart_scan {
                     0u64
