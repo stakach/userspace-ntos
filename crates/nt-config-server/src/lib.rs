@@ -29,7 +29,7 @@ use nt_config_manager::{
     device_property, ConfigManager, DevicePropertySource, DriverServiceBinding, DriverServiceClass,
     RegistryValueType,
 };
-use nt_hive_core::{decode_image, Hive, HiveKind};
+use nt_hive_core::{decode_image, CurrentControlSet, Hive, HiveKind};
 
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
@@ -116,7 +116,10 @@ fn push_optional_blob(out: &mut Vec<u8>, value: Option<&[u8]>) -> Option<()> {
     }
 }
 
-fn system_hive_relative_path(path: &str) -> Option<String> {
+fn system_hive_relative_path(
+    path: &str,
+    current_control_set: &CurrentControlSet,
+) -> Option<String> {
     let mut components = path.split('\\').filter(|component| !component.is_empty());
     if !components.next()?.eq_ignore_ascii_case("Registry")
         || !components.next()?.eq_ignore_ascii_case("Machine")
@@ -127,7 +130,7 @@ fn system_hive_relative_path(path: &str) -> Option<String> {
     let mut relative = String::new();
     if let Some(first) = components.next() {
         relative.push_str(if first.eq_ignore_ascii_case("CurrentControlSet") {
-            nt_hive_core::CURRENT_CONTROL_SET_TARGET
+            current_control_set.as_str()
         } else {
             first
         });
@@ -139,38 +142,46 @@ fn system_hive_relative_path(path: &str) -> Option<String> {
     Some(relative)
 }
 
-fn config_manager_from_system_hive(hive: &Hive) -> ConfigManager {
+fn config_manager_from_system_hive(
+    hive: &Hive,
+    current_control_set: &CurrentControlSet,
+) -> ConfigManager {
     let mut cm = ConfigManager::new();
     let _ = nt_hive_core::import_control_set_services_into_config_manager(
         hive,
         &mut cm,
-        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+        current_control_set.as_str(),
     );
     let _ = nt_hive_core::import_control_set_service_group_order_into_config_manager(
         hive,
         &mut cm,
-        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+        current_control_set.as_str(),
     );
     let _ = nt_hive_core::import_control_set_enum_into_config_manager(
         hive,
         &mut cm,
-        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+        current_control_set.as_str(),
     );
     let _ = nt_hive_core::import_control_set_class_into_config_manager(
         hive,
         &mut cm,
-        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+        current_control_set.as_str(),
     );
     let _ = nt_hive_core::import_control_set_network_into_config_manager(
         hive,
         &mut cm,
-        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+        current_control_set.as_str(),
     );
     cm
 }
 
-fn encode_hive_key_snapshot(hive: &Hive, mount_generation: u64, path: &str) -> Option<Vec<u8>> {
-    let relative = system_hive_relative_path(path)?;
+fn encode_hive_key_snapshot(
+    hive: &Hive,
+    mount_generation: u64,
+    current_control_set: &CurrentControlSet,
+    path: &str,
+) -> Option<Vec<u8>> {
+    let relative = system_hive_relative_path(path, current_control_set)?;
     let key = hive.open_key(&relative)?;
     let subkey_count = hive.subkey_count(key);
     let value_count = hive.value_count(key);
@@ -266,6 +277,12 @@ struct HiveKeySnapshot {
     offset: usize,
 }
 
+struct MountedSystemHive {
+    hive: Hive,
+    generation: u64,
+    current_control_set: CurrentControlSet,
+}
+
 /// The Configuration Manager service: the registry authority + the wire dispatcher.
 pub struct CmServer {
     cm: ConfigManager,
@@ -273,8 +290,7 @@ pub struct CmServer {
     next_device_property_token: u64,
     driver_service_snapshot: Option<DriverServiceSnapshot>,
     next_driver_service_token: u64,
-    system_hive: Option<Hive>,
-    system_hive_generation: u64,
+    system_hive: Option<MountedSystemHive>,
     hive_imports: Vec<HiveImport>,
     next_hive_import_token: u64,
     hive_key_snapshots: Vec<HiveKeySnapshot>,
@@ -296,7 +312,6 @@ impl CmServer {
             driver_service_snapshot: None,
             next_driver_service_token: 1,
             system_hive: None,
-            system_hive_generation: 0,
             hive_imports: Vec::new(),
             next_hive_import_token: 1,
             hive_key_snapshots: Vec::new(),
@@ -313,7 +328,6 @@ impl CmServer {
             driver_service_snapshot: None,
             next_driver_service_token: 1,
             system_hive: None,
-            system_hive_generation: 0,
             hive_imports: Vec::new(),
             next_hive_import_token: 1,
             hive_key_snapshots: Vec::new(),
@@ -853,13 +867,24 @@ impl CmServer {
                 if hive.kind != HiveKind::System {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
-                let Some(generation) = self.system_hive_generation.checked_add(1) else {
+                let Ok(current_control_set) = hive.current_control_set() else {
+                    return reply(STATUS_REGISTRY_CORRUPT, 0);
+                };
+                let current_generation = self
+                    .system_hive
+                    .as_ref()
+                    .map(|mounted| mounted.generation)
+                    .unwrap_or(0);
+                let Some(generation) = current_generation.checked_add(1) else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
                 };
-                let cm = config_manager_from_system_hive(&hive);
+                let cm = config_manager_from_system_hive(&hive, &current_control_set);
                 self.cm = cm;
-                self.system_hive = Some(hive);
-                self.system_hive_generation = generation;
+                self.system_hive = Some(MountedSystemHive {
+                    hive,
+                    generation,
+                    current_control_set,
+                });
                 self.hive_imports.swap_remove(index);
                 reply_with_info(STATUS_SUCCESS, 0, generation, req.transfer_token)
             }
@@ -922,18 +947,22 @@ impl CmServer {
                 if req.transfer_token != 0 || req.value_offset != 0 || req.chunk_capacity == 0 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
-                let Some(hive) = self.system_hive.as_ref() else {
+                let Some(mounted) = self.system_hive.as_ref() else {
                     return reply(STATUS_DEVICE_NOT_READY, 0);
                 };
-                let Some(relative) = system_hive_relative_path(&path) else {
+                let Some(relative) = system_hive_relative_path(&path, &mounted.current_control_set)
+                else {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 };
-                if hive.open_key(&relative).is_none() {
+                if mounted.hive.open_key(&relative).is_none() {
                     return reply(STATUS_OBJECT_NAME_NOT_FOUND, 0);
                 }
-                let Some(value) =
-                    encode_hive_key_snapshot(hive, self.system_hive_generation, &path)
-                else {
+                let Some(value) = encode_hive_key_snapshot(
+                    &mounted.hive,
+                    mounted.generation,
+                    &mounted.current_control_set,
+                    &path,
+                ) else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
                 };
                 let needed = value.len();
@@ -1205,6 +1234,14 @@ mod tests {
         let token = begin_hive_import(server, image);
         push_hive_import(server, token, image);
         commit_hive_import(server, token, image)
+    }
+
+    fn selected_system_hive(number: u32) -> Hive {
+        let mut hive = Hive::new(HiveKind::System);
+        let select = hive.create_key("Select");
+        hive.set_dword(select, "Current", number);
+        hive.create_key(&alloc::format!("ControlSet{number:03}"));
+        hive
     }
 
     fn server() -> CmServer {
@@ -1554,11 +1591,11 @@ mod tests {
 
     #[test]
     fn hive_import_tokens_are_independent_and_abort_exactly_one_upload() {
-        let mut first = Hive::new(HiveKind::System);
+        let mut first = selected_system_hive(1);
         first.create_key(r"ControlSet001\Services\First");
         first.finish_clean_import();
         let first = encode_image(&first);
-        let mut second = Hive::new(HiveKind::System);
+        let mut second = selected_system_hive(1);
         second.create_key(r"ControlSet001\Services\Second");
         second.finish_clean_import();
         let second = encode_image(&second);
@@ -1587,20 +1624,133 @@ mod tests {
             .system_hive
             .as_ref()
             .unwrap()
+            .hive
             .open_key(r"ControlSet001\Services\First")
             .is_some());
         assert!(server
             .system_hive
             .as_ref()
             .unwrap()
+            .hive
             .open_key(r"ControlSet001\Services\Second")
             .is_none());
     }
 
     #[test]
+    fn mounted_system_hive_uses_its_selected_control_set_for_keys_and_semantics() {
+        let mut hive = selected_system_hive(2);
+        let inactive = hive.create_key(r"ControlSet001\Services\Inactive");
+        hive.set_value(
+            inactive,
+            "ImagePath",
+            RegistryValueType::ExpandSz,
+            encode_sz(r"system32\drivers\inactive.sys"),
+        );
+        hive.set_dword(inactive, "Type", 1);
+        hive.set_dword(inactive, "Start", SERVICE_DEMAND_START);
+        let active = hive.create_key(r"ControlSet002\Services\Active");
+        hive.set_value(
+            active,
+            "ImagePath",
+            RegistryValueType::ExpandSz,
+            encode_sz(r"system32\drivers\active.sys"),
+        );
+        hive.set_dword(active, "Type", 1);
+        hive.set_dword(active, "Start", SERVICE_DEMAND_START);
+        hive.finish_clean_import();
+
+        let mut server = CmServer::new();
+        assert_eq!(publish_hive(&mut server, &encode_image(&hive)), 1);
+        let mounted = server.system_hive.as_ref().unwrap();
+        assert_eq!(mounted.current_control_set.as_str(), "ControlSet002");
+        assert!(server.config().service_metadata("Active").is_some());
+        assert!(server.config().service_metadata("Inactive").is_none());
+
+        let mut current_out = vec![0u8; CM_HIVE_KEY_CHUNK_BYTES];
+        let current = server.dispatch(
+            opcode::CM_OP_QUERY_HIVE_KEY,
+            &hive_key_request(
+                r"\Registry\Machine\System\CurrentControlSet\Services\Active",
+                hive_key_transfer::BEGIN,
+                0,
+                0,
+                CM_HIVE_KEY_CHUNK_BYTES as u32,
+            ),
+            &mut current_out,
+        );
+        assert_eq!(current.status, STATUS_SUCCESS);
+        let mut explicit_out = vec![0u8; CM_HIVE_KEY_CHUNK_BYTES];
+        let explicit = server.dispatch(
+            opcode::CM_OP_QUERY_HIVE_KEY,
+            &hive_key_request(
+                r"\Registry\Machine\System\ControlSet002\Services\Active",
+                hive_key_transfer::BEGIN,
+                0,
+                0,
+                CM_HIVE_KEY_CHUNK_BYTES as u32,
+            ),
+            &mut explicit_out,
+        );
+        assert_eq!(explicit.status, STATUS_SUCCESS);
+        let missing = server.dispatch(
+            opcode::CM_OP_QUERY_HIVE_KEY,
+            &hive_key_request(
+                r"\Registry\Machine\System\CurrentControlSet\Services\Inactive",
+                hive_key_transfer::BEGIN,
+                0,
+                0,
+                CM_HIVE_KEY_CHUNK_BYTES as u32,
+            ),
+            &mut current_out,
+        );
+        assert_eq!(missing.status, STATUS_OBJECT_NAME_NOT_FOUND);
+    }
+
+    #[test]
+    fn invalid_control_set_import_preserves_the_live_mount_generation() {
+        let mut stable = selected_system_hive(1);
+        stable.create_key(r"ControlSet001\Services\Stable");
+        stable.finish_clean_import();
+        let stable_image = encode_image(&stable);
+        let mut server = CmServer::new();
+        assert_eq!(publish_hive(&mut server, &stable_image), 1);
+
+        let mut invalid = Hive::new(HiveKind::System);
+        invalid.create_key(r"ControlSet001\Services\Replacement");
+        invalid.finish_clean_import();
+        let invalid_image = encode_image(&invalid);
+        let token = begin_hive_import(&mut server, &invalid_image);
+        push_hive_import(&mut server, token, &invalid_image);
+        let response = server.dispatch(
+            opcode::CM_OP_IMPORT_HIVE,
+            &hive_import_request(
+                hive_import_transfer::COMMIT,
+                token,
+                invalid_image.len() as u32,
+                invalid_image.len() as u32,
+                &[],
+            ),
+            &mut [],
+        );
+        assert_eq!(response.status, STATUS_REGISTRY_CORRUPT);
+        let mounted = server.system_hive.as_ref().unwrap();
+        assert_eq!(mounted.generation, 1);
+        assert_eq!(mounted.current_control_set.as_str(), "ControlSet001");
+        assert!(mounted
+            .hive
+            .open_key(r"ControlSet001\Services\Stable")
+            .is_some());
+        assert!(mounted
+            .hive
+            .open_key(r"ControlSet001\Services\Replacement")
+            .is_none());
+        assert_eq!(server.hive_imports.len(), 1);
+    }
+
+    #[test]
     fn hive_key_snapshot_survives_atomic_mount_replacement() {
         let path = r"\Registry\Machine\System\CurrentControlSet\Services\Stable";
-        let mut first = Hive::new(HiveKind::System);
+        let mut first = selected_system_hive(1);
         let key = first.create_key(r"ControlSet001\Services\Stable");
         assert!(first.set_value(
             key,
@@ -1610,8 +1760,8 @@ mod tests {
         ));
         first.finish_clean_import();
         let first_image = encode_image(&first);
-        let mut second = Hive::new(HiveKind::System);
-        let key = second.create_key(r"ControlSet001\Services\Stable");
+        let mut second = selected_system_hive(2);
+        let key = second.create_key(r"ControlSet002\Services\Stable");
         assert!(second.set_value(
             key,
             "Payload",
@@ -1623,8 +1773,14 @@ mod tests {
 
         let mut server = CmServer::new();
         assert_eq!(publish_hive(&mut server, &first_image), 1);
-        let expected = encode_hive_key_snapshot(server.system_hive.as_ref().unwrap(), 1, path)
-            .expect("snapshot");
+        let mounted = server.system_hive.as_ref().unwrap();
+        let expected = encode_hive_key_snapshot(
+            &mounted.hive,
+            mounted.generation,
+            &mounted.current_control_set,
+            path,
+        )
+        .expect("snapshot");
         let mut first_bank = [0u8; 64];
         let begin = server.dispatch(
             opcode::CM_OP_QUERY_HIVE_KEY,
@@ -1654,6 +1810,8 @@ mod tests {
             assembled.extend_from_slice(&bank[..pull.information as usize]);
         }
         assert_eq!(assembled, expected);
-        assert_eq!(server.system_hive_generation, 2);
+        let mounted = server.system_hive.as_ref().unwrap();
+        assert_eq!(mounted.generation, 2);
+        assert_eq!(mounted.current_control_set.as_str(), "ControlSet002");
     }
 }

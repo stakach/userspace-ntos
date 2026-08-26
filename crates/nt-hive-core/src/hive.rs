@@ -78,6 +78,35 @@ pub enum DeleteKeyError {
 pub enum HiveOverlayError {
     KindMismatch,
     InvalidSource,
+    InvalidControlSetSelection,
+}
+
+/// The control set selected by a SYSTEM hive's `Select\\Current` value.
+///
+/// Construction is private so callers cannot attach an unchecked alias identity to a hive mount.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CurrentControlSet {
+    number: u32,
+    name: String,
+}
+
+impl CurrentControlSet {
+    pub fn number(&self) -> u32 {
+        self.number
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.name
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CurrentControlSetError {
+    WrongHiveKind,
+    SelectKeyMissing,
+    CurrentValueMissing,
+    CurrentValueInvalid,
+    TargetKeyMissing,
 }
 
 /// A mounted registry subtree as a cell arena (spec §6.1).
@@ -101,6 +130,39 @@ pub struct Hive {
 /// corresponding destination metadata only when it is explicitly present. Neither input is
 /// modified, and the returned hive is a clean persistence baseline.
 pub fn compose_hive_overlay(base: &Hive, overlay: &Hive) -> Result<Hive, HiveOverlayError> {
+    compose_hive_overlay_inner(base, overlay, None)
+}
+
+/// Compose a generated SYSTEM configuration hive onto the persistent hive's selected control set.
+///
+/// The overlay declares its source control set through its own `Select\\Current`. Its selected
+/// subtree is applied to the base hive's selected subtree, while the base `Select` key remains the
+/// sole boot-selection authority.
+pub fn compose_system_hive_overlay(base: &Hive, overlay: &Hive) -> Result<Hive, HiveOverlayError> {
+    if base.kind != overlay.kind {
+        return Err(HiveOverlayError::KindMismatch);
+    }
+    if base.kind != HiveKind::System {
+        return Err(HiveOverlayError::KindMismatch);
+    }
+    let base_control_set = base
+        .current_control_set()
+        .map_err(|_| HiveOverlayError::InvalidControlSetSelection)?;
+    let overlay_control_set = overlay
+        .current_control_set()
+        .map_err(|_| HiveOverlayError::InvalidControlSetSelection)?;
+    compose_hive_overlay_inner(
+        base,
+        overlay,
+        Some((overlay_control_set.as_str(), base_control_set.as_str())),
+    )
+}
+
+fn compose_hive_overlay_inner(
+    base: &Hive,
+    overlay: &Hive,
+    system_control_set_remap: Option<(&str, &str)>,
+) -> Result<Hive, HiveOverlayError> {
     if base.kind != overlay.kind {
         return Err(HiveOverlayError::KindMismatch);
     }
@@ -108,7 +170,7 @@ pub fn compose_hive_overlay(base: &Hive, overlay: &Hive) -> Result<Hive, HiveOve
     let mut composed = base.clone();
     let mut pending = Vec::new();
     let mut visited = Vec::new();
-    pending.push((overlay.root(), composed.root()));
+    pending.push((overlay.root(), Some(composed.root())));
 
     while let Some((source_id, destination_id)) = pending.pop() {
         if visited.iter().any(|visited_id| *visited_id == source_id) {
@@ -154,23 +216,41 @@ pub fn compose_hive_overlay(base: &Hive, overlay: &Hive) -> Result<Hive, HiveOve
             children.push((*child_id, child.name.clone()));
         }
 
-        if let Some(class_name) = class_name.as_deref() {
-            if !composed.set_key_class(destination_id, Some(class_name)) {
-                return Err(HiveOverlayError::InvalidSource);
+        if let Some(destination_id) = destination_id {
+            if let Some(class_name) = class_name.as_deref() {
+                if !composed.set_key_class(destination_id, Some(class_name)) {
+                    return Err(HiveOverlayError::InvalidSource);
+                }
             }
-        }
-        if let Some(descriptor) = security_descriptor.as_deref() {
-            if !composed.set_key_security_descriptor(destination_id, descriptor) {
-                return Err(HiveOverlayError::InvalidSource);
+            if let Some(descriptor) = security_descriptor.as_deref() {
+                if !composed.set_key_security_descriptor(destination_id, descriptor) {
+                    return Err(HiveOverlayError::InvalidSource);
+                }
             }
-        }
-        for (name, value_type, data) in values {
-            if !composed.set_value(destination_id, &name, value_type, data) {
-                return Err(HiveOverlayError::InvalidSource);
+            for (name, value_type, data) in values {
+                if !composed.set_value(destination_id, &name, value_type, data) {
+                    return Err(HiveOverlayError::InvalidSource);
+                }
             }
         }
         for (child_id, name) in children.into_iter().rev() {
-            let destination_child = composed.create_subkey(destination_id, &name);
+            let destination_child = match destination_id {
+                Some(destination_id) if source_id == overlay.root() => {
+                    if system_control_set_remap.is_some() && name.eq_ignore_ascii_case("Select") {
+                        None
+                    } else {
+                        let destination_name = match system_control_set_remap {
+                            Some((source, destination)) if name.eq_ignore_ascii_case(source) => {
+                                destination
+                            }
+                            _ => name.as_str(),
+                        };
+                        Some(composed.create_subkey(destination_id, destination_name))
+                    }
+                }
+                Some(destination_id) => Some(composed.create_subkey(destination_id, &name)),
+                None => None,
+            };
             pending.push((child_id, destination_child));
         }
     }
@@ -199,6 +279,32 @@ impl Hive {
     pub fn root(&self) -> CellId {
         self.root
     }
+
+    /// Resolve the boot-selected control set from `Select\\Current` without a default.
+    pub fn current_control_set(&self) -> Result<CurrentControlSet, CurrentControlSetError> {
+        if self.kind != HiveKind::System {
+            return Err(CurrentControlSetError::WrongHiveKind);
+        }
+        let select = self
+            .open_key("Select")
+            .ok_or(CurrentControlSetError::SelectKeyMissing)?;
+        let (value_type, data) = self
+            .query_value(select, "Current")
+            .ok_or(CurrentControlSetError::CurrentValueMissing)?;
+        if value_type != RegistryValueType::Dword || data.len() != core::mem::size_of::<u32>() {
+            return Err(CurrentControlSetError::CurrentValueInvalid);
+        }
+        let number = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        if number == 0 {
+            return Err(CurrentControlSetError::CurrentValueInvalid);
+        }
+        let name = alloc::format!("ControlSet{number:03}");
+        if self.open_key(&name).is_none() {
+            return Err(CurrentControlSetError::TargetKeyMissing);
+        }
+        Ok(CurrentControlSet { number, name })
+    }
+
     pub fn cell_count(&self) -> usize {
         self.cells.iter().filter(|c| c.is_some()).count()
     }

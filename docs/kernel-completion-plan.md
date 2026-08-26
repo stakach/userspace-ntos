@@ -2865,6 +2865,13 @@ existing synchronous DMA/PnP fixture so the two lifecycle modes remain independe
   hive flush/checkpoint gates remain green. The current D4 frontier is closed for repeat-boot
   registry/profile durability; future work should open a new storage-specific D item if real-device
   crash consistency exposes a narrower gap.
+- `[~]` D5: Converge the active SYSTEM hive behind the isolated Configuration Manager without
+  metadata loss or a fixed control-set identity. Derive the boot control set from the mounted
+  SYSTEM hive's `Select\\Current` value, rebase generated configuration from its declared source
+  control set onto that selected destination, preserve real REGF key class/security metadata
+  through mutable-hive import and image transport, and only then publish the single composed image.
+  No `ControlSet001` default, generated-only mount, or metadata-dropping import may remain as a
+  fallback.
 
 ## Immediate Iteration
 
@@ -12647,3 +12654,45 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     valid as more NICs and driver fixtures are configured. Review adjustment: the merge mechanism
     is closed. Next move replay/composition before boot launch-plan selection and the first CM
     import, using the restored SYSTEM primary plus log when present and the installed REGF otherwise.
+
+    Persistent SYSTEM composition prerequisite review (2026-08-26): two lossy assumptions must be
+    removed before the composed image can become the only live authority. First,
+    `CurrentControlSet` is still forced to `ControlSet001` in the hive namespace and isolated CM
+    import. Resolve it strictly from the mounted SYSTEM hive's `Select\\Current` `REG_DWORD`, reject
+    a missing/invalid selector or target control set, preserve the persistent hive's selection, and
+    remap the generated overlay's selected control-set subtree onto that target. There is no
+    `ControlSet001` fallback. Add a `ControlSet002` fixture that proves CM key snapshots and semantic
+    driver selection use the selected set while the inactive persistent set remains unchanged.
+
+    Second, installed REGF import currently copies only subkeys and values. Preserve NK class data
+    and SK security descriptors with bounds-checked cell decoding, keep every supported NT registry
+    value type exact, and handle unknown types explicitly rather than coercing them to `REG_BINARY`.
+    Only after both crate boundaries are green should startup compose the replayed writable SYSTEM
+    primary, or the installed REGF on a genuinely absent first boot, with the generated overlay and
+    publish exactly one CM generation. A corrupt persisted primary/log must fail closed and must not
+    silently select the installed image.
+
+    Dynamic isolated-CM control-set checkpoint (2026-08-26, crate accepted): `nt-hive-core` now
+    derives an unforgeable selected-control-set identity from a SYSTEM hive's strict
+    `Select\\Current` `REG_DWORD`, rejects zero, missing selector state, the wrong hive kind, and a
+    missing `ControlSetNNN` target without defaulting to `ControlSet001`. The SYSTEM overlay
+    compositor maps the generated image's declared selected subtree onto the persistent hive's
+    selected subtree, traverses skipped `Select` input for structural validation, and preserves the
+    persistent `Select` values and inactive control sets.
+
+    `CmServer` publishes the decoded hive, selected identity, derived semantic Configuration Manager,
+    and generation as one mounted tuple. Streamed `CurrentControlSet` reads and all Services/Enum/
+    Class/Network semantic imports consume that stored generation identity; failed selection
+    validation leaves the prior mount, semantic state, generation, and outstanding snapshots
+    unchanged. Tests use `Select\\Current=2`, prove only `ControlSet002` supplies live service
+    metadata, and retain a generation-1 snapshot while generation 2 selects a different set. The
+    generated CONFIG image now declares source selection 1 explicitly so the current atomic import
+    remains valid until the composed-image cut removes it.
+
+    Focused validation is green at `nt-hive-core` library `74/74`, generator `14/14`,
+    `nt-config-server` `9/9`, and `nt-config-client` `13/13`; the freestanding executive release
+    check remains green at the established 212-warning baseline. Review adjustment: next preserve
+    REGF NK class and SK security metadata during import. Then convert the generic mutable-hive mount
+    alias and remaining executive readers to the selected identity before publishing the composed
+    live SYSTEM image; the compatibility `CURRENT_CONTROL_SET_TARGET` path is not accepted as final
+    authority.

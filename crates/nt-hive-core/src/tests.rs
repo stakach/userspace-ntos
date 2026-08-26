@@ -310,6 +310,127 @@ fn hive_overlay_rejects_a_cyclic_source_without_mutating_the_base() {
 }
 
 #[test]
+fn system_hive_resolves_current_control_set_without_a_default() {
+    let mut hive = Hive::new(HiveKind::System);
+    hive.create_key(r"ControlSet001\Services\Inactive");
+    hive.create_key(r"ControlSet002\Services\Active");
+    let select = hive.create_key("Select");
+    hive.set_dword(select, "Current", 2);
+
+    let selected = hive.current_control_set().expect("selected control set");
+    assert_eq!(selected.number(), 2);
+    assert_eq!(selected.as_str(), "ControlSet002");
+
+    let missing_select = Hive::new(HiveKind::System);
+    assert_eq!(
+        missing_select.current_control_set(),
+        Err(CurrentControlSetError::SelectKeyMissing)
+    );
+
+    let mut missing_current = Hive::new(HiveKind::System);
+    missing_current.create_key("Select");
+    missing_current.create_key("ControlSet001");
+    assert_eq!(
+        missing_current.current_control_set(),
+        Err(CurrentControlSetError::CurrentValueMissing)
+    );
+
+    let mut wrong_type = Hive::new(HiveKind::System);
+    let select = wrong_type.create_key("Select");
+    wrong_type.set_value(
+        select,
+        "Current",
+        RegistryValueType::Binary,
+        1u32.to_le_bytes().to_vec(),
+    );
+    wrong_type.create_key("ControlSet001");
+    assert_eq!(
+        wrong_type.current_control_set(),
+        Err(CurrentControlSetError::CurrentValueInvalid)
+    );
+
+    let mut zero = Hive::new(HiveKind::System);
+    let select = zero.create_key("Select");
+    zero.set_dword(select, "Current", 0);
+    zero.create_key("ControlSet000");
+    assert_eq!(
+        zero.current_control_set(),
+        Err(CurrentControlSetError::CurrentValueInvalid)
+    );
+
+    let mut missing_target = Hive::new(HiveKind::System);
+    let select = missing_target.create_key("Select");
+    missing_target.set_dword(select, "Current", 7);
+    assert_eq!(
+        missing_target.current_control_set(),
+        Err(CurrentControlSetError::TargetKeyMissing)
+    );
+
+    assert_eq!(
+        Hive::new(HiveKind::Software).current_control_set(),
+        Err(CurrentControlSetError::WrongHiveKind)
+    );
+}
+
+#[test]
+fn system_hive_overlay_rebases_selected_subtree_and_preserves_base_selection() {
+    let mut base = Hive::new(HiveKind::System);
+    let select = base.create_key("Select");
+    base.set_dword(select, "Current", 2);
+    base.set_dword(select, "Default", 2);
+    let inactive = base.create_key(r"ControlSet001\Services\Inactive");
+    base.set_dword(inactive, "BaseOnly", 1);
+    let active = base.create_key(r"ControlSet002\Services\Persistent");
+    base.set_dword(active, "BaseOnly", 2);
+    base.finish_clean_import();
+
+    let mut generated = Hive::new(HiveKind::System);
+    let select = generated.create_key("Select");
+    generated.set_dword(select, "Current", 1);
+    generated.set_dword(select, "Default", 1);
+    let generated_service = generated.create_key(r"ControlSet001\Services\Generated");
+    generated.set_dword(generated_service, "Start", 1);
+    generated.finish_clean_import();
+
+    let composed =
+        compose_system_hive_overlay(&base, &generated).expect("compose selected control set");
+    let selected = composed
+        .current_control_set()
+        .expect("base selection retained");
+    assert_eq!(selected.as_str(), "ControlSet002");
+    let composed_select = composed.open_key("Select").unwrap();
+    assert_eq!(composed.query_dword(composed_select, "Current"), Some(2));
+    assert_eq!(composed.query_dword(composed_select, "Default"), Some(2));
+    assert!(composed
+        .open_key(r"ControlSet002\Services\Generated")
+        .is_some());
+    assert!(composed
+        .open_key(r"ControlSet001\Services\Generated")
+        .is_none());
+    assert_eq!(
+        composed.query_dword(
+            composed
+                .open_key(r"ControlSet001\Services\Inactive")
+                .unwrap(),
+            "BaseOnly"
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        composed.query_dword(
+            composed
+                .open_key(r"ControlSet002\Services\Persistent")
+                .unwrap(),
+            "BaseOnly"
+        ),
+        Some(2)
+    );
+    assert_eq!(composed.generation, 0);
+    assert_eq!(composed.sequence, 0);
+    assert_eq!(composed.dirty_count(), 0);
+}
+
+#[test]
 fn hive_delete_key_removes_only_leaf_keys() {
     let mut h = Hive::new(HiveKind::Software);
     let parent = h.create_key(r"Classes\CLSID");

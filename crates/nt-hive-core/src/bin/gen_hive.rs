@@ -1053,6 +1053,11 @@ fn build_hive_with_configuration(
     display_mode: GeneratedDisplayMode,
 ) -> Hive {
     let mut hive = Hive::new(HiveKind::System);
+    let select = hive.create_key("Select");
+    hive.set_dword(select, "Current", 1);
+    hive.set_dword(select, "Default", 1);
+    hive.set_dword(select, "LastKnownGood", 1);
+    hive.set_dword(select, "Failed", 0);
     // A recognizable marker the executive reads back: ...\NtosTest\Answer = REG_DWORD 42.
     let key = hive.create_key(r"ControlSet001\Services\NtosTest");
     hive.set_dword(key, "Answer", 42);
@@ -1136,6 +1141,18 @@ fn main() {
 mod tests {
     use super::*;
     use nt_hive_core::decode_image;
+
+    #[test]
+    fn generated_hive_declares_its_source_control_set() {
+        let hive = build_hive();
+        let selected = hive.current_control_set().expect("generated selection");
+        assert_eq!(selected.number(), 1);
+        assert_eq!(selected.as_str(), "ControlSet001");
+        let select = hive.open_key("Select").expect("Select key");
+        assert_eq!(hive.query_dword(select, "Default"), Some(1));
+        assert_eq!(hive.query_dword(select, "LastKnownGood"), Some(1));
+        assert_eq!(hive.query_dword(select, "Failed"), Some(0));
+    }
 
     #[test]
     fn generated_hive_declares_irp_fsd_test_service() {

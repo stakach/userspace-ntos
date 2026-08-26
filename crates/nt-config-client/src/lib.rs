@@ -1071,6 +1071,8 @@ mod tests {
     #[test]
     fn mounted_system_hive_import_and_complete_key_snapshot_cross_frames() {
         let mut hive = Hive::new(HiveKind::System);
+        let select = hive.create_key("Select");
+        hive.set_dword(select, "Current", 1);
         let key = hive.create_key(r"ControlSet001\Services\Large");
         assert!(hive.set_key_class(key, Some("DriverServiceClass")));
         let security = vec![0x5au8; 5_000];
@@ -1127,6 +1129,8 @@ mod tests {
     #[test]
     fn corrupt_hive_import_does_not_replace_published_mount() {
         let mut hive = Hive::new(HiveKind::System);
+        let select = hive.create_key("Select");
+        hive.set_dword(select, "Current", 1);
         let key = hive.create_key(r"ControlSet001\Services\Stable");
         assert!(hive.set_dword(key, "Start", 3));
         hive.finish_clean_import();

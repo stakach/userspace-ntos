@@ -55,8 +55,9 @@ pub use config_import::{
     import_control_set_services_into_config_manager,
 };
 pub use hive::{
-    apply_ccs_alias, compose_hive_overlay, CellId, DeleteKeyError, Hive, HiveId, HiveKind,
-    HiveMountTable, HiveOverlayError, MutableHiveSet, RegistryValueCopyProvenance,
+    apply_ccs_alias, compose_hive_overlay, compose_system_hive_overlay, CellId, CurrentControlSet,
+    CurrentControlSetError, DeleteKeyError, Hive, HiveId, HiveKind, HiveMountTable,
+    HiveOverlayError, MutableHiveSet, RegistryValueCopyProvenance,
     RegistryValueCopyProvenanceTable, RegistryValueType, ResolvedHiveKey, ResolvedHiveValue,
     CURRENT_CONTROL_SET_TARGET, SYSTEM_HIVE_PATH,
 };
