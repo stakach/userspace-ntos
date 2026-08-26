@@ -11561,9 +11561,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Focused validation is green for `nt-io-manager` at `190/190`, including wrong-cookie bind,
     reverse lookup, and unbind rejection while the exact live projection remains intact. The
     freestanding executive check remains at the established 212-warning baseline, `cargo fmt` is
-    clean for the changed crate, and `git diff --check` is clean. A fresh serialized desktop gate is
-    still required after this checkpoint; the last accepted Explorer/resource proofs remain the
-    preceding runs recorded above.
+    clean for the changed crate, and `git diff --check` is clean. Serialized proof
+    `.tmp/run-desktop-exact-domain-20260826.log` reaches genuine userinit and Explorer launch,
+    completes real nested user callbacks, paints all `480000/480000` pixels of the miniport-selected
+    `800x600` shell with at least 32 non-background colours, reports zero CSpace/pool corruption and
+    zero VSpace unmap failures, passes all `293/293` executive gates, and emits the sentinel.
 
     Review adjustment: full lifetime teardown remains open and is now ordered explicitly. First key
     hosted paging rows by exact domain identity plus PML4, extend persistent IRP/resource/DMA owners
