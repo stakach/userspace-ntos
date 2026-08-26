@@ -12010,3 +12010,35 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Explorer paints `480000/480000` pixels with at least 32 non-background colours, all `293/293`
     executive gates pass, and the sentinel fires. The integration checkpoint is closed without
     weakening or removing the schedule-sensitive ScrollBar observation.
+
+    One-shot NDIS work-item retirement checkpoint (2026-08-26, implementation green; serialized
+    desktop proof pending): `nt-hosted-runtime` now owns a generation-bearing one-shot callback
+    state machine that distinguishes a provider schedule call in flight, one queued invocation, and
+    one provider wrapper invocation in flight. It rejects a second queue ownership for the same
+    embedded `WORK_QUEUE_ITEM`, permits a dequeued callback to requeue itself, rejects stale
+    completion tokens, and permanently blocks retirement after an indeterminate schedule or wrapper
+    dispatch. Focused runtime validation is green at `71/71`.
+
+    The executive work-item parent now carries separate preparing, queued, and active invocation
+    slots. Every invocation owns its exact routine, context, callback thunk, and thunk-binding lease,
+    so a running callback may reinitialize and requeue the same `NDIS_WORK_ITEM` with a different
+    routine without overwriting the active invocation's ownership. Returned provider success moves
+    preparing ownership to queued; a returned failure releases only the unpublished preparing
+    invocation; an incomplete provider call retains `CompensationRequired`. The generic provider
+    work-queue drain recognizes the exact embedded `WrapperReserved` queue entry, moves queued
+    ownership to active before calling ReactOS's `ndisProcWorkItemHandler`, and releases the active
+    binding only after that provider wrapper has returned. The provider pool parent is freed only
+    when no preparing, queued, or active invocation remains. A callback or worker fault retains the
+    exact parent and prevents raw-address reuse.
+
+    Review adjustment: ordinary `NdisMCancelTimer` is arming state, not timer destruction. Final
+    timer-thunk retirement must be adapter-exact and follow real Halt/Remove, a completed cancel for
+    the latest arm generation, canonical timer inactivity, zero queued/provider/dependent DPC work,
+    and dependency-dispatch quiescence. Store the exact provider miniport handle on each timer to
+    keep this multi-NIC safe. Miniport-block mirror retirement likewise needs an adapter-exact real
+    STOP/REMOVE PnP transaction; the current transport can dispatch generic PnP minors, but the
+    executive exposes only START and has no complete devnode removal transaction. After the pending
+    serialized work-item integration proof, implement generic synchronous PnP query/cancel/stop and
+    remove orchestration, then use successful outer STOP/REMOVE completion as the mirror/timer
+    retirement fence. Do not treat `KeCancelTimer == FALSE`, a Halt callback alone, or local binding
+    teardown as quiescence proof.

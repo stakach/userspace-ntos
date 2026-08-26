@@ -139,6 +139,180 @@ impl HostedProviderReleaseProgress {
     }
 }
 
+/// Generation-bearing ownership state for a callback object backed by one embedded work item.
+///
+/// A queued work item may requeue itself after the provider has dequeued it, but the same embedded
+/// queue entry cannot be queued twice. The raw callback address remains owned until the provider's
+/// wrapper routine has returned, which is later than the dependent callback's own return.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostedOneShotCallbackState {
+    next_generation: u64,
+    schedule_in_flight: u64,
+    queued_generation: u64,
+    active_generation: u64,
+    callback_observed: bool,
+    indeterminate: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostedOneShotCallbackToken {
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostedOneShotCallbackError {
+    Busy,
+    GenerationExhausted,
+    Indeterminate,
+    InvalidToken,
+    InvalidTransition,
+}
+
+impl HostedOneShotCallbackState {
+    pub const fn new() -> Self {
+        Self {
+            next_generation: 0,
+            schedule_in_flight: 0,
+            queued_generation: 0,
+            active_generation: 0,
+            callback_observed: false,
+            indeterminate: false,
+        }
+    }
+
+    pub fn begin_schedule(
+        &mut self,
+    ) -> Result<HostedOneShotCallbackToken, HostedOneShotCallbackError> {
+        if self.indeterminate {
+            return Err(HostedOneShotCallbackError::Indeterminate);
+        }
+        if self.schedule_in_flight != 0 || self.queued_generation != 0 {
+            return Err(HostedOneShotCallbackError::Busy);
+        }
+        let generation = self
+            .next_generation
+            .checked_add(1)
+            .filter(|generation| *generation != 0)
+            .ok_or(HostedOneShotCallbackError::GenerationExhausted)?;
+        self.next_generation = generation;
+        self.schedule_in_flight = generation;
+        Ok(HostedOneShotCallbackToken { generation })
+    }
+
+    pub fn cancel_schedule(
+        &mut self,
+        token: HostedOneShotCallbackToken,
+    ) -> Result<(), HostedOneShotCallbackError> {
+        if self.schedule_in_flight != token.generation {
+            return Err(HostedOneShotCallbackError::InvalidToken);
+        }
+        self.schedule_in_flight = 0;
+        Ok(())
+    }
+
+    pub fn commit_schedule(
+        &mut self,
+        token: HostedOneShotCallbackToken,
+    ) -> Result<(), HostedOneShotCallbackError> {
+        if self.indeterminate {
+            return Err(HostedOneShotCallbackError::Indeterminate);
+        }
+        if self.schedule_in_flight != token.generation || self.queued_generation != 0 {
+            return Err(HostedOneShotCallbackError::InvalidToken);
+        }
+        self.schedule_in_flight = 0;
+        self.queued_generation = token.generation;
+        Ok(())
+    }
+
+    pub fn mark_schedule_indeterminate(
+        &mut self,
+        token: HostedOneShotCallbackToken,
+    ) -> Result<(), HostedOneShotCallbackError> {
+        if self.schedule_in_flight != token.generation {
+            return Err(HostedOneShotCallbackError::InvalidToken);
+        }
+        self.indeterminate = true;
+        Ok(())
+    }
+
+    pub fn begin_provider_dispatch(
+        &mut self,
+    ) -> Result<HostedOneShotCallbackToken, HostedOneShotCallbackError> {
+        if self.indeterminate {
+            return Err(HostedOneShotCallbackError::Indeterminate);
+        }
+        if self.active_generation != 0 {
+            return Err(HostedOneShotCallbackError::Busy);
+        }
+        if self.queued_generation == 0 {
+            return Err(HostedOneShotCallbackError::InvalidTransition);
+        }
+        let generation = self.queued_generation;
+        self.queued_generation = 0;
+        self.active_generation = generation;
+        self.callback_observed = false;
+        Ok(HostedOneShotCallbackToken { generation })
+    }
+
+    pub fn observe_callback(
+        &mut self,
+        token: HostedOneShotCallbackToken,
+    ) -> Result<(), HostedOneShotCallbackError> {
+        if self.active_generation != token.generation {
+            return Err(HostedOneShotCallbackError::InvalidToken);
+        }
+        if self.callback_observed {
+            return Err(HostedOneShotCallbackError::InvalidTransition);
+        }
+        self.callback_observed = true;
+        Ok(())
+    }
+
+    /// Completes the provider wrapper dispatch and reports whether the callback owner is quiescent.
+    pub fn complete_provider_dispatch(
+        &mut self,
+        token: HostedOneShotCallbackToken,
+    ) -> Result<bool, HostedOneShotCallbackError> {
+        if self.indeterminate {
+            return Err(HostedOneShotCallbackError::Indeterminate);
+        }
+        if self.active_generation != token.generation {
+            return Err(HostedOneShotCallbackError::InvalidToken);
+        }
+        if !self.callback_observed {
+            return Err(HostedOneShotCallbackError::InvalidTransition);
+        }
+        self.active_generation = 0;
+        self.callback_observed = false;
+        Ok(self.can_retire())
+    }
+
+    pub fn mark_provider_dispatch_indeterminate(
+        &mut self,
+        token: HostedOneShotCallbackToken,
+    ) -> Result<(), HostedOneShotCallbackError> {
+        if self.active_generation != token.generation {
+            return Err(HostedOneShotCallbackError::InvalidToken);
+        }
+        self.indeterminate = true;
+        Ok(())
+    }
+
+    pub const fn can_retire(self) -> bool {
+        !self.indeterminate
+            && self.schedule_in_flight == 0
+            && self.queued_generation == 0
+            && self.active_generation == 0
+    }
+}
+
+impl Default for HostedOneShotCallbackState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostedThunkSlotState {
     Free,
@@ -3202,5 +3376,100 @@ mod tests {
         }));
         assert_eq!(calls, 0);
         assert_eq!(progress.pending(), 0);
+    }
+
+    #[test]
+    fn one_shot_callback_retires_only_after_provider_wrapper_returns() {
+        let mut state = HostedOneShotCallbackState::new();
+        let scheduled = state.begin_schedule().unwrap();
+        state.commit_schedule(scheduled).unwrap();
+        assert!(!state.can_retire());
+
+        let active = state.begin_provider_dispatch().unwrap();
+        state.observe_callback(active).unwrap();
+        assert!(!state.can_retire());
+        assert!(state.complete_provider_dispatch(active).unwrap());
+        assert!(state.can_retire());
+    }
+
+    #[test]
+    fn one_shot_callback_requeue_keeps_parent_live() {
+        let mut state = HostedOneShotCallbackState::new();
+        let first = state.begin_schedule().unwrap();
+        state.commit_schedule(first).unwrap();
+        let active = state.begin_provider_dispatch().unwrap();
+        state.observe_callback(active).unwrap();
+
+        let second = state.begin_schedule().unwrap();
+        state.commit_schedule(second).unwrap();
+        assert!(!state.complete_provider_dispatch(active).unwrap());
+
+        let active = state.begin_provider_dispatch().unwrap();
+        state.observe_callback(active).unwrap();
+        assert!(state.complete_provider_dispatch(active).unwrap());
+    }
+
+    #[test]
+    fn one_shot_callback_rejects_duplicate_queue_ownership() {
+        let mut state = HostedOneShotCallbackState::new();
+        let scheduled = state.begin_schedule().unwrap();
+        state.commit_schedule(scheduled).unwrap();
+        assert_eq!(
+            state.begin_schedule(),
+            Err(HostedOneShotCallbackError::Busy)
+        );
+    }
+
+    #[test]
+    fn one_shot_callback_requires_observed_callback_before_completion() {
+        let mut state = HostedOneShotCallbackState::new();
+        let scheduled = state.begin_schedule().unwrap();
+        state.commit_schedule(scheduled).unwrap();
+        let active = state.begin_provider_dispatch().unwrap();
+        assert_eq!(
+            state.complete_provider_dispatch(active),
+            Err(HostedOneShotCallbackError::InvalidTransition)
+        );
+        state.mark_provider_dispatch_indeterminate(active).unwrap();
+        assert!(!state.can_retire());
+    }
+
+    #[test]
+    fn one_shot_callback_indeterminate_schedule_never_quiesces() {
+        let mut state = HostedOneShotCallbackState::new();
+        let scheduled = state.begin_schedule().unwrap();
+        state.mark_schedule_indeterminate(scheduled).unwrap();
+        assert!(!state.can_retire());
+        assert_eq!(
+            state.begin_schedule(),
+            Err(HostedOneShotCallbackError::Indeterminate)
+        );
+    }
+
+    #[test]
+    fn one_shot_callback_aborted_schedule_returns_to_idle() {
+        let mut state = HostedOneShotCallbackState::new();
+        let scheduled = state.begin_schedule().unwrap();
+        state.cancel_schedule(scheduled).unwrap();
+        assert!(state.can_retire());
+    }
+
+    #[test]
+    fn one_shot_callback_rejects_stale_dispatch_token() {
+        let mut state = HostedOneShotCallbackState::new();
+        let first = state.begin_schedule().unwrap();
+        state.commit_schedule(first).unwrap();
+        let first_active = state.begin_provider_dispatch().unwrap();
+        state.observe_callback(first_active).unwrap();
+        state.complete_provider_dispatch(first_active).unwrap();
+
+        let second = state.begin_schedule().unwrap();
+        state.commit_schedule(second).unwrap();
+        let second_active = state.begin_provider_dispatch().unwrap();
+        assert_eq!(
+            state.observe_callback(first_active),
+            Err(HostedOneShotCallbackError::InvalidToken)
+        );
+        state.observe_callback(second_active).unwrap();
     }
 }

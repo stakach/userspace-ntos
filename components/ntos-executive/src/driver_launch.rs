@@ -45,6 +45,7 @@ use nt_hosted_runtime::{
     HostedProviderExportResultSemantics, HostedProviderExportSideEffect,
     HostedProviderImportBinding, HostedProviderImportBindingError, HostedProviderImportThunkError,
     HostedProviderImportThunkPlan, HostedProviderObjectOwner, HostedProviderReleaseProgress,
+    HostedOneShotCallbackError, HostedOneShotCallbackState, HostedOneShotCallbackToken,
     HostedThunkLeaseRelease, HostedThunkReservation, HostedThunkSlotKey, HostedThunkSlotRegistry,
     HostedThunkSlotToken, NdisMiniportCharacteristicsLayoutError,
     NdisProtocolCharacteristicsLayoutError,
@@ -573,6 +574,7 @@ const NDIS_MINIPORT_TIMER_FUNCTION_CALLBACK_OFFSET_X64: u64 = 0x80;
 const NDIS_WORK_ITEM_CONTEXT_OFFSET_X64: u64 = 0x00;
 const NDIS_WORK_ITEM_ROUTINE_OFFSET_X64: u64 = 0x08;
 const NDIS_WORK_ITEM_ROUTINE_CALLBACK_OFFSET_X64: u64 = 0x08;
+const NDIS_WORK_ITEM_WRAPPER_RESERVED_OFFSET_X64: u64 = 0x10;
 const NDIS_WORK_ITEM_LEN_X64: u64 = 0x50;
 const NDIS_PROTOCOL_OPEN_ADAPTER_COMPLETE_CALLBACK_OFFSET_X64: u64 = 0x08;
 const NDIS_PROTOCOL_CLOSE_ADAPTER_COMPLETE_CALLBACK_OFFSET_X64: u64 = 0x10;
@@ -14664,6 +14666,8 @@ struct ProviderMarshalState {
     miniport_timer_construction_index: usize,
     miniport_timer_shadow_index: usize,
     ndis_work_item_construction_index: usize,
+    ndis_work_item_schedule_token: Option<HostedOneShotCallbackToken>,
+    ndis_work_item_parent_constructing: bool,
     callback_parent_construction_index: usize,
     callback_parent_handle_exec_va: u64,
     callback_parent_input_provider_handle: u64,
@@ -14746,6 +14750,8 @@ impl ProviderMarshalState {
             miniport_timer_construction_index: usize::MAX,
             miniport_timer_shadow_index: usize::MAX,
             ndis_work_item_construction_index: usize::MAX,
+            ndis_work_item_schedule_token: None,
+            ndis_work_item_parent_constructing: false,
             callback_parent_construction_index: usize::MAX,
             callback_parent_handle_exec_va: 0,
             callback_parent_input_provider_handle: 0,
@@ -14972,6 +14978,35 @@ impl HostedProviderCallbackParent {
 }
 
 #[derive(Clone, Copy)]
+struct HostedProviderNdisWorkItemInvocation {
+    token: Option<HostedOneShotCallbackToken>,
+    dependent_context: u64,
+    dependent_routine: u64,
+    provider_routine_thunk: u64,
+    provider_routine_binding: Option<HostedExecutableThunkBinding>,
+}
+
+impl HostedProviderNdisWorkItemInvocation {
+    const fn empty() -> Self {
+        Self {
+            token: None,
+            dependent_context: 0,
+            dependent_routine: 0,
+            provider_routine_thunk: 0,
+            provider_routine_binding: None,
+        }
+    }
+
+    const fn is_empty(self) -> bool {
+        self.token.is_none()
+            && self.dependent_context == 0
+            && self.dependent_routine == 0
+            && self.provider_routine_thunk == 0
+            && self.provider_routine_binding.is_none()
+    }
+}
+
+#[derive(Clone, Copy)]
 struct HostedProviderNdisWorkItemShadow {
     present: bool,
     construction_state: HostedProviderConstructionState,
@@ -14980,10 +15015,10 @@ struct HostedProviderNdisWorkItemShadow {
     dependent_instance: usize,
     dependent_component_va: u64,
     provider_component_va: u64,
-    dependent_context: u64,
-    dependent_routine: u64,
-    provider_routine_thunk: u64,
-    provider_routine_binding: Option<HostedExecutableThunkBinding>,
+    schedule_state: HostedOneShotCallbackState,
+    preparing: HostedProviderNdisWorkItemInvocation,
+    queued: HostedProviderNdisWorkItemInvocation,
+    active: HostedProviderNdisWorkItemInvocation,
     bytes: u64,
 }
 
@@ -14997,10 +15032,10 @@ impl HostedProviderNdisWorkItemShadow {
             dependent_instance: 0,
             dependent_component_va: 0,
             provider_component_va: 0,
-            dependent_context: 0,
-            dependent_routine: 0,
-            provider_routine_thunk: 0,
-            provider_routine_binding: None,
+            schedule_state: HostedOneShotCallbackState::new(),
+            preparing: HostedProviderNdisWorkItemInvocation::empty(),
+            queued: HostedProviderNdisWorkItemInvocation::empty(),
+            active: HostedProviderNdisWorkItemInvocation::empty(),
             bytes: 0,
         }
     }
@@ -17713,9 +17748,13 @@ unsafe fn abort_provider_export_marshal_before_dispatch(state: &ProviderMarshalS
         );
     }
     if state.ndis_work_item_construction_index != usize::MAX {
-        rollback_hosted_provider_ndis_work_item_construction(
-            state.ndis_work_item_construction_index,
-        );
+        if let Some(token) = state.ndis_work_item_schedule_token {
+            abort_hosted_provider_ndis_work_item_schedule(
+                state.ndis_work_item_construction_index,
+                token,
+                state.ndis_work_item_parent_constructing,
+            );
+        }
     }
     if state.callback_parent_construction_index != usize::MAX {
         rollback_hosted_provider_callback_parent(state.callback_parent_construction_index);
@@ -17765,9 +17804,12 @@ unsafe fn abort_provider_export_marshal_after_possible_dispatch(state: &Provider
         );
     }
     if state.ndis_work_item_construction_index != usize::MAX {
-        retain_indeterminate_hosted_provider_ndis_work_item_construction(
-            state.ndis_work_item_construction_index,
-        );
+        if let Some(token) = state.ndis_work_item_schedule_token {
+            retain_indeterminate_hosted_provider_ndis_work_item_schedule(
+                state.ndis_work_item_construction_index,
+                token,
+            );
+        }
     }
     if state.callback_parent_construction_index != usize::MAX {
         retain_indeterminate_hosted_provider_callback_parent(
@@ -21528,20 +21570,18 @@ unsafe fn find_hosted_provider_ndis_work_item_shadow(
 
 unsafe fn find_hosted_provider_ndis_work_item_shadow_by_provider(
     provider_instance: usize,
-    dependent_instance: usize,
     provider_component_va: u64,
-) -> Option<HostedProviderNdisWorkItemShadow> {
+) -> Option<(usize, HostedProviderNdisWorkItemShadow)> {
     if provider_component_va == 0 {
         return None;
     }
     let Some(records) = hosted_provider_ndis_work_item_shadows() else {
         return None;
     };
-    for record in records.iter().copied() {
+    for (index, record) in records.iter().copied().enumerate() {
         if record.present
             && record.construction_state == HostedProviderConstructionState::Published
             && record.provider_instance == provider_instance
-            && record.dependent_instance == dependent_instance
             && hosted_provider_object_owner_is_live(
                 record.owner,
                 record.provider_instance,
@@ -21549,7 +21589,7 @@ unsafe fn find_hosted_provider_ndis_work_item_shadow_by_provider(
             )
             && record.provider_component_va == provider_component_va
         {
-            return Some(record);
+            return Some((index, record));
         }
     }
     None
@@ -21618,10 +21658,10 @@ unsafe fn allocate_hosted_provider_ndis_work_item_shadow(
         dependent_instance,
         dependent_component_va,
         provider_component_va,
-        dependent_context: 0,
-        dependent_routine: 0,
-        provider_routine_thunk: 0,
-        provider_routine_binding: None,
+        schedule_state: HostedOneShotCallbackState::new(),
+        preparing: HostedProviderNdisWorkItemInvocation::empty(),
+        queued: HostedProviderNdisWorkItemInvocation::empty(),
+        active: HostedProviderNdisWorkItemInvocation::empty(),
         bytes: NDIS_WORK_ITEM_LEN_X64,
     };
     let records = hosted_provider_ndis_work_item_shadows_mut();
@@ -21641,7 +21681,7 @@ unsafe fn hosted_provider_ndis_work_item_shadow(
     dependent_instance: usize,
     dependent_inst: DriverInstance,
     dependent_component_va: u64,
-) -> Result<(u64, usize, bool), i32> {
+) -> Result<(u64, usize, bool, HostedOneShotCallbackToken), i32> {
     let Some(dependent_exec_va) = component_to_exec_va_for_instance(
         dependent_instance,
         dependent_inst,
@@ -21679,41 +21719,45 @@ unsafe fn hosted_provider_ndis_work_item_shadow(
         HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_INVALID_PARAMETER);
     }
-    if shadow.dependent_routine != dependent_routine && shadow.provider_routine_binding.is_some() {
-        // NDIS has no work-item cancellation primitive. Replacing the routine before the provider
-        // has completed the prior work would discard the only exact owner of its raw callback.
+    if !shadow.preparing.is_empty() {
         return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
     }
-    let mut acquired_binding = None;
-    if shadow.provider_routine_binding.is_none() {
-        let thunk = match provider_marshal_emit_callback_thunk(
-            provider_instance,
-            dependent_instance,
-            dependent_routine,
-            NDIS_WORK_ITEM_ROUTINE_CALLBACK_OFFSET_X64,
-            HOSTED_PROVIDER_CALLBACK_KIND_NDIS_WORK_ITEM,
-        ) {
-            Ok(thunk) => thunk,
-            Err(status) => {
-                if constructing {
-                    rollback_hosted_provider_ndis_work_item_construction(index);
-                }
-                return Err(status);
-            }
-        };
-        shadow.provider_routine_thunk = thunk.run_va;
-        shadow.provider_routine_binding = Some(thunk.binding);
-        acquired_binding = Some(thunk.binding);
-        shadow.dependent_routine = dependent_routine;
-    }
-    shadow.dependent_context = dependent_context;
+    let schedule_token = shadow.schedule_state.begin_schedule().map_err(|error| match error {
+        HostedOneShotCallbackError::Busy => nt_status::NtStatus::DEVICE_BUSY.raw(),
+        HostedOneShotCallbackError::GenerationExhausted => STATUS_INSUFFICIENT_RESOURCES,
+        HostedOneShotCallbackError::Indeterminate
+        | HostedOneShotCallbackError::InvalidToken
+        | HostedOneShotCallbackError::InvalidTransition => STATUS_DEVICE_NOT_READY,
+    })?;
     if !store_hosted_provider_ndis_work_item_shadow(index, shadow) {
-        if let Some(binding) = acquired_binding {
-            let _ = release_instance_executable_thunk_binding(binding, true);
-        }
         if constructing {
             rollback_hosted_provider_ndis_work_item_construction(index);
         }
+        return Err(STATUS_DEVICE_NOT_READY);
+    }
+    let thunk = match provider_marshal_emit_callback_thunk(
+        provider_instance,
+        dependent_instance,
+        dependent_routine,
+        NDIS_WORK_ITEM_ROUTINE_CALLBACK_OFFSET_X64,
+        HOSTED_PROVIDER_CALLBACK_KIND_NDIS_WORK_ITEM,
+    ) {
+        Ok(thunk) => thunk,
+        Err(status) => {
+            abort_hosted_provider_ndis_work_item_schedule(index, schedule_token, constructing);
+            return Err(status);
+        }
+    };
+    shadow.preparing = HostedProviderNdisWorkItemInvocation {
+        token: Some(schedule_token),
+        dependent_context,
+        dependent_routine,
+        provider_routine_thunk: thunk.run_va,
+        provider_routine_binding: Some(thunk.binding),
+    };
+    if !store_hosted_provider_ndis_work_item_shadow(index, shadow) {
+        let _ = release_instance_executable_thunk_binding(thunk.binding, true);
+        abort_hosted_provider_ndis_work_item_schedule(index, schedule_token, constructing);
         HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_DEVICE_NOT_READY);
     }
@@ -21724,6 +21768,7 @@ unsafe fn hosted_provider_ndis_work_item_shadow(
         shadow.provider_component_va,
         NDIS_WORK_ITEM_LEN_X64,
     ) else {
+        abort_hosted_provider_ndis_work_item_schedule(index, schedule_token, constructing);
         HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_INVALID_PARAMETER);
     };
@@ -21734,9 +21779,41 @@ unsafe fn hosted_provider_ndis_work_item_shadow(
     );
     write_unaligned(
         (provider_exec_va + NDIS_WORK_ITEM_ROUTINE_OFFSET_X64) as *mut u64,
-        shadow.provider_routine_thunk,
+        thunk.run_va,
     );
-    Ok((shadow.provider_component_va, index, constructing))
+    Ok((
+        shadow.provider_component_va,
+        index,
+        constructing,
+        schedule_token,
+    ))
+}
+
+unsafe fn abort_hosted_provider_ndis_work_item_schedule(
+    index: usize,
+    token: HostedOneShotCallbackToken,
+    parent_constructing: bool,
+) {
+    let Some(record) = hosted_provider_ndis_work_item_shadows_mut().get_mut(index) else {
+        return;
+    };
+    if !record.present || record.preparing.token != Some(token) && !record.preparing.is_empty() {
+        return;
+    }
+    let state_cancelled = record.schedule_state.cancel_schedule(token).is_ok();
+    let binding_released = match record.preparing.provider_routine_binding {
+        Some(binding) => release_instance_executable_thunk_binding(binding, true),
+        None => true,
+    };
+    if state_cancelled && binding_released {
+        record.preparing = HostedProviderNdisWorkItemInvocation::empty();
+    } else {
+        record.construction_state = HostedProviderConstructionState::CompensationRequired;
+        return;
+    }
+    if parent_constructing {
+        rollback_hosted_provider_ndis_work_item_construction(index);
+    }
 }
 
 unsafe fn rollback_hosted_provider_ndis_work_item_construction(index: usize) {
@@ -21753,10 +21830,14 @@ unsafe fn rollback_hosted_provider_ndis_work_item_construction(index: usize) {
         return;
     }
     record.construction_state = HostedProviderConstructionState::RollingBack;
-    let binding_released = match record.provider_routine_binding {
+    if !record.queued.is_empty() || !record.active.is_empty() || !record.schedule_state.can_retire() {
+        record.construction_state = HostedProviderConstructionState::CompensationRequired;
+        return;
+    }
+    let binding_released = match record.preparing.provider_routine_binding {
         Some(binding) => {
             if release_instance_executable_thunk_binding(binding, true) {
-                record.provider_routine_binding = None;
+                record.preparing = HostedProviderNdisWorkItemInvocation::empty();
                 true
             } else {
                 false
@@ -21782,25 +21863,35 @@ unsafe fn rollback_hosted_provider_ndis_work_item_construction(index: usize) {
     }
 }
 
-unsafe fn retain_indeterminate_hosted_provider_ndis_work_item_construction(index: usize) {
+unsafe fn retain_indeterminate_hosted_provider_ndis_work_item_schedule(
+    index: usize,
+    token: HostedOneShotCallbackToken,
+) {
     if let Some(record) = hosted_provider_ndis_work_item_shadows_mut().get_mut(index) {
-        if record.present
-            && record.construction_state == HostedProviderConstructionState::Constructing
-        {
+        if record.present && record.schedule_state.mark_schedule_indeterminate(token).is_ok() {
             record.construction_state = HostedProviderConstructionState::CompensationRequired;
         }
     }
 }
 
-unsafe fn finish_hosted_provider_ndis_work_item_construction(index: usize) -> bool {
+unsafe fn commit_hosted_provider_ndis_work_item_schedule(
+    index: usize,
+    token: HostedOneShotCallbackToken,
+    parent_constructing: bool,
+) -> bool {
     let Some(record) = hosted_provider_ndis_work_item_shadows_mut().get_mut(index) else {
         return false;
     };
     if !record.present
-        || record.construction_state != HostedProviderConstructionState::Constructing
-        || record.dependent_routine == 0
-        || record.provider_routine_thunk == 0
-        || record.provider_routine_binding.is_none()
+        || record.preparing.token != Some(token)
+        || record.preparing.dependent_routine == 0
+        || record.preparing.provider_routine_thunk == 0
+        || record.preparing.provider_routine_binding.is_none()
+        || !record.queued.is_empty()
+        || parent_constructing
+            && record.construction_state != HostedProviderConstructionState::Constructing
+        || !parent_constructing
+            && record.construction_state != HostedProviderConstructionState::Published
         || !hosted_provider_object_owner_is_live(
             record.owner,
             record.provider_instance,
@@ -21809,7 +21900,14 @@ unsafe fn finish_hosted_provider_ndis_work_item_construction(index: usize) -> bo
     {
         return false;
     }
-    record.construction_state = HostedProviderConstructionState::Published;
+    if record.schedule_state.commit_schedule(token).is_err() {
+        return false;
+    }
+    record.queued = record.preparing;
+    record.preparing = HostedProviderNdisWorkItemInvocation::empty();
+    if parent_constructing {
+        record.construction_state = HostedProviderConstructionState::Published;
+    }
     true
 }
 
@@ -21841,7 +21939,10 @@ unsafe fn clear_hosted_provider_ndis_work_item_shadows_for_instance(
         {
             continue;
         }
-        if record.provider_routine_binding.is_some()
+        if !record.preparing.is_empty()
+            || !record.queued.is_empty()
+            || !record.active.is_empty()
+            || !record.schedule_state.can_retire()
             || !hosted_provider_object_owner_matches_instance(
             record.owner,
             record.provider_instance,
@@ -21861,6 +21962,132 @@ unsafe fn clear_hosted_provider_ndis_work_item_shadows_for_instance(
         }
     }
     failures
+}
+
+#[derive(Clone, Copy)]
+struct HostedProviderNdisWorkItemDispatch {
+    shadow_index: usize,
+    token: HostedOneShotCallbackToken,
+}
+
+unsafe fn begin_hosted_provider_ndis_work_item_dispatch(
+    provider_instance: usize,
+    work_item: u64,
+    provider_component_va: u64,
+) -> Result<Option<HostedProviderNdisWorkItemDispatch>, i32> {
+    let Some((index, mut record)) = find_hosted_provider_ndis_work_item_shadow_by_provider(
+        provider_instance,
+        provider_component_va,
+    ) else {
+        return Ok(None);
+    };
+    if record
+        .provider_component_va
+        .checked_add(NDIS_WORK_ITEM_WRAPPER_RESERVED_OFFSET_X64)
+        != Some(work_item)
+        || record.queued.is_empty()
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let token = record
+        .schedule_state
+        .begin_provider_dispatch()
+        .map_err(|_| STATUS_DEVICE_NOT_READY)?;
+    if record.queued.token != Some(token) || !record.active.is_empty() {
+        return Err(STATUS_DEVICE_NOT_READY);
+    }
+    record.active = record.queued;
+    record.queued = HostedProviderNdisWorkItemInvocation::empty();
+    if !store_hosted_provider_ndis_work_item_shadow(index, record) {
+        return Err(STATUS_DEVICE_NOT_READY);
+    }
+    Ok(Some(HostedProviderNdisWorkItemDispatch {
+        shadow_index: index,
+        token,
+    }))
+}
+
+unsafe fn observe_hosted_provider_ndis_work_item_callback(
+    dispatch: HostedProviderNdisWorkItemDispatch,
+    target: u64,
+) -> Option<HostedProviderNdisWorkItemInvocation> {
+    let record = hosted_provider_ndis_work_item_shadows_mut().get_mut(dispatch.shadow_index)?;
+    if !record.present
+        || record.construction_state != HostedProviderConstructionState::Published
+        || record.active.token != Some(dispatch.token)
+        || record.active.dependent_routine != target
+        || record.active.provider_routine_binding.is_none()
+        || record
+            .schedule_state
+            .observe_callback(dispatch.token)
+            .is_err()
+    {
+        return None;
+    }
+    Some(record.active)
+}
+
+unsafe fn mark_hosted_provider_ndis_work_item_dispatch_indeterminate(
+    dispatch: HostedProviderNdisWorkItemDispatch,
+) {
+    if let Some(record) = hosted_provider_ndis_work_item_shadows_mut().get_mut(dispatch.shadow_index)
+    {
+        if record.present
+            && record.active.token == Some(dispatch.token)
+            && record
+                .schedule_state
+                .mark_provider_dispatch_indeterminate(dispatch.token)
+                .is_ok()
+        {
+            record.construction_state = HostedProviderConstructionState::CompensationRequired;
+        }
+    }
+}
+
+unsafe fn complete_hosted_provider_ndis_work_item_dispatch(
+    dispatch: HostedProviderNdisWorkItemDispatch,
+) -> bool {
+    let Some(record) = hosted_provider_ndis_work_item_shadows_mut().get_mut(dispatch.shadow_index)
+    else {
+        return false;
+    };
+    if !record.present
+        || record.construction_state != HostedProviderConstructionState::Published
+        || record.active.token != Some(dispatch.token)
+    {
+        return false;
+    }
+    let Ok(can_retire) = record
+        .schedule_state
+        .complete_provider_dispatch(dispatch.token)
+    else {
+        mark_hosted_provider_ndis_work_item_dispatch_indeterminate(dispatch);
+        return false;
+    };
+    let Some(binding) = record.active.provider_routine_binding else {
+        record.construction_state = HostedProviderConstructionState::CompensationRequired;
+        return false;
+    };
+    if !release_instance_executable_thunk_binding(binding, true) {
+        record.construction_state = HostedProviderConstructionState::CompensationRequired;
+        return false;
+    }
+    record.active = HostedProviderNdisWorkItemInvocation::empty();
+    if !can_retire {
+        return true;
+    }
+    record.construction_state = HostedProviderConstructionState::RollingBack;
+    if !release_hosted_provider_owned_pool_allocation(
+        record.owner,
+        record.provider_instance,
+        record.dependent_instance,
+        record.provider_instance,
+        record.provider_component_va,
+    ) {
+        return false;
+    }
+    *record = HostedProviderNdisWorkItemShadow::empty();
+    true
 }
 
 unsafe fn provider_marshal_emit_import_thunk_for_instance(
@@ -23463,7 +23690,7 @@ unsafe fn provider_marshal_ndis_work_item(
     dependent_inst: DriverInstance,
     arg_value: u64,
 ) -> Result<u64, i32> {
-    let (provider_component_va, construction_index, constructing) =
+    let (provider_component_va, construction_index, constructing, schedule_token) =
         hosted_provider_ndis_work_item_shadow(
         provider_instance,
         provider_inst,
@@ -23471,9 +23698,9 @@ unsafe fn provider_marshal_ndis_work_item(
         dependent_inst,
         arg_value,
     )?;
-    if constructing {
-        state.ndis_work_item_construction_index = construction_index;
-    }
+    state.ndis_work_item_construction_index = construction_index;
+    state.ndis_work_item_schedule_token = Some(schedule_token);
+    state.ndis_work_item_parent_constructing = constructing;
     Ok(provider_component_va)
 }
 
@@ -25029,20 +25256,30 @@ unsafe fn complete_provider_export_marshal(
         }
     }
     if state.ndis_work_item_construction_index != usize::MAX {
-        if success {
-            if !finish_hosted_provider_ndis_work_item_construction(
-                state.ndis_work_item_construction_index,
-            ) {
-                retain_indeterminate_hosted_provider_ndis_work_item_construction(
+        if let Some(token) = state.ndis_work_item_schedule_token {
+            if success {
+                if !commit_hosted_provider_ndis_work_item_schedule(
                     state.ndis_work_item_construction_index,
+                    token,
+                    state.ndis_work_item_parent_constructing,
+                ) {
+                    retain_indeterminate_hosted_provider_ndis_work_item_schedule(
+                        state.ndis_work_item_construction_index,
+                        token,
+                    );
+                    *result = STATUS_DEVICE_NOT_READY as u32 as u64;
+                    success = false;
+                }
+            } else {
+                abort_hosted_provider_ndis_work_item_schedule(
+                    state.ndis_work_item_construction_index,
+                    token,
+                    state.ndis_work_item_parent_constructing,
                 );
-                *result = STATUS_DEVICE_NOT_READY as u32 as u64;
-                success = false;
             }
         } else {
-            rollback_hosted_provider_ndis_work_item_construction(
-                state.ndis_work_item_construction_index,
-            );
+            *result = STATUS_DEVICE_NOT_READY as u32 as u64;
+            success = false;
         }
     }
     if state.callback_parent_construction_index != usize::MAX {
@@ -26472,6 +26709,18 @@ unsafe fn drain_hosted_work_queue_for_instance(
             HOSTED_WORK_QUEUE_KIND_IO => [arg0, arg1, 0, 0],
             _ => continue,
         };
+        let ndis_work_dispatch = if kind == HOSTED_WORK_QUEUE_KIND_EX {
+            match begin_hosted_provider_ndis_work_item_dispatch(instance_index, work_item, arg0) {
+                Ok(dispatch) => dispatch,
+                Err(status) => {
+                    register_instance_ready(instance_index, false);
+                    write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, saved_irql);
+                    return Err(status);
+                }
+            }
+        } else {
+            None
+        };
         write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, PASSIVE_LEVEL);
         match dispatch_hosted_component_target(
             instance_index,
@@ -26482,6 +26731,13 @@ unsafe fn drain_hosted_work_queue_for_instance(
             [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
         ) {
             Ok(_) => {
+                if ndis_work_dispatch
+                    .is_some_and(|dispatch| !complete_hosted_provider_ndis_work_item_dispatch(dispatch))
+                {
+                    register_instance_ready(instance_index, false);
+                    write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, saved_irql);
+                    return Err(STATUS_DEVICE_NOT_READY);
+                }
                 drained = drained.saturating_add(1);
                 let total = read_volatile((shared + SH_WORK_QUEUE_DRAINED) as *const u64);
                 write_volatile(
@@ -26490,11 +26746,17 @@ unsafe fn drain_hosted_work_queue_for_instance(
                 );
             }
             Err(HostedComponentDispatchError::Status(status)) => {
+                if let Some(dispatch) = ndis_work_dispatch {
+                    mark_hosted_provider_ndis_work_item_dispatch_indeterminate(dispatch);
+                }
                 register_instance_ready(instance_index, false);
                 write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, saved_irql);
                 return Err(status);
             }
             Err(HostedComponentDispatchError::Wall(pr)) => {
+                if let Some(dispatch) = ndis_work_dispatch {
+                    mark_hosted_provider_ndis_work_item_dispatch_indeterminate(dispatch);
+                }
                 trace_hosted_work_queue_wall(
                     instance_index,
                     kind,
@@ -27903,25 +28165,37 @@ unsafe fn service_ndis_work_item_callback(
     if record.callback_offset != NDIS_WORK_ITEM_ROUTINE_CALLBACK_OFFSET_X64 {
         return Err(STATUS_NOT_SUPPORTED);
     }
-    let Some(shadow) = find_hosted_provider_ndis_work_item_shadow_by_provider(
-        provider_instance,
-        record.dependent_instance,
-        arg0,
+    let Some((shadow_index, shadow)) =
+        find_hosted_provider_ndis_work_item_shadow_by_provider(provider_instance, arg0)
+    else {
+        HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    if shadow.dependent_instance != record.dependent_instance || shadow.dependent_component_va == 0 {
+        HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let Some(token) = shadow.active.token else {
+        HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let Some(active) = observe_hosted_provider_ndis_work_item_callback(
+        HostedProviderNdisWorkItemDispatch {
+            shadow_index,
+            token,
+        },
+        record.target,
     ) else {
         HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_INVALID_PARAMETER);
     };
-    if shadow.dependent_routine != record.target || shadow.dependent_component_va == 0 {
-        HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-        return Err(STATUS_INVALID_PARAMETER);
-    }
     dispatch_dependent_provider_callback(
         record,
         dependent_inst,
         exec_code_va,
         [
             shadow.dependent_component_va,
-            shadow.dependent_context,
+            active.dependent_context,
             0,
             0,
         ],
