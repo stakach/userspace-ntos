@@ -2429,7 +2429,12 @@ unsafe fn pump_service_generic_fault(
             return false;
         }
     } else {
-        crate::driver_launch::ensure_paging(page, ch.pml4);
+        let Some(domain) = crate::driver_launch::hosted_domain_identity_for_pml4(ch.pml4) else {
+            return false;
+        };
+        if !crate::driver_launch::ensure_paging(page, ch.pml4, domain) {
+            return false;
+        }
     }
     let f = crate::alloc_frame();
     let map = crate::page_map_r(f, page, crate::RW_NX, ch.pml4);

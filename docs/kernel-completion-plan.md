@@ -11581,6 +11581,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     incomplete. Add lifecycle tests for veto, retry, surprise removal, provider dependency refusal,
     interface/DeviceMap withdrawal, and zero retained ownership after successful removal.
 
+    Exact hosted paging ownership checkpoint (2026-08-26, accepted locally): hosted paging rows are
+    now keyed by complete domain identity, PML4, level, and virtual span. Demand faults resolve the
+    one live hosted domain that owns their PML4 and fail closed if the PML4 is absent or ambiguous.
+    A row for another domain generation blocks reuse instead of treating `seL4_DeleteFirst` as proof
+    that the replacement owns the existing hierarchy. Teardown matches both identity and PML4 and
+    retains rows whose cap deletion fails. Allocation reserves registry capacity before retyping;
+    a temporary cap that cannot be deleted after `DeleteFirst` remains recorded for exact retry.
+    Executive-root MMIO paging now uses the existing executive paging authority rather than entering
+    the hosted-domain table.
+
+    Local validation is green for `cargo fmt --all -- --check`, `git diff --check`, and the
+    freestanding executive check at the established 212-warning baseline. A serialized desktop gate
+    remains required for this paging checkpoint. Review adjustment: next extend persistent IRP,
+    Resource Manager, and DMA ownership with the exact domain generation; then repair provider route,
+    callback, and unload lifetime before starting the ordered PnP removal transaction.
+
     Track one separate rust-micro correctness item after this lifetime tranche: device-frame mapping
     cache attributes are still marked TODO in `rust-micro/src/untyped.rs`. Define and prove the x86
     MMIO/device-memory cache policy rather than relying on comments that describe all device frames

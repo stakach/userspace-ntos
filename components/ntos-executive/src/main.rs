@@ -25239,7 +25239,7 @@ unsafe fn claim_device_pages(bi: &BootInfo, paddr: u64, vaddr: u64, n: u64) -> u
             let mut base = 0u64;
             for p in 0..n {
                 if p == 0 || ((vaddr + p * 0x1000) & 0x1F_FFFF) == 0 {
-                    driver_launch::ensure_paging(vaddr + p * 0x1000, CAP_INIT_THREAD_VSPACE);
+                    ensure_executive_paging(vaddr + p * 0x1000);
                 }
                 let frame = alloc_slot();
                 if p == 0 {

@@ -30090,6 +30090,7 @@ const HOSTED_PAGING_PT_SPAN: u64 = 0x20_0000;
 
 #[derive(Clone, Copy)]
 struct HostedPagingMapping {
+    domain: HostedDomainIdentity,
     pml4: u64,
     level: u8,
     base: u64,
@@ -30129,6 +30130,7 @@ fn hosted_paging_base(page: u64, span: u64) -> u64 {
 }
 
 unsafe fn ensure_hosted_paging_level(
+    domain: HostedDomainIdentity,
     pml4: u64,
     page: u64,
     level: u8,
@@ -30139,11 +30141,23 @@ unsafe fn ensure_hosted_paging_level(
 ) -> bool {
     let base = hosted_paging_base(page, span);
     let mappings = hosted_paging_mappings_mut();
-    if mappings
+    if let Some(mapping) = mappings
         .iter()
-        .any(|mapping| mapping.pml4 == pml4 && mapping.level == level && mapping.base == base)
+        .find(|mapping| mapping.pml4 == pml4 && mapping.level == level && mapping.base == base)
     {
-        return true;
+        if mapping.domain == domain {
+            return true;
+        }
+        print_str(b"[driver-launch] hosted paging owner collision pml4=0x");
+        print_hex64(pml4);
+        print_str(b" base=0x");
+        print_hex64(base);
+        print_str(b"\n");
+        return false;
+    }
+
+    if mappings.try_reserve(1).is_err() {
+        return false;
     }
 
     let cap = alloc_slot();
@@ -30163,8 +30177,11 @@ unsafe fn ensure_hosted_paging_level(
 
     let map = paging_struct_map_r(cap, map_label, base, pml4);
     let stored_cap = if map == SEL4_DELETE_FIRST {
-        let _ = cnode_delete_recycle_r(cap);
-        0
+        if cnode_delete_recycle_r(cap) == 0 {
+            0
+        } else {
+            cap
+        }
     } else if map != 0 {
         print_str(b"[driver-launch] hosted paging ");
         print_str(name);
@@ -30181,6 +30198,7 @@ unsafe fn ensure_hosted_paging_level(
     };
 
     mappings.push(HostedPagingMapping {
+        domain,
         pml4,
         level,
         base,
@@ -30189,7 +30207,10 @@ unsafe fn ensure_hosted_paging_level(
     true
 }
 
-unsafe fn clear_hosted_paging_for_pml4(pml4: u64) -> u64 {
+unsafe fn clear_hosted_paging_for_domain(
+    domain: HostedDomainIdentity,
+    pml4: u64,
+) -> u64 {
     let Some(mappings) = (*core::ptr::addr_of_mut!(HOSTED_PAGING_MAPPINGS)).as_mut() else {
         return 0;
     };
@@ -30197,10 +30218,11 @@ unsafe fn clear_hosted_paging_for_pml4(pml4: u64) -> u64 {
     let mut index = mappings.len();
     while index != 0 {
         index -= 1;
-        if mappings[index].pml4 == pml4 {
-            let mapping = mappings.remove(index);
-            if mapping.cap != 0 && cnode_delete_recycle_r(mapping.cap) != 0 {
+        if mappings[index].domain == domain && mappings[index].pml4 == pml4 {
+            if mappings[index].cap != 0 && cnode_delete_recycle_r(mappings[index].cap) != 0 {
                 failures += 1;
+            } else {
+                mappings.remove(index);
             }
         }
     }
@@ -30285,8 +30307,19 @@ unsafe fn clear_hosted_resource_map_caps_for_device(
 /// Ensure the paging hierarchy covering `page` exists in a hosted driver's `pml4`.
 /// Device resource windows can span multiple 2 MiB leaves and may sit outside the image skeleton's
 /// original 1 GiB page directory, so this builds every level down to the leaf PT.
-pub(crate) unsafe fn ensure_paging(page: u64, pml4: u64) -> bool {
+pub(crate) unsafe fn ensure_paging(
+    page: u64,
+    pml4: u64,
+    domain: HostedDomainIdentity,
+) -> bool {
+    if pml4 == 0
+        || domain.domain_id == nt_io_manager::HostedDomainId::NULL
+        || domain.cookie == 0
+    {
+        return false;
+    }
     ensure_hosted_paging_level(
+        domain,
         pml4,
         page,
         HOSTED_PAGING_LEVEL_PDPT,
@@ -30295,6 +30328,7 @@ pub(crate) unsafe fn ensure_paging(page: u64, pml4: u64) -> bool {
         LBL_X86_PDPT_MAP,
         b"pdpt",
     ) && ensure_hosted_paging_level(
+        domain,
         pml4,
         page,
         HOSTED_PAGING_LEVEL_PD,
@@ -30303,6 +30337,7 @@ pub(crate) unsafe fn ensure_paging(page: u64, pml4: u64) -> bool {
         LBL_X86_PAGE_DIRECTORY_MAP,
         b"pd",
     ) && ensure_hosted_paging_level(
+        domain,
         pml4,
         page,
         HOSTED_PAGING_LEVEL_PT,
@@ -35895,7 +35930,11 @@ unsafe fn release_driver_component_mechanism(index: usize, inst: DriverInstance)
     failures += stack_failures;
     let release = crate::spawn_hosts::release_component_map_cap_bank(inst.map_cap_bank);
     failures += release.failures;
-    failures += clear_hosted_paging_for_pml4(inst.pml4);
+    if let Some(domain) = instance_domain_identity(inst) {
+        failures += clear_hosted_paging_for_domain(domain, inst.pml4);
+    } else if inst.pml4 != 0 {
+        failures += 1;
+    }
     let (source_caps, source_failures) = release_driver_source_frame_runs(inst);
     failures += source_failures;
     if inst.cnode != 0 {
@@ -35982,6 +36021,35 @@ fn instance(i: usize) -> Option<DriverInstance> {
     } else {
         None
     }
+}
+
+fn instance_domain_identity(inst: DriverInstance) -> Option<HostedDomainIdentity> {
+    if inst.hosted_domain_id == 0 || inst.hosted_domain_cookie == 0 {
+        return None;
+    }
+    Some(HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId(inst.hosted_domain_id),
+        cookie: inst.hosted_domain_cookie,
+    })
+}
+
+pub(crate) fn hosted_domain_identity_for_pml4(pml4: u64) -> Option<HostedDomainIdentity> {
+    if pml4 == 0 {
+        return None;
+    }
+    let mut resolved = None;
+    for inst in unsafe { driver_instances()? }
+        .iter()
+        .copied()
+        .filter(|inst| inst.used && inst.pml4 == pml4)
+    {
+        let identity = instance_domain_identity(inst)?;
+        if resolved.is_some_and(|current| current != identity) {
+            return None;
+        }
+        resolved = Some(identity);
+    }
+    resolved
 }
 
 fn instance_by_driver_id(driver_id: u64) -> Option<(usize, DriverInstance)> {
@@ -36351,7 +36419,10 @@ unsafe fn spawn_hosted_driver_worker_thread(
     let scratch_exec_va = exec_base.checked_add(FSD_WORKER_SCRATCH_OFFSET)?;
     let badge = FSD_WORKER_BADGE_BASE.checked_add(exec_alias_slot)?;
 
-    if !ensure_paging(stack_base, inst.pml4) || !crate::ensure_executive_paging(exec_base) {
+    let domain = instance_domain_identity(inst)?;
+    if !ensure_paging(stack_base, inst.pml4, domain)
+        || !crate::ensure_executive_paging(exec_base)
+    {
         return None;
     }
 
@@ -38102,6 +38173,8 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     let (instance_index, inst) = instance_by_driver_id(binding.driver_id)
         .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    let paging_domain =
+        instance_domain_identity(inst).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     if video_memory.is_some() && !hosted_instance_video_port_initialized(inst) {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
@@ -38152,7 +38225,11 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             dma_pages,
         );
         for window in 0..grant.map_pages.div_ceil(512).max(1) {
-            if !ensure_paging(grant.component_va + window * 0x20_0000, inst.pml4) {
+            if !ensure_paging(
+                grant.component_va + window * 0x20_0000,
+                inst.pml4,
+                paging_domain,
+            ) {
                 rollback_staged_hosted_resource_grant(
                     binding,
                     instance_index,
@@ -38248,7 +38325,11 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             return Err(nt_status::NtStatus::INVALID_PARAMETER);
         }
         for window in 0..dma_pages.div_ceil(512).max(1) {
-            if !ensure_paging(dma_va + window * 0x20_0000, inst.pml4) {
+            if !ensure_paging(
+                dma_va + window * 0x20_0000,
+                inst.pml4,
+                paging_domain,
+            ) {
                 rollback_staged_hosted_resource_grant(
                     binding,
                     instance_index,
