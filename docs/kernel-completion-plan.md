@@ -13887,3 +13887,38 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     The root service-loop mark/reset compatibility boundary and dirty-publication finalizer also
     remain: the durable cache watermark is now a hard ownership invariant, but it does not by itself
     justify retiring that older machinery.
+
+    Object Manager Directory roots and relative file attributes (2026-08-27, accepted): a canonical
+    Object Manager Directory handle can now serve as `OBJECT_ATTRIBUTES.RootDirectory` for
+    `NtOpenFile`, `NtCreateFile`, `NtCreateNamedPipeFile`, `NtQueryAttributesFile`, and
+    `NtQueryFullAttributesFile`. Process-local handles are type checked and require
+    `DIRECTORY_TRAVERSE`; legacy bootstrap namespace handles retain their existing full-access
+    contract. At the namespace crossing, the executive reconstructs the exact live absolute
+    directory path into bounded storage, rejects stale, cyclic, over-depth, and truncated identity,
+    joins the relative UTF-16 name once, and then reuses the ordinary absolute device/volume parser.
+    An unresolved Object Manager root cannot enter File-relative dispatch or retry under another
+    authority.
+
+    Attribute queries now use the same captured `OBJECT_ATTRIBUTES` and parse-root contract as file
+    create/open. Writable-overlay and FAT directory File handles query the exact child beneath their
+    live directory object; a non-directory root returns `STATUS_NOT_A_DIRECTORY`. Hosted-provider
+    File roots return `STATUS_NOT_SUPPORTED` until a canonical provider attribute-query IRP is
+    implemented, rather than falling back to an absolute or local lookup. The superseded fixed query
+    name scratch and its allocation-free-but-duplicated PE Unicode/object-attribute readers were
+    deleted.
+
+    Focused validation passes `nt-types` `12/12` and `nt-fs` `69/69`; the freestanding executive
+    release check remains green at the established warning baseline. Serialized acceptance
+    `.tmp/run-headless-object-directory-file-root-20260827.log` completed all five configured PnP
+    starts, exercised 672 writable-filesystem attribute queries, launched genuine userinit and
+    Explorer, painted 480,000/480,000 framebuffer pixels with at least 32 colors, passed all
+    `295/295` gates, and matched the sentinel. Final durable allocation was 14,817,072 B with
+    6,154,320 B reusable; scratch returned to zero after its 278,112 B peak. No allocator
+    corruption, pool exhaustion, or VM allocation failure was reported.
+
+    Review adjustment: Object Manager Directory roots and local File-root attribute queries are
+    closed. Next inventory `NtSetInformationFile` path-bearing classes and implement rooted rename,
+    link, and delete through canonical File/object identity. Do not translate a hosted File root to
+    a local path: add a real provider query/set-information IRP contract first. Continue removing
+    obsolete capture helpers as each consumer moves to `CapturedFileObjectAttributes`. The root
+    service-loop compatibility mark/reset remains a separate lifetime-classification item.

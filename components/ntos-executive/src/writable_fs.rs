@@ -1295,6 +1295,17 @@ pub(crate) unsafe fn query_attributes_relative(
     Some(info)
 }
 
+/// Query a child beneath an existing writable-volume directory FILE_OBJECT without opening it.
+pub(crate) unsafe fn query_attributes_relative_to_directory(
+    root_file_id: u64,
+    relative: &[u8],
+) -> Result<nt_fs::StandardInformation, u32> {
+    let Some(fs) = writable_fs() else {
+        return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+    };
+    fs.query_attributes_relative_to_directory(root_file_id, relative)
+}
+
 /// Query an existing writable-layer entry without mounting the writable volume. This is used by
 /// fixed-drive union paths: an existing writable entry wins, but a missing writable entry must leave
 /// the installed read-only FAT namespace visible.

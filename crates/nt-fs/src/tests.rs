@@ -572,6 +572,43 @@ fn directory_relative_create_rejects_invalid_roots_and_names() {
 }
 
 #[test]
+fn directory_file_object_is_a_real_relative_attribute_root() {
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_directory(r"\??\C:\profiles\Administrator"));
+    assert!(fs.provision_file(r"\??\C:\profiles\Administrator\ntuser.dat", b"regf"));
+    let directory = fs.zw_create_file_relative(
+        b"profiles\\administrator",
+        FILE_READ_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE,
+    );
+    let file = fs.zw_create_file_relative(
+        b"profiles\\administrator\\ntuser.dat",
+        FILE_READ_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
+
+    let info = fs
+        .query_attributes_relative_to_directory(directory.handle, b"NTUSER.DAT")
+        .unwrap();
+    assert_eq!(info.end_of_file, 4);
+    assert!(!info.is_directory);
+    assert_eq!(
+        fs.query_attributes_relative_to_directory(file.handle, b"child"),
+        Err(STATUS_NOT_A_DIRECTORY)
+    );
+    assert_eq!(
+        fs.query_attributes_relative_to_directory(directory.handle, b"missing"),
+        Err(STATUS_OBJECT_NAME_NOT_FOUND)
+    );
+}
+
+#[test]
 fn create_dispositions() {
     let mut fs = FileSystem::new(MemFs::with_fixture());
     // OPEN an existing fixture hive file.

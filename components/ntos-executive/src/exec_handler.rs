@@ -121,15 +121,10 @@ impl CapturedFileObjectAttributes {
 #[derive(Copy, Clone)]
 enum FileParseRoot {
     Absolute,
-    FatDirectory {
-        first_cluster: u32,
-        object_id: u32,
-    },
+    ObjectDirectory { index: usize },
+    FatDirectory { first_cluster: u32, object_id: u32 },
     OverlayFile(u64),
-    HostedFile {
-        file_id: u64,
-        device_id: u64,
-    },
+    HostedFile { file_id: u64, device_id: u64 },
     NonDirectoryFile,
 }
 
@@ -353,7 +348,6 @@ static SETUP_PROVISION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 // The hosted syscall lane is single-dispatch today; keep overlay copy chunks out of the bump heap.
 static mut OVERLAY_WRITE_SCRATCH: [u8; 64 * 1024] = [0; 64 * 1024];
 static mut SETUP_UNATTEND_SCRATCH: [u8; 4096] = [0; 4096];
-static mut NT_QUERY_ATTR_NAME16_SCRATCH: [u16; 1024] = [0; 1024];
 static mut NT_QUERY_ATTR_FOLDED_SCRATCH: [u8; 1024] = [0; 1024];
 static mut NT_QUERY_ATTR_RELATIVE_SCRATCH: [u8; FILE_VOLUME_RELATIVE_CAP] =
     [0; FILE_VOLUME_RELATIVE_CAP];
@@ -9816,14 +9810,11 @@ impl ExecNtHandler {
     ) -> (u32, u64, u64) {
         let mut folded = [0u8; FILE_OBJECT_NAME_CAP];
         let mut relative = [0u8; FILE_OBJECT_NAME_CAP];
-        let relative_len = match Self::capture_relative_file_path(
-            name16,
-            &mut folded,
-            &mut relative,
-        ) {
-            Ok(length) => length,
-            Err(status) => return (status, 0, 0),
-        };
+        let relative_len =
+            match Self::capture_relative_file_path(name16, &mut folded, &mut relative) {
+                Ok(length) => length,
+                Err(status) => return (status, 0, 0),
+            };
         let relative = &relative[..relative_len];
 
         let publish_overlay = |this: &mut Self, result: (u32, Option<u64>, u64)| {
@@ -9945,9 +9936,9 @@ impl ExecNtHandler {
                 )
             }
             FileParseRoot::NonDirectoryFile => (nt_fs::STATUS_NOT_A_DIRECTORY, 0, 0),
-            FileParseRoot::Absolute | FileParseRoot::HostedFile { .. } => {
-                (STATUS_INVALID_HANDLE, 0, 0)
-            }
+            FileParseRoot::Absolute
+            | FileParseRoot::ObjectDirectory { .. }
+            | FileParseRoot::HostedFile { .. } => (STATUS_INVALID_HANDLE, 0, 0),
         }
     }
 
@@ -14482,6 +14473,53 @@ impl ExecNtHandler {
         n
     }
 
+    /// Reconstruct a canonical namespace path without truncation. File parsing uses this stricter
+    /// form because a shortened Object Manager directory name must never select a different device
+    /// or volume.
+    fn object_namespace_path_exact(&self, index: usize, out: &mut [u8]) -> Option<usize> {
+        const MAX_COMPONENTS: usize = NAMED_OBJECT_PATH_CAP / 2 + 1;
+        let mut chain = [0usize; MAX_COMPONENTS];
+        let mut count = 0usize;
+        let mut current = index;
+        loop {
+            let entry = self.obj_ns.get(current)?;
+            if !entry.is_live() || count == chain.len() {
+                return None;
+            }
+            chain[count] = current;
+            count += 1;
+            if entry.parent == OBJ_PARENT_ROOT {
+                break;
+            }
+            current = entry.parent;
+        }
+        if out.is_empty() {
+            return None;
+        }
+        out[0] = b'\\';
+        let mut length = 1usize;
+        for position in (0..count).rev() {
+            let entry = &self.obj_ns[chain[position]];
+            if entry.parent == OBJ_PARENT_ROOT {
+                continue;
+            }
+            let separator = usize::from(length > 1);
+            let next = length
+                .checked_add(separator)?
+                .checked_add(entry.name().len())?;
+            if next > out.len() {
+                return None;
+            }
+            if separator != 0 {
+                out[length] = b'\\';
+                length += 1;
+            }
+            out[length..next].copy_from_slice(entry.name());
+            length = next;
+        }
+        Some(length)
+    }
+
     fn write_ascii_utf16le(src: &[u8], dst: &mut [u8]) -> usize {
         let mut n = 0usize;
         for &b in src {
@@ -18537,39 +18575,6 @@ impl ExecNtHandler {
         out
     }
 
-    unsafe fn read_ustr_pe_into(&self, ustr_va: u64, out: &mut [u16]) -> Option<usize> {
-        if ustr_va == 0 {
-            return None;
-        }
-        let mut header = [0u8; 16];
-        if !self.xas_read(ustr_va, &mut header) {
-            return None;
-        }
-        let byte_len = u16::from_le_bytes([header[0], header[1]]) as usize;
-        let maximum_len = u16::from_le_bytes([header[2], header[3]]) as usize;
-        let buffer_va = u64::from_le_bytes(header[8..16].try_into().unwrap());
-        if byte_len & 1 != 0 || byte_len > maximum_len || byte_len / 2 > out.len() {
-            return None;
-        }
-        if byte_len == 0 {
-            return Some(0);
-        }
-        if buffer_va == 0 {
-            return None;
-        }
-        let units = byte_len / 2;
-        let mut i = 0usize;
-        while i < units {
-            let mut w = [0u8; 2];
-            if !self.xas_read(buffer_va + (i as u64) * 2, &mut w) {
-                return None;
-            }
-            out[i] = u16::from_le_bytes(w);
-            i += 1;
-        }
-        Some(units)
-    }
-
     unsafe fn read_directory_pattern(
         &self,
         ustr_va: u64,
@@ -18619,18 +18624,6 @@ impl ExecNtHandler {
             return alloc::vec::Vec::new();
         }
         self.read_ustr_pe(objname)
-    }
-
-    unsafe fn read_objattr_name_pe_into(&self, oa_va: u64, out: &mut [u16]) -> Option<usize> {
-        let mut p = [0u8; 8];
-        if !self.xas_read(oa_va + 0x10, &mut p) {
-            return None;
-        }
-        let objname = u64::from_le_bytes(p);
-        if objname == 0 {
-            return Some(0);
-        }
-        self.read_ustr_pe_into(objname, out)
     }
 
     /// Capture the caller-owned part of an I/O Manager file open. The fixed representation may be
@@ -18704,12 +18697,28 @@ impl ExecNtHandler {
                 Err(STATUS_OBJECT_PATH_SYNTAX_BAD)
             };
         }
+        if captured.root >= OBJ_HANDLE_BASE {
+            let index = self.object_namespace_index_for_handle(
+                captured.root,
+                Some(OBJ_KIND_DIRECTORY),
+                DIRECTORY_TRAVERSE_ACCESS,
+            )?;
+            return Ok(FileParseRoot::ObjectDirectory { index });
+        }
         let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
         let object = self
             .pm
             .lookup_handle(pid, captured.root as nt_process::Handle)
             .ok_or(STATUS_INVALID_HANDLE)?;
         match object {
+            nt_process::HandleObject::Opaque(_) => {
+                let index = self.object_namespace_index_for_handle(
+                    captured.root,
+                    Some(OBJ_KIND_DIRECTORY),
+                    DIRECTORY_TRAVERSE_ACCESS,
+                )?;
+                Ok(FileParseRoot::ObjectDirectory { index })
+            }
             nt_process::HandleObject::Directory {
                 first_cluster,
                 object_id,
@@ -18751,13 +18760,34 @@ impl ExecNtHandler {
         }
     }
 
+    fn normalize_object_directory_file_name<'a>(
+        &self,
+        root: FileParseRoot,
+        name: &'a [u16],
+        namespace_path: &mut [u8],
+        absolute_name: &'a mut [u16],
+    ) -> Result<(FileParseRoot, &'a [u16]), u32> {
+        let FileParseRoot::ObjectDirectory { index } = root else {
+            return Ok((root, name));
+        };
+        let path_len = self
+            .object_namespace_path_exact(index, namespace_path)
+            .ok_or(STATUS_OBJECT_NAME_INVALID)?;
+        let name_len = nt_types::join_object_directory_name_into(
+            &namespace_path[..path_len],
+            name,
+            absolute_name,
+        )
+        .ok_or(STATUS_OBJECT_NAME_INVALID)?;
+        Ok((FileParseRoot::Absolute, &absolute_name[..name_len]))
+    }
+
     fn capture_relative_file_path(
         name: &[u16],
         folded: &mut [u8],
         relative: &mut [u8],
     ) -> Result<usize, u32> {
-        nt_fs::nt_file_relative_path_into(name, folded, relative)
-            .ok_or(STATUS_OBJECT_NAME_INVALID)
+        nt_fs::nt_file_relative_path_into(name, folded, relative).ok_or(STATUS_OBJECT_NAME_INVALID)
     }
 
     fn join_volume_relative_path(
@@ -18778,6 +18808,47 @@ impl ExecNtHandler {
         }
         output[parent.len() + separator..length].copy_from_slice(child);
         Ok(length)
+    }
+
+    unsafe fn query_local_file_relative(
+        &self,
+        root: FileParseRoot,
+        name: &[u16],
+    ) -> Result<nt_fs::StandardInformation, u32> {
+        let mut folded = [0u8; FILE_OBJECT_NAME_CAP];
+        let mut relative = [0u8; FILE_OBJECT_NAME_CAP];
+        let relative_len = Self::capture_relative_file_path(name, &mut folded, &mut relative)?;
+        let relative = &relative[..relative_len];
+        match root {
+            FileParseRoot::OverlayFile(root_file_id) => unsafe {
+                crate::writable_fs::query_attributes_relative_to_directory(root_file_id, relative)
+            },
+            FileParseRoot::FatDirectory {
+                first_cluster,
+                object_id,
+            } => {
+                let open = self.directory_opens.get(object_id)?;
+                if open.first_cluster != first_cluster {
+                    return Err(STATUS_INVALID_HANDLE);
+                }
+                let Some((_, size, fat_attributes)) = exec_fs().and_then(|fs| {
+                    crate::fs_loader::fat_open_path_entry_from(&fs, first_cluster, relative)
+                }) else {
+                    return Err(nt_fs::STATUS_OBJECT_NAME_NOT_FOUND);
+                };
+                let attributes = nt_fs::file_attributes_from_fat(fat_attributes);
+                Ok(nt_fs::StandardInformation {
+                    end_of_file: size as u64,
+                    is_directory: attributes & nt_fs::FILE_ATTRIBUTE_DIRECTORY != 0,
+                    attributes,
+                })
+            }
+            FileParseRoot::NonDirectoryFile => Err(nt_fs::STATUS_NOT_A_DIRECTORY),
+            FileParseRoot::HostedFile { .. } => Err(STATUS_NOT_SUPPORTED),
+            FileParseRoot::Absolute | FileParseRoot::ObjectDirectory { .. } => {
+                Err(STATUS_INVALID_HANDLE)
+            }
+        }
     }
 
     /// Render a complete FILE_BASIC_INFORMATION with the backing volume's real attributes. This
@@ -19103,9 +19174,10 @@ impl ExecNtHandler {
         .iter()
         .any(|candidate| {
             path.len() == candidate.len()
-                && path.iter().zip(*candidate).all(|(&unit, &byte)| {
-                    unit <= 0x7f && (unit as u8).eq_ignore_ascii_case(&byte)
-                })
+                && path
+                    .iter()
+                    .zip(*candidate)
+                    .all(|(&unit, &byte)| unit <= 0x7f && (unit as u8).eq_ignore_ascii_case(&byte))
         })
     }
 
@@ -21223,17 +21295,37 @@ impl ExecNtHandler {
     #[inline(never)]
     unsafe fn nt_query_attributes_file_service(&mut self, args: &[u64]) -> u32 {
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-        const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
         let ctx = self.loop_ctx.unwrap();
         let reg = unsafe { &*ctx.reg };
-        let name16_buf = unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_NAME16_SCRATCH) };
-        let Some(name16_len) = (unsafe { self.read_objattr_name_pe_into(args[0], name16_buf) })
-        else {
-            return STATUS_OBJECT_NAME_INVALID;
+        let captured = match unsafe { self.capture_file_object_attributes(args[0]) } {
+            Ok(captured) => captured,
+            Err(status) => return status,
         };
-        let name16 = &name16_buf[..name16_len];
-        if name16.is_empty() {
-            return STATUS_OBJECT_NAME_INVALID;
+        let parse_root = match self.resolve_file_parse_root(&captured) {
+            Ok(root) => root,
+            Err(status) => return status,
+        };
+        let mut namespace_path = [0u8; NAMED_OBJECT_PATH_CAP];
+        let mut absolute_name = [0u16; FILE_OBJECT_NAME_CAP];
+        let (parse_root, name16) = match self.normalize_object_directory_file_name(
+            parse_root,
+            captured.name(),
+            &mut namespace_path,
+            &mut absolute_name,
+        ) {
+            Ok(resolved) => resolved,
+            Err(status) => return status,
+        };
+        if !matches!(parse_root, FileParseRoot::Absolute) {
+            let info = match unsafe { self.query_local_file_relative(parse_root, name16) } {
+                Ok(info) => info,
+                Err(status) => return status,
+            };
+            return if unsafe { self.write_file_basic_attributes(args[1], info.attributes) } {
+                nt_fs::STATUS_SUCCESS
+            } else {
+                STATUS_ACCESS_VIOLATION
+            };
         }
         // The writable overlay wins for paths it owns. A miss is not enough to hide an installed
         // read-only file that has not been modified yet, so unresolved prefix paths continue into
@@ -21339,17 +21431,37 @@ impl ExecNtHandler {
     #[inline(never)]
     unsafe fn nt_query_full_attributes_file_service(&mut self, args: &[u64]) -> u32 {
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-        const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
         let ctx = self.loop_ctx.unwrap();
         let reg = unsafe { &*ctx.reg };
-        let name16_buf = unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_NAME16_SCRATCH) };
-        let Some(name16_len) = (unsafe { self.read_objattr_name_pe_into(args[0], name16_buf) })
-        else {
-            return STATUS_OBJECT_NAME_INVALID;
+        let captured = match unsafe { self.capture_file_object_attributes(args[0]) } {
+            Ok(captured) => captured,
+            Err(status) => return status,
         };
-        let name16 = &name16_buf[..name16_len];
-        if name16.is_empty() {
-            return STATUS_OBJECT_NAME_INVALID;
+        let parse_root = match self.resolve_file_parse_root(&captured) {
+            Ok(root) => root,
+            Err(status) => return status,
+        };
+        let mut namespace_path = [0u8; NAMED_OBJECT_PATH_CAP];
+        let mut absolute_name = [0u16; FILE_OBJECT_NAME_CAP];
+        let (parse_root, name16) = match self.normalize_object_directory_file_name(
+            parse_root,
+            captured.name(),
+            &mut namespace_path,
+            &mut absolute_name,
+        ) {
+            Ok(resolved) => resolved,
+            Err(status) => return status,
+        };
+        if !matches!(parse_root, FileParseRoot::Absolute) {
+            let info = match unsafe { self.query_local_file_relative(parse_root, name16) } {
+                Ok(info) => info,
+                Err(status) => return status,
+            };
+            return if unsafe { self.write_file_network_open_information(args[1], info) } {
+                nt_fs::STATUS_SUCCESS
+            } else {
+                STATUS_ACCESS_VIOLATION
+            };
         }
 
         let folded_scratch = unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_FOLDED_SCRATCH) };
@@ -21442,9 +21554,19 @@ impl ExecNtHandler {
             Ok(captured) => captured,
             Err(status) => return status,
         };
-        let name16 = captured.name();
         let parse_root = match self.resolve_file_parse_root(&captured) {
             Ok(root) => root,
+            Err(status) => return status,
+        };
+        let mut namespace_path = [0u8; NAMED_OBJECT_PATH_CAP];
+        let mut absolute_name = [0u16; FILE_OBJECT_NAME_CAP];
+        let (parse_root, name16) = match self.normalize_object_directory_file_name(
+            parse_root,
+            captured.name(),
+            &mut namespace_path,
+            &mut absolute_name,
+        ) {
+            Ok(resolved) => resolved,
             Err(status) => return status,
         };
         let _captured_attributes = captured.attributes;
@@ -21697,8 +21819,7 @@ impl ExecNtHandler {
                 nt_fs::FILE_OPEN,
                 open_options,
             );
-            if !Self::overlay_open_missed(status) || Self::readonly_volume_entry(name16).is_none()
-            {
+            if !Self::overlay_open_missed(status) || Self::readonly_volume_entry(name16).is_none() {
                 let mut opened_handle = 0u64;
                 if let Some(file_id) = file_id {
                     self.writable_fs_dirty = true;
@@ -21795,7 +21916,7 @@ impl ExecNtHandler {
         let volume_entry = volume_path.and_then(|path| {
             exec_fs().and_then(|fs| {
                 if path.is_empty() {
-                        Some((fs.root_cl, 0, 0x10))
+                    Some((fs.root_cl, 0, 0x10))
                 } else {
                     fat_open_path_entry(&fs, path)
                 }
@@ -24109,9 +24230,19 @@ impl ExecNtHandler {
                     Ok(captured) => captured,
                     Err(status) => return status,
                 };
-                let name16 = captured.name();
                 let parse_root = match self.resolve_file_parse_root(&captured) {
                     Ok(root) => root,
+                    Err(status) => return status,
+                };
+                let mut namespace_path = [0u8; NAMED_OBJECT_PATH_CAP];
+                let mut absolute_name = [0u16; FILE_OBJECT_NAME_CAP];
+                let (parse_root, name16) = match self.normalize_object_directory_file_name(
+                    parse_root,
+                    captured.name(),
+                    &mut namespace_path,
+                    &mut absolute_name,
+                ) {
+                    Ok(resolved) => resolved,
                     Err(status) => return status,
                 };
                 let _captured_attributes = captured.attributes;
@@ -24136,6 +24267,7 @@ impl ExecNtHandler {
                     }
                     FileParseRoot::FatDirectory { .. }
                     | FileParseRoot::OverlayFile(_)
+                    | FileParseRoot::ObjectDirectory { .. }
                     | FileParseRoot::NonDirectoryFile => return STATUS_INVALID_HANDLE,
                 };
                 let share_access = nt_ulong_arg(args[4]);
@@ -29618,9 +29750,19 @@ impl ExecNtHandler {
                     Ok(captured) => captured,
                     Err(status) => return status,
                 };
-                let name16 = captured.name();
                 let parse_root = match self.resolve_file_parse_root(&captured) {
                     Ok(root) => root,
+                    Err(status) => return status,
+                };
+                let mut namespace_path = [0u8; NAMED_OBJECT_PATH_CAP];
+                let mut absolute_name = [0u16; FILE_OBJECT_NAME_CAP];
+                let (parse_root, name16) = match self.normalize_object_directory_file_name(
+                    parse_root,
+                    captured.name(),
+                    &mut namespace_path,
+                    &mut absolute_name,
+                ) {
+                    Ok(resolved) => resolved,
                     Err(status) => return status,
                 };
                 let _captured_attributes = captured.attributes;
@@ -30006,9 +30148,7 @@ impl ExecNtHandler {
                             {
                                 crate::writable_fs::note_directory_create(self.pi, relative, true);
                             } else if status == nt_fs::STATUS_OBJECT_NAME_COLLISION {
-                                crate::writable_fs::note_directory_create(
-                                    self.pi, relative, false,
-                                );
+                                crate::writable_fs::note_directory_create(self.pi, relative, false);
                             }
                         } else if status == nt_fs::STATUS_SUCCESS
                             && info == nt_fs::FILE_CREATED as u64
@@ -30133,8 +30273,7 @@ impl ExecNtHandler {
                                 info = 0;
                             }
                         }
-                    } else if let Some(miss_status) = Self::readonly_disk_open_miss_status(name16)
-                    {
+                    } else if let Some(miss_status) = Self::readonly_disk_open_miss_status(name16) {
                         status = miss_status;
                         let count =
                             NT_CREATE_FILE_READONLY_FAT_MISSES.fetch_add(1, Ordering::Relaxed);

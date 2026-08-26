@@ -24,7 +24,7 @@ pub use object::{
     ClientId, Generation, HandleValue, ObjAttrFlags, ObjectId, ObjectTypeId, GEN_BITS, SLOT_BITS,
 };
 #[cfg(feature = "alloc")]
-pub use path::{NtPath, UnicodeString};
+pub use path::{join_object_directory_name_into, NtPath, UnicodeString};
 
 bitflags::bitflags! {
     /// A Windows access mask. The named bits are the standard + generic rights

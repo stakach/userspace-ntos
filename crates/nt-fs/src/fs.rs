@@ -1800,7 +1800,11 @@ impl MemFs {
     }
 
     fn query_folded_relative(&self, rel_path: &[u8]) -> Option<StandardInformation> {
-        let id = self.lookup_folded_relative(rel_path)?;
+        self.query_folded_from(0, rel_path)
+    }
+
+    fn query_folded_from(&self, start: u64, rel_path: &[u8]) -> Option<StandardInformation> {
+        let id = self.lookup_folded_from(start, rel_path)?;
         Some(StandardInformation {
             end_of_file: self.size(id),
             is_directory: self.is_dir(id),
@@ -3202,6 +3206,29 @@ impl FileSystem {
     /// canonical relative path.
     pub fn query_attributes_relative(&self, relative: &[u8]) -> Option<StandardInformation> {
         self.volume.query_folded_relative(relative)
+    }
+
+    /// Query a folded path beneath an existing directory FILE_OBJECT without opening the child.
+    pub fn query_attributes_relative_to_directory(
+        &self,
+        root_directory: u64,
+        relative: &[u8],
+    ) -> Result<StandardInformation, u32> {
+        let Some(root_node) = self.obj(root_directory).map(|object| object.node_id) else {
+            return Err(STATUS_INVALID_HANDLE);
+        };
+        let Some(root) = self.volume.node(root_node) else {
+            return Err(STATUS_INVALID_HANDLE);
+        };
+        if !root.is_dir {
+            return Err(STATUS_NOT_A_DIRECTORY);
+        }
+        if relative.is_empty() || relative.first() == Some(&b'\\') {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        self.volume
+            .query_folded_from(root_node, relative)
+            .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)
     }
 
     /// `ZwClose` (spec §8.7, §6.2): cleanup-before-close, then free the file object. A file object

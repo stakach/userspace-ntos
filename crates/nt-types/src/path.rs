@@ -79,6 +79,39 @@ fn fold_ascii(u: u16) -> u16 {
     }
 }
 
+/// Join a canonical absolute Object Manager directory path to a relative file name without
+/// allocating. The directory path is ASCII because it comes from the kernel namespace table; the
+/// file name remains exact UTF-16 for the target filesystem's parser.
+pub fn join_object_directory_name_into(
+    directory: &[u8],
+    relative: &[u16],
+    output: &mut [u16],
+) -> Option<usize> {
+    if directory.first() != Some(&b'\\')
+        || directory.iter().any(|byte| !byte.is_ascii())
+        || relative.is_empty()
+        || relative.first() == Some(&SEPARATOR)
+    {
+        return None;
+    }
+    let separator = usize::from(directory != b"\\" && directory.last() != Some(&b'\\'));
+    let length = directory
+        .len()
+        .checked_add(separator)?
+        .checked_add(relative.len())?;
+    if length > output.len() {
+        return None;
+    }
+    for (index, byte) in directory.iter().copied().enumerate() {
+        output[index] = byte as u16;
+    }
+    if separator != 0 {
+        output[directory.len()] = SEPARATOR;
+    }
+    output[directory.len() + separator..length].copy_from_slice(relative);
+    Some(length)
+}
+
 impl FromIterator<u16> for UnicodeString {
     fn from_iter<T: IntoIterator<Item = u16>>(iter: T) -> Self {
         Self {
@@ -244,5 +277,39 @@ mod tests {
         assert!(a.eq_ignore_ascii_case(&b));
         assert_eq!(a.to_ascii_folded(), UnicodeString::from_str("event"));
         assert_ne!(a, b); // exact comparison still distinguishes
+    }
+
+    #[test]
+    fn object_directory_relative_name_is_joined_exactly() {
+        let relative: Vec<u16> = r"C:\Windows\System32\ntdll.dll".encode_utf16().collect();
+        let mut output = [0u16; 64];
+        let length = join_object_directory_name_into(b"\\??", &relative, &mut output).unwrap();
+        assert_eq!(
+            &output[..length],
+            &r"\??\C:\Windows\System32\ntdll.dll"
+                .encode_utf16()
+                .collect::<Vec<_>>()
+        );
+
+        let leaf: Vec<u16> = "Device".encode_utf16().collect();
+        let length = join_object_directory_name_into(b"\\", &leaf, &mut output).unwrap();
+        assert_eq!(
+            &output[..length],
+            &r"\Device".encode_utf16().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn object_directory_relative_name_rejects_invalid_or_truncated_input() {
+        let leaf: Vec<u16> = "child".encode_utf16().collect();
+        assert!(join_object_directory_name_into(b"Device", &leaf, &mut [0; 32]).is_none());
+        assert!(join_object_directory_name_into(b"\\Device", &[], &mut [0; 32]).is_none());
+        assert!(join_object_directory_name_into(
+            b"\\Device",
+            &r"\absolute".encode_utf16().collect::<Vec<_>>(),
+            &mut [0; 32],
+        )
+        .is_none());
+        assert!(join_object_directory_name_into(b"\\Device", &leaf, &mut [0; 8]).is_none());
     }
 }
