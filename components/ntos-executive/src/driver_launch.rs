@@ -44,13 +44,13 @@ use nt_hosted_runtime::{
     HostedProviderDomainStatus, HostedProviderExportCallPlan, HostedProviderExportMarshalPolicy,
     HostedProviderExportResultSemantics, HostedProviderExportSideEffect,
     HostedProviderImportBinding, HostedProviderImportBindingError, HostedProviderImportThunkError,
-    HostedProviderImportThunkPlan, NdisMiniportCharacteristicsLayoutError,
-    NdisProtocolCharacteristicsLayoutError, DC21X4_ADAPTER_CURRENT_INTERRUPT_MASK_OFFSET_X64,
-    DC21X4_ADAPTER_CURRENT_RBD_OFFSET_X64, DC21X4_ADAPTER_FLAGS_OFFSET_X64,
-    DC21X4_ADAPTER_HEAD_RBD_OFFSET_X64, DC21X4_ADAPTER_INTERRUPT_STATUS_OFFSET_X64,
-    DC21X4_ADAPTER_TAIL_RBD_OFFSET_X64, HOSTED_PROVIDER_EXPORT_ARG_CAP,
-    HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN, NDIS_MINIPORT_BLOCK_ETH_DB_OFFSET_X64,
-    NDIS_MINIPORT_BLOCK_ETH_RX_COMPLETE_HANDLER_OFFSET_X64,
+    HostedProviderImportThunkPlan, HostedProviderObjectOwner, HostedProviderReleaseProgress,
+    NdisMiniportCharacteristicsLayoutError, NdisProtocolCharacteristicsLayoutError,
+    DC21X4_ADAPTER_CURRENT_INTERRUPT_MASK_OFFSET_X64, DC21X4_ADAPTER_CURRENT_RBD_OFFSET_X64,
+    DC21X4_ADAPTER_FLAGS_OFFSET_X64, DC21X4_ADAPTER_HEAD_RBD_OFFSET_X64,
+    DC21X4_ADAPTER_INTERRUPT_STATUS_OFFSET_X64, DC21X4_ADAPTER_TAIL_RBD_OFFSET_X64,
+    HOSTED_PROVIDER_EXPORT_ARG_CAP, HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN,
+    NDIS_MINIPORT_BLOCK_ETH_DB_OFFSET_X64, NDIS_MINIPORT_BLOCK_ETH_RX_COMPLETE_HANDLER_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_ETH_RX_INDICATE_HANDLER_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_MINIPORT_ADAPTER_CONTEXT_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_MINIPORT_NAME_OFFSET_X64,
@@ -74,8 +74,8 @@ use nt_io_manager::{
     HostedDevicePropertyOwner, HostedDevicePropertyTransferError,
     HostedDevicePropertyTransferTable, HostedDomainIdentity, InformationParameters, IoManager,
     IoParameters, IrpId, IrpProjection, MajorFunctionTable, ObjectManagerPort, ReadWriteParameters,
-    ShareAccess, WdmDriverObjectInit, WdmFileObjectInit,
-    WdmIoStackLocationInit, WdmIoStackParameters, WdmIrpInit, WDM_X64_DRIVER_EXTENSION_OFFSET,
+    ShareAccess, WdmDriverObjectInit, WdmFileObjectInit, WdmIoStackLocationInit,
+    WdmIoStackParameters, WdmIrpInit, WDM_X64_DRIVER_EXTENSION_OFFSET,
     WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET,
     WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET, WDM_X64_FILE_OBJECT_SIZE,
     WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
@@ -214,8 +214,7 @@ const FSD_DATA_IRP_DISPATCH_REQUEST_OFF: u64 = 0x1000;
 const _: () =
     assert!(FSD_DATA_SE_SID_POOL_OFF + nt_security::se_exports::SID_POOL_SIZE as u64 <= 0x1000);
 const _: () = assert!(
-    FSD_DATA_IRP_DISPATCH_REQUEST_OFF + core::mem::size_of::<IrpDispatchRequest>() as u64
-        <= 0x2000
+    FSD_DATA_IRP_DISPATCH_REQUEST_OFF + core::mem::size_of::<IrpDispatchRequest>() as u64 <= 0x2000
 );
 const FSD_HOSTED_SYSTEM_RANGE_START: u64 = FSD_CODE_VA;
 
@@ -524,8 +523,7 @@ pub const SH_REQ_FILEID: u64 = 0x68; // in/out: opaque FILE_OBJECT id (u64)
 pub const SH_REQ_STATUS: u64 = 0x70; // out: IoStatus.Status (i32)
 pub const SH_REQ_REQUESTOR_TID: u64 = 0x74; // in: requesting NT thread id (u32)
 pub const SH_REQ_INFO: u64 = 0x78; // out: IoStatus.Information (u64)
-const _: () =
-    assert!(SH_SYMLINK_TARGET_BUF + SH_CAPTURED_PATH_BYTES as u64 <= SH_REQ_CONTROL_ID);
+const _: () = assert!(SH_SYMLINK_TARGET_BUF + SH_CAPTURED_PATH_BYTES as u64 <= SH_REQ_CONTROL_ID);
 const _: () = assert!(SH_REQ_CONTROL_ID + 8 <= SH_RESOURCE_INTERRUPT_VECTOR);
 
 const WDM_X64_DRIVER_EXTENSION_ADD_DEVICE_OFFSET: u64 = 0x08;
@@ -1357,8 +1355,8 @@ unsafe fn claim_pending_irp_completion(irp: u64) -> Option<PendingIrpCompletionC
         }
         let state = pending_irp_owner_state(node).load(Ordering::Acquire);
         let kind = hosted_irp_state_kind(state);
-        if let Some(owner_claim) = completion_owner_phase(kind)
-            .and_then(nt_io_manager::CompletionOwnerClaim::begin)
+        if let Some(owner_claim) =
+            completion_owner_phase(kind).and_then(nt_io_manager::CompletionOwnerClaim::begin)
         {
             // The raw IRP identity and completion projection remain immutable while the owner is
             // active. Match the raw IRP before claiming the lifecycle word; the generation-bearing
@@ -1415,8 +1413,7 @@ unsafe fn pending_irp_raw_identity_exists(irp: u64) -> bool {
             return false;
         }
         let kind = hosted_irp_state_kind(pending_irp_owner_state(node).load(Ordering::Acquire));
-        if kind != HOSTED_IRP_TOMBSTONE
-            && pending_irp_raw_irp(node).load(Ordering::Relaxed) == irp
+        if kind != HOSTED_IRP_TOMBSTONE && pending_irp_raw_irp(node).load(Ordering::Relaxed) == irp
         {
             return true;
         }
@@ -1456,20 +1453,12 @@ unsafe fn release_pending_irp_completion_claim(
         completion_owner_kind(claim.owner_claim.release(release, true)),
     );
     pending_irp_owner_state(claim.node)
-        .compare_exchange(
-            deferred,
-            handed_off,
-            Ordering::Release,
-            Ordering::Acquire,
-        )
+        .compare_exchange(deferred, handed_off, Ordering::Release, Ordering::Acquire)
         .expect("hosted IRP completion claim lost its caller handoff");
 }
 
 unsafe fn restore_pending_irp_completion_claim(claim: PendingIrpCompletionClaim) {
-    release_pending_irp_completion_claim(
-        claim,
-        nt_io_manager::CompletionClaimRelease::Restore,
-    );
+    release_pending_irp_completion_claim(claim, nt_io_manager::CompletionClaimRelease::Restore);
 }
 
 unsafe fn park_pending_irp_completion_claim(claim: PendingIrpCompletionClaim) {
@@ -4574,8 +4563,7 @@ const HOSTED_REGISTRY_ARG_VALUE_OFF: u64 =
 const HOSTED_REGISTRY_ARG_DATA_OFF: u64 =
     HOSTED_REGISTRY_ARG_VALUE_OFF + HOSTED_REGISTRY_PATH_MAX as u64;
 const HOSTED_REGISTRY_ARG_DATA_CAP: u64 = HOSTED_REGISTRY_VALUE_SCRATCH_MAX as u64;
-const _: () =
-    assert!(HOSTED_REGISTRY_ARG_DATA_OFF + HOSTED_REGISTRY_ARG_DATA_CAP <= FSD_ARG_BYTES);
+const _: () = assert!(HOSTED_REGISTRY_ARG_DATA_OFF + HOSTED_REGISTRY_ARG_DATA_CAP <= FSD_ARG_BYTES);
 const HOSTED_REGISTRY_OP_OPEN_RELATIVE_KEY: u64 = 1;
 const HOSTED_REGISTRY_OP_OPEN_DEVICE_KEY: u64 = 2;
 const HOSTED_REGISTRY_OP_CLOSE: u64 = 3;
@@ -4589,7 +4577,8 @@ const HOSTED_DEVICE_OP_QUERY_PROPERTY_ABORT: u64 = 3;
 const HOSTED_DEVICE_OP_CLAIM_PORT_RANGE: u64 = 4;
 const HOSTED_DEVICE_ARG_DATA_OFF: u64 = FSD_ARG_BYTES;
 const HOSTED_DEVICE_ARG_DATA_CAP: u64 = REP_DATA_LEN as u64;
-const _: () = assert!(HOSTED_DEVICE_ARG_DATA_OFF + HOSTED_DEVICE_ARG_DATA_CAP == FSD_ARG_MAPPED_BYTES);
+const _: () =
+    assert!(HOSTED_DEVICE_ARG_DATA_OFF + HOSTED_DEVICE_ARG_DATA_CAP == FSD_ARG_MAPPED_BYTES);
 const HOSTED_EXPORT_NAME_MAX: usize = 96;
 const HOSTED_INTERFACE_LINK_MAX: usize = 192;
 type HostedRegistryIdentityId = usize;
@@ -5419,11 +5408,7 @@ unsafe fn hosted_device_property_begin(
     (status as u32 as i32, required_len, token, chunk_len)
 }
 
-unsafe fn hosted_device_property_pull(
-    pdo: u64,
-    token: u64,
-    offset: u64,
-) -> (i32, u64, u64, u64) {
+unsafe fn hosted_device_property_pull(pdo: u64, token: u64, offset: u64) -> (i32, u64, u64, u64) {
     let (_label, status, required_len, reply_token, chunk_len) = call_on4(
         (FSD_SERVICE_DEVICE_LABEL << 12) | 4,
         HOSTED_DEVICE_OP_QUERY_PROPERTY_PULL,
@@ -5431,12 +5416,7 @@ unsafe fn hosted_device_property_pull(
         token,
         offset,
     );
-    (
-        status as u32 as i32,
-        required_len,
-        reply_token,
-        chunk_len,
-    )
+    (status as u32 as i32, required_len, reply_token, chunk_len)
 }
 
 unsafe fn hosted_device_property_abort(pdo: u64, token: u64) {
@@ -6623,15 +6603,17 @@ extern "win64" fn s_io_get_device_property(
         let _reply_guard = component_device_reply_lock();
         let (mut status, required_len_wire, token, first_chunk_wire) =
             hosted_device_property_begin(pdo, property, buffer_len);
-        let (required_len, first_chunk) =
-            match (u32::try_from(required_len_wire), u32::try_from(first_chunk_wire)) {
-                (Ok(required_len), Ok(first_chunk)) => (required_len, first_chunk),
-                _ => {
-                    hosted_device_property_abort(pdo, token);
-                    status = STATUS_INVALID_PARAMETER;
-                    (0, 0)
-                }
-            };
+        let (required_len, first_chunk) = match (
+            u32::try_from(required_len_wire),
+            u32::try_from(first_chunk_wire),
+        ) {
+            (Ok(required_len), Ok(first_chunk)) => (required_len, first_chunk),
+            _ => {
+                hosted_device_property_abort(pdo, token);
+                status = STATUS_INVALID_PARAMETER;
+                (0, 0)
+            }
+        };
         write_unaligned(result_len as *mut u32, required_len);
         if status != STATUS_SUCCESS {
             trace_io_get_device_property(pdo, property, buffer_len, status, 0);
@@ -7240,13 +7222,7 @@ extern "win64" fn s_io_build_device_io_control_request(
                     flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER;
                 }
                 if output_buffer != 0 && output_buffer_length != 0 {
-                    mdl = s_io_allocate_mdl(
-                        output_buffer,
-                        output_buffer_length,
-                        0,
-                        0,
-                        irp,
-                    );
+                    mdl = s_io_allocate_mdl(output_buffer, output_buffer_length, 0, 0, irp);
                     if mdl == 0 {
                         if system_buffer != 0 {
                             pool_free(system_buffer);
@@ -7769,11 +7745,9 @@ unsafe fn validate_hosted_irp_packet(irp: u64) -> Option<(u8, u8, u64)> {
     }
     let packet_size = read_unaligned((irp + 2) as *const u16) as u64;
     let stack_count = read_unaligned((irp + WDM_X64_IRP_STACK_COUNT_OFFSET) as *const u8);
-    let current_location =
-        read_unaligned((irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *const u8);
-    let required = (WDM_X64_IRP_SIZE as u64).checked_add(
-        (stack_count as u64).checked_mul(WDM_X64_IO_STACK_LOCATION_SIZE as u64)?,
-    )?;
+    let current_location = read_unaligned((irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *const u8);
+    let required = (WDM_X64_IRP_SIZE as u64)
+        .checked_add((stack_count as u64).checked_mul(WDM_X64_IO_STACK_LOCATION_SIZE as u64)?)?;
     let terminal_location = stack_count.checked_add(1)?;
     if stack_count == 0
         || current_location == 0
@@ -7814,15 +7788,15 @@ unsafe fn unwind_hosted_irp(irp: u64) -> Result<HostedIrpUnwindOutcome, ()> {
     let mut cursor = nt_io_manager::CompletionUnwindCursor::new(stack_count, current_location)
         .map_err(|_| ())?;
     let last_stack = irp + WDM_X64_IRP_SIZE as u64;
-    let mut error_code = if read_unaligned(
-        (last_stack + WDM_X64_IO_STACK_CONTROL_OFFSET) as *const u8,
-    ) & WDM_X64_SL_ERROR_RETURNED
-        != 0
-    {
-        read_unaligned((last_stack + 0x20) as *const i32)
-    } else {
-        STATUS_SUCCESS
-    };
+    let mut error_code =
+        if read_unaligned((last_stack + WDM_X64_IO_STACK_CONTROL_OFFSET) as *const u8)
+            & WDM_X64_SL_ERROR_RETURNED
+            != 0
+        {
+            read_unaligned((last_stack + 0x20) as *const i32)
+        } else {
+            STATUS_SUCCESS
+        };
 
     while !cursor.is_terminal() {
         let status = read_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *const i32);
@@ -7835,9 +7809,8 @@ unsafe fn unwind_hosted_irp(irp: u64) -> Result<HostedIrpUnwindOutcome, ()> {
                 current_control | WDM_X64_SL_ERROR_RETURNED,
             );
             write_unaligned((last_stack + 0x20) as *mut i32, error_code);
-            let last_control = read_unaligned(
-                (last_stack + WDM_X64_IO_STACK_CONTROL_OFFSET) as *const u8,
-            );
+            let last_control =
+                read_unaligned((last_stack + WDM_X64_IO_STACK_CONTROL_OFFSET) as *const u8);
             write_unaligned(
                 (last_stack + WDM_X64_IO_STACK_CONTROL_OFFSET) as *mut u8,
                 last_control | WDM_X64_SL_ERROR_RETURNED,
@@ -7845,9 +7818,8 @@ unsafe fn unwind_hosted_irp(irp: u64) -> Result<HostedIrpUnwindOutcome, ()> {
         }
 
         let control = read_unaligned((stack + WDM_X64_IO_STACK_CONTROL_OFFSET) as *const u8);
-        let completion = read_unaligned(
-            (stack + WDM_X64_IO_STACK_COMPLETION_ROUTINE_OFFSET) as *const u64,
-        );
+        let completion =
+            read_unaligned((stack + WDM_X64_IO_STACK_COMPLETION_ROUTINE_OFFSET) as *const u64);
         let context = read_unaligned((stack + WDM_X64_IO_STACK_CONTEXT_OFFSET) as *const u64);
         let cancelled = read_unaligned((irp + WDM_X64_IRP_CANCEL_OFFSET) as *const u8) != 0;
         let frame = cursor
@@ -12682,12 +12654,9 @@ extern "win64" fn s_hal_translate_bus_address(
         } else {
             SH_RESOURCE_ADDRESS_KIND_PORT
         };
-        let Some(resource) = find_shared_address_resource_by_raw_range(
-            FSD_SHARED_VADDR,
-            kind,
-            bus_address,
-            1,
-        ) else {
+        let Some(resource) =
+            find_shared_address_resource_by_raw_range(FSD_SHARED_VADDR, kind, bus_address, 1)
+        else {
             trace_hosted_hal_translate_bus_address(
                 if requested_space == 0 {
                     b"reject-mmio"
@@ -12871,8 +12840,7 @@ unsafe fn hosted_pci_config_byte(offset: u32) -> u8 {
                 if resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT {
                     (resource.raw_start as u32 & 0xFFFF_FFFC) | 1
                 } else {
-                    (resource.raw_start as u32 & 0xFFFF_FFF0)
-                        | (resource.pci_flags as u32 & 0xF)
+                    (resource.raw_start as u32 & 0xFFFF_FFF0) | (resource.pci_flags as u32 & 0xF)
                 }
             } else if bar_index != 0 {
                 find_shared_address_resource_by_bar(FSD_SHARED_VADDR, bar_index - 1)
@@ -13116,9 +13084,7 @@ unsafe fn read_shared_address_resource(sh: u64, index: u64) -> Option<SharedAddr
         va: read_volatile((record + SH_RESOURCE_ADDRESS_VA) as *const u64),
         map_len: read_volatile((record + SH_RESOURCE_ADDRESS_MAP_LEN) as *const u64),
         broker_va_or_root_cap: 0,
-        component_cap: read_volatile(
-            (record + SH_RESOURCE_ADDRESS_COMPONENT_CAP) as *const u64,
-        ),
+        component_cap: read_volatile((record + SH_RESOURCE_ADDRESS_COMPONENT_CAP) as *const u64),
     };
     if !matches!(
         resource.kind,
@@ -13151,10 +13117,7 @@ unsafe fn write_shared_address_resource(sh: u64, index: u64, value: SharedAddres
         (record + SH_RESOURCE_ADDRESS_FLAGS) as *mut u16,
         value.flags,
     );
-    write_volatile(
-        (record + SH_RESOURCE_ADDRESS_SHARE) as *mut u8,
-        value.share,
-    );
+    write_volatile((record + SH_RESOURCE_ADDRESS_SHARE) as *mut u8, value.share);
     write_volatile(
         (record + SH_RESOURCE_ADDRESS_PCI_FLAGS) as *mut u8,
         value.pci_flags,
@@ -13173,10 +13136,7 @@ unsafe fn write_shared_address_resource(sh: u64, index: u64, value: SharedAddres
         (record + SH_RESOURCE_ADDRESS_MAP_LEN) as *mut u64,
         value.map_len,
     );
-    write_volatile(
-        (record + SH_RESOURCE_ADDRESS_RESERVED) as *mut u64,
-        0,
-    );
+    write_volatile((record + SH_RESOURCE_ADDRESS_RESERVED) as *mut u64, 0);
     write_volatile(
         (record + SH_RESOURCE_ADDRESS_COMPONENT_CAP) as *mut u64,
         value.component_cap,
@@ -13213,9 +13173,9 @@ unsafe fn publish_shared_address_resources(sh: u64, resources: &[SharedAddressRe
                     | nt_cm_resources::CM_RESOURCE_SHARE_DRIVER_EXCLUSIVE
                     | nt_cm_resources::CM_RESOURCE_SHARE_SHARED
             )
-            || resources[..index].iter().any(|prior| {
-                prior.kind == resource.kind && prior.bar_index == resource.bar_index
-            })
+            || resources[..index]
+                .iter()
+                .any(|prior| prior.kind == resource.kind && prior.bar_index == resource.bar_index)
         {
             return false;
         }
@@ -13334,7 +13294,6 @@ unsafe fn shared_has_port_resources(sh: u64) -> bool {
         .is_some_and(|resource| resource.component_cap != 0)
 }
 
-
 unsafe fn component_write_video_access_range(ptr: u64, range: VideoAccessRangeX64) {
     let mut raw = [0u8; VIDEO_ACCESS_RANGE_X64_SIZE];
     let _ = range.write(&mut raw);
@@ -13382,7 +13341,6 @@ unsafe fn hosted_memory_range_granted(start: u64, len: u64) -> bool {
     )
     .is_some()
 }
-
 
 unsafe fn hosted_video_memory_caller_va(start: u64, len: u64) -> Option<u64> {
     let grant_start = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_MEMORY_PHYS) as *const u64);
@@ -13456,18 +13414,19 @@ unsafe fn hosted_io_model_state_for_port_mut(
         .iter_mut()
         .find_map(|state| {
             let end = port.checked_add(width)?;
-            let resource = hosted_state_address_resources(state)
-                .iter()
-                .copied()
-                .find(|resource| {
-                    resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT
-                        && resource.broker_va_or_root_cap != 0
-                        && port >= resource.translated_start
-                        && resource
-                            .translated_start
-                            .checked_add(resource.len)
-                            .is_some_and(|limit| end <= limit)
-                })?;
+            let resource =
+                hosted_state_address_resources(state)
+                    .iter()
+                    .copied()
+                    .find(|resource| {
+                        resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT
+                            && resource.broker_va_or_root_cap != 0
+                            && port >= resource.translated_start
+                            && resource
+                                .translated_start
+                                .checked_add(resource.len)
+                                .is_some_and(|limit| end <= limit)
+                    })?;
             Some((state, port - resource.translated_start))
         })
 }
@@ -13838,11 +13797,8 @@ extern "win64" fn s_video_port_verify_access_ranges(
         if let Some(range) = supplemental {
             let pdo = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_PDO_OBJECT) as *const u64);
             if pdo == 0
-                || hosted_device_claim_port_range(
-                    pdo,
-                    range.range_start,
-                    range.range_length as u64,
-                ) != STATUS_SUCCESS
+                || hosted_device_claim_port_range(pdo, range.range_start, range.range_length as u64)
+                    != STATUS_SUCCESS
                 || !hosted_video_range_granted(range)
             {
                 return VP_ERROR_INVALID_PARAMETER;
@@ -14557,10 +14513,18 @@ const NDIS_DEVICE_PROPERTY_FDO: u8 = 2;
 const NDIS_DEVICE_PROPERTY_NEXT: u8 = 3;
 const NDIS_DEVICE_PROPERTY_ALLOCATED_RESOURCES: u8 = 4;
 const NDIS_DEVICE_PROPERTY_TRANSLATED_RESOURCES: u8 = 5;
+const EMPTY_HOSTED_PROVIDER_OBJECT_OWNER: HostedProviderObjectOwner = HostedProviderObjectOwner {
+    provider_domain_id: 0,
+    provider_domain_cookie: 0,
+    dependent_domain_id: 0,
+    dependent_domain_cookie: 0,
+};
 
 #[derive(Clone, Copy)]
 struct HostedProviderDomainDependency {
     present: bool,
+    retiring: bool,
+    in_flight: u64,
     dependent_instance: usize,
     provider_instance: usize,
     dependent_domain: HostedDomainIdentity,
@@ -14572,6 +14536,8 @@ impl HostedProviderDomainDependency {
     const fn empty() -> Self {
         Self {
             present: false,
+            retiring: false,
+            in_flight: 0,
             dependent_instance: 0,
             provider_instance: 0,
             dependent_domain: HostedDomainIdentity {
@@ -14591,6 +14557,8 @@ impl HostedProviderDomainDependency {
 struct HostedProviderDispatchRoute {
     used: bool,
     retiring: bool,
+    owner: HostedProviderObjectOwner,
+    release_progress: HostedProviderReleaseProgress,
     dependent_instance: usize,
     provider_instance: usize,
     dependent_domain: HostedDomainIdentity,
@@ -14609,6 +14577,8 @@ impl HostedProviderDispatchRoute {
         Self {
             used: false,
             retiring: false,
+            owner: EMPTY_HOSTED_PROVIDER_OBJECT_OWNER,
+            release_progress: HostedProviderReleaseProgress::new(0),
             dependent_instance: 0,
             provider_instance: 0,
             dependent_domain: HostedDomainIdentity {
@@ -14781,9 +14751,10 @@ impl ProviderMarshalState {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 struct HostedProviderNdisPacketShadow {
     present: bool,
+    owner: HostedProviderObjectOwner,
     provider_instance: usize,
     dependent_instance: usize,
     dependent_component_va: u64,
@@ -14800,6 +14771,7 @@ impl HostedProviderNdisPacketShadow {
     const fn empty() -> Self {
         Self {
             present: false,
+            owner: EMPTY_HOSTED_PROVIDER_OBJECT_OWNER,
             provider_instance: 0,
             dependent_instance: 0,
             dependent_component_va: 0,
@@ -14814,9 +14786,10 @@ impl HostedProviderNdisPacketShadow {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 struct HostedProviderNdisBufferShadow {
     present: bool,
+    owner: HostedProviderObjectOwner,
     provider_instance: usize,
     dependent_instance: usize,
     dependent_component_va: u64,
@@ -14834,6 +14807,7 @@ impl HostedProviderNdisBufferShadow {
     const fn empty() -> Self {
         Self {
             present: false,
+            owner: EMPTY_HOSTED_PROVIDER_OBJECT_OWNER,
             provider_instance: 0,
             dependent_instance: 0,
             dependent_component_va: 0,
@@ -14852,6 +14826,7 @@ impl HostedProviderNdisBufferShadow {
 #[derive(Clone, Copy)]
 struct HostedProviderMiniportInterruptShadow {
     present: bool,
+    owner: HostedProviderObjectOwner,
     provider_instance: usize,
     dependent_instance: usize,
     dependent_component_va: u64,
@@ -14863,6 +14838,7 @@ impl HostedProviderMiniportInterruptShadow {
     const fn empty() -> Self {
         Self {
             present: false,
+            owner: EMPTY_HOSTED_PROVIDER_OBJECT_OWNER,
             provider_instance: 0,
             dependent_instance: 0,
             dependent_component_va: 0,
@@ -14875,6 +14851,7 @@ impl HostedProviderMiniportInterruptShadow {
 #[derive(Clone, Copy)]
 struct HostedProviderMiniportTimerShadow {
     present: bool,
+    owner: HostedProviderObjectOwner,
     provider_instance: usize,
     dependent_instance: usize,
     dependent_component_va: u64,
@@ -14886,6 +14863,7 @@ impl HostedProviderMiniportTimerShadow {
     const fn empty() -> Self {
         Self {
             present: false,
+            owner: EMPTY_HOSTED_PROVIDER_OBJECT_OWNER,
             provider_instance: 0,
             dependent_instance: 0,
             dependent_component_va: 0,
@@ -14898,6 +14876,7 @@ impl HostedProviderMiniportTimerShadow {
 #[derive(Clone, Copy)]
 struct HostedProviderNdisWorkItemShadow {
     present: bool,
+    owner: HostedProviderObjectOwner,
     provider_instance: usize,
     dependent_instance: usize,
     dependent_component_va: u64,
@@ -14912,6 +14891,7 @@ impl HostedProviderNdisWorkItemShadow {
     const fn empty() -> Self {
         Self {
             present: false,
+            owner: EMPTY_HOSTED_PROVIDER_OBJECT_OWNER,
             provider_instance: 0,
             dependent_instance: 0,
             dependent_component_va: 0,
@@ -14927,6 +14907,7 @@ impl HostedProviderNdisWorkItemShadow {
 #[derive(Clone, Copy)]
 struct HostedProviderNdisMiniportBlockMirror {
     present: bool,
+    owner: HostedProviderObjectOwner,
     provider_instance: usize,
     dependent_instance: usize,
     provider_component_va: u64,
@@ -14948,6 +14929,7 @@ impl HostedProviderNdisMiniportBlockMirror {
     const fn empty() -> Self {
         Self {
             present: false,
+            owner: EMPTY_HOSTED_PROVIDER_OBJECT_OWNER,
             provider_instance: 0,
             dependent_instance: 0,
             provider_component_va: 0,
@@ -14992,6 +14974,8 @@ struct HostedProviderCallbackRecord {
 #[derive(Clone, Copy)]
 struct HostedProviderPointerAllocation {
     present: bool,
+    owner: HostedProviderObjectOwner,
+    release_progress: HostedProviderReleaseProgress,
     dependent_instance: usize,
     dependent_component_va: u64,
     provider_instance: usize,
@@ -15003,6 +14987,8 @@ impl HostedProviderPointerAllocation {
     const fn empty() -> Self {
         Self {
             present: false,
+            owner: EMPTY_HOSTED_PROVIDER_OBJECT_OWNER,
+            release_progress: HostedProviderReleaseProgress::new(0),
             dependent_instance: 0,
             dependent_component_va: 0,
             provider_instance: 0,
@@ -15010,6 +14996,96 @@ impl HostedProviderPointerAllocation {
             bytes: 0,
         }
     }
+}
+
+fn hosted_provider_object_owner_for_pair(
+    provider_instance: usize,
+    dependent_instance: usize,
+) -> Option<HostedProviderObjectOwner> {
+    let provider = instance(provider_instance).and_then(instance_domain_identity)?;
+    let dependent = instance(dependent_instance).and_then(instance_domain_identity)?;
+    let dependency = unsafe {
+        hosted_provider_domain_dependency_for_pair(provider_instance, dependent_instance)
+    }?;
+    if dependency.dependent_domain != dependent || dependency.provider_domain != provider {
+        return None;
+    }
+    HostedProviderObjectOwner::new(
+        provider.domain_id.raw(),
+        provider.cookie,
+        dependent.domain_id.raw(),
+        dependent.cookie,
+    )
+}
+
+fn hosted_provider_object_owner_is_live(
+    owner: HostedProviderObjectOwner,
+    provider_instance: usize,
+    dependent_instance: usize,
+) -> bool {
+    let Some(current) =
+        hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
+    else {
+        return false;
+    };
+    owner == current
+}
+
+fn hosted_provider_object_owner_is_current(
+    owner: HostedProviderObjectOwner,
+    provider_instance: usize,
+    dependent_instance: usize,
+) -> bool {
+    let Some(provider) = instance(provider_instance).and_then(instance_domain_identity) else {
+        return false;
+    };
+    let Some(dependent) = instance(dependent_instance).and_then(instance_domain_identity) else {
+        return false;
+    };
+    if !owner.pair_matches(
+        provider.domain_id.raw(),
+        provider.cookie,
+        dependent.domain_id.raw(),
+        dependent.cookie,
+    ) {
+        return false;
+    }
+    unsafe {
+        hosted_provider_domain_dependency_for_pair_current(provider_instance, dependent_instance)
+            .is_some_and(|dependency| {
+                dependency.provider_domain == provider && dependency.dependent_domain == dependent
+            })
+    }
+}
+
+fn hosted_provider_object_owner_matches_instance(
+    owner: HostedProviderObjectOwner,
+    provider_instance: usize,
+    dependent_instance: usize,
+    retiring_instance: usize,
+    retiring_domain: HostedDomainIdentity,
+) -> bool {
+    (provider_instance == retiring_instance
+        && owner.provider_matches(retiring_domain.domain_id.raw(), retiring_domain.cookie))
+        || (dependent_instance == retiring_instance
+            && owner.dependent_matches(retiring_domain.domain_id.raw(), retiring_domain.cookie))
+}
+
+unsafe fn release_hosted_provider_owned_pool_allocation(
+    owner: HostedProviderObjectOwner,
+    provider_instance: usize,
+    dependent_instance: usize,
+    allocation_instance: usize,
+    component_va: u64,
+) -> bool {
+    if component_va == 0
+        || !hosted_provider_object_owner_is_current(owner, provider_instance, dependent_instance)
+        || allocation_instance != provider_instance && allocation_instance != dependent_instance
+    {
+        return false;
+    }
+    instance(allocation_instance)
+        .is_some_and(|inst| release_hosted_instance_pool_allocation_if_live(inst, component_va))
 }
 
 static mut HOSTED_DEP_IMAGES: Option<Vec<LoadedDependencyImage>> = None;
@@ -16035,7 +16111,11 @@ unsafe fn instance_executable_thunk_available(instance_index: usize) -> u64 {
     slots.saturating_sub(inst.thunk_next)
 }
 
-fn hosted_provider_domain_dependency_is_live(
+fn hosted_provider_domain_dependency_is_live(dependency: HostedProviderDomainDependency) -> bool {
+    !dependency.retiring && hosted_provider_domain_dependency_is_current(dependency)
+}
+
+fn hosted_provider_domain_dependency_is_current(
     dependency: HostedProviderDomainDependency,
 ) -> bool {
     if !dependency.present
@@ -16058,6 +16138,20 @@ fn hosted_provider_domain_dependency_is_live(
                     && singleton.owner_domain == dependency.provider_domain
         )
     }
+}
+
+unsafe fn hosted_provider_domain_dependency_for_pair_current(
+    provider_instance: usize,
+    dependent_instance: usize,
+) -> Option<HostedProviderDomainDependency> {
+    hosted_provider_domain_dependencies()?
+        .iter()
+        .copied()
+        .find(|dependency| {
+            dependency.provider_instance == provider_instance
+                && dependency.dependent_instance == dependent_instance
+                && hosted_provider_domain_dependency_is_current(*dependency)
+        })
 }
 
 unsafe fn hosted_provider_domain_dependency_for_pair(
@@ -16104,9 +16198,12 @@ unsafe fn ensure_hosted_provider_domain_dependency(
                 && existing.dependent_instance == dependent_instance
                 && existing.provider_domain == provider_domain
                 && existing.provider_publication_cookie == provider_publication_cookie
-                && hosted_provider_domain_dependency_is_live(existing)
             {
-                Ok(existing)
+                if hosted_provider_domain_dependency_is_live(existing) {
+                    Ok(existing)
+                } else {
+                    Err(STATUS_DEVICE_NOT_READY)
+                }
             } else {
                 Err(nt_status::NtStatus::OBJECT_NAME_COLLISION.raw())
             };
@@ -16120,6 +16217,8 @@ unsafe fn ensure_hosted_provider_domain_dependency(
     }
     let dependency = HostedProviderDomainDependency {
         present: true,
+        retiring: false,
+        in_flight: 0,
         dependent_instance,
         provider_instance,
         dependent_domain,
@@ -16135,6 +16234,93 @@ unsafe fn ensure_hosted_provider_domain_dependency(
     Ok(dependency)
 }
 
+struct HostedProviderDependencyDispatchLease {
+    provider_domain: HostedDomainIdentity,
+    dependent_domain: HostedDomainIdentity,
+    provider_publication_cookie: u64,
+}
+
+impl Drop for HostedProviderDependencyDispatchLease {
+    fn drop(&mut self) {
+        unsafe {
+            let dependencies = hosted_provider_domain_dependencies_mut();
+            let Some(dependency) = dependencies.iter_mut().find(|dependency| {
+                dependency.present
+                    && dependency.provider_domain == self.provider_domain
+                    && dependency.dependent_domain == self.dependent_domain
+                    && dependency.provider_publication_cookie == self.provider_publication_cookie
+            }) else {
+                panic!("hosted provider dependency disappeared with dispatch in flight");
+            };
+            assert!(
+                dependency.in_flight != 0,
+                "hosted provider dependency dispatch lease underflow"
+            );
+            dependency.in_flight -= 1;
+        }
+    }
+}
+
+unsafe fn acquire_hosted_provider_dependency_dispatch_lease(
+    provider_instance: usize,
+    dependent_instance: usize,
+    provider_publication_cookie: u64,
+) -> Option<HostedProviderDependencyDispatchLease> {
+    let dependencies = hosted_provider_domain_dependencies_mut();
+    let dependency = dependencies.iter_mut().find(|dependency| {
+        dependency.provider_instance == provider_instance
+            && dependency.dependent_instance == dependent_instance
+            && dependency.provider_publication_cookie == provider_publication_cookie
+            && hosted_provider_domain_dependency_is_live(**dependency)
+    })?;
+    dependency.in_flight = dependency.in_flight.checked_add(1)?;
+    Some(HostedProviderDependencyDispatchLease {
+        provider_domain: dependency.provider_domain,
+        dependent_domain: dependency.dependent_domain,
+        provider_publication_cookie,
+    })
+}
+
+unsafe fn begin_hosted_provider_dependency_retirement_for_instance(
+    instance_index: usize,
+    domain: HostedDomainIdentity,
+) -> u64 {
+    let Some(dependencies) =
+        (*core::ptr::addr_of_mut!(HOSTED_PROVIDER_DOMAIN_DEPENDENCIES)).as_mut()
+    else {
+        return 0;
+    };
+    let mut failures = 0u64;
+    for dependency in dependencies
+        .iter_mut()
+        .filter(|dependency| dependency.present)
+    {
+        if dependency.provider_instance == instance_index {
+            if dependency.provider_domain != domain {
+                failures += 1;
+            } else if dependency.dependent_instance != instance_index {
+                // Provider domains cannot retire while a live dependent still owns the link.
+                failures += 1;
+            }
+            continue;
+        }
+        if dependency.dependent_instance != instance_index {
+            continue;
+        }
+        if dependency.dependent_domain != domain
+            || !hosted_provider_domain_dependency_is_current(*dependency)
+        {
+            failures += 1;
+            continue;
+        }
+        dependency.retiring = true;
+        if dependency.in_flight != 0 {
+            failures += 1;
+        }
+    }
+    failures
+}
+
 unsafe fn register_hosted_provider_callback_record(
     provider_instance: usize,
     dependent_instance: usize,
@@ -16142,10 +16328,8 @@ unsafe fn register_hosted_provider_callback_record(
     callback_offset: u64,
     callback_kind: u8,
 ) -> Option<u64> {
-    let dependency = hosted_provider_domain_dependency_for_pair(
-        provider_instance,
-        dependent_instance,
-    )?;
+    let dependency =
+        hosted_provider_domain_dependency_for_pair(provider_instance, dependent_instance)?;
     let dependent_inst = instance(dependent_instance)?;
     let image_frames = if dependent_inst.image_frames == 0 {
         FSD_IMAGE_FRAMES
@@ -16188,6 +16372,17 @@ unsafe fn hosted_provider_callback_record(cookie: u64) -> Option<HostedProviderC
             != Some(record.provider_domain)
         || instance(record.dependent_instance).and_then(instance_domain_identity)
             != Some(record.dependent_domain)
+        || hosted_provider_dispatch_routes().is_some_and(|routes| {
+            routes.iter().any(|route| {
+                route.used
+                    && route.retiring
+                    && route.provider_instance == record.provider_instance
+                    && route.dependent_instance == record.dependent_instance
+                    && route.provider_domain == record.provider_domain
+                    && route.dependent_domain == record.dependent_domain
+                    && route.provider_publication_cookie == record.provider_publication_cookie
+            })
+        })
     {
         return None;
     }
@@ -16201,9 +16396,7 @@ unsafe fn hosted_provider_callback_record(cookie: u64) -> Option<HostedProviderC
         .then_some(record)
 }
 
-unsafe fn clear_hosted_provider_callback_records_for_route(
-    route: HostedProviderDispatchRoute,
-) {
+unsafe fn clear_hosted_provider_callback_records_for_route(route: HostedProviderDispatchRoute) {
     for record in hosted_provider_callback_records_mut().iter_mut() {
         if record.present
             && record.provider_domain == route.provider_domain
@@ -16317,8 +16510,9 @@ fn clear_hosted_provider_domain_link(
     provider: HostedDomainIdentity,
 ) -> Result<(), nt_status::NtStatus> {
     match io_manager_mut().hosted_provider_identity(dependent) {
-        Some(link) if link == provider => io_manager_mut()
-            .clear_hosted_domain_provider(dependent, provider),
+        Some(link) if link == provider => {
+            io_manager_mut().clear_hosted_domain_provider(dependent, provider)
+        }
         None => Ok(()),
         Some(_) => Err(nt_status::NtStatus::INVALID_PARAMETER),
     }
@@ -16341,24 +16535,19 @@ unsafe fn clear_hosted_provider_callback_records_for_dependency(
 unsafe fn teardown_hosted_provider_domain_dependency(
     dependency: HostedProviderDomainDependency,
 ) -> Result<(), nt_status::NtStatus> {
-    if instance(dependency.dependent_instance).and_then(instance_domain_identity)
-        != Some(dependency.dependent_domain)
-        || instance(dependency.provider_instance).and_then(instance_domain_identity)
-            != Some(dependency.provider_domain)
+    if !dependency.present
+        || !dependency.retiring
+        || dependency.in_flight != 0
+        || !hosted_provider_domain_dependency_is_current(dependency)
     {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
-    clear_hosted_provider_domain_link(
-        dependency.dependent_domain,
-        dependency.provider_domain,
-    )?;
+    clear_hosted_provider_domain_link(dependency.dependent_domain, dependency.provider_domain)?;
     clear_hosted_provider_callback_records_for_dependency(dependency);
     Ok(())
 }
 
-unsafe fn clear_hosted_provider_domain_dependencies_for_instance(
-    instance_index: usize,
-) -> u64 {
+unsafe fn clear_hosted_provider_domain_dependencies_for_instance(instance_index: usize) -> u64 {
     let Some(dependencies) =
         (*core::ptr::addr_of_mut!(HOSTED_PROVIDER_DOMAIN_DEPENDENCIES)).as_mut()
     else {
@@ -16384,16 +16573,39 @@ unsafe fn clear_hosted_provider_domain_dependencies_for_instance(
 }
 
 unsafe fn teardown_hosted_provider_dispatch_route(
-    route: HostedProviderDispatchRoute,
+    route: &mut HostedProviderDispatchRoute,
 ) -> Result<(), nt_status::NtStatus> {
-    let provider_inst = instance(route.provider_instance)
-        .filter(|inst| instance_domain_identity(*inst) == Some(route.provider_domain))
-        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    if !route.used
+        || !route.retiring
+        || !route.owner.pair_matches(
+            route.provider_domain.domain_id.raw(),
+            route.provider_domain.cookie,
+            route.dependent_domain.domain_id.raw(),
+            route.dependent_domain.cookie,
+        )
+        || !hosted_provider_object_owner_is_current(
+            route.owner,
+            route.provider_instance,
+            route.dependent_instance,
+        )
+        || !hosted_provider_domain_dependency_for_pair_current(
+            route.provider_instance,
+            route.dependent_instance,
+        )
+        .is_some_and(|dependency| {
+            dependency.retiring
+                && dependency.in_flight == 0
+                && dependency.provider_domain == route.provider_domain
+                && dependency.dependent_domain == route.dependent_domain
+                && dependency.provider_publication_cookie == route.provider_publication_cookie
+        })
+    {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
     let driver_binding = io_manager_mut()
         .hosted_driver_by_identity(route.provider_domain, route.provider_driver_object);
     match driver_binding {
-        Some(driver) if driver == DriverId(route.dependent_driver_id) => {
-        }
+        Some(driver) if driver == DriverId(route.dependent_driver_id) => {}
         None => {}
         Some(_) => return Err(nt_status::NtStatus::INVALID_PARAMETER),
     }
@@ -16406,21 +16618,39 @@ unsafe fn teardown_hosted_provider_dispatch_route(
             return Err(nt_status::NtStatus::INVALID_PARAMETER);
         }
     }
-    clear_hosted_provider_callback_records_for_route(route);
-    clear_driver_object_extensions_for_driver_object(route.provider_driver_object);
-    if !release_hosted_instance_pool_allocation_if_live(
-        provider_inst,
-        route.provider_driver_extension,
-    ) || !release_hosted_instance_pool_allocation_if_live(
-        provider_inst,
-        route.provider_driver_object,
-    ) {
+    let owner = route.owner;
+    let provider_instance = route.provider_instance;
+    let dependent_instance = route.dependent_instance;
+    let provider_driver_extension = route.provider_driver_extension;
+    let provider_driver_object = route.provider_driver_object;
+    if !route.release_progress.release_with(|bit| match bit {
+        0 => release_hosted_provider_owned_pool_allocation(
+            owner,
+            provider_instance,
+            dependent_instance,
+            provider_instance,
+            provider_driver_extension,
+        ),
+        1 => release_hosted_provider_owned_pool_allocation(
+            owner,
+            provider_instance,
+            dependent_instance,
+            provider_instance,
+            provider_driver_object,
+        ),
+        _ => false,
+    }) {
         return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     }
+    clear_hosted_provider_callback_records_for_route(*route);
+    clear_driver_object_extensions_for_driver_object(route.provider_driver_object);
     Ok(())
 }
 
-unsafe fn clear_hosted_provider_dispatch_routes_for_instance(instance_index: usize) -> u64 {
+unsafe fn clear_hosted_provider_dispatch_routes_for_instance(
+    instance_index: usize,
+    domain: HostedDomainIdentity,
+) -> u64 {
     let Some(routes) = (*core::ptr::addr_of_mut!(HOSTED_PROVIDER_DISPATCH_ROUTES)).as_mut() else {
         return 0;
     };
@@ -16432,8 +16662,17 @@ unsafe fn clear_hosted_provider_dispatch_routes_for_instance(instance_index: usi
                 || route.provider_instance == instance_index)
         {
             routes[index].retiring = true;
-            let route = routes[index];
-            if teardown_hosted_provider_dispatch_route(route).is_ok() {
+            if !hosted_provider_object_owner_matches_instance(
+                routes[index].owner,
+                routes[index].provider_instance,
+                routes[index].dependent_instance,
+                instance_index,
+                domain,
+            ) {
+                failures += 1;
+                continue;
+            }
+            if teardown_hosted_provider_dispatch_route(&mut routes[index]).is_ok() {
                 routes[index] = HostedProviderDispatchRoute::empty();
             } else {
                 failures += 1;
@@ -16530,6 +16769,10 @@ unsafe fn register_hosted_provider_driver_object_shadow(
     if singleton.instance != provider_instance || singleton.owner_domain != provider_domain {
         return Err(STATUS_INVALID_PARAMETER);
     }
+    let Some(owner) = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
+    else {
+        return Err(STATUS_DEVICE_NOT_READY);
+    };
     if let Some(routes) = hosted_provider_dispatch_routes() {
         if let Some((index, route)) = routes
             .iter()
@@ -16593,6 +16836,8 @@ unsafe fn register_hosted_provider_driver_object_shadow(
     let route = HostedProviderDispatchRoute {
         used: true,
         retiring: false,
+        owner,
+        release_progress: HostedProviderReleaseProgress::new(0b11),
         dependent_instance,
         provider_instance,
         dependent_domain,
@@ -16689,37 +16934,44 @@ unsafe fn complete_hosted_provider_miniport_registration(
 }
 
 unsafe fn register_hosted_provider_pointer_allocation(
+    owner: HostedProviderObjectOwner,
     dependent_instance: usize,
     dependent_component_va: u64,
     provider_instance: usize,
     bytes: u64,
-) -> bool {
-    if dependent_component_va == 0 || bytes == 0 {
-        return false;
-    }
+) {
+    assert!(dependent_component_va != 0 && bytes != 0);
+    assert!(hosted_provider_object_owner_is_live(
+        owner,
+        provider_instance,
+        dependent_instance,
+    ));
     let records = hosted_provider_pointer_allocations_mut();
     for record in records.iter_mut() {
         if !record.present {
             *record = HostedProviderPointerAllocation {
                 present: true,
+                owner,
+                release_progress: HostedProviderReleaseProgress::new(1),
                 dependent_instance,
                 dependent_component_va,
                 provider_instance,
                 provider_component_va: 0,
                 bytes,
             };
-            return true;
+            return;
         }
     }
     records.push(HostedProviderPointerAllocation {
         present: true,
+        owner,
+        release_progress: HostedProviderReleaseProgress::new(1),
         dependent_instance,
         dependent_component_va,
         provider_instance,
         provider_component_va: 0,
         bytes,
     });
-    true
 }
 
 unsafe fn hosted_provider_pointer_allocation(
@@ -16734,6 +16986,11 @@ unsafe fn hosted_provider_pointer_allocation(
         if record.present
             && record.dependent_instance == dependent_instance
             && record.dependent_component_va == dependent_component_va
+            && hosted_provider_object_owner_is_live(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+            )
             && (bytes == 0 || bytes <= record.bytes)
         {
             return Some(record);
@@ -16757,71 +17014,98 @@ unsafe fn associate_hosted_provider_pointer_allocation(
             && record.dependent_instance == dependent_instance
             && record.dependent_component_va == dependent_component_va
             && record.provider_instance == provider_instance
+            && hosted_provider_object_owner_is_live(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+            )
             && record.provider_component_va == 0
         {
             record.provider_component_va = provider_component_va;
+            record.release_progress.add_pending(1 << 1);
             return true;
         }
     }
     false
 }
 
-unsafe fn take_hosted_provider_pointer_allocation(
+unsafe fn release_hosted_provider_pointer_allocation_record(
+    record: &mut HostedProviderPointerAllocation,
+    provider_component_override: u64,
+) -> bool {
+    if !record.present
+        || !hosted_provider_object_owner_is_current(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+        )
+    {
+        return false;
+    }
+    if provider_component_override != 0 {
+        if record.provider_component_va != 0
+            && record.provider_component_va != provider_component_override
+        {
+            return false;
+        }
+        if record.provider_component_va == 0 {
+            record.provider_component_va = provider_component_override;
+            record.release_progress.add_pending(1 << 1);
+        }
+    }
+    let dependent_instance = record.dependent_instance;
+    let dependent_component_va = record.dependent_component_va;
+    let provider_instance = record.provider_instance;
+    let provider_component_va = record.provider_component_va;
+    record.release_progress.release_with(|bit| match bit {
+        0 => instance(dependent_instance).is_some_and(|inst| {
+            release_hosted_instance_pool_allocation_if_live(inst, dependent_component_va)
+        }),
+        1 => instance(provider_instance).is_some_and(|inst| {
+            release_hosted_instance_pool_allocation_if_live(inst, provider_component_va)
+        }),
+        _ => false,
+    })
+}
+
+unsafe fn release_hosted_provider_pointer_allocation_by_dependent(
     dependent_instance: usize,
     component_va: u64,
-) -> Option<HostedProviderPointerAllocation> {
-    let records = hosted_provider_pointer_allocations_mut();
-    for record in records.iter_mut() {
+    provider_component_override: u64,
+) -> bool {
+    for record in hosted_provider_pointer_allocations_mut().iter_mut() {
         if record.present
             && record.dependent_instance == dependent_instance
             && record.dependent_component_va == component_va
+            && hosted_provider_object_owner_is_live(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+            )
         {
-            let taken = *record;
+            if !release_hosted_provider_pointer_allocation_record(
+                record,
+                provider_component_override,
+            ) {
+                return false;
+            }
             *record = HostedProviderPointerAllocation::empty();
-            return Some(taken);
+            return true;
         }
     }
     HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-    None
-}
-
-unsafe fn release_hosted_provider_pointer_allocation(
-    record: HostedProviderPointerAllocation,
-    provider_component_override: u64,
-) -> bool {
-    let Some(dependent_inst) = instance(record.dependent_instance) else {
-        return false;
-    };
-    let provider_component_va = if provider_component_override != 0 {
-        provider_component_override
-    } else {
-        record.provider_component_va
-    };
-    let dependent_released = release_hosted_instance_pool_allocation_if_live(
-        dependent_inst,
-        record.dependent_component_va,
-    );
-    let provider_released = if provider_component_va == 0 {
-        true
-    } else if let Some(provider_inst) = instance(record.provider_instance) {
-        release_hosted_instance_pool_allocation_if_live(provider_inst, provider_component_va)
-    } else {
-        false
-    };
-    dependent_released && provider_released
+    false
 }
 
 unsafe fn abort_provider_export_marshal_before_dispatch(state: &ProviderMarshalState) {
     if state.pointer_allocation_dependent_component_va == 0 {
         return;
     }
-    let Some(record) = take_hosted_provider_pointer_allocation(
+    if !release_hosted_provider_pointer_allocation_by_dependent(
         state.pointer_allocation_dependent_instance,
         state.pointer_allocation_dependent_component_va,
-    ) else {
-        return;
-    };
-    if !release_hosted_provider_pointer_allocation(record, 0) {
+        0,
+    ) {
         HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -16830,43 +17114,63 @@ unsafe fn abort_provider_export_marshal_after_possible_dispatch(state: &Provider
     if state.pointer_allocation_dependent_component_va != 0 {
         let provider_component_va =
             read_unaligned(state.pointer_allocation_provider_output_exec_va as *const u64);
-        if let Some(record) = take_hosted_provider_pointer_allocation(
+        if !release_hosted_provider_pointer_allocation_by_dependent(
             state.pointer_allocation_dependent_instance,
             state.pointer_allocation_dependent_component_va,
+            provider_component_va,
         ) {
-            if !release_hosted_provider_pointer_allocation(record, provider_component_va) {
-                HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-            }
+            HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         }
     }
     if state.pointer_free_dependent_component_va != 0 {
-        if let Some(record) = take_hosted_provider_pointer_allocation(
+        let record_matches = hosted_provider_pointer_allocation(
             state.pointer_free_dependent_instance,
             state.pointer_free_dependent_component_va,
-        ) {
-            if record.provider_instance != state.pointer_free_provider_instance
-                || record.provider_component_va != state.pointer_free_provider_component_va
-                || !release_hosted_provider_pointer_allocation(record, 0)
-            {
-                HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-            }
+            0,
+        )
+        .is_some_and(|record| {
+            record.provider_instance == state.pointer_free_provider_instance
+                && record.provider_component_va == state.pointer_free_provider_component_va
+        });
+        if !record_matches
+            || !release_hosted_provider_pointer_allocation_by_dependent(
+                state.pointer_free_dependent_instance,
+                state.pointer_free_dependent_component_va,
+                0,
+            )
+        {
+            HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
 
-unsafe fn clear_hosted_provider_pointer_allocations_for_instance(instance_index: usize) -> u64 {
+unsafe fn clear_hosted_provider_pointer_allocations_for_instance(
+    instance_index: usize,
+    domain: HostedDomainIdentity,
+) -> u64 {
     let records = hosted_provider_pointer_allocations_mut();
     let mut failures = 0u64;
     for record in records.iter_mut() {
-        if !record.present
-            || record.dependent_instance != instance_index
-                && record.provider_instance != instance_index
+        if !record.present {
+            continue;
+        }
+        if record.dependent_instance != instance_index && record.provider_instance != instance_index
         {
             continue;
         }
-        let taken = *record;
-        *record = HostedProviderPointerAllocation::empty();
-        if !release_hosted_provider_pointer_allocation(taken, 0) {
+        if !hosted_provider_object_owner_matches_instance(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+            instance_index,
+            domain,
+        ) {
+            failures += 1;
+            continue;
+        }
+        if release_hosted_provider_pointer_allocation_record(record, 0) {
+            *record = HostedProviderPointerAllocation::empty();
+        } else {
             failures += 1;
         }
     }
@@ -16929,6 +17233,11 @@ unsafe fn find_hosted_provider_ndis_packet_shadow_by_dependent(
         if record.present
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
+            && hosted_provider_object_owner_is_live(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+            )
             && record.dependent_component_va == dependent_component_va
         {
             return Some((index, record));
@@ -16952,6 +17261,11 @@ unsafe fn find_hosted_provider_ndis_packet_shadow_by_provider_for_dependent(
         if record.present
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
+            && hosted_provider_object_owner_is_live(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+            )
             && record.provider_component_va == provider_component_va
         {
             return Some((index, record));
@@ -16973,8 +17287,28 @@ unsafe fn update_hosted_provider_ndis_packet_sg_shadow(
         if record.present
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
+            && hosted_provider_object_owner_is_live(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+            )
             && record.dependent_component_va == dependent_component_va
         {
+            if record.dependent_sg_component_owned_by_bridge
+                && record.dependent_sg_component_va != 0
+                && record.dependent_sg_component_va != dependent_sg_component_va
+            {
+                let Some(dependent_inst) = instance(record.dependent_instance) else {
+                    return false;
+                };
+                if !release_hosted_instance_pool_allocation_if_live(
+                    dependent_inst,
+                    record.dependent_sg_component_va,
+                ) {
+                    return false;
+                }
+                record.dependent_sg_component_owned_by_bridge = false;
+            }
             record.dependent_sg_component_va = dependent_sg_component_va;
             record.provider_sg_component_va = provider_sg_component_va;
             record.dependent_sg_component_owned_by_bridge = dependent_sg_component_owned_by_bridge;
@@ -16984,6 +17318,49 @@ unsafe fn update_hosted_provider_ndis_packet_sg_shadow(
     false
 }
 
+unsafe fn release_hosted_provider_ndis_packet_shadow_record(
+    record: &mut HostedProviderNdisPacketShadow,
+) -> bool {
+    if !record.present
+        || !hosted_provider_object_owner_is_current(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+        )
+    {
+        return false;
+    }
+    let mut complete = true;
+    if record.dependent_component_owned_by_bridge {
+        if instance(record.dependent_instance).is_some_and(|inst| {
+            release_hosted_instance_pool_allocation_if_live(inst, record.dependent_component_va)
+        }) {
+            record.dependent_component_owned_by_bridge = false;
+        } else {
+            complete = false;
+        }
+    }
+    if record.dependent_sg_component_owned_by_bridge && record.dependent_sg_component_va != 0 {
+        if instance(record.dependent_instance).is_some_and(|inst| {
+            release_hosted_instance_pool_allocation_if_live(inst, record.dependent_sg_component_va)
+        }) {
+            record.dependent_sg_component_owned_by_bridge = false;
+        } else {
+            complete = false;
+        }
+    }
+    if record.provider_component_owned_by_bridge {
+        if instance(record.provider_instance).is_some_and(|inst| {
+            release_hosted_instance_pool_allocation_if_live(inst, record.provider_component_va)
+        }) {
+            record.provider_component_owned_by_bridge = false;
+        } else {
+            complete = false;
+        }
+    }
+    complete
+}
+
 unsafe fn register_hosted_provider_ndis_packet_shadow(
     shadow: HostedProviderNdisPacketShadow,
 ) -> bool {
@@ -16991,6 +17368,11 @@ unsafe fn register_hosted_provider_ndis_packet_shadow(
         || shadow.dependent_component_va == 0
         || shadow.bytes < NDIS_PACKET_MIN_LEN_X64
         || shadow.bytes > NDIS_PACKET_MAX_SHADOW_LEN_X64
+        || !hosted_provider_object_owner_is_live(
+            shadow.owner,
+            shadow.provider_instance,
+            shadow.dependent_instance,
+        )
     {
         return false;
     }
@@ -17002,30 +17384,7 @@ unsafe fn register_hosted_provider_ndis_packet_shadow(
             && (record.dependent_component_va == shadow.dependent_component_va
                 || record.provider_component_va == shadow.provider_component_va)
         {
-            if record.provider_component_owned_by_bridge
-                && record.provider_component_va != shadow.provider_component_va
-            {
-                if let Some(provider_inst) = instance(record.provider_instance) {
-                    hosted_instance_pool_free(provider_inst, record.provider_component_va);
-                }
-            }
-            if record.dependent_component_owned_by_bridge
-                && record.dependent_component_va != shadow.dependent_component_va
-            {
-                if let Some(dependent_inst) = instance(record.dependent_instance) {
-                    hosted_instance_pool_free(dependent_inst, record.dependent_component_va);
-                }
-            }
-            if record.dependent_sg_component_owned_by_bridge
-                && record.dependent_sg_component_va != 0
-                && record.dependent_sg_component_va != shadow.dependent_sg_component_va
-            {
-                if let Some(dependent_inst) = instance(record.dependent_instance) {
-                    hosted_instance_pool_free(dependent_inst, record.dependent_sg_component_va);
-                }
-            }
-            *record = shadow;
-            return true;
+            return *record == shadow;
         }
         if !record.present {
             *record = shadow;
@@ -17036,28 +17395,35 @@ unsafe fn register_hosted_provider_ndis_packet_shadow(
     true
 }
 
-unsafe fn take_hosted_provider_ndis_packet_shadow_by_dependent(
+unsafe fn release_hosted_provider_ndis_packet_shadow_by_dependent(
     provider_instance: usize,
     dependent_instance: usize,
     dependent_component_va: u64,
-) -> Option<HostedProviderNdisPacketShadow> {
+) -> bool {
     if dependent_component_va == 0 {
-        return None;
+        return false;
     }
     let records = hosted_provider_ndis_packet_shadows_mut();
     for record in records.iter_mut() {
         if record.present
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
+            && hosted_provider_object_owner_is_live(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+            )
             && record.dependent_component_va == dependent_component_va
         {
-            let taken = *record;
+            if !release_hosted_provider_ndis_packet_shadow_record(record) {
+                return false;
+            }
             *record = HostedProviderNdisPacketShadow::empty();
-            return Some(taken);
+            return true;
         }
     }
     HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-    None
+    false
 }
 
 unsafe fn find_hosted_provider_ndis_buffer_shadow_by_dependent(
@@ -17075,6 +17441,11 @@ unsafe fn find_hosted_provider_ndis_buffer_shadow_by_dependent(
         if record.present
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
+            && hosted_provider_object_owner_is_live(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+            )
             && record.dependent_component_va == dependent_component_va
         {
             return Some((index, record));
@@ -17098,6 +17469,11 @@ unsafe fn find_hosted_provider_ndis_buffer_shadow_by_provider_for_dependent(
         if record.present
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
+            && hosted_provider_object_owner_is_live(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+            )
             && record.provider_component_va == provider_component_va
         {
             return Some((index, record));
@@ -17125,7 +17501,14 @@ unsafe fn provider_receive_buffer_exec_va(
         return None;
     };
     for shadow in records.iter().copied() {
-        if shadow.present && shadow.provider_instance == provider_instance {
+        if shadow.present
+            && shadow.provider_instance == provider_instance
+            && hosted_provider_object_owner_is_live(
+                shadow.owner,
+                shadow.provider_instance,
+                shadow.dependent_instance,
+            )
+        {
             if let Some(offset) = component_subrange_offset(
                 shadow.provider_data_component_va,
                 shadow.bytes,
@@ -17158,6 +17541,55 @@ unsafe fn provider_receive_buffer_exec_va(
     None
 }
 
+unsafe fn release_hosted_provider_ndis_buffer_shadow_record(
+    record: &mut HostedProviderNdisBufferShadow,
+) -> bool {
+    if !record.present
+        || !hosted_provider_object_owner_is_current(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+        )
+    {
+        return false;
+    }
+    let mut complete = true;
+    macro_rules! release_owned {
+        ($owned:ident, $instance:ident, $component_va:ident) => {
+            if record.$owned {
+                if instance(record.$instance).is_some_and(|inst| {
+                    release_hosted_instance_pool_allocation_if_live(inst, record.$component_va)
+                }) {
+                    record.$owned = false;
+                } else {
+                    complete = false;
+                }
+            }
+        };
+    }
+    release_owned!(
+        provider_component_owned_by_bridge,
+        provider_instance,
+        provider_component_va
+    );
+    release_owned!(
+        provider_data_component_owned_by_bridge,
+        provider_instance,
+        provider_data_component_va
+    );
+    release_owned!(
+        dependent_component_owned_by_bridge,
+        dependent_instance,
+        dependent_component_va
+    );
+    release_owned!(
+        dependent_data_component_owned_by_bridge,
+        dependent_instance,
+        dependent_data_component_va
+    );
+    complete
+}
+
 unsafe fn register_hosted_provider_ndis_buffer_shadow(
     shadow: HostedProviderNdisBufferShadow,
 ) -> bool {
@@ -17167,6 +17599,11 @@ unsafe fn register_hosted_provider_ndis_buffer_shadow(
         || shadow.provider_data_component_va == 0
         || shadow.bytes == 0
         || shadow.bytes > u32::MAX as u64
+        || !hosted_provider_object_owner_is_live(
+            shadow.owner,
+            shadow.provider_instance,
+            shadow.dependent_instance,
+        )
     {
         return false;
     }
@@ -17178,36 +17615,7 @@ unsafe fn register_hosted_provider_ndis_buffer_shadow(
             && (record.dependent_component_va == shadow.dependent_component_va
                 || record.provider_component_va == shadow.provider_component_va)
         {
-            if record.provider_component_owned_by_bridge
-                && record.provider_component_va != shadow.provider_component_va
-            {
-                if let Some(provider_inst) = instance(record.provider_instance) {
-                    hosted_instance_pool_free(provider_inst, record.provider_component_va);
-                }
-            }
-            if record.provider_data_component_owned_by_bridge
-                && record.provider_data_component_va != shadow.provider_data_component_va
-            {
-                if let Some(provider_inst) = instance(record.provider_instance) {
-                    hosted_instance_pool_free(provider_inst, record.provider_data_component_va);
-                }
-            }
-            if record.dependent_component_owned_by_bridge
-                && record.dependent_component_va != shadow.dependent_component_va
-            {
-                if let Some(dependent_inst) = instance(record.dependent_instance) {
-                    hosted_instance_pool_free(dependent_inst, record.dependent_component_va);
-                }
-            }
-            if record.dependent_data_component_owned_by_bridge
-                && record.dependent_data_component_va != shadow.dependent_data_component_va
-            {
-                if let Some(dependent_inst) = instance(record.dependent_instance) {
-                    hosted_instance_pool_free(dependent_inst, record.dependent_data_component_va);
-                }
-            }
-            *record = shadow;
-            return true;
+            return *record == shadow;
         }
         if !record.present {
             *record = shadow;
@@ -17218,55 +17626,53 @@ unsafe fn register_hosted_provider_ndis_buffer_shadow(
     true
 }
 
-unsafe fn clear_hosted_provider_ndis_shadows_for_instance(instance_index: usize) {
+unsafe fn clear_hosted_provider_ndis_shadows_for_instance(
+    instance_index: usize,
+    domain: HostedDomainIdentity,
+) -> u64 {
+    let mut failures = 0u64;
     for record in hosted_provider_ndis_packet_shadows_mut().iter_mut() {
-        if record.present
-            && (record.provider_instance == instance_index
-                || record.dependent_instance == instance_index)
+        if !record.present
+            || record.provider_instance != instance_index
+                && record.dependent_instance != instance_index
         {
-            if let Some(dependent_inst) = instance(record.dependent_instance) {
-                if record.dependent_component_owned_by_bridge {
-                    hosted_instance_pool_free(dependent_inst, record.dependent_component_va);
-                }
-                if record.dependent_sg_component_owned_by_bridge
-                    && record.dependent_sg_component_va != 0
-                {
-                    hosted_instance_pool_free(dependent_inst, record.dependent_sg_component_va);
-                }
-            }
-            if record.provider_component_owned_by_bridge {
-                if let Some(provider_inst) = instance(record.provider_instance) {
-                    hosted_instance_pool_free(provider_inst, record.provider_component_va);
-                }
-            }
+            continue;
+        }
+        if !hosted_provider_object_owner_matches_instance(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+            instance_index,
+            domain,
+        ) || !release_hosted_provider_ndis_packet_shadow_record(record)
+        {
+            failures += 1;
+        } else {
             *record = HostedProviderNdisPacketShadow::empty();
         }
     }
 
     for record in hosted_provider_ndis_buffer_shadows_mut().iter_mut() {
-        if record.present
-            && (record.provider_instance == instance_index
-                || record.dependent_instance == instance_index)
+        if !record.present
+            || record.provider_instance != instance_index
+                && record.dependent_instance != instance_index
         {
-            if let Some(provider_inst) = instance(record.provider_instance) {
-                if record.provider_component_owned_by_bridge {
-                    hosted_instance_pool_free(provider_inst, record.provider_component_va);
-                }
-                if record.provider_data_component_owned_by_bridge {
-                    hosted_instance_pool_free(provider_inst, record.provider_data_component_va);
-                }
-            }
-            if let Some(dependent_inst) = instance(record.dependent_instance) {
-                if record.dependent_component_owned_by_bridge {
-                    hosted_instance_pool_free(dependent_inst, record.dependent_component_va);
-                }
-                if record.dependent_data_component_owned_by_bridge {
-                    hosted_instance_pool_free(dependent_inst, record.dependent_data_component_va);
-                }
-            }
+            continue;
+        }
+        if !hosted_provider_object_owner_matches_instance(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+            instance_index,
+            domain,
+        ) || !release_hosted_provider_ndis_buffer_shadow_record(record)
+        {
+            failures += 1;
+        } else {
             *record = HostedProviderNdisBufferShadow::empty();
         }
     }
+    failures
 }
 
 fn component_subrange_offset(base: u64, len: u64, value: u64, bytes: u64) -> Option<u64> {
@@ -17331,6 +17737,8 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_dependent_from_provider(
     dependent_inst: DriverInstance,
     provider_component_va: u64,
 ) -> Result<HostedProviderNdisBufferShadow, i32> {
+    let owner = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
+        .ok_or(STATUS_DEVICE_NOT_READY)?;
     if let Some((_index, shadow)) =
         find_hosted_provider_ndis_buffer_shadow_by_provider_for_dependent(
             provider_instance,
@@ -17418,6 +17826,7 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_dependent_from_provider(
     write_ndis_mdl(dependent_mdl_exec, dependent_data_component_va, bytes, 0);
     let shadow = HostedProviderNdisBufferShadow {
         present: true,
+        owner,
         provider_instance,
         dependent_instance,
         dependent_component_va,
@@ -17447,6 +17856,8 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_provider_from_dependent(
     dependent_inst: DriverInstance,
     dependent_component_va: u64,
 ) -> Result<HostedProviderNdisBufferShadow, i32> {
+    let owner = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
+        .ok_or(STATUS_DEVICE_NOT_READY)?;
     if let Some((_index, shadow)) = find_hosted_provider_ndis_buffer_shadow_by_dependent(
         provider_instance,
         dependent_instance,
@@ -17532,6 +17943,7 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_provider_from_dependent(
     write_ndis_mdl(provider_mdl_exec, provider_data_component_va, bytes, 0);
     let shadow = HostedProviderNdisBufferShadow {
         present: true,
+        owner,
         provider_instance,
         dependent_instance,
         dependent_component_va,
@@ -17561,6 +17973,8 @@ unsafe fn ensure_hosted_provider_ndis_packet_shadow_for_dependent_from_provider(
     dependent_inst: DriverInstance,
     provider_component_va: u64,
 ) -> Result<HostedProviderNdisPacketShadow, i32> {
+    let owner = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
+        .ok_or(STATUS_DEVICE_NOT_READY)?;
     if let Some((_index, shadow)) =
         find_hosted_provider_ndis_packet_shadow_by_provider_for_dependent(
             provider_instance,
@@ -17647,6 +18061,7 @@ unsafe fn ensure_hosted_provider_ndis_packet_shadow_for_dependent_from_provider(
     copy_bytes(dependent_packet_exec, provider_packet_exec, packet_bytes);
     let shadow = HostedProviderNdisPacketShadow {
         present: true,
+        owner,
         provider_instance,
         dependent_instance,
         dependent_component_va,
@@ -17669,12 +18084,13 @@ unsafe fn ensure_hosted_provider_ndis_packet_shadow_for_dependent_from_provider(
         dependent_inst,
         shadow,
     ) {
-        let _ = take_hosted_provider_ndis_packet_shadow_by_dependent(
+        if !release_hosted_provider_ndis_packet_shadow_by_dependent(
             provider_instance,
             dependent_instance,
             dependent_component_va,
-        );
-        hosted_instance_pool_free(dependent_inst, dependent_component_va);
+        ) {
+            HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        }
         return Err(status);
     }
     Ok(shadow)
@@ -17688,6 +18104,8 @@ unsafe fn ensure_hosted_provider_ndis_packet_shadow_for_provider_from_dependent(
     dependent_component_va: u64,
     translate_buffers: bool,
 ) -> Result<HostedProviderNdisPacketShadow, i32> {
+    let owner = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
+        .ok_or(STATUS_DEVICE_NOT_READY)?;
     if let Some((_index, shadow)) = find_hosted_provider_ndis_packet_shadow_by_dependent(
         provider_instance,
         dependent_instance,
@@ -17734,6 +18152,7 @@ unsafe fn ensure_hosted_provider_ndis_packet_shadow_for_provider_from_dependent(
     copy_bytes(provider_packet_exec, dependent_packet_exec, packet_bytes);
     let shadow = HostedProviderNdisPacketShadow {
         present: true,
+        owner,
         provider_instance,
         dependent_instance,
         dependent_component_va,
@@ -17757,12 +18176,13 @@ unsafe fn ensure_hosted_provider_ndis_packet_shadow_for_provider_from_dependent(
         shadow,
         translate_buffers,
     ) {
-        let _ = take_hosted_provider_ndis_packet_shadow_by_dependent(
+        if !release_hosted_provider_ndis_packet_shadow_by_dependent(
             provider_instance,
             dependent_instance,
             dependent_component_va,
-        );
-        hosted_instance_pool_free(provider_inst, provider_component_va);
+        ) {
+            HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        }
         return Err(status);
     }
     Ok(shadow)
@@ -18869,6 +19289,12 @@ unsafe fn complete_provider_ndis_packet_allocation(
         write_unaligned(state.ndis_packet_out_dependent_exec_va as *mut u64, 0);
         return;
     }
+    let Some(owner) = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
+    else {
+        write_provider_ndis_status(state, STATUS_DEVICE_NOT_READY);
+        write_unaligned(state.ndis_packet_out_dependent_exec_va as *mut u64, 0);
+        return;
+    };
     let provider_packet = read_unaligned(state.ndis_packet_out_provider_exec_va as *const u64);
     if provider_packet == 0 {
         write_provider_ndis_status(state, STATUS_INSUFFICIENT_RESOURCES);
@@ -18919,6 +19345,7 @@ unsafe fn complete_provider_ndis_packet_allocation(
     copy_bytes(dependent_packet_exec, provider_packet_exec, packet_bytes);
     if !register_hosted_provider_ndis_packet_shadow(HostedProviderNdisPacketShadow {
         present: true,
+        owner,
         provider_instance,
         dependent_instance,
         dependent_component_va: dependent_packet,
@@ -18961,6 +19388,18 @@ unsafe fn complete_provider_ndis_buffer_allocation(
         write_unaligned(state.ndis_buffer_out_dependent_exec_va as *mut u64, 0);
         return;
     }
+    let Some(owner) = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
+    else {
+        if state.ndis_buffer_out_provider_data_owned_by_bridge {
+            hosted_instance_pool_free(
+                provider_inst,
+                state.ndis_buffer_out_provider_data_component_va,
+            );
+        }
+        write_provider_ndis_status(state, STATUS_DEVICE_NOT_READY);
+        write_unaligned(state.ndis_buffer_out_dependent_exec_va as *mut u64, 0);
+        return;
+    };
     let provider_buffer = read_unaligned(state.ndis_buffer_out_provider_exec_va as *const u64);
     if provider_buffer == 0 || state.ndis_buffer_out_bytes == 0 {
         if state.ndis_buffer_out_provider_data_owned_by_bridge {
@@ -19033,6 +19472,7 @@ unsafe fn complete_provider_ndis_buffer_allocation(
     );
     if !register_hosted_provider_ndis_buffer_shadow(HostedProviderNdisBufferShadow {
         present: true,
+        owner,
         provider_instance,
         dependent_instance,
         dependent_component_va: dependent_buffer,
@@ -19195,9 +19635,7 @@ unsafe fn complete_provider_ndis_packet_array_copyback(
 unsafe fn complete_provider_ndis_packet_free(
     state: &ProviderMarshalState,
     provider_instance: usize,
-    provider_inst: DriverInstance,
     dependent_instance: usize,
-    dependent_inst: DriverInstance,
 ) {
     if !state.ndis_packet_free_on_success
         || state.ndis_packet_free_dependent_component_va == 0
@@ -19205,21 +19643,12 @@ unsafe fn complete_provider_ndis_packet_free(
     {
         return;
     }
-    let Some(shadow) = take_hosted_provider_ndis_packet_shadow_by_dependent(
+    if !release_hosted_provider_ndis_packet_shadow_by_dependent(
         provider_instance,
         dependent_instance,
         state.ndis_packet_free_dependent_component_va,
-    ) else {
-        return;
-    };
-    if shadow.dependent_sg_component_owned_by_bridge && shadow.dependent_sg_component_va != 0 {
-        hosted_instance_pool_free(dependent_inst, shadow.dependent_sg_component_va);
-    }
-    if shadow.dependent_component_owned_by_bridge {
-        hosted_instance_pool_free(dependent_inst, shadow.dependent_component_va);
-    }
-    if shadow.provider_component_owned_by_bridge {
-        hosted_instance_pool_free(provider_inst, shadow.provider_component_va);
+    ) {
+        HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -19275,13 +19704,7 @@ unsafe fn complete_provider_ndis_object_shadows(
         dependent_instance,
         dependent_inst,
     );
-    complete_provider_ndis_packet_free(
-        state,
-        provider_instance,
-        provider_inst,
-        dependent_instance,
-        dependent_inst,
-    );
+    complete_provider_ndis_packet_free(state, provider_instance, dependent_instance);
 }
 
 unsafe fn find_hosted_provider_miniport_interrupt_shadow(
@@ -19299,6 +19722,11 @@ unsafe fn find_hosted_provider_miniport_interrupt_shadow(
         if record.present
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
+            && hosted_provider_object_owner_is_live(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+            )
             && record.dependent_component_va == dependent_component_va
         {
             return Some((index, record));
@@ -19313,6 +19741,8 @@ unsafe fn allocate_hosted_provider_miniport_interrupt_shadow(
     dependent_instance: usize,
     dependent_component_va: u64,
 ) -> Result<HostedProviderMiniportInterruptShadow, i32> {
+    let owner = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
+        .ok_or(STATUS_DEVICE_NOT_READY)?;
     let Some(provider_component_va) =
         hosted_instance_pool_alloc(provider_inst, NDIS_MINIPORT_INTERRUPT_LEN_X64)
     else {
@@ -19332,6 +19762,7 @@ unsafe fn allocate_hosted_provider_miniport_interrupt_shadow(
 
     let shadow = HostedProviderMiniportInterruptShadow {
         present: true,
+        owner,
         provider_instance,
         dependent_instance,
         dependent_component_va,
@@ -19407,56 +19838,68 @@ unsafe fn hosted_provider_miniport_interrupt_shadow(
     ))
 }
 
-unsafe fn take_hosted_provider_miniport_interrupt_shadow_by_provider(
-    provider_instance: usize,
-    provider_component_va: u64,
-) -> Option<HostedProviderMiniportInterruptShadow> {
-    if provider_component_va == 0 {
-        return None;
-    }
-    let records = hosted_provider_miniport_interrupt_shadows_mut();
-    for record in records.iter_mut() {
-        if record.present
-            && record.provider_instance == provider_instance
-            && record.provider_component_va == provider_component_va
-        {
-            let taken = *record;
-            *record = HostedProviderMiniportInterruptShadow::empty();
-            return Some(taken);
-        }
-    }
-    HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-    None
-}
-
 unsafe fn free_hosted_provider_miniport_interrupt_shadow(
     provider_instance: usize,
     provider_component_va: u64,
 ) -> bool {
-    let Some(shadow) = take_hosted_provider_miniport_interrupt_shadow_by_provider(
-        provider_instance,
-        provider_component_va,
-    ) else {
-        return false;
-    };
-    let Some(provider_inst) = instance(shadow.provider_instance) else {
-        return false;
-    };
-    hosted_instance_pool_free(provider_inst, shadow.provider_component_va)
-}
-
-unsafe fn clear_hosted_provider_miniport_interrupt_shadows_for_instance(instance_index: usize) {
     for record in hosted_provider_miniport_interrupt_shadows_mut().iter_mut() {
         if record.present
-            && (record.provider_instance == instance_index
-                || record.dependent_instance == instance_index)
+            && record.provider_instance == provider_instance
+            && record.provider_component_va == provider_component_va
+            && hosted_provider_object_owner_is_live(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+            )
         {
-            if let Some(provider_inst) = instance(record.provider_instance) {
-                hosted_instance_pool_free(provider_inst, record.provider_component_va);
+            if !release_hosted_provider_owned_pool_allocation(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+                record.provider_instance,
+                record.provider_component_va,
+            ) {
+                return false;
             }
+            *record = HostedProviderMiniportInterruptShadow::empty();
+            return true;
+        }
+    }
+    HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+    false
+}
+
+unsafe fn clear_hosted_provider_miniport_interrupt_shadows_for_instance(
+    instance_index: usize,
+    domain: HostedDomainIdentity,
+) -> u64 {
+    let mut failures = 0u64;
+    for record in hosted_provider_miniport_interrupt_shadows_mut().iter_mut() {
+        if !record.present
+            || record.provider_instance != instance_index
+                && record.dependent_instance != instance_index
+        {
+            continue;
+        }
+        if !hosted_provider_object_owner_matches_instance(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+            instance_index,
+            domain,
+        ) || !release_hosted_provider_owned_pool_allocation(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+            record.provider_instance,
+            record.provider_component_va,
+        ) {
+            failures += 1;
+        } else {
             *record = HostedProviderMiniportInterruptShadow::empty();
         }
     }
+    failures
 }
 
 unsafe fn find_hosted_provider_miniport_timer_shadow(
@@ -19474,6 +19917,11 @@ unsafe fn find_hosted_provider_miniport_timer_shadow(
         if record.present
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
+            && hosted_provider_object_owner_is_live(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+            )
             && record.dependent_component_va == dependent_component_va
         {
             return Some((index, record));
@@ -19497,6 +19945,11 @@ unsafe fn find_hosted_provider_miniport_timer_shadow_by_provider(
         if record.present
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
+            && hosted_provider_object_owner_is_live(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+            )
             && record.provider_component_va == provider_component_va
         {
             return Some(record);
@@ -19525,6 +19978,8 @@ unsafe fn allocate_hosted_provider_miniport_timer_shadow(
     dependent_instance: usize,
     dependent_component_va: u64,
 ) -> Result<HostedProviderMiniportTimerShadow, i32> {
+    let owner = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
+        .ok_or(STATUS_DEVICE_NOT_READY)?;
     let Some(provider_component_va) =
         hosted_instance_pool_alloc(provider_inst, NDIS_MINIPORT_TIMER_LEN_X64)
     else {
@@ -19544,6 +19999,7 @@ unsafe fn allocate_hosted_provider_miniport_timer_shadow(
 
     let shadow = HostedProviderMiniportTimerShadow {
         present: true,
+        owner,
         provider_instance,
         dependent_instance,
         dependent_component_va,
@@ -19619,18 +20075,37 @@ unsafe fn hosted_provider_miniport_timer_shadow(
     ))
 }
 
-unsafe fn clear_hosted_provider_miniport_timer_shadows_for_instance(instance_index: usize) {
+unsafe fn clear_hosted_provider_miniport_timer_shadows_for_instance(
+    instance_index: usize,
+    domain: HostedDomainIdentity,
+) -> u64 {
+    let mut failures = 0u64;
     for record in hosted_provider_miniport_timer_shadows_mut().iter_mut() {
-        if record.present
-            && (record.provider_instance == instance_index
-                || record.dependent_instance == instance_index)
+        if !record.present
+            || record.provider_instance != instance_index
+                && record.dependent_instance != instance_index
         {
-            if let Some(provider_inst) = instance(record.provider_instance) {
-                hosted_instance_pool_free(provider_inst, record.provider_component_va);
-            }
+            continue;
+        }
+        if !hosted_provider_object_owner_matches_instance(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+            instance_index,
+            domain,
+        ) || !release_hosted_provider_owned_pool_allocation(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+            record.provider_instance,
+            record.provider_component_va,
+        ) {
+            failures += 1;
+        } else {
             *record = HostedProviderMiniportTimerShadow::empty();
         }
     }
+    failures
 }
 
 unsafe fn find_hosted_provider_ndis_work_item_shadow(
@@ -19648,6 +20123,11 @@ unsafe fn find_hosted_provider_ndis_work_item_shadow(
         if record.present
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
+            && hosted_provider_object_owner_is_live(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+            )
             && record.dependent_component_va == dependent_component_va
         {
             return Some((index, record));
@@ -19671,6 +20151,11 @@ unsafe fn find_hosted_provider_ndis_work_item_shadow_by_provider(
         if record.present
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
+            && hosted_provider_object_owner_is_live(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+            )
             && record.provider_component_va == provider_component_va
         {
             return Some(record);
@@ -19682,10 +20167,26 @@ unsafe fn find_hosted_provider_ndis_work_item_shadow_by_provider(
 unsafe fn store_hosted_provider_ndis_work_item_shadow(
     index: usize,
     shadow: HostedProviderNdisWorkItemShadow,
-) {
-    if let Some(record) = hosted_provider_ndis_work_item_shadows_mut().get_mut(index) {
-        *record = shadow;
+) -> bool {
+    let Some(record) = hosted_provider_ndis_work_item_shadows_mut().get_mut(index) else {
+        return false;
+    };
+    if !record.present
+        || record.owner != shadow.owner
+        || record.provider_instance != shadow.provider_instance
+        || record.dependent_instance != shadow.dependent_instance
+        || record.provider_component_va != shadow.provider_component_va
+        || record.dependent_component_va != shadow.dependent_component_va
+        || !hosted_provider_object_owner_is_live(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+        )
+    {
+        return false;
     }
+    *record = shadow;
+    true
 }
 
 unsafe fn allocate_hosted_provider_ndis_work_item_shadow(
@@ -19694,6 +20195,8 @@ unsafe fn allocate_hosted_provider_ndis_work_item_shadow(
     dependent_instance: usize,
     dependent_component_va: u64,
 ) -> Result<(usize, HostedProviderNdisWorkItemShadow), i32> {
+    let owner = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
+        .ok_or(STATUS_DEVICE_NOT_READY)?;
     let Some(provider_component_va) =
         hosted_instance_pool_alloc(provider_inst, NDIS_WORK_ITEM_LEN_X64)
     else {
@@ -19713,6 +20216,7 @@ unsafe fn allocate_hosted_provider_ndis_work_item_shadow(
 
     let shadow = HostedProviderNdisWorkItemShadow {
         present: true,
+        owner,
         provider_instance,
         dependent_instance,
         dependent_component_va,
@@ -19785,7 +20289,10 @@ unsafe fn hosted_provider_ndis_work_item_shadow(
         shadow.dependent_routine = dependent_routine;
     }
     shadow.dependent_context = dependent_context;
-    store_hosted_provider_ndis_work_item_shadow(index, shadow);
+    if !store_hosted_provider_ndis_work_item_shadow(index, shadow) {
+        HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_DEVICE_NOT_READY);
+    }
 
     let Some(provider_exec_va) = component_to_exec_va_for_instance(
         provider_instance,
@@ -19808,18 +20315,37 @@ unsafe fn hosted_provider_ndis_work_item_shadow(
     Ok(shadow.provider_component_va)
 }
 
-unsafe fn clear_hosted_provider_ndis_work_item_shadows_for_instance(instance_index: usize) {
+unsafe fn clear_hosted_provider_ndis_work_item_shadows_for_instance(
+    instance_index: usize,
+    domain: HostedDomainIdentity,
+) -> u64 {
+    let mut failures = 0u64;
     for record in hosted_provider_ndis_work_item_shadows_mut().iter_mut() {
-        if record.present
-            && (record.provider_instance == instance_index
-                || record.dependent_instance == instance_index)
+        if !record.present
+            || record.provider_instance != instance_index
+                && record.dependent_instance != instance_index
         {
-            if let Some(provider_inst) = instance(record.provider_instance) {
-                hosted_instance_pool_free(provider_inst, record.provider_component_va);
-            }
+            continue;
+        }
+        if !hosted_provider_object_owner_matches_instance(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+            instance_index,
+            domain,
+        ) || !release_hosted_provider_owned_pool_allocation(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+            record.provider_instance,
+            record.provider_component_va,
+        ) {
+            failures += 1;
+        } else {
             *record = HostedProviderNdisWorkItemShadow::empty();
         }
     }
+    failures
 }
 
 unsafe fn provider_marshal_emit_import_thunk_for_instance(
@@ -20009,6 +20535,11 @@ unsafe fn hosted_provider_ndis_miniport_block_mirror_by_provider(
         if record.present
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
+            && hosted_provider_object_owner_is_live(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+            )
             && record.provider_component_va == provider_component_va
         {
             return Some((index, record));
@@ -20030,6 +20561,11 @@ unsafe fn hosted_provider_ndis_miniport_block_mirror_by_provider_component(
     for record in records.iter().copied() {
         if record.present
             && record.provider_instance == provider_instance
+            && hosted_provider_object_owner_is_live(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+            )
             && record.provider_component_va == provider_component_va
         {
             return Some(record);
@@ -20053,6 +20589,11 @@ unsafe fn hosted_provider_ndis_miniport_block_mirror_by_dependent(
         if record.present
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
+            && hosted_provider_object_owner_is_live(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+            )
             && record.dependent_component_va == dependent_component_va
         {
             return Some(record);
@@ -20068,7 +20609,14 @@ unsafe fn hosted_provider_ndis_miniport_block_mirror_by_dependent_instance(
         return None;
     };
     for record in records.iter().copied() {
-        if record.present && record.dependent_instance == dependent_instance {
+        if record.present
+            && record.dependent_instance == dependent_instance
+            && hosted_provider_object_owner_is_live(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+            )
+        {
             return Some(record);
         }
     }
@@ -20125,6 +20673,11 @@ unsafe fn register_hosted_provider_ndis_miniport_block_mirror(
         || mirror.td_complete_thunk == 0
         || mirror.query_complete_thunk == 0
         || mirror.set_complete_thunk == 0
+        || !hosted_provider_object_owner_is_live(
+            mirror.owner,
+            mirror.provider_instance,
+            mirror.dependent_instance,
+        )
     {
         return false;
     }
@@ -20280,6 +20833,11 @@ unsafe fn refresh_hosted_provider_ndis_miniport_block_mirrors_for_pair(
         if mirror.present
             && mirror.provider_instance == provider_instance
             && mirror.dependent_instance == dependent_instance
+            && hosted_provider_object_owner_is_live(
+                mirror.owner,
+                mirror.provider_instance,
+                mirror.dependent_instance,
+            )
         {
             matched = true;
             refresh_hosted_provider_ndis_miniport_block_mirror(
@@ -20304,6 +20862,8 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
     dependent_inst: DriverInstance,
     provider_component_va: u64,
 ) -> Result<HostedProviderNdisMiniportBlockMirror, i32> {
+    let owner = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
+        .ok_or(STATUS_DEVICE_NOT_READY)?;
     let Some(provider_exec) = component_to_exec_va_for_instance(
         provider_instance,
         provider_inst,
@@ -20341,6 +20901,7 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
 
     let mut mirror = HostedProviderNdisMiniportBlockMirror {
         present: true,
+        owner,
         provider_instance,
         dependent_instance,
         provider_component_va,
@@ -20437,18 +20998,80 @@ unsafe fn ensure_hosted_provider_ndis_miniport_block_mirror(
     )
 }
 
-unsafe fn clear_hosted_provider_ndis_miniport_block_mirrors_for_instance(instance_index: usize) {
+unsafe fn clear_hosted_provider_ndis_miniport_block_mirrors_for_instance(
+    instance_index: usize,
+    domain: HostedDomainIdentity,
+) -> u64 {
+    let mut failures = 0u64;
     for record in hosted_provider_ndis_miniport_block_mirrors_mut().iter_mut() {
-        if record.present
-            && (record.provider_instance == instance_index
-                || record.dependent_instance == instance_index)
+        if !record.present
+            || record.provider_instance != instance_index
+                && record.dependent_instance != instance_index
         {
-            if let Some(dependent_inst) = instance(record.dependent_instance) {
-                hosted_instance_pool_free(dependent_inst, record.dependent_component_va);
-            }
+            continue;
+        }
+        if !hosted_provider_object_owner_matches_instance(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+            instance_index,
+            domain,
+        ) || !release_hosted_provider_owned_pool_allocation(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+            record.dependent_instance,
+            record.dependent_component_va,
+        ) {
+            failures += 1;
+        } else {
             *record = HostedProviderNdisMiniportBlockMirror::empty();
         }
     }
+    failures
+}
+
+unsafe fn hosted_provider_lifetime_records_reference_instance(instance_index: usize) -> bool {
+    let references = |provider_instance: usize, dependent_instance: usize| {
+        provider_instance == instance_index || dependent_instance == instance_index
+    };
+    hosted_provider_domain_dependencies().is_some_and(|records| {
+        records.iter().any(|record| {
+            record.present && references(record.provider_instance, record.dependent_instance)
+        })
+    }) || hosted_provider_dispatch_routes().is_some_and(|records| {
+        records.iter().any(|record| {
+            record.used && references(record.provider_instance, record.dependent_instance)
+        })
+    }) || hosted_provider_pointer_allocations().is_some_and(|records| {
+        records.iter().any(|record| {
+            record.present && references(record.provider_instance, record.dependent_instance)
+        })
+    }) || hosted_provider_ndis_packet_shadows().is_some_and(|records| {
+        records.iter().any(|record| {
+            record.present && references(record.provider_instance, record.dependent_instance)
+        })
+    }) || hosted_provider_ndis_buffer_shadows().is_some_and(|records| {
+        records.iter().any(|record| {
+            record.present && references(record.provider_instance, record.dependent_instance)
+        })
+    }) || hosted_provider_miniport_interrupt_shadows().is_some_and(|records| {
+        records.iter().any(|record| {
+            record.present && references(record.provider_instance, record.dependent_instance)
+        })
+    }) || hosted_provider_miniport_timer_shadows().is_some_and(|records| {
+        records.iter().any(|record| {
+            record.present && references(record.provider_instance, record.dependent_instance)
+        })
+    }) || hosted_provider_ndis_work_item_shadows().is_some_and(|records| {
+        records.iter().any(|record| {
+            record.present && references(record.provider_instance, record.dependent_instance)
+        })
+    }) || hosted_provider_ndis_miniport_block_mirrors().is_some_and(|records| {
+        records.iter().any(|record| {
+            record.present && references(record.provider_instance, record.dependent_instance)
+        })
+    })
 }
 
 unsafe fn provider_marshal_emit_callback_thunk(
@@ -21298,6 +21921,10 @@ unsafe fn provider_marshal_output_pointer_from_length(
     if length == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
+    let Some(owner) = hosted_provider_object_owner_for_pair(provider_instance, dependent_index)
+    else {
+        return Err(STATUS_DEVICE_NOT_READY);
+    };
     let Some(dependent_exec_va) =
         component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, 8)
     else {
@@ -21306,20 +21933,23 @@ unsafe fn provider_marshal_output_pointer_from_length(
     let Some(allocated_component_va) = hosted_instance_pool_alloc(dependent_inst, length) else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
-    if !register_hosted_provider_pointer_allocation(
+    register_hosted_provider_pointer_allocation(
+        owner,
         dependent_index,
         allocated_component_va,
         provider_instance,
         length,
-    ) {
-        hosted_instance_pool_free(dependent_inst, allocated_component_va);
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
-    }
+    );
     let Some((provider_component_va, provider_exec_va)) =
         provider_marshal_alloc(state, provider_shared, 8)
     else {
-        take_hosted_provider_pointer_allocation(dependent_index, allocated_component_va);
-        hosted_instance_pool_free(dependent_inst, allocated_component_va);
+        if !release_hosted_provider_pointer_allocation_by_dependent(
+            dependent_index,
+            allocated_component_va,
+            0,
+        ) {
+            HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        }
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
     if provider_marshal_add_copyout_with_fixed(
@@ -21333,8 +21963,13 @@ unsafe fn provider_marshal_output_pointer_from_length(
     )
     .is_none()
     {
-        take_hosted_provider_pointer_allocation(dependent_index, allocated_component_va);
-        hosted_instance_pool_free(dependent_inst, allocated_component_va);
+        if !release_hosted_provider_pointer_allocation_by_dependent(
+            dependent_index,
+            allocated_component_va,
+            0,
+        ) {
+            HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        }
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
     if provider_marshal_add_deferred_free(
@@ -21345,8 +21980,13 @@ unsafe fn provider_marshal_output_pointer_from_length(
     )
     .is_none()
     {
-        take_hosted_provider_pointer_allocation(dependent_index, allocated_component_va);
-        hosted_instance_pool_free(dependent_inst, allocated_component_va);
+        if !release_hosted_provider_pointer_allocation_by_dependent(
+            dependent_index,
+            allocated_component_va,
+            0,
+        ) {
+            HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        }
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
     state.pointer_allocation_dependent_instance = dependent_index;
@@ -22430,8 +23070,16 @@ unsafe fn complete_provider_export_marshal(
             // The paired provider allocation is retained until the dependent calls
             // NdisFreeMemory. The fixed copyout below publishes only the dependent address.
         } else {
-            if provider_pointer_valid {
-                let _ = hosted_instance_pool_free(provider_inst, provider_component_va);
+            if !release_hosted_provider_pointer_allocation_by_dependent(
+                state.pointer_allocation_dependent_instance,
+                state.pointer_allocation_dependent_component_va,
+                if provider_pointer_valid {
+                    provider_component_va
+                } else {
+                    0
+                },
+            ) {
+                HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
             }
             if success {
                 *result = STATUS_INVALID_PARAMETER as u32 as u64;
@@ -22469,16 +23117,17 @@ unsafe fn complete_provider_export_marshal(
             PROVIDER_MARSHAL_FREE_ON_FAILURE => !success,
             _ => false,
         };
-        if should_free {
-            if let Some(inst) = instance(deferred.dependent_instance) {
-                if take_hosted_provider_pointer_allocation(
-                    deferred.dependent_instance,
-                    deferred.component_va,
-                )
-                .is_some()
-                {
-                    hosted_instance_pool_free(inst, deferred.component_va);
-                }
+        let pointer_allocation_already_released = state.pointer_allocation_dependent_component_va
+            != 0
+            && deferred.dependent_instance == state.pointer_allocation_dependent_instance
+            && deferred.component_va == state.pointer_allocation_dependent_component_va;
+        if should_free && !pointer_allocation_already_released {
+            if !release_hosted_provider_pointer_allocation_by_dependent(
+                deferred.dependent_instance,
+                deferred.component_va,
+                0,
+            ) {
+                HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
             }
         }
         free_index += 1;
@@ -23173,9 +23822,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
         singleton.image_len,
         provider_export_rva,
     )
-    .or_else(|| {
-        hosted_provider_internal_rva_marshal_policy(singleton, provider_export_rva)
-    }) else {
+    .or_else(|| hosted_provider_internal_rva_marshal_policy(singleton, provider_export_rva)) else {
         return hosted_provider_export_failure(STATUS_NOT_SUPPORTED);
     };
     let packet_array_export = provider_policy_uses_packet_array(policy);
@@ -23236,6 +23883,13 @@ pub(crate) unsafe fn service_hosted_provider_export(
         );
         return hosted_provider_export_failure(status);
     }
+    let Some(_dependency_lease) = acquire_hosted_provider_dependency_dispatch_lease(
+        singleton.instance,
+        dependent_index,
+        singleton.provider_publication_cookie,
+    ) else {
+        return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
+    };
     let Some(exec_code_va) =
         ExecVaWindow::try_for_instance(singleton.instance).map(|win| win.code_va)
     else {
@@ -24584,7 +25238,14 @@ unsafe fn provider_miniport_mirror_for_device_name(
 ) -> Option<(HostedProviderNdisMiniportBlockMirror, HostedDeviceBinding)> {
     let records = hosted_provider_ndis_miniport_block_mirrors()?;
     for mirror in records.iter().copied() {
-        if mirror.present && mirror.provider_instance == provider_instance {
+        if mirror.present
+            && mirror.provider_instance == provider_instance
+            && hosted_provider_object_owner_is_live(
+                mirror.owner,
+                mirror.provider_instance,
+                mirror.dependent_instance,
+            )
+        {
             let miniport_name = match mirror
                 .provider_component_va
                 .checked_add(NDIS_MINIPORT_BLOCK_MINIPORT_NAME_OFFSET_X64)
@@ -24606,7 +25267,18 @@ unsafe fn provider_miniport_mirror_for_device_name(
                 if dependent_device_id != 0 {
                     if let Some(binding) = hosted_resource_binding_by_device_id(dependent_device_id)
                     {
-                        return Some((mirror, binding));
+                        let provider_domain = HostedDomainIdentity {
+                            domain_id: nt_io_manager::HostedDomainId(
+                                mirror.owner.provider_domain_id,
+                            ),
+                            cookie: mirror.owner.provider_domain_cookie,
+                        };
+                        if binding.instance == mirror.dependent_instance
+                            && binding.projection_instance == mirror.provider_instance
+                            && binding.projection_domain == provider_domain
+                        {
+                            return Some((mirror, binding));
+                        }
                     }
                 }
             }
@@ -25238,6 +25910,13 @@ pub(crate) unsafe fn service_hosted_provider_callback(
     };
     let Some(record) = hosted_provider_callback_record(callback_cookie) else {
         return hosted_provider_callback_failure(STATUS_INVALID_PARAMETER);
+    };
+    let Some(_dependency_lease) = acquire_hosted_provider_dependency_dispatch_lease(
+        record.provider_instance,
+        record.dependent_instance,
+        record.provider_publication_cookie,
+    ) else {
+        return hosted_provider_callback_failure(STATUS_DEVICE_NOT_READY);
     };
     let Some(dependent_inst) = instance(record.dependent_instance) else {
         return hosted_provider_callback_failure(STATUS_DEVICE_NOT_READY);
@@ -27422,8 +28101,7 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
     if major == FSD_DISPATCH_ROLLBACK_ADD_DEVICE {
         let driver_object = read_volatile((FSD_SHARED_VADDR + SH_DRVOBJ) as *const u64);
         let pdo = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
-        let previous_device_head =
-            read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
+        let previous_device_head = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
         let delete_pdo = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64) != 0;
         if pdo == 0 || (driver_object == 0 && previous_device_head != 0) {
             return (STATUS_INVALID_PARAMETER, 0);
@@ -28078,8 +28756,8 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     }
     core::ptr::write_bytes(irp as *mut u8, 0, irp_packet_len as usize);
     let iosl = irp + WDM_X64_IRP_SIZE as u64;
-    let current_iosl = iosl
-        + (current_location as u64 - 1).saturating_mul(WDM_X64_IO_STACK_LOCATION_SIZE as u64);
+    let current_iosl =
+        iosl + (current_location as u64 - 1).saturating_mul(WDM_X64_IO_STACK_LOCATION_SIZE as u64);
     let mut pnp_resource_list = 0u64;
     let mut create_security_context = 0u64;
     let mut create_access_state = 0u64;
@@ -28475,9 +29153,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         let state = pending_irp_owner_state(owner_node).load(Ordering::Acquire);
         if matches!(
             hosted_irp_state_kind(state),
-            HOSTED_IRP_DISPATCHING
-                | HOSTED_IRP_COMPLETED_DISPATCH
-                | HOSTED_IRP_STOPPED_DISPATCH
+            HOSTED_IRP_DISPATCHING | HOSTED_IRP_COMPLETED_DISPATCH | HOSTED_IRP_STOPPED_DISPATCH
         ) {
             let abandoned = hosted_irp_state_with_kind(state, HOSTED_IRP_ABANDONED);
             if pending_irp_owner_state(owner_node)
@@ -30652,10 +31328,7 @@ unsafe fn ensure_hosted_paging_level(
     true
 }
 
-unsafe fn clear_hosted_paging_for_domain(
-    domain: HostedDomainIdentity,
-    pml4: u64,
-) -> u64 {
+unsafe fn clear_hosted_paging_for_domain(domain: HostedDomainIdentity, pml4: u64) -> u64 {
     let Some(mappings) = (*core::ptr::addr_of_mut!(HOSTED_PAGING_MAPPINGS)).as_mut() else {
         return 0;
     };
@@ -30752,15 +31425,8 @@ unsafe fn clear_hosted_resource_map_caps_for_device(
 /// Ensure the paging hierarchy covering `page` exists in a hosted driver's `pml4`.
 /// Device resource windows can span multiple 2 MiB leaves and may sit outside the image skeleton's
 /// original 1 GiB page directory, so this builds every level down to the leaf PT.
-pub(crate) unsafe fn ensure_paging(
-    page: u64,
-    pml4: u64,
-    domain: HostedDomainIdentity,
-) -> bool {
-    if pml4 == 0
-        || domain.domain_id == nt_io_manager::HostedDomainId::NULL
-        || domain.cookie == 0
-    {
+pub(crate) unsafe fn ensure_paging(page: u64, pml4: u64, domain: HostedDomainIdentity) -> bool {
+    if pml4 == 0 || domain.domain_id == nt_io_manager::HostedDomainId::NULL || domain.cookie == 0 {
         return false;
     }
     ensure_hosted_paging_level(
@@ -32200,14 +32866,11 @@ unsafe fn retire_hosted_device_port_caps(
     binding: HostedDeviceBinding,
 ) -> Result<(), nt_status::NtStatus> {
     let states = hosted_device_resource_states_mut();
-    let Some(index) = states
-        .iter()
-        .position(|state| {
-            state.device_id != 0
-                && state.device_id == binding.device_id
-                && state.projection_domain == binding.projection_domain
-        })
-    else {
+    let Some(index) = states.iter().position(|state| {
+        state.device_id != 0
+            && state.device_id == binding.device_id
+            && state.projection_domain == binding.projection_domain
+    }) else {
         return Ok(());
     };
     let state = states[index];
@@ -32238,14 +32901,11 @@ unsafe fn remove_hosted_device_resource_state(
     binding: HostedDeviceBinding,
 ) -> Result<(), nt_status::NtStatus> {
     let states = hosted_device_resource_states_mut();
-    let Some(index) = states
-        .iter()
-        .position(|state| {
-            state.device_id != 0
-                && state.device_id == binding.device_id
-                && state.projection_domain == binding.projection_domain
-        })
-    else {
+    let Some(index) = states.iter().position(|state| {
+        state.device_id != 0
+            && state.device_id == binding.device_id
+            && state.projection_domain == binding.projection_domain
+    }) else {
         return Ok(());
     };
     if let Some(lease) = states[index].pnp_context_lease {
@@ -32366,12 +33026,13 @@ unsafe fn clear_hosted_resource_projection(
                         if crate::cnode_delete_in_cnode_r(inst.cnode, resource.component_cap) != 0 {
                             return Err(nt_status::NtStatus::UNSUCCESSFUL);
                         }
-                        if let Some(current) = hosted_device_resource_states_mut()
-                            .iter_mut()
-                            .find(|current| {
-                                current.device_id == binding.device_id
-                                    && current.projection_domain == binding.projection_domain
-                            })
+                        if let Some(current) =
+                            hosted_device_resource_states_mut()
+                                .iter_mut()
+                                .find(|current| {
+                                    current.device_id == binding.device_id
+                                        && current.projection_domain == binding.projection_domain
+                                })
                         {
                             current.address_resources[resource_index].component_cap = 0;
                         }
@@ -32460,23 +33121,23 @@ pub(crate) fn service_hosted_root_pdo_pnp(
 ) -> i32 {
     let (instance, inst, device_id) =
         match authenticated_hosted_root_pdo(ch, pdo_object, active_reply_cap) {
-        Ok(resolved) => resolved,
-        Err(status) => return status.raw(),
-    };
+            Ok(resolved) => resolved,
+            Err(status) => return status.raw(),
+        };
     let identity = HostedDomainIdentity {
         domain_id: nt_io_manager::HostedDomainId(inst.hosted_domain_id),
         cookie: inst.hosted_domain_cookie,
     };
     let authorized = unsafe {
         hosted_device_bindings().is_some_and(|bindings| {
-                bindings.iter().any(|binding| {
-                    binding.used
-                        && binding.projection_instance == instance
-                        && binding.projection_domain == identity
-                        && binding.pdo_object == pdo_object
-                        && binding.pdo_device_id == device_id.raw()
-                })
+            bindings.iter().any(|binding| {
+                binding.used
+                    && binding.projection_instance == instance
+                    && binding.projection_domain == identity
+                    && binding.pdo_object == pdo_object
+                    && binding.pdo_device_id == device_id.raw()
             })
+        })
     };
     if !authorized {
         return nt_status::NtStatus::ACCESS_DENIED.raw();
@@ -32529,18 +33190,18 @@ unsafe fn config_device_property_snapshot(
 ) -> Result<Vec<u8>, nt_config_client::QueryError> {
     let required =
         match crate::config_manager_query_device_property(instance_path, property, &mut []) {
-        Ok(0) => return Ok(Vec::new()),
-        Ok(_) => {
-            return Err(nt_config_client::QueryError {
-                status: STATUS_INVALID_PARAMETER,
-                required_len: 0,
-            })
-        }
-        Err(error) if error.status == STATUS_BUFFER_TOO_SMALL && error.required_len != 0 => {
-            error.required_len
-        }
-        Err(error) => return Err(error),
-    };
+            Ok(0) => return Ok(Vec::new()),
+            Ok(_) => {
+                return Err(nt_config_client::QueryError {
+                    status: STATUS_INVALID_PARAMETER,
+                    required_len: 0,
+                })
+            }
+            Err(error) if error.status == STATUS_BUFFER_TOO_SMALL && error.required_len != 0 => {
+                error.required_len
+            }
+            Err(error) => return Err(error),
+        };
     let mut value = Vec::new();
     value
         .try_reserve_exact(required)
@@ -32839,8 +33500,7 @@ fn register_hosted_device_binding(
         let projections_live = io_manager_mut()
             .hosted_device_by_identity(projection_domain, pdo_object)
             == Some(nt_io_manager::DeviceId(pdo_device_id))
-            && io_manager_mut()
-                .hosted_device_by_identity(projection_domain, device_object)
+            && io_manager_mut().hosted_device_by_identity(projection_domain, device_object)
                 == Some(nt_io_manager::DeviceId(device_id));
         return if exact && projections_live {
             Ok(())
@@ -32857,10 +33517,7 @@ fn register_hosted_device_binding(
     }
     let resource_state_slot = {
         let states = unsafe { hosted_device_resource_states_mut() };
-        if let Some(index) = states
-            .iter()
-            .position(|state| state.device_id == device_id)
-        {
+        if let Some(index) = states.iter().position(|state| state.device_id == device_id) {
             if states[index].projection_domain != projection_domain
                 || states[index].pnp_context_lease.is_some()
             {
@@ -33191,14 +33848,11 @@ unsafe fn read_hosted_device_resource_state_from_shared(
 unsafe fn refresh_hosted_device_resource_state(binding: HostedDeviceBinding, sh: u64) {
     let state = read_hosted_device_resource_state_from_shared(binding, sh);
     let states = hosted_device_resource_states_mut();
-    if let Some(index) = states
-        .iter()
-        .position(|slot| {
-            slot.device_id != 0
-                && slot.device_id == binding.device_id
-                && slot.projection_domain == binding.projection_domain
-        })
-    {
+    if let Some(index) = states.iter().position(|slot| {
+        slot.device_id != 0
+            && slot.device_id == binding.device_id
+            && slot.projection_domain == binding.projection_domain
+    }) {
         states[index] = state;
     } else {
         states.push(state);
@@ -33709,10 +34363,10 @@ pub(crate) unsafe fn hosted_io_port_fault_grant(
             hosted_state_address_resources(state)
                 .iter()
                 .any(|resource| {
-            resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT
-                && resource.broker_va_or_root_cap != 0
-                && io_port_in_range(port, resource.translated_start, resource.len)
-        })
+                    resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT
+                        && resource.broker_va_or_root_cap != 0
+                        && io_port_in_range(port, resource.translated_start, resource.len)
+                })
         }
     })?;
     let resource = hosted_state_address_resources(&state)
@@ -35390,12 +36044,11 @@ fn clear_hosted_device_bindings_for_instance(instance: usize) -> u64 {
                 .as_ref()
                 .and_then(|bindings| bindings.get(index))
                 .copied()
-    };
+        };
         let Some(binding) = binding else {
             break;
         };
-        if binding.used
-            && (binding.instance == instance || binding.projection_instance == instance)
+        if binding.used && (binding.instance == instance || binding.projection_instance == instance)
         {
             if teardown_hosted_device_binding(binding) {
                 unsafe {
@@ -36278,6 +36931,28 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
             },
         )
     });
+    unsafe {
+        match retiring_domain {
+            Some(domain) => {
+                let failures = begin_hosted_provider_dependency_retirement_for_instance(i, domain);
+                if failures != 0 {
+                    print_str(b"[driver-launch] provider dispatch retirement blocked inst=");
+                    print_u64(i as u64);
+                    print_str(b" failures=");
+                    print_u64(failures);
+                    print_str(b"\n");
+                    return Err(nt_status::NtStatus::DEVICE_BUSY);
+                }
+            }
+            None if hosted_provider_lifetime_records_reference_instance(i) => {
+                print_str(b"[driver-launch] provider lifetime retirement lacks exact domain inst=");
+                print_u64(i as u64);
+                print_str(b"\n");
+                return Err(nt_status::NtStatus::DEVICE_BUSY);
+            }
+            None => {}
+        }
+    }
     if let Some(domain) = retiring_domain {
         unsafe {
             hosted_device_property_transfers_mut().remove_domain(domain);
@@ -36307,34 +36982,46 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
         print_str(b"\n");
     }
     unsafe {
-        let pointer_failures = clear_hosted_provider_pointer_allocations_for_instance(i);
-        if pointer_failures != 0 {
-            teardown_blocked = true;
-            print_str(b"[driver-launch] provider pointer allocation release failed inst=");
-            print_u64(i as u64);
-            print_str(b" failures=");
-            print_u64(pointer_failures);
-            print_str(b"\n");
-        }
-        clear_hosted_provider_ndis_shadows_for_instance(i);
-        clear_hosted_provider_miniport_interrupt_shadows_for_instance(i);
-        clear_hosted_provider_miniport_timer_shadows_for_instance(i);
-        clear_hosted_provider_ndis_work_item_shadows_for_instance(i);
-        clear_hosted_provider_ndis_miniport_block_mirrors_for_instance(i);
-        let route_failures = clear_hosted_provider_dispatch_routes_for_instance(i);
-        let dependency_failures = clear_hosted_provider_domain_dependencies_for_instance(i);
-        let singleton_failures = clear_hosted_provider_singletons_for_instance(i);
-        if route_failures != 0 || dependency_failures != 0 || singleton_failures != 0 {
-            teardown_blocked = true;
-            print_str(b"[driver-launch] provider lifetime retirement blocked inst=");
-            print_u64(i as u64);
-            print_str(b" routes=");
-            print_u64(route_failures);
-            print_str(b" dependencies=");
-            print_u64(dependency_failures);
-            print_str(b" singletons=");
-            print_u64(singleton_failures);
-            print_str(b"\n");
+        if let Some(domain) = retiring_domain {
+            let mut shadow_failures = 0u64;
+            let mut route_failures = 0u64;
+            let mut dependency_failures = 0u64;
+            let mut singleton_failures = 0u64;
+            shadow_failures += clear_hosted_provider_pointer_allocations_for_instance(i, domain);
+            shadow_failures += clear_hosted_provider_ndis_shadows_for_instance(i, domain);
+            shadow_failures +=
+                clear_hosted_provider_miniport_interrupt_shadows_for_instance(i, domain);
+            shadow_failures += clear_hosted_provider_miniport_timer_shadows_for_instance(i, domain);
+            shadow_failures += clear_hosted_provider_ndis_work_item_shadows_for_instance(i, domain);
+            shadow_failures +=
+                clear_hosted_provider_ndis_miniport_block_mirrors_for_instance(i, domain);
+            if shadow_failures == 0 {
+                route_failures = clear_hosted_provider_dispatch_routes_for_instance(i, domain);
+            }
+            if shadow_failures == 0 && route_failures == 0 {
+                dependency_failures = clear_hosted_provider_domain_dependencies_for_instance(i);
+            }
+            if shadow_failures == 0 && route_failures == 0 && dependency_failures == 0 {
+                singleton_failures = clear_hosted_provider_singletons_for_instance(i);
+            }
+            if shadow_failures != 0
+                || route_failures != 0
+                || dependency_failures != 0
+                || singleton_failures != 0
+            {
+                teardown_blocked = true;
+                print_str(b"[driver-launch] provider lifetime retirement blocked inst=");
+                print_u64(i as u64);
+                print_str(b" shadows=");
+                print_u64(shadow_failures);
+                print_str(b" routes=");
+                print_u64(route_failures);
+                print_str(b" dependencies=");
+                print_u64(dependency_failures);
+                print_str(b" singletons=");
+                print_u64(singleton_failures);
+                print_str(b"\n");
+            }
         }
     }
     let inst = instance(i);
@@ -36363,9 +37050,7 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
                     Some(_) => teardown_blocked = true,
                 }
             }
-            if !teardown_blocked
-                && io_manager_mut().driver(DriverId(inst.driver_id)).is_some()
-            {
+            if !teardown_blocked && io_manager_mut().driver(DriverId(inst.driver_id)).is_some() {
                 if let Err(status) = io_manager_mut().destroy_driver(DriverId(inst.driver_id)) {
                     print_str(b"[driver-launch] canonical driver teardown failed id=");
                     print_u64(inst.driver_id);
@@ -36921,9 +37606,7 @@ unsafe fn spawn_hosted_driver_worker_thread(
     let badge = FSD_WORKER_BADGE_BASE.checked_add(exec_alias_slot)?;
 
     let domain = instance_domain_identity(inst)?;
-    if !ensure_paging(stack_base, inst.pml4, domain)
-        || !crate::ensure_executive_paging(exec_base)
-    {
+    if !ensure_paging(stack_base, inst.pml4, domain) || !crate::ensure_executive_paging(exec_base) {
         return None;
     }
 
@@ -38340,8 +39023,8 @@ where
     if !root_is_unattached {
         return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
     }
-    let existing_pdo_object = io_manager_mut()
-        .hosted_device_address_by_identity(projection_domain, pdo_device);
+    let existing_pdo_object =
+        io_manager_mut().hosted_device_address_by_identity(projection_domain, pdo_device);
     let (pdo_object, pdo_projection_created) = match existing_pdo_object {
         Some(pdo_object) => {
             let binding_live = hosted_device_bindings().is_some_and(|bindings| {
@@ -38810,11 +39493,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             return Err(nt_status::NtStatus::INVALID_PARAMETER);
         }
         for window in 0..dma_pages.div_ceil(512).max(1) {
-            if !ensure_paging(
-                dma_va + window * 0x20_0000,
-                inst.pml4,
-                paging_domain,
-            ) {
+            if !ensure_paging(dma_va + window * 0x20_0000, inst.pml4, paging_domain) {
                 rollback_staged_hosted_resource_grant(
                     binding,
                     instance_index,
@@ -39956,8 +40635,7 @@ pub(crate) unsafe fn unload_driver_by_name(
     if inst.driver_unload == 0 {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
-    let domain =
-        instance_domain_identity(inst).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let domain = instance_domain_identity(inst).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     io_manager_mut().can_unload_hosted_provider(domain)?;
 
     {

@@ -11739,3 +11739,39 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     stack and dispatcher documentation. Compatibility catalog status must reflect the provider that
     actually binds an implementation; do not mark generic-loader imports implemented merely because
     the executive's registration-driven resolver can serve them.
+
+    Provider shadow retirement checkpoint (2026-08-26, implementation green; serialized boot proof
+    pending): every persistent provider pointer, packet, MDL, interrupt, timer, work-item, miniport
+    mirror, and dispatch-route record now retains the exact provider and dependent domain ids and
+    generation cookies. Normal lookup requires a live dependency; teardown uses a separate exact
+    current-authority predicate so an irreversible retirement fence does not make its own cleanup
+    records unreachable. A dependency-wide dispatch lease now covers both provider exports and
+    reverse callbacks, including callbacks published before a miniport DriverObject route exists.
+    Retirement is established before any timer, thread, resource, device-binding, or provider
+    teardown and returns `DEVICE_BUSY` while a call is in flight or a provider still has live
+    dependents.
+
+    Published bridge allocations are released in place. Successful pool releases clear only their
+    ownership bit, failed releases retain the exact record for retry, and `clear_instance` does not
+    advance to routes, dependency links, singleton publication, driver destruction, mechanism
+    release, or domain unregister while an earlier provider stage remains incomplete. Route
+    retirement rejects new route lookup and dependency dispatch, exact-unbinds the canonical
+    DriverObject projection, records two-sided pool-release progress, and tombstones callback and
+    extension metadata only after both owned allocations are gone. Packet and MDL key collisions no
+    longer mutate or partially release an established shadow: exact duplicates are idempotent and
+    other collisions fail closed. Pointer-output failure attaches a valid provider allocation to the
+    durable pair record and uses the same retry transaction instead of raw-freeing it.
+
+    Focused validation is green for `nt-hosted-runtime` at `57/57`, including stale-generation,
+    partial-retry, late-owned-resource, and completed-ledger idempotence tests. The freestanding
+    executive release check remains at the established 212-warning baseline and `git diff --check`
+    is clean.
+
+    Review adjustment: this closes failure-retaining cleanup for already-published provider bridge
+    objects, not every construction rollback. Next reserve constructing rows before multi-allocation
+    packet, MDL, scatter/gather, interrupt, timer, work-item, miniport-mirror, and route setup; add
+    ownership bits as each allocation or callback thunk is acquired; and retain those rows whenever
+    rollback cannot complete. Executable thunk slots and their callback records also need explicit
+    exact-owner retirement/reuse rather than monotonic consumption. After a serialized desktop proof
+    for this checkpoint, complete those construction/thunk lifetimes before beginning the ordered
+    PnP query/cancel/remove transaction.

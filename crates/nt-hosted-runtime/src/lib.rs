@@ -47,6 +47,98 @@ pub const NDIS30_PROTOCOL_CHARACTERISTICS_LEN_X64: u64 = 0x68;
 pub const NDIS40_PROTOCOL_CHARACTERISTICS_LEN_X64: u64 = 0x90;
 pub const NDIS50_PROTOCOL_CHARACTERISTICS_LEN_X64: u64 = 0xd0;
 
+/// Exact lifetime authority for an object projected between two hosted driver domains.
+///
+/// Runtime instance slots and component virtual addresses are reusable. Bridge objects therefore
+/// retain both domain generations and must validate this authority before resolving either side.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostedProviderObjectOwner {
+    pub provider_domain_id: u64,
+    pub provider_domain_cookie: u64,
+    pub dependent_domain_id: u64,
+    pub dependent_domain_cookie: u64,
+}
+
+impl HostedProviderObjectOwner {
+    pub const fn new(
+        provider_domain_id: u64,
+        provider_domain_cookie: u64,
+        dependent_domain_id: u64,
+        dependent_domain_cookie: u64,
+    ) -> Option<Self> {
+        if provider_domain_id == 0
+            || provider_domain_cookie == 0
+            || dependent_domain_id == 0
+            || dependent_domain_cookie == 0
+        {
+            return None;
+        }
+        Some(Self {
+            provider_domain_id,
+            provider_domain_cookie,
+            dependent_domain_id,
+            dependent_domain_cookie,
+        })
+    }
+
+    pub const fn provider_matches(self, domain_id: u64, cookie: u64) -> bool {
+        self.provider_domain_id == domain_id && self.provider_domain_cookie == cookie
+    }
+
+    pub const fn dependent_matches(self, domain_id: u64, cookie: u64) -> bool {
+        self.dependent_domain_id == domain_id && self.dependent_domain_cookie == cookie
+    }
+
+    pub const fn pair_matches(
+        self,
+        provider_domain_id: u64,
+        provider_domain_cookie: u64,
+        dependent_domain_id: u64,
+        dependent_domain_cookie: u64,
+    ) -> bool {
+        self.provider_matches(provider_domain_id, provider_domain_cookie)
+            && self.dependent_matches(dependent_domain_id, dependent_domain_cookie)
+    }
+}
+
+/// Retry-safe progress for a bridge record that owns up to 64 independently releasable resources.
+/// A failed release keeps its bit pending; successful resources are not released again on retry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostedProviderReleaseProgress {
+    pending: u64,
+}
+
+impl HostedProviderReleaseProgress {
+    pub const fn new(pending: u64) -> Self {
+        Self { pending }
+    }
+
+    pub const fn pending(self) -> u64 {
+        self.pending
+    }
+
+    pub const fn is_complete(self) -> bool {
+        self.pending == 0
+    }
+
+    pub fn add_pending(&mut self, mask: u64) {
+        self.pending |= mask;
+    }
+
+    pub fn release_with(&mut self, mut release: impl FnMut(u32) -> bool) -> bool {
+        let mut remaining = self.pending;
+        while remaining != 0 {
+            let bit = remaining.trailing_zeros();
+            let mask = 1u64 << bit;
+            if release(bit) {
+                self.pending &= !mask;
+            }
+            remaining &= !mask;
+        }
+        self.is_complete()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeRange {
     pub base: u64,
@@ -2587,5 +2679,61 @@ mod tests {
             encode_hosted_provider_callback_thunk(thunk, &mut too_small),
             Err(HostedProviderImportThunkError::OutputTooSmall)
         );
+    }
+
+    #[test]
+    fn provider_object_owner_rejects_stale_domain_generations() {
+        let owner = HostedProviderObjectOwner::new(7, 11, 9, 13).unwrap();
+        assert!(owner.pair_matches(7, 11, 9, 13));
+        assert!(!owner.pair_matches(7, 12, 9, 13));
+        assert!(!owner.pair_matches(7, 11, 9, 14));
+        assert_eq!(HostedProviderObjectOwner::new(0, 11, 9, 13), None);
+        assert_eq!(HostedProviderObjectOwner::new(7, 11, 9, 0), None);
+    }
+
+    #[test]
+    fn provider_release_progress_retains_only_failed_resources() {
+        let mut progress = HostedProviderReleaseProgress::new(0b111);
+        let mut first_seen = 0u64;
+        assert!(!progress.release_with(|bit| {
+            first_seen |= 1 << bit;
+            bit != 1
+        }));
+        assert_eq!(first_seen, 0b111);
+        assert_eq!(progress.pending(), 0b010);
+
+        let mut retry_seen = 0u64;
+        assert!(progress.release_with(|bit| {
+            retry_seen |= 1 << bit;
+            true
+        }));
+        assert_eq!(retry_seen, 0b010);
+        assert!(progress.is_complete());
+    }
+
+    #[test]
+    fn provider_release_progress_accepts_late_owned_resources() {
+        let mut progress = HostedProviderReleaseProgress::new(0b001);
+        assert!(progress.release_with(|bit| bit == 0));
+
+        progress.add_pending(0b110);
+        let mut seen = 0u64;
+        assert!(progress.release_with(|bit| {
+            seen |= 1 << bit;
+            true
+        }));
+        assert_eq!(seen, 0b110);
+    }
+
+    #[test]
+    fn provider_release_progress_is_idempotent_when_complete() {
+        let mut progress = HostedProviderReleaseProgress::new(0);
+        let mut calls = 0u64;
+        assert!(progress.release_with(|_| {
+            calls += 1;
+            false
+        }));
+        assert_eq!(calls, 0);
+        assert_eq!(progress.pending(), 0);
     }
 }
