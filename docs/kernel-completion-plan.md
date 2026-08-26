@@ -11600,7 +11600,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Manager, and DMA ownership with the exact domain generation; then repair provider route, callback,
     and unload lifetime before starting the ordered PnP removal transaction.
 
-    Exact retained-IRP owner checkpoint (2026-08-26, accepted locally): the component-side
+    Exact retained-IRP owner checkpoint (2026-08-26, accepted): the component-side
     `PendingIrp` record now retains the full generation-bearing target `HostedDomainIdentity` from
     the typed dispatch envelope instead of discarding its cookie. Completion polling reconstructs
     the exact live dependent identity and will not publish a ready completion owned by a stale
@@ -11608,7 +11608,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     identity type is explicitly `repr(C)` because it is embedded in the shared executive/component
     record. Local validation is green for `nt-io-manager` at `190/190`, `cargo fmt --all -- --check`,
     `git diff --check`, and the freestanding executive check at the established 212-warning baseline.
-    A serialized desktop gate remains required for the changed pending-IRP layout.
+    Serialized proof `.tmp/run-desktop-exact-irp-owner-20260826.log` reaches genuine userinit and
+    Explorer launch, completes the real callback path, paints all `480000/480000` pixels of the
+    miniport-selected `800x600` shell with at least 32 non-background colours, reports zero VSpace
+    unmap failures and zero pool corruption, passes all `293/293` executive gates, and emits the
+    sentinel. Review adjustment: retained IRPs are now generation-exact. Next extend Resource
+    Manager and DMA owners with the same generation and reject cross-generation access/revocation;
+    provider route/callback/unload lifetime and ordered PnP removal remain after that boundary.
 
     Track one separate rust-micro correctness item after this lifetime tranche: device-frame mapping
     cache attributes are still marked TODO in `rust-micro/src/untyped.rs`. Define and prove the x86
