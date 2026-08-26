@@ -12011,8 +12011,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     executive gates pass, and the sentinel fires. The integration checkpoint is closed without
     weakening or removing the schedule-sensitive ScrollBar observation.
 
-    One-shot NDIS work-item retirement checkpoint (2026-08-26, implementation green; serialized
-    desktop proof pending): `nt-hosted-runtime` now owns a generation-bearing one-shot callback
+    One-shot NDIS work-item retirement checkpoint (2026-08-26, accepted): `nt-hosted-runtime` now
+    owns a generation-bearing one-shot callback
     state machine that distinguishes a provider schedule call in flight, one queued invocation, and
     one provider wrapper invocation in flight. It rejects a second queue ownership for the same
     embedded `WORK_QUEUE_ITEM`, permits a dequeued callback to requeue itself, rejects stale
@@ -12031,6 +12031,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     when no preparing, queued, or active invocation remains. A callback or worker fault retains the
     exact parent and prevents raw-address reuse.
 
+    Serialized integration proof `.tmp/run-desktop-work-item-retirement-20260826.log` reaches real
+    Explorer shell chrome, paints all `480000/480000` framebuffer pixels with at least 32
+    non-background colours, passes all `293/293` executive gates, and emits the sentinel with zero
+    provider-export rejection, hosted-work wall, or hosted-work capacity records. The current normal
+    desktop workload does not call `NdisScheduleWorkItem`, so changed-routine requeue and final
+    wrapper-return retirement remain focused-state-machine proof rather than a claimed live-driver
+    observation. Keep that distinction explicit until a real driver workload schedules an item; do
+    not add a synthetic boot probe solely to manufacture the observation.
+
     Review adjustment: ordinary `NdisMCancelTimer` is arming state, not timer destruction. Final
     timer-thunk retirement must be adapter-exact and follow real Halt/Remove, a completed cancel for
     the latest arm generation, canonical timer inactivity, zero queued/provider/dependent DPC work,
@@ -12041,4 +12050,6 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     serialized work-item integration proof, implement generic synchronous PnP query/cancel/stop and
     remove orchestration, then use successful outer STOP/REMOVE completion as the mirror/timer
     retirement fence. Do not treat `KeCancelTimer == FALSE`, a Halt callback alone, or local binding
-    teardown as quiescence proof.
+    teardown as quiescence proof. With one-shot work-item ownership implemented and its desktop
+    integration accepted, the next callback-lifetime step is the generic PnP query/cancel/stop/remove
+    transaction and adapter-exact mirror identity needed to provide that real retirement fence.
