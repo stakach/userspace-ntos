@@ -102,26 +102,6 @@ impl CapturedNamedObjectAttributes {
     }
 }
 
-struct CapturedIoCompletionObjectAttributes {
-    attributes: u32,
-    name_len: usize,
-    name: [u16; EXEC_IO_COMPLETION_NAME_UNITS],
-}
-
-impl CapturedIoCompletionObjectAttributes {
-    const fn anonymous() -> Self {
-        Self {
-            attributes: 0,
-            name_len: 0,
-            name: [0; EXEC_IO_COMPLETION_NAME_UNITS],
-        }
-    }
-
-    fn name(&self) -> &[u16] {
-        &self.name[..self.name_len]
-    }
-}
-
 fn try_zeroed_transfer_buffer(len: usize) -> Result<alloc::vec::Vec<u8>, u32> {
     let mut bytes = alloc::vec::Vec::new();
     bytes
@@ -11366,7 +11346,27 @@ impl ExecNtHandler {
             }
         }
         if let Some(port_id) = release.port_id {
-            let _ = self.io_completion_ports.release(port_id);
+            self.release_io_completion_reference(port_id);
+        }
+    }
+
+    fn io_completion_namespace_index(&self, id: u32) -> Option<usize> {
+        self.obj_ns.iter().position(|entry| {
+            entry.is_live() && entry.kind == OBJ_KIND_IO_COMPLETION && entry.payload == id as u64
+        })
+    }
+
+    /// Drop one body reference and unlink a named completion port after its final reference goes.
+    pub(crate) fn release_io_completion_reference(&mut self, id: u32) {
+        if self.io_completion_ports.release(id).is_err()
+            || self.io_completion_ports.depth(id).is_ok()
+        {
+            return;
+        }
+        for entry in self.obj_ns.iter_mut().filter(|entry| {
+            entry.is_live() && entry.kind == OBJ_KIND_IO_COMPLETION && entry.payload == id as u64
+        }) {
+            entry.unlink();
         }
     }
 
@@ -14092,6 +14092,7 @@ impl ExecNtHandler {
             Some(3) => b"Semaphore",
             Some(4) => b"Mutant",
             Some(OBJ_KIND_TIMER) => b"Timer",
+            Some(OBJ_KIND_IO_COMPLETION) => b"IoCompletion",
             _ => match object {
                 nt_process::HandleObject::Process(_) => b"Process",
                 nt_process::HandleObject::Thread(_) => b"Thread",
@@ -14157,6 +14158,9 @@ impl ExecNtHandler {
                 .get(index)
                 .filter(|entry| entry.is_live())
                 .map(|_| index);
+        }
+        if let nt_process::HandleObject::IoCompletion(id) = object {
+            return self.io_completion_namespace_index(id);
         }
         let tag = match object {
             nt_process::HandleObject::Opaque(tag) => tag,
@@ -16395,7 +16399,7 @@ impl ExecNtHandler {
                 let _ = self.token_store.release(token);
             }
             nt_process::HandleObject::IoCompletion(id) => {
-                let _ = self.io_completion_ports.release(id);
+                self.release_io_completion_reference(id);
             }
             nt_process::HandleObject::File(file_id) => {
                 self.release_file_handle_reference(file_id);
@@ -18536,66 +18540,6 @@ impl ExecNtHandler {
         })
     }
 
-    unsafe fn capture_io_completion_object_attributes(
-        &self,
-        oa_va: u64,
-    ) -> Result<CapturedIoCompletionObjectAttributes, u32> {
-        const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
-
-        if oa_va == 0 {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let mut oa = [0u8; 0x30];
-        if !self.xas_read(oa_va, &mut oa) {
-            return Err(STATUS_ACCESS_VIOLATION);
-        }
-        if u32::from_le_bytes(oa[0..4].try_into().unwrap()) != 0x30 {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let attributes = u32::from_le_bytes(oa[24..28].try_into().unwrap());
-        let object_name = u64::from_le_bytes(oa[16..24].try_into().unwrap());
-        if object_name == 0 {
-            return Ok(CapturedIoCompletionObjectAttributes {
-                attributes,
-                ..CapturedIoCompletionObjectAttributes::anonymous()
-            });
-        }
-
-        let mut ustr = [0u8; 16];
-        if !self.xas_read(object_name, &mut ustr) {
-            return Err(STATUS_ACCESS_VIOLATION);
-        }
-        let byte_len = u16::from_le_bytes(ustr[0..2].try_into().unwrap()) as usize;
-        let maximum_len = u16::from_le_bytes(ustr[2..4].try_into().unwrap()) as usize;
-        let buffer = u64::from_le_bytes(ustr[8..16].try_into().unwrap());
-        if byte_len & 1 != 0 || byte_len > maximum_len {
-            return Err(STATUS_OBJECT_NAME_INVALID);
-        }
-        let name_len = byte_len / 2;
-        if name_len > EXEC_IO_COMPLETION_NAME_UNITS {
-            return Err(nt_io_completion::STATUS_NAME_TOO_LONG);
-        }
-        let mut captured = CapturedIoCompletionObjectAttributes {
-            attributes,
-            ..CapturedIoCompletionObjectAttributes::anonymous()
-        };
-        captured.name_len = name_len;
-        if name_len == 0 {
-            return Ok(captured);
-        }
-        if buffer == 0 {
-            return Err(STATUS_ACCESS_VIOLATION);
-        }
-        for index in 0..name_len {
-            let mut word = [0u8; 2];
-            if !self.xas_read(buffer + (index * 2) as u64, &mut word) {
-                return Err(STATUS_ACCESS_VIOLATION);
-            }
-            captured.name[index] = u16::from_le_bytes(word);
-        }
-        Ok(captured)
-    }
-
     unsafe fn read_unicode_string16(&self, ustr_va: u64) -> Result<alloc::vec::Vec<u16>, u32> {
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
         const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
@@ -18748,11 +18692,17 @@ impl ExecNtHandler {
         let Some(index) = self.query_object_namespace_index(object, direct_index) else {
             return STATUS_OBJECT_TYPE_MISMATCH;
         };
-        if let Some(entry) = self.obj_ns.get_mut(index) {
-            if !entry.is_live() {
-                return 0xC000_0008;
+        let (was_permanent, kind, payload) = match self.obj_ns.get_mut(index) {
+            Some(entry) if entry.is_live() => {
+                let state = (entry.permanent, entry.kind, entry.payload);
+                entry.permanent = false;
+                state
             }
-            entry.permanent = false;
+            _ => return 0xC000_0008,
+        };
+        if was_permanent && kind == OBJ_KIND_IO_COMPLETION {
+            self.release_io_completion_reference(payload as u32);
+            return 0;
         }
         self.obj_delete_name_check(index);
         0
@@ -27621,6 +27571,8 @@ impl ExecNtHandler {
                             OBJ_KIND_SEMAPHORE => "Semaphore",
                             OBJ_KIND_MUTANT => "Mutant",
                             OBJ_KIND_LPC_PORT => "Port",
+                            OBJ_KIND_TIMER => "Timer",
+                            OBJ_KIND_IO_COMPLETION => "IoCompletion",
                             _ => "Directory",
                         };
                         records.push((name16, type_name));
@@ -28622,6 +28574,7 @@ impl ExecNtHandler {
             // which can feed packets through nt-io-completion's field-for-field adapter.
             NativeService::NtCreateIoCompletion => unsafe {
                 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
                 const STATUS_OBJECT_NAME_EXISTS: u32 = 0x4000_0000;
                 let out_handle = args[0];
                 let desired_access = nt_ulong_arg(args[1]);
@@ -28632,12 +28585,53 @@ impl ExecNtHandler {
                     return STATUS_ACCESS_VIOLATION;
                 }
                 let captured = if oa == 0 {
-                    CapturedIoCompletionObjectAttributes::anonymous()
+                    None
                 } else {
-                    match self.capture_io_completion_object_attributes(oa) {
-                        Ok(captured) => captured,
+                    match self.capture_named_object_attributes(oa) {
+                        Ok(captured) => Some(captured),
                         Err(status) => return status,
                     }
+                };
+                let attributes = captured.as_ref().map_or(0, |captured| captured.attributes);
+                let create_anonymous = |this: &mut Self| -> u32 {
+                    let object_id = match this.io_completion_ports.create(concurrency) {
+                        Ok(id) => id,
+                        Err(status) => return status,
+                    };
+                    let handle = match this.mint_io_completion_handle(object_id, desired_access) {
+                        Some(handle) => handle,
+                        None => {
+                            this.release_io_completion_reference(object_id);
+                            return nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
+                        }
+                    };
+                    if !this.xas_try_write_buf(out_handle, &handle.to_le_bytes()) {
+                        this.close_current_handle(handle);
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    trace_io_completion(
+                        this.pi,
+                        b"create",
+                        handle,
+                        Some(object_id),
+                        nt_io_completion::STATUS_SUCCESS,
+                        this.io_completion_ports.depth(object_id).ok(),
+                        0,
+                        0,
+                        0,
+                        0,
+                    );
+                    nt_io_completion::STATUS_SUCCESS
+                };
+                let Some(captured) = captured else {
+                    return create_anonymous(self);
+                };
+                let Some(path) = captured.path() else {
+                    return create_anonymous(self);
+                };
+                let (root_idx, path) = match self.event_root_and_path(captured.root, path) {
+                    Ok(resolved) => resolved,
+                    Err(status) => return status,
                 };
                 if !NT_CREATE_IO_COMPLETION_TRACED.swap(true, Ordering::Relaxed) {
                     print_str(b"[nt-create-io-completion] pi=");
@@ -28647,57 +28641,113 @@ impl ExecNtHandler {
                     print_str(b" oa=0x");
                     print_hex(oa as u32);
                     print_str(b" attrs=0x");
-                    print_hex(captured.attributes);
+                    print_hex(attributes);
                     print_str(b" concurrency=");
                     print_u64(concurrency as u64);
                     print_str(b" name=\"");
-                    for &unit in captured.name().iter().take(64) {
-                        debug_put_char(if (0x20..0x7f).contains(&unit) {
-                            unit as u8
+                    for &byte in path.iter().take(64) {
+                        debug_put_char(if (0x20..0x7f).contains(&byte) {
+                            byte
                         } else {
                             b'?'
                         });
                     }
                     print_str(b"\"\n");
                 }
-                let created = match self.io_completion_ports.create(
-                    captured.name(),
-                    concurrency,
-                    captured.attributes & 0x40 != 0,
-                ) {
-                    Ok(created) => created,
+                if let Some(index) = self.obj_resolve(path, root_idx) {
+                    if self.obj_ns[index].kind != OBJ_KIND_IO_COMPLETION {
+                        return STATUS_OBJECT_TYPE_MISMATCH;
+                    }
+                    let object_id = self.obj_ns[index].payload as u32;
+                    if let Err(status) = self.io_completion_ports.retain(object_id) {
+                        return status;
+                    }
+                    let handle = match self.mint_io_completion_handle(object_id, desired_access) {
+                        Some(handle) => handle,
+                        None => {
+                            self.release_io_completion_reference(object_id);
+                            return nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
+                        }
+                    };
+                    if !self.xas_try_write_buf(out_handle, &handle.to_le_bytes()) {
+                        self.close_current_handle(handle);
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    trace_io_completion(
+                        self.pi,
+                        b"create",
+                        handle,
+                        Some(object_id),
+                        STATUS_OBJECT_NAME_EXISTS,
+                        self.io_completion_ports.depth(object_id).ok(),
+                        0,
+                        0,
+                        0,
+                        0,
+                    );
+                    return STATUS_OBJECT_NAME_EXISTS;
+                }
+
+                let object_id = match self.io_completion_ports.create(concurrency) {
+                    Ok(id) => id,
                     Err(status) => return status,
                 };
-                let handle = match self.mint_io_completion_handle(created.id, desired_access) {
+                let permanent = attributes & OBJ_PERMANENT != 0;
+                if permanent {
+                    if let Err(status) = self.io_completion_ports.retain(object_id) {
+                        self.release_io_completion_reference(object_id);
+                        return status;
+                    }
+                }
+                let index =
+                    match self.obj_create(path, root_idx, OBJ_KIND_IO_COMPLETION, &[], permanent) {
+                        Some(index) => index,
+                        None => {
+                            if permanent {
+                                self.release_io_completion_reference(object_id);
+                            }
+                            self.release_io_completion_reference(object_id);
+                            return nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
+                        }
+                    };
+                self.obj_ns[index].payload = object_id as u64;
+                let handle = match self.mint_io_completion_handle(object_id, desired_access) {
                     Some(handle) => handle,
                     None => {
-                        let _ = self.io_completion_ports.release(created.id);
+                        self.rollback_new_namespace_object(index);
+                        if permanent {
+                            self.release_io_completion_reference(object_id);
+                        }
+                        self.release_io_completion_reference(object_id);
                         return nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
                     }
                 };
-                self.xas_write_buf(out_handle, &handle.to_le_bytes());
-                let status = if created.created {
-                    nt_io_completion::STATUS_SUCCESS
-                } else {
-                    STATUS_OBJECT_NAME_EXISTS
-                };
+                if !self.xas_try_write_buf(out_handle, &handle.to_le_bytes()) {
+                    self.close_current_handle(handle);
+                    if permanent {
+                        self.release_io_completion_reference(object_id);
+                    }
+                    return STATUS_ACCESS_VIOLATION;
+                }
                 trace_io_completion(
                     self.pi,
                     b"create",
                     handle,
-                    Some(created.id),
-                    status,
-                    self.io_completion_ports.depth(created.id).ok(),
+                    Some(object_id),
+                    nt_io_completion::STATUS_SUCCESS,
+                    self.io_completion_ports.depth(object_id).ok(),
                     0,
                     0,
                     0,
                     0,
                 );
-                status
+                nt_io_completion::STATUS_SUCCESS
             },
             NativeService::NtOpenIoCompletion => unsafe {
                 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-                const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+                const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
+                const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+                const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
                 let out_handle = args[0];
                 let desired_access = nt_ulong_arg(args[1]);
                 let oa = args[2];
@@ -28708,25 +28758,39 @@ impl ExecNtHandler {
                 if oa == 0 {
                     return STATUS_INVALID_PARAMETER;
                 }
-                let captured = match self.capture_io_completion_object_attributes(oa) {
+                let captured = match self.capture_named_object_attributes(oa) {
                     Ok(captured) => captured,
                     Err(status) => return status,
                 };
-                let object_id = match self.io_completion_ports.open(
-                    captured.name(),
-                    captured.attributes & OBJ_CASE_INSENSITIVE != 0,
-                ) {
-                    Ok(id) => id,
+                let Some(path) = captured.path() else {
+                    return STATUS_OBJECT_NAME_INVALID;
+                };
+                let (root_idx, path) = match self.event_root_and_path(captured.root, path) {
+                    Ok(resolved) => resolved,
                     Err(status) => return status,
+                };
+                let index = match self.obj_resolve(path, root_idx) {
+                    Some(index) => index,
+                    None => return STATUS_OBJECT_NAME_NOT_FOUND,
+                };
+                if self.obj_ns[index].kind != OBJ_KIND_IO_COMPLETION {
+                    return STATUS_OBJECT_TYPE_MISMATCH;
+                }
+                let object_id = self.obj_ns[index].payload as u32;
+                if let Err(status) = self.io_completion_ports.retain(object_id) {
+                    return status;
                 };
                 let handle = match self.mint_io_completion_handle(object_id, desired_access) {
                     Some(handle) => handle,
                     None => {
-                        let _ = self.io_completion_ports.release(object_id);
+                        self.release_io_completion_reference(object_id);
                         return nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
                     }
                 };
-                self.xas_write_buf(out_handle, &handle.to_le_bytes());
+                if !self.xas_try_write_buf(out_handle, &handle.to_le_bytes()) {
+                    self.close_current_handle(handle);
+                    return STATUS_ACCESS_VIOLATION;
+                }
                 nt_io_completion::STATUS_SUCCESS
             },
             NativeService::NtSetIoCompletion => {
@@ -30597,8 +30661,7 @@ impl ExecNtHandler {
                                                     nt_io_completion::STATUS_SUCCESS
                                                 }
                                                 Err(status) => {
-                                                    let _ =
-                                                        self.io_completion_ports.release(port_id);
+                                                    self.release_io_completion_reference(port_id);
                                                     status
                                                 }
                                             }

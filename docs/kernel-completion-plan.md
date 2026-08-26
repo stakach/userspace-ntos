@@ -13772,3 +13772,35 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `nt-io-completion` should own only port reference/concurrency/packet state. Delete the private
     port-name machinery once the shared namespace path is accepted. Then resume the file capture and
     publication inventory.
+
+    Shared Object Manager completion-port identity (2026-08-27, accepted): named I/O completion
+    ports now use the same canonical Object Manager namespace as Event, Timer, Semaphore, Mutant,
+    Directory, SymbolicLink, and LPC objects. `NtCreateIoCompletion` and `NtOpenIoCompletion`
+    resolve absolute or `RootDirectory`-relative paths through that authority, reject cross-type
+    collisions, publish the backing port ID in the namespace entry, and expose the shared name and
+    `IoCompletion` type through `NtQueryObject` and directory enumeration. The completion-port crate
+    no longer stores names, folds case, performs named lookup, or imposes a private 64-unit name
+    ceiling; it owns only body references, concurrency, and queued packets.
+
+    Completion-port lifetime now follows body references rather than process-handle count. Handles,
+    File associations, and parked removers all use one release path; the final reference unlinks a
+    temporary named object before its body ID can be recycled. An `OBJ_PERMANENT` namespace entry
+    owns an explicit reference, and `NtMakeTemporaryObject` releases exactly that reference while a
+    caller handle keeps the body alive. Handle publication and every allocation/copyout failure path
+    compensate both namespace and body ownership without a fallback.
+
+    Focused `nt-io-completion` validation passes all 32 tests, and the freestanding executive check
+    remains green at the established 212-warning baseline. Serialized acceptance
+    `.tmp/run-headless-io-completion-object-namespace-20260827.log` exercised four live completion
+    ports, parked removers, File completion associations, userinit, and genuine Explorer. It passed
+    all `295/295` gates, matched the sentinel, and painted all 480,000 framebuffer pixels with at
+    least 32 colors. Scratch returned to zero at the unchanged 278,112 B peak; final durable
+    allocation was 14,818,544 B with 6,152,848 B reusable.
+
+    Review adjustment: completion-port capture, identity, and reference lifetime are closed. Resume
+    the file create/open inventory with a strict phase split: caller `OBJECT_ATTRIBUTES`, Unicode
+    names, EA data, and synchronous encoder buffers may be transient only until the canonical File
+    object/device request is formed. File objects, canonical IRPs, pending provider requests, APC and
+    event state, completion-port packets, cache entries, and process handles remain durable. Remove
+    each legacy capture allocation only after its last consumer is explicit; do not wrap a complete
+    potentially parking file syscall in a scratch scope.

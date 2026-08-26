@@ -14,8 +14,6 @@ pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 pub const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 pub const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
-pub const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
-pub const STATUS_NAME_TOO_LONG: u32 = 0xC000_0106;
 pub const STATUS_QUOTA_EXCEEDED: u32 = 0xC000_0044;
 
 pub const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: u32 = 0x0000_0001;
@@ -976,32 +974,22 @@ impl Default for CompletionWaiterTable {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CreateResult {
-    pub id: u32,
-    pub created: bool,
-}
-
 #[derive(Clone, Copy)]
-struct CompletionPort<const PACKETS: usize, const NAME_UNITS: usize> {
+struct CompletionPort<const PACKETS: usize> {
     occupied: bool,
     references: u16,
     concurrency: u32,
-    name_len: u16,
-    name: [u16; NAME_UNITS],
     packets: [CompletionPacket; PACKETS],
     head: usize,
     len: usize,
 }
 
-impl<const PACKETS: usize, const NAME_UNITS: usize> CompletionPort<PACKETS, NAME_UNITS> {
+impl<const PACKETS: usize> CompletionPort<PACKETS> {
     const fn empty() -> Self {
         Self {
             occupied: false,
             references: 0,
             concurrency: 0,
-            name_len: 0,
-            name: [0; NAME_UNITS],
             packets: [CompletionPacket {
                 key_context: 0,
                 apc_context: 0,
@@ -1011,10 +999,6 @@ impl<const PACKETS: usize, const NAME_UNITS: usize> CompletionPort<PACKETS, NAME
             head: 0,
             len: 0,
         }
-    }
-
-    fn name(&self) -> &[u16] {
-        &self.name[..self.name_len as usize]
     }
 
     fn retain(&mut self) -> Result<(), u32> {
@@ -1030,13 +1014,11 @@ impl<const PACKETS: usize, const NAME_UNITS: usize> CompletionPort<PACKETS, NAME
     }
 }
 
-pub struct CompletionPortTable<const PORTS: usize, const PACKETS: usize, const NAME_UNITS: usize> {
-    ports: [CompletionPort<PACKETS, NAME_UNITS>; PORTS],
+pub struct CompletionPortTable<const PORTS: usize, const PACKETS: usize> {
+    ports: [CompletionPort<PACKETS>; PORTS],
 }
 
-impl<const PORTS: usize, const PACKETS: usize, const NAME_UNITS: usize>
-    CompletionPortTable<PORTS, PACKETS, NAME_UNITS>
-{
+impl<const PORTS: usize, const PACKETS: usize> CompletionPortTable<PORTS, PACKETS> {
     pub const fn new() -> Self {
         assert!(PORTS > 0);
         assert!(PACKETS > 0);
@@ -1051,24 +1033,9 @@ impl<const PORTS: usize, const PACKETS: usize, const NAME_UNITS: usize>
         }
     }
 
-    pub fn create(
-        &mut self,
-        name: &[u16],
-        concurrency: u32,
-        case_insensitive: bool,
-    ) -> Result<CreateResult, u32> {
-        if name.len() > NAME_UNITS {
-            return Err(STATUS_NAME_TOO_LONG);
-        }
-        if !name.is_empty() {
-            if let Some(index) = self.find_name(name, case_insensitive) {
-                self.ports[index].retain()?;
-                return Ok(CreateResult {
-                    id: index as u32,
-                    created: false,
-                });
-            }
-        }
+    /// Allocate one distinct completion-port body. Object Manager naming and collision policy live
+    /// above this queue/reference store; the returned reference belongs to the first handle.
+    pub fn create(&mut self, concurrency: u32) -> Result<u32, u32> {
         let index = self
             .ports
             .iter()
@@ -1078,22 +1045,6 @@ impl<const PORTS: usize, const PACKETS: usize, const NAME_UNITS: usize>
         port.occupied = true;
         port.references = 1;
         port.concurrency = concurrency;
-        port.name_len = name.len() as u16;
-        port.name[..name.len()].copy_from_slice(name);
-        Ok(CreateResult {
-            id: index as u32,
-            created: true,
-        })
-    }
-
-    pub fn open(&mut self, name: &[u16], case_insensitive: bool) -> Result<u32, u32> {
-        if name.is_empty() {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let index = self
-            .find_name(name, case_insensitive)
-            .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
-        self.ports[index].retain()?;
         Ok(index as u32)
     }
 
@@ -1153,48 +1104,24 @@ impl<const PORTS: usize, const PACKETS: usize, const NAME_UNITS: usize>
         Ok(self.port(id)?.concurrency)
     }
 
-    fn port(&self, id: u32) -> Result<&CompletionPort<PACKETS, NAME_UNITS>, u32> {
+    fn port(&self, id: u32) -> Result<&CompletionPort<PACKETS>, u32> {
         self.ports
             .get(id as usize)
             .filter(|port| port.occupied)
             .ok_or(STATUS_INVALID_HANDLE)
     }
 
-    fn port_mut(&mut self, id: u32) -> Result<&mut CompletionPort<PACKETS, NAME_UNITS>, u32> {
+    fn port_mut(&mut self, id: u32) -> Result<&mut CompletionPort<PACKETS>, u32> {
         self.ports
             .get_mut(id as usize)
             .filter(|port| port.occupied)
             .ok_or(STATUS_INVALID_HANDLE)
     }
-
-    fn find_name(&self, name: &[u16], case_insensitive: bool) -> Option<usize> {
-        self.ports.iter().position(|port| {
-            port.occupied
-                && port.name().len() == name.len()
-                && port.name().iter().zip(name).all(|(&left, &right)| {
-                    if case_insensitive {
-                        fold_ascii(left) == fold_ascii(right)
-                    } else {
-                        left == right
-                    }
-                })
-        })
-    }
 }
 
-impl<const PORTS: usize, const PACKETS: usize, const NAME_UNITS: usize> Default
-    for CompletionPortTable<PORTS, PACKETS, NAME_UNITS>
-{
+impl<const PORTS: usize, const PACKETS: usize> Default for CompletionPortTable<PORTS, PACKETS> {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-fn fold_ascii(unit: u16) -> u16 {
-    if unit >= b'A' as u16 && unit <= b'Z' as u16 {
-        unit + (b'a' - b'A') as u16
-    } else {
-        unit
     }
 }
 
@@ -1204,7 +1131,7 @@ mod tests {
 
     use super::*;
 
-    type Ports = CompletionPortTable<2, 2, 16>;
+    type Ports = CompletionPortTable<2, 2>;
 
     #[test]
     fn completion_publication_distinguishes_inline_errors_from_deferred_errors() {
@@ -1252,67 +1179,32 @@ mod tests {
     #[test]
     fn create_tracks_concurrency_and_distinct_anonymous_objects() {
         let mut ports = Ports::new();
-        let first = ports.create(&[], 4, false).unwrap();
-        let second = ports.create(&[], 0, false).unwrap();
-        assert!(first.created);
-        assert!(second.created);
-        assert_ne!(first.id, second.id);
-        assert_eq!(ports.concurrency(first.id), Ok(4));
+        let first = ports.create(4).unwrap();
+        let second = ports.create(0).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(ports.concurrency(first), Ok(4));
     }
 
     #[test]
-    fn named_create_and_open_share_an_object() {
+    fn retained_reference_shares_the_same_port_state() {
         let mut ports = Ports::new();
-        let created = ports
-            .create(
-                &[b'P' as u16, b'o' as u16, b'r' as u16, b't' as u16],
-                2,
-                true,
-            )
-            .unwrap();
-        let duplicate = ports
-            .create(
-                &[b'p' as u16, b'O' as u16, b'R' as u16, b'T' as u16],
-                9,
-                true,
-            )
-            .unwrap();
-        assert!(!duplicate.created);
-        assert_eq!(duplicate.id, created.id);
-        assert_eq!(ports.concurrency(created.id), Ok(2));
+        let id = ports.create(2).unwrap();
+        ports.retain(id).unwrap();
+        ports.enqueue(id, packet(7)).unwrap();
+        ports.release(id).unwrap();
+        assert_eq!(ports.concurrency(id), Ok(2));
         assert_eq!(
-            ports.open(&[b'p' as u16, b'o' as u16, b'r' as u16, b't' as u16], true),
-            Ok(created.id)
+            ports.remove(id, RemoveMode::Poll),
+            Ok(RemoveResult::Packet(packet(7)))
         );
     }
 
     #[test]
-    fn case_sensitive_names_and_missing_opens_are_distinct() {
+    fn object_capacity_fails_truthfully() {
         let mut ports = Ports::new();
-        let upper = [b'P' as u16];
-        let lower = [b'p' as u16];
-        let first = ports.create(&upper, 1, false).unwrap();
-        let second = ports.create(&lower, 1, false).unwrap();
-        assert_ne!(first.id, second.id);
-        assert_eq!(
-            ports.open(&[b'x' as u16], false),
-            Err(STATUS_OBJECT_NAME_NOT_FOUND)
-        );
-    }
-
-    #[test]
-    fn object_and_name_capacity_fail_truthfully() {
-        let mut ports = Ports::new();
-        assert_eq!(
-            ports.create(&[b'x' as u16; 17], 1, false),
-            Err(STATUS_NAME_TOO_LONG)
-        );
-        ports.create(&[], 1, false).unwrap();
-        ports.create(&[], 1, false).unwrap();
-        assert_eq!(
-            ports.create(&[], 1, false),
-            Err(STATUS_INSUFFICIENT_RESOURCES)
-        );
+        ports.create(1).unwrap();
+        ports.create(1).unwrap();
+        assert_eq!(ports.create(1), Err(STATUS_INSUFFICIENT_RESOURCES));
     }
 
     #[test]
@@ -1328,7 +1220,7 @@ mod tests {
     #[test]
     fn packets_are_fifo_and_depth_is_exact() {
         let mut ports = Ports::new();
-        let id = ports.create(&[], 1, false).unwrap().id;
+        let id = ports.create(1).unwrap();
         ports.enqueue(id, packet(10)).unwrap();
         ports.enqueue(id, packet(20)).unwrap();
         assert_eq!(ports.depth(id), Ok(2));
@@ -1346,7 +1238,7 @@ mod tests {
     #[test]
     fn full_queue_is_reported_without_overwrite() {
         let mut ports = Ports::new();
-        let id = ports.create(&[], 1, false).unwrap().id;
+        let id = ports.create(1).unwrap();
         ports.enqueue(id, packet(1)).unwrap();
         ports.enqueue(id, packet(2)).unwrap();
         assert_eq!(ports.enqueue(id, packet(3)), Err(STATUS_QUOTA_EXCEEDED));
@@ -1359,7 +1251,7 @@ mod tests {
     #[test]
     fn empty_remove_distinguishes_poll_from_blocking_wait() {
         let mut ports = Ports::new();
-        let id = ports.create(&[], 1, false).unwrap().id;
+        let id = ports.create(1).unwrap();
         assert_eq!(
             ports.remove(id, RemoveMode::Poll),
             Ok(RemoveResult::Empty(STATUS_TIMEOUT))
@@ -1374,7 +1266,7 @@ mod tests {
     fn invalid_and_released_ids_are_rejected() {
         let mut ports = Ports::new();
         assert_eq!(ports.depth(99), Err(STATUS_INVALID_HANDLE));
-        let id = ports.create(&[], 1, false).unwrap().id;
+        let id = ports.create(1).unwrap();
         ports.release(id).unwrap();
         assert_eq!(ports.enqueue(id, packet(1)), Err(STATUS_INVALID_HANDLE));
     }
@@ -1382,20 +1274,19 @@ mod tests {
     #[test]
     fn final_release_recycles_but_shared_reference_does_not() {
         let mut ports = Ports::new();
-        let name = [b'x' as u16];
-        let id = ports.create(&name, 1, false).unwrap().id;
-        assert_eq!(ports.open(&name, false), Ok(id));
+        let id = ports.create(1).unwrap();
+        ports.retain(id).unwrap();
         ports.release(id).unwrap();
         assert_eq!(ports.depth(id), Ok(0));
         ports.release(id).unwrap();
         assert_eq!(ports.depth(id), Err(STATUS_INVALID_HANDLE));
-        assert_eq!(ports.create(&[], 3, false).unwrap().id, id);
+        assert_eq!(ports.create(3).unwrap(), id);
     }
 
     #[test]
     fn parked_waiter_reference_survives_last_handle_close() {
         let mut ports = Ports::new();
-        let id = ports.create(&[], 1, false).unwrap().id;
+        let id = ports.create(1).unwrap();
         ports.retain(id).unwrap();
         ports.release(id).unwrap();
         assert_eq!(ports.depth(id), Ok(0));
@@ -1406,25 +1297,22 @@ mod tests {
         );
         ports.release(id).unwrap();
         assert_eq!(ports.depth(id), Err(STATUS_INVALID_HANDLE));
-        assert_eq!(ports.create(&[], 2, false).unwrap().id, id);
+        assert_eq!(ports.create(2).unwrap(), id);
     }
 
     #[test]
     fn every_reference_path_reports_overflow_without_saturating() {
         let mut ports = Ports::new();
-        let name = [b'x' as u16];
-        let id = ports.create(&name, 1, false).unwrap().id;
+        let id = ports.create(1).unwrap();
         ports.ports[id as usize].references = u16::MAX;
         assert_eq!(ports.retain(id), Err(STATUS_QUOTA_EXCEEDED));
-        assert_eq!(ports.open(&name, false), Err(STATUS_QUOTA_EXCEEDED));
-        assert_eq!(ports.create(&name, 9, false), Err(STATUS_QUOTA_EXCEEDED));
         assert_eq!(ports.ports[id as usize].references, u16::MAX);
     }
 
     #[test]
     fn transport_adapter_maps_surt_fields_without_transport_dependency() {
         let mut ports = Ports::new();
-        let id = ports.create(&[], 1, false).unwrap().id;
+        let id = ports.create(1).unwrap();
         ports
             .enqueue_transport(
                 id,
@@ -1833,7 +1721,7 @@ mod tests {
     #[test]
     fn completion_port_packets_preserve_null_apc_context() {
         let mut ports = Ports::new();
-        let port = ports.create(&[], 0, false).unwrap();
+        let port = ports.create(0).unwrap();
         let packet = CompletionPacket {
             key_context: 0x1234_5678,
             apc_context: 0,
@@ -1841,9 +1729,9 @@ mod tests {
             information: 72,
         };
 
-        assert_eq!(ports.enqueue(port.id, packet), Ok(()));
+        assert_eq!(ports.enqueue(port, packet), Ok(()));
         assert_eq!(
-            ports.remove(port.id, RemoveMode::Poll),
+            ports.remove(port, RemoveMode::Poll),
             Ok(RemoveResult::Packet(packet))
         );
     }

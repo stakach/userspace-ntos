@@ -16359,7 +16359,7 @@ unsafe fn io_completion_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
         );
         release_reply_pool_cap(waiter.reply_cap);
         thread_wait_state_clear_badge_ready(handler, waiter.badge);
-        let _ = handler.io_completion_ports.release(waiter.port_id);
+        handler.release_io_completion_reference(waiter.port_id);
         IO_COMPLETION_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
         woken += 1;
     }
@@ -16801,7 +16801,7 @@ unsafe fn io_completion_cancel_thread(handler: &mut ExecNtHandler, thread_id: u6
             release_reply_pool_cap(cap);
         }
         thread_wait_state_clear_badge(waiter.badge);
-        let _ = handler.io_completion_ports.release(waiter.port_id);
+        handler.release_io_completion_reference(waiter.port_id);
     }
 }
 
@@ -16820,7 +16820,7 @@ unsafe fn io_completion_cancel_process(handler: &mut ExecNtHandler, process_inde
             release_reply_pool_cap(cap);
         }
         thread_wait_state_clear_badge(waiter.badge);
-        let _ = handler.io_completion_ports.release(waiter.port_id);
+        handler.release_io_completion_reference(waiter.port_id);
     }
 }
 
@@ -21069,6 +21069,7 @@ const OBJ_KIND_SEMAPHORE: u8 = 3;
 const OBJ_KIND_MUTANT: u8 = 4;
 const OBJ_KIND_LPC_PORT: u8 = 5;
 const OBJ_KIND_TIMER: u8 = 6;
+const OBJ_KIND_IO_COMPLETION: u8 = 7;
 const OBJ_KIND_DELETED: u8 = 0xff;
 const OBJ_NAME_CAP: usize = 128;
 const OBJ_PARENT_ROOT: usize = usize::MAX;
@@ -21100,8 +21101,8 @@ fn take_object_namespace_growth_dirty() -> bool {
 /// allocation before the next bump-heap reset. NT object leaf names are allowed to be long enough for
 /// BaseNamedObjects mutexes such as userenv's per-profile mutex; `target` is link-only data; `payload`
 /// carries backing object identity for kinds whose state lives outside the namespace, such as LPC
-/// listen port handles. `permanent` mirrors `OBJ_PERMANENT`; non-permanent named objects are
-/// unlinked from the namespace when their last handle closes.
+/// listen port handles and I/O completion ports. `permanent` mirrors `OBJ_PERMANENT`;
+/// non-permanent named objects are unlinked when their final body reference goes away.
 #[derive(Clone, Copy)]
 struct ObjEntry {
     name: [u8; OBJ_NAME_CAP], // leaf name, lowercased ASCII (len in name_len)
@@ -22109,9 +22110,7 @@ unsafe fn reset_exec_nt_handler(
     ExecNtHandler::initialize_in(slot, hosted_images, driver_starts, require_boot_system)
 }
 
-const EXEC_IO_COMPLETION_NAME_UNITS: usize = 64;
-type ExecIoCompletionPortTable =
-    nt_io_completion::CompletionPortTable<TP_WORKER_PI_COUNT, 8, EXEC_IO_COMPLETION_NAME_UNITS>;
+type ExecIoCompletionPortTable = nt_io_completion::CompletionPortTable<TP_WORKER_PI_COUNT, 8>;
 type ExecFileCompletionTable = nt_io_completion::FileCompletionTable<128>;
 type ExecProcessMechanismTable = nt_user_host::ProcessMechanismTable<MAX_PI>;
 type ExecThreadMechanismTable = nt_user_host::ThreadMechanismTable<MAX_PI, PM_RUNTIME_THREAD_SLOTS>;
@@ -22134,19 +22133,9 @@ impl ExecIoCompletionPorts {
         Self { table }
     }
 
-    fn create(
-        &mut self,
-        name: &[u16],
-        concurrency: u32,
-        case_insensitive: bool,
-    ) -> Result<nt_io_completion::CreateResult, u32> {
+    fn create(&mut self, concurrency: u32) -> Result<u32, u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).create(name, concurrency, case_insensitive) }
-    }
-
-    fn open(&mut self, name: &[u16], case_insensitive: bool) -> Result<u32, u32> {
-        // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).open(name, case_insensitive) }
+        unsafe { (&mut *self.table).create(concurrency) }
     }
 
     fn retain(&mut self, id: u32) -> Result<(), u32> {

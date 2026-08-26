@@ -21791,7 +21791,7 @@ unsafe fn io_completion_park(
     let waiters = unsafe { &mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS) };
     let old_capacity = waiters.capacity();
     if waiters.insert(waiter).is_err() {
-        let _ = nt_handler.io_completion_ports.release(port_id);
+        nt_handler.release_io_completion_reference(port_id);
         return false;
     }
     if waiters.capacity() != old_capacity {
@@ -21868,7 +21868,7 @@ unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
     );
     release_reply_pool_cap(waiter.reply_cap);
     thread_wait_state_clear_badge_ready(nt_handler, waiter.badge);
-    let _ = nt_handler.io_completion_ports.release(waiter.port_id);
+    nt_handler.release_io_completion_reference(waiter.port_id);
     IO_COMPLETION_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
     true
 }
