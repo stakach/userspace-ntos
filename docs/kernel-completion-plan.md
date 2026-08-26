@@ -2443,6 +2443,104 @@ durable-allocation reporting beyond its completion queues to GenStore growth and
 storage before relying on it for removal transactions. These are mechanism fixes; do not mask a
 corrupt snapshot, drop dirty state, or add a boot recovery fallback.
 
+B3 I/O Manager durable-record ownership checkpoint (2026-08-27, accepted; ownership refinement
+below): the first
+serialized run after the identity-safe rust-micro paging teardown advanced beyond the former
+executive heap-page fault, then exposed the independent durable-allocation gap described above.
+LSASS's first `\lsarpc` server remained process-visible as handle `0x2c` and completion-policy
+`FileId 0x0000010000000002`; its pending LISTEN completed normally, but allocation of the replacement
+server instance grew manager-owned state above the service-loop rewind mark. The pump report only
+covered completion/retry queues, so the finalizer reclaimed the canonical File store while the
+generation-exact process handle and completion policy correctly remained live. The later real
+`FlushFileBuffers` failed `STATUS_INVALID_HANDLE`, and the first final-handle cleanup correctly
+failed hard instead of manufacturing success.
+
+`nt-io-manager` now owns one sticky durable-storage signal covering driver, device, File, IRP, and
+hosted-domain record publication, nested hosted identity bindings, backend registration, and every
+manager-owned completion/cancel/close retry queue. This includes record-owned heap data even when a
+GenStore slot is reused without vector growth. The executive consumes that single signal in the
+existing durable-state finalizer; the old executive pump-only dirty hook is removed. Unpublished
+CREATE abandonment and committed final-handle cleanup also have distinct executive integration
+entry points, while both retain the manager's fail-closed lifecycle validation. Focused regression
+coverage crosses File-slot reuse and IRP allocation outside `pump()`, and the complete
+`nt-io-manager` suite passes `196/196`. Subsequent serialized desktop proofs preserve the same
+`\lsarpc` File lifecycle, genuine userinit/Explorer launch, complete shell framebuffer, all
+executive gates, and the sentinel. The broad lifetime fix is accepted; the sticky signal's
+over-retention is addressed separately below.
+
+Exact I/O durability epochs (2026-08-27, accepted; heap attribution follow-up below):
+the accepted CM transaction run ended with the executive bump heap at `15101840/16777216` bytes.
+The durability signal was correct about live records but over-conservative about records created
+and destroyed inside one syscall: every synchronous or failed File/IRP construction pinned the
+complete current heap mark even when its exact canonical record and nested storage had already been
+released. Queue insertions also marked every push rather than only backing-capacity growth, and the
+first service-loop finalizer consumed bootstrap I/O state already covered by its initial watermark.
+
+`GenStore` now carries an internal insertion epoch with each live slot. The I/O Manager counts exact
+record acquisitions in the current durability epoch; generation-exact removal in the same epoch
+cancels only that acquisition. A barrier advances the epoch, so later removal of an older record
+cannot accidentally discharge a new owner. Driver, device, File, IRP, and hosted-domain stores mark
+their backing capacity separately, as do hosted projection and completion/cancel/close queues.
+Persistent record-owned strings, vectors, buffers, and backend boxes still pin correctly, while a
+synchronous File/IRP using an existing slot can be created and destroyed without a false durable
+signal. The service loop explicitly consumes the bootstrap epoch immediately after establishing the
+watermark that already contains it.
+
+Regression coverage proves first slot growth remains durable, slot-reused File/IRP rollback is
+clean, a still-live IRP remains durable, and consuming one epoch cannot be repeated. The full
+`nt-io-manager` suite remains `196/196`. Serialized proof
+`.tmp/run-desktop-io-durable-epochs-20260827.log` launches genuine userinit and Explorer, redirects
+487 real api0 callbacks, paints 480000/480000 non-background framebuffer pixels with at least 32
+distinct colors, passes all `295/295` executive gates, and matches the sentinel. The final heap is
+`14951936/16777216` bytes, essentially unchanged from the 14.9-15.1 MiB baseline. The first census
+already carried that watermark after runtime registry/profile persistence and before the later
+synchronous shell I/O churn, so this is not evidence against the exact I/O epoch model.
+
+Review adjustment: the I/O ownership correction is accepted on its exact lifetime and full desktop
+proof. Attribute the remaining heap baseline to the mutable hive, persistence journal, and writable
+snapshot owners next. Reduce duplicated or trapped storage at those mechanisms; do not weaken the
+durability barrier or raise the component ceiling to conceal it.
+
+Allocator rewind/accounting correction (2026-08-27, implementation green; desktop measurement
+pending): the heap audit found that the reported bump watermark is not live allocation usage. The
+allocator already returns dropped objects to an address-ordered, coalescing free list, so transient
+blocks below a later durable object remain reusable even when they cannot lower the top watermark.
+The old gate and pool diagnostics called that watermark permanent `used` memory and reported only
+the virgin range above it as free, hiding reusable holes and overstating pressure.
+
+A separate correctness error amplified that diagnostic problem: `reset_to(old_mark)` assigned the
+requested mark even when normal deallocation had already lowered the current bump below it. A
+function documented as rewind could therefore advance the allocator and turn a released top range
+back into apparent occupancy. Reset now chooses the minimum of requested mark, current bump, and
+component capacity, with compile-time cases proving it cannot advance. `HeapUsage` walks the
+allocator-owned free list once and reports watermark, estimated live allocated bytes, total
+reusable bytes, largest reusable block, and virgin top range. Census, pool, and final-gate output now
+publish these distinct values. The freestanding executive check is green at the established
+212-warning baseline. Review adjustment: rerun desktop acceptance and use `allocated`, `reusable`,
+and `largest` rather than the watermark alone to decide whether hive compaction is actually needed.
+
+Gate review (2026-08-27): `.tmp/run-headless-io-manager-durable-records-20260827.log` passed the
+former executive-heap and LSASS File-store failure points: replacement RPC servers retained their
+canonical identities and no cleanup panic recurred. The later `memcpy` fault was not the rootserver
+and was not an unmap regression. TCB 3 is isolated Configuration Manager; its VSpace mapped exactly
+1024 heap frames (4 MiB), while the shared executive-image allocator continued to advertise its
+4096-frame (16 MiB) ceiling. The fault at `0x0000010020400000` was the first byte after CM's mapping,
+and the same component/address pair is present in multiple pre- and post-paging-fix logs.
+
+Spawned executive-image components now receive their mapped heap-frame count in the initial thread
+context and publish that limit before their first allocation. Allocation, reallocation, free-list
+insertion, headroom reporting, and mark/reset all use the component-local ceiling, so a bounded
+service returns allocation failure instead of crossing into an unmapped page. The generic component
+descriptor derives this value from its declared `HEAP_BASE` region rather than carrying a second
+capacity field that could drift. CM receives the full 16 MiB profile because runtime SYSTEM
+transactions atomically own the encoded hive, decoded tree, indexes, and transaction snapshots; the
+last accepted desktop still had about 250 MiB of root Untyped headroom. The permanent-root
+delete/unmap/move guards remain useful independent ownership defenses, but they are not credited as
+the cause or fix for this service-local boundary fault. The freestanding executive check passes at
+the established 212-warning baseline; the next serialized desktop gate must pass the former CM
+boundary, preserve the LSASS replacement File lifecycle, reach genuine Explorer pixels, and exit
+through the sentinel.
+
 B3 canonical videoprt START checkpoint (2026-08-26, implementation green): hosted display START no
 longer bypasses the canonical I/O Manager and PnP Manager transaction. The boot orchestrator now
 sends every devnode through the same File-less `IRP_MN_START_DEVICE` preparation, exact stack
@@ -13133,10 +13231,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     metadata, and security descriptors; values and whole transactions stream across arbitrarily
     many SURT frames instead of inheriting the shared frame's 4 KiB size.
 
-    Commit decodes the complete journal, applies it to a cloned hive, revalidates the selected
-    control set, rebuilds CM's semantic service/PnP indexes, and only then publishes the candidate
-    with one generation increment. A bad record, missing object, non-leaf delete, corrupt control
-    set, or stale generation leaves both the mounted hive and semantic indexes unchanged. The
+    At this checkpoint, commit decoded the complete journal, applied it to a cloned hive,
+    revalidated the selected control set, rebuilt CM's semantic service/PnP indexes, and only then
+    published the candidate with one generation increment. That unconditional semantic rebuild has
+    since been removed by the incremental publication checkpoint below. A bad record, missing
+    object, non-leaf delete, corrupt control set, or stale generation leaves both the mounted hive
+    and semantic indexes unchanged. The
     client integration test crosses more than two request frames, verifies key/value/class/security
     mutation and deletion, observes the newly committed Win32-service metadata through a
     generation-2 launch plan, proves transaction-wide rollback, and rejects a stale generation-1
@@ -13210,3 +13310,212 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     SYSTEM mutation authority as each path moves; keep SOFTWARE, user, SECURITY, and SAM ownership
     separate. Expose an explicit CM registry transport to win32k only after this runtime audit is
     closed.
+
+    Runtime SYSTEM mutation ownership (2026-08-27, in progress): the audit found four call paths
+    that can still mutate the executive projection before CM: nonvolatile `NtCreateKey` (including
+    initial class/security metadata), `NtSetValueKey`, `NtDeleteKey`/`NtDeleteValueKey`, and
+    `NtSetDefaultLocale(FALSE)`. `NtSetSecurityObject` is a fifth entry point into the same key
+    security mutation primitive. Volatile overlay keys and the SOFTWARE, SECURITY, SAM, `.Default`,
+    and dynamically mounted user hives are separate authorities and must retain their current paths.
+
+    Extend the owned SYSTEM transaction representation to the complete CM mutation vocabulary and
+    route each persistent SYSTEM branch through one generation-checked CM commit before replaying
+    that accepted transaction into the durable SYSTEM journal. Key creation must commit create,
+    class, and security as one atomic transaction. Delete and security mutations must follow the same
+    rule; there is no direct SYSTEM fallback when CM is unavailable or rejects the transaction.
+    Accept this checkpoint only after focused checks and a serialized desktop run prove runtime
+    registry consumers, registry-selected PnP/networking, profile unload/reload, genuine Explorer
+    rendering, every executive gate, and the sentinel.
+
+    Incremental runtime SYSTEM publication (2026-08-27, accepted; performance follow-up below):
+    profiling the first CM-authoritative runtime boot showed `services.exe` spending
+    roughly 140-275 ms in each `NtCreateKey`/`NtSetValueKey`. CM was cloning and validating the
+    authoritative hive correctly, but then rebuilt its complete semantic ConfigManager after every
+    native registry call. Besides dominating boot time, replacement discarded live devnode property
+    bags and registered device-interface state that are not reconstructed from the five imported
+    SYSTEM subtrees.
+
+    Mutation commit now validates the complete journal against the candidate hive first, then
+    atomically projects only the selected control set's Services, ServiceGroupOrder, Enum, Class,
+    and Network changes into a cloned compact CM registry. The old unconditional
+    `config_manager_from_system_hive` assignment is deleted. Enum changes refresh the semantic
+    devnode index while retaining matching identities, property bags, and interfaces. Inactive
+    control sets and unrelated SYSTEM branches remain authoritative in the mounted hive but do not
+    enter CM's derived model. A real `Select\\Current` change deliberately constructs the newly
+    selected semantic view; it is the only runtime mutation path that replaces the complete view.
+
+    Atomic projection failures reject publication instead of exposing a partially updated CM
+    registry or invoking a behavioral fallback. Server regressions prove selected/physical alias
+    handling, exclusion of inactive and non-semantic branches, live service metadata updates, Enum
+    refresh, and preservation of a runtime devnode property plus registered interface. CM manager
+    `29/29`, client `15/15`, and server `16/16` tests are green. The serialized acceptance after the
+    hive transaction reached genuine userinit and Explorer, painted all 480000 framebuffer pixels,
+    passed all `295/295` executive gates, and matched the sentinel. Review adjustment: correctness
+    is accepted; retain the atomic incremental projection while closing its remaining registry-copy
+    cost with the transaction below.
+
+    Hive-local undo transaction (2026-08-27, accepted; registry performance follow-up below): the
+    first serialized measurement proved the remaining full-hive clone was still material. At 56 s,
+    `NtCreateKey` averaged about 25 ms and `NtSetValueKey` about 45 ms; by 86 s the latter had grown
+    to about 93 ms as the live hive expanded. The diagnostic run was stopped after 147 s rather than
+    treating a three-to-sixfold improvement as acceptance.
+
+    `nt-hive-core` now owns a bounded `HiveTransaction`. It snapshots only pre-existing cells before
+    their first mutation and records cell-arena, immutable-value-blob, identity, sequence, and dirty
+    watermarks. New cells/blobs disappear by arena truncation and touched cells are restored exactly
+    when an uncommitted transaction drops. Create, typed set/delete, leaf-key delete, class, and
+    security mutations all use this primitive. A successful CM commit explicitly commits the hive
+    transaction only after the selected control set validates and the atomic semantic-registry
+    projection is ready; any hive or projection error therefore restores both authorities without a
+    whole-hive clone or behavioral fallback. A real selected-control-set change builds its complete
+    semantic view from the transaction's temporary state before publication.
+
+    Exact-image rollback tests cover mixed create/replace/delete/class/security changes together
+    with arena lengths, cell identity, sequence, and dirty state; a separate commit test proves all
+    mutations publish. `nt-hive-core` library `78/78` and generator `14/14` tests pass, CM server
+    remains `16/16`, and the client's streamed atomic mutation/rollback test passes. The serialized
+    run `.tmp/run-desktop-cm-undo-transaction-20260827.log` reached genuine userinit and Explorer,
+    reported `begin/end=5/20`, 187 direct GDI returns, 135 batch flushes covering 184 records, and
+    480000/480000 non-background framebuffer pixels with at least 32 distinct colors. All `295/295`
+    executive gates passed and the sentinel matched. Native `NtCreateKey`/`NtSetValueKey` fell to
+    roughly 5-9 ms per call, proving the hive clone was removed but also isolating the compact
+    semantic-registry clone as the remaining per-commit cost.
+
+    Registry-local undo transaction (2026-08-27, accepted): `nt-config-manager::Registry` no longer
+    implements `Clone`. It now exposes a bounded
+    `RegistryTransaction` that snapshots each touched pre-existing key record once, removes newly
+    allocated records, restores deleted records in stable ID order, and restores key-ID/generation
+    allocators on rollback. Its public mutation surface covers create, typed values, volatility,
+    value deletion, and leaf or recursive key deletion; read-only projection queries remain
+    available without exposing an unjournaled mutable registry reference.
+
+    CM now stages the selected-control-set semantic projection directly through this transaction
+    alongside the hive transaction. Both are prepared before either is committed, and no fallible
+    operation remains between their commits. The old complete compact-registry clone and assignment
+    are deleted. Manager rollback/commit regressions pass with the complete `31/31` manager suite,
+    and the server remains `16/16`. Serialized proof
+    `.tmp/run-desktop-cm-registry-transaction-20260827.log` reached genuine Explorer, painted
+    480000/480000 framebuffer pixels with at least 32 colors, passed all `295/295` executive gates,
+    and matched the sentinel. Native `NtCreateKey` fell to about 0.50 ms and `NtSetValueKey` to
+    about 0.36 ms, closing both complete per-mutation clones.
+
+    VSpace lifetime correction (2026-08-27, microkernel accepted; desktop validation pending): a
+    serialized acceptance run exposed an executive heap fault at the first page of a later 2 MiB
+    heap window. Service and diagnostic VSpaces were first corrected to assign an ASID before any
+    paging map; this closed real ASID-zero teardown ambiguity but a repeated run still lost the
+    exact same executive heap window. Permanent root paging/frame caps were then moved into an
+    explicitly pinned root-cap bank, every heap retype/map became checked, and every heap page was
+    touched immediately. The fault still reproduced with no attempted deletion of a pinned cap,
+    ruling out the executive slot recycler.
+
+    Every production, diagnostic, standalone-component, rootserver-demo, and SURT-demo VSpace
+    constructor now assigns an ASID before its first paging map. The executive has one required
+    helper and no bypass switch or continue-on-error branch. `sel4-rt` exposes the same operation as
+    a real `Call`, so standalone constructors also stop on failure instead of treating a send-only
+    attempt as success. rust-micro rejects both paging-structure and frame maps through an explicit
+    unassigned PML4 cap; its focused spec proves rejection leaves the invoked cap unmapped.
+
+    rust-micro commit `77d5804` is pushed. `build_kernel.sh` completed, the new
+    `paging maps reject an unassigned explicit VSpace` spec passed, every kernel spec passed, the
+    isolated rootserver child executed in its assigned VSpace, and QEMU exited through the MCS
+    proof. The adjacent file-cleanup lifecycle now also returns immediately for repeated cleanup
+    starters, leaving the first accepted caller as the sole owner of endpoint-index retirement and
+    hosted FILE_OBJECT release. Review adjustment: run the freestanding executive checks and one
+    serialized full boot next; accept the runtime SYSTEM checkpoint only if the CM transaction gate,
+    profile/PnP/networking consumers, genuine Explorer framebuffer proof, all executive checks, and
+    sentinel pass without a rootserver heap fault or duplicate cleanup release.
+
+    Paging teardown identity correction (2026-08-27, microkernel accepted; desktop validation
+    pending): the decisive kernel audit found that PT/PD/PDPT Map installed a live hardware parent
+    entry but retained ASID zero in the invoked cap. Their Unmap only cleared cap metadata, while
+    CNode Delete/Revoke could clear the CTE, return its 4 KiB physical page to the parent Untyped,
+    and later retype/zero that page even though hardware still referenced it. A reused leaf-table
+    page precisely explains an entire 2 MiB heap window disappearing.
+
+    Paging-structure Map now records the destination VSpace ASID. Unmap, Delete, recursive CNode
+    destruction, and Revoke preflight the exact `(ASID, virtual range, physical page)` parent entry,
+    detach it before clearing ownership metadata, and flush the complete affected VSpace locally
+    and on remote CPUs. Any inconsistent mapped paging cap fails before a CTE or Untyped edge is
+    changed. Frame teardown now applies the same physical-identity check for 4 KiB, 2 MiB, and 1 GiB
+    leaves, so a stale frame cap cannot erase a replacement mapping at the same virtual address.
+    The obsolete spec-only ASID-zero PageTable roundtrip was removed; the replacement spec builds a
+    real assigned PML4 hierarchy and proves Map persists the ASID, mismatch Unmap is atomic, and
+    exact Unmap removes the hardware PDE. Focused stale-identity tests cover every paging level and
+    frame size. rust-micro commit `d1e1de5` is pushed; `build_kernel.sh` and every kernel spec pass.
+
+    Review adjustment: rebuild the parent against `d1e1de5`, rerun the freestanding executive
+    checks, and execute one serialized full desktop acceptance. Require the executive heap to pass
+    its former `HEAP_BASE + 4 MiB` failure point, zero pinned-cap delete refusals, CM-first runtime
+    mutation proof, genuine profile/PnP/networking consumers, Explorer framebuffer proof, all
+    executive gates, and the sentinel before accepting the combined checkpoint.
+
+    CNode Move ownership correction (2026-08-27, microkernel accepted; desktop validation pending):
+    the cap-bank audit found that rust-micro's `CNodeMove` transferred only the capability payload.
+    It left the source CTE's MDB parent behind and did not install that parent on the destination.
+    Reusing a moved-from root slot could therefore retain a stale derivation edge; later revoke of
+    the old parent could delete the unrelated replacement cap while failing to follow ownership to
+    the moved capability.
+
+    Move now snapshots and transfers the source capability and MDB parent as one ownership record,
+    then clears both fields in the source CTE. Child counts remain attached to the same derivation
+    edge and therefore do not change during relocation. The focused spec moves a derived endpoint,
+    reuses the source slot for an unrelated root cap, revokes the original parent, and proves the
+    reused cap survives while the moved child is removed. `build_kernel.sh` and every kernel spec
+    pass; rust-micro commit `a39857d` is pushed. The parent now points at this commit. Remaining
+    microkernel capability work stays explicit: audit Rotate, non-frame IPC cap-transfer mapping
+    teardown, and live-ASID exhaustion as separate correctness changes rather than bundling them
+    into the desktop blocker.
+
+    Exact I/O durable ownership (2026-08-27, accepted): persistent I/O store growth and live record
+    acquisition now have separate ownership signals. File and IRP insertion records an acquisition
+    epoch; removal before the service-loop barrier cancels only the matching epoch, while live
+    driver, device, file, IRP, and hosted-domain records keep their storage pinned. Reused slots and
+    queue pushes that do not grow backing capacity no longer pin the executive heap. `nt-io-manager`
+    passes `196/196`; serialized proof `.tmp/run-desktop-io-durable-epochs-20260827.log` passed all
+    `295/295` gates, rendered the complete Explorer framebuffer, and matched the sentinel.
+
+    Allocator accounting correction (2026-08-27, implementation green; one unrelated gate remains
+    open): `reset_to` can no longer raise the bump cursor after normal deallocation already lowered
+    it. Runtime census now separates bump watermark, allocated bytes, reusable bytes, largest hole,
+    and top-contiguous space. The serialized measurement
+    `.tmp/run-desktop-allocator-usage-20260827.log` reached genuine Explorer and painted
+    480000/480000 pixels. Its final watermark was 14924320 B, with 14457224 B allocated and 2319928
+    B reusable (1852832 B contiguous at the top). The sentinel matched, but the run passed `294/295`:
+    the historical modal-paint-prefix counter reported one error even though the real dialog-paint
+    and Explorer chrome gates passed. Do not accept or suppress that discrepancy; rerun after the
+    retained-storage changes and investigate it if it repeats.
+
+    Retained immutable storage cleanup (2026-08-27, accepted): `nt-fs::MemFs` now atomically
+    compacts orphaned immutable blobs and remaps every live
+    extent only after allocation and validation succeed. Snapshot bytes are identical before and
+    after compaction, and a no-op compaction does not replace storage. `nt-fs` passes `65/65`.
+    Executive checkpoints compact only after a new durable volume snapshot commits and after
+    snapshot scratch is rewound; successful replacement storage is then included in the durable
+    allocator boundary. The live handler also takes and drops the composed encoded SYSTEM image
+    after isolated CM imports it and the executive decodes it, removing a permanent transport copy
+    without changing either registry authority.
+
+    `nt-hive-core::Hive::compact_value_blobs` similarly builds and validates a complete old-to-new
+    payload map before publication, preserves stable `CellId`s, shared `Rc` payload identity,
+    generation, sequence, dirty state, and exact encoded image bytes, and is unavailable while a
+    `HiveTransaction` owns the hive. The library passes `80/80` and the generator `14/14`. Wire this
+    primitive only at successful full-hive checkpoints or an explicit bounded mutation threshold;
+    never compact inside an undo transaction.
+
+    Serialized proof `.tmp/run-desktop-storage-compaction-20260827.log` released 275868 encoded
+    SYSTEM transport bytes, committed five writable-volume snapshot generations, compacted blobs
+    from 3345 to 3302 and later 3352 to 3328 while preserving snapshot-backed boot state, and
+    reduced final allocated executive heap from 14457224 B in the preceding measurement to
+    14169728 B. Genuine userinit and Explorer launched; Explorer produced 187 direct GDI returns,
+    135 batch flushes covering 184 records, and 480000/480000 non-background pixels with at least
+    32 colors. The modal-paint-prefix gate passed on this rerun, all `295/295` executive gates
+    passed, and the sentinel matched.
+
+    Review adjustment: restore real full primary-hive checkpoints next (primary replace before log
+    truncate), fix generation publication on image-write failure, and compact value blobs only at
+    that committed boundary. Bound outstanding CM hive-key transfer snapshots without invalidating
+    valid readers. After that, split the executive allocator into explicit durable and per-dispatch
+    scratch arenas so temporary capture, path, CM encoding, and journal buffers cannot fragment
+    durable contiguous headroom. The larger architectural closure remains moving native SYSTEM
+    handles and persistence into CM so the executive mirror and split-brain post-CM projection can
+    be deleted rather than maintained indefinitely.
