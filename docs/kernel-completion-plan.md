@@ -13049,3 +13049,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     waits, debug reporter blocks, synchronous/pending File continuations, and LPC/CSR rendezvous
     records must either retain a complete immutable fault reply or prove that they never outlive the
     authoritative receive context. No 18-word wake may source register words from ambient IPC state.
+
+    CM read-ownership desktop acceptance (2026-08-27, accepted): the clean serialized run in
+    `.tmp/run-desktop-full-waiter-context-20260827.log` mounted isolated CM's composed SYSTEM hive at
+    generation 1, resolved the registry-backed network setup at that generation, and completed all
+    five selected PnP starts without failure or indeterminate state. The former LSA/IOCP stall did
+    not recur.
+
+    Real winlogon launched userinit through `CreateProcessAsUserW`; userinit opened and launched
+    Explorer; Explorer installed 18 client WndProcs, completed 669 real api0 callbacks without a
+    callback failure, and flushed 184 GDI batch records. The final 800x600 framebuffer contained
+    480,000 non-background pixels with at least 32 distinct colors. All `293/293` executive checks
+    passed and the microtest sentinel was observed.
+
+    Review adjustment: CM read ownership and its desktop acceptance are closed. Keep the global
+    parked-continuation audit next because GUI message waiting is exercised by the accepted shell and
+    still stores a resume triple. Migrate every genuinely asynchronous hosted syscall continuation
+    to the shared full-register value, deleting redundant reply arrays/triples where possible. Then
+    consolidate immutable snapshot-bank server mechanics before beginning CM mutation leases and
+    the explicit win32k CM transport.
