@@ -59,7 +59,7 @@ pub use config_import::{
 pub use hive::{
     compose_hive_overlay, compose_system_hive_overlay, CellId, CurrentControlSet,
     CurrentControlSetError, DeleteKeyError, Hive, HiveId, HiveKind, HiveMountTable,
-    HiveOverlayError, MutableHiveSet, RegistryValueCopyProvenance,
+    HiveOverlayError, HiveTransaction, MutableHiveSet, RegistryValueCopyProvenance,
     RegistryValueCopyProvenanceTable, RegistryValueType, ResolvedHiveKey, ResolvedHiveValue,
     SYSTEM_HIVE_PATH,
 };

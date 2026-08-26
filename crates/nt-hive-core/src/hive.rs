@@ -131,6 +131,139 @@ pub struct Hive {
     pub(crate) clean_sequence: u64,
 }
 
+/// A bounded undo transaction over one hive.
+///
+/// Only cells that existed before the transaction and are about to be modified are cloned. New
+/// cells and value blobs are discarded by truncating their arenas to the captured watermarks.
+/// Dropping an uncommitted transaction restores the exact pre-transaction hive state.
+pub struct HiveTransaction<'a> {
+    hive: &'a mut Hive,
+    original_cells_len: usize,
+    original_value_blobs_len: usize,
+    original_next_id: u64,
+    original_generation: u64,
+    original_sequence: u64,
+    original_clean_sequence: u64,
+    original_cells: Vec<(usize, Option<Cell>)>,
+    committed: bool,
+}
+
+impl HiveTransaction<'_> {
+    fn snapshot_cell(&mut self, id: CellId) {
+        let index = id.0 as usize;
+        if index >= self.original_cells_len
+            || self
+                .original_cells
+                .iter()
+                .any(|(saved_index, _)| *saved_index == index)
+        {
+            return;
+        }
+        self.original_cells
+            .push((index, self.hive.cells[index].clone()));
+    }
+
+    pub fn hive(&self) -> &Hive {
+        self.hive
+    }
+
+    pub fn current_control_set(&self) -> Result<CurrentControlSet, CurrentControlSetError> {
+        self.hive.current_control_set()
+    }
+
+    pub fn open_key(&self, rel_path: &str) -> Option<CellId> {
+        self.hive.open_key(rel_path)
+    }
+
+    pub fn create_key(&mut self, rel_path: &str) -> CellId {
+        let mut current = self.hive.root;
+        for component in Hive::components(rel_path) {
+            if let Some(child) = self.hive.open_subkey(current, component) {
+                current = child;
+                continue;
+            }
+            self.snapshot_cell(current);
+            current = self.hive.create_subkey(current, component);
+        }
+        current
+    }
+
+    pub fn set_key_class(&mut self, key: CellId, class_name: Option<&str>) -> bool {
+        self.snapshot_cell(key);
+        self.hive.set_key_class(key, class_name)
+    }
+
+    pub fn set_key_security_descriptor(&mut self, key: CellId, descriptor: &[u8]) -> bool {
+        self.snapshot_cell(key);
+        self.hive.set_key_security_descriptor(key, descriptor)
+    }
+
+    pub fn set_value(
+        &mut self,
+        key: CellId,
+        name: &str,
+        value_type: RegistryValueType,
+        data: Vec<u8>,
+    ) -> bool {
+        self.snapshot_cell(key);
+        if let Some(value) = self.hive.value_id_by_name(key, name) {
+            self.snapshot_cell(value);
+        }
+        self.hive.set_value(key, name, value_type, data)
+    }
+
+    pub fn delete_value(&mut self, key: CellId, name: &str) -> bool {
+        self.snapshot_cell(key);
+        if let Some(value) = self.hive.value_id_by_name(key, name) {
+            self.snapshot_cell(value);
+        }
+        self.hive.delete_value(key, name)
+    }
+
+    pub fn delete_key(&mut self, key: CellId) -> Result<(), DeleteKeyError> {
+        if let Some((parent, values)) = self
+            .hive
+            .key(key)
+            .map(|cell| (cell.parent, cell.values.clone()))
+        {
+            if let Some(parent) = parent {
+                self.snapshot_cell(parent);
+            }
+            self.snapshot_cell(key);
+            for value in values {
+                self.snapshot_cell(value);
+            }
+        }
+        self.hive.delete_key(key)
+    }
+
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+
+    fn rollback(&mut self) {
+        self.hive.cells.truncate(self.original_cells_len);
+        for (index, cell) in self.original_cells.drain(..) {
+            self.hive.cells[index] = cell;
+        }
+        self.hive
+            .value_blobs
+            .truncate(self.original_value_blobs_len);
+        self.hive.next_id = self.original_next_id;
+        self.hive.generation = self.original_generation;
+        self.hive.sequence = self.original_sequence;
+        self.hive.clean_sequence = self.original_clean_sequence;
+    }
+}
+
+impl Drop for HiveTransaction<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.rollback();
+        }
+    }
+}
+
 /// Compose an additive setup/configuration overlay onto an already-replayed hive.
 ///
 /// Existing destination keys and values are matched case-insensitively. Values present in the
@@ -287,6 +420,20 @@ impl Hive {
 
     pub fn root(&self) -> CellId {
         self.root
+    }
+
+    pub fn begin_transaction(&mut self) -> HiveTransaction<'_> {
+        HiveTransaction {
+            original_cells_len: self.cells.len(),
+            original_value_blobs_len: self.value_blobs.len(),
+            original_next_id: self.next_id,
+            original_generation: self.generation,
+            original_sequence: self.sequence,
+            original_clean_sequence: self.clean_sequence,
+            hive: self,
+            original_cells: Vec::new(),
+            committed: false,
+        }
     }
 
     /// Resolve the boot-selected control set from `Select\\Current` without a default.

@@ -461,6 +461,85 @@ fn hive_delete_key_removes_only_leaf_keys() {
 }
 
 #[test]
+fn hive_transaction_drop_restores_touched_cells_and_arena_watermarks() {
+    let mut hive = mountable_system_hive();
+    let stable = hive.create_key(r"ControlSet001\Services\Stable");
+    assert!(hive.set_value(
+        stable,
+        "ImagePath",
+        RegistryValueType::ExpandSz,
+        b"stable".to_vec(),
+    ));
+    assert!(hive.set_value(
+        stable,
+        "DeleteMe",
+        RegistryValueType::Binary,
+        b"delete".to_vec(),
+    ));
+    assert!(hive.set_key_class(stable, Some("original class")));
+    assert!(hive.set_key_security_descriptor(stable, b"original security"));
+    let removed = hive.create_key(r"ControlSet001\Services\Removed");
+    assert!(hive.set_dword(removed, "Start", 3));
+    hive.finish_clean_import();
+
+    let image = encode_image(&hive);
+    let cells_len = hive.cells.len();
+    let value_blobs_len = hive.value_blobs.len();
+    let next_id = hive.next_id;
+    let sequence = hive.sequence;
+    let clean_sequence = hive.clean_sequence;
+    {
+        let mut transaction = hive.begin_transaction();
+        let created = transaction.create_key(r"ControlSet001\Services\Created");
+        assert!(transaction.set_value(
+            created,
+            "Start",
+            RegistryValueType::Dword,
+            2u32.to_le_bytes().to_vec(),
+        ));
+        assert!(transaction.set_value(
+            stable,
+            "ImagePath",
+            RegistryValueType::ExpandSz,
+            b"replacement".to_vec(),
+        ));
+        assert!(transaction.delete_value(stable, "DeleteMe"));
+        assert!(transaction.set_key_class(stable, Some("replacement class")));
+        assert!(transaction.set_key_security_descriptor(stable, b"replacement security"));
+        assert_eq!(transaction.delete_key(removed), Ok(()));
+    }
+
+    assert_eq!(encode_image(&hive), image);
+    assert_eq!(hive.cells.len(), cells_len);
+    assert_eq!(hive.value_blobs.len(), value_blobs_len);
+    assert_eq!(hive.next_id, next_id);
+    assert_eq!(hive.sequence, sequence);
+    assert_eq!(hive.clean_sequence, clean_sequence);
+    assert_eq!(hive.dirty_count(), 0);
+}
+
+#[test]
+fn hive_transaction_commit_publishes_all_mutations() {
+    let mut hive = mountable_system_hive();
+    hive.finish_clean_import();
+    {
+        let mut transaction = hive.begin_transaction();
+        let service = transaction.create_key(r"ControlSet001\Services\Committed");
+        assert!(transaction.set_value(
+            service,
+            "Start",
+            RegistryValueType::Dword,
+            3u32.to_le_bytes().to_vec(),
+        ));
+        transaction.commit();
+    }
+
+    let service = hive.open_key(r"ControlSet001\Services\Committed").unwrap();
+    assert_eq!(hive.query_dword(service, "Start"), Some(3));
+    assert!(hive.dirty_count() > 0);
+}
+
+#[test]
 fn mount_table_currentcontrolset_resolver() {
     let mut mt = HiveMountTable::new();
     let mut system = mountable_system_hive();

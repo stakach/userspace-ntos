@@ -47,7 +47,7 @@ use nt_config_manager::{
 };
 use nt_hive_core::{
     collect_reactos_network_adapter_bindings, decode_image, CurrentControlSet, Hive, HiveKind,
-    ReactOsNetworkAdapterBinding,
+    HiveTransaction, ReactOsNetworkAdapterBinding,
 };
 
 const STATUS_SUCCESS: i32 = 0;
@@ -212,7 +212,7 @@ fn config_manager_from_system_hive(
 }
 
 fn apply_system_hive_mutation(
-    hive: &mut Hive,
+    transaction: &mut HiveTransaction<'_>,
     current_control_set: &CurrentControlSet,
     mutation: &HiveMutation,
 ) -> Result<(), i32> {
@@ -221,7 +221,7 @@ fn apply_system_hive_mutation(
     };
     match mutation {
         HiveMutation::CreateKey { path } => {
-            hive.create_key(&relative(&path)?);
+            transaction.create_key(&relative(&path)?);
             Ok(())
         }
         HiveMutation::SetValue {
@@ -232,44 +232,48 @@ fn apply_system_hive_mutation(
         } => {
             let value_type =
                 RegistryValueType::from_u32(*value_type).ok_or(STATUS_INVALID_PARAMETER)?;
-            let key = hive
+            let key = transaction
                 .open_key(&relative(&path)?)
                 .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
-            hive.set_value(key, name, value_type, data.clone())
+            transaction
+                .set_value(key, name, value_type, data.clone())
                 .then_some(())
                 .ok_or(STATUS_INVALID_PARAMETER)
         }
         HiveMutation::DeleteValue { path, name } => {
-            let key = hive
+            let key = transaction
                 .open_key(&relative(&path)?)
                 .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
-            hive.delete_value(key, name)
+            transaction
+                .delete_value(key, name)
                 .then_some(())
                 .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)
         }
         HiveMutation::DeleteKey { path } => {
-            let key = hive
+            let key = transaction
                 .open_key(&relative(&path)?)
                 .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
-            match hive.delete_key(key) {
+            match transaction.delete_key(key) {
                 Ok(()) => Ok(()),
                 Err(nt_hive_core::DeleteKeyError::NotFound) => Err(STATUS_OBJECT_NAME_NOT_FOUND),
                 Err(nt_hive_core::DeleteKeyError::CannotDelete) => Err(STATUS_CANNOT_DELETE),
             }
         }
         HiveMutation::SetKeyClass { path, class_name } => {
-            let key = hive
+            let key = transaction
                 .open_key(&relative(&path)?)
                 .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
-            hive.set_key_class(key, class_name.as_deref())
+            transaction
+                .set_key_class(key, class_name.as_deref())
                 .then_some(())
                 .ok_or(STATUS_INVALID_PARAMETER)
         }
         HiveMutation::SetKeySecurity { path, descriptor } => {
-            let key = hive
+            let key = transaction
                 .open_key(&relative(&path)?)
                 .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
-            hive.set_key_security_descriptor(key, descriptor)
+            transaction
+                .set_key_security_descriptor(key, descriptor)
                 .then_some(())
                 .ok_or(STATUS_INVALID_PARAMETER)
         }
@@ -1192,38 +1196,32 @@ impl CmServer {
         mutations: &[HiveMutation],
         next_generation: u64,
     ) -> Result<(), i32> {
-        let (candidate, previous_control_set, current_control_set) = {
-            let mounted = self.system_hive.as_ref().ok_or(STATUS_DEVICE_NOT_READY)?;
-            let mut candidate = mounted.hive.clone();
-            for mutation in mutations {
-                apply_system_hive_mutation(&mut candidate, &mounted.current_control_set, mutation)?;
-            }
-            let current_control_set = candidate
-                .current_control_set()
-                .map_err(|_| STATUS_REGISTRY_CORRUPT)?;
-            (
-                candidate,
-                mounted.current_control_set.clone(),
-                current_control_set,
-            )
-        };
+        let mounted = self.system_hive.as_mut().ok_or(STATUS_DEVICE_NOT_READY)?;
+        let previous_control_set = mounted.current_control_set.clone();
+        let mut transaction = mounted.hive.begin_transaction();
+        for mutation in mutations {
+            apply_system_hive_mutation(&mut transaction, &previous_control_set, mutation)?;
+        }
+        let current_control_set = transaction
+            .current_control_set()
+            .map_err(|_| STATUS_REGISTRY_CORRUPT)?;
 
         if previous_control_set == current_control_set {
             let mut registry = self.cm.registry().clone();
             let enum_changed =
                 project_system_hive_mutations(&mut registry, &current_control_set, mutations)?;
+            transaction.commit();
             *self.cm.registry_mut() = registry;
             if enum_changed {
                 self.cm.refresh_registry_devnodes();
             }
         } else {
-            self.cm = config_manager_from_system_hive(&candidate, &current_control_set);
+            let cm = config_manager_from_system_hive(transaction.hive(), &current_control_set);
+            transaction.commit();
+            self.cm = cm;
         }
-        self.system_hive = Some(MountedSystemHive {
-            hive: candidate,
-            generation: next_generation,
-            current_control_set,
-        });
+        mounted.generation = next_generation;
+        mounted.current_control_set = current_control_set;
         Ok(())
     }
 
