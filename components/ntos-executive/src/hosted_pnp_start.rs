@@ -449,30 +449,12 @@ unsafe fn start_one_devnode<H, C>(
                         &grant.raw_resource_list,
                         &grant.translated_resource_list,
                     ) {
-                        Ok(()) => {
-                            if driver_launch::hosted_device_video_port_initialized(device_id) {
-                                match driver_launch::start_hosted_video_device(
-                                    device_id,
-                                    &grant.raw_resource_list,
-                                    &grant.translated_resource_list,
-                                    grant.pci_interrupt_line,
-                                ) {
-                                    Ok(()) => Ok(()),
-                                    Err(status) => Err(rollback_pre_dispatch_start(
-                                        device_id,
-                                        grant.pci_interrupt_line,
-                                        status,
-                                    )),
-                                }
-                            } else {
-                                canonical_start_status(
-                                    device_id,
-                                    &grant.raw_resource_list,
-                                    &grant.translated_resource_list,
-                                    grant.pci_interrupt_line,
-                                )
-                            }
-                        }
+                        Ok(()) => canonical_start_status(
+                            device_id,
+                            &grant.raw_resource_list,
+                            &grant.translated_resource_list,
+                            grant.pci_interrupt_line,
+                        ),
                         Err(status) => Err(rollback_pre_dispatch_start(
                             device_id,
                             grant.pci_interrupt_line,
@@ -486,23 +468,7 @@ unsafe fn start_one_devnode<H, C>(
                         &[],
                         &[],
                     ) {
-                        Ok(()) => {
-                            if driver_launch::hosted_device_video_port_initialized(device_id) {
-                                match driver_launch::start_hosted_video_device(
-                                    device_id,
-                                    &[],
-                                    &[],
-                                    None,
-                                ) {
-                                    Ok(()) => Ok(()),
-                                    Err(status) => Err(rollback_pre_dispatch_start(
-                                        device_id, None, status,
-                                    )),
-                                }
-                            } else {
-                                canonical_start_status(device_id, &[], &[], None)
-                            }
-                        }
+                        Ok(()) => canonical_start_status(device_id, &[], &[], None),
                         Err(status) => {
                             Err(rollback_pre_dispatch_start(device_id, None, status))
                         }

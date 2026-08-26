@@ -34500,11 +34500,15 @@ impl DriverDispatchBackend for HostedDriverBackend {
                 status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
             };
         };
-        // Video devices still use the explicit videoprt startup path. The generic video
-        // CREATE/IOCTL adapter does not constitute a PnP stack and must not synthesize a return.
         if unsafe { hosted_instance_video_port_initialized(binding_instance) } {
-            return PnpBackendDispatch::NotDispatched {
-                status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            return unsafe {
+                dispatch_video_pnp_irp_for_instance(
+                    binding.instance,
+                    binding_instance,
+                    binding,
+                    irp,
+                    ctx.system_buffer,
+                )
             };
         }
         let mut output = [];
@@ -42921,13 +42925,67 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
     Ok(())
 }
 
-unsafe fn dispatch_video_find_adapter_for_instance(
+unsafe fn dispatch_video_pnp_irp_for_instance(
     index: usize,
     inst: DriverInstance,
-) -> Result<u32, nt_status::NtStatus> {
+    binding: HostedDeviceBinding,
+    irp: &IrpProjection,
+    system_buffer: &[u8],
+) -> PnpBackendDispatch {
+    let IoParameters::Pnp(parameters) = &irp.parameters else {
+        return PnpBackendDispatch::NotDispatched {
+            status: nt_status::NtStatus::INVALID_PARAMETER,
+        };
+    };
+    let Some(start) = parameters.start else {
+        return PnpBackendDispatch::NotDispatched {
+            status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        };
+    };
+    if (start.raw_resource_list_len == 0) != (start.translated_resource_list_len == 0) {
+        return PnpBackendDispatch::NotDispatched {
+            status: nt_status::NtStatus::INVALID_PARAMETER,
+        };
+    }
+    let expected_len = start
+        .raw_resource_list_len
+        .checked_add(start.translated_resource_list_len)
+        .and_then(|len| usize::try_from(len).ok());
+    if irp.minor != IRP_MN_START_DEVICE as u8
+        || parameters.minor != irp.minor
+        || expected_len != Some(system_buffer.len())
+        || !inst.ready
+        || read_volatile((inst.exec_shared_va + SH_VIDEO_PORT_INITIALIZED) as *const u32) == 0
+    {
+        return PnpBackendDispatch::NotDispatched {
+            status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        };
+    }
+
+    let root_status = nt_status::NtStatus(hosted_root_bus_mut().dispatch_pnp(
+        nt_io_manager::DeviceId(binding.pdo_device_id),
+        IRP_MN_START_DEVICE as u8,
+    ));
+    if !root_status.is_success() {
+        return PnpBackendDispatch::Returned {
+            status: root_status,
+            information: 0,
+        };
+    }
+
+    dispatch_video_find_adapter_pnp_for_instance(index, inst, binding.device_id)
+}
+
+unsafe fn dispatch_video_find_adapter_pnp_for_instance(
+    index: usize,
+    inst: DriverInstance,
+    device_id: u64,
+) -> PnpBackendDispatch {
     let sh = inst.exec_shared_va;
     if read_volatile((sh + SH_VIDEO_PORT_INITIALIZED) as *const u32) == 0 {
-        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        return PnpBackendDispatch::Indeterminate {
+            transport_status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        };
     }
     let interface_type = read_volatile((sh + SH_RESOURCE_INTERFACE_TYPE) as *const u32);
     let bus_number = read_volatile((sh + SH_RESOURCE_BUS_NUMBER) as *const u32);
@@ -42947,9 +43005,11 @@ unsafe fn dispatch_video_find_adapter_for_instance(
         0,
     );
     let mut raw = [0u8; VIDEO_PORT_CONFIG_INFO_X64_SIZE];
-    config
-        .write(&mut raw)
-        .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+    if config.write(&mut raw).is_err() {
+        return PnpBackendDispatch::Indeterminate {
+            transport_status: nt_status::NtStatus::INVALID_PARAMETER,
+        };
+    }
     let mut idx = 0usize;
     while idx < raw.len() {
         write_volatile((inst.exec_arg_va + idx as u64) as *mut u8, raw[idx]);
@@ -42971,14 +43031,17 @@ unsafe fn dispatch_video_find_adapter_for_instance(
     write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
     write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
 
+    let Some(exec_window) = ExecVaWindow::try_for_instance(index) else {
+        return PnpBackendDispatch::Indeterminate {
+            transport_status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+        };
+    };
     let ch = crate::spawn_hosts::PumpChannel {
         fault_ep: inst.fault_ep,
         pml4: inst.pml4,
         code_va: 0,
         image_frames: 0,
-        exec_code_va: ExecVaWindow::try_for_instance(index)
-            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?
-            .code_va,
+        exec_code_va: exec_window.code_va,
         root_image_rights: 3,
         root_image_map_owner: inst.map_cap_bank.owner,
         shared_va: sh,
@@ -42999,10 +43062,39 @@ unsafe fn dispatch_video_find_adapter_for_instance(
     let pr = hosted_component_pump(&ch);
     if !pr.completed {
         register_instance_ready(index, false);
-        return Err(nt_status::NtStatus::UNSUCCESSFUL);
+        return PnpBackendDispatch::Indeterminate {
+            transport_status: nt_status::NtStatus::UNSUCCESSFUL,
+        };
     }
-    nt_status::NtStatus(pr.status).to_result()?;
-    Ok(pr.result as u32)
+    let component_status = nt_status::NtStatus(pr.status);
+    if !component_status.is_success() {
+        return PnpBackendDispatch::Returned {
+            status: component_status,
+            information: 0,
+        };
+    }
+    let video_status = pr.result as u32;
+    let again = read_volatile((sh + SH_VIDEO_FIND_ADAPTER_AGAIN) as *const u8);
+    if video_status != VP_NO_ERROR || again != 0 {
+        print_str(b"[driver-launch] hosted video FindAdapter returned device_id=");
+        print_u64(device_id);
+        print_str(b" status=0x");
+        print_hex(video_status);
+        print_str(b" calls=");
+        print_u64(read_volatile(
+            (sh + SH_VIDEO_FIND_ADAPTER_CALLS) as *const u64,
+        ));
+        print_str(b" again=");
+        print_u64(again as u64);
+        print_str(b"\n");
+    }
+    PnpBackendDispatch::Returned {
+        status: match video_port_status(video_status) {
+            Ok(()) => nt_status::NtStatus::SUCCESS,
+            Err(status) => status,
+        },
+        information: 0,
+    }
 }
 
 unsafe fn hosted_instance_video_port_initialized(inst: DriverInstance) -> bool {
@@ -43336,82 +43428,7 @@ pub(crate) unsafe fn rollback_hosted_device_start(
     Ok(())
 }
 
-/// Preserve the existing explicit videoprt startup until videoprt has a canonical PnP backend.
-pub(crate) unsafe fn start_hosted_video_device(
-    device_id: u64,
-    raw_resource_list: &[u8],
-    translated_resource_list: &[u8],
-    pci_interrupt_line: Option<crate::pnp::PciInterruptLineProgramming>,
-) -> Result<(), nt_status::NtStatus> {
-    if raw_resource_list.is_empty() != translated_resource_list.is_empty() {
-        return Err(nt_status::NtStatus::INVALID_PARAMETER);
-    }
-    let binding = hosted_device_binding_by_device_id(device_id)
-        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    let (_, inst) = instance_by_driver_id(binding.driver_id)
-        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
-    if !inst.ready {
-        return Err(nt_status::NtStatus(0xC000_00A3u32 as i32)); // STATUS_DEVICE_NOT_READY
-    }
-    let sh = inst.exec_shared_va;
-    if raw_resource_list.is_empty() {
-        restore_hosted_device_resource_state(binding, sh, false)?;
-    }
-    clear_shared_device_interface_state_at(sh);
-    let video_initialized = read_volatile((sh + SH_VIDEO_PORT_INITIALIZED) as *const u32) != 0;
-    let video_find_adapter = read_volatile((sh + SH_VIDEO_HW_FIND_ADAPTER) as *const u64);
-    let video_initialize = read_volatile((sh + SH_VIDEO_HW_INITIALIZE) as *const u64);
-    let video_start_io = read_volatile((sh + SH_VIDEO_HW_START_IO) as *const u64);
-    if !video_initialized
-        && (video_find_adapter != 0 || video_initialize != 0 || video_start_io != 0)
-    {
-        print_str(b"[driver-launch] hosted video callbacks without initialization device_id=");
-        print_u64(device_id);
-        print_str(b" find=0x");
-        print_hex64(video_find_adapter);
-        print_str(b" init=0x");
-        print_hex64(video_initialize);
-        print_str(b" startio=0x");
-        print_hex64(video_start_io);
-        print_str(b"\n");
-    }
-    if !video_initialized {
-        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-    }
-    let root_status = hosted_root_bus_mut().dispatch_pnp(
-        nt_io_manager::DeviceId(binding.pdo_device_id),
-        IRP_MN_START_DEVICE as u8,
-    );
-    nt_status::NtStatus(root_status).to_result()?;
-    let video_status = dispatch_video_find_adapter_for_instance(binding.instance, inst)?;
-    let again = read_volatile((sh + SH_VIDEO_FIND_ADAPTER_AGAIN) as *const u8);
-    if video_status != VP_NO_ERROR || again != 0 {
-        print_str(b"[driver-launch] hosted video FindAdapter returned device_id=");
-        print_u64(device_id);
-        print_str(b" status=0x");
-        print_hex(video_status);
-        print_str(b" calls=");
-        print_u64(read_volatile(
-            (sh + SH_VIDEO_FIND_ADAPTER_CALLS) as *const u64,
-        ));
-        print_str(b" again=");
-        print_u64(again as u64);
-        print_str(b"\n");
-    }
-    record_hosted_resource_usage(binding, sh)?;
-    video_port_status(video_status)?;
-    apply_hosted_device_interface_state(sh)?;
-    if let Some(state) = hosted_device_resource_states_mut()
-        .iter_mut()
-        .find(|state| state.device_id == binding.device_id)
-    {
-        state.pci_interrupt_line = pci_interrupt_line;
-    }
-    refresh_hosted_device_resource_state(binding, sh);
-    Ok(())
-}
-
-/// Send a canonical `IRP_MN_START_DEVICE` through the complete non-video FDO stack.
+/// Send a canonical `IRP_MN_START_DEVICE` through the complete FDO stack.
 pub(crate) unsafe fn start_hosted_device_canonical(
     device_id: u64,
     raw_resource_list: &[u8],
@@ -43431,9 +43448,6 @@ pub(crate) unsafe fn start_hosted_device_canonical(
         .ok_or_else(|| local_failure(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND))?;
     if !inst.ready {
         return Err(local_failure(nt_status::NtStatus(0xC000_00A3u32 as i32)));
-    }
-    if hosted_instance_video_port_initialized(inst) {
-        return Err(local_failure(nt_status::NtStatus::INVALID_DEVICE_REQUEST));
     }
     let sh = inst.exec_shared_va;
     if raw_resource_list.is_empty() {

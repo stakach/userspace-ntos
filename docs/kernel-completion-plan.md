@@ -2443,6 +2443,35 @@ durable-allocation reporting beyond its completion queues to GenStore growth and
 storage before relying on it for removal transactions. These are mechanism fixes; do not mask a
 corrupt snapshot, drop dirty state, or add a boot recovery fallback.
 
+B3 canonical videoprt START checkpoint (2026-08-26, implementation green): hosted display START no
+longer bypasses the canonical I/O Manager and PnP Manager transaction. The boot orchestrator now
+sends every devnode through the same File-less `IRP_MN_START_DEVICE` preparation, exact stack
+snapshot, generation-bearing lifecycle token, and returned/pending/indeterminate result surface.
+The local videoprt implementation is a typed PnP backend for that outer IRP: it validates START's
+paired raw/translated resource extents before entry, forwards the real lower PDO START, invokes the
+isolated miniport's `HwFindAdapter`, maps the returned `VP_STATUS`, and publishes a genuine backend
+return. A component pump wall after lower-stack entry is retained as `Indeterminate`; it is never
+converted into a driver failure.
+
+The explicit `start_hosted_video_device` authority, both video/non-video boot forks, and the
+canonical dispatch refusals for video have been removed. Resource usage, interface state, PCI line
+ownership, and route publication now occur only through the common terminal START publication path.
+The internal `FSD_DISPATCH_VIDEO_FIND_ADAPTER` operation remains solely as the current local
+videoprt-to-miniport callback mechanism; CREATE/HwInitialize and IOCTL/HwStartIo likewise remain
+live post-start device-I/O mechanisms rather than duplicate lifecycle authority. Formatting and the
+freestanding executive check are green at the established 212-warning baseline. Serialized desktop
+validation is the next gate and must prove bochsmp START through the canonical transaction, route
+publication, genuine Explorer paint, and no retained indeterminate PnP row.
+
+Review adjustment: once that run is accepted, preserve asynchronous START as a first-class boot
+disposition. The current `canonical_start_status` adapter incorrectly flattens `Pending` into
+`STATUS_PENDING` failure and `Indeterminate` into a terminal driver error; demand `NtLoadDriver`
+can consequently unload a driver that still owns its START IRP. Replace the stack-local terminal
+report with exact `IrpId`-keyed pending observations, update boot counters/evidence only after the
+driver-origin completion, lifecycle commit, backend acknowledgement, and post-start publication,
+and retain indeterminate rows as teardown barriers. After that, harden I/O Manager deletion and
+exact detach ordering before wiring query/cancel/stop/remove and adapter-exact callback retirement.
+
 ### A. SCM-Controlled Service Startup
 
 - `[x]` A0: Inventory the current SCM/service startup path and mark the static boundaries still in
