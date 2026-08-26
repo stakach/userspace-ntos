@@ -155,6 +155,22 @@ impl<P> IoManager<P> {
         output_len: u32,
         system_buffer: &mut [u8],
     ) -> Result<ExternalDispatchResult, NtStatus> {
+        match &params {
+            IoParameters::Pnp(parameters) => {
+                let expected_input = parameters.input_len();
+                if major != nt_io_abi::major::IRP_MJ_PNP
+                    || input_len != expected_input
+                    || output_len != 0
+                    || system_buffer.len() != expected_input as usize
+                {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                }
+            }
+            _ if major == nt_io_abi::major::IRP_MJ_PNP => {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            _ => {}
+        }
         if self.driver(driver_id).is_none() {
             return Err(NtStatus::INVALID_PARAMETER);
         }

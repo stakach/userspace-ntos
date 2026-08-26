@@ -18,6 +18,7 @@ object-manager = ["dep:nt-object-manager"]
 nt-status = { workspace = true }
 nt-types = { workspace = true }
 nt-io-abi = { workspace = true }
+nt-pnp-abi = { workspace = true }
 nt-object-manager = { workspace = true, optional = true }
 bitflags = { workspace = true }
 

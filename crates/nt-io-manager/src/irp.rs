@@ -70,6 +70,71 @@ pub struct InformationParameters {
     pub length: u32,
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct PnpStartParameters {
+    pub raw_resource_list_len: u32,
+    pub translated_resource_list_len: u32,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct PnpParameters {
+    pub minor: u8,
+    pub start: Option<PnpStartParameters>,
+}
+
+impl PnpParameters {
+    pub fn lifecycle(minor: u8) -> Result<Self, NtStatus> {
+        if minor == nt_pnp_abi::IRP_MN_START_DEVICE || !Self::is_lifecycle_minor(minor) {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(Self { minor, start: None })
+    }
+
+    pub fn start(
+        raw_resource_list_len: u32,
+        translated_resource_list_len: u32,
+    ) -> Result<Self, NtStatus> {
+        if (raw_resource_list_len == 0) != (translated_resource_list_len == 0)
+            || raw_resource_list_len
+                .checked_add(translated_resource_list_len)
+                .is_none()
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(Self {
+            minor: nt_pnp_abi::IRP_MN_START_DEVICE,
+            start: Some(PnpStartParameters {
+                raw_resource_list_len,
+                translated_resource_list_len,
+            }),
+        })
+    }
+
+    pub fn input_len(self) -> u32 {
+        self.start
+            .map(|start| {
+                start
+                    .raw_resource_list_len
+                    .checked_add(start.translated_resource_list_len)
+                    .expect("validated PnP START extents overflowed")
+            })
+            .unwrap_or(0)
+    }
+
+    fn is_lifecycle_minor(minor: u8) -> bool {
+        matches!(
+            minor,
+            nt_pnp_abi::IRP_MN_QUERY_REMOVE_DEVICE
+                | nt_pnp_abi::IRP_MN_REMOVE_DEVICE
+                | nt_pnp_abi::IRP_MN_CANCEL_REMOVE_DEVICE
+                | nt_pnp_abi::IRP_MN_STOP_DEVICE
+                | nt_pnp_abi::IRP_MN_QUERY_STOP_DEVICE
+                | nt_pnp_abi::IRP_MN_CANCEL_STOP_DEVICE
+                | nt_pnp_abi::IRP_MN_SURPRISE_REMOVAL
+        )
+    }
+}
+
 /// The per-major parameter payload of an I/O stack location (spec §13.3). Only
 /// the v0.1 variants are functional; the rest route to `STATUS_NOT_SUPPORTED`.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -84,7 +149,7 @@ pub enum IoParameters {
     FlushBuffers,
     QueryInformation(InformationParameters),
     SetInformation(InformationParameters),
-    Pnp,
+    Pnp(PnpParameters),
     Power,
     #[default]
     Unsupported,
@@ -103,6 +168,7 @@ impl IoParameters {
             }
             IoParameters::QueryInformation(p) => (0, p.length.min(cap)),
             IoParameters::SetInformation(p) => (p.length.min(cap), 0),
+            IoParameters::Pnp(p) => (p.input_len().min(cap), 0),
             _ => (0, 0),
         }
     }

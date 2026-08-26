@@ -94,12 +94,23 @@ fn build_dispatch_request(
         &mut cursor,
         ctx.user_buffer.as_ref().map(|b| b.len()).unwrap_or(0),
     )?;
-    let (ioctl_code, input_len, output_len) = match &irp.parameters {
+    let (ioctl_code, input_len, output_len, parameter_offset, parameter_len) = match &irp.parameters
+    {
         crate::irp::IoParameters::DeviceControl(p)
         | crate::irp::IoParameters::InternalDeviceControl(p) => {
-            (p.ioctl_code, p.input_len, p.output_len)
+            (p.ioctl_code, p.input_len, p.output_len, 0, 0)
         }
-        _ => (0, 0, 0),
+        crate::irp::IoParameters::Pnp(p) => match p.start {
+            Some(start) => (
+                0,
+                p.input_len(),
+                0,
+                start.raw_resource_list_len,
+                start.translated_resource_list_len,
+            ),
+            None => (0, 0, 0, 0, 0),
+        },
+        _ => (0, 0, 0, 0, 0),
     };
     Ok(IrpDispatchRequest {
         abi_version: IO_ABI_VERSION as u16,
@@ -131,8 +142,8 @@ fn build_dispatch_request(
         input_len,
         output_len,
         ioctl_code,
-        parameter_offset: 0,
-        parameter_len: 0,
+        parameter_offset,
+        parameter_len,
         stack_location: irp.stack_location as u32,
         stack_count: irp.stack_count as u32,
     })

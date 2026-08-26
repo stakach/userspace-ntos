@@ -31357,6 +31357,12 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         }
         return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
     }
+    if major == IRP_MJ_PNP {
+        write_unaligned(
+            (irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *mut i32,
+            STATUS_NOT_SUPPORTED,
+        );
+    }
     let read_completion = pending_irp_returns_read_bytes(major, fsctl, outlen);
     let completion_source_kind = if !(major == IRP_MJ_FILE_SYSTEM_CONTROL
         && fsctl == FSCTL_PIPE_TRANSCEIVE)
@@ -34198,6 +34204,18 @@ fn hosted_irp_dispatch_request(
     {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
+    let (parameter_offset, parameter_len) = match &irp.parameters {
+        IoParameters::Pnp(parameters) => parameters
+            .start
+            .map(|start| {
+                (
+                    start.raw_resource_list_len,
+                    start.translated_resource_list_len,
+                )
+            })
+            .unwrap_or((0, 0)),
+        _ => (0, 0),
+    };
     Ok(IrpDispatchRequest {
         abi_version: IO_ABI_VERSION as u16,
         abi_size: core::mem::size_of::<IrpDispatchRequest>() as u16,
@@ -34218,6 +34236,8 @@ fn hosted_irp_dispatch_request(
             .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?,
         ioctl_code: u32::try_from(projection_fsctl(irp))
             .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?,
+        parameter_offset,
+        parameter_len,
         stack_location: u32::try_from(irp.stack_location)
             .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?,
         stack_count: u32::try_from(irp.stack_count)
@@ -34545,7 +34565,7 @@ fn external_irp_parameters(
             },
         )),
         major::IRP_MJ_POWER => Some(IoParameters::Power),
-        major::IRP_MJ_PNP => Some(IoParameters::Pnp),
+        major::IRP_MJ_PNP => None,
         _ => Some(IoParameters::Unsupported),
     }
 }
@@ -35481,6 +35501,24 @@ fn hosted_pnp_property_status(error: nt_pnp_manager::PnpPropertyError) -> i32 {
         nt_pnp_manager::PnpPropertyError::InvalidProperty => STATUS_INVALID_PARAMETER_2,
         nt_pnp_manager::PnpPropertyError::ObjectNameNotFound => STATUS_OBJECT_NAME_NOT_FOUND,
         nt_pnp_manager::PnpPropertyError::DeviceNotReady => STATUS_DEVICE_NOT_READY,
+    }
+}
+
+fn hosted_pnp_status(error: nt_pnp_manager::PnpError) -> nt_status::NtStatus {
+    match error {
+        nt_pnp_manager::PnpError::InsufficientResources => {
+            nt_status::NtStatus::INSUFFICIENT_RESOURCES
+        }
+        nt_pnp_manager::PnpError::ConflictingPdo
+        | nt_pnp_manager::PnpError::ConflictingStack => {
+            nt_status::NtStatus::OBJECT_NAME_COLLISION
+        }
+        nt_pnp_manager::PnpError::DispatchInFlight => nt_status::NtStatus::DEVICE_BUSY,
+        nt_pnp_manager::PnpError::StaleId | nt_pnp_manager::PnpError::StaleDispatch => {
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST
+        }
+        nt_pnp_manager::PnpError::InvalidIdentity
+        | nt_pnp_manager::PnpError::InvalidTransition => nt_status::NtStatus::INVALID_PARAMETER,
     }
 }
 
@@ -41497,15 +41535,7 @@ where
     );
     hosted_pnp_manager_mut()
         .register_enumerated_pdo(instance_path, pdo_device_id, pdo_properties)
-        .map_err(|error| match error {
-            nt_pnp_manager::PnpError::InsufficientResources => {
-                nt_status::NtStatus::INSUFFICIENT_RESOURCES
-            }
-            nt_pnp_manager::PnpError::ConflictingPdo => nt_status::NtStatus::OBJECT_NAME_COLLISION,
-            nt_pnp_manager::PnpError::InvalidIdentity
-            | nt_pnp_manager::PnpError::InvalidTransition
-            | nt_pnp_manager::PnpError::StaleId => nt_status::NtStatus::INVALID_PARAMETER,
-        })?;
+        .map_err(hosted_pnp_status)?;
     let projection_domain = HostedDomainIdentity {
         domain_id: nt_io_manager::HostedDomainId(projection_inst.hosted_domain_id),
         cookie: projection_inst.hosted_domain_cookie,
@@ -42848,15 +42878,7 @@ pub(crate) unsafe fn commit_hosted_device_resource_assignment(
     let translated = clone_pnp_resource_list(translated_resource_list)?;
     hosted_pnp_manager_mut()
         .commit_resource_assignment(binding.pdo_device_id, raw, translated)
-        .map_err(|error| match error {
-            nt_pnp_manager::PnpError::InsufficientResources => {
-                nt_status::NtStatus::INSUFFICIENT_RESOURCES
-            }
-            nt_pnp_manager::PnpError::ConflictingPdo => nt_status::NtStatus::OBJECT_NAME_COLLISION,
-            nt_pnp_manager::PnpError::InvalidIdentity
-            | nt_pnp_manager::PnpError::InvalidTransition
-            | nt_pnp_manager::PnpError::StaleId => nt_status::NtStatus::INVALID_PARAMETER,
-        })
+        .map_err(hosted_pnp_status)
 }
 
 pub(crate) unsafe fn commit_hosted_filtered_resource_requirements(
@@ -42868,15 +42890,7 @@ pub(crate) unsafe fn commit_hosted_filtered_resource_requirements(
     let filtered = clone_pnp_resource_list(filtered_requirements)?;
     hosted_pnp_manager_mut()
         .commit_filtered_resource_requirements(binding.pdo_device_id, filtered)
-        .map_err(|error| match error {
-            nt_pnp_manager::PnpError::InsufficientResources => {
-                nt_status::NtStatus::INSUFFICIENT_RESOURCES
-            }
-            nt_pnp_manager::PnpError::ConflictingPdo => nt_status::NtStatus::OBJECT_NAME_COLLISION,
-            nt_pnp_manager::PnpError::InvalidIdentity
-            | nt_pnp_manager::PnpError::InvalidTransition
-            | nt_pnp_manager::PnpError::StaleId => nt_status::NtStatus::INVALID_PARAMETER,
-        })
+        .map_err(hosted_pnp_status)
 }
 
 pub(crate) unsafe fn rollback_hosted_device_start(device_id: u64) {

@@ -12085,3 +12085,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     not an outer-stack return. Then replace the old START constructor, wire query/cancel/stop/remove
     through the same path, and retire the standalone `pnp-svc` atomic START/REMOVE transition
     shortcut instead of layering the new transaction model over it.
+
+    Canonical typed PnP IRP checkpoint (2026-08-26, implementation green): `nt-io-manager` now
+    represents lifecycle requests as `PnpParameters`, validates the complete supported minor set,
+    and accepts START only with paired, non-overflowing raw and translated resource-list lengths.
+    Canonical external dispatch rejects a PnP payload whose exact input extent differs from those
+    typed lengths or which exposes any output buffer. The PnP minor becomes both the immutable
+    origin minor and the active top stack-location minor, while the canonical IRP begins with
+    `STATUS_NOT_SUPPORTED` rather than a fabricated zero success status.
+
+    Both generic isolated-peer and production hosted-peer wire builders derive START's input length
+    and existing `parameter_offset`/`parameter_len` split from the typed record. The component-side
+    WDM builder likewise seeds `IoStatus.Status = STATUS_NOT_SUPPORTED` before entering the real
+    major-function handler; only START decodes the two resource pointers and every other lifecycle
+    minor retains an empty parameter union. Focused `nt-io-manager` validation is green at `193/193`,
+    including malformed-pair rejection, canonical minor/status projection, strict external extents,
+    and exact peer-wire split coverage. `nt-pnp-manager` remains green at `14/14`; the freestanding
+    executive check remains at the established 212-warning baseline.
+
+    Review adjustment: the old executive START constructor is still live because replacement must
+    preserve three distinct outcomes. Add canonical PnP preparation/dispatch that returns
+    `Returned(status)`, `Pending(IrpId)`, or `Indeterminate`; bind the lifecycle token to the exact
+    canonical IRP before entry, consume it only on a genuine outer-stack return, and keep it across
+    `STATUS_PENDING`. A backend fault synthesized by I/O-manager recovery must remain indeterminate.
+    After that, replace START, add the remaining lifecycle orchestration and explicit videoprt
+    backend, then build the failure-retaining device-removal journal. Also correct I/O-manager
+    delete admission and exact detach/namespace teardown before allowing the manager's removal token
+    to publish `Removed`.

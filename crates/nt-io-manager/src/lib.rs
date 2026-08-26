@@ -84,8 +84,8 @@ pub use file::{CreateOptions, FileFlags, FileRecord, FileState, ShareAccess};
 pub use hosted_domain::{HostedDomainIdentity, HostedDomainRecord, HostedProviderIdentity};
 pub use irp::{
     BufferAccess, CancelState, CreateParameters, DeviceControlParameters, InformationParameters,
-    IoBufferRef, IoParameters, IoStackLocation, IrpRecord, IrpState, ReadWriteParameters,
-    StackControl, StackFlags,
+    IoBufferRef, IoParameters, IoStackLocation, IrpRecord, IrpState, PnpParameters,
+    PnpStartParameters, ReadWriteParameters, StackControl, StackFlags,
 };
 pub use mock_driver::{IoctlBehavior, MockDriverBackend};
 pub use object_port::{MockObjectPort, ObjectManagerPort};
@@ -390,6 +390,9 @@ impl<P> IoManager<P> {
             let mut location = IoStackLocation::new(device.driver_id, major, current, file);
             if stack.is_empty() {
                 location.parameters = parameters.clone();
+                if let IoParameters::Pnp(parameters) = parameters {
+                    location.minor = parameters.minor;
+                }
             }
             stack.push(location);
             let Some(lower) = device.attached_to else {
@@ -422,6 +425,9 @@ impl<P> IoManager<P> {
         }
         let stack = if device == DeviceId::NULL {
             let mut location = IoStackLocation::new(driver, major, DeviceId::NULL, file);
+            if let IoParameters::Pnp(parameters) = &parameters {
+                location.minor = parameters.minor;
+            }
             location.parameters = parameters;
             let mut stack = Vec::new();
             stack
@@ -444,6 +450,10 @@ impl<P> IoManager<P> {
         }
         let mut irp = IrpRecord::new(client, device, file, major);
         irp.origin_driver_id = driver;
+        irp.origin_minor = stack[0].minor;
+        if major == nt_io_abi::major::IRP_MJ_PNP {
+            irp.status = NtStatus::NOT_SUPPORTED;
+        }
         irp.stack = stack;
         Ok(irp)
     }
@@ -1705,13 +1715,172 @@ mod tests {
         assert_eq!(
             d.dispatch_irp(
                 ctx(&mut buf),
-                &projection(major::IRP_MJ_PNP, IoParameters::Pnp)
+                &projection(
+                    major::IRP_MJ_PNP,
+                    IoParameters::Pnp(
+                        PnpParameters::lifecycle(nt_pnp_abi::IRP_MN_QUERY_STOP_DEVICE).unwrap(),
+                    ),
+                )
             )
             .unwrap(),
             DispatchOutcome::Failed {
                 status: NtStatus::INVALID_DEVICE_REQUEST
             }
         );
+    }
+
+    #[test]
+    fn typed_pnp_parameters_validate_lifecycle_payloads() {
+        assert_eq!(PnpParameters::start(0, 0).unwrap().input_len(), 0);
+        assert_eq!(PnpParameters::start(24, 40).unwrap().input_len(), 64);
+        assert_eq!(
+            PnpParameters::start(24, 0),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        assert_eq!(
+            PnpParameters::lifecycle(nt_pnp_abi::IRP_MN_START_DEVICE),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        assert_eq!(
+            PnpParameters::lifecycle(0xff),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
+    fn canonical_pnp_irp_carries_minor_and_exact_start_extents() {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let client = io.register_client();
+        let root_driver = io
+            .create_driver(&path("\\Driver\\Root"), Box::new(MockDriverBackend::new()))
+            .unwrap();
+        let root = io
+            .create_device(
+                root_driver,
+                None,
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::empty(),
+                0,
+            )
+            .unwrap();
+        let function_driver = io
+            .create_driver(
+                &path("\\Driver\\Function"),
+                Box::new(MockDriverBackend::new()),
+            )
+            .unwrap();
+        let function = io
+            .create_device(
+                function_driver,
+                None,
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::empty(),
+                0,
+            )
+            .unwrap();
+        io.attach_device_to_stack(function, root).unwrap();
+        let parameters = PnpParameters::start(24, 40).unwrap();
+        let record = io
+            .build_irp_record(
+                client,
+                function_driver,
+                function,
+                None,
+                major::IRP_MJ_PNP,
+                IoParameters::Pnp(parameters),
+            )
+            .unwrap();
+        assert_eq!(record.origin_minor, nt_pnp_abi::IRP_MN_START_DEVICE);
+        assert_eq!(record.status, NtStatus::NOT_SUPPORTED);
+        assert_eq!(record.stack.len(), 2);
+        assert_eq!(record.stack[0].minor, nt_pnp_abi::IRP_MN_START_DEVICE);
+        assert_eq!(record.stack[0].parameters, IoParameters::Pnp(parameters));
+
+        let mut valid_buffer = [0u8; 64];
+        assert!(io
+            .build_and_dispatch_external_to_device(
+                client,
+                function,
+                None,
+                0,
+                0,
+                major::IRP_MJ_PNP,
+                IoParameters::Pnp(parameters),
+                64,
+                0,
+                &mut valid_buffer,
+            )
+            .is_ok());
+        assert_eq!(
+            io.build_and_dispatch_external_to_device(
+                client,
+                function,
+                None,
+                0,
+                0,
+                major::IRP_MJ_PNP,
+                IoParameters::Pnp(parameters),
+                63,
+                0,
+                &mut valid_buffer,
+            ),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
+    fn peer_pnp_wire_request_preserves_start_split() {
+        let control = MockPeerControl::new();
+        let mut io = io();
+        let client = io.register_client();
+        let (backend, _) = peer_backend(&mut io, &control);
+        let mut dispatch = MajorFunctionTable::new();
+        dispatch.set(
+            major::IRP_MJ_PNP,
+            DispatchTarget::DriverPeer(DriverPeerId(0)),
+        );
+        let driver = io
+            .create_driver_peer_with_major_table(
+                &path("\\Driver\\PnpPeer"),
+                Box::new(backend),
+                dispatch,
+            )
+            .unwrap();
+        let device = io
+            .create_device(
+                driver,
+                None,
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let parameters = PnpParameters::start(24, 40).unwrap();
+        let mut resources = [0u8; 64];
+        let _ = io
+            .build_and_dispatch_external_to_device(
+                client,
+                device,
+                None,
+                0,
+                0,
+                major::IRP_MJ_PNP,
+                IoParameters::Pnp(parameters),
+                64,
+                0,
+                &mut resources,
+            )
+            .unwrap();
+        let request = control.last_request().unwrap();
+        assert_eq!(request.major, major::IRP_MJ_PNP);
+        assert_eq!(request.minor, nt_pnp_abi::IRP_MN_START_DEVICE);
+        assert_eq!(request.input_len, 64);
+        assert_eq!(request.output_len, 0);
+        assert_eq!(request.parameter_offset, 24);
+        assert_eq!(request.parameter_len, 40);
     }
 
     // --- Open / create path (Milestone 5) ----------------------------------
