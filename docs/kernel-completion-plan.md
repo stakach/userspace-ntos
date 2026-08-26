@@ -11845,3 +11845,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     release check remains green at the established 212-warning baseline and `git diff --check` is
     clean. Timer and work-item construction remain coupled to the open generation-safe callback-thunk
     work; provider-returned packet/buffer compensation remains open as recorded above.
+
+    Generation-safe thunk runtime checkpoint (2026-08-26, crate green; executive wiring pending):
+    `nt-hosted-runtime` now owns a fixed-capacity executable-thunk slot registry with exact
+    provider/dependent owner, purpose, target, discriminator, slot index, and nonzero generation.
+    Reservation is private until commit, exact live keys deduplicate, active reservations and
+    retiring keys return busy, aborted unpublished slots can be reused with a new generation, and
+    stale tokens cannot commit or resolve a reused slot. Published thunks must enter `Retiring` and
+    cannot return to `Free` until the caller supplies proof that the exact owner is quiesced; this is
+    required because a stale raw code address cannot validate the registry generation itself.
+
+    Focused `nt-hosted-runtime` validation is green at `61/61`, adding reservation invisibility,
+    abort/reuse generation, live-key deduplication, capacity, stale-token, and owner-quiescence tests.
+    Next replace each executive instance's monotonic `thunk_next` allocation with this registry,
+    reserve before planning or encoding, abort on every pre-publication failure, parent callback rows
+    to the exact slot token, and retire live slots only behind the dependency/instance dispatch fence.
+    Do not enable live raw-address reuse merely because the registry token generation changed.
