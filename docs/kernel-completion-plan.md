@@ -13008,3 +13008,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     gates, and the sentinel. After acceptance, consolidate the repeated immutable-plan snapshot-bank
     server mechanics, then begin CM-owned SYSTEM mutation leases/journalling and route win32k's
     component-local registry calls through an explicit CM transport.
+
+    Dispatcher-wait continuation correction (2026-08-27, implementation green): the first CM-reader
+    acceptance attempts exposed a generic asynchronous-wait defect rather than a CM regression. A
+    hosted UnknownSyscall waiter retained only RIP, RSP, and RFLAGS; its eventual 18-word fault reply
+    therefore borrowed MR1..MR14 from whichever unrelated caller happened to trigger the wake. LSA's
+    RPC worker survived short retained pipe reads by timing, but a read parked across profile-hive
+    mounting resumed with a corrupted callee-saved connection pointer and abandoned request call 4.
+
+    `nt-syscall-abi::ParkedSyscallReply` now owns the complete immutable 18-register UnknownSyscall
+    continuation and distinguishes it from a native one-word seL4-Call reply. The dispatcher waiter
+    stores that value and every signal/timeout wake overlays only the terminal NTSTATUS before
+    replying. Host tests prove every non-status register survives and native replies retain their
+    one-word wire shape (`18/18`); the freestanding executive check remains green at the established
+    212-warning baseline. A serialized diagnostic rerun passed the former call-4 frontier, consumed
+    its remaining RPC header and payload, and continued through subsequent SCM traffic and dynamic
+    service starts. Temporary RPC/user-memory/exit-stack probes were removed after that proof.
+
+    Review adjustment: keep desktop acceptance open and let the next serialized run reach its normal
+    three-minute gate rather than stopping at the former frontier. On acceptance, audit the sibling
+    keyed-event, delay, and I/O-completion waiter records and migrate any remaining partial register
+    continuations to the same ABI type before snapshot-bank consolidation; no parked syscall may
+    depend on ambient IPC-buffer contents.

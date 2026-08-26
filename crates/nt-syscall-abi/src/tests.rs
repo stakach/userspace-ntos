@@ -258,3 +258,25 @@ fn native_retry_reply_cannot_alias_an_ntstatus() {
     assert!(NT_NATIVE_RETRY_REPLY > u32::MAX as u64);
     assert_ne!(NT_NATIVE_RETRY_REPLY >> 32, 0);
 }
+
+#[test]
+fn parked_unknown_syscall_reply_preserves_every_non_status_register() {
+    let original = core::array::from_fn(|index| 0x1000 + index as u64);
+    let parked = ParkedSyscallReply::unknown_syscall(original, 0xaaaa, 0xbbbb, 0xcccc);
+    let resumed = parked.registers_with_status(0x102);
+
+    assert_eq!(parked.message_length(), 18);
+    assert_eq!(resumed[0], 0x102);
+    assert_eq!(&resumed[1..15], &original[1..15]);
+    assert_eq!(&resumed[15..], &[0xaaaa, 0xbbbb, 0xcccc]);
+}
+
+#[test]
+fn parked_native_call_uses_a_one_word_reply() {
+    let parked = ParkedSyscallReply::native_call();
+    let resumed = parked.registers_with_status(0xc000_0001);
+
+    assert_eq!(parked.message_length(), 1);
+    assert_eq!(resumed[0], 0xc000_0001);
+    assert!(resumed[1..].iter().all(|register| *register == 0));
+}

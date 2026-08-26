@@ -8571,6 +8571,16 @@ pub(crate) unsafe fn service_sec_image(
             let syscall_reply_context = authoritative_syscall_context
                 .map(|(_, context)| context)
                 .unwrap_or_else(|| SyscallReplyContext::capture(m0, m1, m2, m3));
+            let parked_syscall_reply = if native_call_transport {
+                nt_syscall_abi::ParkedSyscallReply::native_call()
+            } else {
+                nt_syscall_abi::ParkedSyscallReply::unknown_syscall(
+                    syscall_reply_context.regs,
+                    resume_ip,
+                    sp,
+                    flags,
+                )
+            };
             let current_tid = nt_handler
                 .hosted_thread_tid_for_badge(badge)
                 .unwrap_or_else(|| {
@@ -16076,9 +16086,7 @@ pub(crate) unsafe fn service_sec_image(
                     result = 0xC000_009A;
                 } else if wait_park(
                     park_object,
-                    resume_ip,
-                    sp,
-                    flags,
+                    parked_syscall_reply,
                     nt_handler.current_tid,
                     park_wait_deadline,
                 ) {
@@ -16132,9 +16140,7 @@ pub(crate) unsafe fn service_sec_image(
                     &park_wait_set[..park_wait_set_n],
                     &park_wait_indices[..park_wait_set_n],
                     park_wait_set_all,
-                    resume_ip,
-                    sp,
-                    flags,
+                    parked_syscall_reply,
                     nt_handler.current_tid,
                     park_wait_deadline,
                 ) {
@@ -19367,15 +19373,19 @@ pub(crate) unsafe fn service_sec_image(
                     // distinctive SSN, so the assertion below is unchanged in strength.
                     let mut w_mi = 0u64;
                     let mut w_m0 = 0u64;
+                    let mut w_m1 = 0u64;
                     let mut w_m2 = 0u64;
+                    let mut w_m3 = 0u64;
                     let mut select_guard = 0;
                     while select_guard < 8 {
                         select_guard += 1;
-                        let (_wb, mi_r, m0_r, _w1, m2_r, _w3) =
+                        let (_wb, mi_r, m0_r, m1_r, m2_r, m3_r) =
                             recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                         w_mi = mi_r;
                         w_m0 = m0_r;
+                        w_m1 = m1_r;
                         w_m2 = m2_r;
+                        w_m3 = m3_r;
                         if (mi_r >> 12) == 2 && m0_r == 0xD1 {
                             break;
                         }
@@ -19384,6 +19394,12 @@ pub(crate) unsafe fn service_sec_image(
                     let w_ip = w_m2; // RCX = the syscall return address (the loop's `resume_ip`)
                     let w_sp = get_recv_mr(16);
                     let w_flags = get_recv_mr(17);
+                    let w_reply = nt_syscall_abi::ParkedSyscallReply::unknown_syscall(
+                        SyscallReplyContext::capture(w_m0, w_m1, w_m2, w_m3).regs,
+                        w_ip,
+                        w_sp,
+                        w_flags,
+                    );
                     dbgk_blk_trace(b"dw1", w_mi, w_m0, 0, marker_d());
                     // The handler's own park REQUEST (NULL *Timeout, empty queue) — the exact arm a
                     // hosted debugger would take.
@@ -19398,9 +19414,7 @@ pub(crate) unsafe fn service_sec_image(
                         && park_index >= 0
                         && wait_park(
                             WaitObject::dispatcher(park_index as usize),
-                            w_ip,
-                            w_sp,
-                            w_flags,
+                            w_reply,
                             0xD1D1_0001,
                             None,
                         )

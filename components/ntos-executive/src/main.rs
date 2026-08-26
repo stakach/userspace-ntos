@@ -2488,9 +2488,7 @@ struct ObjectWaiterRecord {
     reply_cap: u64,
     tid: u64,
     deadline: u64,
-    resume_ip: u64,
-    resume_sp: u64,
-    resume_flags: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
     pending_wake_index: u64,
     pending_wake_object: WaitObject,
 }
@@ -2505,9 +2503,7 @@ impl ObjectWaiterRecord {
             reply_cap: 0,
             tid: 0,
             deadline: u64::MAX,
-            resume_ip: 0,
-            resume_sp: 0,
-            resume_flags: 0,
+            reply: nt_syscall_abi::ParkedSyscallReply::native_call(),
             pending_wake_index: u64::MAX,
             pending_wake_object: WaitObject::FREE,
         }
@@ -2525,9 +2521,7 @@ impl ObjectWaiterRecord {
         reply_cap: u64,
         tid: u64,
         deadline: Option<u64>,
-        resume_ip: u64,
-        sp: u64,
-        flags: u64,
+        reply: nt_syscall_abi::ParkedSyscallReply,
     ) -> Self {
         let mut record = Self::empty();
         for (index, object) in objects.iter().copied().enumerate() {
@@ -2539,9 +2533,7 @@ impl ObjectWaiterRecord {
         record.reply_cap = reply_cap;
         record.tid = tid;
         record.deadline = deadline.unwrap_or(u64::MAX);
-        record.resume_ip = resume_ip;
-        record.resume_sp = sp;
-        record.resume_flags = flags;
+        record.reply = reply;
         record
     }
 }
@@ -3145,7 +3137,7 @@ unsafe fn watchdog_report(messages: u64) {
         print_str(b" deadline=");
         print_u64(record.deadline);
         print_str(b" resume-ip=0x");
-        print_hex_u64(record.resume_ip);
+        print_hex_u64(record.reply.resume_ip());
         print_str(b"\n");
     }
     for slot in 0..keyed_waiter_len() {
@@ -15456,6 +15448,29 @@ unsafe fn client_reply_on(
     label == 0
 }
 
+/// Resume a parked NT syscall without borrowing register words from the caller currently being
+/// serviced. Hosted `syscall` faults require the complete saved register file; native seL4 calls
+/// require only the terminal status word.
+unsafe fn reply_parked_syscall(
+    reply_cptr: u64,
+    continuation: nt_syscall_abi::ParkedSyscallReply,
+    status: u64,
+) -> bool {
+    let registers = continuation.registers_with_status(status);
+    let length = continuation.message_length();
+    for (index, value) in registers.iter().copied().enumerate().take(length).skip(4) {
+        set_reply_mr(index, value);
+    }
+    client_reply_on(
+        reply_cptr,
+        length as u64,
+        registers[0],
+        registers[1],
+        registers[2],
+        registers[3],
+    )
+}
+
 #[inline]
 fn fallback_monotonic_time_100ns() -> u64 {
     unsafe { core::arch::x86_64::_rdtsc() / 10 }
@@ -16533,14 +16548,12 @@ unsafe fn io_completion_cancel_process(handler: &mut ExecNtHandler, process_inde
 /// pool/waiter queue is exhausted.
 unsafe fn wait_park(
     object: WaitObject,
-    resume_ip: u64,
-    sp: u64,
-    flags: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
     tid: u64,
     deadline: Option<u64>,
 ) -> bool {
     // Single-object wait = a 1-object WaitAny set.
-    wait_park_multi(&[object], &[0], false, resume_ip, sp, flags, tid, deadline)
+    wait_park_multi(&[object], &[0], false, reply, tid, deadline)
 }
 
 unsafe fn wait_cancel_thread(handler: &ExecNtHandler, tid: u64) {
@@ -17267,9 +17280,7 @@ unsafe fn wait_park_multi(
     objects: &[WaitObject],
     result_indices: &[u8],
     wait_all: bool,
-    resume_ip: u64,
-    sp: u64,
-    flags: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
     tid: u64,
     deadline: Option<u64>,
 ) -> bool {
@@ -17301,9 +17312,7 @@ unsafe fn wait_park_multi(
         stolen,
         tid,
         deadline,
-        resume_ip,
-        sp,
-        flags,
+        reply,
     )) {
         WAIT_PARK_NO_WAITER_SLOT.fetch_add(1, Ordering::Relaxed);
         return false;
@@ -17413,13 +17422,9 @@ unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<
         };
         let cap = record.reply_cap;
         if cap != 0 {
-            // Resume the parked wait with STATUS_WAIT_0 + index. The waiter blocked as a native syscall
-            // (UnknownSyscall fault); apply_fault_reply restores RCX←resume_ip, RSP←sp, RFLAGS←flags
-            // (IPC MR15/16/17) and RAX/r10←status. r10 (status) = wake_index = WAIT_OBJECT_0+index.
-            set_reply_mr(15, record.resume_ip);
-            set_reply_mr(16, record.resume_sp);
-            set_reply_mr(17, record.resume_flags);
-            client_reply_on(cap, 18, wake_index, 0, 0, 0);
+            // Resume with STATUS_WAIT_0 + index. UnknownSyscall replies restore the exact retained
+            // register file with only RAX replaced; native seL4 calls receive a one-word status.
+            reply_parked_syscall(cap, record.reply, wake_index);
             // Return this reply object to the pool (clear its used bit).
             release_reply_pool_cap(cap);
             let trace = WAIT_WAKE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -17465,10 +17470,7 @@ unsafe fn wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
         }
         let cap = record.reply_cap;
         if cap != 0 {
-            set_reply_mr(15, record.resume_ip);
-            set_reply_mr(16, record.resume_sp);
-            set_reply_mr(17, record.resume_flags);
-            client_reply_on(cap, 18, 0x102, 0, 0, 0);
+            reply_parked_syscall(cap, record.reply, 0x102);
             release_reply_pool_cap(cap);
             thread_wait_state_clear_tid_ready(handler, record.tid);
             woken += 1;
