@@ -12489,3 +12489,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     now ensures its component's software-DPC queue independently of resource assignment. This is a
     kernel mechanism correction, not a fixture exception. Repeat the serialized acceptance run and
     require both devnodes to complete before closing the checkpoint.
+
+    Multi-devnode asynchronous START integration (2026-08-26, accepted): the serialized rerun
+    `.tmp/run-desktop-pending-start-dpc-init-20260826.log` observes the complete real sequence. The
+    first devnode's START returns `STATUS_PENDING`; instance 8 then accepts its timer-DPC activation,
+    publishes the exact driver completion, and the PnP batch records terminal success before issuing
+    AddDevice for the second devnode. The second START independently returns pending and follows the
+    same timer-DPC, exact completion, and terminal publication path. Both evidence rows report
+    `dpc=1`, no resource list is fabricated for either root device, and no second-devnode work occurs
+    before the first canonical IRP is terminal.
+
+    The final boot report has no pending or indeterminate PnP rows. `exec_boot_pnp_starts_terminal`,
+    `exec_generic_hw_registry_selected`, `exec_generic_pnp_starts_terminal`, and
+    `exec_generic_pnp_pending_starts_observed` all pass. Genuine userinit and Explorer run, the shell
+    paints all `480000/480000` framebuffer pixels with at least 32 non-background colours, all
+    `296/296` executive gates pass, and the sentinel fires. This closes the replyless multi-devnode
+    asynchronous START scheduler checkpoint without a fixture exception or static driver identity.
+
+    Review adjustment: the next canonical PnP frontier is a later, live Configuration Manager
+    devnode arrival for a DEMAND_START driver plus a genuine user-mode `NtLoadDriver` request where
+    appropriate. Unify native driver-load service metadata with the mutable CM authority first; the
+    native path still reads immutable boot-hive metadata, while device action uses the live imported
+    manager. Preserve the two distinct NT owners: enumerated present-device action uses replyless
+    kernel `IopLoadDriver`, and an explicit native request retains its caller reply. Do not add a
+    service-name exclusion, a duplicate boot cohort, or a fallback to static image metadata.
