@@ -11740,8 +11740,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     actually binds an implementation; do not mark generic-loader imports implemented merely because
     the executive's registration-driven resolver can serve them.
 
-    Provider shadow retirement checkpoint (2026-08-26, implementation green; serialized boot proof
-    pending): every persistent provider pointer, packet, MDL, interrupt, timer, work-item, miniport
+    Provider shadow retirement checkpoint (2026-08-26, accepted locally): every persistent provider
+    pointer, packet, MDL, interrupt, timer, work-item, miniport
     mirror, and dispatch-route record now retains the exact provider and dependent domain ids and
     generation cookies. Normal lookup requires a live dependency; teardown uses a separate exact
     current-authority predicate so an irreversible retirement fence does not make its own cleanup
@@ -11765,13 +11765,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Focused validation is green for `nt-hosted-runtime` at `57/57`, including stale-generation,
     partial-retry, late-owned-resource, and completed-ledger idempotence tests. The freestanding
     executive release check remains at the established 212-warning baseline and `git diff --check`
-    is clean.
+    is clean. Serialized desktop proof
+    `.tmp/run-desktop-provider-shadow-retirement-20260826.log` passes the real provider NDIS receive
+    gate, reaches genuine Explorer, paints all `480000/480000` pixels of the miniport-selected
+    `800x600` shell with at least 32 non-background colours, passes all `293/293` executive gates,
+    and emits the sentinel.
 
     Review adjustment: this closes failure-retaining cleanup for already-published provider bridge
     objects, not every construction rollback. Next reserve constructing rows before multi-allocation
     packet, MDL, scatter/gather, interrupt, timer, work-item, miniport-mirror, and route setup; add
     ownership bits as each allocation or callback thunk is acquired; and retain those rows whenever
     rollback cannot complete. Executable thunk slots and their callback records also need explicit
-    exact-owner retirement/reuse rather than monotonic consumption. After a serialized desktop proof
-    for this checkpoint, complete those construction/thunk lifetimes before beginning the ordered
-    PnP query/cancel/remove transaction.
+    exact-owner retirement/reuse rather than monotonic consumption. Complete those
+    construction/thunk lifetimes before beginning the ordered PnP query/cancel/remove transaction.
