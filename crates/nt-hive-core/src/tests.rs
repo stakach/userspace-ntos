@@ -2009,7 +2009,9 @@ fn fault_on_image_write_preserves_previous() {
         },
     )
     .unwrap();
+    let generation_before_failed_flush = hive.generation;
     assert_eq!(mgr.flush(&mut hive), Err(HiveIoError::Io)); // image write #2 faults
+    assert_eq!(hive.generation, generation_before_failed_flush);
     let provider = mgr.into_provider();
     let booted = HiveManager::new(provider).boot(HiveKind::System).unwrap();
     let key = booted.open_key(r"ControlSet001\X").unwrap();
@@ -2032,10 +2034,16 @@ fn try_flush_reports_io_fault_and_preserves_replay_log() {
     )
     .unwrap();
 
+    let generation_before_failed_flush = hive.generation;
+    let sequence_before_failed_flush = hive.sequence;
+    let dirty_before_failed_flush = hive.dirty_count();
     assert_eq!(
         mgr.try_flush(&mut hive),
         Err(HiveFlushError::Io(HiveIoError::Io))
     );
+    assert_eq!(hive.generation, generation_before_failed_flush);
+    assert_eq!(hive.sequence, sequence_before_failed_flush);
+    assert_eq!(hive.dirty_count(), dirty_before_failed_flush);
 
     let provider = mgr.into_provider();
     let booted = HiveManager::new(provider).boot(HiveKind::System).unwrap();

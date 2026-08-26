@@ -296,9 +296,13 @@ impl<P: HiveIoProvider> HiveManager<P> {
     /// Checkpoint / lazy flush (spec §13.4): write a fresh image + truncate the log + clear the
     /// dirty set. Leaves the previous image intact on a write fault (spec §18.1).
     pub fn flush(&mut self, hive: &mut Hive) -> Result<(), HiveIoError> {
-        hive.generation += 1;
+        let previous_generation = hive.generation;
+        hive.generation = hive.generation.saturating_add(1);
         let bytes = encode_image(hive);
-        self.provider.write_primary_image_atomic_owned(bytes)?;
+        if let Err(err) = self.provider.write_primary_image_atomic_owned(bytes) {
+            hive.generation = previous_generation;
+            return Err(err);
+        }
         self.provider.flush_image()?;
         self.provider.truncate_log()?;
         self.provider.flush_log()?;
@@ -311,11 +315,19 @@ impl<P: HiveIoProvider> HiveManager<P> {
     /// of panicking. I/O failures preserve the previous image and the current log, matching
     /// [`Self::flush`].
     pub fn try_flush(&mut self, hive: &mut Hive) -> Result<(), HiveFlushError> {
-        hive.generation += 1;
-        let bytes = try_encode_image(hive).map_err(HiveFlushError::Encode)?;
-        self.provider
-            .write_primary_image_atomic_owned(bytes)
-            .map_err(HiveFlushError::Io)?;
+        let previous_generation = hive.generation;
+        hive.generation = hive.generation.saturating_add(1);
+        let bytes = match try_encode_image(hive) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                hive.generation = previous_generation;
+                return Err(HiveFlushError::Encode(err));
+            }
+        };
+        if let Err(err) = self.provider.write_primary_image_atomic_owned(bytes) {
+            hive.generation = previous_generation;
+            return Err(HiveFlushError::Io(err));
+        }
         self.provider.flush_image().map_err(HiveFlushError::Io)?;
         self.provider.truncate_log().map_err(HiveFlushError::Io)?;
         self.provider.flush_log().map_err(HiveFlushError::Io)?;
