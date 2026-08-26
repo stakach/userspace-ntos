@@ -12112,3 +12112,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     backend, then build the failure-retaining device-removal journal. Also correct I/O-manager
     delete admission and exact detach/namespace teardown before allowing the manager's removal token
     to publish `Removed`.
+
+    Canonical stack-publication integration checkpoint (2026-08-26, accepted): the first serialized
+    desktop run after strict PnP status initialization exposed that production AddDevice still
+    skipped the manager's new `DeviceStackBuilt` transaction. Resource assignment therefore
+    correctly rejected all three real hardware devnodes in `Enumerated` with
+    `STATUS_INVALID_PARAMETER`; no hosted START IRP was dispatched. The executive now commits the
+    exact canonical PDO/FDO/driver tuple only after the driver's real AddDevice has returned and the
+    I/O manager has attached the FDO. Any later construction failure rolls that exact manager tuple
+    back before dismantling the external stack. The old implicit `Enumerated -> ResourcesAssigned`
+    behavior is not restored.
+
+    Focused validation remains green at `nt-pnp-manager` `14/14` and `nt-io-manager` `193/193`; the
+    freestanding executive check and release link remain green at the established 212-warning
+    baseline. Serialized proof `.tmp/run-desktop-pnp-stack-commit-20260826.log` returns success from
+    real E1000, DMA test, and bochsmp START transactions, passes root-PDO, provider NDIS receive,
+    interrupt, DPC, and DMA gates, launches genuine userinit and Explorer, and paints all
+    `480000/480000` framebuffer pixels with at least 32 non-background colours. All `293/293`
+    executive gates pass and the sentinel fires.
+
+    Review adjustment: the pre-canonical START helper remains the next retirement target. Prepare
+    the canonical PnP IRP before acquiring a lifecycle dispatch token, bind the token to its exact
+    `IrpId`, and preserve `Returned`, `Pending`, and `Indeterminate` as distinct outcomes through
+    final completion. Do not let a local preparation failure strand a manager dispatch token, and
+    do not reinterpret a hosted transport wall or I/O-manager fault synthesis as an outer-stack
+    return.

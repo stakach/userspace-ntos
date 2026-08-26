@@ -41440,9 +41440,23 @@ unsafe fn rollback_uncommitted_add_device(
     add_device: Option<&AddDeviceDispatchResult>,
     fdo_device_id: Option<nt_io_manager::DeviceId>,
     canonical_fdo_attached: bool,
+    pnp_stack_committed: bool,
+    driver_id: u64,
     pdo_projection_created: bool,
 ) -> Result<(), nt_status::NtStatus> {
     let mut cleanup_status = None;
+    if pnp_stack_committed {
+        let rollback = fdo_device_id
+            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)
+            .and_then(|fdo_device_id| {
+                hosted_pnp_manager_mut()
+                    .rollback_device_stack(pdo_device_id, fdo_device_id.raw(), driver_id)
+                    .map_err(hosted_pnp_status)
+            });
+        if let Err(status) = rollback {
+            cleanup_status = Some(status);
+        }
+    }
     let (driver_object, previous_device_head) = add_device
         .map(|result| (result.driver_object, result.previous_device_head))
         .unwrap_or((0, 0));
@@ -41595,6 +41609,7 @@ where
     let mut add_device = None;
     let mut fdo_device_id = None;
     let mut canonical_fdo_attached = false;
+    let mut pnp_stack_committed = false;
 
     let result = (|| -> Result<u64, nt_status::NtStatus> {
         registry_identity_id = allocate_hosted_registry_identity(registry_identity)?;
@@ -41647,6 +41662,10 @@ where
         fdo_device_id = Some(device_id);
         io_manager_mut().attach_device_to_stack(device_id, pdo_device)?;
         canonical_fdo_attached = true;
+        hosted_pnp_manager_mut()
+            .commit_device_stack(pdo_device_id, device_id.raw(), driver_id)
+            .map_err(hosted_pnp_status)?;
+        pnp_stack_committed = true;
         if !driver_instances().is_some_and(|table| index < table.len() && table[index].used) {
             return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
         }
@@ -41698,6 +41717,8 @@ where
                 add_device.as_ref(),
                 fdo_device_id,
                 canonical_fdo_attached,
+                pnp_stack_committed,
+                driver_id,
                 pdo_projection_created,
             ) {
                 print_str(b"[driver-launch] AddDevice rollback failed status=0x");
