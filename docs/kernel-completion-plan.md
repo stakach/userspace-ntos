@@ -2524,6 +2524,37 @@ busy-wait inside either path. Once both callers consume the same continuation me
 driver fixture that returns `STATUS_PENDING` from START and later calls `IoCompleteRequest`, then
 continue with I/O Manager deletion admission and ordered query/cancel/stop/remove.
 
+B3 asynchronous demand-load continuation checkpoint (2026-08-26, implementation green):
+`NtLoadDriver` no longer exposes `STATUS_PENDING` as a terminal syscall result. A new host-tested
+`nt-driver-start` coordinator serializes a multi-devnode batch, gives each dispatch an exact driver
+and devnode token, retains the active canonical `IrpId`, rejects stale observations, and preserves a
+permanent ownership-loss barrier. Its continuation table reserves a generation-exact slot before
+DriverEntry/AddDevice/START side effects and grows without a driver-count policy limit; allocation
+failure and Reply-object exhaustion therefore fail before driver entry.
+
+The executive moves the owned registry launch specification into that reservation, publishes the
+continuation before rotating `REPLY_MAIN`, and immediately redrives it after publication to close
+completion-before-park. Later hosted-I/O pumps observe only the exact START, finish staged evidence
+and video-route publication, then synchronously advance later devnodes until the next pending START
+or the batch's single terminal reply. Native callers receive a one-word terminal result;
+compatibility-trap callers receive their restored 18-register frame. Thread exit deletes and
+retypes only the bound Reply object while retaining the driver batch and PnP transaction to
+completion. An ownership-loss row remains an explicit `NtUnloadDriver` barrier. Synchronous failure
+stops later devnodes; rollback/unload is still admitted only before AddDevice ownership exists.
+
+Focused validation is green at `nt-driver-start` `5/5`, `nt-pnp-manager` `14/14`, and
+`nt-io-manager` `195/195`; the freestanding executive check remains at the established 212-warning
+baseline. Serialized desktop validation is still required before accepting this checkpoint.
+
+Review adjustment: demand-start reply ownership is closed once that desktop run is accepted. The
+next mechanism is a resumable boot-driver launch phase using the same batch coordinator without a
+syscall Reply owner; boot launch currently precedes the ordinary receive loop and must stop and
+yield on an unfinished START rather than busy-wait or advance to another devnode. After boot and
+demand callers share the cursor semantics, add a real isolated driver fixture that returns
+`STATUS_PENDING` from START and later calls `IoCompleteRequest`, exercise at least two devnodes, and
+prove one terminal demand reply plus resumed boot progression. Then continue with exact I/O Manager
+delete admission and the query/cancel/stop/remove removal journal.
+
 ### A. SCM-Controlled Service Startup
 
 - `[x]` A0: Inventory the current SCM/service startup path and mark the static boundaries still in

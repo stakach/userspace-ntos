@@ -2769,6 +2769,13 @@ impl ExecNtHandler {
         write_field!(pending_file_io_transfer, None);
         write_field!(pending_file_io_wait, false);
         write_field!(pending_file_io_reservation, None);
+        write_field!(
+            pending_driver_loads,
+            nt_driver_start::PendingDriverStartTable::with_capacity(
+                PENDING_DRIVER_LOAD_INITIAL_CAPACITY,
+            )
+        );
+        write_field!(pending_driver_load_transfer, None);
         write_field!(pending_synchronous_file_wait, None);
         write_field!(pending_file_cleanup_wait, None);
         write_field!(pending_file_irp_drain, None);
@@ -5659,6 +5666,7 @@ impl ExecNtHandler {
         const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
         const STATUS_IMAGE_ALREADY_LOADED: u32 = 0xC000_010E;
         const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+        const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 
         if !self.current_token_has_privilege(nt_security::SE_LOAD_DRIVER) {
             return STATUS_PRIVILEGE_NOT_HELD;
@@ -5681,24 +5689,85 @@ impl ExecNtHandler {
             return STATUS_IMAGE_ALREADY_LOADED;
         }
 
+        let start_reservation = if spec.class == driver_launch::DriverClass::Device
+            && !spec.devnodes.is_empty()
+        {
+            if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free() {
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            let old_capacity = self.pending_driver_loads.allocation_capacity();
+            match self.pending_driver_loads.reserve() {
+                Ok(reservation) => {
+                    if self.pending_driver_loads.allocation_capacity() != old_capacity {
+                        crate::mark_durable_table_growth_dirty();
+                    }
+                    Some(reservation)
+                }
+                Err(_) => return STATUS_INSUFFICIENT_RESOURCES,
+            }
+        } else {
+            None
+        };
+
         let Some(fs) = exec_fs() else {
+            if let Some(reservation) = start_reservation {
+                self.pending_driver_loads
+                    .cancel(reservation)
+                    .expect("unused driver-load reservation became stale");
+            }
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
         let Some(dc) =
             driver_launch::load_driver(&fs, &spec.image_path, spec.class, &spec.driver_object_path)
         else {
+            if let Some(reservation) = start_reservation {
+                self.pending_driver_loads
+                    .cancel(reservation)
+                    .expect("failed driver load lost its continuation reservation");
+            }
             return STATUS_UNSUCCESSFUL;
         };
-        if spec.class == driver_launch::DriverClass::Device && !spec.devnodes.is_empty() {
-            if let Err(failure) = start_owned_driver_service_devnodes(
+        if let Some(reservation) = start_reservation {
+            let mut batch = OwnedHostedPnpStartBatch::new(
                 &dc,
-                &spec,
+                spec,
                 HostedPnpStartOptions::demand_start(),
-            ) {
-                if !failure.teardown_blocked {
-                    let _ = driver_launch::unload_driver_by_name(&spec.driver_object_path);
+            );
+            match batch.drive() {
+                OwnedHostedPnpStartProgress::AwaitingCompletion => {
+                    self.pending_driver_load_transfer = Some((batch, reservation));
+                    return nt_status::NtStatus::PENDING.raw() as u32;
                 }
-                return failure.status.raw() as u32;
+                OwnedHostedPnpStartProgress::Complete(result) => {
+                    self.pending_driver_loads
+                        .cancel(reservation)
+                        .expect("synchronous driver START lost its continuation reservation");
+                    if let Err(failure) = result {
+                        if !failure.teardown_blocked {
+                            let _ = driver_launch::unload_driver_by_name(
+                                batch.driver_object_path(),
+                            );
+                        }
+                        return failure.status.raw() as u32;
+                    }
+                }
+                OwnedHostedPnpStartProgress::OwnershipLost(failure) => {
+                    self.pending_driver_loads
+                        .publish(
+                            reservation,
+                            PendingNtLoadDriver {
+                                batch,
+                                tid: 0,
+                                badge: 0,
+                                reply_cap: 0,
+                                native_call_transport: true,
+                                reply_mrs: [0; 18],
+                            },
+                        )
+                        .expect("lost driver START ownership could not publish its barrier");
+                    crate::mark_durable_table_growth_dirty();
+                    return failure.status.raw() as u32;
+                }
             }
         }
         0
@@ -5725,6 +5794,20 @@ impl ExecNtHandler {
         ) else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
+        for slot in 0..self.pending_driver_loads.slot_count() {
+            if self
+                .pending_driver_loads
+                .get(slot)
+                .is_some_and(|pending| {
+                    pending
+                        .batch
+                        .driver_object_path()
+                        .eq_ignore_ascii_case(&driver_object_path)
+                })
+            {
+                return nt_status::NtStatus::DEVICE_BUSY.raw() as u32;
+            }
+        }
         match driver_launch::unload_driver_by_name(&driver_object_path) {
             Ok(()) => 0,
             Err(status) => status.raw() as u32,

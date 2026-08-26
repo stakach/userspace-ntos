@@ -9110,6 +9110,12 @@ pub(crate) unsafe fn service_sec_image(
                 bool,
                 nt_io_manager::PendingFileIoReservation,
             )> = None;
+            let mut transfer_pending_driver_load: Option<(
+                OwnedHostedPnpStartBatch,
+                nt_driver_start::Reservation,
+                bool,
+                [u64; 18],
+            )> = None;
             let mut transfer_file_irp_drain: Option<(
                 nt_io_manager::PendingFileIrpDrain,
                 nt_io_manager::PendingFileIrpDrainReservation,
@@ -9229,6 +9235,10 @@ pub(crate) unsafe fn service_sec_image(
                 );
                 nt_handler.pending_file_io_transfer = None;
                 nt_handler.pending_file_io_wait = false;
+                assert!(
+                    nt_handler.pending_driver_load_transfer.is_none(),
+                    "previous syscall leaked a driver-load continuation reservation"
+                );
                 nt_handler.pending_synchronous_file_wait = None;
                 assert!(
                     nt_handler.pending_file_cleanup_wait.is_none(),
@@ -9831,6 +9841,16 @@ pub(crate) unsafe fn service_sec_image(
                         "unused pending File reservation became stale"
                     );
                 }
+                if let Some((batch, reservation)) =
+                    nt_handler.pending_driver_load_transfer.take()
+                {
+                    transfer_pending_driver_load = Some((
+                        batch,
+                        reservation,
+                        native_call_transport,
+                        syscall_reply_context.regs,
+                    ));
+                }
                 if let Some(mut waiter) = nt_handler.pending_synchronous_file_wait.take() {
                     // Publish the exact FIFO owner before any post-dispatch completion can release
                     // the current Busy owner and inspect the policy waiter count.
@@ -9927,6 +9947,7 @@ pub(crate) unsafe fn service_sec_image(
                     park_dbgk_reporter = true;
                 }
                 let hosted_io_progress = driver_launch::pump_hosted_io_completions();
+                let _ = pending_driver_load_redrive_all(&mut nt_handler);
                 if hosted_io_progress != 0
                     || FILE_IO_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel)
                 {
@@ -16146,6 +16167,45 @@ pub(crate) unsafe fn service_sec_image(
             // A contended synchronous File has referenced its canonical route but has not created
             // an IRP. Transfer the live syscall reply into the FIFO acquisition owner.
             if synchronous_file_wait_parked {
+                let _ = finalize_service_loop_durable_state(
+                    &mut nt_handler,
+                    &mut heap_mark,
+                );
+                let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                badge = nb;
+                mi = nmi;
+                m0 = nm0;
+                m1 = nm1;
+                m2 = nm2;
+                m3 = nm3;
+                continue;
+            }
+            // Demand driver loads retain the exact START cursor and live syscall reply until every
+            // devnode is terminal. Publication precedes Reply-object rotation.
+            if let Some((batch, reservation, native_call_transport, reply_mrs)) =
+                transfer_pending_driver_load.take()
+            {
+                pending_driver_load_transfer(
+                    &mut nt_handler,
+                    batch,
+                    reservation,
+                    native_call_transport,
+                    reply_mrs,
+                    resume_ip,
+                    sp,
+                    flags,
+                );
+                trace_indefinite_wait_park(
+                    &nt_handler,
+                    badge,
+                    live_top_badges(&nt_handler),
+                    crash_parked,
+                    wait_parked,
+                );
+                mark_wait_parked!(pi, resume_ip);
+                driver_launch::pump_hosted_io_completions();
+                let _ = pending_driver_load_redrive_all(&mut nt_handler);
                 let _ = finalize_service_loop_durable_state(
                     &mut nt_handler,
                     &mut heap_mark,
@@ -23304,6 +23364,187 @@ unsafe fn file_cleanup_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         completed += 1;
     }
     completed
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn pending_driver_load_transfer(
+    nt_handler: &mut ExecNtHandler,
+    batch: OwnedHostedPnpStartBatch,
+    reservation: nt_driver_start::Reservation,
+    native_call_transport: bool,
+    mut reply_mrs: [u64; 18],
+    resume_ip: u64,
+    sp: u64,
+    flags: u64,
+) {
+    let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    assert_ne!(stolen, 0, "pending driver-load Reply object disappeared after preflight");
+    let (fresh_index, fresh) = wait_reply_pool_find_free()
+        .expect("pending driver-load Reply-pool claim disappeared after preflight");
+    if !native_call_transport {
+        reply_mrs[15] = resume_ip;
+        reply_mrs[16] = sp;
+        reply_mrs[17] = flags;
+    }
+    nt_handler
+        .pending_driver_loads
+        .publish(
+            reservation,
+            PendingNtLoadDriver {
+                batch,
+                tid: nt_handler.current_tid,
+                badge: nt_handler.current_badge,
+                reply_cap: stolen,
+                native_call_transport,
+                reply_mrs,
+            },
+        )
+        .expect("reserved driver-load continuation rejected its exact batch");
+    crate::mark_durable_table_growth_dirty();
+    wait_reply_pool_mark_used(fresh_index);
+    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+}
+
+unsafe fn pending_driver_load_reply(
+    nt_handler: &mut ExecNtHandler,
+    pending: &mut PendingNtLoadDriver,
+    status: u32,
+) {
+    let cap = core::mem::replace(&mut pending.reply_cap, 0);
+    if cap == 0 {
+        return;
+    }
+    let native_call_transport = pending.native_call_transport;
+    let reply_mrs = pending.reply_mrs;
+    let badge = pending.badge;
+    pending.tid = 0;
+    pending.badge = 0;
+    pending_driver_load_reply_owner(
+        nt_handler,
+        cap,
+        native_call_transport,
+        reply_mrs,
+        badge,
+        status,
+    );
+}
+
+unsafe fn pending_driver_load_reply_owner(
+    nt_handler: &mut ExecNtHandler,
+    cap: u64,
+    native_call_transport: bool,
+    reply_mrs: [u64; 18],
+    badge: u64,
+    status: u32,
+) {
+    if native_call_transport {
+        let _ = client_reply_on(cap, 1, status as u64, 0, 0, 0);
+    } else {
+        for index in 4..reply_mrs.len() {
+            set_reply_mr(index, reply_mrs[index]);
+        }
+        let _ = client_reply_on(
+            cap,
+            18,
+            status as u64,
+            reply_mrs[1],
+            reply_mrs[2],
+            reply_mrs[3],
+        );
+    }
+    release_reply_pool_cap(cap);
+    thread_wait_state_clear_badge_ready(nt_handler, badge);
+}
+
+unsafe fn pending_driver_load_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
+    let mut completed = 0u64;
+    for slot in 0..nt_handler.pending_driver_loads.slot_count() {
+        let progress = {
+            let Some(pending) = nt_handler.pending_driver_loads.get_mut(slot) else {
+                continue;
+            };
+            pending.batch.drive()
+        };
+        match progress {
+            OwnedHostedPnpStartProgress::AwaitingCompletion => {}
+            OwnedHostedPnpStartProgress::Complete(result) => {
+                let mut pending = nt_handler
+                    .pending_driver_loads
+                    .take(slot)
+                    .expect("completed driver-load continuation disappeared");
+                let status = match result {
+                    Ok(_) => nt_status::NtStatus::SUCCESS.raw() as u32,
+                    Err(failure) => failure.status.raw() as u32,
+                };
+                pending_driver_load_reply(nt_handler, &mut pending, status);
+                completed += 1;
+            }
+            OwnedHostedPnpStartProgress::OwnershipLost(failure) => {
+                let status = failure.status.raw() as u32;
+                let reply_owner = {
+                    let Some(pending) = nt_handler.pending_driver_loads.get_mut(slot) else {
+                        continue;
+                    };
+                    let cap = core::mem::replace(&mut pending.reply_cap, 0);
+                    if cap == 0 {
+                        None
+                    } else {
+                        let owner = (
+                            cap,
+                            pending.native_call_transport,
+                            pending.reply_mrs,
+                            pending.badge,
+                        );
+                        pending.tid = 0;
+                        pending.badge = 0;
+                        Some(owner)
+                    }
+                };
+                if let Some((cap, native, reply_mrs, badge)) = reply_owner {
+                    pending_driver_load_reply_owner(
+                        nt_handler,
+                        cap,
+                        native,
+                        reply_mrs,
+                        badge,
+                        status,
+                    );
+                    completed += 1;
+                }
+            }
+        }
+    }
+    completed
+}
+
+pub(crate) unsafe fn pending_driver_load_abandon_thread(
+    nt_handler: &mut ExecNtHandler,
+    tid: u64,
+) -> u64 {
+    let mut abandoned = 0u64;
+    for slot in 0..nt_handler.pending_driver_loads.slot_count() {
+        let Some(pending) = nt_handler.pending_driver_loads.get_mut(slot) else {
+            continue;
+        };
+        if pending.tid != tid || pending.reply_cap == 0 {
+            continue;
+        }
+        let cap = core::mem::replace(&mut pending.reply_cap, 0);
+        let deleted = cnode_delete_r(cap);
+        let retyped = if deleted == 0 {
+            untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
+        } else {
+            u64::MAX
+        };
+        if deleted == 0 && retyped == 0 {
+            release_reply_pool_cap(cap);
+        }
+        thread_wait_state_clear_badge(pending.badge);
+        pending.tid = 0;
+        pending.badge = 0;
+        abandoned += 1;
+    }
+    abandoned
 }
 
 unsafe fn pending_file_io_transfer(

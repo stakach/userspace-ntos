@@ -16997,6 +16997,7 @@ pub(crate) unsafe fn release_unregistered_hosted_thread_spawn(spawn: HostedThrea
 }
 
 unsafe fn hosted_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
+    let _ = crate::service_sec_image::pending_driver_load_abandon_thread(handler, tid);
     let _ = handler.cancel_file_io_for_thread_teardown(tid);
     thread_wait_state_clear_tid(handler, tid);
 }
@@ -21485,6 +21486,15 @@ struct ExecNtHandler {
     pending_file_io_wait: bool,
     /// Exact pre-dispatch owner claim consumed only if the driver returns a pending IRP.
     pending_file_io_reservation: Option<nt_io_manager::PendingFileIoReservation>,
+    /// Demand-start `NtLoadDriver` batches. The handler reserves a generation-exact slot before
+    /// DriverEntry/AddDevice/START side effects, and the service loop attaches the live syscall
+    /// Reply object only when an exact START IRP remains pending.
+    pending_driver_loads:
+        nt_driver_start::PendingDriverStartTable<PendingNtLoadDriver>,
+    pending_driver_load_transfer: Option<(
+        OwnedHostedPnpStartBatch,
+        nt_driver_start::Reservation,
+    )>,
     /// Contended synchronous File acquisition transferred into the FIFO owner at the reply site.
     pending_synchronous_file_wait: Option<nt_io_manager::SynchronousFileWaiter>,
     /// Final-handle `NtClose` continuation reserved before removing the process handle. File Busy
@@ -21620,6 +21630,17 @@ struct ExecNtHandler {
     /// MemFs file object without forcing a whole-volume raw-reserve checkpoint in the hot syscall
     /// path.
     writable_fs_commit_required: bool,
+}
+
+const PENDING_DRIVER_LOAD_INITIAL_CAPACITY: usize = 8;
+
+struct PendingNtLoadDriver {
+    batch: OwnedHostedPnpStartBatch,
+    tid: u64,
+    badge: u64,
+    reply_cap: u64,
+    native_call_transport: bool,
+    reply_mrs: [u64; 18],
 }
 
 static mut EXEC_NT_HANDLER_WORK: core::mem::MaybeUninit<ExecNtHandler> =

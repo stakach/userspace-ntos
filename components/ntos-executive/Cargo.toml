@@ -72,6 +72,7 @@ nt-root-bus = { path = "../../crates/nt-root-bus" }
 nt-pnp = { path = "../../crates/nt-pnp" }
 nt-pnp-manager = { path = "../../crates/nt-pnp-manager" }
 nt-pnp-context = { path = "../../crates/nt-pnp-context" }
+nt-driver-start = { path = "../../crates/nt-driver-start" }
 # PE loader — load + map + relocate a real Windows .sys binary in the isolated host.
 nt-pe-loader = { path = "../../crates/nt-pe-loader" }
 # Process Manager — real EPROCESS/ETHREAD + per-process handle tables + lifecycle. The live
