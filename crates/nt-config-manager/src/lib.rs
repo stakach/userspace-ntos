@@ -26,7 +26,8 @@ pub use property::{
     device_property, devprop_type, DevPropKey, DevicePropertySource, PropertyBag, PropertyValue,
 };
 pub use registry::{
-    encode_multi_sz, encode_sz, Registry, RegistryKeyId, RegistryValue, RegistryValueType,
+    encode_multi_sz, encode_sz, Registry, RegistryKeyId, RegistryTransaction, RegistryValue,
+    RegistryValueType,
 };
 
 /// The NT root-bus pseudo-devnode exposed through user-mode PnP relations.

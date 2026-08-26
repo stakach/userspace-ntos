@@ -42,7 +42,7 @@ use nt_config_abi::{
 };
 use nt_config_manager::{
     device_property, ConfigManager, DevicePropertySource, DriverServiceBinding, DriverServiceClass,
-    Registry, RegistryValueType, Win32ServiceProcessKind, Win32ServiceProcessLaunch,
+    RegistryTransaction, RegistryValueType, Win32ServiceProcessKind, Win32ServiceProcessLaunch,
     SERVICE_BOOT_START, SERVICE_DEMAND_START, SERVICE_SYSTEM_START,
 };
 use nt_hive_core::{
@@ -327,7 +327,7 @@ fn semantic_system_registry_path(
 }
 
 fn project_system_hive_mutations(
-    registry: &mut Registry,
+    registry: &mut RegistryTransaction<'_>,
     current_control_set: &CurrentControlSet,
     mutations: &[HiveMutation],
 ) -> Result<bool, i32> {
@@ -1207,11 +1207,11 @@ impl CmServer {
             .map_err(|_| STATUS_REGISTRY_CORRUPT)?;
 
         if previous_control_set == current_control_set {
-            let mut registry = self.cm.registry().clone();
+            let mut registry = self.cm.registry_mut().begin_transaction();
             let enum_changed =
                 project_system_hive_mutations(&mut registry, &current_control_set, mutations)?;
             transaction.commit();
-            *self.cm.registry_mut() = registry;
+            registry.commit();
             if enum_changed {
                 self.cm.refresh_registry_devnodes();
             }

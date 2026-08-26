@@ -7,6 +7,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::ops::Deref;
 
 /// An opaque registry key handle.
 pub type RegistryKeyId = u64;
@@ -176,7 +177,6 @@ struct KeyRecord {
 }
 
 /// The registry tree.
-#[derive(Clone)]
 pub struct Registry {
     keys: Vec<KeyRecord>,
     next_id: RegistryKeyId,
@@ -214,6 +214,14 @@ impl Registry {
             r.create_key(path);
         }
         r
+    }
+
+    /// Begin a bounded undo transaction over the registry tree.
+    ///
+    /// Only pre-existing records touched by a mutation are copied. New records are removed and
+    /// the allocation counters are restored if the transaction is dropped without committing.
+    pub fn begin_transaction(&mut self) -> RegistryTransaction<'_> {
+        RegistryTransaction::new(self)
     }
 
     fn alloc_key(&mut self, parent: Option<RegistryKeyId>, name: &str) -> RegistryKeyId {
@@ -463,6 +471,179 @@ impl Registry {
     }
 }
 
+/// A bounded undo transaction over a [`Registry`].
+///
+/// Read-only registry methods are available through [`Deref`]. Mutations must use the methods on
+/// this type so the original records can be restored if a later operation fails.
+pub struct RegistryTransaction<'a> {
+    registry: &'a mut Registry,
+    original_next_id: RegistryKeyId,
+    original_next_gen: u32,
+    undo: Vec<KeyRecord>,
+    committed: bool,
+}
+
+impl<'a> RegistryTransaction<'a> {
+    fn new(registry: &'a mut Registry) -> Self {
+        Self {
+            original_next_id: registry.next_id,
+            original_next_gen: registry.next_gen,
+            registry,
+            undo: Vec::new(),
+            committed: false,
+        }
+    }
+
+    fn snapshot_key(&mut self, id: RegistryKeyId) {
+        if id >= self.original_next_id || self.undo.iter().any(|record| record.id == id) {
+            return;
+        }
+        if let Some(record) = self.registry.record(id) {
+            self.undo.push(record.clone());
+        }
+    }
+
+    /// Commit all staged mutations.
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+
+    /// `ZwCreateKey` — open or create the key at `path`, creating intermediate keys.
+    pub fn create_key(&mut self, path: &str) -> RegistryKeyId {
+        let mut current = self.registry.root;
+        for component in Registry::components(path) {
+            current = self.create_subkey(current, component);
+        }
+        current
+    }
+
+    /// Open or create an immediate subkey.
+    pub fn create_subkey(&mut self, parent: RegistryKeyId, name: &str) -> RegistryKeyId {
+        if let Some(id) = self.registry.open_subkey(parent, name) {
+            return id;
+        }
+        self.snapshot_key(parent);
+        self.registry.create_subkey(parent, name)
+    }
+
+    pub fn set_volatile(&mut self, id: RegistryKeyId, volatile: bool) {
+        if self.registry.key_exists(id) {
+            self.snapshot_key(id);
+            self.registry.set_volatile(id, volatile);
+        }
+    }
+
+    /// `ZwSetValueKey` — set (create or replace) a named value on a key.
+    pub fn set_value(
+        &mut self,
+        key: RegistryKeyId,
+        name: &str,
+        value_type: RegistryValueType,
+        data: Vec<u8>,
+    ) -> bool {
+        if !self.registry.key_exists(key) {
+            return false;
+        }
+        self.snapshot_key(key);
+        self.registry.set_value(key, name, value_type, data)
+    }
+
+    pub fn set_dword(&mut self, key: RegistryKeyId, name: &str, value: u32) -> bool {
+        self.set_value(
+            key,
+            name,
+            RegistryValueType::Dword,
+            value.to_le_bytes().to_vec(),
+        )
+    }
+
+    pub fn set_qword(&mut self, key: RegistryKeyId, name: &str, value: u64) -> bool {
+        self.set_value(
+            key,
+            name,
+            RegistryValueType::Qword,
+            value.to_le_bytes().to_vec(),
+        )
+    }
+
+    pub fn set_string(&mut self, key: RegistryKeyId, name: &str, value: &str) -> bool {
+        self.set_value(key, name, RegistryValueType::Sz, encode_sz(value))
+    }
+
+    /// `ZwDeleteValueKey`.
+    pub fn delete_value(&mut self, key: RegistryKeyId, name: &str) -> bool {
+        if self.registry.query_value(key, name).is_none() {
+            return false;
+        }
+        self.snapshot_key(key);
+        self.registry.delete_value(key, name)
+    }
+
+    /// `ZwDeleteKey` — delete a key, optionally including its descendants.
+    pub fn delete_key(&mut self, key: RegistryKeyId, recursive: bool) -> bool {
+        let Some(record) = self.registry.record(key) else {
+            return false;
+        };
+        if !recursive && !record.subkeys.is_empty() {
+            return false;
+        }
+
+        let parent = record.parent;
+        let mut pending = alloc::vec![key];
+        let mut affected = Vec::new();
+        while let Some(id) = pending.pop() {
+            let Some(record) = self.registry.record(id) else {
+                continue;
+            };
+            pending.extend(record.subkeys.iter().map(|(_, child)| *child));
+            affected.push(id);
+        }
+        if let Some(parent) = parent {
+            self.snapshot_key(parent);
+        }
+        for id in affected {
+            self.snapshot_key(id);
+        }
+        self.registry.delete_key(key, recursive)
+    }
+}
+
+impl Deref for RegistryTransaction<'_> {
+    type Target = Registry;
+
+    fn deref(&self) -> &Self::Target {
+        self.registry
+    }
+}
+
+impl Drop for RegistryTransaction<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+
+        self.registry
+            .keys
+            .retain(|record| record.id < self.original_next_id);
+        self.undo.sort_by_key(|record| record.id);
+        for original in self.undo.drain(..) {
+            if let Some(current) = self.registry.record_mut(original.id) {
+                *current = original;
+            } else {
+                let index = self
+                    .registry
+                    .keys
+                    .iter()
+                    .position(|record| record.id > original.id)
+                    .unwrap_or(self.registry.keys.len());
+                self.registry.keys.insert(index, original);
+            }
+        }
+        self.registry.next_id = self.original_next_id;
+        self.registry.next_gen = self.original_next_gen;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,5 +729,56 @@ mod tests {
         assert!(!r.delete_key(parent, false));
         assert!(r.delete_key(parent, true));
         assert_eq!(r.open_key(r"\Registry\Machine\P"), None);
+    }
+
+    #[test]
+    fn transaction_drop_restores_touched_records_and_allocators() {
+        let mut registry = Registry::new();
+        let parent = registry.create_key(r"\Registry\Machine\Txn");
+        let leaf = registry.create_subkey(parent, "Leaf");
+        registry.set_dword(parent, "Keep", 7);
+        registry.set_string(leaf, "DeleteMe", "old");
+        let before = registry.snapshot_keys();
+        let next_id = registry.next_id;
+        let next_gen = registry.next_gen;
+        let parent_generation = registry.generation(parent);
+
+        {
+            let mut transaction = registry.begin_transaction();
+            transaction.set_dword(parent, "Keep", 9);
+            transaction.delete_value(leaf, "DeleteMe");
+            transaction.set_volatile(leaf, true);
+            transaction.delete_key(leaf, false);
+            let replacement = transaction.create_subkey(parent, "Leaf");
+            transaction.set_string(replacement, "New", "value");
+            transaction.create_key(r"\Registry\Machine\Txn\Created\Nested");
+        }
+
+        assert_eq!(registry.snapshot_keys(), before);
+        assert_eq!(registry.next_id, next_id);
+        assert_eq!(registry.next_gen, next_gen);
+        assert_eq!(registry.generation(parent), parent_generation);
+        assert_eq!(registry.query_dword(parent, "Keep"), Some(7));
+        let restored_leaf = registry.open_subkey(parent, "Leaf").unwrap();
+        assert_eq!(
+            registry.query_string(restored_leaf, "DeleteMe").as_deref(),
+            Some("old")
+        );
+        assert!(!registry.is_volatile(restored_leaf));
+    }
+
+    #[test]
+    fn transaction_commit_publishes_mutations() {
+        let mut registry = Registry::new();
+        let parent = registry.create_key(r"\Registry\Machine\TxnCommit");
+        {
+            let mut transaction = registry.begin_transaction();
+            let child = transaction.create_subkey(parent, "Child");
+            transaction.set_dword(child, "Value", 42);
+            transaction.commit();
+        }
+
+        let child = registry.open_subkey(parent, "Child").unwrap();
+        assert_eq!(registry.query_dword(child, "Value"), Some(42));
     }
 }
