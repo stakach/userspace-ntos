@@ -28739,16 +28739,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let system_boot_driver_plan = system_hive_boot_driver_launch_plan();
     let config_pnp_plan = config_hive_boot_system_pnp_driver_launch_plan();
     let config_demand_pnp_plan = config_hive_demand_pnp_driver_launch_plan();
-    let boot_device_service_count = system_boot_driver_plan
+    let replyless_device_service_count = system_boot_driver_plan
         .as_slice()
         .iter()
         .chain(config_pnp_plan.as_slice())
+        .chain(config_demand_pnp_plan.as_slice())
         .filter(|spec| {
             spec.class == driver_launch::DriverClass::Device && spec.devnode_count != 0
         })
         .count();
     let mut driver_start_bootstrap = DriverStartBootstrap::with_capacity(
-        PENDING_DRIVER_LOAD_INITIAL_CAPACITY.saturating_add(boot_device_service_count),
+        PENDING_DRIVER_LOAD_INITIAL_CAPACITY.saturating_add(replyless_device_service_count),
     );
     let scm_service_selection = system_hive_service_selection_report();
     print_str(b"[scm-select] auto-win32 count=");
@@ -29737,9 +29738,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut generic_pci_started = 0u64;
     let mut generic_pci_resource_accessed = false;
     let mut generic_pci_first_error = 0u32;
-    // The demand plan participates in resource discovery above, but only NtLoadDriver may execute
-    // its DriverEntry/AddDevice/START policy.
-    let config_pnp_launch_plans = [config_pnp_plan];
+    // A present devnode demand-loads its registry-selected function driver when no Driver object is
+    // loaded yet. This is the kernel PnP IopLoadDriver path, independent of a user NtLoadDriver
+    // request; Start=3 remains loadable here and only a disabled service is excluded by selection.
+    let config_pnp_launch_plans = [config_pnp_plan, config_demand_pnp_plan];
     if config_pnp_launch_plans
         .iter()
         .any(|plan| !plan.as_slice().is_empty())

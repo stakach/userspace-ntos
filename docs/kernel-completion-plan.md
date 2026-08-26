@@ -2581,21 +2581,45 @@ O(events + batches), not one global completion pump per batch. Completion merges
 batch report, publishes terminal START evidence/video routing, and removes the row. An ownership-loss
 row remains an unload barrier. The old non-resumable inline START adapter has been deleted.
 
-Demand-start policy is no longer violated by the B3 bootstrap proof: the demand plan still
-participates in resource-context discovery, but only boot/system plans execute before user mode and
-only `NtLoadDriver` may execute demand DriverEntry/AddDevice/START. Hardware gates defer when the
-preboot snapshot contains pending or indeterminate ownership and then consume the final post-service
-snapshot; a new `exec_boot_pnp_starts_terminal` gate exposes any unfinished replyless boot batch.
+Demand-start execution has two real authorities. A native `NtLoadDriver` request owns a syscall
+reply, while a present PnP devnode may demand-load its registry-selected function driver through the
+kernel `IopLoadDriver` device-action path without fabricating a user syscall. Both authorities use
+the same exact launch metadata and resumable batch; ordinary boot/system services and enumerated
+demand-start device services use the replyless owner. Disabled services remain excluded. Hardware
+gates defer when the preboot snapshot contains pending or indeterminate ownership and then consume
+the final post-service snapshot; a new `exec_boot_pnp_starts_terminal` gate exposes any unfinished
+replyless batch.
 Focused validation is green at `nt-driver-start` `5/5`, `nt-pnp-manager` `14/14`, and
 `nt-io-manager` `195/195`. The freestanding executive check is back at the established 212-warning
 baseline, formatting and `git diff --check` are clean.
 
-Review adjustment: run the serialized desktop gate before accepting this handoff. It must retain
-the three real canonical hardware STARTs, exact bochsmp route publication, provider-domain network
-traffic, genuine Explorer paint, the new boot terminal gate, and the sentinel. After acceptance,
-add a separate two-devnode WDM fixture whose START returns `STATUS_PENDING` and completes from a
-real timer/DPC through `IoCompleteRequest`; keep it separate from the existing DMA/PnP fixture so
-synchronous and asynchronous lifecycle coverage remain independently diagnosable.
+Validation review: two serialized attempts with the demand device-action cohort omitted
+both reached terminal boot/system START state (`drvwait=0`) but stopped before userinit. Their
+hardware report contained only E1000 and the DMA fixture (`selected=2`) and no hosted video route.
+The preceding accepted desktop proof contained the registry-selected `bochsmp` devnode as the third
+canonical START and published its hosted route. Review of ReactOS `PipCallDriverAddDevice` confirms
+that an enumerated devnode opens its service key and calls kernel `IopLoadDriver` when the Driver
+object is absent; this is not restricted to a user `NtLoadDriver` syscall and `Start=3` is not
+disabled. The replyless cohort therefore includes both boot/system services and present,
+registry-selected demand-start devnodes. The correction retains the shared resumable owner and does
+not restore the deleted raw START adapter.
+
+Serialized validation (2026-08-26, accepted):
+`.tmp/run-desktop-replyless-device-action-20260826.log` starts the real E1000, DMA-test, and
+registry-selected bochsmp stacks through the replyless canonical device-action path. The hardware
+report is `selected/attempted/add/started=3/3/3/3` and
+`terminal/failed/pending/indeterminate=3/0/0/0`; bochsmp publishes the hosted video route, provider
+sharing completes `47/47` exports with zero rejections, and the final replyless report passes
+`exec_boot_pnp_starts_terminal` with config `attempted/terminal/pending/indeterminate=3/3/0/0`.
+Genuine userinit and Explorer launch, 669 real api0 callbacks complete with zero callback failures,
+and Explorer paints all `480000/480000` framebuffer pixels with at least 32 non-background colours.
+All `295/295` executive gates pass and the sentinel fires. QEMU was stopped only after the sentinel.
+The replyless boot and PnP device-action continuation checkpoint is accepted.
+
+Review adjustment: add the separate two-devnode WDM fixture next. Its START must return
+`STATUS_PENDING`, complete later from a real timer/DPC through `IoCompleteRequest`, and prove both a
+terminal native demand reply and resumed replyless boot progression. Keep it separate from the
+existing synchronous DMA/PnP fixture so the two lifecycle modes remain independently diagnosable.
 
 ### A. SCM-Controlled Service Startup
 
