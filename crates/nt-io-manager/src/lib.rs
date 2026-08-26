@@ -4805,6 +4805,12 @@ mod tests {
             .unwrap()
             .flags
             .contains(DriverFlags::FAULTED));
+        assert_eq!(
+            om.acknowledge_completed_irp_strict(irp),
+            Err(NtStatus::DEVICE_NOT_CONNECTED)
+        );
+        assert_eq!(om.completed_irp(irp).unwrap().id, irp);
+        assert!(om.irp(irp).is_some());
         om.acknowledge_completed_irp(irp).unwrap();
         assert!(om.irp(irp).is_none());
 

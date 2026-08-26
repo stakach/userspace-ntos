@@ -2484,6 +2484,37 @@ driver-origin completion, lifecycle commit, backend acknowledgement, and post-st
 and retain indeterminate rows as teardown barriers. After that, harden I/O Manager deletion and
 exact detach ordering before wiring query/cancel/stop/remove and adapter-exact callback retirement.
 
+B3 asynchronous START integrity checkpoint (2026-08-26, implementation green): a pending hosted
+START is no longer flattened into an ordinary failed batch that demand `NtLoadDriver` may unload.
+The executive transaction separates the driver's returned status from an indeterminate transport or
+lifecycle barrier, permits only explicit phase transitions, retains a terminal row until an exact
+`IrpId` observer consumes it, and blocks driver unload while any transaction still owns the driver.
+The completion drain accepts only the captured driver/device/minor identity and driver-origin
+provenance, commits the PnP lifecycle before acknowledgement, and now uses a strict I/O Manager ACK.
+A faulted backend cannot turn local IRP reclamation into false acknowledgement proof: the exact
+completion and IRP remain retained and the PnP transaction becomes indeterminate.
+
+Post-START publication is resumable by stage. PCI line state, MMIO usage, interrupt connection, DMA
+usage, interface state, and the resource snapshot each publish once; a failed MMIO validation rolls
+back the newly created mapping before retry. Boot and hardware reports distinguish attempted,
+terminal, failed, pending, observed-pending, and indeterminate STARTs, and the new gate requires
+every attempted production START to be terminal with no barrier. A nonblocking observation after
+dispatch closes the completion-before-caller race without monopolising the executive receive loop.
+Focused validation is green at `nt-io-manager` `195/195`, `nt-pnp-manager` `14/14`, the freestanding
+executive check is back at the established 212-warning baseline, and `git diff --check` is clean.
+
+Review adjustment: asynchronous demand start is not complete yet. An outstanding START currently
+remains loaded and returns the intermediate `STATUS_PENDING` result instead of illegally unloading,
+but NT `NtLoadDriver` semantics require one terminal reply. Replace the batch-local loop with a
+generation-exact resumable devnode-start record and park the native syscall on a reserved seL4 Reply
+capability. Redrive it after hosted-I/O progress and immediately after parking; terminal observation
+must finish evidence/route publication and continue later devnodes before replying once. Thread exit
+releases only reply ownership, not the driver transaction. Boot-time pending START also needs a
+resumable launch phase because boot driver launch precedes the ordinary service receive loop. Do not
+busy-wait inside either path. Once both callers consume the same continuation mechanism, add a real
+driver fixture that returns `STATUS_PENDING` from START and later calls `IoCompleteRequest`, then
+continue with I/O Manager deletion admission and ordered query/cancel/stop/remove.
+
 ### A. SCM-Controlled Service Startup
 
 - `[x]` A0: Inventory the current SCM/service startup path and mark the static boundaries still in

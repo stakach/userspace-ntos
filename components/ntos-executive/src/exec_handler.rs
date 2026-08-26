@@ -5690,13 +5690,15 @@ impl ExecNtHandler {
             return STATUS_UNSUCCESSFUL;
         };
         if spec.class == driver_launch::DriverClass::Device && !spec.devnodes.is_empty() {
-            if let Err(status) = start_owned_driver_service_devnodes(
+            if let Err(failure) = start_owned_driver_service_devnodes(
                 &dc,
                 &spec,
                 HostedPnpStartOptions::demand_start(),
             ) {
-                let _ = driver_launch::unload_driver_by_name(&spec.driver_object_path);
-                return status.raw() as u32;
+                if !failure.teardown_blocked {
+                    let _ = driver_launch::unload_driver_by_name(&spec.driver_object_path);
+                }
+                return failure.status.raw() as u32;
             }
         }
         0

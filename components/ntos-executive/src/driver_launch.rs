@@ -34156,66 +34156,128 @@ unsafe fn drain_hosted_pnp_completions() -> usize {
                     && completion.user_data == 0
                     && completion.requestor_tid == 0;
                 if !identity_valid || completion.completion_origin != IrpCompletionOrigin::Driver {
-                    let _ = set_hosted_pnp_transaction_phase(
+                    set_hosted_pnp_indeterminate(
                         irp_id,
-                        HostedPnpTransactionPhase::Indeterminate,
-                        completion.status,
-                    );
+                        nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                    )
+                    .expect("hosted PnP identity failure lost its transaction");
                     progress = progress.saturating_add(1);
                     index += 1;
                     continue;
                 }
-                if complete_hosted_pnp_lifecycle(irp_id, completion.status).is_err() {
-                    let _ = set_hosted_pnp_transaction_phase(
-                        irp_id,
-                        HostedPnpTransactionPhase::Indeterminate,
-                        completion.status,
-                    );
+                if let Err(lifecycle_status) =
+                    complete_hosted_pnp_lifecycle(irp_id, completion.status)
+                {
+                    set_hosted_pnp_indeterminate(irp_id, lifecycle_status)
+                        .expect("hosted PnP lifecycle failure lost its transaction");
                     progress = progress.saturating_add(1);
                     index += 1;
                     continue;
                 }
-                let _ = set_hosted_pnp_transaction_phase(
+                set_hosted_pnp_driver_status(
                     irp_id,
                     HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck,
                     completion.status,
-                );
+                )
+                .expect("hosted PnP completion lost its transaction");
                 progress = progress.saturating_add(1);
                 continue;
             }
             HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck => {
-                if io_manager_mut().acknowledge_completed_irp(irp_id).is_err() {
+                if let Err(status) = io_manager_mut().acknowledge_completed_irp_strict(irp_id) {
+                    set_hosted_pnp_indeterminate(irp_id, status)
+                        .expect("hosted PnP acknowledgement failure lost its transaction");
+                    progress = progress.saturating_add(1);
                     index += 1;
                     continue;
                 }
                 if minor == nt_pnp_manager::PnpMinor::StartDevice {
                     if finish_hosted_start_publication(irp_id).is_err() {
-                        let _ = set_hosted_pnp_transaction_phase_only(
+                        transition_hosted_pnp_transaction_phase(
                             irp_id,
                             HostedPnpTransactionPhase::PostStartRepair,
-                        );
+                        )
+                        .expect("hosted PnP repair transition lost its transaction");
                         progress = progress.saturating_add(1);
                         index += 1;
                         continue;
                     }
+                    transition_hosted_pnp_transaction_phase(
+                        irp_id,
+                        HostedPnpTransactionPhase::Terminal,
+                    )
+                    .expect("hosted PnP terminal transition lost its transaction");
+                    progress = progress.saturating_add(1);
+                    index += 1;
+                    continue;
                 }
                 remove_hosted_pnp_transaction(irp_id);
                 progress = progress.saturating_add(1);
             }
             HostedPnpTransactionPhase::PostStartRepair => {
                 if finish_hosted_start_publication(irp_id).is_ok() {
-                    remove_hosted_pnp_transaction(irp_id);
+                    transition_hosted_pnp_transaction_phase(
+                        irp_id,
+                        HostedPnpTransactionPhase::Terminal,
+                    )
+                    .expect("hosted PnP repaired transaction could not become terminal");
                     progress = progress.saturating_add(1);
+                    index += 1;
                 } else {
                     index += 1;
                 }
             }
-            HostedPnpTransactionPhase::Prepared | HostedPnpTransactionPhase::Indeterminate => {
+            HostedPnpTransactionPhase::Prepared
+            | HostedPnpTransactionPhase::Terminal
+            | HostedPnpTransactionPhase::Indeterminate => {
                 index += 1;
             }
         }
     }
     progress
+}
+
+pub(crate) unsafe fn observe_hosted_pnp_start(
+    irp_id: u64,
+) -> Result<HostedPnpStartObservation, nt_status::NtStatus> {
+    if irp_id == 0 {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let irp_id = IrpId(irp_id);
+    let transactions = hosted_pnp_transactions_mut();
+    let index = transactions
+        .iter()
+        .position(|transaction| transaction.irp_id == irp_id)
+        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    let minor = transactions[index].minor;
+    let phase = transactions[index].phase;
+    if minor != nt_pnp_manager::PnpMinor::StartDevice {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    match phase {
+        HostedPnpTransactionPhase::Terminal => {
+            let transaction = transactions.remove(index);
+            Ok(HostedPnpStartObservation::Terminal {
+                driver_status: transaction
+                    .driver_status
+                    .expect("terminal hosted PnP START has no driver status"),
+            })
+        }
+        HostedPnpTransactionPhase::Indeterminate => {
+            Ok(HostedPnpStartObservation::Indeterminate {
+                transport_status: transactions[index]
+                    .barrier_status
+                    .expect("indeterminate hosted PnP START has no barrier status"),
+            })
+        }
+        HostedPnpTransactionPhase::Prepared
+        | HostedPnpTransactionPhase::Dispatching
+        | HostedPnpTransactionPhase::AwaitingCompletion
+        | HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck
+        | HostedPnpTransactionPhase::PostStartRepair => {
+            Ok(HostedPnpStartObservation::AwaitingCompletion)
+        }
+    }
 }
 
 pub(crate) unsafe fn abandon_pending_irp(irp_id: u64) -> Result<(), u32> {
@@ -35216,6 +35278,7 @@ enum HostedPnpTransactionPhase {
     AwaitingCompletion,
     LifecycleCommittedAwaitingAck,
     PostStartRepair,
+    Terminal,
     Indeterminate,
 }
 
@@ -35228,8 +35291,15 @@ struct HostedPnpTransaction {
     completion_device_id: nt_io_manager::DeviceId,
     token: Option<nt_pnp_manager::PnpDispatchToken>,
     phase: HostedPnpTransactionPhase,
-    terminal_status: nt_status::NtStatus,
+    driver_status: Option<nt_status::NtStatus>,
+    barrier_status: Option<nt_status::NtStatus>,
     pci_interrupt_line: Option<crate::pnp::PciInterruptLineProgramming>,
+    pci_line_published: bool,
+    mmio_usage_published: bool,
+    interrupt_usage_published: bool,
+    dma_usage_published: bool,
+    interface_state_published: bool,
+    resource_snapshot_published: bool,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -35242,8 +35312,20 @@ pub(crate) enum HostedPnpStartOutcome {
         transport_status: nt_status::NtStatus,
     },
     RepairRequired {
+        irp_id: u64,
         driver_status: nt_status::NtStatus,
         repair_status: nt_status::NtStatus,
+    },
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HostedPnpStartObservation {
+    AwaitingCompletion,
+    Terminal {
+        driver_status: nt_status::NtStatus,
+    },
+    Indeterminate {
+        transport_status: nt_status::NtStatus,
     },
 }
 
@@ -35582,29 +35664,81 @@ unsafe fn set_hosted_pnp_transaction_token(
     Ok(())
 }
 
-unsafe fn set_hosted_pnp_transaction_phase(
+unsafe fn transition_hosted_pnp_transaction_phase(
     irp_id: IrpId,
     phase: HostedPnpTransactionPhase,
-    terminal_status: nt_status::NtStatus,
 ) -> Result<(), nt_status::NtStatus> {
     let transaction = hosted_pnp_transactions_mut()
         .iter_mut()
         .find(|transaction| transaction.irp_id == irp_id)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let allowed = matches!(
+        (transaction.phase, phase),
+        (
+            HostedPnpTransactionPhase::Dispatching,
+            HostedPnpTransactionPhase::AwaitingCompletion
+        ) | (
+            HostedPnpTransactionPhase::Dispatching,
+            HostedPnpTransactionPhase::PostStartRepair
+        ) | (
+            HostedPnpTransactionPhase::Dispatching,
+            HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck
+        ) | (
+            HostedPnpTransactionPhase::AwaitingCompletion,
+            HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck
+        ) | (
+            HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck,
+            HostedPnpTransactionPhase::PostStartRepair
+        ) | (
+            HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck,
+            HostedPnpTransactionPhase::Terminal
+        ) | (
+            HostedPnpTransactionPhase::PostStartRepair,
+            HostedPnpTransactionPhase::Terminal
+        )
+    ) || (phase == HostedPnpTransactionPhase::Indeterminate
+        && !matches!(
+            transaction.phase,
+            HostedPnpTransactionPhase::Terminal | HostedPnpTransactionPhase::Indeterminate
+        ));
+    if !allowed {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
     transaction.phase = phase;
-    transaction.terminal_status = terminal_status;
     Ok(())
 }
 
-unsafe fn set_hosted_pnp_transaction_phase_only(
+unsafe fn set_hosted_pnp_driver_status(
     irp_id: IrpId,
     phase: HostedPnpTransactionPhase,
+    driver_status: nt_status::NtStatus,
 ) -> Result<(), nt_status::NtStatus> {
     let transaction = hosted_pnp_transactions_mut()
         .iter_mut()
         .find(|transaction| transaction.irp_id == irp_id)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    transaction.phase = phase;
+    if transaction.driver_status.is_some() || transaction.barrier_status.is_some() {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    transition_hosted_pnp_transaction_phase(irp_id, phase)?;
+    let transaction = hosted_pnp_transactions_mut()
+        .iter_mut()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    transaction.driver_status = Some(driver_status);
+    Ok(())
+}
+
+unsafe fn set_hosted_pnp_indeterminate(
+    irp_id: IrpId,
+    barrier_status: nt_status::NtStatus,
+) -> Result<(), nt_status::NtStatus> {
+    transition_hosted_pnp_transaction_phase(irp_id, HostedPnpTransactionPhase::Indeterminate)?;
+    let transaction = hosted_pnp_transactions_mut()
+        .iter_mut()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    transaction.barrier_status = Some(barrier_status);
     Ok(())
 }
 
@@ -35630,40 +35764,83 @@ unsafe fn complete_hosted_pnp_lifecycle(
 unsafe fn finish_hosted_start_publication(
     irp_id: IrpId,
 ) -> Result<(), nt_status::NtStatus> {
-    let transactions = hosted_pnp_transactions_mut();
-    let transaction = transactions
+    let transaction = hosted_pnp_transactions_mut()
         .iter()
         .find(|transaction| transaction.irp_id == irp_id)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     let binding = transaction.binding;
-    let terminal_status = transaction.terminal_status;
+    let terminal_status = transaction
+        .driver_status
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     let pci_interrupt_line = transaction.pci_interrupt_line;
+    let pci_line_published = transaction.pci_line_published;
+    let mmio_usage_published = transaction.mmio_usage_published;
+    let interrupt_usage_published = transaction.interrupt_usage_published;
+    let dma_usage_published = transaction.dma_usage_published;
+    let interface_state_published = transaction.interface_state_published;
+    let resource_snapshot_published = transaction.resource_snapshot_published;
     let sh = instance_by_driver_id(binding.driver_id)
         .map(|(_, instance)| instance.exec_shared_va)
         .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
 
-    let mut first_error = None;
-    if let Some(state) = hosted_device_resource_states_mut()
-        .iter_mut()
-        .find(|state| {
-            state.device_id == binding.device_id
-                && state.projection_domain == binding.projection_domain
-        })
-    {
+    if !pci_line_published {
+        let state = hosted_device_resource_states_mut()
+            .iter_mut()
+            .find(|state| {
+                state.device_id == binding.device_id
+                    && state.projection_domain == binding.projection_domain
+            })
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
         state.pci_interrupt_line = pci_interrupt_line;
-    } else {
-        first_error = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        hosted_pnp_transactions_mut()
+            .iter_mut()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            .pci_line_published = true;
     }
-    if let Err(status) = record_hosted_resource_usage(binding, sh) {
-        first_error.get_or_insert(status);
+    if !mmio_usage_published {
+        record_hosted_mmio_usage(binding, sh)?;
+        hosted_pnp_transactions_mut()
+            .iter_mut()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            .mmio_usage_published = true;
     }
-    if terminal_status.is_success() {
-        if let Err(status) = apply_hosted_device_interface_state(sh) {
-            first_error.get_or_insert(status);
+    if !interrupt_usage_published {
+        publish_hosted_interrupt_connection_from_shared(binding, sh)?;
+        hosted_pnp_transactions_mut()
+            .iter_mut()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            .interrupt_usage_published = true;
+    }
+    if !dma_usage_published {
+        replay_hosted_dma_allocation_records(binding, sh)?;
+        hosted_pnp_transactions_mut()
+            .iter_mut()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            .dma_usage_published = true;
+    }
+    if !interface_state_published {
+        if terminal_status.is_success() {
+            apply_hosted_device_interface_state(sh)?;
         }
+        hosted_pnp_transactions_mut()
+            .iter_mut()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            .interface_state_published = true;
     }
-    refresh_hosted_device_resource_state(binding, sh);
-    first_error.map_or(Ok(()), Err)
+    if !resource_snapshot_published {
+        refresh_hosted_device_resource_state(binding, sh);
+        hosted_pnp_transactions_mut()
+            .iter_mut()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            .resource_snapshot_published = true;
+    }
+    Ok(())
 }
 
 unsafe fn hosted_resource_manager_mut() -> &'static mut ResourceManager {
@@ -42843,7 +43020,7 @@ unsafe fn replay_hosted_dma_allocation_records(
     Ok(())
 }
 
-unsafe fn record_hosted_resource_usage(
+unsafe fn record_hosted_mmio_usage(
     binding: HostedDeviceBinding,
     sh: u64,
 ) -> Result<(), nt_status::NtStatus> {
@@ -42859,23 +43036,21 @@ unsafe fn record_hosted_resource_usage(
             true,
         )
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        let expected_resource_id = hosted_mmio_resource_id(binding.device_id, resource.bar_index)
+            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
         let mapped = hosted_resource_manager_mut()
             .map_io_space(owner, mapped_phys, mapped_len, nt_hal_abi::MM_NON_CACHED)
             .map_err(hosted_hal_status)?;
-        if mapped.resource_id
-            != hosted_mmio_resource_id(binding.device_id, resource.bar_index)
-                .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?
+        if mapped.resource_id != expected_resource_id
             || mapped.translated_start != mapped_phys
             || mapped.length != mapped_len
             || resource.va == 0
         {
+            let _ = hosted_resource_manager_mut().unmap_io_space(owner, mapped.mapping_id);
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
     }
-
-    publish_hosted_interrupt_connection_from_shared(binding, sh)?;
-
-    replay_hosted_dma_allocation_records(binding, sh)
+    Ok(())
 }
 
 unsafe fn publish_hosted_interrupt_connection_from_shared(
@@ -43503,8 +43678,15 @@ pub(crate) unsafe fn start_hosted_device_canonical(
         completion_device_id,
         token: None,
         phase: HostedPnpTransactionPhase::Prepared,
-        terminal_status: nt_status::NtStatus::NOT_SUPPORTED,
+        driver_status: None,
+        barrier_status: None,
         pci_interrupt_line,
+        pci_line_published: false,
+        mmio_usage_published: false,
+        interrupt_usage_published: false,
+        dma_usage_published: false,
+        interface_state_published: false,
+        resource_snapshot_published: false,
     };
     if let Err(status) = reserve_hosted_pnp_transaction(transaction) {
         let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
@@ -43532,23 +43714,22 @@ pub(crate) unsafe fn start_hosted_device_canonical(
     match io_manager_mut().dispatch_prepared_external_pnp(prepared) {
         ExternalPnpDispatchResult::Returned { status, .. } => {
             if let Err(transport_status) = complete_hosted_pnp_lifecycle(irp_id, status) {
-                let _ = set_hosted_pnp_transaction_phase(
-                    irp_id,
-                    HostedPnpTransactionPhase::Indeterminate,
-                    status,
-                );
+                set_hosted_pnp_indeterminate(irp_id, transport_status)
+                    .expect("synchronous hosted PnP lifecycle failure lost its transaction");
                 return Ok(HostedPnpStartOutcome::Indeterminate {
                     irp_id: irp_id.raw(),
                     transport_status,
                 });
             }
-            let _ = set_hosted_pnp_transaction_phase(
+            set_hosted_pnp_driver_status(
                 irp_id,
                 HostedPnpTransactionPhase::PostStartRepair,
                 status,
-            );
+            )
+            .expect("synchronous hosted PnP START lost its transaction");
             if let Err(repair_status) = finish_hosted_start_publication(irp_id) {
                 return Ok(HostedPnpStartOutcome::RepairRequired {
+                    irp_id: irp_id.raw(),
                     driver_status: status,
                     repair_status,
                 });
@@ -43561,11 +43742,11 @@ pub(crate) unsafe fn start_hosted_device_canonical(
             }
         }
         ExternalPnpDispatchResult::Pending { irp_id } => {
-            let _ = set_hosted_pnp_transaction_phase(
+            transition_hosted_pnp_transaction_phase(
                 irp_id,
                 HostedPnpTransactionPhase::AwaitingCompletion,
-                nt_status::NtStatus::PENDING,
-            );
+            )
+            .expect("pending hosted PnP START lost its transaction");
             Ok(HostedPnpStartOutcome::Pending {
                 irp_id: irp_id.raw(),
             })
@@ -43574,11 +43755,8 @@ pub(crate) unsafe fn start_hosted_device_canonical(
             irp_id,
             transport_status,
         } => {
-            let _ = set_hosted_pnp_transaction_phase(
-                irp_id,
-                HostedPnpTransactionPhase::Indeterminate,
-                transport_status,
-            );
+            set_hosted_pnp_indeterminate(irp_id, transport_status)
+                .expect("indeterminate hosted PnP START lost its transaction");
             Ok(HostedPnpStartOutcome::Indeterminate {
                 irp_id: irp_id.raw(),
                 transport_status,
@@ -43694,6 +43872,12 @@ pub(crate) unsafe fn unload_driver_by_name(
 ) -> Result<(), nt_status::NtStatus> {
     let driver_id =
         driver_id_by_name(driver_object_path).ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    if hosted_pnp_transactions_mut()
+        .iter()
+        .any(|transaction| transaction.binding.driver_id == driver_id)
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     let (index, inst) =
         instance_by_driver_id(driver_id).ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
     if inst.driver_unload == 0 {

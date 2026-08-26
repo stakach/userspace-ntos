@@ -28511,6 +28511,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         let mut generic_hw_video_route_attempted = 0u64;
         let mut generic_hw_video_route_published_count = 0u64;
         let mut generic_hw_first_error = 0u32;
+        let mut generic_hw_terminal = 0u64;
+        let mut generic_hw_failed = 0u64;
+        let mut generic_hw_pending = 0u64;
+        let mut generic_hw_pending_observed = 0u64;
+        let mut generic_hw_indeterminate = 0u64;
+        let mut generic_hw_first_indeterminate = 0u32;
         for spec in system_boot_driver_plan.as_slice() {
             let spec_devnodes = system_boot_driver_plan.devnodes_for(spec);
             if driver_launch::driver_id_by_name(spec.driver_object_path.as_str()).is_some() {
@@ -28554,12 +28560,22 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     generic_hw_root_started |= start_report.root_started;
                     generic_hw_video_route_published |= start_report.video_route_published;
                     generic_hw_attempted += start_report.attempted;
+                    generic_hw_terminal += start_report.terminal;
                     generic_hw_started += start_report.started;
+                    generic_hw_failed += start_report.failed;
+                    generic_hw_pending += start_report.pending;
+                    generic_hw_pending_observed += start_report.pending_observed;
+                    generic_hw_indeterminate += start_report.indeterminate;
                     generic_hw_video_route_attempted += start_report.video_route_attempted_count;
                     generic_hw_video_route_published_count +=
                         start_report.video_route_published_count;
                     if generic_hw_first_error == 0 && start_report.first_error != 0 {
                         generic_hw_first_error = start_report.first_error;
+                    }
+                    if generic_hw_first_indeterminate == 0
+                        && start_report.first_indeterminate != 0
+                    {
+                        generic_hw_first_indeterminate = start_report.first_indeterminate;
                     }
                 }
                 let device_path =
@@ -28587,8 +28603,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_u64(generic_hw_attempted);
             print_str(b" started=");
             print_u64(generic_hw_started);
+            print_str(b" terminal/failed/pending/pending-observed/indeterminate=");
+            print_u64(generic_hw_terminal);
+            print_str(b"/");
+            print_u64(generic_hw_failed);
+            print_str(b"/");
+            print_u64(generic_hw_pending);
+            print_str(b"/");
+            print_u64(generic_hw_pending_observed);
+            print_str(b"/");
+            print_u64(generic_hw_indeterminate);
             print_str(b" first_error=0x");
             print_hex(generic_hw_first_error);
+            print_str(b" first_indeterminate=0x");
+            print_hex(generic_hw_first_indeterminate);
             print_str(b" mmio=");
             print_u64(generic_hw_mmio_mapped as u64);
             print_str(b" int=");
@@ -29363,11 +29391,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut generic_hw_video_route_published = false;
     let mut generic_hw_selected = 0u64;
     let mut generic_hw_attempted = 0u64;
+    let mut generic_hw_terminal = 0u64;
     let mut generic_hw_add_device_count = 0u64;
     let mut generic_hw_started = 0u64;
+    let mut generic_hw_failed = 0u64;
+    let mut generic_hw_pending = 0u64;
+    let mut generic_hw_pending_observed = 0u64;
+    let mut generic_hw_indeterminate = 0u64;
     let mut generic_hw_video_route_attempted = 0u64;
     let mut generic_hw_video_route_published_count = 0u64;
     let mut generic_hw_first_error = 0u32;
+    let mut generic_hw_first_indeterminate = 0u32;
     let mut generic_root_attempted = 0u64;
     let mut generic_root_started = 0u64;
     let mut generic_pci_registry_selected = false;
@@ -29427,10 +29461,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         generic_hw_driver_loaded |= start_report.driver_ready_for_pnp;
                         generic_hw_add_device |= start_report.add_device;
                         generic_hw_attempted += start_report.attempted;
+                        generic_hw_terminal += start_report.terminal;
                         generic_hw_add_device_count += start_report.add_device_count;
                         generic_hw_started += start_report.started;
+                        generic_hw_failed += start_report.failed;
+                        generic_hw_pending += start_report.pending;
+                        generic_hw_pending_observed += start_report.pending_observed;
+                        generic_hw_indeterminate += start_report.indeterminate;
                         if generic_hw_first_error == 0 && start_report.first_error != 0 {
                             generic_hw_first_error = start_report.first_error;
+                        }
+                        if generic_hw_first_indeterminate == 0
+                            && start_report.first_indeterminate != 0
+                        {
+                            generic_hw_first_indeterminate = start_report.first_indeterminate;
                         }
                         if spec_has_pci_devnode {
                             generic_pci_add_device |= start_report.add_device;
@@ -29578,8 +29622,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_u64(generic_hw_add_device_count);
         print_str(b" started=");
         print_u64(generic_hw_started);
+        print_str(b" terminal/failed/pending/pending-observed/indeterminate=");
+        print_u64(generic_hw_terminal);
+        print_str(b"/");
+        print_u64(generic_hw_failed);
+        print_str(b"/");
+        print_u64(generic_hw_pending);
+        print_str(b"/");
+        print_u64(generic_hw_pending_observed);
+        print_str(b"/");
+        print_u64(generic_hw_indeterminate);
         print_str(b" first_error=0x");
         print_hex(generic_hw_first_error);
+        print_str(b" first_indeterminate=0x");
+        print_hex(generic_hw_first_indeterminate);
         print_str(b" pci_selected=");
         print_u64(generic_pci_selected);
         print_str(b" pci_attempted=");
@@ -29731,6 +29787,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             && generic_hw_add_device
             && generic_hw_attempted == generic_hw_selected
             && generic_hw_add_device_count == generic_hw_selected,
+        &mut passed,
+    );
+    check(
+        b"exec_generic_pnp_starts_terminal",
+        generic_hw_attempted != 0
+            && generic_hw_terminal == generic_hw_attempted
+            && generic_hw_started + generic_hw_failed == generic_hw_terminal
+            && generic_hw_pending == 0
+            && generic_hw_indeterminate == 0
+            && generic_hw_first_indeterminate == 0,
         &mut passed,
     );
     check(

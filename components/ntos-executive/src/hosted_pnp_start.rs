@@ -55,8 +55,13 @@ pub(crate) struct HostedPnpStartReport {
     pub(crate) root_started: bool,
     pub(crate) video_route_published: bool,
     pub(crate) attempted: u64,
+    pub(crate) terminal: u64,
     pub(crate) add_device_count: u64,
     pub(crate) started: u64,
+    pub(crate) failed: u64,
+    pub(crate) pending: u64,
+    pub(crate) pending_observed: u64,
+    pub(crate) indeterminate: u64,
     pub(crate) resource_granted_count: u64,
     pub(crate) mmio_mapped_count: u64,
     pub(crate) interrupt_connected_count: u64,
@@ -91,6 +96,13 @@ pub(crate) struct HostedPnpStartReport {
     pub(crate) video_route_attempted_count: u64,
     pub(crate) video_route_published_count: u64,
     pub(crate) first_error: u32,
+    pub(crate) first_indeterminate: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HostedPnpStartBatchFailure {
+    pub(crate) status: nt_status::NtStatus,
+    pub(crate) teardown_blocked: bool,
 }
 
 struct HostedPnpDevnodeStart<'a, H, C> {
@@ -153,7 +165,7 @@ pub(crate) unsafe fn start_owned_driver_service_devnodes(
     dc: &driver_launch::DriverComponent,
     spec: &DriverServiceLaunchSpec,
     options: HostedPnpStartOptions,
-) -> Result<HostedPnpStartReport, nt_status::NtStatus> {
+) -> Result<HostedPnpStartReport, HostedPnpStartBatchFailure> {
     let mut report = HostedPnpStartReport {
         driver_ready_for_pnp: (dc.verdict & V_ENTERED) != 0
             && (dc.add_device != 0
@@ -177,10 +189,26 @@ pub(crate) unsafe fn start_owned_driver_service_devnodes(
             &mut report,
         );
     }
-    if report.first_error != 0 {
-        Err(nt_status::NtStatus(report.first_error as i32))
-    } else if report.attempted != report.started {
-        Err(nt_status::NtStatus::UNSUCCESSFUL)
+    if report.indeterminate != 0 {
+        Err(HostedPnpStartBatchFailure {
+            status: nt_status::NtStatus(report.first_indeterminate as i32),
+            teardown_blocked: true,
+        })
+    } else if report.pending != 0 {
+        Err(HostedPnpStartBatchFailure {
+            status: nt_status::NtStatus::PENDING,
+            teardown_blocked: true,
+        })
+    } else if report.first_error != 0 {
+        Err(HostedPnpStartBatchFailure {
+            status: nt_status::NtStatus(report.first_error as i32),
+            teardown_blocked: report.add_device_count != 0,
+        })
+    } else if report.terminal != report.attempted || report.started != report.attempted {
+        Err(HostedPnpStartBatchFailure {
+            status: nt_status::NtStatus::UNSUCCESSFUL,
+            teardown_blocked: report.add_device_count != 0,
+        })
     } else {
         Ok(report)
     }
@@ -406,7 +434,7 @@ unsafe fn start_one_devnode<H, C>(
     ) {
         Ok(prepared) => prepared,
         Err(status) => {
-            remember_error(report, status);
+            record_terminal_start_failure(report, status);
             print_resource_preparation_failure(
                 options.trace,
                 service_name,
@@ -455,11 +483,14 @@ unsafe fn start_one_devnode<H, C>(
                             &grant.translated_resource_list,
                             grant.pci_interrupt_line,
                         ),
-                        Err(status) => Err(rollback_pre_dispatch_start(
-                            device_id,
-                            grant.pci_interrupt_line,
-                            status,
-                        )),
+                        Err(status) => CanonicalStartDisposition::Terminal {
+                            status: rollback_pre_dispatch_start(
+                                device_id,
+                                grant.pci_interrupt_line,
+                                status,
+                            ),
+                            waited: false,
+                        },
                     }
                 }
                 Ok(None) => {
@@ -469,9 +500,10 @@ unsafe fn start_one_devnode<H, C>(
                         &[],
                     ) {
                         Ok(()) => canonical_start_status(device_id, &[], &[], None),
-                        Err(status) => {
-                            Err(rollback_pre_dispatch_start(device_id, None, status))
-                        }
+                        Err(status) => CanonicalStartDisposition::Terminal {
+                            status: rollback_pre_dispatch_start(device_id, None, status),
+                            waited: false,
+                        },
                     }
                 }
                 Err(status) => {
@@ -482,18 +514,47 @@ unsafe fn start_one_devnode<H, C>(
                         devnode.instance_id,
                         status,
                     );
-                    Err(status)
+                    CanonicalStartDisposition::Terminal {
+                        status,
+                        waited: false,
+                    }
                 }
             };
             let start_status_raw = match start_status {
-                Ok(()) => {
-                    report.start_ok = true;
-                    report.started += 1;
-                    0
-                }
-                Err(status) => {
-                    remember_error(report, status);
+                CanonicalStartDisposition::Terminal { status, waited } => {
+                    report.terminal += 1;
+                    report.pending_observed += waited as u64;
+                    if status.is_success() {
+                        report.start_ok = true;
+                        report.started += 1;
+                    } else {
+                        report.failed += 1;
+                        remember_error(report, status);
+                    }
                     status.raw() as u32
+                }
+                CanonicalStartDisposition::Indeterminate {
+                    transport_status,
+                    waited,
+                } => {
+                    report.pending_observed += waited as u64;
+                    report.indeterminate += 1;
+                    if report.first_indeterminate == 0 {
+                        report.first_indeterminate = transport_status.raw() as u32;
+                    }
+                    print_start_indeterminate(
+                        options.trace,
+                        service_name,
+                        devnode.instance_id,
+                        transport_status,
+                    );
+                    return;
+                }
+                CanonicalStartDisposition::Pending { driver_pending } => {
+                    report.pending += 1;
+                    report.pending_observed += driver_pending as u64;
+                    print_start_pending(options.trace, service_name, devnode.instance_id);
+                    return;
                 }
             };
             print_start_status(
@@ -533,10 +594,24 @@ unsafe fn start_one_devnode<H, C>(
                 .release_context_lease()
                 .err()
                 .unwrap_or(status);
-            remember_error(report, status);
+            record_terminal_start_failure(report, status);
             print_add_device_failure(options.trace, service_name, devnode.instance_id, status);
         }
     }
+}
+
+enum CanonicalStartDisposition {
+    Terminal {
+        status: nt_status::NtStatus,
+        waited: bool,
+    },
+    Indeterminate {
+        transport_status: nt_status::NtStatus,
+        waited: bool,
+    },
+    Pending {
+        driver_pending: bool,
+    },
 }
 
 unsafe fn canonical_start_status(
@@ -544,36 +619,73 @@ unsafe fn canonical_start_status(
     raw_resource_list: &[u8],
     translated_resource_list: &[u8],
     pci_interrupt_line: Option<crate::pnp::PciInterruptLineProgramming>,
-) -> Result<(), nt_status::NtStatus> {
+) -> CanonicalStartDisposition {
     match driver_launch::start_hosted_device_canonical(
         device_id,
         raw_resource_list,
         translated_resource_list,
         pci_interrupt_line,
     ) {
-        Ok(driver_launch::HostedPnpStartOutcome::Started) => Ok(()),
-        Ok(driver_launch::HostedPnpStartOutcome::Failed(status)) => Err(status),
-        Ok(driver_launch::HostedPnpStartOutcome::Pending { .. }) => {
-            Err(nt_status::NtStatus::PENDING)
+        Ok(driver_launch::HostedPnpStartOutcome::Started) => CanonicalStartDisposition::Terminal {
+            status: nt_status::NtStatus::SUCCESS,
+            waited: false,
+        },
+        Ok(driver_launch::HostedPnpStartOutcome::Failed(status)) => {
+            CanonicalStartDisposition::Terminal {
+                status,
+                waited: false,
+            }
+        }
+        Ok(driver_launch::HostedPnpStartOutcome::Pending { irp_id }) => {
+            observe_canonical_start(irp_id, true)
         }
         Ok(driver_launch::HostedPnpStartOutcome::Indeterminate {
             transport_status,
             ..
-        }) => Err(transport_status),
-        Ok(driver_launch::HostedPnpStartOutcome::RepairRequired {
-            driver_status,
-            repair_status,
-        }) => Err(if driver_status.is_success() {
-            repair_status
-        } else {
-            driver_status
-        }),
-        Err(failure) if failure.rollback_safe => Err(rollback_pre_dispatch_start(
-            device_id,
-            pci_interrupt_line,
-            failure.status,
-        )),
-        Err(failure) => Err(failure.status),
+        }) => CanonicalStartDisposition::Indeterminate {
+            transport_status,
+            waited: false,
+        },
+        Ok(driver_launch::HostedPnpStartOutcome::RepairRequired { irp_id, .. }) => {
+            observe_canonical_start(irp_id, false)
+        }
+        Err(failure) if failure.rollback_safe => CanonicalStartDisposition::Terminal {
+            status: rollback_pre_dispatch_start(
+                device_id,
+                pci_interrupt_line,
+                failure.status,
+            ),
+            waited: false,
+        },
+        Err(failure) => CanonicalStartDisposition::Terminal {
+            status: failure.status,
+            waited: false,
+        },
+    }
+}
+
+unsafe fn observe_canonical_start(irp_id: u64, driver_pending: bool) -> CanonicalStartDisposition {
+    driver_launch::pump_hosted_io_completions();
+    match driver_launch::observe_hosted_pnp_start(irp_id) {
+        Ok(driver_launch::HostedPnpStartObservation::Terminal { driver_status }) => {
+            CanonicalStartDisposition::Terminal {
+                status: driver_status,
+                waited: driver_pending,
+            }
+        }
+        Ok(driver_launch::HostedPnpStartObservation::Indeterminate { transport_status }) => {
+            CanonicalStartDisposition::Indeterminate {
+                transport_status,
+                waited: driver_pending,
+            }
+        }
+        Ok(driver_launch::HostedPnpStartObservation::AwaitingCompletion) => {
+            CanonicalStartDisposition::Pending { driver_pending }
+        }
+        Err(transport_status) => CanonicalStartDisposition::Indeterminate {
+            transport_status,
+            waited: driver_pending,
+        },
     }
 }
 
@@ -608,6 +720,15 @@ fn remember_error(report: &mut HostedPnpStartReport, status: nt_status::NtStatus
     if report.first_error == 0 {
         report.first_error = status.raw() as u32;
     }
+}
+
+fn record_terminal_start_failure(
+    report: &mut HostedPnpStartReport,
+    status: nt_status::NtStatus,
+) {
+    report.terminal += 1;
+    report.failed += 1;
+    remember_error(report, status);
 }
 
 fn hosted_display_service_registry_path(service_name: &str) -> Option<Vec<u8>> {
@@ -984,6 +1105,51 @@ fn print_start_status(
     print_str(instance_id.as_bytes());
     print_str(b" status=");
     print_hex(status);
+    print_str(b"\n");
+}
+
+fn print_start_indeterminate(
+    trace: HostedPnpStartTrace,
+    service_name: &str,
+    instance_id: &str,
+    transport_status: nt_status::NtStatus,
+) {
+    print_str(match trace {
+        HostedPnpStartTrace::HardwareProof => {
+            b"[driver-launch] generic hardware StartDevice indeterminate service="
+        }
+        HostedPnpStartTrace::DemandStart => {
+            b"[driver-launch] demand StartDevice indeterminate service="
+        }
+        HostedPnpStartTrace::BootService => {
+            b"[driver-launch] StartDevice indeterminate service="
+        }
+    });
+    print_str(service_name.as_bytes());
+    print_str(b" devnode=");
+    print_str(instance_id.as_bytes());
+    print_str(b" transport_status=");
+    print_hex(transport_status.raw() as u32);
+    print_str(b"\n");
+}
+
+fn print_start_pending(
+    trace: HostedPnpStartTrace,
+    service_name: &str,
+    instance_id: &str,
+) {
+    print_str(match trace {
+        HostedPnpStartTrace::HardwareProof => {
+            b"[driver-launch] generic hardware StartDevice pending service="
+        }
+        HostedPnpStartTrace::DemandStart => {
+            b"[driver-launch] demand StartDevice pending service="
+        }
+        HostedPnpStartTrace::BootService => b"[driver-launch] StartDevice pending service=",
+    });
+    print_str(service_name.as_bytes());
+    print_str(b" devnode=");
+    print_str(instance_id.as_bytes());
     print_str(b"\n");
 }
 

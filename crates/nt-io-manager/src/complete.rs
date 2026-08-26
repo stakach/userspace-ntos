@@ -401,6 +401,27 @@ impl<P: ObjectManagerPort> IoManager<P> {
     /// any FILE_OBJECT close that was waiting for this reference. Consumers may
     /// acknowledge independent ready requests out of enumeration order.
     pub fn acknowledge_completed_irp(&mut self, irp_id: IrpId) -> Result<CompletedIrp, NtStatus> {
+        self.acknowledge_completed_irp_inner(irp_id, true)
+    }
+
+    /// Require a live backend acknowledgement before reclaiming a published completion.
+    ///
+    /// Lifecycle consumers use this stronger operation because reclaiming an IRP after its backend
+    /// faulted proves cleanup, not that the driver accepted the exact completion acknowledgement.
+    /// A faulted backend leaves the completion and canonical IRP retained for the caller's
+    /// indeterminate-state barrier.
+    pub fn acknowledge_completed_irp_strict(
+        &mut self,
+        irp_id: IrpId,
+    ) -> Result<CompletedIrp, NtStatus> {
+        self.acknowledge_completed_irp_inner(irp_id, false)
+    }
+
+    fn acknowledge_completed_irp_inner(
+        &mut self,
+        irp_id: IrpId,
+        reclaim_faulted_backend: bool,
+    ) -> Result<CompletedIrp, NtStatus> {
         let queue_index = self
             .completed_irps
             .iter()
@@ -414,7 +435,11 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .map(|driver| driver.backend.0 as usize)
             .filter(|index| *index < self.backends.len())
             .ok_or(NtStatus::INVALID_PARAMETER)?;
-        if !self.backends[backend_index].is_faulted() {
+        if self.backends[backend_index].is_faulted() {
+            if !reclaim_faulted_backend {
+                return Err(NtStatus::DEVICE_NOT_CONNECTED);
+            }
+        } else {
             self.backends[backend_index].acknowledge_completion(irp_id)?;
         }
         self.completed_irps.remove(queue_index);
