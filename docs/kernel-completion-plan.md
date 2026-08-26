@@ -12619,3 +12619,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Then construct one boot image from the replayed persistent SYSTEM hive plus the generated
     configuration overlay, hand that image to CM once, and migrate direct SYSTEM readers before
     introducing journalled mutation leases. Do not retain the generated-only mount as a fallback.
+
+    Generated CONFIG atomic-mount integration (2026-08-26, accepted): serialized desktop proof
+    `.tmp/run-desktop-cm-atomic-mount-20260826.log` mounts the complete 11,720-byte generated SYSTEM
+    image at CM generation 1 with `STATUS_SUCCESS`; `exec_cm_live_hive_seeded` passes and the removed
+    key-by-key recreation path is not present. All five registry-selected PnP devices reach terminal
+    success, including two genuine pending START completions, with no failed, pending, or
+    indeterminate rows.
+
+    Genuine userinit and Explorer reach the shell, and Explorer paints all `480000/480000` pixels of
+    the `800x600` framebuffer with at least 32 non-background colours. All `296/296` executive gates
+    pass and the QEMU sentinel fires. Review adjustment: the transport and generated-image handoff
+    are closed. Continue by composing and importing the replayed persistent SYSTEM state plus the
+    generated overlay as one image, then move direct SYSTEM readers to CM. The generated-only image
+    must disappear in that accepted cut rather than remain as a recovery path.
