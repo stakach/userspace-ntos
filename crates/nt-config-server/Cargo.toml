@@ -10,6 +10,7 @@ authors.workspace = true
 [dependencies]
 nt-config-abi = { workspace = true }
 nt-config-manager = { workspace = true }
+nt-hive-core = { workspace = true }
 nt-status = { workspace = true }
 
 [lints.clippy]

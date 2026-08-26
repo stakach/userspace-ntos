@@ -12576,3 +12576,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     SYSTEM Services/Enum mutations with the CM-owned registry without dual-write, and add typed
     historical seed versus live devnode publication/change generations before wiring runtime device
     action.
+
+    SYSTEM authority convergence design review (2026-08-26): the existing isolated
+    `ConfigManager::Registry` is a semantic metadata tree, not the mounted NT hive engine. It omits
+    key class/security, mount generations, journal sequence, save/load/unload, and checkpoint
+    ownership, while the executive's `MutableHiveSet` implements those contracts. Extending both
+    until they happen to agree would create two hive engines and preserve the authority split.
+
+    Migrate the active SYSTEM hive itself behind `CmServer` instead. Stage this without a fallback:
+    first add an atomic tokenized bulk mount and complete immutable streamed reads over the real
+    `nt-hive-core::Hive`; then seed that mount once from the replayed persistent SYSTEM view plus the
+    generated configuration overlay and move every direct SYSTEM reader to it. Next add
+    generation-exact key leases and journal-before-apply PREPARE/COMMIT/ABORT mutations, with the
+    executive acting only as the filesystem byte sink. Finally route all native SYSTEM handles,
+    remove the executive SYSTEM mount, key-by-key CM seed, static SYSTEM readers, and executive
+    Services-order cache in the same accepted cut. SOFTWARE, SECURITY, SAM, user hives, and volatile
+    state remain separately owned until their own mount migration; no path may have overlapping live
+    owners.

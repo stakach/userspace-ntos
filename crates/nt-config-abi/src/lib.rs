@@ -22,7 +22,16 @@ pub const CM_DRIVER_SERVICE_CHUNK_BYTES: usize = 4096;
 pub const CM_DRIVER_SERVICE_SNAPSHOT_MAGIC: u32 = 0x4453_4D43; // `CMSD`
 pub const CM_DRIVER_SERVICE_SNAPSHOT_VERSION: u16 = 1;
 pub const CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES: usize = 16;
+/// Maximum payload carried by one SYSTEM-hive import request frame.
+pub const CM_HIVE_IMPORT_CHUNK_BYTES: usize = 4064;
+/// Maximum payload carried by one mounted-hive key snapshot completion frame.
+pub const CM_HIVE_KEY_CHUNK_BYTES: usize = 4096;
+pub const CM_HIVE_KEY_SNAPSHOT_MAGIC: u32 = 0x4B48_4D43; // `CMHK`
+pub const CM_HIVE_KEY_SNAPSHOT_VERSION: u16 = 1;
+pub const CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES: usize = 24;
+pub const CM_MAX_HIVE_PATH_UNITS: usize = 512;
 pub const CM_OPTIONAL_STRING_ABSENT: u32 = u32::MAX;
+pub const CM_OPTIONAL_BLOB_ABSENT: u32 = u32::MAX;
 
 pub mod opcode {
     pub const CM_OP_PING: u16 = 0x2100;
@@ -44,6 +53,10 @@ pub mod opcode {
     pub const CM_OP_QUERY_DEVICE_PROPERTY: u16 = 0x2140;
     /// Resolve one live driver service and all registry-bound devnodes.
     pub const CM_OP_QUERY_DRIVER_SERVICE: u16 = 0x2141;
+    /// Atomically import and publish one mounted `nt-hive-core` SYSTEM image.
+    pub const CM_OP_IMPORT_HIVE: u16 = 0x2150;
+    /// Return one immutable, complete mounted-hive key snapshot.
+    pub const CM_OP_QUERY_HIVE_KEY: u16 = 0x2151;
 }
 
 /// Operation carried by [`CmDevicePropertyRequest::operation`]. Property values are immutable for
@@ -59,6 +72,26 @@ pub mod driver_service_transfer {
     pub const BEGIN: u16 = 1;
     pub const PULL: u16 = 2;
     pub const ABORT: u16 = 3;
+}
+
+/// Operation carried by [`CmHiveImportRequest::operation`].
+pub mod hive_import_transfer {
+    pub const BEGIN: u16 = 1;
+    pub const PUSH: u16 = 2;
+    pub const COMMIT: u16 = 3;
+    pub const ABORT: u16 = 4;
+}
+
+/// Operation carried by [`CmHiveKeyRequest::operation`].
+pub mod hive_key_transfer {
+    pub const BEGIN: u16 = 1;
+    pub const PULL: u16 = 2;
+    pub const ABORT: u16 = 3;
+}
+
+/// Mount identifiers carried by mounted-hive operations.
+pub mod hive_mount {
+    pub const SYSTEM: u16 = 1;
 }
 
 /// Values encoded in the driver-binding snapshot header's `class` field.
@@ -163,6 +196,38 @@ pub struct CmDriverServiceRequest {
     pub transfer_token: u64,
 }
 
+/// `import_hive`: a tokenized upload. BEGIN reserves `total_len_bytes`; PUSH carries one chunk at
+/// `chunk_offset` and appends it at `value_offset`; COMMIT atomically validates and publishes the
+/// complete image; ABORT releases the staged bytes.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmHiveImportRequest {
+    pub abi_size: u16,
+    pub abi_version: u16,
+    pub operation: u16,
+    pub mount: u16,
+    pub value_offset: u32,
+    pub chunk_offset: u32,
+    pub chunk_len_bytes: u32,
+    pub total_len_bytes: u32,
+    pub transfer_token: u64,
+}
+
+/// `query_hive_key`: a full NT key path plus an immutable snapshot-bank cursor.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmHiveKeyRequest {
+    pub abi_size: u16,
+    pub abi_version: u16,
+    pub operation: u16,
+    pub mount: u16,
+    pub value_offset: u32,
+    pub chunk_capacity: u32,
+    pub path_offset: u32,
+    pub path_len_bytes: u32,
+    pub transfer_token: u64,
+}
+
 macro_rules! wire {
     ($t:ty) => {
         impl $t {
@@ -193,6 +258,8 @@ wire!(CmValueRequest);
 wire!(CmRawValueRequest);
 wire!(CmDevicePropertyRequest);
 wire!(CmDriverServiceRequest);
+wire!(CmHiveImportRequest);
+wire!(CmHiveKeyRequest);
 
 /// Decode a UTF-16LE slice of `buf` (at `offset`, `len_bytes` long) into a `str`
 /// via the caller's scratch — returns the u16 units. Used by the server.
@@ -272,5 +339,42 @@ mod tests {
             CmDriverServiceRequest::from_bytes(request.as_bytes()),
             Some(request)
         );
+    }
+
+    #[test]
+    fn mounted_hive_requests_have_stable_wire_layout() {
+        assert_eq!(opcode::CM_OP_IMPORT_HIVE, 0x2150);
+        assert_eq!(opcode::CM_OP_QUERY_HIVE_KEY, 0x2151);
+        assert_eq!(core::mem::size_of::<CmHiveImportRequest>(), 32);
+        assert_eq!(core::mem::size_of::<CmHiveKeyRequest>(), 32);
+
+        let import = CmHiveImportRequest {
+            abi_size: 32,
+            abi_version: CM_ABI_VERSION,
+            operation: hive_import_transfer::PUSH,
+            mount: hive_mount::SYSTEM,
+            value_offset: 0x1122_3344,
+            chunk_offset: 32,
+            chunk_len_bytes: 0x5566_7788,
+            total_len_bytes: 0x99aa_bbcc,
+            transfer_token: 0x1122_3344_5566_7788,
+        };
+        assert_eq!(
+            CmHiveImportRequest::from_bytes(import.as_bytes()),
+            Some(import)
+        );
+
+        let query = CmHiveKeyRequest {
+            abi_size: 32,
+            abi_version: CM_ABI_VERSION,
+            operation: hive_key_transfer::PULL,
+            mount: hive_mount::SYSTEM,
+            value_offset: 0x1122_3344,
+            chunk_capacity: 0x5566_7788,
+            path_offset: 32,
+            path_len_bytes: 0x99aa_bbcc,
+            transfer_token: 0x1122_3344_5566_7788,
+        };
+        assert_eq!(CmHiveKeyRequest::from_bytes(query.as_bytes()), Some(query));
     }
 }

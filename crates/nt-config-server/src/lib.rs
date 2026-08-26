@@ -14,17 +14,22 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use nt_config_abi::{
-    device_property_transfer, driver_service_class, driver_service_transfer, opcode, read_utf16,
-    CmDevicePropertyRequest, CmDriverServiceRequest, CmEnumerateKeyRequest, CmKeyRequest,
-    CmRawValueRequest, CmReply, CmValueRequest, CM_ABI_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES,
-    CM_DRIVER_SERVICE_CHUNK_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES,
-    CM_DRIVER_SERVICE_SNAPSHOT_MAGIC, CM_DRIVER_SERVICE_SNAPSHOT_VERSION, CM_MAX_INSTANCE_UNITS,
-    CM_MAX_SERVICE_UNITS, CM_OPTIONAL_STRING_ABSENT,
+    device_property_transfer, driver_service_class, driver_service_transfer, hive_import_transfer,
+    hive_key_transfer, hive_mount, opcode, read_utf16, CmDevicePropertyRequest,
+    CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveImportRequest, CmHiveKeyRequest,
+    CmKeyRequest, CmRawValueRequest, CmReply, CmValueRequest, CM_ABI_VERSION,
+    CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_DRIVER_SERVICE_CHUNK_BYTES,
+    CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_MAGIC,
+    CM_DRIVER_SERVICE_SNAPSHOT_VERSION, CM_HIVE_IMPORT_CHUNK_BYTES, CM_HIVE_KEY_CHUNK_BYTES,
+    CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES, CM_HIVE_KEY_SNAPSHOT_MAGIC, CM_HIVE_KEY_SNAPSHOT_VERSION,
+    CM_MAX_HIVE_PATH_UNITS, CM_MAX_INSTANCE_UNITS, CM_MAX_SERVICE_UNITS, CM_OPTIONAL_BLOB_ABSENT,
+    CM_OPTIONAL_STRING_ABSENT,
 };
 use nt_config_manager::{
     device_property, ConfigManager, DevicePropertySource, DriverServiceBinding, DriverServiceClass,
     RegistryValueType,
 };
+use nt_hive_core::{decode_image, Hive, HiveKind};
 
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
@@ -33,8 +38,10 @@ const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
 const STATUS_NO_MORE_ENTRIES: i32 = 0x8000_001Au32 as i32;
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES: i32 = 0xC000_009Au32 as i32;
+const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 const STATUS_INVALID_SYSTEM_SERVICE: i32 = 0xC000_001Cu32 as i32;
 const STATUS_NOT_SUPPORTED: i32 = 0xC000_00BBu32 as i32;
+const STATUS_REGISTRY_CORRUPT: i32 = 0xC000_014Cu32 as i32;
 
 /// Max UTF-16 units in a decoded key path / value name.
 const MAX_NAME_UNITS: usize = 512;
@@ -93,6 +100,104 @@ fn push_optional_string(out: &mut Vec<u8>, value: Option<&str>) -> Option<()> {
     }
 }
 
+fn push_blob(out: &mut Vec<u8>, value: &[u8]) -> Option<()> {
+    push_u32(out, u32::try_from(value.len()).ok()?);
+    out.extend_from_slice(value);
+    Some(())
+}
+
+fn push_optional_blob(out: &mut Vec<u8>, value: Option<&[u8]>) -> Option<()> {
+    match value {
+        Some(value) => push_blob(out, value),
+        None => {
+            push_u32(out, CM_OPTIONAL_BLOB_ABSENT);
+            Some(())
+        }
+    }
+}
+
+fn system_hive_relative_path(path: &str) -> Option<String> {
+    let mut components = path.split('\\').filter(|component| !component.is_empty());
+    if !components.next()?.eq_ignore_ascii_case("Registry")
+        || !components.next()?.eq_ignore_ascii_case("Machine")
+        || !components.next()?.eq_ignore_ascii_case("System")
+    {
+        return None;
+    }
+    let mut relative = String::new();
+    if let Some(first) = components.next() {
+        relative.push_str(if first.eq_ignore_ascii_case("CurrentControlSet") {
+            nt_hive_core::CURRENT_CONTROL_SET_TARGET
+        } else {
+            first
+        });
+    }
+    for component in components {
+        relative.push('\\');
+        relative.push_str(component);
+    }
+    Some(relative)
+}
+
+fn config_manager_from_system_hive(hive: &Hive) -> ConfigManager {
+    let mut cm = ConfigManager::new();
+    let _ = nt_hive_core::import_control_set_services_into_config_manager(
+        hive,
+        &mut cm,
+        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+    );
+    let _ = nt_hive_core::import_control_set_service_group_order_into_config_manager(
+        hive,
+        &mut cm,
+        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+    );
+    let _ = nt_hive_core::import_control_set_enum_into_config_manager(
+        hive,
+        &mut cm,
+        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+    );
+    let _ = nt_hive_core::import_control_set_class_into_config_manager(
+        hive,
+        &mut cm,
+        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+    );
+    let _ = nt_hive_core::import_control_set_network_into_config_manager(
+        hive,
+        &mut cm,
+        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+    );
+    cm
+}
+
+fn encode_hive_key_snapshot(hive: &Hive, mount_generation: u64, path: &str) -> Option<Vec<u8>> {
+    let relative = system_hive_relative_path(path)?;
+    let key = hive.open_key(&relative)?;
+    let subkey_count = hive.subkey_count(key);
+    let value_count = hive.value_count(key);
+    let mut out = Vec::new();
+    push_u32(&mut out, CM_HIVE_KEY_SNAPSHOT_MAGIC);
+    push_u16(&mut out, CM_HIVE_KEY_SNAPSHOT_VERSION);
+    push_u16(&mut out, 0);
+    out.extend_from_slice(&mount_generation.to_le_bytes());
+    push_u32(&mut out, u32::try_from(subkey_count).ok()?);
+    push_u32(&mut out, u32::try_from(value_count).ok()?);
+    debug_assert_eq!(out.len(), CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES);
+    push_string(&mut out, path)?;
+    push_optional_string(&mut out, hive.key_class(key))?;
+    push_optional_blob(&mut out, hive.key_security_descriptor(key))?;
+    for index in 0..subkey_count {
+        push_string(&mut out, hive.subkey_name_by_index(key, index)?)?;
+        push_optional_string(&mut out, hive.subkey_class_by_index(key, index))?;
+    }
+    for index in 0..value_count {
+        let (name, value_type, data) = hive.value_by_index(key, index)?;
+        push_string(&mut out, name)?;
+        push_u32(&mut out, value_type as u32);
+        push_blob(&mut out, data)?;
+    }
+    Some(out)
+}
+
 fn encode_driver_service_binding(
     cm: &ConfigManager,
     binding: &DriverServiceBinding,
@@ -146,6 +251,21 @@ struct DriverServiceSnapshot {
     offset: usize,
 }
 
+struct HiveImport {
+    token: u64,
+    mount: u16,
+    total_len: usize,
+    value: Vec<u8>,
+}
+
+struct HiveKeySnapshot {
+    token: u64,
+    mount: u16,
+    path: String,
+    value: Vec<u8>,
+    offset: usize,
+}
+
 /// The Configuration Manager service: the registry authority + the wire dispatcher.
 pub struct CmServer {
     cm: ConfigManager,
@@ -153,6 +273,12 @@ pub struct CmServer {
     next_device_property_token: u64,
     driver_service_snapshot: Option<DriverServiceSnapshot>,
     next_driver_service_token: u64,
+    system_hive: Option<Hive>,
+    system_hive_generation: u64,
+    hive_imports: Vec<HiveImport>,
+    next_hive_import_token: u64,
+    hive_key_snapshots: Vec<HiveKeySnapshot>,
+    next_hive_key_token: u64,
 }
 
 impl Default for CmServer {
@@ -169,6 +295,12 @@ impl CmServer {
             next_device_property_token: 1,
             driver_service_snapshot: None,
             next_driver_service_token: 1,
+            system_hive: None,
+            system_hive_generation: 0,
+            hive_imports: Vec::new(),
+            next_hive_import_token: 1,
+            hive_key_snapshots: Vec::new(),
+            next_hive_key_token: 1,
         }
     }
 
@@ -180,6 +312,12 @@ impl CmServer {
             next_device_property_token: 1,
             driver_service_snapshot: None,
             next_driver_service_token: 1,
+            system_hive: None,
+            system_hive_generation: 0,
+            hive_imports: Vec::new(),
+            next_hive_import_token: 1,
+            hive_key_snapshots: Vec::new(),
+            next_hive_key_token: 1,
         }
     }
 
@@ -207,6 +345,8 @@ impl CmServer {
             opcode::CM_OP_ENUMERATE_KEY => self.op_enumerate_key(in_buf, out_buf),
             opcode::CM_OP_QUERY_DEVICE_PROPERTY => self.op_query_device_property(in_buf, out_buf),
             opcode::CM_OP_QUERY_DRIVER_SERVICE => self.op_query_driver_service(in_buf, out_buf),
+            opcode::CM_OP_IMPORT_HIVE => self.op_import_hive(in_buf),
+            opcode::CM_OP_QUERY_HIVE_KEY => self.op_query_hive_key(in_buf, out_buf),
             _ => reply(STATUS_INVALID_SYSTEM_SERVICE, 0),
         }
     }
@@ -603,6 +743,267 @@ impl CmServer {
             _ => reply(STATUS_INVALID_PARAMETER, 0),
         }
     }
+
+    fn op_import_hive(&mut self, buf: &[u8]) -> CmReply {
+        let Some(req) = CmHiveImportRequest::from_bytes(buf) else {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        };
+        let header_size = core::mem::size_of::<CmHiveImportRequest>();
+        if req.abi_size as usize != header_size
+            || req.abi_version != CM_ABI_VERSION
+            || req.mount != hive_mount::SYSTEM
+        {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        }
+        let Ok(total_len) = usize::try_from(req.total_len_bytes) else {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        };
+        match req.operation {
+            hive_import_transfer::BEGIN => {
+                if req.transfer_token != 0
+                    || req.value_offset != 0
+                    || req.chunk_offset != 0
+                    || req.chunk_len_bytes != 0
+                    || total_len == 0
+                    || buf.len() != header_size
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let token = self.next_hive_import_token;
+                let Some(next_token) = token.checked_add(1) else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                };
+                if token == 0 || self.hive_imports.try_reserve(1).is_err() {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                }
+                let mut value = Vec::new();
+                if value.try_reserve_exact(total_len).is_err() {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                }
+                self.next_hive_import_token = next_token;
+                self.hive_imports.push(HiveImport {
+                    token,
+                    mount: req.mount,
+                    total_len,
+                    value,
+                });
+                reply_with_info(STATUS_SUCCESS, 0, total_len as u64, token)
+            }
+            hive_import_transfer::PUSH => {
+                let chunk_len = req.chunk_len_bytes as usize;
+                let chunk_offset = req.chunk_offset as usize;
+                let Some(chunk_end) = chunk_offset.checked_add(chunk_len) else {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                };
+                if req.transfer_token == 0
+                    || chunk_len == 0
+                    || chunk_len > CM_HIVE_IMPORT_CHUNK_BYTES
+                    || chunk_offset != header_size
+                    || chunk_end != buf.len()
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let Some(import) = self.hive_imports.iter_mut().find(|import| {
+                    import.token == req.transfer_token
+                        && import.mount == req.mount
+                        && import.total_len == total_len
+                }) else {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                };
+                if import.value.len() != req.value_offset as usize
+                    || import.value.len().checked_add(chunk_len).is_none()
+                    || import.value.len() + chunk_len > import.total_len
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                import
+                    .value
+                    .extend_from_slice(&buf[chunk_offset..chunk_end]);
+                reply_with_info(
+                    STATUS_SUCCESS,
+                    req.chunk_len_bytes,
+                    import.value.len() as u64,
+                    req.transfer_token,
+                )
+            }
+            hive_import_transfer::COMMIT => {
+                if req.transfer_token == 0
+                    || req.chunk_offset != 0
+                    || req.chunk_len_bytes != 0
+                    || buf.len() != header_size
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let Some(index) = self.hive_imports.iter().position(|import| {
+                    import.token == req.transfer_token
+                        && import.mount == req.mount
+                        && import.total_len == total_len
+                }) else {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                };
+                let import = &self.hive_imports[index];
+                if import.value.len() != import.total_len
+                    || req.value_offset as usize != import.total_len
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let Ok(hive) = decode_image(&import.value) else {
+                    return reply(STATUS_REGISTRY_CORRUPT, 0);
+                };
+                if hive.kind != HiveKind::System {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let Some(generation) = self.system_hive_generation.checked_add(1) else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                };
+                let cm = config_manager_from_system_hive(&hive);
+                self.cm = cm;
+                self.system_hive = Some(hive);
+                self.system_hive_generation = generation;
+                self.hive_imports.swap_remove(index);
+                reply_with_info(STATUS_SUCCESS, 0, generation, req.transfer_token)
+            }
+            hive_import_transfer::ABORT => {
+                if req.transfer_token == 0
+                    || req.value_offset != 0
+                    || req.chunk_offset != 0
+                    || req.chunk_len_bytes != 0
+                    || buf.len() != header_size
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let Some(index) = self.hive_imports.iter().position(|import| {
+                    import.token == req.transfer_token
+                        && import.mount == req.mount
+                        && import.total_len == total_len
+                }) else {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                };
+                self.hive_imports.swap_remove(index);
+                reply(STATUS_SUCCESS, 0)
+            }
+            _ => reply(STATUS_INVALID_PARAMETER, 0),
+        }
+    }
+
+    fn op_query_hive_key(&mut self, buf: &[u8], out_buf: &mut [u8]) -> CmReply {
+        let Some(req) = CmHiveKeyRequest::from_bytes(buf) else {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        };
+        let header_size = core::mem::size_of::<CmHiveKeyRequest>();
+        if req.abi_size as usize != header_size
+            || req.abi_version != CM_ABI_VERSION
+            || req.mount != hive_mount::SYSTEM
+            || req.path_offset as usize != header_size
+            || req.path_len_bytes == 0
+            || req.path_len_bytes % 2 != 0
+            || req.path_len_bytes as usize > CM_MAX_HIVE_PATH_UNITS * 2
+            || header_size.checked_add(req.path_len_bytes as usize) != Some(buf.len())
+            || req.chunk_capacity as usize > CM_HIVE_KEY_CHUNK_BYTES
+            || req.chunk_capacity as usize > out_buf.len()
+        {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        }
+        let mut units = [0u16; CM_MAX_HIVE_PATH_UNITS];
+        let Some(unit_count) = read_utf16(buf, req.path_offset, req.path_len_bytes, &mut units)
+        else {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        };
+        let units = &units[..unit_count];
+        if units.contains(&0) {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        }
+        let Ok(path) = String::from_utf16(units) else {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        };
+
+        match req.operation {
+            hive_key_transfer::BEGIN => {
+                if req.transfer_token != 0 || req.value_offset != 0 || req.chunk_capacity == 0 {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let Some(hive) = self.system_hive.as_ref() else {
+                    return reply(STATUS_DEVICE_NOT_READY, 0);
+                };
+                let Some(relative) = system_hive_relative_path(&path) else {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                };
+                if hive.open_key(&relative).is_none() {
+                    return reply(STATUS_OBJECT_NAME_NOT_FOUND, 0);
+                }
+                let Some(value) =
+                    encode_hive_key_snapshot(hive, self.system_hive_generation, &path)
+                else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                };
+                let needed = value.len();
+                let written = core::cmp::min(needed, req.chunk_capacity as usize);
+                out_buf[..written].copy_from_slice(&value[..written]);
+                if written == needed {
+                    return reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, 0);
+                }
+                let token = self.next_hive_key_token;
+                let Some(next_token) = token.checked_add(1) else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                };
+                if token == 0 || self.hive_key_snapshots.try_reserve(1).is_err() {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                }
+                self.next_hive_key_token = next_token;
+                self.hive_key_snapshots.push(HiveKeySnapshot {
+                    token,
+                    mount: req.mount,
+                    path,
+                    value,
+                    offset: written,
+                });
+                reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, token)
+            }
+            hive_key_transfer::PULL => {
+                if req.transfer_token == 0 || req.chunk_capacity == 0 {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let Some(index) = self.hive_key_snapshots.iter().position(|snapshot| {
+                    snapshot.token == req.transfer_token
+                        && snapshot.mount == req.mount
+                        && snapshot.path.eq_ignore_ascii_case(&path)
+                        && snapshot.offset == req.value_offset as usize
+                }) else {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                };
+                let snapshot = &mut self.hive_key_snapshots[index];
+                let needed = snapshot.value.len();
+                let written = core::cmp::min(needed - snapshot.offset, req.chunk_capacity as usize);
+                let end = snapshot.offset + written;
+                out_buf[..written].copy_from_slice(&snapshot.value[snapshot.offset..end]);
+                snapshot.offset = end;
+                if end == needed {
+                    self.hive_key_snapshots.swap_remove(index);
+                }
+                reply_with_info(
+                    STATUS_SUCCESS,
+                    written as u32,
+                    needed as u64,
+                    req.transfer_token,
+                )
+            }
+            hive_key_transfer::ABORT => {
+                if req.transfer_token == 0 || req.value_offset != 0 || req.chunk_capacity != 0 {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let Some(index) = self.hive_key_snapshots.iter().position(|snapshot| {
+                    snapshot.token == req.transfer_token
+                        && snapshot.mount == req.mount
+                        && snapshot.path.eq_ignore_ascii_case(&path)
+                }) else {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                };
+                self.hive_key_snapshots.swap_remove(index);
+                reply(STATUS_SUCCESS, 0)
+            }
+            _ => reply(STATUS_INVALID_PARAMETER, 0),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -616,6 +1017,7 @@ mod tests {
         CmDriverServiceRequest, CM_ABI_VERSION,
     };
     use nt_config_manager::{encode_sz, ENUM_PATH, SERVICES_PATH, SERVICE_DEMAND_START};
+    use nt_hive_core::{encode_image, Hive, HiveKind};
 
     const INSTANCE: &str = r"PCI\VEN_8086&DEV_100E\0001";
 
@@ -695,6 +1097,114 @@ mod tests {
         let mut bytes = Vec::from(header.as_bytes());
         bytes.extend_from_slice(&service_bytes);
         bytes
+    }
+
+    fn hive_import_request(
+        operation: u16,
+        transfer_token: u64,
+        value_offset: u32,
+        total_len_bytes: u32,
+        chunk: &[u8],
+    ) -> Vec<u8> {
+        let header_size = core::mem::size_of::<CmHiveImportRequest>();
+        let header = CmHiveImportRequest {
+            abi_size: header_size as u16,
+            abi_version: CM_ABI_VERSION,
+            operation,
+            mount: hive_mount::SYSTEM,
+            value_offset,
+            chunk_offset: if chunk.is_empty() {
+                0
+            } else {
+                header_size as u32
+            },
+            chunk_len_bytes: chunk.len() as u32,
+            total_len_bytes,
+            transfer_token,
+        };
+        let mut bytes = Vec::from(header.as_bytes());
+        bytes.extend_from_slice(chunk);
+        bytes
+    }
+
+    fn hive_key_request(
+        path: &str,
+        operation: u16,
+        transfer_token: u64,
+        value_offset: u32,
+        chunk_capacity: u32,
+    ) -> Vec<u8> {
+        let path_bytes = utf16(path);
+        let header_size = core::mem::size_of::<CmHiveKeyRequest>();
+        let header = CmHiveKeyRequest {
+            abi_size: header_size as u16,
+            abi_version: CM_ABI_VERSION,
+            operation,
+            mount: hive_mount::SYSTEM,
+            value_offset,
+            chunk_capacity,
+            path_offset: header_size as u32,
+            path_len_bytes: path_bytes.len() as u32,
+            transfer_token,
+        };
+        let mut bytes = Vec::from(header.as_bytes());
+        bytes.extend_from_slice(&path_bytes);
+        bytes
+    }
+
+    fn begin_hive_import(server: &mut CmServer, image: &[u8]) -> u64 {
+        let response = server.dispatch(
+            opcode::CM_OP_IMPORT_HIVE,
+            &hive_import_request(hive_import_transfer::BEGIN, 0, 0, image.len() as u32, &[]),
+            &mut [],
+        );
+        assert_eq!(response.status, STATUS_SUCCESS);
+        assert_ne!(response.detail1, 0);
+        response.detail1
+    }
+
+    fn push_hive_import(server: &mut CmServer, token: u64, image: &[u8]) {
+        let mut offset = 0usize;
+        while offset < image.len() {
+            let end = core::cmp::min(offset + CM_HIVE_IMPORT_CHUNK_BYTES, image.len());
+            let response = server.dispatch(
+                opcode::CM_OP_IMPORT_HIVE,
+                &hive_import_request(
+                    hive_import_transfer::PUSH,
+                    token,
+                    offset as u32,
+                    image.len() as u32,
+                    &image[offset..end],
+                ),
+                &mut [],
+            );
+            assert_eq!(response.status, STATUS_SUCCESS);
+            assert_eq!(response.detail0, end as u64);
+            offset = end;
+        }
+    }
+
+    fn commit_hive_import(server: &mut CmServer, token: u64, image: &[u8]) -> u64 {
+        let response = server.dispatch(
+            opcode::CM_OP_IMPORT_HIVE,
+            &hive_import_request(
+                hive_import_transfer::COMMIT,
+                token,
+                image.len() as u32,
+                image.len() as u32,
+                &[],
+            ),
+            &mut [],
+        );
+        assert_eq!(response.status, STATUS_SUCCESS);
+        assert_eq!(response.detail1, token);
+        response.detail0
+    }
+
+    fn publish_hive(server: &mut CmServer, image: &[u8]) -> u64 {
+        let token = begin_hive_import(server, image);
+        push_hive_import(server, token, image);
+        commit_hive_import(server, token, image)
     }
 
     fn server() -> CmServer {
@@ -1040,5 +1550,110 @@ mod tests {
                 .image_path,
             r"system32\drivers\replacement.sys"
         );
+    }
+
+    #[test]
+    fn hive_import_tokens_are_independent_and_abort_exactly_one_upload() {
+        let mut first = Hive::new(HiveKind::System);
+        first.create_key(r"ControlSet001\Services\First");
+        first.finish_clean_import();
+        let first = encode_image(&first);
+        let mut second = Hive::new(HiveKind::System);
+        second.create_key(r"ControlSet001\Services\Second");
+        second.finish_clean_import();
+        let second = encode_image(&second);
+
+        let mut server = CmServer::new();
+        let first_token = begin_hive_import(&mut server, &first);
+        let second_token = begin_hive_import(&mut server, &second);
+        assert_ne!(first_token, second_token);
+        push_hive_import(&mut server, second_token, &second);
+        push_hive_import(&mut server, first_token, &first);
+        assert_eq!(commit_hive_import(&mut server, first_token, &first), 1);
+        let abort = server.dispatch(
+            opcode::CM_OP_IMPORT_HIVE,
+            &hive_import_request(
+                hive_import_transfer::ABORT,
+                second_token,
+                0,
+                second.len() as u32,
+                &[],
+            ),
+            &mut [],
+        );
+        assert_eq!(abort.status, STATUS_SUCCESS);
+        assert_eq!(server.hive_imports.len(), 0);
+        assert!(server
+            .system_hive
+            .as_ref()
+            .unwrap()
+            .open_key(r"ControlSet001\Services\First")
+            .is_some());
+        assert!(server
+            .system_hive
+            .as_ref()
+            .unwrap()
+            .open_key(r"ControlSet001\Services\Second")
+            .is_none());
+    }
+
+    #[test]
+    fn hive_key_snapshot_survives_atomic_mount_replacement() {
+        let path = r"\Registry\Machine\System\CurrentControlSet\Services\Stable";
+        let mut first = Hive::new(HiveKind::System);
+        let key = first.create_key(r"ControlSet001\Services\Stable");
+        assert!(first.set_value(
+            key,
+            "Payload",
+            nt_hive_core::RegistryValueType::Binary,
+            vec![0x11; 9_000],
+        ));
+        first.finish_clean_import();
+        let first_image = encode_image(&first);
+        let mut second = Hive::new(HiveKind::System);
+        let key = second.create_key(r"ControlSet001\Services\Stable");
+        assert!(second.set_value(
+            key,
+            "Payload",
+            nt_hive_core::RegistryValueType::Binary,
+            vec![0x22; 9_000],
+        ));
+        second.finish_clean_import();
+        let second_image = encode_image(&second);
+
+        let mut server = CmServer::new();
+        assert_eq!(publish_hive(&mut server, &first_image), 1);
+        let expected = encode_hive_key_snapshot(server.system_hive.as_ref().unwrap(), 1, path)
+            .expect("snapshot");
+        let mut first_bank = [0u8; 64];
+        let begin = server.dispatch(
+            opcode::CM_OP_QUERY_HIVE_KEY,
+            &hive_key_request(path, hive_key_transfer::BEGIN, 0, 0, 64),
+            &mut first_bank,
+        );
+        assert_eq!(begin.status, STATUS_SUCCESS);
+        assert_ne!(begin.detail1, 0);
+        assert_eq!(publish_hive(&mut server, &second_image), 2);
+
+        let mut assembled = Vec::from(&first_bank[..begin.information as usize]);
+        while assembled.len() < expected.len() {
+            let bank_len = core::cmp::min(64, expected.len() - assembled.len());
+            let mut bank = vec![0u8; bank_len];
+            let pull = server.dispatch(
+                opcode::CM_OP_QUERY_HIVE_KEY,
+                &hive_key_request(
+                    path,
+                    hive_key_transfer::PULL,
+                    begin.detail1,
+                    assembled.len() as u32,
+                    bank_len as u32,
+                ),
+                &mut bank,
+            );
+            assert_eq!(pull.status, STATUS_SUCCESS);
+            assembled.extend_from_slice(&bank[..pull.information as usize]);
+        }
+        assert_eq!(assembled, expected);
+        assert_eq!(server.system_hive_generation, 2);
     }
 }
