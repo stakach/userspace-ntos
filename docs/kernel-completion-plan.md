@@ -13182,3 +13182,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
 
     Review adjustment: migrate the remaining executive SYSTEM setup batches to the same CM-first
     helper and remove their direct-first paths before beginning the explicit win32k CM transport.
+
+    Remaining executive SYSTEM setup batches (2026-08-27, accepted): network,
+    print, and the SYSTEM half of locale provisioning now collect owned create/set operations
+    without mutating the executive hive. Each non-empty batch commits atomically against the live CM
+    generation and only then projects those exact operations into the writable SYSTEM journal. The
+    collector refuses paths outside CM's SYSTEM mount and preserves idempotent no-op behavior against
+    the projection from which CM was imported. SOFTWARE, `.Default`, and mounted user hives retain
+    their separate journal authority; they do not pass through the SYSTEM transaction API.
+
+    The shared CM-first projection helper replaces the three direct-first SYSTEM paths. Network
+    commits invalidate the derived service-order cache; print and locale commits preserve it because
+    their key ranges cannot affect service group ordering.
+
+    Serialized desktop acceptance is green. Locale proved an idempotent `CM-generation=unchanged`,
+    Setup committed through generation 2, the existing network seed remained an idempotent no-op,
+    and print committed through generation 3. CM selected and started all five registry-backed PnP
+    devices, including both PCI devices and three root devices. The run mounted the user profile
+    twice around a real `NtUnloadKey`, restored its 185424-byte checkpoint, launched genuine userinit
+    and Explorer processes, and reported 480000/480000 non-background framebuffer pixels with at
+    least 32 distinct colors. All 293 executive checks passed and the sentinel matched, with no
+    failed gate or invalid-handle diagnostic in
+    `.tmp/run-desktop-cm-first-system-setup-final-20260827.log`.
+
+    Review adjustment: audit and migrate runtime `NtCreateKey`/`NtSetValueKey` and locale persistence
+    writes under `HKLM\SYSTEM` to the CM-authoritative transaction path. Remove the executive-side
+    SYSTEM mutation authority as each path moves; keep SOFTWARE, user, SECURITY, and SAM ownership
+    separate. Expose an explicit CM registry transport to win32k only after this runtime audit is
+    closed.

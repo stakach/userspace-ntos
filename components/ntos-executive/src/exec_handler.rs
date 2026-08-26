@@ -447,6 +447,168 @@ impl nt_hive_core::ReactOsSetupSeedTarget for ExecJournalReactOsSetupSeedTarget<
     }
 }
 
+enum OwnedSystemHiveMutation {
+    CreateKey {
+        path: alloc::string::String,
+    },
+    SetValue {
+        path: alloc::string::String,
+        name: alloc::string::String,
+        value_type: nt_hive_core::RegistryValueType,
+        data: alloc::vec::Vec<u8>,
+    },
+}
+
+impl OwnedSystemHiveMutation {
+    fn as_client_mutation(&self) -> nt_config_client::SystemHiveMutation<'_> {
+        match self {
+            Self::CreateKey { path } => nt_config_client::SystemHiveMutation::CreateKey { path },
+            Self::SetValue {
+                path,
+                name,
+                value_type,
+                data,
+            } => nt_config_client::SystemHiveMutation::SetValue {
+                path,
+                name,
+                value_type: *value_type as u32,
+                data,
+            },
+        }
+    }
+}
+
+struct CollectSystemSetupSeedTarget<'a> {
+    handler: &'a ExecNtHandler,
+    mutations: alloc::vec::Vec<OwnedSystemHiveMutation>,
+    failed: bool,
+}
+
+impl<'a> CollectSystemSetupSeedTarget<'a> {
+    fn new(handler: &'a ExecNtHandler) -> Self {
+        Self {
+            handler,
+            mutations: alloc::vec::Vec::new(),
+            failed: false,
+        }
+    }
+
+    fn owns_system_path(&self, path: &str) -> bool {
+        self.handler
+            .mutable_hives
+            .resolve_path(path)
+            .is_some_and(|(hive, _)| hive == HIVE_SEL_SYSTEM)
+    }
+
+    fn pending_value(
+        &self,
+        path: &str,
+        name: &str,
+    ) -> Option<(nt_hive_core::RegistryValueType, &[u8])> {
+        self.mutations.iter().rev().find_map(|mutation| match mutation {
+            OwnedSystemHiveMutation::SetValue {
+                path: pending_path,
+                name: pending_name,
+                value_type,
+                data,
+            } if pending_path.eq_ignore_ascii_case(path)
+                && pending_name.eq_ignore_ascii_case(name) =>
+            {
+                Some((*value_type, data.as_slice()))
+            }
+            _ => None,
+        })
+    }
+}
+
+impl nt_hive_core::ReactOsSetupSeedTarget for CollectSystemSetupSeedTarget<'_> {
+    fn create_key(&mut self, path: &str) -> bool {
+        if !self.owns_system_path(path) {
+            self.failed = true;
+            return false;
+        }
+        if self.handler.mutable_registry_key_by_path(path).is_none()
+            && !self.mutations.iter().any(|mutation| {
+                matches!(
+                    mutation,
+                    OwnedSystemHiveMutation::CreateKey { path: pending }
+                        if pending.eq_ignore_ascii_case(path)
+                )
+            })
+        {
+            self.mutations
+                .push(OwnedSystemHiveMutation::CreateKey { path: path.into() });
+        }
+        true
+    }
+
+    fn set_value(
+        &mut self,
+        path: &str,
+        name: &str,
+        value_type: nt_hive_core::RegistryValueType,
+        data: alloc::vec::Vec<u8>,
+    ) -> bool {
+        if !self.owns_system_path(path) {
+            self.failed = true;
+            return false;
+        }
+        if self.value_matches(path, name, value_type, &data) {
+            return false;
+        }
+        if self.handler.mutable_registry_key_by_path(path).is_none() && !self.create_key(path) {
+            return false;
+        }
+        self.mutations.push(OwnedSystemHiveMutation::SetValue {
+            path: path.into(),
+            name: name.into(),
+            value_type,
+            data,
+        });
+        true
+    }
+
+    fn has_value(&self, path: &str, name: &str) -> bool {
+        self.pending_value(path, name).is_some()
+            || self
+                .handler
+                .mutable_registry_key_by_path(path)
+                .and_then(|key| self.handler.mutable_hives.query_value(key, name))
+                .is_some()
+    }
+
+    fn value_matches(
+        &self,
+        path: &str,
+        name: &str,
+        value_type: nt_hive_core::RegistryValueType,
+        data: &[u8],
+    ) -> bool {
+        self.pending_value(path, name)
+            .or_else(|| {
+                self.handler
+                    .mutable_registry_key_by_path(path)
+                    .and_then(|key| self.handler.mutable_hives.query_value(key, name))
+            })
+            .is_some_and(|(ty, existing)| ty == value_type && existing == data)
+    }
+
+    fn query_value(
+        &self,
+        path: &str,
+        name: &str,
+    ) -> Option<(nt_hive_core::RegistryValueType, alloc::vec::Vec<u8>)> {
+        self.pending_value(path, name)
+            .map(|(ty, data)| (ty, data.to_vec()))
+            .or_else(|| {
+                self.handler
+                    .mutable_registry_key_by_path(path)
+                    .and_then(|key| self.handler.mutable_hives.query_value(key, name))
+                    .map(|(ty, data)| (ty, data.to_vec()))
+            })
+    }
+}
+
 #[used]
 static NT_OPEN_FILE_SERVICE_ENTRY: ExecServiceHandler = exec_nt_open_file_service_entry;
 #[used]
@@ -3130,6 +3292,37 @@ impl ExecNtHandler {
             && SAM_SETUP_KEYS_CREATED.load(Ordering::Relaxed) == 0
     }
 
+    fn commit_and_project_system_setup_mutations(
+        &mut self,
+        mutations: &[OwnedSystemHiveMutation],
+    ) -> Result<u64, u32> {
+        let client_mutations: alloc::vec::Vec<_> = mutations
+            .iter()
+            .map(OwnedSystemHiveMutation::as_client_mutation)
+            .collect();
+        let generation = unsafe {
+            crate::config_manager_commit_system_hive_mutations(&client_mutations)
+        }
+        .map_err(|status| status as u32)?;
+        for mutation in mutations {
+            match mutation {
+                OwnedSystemHiveMutation::CreateKey { path } => {
+                    self.ensure_mutable_registry_key_by_path_journaled(path)?;
+                }
+                OwnedSystemHiveMutation::SetValue {
+                    path,
+                    name,
+                    value_type,
+                    data,
+                } => {
+                    let key = self.ensure_mutable_registry_key_by_path_journaled(path)?;
+                    self.journal_set_mutable_value(key, name, *value_type, data)?;
+                }
+            }
+        }
+        Ok(generation)
+    }
+
     /// Seed ReactOS network setup state that `hivesys.inf`, `nettcpip.inf`, and `afd_reg.inf`
     /// normally materialize. This publishes installed-boot service and TCPIP parameter metadata into
     /// the mounted mutable SYSTEM hive; registry consumers and Config Manager still perform ordinary
@@ -3147,8 +3340,8 @@ impl ExecNtHandler {
                 .map(|plan| plan.adapters.len() as u64)
                 .unwrap_or(u64::MAX),
         );
-        let (stats, changed, failed, last_status) = {
-            let mut target = ExecJournalReactOsSetupSeedTarget::new(self);
+        let (stats, mutations, failed) = {
+            let mut target = CollectSystemSetupSeedTarget::new(self);
             trace_setup_provision_phase(b"network-seed-core-begin", 0);
             let mut stats = nt_hive_core::seed_reactos_network_setup_into_target(&mut target);
             trace_setup_provision_phase(b"network-seed-core-end", stats.total_values() as u64);
@@ -3182,9 +3375,9 @@ impl ExecNtHandler {
                 );
                 trace_setup_provision_phase(b"network-bindings-end", stats.total_values() as u64);
             }
-            (stats, target.changed(), target.failed, target.last_status)
+            (stats, target.mutations, target.failed)
         };
-        if !changed {
+        if mutations.is_empty() {
             if self
                 .mutable_registry_value_by_path(
                     r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip\Parameters",
@@ -3197,14 +3390,27 @@ impl ExecNtHandler {
                 print_str(b"[network-setup] ReactOS network setup not provisioned\n");
             }
             if failed {
-                print_str(b"[network-setup] ReactOS network setup journal incomplete status=0x");
-                print_hex(last_status);
-                print_str(b"\n");
+                print_str(b"[network-setup] SYSTEM mutation collection unavailable\n");
             }
             return;
         }
+        if failed {
+            print_str(b"[network-setup] SYSTEM mutation collection rejected a non-SYSTEM path\n");
+            return;
+        }
+        let generation = match self.commit_and_project_system_setup_mutations(&mutations) {
+            Ok(generation) => generation,
+            Err(status) => {
+                print_str(b"[network-setup] CM-owned SYSTEM commit/projection failed status=0x");
+                print_hex(status);
+                print_str(b"\n");
+                return;
+            }
+        };
         self.mark_mutable_hives_dirty();
-        print_str(b"[network-setup] HKLM\\SYSTEM network setup provisioned: ndis=");
+        print_str(b"[network-setup] HKLM\\SYSTEM committed through CM generation ");
+        print_u64(generation);
+        print_str(b": ndis=");
         print_u64(stats.ndis_service_values as u64);
         print_str(b" tcpip-service=");
         print_u64(stats.tcpip_service_values as u64);
@@ -3221,11 +3427,6 @@ impl ExecNtHandler {
         print_str(b" afd=");
         print_u64(stats.afd_service_values as u64);
         print_str(b"\n");
-        if failed {
-            print_str(b"[network-setup] ReactOS network setup journal incomplete status=0x");
-            print_hex(last_status);
-            print_str(b"\n");
-        }
     }
 
     /// Seed ReactOS shell COM classes that explorer reaches through `rshell.cpp` fallback
@@ -3260,8 +3461,8 @@ impl ExecNtHandler {
     /// architecture. This lets `spoolsv`/`localspl` discover the print environment through real
     /// registry syscalls and then load `winprint.dll` from the real spool directory.
     fn provision_reactos_print_setup(&mut self) {
-        let (stats, changed, failed, last_status) = {
-            let mut target = ExecJournalReactOsSetupSeedTarget::new(self);
+        let (stats, mutations, failed) = {
+            let mut target = CollectSystemSetupSeedTarget::new(self);
             trace_setup_provision_phase(b"print-seed-begin", 0);
             let stats = nt_hive_core::seed_reactos_print_setup_into_target(&mut target);
             trace_setup_provision_phase(
@@ -3271,9 +3472,9 @@ impl ExecNtHandler {
                     + stats.print_processor_values as u64
                     + stats.monitor_values as u64,
             );
-            (stats, target.changed(), target.failed, target.last_status)
+            (stats, target.mutations, target.failed)
         };
-        if !changed {
+        if mutations.is_empty() {
             if self
                 .mutable_registry_value_by_path(
                     r"\Registry\Machine\System\CurrentControlSet\Control\Print\Monitors\Local Port",
@@ -3286,14 +3487,27 @@ impl ExecNtHandler {
                 print_str(b"[print-setup] ReactOS print setup not provisioned\n");
             }
             if failed {
-                print_str(b"[print-setup] ReactOS print setup journal incomplete status=0x");
-                print_hex(last_status);
-                print_str(b"\n");
+                print_str(b"[print-setup] SYSTEM mutation collection unavailable\n");
             }
             return;
         }
+        if failed {
+            print_str(b"[print-setup] SYSTEM mutation collection rejected a non-SYSTEM path\n");
+            return;
+        }
+        let generation = match self.commit_and_project_system_setup_mutations(&mutations) {
+            Ok(generation) => generation,
+            Err(status) => {
+                print_str(b"[print-setup] CM-owned SYSTEM commit/projection failed status=0x");
+                print_hex(status);
+                print_str(b"\n");
+                return;
+            }
+        };
         self.mark_mutable_hives_dirty_preserving_services_order();
-        print_str(b"[print-setup] HKLM\\SYSTEM print setup provisioned: root=");
+        print_str(b"[print-setup] HKLM\\SYSTEM committed through CM generation ");
+        print_u64(generation);
+        print_str(b": root=");
         print_u64(stats.root_values as u64);
         print_str(b" env=");
         print_u64(stats.environment_values as u64);
@@ -3302,11 +3516,6 @@ impl ExecNtHandler {
         print_str(b" monitors=");
         print_u64(stats.monitor_values as u64);
         print_str(b"\n");
-        if failed {
-            print_str(b"[print-setup] ReactOS print setup journal incomplete status=0x");
-            print_hex(last_status);
-            print_str(b"\n");
-        }
     }
 
     /// Seed the default-user profile shell-folder registry state ReactOS setup normally writes.
@@ -3553,27 +3762,56 @@ impl ExecNtHandler {
         }
         trace_setup_provision_phase(b"locale-system-key-end", 1);
         trace_setup_provision_phase(b"locale-system-default-begin", system_locale_len as u64);
-        let Some(system_default_changed) = self.ensure_mutable_registry_value_by_path(
-            NLS_LANGUAGE,
-            "Default",
-            REG_SZ,
-            &system_locale[..system_locale_len],
-        ) else {
-            print_str(b"[locale-setup] HKLM\\...\\Nls\\Language\\Default mutable write failed\n");
-            return;
-        };
-        trace_setup_provision_phase(b"locale-system-default-end", system_default_changed as u64);
-        trace_setup_provision_phase(b"locale-install-language-begin", system_locale_len as u64);
-        let Some(install_language_changed) = self.ensure_mutable_registry_value_by_path(
-            NLS_LANGUAGE,
-            "InstallLanguage",
-            REG_SZ,
-            &system_locale[..system_locale_len],
-        ) else {
-            print_str(
-                b"[locale-setup] HKLM\\...\\Nls\\Language\\InstallLanguage mutable write failed\n",
+        let (system_default_changed, install_language_changed, mutations, failed) = {
+            let mut target = CollectSystemSetupSeedTarget::new(self);
+            let system_default_changed = nt_hive_core::ReactOsSetupSeedTarget::set_value(
+                &mut target,
+                NLS_LANGUAGE,
+                "Default",
+                nt_hive_core::RegistryValueType::Sz,
+                system_locale[..system_locale_len].to_vec(),
             );
+            trace_setup_provision_phase(
+                b"locale-system-default-end",
+                system_default_changed as u64,
+            );
+            trace_setup_provision_phase(
+                b"locale-install-language-begin",
+                system_locale_len as u64,
+            );
+            let install_language_changed = nt_hive_core::ReactOsSetupSeedTarget::set_value(
+                &mut target,
+                NLS_LANGUAGE,
+                "InstallLanguage",
+                nt_hive_core::RegistryValueType::Sz,
+                system_locale[..system_locale_len].to_vec(),
+            );
+            (
+                system_default_changed,
+                install_language_changed,
+                target.mutations,
+                target.failed,
+            )
+        };
+        if failed {
+            print_str(b"[locale-setup] SYSTEM mutation collection unavailable\n");
             return;
+        }
+        let system_generation = if mutations.is_empty() {
+            None
+        } else {
+            match self.commit_and_project_system_setup_mutations(&mutations) {
+                Ok(generation) => {
+                    self.mark_mutable_hives_dirty_preserving_services_order();
+                    Some(generation)
+                }
+                Err(status) => {
+                    print_str(b"[locale-setup] CM-owned SYSTEM commit/projection failed status=0x");
+                    print_hex(status);
+                    print_str(b"\n");
+                    return;
+                }
+            }
         };
         trace_setup_provision_phase(
             b"locale-install-language-end",
@@ -3600,6 +3838,13 @@ impl ExecNtHandler {
         print_str(b") | HKLM\\...\\Nls\\Language Default=");
         for &byte in system_ascii {
             debug_put_char(byte);
+        }
+        match system_generation {
+            Some(generation) => {
+                print_str(b" CM-generation=");
+                print_u64(generation);
+            }
+            None => print_str(b" CM-generation=unchanged"),
         }
         print_str(b"\n");
     }
