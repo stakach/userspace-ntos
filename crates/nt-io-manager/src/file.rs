@@ -1,7 +1,7 @@
 //! File object records + their lifecycle state machine (spec §12).
 
 use nt_io_abi::{DeviceId, FileId};
-use nt_types::{AccessMask, ClientId, NtPath, ObjectId};
+use nt_types::{AccessMask, ClientId, ObjectId, UnicodeString};
 
 bitflags::bitflags! {
     /// `FILE_SHARE_*` share access.
@@ -104,8 +104,13 @@ pub struct FileRecord {
     pub share_access: ShareAccess,
     pub create_options: CreateOptions,
     pub flags: FileFlags,
+    /// Parent captured for a handle-relative CREATE. `allocate_irp` transfers this identity into
+    /// the CREATE stack and clears it here; the CREATE IRP, not the child File lifetime, retains
+    /// the parent.
     pub related_file: Option<FileId>,
-    pub file_name: Option<NtPath>,
+    /// Exact `FILE_OBJECT.FileName` supplied to the filesystem. It may be absolute, relative, or
+    /// empty; it is not an Object Manager path and therefore must not be parsed as `NtPath`.
+    pub file_name: UnicodeString,
     /// Mutable driver-owned `FILE_OBJECT.FsContext` payload. Canonical identity
     /// is always `id`; drivers may share, replace, tag, clear, or leave this
     /// value null.
@@ -131,7 +136,7 @@ impl FileRecord {
         desired_access: AccessMask,
         share_access: ShareAccess,
         create_options: CreateOptions,
-        file_name: Option<NtPath>,
+        file_name: UnicodeString,
     ) -> Self {
         Self {
             id: FileId::NULL,

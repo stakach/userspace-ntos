@@ -1601,12 +1601,16 @@ impl MemFs {
         Some(cur)
     }
 
-    fn lookup_folded_relative(&self, path: &[u8]) -> Option<u64> {
-        let mut cur = 0;
+    fn lookup_folded_from(&self, start: u64, path: &[u8]) -> Option<u64> {
+        let mut cur = start;
         for comp in path.split(|byte| *byte == b'\\').filter(|c| !c.is_empty()) {
             cur = self.child_folded_bytes(cur, comp)?;
         }
         Some(cur)
+    }
+
+    fn lookup_folded_relative(&self, path: &[u8]) -> Option<u64> {
+        self.lookup_folded_from(0, path)
     }
 
     /// Split a path into (parent components, leaf name).
@@ -1707,15 +1711,16 @@ impl MemFs {
         }
     }
 
-    fn create_folded_relative(
+    fn create_folded_from(
         &mut self,
+        start: u64,
         rel_path: &[u8],
         disposition: u32,
         options: u32,
         file_attributes: u32,
     ) -> Result<(u64, u32), u32> {
         let want_dir = options & FILE_DIRECTORY_FILE != 0;
-        let existing = self.lookup_folded_relative(rel_path);
+        let existing = self.lookup_folded_from(start, rel_path);
         match existing {
             Some(id) => {
                 let is_dir = self.node(id).unwrap().is_dir;
@@ -1749,7 +1754,7 @@ impl MemFs {
                     let (parent_path, leaf) =
                         Self::parent_and_leaf_bytes(rel_path).ok_or(STATUS_INVALID_PARAMETER)?;
                     let parent = self
-                        .lookup_folded_relative(parent_path)
+                        .lookup_folded_from(start, parent_path)
                         .ok_or(STATUS_OBJECT_PATH_NOT_FOUND)?;
                     if !self.node(parent).unwrap().is_dir {
                         return Err(STATUS_OBJECT_PATH_NOT_FOUND);
@@ -1770,6 +1775,16 @@ impl MemFs {
                 _ => Err(STATUS_INVALID_PARAMETER),
             },
         }
+    }
+
+    fn create_folded_relative(
+        &mut self,
+        rel_path: &[u8],
+        disposition: u32,
+        options: u32,
+        file_attributes: u32,
+    ) -> Result<(u64, u32), u32> {
+        self.create_folded_from(0, rel_path, disposition, options, file_attributes)
     }
 
     /// Query a volume-relative path's attributes WITHOUT opening a handle — the
@@ -2474,6 +2489,33 @@ pub struct CreateResult {
 pub const INVALID_HANDLE: u64 = u64::MAX;
 
 impl FileSystem {
+    fn publish_file_object(
+        &mut self,
+        node_id: u64,
+        information: u32,
+        options: u32,
+    ) -> CreateResult {
+        let handle = match self.handles.iter().position(|slot| slot.is_none()) {
+            Some(free) => free as u64,
+            None => {
+                self.handles.push(None);
+                (self.handles.len() - 1) as u64
+            }
+        };
+        self.handles[handle as usize] = Some(FileObject {
+            node_id,
+            current_offset: 0,
+            references: 1,
+            delete_pending: options & FILE_DELETE_ON_CLOSE != 0,
+            query: DirectoryQueryState::new(),
+        });
+        CreateResult {
+            status: STATUS_SUCCESS,
+            handle,
+            information,
+        }
+    }
+
     /// A file system over `volume`, mounted with the required v0.1 mounts (spec §13.2).
     pub fn new(volume: MemFs) -> Self {
         FileSystem {
@@ -2623,28 +2665,8 @@ impl FileSystem {
             .volume
             .create(&rel, disposition, options, file_attributes)
         {
-            Ok((node_id, information)) => {
-                // Directory/non-directory intent already validated in create().
-                let handle = match self.handles.iter().position(|slot| slot.is_none()) {
-                    Some(free) => free as u64,
-                    None => {
-                        self.handles.push(None);
-                        (self.handles.len() - 1) as u64
-                    }
-                };
-                self.handles[handle as usize] = Some(FileObject {
-                    node_id,
-                    current_offset: 0,
-                    references: 1,
-                    delete_pending: options & FILE_DELETE_ON_CLOSE != 0,
-                    query: DirectoryQueryState::new(),
-                });
-                CreateResult {
-                    status: STATUS_SUCCESS,
-                    handle,
-                    information,
-                }
-            }
+            // Directory/non-directory intent already validated in create().
+            Ok((node_id, information)) => self.publish_file_object(node_id, information, options),
             Err(status) => fail(status),
         }
     }
@@ -2671,27 +2693,48 @@ impl FileSystem {
             .volume
             .create_folded_relative(relative, disposition, options, file_attributes)
         {
-            Ok((node_id, information)) => {
-                let handle = match self.handles.iter().position(|slot| slot.is_none()) {
-                    Some(free) => free as u64,
-                    None => {
-                        self.handles.push(None);
-                        (self.handles.len() - 1) as u64
-                    }
-                };
-                self.handles[handle as usize] = Some(FileObject {
-                    node_id,
-                    current_offset: 0,
-                    references: 1,
-                    delete_pending: options & FILE_DELETE_ON_CLOSE != 0,
-                    query: DirectoryQueryState::new(),
-                });
-                CreateResult {
-                    status: STATUS_SUCCESS,
-                    handle,
-                    information,
-                }
-            }
+            Ok((node_id, information)) => self.publish_file_object(node_id, information, options),
+            Err(status) => fail(status),
+        }
+    }
+
+    /// Create or open a folded path beneath an existing directory FILE_OBJECT. The directory's
+    /// node identity, rather than a reconstructed absolute string, is the parse root.
+    pub fn zw_create_file_relative_to_directory(
+        &mut self,
+        root_directory: u64,
+        relative: &[u8],
+        _desired_access: u32,
+        file_attributes: u32,
+        _share_access: u32,
+        disposition: u32,
+        options: u32,
+    ) -> CreateResult {
+        let fail = |status| CreateResult {
+            status,
+            handle: INVALID_HANDLE,
+            information: 0,
+        };
+        let Some(root_node) = self.obj(root_directory).map(|object| object.node_id) else {
+            return fail(STATUS_INVALID_HANDLE);
+        };
+        let Some(root) = self.volume.node(root_node) else {
+            return fail(STATUS_INVALID_HANDLE);
+        };
+        if !root.is_dir {
+            return fail(STATUS_NOT_A_DIRECTORY);
+        }
+        if relative.is_empty() || relative.first() == Some(&b'\\') {
+            return fail(STATUS_INVALID_PARAMETER);
+        }
+        match self.volume.create_folded_from(
+            root_node,
+            relative,
+            disposition,
+            options,
+            file_attributes,
+        ) {
+            Ok((node_id, information)) => self.publish_file_object(node_id, information, options),
             Err(status) => fail(status),
         }
     }

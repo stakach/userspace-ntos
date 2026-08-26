@@ -13838,3 +13838,52 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     remaining allocating `writable_path` and `volume_path` helpers with bounded `*_into` forms.
     Preserve the current phase boundary: path resolution is synchronous, while canonical Files,
     IRPs, pending CREATE publication, APC/event/IOCP state, and process handles remain durable.
+
+    File RootDirectory and RelatedFileObject identity (2026-08-27, accepted): file opens no longer
+    capture and then ignore `OBJECT_ATTRIBUTES.RootDirectory`. The executive resolves a non-null
+    root through the calling process's canonical File handle and distinguishes FAT directories,
+    writable-overlay directories, hosted provider Files, and non-directory Files. FAT directory
+    handles retain both their on-volume cluster and a bounded canonical volume-relative path;
+    overlay handles retain node identity. Relative lookup/create therefore starts at the exact
+    directory object, crosses the read-only FAT and writable overlay coherently, and rejects stale,
+    foreign, or non-directory roots instead of retrying as an absolute path. The allocating
+    `writable_path` and `volume_path` helpers were deleted in favour of bounded `*_into` forms.
+
+    I/O ABI version 6 carries the canonical related File ID on CREATE. The I/O Manager derives the
+    target device from that exact parent, retains both parent and child while the CREATE IRP is
+    outstanding, and defers final parent close until completion. Hosted providers receive the
+    relative leaf in `FILE_OBJECT.FileName` and the parent projection in
+    `FILE_OBJECT.RelatedFileObject` at the NT5 x64 `+0x40` field. Receiver-side relation synthesis
+    and mismatched-device/self/stale relations are rejected. The same contract now drives rooted
+    NPFS opens, while local FAT/overlay image opens publish their real File handles into the DLL
+    registry. The ntdll loader also canonicalizes dependent DLL requests to absolute NT names:
+    rooted names are preserved, drive paths use `\??\`, and bare imports use
+    `\SystemRoot\System32\`; over-capacity names fail rather than truncate.
+
+    The ABI change exposed a component-side PnP validator bug which treated the valid non-CREATE
+    pair `(file_id=0, related_file_id=0)` as a self-relation. The validator now applies relation
+    rules only when a nonzero related File is present. Separately, the dynamic `rundll32` teardown
+    exposed raw DLL/shared-image cache storage surviving the service-loop allocator rewind. Those
+    registries now pin their backing chunks and vector storage immediately in the allocator's
+    durable watermark. The watermark occupies its own asserted metadata word; an initial rejected
+    run caught and corrected an overlap with the mapped-heap-size word before acceptance.
+
+    Focused validation passes `nt-io-abi` `5/5`, `nt-io-manager` `202/202`, `nt-fs` `68/68`, and
+    `nt-types` `10/10`; the freestanding executive release check remains green at the established
+    212-warning baseline. Final serialized acceptance
+    `.tmp/run-headless-file-root-relative-final2-20260827.log` completed all five configured PnP
+    starts, reclaimed process 16 with 551 frames, 491 shared mappings, 2,861 win32k capabilities,
+    59 DLL-cache records, 17 DLL views, and two private page tables, and reported no allocator
+    corruption or allocation failure. Explorer painted 480,000/480,000 pixels with at least 32
+    colors, all `295/295` gates passed, and the sentinel matched. Final durable allocation was
+    14,814,432 B with 6,156,960 B reusable; scratch returned to zero at its unchanged 278,112 B
+    peak.
+
+    Review adjustment: File-handle `RootDirectory` resolution and provider
+    `RelatedFileObject` lifetime are closed. Object Manager Directory handles are not yet valid
+    file roots; unify directory-root parsing where the object namespace crosses into the file
+    namespace before extending rooted rename/link/delete/query surfaces. Inventory the remaining
+    file query/set-information operations for duplicated path identity and allocating capture.
+    The root service-loop mark/reset compatibility boundary and dirty-publication finalizer also
+    remain: the durable cache watermark is now a hard ownership invariant, but it does not by itself
+    justify retiring that older machinery.

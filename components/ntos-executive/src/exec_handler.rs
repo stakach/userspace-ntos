@@ -86,6 +86,7 @@ const PNP_SET_DEVICE_STATUS: u32 = 1;
 const PNP_CLEAR_DEVICE_STATUS: u32 = 2;
 const NAMED_OBJECT_PATH_CAP: usize = 1024;
 const FILE_OBJECT_NAME_CAP: usize = 1024;
+const FILE_VOLUME_RELATIVE_CAP: usize = FILE_OBJECT_NAME_CAP + 16;
 const PNP_BUS_RELATIONS: u32 = 3;
 const GUID_DEVICE_ENUMERATED_BYTES: [u8; 16] = [
     0x0a, 0x40, 0x3a, 0xcb, 0xf0, 0x46, 0xd0, 0x11, 0xb0, 0x8f, 0x00, 0x60, 0x97, 0x13, 0x05, 0x3f,
@@ -115,6 +116,21 @@ impl CapturedFileObjectAttributes {
     fn name(&self) -> &[u16] {
         &self.name[..self.name_len]
     }
+}
+
+#[derive(Copy, Clone)]
+enum FileParseRoot {
+    Absolute,
+    FatDirectory {
+        first_cluster: u32,
+        object_id: u32,
+    },
+    OverlayFile(u64),
+    HostedFile {
+        file_id: u64,
+        device_id: u64,
+    },
+    NonDirectoryFile,
 }
 
 fn try_zeroed_transfer_buffer(len: usize) -> Result<alloc::vec::Vec<u8>, u32> {
@@ -339,7 +355,8 @@ static mut OVERLAY_WRITE_SCRATCH: [u8; 64 * 1024] = [0; 64 * 1024];
 static mut SETUP_UNATTEND_SCRATCH: [u8; 4096] = [0; 4096];
 static mut NT_QUERY_ATTR_NAME16_SCRATCH: [u16; 1024] = [0; 1024];
 static mut NT_QUERY_ATTR_FOLDED_SCRATCH: [u8; 1024] = [0; 1024];
-static mut NT_QUERY_ATTR_RELATIVE_SCRATCH: [u8; 1024] = [0; 1024];
+static mut NT_QUERY_ATTR_RELATIVE_SCRATCH: [u8; FILE_VOLUME_RELATIVE_CAP] =
+    [0; FILE_VOLUME_RELATIVE_CAP];
 type ExecServiceHandler = unsafe extern "C" fn(*mut ExecNtHandler, *const u64, usize) -> u32;
 
 fn trace_setup_provision_phase(phase: &[u8], detail: u64) {
@@ -4964,13 +4981,13 @@ impl ExecNtHandler {
     /// # Safety
     /// Borrows the mounted writable volume for the duration of the copy; single-threaded executive.
     unsafe fn read_file_by_nt_path(name16: &[u16], dst: &mut [u8]) -> Option<usize> {
-        if let Some(relative) = crate::writable_fs::writable_path(name16) {
+        let mut folded = [0u8; FILE_OBJECT_NAME_CAP];
+        let mut relative = [0u8; FILE_VOLUME_RELATIVE_CAP];
+        if let Some(relative_len) =
+            crate::writable_fs::writable_path_into(name16, &mut folded, &mut relative)
+        {
             let fs = crate::writable_fs::writable_fs()?;
-            let mut path = alloc::string::String::from(r"\??\C:\");
-            for &byte in &relative {
-                path.push(byte as char);
-            }
-            let bytes = fs.file_bytes(&path)?;
+            let bytes = fs.file_bytes_relative(&relative[..relative_len])?;
             if bytes.len() > dst.len() {
                 return None;
             }
@@ -9656,24 +9673,32 @@ impl ExecNtHandler {
         desired_access: u32,
         open_options: u32,
     ) -> Option<(u32, u32)> {
-        const FILE_EXECUTE: u32 = 0x0000_0020;
-        const GENERIC_READ: u32 = 0x8000_0000;
-        const GENERIC_EXECUTE: u32 = 0x2000_0000;
-        const GENERIC_ALL: u32 = 0x1000_0000;
-        let wants_read = desired_access & (nt_fs::FILE_READ_DATA | GENERIC_READ | GENERIC_ALL) != 0;
-        let wants_execute = desired_access & (FILE_EXECUTE | GENERIC_EXECUTE) != 0;
-        let synchronous = open_options
-            & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
-            != 0;
-        if open_options & nt_fs::FILE_DIRECTORY_FILE != 0
-            || !wants_read
-            || wants_execute
-            || !synchronous
-        {
+        if !Self::readonly_disk_open_allowed(desired_access, open_options) {
             return None;
         }
         nt_fs::nt_path_to_volume_relative(name16, b"reactos")
             .and_then(|path| unsafe { exec_fs().and_then(|fs| fat_open_path(&fs, &path)) })
+    }
+
+    fn readonly_disk_open_allowed(desired_access: u32, open_options: u32) -> bool {
+        const FILE_EXECUTE: u32 = 0x0000_0020;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const GENERIC_EXECUTE: u32 = 0x2000_0000;
+        const GENERIC_ALL: u32 = 0x1000_0000;
+        let wants_read_or_execute = desired_access
+            & (nt_fs::FILE_READ_DATA | FILE_EXECUTE | GENERIC_READ | GENERIC_EXECUTE | GENERIC_ALL)
+            != 0;
+        let wants_write = desired_access
+            & (nt_fs::FILE_WRITE_DATA | nt_fs::FILE_APPEND_DATA | GENERIC_WRITE | GENERIC_ALL)
+            != 0;
+        let synchronous = open_options
+            & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
+            != 0;
+        !(open_options & nt_fs::FILE_DIRECTORY_FILE != 0
+            || !wants_read_or_execute
+            || wants_write
+            || !synchronous)
     }
 
     fn readonly_volume_entry(name16: &[u16]) -> Option<(u32, u32, u8)> {
@@ -9751,9 +9776,17 @@ impl ExecNtHandler {
     }
 
     /// Mint a process-local handle for a directory on the mounted FAT volume.
-    pub(crate) fn mint_directory_handle(&mut self, first_cluster: u32, access: u32) -> Option<u64> {
+    pub(crate) fn mint_directory_handle(
+        &mut self,
+        first_cluster: u32,
+        volume_relative_path: &[u8],
+        access: u32,
+    ) -> Option<u64> {
         let pid = self.pm_pid_for_pi(self.pi)?;
-        let object_id = self.directory_opens.create(first_cluster).ok()?;
+        let object_id = self
+            .directory_opens
+            .create(first_cluster, volume_relative_path)
+            .ok()?;
         let handle = match self.insert_process_handle(
             pid,
             nt_process::HandleObject::Directory {
@@ -9769,6 +9802,153 @@ impl ExecNtHandler {
             }
         };
         Some(handle as u64)
+    }
+
+    unsafe fn create_local_file_relative(
+        &mut self,
+        root: FileParseRoot,
+        name16: &[u16],
+        desired_access: u32,
+        file_attributes: u32,
+        share_access: u32,
+        disposition: u32,
+        options: u32,
+    ) -> (u32, u64, u64) {
+        let mut folded = [0u8; FILE_OBJECT_NAME_CAP];
+        let mut relative = [0u8; FILE_OBJECT_NAME_CAP];
+        let relative_len = match Self::capture_relative_file_path(
+            name16,
+            &mut folded,
+            &mut relative,
+        ) {
+            Ok(length) => length,
+            Err(status) => return (status, 0, 0),
+        };
+        let relative = &relative[..relative_len];
+
+        let publish_overlay = |this: &mut Self, result: (u32, Option<u64>, u64)| {
+            let (mut status, file_id, information) = result;
+            let mut handle = 0;
+            if let Some(file_id) = file_id {
+                this.writable_fs_dirty = true;
+                match this.mint_overlay_file_handle(file_id, desired_access) {
+                    Some(opened) => handle = opened,
+                    None => status = STATUS_INSUFFICIENT_RESOURCES,
+                }
+            }
+            (status, information, handle)
+        };
+
+        match root {
+            FileParseRoot::OverlayFile(root_file_id) => publish_overlay(
+                self,
+                crate::writable_fs::create_relative_to_directory(
+                    root_file_id,
+                    relative,
+                    desired_access,
+                    file_attributes,
+                    share_access,
+                    disposition,
+                    options,
+                ),
+            ),
+            FileParseRoot::FatDirectory {
+                first_cluster,
+                object_id,
+            } => {
+                let mut parent_path = [0u8; nt_fs::DIRECTORY_OPEN_PATH_CAP];
+                let parent_len = {
+                    let Ok(open) = self.directory_opens.get(object_id) else {
+                        return (STATUS_INVALID_HANDLE, 0, 0);
+                    };
+                    if open.first_cluster != first_cluster
+                        || open.volume_relative_path().len() > parent_path.len()
+                    {
+                        return (STATUS_INVALID_HANDLE, 0, 0);
+                    }
+                    let length = open.volume_relative_path().len();
+                    parent_path[..length].copy_from_slice(open.volume_relative_path());
+                    length
+                };
+                let mut full_path = [0u8; nt_fs::DIRECTORY_OPEN_PATH_CAP];
+                let full_len = match Self::join_volume_relative_path(
+                    &parent_path[..parent_len],
+                    relative,
+                    &mut full_path,
+                ) {
+                    Ok(length) => length,
+                    Err(status) => return (status, 0, 0),
+                };
+                let full_path = &full_path[..full_len];
+                if crate::writable_fs::query_attributes_relative_if_mounted(full_path).is_some() {
+                    return publish_overlay(
+                        self,
+                        crate::writable_fs::create(
+                            full_path,
+                            desired_access,
+                            file_attributes,
+                            share_access,
+                            disposition,
+                            options,
+                        ),
+                    );
+                }
+                let fat_entry = exec_fs().and_then(|fs| {
+                    crate::fs_loader::fat_open_path_entry_from(&fs, first_cluster, relative)
+                });
+                if disposition == nt_fs::FILE_OPEN
+                    || (disposition == nt_fs::FILE_OPEN_IF && fat_entry.is_some())
+                {
+                    let Some((cluster, size, attributes)) = fat_entry else {
+                        return (nt_fs::STATUS_OBJECT_NAME_NOT_FOUND, 0, 0);
+                    };
+                    let is_directory = attributes & nt_fs::FILE_ATTRIBUTE_DIRECTORY as u8 != 0;
+                    if options & nt_fs::FILE_DIRECTORY_FILE != 0 && !is_directory {
+                        return (nt_fs::STATUS_NOT_A_DIRECTORY, 0, 0);
+                    }
+                    if options & nt_fs::FILE_NON_DIRECTORY_FILE != 0 && is_directory {
+                        return (nt_fs::STATUS_FILE_IS_A_DIRECTORY, 0, 0);
+                    }
+                    let handle = if is_directory {
+                        self.mint_directory_handle(cluster, full_path, desired_access)
+                    } else if Self::readonly_disk_open_allowed(desired_access, options) {
+                        self.mint_disk_file_handle(cluster, size, desired_access)
+                    } else {
+                        return (nt_fs::STATUS_NOT_SUPPORTED, 0, 0);
+                    };
+                    return match handle {
+                        Some(handle) => (nt_fs::STATUS_SUCCESS, nt_fs::FILE_OPENED as u64, handle),
+                        None => (STATUS_INSUFFICIENT_RESOURCES, 0, 0),
+                    };
+                }
+                if disposition == nt_fs::FILE_CREATE && fat_entry.is_some() {
+                    return (nt_fs::STATUS_OBJECT_NAME_COLLISION, 0, 0);
+                }
+                if let Some(parent) = Self::volume_relative_parent(full_path) {
+                    if Self::readonly_volume_relative_is_dir(parent)
+                        && crate::writable_fs::provision_directory_relative_change(parent)
+                            == Some(true)
+                    {
+                        self.writable_fs_dirty = true;
+                    }
+                }
+                publish_overlay(
+                    self,
+                    crate::writable_fs::create(
+                        full_path,
+                        desired_access,
+                        file_attributes,
+                        share_access,
+                        disposition,
+                        options,
+                    ),
+                )
+            }
+            FileParseRoot::NonDirectoryFile => (nt_fs::STATUS_NOT_A_DIRECTORY, 0, 0),
+            FileParseRoot::Absolute | FileParseRoot::HostedFile { .. } => {
+                (STATUS_INVALID_HANDLE, 0, 0)
+            }
+        }
     }
 
     fn disk_file_for(&self, handle: u64) -> Result<Option<(u32, u32, u32)>, u32> {
@@ -18510,6 +18690,96 @@ impl ExecNtHandler {
         })
     }
 
+    /// Resolve the I/O parse root through the caller's canonical process handle table. A null root
+    /// requires an absolute Object Manager name. A File root deliberately accepts either spelling;
+    /// the owning filesystem parse routine decides whether a leading separator is valid.
+    fn resolve_file_parse_root(
+        &self,
+        captured: &CapturedFileObjectAttributes,
+    ) -> Result<FileParseRoot, u32> {
+        if captured.root == 0 {
+            return if captured.name().first() == Some(&(b'\\' as u16)) {
+                Ok(FileParseRoot::Absolute)
+            } else {
+                Err(STATUS_OBJECT_PATH_SYNTAX_BAD)
+            };
+        }
+        let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
+        let object = self
+            .pm
+            .lookup_handle(pid, captured.root as nt_process::Handle)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        match object {
+            nt_process::HandleObject::Directory {
+                first_cluster,
+                object_id,
+            } => {
+                let open = self.directory_opens.get(object_id)?;
+                if open.first_cluster != first_cluster {
+                    return Err(STATUS_INVALID_HANDLE);
+                }
+                Ok(FileParseRoot::FatDirectory {
+                    first_cluster,
+                    object_id,
+                })
+            }
+            nt_process::HandleObject::OverlayFile(file_id) => {
+                // SAFETY: the executive service loop serializes every writable-volume access.
+                if unsafe { crate::writable_fs::standard_information(file_id) }.is_none() {
+                    return Err(STATUS_INVALID_HANDLE);
+                }
+                Ok(FileParseRoot::OverlayFile(file_id))
+            }
+            nt_process::HandleObject::RoutedFile { file_id, device_id } => {
+                let Some((live_device_id, _)) = driver_launch::hosted_file_route(file_id) else {
+                    return Err(STATUS_INVALID_HANDLE);
+                };
+                if live_device_id != device_id {
+                    return Err(STATUS_INVALID_HANDLE);
+                }
+                Ok(FileParseRoot::HostedFile { file_id, device_id })
+            }
+            nt_process::HandleObject::File(file_id) => {
+                let Some((device_id, _)) = driver_launch::hosted_file_route(file_id) else {
+                    return Err(STATUS_INVALID_HANDLE);
+                };
+                Ok(FileParseRoot::HostedFile { file_id, device_id })
+            }
+            nt_process::HandleObject::DiskFile { .. }
+            | nt_process::HandleObject::BootStatusFile => Ok(FileParseRoot::NonDirectoryFile),
+            _ => Err(STATUS_INVALID_HANDLE),
+        }
+    }
+
+    fn capture_relative_file_path(
+        name: &[u16],
+        folded: &mut [u8],
+        relative: &mut [u8],
+    ) -> Result<usize, u32> {
+        nt_fs::nt_file_relative_path_into(name, folded, relative)
+            .ok_or(STATUS_OBJECT_NAME_INVALID)
+    }
+
+    fn join_volume_relative_path(
+        parent: &[u8],
+        child: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, u32> {
+        let separator = usize::from(!parent.is_empty());
+        let length = parent
+            .len()
+            .checked_add(separator)
+            .and_then(|length| length.checked_add(child.len()))
+            .filter(|length| *length <= output.len())
+            .ok_or(STATUS_OBJECT_NAME_INVALID)?;
+        output[..parent.len()].copy_from_slice(parent);
+        if separator != 0 {
+            output[parent.len()] = b'\\';
+        }
+        output[parent.len() + separator..length].copy_from_slice(child);
+        Ok(length)
+    }
+
     /// Render a complete FILE_BASIC_INFORMATION with the backing volume's real attributes. This
     /// volume does not track timestamps, so zero is the honest value for all four time fields.
     unsafe fn write_file_basic_attributes(&self, output: u64, attributes: u32) -> bool {
@@ -18847,6 +19117,7 @@ impl ExecNtHandler {
         &mut self,
         major: u8,
         name16: &[u16],
+        related_file_id: Option<u64>,
         provider_context: u64,
         desired_access: u32,
         share_access: u32,
@@ -18872,6 +19143,12 @@ impl ExecNtHandler {
         }
         let device_id = driver_launch::device_id_by_name("\\Device\\NamedPipe")
             .ok_or(STATUS_DEVICE_NOT_READY)?;
+        if related_file_id.is_some_and(|file_id| {
+            driver_launch::hosted_file_route(file_id)
+                .is_none_or(|(parent_device_id, _)| parent_device_id != device_id)
+        }) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
         let server = major == major::IRP_MJ_CREATE_NAMED_PIPE;
         if !matches!(
             major,
@@ -18884,13 +19161,23 @@ impl ExecNtHandler {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
         let reservation = self.reserve_current_process_handle_slot()?;
-        let canonical_file_id = match driver_launch::allocate_hosted_file(
-            device_id,
-            desired_access,
-            share_access,
-            create_options,
-            name16,
-        ) {
+        let allocated_file = match related_file_id {
+            Some(related_file_id) => driver_launch::allocate_hosted_relative_file(
+                related_file_id,
+                desired_access,
+                share_access,
+                create_options,
+                name16,
+            ),
+            None => driver_launch::allocate_hosted_file(
+                device_id,
+                desired_access,
+                share_access,
+                create_options,
+                name16,
+            ),
+        };
+        let canonical_file_id = match allocated_file {
             Ok(file_id) => file_id,
             Err(status) => {
                 let _ = self.pm.cancel_reserved_handle(reservation);
@@ -18933,6 +19220,7 @@ impl ExecNtHandler {
                 create_disposition,
                 file_attributes,
                 ea_length: u32::try_from(ea.len()).map_err(|_| STATUS_INVALID_BUFFER_SIZE)?,
+                related_file: related_file_id.map(nt_io_manager::FileId),
             },
             &in_bytes,
             &mut out,
@@ -20966,9 +21254,12 @@ impl ExecNtHandler {
                 };
             }
         }
-        if let Some(relative) = crate::writable_fs::volume_path(name16) {
-            if let Some(info) = crate::writable_fs::query_attributes_relative_if_mounted(&relative)
-            {
+        if let Some(relative_len) =
+            crate::writable_fs::volume_path_into(name16, folded_scratch, relative_scratch)
+        {
+            if let Some(info) = crate::writable_fs::query_attributes_relative_if_mounted(
+                &relative_scratch[..relative_len],
+            ) {
                 return if self.write_file_basic_attributes(args[1], info.attributes) {
                     nt_fs::STATUS_SUCCESS
                 } else {
@@ -21077,9 +21368,12 @@ impl ExecNtHandler {
                 };
             }
         }
-        if let Some(relative) = crate::writable_fs::volume_path(name16) {
-            if let Some(info) = crate::writable_fs::query_attributes_relative_if_mounted(&relative)
-            {
+        if let Some(relative_len) =
+            crate::writable_fs::volume_path_into(name16, folded_scratch, relative_scratch)
+        {
+            if let Some(info) = crate::writable_fs::query_attributes_relative_if_mounted(
+                &relative_scratch[..relative_len],
+            ) {
                 return if self.write_file_network_open_information(args[1], info) {
                     nt_fs::STATUS_SUCCESS
                 } else {
@@ -21149,7 +21443,11 @@ impl ExecNtHandler {
             Err(status) => return status,
         };
         let name16 = captured.name();
-        let _captured_root_and_attributes = (captured.root, captured.attributes);
+        let parse_root = match self.resolve_file_parse_root(&captured) {
+            Ok(root) => root,
+            Err(status) => return status,
+        };
+        let _captured_attributes = captured.attributes;
         let mut nb = [0u8; 96];
         let nlen = {
             let mut n = 0;
@@ -21162,6 +21460,104 @@ impl ExecNtHandler {
             }
             n
         };
+        if !matches!(parse_root, FileParseRoot::Absolute) {
+            if let FileParseRoot::HostedFile { file_id, device_id } = parse_root {
+                if name16.first() == Some(&(b'\\' as u16)) {
+                    return STATUS_OBJECT_NAME_INVALID;
+                }
+                if driver_launch::device_id_by_name("\\Device\\NamedPipe") != Some(device_id) {
+                    return STATUS_INVALID_DEVICE_REQUEST;
+                }
+                let provider_context = nt_io_manager::pipe_name_hash(name16);
+                let dispatch = self.npfs_create_file(
+                    major::IRP_MJ_CREATE,
+                    name16,
+                    Some(file_id),
+                    provider_context,
+                    desired_access,
+                    share_access,
+                    nt_fs::FILE_OPEN,
+                    0,
+                    open_options,
+                    &[],
+                    file_handle_out,
+                    args[3],
+                );
+                let publication = match dispatch {
+                    Ok(dispatch) => self.finish_npfs_create_dispatch(
+                        dispatch,
+                        major::IRP_MJ_CREATE,
+                        desired_access,
+                        provider_context,
+                    ),
+                    Err(status) => Some(HostedCreatePublication {
+                        status,
+                        information: 0,
+                        handle: 0,
+                        wake_server_fid: 0,
+                    }),
+                };
+                let Some(publication) = publication else {
+                    return STATUS_PENDING;
+                };
+                if publication.handle != 0 {
+                    self.queue_write(file_handle_out, publication.handle);
+                    self.pipe_endpoint_progress |= publication.wake_server_fid != 0;
+                } else {
+                    self.write_nt_open_file_handle_out(file_handle_out, 0);
+                }
+                self.xas_write_buf(args[3], &publication.status.to_le_bytes());
+                self.xas_write_buf(args[3] + 8, &publication.information.to_le_bytes());
+                trace_pipe_open(
+                    b"NtOpenFile(relative)",
+                    self.pi,
+                    self.current_badge,
+                    self.current_tid,
+                    desired_access,
+                    share_access,
+                    nt_fs::FILE_OPEN,
+                    open_options,
+                    publication.status,
+                    publication.information,
+                    name16,
+                );
+                return publication.status;
+            }
+            let (status, information, handle) = self.create_local_file_relative(
+                parse_root,
+                name16,
+                desired_access,
+                0,
+                share_access,
+                nt_fs::FILE_OPEN,
+                open_options,
+            );
+            let registry_slot = (status == nt_fs::STATUS_SUCCESS && handle != 0)
+                .then(|| reg.resolve_name(&nb[..nlen]))
+                .flatten();
+            if handle != 0 {
+                self.queue_write(file_handle_out, handle);
+                if let Some(index) = registry_slot {
+                    reg.set_file_handle(self.pi, index, handle);
+                }
+            } else {
+                self.write_nt_open_file_handle_out(file_handle_out, 0);
+            }
+            if args[3] != 0 {
+                self.xas_write_buf(args[3], &status.to_le_bytes());
+                self.xas_write_buf(args[3] + 8, &information.to_le_bytes());
+            }
+            loader_trace_record(
+                self.pi,
+                LoaderOp::OpenFile,
+                status,
+                registry_slot,
+                0,
+                handle,
+                &nb[..nlen],
+            );
+            return status;
+        }
         {
             if boot_status_path_matches(name16) {
                 let mut status = nt_fs::STATUS_SUCCESS;
@@ -21226,6 +21622,7 @@ impl ExecNtHandler {
                 let dispatch = self.npfs_create_file(
                     major::IRP_MJ_CREATE,
                     leaf,
+                    None,
                     provider_context,
                     desired_access,
                     share_access,
@@ -21286,9 +21683,14 @@ impl ExecNtHandler {
                 return publication.status;
             }
         }
-        if let Some(relative) = crate::writable_fs::writable_path(name16) {
+        let mut path_folded = [0u8; FILE_OBJECT_NAME_CAP];
+        let mut path_relative = [0u8; FILE_VOLUME_RELATIVE_CAP];
+        if let Some(relative_len) =
+            crate::writable_fs::writable_path_into(name16, &mut path_folded, &mut path_relative)
+        {
+            let relative = &path_relative[..relative_len];
             let (mut status, file_id, information) = crate::writable_fs::create(
-                &relative,
+                relative,
                 desired_access,
                 0,
                 share_access,
@@ -21333,11 +21735,14 @@ impl ExecNtHandler {
                 return status;
             }
         }
-        if let Some(relative) = crate::writable_fs::volume_path(name16) {
-            if crate::writable_fs::query_attributes_relative_if_mounted(&relative).is_some() {
+        let volume_relative_len =
+            crate::writable_fs::volume_path_into(name16, &mut path_folded, &mut path_relative);
+        if let Some(relative_len) = volume_relative_len {
+            let relative = &path_relative[..relative_len];
+            if crate::writable_fs::query_attributes_relative_if_mounted(relative).is_some() {
                 let (mut status, file_id, information) =
                     crate::writable_fs::open_existing_relative_if_mounted(
-                        &relative,
+                        relative,
                         desired_access,
                         0,
                         share_access,
@@ -21386,16 +21791,16 @@ impl ExecNtHandler {
         let want_dir = open_options & FILE_DIRECTORY_FILE as u32 != 0;
         // Directory opens resolve authoritatively against the mounted FAT volume. The empty
         // volume-relative path denotes the FAT root directory.
-        let volume_entry =
-            nt_fs::nt_path_to_volume_relative(name16, b"reactos").and_then(|path| {
-                exec_fs().and_then(|fs| {
-                    if path.is_empty() {
+        let volume_path = volume_relative_len.map(|length| &path_relative[..length]);
+        let volume_entry = volume_path.and_then(|path| {
+            exec_fs().and_then(|fs| {
+                if path.is_empty() {
                         Some((fs.root_cl, 0, 0x10))
-                    } else {
-                        fat_open_path_entry(&fs, &path)
-                    }
-                })
-            });
+                } else {
+                    fat_open_path_entry(&fs, path)
+                }
+            })
+        });
         let volume_directory = if want_dir {
             volume_entry
                 .filter(|(_, _, attributes)| attributes & 0x10 != 0)
@@ -21535,7 +21940,11 @@ impl ExecNtHandler {
         let status: u32 =
             if volume_directory.is_some() || hosted_exe_leaf.is_some() || dll_i.is_some() {
                 let h = if let Some(first_cluster) = volume_directory {
-                    self.mint_directory_handle(first_cluster, desired_access)
+                    self.mint_directory_handle(
+                        first_cluster,
+                        volume_path.unwrap_or(&[]),
+                        desired_access,
+                    )
                 } else {
                     Some(self.mint_handle())
                 };
@@ -23701,12 +24110,34 @@ impl ExecNtHandler {
                     Err(status) => return status,
                 };
                 let name16 = captured.name();
-                let _captured_root_and_attributes = (captured.root, captured.attributes);
-                let mut leaf_buf = [0u16; FILE_OBJECT_NAME_CAP + 1];
-                let Some(leaf_len) = Self::pipe_leaf16_into(name16, &mut leaf_buf) else {
-                    return STATUS_OBJECT_NAME_INVALID;
+                let parse_root = match self.resolve_file_parse_root(&captured) {
+                    Ok(root) => root,
+                    Err(status) => return status,
                 };
-                let leaf = &leaf_buf[..leaf_len];
+                let _captured_attributes = captured.attributes;
+                let mut leaf_buf = [0u16; FILE_OBJECT_NAME_CAP + 1];
+                let (leaf, related_file_id) = match parse_root {
+                    FileParseRoot::Absolute => {
+                        let Some(leaf_len) = Self::pipe_leaf16_into(name16, &mut leaf_buf) else {
+                            return STATUS_OBJECT_NAME_INVALID;
+                        };
+                        (&leaf_buf[..leaf_len], None)
+                    }
+                    FileParseRoot::HostedFile { file_id, device_id } => {
+                        if name16.first() == Some(&(b'\\' as u16)) {
+                            return STATUS_OBJECT_NAME_INVALID;
+                        }
+                        if driver_launch::device_id_by_name("\\Device\\NamedPipe")
+                            != Some(device_id)
+                        {
+                            return STATUS_INVALID_DEVICE_REQUEST;
+                        }
+                        (name16, Some(file_id))
+                    }
+                    FileParseRoot::FatDirectory { .. }
+                    | FileParseRoot::OverlayFile(_)
+                    | FileParseRoot::NonDirectoryFile => return STATUS_INVALID_HANDLE,
+                };
                 let share_access = nt_ulong_arg(args[4]);
                 let create_disposition = nt_ulong_arg(args[5]);
                 let options = nt_ulong_arg(args[6]);
@@ -23733,6 +24164,7 @@ impl ExecNtHandler {
                 let dispatch = self.npfs_create_file(
                     major::IRP_MJ_CREATE_NAMED_PIPE,
                     leaf,
+                    related_file_id,
                     name_hash,
                     desired_access,
                     share_access,
@@ -29187,7 +29619,11 @@ impl ExecNtHandler {
                     Err(status) => return status,
                 };
                 let name16 = captured.name();
-                let _captured_root_and_attributes = (captured.root, captured.attributes);
+                let parse_root = match self.resolve_file_parse_root(&captured) {
+                    Ok(root) => root,
+                    Err(status) => return status,
+                };
+                let _captured_attributes = captured.attributes;
                 let iosb = args[3];
                 if file_handle_out == 0
                     || iosb == 0
@@ -29251,13 +29687,96 @@ impl ExecNtHandler {
                     }
                     print_str(b"\"\n");
                 }
+                if !matches!(parse_root, FileParseRoot::Absolute) {
+                    if let FileParseRoot::HostedFile { file_id, device_id } = parse_root {
+                        if name16.first() == Some(&(b'\\' as u16)) {
+                            return STATUS_OBJECT_NAME_INVALID;
+                        }
+                        if driver_launch::device_id_by_name("\\Device\\NamedPipe")
+                            != Some(device_id)
+                        {
+                            return STATUS_INVALID_DEVICE_REQUEST;
+                        }
+                        if create_disposition != nt_fs::FILE_OPEN {
+                            return STATUS_INVALID_PARAMETER;
+                        }
+                        if create_options & nt_fs::FILE_DIRECTORY_FILE != 0 {
+                            return nt_fs::STATUS_OBJECT_NAME_COLLISION;
+                        }
+                        let provider_context = nt_io_manager::pipe_name_hash(name16);
+                        let dispatch = self.npfs_create_file(
+                            major::IRP_MJ_CREATE,
+                            name16,
+                            Some(file_id),
+                            provider_context,
+                            desired_access,
+                            share_access,
+                            create_disposition,
+                            file_attributes,
+                            create_options,
+                            &ea,
+                            file_handle_out,
+                            iosb,
+                        );
+                        let publication = match dispatch {
+                            Ok(dispatch) => self.finish_npfs_create_dispatch(
+                                dispatch,
+                                major::IRP_MJ_CREATE,
+                                desired_access,
+                                provider_context,
+                            ),
+                            Err(status) => Some(HostedCreatePublication {
+                                status,
+                                information: 0,
+                                handle: 0,
+                                wake_server_fid: 0,
+                            }),
+                        };
+                        let Some(publication) = publication else {
+                            return STATUS_PENDING;
+                        };
+                        if publication.handle != 0 {
+                            self.queue_write(file_handle_out, publication.handle);
+                            self.pipe_endpoint_progress |= publication.wake_server_fid != 0;
+                        } else {
+                            self.queue_write(file_handle_out, 0);
+                        }
+                        self.xas_write_buf(iosb, &publication.status.to_le_bytes());
+                        self.xas_write_buf(iosb + 8, &publication.information.to_le_bytes());
+                        return publication.status;
+                    }
+                    let (status, information, handle) = self.create_local_file_relative(
+                        parse_root,
+                        name16,
+                        desired_access,
+                        file_attributes,
+                        share_access,
+                        create_disposition,
+                        create_options,
+                    );
+                    self.queue_write(file_handle_out, handle);
+                    self.xas_write_buf(iosb, &status.to_le_bytes());
+                    self.xas_write_buf(iosb + 8, &information.to_le_bytes());
+                    return status;
+                }
                 let mut status;
                 let mut info = 0u64;
                 let mut pending_pipe_create = false;
-                let volume_relative = crate::writable_fs::volume_path(name16);
-                let volume_overlay_hit = volume_relative.as_ref().is_some_and(|relative| {
-                    crate::writable_fs::query_attributes_relative_if_mounted(relative).is_some()
+                let mut volume_folded = [0u8; FILE_OBJECT_NAME_CAP];
+                let mut volume_relative = [0u8; FILE_VOLUME_RELATIVE_CAP];
+                let volume_relative_len = crate::writable_fs::volume_path_into(
+                    name16,
+                    &mut volume_folded,
+                    &mut volume_relative,
+                );
+                let volume_overlay_hit = volume_relative_len.is_some_and(|length| {
+                    crate::writable_fs::query_attributes_relative_if_mounted(
+                        &volume_relative[..length],
+                    )
+                    .is_some()
                 });
+                let mut writable_folded = [0u8; FILE_OBJECT_NAME_CAP];
+                let mut writable_relative = [0u8; FILE_VOLUME_RELATIVE_CAP];
                 if boot_status_path_matches(name16) {
                     if create_options & nt_fs::FILE_DIRECTORY_FILE != 0 {
                         status = nt_fs::STATUS_OBJECT_NAME_COLLISION;
@@ -29309,6 +29828,7 @@ impl ExecNtHandler {
                         let dispatch = self.npfs_create_file(
                             major::IRP_MJ_CREATE,
                             &root_name,
+                            None,
                             0,
                             desired_access,
                             share_access,
@@ -29359,6 +29879,7 @@ impl ExecNtHandler {
                         let dispatch = self.npfs_create_file(
                             major::IRP_MJ_CREATE,
                             leaf,
+                            None,
                             pipe_hash,
                             desired_access,
                             share_access,
@@ -29395,7 +29916,12 @@ impl ExecNtHandler {
                             pending_pipe_create = true;
                         }
                     }
-                } else if let Some(relative) = crate::writable_fs::writable_path(name16) {
+                } else if let Some(relative_len) = crate::writable_fs::writable_path_into(
+                    name16,
+                    &mut writable_folded,
+                    &mut writable_relative,
+                ) {
+                    let relative = &writable_relative[..relative_len];
                     // ★ THE WRITABLE FILESYSTEM OVERLAY. The path resolved into a declared writable
                     // mount prefix (see `writable_fs::WRITABLE_PREFIXES`) — this is the boundary the
                     // previous batch's unserved namespace miss left open, and it is where
@@ -29404,7 +29930,7 @@ impl ExecNtHandler {
                     // through to a REAL file system: a create that cannot be satisfied still fails
                     // with the correct NTSTATUS, and no handle is fabricated.
                     let (st, file_id, information) = crate::writable_fs::create(
-                        &relative,
+                        relative,
                         desired_access,
                         file_attributes,
                         share_access,
@@ -29478,16 +30004,16 @@ impl ExecNtHandler {
                         if create_options & nt_fs::FILE_DIRECTORY_FILE != 0 {
                             if status == nt_fs::STATUS_SUCCESS && info == nt_fs::FILE_CREATED as u64
                             {
-                                crate::writable_fs::note_directory_create(self.pi, &relative, true);
+                                crate::writable_fs::note_directory_create(self.pi, relative, true);
                             } else if status == nt_fs::STATUS_OBJECT_NAME_COLLISION {
                                 crate::writable_fs::note_directory_create(
-                                    self.pi, &relative, false,
+                                    self.pi, relative, false,
                                 );
                             }
                         } else if status == nt_fs::STATUS_SUCCESS
                             && info == nt_fs::FILE_CREATED as u64
                         {
-                            crate::writable_fs::note_profile_file_create(self.pi, &relative);
+                            crate::writable_fs::note_profile_file_create(self.pi, relative);
                         }
                         if let Some(file_id) = file_id {
                             match self.mint_overlay_file_handle(file_id, desired_access) {
@@ -29499,9 +30025,9 @@ impl ExecNtHandler {
                             }
                         }
                     }
-                } else if let Some(relative) = volume_relative
-                    .as_deref()
+                } else if let Some(relative) = volume_relative_len
                     .filter(|_| create_disposition != nt_fs::FILE_OPEN || volume_overlay_hit)
+                    .map(|length| &volume_relative[..length])
                 {
                     let disposition = create_disposition;
                     let options = create_options;

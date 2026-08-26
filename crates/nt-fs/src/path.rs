@@ -255,6 +255,46 @@ pub fn nt_path_to_volume_relative_into(
     Some(out_len)
 }
 
+/// Canonicalize a caller's file name for parsing beneath an existing directory FILE_OBJECT.
+/// The result is lowercase ASCII, uses `\\` separators, drops `.` and repeated separators, and
+/// rejects absolute names, parent traversal, drive prefixes, and output overflow.
+pub fn nt_file_relative_path_into(
+    path: &[u16],
+    folded: &mut [u8],
+    out: &mut [u8],
+) -> Option<usize> {
+    if path.is_empty()
+        || matches!(path.first(), Some(unit) if *unit == b'\\' as u16 || *unit == b'/' as u16)
+        || folded.len() < path.len()
+    {
+        return None;
+    }
+    let mut folded_len = 0usize;
+    let mut previous_separator = false;
+    for &unit in path {
+        if unit > 0x7f {
+            return None;
+        }
+        let mut byte = (unit as u8).to_ascii_lowercase();
+        if byte == b'/' {
+            byte = b'\\';
+        }
+        if byte == b'\\' {
+            if previous_separator {
+                continue;
+            }
+            previous_separator = true;
+        } else {
+            previous_separator = false;
+        }
+        folded[folded_len] = byte;
+        folded_len += 1;
+    }
+    let mut out_len = 0usize;
+    push_relative_suffix(out, &mut out_len, &folded[..folded_len])?;
+    (out_len != 0).then_some(out_len)
+}
+
 fn push_drive_relative_into(
     system_root: &[u8],
     relative: &[u8],

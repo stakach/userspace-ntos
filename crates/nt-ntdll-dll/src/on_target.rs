@@ -2391,13 +2391,36 @@ unsafe fn resolve_export_addr(
 /// On-target hosted process; issues real syscalls the executive services.
 #[cfg(target_arch = "x86_64")]
 unsafe fn load_dependent_dll(open_name_lc: &[u8]) -> u64 {
-    // Build a NUL-terminated UTF-16 object name for OBJECT_ATTRIBUTES.ObjectName. Static import
-    // dependencies arrive as bare stems and use the default System32 search. Runtime LdrLoadDll
-    // callers may provide a full DOS/NT path, which must be preserved so service DLLs in
-    // subdirectories (for example system32\wbem) open the exact file.
+    // Build an absolute NT object name for OBJECT_ATTRIBUTES.ObjectName. NtOpenFile cannot resolve
+    // a relative name when RootDirectory is null: static imports use System32, DOS drive paths use
+    // the \?? namespace, and already-absolute NT names pass through unchanged.
     let mut wname = [0u16; 180];
     let mut wn = 0usize;
-    for &b in open_name_lc.iter().take(wname.len() - 5) {
+    let prefix: &[u8] = if open_name_lc.first() == Some(&b'\\') {
+        b""
+    } else if open_name_lc.get(1) == Some(&b':') {
+        b"\\??\\"
+    } else {
+        b"\\SystemRoot\\System32\\"
+    };
+    let extension_len = if dll_leaf_has_extension(open_name_lc) {
+        0
+    } else {
+        4
+    };
+    if prefix
+        .len()
+        .checked_add(open_name_lc.len())
+        .and_then(|length| length.checked_add(extension_len))
+        .is_none_or(|length| length > wname.len())
+    {
+        return 0;
+    }
+    for &b in prefix {
+        wname[wn] = b as u16;
+        wn += 1;
+    }
+    for &b in open_name_lc {
         wname[wn] = b as u16;
         wn += 1;
     }

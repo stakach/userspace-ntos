@@ -9,7 +9,7 @@
 use alloc::vec::Vec;
 
 use nt_status::NtStatus;
-use nt_types::{AccessMask, ClientId, NtPath, ObjectId};
+use nt_types::{AccessMask, ClientId, ObjectId, UnicodeString};
 
 use crate::dispatch::{DispatchContext, DispatchOutcome, IrpProjection, PnpBackendDispatch};
 use crate::file::{CreateOptions, FileRecord, FileState, ShareAccess};
@@ -306,7 +306,7 @@ impl<P> IoManager<P> {
         desired_access: AccessMask,
         share_access: ShareAccess,
         create_options: CreateOptions,
-        file_name: Option<NtPath>,
+        file_name: UnicodeString,
     ) -> Result<FileId, NtStatus> {
         if self.device(device_id).is_none() {
             return Err(NtStatus::INVALID_PARAMETER);
@@ -320,6 +320,38 @@ impl<P> IoManager<P> {
             create_options,
             file_name,
         )))
+    }
+
+    /// Allocate a canonical File whose CREATE is parsed relative to an existing open File. The
+    /// parent is the sole device-route authority, so a cross-device relationship cannot be
+    /// constructed by the caller.
+    pub fn allocate_external_relative_file(
+        &mut self,
+        client: ClientId,
+        related_file: FileId,
+        desired_access: AccessMask,
+        share_access: ShareAccess,
+        create_options: CreateOptions,
+        file_name: UnicodeString,
+    ) -> Result<FileId, NtStatus> {
+        let device_id = {
+            let parent = self.file(related_file).ok_or(NtStatus::INVALID_HANDLE)?;
+            if parent.client_id != client || !parent.state.is_open() {
+                return Err(NtStatus::INVALID_HANDLE);
+            }
+            parent.device_id
+        };
+        let mut file = FileRecord::new(
+            ObjectId::NULL,
+            client,
+            device_id,
+            desired_access,
+            share_access,
+            create_options,
+            file_name,
+        );
+        file.related_file = Some(related_file);
+        Ok(self.add_file(file))
     }
 
     /// Return the mutable driver-owned context attached to a live canonical
@@ -416,7 +448,7 @@ impl<P> IoManager<P> {
         user_data: u64,
         requestor_tid: u64,
         major: u8,
-        params: IoParameters,
+        mut params: IoParameters,
         input_len: u32,
         output_len: u32,
         system_buffer: &mut [u8],
@@ -452,6 +484,10 @@ impl<P> IoManager<P> {
                 return Err(NtStatus::INVALID_HANDLE);
             }
             if crate::is_create_major(major) {
+                let IoParameters::Create(create) = &mut params else {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                };
+                create.related_file = file.related_file;
                 0
             } else {
                 file.driver_context.unwrap_or(0)

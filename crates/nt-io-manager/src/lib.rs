@@ -845,14 +845,47 @@ impl<P> IoManager<P> {
             {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
+            let related_file = match record.current_stack().map(|stack| &stack.parameters) {
+                Some(IoParameters::Create(parameters)) if is_create_major(record.origin_major) => {
+                    parameters.related_file
+                }
+                _ => None,
+            };
+            if let Some(related_file) = related_file {
+                let parent = self
+                    .files
+                    .get(related_file)
+                    .ok_or(NtStatus::INVALID_HANDLE)?;
+                if related_file == file_id
+                    || parent.client_id != record.client_id
+                    || parent.device_id != file.device_id
+                    || !parent.state.is_open()
+                    || file.related_file != Some(related_file)
+                {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                }
+                parent
+                    .outstanding_irp_refs
+                    .checked_add(1)
+                    .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+            }
             if !is_create_major(record.origin_major) {
                 record.user_data = file.driver_context.unwrap_or(0);
             }
-            let file = self.files.get_mut(file_id).expect("validated file");
-            file.outstanding_irp_refs = file
-                .outstanding_irp_refs
+            file.outstanding_irp_refs
                 .checked_add(1)
                 .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+            let file = self.files.get_mut(file_id).expect("validated file");
+            file.outstanding_irp_refs += 1;
+            if related_file.is_some() {
+                file.related_file = None;
+            }
+            if let Some(related_file) = related_file {
+                self.files
+                    .get_mut(related_file)
+                    .expect("validated related File")
+                    .outstanding_irp_refs += 1;
+            }
         }
         let capacity = self.irps.capacity();
         let id = self.irps.insert_tagged(record, self.durable_record_epoch);
@@ -882,7 +915,37 @@ impl<P> IoManager<P> {
                     .expect("canonical FILE_OBJECT IRP reference underflow");
             }
         }
+        let related_file = match record.current_stack().map(|stack| &stack.parameters) {
+            Some(IoParameters::Create(parameters)) => parameters.related_file,
+            _ => None,
+        };
+        if let Some(related_file) = related_file {
+            let close_deferred = {
+                let parent = self
+                    .files
+                    .get_mut(related_file)
+                    .expect("canonical related FILE_OBJECT disappeared before CREATE IRP");
+                parent.outstanding_irp_refs = parent
+                    .outstanding_irp_refs
+                    .checked_sub(1)
+                    .expect("canonical related FILE_OBJECT IRP reference underflow");
+                parent.close_deferred
+            };
+            if close_deferred {
+                self.queue_deferred_file_close(related_file);
+            }
+        }
         Some(record)
+    }
+
+    pub(crate) fn queue_deferred_file_close(&mut self, file_id: FileId) {
+        if !self.deferred_file_close_retries.contains(&file_id) {
+            let capacity = self.deferred_file_close_retries.capacity();
+            self.deferred_file_close_retries.push(file_id);
+            if self.deferred_file_close_retries.capacity() != capacity {
+                self.mark_durable_storage_dirty();
+            }
+        }
     }
     pub fn irp_count(&self) -> usize {
         self.irps.len()
@@ -1279,7 +1342,7 @@ mod tests {
             AccessMask::GENERIC_READ,
             ShareAccess::READ,
             CreateOptions::empty(),
-            Some(path("\\Device\\Test0")),
+            path("\\Device\\Test0").to_unicode_string(),
         ));
 
         let f = om.file_mut(fid).unwrap();
@@ -1311,7 +1374,7 @@ mod tests {
             AccessMask::GENERIC_READ,
             ShareAccess::READ,
             CreateOptions::empty(),
-            Some(path("\\Device\\Test0\\first")),
+            path("\\Device\\Test0\\first").to_unicode_string(),
         ));
         assert!(om.take_durable_storage_dirty());
         assert!(!om.take_durable_storage_dirty());
@@ -1324,7 +1387,7 @@ mod tests {
             AccessMask::GENERIC_READ,
             ShareAccess::READ,
             CreateOptions::empty(),
-            Some(path("\\Device\\Test0\\replacement")),
+            path("\\Device\\Test0\\replacement").to_unicode_string(),
         ));
         assert_ne!(replacement, first);
         // Reusing a GenStore slot still transfers ownership of the new record's
@@ -1339,7 +1402,7 @@ mod tests {
             AccessMask::GENERIC_READ,
             ShareAccess::READ,
             CreateOptions::empty(),
-            Some(path("\\Device\\Test0\\transient")),
+            path("\\Device\\Test0\\transient").to_unicode_string(),
         ));
         assert!(om.remove_file(transient).is_some());
         // The existing GenStore slot and all record-owned storage were released in this epoch.
@@ -3252,7 +3315,7 @@ mod tests {
                 AccessMask::GENERIC_READ,
                 ShareAccess::READ,
                 CreateOptions::empty(),
-                Some(path("\\Device\\ExternalFile0\\name")),
+                nt_types::UnicodeString::from_str("\\Device\\ExternalFile0\\name"),
             )
             .unwrap();
         assert_eq!(om.file(file_id).unwrap().state, FileState::Allocated);
@@ -3321,6 +3384,189 @@ mod tests {
     }
 
     #[test]
+    fn external_relative_create_uses_parent_route_and_exact_file_name() {
+        let mut om = io();
+        let client = om.register_client();
+        let other_client = om.register_client();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(std::vec::Vec::new()));
+        let driver = om
+            .create_driver(
+                &path("\\Driver\\RelativeFile"),
+                Box::new(RecordingBackend {
+                    seen: seen.clone(),
+                    status: NtStatus::SUCCESS,
+                    information: 0,
+                    file_context: None,
+                    output: std::vec::Vec::new(),
+                }),
+            )
+            .unwrap();
+        let device = om
+            .create_device(
+                driver,
+                Some(&path("\\Device\\RelativeFile0")),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let parent = om
+            .allocate_external_file(
+                client,
+                device,
+                AccessMask::GENERIC_READ,
+                ShareAccess::READ,
+                CreateOptions::DIRECTORY_FILE,
+                nt_types::UnicodeString::from_str("\\Device\\RelativeFile0\\parent"),
+            )
+            .unwrap();
+        let parent_record = om.file_mut(parent).unwrap();
+        assert!(parent_record.transition(FileState::CreateIrpDispatched));
+        assert!(parent_record.transition(FileState::Open));
+
+        assert_eq!(
+            om.allocate_external_relative_file(
+                other_client,
+                parent,
+                AccessMask::GENERIC_READ,
+                ShareAccess::READ,
+                CreateOptions::empty(),
+                nt_types::UnicodeString::from_str("child"),
+            ),
+            Err(NtStatus::INVALID_HANDLE)
+        );
+        let child = om
+            .allocate_external_relative_file(
+                client,
+                parent,
+                AccessMask::GENERIC_READ,
+                ShareAccess::READ,
+                CreateOptions::empty(),
+                nt_types::UnicodeString::from_str("child"),
+            )
+            .unwrap();
+        let child_record = om.file(child).unwrap();
+        assert_eq!(child_record.device_id, device);
+        assert_eq!(child_record.related_file, Some(parent));
+        assert_eq!(
+            child_record.file_name,
+            nt_types::UnicodeString::from_str("child")
+        );
+
+        let result = om
+            .build_and_dispatch_external_to_device(
+                client,
+                device,
+                Some(child),
+                0,
+                91,
+                major::IRP_MJ_CREATE,
+                IoParameters::Create(CreateParameters::default()),
+                0,
+                0,
+                &mut [],
+            )
+            .unwrap();
+        assert!(matches!(
+            result,
+            ExternalDispatchResult::Completed {
+                status: NtStatus::SUCCESS,
+                ..
+            }
+        ));
+        assert_eq!(om.file(child).unwrap().related_file, None);
+        assert_eq!(om.file(parent).unwrap().outstanding_irp_refs, 0);
+        let seen = seen.borrow();
+        let IoParameters::Create(parameters) = &seen[0].parameters else {
+            panic!("expected CREATE parameters")
+        };
+        assert_eq!(parameters.related_file, Some(parent));
+    }
+
+    #[test]
+    fn pending_relative_create_retains_parent_only_until_irp_ack() {
+        let mut om = io();
+        let client = om.register_client();
+        let driver = om
+            .create_driver(
+                &path("\\Driver\\PendingRelativeCreate"),
+                Box::new(PendingCreateBackend::default()),
+            )
+            .unwrap();
+        let device = om
+            .create_device(
+                driver,
+                Some(&path("\\Device\\PendingRelativeCreate0")),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let parent = om
+            .allocate_external_file(
+                client,
+                device,
+                AccessMask::GENERIC_READ,
+                ShareAccess::READ,
+                CreateOptions::DIRECTORY_FILE,
+                nt_types::UnicodeString::new(),
+            )
+            .unwrap();
+        let parent_record = om.file_mut(parent).unwrap();
+        assert!(parent_record.transition(FileState::CreateIrpDispatched));
+        assert!(parent_record.transition(FileState::Open));
+        let child = om
+            .allocate_external_relative_file(
+                client,
+                parent,
+                AccessMask::GENERIC_READ,
+                ShareAccess::READ,
+                CreateOptions::empty(),
+                nt_types::UnicodeString::from_str("child"),
+            )
+            .unwrap();
+        let pending = om
+            .build_and_dispatch_external_to_device(
+                client,
+                device,
+                Some(child),
+                0,
+                92,
+                major::IRP_MJ_CREATE,
+                IoParameters::Create(CreateParameters::default()),
+                0,
+                0,
+                &mut [],
+            )
+            .unwrap();
+        let ExternalDispatchResult::Pending { irp_id } = pending else {
+            panic!("expected pending relative CREATE")
+        };
+        assert_eq!(om.file(parent).unwrap().outstanding_irp_refs, 1);
+
+        om.release_external_file(client, parent).unwrap();
+        assert_eq!(om.file(parent).unwrap().state, FileState::ClosePending);
+        assert!(om.publish_driver_completion(
+            driver,
+            DriverCompletion {
+                irp_id,
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: Some(0x1234),
+            }
+        ));
+        assert_eq!(om.file(parent).unwrap().outstanding_irp_refs, 1);
+        om.acknowledge_completed_irp(irp_id).unwrap();
+        assert_eq!(om.file(parent).unwrap().outstanding_irp_refs, 0);
+        assert!(om.file(parent).unwrap().close_deferred);
+        assert_eq!(om.pump(), 1);
+        assert!(om.file(parent).is_none());
+        assert_eq!(om.external_file_context(client, child), Ok(Some(0x1234)));
+    }
+
+    #[test]
     fn external_named_pipe_create_uses_the_canonical_file_lifecycle() {
         let mut om = io();
         let client = ClientId(67);
@@ -3354,7 +3600,7 @@ mod tests {
                 AccessMask::GENERIC_READ | AccessMask::GENERIC_WRITE,
                 ShareAccess::READ | ShareAccess::WRITE,
                 CreateOptions::empty(),
-                Some(path("\\pipe\\svc")),
+                nt_types::UnicodeString::from_str("\\pipe\\svc"),
             )
             .unwrap();
         let mut empty = [];
@@ -3649,7 +3895,7 @@ mod tests {
                 AccessMask::GENERIC_READ,
                 ShareAccess::READ,
                 CreateOptions::empty(),
-                None,
+                nt_types::UnicodeString::new(),
             )
             .unwrap();
         let pending = om
@@ -3764,7 +4010,7 @@ mod tests {
                 AccessMask::GENERIC_READ,
                 ShareAccess::READ,
                 CreateOptions::empty(),
-                Some(path("\\pipe\\pending")),
+                nt_types::UnicodeString::from_str("\\pipe\\pending"),
             )
             .unwrap();
         let mut empty = [];
@@ -5027,7 +5273,7 @@ mod tests {
             AccessMask::GENERIC_READ,
             ShareAccess::READ,
             CreateOptions::empty(),
-            None,
+            nt_types::UnicodeString::new(),
         ));
         let fp = om.project_file(fid).unwrap();
         assert_eq!(fp.file_id, fid.0);
@@ -5106,6 +5352,7 @@ mod tests {
             WdmFileObjectInit {
                 device_object: 0x4444,
                 fs_context: 0x5555,
+                related_file_object: 0x5a5a,
                 file_name_len: 12,
                 file_name_max_len: 14,
                 file_name_buffer: 0x6666,
@@ -5116,6 +5363,7 @@ mod tests {
         assert_eq!(le_u16(&file, 0x02), WDM_X64_FILE_OBJECT_SIZE as u16);
         assert_eq!(le_u64(&file, 0x08), 0x4444);
         assert_eq!(le_u64(&file, 0x18), 0x5555);
+        assert_eq!(le_u64(&file, 0x40), 0x5a5a);
         assert_eq!(le_u16(&file, 0x58), 12);
         assert_eq!(le_u16(&file, 0x5a), 14);
         assert_eq!(le_u64(&file, 0x60), 0x6666);

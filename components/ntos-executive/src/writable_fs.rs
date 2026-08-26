@@ -1165,25 +1165,6 @@ pub(crate) fn take_runtime_dirty() -> bool {
     WRITABLE_FS_RUNTIME_DIRTY.swap(false, Ordering::AcqRel)
 }
 
-/// Classify an NT object name: `Some(volume-relative path)` when it belongs to the writable volume,
-/// `None` when the read-only namespace still owns it.
-pub(crate) fn writable_path(name: &[u16]) -> Option<alloc::vec::Vec<u8>> {
-    if !WRITABLE_OVERLAY_MOUNTED {
-        return None;
-    }
-    nt_fs::writable_mount_relative(name, b"reactos", WRITABLE_PREFIXES)
-}
-
-/// Classify an NT object name into the local fixed C: volume. Unlike [`writable_path`], this does
-/// not claim prefix ownership; callers use it for the writable layer of the same installed volume,
-/// while read-only FAT stays the source for installed files that have no writable-layer entry.
-pub(crate) fn volume_path(name: &[u16]) -> Option<alloc::vec::Vec<u8>> {
-    if !WRITABLE_OVERLAY_MOUNTED {
-        return None;
-    }
-    nt_fs::nt_path_to_volume_relative(name, b"reactos")
-}
-
 pub(crate) fn writable_path_into(
     name: &[u16],
     folded: &mut [u8],
@@ -1193,6 +1174,20 @@ pub(crate) fn writable_path_into(
         return None;
     }
     nt_fs::writable_mount_relative_into(name, b"reactos", WRITABLE_PREFIXES, folded, relative)
+}
+
+/// Classify an NT object name into the local fixed C: volume without allocating. Unlike
+/// [`writable_path_into`], this does not claim prefix ownership; callers use it for the writable
+/// layer while an absent entry remains visible through the installed read-only FAT source.
+pub(crate) fn volume_path_into(
+    name: &[u16],
+    folded: &mut [u8],
+    relative: &mut [u8],
+) -> Option<usize> {
+    if !WRITABLE_OVERLAY_MOUNTED {
+        return None;
+    }
+    nt_fs::nt_path_to_volume_relative_into(name, b"reactos", folded, relative)
 }
 
 /// `NtCreateFile` / `NtOpenFile` against the writable volume. Returns
@@ -1240,6 +1235,54 @@ pub(crate) unsafe fn create(
     } else {
         (result.status, None, 0)
     }
+}
+
+/// `NtCreateFile` / `NtOpenFile` beneath an existing writable-volume directory FILE_OBJECT.
+/// Resolution starts from the filesystem's parent node identity; no absolute path is synthesized.
+pub(crate) unsafe fn create_relative_to_directory(
+    root_file_id: u64,
+    relative: &[u8],
+    desired_access: u32,
+    file_attributes: u32,
+    share_access: u32,
+    disposition: u32,
+    options: u32,
+) -> (u32, Option<u64>, u64) {
+    let Some(fs) = writable_fs() else {
+        return (nt_fs::STATUS_DEVICE_NOT_READY, None, 0);
+    };
+    let result = fs.zw_create_file_relative_to_directory(
+        root_file_id,
+        relative,
+        desired_access,
+        file_attributes,
+        share_access,
+        disposition,
+        options,
+    );
+    if result.status != nt_fs::STATUS_SUCCESS {
+        return (result.status, None, 0);
+    }
+    mark_runtime_dirty();
+    if create_information_changes_volume(result.information) {
+        mark_snapshot_dirty();
+    }
+    match result.information {
+        nt_fs::FILE_CREATED => {
+            OVERLAY_CREATES.fetch_add(1, Ordering::Relaxed);
+            if options & nt_fs::FILE_DIRECTORY_FILE != 0 {
+                OVERLAY_DIRS_CREATED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        _ => {
+            OVERLAY_OPENS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    (
+        result.status,
+        Some(result.handle),
+        result.information as u64,
+    )
 }
 
 pub(crate) unsafe fn query_attributes_relative(

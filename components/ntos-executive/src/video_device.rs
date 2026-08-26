@@ -410,6 +410,7 @@ unsafe fn rewrite_video_file_projection(file_id: u64) -> bool {
         WdmFileObjectInit {
             device_object: objects.device,
             fs_context: file_id,
+            related_file_object: 0,
             file_name_len: 0,
             file_name_max_len: 0,
             file_name_buffer: 0,

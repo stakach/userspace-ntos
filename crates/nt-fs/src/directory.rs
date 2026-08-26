@@ -3,7 +3,7 @@
 use crate::{
     STATUS_BUFFER_OVERFLOW, STATUS_INFO_LENGTH_MISMATCH, STATUS_INSUFFICIENT_RESOURCES,
     STATUS_INVALID_HANDLE, STATUS_INVALID_INFO_CLASS, STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE,
-    STATUS_QUOTA_EXCEEDED, STATUS_SUCCESS,
+    STATUS_OBJECT_NAME_INVALID, STATUS_QUOTA_EXCEEDED, STATUS_SUCCESS,
 };
 
 pub const MAX_DIRECTORY_NAME: usize = 260;
@@ -135,6 +135,16 @@ impl DirectoryQueryState {
 pub struct DirectoryOpen {
     pub first_cluster: u32,
     pub query: DirectoryQueryState,
+    path_len: u16,
+    path: [u8; DIRECTORY_OPEN_PATH_CAP],
+}
+
+pub const DIRECTORY_OPEN_PATH_CAP: usize = 1024;
+
+impl DirectoryOpen {
+    pub fn volume_relative_path(&self) -> &[u8] {
+        &self.path[..self.path_len as usize]
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -152,6 +162,8 @@ impl DirectoryOpenSlot {
             open: DirectoryOpen {
                 first_cluster: 0,
                 query: DirectoryQueryState::new(),
+                path_len: 0,
+                path: [0; DIRECTORY_OPEN_PATH_CAP],
             },
         }
     }
@@ -169,19 +181,26 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
         }
     }
 
-    pub fn create(&mut self, first_cluster: u32) -> Result<u32, u32> {
+    pub fn create(&mut self, first_cluster: u32, volume_relative_path: &[u8]) -> Result<u32, u32> {
+        if volume_relative_path.len() > DIRECTORY_OPEN_PATH_CAP {
+            return Err(STATUS_OBJECT_NAME_INVALID);
+        }
         let (index, slot) = self
             .slots
             .iter_mut()
             .enumerate()
             .find(|(_, slot)| !slot.occupied)
             .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        let mut path = [0; DIRECTORY_OPEN_PATH_CAP];
+        path[..volume_relative_path.len()].copy_from_slice(volume_relative_path);
         *slot = DirectoryOpenSlot {
             occupied: true,
             references: 1,
             open: DirectoryOpen {
                 first_cluster,
                 query: DirectoryQueryState::new(),
+                path_len: volume_relative_path.len() as u16,
+                path,
             },
         };
         Ok(index as u32)
@@ -843,31 +862,35 @@ mod tests {
     #[test]
     fn directory_open_references_share_query_state() {
         let mut table = DirectoryOpenTable::<2>::new();
-        let shared = table.create(41).unwrap();
-        let independent = table.create(41).unwrap();
+        let shared = table.create(41, b"reactos\\system32").unwrap();
+        let independent = table.create(41, b"reactos\\system32").unwrap();
         table.retain(shared).unwrap();
         table.get_mut(shared).unwrap().query.cursor = 7;
         assert_eq!(table.get(shared).unwrap().query.cursor(), 7);
+        assert_eq!(
+            table.get(shared).unwrap().volume_relative_path(),
+            b"reactos\\system32"
+        );
         assert_eq!(table.get(independent).unwrap().query.cursor(), 0);
         table.release(shared).unwrap();
         assert_eq!(table.get(shared).unwrap().first_cluster, 41);
         table.release(shared).unwrap();
         assert_eq!(table.get(shared), Err(STATUS_INVALID_HANDLE));
-        assert_eq!(table.create(99).unwrap(), shared);
+        assert_eq!(table.create(99, b"reactos").unwrap(), shared);
     }
 
     #[test]
     fn directory_open_table_clear_reuses_fixed_storage() {
         let mut table = DirectoryOpenTable::<2>::new();
-        let first = table.create(41).unwrap();
+        let first = table.create(41, b"reactos").unwrap();
         table.retain(first).unwrap();
-        table.create(42).unwrap();
+        table.create(42, b"reactos\\system32").unwrap();
 
         table.clear();
 
         assert_eq!(table.get(first), Err(STATUS_INVALID_HANDLE));
-        assert_eq!(table.create(99).unwrap(), 0);
-        assert_eq!(table.create(100).unwrap(), 1);
+        assert_eq!(table.create(99, b"").unwrap(), 0);
+        assert_eq!(table.create(100, b"reactos").unwrap(), 1);
     }
 
     #[test]

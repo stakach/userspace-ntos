@@ -212,13 +212,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
     }
 
     pub(crate) fn schedule_deferred_file_close(&mut self, file_id: FileId) {
-        if !self.deferred_file_close_retries.contains(&file_id) {
-            let capacity = self.deferred_file_close_retries.capacity();
-            self.deferred_file_close_retries.push(file_id);
-            if self.deferred_file_close_retries.capacity() != capacity {
-                self.mark_durable_storage_dirty();
-            }
-        }
+        self.queue_deferred_file_close(file_id);
     }
 
     /// The IRPs currently pending or cancel-requested. Completed-but-unconsumed

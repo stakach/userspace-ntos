@@ -326,7 +326,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             desired_access,
             share_access,
             create_options,
-            Some(path.clone()),
+            path.to_unicode_string(),
         ));
 
         // 3. Broker the OM File object + a handle for the client (spec §8.4).
@@ -370,6 +370,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 create_disposition,
                 file_attributes: 0,
                 ea_length: 0,
+                related_file: None,
             }),
         ) {
             Ok(irp) => irp,

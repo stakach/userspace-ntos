@@ -30,9 +30,9 @@ pub use fs::{
 };
 pub use hive_provider::NtFileHiveIoProvider;
 pub use path::{
-    is_named_pipe_path, is_under_prefix, normalize_separators, nt_path_to_volume_relative,
-    nt_path_to_volume_relative_into, writable_mount_relative, writable_mount_relative_into,
-    MountManager, DOS_DRIVE_FIXED, MEMFS_VOLUME,
+    is_named_pipe_path, is_under_prefix, normalize_separators, nt_file_relative_path_into,
+    nt_path_to_volume_relative, nt_path_to_volume_relative_into, writable_mount_relative,
+    writable_mount_relative_into, MountManager, DOS_DRIVE_FIXED, MEMFS_VOLUME,
 };
 pub use query::*;
 pub use snapshot_store::{

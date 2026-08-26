@@ -396,6 +396,20 @@ fn path_to_volume_relative_into_matches_allocating_api() {
 }
 
 #[test]
+fn file_relative_path_into_is_bounded_and_canonical() {
+    let path = wide(r"Profiles//.\Administrator\NTUSER.DAT");
+    let mut folded = [0u8; 64];
+    let mut out = [0u8; 64];
+    let len = nt_file_relative_path_into(&path, &mut folded, &mut out).unwrap();
+    assert_eq!(&out[..len], b"profiles\\administrator\\ntuser.dat");
+    assert!(nt_file_relative_path_into(&wide(r"\absolute"), &mut folded, &mut out).is_none());
+    assert!(nt_file_relative_path_into(&wide(r"..\escape"), &mut folded, &mut out).is_none());
+    assert!(nt_file_relative_path_into(&wide(r"c:leaf"), &mut folded, &mut out).is_none());
+    assert!(nt_file_relative_path_into(&[], &mut folded, &mut out).is_none());
+    assert!(nt_file_relative_path_into(&wide("toolong"), &mut [0u8; 4], &mut out).is_none());
+}
+
+#[test]
 fn writable_mount_relative_into_and_relative_query_are_canonical() {
     const PREFIXES: &[&[u8]] = &[b"profiles"];
     let path = wide(r"\DosDevices\C:\PROFILES\Administrator\ntuser.dat");
@@ -464,6 +478,96 @@ fn relative_create_uses_folded_volume_paths_directly() {
     assert_eq!(
         (info.end_of_file, info.attributes),
         (4, FILE_ATTRIBUTE_HIDDEN)
+    );
+}
+
+#[test]
+fn directory_file_object_is_a_real_relative_create_root() {
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_directory(r"\??\C:\profiles\Administrator"));
+    let root = fs.zw_create_file_relative(
+        b"profiles\\administrator",
+        FILE_READ_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE,
+    );
+    assert_eq!(root.status, STATUS_SUCCESS);
+
+    let child = fs.zw_create_file_relative_to_directory(
+        root.handle,
+        b"NTUSER.DAT",
+        FILE_WRITE_DATA,
+        FILE_ATTRIBUTE_HIDDEN,
+        0,
+        FILE_OPEN_IF,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(
+        (child.status, child.information),
+        (STATUS_SUCCESS, FILE_CREATED)
+    );
+    assert_eq!(
+        fs.zw_write_file(child.handle, None, b"regf"),
+        (STATUS_SUCCESS, 4)
+    );
+    assert_eq!(fs.zw_close(root.handle), STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_read_file(child.handle, Some(0), 4),
+        (STATUS_SUCCESS, b"regf".to_vec())
+    );
+    assert_eq!(
+        fs.file_bytes(r"\??\C:\profiles\administrator\ntuser.dat"),
+        Some(&b"regf"[..])
+    );
+}
+
+#[test]
+fn directory_relative_create_rejects_invalid_roots_and_names() {
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_directory(r"\??\C:\profiles"));
+    assert!(fs.provision_file(r"\??\C:\profiles\ordinary.bin", b"x"));
+    let directory = fs.zw_create_file_relative(
+        b"profiles",
+        FILE_READ_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE,
+    );
+    let file = fs.zw_create_file_relative(
+        b"profiles\\ordinary.bin",
+        FILE_READ_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
+
+    let open = |fs: &mut FileSystem, root, name: &[u8]| {
+        fs.zw_create_file_relative_to_directory(root, name, FILE_READ_DATA, 0, 0, FILE_OPEN, 0)
+    };
+    assert_eq!(
+        open(&mut fs, file.handle, b"child").status,
+        STATUS_NOT_A_DIRECTORY
+    );
+    assert_eq!(
+        open(&mut fs, directory.handle, b"\\child").status,
+        STATUS_INVALID_PARAMETER
+    );
+    assert_eq!(
+        open(&mut fs, directory.handle, b"").status,
+        STATUS_INVALID_PARAMETER
+    );
+    assert_eq!(
+        open(&mut fs, u64::MAX - 1, b"child").status,
+        STATUS_INVALID_HANDLE
+    );
+    assert_eq!(fs.zw_close(directory.handle), STATUS_SUCCESS);
+    assert_eq!(
+        open(&mut fs, directory.handle, b"child").status,
+        STATUS_INVALID_HANDLE
     );
 }
 

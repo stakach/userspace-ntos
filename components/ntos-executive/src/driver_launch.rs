@@ -30886,6 +30886,16 @@ extern "win64" fn s_hosted_provider_callback_gate_body(
 /// CurrentLocation@0x43, UserBuffer@0x70,
 /// Tail.Overlay.CurrentStackLocation@0xb8 }. IO_STACK_LOCATION { Major@0, Minor@1, Parameters(union)
 /// @0x08, DeviceObject@0x28, FileObject@0x30 }.
+const fn valid_related_file_relation(is_create: bool, file_id: u64, related_file_id: u64) -> bool {
+    related_file_id == 0 || (is_create && related_file_id != file_id)
+}
+
+const _: () = assert!(valid_related_file_relation(false, 0, 0));
+const _: () = assert!(valid_related_file_relation(false, 7, 0));
+const _: () = assert!(valid_related_file_relation(true, 7, 6));
+const _: () = assert!(!valid_related_file_relation(false, 0, 6));
+const _: () = assert!(!valid_related_file_relation(true, 7, 7));
+
 unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     let devobj = read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64);
     let request = read_volatile(
@@ -30950,6 +30960,18 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     if is_create && canonical_file_id == 0 {
         return (0xC000_0008u32 as i32, 0); // STATUS_INVALID_HANDLE
     }
+    if !valid_related_file_relation(is_create, canonical_file_id, request.related_file_id) {
+        return (STATUS_INVALID_PARAMETER, 0);
+    }
+    let related_file_object = if request.related_file_id == 0 {
+        0
+    } else {
+        let related = fo_lookup(request.related_file_id);
+        if related == 0 {
+            return (0xC000_0008u32 as i32, 0); // STATUS_INVALID_HANDLE
+        }
+        related
+    };
     // A kernel-originated PnP/control request may legitimately have no FILE_OBJECT. Any request
     // carrying a canonical FileId, however, must use the exact component-local object bound by
     // CREATE. The component never fabricates a replacement for a missing binding.
@@ -31013,6 +31035,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             WdmFileObjectInit {
                 device_object: devobj,
                 fs_context: file_id,
+                related_file_object,
                 file_name_len: create_file_name_len as u16,
                 file_name_max_len: (create_file_name_len + 2) as u16,
                 file_name_buffer: fo + WDM_X64_FILE_OBJECT_SIZE as u64,
@@ -34552,6 +34575,12 @@ fn hosted_irp_dispatch_request(
         driver_id: irp.driver_id.raw(),
         device_id: irp.device_id.raw(),
         file_id: irp.file_id.map(FileId::raw).unwrap_or(0),
+        related_file_id: match &irp.parameters {
+            IoParameters::Create(parameters) => {
+                parameters.related_file.map(FileId::raw).unwrap_or(0)
+            }
+            _ => 0,
+        },
         buffer_id: irp.buffer.map(|buffer| buffer.buffer_id).unwrap_or(0),
         buffer_len: u32::try_from(input_len.max(output_len))
             .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?,
@@ -44735,11 +44764,7 @@ pub(crate) fn allocate_hosted_file(
     file_name: &[u16],
 ) -> Result<u64, u32> {
     require_hosted_device_ready_for_dispatch(device_id)?;
-    let file_name = if file_name.is_empty() {
-        None
-    } else {
-        Some(NtPath::parse(file_name).map_err(|_| STATUS_INVALID_PARAMETER as u32)?)
-    };
+    let file_name = nt_types::UnicodeString::from_units(file_name);
     io_manager_mut()
         .allocate_external_file(
             ClientId(IO_MANAGER_COMPONENT_ID),
@@ -44748,6 +44773,37 @@ pub(crate) fn allocate_hosted_file(
             ShareAccess::from_bits_retain(share_access),
             CreateOptions::from_bits_retain(create_options),
             file_name,
+        )
+        .map(|file_id| file_id.raw())
+        .map_err(|status| status.raw() as u32)
+}
+
+/// Allocate a canonical File whose CREATE is relative to another open File. The manager derives
+/// the device from the generation-exact parent and rejects stale or cross-client identity.
+pub(crate) fn allocate_hosted_relative_file(
+    related_file_id: u64,
+    desired_access: u32,
+    share_access: u32,
+    create_options: u32,
+    file_name: &[u16],
+) -> Result<u64, u32> {
+    let related_file = FileId(related_file_id);
+    let device_id = io_manager_mut()
+        .file(related_file)
+        .filter(|file| {
+            file.client_id == ClientId(IO_MANAGER_COMPONENT_ID) && file.state.is_open()
+        })
+        .map(|file| file.device_id.raw())
+        .ok_or(STATUS_INVALID_HANDLE as u32)?;
+    require_hosted_device_ready_for_dispatch(device_id)?;
+    io_manager_mut()
+        .allocate_external_relative_file(
+            ClientId(IO_MANAGER_COMPONENT_ID),
+            related_file,
+            AccessMask::from_bits_retain(desired_access),
+            ShareAccess::from_bits_retain(share_access),
+            CreateOptions::from_bits_retain(create_options),
+            nt_types::UnicodeString::from_units(file_name),
         )
         .map(|file_id| file_id.raw())
         .map_err(|status| status.raw() as u32)

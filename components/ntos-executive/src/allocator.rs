@@ -74,9 +74,11 @@ const MAPPED_HEAP_BYTES: usize =
 const TRANSIENT_CTR: usize = HEAP_BASE + 64; // bytes consumed downward from the mapped heap end
 const TRANSIENT_DEPTH: usize = HEAP_BASE + 72; // nested transient allocation scopes
 const TRANSIENT_HIGH_WATER: usize = HEAP_BASE + 80; // peak transient bytes consumed
+const DURABLE_FLOOR: usize = HEAP_BASE + 88; // bump watermark protected from bulk rewind
 const DATA: usize = HEAP_BASE + 128; // allocations start past allocator/local metadata
 const _: () = assert!(MAPPED_HEAP_BYTES + size_of::<usize>() <= TRANSIENT_CTR);
-const _: () = assert!(TRANSIENT_HIGH_WATER + size_of::<usize>() <= DATA);
+const _: () = assert!(TRANSIENT_HIGH_WATER + size_of::<usize>() <= DURABLE_FLOOR);
+const _: () = assert!(DURABLE_FLOOR + size_of::<usize>() <= DATA);
 const WORD: usize = size_of::<usize>();
 const ALLOC_GRANULE: usize = align_of::<usize>();
 const FREE_NODE_SIZE: usize = WORD * 2; // { size, next } stored inside the freed block
@@ -236,6 +238,24 @@ fn debug_usize(mut value: usize) {
     debug_bytes(&buf[i..]);
 }
 
+fn debug_hex_usize(value: usize) {
+    debug_bytes(b"0x");
+    let mut shift = usize::BITS;
+    let mut started = false;
+    while shift != 0 {
+        shift -= 4;
+        let nibble = ((value >> shift) & 0xf) as u8;
+        if nibble != 0 || started || shift == 0 {
+            started = true;
+            crate::debug_put_char(if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + nibble - 10
+            });
+        }
+    }
+}
+
 fn debug_context(context: u32) {
     let label: &[u8] = match context {
         ALLOC_CTX_REGF_IMPORT => b"regf-import",
@@ -381,14 +401,90 @@ unsafe fn set_free_node(node: usize, size: usize, next: usize) {
     }
 }
 
+#[cold]
+#[inline(never)]
+fn allocator_corruption(
+    operation: &'static [u8],
+    owner_start: usize,
+    owner_size: usize,
+    node: usize,
+    node_size: usize,
+    next: usize,
+) -> ! {
+    debug_bytes(b"[alloc-corrupt] op=");
+    debug_bytes(operation);
+    debug_bytes(b" owner=");
+    debug_hex_usize(owner_start);
+    debug_bytes(b" owner-size=");
+    debug_usize(owner_size);
+    debug_bytes(b" node=");
+    debug_hex_usize(node);
+    debug_bytes(b" node-size=");
+    debug_usize(node_size);
+    debug_bytes(b" next=");
+    debug_hex_usize(next);
+    debug_bytes(b" bump=");
+    debug_usize(unsafe { read_word(CTR) });
+    let scope_ptr = OOM_SCOPE_PTR.load(Ordering::Relaxed);
+    let scope_len = OOM_SCOPE_LEN.load(Ordering::Relaxed);
+    if scope_ptr != 0 && scope_len != 0 {
+        debug_bytes(b" scope=");
+        // SAFETY: scopes are static byte strings installed through `enter_scope`.
+        debug_bytes(unsafe { core::slice::from_raw_parts(scope_ptr as *const u8, scope_len) });
+    }
+    crate::debug_put_char(b'\n');
+    panic!("allocator free-list corruption");
+}
+
+/// Validate the complete address-ordered free list before following any link. A damaged node must
+/// fail at the first allocator boundary instead of being copied into `FREE_HEAD` and surfacing later
+/// as an unrelated low-address rootserver page fault.
+unsafe fn validate_free_list(operation: &'static [u8], owner_start: usize, owner_size: usize) {
+    let top = DATA + unsafe { read_word(CTR) };
+    let mut previous_end = DATA;
+    let mut node = unsafe { read_word(FREE_HEAD) };
+    let mut guard = 0usize;
+    let max_nodes = durable_heap_capacity() / FREE_NODE_SIZE;
+    while node != 0 {
+        if node < DATA
+            || node >= top
+            || node % ALLOC_GRANULE != 0
+            || guard >= max_nodes
+        {
+            allocator_corruption(operation, owner_start, owner_size, node, 0, 0);
+        }
+        let size = unsafe { free_node_size(node) };
+        let next = unsafe { free_node_next(node) };
+        let Some(end) = node.checked_add(size) else {
+            allocator_corruption(operation, owner_start, owner_size, node, size, next);
+        };
+        if node < previous_end
+            || size < FREE_NODE_SIZE
+            || size % ALLOC_GRANULE != 0
+            || end > top
+            || (next != 0
+                && (next <= node
+                    || next < end
+                    || next >= top
+                    || next % ALLOC_GRANULE != 0))
+        {
+            allocator_corruption(operation, owner_start, owner_size, node, size, next);
+        }
+        previous_end = end;
+        node = next;
+        guard += 1;
+    }
+}
+
 unsafe fn insert_free_block(start: usize, size: usize) {
+    let allocated_end = DATA + unsafe { read_word(CTR) };
     if size < FREE_NODE_SIZE
         || start < DATA
         || start
             .checked_add(size)
-            .is_none_or(|end| end > durable_heap_end())
+            .is_none_or(|end| end > allocated_end)
     {
-        return;
+        allocator_corruption(b"insert", start, size, start, size, 0);
     }
 
     let mut prev = 0usize;
@@ -401,6 +497,15 @@ unsafe fn insert_free_block(start: usize, size: usize) {
     }
     if cur == start {
         return;
+    }
+    let end = start + size;
+    if (prev != 0
+        && prev
+            .checked_add(unsafe { free_node_size(prev) })
+            .is_none_or(|prev_end| prev_end > start))
+        || (cur != 0 && end > cur)
+    {
+        allocator_corruption(b"insert-overlap", start, size, cur, 0, 0);
     }
 
     unsafe {
@@ -686,7 +791,6 @@ unsafe impl GlobalAlloc for Bump {
         let Some(new_block_size) = block_size(new_size) else {
             return null_mut();
         };
-
         if new_block_size <= old_block_size {
             let tail = old_block_size - new_block_size;
             if tail >= FREE_NODE_SIZE {
@@ -761,6 +865,19 @@ pub fn mark() -> usize {
     unsafe { read_word(CTR) }
 }
 
+/// Permanently retain every durable allocation made up to the current bump watermark.
+///
+/// Raw-pointer registries call this immediately after acquiring storage. Unlike the service-loop
+/// dirty finalizer, this floor is part of the allocator's own rewind contract and therefore cannot
+/// be skipped by an unusual reply, park, or teardown control path.
+pub fn pin_current() {
+    let current = mark();
+    let floor = unsafe { read_word(DURABLE_FLOOR) };
+    if current > floor {
+        unsafe { write_word(DURABLE_FLOOR, current) };
+    }
+}
+
 /// Bytes still available above the current bump mark.
 pub fn remaining() -> usize {
     durable_heap_capacity().saturating_sub(mark())
@@ -784,6 +901,7 @@ pub struct HeapUsage {
 /// `bump` is an address-space watermark, not live allocation bytes. Dropped allocations below a
 /// later durable object remain reusable through the free list even when they cannot lower it.
 pub fn usage() -> HeapUsage {
+    unsafe { validate_free_list(b"usage", 0, 0) };
     let bump = mark();
     let top_reusable = remaining();
     let mut free_bytes = 0usize;
@@ -824,9 +942,21 @@ const fn rewind_target(requested: usize, current: usize, capacity: usize) -> usi
     }
 }
 
+const fn rewind_target_with_floor(
+    requested: usize,
+    floor: usize,
+    current: usize,
+    capacity: usize,
+) -> usize {
+    let retained = if requested > floor { requested } else { floor };
+    rewind_target(retained, current, capacity)
+}
+
 const _: () = assert!(rewind_target(12, 8, 16) == 8);
 const _: () = assert!(rewind_target(4, 8, 16) == 4);
 const _: () = assert!(rewind_target(20, 24, 16) == 16);
+const _: () = assert!(rewind_target_with_floor(4, 12, 16, 32) == 12);
+const _: () = assert!(rewind_target_with_floor(20, 12, 16, 32) == 16);
 
 /// Rewind the bump counter to a [`mark`], reclaiming everything allocated since.
 ///
@@ -834,9 +964,10 @@ const _: () = assert!(rewind_target(20, 24, 16) == 16);
 /// All allocations made after `m` must be dead (unreferenced) at this point.
 pub unsafe fn reset_to(m: usize) {
     let current = unsafe { read_word(CTR) };
-    let bounded = rewind_target(m, current, durable_heap_capacity());
+    let floor = unsafe { read_word(DURABLE_FLOOR) };
+    let bounded = rewind_target_with_floor(m, floor, current, durable_heap_capacity());
     unsafe {
-        write_word(CTR, bounded);
         trim_free_list_to(DATA + bounded);
+        write_word(CTR, bounded);
     }
 }

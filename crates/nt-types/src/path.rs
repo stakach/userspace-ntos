@@ -111,6 +111,19 @@ pub struct NtPath {
 }
 
 impl NtPath {
+    /// Reconstruct the canonical absolute UTF-16 name represented by this parsed path.
+    pub fn to_unicode_string(&self) -> UnicodeString {
+        let mut units = Vec::new();
+        units.push(SEPARATOR);
+        for (index, component) in self.components.iter().enumerate() {
+            if index != 0 {
+                units.push(SEPARATOR);
+            }
+            units.extend_from_slice(component.as_units());
+        }
+        UnicodeString { units }
+    }
+
     /// Parse an absolute NT path from UTF-16 code units.
     ///
     /// Rules (spec §9.4): the separator is `\`; the path must be absolute (start

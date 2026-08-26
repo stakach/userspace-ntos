@@ -8313,6 +8313,7 @@ unsafe fn dll_cache_alloc_chunk() -> Option<*mut DllCacheChunk> {
         return None;
     }
     core::ptr::write(ptr, DllCacheChunk::empty());
+    allocator::pin_current();
     DLL_CACHE_DIRTY.store(true, Ordering::Relaxed);
     Some(ptr)
 }
@@ -8389,6 +8390,7 @@ unsafe fn dll_cache_put(va: u64, fr: u64) -> bool {
             DLL_CACHE_INSERT_FAILURES.fetch_add(1, Ordering::Relaxed);
             return false;
         }
+        allocator::pin_current();
         DLL_CACHE_DIRTY.store(true, Ordering::Relaxed);
         let Some(chunk) = dll_cache_alloc_chunk() else {
             return false;
@@ -9299,6 +9301,7 @@ unsafe fn shared_image_mapping_alloc_chunk() -> Option<*mut SharedImageMappingCh
         return None;
     }
     core::ptr::write(ptr, SharedImageMappingChunk::empty());
+    allocator::pin_current();
     SHARED_IMAGE_MAPPING_DIRTY.store(true, Ordering::Relaxed);
     Some(ptr)
 }
@@ -9456,6 +9459,7 @@ unsafe fn shared_image_mapping_push_prepared(
             SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
             return false;
         }
+        allocator::pin_current();
         let Some(chunk) = shared_image_mapping_alloc_chunk() else {
             return false;
         };
@@ -17466,7 +17470,6 @@ unsafe fn reclaim_final_process_vm(
             let _ = generic_sections.unmap_view(pi, view.base);
             stats.generic_views = stats.generic_views.saturating_add(1);
         }
-
         stats.dll_views = (&mut *ctx.reg).clear_mapped_for_pi(pi) as u64;
         {
             let dll_arena_paging = &mut *ctx.dll_arena_paging;
@@ -22513,9 +22516,9 @@ impl ExecDirectoryOpens {
         Self { table }
     }
 
-    fn create(&mut self, first_cluster: u32) -> Result<u32, u32> {
+    fn create(&mut self, first_cluster: u32, volume_relative_path: &[u8]) -> Result<u32, u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).create(first_cluster) }
+        unsafe { (&mut *self.table).create(first_cluster, volume_relative_path) }
     }
 
     fn get(&self, id: u32) -> Result<&nt_fs::DirectoryOpen, u32> {
@@ -29140,6 +29143,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 create_disposition: 3, /* FILE_OPEN_IF */
                                 file_attributes: 0,
                                 ea_length: 0,
+                                related_file: None,
                             },
                             &name16,
                             &mut out,
@@ -29197,6 +29201,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                     create_disposition: 1, /* FILE_OPEN */
                                     file_attributes: 0,
                                     ea_length: 0,
+                                    related_file: None,
                                 },
                                 &name16,
                                 &mut cout,

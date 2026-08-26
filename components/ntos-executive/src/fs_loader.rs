@@ -887,17 +887,18 @@ fn name_to_83_into(comp: &[u8], out: &mut [u8; 11]) {
 /// the seam a full `\SystemRoot\system32\X` loader generalizes (see P7).
 unsafe fn fat_open_path_entry_inner(
     fs: &Fat32,
+    start_cluster: u32,
     path: &[u8],
     use_system32_cache: bool,
 ) -> Option<(u32, u32, u8)> {
-    if use_system32_cache {
+    if use_system32_cache && start_cluster == fs.root_cl {
         if let Some(leaf) = system32_leaf_from_volume_path(path) {
             if let Some(entry) = system32_cache_lookup(fs, leaf) {
                 return Some(entry);
             }
         }
     }
-    let mut cur = fs.root_cl;
+    let mut cur = start_cluster;
     let mut start = 0usize;
     let mut i = 0usize;
     let mut result: Option<(u32, u32, u8)> = None;
@@ -923,14 +924,29 @@ unsafe fn fat_open_path_entry_inner(
 }
 
 pub(crate) unsafe fn fat_open_path_entry(fs: &Fat32, path: &[u8]) -> Option<(u32, u32, u8)> {
-    fat_open_path_entry_inner(fs, path, true)
+    fat_open_path_entry_inner(fs, fs.root_cl, path, true)
 }
 
 pub(crate) unsafe fn fat_open_path_entry_uncached(
     fs: &Fat32,
     path: &[u8],
 ) -> Option<(u32, u32, u8)> {
-    fat_open_path_entry_inner(fs, path, false)
+    fat_open_path_entry_inner(fs, fs.root_cl, path, false)
+}
+
+/// Resolve a canonical relative path beneath an already-open FAT directory. Directory handles
+/// carry the directory's first cluster, so this preserves identity across namespace traversal
+/// without reconstructing an absolute path.
+pub(crate) unsafe fn fat_open_path_entry_from(
+    fs: &Fat32,
+    start_cluster: u32,
+    path: &[u8],
+) -> Option<(u32, u32, u8)> {
+    if path.is_empty() {
+        Some((start_cluster, 0, 0x10))
+    } else {
+        fat_open_path_entry_inner(fs, start_cluster, path, false)
+    }
 }
 
 pub(crate) unsafe fn fat_open_path_uncached(fs: &Fat32, path: &[u8]) -> Option<(u32, u32)> {

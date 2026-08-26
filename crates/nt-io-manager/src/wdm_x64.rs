@@ -48,6 +48,7 @@ pub struct WdmDeviceObjectInit {
 pub struct WdmFileObjectInit {
     pub device_object: u64,
     pub fs_context: u64,
+    pub related_file_object: u64,
     pub file_name_len: u16,
     pub file_name_max_len: u16,
     pub file_name_buffer: u64,
@@ -176,6 +177,7 @@ pub fn write_wdm_file_object(
     put_u16(bytes, 0x02, WDM_X64_FILE_OBJECT_SIZE as u16);
     put_u64(bytes, 0x08, init.device_object);
     put_u64(bytes, 0x18, init.fs_context);
+    put_u64(bytes, 0x40, init.related_file_object);
     put_u16(bytes, 0x58, init.file_name_len);
     put_u16(bytes, 0x5a, init.file_name_max_len);
     put_u64(bytes, 0x60, init.file_name_buffer);
@@ -212,6 +214,7 @@ pub fn write_wdm_open_device_projection(
         WdmFileObjectInit {
             device_object: init.device_object,
             fs_context: init.file_object_context,
+            related_file_object: 0,
             file_name_len: 0,
             file_name_max_len: 0,
             file_name_buffer: 0,

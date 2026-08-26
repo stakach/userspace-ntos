@@ -18,7 +18,7 @@ use nt_status::NtStatus;
 use crate::dispatch::{
     DispatchContext, DispatchOutcome, DriverCompletion, DriverDispatchBackend, IrpProjection,
 };
-use crate::{HostedDomainIdentity, HostedProviderIdentity, IrpId};
+use crate::{FileId, HostedDomainIdentity, HostedProviderIdentity, IrpId};
 
 /// The transport to a driver peer: dispatch/cancel, poll reverse-ring
 /// completions, report faults (spec §16.1–16.2).
@@ -170,6 +170,12 @@ fn build_dispatch_request(
         driver_id: irp.driver_id.0,
         device_id: irp.device_id.0,
         file_id: irp.file_id.map(|f| f.0).unwrap_or(0),
+        related_file_id: match &irp.parameters {
+            crate::irp::IoParameters::Create(parameters) => {
+                parameters.related_file.map(FileId::raw).unwrap_or(0)
+            }
+            _ => 0,
+        },
         buffer_id: irp.buffer.map(|b| b.buffer_id).unwrap_or(0),
         buffer_offset: buffer_offset as u64,
         buffer_len,

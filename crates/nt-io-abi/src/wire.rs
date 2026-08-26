@@ -99,6 +99,8 @@ pub struct IrpDispatchRequest {
     pub driver_id: u64,
     pub device_id: u64,
     pub file_id: u64,
+    /// Canonical parent File for a handle-relative CREATE, or zero.
+    pub related_file_id: u64,
     pub buffer_id: u64,
     pub buffer_offset: u64,
     pub buffer_len: u32,
@@ -156,7 +158,7 @@ const _: () = {
     assert!(size_of::<IoDeviceControlRequest>() == 56);
     assert!(size_of::<IoFileRequest>() == 16);
     assert!(size_of::<IoCancelRequest>() == 16);
-    assert!(size_of::<IrpDispatchRequest>() == 176);
+    assert!(size_of::<IrpDispatchRequest>() == 184);
     assert!(size_of::<IoReply>() == 32);
     assert!(align_of::<IoReadWriteRequest>() == 8);
     assert!(align_of::<IrpDispatchRequest>() == 8);
