@@ -12924,3 +12924,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and hosted-driver inline launch plans from them, and delete `boot_system_config_manager` plus
     every plan-time decode of `BOOT_SYSTEM_HIVE_IMAGE`. Runtime PnP operations that still require a
     mutable semantic manager must move to CM queries rather than preserving that local decoder.
+
+    Executive driver-plan migration (2026-08-26, implementation green): after atomic SYSTEM mount,
+    the executive queries exactly one boot/system snapshot and one demand snapshot and rejects any
+    generation other than the published live generation. Hosted filesystem/network drivers,
+    boot/system PnP bindings, demand PnP bindings, the unhosted proof driver, and demand-driver SCM
+    diagnostics are all projected from those two CM-owned snapshots. The executive retains only
+    its capability policy: filesystem services require the `File System` group, legacy hosted
+    network services require the NT5 wrapper/transport groups and no devnodes, while PnP services
+    require Device class plus at least one devnode.
+
+    The superseded manager-based launch projection, devnode copying, shape counting, and repeated
+    boot-image decode calls are deleted. The freestanding executive release check remains green at
+    the established 212-warning baseline.
+
+    Review adjustment: startup driver launch-plan ownership is closed, but the encoded-image
+    decoder cannot yet be deleted. `system_hive_service_selection_report` still rebuilds CM to
+    enumerate Win32 service launches, and runtime `NtPlugPlayControl` still rebuilds it for device
+    existence, event enumeration, interfaces, dynamic properties, relations, and depth. Add
+    generation-bearing CM service-plan and PnP topology query APIs, migrate those callers, then
+    delete `boot_system_config_manager`, its image-size marker, and every remaining semantic import
+    from `BOOT_SYSTEM_HIVE_IMAGE` in one checkpoint.

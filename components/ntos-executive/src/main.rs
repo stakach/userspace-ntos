@@ -83,9 +83,7 @@ use alloc::vec::Vec;
 
 use nt_config_abi::CmReply;
 use nt_config_client::ConfigClient;
-use nt_config_manager::{
-    DriverServiceClass, SERVICE_DEMAND_START, SERVICE_DISABLED, SERVICE_SYSTEM_START,
-};
+use nt_config_manager::{SERVICE_DEMAND_START, SERVICE_DISABLED, SERVICE_SYSTEM_START};
 use nt_hive_core::{
     HiveKind, MutableHiveSet, RegistryValueCopyProvenance, RegistryValueCopyProvenanceTable,
     ResolvedHiveKey, ResolvedHiveValue,
@@ -657,9 +655,7 @@ static mut HOSTED_TP_WORKER_WINDOW_RESOURCES: alloc::vec::Vec<
     [HostedTpWorkerWindowResources; TP_WORKER_SLOT_COUNT],
 > = alloc::vec::Vec::new();
 
-pub(crate) unsafe fn reset_hosted_tp_worker_window_resources(
-    slots: usize,
-) -> bool {
+pub(crate) unsafe fn reset_hosted_tp_worker_window_resources(slots: usize) -> bool {
     let table = &mut *core::ptr::addr_of_mut!(HOSTED_TP_WORKER_WINDOW_RESOURCES);
     table.clear();
     if table.try_reserve(slots).is_err() {
@@ -1386,9 +1382,8 @@ pub(crate) const HOSTED_PROCESS_IMAGE_CAP: usize = MAX_PI * 4;
 const VM_REGION_CAPACITY: usize = 96;
 const USER_ADDRESS_LIMIT: u64 = 0x0000_07ff_ffff_0000;
 static PROCESS_VM_REGION_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
-static mut PROCESS_VM_REGIONS: alloc::vec::Vec<
-    nt_address_space::VmRegionMap<VM_REGION_CAPACITY>,
-> = alloc::vec::Vec::new();
+static mut PROCESS_VM_REGIONS: alloc::vec::Vec<nt_address_space::VmRegionMap<VM_REGION_CAPACITY>> =
+    alloc::vec::Vec::new();
 /// Non-private committed mappings owned outside the private VAD allocator.
 ///
 /// This covers process-lifetime runtime pages plus mapped section/image views. Image views are
@@ -1450,9 +1445,8 @@ pub(crate) unsafe fn reset_process_committed_mappings(slots: usize) -> bool {
 
 unsafe fn process_committed_mapping_table_mut(
     pi: usize,
-) -> Option<
-    &'static mut nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>,
-> {
+) -> Option<&'static mut nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>>
+{
     (&mut *core::ptr::addr_of_mut!(PROCESS_COMMITTED_MAPPINGS)).get_mut(pi)
 }
 
@@ -1607,8 +1601,7 @@ pub(crate) static mut COMMITTED_MAP_AFTER: nt_address_space::VmCommittedRangeTab
 > = nt_address_space::VmCommittedRangeTable::new();
 const PRIVATE_VM_PT_COUNT: usize = ((PRIVATE_VM_LIMIT - SMSS_ALLOC_VA) / 0x20_0000) as usize;
 static PROCESS_VM_PT_CAP_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
-static mut PROCESS_VM_PT_CAPS: alloc::vec::Vec<[u64; PRIVATE_VM_PT_COUNT]> =
-    alloc::vec::Vec::new();
+static mut PROCESS_VM_PT_CAPS: alloc::vec::Vec<[u64; PRIVATE_VM_PT_COUNT]> = alloc::vec::Vec::new();
 const VM_FREE_FRAME_CAPACITY: usize = 4096;
 static mut VM_FREE_FRAMES: [u64; VM_FREE_FRAME_CAPACITY] = [0; VM_FREE_FRAME_CAPACITY];
 static mut VM_FREE_FRAME_N: usize = 0;
@@ -2101,10 +2094,8 @@ const _: () =
 /// The IOAPIC pins PCI INTx routes to on q35 (GSI 16..23) — the NIC's exact pin is
 /// chipset-routed, so we cover them all (edge-triggered, one delivery per assertion).
 const Q35_PCI_INTX_IOAPIC_ROUTE_MASK: u32 = 0x00FF_0000;
-const Q35_PCI_INTX_ROUTES: nt_pnp::PciIntxRoutingTable = nt_pnp::PciIntxRoutingTable::new(
-    0,
-    [Some(16), Some(17), Some(18), Some(19)],
-);
+const Q35_PCI_INTX_ROUTES: nt_pnp::PciIntxRoutingTable =
+    nt_pnp::PciIntxRoutingTable::new(0, [Some(16), Some(17), Some(18), Some(19)]);
 /// The PIT is routed through GSI 2 on PC/q35 systems. HPET Timer 0 advertises it as legal, but
 /// sharing the executive delay timer with the kernel tick gives the delay path false expiries.
 const LEGACY_PIT_IOAPIC_ROUTE_MASK: u32 = 1u32 << 2;
@@ -2394,7 +2385,10 @@ impl ThreadWaitParkTable {
 
     fn stats(&self) -> (usize, usize, usize, u64, u64) {
         (
-            self.badges_plus_one.iter().filter(|badge| **badge != 0).count(),
+            self.badges_plus_one
+                .iter()
+                .filter(|badge| **badge != 0)
+                .count(),
             self.badges_plus_one.len(),
             self.badges_plus_one.capacity(),
             self.allocation_failures,
@@ -5848,8 +5842,7 @@ fn get_message_guard_spec(passed: &mut u64) {
     check(
         b"exec_win32k_blocking_getmessage_guarded",
         !GET_MESSAGE_EMPTY_QUEUE_GUARD
-            || (peeks >= 1
-                && peeks == ready.saturating_add(repopulated).saturating_add(parks)),
+            || (peeks >= 1 && peeks == ready.saturating_add(repopulated).saturating_add(parks)),
         passed,
     );
 }
@@ -7129,8 +7122,7 @@ macro_rules! subdrain {
     ($slot:expr, $body:expr) => {{
         let __s = disk_census_ticks();
         let __w: u64 = $body;
-        SUBDRAIN_TICKS[$slot]
-            .fetch_add(disk_census_ticks().wrapping_sub(__s), Ordering::Relaxed);
+        SUBDRAIN_TICKS[$slot].fetch_add(disk_census_ticks().wrapping_sub(__s), Ordering::Relaxed);
         SUBDRAIN_WOKEN[$slot].fetch_add(__w, Ordering::Relaxed);
         __w
     }};
@@ -7655,12 +7647,8 @@ pub(crate) fn print_census_counters(tag: &[u8]) {
     print_u64(nested);
     print_str(b" ucb-seq=");
     print_u64(seq);
-    let (
-        w32_dispatch_rows,
-        w32_dispatch_cap,
-        w32_dispatch_alloc_fails,
-        w32_dispatch_misses,
-    ) = w32_total_dispatch_row_stats();
+    let (w32_dispatch_rows, w32_dispatch_cap, w32_dispatch_alloc_fails, w32_dispatch_misses) =
+        w32_total_dispatch_row_stats();
     print_str(b" w32-dispatch/pi=");
     for pi in 0..w32_dispatch_rows {
         if pi != 0 {
@@ -8211,9 +8199,7 @@ unsafe fn dll_cache_find(va: u64) -> Option<(usize, usize)> {
     None
 }
 
-unsafe fn dll_cache_last_nonempty_chunk(
-    chunks: &[*mut DllCacheChunk],
-) -> Option<(usize, usize)> {
+unsafe fn dll_cache_last_nonempty_chunk(chunks: &[*mut DllCacheChunk]) -> Option<(usize, usize)> {
     let mut index = chunks.len();
     while index != 0 {
         index -= 1;
@@ -8314,8 +8300,7 @@ unsafe fn dll_cache_evict_unreferenced_all() -> u64 {
     let mut chunk_index = 0usize;
     while chunk_index < chunks.len() {
         let mut record_index = 0usize;
-        while chunk_index < chunks.len()
-            && record_index < dll_cache_chunk_len(chunks[chunk_index])
+        while chunk_index < chunks.len() && record_index < dll_cache_chunk_len(chunks[chunk_index])
         {
             let page = (*chunks[chunk_index]).records[record_index].va;
             if !shared_image_mapping_page_referenced(page) {
@@ -8414,15 +8399,9 @@ unsafe fn csrss_frame_put_at_cap_source_owned(
     source_cap: u64,
     owns_frame: bool,
 ) -> bool {
-    match (&mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY)).insert(
-        pi,
-        page,
-        fr,
-        alias,
-        alias_cap,
-        source_cap,
-        owns_frame,
-    ) {
+    match (&mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY))
+        .insert(pi, page, fr, alias, alias_cap, source_cap, owns_frame)
+    {
         Ok(ClientFrameInsert::Inserted { grew }) => {
             if grew {
                 mark_durable_table_growth_dirty();
@@ -8484,8 +8463,7 @@ pub(crate) unsafe fn csrss_frame_drop_process_range(pi: u64, base: u64, size: u6
 pub(crate) unsafe fn csrss_frame_drop_process_all(pi: u64) -> u64 {
     let mut dropped = 0u64;
     loop {
-        let Some(page) = (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY))
-            .first_page_for_process(pi)
+        let Some(page) = (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).first_page_for_process(pi)
         else {
             break;
         };
@@ -8861,7 +8839,10 @@ fn print_frame_registry_top_pi(by_pi: &[u64]) {
         let mut best_pi = usize::MAX;
         let mut best_count = 0u64;
         for (pi, count) in by_pi.iter().enumerate() {
-            if selected[..printed].iter().any(|&selected_pi| selected_pi == pi) {
+            if selected[..printed]
+                .iter()
+                .any(|&selected_pi| selected_pi == pi)
+            {
                 continue;
             }
             if *count > best_count {
@@ -9382,11 +9363,7 @@ unsafe fn shared_image_mapping_put_banked(pi: u64, page: u64, map_cap: u64) -> b
     }
 }
 
-unsafe fn shared_image_mapping_replace_banked_after_map(
-    pi: u64,
-    page: u64,
-    map_cap: u64,
-) -> bool {
+unsafe fn shared_image_mapping_replace_banked_after_map(pi: u64, page: u64, map_cap: u64) -> bool {
     if pi > u8::MAX as u64 || map_cap == 0 {
         SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
         return false;
@@ -10846,10 +10823,7 @@ fn note_teb_tail_row_miss() {
 }
 
 pub(crate) fn teb_tail_alias_live_for_pi(pi: usize) -> bool {
-    unsafe {
-        teb_tail_alias_live_row(pi)
-            .is_some_and(|row| row.load(Ordering::Relaxed) != 0)
-    }
+    unsafe { teb_tail_alias_live_row(pi).is_some_and(|row| row.load(Ordering::Relaxed) != 0) }
 }
 
 fn teb_tail_row_stats() -> (usize, usize, usize, usize, usize, usize, u64, u64, u64) {
@@ -12570,7 +12544,8 @@ unsafe fn vm_ensure_private_pt(pi: usize, page: u64, pml4: u64) -> Result<(), u3
         .filter(|offset| *offset < PRIVATE_VM_LIMIT - SMSS_ALLOC_VA)
         .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?;
     let index = (offset / 0x20_0000) as usize;
-    let caps = process_private_pt_caps_mut(pi).ok_or(nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
+    let caps =
+        process_private_pt_caps_mut(pi).ok_or(nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
     let slot = caps.as_mut_ptr().add(index);
     if core::ptr::read(slot) != 0 {
         return Ok(());
@@ -13727,8 +13702,8 @@ unsafe fn settle_hosted_pnp_context_grant(
     context_lease: nt_pnp_context::ContextLeaseIdentity,
     result: Result<Option<HostedDevnodeGrant>, nt_status::NtStatus>,
 ) -> Result<Option<HostedDevnodeGrant>, nt_status::NtStatus> {
-    let retained = driver_launch::hosted_pnp_context_lease_for_device(device_id)
-        == Some(context_lease);
+    let retained =
+        driver_launch::hosted_pnp_context_lease_for_device(device_id) == Some(context_lease);
     match (result, retained) {
         (Ok(grant), true) => Ok(grant),
         (Ok(_), false) => {
@@ -14012,9 +13987,7 @@ unsafe fn grant_hosted_root_devnode_resources(
         .assignment
         .interrupt_resource(nt_pnp::ResourceView::Translated)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    if memory.start != window.mmio_phys
-        || window.mmio_frame_base == 0
-        || window.dma_frame_base == 0
+    if memory.start != window.mmio_phys || window.mmio_frame_base == 0 || window.dma_frame_base == 0
     {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
@@ -14078,12 +14051,8 @@ unsafe fn grant_hosted_devnode_resources(
             lease,
         } => {
             let context_lease = lease.into_identity();
-            let result = grant_hosted_pci_devnode_resources(
-                device_id,
-                bus_resources,
-                window,
-                context_lease,
-            );
+            let result =
+                grant_hosted_pci_devnode_resources(device_id, bus_resources, window, context_lease);
             settle_hosted_pnp_context_grant(device_id, context_lease, result)
         }
         PreparedHostedResourcePlan::Root {
@@ -14621,13 +14590,7 @@ unsafe fn map_own_heap() {
 
 /// Build a spawned service's VSpace: image RO+X, private heap, private stack, and
 /// the four shared SURT frames at the shared vaddrs.
-unsafe fn build_service_vspace(
-    sub: u64,
-    comp: u64,
-    req: u64,
-    rep: u64,
-    heap_frames: u64,
-) -> u64 {
+unsafe fn build_service_vspace(sub: u64, comp: u64, req: u64, rep: u64, heap_frames: u64) -> u64 {
     assert!(heap_frames != 0 && heap_frames <= allocator::HEAP_FRAMES);
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
@@ -15071,6 +15034,23 @@ pub(crate) unsafe fn config_manager_query_driver_service(
     client.query_driver_service(service)
 }
 
+pub(crate) unsafe fn config_manager_query_driver_launch_plan(
+    plan_kind: u16,
+) -> Result<nt_config_client::DriverLaunchPlanSnapshot, i32> {
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if expected_generation == 0 {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    let snapshot = client.query_driver_launch_plan(plan_kind)?;
+    if snapshot.mount_generation != expected_generation {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    Ok(snapshot)
+}
+
 pub(crate) unsafe fn config_manager_query_system_hive_key(
     path: &str,
 ) -> Result<nt_config_client::HiveKeySnapshot, i32> {
@@ -15467,7 +15447,9 @@ fn monotonic_time_100ns() -> u64 {
     let period = HPET_PERIOD_FS.load(Ordering::Relaxed);
     if period != 0 && HPET_MONOTONIC_READY.load(Ordering::Acquire) {
         let offset = HPET_MONOTONIC_OFFSET_100NS.load(Ordering::Relaxed);
-        unsafe { nt_delay_execution::epoch_time_from_counter(hpet_counter_time_100ns(period), offset) }
+        unsafe {
+            nt_delay_execution::epoch_time_from_counter(hpet_counter_time_100ns(period), offset)
+        }
     } else {
         fallback_monotonic_time_100ns()
     }
@@ -15791,9 +15773,7 @@ unsafe fn delay_timer_init() -> bool {
     true
 }
 
-unsafe fn delay_timer_next_deadline(
-    queue: &nt_delay_execution::Queue,
-) -> Option<(u64, u64)> {
+unsafe fn delay_timer_next_deadline(queue: &nt_delay_execution::Queue) -> Option<(u64, u64)> {
     let delay_deadline = queue.next_deadline();
     let event_deadline = object_waiter_next_deadline();
     let keyed_deadline = unsafe { (&*core::ptr::addr_of!(KEYED_WAITERS)).next_deadline() };
@@ -15978,8 +15958,7 @@ unsafe fn delay_wake_due(
         let reply_started = disk_census_ticks();
         client_reply_on(waiter.reply_cap, 18, 0, 0, 0, 0);
         let reply_done = disk_census_ticks();
-        DELAY_WAKE_REPLY_TICKS
-            .fetch_add(reply_done.wrapping_sub(reply_started), Ordering::Relaxed);
+        DELAY_WAKE_REPLY_TICKS.fetch_add(reply_done.wrapping_sub(reply_started), Ordering::Relaxed);
         release_reply_pool_cap(waiter.reply_cap);
         thread_wait_state_clear_badge_ready(handler, waiter.badge);
         DELAY_WAKE_OTHER_TICKS.fetch_add(
@@ -16149,9 +16128,7 @@ unsafe fn delay_timer_ack_irq() {
 }
 
 fn object_waiter_table_reset() -> bool {
-    unsafe {
-        (&mut *core::ptr::addr_of_mut!(OBJECT_WAITERS)).reset(OBJECT_WAITER_INITIAL_RESERVE)
-    }
+    unsafe { (&mut *core::ptr::addr_of_mut!(OBJECT_WAITERS)).reset(OBJECT_WAITER_INITIAL_RESERVE) }
 }
 
 fn object_waiter_table_stats() -> (usize, usize, usize, u64, u64) {
@@ -16192,8 +16169,11 @@ fn object_waiter_clear_pending_wakes() {
 
 fn object_waiter_mark_pending_wake(slot: usize, wake_index: u64, wake_object: WaitObject) {
     unsafe {
-        (&mut *core::ptr::addr_of_mut!(OBJECT_WAITERS))
-            .mark_pending_wake(slot, wake_index, wake_object);
+        (&mut *core::ptr::addr_of_mut!(OBJECT_WAITERS)).mark_pending_wake(
+            slot,
+            wake_index,
+            wake_object,
+        );
     }
 }
 
@@ -16428,10 +16408,7 @@ unsafe fn delay_timer_shutdown(queue: &nt_delay_execution::Queue) {
     let _ = syscall5(SYS_SEND, 1, LBL_TCB_UNBIND_NOTIFICATION << 12, 0, 0, 0);
 }
 
-unsafe fn delay_cancel_thread(
-    queue: &mut nt_delay_execution::Queue,
-    thread_id: u64,
-) {
+unsafe fn delay_cancel_thread(queue: &mut nt_delay_execution::Queue, thread_id: u64) {
     while let Some(waiter) = queue.pop_thread(thread_id) {
         let cap = waiter.reply_cap;
         let deleted = cnode_delete_r(cap);
@@ -16655,8 +16632,8 @@ unsafe fn dbgk_reporter_abandon(block: &nt_process::dbgk::ReporterBlock) -> bool
 
 fn keyed_wait_tables_reset() -> bool {
     unsafe {
-        let waiters_ok = (&mut *core::ptr::addr_of_mut!(KEYED_WAITERS))
-            .reset(KEYED_WAITER_INITIAL_RESERVE);
+        let waiters_ok =
+            (&mut *core::ptr::addr_of_mut!(KEYED_WAITERS)).reset(KEYED_WAITER_INITIAL_RESERVE);
         let releasers_ok = (&mut *core::ptr::addr_of_mut!(KEYED_RELEASE_WAITERS))
             .reset(KEYED_WAITER_INITIAL_RESERVE);
         waiters_ok && releasers_ok
@@ -18155,8 +18132,7 @@ fn system_hive_regf() -> Option<RegfHive<'static>> {
 }
 
 unsafe fn storage_config_hive_image_bytes() -> Option<&'static [u8]> {
-    let hive_size =
-        core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x18) as *const u32) as usize;
+    let hive_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x18) as *const u32) as usize;
     if hive_size == 0 || hive_size > STORAGE_HIVE_IMAGE_CAP {
         return None;
     }
@@ -18188,12 +18164,11 @@ struct BootSystemImageReport {
     image_bytes: u64,
 }
 
-unsafe fn prepare_boot_system_hive_image(
-) -> Result<BootSystemImageReport, BootSystemImageError> {
-    let generated = storage_config_hive_image_bytes()
-        .ok_or(BootSystemImageError::GeneratedOverlayMissing)?;
-    let persistence = writable_fs::restore_boot_system_persistence()
-        .map_err(BootSystemImageError::Restore)?;
+unsafe fn prepare_boot_system_hive_image() -> Result<BootSystemImageReport, BootSystemImageError> {
+    let generated =
+        storage_config_hive_image_bytes().ok_or(BootSystemImageError::GeneratedOverlayMissing)?;
+    let persistence =
+        writable_fs::restore_boot_system_persistence().map_err(BootSystemImageError::Restore)?;
     let mut snapshot_generation = 0;
     let mut snapshot_bytes = 0;
     let (primary, log) = match persistence {
@@ -18217,8 +18192,8 @@ unsafe fn prepare_boot_system_hive_image(
         .current_control_set()
         .map_err(BootSystemImageError::Selection)?
         .number();
-    let image = nt_hive_core::try_encode_image(&composed.hive)
-        .map_err(BootSystemImageError::Encode)?;
+    let image =
+        nt_hive_core::try_encode_image(&composed.hive).map_err(BootSystemImageError::Encode)?;
     let image_bytes = image.len() as u64;
     *core::ptr::addr_of_mut!(BOOT_SYSTEM_HIVE_IMAGE) = Some(image);
     BOOT_SYSTEM_HIVE_IMAGE_BYTES.store(image_bytes, Ordering::Release);
@@ -18891,14 +18866,16 @@ impl HostedPciHardwareGrant {
                     || grant.len == 0
                     || grant.frame_base == 0
                     || grant.pages == 0
-                    || device.bars.iter().find(|bar| bar.index == grant.bar_index).is_none_or(
-                        |bar| {
+                    || device
+                        .bars
+                        .iter()
+                        .find(|bar| bar.index == grant.bar_index)
+                        .is_none_or(|bar| {
                             bar.is_io
                                 || !bar.is_assigned()
                                 || bar.base != grant.phys
                                 || bar.size != grant.len
-                        },
-                    )
+                        })
             })
         {
             return None;
@@ -19498,47 +19475,6 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
     report
 }
 
-fn driver_class_from_config(class: DriverServiceClass) -> driver_launch::DriverClass {
-    match class {
-        DriverServiceClass::FileSystem => driver_launch::DriverClass::Fsd,
-        DriverServiceClass::Device => driver_launch::DriverClass::Device,
-    }
-}
-
-fn driver_launch_spec_from_config_driver_spec(
-    service: &nt_config_manager::DriverServiceLaunchSpec,
-    max_start: u32,
-) -> Option<(Vec<u8>, driver_launch::DriverClass)> {
-    if service.start_type > max_start || service.start_type >= SERVICE_DISABLED {
-        return None;
-    };
-    let class = driver_class_from_config(service.class);
-    let path = registry_ascii_path(&service.image_path)?;
-    Some((path, class))
-}
-
-fn driver_launch_spec_from_service_metadata(
-    service: &nt_config_manager::ServiceMetadata,
-    max_start: u32,
-) -> Option<(Vec<u8>, driver_launch::DriverClass)> {
-    let service = service.driver_launch_spec()?;
-    driver_launch_spec_from_config_driver_spec(&service, max_start)
-}
-
-fn current_driver_host_can_boot_launch(
-    cm: &nt_config_manager::ConfigManager,
-    service: &nt_config_manager::ServiceMetadata,
-) -> bool {
-    match service.driver_service_class() {
-        Some(DriverServiceClass::FileSystem) => service
-            .load_order_group
-            .as_deref()
-            .is_some_and(|group| group.eq_ignore_ascii_case(FILE_SYSTEM_LOAD_ORDER_GROUP)),
-        Some(DriverServiceClass::Device) => cm.is_boot_system_legacy_driver(service),
-        None => false,
-    }
-}
-
 fn owned_driver_launch_spec_from_live_config_binding(
     binding: nt_config_client::DriverServiceBinding,
     max_start: u32,
@@ -19622,225 +19558,165 @@ fn append_inline_id_list(
     Some((start, count))
 }
 
-fn inline_devnode_spec_header_from_record(
-    cm: &nt_config_manager::ConfigManager,
-    devnode: &nt_config_manager::DevnodeRecord,
-    plan: &mut InlineDriverLaunchPlan,
-) -> Option<InlineDriverDevnodeSpec> {
-    let mut dst = InlineDriverDevnodeSpec::empty();
-    dst.instance_id = plan.push_string(&devnode.instance_id)?;
-    if let Some(pdo_name) = devnode.pdo_name.as_deref() {
-        dst.pdo_name = plan.push_string(pdo_name)?;
-        dst.pdo_name_present = true;
+fn live_config_driver_class(
+    class: nt_config_client::DriverServiceClass,
+) -> driver_launch::DriverClass {
+    match class {
+        nt_config_client::DriverServiceClass::Device => driver_launch::DriverClass::Device,
+        nt_config_client::DriverServiceClass::FileSystem => driver_launch::DriverClass::Fsd,
     }
-    if let Some(driver_key) = devnode.driver_key.as_deref() {
-        dst.driver_key = plan.push_string(driver_key)?;
-        dst.driver_key_present = true;
-    }
-    if let Some(linkage_export) = cm.devnode_linkage_export(devnode) {
-        dst.linkage_export = plan.push_string(&linkage_export)?;
-        dst.linkage_export_present = true;
-    }
-    Some(dst)
 }
 
-fn inline_devnode_spec_header_shape_from_record(
-    cm: &nt_config_manager::ConfigManager,
-    devnode: &nt_config_manager::DevnodeRecord,
-) -> Option<usize> {
-    let mut string_bytes = 0usize;
-    checked_add_plan_string(&mut string_bytes, &devnode.instance_id)?;
-    if let Some(pdo_name) = devnode.pdo_name.as_deref() {
-        checked_add_plan_string(&mut string_bytes, pdo_name)?;
-    }
-    if let Some(driver_key) = devnode.driver_key.as_deref() {
-        checked_add_plan_string(&mut string_bytes, driver_key)?;
-    }
-    if let Some(linkage_export) = cm.devnode_linkage_export(devnode) {
-        checked_add_plan_string(&mut string_bytes, &linkage_export)?;
-    }
-    Some(string_bytes)
-}
-
-fn inline_devnode_spec_from_record(
-    cm: &nt_config_manager::ConfigManager,
-    devnode: &nt_config_manager::DevnodeRecord,
-    plan: &mut InlineDriverLaunchPlan,
-) -> Option<InlineDriverDevnodeSpec> {
-    let mut dst = inline_devnode_spec_header_from_record(cm, devnode, plan)?;
-    let (hardware_start, hardware_count) = append_inline_id_list(&devnode.hardware_ids, plan)?;
-    let (compatible_start, compatible_count) =
-        append_inline_id_list(&devnode.compatible_ids, plan)?;
-    dst.hardware_id_start = hardware_start;
-    dst.hardware_id_count = hardware_count;
-    dst.compatible_id_start = compatible_start;
-    dst.compatible_id_count = compatible_count;
-    Some(dst)
-}
-
-fn inline_devnode_shape_from_record(
-    cm: &nt_config_manager::ConfigManager,
-    devnode: &nt_config_manager::DevnodeRecord,
-) -> Option<InlineDriverDevnodePlanShape> {
-    let header_string_bytes = inline_devnode_spec_header_shape_from_record(cm, devnode)?;
-    let hardware = count_inline_id_list(&devnode.hardware_ids)?;
-    let compatible = count_inline_id_list(&devnode.compatible_ids)?;
-    Some(InlineDriverDevnodePlanShape {
-        devnodes: 1,
-        ids: hardware.ids.checked_add(compatible.ids)?,
-        string_bytes: header_string_bytes
-            .checked_add(hardware.string_bytes)?
-            .checked_add(compatible.string_bytes)?,
-    })
-}
-
-fn count_inline_devnodes_from_records(
-    cm: &nt_config_manager::ConfigManager,
-    records: &[nt_config_manager::DevnodeRecord],
-) -> InlineDriverDevnodePlanShape {
-    let mut shape = InlineDriverDevnodePlanShape::default();
-    for devnode in records {
-        if let Some(devnode_shape) = inline_devnode_shape_from_record(cm, devnode) {
-            let Some(devnodes) = shape.devnodes.checked_add(devnode_shape.devnodes) else {
-                break;
-            };
-            let Some(ids) = shape.ids.checked_add(devnode_shape.ids) else {
-                break;
-            };
-            let Some(string_bytes) = shape.string_bytes.checked_add(devnode_shape.string_bytes)
-            else {
-                break;
-            };
-            shape.devnodes = devnodes;
-            shape.ids = ids;
-            shape.string_bytes = string_bytes;
-        }
-    }
-    shape
-}
-
-fn count_inline_devnodes(
-    cm: &nt_config_manager::ConfigManager,
-    service_name: &str,
-) -> InlineDriverDevnodePlanShape {
-    let mut shape = InlineDriverDevnodePlanShape::default();
-    for devnode in cm.devnodes_for_service(service_name) {
-        if let Some(devnode_shape) = inline_devnode_shape_from_record(cm, devnode) {
-            let Some(devnodes) = shape.devnodes.checked_add(devnode_shape.devnodes) else {
-                break;
-            };
-            let Some(ids) = shape.ids.checked_add(devnode_shape.ids) else {
-                break;
-            };
-            let Some(string_bytes) = shape.string_bytes.checked_add(devnode_shape.string_bytes)
-            else {
-                break;
-            };
-            shape.devnodes = devnodes;
-            shape.ids = ids;
-            shape.string_bytes = string_bytes;
-        }
-    }
-    shape
-}
-
-fn append_inline_devnodes_from_records(
-    cm: &nt_config_manager::ConfigManager,
-    records: &[nt_config_manager::DevnodeRecord],
-    plan: &mut InlineDriverLaunchPlan,
-) -> Option<(usize, usize)> {
-    let start = plan.devnode_len();
-    let mut count = 0usize;
-    for devnode in records {
-        if let Some(dst) = inline_devnode_spec_from_record(cm, devnode, plan) {
-            if !plan.push_devnode(dst) {
-                return None;
-            }
-            count += 1;
-        }
-    }
-    Some((start, count))
-}
-
-fn append_inline_devnodes(
-    cm: &nt_config_manager::ConfigManager,
-    service_name: &str,
-    plan: &mut InlineDriverLaunchPlan,
-) -> Option<(usize, usize)> {
-    let start = plan.devnode_len();
-    let mut count = 0usize;
-    for devnode in cm.devnodes_for_service(service_name) {
-        if let Some(dst) = inline_devnode_spec_from_record(cm, devnode, plan) {
-            if !plan.push_devnode(dst) {
-                return None;
-            }
-            count += 1;
-        }
-    }
-    Some((start, count))
-}
-
-fn inline_driver_launch_spec_header_from_service_metadata(
-    service: &nt_config_manager::ServiceMetadata,
+fn live_config_driver_image_path(
+    binding: &nt_config_client::DriverServiceBinding,
     max_start: u32,
-    plan: &mut InlineDriverLaunchPlan,
-) -> Option<InlineDriverLaunchSpec> {
-    let (image_path, class) = driver_launch_spec_from_service_metadata(service, max_start)?;
-    let driver_object_path = service.driver_object_path()?;
-    let mut spec = InlineDriverLaunchSpec::empty();
-    spec.service_name = plan.push_string(&service.name)?;
-    spec.driver_object_path = plan.push_string(&driver_object_path)?;
-    spec.image_path = plan.push_string_bytes(&image_path)?;
-    if let Some(class_guid) = service.class_guid.as_deref() {
-        spec.class_guid = plan.push_string(class_guid)?;
-        spec.class_guid_present = true;
+) -> Option<Vec<u8>> {
+    if binding.start_type > max_start || binding.start_type >= SERVICE_DISABLED {
+        return None;
     }
-    spec.class = class;
-    Some(spec)
+    registry_ascii_path(&binding.image_path)
 }
 
-fn inline_driver_launch_spec_header_shape_from_service_metadata(
-    service: &nt_config_manager::ServiceMetadata,
+fn current_driver_host_can_boot_launch_live(
+    binding: &nt_config_client::DriverServiceBinding,
+) -> bool {
+    match binding.class {
+        nt_config_client::DriverServiceClass::FileSystem => binding
+            .load_order_group
+            .as_deref()
+            .is_some_and(|group| group.eq_ignore_ascii_case(FILE_SYSTEM_LOAD_ORDER_GROUP)),
+        nt_config_client::DriverServiceClass::Device => {
+            binding.devnodes.is_empty()
+                && binding.load_order_group.as_deref().is_some_and(|group| {
+                    group.eq_ignore_ascii_case(nt_config_manager::NETWORK_WRAPPER_LOAD_ORDER_GROUP)
+                        || group.eq_ignore_ascii_case(
+                            nt_config_manager::NETWORK_PNP_TRANSPORT_LOAD_ORDER_GROUP,
+                        )
+                        || group.eq_ignore_ascii_case(
+                            nt_config_manager::NETWORK_TRANSPORT_LOAD_ORDER_GROUP,
+                        )
+                })
+        }
+    }
+}
+
+fn inline_driver_launch_spec_header_shape_from_live_binding(
+    binding: &nt_config_client::DriverServiceBinding,
     max_start: u32,
 ) -> Option<usize> {
-    let (image_path, _) = driver_launch_spec_from_service_metadata(service, max_start)?;
-    let driver_object_path = service.driver_object_path()?;
+    let image_path = live_config_driver_image_path(binding, max_start)?;
     let mut string_bytes = 0usize;
-    checked_add_plan_string(&mut string_bytes, &service.name)?;
-    checked_add_plan_string(&mut string_bytes, &driver_object_path)?;
+    checked_add_plan_string(&mut string_bytes, &binding.service_name)?;
+    checked_add_plan_string(&mut string_bytes, &binding.driver_object_path)?;
     checked_add_plan_bytes(&mut string_bytes, &image_path)?;
-    if let Some(class_guid) = service.class_guid.as_deref() {
+    if let Some(class_guid) = binding.class_guid.as_deref() {
         checked_add_plan_string(&mut string_bytes, class_guid)?;
     }
     Some(string_bytes)
 }
 
-fn inline_driver_launch_spec_from_service_metadata(
-    cm: &nt_config_manager::ConfigManager,
-    service: &nt_config_manager::ServiceMetadata,
+fn inline_driver_launch_spec_header_from_live_binding(
+    binding: &nt_config_client::DriverServiceBinding,
     max_start: u32,
     plan: &mut InlineDriverLaunchPlan,
 ) -> Option<InlineDriverLaunchSpec> {
-    let mut spec =
-        inline_driver_launch_spec_header_from_service_metadata(service, max_start, plan)?;
-    let (start, count) = append_inline_devnodes(cm, &service.name, plan)?;
-    spec.devnode_start = start;
-    spec.devnode_count = count;
+    let image_path = live_config_driver_image_path(binding, max_start)?;
+    let mut spec = InlineDriverLaunchSpec::empty();
+    spec.service_name = plan.push_string(&binding.service_name)?;
+    spec.driver_object_path = plan.push_string(&binding.driver_object_path)?;
+    spec.image_path = plan.push_string_bytes(&image_path)?;
+    if let Some(class_guid) = binding.class_guid.as_deref() {
+        spec.class_guid = plan.push_string(class_guid)?;
+        spec.class_guid_present = true;
+    }
+    spec.class = live_config_driver_class(binding.class);
     Some(spec)
 }
 
-fn inline_driver_launch_spec_from_pnp_binding(
-    cm: &nt_config_manager::ConfigManager,
-    binding: nt_config_manager::PnpDriverBinding,
+fn inline_devnode_shape_from_live_binding(
+    devnode: &nt_config_client::DriverServiceDevnode,
+) -> Option<InlineDriverDevnodePlanShape> {
+    let mut string_bytes = 0usize;
+    checked_add_plan_string(&mut string_bytes, &devnode.instance_id)?;
+    for value in [
+        devnode.pdo_name.as_deref(),
+        devnode.driver_key.as_deref(),
+        devnode.linkage_export.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        checked_add_plan_string(&mut string_bytes, value)?;
+    }
+    let hardware = count_inline_id_list(&devnode.hardware_ids)?;
+    let compatible = count_inline_id_list(&devnode.compatible_ids)?;
+    Some(InlineDriverDevnodePlanShape {
+        devnodes: 1,
+        ids: hardware.ids.checked_add(compatible.ids)?,
+        string_bytes: string_bytes
+            .checked_add(hardware.string_bytes)?
+            .checked_add(compatible.string_bytes)?,
+    })
+}
+
+fn count_inline_devnodes_from_live_binding(
+    devnodes: &[nt_config_client::DriverServiceDevnode],
+) -> Option<InlineDriverDevnodePlanShape> {
+    let mut shape = InlineDriverDevnodePlanShape::default();
+    for devnode in devnodes {
+        let devnode_shape = inline_devnode_shape_from_live_binding(devnode)?;
+        shape.devnodes = shape.devnodes.checked_add(devnode_shape.devnodes)?;
+        shape.ids = shape.ids.checked_add(devnode_shape.ids)?;
+        shape.string_bytes = shape.string_bytes.checked_add(devnode_shape.string_bytes)?;
+    }
+    Some(shape)
+}
+
+fn inline_devnode_from_live_binding(
+    devnode: &nt_config_client::DriverServiceDevnode,
+    plan: &mut InlineDriverLaunchPlan,
+) -> Option<InlineDriverDevnodeSpec> {
+    let mut dst = InlineDriverDevnodeSpec::empty();
+    dst.instance_id = plan.push_string(&devnode.instance_id)?;
+    if let Some(value) = devnode.pdo_name.as_deref() {
+        dst.pdo_name = plan.push_string(value)?;
+        dst.pdo_name_present = true;
+    }
+    if let Some(value) = devnode.driver_key.as_deref() {
+        dst.driver_key = plan.push_string(value)?;
+        dst.driver_key_present = true;
+    }
+    if let Some(value) = devnode.linkage_export.as_deref() {
+        dst.linkage_export = plan.push_string(value)?;
+        dst.linkage_export_present = true;
+    }
+    let (hardware_id_start, hardware_id_count) =
+        append_inline_id_list(&devnode.hardware_ids, plan)?;
+    let (compatible_id_start, compatible_id_count) =
+        append_inline_id_list(&devnode.compatible_ids, plan)?;
+    dst.hardware_id_start = hardware_id_start;
+    dst.hardware_id_count = hardware_id_count;
+    dst.compatible_id_start = compatible_id_start;
+    dst.compatible_id_count = compatible_id_count;
+    Some(dst)
+}
+
+fn inline_driver_launch_spec_from_live_binding(
+    binding: &nt_config_client::DriverServiceBinding,
     max_start: u32,
     plan: &mut InlineDriverLaunchPlan,
 ) -> Option<InlineDriverLaunchSpec> {
-    let mut spec =
-        inline_driver_launch_spec_header_from_service_metadata(&binding.service, max_start, plan)?;
-    let (start, count) = append_inline_devnodes_from_records(cm, &binding.devnodes, plan)?;
+    let mut spec = inline_driver_launch_spec_header_from_live_binding(binding, max_start, plan)?;
+    let start = plan.devnode_len();
+    for devnode in &binding.devnodes {
+        let devnode = inline_devnode_from_live_binding(devnode, plan)?;
+        if !plan.push_devnode(devnode) {
+            return None;
+        }
+    }
     spec.devnode_start = start;
-    spec.devnode_count = count;
-    (spec.devnode_count != 0).then_some(spec)
+    spec.devnode_count = binding.devnodes.len();
+    Some(spec)
 }
 
 fn boot_system_config_manager() -> Option<nt_config_manager::ConfigManager> {
@@ -19919,72 +19795,76 @@ fn mount_live_config_manager_config_hive() -> LiveConfigManagerMountReport {
     report
 }
 
-fn config_hive_boot_system_driver_launch_spec() -> Option<ConfigHiveDriverLaunchSpec> {
-    let cm = boot_system_config_manager()?;
-    let service = cm
-        .boot_system_driver_candidates()
-        .into_iter()
-        .find(|service| {
-            service.driver_service_class() == Some(DriverServiceClass::FileSystem)
-                && !current_driver_host_can_boot_launch(&cm, service)
-        })?;
-    let (image_path, class) =
-        driver_launch_spec_from_service_metadata(&service, SERVICE_SYSTEM_START)?;
-    let driver_object_path = service.driver_object_path()?;
+fn config_hive_boot_system_driver_launch_spec(
+    snapshot: &nt_config_client::DriverLaunchPlanSnapshot,
+) -> Option<ConfigHiveDriverLaunchSpec> {
+    let service = snapshot.bindings.iter().find(|binding| {
+        binding.class == nt_config_client::DriverServiceClass::FileSystem
+            && !current_driver_host_can_boot_launch_live(binding)
+    })?;
+    let image_path = live_config_driver_image_path(service, SERVICE_SYSTEM_START)?;
     Some(ConfigHiveDriverLaunchSpec {
-        service_name: service.name,
-        driver_object_path,
+        service_name: service.service_name.clone(),
+        driver_object_path: service.driver_object_path.clone(),
         image_path,
-        class,
+        class: live_config_driver_class(service.class),
     })
 }
 
-fn config_hive_pnp_driver_bindings_for_start(
-    cm: &nt_config_manager::ConfigManager,
-    start_type: u32,
-) -> Vec<nt_config_manager::PnpDriverBinding> {
-    if start_type == SERVICE_DEMAND_START {
-        cm.demand_start_pnp_driver_bindings()
-    } else {
-        cm.boot_system_pnp_driver_bindings()
-    }
+#[derive(Clone, Copy)]
+enum LiveDriverPlanProjection {
+    HostedBoot,
+    Pnp,
 }
 
-fn count_config_hive_pnp_driver_launch_shape(start_type: u32) -> InlineDriverLaunchPlanShape {
-    let heap_mark = allocator::mark();
-    let mut shape = InlineDriverLaunchPlanShape::default();
-    if let Some(cm) = boot_system_config_manager() {
-        for binding in config_hive_pnp_driver_bindings_for_start(&cm, start_type) {
-            if let Some(header_string_bytes) =
-                inline_driver_launch_spec_header_shape_from_service_metadata(
-                    &binding.service,
-                    start_type,
-                )
-            {
-                let devnodes = count_inline_devnodes_from_records(&cm, &binding.devnodes);
-                let Some(string_bytes) = header_string_bytes.checked_add(devnodes.string_bytes)
-                else {
-                    break;
-                };
-                if devnodes.devnodes != 0
-                    && !shape.add_spec(devnodes.devnodes, devnodes.ids, string_bytes)
-                {
-                    break;
-                }
-            }
+fn live_driver_binding_selected(
+    binding: &nt_config_client::DriverServiceBinding,
+    projection: LiveDriverPlanProjection,
+) -> bool {
+    match projection {
+        LiveDriverPlanProjection::HostedBoot => current_driver_host_can_boot_launch_live(binding),
+        LiveDriverPlanProjection::Pnp => {
+            binding.class == nt_config_client::DriverServiceClass::Device
+                && !binding.devnodes.is_empty()
         }
     }
-    unsafe { allocator::reset_to(heap_mark) };
-    shape
 }
 
-fn config_hive_pnp_driver_launch_plan_for_start(
-    start_type: u32,
+fn count_live_driver_launch_shape(
+    bindings: &[nt_config_client::DriverServiceBinding],
+    max_start: u32,
+    projection: LiveDriverPlanProjection,
+) -> Option<InlineDriverLaunchPlanShape> {
+    let mut shape = InlineDriverLaunchPlanShape::default();
+    for binding in bindings {
+        if !live_driver_binding_selected(binding, projection) {
+            continue;
+        }
+        let header = inline_driver_launch_spec_header_shape_from_live_binding(binding, max_start)?;
+        let devnodes = count_inline_devnodes_from_live_binding(&binding.devnodes)?;
+        let string_bytes = header.checked_add(devnodes.string_bytes)?;
+        shape
+            .add_spec(devnodes.devnodes, devnodes.ids, string_bytes)
+            .then_some(())?;
+    }
+    Some(shape)
+}
+
+fn live_driver_launch_plan(
+    snapshot: &nt_config_client::DriverLaunchPlanSnapshot,
+    max_start: u32,
+    projection: LiveDriverPlanProjection,
     plan: &'static mut InlineDriverLaunchPlan,
     label: &[u8],
 ) -> &'static InlineDriverLaunchPlan {
-    let required = count_config_hive_pnp_driver_launch_shape(start_type);
     plan.clear();
+    let Some(required) = count_live_driver_launch_shape(&snapshot.bindings, max_start, projection)
+    else {
+        print_str(b"[driver-launch] ");
+        print_str(label);
+        print_str(b" launch plan shape invalid\n");
+        return plan;
+    };
     if !plan.reserve_shape(required) {
         print_str(b"[driver-launch] ");
         print_str(label);
@@ -19999,35 +19879,13 @@ fn config_hive_pnp_driver_launch_plan_for_start(
         print_str(b"\n");
         return plan;
     }
-    let heap_mark = allocator::mark();
-    if let Some(cm) = boot_system_config_manager() {
-        for binding in config_hive_pnp_driver_bindings_for_start(&cm, start_type) {
-            if inline_driver_launch_spec_header_shape_from_service_metadata(
-                &binding.service,
-                start_type,
-            )
-            .is_none()
-            {
-                continue;
-            }
-            if let Some(spec) =
-                inline_driver_launch_spec_from_pnp_binding(&cm, binding, start_type, plan)
-            {
-                if !plan.push(spec) {
-                    print_str(b"[driver-launch] ");
-                    print_str(label);
-                    print_str(b" launch plan capacity raced specs=");
-                    print_u64(required.specs as u64);
-                    print_str(b" devnodes=");
-                    print_u64(required.devnodes as u64);
-                    print_str(b" ids=");
-                    print_u64(required.ids as u64);
-                    print_str(b" strings=");
-                    print_u64(required.string_bytes as u64);
-                    print_str(b"\n");
-                    break;
-                }
-            } else {
+    for binding in &snapshot.bindings {
+        if !live_driver_binding_selected(binding, projection) {
+            continue;
+        }
+        match inline_driver_launch_spec_from_live_binding(binding, max_start, plan) {
+            Some(spec) if plan.push(spec) => {}
+            _ => {
                 print_str(b"[driver-launch] ");
                 print_str(label);
                 print_str(b" launch plan fill failed specs=");
@@ -20043,21 +19901,28 @@ fn config_hive_pnp_driver_launch_plan_for_start(
             }
         }
     }
-    unsafe { allocator::reset_to(heap_mark) };
     plan
 }
 
-fn config_hive_boot_system_pnp_driver_launch_plan() -> &'static InlineDriverLaunchPlan {
-    config_hive_pnp_driver_launch_plan_for_start(
+fn config_hive_boot_system_pnp_driver_launch_plan(
+    snapshot: &nt_config_client::DriverLaunchPlanSnapshot,
+) -> &'static InlineDriverLaunchPlan {
+    live_driver_launch_plan(
+        snapshot,
         SERVICE_SYSTEM_START,
+        LiveDriverPlanProjection::Pnp,
         unsafe { config_boot_pnp_driver_plan_mut() },
         b"config boot/system PnP",
     )
 }
 
-fn config_hive_demand_pnp_driver_launch_plan() -> &'static InlineDriverLaunchPlan {
-    config_hive_pnp_driver_launch_plan_for_start(
+fn config_hive_demand_pnp_driver_launch_plan(
+    snapshot: &nt_config_client::DriverLaunchPlanSnapshot,
+) -> &'static InlineDriverLaunchPlan {
+    live_driver_launch_plan(
+        snapshot,
         SERVICE_DEMAND_START,
+        LiveDriverPlanProjection::Pnp,
         unsafe { config_demand_pnp_driver_plan_mut() },
         b"config demand PnP",
     )
@@ -20103,14 +19968,16 @@ fn copy_win32_service_launch_selection(
 }
 
 fn copy_driver_service_selection(
-    service: &nt_config_manager::DriverServiceLaunchSpec,
+    service: &nt_config_client::DriverServiceBinding,
     name: &mut InlineAscii<BOOT_DRIVER_SERVICE_NAME_MAX>,
     image_path: &mut InlineAscii<BOOT_DRIVER_IMAGE_PATH_MAX>,
 ) -> bool {
     name.set_str(&service.service_name) && image_path.set_str(&service.image_path)
 }
 
-fn system_hive_service_selection_report() -> InlineServiceSelectionReport {
+fn system_hive_service_selection_report(
+    demand_drivers: &nt_config_client::DriverLaunchPlanSnapshot,
+) -> InlineServiceSelectionReport {
     let heap_mark = allocator::mark();
     let mut report = InlineServiceSelectionReport::empty();
     if let Some(cm) = boot_system_config_manager() {
@@ -20141,119 +20008,32 @@ fn system_hive_service_selection_report() -> InlineServiceSelectionReport {
                 &mut report.demand_win32_interactive,
             );
         }
-
-        let demand_drivers = cm.demand_start_driver_launch_specs();
-        report.demand_driver_count = demand_drivers.len() as u64;
-        if let Some(service) = demand_drivers.first() {
-            let _ = copy_driver_service_selection(
-                service,
-                &mut report.demand_driver_name,
-                &mut report.demand_driver_image_path,
-            );
-            let _ = report
-                .demand_driver_object_path
-                .set_str(&service.driver_object_path);
-        }
+    }
+    report.demand_driver_count = demand_drivers.bindings.len() as u64;
+    if let Some(service) = demand_drivers.bindings.first() {
+        let _ = copy_driver_service_selection(
+            service,
+            &mut report.demand_driver_name,
+            &mut report.demand_driver_image_path,
+        );
+        let _ = report
+            .demand_driver_object_path
+            .set_str(&service.driver_object_path);
     }
     unsafe { allocator::reset_to(heap_mark) };
     report
 }
 
-fn count_system_hive_boot_driver_launch_shape() -> InlineDriverLaunchPlanShape {
-    let heap_mark = allocator::mark();
-    let mut shape = InlineDriverLaunchPlanShape::default();
-    if let Some(cm) = boot_system_config_manager() {
-        for service in cm.boot_system_driver_candidates() {
-            if !current_driver_host_can_boot_launch(&cm, &service) {
-                continue;
-            }
-            if let Some(header_string_bytes) =
-                inline_driver_launch_spec_header_shape_from_service_metadata(
-                    &service,
-                    SERVICE_SYSTEM_START,
-                )
-            {
-                let devnodes = count_inline_devnodes(&cm, &service.name);
-                let Some(string_bytes) = header_string_bytes.checked_add(devnodes.string_bytes)
-                else {
-                    break;
-                };
-                if !shape.add_spec(devnodes.devnodes, devnodes.ids, string_bytes) {
-                    break;
-                }
-            }
-        }
-    }
-    unsafe { allocator::reset_to(heap_mark) };
-    shape
-}
-
-fn system_hive_boot_driver_launch_plan() -> &'static InlineDriverLaunchPlan {
-    let required = count_system_hive_boot_driver_launch_shape();
-    let plan = unsafe { system_boot_driver_plan_mut() };
-    plan.clear();
-    if !plan.reserve_shape(required) {
-        print_str(b"[driver-launch] system boot driver launch plan reserve failed specs=");
-        print_u64(required.specs as u64);
-        print_str(b" devnodes=");
-        print_u64(required.devnodes as u64);
-        print_str(b" ids=");
-        print_u64(required.ids as u64);
-        print_str(b" strings=");
-        print_u64(required.string_bytes as u64);
-        print_str(b"\n");
-        return plan;
-    }
-    let heap_mark = allocator::mark();
-    if let Some(cm) = boot_system_config_manager() {
-        for service in cm.boot_system_driver_candidates() {
-            if !current_driver_host_can_boot_launch(&cm, &service) {
-                continue;
-            }
-            if inline_driver_launch_spec_header_shape_from_service_metadata(
-                &service,
-                SERVICE_SYSTEM_START,
-            )
-            .is_none()
-            {
-                continue;
-            }
-            if let Some(spec) = inline_driver_launch_spec_from_service_metadata(
-                &cm,
-                &service,
-                SERVICE_SYSTEM_START,
-                plan,
-            ) {
-                if !plan.push(spec) {
-                    print_str(
-                        b"[driver-launch] system boot driver launch plan capacity raced specs=",
-                    );
-                    print_u64(required.specs as u64);
-                    print_str(b" devnodes=");
-                    print_u64(required.devnodes as u64);
-                    print_str(b" ids=");
-                    print_u64(required.ids as u64);
-                    print_str(b" strings=");
-                    print_u64(required.string_bytes as u64);
-                    print_str(b"\n");
-                    break;
-                }
-            } else {
-                print_str(b"[driver-launch] system boot driver launch plan fill failed specs=");
-                print_u64(required.specs as u64);
-                print_str(b" devnodes=");
-                print_u64(required.devnodes as u64);
-                print_str(b" ids=");
-                print_u64(required.ids as u64);
-                print_str(b" strings=");
-                print_u64(required.string_bytes as u64);
-                print_str(b"\n");
-                break;
-            }
-        }
-    }
-    unsafe { allocator::reset_to(heap_mark) };
-    plan
+fn system_hive_boot_driver_launch_plan(
+    snapshot: &nt_config_client::DriverLaunchPlanSnapshot,
+) -> &'static InlineDriverLaunchPlan {
+    live_driver_launch_plan(
+        snapshot,
+        SERVICE_SYSTEM_START,
+        LiveDriverPlanProjection::HostedBoot,
+        unsafe { system_boot_driver_plan_mut() },
+        b"system hosted boot",
+    )
 }
 
 pub(crate) unsafe fn live_config_driver_service_launch_spec(
@@ -20319,9 +20099,8 @@ fn live_system_hive_value<'a>(
 }
 
 fn system_hive_nls_keyboard_layout_id(out: &mut [u8]) -> Option<usize> {
-    let key = live_system_hive_key(
-        r"\Registry\Machine\System\CurrentControlSet\Control\Nls\Language",
-    )?;
+    let key =
+        live_system_hive_key(r"\Registry\Machine\System\CurrentControlSet\Control\Nls\Language")?;
     let value = live_system_hive_value(&key, "Default")?;
     registry_layout_id_from_value(&value.data, out)
 }
@@ -20714,9 +20493,7 @@ fn is_numbered_control_set_component(component: &str) -> bool {
     let bytes = component.as_bytes();
     bytes.len() == b"ControlSet000".len()
         && bytes[..b"ControlSet".len()].eq_ignore_ascii_case(b"ControlSet")
-        && bytes[b"ControlSet".len()..]
-            .iter()
-            .all(u8::is_ascii_digit)
+        && bytes[b"ControlSet".len()..].iter().all(u8::is_ascii_digit)
 }
 /// True if `comps` (backslash-split, no `\Registry\Machine` prefix) name the Winlogon key
 /// `Software\Microsoft\Windows NT\CurrentVersion\Winlogon`. Matched EXACTLY (5 components, in order)
@@ -21307,14 +21084,13 @@ impl PendingWaitTimeout {
     fn deadline_at_park(self) -> Option<u64> {
         let now = monotonic_time_100ns();
         if self.specified {
-            Some(match nt_delay_execution::due_time(
-                self.interval_100ns,
-                now,
-                nt_system_time_100ns(),
-            ) {
-                nt_delay_execution::Due::Immediate => now,
-                nt_delay_execution::Due::Monotonic100ns(deadline) => deadline,
-            })
+            Some(
+                match nt_delay_execution::due_time(self.interval_100ns, now, nt_system_time_100ns())
+                {
+                    nt_delay_execution::Due::Immediate => now,
+                    nt_delay_execution::Due::Monotonic100ns(deadline) => deadline,
+                },
+            )
         } else {
             None
         }
@@ -21560,19 +21336,14 @@ struct ExecNtHandler {
     /// Demand-start `NtLoadDriver` batches. The handler reserves a generation-exact slot before
     /// DriverEntry/AddDevice/START side effects, and the service loop attaches the live syscall
     /// Reply object only when an exact START IRP remains pending.
-    pending_driver_loads:
-        nt_driver_start::PendingDriverStartTable<PendingDriverStart>,
+    pending_driver_loads: nt_driver_start::PendingDriverStartTable<PendingDriverStart>,
     boot_driver_start_reports: BootDriverStartReports,
-    pending_driver_load_transfer: Option<(
-        OwnedHostedPnpStartBatch,
-        nt_driver_start::Reservation,
-    )>,
+    pending_driver_load_transfer: Option<(OwnedHostedPnpStartBatch, nt_driver_start::Reservation)>,
     /// Contended synchronous File acquisition transferred into the FIFO owner at the reply site.
     pending_synchronous_file_wait: Option<nt_io_manager::SynchronousFileWaiter>,
     /// Final-handle `NtClose` continuation reserved before removing the process handle. File Busy
     /// ordering and CLEANUP/CLOSE ownership remain in their canonical policy/manager tables.
-    pending_file_cleanup_wait:
-        Option<(u64, nt_io_manager::PendingFileCleanupWaitReservation)>,
+    pending_file_cleanup_wait: Option<(u64, nt_io_manager::PendingFileCleanupWaitReservation)>,
     /// `NtCancelIoFile` continuation reserved before cancellation and transferred into its drain
     /// table only at the reply-capability park site.
     pending_file_irp_drain: Option<(
@@ -21761,31 +21532,30 @@ unsafe fn launch_boot_driver_service(
         trace: options.trace,
         pci: inline_launch_spec_has_pci_devnode(plan.devnodes_for(spec)),
     };
-    let prepared_start = if spec.class == driver_launch::DriverClass::Device
-        && spec.devnode_count != 0
-    {
-        let owned = match owned_driver_launch_spec_from_inline(spec, plan) {
-            Some(owned) => owned,
-            None => {
-                print_str(b"[driver-launch] boot START ownership allocation failed service=");
-                print_str(spec.service_name.as_bytes());
-                print_str(b"\n");
-                return None;
-            }
+    let prepared_start =
+        if spec.class == driver_launch::DriverClass::Device && spec.devnode_count != 0 {
+            let owned = match owned_driver_launch_spec_from_inline(spec, plan) {
+                Some(owned) => owned,
+                None => {
+                    print_str(b"[driver-launch] boot START ownership allocation failed service=");
+                    print_str(spec.service_name.as_bytes());
+                    print_str(b"\n");
+                    return None;
+                }
+            };
+            let reservation = match driver_starts.pending.reserve() {
+                Ok(reservation) => reservation,
+                Err(_) => {
+                    print_str(b"[driver-launch] boot START continuation reserve failed service=");
+                    print_str(spec.service_name.as_bytes());
+                    print_str(b"\n");
+                    return None;
+                }
+            };
+            Some((owned, reservation))
+        } else {
+            None
         };
-        let reservation = match driver_starts.pending.reserve() {
-            Ok(reservation) => reservation,
-            Err(_) => {
-                print_str(b"[driver-launch] boot START continuation reserve failed service=");
-                print_str(spec.service_name.as_bytes());
-                print_str(b"\n");
-                return None;
-            }
-        };
-        Some((owned, reservation))
-    } else {
-        None
-    };
     let Some(dc) = load_driver(
         fs,
         spec.image_path.as_bytes(),
@@ -21976,9 +21746,7 @@ fn report_deferred_generic_hardware_checks(
     );
     check(
         b"exec_generic_pci_add_device_reached",
-        pci_report.add_device
-            && pci_selected != 0
-            && pci_report.add_device_count == pci_selected,
+        pci_report.add_device && pci_selected != 0 && pci_report.add_device_count == pci_selected,
         passed,
     );
     check(
@@ -21996,9 +21764,7 @@ fn report_deferred_generic_hardware_checks(
     );
     check(
         b"exec_generic_hw_interrupt_delivered",
-        report.interrupt_connected
-            && report.interrupt_delivered
-            && report.interrupt_acknowledged,
+        report.interrupt_connected && report.interrupt_delivered && report.interrupt_acknowledged,
         passed,
     );
     check(
@@ -22284,10 +22050,7 @@ impl ExecFileCompletion {
         unsafe { (&mut *self.table).release_io(file_id, tid) }
     }
 
-    fn release_cleanup_io(
-        &mut self,
-        file_id: u64,
-    ) -> Result<nt_io_completion::FileIoRelease, u32> {
+    fn release_cleanup_io(&mut self, file_id: u64) -> Result<nt_io_completion::FileIoRelease, u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe { (&mut *self.table).release_cleanup_io(file_id) }
     }
@@ -25876,7 +25639,7 @@ unsafe fn ahci_read_sectors(
         pw(0x04, (dma_paddr >> 32) as u32); // PxCLBU
         pw(0x08, (dma_paddr + 0x400) as u32); // PxFB (FIS rx @ +0x400)
         pw(0x0C, ((dma_paddr + 0x400) >> 32) as u32); // PxFBU
-                                            // Start FRE, then ST.
+                                                      // Start FRE, then ST.
         pw(0x18, pr(0x18) | PX_CMD_FRE);
         core::hint::spin_loop();
         pw(0x18, pr(0x18) | PX_CMD_ST);
@@ -25907,7 +25670,10 @@ unsafe fn ahci_read_sectors(
     // Command Header slot 0 @ dma+0. DW0 = CFL(5) | PRDTL(1)<<16; CTBA @ +8.
     core::ptr::write_volatile(dma_vaddr as *mut u32, 5 | (1u32 << 16));
     core::ptr::write_volatile((dma_vaddr + 8) as *mut u32, (dma_paddr + 0x500) as u32); // CTBA
-    core::ptr::write_volatile((dma_vaddr + 12) as *mut u32, ((dma_paddr + 0x500) >> 32) as u32); // CTBAU
+    core::ptr::write_volatile(
+        (dma_vaddr + 12) as *mut u32,
+        ((dma_paddr + 0x500) >> 32) as u32,
+    ); // CTBAU
 
     // Issue command slot 0 (PxCI bit 0) + poll for completion.
     pw(0x38, 1);
@@ -26000,7 +25766,10 @@ unsafe fn ahci_write_sectors(
     // Command Header slot 0: CFL(5) | W(1)<<6 | PRDTL(1)<<16.
     core::ptr::write_volatile(dma_vaddr as *mut u32, 5 | (1u32 << 6) | (1u32 << 16));
     core::ptr::write_volatile((dma_vaddr + 8) as *mut u32, (dma_paddr + 0x500) as u32);
-    core::ptr::write_volatile((dma_vaddr + 12) as *mut u32, ((dma_paddr + 0x500) >> 32) as u32);
+    core::ptr::write_volatile(
+        (dma_vaddr + 12) as *mut u32,
+        ((dma_paddr + 0x500) >> 32) as u32,
+    );
 
     pw(0x38, 1);
     for _ in 0..5_000_000u64 {
@@ -27189,35 +26958,35 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_u64(pre_hive_nic_irq as u64);
                 print_str(b")\n");
                 let (dma_grant, dma_iommu) = allocate_mapped_hosted_pci_dma_grant(device);
-                    print_str(b"[driver-launch] pre-storage hosted PCI DMA mint=");
-                    print_u64(dma_iommu.mint_err);
-                    print_str(b" iopt=");
-                    print_u64(dma_iommu.iopt_err);
-                    print_str(b" map=");
-                    print_u64(dma_iommu.map_io_err);
-                    print_str(b"\n");
-                    if let Some(dma_grant) = dma_grant {
-                        hosted_pci_dma_grants += 1;
-                        if let Some(interrupt_vector) = hosted_pci_interrupt_vector(device) {
-                            if let Some(grant) = HostedPciHardwareGrant::for_device(
-                                device,
-                                memory,
-                                interrupt_vector,
-                                false,
-                                Some(dma_grant),
-                            ) {
-                                hosted_pci_hardware_grants.push(grant);
-                                hosted_pci_existing_grants += 1;
-                            } else {
-                                hosted_pci_existing_grant_failures += 1;
-                            }
+                print_str(b"[driver-launch] pre-storage hosted PCI DMA mint=");
+                print_u64(dma_iommu.mint_err);
+                print_str(b" iopt=");
+                print_u64(dma_iommu.iopt_err);
+                print_str(b" map=");
+                print_u64(dma_iommu.map_io_err);
+                print_str(b"\n");
+                if let Some(dma_grant) = dma_grant {
+                    hosted_pci_dma_grants += 1;
+                    if let Some(interrupt_vector) = hosted_pci_interrupt_vector(device) {
+                        if let Some(grant) = HostedPciHardwareGrant::for_device(
+                            device,
+                            memory,
+                            interrupt_vector,
+                            false,
+                            Some(dma_grant),
+                        ) {
+                            hosted_pci_hardware_grants.push(grant);
+                            hosted_pci_existing_grants += 1;
                         } else {
                             hosted_pci_existing_grant_failures += 1;
                         }
                     } else {
-                        hosted_pci_dma_grant_failures += 1;
                         hosted_pci_existing_grant_failures += 1;
                     }
+                } else {
+                    hosted_pci_dma_grant_failures += 1;
+                    hosted_pci_existing_grant_failures += 1;
+                }
             } else {
                 hosted_pci_existing_grant_failures += 1;
             }
@@ -27855,8 +27624,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         }
     }
 
-    let boot_system = prepare_boot_system_hive_image()
-        .expect("restore and compose the boot SYSTEM authority");
+    let boot_system =
+        prepare_boot_system_hive_image().expect("restore and compose the boot SYSTEM authority");
     print_str(b"[cm-compose] origin=");
     print_str(match boot_system.origin {
         nt_hive_regf::BootSystemHiveOrigin::InstalledRegf => b"installed-regf",
@@ -28164,21 +27933,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 NLS_OEM_SIZE.load(Ordering::Relaxed) as usize,
                 NLS_CASE_SIZE.load(Ordering::Relaxed) as usize,
             ];
-            let entry_rva = match win32k_subsystem::load_into(
-                WIN32KBUF_VADDR,
-                win32k_size,
-                nls_sizes,
-            ) {
-                Some(entry_rva) => {
-                    let _ = register_system_module(
-                        b"reactos\\system32\\win32k.sys",
-                        win32k_subsystem::WIN32K_CODE_VA,
-                        win32k_pe::WIN32K_PE.size_of_image,
-                    );
-                    entry_rva
-                }
-                None => panic!("win32k image rejected by its native load contract"),
-            };
+            let entry_rva =
+                match win32k_subsystem::load_into(WIN32KBUF_VADDR, win32k_size, nls_sizes) {
+                    Some(entry_rva) => {
+                        let _ = register_system_module(
+                            b"reactos\\system32\\win32k.sys",
+                            win32k_subsystem::WIN32K_CODE_VA,
+                            win32k_pe::WIN32K_PE.size_of_image,
+                        );
+                        entry_rva
+                    }
+                    None => panic!("win32k image rejected by its native load contract"),
+                };
             print_str(b"[win32k-svc] loaded win32k.sys; DriverEntry rva=0x");
             print_hex(entry_rva);
             print_str(b"\n");
@@ -28776,22 +28542,28 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         }
     }
 
-    let system_boot_driver_plan = system_hive_boot_driver_launch_plan();
-    let config_pnp_plan = config_hive_boot_system_pnp_driver_launch_plan();
-    let config_demand_pnp_plan = config_hive_demand_pnp_driver_launch_plan();
+    let boot_driver_snapshot = config_manager_query_driver_launch_plan(
+        nt_config_abi::launch_plan_kind::BOOT_SYSTEM_DRIVERS,
+    )
+    .expect("query live boot/system driver launch plan");
+    let demand_driver_snapshot =
+        config_manager_query_driver_launch_plan(nt_config_abi::launch_plan_kind::DEMAND_DRIVERS)
+            .expect("query live demand driver launch plan");
+    let proof_driver_spec = config_hive_boot_system_driver_launch_spec(&boot_driver_snapshot);
+    let system_boot_driver_plan = system_hive_boot_driver_launch_plan(&boot_driver_snapshot);
+    let config_pnp_plan = config_hive_boot_system_pnp_driver_launch_plan(&boot_driver_snapshot);
+    let config_demand_pnp_plan = config_hive_demand_pnp_driver_launch_plan(&demand_driver_snapshot);
     let replyless_device_service_count = system_boot_driver_plan
         .as_slice()
         .iter()
         .chain(config_pnp_plan.as_slice())
         .chain(config_demand_pnp_plan.as_slice())
-        .filter(|spec| {
-            spec.class == driver_launch::DriverClass::Device && spec.devnode_count != 0
-        })
+        .filter(|spec| spec.class == driver_launch::DriverClass::Device && spec.devnode_count != 0)
         .count();
     let mut driver_start_bootstrap = DriverStartBootstrap::with_capacity(
         PENDING_DRIVER_LOAD_INITIAL_CAPACITY.saturating_add(replyless_device_service_count),
     );
-    let scm_service_selection = system_hive_service_selection_report();
+    let scm_service_selection = system_hive_service_selection_report(&demand_driver_snapshot);
     print_str(b"[scm-select] auto-win32 count=");
     print_u64(scm_service_selection.auto_win32_count);
     print_str(b" first=");
@@ -29058,12 +28830,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     })
                     .and_then(|file_id| {
                         match driver_launch::dispatch_hosted_file_irp_result_exact(
-                            file_id,
-                            1, /* IRP_MJ_CREATE_NAMED_PIPE */
-                            0,
-                            0,
-                            &name16,
-                            &mut out,
+                            file_id, 1, /* IRP_MJ_CREATE_NAMED_PIPE */
+                            0, 0, &name16, &mut out,
                         ) {
                             Ok((status, information, _, context)) => {
                                 Some((status, information, file_id, context.unwrap_or(0)))
@@ -29108,12 +28876,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         })
                         .and_then(|file_id| {
                             match driver_launch::dispatch_hosted_file_irp_result_exact(
-                                file_id,
-                                0, /* IRP_MJ_CREATE */
-                                0,
-                                0,
-                                &name16,
-                                &mut cout,
+                                file_id, 0, /* IRP_MJ_CREATE */
+                                0, 0, &name16, &mut cout,
                             ) {
                                 Ok((status, information, _, context)) => {
                                     Some((status, information, file_id, context.unwrap_or(0)))
@@ -29474,7 +29238,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             // STATUS_BUFFER_OVERFLOW + 16 bytes and queue the 32-byte remainder.
                             let mut hdr_in = [0u8; 16];
                             let hdr_pend = driver_launch::npfs_dispatch_irp_exact(
-                                3, /* READ */ 0, cli_fid, &[], &mut hdr_in,
+                                3,
+                                /* READ */ 0,
+                                cli_fid,
+                                &[],
+                                &mut hdr_in,
                             );
                             let hdr_pended = matches!(
                                 hdr_pend,
@@ -29533,7 +29301,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                         == 0,
                                 &mut passed,
                             );
-
 
                             // ★ C-i: THE RESULT A DISPATCH RETURNS IS ITS OWN — the behavioural leg
                             // of `exec_irp_transport_call_bound`. Run three IRPs whose results are
@@ -29612,7 +29379,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         // then proves load -> DriverEntry -> unload -> object teardown without probing a compiled-in
         // service identity. This driver creates no DEVICE_OBJECT, so it must not receive a fabricated
         // CREATE request merely to exercise the transport.
-        let proof_driver_spec = config_hive_boot_system_driver_launch_spec();
         if let Some(proof_driver_spec) = proof_driver_spec {
             print_str(b"[driver-launch] launching service ");
             print_str(proof_driver_spec.service_name.as_bytes());
@@ -29911,34 +29677,28 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             generic_hw_dma_device_model_failure_count
                                 .saturating_add(start_report.dma_device_model_failure_count);
                         generic_hw_dma_tx_window_observation_count =
-                            generic_hw_dma_tx_window_observation_count.saturating_add(
-                                start_report.dma_tx_window_observation_count,
-                            );
+                            generic_hw_dma_tx_window_observation_count
+                                .saturating_add(start_report.dma_tx_window_observation_count);
                         generic_hw_dma_tx_window_enabled_count =
                             generic_hw_dma_tx_window_enabled_count
                                 .saturating_add(start_report.dma_tx_window_enabled_count);
                         generic_hw_dma_tx_window_ring_ready_count =
-                            generic_hw_dma_tx_window_ring_ready_count.saturating_add(
-                                start_report.dma_tx_window_ring_ready_count,
-                            );
+                            generic_hw_dma_tx_window_ring_ready_count
+                                .saturating_add(start_report.dma_tx_window_ring_ready_count);
                         generic_hw_dma_tx_window_posted_count =
                             generic_hw_dma_tx_window_posted_count
                                 .saturating_add(start_report.dma_tx_window_posted_count);
-                        generic_hw_dma_tx_window_idle_count =
-                            generic_hw_dma_tx_window_idle_count
-                                .saturating_add(start_report.dma_tx_window_idle_count);
+                        generic_hw_dma_tx_window_idle_count = generic_hw_dma_tx_window_idle_count
+                            .saturating_add(start_report.dma_tx_window_idle_count);
                         generic_hw_dma_tx_descriptor_candidate_count =
-                            generic_hw_dma_tx_descriptor_candidate_count.saturating_add(
-                                start_report.dma_tx_descriptor_candidate_count,
-                            );
+                            generic_hw_dma_tx_descriptor_candidate_count
+                                .saturating_add(start_report.dma_tx_descriptor_candidate_count);
                         generic_hw_dma_tx_descriptor_map_candidate_count =
-                            generic_hw_dma_tx_descriptor_map_candidate_count.saturating_add(
-                                start_report.dma_tx_descriptor_map_candidate_count,
-                            );
+                            generic_hw_dma_tx_descriptor_map_candidate_count
+                                .saturating_add(start_report.dma_tx_descriptor_map_candidate_count);
                         generic_hw_dma_tx_descriptor_done_seen_count =
-                            generic_hw_dma_tx_descriptor_done_seen_count.saturating_add(
-                                start_report.dma_tx_descriptor_done_seen_count,
-                            );
+                            generic_hw_dma_tx_descriptor_done_seen_count
+                                .saturating_add(start_report.dma_tx_descriptor_done_seen_count);
                         if start_report.dma_tx_descriptor_candidate_count != 0
                             || start_report.dma_tx_descriptor_done_seen_count != 0
                         {
@@ -30078,9 +29838,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let provider_sharing = driver_launch::hosted_provider_sharing_evidence();
     if !generic_hw_gates_deferred
         && (provider_sharing.primary_services != 0
-        || provider_sharing.private_dependencies != 0
-        || provider_sharing.singleton_providers != 0
-        || provider_sharing.provider_domain_bindings != 0)
+            || provider_sharing.private_dependencies != 0
+            || provider_sharing.singleton_providers != 0
+            || provider_sharing.provider_domain_bindings != 0)
     {
         print_str(b"[driver-launch] hosted provider sharing primary=");
         print_u64(provider_sharing.primary_services);
@@ -30148,106 +29908,109 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         check(
             b"exec_generic_hw_registry_selected",
             generic_hw_registry_selected
-            && generic_hw_driver_loaded
-            && generic_hw_add_device
-            && generic_hw_attempted == generic_hw_selected
-            && generic_hw_add_device_count == generic_hw_selected,
+                && generic_hw_driver_loaded
+                && generic_hw_add_device
+                && generic_hw_attempted == generic_hw_selected
+                && generic_hw_add_device_count == generic_hw_selected,
             &mut passed,
         );
-    check(
-        b"exec_generic_pnp_starts_terminal",
-        generic_hw_attempted != 0
-            && generic_hw_terminal == generic_hw_attempted
-            && generic_hw_started + generic_hw_failed == generic_hw_terminal
-            && generic_hw_pending == 0
-            && generic_hw_indeterminate == 0
-            && generic_hw_first_indeterminate == 0,
-        &mut passed,
-    );
-    check(
-        b"exec_generic_pnp_pending_starts_observed",
-        generic_hw_pending_observed >= 2,
-        &mut passed,
-    );
-    check(
-        b"exec_generic_hw_mmio_interrupt_dma",
-        generic_hw_granted
-            && generic_hw_mmio_mapped
-            && generic_hw_interrupt_connected
-            && generic_hw_dma_adapter
-            && generic_hw_dma_common,
-        &mut passed,
-    );
-    check(
-        b"exec_generic_hw_root_pdo_started",
-        generic_root_attempted != 0
-            && generic_root_started == generic_root_attempted
-            && generic_hw_start_ok
-            && generic_hw_root_started,
-        &mut passed,
-    );
-    check(
-        b"exec_generic_pci_registry_selected",
-        generic_pci_registry_selected && generic_pci_selected != 0,
-        &mut passed,
-    );
-    check(
-        b"exec_generic_pci_provider_domain_serviced",
-        generic_pci_provider_domain_bound
-            && generic_pci_provider_export_requests != 0
-            && generic_pci_provider_export_completions != 0
-            && generic_pci_provider_export_rejections == 0,
-        &mut passed,
-    );
-    let provider_legacy_receive_ok = provider_sharing.provider_protocol_receive_requests != 0
-        && provider_sharing.provider_protocol_receive_requests
-            == provider_sharing.provider_protocol_receive_completions
-        && provider_sharing.provider_protocol_receive_complete_requests != 0
-        && provider_sharing.provider_protocol_receive_complete_requests
-            == provider_sharing.provider_protocol_receive_complete_completions;
-    let provider_packet_receive_ok = provider_sharing.provider_protocol_receive_packet_requests != 0
-        && provider_sharing.provider_protocol_receive_packet_requests
-            == provider_sharing.provider_protocol_receive_packet_completions;
-    let provider_packet_array_receive_ok =
-        provider_sharing.provider_packet_array_export_requests != 0
+        check(
+            b"exec_generic_pnp_starts_terminal",
+            generic_hw_attempted != 0
+                && generic_hw_terminal == generic_hw_attempted
+                && generic_hw_started + generic_hw_failed == generic_hw_terminal
+                && generic_hw_pending == 0
+                && generic_hw_indeterminate == 0
+                && generic_hw_first_indeterminate == 0,
+            &mut passed,
+        );
+        check(
+            b"exec_generic_pnp_pending_starts_observed",
+            generic_hw_pending_observed >= 2,
+            &mut passed,
+        );
+        check(
+            b"exec_generic_hw_mmio_interrupt_dma",
+            generic_hw_granted
+                && generic_hw_mmio_mapped
+                && generic_hw_interrupt_connected
+                && generic_hw_dma_adapter
+                && generic_hw_dma_common,
+            &mut passed,
+        );
+        check(
+            b"exec_generic_hw_root_pdo_started",
+            generic_root_attempted != 0
+                && generic_root_started == generic_root_attempted
+                && generic_hw_start_ok
+                && generic_hw_root_started,
+            &mut passed,
+        );
+        check(
+            b"exec_generic_pci_registry_selected",
+            generic_pci_registry_selected && generic_pci_selected != 0,
+            &mut passed,
+        );
+        check(
+            b"exec_generic_pci_provider_domain_serviced",
+            generic_pci_provider_domain_bound
+                && generic_pci_provider_export_requests != 0
+                && generic_pci_provider_export_completions != 0
+                && generic_pci_provider_export_rejections == 0,
+            &mut passed,
+        );
+        let provider_legacy_receive_ok = provider_sharing.provider_protocol_receive_requests != 0
+            && provider_sharing.provider_protocol_receive_requests
+                == provider_sharing.provider_protocol_receive_completions
+            && provider_sharing.provider_protocol_receive_complete_requests != 0
+            && provider_sharing.provider_protocol_receive_complete_requests
+                == provider_sharing.provider_protocol_receive_complete_completions;
+        let provider_packet_receive_ok = provider_sharing.provider_protocol_receive_packet_requests
+            != 0
+            && provider_sharing.provider_protocol_receive_packet_requests
+                == provider_sharing.provider_protocol_receive_packet_completions;
+        let provider_packet_array_receive_ok = provider_sharing
+            .provider_packet_array_export_requests
+            != 0
             && provider_sharing.provider_packet_array_export_requests
                 == provider_sharing.provider_packet_array_export_completions
             && ((provider_sharing.provider_packet_array_protocol_receive_packet_requests != 0
                 && provider_sharing.provider_packet_array_protocol_receive_packet_requests
-                    == provider_sharing
-                        .provider_packet_array_protocol_receive_packet_completions)
+                    == provider_sharing.provider_packet_array_protocol_receive_packet_completions)
                 || (provider_sharing.provider_packet_array_protocol_receive_requests != 0
                     && provider_sharing.provider_packet_array_protocol_receive_requests
                         == provider_sharing.provider_packet_array_protocol_receive_completions));
-    check(
-        b"exec_provider_ndis_receive_indicated",
-        provider_legacy_receive_ok || provider_packet_receive_ok || provider_packet_array_receive_ok,
-        &mut passed,
-    );
-    check(
-        b"exec_generic_pci_add_device_reached",
-        generic_pci_add_device
-            && generic_pci_selected != 0
-            && generic_pci_add_device_count == generic_pci_selected,
-        &mut passed,
-    );
-    check(
-        b"exec_generic_pci_resource_accessed",
-        generic_pci_registry_selected && generic_pci_resource_accessed,
-        &mut passed,
-    );
-    check(
-        b"exec_generic_hw_interrupt_delivered",
-        generic_hw_interrupt_connected
-            && generic_hw_interrupt_delivered
-            && generic_hw_interrupt_acknowledged,
-        &mut passed,
-    );
-    check(
-        b"exec_generic_hw_dpc_delivered",
-        generic_hw_interrupt_delivered && generic_hw_dpc_delivered,
-        &mut passed,
-    );
+        check(
+            b"exec_provider_ndis_receive_indicated",
+            provider_legacy_receive_ok
+                || provider_packet_receive_ok
+                || provider_packet_array_receive_ok,
+            &mut passed,
+        );
+        check(
+            b"exec_generic_pci_add_device_reached",
+            generic_pci_add_device
+                && generic_pci_selected != 0
+                && generic_pci_add_device_count == generic_pci_selected,
+            &mut passed,
+        );
+        check(
+            b"exec_generic_pci_resource_accessed",
+            generic_pci_registry_selected && generic_pci_resource_accessed,
+            &mut passed,
+        );
+        check(
+            b"exec_generic_hw_interrupt_delivered",
+            generic_hw_interrupt_connected
+                && generic_hw_interrupt_delivered
+                && generic_hw_interrupt_acknowledged,
+            &mut passed,
+        );
+        check(
+            b"exec_generic_hw_dpc_delivered",
+            generic_hw_interrupt_delivered && generic_hw_dpc_delivered,
+            &mut passed,
+        );
         check(
             b"exec_generic_hw_dma_packet_descriptors",
             generic_hw_dma_common && generic_hw_dma_packet_descriptors,
