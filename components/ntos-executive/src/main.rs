@@ -159,7 +159,7 @@ pub const CM_REQ_VADDR: u64 = 0x0000_0100_1056_0000;
 pub const CM_REP_VADDR: u64 = 0x0000_0100_1057_0000;
 /// CM atomically owns the encoded SYSTEM image, decoded hive, semantic indexes, and runtime
 /// transaction snapshots. Other isolated services retain the default 512 KiB profile.
-pub const CONFIG_MANAGER_SERVICE_HEAP_FRAMES: u64 = allocator::HEAP_FRAMES;
+pub const CONFIG_MANAGER_SERVICE_HEAP_FRAMES: u64 = 4096;
 const _: () = assert!(CONFIG_MANAGER_SERVICE_HEAP_FRAMES <= allocator::HEAP_FRAMES);
 // A THIRD ring set — the executive's side of the I/O Manager service.
 pub const IO_SUB_VADDR: u64 = 0x0000_0100_1058_0000;
@@ -293,13 +293,13 @@ pub const USERINIT_ENV_SCRATCH_VA: u64 = 0x0000_0100_1490_0000;
 pub const USERINIT_HEAP_MIRROR_VA: u64 = 0x0000_0100_14A0_0000;
 pub const USERINIT_IMAGE_MIRROR_VA: u64 = 0x0000_0100_14C0_0000;
 /// The 7th hosted process — explorer.exe, launched by userinit's StartShell. Its image is at
-/// `\SystemRoot\explorer.exe` (root of the ReactOS tree, not System32). The 0x3900 scratch window is
-/// the next 64 MiB demand-fill lane after userinit; mirrors start immediately after it.
+/// `\SystemRoot\explorer.exe` (root of the ReactOS tree, not System32). Its scratch window is the
+/// next 64 MiB demand-fill lane after userinit; mirrors start immediately after it.
 pub const EXPLORER_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + 6 * DEMAND_SCRATCH_WINDOW;
-pub const EXPLORER_STACK_MIRROR_VA: u64 = 0x0000_0100_3D00_0000;
-pub const EXPLORER_ENV_SCRATCH_VA: u64 = 0x0000_0100_3D10_0000;
-pub const EXPLORER_HEAP_MIRROR_VA: u64 = 0x0000_0100_3D20_0000;
-pub const EXPLORER_IMAGE_MIRROR_VA: u64 = 0x0000_0100_3D40_0000;
+pub const EXPLORER_STACK_MIRROR_VA: u64 = EXPLORER_SCRATCH_BASE + DEMAND_SCRATCH_WINDOW;
+pub const EXPLORER_ENV_SCRATCH_VA: u64 = EXPLORER_STACK_MIRROR_VA + 0x10_0000;
+pub const EXPLORER_HEAP_MIRROR_VA: u64 = EXPLORER_STACK_MIRROR_VA + 0x20_0000;
+pub const EXPLORER_IMAGE_MIRROR_VA: u64 = EXPLORER_STACK_MIRROR_VA + 0x40_0000;
 const _: () = {
     assert!(USERINIT_STACK_MIRROR_VA & 0x1f_ffff == 0);
     assert!(USERINIT_ENV_SCRATCH_VA >= USERINIT_STACK_MIRROR_VA + STACK_FRAMES * 0x1000);
@@ -1333,11 +1333,11 @@ pub const CSRSS_BADGE: u64 = 2;
 // executive mappings (POOL_VADDR 0x1500, SRVBUF 0x1400, win32k pools 0x0A00 — all far below
 // 0x2000). Their page tables are mapped per-window at spawn (see `map_demand_scratch_pts`).
 pub const DEMAND_SCRATCH_WINDOW: u64 = 0x0400_0000; // 64 MiB per process
-                                                    // Base sits PAST the executive's own heap (`allocator::HEAP_BASE` = 0x2000_0000, 2 MiB) and every
-                                                    // other executive mapping, and the 7 × 64 MiB windows (→ 0x3D00_0000) stay inside the first 1 GiB
-                                                    // page directory (0..0x4000_0000, already present — the heap + old scratch PTs live in it), so
-                                                    // `map_demand_scratch_pts` needs to create only PTs, not a fresh PD/PDPT.
-pub const SMSS_SCRATCH_BASE: u64 = 0x0000_0100_2100_0000;
+                                                    // The static-process lanes begin exactly after the executive's runtime-mapped heap and the 7 ×
+                                                    // 64 MiB windows remain below PRIVATE_VM_LIMIT. `ensure_executive_paging` builds every missing
+                                                    // paging level, so this layout does not depend on boot-image page tables.
+pub const SMSS_SCRATCH_BASE: u64 = allocator::HEAP_BASE as u64 + allocator::HEAP_FRAMES * 0x1000;
+const _: () = assert!(SMSS_SCRATCH_BASE & 0x1f_ffff == 0);
 /// csrss's demand-fault scratch window (own 64 MiB, PTs mapped at spawn).
 pub const CSRSS_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + DEMAND_SCRATCH_WINDOW;
 /// Fault-endpoint badge for the THIRD hosted process (winlogon). Distinct from smss (0) + csrss (2).
@@ -6126,10 +6126,24 @@ unsafe fn software_hive_mount_spec(passed: &mut u64) {
 /// SUCCEEDS against a real file system — see `exec_writable_overlay_mounted` +
 /// `exec_winlogon_profile_directories_created`, which carry that claim. Later gates now own the
 /// userinit/explorer spawn frontier.
-fn winlogon_profile_directory_spec(passed: &mut u64) {
+unsafe fn winlogon_profile_directory_spec(passed: &mut u64) {
     let opens = WINLOGON_PROFILE_LIST_OPENS.load(Ordering::Relaxed);
     let hits = WINLOGON_PROFILE_LIST_HITS.load(Ordering::Relaxed);
     let reads = WINLOGON_PROFILES_DIR_READS.load(Ordering::Relaxed);
+    let sid_keys_created = PROFILE_LIST_SID_KEYS_CREATED.load(Ordering::Relaxed);
+    let profile_image_path_sets = PROFILE_LIST_PROFILE_IMAGE_PATH_SETS.load(Ordering::Relaxed);
+    let profile_image_path_readbacks =
+        PROFILE_LIST_PROFILE_IMAGE_PATH_READBACKS.load(Ordering::Relaxed);
+    let profile_key_proven = sid_keys_created != 0 || profile_image_path_readbacks != 0;
+    let profile_path_proven = profile_image_path_sets != 0 || profile_image_path_readbacks != 0;
+    let copied_this_boot = crate::writable_fs::PROFILE_USER_DIR_CREATED.load(Ordering::Relaxed)
+        != 0
+        && crate::writable_fs::PROFILE_COPY_FILES.load(Ordering::Relaxed) != 0;
+    let copied_from_restored_volume = crate::writable_fs::snapshot_restore_seen()
+        && crate::writable_fs::directory_exists_at(crate::writable_fs::COPIED_PROFILE_DIR)
+        && crate::writable_fs::copied_profile_probe_ok()
+        && crate::writable_fs::hive_image_len_at(crate::writable_fs::COPIED_PROFILE_NTUSER_DAT)
+            != 0;
     print_str(b"[wl-profile] GetProfilesDirectoryW: ProfileList opens=");
     print_u64(opens);
     print_str(b" served-from-mount=");
@@ -6137,11 +6151,13 @@ fn winlogon_profile_directory_spec(passed: &mut u64) {
     print_str(b" ProfilesDirectory value-reads=");
     print_u64(reads);
     print_str(b" ProfileSID keys-created=");
-    print_u64(PROFILE_LIST_SID_KEYS_CREATED.load(Ordering::Relaxed));
+    print_u64(sid_keys_created);
     print_str(b" value-sets=");
     print_u64(PROFILE_LIST_SID_VALUE_SETS.load(Ordering::Relaxed));
-    print_str(b" ProfileImagePath=");
-    print_u64(PROFILE_LIST_PROFILE_IMAGE_PATH_SETS.load(Ordering::Relaxed));
+    print_str(b" ProfileImagePath writes/readbacks=");
+    print_u64(profile_image_path_sets);
+    print_str(b"/");
+    print_u64(profile_image_path_readbacks);
     print_str(b" RefCount=");
     print_u64(PROFILE_LIST_REFCOUNT_SETS.load(Ordering::Relaxed));
     print_str(b" SOFTWARE value-reads=");
@@ -6166,14 +6182,16 @@ fn winlogon_profile_directory_spec(passed: &mut u64) {
             // only way GetProfilesDirectoryW can return TRUE and the only way CreateUserProfileW
             // is reachable at all.
             && reads >= 1
-            // … and CreateUserProfileW created the real per-SID ProfileList key/value set and copied
-            // the default profile into the writable overlay. Earlier runs used a read-only FAT probe
-            // as a proxy; the stronger invariant is the concrete profile materialisation.
-            && PROFILE_LIST_SID_KEYS_CREATED.load(Ordering::Relaxed) >= 1
-            && PROFILE_LIST_PROFILE_IMAGE_PATH_SETS.load(Ordering::Relaxed) >= 1
+            // … and the real per-SID ProfileList key/value set either came from this first boot or
+            // was read back from a durable primary. A restored ProfileImagePath is proven only when
+            // winlogon successfully queries its exact mounted REG_EXPAND_SZ payload.
+            && profile_key_proven
+            && profile_path_proven
             && PROFILE_LIST_REFCOUNT_SETS.load(Ordering::Relaxed) >= 1
-            && crate::writable_fs::PROFILE_USER_DIR_CREATED.load(Ordering::Relaxed) >= 1
-            && crate::writable_fs::PROFILE_COPY_FILES.load(Ordering::Relaxed) >= 1
+            // The profile content follows the same first-boot/restart rule: either concrete copy
+            // operations happened now, or the restored volume contains the directory, exact probe
+            // bytes, and a non-empty user hive.
+            && (copied_this_boot || copied_from_restored_volume)
             // ... while any ordinary misses under that same mounted namespace stay real filesystem
             // misses, not unserved-namespace misses. A fully satisfied boot is allowed to have zero
             // misses.
@@ -20807,6 +20825,8 @@ pub(crate) static WINLOGON_PROFILES_DIR_READS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PROFILE_LIST_SID_KEYS_CREATED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PROFILE_LIST_SID_VALUE_SETS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PROFILE_LIST_PROFILE_IMAGE_PATH_SETS: AtomicU64 = AtomicU64::new(0);
+/// Successful winlogon reads of the exact persisted per-SID ProfileImagePath payload.
+pub(crate) static PROFILE_LIST_PROFILE_IMAGE_PATH_READBACKS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PROFILE_LIST_REFCOUNT_SETS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PROFILE_LIST_VALUE_TRACE: AtomicU64 = AtomicU64::new(0);
 /// True for a path under the LSA SECURITY hive or the SAM hive (`\Registry\Machine\SECURITY[...]` or

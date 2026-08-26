@@ -1511,20 +1511,17 @@ fn checkpoint_boot_hives_at_quiesce(nt_handler: &mut ExecNtHandler) -> u32 {
         return nt_fs::STATUS_SUCCESS;
     }
     let dirty_cells = nt_handler.boot_mutable_hive_dirty_cells();
-    let unseeded_dirty_cells = nt_handler.unseeded_boot_mutable_hive_dirty_cells();
     let pending_journal_records = nt_handler.mutable_hive_journal_pending_records;
     if dirty_cells == 0 && pending_journal_records == 0 {
         return nt_fs::STATUS_SUCCESS;
     }
-    if unseeded_dirty_cells != 0 {
-        print_str(b"[cm-flush] quiesce boot hive primary seed dirty-cells=");
-        print_u64(unseeded_dirty_cells as u64);
-        print_str(b" total-dirty=");
+    if dirty_cells != 0 {
+        print_str(b"[cm-flush] quiesce boot hive checkpoint dirty-cells=");
         print_u64(dirty_cells as u64);
         print_str(b"\n");
-        let status = nt_handler.checkpoint_unseeded_dirty_boot_mutable_hives();
+        let status = nt_handler.checkpoint_dirty_boot_mutable_hives_preserving_headroom();
         if status != nt_fs::STATUS_SUCCESS {
-            print_str(b"[cm-flush] quiesce boot hive primary seed failed status=0x");
+            print_str(b"[cm-flush] quiesce boot hive checkpoint failed status=0x");
             print_hex(status);
             print_str(b"\n");
             return status;

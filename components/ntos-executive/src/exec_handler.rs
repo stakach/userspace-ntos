@@ -5348,6 +5348,39 @@ impl ExecNtHandler {
             print_str(b"\n");
             return Self::mutable_hive_flush_failure_status(err);
         }
+        let compacted = {
+            let Some(hive) = self.mutable_hives.hive_mut(hive_sel) else {
+                return STATUS_INVALID_HANDLE;
+            };
+            hive.compact_value_blobs()
+        };
+        match compacted {
+            Ok(compaction) if compaction.reclaimed_blobs() != 0 => {
+                self.mutable_hives_dirty = true;
+                print_str(b"[cm-flush] compacted hive value blobs=");
+                print_u64(compaction.blobs_before as u64);
+                print_str(b"->");
+                print_u64(compaction.blobs_after as u64);
+                print_str(b" bytes=");
+                print_u64(compaction.bytes_before as u64);
+                print_str(b"->");
+                print_u64(compaction.bytes_after as u64);
+                print_str(b" path=");
+                print_ascii_str(file_path);
+                print_str(b"\n");
+            }
+            Ok(_) => {}
+            Err(err) => {
+                print_str(b"[cm-flush] hive value compaction deferred err=");
+                print_str(match err {
+                    nt_hive_core::HiveValueBlobCompactError::MissingBlob => b"missing-blob",
+                    nt_hive_core::HiveValueBlobCompactError::OutOfMemory => b"out-of-memory",
+                });
+                print_str(b" path=");
+                print_ascii_str(file_path);
+                print_str(b"\n");
+            }
+        }
         {
             self.writable_fs_dirty = true;
             self.writable_fs_commit_required = true;
@@ -5366,27 +5399,6 @@ impl ExecNtHandler {
             print_str(b"\n");
         }
         nt_fs::STATUS_SUCCESS
-    }
-
-    fn note_boot_hive_journal_checkpoint(&mut self, file_path: &str, dirty_cells: usize) {
-        self.writable_fs_dirty = true;
-        self.writable_fs_commit_required = true;
-        let image_len = unsafe { crate::writable_fs::hive_image_len_at(file_path) };
-        let log_len = unsafe { crate::writable_fs::hive_log_len_if_mounted(file_path) };
-        let durable_bytes = image_len.saturating_add(log_len);
-        REG_FLUSH_KEY_BOOT_HIVE_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
-        REG_FLUSH_KEY_BOOT_HIVE_BYTES.store(durable_bytes as u64, Ordering::Relaxed);
-        print_str(b"[cm-flush] boot hive journal checkpoint dirty-cells=");
-        print_u64(dirty_cells as u64);
-        print_str(b" pending-records=");
-        print_u64(self.mutable_hive_journal_pending_records as u64);
-        print_str(b" image-bytes=");
-        print_u64(image_len as u64);
-        print_str(b" log-bytes=");
-        print_u64(log_len as u64);
-        print_str(b" path=");
-        print_ascii_str(file_path);
-        print_str(b"\n");
     }
 
     pub(crate) fn complete_committed_mutable_hive_journal_snapshot(&mut self, reason: &[u8]) {
@@ -5474,14 +5486,6 @@ impl ExecNtHandler {
         let Some(file_path) = Self::boot_mutable_hive_checkpoint_path(hive_sel) else {
             return 0xC000_0008;
         };
-        if unsafe { crate::writable_fs::hive_image_len_at(file_path) != 0 } {
-            self.note_boot_hive_journal_checkpoint(file_path, dirty_cells);
-            return nt_fs::STATUS_SUCCESS;
-        }
-        if unsafe { crate::writable_fs::hive_log_len_if_mounted(file_path) != 0 } {
-            self.note_boot_hive_journal_checkpoint(file_path, dirty_cells);
-            return nt_fs::STATUS_SUCCESS;
-        }
         let Some(hive) = self.mutable_hives.hive(hive_sel) else {
             return 0xC000_0008;
         };
@@ -5554,7 +5558,7 @@ impl ExecNtHandler {
         nt_fs::STATUS_SUCCESS
     }
 
-    pub(crate) fn checkpoint_unseeded_dirty_boot_mutable_hives(&mut self) -> u32 {
+    pub(crate) fn checkpoint_dirty_boot_mutable_hives_preserving_headroom(&mut self) -> u32 {
         #[derive(Copy, Clone)]
         struct Candidate {
             hive_sel: u32,
@@ -5583,28 +5587,22 @@ impl ExecNtHandler {
             if dirty == 0 {
                 continue;
             }
-            let Some(path) = Self::boot_mutable_hive_checkpoint_path(hive_sel) else {
+            if Self::boot_mutable_hive_checkpoint_path(hive_sel).is_none() {
+                continue;
+            }
+            let Some(hive) = self.mutable_hives.hive(hive_sel) else {
                 continue;
             };
-            if unsafe { crate::writable_fs::hive_image_len_at(path) == 0 } {
-                let log_len = unsafe { crate::writable_fs::hive_log_len_if_mounted(path) };
-                if log_len != 0 {
-                    continue;
-                }
-                let Some(hive) = self.mutable_hives.hive(hive_sel) else {
-                    continue;
-                };
-                let image_len = match nt_hive_core::encoded_image_len(hive) {
-                    Ok(len) => len,
-                    Err(_) => usize::MAX,
-                };
-                candidates[candidate_len] = Some(Candidate {
-                    hive_sel,
-                    dirty,
-                    image_len,
-                });
-                candidate_len += 1;
-            }
+            let image_len = match nt_hive_core::encoded_image_len(hive) {
+                Ok(len) => len,
+                Err(_) => usize::MAX,
+            };
+            candidates[candidate_len] = Some(Candidate {
+                hive_sel,
+                dirty,
+                image_len,
+            });
+            candidate_len += 1;
         }
         REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.store(total_dirty as u64, Ordering::Relaxed);
 
@@ -5641,12 +5639,9 @@ impl ExecNtHandler {
 
         let remaining_dirty = self.boot_mutable_hive_dirty_cells();
         REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.store(remaining_dirty as u64, Ordering::Relaxed);
-        let unseeded_dirty = self.unseeded_boot_mutable_hive_dirty_cells();
-        if unseeded_dirty != 0 {
+        if remaining_dirty != 0 {
             self.mutable_hives_dirty = true;
-            print_str(b"[cm-flush] quiesce boot hive dirty refresh deferred dirty-cells=");
-            print_u64(unseeded_dirty as u64);
-            print_str(b" total-dirty=");
+            print_str(b"[cm-flush] quiesce boot hive checkpoint deferred dirty-cells=");
             print_u64(remaining_dirty as u64);
             print_str(b" heap-headroom=");
             print_u64(crate::allocator::remaining() as u64);
@@ -5664,30 +5659,6 @@ impl ExecNtHandler {
             HIVE_SEL_SAM,
             HIVE_SEL_USER_DEFAULT,
         ] {
-            total_dirty = total_dirty.saturating_add(
-                self.mutable_hives
-                    .hive(hive_sel)
-                    .map_or(0, |hive| hive.dirty_count()),
-            );
-        }
-        total_dirty
-    }
-
-    pub(crate) fn unseeded_boot_mutable_hive_dirty_cells(&self) -> usize {
-        let mut total_dirty = 0usize;
-        for hive_sel in [
-            HIVE_SEL_SYSTEM,
-            HIVE_SEL_SOFTWARE,
-            HIVE_SEL_SECURITY,
-            HIVE_SEL_SAM,
-            HIVE_SEL_USER_DEFAULT,
-        ] {
-            let Some(path) = Self::boot_mutable_hive_checkpoint_path(hive_sel) else {
-                continue;
-            };
-            if unsafe { crate::writable_fs::hive_image_len_at(path) != 0 } {
-                continue;
-            }
             total_dirty = total_dirty.saturating_add(
                 self.mutable_hives
                     .hive(hive_sel)
@@ -24083,6 +24054,30 @@ impl ExecNtHandler {
                             if self.current_process_is_winlogon() && name_lc == "profilesdirectory"
                             {
                                 WINLOGON_PROFILES_DIR_READS.fetch_add(1, Ordering::Relaxed);
+                            } else if self.current_process_is_winlogon()
+                                && name_lc == "profileimagepath"
+                                && key_path
+                                    .as_deref()
+                                    .is_some_and(is_profile_list_sid_key_canon)
+                            {
+                                const EXPECTED: &[u8] = b"%SystemDrive%\\Profiles\\Administrator";
+                                let exact = ty == 2
+                                    && data.len() == (EXPECTED.len() + 1) * 2
+                                    && data
+                                        .chunks_exact(2)
+                                        .zip(
+                                            EXPECTED
+                                                .iter()
+                                                .map(|byte| *byte as u16)
+                                                .chain(core::iter::once(0)),
+                                        )
+                                        .all(|(pair, expected)| {
+                                            u16::from_le_bytes([pair[0], pair[1]]) == expected
+                                        });
+                                if exact {
+                                    PROFILE_LIST_PROFILE_IMAGE_PATH_READBACKS
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
                         trace_winlogon_post_lsa_registry(

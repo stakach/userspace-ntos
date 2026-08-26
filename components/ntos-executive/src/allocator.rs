@@ -47,7 +47,12 @@ pub const HEAP_BASE: usize = 0x0000_0100_2000_0000;
 /// real desktop proof with only about 128 KiB left under the executive bump cap while the measured
 /// root-Untyped pool still had about 59 MiB free. This is a local executive-arena ceiling, not a
 /// BOOTBOOT/initrd or general VM-memory limit.
-pub const HEAP_FRAMES: u64 = 4096;
+/// ★ RAISED 4096 -> 6144 (16 MiB -> 24 MiB) when real boot-hive checkpoints replaced the
+/// journal-only acknowledgement. Retaining the five primary images raised the measured live floor
+/// to 14.24 MiB and left only 861 KiB contiguous, causing Explorer process-parameter construction
+/// to fail. The extra 8 MiB is mapped from root Untyped at runtime and does not enlarge the loaded
+/// executable or initrd. Isolated-service heap profiles remain independently bounded.
+pub const HEAP_FRAMES: u64 = 6144;
 /// Default heap frames mapped into an isolated component. Services that own larger durable state
 /// declare a larger profile at spawn time instead of charging every component for that capacity.
 pub const DEFAULT_SERVICE_HEAP_FRAMES: u64 = 128;

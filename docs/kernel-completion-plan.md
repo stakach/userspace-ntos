@@ -13399,7 +13399,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and matched the sentinel. Native `NtCreateKey` fell to about 0.50 ms and `NtSetValueKey` to
     about 0.36 ms, closing both complete per-mutation clones.
 
-    VSpace lifetime correction (2026-08-27, microkernel accepted; desktop validation pending): a
+    VSpace lifetime correction (2026-08-27, accepted): a
     serialized acceptance run exposed an executive heap fault at the first page of a later 2 MiB
     heap window. Service and diagnostic VSpaces were first corrected to assign an ASID before any
     paging map; this closed real ASID-zero teardown ambiguity but a repeated run still lost the
@@ -13420,13 +13420,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     isolated rootserver child executed in its assigned VSpace, and QEMU exited through the MCS
     proof. The adjacent file-cleanup lifecycle now also returns immediately for repeated cleanup
     starters, leaving the first accepted caller as the sole owner of endpoint-index retirement and
-    hosted FILE_OBJECT release. Review adjustment: run the freestanding executive checks and one
-    serialized full boot next; accept the runtime SYSTEM checkpoint only if the CM transaction gate,
-    profile/PnP/networking consumers, genuine Explorer framebuffer proof, all executive checks, and
-    sentinel pass without a rootserver heap fault or duplicate cleanup release.
+    hosted FILE_OBJECT release. The combined runtime validation below satisfies the required CM,
+    profile, PnP, networking, framebuffer, and duplicate-release conditions without a rootserver
+    heap fault.
 
-    Paging teardown identity correction (2026-08-27, microkernel accepted; desktop validation
-    pending): the decisive kernel audit found that PT/PD/PDPT Map installed a live hardware parent
+    Paging teardown identity correction (2026-08-27, accepted): the decisive kernel audit found
+    that PT/PD/PDPT Map installed a live hardware parent
     entry but retained ASID zero in the invoked cap. Their Unmap only cleared cap metadata, while
     CNode Delete/Revoke could clear the CTE, return its 4 KiB physical page to the parent Untyped,
     and later retype/zero that page even though hardware still referenced it. A reused leaf-table
@@ -13443,13 +13442,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     exact Unmap removes the hardware PDE. Focused stale-identity tests cover every paging level and
     frame size. rust-micro commit `d1e1de5` is pushed; `build_kernel.sh` and every kernel spec pass.
 
-    Review adjustment: rebuild the parent against `d1e1de5`, rerun the freestanding executive
-    checks, and execute one serialized full desktop acceptance. Require the executive heap to pass
-    its former `HEAP_BASE + 4 MiB` failure point, zero pinned-cap delete refusals, CM-first runtime
-    mutation proof, genuine profile/PnP/networking consumers, Explorer framebuffer proof, all
-    executive gates, and the sentinel before accepting the combined checkpoint.
+    The combined runtime validation below passes the former `HEAP_BASE + 4 MiB` failure point with
+    zero pinned-cap delete refusals and retains the required CM-first mutation, profile, PnP,
+    networking, framebuffer, full-gate, and sentinel proofs.
 
-    CNode Move ownership correction (2026-08-27, microkernel accepted; desktop validation pending):
+    CNode Move ownership correction (2026-08-27, accepted):
     the cap-bank audit found that rust-micro's `CNodeMove` transferred only the capability payload.
     It left the source CTE's MDB parent behind and did not install that parent on the destination.
     Reusing a moved-from root slot could therefore retain a stale derivation edge; later revoke of
@@ -13466,6 +13463,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     teardown, and live-ASID exhaustion as separate correctness changes rather than bundling them
     into the desktop blocker.
 
+    Combined runtime validation is closed by the serialized primary-checkpoint acceptance pair
+    below. Both the fresh boot and same-image restart traversed the former executive heap failure
+    window, reported zero pinned-cap delete/unmap/move refusals, painted the complete Explorer
+    framebuffer, passed `295/295`, and matched the sentinel.
+
     Exact I/O durable ownership (2026-08-27, accepted): persistent I/O store growth and live record
     acquisition now have separate ownership signals. File and IRP insertion records an acquisition
     epoch; removal before the service-loop barrier cancels only the matching epoch, while live
@@ -13474,16 +13476,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     passes `196/196`; serialized proof `.tmp/run-desktop-io-durable-epochs-20260827.log` passed all
     `295/295` gates, rendered the complete Explorer framebuffer, and matched the sentinel.
 
-    Allocator accounting correction (2026-08-27, implementation green; one unrelated gate remains
-    open): `reset_to` can no longer raise the bump cursor after normal deallocation already lowered
+    Allocator accounting correction (2026-08-27, accepted): `reset_to` can no longer raise the bump
+    cursor after normal deallocation already lowered
     it. Runtime census now separates bump watermark, allocated bytes, reusable bytes, largest hole,
     and top-contiguous space. The serialized measurement
     `.tmp/run-desktop-allocator-usage-20260827.log` reached genuine Explorer and painted
     480000/480000 pixels. Its final watermark was 14924320 B, with 14457224 B allocated and 2319928
-    B reusable (1852832 B contiguous at the top). The sentinel matched, but the run passed `294/295`:
-    the historical modal-paint-prefix counter reported one error even though the real dialog-paint
-    and Explorer chrome gates passed. Do not accept or suppress that discrepancy; rerun after the
-    retained-storage changes and investigate it if it repeats.
+    B reusable (1852832 B contiguous at the top). That measurement had one transient historical
+    modal-prefix gate failure despite successful real dialog and Explorer painting. The later
+    retained-storage run and both final checkpoint boots passed the same gate and every `295/295`
+    check, closing the discrepancy without suppressing it.
 
     Retained immutable storage cleanup (2026-08-27, accepted): `nt-fs::MemFs` now atomically
     compacts orphaned immutable blobs and remaps every live
@@ -13519,3 +13521,57 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     durable contiguous headroom. The larger architectural closure remains moving native SYSTEM
     handles and persistence into CM so the executive mirror and split-brain post-CM projection can
     be deleted rather than maintained indefinitely.
+
+    Full primary-hive checkpoint restoration (2026-08-27, accepted): both infallible and fallible
+    `HiveManager` flush paths now restore the
+    prior generation when encoding or the atomic primary replace fails. Once the primary replace
+    succeeds, later image/log flush failures retain the published generation and dirty/log state,
+    keeping the live hive aligned with the primary while preserving replay work. Failure-injection
+    assertions cover generation, sequence, dirty cells, previous primary, and retained log; the
+    library remains `80/80` and the generator `14/14`.
+
+    The executive no longer treats an existing primary or non-empty journal as permission to report
+    a synthetic checkpoint. Explicit `NtFlushKey` and the quiesce checkpoint scheduler now run the
+    real `try_flush` primary-replace/log-truncate protocol for every dirty boot hive that fits the
+    preserved-headroom policy. The old journal-only checkpoint function and unseeded-only scheduler
+    are deleted. After a complete flush, the mounted hive compacts unreachable value payloads; a
+    compaction allocation failure leaves the already-persisted hive valid and defers only memory
+    reclamation. Require a serialized run to show a core primary image, zero-byte sidecar log, live
+    value-blob compaction telemetry when reclaimable history exists, a committed raw-volume snapshot,
+    restart-safe CM composition, genuine Explorer rendering, `295/295`, and the sentinel.
+
+    The first serialized integration run proved real primary replacement for SYSTEM (370,180 B then
+    466,804 B), SOFTWARE (627,759 B), SECURITY (1,842 B), SAM (588 B), DEFAULT (185,390 B), and the
+    dynamic user hive (185,424 B), with committed writable-volume generations. It also exposed a
+    real capacity regression: retained primaries raised the 16 MiB executive arena to 14,929,168 B
+    live with only 881,928 B contiguous, and Explorer failed while building process parameters.
+    This is not a BOOTBOOT limit: the arena is backed from root Untyped after boot. The executive
+    profile is therefore 24 MiB, CM remains independently capped at 16 MiB, and the adjacent static
+    process scratch/mirror layout is derived from the heap boundary with compile-time alignment and
+    range checks.
+
+    The direct same-image restart restored writable generation 5 (1,692,212 B), selected
+    `persisted-core` SYSTEM (472,616 B), replayed through sequence 3039, and mounted SOFTWARE,
+    SECURITY, SAM, and DEFAULT primaries with zero-byte logs. Genuine Explorer again painted
+    480,000/480,000 pixels. The run exposed one first-boot-only proof: the profile gate required a
+    new SID key, ProfileImagePath write, and file copy even though the exact durable key and profile
+    were already present. ReactOS does not repeat the ProfileImagePath write on that path, so the
+    restart branch now requires winlogon's successful query of the exact mounted REG_EXPAND_SZ
+    payload plus the restored directory, probe bytes, and non-empty ntuser.dat.
+
+    Final serialized acceptance uses
+    `.tmp/run-headless-primary-checkpoint-readback-20260827.log` followed by a direct same-image
+    `.tmp/run-restart-primary-checkpoint-readback-20260827.log`. The fresh boot checkpointed every
+    boot hive, compacted reclaimable value payloads, committed writable generation 5 (1,692,192 B),
+    retained a 9,012,040 B largest reusable executive block, painted 480,000/480,000 Explorer
+    pixels, passed `295/295`, and matched the sentinel. The restart restored that exact generation,
+    selected `persisted-core` SYSTEM (472,616 B) at replay sequence 3039, mounted SOFTWARE
+    (628,313 B), SECURITY (1,842 B), SAM (12,376 B), and DEFAULT (185,390 B) with zero-byte logs,
+    observed the exact ProfileImagePath readback without rewriting it, painted the complete shell,
+    passed `295/295`, and matched the sentinel. Final allocated executive heap was 14,268,024 B
+    with a 9,527,536 B largest reusable block under the 24 MiB runtime arena.
+
+    Review adjustment: the checkpoint, restart, runtime-heap, VSpace, paging teardown, CNode Move,
+    and allocator-accounting validations are closed. Next bound outstanding CM hive-key transfer
+    snapshots without invalidating valid concurrent readers. Then split durable and per-dispatch
+    executive allocation so transient capture/encoding buffers cannot fragment durable headroom.
