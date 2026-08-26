@@ -11778,3 +11778,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     rollback cannot complete. Executable thunk slots and their callback records also need explicit
     exact-owner retirement/reuse rather than monotonic consumption. Complete those
     construction/thunk lifetimes before beginning the ordered PnP query/cancel/remove transaction.
+
+    Provider route construction checkpoint (2026-08-26, implementation green; serialized proof
+    pending): provider-domain DriverObject routes now reserve a non-dispatchable exact-owner row and
+    vector capacity before allocating either the provider DriverObject or DriverExtension. Each
+    acquired allocation is added to the row's release ledger immediately. Initialization and exact
+    I/O-Manager binding failures unbind any published identity, release only still-owned resources,
+    and either clear the completed construction or retain the constructing row for an exact retry.
+    Registration retries clean a matching incomplete construction before starting again; instance
+    teardown recognizes and drains constructing routes without treating them as live dispatch
+    authority. Route-local callback rejection was removed because the dependency-wide retirement
+    lease is the correct barrier for callbacks that can legitimately predate route publication.
+    The freestanding executive release check remains green at the established 212-warning baseline
+    and `git diff --check` is clean. Packet/MDL, scatter/gather, interrupt, timer, work-item,
+    miniport-mirror, and executable-thunk construction transactions remain open.

@@ -14556,6 +14556,7 @@ impl HostedProviderDomainDependency {
 #[derive(Clone, Copy)]
 struct HostedProviderDispatchRoute {
     used: bool,
+    constructing: bool,
     retiring: bool,
     owner: HostedProviderObjectOwner,
     release_progress: HostedProviderReleaseProgress,
@@ -14576,6 +14577,7 @@ impl HostedProviderDispatchRoute {
     const fn empty() -> Self {
         Self {
             used: false,
+            constructing: false,
             retiring: false,
             owner: EMPTY_HOSTED_PROVIDER_OBJECT_OWNER,
             release_progress: HostedProviderReleaseProgress::new(0),
@@ -14601,6 +14603,7 @@ impl HostedProviderDispatchRoute {
 
     fn add_device_ready(self) -> bool {
         self.used
+            && !self.constructing
             && !self.retiring
             && self.provider_instance != self.dependent_instance
             && self.dependent_domain.domain_id != nt_io_manager::HostedDomainId::NULL
@@ -16372,17 +16375,6 @@ unsafe fn hosted_provider_callback_record(cookie: u64) -> Option<HostedProviderC
             != Some(record.provider_domain)
         || instance(record.dependent_instance).and_then(instance_domain_identity)
             != Some(record.dependent_domain)
-        || hosted_provider_dispatch_routes().is_some_and(|routes| {
-            routes.iter().any(|route| {
-                route.used
-                    && route.retiring
-                    && route.provider_instance == record.provider_instance
-                    && route.dependent_instance == record.dependent_instance
-                    && route.provider_domain == record.provider_domain
-                    && route.dependent_domain == record.dependent_domain
-                    && route.provider_publication_cookie == record.provider_publication_cookie
-            })
-        })
     {
         return None;
     }
@@ -16421,7 +16413,7 @@ unsafe fn hosted_provider_dispatch_routes() -> Option<&'static Vec<HostedProvide
 }
 
 fn hosted_provider_dispatch_route_is_live(route: HostedProviderDispatchRoute) -> bool {
-    if !route.used || route.retiring {
+    if !route.used || route.constructing || route.retiring {
         return false;
     }
     let dependent_live = instance(route.dependent_instance).and_then(instance_domain_identity);
@@ -16572,10 +16564,88 @@ unsafe fn clear_hosted_provider_domain_dependencies_for_instance(instance_index:
     failures
 }
 
+unsafe fn release_hosted_provider_dispatch_route_allocations(
+    route: &mut HostedProviderDispatchRoute,
+) -> bool {
+    if !route.used
+        || !hosted_provider_object_owner_is_current(
+            route.owner,
+            route.provider_instance,
+            route.dependent_instance,
+        )
+    {
+        return false;
+    }
+    let owner = route.owner;
+    let provider_instance = route.provider_instance;
+    let dependent_instance = route.dependent_instance;
+    let provider_driver_extension = route.provider_driver_extension;
+    let provider_driver_object = route.provider_driver_object;
+    route.release_progress.release_with(|bit| match bit {
+        0 => release_hosted_provider_owned_pool_allocation(
+            owner,
+            provider_instance,
+            dependent_instance,
+            provider_instance,
+            provider_driver_extension,
+        ),
+        1 => release_hosted_provider_owned_pool_allocation(
+            owner,
+            provider_instance,
+            dependent_instance,
+            provider_instance,
+            provider_driver_object,
+        ),
+        _ => false,
+    })
+}
+
+unsafe fn abort_hosted_provider_dispatch_route_construction(
+    route: &mut HostedProviderDispatchRoute,
+) -> bool {
+    if !route.used || !route.constructing {
+        return false;
+    }
+    if route.provider_driver_object != 0 {
+        let driver_binding = io_manager_mut()
+            .hosted_driver_by_identity(route.provider_domain, route.provider_driver_object);
+        match driver_binding {
+            Some(driver) if driver == DriverId(route.dependent_driver_id) => {
+                if !io_manager_mut().unbind_hosted_driver_identity(
+                    route.provider_domain,
+                    route.provider_driver_object,
+                    driver,
+                ) {
+                    return false;
+                }
+            }
+            None => {}
+            Some(_) => return false,
+        }
+        clear_driver_object_extensions_for_driver_object(route.provider_driver_object);
+    }
+    release_hosted_provider_dispatch_route_allocations(route)
+}
+
+unsafe fn retain_or_clear_failed_hosted_provider_dispatch_route(
+    route_index: usize,
+    status: i32,
+) -> i32 {
+    let routes = hosted_provider_dispatch_routes_mut();
+    if routes
+        .get_mut(route_index)
+        .is_some_and(|route| abort_hosted_provider_dispatch_route_construction(route))
+    {
+        routes[route_index] = HostedProviderDispatchRoute::empty();
+    }
+    status
+}
+
 unsafe fn teardown_hosted_provider_dispatch_route(
     route: &mut HostedProviderDispatchRoute,
 ) -> Result<(), nt_status::NtStatus> {
     if !route.used
+        || route.constructing
         || !route.retiring
         || !route.owner.pair_matches(
             route.provider_domain.domain_id.raw(),
@@ -16618,28 +16688,7 @@ unsafe fn teardown_hosted_provider_dispatch_route(
             return Err(nt_status::NtStatus::INVALID_PARAMETER);
         }
     }
-    let owner = route.owner;
-    let provider_instance = route.provider_instance;
-    let dependent_instance = route.dependent_instance;
-    let provider_driver_extension = route.provider_driver_extension;
-    let provider_driver_object = route.provider_driver_object;
-    if !route.release_progress.release_with(|bit| match bit {
-        0 => release_hosted_provider_owned_pool_allocation(
-            owner,
-            provider_instance,
-            dependent_instance,
-            provider_instance,
-            provider_driver_extension,
-        ),
-        1 => release_hosted_provider_owned_pool_allocation(
-            owner,
-            provider_instance,
-            dependent_instance,
-            provider_instance,
-            provider_driver_object,
-        ),
-        _ => false,
-    }) {
+    if !release_hosted_provider_dispatch_route_allocations(route) {
         return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     }
     clear_hosted_provider_callback_records_for_route(*route);
@@ -16661,6 +16710,21 @@ unsafe fn clear_hosted_provider_dispatch_routes_for_instance(
             && (route.dependent_instance == instance_index
                 || route.provider_instance == instance_index)
         {
+            if route.constructing {
+                if !hosted_provider_object_owner_matches_instance(
+                    route.owner,
+                    route.provider_instance,
+                    route.dependent_instance,
+                    instance_index,
+                    domain,
+                ) || !abort_hosted_provider_dispatch_route_construction(&mut routes[index])
+                {
+                    failures += 1;
+                } else {
+                    routes[index] = HostedProviderDispatchRoute::empty();
+                }
+                continue;
+            }
             routes[index].retiring = true;
             if !hosted_provider_object_owner_matches_instance(
                 routes[index].owner,
@@ -16773,71 +16837,51 @@ unsafe fn register_hosted_provider_driver_object_shadow(
     else {
         return Err(STATUS_DEVICE_NOT_READY);
     };
-    if let Some(routes) = hosted_provider_dispatch_routes() {
-        if let Some((index, route)) = routes
+    if let Some((index, route)) = hosted_provider_dispatch_routes().and_then(|routes| {
+        routes
             .iter()
             .copied()
             .enumerate()
             .find(|(_, route)| route.used && route.dependent_domain == dependent_domain)
-        {
-            if hosted_provider_dispatch_route_is_live(route)
-                && route.provider_instance == provider_instance
-                && route.dependent_instance == dependent_instance
-                && route.provider_domain == provider_domain
-                && route.provider_publication_cookie == provider_publication_cookie
-                && route.dependent_driver_object == dependent_driver_object
-                && route.dependent_driver_id == dependent_inst.driver_id
-                && route.provider_driver_object != 0
-            {
-                return io_manager_mut()
-                    .bind_hosted_driver_identity(
-                        provider_domain,
-                        route.provider_driver_object,
-                        DriverId(dependent_inst.driver_id),
-                    )
-                    .map(|()| index)
-                    .map_err(nt_status::NtStatus::raw);
+    }) {
+        let exact = route.owner == owner
+            && route.provider_instance == provider_instance
+            && route.dependent_instance == dependent_instance
+            && route.provider_domain == provider_domain
+            && route.provider_publication_cookie == provider_publication_cookie
+            && route.dependent_driver_object == dependent_driver_object
+            && route.dependent_driver_id == dependent_inst.driver_id;
+        if route.constructing {
+            if !exact {
+                return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION.raw());
             }
+            let routes = hosted_provider_dispatch_routes_mut();
+            if !abort_hosted_provider_dispatch_route_construction(&mut routes[index]) {
+                return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
+            }
+            routes[index] = HostedProviderDispatchRoute::empty();
+        } else if exact
+            && hosted_provider_dispatch_route_is_live(route)
+            && route.provider_driver_object != 0
+        {
+            return io_manager_mut()
+                .bind_hosted_driver_identity(
+                    provider_domain,
+                    route.provider_driver_object,
+                    DriverId(dependent_inst.driver_id),
+                )
+                .map(|()| index)
+                .map_err(nt_status::NtStatus::raw);
+        } else {
             return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION.raw());
         }
     }
-    let Some(provider_driver_object) =
-        hosted_instance_pool_alloc(provider_inst, WDM_X64_DRIVER_OBJECT_SIZE as u64)
-    else {
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
-    };
-    let Some(provider_driver_extension) =
-        hosted_instance_pool_alloc(provider_inst, WDM_X64_DRIVER_EXTENSION_SIZE as u64)
-    else {
-        hosted_instance_pool_free(provider_inst, provider_driver_object);
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
-    };
-    if let Err(status) = initialize_provider_driver_object_shadow_for_instance(
-        provider_instance,
-        provider_inst,
-        provider_driver_object,
-        provider_driver_extension,
-    ) {
-        hosted_instance_pool_free(provider_inst, provider_driver_extension);
-        hosted_instance_pool_free(provider_inst, provider_driver_object);
-        return Err(status);
-    }
-    if let Err(status) = io_manager_mut().bind_hosted_driver_identity(
-        provider_domain,
-        provider_driver_object,
-        DriverId(dependent_inst.driver_id),
-    ) {
-        clear_driver_object_extensions_for_driver_object(provider_driver_object);
-        hosted_instance_pool_free(provider_inst, provider_driver_extension);
-        hosted_instance_pool_free(provider_inst, provider_driver_object);
-        return Err(status.raw());
-    }
-    let routes = hosted_provider_dispatch_routes_mut();
     let route = HostedProviderDispatchRoute {
         used: true,
+        constructing: true,
         retiring: false,
         owner,
-        release_progress: HostedProviderReleaseProgress::new(0b11),
+        release_progress: HostedProviderReleaseProgress::new(0),
         dependent_instance,
         provider_instance,
         dependent_domain,
@@ -16845,17 +16889,91 @@ unsafe fn register_hosted_provider_driver_object_shadow(
         provider_publication_cookie,
         dependent_driver_id: dependent_inst.driver_id,
         dependent_driver_object,
-        provider_driver_object,
-        provider_driver_extension,
+        provider_driver_object: 0,
+        provider_driver_extension: 0,
         provider_wrapper_handle: 0,
         provider_add_device: 0,
     };
-    if let Some((index, slot)) = routes.iter_mut().enumerate().find(|(_, slot)| !slot.used) {
-        *slot = route;
-        Ok(index)
+    let route_index = {
+        let routes = hosted_provider_dispatch_routes_mut();
+        if let Some(index) = routes.iter().position(|route| !route.used) {
+            routes[index] = route;
+            index
+        } else {
+            routes
+                .try_reserve(1)
+                .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+            routes.push(route);
+            routes.len() - 1
+        }
+    };
+    let Some(provider_driver_object) =
+        hosted_instance_pool_alloc(provider_inst, WDM_X64_DRIVER_OBJECT_SIZE as u64)
+    else {
+        return Err(retain_or_clear_failed_hosted_provider_dispatch_route(
+            route_index,
+            STATUS_INSUFFICIENT_RESOURCES,
+        ));
+    };
+    {
+        let route = &mut hosted_provider_dispatch_routes_mut()[route_index];
+        route.provider_driver_object = provider_driver_object;
+        route.release_progress.add_pending(1 << 1);
+    }
+    let Some(provider_driver_extension) =
+        hosted_instance_pool_alloc(provider_inst, WDM_X64_DRIVER_EXTENSION_SIZE as u64)
+    else {
+        return Err(retain_or_clear_failed_hosted_provider_dispatch_route(
+            route_index,
+            STATUS_INSUFFICIENT_RESOURCES,
+        ));
+    };
+    {
+        let route = &mut hosted_provider_dispatch_routes_mut()[route_index];
+        route.provider_driver_extension = provider_driver_extension;
+        route.release_progress.add_pending(1 << 0);
+    }
+    if let Err(status) = initialize_provider_driver_object_shadow_for_instance(
+        provider_instance,
+        provider_inst,
+        provider_driver_object,
+        provider_driver_extension,
+    ) {
+        return Err(retain_or_clear_failed_hosted_provider_dispatch_route(
+            route_index,
+            status,
+        ));
+    }
+    if let Err(status) = io_manager_mut().bind_hosted_driver_identity(
+        provider_domain,
+        provider_driver_object,
+        DriverId(dependent_inst.driver_id),
+    ) {
+        return Err(retain_or_clear_failed_hosted_provider_dispatch_route(
+            route_index,
+            status.raw(),
+        ));
+    }
+    let published = {
+        let route = &mut hosted_provider_dispatch_routes_mut()[route_index];
+        if route.constructing
+            && route.owner == owner
+            && route.provider_driver_object == provider_driver_object
+            && route.provider_driver_extension == provider_driver_extension
+        {
+            route.constructing = false;
+            true
+        } else {
+            false
+        }
+    };
+    if published {
+        Ok(route_index)
     } else {
-        routes.push(route);
-        Ok(routes.len() - 1)
+        Err(retain_or_clear_failed_hosted_provider_dispatch_route(
+            route_index,
+            STATUS_DEVICE_NOT_READY,
+        ))
     }
 }
 
@@ -16870,7 +16988,7 @@ unsafe fn set_hosted_provider_route_wrapper(
     let Some(route) = routes.get_mut(route_index) else {
         return Err(STATUS_DEVICE_NOT_READY);
     };
-    if !route.used {
+    if !hosted_provider_dispatch_route_is_live(*route) {
         return Err(STATUS_DEVICE_NOT_READY);
     }
     route.provider_wrapper_handle = provider_wrapper_handle;
@@ -16917,7 +17035,7 @@ unsafe fn complete_hosted_provider_miniport_registration(
     let Some(slot) = routes.get_mut(route_index) else {
         return Err(STATUS_DEVICE_NOT_READY);
     };
-    if !slot.used {
+    if !hosted_provider_dispatch_route_is_live(*slot) {
         return Err(STATUS_DEVICE_NOT_READY);
     }
     slot.provider_add_device = add_device;
