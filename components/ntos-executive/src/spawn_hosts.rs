@@ -269,7 +269,7 @@ fn component_heap_pt_count(frames: u64) -> u64 {
 fn component_descriptor_map_cap_count(d: &ComponentDescriptor, img_count: u64) -> u64 {
     let image_skeleton_caps = 2 + component_heap_pt_count(img_count) + 1;
     let heap_caps = if d.map_heap_pt {
-        component_heap_pt_count(allocator::SERVICE_HEAP_FRAMES)
+        component_heap_pt_count(allocator::DEFAULT_SERVICE_HEAP_FRAMES)
     } else {
         0
     };
@@ -530,7 +530,11 @@ pub(crate) unsafe fn spawn_component(d: &ComponentDescriptor) -> SpawnedComponen
     }
     component_map_image_skeleton(pml4, img_count, &mut map_cap_bank);
     if d.map_heap_pt {
-        component_map_heap_pts(pml4, allocator::SERVICE_HEAP_FRAMES, &mut map_cap_bank);
+        component_map_heap_pts(
+            pml4,
+            allocator::DEFAULT_SERVICE_HEAP_FRAMES,
+            &mut map_cap_bank,
+        );
     }
     trace_component_spawn_stage(b"vspace-ready", pml4, map_cap_bank.count);
     if d.lazy_image {
@@ -792,7 +796,7 @@ pub(crate) unsafe fn spawn_storage_host(
     regions[n] = Region {
         source: FrameSource::FreshZeroed,
         base_va: allocator::HEAP_BASE as u64,
-        count: allocator::SERVICE_HEAP_FRAMES,
+        count: allocator::DEFAULT_SERVICE_HEAP_FRAMES,
         rights: Rights::Uniform(RW_NX),
         pts: 0,
     };

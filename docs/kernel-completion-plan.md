@@ -12839,3 +12839,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     service requires the composed SYSTEM image and fails closed if publication did not occur. This
     preserves initialization ordering without reintroducing an installed/generated fallback; the
     freestanding executive check remains green at 212 warnings. Rerun serialized desktop acceptance.
+
+    Second acceptance adjustment (2026-08-26): composition successfully produced the complete
+    275,868-byte first-boot SYSTEM image, proving source selection and overlay rebasing, but atomic
+    CM commit crossed the old generic service's 512 KiB heap mapping while the service concurrently
+    owned encoded bytes, decoded cells, and semantic indexes. The transport was already correctly
+    streaming 4,064-byte chunks; no larger shared message or partial publication is needed.
+
+    Isolated service construction now takes an explicit heap-frame resource profile. Object, I/O,
+    LPC, and ordinary hosted components retain the 128-frame default, while CM declares a 1,024-frame
+    arena within the existing 16 MiB allocator VA contract. Page-table and frame mapping scale from
+    that declaration, so the complete image remains atomic without charging every service or adding
+    a hive-size fallback. The freestanding executive check is again green at 212 warnings. Rerun the
+    serialized desktop gate.

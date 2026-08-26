@@ -159,6 +159,10 @@ pub const CM_SUB_VADDR: u64 = 0x0000_0100_1054_0000;
 pub const CM_COMP_VADDR: u64 = 0x0000_0100_1055_0000;
 pub const CM_REQ_VADDR: u64 = 0x0000_0100_1056_0000;
 pub const CM_REP_VADDR: u64 = 0x0000_0100_1057_0000;
+/// CM atomically owns the encoded SYSTEM image, decoded hive, and semantic indexes during mount.
+/// Other isolated services retain the default 512 KiB profile.
+pub const CONFIG_MANAGER_SERVICE_HEAP_FRAMES: u64 = 1024;
+const _: () = assert!(CONFIG_MANAGER_SERVICE_HEAP_FRAMES <= allocator::HEAP_FRAMES);
 // A THIRD ring set — the executive's side of the I/O Manager service.
 pub const IO_SUB_VADDR: u64 = 0x0000_0100_1058_0000;
 pub const IO_COMP_VADDR: u64 = 0x0000_0100_1059_0000;
@@ -14548,12 +14552,6 @@ pub(crate) unsafe fn map_tp_worker_target_lane_pts(pml4: u64) {
     }
 }
 
-/// Build the page table for the relocated heap region (`HEAP_BASE`) in `pml4`. The spawned-service
-/// heap is deliberately smaller than the executive heap but still fits one 2 MiB PT.
-unsafe fn map_heap_pt(pml4: u64) {
-    map_heap_pts(pml4, allocator::SERVICE_HEAP_FRAMES);
-}
-
 /// Build enough leaf page tables at `HEAP_BASE` to cover `frames` 4 KiB pages (one PT per 2 MiB).
 /// The executive's own heap is larger than a spawned service's, so the two callers differ only in
 /// how many they ask for.
@@ -14623,13 +14621,20 @@ unsafe fn map_own_heap() {
 
 /// Build a spawned service's VSpace: image RO+X, private heap, private stack, and
 /// the four shared SURT frames at the shared vaddrs.
-unsafe fn build_service_vspace(sub: u64, comp: u64, req: u64, rep: u64) -> u64 {
+unsafe fn build_service_vspace(
+    sub: u64,
+    comp: u64,
+    req: u64,
+    rep: u64,
+    heap_frames: u64,
+) -> u64 {
+    assert!(heap_frames != 0 && heap_frames <= allocator::HEAP_FRAMES);
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
     map_image_skeleton(pml4, img_count);
-    map_heap_pt(pml4);
+    map_heap_pts(pml4, heap_frames);
     for i in 0..img_count {
         let cp = alloc_slot();
         let _ = syscall5(
@@ -14642,7 +14647,7 @@ unsafe fn build_service_vspace(sub: u64, comp: u64, req: u64, rep: u64) -> u64 {
         );
         let _ = page_map(cp, IMAGE_BASE + i * 0x1000, /* RO */ 2, pml4);
     }
-    for i in 0..allocator::SERVICE_HEAP_FRAMES {
+    for i in 0..heap_frames {
         let f = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
         let _ = page_map(f, allocator::HEAP_BASE as u64 + i * 0x1000, RW_NX, pml4);
@@ -14669,8 +14674,9 @@ unsafe fn spawn_service(
     comp: u64,
     req: u64,
     rep: u64,
+    heap_frames: u64,
 ) {
-    let pml4 = build_service_vspace(sub, comp, req, rep);
+    let pml4 = build_service_vspace(sub, comp, req, rep, heap_frames);
     let ipcbuf = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ipcbuf);
     let _ = page_map(ipcbuf, IPCBUF_VADDR, RW_NX, pml4);
@@ -25524,6 +25530,7 @@ unsafe fn stand_up_service(
     comp_v: u64,
     req_v: u64,
     rep_v: u64,
+    heap_frames: u64,
 ) -> RingChannel<'static> {
     let n_sub = make_object(OBJ_NOTIFICATION);
     let n_comp = make_object(OBJ_NOTIFICATION);
@@ -25559,6 +25566,7 @@ unsafe fn stand_up_service(
         copy_cap(f_comp),
         copy_cap(f_req),
         copy_cap(f_rep),
+        heap_frames,
     );
     let sq = match Producer::<SurtSqe>::attach(sub_v as *mut u8, RING_LEN) {
         Ok(p) => p,
@@ -26162,6 +26170,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             COMP_RING_VADDR,
             REQ_DATA_VADDR,
             REP_DATA_VADDR,
+            allocator::DEFAULT_SERVICE_HEAP_FRAMES,
         )))));
     install_object_manager_client(&mut *c);
 
@@ -26223,6 +26232,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             CM_COMP_VADDR,
             CM_REQ_VADDR,
             CM_REP_VADDR,
+            CONFIG_MANAGER_SERVICE_HEAP_FRAMES,
         )))));
     install_config_manager_client(&mut *cm);
     let svc_key = r"\Registry\Machine\System\CurrentControlSet\Services\Demo";
@@ -26266,6 +26276,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         IO_COMP_VADDR,
         IO_REQ_VADDR,
         IO_REP_VADDR,
+        allocator::DEFAULT_SERVICE_HEAP_FRAMES,
     )));
     check(b"exec_io_ping", io.ping().is_success(), &mut passed);
     let io_handle = io.open(
@@ -26300,6 +26311,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         LPC_COMP_VADDR,
         LPC_REQ_VADDR,
         LPC_REP_VADDR,
+        allocator::DEFAULT_SERVICE_HEAP_FRAMES,
     )));
     check(b"exec_lpc_ping", lpc.ping(), &mut passed);
     // Self-test the AUTHENTIC (Manual/path-B) connect rendezvous end-to-end through the isolated
@@ -28187,7 +28199,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 regions[n] = Region {
                     source: FrameSource::FreshZeroed,
                     base_va: allocator::HEAP_BASE as u64,
-                    count: allocator::SERVICE_HEAP_FRAMES,
+                    count: allocator::DEFAULT_SERVICE_HEAP_FRAMES,
                     rights: Rights::Uniform(RW_NX),
                     pts: 0,
                 };

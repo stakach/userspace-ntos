@@ -26,8 +26,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 pub const HEAP_BASE: usize = 0x0000_0100_2000_0000;
 /// Heap size in 4 KiB frames — the allocator's hard cap. Now that the VA layout is roomy, the
 /// executive gets a dedicated desktop-sized arena (was a cramped 128 KiB that OOM'd during registry
-/// enum, forcing per-syscall mark/reset). Spawned services map only [`SERVICE_HEAP_FRAMES`] to spare
-/// the boot frame budget; they never allocate near this cap.
+/// enum, forcing per-syscall mark/reset). Spawned services map a declared subset of this address
+/// range; ordinary components use [`DEFAULT_SERVICE_HEAP_FRAMES`].
 /// ★ RAISED 512 -> 1536 (2 MiB -> 6 MiB). The 2 MiB cap was measured at **1953957/2097152 = 93%**
 /// at the winlogon profile frontier: the CM overlay, the writable volume and every `*_dirty`
 /// mark-pin move the permanent floor, and a heap that reaches its cap does not panic — allocations
@@ -47,12 +47,9 @@ pub const HEAP_BASE: usize = 0x0000_0100_2000_0000;
 /// root-Untyped pool still had about 59 MiB free. This is a local executive-arena ceiling, not a
 /// BOOTBOOT/initrd or general VM-memory limit.
 pub const HEAP_FRAMES: u64 = 4096;
-/// Heap frames mapped into a spawned service's VSpace. **Deliberately NOT raised with
-/// [`HEAP_FRAMES`]** — a service's heap is per-VSpace, so tracking the executive would spend
-/// `services x frames` boot memory for heaps that allocate only a small bootstrap working set. The
-/// documented consequence is that a spawned service allocating past its own 512 KiB faults instead
-/// of returning null; nothing comes remotely close (the old shared 32-frame heap sufficed for them).
-pub const SERVICE_HEAP_FRAMES: u64 = 128;
+/// Default heap frames mapped into an isolated component. Services that own larger durable state
+/// declare a larger profile at spawn time instead of charging every component for that capacity.
+pub const DEFAULT_SERVICE_HEAP_FRAMES: u64 = 128;
 
 const HEAP_SIZE: usize = (HEAP_FRAMES as usize) * 0x1000;
 const CTR: usize = HEAP_BASE; // 8-byte bump offset, in the RW heap
