@@ -5429,6 +5429,7 @@ pub(crate) unsafe fn service_sec_image(
     let mut nt_handler = reset_exec_nt_handler(
         exe_image_catalog as *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
         driver_starts,
+        live_service,
     );
     if live_service {
         print_str(b"[sec-init] handler-ready\n");

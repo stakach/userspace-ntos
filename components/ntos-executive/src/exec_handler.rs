@@ -2523,6 +2523,7 @@ impl ExecNtHandler {
         slot: *mut ExecNtHandler,
         hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
         driver_starts: DriverStartBootstrap,
+        require_boot_system: bool,
     ) -> &'static mut Self {
         // SAFETY: HIVEBUF is a fixed, executive-lifetime mapping the storage host filled from
         // ::ROSSYS.HIV; REAL_HIVE_SIZE is its reported byte length (0 if unstaged → None).
@@ -2567,17 +2568,19 @@ impl ExecNtHandler {
             }
         };
         let mut mutable_hives = nt_hive_core::MutableHiveSet::new();
-        let boot_system_image = unsafe { boot_system_hive_image_bytes() }
-            .expect("composed boot SYSTEM image was prepared before handler initialization");
-        let boot_system_hive = nt_hive_core::decode_image(boot_system_image)
-            .expect("prepared boot SYSTEM image remains valid");
-        mutable_hives
-            .mount(
-                hive_mount(HIVE_SEL_SYSTEM),
-                HIVE_SEL_SYSTEM,
-                boot_system_hive,
-            )
-            .expect("mount composed boot SYSTEM hive");
+        if let Some(boot_system_image) = unsafe { boot_system_hive_image_bytes() } {
+            let boot_system_hive = nt_hive_core::decode_image(boot_system_image)
+                .expect("prepared boot SYSTEM image remains valid");
+            mutable_hives
+                .mount(
+                    hive_mount(HIVE_SEL_SYSTEM),
+                    HIVE_SEL_SYSTEM,
+                    boot_system_hive,
+                )
+                .expect("mount composed boot SYSTEM hive");
+        } else if require_boot_system {
+            panic!("live hosted-process service requires the composed boot SYSTEM image");
+        }
         if let Some(ref regf) = software_hive {
             mount_mutable_regf_hive(
                 &mut mutable_hives,

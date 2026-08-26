@@ -21998,12 +21998,13 @@ static mut EXEC_NT_HANDLER_WORK: core::mem::MaybeUninit<ExecNtHandler> =
 unsafe fn reset_exec_nt_handler(
     hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
     driver_starts: DriverStartBootstrap,
+    require_boot_system: bool,
 ) -> &'static mut ExecNtHandler {
     let slot = core::ptr::addr_of_mut!(EXEC_NT_HANDLER_WORK) as *mut ExecNtHandler;
     // SAFETY: `service_sec_image` is serialized and owns the returned exclusive borrow until the
     // service loop exits. Reinitializing this slot intentionally leaks the previous bump-heap-backed
     // contents, matching the rest of the rootserver bootstrap allocator model.
-    ExecNtHandler::initialize_in(slot, hosted_images, driver_starts)
+    ExecNtHandler::initialize_in(slot, hosted_images, driver_starts, require_boot_system)
 }
 
 type ExecIoCompletionPortTable = nt_io_completion::CompletionPortTable<TP_WORKER_PI_COUNT, 8, 64>;

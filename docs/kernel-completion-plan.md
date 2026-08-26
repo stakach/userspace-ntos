@@ -12832,3 +12832,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     authority. Then replace local re-decoding of the composed image with generation-bound CM query
     APIs before introducing journalled mutation leases; the encoded boot image is a handoff artifact,
     not a second mutable owner.
+
+    First acceptance adjustment (2026-08-26): the pre-storage SEC_IMAGE transport self-test also
+    constructs an executive syscall handler, before a boot registry authority can exist. Handler
+    initialization now accepts that explicitly unmounted test phase, while the live hosted-process
+    service requires the composed SYSTEM image and fails closed if publication did not occur. This
+    preserves initialization ordering without reintroducing an installed/generated fallback; the
+    freestanding executive check remains green at 212 warnings. Rerun serialized desktop acceptance.
