@@ -164,6 +164,7 @@ fn fold(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
+#[derive(Clone)]
 struct KeyRecord {
     id: RegistryKeyId,
     parent: Option<RegistryKeyId>,
@@ -175,6 +176,7 @@ struct KeyRecord {
 }
 
 /// The registry tree.
+#[derive(Clone)]
 pub struct Registry {
     keys: Vec<KeyRecord>,
     next_id: RegistryKeyId,

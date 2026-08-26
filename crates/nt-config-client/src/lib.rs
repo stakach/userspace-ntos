@@ -2047,7 +2047,7 @@ mod tests {
     }
 
     #[test]
-    fn system_hive_mutation_is_streamed_atomic_and_rebuilds_semantic_views() {
+    fn system_hive_mutation_is_streamed_atomic_and_updates_semantic_views() {
         const STATUS_REVISION_MISMATCH: i32 = 0xC000_0059u32 as i32;
         const STATUS_CANNOT_DELETE: i32 = 0xC000_0121u32 as i32;
         const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;

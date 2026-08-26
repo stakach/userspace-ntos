@@ -42,8 +42,8 @@ use nt_config_abi::{
 };
 use nt_config_manager::{
     device_property, ConfigManager, DevicePropertySource, DriverServiceBinding, DriverServiceClass,
-    RegistryValueType, Win32ServiceProcessKind, Win32ServiceProcessLaunch, SERVICE_BOOT_START,
-    SERVICE_DEMAND_START, SERVICE_SYSTEM_START,
+    Registry, RegistryValueType, Win32ServiceProcessKind, Win32ServiceProcessLaunch,
+    SERVICE_BOOT_START, SERVICE_DEMAND_START, SERVICE_SYSTEM_START,
 };
 use nt_hive_core::{
     collect_reactos_network_adapter_bindings, decode_image, CurrentControlSet, Hive, HiveKind,
@@ -214,7 +214,7 @@ fn config_manager_from_system_hive(
 fn apply_system_hive_mutation(
     hive: &mut Hive,
     current_control_set: &CurrentControlSet,
-    mutation: HiveMutation,
+    mutation: &HiveMutation,
 ) -> Result<(), i32> {
     let relative = |path: &str| {
         system_hive_relative_path(path, current_control_set).ok_or(STATUS_INVALID_PARAMETER)
@@ -231,11 +231,11 @@ fn apply_system_hive_mutation(
             data,
         } => {
             let value_type =
-                RegistryValueType::from_u32(value_type).ok_or(STATUS_INVALID_PARAMETER)?;
+                RegistryValueType::from_u32(*value_type).ok_or(STATUS_INVALID_PARAMETER)?;
             let key = hive
                 .open_key(&relative(&path)?)
                 .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
-            hive.set_value(key, &name, value_type, data)
+            hive.set_value(key, name, value_type, data.clone())
                 .then_some(())
                 .ok_or(STATUS_INVALID_PARAMETER)
         }
@@ -243,7 +243,7 @@ fn apply_system_hive_mutation(
             let key = hive
                 .open_key(&relative(&path)?)
                 .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
-            hive.delete_value(key, &name)
+            hive.delete_value(key, name)
                 .then_some(())
                 .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)
         }
@@ -269,11 +269,115 @@ fn apply_system_hive_mutation(
             let key = hive
                 .open_key(&relative(&path)?)
                 .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
-            hive.set_key_security_descriptor(key, &descriptor)
+            hive.set_key_security_descriptor(key, descriptor)
                 .then_some(())
                 .ok_or(STATUS_INVALID_PARAMETER)
         }
     }
+}
+
+fn semantic_system_registry_path(
+    path: &str,
+    current_control_set: &CurrentControlSet,
+) -> Result<Option<(String, bool)>, i32> {
+    let relative =
+        system_hive_relative_path(path, current_control_set).ok_or(STATUS_INVALID_PARAMETER)?;
+    let mut components = relative
+        .split('\\')
+        .filter(|component| !component.is_empty());
+    let Some(control_set) = components.next() else {
+        return Ok(None);
+    };
+    if !control_set.eq_ignore_ascii_case(current_control_set.as_str()) {
+        return Ok(None);
+    }
+    let Some(root) = components.next() else {
+        return Ok(None);
+    };
+    let mut semantic = String::from(r"\Registry\Machine\System\CurrentControlSet");
+    semantic.push('\\');
+    semantic.push_str(root);
+    let affects_enum = root.eq_ignore_ascii_case("Enum");
+    let included = if root.eq_ignore_ascii_case("Services") || affects_enum {
+        true
+    } else if root.eq_ignore_ascii_case("Control") {
+        let Some(control_root) = components.next() else {
+            return Ok(None);
+        };
+        semantic.push('\\');
+        semantic.push_str(control_root);
+        control_root.eq_ignore_ascii_case("ServiceGroupOrder")
+            || control_root.eq_ignore_ascii_case("Class")
+            || control_root.eq_ignore_ascii_case("Network")
+    } else {
+        false
+    };
+    if !included {
+        return Ok(None);
+    }
+    for component in components {
+        semantic.push('\\');
+        semantic.push_str(component);
+    }
+    Ok(Some((semantic, affects_enum)))
+}
+
+fn project_system_hive_mutations(
+    registry: &mut Registry,
+    current_control_set: &CurrentControlSet,
+    mutations: &[HiveMutation],
+) -> Result<bool, i32> {
+    let mut enum_changed = false;
+    for mutation in mutations {
+        let path = match mutation {
+            HiveMutation::CreateKey { path }
+            | HiveMutation::SetValue { path, .. }
+            | HiveMutation::DeleteValue { path, .. }
+            | HiveMutation::DeleteKey { path }
+            | HiveMutation::SetKeyClass { path, .. }
+            | HiveMutation::SetKeySecurity { path, .. } => path,
+        };
+        let Some((path, affects_enum)) = semantic_system_registry_path(path, current_control_set)?
+        else {
+            continue;
+        };
+        enum_changed |= affects_enum;
+        match mutation {
+            HiveMutation::CreateKey { .. } => {
+                registry.create_key(&path);
+            }
+            HiveMutation::SetValue {
+                name,
+                value_type,
+                data,
+                ..
+            } => {
+                let value_type =
+                    RegistryValueType::from_u32(*value_type).ok_or(STATUS_INVALID_PARAMETER)?;
+                let key = registry.open_key(&path).ok_or(STATUS_REGISTRY_CORRUPT)?;
+                if !registry.set_value(key, name, value_type, data.clone()) {
+                    return Err(STATUS_REGISTRY_CORRUPT);
+                }
+            }
+            HiveMutation::DeleteValue { name, .. } => {
+                let key = registry.open_key(&path).ok_or(STATUS_REGISTRY_CORRUPT)?;
+                if !registry.delete_value(key, name) {
+                    return Err(STATUS_REGISTRY_CORRUPT);
+                }
+            }
+            HiveMutation::DeleteKey { .. } => {
+                let key = registry.open_key(&path).ok_or(STATUS_REGISTRY_CORRUPT)?;
+                if !registry.delete_key(key, false) {
+                    return Err(STATUS_REGISTRY_CORRUPT);
+                }
+            }
+            HiveMutation::SetKeyClass { .. } | HiveMutation::SetKeySecurity { .. } => {
+                // Class and security metadata remain authoritative in the mounted hive. The
+                // semantic ConfigManager registry does not model either attribute.
+            }
+        }
+    }
+    Ok(enum_changed)
 }
 
 fn encode_hive_key_snapshot(
@@ -1083,6 +1187,46 @@ impl CmServer {
         }
     }
 
+    fn commit_system_hive_mutations(
+        &mut self,
+        mutations: &[HiveMutation],
+        next_generation: u64,
+    ) -> Result<(), i32> {
+        let (candidate, previous_control_set, current_control_set) = {
+            let mounted = self.system_hive.as_ref().ok_or(STATUS_DEVICE_NOT_READY)?;
+            let mut candidate = mounted.hive.clone();
+            for mutation in mutations {
+                apply_system_hive_mutation(&mut candidate, &mounted.current_control_set, mutation)?;
+            }
+            let current_control_set = candidate
+                .current_control_set()
+                .map_err(|_| STATUS_REGISTRY_CORRUPT)?;
+            (
+                candidate,
+                mounted.current_control_set.clone(),
+                current_control_set,
+            )
+        };
+
+        if previous_control_set == current_control_set {
+            let mut registry = self.cm.registry().clone();
+            let enum_changed =
+                project_system_hive_mutations(&mut registry, &current_control_set, mutations)?;
+            *self.cm.registry_mut() = registry;
+            if enum_changed {
+                self.cm.refresh_registry_devnodes();
+            }
+        } else {
+            self.cm = config_manager_from_system_hive(&candidate, &current_control_set);
+        }
+        self.system_hive = Some(MountedSystemHive {
+            hive: candidate,
+            generation: next_generation,
+            current_control_set,
+        });
+        Ok(())
+    }
+
     fn op_mutate_system_hive(&mut self, buf: &[u8]) -> CmReply {
         let Some(req) = CmHiveMutationRequest::from_bytes(buf) else {
             return reply(STATUS_INVALID_PARAMETER, 0);
@@ -1199,30 +1343,10 @@ impl CmServer {
                 let Some(next_generation) = current_generation.checked_add(1) else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, current_generation);
                 };
-                let (candidate, current_control_set) = {
-                    let mounted = self.system_hive.as_ref().unwrap();
-                    let mut candidate = mounted.hive.clone();
-                    for mutation in mutations {
-                        if let Err(status) = apply_system_hive_mutation(
-                            &mut candidate,
-                            &mounted.current_control_set,
-                            mutation,
-                        ) {
-                            return reply(status, current_generation);
-                        }
-                    }
-                    let Ok(current_control_set) = candidate.current_control_set() else {
-                        return reply(STATUS_REGISTRY_CORRUPT, current_generation);
-                    };
-                    (candidate, current_control_set)
-                };
-                let cm = config_manager_from_system_hive(&candidate, &current_control_set);
-                self.cm = cm;
-                self.system_hive = Some(MountedSystemHive {
-                    hive: candidate,
-                    generation: next_generation,
-                    current_control_set,
-                });
+                if let Err(status) = self.commit_system_hive_mutations(&mutations, next_generation)
+                {
+                    return reply(status, current_generation);
+                }
                 reply_with_info(STATUS_SUCCESS, 0, next_generation, req.lease_token)
             }
             hive_mutation_transfer::ABORT => {
@@ -1788,7 +1912,9 @@ mod tests {
         device_property_transfer, driver_service_transfer, CmDevicePropertyRequest,
         CmDriverServiceRequest, CM_ABI_VERSION,
     };
-    use nt_config_manager::{encode_sz, ENUM_PATH, SERVICES_PATH, SERVICE_DEMAND_START};
+    use nt_config_manager::{
+        encode_sz, PropertyValue, ENUM_PATH, SERVICES_PATH, SERVICE_DEMAND_START,
+    };
     use nt_hive_core::{encode_image, Hive, HiveKind};
 
     const INSTANCE: &str = r"PCI\VEN_8086&DEV_100E\0001";
@@ -2556,5 +2682,170 @@ mod tests {
         let mounted = server.system_hive.as_ref().unwrap();
         assert_eq!(mounted.generation, 2);
         assert_eq!(mounted.current_control_set.as_str(), "ControlSet002");
+    }
+
+    #[test]
+    fn semantic_system_paths_follow_only_the_selected_imported_subtrees() {
+        let hive = selected_system_hive(2);
+        let current_control_set = hive.current_control_set().unwrap();
+        assert_eq!(
+            semantic_system_registry_path(
+                r"\Registry\Machine\System\CurrentControlSet\Services\Live",
+                &current_control_set,
+            )
+            .unwrap(),
+            Some((
+                String::from(r"\Registry\Machine\System\CurrentControlSet\Services\Live"),
+                false,
+            ))
+        );
+        assert_eq!(
+            semantic_system_registry_path(
+                r"\Registry\Machine\System\ControlSet002\Enum\ROOT\LIVE\0000",
+                &current_control_set,
+            )
+            .unwrap(),
+            Some((
+                String::from(r"\Registry\Machine\System\CurrentControlSet\Enum\ROOT\LIVE\0000"),
+                true,
+            ))
+        );
+        assert_eq!(
+            semantic_system_registry_path(
+                r"\Registry\Machine\System\ControlSet001\Services\Inactive",
+                &current_control_set,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            semantic_system_registry_path(
+                r"\Registry\Machine\System\CurrentControlSet\Control\Print",
+                &current_control_set,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            semantic_system_registry_path(
+                r"\Registry\Machine\System\CurrentControlSet\Setup",
+                &current_control_set,
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn system_mutation_commit_preserves_live_pnp_state_and_updates_semantics() {
+        let mut hive = selected_system_hive(1);
+        let enum_key = hive.create_key(&alloc::format!(r"ControlSet001\Enum\{INSTANCE}"));
+        assert!(hive.set_value(
+            enum_key,
+            "PdoName",
+            RegistryValueType::Sz,
+            encode_sz(r"\Device\NTPNP_PCI0001"),
+        ));
+        hive.finish_clean_import();
+
+        let mut server = CmServer::new();
+        assert_eq!(publish_hive(&mut server, &encode_image(&hive)), 1);
+        let devnode = server.config().devnode(INSTANCE).unwrap().id;
+        assert!(server.config_mut().set_legacy_property(
+            devnode,
+            device_property::FRIENDLY_NAME,
+            PropertyValue::string("runtime property"),
+        ));
+        let interface = server
+            .config_mut()
+            .register_interface(
+                devnode,
+                "{4D36E972-E325-11CE-BFC1-08002BE10318}",
+                "runtime",
+                true,
+            )
+            .unwrap();
+        let interface_link = server
+            .config()
+            .interface(interface)
+            .unwrap()
+            .symbolic_link
+            .clone();
+
+        let service_path =
+            String::from(r"\Registry\Machine\System\CurrentControlSet\Services\RuntimeSvc");
+        let enum_path =
+            alloc::format!(r"\Registry\Machine\System\CurrentControlSet\Enum\{INSTANCE}");
+        let mutations = vec![
+            HiveMutation::CreateKey {
+                path: service_path.clone(),
+            },
+            HiveMutation::SetValue {
+                path: service_path.clone(),
+                name: String::from("ImagePath"),
+                value_type: RegistryValueType::ExpandSz as u32,
+                data: encode_sz(r"system32\drivers\runtime.sys"),
+            },
+            HiveMutation::SetValue {
+                path: service_path.clone(),
+                name: String::from("Type"),
+                value_type: RegistryValueType::Dword as u32,
+                data: 1u32.to_le_bytes().to_vec(),
+            },
+            HiveMutation::SetValue {
+                path: service_path,
+                name: String::from("Start"),
+                value_type: RegistryValueType::Dword as u32,
+                data: SERVICE_DEMAND_START.to_le_bytes().to_vec(),
+            },
+            HiveMutation::SetValue {
+                path: enum_path,
+                name: String::from("FriendlyName"),
+                value_type: RegistryValueType::Sz as u32,
+                data: encode_sz("updated by transaction"),
+            },
+            HiveMutation::CreateKey {
+                path: String::from(
+                    r"\Registry\Machine\System\CurrentControlSet\Control\Print\IgnoredByCm",
+                ),
+            },
+        ];
+        assert_eq!(server.commit_system_hive_mutations(&mutations, 2), Ok(()));
+
+        let mounted = server.system_hive.as_ref().unwrap();
+        assert_eq!(mounted.generation, 2);
+        assert!(mounted
+            .hive
+            .open_key(r"ControlSet001\Control\Print\IgnoredByCm")
+            .is_some());
+        assert!(server
+            .config()
+            .registry()
+            .open_key(r"\Registry\Machine\System\CurrentControlSet\Control\Print\IgnoredByCm")
+            .is_none());
+        assert_eq!(
+            server
+                .config()
+                .service_metadata("RuntimeSvc")
+                .unwrap()
+                .image_path
+                .as_deref(),
+            Some(r"system32\drivers\runtime.sys")
+        );
+        let refreshed = server.config().devnode(INSTANCE).unwrap();
+        assert_eq!(refreshed.id, devnode);
+        assert_eq!(
+            server
+                .config()
+                .query_legacy_property(devnode, device_property::FRIENDLY_NAME)
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("runtime property")
+        );
+        assert_eq!(
+            server.config().interface(interface).unwrap().symbolic_link,
+            interface_link
+        );
     }
 }
