@@ -13,8 +13,8 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use nt_io_abi::{
-    ioctl, major, valid_quota_parameters, valid_set_information_control, IrpDispatchRequest,
-    IO_ABI_VERSION,
+    ioctl, major, valid_ea_parameters, valid_quota_parameters, valid_set_information_control,
+    IrpDispatchRequest, IO_ABI_VERSION,
 };
 use nt_status::NtStatus;
 
@@ -149,6 +149,10 @@ fn build_dispatch_request(
         crate::irp::IoParameters::SetInformation(p) => {
             (p.info_class, p.length, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
         }
+        crate::irp::IoParameters::QueryEa(p) => {
+            (0, p.ea_list_length, p.length, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        }
+        crate::irp::IoParameters::SetEa(p) => (0, p.length, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
         crate::irp::IoParameters::QueryQuota(p) => {
             let input_len = p.input_length().ok_or(NtStatus::INVALID_PARAMETER)?;
             (
@@ -196,6 +200,12 @@ fn build_dispatch_request(
             parameters.control.wire_value()
         }
         _ => 0,
+    };
+    let (ea_list_length, ea_index) = match &irp.parameters {
+        crate::irp::IoParameters::QueryEa(parameters) => {
+            (parameters.ea_list_length, parameters.ea_index)
+        }
+        _ => (0, 0),
     };
     Ok(IrpDispatchRequest {
         abi_version: IO_ABI_VERSION as u16,
@@ -247,6 +257,8 @@ fn build_dispatch_request(
         create_ea_length,
         quota_sid_list_length,
         quota_start_sid_length,
+        ea_list_length,
+        ea_index,
         parameter_offset,
         parameter_len,
         stack_location: irp.stack_location as u32,
@@ -421,6 +433,12 @@ impl DriverPeerTransport for MockDriverPeer {
                 request.quota_start_sid_length,
                 request.input_len,
             )
+            || !valid_ea_parameters(
+                request.major,
+                request.ea_list_length,
+                request.ea_index,
+                request.input_len,
+            )
             || (request.major != major::IRP_MJ_SET_INFORMATION
                 && (request.target_file_id != 0 || request.set_information_control != 0))
             || (request.target_file_id != 0 && !matches!(request.ioctl_code, 10 | 11 | 31))
@@ -433,6 +451,10 @@ impl DriverPeerTransport for MockDriverPeer {
             request.major,
             major::IRP_MJ_READ
                 | major::IRP_MJ_WRITE
+                | major::IRP_MJ_QUERY_EA
+                | major::IRP_MJ_SET_EA
+                | major::IRP_MJ_QUERY_QUOTA
+                | major::IRP_MJ_SET_QUOTA
                 | major::IRP_MJ_DEVICE_CONTROL
                 | major::IRP_MJ_INTERNAL_DEVICE_CONTROL
         );
@@ -510,6 +532,8 @@ impl DriverPeerTransport for MockDriverPeer {
             }
             major::IRP_MJ_QUERY_INFORMATION
             | major::IRP_MJ_SET_INFORMATION
+            | major::IRP_MJ_QUERY_EA
+            | major::IRP_MJ_SET_EA
             | major::IRP_MJ_QUERY_QUOTA
             | major::IRP_MJ_SET_QUOTA => DispatchOutcome::Completed {
                 status: NtStatus::SUCCESS,

@@ -70,8 +70,10 @@ pub enum NativeService {
     NtCreateNamedPipeFile,
     NtFsControlFile,
     NtQueryDirectoryFile,
+    NtQueryEaFile,
     NtQueryInformationFile,
     NtSetInformationFile,
+    NtSetEaFile,
     NtQueryQuotaInformationFile,
     NtSetQuotaInformationFile,
     NtFlushBuffersFile,
@@ -272,8 +274,10 @@ impl NativeService {
             NtCreateNamedPipeFile => "NtCreateNamedPipeFile",
             NtFsControlFile => "NtFsControlFile",
             NtQueryDirectoryFile => "NtQueryDirectoryFile",
+            NtQueryEaFile => "NtQueryEaFile",
             NtQueryInformationFile => "NtQueryInformationFile",
             NtSetInformationFile => "NtSetInformationFile",
+            NtSetEaFile => "NtSetEaFile",
             NtQueryQuotaInformationFile => "NtQueryQuotaInformationFile",
             NtSetQuotaInformationFile => "NtSetQuotaInformationFile",
             NtFlushBuffersFile => "NtFlushBuffersFile",
@@ -579,6 +583,8 @@ impl NativeService {
         NativeService::NtSetContextThread,
         NativeService::NtQueryQuotaInformationFile,
         NativeService::NtSetQuotaInformationFile,
+        NativeService::NtQueryEaFile,
+        NativeService::NtSetEaFile,
     ];
 }
 

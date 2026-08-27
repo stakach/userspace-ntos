@@ -107,6 +107,15 @@ pub enum WdmIoStackParameters {
         target_file_object: u64,
         control: crate::SetInformationControl,
     },
+    QueryEa {
+        length: u32,
+        ea_list: u64,
+        ea_list_length: u32,
+        ea_index: u32,
+    },
+    SetEa {
+        length: u32,
+    },
     QueryQuota {
         length: u32,
         sid_list: u64,
@@ -317,6 +326,20 @@ pub fn write_wdm_io_stack_location(
             put_u32(bytes, 0x10, information_class);
             put_u64(bytes, 0x18, target_file_object);
             put_u32(bytes, 0x20, control.wire_value());
+        }
+        WdmIoStackParameters::QueryEa {
+            length,
+            ea_list,
+            ea_list_length,
+            ea_index,
+        } => {
+            put_u32(bytes, 0x08, length);
+            put_u64(bytes, 0x10, ea_list);
+            put_u32(bytes, 0x18, ea_list_length);
+            put_u32(bytes, 0x1c, ea_index);
+        }
+        WdmIoStackParameters::SetEa { length } => {
+            put_u32(bytes, 0x08, length);
         }
         WdmIoStackParameters::QueryQuota {
             length,

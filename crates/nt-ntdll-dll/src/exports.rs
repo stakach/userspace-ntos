@@ -25345,6 +25345,7 @@ zw_alias!(
     "ZwSetDefaultUILanguage",
     nt_set_default_ui_language
 );
+zw_alias!(zw_set_ea_file, "ZwSetEaFile", nt_set_ea_file);
 zw_alias!(zw_set_event, "ZwSetEvent", nt_set_event);
 zw_alias!(
     zw_set_information_debug_object,
@@ -30313,6 +30314,7 @@ pub unsafe extern "C" fn export_anchor() {
         zw_set_default_hard_error_port as *const () as usize,
         zw_set_default_locale as *const () as usize,
         zw_set_default_ui_language as *const () as usize,
+        zw_set_ea_file as *const () as usize,
         zw_set_event as *const () as usize,
         zw_set_information_debug_object as *const () as usize,
         zw_set_information_file as *const () as usize,

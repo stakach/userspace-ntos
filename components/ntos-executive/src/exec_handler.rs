@@ -19860,6 +19860,48 @@ impl ExecNtHandler {
         ))
     }
 
+    unsafe fn dispatch_hosted_file_query_ea_for(
+        &mut self,
+        route: HostedFileRoute,
+        parameters: nt_io_manager::QueryEaParameters,
+        stack_flags: nt_io_manager::StackFlags,
+        ea_list: &[u8],
+        output: &mut [u8],
+    ) -> Result<(i32, u64, u64), u32> {
+        let (status, information, pending_irp_id, _) =
+            driver_launch::dispatch_hosted_file_query_ea_irp_result_exact(
+                route.file_id,
+                self.current_tid,
+                parameters,
+                stack_flags,
+                ea_list,
+                output,
+            )?;
+        Ok((
+            status,
+            information,
+            pending_irp_id.map(|irp_id| irp_id.raw()).unwrap_or(0),
+        ))
+    }
+
+    unsafe fn dispatch_hosted_file_set_ea_for(
+        &mut self,
+        route: HostedFileRoute,
+        input: &[u8],
+    ) -> Result<(i32, u64, u64), u32> {
+        let (status, information, pending_irp_id, _) =
+            driver_launch::dispatch_hosted_file_set_ea_irp_result_exact(
+                route.file_id,
+                self.current_tid,
+                input,
+            )?;
+        Ok((
+            status,
+            information,
+            pending_irp_id.map(|irp_id| irp_id.raw()).unwrap_or(0),
+        ))
+    }
+
     unsafe fn dispatch_hosted_file_set_quota_for(
         &mut self,
         route: HostedFileRoute,
@@ -19876,6 +19918,202 @@ impl ExecNtHandler {
             information,
             pending_irp_id.map(|irp_id| irp_id.raw()).unwrap_or(0),
         ))
+    }
+
+    unsafe fn service_hosted_query_ea(
+        &mut self,
+        handle: u64,
+        iosb: u64,
+        output_va: u64,
+        route: HostedFileRoute,
+        parameters: nt_io_manager::QueryEaParameters,
+        stack_flags: nt_io_manager::StackFlags,
+        ea_list: &[u8],
+        output: &mut [u8],
+    ) -> (u32, u64) {
+        let file_id = route.file_id;
+        let synchronous_file = match self.file_completion.is_synchronous(file_id) {
+            Ok(synchronous) => synchronous,
+            Err(status) => return (status, 0),
+        };
+        if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
+            || !wait_reply_pool_has_free()
+            || !self.reserve_pending_file_io_owner()
+        {
+            return (nt_io_completion::STATUS_INSUFFICIENT_RESOURCES, 0);
+        }
+        let Some(granted_access) = self.hosted_file_access_for(handle) else {
+            return (nt_fs::STATUS_INVALID_HANDLE, 0);
+        };
+        match self.prepare_hosted_file_io(route, handle, granted_access) {
+            Ok(true) => {}
+            Ok(false) => return (STATUS_PENDING, 0),
+            Err(status) => return (status, 0),
+        }
+        if self.file_completion.set_signaled(file_id, false).is_err() {
+            self.release_file_reference(file_id);
+            return (nt_fs::STATUS_INVALID_HANDLE, 0);
+        }
+
+        let output_capacity = output.len();
+        let (mut status, mut information, pending_irp_id) =
+            match self.dispatch_hosted_file_query_ea_for(
+                route,
+                parameters,
+                stack_flags,
+                ea_list,
+                output,
+            ) {
+                Ok((driver_status, completed, irp_id)) => {
+                    (driver_status as u32, completed, irp_id)
+                }
+                Err(route_status) => (route_status, 0, 0),
+            };
+        if status == STATUS_PENDING {
+            if pending_irp_id == 0 {
+                status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
+                information = 0;
+                if synchronous_file {
+                    let _ = self.signal_file_completion(file_id, status);
+                }
+                self.release_file_reference(file_id);
+            } else {
+                self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
+                    file_id,
+                    irp_id: pending_irp_id,
+                    major: major::IRP_MJ_QUERY_EA,
+                    control_code: 0,
+                    operation: nt_io_manager::PendingFileIoOperation::Transfer,
+                    delivery_state: 0,
+                    pi: self.pi as u32,
+                    tid: self.current_tid,
+                    sync_lock_owner_tid: 0,
+                    badge: self.current_badge,
+                    consumer_abandoned: false,
+                    user_apc_interrupt_requested: false,
+                    output_va,
+                    output_len: output_capacity as u32,
+                    output_offset: 0,
+                    iosb_va: iosb,
+                    apc_routine: 0,
+                    apc_context: 0,
+                    completion_port_suppressed: true,
+                    signal_file: synchronous_file,
+                    publish_iocp: false,
+                    event_obj_idx: u64::MAX,
+                    reply_cap: 0,
+                    reply_required: false,
+                    native_call_transport: false,
+                    reply_mrs: [0; 18],
+                    resume_ip: 0,
+                    resume_sp: 0,
+                    resume_flags: 0,
+                });
+                self.pending_file_io_wait = true;
+            }
+        } else {
+            let copy_len = information
+                .min(output_capacity as u64)
+                .min(output.len() as u64) as usize;
+            if copy_len != 0 && !self.xas_try_write_buf(output_va, &output[..copy_len]) {
+                status = STATUS_ACCESS_VIOLATION;
+                information = 0;
+            }
+            if synchronous_file {
+                let _ = self.signal_file_completion(file_id, status);
+            }
+            self.release_file_reference(file_id);
+        }
+        (status, information)
+    }
+
+    unsafe fn service_hosted_set_ea(
+        &mut self,
+        handle: u64,
+        iosb: u64,
+        route: HostedFileRoute,
+        input: &[u8],
+    ) -> (u32, u64) {
+        let file_id = route.file_id;
+        let synchronous_file = match self.file_completion.is_synchronous(file_id) {
+            Ok(synchronous) => synchronous,
+            Err(status) => return (status, 0),
+        };
+        if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
+            || !wait_reply_pool_has_free()
+            || !self.reserve_pending_file_io_owner()
+        {
+            return (nt_io_completion::STATUS_INSUFFICIENT_RESOURCES, 0);
+        }
+        let Some(granted_access) = self.hosted_file_access_for(handle) else {
+            return (nt_fs::STATUS_INVALID_HANDLE, 0);
+        };
+        match self.prepare_hosted_file_io(route, handle, granted_access) {
+            Ok(true) => {}
+            Ok(false) => return (STATUS_PENDING, 0),
+            Err(status) => return (status, 0),
+        }
+        if self.file_completion.set_signaled(file_id, false).is_err() {
+            self.release_file_reference(file_id);
+            return (nt_fs::STATUS_INVALID_HANDLE, 0);
+        }
+
+        let (mut status, mut information, pending_irp_id) =
+            match self.dispatch_hosted_file_set_ea_for(route, input) {
+                Ok((driver_status, completed, irp_id)) => {
+                    (driver_status as u32, completed, irp_id)
+                }
+                Err(route_status) => (route_status, 0, 0),
+            };
+        if status == STATUS_PENDING {
+            if pending_irp_id == 0 {
+                status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
+                information = 0;
+                if synchronous_file {
+                    let _ = self.signal_file_completion(file_id, status);
+                }
+                self.release_file_reference(file_id);
+            } else {
+                self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
+                    file_id,
+                    irp_id: pending_irp_id,
+                    major: major::IRP_MJ_SET_EA,
+                    control_code: 0,
+                    operation: nt_io_manager::PendingFileIoOperation::Transfer,
+                    delivery_state: 0,
+                    pi: self.pi as u32,
+                    tid: self.current_tid,
+                    sync_lock_owner_tid: 0,
+                    badge: self.current_badge,
+                    consumer_abandoned: false,
+                    user_apc_interrupt_requested: false,
+                    output_va: 0,
+                    output_len: 0,
+                    output_offset: 0,
+                    iosb_va: iosb,
+                    apc_routine: 0,
+                    apc_context: 0,
+                    completion_port_suppressed: true,
+                    signal_file: synchronous_file,
+                    publish_iocp: false,
+                    event_obj_idx: u64::MAX,
+                    reply_cap: 0,
+                    reply_required: false,
+                    native_call_transport: false,
+                    reply_mrs: [0; 18],
+                    resume_ip: 0,
+                    resume_sp: 0,
+                    resume_flags: 0,
+                });
+                self.pending_file_io_wait = true;
+            }
+        } else {
+            if synchronous_file {
+                let _ = self.signal_file_completion(file_id, status);
+            }
+            self.release_file_reference(file_id);
+        }
+        (status, information)
     }
 
     unsafe fn service_hosted_query_quota(
@@ -30363,6 +30601,180 @@ impl ExecNtHandler {
                     return nt_syscall::STATUS_ACCESS_VIOLATION;
                 }
                 nt_fs::STATUS_SUCCESS
+            },
+            // NtQueryEaFile(FileHandle, IoStatusBlock, Buffer, Length, ReturnSingleEntry,
+            // EaList, EaListLength, EaIndex, RestartScan).
+            NativeService::NtQueryEaFile => unsafe {
+                let iosb = args[1];
+                let output = args[2];
+                let length = nt_ulong_arg(args[3]) as usize;
+                if iosb == 0 || iosb & 7 != 0 {
+                    return if iosb == 0 {
+                        STATUS_ACCESS_VIOLATION
+                    } else {
+                        STATUS_DATATYPE_MISALIGNMENT
+                    };
+                }
+                if length != 0 && (output == 0 || output & 3 != 0) {
+                    return if output == 0 {
+                        STATUS_ACCESS_VIOLATION
+                    } else {
+                        STATUS_DATATYPE_MISALIGNMENT
+                    };
+                }
+                if !self.probe_user_output(iosb, 16)
+                    || !self.probe_user_output(output, length)
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+
+                let mut ea_index = 0u32;
+                let index_specified = args[7] != 0;
+                if index_specified {
+                    if args[7] & 3 != 0 {
+                        return STATUS_DATATYPE_MISALIGNMENT;
+                    }
+                    let mut bytes = [0u8; 4];
+                    if !self.xas_read(args[7], &mut bytes) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    ea_index = u32::from_le_bytes(bytes);
+                }
+
+                let requested_ea_list_length = nt_ulong_arg(args[6]) as usize;
+                let ea_list_length = if args[5] != 0 && requested_ea_list_length != 0 {
+                    if args[5] & 3 != 0 {
+                        return STATUS_DATATYPE_MISALIGNMENT;
+                    }
+                    requested_ea_list_length
+                } else {
+                    0
+                };
+                let mut ea_list = match try_zeroed_transfer_buffer(ea_list_length) {
+                    Ok(bytes) => bytes,
+                    Err(status) => return status,
+                };
+                if ea_list_length != 0 {
+                    if !self.xas_read(args[5], &mut ea_list) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    if let Err(error) = nt_io_manager::validate_get_ea_buffer(&ea_list) {
+                        let status = nt_status::NtStatus::EA_LIST_INCONSISTENT.raw() as u32;
+                        let _ = self.write_current_iosb(iosb, status, error.offset as u64);
+                        return status;
+                    }
+                }
+
+                let io_metadata = match self.io_manager_file_query_metadata(args[0]) {
+                    Ok(metadata) => metadata,
+                    Err(status) => return status,
+                };
+                if !nt_io_manager::query_ea_access_granted(
+                    nt_types::AccessMask::from_bits_retain(io_metadata.access_flags),
+                ) {
+                    return STATUS_ACCESS_DENIED;
+                }
+                let Some(route) = self.hosted_file_route_for(args[0]) else {
+                    let status = STATUS_INVALID_DEVICE_REQUEST;
+                    let _ = self.write_current_iosb(iosb, status, 0);
+                    return status;
+                };
+
+                let mut routed_output = match try_zeroed_transfer_buffer(length) {
+                    Ok(bytes) => bytes,
+                    Err(status) => return status,
+                };
+                let parameters = nt_io_manager::QueryEaParameters {
+                    length: length as u32,
+                    ea_list_length: ea_list_length as u32,
+                    ea_index,
+                };
+                let mut stack_flags = nt_io_manager::StackFlags::empty();
+                if args[8] as u8 != 0 {
+                    stack_flags |= nt_io_manager::StackFlags::RESTART_SCAN;
+                }
+                if args[4] as u8 != 0 {
+                    stack_flags |= nt_io_manager::StackFlags::RETURN_SINGLE_ENTRY;
+                }
+                if index_specified {
+                    stack_flags |= nt_io_manager::StackFlags::INDEX_SPECIFIED;
+                }
+                let (status, information) = self.service_hosted_query_ea(
+                    args[0],
+                    iosb,
+                    output,
+                    route,
+                    parameters,
+                    stack_flags,
+                    &ea_list,
+                    &mut routed_output,
+                );
+                if status != STATUS_PENDING
+                    && !self.write_current_iosb(iosb, status, information)
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                status
+            },
+            // NtSetEaFile(FileHandle, IoStatusBlock, Buffer, Length).
+            NativeService::NtSetEaFile => unsafe {
+                let iosb = args[1];
+                let input = args[2];
+                let length = nt_ulong_arg(args[3]) as usize;
+                if iosb == 0 || iosb & 7 != 0 {
+                    return if iosb == 0 {
+                        STATUS_ACCESS_VIOLATION
+                    } else {
+                        STATUS_DATATYPE_MISALIGNMENT
+                    };
+                }
+                if length != 0 && (input == 0 || input & 3 != 0) {
+                    return if input == 0 {
+                        STATUS_ACCESS_VIOLATION
+                    } else {
+                        STATUS_DATATYPE_MISALIGNMENT
+                    };
+                }
+                if !self.probe_user_output(iosb, 16) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let mut captured = match try_zeroed_transfer_buffer(length) {
+                    Ok(bytes) => bytes,
+                    Err(status) => return status,
+                };
+                if length != 0 {
+                    if !self.xas_read(input, &mut captured) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    if let Err(error) = nt_io_manager::validate_ea_buffer(&captured) {
+                        let status = nt_status::NtStatus::EA_LIST_INCONSISTENT.raw() as u32;
+                        let _ = self.write_current_iosb(iosb, status, error.offset as u64);
+                        return status;
+                    }
+                }
+
+                let io_metadata = match self.io_manager_file_query_metadata(args[0]) {
+                    Ok(metadata) => metadata,
+                    Err(status) => return status,
+                };
+                if !nt_io_manager::set_ea_access_granted(
+                    nt_types::AccessMask::from_bits_retain(io_metadata.access_flags),
+                ) {
+                    return STATUS_ACCESS_DENIED;
+                }
+                let Some(route) = self.hosted_file_route_for(args[0]) else {
+                    let status = STATUS_INVALID_DEVICE_REQUEST;
+                    let _ = self.write_current_iosb(iosb, status, 0);
+                    return status;
+                };
+                let (status, information) =
+                    self.service_hosted_set_ea(args[0], iosb, route, &captured);
+                if status != STATUS_PENDING
+                    && !self.write_current_iosb(iosb, status, information)
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                status
             },
             // NtQueryQuotaInformationFile(FileHandle, IoStatusBlock, Buffer, Length,
             // ReturnSingleEntry, SidList, SidListLength, StartSid, RestartScan).

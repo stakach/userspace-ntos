@@ -253,6 +253,21 @@ fn quota_services_register_with_native_numbers_and_argument_contracts() {
 }
 
 #[test]
+fn ea_services_register_with_native_numbers_and_argument_contracts() {
+    let cases = [
+        (NativeService::NtQueryEaFile, "NtQueryEaFile", 154, 9),
+        (NativeService::NtSetEaFile, "NtSetEaFile", 227, 4),
+    ];
+    let table = NativeServiceTable::test_profile();
+    for (service, name, ssn, argc) in cases {
+        assert_eq!(service.name(), name);
+        assert_eq!(service.arg_count(), (argc, argc));
+        assert_eq!(nt_syscall_abi::ssn_of(name), Some(ssn));
+        assert!(table.number_of(service).is_some());
+    }
+}
+
+#[test]
 fn query_full_attributes_file_registers_with_native_contract() {
     assert_eq!(
         NativeService::NtQueryFullAttributesFile.name(),

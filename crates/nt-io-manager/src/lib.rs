@@ -84,7 +84,10 @@ pub use driver_host::{DriverHostRoutine, MvpStatus};
 pub use driver_peer::{
     DriverPeerBackend, DriverPeerTransport, MockDriverPeer, MockPeerControl, PeerTransferBuffers,
 };
-pub use ea::{validate_ea_buffer, EaValidationError};
+pub use ea::{
+    query_ea_access_granted, set_ea_access_granted, validate_ea_buffer, validate_get_ea_buffer,
+    EaValidationError, QueryEaParameters, SetEaParameters,
+};
 pub use external_dispatch::{
     ExternalDispatchResult, ExternalPnpDispatchResult, PreparedExternalPnpIrp,
 };
@@ -5491,6 +5494,117 @@ mod tests {
     }
 
     #[test]
+    fn peer_ea_wire_preserves_name_list_index_and_stack_flags() {
+        let control = MockPeerControl::new();
+        let mut om = io();
+        let client = om.register_client();
+        let (backend, _) = peer_backend(&mut om, &control);
+        let mut dispatch = MajorFunctionTable::new();
+        for major in [
+            major::IRP_MJ_CREATE,
+            major::IRP_MJ_CLEANUP,
+            major::IRP_MJ_CLOSE,
+            major::IRP_MJ_QUERY_EA,
+            major::IRP_MJ_SET_EA,
+        ] {
+            dispatch.set(major, DispatchTarget::DriverPeer(DriverPeerId(0)));
+        }
+        let driver = om
+            .create_driver_peer_with_major_table(
+                &path("\\Driver\\EaPeer"),
+                Box::new(backend),
+                dispatch,
+            )
+            .unwrap();
+        om.create_device(
+            driver,
+            Some(&path("\\Device\\EaPeer")),
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        )
+        .unwrap();
+        let handle = om
+            .open(
+                client,
+                &path("\\Device\\EaPeer"),
+                AccessMask::GENERIC_READ | AccessMask::GENERIC_WRITE,
+                ShareAccess::empty(),
+                CreateOptions::empty(),
+                0,
+            )
+            .unwrap();
+        let (file, device, _) = om
+            .reference_open_file_details(client, handle, AccessMask::GENERIC_READ)
+            .unwrap();
+        let flags = StackFlags::RESTART_SCAN
+            | StackFlags::RETURN_SINGLE_ENTRY
+            | StackFlags::INDEX_SPECIFIED;
+        let mut query_buffer = [0u8; 80];
+        assert_eq!(
+            om.build_and_dispatch_external_to_device_with_stack_flags(
+                client,
+                device,
+                Some(file),
+                0,
+                21,
+                major::IRP_MJ_QUERY_EA,
+                IoParameters::QueryEa(QueryEaParameters {
+                    length: 64,
+                    ea_list_length: 16,
+                    ea_index: 7,
+                }),
+                flags,
+                16,
+                64,
+                &mut query_buffer,
+            ),
+            Ok(ExternalDispatchResult::Completed {
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: None,
+            })
+        );
+        let request = control.last_request().unwrap();
+        assert_eq!(request.major, major::IRP_MJ_QUERY_EA);
+        assert_eq!(request.flags as u8, 0x07);
+        assert_eq!(request.input_len, 16);
+        assert_eq!(request.output_len, 64);
+        assert_eq!(request.buffer_len, 80);
+        assert_eq!(request.ea_list_length, 16);
+        assert_eq!(request.ea_index, 7);
+
+        let mut set_buffer = [0u8; 24];
+        assert_eq!(
+            om.build_and_dispatch_external_to_device(
+                client,
+                device,
+                Some(file),
+                0,
+                22,
+                major::IRP_MJ_SET_EA,
+                IoParameters::SetEa(SetEaParameters { length: 24 }),
+                24,
+                0,
+                &mut set_buffer,
+            ),
+            Ok(ExternalDispatchResult::Completed {
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: None,
+            })
+        );
+        let request = control.last_request().unwrap();
+        assert_eq!(request.major, major::IRP_MJ_SET_EA);
+        assert_eq!(request.flags, 0);
+        assert_eq!(request.input_len, 24);
+        assert_eq!(request.output_len, 0);
+        assert_eq!(request.ea_list_length, 0);
+        assert_eq!(request.ea_index, 0);
+    }
+
+    #[test]
     fn peer_direct_and_neither_ioctls_round_trip_split_buffers() {
         let ctrl = MockPeerControl::new();
         let (mut om, client, handle, _identity) =
@@ -5909,6 +6023,47 @@ mod tests {
         assert_eq!(le_u64(&stack, 0x20), 0x6666);
         assert_eq!(le_u64(&stack, 0x28), 0x4444);
         assert_eq!(le_u64(&stack, 0x30), 0x5555);
+
+        write_wdm_io_stack_location(
+            &mut stack,
+            WdmIoStackLocationInit {
+                major: major::IRP_MJ_QUERY_EA,
+                minor: 0,
+                flags: 0x07,
+                control: 0,
+                device_object: 0x4444,
+                file_object: 0x5555,
+                parameters: WdmIoStackParameters::QueryEa {
+                    length: 0x100,
+                    ea_list: 0x6666,
+                    ea_list_length: 0x20,
+                    ea_index: 7,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(stack[0x00], major::IRP_MJ_QUERY_EA);
+        assert_eq!(stack[0x02], 0x07);
+        assert_eq!(le_u32(&stack, 0x08), 0x100);
+        assert_eq!(le_u64(&stack, 0x10), 0x6666);
+        assert_eq!(le_u32(&stack, 0x18), 0x20);
+        assert_eq!(le_u32(&stack, 0x1c), 7);
+
+        write_wdm_io_stack_location(
+            &mut stack,
+            WdmIoStackLocationInit {
+                major: major::IRP_MJ_SET_EA,
+                minor: 0,
+                flags: 0,
+                control: 0,
+                device_object: 0x4444,
+                file_object: 0x5555,
+                parameters: WdmIoStackParameters::SetEa { length: 0x80 },
+            },
+        )
+        .unwrap();
+        assert_eq!(stack[0x00], major::IRP_MJ_SET_EA);
+        assert_eq!(le_u32(&stack, 0x08), 0x80);
 
         write_wdm_io_stack_location(
             &mut stack,

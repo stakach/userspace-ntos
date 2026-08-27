@@ -70,8 +70,8 @@ use nt_hosted_runtime::{
     NDIS_PROTOCOL_CHARACTERISTICS_NAME_OFFSET_X64,
 };
 use nt_io_abi::{
-    ioctl, major, valid_quota_parameters, valid_set_information_control, IrpDispatchRequest,
-    IO_ABI_VERSION,
+    ioctl, major, valid_ea_parameters, valid_quota_parameters, valid_set_information_control,
+    IrpDispatchRequest, IO_ABI_VERSION,
 };
 use nt_io_manager::{
     write_wdm_driver_object, write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
@@ -83,8 +83,9 @@ use nt_io_manager::{
     HostedDevicePropertyTransferError, HostedDevicePropertyTransferTable, HostedDomainIdentity,
     InformationParameters, IoManager, IoParameters, IrpCompletionOrigin, IrpId, IrpProjection,
     MajorFunctionTable, ObjectManagerPort, PnpBackendDispatch, PnpParameters,
-    QueryQuotaParameters, ReadWriteParameters, SetInformationControl, SetInformationParameters,
-    SetQuotaParameters, ShareAccess, StackFlags, WdmDriverObjectInit, WdmFileObjectInit,
+    QueryEaParameters, QueryQuotaParameters, ReadWriteParameters, SetEaParameters,
+    SetInformationControl, SetInformationParameters, SetQuotaParameters, ShareAccess, StackFlags,
+    WdmDriverObjectInit, WdmFileObjectInit,
     WdmIoStackLocationInit,
     WdmIoStackParameters, WdmIrpInit, WDM_X64_DRIVER_EXTENSION_OFFSET,
     WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET,
@@ -878,6 +879,7 @@ fn control_transfer_method(major: u64, code: u64) -> Option<u32> {
 fn pending_irp_returns_read_bytes(major: u64, fsctl: u64, output_len: u64) -> bool {
     major == IRP_MJ_READ
         || major == IRP_MJ_QUERY_INFORMATION
+        || major == major::IRP_MJ_QUERY_EA as u64
         || major == major::IRP_MJ_QUERY_QUOTA as u64
         || major == IRP_MJ_FILE_SYSTEM_CONTROL && fsctl == FSCTL_PIPE_TRANSCEIVE
         || control_transfer_method(major, fsctl).is_some() && output_len != 0
@@ -31025,6 +31027,14 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     ) {
         return (STATUS_INVALID_PARAMETER, 0);
     }
+    if !valid_ea_parameters(
+        major as u8,
+        request.ea_list_length,
+        request.ea_index,
+        request.input_len,
+    ) {
+        return (STATUS_INVALID_PARAMETER, 0);
+    }
     let related_file_object = if request.related_file_id == 0 {
         0
     } else {
@@ -31131,7 +31141,10 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     // - METHOD_{IN,OUT}_DIRECT: SystemBuffer owns input; MdlAddress maps the output buffer.
     // - METHOD_NEITHER: Type3InputBuffer carries input; Irp->UserBuffer carries output.
     let control_method = control_transfer_method(major, fsctl);
-    let output_is_separate = (major as u8 == major::IRP_MJ_QUERY_QUOTA
+    let output_is_separate = (matches!(
+        major as u8,
+        major::IRP_MJ_QUERY_EA | major::IRP_MJ_QUERY_QUOTA
+    )
         || matches!(
             control_method,
             Some(ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT | ioctl::METHOD_NEITHER)
@@ -31280,7 +31293,10 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 0
             },
         ),
-        _ if major as u8 == major::IRP_MJ_QUERY_QUOTA => (
+        _ if matches!(
+            major as u8,
+            major::IRP_MJ_QUERY_EA | major::IRP_MJ_QUERY_QUOTA
+        ) => (
             if outlen != 0 { data } else { 0 },
             if outlen != 0 { data } else { 0 },
             0,
@@ -31445,6 +31461,21 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 _ => SetInformationControl::None,
             },
         },
+        value if value as u8 == major::IRP_MJ_QUERY_EA => WdmIoStackParameters::QueryEa {
+            length: outlen as u32,
+            ea_list: if request.ea_list_length != 0 {
+                input_data
+            } else {
+                0
+            },
+            ea_list_length: request.ea_list_length,
+            ea_index: request.ea_index,
+        },
+        value if value as u8 == major::IRP_MJ_SET_EA => {
+            WdmIoStackParameters::SetEa {
+                length: inlen as u32,
+            }
+        }
         value if value as u8 == major::IRP_MJ_QUERY_QUOTA => {
             let sid_list_length = request.quota_sid_list_length as u64;
             let start_sid_length = request.quota_start_sid_length as u64;
@@ -31600,7 +31631,11 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             system_buffer,
             user_buffer,
             thread: s_current_process(),
-            auxiliary_buffer: if major as u8 == major::IRP_MJ_QUERY_QUOTA && inlen != 0 {
+            auxiliary_buffer: if matches!(
+                major as u8,
+                major::IRP_MJ_QUERY_EA | major::IRP_MJ_QUERY_QUOTA
+            ) && inlen != 0
+            {
                 input_data
             } else {
                 0
@@ -34643,7 +34678,10 @@ fn projection_buffer_extents(irp: &IrpProjection, cap: usize) -> (usize, usize) 
 }
 
 fn projection_uses_separate_output(irp: &IrpProjection) -> bool {
-    if matches!(irp.parameters, IoParameters::QueryQuota(_)) {
+    if matches!(
+        irp.parameters,
+        IoParameters::QueryEa(_) | IoParameters::QueryQuota(_)
+    ) {
         return true;
     }
     matches!(
@@ -34728,6 +34766,14 @@ fn hosted_irp_dispatch_request(
         },
         quota_start_sid_length: match &irp.parameters {
             IoParameters::QueryQuota(parameters) => parameters.start_sid_length,
+            _ => 0,
+        },
+        ea_list_length: match &irp.parameters {
+            IoParameters::QueryEa(parameters) => parameters.ea_list_length,
+            _ => 0,
+        },
+        ea_index: match &irp.parameters {
+            IoParameters::QueryEa(parameters) => parameters.ea_index,
             _ => 0,
         },
         buffer_id: irp.buffer.map(|buffer| buffer.buffer_id).unwrap_or(0),
@@ -35131,6 +35177,7 @@ fn external_irp_parameters(
     output_len: u32,
     create: Option<CreateParameters>,
     set_information: Option<SetInformationParameters>,
+    query_ea: Option<QueryEaParameters>,
     query_quota: Option<QueryQuotaParameters>,
 ) -> Option<IoParameters> {
     match major {
@@ -35164,6 +35211,13 @@ fn external_irp_parameters(
             (parameters.info_class == external_code(fsctl)? && parameters.length == input_len)
                 .then_some(IoParameters::SetInformation(parameters))
         }
+        major::IRP_MJ_QUERY_EA => {
+            let parameters = query_ea?;
+            (parameters.ea_list_length == input_len && parameters.length == output_len)
+                .then_some(IoParameters::QueryEa(parameters))
+        }
+        major::IRP_MJ_SET_EA => (query_ea.is_none() && output_len == 0)
+            .then_some(IoParameters::SetEa(SetEaParameters { length: input_len })),
         major::IRP_MJ_QUERY_QUOTA => {
             let parameters = query_quota?;
             (parameters.input_length() == Some(input_len) && parameters.length == output_len)
@@ -35203,6 +35257,7 @@ fn dispatch_external_irp_to_device_record_result_exact(
     out: &mut [u8],
     create: Option<CreateParameters>,
     set_information: Option<SetInformationParameters>,
+    query_ea: Option<QueryEaParameters>,
     query_quota: Option<QueryQuotaParameters>,
     stack_flags: StackFlags,
 ) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
@@ -35216,10 +35271,14 @@ fn dispatch_external_irp_to_device_record_result_exact(
         output_len,
         create,
         set_information,
+        query_ea,
         query_quota,
     )
         .ok_or(STATUS_INVALID_PARAMETER as u32)?;
-    let separate_output = (major == major::IRP_MJ_QUERY_QUOTA
+    let separate_output = (matches!(
+        major,
+        major::IRP_MJ_QUERY_EA | major::IRP_MJ_QUERY_QUOTA
+    )
         || matches!(
             control_transfer_method(major as u64, fsctl),
             Some(ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT | ioctl::METHOD_NEITHER)
@@ -35240,7 +35299,7 @@ fn dispatch_external_irp_to_device_record_result_exact(
     system_buffer.resize(system_buffer_len, 0);
     if matches!(
         major,
-        major::IRP_MJ_QUERY_INFORMATION | major::IRP_MJ_QUERY_QUOTA
+        major::IRP_MJ_QUERY_INFORMATION | major::IRP_MJ_QUERY_EA | major::IRP_MJ_QUERY_QUOTA
     ) {
         system_buffer[..out.len()].copy_from_slice(out);
     }
@@ -45090,6 +45149,7 @@ pub(crate) unsafe fn dispatch_hosted_file_irp_result_exact(
         None,
         None,
         None,
+        None,
         StackFlags::empty(),
     )
 }
@@ -45124,6 +45184,81 @@ pub(crate) unsafe fn dispatch_hosted_file_set_information_irp_result_exact(
         &mut output,
         None,
         Some(parameters),
+        None,
+        None,
+        StackFlags::empty(),
+    )
+}
+
+/// Dispatch an EA query with its captured name-list buffer kept separate from
+/// the provider's result buffer.
+pub(crate) unsafe fn dispatch_hosted_file_query_ea_irp_result_exact(
+    file_id: u64,
+    requestor_tid: u64,
+    parameters: QueryEaParameters,
+    stack_flags: StackFlags,
+    ea_list: &[u8],
+    out: &mut [u8],
+) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
+    if parameters.ea_list_length as usize != ea_list.len()
+        || parameters.length as usize != out.len()
+        || stack_flags.bits() & !0x07 != 0
+    {
+        return Err(STATUS_INVALID_PARAMETER as u32);
+    }
+    let canonical_file_id = FileId(file_id);
+    let device_id = io_manager_mut()
+        .file(canonical_file_id)
+        .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID))
+        .map(|file| file.device_id.raw())
+        .ok_or(STATUS_INVALID_HANDLE as u32)?;
+    require_hosted_device_ready_for_dispatch(device_id)?;
+    dispatch_external_irp_to_device_record_result_exact(
+        device_id,
+        Some(canonical_file_id),
+        major::IRP_MJ_QUERY_EA as u64,
+        0,
+        0,
+        requestor_tid,
+        ea_list,
+        out,
+        None,
+        None,
+        Some(parameters),
+        None,
+        stack_flags,
+    )
+}
+
+/// Dispatch a validated EA update through the canonical provider File.
+pub(crate) unsafe fn dispatch_hosted_file_set_ea_irp_result_exact(
+    file_id: u64,
+    requestor_tid: u64,
+    input: &[u8],
+) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
+    if input.len() > u32::MAX as usize {
+        return Err(STATUS_INVALID_PARAMETER as u32);
+    }
+    let canonical_file_id = FileId(file_id);
+    let device_id = io_manager_mut()
+        .file(canonical_file_id)
+        .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID))
+        .map(|file| file.device_id.raw())
+        .ok_or(STATUS_INVALID_HANDLE as u32)?;
+    require_hosted_device_ready_for_dispatch(device_id)?;
+    let mut output = [];
+    dispatch_external_irp_to_device_record_result_exact(
+        device_id,
+        Some(canonical_file_id),
+        major::IRP_MJ_SET_EA as u64,
+        0,
+        0,
+        requestor_tid,
+        input,
+        &mut output,
+        None,
+        None,
+        None,
         None,
         StackFlags::empty(),
     )
@@ -45163,6 +45298,7 @@ pub(crate) unsafe fn dispatch_hosted_file_query_quota_irp_result_exact(
         out,
         None,
         None,
+        None,
         Some(parameters),
         stack_flags,
     )
@@ -45194,6 +45330,7 @@ pub(crate) unsafe fn dispatch_hosted_file_set_quota_irp_result_exact(
         requestor_tid,
         input,
         &mut output,
+        None,
         None,
         None,
         None,
@@ -45238,6 +45375,7 @@ pub(crate) unsafe fn dispatch_hosted_file_create_irp_result_exact(
         Some(parameters),
         None,
         None,
+        None,
         StackFlags::empty(),
     )
 }
@@ -45272,6 +45410,7 @@ pub(crate) unsafe fn dispatch_hosted_target_directory_create_irp_result_exact(
         in_data,
         &mut output,
         Some(parameters),
+        None,
         None,
         None,
         StackFlags::FORCE_ACCESS_CHECK | StackFlags::OPEN_TARGET_DIRECTORY,

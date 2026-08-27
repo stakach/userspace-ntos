@@ -24,7 +24,7 @@ pub use wire::{
 };
 
 /// ABI version of this wire contract; bumped on any incompatible change.
-pub const IO_ABI_VERSION: u32 = 9;
+pub const IO_ABI_VERSION: u32 = 10;
 
 /// Validate the raw `IO_STACK_LOCATION.Parameters.SetFile` control union.
 /// `information_class` is the class carried in `IrpDispatchRequest::ioctl_code`.
@@ -62,6 +62,21 @@ pub const fn valid_quota_parameters(
         }
     } else {
         sid_list_length == 0 && start_sid_length == 0
+    }
+}
+
+/// Validate query-EA-specific parameters against the canonical auxiliary
+/// buffer extent. Other major functions must not carry EA query state.
+pub const fn valid_ea_parameters(
+    major_function: u8,
+    ea_list_length: u32,
+    ea_index: u32,
+    input_length: u32,
+) -> bool {
+    if major_function == major::IRP_MJ_QUERY_EA {
+        ea_list_length == input_length
+    } else {
+        ea_list_length == 0 && ea_index == 0
     }
 }
 
@@ -264,6 +279,8 @@ mod tests {
             set_information_control: 0x1234,
             quota_sid_list_length: 24,
             quota_start_sid_length: 12,
+            ea_list_length: 16,
+            ea_index: 7,
             stack_location: 1,
             stack_count: 3,
             ..Default::default()
@@ -295,5 +312,13 @@ mod tests {
         ));
         assert!(valid_quota_parameters(major::IRP_MJ_SET_QUOTA, 0, 0, 56));
         assert!(!valid_quota_parameters(major::IRP_MJ_SET_QUOTA, 8, 0, 56));
+    }
+
+    #[test]
+    fn ea_parameters_are_query_major_specific() {
+        assert!(valid_ea_parameters(major::IRP_MJ_QUERY_EA, 16, 7, 16));
+        assert!(!valid_ea_parameters(major::IRP_MJ_QUERY_EA, 16, 7, 12));
+        assert!(valid_ea_parameters(major::IRP_MJ_SET_EA, 0, 0, 32));
+        assert!(!valid_ea_parameters(major::IRP_MJ_SET_EA, 16, 0, 32));
     }
 }

@@ -5,8 +5,8 @@ use super::*;
 /// The exact count of `Nt*` services in the shared table: the current hosted ReactOS import set,
 /// ntdll-internal services (`NtSecureConnectPort`, `NtCallbackReturn`), and registry hive
 /// load/unload variants that route to real executive CM functionality.
-const REQUIRED_NT_COUNT: usize = 221;
-const REQUIRED_ZW_COUNT: usize = 221;
+const REQUIRED_NT_COUNT: usize = 222;
+const REQUIRED_ZW_COUNT: usize = 222;
 
 #[test]
 fn required_counts() {
@@ -129,6 +129,7 @@ fn ssn_anchors_match_reactos_and_executive() {
         ("NtQueryValueKey", 185),          // SSN_NT_QUERY_VALUE_KEY = 185
         ("NtRaiseException", 189),         // SSN_NT_RAISE_EXCEPTION = 189
         ("NtSetDebugFilterState", 222),    // SSN_NT_SET_DEBUG_FILTER_STATE = 222
+        ("NtSetEaFile", 227),
         ("NtSetQuotaInformationFile", 245),
         ("NtSetSystemPowerState", 250), // SSN_NT_SET_SYSTEM_POWER_STATE = 250
         ("NtSetUuidSeed", 255),         // SSN_NT_SET_UUID_SEED = 255

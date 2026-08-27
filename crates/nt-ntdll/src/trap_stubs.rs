@@ -338,6 +338,7 @@ generate_trap_stubs! {
         "NtSetDefaultUILanguage",
         225
     ),
+    (nt_set_ea_file, "NtSetEaFile", 227),
     (nt_set_event, "NtSetEvent", 228),
     (nt_set_information_debug_object, "NtSetInformationDebugObject", 232),
     (nt_set_information_file, "NtSetInformationFile", 233),

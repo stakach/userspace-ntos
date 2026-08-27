@@ -6,6 +6,7 @@ use nt_io_abi::{DeviceId, DriverId, FileId, IrpId};
 use nt_status::NtStatus;
 use nt_types::{AccessMask, ClientId};
 
+use crate::ea::{QueryEaParameters, SetEaParameters};
 use crate::file::{CreateOptions, ShareAccess};
 use crate::quota::{QueryQuotaParameters, SetQuotaParameters};
 
@@ -201,6 +202,8 @@ pub enum IoParameters {
     FlushBuffers,
     QueryInformation(InformationParameters),
     SetInformation(SetInformationParameters),
+    QueryEa(QueryEaParameters),
+    SetEa(SetEaParameters),
     QueryQuota(QueryQuotaParameters),
     SetQuota(SetQuotaParameters),
     Pnp(PnpParameters),
@@ -222,6 +225,8 @@ impl IoParameters {
             }
             IoParameters::QueryInformation(p) => (0, p.length.min(cap)),
             IoParameters::SetInformation(p) => (p.length.min(cap), 0),
+            IoParameters::QueryEa(p) => (p.ea_list_length.min(cap), p.length.min(cap)),
+            IoParameters::SetEa(p) => (p.length.min(cap), 0),
             IoParameters::QueryQuota(p) => (
                 p.input_length().unwrap_or(u32::MAX).min(cap),
                 p.length.min(cap),

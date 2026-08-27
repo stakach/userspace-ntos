@@ -93,6 +93,8 @@ statuses! {
     INVALID_SID = 0xC000_0078u32;
     /// A variable-length quota entry chain is malformed.
     QUOTA_LIST_INCONSISTENT = 0xC000_0266u32;
+    /// A variable-length EA name or value chain is malformed.
+    EA_LIST_INCONSISTENT = 0x8000_0014u32;
     /// The requested address range conflicts with an existing resource assignment.
     CONFLICTING_ADDRESSES = 0xC000_0018u32;
     /// Access was denied.
