@@ -14540,6 +14540,32 @@ impl ExecNtHandler {
         Some(length)
     }
 
+    fn object_namespace_absolute_name_into(
+        &self,
+        root_index: usize,
+        name: &[u8],
+        output: &mut [u8],
+    ) -> Option<usize> {
+        if name.first() == Some(&b'\\') {
+            if name.len() > output.len() {
+                return None;
+            }
+            output[..name.len()].copy_from_slice(name);
+            return Some(name.len());
+        }
+        let root_len = self.object_namespace_path_exact(root_index, output)?;
+        let separator = usize::from(root_len > 1 && output[root_len - 1] != b'\\');
+        let length = root_len.checked_add(separator)?.checked_add(name.len())?;
+        if name.is_empty() || length > output.len() {
+            return None;
+        }
+        if separator != 0 {
+            output[root_len] = b'\\';
+        }
+        output[root_len + separator..length].copy_from_slice(name);
+        Some(length)
+    }
+
     fn write_ascii_utf16le(src: &[u8], dst: &mut [u8]) -> usize {
         let mut n = 0usize;
         for &b in src {
@@ -18988,12 +19014,19 @@ impl ExecNtHandler {
                 Err(nt_fs::STATUS_NOT_SAME_DEVICE)
             }
             FileParseRoot::NonDirectoryFile => Err(nt_fs::STATUS_NOT_A_DIRECTORY),
-            FileParseRoot::Absolute => driver_launch::hosted_file_device_relative_name(
-                source.file_id,
-                name,
-                open_name,
-            )
-            .map(HostedSetFileNameTarget::OpenParent),
+            FileParseRoot::Absolute => {
+                let mut canonical = [0u16; FILE_OBJECT_NAME_CAP];
+                let canonical_len = unsafe {
+                    crate::object_manager_reparse_file_path(name, &mut canonical)
+                }
+                .map_err(|status| status.raw() as u32)?;
+                driver_launch::hosted_file_device_relative_name(
+                    source.file_id,
+                    &canonical[..canonical_len],
+                    open_name,
+                )
+                .map(HostedSetFileNameTarget::OpenParent)
+            }
             FileParseRoot::ObjectDirectory { .. } => Err(nt_fs::STATUS_INVALID_HANDLE),
         }
     }
@@ -19241,7 +19274,21 @@ impl ExecNtHandler {
         {
             return;
         }
-        match entry.kind {
+        let kind = entry.kind;
+        let mirrored_symbolic_link = kind == OBJ_KIND_SYMBOLIC_LINK && entry.payload != 0;
+        let mut mirrored_path = [0u8; NAMED_OBJECT_PATH_CAP];
+        if mirrored_symbolic_link {
+            let Some(length) = self.object_namespace_path_exact(index, &mut mirrored_path) else {
+                return;
+            };
+            let Ok(path) = core::str::from_utf8(&mirrored_path[..length]) else {
+                return;
+            };
+            if unsafe { crate::object_manager_delete_symbolic_link_path(path) }.is_err() {
+                return;
+            }
+        }
+        match kind {
             OBJ_KIND_DIRECTORY | OBJ_KIND_SYMBOLIC_LINK | OBJ_KIND_LPC_PORT => {}
             OBJ_KIND_EVENT => {
                 self.events.remove_existing(index as u64);
@@ -28992,17 +29039,32 @@ impl ExecNtHandler {
                     Ok(target) => target,
                     Err(status) => return status,
                 };
+                if target16.len() > OBJ_NAME_CAP
+                    || target16.iter().any(|unit| *unit > 0x7f)
+                {
+                    return nt_fs::STATUS_OBJECT_NAME_INVALID;
+                }
                 let mut tbuf = [0u8; OBJ_NAME_CAP]; // keep the target's case (a device path)
-                let mut tl = 0;
-                for &w in &target16 {
-                    if tl >= tbuf.len() {
-                        break;
-                    }
-                    tbuf[tl] = w as u8;
-                    tl += 1;
+                let tl = target16.len();
+                for (byte, &unit) in tbuf[..tl].iter_mut().zip(&target16) {
+                    *byte = unit as u8;
                 }
                 drop(target16);
                 drop(transient_scope);
+                let mut absolute_link = [0u8; NAMED_OBJECT_PATH_CAP];
+                let Some(absolute_link_len) =
+                    self.object_namespace_absolute_name_into(root_idx, path, &mut absolute_link)
+                else {
+                    return nt_fs::STATUS_OBJECT_NAME_INVALID;
+                };
+                let Some(absolute_link) =
+                    core::str::from_utf8(&absolute_link[..absolute_link_len]).ok()
+                else {
+                    return nt_fs::STATUS_OBJECT_NAME_INVALID;
+                };
+                let Some(target) = core::str::from_utf8(&tbuf[..tl]).ok() else {
+                    return nt_fs::STATUS_OBJECT_NAME_INVALID;
+                };
                 match self.obj_resolve_open_link(path, root_idx) {
                     Some(index) if self.obj_ns[index].kind == OBJ_KIND_SYMBOLIC_LINK => {
                         let Some(handle) = self.mint_object_namespace_handle(index, desired_access)
@@ -29026,16 +29088,37 @@ impl ExecNtHandler {
                         permanent,
                     ) {
                         Some(index) => {
+                            let mirror_id = match crate::object_manager_create_symbolic_link_path_with_permanence(
+                                absolute_link,
+                                target,
+                                permanent,
+                            ) {
+                                Ok(id) => id,
+                                Err(status) => {
+                                    self.rollback_new_namespace_object(index);
+                                    return status.raw() as u32;
+                                }
+                            };
+                            self.obj_ns[index].payload = mirror_id;
                             let Some(handle) =
                                 self.mint_object_namespace_handle(index, desired_access)
                             else {
+                                let _ = crate::object_manager_delete_symbolic_link_path(
+                                    absolute_link,
+                                );
                                 self.rollback_new_namespace_object(index);
                                 return 0xC000_009A;
                             };
                             if !self.xas_write_u64(out, handle) {
+                                // Keep handle-close cleanup local; this failed create is rolled back
+                                // explicitly in both namespace authorities below.
+                                self.obj_ns[index].payload = 0;
                                 if let Some(pid) = self.pm_pid_for_pi(self.pi) {
                                     let _ = self.close_process_handle(pid, handle);
                                 }
+                                let _ = crate::object_manager_delete_symbolic_link_path(
+                                    absolute_link,
+                                );
                                 self.rollback_new_namespace_object(index);
                                 return 0xC000_0005;
                             }

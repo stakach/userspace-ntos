@@ -51,6 +51,22 @@ fn full_service_roundtrip() {
     let expected: Vec<u16> = "\\Device\\Test0".encode_utf16().collect();
     assert_eq!(target, expected);
 
+    c.create_symbolic_link("\\KnownDlls\\KnownDllPath", "C:\\Windows\\system32", true)
+        .unwrap();
+    let target = c
+        .query_symbolic_link("\\KnownDlls\\KnownDllPath", true)
+        .unwrap();
+    let expected: Vec<u16> = "C:\\Windows\\system32".encode_utf16().collect();
+    assert_eq!(target, expected);
+
+    c.create_device("\\Device\\Volume0", 0x494f, 17, true)
+        .unwrap();
+    c.create_symbolic_link("\\??\\C:", "\\Device\\Volume0", true)
+        .unwrap();
+    let aliased: Vec<u16> = "\\??\\c:\\Folder\\Leaf".encode_utf16().collect();
+    let canonical: Vec<u16> = "\\Device\\Volume0\\Folder\\Leaf".encode_utf16().collect();
+    assert_eq!(c.reparse_file_path(&aliased, true).unwrap(), canonical);
+
     c.delete_object("\\??\\Link", true).unwrap();
     assert_eq!(
         c.lookup("\\??\\Link", true).unwrap_err(),

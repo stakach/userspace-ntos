@@ -105,6 +105,7 @@ impl Server {
             opcode::OB_OP_DEREFERENCE_OBJECT => self.op_dereference_object(client, in_buf),
             opcode::OB_OP_DELETE_OBJECT => self.op_delete_object(in_buf),
             opcode::OB_OP_LOOKUP_PATH => self.op_lookup(in_buf),
+            opcode::OB_OP_REPARSE_FILE_PATH => self.op_reparse_file_path(in_buf, out_buf),
             opcode::OB_OP_QUERY_OBJECT => self.op_query_object(in_buf, out_buf),
             opcode::OB_OP_CREATE_DIRECTORY => self.op_create_directory(in_buf),
             opcode::OB_OP_CREATE_SYMBOLIC_LINK => self.op_create_symlink(in_buf),
@@ -317,12 +318,12 @@ impl Server {
     fn op_create_symlink(&mut self, buf: &[u8]) -> Result<ObReply, NtStatus> {
         let req: ObCreateSymbolicLinkRequest = read_req(buf)?;
         let link_path = read_path(buf, req.link_offset, req.link_len_bytes)?;
-        let target = read_path(buf, req.target_offset, req.target_len_bytes)?;
+        let target = read_unicode(buf, req.target_offset, req.target_len_bytes)?;
         let (parent, leaf) = self.split_parent(&link_path)?;
         let permanent = permanent_of(req.obj_attributes);
         let link = self
             .om
-            .create_symbolic_link(&parent, &leaf, target, permanent)?;
+            .create_symbolic_link_target(&parent, &leaf, target, permanent)?;
         Ok(reply(NtStatus::SUCCESS, 0, link.id().0, 0))
     }
 
@@ -331,13 +332,35 @@ impl Server {
         let path = read_path(buf, req.path_offset, req.path_len_bytes)?;
         let link = self.om.lookup_link(&path, case_of(req.flags))?;
         let target = self.om.query_symbolic_link(&link)?;
-        let units = target.to_units();
+        let units = target.as_units();
         let nbytes = units.len() * 2;
         let dst = out_buf
             .get_mut(..nbytes)
             .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
         for (i, u) in units.iter().enumerate() {
             dst[i * 2..i * 2 + 2].copy_from_slice(&u.to_le_bytes());
+        }
+        Ok(reply(NtStatus::SUCCESS, nbytes as u32, 0, 0))
+    }
+
+    fn op_reparse_file_path(
+        &mut self,
+        buf: &[u8],
+        out_buf: &mut [u8],
+    ) -> Result<ObReply, NtStatus> {
+        let req: ObLookupPathRequest = read_req(buf)?;
+        let path = read_path(buf, req.path_offset, req.path_len_bytes)?;
+        let reparsed = self.om.reparse_file_path(&path, case_of(req.flags))?;
+        let units = reparsed.to_units();
+        let nbytes = units
+            .len()
+            .checked_mul(2)
+            .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+        let dst = out_buf
+            .get_mut(..nbytes)
+            .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+        for (index, unit) in units.iter().enumerate() {
+            dst[index * 2..index * 2 + 2].copy_from_slice(&unit.to_le_bytes());
         }
         Ok(reply(NtStatus::SUCCESS, nbytes as u32, 0, 0))
     }
@@ -363,6 +386,11 @@ fn read_req<T: Pod>(buf: &[u8]) -> Result<T, NtStatus> {
 }
 
 fn read_path(buf: &[u8], offset: u32, len_bytes: u32) -> Result<NtPath, NtStatus> {
+    let units = read_unicode(buf, offset, len_bytes)?;
+    NtPath::parse(units.as_units())
+}
+
+fn read_unicode(buf: &[u8], offset: u32, len_bytes: u32) -> Result<UnicodeString, NtStatus> {
     let start = offset as usize;
     let end = start
         .checked_add(len_bytes as usize)
@@ -375,7 +403,7 @@ fn read_path(buf: &[u8], offset: u32, len_bytes: u32) -> Result<NtPath, NtStatus
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
-    NtPath::parse(&units)
+    Ok(UnicodeString::from_units(&units))
 }
 
 fn check_size<T>(abi_size: u16) -> Result<(), NtStatus> {

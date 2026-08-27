@@ -10646,6 +10646,7 @@ pub(crate) unsafe fn service_sec_image(
                     // the credential keystrokes went in, `EndDialog` destroying it is the dialog
                     // reaching its DECISION — the intended outcome, not a fault.
                     if !winlogon_credential_started() {
+                        print_str(b"[dialog-pump] ERROR target destroyed before credential input\n");
                         WINLOGON_DIALOG_MODAL_ERRORS.fetch_add(1, Ordering::Relaxed);
                     }
                     print_str(b"[dialog-pump] correlated IDD_LOGON was destroyed; parking modal GetMessage\n");

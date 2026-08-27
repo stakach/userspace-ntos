@@ -154,6 +154,35 @@ impl<B: Backend> ObjectClient<B> {
         Ok(ObjectId(r.detail0))
     }
 
+    /// Expand Object Manager links and return the canonical Device path plus untouched filesystem
+    /// suffix. Unlike object lookup, the suffix is not interpreted as namespace children.
+    pub fn reparse_file_path(
+        &mut self,
+        path: &[u16],
+        case_insensitive: bool,
+    ) -> Result<Vec<u16>, NtStatus> {
+        let req = ObLookupPathRequest {
+            abi_size: size_of::<ObLookupPathRequest>() as u16,
+            flags: case_flag(case_insensitive),
+            path_offset: size_of::<ObLookupPathRequest>() as u32,
+            path_len_bytes: byte_len(path),
+        };
+        let buf = pack(&req, path);
+        let mut out = vec![0u8; 4096];
+        let reply = self
+            .backend
+            .call(opcode::OB_OP_REPARSE_FILE_PATH, &buf, &mut out);
+        NtStatus(reply.status).to_result()?;
+        let bytes = out
+            .get(..reply.information as usize)
+            .filter(|bytes| bytes.len() & 1 == 0)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        Ok(bytes
+            .chunks_exact(2)
+            .map(|word| u16::from_le_bytes([word[0], word[1]]))
+            .collect())
+    }
+
     /// Delete a named object from its parent directory. This unlinks the namespace route; outstanding
     /// references stay governed by the Object Manager store.
     pub fn delete_object(&mut self, path: &str, case_insensitive: bool) -> Result<(), NtStatus> {

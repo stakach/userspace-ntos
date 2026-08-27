@@ -45,6 +45,7 @@ pub mod opcode {
     pub const OB_OP_LOOKUP_PATH: u16 = 0x2030;
     pub const OB_OP_QUERY_OBJECT: u16 = 0x2031;
     pub const OB_OP_QUERY_DIRECTORY: u16 = 0x2032;
+    pub const OB_OP_REPARSE_FILE_PATH: u16 = 0x2033;
 
     /// Deferred — see spec §12.1.
     pub const OB_OP_DUPLICATE_HANDLE: u16 = 0x2040;

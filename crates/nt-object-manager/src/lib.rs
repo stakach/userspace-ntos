@@ -620,7 +620,13 @@ mod tests {
             "\\FileSystem",
             "\\FileSystem\\Filters",
             "\\??",
+            "\\Global??",
+            "\\KnownDlls",
             "\\BaseNamedObjects",
+            "\\BaseNamedObjects\\Restricted",
+            "\\Sessions\\BnoLinks",
+            "\\Sessions\\0",
+            "\\Windows\\WindowStations",
         ] {
             let d = om.lookup_path(&path(p), CI).unwrap();
             assert!(d.is_permanent());
@@ -814,14 +820,28 @@ mod tests {
             link.id()
         );
         // query the target
-        assert_eq!(
-            om.query_symbolic_link(&link).unwrap(),
-            path("\\Device\\Bar")
-        );
+        assert_eq!(om.query_symbolic_link(&link).unwrap(), uni("\\Device\\Bar"));
         // querying a non-symlink is a type mismatch
         assert_eq!(
             om.query_symbolic_link(&bar).unwrap_err(),
             NtStatus::OBJECT_TYPE_MISMATCH
+        );
+    }
+
+    #[test]
+    fn symbolic_link_preserves_non_namespace_target() {
+        let mut om = bootstrapped();
+        let known_dlls = om.lookup_path(&path("\\KnownDlls"), CI).unwrap();
+        let target = uni("C:\\Windows\\system32");
+        let link = om
+            .create_symbolic_link_target(&known_dlls, &uni("KnownDllPath"), target.clone(), true)
+            .unwrap();
+
+        assert_eq!(om.query_symbolic_link(&link).unwrap(), target);
+        assert_eq!(
+            om.lookup_path(&path("\\KnownDlls\\KnownDllPath"), CI)
+                .unwrap_err(),
+            NtStatus::OBJECT_PATH_NOT_FOUND
         );
     }
 
@@ -843,6 +863,57 @@ mod tests {
         assert_eq!(
             om.lookup_path(&path("\\??\\D\\Sub\\X"), CI).unwrap().id(),
             x.id()
+        );
+    }
+
+    #[test]
+    fn file_reparse_expands_dos_link_and_preserves_device_suffix() {
+        let mut om = bootstrapped();
+        let device = om.lookup_path(&path("\\Device"), CI).unwrap();
+        let dosdev = om.lookup_path(&path("\\??"), CI).unwrap();
+        let io = ComponentId(7);
+        let volume = om
+            .create_device(&device, &uni("Volume7"), io, 70, true)
+            .unwrap();
+        om.create_symbolic_link(&dosdev, &uni("C:"), path("\\Device\\Volume7"), true)
+            .unwrap();
+
+        assert_eq!(
+            om.reparse_file_path(&path("\\??\\c:\\Folder\\Leaf"), CI)
+                .unwrap(),
+            path("\\Device\\Volume7\\Folder\\Leaf")
+        );
+        assert_eq!(
+            om.reparse_file_path(&path("\\Device\\Volume7\\Direct"), CI)
+                .unwrap(),
+            path("\\Device\\Volume7\\Direct")
+        );
+        assert_eq!(
+            om.lookup_path(&path("\\Device\\Volume7"), CI).unwrap().id(),
+            volume.id()
+        );
+    }
+
+    #[test]
+    fn file_reparse_rejects_missing_device_and_link_loops() {
+        let mut om = bootstrapped();
+        let dosdev = om.lookup_path(&path("\\??"), CI).unwrap();
+        om.create_symbolic_link(&dosdev, &uni("Missing"), path("\\Device\\Absent"), true)
+            .unwrap();
+        om.create_symbolic_link(&dosdev, &uni("Loop"), path("\\??\\Loop"), true)
+            .unwrap();
+
+        assert_eq!(
+            om.reparse_file_path(&path("\\??\\Missing\\Leaf"), CI),
+            Err(NtStatus::OBJECT_PATH_NOT_FOUND)
+        );
+        assert_eq!(
+            om.reparse_file_path(&path("\\??\\Loop\\Leaf"), CI),
+            Err(NtStatus::OBJECT_PATH_NOT_FOUND)
+        );
+        assert_eq!(
+            om.reparse_file_path(&path("\\BaseNamedObjects"), CI),
+            Err(NtStatus::OBJECT_PATH_NOT_FOUND)
         );
     }
 

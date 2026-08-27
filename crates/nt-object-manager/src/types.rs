@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 use nt_status::NtStatus;
 use nt_types::{
-    AccessMask, CaseSensitivity, GenericMapping, NtPath, ObjectId, ObjectTypeId, UnicodeString,
+    AccessMask, CaseSensitivity, GenericMapping, ObjectId, ObjectTypeId, UnicodeString,
 };
 
 use crate::store::ObjectRef;
@@ -204,7 +204,10 @@ impl DirectoryBody {
 
 /// A symbolic-link body.
 pub struct SymbolicLinkBody {
-    pub target: NtPath,
+    /// The exact target supplied to NtCreateSymbolicLinkObject. Object Manager symbolic-link
+    /// targets are Unicode strings, not necessarily absolute NT namespace paths (for example,
+    /// SMSS publishes `KnownDllPath` with a DOS path target).
+    pub target: UnicodeString,
 }
 
 /// A dispatcher event (minimal — full wait semantics are out of scope for v0.1).

@@ -4057,6 +4057,7 @@ pub(crate) unsafe fn winlogon_dialog_modal_observe(
 ) -> bool {
     let idd_hwnd = WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed);
     if WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) == 0 || idd_hwnd == 0 {
+        print_str(b"[dialog-pump] ERROR observe before correlated dialog\n");
         WINLOGON_DIALOG_MODAL_ERRORS.fetch_add(1, Ordering::Relaxed);
         return false;
     }
@@ -4073,6 +4074,15 @@ pub(crate) unsafe fn winlogon_dialog_modal_observe(
         Some(message)
     };
     if state.complete(ssn, result as u32 as i32, message).is_err() {
+        print_str(b"[dialog-pump] ERROR invalid completion expected=");
+        print_hex(state.expected_ssn().unwrap_or(0) as u32);
+        print_str(b" actual=");
+        print_hex(ssn as u32);
+        print_str(b" result=");
+        print_hex(result as u32);
+        print_str(b" message=");
+        print_hex(message.unwrap_or(0) as u32);
+        print_str(b"\n");
         WINLOGON_DIALOG_MODAL_ERRORS.fetch_add(1, Ordering::Relaxed);
         return false;
     }
@@ -15140,16 +15150,41 @@ pub(crate) unsafe fn object_manager_create_symbolic_link_path(
     link: &str,
     target: &str,
 ) -> Result<(), nt_status::NtStatus> {
+    object_manager_create_symbolic_link_path_with_permanence(link, target, true).map(|_| ())
+}
+
+pub(crate) unsafe fn object_manager_create_symbolic_link_path_with_permanence(
+    link: &str,
+    target: &str,
+    permanent: bool,
+) -> Result<u64, nt_status::NtStatus> {
     let client = OBJECT_CLIENT_PTR
         .as_mut()
         .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
-    client.create_symbolic_link(link, target, true).map(|_| ())
+    client
+        .create_symbolic_link(link, target, permanent)
+        .map(|id| id.0)
 }
 
 pub(crate) unsafe fn object_manager_delete_symbolic_link_path(
     link: &str,
 ) -> Result<(), nt_status::NtStatus> {
     object_manager_delete_path(link)
+}
+
+pub(crate) unsafe fn object_manager_reparse_file_path(
+    path: &[u16],
+    output: &mut [u16],
+) -> Result<usize, nt_status::NtStatus> {
+    let client = OBJECT_CLIENT_PTR
+        .as_mut()
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    let reparsed = client.reparse_file_path(path, true)?;
+    if reparsed.len() > output.len() {
+        return Err(nt_status::NtStatus::OBJECT_NAME_INVALID);
+    }
+    output[..reparsed.len()].copy_from_slice(&reparsed);
+    Ok(reparsed.len())
 }
 
 pub(crate) unsafe fn object_manager_create_file_handle(

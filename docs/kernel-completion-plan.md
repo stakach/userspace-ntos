@@ -14040,7 +14040,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Review adjustment: direct device-qualified and normalized Object Manager Directory provider
     targets are closed without a synthetic result or local-path fallback.
 
-    Provider source-kind pre-query (2026-08-27, implemented): rename/link no longer treats the
+    Provider source-kind pre-query (2026-08-27, accepted): rename/link no longer treats the
     absence of `FILE_DIRECTORY_FILE` as proof that the source is an ordinary File. Explicit
     `FILE_DIRECTORY_FILE` and `FILE_NON_DIRECTORY_FILE` opens carry authoritative kind; an
     ambiguous source now dispatches a real provider `IRP_MJ_QUERY_INFORMATION` for the complete
@@ -14069,3 +14069,44 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `FileLinkInformation` still requires MemFs multiple-entry/link-count ownership. After those
     identity items, resume the remaining file query/set capture inventory and the separate root
     service-loop mark/reset lifetime-classification item.
+
+    Object Manager file-alias reparse (2026-08-27, accepted): absolute provider rename/link targets
+    no longer reach the I/O Manager's same-device check as unresolved DOS-device or mount aliases.
+    Object Manager ABI opcode `OB_OP_REPARSE_FILE_PATH` expands the live namespace's symbolic links
+    under the same bounded 32-hop rule as lookup, stops only at a real `Device` object, and returns
+    that canonical device path with the filesystem-owned suffix untouched. Missing devices,
+    non-Device endpoints, loops, over-capacity output, and cross-device targets fail closed. The
+    executive provider target resolver now reparses through that service first and only then strips
+    the source File's live device prefix; no static drive-letter/device table or path fallback was
+    added.
+
+    Native `NtCreateSymbolicLinkObject` now publishes new links into the isolated Object Manager
+    with their exact absolute namespace name and permanence, records the returned service object
+    identity in the executive projection, rolls both authorities back on failed handle publication,
+    and deletes temporary mirrored names through the service before unlinking the projection. The
+    isolated service's bootstrap namespace now matches the standard directories and session
+    subdirectories already exposed to native callers. Symbolic-link bodies preserve the exact
+    Unicode target rather than requiring an absolute `NtPath`; this is required by SMSS's real
+    `KnownDllPath -> C:\\Windows\\system32` link and also removes the old service-side target-shape
+    assumption. Absolute targets continue to participate in ordinary lookup/reparse, while a target
+    outside the NT namespace is queryable but cannot be followed as an Object Manager path.
+
+    Focused validation passes `nt-object-manager` `67/67`, `nt-object-abi` `2/2`, and
+    `nt-object-server` unit/roundtrip `4/4` and `7/7`; the freestanding executive check remains green
+    at the established 212-warning baseline. The first integration run correctly rejected the
+    service's old absolute-target assumption at SMSS `KnownDllPath`; after fixing the model, two
+    complete desktop runs exposed the existing ordering-sensitive modal-pump evidence edge at
+    `294/295` despite genuine Explorer and full framebuffer paint. Narrow failure-source diagnostics
+    now distinguish its three error sites. Final serialized acceptance
+    `.tmp/run-headless-object-manager-file-reparse-diag-20260827.log` emitted no such error, selected,
+    added, and started all five configured PnP devices (including both pending-start observations),
+    launched genuine userinit and Explorer, painted 480,000/480,000 pixels with at least 32 colors,
+    passed all `295/295` gates, and matched the sentinel. Scratch returned to zero after its unchanged
+    278,112 B peak; final allocated durable state was 14,801,440 B with 6,169,952 B reusable.
+
+    Review adjustment: provider absolute alias identity is closed at the Object Manager boundary.
+    Local `FileLinkInformation` still requires MemFs multiple-entry/link-count ownership. Then resume
+    the remaining file query/set capture inventory and the separate root service-loop mark/reset
+    lifetime-classification item. The executive namespace is still a compatibility projection; move
+    additional native object kinds behind the isolated Object Manager incrementally rather than
+    adding another mirroring path or reintroducing static namespace identities.

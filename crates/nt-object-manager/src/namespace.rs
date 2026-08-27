@@ -24,7 +24,20 @@ const DIRECTORY_TYPE_NAME: &str = "Directory";
 const SYMLINK_TYPE_NAME: &str = "SymbolicLink";
 
 /// The core root directories created at bootstrap (spec §9.1).
-const ROOT_DIRECTORIES: &[&str] = &["Device", "Driver", "FileSystem", "??", "BaseNamedObjects"];
+const ROOT_DIRECTORIES: &[&str] = &[
+    "??",
+    "Device",
+    "Global??",
+    "KnownDlls",
+    "BaseNamedObjects",
+    "Sessions",
+    "DosDevices",
+    "Windows",
+    "ObjectTypes",
+    "Driver",
+    "FileSystem",
+    "Security",
+];
 
 /// Maximum symbolic-link expansions during one lookup (spec §9.3), to bound loops.
 const SYMLINK_LIMIT: u32 = 32;
@@ -100,14 +113,59 @@ impl ObjectManager {
         root.set_permanent(true);
         self.root = Some(root.clone());
         let mut filesystem = None;
+        let mut windows = None;
+        let mut base_named_objects = None;
+        let mut sessions = None;
         for name in ROOT_DIRECTORIES {
             let dir = self.create_directory(&root, &UnicodeString::from_str(name), true)?;
-            if *name == "FileSystem" {
-                filesystem = Some(dir);
+            match *name {
+                "FileSystem" => filesystem = Some(dir),
+                "Windows" => windows = Some(dir),
+                "BaseNamedObjects" => base_named_objects = Some(dir),
+                "Sessions" => sessions = Some(dir),
+                _ => {}
             }
         }
         if let Some(filesystem) = filesystem {
             self.create_directory(&filesystem, &UnicodeString::from_str("Filters"), true)?;
+        }
+        if let Some(windows) = windows {
+            self.create_directory(&windows, &UnicodeString::from_str("WindowStations"), true)?;
+        }
+        if let Some(base_named_objects) = base_named_objects {
+            self.create_directory(
+                &base_named_objects,
+                &UnicodeString::from_str("Restricted"),
+                true,
+            )?;
+            self.create_symbolic_link(
+                &base_named_objects,
+                &UnicodeString::from_str("Global"),
+                NtPath::parse_str("\\BaseNamedObjects")?,
+                true,
+            )?;
+            self.create_symbolic_link(
+                &base_named_objects,
+                &UnicodeString::from_str("Local"),
+                NtPath::parse_str("\\BaseNamedObjects")?,
+                true,
+            )?;
+            self.create_symbolic_link(
+                &base_named_objects,
+                &UnicodeString::from_str("Session"),
+                NtPath::parse_str("\\Sessions\\BnoLinks")?,
+                true,
+            )?;
+        }
+        if let Some(sessions) = sessions {
+            self.create_directory(&sessions, &UnicodeString::from_str("BnoLinks"), true)?;
+            let session0 = self.create_directory(&sessions, &UnicodeString::from_str("0"), true)?;
+            self.create_symbolic_link(
+                &session0,
+                &UnicodeString::from_str("BaseNamedObjects"),
+                NtPath::parse_str("\\BaseNamedObjects")?,
+                true,
+            )?;
         }
         Ok(())
     }
@@ -198,6 +256,18 @@ impl ObjectManager {
         target: NtPath,
         permanent: bool,
     ) -> Result<ObjectRef, NtStatus> {
+        self.create_symbolic_link_target(parent, name, target.to_unicode_string(), permanent)
+    }
+
+    /// Create a symbolic link while preserving the exact Unicode target. Unlike object names,
+    /// symbolic-link targets are not required to be absolute NT namespace paths.
+    pub fn create_symbolic_link_target(
+        &mut self,
+        parent: &ObjectRef,
+        name: &UnicodeString,
+        target: UnicodeString,
+        permanent: bool,
+    ) -> Result<ObjectRef, NtStatus> {
         let ty = self.ensure_symlink_type()?;
         let link = self.create_object(ty, ObjectBody::SymbolicLink(SymbolicLinkBody { target }))?;
         self.insert_named_object(parent, name, &link, permanent)?;
@@ -206,7 +276,7 @@ impl ObjectManager {
 
     /// The target of a symbolic-link object. `STATUS_OBJECT_TYPE_MISMATCH` if
     /// `link` is not a symbolic link.
-    pub fn query_symbolic_link(&self, link: &ObjectRef) -> Result<NtPath, NtStatus> {
+    pub fn query_symbolic_link(&self, link: &ObjectRef) -> Result<UnicodeString, NtStatus> {
         link.with_body(|b| match b {
             ObjectBody::SymbolicLink(s) => Ok(s.target.clone()),
             _ => Err(NtStatus::OBJECT_TYPE_MISMATCH),
@@ -226,6 +296,64 @@ impl ObjectManager {
     /// `OBJ_OPENLINK` behaviour, used to query a link.
     pub fn lookup_link(&self, path: &NtPath, case: CaseSensitivity) -> Result<ObjectRef, NtStatus> {
         self.lookup_path_ex(path, case, false)
+    }
+
+    /// Expand Object Manager symbolic links in a file path and stop at the canonical Device
+    /// object. Components after that object belong to the filesystem parser and are preserved
+    /// exactly rather than looked up as Object Manager children.
+    pub fn reparse_file_path(
+        &self,
+        path: &NtPath,
+        case: CaseSensitivity,
+    ) -> Result<NtPath, NtStatus> {
+        let root = self.root.clone().ok_or(NtStatus::OBJECT_PATH_NOT_FOUND)?;
+        let mut comps: Vec<UnicodeString> = path.components().to_vec();
+        let mut current = root;
+        let mut idx = 0usize;
+        let mut hops = 0u32;
+
+        while idx < comps.len() {
+            let child = current.with_body(|body| match body {
+                ObjectBody::Directory(directory) => directory.lookup(&comps[idx], case),
+                _ => None,
+            });
+            let child = child.ok_or_else(|| {
+                if idx + 1 == comps.len() {
+                    NtStatus::OBJECT_NAME_NOT_FOUND
+                } else {
+                    NtStatus::OBJECT_PATH_NOT_FOUND
+                }
+            })?;
+            let target = child.with_body(|body| match body {
+                ObjectBody::SymbolicLink(link) => Some(link.target.clone()),
+                _ => None,
+            });
+            if let Some(target) = target {
+                hops += 1;
+                if hops > SYMLINK_LIMIT {
+                    return Err(NtStatus::OBJECT_PATH_NOT_FOUND);
+                }
+                let target = NtPath::parse(target.as_units())
+                    .map_err(|_| NtStatus::OBJECT_PATH_NOT_FOUND)?;
+                let mut rebuilt = target.components().to_vec();
+                rebuilt.extend_from_slice(&comps[idx + 1..]);
+                comps = rebuilt;
+                current = self.root.clone().ok_or(NtStatus::OBJECT_PATH_NOT_FOUND)?;
+                idx = 0;
+                continue;
+            }
+            if child.with_body(|body| matches!(body, ObjectBody::Device(_))) {
+                return Ok(NtPath::from_components(comps));
+            }
+            if idx + 1 != comps.len()
+                && !child.with_body(|body| matches!(body, ObjectBody::Directory(_)))
+            {
+                return Err(NtStatus::OBJECT_PATH_NOT_FOUND);
+            }
+            current = child;
+            idx += 1;
+        }
+        Err(NtStatus::OBJECT_PATH_NOT_FOUND)
     }
 
     /// Core path resolver. Intermediate symbolic links are always followed; the
@@ -273,6 +401,8 @@ impl ObjectManager {
                     if hops > SYMLINK_LIMIT {
                         return Err(NtStatus::OBJECT_PATH_NOT_FOUND); // loop / too many links
                     }
+                    let t =
+                        NtPath::parse(t.as_units()).map_err(|_| NtStatus::OBJECT_PATH_NOT_FOUND)?;
                     let mut rebuilt: Vec<UnicodeString> = t.components().to_vec();
                     rebuilt.extend_from_slice(&comps[idx + 1..]);
                     comps = rebuilt;
