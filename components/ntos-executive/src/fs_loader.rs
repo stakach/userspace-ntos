@@ -31,20 +31,54 @@ const SYSTEM32_CACHE_NAME_CAP: usize = 96;
 #[derive(Clone, Copy)]
 struct System32CacheEntry {
     name_len: u8,
-    attr: u8,
     cluster: u32,
-    size: u32,
+    metadata: nt_fs::FileMetadata,
     name: [u8; SYSTEM32_CACHE_NAME_CAP],
 }
 
 impl System32CacheEntry {
     const EMPTY: Self = Self {
         name_len: 0,
-        attr: 0,
         cluster: 0,
-        size: 0,
+        metadata: nt_fs::FileMetadata {
+            creation_time: 0,
+            last_access_time: 0,
+            last_write_time: 0,
+            change_time: 0,
+            allocation_size: 0,
+            end_of_file: 0,
+            file_id: 0,
+            attributes: 0,
+            reparse_tag: 0,
+            number_of_links: 0,
+            delete_pending: false,
+            is_directory: false,
+        },
         name: [0; SYSTEM32_CACHE_NAME_CAP],
     };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FatOpenMetadata {
+    pub(crate) first_cluster: u32,
+    pub(crate) metadata: nt_fs::FileMetadata,
+}
+
+impl FatOpenMetadata {
+    fn from_record(record: nt_fs::FatDirectoryRecord) -> Self {
+        Self {
+            first_cluster: record.first_cluster,
+            metadata: record.metadata(),
+        }
+    }
+
+    fn entry_tuple(self) -> (u32, u32, u8) {
+        (
+            self.first_cluster,
+            self.metadata.end_of_file.min(u32::MAX as u64) as u32,
+            self.metadata.attributes.min(u8::MAX as u32) as u8,
+        )
+    }
 }
 
 const SYSTEM32_CACHE_STATE_BASE: usize = crate::allocator::COMPONENT_LOCAL_WORD_BASE;
@@ -261,6 +295,7 @@ pub(crate) unsafe fn fat_visit_directory(
                     nt_fs::FatDirectorySlot::End => return,
                     nt_fs::FatDirectorySlot::Skipped => {}
                     nt_fs::FatDirectorySlot::Entry(record) => {
+                        let record = record.with_parent_cluster(dir_cluster);
                         if !visit(record.entry, record.first_cluster) {
                             return;
                         }
@@ -301,8 +336,7 @@ unsafe fn system32_cache_insert(
     cache: &mut [System32CacheEntry],
     name: &[u8],
     cluster: u32,
-    size: u32,
-    attr: u8,
+    metadata: nt_fs::FileMetadata,
     next: &mut usize,
 ) {
     if name.is_empty() || name.len() > SYSTEM32_CACHE_NAME_CAP {
@@ -325,9 +359,8 @@ unsafe fn system32_cache_insert(
     let entry = &mut cache[*next];
     *entry = System32CacheEntry::EMPTY;
     entry.name_len = name.len() as u8;
-    entry.attr = attr;
     entry.cluster = cluster;
-    entry.size = size;
+    entry.metadata = metadata;
     entry.name[..name.len()].copy_from_slice(name);
     *next += 1;
 }
@@ -379,16 +412,19 @@ unsafe fn system32_cache_build(fs: &Fat32) -> bool {
     system32_cache_state_write(SYSTEM32_CACHE_STATE_OVERFLOW, 0);
     let mut next = 0usize;
     fat_visit_directory(fs, system32_cluster, |record, first_cluster| {
-        let attr = record.attributes as u8;
-        let size = record.end_of_file.min(u32::MAX as u64) as u32;
+        let metadata = nt_fs::FatDirectoryRecord {
+            entry: record,
+            first_cluster,
+        }
+        .metadata();
         let mut name = [0u8; SYSTEM32_CACHE_NAME_CAP];
         if let Some(len) = ascii_units_to_lower(record.name(), &mut name) {
-            system32_cache_insert(cache, &name[..len], first_cluster, size, attr, &mut next);
+            system32_cache_insert(cache, &name[..len], first_cluster, metadata, &mut next);
         }
         if !record.short_name().is_empty() {
             let mut alias = [0u8; SYSTEM32_CACHE_NAME_CAP];
             if let Some(len) = ascii_units_to_lower(record.short_name(), &mut alias) {
-                system32_cache_insert(cache, &alias[..len], first_cluster, size, attr, &mut next);
+                system32_cache_insert(cache, &alias[..len], first_cluster, metadata, &mut next);
             }
         }
         true
@@ -405,6 +441,10 @@ unsafe fn system32_cache_build(fs: &Fat32) -> bool {
 }
 
 unsafe fn system32_cache_lookup(fs: &Fat32, leaf: &[u8]) -> Option<(u32, u32, u8)> {
+    system32_cache_lookup_metadata(fs, leaf).map(FatOpenMetadata::entry_tuple)
+}
+
+unsafe fn system32_cache_lookup_metadata(fs: &Fat32, leaf: &[u8]) -> Option<FatOpenMetadata> {
     if leaf.is_empty() || leaf.len() > SYSTEM32_CACHE_NAME_CAP || component_has_separator(leaf) {
         return None;
     }
@@ -427,7 +467,10 @@ unsafe fn system32_cache_lookup(fs: &Fat32, leaf: &[u8]) -> Option<(u32, u32, u8
         let entry = &cache[index];
         let len = entry.name_len as usize;
         if len == leaf.len() && entry.name[..len] == wanted[..leaf.len()] {
-            return Some((entry.cluster, entry.size, entry.attr));
+            return Some(FatOpenMetadata {
+                first_cluster: entry.cluster,
+                metadata: entry.metadata,
+            });
         }
         index += 1;
     }
@@ -879,73 +922,131 @@ fn name_to_83_into(comp: &[u8], out: &mut [u8; 11]) {
     }
 }
 
-/// Resolve a `\`- or `/`-separated PATH (e.g. `b"reactos\\system32\\ntdll.dll"`) from the
-/// volume root, walking each component with `dir_find`. Returns `(first_cluster, size)` of the
-/// final file, or `None` if any component is missing. 8.3 short names only (no LFN reassembly)
-/// — sufficient for the real ReactOS tree, whose names carry clean 8.3 aliases. Each non-final
-/// component must be a directory (FAT attr bit 0x10). This is the FS-backed-by-path primitive:
-/// the seam a full `\SystemRoot\system32\X` loader generalizes (see P7).
-unsafe fn fat_open_path_entry_inner(
+fn fat_name_matches_ascii(name: &[u16], wanted: &[u8]) -> bool {
+    name.len() == wanted.len()
+        && name.iter().zip(wanted).all(|(unit, byte)| {
+            *unit <= 0x7f && (*unit as u8).eq_ignore_ascii_case(byte)
+        })
+}
+
+unsafe fn fat_find_open_metadata(
+    fs: &Fat32,
+    directory_cluster: u32,
+    component: &[u8],
+) -> Option<FatOpenMetadata> {
+    let mut found = None;
+    fat_visit_directory(fs, directory_cluster, |entry, first_cluster| {
+        let matches = fat_name_matches_ascii(entry.name(), component)
+            || (!entry.short_name().is_empty()
+                && fat_name_matches_ascii(entry.short_name(), component));
+        if matches {
+            found = Some(FatOpenMetadata::from_record(nt_fs::FatDirectoryRecord {
+                entry,
+                first_cluster,
+            }));
+            false
+        } else {
+            true
+        }
+    });
+    found
+}
+
+unsafe fn fat_open_path_metadata_inner(
     fs: &Fat32,
     start_cluster: u32,
     path: &[u8],
     use_system32_cache: bool,
-) -> Option<(u32, u32, u8)> {
+) -> Option<FatOpenMetadata> {
     if use_system32_cache && start_cluster == fs.root_cl {
         if let Some(leaf) = system32_leaf_from_volume_path(path) {
-            if let Some(entry) = system32_cache_lookup(fs, leaf) {
+            if let Some(entry) = system32_cache_lookup_metadata(fs, leaf) {
                 return Some(entry);
             }
         }
     }
-    let mut cur = start_cluster;
+    let mut current = start_cluster;
     let mut start = 0usize;
-    let mut i = 0usize;
-    let mut result: Option<(u32, u32, u8)> = None;
-    while i <= path.len() {
-        let is_sep = i == path.len() || path[i] == b'\\' || path[i] == b'/';
-        if is_sep {
-            if i > start {
-                let (cl, sz, attr) = dir_find_lfn(fs, cur, &path[start..i])?;
-                if i == path.len() {
-                    result = Some((cl, sz, attr));
+    let mut result = None;
+    let mut index = 0usize;
+    while index <= path.len() {
+        let separator = index == path.len() || path[index] == b'\\' || path[index] == b'/';
+        if separator {
+            if index > start {
+                let entry = fat_find_open_metadata(fs, current, &path[start..index])?;
+                if index == path.len() {
+                    result = Some(entry);
                 } else {
-                    if (attr & 0x10) == 0 {
-                        return None; // intermediate must be a directory
+                    if !entry.metadata.is_directory {
+                        return None;
                     }
-                    cur = cl;
+                    current = entry.first_cluster;
                 }
             }
-            start = i + 1;
+            start = index + 1;
         }
-        i += 1;
+        index += 1;
     }
     result
 }
 
+pub(crate) fn fat_root_metadata(fs: &Fat32) -> FatOpenMetadata {
+    const FAT_EPOCH_NT_TIME: u64 = 119_600_064_000_000_000;
+    FatOpenMetadata {
+        first_cluster: fs.root_cl,
+        metadata: nt_fs::FileMetadata {
+            creation_time: FAT_EPOCH_NT_TIME,
+            last_access_time: FAT_EPOCH_NT_TIME,
+            last_write_time: FAT_EPOCH_NT_TIME,
+            change_time: FAT_EPOCH_NT_TIME,
+            allocation_size: 0,
+            end_of_file: 0,
+            file_id: 0,
+            attributes: nt_fs::FILE_ATTRIBUTE_DIRECTORY,
+            reparse_tag: 0,
+            number_of_links: 1,
+            delete_pending: false,
+            is_directory: true,
+        },
+    }
+}
+
+pub(crate) unsafe fn fat_open_path_metadata(
+    fs: &Fat32,
+    path: &[u8],
+) -> Option<FatOpenMetadata> {
+    if path.is_empty() {
+        Some(fat_root_metadata(fs))
+    } else {
+        fat_open_path_metadata_inner(fs, fs.root_cl, path, true)
+    }
+}
+
+pub(crate) unsafe fn fat_open_path_metadata_from(
+    fs: &Fat32,
+    start_cluster: u32,
+    path: &[u8],
+) -> Option<FatOpenMetadata> {
+    if path.is_empty() {
+        (start_cluster == fs.root_cl).then(|| fat_root_metadata(fs))
+    } else {
+        fat_open_path_metadata_inner(fs, start_cluster, path, false)
+    }
+}
+
 pub(crate) unsafe fn fat_open_path_entry(fs: &Fat32, path: &[u8]) -> Option<(u32, u32, u8)> {
-    fat_open_path_entry_inner(fs, fs.root_cl, path, true)
+    fat_open_path_metadata(fs, path).map(FatOpenMetadata::entry_tuple)
 }
 
 pub(crate) unsafe fn fat_open_path_entry_uncached(
     fs: &Fat32,
     path: &[u8],
 ) -> Option<(u32, u32, u8)> {
-    fat_open_path_entry_inner(fs, fs.root_cl, path, false)
-}
-
-/// Resolve a canonical relative path beneath an already-open FAT directory. Directory handles
-/// carry the directory's first cluster, so this preserves identity across namespace traversal
-/// without reconstructing an absolute path.
-pub(crate) unsafe fn fat_open_path_entry_from(
-    fs: &Fat32,
-    start_cluster: u32,
-    path: &[u8],
-) -> Option<(u32, u32, u8)> {
     if path.is_empty() {
-        Some((start_cluster, 0, 0x10))
+        Some(fat_root_metadata(fs).entry_tuple())
     } else {
-        fat_open_path_entry_inner(fs, start_cluster, path, false)
+        fat_open_path_metadata_inner(fs, fs.root_cl, path, false)
+            .map(FatOpenMetadata::entry_tuple)
     }
 }
 
@@ -1019,45 +1120,14 @@ pub(crate) unsafe fn sys32_exists(leaf: &[u8]) -> bool {
     }
 }
 
-pub(crate) unsafe fn query_nt_path_attributes_into(
+pub(crate) unsafe fn query_nt_path_metadata_into(
     name: &[u16],
     folded: &mut [u8],
     relative: &mut [u8],
-) -> Option<u32> {
+) -> Option<nt_fs::FileMetadata> {
     let len = nt_fs::nt_path_to_volume_relative_into(name, b"reactos", folded, relative)?;
-    if len == 0 {
-        return Some(nt_fs::FILE_ATTRIBUTE_DIRECTORY);
-    }
     let fs = exec_fs()?;
-    let (_, _, fat_attributes) = fat_open_path_entry(&fs, &relative[..len])?;
-    Some(nt_fs::file_attributes_from_fat(fat_attributes))
-}
-
-pub(crate) unsafe fn query_nt_path_standard_info_into(
-    name: &[u16],
-    folded: &mut [u8],
-    relative: &mut [u8],
-) -> Option<nt_fs::StandardInformation> {
-    let len = nt_fs::nt_path_to_volume_relative_into(name, b"reactos", folded, relative)?;
-    if len == 0 {
-        return Some(nt_fs::StandardInformation {
-            end_of_file: 0,
-            is_directory: true,
-            attributes: nt_fs::FILE_ATTRIBUTE_DIRECTORY,
-            number_of_links: 1,
-            delete_pending: false,
-        });
-    }
-    let fs = exec_fs()?;
-    let (_, size, fat_attributes) = fat_open_path_entry(&fs, &relative[..len])?;
-    let attributes = nt_fs::file_attributes_from_fat(fat_attributes);
-    Some(nt_fs::StandardInformation {
-        end_of_file: size as u64,
-        is_directory: attributes & nt_fs::FILE_ATTRIBUTE_DIRECTORY != 0,
-        attributes,
-        number_of_links: 1,
-        delete_pending: false,
-    })
+    fat_open_path_metadata(&fs, &relative[..len]).map(|entry| entry.metadata)
 }
 
 // --- P7-A: EXECUTIVE-SIDE FS-BY-PATH LOADER (generic, zero-per-binary) ---------------------------

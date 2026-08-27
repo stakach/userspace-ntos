@@ -1,6 +1,6 @@
 //! Pure FAT directory-slot decoding for native directory queries.
 
-use crate::{DirectoryEntry, MAX_DIRECTORY_NAME};
+use crate::{file_attributes_from_fat, DirectoryEntry, FileMetadata, MAX_DIRECTORY_NAME};
 
 const LFN_ATTRIBUTE: u8 = 0x0f;
 const VOLUME_ID_ATTRIBUTE: u8 = 0x08;
@@ -12,6 +12,33 @@ const LFN_OFFSETS: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30]
 pub struct FatDirectoryRecord {
     pub entry: DirectoryEntry,
     pub first_cluster: u32,
+}
+
+impl FatDirectoryRecord {
+    /// Bind the directory-relative slot offset to its stable parent-directory identity. The volume
+    /// is read-only, so this pair remains invariant for the lifetime of every open FAT File object.
+    pub fn with_parent_cluster(mut self, parent_cluster: u32) -> Self {
+        self.entry.file_id = (u64::from(parent_cluster) << 32) | u64::from(self.entry.file_index);
+        self
+    }
+
+    pub fn metadata(self) -> FileMetadata {
+        let attributes = file_attributes_from_fat(self.entry.attributes as u8);
+        FileMetadata {
+            creation_time: self.entry.creation_time,
+            last_access_time: self.entry.last_access_time,
+            last_write_time: self.entry.last_write_time,
+            change_time: self.entry.change_time,
+            allocation_size: self.entry.allocation_size,
+            end_of_file: self.entry.end_of_file,
+            file_id: self.entry.file_id,
+            attributes,
+            reparse_tag: 0,
+            number_of_links: 1,
+            delete_pending: false,
+            is_directory: attributes & crate::FILE_ATTRIBUTE_DIRECTORY != 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -358,6 +385,31 @@ mod tests {
         );
         assert_eq!(record.first_cluster, 0x0001_0002);
         assert_eq!(record.entry.allocation_size, 4096);
+    }
+
+    #[test]
+    fn parent_slot_identity_and_fat_metadata_are_preserved() {
+        let mut slot = short_slot(*b"FILE    TXT");
+        let epoch = (1u16 << 5) | 1;
+        slot[14..16].copy_from_slice(&0u16.to_le_bytes());
+        slot[16..18].copy_from_slice(&epoch.to_le_bytes());
+        slot[18..20].copy_from_slice(&epoch.to_le_bytes());
+        slot[22..24].copy_from_slice(&0u16.to_le_bytes());
+        slot[24..26].copy_from_slice(&epoch.to_le_bytes());
+        let mut decoder = FatDirectoryDecoder::new();
+        let FatDirectorySlot::Entry(record) = decoder.consume(&slot, 64, 4096) else {
+            panic!()
+        };
+        let metadata = record.with_parent_cluster(7).metadata();
+        assert_eq!(metadata.file_id, (7u64 << 32) | 64);
+        assert_eq!(metadata.end_of_file, 513);
+        assert_eq!(metadata.allocation_size, 4096);
+        assert_eq!(metadata.creation_time, 119_600_064_000_000_000);
+        assert_eq!(metadata.last_access_time, metadata.creation_time);
+        assert_eq!(metadata.last_write_time, metadata.creation_time);
+        assert_eq!(metadata.change_time, metadata.creation_time);
+        assert_eq!(metadata.attributes, crate::FILE_ATTRIBUTE_ARCHIVE);
+        assert_eq!(metadata.number_of_links, 1);
     }
 
     #[test]

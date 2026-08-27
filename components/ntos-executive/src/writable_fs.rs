@@ -117,8 +117,7 @@ pub(crate) const PROVISION_DEFAULT_USER_PROFILE: bool = true;
 /// and `RegLoadKeyW` returns `Error: 2` again (`exec_profile_ntuser_dat_present` FAILs).
 pub(crate) const PROVISION_NTUSER_DAT: bool = true;
 
-/// The `ntuser.dat` leaf, its source profile, and the destination the copy must produce.
-pub(crate) const NTUSER_DAT_LEAF: &str = "ntuser.dat";
+/// The `ntuser.dat` source profile and destination the copy must produce.
 pub(crate) const DEFAULT_USER_NTUSER_DAT: &str = r"\??\C:\Profiles\Default User\ntuser.dat";
 pub(crate) const COPIED_PROFILE_NTUSER_DAT: &str = r"\??\C:\Profiles\Administrator\ntuser.dat";
 
@@ -684,13 +683,14 @@ fn note_restored_snapshot(generation: u64, bytes: usize, nodes: usize) {
 }
 
 unsafe fn install_writable_fs(mut fs: nt_fs::FileSystem, restored: bool) {
+    let timestamps_initialized = fs.initialize_timestamps(nt_system_time_100ns());
     selftest(&mut fs);
     let provisioned = provision_missing_installed_sources(&mut fs);
     let slot = &mut *core::ptr::addr_of_mut!(EXEC_WRITABLE_FS);
     *slot = Some(fs);
     mark_runtime_dirty();
     WRITABLE_FS_MOUNT_DIRTY.store(true, Ordering::Release);
-    if provisioned || !restored {
+    if timestamps_initialized || provisioned || !restored {
         mark_snapshot_dirty();
     }
 }
@@ -1010,7 +1010,9 @@ pub(crate) unsafe fn writable_fs() -> Option<&'static mut nt_fs::FileSystem> {
         };
         install_writable_fs(fs, restored);
     }
-    slot.as_mut()
+    let fs = slot.as_mut()?;
+    fs.set_current_time_100ns(nt_system_time_100ns());
+    Some(fs)
 }
 
 pub(crate) enum BootSystemPersistence {
@@ -1285,25 +1287,22 @@ pub(crate) unsafe fn create_relative_to_directory(
     )
 }
 
-pub(crate) unsafe fn query_attributes_relative(
-    relative: &[u8],
-) -> Option<nt_fs::StandardInformation> {
+pub(crate) unsafe fn query_metadata_relative(relative: &[u8]) -> Option<nt_fs::FileMetadata> {
     OVERLAY_ATTR_QUERIES.fetch_add(1, Ordering::Relaxed);
     let fs = writable_fs()?;
-    let info = fs.query_attributes_relative(relative)?;
+    let info = fs.query_metadata_relative(relative)?;
     OVERLAY_ATTR_HITS.fetch_add(1, Ordering::Relaxed);
     Some(info)
 }
 
-/// Query a child beneath an existing writable-volume directory FILE_OBJECT without opening it.
-pub(crate) unsafe fn query_attributes_relative_to_directory(
+pub(crate) unsafe fn query_metadata_relative_to_directory(
     root_file_id: u64,
     relative: &[u8],
-) -> Result<nt_fs::StandardInformation, u32> {
+) -> Result<nt_fs::FileMetadata, u32> {
     let Some(fs) = writable_fs() else {
         return Err(nt_fs::STATUS_DEVICE_NOT_READY);
     };
-    fs.query_attributes_relative_to_directory(root_file_id, relative)
+    fs.query_metadata_relative_to_directory(root_file_id, relative)
 }
 
 /// Query an existing writable-layer entry without mounting the writable volume. This is used by
@@ -1317,6 +1316,19 @@ pub(crate) unsafe fn query_attributes_relative_if_mounted(
     };
     OVERLAY_ATTR_QUERIES.fetch_add(1, Ordering::Relaxed);
     let info = fs.query_attributes_relative(relative)?;
+    OVERLAY_ATTR_HITS.fetch_add(1, Ordering::Relaxed);
+    Some(info)
+}
+
+pub(crate) unsafe fn query_metadata_relative_if_mounted(
+    relative: &[u8],
+) -> Option<nt_fs::FileMetadata> {
+    let Some(fs) = (*core::ptr::addr_of_mut!(EXEC_WRITABLE_FS)).as_mut() else {
+        return None;
+    };
+    fs.set_current_time_100ns(nt_system_time_100ns());
+    OVERLAY_ATTR_QUERIES.fetch_add(1, Ordering::Relaxed);
+    let info = fs.query_metadata_relative(relative)?;
     OVERLAY_ATTR_HITS.fetch_add(1, Ordering::Relaxed);
     Some(info)
 }
@@ -1699,6 +1711,10 @@ pub(crate) unsafe fn flush(file_id: u64) -> u32 {
 /// `NtQueryInformationFile` metadata for a writable-volume file object.
 pub(crate) unsafe fn standard_information(file_id: u64) -> Option<nt_fs::StandardInformation> {
     writable_fs()?.zw_query_standard_information(file_id)
+}
+
+pub(crate) unsafe fn metadata(file_id: u64) -> Option<nt_fs::FileMetadata> {
+    writable_fs()?.zw_query_metadata(file_id)
 }
 
 /// Current byte offset for a writable-volume file object.

@@ -14214,3 +14214,50 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     in `nt-fs`; keep hosted files on real FSD dispatch. Then address retained-name semantics for
     `FileNameInformation`/`FileAllInformation`. Do not substitute handle numbers, zero timestamps, or
     cached provider identity for filesystem metadata.
+
+    Filesystem-owned file metadata checkpoint (2026-08-27, accepted): `nt-fs` now owns the native
+    encoders and real backing metadata for `FileBasicInformation`, `FileInternalInformation`,
+    `FileNetworkOpenInformation`, and `FileAttributeTagInformation`. MemFs nodes carry stable file
+    identities independently of storage slots, update their four NT timestamps through real file
+    operations, and preserve identities, timestamps, hard links, and root metadata in snapshot
+    schema 3 while retaining schema-1/2 read compatibility. FAT opens derive stable identity from
+    the parent directory cluster and directory-entry offset, translate the real FAT timestamps,
+    attributes, and sizes, and report the volume's absence of reparse tags. Duplicate or zero
+    primary MemFs identities are rejected
+    during restore instead of being repaired with fabricated values.
+
+    Executive FAT directory/file opens, loader-cache entries, and writable-overlay Files retain
+    that filesystem metadata. Loader-cache hits now publish ordinary DiskFile handles; the obsolete
+    `CachedFile` handle variant and its cache-local identity path are removed. By-name attribute
+    queries resolve first through the writable mount and then through the mounted FAT volume; the
+    former executable-extension existence fallback is gone. Routed hosted File objects still issue
+    the real `IRP_MJ_QUERY_INFORMATION` to their owning FSD, while only the fixed
+    I/O-Manager-owned query classes complete above FSD dispatch. BootStatus remains an explicit
+    special File provider with tracked metadata and is not treated as closure of provider-backed
+    file ownership.
+
+    The acceptance run also removed an unrelated limit exposed by the resource gate. Unmapped frame
+    capabilities now live in a growable `nt-address-space::RecycledFramePool` instead of a fixed
+    4,096-entry array. The stale service-start count reset, which leaked frames recycled by the
+    SEC_IMAGE self-test, is deleted. The gate now rejects allocation failures rather than rejecting
+    a healthy cache above an arbitrary 75-percent occupancy. Host coverage grows the pool beyond
+    the former cap and verifies LIFO reuse. In the serialized boot, the live pool reported
+    `2918/3675/4096/0` (live/high-water/current Vec capacity/allocation failures); the 4,096 value is
+    observed allocation capacity, not a policy ceiling.
+
+    Focused validation passes `nt-fs` `77/77`, `nt-address-space` `54/54`, `nt-io-manager`
+    `210/210`, and `nt-process` `107/107`; the freestanding executive builds at the improved
+    211-warning baseline. Serialized acceptance
+    `.tmp/run-headless-filesystem-metadata-frame-pool-final-20260827.log` reaches quiescence at
+    `106190 ms`, launches genuine userinit and Explorer, completes 668 Explorer api0 redirects with
+    zero callback failures, paints `480000/480000` framebuffer pixels with at least 32 colours,
+    passes all `295/295` gates, and matches the sentinel. The writable snapshot commits generation 5
+    at 1,749,782 bytes, and the VM/resource gate reports zero frame-pool, mapping, registry, retype,
+    and allocation failures.
+
+    Review adjustment: the current filesystem-owned fixed metadata group and recycled-frame policy
+    cap are closed. Next model retained opened-name identity in `nt-fs`, implement
+    `FileNameInformation` and the composite `FileAllInformation` from the same File object state,
+    and keep provider-backed objects on real FSD dispatch. After that, audit the special BootStatus
+    provider and local copy-up/open lifetime so every non-device File has one explicit filesystem
+    owner; do not add a cached-name, handle-number, or zero-metadata fallback.

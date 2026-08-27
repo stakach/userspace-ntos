@@ -135,6 +135,7 @@ impl DirectoryQueryState {
 pub struct DirectoryOpen {
     pub first_cluster: u32,
     pub create_options: u32,
+    pub metadata: crate::FileMetadata,
     pub query: DirectoryQueryState,
     path_len: u16,
     path: [u8; DIRECTORY_OPEN_PATH_CAP],
@@ -163,6 +164,20 @@ impl DirectoryOpenSlot {
             open: DirectoryOpen {
                 first_cluster: 0,
                 create_options: 0,
+                metadata: crate::FileMetadata {
+                    creation_time: 0,
+                    last_access_time: 0,
+                    last_write_time: 0,
+                    change_time: 0,
+                    allocation_size: 0,
+                    end_of_file: 0,
+                    file_id: 0,
+                    attributes: 0,
+                    reparse_tag: 0,
+                    number_of_links: 0,
+                    delete_pending: false,
+                    is_directory: false,
+                },
                 query: DirectoryQueryState::new(),
                 path_len: 0,
                 path: [0; DIRECTORY_OPEN_PATH_CAP],
@@ -188,6 +203,7 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
         first_cluster: u32,
         volume_relative_path: &[u8],
         create_options: u32,
+        metadata: crate::FileMetadata,
     ) -> Result<u32, u32> {
         if volume_relative_path.len() > DIRECTORY_OPEN_PATH_CAP {
             return Err(STATUS_OBJECT_NAME_INVALID);
@@ -206,6 +222,7 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
             open: DirectoryOpen {
                 first_cluster,
                 create_options,
+                metadata,
                 query: DirectoryQueryState::new(),
                 path_len: volume_relative_path.len() as u16,
                 path,
@@ -279,6 +296,7 @@ pub struct ReadOnlyFileOpen {
     pub size: u32,
     pub current_offset: u64,
     pub create_options: u32,
+    pub metadata: crate::FileMetadata,
 }
 
 #[derive(Clone, Copy)]
@@ -298,6 +316,20 @@ impl ReadOnlyFileOpenSlot {
                 size: 0,
                 current_offset: 0,
                 create_options: 0,
+                metadata: crate::FileMetadata {
+                    creation_time: 0,
+                    last_access_time: 0,
+                    last_write_time: 0,
+                    change_time: 0,
+                    allocation_size: 0,
+                    end_of_file: 0,
+                    file_id: 0,
+                    attributes: 0,
+                    reparse_tag: 0,
+                    number_of_links: 0,
+                    delete_pending: false,
+                    is_directory: false,
+                },
             },
         }
     }
@@ -320,6 +352,7 @@ impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
         first_cluster: u32,
         size: u32,
         create_options: u32,
+        metadata: crate::FileMetadata,
     ) -> Result<u32, u32> {
         let (index, slot) = self
             .slots
@@ -335,6 +368,7 @@ impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
                 size,
                 current_offset: 0,
                 create_options,
+                metadata,
             },
         };
         Ok(index as u32)
@@ -878,8 +912,22 @@ mod tests {
     #[test]
     fn directory_open_references_share_query_state() {
         let mut table = DirectoryOpenTable::<2>::new();
-        let shared = table.create(41, b"reactos\\system32", 0x20).unwrap();
-        let independent = table.create(41, b"reactos\\system32", 0x10).unwrap();
+        let shared = table
+            .create(
+                41,
+                b"reactos\\system32",
+                0x20,
+                crate::FileMetadata::default(),
+            )
+            .unwrap();
+        let independent = table
+            .create(
+                41,
+                b"reactos\\system32",
+                0x10,
+                crate::FileMetadata::default(),
+            )
+            .unwrap();
         table.retain(shared).unwrap();
         table.get_mut(shared).unwrap().query.cursor = 7;
         assert_eq!(table.get(shared).unwrap().query.cursor(), 7);
@@ -893,28 +941,51 @@ mod tests {
         assert_eq!(table.get(shared).unwrap().create_options, 0x20);
         table.release(shared).unwrap();
         assert_eq!(table.get(shared), Err(STATUS_INVALID_HANDLE));
-        assert_eq!(table.create(99, b"reactos", 0).unwrap(), shared);
+        assert_eq!(
+            table
+                .create(99, b"reactos", 0, crate::FileMetadata::default())
+                .unwrap(),
+            shared
+        );
     }
 
     #[test]
     fn directory_open_table_clear_reuses_fixed_storage() {
         let mut table = DirectoryOpenTable::<2>::new();
-        let first = table.create(41, b"reactos", 0).unwrap();
+        let first = table
+            .create(41, b"reactos", 0, crate::FileMetadata::default())
+            .unwrap();
         table.retain(first).unwrap();
-        table.create(42, b"reactos\\system32", 0).unwrap();
+        table
+            .create(42, b"reactos\\system32", 0, crate::FileMetadata::default())
+            .unwrap();
 
         table.clear();
 
         assert_eq!(table.get(first), Err(STATUS_INVALID_HANDLE));
-        assert_eq!(table.create(99, b"", 0).unwrap(), 0);
-        assert_eq!(table.create(100, b"reactos", 0).unwrap(), 1);
+        assert_eq!(
+            table
+                .create(99, b"", 0, crate::FileMetadata::default())
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            table
+                .create(100, b"reactos", 0, crate::FileMetadata::default())
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
     fn readonly_file_open_references_share_position() {
         let mut table = ReadOnlyFileOpenTable::<2>::new();
-        let shared = table.create(41, 64, 0x20).unwrap();
-        let independent = table.create(41, 64, 0x10).unwrap();
+        let shared = table
+            .create(41, 64, 0x20, crate::FileMetadata::default())
+            .unwrap();
+        let independent = table
+            .create(41, 64, 0x10, crate::FileMetadata::default())
+            .unwrap();
         table.retain(shared).unwrap();
         table.get_mut(shared).unwrap().current_offset = 17;
         assert_eq!(table.get(shared).unwrap().current_offset, 17);
@@ -924,20 +995,39 @@ mod tests {
         assert_eq!(table.get(shared).unwrap().create_options, 0x20);
         table.release(shared).unwrap();
         assert_eq!(table.get(shared), Err(STATUS_INVALID_HANDLE));
-        assert_eq!(table.create(99, 128, 0).unwrap(), shared);
+        assert_eq!(
+            table
+                .create(99, 128, 0, crate::FileMetadata::default())
+                .unwrap(),
+            shared
+        );
     }
 
     #[test]
     fn readonly_file_open_table_clear_reuses_fixed_storage() {
         let mut table = ReadOnlyFileOpenTable::<2>::new();
-        let first = table.create(41, 64, 0).unwrap();
+        let first = table
+            .create(41, 64, 0, crate::FileMetadata::default())
+            .unwrap();
         table.retain(first).unwrap();
-        table.create(42, 128, 0).unwrap();
+        table
+            .create(42, 128, 0, crate::FileMetadata::default())
+            .unwrap();
 
         table.clear();
 
         assert_eq!(table.get(first), Err(STATUS_INVALID_HANDLE));
-        assert_eq!(table.create(99, 1, 0).unwrap(), 0);
-        assert_eq!(table.create(100, 2, 0).unwrap(), 1);
+        assert_eq!(
+            table
+                .create(99, 1, 0, crate::FileMetadata::default())
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            table
+                .create(100, 2, 0, crate::FileMetadata::default())
+                .unwrap(),
+            1
+        );
     }
 }

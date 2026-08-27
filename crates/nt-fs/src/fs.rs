@@ -24,7 +24,8 @@ use crate::status::*;
 const ZERO_EXTENT_BLOB: usize = usize::MAX;
 const MEMFS_SNAPSHOT_MAGIC: [u8; 8] = *b"USNTFS\0\x01";
 const MEMFS_SNAPSHOT_VERSION_V1: u16 = 1;
-const MEMFS_SNAPSHOT_VERSION: u16 = 2;
+const MEMFS_SNAPSHOT_VERSION_V2: u16 = 2;
+const MEMFS_SNAPSHOT_VERSION: u16 = 3;
 const MEMFS_SNAPSHOT_HEADER_LEN: usize = 32;
 const SNAP_REC_DIR: u8 = 1;
 const SNAP_REC_FILE: u8 = 2;
@@ -447,8 +448,13 @@ impl<'a> SnapshotReader<'a> {
 }
 
 struct MemFsNode {
+    file_id: u64,
     is_dir: bool,
     attributes: u32,
+    creation_time: u64,
+    last_access_time: u64,
+    last_write_time: u64,
+    change_time: u64,
     link_count: u32,
     parent: u64,
     data: FileData,
@@ -468,7 +474,9 @@ struct MemFsDirEntry {
 pub struct MemFs {
     nodes: Vec<Option<MemFsNode>>,
     blobs: Vec<Vec<u8>>,
+    next_file_id: u64,
     next_entry_id: u64,
+    current_time_100ns: u64,
 }
 
 fn fold(s: &str) -> String {
@@ -487,17 +495,74 @@ impl MemFs {
         let mut fs = MemFs {
             nodes: Vec::new(),
             blobs: Vec::new(),
+            next_file_id: 1,
             next_entry_id: 1,
+            current_time_100ns: 0,
         };
         fs.nodes.push(Some(MemFsNode {
+            file_id: 0,
             is_dir: true,
             attributes: FILE_ATTRIBUTE_DIRECTORY,
+            creation_time: 0,
+            last_access_time: 0,
+            last_write_time: 0,
+            change_time: 0,
             link_count: 1,
             parent: 0,
             data: FileData::empty(),
             children: Vec::new(),
         }));
         fs
+    }
+
+    fn set_current_time_100ns(&mut self, now: u64) {
+        self.current_time_100ns = now;
+    }
+
+    fn initialize_timestamps(&mut self, now: u64) -> bool {
+        self.current_time_100ns = now;
+        let mut changed = false;
+        for node in self.nodes.iter_mut().flatten() {
+            if node.creation_time == 0 {
+                node.creation_time = now;
+                changed = true;
+            }
+            if node.last_access_time == 0 {
+                node.last_access_time = now;
+                changed = true;
+            }
+            if node.last_write_time == 0 {
+                node.last_write_time = now;
+                changed = true;
+            }
+            if node.change_time == 0 {
+                node.change_time = now;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn touch_write(&mut self, id: u64) {
+        let now = self.current_time_100ns;
+        if let Some(node) = self.node_mut(id) {
+            node.last_write_time = now;
+            node.change_time = now;
+        }
+    }
+
+    fn touch_change(&mut self, id: u64) {
+        let now = self.current_time_100ns;
+        if let Some(node) = self.node_mut(id) {
+            node.change_time = now;
+        }
+    }
+
+    fn touch_access(&mut self, id: u64) {
+        let now = self.current_time_100ns;
+        if let Some(node) = self.node_mut(id) {
+            node.last_access_time = now;
+        }
     }
 
     /// Remove immutable data blobs that no live file extent references.
@@ -611,7 +676,10 @@ impl MemFs {
             return Err(MemFsSnapshotError::UnsupportedVersion);
         }
         let version = r.u16()?;
-        if !matches!(version, MEMFS_SNAPSHOT_VERSION_V1 | MEMFS_SNAPSHOT_VERSION) {
+        if !matches!(
+            version,
+            MEMFS_SNAPSHOT_VERSION_V1 | MEMFS_SNAPSHOT_VERSION_V2 | MEMFS_SNAPSHOT_VERSION
+        ) {
             return Err(MemFsSnapshotError::UnsupportedVersion);
         }
         let record_count = r.u32()?;
@@ -668,11 +736,19 @@ impl MemFs {
     /// Serialize the volume tree to a versioned, checksummed snapshot. Open FILE_OBJECT handles are
     /// intentionally not part of the image; a restored boot reopens files through normal Zw paths.
     pub fn to_snapshot(&self) -> Result<Vec<u8>, MemFsSnapshotError> {
-        let mut record_count = 0u32;
+        let root = self.node(0).ok_or(MemFsSnapshotError::InvalidRecord)?;
+        let mut record_count = 1u32;
         let mut path = String::new();
         let mut measured_files = Vec::new();
-        let payload_len =
-            self.measure_snapshot_children(0, &mut path, &mut measured_files, &mut record_count)?;
+        let payload_len = self
+            .snapshot_record_len("", root, false)?
+            .checked_add(self.measure_snapshot_children(
+                0,
+                &mut path,
+                &mut measured_files,
+                &mut record_count,
+            )?)
+            .ok_or(MemFsSnapshotError::InvalidRecord)?;
 
         let mut out = Vec::new();
         let total_len = MEMFS_SNAPSHOT_HEADER_LEN
@@ -681,7 +757,8 @@ impl MemFs {
         out.try_reserve_exact(total_len)
             .map_err(|_| MemFsSnapshotError::OutOfMemory)?;
         out.resize(MEMFS_SNAPSHOT_HEADER_LEN, 0);
-        let mut written_records = 0u32;
+        self.write_snapshot_record("", root, false, &mut out)?;
+        let mut written_records = 1u32;
         let mut written_files = Vec::new();
         self.write_snapshot_children(
             0,
@@ -716,10 +793,15 @@ impl MemFs {
             let attributes = r.u32()?;
             let path_len =
                 usize::try_from(r.u32()?).map_err(|_| MemFsSnapshotError::InvalidRecord)?;
-            let node_key = if info.version >= MEMFS_SNAPSHOT_VERSION {
+            let node_key = if info.version >= MEMFS_SNAPSHOT_VERSION_V2 {
                 r.u64()?
             } else {
                 0
+            };
+            let times = if info.version >= MEMFS_SNAPSHOT_VERSION {
+                [r.u64()?, r.u64()?, r.u64()?, r.u64()?]
+            } else {
+                [0; 4]
             };
             let logical_len =
                 usize::try_from(r.u64()?).map_err(|_| MemFsSnapshotError::InvalidRecord)?;
@@ -728,8 +810,27 @@ impl MemFs {
             let path_bytes = r.take(path_len)?;
             let path =
                 core::str::from_utf8(path_bytes).map_err(|_| MemFsSnapshotError::InvalidPath)?;
-            if kind == SNAP_REC_LINK {
+            if path.is_empty() {
                 if info.version < MEMFS_SNAPSHOT_VERSION
+                    || seen != 0
+                    || kind != SNAP_REC_DIR
+                    || node_key != 0
+                    || logical_len != 0
+                    || extent_count != 0
+                {
+                    return Err(MemFsSnapshotError::InvalidRecord);
+                }
+                let root = fs.node_mut(0).ok_or(MemFsSnapshotError::InvalidRecord)?;
+                root.attributes = attributes | FILE_ATTRIBUTE_DIRECTORY;
+                root.creation_time = times[0];
+                root.last_access_time = times[1];
+                root.last_write_time = times[2];
+                root.change_time = times[3];
+                seen = 1;
+                continue;
+            }
+            if kind == SNAP_REC_LINK {
+                if info.version < MEMFS_SNAPSHOT_VERSION_V2
                     || node_key == 0
                     || logical_len != 0
                     || extent_count != 0
@@ -741,7 +842,7 @@ impl MemFs {
                     .find(|(key, _)| *key == node_key)
                     .map(|(_, id)| *id)
                     .ok_or(MemFsSnapshotError::InvalidRecord)?;
-                fs.restore_snapshot_link(path, target, attributes)?;
+                fs.restore_snapshot_link(path, target, attributes, times)?;
                 seen = seen
                     .checked_add(1)
                     .ok_or(MemFsSnapshotError::InvalidRecord)?;
@@ -752,7 +853,12 @@ impl MemFs {
                 SNAP_REC_FILE => false,
                 _ => return Err(MemFsSnapshotError::InvalidRecord),
             };
-            let id = fs.restore_snapshot_node(path, is_dir, attributes)?;
+            let file_id = if info.version >= MEMFS_SNAPSHOT_VERSION_V2 {
+                Some(node_key)
+            } else {
+                None
+            };
+            let id = fs.restore_snapshot_node(path, is_dir, attributes, times, file_id)?;
             if is_dir {
                 if logical_len != 0 || extent_count != 0 {
                     return Err(MemFsSnapshotError::InvalidRecord);
@@ -763,7 +869,7 @@ impl MemFs {
                     return Err(MemFsSnapshotError::InvalidRecord);
                 };
                 node.data = data;
-                if info.version >= MEMFS_SNAPSHOT_VERSION {
+                if info.version >= MEMFS_SNAPSHOT_VERSION_V2 {
                     if node_key == 0
                         || hardlink_nodes.iter().any(|(key, _)| *key == node_key)
                         || hardlink_nodes.try_reserve_exact(1).is_err()
@@ -808,10 +914,15 @@ impl MemFs {
             let attributes = r.u32()?;
             let path_len =
                 usize::try_from(r.u32()?).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
-            let node_key = if header.info.version >= MEMFS_SNAPSHOT_VERSION {
+            let node_key = if header.info.version >= MEMFS_SNAPSHOT_VERSION_V2 {
                 r.u64()?
             } else {
                 0
+            };
+            let times = if header.info.version >= MEMFS_SNAPSHOT_VERSION {
+                [r.u64()?, r.u64()?, r.u64()?, r.u64()?]
+            } else {
+                [0; 4]
             };
             let logical_len =
                 usize::try_from(r.u64()?).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
@@ -820,8 +931,27 @@ impl MemFs {
             let path_bytes = r.vec(path_len)?;
             let path =
                 core::str::from_utf8(&path_bytes).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
-            if kind == SNAP_REC_LINK {
+            if path.is_empty() {
                 if header.info.version < MEMFS_SNAPSHOT_VERSION
+                    || seen != 0
+                    || kind != SNAP_REC_DIR
+                    || node_key != 0
+                    || logical_len != 0
+                    || extent_count != 0
+                {
+                    return Err(SnapshotBlockStoreError::Corrupt);
+                }
+                let root = fs.node_mut(0).ok_or(SnapshotBlockStoreError::Corrupt)?;
+                root.attributes = attributes | FILE_ATTRIBUTE_DIRECTORY;
+                root.creation_time = times[0];
+                root.last_access_time = times[1];
+                root.last_write_time = times[2];
+                root.change_time = times[3];
+                seen = 1;
+                continue;
+            }
+            if kind == SNAP_REC_LINK {
+                if header.info.version < MEMFS_SNAPSHOT_VERSION_V2
                     || node_key == 0
                     || logical_len != 0
                     || extent_count != 0
@@ -833,7 +963,7 @@ impl MemFs {
                     .find(|(key, _)| *key == node_key)
                     .map(|(_, id)| *id)
                     .ok_or(SnapshotBlockStoreError::Corrupt)?;
-                fs.restore_snapshot_link(path, target, attributes)
+                fs.restore_snapshot_link(path, target, attributes, times)
                     .map_err(snapshot_error_to_store_error)?;
                 seen = seen
                     .checked_add(1)
@@ -846,7 +976,13 @@ impl MemFs {
                 _ => return Err(SnapshotBlockStoreError::Corrupt),
             };
             let id = fs
-                .restore_snapshot_node(path, is_dir, attributes)
+                .restore_snapshot_node(
+                    path,
+                    is_dir,
+                    attributes,
+                    times,
+                    (header.info.version >= MEMFS_SNAPSHOT_VERSION_V2).then_some(node_key),
+                )
                 .map_err(snapshot_error_to_store_error)?;
             if is_dir {
                 if logical_len != 0 || extent_count != 0 {
@@ -859,7 +995,7 @@ impl MemFs {
                     return Err(SnapshotBlockStoreError::Corrupt);
                 };
                 node.data = data;
-                if header.info.version >= MEMFS_SNAPSHOT_VERSION {
+                if header.info.version >= MEMFS_SNAPSHOT_VERSION_V2 {
                     if node_key == 0
                         || hardlink_nodes.iter().any(|(key, _)| *key == node_key)
                         || hardlink_nodes.try_reserve_exact(1).is_err()
@@ -967,7 +1103,7 @@ impl MemFs {
                 seen_files.push(child_id);
                 false
             };
-            self.write_snapshot_record(path, child_id, child, link_only, out)?;
+            self.write_snapshot_record(path, child, link_only, out)?;
             *record_count = record_count
                 .checked_add(1)
                 .ok_or(MemFsSnapshotError::InvalidRecord)?;
@@ -983,7 +1119,9 @@ impl MemFs {
         &self,
         sink: &mut S,
     ) -> Result<u32, SnapshotBlockStoreError> {
-        let mut record_count = 0u32;
+        let root = self.node(0).ok_or(SnapshotBlockStoreError::Corrupt)?;
+        self.write_snapshot_record_to_sink("", root, false, sink)?;
+        let mut record_count = 1u32;
         let mut path = String::new();
         let mut seen_files = Vec::new();
         self.write_snapshot_children_to_sink(
@@ -1035,7 +1173,7 @@ impl MemFs {
                 seen_files.push(child_id);
                 false
             };
-            self.write_snapshot_record_to_sink(path, child_id, child, link_only, sink)?;
+            self.write_snapshot_record_to_sink(path, child, link_only, sink)?;
             *record_count = record_count
                 .checked_add(1)
                 .ok_or(SnapshotBlockStoreError::Corrupt)?;
@@ -1129,6 +1267,7 @@ impl MemFs {
             .checked_add(4)
             .and_then(|n| n.checked_add(4))
             .and_then(|n| n.checked_add(8))
+            .and_then(|n| n.checked_add(32))
             .and_then(|n| n.checked_add(8))
             .and_then(|n| n.checked_add(4))
             .and_then(|n| n.checked_add(path_len as usize))
@@ -1139,7 +1278,6 @@ impl MemFs {
     fn write_snapshot_record(
         &self,
         path: &str,
-        node_id: u64,
         node: &MemFsNode,
         link_only: bool,
         out: &mut Vec<u8>,
@@ -1165,7 +1303,11 @@ impl MemFs {
         });
         put_u32(out, node.attributes);
         put_u32(out, path_len);
-        put_u64(out, node_id);
+        put_u64(out, node.file_id);
+        put_u64(out, node.creation_time);
+        put_u64(out, node.last_access_time);
+        put_u64(out, node.last_write_time);
+        put_u64(out, node.change_time);
         put_u64(out, logical_len);
         put_u32(out, extent_count);
         out.extend_from_slice(path.as_bytes());
@@ -1178,7 +1320,6 @@ impl MemFs {
     fn write_snapshot_record_to_sink<S: SnapshotPayloadSink>(
         &self,
         path: &str,
-        node_id: u64,
         node: &MemFsNode,
         link_only: bool,
         sink: &mut S,
@@ -1196,7 +1337,7 @@ impl MemFs {
             u32::try_from(Self::snapshot_extent_count(&node.data))
                 .map_err(|_| SnapshotBlockStoreError::Corrupt)?
         };
-        let mut header = [0u8; 29];
+        let mut header = [0u8; 61];
         header[0] = if link_only {
             SNAP_REC_LINK
         } else if node.is_dir {
@@ -1206,9 +1347,13 @@ impl MemFs {
         };
         put_u32_at(&mut header[1..5], node.attributes);
         put_u32_at(&mut header[5..9], path_len);
-        put_u64_at(&mut header[9..17], node_id);
-        put_u64_at(&mut header[17..25], logical_len);
-        put_u32_at(&mut header[25..29], extent_count);
+        put_u64_at(&mut header[9..17], node.file_id);
+        put_u64_at(&mut header[17..25], node.creation_time);
+        put_u64_at(&mut header[25..33], node.last_access_time);
+        put_u64_at(&mut header[33..41], node.last_write_time);
+        put_u64_at(&mut header[41..49], node.change_time);
+        put_u64_at(&mut header[49..57], logical_len);
+        put_u32_at(&mut header[57..61], extent_count);
         sink.write_all(&header)?;
         sink.write_all(path.as_bytes())?;
         if !node.is_dir && !link_only {
@@ -1374,6 +1519,8 @@ impl MemFs {
         path: &str,
         is_dir: bool,
         attributes: u32,
+        times: [u64; 4],
+        file_id: Option<u64>,
     ) -> Result<u64, MemFsSnapshotError> {
         if !Self::valid_snapshot_path(path) {
             return Err(MemFsSnapshotError::InvalidPath);
@@ -1393,7 +1540,26 @@ impl MemFs {
         if !is_dir && attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
             return Err(MemFsSnapshotError::InvalidRecord);
         }
+        if let Some(file_id) = file_id {
+            if file_id == 0
+                || self
+                    .nodes
+                    .iter()
+                    .flatten()
+                    .any(|node| node.file_id == file_id)
+            {
+                return Err(MemFsSnapshotError::InvalidRecord);
+            }
+        }
         let id = self.create_child(parent, leaf, is_dir);
+        if let Some(file_id) = file_id {
+            self.node_mut(id).unwrap().file_id = file_id;
+            self.next_file_id = self.next_file_id.max(
+                file_id
+                    .checked_add(1)
+                    .ok_or(MemFsSnapshotError::InvalidRecord)?,
+            );
+        }
         let Some(node) = self.node_mut(id) else {
             return Err(MemFsSnapshotError::InvalidRecord);
         };
@@ -1402,6 +1568,10 @@ impl MemFs {
         } else {
             attributes
         };
+        node.creation_time = times[0];
+        node.last_access_time = times[1];
+        node.last_write_time = times[2];
+        node.change_time = times[3];
         Ok(id)
     }
 
@@ -1410,6 +1580,7 @@ impl MemFs {
         path: &str,
         target: u64,
         attributes: u32,
+        times: [u64; 4],
     ) -> Result<(), MemFsSnapshotError> {
         if !Self::valid_snapshot_path(path) || self.lookup(path).is_some() {
             return Err(MemFsSnapshotError::InvalidPath);
@@ -1417,7 +1588,16 @@ impl MemFs {
         let Some(target_node) = self.node(target) else {
             return Err(MemFsSnapshotError::InvalidRecord);
         };
-        if target_node.is_dir || target_node.attributes != attributes {
+        if target_node.is_dir
+            || target_node.attributes != attributes
+            || times
+                != [
+                    target_node.creation_time,
+                    target_node.last_access_time,
+                    target_node.last_write_time,
+                    target_node.change_time,
+                ]
+        {
             return Err(MemFsSnapshotError::InvalidRecord);
         }
         let Some((parent_path, leaf)) = Self::parent_and_leaf_relative(path) else {
@@ -1616,13 +1796,24 @@ impl MemFs {
 
     fn create_child_with_entry(&mut self, parent: u64, name: &str, is_dir: bool) -> (u64, u64) {
         let node_id = self.nodes.len() as u64;
+        let file_id = self.next_file_id;
+        self.next_file_id = self
+            .next_file_id
+            .checked_add(1)
+            .expect("MemFs file identity exhausted");
+        let now = self.current_time_100ns;
         self.nodes.push(Some(MemFsNode {
+            file_id,
             is_dir,
             attributes: if is_dir {
                 FILE_ATTRIBUTE_DIRECTORY
             } else {
                 FILE_ATTRIBUTE_ARCHIVE
             },
+            creation_time: now,
+            last_access_time: now,
+            last_write_time: now,
+            change_time: now,
             link_count: 0,
             parent,
             data: FileData::empty(),
@@ -2230,6 +2421,42 @@ impl MemFs {
             number_of_links: self.node(id)?.link_count,
             delete_pending: false,
         })
+    }
+
+    fn metadata(&self, id: u64, delete_pending: bool) -> Option<FileMetadata> {
+        let node = self.node(id)?;
+        let end_of_file = if node.is_dir { 0 } else { self.size(id) };
+        let allocation_size = if node.is_dir || end_of_file == 0 {
+            0
+        } else {
+            end_of_file.saturating_add(0xfff) & !0xfff
+        };
+        Some(FileMetadata {
+            creation_time: node.creation_time,
+            last_access_time: node.last_access_time,
+            last_write_time: node.last_write_time,
+            change_time: node.change_time,
+            allocation_size,
+            end_of_file,
+            file_id: node.file_id,
+            attributes: node.attributes,
+            reparse_tag: 0,
+            number_of_links: node.link_count,
+            delete_pending,
+            is_directory: node.is_dir,
+        })
+    }
+
+    fn query_metadata(&self, rel_path: &str) -> Option<FileMetadata> {
+        self.metadata(self.lookup(rel_path)?, false)
+    }
+
+    fn query_metadata_folded_relative(&self, rel_path: &[u8]) -> Option<FileMetadata> {
+        self.metadata(self.lookup_folded_relative(rel_path)?, false)
+    }
+
+    fn query_metadata_folded_from(&self, start: u64, rel_path: &[u8]) -> Option<FileMetadata> {
+        self.metadata(self.lookup_folded_from(start, rel_path)?, false)
     }
 
     fn is_dir(&self, id: u64) -> bool {
@@ -2897,6 +3124,44 @@ pub struct StandardInformation {
     pub delete_pending: bool,
 }
 
+/// Filesystem-owned metadata shared by handle and by-name query paths. `file_id` identifies the
+/// underlying node, so every hard link to a MemFs file reports the same identity.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileMetadata {
+    pub creation_time: u64,
+    pub last_access_time: u64,
+    pub last_write_time: u64,
+    pub change_time: u64,
+    pub allocation_size: u64,
+    pub end_of_file: u64,
+    pub file_id: u64,
+    pub attributes: u32,
+    pub reparse_tag: u32,
+    pub number_of_links: u32,
+    pub delete_pending: bool,
+    pub is_directory: bool,
+}
+
+impl FileMetadata {
+    pub fn query_metadata(self) -> crate::QueryMetadata {
+        crate::QueryMetadata {
+            creation_time: self.creation_time,
+            last_access_time: self.last_access_time,
+            last_write_time: self.last_write_time,
+            change_time: self.change_time,
+            allocation_size: self.allocation_size,
+            end_of_file: self.end_of_file,
+            file_id: self.file_id,
+            file_attributes: self.attributes,
+            reparse_tag: self.reparse_tag,
+            number_of_links: self.number_of_links,
+            delete_pending: self.delete_pending,
+            directory: self.is_directory,
+            ..crate::QueryMetadata::default()
+        }
+    }
+}
+
 /// Canonical parse root for a file rename. This keeps process handles out of
 /// the filesystem API while preserving the three NT rename name forms.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -3000,6 +3265,17 @@ impl FileSystem {
             mounts: MountManager::new(),
             handles: Vec::new(),
         }
+    }
+
+    /// Publish the kernel's current NT system time to the filesystem for subsequent mutations.
+    pub fn set_current_time_100ns(&mut self, now: u64) {
+        self.volume.set_current_time_100ns(now);
+    }
+
+    /// Initialize a new volume and migrate pre-v3 snapshots whose format did not carry timestamps.
+    /// Returns whether durable node metadata changed and therefore needs a checkpoint.
+    pub fn initialize_timestamps(&mut self, now: u64) -> bool {
+        self.volume.initialize_timestamps(now)
     }
 
     /// Export just the durable volume tree. Open handles are per-boot FILE_OBJECT state and are not
@@ -3175,6 +3451,7 @@ impl FileSystem {
             }
         };
         if status == STATUS_SUCCESS {
+            self.volume.touch_change(source);
             self.reap_unlinked_nodes();
         }
         status
@@ -3247,6 +3524,7 @@ impl FileSystem {
             }
         };
         if status == STATUS_SUCCESS {
+            self.volume.touch_change(source);
             self.reap_unlinked_nodes();
         }
         status
@@ -3416,6 +3694,9 @@ impl FileSystem {
             return (STATUS_END_OF_FILE, 0);
         }
         let read = self.volume.read_at_into(node_id, offset, output);
+        if read != 0 {
+            self.volume.touch_access(node_id);
+        }
         if byte_offset.is_none() {
             self.obj_mut(handle).unwrap().current_offset = offset + read as u64;
         }
@@ -3445,6 +3726,9 @@ impl FileSystem {
         if byte_offset.is_none() {
             self.obj_mut(handle).unwrap().current_offset = offset + n as u64;
         }
+        if n != 0 {
+            self.volume.touch_write(node_id);
+        }
         (STATUS_SUCCESS, n)
     }
 
@@ -3466,6 +3750,7 @@ impl FileSystem {
         }
         let end = self.volume.size(node_id);
         self.obj_mut(handle).unwrap().current_offset = end;
+        self.volume.touch_write(node_id);
         (STATUS_SUCCESS, n)
     }
 
@@ -3496,6 +3781,7 @@ impl FileSystem {
         if written != data.len() {
             return (STATUS_INSUFFICIENT_RESOURCES, written);
         }
+        self.volume.touch_write(node_id);
         (STATUS_SUCCESS, written)
     }
 
@@ -3517,6 +3803,7 @@ impl FileSystem {
             return STATUS_INSUFFICIENT_RESOURCES;
         }
         self.obj_mut(handle).unwrap().current_offset = len;
+        self.volume.touch_write(node_id);
         STATUS_SUCCESS
     }
 
@@ -3539,6 +3826,12 @@ impl FileSystem {
             number_of_links: self.volume.node(obj.node_id)?.link_count,
             delete_pending: obj.delete_pending,
         })
+    }
+
+    /// Query the filesystem-owned metadata for an open File object.
+    pub fn zw_query_metadata(&self, handle: u64) -> Option<FileMetadata> {
+        let obj = self.obj(handle)?;
+        self.volume.metadata(obj.node_id, obj.delete_pending)
     }
 
     /// `ZwQueryDirectoryFile` (spec §17): enumerate the directory this file object is open on,
@@ -3595,16 +3888,42 @@ impl FileSystem {
                 if data.len() < 40 {
                     return STATUS_INFO_LENGTH_MISMATCH;
                 }
+                let creation_time = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                let last_access_time = u64::from_le_bytes(data[8..16].try_into().unwrap());
+                let last_write_time = u64::from_le_bytes(data[16..24].try_into().unwrap());
+                let change_time = u64::from_le_bytes(data[24..32].try_into().unwrap());
                 let attributes = u32::from_le_bytes(data[32..36].try_into().unwrap());
                 let requested = attributes & FILE_ATTRIBUTE_SETTABLE;
-                if requested != 0 {
-                    let is_dir = self.volume.is_dir(node_id);
-                    if let Some(node) = self.volume.node_mut(node_id) {
+                let is_dir = self.volume.is_dir(node_id);
+                let now = self.volume.current_time_100ns;
+                if let Some(node) = self.volume.node_mut(node_id) {
+                    let mut changed = false;
+                    if creation_time != 0 {
+                        node.creation_time = creation_time;
+                        changed = true;
+                    }
+                    if last_access_time != 0 {
+                        node.last_access_time = last_access_time;
+                        changed = true;
+                    }
+                    if last_write_time != 0 {
+                        node.last_write_time = last_write_time;
+                        changed = true;
+                    }
+                    if change_time != 0 {
+                        node.change_time = change_time;
+                        changed = true;
+                    }
+                    if requested != 0 {
                         node.attributes = if is_dir {
                             requested | FILE_ATTRIBUTE_DIRECTORY
                         } else {
                             requested
                         };
+                        changed = true;
+                    }
+                    if changed && change_time == 0 {
+                        node.change_time = now;
                     }
                 }
                 STATUS_SUCCESS
@@ -3654,7 +3973,11 @@ impl FileSystem {
                     return STATUS_INFO_LENGTH_MISMATCH;
                 }
                 let length = u64::from_le_bytes(data[0..8].try_into().unwrap());
-                self.volume.set_end_of_file(node_id, length)
+                let status = self.volume.set_end_of_file(node_id, length);
+                if status == STATUS_SUCCESS {
+                    self.volume.touch_write(node_id);
+                }
+                status
             }
             FILE_RENAME_INFORMATION => {
                 let (replace_if_exists, root_directory, target) =
@@ -3781,7 +4104,11 @@ impl FileSystem {
         if self.volume.is_dir(id) {
             return false;
         }
-        self.volume.set_file_data(id, bytes)
+        let installed = self.volume.set_file_data(id, bytes);
+        if installed {
+            self.volume.touch_write(id);
+        }
+        installed
     }
 
     /// Create `path` as a FILE by taking ownership of `bytes`.
@@ -3806,6 +4133,9 @@ impl FileSystem {
         }
         let installed = self.volume.set_file_data_owned(id, bytes);
         debug_assert!(installed);
+        if installed {
+            self.volume.touch_write(id);
+        }
         Ok(())
     }
 
@@ -3827,7 +4157,11 @@ impl FileSystem {
         if self.volume.is_dir(id) {
             return false;
         }
-        self.volume.set_file_data(id, bytes)
+        let installed = self.volume.set_file_data(id, bytes);
+        if installed {
+            self.volume.touch_write(id);
+        }
+        installed
     }
 
     /// A file's bytes, borrowed in place (no copy) — the read side [`provision_file`] writes.
@@ -3874,11 +4208,20 @@ impl FileSystem {
         self.volume.query(&rel)
     }
 
+    pub fn query_metadata(&self, path: &str) -> Option<FileMetadata> {
+        let rel = self.to_relative(&normalize_separators(path))?;
+        self.volume.query_metadata(&rel)
+    }
+
     /// Query a lowercase volume-relative path produced by `nt_path_to_volume_relative{,_into}`.
     /// This avoids allocating a temporary NT path string on hot syscall paths that already own a
     /// canonical relative path.
     pub fn query_attributes_relative(&self, relative: &[u8]) -> Option<StandardInformation> {
         self.volume.query_folded_relative(relative)
+    }
+
+    pub fn query_metadata_relative(&self, relative: &[u8]) -> Option<FileMetadata> {
+        self.volume.query_metadata_folded_relative(relative)
     }
 
     /// Query a folded path beneath an existing directory FILE_OBJECT without opening the child.
@@ -3901,6 +4244,28 @@ impl FileSystem {
         }
         self.volume
             .query_folded_from(root_node, relative)
+            .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)
+    }
+
+    pub fn query_metadata_relative_to_directory(
+        &self,
+        root_directory: u64,
+        relative: &[u8],
+    ) -> Result<FileMetadata, u32> {
+        let Some(root_node) = self.obj(root_directory).map(|object| object.node_id) else {
+            return Err(STATUS_INVALID_HANDLE);
+        };
+        let Some(root) = self.volume.node(root_node) else {
+            return Err(STATUS_INVALID_HANDLE);
+        };
+        if !root.is_dir {
+            return Err(STATUS_NOT_A_DIRECTORY);
+        }
+        if relative.is_empty() || relative.first() == Some(&b'\\') {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        self.volume
+            .query_metadata_folded_from(root_node, relative)
             .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)
     }
 

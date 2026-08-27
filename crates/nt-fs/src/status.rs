@@ -34,6 +34,7 @@ pub const FILE_ATTRIBUTE_SYSTEM: u32 = 0x0000_0004;
 pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 pub const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
 pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+pub const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
 /// FAT directory entries use the same low attribute bits as NT file attributes. Preserve those
 /// real bits, but translate an empty FAT attribute byte into NT's required NORMAL marker.
@@ -55,6 +56,7 @@ pub const FILE_ATTRIBUTE_SETTABLE: u32 = FILE_ATTRIBUTE_READONLY
 
 // FILE_INFORMATION_CLASS values used by NtSetInformationFile (spec §19).
 pub const FILE_BASIC_INFORMATION: u32 = 4;
+pub const FILE_INTERNAL_INFORMATION: u32 = 6;
 pub const FILE_ACCESS_INFORMATION: u32 = 8;
 pub const FILE_RENAME_INFORMATION: u32 = 10;
 pub const FILE_LINK_INFORMATION: u32 = 11;
@@ -64,6 +66,8 @@ pub const FILE_MODE_INFORMATION: u32 = 16;
 pub const FILE_ALIGNMENT_INFORMATION: u32 = 17;
 pub const FILE_ALLOCATION_INFORMATION: u32 = 19;
 pub const FILE_END_OF_FILE_INFORMATION: u32 = 20;
+pub const FILE_NETWORK_OPEN_INFORMATION: u32 = 34;
+pub const FILE_ATTRIBUTE_TAG_INFORMATION: u32 = 35;
 pub const FILE_DISPOSITION_INFORMATION_EX: u32 = 64;
 
 // FILE_DISPOSITION_INFORMATION_EX flags.

@@ -731,6 +731,10 @@ static CM_REGISTRY_BOOT_SETUP: AtomicBool = AtomicBool::new(false);
 static CM_REGISTRY_BOOT_ACCEPTED: AtomicBool = AtomicBool::new(false);
 static CM_REGISTRY_LAZY_FLUSH_ENABLED: AtomicBool = AtomicBool::new(false);
 static EXEC_BOOT_STATUS_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static EXEC_BOOT_STATUS_CREATION_TIME: AtomicU64 = AtomicU64::new(0);
+static EXEC_BOOT_STATUS_LAST_ACCESS_TIME: AtomicU64 = AtomicU64::new(0);
+static EXEC_BOOT_STATUS_LAST_WRITE_TIME: AtomicU64 = AtomicU64::new(0);
+static EXEC_BOOT_STATUS_CHANGE_TIME: AtomicU64 = AtomicU64::new(0);
 static mut EXEC_BOOT_STATUS_DATA: [u8; EXEC_BOOT_STATUS_FILE_SIZE] =
     [0; EXEC_BOOT_STATUS_FILE_SIZE];
 
@@ -956,7 +960,6 @@ fn trace_handle_object_for(nt: &ExecNtHandler, handle: u64) {
         }
         Some(nt_process::HandleObject::DiskFile { .. }) => print_str(b"disk-file"),
         Some(nt_process::HandleObject::Directory { .. }) => print_str(b"directory"),
-        Some(nt_process::HandleObject::CachedFile { .. }) => print_str(b"cached-file"),
         Some(nt_process::HandleObject::BootStatusFile { .. }) => print_str(b"boot-status"),
         Some(nt_process::HandleObject::IoCompletion(_)) => print_str(b"io-completion"),
         Some(nt_process::HandleObject::RegistryKey(_)) => print_str(b"registry-key"),
@@ -2372,6 +2375,11 @@ unsafe fn reset_boot_status_data() {
         *data.add(0x09) = 30; // AabTimeout
         *data.add(0x0A) = 1; // LastBootSucceeded
     }
+    let now = nt_system_time_100ns();
+    EXEC_BOOT_STATUS_CREATION_TIME.store(now, Ordering::Release);
+    EXEC_BOOT_STATUS_LAST_ACCESS_TIME.store(now, Ordering::Release);
+    EXEC_BOOT_STATUS_LAST_WRITE_TIME.store(now, Ordering::Release);
+    EXEC_BOOT_STATUS_CHANGE_TIME.store(now, Ordering::Release);
     EXEC_BOOT_STATUS_INITIALIZED.store(true, Ordering::Release);
 }
 
@@ -9387,17 +9395,6 @@ impl ExecNtHandler {
         h
     }
 
-    fn mint_cached_file_handle(&mut self, access: u32, create_options: u32) -> Option<u64> {
-        let pid = self.pm_pid_for_pi(self.pi)?;
-        self.insert_process_handle(
-            pid,
-            nt_process::HandleObject::CachedFile { create_options },
-            access,
-        )
-        .ok()
-        .map(u64::from)
-    }
-
     fn map_directory_object_access(mut access: u32) -> u32 {
         const READ_CONTROL: u32 = 0x0002_0000;
         const DIRECTORY_ALL_ACCESS: u32 = 0x000F_0000 | 0x000F;
@@ -9606,15 +9603,16 @@ impl ExecNtHandler {
     /// Mint a process-local handle for a read-only file on the mounted FAT volume.
     pub(crate) fn mint_disk_file_handle(
         &mut self,
-        first_cluster: u32,
-        size: u32,
+        file: crate::fs_loader::FatOpenMetadata,
         access: u32,
         create_options: u32,
     ) -> Option<u64> {
         let pid = self.pm_pid_for_pi(self.pi)?;
+        let first_cluster = file.first_cluster;
+        let size = u32::try_from(file.metadata.end_of_file).ok()?;
         let object_id = self
             .readonly_file_opens
-            .create(first_cluster, size, create_options)
+            .create(first_cluster, size, create_options, file.metadata)
             .ok()?;
         let handle = match self.insert_process_handle(
             pid,
@@ -9638,12 +9636,13 @@ impl ExecNtHandler {
         name16: &[u16],
         desired_access: u32,
         open_options: u32,
-    ) -> Option<(u32, u32)> {
+    ) -> Option<crate::fs_loader::FatOpenMetadata> {
         if !Self::readonly_disk_open_allowed(desired_access, open_options) {
             return None;
         }
-        nt_fs::nt_path_to_volume_relative(name16, b"reactos")
-            .and_then(|path| unsafe { exec_fs().and_then(|fs| fat_open_path(&fs, &path)) })
+        nt_fs::nt_path_to_volume_relative(name16, b"reactos").and_then(|path| unsafe {
+            exec_fs().and_then(|fs| crate::fs_loader::fat_open_path_metadata(&fs, &path))
+        })
     }
 
     fn readonly_disk_open_allowed(desired_access: u32, open_options: u32) -> bool {
@@ -9744,15 +9743,24 @@ impl ExecNtHandler {
     /// Mint a process-local handle for a directory on the mounted FAT volume.
     pub(crate) fn mint_directory_handle(
         &mut self,
-        first_cluster: u32,
+        directory: crate::fs_loader::FatOpenMetadata,
         volume_relative_path: &[u8],
         access: u32,
         create_options: u32,
     ) -> Option<u64> {
         let pid = self.pm_pid_for_pi(self.pi)?;
+        let first_cluster = directory.first_cluster;
+        if !directory.metadata.is_directory {
+            return None;
+        }
         let object_id = self
             .directory_opens
-            .create(first_cluster, volume_relative_path, create_options)
+            .create(
+                first_cluster,
+                volume_relative_path,
+                create_options,
+                directory.metadata,
+            )
             .ok()?;
         let handle = match self.insert_process_handle(
             pid,
@@ -9858,15 +9866,15 @@ impl ExecNtHandler {
                     );
                 }
                 let fat_entry = exec_fs().and_then(|fs| {
-                    crate::fs_loader::fat_open_path_entry_from(&fs, first_cluster, relative)
+                    crate::fs_loader::fat_open_path_metadata_from(&fs, first_cluster, relative)
                 });
                 if disposition == nt_fs::FILE_OPEN
                     || (disposition == nt_fs::FILE_OPEN_IF && fat_entry.is_some())
                 {
-                    let Some((cluster, size, attributes)) = fat_entry else {
+                    let Some(entry) = fat_entry else {
                         return (nt_fs::STATUS_OBJECT_NAME_NOT_FOUND, 0, 0);
                     };
-                    let is_directory = attributes & nt_fs::FILE_ATTRIBUTE_DIRECTORY as u8 != 0;
+                    let is_directory = entry.metadata.is_directory;
                     if options & nt_fs::FILE_DIRECTORY_FILE != 0 && !is_directory {
                         return (nt_fs::STATUS_NOT_A_DIRECTORY, 0, 0);
                     }
@@ -9874,9 +9882,9 @@ impl ExecNtHandler {
                         return (nt_fs::STATUS_FILE_IS_A_DIRECTORY, 0, 0);
                     }
                     let handle = if is_directory {
-                        self.mint_directory_handle(cluster, full_path, desired_access, options)
+                        self.mint_directory_handle(entry, full_path, desired_access, options)
                     } else if Self::readonly_disk_open_allowed(desired_access, options) {
-                        self.mint_disk_file_handle(cluster, size, desired_access, options)
+                        self.mint_disk_file_handle(entry, desired_access, options)
                     } else {
                         return (nt_fs::STATUS_NOT_SUPPORTED, 0, 0);
                     };
@@ -10095,6 +10103,23 @@ impl ExecNtHandler {
         }
     }
 
+    fn boot_status_file_metadata() -> nt_fs::FileMetadata {
+        nt_fs::FileMetadata {
+            creation_time: EXEC_BOOT_STATUS_CREATION_TIME.load(Ordering::Acquire),
+            last_access_time: EXEC_BOOT_STATUS_LAST_ACCESS_TIME.load(Ordering::Acquire),
+            last_write_time: EXEC_BOOT_STATUS_LAST_WRITE_TIME.load(Ordering::Acquire),
+            change_time: EXEC_BOOT_STATUS_CHANGE_TIME.load(Ordering::Acquire),
+            allocation_size: EXEC_BOOT_STATUS_FILE_SIZE as u64,
+            end_of_file: EXEC_BOOT_STATUS_FILE_SIZE as u64,
+            file_id: boot_status_data_ptr() as u64,
+            attributes: nt_fs::FILE_ATTRIBUTE_ARCHIVE,
+            reparse_tag: 0,
+            number_of_links: 1,
+            delete_pending: false,
+            is_directory: false,
+        }
+    }
+
     fn boot_status_check_access(&self, handle: u64, wanted: u32, generic: u32) -> Result<(), u32> {
         const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
         const GENERIC_ALL: u32 = 0x1000_0000;
@@ -10148,6 +10173,7 @@ impl ExecNtHandler {
                 self.xas_write_buf(buffer, src);
             }
         }
+        EXEC_BOOT_STATUS_LAST_ACCESS_TIME.store(nt_system_time_100ns(), Ordering::Release);
         Ok(copy_len as u64)
     }
 
@@ -10184,6 +10210,11 @@ impl ExecNtHandler {
                     copy_len,
                 );
             }
+        }
+        if copy_len != 0 {
+            let now = nt_system_time_100ns();
+            EXEC_BOOT_STATUS_LAST_WRITE_TIME.store(now, Ordering::Release);
+            EXEC_BOOT_STATUS_CHANGE_TIME.store(now, Ordering::Release);
         }
         Ok(copy_len as u64)
     }
@@ -14271,8 +14302,7 @@ impl ExecNtHandler {
                 | nt_process::HandleObject::DiskFile { .. }
                 | nt_process::HandleObject::Directory { .. }
                 | nt_process::HandleObject::OverlayFile(_)
-                | nt_process::HandleObject::BootStatusFile { .. }
-                | nt_process::HandleObject::CachedFile { .. } => b"File",
+                | nt_process::HandleObject::BootStatusFile { .. } => b"File",
                 nt_process::HandleObject::IoCompletion(_) => b"IoCompletion",
                 nt_process::HandleObject::RegistryKey(_) => b"Key",
                 nt_process::HandleObject::Token(_) | nt_process::HandleObject::TokenObject(_) => {
@@ -18762,8 +18792,7 @@ impl ExecNtHandler {
                 Ok(FileParseRoot::HostedFile { file_id, device_id })
             }
             nt_process::HandleObject::DiskFile { .. }
-            | nt_process::HandleObject::BootStatusFile { .. }
-            | nt_process::HandleObject::CachedFile { .. } => Ok(FileParseRoot::NonDirectoryFile),
+            | nt_process::HandleObject::BootStatusFile { .. } => Ok(FileParseRoot::NonDirectoryFile),
             _ => Err(STATUS_INVALID_HANDLE),
         }
     }
@@ -18989,14 +19018,14 @@ impl ExecNtHandler {
         &self,
         root: FileParseRoot,
         name: &[u16],
-    ) -> Result<nt_fs::StandardInformation, u32> {
+    ) -> Result<nt_fs::FileMetadata, u32> {
         let mut folded = [0u8; FILE_OBJECT_NAME_CAP];
         let mut relative = [0u8; FILE_OBJECT_NAME_CAP];
         let relative_len = Self::capture_relative_file_path(name, &mut folded, &mut relative)?;
         let relative = &relative[..relative_len];
         match root {
             FileParseRoot::OverlayFile(root_file_id) => unsafe {
-                crate::writable_fs::query_attributes_relative_to_directory(root_file_id, relative)
+                crate::writable_fs::query_metadata_relative_to_directory(root_file_id, relative)
             },
             FileParseRoot::FatDirectory {
                 first_cluster,
@@ -19006,19 +19035,12 @@ impl ExecNtHandler {
                 if open.first_cluster != first_cluster {
                     return Err(STATUS_INVALID_HANDLE);
                 }
-                let Some((_, size, fat_attributes)) = exec_fs().and_then(|fs| {
-                    crate::fs_loader::fat_open_path_entry_from(&fs, first_cluster, relative)
+                let Some(entry) = exec_fs().and_then(|fs| {
+                    crate::fs_loader::fat_open_path_metadata_from(&fs, first_cluster, relative)
                 }) else {
                     return Err(nt_fs::STATUS_OBJECT_NAME_NOT_FOUND);
                 };
-                let attributes = nt_fs::file_attributes_from_fat(fat_attributes);
-                Ok(nt_fs::StandardInformation {
-                    end_of_file: size as u64,
-                    is_directory: attributes & nt_fs::FILE_ATTRIBUTE_DIRECTORY != 0,
-                    attributes,
-                    number_of_links: 1,
-                    delete_pending: false,
-                })
+                Ok(entry.metadata)
             }
             FileParseRoot::NonDirectoryFile => Err(nt_fs::STATUS_NOT_A_DIRECTORY),
             FileParseRoot::HostedFile { .. } => Err(STATUS_NOT_SUPPORTED),
@@ -19028,30 +19050,39 @@ impl ExecNtHandler {
         }
     }
 
-    /// Render a complete FILE_BASIC_INFORMATION with the backing volume's real attributes. This
-    /// volume does not track timestamps, so zero is the honest value for all four time fields.
-    unsafe fn write_file_basic_attributes(&self, output: u64, attributes: u32) -> bool {
+    unsafe fn write_file_basic_information(
+        &self,
+        output: u64,
+        info: nt_fs::FileMetadata,
+    ) -> bool {
         let mut basic = [0u8; 40];
-        basic[0x20..0x24].copy_from_slice(&attributes.to_le_bytes());
+        if nt_fs::encode_query_information(
+            nt_fs::FILE_BASIC_INFORMATION,
+            info.query_metadata(),
+            &mut basic,
+        )
+        .is_err()
+        {
+            return false;
+        }
         self.xas_try_write_buf(output, &basic)
     }
 
-    /// Render FILE_NETWORK_OPEN_INFORMATION. The backing volumes currently expose timestamps as
-    /// unknown, so all four time fields remain zero; EOF/kind/attributes come from the real path.
     unsafe fn write_file_network_open_information(
         &self,
         output: u64,
-        info: nt_fs::StandardInformation,
+        info: nt_fs::FileMetadata,
     ) -> bool {
         let mut network = [0u8; 56];
-        let allocation_size = if info.is_directory {
-            0
-        } else {
-            info.end_of_file.saturating_add(0xFFF) & !0xFFF
-        };
-        network[0x20..0x28].copy_from_slice(&allocation_size.to_le_bytes());
-        network[0x28..0x30].copy_from_slice(&info.end_of_file.to_le_bytes());
-        network[0x30..0x34].copy_from_slice(&info.attributes.to_le_bytes());
+        if nt_fs::encode_query_information(
+            nt_fs::FILE_NETWORK_OPEN_INFORMATION,
+            info.query_metadata(),
+            &mut network,
+        )
+        .is_err()
+        {
+            return false;
+        }
         self.xas_try_write_buf(output, &network)
     }
 
@@ -20372,8 +20403,7 @@ impl ExecNtHandler {
             nt_process::HandleObject::OverlayFile(file_id) => {
                 (crate::writable_fs::file_mode(file_id).ok_or(nt_fs::STATUS_INVALID_HANDLE)?, 0)
             }
-            nt_process::HandleObject::CachedFile { create_options }
-            | nt_process::HandleObject::BootStatusFile { create_options } => (
+            nt_process::HandleObject::BootStatusFile { create_options } => (
                 nt_fs::file_mode_from_create_options(create_options),
                 0,
             ),
@@ -21892,13 +21922,6 @@ impl ExecNtHandler {
         }
         None
     }
-    /// Does a `\SystemRoot\System32` file for this probe exist? Resolve any caller-supplied
-    /// System32-relative subpath on the REAL \reactos FS by-path (`sys32_exists` → `open_sys32` →
-    /// `fat_open_path`). This is the sole existence authority: a file exists iff it is present on the
-    /// actual volume. nt-dll-registry keeps the SEC_IMAGE base/geometry role for CONTENT.
-    pub(crate) fn fs_system32_has(&self, folded: &[u8]) -> bool {
-        unsafe { sys32_exists(sys32_probe_relative_path(folded)) }
-    }
     /// Does `\reactos\<leaf>` exist as a regular file on the executive's mounted FAT volume?
     /// `explorer.exe` is a shell image at `%SystemRoot%`, not System32, so its admission has to use
     /// the same real-FS root lookup as the PE preloader instead of the caller's transient DOS path.
@@ -22024,7 +22047,7 @@ impl ExecNtHandler {
                 Ok(info) => info,
                 Err(status) => return status,
             };
-            return if unsafe { self.write_file_basic_attributes(args[1], info.attributes) } {
+            return if unsafe { self.write_file_basic_information(args[1], info) } {
                 nt_fs::STATUS_SUCCESS
             } else {
                 STATUS_ACCESS_VIOLATION
@@ -22040,9 +22063,9 @@ impl ExecNtHandler {
             crate::writable_fs::writable_path_into(name16, folded_scratch, relative_scratch)
         {
             if let Some(info) =
-                crate::writable_fs::query_attributes_relative(&relative_scratch[..relative_len])
+                crate::writable_fs::query_metadata_relative(&relative_scratch[..relative_len])
             {
-                return if unsafe { self.write_file_basic_attributes(args[1], info.attributes) } {
+                return if unsafe { self.write_file_basic_information(args[1], info) } {
                     nt_fs::STATUS_SUCCESS
                 } else {
                     STATUS_ACCESS_VIOLATION
@@ -22052,10 +22075,10 @@ impl ExecNtHandler {
         if let Some(relative_len) =
             crate::writable_fs::volume_path_into(name16, folded_scratch, relative_scratch)
         {
-            if let Some(info) = crate::writable_fs::query_attributes_relative_if_mounted(
+            if let Some(info) = crate::writable_fs::query_metadata_relative_if_mounted(
                 &relative_scratch[..relative_len],
             ) {
-                return if self.write_file_basic_attributes(args[1], info.attributes) {
+                return if self.write_file_basic_information(args[1], info) {
                     nt_fs::STATUS_SUCCESS
                 } else {
                     STATUS_ACCESS_VIOLATION
@@ -22063,13 +22086,13 @@ impl ExecNtHandler {
             }
         }
         // General read-only namespace lookup. This is intentionally below the writable mount so
-        // profile paths stay overlay-backed, but above loader-specific EXE/DLL probes.
-        if let Some(attributes) = crate::fs_loader::query_nt_path_attributes_into(
+        // Profile paths stay overlay-backed; all remaining names resolve through mounted FAT.
+        if let Some(info) = crate::fs_loader::query_nt_path_metadata_into(
             name16,
             folded_scratch,
             relative_scratch,
         ) {
-            return if unsafe { self.write_file_basic_attributes(args[1], attributes) } {
+            return if unsafe { self.write_file_basic_information(args[1], info) } {
                 nt_fs::STATUS_SUCCESS
             } else {
                 STATUS_ACCESS_VIOLATION
@@ -22084,39 +22107,18 @@ impl ExecNtHandler {
             nb[nlen] = (w as u8).to_ascii_lowercase();
             nlen += 1;
         }
-        // Report EXISTS for hosted EXE probes and registered DLLs. The registry rejects SxS probes
-        // itself so the loader does not take the .Local/manifest path.
-        let is_sxs = nt_dll_registry::Registry::is_sxs_probe(&nb[..nlen]);
-        let catalog = unsafe { &*ctx.exe_image_catalog };
-        let exe_exists = Self::exe_probe_image(catalog, &nb[..nlen], is_sxs)
-            .is_some_and(Self::hosted_image_exists);
-        let dll_exists = self.pi >= 1 && self.fs_system32_has(&nb[..nlen]);
-        let status: u32 = if exe_exists {
-            if unsafe { self.write_file_basic_attributes(args[1], nt_fs::FILE_ATTRIBUTE_NORMAL) } {
-                0
-            } else {
-                STATUS_ACCESS_VIOLATION
+        let status = nt_fs::STATUS_OBJECT_NAME_NOT_FOUND;
+        if self.pi >= 1 && self.pi != 2 {
+            print_str(b"[ntos-exec] NtQueryAttributesFile(hosted) not-found: \"");
+            for &w in name16.iter().take(96) {
+                debug_put_char(if (0x20..0x7f).contains(&w) {
+                    w as u8
+                } else {
+                    b'?'
+                });
             }
-        } else if dll_exists {
-            if unsafe { self.write_file_basic_attributes(args[1], nt_fs::FILE_ATTRIBUTE_NORMAL) } {
-                0
-            } else {
-                STATUS_ACCESS_VIOLATION
-            }
-        } else {
-            if self.pi >= 1 && self.pi != 2 {
-                print_str(b"[ntos-exec] NtQueryAttributesFile(hosted) not-found: \"");
-                for &w in name16.iter().take(96) {
-                    debug_put_char(if (0x20..0x7f).contains(&w) {
-                        w as u8
-                    } else {
-                        b'?'
-                    });
-                }
-                print_str(b"\"\n");
-            }
-            0xC000_0034
-        };
+            print_str(b"\"\n");
+        }
         unsafe {
             loader_trace_record(
                 self.pi,
@@ -22174,7 +22176,7 @@ impl ExecNtHandler {
             crate::writable_fs::writable_path_into(name16, folded_scratch, relative_scratch)
         {
             if let Some(info) =
-                crate::writable_fs::query_attributes_relative(&relative_scratch[..relative_len])
+                crate::writable_fs::query_metadata_relative(&relative_scratch[..relative_len])
             {
                 return if unsafe { self.write_file_network_open_information(args[1], info) } {
                     nt_fs::STATUS_SUCCESS
@@ -22186,7 +22188,7 @@ impl ExecNtHandler {
         if let Some(relative_len) =
             crate::writable_fs::volume_path_into(name16, folded_scratch, relative_scratch)
         {
-            if let Some(info) = crate::writable_fs::query_attributes_relative_if_mounted(
+            if let Some(info) = crate::writable_fs::query_metadata_relative_if_mounted(
                 &relative_scratch[..relative_len],
             ) {
                 return if self.write_file_network_open_information(args[1], info) {
@@ -22197,7 +22199,7 @@ impl ExecNtHandler {
             }
         }
 
-        if let Some(info) = crate::fs_loader::query_nt_path_standard_info_into(
+        if let Some(info) = crate::fs_loader::query_nt_path_metadata_into(
             name16,
             folded_scratch,
             relative_scratch,
@@ -22617,23 +22619,15 @@ impl ExecNtHandler {
         // volume-relative path denotes the FAT root directory.
         let volume_path = volume_relative_len.map(|length| &path_relative[..length]);
         let volume_entry = volume_path.and_then(|path| {
-            exec_fs().and_then(|fs| {
-                if path.is_empty() {
-                    Some((fs.root_cl, 0, 0x10))
-                } else {
-                    fat_open_path_entry(&fs, path)
-                }
-            })
+            exec_fs().and_then(|fs| crate::fs_loader::fat_open_path_metadata(&fs, path))
         });
         let volume_directory = if want_dir {
-            volume_entry
-                .filter(|(_, _, attributes)| attributes & 0x10 != 0)
-                .map(|(first_cluster, _, _)| first_cluster)
+            volume_path.zip(volume_entry.filter(|entry| entry.metadata.is_directory))
         } else {
             None
         };
-        let volume_not_directory =
-            volume_entry.is_some_and(|(_, _, attributes)| attributes & 0x10 == 0);
+        let volume_file = volume_entry.filter(|entry| !entry.metadata.is_directory);
+        let volume_not_directory = volume_file.is_some();
         let dynamic_role = self.dynamic_child_role();
         let mut hosted_exe_image = {
             let catalog = &*ctx.exe_image_catalog;
@@ -22758,22 +22752,51 @@ impl ExecNtHandler {
             }
         }
         let mut opened_handle = 0;
-        let status: u32 =
-            if volume_directory.is_some() || hosted_exe_leaf.is_some() || dll_i.is_some() {
-                let h = if let Some(first_cluster) = volume_directory {
-                    self.mint_directory_handle(
-                        first_cluster,
-                        volume_path.unwrap_or(&[]),
-                        desired_access,
-                        open_options,
-                    )
-                } else {
-                    self.mint_cached_file_handle(desired_access, open_options)
-                };
-                let Some(h) = h else {
-                    let status = 0xC000_009A;
-                    let iosb = args[3];
+        let loader_file = (hosted_exe_leaf.is_some() || dll_i.is_some())
+            .then_some(volume_file)
+            .flatten();
+        let loader_open = if let Some((path, directory)) = volume_directory {
+            self.mint_directory_handle(directory, path, desired_access, open_options)
+        } else if let Some(file) = loader_file {
+            self.mint_disk_file_handle(file, desired_access, open_options)
+        } else {
+            None
+        };
+        let status: u32 = if volume_directory.is_some() || loader_file.is_some() {
+            let Some(h) = loader_open else {
+                let status = 0xC000_009A;
+                let iosb = args[3];
+                self.write_nt_open_file_handle_out(file_handle_out, 0);
+                if iosb != 0 {
+                    smss_stack_write32(iosb, status);
+                    smss_stack_write(iosb + 8, 0);
+                }
+                loader_trace_record(
+                    self.pi,
+                    LoaderOp::OpenFile,
+                    status,
+                    dll_i,
+                    0,
+                    0,
+                    &nb[..nlen],
+                );
+                return status;
+            };
+            opened_handle = h;
+            if let Some(image) = hosted_exe_image {
+                if let Err(error) = record_hosted_child_exe_open(ctx, self.pi, image, h) {
+                    let status = hosted_exe_open_status(error);
+                    if HOSTED_EXE_OPEN_FAILURE_TRACE_N.fetch_add(1, Ordering::Relaxed) < 8 {
+                        print_str(b"[hosted-exe] open record failed pi=");
+                        print_u64(self.pi as u64);
+                        print_str(b" leaf=");
+                        print_str(image.leaf);
+                        print_str(b" status=0x");
+                        print_hex(status);
+                        print_str(b"\n");
+                    }
                     self.write_nt_open_file_handle_out(file_handle_out, 0);
+                    let iosb = args[3];
                     if iosb != 0 {
                         smss_stack_write32(iosb, status);
                         smss_stack_write(iosb + 8, 0);
@@ -22788,100 +22811,69 @@ impl ExecNtHandler {
                         &nb[..nlen],
                     );
                     return status;
-                };
-                opened_handle = h;
-                if let Some(image) = hosted_exe_image {
-                    if let Err(error) = record_hosted_child_exe_open(ctx, self.pi, image, h) {
-                        let status = hosted_exe_open_status(error);
-                        if HOSTED_EXE_OPEN_FAILURE_TRACE_N.fetch_add(1, Ordering::Relaxed) < 8 {
-                            print_str(b"[hosted-exe] open record failed pi=");
-                            print_u64(self.pi as u64);
-                            print_str(b" leaf=");
-                            print_str(image.leaf);
-                            print_str(b" status=0x");
-                            print_hex(status);
-                            print_str(b"\n");
-                        }
-                        self.write_nt_open_file_handle_out(file_handle_out, 0);
-                        let iosb = args[3];
-                        if iosb != 0 {
-                            smss_stack_write32(iosb, status);
-                            smss_stack_write(iosb + 8, 0);
-                        }
-                        loader_trace_record(
-                            self.pi,
-                            LoaderOp::OpenFile,
-                            status,
-                            dll_i,
-                            0,
-                            0,
-                            &nb[..nlen],
-                        );
-                        return status;
-                    }
                 }
-                smss_stack_write(file_handle_out, h);
-                if let Some(i) = dll_i {
-                    reg.set_file_handle(self.pi, i, h);
-                }
-                let iosb = args[3];
-                if iosb != 0 {
-                    smss_stack_write32(iosb, 0);
-                    smss_stack_write(iosb + 8, 1);
-                }
-                0
-            } else if let Some((first_cluster, file_size)) =
-                Self::readonly_disk_open_entry(name16, desired_access, open_options)
-            {
-                let mut status = nt_fs::STATUS_SUCCESS;
-                let opened_handle =
-                    self.mint_disk_file_handle(
-                        first_cluster,
-                        file_size,
-                        desired_access,
-                        open_options,
-                    );
-                if let Some(handle) = opened_handle {
+            }
+            smss_stack_write(file_handle_out, h);
+            if let Some(i) = dll_i {
+                reg.set_file_handle(self.pi, i, h);
+            }
+            let iosb = args[3];
+            if iosb != 0 {
+                smss_stack_write32(iosb, 0);
+                smss_stack_write(iosb + 8, 1);
+            }
+            0
+        } else if let Some(file) =
+            Self::readonly_disk_open_entry(name16, desired_access, open_options)
+        {
+            let mut status = nt_fs::STATUS_SUCCESS;
+            let opened = self.mint_disk_file_handle(file, desired_access, open_options);
+            let opened_handle = match opened {
+                Some(handle) => {
                     self.queue_write(file_handle_out, handle);
-                } else {
+                    handle
+                }
+                None => {
                     status = 0xC000_009A;
                     self.write_nt_open_file_handle_out(file_handle_out, 0);
-                }
-                let iosb = args[3];
-                if iosb != 0 {
-                    self.xas_write_buf(iosb, &status.to_le_bytes());
-                    self.xas_write_buf(
-                        iosb + 8,
-                        &(if status == nt_fs::STATUS_SUCCESS {
-                            1u64
-                        } else {
-                            0
-                        })
-                        .to_le_bytes(),
-                    );
-                }
-                loader_trace_record(
-                    self.pi,
-                    LoaderOp::OpenFile,
-                    status,
-                    None,
-                    0,
-                    opened_handle.unwrap_or(0),
-                    &nb[..nlen],
-                );
-                return status;
-            } else {
-                if self.current_process_is_lsass() {
-                    print_str(b"[lsass-open-miss] name=");
-                    print_str(&nb[..nlen.min(80)]);
-                    print_str(b" -> 0xC0000034\n");
-                }
-                if volume_not_directory {
-                    0xC000_0103
-                } else {
-                    0xC000_0034
+                    0
                 }
             };
+            let iosb = args[3];
+            if iosb != 0 {
+                self.xas_write_buf(iosb, &status.to_le_bytes());
+                self.xas_write_buf(
+                    iosb + 8,
+                    &(if status == nt_fs::STATUS_SUCCESS {
+                        1u64
+                    } else {
+                        0
+                    })
+                    .to_le_bytes(),
+                );
+            }
+            loader_trace_record(
+                self.pi,
+                LoaderOp::OpenFile,
+                status,
+                None,
+                0,
+                opened_handle,
+                &nb[..nlen],
+            );
+            return status;
+        } else {
+            if self.current_process_is_lsass() {
+                print_str(b"[lsass-open-miss] name=");
+                print_str(&nb[..nlen.min(80)]);
+                print_str(b" -> 0xC0000034\n");
+            }
+            if volume_not_directory {
+                0xC000_0103
+            } else {
+                0xC000_0034
+            }
+        };
         loader_trace_record(
             self.pi,
             LoaderOp::OpenFile,
@@ -29296,7 +29288,6 @@ impl ExecNtHandler {
                                 | nt_process::HandleObject::RoutedFile { .. }
                                 | nt_process::HandleObject::OverlayFile(_)
                                 | nt_process::HandleObject::BootStatusFile { .. }
-                                | nt_process::HandleObject::CachedFile { .. }
                                 | nt_process::HandleObject::Opaque(_)
                         )
                     );
@@ -29862,9 +29853,8 @@ impl ExecNtHandler {
                     }
                     return status;
                 }
-                // 40 = the largest class this encoder produces (FILE_BASIC_INFORMATION); it was 24
-                // when FILE_STANDARD_INFORMATION was the only one supported.
-                let mut encoded = [0u8; 40];
+                // FILE_NETWORK_OPEN_INFORMATION is the largest fixed class emitted locally.
+                let mut encoded = [0u8; 56];
                 let encoded_capacity = encoded.len();
                 let required = match nt_fs::encode_query_information(
                     class,
@@ -29887,18 +29877,22 @@ impl ExecNtHandler {
                     Some(pid) => pid,
                     None => return nt_fs::STATUS_INVALID_HANDLE,
                 };
-                let object = match self.pm.lookup_handle(pid, args[0] as nt_process::Handle) {
+                let process_handle = match nt_process::Handle::try_from(args[0]) {
+                    Ok(handle) => handle,
+                    Err(_) => return nt_fs::STATUS_INVALID_HANDLE,
+                };
+                let object = match self.pm.lookup_handle(pid, process_handle) {
                     Some(object) => object,
                     None => return nt_fs::STATUS_INVALID_HANDLE,
                 };
                 let access_flags = match self
                     .pm
-                    .handle_access(pid, args[0] as nt_process::Handle)
+                    .handle_access(pid, process_handle)
                 {
                     Some(access) => access,
                     None => return nt_fs::STATUS_INVALID_HANDLE,
                 };
-                let size_directory_and_position = match object {
+                let (file_metadata, current_byte_offset) = match object {
                     nt_process::HandleObject::DiskFile {
                         first_cluster,
                         size,
@@ -29911,44 +29905,30 @@ impl ExecNtHandler {
                         if open.first_cluster != first_cluster || open.size != size {
                             return nt_fs::STATUS_INVALID_HANDLE;
                         }
-                        Some((size as u64, false, open.current_offset, 1, false))
+                        (open.metadata, open.current_offset)
                     }
-                    nt_process::HandleObject::Directory { .. } => Some((0, true, 0, 1, false)),
-                    // ★ THE WRITABLE FILESYSTEM OVERLAY: the size/kind the volume really holds.
+                    nt_process::HandleObject::Directory {
+                        first_cluster,
+                        object_id,
+                    } => {
+                        let open = match self.directory_opens.get(object_id) {
+                            Ok(open) if open.first_cluster == first_cluster => open,
+                            _ => return nt_fs::STATUS_INVALID_HANDLE,
+                        };
+                        (open.metadata, 0)
+                    }
                     nt_process::HandleObject::OverlayFile(file_id) => {
-                        let offset = crate::writable_fs::current_offset(file_id).unwrap_or(0);
-                        crate::writable_fs::standard_information(file_id).map(|info| {
-                            (
-                                info.end_of_file,
-                                info.is_directory,
-                                offset,
-                                info.number_of_links,
-                                info.delete_pending,
-                            )
-                        })
+                        let Some(offset) = crate::writable_fs::current_offset(file_id) else {
+                            return nt_fs::STATUS_INVALID_HANDLE;
+                        };
+                        let Some(metadata) = crate::writable_fs::metadata(file_id) else {
+                            return nt_fs::STATUS_INVALID_HANDLE;
+                        };
+                        (metadata, offset)
                     }
                     nt_process::HandleObject::BootStatusFile { .. } => {
-                        Some((EXEC_BOOT_STATUS_FILE_SIZE as u64, false, 0, 1, false))
-                    }
-                    nt_process::HandleObject::CachedFile { .. } => {
-                        let ctx = match self.loop_ctx {
-                            Some(ctx) => ctx,
-                            None => return nt_fs::STATUS_INVALID_HANDLE,
-                        };
-                        let reg = &*ctx.reg;
-                        if let Some(index) = reg.index_for_file(self.pi, args[0]) {
-                            ctx.dll_pes()[index]
-                                .as_ref()
-                                .map(|pe| (pe.bytes().len() as u64, false, 0, 1, false))
-                        } else if let Some(index) =
-                            (&*ctx.exe_images).index_for_file(self.pi, args[0])
-                        {
-                            (&*ctx.exe_images)
-                                .get(index)
-                                .map(|slot| (slot.metadata.file_size, false, 0, 1, false))
-                        } else {
-                            None
-                        }
+                        ensure_boot_status_data();
+                        (Self::boot_status_file_metadata(), 0)
                     }
                     nt_process::HandleObject::File(_)
                     | nt_process::HandleObject::RoutedFile { .. } => {
@@ -29956,22 +29936,9 @@ impl ExecNtHandler {
                     }
                     _ => return 0xC000_0024, // STATUS_OBJECT_TYPE_MISMATCH
                 };
-                let (size, directory, current_byte_offset, number_of_links, delete_pending) =
-                    match size_directory_and_position {
-                        Some(metadata) => metadata,
-                        None => return nt_fs::STATUS_INVALID_HANDLE,
-                    };
-                let metadata = nt_fs::QueryMetadata {
-                    allocation_size: size.saturating_add(0xFFF) & !0xFFF,
-                    end_of_file: size,
-                    current_byte_offset,
-                    access_flags,
-                    mode: 0,
-                    alignment_requirement: 0,
-                    number_of_links,
-                    delete_pending,
-                    directory,
-                };
+                let mut metadata = file_metadata.query_metadata();
+                metadata.current_byte_offset = current_byte_offset;
+                metadata.access_flags = access_flags;
                 nt_fs::encode_query_information(class, metadata, &mut encoded)
                     .expect("validated query class and length");
                 if !self.xas_try_write_buf(output, &encoded[..required]) {
@@ -30030,9 +29997,8 @@ impl ExecNtHandler {
                 }
             },
             // NtQueryAttributesFile(*OBJECT_ATTRIBUTES[R10], *FILE_BASIC_INFORMATION[RDX]=args[1]).
-            // RtlDosSearchPath_U probes for csrss.exe here (SmpParseCommandLine). Report it EXISTS
-            // (FileAttributes = FILE_ATTRIBUTE_NORMAL) so SMP_INVALID_PATH isn't set; everything else
-            // → not-found so the loader's manifest probes keep failing.
+            // Resolve through the writable union and mounted FAT namespace, returning only metadata
+            // owned by the backing filesystem.
             NativeService::NtQueryAttributesFile => unsafe {
                 let service = core::ptr::read_volatile(core::ptr::addr_of!(
                     NT_QUERY_ATTRIBUTES_FILE_SERVICE_ENTRY
@@ -30877,17 +30843,13 @@ impl ExecNtHandler {
                     );
                     let disposition = create_disposition;
                     if disposition == nt_fs::FILE_OPEN && Self::overlay_open_missed(st) {
-                        if let Some((first_cluster, file_size)) =
+                        if let Some(file) =
                             Self::readonly_disk_open_entry(name16, desired_access, create_options)
                         {
+                            let file_size = file.metadata.end_of_file;
                             status = nt_fs::STATUS_SUCCESS;
                             info = nt_fs::FILE_OPENED as u64;
-                            match self.mint_disk_file_handle(
-                                first_cluster,
-                                file_size,
-                                desired_access,
-                                create_options,
-                            ) {
+                            match self.mint_disk_file_handle(file, desired_access, create_options) {
                                 Some(handle) => {
                                     self.queue_write(file_handle_out, handle);
                                     let count = NT_CREATE_FILE_READONLY_FAT_OPENS
@@ -30896,7 +30858,7 @@ impl ExecNtHandler {
                                         print_str(b"[nt-create-file] pi=");
                                         print_u64(self.pi as u64);
                                         print_str(b" read-only FAT open size=");
-                                        print_u64(file_size as u64);
+                                        print_u64(file_size);
                                         print_str(b" name=\"");
                                         for &unit in name16.iter().take(96) {
                                             debug_put_char(if (0x20..0x7f).contains(&unit) {
@@ -31039,17 +31001,13 @@ impl ExecNtHandler {
                         }
                     }
                 } else if create_disposition == nt_fs::FILE_OPEN {
-                    if let Some((first_cluster, file_size)) =
+                    if let Some(file) =
                         Self::readonly_disk_open_entry(name16, desired_access, create_options)
                     {
+                        let file_size = file.metadata.end_of_file;
                         status = nt_fs::STATUS_SUCCESS;
                         info = nt_fs::FILE_OPENED as u64;
-                        match self.mint_disk_file_handle(
-                            first_cluster,
-                            file_size,
-                            desired_access,
-                            create_options,
-                        ) {
+                        match self.mint_disk_file_handle(file, desired_access, create_options) {
                             Some(handle) => {
                                 self.queue_write(file_handle_out, handle);
                                 let count = NT_CREATE_FILE_READONLY_FAT_OPENS
@@ -31058,7 +31016,7 @@ impl ExecNtHandler {
                                     print_str(b"[nt-create-file] pi=");
                                     print_u64(self.pi as u64);
                                     print_str(b" read-only FAT open size=");
-                                    print_u64(file_size as u64);
+                                    print_u64(file_size);
                                     print_str(b" name=\"");
                                     for &unit in name16.iter().take(96) {
                                         debug_put_char(if (0x20..0x7f).contains(&unit) {

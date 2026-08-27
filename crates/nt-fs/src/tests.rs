@@ -129,6 +129,7 @@ fn query_information_encodes_standard_layout() {
         number_of_links: 2,
         delete_pending: true,
         directory: false,
+        ..QueryMetadata::default()
     };
     let mut output = [0xCC; 40];
     assert_eq!(
@@ -192,6 +193,95 @@ fn query_information_encodes_basic_information_attributes_by_kind() {
         encode_query_information(FILE_BASIC_INFORMATION, file, &mut output[..39]),
         Err(STATUS_INFO_LENGTH_MISMATCH)
     );
+}
+
+#[test]
+fn query_information_encodes_filesystem_owned_metadata() {
+    let metadata = QueryMetadata {
+        creation_time: 0x0102_0304_0506_0708,
+        last_access_time: 0x1112_1314_1516_1718,
+        last_write_time: 0x2122_2324_2526_2728,
+        change_time: 0x3132_3334_3536_3738,
+        allocation_size: 0x5000,
+        end_of_file: 0x4321,
+        file_id: 0x4142_4344_4546_4748,
+        file_attributes: FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE,
+        reparse_tag: 0xA000_000C,
+        ..QueryMetadata::default()
+    };
+
+    let mut internal = [0xCC; 12];
+    assert_eq!(
+        encode_query_information(FILE_INTERNAL_INFORMATION, metadata, &mut internal),
+        Ok(8)
+    );
+    assert_eq!(
+        u64::from_le_bytes(internal[..8].try_into().unwrap()),
+        metadata.file_id
+    );
+    assert_eq!(&internal[8..], &[0xCC; 4]);
+
+    let mut network = [0xCC; 60];
+    assert_eq!(
+        encode_query_information(FILE_NETWORK_OPEN_INFORMATION, metadata, &mut network),
+        Ok(56)
+    );
+    for (offset, expected) in [
+        (0, metadata.creation_time),
+        (8, metadata.last_access_time),
+        (16, metadata.last_write_time),
+        (24, metadata.change_time),
+        (32, metadata.allocation_size),
+        (40, metadata.end_of_file),
+    ] {
+        assert_eq!(
+            u64::from_le_bytes(network[offset..offset + 8].try_into().unwrap()),
+            expected
+        );
+    }
+    assert_eq!(
+        u32::from_le_bytes(network[48..52].try_into().unwrap()),
+        metadata.file_attributes
+    );
+    assert_eq!(&network[52..56], &[0; 4]);
+    assert_eq!(&network[56..], &[0xCC; 4]);
+
+    let mut tag = [0xCC; 8];
+    assert_eq!(
+        encode_query_information(FILE_ATTRIBUTE_TAG_INFORMATION, metadata, &mut tag),
+        Ok(8)
+    );
+    assert_eq!(
+        u32::from_le_bytes(tag[..4].try_into().unwrap()),
+        metadata.file_attributes
+    );
+    assert_eq!(u32::from_le_bytes(tag[4..].try_into().unwrap()), 0);
+
+    let reparsed = QueryMetadata {
+        file_attributes: FILE_ATTRIBUTE_REPARSE_POINT,
+        ..metadata
+    };
+    assert_eq!(
+        encode_query_information(FILE_ATTRIBUTE_TAG_INFORMATION, reparsed, &mut tag),
+        Ok(8)
+    );
+    assert_eq!(
+        u32::from_le_bytes(tag[4..].try_into().unwrap()),
+        metadata.reparse_tag
+    );
+
+    for (class, short) in [
+        (FILE_INTERNAL_INFORMATION, 7usize),
+        (FILE_NETWORK_OPEN_INFORMATION, 55),
+        (FILE_ATTRIBUTE_TAG_INFORMATION, 7),
+    ] {
+        let mut output = [0xCC; 56];
+        assert_eq!(
+            encode_query_information(class, metadata, &mut output[..short]),
+            Err(STATUS_INFO_LENGTH_MISMATCH)
+        );
+        assert!(output[..short].iter().all(|byte| *byte == 0xCC));
+    }
 }
 
 /// `FileEaInformation` is the second class `CreateDirectoryExW` needs. A volume with no extended
@@ -1195,7 +1285,7 @@ fn memfs_snapshot_rejects_corrupt_or_malformed_images() {
 }
 
 #[test]
-fn memfs_snapshot_v2_reader_accepts_v1_directory_records() {
+fn memfs_snapshot_v3_reader_accepts_v1_directory_records() {
     fn crc32c(bytes: &[u8]) -> u32 {
         let mut crc = 0xFFFF_FFFFu32;
         for &byte in bytes {
@@ -2230,6 +2320,7 @@ fn writable_volume_set_information_and_delete() {
 #[test]
 fn writable_volume_hardlinks_share_nodes_and_retain_exact_entries() {
     let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.initialize_timestamps(100));
     assert!(fs.provision_directory(r"\??\C:\links"));
     let source = fs.zw_create_file(
         r"\??\C:\links\source.txt",
@@ -2273,6 +2364,11 @@ fn writable_volume_hardlinks_share_nodes_and_retain_exact_entries() {
         FILE_NON_DIRECTORY_FILE,
     );
     assert_eq!(alias.status, STATUS_SUCCESS);
+    let source_metadata = fs.zw_query_metadata(source.handle).unwrap();
+    let alias_metadata = fs.zw_query_metadata(alias.handle).unwrap();
+    assert_eq!(source_metadata.file_id, alias_metadata.file_id);
+    assert_eq!(source_metadata.creation_time, 100);
+    fs.set_current_time_100ns(200);
     assert_eq!(
         fs.zw_query_standard_information(alias.handle)
             .unwrap()
@@ -2287,6 +2383,10 @@ fn writable_volume_hardlinks_share_nodes_and_retain_exact_entries() {
         fs.file_bytes(r"\??\C:\links\source.txt"),
         Some(&b"shared"[..])
     );
+    let written_metadata = fs.zw_query_metadata(alias.handle).unwrap();
+    assert_eq!(written_metadata.creation_time, 100);
+    assert_eq!(written_metadata.last_write_time, 200);
+    assert_eq!(written_metadata.change_time, 200);
 
     let renamed = rename_information("renamed.txt", 0, false);
     assert_eq!(
@@ -2364,8 +2464,9 @@ fn writable_volume_hardlinks_share_nodes_and_retain_exact_entries() {
     );
 
     let snapshot = fs.export_volume_snapshot().unwrap();
-    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 2);
+    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 3);
     let mut restored = FileSystem::from_volume_snapshot(&snapshot).unwrap();
+    assert!(!restored.initialize_timestamps(300));
     let restored_alias = restored.zw_create_file(
         r"\??\C:\links\renamed.txt",
         FILE_WRITE_DATA,
@@ -2384,6 +2485,12 @@ fn writable_volume_hardlinks_share_nodes_and_retain_exact_entries() {
     );
     assert_eq!(restored_alias.status, STATUS_SUCCESS);
     assert_eq!(restored_target.status, STATUS_SUCCESS);
+    let restored_alias_metadata = restored.zw_query_metadata(restored_alias.handle).unwrap();
+    let restored_target_metadata = restored.zw_query_metadata(restored_target.handle).unwrap();
+    assert_eq!(restored_alias_metadata.file_id, written_metadata.file_id);
+    assert_eq!(restored_target_metadata.file_id, written_metadata.file_id);
+    assert_eq!(restored_alias_metadata.creation_time, 100);
+    assert_eq!(restored_alias_metadata.last_write_time, 200);
     assert_eq!(
         restored
             .zw_query_standard_information(restored_alias.handle)
