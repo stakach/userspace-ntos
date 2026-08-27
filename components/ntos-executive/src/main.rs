@@ -2833,6 +2833,11 @@ static KEYED_RELEASE_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 /// and backend acknowledgement, independent of the provider that owns the request.
 static mut PENDING_FILE_IO: nt_io_manager::PendingFileIoTable =
     nt_io_manager::PendingFileIoTable::new();
+/// Captured provider rename/link buffers survive the internal target-parent CREATE and the source
+/// SET_INFORMATION without retaining caller memory. The generic pending File owner carries the
+/// syscall reply; this table carries the multi-IRP transaction state.
+static mut PENDING_SET_FILE_NAMES: nt_io_manager::PendingSetFileNameTable =
+    nt_io_manager::PendingSetFileNameTable::new();
 /// Syscalls that have referenced a synchronous File but are waiting for its Busy owner. The File
 /// table owns lock policy; this table owns FIFO continuation identity and the retained route.
 static mut SYNCHRONOUS_FILE_WAITERS: nt_io_manager::SynchronousFileWaitTable =
@@ -16562,6 +16567,7 @@ fn io_completion_waiter_table_stats() -> (usize, usize, usize, u64, u64) {
 fn hosted_io_owner_tables_reset() -> bool {
     unsafe {
         (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO)).reset()
+            && (&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES)).reset()
             && (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS)).reset()
             && (&mut *core::ptr::addr_of_mut!(PENDING_FILE_CLEANUP_WAITS)).reset()
             && (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS)).reset()

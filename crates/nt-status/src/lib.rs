@@ -81,6 +81,8 @@ statuses! {
     OBJECT_NAME_NOT_FOUND = 0xC000_0034u32;
     /// An object with that name already exists.
     OBJECT_NAME_COLLISION = 0xC000_0035u32;
+    /// The supplied object name is malformed.
+    OBJECT_NAME_INVALID = 0xC000_0033u32;
     /// A component of the object path was not found.
     OBJECT_PATH_NOT_FOUND = 0xC000_003Au32;
     /// The handle is invalid (unknown or stale).
@@ -103,6 +105,8 @@ statuses! {
     NOT_IMPLEMENTED = 0xC000_0002u32;
     /// The request is not supported.
     NOT_SUPPORTED = 0xC000_00BBu32;
+    /// Source and target resolve to different device stacks.
+    NOT_SAME_DEVICE = 0xC000_00D4u32;
     /// A general failure (catch-all, e.g. a faulted transport).
     UNSUCCESSFUL = 0xC000_0001u32;
     /// The I/O request is invalid for this device (bad major function).
@@ -151,9 +155,11 @@ mod tests {
     fn real_ntstatus_values() {
         // Guard against typos — these are the real Windows codes.
         assert_eq!(NtStatus::SUCCESS.raw(), 0);
+        assert_eq!(NtStatus::OBJECT_NAME_INVALID.0 as u32, 0xC000_0033);
         assert_eq!(NtStatus::OBJECT_NAME_NOT_FOUND.0 as u32, 0xC000_0034);
         assert_eq!(NtStatus::INVALID_HANDLE.0 as u32, 0xC000_0008);
         assert_eq!(NtStatus::OBJECT_TYPE_MISMATCH.0 as u32, 0xC000_0024);
+        assert_eq!(NtStatus::NOT_SAME_DEVICE.0 as u32, 0xC000_00D4);
     }
 
     #[test]

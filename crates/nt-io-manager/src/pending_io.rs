@@ -45,11 +45,21 @@ pub struct PendingFileCreate {
     pub handle_value: u64,
 }
 
+/// Correlation for the internal target-parent CREATE that precedes a provider-backed rename/link
+/// SET_INFORMATION. The outer File remains the source and owns Busy/completion publication; the
+/// target File is never process-handle visible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct PendingSetFileNameOperation {
+    pub transaction_id: u64,
+    pub target_file_id: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum PendingFileIoOperation {
     #[default]
     Transfer,
     Create(PendingFileCreate),
+    SetFileName(PendingSetFileNameOperation),
 }
 
 /// One pending File-bound operation and every completion surface owned by that exact IRP.
@@ -217,6 +227,21 @@ impl PendingFileIoTable {
                     && !pending.publish_iocp
                     && pending.event_obj_idx == u64::MAX
             }
+            PendingFileIoOperation::SetFileName(operation) => {
+                operation.transaction_id != 0
+                    && operation.target_file_id != 0
+                    && operation.target_file_id != pending.file_id
+                    && matches!(
+                        pending.major,
+                        nt_io_abi::major::IRP_MJ_CREATE | nt_io_abi::major::IRP_MJ_SET_INFORMATION
+                    )
+                    && pending.output_va == 0
+                    && pending.output_len == 0
+                    && pending.iosb_va != 0
+                    && pending.apc_routine == 0
+                    && !pending.publish_iocp
+                    && pending.event_obj_idx == u64::MAX
+            }
         };
         let control_valid = matches!(
             pending.major,
@@ -232,7 +257,7 @@ impl PendingFileIoTable {
             && (!matches!(pending.operation, PendingFileIoOperation::Create(_))
                 || pending.sync_lock_owner_tid == 0)
             && (!pending.consumer_abandoned
-                || matches!(pending.operation, PendingFileIoOperation::Transfer))
+                || !matches!(pending.operation, PendingFileIoOperation::Create(_)))
             && !pending.user_apc_interrupt_requested
             && (pending.output_len == 0 || pending.output_va != 0)
             && (pending.apc_routine == 0 || !pending.publish_iocp)
@@ -424,11 +449,41 @@ impl PendingFileIoTable {
         major: u8,
     ) -> bool {
         self.get(slot).is_some_and(|pending| {
+            let expected_file_id = match pending.operation {
+                PendingFileIoOperation::SetFileName(operation)
+                    if pending.major == nt_io_abi::major::IRP_MJ_CREATE =>
+                {
+                    operation.target_file_id
+                }
+                _ => pending.file_id,
+            };
             pending.irp_id == irp_id
-                && pending.file_id == file_id
+                && expected_file_id == file_id
                 && pending.tid == requestor_tid
                 && pending.major == major
         })
+    }
+
+    /// Move a rename/link transaction from its acknowledged target CREATE to the retained source
+    /// SET_INFORMATION IRP without changing its syscall delivery owner.
+    pub fn retarget_set_file_name_irp_exact(
+        &mut self,
+        slot: usize,
+        old_irp_id: u64,
+        new_irp_id: u64,
+    ) -> Option<()> {
+        let pending = self.slots.get_mut(slot)?.as_mut()?;
+        if pending.irp_id != old_irp_id
+            || new_irp_id == 0
+            || pending.major != nt_io_abi::major::IRP_MJ_CREATE
+            || !matches!(pending.operation, PendingFileIoOperation::SetFileName(_))
+            || pending.delivery_state != 0
+        {
+            return None;
+        }
+        pending.irp_id = new_irp_id;
+        pending.major = nt_io_abi::major::IRP_MJ_SET_INFORMATION;
+        Some(())
     }
 
     fn required_delivery_state(pending: PendingFileIo) -> u16 {
@@ -629,7 +684,7 @@ impl PendingFileIoTable {
         for pending in self.slots.iter_mut().flatten() {
             if pending.tid != tid
                 || pending.consumer_abandoned
-                || !matches!(pending.operation, PendingFileIoOperation::Transfer)
+                || matches!(pending.operation, PendingFileIoOperation::Create(_))
             {
                 continue;
             }
@@ -1242,6 +1297,43 @@ mod tests {
             7,
             nt_io_abi::major::IRP_MJ_FLUSH_BUFFERS,
         ));
+    }
+
+    #[test]
+    fn set_file_name_owner_moves_from_target_create_to_source_set_exactly_once() {
+        let mut table = PendingFileIoTable::new();
+        let mut request = pending(11, 21, 7);
+        request.major = nt_io_abi::major::IRP_MJ_CREATE;
+        request.operation = PendingFileIoOperation::SetFileName(PendingSetFileNameOperation {
+            transaction_id: 31,
+            target_file_id: 12,
+        });
+        request.output_va = 0;
+        request.output_len = 0;
+        request.apc_routine = 0;
+        request.event_obj_idx = u64::MAX;
+        request.signal_file = true;
+        request.sync_lock_owner_tid = 7;
+        let slot = table.park(request).unwrap();
+
+        assert!(table.matches_completion_exact(slot, 21, 12, 7, nt_io_abi::major::IRP_MJ_CREATE,));
+        assert!(!table.matches_completion_exact(slot, 21, 11, 7, nt_io_abi::major::IRP_MJ_CREATE,));
+        assert!(table
+            .retarget_set_file_name_irp_exact(slot, 99, 22)
+            .is_none());
+        table
+            .retarget_set_file_name_irp_exact(slot, 21, 22)
+            .unwrap();
+        assert!(table.matches_completion_exact(
+            slot,
+            22,
+            11,
+            7,
+            nt_io_abi::major::IRP_MJ_SET_INFORMATION,
+        ));
+        assert!(table
+            .retarget_set_file_name_irp_exact(slot, 22, 23)
+            .is_none());
     }
 
     #[test]

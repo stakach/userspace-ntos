@@ -44891,6 +44891,28 @@ pub(crate) fn hosted_file_exists(file_id: u64) -> bool {
     io_manager_mut().file(FileId(file_id)).is_some()
 }
 
+pub(crate) fn hosted_file_create_options(file_id: u64) -> Option<CreateOptions> {
+    io_manager_mut()
+        .file(FileId(file_id))
+        .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID) && file.state.is_open())
+        .map(|file| file.create_options)
+}
+
+pub(crate) fn hosted_file_device_relative_name(
+    file_id: u64,
+    absolute_name: &[u16],
+    output: &mut [u16],
+) -> Result<usize, u32> {
+    io_manager_mut()
+        .external_file_device_relative_name(
+            ClientId(IO_MANAGER_COMPONENT_ID),
+            FileId(file_id),
+            absolute_name,
+            output,
+        )
+        .map_err(|status| status.raw() as u32)
+}
+
 fn hosted_file_state_code(state: FileState) -> u64 {
     match state {
         FileState::Allocated => 1,
@@ -45007,6 +45029,41 @@ pub(crate) unsafe fn dispatch_hosted_file_create_irp_result_exact(
         Some(parameters),
         None,
         StackFlags::empty(),
+    )
+}
+
+/// Open the parent of a provider-backed rename/link target. The temporary canonical File is never
+/// inserted into a process handle table; `SL_OPEN_TARGET_DIRECTORY` is the only target-parent
+/// directive crossing the driver boundary.
+pub(crate) unsafe fn dispatch_hosted_target_directory_create_irp_result_exact(
+    file_id: u64,
+    requestor_tid: u64,
+    parameters: CreateParameters,
+    in_data: &[u8],
+) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
+    if parameters.ea_length != 0 || parameters.related_file.is_some() {
+        return Err(STATUS_INVALID_PARAMETER as u32);
+    }
+    let canonical_file_id = FileId(file_id);
+    let device_id = io_manager_mut()
+        .file(canonical_file_id)
+        .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID))
+        .map(|file| file.device_id.raw())
+        .ok_or(STATUS_INVALID_HANDLE as u32)?;
+    require_hosted_device_ready_for_dispatch(device_id)?;
+    let mut output = [];
+    dispatch_external_irp_to_device_record_result_exact(
+        device_id,
+        Some(canonical_file_id),
+        major::IRP_MJ_CREATE as u64,
+        0,
+        0,
+        requestor_tid,
+        in_data,
+        &mut output,
+        Some(parameters),
+        None,
+        StackFlags::FORCE_ACCESS_CHECK | StackFlags::OPEN_TARGET_DIRECTORY,
     )
 }
 

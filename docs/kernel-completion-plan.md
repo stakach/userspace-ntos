@@ -14002,6 +14002,47 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     but absolute/Object Manager Directory rename and link still return `STATUS_NOT_SUPPORTED`.
     Next add a durable, generation-protected owner for the two-phase target CREATE -> source SET
     transaction. It must own the scrubbed set-information buffer while either IRP is pending, never
-    publish the temporary target File as a process handle, acquire the source synchronous lock only
-    after the target CREATE completes, and drive target CLEANUP/CLOSE through the canonical File
-    lifecycle on every terminal or abandoned path.
+    publish the temporary target File as a process handle, retain the source synchronous lock over
+    the internal target open as `NtSetInformationFile` does, and drive target CLEANUP/CLOSE through
+    the canonical File lifecycle on every terminal or abandoned path.
+
+    Resumable provider target-open/set transaction (2026-08-27, accepted): absolute target names
+    under the source File's canonical device and Object Manager Directory roots that normalize to
+    that device now execute the real NT sequence. The I/O Manager validates and strips the live
+    device prefix without allocating or matching a static device list, allocates a temporary
+    generation-protected target File, and dispatches `IRP_MJ_CREATE` with
+    `SL_FORCE_ACCESS_CHECK | SL_OPEN_TARGET_DIRECTORY`, `FILE_OPEN`, read/write sharing, and
+    `FILE_OPEN_FOR_BACKUP_INTENT`. The target File is never inserted into a process handle table.
+    Known directory sources request `FILE_ADD_SUBDIRECTORY`; ordinary sources request
+    `FILE_WRITE_DATA`, both with `SYNCHRONIZE`.
+
+    A new host-tested `PendingSetFileNameTable` reserves before dispatch and owns the captured
+    target name and scrubbed set-information buffer under a generation-protected transaction id.
+    It admits only `TargetCreate -> SourceSet` or exact inline-terminal transitions, keeps an
+    updating slot unavailable during re-entrant provider dispatch, and rejects stale ids,
+    reservation replay, and invalid source/target identity. The generic pending File owner now
+    correlates the target CREATE completion to the temporary File, retargets exactly once to the
+    source SET IRP, and retains the source File reference, synchronous Busy owner, IOSB, and parked
+    syscall reply throughout. CREATE failure, link collision, synchronous SET, pending SET,
+    acknowledgement retry, dead-thread abandonment, and final target CLEANUP/CLOSE all converge on
+    the same terminal ownership path. Captured-buffer publication marks durable ownership even when
+    the transaction table reuses capacity; final teardown returns that storage to the allocator's
+    reusable free list.
+
+    Focused validation passes `nt-status` `4/4` and `nt-io-manager` `210/210`; the freestanding
+    executive check remains green at the established 212-warning baseline. Serialized acceptance
+    `.tmp/run-headless-provider-set-transaction-20260827.log` completed all five configured PnP
+    starts, launched genuine userinit and Explorer, painted 480,000/480,000 framebuffer pixels with
+    at least 32 colors, passed all `295/295` gates, and matched the sentinel. Scratch returned to
+    zero after its unchanged 278,112 B peak; final allocated durable state was 14,788,984 B with
+    6,182,408 B reusable.
+
+    Review adjustment: direct device-qualified and normalized Object Manager Directory provider
+    targets are closed without a synthetic result or local-path fallback. A source directory opened
+    without explicit `FILE_DIRECTORY_FILE` still needs an internal provider
+    `FileBasicInformation` query before choosing `FILE_ADD_SUBDIRECTORY`; model that as a preceding
+    resumable phase rather than guessing. Absolute aliases such as DOS-device/mount paths must be
+    reparsed by the Object Manager to the canonical device before the same-device prefix check.
+    Local `FileLinkInformation` still requires MemFs multiple-entry/link-count ownership. After
+    those identity items, resume the remaining file query/set capture inventory and the separate
+    root service-loop mark/reset lifetime-classification item.

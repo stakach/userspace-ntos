@@ -41,6 +41,7 @@ mod mock_driver;
 mod object_port;
 mod open;
 mod pending_io;
+mod pending_set_file_name;
 mod pipe;
 mod projection;
 mod read_write;
@@ -97,11 +98,15 @@ pub use mock_driver::{IoctlBehavior, MockDriverBackend};
 pub use object_port::{MockObjectPort, ObjectManagerPort};
 pub use pending_io::{
     PendingFileCreate, PendingFileIo, PendingFileIoOperation, PendingFileIoReservation,
-    PendingFileIoTable, IO_DELIVERY_APC_PUBLISHED, IO_DELIVERY_BACKEND_ACKED,
-    IO_DELIVERY_BUFFER_PUBLISHED, IO_DELIVERY_CREATE_COMMITTED, IO_DELIVERY_EVENT_PUBLISHED,
-    IO_DELIVERY_FILE_LOCK_RELEASED, IO_DELIVERY_FILE_PUBLISHED, IO_DELIVERY_HANDLE_PUBLISHED,
-    IO_DELIVERY_IOCP_PUBLISHED, IO_DELIVERY_IOSB_PUBLISHED, IO_DELIVERY_REPLY_CLAIMED,
-    IO_DELIVERY_REPLY_PUBLISHED,
+    PendingFileIoTable, PendingSetFileNameOperation, IO_DELIVERY_APC_PUBLISHED,
+    IO_DELIVERY_BACKEND_ACKED, IO_DELIVERY_BUFFER_PUBLISHED, IO_DELIVERY_CREATE_COMMITTED,
+    IO_DELIVERY_EVENT_PUBLISHED, IO_DELIVERY_FILE_LOCK_RELEASED, IO_DELIVERY_FILE_PUBLISHED,
+    IO_DELIVERY_HANDLE_PUBLISHED, IO_DELIVERY_IOCP_PUBLISHED, IO_DELIVERY_IOSB_PUBLISHED,
+    IO_DELIVERY_REPLY_CLAIMED, IO_DELIVERY_REPLY_PUBLISHED,
+};
+pub use pending_set_file_name::{
+    PendingSetFileName, PendingSetFileNameId, PendingSetFileNamePhase,
+    PendingSetFileNameReservation, PendingSetFileNameTable,
 };
 pub use pipe::{
     pipe_endpoint_end, pipe_endpoint_file_id, pipe_endpoint_primary_context, pipe_name_hash,
@@ -5391,6 +5396,20 @@ mod tests {
         let (source, device, _) = om
             .reference_open_file_details(client, handle, AccessMask::GENERIC_READ)
             .unwrap();
+        let mut relative = [0u16; 32];
+        let absolute: Vec<u16> = "\\DEVICE\\peer0\\target\\leaf".encode_utf16().collect();
+        let relative_len = om
+            .external_file_device_relative_name(client, source, &absolute, &mut relative)
+            .unwrap();
+        assert_eq!(
+            &relative[..relative_len],
+            &"\\target\\leaf".encode_utf16().collect::<Vec<_>>()
+        );
+        let other: Vec<u16> = "\\Device\\Other\\target".encode_utf16().collect();
+        assert_eq!(
+            om.external_file_device_relative_name(client, source, &other, &mut relative),
+            Err(NtStatus::NOT_SAME_DEVICE)
+        );
         let target_access = AccessMask::from_bits_retain(0x0000_0002) | AccessMask::SYNCHRONIZE;
         let target = om
             .allocate_external_file(

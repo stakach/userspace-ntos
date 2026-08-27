@@ -368,6 +368,55 @@ impl<P> IoManager<P> {
         Ok(file.driver_context)
     }
 
+    /// Strip the canonical device prefix from an absolute Object Manager name for an operation
+    /// already rooted at `file_id`. This is the same-device authority check used before opening a
+    /// rename/link target parent; no namespace spelling is converted into a File identity here.
+    pub fn external_file_device_relative_name(
+        &self,
+        client: ClientId,
+        file_id: FileId,
+        absolute_name: &[u16],
+        output: &mut [u16],
+    ) -> Result<usize, NtStatus> {
+        let file = self.file(file_id).ok_or(NtStatus::INVALID_HANDLE)?;
+        if file.client_id != client || !file.state.is_open() {
+            return Err(NtStatus::INVALID_HANDLE);
+        }
+        let device = self
+            .device(file.device_id)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        let device_name = device
+            .name
+            .as_ref()
+            .ok_or(NtStatus::OBJECT_PATH_NOT_FOUND)?
+            .to_unicode_string();
+        let device_name = device_name.as_units();
+        if absolute_name.len() <= device_name.len()
+            || absolute_name.get(device_name.len()) != Some(&(b'\\' as u16))
+            || !absolute_name[..device_name.len()]
+                .iter()
+                .zip(device_name)
+                .all(|(&left, &right)| {
+                    let fold = |unit: u16| {
+                        if (b'A' as u16..=b'Z' as u16).contains(&unit) {
+                            unit + 32
+                        } else {
+                            unit
+                        }
+                    };
+                    fold(left) == fold(right)
+                })
+        {
+            return Err(NtStatus::NOT_SAME_DEVICE);
+        }
+        let relative = &absolute_name[device_name.len()..];
+        if relative.len() > output.len() {
+            return Err(NtStatus::OBJECT_NAME_INVALID);
+        }
+        output[..relative.len()].copy_from_slice(relative);
+        Ok(relative.len())
+    }
+
     /// Build one IRP for `device_id`, route it through the owning driver's
     /// dispatch table, and return either its synchronous result or the canonical
     /// id retained for asynchronous completion.
