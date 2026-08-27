@@ -54,6 +54,7 @@ pub enum NativeService {
     NtClose,
     NtDuplicateObject,
     NtWaitForSingleObject,
+    NtWaitForMultipleObjects,
     NtSignalAndWaitForSingleObject,
     NtQueryObject,
     // Global atom table
@@ -265,6 +266,7 @@ impl NativeService {
             NtClose => "NtClose",
             NtDuplicateObject => "NtDuplicateObject",
             NtWaitForSingleObject => "NtWaitForSingleObject",
+            NtWaitForMultipleObjects => "NtWaitForMultipleObjects",
             NtSignalAndWaitForSingleObject => "NtSignalAndWaitForSingleObject",
             NtQueryObject => "NtQueryObject",
             NtAddAtom => "NtAddAtom",
@@ -600,6 +602,7 @@ impl NativeService {
         NativeService::NtSetVolumeInformationFile,
         NativeService::NtNotifyChangeDirectoryFile,
         NativeService::NtSignalAndWaitForSingleObject,
+        NativeService::NtWaitForMultipleObjects,
     ];
 }
 

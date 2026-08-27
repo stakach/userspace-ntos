@@ -8954,7 +8954,7 @@ pub(crate) unsafe fn service_sec_image(
             // Checkpoint B: -1 = no wait-park; >=0 = NtWaitForSingleObject asked to park this caller on
             // the encoded WaitObject in nt_handler.wait_park_event after dispatch.
             let mut park_wait_event: i64 = -1;
-            // Array-wait park (NtWaitForMultipleObjects): the resolved obj_ns event set + WaitAll flag.
+            // Array-wait park: the typed dispatcher/process/thread/File set + WaitAll flag.
             // count 0 = no array-park. Consumed next to park_wait_event in the reply block.
             let park_wait_set = &mut *core::ptr::addr_of_mut!(PARK_WAIT_SET_WORK);
             let park_wait_indices = &mut *core::ptr::addr_of_mut!(PARK_WAIT_INDEX_WORK);
@@ -9074,6 +9074,8 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.wait_park_event = -1;
                 nt_handler.wait_alertable = false;
                 nt_handler.wait_timeout = PendingWaitTimeout::none();
+                nt_handler.wait_park_count = 0;
+                nt_handler.wait_park_all = false;
                 nt_handler.keyed_wait_key = u64::MAX;
                 nt_handler.keyed_wait_timeout = PendingWaitTimeout::none();
                 nt_handler.keyed_release_wait_key = u64::MAX;
@@ -9616,6 +9618,16 @@ pub(crate) unsafe fn service_sec_image(
                     park_wait_event = nt_handler.wait_park_event;
                     park_wait_alertable = nt_handler.wait_alertable;
                     park_wait_deadline = nt_handler.wait_timeout.deadline_at_park();
+                }
+                if nt_handler.wait_park_count > 0 {
+                    park_wait_set_n = nt_handler.wait_park_count;
+                    park_wait_set_all = nt_handler.wait_park_all;
+                    park_wait_alertable = nt_handler.wait_alertable;
+                    park_wait_deadline = nt_handler.wait_timeout.deadline_at_park();
+                    park_wait_set[..park_wait_set_n]
+                        .copy_from_slice(&nt_handler.wait_park_objects[..park_wait_set_n]);
+                    park_wait_indices[..park_wait_set_n]
+                        .copy_from_slice(&nt_handler.wait_park_result_indices[..park_wait_set_n]);
                 }
                 if nt_handler.keyed_wait_key != u64::MAX {
                     park_keyed_wait_key = nt_handler.keyed_wait_key;
@@ -10180,208 +10192,6 @@ pub(crate) unsafe fn service_sec_image(
                 // returns and csrss.exe's main continues. (One-time; NtRaiseHardError already routes to
                 // our diagnostic path.)
                 result = 0; // STATUS_SUCCESS
-            } else if m0 == 280 && badge != 0 {
-                // ★ NtWaitForMultipleObjects(ObjectCount=R10, HandleArray=RDX, WaitType=R8,
-                // Alertable=R9, *TimeOut=[sp+0x28]) — REAL array-wait with reply-cap parking (Part 1 of
-                // the winlogon rpcrt4 handshake). WaitType 1 = WaitAny, 0 = WaitAll. This is the
-                // worker-thread half of the rpcrt4 two-thread handshake: the server WORKER thread
-                // (multiplexed via WINLOGON_WORKER_BADGE / SVC/LSASS listeners) runs
-                // rpcrt4_protseq_np_wait_for_new_connection = WaitForMultipleObjects([mgr_event,
-                // listen_events…]). We resolve the handle array to dispatcher objects:
-                //   • WaitAny + any already signalled → immediate WAIT_0+index.
-                //   • WaitAll + all signalled → immediate WAIT_0.
-                //   • otherwise, if the set contains at least one real waitable object —
-                //     the main thread's signal_state_changed SetEvents mgr_event) → PARK on the set
-                //     (steal the reply cap, recv next, wake on NtSetEvent). ★ NO-DEADLOCK: only park
-                //     when a real event is present; a set of only fake handles → immediate WAIT_0.
-                let count = get_recv_mr(9) as usize; // R10 = ObjectCount
-                let harr = m3; // RDX = HandleArray
-                let wait_type = get_recv_mr(7); // R8 = WaitType (1=Any, 0=All)
-                let alertable = get_recv_mr(8) as u8 != 0; // R9 = Alertable BOOLEAN
-                let wait_all = wait_type == 0;
-                let mut nev = 0usize;
-                let mut any_signalled_idx: i64 = -1; // handle-array index (k) of the first signalled
-                let mut any_signalled_obj = WaitObject::FREE;
-                let mut any_signalled_real = false;
-                let mut all_signalled = true;
-                let mut has_wait_object = false;
-                let mut wait_identities = [WaitObject::FREE.raw(); WAITER_MAX_EVENTS];
-                let mut wait_error: Option<u32> =
-                    if harr == 0 || count == 0 || count > WAITER_MAX_EVENTS || wait_type > 1 {
-                        Some(0xC000_000D) // STATUS_INVALID_PARAMETER
-                    } else {
-                        None
-                    };
-                let trace = EVENT_TRACE_N.fetch_add(1, Ordering::Relaxed);
-                if wait_error.is_none() {
-                    for k in 0..count {
-                        let h = client_read_u64_mapped(
-                            pi as u64,
-                            harr + (k as u64) * 8,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        )
-                        .unwrap_or(0);
-                        match nt_handler.wait_object_for_handle(h, SYNCHRONIZE_ACCESS) {
-                            Ok(object) => {
-                                if trace < 32 {
-                                    print_str(b"[event] wait-item k=");
-                                    print_u64(k as u64);
-                                    print_str(b" h=0x");
-                                    print_hex_u64(h);
-                                    print_str(b" -> ");
-                                    print_str(object.describe());
-                                    print_str(b"=");
-                                    print_u64(object.id());
-                                    print_str(b"\n");
-                                }
-                                has_wait_object = true;
-                                park_wait_set[nev] = object;
-                                park_wait_indices[nev] = k as u8;
-                                wait_identities[k] = object.raw();
-                                nev += 1;
-                                if nt_handler.wait_object_ready(object) {
-                                    if any_signalled_idx < 0 {
-                                        any_signalled_idx = k as i64;
-                                        any_signalled_obj = object;
-                                        any_signalled_real = true;
-                                    }
-                                } else {
-                                    all_signalled = false;
-                                }
-                                continue;
-                            }
-                            Err(status) => {
-                                if trace < 32 {
-                                    print_str(b"[event] wait-item k=");
-                                    print_u64(k as u64);
-                                    print_str(b" h=0x");
-                                    print_hex_u64(h);
-                                    print_str(b" -> status=0x");
-                                    print_hex(status);
-                                    print_str(b"\n");
-                                }
-                                wait_error = Some(status);
-                                break;
-                            }
-                        }
-                    }
-                    if wait_all && wait_error.is_none() {
-                        'duplicates: for left in 0..count {
-                            for right in left + 1..count {
-                                if wait_identities[left] == wait_identities[right] {
-                                    wait_error = Some(0xC000_0030); // STATUS_INVALID_PARAMETER_MIX
-                                    break 'duplicates;
-                                }
-                            }
-                        }
-                    }
-                }
-                // Consume dispatcher state only after the complete immediate condition is satisfied.
-                let timeout_ptr = client_read_u64_mapped(
-                    pi as u64,
-                    sp + 0x28,
-                    filled_pages,
-                    faults as usize,
-                    scratch_base,
-                )
-                .unwrap_or(0);
-                let wait_due = if timeout_ptr == 0 {
-                    None
-                } else {
-                    Some(nt_delay_execution::due_time(
-                        client_read_u64_mapped(
-                            pi as u64,
-                            timeout_ptr,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        )
-                        .unwrap_or(0) as i64,
-                        monotonic_time_100ns(),
-                        nt_system_time_100ns(),
-                    ))
-                };
-                let zero_timeout = matches!(wait_due, Some(nt_delay_execution::Due::Immediate));
-                let finite_deadline = match wait_due {
-                    Some(nt_delay_execution::Due::Monotonic100ns(deadline)) => Some(deadline),
-                    _ => None,
-                };
-                if trace < 32 {
-                    print_str(b"[event] wait-multi pi=");
-                    print_u64(pi as u64);
-                    print_str(b" badge=");
-                    print_u64(badge);
-                    print_str(b" count=");
-                    print_u64(count as u64);
-                    print_str(if wait_all { b" all" } else { b" any" });
-                    print_str(b" waitable=");
-                    print_u64(nev as u64);
-                    print_str(b" alertable=");
-                    print_u64(alertable as u64);
-                    print_str(if zero_timeout {
-                        b" timeout=zero\n"
-                    } else if timeout_ptr == 0 {
-                        b" timeout=infinite\n"
-                    } else {
-                        b" timeout=finite\n"
-                    });
-                }
-                let mut delivered_user_apc = false;
-                let mut user_apc_error = None;
-                if wait_error.is_none() && alertable {
-                    match unsafe { nt_handler.try_deliver_current_user_apc() } {
-                        Ok(true) => {
-                            delivered_user_apc = true;
-                            redirected_user_apc = true;
-                        }
-                        Ok(false) => {}
-                        Err(status) => user_apc_error = Some(status),
-                    }
-                }
-                if delivered_user_apc {
-                    result = 0x0000_00C0;
-                } else if let Some(status) = user_apc_error {
-                    result = status as u64;
-                } else if let Some(status) = wait_error {
-                    result = status as u64;
-                } else if wait_all {
-                    if has_wait_object && all_signalled {
-                        for k in 0..nev {
-                            nt_handler.wait_object_consume(park_wait_set[k]);
-                        }
-                        result = 0; // WAIT_0 (all satisfied)
-                    } else if zero_timeout {
-                        result = 0x102;
-                    } else if has_wait_object {
-                        park_wait_set_n = nev;
-                        park_wait_set_all = true;
-                        park_wait_alertable = alertable;
-                        park_wait_deadline = finite_deadline;
-                        result = 0;
-                    } else {
-                        result = 0; // no wait object → immediate WAIT_0 for legacy compatibility handles
-                    }
-                } else {
-                    // WaitAny
-                    if any_signalled_idx >= 0 {
-                        if any_signalled_real {
-                            nt_handler.wait_object_consume(any_signalled_obj);
-                        }
-                        result = any_signalled_idx as u64; // WAIT_OBJECT_0 + index
-                    } else if zero_timeout {
-                        result = 0x102;
-                    } else if has_wait_object {
-                        park_wait_set_n = nev;
-                        park_wait_set_all = false;
-                        park_wait_alertable = alertable;
-                        park_wait_deadline = finite_deadline;
-                        result = 0;
-                    } else {
-                        result = 0; // no wait object to park on; legacy compatibility handles only
-                    }
-                }
             } else if m0 == 19 {
                 // NtApphelpCacheControl(Command=R10, Data=RDX). kernel32's CreateProcessInternalW →
                 // BasepCheckBadapp → BaseCheckAppcompatCache → BasepShimCacheSearch does
@@ -10397,15 +10207,6 @@ pub(crate) unsafe fn service_sec_image(
                 // terminate port (so CSR is told when the thread dies). No terminate-port model in the
                 // host → accept it (STATUS_SUCCESS) so winlogon's kernel32 DllMain completes + the
                 // loader runs the remaining DllMains toward winlogon's entry.
-                result = 0;
-            } else if m0 == 280 && badge == 0 {
-                // NtWaitForMultipleObjects — smss's main thread waits (WaitAny) on {csrss, winlogon}
-                // to die (smss.c:518). In our boot NEITHER dies, so smss's correct terminal state is to
-                // block here FOREVER. PARK it (never reply, recv the next event) so the higher-priority
-                // winlogon keeps running forward. Returning STATUS_WAIT_0 instead would make smss think
-                // csrss/winlogon terminated -> its hard-error teardown path (wrong). This is the
-                // designed end of smss's lifetime; the loop now terminates on winlogon's next wall.
-                park_caller = true;
                 result = 0;
             } else if m0 >= win32k_subsystem::WIN32K_SERVICE_BASE
                 && (hosted_non_native_top_level_badge(&nt_handler, badge)
@@ -15868,10 +15669,8 @@ pub(crate) unsafe fn service_sec_image(
                     result = 0xC000_009A;
                 }
             }
-            // Array-wait park (NtWaitForMultipleObjects): PARK on the resolved event SET (WaitAny/All).
-            // The matching NtSetEvent (signal_state_changed → SetEvent(mgr_event)) wakes it via
-            // dispatcher wake path, returning WAIT_0+index. Pool/queue exhaustion returns
-            // STATUS_INSUFFICIENT_RESOURCES through the normal reply path.
+            // Array-wait park: retain the exact typed set and park the reply capability. Any matching
+            // owner transition wakes it through the shared dispatcher path with WAIT_0+index.
             if park_wait_set_n > 0 && reply_main != 0 {
                 if park_wait_deadline.is_some() && !delay_timer_init() {
                     result = 0xC000_009A;
@@ -15897,9 +15696,9 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" NtWaitForMultipleObjects(");
                     print_u64(park_wait_set_n as u64);
                     print_str(if park_wait_set_all {
-                        b" events, WaitAll) UNSIGNALLED -> PARK caller\n"
+                        b" objects, WaitAll) UNSIGNALLED -> PARK caller\n"
                     } else {
-                        b" events, WaitAny) UNSIGNALLED -> PARK caller\n"
+                        b" objects, WaitAny) UNSIGNALLED -> PARK caller\n"
                     });
                     if park_wait_deadline.is_none() && wait_still_parked {
                         trace_indefinite_wait_park(

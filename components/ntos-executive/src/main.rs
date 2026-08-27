@@ -1107,6 +1107,7 @@ pub const SSN_NT_OPEN_SEMAPHORE: u64 = 132;
 pub const SSN_NT_QUERY_SEMAPHORE: u64 = 177;
 pub const SSN_NT_RELEASE_SEMAPHORE: u64 = 197;
 pub const SSN_NT_SIGNAL_AND_WAIT_FOR_SINGLE_OBJECT: u64 = 259;
+pub const SSN_NT_WAIT_FOR_MULTIPLE_OBJECTS: u64 = 280;
 // NT LPC connection-rendezvous SSNs (ReactOS ntdll — the one smss/csrss run).
 pub const SSN_NT_ACCEPT_CONNECT_PORT: u64 = 0;
 pub const SSN_NT_COMPLETE_CONNECT_PORT: u64 = 31;
@@ -21669,6 +21670,12 @@ struct ExecNtHandler {
     /// Raw NT timeout interval for the pending wait-object park. The loop converts it into a
     /// monotonic deadline at the reply-cap park boundary, after any handler-side bookkeeping.
     wait_timeout: PendingWaitTimeout,
+    /// Typed set captured by `NtWaitForMultipleObjects` for reply-cap parking.
+    wait_capture_handles: [u64; WAITER_MAX_EVENTS],
+    wait_park_objects: [WaitObject; WAITER_MAX_EVENTS],
+    wait_park_result_indices: [u8; WAITER_MAX_EVENTS],
+    wait_park_count: usize,
+    wait_park_all: bool,
     /// `NtWaitForKeyedEvent` asks the loop to park this syscall on an arbitrary user-mode key.
     /// Finite waits reuse the shared delay timer.
     keyed_wait_key: u64,
@@ -23686,6 +23693,10 @@ fn build_nt_table() -> NativeServiceTable {
             ),
             (NativeService::NtQueryObject, 170),
             (NativeService::NtWaitForSingleObject, 281),
+            (
+                NativeService::NtWaitForMultipleObjects,
+                SSN_NT_WAIT_FOR_MULTIPLE_OBJECTS as u32,
+            ),
             (
                 NativeService::NtSignalAndWaitForSingleObject,
                 SSN_NT_SIGNAL_AND_WAIT_FOR_SINGLE_OBJECT as u32,

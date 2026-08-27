@@ -20,6 +20,9 @@ const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
 const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_INVALID_PARAMETER_MIX: u32 = 0xC000_0030;
+const STATUS_INVALID_PARAMETER_1: u32 = 0xC000_00EF;
+const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
 const STATUS_NO_SUCH_DEVICE: u32 = 0xC000_000E;
 const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
@@ -3073,6 +3076,11 @@ impl ExecNtHandler {
         write_field!(wait_park_event, -1);
         write_field!(wait_alertable, false);
         write_field!(wait_timeout, PendingWaitTimeout::none());
+        write_field!(wait_capture_handles, [0; WAITER_MAX_EVENTS]);
+        write_field!(wait_park_objects, [WaitObject::FREE; WAITER_MAX_EVENTS]);
+        write_field!(wait_park_result_indices, [0; WAITER_MAX_EVENTS]);
+        write_field!(wait_park_count, 0);
+        write_field!(wait_park_all, false);
         write_field!(keyed_wait_key, u64::MAX);
         write_field!(keyed_wait_timeout, PendingWaitTimeout::none());
         write_field!(keyed_release_wait_key, u64::MAX);
@@ -11155,6 +11163,115 @@ impl ExecNtHandler {
         0x102
     }
 
+    fn begin_multiple_object_wait(
+        &mut self,
+        count: u32,
+        handle_array: u64,
+        wait_type: u32,
+        alertable: bool,
+        timeout_ptr: u64,
+    ) -> u32 {
+        if count == 0 || count as usize > WAITER_MAX_EVENTS {
+            return STATUS_INVALID_PARAMETER_1;
+        }
+        if wait_type > 1 {
+            return STATUS_INVALID_PARAMETER_3;
+        }
+        let timeout_interval = match self.wait_timeout_interval(timeout_ptr) {
+            Ok(timeout) => timeout,
+            Err(status) => return status,
+        };
+        if handle_array == 0 {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if handle_array & 7 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+
+        // Capture the full user array before resolving any handle, matching Ob's rule that a caller
+        // cannot retarget later entries while the kernel references the earlier ones.
+        let count = count as usize;
+        for index in 0..count {
+            let Some(address) = handle_array.checked_add((index as u64) * 8) else {
+                return STATUS_ACCESS_VIOLATION;
+            };
+            let mut bytes = [0u8; 8];
+            if !unsafe { self.xas_read(address, &mut bytes) } {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            self.wait_capture_handles[index] = u64::from_le_bytes(bytes);
+        }
+
+        for index in 0..count {
+            let handle = self.wait_capture_handles[index];
+            self.wait_park_objects[index] =
+                match self.wait_object_for_handle(handle, SYNCHRONIZE_ACCESS) {
+                    Ok(object) => object,
+                    Err(status) => return status,
+                };
+        }
+
+        let wait_all = wait_type == 0;
+        if wait_all {
+            for left in 0..count {
+                if self.wait_park_objects[left + 1..count]
+                    .contains(&self.wait_park_objects[left])
+                {
+                    return STATUS_INVALID_PARAMETER_MIX;
+                }
+            }
+        }
+        if alertable {
+            match unsafe { self.try_deliver_current_user_apc() } {
+                Ok(true) => return 0x0000_00C0,
+                Ok(false) => {}
+                Err(status) => return status,
+            }
+        }
+
+        if wait_all {
+            let mut all_ready = true;
+            for index in 0..count {
+                if !self.wait_object_ready(self.wait_park_objects[index]) {
+                    all_ready = false;
+                    break;
+                }
+            }
+            if all_ready {
+                for index in 0..count {
+                    let object = self.wait_park_objects[index];
+                    self.wait_object_consume(object);
+                }
+                return 0;
+            }
+        } else {
+            for index in 0..count {
+                let object = self.wait_park_objects[index];
+                if self.wait_object_ready(object) {
+                    self.wait_object_consume(object);
+                    return index as u32;
+                }
+            }
+        }
+
+        if let Some(timeout) = timeout_interval.map(PendingWaitTimeout::from_interval) {
+            match timeout.due_now().expect("captured timeout has a due time") {
+                nt_delay_execution::Due::Immediate => return 0x102,
+                nt_delay_execution::Due::Monotonic100ns(_) => self.wait_timeout = timeout,
+            }
+        }
+        for (index, result_index) in self.wait_park_result_indices[..count]
+            .iter_mut()
+            .enumerate()
+        {
+            *result_index = index as u8;
+        }
+        self.wait_park_count = count;
+        self.wait_park_all = wait_all;
+        self.wait_alertable = alertable;
+        0x102
+    }
+
     fn process_thread_or_file_wait_object(
         &self,
         handle: u64,
@@ -18709,6 +18826,9 @@ impl ExecNtHandler {
     fn wait_timeout_interval(&self, timeout_ptr: u64) -> Result<Option<i64>, u32> {
         if timeout_ptr == 0 {
             return Ok(None);
+        }
+        if timeout_ptr & 7 != 0 {
+            return Err(STATUS_DATATYPE_MISALIGNMENT);
         }
         Ok(Some(self.read_user_i64(timeout_ptr)?))
     }
@@ -31052,6 +31172,13 @@ impl ExecNtHandler {
                     Err(status) => status,
                 }
             }
+            NativeService::NtWaitForMultipleObjects => self.begin_multiple_object_wait(
+                nt_ulong_arg(args[0]),
+                args[1],
+                nt_ulong_arg(args[2]),
+                nt_boolean_arg(args[3]),
+                args[4],
+            ),
             NativeService::NtSignalAndWaitForSingleObject => {
                 let timeout_ptr = args[3];
                 let timeout = match self.wait_timeout_interval(timeout_ptr) {

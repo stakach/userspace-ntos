@@ -883,6 +883,22 @@ fn signal_and_wait_uses_its_canonical_service_contract() {
 }
 
 #[test]
+fn wait_for_multiple_objects_uses_its_canonical_service_contract() {
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtWaitForMultipleObjects, 280)],
+    );
+    let entry = table.lookup(280).unwrap();
+    assert_eq!(entry.service, NativeService::NtWaitForMultipleObjects);
+    assert_eq!(entry.min_args, 5);
+    assert_eq!(entry.max_args, 5);
+    assert_eq!(
+        NativeService::NtWaitForMultipleObjects.name(),
+        "NtWaitForMultipleObjects"
+    );
+}
+
+#[test]
 fn migrated_services_dispatch_and_validate() {
     // Register on a test dispatcher and prove: (a) a bad arg count is rejected before the handler,
     // (b) a good call reaches the handler with the previous mode set.

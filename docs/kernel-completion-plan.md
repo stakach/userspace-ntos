@@ -14983,7 +14983,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     trait that unblocks general applications; do not add a boot-image identity branch or successful
     compatibility fallback.
 
-    Native-service registration audit (2026-08-27, in progress): the canonical ABI contains 222
+    Native-service registration audit (2026-08-27): the canonical ABI contains 222
     `Nt*` exports, while the typed executive surface contains 162 services and `build_nt_table`
     registers 160 distinct service variants. The two typed-but-unregistered variants are legacy
     dispatch migrations (`NtDeviceIoControlFile` and `NtCreateThreadEx`); the ABI-to-typed-surface
@@ -14996,3 +14996,29 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     changing signal state; then enter the existing alertable single-object wait path in the same
     serialized executive transition. Do not emulate unsupported signal object types or split the
     operation into user-visible `NtSetEvent` plus `NtWaitForSingleObject` calls.
+
+    `NtSignalAndWaitForSingleObject` (2026-08-27, accepted): SSN 259 is now a typed registered
+    service. `nt-kernel-exec` owns the event, semaphore, and mutant signal transition and preserves
+    invalid-object, semaphore-limit, and mutant-owner failures. The executive probes the timeout,
+    resolves both handles with their native access requirements, applies the signal, wakes existing
+    waiters, and enters the shared APC-aware single-object wait path without releasing its serialized
+    dispatch boundary. Same-object synchronization events are therefore signaled and consumed in one
+    operation, not exposed as two syscalls.
+
+    Focused validation passes `nt-kernel-exec` `170/170`, `nt-syscall` `59/59`, `git diff --check`,
+    the freestanding executive at the established 211-warning baseline, and the release build. Code
+    checkpoint `f61561c4` is pushed. Serialized acceptance
+    `.tmp/run-headless-signal-wait-20260827.log` reached quiescence at 103,832 ms, launched genuine
+    userinit and Explorer, completed 668 Explorer api0 redirects with zero callback or dead-callback
+    failures, recorded paint begin/end `5/20`, 187 direct GDI returns, and 135 batch flushes covering
+    184 records, painted `480000/480000` framebuffer pixels with at least 32 colours, passed all
+    `295/295` gates, and matched the sentinel. Snapshot generation 5 committed 1,755,492 bytes;
+    scratch returned to zero and the resource census reported no page-table, frame, mapping, alias,
+    registry, untyped-allocation, frame-registration, image-bank, or allocator failures.
+
+    Review adjustment: the first absent dispatcher trait is closed, leaving 60 ABI exports outside
+    the typed surface. Before selecting another new trait, remove the remaining legacy SSN 280
+    `NtWaitForMultipleObjects` ladder. It currently contains both successful fake-handle behavior and
+    a badge-zero smss identity branch even though dispatcher, process, thread, File, timeout, APC,
+    and exact retained-set machinery now exist. Register it as a typed service, resolve every handle
+    or fail, use the shared atomic WaitAny/WaitAll consumption rules, and delete both old branches.
