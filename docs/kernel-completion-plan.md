@@ -14776,3 +14776,46 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     volume information, byte-range locks, and directory change notification. Prefer the next pair
     whose provider IRP and local semantic owner can be completed without introducing executive
     policy or a successful unsupported result.
+
+    Native volume-information boundary (2026-08-27, accepted):
+    `NtQueryVolumeInformationFile` no longer fabricates a successful disk/mounted result in the
+    executive, and `NtSetVolumeInformationFile` is now registered at its canonical ReactOS NT5
+    service number. The I/O Manager owns the exact query/set class tables, minimum lengths,
+    alignments, access checks, label-extent validation, typed parameters, buffered extents, and
+    pending completion lifecycle. Provider Files issue genuine
+    `IRP_MJ_QUERY_VOLUME_INFORMATION` and `IRP_MJ_SET_VOLUME_INFORMATION` requests and receive the
+    native x64 QueryVolume/SetVolume stack unions. The existing cross-domain request layout carries
+    the information class in its generic class field, so this adds validation without another ABI
+    version or a parallel transport.
+
+    The local filesystem now owns its volume data. FAT BPB serial and label fields identify the
+    mounted volume, FAT32 FSInfo signatures and free-cluster data supply allocation geometry, and
+    the filesystem encoder owns the native variable-length volume, size, full-size, device, and
+    attribute structures. The writable overlay reports the same underlying mounted-volume
+    identity rather than becoming an executive-created volume. Unsupported local control and
+    object-ID facilities return `STATUS_INVALID_DEVICE_REQUEST`; local ordinary File handles cannot
+    mutate volume state and return the filesystem's `STATUS_ACCESS_DENIED`. No zero quota/control
+    record, object ID, capacity estimate, or successful set result is synthesized.
+
+    `FileFsDriverPathInformation` remains I/O-Manager-owned as on NT5: the driver name is captured
+    from the caller, resolved case-insensitively against canonical driver objects, and checked
+    across the exact live attachment stack for the referenced File. Focused validation passes
+    `nt-io-abi` `9/9`, `nt-fs` `103/103`, `nt-io-manager` `228/228`, `nt-syscall-abi` `19/19`,
+    `nt-ntdll` `709/709`, and `nt-syscall` `56/56`. The freestanding executive compiles at the
+    established 211-warning baseline. The dedicated DLL build/verifier sees all 222 Nt stubs, all
+    222 Zw aliases, valid relocations, and complete imports for the boot-critical ReactOS images.
+    Code checkpoint `cbffcbe5` is pushed.
+
+    Serialized acceptance `.tmp/run-headless-native-volume-20260827.log` reached quiescence at
+    111,952 ms, launched genuine userinit and Explorer, completed 665 Explorer api0 redirects with
+    zero callback failures, painted `480000/480000` framebuffer pixels with at least 32 colours,
+    passed all `295/295` gates, and matched the sentinel. Snapshot generation 5 committed the
+    version-6 payload at 1,755,666 bytes; scratch returned to zero and the resource census reported
+    no frame, mapping, registry, untyped-allocation, or allocator failures.
+
+    Review adjustment: native volume capture, access, filesystem encoding, provider dispatch,
+    driver-stack inspection, and completion ownership are closed. Optional control/object-ID
+    facilities remain explicit filesystem capabilities. Continue with the byte-range lock pair
+    (`NtLockFile` and `NtUnlockFile`): inventory the current native exports and dispatch first, then
+    place conflict/wait ownership in a filesystem-level lock manager, route provider Files through
+    `IRP_MJ_LOCK_CONTROL`, and preserve asynchronous event/APC/IOCP plus cancellation semantics.
