@@ -1422,6 +1422,7 @@ pub(crate) unsafe fn copy_up_installed_file(
         InstalledFileCopyUp::MetadataOnly => {
             metadata.allocation_size = 0;
             metadata.end_of_file = 0;
+            metadata.valid_data_length = 0;
             alloc::vec::Vec::new()
         }
     };
@@ -1826,6 +1827,18 @@ pub(crate) unsafe fn set_information(file_id: u64, class: u32, data: &[u8]) -> u
         mark_snapshot_dirty();
     }
     status
+}
+
+/// Capture create-time security context on the filesystem's open description before its process
+/// handle is published. The filesystem retains this across handle duplication like an FSD CCB.
+pub(crate) unsafe fn capture_open_privileges(
+    file_id: u64,
+    privileges: nt_fs::FileOpenPrivileges,
+) -> u32 {
+    let Some(fs) = writable_fs() else {
+        return nt_fs::STATUS_INVALID_HANDLE;
+    };
+    fs.capture_open_privileges(file_id, privileges)
 }
 
 /// Rename a writable-volume File using a canonical filesystem parse root.

@@ -10115,6 +10115,15 @@ impl ExecNtHandler {
     /// Mint a process-local handle for a file or directory on the WRITABLE overlay volume.
     /// `file_id` is that volume's own file-object id (see `writable_fs`).
     pub(crate) fn mint_overlay_file_handle(&mut self, file_id: u64, access: u32) -> Option<u64> {
+        let privileges = nt_fs::FileOpenPrivileges {
+            manage_volume: self.current_token_has_privilege(nt_security::SE_MANAGE_VOLUME),
+        };
+        if unsafe { crate::writable_fs::capture_open_privileges(file_id, privileges) }
+            != nt_fs::STATUS_SUCCESS
+        {
+            unsafe { crate::writable_fs::close(file_id) };
+            return None;
+        }
         let Some(pid) = self.pm_pid_for_pi(self.pi) else {
             unsafe { crate::writable_fs::close(file_id) };
             return None;

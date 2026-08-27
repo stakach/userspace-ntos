@@ -26,7 +26,8 @@ const MEMFS_SNAPSHOT_MAGIC: [u8; 8] = *b"USNTFS\0\x01";
 const MEMFS_SNAPSHOT_VERSION_V1: u16 = 1;
 const MEMFS_SNAPSHOT_VERSION_V2: u16 = 2;
 const MEMFS_SNAPSHOT_VERSION_V3: u16 = 3;
-const MEMFS_SNAPSHOT_VERSION: u16 = 4;
+const MEMFS_SNAPSHOT_VERSION_V4: u16 = 4;
+const MEMFS_SNAPSHOT_VERSION: u16 = 5;
 const MEMFS_SNAPSHOT_HEADER_LEN: usize = 32;
 const MEMFS_ALLOCATION_UNIT: u64 = 0x1000;
 const SNAP_REC_DIR: u8 = 1;
@@ -468,6 +469,7 @@ struct MemFsNode {
     link_count: u32,
     parent: u64,
     allocation_size: u64,
+    valid_data_length: u64,
     data: FileData,
     children: Vec<MemFsDirEntry>,
 }
@@ -521,6 +523,7 @@ impl MemFs {
             link_count: 1,
             parent: 0,
             allocation_size: 0,
+            valid_data_length: 0,
             data: FileData::empty(),
             children: Vec::new(),
         }));
@@ -693,6 +696,7 @@ impl MemFs {
             MEMFS_SNAPSHOT_VERSION_V1
                 | MEMFS_SNAPSHOT_VERSION_V2
                 | MEMFS_SNAPSHOT_VERSION_V3
+                | MEMFS_SNAPSHOT_VERSION_V4
                 | MEMFS_SNAPSHOT_VERSION
         ) {
             return Err(MemFsSnapshotError::UnsupportedVersion);
@@ -821,10 +825,15 @@ impl MemFs {
             let logical_len_u64 = r.u64()?;
             let logical_len =
                 usize::try_from(logical_len_u64).map_err(|_| MemFsSnapshotError::InvalidRecord)?;
-            let allocation_size = if info.version >= MEMFS_SNAPSHOT_VERSION {
+            let allocation_size = if info.version >= MEMFS_SNAPSHOT_VERSION_V4 {
                 r.u64()?
             } else {
                 allocation_size_for_eof(logical_len_u64)
+            };
+            let valid_data_length = if info.version >= MEMFS_SNAPSHOT_VERSION {
+                r.u64()?
+            } else {
+                logical_len_u64
             };
             let extent_count =
                 usize::try_from(r.u32()?).map_err(|_| MemFsSnapshotError::InvalidRecord)?;
@@ -838,6 +847,7 @@ impl MemFs {
                     || node_key != 0
                     || logical_len != 0
                     || allocation_size != 0
+                    || valid_data_length != 0
                     || extent_count != 0
                 {
                     return Err(MemFsSnapshotError::InvalidRecord);
@@ -856,6 +866,7 @@ impl MemFs {
                     || node_key == 0
                     || logical_len != 0
                     || allocation_size != 0
+                    || valid_data_length != 0
                     || extent_count != 0
                 {
                     return Err(MemFsSnapshotError::InvalidRecord);
@@ -883,12 +894,17 @@ impl MemFs {
             };
             let id = fs.restore_snapshot_node(path, is_dir, attributes, times, file_id)?;
             if is_dir {
-                if logical_len != 0 || allocation_size != 0 || extent_count != 0 {
+                if logical_len != 0
+                    || allocation_size != 0
+                    || valid_data_length != 0
+                    || extent_count != 0
+                {
                     return Err(MemFsSnapshotError::InvalidRecord);
                 }
             } else {
                 if allocation_size & (MEMFS_ALLOCATION_UNIT - 1) != 0
                     || allocation_size < allocation_size_for_eof(logical_len_u64)
+                    || valid_data_length > logical_len_u64
                 {
                     return Err(MemFsSnapshotError::InvalidRecord);
                 }
@@ -897,6 +913,7 @@ impl MemFs {
                     return Err(MemFsSnapshotError::InvalidRecord);
                 };
                 node.allocation_size = allocation_size;
+                node.valid_data_length = valid_data_length;
                 node.data = data;
                 if info.version >= MEMFS_SNAPSHOT_VERSION_V2 {
                     if node_key == 0
@@ -956,10 +973,15 @@ impl MemFs {
             let logical_len_u64 = r.u64()?;
             let logical_len =
                 usize::try_from(logical_len_u64).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
-            let allocation_size = if header.info.version >= MEMFS_SNAPSHOT_VERSION {
+            let allocation_size = if header.info.version >= MEMFS_SNAPSHOT_VERSION_V4 {
                 r.u64()?
             } else {
                 allocation_size_for_eof(logical_len_u64)
+            };
+            let valid_data_length = if header.info.version >= MEMFS_SNAPSHOT_VERSION {
+                r.u64()?
+            } else {
+                logical_len_u64
             };
             let extent_count =
                 usize::try_from(r.u32()?).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
@@ -973,6 +995,7 @@ impl MemFs {
                     || node_key != 0
                     || logical_len != 0
                     || allocation_size != 0
+                    || valid_data_length != 0
                     || extent_count != 0
                 {
                     return Err(SnapshotBlockStoreError::Corrupt);
@@ -991,6 +1014,7 @@ impl MemFs {
                     || node_key == 0
                     || logical_len != 0
                     || allocation_size != 0
+                    || valid_data_length != 0
                     || extent_count != 0
                 {
                     return Err(SnapshotBlockStoreError::Corrupt);
@@ -1022,12 +1046,17 @@ impl MemFs {
                 )
                 .map_err(snapshot_error_to_store_error)?;
             if is_dir {
-                if logical_len != 0 || allocation_size != 0 || extent_count != 0 {
+                if logical_len != 0
+                    || allocation_size != 0
+                    || valid_data_length != 0
+                    || extent_count != 0
+                {
                     return Err(SnapshotBlockStoreError::Corrupt);
                 }
             } else {
                 if allocation_size & (MEMFS_ALLOCATION_UNIT - 1) != 0
                     || allocation_size < allocation_size_for_eof(logical_len_u64)
+                    || valid_data_length > logical_len_u64
                 {
                     return Err(SnapshotBlockStoreError::Corrupt);
                 }
@@ -1037,6 +1066,7 @@ impl MemFs {
                     return Err(SnapshotBlockStoreError::Corrupt);
                 };
                 node.allocation_size = allocation_size;
+                node.valid_data_length = valid_data_length;
                 node.data = data;
                 if header.info.version >= MEMFS_SNAPSHOT_VERSION_V2 {
                     if node_key == 0
@@ -1302,10 +1332,11 @@ impl MemFs {
     ) -> Result<usize, MemFsSnapshotError> {
         let path_len = u32::try_from(path.len()).map_err(|_| MemFsSnapshotError::InvalidPath)?;
         let end_of_file = node.data.len(&self.blobs) as u64;
-        if (node.is_dir && node.allocation_size != 0)
+        if (node.is_dir && (node.allocation_size != 0 || node.valid_data_length != 0))
             || (!node.is_dir
                 && (node.allocation_size & (MEMFS_ALLOCATION_UNIT - 1) != 0
-                    || node.allocation_size < allocation_size_for_eof(end_of_file)))
+                    || node.allocation_size < allocation_size_for_eof(end_of_file)
+                    || node.valid_data_length > end_of_file))
         {
             return Err(MemFsSnapshotError::InvalidRecord);
         }
@@ -1319,6 +1350,7 @@ impl MemFs {
             .and_then(|n| n.checked_add(4))
             .and_then(|n| n.checked_add(8))
             .and_then(|n| n.checked_add(32))
+            .and_then(|n| n.checked_add(8))
             .and_then(|n| n.checked_add(8))
             .and_then(|n| n.checked_add(8))
             .and_then(|n| n.checked_add(4))
@@ -1345,6 +1377,11 @@ impl MemFs {
         } else {
             node.allocation_size
         };
+        let valid_data_length = if node.is_dir || link_only {
+            0
+        } else {
+            node.valid_data_length
+        };
         let extent_count = if node.is_dir || link_only {
             0
         } else {
@@ -1367,6 +1404,7 @@ impl MemFs {
         put_u64(out, node.change_time);
         put_u64(out, logical_len);
         put_u64(out, allocation_size);
+        put_u64(out, valid_data_length);
         put_u32(out, extent_count);
         out.extend_from_slice(path.as_bytes());
         if !node.is_dir && !link_only {
@@ -1394,13 +1432,18 @@ impl MemFs {
         } else {
             node.allocation_size
         };
+        let valid_data_length = if node.is_dir || link_only {
+            0
+        } else {
+            node.valid_data_length
+        };
         let extent_count = if node.is_dir || link_only {
             0
         } else {
             u32::try_from(Self::snapshot_extent_count(&node.data))
                 .map_err(|_| SnapshotBlockStoreError::Corrupt)?
         };
-        let mut header = [0u8; 69];
+        let mut header = [0u8; 77];
         header[0] = if link_only {
             SNAP_REC_LINK
         } else if node.is_dir {
@@ -1417,7 +1460,8 @@ impl MemFs {
         put_u64_at(&mut header[41..49], node.change_time);
         put_u64_at(&mut header[49..57], logical_len);
         put_u64_at(&mut header[57..65], allocation_size);
-        put_u32_at(&mut header[65..69], extent_count);
+        put_u64_at(&mut header[65..73], valid_data_length);
+        put_u32_at(&mut header[73..77], extent_count);
         sink.write_all(&header)?;
         sink.write_all(path.as_bytes())?;
         if !node.is_dir && !link_only {
@@ -1881,6 +1925,7 @@ impl MemFs {
             link_count: 0,
             parent,
             allocation_size: 0,
+            valid_data_length: 0,
             data: FileData::empty(),
             children: Vec::new(),
         }));
@@ -2394,6 +2439,7 @@ impl MemFs {
                             let node = self.node_mut(id).unwrap();
                             node.data = FileData::empty();
                             node.allocation_size = 0;
+                            node.valid_data_length = 0;
                         }
                         Ok((id, entry_id, FILE_OVERWRITTEN))
                     }
@@ -2402,6 +2448,7 @@ impl MemFs {
                             let node = self.node_mut(id).unwrap();
                             node.data = FileData::empty();
                             node.allocation_size = 0;
+                            node.valid_data_length = 0;
                         }
                         Ok((id, entry_id, FILE_SUPERSEDED))
                     }
@@ -2466,6 +2513,7 @@ impl MemFs {
                             let node = self.node_mut(id).unwrap();
                             node.data = FileData::empty();
                             node.allocation_size = 0;
+                            node.valid_data_length = 0;
                         }
                         Ok((id, entry_id, FILE_OVERWRITTEN))
                     }
@@ -2474,6 +2522,7 @@ impl MemFs {
                             let node = self.node_mut(id).unwrap();
                             node.data = FileData::empty();
                             node.allocation_size = 0;
+                            node.valid_data_length = 0;
                         }
                         Ok((id, entry_id, FILE_SUPERSEDED))
                     }
@@ -2559,6 +2608,11 @@ impl MemFs {
             change_time: node.change_time,
             allocation_size,
             end_of_file,
+            valid_data_length: if node.is_dir {
+                0
+            } else {
+                node.valid_data_length
+            },
             file_id: node.file_id,
             attributes: node.attributes,
             reparse_tag: 0,
@@ -2601,7 +2655,9 @@ impl MemFs {
         };
         let current = self.size(id) as usize;
         if length <= current {
-            self.node_mut(id).unwrap().data.truncate(length);
+            let node = self.node_mut(id).unwrap();
+            node.data.truncate(length);
+            node.valid_data_length = node.valid_data_length.min(length as u64);
             return STATUS_SUCCESS;
         }
         if !self.extend_with_zeroes(id, length - current) {
@@ -2631,9 +2687,28 @@ impl MemFs {
             return STATUS_INVALID_PARAMETER;
         };
         if self.size(id) as usize > allocation_len {
-            self.node_mut(id).unwrap().data.truncate(allocation_len);
+            let node = self.node_mut(id).unwrap();
+            node.data.truncate(allocation_len);
+            node.valid_data_length = node.valid_data_length.min(allocation_size);
         }
         self.node_mut(id).unwrap().allocation_size = allocation_size;
+        STATUS_SUCCESS
+    }
+
+    fn set_valid_data_length(&mut self, id: u64, requested: u64) -> u32 {
+        let Some(node) = self.node(id) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        if node.is_dir {
+            return STATUS_INVALID_DEVICE_REQUEST;
+        }
+        if requested > i64::MAX as u64
+            || requested < node.valid_data_length
+            || requested > node.data.len(&self.blobs) as u64
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+        self.node_mut(id).unwrap().valid_data_length = requested;
         STATUS_SUCCESS
     }
 
@@ -2641,6 +2716,13 @@ impl MemFs {
         let required = allocation_size_for_eof(self.size(id));
         if let Some(node) = self.node_mut(id) {
             node.allocation_size = node.allocation_size.max(required);
+        }
+    }
+
+    fn mark_data_initialized_through(&mut self, id: u64, end: u64) {
+        let end = end.min(self.size(id));
+        if let Some(node) = self.node_mut(id) {
+            node.valid_data_length = node.valid_data_length.max(end);
         }
     }
 
@@ -2862,6 +2944,7 @@ impl MemFs {
         };
         node.data = FileData::Extents(extents);
         node.allocation_size = allocation_size_for_eof(bytes.len() as u64);
+        node.valid_data_length = bytes.len() as u64;
         true
     }
 
@@ -2879,6 +2962,7 @@ impl MemFs {
             return false;
         };
         node.allocation_size = allocation_size_for_eof(bytes.len() as u64);
+        node.valid_data_length = bytes.len() as u64;
         node.data = FileData::Bytes(bytes);
         true
     }
@@ -3272,6 +3356,14 @@ pub struct FileShareAccess {
     shared_delete: bool,
 }
 
+/// Privileges captured from the create request's effective subject and retained by one File open
+/// description. Filesystems consume these CCB-like flags; they do not re-evaluate a possibly
+/// different thread token when a later information request arrives.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileOpenPrivileges {
+    pub manage_volume: bool,
+}
+
 impl FileShareAccess {
     pub(crate) const fn none() -> Self {
         Self {
@@ -3335,6 +3427,7 @@ struct FileObject {
     /// One share claim belongs to this open description. Duplicated handles only increase
     /// `references`; the claim is released when the final reference closes.
     share: FileShareAccess,
+    open_privileges: FileOpenPrivileges,
     /// Handles referring to this file object. `NtDuplicateObject` adds one, `ZwClose` removes one;
     /// the object (and any pending delete) is actioned when the last one goes.
     references: u32,
@@ -3365,6 +3458,7 @@ pub struct FileMetadata {
     pub change_time: u64,
     pub allocation_size: u64,
     pub end_of_file: u64,
+    pub valid_data_length: u64,
     pub file_id: u64,
     pub attributes: u32,
     pub reparse_tag: u32,
@@ -3595,6 +3689,7 @@ impl FileSystem {
             current_offset: 0,
             create_options: options,
             share,
+            open_privileges: FileOpenPrivileges::default(),
             references: 1,
             delete_pending: options & FILE_DELETE_ON_CLOSE != 0,
             query: DirectoryQueryState::new(),
@@ -3618,6 +3713,20 @@ impl FileSystem {
     /// Publish the kernel's current NT system time to the filesystem for subsequent mutations.
     pub fn set_current_time_100ns(&mut self, now: u64) {
         self.volume.set_current_time_100ns(now);
+    }
+
+    /// Complete the create path's security-context capture before the File object is published to
+    /// user mode. Duplicated handles retain these flags through their shared open description.
+    pub fn capture_open_privileges(
+        &mut self,
+        handle: u64,
+        privileges: FileOpenPrivileges,
+    ) -> u32 {
+        let Some(object) = self.obj_mut(handle) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        object.open_privileges = privileges;
+        STATUS_SUCCESS
     }
 
     /// Initialize a new volume and migrate pre-v3 snapshots whose format did not carry timestamps.
@@ -4032,6 +4141,7 @@ impl FileSystem {
             || metadata.reparse_tag != 0
             || metadata.attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
             || metadata.end_of_file != bytes.len() as u64
+            || metadata.valid_data_length > metadata.end_of_file
             || (metadata.allocation_size != 0 && metadata.allocation_size < metadata.end_of_file)
         {
             return Err(STATUS_INVALID_PARAMETER);
@@ -4062,6 +4172,7 @@ impl FileSystem {
         node.change_time = metadata.change_time;
         node.allocation_size =
             allocation_size_for_eof(metadata.allocation_size.max(metadata.end_of_file));
+        node.valid_data_length = metadata.valid_data_length;
         node.attributes = match metadata.attributes & FILE_ATTRIBUTE_SETTABLE {
             0 => FILE_ATTRIBUTE_NORMAL,
             attributes => attributes,
@@ -4209,6 +4320,8 @@ impl FileSystem {
         }
         if n != 0 {
             self.volume.ensure_allocation_covers_eof(node_id);
+            self.volume
+                .mark_data_initialized_through(node_id, offset + n as u64);
             self.volume.touch_write(node_id);
         }
         (STATUS_SUCCESS, n)
@@ -4233,6 +4346,7 @@ impl FileSystem {
         let end = self.volume.size(node_id);
         self.obj_mut(handle).unwrap().current_offset = end;
         self.volume.ensure_allocation_covers_eof(node_id);
+        self.volume.mark_data_initialized_through(node_id, end);
         self.volume.touch_write(node_id);
         (STATUS_SUCCESS, n)
     }
@@ -4265,6 +4379,8 @@ impl FileSystem {
             return (STATUS_INSUFFICIENT_RESOURCES, written);
         }
         self.volume.ensure_allocation_covers_eof(node_id);
+        self.volume
+            .mark_data_initialized_through(node_id, self.volume.size(node_id));
         self.volume.touch_write(node_id);
         (STATUS_SUCCESS, written)
     }
@@ -4481,6 +4597,22 @@ impl FileSystem {
                 }
                 let allocation_size = u64::from_le_bytes(data[0..8].try_into().unwrap());
                 let status = self.volume.set_allocation_size(node_id, allocation_size);
+                if status == STATUS_SUCCESS {
+                    self.volume.touch_write(node_id);
+                }
+                status
+            }
+            FILE_VALID_DATA_LENGTH_INFORMATION => {
+                if data.len() < 8 {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                if !self.obj(handle).unwrap().open_privileges.manage_volume {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                let valid_data_length = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                let status = self
+                    .volume
+                    .set_valid_data_length(node_id, valid_data_length);
                 if status == STATUS_SUCCESS {
                     self.volume.touch_write(node_id);
                 }

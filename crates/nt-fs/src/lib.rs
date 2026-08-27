@@ -27,7 +27,7 @@ pub use file_backing::FileBacking;
 pub use fs::{
     installed_file_open_action, parse_file_basic_information_attributes,
     parse_set_file_name_information, validate_file_create_parameters, CreateResult, FileMetadata,
-    FileRenameRoot, FileShareAccess, FileSystem, InstalledFileOpenAction, MemFs,
+    FileOpenPrivileges, FileRenameRoot, FileShareAccess, FileSystem, InstalledFileOpenAction, MemFs,
     MemFsBlobCompactError, MemFsBlobCompaction, MemFsSnapshotError, MemFsSnapshotInfo,
     SetFileNameInformation, StandardInformation, INVALID_HANDLE,
 };

@@ -14581,3 +14581,43 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     every byte is initialized. A writable short name needs a real MemFs alias namespace, collision
     policy, persistence, rename/link integration, and query support; do not derive an executive-side
     alias. Provider-backed Files must retain their FSD-owned set-information path throughout.
+
+    Valid-data-length ownership and create-time privilege capture (2026-08-27, accepted): MemFs
+    now owns `ValidDataLength` independently from allocation size and logical EOF. Ordinary writes
+    initialize through their completed range, including the zeroed gap before a noncontiguous
+    write; EOF growth retains the previous VDL; EOF or allocation truncation clamps it; overwrite,
+    supersede, provisioning, and installed-file copy-up establish the VDL appropriate to the bytes
+    actually supplied. FAT metadata reports its existing file contents as fully initialized.
+
+    The I/O Manager continues to enforce class 39's `FILE_WRITE_DATA` access contract. Matching
+    FastFAT's CCB boundary, the executive captures enabled `SeManageVolumePrivilege` from the
+    effective create subject before publishing an overlay File handle, and the filesystem retains
+    that flag on the shared open description. A later `FileValidDataLengthInformation` request does
+    not re-check a possibly different current token. Without the captured flag it fails with
+    `STATUS_INVALID_PARAMETER`; with it, VDL may only move forward and may never pass EOF. Negative
+    native `LARGE_INTEGER` values, backward movement, directories, and values beyond EOF fail
+    without mutation. Provider-backed Files retain their real FSD-owned set-information route.
+
+    Writable snapshot format version 5 persists VDL. The reader accepts versions 1 through 4 and
+    derives legacy VDL from EOF; both allocating and streaming readers reject VDL beyond EOF, and
+    both writers emit the same record layout. Tests exercise the privilege denial and capture,
+    monotonic range checks, write and truncate transitions, version-5 persistence, and explicit
+    version-1, version-3, and version-4 compatibility.
+
+    Focused validation passes `nt-fs` `95/95`; the freestanding executive remains at the established
+    211-warning baseline. The first serialized run painted the full desktop but missed the
+    workload-observational userinit `ScrollBar` query gate (`294/295`). The accepted rerun
+    `.tmp/run-headless-valid-data-length-rerun-20260827.log` exercised that query, launched genuine
+    userinit and Explorer, completed 668 Explorer api0 redirects with zero callback failures,
+    painted `480000/480000` framebuffer pixels with at least 32 colours, passed all `295/295` gates,
+    and matched the sentinel. The version-5 snapshot committed generation 5 at 1,752,142 bytes;
+    scratch returned to zero and the resource census reported no frame, mapping, registry, retype,
+    or allocator failures.
+
+    Review adjustment: `FileValidDataLengthInformation` is closed for the writable filesystem.
+    Continue with `FileShortNameInformation`, but keep alias policy entirely in MemFs: store an
+    optional alias on each directory entry, enforce case-insensitive long-name and alias collision
+    domains, update lookup/enumeration/query, preserve or remove aliases through rename, link, and
+    unlink, and persist them. Do not expose a generated executive-side alias. Installed FAT remains
+    read-only and already reports the exact physical 8.3 entry; provider-backed Files remain FSD
+    owned.

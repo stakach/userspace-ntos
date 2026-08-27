@@ -1809,7 +1809,7 @@ fn memfs_snapshot_rejects_corrupt_or_malformed_images() {
 }
 
 #[test]
-fn memfs_snapshot_v4_reader_accepts_v1_directory_records() {
+fn memfs_snapshot_v5_reader_accepts_v1_directory_records() {
     fn crc32c(bytes: &[u8]) -> u32 {
         let mut crc = 0xFFFF_FFFFu32;
         for &byte in bytes {
@@ -1851,7 +1851,7 @@ fn memfs_snapshot_v4_reader_accepts_v1_directory_records() {
 }
 
 #[test]
-fn memfs_snapshot_v4_reader_derives_allocation_for_v3_files() {
+fn memfs_snapshot_v5_reader_derives_sizes_for_v3_files() {
     fn crc32c(bytes: &[u8]) -> u32 {
         let mut crc = 0xFFFF_FFFFu32;
         for &byte in bytes {
@@ -1910,8 +1910,78 @@ fn memfs_snapshot_v4_reader_derives_allocation_for_v3_files() {
         .expect("v3 file restored");
     assert_eq!(metadata.end_of_file, 3);
     assert_eq!(metadata.allocation_size, 4096);
+    assert_eq!(metadata.valid_data_length, 3);
     assert_eq!(metadata.creation_time, 5);
     assert_eq!(fs.file_bytes_relative(b"legacy.bin"), Some(&b"old"[..]));
+}
+
+#[test]
+fn memfs_snapshot_v5_reader_derives_valid_data_length_for_v4_files() {
+    fn crc32c(bytes: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in bytes {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0x82F6_3B78
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    let mut payload = alloc::vec::Vec::new();
+    payload.push(1); // SNAP_REC_DIR root
+    payload.extend_from_slice(&FILE_ATTRIBUTE_DIRECTORY.to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&0u64.to_le_bytes());
+    for time in [1u64, 2, 3, 4] {
+        payload.extend_from_slice(&time.to_le_bytes());
+    }
+    payload.extend_from_slice(&0u64.to_le_bytes());
+    payload.extend_from_slice(&0u64.to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+
+    let path = b"version4.bin";
+    payload.push(2); // SNAP_REC_FILE
+    payload.extend_from_slice(&FILE_ATTRIBUTE_ARCHIVE.to_le_bytes());
+    payload.extend_from_slice(&(path.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&11u64.to_le_bytes());
+    for time in [5u64, 6, 7, 8] {
+        payload.extend_from_slice(&time.to_le_bytes());
+    }
+    payload.extend_from_slice(&4u64.to_le_bytes());
+    payload.extend_from_slice(&8192u64.to_le_bytes());
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(path);
+    payload.push(1); // SNAP_EXTENT_DATA
+    payload.extend_from_slice(&4u64.to_le_bytes());
+    payload.extend_from_slice(b"data");
+
+    let mut snapshot = alloc::vec![0u8; 32];
+    snapshot[0..8].copy_from_slice(b"USNTFS\0\x01");
+    snapshot[8..10].copy_from_slice(&32u16.to_le_bytes());
+    snapshot[10..12].copy_from_slice(&4u16.to_le_bytes());
+    snapshot[12..16].copy_from_slice(&2u32.to_le_bytes());
+    snapshot[16..24].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+    snapshot[24..28].copy_from_slice(&crc32c(&payload).to_le_bytes());
+    let header_crc = crc32c(&snapshot[..28]);
+    snapshot[28..32].copy_from_slice(&header_crc.to_le_bytes());
+    snapshot.extend_from_slice(&payload);
+
+    let fs = FileSystem::from_volume_snapshot(&snapshot).unwrap();
+    let metadata = fs
+        .query_metadata_relative(b"version4.bin")
+        .expect("v4 file restored");
+    assert_eq!(metadata.end_of_file, 4);
+    assert_eq!(metadata.allocation_size, 8192);
+    assert_eq!(metadata.valid_data_length, 4);
+    assert_eq!(
+        fs.file_bytes_relative(b"version4.bin"),
+        Some(&b"data"[..])
+    );
 }
 
 #[test]
@@ -3078,7 +3148,7 @@ fn writable_volume_hardlinks_share_nodes_and_retain_exact_entries() {
     );
 
     let snapshot = fs.export_volume_snapshot().unwrap();
-    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 4);
+    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 5);
     let mut restored = FileSystem::from_volume_snapshot(&snapshot).unwrap();
     assert!(!restored.initialize_timestamps(300));
     let restored_alias = restored.zw_create_file(
@@ -3157,7 +3227,7 @@ fn file_allocation_information_is_distinct_from_end_of_file_and_persists() {
     assert_eq!(preallocated.allocation_size, 16384);
 
     let snapshot = fs.export_volume_snapshot().unwrap();
-    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 4);
+    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 5);
     let mut restored = FileSystem::from_volume_snapshot(&snapshot).unwrap();
     let reopened = restored.zw_create_file(
         r"\??\C:\allocation\state.bin",
@@ -3213,6 +3283,112 @@ fn file_allocation_information_is_distinct_from_end_of_file_and_persists() {
         );
     }
     assert_eq!(restored.zw_query_metadata(reopened.handle).unwrap(), grown);
+}
+
+#[test]
+fn valid_data_length_is_privileged_monotonic_node_state_and_persists() {
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_directory(r"\??\C:\vdl"));
+    let file = fs.zw_create_file(
+        r"\??\C:\vdl\state.bin",
+        FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(file.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_write_file(file.handle, Some(0), &[0x5a; 100]),
+        (STATUS_SUCCESS, 100)
+    );
+    assert_eq!(
+        fs.zw_set_information_file(
+            file.handle,
+            FILE_END_OF_FILE_INFORMATION,
+            &200u64.to_le_bytes(),
+        ),
+        STATUS_SUCCESS
+    );
+    let grown = fs.zw_query_metadata(file.handle).unwrap();
+    assert_eq!(grown.end_of_file, 200);
+    assert_eq!(grown.valid_data_length, 100);
+
+    // FastFAT captures SeManageVolumePrivilege into the CCB during create. Merely holding
+    // FILE_WRITE_DATA is insufficient for an explicit VDL change.
+    assert_eq!(
+        fs.zw_set_information_file(
+            file.handle,
+            FILE_VALID_DATA_LENGTH_INFORMATION,
+            &150u64.to_le_bytes(),
+        ),
+        STATUS_INVALID_PARAMETER
+    );
+    assert_eq!(
+        fs.capture_open_privileges(
+            file.handle,
+            FileOpenPrivileges {
+                manage_volume: true,
+            },
+        ),
+        STATUS_SUCCESS
+    );
+    assert_eq!(
+        fs.zw_set_information_file(
+            file.handle,
+            FILE_VALID_DATA_LENGTH_INFORMATION,
+            &150u64.to_le_bytes(),
+        ),
+        STATUS_SUCCESS
+    );
+    for invalid in [149u64, 201, u64::MAX] {
+        assert_eq!(
+            fs.zw_set_information_file(
+                file.handle,
+                FILE_VALID_DATA_LENGTH_INFORMATION,
+                &invalid.to_le_bytes(),
+            ),
+            STATUS_INVALID_PARAMETER
+        );
+    }
+
+    let snapshot = fs.export_volume_snapshot().unwrap();
+    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 5);
+    let mut restored = FileSystem::from_volume_snapshot(&snapshot).unwrap();
+    let reopened = restored.zw_create_file(
+        r"\??\C:\vdl\state.bin",
+        FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    let persisted = restored.zw_query_metadata(reopened.handle).unwrap();
+    assert_eq!(persisted.end_of_file, 200);
+    assert_eq!(persisted.valid_data_length, 150);
+
+    assert_eq!(
+        restored.zw_set_information_file(
+            reopened.handle,
+            FILE_END_OF_FILE_INFORMATION,
+            &120u64.to_le_bytes(),
+        ),
+        STATUS_SUCCESS
+    );
+    assert_eq!(
+        restored
+            .zw_query_metadata(reopened.handle)
+            .unwrap()
+            .valid_data_length,
+        120
+    );
+    assert_eq!(
+        restored.zw_write_file(reopened.handle, Some(180), b"write"),
+        (STATUS_SUCCESS, 5)
+    );
+    let written = restored.zw_query_metadata(reopened.handle).unwrap();
+    assert_eq!(written.end_of_file, 185);
+    assert_eq!(written.valid_data_length, 185);
 }
 
 #[test]
@@ -3485,6 +3661,7 @@ fn installed_file_import_preserves_state_before_normal_open() {
         change_time: 44,
         allocation_size: 4096,
         end_of_file: 7,
+        valid_data_length: 7,
         file_id: 0x1234_5678,
         attributes: FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE,
         reparse_tag: 0,

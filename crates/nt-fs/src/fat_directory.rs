@@ -62,6 +62,7 @@ impl FatDirectoryRecord {
             change_time: self.entry.change_time,
             allocation_size: self.entry.allocation_size,
             end_of_file: self.entry.end_of_file,
+            valid_data_length: self.entry.end_of_file,
             file_id: self.entry.file_id,
             attributes,
             reparse_tag: 0,
