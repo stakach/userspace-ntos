@@ -15050,3 +15050,33 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     registration. `NtCreateThreadEx` is different: the pinned ReactOS target deliberately has only an
     11-argument compatibility arity row and no service-number row, so keep its real executive handler
     available to explicit compatibility tables without inventing an SSN in the hosted target ABI.
+
+    Native device-control registration (2026-08-27, accepted): `build_nt_table` again exposes the
+    existing real `NtDeviceIoControlFile` handler at canonical SSN 69. A focused contract test locks
+    the ten-argument ABI and service number; no numeric compatibility branch was added. The only
+    typed service absent from the hosted table is now the intentionally unnumbered
+    `NtCreateThreadEx` compatibility extension.
+
+    Validation passes `nt-syscall` `61/61`, `git diff --check`, the freestanding executive, and the
+    release build. Code checkpoint `160d4d53` is pushed. Serialized acceptance
+    `.tmp/run-headless-device-io-registration-20260827.log` reached quiescence at 105,694 ms,
+    launched genuine userinit and Explorer, completed 668 Explorer api0 redirects with zero callback
+    or dead-callback failures, preserved paint begin/end `5/20`, 187 direct GDI returns, and 135 batch
+    flushes covering 184 records, painted `480000/480000` framebuffer pixels with at least 32
+    colours, passed all `295/295` gates, and matched the sentinel. The workload did not issue SSN 69,
+    so this is a full non-regression gate rather than a live device-control exercise. Scratch returned
+    to zero and the resource census again reported no VM, untyped-allocation, frame-registration,
+    image-bank, or allocator failure.
+
+    Review adjustment: table convergence is complete for every numbered typed service. Keep
+    `NtCreateThreadEx` out of the pinned hosted table unless the target ABI gains a real export.
+    Select the next implementation from the 59 canonical ABI exports still absent from the typed
+    surface, prioritizing a general kernel trait with a ReactOS implementation and testable core
+    semantics over a boot-specific probe or compatibility result.
+
+    The next selected trait is `NtSuspendThread` (SSN 263). It closes the missing half of the real
+    ETHREAD/TCB resume plane: probe the optional previous-count output before changing state, require
+    `THREAD_SUSPEND_RESUME`, preserve nested suspend counts and `STATUS_SUSPEND_COUNT_EXCEEDED`, and
+    transition the seL4 TCB only on the first suspension. As part of this slice, remove the
+    executive's one-bit pool-thread suspended mask and make the `nt-process` ETHREAD suspend count
+    authoritative for create-suspended, suspend, resume, spawn, and cleanup paths.

@@ -3135,7 +3135,6 @@ impl ExecNtHandler {
         write_field!(temporary_process_slots, zeroed_temporary_process_slot_vec());
         write_field!(thread_mechanisms, ExecThreadMechanisms::reset());
         write_field!(pool_used, zeroed_process_slot_u64_vec());
-        write_field!(pool_suspended, zeroed_process_slot_u64_vec());
         write_field!(tp_worker_window_used, zeroed_process_slot_u64_vec());
         write_field!(thread_runtime, HostedThreadRuntimes::reset());
         write_field!(win32k_session, Win32kSessionRuntime::reset());
@@ -7829,43 +7828,6 @@ impl ExecNtHandler {
         true
     }
 
-    pub(crate) fn set_pool_thread_suspended(
-        &mut self,
-        pi: usize,
-        slot: usize,
-        suspended: bool,
-    ) -> bool {
-        let Some(bit) = Self::pool_slot_bit(slot) else {
-            return false;
-        };
-        let Some(mask) = self.pool_suspended.get_mut(pi) else {
-            return false;
-        };
-        if suspended {
-            *mask |= bit;
-        } else {
-            *mask &= !bit;
-        }
-        true
-    }
-
-    pub(crate) fn take_pool_thread_suspended(&mut self, pi: usize, slot: usize) -> Option<u32> {
-        let bit = Self::pool_slot_bit(slot)?;
-        let mask = self.pool_suspended.get_mut(pi)?;
-        let was_suspended = *mask & bit != 0;
-        *mask &= !bit;
-        Some(was_suspended as u32)
-    }
-
-    pub(crate) fn is_pool_thread_suspended(&self, pi: usize, slot: usize) -> bool {
-        let Some(bit) = Self::pool_slot_bit(slot) else {
-            return false;
-        };
-        self.pool_suspended
-            .get(pi)
-            .is_some_and(|mask| *mask & bit != 0)
-    }
-
     fn temporary_pid_for_pi(&self, pi: usize) -> Option<nt_process::ProcessId> {
         let pid = *self.temporary_process_slots.get(pi)?;
         (pid != 0).then_some(pid)
@@ -7936,7 +7898,6 @@ impl ExecNtHandler {
         }
         self.register_hosted_pool_thread_identity(pi, slot, tid)?;
         self.release_pool_usage_slot(pi, slot);
-        self.set_pool_thread_suspended(pi, slot, false);
         Ok(())
     }
 
@@ -7950,7 +7911,6 @@ impl ExecNtHandler {
         }
         let _ = self.thread_mechanisms.release_pool(pi, slot);
         self.release_pool_usage_slot(pi, slot);
-        self.set_pool_thread_suspended(pi, slot, false);
     }
 
     pub(crate) fn register_hosted_thread_tcb(
@@ -8787,14 +8747,6 @@ impl ExecNtHandler {
         USER_STACK_VAD_RELEASES.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn hosted_thread_runtime_for_nt_resume_thread(&self, tid: u64) -> Option<HostedThreadRuntime> {
-        let runtime = self.thread_runtime.get_by_tid(tid)?;
-        runtime
-            .role
-            .can_raw_resume_from_nt_resume_thread()
-            .then_some(runtime)
-    }
-
     pub(crate) fn hosted_main_thread_tcb_for_pi(&self, pi: usize) -> Option<u64> {
         self.thread_runtime.tcb_for_main_pi(pi)
     }
@@ -8995,7 +8947,6 @@ impl ExecNtHandler {
             .pm
             .set_thread_state(thread, nt_process::ThreadState::Initialized);
         self.release_pool_usage_slot(self.pi, pool_slot);
-        self.set_pool_thread_suspended(self.pi, pool_slot, false);
     }
 
     fn abandon_created_hosted_thread_for(
@@ -9013,7 +8964,6 @@ impl ExecNtHandler {
             .pm
             .set_thread_state(thread, nt_process::ThreadState::Initialized);
         self.release_pool_usage_slot(owner_pi, pool_slot);
-        self.set_pool_thread_suspended(owner_pi, pool_slot, false);
     }
 
     fn reserve_created_hosted_thread_role(
@@ -13296,15 +13246,6 @@ impl ExecNtHandler {
                 reject!(b"handle-insert", status);
             }
         };
-        if !self.set_pool_thread_suspended(target_pi, pool_slot, create_suspended) {
-            self.release_unmapped_hosted_tp_worker_slot(target_pi, slot, tid);
-            let _ = self.close_process_handle(caller_pid, handle);
-            let _ = self
-                .pm
-                .set_thread_state(thread, nt_process::ThreadState::Initialized);
-            self.release_pool_usage_slot(target_pi, pool_slot);
-            reject!(b"suspend-state", STATUS_INSUFFICIENT_RESOURCES);
-        }
         if let Some(initial_teb) = initial_teb {
             let _ = self.remember_hosted_thread_user_stack(tid, initial_teb);
         }
@@ -13377,13 +13318,10 @@ impl ExecNtHandler {
                     .pm
                     .set_thread_state(thread, nt_process::ThreadState::Initialized);
                 self.release_pool_usage_slot(owner_pi, pool_slot);
-                self.set_pool_thread_suspended(owner_pi, pool_slot, false);
                 return Err(status);
             }
         };
-        if !self.set_pool_thread_suspended(owner_pi, pool_slot, create_suspended)
-            || !self.reserve_hosted_tp_worker_slot(owner_pi, worker_slot, tid)
-        {
+        if !self.reserve_hosted_tp_worker_slot(owner_pi, worker_slot, tid) {
             self.abandon_created_hosted_thread_for(owner_pi, pool_slot, tid, caller_pid, handle);
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
@@ -13630,14 +13568,6 @@ impl ExecNtHandler {
         let _ = self
             .pm
             .set_thread_create_time(t, nt_system_time_100ns() as i64);
-        if !self.set_pool_thread_suspended(self.pi, slot, create_suspended) {
-            let _ = self.close_process_handle(pid, h as u64);
-            let _ = self
-                .pm
-                .set_thread_state(t, nt_process::ThreadState::Initialized);
-            self.release_pool_usage_slot(self.pi, slot);
-            return None;
-        }
         let _ = self.pm.report_existing_thread_create(t);
         PM_GENERAL_THREADS_CREATED.fetch_add(1, Ordering::Relaxed);
         Some((slot, tid, h as u64))
@@ -15259,6 +15189,27 @@ impl ExecNtHandler {
         Ok((pid, pi))
     }
 
+    fn resolve_hosted_thread_for_control(
+        &self,
+        handle: u64,
+    ) -> Result<(nt_process::ThreadId, nt_user_host::ThreadMechanism), u32> {
+        const THREAD_SUSPEND_RESUME: u32 = 0x0002;
+
+        let caller_pid = self
+            .pm_pid_for_pi(self.pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let tid = self.pm.resolve_thread_handle(
+            caller_pid,
+            self.current_tid as nt_process::ThreadId,
+            handle,
+            THREAD_SUSPEND_RESUME,
+        )?;
+        let mechanism = self
+            .hosted_thread_mechanism_for_tid(tid as u64)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        Ok((tid, mechanism))
+    }
+
     unsafe fn user_memory_read(&self, memory: SyscallUserMemory, va: u64, dst: &mut [u8]) -> bool {
         match memory {
             SyscallUserMemory::CurrentProcess => self.xas_read(va, dst),
@@ -15290,12 +15241,17 @@ impl ExecNtHandler {
         args: &[u64],
         memory: SyscallUserMemory,
     ) -> u32 {
-        const THREAD_SUSPEND_RESUME: u32 = 0x0002;
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
         const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
 
         let thread_handle = args[0];
         let previous_count = args[1];
+        if previous_count != 0 && previous_count & 3 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        if previous_count != 0 && !self.user_memory_probe_output(memory, previous_count, 4) {
+            return STATUS_ACCESS_VIOLATION;
+        }
         print_str(b"[thread-life] NtResumeThread pi=");
         print_u64(self.pi as u64);
         print_str(b" handle=0x");
@@ -15305,20 +15261,8 @@ impl ExecNtHandler {
         print_hex(previous_count as u32);
         print_str(b"\n");
 
-        let caller_pid = match self.pm_pid_for_pi(self.pi) {
-            Some(pid) => pid,
-            None => {
-                print_str(b"[thread-life] resume failed: caller has no EPROCESS\n");
-                return nt_process::STATUS_INVALID_HANDLE;
-            }
-        };
-        let tid = match self.pm.resolve_thread_handle(
-            caller_pid,
-            self.current_tid as nt_process::ThreadId,
-            thread_handle,
-            THREAD_SUSPEND_RESUME,
-        ) {
-            Ok(tid) => tid as u64,
+        let (tid, mechanism) = match self.resolve_hosted_thread_for_control(thread_handle) {
+            Ok((tid, mechanism)) => (tid as u64, mechanism),
             Err(status) => {
                 print_str(b"[thread-life] resume failed: handle resolution status=0x");
                 print_hex(status);
@@ -15326,51 +15270,11 @@ impl ExecNtHandler {
                 return status;
             }
         };
-        let Some(mechanism) = self.hosted_thread_mechanism_for_tid(tid) else {
-            return nt_process::STATUS_INVALID_HANDLE;
+        let previous = match self.pm.resume_thread(tid as nt_process::ThreadId) {
+            Ok(previous) => previous,
+            Err(status) => return status,
         };
-        let (pi, slot) = match mechanism.kind {
-            nt_user_host::ThreadMechanismKind::Main => {
-                let main_pi = mechanism.pi;
-                let previous = match self.pm.resume_thread(tid as nt_process::ThreadId) {
-                    Ok(previous) => previous,
-                    Err(status) => return status,
-                };
-                print_str(b"[thread-life] resume main tid=");
-                print_u64(tid);
-                print_str(b" pi=");
-                print_u64(main_pi as u64);
-                print_str(b" previous=");
-                print_u64(previous as u64);
-                print_str(b"\n");
-                if previous_count != 0
-                    && !self.user_memory_write(memory, previous_count, &previous.to_le_bytes())
-                {
-                    return STATUS_ACCESS_VIOLATION;
-                }
-                if previous == 1 {
-                    let tcb = self.hosted_main_thread_tcb_for_pi(main_pi).unwrap_or(0);
-                    if tcb <= 1 || tcb_resume(tcb) != 0 {
-                        return STATUS_UNSUCCESSFUL;
-                    }
-                }
-                return 0;
-            }
-            nt_user_host::ThreadMechanismKind::Pool { slot } => (mechanism.pi, slot),
-        };
-
-        let Some(previous) = self.take_pool_thread_suspended(pi, slot) else {
-            return nt_process::STATUS_INVALID_PARAMETER;
-        };
-        if previous_count != 0
-            && !self.user_memory_write(memory, previous_count, &(previous as u32).to_le_bytes())
-        {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        if previous != 0 {
-            let _ = self
-                .pm
-                .set_thread_state(tid as nt_process::ThreadId, nt_process::ThreadState::Ready);
+        if previous == 1 {
             let csr_role = match self.hosted_thread_role(tid) {
                 Some(HostedThreadRole::CsrApi) => 1,
                 Some(HostedThreadRole::CsrSbApi) => 2,
@@ -15378,47 +15282,70 @@ impl ExecNtHandler {
             };
             if csr_role != 0 {
                 self.csr_start_request = csr_role;
-                print_str(b"[csr-thread] resume scheduled role=");
-                print_u64(csr_role as u64);
-                print_str(b" tid=");
-                print_u64(tid);
-                print_str(b" previous=1\n");
-                return 0;
+            } else {
+                let tcb = self.hosted_thread_tcb(tid).unwrap_or(0);
+                if tcb <= 1 || tcb_resume(tcb) != 0 {
+                    let _ = self.pm.suspend_thread(tid as nt_process::ThreadId);
+                    return STATUS_UNSUCCESSFUL;
+                }
             }
-            // `slot` is the process-manager pool slot. Generic TP workers also have a hosted
-            // window slot, and the TCB belongs to that hosted role rather than the PM slot index.
-            let Some(runtime) = self.hosted_thread_runtime_for_nt_resume_thread(tid) else {
-                return STATUS_UNSUCCESSFUL;
-            };
-            let tcb = runtime.tcb;
-            if tcb <= 1 {
+        }
+        print_str(b"[thread-life] resume tid=");
+        print_u64(tid);
+        print_str(b" pi=");
+        print_u64(mechanism.pi as u64);
+        print_str(b" previous=");
+        print_u64(previous as u64);
+        print_str(b"\n");
+        if previous_count != 0
+            && !self.user_memory_write(memory, previous_count, &previous.to_le_bytes())
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        0
+    }
+
+    pub(crate) unsafe fn nt_suspend_thread_with_user_memory(
+        &mut self,
+        args: &[u64],
+        memory: SyscallUserMemory,
+    ) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+
+        let previous_count = args[1];
+        if previous_count != 0 && previous_count & 3 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        if previous_count != 0 && !self.user_memory_probe_output(memory, previous_count, 4) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let (tid, mechanism) = match self.resolve_hosted_thread_for_control(args[0]) {
+            Ok((tid, mechanism)) => (tid as u64, mechanism),
+            Err(status) => return status,
+        };
+        let previous = match self.pm.suspend_thread(tid as nt_process::ThreadId) {
+            Ok(previous) => previous,
+            Err(status) => return status,
+        };
+        if previous == 0 {
+            let tcb = self.hosted_thread_tcb(tid).unwrap_or(0);
+            if tcb <= 1 || tcb_suspend_r(tcb) != 0 {
+                let _ = self.pm.resume_thread(tid as nt_process::ThreadId);
                 return STATUS_UNSUCCESSFUL;
             }
-            let hosted_slot =
-                runtime
-                    .role
-                    .worker_window_slot()
-                    .unwrap_or_else(|| match runtime.role {
-                        HostedThreadRole::WinlogonWorker { slot } => slot,
-                        _ => slot,
-                    });
-            let result = tcb_resume(tcb);
-            print_str(b"[thread-life] resume pi=");
-            print_u64(runtime.pi as u64);
-            print_str(b" slot=");
-            print_u64(hosted_slot as u64);
-            print_str(b" pool_slot=");
-            print_u64(slot as u64);
-            print_str(b" tid=");
-            print_u64(tid);
-            print_str(b" tcb=0x");
-            print_hex(tcb as u32);
-            print_str(b" previous=1 result=");
-            print_u64(result);
-            print_str(b"\n");
-            if result != 0 {
-                return STATUS_UNSUCCESSFUL;
-            }
+        }
+        print_str(b"[thread-life] suspend tid=");
+        print_u64(tid);
+        print_str(b" pi=");
+        print_u64(mechanism.pi as u64);
+        print_str(b" previous=");
+        print_u64(previous as u64);
+        print_str(b"\n");
+        if previous_count != 0
+            && !self.user_memory_write(memory, previous_count, &previous.to_le_bytes())
+        {
+            return STATUS_ACCESS_VIOLATION;
         }
         0
     }
@@ -29975,6 +29902,9 @@ impl ExecNtHandler {
             NativeService::NtAccessCheck => unsafe { self.nt_access_check(ctx, args) },
             NativeService::NtResumeThread => unsafe {
                 self.nt_resume_thread_with_user_memory(args, SyscallUserMemory::CurrentProcess)
+            },
+            NativeService::NtSuspendThread => unsafe {
+                self.nt_suspend_thread_with_user_memory(args, SyscallUserMemory::CurrentProcess)
             },
             // NtMakeTemporaryObject(ObjectHandle): reference the object with DELETE access, clear
             // OBJ_PERMANENT, and run the normal name-delete check.

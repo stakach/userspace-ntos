@@ -20642,8 +20642,9 @@ unsafe fn print_quiesce_addr(
 #[inline]
 fn hosted_thread_suspended(nt_handler: &ExecNtHandler, tid: u64) -> bool {
     nt_handler
-        .pm_pool_slot_for_tid(tid)
-        .is_some_and(|(pi, slot)| nt_handler.is_pool_thread_suspended(pi, slot))
+        .pm
+        .thread(tid as nt_process::ThreadId)
+        .is_some_and(|thread| thread.suspend_count != 0)
 }
 
 #[inline]
@@ -20922,11 +20923,7 @@ unsafe fn spawn_requested_tp_worker(
         .hosted_thread_role_for_badge(badge)
         .unwrap_or(HostedThreadRole::TpWorker { slot: worker_slot });
     let cid_proc = nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64;
-    let suspended = nt_handler
-        .pm_pool_slot_for_tid(tid)
-        .is_some_and(|(pool_pi, slot)| {
-            pool_pi == pi && nt_handler.is_pool_thread_suspended(pool_pi, slot)
-        });
+    let suspended = hosted_thread_suspended(nt_handler, tid);
     let rpc_worker = role.is_scm_rpc_worker() || role.is_lsa_rpc_worker();
     let spawned = spawn_tp_worker_thread(
         pi,
@@ -20946,7 +20943,6 @@ unsafe fn spawn_requested_tp_worker(
                 nt_process::ThreadState::Initialized,
             );
             let _ = nt_handler.release_pool_usage_slot(pool_pi, pool_slot);
-            let _ = nt_handler.set_pool_thread_suspended(pool_pi, pool_slot, false);
         }
         return;
     }
@@ -20958,7 +20954,6 @@ unsafe fn spawn_requested_tp_worker(
                 nt_process::ThreadState::Initialized,
             );
             let _ = nt_handler.release_pool_usage_slot(pool_pi, pool_slot);
-            let _ = nt_handler.set_pool_thread_suspended(pool_pi, pool_slot, false);
         }
         return;
     }

@@ -109,6 +109,21 @@ fn nested_thread_suspend_resume_tracks_previous_count() {
     assert_eq!(pm.resume_thread(tid), Ok(1));
     assert_eq!(pm.thread(tid).unwrap().state, ThreadState::Ready);
     assert_eq!(pm.resume_thread(tid), Ok(0));
+
+    pm.suspend_thread(tid).unwrap();
+    pm.set_thread_state(tid, ThreadState::Initialized).unwrap();
+    assert_eq!(pm.thread(tid).unwrap().suspend_count, 0);
+}
+
+#[test]
+fn thread_suspend_count_overflow_is_reported_without_mutation() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("overflow.exe", None, None);
+    let tid = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+    pm.threads.get_mut(&tid).unwrap().suspend_count = u32::MAX;
+
+    assert_eq!(pm.suspend_thread(tid), Err(STATUS_SUSPEND_COUNT_EXCEEDED));
+    assert_eq!(pm.thread(tid).unwrap().suspend_count, u32::MAX);
 }
 
 #[test]

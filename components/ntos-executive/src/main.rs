@@ -1218,6 +1218,8 @@ pub const SSN_NT_OPEN_EVENT_PAIR: u64 = 121;
 /// model per-process suspend counts yet; the handler validates process handles, then returns success.
 pub const SSN_NT_RESUME_PROCESS: u64 = 213;
 pub const SSN_NT_SUSPEND_PROCESS: u64 = 262;
+/// Thread suspend is backed by the ETHREAD count and the hosted TCB transition.
+pub const SSN_NT_SUSPEND_THREAD: u64 = 263;
 /// Power manager and UUID cache imports. Power transitions require a future policy/hardware plane;
 /// UUID seed probes the caller buffer but no kernel UUID allocator currently reads the cached value.
 pub const SSN_NT_SET_SYSTEM_POWER_STATE: u64 = 250;
@@ -17456,7 +17458,6 @@ unsafe fn terminate_hosted_thread_mechanism(
         let runtime = handler.release_hosted_thread_runtime(tid);
         if let Some((pi, slot)) = pool_slot {
             let _ = handler.release_pool_usage_slot(pi, slot);
-            let _ = handler.set_pool_thread_suspended(pi, slot, false);
         }
         if let Some(runtime) = runtime {
             handler.release_hosted_thread_user_stack_vad(runtime);
@@ -21799,8 +21800,6 @@ struct ExecNtHandler {
     thread_mechanisms: ExecThreadMechanisms,
     /// Runtime occupancy mask for the pre-created ETHREAD pool of each hosted process.
     pool_used: alloc::vec::Vec<u64>,
-    /// Runtime suspended-on-create mask for claimed pool ETHREADs.
-    pool_suspended: alloc::vec::Vec<u64>,
     /// Hosted worker stack/TEB VA windows consumed in each process VSpace. Thread teardown releases
     /// the mapped frames/caps and clears the slot, so a later ETHREAD can reuse the same mechanism
     /// lane with fresh stack/TEB/IPCBUF/trampoline frames.
@@ -22833,10 +22832,6 @@ impl HostedThreadRole {
     const fn is_lsa_rpc_worker(self) -> bool {
         matches!(self.rpc_worker_kind(), Some(HostedRpcWorkerKind::Lsa))
     }
-
-    const fn can_raw_resume_from_nt_resume_thread(self) -> bool {
-        true
-    }
 }
 
 const fn hosted_thread_runtime_gate_bit(pi: usize, role: HostedThreadRole) -> u64 {
@@ -23687,6 +23682,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtQuerySecurityObject, 176),
             (NativeService::NtSetSecurityObject, 246),
             (NativeService::NtResumeThread, 214),
+            (NativeService::NtSuspendThread, SSN_NT_SUSPEND_THREAD as u32),
             (NativeService::NtSetInformationObject, 236),
             // Workstream A batch 3 (group B1): query + object-namespace services.
             (

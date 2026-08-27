@@ -2426,6 +2426,9 @@ impl ProcessManager {
             return Err(STATUS_INVALID_PARAMETER);
         }
         t.state = state;
+        if state == ThreadState::Initialized {
+            t.suspend_count = 0;
+        }
         if state == ThreadState::Terminated {
             t.user_apc_queue.clear();
         }

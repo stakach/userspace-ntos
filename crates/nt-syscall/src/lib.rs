@@ -219,6 +219,7 @@ pub enum NativeService {
     NtQuerySecurityObject,
     NtSetSecurityObject,
     NtResumeThread,
+    NtSuspendThread,
     NtSetInformationObject,
     NtSetUuidSeed,
     // Group B: query + object-namespace services (executive out-writes / obj_ns lookups).
@@ -400,6 +401,7 @@ impl NativeService {
             NtQuerySecurityObject => "NtQuerySecurityObject",
             NtSetSecurityObject => "NtSetSecurityObject",
             NtResumeThread => "NtResumeThread",
+            NtSuspendThread => "NtSuspendThread",
             NtSetInformationObject => "NtSetInformationObject",
             NtSetUuidSeed => "NtSetUuidSeed",
             NtQueryVirtualMemory => "NtQueryVirtualMemory",
@@ -523,6 +525,7 @@ impl NativeService {
         NativeService::NtQuerySecurityObject,
         NativeService::NtSetSecurityObject,
         NativeService::NtResumeThread,
+        NativeService::NtSuspendThread,
         NativeService::NtSetInformationObject,
         NativeService::NtSetUuidSeed,
         NativeService::NtQueryVirtualMemory,

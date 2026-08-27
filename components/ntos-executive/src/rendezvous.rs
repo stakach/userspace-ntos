@@ -211,20 +211,11 @@ unsafe fn csr_api_worker_create_thread(
                 return Err(status);
             }
         };
-        if !nt_handler.set_pool_thread_suspended(target_pi, pool_slot, create_suspended) {
-            let _ = nt_handler.close_process_handle(caller_pid, handle);
-            let _ = nt_handler
-                .pm
-                .set_thread_state(tid_id, nt_process::ThreadState::Initialized);
-            nt_handler.release_pool_usage_slot(target_pi, pool_slot);
-            return Err(STATUS_INSUFFICIENT_RESOURCES);
-        }
         if !nt_handler.reserve_hosted_tp_worker_slot(target_pi, worker_slot, tid) {
             let _ = nt_handler.close_process_handle(caller_pid, handle);
             let _ = nt_handler
                 .pm
                 .set_thread_state(tid_id, nt_process::ThreadState::Initialized);
-            nt_handler.set_pool_thread_suspended(target_pi, pool_slot, false);
             nt_handler.release_pool_usage_slot(target_pi, pool_slot);
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
@@ -247,7 +238,6 @@ unsafe fn csr_api_worker_create_thread(
             let _ = nt_handler
                 .pm
                 .set_thread_state(tid_id, nt_process::ThreadState::Initialized);
-            nt_handler.set_pool_thread_suspended(target_pi, pool_slot, false);
             nt_handler.release_pool_usage_slot(target_pi, pool_slot);
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
@@ -1525,6 +1515,7 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
     const SSN_QUERY_OBJECT: u64 = 170;
     const SSN_SET_INFO_OBJECT: u64 = 236;
     const SSN_RESUME_THREAD: u64 = 214;
+    const SSN_SUSPEND_THREAD: u64 = 263;
     const SSN_DUPLICATE_OBJECT: u64 = 71;
     const DUPLICATE_CLOSE_SOURCE: u32 = 1;
     const DUPLICATE_SAME_ACCESS: u32 = 2;
@@ -1910,6 +1901,24 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                         nt_handler.pi = saved_pi;
                         nt_handler.current_tid = saved_tid;
                         print_str(b"[csr-api] serviced worker NtResumeThread status=0x");
+                        print_hex(status);
+                        print_str(b"\n");
+                        result = status as u64;
+                    }
+                    SSN_SUSPEND_THREAD => {
+                        let suspend_args = [get_recv_mr(9), rdx];
+                        let saved_pi = nt_handler.pi;
+                        let saved_tid = nt_handler.current_tid;
+                        nt_handler.pi = 1;
+                        nt_handler.current_tid =
+                            hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
+                        let status = nt_handler.nt_suspend_thread_with_user_memory(
+                            &suspend_args,
+                            SyscallUserMemory::CsrThreadStack { sb: false },
+                        );
+                        nt_handler.pi = saved_pi;
+                        nt_handler.current_tid = saved_tid;
+                        print_str(b"[csr-api] serviced worker NtSuspendThread status=0x");
                         print_hex(status);
                         print_str(b"\n");
                         result = status as u64;
@@ -3435,6 +3444,7 @@ unsafe fn csr_sb_api_request_rendezvous(
     const SSN_QUERY_OBJECT: u64 = 170;
     const SSN_SET_INFO_OBJECT: u64 = 236;
     const SSN_RESUME_THREAD: u64 = 214;
+    const SSN_SUSPEND_THREAD: u64 = 263;
     const SSN_REPLY_WAIT_RECV: u64 = 203;
     const SSN_CLOSE: u64 = 27;
 
@@ -3703,6 +3713,24 @@ unsafe fn csr_sb_api_request_rendezvous(
                         nt_handler.pi = saved_pi;
                         nt_handler.current_tid = saved_tid;
                         print_str(b"[csr-sb-api] serviced worker NtResumeThread status=0x");
+                        print_hex(status);
+                        print_str(b"\n");
+                        result = status as u64;
+                    }
+                    SSN_SUSPEND_THREAD => {
+                        let suspend_args = [get_recv_mr(9), rdx];
+                        let saved_pi = nt_handler.pi;
+                        let saved_tid = nt_handler.current_tid;
+                        nt_handler.pi = 1;
+                        nt_handler.current_tid =
+                            hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrSbApi);
+                        let status = nt_handler.nt_suspend_thread_with_user_memory(
+                            &suspend_args,
+                            SyscallUserMemory::CsrThreadStack { sb: true },
+                        );
+                        nt_handler.pi = saved_pi;
+                        nt_handler.current_tid = saved_tid;
+                        print_str(b"[csr-sb-api] serviced worker NtSuspendThread status=0x");
                         print_hex(status);
                         print_str(b"\n");
                         result = status as u64;

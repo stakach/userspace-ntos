@@ -613,6 +613,7 @@ fn group_a_services_register_with_exact_bounds() {
         (NativeService::NtFreeVirtualMemory, 87),
         (NativeService::NtQuerySecurityObject, 176),
         (NativeService::NtResumeThread, 214),
+        (NativeService::NtSuspendThread, 263),
         (NativeService::NtSetInformationObject, 236),
         (NativeService::NtSetSecurityObject, 246),
     ];
