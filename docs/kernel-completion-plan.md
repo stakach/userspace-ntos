@@ -14861,3 +14861,51 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     cancellation, and cleanup in the filesystem owner. Provider-backed directories must receive
     real `IRP_MJ_DIRECTORY_CONTROL`/`IRP_MN_NOTIFY_CHANGE_DIRECTORY` requests; the executive must
     not poll directories, infer changes from syscall names, or synthesize successful notifications.
+
+    Native directory-change notification boundary (2026-08-27, accepted):
+    `NtNotifyChangeDirectoryFile` now uses its canonical ReactOS NT5 service number, nine-argument
+    ntdll trap stub, Zw alias, executive registration, and native dispatch. The I/O Manager owns
+    File-handle access validation, event reset, IOSB/APC/completion-port publication, output-buffer
+    retention, alertable cancellation, and typed notify parameters. Provider-backed directories
+    issue genuine `IRP_MJ_DIRECTORY_CONTROL`/`IRP_MN_NOTIFY_CHANGE_DIRECTORY` requests with
+    `SL_WATCH_TREE`; the hosted receiver reconstructs the native WDM DirectoryControl union rather
+    than routing the request through an executive directory poll.
+
+    FAT and the writable MemFs namespace own notification registration, filter matching, direct
+    versus subtree scope, `FILE_NOTIFY_INFORMATION` encoding, paired old/new rename actions,
+    record alignment, caller-buffer overflow, cancellation, and cleanup. Namespace mutations wake
+    only matching registrations, and a pending registration remains an actual filesystem operation
+    until a mutation, cancellation, or owner cleanup produces its terminal result. No syscall-name
+    inference, timer polling, empty successful record, or provider-success fallback remains.
+
+    The local File object boundary is now waitable as well as cancellable. FAT directories,
+    read-only FAT Files, and writable-overlay Files keep signal state on the shared open description
+    used by duplicated handles. Pending local notify and byte-lock operations retain a separate I/O
+    reference across last-handle cleanup, clear the File signal while outstanding, publish terminal
+    state through the native event policy, and release the retained object only after IOSB, event,
+    APC, and completion-port surfaces have been published. Typed local wait identities replace the
+    old assumption that only provider-backed File objects can be waited on.
+
+    Focused validation passes `nt-fs` `119/119`, `nt-io-manager` `236/236`, `nt-io-abi` `12/12`,
+    `nt-syscall-abi` `19/19`, `nt-syscall` `58/58`, and `nt-ntdll` `709/709`. The freestanding
+    executive compiles at the established 211-warning baseline, the release executive build
+    succeeds, and the DLL gate sees all 222 Nt stubs, all 222 Zw aliases, 2,766 valid relocation
+    fixups, and complete imports for the boot-critical ReactOS images. Code checkpoints `8ad3b7be`,
+    `81fa09b3`, and `b0007bf3` are pushed.
+
+    Serialized acceptance `.tmp/run-headless-directory-notify-waits-20260827.log` reached
+    quiescence at 105,962 ms, launched genuine userinit and Explorer, completed 668 Explorer api0
+    redirects with zero callback or dead-callback failures, recorded paint begin/end `5/20`, 187
+    direct GDI returns, and 135 batch flushes covering 184 records, painted `480000/480000`
+    framebuffer pixels with at least 32 colours, passed all `295/295` gates, and matched the
+    sentinel. Snapshot generation 5 committed the version-6 payload at 1,755,492 bytes; scratch
+    returned to zero and the resource census reported no page-table, frame, mapping, alias,
+    registry, untyped-allocation, frame-registration, or allocator failures.
+
+    Review adjustment: native directory-change capture, filesystem ownership, provider dispatch,
+    cancellation, File waitability, and completion lifetime are closed. Before selecting another
+    native service, generalize the same local FILE_OBJECT signal and retained-reference discipline
+    across every asynchronous local read, write, and directory-query path, then make outstanding
+    waits retain the referenced dispatcher object until removal. This is object-lifetime work, not
+    an executive compatibility path. After that audit the remaining exported ntdll native services
+    against executive registration and choose the next absent kernel trait from the actual gap list.
