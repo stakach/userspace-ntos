@@ -4143,3 +4143,130 @@ fn provisioned_file_extend_reads_zeroes_and_materializes_on_write() {
     assert_eq!(status, STATUS_SUCCESS);
     assert_eq!(&bytes, b"evt\0\0xy\0");
 }
+
+fn notify_names(bytes: &[u8]) -> alloc::vec::Vec<(u32, alloc::string::String)> {
+    let mut names = alloc::vec::Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let next = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let action = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+        let length =
+            u32::from_le_bytes(bytes[offset + 8..offset + 12].try_into().unwrap()) as usize;
+        let units = bytes[offset + 12..offset + 12 + length]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<alloc::vec::Vec<_>>();
+        names.push((action, alloc::string::String::from_utf16(&units).unwrap()));
+        if next == 0 {
+            return names;
+        }
+        offset += next;
+    }
+}
+
+#[test]
+fn writable_filesystem_reports_real_mutations_and_cleanup() {
+    let mut fs = FileSystem::new(MemFs::with_fixture());
+    let directory = fs.zw_create_file(
+        r"\??\C:\Temp",
+        FILE_LIST_DIRECTORY | SYNCHRONIZE,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+    );
+    assert_eq!(directory.status, STATUS_SUCCESS);
+    let notify = fs
+        .zw_notify_change_directory_file(
+            directory.handle,
+            FILE_NOTIFY_CHANGE_FILE_NAME,
+            false,
+            256,
+            99,
+        )
+        .unwrap();
+
+    let file = fs.zw_create_file(
+        r"\??\C:\Temp\created.txt",
+        FILE_WRITE_DATA | DELETE,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_CREATE,
+        0,
+    );
+    assert_eq!(file.status, STATUS_SUCCESS);
+    let completion = fs.pop_directory_notify_completion().unwrap();
+    assert_eq!(completion.id, notify);
+    assert_eq!(completion.context, 99);
+    assert_eq!(completion.status, STATUS_SUCCESS);
+    assert_eq!(
+        notify_names(&completion.bytes),
+        alloc::vec![(FILE_ACTION_ADDED, "created.txt".into())]
+    );
+
+    let cleanup = fs
+        .zw_notify_change_directory_file(
+            directory.handle,
+            FILE_NOTIFY_CHANGE_FILE_NAME,
+            false,
+            256,
+            100,
+        )
+        .unwrap();
+    assert_eq!(fs.zw_close(directory.handle), STATUS_SUCCESS);
+    let completion = fs.pop_directory_notify_completion().unwrap();
+    assert_eq!(completion.id, cleanup);
+    assert_eq!(completion.status, STATUS_NOTIFY_CLEANUP);
+    assert_eq!(completion.information, 0);
+}
+
+#[test]
+fn writable_filesystem_batches_rename_old_and_new_names() {
+    let mut fs = FileSystem::new(MemFs::with_fixture());
+    let directory = fs.zw_create_file(
+        r"\??\C:\Temp",
+        FILE_LIST_DIRECTORY,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE,
+    );
+    let file = fs.zw_create_file(
+        r"\??\C:\Temp\before.txt",
+        DELETE,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_CREATE,
+        0,
+    );
+    assert_eq!(directory.status, STATUS_SUCCESS);
+    assert_eq!(file.status, STATUS_SUCCESS);
+    fs.zw_notify_change_directory_file(
+        directory.handle,
+        FILE_NOTIFY_CHANGE_FILE_NAME,
+        false,
+        256,
+        1,
+    )
+    .unwrap();
+    assert_eq!(
+        fs.zw_rename_file(
+            file.handle,
+            FileRenameRoot::SourceParent,
+            &"after.txt"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<alloc::vec::Vec<_>>(),
+            false,
+        ),
+        STATUS_SUCCESS
+    );
+    let completion = fs.pop_directory_notify_completion().unwrap();
+    assert_eq!(
+        notify_names(&completion.bytes),
+        alloc::vec![
+            (FILE_ACTION_RENAMED_OLD_NAME, "before.txt".into()),
+            (FILE_ACTION_RENAMED_NEW_NAME, "after.txt".into()),
+        ]
+    );
+}

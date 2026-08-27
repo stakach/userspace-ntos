@@ -110,6 +110,10 @@ pub const FILE_OVERWRITTEN: u32 = 3;
 pub const FILE_EXISTS: u32 = 4;
 pub const FILE_DOES_NOT_EXIST: u32 = 5;
 
+// Directory change notification completion statuses.
+pub const STATUS_NOTIFY_CLEANUP: u32 = 0x0000_010B;
+pub const STATUS_NOTIFY_ENUM_DIR: u32 = 0x0000_010C;
+
 // CreateOptions (spec §8.1)
 pub const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 pub const FILE_WRITE_THROUGH: u32 = 0x0000_0002;
@@ -136,6 +140,7 @@ pub const FILE_SHARE_VALID_FLAGS: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FIL
 
 // DesiredAccess (spec §8.1)
 pub const FILE_READ_DATA: u32 = 0x0000_0001;
+pub const FILE_LIST_DIRECTORY: u32 = FILE_READ_DATA;
 pub const FILE_WRITE_DATA: u32 = 0x0000_0002;
 pub const FILE_APPEND_DATA: u32 = 0x0000_0004;
 pub const FILE_EXECUTE: u32 = 0x0000_0020;

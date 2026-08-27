@@ -5,7 +5,7 @@
 //! and handles behind the `ZwCreateFile` / `ZwReadFile` / `ZwWriteFile` / `ZwFlushBuffersFile` /
 //! `ZwQueryInformationFile` / `ZwClose` surface.
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::directory::{
@@ -3929,6 +3929,7 @@ pub struct FileSystem {
     volume: MemFs,
     mounts: MountManager,
     handles: Vec<Option<FileObject>>,
+    notifications: crate::DirectoryNotifyTable<u64>,
 }
 
 /// The result of `ZwCreateFile`: `(status, handle, information)` (spec §8.1).
@@ -3963,6 +3964,28 @@ impl FileSystem {
                 (self.handles.len() - 1) as u64
             }
         };
+        let notify = match information {
+            FILE_CREATED => Some((
+                if self.volume.is_dir(node_id) {
+                    crate::FILE_NOTIFY_CHANGE_DIR_NAME
+                } else {
+                    crate::FILE_NOTIFY_CHANGE_FILE_NAME
+                },
+                crate::FILE_ACTION_ADDED,
+            )),
+            FILE_OVERWRITTEN | FILE_SUPERSEDED => Some((
+                crate::FILE_NOTIFY_CHANGE_SIZE | crate::FILE_NOTIFY_CHANGE_LAST_WRITE,
+                crate::FILE_ACTION_MODIFIED,
+            )),
+            _ => None,
+        };
+        if let Some((filter, action)) = notify {
+            self.notifications.report_change(crate::DirectoryChange {
+                full_path: &opened_name,
+                filter,
+                action,
+            });
+        }
         self.handles[handle as usize] = Some(FileObject {
             node_id,
             entry_id,
@@ -3988,7 +4011,95 @@ impl FileSystem {
             volume,
             mounts: MountManager::new(),
             handles: Vec::new(),
+            notifications: crate::DirectoryNotifyTable::new(),
         }
+    }
+
+    /// Register one filesystem-owned directory notification request. `context` is the I/O
+    /// Manager's opaque completion correlation; it is never interpreted by the filesystem.
+    pub fn zw_notify_change_directory_file(
+        &mut self,
+        handle: u64,
+        completion_filter: u32,
+        watch_tree: bool,
+        buffer_length: u32,
+        context: u64,
+    ) -> Result<crate::DirectoryNotifyId, u32> {
+        let Some(object) = self.obj(handle) else {
+            return Err(STATUS_INVALID_HANDLE);
+        };
+        if !self.volume.is_dir(object.node_id) {
+            return Err(STATUS_NOT_A_DIRECTORY);
+        }
+        let directory = self
+            .zw_query_opened_name(handle)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        self.notifications.register(
+            handle,
+            &directory,
+            completion_filter,
+            watch_tree,
+            buffer_length,
+            context,
+        )
+    }
+
+    pub fn zw_cancel_directory_notify(&mut self, id: crate::DirectoryNotifyId) -> bool {
+        self.notifications.cancel(id)
+    }
+
+    pub fn pop_directory_notify_completion(
+        &mut self,
+    ) -> Option<crate::DirectoryNotifyCompletion<u64>> {
+        self.notifications.pop_completion()
+    }
+
+    fn report_handle_change(&mut self, handle: u64, filter: u32) {
+        if let Some(path) = self.zw_query_opened_name(handle) {
+            self.notifications.report_change(crate::DirectoryChange {
+                full_path: &path,
+                filter,
+                action: crate::FILE_ACTION_MODIFIED,
+            });
+        }
+    }
+
+    fn rename_target_name(
+        &self,
+        handle: u64,
+        root: FileRenameRoot,
+        target: &str,
+    ) -> Option<String> {
+        let root_name = match root {
+            FileRenameRoot::SourceParent => {
+                let source = self.zw_query_opened_name(handle)?;
+                source
+                    .rsplit_once('\\')
+                    .map_or(
+                        "\\",
+                        |(parent, _)| {
+                            if parent.is_empty() {
+                                "\\"
+                            } else {
+                                parent
+                            }
+                        },
+                    )
+                    .to_string()
+            }
+            FileRenameRoot::VolumeRoot => "\\".to_string(),
+            FileRenameRoot::Directory(directory) => self.zw_query_opened_name(directory)?,
+        };
+        let target = target.trim_start_matches('\\');
+        let mut path = String::new();
+        path.try_reserve_exact(root_name.len().checked_add(target.len())?.checked_add(1)?)
+            .ok()?;
+        path.push_str(&root_name);
+        if path != "\\" {
+            path.push('\\');
+        }
+        path.push_str(target);
+        Some(path)
     }
 
     /// Publish the kernel's current NT system time to the filesystem for subsequent mutations.
@@ -4159,6 +4270,12 @@ impl FileSystem {
         if target.is_empty() || self.to_relative(target).is_some() {
             return STATUS_INVALID_PARAMETER;
         }
+        let Some(old_name) = self.zw_query_opened_name(handle) else {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        };
+        let Some(new_name) = self.rename_target_name(handle, root, target) else {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        };
         let status = match root {
             FileRenameRoot::SourceParent => {
                 if target.starts_with('\\') {
@@ -4199,6 +4316,23 @@ impl FileSystem {
             }
         };
         if status == STATUS_SUCCESS {
+            let filter = if self.volume.is_dir(source) {
+                crate::FILE_NOTIFY_CHANGE_DIR_NAME
+            } else {
+                crate::FILE_NOTIFY_CHANGE_FILE_NAME
+            };
+            self.notifications.report_changes(&[
+                crate::DirectoryChange {
+                    full_path: &old_name,
+                    filter,
+                    action: crate::FILE_ACTION_RENAMED_OLD_NAME,
+                },
+                crate::DirectoryChange {
+                    full_path: &new_name,
+                    filter,
+                    action: crate::FILE_ACTION_RENAMED_NEW_NAME,
+                },
+            ]);
             self.volume.touch_change(source);
             if let Some(name) = self.volume.opened_name(source_entry) {
                 for object in self.handles.iter_mut().flatten() {
@@ -4245,6 +4379,9 @@ impl FileSystem {
         if target.is_empty() || self.to_relative(target).is_some() {
             return STATUS_INVALID_PARAMETER;
         }
+        let Some(new_name) = self.rename_target_name(handle, root, target) else {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        };
         let status = match root {
             FileRenameRoot::SourceParent => {
                 if target.starts_with('\\') {
@@ -4279,6 +4416,11 @@ impl FileSystem {
             }
         };
         if status == STATUS_SUCCESS {
+            self.notifications.report_change(crate::DirectoryChange {
+                full_path: &new_name,
+                filter: crate::FILE_NOTIFY_CHANGE_FILE_NAME,
+                action: crate::FILE_ACTION_ADDED,
+            });
             self.volume.touch_change(source);
             self.reap_unlinked_nodes();
         }
@@ -4565,6 +4707,7 @@ impl FileSystem {
         let read = self.volume.read_at_into(node_id, offset, output);
         if read != 0 {
             self.volume.touch_access(node_id);
+            self.report_handle_change(handle, crate::FILE_NOTIFY_CHANGE_LAST_ACCESS);
         }
         if byte_offset.is_none() {
             self.obj_mut(handle).unwrap().current_offset = offset + read as u64;
@@ -4600,6 +4743,10 @@ impl FileSystem {
             self.volume
                 .mark_data_initialized_through(node_id, offset + n as u64);
             self.volume.touch_write(node_id);
+            self.report_handle_change(
+                handle,
+                crate::FILE_NOTIFY_CHANGE_SIZE | crate::FILE_NOTIFY_CHANGE_LAST_WRITE,
+            );
         }
         (STATUS_SUCCESS, n)
     }
@@ -4625,6 +4772,10 @@ impl FileSystem {
         self.volume.ensure_allocation_covers_eof(node_id);
         self.volume.mark_data_initialized_through(node_id, end);
         self.volume.touch_write(node_id);
+        self.report_handle_change(
+            handle,
+            crate::FILE_NOTIFY_CHANGE_SIZE | crate::FILE_NOTIFY_CHANGE_LAST_WRITE,
+        );
         (STATUS_SUCCESS, n)
     }
 
@@ -4681,6 +4832,10 @@ impl FileSystem {
         }
         self.obj_mut(handle).unwrap().current_offset = len;
         self.volume.touch_write(node_id);
+        self.report_handle_change(
+            handle,
+            crate::FILE_NOTIFY_CHANGE_SIZE | crate::FILE_NOTIFY_CHANGE_LAST_WRITE,
+        );
         STATUS_SUCCESS
     }
 
@@ -4822,6 +4977,13 @@ impl FileSystem {
                         node.change_time = now;
                     }
                 }
+                self.report_handle_change(
+                    handle,
+                    crate::FILE_NOTIFY_CHANGE_ATTRIBUTES
+                        | crate::FILE_NOTIFY_CHANGE_CREATION
+                        | crate::FILE_NOTIFY_CHANGE_LAST_ACCESS
+                        | crate::FILE_NOTIFY_CHANGE_LAST_WRITE,
+                );
                 STATUS_SUCCESS
             }
             FILE_DISPOSITION_INFORMATION => {
@@ -4872,6 +5034,10 @@ impl FileSystem {
                 let status = self.volume.set_end_of_file(node_id, length);
                 if status == STATUS_SUCCESS {
                     self.volume.touch_write(node_id);
+                    self.report_handle_change(
+                        handle,
+                        crate::FILE_NOTIFY_CHANGE_SIZE | crate::FILE_NOTIFY_CHANGE_LAST_WRITE,
+                    );
                 }
                 status
             }
@@ -4883,6 +5049,10 @@ impl FileSystem {
                 let status = self.volume.set_allocation_size(node_id, allocation_size);
                 if status == STATUS_SUCCESS {
                     self.volume.touch_write(node_id);
+                    self.report_handle_change(
+                        handle,
+                        crate::FILE_NOTIFY_CHANGE_SIZE | crate::FILE_NOTIFY_CHANGE_LAST_WRITE,
+                    );
                 }
                 status
             }
@@ -4899,6 +5069,10 @@ impl FileSystem {
                     .set_valid_data_length(node_id, valid_data_length);
                 if status == STATUS_SUCCESS {
                     self.volume.touch_write(node_id);
+                    self.report_handle_change(
+                        handle,
+                        crate::FILE_NOTIFY_CHANGE_SIZE | crate::FILE_NOTIFY_CHANGE_LAST_WRITE,
+                    );
                 }
                 status
             }
@@ -4908,7 +5082,11 @@ impl FileSystem {
                     Err(status) => return status,
                 };
                 let entry_id = self.obj(handle).unwrap().entry_id;
-                self.volume.set_entry_short_name(entry_id, short_name)
+                let status = self.volume.set_entry_short_name(entry_id, short_name);
+                if status == STATUS_SUCCESS {
+                    self.report_handle_change(handle, crate::FILE_NOTIFY_CHANGE_FILE_NAME);
+                }
+                status
             }
             FILE_RENAME_INFORMATION => {
                 let (replace_if_exists, root_directory, target) =
@@ -5220,11 +5398,29 @@ impl FileSystem {
                 if obj.references != 0 {
                     return STATUS_SUCCESS;
                 }
-                let (entry_id, delete_pending) = (obj.entry_id, obj.delete_pending);
+                let (entry_id, delete_pending, node_id) =
+                    (obj.entry_id, obj.delete_pending, obj.node_id);
+                let deleted_name = delete_pending
+                    .then(|| self.volume.opened_name(entry_id))
+                    .flatten();
+                let deleted_filter = if self.volume.is_dir(node_id) {
+                    crate::FILE_NOTIFY_CHANGE_DIR_NAME
+                } else {
+                    crate::FILE_NOTIFY_CHANGE_FILE_NAME
+                };
+                self.notifications.cleanup_file_object(handle);
                 // IRP_MJ_CLEANUP (last handle) then IRP_MJ_CLOSE → free the FILE_OBJECT.
                 self.handles[handle as usize] = None;
                 if delete_pending && entry_id != 0 {
-                    let _ = self.volume.unlink_entry(entry_id);
+                    if self.volume.unlink_entry(entry_id).is_ok() {
+                        if let Some(deleted_name) = deleted_name {
+                            self.notifications.report_change(crate::DirectoryChange {
+                                full_path: &deleted_name,
+                                filter: deleted_filter,
+                                action: crate::FILE_ACTION_REMOVED,
+                            });
+                        }
+                    }
                 }
                 self.reap_unlinked_nodes();
                 STATUS_SUCCESS
