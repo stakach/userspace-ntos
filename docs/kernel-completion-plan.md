@@ -14622,7 +14622,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     read-only and already reports the exact physical 8.3 entry; provider-backed Files remain FSD
     owned.
 
-    MemFs short-name namespace and native class-40 boundary (2026-08-27, focused implementation):
+    MemFs short-name namespace and native class-40 boundary (2026-08-27, accepted):
     MemFs now stores an optional validated 8.3 alias on each directory entry. Long names and aliases
     participate in one case-insensitive lookup and collision domain, so creates, opens, renames, and
     hard links cannot shadow an existing name through a second namespace. Rename preserves the
@@ -14643,6 +14643,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the security boundary is uniform and no filesystem path receives a synthetic success.
 
     Focused validation passes `nt-fs` `97/97`, `nt-io-manager` `214/214`, `git diff --check`, and
-    the freestanding executive at the established 211-warning baseline. A serialized desktop
-    acceptance run remains required before this item is marked accepted and the next capability is
-    selected.
+    the freestanding executive at the established 211-warning baseline. Serialized acceptance
+    `.tmp/run-headless-short-names-20260827.log` reached quiescence at 113,452 ms, launched genuine
+    userinit and Explorer, completed 665 Explorer api0 redirects with zero callback failures,
+    painted `480000/480000` framebuffer pixels with at least 32 colours, passed all `295/295`
+    gates, and matched the sentinel. Snapshot generation 5 committed the version-6 payload at
+    1,755,656 bytes; scratch returned to zero and the resource census reported no frame, mapping,
+    registry, retype, or allocator failures.
+
+    Review adjustment: writable short-name ownership is closed without an executive alias
+    generator or a provider fallback. Continue the remaining File-information inventory by
+    auditing the object-ID, quota, move-cluster, and tracking set classes against their actual NT
+    filesystem and FSCTL ownership. Implement a persistent facility only where MemFs can own its
+    full namespace/accounting semantics; otherwise retain an explicit filesystem failure and the
+    provider's real `IRP_MJ_SET_INFORMATION` route. Do not turn a valid class number into success
+    when the mounted filesystem has not implemented the facility.
