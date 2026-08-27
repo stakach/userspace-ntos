@@ -15109,3 +15109,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     identities. `NtQuerySymbolicLinkObject` is the leading candidate because create/open and the
     namespace target object already exist; audit target ownership, query buffer semantics, access
     rights, and any remaining numeric branch before implementation.
+
+    `NtQuerySymbolicLinkObject` (2026-08-27, accepted): SSN 178 is now a typed registered service
+    with no numeric branch. It probes the writable `UNICODE_STRING`, the complete caller-declared
+    target buffer, and the optional result-length output before handle resolution; requires a real
+    SymbolicLink handle with `SYMBOLIC_LINK_QUERY`; reads the handle-referenced namespace body's
+    target without reparsing it; returns exact UTF-16 bytes and `Length`; and reports the required
+    byte count with `STATUS_BUFFER_TOO_SMALL` when necessary. Checked copyout converts a post-probe
+    mapping failure into `STATUS_ACCESS_VIOLATION`. The new variants were appended to
+    `NativeService::ALL`, preserving every existing deterministic Test-profile number.
+
+    Validation passes `nt-object-manager` `67/67` (including exact symbolic-link target ownership),
+    `nt-syscall` `61/61`, `git diff --check`, the freestanding executive, and the release build. Code
+    checkpoint `dd80bdfa` is pushed. Serialized acceptance
+    `.tmp/run-headless-query-symbolic-link-20260827.log` reached quiescence at 102,376 ms, launched
+    genuine userinit and Explorer, completed 668 Explorer api0 redirects with zero callback or
+    dead-callback failures, recorded paint begin/end `5/20`, 187 direct GDI returns, and 135 batch
+    flushes covering 184 records, painted `480000/480000` framebuffer pixels with at least 32
+    colours, passed all `295/295` gates, and matched the sentinel. Startup did not issue SSN 178, so
+    this run is explicitly a full non-regression gate; the apparent `0xB2` log values are user-callback
+    payload lengths. Scratch returned to zero and no VM, untyped-allocation, frame-registration,
+    image-bank, or allocator failure was reported.
+
+    Review adjustment: the typed surface now contains 166 services, the hosted table registers 165
+    numbered variants, and 57 canonical ABI exports remain absent. Re-audit the gap list before the
+    next selection. Continue favoring small, composable Ob/Ps/Se/Mm traits with independently
+    testable state over compatibility-only behavior; do not reinterpret instrumentation values as
+    live syscall proof.
