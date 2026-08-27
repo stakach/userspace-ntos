@@ -185,7 +185,6 @@ pub struct GenericSectionTable {
     sections: Vec<GenericSection>,
     views: Vec<GenericSectionView>,
     pages: Vec<GenericSectionPage>,
-    dirty: bool,
     section_growths: u64,
     section_allocation_failures: u64,
     view_growths: u64,
@@ -200,7 +199,6 @@ impl GenericSectionTable {
             sections: Vec::new(),
             views: Vec::new(),
             pages: Vec::new(),
-            dirty: false,
             section_growths: 0,
             section_allocation_failures: 0,
             view_growths: 0,
@@ -227,7 +225,6 @@ impl GenericSectionTable {
         self.sections.clear();
         self.views.clear();
         self.pages.clear();
-        self.dirty = false;
         self.section_growths = 0;
         self.section_allocation_failures = 0;
         self.view_growths = 0;
@@ -257,7 +254,6 @@ impl GenericSectionTable {
         }
         if self.sections.capacity() != old_capacity {
             self.section_growths = self.section_growths.saturating_add(1);
-            self.dirty = true;
         }
         self.sections.push(section);
         Some(self.sections.len() - 1)
@@ -271,7 +267,6 @@ impl GenericSectionTable {
         }
         if self.views.capacity() != old_capacity {
             self.view_growths = self.view_growths.saturating_add(1);
-            self.dirty = true;
         }
         self.views.push(view);
         true
@@ -285,7 +280,6 @@ impl GenericSectionTable {
         }
         if self.pages.capacity() != old_capacity {
             self.page_growths = self.page_growths.saturating_add(1);
-            self.dirty = true;
         }
         self.pages.push(page);
         true
@@ -534,12 +528,6 @@ impl GenericSectionTable {
         None
     }
 
-    pub fn take_dirty(&mut self) -> bool {
-        let dirty = self.dirty;
-        self.dirty = false;
-        dirty
-    }
-
     pub fn stats(&self) -> GenericSectionTableStats {
         GenericSectionTableStats {
             live_sections: self.sections.iter().filter(|section| section.live).count(),
@@ -608,8 +596,6 @@ mod tests {
         assert_eq!(stats.section_growths, 1);
         assert_eq!(stats.view_growths, 1);
         assert_eq!(stats.page_growths, 1);
-        assert!(table.take_dirty());
-        assert!(!table.take_dirty());
     }
 
     #[test]
@@ -631,7 +617,6 @@ mod tests {
         assert_eq!(stats.section_growths, 0);
         assert_eq!(stats.view_growths, 0);
         assert_eq!(stats.page_growths, 0);
-        assert!(!table.take_dirty());
     }
 
     #[test]

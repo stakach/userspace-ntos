@@ -1730,7 +1730,6 @@ pub(crate) struct DllPeStoreStats {
 
 pub(crate) struct DllPeStore {
     entries: Vec<Option<nt_pe_loader::PeFile<'static>>>,
-    dirty: bool,
     growths: u64,
     allocation_failures: u64,
 }
@@ -1739,7 +1738,6 @@ impl DllPeStore {
     pub(crate) const fn new() -> Self {
         Self {
             entries: Vec::new(),
-            dirty: false,
             growths: 0,
             allocation_failures: 0,
         }
@@ -1747,7 +1745,6 @@ impl DllPeStore {
 
     pub(crate) fn reset(&mut self) {
         self.entries.clear();
-        self.dirty = false;
         self.growths = 0;
         self.allocation_failures = 0;
     }
@@ -1772,7 +1769,6 @@ impl DllPeStore {
         while self.entries.len() <= slot {
             self.entries.push(None);
         }
-        self.dirty = true;
         Ok(true)
     }
 
@@ -1783,22 +1779,11 @@ impl DllPeStore {
     ) -> Result<(), ()> {
         self.ensure_slot(slot)?;
         self.entries[slot] = pe;
-        self.dirty = true;
         Ok(())
     }
 
     pub(crate) fn as_slice(&self) -> &[Option<nt_pe_loader::PeFile<'static>>] {
         &self.entries
-    }
-
-    pub(crate) fn clear_dirty(&mut self) {
-        self.dirty = false;
-    }
-
-    pub(crate) fn take_dirty(&mut self) -> bool {
-        let dirty = self.dirty;
-        self.dirty = false;
-        dirty
     }
 
     pub(crate) fn stats(&self) -> DllPeStoreStats {
@@ -1830,7 +1815,6 @@ impl DllArenaPagingRecord {
 
 pub(crate) struct DllArenaPagingState {
     records: Vec<DllArenaPagingRecord>,
-    dirty: bool,
     growths: u64,
     allocation_failures: u64,
 }
@@ -1839,7 +1823,6 @@ impl DllArenaPagingState {
     pub(crate) const fn new() -> Self {
         Self {
             records: Vec::new(),
-            dirty: false,
             growths: 0,
             allocation_failures: 0,
         }
@@ -1847,7 +1830,6 @@ impl DllArenaPagingState {
 
     pub(crate) fn reset(&mut self) {
         self.records.clear();
-        self.dirty = false;
         self.growths = 0;
         self.allocation_failures = 0;
     }
@@ -1867,10 +1849,8 @@ impl DllArenaPagingState {
         }
         if self.records.capacity() != old_capacity {
             self.growths = self.growths.saturating_add(1);
-            self.dirty = true;
         }
         self.records.push(DllArenaPagingRecord::new(pi));
-        self.dirty = true;
         Ok(self.records.len() - 1)
     }
 
@@ -1917,12 +1897,6 @@ impl DllArenaPagingState {
         if let Some(index) = self.index_for(pi) {
             self.records.swap_remove(index);
         }
-    }
-
-    pub(crate) fn take_dirty(&mut self) -> bool {
-        let dirty = self.dirty;
-        self.dirty = false;
-        dirty
     }
 
     pub(crate) fn stats(&self) -> DllArenaPagingStats {
@@ -2303,10 +2277,6 @@ const HOSTED_THREAD_RUNTIME_INITIAL_RESERVE: usize =
     MAX_PI * (1 + PM_RUNTIME_THREAD_SLOTS + TP_WORKER_SLOT_COUNT) + 16;
 const HOSTED_THREAD_WAIT_INITIAL_RESERVE: usize = HOSTED_THREAD_RUNTIME_INITIAL_RESERVE;
 const WAIT_REPLY_POOL_INITIAL_RESERVE: usize = HOSTED_THREAD_WAIT_INITIAL_RESERVE + 1;
-/// Set when a service-loop-owned growable table reallocates above the current bump-heap reset mark.
-/// The loop consumes this bit before resetting so the new backing storage remains durable.
-static DURABLE_TABLE_GROWTH_DIRTY: AtomicBool = AtomicBool::new(false);
-
 #[derive(Clone, Copy)]
 struct WaitReplyPoolRecord {
     cap: u64,
@@ -2320,14 +2290,6 @@ static WAIT_REPLY_POOL_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WAIT_REPLY_POOL_SLOT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WAIT_REPLY_POOL_RETYPE_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WAIT_REPLY_POOL_STORE_FAILURES: AtomicU64 = AtomicU64::new(0);
-
-fn mark_durable_table_growth_dirty() {
-    DURABLE_TABLE_GROWTH_DIRTY.store(true, Ordering::Relaxed);
-}
-
-fn take_durable_table_growth_dirty() -> bool {
-    DURABLE_TABLE_GROWTH_DIRTY.swap(false, Ordering::Relaxed)
-}
 
 struct ThreadWaitParkTable {
     badges_plus_one: Vec<u64>,
@@ -2375,7 +2337,6 @@ impl ThreadWaitParkTable {
                 self.store_failures = self.store_failures.saturating_add(1);
                 return;
             }
-            mark_durable_table_growth_dirty();
         }
         self.badges_plus_one.push(encoded);
     }
@@ -2583,7 +2544,6 @@ impl ObjectWaiterTable {
                 self.store_failures = self.store_failures.saturating_add(1);
                 return None;
             }
-            mark_durable_table_growth_dirty();
         }
         let index = self.entries.len();
         self.entries.push(ObjectWaiterRecord::empty());
@@ -2762,7 +2722,6 @@ impl KeyedWaiterTable {
                 self.store_failures = self.store_failures.saturating_add(1);
                 return None;
             }
-            mark_durable_table_growth_dirty();
         }
         let index = self.entries.len();
         self.entries.push(KeyedWaiterRecord::empty());
@@ -2897,22 +2856,14 @@ pub(crate) fn pipe_server_preconnected_forget(server_fid: u64) -> bool {
 pub(crate) fn reserve_pipe_create_metadata(server: bool) -> bool {
     unsafe {
         let names = &mut *core::ptr::addr_of_mut!(PIPE_FID_NAMES);
-        let names_capacity = names.capacity();
         if !names.ensure_capacity() {
             return false;
-        }
-        if names.capacity() != names_capacity {
-            mark_durable_table_growth_dirty();
         }
 
         if !server {
             let preconnected = &mut *core::ptr::addr_of_mut!(PIPE_PRECONNECTED_SERVERS);
-            let preconnected_capacity = preconnected.capacity();
             if !preconnected.ensure_capacity() {
                 return false;
-            }
-            if preconnected.capacity() != preconnected_capacity {
-                mark_durable_table_growth_dirty();
             }
         }
         true
@@ -7943,8 +7894,7 @@ static PFILLED_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// Per-hosted-process demand-fill bookkeeping (page VA per fault index), one row per admitted
 /// hosted process. Kept off the bounded rootserver stack, but no longer as a fixed BSS matrix:
-/// `service_sec_image` sizes this vector for the runtime process-index window before taking the
-/// service-loop heap mark.
+/// `service_sec_image` sizes this vector for the runtime process-index window.
 static mut PFILLED: alloc::vec::Vec<[u64; 512]> = alloc::vec::Vec::new();
 
 unsafe fn reset_pfilled_work(slots: usize) -> Option<&'static mut [[u64; 512]]> {
@@ -8298,15 +8248,10 @@ impl DllCacheChunk {
 }
 
 static mut DLL_CACHE_CHUNKS: Option<Vec<*mut DllCacheChunk>> = None;
-static DLL_CACHE_DIRTY: AtomicBool = AtomicBool::new(false);
 static DLL_SHARED_HITS: AtomicU64 = AtomicU64::new(0);
 static DLL_CACHE_INSERT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static DLL_CACHE_DUPLICATE_INSERTS: AtomicU64 = AtomicU64::new(0);
 static DLL_CACHE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
-
-pub(crate) fn take_dll_cache_dirty() -> bool {
-    DLL_CACHE_DIRTY.swap(false, Ordering::Relaxed)
-}
 
 unsafe fn dll_cache_chunks_mut() -> &'static mut Vec<*mut DllCacheChunk> {
     let slot = &mut *core::ptr::addr_of_mut!(DLL_CACHE_CHUNKS);
@@ -8328,8 +8273,6 @@ unsafe fn dll_cache_alloc_chunk() -> Option<*mut DllCacheChunk> {
         return None;
     }
     core::ptr::write(ptr, DllCacheChunk::empty());
-    allocator::pin_current();
-    DLL_CACHE_DIRTY.store(true, Ordering::Relaxed);
     Some(ptr)
 }
 
@@ -8405,8 +8348,6 @@ unsafe fn dll_cache_put(va: u64, fr: u64) -> bool {
             DLL_CACHE_INSERT_FAILURES.fetch_add(1, Ordering::Relaxed);
             return false;
         }
-        allocator::pin_current();
-        DLL_CACHE_DIRTY.store(true, Ordering::Relaxed);
         let Some(chunk) = dll_cache_alloc_chunk() else {
             return false;
         };
@@ -8558,12 +8499,7 @@ unsafe fn csrss_frame_put_at_cap_source_owned(
     match (&mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY))
         .insert(pi, page, fr, alias, alias_cap, source_cap, owns_frame)
     {
-        Ok(ClientFrameInsert::Inserted { grew }) => {
-            if grew {
-                mark_durable_table_growth_dirty();
-            }
-            true
-        }
+        Ok(ClientFrameInsert::Inserted { .. }) => true,
         Ok(ClientFrameInsert::Updated) => true,
         Err(_) => false,
     }
@@ -9123,7 +9059,6 @@ impl SharedImageMappingChunk {
 }
 
 static mut SHARED_IMAGE_MAPPING_CHUNKS: Option<Vec<*mut SharedImageMappingChunk>> = None;
-static SHARED_IMAGE_MAPPING_DIRTY: AtomicBool = AtomicBool::new(false);
 static SHARED_IMAGE_MAPPING_LIVE: AtomicU64 = AtomicU64::new(0);
 const IMAGE_MAP_CAP_BANK_RADIX: u32 = 12;
 const IMAGE_MAP_CAP_BANK_SEGMENT_SLOTS: u64 = 1u64 << IMAGE_MAP_CAP_BANK_RADIX;
@@ -9179,10 +9114,6 @@ unsafe fn shared_image_mapping_chunks_mut() -> &'static mut Vec<*mut SharedImage
         *slot = Some(Vec::new());
     }
     slot.as_mut().unwrap()
-}
-
-pub(crate) fn take_shared_image_mapping_dirty() -> bool {
-    SHARED_IMAGE_MAPPING_DIRTY.swap(false, Ordering::Relaxed)
 }
 
 unsafe fn image_map_cap_bank_ensure_segment(segment: usize) -> Option<u64> {
@@ -9316,8 +9247,6 @@ unsafe fn shared_image_mapping_alloc_chunk() -> Option<*mut SharedImageMappingCh
         return None;
     }
     core::ptr::write(ptr, SharedImageMappingChunk::empty());
-    allocator::pin_current();
-    SHARED_IMAGE_MAPPING_DIRTY.store(true, Ordering::Relaxed);
     Some(ptr)
 }
 
@@ -9383,7 +9312,6 @@ unsafe fn shared_image_mapping_remove_at(
         (*chunks[chunk_index]).entries[entry_index] = last;
     }
     SHARED_IMAGE_MAPPING_LIVE.fetch_sub(1, Ordering::Relaxed);
-    SHARED_IMAGE_MAPPING_DIRTY.store(true, Ordering::Relaxed);
     Some(removed)
 }
 
@@ -9474,7 +9402,6 @@ unsafe fn shared_image_mapping_push_prepared(
             SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
             return false;
         }
-        allocator::pin_current();
         let Some(chunk) = shared_image_mapping_alloc_chunk() else {
             return false;
         };
@@ -14326,7 +14253,6 @@ unsafe fn exec_paging_prepare_mark(key: u64, page: u64, level: &[u8]) -> bool {
     if entries.iter().any(|entry| *entry == key) {
         return true;
     }
-    let old_capacity = entries.capacity();
     if entries.try_reserve(1).is_err() {
         print_str(b"[exec-paging] seen-set allocation failed ");
         print_str(level);
@@ -14338,9 +14264,6 @@ unsafe fn exec_paging_prepare_mark(key: u64, page: u64, level: &[u8]) -> bool {
         print_hex(key as u32);
         print_str(b"\n");
         return false;
-    }
-    if entries.capacity() != old_capacity {
-        mark_durable_table_growth_dirty();
     }
     true
 }
@@ -15930,14 +15853,10 @@ fn wait_reply_pool_insert_cap(cap: u64, used: bool) -> Option<usize> {
             pool[index] = WaitReplyPoolRecord { cap, used };
             return Some(index);
         }
-        let old_capacity = pool.capacity();
         if pool.len() == pool.capacity() && pool.try_reserve(1).is_err() {
             WAIT_REPLY_POOL_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
             WAIT_REPLY_POOL_STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
             return None;
-        }
-        if pool.capacity() != old_capacity {
-            mark_durable_table_growth_dirty();
         }
         pool.push(WaitReplyPoolRecord { cap, used });
         Some(pool.len() - 1)
@@ -16330,12 +16249,8 @@ unsafe fn delay_park(
         thread_id,
         badge,
     };
-    let old_capacity = queue.capacity();
     if queue.insert(waiter).is_err() {
         return false;
-    }
-    if queue.capacity() != old_capacity {
-        mark_durable_table_growth_dirty();
     }
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
@@ -21119,11 +21034,9 @@ const OBJ_KIND_DELETED: u8 = 0xff;
 const OBJ_NAME_CAP: usize = 128;
 const OBJ_PARENT_ROOT: usize = usize::MAX;
 const OBJ_PARENT_ANONYMOUS: usize = usize::MAX - 1;
-static OBJ_NS_GROWTH_DIRTY: AtomicU64 = AtomicU64::new(0);
 static OBJ_NS_GROWTHS: AtomicU64 = AtomicU64::new(0);
 
 fn mark_object_namespace_growth(old_capacity: usize, new_capacity: usize, len: usize) {
-    OBJ_NS_GROWTH_DIRTY.store(1, Ordering::Relaxed);
     let n = OBJ_NS_GROWTHS.fetch_add(1, Ordering::Relaxed);
     if n < 8 {
         print_str(b"[obj-ns] grew capacity ");
@@ -21136,18 +21049,13 @@ fn mark_object_namespace_growth(old_capacity: usize, new_capacity: usize, len: u
     }
 }
 
-fn take_object_namespace_growth_dirty() -> bool {
-    OBJ_NS_GROWTH_DIRTY.swap(0, Ordering::Relaxed) != 0
-}
-
 /// One node in the executive's minimal object-manager namespace. Inline, `Copy`, no nested heap
-/// allocation. The backing `Vec` starts below the per-syscall heap mark; if real object-manager
-/// traffic outgrows that reserve, growth is marked durable so the service loop pins the new backing
-/// allocation before the next bump-heap reset. NT object leaf names are allowed to be long enough for
-/// BaseNamedObjects mutexes such as userenv's per-profile mutex; `target` is link-only data; `payload`
-/// carries backing object identity for kinds whose state lives outside the namespace, such as LPC
-/// listen port handles and I/O completion ports. `permanent` mirrors `OBJ_PERMANENT`;
-/// non-permanent named objects are unlinked when their final body reference goes away.
+/// allocation. Its backing `Vec` remains live through ordinary ownership and may grow beyond the
+/// boot reserve. NT object leaf names are allowed to be long enough for BaseNamedObjects mutexes
+/// such as userenv's per-profile mutex; `target` is link-only data; `payload` carries backing object
+/// identity for kinds whose state lives outside the namespace, such as LPC listen port handles and
+/// I/O completion ports. `permanent` mirrors `OBJ_PERMANENT`; non-permanent named objects are
+/// unlinked when their final body reference goes away.
 #[derive(Clone, Copy)]
 struct ObjEntry {
     name: [u8; OBJ_NAME_CAP], // leaf name, lowercased ASCII (len in name_len)
@@ -21460,13 +21368,9 @@ struct ExecNtHandler {
     /// ★ The `\Registry\User` (`HKEY_USERS`) MOUNT TABLE — every hive that is not one of the four
     /// boot mounts above, in ONE general mechanism: `\Registry\User\.Default` (mounted at
     /// construction from the staged `config\default`, exactly as `CmpInitializeHiveList` does) and
-    /// the per-user hives `NtLoadKey` mounts at run time. Pre-reserved in `new()` so pushes never
-    /// reallocate; the run-time `String` growth is pinned via `hive_mounts_dirty`.
+    /// the per-user hives `NtLoadKey` mounts at run time. The vector owns its run-time path and hive
+    /// allocations directly.
     pub(crate) hive_mounts: alloc::vec::Vec<HiveMount>,
-    /// Set by `NtLoadKey`/`NtUnloadKey`; the service loop pins the bump-heap mark past the mount's
-    /// path strings and mutable hive import arena so the mount survives the per-syscall reset (the
-    /// `overlay_dirty` contract).
-    pub(crate) hive_mounts_dirty: bool,
     /// Owned mutable hive authority mounted at the same NT registry roots as the borrowed `RegfHive`
     /// selectors. Mounted-hive create/open handles use `mutable_key_handles` so later writes can
     /// land in this authority without path shadowing through `RegistryOverlay`.
@@ -21475,12 +21379,6 @@ struct ExecNtHandler {
     /// are released when the last process handle to that target closes; dynamic hive unload also
     /// clears entries for that hive so stale handles stop resolving.
     mutable_key_handles: alloc::vec::Vec<Option<ResolvedHiveKey>>,
-    /// Set when a mutable hive create/value write allocates new key/value arena state above the
-    /// service-loop heap mark, or when the mutable key target table outgrows its reserved buffer.
-    /// The service loop pins the live hive cells immediately and checkpoints dirty boot-mounted hives
-    /// at coarse lazy-writer boundaries. Clean hives are skipped while later
-    /// SAM/SECURITY/SOFTWARE mutations still persist before the gate.
-    mutable_hives_dirty: bool,
     /// Mutable-hive journal records appended since the last writable-volume snapshot. The log append
     /// itself is synchronous in the mounted volume; this counter batches the expensive snapshot
     /// reserve commit instead of exporting the whole writable volume after every registry value.
@@ -21502,7 +21400,6 @@ struct ExecNtHandler {
     /// kernel-side enumeration index, invalidated by any mutable hive write and rebuilt on demand.
     registry_services_order_cache: alloc::vec::Vec<alloc::string::String>,
     registry_services_order_cache_valid: bool,
-    registry_services_order_cache_dirty: bool,
     /// Last successful mutable-hive value copyout to a hosted process. ReactOS `RegCopyTreeW`
     /// enumerates a source value into a process heap buffer, then calls `NtSetValueKey` with a data
     /// pointer into that same buffer. Keeping the source value identity here lets the Configuration
@@ -21514,12 +21411,10 @@ struct ExecNtHandler {
     /// security queries/updates still target their handle identity.
     registry_machine_root_security_descriptor: Option<alloc::vec::Vec<u8>>,
     registry_user_root_security_descriptor: Option<alloc::vec::Vec<u8>>,
-    /// Set when virtual-root descriptor storage grew above the service loop heap mark.
-    registry_virtual_roots_dirty: bool,
     /// Live system timezone state returned by class 44 and used to derive class 3's current bias.
     time_zone_information: nt_kernel_exec::timezone::TimeZoneInformation,
-    /// The minimal object-manager namespace (index 0 = root `\`). Pre-reserved below the heap mark
-    /// its entries are inline (no nested heap) so pushes never reallocate.
+    /// The minimal object-manager namespace (index 0 = root `\`). Entries are inline and the owned
+    /// vector grows beyond its boot reserve when required.
     obj_ns: alloc::vec::Vec<ObjEntry>,
     /// Dispatcher state for every `obj_ns` event, keyed by the stable namespace index. The store
     /// owns manual/auto-reset and signal state; `obj_ns` owns names and identity.
@@ -21527,16 +21422,13 @@ struct ExecNtHandler {
     /// Native waitable timers, keyed by `obj_ns` timer entries. Dispatcher signal state is stored in
     /// `events`; this table holds due-time, period, and optional APC metadata.
     user_timers: alloc::vec::Vec<UserTimerRecord>,
-    user_timers_dirty: bool,
     user_timer_rearm_requested: bool,
     /// Counting semaphore state keyed by the same stable namespace indices.
     semaphores: nt_kernel_exec::SemaphoreStore,
     /// Mutant state keyed by the same stable namespace indices.
     mutants: nt_kernel_exec::MutantStore,
-    /// The session-global atom namespace backing NtAdd/Find/Delete/QueryInformationAtom. Its arena
-    /// is allocated once in `new()` below the per-syscall heap mark; atom operations mutate only
-    /// that fixed buffer, so duplicate refcounts and names survive bump-allocator rewinds and are
-    /// shared across every hosted process (`pi`).
+    /// The session-global atom namespace backing NtAdd/Find/Delete/QueryInformationAtom. Its fixed
+    /// arena is allocated once in `new()` and shared across every hosted process (`pi`).
     global_atoms: nt_kernel_exec::rtl_atom::OwnedAtomTable,
     /// Fixed executive completion-port objects and packet queues. The backing table lives in BSS so
     /// `ExecNtHandler::initialize_in` does not materialize it on the early root task stack.
@@ -21722,12 +21614,9 @@ struct ExecNtHandler {
     /// nt-lpc-server owns the namespace + rendezvous, but is NOT on the message path. When a CONNECT
     /// completes through the server, the executive records the connection here so the future message
     /// bulk (NtRequestWaitReplyPort/NtReplyWaitReceivePort/NtReplyPort) is served by DIRECT cross-
-    /// badge delivery against this cache — never a per-message round-trip to the server. Pre-reserved
-    /// below the heap mark and grown as needed. Records are `Copy` (inline name, no nested heap);
-    /// when the vector itself grows above the loop's heap mark, `lpc_connections_dirty` asks the
-    /// service loop to pin that storage before the next per-syscall bump reset.
+    /// badge delivery against this cache — never a per-message round-trip to the server. Records are
+    /// `Copy` (inline name, no nested heap), and the vector owns any growth beyond its boot reserve.
     lpc_connections: alloc::vec::Vec<LpcConnRecord>,
-    lpc_connections_dirty: bool,
     /// winlogon's CSR client-connect LpcWrite heap-view base (0 = the CSR regions haven't been mapped
     /// yet). Set the first time NtSecureConnectPort services winlogon's kernel32 → \Windows\ApiPort
     /// connect; guards the one-time region mapping (heap view + static server data) in that handler.
@@ -21739,8 +21628,7 @@ struct ExecNtHandler {
     csr_view_mask: u32,
     /// The real NT Process Manager (nt-process): EPROCESS/ETHREAD, per-process handle tables, and the
     /// process/thread lifecycle. FIRST convergence increment — each hosted process (smss/csrss/
-    /// winlogon) is backed by a real EPROCESS created in `new()` (below the per-syscall heap mark, so
-    /// its BTreeMap allocations survive the bump reset). This increment only CREATES + LOOKS UP the
+    /// winlogon) is backed by a real EPROCESS created in `new()`. This increment only CREATES + LOOKS UP the
     /// EPROCESSes (read-only during the loop, so no runtime realloc). Policy lives here; the seL4
     /// VSpace/CSpace/TCB caps + mirror/scratch VAs stay executive-side because only the trusted root
     /// task holds those caps, linked to an EPROCESS through the process mechanism table.
@@ -21775,36 +21663,15 @@ struct ExecNtHandler {
     /// explicit session/runtime lookup.
     win32k_session: Win32kSessionRuntime,
     /// Stable, reference-counted token objects. Each EPROCESS records its primary `TokenId`; token
-    /// handles and ETHREAD impersonation contexts retain independent references.
+    /// handles and ETHREAD impersonation contexts retain independent references and their storage.
     token_store: nt_security::TokenStore,
-    /// Set when a successful token duplication allocated durable group/privilege vectors above the
-    /// service loop's current bump-heap mark. The loop advances the mark before its next reset.
-    token_dirty: bool,
-    /// Set when a live `NtCreateProcess[Ex]` allocated EPROCESS/ETHREAD/handle-table state above the
-    /// service loop's current bump-heap mark. The loop advances the mark before its next reset.
-    process_dirty: bool,
     /// Volatile registry write plane for keys that do not belong to a mounted mutable hive.
     /// Mounted hive paths use `mutable_hives`; this overlay remains for explicitly volatile state
     /// such as boot-created Control keys until D4 gives volatile keys first-class hive ownership.
     overlay: nt_hive_core::RegistryOverlay,
-    /// Set by a handler that mutated `overlay` (`NtCreateKey`/`NtSetValueKey`). The service loop
-    /// consumes it after dispatch: it advances the heap high-water mark to the current bump
-    /// position so the overlay's runtime allocations are retained past the next per-syscall reset.
-    overlay_dirty: bool,
-    // On-demand DLL loads are reset-safe by construction: registry slots and per-pi handle stores
-    // are pre-reserved before the service-loop heap mark, PE bytes live in the cap-mapped pool, and
-    // `PeFile` section metadata is inline. Transient import/relocation/path allocations from the
-    // load syscall must therefore be reclaimed by the normal per-syscall heap rewind.
-    /// Set by NtOpenFile when a dynamic hosted executable is admitted from the mounted ReactOS
-    /// volume. The executable's pool bytes are outside the bump heap, but the parsed PE section table
-    /// and catalog/runtime strings are durable loop state and must survive the next syscall reset.
-    hosted_exe_dirty: bool,
-    /// Set by any handler that touched the WRITABLE FILESYSTEM OVERLAY (`writable_fs`) — its mount,
-    /// a create/write/set-information/close, or a read (whose transient buffer is harmless but whose
-    /// lazily-mounted volume is not). Exactly the same contract as `overlay_dirty`: the service loop
-    /// advances the heap high-water mark past the volume's `Vec`/`String` growth so the files and
-    /// directories a hosted process created SURVIVE the next per-syscall bump reset. Without it the
-    /// volume would be handed back to the allocator the instant the syscall returned.
+    /// Set by any handler that touched the writable filesystem. This schedules the service-loop
+    /// ownership barrier so explicit durability requests can publish a volume snapshot before the
+    /// corresponding success becomes externally visible.
     writable_fs_dirty: bool,
     /// Explicit writable-volume durability callers set this when user-visible success depends on a
     /// registry save/flush checkpoint reaching the snapshot reserve before the current syscall
@@ -24698,13 +24565,12 @@ static PM_IDENTITY_OK: AtomicU64 = AtomicU64::new(0);
 /// Incremented each time the live service loop resolves the current fault badge to its EPROCESS via
 /// the ProcessManager-backed handler lookup.
 static PM_BADGE_LOOKUPS: AtomicU64 = AtomicU64::new(0);
-/// Initial handle-table capacity per hosted EPROCESS (path 1). This is only the bootstrap reserve:
-/// real hosted workloads can outgrow it, and the executive pins the bump-heap mark whenever a
-/// ProcessManager handle table expands after boot.
+/// Initial handle-table capacity per hosted EPROCESS (path 1). This is only the bootstrap reserve;
+/// real hosted workloads can outgrow it through the ProcessManager's owned handle table.
 const PM_HANDLE_RESERVE: usize = 512;
 /// Live debugger objects the executive supports without growing the durable `nt-process` Dbgk table
-/// after the boot heap mark. These are still created dynamically through `NtCreateDebugObject`; the
-/// cap is storage accounting, not identity policy.
+/// beyond its configured storage. These are still created dynamically through
+/// `NtCreateDebugObject`; the cap is storage accounting, not identity policy.
 const PM_DEBUG_OBJECT_SLOTS: usize = 8;
 /// Per-debug-object queue budget: enough for attach fake thread/module messages plus live exception,
 /// create/exit, and module events in the hosted ReactOS frontier.
@@ -24721,8 +24587,7 @@ static PM_HANDLES_CLOSED: AtomicU64 = AtomicU64::new(0);
 static PM_HANDLE_CAP_BOOT: AtomicU64 = AtomicU64::new(0);
 /// Maximum current per-EPROCESS handle-table capacity across hosted processes.
 static PM_HANDLE_CAP_MAX: AtomicU64 = AtomicU64::new(0);
-/// Count of real handle-table capacity growths after the bootstrap reserve. Each growth sets
-/// `ExecNtHandler.process_dirty`, so the service loop pins the bump-heap mark before the next reset.
+/// Count of real handle-table capacity growths after the bootstrap reserve.
 static PM_HANDLE_CAP_GROWTHS: AtomicU64 = AtomicU64::new(0);
 // === Path 2 — lifecycle: real ETHREADs + create/terminate/open routed through pm ===============
 /// Bit `pi` set once the target process's INITIAL thread has been created through `NtCreateThread`
@@ -27449,8 +27314,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             );
             // userinit is the first process whose stack and environment mirrors live outside the
             // early FILEBUF PT. Install their shared 2 MiB executive PT before the runtime spawn so
-            // every mirrored stack/env page_map has a valid destination without allocating policy
-            // state under the per-syscall reset mark.
+            // every mirrored stack/env page_map has a valid destination.
             let userinit_mirror_pt = alloc_slot();
             let _ = untyped_retype(
                 CAP_INIT_UNTYPED,
@@ -30913,8 +30777,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // Path 1 — handle-table routing: the executive handle-mint sites now record every
                     // handle into the caller's REAL per-EPROCESS handle table, and NtClose frees it
                     // (was a no-op). The table starts with a bootstrap reserve, then grows
-                    // dynamically like NT's HANDLE_TABLE; each growth pins the bump-heap mark before
-                    // reset, so durable table storage is not reclaimed as transient syscall data.
+                    // dynamically like NT's HANDLE_TABLE under ProcessManager ownership.
                     let tracked = PM_HANDLES_TRACKED.load(Ordering::Relaxed);
                     let peak = PM_HANDLE_PEAK.load(Ordering::Relaxed);
                     let min_cap = PM_HANDLE_CAP_BOOT.load(Ordering::Relaxed);
@@ -30946,7 +30809,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_hex(max_cap as u32);
                     print_str(b" growths=0x");
                     print_hex(growths as u32);
-                    print_str(b" (dynamic capacity pinned)\n");
+                    print_str(b" (dynamically owned capacity)\n");
                     // Path 2 — lifecycle: real ETHREADs back the live main threads (bound to their
                     // image entry at spawn), and NtTerminateProcess/NtOpenProcess route through pm.
                     // Hosted EPROCESS identity is durable; main-thread liveness is only required for

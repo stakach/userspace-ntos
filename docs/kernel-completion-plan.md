@@ -14151,3 +14151,35 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and dirty signals that carry real publication or persistence semantics. Then resume the remaining
     file query/set capture inventory. Do not replace ownership-driven reclamation with another
     watermark heuristic.
+
+    Ownership-driven allocator retention cleanup (2026-08-27, accepted): all compatibility
+    machinery that existed solely to protect allocations from the retired service-loop rewind is
+    removed. The allocator no longer exposes a durable floor or `pin_current`; the service-loop
+    finalizer no longer accepts a heap mark; and executive, I/O Manager, section-table, DLL-cache,
+    shared-image, namespace, process, token, LPC, timer, hive, overlay, and hosted-image growth no
+    longer publish pin-only dirty latches. `nt-io-manager` also drops its insertion-epoch tagging and
+    acquisition counters now that ordinary generation-protected store identity owns object lifetime.
+    This removes retention policy from subsystem mutation paths instead of replacing the rewind with
+    another watermark mechanism.
+
+    Dirty state with an actual NT or persistence meaning remains intact: writable-volume mount and
+    runtime changes still schedule snapshot checkpoint/compaction, mutable-hive changes still drive
+    journal completion and restored-image refresh, failed checkpoints retain their retry state, and
+    individual section pages still track real writeback dirtiness. Dynamic tables continue to expose
+    capacity and growth metrics without treating allocation as a service-loop lifetime event.
+
+    Focused validation passes `nt-io-manager` `210/210` and `nt-memory-manager` `13/13`; the
+    freestanding executive check remains green at the established 212-warning baseline. Serialized
+    acceptance `.tmp/run-headless-ownership-retention-cleanup-20260827.log` selected, added, and
+    started all five configured PnP devices, observed both pending starts, launched genuine userinit
+    and Explorer, painted `480000/480000` framebuffer pixels with at least 32 colours, passed all
+    `295/295` gates, and matched the sentinel. The writable snapshot reached generation 5 at
+    1,693,268 bytes. Final allocator state reported a 16,227,560-byte watermark, 14,804,992 bytes
+    allocated, 6,166,400 bytes reusable, no scratch residue after its 278,112-byte peak, and zero
+    corruption.
+
+    Review adjustment: ownership now governs all executive heap retention; no mark/reset
+    compatibility machinery remains. Resume the remaining file query/set information-class inventory
+    and implement the next missing class at the `nt-fs` model boundary first, then wire executive
+    capture/probe and completion against that tested contract. Keep provider and local-file paths on
+    the same native ABI and reject unsupported classes explicitly rather than synthesizing results.

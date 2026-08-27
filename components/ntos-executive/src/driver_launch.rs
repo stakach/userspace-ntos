@@ -10969,15 +10969,11 @@ pub(crate) unsafe fn hosted_driver_timer_wake_due(now_100ns: u64) -> u64 {
                     .iter()
                     .any(|queued| queued.instance == instance_index && queued.dpc_ptr == dpc)
                 {
-                    let old_capacity = activations.capacity();
                     activations.push(HostedDriverDpcActivation {
                         instance: instance_index,
                         timer_ptr: expiry.timer_ptr,
                         dpc_ptr: dpc,
                     });
-                    if activations.capacity() != old_capacity {
-                        crate::mark_durable_table_growth_dirty();
-                    }
                 }
             }
         }
@@ -33788,12 +33784,8 @@ unsafe fn ensure_hosted_paging_level(
         return false;
     }
 
-    let old_capacity = mappings.capacity();
     if mappings.try_reserve(1).is_err() {
         return false;
-    }
-    if mappings.capacity() != old_capacity {
-        crate::mark_durable_table_growth_dirty();
     }
 
     let cap = alloc_slot();
@@ -33872,12 +33864,8 @@ unsafe fn hosted_resource_map_caps_mut() -> &'static mut Vec<HostedResourceMapCa
 
 unsafe fn reserve_hosted_resource_map_caps(additional: usize) -> Result<(), nt_status::NtStatus> {
     let caps = hosted_resource_map_caps_mut();
-    let old_capacity = caps.capacity();
     caps.try_reserve_exact(additional)
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    if caps.capacity() != old_capacity {
-        crate::mark_durable_table_growth_dirty();
-    }
     Ok(())
 }
 
@@ -34160,10 +34148,6 @@ fn pump_io_manager(io: &mut ExecutiveIoManager) -> usize {
 /// Consume the manager's complete durable-allocation signal. Unlike the pump
 /// report, this includes canonical driver/device/File/IRP/domain records and
 /// their record-owned heap data regardless of which operation created them.
-pub(crate) fn take_io_manager_durable_storage_dirty() -> bool {
-    io_manager_mut().take_durable_storage_dirty()
-}
-
 fn copy_completed_external_irp_by_id(
     irp_id: IrpId,
     with_output: bool,
@@ -35888,13 +35872,9 @@ unsafe fn reserve_hosted_pnp_transaction(
     {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
-    let capacity = transactions.capacity();
     transactions
         .try_reserve(1)
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    if transactions.capacity() != capacity {
-        crate::mark_durable_table_growth_dirty();
-    }
     transactions.push(transaction);
     Ok(())
 }
@@ -39405,7 +39385,6 @@ unsafe fn reserve_active_hosted_irp_transfer_slot() -> Result<(), nt_status::NtS
         transfers
             .try_reserve(1)
             .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-        crate::mark_durable_table_growth_dirty();
     }
     Ok(())
 }
@@ -39440,7 +39419,6 @@ unsafe fn enter_active_hosted_irp_transfer(
     let depth = transfers.len();
     if transfers.len() == transfers.capacity() {
         transfers.try_reserve(1).ok()?;
-        crate::mark_durable_table_growth_dirty();
     }
     transfers.push(ActiveHostedIrpTransfer {
         shared_va,
@@ -39627,18 +39605,16 @@ unsafe fn hosted_driver_waiters_mut() -> &'static mut Vec<HostedDriverRawWaiter>
 
 unsafe fn hosted_driver_timer_queue_mut(
     instance: usize,
-) -> (&'static mut nt_kernel_exec::TimerQueue, bool) {
+) -> &'static mut nt_kernel_exec::TimerQueue {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DRIVER_TIMERS);
     if slot.is_none() {
         *slot = Some(Vec::new());
     }
     let queues = slot.as_mut().unwrap();
-    let old_capacity = queues.capacity();
     while queues.len() <= instance {
         queues.push(nt_kernel_exec::TimerQueue::new());
     }
-    let grew = queues.capacity() != old_capacity;
-    (&mut queues[instance], grew)
+    &mut queues[instance]
 }
 
 unsafe fn hosted_driver_dpc_activations_mut() -> &'static mut Vec<HostedDriverDpcActivation> {
@@ -41500,8 +41476,7 @@ pub(crate) fn service_hosted_driver_ke_set_timer(
 
     unsafe {
         write_unaligned((exec_timer + 4) as *mut i32, 0);
-        let (queue, outer_grew) = hosted_driver_timer_queue_mut(instance);
-        let old_capacity = queue.capacity();
+        let queue = hosted_driver_timer_queue_mut(instance);
         let was_active = queue.set(
             timer,
             due_time,
@@ -41509,9 +41484,6 @@ pub(crate) fn service_hosted_driver_ke_set_timer(
             (dpc != 0).then_some(dpc),
             &ExecutiveClock,
         );
-        if outer_grew || queue.capacity() != old_capacity {
-            crate::mark_durable_table_growth_dirty();
-        }
         let _ = crate::service_sec_image::rearm_registered_delay_timer();
         was_active as u8
     }
@@ -41534,10 +41506,7 @@ pub(crate) fn service_hosted_driver_ke_cancel_timer(
         return 0;
     }
     unsafe {
-        let (queue, grew) = hosted_driver_timer_queue_mut(instance);
-        if grew {
-            crate::mark_durable_table_growth_dirty();
-        }
+        let queue = hosted_driver_timer_queue_mut(instance);
         let was_active = queue.cancel(timer);
         let _ = crate::service_sec_image::rearm_registered_delay_timer();
         was_active as u8

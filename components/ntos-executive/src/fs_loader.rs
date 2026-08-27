@@ -1251,9 +1251,9 @@ pub(crate) struct DemandLoadResult {
 /// DLL (no code-path difference — it operates on the PE store slice + the registry).
 ///
 /// PERSISTENCE: the pool bytes live in the atomic-`POOL_NEXT` cap-mapped arena (NOT the bump heap →
-/// survives the per-syscall reset). The service loop pre-reserves slots from the live System32 cache
-/// before the heap mark, and a miss beyond that reserve grows the registry + PE store through checked
-/// vector admission. The service loop pins the durable heap mark when that store reports growth.
+/// remains valid after this call). The service loop pre-reserves slots from the live System32 cache,
+/// and a miss beyond that reserve grows the registry and PE store through checked vector admission;
+/// both stores retain their backing allocations through ordinary ownership.
 /// Transient path, import, and relocation vectors from this syscall are reclaimed by the normal
 /// per-syscall rewind.
 ///

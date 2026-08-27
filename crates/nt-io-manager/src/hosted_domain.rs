@@ -80,7 +80,7 @@ fn bind<I: Copy + Eq>(
     bindings: &mut Vec<HostedPointerBinding<I>>,
     address: u64,
     id: I,
-) -> Result<(bool, bool), NtStatus> {
+) -> Result<(), NtStatus> {
     if address == 0 {
         return Err(NtStatus::INVALID_PARAMETER);
     }
@@ -89,17 +89,16 @@ fn bind<I: Copy + Eq>(
         .find(|binding| binding.address == address || binding.id == id)
     {
         return if existing.address == address && existing.id == id {
-            Ok((false, false))
+            Ok(())
         } else {
             Err(NtStatus::OBJECT_NAME_COLLISION)
         };
     }
-    let capacity = bindings.capacity();
     bindings
         .try_reserve(1)
         .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
     bindings.push(HostedPointerBinding { address, id });
-    Ok((true, bindings.capacity() != capacity))
+    Ok(())
 }
 
 fn resolve<I: Copy + Eq>(bindings: &[HostedPointerBinding<I>], address: u64) -> Option<I> {
@@ -134,20 +133,13 @@ impl<P> IoManager<P> {
     /// Allocate a fresh hosted address-domain identity. Its cookie is the same generation-protected
     /// value carried independently in authenticated dispatch envelopes.
     pub fn register_hosted_domain(&mut self) -> HostedDomainIdentity {
-        let capacity = self.hosted_domains.capacity();
-        let id = self
-            .hosted_domains
-            .insert_tagged(HostedDomainRecord::new(), self.durable_record_epoch);
+        let id = self.hosted_domains.insert(HostedDomainRecord::new());
         let record = self
             .hosted_domains
             .get_mut(id)
             .expect("just inserted domain");
         record.cookie = id.raw();
         let cookie = record.cookie;
-        if self.hosted_domains.capacity() != capacity {
-            self.mark_durable_storage_dirty();
-        }
-        self.note_durable_record_acquired();
         HostedDomainIdentity {
             domain_id: id,
             cookie,
@@ -177,11 +169,9 @@ impl<P> IoManager<P> {
         {
             return Err(NtStatus::DEVICE_BUSY);
         }
-        let (_, insertion_epoch) = self
-            .hosted_domains
-            .remove_tagged(identity.domain_id)
+        self.hosted_domains
+            .remove(identity.domain_id)
             .ok_or(NtStatus::INVALID_PARAMETER)?;
-        self.note_durable_record_released(insertion_epoch);
         Ok(())
     }
 
@@ -296,11 +286,7 @@ impl<P> IoManager<P> {
             .get_mut(identity.domain_id)
             .filter(|domain| identity.cookie != 0 && domain.cookie == identity.cookie)
             .ok_or(NtStatus::INVALID_PARAMETER)?;
-        let (_, grew) = bind(&mut domain.drivers, address, driver)?;
-        if grew {
-            self.mark_durable_storage_dirty();
-        }
-        Ok(())
+        bind(&mut domain.drivers, address, driver)
     }
 
     /// Bind a hosted DeviceObject projection only when both independently carried pieces of the
@@ -319,11 +305,7 @@ impl<P> IoManager<P> {
             .get_mut(identity.domain_id)
             .filter(|domain| identity.cookie != 0 && domain.cookie == identity.cookie)
             .ok_or(NtStatus::INVALID_PARAMETER)?;
-        let (_, grew) = bind(&mut domain.devices, address, device)?;
-        if grew {
-            self.mark_durable_storage_dirty();
-        }
-        Ok(())
+        bind(&mut domain.devices, address, device)
     }
 
     pub fn bind_hosted_file_identity(
@@ -340,11 +322,7 @@ impl<P> IoManager<P> {
             .get_mut(identity.domain_id)
             .filter(|domain| identity.cookie != 0 && domain.cookie == identity.cookie)
             .ok_or(NtStatus::INVALID_PARAMETER)?;
-        let (_, grew) = bind(&mut domain.files, address, file)?;
-        if grew {
-            self.mark_durable_storage_dirty();
-        }
-        Ok(())
+        bind(&mut domain.files, address, file)
     }
 
     /// Remove one exact hosted DriverObject projection. Stale teardown cannot erase a replacement

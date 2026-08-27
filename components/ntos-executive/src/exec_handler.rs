@@ -177,33 +177,18 @@ fn file_io_mode_from_create(
 
 unsafe fn reserve_synchronous_file_waiter() -> bool {
     let waiters = &mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS);
-    let old_capacity = waiters.capacity();
-    let reserved = waiters.ensure_capacity();
-    if reserved && waiters.capacity() != old_capacity {
-        crate::mark_durable_table_growth_dirty();
-    }
-    reserved
+    waiters.ensure_capacity()
 }
 
 unsafe fn reserve_file_irp_drain_waiter() -> Option<nt_io_manager::PendingFileIrpDrainReservation> {
     let waiters = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS);
-    let old_capacity = waiters.allocation_capacity();
-    let reservation = waiters.reserve();
-    if reservation.is_some() && waiters.allocation_capacity() != old_capacity {
-        crate::mark_durable_table_growth_dirty();
-    }
-    reservation
+    waiters.reserve()
 }
 
 unsafe fn reserve_file_cleanup_waiter() -> Option<nt_io_manager::PendingFileCleanupWaitReservation>
 {
     let waiters = &mut *core::ptr::addr_of_mut!(PENDING_FILE_CLEANUP_WAITS);
-    let old_capacity = waiters.allocation_capacity();
-    let reservation = waiters.reserve();
-    if reservation.is_some() && waiters.allocation_capacity() != old_capacity {
-        crate::mark_durable_table_growth_dirty();
-    }
-    reservation
+    waiters.reserve()
 }
 
 #[derive(Clone, Copy)]
@@ -2775,13 +2760,7 @@ impl ExecNtHandler {
             "one syscall reserved more than one pending File owner"
         );
         let pending = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
-        let old_capacity = pending.allocation_capacity();
         self.pending_file_io_reservation = pending.reserve();
-        if self.pending_file_io_reservation.is_some()
-            && pending.allocation_capacity() != old_capacity
-        {
-            crate::mark_durable_table_growth_dirty();
-        }
         self.pending_file_io_reservation.is_some()
     }
 
@@ -2789,12 +2768,7 @@ impl ExecNtHandler {
         &mut self,
     ) -> Option<nt_io_manager::PendingSetFileNameReservation> {
         let pending = &mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES);
-        let old_capacity = pending.capacity();
-        let reservation = pending.reserve();
-        if reservation.is_some() && pending.capacity() != old_capacity {
-            crate::mark_durable_table_growth_dirty();
-        }
-        reservation
+        pending.reserve()
     }
 
     #[inline(never)]
@@ -2995,10 +2969,8 @@ impl ExecNtHandler {
         write_field!(sam_hive, sam_hive);
         write_field!(software_hive, software_hive);
         write_field!(hive_mounts, hive_mounts);
-        write_field!(hive_mounts_dirty, false);
         write_field!(mutable_hives, mutable_hives);
         write_field!(mutable_key_handles, alloc::vec::Vec::with_capacity(256));
-        write_field!(mutable_hives_dirty, false);
         write_field!(mutable_hive_journal_pending_records, 0);
         write_field!(mutable_hive_journal_pending_boot_mask, 0);
         write_field!(mutable_hive_journal_dirty_boot_mask, 0);
@@ -3008,19 +2980,16 @@ impl ExecNtHandler {
             alloc::vec::Vec::with_capacity(256)
         );
         write_field!(registry_services_order_cache_valid, false);
-        write_field!(registry_services_order_cache_dirty, false);
         write_field!(
             registry_value_copy_provenance,
             RegistryValueCopyProvenanceTable::with_capacity(64)
         );
         write_field!(registry_machine_root_security_descriptor, None);
         write_field!(registry_user_root_security_descriptor, None);
-        write_field!(registry_virtual_roots_dirty, false);
         write_field!(time_zone_information, time_zone_information);
         write_field!(obj_ns, build_initial_object_namespace());
         write_field!(events, nt_kernel_exec::EventStore::with_capacity(192));
         write_field!(user_timers, alloc::vec::Vec::with_capacity(32));
-        write_field!(user_timers_dirty, false);
         write_field!(user_timer_rearm_requested, false);
         write_field!(
             semaphores,
@@ -3103,7 +3072,6 @@ impl ExecNtHandler {
         write_field!(csr_rendezvous_conn, 0);
         write_field!(csr_rendezvous_out, 0);
         write_field!(lpc_connections, alloc::vec::Vec::with_capacity(16));
-        write_field!(lpc_connections_dirty, false);
         write_field!(winlogon_csr_view, 0);
         write_field!(csr_view_mask, 0);
         write_field!(pm, pm);
@@ -3118,11 +3086,7 @@ impl ExecNtHandler {
         write_field!(thread_runtime, HostedThreadRuntimes::reset());
         write_field!(win32k_session, Win32kSessionRuntime::reset());
         write_field!(token_store, nt_security::TokenStore::with_capacity(64));
-        write_field!(token_dirty, false);
-        write_field!(process_dirty, false);
         write_field!(overlay, nt_hive_core::RegistryOverlay::with_capacity(64));
-        write_field!(overlay_dirty, false);
-        write_field!(hosted_exe_dirty, false);
         write_field!(writable_fs_dirty, false);
         write_field!(writable_fs_commit_required, false);
         let handler = &mut *slot;
@@ -3582,7 +3546,7 @@ impl ExecNtHandler {
                 return;
             }
         };
-        self.mark_mutable_hives_dirty();
+        self.note_mutable_hives_changed();
         print_str(b"[network-setup] HKLM\\SYSTEM committed through CM generation ");
         print_u64(generation);
         print_str(b": ndis=");
@@ -3621,7 +3585,7 @@ impl ExecNtHandler {
         };
         EXPLORER_SHELL_COM_REG_CLASSES_PROVISIONED.store(mask, Ordering::Relaxed);
         if changed {
-            self.mark_mutable_hives_dirty_preserving_services_order();
+            self.note_mutable_hives_changed_preserving_services_order();
             trace_setup_provision_phase(b"shell-com-changed", mask);
         }
         if failed {
@@ -3681,7 +3645,7 @@ impl ExecNtHandler {
                 return;
             }
         };
-        self.mark_mutable_hives_dirty_preserving_services_order();
+        self.note_mutable_hives_changed_preserving_services_order();
         print_str(b"[print-setup] HKLM\\SYSTEM committed through CM generation ");
         print_u64(generation);
         print_str(b": root=");
@@ -3733,7 +3697,7 @@ impl ExecNtHandler {
             }
             return;
         }
-        self.mark_mutable_hives_dirty_preserving_services_order();
+        self.note_mutable_hives_changed_preserving_services_order();
         print_str(b"[profile-setup] HKU\\.DEFAULT shell folders provisioned: Shell Folders=");
         print_u64(stats.shell_folder_values as u64);
         print_str(b" User Shell Folders=");
@@ -3855,8 +3819,7 @@ impl ExecNtHandler {
     /// ★ BYPASS SWITCH `PROVISION_DEFAULT_USER_LOCALE`.
     ///
     /// # Safety
-    /// Runs during construction, below the service loop's bump-heap mark, so the overlay strings
-    /// it allocates are permanent by construction (no `overlay_dirty` pin needed).
+    /// Runs during construction; the overlay owns the strings it allocates.
     unsafe fn provision_default_user_locale(&mut self) {
         if !PROVISION_DEFAULT_USER_LOCALE {
             return;
@@ -3978,7 +3941,7 @@ impl ExecNtHandler {
                 .commit_and_project_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)
             {
                 Ok(generation) => {
-                    self.mark_mutable_hives_dirty_preserving_services_order();
+                    self.note_mutable_hives_changed_preserving_services_order();
                     Some(generation)
                 }
                 Err(status) => {
@@ -4094,7 +4057,7 @@ impl ExecNtHandler {
         let grows_buffer = self.mutable_key_handles.len() == self.mutable_key_handles.capacity();
         self.mutable_key_handles.push(Some(key));
         if grows_buffer {
-            self.mark_mutable_hives_dirty_preserving_services_order();
+            self.note_mutable_hives_changed_preserving_services_order();
         }
         Ok(MUTABLE_KEY_TAG | (self.mutable_key_handles.len() - 1) as u32)
     }
@@ -5205,7 +5168,6 @@ impl ExecNtHandler {
             slot: None,
             dynamic: false,
         });
-        self.hive_mounts_dirty = true;
     }
 
     fn refresh_boot_hive_checkpoint_from_path(&mut self, hive_sel: u32, file_path: &str) -> bool {
@@ -5416,7 +5378,6 @@ impl ExecNtHandler {
         };
         match compacted {
             Ok(compaction) if compaction.reclaimed_blobs() != 0 => {
-                self.mutable_hives_dirty = true;
                 print_str(b"[cm-flush] compacted hive value blobs=");
                 print_u64(compaction.blobs_before as u64);
                 print_str(b"->");
@@ -5700,7 +5661,6 @@ impl ExecNtHandler {
         let remaining_dirty = self.boot_mutable_hive_dirty_cells();
         REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.store(remaining_dirty as u64, Ordering::Relaxed);
         if remaining_dirty != 0 {
-            self.mutable_hives_dirty = true;
             print_str(b"[cm-flush] quiesce boot hive checkpoint deferred dirty-cells=");
             print_u64(remaining_dirty as u64);
             print_str(b" heap-headroom=");
@@ -6028,7 +5988,7 @@ impl ExecNtHandler {
             }
             NT_LOAD_KEY_CORE_HIVE_MOUNTED.fetch_add(1, Ordering::Relaxed);
         }
-        self.mark_mutable_hives_dirty_preserving_services_order();
+        self.note_mutable_hives_changed_preserving_services_order();
         self.hive_mounts.push(HiveMount {
             sel: hive_sel,
             canon,
@@ -6038,7 +5998,6 @@ impl ExecNtHandler {
             slot: Some(slot),
             dynamic: true,
         });
-        self.hive_mounts_dirty = true;
         NT_LOAD_KEY_MOUNTED.fetch_add(1, Ordering::Relaxed);
         NT_LOAD_KEY_HIVE_BYTES.store(len as u64, Ordering::Relaxed);
         NT_LOAD_KEY_ROOT_SUBKEYS.store(root_subkeys, Ordering::Relaxed);
@@ -6218,14 +6177,8 @@ impl ExecNtHandler {
                 if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free() {
                     return STATUS_INSUFFICIENT_RESOURCES;
                 }
-                let old_capacity = self.pending_driver_loads.allocation_capacity();
                 match self.pending_driver_loads.reserve() {
-                    Ok(reservation) => {
-                        if self.pending_driver_loads.allocation_capacity() != old_capacity {
-                            crate::mark_durable_table_growth_dirty();
-                        }
-                        Some(reservation)
-                    }
+                    Ok(reservation) => Some(reservation),
                     Err(_) => return STATUS_INSUFFICIENT_RESOURCES,
                 }
             } else {
@@ -6280,7 +6233,6 @@ impl ExecNtHandler {
                             },
                         )
                         .expect("lost driver START ownership could not publish its barrier");
-                    crate::mark_durable_table_growth_dirty();
                     return failure.status.raw() as u32;
                 }
             }
@@ -6392,7 +6344,7 @@ impl ExecNtHandler {
             USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
         }
         if self.mutable_hives.unmount(&mount.mount).is_some() {
-            self.mark_mutable_hives_dirty_preserving_services_order();
+            self.note_mutable_hives_changed_preserving_services_order();
         }
         let mut mutable_handles_invalidated = 0usize;
         for entry in self.mutable_key_handles.iter_mut() {
@@ -6402,8 +6354,6 @@ impl ExecNtHandler {
             }
         }
         let overlay_detached = self.overlay.detach_subtree(&canon);
-        self.overlay_dirty = true;
-        self.hive_mounts_dirty = true;
         NT_UNLOAD_KEY_DETACHED.fetch_add(1, Ordering::Relaxed);
         if let Some(index) = event_index {
             let status = self.signal_event_index(index);
@@ -6520,17 +6470,14 @@ impl ExecNtHandler {
     ) -> Result<(), u32> {
         if target == MACHINE_ROOT_KEY {
             self.registry_machine_root_security_descriptor = Some(descriptor.to_vec());
-            self.registry_virtual_roots_dirty = true;
             return Ok(());
         }
         if target == USER_ROOT_KEY {
             self.registry_user_root_security_descriptor = Some(descriptor.to_vec());
-            self.registry_virtual_roots_dirty = true;
             return Ok(());
         }
         if let Some(index) = self.registry_overlay_index(target) {
             if self.overlay.set_key_security_descriptor(index, descriptor) {
-                self.overlay_dirty = true;
                 return Ok(());
             }
             return Err(0xC000_0008);
@@ -6548,7 +6495,7 @@ impl ExecNtHandler {
             } else {
                 self.journal_set_mutable_key_security_descriptor(key, descriptor)?;
             }
-            self.mark_mutable_hives_dirty_preserving_services_order();
+            self.note_mutable_hives_changed_preserving_services_order();
             return Ok(());
         }
         if self.base_hive(target).is_some() {
@@ -6565,7 +6512,6 @@ impl ExecNtHandler {
         if !self.overlay.set_key_security_descriptor(index, descriptor) {
             return Err(0xC000_0008);
         }
-        self.overlay_dirty = true;
         Ok(())
     }
 
@@ -6710,7 +6656,7 @@ impl ExecNtHandler {
         {
             return false;
         }
-        self.mark_mutable_hives_dirty_for_services_order_change(
+        self.note_mutable_hives_changed_for_services_order_change(
             self.registry_services_order_value_write_may_reorder(full_path),
         );
         true
@@ -6861,7 +6807,7 @@ impl ExecNtHandler {
                 }],
                 SystemHiveMutationOrigin::Runtime,
             )?;
-            self.mark_mutable_hives_dirty_preserving_services_order();
+            self.note_mutable_hives_changed_preserving_services_order();
             return Ok(());
         }
         self.ensure_mutable_registry_value_by_path(&path, value_name, REG_SZ, &data[..len])
@@ -7397,22 +7343,19 @@ impl ExecNtHandler {
         stats
     }
 
-    fn mark_mutable_hives_dirty(&mut self) {
-        self.mutable_hives_dirty = true;
+    fn note_mutable_hives_changed(&mut self) {
         self.invalidate_registry_services_order_cache();
         bump_progress();
     }
 
-    fn mark_mutable_hives_dirty_preserving_services_order(&mut self) {
-        self.mutable_hives_dirty = true;
+    fn note_mutable_hives_changed_preserving_services_order(&mut self) {
         bump_progress();
     }
 
-    fn mark_mutable_hives_dirty_for_services_order_change(
+    fn note_mutable_hives_changed_for_services_order_change(
         &mut self,
         services_order_may_change: bool,
     ) {
-        self.mutable_hives_dirty = true;
         if services_order_may_change {
             self.invalidate_registry_services_order_cache();
         }
@@ -7583,13 +7526,11 @@ impl ExecNtHandler {
         else {
             self.registry_services_order_cache.clear();
             self.registry_services_order_cache_valid = true;
-            self.registry_services_order_cache_dirty = true;
             return true;
         };
         let Some(hive) = self.mutable_hives.hive(services_key.hive) else {
             self.registry_services_order_cache.clear();
             self.registry_services_order_cache_valid = true;
-            self.registry_services_order_cache_dirty = true;
             return true;
         };
         let mut entries = alloc::vec::Vec::with_capacity(hive.subkey_count(services_key.key));
@@ -7615,7 +7556,6 @@ impl ExecNtHandler {
             self.registry_services_order_cache.push(entry.name);
         }
         self.registry_services_order_cache_valid = true;
-        self.registry_services_order_cache_dirty = true;
         true
     }
 
@@ -9339,7 +9279,6 @@ impl ExecNtHandler {
         let handle = self.pm.insert_handle(pid, object, granted_access)?;
         let cap_after = self.pm.handle_capacity(pid);
         if cap_after > cap_before {
-            self.process_dirty = true;
             PM_HANDLE_CAP_GROWTHS.fetch_add(1, Ordering::Relaxed);
         }
         if cap_after as u64 > PM_HANDLE_CAP_MAX.load(Ordering::Relaxed) {
@@ -9410,8 +9349,6 @@ impl ExecNtHandler {
             let _ = self.token_store.release(token);
             return Err(status);
         }
-        self.token_dirty = true;
-        self.process_dirty = true;
         PM_DYNAMIC_PROCESS_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         self.refresh_process_manager_gates();
         unsafe {
@@ -9610,7 +9547,6 @@ impl ExecNtHandler {
         let reservation = self.pm.try_reserve_handle_slot(pid)?;
         let reserved = self.pm.handle_capacity(pid);
         if reserved != capacity {
-            self.process_dirty = true;
             PM_HANDLE_CAP_GROWTHS.fetch_add(1, Ordering::Relaxed);
             PM_HANDLE_CAP_MAX.fetch_max(reserved as u64, Ordering::Relaxed);
         }
@@ -17011,11 +16947,7 @@ impl ExecNtHandler {
                 Ok(token) => token,
                 Err(status) => return status,
             };
-        let status = self.insert_owned_token_handle(caller_pid, duplicate, desired_access, out);
-        if status == 0 {
-            self.token_dirty = true;
-        }
-        status
+        self.insert_owned_token_handle(caller_pid, duplicate, desired_access, out)
     }
 
     /// `NtCreateToken(TokenHandle, DesiredAccess, ObjectAttributes, TokenType, AuthenticationId,`
@@ -17171,9 +17103,6 @@ impl ExecNtHandler {
             // `insert_owned_token_handle` already released the token on every failure path.
             return status;
         }
-        // The token body was allocated ABOVE this iteration's bump-heap mark; pin the mark past it
-        // so the minted token survives the per-syscall reset (same contract as NtDuplicateToken).
-        self.token_dirty = true;
         SE_CREATE_TOKEN_MINTED.fetch_add(1, Ordering::Relaxed);
         if SE_CREATE_TOKEN_PI.load(Ordering::Relaxed) == u64::MAX {
             // Read the shape back OUT OF THE STORE, not out of the captured value, so the recorded
@@ -17280,11 +17209,7 @@ impl ExecNtHandler {
             }
             context.token
         };
-        let status = self.insert_owned_token_handle(caller_pid, owned, nt_ulong_arg(args[1]), out);
-        if status == 0 && context.copy_on_open {
-            self.token_dirty = true;
-        }
-        status
+        self.insert_owned_token_handle(caller_pid, owned, nt_ulong_arg(args[1]), out)
     }
 
     unsafe fn nt_set_thread_impersonation_token(&mut self, args: &[u64]) -> u32 {
@@ -20259,9 +20184,7 @@ impl ExecNtHandler {
         let transaction_id = (&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))
             .park_reserved(transaction_reservation, transaction)
             .expect("reserved set-file-name transaction rejected its captured buffers");
-        // Both owned buffers now outlive this syscall dispatch. Protect their durable allocations
-        // from the service-loop compatibility rewind even when the table reused existing capacity.
-        crate::mark_durable_table_growth_dirty();
+        // Both captured buffers transfer into the pending I/O owner before this dispatch returns.
         self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
             file_id: route.file_id,
             irp_id: pending_irp,
@@ -20648,7 +20571,6 @@ impl ExecNtHandler {
                 print_str(b"[lpc-cache] failed to grow established LPC connection table\n");
                 return false;
             }
-            self.lpc_connections_dirty = true;
             print_str(b"[lpc-cache] grew established LPC connection table capacity=");
             print_u64(self.lpc_connections.capacity() as u64);
             print_str(b"\n");
@@ -21585,7 +21507,6 @@ impl ExecNtHandler {
             self.user_timers
                 .try_reserve(self.user_timers.capacity().max(16))
                 .map_err(|_| 0xC000_009A_u32)?;
-            self.user_timers_dirty = true;
         }
         self.user_timers.push(UserTimerRecord {
             object_index,
@@ -22632,12 +22553,9 @@ impl ExecNtHandler {
             }
         };
         if hosted_exe_image.is_none() && !want_dir {
-            if let Some((image, admitted)) =
+            if let Some((image, _)) =
                 admit_dynamic_hosted_exe(ctx, dynamic_role, name16, &nb[..nlen], is_sxs)
             {
-                if admitted {
-                    self.hosted_exe_dirty = true;
-                }
                 hosted_exe_image = Some(image);
             }
         }
@@ -24053,7 +23971,7 @@ impl ExecNtHandler {
                     };
                     crate::probe_seg!(
                         8,
-                        self.mark_mutable_hives_dirty_for_services_order_change(
+                        self.note_mutable_hives_changed_for_services_order_change(
                             self.registry_services_order_key_membership_may_change(canon),
                         )
                     );
@@ -24141,7 +24059,6 @@ impl ExecNtHandler {
                         return 0xC000_0008;
                     }
                 }
-                self.overlay_dirty = true;
                 let canon = self.overlay.path(oidx).unwrap_or("");
                 // Provenance counters for the LSA/SAM gate specs: keys created by lsasrv's OWN
                 // `LsapCreateDatabaseKeys`/`LsapCreateDatabaseObjects` under SECURITY\Policy, and by
@@ -24397,7 +24314,7 @@ impl ExecNtHandler {
                         ) {
                             return status;
                         }
-                        self.mark_mutable_hives_dirty_for_services_order_change(
+                        self.note_mutable_hives_changed_for_services_order_change(
                             services_order_may_change,
                         );
                         return 0;
@@ -24430,7 +24347,7 @@ impl ExecNtHandler {
                             false
                         };
                         if logged_copy {
-                            self.mark_mutable_hives_dirty_for_services_order_change(
+                            self.note_mutable_hives_changed_for_services_order_change(
                                 services_order_may_change,
                             );
                             return 0;
@@ -24455,7 +24372,7 @@ impl ExecNtHandler {
                     ) {
                         return status;
                     }
-                    self.mark_mutable_hives_dirty_for_services_order_change(
+                    self.note_mutable_hives_changed_for_services_order_change(
                         services_order_may_change,
                     );
                     return 0;
@@ -24487,7 +24404,6 @@ impl ExecNtHandler {
                 {
                     return 0xC000_0008;
                 }
-                self.overlay_dirty = true;
                 bump_progress();
                 0 // STATUS_SUCCESS
             },
@@ -24583,7 +24499,6 @@ impl ExecNtHandler {
                     if self.overlay.detach_subtree(&path) == 0 {
                         return 0xC000_0034;
                     }
-                    self.overlay_dirty = true;
                     bump_progress();
                     return 0;
                 }
@@ -24607,11 +24522,9 @@ impl ExecNtHandler {
                     match mutation_status {
                         Ok(()) => {
                             if let Some(path) = key_path.as_deref() {
-                                if self.overlay.detach_subtree(path) != 0 {
-                                    self.overlay_dirty = true;
-                                }
+                                let _ = self.overlay.detach_subtree(path);
                             }
-                            self.mark_mutable_hives_dirty_for_services_order_change(
+                            self.note_mutable_hives_changed_for_services_order_change(
                                 services_order_may_change,
                             );
                             return 0;
@@ -24659,7 +24572,6 @@ impl ExecNtHandler {
                     if !self.overlay.delete_value(index, name) {
                         return 0xC000_0008;
                     }
-                    self.overlay_dirty = true;
                     bump_progress();
                     return 0;
                 }
@@ -24682,7 +24594,7 @@ impl ExecNtHandler {
                     if let Err(status) = mutation_status {
                         return status;
                     }
-                    self.mark_mutable_hives_dirty_for_services_order_change(
+                    self.note_mutable_hives_changed_for_services_order_change(
                         services_order_may_change,
                     );
                     return 0;
@@ -28331,7 +28243,6 @@ impl ExecNtHandler {
                             updated,
                         ) {
                             Ok(()) => {
-                                self.process_dirty = true;
                                 0
                             }
                             Err(status) => status,
@@ -28370,7 +28281,6 @@ impl ExecNtHandler {
                             updated,
                         ) {
                             Ok(()) => {
-                                self.process_dirty = true;
                                 0
                             }
                             Err(status) => status,
@@ -33584,7 +33494,6 @@ impl ExecNtHandler {
                     self.pm.destroy_debug_object(object);
                     return 0xC000_0005;
                 }
-                self.process_dirty = true;
                 DBGK_OBJECTS_CREATED.fetch_add(1, Ordering::Relaxed);
                 0
             },

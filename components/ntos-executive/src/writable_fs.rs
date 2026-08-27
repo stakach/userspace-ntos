@@ -1357,10 +1357,8 @@ pub(crate) unsafe fn open_existing_relative_if_mounted(
 /// Provision a writable-layer directory by already-folded volume-relative path. This is not a
 /// syscall success path; it materializes directory objects that the installed read-only image proves
 /// exist so later creates can allocate children in the writable layer.
-/// Provision a writable-layer directory and report whether the mounted volume grew.
-///
-/// The service loop uses the growth bit to pin bump-heap allocations that became durable MemFs
-/// metadata. A successful no-op provision should not pin unrelated transient syscall buffers.
+/// Provision a writable-layer directory and report whether the mounted volume grew. Callers use the
+/// growth result to schedule persistence work only when the filesystem actually changed.
 pub(crate) unsafe fn provision_directory_relative_change(relative: &[u8]) -> Option<bool> {
     let Some(fs) = writable_fs() else {
         return None;

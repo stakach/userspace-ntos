@@ -60,7 +60,6 @@ impl_io_id!(
 struct Slot<T> {
     generation: u32,
     value: Option<T>,
-    insertion_epoch: u64,
 }
 
 /// A slot-map of `T` keyed by a generation-protected id `I`.
@@ -85,22 +84,15 @@ impl<I: IoId, T> GenStore<I, T> {
 
     /// Insert a record, returning its fresh id (reuses a freed slot if any).
     pub fn insert(&mut self, value: T) -> I {
-        self.insert_tagged(value, 0)
-    }
-
-    /// Insert a record carrying an owner-defined acquisition epoch.
-    pub fn insert_tagged(&mut self, value: T, insertion_epoch: u64) -> I {
         if let Some(idx) = self.slots.iter().position(|s| s.value.is_none()) {
             // The slot's generation was already bumped when it was freed.
             self.slots[idx].value = Some(value);
-            self.slots[idx].insertion_epoch = insertion_epoch;
             I::from_parts(self.slots[idx].generation, idx as u64)
         } else {
             let idx = self.slots.len();
             self.slots.push(Slot {
                 generation: 1,
                 value: Some(value),
-                insertion_epoch,
             });
             I::from_parts(1, idx as u64)
         }
@@ -131,22 +123,15 @@ impl<I: IoId, T> GenStore<I, T> {
     /// Remove a record by id (bumping its slot's generation). Returns the record,
     /// or `None` for a stale/unknown id.
     pub fn remove(&mut self, id: I) -> Option<T> {
-        self.remove_tagged(id).map(|(value, _)| value)
-    }
-
-    /// Remove a record and return the acquisition epoch stored with it.
-    pub fn remove_tagged(&mut self, id: I) -> Option<(T, u64)> {
         let (gen, slot) = id.parts();
         let s = self.slots.get_mut(slot as usize)?;
         if s.generation != gen {
             return None;
         }
         let v = s.value.take();
-        let insertion_epoch = s.insertion_epoch;
         let value = v?;
-        s.insertion_epoch = 0;
         s.generation = next_gen(s.generation);
-        Some((value, insertion_epoch))
+        Some(value)
     }
 
     /// True if `id` resolves to a live record.

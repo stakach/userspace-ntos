@@ -14,9 +14,8 @@
 //! `CurrentControlSet` identity before canonicalization, so alias and physical paths land on the
 //! same overlay key.
 //!
-//! `no_std` + `alloc`. Pure model (no I/O, no pointers) → host-testable; the executive keeps one
-//! instance alive across its per-syscall bump-heap reset by pre-reserving its capacity and pinning
-//! the heap high-water mark past each mutation (see the executive's `service_sec_image` loop).
+//! `no_std` + `alloc`. Pure model (no I/O, no pointers) → host-testable; the executive owns one
+//! instance for the mounted hive's lifetime.
 
 extern crate alloc;
 

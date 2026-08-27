@@ -199,12 +199,6 @@ pub struct IoManager<P> {
     disconnected_client_retries: Vec<ClientId>,
     port: P,
     backends: Vec<Box<dyn DriverDispatchBackend>>,
-    /// Sticky notification that manager-owned backing storage grew.
-    durable_storage_dirty: bool,
-    /// Epoch and live count for record-owned allocations acquired since the last durability
-    /// barrier. Removing the exact record in the same epoch cancels that acquisition.
-    durable_record_epoch: u64,
-    durable_record_acquisitions: usize,
 }
 
 impl<P> IoManager<P> {
@@ -224,43 +218,7 @@ impl<P> IoManager<P> {
             disconnected_client_retries: Vec::new(),
             port,
             backends: Vec::new(),
-            durable_storage_dirty: false,
-            durable_record_epoch: 1,
-            durable_record_acquisitions: 0,
         }
-    }
-
-    #[inline]
-    pub(crate) fn mark_durable_storage_dirty(&mut self) {
-        self.durable_storage_dirty = true;
-    }
-
-    #[inline]
-    fn note_durable_record_acquired(&mut self) {
-        self.durable_record_acquisitions = self
-            .durable_record_acquisitions
-            .checked_add(1)
-            .expect("durable I/O record acquisition overflow");
-    }
-
-    #[inline]
-    fn note_durable_record_released(&mut self, insertion_epoch: u64) {
-        if insertion_epoch == self.durable_record_epoch {
-            self.durable_record_acquisitions = self
-                .durable_record_acquisitions
-                .checked_sub(1)
-                .expect("durable I/O record acquisition underflow");
-        }
-    }
-
-    /// Consume notification that the manager acquired heap-backed state which
-    /// may outlive the operation that created it.
-    pub fn take_durable_storage_dirty(&mut self) -> bool {
-        let dirty = core::mem::take(&mut self.durable_storage_dirty)
-            || self.durable_record_acquisitions != 0;
-        self.durable_record_acquisitions = 0;
-        self.durable_record_epoch = self.durable_record_epoch.wrapping_add(1).max(1);
-        dirty
     }
 
     /// Borrow the Object Manager port.
@@ -275,7 +233,6 @@ impl<P> IoManager<P> {
     /// Register a dispatch backend, returning its registry index.
     pub fn register_backend(&mut self, backend: Box<dyn DriverDispatchBackend>) -> usize {
         self.backends.push(backend);
-        self.mark_durable_storage_dirty();
         self.backends.len() - 1
     }
 
@@ -283,15 +240,8 @@ impl<P> IoManager<P> {
 
     /// Register a driver record, assigning + returning its id.
     pub fn register_driver(&mut self, record: DriverRecord) -> DriverId {
-        let capacity = self.drivers.capacity();
-        let id = self
-            .drivers
-            .insert_tagged(record, self.durable_record_epoch);
+        let id = self.drivers.insert(record);
         self.drivers.get_mut(id).expect("just inserted").id = id;
-        if self.drivers.capacity() != capacity {
-            self.mark_durable_storage_dirty();
-        }
-        self.note_durable_record_acquired();
         id
     }
 
@@ -302,9 +252,7 @@ impl<P> IoManager<P> {
         self.drivers.get_mut(id)
     }
     pub fn remove_driver(&mut self, id: DriverId) -> Option<DriverRecord> {
-        let (record, insertion_epoch) = self.drivers.remove_tagged(id)?;
-        self.note_durable_record_released(insertion_epoch);
-        Some(record)
+        self.drivers.remove(id)
     }
     pub fn driver_count(&self) -> usize {
         self.drivers.len()
@@ -384,24 +332,14 @@ impl<P> IoManager<P> {
     /// linking it into the owning driver's device list.
     pub fn add_device(&mut self, record: DeviceRecord) -> DeviceId {
         let driver_id = record.driver_id;
-        let capacity = self.devices.capacity();
-        let id = self
-            .devices
-            .insert_tagged(record, self.durable_record_epoch);
+        let id = self.devices.insert(record);
         if let Some(d) = self.devices.get_mut(id) {
             d.id = id;
             d.top_of_stack = id;
         }
-        let mut driver_devices_grew = false;
         if let Some(drv) = self.drivers.get_mut(driver_id) {
-            let capacity = drv.devices.capacity();
             drv.devices.push(id);
-            driver_devices_grew = drv.devices.capacity() != capacity;
         }
-        if self.devices.capacity() != capacity || driver_devices_grew {
-            self.mark_durable_storage_dirty();
-        }
-        self.note_durable_record_acquired();
         id
     }
 
@@ -412,8 +350,7 @@ impl<P> IoManager<P> {
         self.devices.get_mut(id)
     }
     pub fn remove_device(&mut self, id: DeviceId) -> Option<DeviceRecord> {
-        let (record, insertion_epoch) = self.devices.remove_tagged(id)?;
-        self.note_durable_record_released(insertion_epoch);
+        let record = self.devices.remove(id)?;
         if let Some(driver) = self.drivers.get_mut(record.driver_id) {
             driver.devices.retain(|device| *device != id);
         }
@@ -760,13 +697,8 @@ impl<P> IoManager<P> {
 
     /// Add a file record, assigning + returning its id.
     pub fn add_file(&mut self, record: FileRecord) -> FileId {
-        let capacity = self.files.capacity();
-        let id = self.files.insert_tagged(record, self.durable_record_epoch);
+        let id = self.files.insert(record);
         self.files.get_mut(id).expect("just inserted").id = id;
-        if self.files.capacity() != capacity {
-            self.mark_durable_storage_dirty();
-        }
-        self.note_durable_record_acquired();
         id
     }
 
@@ -785,9 +717,7 @@ impl<P> IoManager<P> {
         {
             return None;
         }
-        let (record, insertion_epoch) = self.files.remove_tagged(id)?;
-        self.note_durable_record_released(insertion_epoch);
-        Some(record)
+        self.files.remove(id)
     }
     pub fn file_count(&self) -> usize {
         self.files.len()
@@ -970,13 +900,8 @@ impl<P> IoManager<P> {
                     .outstanding_irp_refs += 1;
             }
         }
-        let capacity = self.irps.capacity();
-        let id = self.irps.insert_tagged(record, self.durable_record_epoch);
+        let id = self.irps.insert(record);
         self.irps.get_mut(id).expect("just inserted").id = id;
-        if self.irps.capacity() != capacity {
-            self.mark_durable_storage_dirty();
-        }
-        self.note_durable_record_acquired();
         Ok(id)
     }
 
@@ -987,8 +912,7 @@ impl<P> IoManager<P> {
         self.irps.get_mut(id)
     }
     pub fn free_irp(&mut self, id: IrpId) -> Option<IrpRecord> {
-        let (record, insertion_epoch) = self.irps.remove_tagged(id)?;
-        self.note_durable_record_released(insertion_epoch);
+        let record = self.irps.remove(id)?;
         self.completed_irps.retain(|queued| *queued != id);
         if let Some(file_id) = record.file_id {
             if let Some(file) = self.files.get_mut(file_id) {
@@ -1043,11 +967,7 @@ impl<P> IoManager<P> {
 
     pub(crate) fn queue_deferred_file_close(&mut self, file_id: FileId) {
         if !self.deferred_file_close_retries.contains(&file_id) {
-            let capacity = self.deferred_file_close_retries.capacity();
             self.deferred_file_close_retries.push(file_id);
-            if self.deferred_file_close_retries.capacity() != capacity {
-                self.mark_durable_storage_dirty();
-            }
         }
     }
     pub fn irp_count(&self) -> usize {
@@ -1460,83 +1380,6 @@ mod tests {
         assert!(f.transition(FileState::Closed));
         assert!(f.state.is_closed());
         assert!(!f.transition(FileState::Open)); // closed is terminal
-    }
-
-    #[test]
-    fn durable_storage_signal_covers_file_and_irp_records_outside_pump() {
-        let mut om = io();
-        let driver = a_driver(&mut om);
-        let device = a_device(&mut om, driver);
-        assert!(om.take_durable_storage_dirty());
-        assert!(!om.take_durable_storage_dirty());
-
-        let first = om.add_file(FileRecord::new(
-            ObjectId::NULL,
-            ClientId(1),
-            device,
-            AccessMask::GENERIC_READ,
-            ShareAccess::READ,
-            CreateOptions::empty(),
-            path("\\Device\\Test0\\first").to_unicode_string(),
-        ));
-        assert!(om.take_durable_storage_dirty());
-        assert!(!om.take_durable_storage_dirty());
-
-        assert!(om.remove_file(first).is_some());
-        let replacement = om.add_file(FileRecord::new(
-            ObjectId::NULL,
-            ClientId(1),
-            device,
-            AccessMask::GENERIC_READ,
-            ShareAccess::READ,
-            CreateOptions::empty(),
-            path("\\Device\\Test0\\replacement").to_unicode_string(),
-        ));
-        assert_ne!(replacement, first);
-        // Reusing a GenStore slot still transfers ownership of the new record's
-        // path allocation, so this is durable even without Vec growth.
-        assert!(om.take_durable_storage_dirty());
-        assert!(om.remove_file(replacement).is_some());
-
-        let transient = om.add_file(FileRecord::new(
-            ObjectId::NULL,
-            ClientId(1),
-            device,
-            AccessMask::GENERIC_READ,
-            ShareAccess::READ,
-            CreateOptions::empty(),
-            path("\\Device\\Test0\\transient").to_unicode_string(),
-        ));
-        assert!(om.remove_file(transient).is_some());
-        // The existing GenStore slot and all record-owned storage were released in this epoch.
-        assert!(!om.take_durable_storage_dirty());
-
-        let make_irp = |om: &IoManager<MockObjectPort>| {
-            om.build_irp_record(
-                ClientId(1),
-                driver,
-                device,
-                None,
-                major::IRP_MJ_DEVICE_CONTROL,
-                IoParameters::Unsupported,
-            )
-            .unwrap()
-        };
-        let record = make_irp(&om);
-        let first_irp = om.allocate_irp(record).unwrap();
-        assert!(om.free_irp(first_irp).is_some());
-        // The first insertion grew the IRP slot store even though the record itself was released.
-        assert!(om.take_durable_storage_dirty());
-
-        let record = make_irp(&om);
-        let transient_irp = om.allocate_irp(record).unwrap();
-        assert!(om.free_irp(transient_irp).is_some());
-        assert!(!om.take_durable_storage_dirty());
-
-        let record = make_irp(&om);
-        let pending_irp = om.allocate_irp(record).unwrap();
-        assert!(om.take_durable_storage_dirty());
-        assert!(om.free_irp(pending_irp).is_some());
     }
 
     #[test]

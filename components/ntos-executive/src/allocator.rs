@@ -27,22 +27,20 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 pub const HEAP_BASE: usize = 0x0000_0100_2000_0000;
 /// Heap size in 4 KiB frames — the allocator's hard cap. Now that the VA layout is roomy, the
 /// executive gets a dedicated desktop-sized arena (was a cramped 128 KiB that OOM'd during registry
-/// enum, forcing per-syscall mark/reset). Spawned services map a declared subset of this address
+/// enum, once forcing per-syscall mark/reset). Spawned services map a declared subset of this address
 /// range; ordinary components use [`DEFAULT_SERVICE_HEAP_FRAMES`].
 /// ★ RAISED 512 -> 1536 (2 MiB -> 6 MiB). The 2 MiB cap was measured at **1953957/2097152 = 93%**
-/// at the winlogon profile frontier: the CM overlay, the writable volume and every `*_dirty`
-/// mark-pin move the permanent floor, and a heap that reaches its cap does not panic — allocations
-/// start returning null and callers quietly take their error paths, which is what a mysteriously
-/// slow, never-quiescing boot looks like from outside. The materialised profile tree and the
-/// per-user hive load need headroom above that, so the executive gets it.
+/// at the winlogon profile frontier. A heap that reaches its cap does not panic: allocations start
+/// returning null and callers quietly take their error paths, which is what a mysteriously slow,
+/// never-quiescing boot looks like from outside. The materialised profile tree and the per-user hive
+/// load need headroom above that, so the executive gets it.
 /// ★ RAISED 1536 -> 1792 (6 MiB -> 7 MiB) once Dbgk stopped allocating late and instead precharged
-/// bounded `DEBUG_OBJECT` slots/event queues before the service-loop reset mark. That is durable NT
-/// object state, not transient proof scaffolding, and the previous full boot ended with only a few
-/// KiB free under the 6 MiB cap.
+/// bounded `DEBUG_OBJECT` slots/event queues. That is durable NT object state, not transient proof
+/// scaffolding, and the previous full boot ended with only a few KiB free under the 6 MiB cap.
 /// ★ RAISED 1792 -> 2048 (7 MiB -> 8 MiB) when the live mutable-hive authority started owning
 /// installed setup state and shell COM class provisioning directly in mounted hives. The prior green
 /// boot measured 6.82 MiB used under the 7 MiB cap, leaving too little room for that durable CM
-/// state before the service-loop reset mark. Spawned service heaps remain capped separately below.
+/// state. Spawned service heaps remain capped separately below.
 /// ★ RAISED 2048 -> 4096 (8 MiB -> 16 MiB) after the growable PnP launch/status cleanup produced a
 /// real desktop proof with only about 128 KiB left under the executive bump cap while the measured
 /// root-Untyped pool still had about 59 MiB free. This is a local executive-arena ceiling, not a
@@ -74,11 +72,9 @@ const MAPPED_HEAP_BYTES: usize =
 const TRANSIENT_CTR: usize = HEAP_BASE + 64; // bytes consumed downward from the mapped heap end
 const TRANSIENT_DEPTH: usize = HEAP_BASE + 72; // nested transient allocation scopes
 const TRANSIENT_HIGH_WATER: usize = HEAP_BASE + 80; // peak transient bytes consumed
-const DURABLE_FLOOR: usize = HEAP_BASE + 88; // bump watermark protected from bulk rewind
 const DATA: usize = HEAP_BASE + 128; // allocations start past allocator/local metadata
 const _: () = assert!(MAPPED_HEAP_BYTES + size_of::<usize>() <= TRANSIENT_CTR);
-const _: () = assert!(TRANSIENT_HIGH_WATER + size_of::<usize>() <= DURABLE_FLOOR);
-const _: () = assert!(DURABLE_FLOOR + size_of::<usize>() <= DATA);
+const _: () = assert!(TRANSIENT_HIGH_WATER + size_of::<usize>() <= DATA);
 const WORD: usize = size_of::<usize>();
 const ALLOC_GRANULE: usize = align_of::<usize>();
 const FREE_NODE_SIZE: usize = WORD * 2; // { size, next } stored inside the freed block
@@ -831,19 +827,6 @@ static ALLOC: Bump = Bump;
 /// list; dispatch-local bulk scratch belongs in the independent transient lane.
 pub fn mark() -> usize {
     unsafe { read_word(CTR) }
-}
-
-/// Permanently retain every durable allocation made up to the current bump watermark.
-///
-/// Raw-pointer registries call this immediately after acquiring storage. Unlike the service-loop
-/// dirty finalizer, this floor is part of the allocator's own rewind contract and therefore cannot
-/// be skipped by an unusual reply, park, or teardown control path.
-pub fn pin_current() {
-    let current = mark();
-    let floor = unsafe { read_word(DURABLE_FLOOR) };
-    if current > floor {
-        unsafe { write_word(DURABLE_FLOOR, current) };
-    }
 }
 
 /// Bytes still available above the current bump mark.
