@@ -1176,6 +1176,8 @@ pub const SSN_NT_QUERY_DIRECTORY_OBJECT: u64 = 152;
 /// NtQueryDirectoryFile SSN (sysfuncs.lst line 152 = SSN 151). Activation-context probing uses
 /// this to enumerate real FAT directories with FileBothDirectoryInformation.
 pub const SSN_NT_QUERY_DIRECTORY_FILE: u64 = 151;
+/// NtNotifyChangeDirectoryFile SSN (sysfuncs.lst line 117 = SSN 116).
+pub const SSN_NT_NOTIFY_CHANGE_DIRECTORY_FILE: u64 = 116;
 /// NtOpenEvent SSN (sysfuncs.lst line 121 = SSN 120). CreateEventW's ERROR_ALREADY_EXISTS
 /// fallback + OpenEventW open an existing named event in \BaseNamedObjects.
 pub const SSN_NT_OPEN_EVENT: u64 = 120;
@@ -21438,6 +21440,10 @@ struct ExecNtHandler {
     /// keep their lock state in the receiving FSD through `IRP_MJ_LOCK_CONTROL`.
     byte_range_locks: nt_fs::ByteRangeLockTable<u64>,
     next_local_byte_lock_irp: u64,
+    /// One-shot directory watches for the read-only FAT owner. Writable MemFs notifications remain
+    /// inside its `nt-fs::FileSystem`; provider-backed watches remain inside the receiving FSD.
+    readonly_directory_notifications: nt_fs::DirectoryNotifyTable<u64>,
+    next_local_directory_notify_irp: u64,
     /// Per-call context the dispatch loop refreshes before each `dispatch` (Workstream A: the
     /// converged table-driven path carries executive context on the handler rather than a parallel
     /// mechanism). `pi` = process index (0 = smss, 1 = csrss); `stop` = a side-signal a handler
@@ -22457,6 +22463,11 @@ impl ExecDirectoryOpens {
     fn retain(&mut self, id: u32) -> Result<(), u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe { (&mut *self.table).retain(id) }
+    }
+
+    fn is_final_reference(&self, id: u32) -> Result<bool, u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).is_final_reference(id) }
     }
 
     fn release(&mut self, id: u32) -> Result<(), u32> {
@@ -23511,6 +23522,10 @@ fn build_nt_table() -> NativeServiceTable {
             (
                 NativeService::NtQueryDirectoryFile,
                 SSN_NT_QUERY_DIRECTORY_FILE as u32,
+            ),
+            (
+                NativeService::NtNotifyChangeDirectoryFile,
+                SSN_NT_NOTIFY_CHANGE_DIRECTORY_FILE as u32,
             ),
             (
                 NativeService::NtCreateSymbolicLinkObject,

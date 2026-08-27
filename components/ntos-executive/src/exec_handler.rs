@@ -2375,11 +2375,48 @@ struct LocalByteLockRoute {
     alertable: bool,
 }
 
+enum LocalDirectoryNotifyRoute {
+    Fat {
+        file_object: u64,
+        directory: alloc::string::String,
+        synchronous: bool,
+        alertable: bool,
+    },
+    Overlay {
+        file_id: u64,
+        file_object: u64,
+        synchronous: bool,
+        alertable: bool,
+    },
+}
+
+impl LocalDirectoryNotifyRoute {
+    fn file_object(&self) -> u64 {
+        match self {
+            Self::Fat { file_object, .. } | Self::Overlay { file_object, .. } => *file_object,
+        }
+    }
+
+    fn synchronous(&self) -> bool {
+        match self {
+            Self::Fat { synchronous, .. } | Self::Overlay { synchronous, .. } => *synchronous,
+        }
+    }
+
+    fn alertable(&self) -> bool {
+        match self {
+            Self::Fat { alertable, .. } | Self::Overlay { alertable, .. } => *alertable,
+        }
+    }
+}
+
 const LOCAL_FAT_FILE_OBJECT_TAG: u64 = 0x1000_0000_0000_0000;
 const LOCAL_OVERLAY_FILE_OBJECT_TAG: u64 = 0x2000_0000_0000_0000;
 const LOCAL_FAT_FILE_ID_TAG: u64 = 0x3000_0000_0000_0000;
 const LOCAL_OVERLAY_FILE_ID_TAG: u64 = 0x4000_0000_0000_0000;
+const LOCAL_FAT_DIRECTORY_OBJECT_TAG: u64 = 0x5000_0000_0000_0000;
 const LOCAL_BYTE_LOCK_IRP_TAG: u64 = 0x8000_0000_0000_0000;
+const LOCAL_DIRECTORY_NOTIFY_IRP_TAG: u64 = 0x9000_0000_0000_0000;
 const LOCAL_ID_PAYLOAD_MASK: u64 = 0x0fff_ffff_ffff_ffff;
 
 fn seed_time_zone(
@@ -3007,6 +3044,11 @@ impl ExecNtHandler {
         write_field!(readonly_file_opens, ExecReadOnlyFileOpens::reset());
         write_field!(byte_range_locks, nt_fs::ByteRangeLockTable::new());
         write_field!(next_local_byte_lock_irp, 1);
+        write_field!(
+            readonly_directory_notifications,
+            nt_fs::DirectoryNotifyTable::new()
+        );
+        write_field!(next_local_directory_notify_irp, 1);
         write_field!(pi, 0);
         write_field!(current_tid, 0);
         write_field!(current_badge, 0);
@@ -11836,6 +11878,10 @@ impl ExecNtHandler {
                         let _ = self.byte_range_locks.cancel_wait(wait_id);
                     }
                 }
+                nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(operation) => {
+                    let _ =
+                        self.cancel_local_directory_notify(pending.file_id, operation.notify_id);
+                }
                 _ => {
                     let _ = driver_launch::cancel_irp_if_pending(pending.irp_id);
                 }
@@ -11940,29 +11986,41 @@ impl ExecNtHandler {
         };
         let mut matched = 0usize;
         let mut terminal = 0usize;
-        let local_route = if file_id.is_none() {
-            self.local_byte_lock_route_for(file_handle).ok().flatten()
+        let local_file_object = if file_id.is_none() {
+            match self.local_file_object_for_handle(file_handle) {
+                Ok(file_object) => file_object,
+                Err(status) => return status,
+            }
         } else {
             None
         };
-        if let Some(route) = local_route {
-            let waits: alloc::vec::Vec<_> = (&*core::ptr::addr_of!(PENDING_FILE_IO))
+        if let Some(file_object) = local_file_object {
+            let requests: alloc::vec::Vec<_> = (&*core::ptr::addr_of!(PENDING_FILE_IO))
                 .drain_all()
                 .filter_map(|(_, pending)| {
-                    if pending.file_id != route.file_object || pending.tid != self.current_tid {
+                    if pending.file_id != file_object || pending.tid != self.current_tid {
                         return None;
                     }
                     match pending.operation {
                         nt_io_manager::PendingFileIoOperation::LocalByteLock(operation) => {
-                            nt_fs::ByteRangeWaitId::from_raw(operation.wait_id)
+                            Some((false, operation.wait_id))
+                        }
+                        nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(operation) => {
+                            Some((true, operation.notify_id))
                         }
                         _ => None,
                     }
                 })
                 .collect();
-            matched = waits.len();
-            for wait_id in waits {
-                terminal += self.byte_range_locks.cancel_wait(wait_id) as usize;
+            matched = requests.len();
+            for (directory_notify, request_id) in requests {
+                terminal += if directory_notify {
+                    self.cancel_local_directory_notify(file_object, request_id) as usize
+                } else {
+                    nt_fs::ByteRangeWaitId::from_raw(request_id)
+                        .is_some_and(|wait_id| self.byte_range_locks.cancel_wait(wait_id))
+                        as usize
+                };
             }
             self.publish_local_byte_lock_completions();
         } else if let Some(file_id) = file_id {
@@ -12042,11 +12100,7 @@ impl ExecNtHandler {
             print_str(b" handle=0x");
             print_hex(file_handle as u32);
             print_str(b" fid=0x");
-            print_hex(
-                file_id
-                    .or(local_route.map(|route| route.file_object))
-                    .unwrap_or(0) as u32,
-            );
+            print_hex(file_id.or(local_file_object).unwrap_or(0) as u32);
             print_str(b" cancelled=");
             print_u64(cancelled as u64);
             print_str(b" terminal=");
@@ -12060,6 +12114,269 @@ impl ExecNtHandler {
         } else {
             0
         }
+    }
+
+    unsafe fn nt_notify_change_directory_file_service(&mut self, args: &[u64]) -> u32 {
+        let handle = args[0];
+        let event = args[1];
+        let apc_routine = args[2];
+        let apc_context = args[3];
+        let iosb = args[4];
+        let buffer = args[5];
+        let buffer_length = nt_ulong_arg(args[6]);
+        let completion_filter = nt_ulong_arg(args[7]);
+        let watch_tree = nt_boolean_arg(args[8]);
+
+        if iosb == 0 {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if iosb & 7 != 0 || (buffer_length != 0 && buffer & 3 != 0) {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        if !self.probe_user_output(iosb, 16)
+            || (buffer_length != 0
+                && (buffer == 0 || !self.probe_user_output(buffer, buffer_length as usize)))
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let parameters = nt_io_manager::DirectoryNotifyParameters {
+            length: buffer_length,
+            completion_filter,
+        };
+        if !nt_io_manager::valid_directory_notify_parameters(parameters) {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        let local_route = match self.local_directory_notify_route_for(handle) {
+            Ok(route) => route,
+            Err(status) => return status,
+        };
+        let hosted_route = if local_route.is_none() {
+            match self.hosted_file_route_for(handle) {
+                Some(route) => Some(route),
+                None => return STATUS_INVALID_HANDLE,
+            }
+        } else {
+            None
+        };
+        let hosted_access = if let Some(route) = hosted_route {
+            let Some(access) = self.hosted_file_access_for(handle) else {
+                return STATUS_INVALID_HANDLE;
+            };
+            if !nt_io_manager::directory_notify_access_granted(
+                nt_types::AccessMask::from_bits_retain(access),
+            ) {
+                return STATUS_ACCESS_DENIED;
+            }
+            if apc_routine != 0 && self.file_completion.binding(route.file_id).is_some() {
+                return STATUS_INVALID_PARAMETER;
+            }
+            access
+        } else {
+            0
+        };
+        let event_obj_idx = match self.prepare_io_event_for_request(event) {
+            Ok(index) => index.map_or(u64::MAX, |index| index as u64),
+            Err(status) => return status,
+        };
+        let completion_port_suppressed =
+            nt_io_completion::io_event_suppresses_completion_port(event);
+        let synchronous = local_route
+            .as_ref()
+            .map(LocalDirectoryNotifyRoute::synchronous)
+            .unwrap_or_else(|| {
+                self.file_completion
+                    .is_synchronous(hosted_route.unwrap().file_id)
+                    .unwrap_or(true)
+            });
+        if !self.reserve_pending_file_io_owner()
+            || (synchronous
+                && (REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free()))
+        {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        if let Some(route) = local_route {
+            let request_id = self.allocate_local_directory_notify_irp_id();
+            let registration = match &route {
+                LocalDirectoryNotifyRoute::Fat {
+                    file_object,
+                    directory,
+                    ..
+                } => self.readonly_directory_notifications.register(
+                    *file_object,
+                    directory,
+                    completion_filter,
+                    watch_tree,
+                    buffer_length,
+                    request_id,
+                ),
+                LocalDirectoryNotifyRoute::Overlay { file_id, .. } => {
+                    crate::writable_fs::notify_change_directory(
+                        *file_id,
+                        completion_filter,
+                        watch_tree,
+                        buffer_length,
+                        request_id,
+                    )
+                }
+            };
+            let notify_id = match registration {
+                Ok(id) => id,
+                Err(status) => {
+                    self.complete_terminal_file_io(
+                        0,
+                        event_obj_idx,
+                        self.current_tid,
+                        apc_routine,
+                        apc_context,
+                        iosb,
+                        status,
+                        0,
+                        true,
+                        completion_port_suppressed,
+                    );
+                    return status;
+                }
+            };
+            self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
+                file_id: route.file_object(),
+                irp_id: request_id,
+                major: major::IRP_MJ_DIRECTORY_CONTROL,
+                control_code: 0,
+                operation: nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(
+                    nt_io_manager::PendingLocalDirectoryNotify {
+                        notify_id: notify_id.raw(),
+                        status: STATUS_PENDING,
+                        information: 0,
+                        alertable: route.alertable(),
+                    },
+                ),
+                delivery_state: 0,
+                pi: self.pi as u32,
+                tid: self.current_tid,
+                sync_lock_owner_tid: 0,
+                badge: self.current_badge,
+                consumer_abandoned: false,
+                user_apc_interrupt_requested: false,
+                output_va: buffer,
+                output_len: buffer_length,
+                output_offset: 0,
+                iosb_va: iosb,
+                apc_routine,
+                apc_context,
+                completion_port_suppressed,
+                signal_file: false,
+                publish_iocp: false,
+                event_obj_idx,
+                reply_cap: 0,
+                reply_required: false,
+                native_call_transport: false,
+                reply_mrs: [0; 18],
+                resume_ip: 0,
+                resume_sp: 0,
+                resume_flags: 0,
+            });
+            self.pending_file_io_wait = synchronous;
+            return STATUS_PENDING;
+        }
+
+        let route = hosted_route.unwrap();
+        let mut output = match try_zeroed_transfer_buffer(buffer_length as usize) {
+            Ok(output) => output,
+            Err(status) => return status,
+        };
+        match self.prepare_hosted_file_io(route, handle, hosted_access) {
+            Ok(true) => {}
+            Ok(false) => return STATUS_PENDING,
+            Err(status) => return status,
+        }
+        if let Err(status) = self.file_completion.set_signaled(route.file_id, false) {
+            self.release_file_reference(route.file_id);
+            return status;
+        }
+        let stack_flags = if watch_tree {
+            nt_io_manager::StackFlags::WATCH_TREE
+        } else {
+            nt_io_manager::StackFlags::empty()
+        };
+        let (mut status, mut information, pending_irp_id) =
+            match driver_launch::dispatch_hosted_file_notify_directory_irp_result_exact(
+                route.file_id,
+                self.current_tid,
+                parameters,
+                stack_flags,
+                &mut output,
+            ) {
+                Ok((status, information, irp_id, _)) => (
+                    status as u32,
+                    information,
+                    irp_id.map_or(0, nt_io_manager::IrpId::raw),
+                ),
+                Err(status) => (status, 0, 0),
+            };
+        if status == STATUS_PENDING && pending_irp_id == 0 {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+        }
+        if status == STATUS_PENDING {
+            self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
+                file_id: route.file_id,
+                irp_id: pending_irp_id,
+                major: major::IRP_MJ_DIRECTORY_CONTROL,
+                control_code: 0,
+                operation: nt_io_manager::PendingFileIoOperation::Transfer,
+                delivery_state: 0,
+                pi: self.pi as u32,
+                tid: self.current_tid,
+                sync_lock_owner_tid: 0,
+                badge: self.current_badge,
+                consumer_abandoned: false,
+                user_apc_interrupt_requested: false,
+                output_va: buffer,
+                output_len: buffer_length,
+                output_offset: 0,
+                iosb_va: iosb,
+                apc_routine,
+                apc_context,
+                completion_port_suppressed,
+                signal_file: synchronous || event_obj_idx == u64::MAX,
+                publish_iocp: apc_routine == 0,
+                event_obj_idx,
+                reply_cap: 0,
+                reply_required: false,
+                native_call_transport: false,
+                reply_mrs: [0; 18],
+                resume_ip: 0,
+                resume_sp: 0,
+                resume_flags: 0,
+            });
+            self.pending_file_io_wait = synchronous;
+        } else {
+            if nt_io_completion::file_io_status_copies_output(status) {
+                let copy_len = information as usize;
+                if copy_len > output.len() {
+                    status = STATUS_INVALID_BUFFER_SIZE;
+                    information = 0;
+                } else if copy_len != 0 && !self.xas_try_write_buf(buffer, &output[..copy_len]) {
+                    status = STATUS_ACCESS_VIOLATION;
+                    information = 0;
+                }
+            }
+            self.complete_terminal_file_io(
+                route.file_id,
+                event_obj_idx,
+                self.current_tid,
+                apc_routine,
+                apc_context,
+                iosb,
+                status,
+                information,
+                true,
+                completion_port_suppressed,
+            );
+            self.release_file_reference(route.file_id);
+        }
+        status
     }
 
     unsafe fn nt_lock_file_service(&mut self, args: &[u64]) -> u32 {
@@ -17079,6 +17396,15 @@ impl ExecNtHandler {
                 self.release_file_handle_reference(file_id);
             }
             nt_process::HandleObject::Directory { object_id, .. } => {
+                if self.directory_opens.is_final_reference(object_id) == Ok(true) {
+                    let completed = self
+                        .readonly_directory_notifications
+                        .cleanup_file_object(LOCAL_FAT_DIRECTORY_OBJECT_TAG | object_id as u64);
+                    if completed != 0 {
+                        crate::service_sec_image::FILE_IO_DELIVERY_RETRY_PENDING
+                            .store(true, Ordering::Release);
+                    }
+                }
                 let _ = self.directory_opens.release(object_id);
             }
             nt_process::HandleObject::DiskFile { object_id, .. } => {
@@ -17113,6 +17439,8 @@ impl ExecNtHandler {
                     }
                 }
                 unsafe { crate::writable_fs::close(file_id) };
+                crate::service_sec_image::FILE_IO_DELIVERY_RETRY_PENDING
+                    .store(true, Ordering::Release);
                 self.writable_fs_dirty = true;
             }
             nt_process::HandleObject::Process(pid) => {
@@ -21523,6 +21851,174 @@ impl ExecNtHandler {
         let sequence = self.next_local_byte_lock_irp.max(1) & LOCAL_ID_PAYLOAD_MASK;
         self.next_local_byte_lock_irp = sequence.wrapping_add(1).max(1);
         LOCAL_BYTE_LOCK_IRP_TAG | sequence
+    }
+
+    fn allocate_local_directory_notify_irp_id(&mut self) -> u64 {
+        let sequence = self.next_local_directory_notify_irp.max(1) & LOCAL_ID_PAYLOAD_MASK;
+        self.next_local_directory_notify_irp = sequence.wrapping_add(1).max(1);
+        LOCAL_DIRECTORY_NOTIFY_IRP_TAG | sequence
+    }
+
+    unsafe fn local_directory_notify_route_for(
+        &self,
+        handle: u64,
+    ) -> Result<Option<LocalDirectoryNotifyRoute>, u32> {
+        let pid = self
+            .pm_pid_for_pi(self.pi)
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        let process_handle =
+            nt_process::Handle::try_from(handle).map_err(|_| nt_fs::STATUS_INVALID_HANDLE)?;
+        let object = self
+            .pm
+            .lookup_handle(pid, process_handle)
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        let access = self
+            .pm
+            .handle_access(pid, process_handle)
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        if !nt_io_manager::directory_notify_access_granted(nt_types::AccessMask::from_bits_retain(
+            access,
+        )) {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        match object {
+            nt_process::HandleObject::Directory { object_id, .. } => {
+                let open = self.directory_opens.get(object_id)?;
+                let path = open.volume_relative_path();
+                if path.iter().any(|byte| !byte.is_ascii()) {
+                    return Err(nt_fs::STATUS_OBJECT_NAME_INVALID);
+                }
+                let mut directory = alloc::string::String::new();
+                directory
+                    .try_reserve_exact(path.len().saturating_add(1))
+                    .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+                if path.first() != Some(&b'\\') {
+                    directory.push('\\');
+                }
+                directory.extend(path.iter().map(|byte| *byte as char));
+                let synchronous = open.create_options
+                    & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
+                    != 0;
+                Ok(Some(LocalDirectoryNotifyRoute::Fat {
+                    file_object: LOCAL_FAT_DIRECTORY_OBJECT_TAG | object_id as u64,
+                    directory,
+                    synchronous,
+                    alertable: open.create_options & nt_fs::FILE_SYNCHRONOUS_IO_ALERT != 0,
+                }))
+            }
+            nt_process::HandleObject::OverlayFile(file_id) => {
+                let mode =
+                    crate::writable_fs::file_mode(file_id).ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                Ok(Some(LocalDirectoryNotifyRoute::Overlay {
+                    file_id,
+                    file_object: LOCAL_OVERLAY_FILE_OBJECT_TAG | (file_id & LOCAL_ID_PAYLOAD_MASK),
+                    synchronous: mode
+                        & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
+                        != 0,
+                    alertable: mode & nt_fs::FILE_SYNCHRONOUS_IO_ALERT != 0,
+                }))
+            }
+            nt_process::HandleObject::File(_) | nt_process::HandleObject::RoutedFile { .. } => {
+                Ok(None)
+            }
+            nt_process::HandleObject::DiskFile { .. } => Err(nt_fs::STATUS_NOT_A_DIRECTORY),
+            _ => Err(STATUS_OBJECT_TYPE_MISMATCH),
+        }
+    }
+
+    fn local_file_object_for_handle(&self, handle: u64) -> Result<Option<u64>, u32> {
+        let pid = self
+            .pm_pid_for_pi(self.pi)
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        let process_handle =
+            nt_process::Handle::try_from(handle).map_err(|_| nt_fs::STATUS_INVALID_HANDLE)?;
+        match self
+            .pm
+            .lookup_handle(pid, process_handle)
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
+        {
+            nt_process::HandleObject::Directory { object_id, .. } => {
+                Ok(Some(LOCAL_FAT_DIRECTORY_OBJECT_TAG | object_id as u64))
+            }
+            nt_process::HandleObject::DiskFile { object_id, .. } => {
+                Ok(Some(LOCAL_FAT_FILE_OBJECT_TAG | object_id as u64))
+            }
+            nt_process::HandleObject::OverlayFile(file_id) => Ok(Some(
+                LOCAL_OVERLAY_FILE_OBJECT_TAG | (file_id & LOCAL_ID_PAYLOAD_MASK),
+            )),
+            nt_process::HandleObject::File(_) | nt_process::HandleObject::RoutedFile { .. } => {
+                Ok(None)
+            }
+            _ => Err(STATUS_OBJECT_TYPE_MISMATCH),
+        }
+    }
+
+    pub(crate) unsafe fn local_directory_notify_terminal(
+        &self,
+        file_object: u64,
+        notify_id: u64,
+    ) -> Option<(u32, u32)> {
+        let notify_id = nt_fs::DirectoryNotifyId::from_raw(notify_id)?;
+        match file_object & !LOCAL_ID_PAYLOAD_MASK {
+            LOCAL_FAT_DIRECTORY_OBJECT_TAG => self
+                .readonly_directory_notifications
+                .completion(notify_id)
+                .map(|completion| (completion.status, completion.information)),
+            LOCAL_OVERLAY_FILE_OBJECT_TAG => {
+                crate::writable_fs::directory_notify_completion(notify_id)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) unsafe fn take_local_directory_notify_completion(
+        &mut self,
+        file_object: u64,
+        notify_id: u64,
+    ) -> Option<nt_fs::DirectoryNotifyCompletion<u64>> {
+        let notify_id = nt_fs::DirectoryNotifyId::from_raw(notify_id)?;
+        match file_object & !LOCAL_ID_PAYLOAD_MASK {
+            LOCAL_FAT_DIRECTORY_OBJECT_TAG => self
+                .readonly_directory_notifications
+                .take_completion(notify_id),
+            LOCAL_OVERLAY_FILE_OBJECT_TAG => {
+                crate::writable_fs::take_directory_notify_completion(notify_id)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) unsafe fn restore_local_directory_notify_completion(
+        &mut self,
+        file_object: u64,
+        completion: nt_fs::DirectoryNotifyCompletion<u64>,
+    ) {
+        match file_object & !LOCAL_ID_PAYLOAD_MASK {
+            LOCAL_FAT_DIRECTORY_OBJECT_TAG => self
+                .readonly_directory_notifications
+                .restore_completion_front(completion),
+            LOCAL_OVERLAY_FILE_OBJECT_TAG => {
+                crate::writable_fs::restore_directory_notify_completion(completion)
+            }
+            _ => panic!("local directory notification lost its filesystem owner"),
+        }
+    }
+
+    pub(crate) unsafe fn cancel_local_directory_notify(
+        &mut self,
+        file_object: u64,
+        notify_id: u64,
+    ) -> bool {
+        let Some(notify_id) = nt_fs::DirectoryNotifyId::from_raw(notify_id) else {
+            return false;
+        };
+        match file_object & !LOCAL_ID_PAYLOAD_MASK {
+            LOCAL_FAT_DIRECTORY_OBJECT_TAG => {
+                self.readonly_directory_notifications.cancel(notify_id)
+            }
+            LOCAL_OVERLAY_FILE_OBJECT_TAG => crate::writable_fs::cancel_directory_notify(notify_id),
+            _ => false,
+        }
     }
 
     unsafe fn local_byte_lock_route_for(
@@ -32971,6 +33467,9 @@ impl ExecNtHandler {
             // their own IOSBs/events/file objects with STATUS_CANCELLED; this syscall's IOSB reports
             // the cancel request itself as STATUS_SUCCESS, matching ReactOS IoMgr.
             NativeService::NtCancelIoFile => unsafe { self.nt_cancel_io_file_service(args) },
+            NativeService::NtNotifyChangeDirectoryFile => unsafe {
+                self.nt_notify_change_directory_file_service(args)
+            },
             NativeService::NtLockFile => unsafe { self.nt_lock_file_service(args) },
             NativeService::NtUnlockFile => unsafe { self.nt_unlock_file_service(args) },
             // NtWriteFile captured args: FileHandle=args[0], Event=args[1], ApcRoutine=args[2],

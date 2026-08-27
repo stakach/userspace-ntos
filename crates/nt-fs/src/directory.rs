@@ -319,6 +319,15 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
         Ok(())
     }
 
+    /// Whether releasing one process handle will issue this directory FILE_OBJECT's cleanup/close.
+    pub fn is_final_reference(&self, id: u32) -> Result<bool, u32> {
+        self.slots
+            .get(id as usize)
+            .filter(|slot| slot.occupied)
+            .map(|slot| slot.references == 1)
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
     pub fn release(&mut self, id: u32) -> Result<(), u32> {
         let slot = self
             .slots
@@ -1072,6 +1081,7 @@ mod tests {
             )
             .unwrap();
         table.retain(shared).unwrap();
+        assert_eq!(table.is_final_reference(shared), Ok(false));
         table.get_mut(shared).unwrap().query.cursor = 7;
         assert_eq!(table.get(shared).unwrap().query.cursor(), 7);
         assert_eq!(
@@ -1084,6 +1094,7 @@ mod tests {
         );
         assert_eq!(table.get(independent).unwrap().query.cursor(), 0);
         table.release(shared).unwrap();
+        assert_eq!(table.is_final_reference(shared), Ok(true));
         assert_eq!(table.get(shared).unwrap().first_cluster, 41);
         assert_eq!(table.get(shared).unwrap().create_options, 0x20);
         table.release(shared).unwrap();

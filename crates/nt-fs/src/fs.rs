@@ -4054,6 +4054,27 @@ impl FileSystem {
         self.notifications.pop_completion()
     }
 
+    pub fn directory_notify_completion(
+        &self,
+        id: crate::DirectoryNotifyId,
+    ) -> Option<&crate::DirectoryNotifyCompletion<u64>> {
+        self.notifications.completion(id)
+    }
+
+    pub fn take_directory_notify_completion(
+        &mut self,
+        id: crate::DirectoryNotifyId,
+    ) -> Option<crate::DirectoryNotifyCompletion<u64>> {
+        self.notifications.take_completion(id)
+    }
+
+    pub fn restore_directory_notify_completion(
+        &mut self,
+        completion: crate::DirectoryNotifyCompletion<u64>,
+    ) {
+        self.notifications.restore_completion_front(completion);
+    }
+
     fn report_handle_change(&mut self, handle: u64, filter: u32) {
         if let Some(path) = self.zw_query_opened_name(handle) {
             self.notifications.report_change(crate::DirectoryChange {

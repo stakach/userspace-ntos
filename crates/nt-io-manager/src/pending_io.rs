@@ -66,6 +66,18 @@ pub struct PendingLocalByteLock {
     pub alertable: bool,
 }
 
+/// Terminal state for one local-filesystem directory notification. Provider-backed notifications
+/// retain a canonical IRP and use [`PendingFileIoOperation::Transfer`]; local FSDs publish their
+/// encoded `FILE_NOTIFY_INFORMATION` bytes before committing this owner terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct PendingLocalDirectoryNotify {
+    pub notify_id: u64,
+    pub status: u32,
+    pub information: u32,
+    /// The owning FILE_OBJECT was opened for synchronous alertable I/O.
+    pub alertable: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum PendingFileIoOperation {
     #[default]
@@ -73,6 +85,7 @@ pub enum PendingFileIoOperation {
     Create(PendingFileCreate),
     SetFileName(PendingSetFileNameOperation),
     LocalByteLock(PendingLocalByteLock),
+    LocalDirectoryNotify(PendingLocalDirectoryNotify),
 }
 
 /// One pending File-bound operation and every completion surface owned by that exact IRP.
@@ -274,6 +287,15 @@ impl PendingFileIoTable {
                     && !pending.signal_file
                     && !pending.publish_iocp
             }
+            PendingFileIoOperation::LocalDirectoryNotify(operation) => {
+                pending.major == nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL
+                    && operation.notify_id != 0
+                    && operation.status == nt_status::NtStatus::PENDING.raw() as u32
+                    && operation.information == 0
+                    && pending.iosb_va != 0
+                    && !pending.signal_file
+                    && !pending.publish_iocp
+            }
         };
         let control_valid = matches!(
             pending.major,
@@ -423,14 +445,17 @@ impl PendingFileIoTable {
             pending
                 .filter(|pending| {
                     pending.tid == tid
-                        && pending.sync_lock_owner_tid == tid
                         && pending.reply_required
                         && !pending.consumer_abandoned
                         && !pending.user_apc_interrupt_requested
                         && pending.delivery_state == 0
                         && match pending.operation {
-                            PendingFileIoOperation::Transfer => true,
+                            PendingFileIoOperation::Transfer => pending.sync_lock_owner_tid == tid,
                             PendingFileIoOperation::LocalByteLock(operation) => {
+                                operation.alertable
+                                    && operation.status == nt_status::NtStatus::PENDING.raw() as u32
+                            }
+                            PendingFileIoOperation::LocalDirectoryNotify(operation) => {
                                 operation.alertable
                                     && operation.status == nt_status::NtStatus::PENDING.raw() as u32
                             }
@@ -450,8 +475,11 @@ impl PendingFileIoTable {
     ) -> Option<()> {
         let pending = self.slots.get_mut(slot)?.as_mut()?;
         let interruptible_operation = match pending.operation {
-            PendingFileIoOperation::Transfer => true,
+            PendingFileIoOperation::Transfer => pending.sync_lock_owner_tid == tid,
             PendingFileIoOperation::LocalByteLock(operation) => {
+                operation.alertable && operation.status == nt_status::NtStatus::PENDING.raw() as u32
+            }
+            PendingFileIoOperation::LocalDirectoryNotify(operation) => {
                 operation.alertable && operation.status == nt_status::NtStatus::PENDING.raw() as u32
             }
             _ => false,
@@ -459,7 +487,6 @@ impl PendingFileIoTable {
         if pending.irp_id != irp_id
             || pending.file_id != file_id
             || pending.tid != tid
-            || pending.sync_lock_owner_tid != tid
             || !pending.reply_required
             || pending.consumer_abandoned
             || pending.user_apc_interrupt_requested
@@ -595,6 +622,51 @@ impl PendingFileIoTable {
         }
         operation.status = status;
         pending.operation = PendingFileIoOperation::LocalByteLock(operation);
+        true
+    }
+
+    /// Commit one local FSD notification after its encoded output has reached the caller. The
+    /// explicit publication bit prevents terminal redrive from trying to source local bytes from a
+    /// provider-owned retained IRP.
+    pub fn complete_local_directory_notify_exact(
+        &mut self,
+        irp_id: u64,
+        notify_id: u64,
+        status: u32,
+        information: u32,
+        output_published: bool,
+    ) -> bool {
+        if irp_id == 0 || notify_id == 0 || status == nt_status::NtStatus::PENDING.raw() as u32 {
+            return false;
+        }
+        let Some(pending) = self.slots.iter_mut().flatten().find(|pending| {
+            pending.irp_id == irp_id
+                && matches!(
+                    pending.operation,
+                    PendingFileIoOperation::LocalDirectoryNotify(operation)
+                        if operation.notify_id == notify_id
+                )
+        }) else {
+            return false;
+        };
+        let PendingFileIoOperation::LocalDirectoryNotify(mut operation) = pending.operation else {
+            unreachable!();
+        };
+        if operation.status != nt_status::NtStatus::PENDING.raw() as u32 {
+            return operation.status == status && operation.information == information;
+        }
+        if information > pending.output_len
+            || (pending.output_va != 0 && pending.output_len != 0 && !output_published)
+        {
+            return false;
+        }
+        operation.status = status;
+        operation.information = information;
+        pending.operation = PendingFileIoOperation::LocalDirectoryNotify(operation);
+        if pending.output_va != 0 && pending.output_len != 0 {
+            pending.output_offset = information;
+            pending.delivery_state |= IO_DELIVERY_BUFFER_PUBLISHED;
+        }
         true
     }
 
@@ -1654,9 +1726,6 @@ mod tests {
         request.event_obj_idx = u64::MAX;
         let slot = table.park(request).unwrap();
 
-        let mut synchronous = table.get(slot).unwrap();
-        synchronous.sync_lock_owner_tid = synchronous.tid;
-        table.slots[slot] = Some(synchronous);
         assert_eq!(table.user_apc_interrupt_candidate(7).unwrap().0, slot);
 
         assert!(!table.complete_local_byte_lock_exact(request.irp_id, 8, 0));
@@ -1670,6 +1739,44 @@ mod tests {
         assert!(matches!(
             table.get(slot).unwrap().operation,
             PendingFileIoOperation::LocalByteLock(PendingLocalByteLock { status: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn local_directory_notify_requires_exact_output_publication() {
+        let mut table = PendingFileIoTable::new();
+        let mut request = pending(0x2000_0000_0000_0001, 0x9000_0000_0000_0002, 7);
+        request.major = nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL;
+        request.operation =
+            PendingFileIoOperation::LocalDirectoryNotify(PendingLocalDirectoryNotify {
+                notify_id: 11,
+                status: nt_status::NtStatus::PENDING.raw() as u32,
+                information: 0,
+                alertable: true,
+            });
+        request.output_len = 64;
+        request.apc_routine = 0;
+        request.publish_iocp = false;
+        request.signal_file = false;
+        request.event_obj_idx = u64::MAX;
+        let slot = table.park(request).unwrap();
+
+        assert_eq!(table.user_apc_interrupt_candidate(7).unwrap().0, slot);
+
+        assert!(!table.complete_local_directory_notify_exact(request.irp_id, 12, 0, 24, true));
+        assert!(!table.complete_local_directory_notify_exact(request.irp_id, 11, 0, 24, false));
+        assert!(!table.complete_local_directory_notify_exact(request.irp_id, 11, 0, 65, true));
+        assert!(table.complete_local_directory_notify_exact(request.irp_id, 11, 0, 24, true));
+        let completed = table.get(slot).unwrap();
+        assert_eq!(completed.output_offset, 24);
+        assert_ne!(completed.delivery_state & IO_DELIVERY_BUFFER_PUBLISHED, 0);
+        assert!(matches!(
+            completed.operation,
+            PendingFileIoOperation::LocalDirectoryNotify(PendingLocalDirectoryNotify {
+                status: 0,
+                information: 24,
+                ..
+            })
         ));
     }
 }

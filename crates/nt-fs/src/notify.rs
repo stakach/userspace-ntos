@@ -207,6 +207,29 @@ impl<C> DirectoryNotifyTable<C> {
         self.completions.pop_front()
     }
 
+    pub fn completion(&self, id: DirectoryNotifyId) -> Option<&DirectoryNotifyCompletion<C>> {
+        self.completions
+            .iter()
+            .find(|completion| completion.id == id)
+    }
+
+    pub fn take_completion(
+        &mut self,
+        id: DirectoryNotifyId,
+    ) -> Option<DirectoryNotifyCompletion<C>> {
+        let index = self
+            .completions
+            .iter()
+            .position(|completion| completion.id == id)?;
+        self.completions.remove(index)
+    }
+
+    /// Restore a completion whose user-buffer publication could not finish. The immediately
+    /// preceding removal leaves capacity for this infallible retry path.
+    pub fn restore_completion_front(&mut self, completion: DirectoryNotifyCompletion<C>) {
+        self.completions.push_front(completion);
+    }
+
     fn complete_matching(
         &mut self,
         predicate: impl Fn(&DirectoryNotifyRequest<C>) -> bool,
@@ -425,6 +448,12 @@ mod tests {
             .register(2, r"\", FILE_NOTIFY_CHANGE_FILE_NAME, true, 64, 2)
             .unwrap();
         assert!(table.cancel(cancelled));
+        assert_eq!(
+            table.completion(cancelled).unwrap().status,
+            STATUS_CANCELLED
+        );
+        let completion = table.take_completion(cancelled).unwrap();
+        table.restore_completion_front(completion);
         assert_eq!(table.pop_completion().unwrap().status, STATUS_CANCELLED);
 
         table

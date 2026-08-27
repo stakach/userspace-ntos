@@ -72,6 +72,7 @@ pub enum NativeService {
     NtCreateNamedPipeFile,
     NtFsControlFile,
     NtQueryDirectoryFile,
+    NtNotifyChangeDirectoryFile,
     NtQueryEaFile,
     NtQueryInformationFile,
     NtSetInformationFile,
@@ -279,6 +280,7 @@ impl NativeService {
             NtCreateNamedPipeFile => "NtCreateNamedPipeFile",
             NtFsControlFile => "NtFsControlFile",
             NtQueryDirectoryFile => "NtQueryDirectoryFile",
+            NtNotifyChangeDirectoryFile => "NtNotifyChangeDirectoryFile",
             NtQueryEaFile => "NtQueryEaFile",
             NtQueryInformationFile => "NtQueryInformationFile",
             NtSetInformationFile => "NtSetInformationFile",
@@ -594,6 +596,7 @@ impl NativeService {
         NativeService::NtQueryEaFile,
         NativeService::NtSetEaFile,
         NativeService::NtSetVolumeInformationFile,
+        NativeService::NtNotifyChangeDirectoryFile,
     ];
 }
 

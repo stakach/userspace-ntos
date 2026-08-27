@@ -228,6 +228,25 @@ fn query_directory_file_keeps_native_eleven_argument_contract() {
 }
 
 #[test]
+fn notify_change_directory_file_keeps_native_contract() {
+    assert_eq!(
+        NativeService::NtNotifyChangeDirectoryFile.name(),
+        "NtNotifyChangeDirectoryFile"
+    );
+    assert_eq!(
+        NativeService::NtNotifyChangeDirectoryFile.arg_count(),
+        (9, 9)
+    );
+    assert_eq!(
+        nt_syscall_abi::ssn_of("NtNotifyChangeDirectoryFile"),
+        Some(116)
+    );
+    assert!(NativeServiceTable::test_profile()
+        .number_of(NativeService::NtNotifyChangeDirectoryFile)
+        .is_some());
+}
+
+#[test]
 fn quota_services_register_with_native_numbers_and_argument_contracts() {
     let cases = [
         (

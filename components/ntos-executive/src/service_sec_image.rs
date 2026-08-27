@@ -22831,6 +22831,9 @@ pub(crate) unsafe fn reconcile_user_apc_file_wait(
             }
             Ok(cancelled)
         }
+        nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(operation) => {
+            Ok(nt_handler.cancel_local_directory_notify(pending.file_id, operation.notify_id))
+        }
         _ => driver_launch::cancel_irp_if_pending(pending.irp_id),
     };
     match cancellation {
@@ -23435,6 +23438,9 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             {
                 Some((operation.status, 0u64))
             }
+            nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(operation) => nt_handler
+                .local_directory_notify_terminal(pending.file_id, operation.notify_id)
+                .map(|(status, information)| (status, information as u64)),
             _ => None,
         };
         let mut completed = driver_launch::completed_irp_exact(pending.irp_id);
@@ -23502,6 +23508,46 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             .or_else(|| completed.map(|completion| completion.information))
             .expect("pending File owner has no terminal information");
         let mut backend_ack_required = completed.is_some();
+        if let nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(operation) =
+            pending.operation
+        {
+            let Some(completion) = nt_handler
+                .take_local_directory_notify_completion(pending.file_id, operation.notify_id)
+            else {
+                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                restore_file_io_mirrors!();
+                continue;
+            };
+            assert_eq!(completion.context, pending.irp_id);
+            assert_eq!(completion.status, terminal_status);
+            assert_eq!(completion.information as u64, terminal_information);
+            assert_eq!(completion.bytes.len(), completion.information as usize);
+            let output_published = pending.output_va != 0 && pending.output_len != 0;
+            if !pending.consumer_abandoned
+                && !completion.bytes.is_empty()
+                && !nt_handler.xas_try_write_buf(pending.output_va, &completion.bytes)
+            {
+                nt_handler.restore_local_directory_notify_completion(pending.file_id, completion);
+                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                restore_file_io_mirrors!();
+                continue;
+            }
+            assert!(
+                (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                    .complete_local_directory_notify_exact(
+                        pending.irp_id,
+                        operation.notify_id,
+                        terminal_status,
+                        terminal_information as u32,
+                        output_published,
+                    ),
+                "local directory completion lost its pending I/O owner"
+            );
+            delivery_state = (&*core::ptr::addr_of!(PENDING_FILE_IO))
+                .get(slot)
+                .expect("local directory completion owner disappeared")
+                .delivery_state;
+        }
         if pending.major == nt_io_abi::major::IRP_MJ_QUERY_INFORMATION {
             if let Some(transaction_id) = set_file_name_id {
                 let phase = (&*core::ptr::addr_of!(PENDING_SET_FILE_NAMES))
@@ -24180,6 +24226,7 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 nt_handler.release_file_reference(finished.file_id);
             }
             nt_io_manager::PendingFileIoOperation::LocalByteLock(_) => {}
+            nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(_) => {}
         }
         delivered += 1;
         let trace_completion = FILE_IO_COMPLETION_TRACE.fetch_add(1, Ordering::Relaxed) < 32

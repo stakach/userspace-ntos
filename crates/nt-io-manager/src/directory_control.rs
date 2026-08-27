@@ -16,8 +16,7 @@ pub struct DirectoryNotifyParameters {
 }
 
 pub const fn valid_directory_notify_parameters(parameters: DirectoryNotifyParameters) -> bool {
-    parameters.completion_filter != 0
-        && parameters.completion_filter & !FILE_NOTIFY_VALID_MASK == 0
+    parameters.completion_filter != 0 && parameters.completion_filter & !FILE_NOTIFY_VALID_MASK == 0
 }
 
 pub fn directory_notify_access_granted(granted: AccessMask) -> bool {
@@ -32,21 +31,27 @@ mod tests {
 
     #[test]
     fn validates_filter_and_directory_access() {
-        assert!(valid_directory_notify_parameters(DirectoryNotifyParameters {
-            length: 0,
-            completion_filter: 1,
-        }));
-        assert!(!valid_directory_notify_parameters(DirectoryNotifyParameters {
-            length: 64,
-            completion_filter: 0,
-        }));
-        assert!(!valid_directory_notify_parameters(DirectoryNotifyParameters {
-            length: 64,
-            completion_filter: 0x1000,
-        }));
-        assert!(directory_notify_access_granted(AccessMask::from_bits_retain(
-            FILE_LIST_DIRECTORY
-        )));
+        assert!(valid_directory_notify_parameters(
+            DirectoryNotifyParameters {
+                length: 0,
+                completion_filter: 1,
+            }
+        ));
+        assert!(!valid_directory_notify_parameters(
+            DirectoryNotifyParameters {
+                length: 64,
+                completion_filter: 0,
+            }
+        ));
+        assert!(!valid_directory_notify_parameters(
+            DirectoryNotifyParameters {
+                length: 64,
+                completion_filter: 0x1000,
+            }
+        ));
+        assert!(directory_notify_access_granted(
+            AccessMask::from_bits_retain(FILE_LIST_DIRECTORY)
+        ));
         assert!(!directory_notify_access_granted(AccessMask::GENERIC_WRITE));
     }
 }

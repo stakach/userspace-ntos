@@ -26,8 +26,8 @@ mod complete;
 mod completion_unwind;
 mod device;
 mod device_control;
-mod directory_control;
 mod device_property_transfer;
+mod directory_control;
 mod dispatch;
 mod driver;
 mod driver_host;
@@ -71,14 +71,13 @@ pub use completion_unwind::{
     CompletionUnwindFrame,
 };
 pub use device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
-pub use directory_control::{
-    directory_notify_access_granted, valid_directory_notify_parameters,
-    DirectoryNotifyParameters, IRP_MN_NOTIFY_CHANGE_DIRECTORY, IRP_MN_QUERY_DIRECTORY,
-    SL_WATCH_TREE,
-};
 pub use device_property_transfer::{
     HostedDevicePropertyOwner, HostedDevicePropertyPull, HostedDevicePropertyTransferError,
     HostedDevicePropertyTransferTable,
+};
+pub use directory_control::{
+    directory_notify_access_granted, valid_directory_notify_parameters, DirectoryNotifyParameters,
+    IRP_MN_NOTIFY_CHANGE_DIRECTORY, IRP_MN_QUERY_DIRECTORY, SL_WATCH_TREE,
 };
 pub use dispatch::{
     DispatchContext, DispatchOutcome, DriverCompletion, DriverDispatchBackend, IrpProjection,
@@ -119,11 +118,12 @@ pub use mock_driver::{IoctlBehavior, MockDriverBackend};
 pub use object_port::{MockObjectPort, ObjectManagerPort};
 pub use pending_io::{
     PendingFileCreate, PendingFileIo, PendingFileIoOperation, PendingFileIoReservation,
-    PendingFileIoTable, PendingLocalByteLock, PendingSetFileNameOperation,
-    IO_DELIVERY_APC_PUBLISHED, IO_DELIVERY_BACKEND_ACKED, IO_DELIVERY_BUFFER_PUBLISHED,
-    IO_DELIVERY_CREATE_COMMITTED, IO_DELIVERY_EVENT_PUBLISHED, IO_DELIVERY_FILE_LOCK_RELEASED,
-    IO_DELIVERY_FILE_PUBLISHED, IO_DELIVERY_HANDLE_PUBLISHED, IO_DELIVERY_IOCP_PUBLISHED,
-    IO_DELIVERY_IOSB_PUBLISHED, IO_DELIVERY_REPLY_CLAIMED, IO_DELIVERY_REPLY_PUBLISHED,
+    PendingFileIoTable, PendingLocalByteLock, PendingLocalDirectoryNotify,
+    PendingSetFileNameOperation, IO_DELIVERY_APC_PUBLISHED, IO_DELIVERY_BACKEND_ACKED,
+    IO_DELIVERY_BUFFER_PUBLISHED, IO_DELIVERY_CREATE_COMMITTED, IO_DELIVERY_EVENT_PUBLISHED,
+    IO_DELIVERY_FILE_LOCK_RELEASED, IO_DELIVERY_FILE_PUBLISHED, IO_DELIVERY_HANDLE_PUBLISHED,
+    IO_DELIVERY_IOCP_PUBLISHED, IO_DELIVERY_IOSB_PUBLISHED, IO_DELIVERY_REPLY_CLAIMED,
+    IO_DELIVERY_REPLY_PUBLISHED,
 };
 pub use pending_set_file_name::{
     PendingSetFileName, PendingSetFileNameId, PendingSetFileNamePhase,
@@ -6535,6 +6535,28 @@ mod tests {
         assert_eq!(stack[0x00], major::IRP_MJ_QUERY_VOLUME_INFORMATION);
         assert_eq!(le_u32(&stack, 0x08), 0x48);
         assert_eq!(le_u32(&stack, 0x10), 8);
+
+        write_wdm_io_stack_location(
+            &mut stack,
+            WdmIoStackLocationInit {
+                major: major::IRP_MJ_DIRECTORY_CONTROL,
+                minor: IRP_MN_NOTIFY_CHANGE_DIRECTORY,
+                flags: SL_WATCH_TREE,
+                control: 0,
+                device_object: 0x4444,
+                file_object: 0x5555,
+                parameters: WdmIoStackParameters::NotifyDirectory {
+                    length: 0x240,
+                    completion_filter: 0x53,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(stack[0x00], major::IRP_MJ_DIRECTORY_CONTROL);
+        assert_eq!(stack[0x01], IRP_MN_NOTIFY_CHANGE_DIRECTORY);
+        assert_eq!(stack[0x02], SL_WATCH_TREE);
+        assert_eq!(le_u32(&stack, 0x08), 0x240);
+        assert_eq!(le_u32(&stack, 0x10), 0x53);
 
         write_wdm_io_stack_location(
             &mut stack,

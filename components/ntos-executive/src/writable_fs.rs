@@ -2012,6 +2012,50 @@ pub(crate) unsafe fn is_final_reference(file_id: u64) -> Result<bool, u32> {
         .zw_is_final_reference(file_id)
 }
 
+pub(crate) unsafe fn notify_change_directory(
+    file_id: u64,
+    completion_filter: u32,
+    watch_tree: bool,
+    buffer_length: u32,
+    context: u64,
+) -> Result<nt_fs::DirectoryNotifyId, u32> {
+    writable_fs()
+        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
+        .zw_notify_change_directory_file(
+            file_id,
+            completion_filter,
+            watch_tree,
+            buffer_length,
+            context,
+        )
+}
+
+pub(crate) unsafe fn cancel_directory_notify(id: nt_fs::DirectoryNotifyId) -> bool {
+    writable_fs().is_some_and(|fs| fs.zw_cancel_directory_notify(id))
+}
+
+pub(crate) unsafe fn directory_notify_completion(
+    id: nt_fs::DirectoryNotifyId,
+) -> Option<(u32, u32)> {
+    writable_fs()?
+        .directory_notify_completion(id)
+        .map(|completion| (completion.status, completion.information))
+}
+
+pub(crate) unsafe fn take_directory_notify_completion(
+    id: nt_fs::DirectoryNotifyId,
+) -> Option<nt_fs::DirectoryNotifyCompletion<u64>> {
+    writable_fs()?.take_directory_notify_completion(id)
+}
+
+pub(crate) unsafe fn restore_directory_notify_completion(
+    completion: nt_fs::DirectoryNotifyCompletion<u64>,
+) {
+    if let Some(fs) = writable_fs() {
+        fs.restore_directory_notify_completion(completion);
+    }
+}
+
 /// `NtClose` on a writable-volume file object (honours a pending delete).
 pub(crate) unsafe fn close(file_id: u64) {
     if let Some(fs) = writable_fs() {
