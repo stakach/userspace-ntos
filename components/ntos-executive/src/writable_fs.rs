@@ -2012,6 +2012,30 @@ pub(crate) unsafe fn is_final_reference(file_id: u64) -> Result<bool, u32> {
         .zw_is_final_reference(file_id)
 }
 
+pub(crate) unsafe fn retain_io_reference(file_id: u64) -> Result<(), u32> {
+    writable_fs()
+        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
+        .zw_retain_io_reference(file_id)
+}
+
+pub(crate) unsafe fn release_io_reference(file_id: u64) -> Result<(), u32> {
+    writable_fs()
+        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
+        .zw_release_io_reference(file_id)
+}
+
+pub(crate) unsafe fn set_file_signaled(file_id: u64, signaled: bool) -> Result<(), u32> {
+    writable_fs()
+        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
+        .zw_set_file_signaled(file_id, signaled)
+}
+
+pub(crate) unsafe fn is_file_signaled(file_id: u64) -> Result<bool, u32> {
+    writable_fs()
+        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
+        .zw_is_file_signaled(file_id)
+}
+
 pub(crate) unsafe fn notify_change_directory(
     file_id: u64,
     completion_filter: u32,

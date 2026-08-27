@@ -1305,19 +1305,19 @@ fn share_access_is_symmetric_precedes_truncate_and_lives_until_final_close() {
         .status,
         STATUS_SHARING_VIOLATION
     );
+    fs.zw_retain_io_reference(first.handle).unwrap();
     assert_eq!(fs.zw_close(first.handle), STATUS_SUCCESS);
-    assert_eq!(
-        fs.zw_create_file(
-            r"\??\C:\Temp\shared.dat",
-            FILE_WRITE_DATA,
-            0,
-            FILE_SHARE_WRITE,
-            FILE_OPEN,
-            0,
-        )
-        .status,
-        STATUS_SUCCESS
+    let reopened = fs.zw_create_file(
+        r"\??\C:\Temp\shared.dat",
+        FILE_WRITE_DATA,
+        0,
+        FILE_SHARE_WRITE,
+        FILE_OPEN,
+        0,
     );
+    assert_eq!(reopened.status, STATUS_SUCCESS);
+    assert_eq!(fs.zw_close(reopened.handle), STATUS_SUCCESS);
+    fs.zw_release_io_reference(first.handle).unwrap();
 }
 
 #[test]
@@ -4213,11 +4213,24 @@ fn writable_filesystem_reports_real_mutations_and_cleanup() {
             100,
         )
         .unwrap();
+    fs.zw_retain_io_reference(directory.handle).unwrap();
+    fs.zw_set_file_signaled(directory.handle, false).unwrap();
     assert_eq!(fs.zw_close(directory.handle), STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_is_final_reference(directory.handle),
+        Err(STATUS_INVALID_HANDLE)
+    );
     let completion = fs.pop_directory_notify_completion().unwrap();
     assert_eq!(completion.id, cleanup);
     assert_eq!(completion.status, STATUS_NOTIFY_CLEANUP);
     assert_eq!(completion.information, 0);
+    fs.zw_set_file_signaled(directory.handle, true).unwrap();
+    assert_eq!(fs.zw_is_file_signaled(directory.handle), Ok(true));
+    fs.zw_release_io_reference(directory.handle).unwrap();
+    assert_eq!(
+        fs.zw_is_file_signaled(directory.handle),
+        Err(STATUS_INVALID_HANDLE)
+    );
 }
 
 #[test]

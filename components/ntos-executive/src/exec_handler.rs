@@ -11093,6 +11093,39 @@ impl ExecNtHandler {
                 }
                 Ok(Some(WaitObject::file(file_id)))
             }
+            Some(nt_process::HandleObject::DiskFile { object_id, .. }) => {
+                let granted = self
+                    .pm
+                    .handle_access(caller, handle as nt_process::Handle)
+                    .ok_or(STATUS_INVALID_HANDLE)?;
+                if required_access != 0 && granted & required_access != required_access {
+                    return Err(STATUS_ACCESS_DENIED);
+                }
+                self.readonly_file_opens.is_signaled(object_id)?;
+                Ok(Some(WaitObject::fat_file(object_id)))
+            }
+            Some(nt_process::HandleObject::Directory { object_id, .. }) => {
+                let granted = self
+                    .pm
+                    .handle_access(caller, handle as nt_process::Handle)
+                    .ok_or(STATUS_INVALID_HANDLE)?;
+                if required_access != 0 && granted & required_access != required_access {
+                    return Err(STATUS_ACCESS_DENIED);
+                }
+                self.directory_opens.is_signaled(object_id)?;
+                Ok(Some(WaitObject::fat_directory(object_id)))
+            }
+            Some(nt_process::HandleObject::OverlayFile(file_id)) => {
+                let granted = self
+                    .pm
+                    .handle_access(caller, handle as nt_process::Handle)
+                    .ok_or(STATUS_INVALID_HANDLE)?;
+                if required_access != 0 && granted & required_access != required_access {
+                    return Err(STATUS_ACCESS_DENIED);
+                }
+                unsafe { crate::writable_fs::is_file_signaled(file_id)? };
+                Ok(Some(WaitObject::overlay_file(file_id)))
+            }
             Some(_) | None => Ok(None),
         }
     }
@@ -11173,6 +11206,17 @@ impl ExecNtHandler {
                 .file_completion
                 .is_signaled(object.id())
                 .unwrap_or(false),
+            WaitObject::KIND_FAT_FILE => self
+                .readonly_file_opens
+                .is_signaled(object.id() as u32)
+                .unwrap_or(false),
+            WaitObject::KIND_FAT_DIRECTORY => self
+                .directory_opens
+                .is_signaled(object.id() as u32)
+                .unwrap_or(false),
+            WaitObject::KIND_OVERLAY_FILE => unsafe {
+                crate::writable_fs::is_file_signaled(object.id()).unwrap_or(false)
+            },
             _ => false,
         }
     }
@@ -11190,7 +11234,10 @@ impl ExecNtHandler {
             WaitObject::KIND_WIN32K_EVENT => {
                 crate::win32k_subsystem::event_body_consume(object.id())
             }
-            WaitObject::KIND_FILE => true,
+            WaitObject::KIND_FILE
+            | WaitObject::KIND_FAT_FILE
+            | WaitObject::KIND_FAT_DIRECTORY
+            | WaitObject::KIND_OVERLAY_FILE => true,
             _ => false,
         }
     }
@@ -12198,6 +12245,14 @@ impl ExecNtHandler {
 
         if let Some(route) = local_route {
             let request_id = self.allocate_local_directory_notify_irp_id();
+            let file_object = route.file_object();
+            if let Err(status) = self.retain_local_file_io_reference(file_object) {
+                return status;
+            }
+            if let Err(status) = self.set_local_file_object_signaled(file_object, false) {
+                self.release_local_file_io_reference(file_object);
+                return status;
+            }
             let registration = match &route {
                 LocalDirectoryNotifyRoute::Fat {
                     file_object,
@@ -12224,8 +12279,9 @@ impl ExecNtHandler {
             let notify_id = match registration {
                 Ok(id) => id,
                 Err(status) => {
-                    self.complete_terminal_file_io(
-                        0,
+                    self.complete_terminal_local_file_io(
+                        file_object,
+                        synchronous,
                         event_obj_idx,
                         self.current_tid,
                         apc_routine,
@@ -12236,11 +12292,12 @@ impl ExecNtHandler {
                         true,
                         completion_port_suppressed,
                     );
+                    self.release_local_file_io_reference(file_object);
                     return status;
                 }
             };
             self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
-                file_id: route.file_object(),
+                file_id: file_object,
                 irp_id: request_id,
                 major: major::IRP_MJ_DIRECTORY_CONTROL,
                 control_code: 0,
@@ -12266,7 +12323,7 @@ impl ExecNtHandler {
                 apc_routine,
                 apc_context,
                 completion_port_suppressed,
-                signal_file: false,
+                signal_file: synchronous || event_obj_idx == u64::MAX,
                 publish_iocp: false,
                 event_obj_idx,
                 reply_cap: 0,
@@ -12460,6 +12517,13 @@ impl ExecNtHandler {
 
         if let Some(route) = local_route {
             let request_id = self.allocate_local_byte_lock_irp_id();
+            if let Err(status) = self.retain_local_file_io_reference(route.file_object) {
+                return status;
+            }
+            if let Err(status) = self.set_local_file_object_signaled(route.file_object, false) {
+                self.release_local_file_io_reference(route.file_object);
+                return status;
+            }
             let request = nt_fs::ByteRangeLockRequest::new(
                 route.file_id,
                 nt_fs::ByteRangeLockOwner::new(route.file_object, pid as u64, key),
@@ -12472,8 +12536,9 @@ impl ExecNtHandler {
                 .lock(request, fail_immediately, request_id)
             {
                 nt_fs::ByteRangeLockResult::Granted => {
-                    self.complete_terminal_file_io(
-                        0,
+                    self.complete_terminal_local_file_io(
+                        route.file_object,
+                        synchronous,
                         event_obj_idx,
                         self.current_tid,
                         apc_routine,
@@ -12484,11 +12549,13 @@ impl ExecNtHandler {
                         true,
                         completion_port_suppressed,
                     );
+                    self.release_local_file_io_reference(route.file_object);
                     nt_fs::STATUS_SUCCESS
                 }
                 nt_fs::ByteRangeLockResult::Failed(status) => {
-                    self.complete_terminal_file_io(
-                        0,
+                    self.complete_terminal_local_file_io(
+                        route.file_object,
+                        synchronous,
                         event_obj_idx,
                         self.current_tid,
                         apc_routine,
@@ -12499,6 +12566,7 @@ impl ExecNtHandler {
                         true,
                         completion_port_suppressed,
                     );
+                    self.release_local_file_io_reference(route.file_object);
                     status
                 }
                 nt_fs::ByteRangeLockResult::Pending(wait_id) => {
@@ -12528,7 +12596,7 @@ impl ExecNtHandler {
                         apc_routine,
                         apc_context,
                         completion_port_suppressed,
-                        signal_file: false,
+                        signal_file: synchronous || event_obj_idx == u64::MAX,
                         publish_iocp: false,
                         event_obj_idx,
                         reply_cap: 0,
@@ -21857,6 +21925,95 @@ impl ExecNtHandler {
         let sequence = self.next_local_directory_notify_irp.max(1) & LOCAL_ID_PAYLOAD_MASK;
         self.next_local_directory_notify_irp = sequence.wrapping_add(1).max(1);
         LOCAL_DIRECTORY_NOTIFY_IRP_TAG | sequence
+    }
+
+    fn set_local_file_object_signaled(
+        &mut self,
+        file_object: u64,
+        signaled: bool,
+    ) -> Result<(), u32> {
+        let object_id = (file_object & LOCAL_ID_PAYLOAD_MASK) as u32;
+        match file_object & !LOCAL_ID_PAYLOAD_MASK {
+            LOCAL_FAT_FILE_OBJECT_TAG => self.readonly_file_opens.set_signaled(object_id, signaled),
+            LOCAL_FAT_DIRECTORY_OBJECT_TAG => {
+                self.directory_opens.set_signaled(object_id, signaled)
+            }
+            LOCAL_OVERLAY_FILE_OBJECT_TAG => unsafe {
+                crate::writable_fs::set_file_signaled(file_object & LOCAL_ID_PAYLOAD_MASK, signaled)
+            },
+            _ => Err(nt_fs::STATUS_INVALID_HANDLE),
+        }
+    }
+
+    fn retain_local_file_io_reference(&mut self, file_object: u64) -> Result<(), u32> {
+        let object_id = (file_object & LOCAL_ID_PAYLOAD_MASK) as u32;
+        match file_object & !LOCAL_ID_PAYLOAD_MASK {
+            LOCAL_FAT_FILE_OBJECT_TAG => self.readonly_file_opens.retain_io(object_id),
+            LOCAL_FAT_DIRECTORY_OBJECT_TAG => self.directory_opens.retain_io(object_id),
+            LOCAL_OVERLAY_FILE_OBJECT_TAG => unsafe {
+                crate::writable_fs::retain_io_reference(file_object & LOCAL_ID_PAYLOAD_MASK)
+            },
+            _ => Err(nt_fs::STATUS_INVALID_HANDLE),
+        }
+    }
+
+    pub(crate) fn release_local_file_io_reference(&mut self, file_object: u64) {
+        let object_id = (file_object & LOCAL_ID_PAYLOAD_MASK) as u32;
+        let result = match file_object & !LOCAL_ID_PAYLOAD_MASK {
+            LOCAL_FAT_FILE_OBJECT_TAG => self.readonly_file_opens.release_io(object_id),
+            LOCAL_FAT_DIRECTORY_OBJECT_TAG => self.directory_opens.release_io(object_id),
+            LOCAL_OVERLAY_FILE_OBJECT_TAG => unsafe {
+                crate::writable_fs::release_io_reference(file_object & LOCAL_ID_PAYLOAD_MASK)
+            },
+            _ => Err(nt_fs::STATUS_INVALID_HANDLE),
+        };
+        result.expect("local pending I/O lost its FILE_OBJECT reference");
+    }
+
+    pub(crate) fn signal_local_file_completion(&mut self, file_object: u64) -> u32 {
+        match self.set_local_file_object_signaled(file_object, true) {
+            Ok(()) => {
+                unsafe {
+                    let _ = wait_wake_dispatcher_set(self);
+                }
+                nt_fs::STATUS_SUCCESS
+            }
+            Err(status) => status,
+        }
+    }
+
+    fn complete_terminal_local_file_io(
+        &mut self,
+        file_object: u64,
+        synchronous: bool,
+        event_obj_idx: u64,
+        tid: u64,
+        apc_routine: u64,
+        apc_context: u64,
+        iosb: u64,
+        status: u32,
+        information: u64,
+        completed_inline: bool,
+        completion_port_suppressed: bool,
+    ) {
+        self.complete_terminal_file_io(
+            0,
+            event_obj_idx,
+            tid,
+            apc_routine,
+            apc_context,
+            iosb,
+            status,
+            information,
+            completed_inline,
+            completion_port_suppressed,
+        );
+        if nt_io_completion::file_io_status_publishes_completion(status, completed_inline)
+            && (synchronous || event_obj_idx == u64::MAX)
+        {
+            let result = self.signal_local_file_completion(file_object);
+            assert_eq!(result, nt_fs::STATUS_SUCCESS);
+        }
     }
 
     unsafe fn local_directory_notify_route_for(

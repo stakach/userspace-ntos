@@ -22799,6 +22799,9 @@ pub(crate) unsafe fn reconcile_user_apc_file_wait(
     };
     let alertable = match pending.operation {
         nt_io_manager::PendingFileIoOperation::LocalByteLock(operation) => operation.alertable,
+        nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(operation) => {
+            operation.alertable
+        }
         _ => {
             nt_handler.file_completion.io_mode(pending.file_id)
                 == Ok(nt_io_completion::FileIoMode::SynchronousAlertable)
@@ -24060,9 +24063,14 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 .expect("pending File event owner disappeared");
         }
         if pending.signal_file && delivery_state & nt_io_manager::IO_DELIVERY_FILE_PUBLISHED == 0 {
-            if nt_handler.signal_file_completion(pending.file_id, terminal_status)
-                != nt_fs::STATUS_SUCCESS
-            {
+            let status = match pending.operation {
+                nt_io_manager::PendingFileIoOperation::LocalByteLock(_)
+                | nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(_) => {
+                    nt_handler.signal_local_file_completion(pending.file_id)
+                }
+                _ => nt_handler.signal_file_completion(pending.file_id, terminal_status),
+            };
+            if status != nt_fs::STATUS_SUCCESS {
                 FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
                 restore_file_io_mirrors!();
                 continue;
@@ -24225,8 +24233,10 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 }
                 nt_handler.release_file_reference(finished.file_id);
             }
-            nt_io_manager::PendingFileIoOperation::LocalByteLock(_) => {}
-            nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(_) => {}
+            nt_io_manager::PendingFileIoOperation::LocalByteLock(_)
+            | nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(_) => {
+                nt_handler.release_local_file_io_reference(finished.file_id);
+            }
         }
         delivered += 1;
         let trace_completion = FILE_IO_COMPLETION_TRACE.fetch_add(1, Ordering::Relaxed) < 32

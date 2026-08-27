@@ -2392,6 +2392,9 @@ impl WaitObject {
     pub(crate) const KIND_THREAD: u64 = 2;
     pub(crate) const KIND_WIN32K_EVENT: u64 = 3;
     pub(crate) const KIND_FILE: u64 = 4;
+    pub(crate) const KIND_FAT_FILE: u64 = 5;
+    pub(crate) const KIND_FAT_DIRECTORY: u64 = 6;
+    pub(crate) const KIND_OVERLAY_FILE: u64 = 7;
 
     pub(crate) const FREE: Self = Self(u64::MAX);
 
@@ -2413,6 +2416,18 @@ impl WaitObject {
 
     pub(crate) const fn file(file_id: u64) -> Self {
         Self((Self::KIND_FILE << Self::KIND_SHIFT) | (file_id & Self::ID_MASK))
+    }
+
+    pub(crate) const fn fat_file(object_id: u32) -> Self {
+        Self((Self::KIND_FAT_FILE << Self::KIND_SHIFT) | object_id as u64)
+    }
+
+    pub(crate) const fn fat_directory(object_id: u32) -> Self {
+        Self((Self::KIND_FAT_DIRECTORY << Self::KIND_SHIFT) | object_id as u64)
+    }
+
+    pub(crate) const fn overlay_file(file_id: u64) -> Self {
+        Self((Self::KIND_OVERLAY_FILE << Self::KIND_SHIFT) | (file_id & Self::ID_MASK))
     }
 
     pub(crate) const fn raw(self) -> u64 {
@@ -2442,6 +2457,9 @@ impl WaitObject {
             Self::KIND_THREAD => b"thread",
             Self::KIND_WIN32K_EVENT => b"win32k-event",
             Self::KIND_FILE => b"file",
+            Self::KIND_FAT_FILE => b"fat-file",
+            Self::KIND_FAT_DIRECTORY => b"fat-directory",
+            Self::KIND_OVERLAY_FILE => b"overlay-file",
             _ => b"unknown",
         }
     }
@@ -22465,6 +22483,21 @@ impl ExecDirectoryOpens {
         unsafe { (&mut *self.table).retain(id) }
     }
 
+    fn retain_io(&mut self, id: u32) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).retain_io(id) }
+    }
+
+    fn set_signaled(&mut self, id: u32, signaled: bool) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).set_signaled(id, signaled) }
+    }
+
+    fn is_signaled(&self, id: u32) -> Result<bool, u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).is_signaled(id) }
+    }
+
     fn is_final_reference(&self, id: u32) -> Result<bool, u32> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).is_final_reference(id) }
@@ -22473,6 +22506,11 @@ impl ExecDirectoryOpens {
     fn release(&mut self, id: u32) -> Result<(), u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe { (&mut *self.table).release(id) }
+    }
+
+    fn release_io(&mut self, id: u32) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).release_io(id) }
     }
 }
 
@@ -22544,6 +22582,21 @@ impl ExecReadOnlyFileOpens {
         unsafe { (&mut *self.table).retain(id) }
     }
 
+    fn retain_io(&mut self, id: u32) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).retain_io(id) }
+    }
+
+    fn set_signaled(&mut self, id: u32, signaled: bool) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).set_signaled(id, signaled) }
+    }
+
+    fn is_signaled(&self, id: u32) -> Result<bool, u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).is_signaled(id) }
+    }
+
     fn is_final_reference(&self, id: u32) -> Result<bool, u32> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).is_final_reference(id) }
@@ -22552,6 +22605,11 @@ impl ExecReadOnlyFileOpens {
     fn release(&mut self, id: u32) -> Result<(), u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe { (&mut *self.table).release(id) }
+    }
+
+    fn release_io(&mut self, id: u32) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).release_io(id) }
     }
 }
 
