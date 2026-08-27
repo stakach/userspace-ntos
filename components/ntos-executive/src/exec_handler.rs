@@ -29961,6 +29961,59 @@ impl ExecNtHandler {
                     }
                     return status;
                 }
+                if class == nt_fs::FILE_STREAM_INFORMATION {
+                    let state = match self.local_file_query_state(args[0], false) {
+                        Ok(state) => state,
+                        Err(status) => return status,
+                    };
+                    // The only local stream is the unnamed `::$DATA` stream. Its single record is
+                    // 38 bytes; a directory completes with an empty list.
+                    let mut encoded = [0u8; 38];
+                    let encoded_capacity = encoded.len();
+                    let result = match nt_fs::encode_stream_information(
+                        state.metadata,
+                        &mut encoded[..length.min(encoded_capacity)],
+                    ) {
+                        Ok(result) => result,
+                        Err(status) => return status,
+                    };
+                    let mut iosb_bytes = [0u8; 16];
+                    iosb_bytes[..4].copy_from_slice(&result.status.to_le_bytes());
+                    iosb_bytes[8..16]
+                        .copy_from_slice(&(result.information as u64).to_le_bytes());
+                    if (result.information != 0
+                        && !self.xas_try_write_buf(output, &encoded[..result.information]))
+                        || !self.xas_try_write_buf(iosb, &iosb_bytes)
+                    {
+                        return nt_syscall::STATUS_ACCESS_VIOLATION;
+                    }
+                    return result.status;
+                }
+                if class == nt_fs::FILE_REPARSE_POINT_INFORMATION {
+                    let state = match self.local_file_query_state(args[0], false) {
+                        Ok(state) => state,
+                        Err(status) => return status,
+                    };
+                    let mut encoded = [0u8; nt_fs::FILE_REPARSE_POINT_INFORMATION_LENGTH];
+                    let result = nt_fs::encode_reparse_point_information(
+                        state.metadata,
+                        &mut encoded,
+                    );
+                    let (status, information) = match result {
+                        Ok(information) => (nt_fs::STATUS_SUCCESS, information),
+                        Err(status) => (status, 0),
+                    };
+                    let mut iosb_bytes = [0u8; 16];
+                    iosb_bytes[..4].copy_from_slice(&status.to_le_bytes());
+                    iosb_bytes[8..16].copy_from_slice(&(information as u64).to_le_bytes());
+                    if (information != 0
+                        && !self.xas_try_write_buf(output, &encoded[..information]))
+                        || !self.xas_try_write_buf(iosb, &iosb_bytes)
+                    {
+                        return nt_syscall::STATUS_ACCESS_VIOLATION;
+                    }
+                    return status;
+                }
                 if named_query {
                     let state = match self.local_file_query_state(
                         args[0],

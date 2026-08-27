@@ -14505,3 +14505,36 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     directories, and preserve FSD dispatch for provider-backed Files. Object IDs and quotas remain
     separate optional filesystem facilities; do not substitute `FileInternalInformation` identity
     for an object ID or report successful empty quota data without an owning quota implementation.
+
+    Local stream, compression, and reparse query capabilities (2026-08-27, accepted): `nt-fs` now
+    owns the native layouts and filesystem semantics for classes 22, 28, and 33. A regular FAT or
+    MemFs File reports its one real unnamed `::$DATA` stream with logical and allocation sizes; a
+    directory returns an empty stream list. The record-list encoder refuses partial records with
+    `STATUS_BUFFER_OVERFLOW` and zero information rather than publishing a truncated stream name.
+    Both local filesystems truthfully report `COMPRESSION_FORMAT_NONE`, using logical EOF as the
+    physical size of an ordinary uncompressed File and zero data bytes for a directory.
+
+    Reparse identity is returned only when filesystem metadata carries both
+    `FILE_ATTRIBUTE_REPARSE_POINT` and a nonzero tag. Otherwise the completed query reports
+    `STATUS_NOT_A_REPARSE_POINT`; the executive does not infer a tag or turn absence into successful
+    zero data. The I/O Manager still owns validity, minimum-length, access, alignment, and probe
+    checks. Provider-backed handles are selected before these local completions and continue to
+    issue a real `IRP_MJ_QUERY_INFORMATION` to their FSD. Host tests prove the ABI and failure
+    contracts; this boot workload did not add a synthetic in-guest query solely to manufacture
+    coverage.
+
+    Focused validation passes `nt-fs` `90/90`; the freestanding executive remains at the established
+    211-warning baseline. Serialized acceptance
+    `.tmp/run-headless-local-file-capabilities-20260827.log` reached quiescence at 108,969 ms,
+    launched genuine userinit and Explorer, completed 668 Explorer api0 redirects with zero callback
+    failures, painted `480000/480000` framebuffer pixels with at least 32 colours, passed all
+    `295/295` gates, and matched the sentinel. The writable snapshot committed generation 5 at
+    1,750,172 bytes; scratch returned to zero and the resource census reported no frame, mapping,
+    registry, retype, or allocator failures.
+
+    Review adjustment: local stream, compression, and reparse query ownership is closed. Next audit
+    `FileObjectIdInformation` and `FileQuotaInformation` as optional filesystem facilities. Keep
+    local FAT and MemFs failures explicit unless a persisted object-ID namespace or quota-accounting
+    model is implemented; never substitute the internal file index, security token quotas, or an
+    empty successful record. Provider-backed Files must retain FSD ownership. Then continue the
+    remaining set-information inventory, starting with hard links and allocation/EOF ownership.

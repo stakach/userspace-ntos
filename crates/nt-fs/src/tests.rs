@@ -459,6 +459,96 @@ fn query_information_encodes_fat_alternate_name_and_overflow_prefix() {
 }
 
 #[test]
+fn query_information_encodes_the_local_unnamed_data_stream() {
+    let metadata = QueryMetadata {
+        end_of_file: 0x1234,
+        allocation_size: 0x2000,
+        ..QueryMetadata::default()
+    };
+    let mut output = [0xCC; 42];
+    assert_eq!(
+        encode_stream_information(metadata, &mut output),
+        Ok(QueryInformationResult {
+            status: STATUS_SUCCESS,
+            information: 38,
+        })
+    );
+    assert_eq!(u32::from_le_bytes(output[0..4].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(output[4..8].try_into().unwrap()), 14);
+    assert_eq!(u64::from_le_bytes(output[8..16].try_into().unwrap()), 0x1234);
+    assert_eq!(u64::from_le_bytes(output[16..24].try_into().unwrap()), 0x2000);
+    assert_eq!(&output[24..38], b":\0:\0$\0D\0A\0T\0A\0");
+    assert_eq!(&output[38..], &[0xCC; 4]);
+
+    let mut truncated = [0xCC; FILE_STREAM_INFORMATION_MINIMUM_LENGTH];
+    assert_eq!(
+        encode_stream_information(metadata, &mut truncated),
+        Ok(QueryInformationResult {
+            status: STATUS_BUFFER_OVERFLOW,
+            information: 0,
+        })
+    );
+    assert_eq!(truncated, [0xCC; FILE_STREAM_INFORMATION_MINIMUM_LENGTH]);
+
+    let mut directory = [0xCC; FILE_STREAM_INFORMATION_MINIMUM_LENGTH];
+    assert_eq!(
+        encode_stream_information(
+            QueryMetadata {
+                directory: true,
+                ..metadata
+            },
+            &mut directory,
+        ),
+        Ok(QueryInformationResult {
+            status: STATUS_SUCCESS,
+            information: 0,
+        })
+    );
+    assert_eq!(directory, [0xCC; FILE_STREAM_INFORMATION_MINIMUM_LENGTH]);
+}
+
+#[test]
+fn query_information_encodes_uncompressed_and_reparse_capabilities() {
+    let metadata = QueryMetadata {
+        end_of_file: 0x1234,
+        file_id: 0x5566,
+        file_attributes: FILE_ATTRIBUTE_REPARSE_POINT,
+        reparse_tag: 0xA000_000C,
+        ..QueryMetadata::default()
+    };
+    let mut compression = [0xCC; FILE_COMPRESSION_INFORMATION_LENGTH];
+    assert_eq!(
+        encode_query_information(FILE_COMPRESSION_INFORMATION, metadata, &mut compression),
+        Ok(FILE_COMPRESSION_INFORMATION_LENGTH)
+    );
+    assert_eq!(
+        u64::from_le_bytes(compression[0..8].try_into().unwrap()),
+        metadata.end_of_file
+    );
+    assert_eq!(&compression[8..], &[0; 8]);
+
+    let mut reparse = [0xCC; FILE_REPARSE_POINT_INFORMATION_LENGTH];
+    assert_eq!(
+        encode_reparse_point_information(metadata, &mut reparse),
+        Ok(FILE_REPARSE_POINT_INFORMATION_LENGTH)
+    );
+    assert_eq!(u64::from_le_bytes(reparse[0..8].try_into().unwrap()), 0x5566);
+    assert_eq!(u32::from_le_bytes(reparse[8..12].try_into().unwrap()), 0xA000_000C);
+    assert_eq!(&reparse[12..], &[0; 4]);
+    assert_eq!(
+        encode_reparse_point_information(
+            QueryMetadata {
+                file_attributes: FILE_ATTRIBUTE_NORMAL,
+                reparse_tag: 0,
+                ..metadata
+            },
+            &mut reparse,
+        ),
+        Err(STATUS_NOT_A_REPARSE_POINT)
+    );
+}
+
+#[test]
 fn query_information_composes_file_all_information() {
     let metadata = QueryMetadata {
         creation_time: 1,

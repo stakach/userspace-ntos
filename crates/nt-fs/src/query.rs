@@ -20,12 +20,28 @@ pub const FILE_EA_INFORMATION: u32 = 7;
 pub const FILE_NAME_INFORMATION: u32 = 9;
 pub const FILE_ALL_INFORMATION: u32 = 18;
 pub const FILE_ALTERNATE_NAME_INFORMATION: u32 = 21;
+pub const FILE_STREAM_INFORMATION: u32 = 22;
+pub const FILE_COMPRESSION_INFORMATION: u32 = 28;
+pub const FILE_REPARSE_POINT_INFORMATION: u32 = 33;
 
 pub const FILE_NAME_INFORMATION_MINIMUM_LENGTH: usize = 8;
 pub const FILE_ALL_INFORMATION_MINIMUM_LENGTH: usize = 104;
 pub const FILE_ALTERNATE_NAME_INFORMATION_MINIMUM_LENGTH: usize = 8;
+pub const FILE_STREAM_INFORMATION_MINIMUM_LENGTH: usize = 32;
+pub const FILE_COMPRESSION_INFORMATION_LENGTH: usize = 16;
+pub const FILE_REPARSE_POINT_INFORMATION_LENGTH: usize = 16;
 const FILE_ALL_NAME_LENGTH_OFFSET: usize = 96;
 const FILE_ALL_NAME_OFFSET: usize = 100;
+const FILE_STREAM_NAME_OFFSET: usize = 24;
+const UNNAMED_DATA_STREAM: [u16; 7] = [
+    b':' as u16,
+    b':' as u16,
+    b'$' as u16,
+    b'D' as u16,
+    b'A' as u16,
+    b'T' as u16,
+    b'A' as u16,
+];
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct QueryInformationResult {
@@ -67,6 +83,7 @@ pub fn encode_query_information(
         FILE_POSITION_INFORMATION => 8,
         FILE_MODE_INFORMATION => 4,
         FILE_ALIGNMENT_INFORMATION => 4,
+        FILE_COMPRESSION_INFORMATION => FILE_COMPRESSION_INFORMATION_LENGTH,
         FILE_NETWORK_OPEN_INFORMATION => 56,
         FILE_ATTRIBUTE_TAG_INFORMATION => 8,
         _ => return Err(STATUS_INVALID_INFO_CLASS),
@@ -117,6 +134,17 @@ pub fn encode_query_information(
         FILE_ALIGNMENT_INFORMATION => {
             output[0..4].copy_from_slice(&metadata.alignment_requirement.to_le_bytes());
         }
+        // Local FAT and MemFs have no compressed backing. For an ordinary file the physical
+        // representation is therefore its logical EOF; directories carry no data bytes.
+        FILE_COMPRESSION_INFORMATION => {
+            let compressed_size = if metadata.directory {
+                0
+            } else {
+                metadata.end_of_file
+            };
+            output[0..8].copy_from_slice(&compressed_size.to_le_bytes());
+            // CompressionFormat, all shifts, and Reserved remain zero (COMPRESSION_FORMAT_NONE).
+        }
         FILE_NETWORK_OPEN_INFORMATION => {
             output[0..8].copy_from_slice(&metadata.creation_time.to_le_bytes());
             output[8..16].copy_from_slice(&metadata.last_access_time.to_le_bytes());
@@ -139,6 +167,63 @@ pub fn encode_query_information(
         _ => unreachable!(),
     }
     Ok(required)
+}
+
+/// Encode the single unnamed data stream supported by the local filesystems.
+///
+/// Stream information is a record list, so an undersized buffer cannot receive a partial record.
+/// Directories have no data stream and truthfully return an empty list.
+pub fn encode_stream_information(
+    metadata: QueryMetadata,
+    output: &mut [u8],
+) -> Result<QueryInformationResult, u32> {
+    if output.len() < FILE_STREAM_INFORMATION_MINIMUM_LENGTH {
+        return Err(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    if metadata.directory {
+        return Ok(QueryInformationResult {
+            status: STATUS_SUCCESS,
+            information: 0,
+        });
+    }
+
+    let name_bytes = UNNAMED_DATA_STREAM.len() * 2;
+    let required = FILE_STREAM_NAME_OFFSET + name_bytes;
+    if output.len() < required {
+        return Ok(QueryInformationResult {
+            status: STATUS_BUFFER_OVERFLOW,
+            information: 0,
+        });
+    }
+    output[..required].fill(0);
+    output[4..8].copy_from_slice(&(name_bytes as u32).to_le_bytes());
+    output[8..16].copy_from_slice(&metadata.end_of_file.to_le_bytes());
+    output[16..24].copy_from_slice(&metadata.allocation_size.to_le_bytes());
+    for (index, unit) in UNNAMED_DATA_STREAM.iter().enumerate() {
+        let offset = FILE_STREAM_NAME_OFFSET + index * 2;
+        output[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    Ok(QueryInformationResult {
+        status: STATUS_SUCCESS,
+        information: required,
+    })
+}
+
+/// Encode a reparse-point identity only when the filesystem metadata describes one.
+pub fn encode_reparse_point_information(
+    metadata: QueryMetadata,
+    output: &mut [u8],
+) -> Result<usize, u32> {
+    if output.len() < FILE_REPARSE_POINT_INFORMATION_LENGTH {
+        return Err(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    if metadata.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 || metadata.reparse_tag == 0 {
+        return Err(crate::STATUS_NOT_A_REPARSE_POINT);
+    }
+    output[..FILE_REPARSE_POINT_INFORMATION_LENGTH].fill(0);
+    output[0..8].copy_from_slice(&metadata.file_id.to_le_bytes());
+    output[8..12].copy_from_slice(&metadata.reparse_tag.to_le_bytes());
+    Ok(FILE_REPARSE_POINT_INFORMATION_LENGTH)
 }
 
 /// Encode the variable-length file-name query classes.
