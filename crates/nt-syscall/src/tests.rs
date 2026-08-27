@@ -883,6 +883,18 @@ fn signal_and_wait_uses_its_canonical_service_contract() {
 }
 
 #[test]
+fn device_io_control_uses_its_canonical_service_contract() {
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtDeviceIoControlFile, 69)],
+    );
+    let entry = table.lookup(69).unwrap();
+    assert_eq!(entry.service, NativeService::NtDeviceIoControlFile);
+    assert_eq!(entry.min_args, 10);
+    assert_eq!(entry.max_args, 10);
+}
+
+#[test]
 fn wait_for_multiple_objects_uses_its_canonical_service_contract() {
     let table = NativeServiceTable::from_numbers(
         UserlandAbiProfile::Windows7,

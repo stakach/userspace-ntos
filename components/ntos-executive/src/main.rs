@@ -993,6 +993,8 @@ pub const SSN_NT_SET_IO_COMPLETION: u64 = 241;
 pub const SSN_NT_CREATE_NAMED_PIPE_FILE: u64 = 46;
 /// ntdll's NtFsControlFile SSN (rpcrt4's pipe listen/connect FSCTLs).
 pub const SSN_NT_FS_CONTROL_FILE: u64 = 88;
+/// ntdll's NtDeviceIoControlFile SSN (canonical ReactOS native service table).
+pub const SSN_NT_DEVICE_IO_CONTROL_FILE: u64 = 69;
 /// ntdll's NtProtectVirtualMemory SSN (LdrpInitialize re-protects image sections).
 pub const SSN_NT_PROTECT_VM: u64 = 143;
 /// ntdll's NtQueryDefaultLocale SSN (LdrpInitialize caches the default LCID in an ntdll global).
@@ -23436,6 +23438,10 @@ fn build_nt_table() -> NativeServiceTable {
             (
                 NativeService::NtFsControlFile,
                 SSN_NT_FS_CONTROL_FILE as u32,
+            ),
+            (
+                NativeService::NtDeviceIoControlFile,
+                SSN_NT_DEVICE_IO_CONTROL_FILE as u32,
             ),
             (
                 NativeService::NtQueryValueKey,

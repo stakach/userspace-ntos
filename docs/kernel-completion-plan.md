@@ -15022,3 +15022,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     a badge-zero smss identity branch even though dispatcher, process, thread, File, timeout, APC,
     and exact retained-set machinery now exist. Register it as a typed service, resolve every handle
     or fail, use the shared atomic WaitAny/WaitAll consumption rules, and delete both old branches.
+
+    `NtWaitForMultipleObjects` convergence (2026-08-27, accepted): SSN 280 is now a typed registered
+    service. The handler captures the complete user handle array before resolution, requires
+    `SYNCHRONIZE` on every dispatcher, process, thread, or File object, rejects duplicate WaitAll
+    objects, applies the shared atomic readiness/consumption rules, and transfers the exact retained
+    set, result indices, alertability, and deadline to reply-cap parking. Both the successful
+    fake-handle ladder and the badge-zero smss identity branch have been deleted.
+
+    Focused validation passes `nt-syscall` `60/60`, `git diff --check`, the freestanding executive,
+    and the release build. Code checkpoint `8c36fa41` is pushed. Serialized acceptance
+    `.tmp/run-headless-multi-wait-20260827.log` exercised 39 real multi-object parks, including smss
+    and RPC worker sets of one through six objects, without an invalid-handle or invalid-service
+    diagnostic. It reached quiescence at 105,422 ms, launched genuine userinit and Explorer,
+    completed 668 Explorer api0 redirects with zero callback or dead-callback failures, recorded
+    paint begin/end `5/20`, 187 direct GDI returns, and 135 batch flushes covering 184 records,
+    painted `480000/480000` framebuffer pixels with at least 32 colours, passed all `295/295` gates,
+    and matched the sentinel. Snapshot generation 5 committed 1,755,656 bytes; scratch returned to
+    zero and the resource census reported no page-table, frame, mapping, alias, registry,
+    untyped-allocation, frame-registration, image-bank, or allocator failures.
+
+    Review adjustment: the typed executive surface now contains 164 services and the table registers
+    162 distinct variants, leaving 59 canonical ABI exports outside the typed surface. Before adding
+    another export, audit the two existing typed-but-unregistered services. That audit found a real
+    registration regression for `NtDeviceIoControlFile`: its File/device/IRP handler exists and the
+    pinned ABI assigns SSN 69, but `build_nt_table` no longer exposes it. Restore that canonical
+    registration. `NtCreateThreadEx` is different: the pinned ReactOS target deliberately has only an
+    11-argument compatibility arity row and no service-number row, so keep its real executive handler
+    available to explicit compatibility tables without inventing an SSN in the hosted target ABI.
