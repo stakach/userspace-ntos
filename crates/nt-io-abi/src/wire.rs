@@ -137,6 +137,12 @@ pub struct IrpDispatchRequest {
     pub parameter_len: u32,
     pub stack_location: u32,
     pub stack_count: u32,
+    /// Typed `Parameters.LockControl` values. Length is a value on this pointer-free wire; the
+    /// Driver Host allocates the WDM `PLARGE_INTEGER` and publishes it as IRP auxiliary storage.
+    pub lock_byte_offset: u64,
+    pub lock_length: u64,
+    pub lock_key: u32,
+    pub _reserved1: u32,
 }
 
 impl IrpDispatchRequest {
@@ -172,7 +178,7 @@ const _: () = {
     assert!(size_of::<IoDeviceControlRequest>() == 56);
     assert!(size_of::<IoFileRequest>() == 16);
     assert!(size_of::<IoCancelRequest>() == 16);
-    assert!(size_of::<IrpDispatchRequest>() == 208);
+    assert!(size_of::<IrpDispatchRequest>() == 232);
     assert!(size_of::<IoReply>() == 32);
     assert!(align_of::<IoReadWriteRequest>() == 8);
     assert!(align_of::<IrpDispatchRequest>() == 8);

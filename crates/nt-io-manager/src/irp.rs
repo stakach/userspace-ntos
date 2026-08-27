@@ -8,6 +8,7 @@ use nt_types::{AccessMask, ClientId};
 
 use crate::ea::{QueryEaParameters, SetEaParameters};
 use crate::file::{CreateOptions, ShareAccess};
+use crate::lock_control::LockControlParameters;
 use crate::quota::{QueryQuotaParameters, SetQuotaParameters};
 use crate::volume_information::{QueryVolumeInformationParameters, SetVolumeInformationParameters};
 
@@ -209,6 +210,7 @@ pub enum IoParameters {
     SetQuota(SetQuotaParameters),
     QueryVolumeInformation(QueryVolumeInformationParameters),
     SetVolumeInformation(SetVolumeInformationParameters),
+    LockControl(LockControlParameters),
     Pnp(PnpParameters),
     Power,
     #[default]
@@ -237,6 +239,7 @@ impl IoParameters {
             IoParameters::SetQuota(p) => (p.length.min(cap), 0),
             IoParameters::QueryVolumeInformation(p) => (0, p.length.min(cap)),
             IoParameters::SetVolumeInformation(p) => (p.length.min(cap), 0),
+            IoParameters::LockControl(_) => (0, 0),
             IoParameters::Pnp(p) => (p.input_len().min(cap), 0),
             _ => (0, 0),
         }

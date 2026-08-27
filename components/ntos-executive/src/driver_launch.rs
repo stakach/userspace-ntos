@@ -70,8 +70,9 @@ use nt_hosted_runtime::{
     NDIS_PROTOCOL_CHARACTERISTICS_NAME_OFFSET_X64,
 };
 use nt_io_abi::{
-    ioctl, major, valid_ea_parameters, valid_quota_parameters, valid_set_information_control,
-    valid_volume_information_parameters, IrpDispatchRequest, IO_ABI_VERSION,
+    ioctl, major, valid_ea_parameters, valid_lock_control_parameters, valid_quota_parameters,
+    valid_set_information_control, valid_volume_information_parameters, IrpDispatchRequest,
+    IO_ABI_VERSION,
 };
 use nt_io_manager::{
     write_wdm_driver_object, write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
@@ -81,6 +82,7 @@ use nt_io_manager::{
     ExternalPnpDispatchResult, FileId, FileState, HostedDevicePropertyOwner,
     HostedDevicePropertyTransferError, HostedDevicePropertyTransferTable, HostedDomainIdentity,
     InformationParameters, IoManager, IoParameters, IrpCompletionOrigin, IrpId, IrpProjection,
+    LockControlParameters,
     MajorFunctionTable, ObjectManagerPort, PnpBackendDispatch, PnpParameters, QueryEaParameters,
     QueryQuotaParameters, QueryVolumeInformationParameters, ReadWriteParameters, SetEaParameters,
     SetInformationControl, SetInformationParameters, SetQuotaParameters,
@@ -31013,6 +31015,14 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 || request.create_options != 0
                 || request.create_file_attributes != 0
                 || request.create_ea_length != 0)
+        || !valid_lock_control_parameters(
+            request.major,
+            request.minor,
+            request.flags as u8,
+            request.lock_byte_offset,
+            request.lock_length,
+            request.lock_key,
+        )
     {
         return (STATUS_INVALID_BUFFER_SIZE as i32, 0);
     }
@@ -31555,6 +31565,23 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 information_class: fsctl as u32,
             }
         }
+        value if value as u8 == major::IRP_MJ_LOCK_CONTROL => {
+            aux_data = pool_alloc_zeroed(8);
+            if aux_data == 0 {
+                pool_free(irp);
+                pool_free_request_buffers(data, 0, mdl);
+                if owns_fo {
+                    pool_free(fo);
+                }
+                return (0xC000_009Au32 as i32, 0);
+            }
+            write_unaligned(aux_data as *mut u64, request.lock_length);
+            WdmIoStackParameters::LockControl {
+                length: aux_data,
+                key: request.lock_key,
+                byte_offset: request.lock_byte_offset,
+            }
+        }
         IRP_MJ_FILE_SYSTEM_CONTROL | IRP_MJ_DEVICE_CONTROL | IRP_MJ_INTERNAL_DEVICE_CONTROL => {
             WdmIoStackParameters::DeviceControl {
                 output_buffer_length: outlen as u32,
@@ -31680,7 +31707,9 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             system_buffer,
             user_buffer,
             thread: s_current_process(),
-            auxiliary_buffer: if matches!(
+            auxiliary_buffer: if major as u8 == major::IRP_MJ_LOCK_CONTROL {
+                aux_data
+            } else if matches!(
                 major as u8,
                 major::IRP_MJ_QUERY_EA | major::IRP_MJ_QUERY_QUOTA
             ) && inlen != 0
@@ -34707,6 +34736,8 @@ fn projection_fsctl(irp: &IrpProjection) -> u64 {
         }
         IoParameters::QueryInformation(p) => p.info_class as u64,
         IoParameters::SetInformation(p) => p.info_class as u64,
+        IoParameters::QueryVolumeInformation(p) => p.information_class as u64,
+        IoParameters::SetVolumeInformation(p) => p.information_class as u64,
         _ => 0,
     }
 }
@@ -34821,6 +34852,18 @@ fn hosted_irp_dispatch_request(
         },
         ea_index: match &irp.parameters {
             IoParameters::QueryEa(parameters) => parameters.ea_index,
+            _ => 0,
+        },
+        lock_byte_offset: match &irp.parameters {
+            IoParameters::LockControl(parameters) => parameters.byte_offset,
+            _ => 0,
+        },
+        lock_length: match &irp.parameters {
+            IoParameters::LockControl(parameters) => parameters.length,
+            _ => 0,
+        },
+        lock_key: match &irp.parameters {
+            IoParameters::LockControl(parameters) => parameters.key,
             _ => 0,
         },
         buffer_id: irp.buffer.map(|buffer| buffer.buffer_id).unwrap_or(0),
@@ -35227,6 +35270,7 @@ fn external_irp_parameters(
     query_ea: Option<QueryEaParameters>,
     query_quota: Option<QueryQuotaParameters>,
     volume_information: Option<InformationParameters>,
+    lock_control: Option<LockControlParameters>,
 ) -> Option<IoParameters> {
     match major {
         major::IRP_MJ_CREATE | major::IRP_MJ_CREATE_NAMED_PIPE | major::IRP_MJ_CREATE_MAILSLOT => {
@@ -35293,6 +35337,8 @@ fn external_irp_parameters(
                 }),
             )
         }
+        major::IRP_MJ_LOCK_CONTROL => (fsctl == 0 && input_len == 0 && output_len == 0)
+            .then_some(IoParameters::LockControl(lock_control?)),
         major::IRP_MJ_FLUSH_BUFFERS => Some(IoParameters::FlushBuffers),
         major::IRP_MJ_FILE_SYSTEM_CONTROL | major::IRP_MJ_DEVICE_CONTROL => {
             Some(IoParameters::DeviceControl(DeviceControlParameters {
@@ -35328,6 +35374,7 @@ fn dispatch_external_irp_to_device_record_result_exact(
     query_ea: Option<QueryEaParameters>,
     query_quota: Option<QueryQuotaParameters>,
     volume_information: Option<InformationParameters>,
+    lock_control: Option<LockControlParameters>,
     stack_flags: StackFlags,
 ) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
     let major = external_major(major).ok_or(STATUS_INVALID_PARAMETER as u32)?;
@@ -35343,6 +35390,7 @@ fn dispatch_external_irp_to_device_record_result_exact(
         query_ea,
         query_quota,
         volume_information,
+        lock_control,
     )
     .ok_or(STATUS_INVALID_PARAMETER as u32)?;
     let separate_output = (matches!(major, major::IRP_MJ_QUERY_EA | major::IRP_MJ_QUERY_QUOTA)
@@ -45230,6 +45278,7 @@ pub(crate) unsafe fn dispatch_hosted_file_irp_result_exact(
         None,
         None,
         None,
+        None,
         StackFlags::empty(),
     )
 }
@@ -45264,6 +45313,7 @@ pub(crate) unsafe fn dispatch_hosted_file_set_information_irp_result_exact(
         &mut output,
         None,
         Some(parameters),
+        None,
         None,
         None,
         None,
@@ -45308,6 +45358,7 @@ pub(crate) unsafe fn dispatch_hosted_file_query_ea_irp_result_exact(
         Some(parameters),
         None,
         None,
+        None,
         stack_flags,
     )
 }
@@ -45338,6 +45389,7 @@ pub(crate) unsafe fn dispatch_hosted_file_set_ea_irp_result_exact(
         requestor_tid,
         input,
         &mut output,
+        None,
         None,
         None,
         None,
@@ -45384,6 +45436,7 @@ pub(crate) unsafe fn dispatch_hosted_file_query_quota_irp_result_exact(
         None,
         Some(parameters),
         None,
+        None,
         stack_flags,
     )
 }
@@ -45414,6 +45467,7 @@ pub(crate) unsafe fn dispatch_hosted_file_set_quota_irp_result_exact(
         requestor_tid,
         input,
         &mut output,
+        None,
         None,
         None,
         None,
@@ -45458,6 +45512,7 @@ pub(crate) unsafe fn dispatch_hosted_file_query_volume_information_irp_result_ex
             info_class: parameters.information_class,
             length: parameters.length,
         }),
+        None,
         StackFlags::empty(),
     )
 }
@@ -45497,7 +45552,53 @@ pub(crate) unsafe fn dispatch_hosted_file_set_volume_information_irp_result_exac
             info_class: parameters.information_class,
             length: parameters.length,
         }),
+        None,
         StackFlags::empty(),
+    )
+}
+
+/// Dispatch a typed byte-range lock operation through the canonical provider File.
+pub(crate) unsafe fn dispatch_hosted_file_lock_control_irp_result_exact(
+    file_id: u64,
+    requestor_tid: u64,
+    parameters: LockControlParameters,
+    stack_flags: StackFlags,
+) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
+    if !valid_lock_control_parameters(
+        major::IRP_MJ_LOCK_CONTROL,
+        parameters.minor,
+        stack_flags.bits(),
+        parameters.byte_offset,
+        parameters.length,
+        parameters.key,
+    ) {
+        return Err(STATUS_INVALID_PARAMETER as u32);
+    }
+    let canonical_file_id = FileId(file_id);
+    let device_id = io_manager_mut()
+        .file(canonical_file_id)
+        .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID))
+        .map(|file| file.device_id.raw())
+        .ok_or(STATUS_INVALID_HANDLE as u32)?;
+    require_hosted_device_ready_for_dispatch(device_id)?;
+    let mut input = [];
+    let mut output = [];
+    dispatch_external_irp_to_device_record_result_exact(
+        device_id,
+        Some(canonical_file_id),
+        major::IRP_MJ_LOCK_CONTROL as u64,
+        0,
+        0,
+        requestor_tid,
+        &mut input,
+        &mut output,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(parameters),
+        stack_flags,
     )
 }
 
@@ -45540,6 +45641,7 @@ pub(crate) unsafe fn dispatch_hosted_file_create_irp_result_exact(
         None,
         None,
         None,
+        None,
         StackFlags::empty(),
     )
 }
@@ -45574,6 +45676,7 @@ pub(crate) unsafe fn dispatch_hosted_target_directory_create_irp_result_exact(
         in_data,
         &mut output,
         Some(parameters),
+        None,
         None,
         None,
         None,

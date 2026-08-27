@@ -655,6 +655,26 @@ impl<P> IoManager<P> {
             {
                 return Err(NtStatus::INVALID_PARAMETER)
             }
+            IoParameters::LockControl(parameters) => {
+                if major != nt_io_abi::major::IRP_MJ_LOCK_CONTROL
+                    || input_len != 0
+                    || output_len != 0
+                    || !system_buffer.is_empty()
+                    || !nt_io_abi::valid_lock_control_parameters(
+                        major,
+                        parameters.minor,
+                        stack_flags.bits(),
+                        parameters.byte_offset,
+                        parameters.length,
+                        parameters.key,
+                    )
+                {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                }
+            }
+            _ if major == nt_io_abi::major::IRP_MJ_LOCK_CONTROL => {
+                return Err(NtStatus::INVALID_PARAMETER)
+            }
             _ => {}
         }
         if self.driver(driver_id).is_none() {

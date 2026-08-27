@@ -133,6 +133,11 @@ pub enum WdmIoStackParameters {
         length: u32,
         information_class: u32,
     },
+    LockControl {
+        length: u64,
+        key: u32,
+        byte_offset: u64,
+    },
     DeviceControl {
         output_buffer_length: u32,
         input_buffer_length: u32,
@@ -373,6 +378,15 @@ pub fn write_wdm_io_stack_location(
         } => {
             put_u32(bytes, 0x08, length);
             put_u32(bytes, 0x10, information_class);
+        }
+        WdmIoStackParameters::LockControl {
+            length,
+            key,
+            byte_offset,
+        } => {
+            put_u64(bytes, 0x08, length);
+            put_u32(bytes, 0x10, key);
+            put_u64(bytes, 0x18, byte_offset);
         }
         WdmIoStackParameters::DeviceControl {
             output_buffer_length,

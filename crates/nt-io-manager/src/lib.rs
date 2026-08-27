@@ -38,6 +38,7 @@ mod file;
 mod file_information;
 mod hosted_domain;
 mod irp;
+mod lock_control;
 mod mock_driver;
 mod object_port;
 mod open;
@@ -103,6 +104,10 @@ pub use irp::{
     IoBufferRef, IoParameters, IoStackLocation, IrpCompletionOrigin, IrpRecord, IrpState,
     PnpParameters, PnpStartParameters, ReadWriteParameters, SetInformationControl,
     SetInformationParameters, StackControl, StackFlags,
+};
+pub use lock_control::{
+    LockControlParameters, IRP_MN_LOCK, IRP_MN_UNLOCK_SINGLE, SL_EXCLUSIVE_LOCK,
+    SL_FAIL_IMMEDIATELY,
 };
 pub use mock_driver::{IoctlBehavior, MockDriverBackend};
 pub use object_port::{MockObjectPort, ObjectManagerPort};
@@ -477,8 +482,10 @@ impl<P> IoManager<P> {
             let mut location = IoStackLocation::new(device.driver_id, major, current, file);
             if stack.is_empty() {
                 location.parameters = parameters.clone();
-                if let IoParameters::Pnp(parameters) = parameters {
-                    location.minor = parameters.minor;
+                match parameters {
+                    IoParameters::Pnp(parameters) => location.minor = parameters.minor,
+                    IoParameters::LockControl(parameters) => location.minor = parameters.minor,
+                    _ => {}
                 }
             }
             stack.push(location);
@@ -512,8 +519,10 @@ impl<P> IoManager<P> {
         }
         let stack = if device == DeviceId::NULL {
             let mut location = IoStackLocation::new(driver, major, DeviceId::NULL, file);
-            if let IoParameters::Pnp(parameters) = &parameters {
-                location.minor = parameters.minor;
+            match &parameters {
+                IoParameters::Pnp(parameters) => location.minor = parameters.minor,
+                IoParameters::LockControl(parameters) => location.minor = parameters.minor,
+                _ => {}
             }
             location.parameters = parameters;
             let mut stack = Vec::new();
@@ -5726,6 +5735,87 @@ mod tests {
     }
 
     #[test]
+    fn peer_lock_control_wire_preserves_range_key_minor_and_flags() {
+        let control = MockPeerControl::new();
+        let mut om = io();
+        let client = om.register_client();
+        let (backend, _) = peer_backend(&mut om, &control);
+        let mut dispatch = MajorFunctionTable::new();
+        for major in [
+            major::IRP_MJ_CREATE,
+            major::IRP_MJ_CLEANUP,
+            major::IRP_MJ_CLOSE,
+            major::IRP_MJ_LOCK_CONTROL,
+        ] {
+            dispatch.set(major, DispatchTarget::DriverPeer(DriverPeerId(0)));
+        }
+        let driver = om
+            .create_driver_peer_with_major_table(
+                &path("\\Driver\\LockPeer"),
+                Box::new(backend),
+                dispatch,
+            )
+            .unwrap();
+        let device = om
+            .create_device(
+                driver,
+                Some(&path("\\Device\\LockPeer")),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let handle = om
+            .open(
+                client,
+                &path("\\Device\\LockPeer"),
+                AccessMask::GENERIC_READ | AccessMask::GENERIC_WRITE,
+                ShareAccess::empty(),
+                CreateOptions::empty(),
+                0,
+            )
+            .unwrap();
+        let (file, _, _) = om
+            .reference_open_file_details(client, handle, AccessMask::GENERIC_READ)
+            .unwrap();
+        let mut empty = [];
+        assert_eq!(
+            om.build_and_dispatch_external_to_device_with_stack_flags(
+                client,
+                device,
+                Some(file),
+                0,
+                31,
+                major::IRP_MJ_LOCK_CONTROL,
+                IoParameters::LockControl(LockControlParameters {
+                    minor: IRP_MN_LOCK,
+                    byte_offset: 0x1234_5678_9abc_def0,
+                    length: 0x1000_0000_0000_0001,
+                    key: 0x7654_3210,
+                }),
+                StackFlags::from_bits_retain(SL_FAIL_IMMEDIATELY | SL_EXCLUSIVE_LOCK),
+                0,
+                0,
+                &mut empty,
+            ),
+            Ok(ExternalDispatchResult::Completed {
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: None,
+            })
+        );
+        let request = control.last_request().unwrap();
+        assert_eq!(request.major, major::IRP_MJ_LOCK_CONTROL);
+        assert_eq!(request.minor, IRP_MN_LOCK);
+        assert_eq!(request.flags, 0x03);
+        assert_eq!(request.lock_byte_offset, 0x1234_5678_9abc_def0);
+        assert_eq!(request.lock_length, 0x1000_0000_0000_0001);
+        assert_eq!(request.lock_key, 0x7654_3210);
+        assert_eq!((request.input_len, request.output_len, request.buffer_len), (0, 0, 0));
+    }
+
+    #[test]
     fn peer_ea_wire_preserves_name_list_index_and_stack_flags() {
         let control = MockPeerControl::new();
         let mut om = io();
@@ -6316,6 +6406,30 @@ mod tests {
         assert_eq!(stack[0x00], major::IRP_MJ_QUERY_VOLUME_INFORMATION);
         assert_eq!(le_u32(&stack, 0x08), 0x48);
         assert_eq!(le_u32(&stack, 0x10), 8);
+
+        write_wdm_io_stack_location(
+            &mut stack,
+            WdmIoStackLocationInit {
+                major: major::IRP_MJ_LOCK_CONTROL,
+                minor: IRP_MN_LOCK,
+                flags: SL_FAIL_IMMEDIATELY | SL_EXCLUSIVE_LOCK,
+                control: 0,
+                device_object: 0x4444,
+                file_object: 0x5555,
+                parameters: WdmIoStackParameters::LockControl {
+                    length: 0x6666,
+                    key: 0x1234_5678,
+                    byte_offset: 0x1122_3344_5566_7788,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(stack[0x00], major::IRP_MJ_LOCK_CONTROL);
+        assert_eq!(stack[0x01], IRP_MN_LOCK);
+        assert_eq!(stack[0x02], 0x03);
+        assert_eq!(le_u64(&stack, 0x08), 0x6666);
+        assert_eq!(le_u32(&stack, 0x10), 0x1234_5678);
+        assert_eq!(le_u64(&stack, 0x18), 0x1122_3344_5566_7788);
 
         write_wdm_io_stack_location(
             &mut stack,

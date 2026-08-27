@@ -24,7 +24,26 @@ pub use wire::{
 };
 
 /// ABI version of this wire contract; bumped on any incompatible change.
-pub const IO_ABI_VERSION: u32 = 10;
+pub const IO_ABI_VERSION: u32 = 11;
+
+/// Validate native byte-range lock parameters. Other major functions must not carry lock state.
+pub const fn valid_lock_control_parameters(
+    major_function: u8,
+    minor_function: u8,
+    stack_flags: u8,
+    byte_offset: u64,
+    length: u64,
+    key: u32,
+) -> bool {
+    if major_function != major::IRP_MJ_LOCK_CONTROL {
+        return byte_offset == 0 && length == 0 && key == 0;
+    }
+    match minor_function {
+        1 => stack_flags & !0x03 == 0,
+        2 => stack_flags == 0,
+        _ => false,
+    }
+}
 
 /// Validate the raw `IO_STACK_LOCATION.Parameters.SetFile` control union.
 /// `information_class` is the class carried in `IrpDispatchRequest::ioctl_code`.
@@ -320,6 +339,42 @@ mod tests {
             1
         ));
         assert!(!valid_set_information_control(major::IRP_MJ_READ, 31, 1));
+    }
+
+    #[test]
+    fn lock_control_parameters_are_minor_and_major_specific() {
+        assert!(valid_lock_control_parameters(
+            major::IRP_MJ_LOCK_CONTROL,
+            1,
+            0x03,
+            0x1234,
+            0x5678,
+            9,
+        ));
+        assert!(valid_lock_control_parameters(
+            major::IRP_MJ_LOCK_CONTROL,
+            2,
+            0,
+            0x1234,
+            0x5678,
+            9,
+        ));
+        assert!(!valid_lock_control_parameters(
+            major::IRP_MJ_LOCK_CONTROL,
+            2,
+            1,
+            0,
+            0,
+            0,
+        ));
+        assert!(!valid_lock_control_parameters(
+            major::IRP_MJ_READ,
+            0,
+            0,
+            1,
+            0,
+            0,
+        ));
     }
 
     #[test]
