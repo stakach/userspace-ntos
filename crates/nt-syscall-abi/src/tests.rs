@@ -5,8 +5,8 @@ use super::*;
 /// The exact count of `Nt*` services in the shared table: the current hosted ReactOS import set,
 /// ntdll-internal services (`NtSecureConnectPort`, `NtCallbackReturn`), and registry hive
 /// load/unload variants that route to real executive CM functionality.
-const REQUIRED_NT_COUNT: usize = 219;
-const REQUIRED_ZW_COUNT: usize = 219;
+const REQUIRED_NT_COUNT: usize = 221;
+const REQUIRED_ZW_COUNT: usize = 221;
 
 #[test]
 fn required_counts() {
@@ -99,44 +99,46 @@ fn unknown_name_is_none() {
 fn ssn_anchors_match_reactos_and_executive() {
     // (name, expected SSN, executive const it matches)
     let anchors: &[(&str, u32)] = &[
-        ("NtAcceptConnectPort", 0),        // SSN_NT_ACCEPT_CONNECT_PORT = 0
-        ("NtAddAtom", 8),                  // SSN_NT_ADD_ATOM = 8
-        ("NtAdjustPrivilegesToken", 12),   // SSN_NT_ADJUST_PRIV_TOKEN = 12
-        ("NtAllocateVirtualMemory", 18),   // SSN_NT_ALLOCATE_VM = 0x12
-        ("NtCallbackReturn", 22),          // SSN_NT_CALLBACK_RETURN = 22
-        ("NtClose", 27),                   // SSN_NT_CLOSE = 27
-        ("NtContinue", 34),                // SSN_NT_CONTINUE = 34
-        ("NtCreateFile", 39),              // SSN_NT_CREATE_FILE = 39
-        ("NtCreatePort", 48),              // SSN_NT_CREATE_PORT = 48
-        ("NtCreateSection", 52),           // SSN_NT_CREATE_SECTION = 52
-        ("NtDelayExecution", 61),          // SSN_NT_DELAY_EXECUTION = 61
-        ("NtFsControlFile", 88),           // SSN_NT_FS_CONTROL_FILE = 88
-        ("NtGetPlugPlayEvent", 91),        // SSN_NT_GET_PLUG_PLAY_EVENT = 91
-        ("NtOpenFile", 122),               // (loader hot path)
-        ("NtOpenIoCompletion", 123),       // SSN_NT_OPEN_IO_COMPLETION = 123
-        ("NtOpenKey", 125),                // SSN_NT_OPEN_KEY = 125
-        ("NtLoadKey", 102),                // SSN_NT_LOAD_KEY = 102
-        ("NtLoadKey2", 103),               // SSN_NT_LOAD_KEY2 = 103
-        ("NtLoadKeyEx", 104),              // SSN_NT_LOAD_KEY_EX = 104
-        ("NtPlugPlayControl", 138),        // SSN_NT_PLUG_PLAY_CONTROL = 138
-        ("NtProtectVirtualMemory", 143),   // SSN_NT_PROTECT_VM = 143
-        ("NtQueryDebugFilterState", 148),  // SSN_NT_QUERY_DEBUG_FILTER_STATE = 148
-        ("NtQueryIoCompletion", 166),      // SSN_NT_QUERY_IO_COMPLETION = 166
+        ("NtAcceptConnectPort", 0),       // SSN_NT_ACCEPT_CONNECT_PORT = 0
+        ("NtAddAtom", 8),                 // SSN_NT_ADD_ATOM = 8
+        ("NtAdjustPrivilegesToken", 12),  // SSN_NT_ADJUST_PRIV_TOKEN = 12
+        ("NtAllocateVirtualMemory", 18),  // SSN_NT_ALLOCATE_VM = 0x12
+        ("NtCallbackReturn", 22),         // SSN_NT_CALLBACK_RETURN = 22
+        ("NtClose", 27),                  // SSN_NT_CLOSE = 27
+        ("NtContinue", 34),               // SSN_NT_CONTINUE = 34
+        ("NtCreateFile", 39),             // SSN_NT_CREATE_FILE = 39
+        ("NtCreatePort", 48),             // SSN_NT_CREATE_PORT = 48
+        ("NtCreateSection", 52),          // SSN_NT_CREATE_SECTION = 52
+        ("NtDelayExecution", 61),         // SSN_NT_DELAY_EXECUTION = 61
+        ("NtFsControlFile", 88),          // SSN_NT_FS_CONTROL_FILE = 88
+        ("NtGetPlugPlayEvent", 91),       // SSN_NT_GET_PLUG_PLAY_EVENT = 91
+        ("NtOpenFile", 122),              // (loader hot path)
+        ("NtOpenIoCompletion", 123),      // SSN_NT_OPEN_IO_COMPLETION = 123
+        ("NtOpenKey", 125),               // SSN_NT_OPEN_KEY = 125
+        ("NtLoadKey", 102),               // SSN_NT_LOAD_KEY = 102
+        ("NtLoadKey2", 103),              // SSN_NT_LOAD_KEY2 = 103
+        ("NtLoadKeyEx", 104),             // SSN_NT_LOAD_KEY_EX = 104
+        ("NtPlugPlayControl", 138),       // SSN_NT_PLUG_PLAY_CONTROL = 138
+        ("NtProtectVirtualMemory", 143),  // SSN_NT_PROTECT_VM = 143
+        ("NtQueryDebugFilterState", 148), // SSN_NT_QUERY_DEBUG_FILTER_STATE = 148
+        ("NtQueryIoCompletion", 166),     // SSN_NT_QUERY_IO_COMPLETION = 166
+        ("NtQueryQuotaInformationFile", 174),
         ("NtQuerySystemInformation", 181), // SSN_NT_QUERY_SYSTEM_INFO = 0xb5
         ("NtQuerySystemTime", 182),        // SSN_NT_QUERY_SYSTEM_TIME_SVC = 182
         ("NtResumeProcess", 213),          // SSN_NT_RESUME_PROCESS = 213
         ("NtQueryValueKey", 185),          // SSN_NT_QUERY_VALUE_KEY = 185
         ("NtRaiseException", 189),         // SSN_NT_RAISE_EXCEPTION = 189
         ("NtSetDebugFilterState", 222),    // SSN_NT_SET_DEBUG_FILTER_STATE = 222
-        ("NtSetSystemPowerState", 250),    // SSN_NT_SET_SYSTEM_POWER_STATE = 250
-        ("NtSetUuidSeed", 255),            // SSN_NT_SET_UUID_SEED = 255
-        ("NtSetValueKey", 256),            // SSN_NT_SET_VALUE_KEY = 256
-        ("NtSuspendProcess", 262),         // SSN_NT_SUSPEND_PROCESS = 262
-        ("NtTerminateProcess", 266),       // SSN_NT_TERMINATE_PROCESS = 266
-        ("NtUnloadKey", 272),              // SSN_NT_UNLOAD_KEY = 272
-        ("NtUnloadKey2", 273),             // SSN_NT_UNLOAD_KEY2 = 273
-        ("NtUnloadKeyEx", 274),            // SSN_NT_UNLOAD_KEY_EX = 274
-        ("NtWaitForSingleObject", 281),    // (core sync)
+        ("NtSetQuotaInformationFile", 245),
+        ("NtSetSystemPowerState", 250), // SSN_NT_SET_SYSTEM_POWER_STATE = 250
+        ("NtSetUuidSeed", 255),         // SSN_NT_SET_UUID_SEED = 255
+        ("NtSetValueKey", 256),         // SSN_NT_SET_VALUE_KEY = 256
+        ("NtSuspendProcess", 262),      // SSN_NT_SUSPEND_PROCESS = 262
+        ("NtTerminateProcess", 266),    // SSN_NT_TERMINATE_PROCESS = 266
+        ("NtUnloadKey", 272),           // SSN_NT_UNLOAD_KEY = 272
+        ("NtUnloadKey2", 273),          // SSN_NT_UNLOAD_KEY2 = 273
+        ("NtUnloadKeyEx", 274),         // SSN_NT_UNLOAD_KEY_EX = 274
+        ("NtWaitForSingleObject", 281), // (core sync)
     ];
     for &(name, expect) in anchors {
         assert_eq!(ssn_of(name), Some(expect), "anchor {} SSN drifted", name);

@@ -72,6 +72,8 @@ pub enum NativeService {
     NtQueryDirectoryFile,
     NtQueryInformationFile,
     NtSetInformationFile,
+    NtQueryQuotaInformationFile,
+    NtSetQuotaInformationFile,
     NtFlushBuffersFile,
     NtCreateIoCompletion,
     NtOpenIoCompletion,
@@ -272,6 +274,8 @@ impl NativeService {
             NtQueryDirectoryFile => "NtQueryDirectoryFile",
             NtQueryInformationFile => "NtQueryInformationFile",
             NtSetInformationFile => "NtSetInformationFile",
+            NtQueryQuotaInformationFile => "NtQueryQuotaInformationFile",
+            NtSetQuotaInformationFile => "NtSetQuotaInformationFile",
             NtFlushBuffersFile => "NtFlushBuffersFile",
             NtCreateIoCompletion => "NtCreateIoCompletion",
             NtOpenIoCompletion => "NtOpenIoCompletion",
@@ -573,6 +577,8 @@ impl NativeService {
         NativeService::NtSetDefaultUILanguage,
         NativeService::NtGetContextThread,
         NativeService::NtSetContextThread,
+        NativeService::NtQueryQuotaInformationFile,
+        NativeService::NtSetQuotaInformationFile,
     ];
 }
 

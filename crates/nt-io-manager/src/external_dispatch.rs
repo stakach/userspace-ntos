@@ -551,6 +551,39 @@ impl<P> IoManager<P> {
             _ if major == nt_io_abi::major::IRP_MJ_PNP => {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
+            IoParameters::QueryQuota(parameters) => {
+                let expected_input = parameters
+                    .input_length()
+                    .ok_or(NtStatus::INVALID_PARAMETER)?;
+                let expected_total = expected_input
+                    .checked_add(parameters.length)
+                    .ok_or(NtStatus::INVALID_PARAMETER)?;
+                if major != nt_io_abi::major::IRP_MJ_QUERY_QUOTA
+                    || input_len != expected_input
+                    || output_len != parameters.length
+                    || system_buffer.len() != expected_total as usize
+                    || stack_flags.bits() & !0x07 != 0
+                {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                }
+            }
+            IoParameters::SetQuota(parameters) => {
+                if major != nt_io_abi::major::IRP_MJ_SET_QUOTA
+                    || input_len != parameters.length
+                    || output_len != 0
+                    || system_buffer.len() != parameters.length as usize
+                    || !stack_flags.is_empty()
+                {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                }
+            }
+            _ if matches!(
+                major,
+                nt_io_abi::major::IRP_MJ_QUERY_QUOTA | nt_io_abi::major::IRP_MJ_SET_QUOTA
+            ) =>
+            {
+                return Err(NtStatus::INVALID_PARAMETER)
+            }
             _ => {}
         }
         if self.driver(driver_id).is_none() {

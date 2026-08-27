@@ -23222,6 +23222,8 @@ fn build_nt_table() -> NativeServiceTable {
                 SSN_NT_QUERY_INFORMATION_FILE as u32,
             ),
             (NativeService::NtSetInformationFile, 233),
+            (NativeService::NtQueryQuotaInformationFile, 174),
+            (NativeService::NtSetQuotaInformationFile, 245),
             (NativeService::NtFlushBuffersFile, 81),
             (
                 NativeService::NtCreateNamedPipeFile,

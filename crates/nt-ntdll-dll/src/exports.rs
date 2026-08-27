@@ -25164,6 +25164,11 @@ zw_alias!(
     nt_query_information_file
 );
 zw_alias!(
+    zw_query_quota_information_file,
+    "ZwQueryQuotaInformationFile",
+    nt_query_quota_information_file
+);
+zw_alias!(
     zw_query_information_job_object,
     "ZwQueryInformationJobObject",
     nt_query_information_job_object
@@ -25350,6 +25355,11 @@ zw_alias!(
     zw_set_information_file,
     "ZwSetInformationFile",
     nt_set_information_file
+);
+zw_alias!(
+    zw_set_quota_information_file,
+    "ZwSetQuotaInformationFile",
+    nt_set_quota_information_file
 );
 zw_alias!(
     zw_set_information_job_object,
@@ -30254,6 +30264,7 @@ pub unsafe extern "C" fn export_anchor() {
         zw_query_full_attributes_file as *const () as usize,
         zw_query_information_atom as *const () as usize,
         zw_query_information_file as *const () as usize,
+        zw_query_quota_information_file as *const () as usize,
         zw_query_information_job_object as *const () as usize,
         zw_query_information_process as *const () as usize,
         zw_query_information_thread as *const () as usize,
@@ -30305,6 +30316,7 @@ pub unsafe extern "C" fn export_anchor() {
         zw_set_event as *const () as usize,
         zw_set_information_debug_object as *const () as usize,
         zw_set_information_file as *const () as usize,
+        zw_set_quota_information_file as *const () as usize,
         zw_set_information_job_object as *const () as usize,
         zw_set_information_object as *const () as usize,
         zw_set_information_process as *const () as usize,

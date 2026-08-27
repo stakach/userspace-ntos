@@ -73,6 +73,8 @@ pub struct WdmIrpInit {
     pub user_buffer: u64,
     /// `IRP.Tail.Overlay.Thread`; NPFS uses this for client-security capture.
     pub thread: u64,
+    /// `IRP.Tail.Overlay.AuxiliaryBuffer`.
+    pub auxiliary_buffer: u64,
     pub stack_count: u8,
     pub current_location: u8,
     pub current_stack_location: u64,
@@ -104,6 +106,15 @@ pub enum WdmIoStackParameters {
         information_class: u32,
         target_file_object: u64,
         control: crate::SetInformationControl,
+    },
+    QueryQuota {
+        length: u32,
+        sid_list: u64,
+        sid_list_length: u32,
+        start_sid: u64,
+    },
+    SetQuota {
+        length: u32,
     },
     DeviceControl {
         output_buffer_length: u32,
@@ -250,6 +261,7 @@ pub fn write_wdm_irp(bytes: &mut [u8], init: WdmIrpInit) -> Result<(), WdmLayout
     put_u8(bytes, 0x43, init.current_location);
     put_u64(bytes, 0x70, init.user_buffer);
     put_u64(bytes, 0xa8, init.thread);
+    put_u64(bytes, 0xb0, init.auxiliary_buffer);
     put_u64(bytes, 0xb8, init.current_stack_location);
     Ok(())
 }
@@ -305,6 +317,20 @@ pub fn write_wdm_io_stack_location(
             put_u32(bytes, 0x10, information_class);
             put_u64(bytes, 0x18, target_file_object);
             put_u32(bytes, 0x20, control.wire_value());
+        }
+        WdmIoStackParameters::QueryQuota {
+            length,
+            sid_list,
+            sid_list_length,
+            start_sid,
+        } => {
+            put_u32(bytes, 0x08, length);
+            put_u64(bytes, 0x10, sid_list);
+            put_u32(bytes, 0x18, sid_list_length);
+            put_u64(bytes, 0x20, start_sid);
+        }
+        WdmIoStackParameters::SetQuota { length } => {
+            put_u32(bytes, 0x08, length);
         }
         WdmIoStackParameters::DeviceControl {
             output_buffer_length,

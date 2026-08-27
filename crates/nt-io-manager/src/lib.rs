@@ -45,6 +45,7 @@ mod pending_io;
 mod pending_set_file_name;
 mod pipe;
 mod projection;
+mod quota;
 mod read_write;
 mod retained_completion;
 mod store;
@@ -123,6 +124,10 @@ pub use pipe::{
     FILE_PIPE_SERVER_END, STATUS_INSTANCE_NOT_AVAILABLE, STATUS_INVALID_PIPE_STATE,
     STATUS_PIPE_BUSY, STATUS_PIPE_CONNECTED, STATUS_PIPE_DISCONNECTED, STATUS_PIPE_LISTENING,
     STATUS_PIPE_NOT_AVAILABLE,
+};
+pub use quota::{
+    set_quota_access_granted, sid_length, validate_get_quota_buffer, validate_set_quota_buffer,
+    QueryQuotaParameters, QuotaValidationError, SetQuotaParameters,
 };
 pub use retained_completion::{RetainedCompletion, RetainedCompletionError, RetainedIrpCompletion};
 pub use store::{GenStore, IoId};
@@ -5374,6 +5379,118 @@ mod tests {
     }
 
     #[test]
+    fn peer_quota_wire_preserves_auxiliary_extents_and_stack_flags() {
+        let control = MockPeerControl::new();
+        let mut om = io();
+        let client = om.register_client();
+        let (backend, _) = peer_backend(&mut om, &control);
+        let mut dispatch = MajorFunctionTable::new();
+        for major in [
+            major::IRP_MJ_CREATE,
+            major::IRP_MJ_CLEANUP,
+            major::IRP_MJ_CLOSE,
+            major::IRP_MJ_QUERY_QUOTA,
+            major::IRP_MJ_SET_QUOTA,
+        ] {
+            dispatch.set(major, DispatchTarget::DriverPeer(DriverPeerId(0)));
+        }
+        let driver = om
+            .create_driver_peer_with_major_table(
+                &path("\\Driver\\QuotaPeer"),
+                Box::new(backend),
+                dispatch,
+            )
+            .unwrap();
+        om.create_device(
+            driver,
+            Some(&path("\\Device\\QuotaPeer")),
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        )
+        .unwrap();
+        let handle = om
+            .open(
+                client,
+                &path("\\Device\\QuotaPeer"),
+                AccessMask::GENERIC_READ | AccessMask::GENERIC_WRITE,
+                ShareAccess::empty(),
+                CreateOptions::empty(),
+                0,
+            )
+            .unwrap();
+        let (file, device, _) = om
+            .reference_open_file_details(client, handle, AccessMask::GENERIC_READ)
+            .unwrap();
+        let parameters = QueryQuotaParameters {
+            length: 64,
+            sid_list_length: 20,
+            start_sid_length: 12,
+        };
+        let flags = StackFlags::RESTART_SCAN
+            | StackFlags::RETURN_SINGLE_ENTRY
+            | StackFlags::INDEX_SPECIFIED;
+        let mut query_buffer = [0u8; 96];
+        assert_eq!(
+            om.build_and_dispatch_external_to_device_with_stack_flags(
+                client,
+                device,
+                Some(file),
+                0,
+                19,
+                major::IRP_MJ_QUERY_QUOTA,
+                IoParameters::QueryQuota(parameters),
+                flags,
+                32,
+                64,
+                &mut query_buffer,
+            ),
+            Ok(ExternalDispatchResult::Completed {
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: None,
+            })
+        );
+        let request = control.last_request().unwrap();
+        assert_eq!(request.major, major::IRP_MJ_QUERY_QUOTA);
+        assert_eq!(request.flags as u8, 0x07);
+        assert_eq!(request.input_len, 32);
+        assert_eq!(request.output_len, 64);
+        assert_eq!(request.buffer_len, 96);
+        assert_eq!(request.quota_sid_list_length, 20);
+        assert_eq!(request.quota_start_sid_length, 12);
+
+        let mut set_buffer = [0u8; 48];
+        assert_eq!(
+            om.build_and_dispatch_external_to_device(
+                client,
+                device,
+                Some(file),
+                0,
+                20,
+                major::IRP_MJ_SET_QUOTA,
+                IoParameters::SetQuota(SetQuotaParameters { length: 48 }),
+                48,
+                0,
+                &mut set_buffer,
+            ),
+            Ok(ExternalDispatchResult::Completed {
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: None,
+            })
+        );
+        let request = control.last_request().unwrap();
+        assert_eq!(request.major, major::IRP_MJ_SET_QUOTA);
+        assert_eq!(request.flags, 0);
+        assert_eq!(request.input_len, 48);
+        assert_eq!(request.output_len, 0);
+        assert_eq!(request.quota_sid_list_length, 0);
+        assert_eq!(request.quota_start_sid_length, 0);
+    }
+
+    #[test]
     fn peer_direct_and_neither_ioctls_round_trip_split_buffers() {
         let ctrl = MockPeerControl::new();
         let (mut om, client, handle, _identity) =
@@ -5728,6 +5845,7 @@ mod tests {
                 system_buffer: 0x1111,
                 user_buffer: 0x2222,
                 thread: 0x4444,
+                auxiliary_buffer: 0x5555,
                 stack_count: 1,
                 current_location: 1,
                 current_stack_location: 0x3333,
@@ -5746,6 +5864,7 @@ mod tests {
         assert_eq!(irp[0x43], 1);
         assert_eq!(le_u64(&irp, 0x70), 0x2222);
         assert_eq!(le_u64(&irp, 0xa8), 0x4444);
+        assert_eq!(le_u64(&irp, 0xb0), 0x5555);
         assert_eq!(le_u64(&irp, 0xb8), 0x3333);
 
         assert_eq!(
@@ -5790,6 +5909,47 @@ mod tests {
         assert_eq!(le_u64(&stack, 0x20), 0x6666);
         assert_eq!(le_u64(&stack, 0x28), 0x4444);
         assert_eq!(le_u64(&stack, 0x30), 0x5555);
+
+        write_wdm_io_stack_location(
+            &mut stack,
+            WdmIoStackLocationInit {
+                major: major::IRP_MJ_QUERY_QUOTA,
+                minor: 0,
+                flags: 0x07,
+                control: 0,
+                device_object: 0x4444,
+                file_object: 0x5555,
+                parameters: WdmIoStackParameters::QueryQuota {
+                    length: 0x100,
+                    sid_list: 0x6666,
+                    sid_list_length: 0x20,
+                    start_sid: 0x7777,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(stack[0x00], major::IRP_MJ_QUERY_QUOTA);
+        assert_eq!(stack[0x02], 0x07);
+        assert_eq!(le_u32(&stack, 0x08), 0x100);
+        assert_eq!(le_u64(&stack, 0x10), 0x6666);
+        assert_eq!(le_u32(&stack, 0x18), 0x20);
+        assert_eq!(le_u64(&stack, 0x20), 0x7777);
+
+        write_wdm_io_stack_location(
+            &mut stack,
+            WdmIoStackLocationInit {
+                major: major::IRP_MJ_SET_QUOTA,
+                minor: 0,
+                flags: 0,
+                control: 0,
+                device_object: 0x4444,
+                file_object: 0x5555,
+                parameters: WdmIoStackParameters::SetQuota { length: 0x80 },
+            },
+        )
+        .unwrap();
+        assert_eq!(stack[0x00], major::IRP_MJ_SET_QUOTA);
+        assert_eq!(le_u32(&stack, 0x08), 0x80);
 
         write_wdm_io_stack_location(
             &mut stack,

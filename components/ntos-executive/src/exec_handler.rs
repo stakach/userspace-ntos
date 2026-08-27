@@ -19836,6 +19836,244 @@ impl ExecNtHandler {
         ))
     }
 
+    unsafe fn dispatch_hosted_file_query_quota_for(
+        &mut self,
+        route: HostedFileRoute,
+        parameters: nt_io_manager::QueryQuotaParameters,
+        stack_flags: nt_io_manager::StackFlags,
+        auxiliary: &[u8],
+        output: &mut [u8],
+    ) -> Result<(i32, u64, u64), u32> {
+        let (status, information, pending_irp_id, _) =
+            driver_launch::dispatch_hosted_file_query_quota_irp_result_exact(
+                route.file_id,
+                self.current_tid,
+                parameters,
+                stack_flags,
+                auxiliary,
+                output,
+            )?;
+        Ok((
+            status,
+            information,
+            pending_irp_id.map(|irp_id| irp_id.raw()).unwrap_or(0),
+        ))
+    }
+
+    unsafe fn dispatch_hosted_file_set_quota_for(
+        &mut self,
+        route: HostedFileRoute,
+        input: &[u8],
+    ) -> Result<(i32, u64, u64), u32> {
+        let (status, information, pending_irp_id, _) =
+            driver_launch::dispatch_hosted_file_set_quota_irp_result_exact(
+                route.file_id,
+                self.current_tid,
+                input,
+            )?;
+        Ok((
+            status,
+            information,
+            pending_irp_id.map(|irp_id| irp_id.raw()).unwrap_or(0),
+        ))
+    }
+
+    unsafe fn service_hosted_query_quota(
+        &mut self,
+        handle: u64,
+        iosb: u64,
+        output_va: u64,
+        route: HostedFileRoute,
+        parameters: nt_io_manager::QueryQuotaParameters,
+        stack_flags: nt_io_manager::StackFlags,
+        auxiliary: &[u8],
+        output: &mut [u8],
+    ) -> (u32, u64) {
+        let file_id = route.file_id;
+        let synchronous_file = match self.file_completion.is_synchronous(file_id) {
+            Ok(synchronous) => synchronous,
+            Err(status) => return (status, 0),
+        };
+        if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
+            || !wait_reply_pool_has_free()
+            || !self.reserve_pending_file_io_owner()
+        {
+            return (nt_io_completion::STATUS_INSUFFICIENT_RESOURCES, 0);
+        }
+        let Some(granted_access) = self.hosted_file_access_for(handle) else {
+            return (nt_fs::STATUS_INVALID_HANDLE, 0);
+        };
+        match self.prepare_hosted_file_io(route, handle, granted_access) {
+            Ok(true) => {}
+            Ok(false) => return (STATUS_PENDING, 0),
+            Err(status) => return (status, 0),
+        }
+        if self.file_completion.set_signaled(file_id, false).is_err() {
+            self.release_file_reference(file_id);
+            return (nt_fs::STATUS_INVALID_HANDLE, 0);
+        }
+
+        let output_capacity = output.len();
+        let (mut status, mut information, pending_irp_id) =
+            match self.dispatch_hosted_file_query_quota_for(
+                route,
+                parameters,
+                stack_flags,
+                auxiliary,
+                output,
+            ) {
+                Ok((driver_status, completed, irp_id)) => {
+                    (driver_status as u32, completed, irp_id)
+                }
+                Err(route_status) => (route_status, 0, 0),
+            };
+        if status == STATUS_PENDING {
+            if pending_irp_id == 0 {
+                status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
+                information = 0;
+                if synchronous_file {
+                    let _ = self.signal_file_completion(file_id, status);
+                }
+                self.release_file_reference(file_id);
+            } else {
+                self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
+                    file_id,
+                    irp_id: pending_irp_id,
+                    major: major::IRP_MJ_QUERY_QUOTA,
+                    control_code: 0,
+                    operation: nt_io_manager::PendingFileIoOperation::Transfer,
+                    delivery_state: 0,
+                    pi: self.pi as u32,
+                    tid: self.current_tid,
+                    sync_lock_owner_tid: 0,
+                    badge: self.current_badge,
+                    consumer_abandoned: false,
+                    user_apc_interrupt_requested: false,
+                    output_va,
+                    output_len: output_capacity as u32,
+                    output_offset: 0,
+                    iosb_va: iosb,
+                    apc_routine: 0,
+                    apc_context: 0,
+                    completion_port_suppressed: true,
+                    signal_file: synchronous_file,
+                    publish_iocp: false,
+                    event_obj_idx: u64::MAX,
+                    reply_cap: 0,
+                    reply_required: false,
+                    native_call_transport: false,
+                    reply_mrs: [0; 18],
+                    resume_ip: 0,
+                    resume_sp: 0,
+                    resume_flags: 0,
+                });
+                self.pending_file_io_wait = true;
+            }
+        } else {
+            let copy_len = information
+                .min(output_capacity as u64)
+                .min(output.len() as u64) as usize;
+            if copy_len != 0 && !self.xas_try_write_buf(output_va, &output[..copy_len]) {
+                status = STATUS_ACCESS_VIOLATION;
+                information = 0;
+            }
+            if synchronous_file {
+                let _ = self.signal_file_completion(file_id, status);
+            }
+            self.release_file_reference(file_id);
+        }
+        (status, information)
+    }
+
+    unsafe fn service_hosted_set_quota(
+        &mut self,
+        handle: u64,
+        iosb: u64,
+        route: HostedFileRoute,
+        input: &[u8],
+    ) -> (u32, u64) {
+        let file_id = route.file_id;
+        let synchronous_file = match self.file_completion.is_synchronous(file_id) {
+            Ok(synchronous) => synchronous,
+            Err(status) => return (status, 0),
+        };
+        if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
+            || !wait_reply_pool_has_free()
+            || !self.reserve_pending_file_io_owner()
+        {
+            return (nt_io_completion::STATUS_INSUFFICIENT_RESOURCES, 0);
+        }
+        let Some(granted_access) = self.hosted_file_access_for(handle) else {
+            return (nt_fs::STATUS_INVALID_HANDLE, 0);
+        };
+        match self.prepare_hosted_file_io(route, handle, granted_access) {
+            Ok(true) => {}
+            Ok(false) => return (STATUS_PENDING, 0),
+            Err(status) => return (status, 0),
+        }
+        if self.file_completion.set_signaled(file_id, false).is_err() {
+            self.release_file_reference(file_id);
+            return (nt_fs::STATUS_INVALID_HANDLE, 0);
+        }
+
+        let (mut status, mut information, pending_irp_id) =
+            match self.dispatch_hosted_file_set_quota_for(route, input) {
+                Ok((driver_status, completed, irp_id)) => {
+                    (driver_status as u32, completed, irp_id)
+                }
+                Err(route_status) => (route_status, 0, 0),
+            };
+        if status == STATUS_PENDING {
+            if pending_irp_id == 0 {
+                status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
+                information = 0;
+                if synchronous_file {
+                    let _ = self.signal_file_completion(file_id, status);
+                }
+                self.release_file_reference(file_id);
+            } else {
+                self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
+                    file_id,
+                    irp_id: pending_irp_id,
+                    major: major::IRP_MJ_SET_QUOTA,
+                    control_code: 0,
+                    operation: nt_io_manager::PendingFileIoOperation::Transfer,
+                    delivery_state: 0,
+                    pi: self.pi as u32,
+                    tid: self.current_tid,
+                    sync_lock_owner_tid: 0,
+                    badge: self.current_badge,
+                    consumer_abandoned: false,
+                    user_apc_interrupt_requested: false,
+                    output_va: 0,
+                    output_len: 0,
+                    output_offset: 0,
+                    iosb_va: iosb,
+                    apc_routine: 0,
+                    apc_context: 0,
+                    completion_port_suppressed: true,
+                    signal_file: synchronous_file,
+                    publish_iocp: false,
+                    event_obj_idx: u64::MAX,
+                    reply_cap: 0,
+                    reply_required: false,
+                    native_call_transport: false,
+                    reply_mrs: [0; 18],
+                    resume_ip: 0,
+                    resume_sp: 0,
+                    resume_flags: 0,
+                });
+                self.pending_file_io_wait = true;
+            }
+        } else {
+            if synchronous_file {
+                let _ = self.signal_file_completion(file_id, status);
+            }
+            self.release_file_reference(file_id);
+        }
+        (status, information)
+    }
+
     unsafe fn service_hosted_set_information(
         &mut self,
         handle: u64,
@@ -30125,6 +30363,206 @@ impl ExecNtHandler {
                     return nt_syscall::STATUS_ACCESS_VIOLATION;
                 }
                 nt_fs::STATUS_SUCCESS
+            },
+            // NtQueryQuotaInformationFile(FileHandle, IoStatusBlock, Buffer, Length,
+            // ReturnSingleEntry, SidList, SidListLength, StartSid, RestartScan).
+            NativeService::NtQueryQuotaInformationFile => unsafe {
+                const SID_HEADER_LENGTH: usize = 8;
+                const SID_MAX_SUB_AUTHORITIES: usize = 15;
+
+                let iosb = args[1];
+                let output = args[2];
+                let length = nt_ulong_arg(args[3]) as usize;
+                if iosb == 0 || iosb & 7 != 0 {
+                    return if iosb == 0 {
+                        STATUS_ACCESS_VIOLATION
+                    } else {
+                        STATUS_DATATYPE_MISALIGNMENT
+                    };
+                }
+                if length != 0 && (output == 0 || output & 7 != 0) {
+                    return if output == 0 {
+                        STATUS_ACCESS_VIOLATION
+                    } else {
+                        STATUS_DATATYPE_MISALIGNMENT
+                    };
+                }
+                if !self.probe_user_output(iosb, 16)
+                    || !self.probe_user_output(output, length)
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+
+                let requested_sid_list_length = nt_ulong_arg(args[6]) as usize;
+                let sid_list_length = if args[5] != 0 && requested_sid_list_length != 0 {
+                    if args[5] & 3 != 0 {
+                        return STATUS_DATATYPE_MISALIGNMENT;
+                    }
+                    requested_sid_list_length
+                } else {
+                    0
+                };
+
+                let mut start_sid_length = 0usize;
+                if args[7] != 0 {
+                    if args[7] & 3 != 0 {
+                        return STATUS_DATATYPE_MISALIGNMENT;
+                    }
+                    let mut header = [0u8; SID_HEADER_LENGTH];
+                    if !self.xas_read(args[7], &mut header) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    let sub_authorities = header[1] as usize;
+                    if sub_authorities > SID_MAX_SUB_AUTHORITIES {
+                        return nt_status::NtStatus::INVALID_SID.raw() as u32;
+                    }
+                    start_sid_length = SID_HEADER_LENGTH + sub_authorities * 4;
+                }
+
+                let start_sid_offset = match sid_list_length.checked_add(3) {
+                    Some(length) => length & !3,
+                    None => return STATUS_INSUFFICIENT_RESOURCES,
+                };
+                let auxiliary_length = match start_sid_offset.checked_add(start_sid_length) {
+                    Some(length) => length,
+                    None => return STATUS_INSUFFICIENT_RESOURCES,
+                };
+                let mut auxiliary = match try_zeroed_transfer_buffer(auxiliary_length) {
+                    Ok(bytes) => bytes,
+                    Err(status) => return status,
+                };
+                if sid_list_length != 0 {
+                    if !self.xas_read(args[5], &mut auxiliary[..sid_list_length]) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    if let Err(error) = nt_io_manager::validate_get_quota_buffer(
+                        &auxiliary[..sid_list_length],
+                    ) {
+                        self.xas_write_buf(iosb + 8, &(error.offset as u64).to_le_bytes());
+                        return nt_status::NtStatus::QUOTA_LIST_INCONSISTENT.raw() as u32;
+                    }
+                }
+                if start_sid_length != 0 {
+                    let start_sid = &mut auxiliary
+                        [start_sid_offset..start_sid_offset + start_sid_length];
+                    if !self.xas_read(args[7], start_sid) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    if nt_io_manager::sid_length(start_sid) != Ok(start_sid_length) {
+                        return nt_status::NtStatus::INVALID_SID.raw() as u32;
+                    }
+                }
+
+                if let Err(status) = self.io_manager_file_query_metadata(args[0]) {
+                    return status;
+                }
+                let Some(route) = self.hosted_file_route_for(args[0]) else {
+                    let status = STATUS_INVALID_DEVICE_REQUEST;
+                    let _ = self.write_current_iosb(iosb, status, 0);
+                    return status;
+                };
+
+                let mut routed_output = match try_zeroed_transfer_buffer(length) {
+                    Ok(bytes) => bytes,
+                    Err(status) => return status,
+                };
+                let parameters = nt_io_manager::QueryQuotaParameters {
+                    length: length as u32,
+                    sid_list_length: sid_list_length as u32,
+                    start_sid_length: start_sid_length as u32,
+                };
+                let mut stack_flags = nt_io_manager::StackFlags::empty();
+                if args[8] as u8 != 0 {
+                    stack_flags |= nt_io_manager::StackFlags::RESTART_SCAN;
+                }
+                if args[4] as u8 != 0 {
+                    stack_flags |= nt_io_manager::StackFlags::RETURN_SINGLE_ENTRY;
+                }
+                if start_sid_length != 0 {
+                    stack_flags |= nt_io_manager::StackFlags::INDEX_SPECIFIED;
+                }
+                let (status, information) = self.service_hosted_query_quota(
+                    args[0],
+                    iosb,
+                    output,
+                    route,
+                    parameters,
+                    stack_flags,
+                    &auxiliary,
+                    &mut routed_output,
+                );
+                if status != STATUS_PENDING
+                    && !self.write_current_iosb(iosb, status, information)
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                status
+            },
+            // NtSetQuotaInformationFile(FileHandle, IoStatusBlock, Buffer, Length).
+            NativeService::NtSetQuotaInformationFile => unsafe {
+                let iosb = args[1];
+                let input = args[2];
+                let length = nt_ulong_arg(args[3]) as usize;
+                if iosb == 0 || iosb & 7 != 0 {
+                    return if iosb == 0 {
+                        STATUS_ACCESS_VIOLATION
+                    } else {
+                        STATUS_DATATYPE_MISALIGNMENT
+                    };
+                }
+                if length != 0 && (input == 0 || input & 3 != 0) {
+                    return if input == 0 {
+                        STATUS_ACCESS_VIOLATION
+                    } else {
+                        STATUS_DATATYPE_MISALIGNMENT
+                    };
+                }
+                if !self.probe_user_output(iosb, 16) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let mut captured = match try_zeroed_transfer_buffer(length) {
+                    Ok(bytes) => bytes,
+                    Err(status) => {
+                        let _ = self.write_current_iosb(iosb, status, 0);
+                        return status;
+                    }
+                };
+                if length != 0 && !self.xas_read(input, &mut captured) {
+                    let _ = self.write_current_iosb(iosb, STATUS_ACCESS_VIOLATION, 0);
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if let Err(error) = nt_io_manager::validate_set_quota_buffer(&captured) {
+                    let status = nt_status::NtStatus::QUOTA_LIST_INCONSISTENT.raw() as u32;
+                    let _ = self.write_current_iosb(iosb, status, error.offset as u64);
+                    return status;
+                }
+
+                let io_metadata = match self.io_manager_file_query_metadata(args[0]) {
+                    Ok(metadata) => metadata,
+                    Err(status) => {
+                        let _ = self.write_current_iosb(iosb, status, 0);
+                        return status;
+                    }
+                };
+                if !nt_io_manager::set_quota_access_granted(
+                    nt_types::AccessMask::from_bits_retain(io_metadata.access_flags),
+                ) {
+                    let _ = self.write_current_iosb(iosb, STATUS_ACCESS_DENIED, 0);
+                    return STATUS_ACCESS_DENIED;
+                }
+                let Some(route) = self.hosted_file_route_for(args[0]) else {
+                    let status = STATUS_INVALID_DEVICE_REQUEST;
+                    let _ = self.write_current_iosb(iosb, status, 0);
+                    return status;
+                };
+                let (status, information) =
+                    self.service_hosted_set_quota(args[0], iosb, route, &captured);
+                if status != STATUS_PENDING
+                    && !self.write_current_iosb(iosb, status, information)
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                status
             },
             // NtAllocateVirtualMemory(ProcessHandle, *BaseAddress[RDX]=args[1], ZeroBits,
             // *RegionSize[R9]=args[3], Type[arg5]=args[4], Protect). The fixed VAD policy selects

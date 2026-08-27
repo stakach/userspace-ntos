@@ -24,7 +24,7 @@ pub use wire::{
 };
 
 /// ABI version of this wire contract; bumped on any incompatible change.
-pub const IO_ABI_VERSION: u32 = 8;
+pub const IO_ABI_VERSION: u32 = 9;
 
 /// Validate the raw `IO_STACK_LOCATION.Parameters.SetFile` control union.
 /// `information_class` is the class carried in `IrpDispatchRequest::ioctl_code`.
@@ -40,6 +40,28 @@ pub const fn valid_set_information_control(
         10 | 11 => value <= 1,
         31 => true,
         _ => value == 0,
+    }
+}
+
+/// Validate quota-specific IRP stack parameters against the major function and
+/// the canonical combined auxiliary-buffer extent.
+pub const fn valid_quota_parameters(
+    major_function: u8,
+    sid_list_length: u32,
+    start_sid_length: u32,
+    input_length: u32,
+) -> bool {
+    if major_function == major::IRP_MJ_QUERY_QUOTA {
+        let start_offset = match sid_list_length.checked_add(3) {
+            Some(length) => length & !3,
+            None => return false,
+        };
+        match start_offset.checked_add(start_sid_length) {
+            Some(length) => length == input_length,
+            None => false,
+        }
+    } else {
+        sid_list_length == 0 && start_sid_length == 0
     }
 }
 
@@ -240,6 +262,8 @@ mod tests {
             related_file_id: 0x500,
             target_file_id: 0x600,
             set_information_control: 0x1234,
+            quota_sid_list_length: 24,
+            quota_start_sid_length: 12,
             stack_location: 1,
             stack_count: 3,
             ..Default::default()
@@ -247,5 +271,29 @@ mod tests {
         let bytes = bytemuck::bytes_of(&irp);
         let back: IrpDispatchRequest = bytemuck::pod_read_unaligned(bytes);
         assert_eq!(irp, back);
+    }
+
+    #[test]
+    fn quota_parameters_are_major_specific_and_overflow_checked() {
+        assert!(valid_quota_parameters(
+            major::IRP_MJ_QUERY_QUOTA,
+            21,
+            12,
+            36
+        ));
+        assert!(!valid_quota_parameters(
+            major::IRP_MJ_QUERY_QUOTA,
+            21,
+            12,
+            33
+        ));
+        assert!(!valid_quota_parameters(
+            major::IRP_MJ_QUERY_QUOTA,
+            u32::MAX,
+            1,
+            0
+        ));
+        assert!(valid_quota_parameters(major::IRP_MJ_SET_QUOTA, 0, 0, 56));
+        assert!(!valid_quota_parameters(major::IRP_MJ_SET_QUOTA, 8, 0, 56));
     }
 }

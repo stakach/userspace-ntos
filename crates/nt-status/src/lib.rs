@@ -89,6 +89,10 @@ statuses! {
     INVALID_HANDLE = 0xC000_0008u32;
     /// A parameter was invalid.
     INVALID_PARAMETER = 0xC000_000Du32;
+    /// A captured SID is structurally invalid.
+    INVALID_SID = 0xC000_0078u32;
+    /// A variable-length quota entry chain is malformed.
+    QUOTA_LIST_INCONSISTENT = 0xC000_0266u32;
     /// The requested address range conflicts with an existing resource assignment.
     CONFLICTING_ADDRESSES = 0xC000_0018u32;
     /// Access was denied.

@@ -125,6 +125,10 @@ pub struct IrpDispatchRequest {
     pub create_options: u32,
     pub create_file_attributes: u32,
     pub create_ea_length: u32,
+    /// Bytes occupied by the captured `FILE_GET_QUOTA_INFORMATION` chain.
+    pub quota_sid_list_length: u32,
+    /// Bytes occupied by the separately captured optional start SID.
+    pub quota_start_sid_length: u32,
     pub parameter_offset: u32,
     pub parameter_len: u32,
     pub stack_location: u32,
@@ -164,7 +168,7 @@ const _: () = {
     assert!(size_of::<IoDeviceControlRequest>() == 56);
     assert!(size_of::<IoFileRequest>() == 16);
     assert!(size_of::<IoCancelRequest>() == 16);
-    assert!(size_of::<IrpDispatchRequest>() == 192);
+    assert!(size_of::<IrpDispatchRequest>() == 200);
     assert!(size_of::<IoReply>() == 32);
     assert!(align_of::<IoReadWriteRequest>() == 8);
     assert!(align_of::<IrpDispatchRequest>() == 8);

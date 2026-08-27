@@ -7,6 +7,7 @@ use nt_status::NtStatus;
 use nt_types::{AccessMask, ClientId};
 
 use crate::file::{CreateOptions, ShareAccess};
+use crate::quota::{QueryQuotaParameters, SetQuotaParameters};
 
 /// How a driver peer may touch a registered buffer.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
@@ -200,6 +201,8 @@ pub enum IoParameters {
     FlushBuffers,
     QueryInformation(InformationParameters),
     SetInformation(SetInformationParameters),
+    QueryQuota(QueryQuotaParameters),
+    SetQuota(SetQuotaParameters),
     Pnp(PnpParameters),
     Power,
     #[default]
@@ -219,6 +222,11 @@ impl IoParameters {
             }
             IoParameters::QueryInformation(p) => (0, p.length.min(cap)),
             IoParameters::SetInformation(p) => (p.length.min(cap), 0),
+            IoParameters::QueryQuota(p) => (
+                p.input_length().unwrap_or(u32::MAX).min(cap),
+                p.length.min(cap),
+            ),
+            IoParameters::SetQuota(p) => (p.length.min(cap), 0),
             IoParameters::Pnp(p) => (p.input_len().min(cap), 0),
             _ => (0, 0),
         }
@@ -235,6 +243,11 @@ bitflags::bitflags! {
         const OPEN_TARGET_DIRECTORY = 0x04;
         const STOP_ON_SYMLINK = 0x08;
         const CASE_SENSITIVE = 0x80;
+        // Query-directory/query-EA/query-quota interpretations of the same
+        // per-major IO_STACK_LOCATION flag byte.
+        const RESTART_SCAN = 0x01;
+        const RETURN_SINGLE_ENTRY = 0x02;
+        const INDEX_SPECIFIED = 0x04;
     }
 }
 
