@@ -2525,6 +2525,16 @@ pub fn parse_set_file_name_information(data: &[u8]) -> Result<SetFileNameInforma
     })
 }
 
+/// Parse the provider-owned attribute field from a complete x64 `FILE_BASIC_INFORMATION` result.
+/// The four timestamps remain opaque to the I/O Manager; only the filesystem-owned attributes
+/// determine rename/link target-directory access.
+pub fn parse_file_basic_information_attributes(data: &[u8]) -> Result<u32, u32> {
+    if data.len() < 40 {
+        return Err(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    Ok(u32::from_le_bytes(data[32..36].try_into().unwrap()))
+}
+
 /// The I/O-Manager-facing file system: the volume + mount manager + file-object/handle table,
 /// exposing the Zw* native file APIs (spec §8-§9).
 pub struct FileSystem {

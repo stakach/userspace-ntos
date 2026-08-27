@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PendingSetFileNamePhase {
+    SourceQuery,
     TargetCreate,
     SourceSet,
     TerminalInline,
@@ -27,6 +28,21 @@ pub struct PendingSetFileName {
 }
 
 impl PendingSetFileName {
+    fn validate(
+        source_file_id: u64,
+        target_file_id: u64,
+        information_class: u32,
+        target_name: &[u8],
+        set_information: &[u8],
+    ) -> bool {
+        source_file_id != 0
+            && (target_file_id == 0 || source_file_id != target_file_id)
+            && matches!(information_class, 10 | 11)
+            && !target_name.is_empty()
+            && target_name.len() & 1 == 0
+            && !set_information.is_empty()
+    }
+
     pub fn new(
         source_file_id: u64,
         target_file_id: u64,
@@ -35,19 +51,47 @@ impl PendingSetFileName {
         target_name: Vec<u8>,
         set_information: Vec<u8>,
     ) -> Option<Self> {
-        (source_file_id != 0
-            && target_file_id != 0
-            && source_file_id != target_file_id
-            && matches!(information_class, 10 | 11)
-            && !target_name.is_empty()
-            && target_name.len() & 1 == 0
-            && !set_information.is_empty())
+        (target_file_id != 0
+            && Self::validate(
+                source_file_id,
+                target_file_id,
+                information_class,
+                &target_name,
+                &set_information,
+            ))
         .then_some(Self {
             source_file_id,
             target_file_id,
             information_class,
             replace_if_exists,
             phase: PendingSetFileNamePhase::TargetCreate,
+            terminal_status: nt_status::NtStatus::PENDING.raw() as u32,
+            terminal_information: 0,
+            target_name,
+            set_information,
+        })
+    }
+
+    pub fn awaiting_source_query(
+        source_file_id: u64,
+        information_class: u32,
+        replace_if_exists: bool,
+        target_name: Vec<u8>,
+        set_information: Vec<u8>,
+    ) -> Option<Self> {
+        Self::validate(
+            source_file_id,
+            0,
+            information_class,
+            &target_name,
+            &set_information,
+        )
+        .then_some(Self {
+            source_file_id,
+            target_file_id: 0,
+            information_class,
+            replace_if_exists,
+            phase: PendingSetFileNamePhase::SourceQuery,
             terminal_status: nt_status::NtStatus::PENDING.raw() as u32,
             terminal_information: 0,
             target_name,
@@ -80,9 +124,23 @@ impl PendingSetFileName {
         true
     }
 
+    pub fn advance_to_target_create(&mut self, target_file_id: u64) -> bool {
+        if self.phase != PendingSetFileNamePhase::SourceQuery
+            || target_file_id == 0
+            || target_file_id == self.source_file_id
+        {
+            return false;
+        }
+        self.target_file_id = target_file_id;
+        self.phase = PendingSetFileNamePhase::TargetCreate;
+        true
+    }
+
     pub fn complete_inline(&mut self, status: u32, information: u64) -> bool {
-        if self.phase != PendingSetFileNamePhase::TargetCreate
-            || status == nt_status::NtStatus::PENDING.raw() as u32
+        if !matches!(
+            self.phase,
+            PendingSetFileNamePhase::SourceQuery | PendingSetFileNamePhase::TargetCreate
+        ) || status == nt_status::NtStatus::PENDING.raw() as u32
         {
             return false;
         }
@@ -360,5 +418,15 @@ mod tests {
         let mut pending = record(3, 4);
         assert!(pending.advance_to_source_set());
         assert!(!pending.complete_inline(0, 0));
+
+        let mut query =
+            PendingSetFileName::awaiting_source_query(5, 11, false, vec![b'y', 0], vec![0; 24])
+                .unwrap();
+        assert_eq!(query.phase(), PendingSetFileNamePhase::SourceQuery);
+        assert_eq!(query.target_file_id, 0);
+        assert!(!query.advance_to_target_create(5));
+        assert!(query.advance_to_target_create(6));
+        assert_eq!(query.phase(), PendingSetFileNamePhase::TargetCreate);
+        assert_eq!(query.target_file_id, 6);
     }
 }

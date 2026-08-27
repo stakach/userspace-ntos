@@ -25,9 +25,10 @@ pub use directory::*;
 pub use fat_directory::*;
 pub use file_backing::FileBacking;
 pub use fs::{
-    parse_set_file_name_information, CreateResult, FileRenameRoot, FileSystem, MemFs,
-    MemFsBlobCompactError, MemFsBlobCompaction, MemFsSnapshotError, MemFsSnapshotInfo,
-    SetFileNameInformation, StandardInformation, INVALID_HANDLE,
+    parse_file_basic_information_attributes, parse_set_file_name_information, CreateResult,
+    FileRenameRoot, FileSystem, MemFs, MemFsBlobCompactError, MemFsBlobCompaction,
+    MemFsSnapshotError, MemFsSnapshotInfo, SetFileNameInformation, StandardInformation,
+    INVALID_HANDLE,
 };
 pub use hive_provider::NtFileHiveIoProvider;
 pub use path::{

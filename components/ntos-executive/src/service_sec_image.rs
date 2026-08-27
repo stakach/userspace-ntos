@@ -23638,6 +23638,234 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             .or_else(|| completed.map(|completion| completion.information))
             .expect("pending File owner has no terminal information");
         let mut backend_ack_required = completed.is_some();
+        if pending.major == nt_io_abi::major::IRP_MJ_QUERY_INFORMATION {
+            if let Some(transaction_id) = set_file_name_id {
+                let phase = (&*core::ptr::addr_of!(PENDING_SET_FILE_NAMES))
+                    .get(transaction_id)
+                    .expect("set-file-name source query lost its transaction")
+                    .phase();
+                assert_eq!(
+                    phase,
+                    nt_io_manager::PendingSetFileNamePhase::SourceQuery
+                );
+                if (terminal_status as i32) >= 0 {
+                    const FILE_BASIC_INFORMATION_LEN: usize = 40;
+                    let mut basic = [0u8; FILE_BASIC_INFORMATION_LEN];
+                    if terminal_information < FILE_BASIC_INFORMATION_LEN as u64 {
+                        terminal_status = nt_fs::STATUS_INFO_LENGTH_MISMATCH;
+                        terminal_information = 0;
+                    } else {
+                        match driver_launch::copy_completed_irp_output_exact(
+                            pending.irp_id,
+                            0,
+                            &mut basic,
+                        ) {
+                            Ok(FILE_BASIC_INFORMATION_LEN) => {}
+                            Ok(_) => {
+                                terminal_status = nt_fs::STATUS_INFO_LENGTH_MISMATCH;
+                                terminal_information = 0;
+                            }
+                            Err(_) => {
+                                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                                restore_file_io_mirrors!();
+                                continue;
+                            }
+                        }
+                        let source_is_directory =
+                            match nt_fs::parse_file_basic_information_attributes(&basic) {
+                                Ok(attributes) => {
+                                    attributes & nt_fs::FILE_ATTRIBUTE_DIRECTORY != 0
+                                }
+                                Err(status) => {
+                                    terminal_status = status;
+                                    terminal_information = 0;
+                                    false
+                                }
+                            };
+                        if (terminal_status as i32) >= 0 {
+                            if driver_launch::acknowledge_completed_irp(pending.irp_id).is_err() {
+                                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                                restore_file_io_mirrors!();
+                                continue;
+                            }
+                            backend_ack_required = false;
+                            completed = None;
+                            let mut transaction =
+                                (&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))
+                                    .take_for_update(transaction_id)
+                                    .expect("set-file-name query lost its captured buffers");
+                            let mut target_name = [0u16; crate::exec_handler::FILE_OBJECT_NAME_CAP];
+                            let decoded_name_len = transaction.target_name().len() / 2;
+                            let decoded_name = if decoded_name_len == 0
+                                || decoded_name_len > target_name.len()
+                                || transaction.target_name().len() & 1 != 0
+                            {
+                                None
+                            } else {
+                                for (word, bytes) in target_name[..decoded_name_len]
+                                    .iter_mut()
+                                    .zip(transaction.target_name().chunks_exact(2))
+                                {
+                                    *word = u16::from_le_bytes([bytes[0], bytes[1]]);
+                                }
+                                Some(&target_name[..decoded_name_len])
+                            };
+                            let target = decoded_name
+                                .ok_or(nt_fs::STATUS_OBJECT_NAME_INVALID)
+                                .and_then(|target_name| {
+                                    driver_launch::allocate_hosted_set_file_name_target(
+                                        transaction.source_file_id,
+                                        source_is_directory,
+                                        target_name,
+                                    )
+                                });
+                            match target {
+                                Err(status) => {
+                                    assert!(transaction.complete_inline(status, 0));
+                                    terminal_status = status;
+                                    terminal_information = 0;
+                                }
+                                Ok((target_file_id, target_access)) => {
+                                    assert!(transaction
+                                        .advance_to_target_create(target_file_id));
+                                    let create = driver_launch::dispatch_hosted_target_directory_create_irp_result_exact(
+                                        target_file_id,
+                                        pending.tid,
+                                        nt_io_manager::CreateParameters {
+                                            desired_access: nt_types::AccessMask::from_bits_retain(
+                                                target_access,
+                                            ),
+                                            share_access: nt_io_manager::ShareAccess::READ
+                                                | nt_io_manager::ShareAccess::WRITE,
+                                            create_options: nt_io_manager::CreateOptions::OPEN_FOR_BACKUP_INTENT,
+                                            create_disposition: nt_fs::FILE_OPEN,
+                                            file_attributes: 0,
+                                            ea_length: 0,
+                                            related_file: None,
+                                        },
+                                        transaction.target_name(),
+                                    );
+                                    let (create_status, create_information, create_irp) =
+                                        match create {
+                                            Ok((status, information, irp_id, _)) => {
+                                                (status as u32, information, irp_id)
+                                            }
+                                            Err(status) => (status, 0, None),
+                                        };
+                                    if create_status == nt_status::NtStatus::PENDING.raw() as u32 {
+                                        if let Some(create_irp) = create_irp {
+                                            assert!(
+                                                (&mut *core::ptr::addr_of_mut!(
+                                                    PENDING_SET_FILE_NAMES
+                                                ))
+                                                .restore_update(transaction_id, transaction)
+                                            );
+                                            (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                                                .retarget_set_file_name_query_exact(
+                                                    slot,
+                                                    pending.irp_id,
+                                                    create_irp.raw(),
+                                                    nt_io_abi::major::IRP_MJ_CREATE,
+                                                    target_file_id,
+                                                )
+                                                .expect("set-file-name query owner rejected target CREATE");
+                                            FILE_IO_DELIVERY_RETRY_PENDING
+                                                .store(true, Ordering::Release);
+                                            restore_file_io_mirrors!();
+                                            continue;
+                                        }
+                                        terminal_status = nt_fs::STATUS_INSUFFICIENT_RESOURCES;
+                                        terminal_information = 0;
+                                    } else if (create_status as i32) < 0 {
+                                        terminal_status = create_status;
+                                        terminal_information = create_information;
+                                    } else if transaction.information_class
+                                        == nt_fs::FILE_LINK_INFORMATION
+                                        && !transaction.replace_if_exists
+                                        && create_information == nt_fs::FILE_EXISTS as u64
+                                    {
+                                        terminal_status = nt_fs::STATUS_OBJECT_NAME_COLLISION;
+                                        terminal_information = 0;
+                                    } else {
+                                        let length = u32::try_from(
+                                            transaction.set_information().len(),
+                                        );
+                                        let dispatch = match length {
+                                            Ok(length) => driver_launch::dispatch_hosted_file_set_information_irp_result_exact(
+                                                transaction.source_file_id,
+                                                pending.tid,
+                                                nt_io_manager::SetInformationParameters {
+                                                    info_class: transaction.information_class,
+                                                    length,
+                                                    target_file: Some(nt_io_manager::FileId(
+                                                        target_file_id,
+                                                    )),
+                                                    replace_if_exists: transaction
+                                                        .replace_if_exists,
+                                                },
+                                                transaction.set_information(),
+                                            ),
+                                            Err(_) => Err(nt_fs::STATUS_INVALID_PARAMETER),
+                                        };
+                                        match dispatch {
+                                            Ok((status, _, Some(irp_id), _))
+                                                if status
+                                                    == nt_status::NtStatus::PENDING.raw() =>
+                                            {
+                                                assert!(transaction.advance_to_source_set());
+                                                assert!(
+                                                    (&mut *core::ptr::addr_of_mut!(
+                                                        PENDING_SET_FILE_NAMES
+                                                    ))
+                                                    .restore_update(transaction_id, transaction)
+                                                );
+                                                (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                                                    .retarget_set_file_name_query_exact(
+                                                        slot,
+                                                        pending.irp_id,
+                                                        irp_id.raw(),
+                                                        nt_io_abi::major::IRP_MJ_SET_INFORMATION,
+                                                        target_file_id,
+                                                    )
+                                                    .expect("set-file-name query owner rejected source SET");
+                                                FILE_IO_DELIVERY_RETRY_PENDING
+                                                    .store(true, Ordering::Release);
+                                                restore_file_io_mirrors!();
+                                                continue;
+                                            }
+                                            Ok((status, _, None, _))
+                                                if status
+                                                    == nt_status::NtStatus::PENDING.raw() =>
+                                            {
+                                                terminal_status =
+                                                    nt_fs::STATUS_INSUFFICIENT_RESOURCES;
+                                                terminal_information = 0;
+                                            }
+                                            Ok((status, information, _, _)) => {
+                                                terminal_status = status as u32;
+                                                terminal_information = information;
+                                            }
+                                            Err(status) => {
+                                                terminal_status = status;
+                                                terminal_information = 0;
+                                            }
+                                        }
+                                    }
+                                    assert!(transaction.complete_inline(
+                                        terminal_status,
+                                        terminal_information,
+                                    ));
+                                }
+                            }
+                            assert!(
+                                (&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))
+                                    .restore_update(transaction_id, transaction)
+                            );
+                        }
+                    }
+                }
+            }
+        }
         if pending.major == nt_io_abi::major::IRP_MJ_CREATE {
             if let Some(transaction_id) = set_file_name_id {
                 let phase = (&*core::ptr::addr_of!(PENDING_SET_FILE_NAMES))
@@ -24111,9 +24339,11 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                     (&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))
                         .finish_update(transaction_id)
                 );
-                let _ = driver_launch::abandon_unpublished_hosted_file(
-                    transaction.target_file_id,
-                );
+                if transaction.target_file_id != 0 {
+                    let _ = driver_launch::abandon_unpublished_hosted_file(
+                        transaction.target_file_id,
+                    );
+                }
                 nt_handler.release_file_reference(finished.file_id);
             }
         }

@@ -14038,11 +14038,34 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     6,182,408 B reusable.
 
     Review adjustment: direct device-qualified and normalized Object Manager Directory provider
-    targets are closed without a synthetic result or local-path fallback. A source directory opened
-    without explicit `FILE_DIRECTORY_FILE` still needs an internal provider
-    `FileBasicInformation` query before choosing `FILE_ADD_SUBDIRECTORY`; model that as a preceding
-    resumable phase rather than guessing. Absolute aliases such as DOS-device/mount paths must be
-    reparsed by the Object Manager to the canonical device before the same-device prefix check.
-    Local `FileLinkInformation` still requires MemFs multiple-entry/link-count ownership. After
-    those identity items, resume the remaining file query/set capture inventory and the separate
-    root service-loop mark/reset lifetime-classification item.
+    targets are closed without a synthetic result or local-path fallback.
+
+    Provider source-kind pre-query (2026-08-27, implemented): rename/link no longer treats the
+    absence of `FILE_DIRECTORY_FILE` as proof that the source is an ordinary File. Explicit
+    `FILE_DIRECTORY_FILE` and `FILE_NON_DIRECTORY_FILE` opens carry authoritative kind; an
+    ambiguous source now dispatches a real provider `IRP_MJ_QUERY_INFORMATION` for the complete
+    40-byte `FileBasicInformation` record while retaining the source synchronous Busy owner. The
+    provider's filesystem-owned `FILE_ATTRIBUTE_DIRECTORY` bit selects `FILE_ADD_SUBDIRECTORY` or
+    `FILE_WRITE_DATA` before the target File exists.
+
+    `PendingSetFileNameTable` now models `SourceQuery -> TargetCreate -> SourceSet`. A pending query
+    retains its provider output and the original syscall owner; redrive copies and validates that
+    exact output before acknowledging the query, allocates the kernel-only target, and retargets the
+    same generation-protected completion owner to a pending CREATE or SET. Query failure, short or
+    malformed output, target-allocation failure, thread abandonment, and synchronous downstream
+    completion all converge on the existing terminal cleanup path without a guessed source kind or
+    process-visible target handle. The fixed-record parser lives in `nt-fs` and is host-tested.
+
+    Focused validation passes `nt-fs` `71/71` and `nt-io-manager` `211/211`; the freestanding
+    executive check remains green at the established 212-warning baseline. Serialized acceptance
+    `.tmp/run-headless-provider-source-kind-query-20260827.log` selected, added, and started all
+    five configured PnP devices (including both observed pending starts), launched genuine userinit
+    and Explorer, painted 480,000/480,000 framebuffer pixels with at least 32 colors, passed all
+    `295/295` gates, and matched the sentinel. Scratch returned to zero after its unchanged 278,112
+    B peak; final allocated durable state was 14,803,256 B with 6,168,136 B reusable.
+
+    Review adjustment: absolute aliases such as DOS-device/mount paths must be reparsed by the
+    Object Manager to the canonical device before the same-device prefix check. Local
+    `FileLinkInformation` still requires MemFs multiple-entry/link-count ownership. After those
+    identity items, resume the remaining file query/set capture inventory and the separate root
+    service-loop mark/reset lifetime-classification item.

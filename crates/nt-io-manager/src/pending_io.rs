@@ -47,7 +47,8 @@ pub struct PendingFileCreate {
 
 /// Correlation for the internal target-parent CREATE that precedes a provider-backed rename/link
 /// SET_INFORMATION. The outer File remains the source and owns Busy/completion publication; the
-/// target File is never process-handle visible.
+/// target File is never process-handle visible. `target_file_id` remains zero only while an
+/// ambiguous source kind is awaiting its internal `FileBasicInformation` query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct PendingSetFileNameOperation {
     pub transaction_id: u64,
@@ -229,11 +230,20 @@ impl PendingFileIoTable {
             }
             PendingFileIoOperation::SetFileName(operation) => {
                 operation.transaction_id != 0
-                    && operation.target_file_id != 0
-                    && operation.target_file_id != pending.file_id
+                    && match pending.major {
+                        nt_io_abi::major::IRP_MJ_QUERY_INFORMATION => operation.target_file_id == 0,
+                        nt_io_abi::major::IRP_MJ_CREATE
+                        | nt_io_abi::major::IRP_MJ_SET_INFORMATION => {
+                            operation.target_file_id != 0
+                                && operation.target_file_id != pending.file_id
+                        }
+                        _ => false,
+                    }
                     && matches!(
                         pending.major,
-                        nt_io_abi::major::IRP_MJ_CREATE | nt_io_abi::major::IRP_MJ_SET_INFORMATION
+                        nt_io_abi::major::IRP_MJ_QUERY_INFORMATION
+                            | nt_io_abi::major::IRP_MJ_CREATE
+                            | nt_io_abi::major::IRP_MJ_SET_INFORMATION
                     )
                     && pending.output_va == 0
                     && pending.output_len == 0
@@ -483,6 +493,41 @@ impl PendingFileIoTable {
         }
         pending.irp_id = new_irp_id;
         pending.major = nt_io_abi::major::IRP_MJ_SET_INFORMATION;
+        Some(())
+    }
+
+    /// Move a rename/link transaction from its acknowledged source attribute query to either a
+    /// retained target CREATE or a retained source SET after an inline CREATE.
+    pub fn retarget_set_file_name_query_exact(
+        &mut self,
+        slot: usize,
+        old_irp_id: u64,
+        new_irp_id: u64,
+        new_major: u8,
+        target_file_id: u64,
+    ) -> Option<()> {
+        let pending = self.slots.get_mut(slot)?.as_mut()?;
+        let PendingFileIoOperation::SetFileName(mut operation) = pending.operation else {
+            return None;
+        };
+        if pending.irp_id != old_irp_id
+            || new_irp_id == 0
+            || pending.major != nt_io_abi::major::IRP_MJ_QUERY_INFORMATION
+            || !matches!(
+                new_major,
+                nt_io_abi::major::IRP_MJ_CREATE | nt_io_abi::major::IRP_MJ_SET_INFORMATION
+            )
+            || operation.target_file_id != 0
+            || target_file_id == 0
+            || target_file_id == pending.file_id
+            || pending.delivery_state != 0
+        {
+            return None;
+        }
+        operation.target_file_id = target_file_id;
+        pending.operation = PendingFileIoOperation::SetFileName(operation);
+        pending.irp_id = new_irp_id;
+        pending.major = new_major;
         Some(())
     }
 
@@ -1334,6 +1379,75 @@ mod tests {
         assert!(table
             .retarget_set_file_name_irp_exact(slot, 22, 23)
             .is_none());
+    }
+
+    #[test]
+    fn set_file_name_owner_moves_from_source_query_to_target_create() {
+        let mut table = PendingFileIoTable::new();
+        let mut request = pending(11, 20, 7);
+        request.major = nt_io_abi::major::IRP_MJ_QUERY_INFORMATION;
+        request.operation = PendingFileIoOperation::SetFileName(PendingSetFileNameOperation {
+            transaction_id: 31,
+            target_file_id: 0,
+        });
+        request.output_va = 0;
+        request.output_len = 0;
+        request.apc_routine = 0;
+        request.event_obj_idx = u64::MAX;
+        request.signal_file = true;
+        request.sync_lock_owner_tid = 7;
+        let slot = table.park(request).unwrap();
+
+        assert!(table.matches_completion_exact(
+            slot,
+            20,
+            11,
+            7,
+            nt_io_abi::major::IRP_MJ_QUERY_INFORMATION,
+        ));
+        table
+            .retarget_set_file_name_query_exact(slot, 20, 21, nt_io_abi::major::IRP_MJ_CREATE, 12)
+            .unwrap();
+        assert!(table.matches_completion_exact(slot, 21, 12, 7, nt_io_abi::major::IRP_MJ_CREATE,));
+        assert!(table
+            .retarget_set_file_name_query_exact(
+                slot,
+                21,
+                22,
+                nt_io_abi::major::IRP_MJ_SET_INFORMATION,
+                12,
+            )
+            .is_none());
+
+        let mut direct = pending(31, 40, 9);
+        direct.major = nt_io_abi::major::IRP_MJ_QUERY_INFORMATION;
+        direct.operation = PendingFileIoOperation::SetFileName(PendingSetFileNameOperation {
+            transaction_id: 41,
+            target_file_id: 0,
+        });
+        direct.output_va = 0;
+        direct.output_len = 0;
+        direct.apc_routine = 0;
+        direct.event_obj_idx = u64::MAX;
+        direct.signal_file = true;
+        direct.sync_lock_owner_tid = 9;
+        let direct_slot = table.park(direct).unwrap();
+        table
+            .retarget_set_file_name_query_exact(
+                direct_slot,
+                40,
+                41,
+                nt_io_abi::major::IRP_MJ_SET_INFORMATION,
+                32,
+            )
+            .unwrap();
+        assert!(table.matches_completion_exact(
+            direct_slot,
+            41,
+            31,
+            9,
+            nt_io_abi::major::IRP_MJ_SET_INFORMATION,
+        ));
     }
 
     #[test]

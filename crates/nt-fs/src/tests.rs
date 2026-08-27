@@ -1674,6 +1674,20 @@ fn set_file_name_information_parser_validates_exact_name_extent() {
 }
 
 #[test]
+fn file_basic_information_parser_requires_the_complete_fixed_record() {
+    let mut basic = [0u8; 40];
+    basic[32..36].copy_from_slice(&FILE_ATTRIBUTE_DIRECTORY.to_le_bytes());
+    assert_eq!(
+        parse_file_basic_information_attributes(&basic),
+        Ok(FILE_ATTRIBUTE_DIRECTORY)
+    );
+    assert_eq!(
+        parse_file_basic_information_attributes(&basic[..39]),
+        Err(STATUS_INFO_LENGTH_MISMATCH)
+    );
+}
+
+#[test]
 fn writable_mount_covers_a_prefix_subtree_only() {
     const PREFIXES: &[&[u8]] = &[b"profiles"];
     // At the prefix, and under it at any depth.

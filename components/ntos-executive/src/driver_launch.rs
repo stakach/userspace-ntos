@@ -44898,6 +44898,35 @@ pub(crate) fn hosted_file_create_options(file_id: u64) -> Option<CreateOptions> 
         .map(|file| file.create_options)
 }
 
+/// Allocate the kernel-only target-parent File after the source kind is known. Access is derived
+/// from provider attributes, while device ownership comes from the canonical source File.
+pub(crate) fn allocate_hosted_set_file_name_target(
+    source_file_id: u64,
+    source_is_directory: bool,
+    target_name: &[u16],
+) -> Result<(u64, u32), u32> {
+    const FILE_WRITE_DATA: u32 = 0x0000_0002;
+    const FILE_ADD_SUBDIRECTORY: u32 = 0x0000_0004;
+    let device_id = io_manager_mut()
+        .file(FileId(source_file_id))
+        .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID) && file.state.is_open())
+        .map(|file| file.device_id.raw())
+        .ok_or(STATUS_INVALID_HANDLE as u32)?;
+    let target_access = if source_is_directory {
+        FILE_ADD_SUBDIRECTORY
+    } else {
+        FILE_WRITE_DATA
+    } | nt_types::AccessMask::SYNCHRONIZE.bits();
+    allocate_hosted_file(
+        device_id,
+        target_access,
+        (ShareAccess::READ | ShareAccess::WRITE).bits(),
+        CreateOptions::OPEN_FOR_BACKUP_INTENT.bits(),
+        target_name,
+    )
+    .map(|file_id| (file_id, target_access))
+}
+
 pub(crate) fn hosted_file_device_relative_name(
     file_id: u64,
     absolute_name: &[u16],
