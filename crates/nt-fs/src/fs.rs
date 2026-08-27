@@ -3149,8 +3149,9 @@ impl MemFs {
     }
 }
 
+/// Read/write/delete access and sharing carried by one NT File open description.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-struct FileShareClaim {
+pub struct FileShareAccess {
     read: bool,
     write: bool,
     delete: bool,
@@ -3159,8 +3160,19 @@ struct FileShareClaim {
     shared_delete: bool,
 }
 
-impl FileShareClaim {
-    fn new(desired_access: u32, share_access: u32) -> Self {
+impl FileShareAccess {
+    pub(crate) const fn none() -> Self {
+        Self {
+            read: false,
+            write: false,
+            delete: false,
+            shared_read: false,
+            shared_write: false,
+            shared_delete: false,
+        }
+    }
+
+    pub fn new(desired_access: u32, share_access: u32) -> Self {
         const GENERIC_ALL: u32 = 0x1000_0000;
         const GENERIC_EXECUTE: u32 = 0x2000_0000;
         const GENERIC_WRITE: u32 = 0x4000_0000;
@@ -3170,7 +3182,8 @@ impl FileShareClaim {
         let all = desired_access & (GENERIC_ALL | MAXIMUM_ALLOWED) != 0;
         Self {
             read: all
-                || desired_access & (FILE_READ_DATA | FILE_EXECUTE | GENERIC_READ | GENERIC_EXECUTE)
+                || desired_access
+                    & (FILE_READ_DATA | FILE_EXECUTE | GENERIC_READ | GENERIC_EXECUTE)
                     != 0,
             write: all
                 || desired_access & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE) != 0,
@@ -3185,7 +3198,7 @@ impl FileShareClaim {
         self.read || self.write || self.delete
     }
 
-    fn compatible_with(self, existing: Self) -> bool {
+    pub fn compatible_with(self, existing: Self) -> bool {
         !self.participates()
             || !existing.participates()
             || ((!self.read || existing.shared_read)
@@ -3209,7 +3222,7 @@ struct FileObject {
     create_options: u32,
     /// One share claim belongs to this open description. Duplicated handles only increase
     /// `references`; the claim is released when the final reference closes.
-    share: FileShareClaim,
+    share: FileShareAccess,
     /// Handles referring to this file object. `NtDuplicateObject` adds one, `ZwClose` removes one;
     /// the object (and any pending delete) is actioned when the last one goes.
     references: u32,
@@ -3447,7 +3460,7 @@ impl FileSystem {
         entry_id: u64,
         information: u32,
         options: u32,
-        share: FileShareClaim,
+        share: FileShareAccess,
     ) -> CreateResult {
         let Some(opened_name) = self.volume.opened_name(entry_id) else {
             return CreateResult {
@@ -3559,7 +3572,7 @@ impl FileSystem {
         self.handles.get_mut(handle as usize)?.as_mut()
     }
 
-    fn check_share_access(&self, node_id: u64, requested: FileShareClaim) -> Result<(), u32> {
+    fn check_share_access(&self, node_id: u64, requested: FileShareAccess) -> Result<(), u32> {
         if self
             .handles
             .iter()
@@ -3817,7 +3830,7 @@ impl FileSystem {
         let Some(rel) = self.to_relative(&normalize_separators(path)) else {
             return fail(STATUS_OBJECT_PATH_NOT_FOUND);
         };
-        let share = FileShareClaim::new(desired_access, share_access);
+        let share = FileShareAccess::new(desired_access, share_access);
         if disposition != FILE_CREATE {
             if let Some((node_id, _)) = self.volume.lookup_entry_from(0, &rel) {
                 if let Err(status) = self.check_share_access(node_id, share) {
@@ -3864,7 +3877,7 @@ impl FileSystem {
         ) {
             return fail(status);
         }
-        let share = FileShareClaim::new(desired_access, share_access);
+        let share = FileShareAccess::new(desired_access, share_access);
         if disposition != FILE_CREATE {
             if let Some((node_id, _)) = self.volume.lookup_folded_entry_from(0, relative) {
                 if let Err(status) = self.check_share_access(node_id, share) {
@@ -3979,7 +3992,7 @@ impl FileSystem {
         if relative.is_empty() || relative.first() == Some(&b'\\') {
             return fail(STATUS_INVALID_PARAMETER);
         }
-        let share = FileShareClaim::new(desired_access, share_access);
+        let share = FileShareAccess::new(desired_access, share_access);
         if disposition != FILE_CREATE {
             if let Some((node_id, _)) = self.volume.lookup_folded_entry_from(root_node, relative) {
                 if let Err(status) = self.check_share_access(node_id, share) {

@@ -14393,3 +14393,36 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     filesystem-owned open descriptions, reject incompatible opens by stable FAT identity, and
     check outstanding lower-volume claims before the first writable copy-up transaction. Then
     resume the remaining file query/set information-class inventory.
+
+    Installed FAT open-description share ownership (2026-08-27, accepted): read-only FAT Files and
+    directories now retain the same `nt-fs::FileShareAccess` contract as MemFs. Each open checks
+    symmetric read/write/delete compatibility before publishing a table slot, duplicated process
+    handles retain the original open description and claim, and only final release removes it.
+    Stable nonzero FAT file identity is authoritative across path spelling and case; canonical path
+    comparison remains only for legacy zero-identity metadata. Table exhaustion remains
+    `STATUS_INSUFFICIENT_RESOURCES`, while an incompatible live open is returned truthfully as
+    `STATUS_SHARING_VIOLATION` instead of being collapsed into an allocation failure.
+
+    The installed-file union transition now checks every live lower-volume File claim before
+    materialising a parent, reading source bytes, importing metadata, truncating, or publishing an
+    upper File. A refused mutation therefore leaves both namespaces unchanged. A successful copy-up
+    allocates a new MemFs node and share domain; existing lower handles remain attached to the old
+    immutable FAT identity, while subsequent opens of the visible upper node use MemFs accounting.
+    This preserves the already accepted one-owner copy-up transaction without introducing a global
+    executive share table or a second compatibility path.
+
+    Focused validation passes `nt-fs` `87/87`; the freestanding executive remains at the established
+    211-warning baseline. Serialized acceptance
+    `.tmp/run-headless-fat-share-access-20260827.log` passed the real writable-filesystem self-test at
+    `0x1ff/0x1ff`, launched genuine userinit and Explorer, completed 668 Explorer api0 redirects with
+    zero callback failures, painted `480000/480000` framebuffer pixels with at least 32 colours,
+    passed all `295/295` gates, and matched the sentinel. The writable snapshot committed generation
+    5 at 1,750,152 bytes; final durable allocation was 14,919,024 bytes with 6,052,368 bytes reusable
+    and no scratch residue or allocator corruption.
+
+    Review adjustment: fixed-volume share accounting and the first copy-up preflight are closed.
+    Resume the remaining `NtQueryInformationFile` and `NtSetInformationFile` class inventory. For
+    each missing class, first classify ownership as I/O Manager, filesystem, cache manager, or
+    provider; implement and host-test the native ABI at that owning crate; then wire only capture,
+    probing, dispatch, and completion in the executive. Unsupported operations must remain explicit
+    errors until their real owner exists, with no fabricated metadata or success fallback.

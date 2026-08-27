@@ -22419,6 +22419,8 @@ impl ExecDirectoryOpens {
         &mut self,
         first_cluster: u32,
         volume_relative_path: &[u8],
+        desired_access: u32,
+        share_access: u32,
         create_options: u32,
         metadata: nt_fs::FileMetadata,
     ) -> Result<u32, u32> {
@@ -22427,6 +22429,8 @@ impl ExecDirectoryOpens {
             (&mut *self.table).create(
                 first_cluster,
                 volume_relative_path,
+                desired_access,
+                share_access,
                 create_options,
                 metadata,
             )
@@ -22473,6 +22477,8 @@ impl ExecReadOnlyFileOpens {
         first_cluster: u32,
         size: u32,
         volume_relative_path: &[u8],
+        desired_access: u32,
+        share_access: u32,
         create_options: u32,
         metadata: nt_fs::FileMetadata,
     ) -> Result<u32, u32> {
@@ -22482,6 +22488,8 @@ impl ExecReadOnlyFileOpens {
                 first_cluster,
                 size,
                 volume_relative_path,
+                desired_access,
+                share_access,
                 create_options,
                 metadata,
             )
@@ -22496,6 +22504,24 @@ impl ExecReadOnlyFileOpens {
     fn get_mut(&mut self, id: u32) -> Result<&mut nt_fs::ReadOnlyFileOpen, u32> {
         // SAFETY: mutable access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&mut *self.table).get_mut(id) }
+    }
+
+    fn check_share(
+        &self,
+        volume_relative_path: &[u8],
+        metadata: nt_fs::FileMetadata,
+        desired_access: u32,
+        share_access: u32,
+    ) -> Result<(), u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe {
+            (&*self.table).check_share(
+                volume_relative_path,
+                metadata,
+                desired_access,
+                share_access,
+            )
+        }
     }
 
     fn retain(&mut self, id: u32) -> Result<(), u32> {

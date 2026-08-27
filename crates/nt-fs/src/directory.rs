@@ -3,7 +3,7 @@
 use crate::{
     STATUS_BUFFER_OVERFLOW, STATUS_INFO_LENGTH_MISMATCH, STATUS_INSUFFICIENT_RESOURCES,
     STATUS_INVALID_HANDLE, STATUS_INVALID_INFO_CLASS, STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE,
-    STATUS_OBJECT_NAME_INVALID, STATUS_QUOTA_EXCEEDED, STATUS_SUCCESS,
+    STATUS_OBJECT_NAME_INVALID, STATUS_QUOTA_EXCEEDED, STATUS_SHARING_VIOLATION, STATUS_SUCCESS,
 };
 
 pub const MAX_DIRECTORY_NAME: usize = 260;
@@ -137,6 +137,7 @@ pub struct DirectoryOpen {
     pub create_options: u32,
     pub metadata: crate::FileMetadata,
     pub query: DirectoryQueryState,
+    share: crate::FileShareAccess,
     path_len: u16,
     path: [u8; DIRECTORY_OPEN_PATH_CAP],
 }
@@ -146,6 +147,19 @@ pub const DIRECTORY_OPEN_PATH_CAP: usize = 1024;
 impl DirectoryOpen {
     pub fn volume_relative_path(&self) -> &[u8] {
         &self.path[..self.path_len as usize]
+    }
+}
+
+fn same_fat_file(
+    left_metadata: &crate::FileMetadata,
+    left_path: &[u8],
+    right_metadata: &crate::FileMetadata,
+    right_path: &[u8],
+) -> bool {
+    if left_metadata.file_id != 0 && right_metadata.file_id != 0 {
+        left_metadata.file_id == right_metadata.file_id
+    } else {
+        left_path.eq_ignore_ascii_case(right_path)
     }
 }
 
@@ -179,6 +193,7 @@ impl DirectoryOpenSlot {
                     is_directory: false,
                 },
                 query: DirectoryQueryState::new(),
+                share: crate::FileShareAccess::none(),
                 path_len: 0,
                 path: [0; DIRECTORY_OPEN_PATH_CAP],
             },
@@ -202,12 +217,16 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
         &mut self,
         first_cluster: u32,
         volume_relative_path: &[u8],
+        desired_access: u32,
+        share_access: u32,
         create_options: u32,
         metadata: crate::FileMetadata,
     ) -> Result<u32, u32> {
         if volume_relative_path.len() > DIRECTORY_OPEN_PATH_CAP {
             return Err(STATUS_OBJECT_NAME_INVALID);
         }
+        let requested = crate::FileShareAccess::new(desired_access, share_access);
+        self.check_share_access(volume_relative_path, metadata, requested)?;
         let (index, slot) = self
             .slots
             .iter_mut()
@@ -224,11 +243,46 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
                 create_options,
                 metadata,
                 query: DirectoryQueryState::new(),
+                share: requested,
                 path_len: volume_relative_path.len() as u16,
                 path,
             },
         };
         Ok(index as u32)
+    }
+
+    pub fn check_share(
+        &self,
+        volume_relative_path: &[u8],
+        metadata: crate::FileMetadata,
+        desired_access: u32,
+        share_access: u32,
+    ) -> Result<(), u32> {
+        self.check_share_access(
+            volume_relative_path,
+            metadata,
+            crate::FileShareAccess::new(desired_access, share_access),
+        )
+    }
+
+    fn check_share_access(
+        &self,
+        volume_relative_path: &[u8],
+        metadata: crate::FileMetadata,
+        requested: crate::FileShareAccess,
+    ) -> Result<(), u32> {
+        if self.slots.iter().filter(|slot| slot.occupied).all(|slot| {
+            !same_fat_file(
+                &slot.open.metadata,
+                slot.open.volume_relative_path(),
+                &metadata,
+                volume_relative_path,
+            ) || requested.compatible_with(slot.open.share)
+        }) {
+            Ok(())
+        } else {
+            Err(STATUS_SHARING_VIOLATION)
+        }
     }
 
     pub fn get(&self, id: u32) -> Result<&DirectoryOpen, u32> {
@@ -297,6 +351,7 @@ pub struct ReadOnlyFileOpen {
     pub current_offset: u64,
     pub create_options: u32,
     pub metadata: crate::FileMetadata,
+    share: crate::FileShareAccess,
     path_len: u16,
     path: [u8; DIRECTORY_OPEN_PATH_CAP],
 }
@@ -338,6 +393,7 @@ impl ReadOnlyFileOpenSlot {
                     delete_pending: false,
                     is_directory: false,
                 },
+                share: crate::FileShareAccess::none(),
                 path_len: 0,
                 path: [0; DIRECTORY_OPEN_PATH_CAP],
             },
@@ -362,12 +418,16 @@ impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
         first_cluster: u32,
         size: u32,
         volume_relative_path: &[u8],
+        desired_access: u32,
+        share_access: u32,
         create_options: u32,
         metadata: crate::FileMetadata,
     ) -> Result<u32, u32> {
         if volume_relative_path.len() > DIRECTORY_OPEN_PATH_CAP {
             return Err(STATUS_OBJECT_NAME_INVALID);
         }
+        let requested = crate::FileShareAccess::new(desired_access, share_access);
+        self.check_share_access(volume_relative_path, metadata, requested)?;
         let (index, slot) = self
             .slots
             .iter_mut()
@@ -385,11 +445,46 @@ impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
                 current_offset: 0,
                 create_options,
                 metadata,
+                share: requested,
                 path_len: volume_relative_path.len() as u16,
                 path,
             },
         };
         Ok(index as u32)
+    }
+
+    pub fn check_share(
+        &self,
+        volume_relative_path: &[u8],
+        metadata: crate::FileMetadata,
+        desired_access: u32,
+        share_access: u32,
+    ) -> Result<(), u32> {
+        self.check_share_access(
+            volume_relative_path,
+            metadata,
+            crate::FileShareAccess::new(desired_access, share_access),
+        )
+    }
+
+    fn check_share_access(
+        &self,
+        volume_relative_path: &[u8],
+        metadata: crate::FileMetadata,
+        requested: crate::FileShareAccess,
+    ) -> Result<(), u32> {
+        if self.slots.iter().filter(|slot| slot.occupied).all(|slot| {
+            !same_fat_file(
+                &slot.open.metadata,
+                slot.open.volume_relative_path(),
+                &metadata,
+                volume_relative_path,
+            ) || requested.compatible_with(slot.open.share)
+        }) {
+            Ok(())
+        } else {
+            Err(STATUS_SHARING_VIOLATION)
+        }
     }
 
     pub fn get(&self, id: u32) -> Result<&ReadOnlyFileOpen, u32> {
@@ -934,6 +1029,8 @@ mod tests {
             .create(
                 41,
                 b"reactos\\system32",
+                0,
+                0,
                 0x20,
                 crate::FileMetadata::default(),
             )
@@ -942,6 +1039,8 @@ mod tests {
             .create(
                 41,
                 b"reactos\\system32",
+                0,
+                0,
                 0x10,
                 crate::FileMetadata::default(),
             )
@@ -961,7 +1060,7 @@ mod tests {
         assert_eq!(table.get(shared), Err(STATUS_INVALID_HANDLE));
         assert_eq!(
             table
-                .create(99, b"reactos", 0, crate::FileMetadata::default())
+                .create(99, b"reactos", 0, 0, 0, crate::FileMetadata::default())
                 .unwrap(),
             shared
         );
@@ -971,11 +1070,18 @@ mod tests {
     fn directory_open_table_clear_reuses_fixed_storage() {
         let mut table = DirectoryOpenTable::<2>::new();
         let first = table
-            .create(41, b"reactos", 0, crate::FileMetadata::default())
+            .create(41, b"reactos", 0, 0, 0, crate::FileMetadata::default())
             .unwrap();
         table.retain(first).unwrap();
         table
-            .create(42, b"reactos\\system32", 0, crate::FileMetadata::default())
+            .create(
+                42,
+                b"reactos\\system32",
+                0,
+                0,
+                0,
+                crate::FileMetadata::default(),
+            )
             .unwrap();
 
         table.clear();
@@ -983,13 +1089,13 @@ mod tests {
         assert_eq!(table.get(first), Err(STATUS_INVALID_HANDLE));
         assert_eq!(
             table
-                .create(99, b"", 0, crate::FileMetadata::default())
+                .create(99, b"", 0, 0, 0, crate::FileMetadata::default())
                 .unwrap(),
             0
         );
         assert_eq!(
             table
-                .create(100, b"reactos", 0, crate::FileMetadata::default())
+                .create(100, b"reactos", 0, 0, 0, crate::FileMetadata::default())
                 .unwrap(),
             1
         );
@@ -1003,6 +1109,8 @@ mod tests {
                 41,
                 64,
                 b"reactos\\system32\\ntdll.dll",
+                0,
+                0,
                 0x20,
                 crate::FileMetadata::default(),
             )
@@ -1012,6 +1120,8 @@ mod tests {
                 41,
                 64,
                 b"reactos\\system32\\ntdll.dll",
+                0,
+                0,
                 0x10,
                 crate::FileMetadata::default(),
             )
@@ -1031,7 +1141,15 @@ mod tests {
         assert_eq!(table.get(shared), Err(STATUS_INVALID_HANDLE));
         assert_eq!(
             table
-                .create(99, 128, b"reactos\\x", 0, crate::FileMetadata::default())
+                .create(
+                    99,
+                    128,
+                    b"reactos\\x",
+                    0,
+                    0,
+                    0,
+                    crate::FileMetadata::default(),
+                )
                 .unwrap(),
             shared
         );
@@ -1041,11 +1159,27 @@ mod tests {
     fn readonly_file_open_table_clear_reuses_fixed_storage() {
         let mut table = ReadOnlyFileOpenTable::<2>::new();
         let first = table
-            .create(41, 64, b"reactos\\a", 0, crate::FileMetadata::default())
+            .create(
+                41,
+                64,
+                b"reactos\\a",
+                0,
+                0,
+                0,
+                crate::FileMetadata::default(),
+            )
             .unwrap();
         table.retain(first).unwrap();
         table
-            .create(42, 128, b"reactos\\b", 0, crate::FileMetadata::default())
+            .create(
+                42,
+                128,
+                b"reactos\\b",
+                0,
+                0,
+                0,
+                crate::FileMetadata::default(),
+            )
             .unwrap();
 
         table.clear();
@@ -1053,15 +1187,107 @@ mod tests {
         assert_eq!(table.get(first), Err(STATUS_INVALID_HANDLE));
         assert_eq!(
             table
-                .create(99, 1, b"", 0, crate::FileMetadata::default())
+                .create(99, 1, b"", 0, 0, 0, crate::FileMetadata::default())
                 .unwrap(),
             0
         );
         assert_eq!(
             table
-                .create(100, 2, b"reactos", 0, crate::FileMetadata::default())
+                .create(100, 2, b"reactos", 0, 0, 0, crate::FileMetadata::default(),)
                 .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn fat_open_tables_enforce_stable_identity_share_claims_until_final_release() {
+        let directory_metadata = crate::FileMetadata {
+            file_id: 0xD1,
+            is_directory: true,
+            ..crate::FileMetadata::default()
+        };
+        let mut directories = DirectoryOpenTable::<3>::new();
+        let directory = directories
+            .create(
+                41,
+                b"reactos\\system32",
+                crate::FILE_READ_DATA,
+                crate::FILE_SHARE_READ,
+                0,
+                directory_metadata,
+            )
+            .unwrap();
+        assert_eq!(
+            directories.create(
+                41,
+                b"REACTOS\\SYSTEM32",
+                crate::FILE_WRITE_DATA,
+                crate::FILE_SHARE_READ | crate::FILE_SHARE_WRITE,
+                0,
+                directory_metadata,
+            ),
+            Err(STATUS_SHARING_VIOLATION)
+        );
+        directories.retain(directory).unwrap();
+        directories.release(directory).unwrap();
+        assert_eq!(
+            directories.check_share(
+                b"reactos\\system32",
+                directory_metadata,
+                crate::FILE_WRITE_DATA,
+                crate::FILE_SHARE_READ | crate::FILE_SHARE_WRITE,
+            ),
+            Err(STATUS_SHARING_VIOLATION)
+        );
+        directories.release(directory).unwrap();
+        assert_eq!(
+            directories.check_share(
+                b"reactos\\system32",
+                directory_metadata,
+                crate::FILE_WRITE_DATA,
+                crate::FILE_SHARE_WRITE,
+            ),
+            Ok(())
+        );
+
+        let file_metadata = crate::FileMetadata {
+            file_id: 0xF1,
+            end_of_file: 64,
+            ..crate::FileMetadata::default()
+        };
+        let mut files = ReadOnlyFileOpenTable::<2>::new();
+        let file = files
+            .create(
+                51,
+                64,
+                b"reactos\\system32\\ntdll.dll",
+                crate::FILE_READ_DATA,
+                crate::FILE_SHARE_READ,
+                0,
+                file_metadata,
+            )
+            .unwrap();
+        assert_eq!(
+            files.check_share(
+                b"reactos\\system32\\ntdll.dll",
+                file_metadata,
+                crate::FILE_WRITE_DATA,
+                crate::FILE_SHARE_READ | crate::FILE_SHARE_WRITE,
+            ),
+            Err(STATUS_SHARING_VIOLATION)
+        );
+        files.release(file).unwrap();
+        assert_eq!(
+            files.create(
+                51,
+                64,
+                b"reactos\\system32\\ntdll.dll",
+                crate::FILE_WRITE_DATA,
+                crate::FILE_SHARE_WRITE,
+                0,
+                file_metadata,
+            ),
+            Ok(file)
         );
     }
 }

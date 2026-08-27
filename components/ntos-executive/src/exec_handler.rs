@@ -9582,21 +9582,26 @@ impl ExecNtHandler {
         file: crate::fs_loader::FatOpenMetadata,
         volume_relative_path: &[u8],
         access: u32,
+        share_access: u32,
         create_options: u32,
-    ) -> Option<u64> {
-        let pid = self.pm_pid_for_pi(self.pi)?;
+    ) -> Result<u64, u32> {
+        let pid = self
+            .pm_pid_for_pi(self.pi)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
         let first_cluster = file.first_cluster;
-        let size = u32::try_from(file.metadata.end_of_file).ok()?;
+        let size = u32::try_from(file.metadata.end_of_file)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
         let object_id = self
             .readonly_file_opens
             .create(
                 first_cluster,
                 size,
                 volume_relative_path,
+                access,
+                share_access,
                 create_options,
                 file.metadata,
-            )
-            .ok()?;
+            )?;
         let handle = match self.insert_process_handle(
             pid,
             nt_process::HandleObject::DiskFile {
@@ -9607,12 +9612,12 @@ impl ExecNtHandler {
             access,
         ) {
             Ok(handle) => handle,
-            Err(_) => {
+            Err(status) => {
                 let _ = self.readonly_file_opens.release(object_id);
-                return None;
+                return Err(status);
             }
         };
-        Some(handle as u64)
+        Ok(handle as u64)
     }
 
     fn readonly_disk_open_entry(
@@ -9717,22 +9722,26 @@ impl ExecNtHandler {
         directory: crate::fs_loader::FatOpenMetadata,
         volume_relative_path: &[u8],
         access: u32,
+        share_access: u32,
         create_options: u32,
-    ) -> Option<u64> {
-        let pid = self.pm_pid_for_pi(self.pi)?;
+    ) -> Result<u64, u32> {
+        let pid = self
+            .pm_pid_for_pi(self.pi)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
         let first_cluster = directory.first_cluster;
         if !directory.metadata.is_directory {
-            return None;
+            return Err(nt_fs::STATUS_NOT_A_DIRECTORY);
         }
         let object_id = self
             .directory_opens
             .create(
                 first_cluster,
                 volume_relative_path,
+                access,
+                share_access,
                 create_options,
                 directory.metadata,
-            )
-            .ok()?;
+            )?;
         let handle = match self.insert_process_handle(
             pid,
             nt_process::HandleObject::Directory {
@@ -9742,12 +9751,12 @@ impl ExecNtHandler {
             access,
         ) {
             Ok(handle) => handle,
-            Err(_) => {
+            Err(status) => {
                 let _ = self.directory_opens.release(object_id);
-                return None;
+                return Err(status);
             }
         };
-        Some(handle as u64)
+        Ok(handle as u64)
     }
 
     unsafe fn create_overlay_file_relative(
@@ -9803,10 +9812,11 @@ impl ExecNtHandler {
                     source,
                     relative,
                     desired_access,
+                    share_access,
                     options,
                 ) {
-                    Some(handle) => (nt_fs::STATUS_SUCCESS, nt_fs::FILE_OPENED as u64, handle),
-                    None => (STATUS_INSUFFICIENT_RESOURCES, 0, 0),
+                    Ok(handle) => (nt_fs::STATUS_SUCCESS, nt_fs::FILE_OPENED as u64, handle),
+                    Err(status) => (status, 0, 0),
                 };
             }
             nt_fs::InstalledFileOpenAction::CopyContents => {
@@ -9819,6 +9829,14 @@ impl ExecNtHandler {
                 return (nt_fs::STATUS_OBJECT_NAME_COLLISION, 0, 0);
             }
         };
+        if let Err(status) = self.readonly_file_opens.check_share(
+            relative,
+            source.metadata,
+            desired_access,
+            share_access,
+        ) {
+            return (status, 0, 0);
+        }
         if let Some(parent) = Self::volume_relative_parent(relative) {
             if !Self::readonly_volume_relative_is_dir(parent) {
                 return (nt_fs::STATUS_OBJECT_PATH_NOT_FOUND, 0, 0);
@@ -9957,15 +9975,27 @@ impl ExecNtHandler {
                         return (nt_fs::STATUS_FILE_IS_A_DIRECTORY, 0, 0);
                     }
                     let handle = if is_directory {
-                        self.mint_directory_handle(entry, full_path, desired_access, options)
+                        self.mint_directory_handle(
+                            entry,
+                            full_path,
+                            desired_access,
+                            share_access,
+                            options,
+                        )
                     } else if Self::readonly_disk_open_allowed(desired_access, options) {
-                        self.mint_disk_file_handle(entry, full_path, desired_access, options)
+                        self.mint_disk_file_handle(
+                            entry,
+                            full_path,
+                            desired_access,
+                            share_access,
+                            options,
+                        )
                     } else {
                         return (nt_fs::STATUS_NOT_SUPPORTED, 0, 0);
                     };
                     return match handle {
-                        Some(handle) => (nt_fs::STATUS_SUCCESS, nt_fs::FILE_OPENED as u64, handle),
-                        None => (STATUS_INSUFFICIENT_RESOURCES, 0, 0),
+                        Ok(handle) => (nt_fs::STATUS_SUCCESS, nt_fs::FILE_OPENED as u64, handle),
+                        Err(status) => (status, 0, 0),
                     };
                 }
                 if disposition == nt_fs::FILE_CREATE && fat_entry.is_some() {
@@ -22792,31 +22822,45 @@ impl ExecNtHandler {
             .then_some(volume_file)
             .flatten();
         let loader_open = if let Some((path, directory)) = volume_directory {
-            self.mint_directory_handle(directory, path, desired_access, open_options)
+            Some(self.mint_directory_handle(
+                directory,
+                path,
+                desired_access,
+                share_access,
+                open_options,
+            ))
         } else if let (Some(file), Some(path)) = (loader_file, volume_path) {
-            self.mint_disk_file_handle(file, path, desired_access, open_options)
+            Some(self.mint_disk_file_handle(
+                file,
+                path,
+                desired_access,
+                share_access,
+                open_options,
+            ))
         } else {
             None
         };
-        let status: u32 = if volume_directory.is_some() || loader_file.is_some() {
-            let Some(h) = loader_open else {
-                let status = 0xC000_009A;
-                let iosb = args[3];
-                self.write_nt_open_file_handle_out(file_handle_out, 0);
-                if iosb != 0 {
-                    smss_stack_write32(iosb, status);
-                    smss_stack_write(iosb + 8, 0);
+        let status: u32 = if let Some(loader_open) = loader_open {
+            let h = match loader_open {
+                Ok(handle) => handle,
+                Err(status) => {
+                    let iosb = args[3];
+                    self.write_nt_open_file_handle_out(file_handle_out, 0);
+                    if iosb != 0 {
+                        smss_stack_write32(iosb, status);
+                        smss_stack_write(iosb + 8, 0);
+                    }
+                    loader_trace_record(
+                        self.pi,
+                        LoaderOp::OpenFile,
+                        status,
+                        dll_i,
+                        0,
+                        0,
+                        &nb[..nlen],
+                    );
+                    return status;
                 }
-                loader_trace_record(
-                    self.pi,
-                    LoaderOp::OpenFile,
-                    status,
-                    dll_i,
-                    0,
-                    0,
-                    &nb[..nlen],
-                );
-                return status;
             };
             opened_handle = h;
             if let Some(image) = hosted_exe_image {
@@ -22865,14 +22909,20 @@ impl ExecNtHandler {
         )
         {
             let mut status = nt_fs::STATUS_SUCCESS;
-            let opened = self.mint_disk_file_handle(file, path, desired_access, open_options);
+            let opened = self.mint_disk_file_handle(
+                file,
+                path,
+                desired_access,
+                share_access,
+                open_options,
+            );
             let opened_handle = match opened {
-                Some(handle) => {
+                Ok(handle) => {
                     self.queue_write(file_handle_out, handle);
                     handle
                 }
-                None => {
-                    status = 0xC000_009A;
+                Err(open_status) => {
+                    status = open_status;
                     self.write_nt_open_file_handle_out(file_handle_out, 0);
                     0
                 }
