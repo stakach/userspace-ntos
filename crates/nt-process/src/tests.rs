@@ -216,6 +216,33 @@ fn typed_handles_must_reference_live_process_manager_objects() {
 }
 
 #[test]
+fn parked_wait_references_keep_process_and_thread_dispatcher_objects_live() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("waited.exe", None, None);
+    let tid = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+
+    pm.retain_process_wait_reference(pid).unwrap();
+    pm.retain_thread_wait_reference(tid).unwrap();
+    assert_eq!(pm.process_wait_references(pid), Some(1));
+    assert_eq!(pm.thread_wait_references(tid), Some(1));
+
+    pm.terminate_thread(tid, 0x1234).unwrap();
+    assert!(pm.is_process_signaled(pid));
+    assert!(pm.is_thread_signaled(tid));
+    assert!(!pm.can_reclaim_thread(tid));
+
+    pm.release_process_wait_reference(pid).unwrap();
+    pm.release_thread_wait_reference(tid).unwrap();
+    assert_eq!(pm.process_wait_references(pid), Some(0));
+    assert_eq!(pm.thread_wait_references(tid), Some(0));
+    assert!(pm.can_reclaim_thread(tid));
+    assert_eq!(
+        pm.release_thread_wait_reference(tid),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+}
+
+#[test]
 fn process_security_descriptor_uses_process_handle_access() {
     const READ_CONTROL: u32 = 0x0002_0000;
     const WRITE_DAC: u32 = 0x0004_0000;

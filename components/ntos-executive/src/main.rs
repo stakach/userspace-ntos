@@ -2481,8 +2481,14 @@ struct ObjectWaiterRecord {
     result_indices: [u8; WAITER_MAX_EVENTS],
     count: u8,
     wait_all: bool,
+    alertable: bool,
     reply_cap: u64,
     tid: u64,
+    pi: usize,
+    badge: u64,
+    resume_ip: u64,
+    resume_sp: u64,
+    resume_flags: u64,
     deadline: u64,
     reply: nt_syscall_abi::ParkedSyscallReply,
     pending_wake_index: u64,
@@ -2496,8 +2502,14 @@ impl ObjectWaiterRecord {
             result_indices: [0; WAITER_MAX_EVENTS],
             count: 0,
             wait_all: false,
+            alertable: false,
             reply_cap: 0,
             tid: 0,
+            pi: 0,
+            badge: 0,
+            resume_ip: 0,
+            resume_sp: 0,
+            resume_flags: 0,
             deadline: u64::MAX,
             reply: nt_syscall_abi::ParkedSyscallReply::native_call(),
             pending_wake_index: u64::MAX,
@@ -2514,8 +2526,14 @@ impl ObjectWaiterRecord {
         objects: &[WaitObject],
         result_indices: &[u8],
         wait_all: bool,
+        alertable: bool,
         reply_cap: u64,
         tid: u64,
+        pi: usize,
+        badge: u64,
+        resume_ip: u64,
+        resume_sp: u64,
+        resume_flags: u64,
         deadline: Option<u64>,
         reply: nt_syscall_abi::ParkedSyscallReply,
     ) -> Self {
@@ -2526,8 +2544,14 @@ impl ObjectWaiterRecord {
         }
         record.count = objects.len() as u8;
         record.wait_all = wait_all;
+        record.alertable = alertable;
         record.reply_cap = reply_cap;
         record.tid = tid;
+        record.pi = pi;
+        record.badge = badge;
+        record.resume_ip = resume_ip;
+        record.resume_sp = resume_sp;
+        record.resume_flags = resume_flags;
         record.deadline = deadline.unwrap_or(u64::MAX);
         record.reply = reply;
         record
@@ -2602,6 +2626,29 @@ impl ObjectWaiterTable {
             .iter()
             .copied()
             .any(|entry| entry.is_live() && entry.tid == tid)
+    }
+
+    fn alertable_for_tid(&self, tid: u64) -> Option<(usize, ObjectWaiterRecord)> {
+        self.entries
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, entry)| entry.is_live() && entry.alertable && entry.tid == tid)
+    }
+
+    fn take_exact(
+        &mut self,
+        slot: usize,
+        tid: u64,
+        reply_cap: u64,
+    ) -> Option<ObjectWaiterRecord> {
+        let entry = self.entries.get_mut(slot)?;
+        if !entry.is_live() || entry.tid != tid || entry.reply_cap != reply_cap {
+            return None;
+        }
+        let record = *entry;
+        *entry = ObjectWaiterRecord::empty();
+        Some(record)
     }
 
     fn clear_pending_wakes(&mut self) {
@@ -16477,6 +16524,18 @@ fn object_waiter_contains_tid(tid: u64) -> bool {
     unsafe { (&*core::ptr::addr_of!(OBJECT_WAITERS)).contains_tid(tid) }
 }
 
+fn object_waiter_alertable_for_tid(tid: u64) -> Option<(usize, ObjectWaiterRecord)> {
+    unsafe { (&*core::ptr::addr_of!(OBJECT_WAITERS)).alertable_for_tid(tid) }
+}
+
+fn object_waiter_take_exact(
+    slot: usize,
+    tid: u64,
+    reply_cap: u64,
+) -> Option<ObjectWaiterRecord> {
+    unsafe { (&mut *core::ptr::addr_of_mut!(OBJECT_WAITERS)).take_exact(slot, tid, reply_cap) }
+}
+
 fn object_waiter_next_deadline() -> Option<u64> {
     unsafe { (&*core::ptr::addr_of!(OBJECT_WAITERS)).next_deadline() }
 }
@@ -16810,16 +16869,39 @@ unsafe fn io_completion_cancel_process(handler: &mut ExecNtHandler, process_inde
 /// matching state transition sends on the stolen cap. Returns true on success; false if the
 /// pool/waiter queue is exhausted.
 unsafe fn wait_park(
+    handler: &mut ExecNtHandler,
     object: WaitObject,
+    alertable: bool,
     reply: nt_syscall_abi::ParkedSyscallReply,
     tid: u64,
     deadline: Option<u64>,
 ) -> bool {
     // Single-object wait = a 1-object WaitAny set.
-    wait_park_multi(&[object], &[0], false, reply, tid, deadline)
+    wait_park_multi(
+        handler,
+        &[object],
+        &[0],
+        false,
+        alertable,
+        reply,
+        tid,
+        deadline,
+    )
 }
 
-unsafe fn wait_cancel_thread(handler: &ExecNtHandler, tid: u64) {
+fn release_wait_object_references(handler: &mut ExecNtHandler, record: ObjectWaiterRecord) {
+    for object in record.objects[..record.count as usize]
+        .iter()
+        .copied()
+        .rev()
+    {
+        handler
+            .release_wait_object_reference(object)
+            .expect("parked wait lost its retained object reference");
+    }
+}
+
+unsafe fn wait_cancel_thread(handler: &mut ExecNtHandler, tid: u64) {
     for slot in 0..object_waiter_len() {
         let Some(record) = object_waiter_record(slot) else {
             continue;
@@ -16839,6 +16921,7 @@ unsafe fn wait_cancel_thread(handler: &ExecNtHandler, tid: u64) {
                 release_reply_pool_cap(cap);
             }
         }
+        release_wait_object_references(handler, record);
         object_waiter_clear_slot(slot);
     }
     thread_wait_state_clear_tid(handler, tid);
@@ -17518,9 +17601,11 @@ unsafe fn terminate_hosted_process_mechanisms(
 /// success; false if the pool/queue is exhausted OR the set is too large (`objects.len() >
 /// WAITER_MAX_EVENTS`).
 unsafe fn wait_park_multi(
+    handler: &mut ExecNtHandler,
     objects: &[WaitObject],
     result_indices: &[u8],
     wait_all: bool,
+    alertable: bool,
     reply: nt_syscall_abi::ParkedSyscallReply,
     tid: u64,
     deadline: Option<u64>,
@@ -17544,17 +17629,44 @@ unsafe fn wait_park_multi(
         WAIT_PARK_NO_REPLY_CAP.fetch_add(1, Ordering::Relaxed);
         return false; // pool exhausted → caller reports STATUS_INSUFFICIENT_RESOURCES
     };
+    // Resolve-to-park is one object-manager transaction: each typed identity owns a reference
+    // before the waiter record becomes visible. If any retain fails, roll the partial set back in
+    // reverse order and leave the caller's reply object untouched.
+    let mut retained = 0usize;
+    for object in objects.iter().copied() {
+        if handler.retain_wait_object_reference(object).is_err() {
+            for retained_object in objects[..retained].iter().copied().rev() {
+                handler
+                    .release_wait_object_reference(retained_object)
+                    .expect("wait-reference rollback lost its retained object");
+            }
+            WAIT_PARK_INVALID_SET.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        retained += 1;
+    }
     // Commit: record the waiter's object set + its syscall resume context, install the fresh object as
     // the active recv reply cap.
     if !object_waiter_park(ObjectWaiterRecord::new(
         objects,
         result_indices,
         wait_all,
+        alertable,
         stolen,
         tid,
+        handler.pi,
+        handler.current_badge,
+        handler.current_resume_ip,
+        handler.current_sp,
+        handler.current_flags,
         deadline,
         reply,
     )) {
+        for object in objects.iter().copied().rev() {
+            handler
+                .release_wait_object_reference(object)
+                .expect("failed waiter publication lost its retained object");
+        }
         WAIT_PARK_NO_WAITER_SLOT.fetch_add(1, Ordering::Relaxed);
         return false;
     }
@@ -17694,6 +17806,7 @@ unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<
             woken += 1;
             WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
         }
+        release_wait_object_references(handler, record);
         // Free the slot.
         object_waiter_clear_slot(i);
     }
@@ -17716,6 +17829,7 @@ unsafe fn wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
             thread_wait_state_clear_tid_ready(handler, record.tid);
             woken += 1;
         }
+        release_wait_object_references(handler, record);
         object_waiter_clear_slot(slot);
     }
     woken
@@ -21075,6 +21189,8 @@ struct ObjEntry {
     parent: usize, // index of the parent directory; OBJ_PARENT_ROOT = the root itself
     kind: u8,
     permanent: bool,
+    /// References held by published native wait records after the caller's handle capture.
+    wait_references: u32,
     target: [u8; OBJ_NAME_CAP], // symbolic-link target (kind == 1)
     target_len: u8,
     payload: u64,
@@ -21096,6 +21212,7 @@ impl ObjEntry {
             parent: 0,
             kind: OBJ_KIND_DELETED,
             permanent: false,
+            wait_references: 0,
             target: [0; OBJ_NAME_CAP],
             target_len: 0,
             payload: 0,
@@ -21169,6 +21286,7 @@ impl ObjEntry {
         self.parent = OBJ_PARENT_ANONYMOUS;
         self.kind = OBJ_KIND_DELETED;
         self.permanent = false;
+        self.wait_references = 0;
         self.target = [0; OBJ_NAME_CAP];
         self.target_len = 0;
         self.payload = 0;
@@ -21545,6 +21663,8 @@ struct ExecNtHandler {
     /// WaitObject) instead of replying, and wake it on the matching state transition. -1 = no park.
     /// Reset each dispatch (group-A signal, like spawn_request).
     wait_park_event: i64,
+    /// Alertability captured with the pending single-object wait handoff.
+    wait_alertable: bool,
     /// Raw NT timeout interval for the pending wait-object park. The loop converts it into a
     /// monotonic deadline at the reply-cap park boundary, after any handler-side bookkeeping.
     wait_timeout: PendingWaitTimeout,

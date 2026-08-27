@@ -500,6 +500,8 @@ pub struct NtProcess {
     pub main_thread: Option<ThreadId>,
     pub state: ProcessState,
     pub exit_status: Option<u32>,
+    /// Dispatcher references held by parked waits independently of user handles.
+    wait_references: u32,
     /// Stable primary-token identity. The external token store owns the object bytes and reference
     /// count; the process holds one reference while this slot is populated.
     primary_token: Option<TokenId>,
@@ -709,6 +711,8 @@ pub struct NtThread {
     pub state: ThreadState,
     pub is_system_thread: bool,
     pub exit_status: Option<u32>,
+    /// Dispatcher references held by parked waits independently of user handles.
+    wait_references: u32,
     pub create_time_100ns: i64,
     pub exit_time_100ns: i64,
     pub kernel_time_100ns: i64,
@@ -957,6 +961,7 @@ impl ProcessManager {
                 main_thread: None,
                 state,
                 exit_status: None,
+                wait_references: 0,
                 primary_token: None,
                 win32_process: None,
                 kernel_process_object: None,
@@ -1515,6 +1520,7 @@ impl ProcessManager {
                 state: ThreadState::Ready,
                 is_system_thread,
                 exit_status: None,
+                wait_references: 0,
                 create_time_100ns: 0,
                 exit_time_100ns: 0,
                 kernel_time_100ns: 0,
@@ -2257,15 +2263,15 @@ impl ProcessManager {
     /// closed. Hosts can use this predicate to avoid TID/slot aliasing while reclaiming mechanism
     /// resources independently of the policy object.
     pub fn can_reclaim_thread(&self, tid: ThreadId) -> bool {
-        self.thread(tid)
-            .is_some_and(|thread| thread.state == ThreadState::Terminated)
-            && !self.processes.values().any(|process| {
-                process.handles.iter().any(|entry| {
-                    entry
-                        .entry()
-                        .is_some_and(|entry| entry.object == HandleObject::Thread(tid))
-                })
+        self.thread(tid).is_some_and(|thread| {
+            thread.state == ThreadState::Terminated && thread.wait_references == 0
+        }) && !self.processes.values().any(|process| {
+            process.handles.iter().any(|entry| {
+                entry
+                    .entry()
+                    .is_some_and(|entry| entry.object == HandleObject::Thread(tid))
             })
+        })
     }
 
     /// Reset a preallocated runtime-thread identity after its terminated object is no longer
@@ -2638,6 +2644,52 @@ impl ProcessManager {
     }
 
     /// A process/thread is a waitable dispatcher object, signalled once terminated (spec §12.1).
+    pub fn retain_process_wait_reference(&mut self, pid: ProcessId) -> Result<(), u32> {
+        let process = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        process.wait_references = process
+            .wait_references
+            .checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        Ok(())
+    }
+
+    pub fn release_process_wait_reference(&mut self, pid: ProcessId) -> Result<(), u32> {
+        let process = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        process.wait_references = process
+            .wait_references
+            .checked_sub(1)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        Ok(())
+    }
+
+    pub fn retain_thread_wait_reference(&mut self, tid: ThreadId) -> Result<(), u32> {
+        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        thread.wait_references = thread
+            .wait_references
+            .checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        Ok(())
+    }
+
+    pub fn release_thread_wait_reference(&mut self, tid: ThreadId) -> Result<(), u32> {
+        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        thread.wait_references = thread
+            .wait_references
+            .checked_sub(1)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        Ok(())
+    }
+
+    pub fn process_wait_references(&self, pid: ProcessId) -> Option<u32> {
+        self.processes
+            .get(&pid)
+            .map(|process| process.wait_references)
+    }
+
+    pub fn thread_wait_references(&self, tid: ThreadId) -> Option<u32> {
+        self.threads.get(&tid).map(|thread| thread.wait_references)
+    }
+
     pub fn is_process_signaled(&self, pid: ProcessId) -> bool {
         self.processes
             .get(&pid)

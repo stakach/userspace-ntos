@@ -14909,3 +14909,61 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     waits retain the referenced dispatcher object until removal. This is object-lifetime work, not
     an executive compatibility path. After that audit the remaining exported ntdll native services
     against executive registration and choose the next absent kernel trait from the actual gap list.
+
+    Local FILE_OBJECT completion lifecycle convergence (2026-08-27, accepted): local
+    `NtReadFile`, `NtWriteFile`, and `NtQueryDirectoryFile` now enter the same retain, clear, publish,
+    signal, and release lifecycle as local byte locks and directory-change notifications. The
+    shared FAT or writable-overlay open description is cleared only after event and request capture
+    succeed, remains alive across completion publication even if its final handle is concurrently
+    cleaned up, and is signaled according to the native synchronous-File/no-explicit-event rule.
+    Duplicated handles therefore observe one File event instead of per-handle or provider-only
+    state. The lock and notify paths use the same lifecycle primitive; their replaced duplicate
+    retain/clear/release sequences are removed.
+
+    Focused validation passes `nt-fs` `119/119`, `nt-io-manager` `236/236`, `git diff --check`, and
+    the freestanding executive at the established 211-warning baseline. The serialized release
+    build succeeds. Code checkpoint `909f335f` is pushed. Serialized acceptance
+    `.tmp/run-headless-local-file-lifetime-20260827.log` reached quiescence after the real shell
+    workload, launched genuine userinit and Explorer, completed 668 Explorer api0 redirects with
+    zero callback or dead-callback failures, recorded paint begin/end `5/20`, 187 direct GDI
+    returns, and 135 batch flushes covering 184 records, painted `480000/480000` framebuffer pixels
+    with at least 32 colours, passed all `295/295` gates, and matched the sentinel. Snapshot
+    generation 5 committed 1,755,656 bytes; scratch returned to zero and the resource census
+    reported no page-table, frame, mapping, alias, registry, untyped-allocation,
+    frame-registration, or allocator failures.
+
+    Review adjustment: local File operation signal and I/O-reference ownership are now uniform.
+    Continue the object-lifetime step by making each parked wait own references to its exact set of
+    dispatcher objects until wake, timeout, user-APC interruption, or thread teardown. Closing the
+    last handle must not invalidate an active wait, and reused table slots must not retarget it.
+    Put generation-exact retain/release primitives in the owning object crates where possible and
+    keep the executive responsible only for translating handles into typed wait identities.
+
+    Parked wait-object lifetime convergence (2026-08-27, implementation checkpoint): published
+    single and multiple waits now retain every typed object identity transactionally before moving
+    the caller's reply capability. A partial retain or waiter-publication failure unwinds the exact
+    retained prefix in reverse order. Wake, timeout, queued user-APC interruption, and thread
+    teardown each remove one exact waiter and release its full object set once.
+
+    Process and thread dispatcher references live in `nt-process`; a terminated ETHREAD cannot be
+    recycled while a wait reference exists. Namespace events, timers, semaphores, and mutants carry
+    wait references independently of process handles, so final-handle close defers backing-store
+    removal until the last waiter leaves. Provider Files reuse the I/O Manager FILE_OBJECT reference;
+    FAT Files/directories and writable-overlay Files reuse their filesystem-owned I/O references.
+    Internal debug events and win32k event bodies are already rooted in non-reused kernel/session
+    storage for their owner lifetime. Wait identities are never reconstructed from a closed handle
+    or redirected through a reused table slot.
+
+    Alertability is now part of the parked-wait record rather than only a pre-park poll. All three
+    user-APC producers reconcile through one wait path: an APC queued after an alertable object wait
+    began switches to the target's real hosted context, stages `KiUserApcDispatcher`, removes the
+    generation-exact waiter, releases its object references, and wakes its retained continuation.
+    The same context-switch helper replaces the duplicate synchronous-File APC staging sequence.
+    Making a permanent object temporary now drops only the permanent namespace reference; it no
+    longer unlinks a still handle-referenced body, and final close reclaims anonymous dispatcher
+    objects as well as named ones.
+
+    Focused validation passes `nt-process` `107/107`, `nt-kernel-exec` `168/168`, `nt-fs`
+    `119/119`, `nt-io-manager` `236/236`, `git diff --check`, and the freestanding executive at the
+    established 211-warning baseline. Release-build and serialized desktop acceptance remain the
+    final checks before this milestone is marked accepted.

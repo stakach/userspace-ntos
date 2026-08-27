@@ -3071,6 +3071,7 @@ impl ExecNtHandler {
         write_field!(thread_spawn_request, None);
         write_field!(remote_thread_request, None);
         write_field!(wait_park_event, -1);
+        write_field!(wait_alertable, false);
         write_field!(wait_timeout, PendingWaitTimeout::none());
         write_field!(keyed_wait_key, u64::MAX);
         write_field!(keyed_wait_timeout, PendingWaitTimeout::none());
@@ -9470,6 +9471,10 @@ impl ExecNtHandler {
         let tag = match kind {
             OBJ_KIND_DIRECTORY => DIRECTORY_OBJECT_HANDLE_TAG,
             OBJ_KIND_SYMBOLIC_LINK => SYMBOLIC_LINK_HANDLE_TAG,
+            OBJ_KIND_EVENT => EVENT_HANDLE_TAG,
+            OBJ_KIND_SEMAPHORE => SEMAPHORE_HANDLE_TAG,
+            OBJ_KIND_MUTANT => MUTANT_HANDLE_TAG,
+            OBJ_KIND_TIMER => TIMER_HANDLE_TAG,
             _ => return None,
         };
         Some(tag | index as u64)
@@ -11196,6 +11201,121 @@ impl ExecNtHandler {
         self.wait_object_ready_for(object, self.current_tid)
     }
 
+    fn retain_dispatcher_wait_reference(&mut self, index: usize) -> Result<(), u32> {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+
+        let Some(entry) = self.obj_ns.get(index) else {
+            // Internal dispatcher events (for example DEBUG_OBJECT.EventsPresent) are rooted by
+            // their kernel owner for that owner's lifetime and are never namespace-slot aliases.
+            return self
+                .events
+                .contains(index as u64)
+                .then_some(())
+                .ok_or(STATUS_INVALID_HANDLE);
+        };
+        let backing_exists = match entry.kind {
+            OBJ_KIND_EVENT | OBJ_KIND_TIMER => self.events.contains(index as u64),
+            OBJ_KIND_SEMAPHORE => self.semaphores.contains(index as u64),
+            OBJ_KIND_MUTANT => self.mutants.contains(index as u64),
+            _ => false,
+        };
+        if !entry.is_live() || !backing_exists {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        self.obj_ns[index].wait_references = self.obj_ns[index]
+            .wait_references
+            .checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        Ok(())
+    }
+
+    fn release_dispatcher_wait_reference(&mut self, index: usize) -> Result<(), u32> {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+
+        let Some(entry) = self.obj_ns.get(index) else {
+            return self
+                .events
+                .contains(index as u64)
+                .then_some(())
+                .ok_or(STATUS_INVALID_HANDLE);
+        };
+        if !entry.is_live() {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let references = entry
+            .wait_references
+            .checked_sub(1)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        let kind = entry.kind;
+        self.obj_ns[index].wait_references = references;
+        let final_handleless_reference = references == 0
+            && Self::object_namespace_handle_tag(kind, index).is_some_and(|tag| {
+                self.pm
+                    .handle_object_count(nt_process::HandleObject::Opaque(tag))
+                    == 0
+            });
+        if final_handleless_reference {
+            self.obj_delete_name_check(index);
+        }
+        Ok(())
+    }
+
+    /// Pin the exact object identity stored in a published wait record. Handle capture has already
+    /// enforced access; these owner-specific references only prevent destruction or slot reuse.
+    pub(crate) fn retain_wait_object_reference(&mut self, object: WaitObject) -> Result<(), u32> {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        match object.kind() {
+            WaitObject::KIND_DISPATCHER => {
+                self.retain_dispatcher_wait_reference(object.id() as usize)
+            }
+            WaitObject::KIND_PROCESS => self
+                .pm
+                .retain_process_wait_reference(object.id() as nt_process::ProcessId),
+            WaitObject::KIND_THREAD => self
+                .pm
+                .retain_thread_wait_reference(object.id() as nt_process::ThreadId),
+            // win32k event bodies live in its non-reclaiming session pool. Resolution produced the
+            // body immediately before this serialized park, so the pool allocation is the root.
+            WaitObject::KIND_WIN32K_EVENT if object.id() != 0 => Ok(()),
+            WaitObject::KIND_FILE => self.file_completion.retain_file(object.id()),
+            WaitObject::KIND_FAT_FILE => self.readonly_file_opens.retain_io(object.id() as u32),
+            WaitObject::KIND_FAT_DIRECTORY => self.directory_opens.retain_io(object.id() as u32),
+            WaitObject::KIND_OVERLAY_FILE => unsafe {
+                crate::writable_fs::retain_io_reference(object.id())
+            },
+            _ => Err(STATUS_INVALID_HANDLE),
+        }
+    }
+
+    pub(crate) fn release_wait_object_reference(&mut self, object: WaitObject) -> Result<(), u32> {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        match object.kind() {
+            WaitObject::KIND_DISPATCHER => {
+                self.release_dispatcher_wait_reference(object.id() as usize)
+            }
+            WaitObject::KIND_PROCESS => self
+                .pm
+                .release_process_wait_reference(object.id() as nt_process::ProcessId),
+            WaitObject::KIND_THREAD => self
+                .pm
+                .release_thread_wait_reference(object.id() as nt_process::ThreadId),
+            WaitObject::KIND_WIN32K_EVENT if object.id() != 0 => Ok(()),
+            WaitObject::KIND_FILE => {
+                let release = self.file_completion.release_file(object.id())?;
+                self.complete_file_reference_release(object.id(), release);
+                Ok(())
+            }
+            WaitObject::KIND_FAT_FILE => self.readonly_file_opens.release_io(object.id() as u32),
+            WaitObject::KIND_FAT_DIRECTORY => self.directory_opens.release_io(object.id() as u32),
+            WaitObject::KIND_OVERLAY_FILE => unsafe {
+                crate::writable_fs::release_io_reference(object.id())
+            },
+            _ => Err(STATUS_INVALID_HANDLE),
+        }
+    }
+
     pub(crate) fn wait_object_ready_for(&self, object: WaitObject, thread: u64) -> bool {
         match object.kind() {
             WaitObject::KIND_DISPATCHER => self.dispatcher_ready_for(object.id() as usize, thread),
@@ -11439,7 +11559,7 @@ impl ExecNtHandler {
                     print_str(b"\n");
                 }
                 let _ = unsafe {
-                    crate::service_sec_image::reconcile_user_apc_file_wait(self, target_tid as u64)
+                    crate::service_sec_image::reconcile_user_apc_waits(self, target_tid as u64)
                 };
                 nt_fs::STATUS_SUCCESS
             }
@@ -20042,16 +20162,15 @@ impl ExecNtHandler {
         };
         if !entry.is_live()
             || entry.permanent
-            || entry.name_len == 0
+            || entry.wait_references != 0
             || entry.parent == OBJ_PARENT_ROOT
-            || entry.parent == OBJ_PARENT_ANONYMOUS
         {
             return;
         }
         let kind = entry.kind;
         let mirrored_symbolic_link = kind == OBJ_KIND_SYMBOLIC_LINK && entry.payload != 0;
         let mut mirrored_path = [0u8; NAMED_OBJECT_PATH_CAP];
-        if mirrored_symbolic_link {
+        if mirrored_symbolic_link && entry.parent != OBJ_PARENT_ANONYMOUS {
             let Some(length) = self.object_namespace_path_exact(index, &mut mirrored_path) else {
                 return;
             };
@@ -20126,7 +20245,8 @@ impl ExecNtHandler {
             self.release_io_completion_reference(payload as u32);
             return 0;
         }
-        self.obj_delete_name_check(index);
+        // For ordinary objects, removing OBJ_PERMANENT drops only the namespace's permanent
+        // reference. The existing handle still owns the body; normal last-handle close deletes it.
         0
     }
     /// Normalize a caller's pipe path (`\Device\NamedPipe\ntsvcs`, `\??\pipe\ntsvcs`, `\??\PIPE\ntsvcs`,
@@ -23785,7 +23905,7 @@ impl ExecNtHandler {
                 }
                 if status == nt_fs::STATUS_SUCCESS {
                     let _ = unsafe {
-                        crate::service_sec_image::reconcile_user_apc_file_wait(self, apc_tid)
+                        crate::service_sec_image::reconcile_user_apc_waits(self, apc_tid)
                     };
                 }
             }
@@ -25222,7 +25342,7 @@ impl ExecNtHandler {
                         print_hex_u64(apc.routine);
                         print_str(b"\n");
                         let _ = unsafe {
-                            crate::service_sec_image::reconcile_user_apc_file_wait(
+                            crate::service_sec_image::reconcile_user_apc_waits(
                                 self,
                                 target_tid as u64,
                             )
@@ -30829,6 +30949,7 @@ impl ExecNtHandler {
                         }
                         // Unsignaled wait object → ask the loop to park this caller on it.
                         self.wait_park_event = object.raw() as i64;
+                        self.wait_alertable = alertable;
                         trace_wait_object(self, b"park", handle, object, timeout_ptr, 0x102);
                         print_str(b"[wait] pi=");
                         print_u64(self.pi as u64);

@@ -8960,6 +8960,7 @@ pub(crate) unsafe fn service_sec_image(
             let park_wait_indices = &mut *core::ptr::addr_of_mut!(PARK_WAIT_INDEX_WORK);
             let mut park_wait_set_n: usize = 0;
             let mut park_wait_set_all = false;
+            let mut park_wait_alertable = false;
             let mut park_wait_deadline: Option<u64> = None;
             let mut park_keyed_wait_key: u64 = u64::MAX;
             let mut park_keyed_wait_deadline: Option<u64> = None;
@@ -9071,6 +9072,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.exe_spawn_request = None;
                 nt_handler.thread_spawn_request = None;
                 nt_handler.wait_park_event = -1;
+                nt_handler.wait_alertable = false;
                 nt_handler.wait_timeout = PendingWaitTimeout::none();
                 nt_handler.keyed_wait_key = u64::MAX;
                 nt_handler.keyed_wait_timeout = PendingWaitTimeout::none();
@@ -9612,6 +9614,7 @@ pub(crate) unsafe fn service_sec_image(
                 // resume_ip/sp/flags are known).
                 if nt_handler.wait_park_event >= 0 {
                     park_wait_event = nt_handler.wait_park_event;
+                    park_wait_alertable = nt_handler.wait_alertable;
                     park_wait_deadline = nt_handler.wait_timeout.deadline_at_park();
                 }
                 if nt_handler.keyed_wait_key != u64::MAX {
@@ -10354,6 +10357,7 @@ pub(crate) unsafe fn service_sec_image(
                     } else if has_wait_object {
                         park_wait_set_n = nev;
                         park_wait_set_all = true;
+                        park_wait_alertable = alertable;
                         park_wait_deadline = finite_deadline;
                         result = 0;
                     } else {
@@ -10371,6 +10375,7 @@ pub(crate) unsafe fn service_sec_image(
                     } else if has_wait_object {
                         park_wait_set_n = nev;
                         park_wait_set_all = false;
+                        park_wait_alertable = alertable;
                         park_wait_deadline = finite_deadline;
                         result = 0;
                     } else {
@@ -15806,6 +15811,7 @@ pub(crate) unsafe fn service_sec_image(
                     .hosted_thread_tcb_for_role(pi, HostedThreadRole::WinlogonWorker { slot: 1 })
                     .is_some()
                 && WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) == 0;
+            let park_wait_tid = nt_handler.current_tid;
             if park_wait_event >= 0 && reply_main != 0 {
                 let park_object = match WaitObject::from_raw(park_wait_event as u64) {
                     Some(object) => object,
@@ -15819,9 +15825,11 @@ pub(crate) unsafe fn service_sec_image(
                 } else if park_wait_deadline.is_some() && !delay_timer_init() {
                     result = 0xC000_009A;
                 } else if wait_park(
+                    &mut nt_handler,
                     park_object,
+                    park_wait_alertable,
                     parked_syscall_reply,
-                    nt_handler.current_tid,
+                    park_wait_tid,
                     park_wait_deadline,
                 ) {
                     let current_tid = nt_handler.current_tid;
@@ -15868,11 +15876,13 @@ pub(crate) unsafe fn service_sec_image(
                 if park_wait_deadline.is_some() && !delay_timer_init() {
                     result = 0xC000_009A;
                 } else if wait_park_multi(
+                    &mut nt_handler,
                     &park_wait_set[..park_wait_set_n],
                     &park_wait_indices[..park_wait_set_n],
                     park_wait_set_all,
+                    park_wait_alertable,
                     parked_syscall_reply,
-                    nt_handler.current_tid,
+                    park_wait_tid,
                     park_wait_deadline,
                 ) {
                     let current_tid = nt_handler.current_tid;
@@ -19124,7 +19134,9 @@ pub(crate) unsafe fn service_sec_image(
                         && wait_status == 0x102
                         && park_index >= 0
                         && wait_park(
+                            &mut nt_handler,
                             WaitObject::dispatcher(park_index as usize),
+                            false,
                             w_reply,
                             0xD1D1_0001,
                             None,
@@ -22688,23 +22700,20 @@ unsafe fn lsa_deliver_reply(nt_handler: &mut ExecNtHandler, replymsg: u64) -> bo
     true
 }
 
-/// Redirect one alertable pre-dispatch File acquisition waiter when its target
-/// thread has a queued user APC.
-unsafe fn reconcile_user_apc_file_acquisition_wait(
+/// Temporarily select a parked hosted thread's address-space mirrors and stage one queued user APC
+/// in its saved user context. The service loop is serialized, so restoring this complete context
+/// before publishing the wake keeps the current caller isolated from the target.
+unsafe fn stage_parked_thread_user_apc(
     nt_handler: &mut ExecNtHandler,
+    pi: usize,
+    badge: u64,
     tid: u64,
+    resume_ip: u64,
+    resume_sp: u64,
+    resume_flags: u64,
 ) -> bool {
     const STATUS_USER_APC: u32 = 0x0000_00C0;
-
-    let Some((slot, waiter)) =
-        (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).alertable_waiting_for_thread(tid)
-    else {
-        return false;
-    };
-    let Ok(target_tid) = nt_process::ThreadId::try_from(tid) else {
-        return false;
-    };
-    if nt_handler.pm.peek_user_apc(target_tid).is_none() || waiter.pi as usize >= MAX_PI {
+    if pi >= MAX_PI {
         return false;
     }
 
@@ -22724,22 +22733,21 @@ unsafe fn reconcile_user_apc_file_acquisition_wait(
     let saved_flags = nt_handler.current_flags;
     let saved_ctx = nt_handler.loop_ctx.take();
 
-    let target_pi = waiter.pi as usize;
-    let (sb, ss, smv, hmv, imv, scratch_base) = mirror_ctx_for(waiter.badge, target_pi);
+    let (sb, ss, smv, hmv, imv, scratch_base) = mirror_ctx_for(badge, pi);
     ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
     ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
     ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
     ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
     ACTIVE_IMAGE_MIRROR.store(imv, Ordering::Relaxed);
-    ACTIVE_CLIENT_PI.store(waiter.pi as u64, Ordering::Relaxed);
+    ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
     ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
-    W32_CLIENT_PI.store(waiter.pi as u64, Ordering::Relaxed);
-    nt_handler.pi = target_pi;
-    nt_handler.current_tid = waiter.tid;
-    nt_handler.current_badge = waiter.badge;
-    nt_handler.current_resume_ip = waiter.resume_ip;
-    nt_handler.current_sp = waiter.resume_sp;
-    nt_handler.current_flags = waiter.resume_flags;
+    W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
+    nt_handler.pi = pi;
+    nt_handler.current_tid = tid;
+    nt_handler.current_badge = badge;
+    nt_handler.current_resume_ip = resume_ip;
+    nt_handler.current_sp = resume_sp;
+    nt_handler.current_flags = resume_flags;
 
     let staged = nt_handler.stage_current_user_apc(STATUS_USER_APC) == Ok(true);
 
@@ -22758,8 +22766,67 @@ unsafe fn reconcile_user_apc_file_acquisition_wait(
     nt_handler.current_sp = saved_sp;
     nt_handler.current_flags = saved_flags;
     nt_handler.loop_ctx = saved_ctx;
+    staged
+}
 
-    if !staged {
+/// Interrupt one exact alertable dispatcher-object wait after an APC is queued to its owner.
+unsafe fn reconcile_user_apc_object_wait(nt_handler: &mut ExecNtHandler, tid: u64) -> bool {
+    let Some((slot, record)) = object_waiter_alertable_for_tid(tid) else {
+        return false;
+    };
+    let Ok(target_tid) = nt_process::ThreadId::try_from(tid) else {
+        return false;
+    };
+    if nt_handler.pm.peek_user_apc(target_tid).is_none()
+        || !stage_parked_thread_user_apc(
+            nt_handler,
+            record.pi,
+            record.badge,
+            record.tid,
+            record.resume_ip,
+            record.resume_sp,
+            record.resume_flags,
+        )
+    {
+        return false;
+    }
+
+    let removed = object_waiter_take_exact(slot, record.tid, record.reply_cap)
+        .expect("staged object-wait APC lost its exact waiter");
+    release_wait_object_references(nt_handler, removed);
+    let _ = client_reply_on(removed.reply_cap, 0, 0, 0, 0, 0);
+    release_reply_pool_cap(removed.reply_cap);
+    thread_wait_state_clear_badge_ready(nt_handler, removed.badge);
+    bump_progress();
+    true
+}
+
+/// Redirect one alertable pre-dispatch File acquisition waiter when its target
+/// thread has a queued user APC.
+unsafe fn reconcile_user_apc_file_acquisition_wait(
+    nt_handler: &mut ExecNtHandler,
+    tid: u64,
+) -> bool {
+    let Some((slot, waiter)) =
+        (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).alertable_waiting_for_thread(tid)
+    else {
+        return false;
+    };
+    let Ok(target_tid) = nt_process::ThreadId::try_from(tid) else {
+        return false;
+    };
+    if nt_handler.pm.peek_user_apc(target_tid).is_none() {
+        return false;
+    }
+    if !stage_parked_thread_user_apc(
+        nt_handler,
+        waiter.pi as usize,
+        waiter.badge,
+        waiter.tid,
+        waiter.resume_ip,
+        waiter.resume_sp,
+        waiter.resume_flags,
+    ) {
         return false;
     }
 
@@ -22851,6 +22918,17 @@ pub(crate) unsafe fn reconcile_user_apc_file_wait(
             false
         }
     }
+}
+
+/// Reconcile every alertable wait class that can own a hosted thread continuation. Object waits
+/// are removed immediately; in-flight File I/O first requests cancellation and stays owned until
+/// its real terminal completion wins the race.
+pub(crate) unsafe fn reconcile_user_apc_waits(
+    nt_handler: &mut ExecNtHandler,
+    tid: u64,
+) -> bool {
+    reconcile_user_apc_object_wait(nt_handler, tid)
+        || reconcile_user_apc_file_wait(nt_handler, tid)
 }
 
 /// Transfer one general File syscall into its exact pending-IRP delivery owner. Synchronous
