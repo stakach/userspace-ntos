@@ -14658,3 +14658,41 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     full namespace/accounting semantics; otherwise retain an explicit filesystem failure and the
     provider's real `IRP_MJ_SET_INFORMATION` route. Do not turn a valid class number into success
     when the mounted filesystem has not implemented the facility.
+
+    Move-cluster provider boundary and optional set-facility audit (2026-08-27, accepted): class 31
+    is no longer flattened into rename/link's Boolean `ReplaceIfExists`. The I/O Manager carries a
+    typed set-information control value, validates the exact class/control pairing, and preserves
+    `ClusterCount` across synchronous and pending provider dispatch. For an absolute or
+    root-relative target, the executive performs the same NT5 target-parent CREATE transaction used
+    by rename and hard-link operations, retains the resulting canonical provider `FILE_OBJECT`, and
+    supplies it with the source SET IRP. A relative target with no root handle continues directly to
+    the FSD with a null target File, matching the native boundary. The hosted receiver reconstructs
+    the exact x64 WDM SetFile union at stack offset `0x20`; the cross-component I/O ABI is now
+    version 8 and rejects stale or class-incompatible control values.
+
+    `nt-fs` owns the native x64 `FILE_MOVE_CLUSTER_INFORMATION` parser, including the separate
+    cluster count, root handle, filename length, and UTF-16 path. MemFs does not claim a physical
+    cluster-placement facility, so class 31 reaches the filesystem and returns
+    `STATUS_INVALID_PARAMETER` without mutation. The same explicit local result now applies to the
+    valid but unimplemented object-ID, quota, and tracking set classes 29, 32, and 36. Provider-backed
+    Files retain their real `IRP_MJ_SET_INFORMATION` route. No internal file index is promoted to an
+    object ID, no empty quota ledger is reported as success, and no tracking or placement result is
+    fabricated in the executive.
+
+    Focused validation passes `nt-io-abi` `6/6`, `nt-fs` `99/99`, `nt-io-manager` `214/214`,
+    `git diff --check`, and the freestanding executive at the established 211-warning baseline.
+    Serialized acceptance `.tmp/run-headless-move-cluster-20260827.log` reached quiescence at
+    113,069 ms, launched genuine userinit and Explorer, completed 668 Explorer api0 redirects with
+    zero callback failures, painted `480000/480000` framebuffer pixels with at least 32 colours,
+    passed all `295/295` gates, and matched the sentinel. Snapshot generation 5 committed the
+    version-6 payload at 1,755,646 bytes; scratch returned to zero and the resource census reported
+    no frame, mapping, registry, retype, or allocator failures.
+
+    Review adjustment: the `NtQueryInformationFile`/`NtSetInformationFile` class inventory is closed
+    at the I/O Manager boundary. Optional filesystem facilities remain explicit capabilities, not
+    kernel emulation. The next File-system surface audit is the dedicated native quota API
+    (`NtQueryQuotaInformationFile` and `NtSetQuotaInformationFile`), which does not use
+    `FILE_INFORMATION_CLASS`. First inventory ntdll exports and the native service table, then add
+    the I/O Manager capture, access, restart-scan, SID-list, and completion contracts. Route
+    provider-backed volumes through quota IRPs and keep a local filesystem's absence explicit until
+    it owns a persistent quota ledger and enforcement policy.
