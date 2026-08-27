@@ -43,7 +43,28 @@ use crate::*;
 /// Boot hive source files stay on the FAT volume until the Configuration Manager flushes a live
 /// mutable hive checkpoint into the writable layer. EventLog's `AppEvent.Evt`/`SecEvent.Evt`/
 /// `SysEvent.Evt` files are the first real users.
-pub(crate) const WRITABLE_PREFIXES: &[&[u8]] = &[b"profiles", b"reactos\\system32\\config"];
+///
+/// `reactos\bootstat.dat` is an exact installed mutable file. ReactOS RTL opens, reads, writes and
+/// flushes it through ordinary file syscalls; it has no executive-private backing object.
+pub(crate) const WRITABLE_PREFIXES: &[&[u8]] = &[
+    b"profiles",
+    b"reactos\\system32\\config",
+    b"reactos\\bootstat.dat",
+];
+
+const BOOT_STATUS_PATH: &str = r"\??\C:\ReactOS\bootstat.dat";
+const BOOT_STATUS_VOLUME_RELATIVE: &[u8] = b"reactos\\bootstat.dat";
+const BOOT_STATUS_DATA_SIZE: usize = 0x88;
+
+fn initial_boot_status_data() -> [u8; BOOT_STATUS_DATA_SIZE] {
+    let mut data = [0u8; BOOT_STATUS_DATA_SIZE];
+    data[0..4].copy_from_slice(&(BOOT_STATUS_DATA_SIZE as u32).to_le_bytes());
+    data[4..8].copy_from_slice(&1u32.to_le_bytes()); // NtProductWinNt
+    data[8] = 1; // AabEnabled
+    data[9] = 30; // AabTimeout
+    data[10] = 1; // LastBootSucceeded
+    data
+}
 
 /// ★ BYPASS SWITCH (the batch's control experiment). `false` unmounts the writable volume: every
 /// path below fails as `STATUS_DEVICE_NOT_READY`, `CreateDirectoryW` fails again, and the overlay
@@ -975,6 +996,12 @@ unsafe fn provision_missing_installed_sources(fs: &mut nt_fs::FileSystem) -> boo
         changed |= fs.node_count() != before;
     } else {
         refresh_restored_config_proofs(fs);
+    }
+    if fs
+        .query_attributes_relative(BOOT_STATUS_VOLUME_RELATIVE)
+        .is_none()
+    {
+        changed |= fs.provision_file(BOOT_STATUS_PATH, &initial_boot_status_data());
     }
     changed
 }

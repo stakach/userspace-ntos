@@ -14299,3 +14299,35 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     have exactly one explicit filesystem/provider owner, one open-description lifetime, and one
     metadata/name source. Remove the special executive data path when an ordinary local filesystem
     File can own it; do not preserve a compatibility handle variant or a second data store.
+
+    Boot-status filesystem ownership (2026-08-27, accepted): `\SystemRoot\bootstat.dat` is now an
+    ordinary writable-volume File. The writable mount provisions the missing installed file once
+    with ReactOS RTL's 0x88-byte `RTL_BSD_DATA` initial image and preserves an existing snapshot
+    copy unchanged. ReactOS RTL/SMSS then reaches it through the same `NtOpenFile`, `NtReadFile`,
+    `NtWriteFile`, `NtFlushBuffersFile`, query/set-information, duplicate, and close paths as every
+    other local mutable file.
+
+    The executive-private 0x800-byte static array, initialization latch, fabricated pointer file
+    identity, parallel timestamp atomics, pathname interception, custom disposition logic,
+    BootStatus handle variant, and dedicated read/write/flush/query branches are deleted. The
+    filesystem now owns the file node, open description, current position, share state, access-time
+    changes, namespace identity, contents, and persistence. This matches the ReactOS boundary:
+    setup/RTL defines the installed file contents, while the kernel supplies ordinary File and
+    filesystem mechanics.
+
+    Focused validation passes `nt-process` `106/106`; the freestanding executive remains at the
+    established 211-warning baseline. Serialized acceptance
+    `.tmp/run-headless-bootstatus-overlay-20260827.log` mounted all three writable paths, committed
+    five real volume generations, launched genuine userinit and Explorer, completed 668 Explorer
+    api0 redirects with zero callback failures, painted `480000/480000` framebuffer pixels with at
+    least 32 colours, passed all `295/295` gates, and matched the sentinel. Scratch returned to zero
+    after its unchanged 278,112-byte peak; final allocated durable state was 14,919,064 bytes with
+    6,052,328 bytes reusable and zero allocator corruption.
+
+    Review adjustment: the BootStatus special provider is closed and no compatibility path remains.
+    Next audit the local fixed-drive copy-up/open transaction. An installed FAT file must remain
+    read-only until a mutation requires one exact writable-volume copy; every successful mutating
+    open must publish one MemFs File/open description with the source bytes and metadata transferred
+    before the caller can observe it. Remove any second lookup, duplicate handle publication,
+    path-specific materialization, or partial-copy success path found during that audit. Then resume
+    the remaining file query/set information-class inventory.

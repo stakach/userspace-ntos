@@ -711,10 +711,6 @@ static NT_WAIT_FOR_DEBUG_EVENT_SERVICE_ENTRY: ExecServiceHandler =
 #[used]
 static NT_QUERY_ATTRIBUTES_FILE_SERVICE_ENTRY: ExecServiceHandler =
     exec_nt_query_attributes_file_service_entry;
-const EXEC_BOOT_STATUS_FILE_SIZE: usize = 0x800;
-const EXEC_BSD_DATA_SIZE: usize = 0x88;
-const EXEC_BOOT_STATUS_PATH: &[u8] = b"\\systemroot\\bootstat.dat";
-const EXEC_BOOT_STATUS_VOLUME_PATH: &[u8] = b"reactos\\bootstat.dat";
 const SETUP_UNATTEND_PATH: &[u8] = b"reactos\\unattend.inf";
 const NT_DEFAULT_LOCALE_ID: u32 = 0x0409;
 const NT_BOGUS_LOCALE_ID: u32 = 0xffff_0000;
@@ -731,14 +727,6 @@ static CM_REGISTRY_BOOT_FLAG: AtomicU32 = AtomicU32::new(u32::MAX);
 static CM_REGISTRY_BOOT_SETUP: AtomicBool = AtomicBool::new(false);
 static CM_REGISTRY_BOOT_ACCEPTED: AtomicBool = AtomicBool::new(false);
 static CM_REGISTRY_LAZY_FLUSH_ENABLED: AtomicBool = AtomicBool::new(false);
-static EXEC_BOOT_STATUS_INITIALIZED: AtomicBool = AtomicBool::new(false);
-static EXEC_BOOT_STATUS_CREATION_TIME: AtomicU64 = AtomicU64::new(0);
-static EXEC_BOOT_STATUS_LAST_ACCESS_TIME: AtomicU64 = AtomicU64::new(0);
-static EXEC_BOOT_STATUS_LAST_WRITE_TIME: AtomicU64 = AtomicU64::new(0);
-static EXEC_BOOT_STATUS_CHANGE_TIME: AtomicU64 = AtomicU64::new(0);
-static mut EXEC_BOOT_STATUS_DATA: [u8; EXEC_BOOT_STATUS_FILE_SIZE] =
-    [0; EXEC_BOOT_STATUS_FILE_SIZE];
-
 fn print_sanitized_ascii(bytes: &[u8], limit: usize) {
     for &byte in bytes.iter().take(limit) {
         debug_put_char(if (0x20..0x7f).contains(&byte) {
@@ -961,7 +949,6 @@ fn trace_handle_object_for(nt: &ExecNtHandler, handle: u64) {
         }
         Some(nt_process::HandleObject::DiskFile { .. }) => print_str(b"disk-file"),
         Some(nt_process::HandleObject::Directory { .. }) => print_str(b"directory"),
-        Some(nt_process::HandleObject::BootStatusFile { .. }) => print_str(b"boot-status"),
         Some(nt_process::HandleObject::IoCompletion(_)) => print_str(b"io-completion"),
         Some(nt_process::HandleObject::RegistryKey(_)) => print_str(b"registry-key"),
         Some(nt_process::HandleObject::Process(_)) => print_str(b"process"),
@@ -2352,19 +2339,6 @@ fn native_basic_system_information() -> nt_syscall::system_information::SystemBa
     }
 }
 
-#[inline]
-fn boot_status_data_ptr() -> *mut u8 {
-    core::ptr::addr_of_mut!(EXEC_BOOT_STATUS_DATA) as *mut u8
-}
-
-fn boot_status_path_matches(name: &[u16]) -> bool {
-    name.len() == EXEC_BOOT_STATUS_PATH.len()
-        && name
-            .iter()
-            .zip(EXEC_BOOT_STATUS_PATH.iter())
-            .all(|(&wide, &ascii)| wide <= 0x7F && (wide as u8).to_ascii_lowercase() == ascii)
-}
-
 fn ascii_volume_relative_name(path: &[u8]) -> Result<alloc::vec::Vec<u16>, u32> {
     if path.iter().any(|byte| !byte.is_ascii()) {
         return Err(nt_fs::STATUS_OBJECT_NAME_INVALID);
@@ -2390,32 +2364,6 @@ fn utf16_file_name(name: &str) -> Result<alloc::vec::Vec<u16>, u32> {
 struct LocalFileQueryState {
     metadata: nt_fs::QueryMetadata,
     opened_name: Option<alloc::vec::Vec<u16>>,
-}
-
-unsafe fn reset_boot_status_data() {
-    let data = boot_status_data_ptr();
-    // SAFETY: the boot-status array is executive-lifetime storage.
-    unsafe {
-        core::ptr::write_bytes(data, 0, EXEC_BOOT_STATUS_FILE_SIZE);
-        core::ptr::write_unaligned(data.add(0x00) as *mut u32, EXEC_BSD_DATA_SIZE as u32);
-        core::ptr::write_unaligned(data.add(0x04) as *mut u32, 1); // NtProductWinNt
-        *data.add(0x08) = 1; // AabEnabled
-        *data.add(0x09) = 30; // AabTimeout
-        *data.add(0x0A) = 1; // LastBootSucceeded
-    }
-    let now = nt_system_time_100ns();
-    EXEC_BOOT_STATUS_CREATION_TIME.store(now, Ordering::Release);
-    EXEC_BOOT_STATUS_LAST_ACCESS_TIME.store(now, Ordering::Release);
-    EXEC_BOOT_STATUS_LAST_WRITE_TIME.store(now, Ordering::Release);
-    EXEC_BOOT_STATUS_CHANGE_TIME.store(now, Ordering::Release);
-    EXEC_BOOT_STATUS_INITIALIZED.store(true, Ordering::Release);
-}
-
-unsafe fn ensure_boot_status_data() {
-    if !EXEC_BOOT_STATUS_INITIALIZED.load(Ordering::Acquire) {
-        // SAFETY: repeated reset races are benign in the single-executive boot path.
-        unsafe { reset_boot_status_data() };
-    }
 }
 
 fn seed_time_zone(
@@ -10101,157 +10049,11 @@ impl ExecNtHandler {
             nt_process::HandleObject::File(_)
             | nt_process::HandleObject::RoutedFile { .. }
             | nt_process::HandleObject::DiskFile { .. }
-            | nt_process::HandleObject::Directory { .. }
-            | nt_process::HandleObject::BootStatusFile { .. } => {
+            | nt_process::HandleObject::Directory { .. } => {
                 Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST)
             }
             _ => Err(STATUS_OBJECT_TYPE_MISMATCH),
         }
-    }
-
-    /// Mint a process-local handle for the executive-reserved boot-status file.
-    pub(crate) fn mint_boot_status_handle(
-        &mut self,
-        access: u32,
-        create_options: u32,
-    ) -> Option<u64> {
-        let pid = self.pm_pid_for_pi(self.pi)?;
-        let handle = self
-            .insert_process_handle(
-                pid,
-                nt_process::HandleObject::BootStatusFile { create_options },
-                access,
-            )
-            .ok()?;
-        Some(handle as u64)
-    }
-
-    fn boot_status_handle_access(&self, handle: u64) -> Result<u32, u32> {
-        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
-        let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
-        match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
-            Some(nt_process::HandleObject::BootStatusFile { .. }) => self
-                .pm
-                .handle_access(pid, handle as nt_process::Handle)
-                .ok_or(STATUS_INVALID_HANDLE),
-            _ => Err(STATUS_INVALID_HANDLE),
-        }
-    }
-
-    fn boot_status_file_metadata() -> nt_fs::FileMetadata {
-        nt_fs::FileMetadata {
-            creation_time: EXEC_BOOT_STATUS_CREATION_TIME.load(Ordering::Acquire),
-            last_access_time: EXEC_BOOT_STATUS_LAST_ACCESS_TIME.load(Ordering::Acquire),
-            last_write_time: EXEC_BOOT_STATUS_LAST_WRITE_TIME.load(Ordering::Acquire),
-            change_time: EXEC_BOOT_STATUS_CHANGE_TIME.load(Ordering::Acquire),
-            allocation_size: EXEC_BOOT_STATUS_FILE_SIZE as u64,
-            end_of_file: EXEC_BOOT_STATUS_FILE_SIZE as u64,
-            file_id: boot_status_data_ptr() as u64,
-            attributes: nt_fs::FILE_ATTRIBUTE_ARCHIVE,
-            reparse_tag: 0,
-            number_of_links: 1,
-            delete_pending: false,
-            is_directory: false,
-        }
-    }
-
-    fn boot_status_check_access(&self, handle: u64, wanted: u32, generic: u32) -> Result<(), u32> {
-        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
-        const GENERIC_ALL: u32 = 0x1000_0000;
-        let access = self.boot_status_handle_access(handle)?;
-        if access & (wanted | generic | GENERIC_ALL) == 0 {
-            return Err(STATUS_ACCESS_DENIED);
-        }
-        Ok(())
-    }
-
-    unsafe fn boot_status_offset(&self, byte_offset: u64) -> Result<usize, u32> {
-        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        if byte_offset == 0 {
-            return Ok(0);
-        }
-        let mut raw = [0u8; 8];
-        if !self.xas_read(byte_offset, &mut raw) {
-            return Err(STATUS_ACCESS_VIOLATION);
-        }
-        let signed = i64::from_le_bytes(raw);
-        if signed < 0 || signed as usize > EXEC_BOOT_STATUS_FILE_SIZE {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        Ok(signed as usize)
-    }
-
-    unsafe fn boot_status_read_file(
-        &self,
-        handle: u64,
-        buffer: u64,
-        len: usize,
-        byte_offset: u64,
-    ) -> Result<u64, u32> {
-        const FILE_READ_DATA: u32 = 0x0000_0001;
-        const GENERIC_READ: u32 = 0x8000_0000;
-        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-        self.boot_status_check_access(handle, FILE_READ_DATA, GENERIC_READ)?;
-        if len != 0 && buffer == 0 {
-            return Err(STATUS_ACCESS_VIOLATION);
-        }
-        // SAFETY: reads the caller-supplied LARGE_INTEGER, if present.
-        let offset = unsafe { self.boot_status_offset(byte_offset)? };
-        let available = EXEC_BOOT_STATUS_FILE_SIZE.saturating_sub(offset);
-        let copy_len = len.min(available);
-        // SAFETY: initializes and reads from executive-lifetime boot-status storage.
-        unsafe {
-            ensure_boot_status_data();
-            if copy_len != 0 {
-                let src = core::slice::from_raw_parts(boot_status_data_ptr().add(offset), copy_len);
-                self.xas_write_buf(buffer, src);
-            }
-        }
-        EXEC_BOOT_STATUS_LAST_ACCESS_TIME.store(nt_system_time_100ns(), Ordering::Release);
-        Ok(copy_len as u64)
-    }
-
-    unsafe fn boot_status_write_file(
-        &self,
-        handle: u64,
-        buffer: u64,
-        len: usize,
-        byte_offset: u64,
-    ) -> Result<u64, u32> {
-        const FILE_WRITE_DATA: u32 = 0x0000_0002;
-        const FILE_APPEND_DATA: u32 = 0x0000_0004;
-        const GENERIC_WRITE: u32 = 0x4000_0000;
-        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-        self.boot_status_check_access(handle, FILE_WRITE_DATA | FILE_APPEND_DATA, GENERIC_WRITE)?;
-        if len != 0 && buffer == 0 {
-            return Err(STATUS_ACCESS_VIOLATION);
-        }
-        // SAFETY: reads the caller-supplied LARGE_INTEGER, if present.
-        let offset = unsafe { self.boot_status_offset(byte_offset)? };
-        let available = EXEC_BOOT_STATUS_FILE_SIZE.saturating_sub(offset);
-        let copy_len = len.min(available);
-        let mut payload = alloc::vec![0u8; copy_len];
-        if copy_len != 0 && !self.xas_read(buffer, &mut payload) {
-            return Err(STATUS_ACCESS_VIOLATION);
-        }
-        // SAFETY: initializes and writes into executive-lifetime boot-status storage.
-        unsafe {
-            ensure_boot_status_data();
-            if copy_len != 0 {
-                core::ptr::copy_nonoverlapping(
-                    payload.as_ptr(),
-                    boot_status_data_ptr().add(offset),
-                    copy_len,
-                );
-            }
-        }
-        if copy_len != 0 {
-            let now = nt_system_time_100ns();
-            EXEC_BOOT_STATUS_LAST_WRITE_TIME.store(now, Ordering::Release);
-            EXEC_BOOT_STATUS_CHANGE_TIME.store(now, Ordering::Release);
-        }
-        Ok(copy_len as u64)
     }
 
     /// Mint a process-local event handle that references a shared executive event identity.
@@ -11630,8 +11432,7 @@ impl ExecNtHandler {
             }
             Some(nt_process::HandleObject::DiskFile { .. })
             | Some(nt_process::HandleObject::Directory { .. })
-            | Some(nt_process::HandleObject::OverlayFile(_))
-            | Some(nt_process::HandleObject::BootStatusFile { .. }) => Ok(None),
+            | Some(nt_process::HandleObject::OverlayFile(_)) => Ok(None),
             Some(_) => Err(STATUS_OBJECT_TYPE_MISMATCH),
             None => Err(STATUS_INVALID_HANDLE),
         }
@@ -11689,8 +11490,7 @@ impl ExecNtHandler {
             {
                 Some(nt_process::HandleObject::DiskFile { .. })
                 | Some(nt_process::HandleObject::Directory { .. })
-                | Some(nt_process::HandleObject::OverlayFile(_))
-                | Some(nt_process::HandleObject::BootStatusFile { .. }) => {
+                | Some(nt_process::HandleObject::OverlayFile(_)) => {
                     self.write_current_iosb(iosb, STATUS_INVALID_DEVICE_REQUEST, 0);
                     return STATUS_INVALID_DEVICE_REQUEST;
                 }
@@ -14336,8 +14136,7 @@ impl ExecNtHandler {
                 | nt_process::HandleObject::RoutedFile { .. }
                 | nt_process::HandleObject::DiskFile { .. }
                 | nt_process::HandleObject::Directory { .. }
-                | nt_process::HandleObject::OverlayFile(_)
-                | nt_process::HandleObject::BootStatusFile { .. } => b"File",
+                | nt_process::HandleObject::OverlayFile(_) => b"File",
                 nt_process::HandleObject::IoCompletion(_) => b"IoCompletion",
                 nt_process::HandleObject::RegistryKey(_) => b"Key",
                 nt_process::HandleObject::Token(_) | nt_process::HandleObject::TokenObject(_) => {
@@ -18826,8 +18625,7 @@ impl ExecNtHandler {
                 };
                 Ok(FileParseRoot::HostedFile { file_id, device_id })
             }
-            nt_process::HandleObject::DiskFile { .. }
-            | nt_process::HandleObject::BootStatusFile { .. } => Ok(FileParseRoot::NonDirectoryFile),
+            nt_process::HandleObject::DiskFile { .. } => Ok(FileParseRoot::NonDirectoryFile),
             _ => Err(STATUS_INVALID_HANDLE),
         }
     }
@@ -20438,10 +20236,6 @@ impl ExecNtHandler {
             nt_process::HandleObject::OverlayFile(file_id) => {
                 (crate::writable_fs::file_mode(file_id).ok_or(nt_fs::STATUS_INVALID_HANDLE)?, 0)
             }
-            nt_process::HandleObject::BootStatusFile { create_options } => (
-                nt_fs::file_mode_from_create_options(create_options),
-                0,
-            ),
             _ => return Err(0xC000_0024), // STATUS_OBJECT_TYPE_MISMATCH
         };
         Ok(nt_fs::QueryMetadata {
@@ -20512,15 +20306,6 @@ impl ExecNtHandler {
                     None
                 };
                 (metadata, offset, name)
-            }
-            nt_process::HandleObject::BootStatusFile { .. } => {
-                ensure_boot_status_data();
-                let name = if include_opened_name {
-                    Some(ascii_volume_relative_name(EXEC_BOOT_STATUS_VOLUME_PATH)?)
-                } else {
-                    None
-                };
-                (Self::boot_status_file_metadata(), 0, name)
             }
             nt_process::HandleObject::File(_)
             | nt_process::HandleObject::RoutedFile { .. } => {
@@ -22506,46 +22291,6 @@ impl ExecNtHandler {
                 &nb[..nlen],
             );
             return status;
-        }
-        {
-            if boot_status_path_matches(name16) {
-                let mut status = nt_fs::STATUS_SUCCESS;
-                let mut opened_handle = None;
-                if open_options & nt_fs::FILE_DIRECTORY_FILE != 0 {
-                    status = nt_fs::STATUS_OBJECT_NAME_COLLISION;
-                } else {
-                    ensure_boot_status_data();
-                    opened_handle = self.mint_boot_status_handle(desired_access, open_options);
-                    if opened_handle.is_none() {
-                        status = 0xC000_009A;
-                    }
-                }
-                if let Some(handle) = opened_handle {
-                    self.queue_write(file_handle_out, handle);
-                } else {
-                    self.write_nt_open_file_handle_out(file_handle_out, 0);
-                }
-                let iosb = args[3];
-                if iosb != 0 {
-                    self.xas_write_buf(iosb, &status.to_le_bytes());
-                    let info = if status == nt_fs::STATUS_SUCCESS {
-                        nt_fs::FILE_OPENED as u64
-                    } else {
-                        0
-                    };
-                    self.xas_write_buf(iosb + 8, &info.to_le_bytes());
-                }
-                loader_trace_record(
-                    self.pi,
-                    LoaderOp::OpenFile,
-                    status,
-                    None,
-                    0,
-                    opened_handle.unwrap_or(0),
-                    &nb[..nlen],
-                );
-                return status;
-            }
         }
         // Named-pipe root and endpoint opens both cross the canonical NPFS CREATE boundary. The root
         // path opens a real RootDcb FILE_OBJECT; a leaf path connects to its FCB endpoint.
@@ -29411,7 +29156,6 @@ impl ExecNtHandler {
                                 | nt_process::HandleObject::File(_)
                                 | nt_process::HandleObject::RoutedFile { .. }
                                 | nt_process::HandleObject::OverlayFile(_)
-                                | nt_process::HandleObject::BootStatusFile { .. }
                                 | nt_process::HandleObject::Opaque(_)
                         )
                     );
@@ -30829,52 +30573,7 @@ impl ExecNtHandler {
                 });
                 let mut writable_folded = [0u8; FILE_OBJECT_NAME_CAP];
                 let mut writable_relative = [0u8; FILE_VOLUME_RELATIVE_CAP];
-                if boot_status_path_matches(name16) {
-                    if create_options & nt_fs::FILE_DIRECTORY_FILE != 0 {
-                        status = nt_fs::STATUS_OBJECT_NAME_COLLISION;
-                    } else if let Some(handle) =
-                        self.mint_boot_status_handle(desired_access, create_options)
-                    {
-                        let disposition = create_disposition;
-                        status = nt_fs::STATUS_SUCCESS;
-                        info = match disposition {
-                            nt_fs::FILE_SUPERSEDE => {
-                                reset_boot_status_data();
-                                nt_fs::FILE_SUPERSEDED as u64
-                            }
-                            nt_fs::FILE_OPEN => {
-                                ensure_boot_status_data();
-                                nt_fs::FILE_OPENED as u64
-                            }
-                            nt_fs::FILE_CREATE => {
-                                reset_boot_status_data();
-                                nt_fs::FILE_CREATED as u64
-                            }
-                            nt_fs::FILE_OPEN_IF => {
-                                let existed = EXEC_BOOT_STATUS_INITIALIZED.load(Ordering::Acquire);
-                                ensure_boot_status_data();
-                                if existed {
-                                    nt_fs::FILE_OPENED as u64
-                                } else {
-                                    nt_fs::FILE_CREATED as u64
-                                }
-                            }
-                            nt_fs::FILE_OVERWRITE | nt_fs::FILE_OVERWRITE_IF => {
-                                reset_boot_status_data();
-                                nt_fs::FILE_OVERWRITTEN as u64
-                            }
-                            _ => {
-                                status = nt_fs::STATUS_INVALID_PARAMETER;
-                                0
-                            }
-                        };
-                        if status == nt_fs::STATUS_SUCCESS {
-                            self.queue_write(file_handle_out, handle);
-                        }
-                    } else {
-                        status = 0xC000_009A;
-                    }
-                } else if Self::is_named_pipe_root_path(name16) {
+                if Self::is_named_pipe_root_path(name16) {
                     if create_disposition != nt_fs::FILE_OPEN {
                         status = nt_fs::STATUS_INVALID_PARAMETER;
                     } else {
@@ -31386,16 +31085,7 @@ impl ExecNtHandler {
                         Err(event_status) => event_status,
                         Ok(event_index) => {
                             completion_event_index = event_index;
-                            if self.boot_status_handle_access(fh).is_ok() {
-                                operation_started = true;
-                                match self.boot_status_write_file(fh, buffer, len, byte_offset) {
-                                    Ok(written) => {
-                                        information = written;
-                                        nt_fs::STATUS_SUCCESS
-                                    }
-                                    Err(status) => status,
-                                }
-                            } else if let Some(file_id) = overlay_file {
+                            if let Some(file_id) = overlay_file {
                                 operation_started = true;
                                 // ★ THE WRITABLE FILESYSTEM OVERLAY: a real write of the caller's real bytes.
                                 // `ByteOffset == NULL` (or the FILE_USE_FILE_POINTER_POSITION sentinel) uses and
@@ -31855,15 +31545,6 @@ impl ExecNtHandler {
                                         information = read as u64;
                                         status
                                     }
-                                }
-                            } else if self.boot_status_handle_access(fh).is_ok() {
-                                operation_started = true;
-                                match self.boot_status_read_file(fh, buffer, len, byte_offset) {
-                                    Ok(read) => {
-                                        information = read;
-                                        nt_fs::STATUS_SUCCESS
-                                    }
-                                    Err(status) => status,
                                 }
                             } else {
                                 match self.npfs_read_file_route_for(fh) {
@@ -32420,11 +32101,6 @@ impl ExecNtHandler {
                 let mut npfs_route_status = 0xFFFF_FFFEu32;
                 let mut status = if !iosb_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
-                } else if self.boot_status_handle_access(handle).is_ok() {
-                    match self.boot_status_check_access(handle, 0x0000_0002, 0x4000_0000) {
-                        Ok(()) => nt_fs::STATUS_SUCCESS,
-                        Err(status) => status,
-                    }
                 } else if let Some(overlay_file_id) = self.overlay_file_id_for(handle) {
                     file_id = overlay_file_id;
                     self.writable_fs_dirty = true;
