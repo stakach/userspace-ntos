@@ -675,6 +675,20 @@ impl<P> IoManager<P> {
             _ if major == nt_io_abi::major::IRP_MJ_LOCK_CONTROL => {
                 return Err(NtStatus::INVALID_PARAMETER)
             }
+            IoParameters::NotifyDirectory(parameters) => {
+                if major != nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL
+                    || input_len != 0
+                    || output_len != parameters.length
+                    || system_buffer.len() != parameters.length as usize
+                    || stack_flags.bits() & !crate::SL_WATCH_TREE != 0
+                    || !crate::valid_directory_notify_parameters(*parameters)
+                {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                }
+            }
+            _ if major == nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL => {
+                return Err(NtStatus::INVALID_PARAMETER)
+            }
             _ => {}
         }
         if self.driver(driver_id).is_none() {

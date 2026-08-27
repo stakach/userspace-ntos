@@ -26,6 +26,7 @@ mod complete;
 mod completion_unwind;
 mod device;
 mod device_control;
+mod directory_control;
 mod device_property_transfer;
 mod dispatch;
 mod driver;
@@ -70,6 +71,11 @@ pub use completion_unwind::{
     CompletionUnwindFrame,
 };
 pub use device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
+pub use directory_control::{
+    directory_notify_access_granted, valid_directory_notify_parameters,
+    DirectoryNotifyParameters, IRP_MN_NOTIFY_CHANGE_DIRECTORY, IRP_MN_QUERY_DIRECTORY,
+    SL_WATCH_TREE,
+};
 pub use device_property_transfer::{
     HostedDevicePropertyOwner, HostedDevicePropertyPull, HostedDevicePropertyTransferError,
     HostedDevicePropertyTransferTable,
@@ -489,6 +495,9 @@ impl<P> IoManager<P> {
                 match parameters {
                     IoParameters::Pnp(parameters) => location.minor = parameters.minor,
                     IoParameters::LockControl(parameters) => location.minor = parameters.minor,
+                    IoParameters::NotifyDirectory(_) => {
+                        location.minor = crate::IRP_MN_NOTIFY_CHANGE_DIRECTORY
+                    }
                     _ => {}
                 }
             }
@@ -526,6 +535,9 @@ impl<P> IoManager<P> {
             match &parameters {
                 IoParameters::Pnp(parameters) => location.minor = parameters.minor,
                 IoParameters::LockControl(parameters) => location.minor = parameters.minor,
+                IoParameters::NotifyDirectory(_) => {
+                    location.minor = crate::IRP_MN_NOTIFY_CHANGE_DIRECTORY
+                }
                 _ => {}
             }
             location.parameters = parameters;
@@ -5820,6 +5832,79 @@ mod tests {
             (request.input_len, request.output_len, request.buffer_len),
             (0, 0, 0)
         );
+    }
+
+    #[test]
+    fn peer_directory_notify_wire_preserves_filter_minor_and_watch_tree() {
+        let control = MockPeerControl::new();
+        let mut om = io();
+        let client = om.register_client();
+        let (backend, _) = peer_backend(&mut om, &control);
+        let mut dispatch = MajorFunctionTable::new();
+        for major in [
+            major::IRP_MJ_CREATE,
+            major::IRP_MJ_CLEANUP,
+            major::IRP_MJ_CLOSE,
+            major::IRP_MJ_DIRECTORY_CONTROL,
+        ] {
+            dispatch.set(major, DispatchTarget::DriverPeer(DriverPeerId(0)));
+        }
+        let driver = om
+            .create_driver_peer_with_major_table(
+                &path("\\Driver\\NotifyPeer"),
+                Box::new(backend),
+                dispatch,
+            )
+            .unwrap();
+        let device = om
+            .create_device(
+                driver,
+                Some(&path("\\Device\\NotifyPeer")),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let handle = om
+            .open(
+                client,
+                &path("\\Device\\NotifyPeer"),
+                AccessMask::GENERIC_READ,
+                ShareAccess::empty(),
+                CreateOptions::empty(),
+                0,
+            )
+            .unwrap();
+        let (file, _, _) = om
+            .reference_open_file_details(client, handle, AccessMask::GENERIC_READ)
+            .unwrap();
+        let mut output = [0u8; 96];
+        assert!(matches!(
+            om.build_and_dispatch_external_to_device_with_stack_flags(
+                client,
+                device,
+                Some(file),
+                0,
+                41,
+                major::IRP_MJ_DIRECTORY_CONTROL,
+                IoParameters::NotifyDirectory(DirectoryNotifyParameters {
+                    length: output.len() as u32,
+                    completion_filter: 0x53,
+                }),
+                StackFlags::WATCH_TREE,
+                0,
+                output.len() as u32,
+                &mut output,
+            ),
+            Ok(ExternalDispatchResult::Completed { .. })
+        ));
+        let request = control.last_request().unwrap();
+        assert_eq!(request.major, major::IRP_MJ_DIRECTORY_CONTROL);
+        assert_eq!(request.minor, IRP_MN_NOTIFY_CHANGE_DIRECTORY);
+        assert_eq!(request.flags as u8, SL_WATCH_TREE);
+        assert_eq!(request.ioctl_code, 0x53);
+        assert_eq!((request.input_len, request.output_len), (0, 96));
     }
 
     #[test]

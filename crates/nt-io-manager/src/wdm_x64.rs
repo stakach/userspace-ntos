@@ -137,6 +137,10 @@ pub enum WdmIoStackParameters {
         length: u32,
         information_class: u32,
     },
+    NotifyDirectory {
+        length: u32,
+        completion_filter: u32,
+    },
     LockControl {
         length: u64,
         key: u32,
@@ -393,6 +397,13 @@ pub fn write_wdm_io_stack_location(
         } => {
             put_u32(bytes, 0x08, length);
             put_u32(bytes, 0x10, information_class);
+        }
+        WdmIoStackParameters::NotifyDirectory {
+            length,
+            completion_filter,
+        } => {
+            put_u32(bytes, 0x08, length);
+            put_u32(bytes, 0x10, completion_filter);
         }
         WdmIoStackParameters::LockControl {
             length,

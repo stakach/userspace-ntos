@@ -13,8 +13,9 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use nt_io_abi::{
-    ioctl, major, valid_ea_parameters, valid_lock_control_parameters, valid_quota_parameters,
-    valid_read_write_parameters, valid_set_information_control,
+    ioctl, major, valid_directory_notify_parameters, valid_ea_parameters,
+    valid_lock_control_parameters, valid_quota_parameters, valid_read_write_parameters,
+    valid_set_information_control,
     valid_volume_information_parameters, IrpDispatchRequest, IO_ABI_VERSION,
 };
 use nt_status::NtStatus;
@@ -194,6 +195,21 @@ fn build_dispatch_request(
             p.information_class,
             p.length,
             0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ),
+        crate::irp::IoParameters::NotifyDirectory(p) => (
+            p.completion_filter,
+            0,
+            p.length,
             0,
             0,
             0,
@@ -499,6 +515,13 @@ impl DriverPeerTransport for MockDriverPeer {
                 request.ioctl_code,
                 request.input_len,
                 request.output_len,
+            )
+            || !valid_directory_notify_parameters(
+                request.major,
+                request.minor,
+                request.flags as u8,
+                request.ioctl_code,
+                request.input_len,
             )
             || !valid_lock_control_parameters(
                 request.major,

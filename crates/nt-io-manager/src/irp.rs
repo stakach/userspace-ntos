@@ -6,6 +6,7 @@ use nt_io_abi::{DeviceId, DriverId, FileId, IrpId};
 use nt_status::NtStatus;
 use nt_types::{AccessMask, ClientId};
 
+use crate::directory_control::DirectoryNotifyParameters;
 use crate::ea::{QueryEaParameters, SetEaParameters};
 use crate::file::{CreateOptions, ShareAccess};
 use crate::lock_control::LockControlParameters;
@@ -210,6 +211,7 @@ pub enum IoParameters {
     SetQuota(SetQuotaParameters),
     QueryVolumeInformation(QueryVolumeInformationParameters),
     SetVolumeInformation(SetVolumeInformationParameters),
+    NotifyDirectory(DirectoryNotifyParameters),
     LockControl(LockControlParameters),
     Pnp(PnpParameters),
     Power,
@@ -239,6 +241,7 @@ impl IoParameters {
             IoParameters::SetQuota(p) => (p.length.min(cap), 0),
             IoParameters::QueryVolumeInformation(p) => (0, p.length.min(cap)),
             IoParameters::SetVolumeInformation(p) => (p.length.min(cap), 0),
+            IoParameters::NotifyDirectory(p) => (0, p.length.min(cap)),
             IoParameters::LockControl(_) => (0, 0),
             IoParameters::Pnp(p) => (p.input_len().min(cap), 0),
             _ => (0, 0),
@@ -261,6 +264,7 @@ bitflags::bitflags! {
         const RESTART_SCAN = 0x01;
         const RETURN_SINGLE_ENTRY = 0x02;
         const INDEX_SPECIFIED = 0x04;
+        const WATCH_TREE = 0x01;
     }
 }
 

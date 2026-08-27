@@ -70,8 +70,9 @@ use nt_hosted_runtime::{
     NDIS_PROTOCOL_CHARACTERISTICS_NAME_OFFSET_X64,
 };
 use nt_io_abi::{
-    ioctl, major, valid_ea_parameters, valid_lock_control_parameters, valid_quota_parameters,
-    valid_read_write_parameters, valid_set_information_control,
+    ioctl, major, valid_directory_notify_parameters, valid_ea_parameters,
+    valid_lock_control_parameters, valid_quota_parameters, valid_read_write_parameters,
+    valid_set_information_control,
     valid_volume_information_parameters, IrpDispatchRequest, IO_ABI_VERSION,
 };
 use nt_io_manager::{
@@ -882,6 +883,7 @@ fn pending_irp_returns_read_bytes(major: u64, fsctl: u64, output_len: u64) -> bo
         || major == major::IRP_MJ_QUERY_EA as u64
         || major == major::IRP_MJ_QUERY_QUOTA as u64
         || major == major::IRP_MJ_QUERY_VOLUME_INFORMATION as u64
+        || major == major::IRP_MJ_DIRECTORY_CONTROL as u64
         || major == IRP_MJ_FILE_SYSTEM_CONTROL && fsctl == FSCTL_PIPE_TRANSCEIVE
         || control_transfer_method(major, fsctl).is_some() && output_len != 0
 }
@@ -31069,6 +31071,15 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     ) {
         return (STATUS_INVALID_PARAMETER, 0);
     }
+    if !valid_directory_notify_parameters(
+        major as u8,
+        request.minor,
+        request.flags as u8,
+        request.ioctl_code,
+        request.input_len,
+    ) {
+        return (STATUS_INVALID_PARAMETER, 0);
+    }
     let related_file_object = if request.related_file_id == 0 {
         0
     } else {
@@ -31571,6 +31582,12 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             WdmIoStackParameters::SetVolumeInformation {
                 length: inlen as u32,
                 information_class: fsctl as u32,
+            }
+        }
+        value if value as u8 == major::IRP_MJ_DIRECTORY_CONTROL => {
+            WdmIoStackParameters::NotifyDirectory {
+                length: outlen as u32,
+                completion_filter: fsctl as u32,
             }
         }
         value if value as u8 == major::IRP_MJ_LOCK_CONTROL => {
@@ -35362,6 +35379,12 @@ fn external_irp_parameters(
         }
         major::IRP_MJ_LOCK_CONTROL => (fsctl == 0 && input_len == 0 && output_len == 0)
             .then_some(IoParameters::LockControl(lock_control?)),
+        major::IRP_MJ_DIRECTORY_CONTROL => (input_len == 0).then_some(
+            IoParameters::NotifyDirectory(nt_io_manager::DirectoryNotifyParameters {
+                length: output_len,
+                completion_filter: external_code(fsctl)?,
+            }),
+        ),
         major::IRP_MJ_FLUSH_BUFFERS => Some(IoParameters::FlushBuffers),
         major::IRP_MJ_FILE_SYSTEM_CONTROL | major::IRP_MJ_DEVICE_CONTROL => {
             Some(IoParameters::DeviceControl(DeviceControlParameters {
@@ -35444,6 +35467,7 @@ fn dispatch_external_irp_to_device_record_result_exact(
             | major::IRP_MJ_QUERY_EA
             | major::IRP_MJ_QUERY_QUOTA
             | major::IRP_MJ_QUERY_VOLUME_INFORMATION
+            | major::IRP_MJ_DIRECTORY_CONTROL
     ) {
         system_buffer[..out.len()].copy_from_slice(out);
     }
@@ -45631,6 +45655,49 @@ pub(crate) unsafe fn dispatch_hosted_file_set_volume_information_irp_result_exac
         None,
         None,
         StackFlags::empty(),
+    )
+}
+
+/// Dispatch a directory notification through the canonical provider File. The output buffer is
+/// retained by the I/O Manager when the FSD pends the request.
+pub(crate) unsafe fn dispatch_hosted_file_notify_directory_irp_result_exact(
+    file_id: u64,
+    requestor_tid: u64,
+    parameters: nt_io_manager::DirectoryNotifyParameters,
+    stack_flags: StackFlags,
+    out: &mut [u8],
+) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
+    if parameters.length as usize != out.len()
+        || !nt_io_manager::valid_directory_notify_parameters(parameters)
+        || stack_flags.bits() & !nt_io_manager::SL_WATCH_TREE != 0
+    {
+        return Err(STATUS_INVALID_PARAMETER as u32);
+    }
+    let canonical_file_id = FileId(file_id);
+    let device_id = io_manager_mut()
+        .file(canonical_file_id)
+        .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID))
+        .map(|file| file.device_id.raw())
+        .ok_or(STATUS_INVALID_HANDLE as u32)?;
+    require_hosted_device_ready_for_dispatch(device_id)?;
+    let mut input = [];
+    dispatch_external_irp_to_device_record_result_exact(
+        device_id,
+        Some(canonical_file_id),
+        major::IRP_MJ_DIRECTORY_CONTROL as u64,
+        parameters.completion_filter as u64,
+        0,
+        requestor_tid,
+        &mut input,
+        out,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        stack_flags,
     )
 }
 

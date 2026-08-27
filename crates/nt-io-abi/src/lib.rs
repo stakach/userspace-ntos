@@ -26,6 +26,24 @@ pub use wire::{
 /// ABI version of this wire contract; bumped on any incompatible change.
 pub const IO_ABI_VERSION: u32 = 12;
 
+/// Validate the major/minor/filter/flag shape of a directory notification IRP.
+pub const fn valid_directory_notify_parameters(
+    major_function: u8,
+    minor_function: u8,
+    stack_flags: u8,
+    completion_filter: u32,
+    input_length: u32,
+) -> bool {
+    if major_function != major::IRP_MJ_DIRECTORY_CONTROL {
+        return true;
+    }
+    minor_function == 0x02
+        && stack_flags & !0x01 == 0
+        && completion_filter != 0
+        && completion_filter & !0x0fff == 0
+        && input_length == 0
+}
+
 /// Validate native byte-range lock parameters. Other major functions must not carry lock state.
 pub const fn valid_lock_control_parameters(
     major_function: u8,
@@ -398,6 +416,45 @@ mod tests {
         assert!(!valid_read_write_parameters(
             major::IRP_MJ_LOCK_CONTROL,
             1,
+            0,
+        ));
+    }
+
+    #[test]
+    fn directory_notify_parameters_are_minor_filter_and_flag_specific() {
+        assert!(valid_directory_notify_parameters(
+            major::IRP_MJ_DIRECTORY_CONTROL,
+            0x02,
+            0x01,
+            0x53,
+            0,
+        ));
+        assert!(!valid_directory_notify_parameters(
+            major::IRP_MJ_DIRECTORY_CONTROL,
+            0x01,
+            0,
+            1,
+            0,
+        ));
+        assert!(!valid_directory_notify_parameters(
+            major::IRP_MJ_DIRECTORY_CONTROL,
+            0x02,
+            0x02,
+            1,
+            0,
+        ));
+        assert!(!valid_directory_notify_parameters(
+            major::IRP_MJ_DIRECTORY_CONTROL,
+            0x02,
+            0,
+            0,
+            0,
+        ));
+        assert!(valid_directory_notify_parameters(
+            major::IRP_MJ_QUERY_INFORMATION,
+            0,
+            0,
+            5,
             0,
         ));
     }
