@@ -616,8 +616,15 @@ pub enum HandleObject {
     /// A file OR directory on the executive's WRITABLE overlay volume (`nt-fs` `MemFs`, mounted
     /// over the writable namespace prefixes). The `u64` is that volume's own file-object id.
     OverlayFile(u64),
+    /// A loader-cache-backed File object. Image bytes remain owned by the executive cache while the
+    /// process handle carries the immutable create mode needed by I/O-Manager queries.
+    CachedFile {
+        create_options: u32,
+    },
     /// The executive-reserved `\SystemRoot\bootstat.dat` file used by RTL boot-status APIs.
-    BootStatusFile,
+    BootStatusFile {
+        create_options: u32,
+    },
     /// An executive I/O completion-port object, indexed in the executive's fixed object table.
     IoCompletion(u32),
     /// A Configuration Manager key target. The executive owns the read-only hive and mutable

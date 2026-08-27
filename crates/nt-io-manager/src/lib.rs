@@ -398,6 +398,15 @@ impl<P> IoManager<P> {
         self.top_of_device_stack(device)
     }
 
+    /// The alignment requirement of the live device currently related to `file`. Attachment
+    /// topology is resolved at query time, matching `IoGetRelatedDeviceObject(FileObject)`.
+    pub fn file_alignment_requirement(&self, file: FileId) -> Result<u32, NtStatus> {
+        let device = self.related_device_for_file(file)?;
+        self.device(device)
+            .map(|record| record.alignment_requirement)
+            .ok_or(NtStatus::INVALID_PARAMETER)
+    }
+
     /// Snapshot the live device stack from its current top down to the lowest attached device.
     /// Every location carries its own driver identity; later topology changes cannot retarget an
     /// already allocated IRP.
@@ -2966,11 +2975,15 @@ mod tests {
             .reference_open_file(client, handle, AccessMask::empty())
             .unwrap()
             .0;
+        om.device_mut(lower).unwrap().alignment_requirement = 0x1ff;
         assert_eq!(om.related_device_for_file(file), Ok(lower));
+        assert_eq!(om.file_alignment_requirement(file), Ok(0x1ff));
 
         assert_eq!(om.attach_device_to_stack(middle, lower), Ok(lower));
         assert_eq!(om.attach_device_to_stack(top, lower), Ok(middle));
+        om.device_mut(top).unwrap().alignment_requirement = 0xfff;
         assert_eq!(om.related_device_for_file(file), Ok(top));
+        assert_eq!(om.file_alignment_requirement(file), Ok(0xfff));
         assert_eq!(om.top_of_device_stack(lower), Ok(top));
 
         let mut truncated = om

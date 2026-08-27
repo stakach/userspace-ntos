@@ -123,6 +123,9 @@ fn query_information_encodes_standard_layout() {
         allocation_size: 0x2000,
         end_of_file: 0x1234,
         current_byte_offset: 0,
+        access_flags: 0,
+        mode: 0,
+        alignment_requirement: 0,
         number_of_links: 2,
         delete_pending: true,
         directory: false,
@@ -233,6 +236,63 @@ fn query_information_encodes_file_position() {
         encode_query_information(FILE_POSITION_INFORMATION, metadata, &mut output[..7]),
         Err(STATUS_INFO_LENGTH_MISMATCH)
     );
+}
+
+#[test]
+fn query_information_encodes_io_manager_owned_fields() {
+    let metadata = QueryMetadata {
+        access_flags: 0x0012_0089,
+        mode: FILE_WRITE_THROUGH | FILE_SYNCHRONOUS_IO_NONALERT | FILE_DELETE_ON_CLOSE,
+        alignment_requirement: 0x1ff,
+        ..QueryMetadata::default()
+    };
+    let mut output = [0xCC; 8];
+    for (class, expected) in [
+        (FILE_ACCESS_INFORMATION, metadata.access_flags),
+        (FILE_MODE_INFORMATION, metadata.mode),
+        (FILE_ALIGNMENT_INFORMATION, metadata.alignment_requirement),
+    ] {
+        output.fill(0xCC);
+        assert_eq!(
+            encode_query_information(class, metadata, &mut output),
+            Ok(4)
+        );
+        assert_eq!(
+            u32::from_le_bytes(output[..4].try_into().unwrap()),
+            expected
+        );
+        assert_eq!(&output[4..], &[0xCC; 4]);
+        assert_eq!(
+            encode_query_information(class, metadata, &mut output[..3]),
+            Err(STATUS_INFO_LENGTH_MISMATCH)
+        );
+    }
+}
+
+#[test]
+fn file_mode_retains_only_file_object_mode_options() {
+    let persistent = FILE_WRITE_THROUGH
+        | FILE_SEQUENTIAL_ONLY
+        | FILE_NO_INTERMEDIATE_BUFFERING
+        | FILE_SYNCHRONOUS_IO_ALERT
+        | FILE_DELETE_ON_CLOSE;
+    let transient = FILE_NON_DIRECTORY_FILE | 0x0000_0800 | 0x0020_0000;
+    assert_eq!(
+        file_mode_from_create_options(persistent | transient),
+        persistent
+    );
+
+    let mut fs = FileSystem::new(MemFs::with_fixture());
+    let opened = fs.zw_create_file(
+        SYSTEM_HIVE,
+        FILE_READ_DATA | SYNCHRONIZE,
+        0,
+        0,
+        FILE_OPEN,
+        persistent | transient,
+    );
+    assert_eq!(opened.status, STATUS_SUCCESS);
+    assert_eq!(fs.file_mode(opened.handle), Some(persistent));
 }
 
 use core::cell::RefCell;

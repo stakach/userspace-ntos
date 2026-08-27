@@ -14183,3 +14183,34 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and implement the next missing class at the `nt-fs` model boundary first, then wire executive
     capture/probe and completion against that tested contract. Keep provider and local-file paths on
     the same native ABI and reject unsupported classes explicitly rather than synthesizing results.
+
+    I/O Manager-owned fixed file queries (2026-08-27, accepted): `FileAccessInformation`,
+    `FileModeInformation`, and `FileAlignmentInformation` now follow the NT ownership boundary and
+    complete above filesystem dispatch. Access is the real grant on the caller's process handle;
+    mode is derived from the persistent create options retained by each File object; and hosted-file
+    alignment follows the current related top device through `nt-io-manager`. A routed handle is
+    accepted only while its recorded device identity still matches the live I/O Manager route.
+    These classes no longer manufacture an FSD IRP or rely on a provider-specific answer.
+
+    Loader-cache and boot-status handles are now typed File handles rather than opaque values and
+    retain their create mode. Read-only FAT files, FAT directories, and writable MemFs File objects
+    retain the same information. `nt-fs` owns the exact four-byte ABI encoders and the NT5 mode mask,
+    while the executive owns user probing, handle/type validation, and IOSB completion. Focused
+    validation passes `nt-fs` `75/75`, `nt-io-manager` `210/210`, and `nt-process` `107/107`; the
+    freestanding executive check remains green at the established 212-warning baseline.
+
+    Serialized acceptance `.tmp/run-headless-file-iomgr-query-20260827.log` selected, added, and
+    started all five configured PnP devices, observed both pending starts, launched genuine userinit
+    and Explorer, painted `480000/480000` framebuffer pixels with at least 32 colours, passed all
+    `295/295` gates, and matched the sentinel. The writable snapshot reached generation 5 at
+    1,693,402 bytes. Final allocator state reported a 16,394,336-byte watermark, 14,822,872 bytes
+    allocated, 6,148,520 bytes reusable, no scratch residue after its 278,112-byte peak, and zero
+    corruption.
+
+    Review adjustment: the I/O Manager-owned fixed query group is closed. Next implement the
+    filesystem-owned metadata group without fabricated values: stable `FileInternalInformation`
+    identity, real attributes/tags for `FileAttributeTagInformation`, and the data required by
+    `FileNetworkOpenInformation`. Model stable MemFs node identity and FAT directory-entry identity
+    in `nt-fs`; keep hosted files on real FSD dispatch. Then address retained-name semantics for
+    `FileNameInformation`/`FileAllInformation`. Do not substitute handle numbers, zero timestamps, or
+    cached provider identity for filesystem metadata.

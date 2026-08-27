@@ -22,6 +22,7 @@ bitflags::bitflags! {
         const DIRECTORY_FILE = 0x0000_0001;
         const WRITE_THROUGH = 0x0000_0002;
         const SEQUENTIAL_ONLY = 0x0000_0004;
+        const NO_INTERMEDIATE_BUFFERING = 0x0000_0008;
         const SYNCHRONOUS_IO_ALERT = 0x0000_0010;
         const SYNCHRONOUS_IO_NONALERT = 0x0000_0020;
         const NON_DIRECTORY_FILE = 0x0000_0040;

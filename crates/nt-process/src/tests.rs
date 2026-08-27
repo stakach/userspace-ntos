@@ -1901,19 +1901,35 @@ fn boot_status_file_handle_is_typed_and_process_local() {
     let first = pm.create_process("first.exe", None, None);
     let second = pm.create_process("second.exe", None, None);
     let first_handle = pm
-        .insert_handle(first, HandleObject::BootStatusFile, 0x3)
+        .insert_handle(
+            first,
+            HandleObject::BootStatusFile {
+                create_options: 0x20,
+            },
+            0x3,
+        )
         .unwrap();
     let second_handle = pm
-        .insert_handle(second, HandleObject::BootStatusFile, 0x1)
+        .insert_handle(
+            second,
+            HandleObject::BootStatusFile {
+                create_options: 0x10,
+            },
+            0x1,
+        )
         .unwrap();
     assert_eq!(first_handle, second_handle);
     assert_eq!(
         pm.lookup_handle(first, first_handle),
-        Some(HandleObject::BootStatusFile)
+        Some(HandleObject::BootStatusFile {
+            create_options: 0x20
+        })
     );
     assert_eq!(
         pm.lookup_handle(second, second_handle),
-        Some(HandleObject::BootStatusFile)
+        Some(HandleObject::BootStatusFile {
+            create_options: 0x10
+        })
     );
     assert_eq!(pm.handle_access(first, first_handle), Some(0x3));
 }

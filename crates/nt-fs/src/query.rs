@@ -4,7 +4,10 @@
 /// directory handle (`dll/win32/kernel32/client/file/dir.c:246`) before it can create the copy —
 /// the same class `NtSetInformationFile` already accepted, so it is shared from `status`.
 use crate::{
-    FILE_BASIC_INFORMATION, FILE_POSITION_INFORMATION, STATUS_INFO_LENGTH_MISMATCH,
+    FILE_ACCESS_INFORMATION, FILE_ALIGNMENT_INFORMATION, FILE_BASIC_INFORMATION,
+    FILE_DELETE_ON_CLOSE, FILE_MODE_INFORMATION, FILE_NO_INTERMEDIATE_BUFFERING,
+    FILE_POSITION_INFORMATION, FILE_SEQUENTIAL_ONLY, FILE_SYNCHRONOUS_IO_ALERT,
+    FILE_SYNCHRONOUS_IO_NONALERT, FILE_WRITE_THROUGH, STATUS_INFO_LENGTH_MISMATCH,
     STATUS_INVALID_INFO_CLASS,
 };
 
@@ -23,6 +26,9 @@ pub struct QueryMetadata {
     pub allocation_size: u64,
     pub end_of_file: u64,
     pub current_byte_offset: u64,
+    pub access_flags: u32,
+    pub mode: u32,
+    pub alignment_requirement: u32,
     pub number_of_links: u32,
     pub delete_pending: bool,
     pub directory: bool,
@@ -37,7 +43,10 @@ pub fn encode_query_information(
         FILE_BASIC_INFORMATION => 40,
         FILE_STANDARD_INFORMATION => 24,
         FILE_EA_INFORMATION => 4,
+        FILE_ACCESS_INFORMATION => 4,
         FILE_POSITION_INFORMATION => 8,
+        FILE_MODE_INFORMATION => 4,
+        FILE_ALIGNMENT_INFORMATION => 4,
         _ => return Err(STATUS_INVALID_INFO_CLASS),
     };
     if output.len() < required {
@@ -69,11 +78,35 @@ pub fn encode_query_information(
         // attributes, so 0 is the true answer — and it is what makes `CreateDirectoryExW` skip its
         // `NtQueryEaFile` loop entirely rather than fail.
         FILE_EA_INFORMATION => {}
+        // These three fields belong to the I/O Manager, not the filesystem driver: the handle's
+        // grant, FILE_OBJECT mode flags, and related DEVICE_OBJECT alignment requirement.
+        FILE_ACCESS_INFORMATION => {
+            output[0..4].copy_from_slice(&metadata.access_flags.to_le_bytes());
+        }
         // FILE_POSITION_INFORMATION { LARGE_INTEGER CurrentByteOffset }.
         FILE_POSITION_INFORMATION => {
             output[0..8].copy_from_slice(&metadata.current_byte_offset.to_le_bytes());
         }
+        FILE_MODE_INFORMATION => {
+            output[0..4].copy_from_slice(&metadata.mode.to_le_bytes());
+        }
+        FILE_ALIGNMENT_INFORMATION => {
+            output[0..4].copy_from_slice(&metadata.alignment_requirement.to_le_bytes());
+        }
         _ => unreachable!(),
     }
     Ok(required)
+}
+
+/// Derive the `FILE_MODE_INFORMATION.Mode` value from the create options retained by the
+/// `FILE_OBJECT`. This matches NT5's `IopGetFileMode`: options that do not become persistent
+/// `FO_*` mode flags are intentionally omitted.
+pub const fn file_mode_from_create_options(create_options: u32) -> u32 {
+    create_options
+        & (FILE_WRITE_THROUGH
+            | FILE_SEQUENTIAL_ONLY
+            | FILE_NO_INTERMEDIATE_BUFFERING
+            | FILE_SYNCHRONOUS_IO_ALERT
+            | FILE_SYNCHRONOUS_IO_NONALERT
+            | FILE_DELETE_ON_CLOSE)
 }

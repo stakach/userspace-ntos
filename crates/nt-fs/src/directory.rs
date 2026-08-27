@@ -134,6 +134,7 @@ impl DirectoryQueryState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirectoryOpen {
     pub first_cluster: u32,
+    pub create_options: u32,
     pub query: DirectoryQueryState,
     path_len: u16,
     path: [u8; DIRECTORY_OPEN_PATH_CAP],
@@ -161,6 +162,7 @@ impl DirectoryOpenSlot {
             references: 0,
             open: DirectoryOpen {
                 first_cluster: 0,
+                create_options: 0,
                 query: DirectoryQueryState::new(),
                 path_len: 0,
                 path: [0; DIRECTORY_OPEN_PATH_CAP],
@@ -181,7 +183,12 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
         }
     }
 
-    pub fn create(&mut self, first_cluster: u32, volume_relative_path: &[u8]) -> Result<u32, u32> {
+    pub fn create(
+        &mut self,
+        first_cluster: u32,
+        volume_relative_path: &[u8],
+        create_options: u32,
+    ) -> Result<u32, u32> {
         if volume_relative_path.len() > DIRECTORY_OPEN_PATH_CAP {
             return Err(STATUS_OBJECT_NAME_INVALID);
         }
@@ -198,6 +205,7 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
             references: 1,
             open: DirectoryOpen {
                 first_cluster,
+                create_options,
                 query: DirectoryQueryState::new(),
                 path_len: volume_relative_path.len() as u16,
                 path,
@@ -270,6 +278,7 @@ pub struct ReadOnlyFileOpen {
     pub first_cluster: u32,
     pub size: u32,
     pub current_offset: u64,
+    pub create_options: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -288,6 +297,7 @@ impl ReadOnlyFileOpenSlot {
                 first_cluster: 0,
                 size: 0,
                 current_offset: 0,
+                create_options: 0,
             },
         }
     }
@@ -305,7 +315,12 @@ impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
         }
     }
 
-    pub fn create(&mut self, first_cluster: u32, size: u32) -> Result<u32, u32> {
+    pub fn create(
+        &mut self,
+        first_cluster: u32,
+        size: u32,
+        create_options: u32,
+    ) -> Result<u32, u32> {
         let (index, slot) = self
             .slots
             .iter_mut()
@@ -319,6 +334,7 @@ impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
                 first_cluster,
                 size,
                 current_offset: 0,
+                create_options,
             },
         };
         Ok(index as u32)
@@ -862,8 +878,8 @@ mod tests {
     #[test]
     fn directory_open_references_share_query_state() {
         let mut table = DirectoryOpenTable::<2>::new();
-        let shared = table.create(41, b"reactos\\system32").unwrap();
-        let independent = table.create(41, b"reactos\\system32").unwrap();
+        let shared = table.create(41, b"reactos\\system32", 0x20).unwrap();
+        let independent = table.create(41, b"reactos\\system32", 0x10).unwrap();
         table.retain(shared).unwrap();
         table.get_mut(shared).unwrap().query.cursor = 7;
         assert_eq!(table.get(shared).unwrap().query.cursor(), 7);
@@ -874,52 +890,54 @@ mod tests {
         assert_eq!(table.get(independent).unwrap().query.cursor(), 0);
         table.release(shared).unwrap();
         assert_eq!(table.get(shared).unwrap().first_cluster, 41);
+        assert_eq!(table.get(shared).unwrap().create_options, 0x20);
         table.release(shared).unwrap();
         assert_eq!(table.get(shared), Err(STATUS_INVALID_HANDLE));
-        assert_eq!(table.create(99, b"reactos").unwrap(), shared);
+        assert_eq!(table.create(99, b"reactos", 0).unwrap(), shared);
     }
 
     #[test]
     fn directory_open_table_clear_reuses_fixed_storage() {
         let mut table = DirectoryOpenTable::<2>::new();
-        let first = table.create(41, b"reactos").unwrap();
+        let first = table.create(41, b"reactos", 0).unwrap();
         table.retain(first).unwrap();
-        table.create(42, b"reactos\\system32").unwrap();
+        table.create(42, b"reactos\\system32", 0).unwrap();
 
         table.clear();
 
         assert_eq!(table.get(first), Err(STATUS_INVALID_HANDLE));
-        assert_eq!(table.create(99, b"").unwrap(), 0);
-        assert_eq!(table.create(100, b"reactos").unwrap(), 1);
+        assert_eq!(table.create(99, b"", 0).unwrap(), 0);
+        assert_eq!(table.create(100, b"reactos", 0).unwrap(), 1);
     }
 
     #[test]
     fn readonly_file_open_references_share_position() {
         let mut table = ReadOnlyFileOpenTable::<2>::new();
-        let shared = table.create(41, 64).unwrap();
-        let independent = table.create(41, 64).unwrap();
+        let shared = table.create(41, 64, 0x20).unwrap();
+        let independent = table.create(41, 64, 0x10).unwrap();
         table.retain(shared).unwrap();
         table.get_mut(shared).unwrap().current_offset = 17;
         assert_eq!(table.get(shared).unwrap().current_offset, 17);
         assert_eq!(table.get(independent).unwrap().current_offset, 0);
         table.release(shared).unwrap();
         assert_eq!(table.get(shared).unwrap().first_cluster, 41);
+        assert_eq!(table.get(shared).unwrap().create_options, 0x20);
         table.release(shared).unwrap();
         assert_eq!(table.get(shared), Err(STATUS_INVALID_HANDLE));
-        assert_eq!(table.create(99, 128).unwrap(), shared);
+        assert_eq!(table.create(99, 128, 0).unwrap(), shared);
     }
 
     #[test]
     fn readonly_file_open_table_clear_reuses_fixed_storage() {
         let mut table = ReadOnlyFileOpenTable::<2>::new();
-        let first = table.create(41, 64).unwrap();
+        let first = table.create(41, 64, 0).unwrap();
         table.retain(first).unwrap();
-        table.create(42, 128).unwrap();
+        table.create(42, 128, 0).unwrap();
 
         table.clear();
 
         assert_eq!(table.get(first), Err(STATUS_INVALID_HANDLE));
-        assert_eq!(table.create(99, 1).unwrap(), 0);
-        assert_eq!(table.create(100, 2).unwrap(), 1);
+        assert_eq!(table.create(99, 1, 0).unwrap(), 0);
+        assert_eq!(table.create(100, 2, 0).unwrap(), 1);
     }
 }

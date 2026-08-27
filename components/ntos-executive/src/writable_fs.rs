@@ -1706,6 +1706,11 @@ pub(crate) unsafe fn current_offset(file_id: u64) -> Option<u64> {
     writable_fs()?.current_offset(file_id)
 }
 
+/// I/O-Manager-owned mode flags retained by a writable-volume file object.
+pub(crate) unsafe fn file_mode(file_id: u64) -> Option<u32> {
+    writable_fs()?.file_mode(file_id)
+}
+
 /// `NtSetInformationFile` on a writable-volume file object.
 pub(crate) unsafe fn set_information(file_id: u64, class: u32, data: &[u8]) -> u32 {
     let Some(fs) = writable_fs() else {

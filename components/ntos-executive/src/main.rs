@@ -22424,9 +22424,16 @@ impl ExecDirectoryOpens {
         Self { table }
     }
 
-    fn create(&mut self, first_cluster: u32, volume_relative_path: &[u8]) -> Result<u32, u32> {
+    fn create(
+        &mut self,
+        first_cluster: u32,
+        volume_relative_path: &[u8],
+        create_options: u32,
+    ) -> Result<u32, u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).create(first_cluster, volume_relative_path) }
+        unsafe {
+            (&mut *self.table).create(first_cluster, volume_relative_path, create_options)
+        }
     }
 
     fn get(&self, id: u32) -> Result<&nt_fs::DirectoryOpen, u32> {
@@ -22464,9 +22471,9 @@ impl ExecReadOnlyFileOpens {
         Self { table }
     }
 
-    fn create(&mut self, first_cluster: u32, size: u32) -> Result<u32, u32> {
+    fn create(&mut self, first_cluster: u32, size: u32, create_options: u32) -> Result<u32, u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).create(first_cluster, size) }
+        unsafe { (&mut *self.table).create(first_cluster, size, create_options) }
     }
 
     fn get(&self, id: u32) -> Result<&nt_fs::ReadOnlyFileOpen, u32> {

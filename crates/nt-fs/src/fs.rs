@@ -2875,6 +2875,8 @@ struct FileObject {
     node_id: u64,
     entry_id: u64,
     current_offset: u64,
+    /// Create options retained as `FILE_OBJECT` mode flags for `FileModeInformation`.
+    create_options: u32,
     /// Handles referring to this file object. `NtDuplicateObject` adds one, `ZwClose` removes one;
     /// the object (and any pending delete) is actioned when the last one goes.
     references: u32,
@@ -2979,6 +2981,7 @@ impl FileSystem {
             node_id,
             entry_id,
             current_offset: 0,
+            create_options: options,
             references: 1,
             delete_pending: options & FILE_DELETE_ON_CLOSE != 0,
             query: DirectoryQueryState::new(),
@@ -3726,6 +3729,12 @@ impl FileSystem {
     /// The file object's current byte offset — `FilePositionInformation`'s read side.
     pub fn current_offset(&self, handle: u64) -> Option<u64> {
         self.obj(handle).map(|obj| obj.current_offset)
+    }
+
+    /// I/O-Manager-owned `FileModeInformation` for this live `FILE_OBJECT`.
+    pub fn file_mode(&self, handle: u64) -> Option<u32> {
+        self.obj(handle)
+            .map(|obj| crate::file_mode_from_create_options(obj.create_options))
     }
 
     /// Create every missing directory along `path`, and return whether the leaf is a directory.

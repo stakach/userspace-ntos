@@ -956,7 +956,8 @@ fn trace_handle_object_for(nt: &ExecNtHandler, handle: u64) {
         }
         Some(nt_process::HandleObject::DiskFile { .. }) => print_str(b"disk-file"),
         Some(nt_process::HandleObject::Directory { .. }) => print_str(b"directory"),
-        Some(nt_process::HandleObject::BootStatusFile) => print_str(b"boot-status"),
+        Some(nt_process::HandleObject::CachedFile { .. }) => print_str(b"cached-file"),
+        Some(nt_process::HandleObject::BootStatusFile { .. }) => print_str(b"boot-status"),
         Some(nt_process::HandleObject::IoCompletion(_)) => print_str(b"io-completion"),
         Some(nt_process::HandleObject::RegistryKey(_)) => print_str(b"registry-key"),
         Some(nt_process::HandleObject::Process(_)) => print_str(b"process"),
@@ -9386,6 +9387,17 @@ impl ExecNtHandler {
         h
     }
 
+    fn mint_cached_file_handle(&mut self, access: u32, create_options: u32) -> Option<u64> {
+        let pid = self.pm_pid_for_pi(self.pi)?;
+        self.insert_process_handle(
+            pid,
+            nt_process::HandleObject::CachedFile { create_options },
+            access,
+        )
+        .ok()
+        .map(u64::from)
+    }
+
     fn map_directory_object_access(mut access: u32) -> u32 {
         const READ_CONTROL: u32 = 0x0002_0000;
         const DIRECTORY_ALL_ACCESS: u32 = 0x000F_0000 | 0x000F;
@@ -9597,9 +9609,13 @@ impl ExecNtHandler {
         first_cluster: u32,
         size: u32,
         access: u32,
+        create_options: u32,
     ) -> Option<u64> {
         let pid = self.pm_pid_for_pi(self.pi)?;
-        let object_id = self.readonly_file_opens.create(first_cluster, size).ok()?;
+        let object_id = self
+            .readonly_file_opens
+            .create(first_cluster, size, create_options)
+            .ok()?;
         let handle = match self.insert_process_handle(
             pid,
             nt_process::HandleObject::DiskFile {
@@ -9731,11 +9747,12 @@ impl ExecNtHandler {
         first_cluster: u32,
         volume_relative_path: &[u8],
         access: u32,
+        create_options: u32,
     ) -> Option<u64> {
         let pid = self.pm_pid_for_pi(self.pi)?;
         let object_id = self
             .directory_opens
-            .create(first_cluster, volume_relative_path)
+            .create(first_cluster, volume_relative_path, create_options)
             .ok()?;
         let handle = match self.insert_process_handle(
             pid,
@@ -9857,9 +9874,9 @@ impl ExecNtHandler {
                         return (nt_fs::STATUS_FILE_IS_A_DIRECTORY, 0, 0);
                     }
                     let handle = if is_directory {
-                        self.mint_directory_handle(cluster, full_path, desired_access)
+                        self.mint_directory_handle(cluster, full_path, desired_access, options)
                     } else if Self::readonly_disk_open_allowed(desired_access, options) {
-                        self.mint_disk_file_handle(cluster, size, desired_access)
+                        self.mint_disk_file_handle(cluster, size, desired_access, options)
                     } else {
                         return (nt_fs::STATUS_NOT_SUPPORTED, 0, 0);
                     };
@@ -10042,16 +10059,26 @@ impl ExecNtHandler {
             | nt_process::HandleObject::RoutedFile { .. }
             | nt_process::HandleObject::DiskFile { .. }
             | nt_process::HandleObject::Directory { .. }
-            | nt_process::HandleObject::BootStatusFile => Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST),
+            | nt_process::HandleObject::BootStatusFile { .. } => {
+                Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST)
+            }
             _ => Err(STATUS_OBJECT_TYPE_MISMATCH),
         }
     }
 
     /// Mint a process-local handle for the executive-reserved boot-status file.
-    pub(crate) fn mint_boot_status_handle(&mut self, access: u32) -> Option<u64> {
+    pub(crate) fn mint_boot_status_handle(
+        &mut self,
+        access: u32,
+        create_options: u32,
+    ) -> Option<u64> {
         let pid = self.pm_pid_for_pi(self.pi)?;
         let handle = self
-            .insert_process_handle(pid, nt_process::HandleObject::BootStatusFile, access)
+            .insert_process_handle(
+                pid,
+                nt_process::HandleObject::BootStatusFile { create_options },
+                access,
+            )
             .ok()?;
         Some(handle as u64)
     }
@@ -10060,7 +10087,7 @@ impl ExecNtHandler {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
         let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
         match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
-            Some(nt_process::HandleObject::BootStatusFile) => self
+            Some(nt_process::HandleObject::BootStatusFile { .. }) => self
                 .pm
                 .handle_access(pid, handle as nt_process::Handle)
                 .ok_or(STATUS_INVALID_HANDLE),
@@ -11538,7 +11565,7 @@ impl ExecNtHandler {
             Some(nt_process::HandleObject::DiskFile { .. })
             | Some(nt_process::HandleObject::Directory { .. })
             | Some(nt_process::HandleObject::OverlayFile(_))
-            | Some(nt_process::HandleObject::BootStatusFile) => Ok(None),
+            | Some(nt_process::HandleObject::BootStatusFile { .. }) => Ok(None),
             Some(_) => Err(STATUS_OBJECT_TYPE_MISMATCH),
             None => Err(STATUS_INVALID_HANDLE),
         }
@@ -11597,7 +11624,7 @@ impl ExecNtHandler {
                 Some(nt_process::HandleObject::DiskFile { .. })
                 | Some(nt_process::HandleObject::Directory { .. })
                 | Some(nt_process::HandleObject::OverlayFile(_))
-                | Some(nt_process::HandleObject::BootStatusFile) => {
+                | Some(nt_process::HandleObject::BootStatusFile { .. }) => {
                     self.write_current_iosb(iosb, STATUS_INVALID_DEVICE_REQUEST, 0);
                     return STATUS_INVALID_DEVICE_REQUEST;
                 }
@@ -14244,7 +14271,8 @@ impl ExecNtHandler {
                 | nt_process::HandleObject::DiskFile { .. }
                 | nt_process::HandleObject::Directory { .. }
                 | nt_process::HandleObject::OverlayFile(_)
-                | nt_process::HandleObject::BootStatusFile => b"File",
+                | nt_process::HandleObject::BootStatusFile { .. }
+                | nt_process::HandleObject::CachedFile { .. } => b"File",
                 nt_process::HandleObject::IoCompletion(_) => b"IoCompletion",
                 nt_process::HandleObject::RegistryKey(_) => b"Key",
                 nt_process::HandleObject::Token(_) | nt_process::HandleObject::TokenObject(_) => {
@@ -18734,7 +18762,8 @@ impl ExecNtHandler {
                 Ok(FileParseRoot::HostedFile { file_id, device_id })
             }
             nt_process::HandleObject::DiskFile { .. }
-            | nt_process::HandleObject::BootStatusFile => Ok(FileParseRoot::NonDirectoryFile),
+            | nt_process::HandleObject::BootStatusFile { .. }
+            | nt_process::HandleObject::CachedFile { .. } => Ok(FileParseRoot::NonDirectoryFile),
             _ => Err(STATUS_INVALID_HANDLE),
         }
     }
@@ -20280,6 +20309,82 @@ impl ExecNtHandler {
         }
         let pid = self.pm_pid_for_pi(self.pi)?;
         self.pm.handle_access(pid, handle as nt_process::Handle)
+    }
+
+    unsafe fn io_manager_file_query_metadata(
+        &self,
+        handle: u64,
+    ) -> Result<nt_fs::QueryMetadata, u32> {
+        let pid = self
+            .pm_pid_for_pi(self.pi)
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        let process_handle = nt_process::Handle::try_from(handle)
+            .map_err(|_| nt_fs::STATUS_INVALID_HANDLE)?;
+        let object = self
+            .pm
+            .lookup_handle(pid, process_handle)
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        let access_flags = self
+            .pm
+            .handle_access(pid, process_handle)
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        let (mode, alignment_requirement) = match object {
+            nt_process::HandleObject::RoutedFile { file_id, device_id } => {
+                let route = self
+                    .hosted_file_route_for(handle)
+                    .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                if route.file_id != file_id || route.device_id != device_id {
+                    return Err(nt_fs::STATUS_INVALID_HANDLE);
+                }
+                let create_options = driver_launch::hosted_file_create_options(file_id)
+                    .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                let alignment = driver_launch::hosted_file_alignment_requirement(file_id)
+                    .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                (
+                    nt_fs::file_mode_from_create_options(create_options.bits()),
+                    alignment,
+                )
+            }
+            nt_process::HandleObject::File(file_id) => {
+                let create_options = driver_launch::hosted_file_create_options(file_id)
+                    .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                let alignment = driver_launch::hosted_file_alignment_requirement(file_id)
+                    .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                (
+                    nt_fs::file_mode_from_create_options(create_options.bits()),
+                    alignment,
+                )
+            }
+            nt_process::HandleObject::DiskFile { object_id, .. } => {
+                let open = self.readonly_file_opens.get(object_id)?;
+                (
+                    nt_fs::file_mode_from_create_options(open.create_options),
+                    0,
+                )
+            }
+            nt_process::HandleObject::Directory { object_id, .. } => {
+                let open = self.directory_opens.get(object_id)?;
+                (
+                    nt_fs::file_mode_from_create_options(open.create_options),
+                    0,
+                )
+            }
+            nt_process::HandleObject::OverlayFile(file_id) => {
+                (crate::writable_fs::file_mode(file_id).ok_or(nt_fs::STATUS_INVALID_HANDLE)?, 0)
+            }
+            nt_process::HandleObject::CachedFile { create_options }
+            | nt_process::HandleObject::BootStatusFile { create_options } => (
+                nt_fs::file_mode_from_create_options(create_options),
+                0,
+            ),
+            _ => return Err(0xC000_0024), // STATUS_OBJECT_TYPE_MISMATCH
+        };
+        Ok(nt_fs::QueryMetadata {
+            access_flags,
+            mode,
+            alignment_requirement,
+            ..nt_fs::QueryMetadata::default()
+        })
     }
 
     /// Retain and acquire a routed File before clearing its shared completion signal. `Ok(false)`
@@ -22286,7 +22391,7 @@ impl ExecNtHandler {
                     status = nt_fs::STATUS_OBJECT_NAME_COLLISION;
                 } else {
                     ensure_boot_status_data();
-                    opened_handle = self.mint_boot_status_handle(desired_access);
+                    opened_handle = self.mint_boot_status_handle(desired_access, open_options);
                     if opened_handle.is_none() {
                         status = 0xC000_009A;
                     }
@@ -22660,9 +22765,10 @@ impl ExecNtHandler {
                         first_cluster,
                         volume_path.unwrap_or(&[]),
                         desired_access,
+                        open_options,
                     )
                 } else {
-                    Some(self.mint_handle())
+                    self.mint_cached_file_handle(desired_access, open_options)
                 };
                 let Some(h) = h else {
                     let status = 0xC000_009A;
@@ -22729,7 +22835,12 @@ impl ExecNtHandler {
             {
                 let mut status = nt_fs::STATUS_SUCCESS;
                 let opened_handle =
-                    self.mint_disk_file_handle(first_cluster, file_size, desired_access);
+                    self.mint_disk_file_handle(
+                        first_cluster,
+                        file_size,
+                        desired_access,
+                        open_options,
+                    );
                 if let Some(handle) = opened_handle {
                     self.queue_write(file_handle_out, handle);
                 } else {
@@ -29184,7 +29295,8 @@ impl ExecNtHandler {
                                 | nt_process::HandleObject::File(_)
                                 | nt_process::HandleObject::RoutedFile { .. }
                                 | nt_process::HandleObject::OverlayFile(_)
-                                | nt_process::HandleObject::BootStatusFile
+                                | nt_process::HandleObject::BootStatusFile { .. }
+                                | nt_process::HandleObject::CachedFile { .. }
                                 | nt_process::HandleObject::Opaque(_)
                         )
                     );
@@ -29500,6 +29612,47 @@ impl ExecNtHandler {
                 let output = args[2];
                 let length = nt_ulong_arg(args[3]) as usize;
                 let class = nt_ulong_arg(args[4]);
+                if matches!(
+                    class,
+                    nt_fs::FILE_ACCESS_INFORMATION
+                        | nt_fs::FILE_MODE_INFORMATION
+                        | nt_fs::FILE_ALIGNMENT_INFORMATION
+                ) {
+                    let mut encoded = [0u8; 4];
+                    let available = length.min(encoded.len());
+                    let required = match nt_fs::encode_query_information(
+                        class,
+                        nt_fs::QueryMetadata::default(),
+                        &mut encoded[..available],
+                    ) {
+                        Ok(required) => required,
+                        Err(status) => return status,
+                    };
+                    if iosb == 0 || output == 0 {
+                        return nt_syscall::STATUS_ACCESS_VIOLATION;
+                    }
+                    if iosb & 7 != 0 || output & 3 != 0 {
+                        return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
+                    }
+                    if !self.probe_user_output(iosb, 16) || !self.probe_user_output(output, length)
+                    {
+                        return nt_syscall::STATUS_ACCESS_VIOLATION;
+                    }
+                    let metadata = match self.io_manager_file_query_metadata(args[0]) {
+                        Ok(metadata) => metadata,
+                        Err(status) => return status,
+                    };
+                    nt_fs::encode_query_information(class, metadata, &mut encoded)
+                        .expect("validated I/O Manager file query class and length");
+                    let mut iosb_bytes = [0u8; 16];
+                    iosb_bytes[8..].copy_from_slice(&(required as u64).to_le_bytes());
+                    if !self.xas_try_write_buf(output, &encoded[..required])
+                        || !self.xas_try_write_buf(iosb, &iosb_bytes)
+                    {
+                        return nt_syscall::STATUS_ACCESS_VIOLATION;
+                    }
+                    return nt_fs::STATUS_SUCCESS;
+                }
                 if class == 41 {
                     const FILE_IO_COMPLETION_NOTIFICATION_INFORMATION_LEN: usize = 4;
                     if length < FILE_IO_COMPLETION_NOTIFICATION_INFORMATION_LEN {
@@ -29738,6 +29891,13 @@ impl ExecNtHandler {
                     Some(object) => object,
                     None => return nt_fs::STATUS_INVALID_HANDLE,
                 };
+                let access_flags = match self
+                    .pm
+                    .handle_access(pid, args[0] as nt_process::Handle)
+                {
+                    Some(access) => access,
+                    None => return nt_fs::STATUS_INVALID_HANDLE,
+                };
                 let size_directory_and_position = match object {
                     nt_process::HandleObject::DiskFile {
                         first_cluster,
@@ -29767,10 +29927,10 @@ impl ExecNtHandler {
                             )
                         })
                     }
-                    nt_process::HandleObject::BootStatusFile => {
+                    nt_process::HandleObject::BootStatusFile { .. } => {
                         Some((EXEC_BOOT_STATUS_FILE_SIZE as u64, false, 0, 1, false))
                     }
-                    nt_process::HandleObject::Opaque(_) => {
+                    nt_process::HandleObject::CachedFile { .. } => {
                         let ctx = match self.loop_ctx {
                             Some(ctx) => ctx,
                             None => return nt_fs::STATUS_INVALID_HANDLE,
@@ -29805,6 +29965,9 @@ impl ExecNtHandler {
                     allocation_size: size.saturating_add(0xFFF) & !0xFFF,
                     end_of_file: size,
                     current_byte_offset,
+                    access_flags,
+                    mode: 0,
+                    alignment_requirement: 0,
                     number_of_links,
                     delete_pending,
                     directory,
@@ -30553,7 +30716,9 @@ impl ExecNtHandler {
                 if boot_status_path_matches(name16) {
                     if create_options & nt_fs::FILE_DIRECTORY_FILE != 0 {
                         status = nt_fs::STATUS_OBJECT_NAME_COLLISION;
-                    } else if let Some(handle) = self.mint_boot_status_handle(desired_access) {
+                    } else if let Some(handle) =
+                        self.mint_boot_status_handle(desired_access, create_options)
+                    {
                         let disposition = create_disposition;
                         status = nt_fs::STATUS_SUCCESS;
                         info = match disposition {
@@ -30721,6 +30886,7 @@ impl ExecNtHandler {
                                 first_cluster,
                                 file_size,
                                 desired_access,
+                                create_options,
                             ) {
                                 Some(handle) => {
                                     self.queue_write(file_handle_out, handle);
@@ -30878,7 +31044,12 @@ impl ExecNtHandler {
                     {
                         status = nt_fs::STATUS_SUCCESS;
                         info = nt_fs::FILE_OPENED as u64;
-                        match self.mint_disk_file_handle(first_cluster, file_size, desired_access) {
+                        match self.mint_disk_file_handle(
+                            first_cluster,
+                            file_size,
+                            desired_access,
+                            create_options,
+                        ) {
                             Some(handle) => {
                                 self.queue_write(file_handle_out, handle);
                                 let count = NT_CREATE_FILE_READONLY_FAT_OPENS

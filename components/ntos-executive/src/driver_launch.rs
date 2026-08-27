@@ -44867,6 +44867,15 @@ pub(crate) fn hosted_file_create_options(file_id: u64) -> Option<CreateOptions> 
         .map(|file| file.create_options)
 }
 
+pub(crate) fn hosted_file_alignment_requirement(file_id: u64) -> Option<u32> {
+    let manager = io_manager_mut();
+    let file_id = FileId(file_id);
+    manager
+        .file(file_id)
+        .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID) && file.state.is_open())?;
+    manager.file_alignment_requirement(file_id).ok()
+}
+
 /// Allocate the kernel-only target-parent File after the source kind is known. Access is derived
 /// from provider attributes, while device ownership comes from the canonical source File.
 pub(crate) fn allocate_hosted_set_file_name_target(
