@@ -1740,6 +1740,25 @@ pub(crate) unsafe fn rename(
     status
 }
 
+/// Create a hard link to a writable-volume File through a canonical filesystem parse root.
+/// Process handles are resolved by the executive before entering this boundary.
+pub(crate) unsafe fn link(
+    file_id: u64,
+    root: nt_fs::FileRenameRoot,
+    target_name: &[u8],
+    replace_if_exists: bool,
+) -> u32 {
+    let Some(fs) = writable_fs() else {
+        return nt_fs::STATUS_INVALID_HANDLE;
+    };
+    let status = fs.zw_link_file(file_id, root, target_name, replace_if_exists);
+    if status == nt_fs::STATUS_SUCCESS {
+        OVERLAY_SET_INFO.fetch_add(1, Ordering::Relaxed);
+        mark_snapshot_dirty();
+    }
+    status
+}
+
 /// `NtQueryDirectoryFile` on a writable-volume DIRECTORY file object.
 pub(crate) unsafe fn query_directory(
     file_id: u64,
@@ -2292,6 +2311,9 @@ fn selftest(fs: &mut nt_fs::FileSystem) {
             }
         }
         fs.zw_close(scan.handle);
+    }
+    if dir.status == nt_fs::STATUS_SUCCESS {
+        fs.zw_close(dir.handle);
     }
     // (8) Delete-on-close really unlinks: the file, then the (now empty) directory, and a
     // by-path attribute query for each must MISS afterwards.

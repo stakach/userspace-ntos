@@ -1044,6 +1044,8 @@ pub(crate) unsafe fn query_nt_path_standard_info_into(
             end_of_file: 0,
             is_directory: true,
             attributes: nt_fs::FILE_ATTRIBUTE_DIRECTORY,
+            number_of_links: 1,
+            delete_pending: false,
         });
     }
     let fs = exec_fs()?;
@@ -1053,6 +1055,8 @@ pub(crate) unsafe fn query_nt_path_standard_info_into(
         end_of_file: size as u64,
         is_directory: attributes & nt_fs::FILE_ATTRIBUTE_DIRECTORY != 0,
         attributes,
+        number_of_links: 1,
+        delete_pending: false,
     })
 }
 

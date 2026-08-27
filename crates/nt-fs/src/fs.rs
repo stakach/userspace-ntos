@@ -18,14 +18,17 @@ use crate::snapshot_store::{
 };
 use crate::status::*;
 
-/// A MemFs node (spec §12.3). Carries the node's DOS attributes and its parent link so the volume
-/// can serve directory enumeration (`.`/`..` + children) and unlink, exactly like a real FSD.
+/// A MemFs node (spec §12.3). File data and attributes belong to this shared identity; directory
+/// entries own names. Directories retain their single parent for `..`, while regular files may have
+/// any number of entries and a corresponding link count.
 const ZERO_EXTENT_BLOB: usize = usize::MAX;
 const MEMFS_SNAPSHOT_MAGIC: [u8; 8] = *b"USNTFS\0\x01";
-const MEMFS_SNAPSHOT_VERSION: u16 = 1;
+const MEMFS_SNAPSHOT_VERSION_V1: u16 = 1;
+const MEMFS_SNAPSHOT_VERSION: u16 = 2;
 const MEMFS_SNAPSHOT_HEADER_LEN: usize = 32;
 const SNAP_REC_DIR: u8 = 1;
 const SNAP_REC_FILE: u8 = 2;
+const SNAP_REC_LINK: u8 = 3;
 const SNAP_EXTENT_ZERO: u8 = 0;
 const SNAP_EXTENT_DATA: u8 = 1;
 
@@ -446,17 +449,26 @@ impl<'a> SnapshotReader<'a> {
 struct MemFsNode {
     is_dir: bool,
     attributes: u32,
+    link_count: u32,
     parent: u64,
     data: FileData,
-    /// (folded name, as-created name, node id) — the folded name is the lookup key, the
-    /// as-created name is what directory enumeration reports (NT preserves creation case).
-    children: Vec<(String, String, u64)>,
+    children: Vec<MemFsDirEntry>,
+}
+
+/// A stable directory-entry identity. Multiple entries may name the same non-directory node; open
+/// File objects retain `id` so rename and delete-on-close act on the entry that was actually opened.
+struct MemFsDirEntry {
+    id: u64,
+    folded_name: String,
+    created_name: String,
+    node_id: u64,
 }
 
 /// An in-memory file system (spec §12) — the v0.1 `NtFileSystemRuntime`.
 pub struct MemFs {
     nodes: Vec<Option<MemFsNode>>,
     blobs: Vec<Vec<u8>>,
+    next_entry_id: u64,
 }
 
 fn fold(s: &str) -> String {
@@ -475,10 +487,12 @@ impl MemFs {
         let mut fs = MemFs {
             nodes: Vec::new(),
             blobs: Vec::new(),
+            next_entry_id: 1,
         };
         fs.nodes.push(Some(MemFsNode {
             is_dir: true,
             attributes: FILE_ATTRIBUTE_DIRECTORY,
+            link_count: 1,
             parent: 0,
             data: FileData::empty(),
             children: Vec::new(),
@@ -597,7 +611,7 @@ impl MemFs {
             return Err(MemFsSnapshotError::UnsupportedVersion);
         }
         let version = r.u16()?;
-        if version != MEMFS_SNAPSHOT_VERSION {
+        if !matches!(version, MEMFS_SNAPSHOT_VERSION_V1 | MEMFS_SNAPSHOT_VERSION) {
             return Err(MemFsSnapshotError::UnsupportedVersion);
         }
         let record_count = r.u32()?;
@@ -656,7 +670,9 @@ impl MemFs {
     pub fn to_snapshot(&self) -> Result<Vec<u8>, MemFsSnapshotError> {
         let mut record_count = 0u32;
         let mut path = String::new();
-        let payload_len = self.measure_snapshot_children(0, &mut path, &mut record_count)?;
+        let mut measured_files = Vec::new();
+        let payload_len =
+            self.measure_snapshot_children(0, &mut path, &mut measured_files, &mut record_count)?;
 
         let mut out = Vec::new();
         let total_len = MEMFS_SNAPSHOT_HEADER_LEN
@@ -666,7 +682,14 @@ impl MemFs {
             .map_err(|_| MemFsSnapshotError::OutOfMemory)?;
         out.resize(MEMFS_SNAPSHOT_HEADER_LEN, 0);
         let mut written_records = 0u32;
-        self.write_snapshot_children(0, &mut path, &mut out, &mut written_records)?;
+        let mut written_files = Vec::new();
+        self.write_snapshot_children(
+            0,
+            &mut path,
+            &mut written_files,
+            &mut out,
+            &mut written_records,
+        )?;
         if written_records != record_count || out.len() != total_len {
             return Err(MemFsSnapshotError::InvalidRecord);
         }
@@ -687,11 +710,17 @@ impl MemFs {
         let payload = &bytes[MEMFS_SNAPSHOT_HEADER_LEN..];
         let mut r = SnapshotReader::new(payload);
         let mut seen = 0u32;
+        let mut hardlink_nodes = Vec::new();
         while !r.is_empty() {
             let kind = r.u8()?;
             let attributes = r.u32()?;
             let path_len =
                 usize::try_from(r.u32()?).map_err(|_| MemFsSnapshotError::InvalidRecord)?;
+            let node_key = if info.version >= MEMFS_SNAPSHOT_VERSION {
+                r.u64()?
+            } else {
+                0
+            };
             let logical_len =
                 usize::try_from(r.u64()?).map_err(|_| MemFsSnapshotError::InvalidRecord)?;
             let extent_count =
@@ -699,6 +728,25 @@ impl MemFs {
             let path_bytes = r.take(path_len)?;
             let path =
                 core::str::from_utf8(path_bytes).map_err(|_| MemFsSnapshotError::InvalidPath)?;
+            if kind == SNAP_REC_LINK {
+                if info.version < MEMFS_SNAPSHOT_VERSION
+                    || node_key == 0
+                    || logical_len != 0
+                    || extent_count != 0
+                {
+                    return Err(MemFsSnapshotError::InvalidRecord);
+                }
+                let target = hardlink_nodes
+                    .iter()
+                    .find(|(key, _)| *key == node_key)
+                    .map(|(_, id)| *id)
+                    .ok_or(MemFsSnapshotError::InvalidRecord)?;
+                fs.restore_snapshot_link(path, target, attributes)?;
+                seen = seen
+                    .checked_add(1)
+                    .ok_or(MemFsSnapshotError::InvalidRecord)?;
+                continue;
+            }
             let is_dir = match kind {
                 SNAP_REC_DIR => true,
                 SNAP_REC_FILE => false,
@@ -715,6 +763,15 @@ impl MemFs {
                     return Err(MemFsSnapshotError::InvalidRecord);
                 };
                 node.data = data;
+                if info.version >= MEMFS_SNAPSHOT_VERSION {
+                    if node_key == 0
+                        || hardlink_nodes.iter().any(|(key, _)| *key == node_key)
+                        || hardlink_nodes.try_reserve_exact(1).is_err()
+                    {
+                        return Err(MemFsSnapshotError::InvalidRecord);
+                    }
+                    hardlink_nodes.push((node_key, id));
+                }
             }
             seen = seen
                 .checked_add(1)
@@ -745,11 +802,17 @@ impl MemFs {
         let mut fs = MemFs::new();
         let mut r = SnapshotStreamReader::new(source);
         let mut seen = 0u32;
+        let mut hardlink_nodes = Vec::new();
         while r.remaining() != 0 {
             let kind = r.u8()?;
             let attributes = r.u32()?;
             let path_len =
                 usize::try_from(r.u32()?).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
+            let node_key = if header.info.version >= MEMFS_SNAPSHOT_VERSION {
+                r.u64()?
+            } else {
+                0
+            };
             let logical_len =
                 usize::try_from(r.u64()?).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
             let extent_count =
@@ -757,6 +820,26 @@ impl MemFs {
             let path_bytes = r.vec(path_len)?;
             let path =
                 core::str::from_utf8(&path_bytes).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
+            if kind == SNAP_REC_LINK {
+                if header.info.version < MEMFS_SNAPSHOT_VERSION
+                    || node_key == 0
+                    || logical_len != 0
+                    || extent_count != 0
+                {
+                    return Err(SnapshotBlockStoreError::Corrupt);
+                }
+                let target = hardlink_nodes
+                    .iter()
+                    .find(|(key, _)| *key == node_key)
+                    .map(|(_, id)| *id)
+                    .ok_or(SnapshotBlockStoreError::Corrupt)?;
+                fs.restore_snapshot_link(path, target, attributes)
+                    .map_err(snapshot_error_to_store_error)?;
+                seen = seen
+                    .checked_add(1)
+                    .ok_or(SnapshotBlockStoreError::Corrupt)?;
+                continue;
+            }
             let is_dir = match kind {
                 SNAP_REC_DIR => true,
                 SNAP_REC_FILE => false,
@@ -776,6 +859,15 @@ impl MemFs {
                     return Err(SnapshotBlockStoreError::Corrupt);
                 };
                 node.data = data;
+                if header.info.version >= MEMFS_SNAPSHOT_VERSION {
+                    if node_key == 0
+                        || hardlink_nodes.iter().any(|(key, _)| *key == node_key)
+                        || hardlink_nodes.try_reserve_exact(1).is_err()
+                    {
+                        return Err(SnapshotBlockStoreError::Corrupt);
+                    }
+                    hardlink_nodes.push((node_key, id));
+                }
             }
             seen = seen
                 .checked_add(1)
@@ -840,6 +932,7 @@ impl MemFs {
         &self,
         parent: u64,
         path: &mut String,
+        seen_files: &mut Vec<u64>,
         out: &mut Vec<u8>,
         record_count: &mut u32,
     ) -> Result<(), MemFsSnapshotError> {
@@ -849,8 +942,10 @@ impl MemFs {
         if !node.is_dir {
             return Err(MemFsSnapshotError::InvalidRecord);
         }
-        for (_, name, child_id) in &node.children {
-            let Some(child) = self.node(*child_id) else {
+        for entry in &node.children {
+            let name = &entry.created_name;
+            let child_id = entry.node_id;
+            let Some(child) = self.node(child_id) else {
                 return Err(MemFsSnapshotError::InvalidRecord);
             };
             let prefix_len = path.len();
@@ -861,12 +956,23 @@ impl MemFs {
                 path.push('\\');
             }
             path.push_str(name);
-            self.write_snapshot_record(path, child, out)?;
+            let link_only = if child.is_dir {
+                false
+            } else if seen_files.contains(&child_id) {
+                true
+            } else {
+                seen_files
+                    .try_reserve_exact(1)
+                    .map_err(|_| MemFsSnapshotError::OutOfMemory)?;
+                seen_files.push(child_id);
+                false
+            };
+            self.write_snapshot_record(path, child_id, child, link_only, out)?;
             *record_count = record_count
                 .checked_add(1)
                 .ok_or(MemFsSnapshotError::InvalidRecord)?;
             if child.is_dir {
-                self.write_snapshot_children(*child_id, path, out, record_count)?;
+                self.write_snapshot_children(child_id, path, seen_files, out, record_count)?;
             }
             path.truncate(prefix_len);
         }
@@ -879,7 +985,14 @@ impl MemFs {
     ) -> Result<u32, SnapshotBlockStoreError> {
         let mut record_count = 0u32;
         let mut path = String::new();
-        self.write_snapshot_children_to_sink(0, &mut path, sink, &mut record_count)?;
+        let mut seen_files = Vec::new();
+        self.write_snapshot_children_to_sink(
+            0,
+            &mut path,
+            &mut seen_files,
+            sink,
+            &mut record_count,
+        )?;
         Ok(record_count)
     }
 
@@ -887,6 +1000,7 @@ impl MemFs {
         &self,
         parent: u64,
         path: &mut String,
+        seen_files: &mut Vec<u64>,
         sink: &mut S,
         record_count: &mut u32,
     ) -> Result<(), SnapshotBlockStoreError> {
@@ -896,8 +1010,10 @@ impl MemFs {
         if !node.is_dir {
             return Err(SnapshotBlockStoreError::Corrupt);
         }
-        for (_, name, child_id) in &node.children {
-            let Some(child) = self.node(*child_id) else {
+        for entry in &node.children {
+            let name = &entry.created_name;
+            let child_id = entry.node_id;
+            let Some(child) = self.node(child_id) else {
                 return Err(SnapshotBlockStoreError::Corrupt);
             };
             let prefix_len = path.len();
@@ -908,12 +1024,29 @@ impl MemFs {
                 path.push('\\');
             }
             path.push_str(name);
-            self.write_snapshot_record_to_sink(path, child, sink)?;
+            let link_only = if child.is_dir {
+                false
+            } else if seen_files.contains(&child_id) {
+                true
+            } else {
+                seen_files
+                    .try_reserve_exact(1)
+                    .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
+                seen_files.push(child_id);
+                false
+            };
+            self.write_snapshot_record_to_sink(path, child_id, child, link_only, sink)?;
             *record_count = record_count
                 .checked_add(1)
                 .ok_or(SnapshotBlockStoreError::Corrupt)?;
             if child.is_dir {
-                self.write_snapshot_children_to_sink(*child_id, path, sink, record_count)?;
+                self.write_snapshot_children_to_sink(
+                    child_id,
+                    path,
+                    seen_files,
+                    sink,
+                    record_count,
+                )?;
             }
             path.truncate(prefix_len);
         }
@@ -924,6 +1057,7 @@ impl MemFs {
         &self,
         parent: u64,
         path: &mut String,
+        seen_files: &mut Vec<u64>,
         record_count: &mut u32,
     ) -> Result<usize, MemFsSnapshotError> {
         let Some(node) = self.node(parent) else {
@@ -933,8 +1067,10 @@ impl MemFs {
             return Err(MemFsSnapshotError::InvalidRecord);
         }
         let mut total = 0usize;
-        for (_, name, child_id) in &node.children {
-            let Some(child) = self.node(*child_id) else {
+        for entry in &node.children {
+            let name = &entry.created_name;
+            let child_id = entry.node_id;
+            let Some(child) = self.node(child_id) else {
                 return Err(MemFsSnapshotError::InvalidRecord);
             };
             let prefix_len = path.len();
@@ -945,15 +1081,31 @@ impl MemFs {
                 path.push('\\');
             }
             path.push_str(name);
+            let link_only = if child.is_dir {
+                false
+            } else if seen_files.contains(&child_id) {
+                true
+            } else {
+                seen_files
+                    .try_reserve_exact(1)
+                    .map_err(|_| MemFsSnapshotError::OutOfMemory)?;
+                seen_files.push(child_id);
+                false
+            };
             total = total
-                .checked_add(self.snapshot_record_len(path, child)?)
+                .checked_add(self.snapshot_record_len(path, child, link_only)?)
                 .ok_or(MemFsSnapshotError::InvalidRecord)?;
             *record_count = record_count
                 .checked_add(1)
                 .ok_or(MemFsSnapshotError::InvalidRecord)?;
             if child.is_dir {
                 total = total
-                    .checked_add(self.measure_snapshot_children(*child_id, path, record_count)?)
+                    .checked_add(self.measure_snapshot_children(
+                        child_id,
+                        path,
+                        seen_files,
+                        record_count,
+                    )?)
                     .ok_or(MemFsSnapshotError::InvalidRecord)?;
             }
             path.truncate(prefix_len);
@@ -965,9 +1117,10 @@ impl MemFs {
         &self,
         path: &str,
         node: &MemFsNode,
+        link_only: bool,
     ) -> Result<usize, MemFsSnapshotError> {
         let path_len = u32::try_from(path.len()).map_err(|_| MemFsSnapshotError::InvalidPath)?;
-        let data_len = if node.is_dir {
+        let data_len = if node.is_dir || link_only {
             0
         } else {
             Self::snapshot_file_data_encoded_len(&self.blobs, &node.data)?
@@ -975,6 +1128,7 @@ impl MemFs {
         1usize
             .checked_add(4)
             .and_then(|n| n.checked_add(4))
+            .and_then(|n| n.checked_add(8))
             .and_then(|n| n.checked_add(8))
             .and_then(|n| n.checked_add(4))
             .and_then(|n| n.checked_add(path_len as usize))
@@ -985,32 +1139,37 @@ impl MemFs {
     fn write_snapshot_record(
         &self,
         path: &str,
+        node_id: u64,
         node: &MemFsNode,
+        link_only: bool,
         out: &mut Vec<u8>,
     ) -> Result<(), MemFsSnapshotError> {
         let path_len = u32::try_from(path.len()).map_err(|_| MemFsSnapshotError::InvalidPath)?;
-        let logical_len = if node.is_dir {
+        let logical_len = if node.is_dir || link_only {
             0
         } else {
             node.data.len(&self.blobs) as u64
         };
-        let extent_count = if node.is_dir {
+        let extent_count = if node.is_dir || link_only {
             0
         } else {
             u32::try_from(Self::snapshot_extent_count(&node.data))
                 .map_err(|_| MemFsSnapshotError::InvalidRecord)?
         };
-        out.push(if node.is_dir {
+        out.push(if link_only {
+            SNAP_REC_LINK
+        } else if node.is_dir {
             SNAP_REC_DIR
         } else {
             SNAP_REC_FILE
         });
         put_u32(out, node.attributes);
         put_u32(out, path_len);
+        put_u64(out, node_id);
         put_u64(out, logical_len);
         put_u32(out, extent_count);
         out.extend_from_slice(path.as_bytes());
-        if !node.is_dir {
+        if !node.is_dir && !link_only {
             self.write_snapshot_file_data(&node.data, out)?;
         }
         Ok(())
@@ -1019,35 +1178,40 @@ impl MemFs {
     fn write_snapshot_record_to_sink<S: SnapshotPayloadSink>(
         &self,
         path: &str,
+        node_id: u64,
         node: &MemFsNode,
+        link_only: bool,
         sink: &mut S,
     ) -> Result<(), SnapshotBlockStoreError> {
         let path_len = u32::try_from(path.len()).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
-        let logical_len = if node.is_dir {
+        let logical_len = if node.is_dir || link_only {
             0
         } else {
             u64::try_from(node.data.len(&self.blobs))
                 .map_err(|_| SnapshotBlockStoreError::Corrupt)?
         };
-        let extent_count = if node.is_dir {
+        let extent_count = if node.is_dir || link_only {
             0
         } else {
             u32::try_from(Self::snapshot_extent_count(&node.data))
                 .map_err(|_| SnapshotBlockStoreError::Corrupt)?
         };
-        let mut header = [0u8; 21];
-        header[0] = if node.is_dir {
+        let mut header = [0u8; 29];
+        header[0] = if link_only {
+            SNAP_REC_LINK
+        } else if node.is_dir {
             SNAP_REC_DIR
         } else {
             SNAP_REC_FILE
         };
         put_u32_at(&mut header[1..5], node.attributes);
         put_u32_at(&mut header[5..9], path_len);
-        put_u64_at(&mut header[9..17], logical_len);
-        put_u32_at(&mut header[17..21], extent_count);
+        put_u64_at(&mut header[9..17], node_id);
+        put_u64_at(&mut header[17..25], logical_len);
+        put_u32_at(&mut header[25..29], extent_count);
         sink.write_all(&header)?;
         sink.write_all(path.as_bytes())?;
-        if !node.is_dir {
+        if !node.is_dir && !link_only {
             self.write_snapshot_file_data_to_sink(&node.data, sink)?;
         }
         Ok(())
@@ -1241,6 +1405,37 @@ impl MemFs {
         Ok(id)
     }
 
+    fn restore_snapshot_link(
+        &mut self,
+        path: &str,
+        target: u64,
+        attributes: u32,
+    ) -> Result<(), MemFsSnapshotError> {
+        if !Self::valid_snapshot_path(path) || self.lookup(path).is_some() {
+            return Err(MemFsSnapshotError::InvalidPath);
+        }
+        let Some(target_node) = self.node(target) else {
+            return Err(MemFsSnapshotError::InvalidRecord);
+        };
+        if target_node.is_dir || target_node.attributes != attributes {
+            return Err(MemFsSnapshotError::InvalidRecord);
+        }
+        let Some((parent_path, leaf)) = Self::parent_and_leaf_relative(path) else {
+            return Err(MemFsSnapshotError::InvalidPath);
+        };
+        let Some(parent) = self.lookup(parent_path) else {
+            return Err(MemFsSnapshotError::InvalidPath);
+        };
+        self.insert_entry(parent, leaf, target).map_err(|status| {
+            if status == STATUS_INSUFFICIENT_RESOURCES {
+                MemFsSnapshotError::OutOfMemory
+            } else {
+                MemFsSnapshotError::InvalidRecord
+            }
+        })?;
+        Ok(())
+    }
+
     fn valid_snapshot_path(path: &str) -> bool {
         !path.is_empty()
             && !path.starts_with('\\')
@@ -1361,24 +1556,66 @@ impl MemFs {
     }
 
     fn child(&self, dir: u64, name: &str) -> Option<u64> {
+        self.child_entry(dir, name).map(|entry| entry.node_id)
+    }
+
+    fn child_entry(&self, dir: u64, name: &str) -> Option<&MemFsDirEntry> {
         let folded = fold(name);
         self.node(dir)?
             .children
             .iter()
-            .find(|(n, _, _)| *n == folded)
-            .map(|(_, _, id)| *id)
+            .find(|entry| entry.folded_name == folded)
     }
 
     fn child_folded_bytes(&self, dir: u64, name: &[u8]) -> Option<u64> {
         self.node(dir)?
             .children
             .iter()
-            .find(|(n, _, _)| n.as_bytes().eq_ignore_ascii_case(name))
-            .map(|(_, _, id)| *id)
+            .find(|entry| entry.folded_name.as_bytes().eq_ignore_ascii_case(name))
+            .map(|entry| entry.node_id)
     }
 
-    fn create_child(&mut self, parent: u64, name: &str, is_dir: bool) -> u64 {
-        let id = self.nodes.len() as u64;
+    fn allocate_entry_id(&mut self) -> Result<u64, u32> {
+        let id = self.next_entry_id;
+        self.next_entry_id = self
+            .next_entry_id
+            .checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        Ok(id)
+    }
+
+    fn insert_entry(&mut self, parent: u64, name: &str, node_id: u64) -> Result<u64, u32> {
+        if name.is_empty() || name == "." || name == ".." || name.contains('\\') {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let Some(link_count) = self.node(node_id).map(|node| node.link_count) else {
+            return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+        };
+        let next_link_count = link_count
+            .checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        let Some(parent_node) = self.node_mut(parent) else {
+            return Err(STATUS_OBJECT_PATH_NOT_FOUND);
+        };
+        if !parent_node.is_dir {
+            return Err(STATUS_NOT_A_DIRECTORY);
+        }
+        if parent_node.children.try_reserve_exact(1).is_err() {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        let entry_id = self.allocate_entry_id()?;
+        self.node_mut(parent).unwrap().children.push(MemFsDirEntry {
+            id: entry_id,
+            folded_name: fold(name),
+            created_name: String::from(name),
+            node_id,
+        });
+        self.node_mut(node_id).unwrap().link_count = next_link_count;
+        Ok(entry_id)
+    }
+
+    fn create_child_with_entry(&mut self, parent: u64, name: &str, is_dir: bool) -> (u64, u64) {
+        let node_id = self.nodes.len() as u64;
         self.nodes.push(Some(MemFsNode {
             is_dir,
             attributes: if is_dir {
@@ -1386,37 +1623,68 @@ impl MemFs {
             } else {
                 FILE_ATTRIBUTE_ARCHIVE
             },
+            link_count: 0,
             parent,
             data: FileData::empty(),
             children: Vec::new(),
         }));
-        self.node_mut(parent)
-            .unwrap()
-            .children
-            .push((fold(name), String::from(name), id));
-        id
+        let entry_id = self
+            .insert_entry(parent, name, node_id)
+            .expect("new child has a valid parent and entry capacity");
+        (node_id, entry_id)
     }
 
-    /// Unlink `id` from `parent` and free the node (spec §12.6 — delete-on-close). A non-empty
-    /// directory is refused, exactly as `IRP_MJ_SET_INFORMATION`/`FileDispositionInformation` does.
-    fn unlink(&mut self, parent: u64, id: u64) -> Result<(), u32> {
-        let node = self.node(id).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+    fn create_child(&mut self, parent: u64, name: &str, is_dir: bool) -> u64 {
+        self.create_child_with_entry(parent, name, is_dir).0
+    }
+
+    fn entry_location(&self, entry_id: u64) -> Option<(u64, usize, u64)> {
+        if entry_id == 0 {
+            return None;
+        }
+        for (parent, node) in self.nodes.iter().enumerate() {
+            let Some(node) = node else {
+                continue;
+            };
+            let Some(index) = node.children.iter().position(|entry| entry.id == entry_id) else {
+                continue;
+            };
+            return Some((parent as u64, index, node.children[index].node_id));
+        }
+        None
+    }
+
+    /// Remove one exact directory entry. The node remains resident at link count zero until the
+    /// FileSystem proves that no open File object still references it.
+    fn unlink_entry(&mut self, entry_id: u64) -> Result<u64, u32> {
+        let (parent, index, node_id) = self
+            .entry_location(entry_id)
+            .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+        let node = self.node(node_id).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
         if node.is_dir && !node.children.is_empty() {
             return Err(STATUS_DIRECTORY_NOT_EMPTY);
         }
         let parent_node = self.node_mut(parent).ok_or(STATUS_OBJECT_PATH_NOT_FOUND)?;
-        let before = parent_node.children.len();
-        parent_node.children.retain(|(_, _, child)| *child != id);
-        if parent_node.children.len() == before {
-            return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+        parent_node.children.remove(index);
+        let node = self.node_mut(node_id).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+        node.link_count = node.link_count.saturating_sub(1);
+        Ok(node_id)
+    }
+
+    fn reap_unlinked(&mut self, node_id: u64) {
+        if node_id != 0
+            && self
+                .node(node_id)
+                .is_some_and(|node| node.link_count == 0 && node.children.is_empty())
+        {
+            self.nodes[node_id as usize] = None;
         }
-        self.nodes[id as usize] = None;
-        Ok(())
     }
 
     fn rename_into_parent(
         &mut self,
         source: u64,
+        source_entry: u64,
         target_parent: u64,
         leaf: &str,
         replace_if_exists: bool,
@@ -1424,10 +1692,16 @@ impl MemFs {
         if source == 0 || leaf.is_empty() || leaf == "." || leaf == ".." || leaf.contains('\\') {
             return STATUS_INVALID_PARAMETER;
         }
+        let Some((source_parent, source_index, entry_node)) = self.entry_location(source_entry)
+        else {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        };
+        if entry_node != source {
+            return STATUS_INVALID_HANDLE;
+        }
         let Some(source_node) = self.node(source) else {
             return STATUS_INVALID_HANDLE;
         };
-        let source_parent = source_node.parent;
         let source_is_dir = source_node.is_dir;
         let Some(target_parent_node) = self.node(target_parent) else {
             return STATUS_OBJECT_PATH_NOT_FOUND;
@@ -1451,31 +1725,36 @@ impl MemFs {
             }
         }
 
-        if let Some(existing) = self.child(target_parent, leaf) {
-            if existing == source {
+        let existing = self
+            .child_entry(target_parent, leaf)
+            .map(|entry| (entry.id, entry.node_id));
+        if let Some((existing_entry, existing_node_id)) = existing {
+            if existing_entry == source_entry {
                 if let Some(parent_node) = self.node_mut(target_parent) {
-                    if let Some((folded, created, _)) = parent_node
-                        .children
-                        .iter_mut()
-                        .find(|(_, _, child)| *child == source)
-                    {
-                        *folded = fold(leaf);
-                        *created = String::from(leaf);
-                        return STATUS_SUCCESS;
-                    }
+                    let entry = &mut parent_node.children[source_index];
+                    entry.folded_name = fold(leaf);
+                    entry.created_name = String::from(leaf);
+                    return STATUS_SUCCESS;
                 }
                 return STATUS_OBJECT_NAME_NOT_FOUND;
             }
             if !replace_if_exists {
                 return STATUS_OBJECT_NAME_COLLISION;
             }
-            let Some(existing_node) = self.node(existing) else {
+            let Some(existing_node) = self.node(existing_node_id) else {
                 return STATUS_OBJECT_NAME_NOT_FOUND;
             };
             if source_is_dir || existing_node.is_dir {
                 return STATUS_ACCESS_DENIED;
             }
-            if let Err(status) = self.unlink(target_parent, existing) {
+            if source_parent != target_parent
+                && self
+                    .node_mut(target_parent)
+                    .is_none_or(|parent| parent.children.try_reserve_exact(1).is_err())
+            {
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            if let Err(status) = self.unlink_entry(existing_entry) {
                 return status;
             }
         } else if source_parent != target_parent {
@@ -1493,37 +1772,139 @@ impl MemFs {
         let Some(old_index) = old_parent
             .children
             .iter()
-            .position(|(_, _, child)| *child == source)
+            .position(|entry| entry.id == source_entry)
         else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
-        old_parent.children.remove(old_index);
+        let mut entry = old_parent.children.remove(old_index);
 
         let Some(source_node) = self.node_mut(source) else {
             return STATUS_INVALID_HANDLE;
         };
-        source_node.parent = target_parent;
+        if source_is_dir {
+            source_node.parent = target_parent;
+        }
 
         let Some(parent_node) = self.node_mut(target_parent) else {
             return STATUS_OBJECT_PATH_NOT_FOUND;
         };
-        parent_node
-            .children
-            .push((fold(leaf), String::from(leaf), source));
+        entry.folded_name = fold(leaf);
+        entry.created_name = String::from(leaf);
+        parent_node.children.push(entry);
         STATUS_SUCCESS
     }
 
-    fn rename_relative(&mut self, source: u64, target_path: &str, replace_if_exists: bool) -> u32 {
+    fn rename_relative(
+        &mut self,
+        source: u64,
+        source_entry: u64,
+        target_path: &str,
+        replace_if_exists: bool,
+    ) -> u32 {
         let Some((parent_path, leaf)) = Self::parent_and_leaf_relative(target_path) else {
             return STATUS_INVALID_PARAMETER;
         };
         let Some(parent) = self.lookup(parent_path) else {
             return STATUS_OBJECT_PATH_NOT_FOUND;
         };
-        self.rename_into_parent(source, parent, leaf, replace_if_exists)
+        self.rename_into_parent(source, source_entry, parent, leaf, replace_if_exists)
     }
 
     fn rename_relative_to_dir(
+        &mut self,
+        source: u64,
+        source_entry: u64,
+        root: u64,
+        target_path: &str,
+        replace_if_exists: bool,
+    ) -> u32 {
+        let Some((parent_path, leaf)) = Self::parent_and_leaf_relative(target_path) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let Some(parent) = self.lookup_from(root, parent_path) else {
+            return STATUS_OBJECT_PATH_NOT_FOUND;
+        };
+        self.rename_into_parent(source, source_entry, parent, leaf, replace_if_exists)
+    }
+
+    fn rename_relative_to_source_parent(
+        &mut self,
+        source: u64,
+        source_entry: u64,
+        target_path: &str,
+        replace_if_exists: bool,
+    ) -> u32 {
+        let Some((parent, _, entry_node)) = self.entry_location(source_entry) else {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        };
+        if entry_node != source {
+            return STATUS_INVALID_HANDLE;
+        }
+        self.rename_relative_to_dir(source, source_entry, parent, target_path, replace_if_exists)
+    }
+
+    fn link_into_parent(
+        &mut self,
+        source: u64,
+        target_parent: u64,
+        leaf: &str,
+        replace_if_exists: bool,
+    ) -> u32 {
+        if source == 0 || leaf.is_empty() || leaf == "." || leaf == ".." || leaf.contains('\\') {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let Some(source_node) = self.node(source) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        if source_node.is_dir {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let Some(parent) = self.node(target_parent) else {
+            return STATUS_OBJECT_PATH_NOT_FOUND;
+        };
+        if !parent.is_dir {
+            return STATUS_NOT_A_DIRECTORY;
+        }
+        let existing = self
+            .child_entry(target_parent, leaf)
+            .map(|entry| (entry.id, entry.node_id));
+        if let Some((existing_entry, existing_node)) = existing {
+            if existing_node == source {
+                return STATUS_SUCCESS;
+            }
+            if !replace_if_exists {
+                return STATUS_OBJECT_NAME_COLLISION;
+            }
+            if self.next_entry_id.checked_add(1).is_none() || source_node.link_count == u32::MAX {
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            if self.node(existing_node).is_some_and(|node| node.is_dir) {
+                return STATUS_ACCESS_DENIED;
+            }
+            if let Err(status) = self.unlink_entry(existing_entry) {
+                return status;
+            }
+        } else if self.next_entry_id.checked_add(1).is_none() || source_node.link_count == u32::MAX
+        {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        match self.insert_entry(target_parent, leaf, source) {
+            Ok(_) => STATUS_SUCCESS,
+            Err(status) => status,
+        }
+    }
+
+    fn link_relative(&mut self, source: u64, target_path: &str, replace_if_exists: bool) -> u32 {
+        let Some((parent_path, leaf)) = Self::parent_and_leaf_relative(target_path) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let Some(parent) = self.lookup(parent_path) else {
+            return STATUS_OBJECT_PATH_NOT_FOUND;
+        };
+        self.link_into_parent(source, parent, leaf, replace_if_exists)
+    }
+
+    fn link_relative_to_dir(
         &mut self,
         source: u64,
         root: u64,
@@ -1536,19 +1917,23 @@ impl MemFs {
         let Some(parent) = self.lookup_from(root, parent_path) else {
             return STATUS_OBJECT_PATH_NOT_FOUND;
         };
-        self.rename_into_parent(source, parent, leaf, replace_if_exists)
+        self.link_into_parent(source, parent, leaf, replace_if_exists)
     }
 
-    fn rename_relative_to_source_parent(
+    fn link_relative_to_source_parent(
         &mut self,
         source: u64,
+        source_entry: u64,
         target_path: &str,
         replace_if_exists: bool,
     ) -> u32 {
-        let Some(parent) = self.node(source).map(|node| node.parent) else {
-            return STATUS_INVALID_HANDLE;
+        let Some((parent, _, entry_node)) = self.entry_location(source_entry) else {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
         };
-        self.rename_relative_to_dir(source, parent, target_path, replace_if_exists)
+        if entry_node != source {
+            return STATUS_INVALID_HANDLE;
+        }
+        self.link_relative_to_dir(source, parent, target_path, replace_if_exists)
     }
 
     fn can_mark_delete_pending(&self, id: u64, ignore_readonly: bool) -> u32 {
@@ -1598,11 +1983,18 @@ impl MemFs {
 
     /// Resolve a volume-relative path to a node id.
     fn lookup(&self, path: &str) -> Option<u64> {
-        let mut cur = 0;
+        self.lookup_entry_from(0, path).map(|(node, _)| node)
+    }
+
+    fn lookup_entry_from(&self, start: u64, path: &str) -> Option<(u64, u64)> {
+        let mut cur = start;
+        let mut entry_id = 0;
         for comp in path.split('\\').filter(|c| !c.is_empty()) {
-            cur = self.child(cur, comp)?;
+            let entry = self.child_entry(cur, comp)?;
+            cur = entry.node_id;
+            entry_id = entry.id;
         }
-        Some(cur)
+        Some((cur, entry_id))
     }
 
     fn lookup_from(&self, start: u64, path: &str) -> Option<u64> {
@@ -1614,11 +2006,23 @@ impl MemFs {
     }
 
     fn lookup_folded_from(&self, start: u64, path: &[u8]) -> Option<u64> {
+        self.lookup_folded_entry_from(start, path)
+            .map(|(node, _)| node)
+    }
+
+    fn lookup_folded_entry_from(&self, start: u64, path: &[u8]) -> Option<(u64, u64)> {
         let mut cur = start;
+        let mut entry_id = 0;
         for comp in path.split(|byte| *byte == b'\\').filter(|c| !c.is_empty()) {
-            cur = self.child_folded_bytes(cur, comp)?;
+            let entry = self
+                .node(cur)?
+                .children
+                .iter()
+                .find(|entry| entry.folded_name.as_bytes().eq_ignore_ascii_case(comp))?;
+            cur = entry.node_id;
+            entry_id = entry.id;
         }
-        Some(cur)
+        Some((cur, entry_id))
     }
 
     fn lookup_folded_relative(&self, path: &[u8]) -> Option<u64> {
@@ -1662,11 +2066,11 @@ impl MemFs {
         disposition: u32,
         options: u32,
         file_attributes: u32,
-    ) -> Result<(u64, u32), u32> {
+    ) -> Result<(u64, u64, u32), u32> {
         let want_dir = options & FILE_DIRECTORY_FILE != 0;
-        let existing = self.lookup(rel_path);
+        let existing = self.lookup_entry_from(0, rel_path);
         match existing {
-            Some(id) => {
+            Some((id, entry_id)) => {
                 let is_dir = self.node(id).unwrap().is_dir;
                 if want_dir && !is_dir {
                     return Err(STATUS_NOT_A_DIRECTORY);
@@ -1675,19 +2079,19 @@ impl MemFs {
                     return Err(STATUS_FILE_IS_A_DIRECTORY);
                 }
                 match disposition {
-                    FILE_OPEN | FILE_OPEN_IF => Ok((id, FILE_OPENED)),
+                    FILE_OPEN | FILE_OPEN_IF => Ok((id, entry_id, FILE_OPENED)),
                     FILE_CREATE => Err(STATUS_OBJECT_NAME_COLLISION),
                     FILE_OVERWRITE | FILE_OVERWRITE_IF => {
                         if !is_dir {
                             self.node_mut(id).unwrap().data = FileData::empty();
                         }
-                        Ok((id, FILE_OVERWRITTEN))
+                        Ok((id, entry_id, FILE_OVERWRITTEN))
                     }
                     FILE_SUPERSEDE => {
                         if !is_dir {
                             self.node_mut(id).unwrap().data = FileData::empty();
                         }
-                        Ok((id, FILE_SUPERSEDED))
+                        Ok((id, entry_id, FILE_SUPERSEDED))
                     }
                     _ => Err(STATUS_INVALID_PARAMETER),
                 }
@@ -1703,7 +2107,7 @@ impl MemFs {
                     if !self.node(parent).unwrap().is_dir {
                         return Err(STATUS_OBJECT_PATH_NOT_FOUND);
                     }
-                    let id = self.create_child(parent, leaf, want_dir);
+                    let (id, entry_id) = self.create_child_with_entry(parent, leaf, want_dir);
                     // The caller's FileAttributes are honoured for a newly created file; a
                     // directory always carries FILE_ATTRIBUTE_DIRECTORY (NT sets it, not the
                     // caller). Zero means "defaults", which `create_child` already applied.
@@ -1716,7 +2120,7 @@ impl MemFs {
                             requested
                         };
                     }
-                    Ok((id, FILE_CREATED))
+                    Ok((id, entry_id, FILE_CREATED))
                 }
                 _ => Err(STATUS_INVALID_PARAMETER),
             },
@@ -1730,11 +2134,11 @@ impl MemFs {
         disposition: u32,
         options: u32,
         file_attributes: u32,
-    ) -> Result<(u64, u32), u32> {
+    ) -> Result<(u64, u64, u32), u32> {
         let want_dir = options & FILE_DIRECTORY_FILE != 0;
-        let existing = self.lookup_folded_from(start, rel_path);
+        let existing = self.lookup_folded_entry_from(start, rel_path);
         match existing {
-            Some(id) => {
+            Some((id, entry_id)) => {
                 let is_dir = self.node(id).unwrap().is_dir;
                 if want_dir && !is_dir {
                     return Err(STATUS_NOT_A_DIRECTORY);
@@ -1743,19 +2147,19 @@ impl MemFs {
                     return Err(STATUS_FILE_IS_A_DIRECTORY);
                 }
                 match disposition {
-                    FILE_OPEN | FILE_OPEN_IF => Ok((id, FILE_OPENED)),
+                    FILE_OPEN | FILE_OPEN_IF => Ok((id, entry_id, FILE_OPENED)),
                     FILE_CREATE => Err(STATUS_OBJECT_NAME_COLLISION),
                     FILE_OVERWRITE | FILE_OVERWRITE_IF => {
                         if !is_dir {
                             self.node_mut(id).unwrap().data = FileData::empty();
                         }
-                        Ok((id, FILE_OVERWRITTEN))
+                        Ok((id, entry_id, FILE_OVERWRITTEN))
                     }
                     FILE_SUPERSEDE => {
                         if !is_dir {
                             self.node_mut(id).unwrap().data = FileData::empty();
                         }
-                        Ok((id, FILE_SUPERSEDED))
+                        Ok((id, entry_id, FILE_SUPERSEDED))
                     }
                     _ => Err(STATUS_INVALID_PARAMETER),
                 }
@@ -1772,7 +2176,7 @@ impl MemFs {
                         return Err(STATUS_OBJECT_PATH_NOT_FOUND);
                     }
                     let leaf = core::str::from_utf8(leaf).map_err(|_| STATUS_INVALID_PARAMETER)?;
-                    let id = self.create_child(parent, leaf, want_dir);
+                    let (id, entry_id) = self.create_child_with_entry(parent, leaf, want_dir);
                     let requested = file_attributes & FILE_ATTRIBUTE_SETTABLE;
                     if requested != 0 {
                         let node = self.node_mut(id).unwrap();
@@ -1782,7 +2186,7 @@ impl MemFs {
                             requested
                         };
                     }
-                    Ok((id, FILE_CREATED))
+                    Ok((id, entry_id, FILE_CREATED))
                 }
                 _ => Err(STATUS_INVALID_PARAMETER),
             },
@@ -1795,7 +2199,7 @@ impl MemFs {
         disposition: u32,
         options: u32,
         file_attributes: u32,
-    ) -> Result<(u64, u32), u32> {
+    ) -> Result<(u64, u64, u32), u32> {
         self.create_folded_from(0, rel_path, disposition, options, file_attributes)
     }
 
@@ -1808,6 +2212,8 @@ impl MemFs {
             end_of_file: self.size(id),
             is_directory: self.is_dir(id),
             attributes: self.attributes(id),
+            number_of_links: self.node(id)?.link_count,
+            delete_pending: false,
         })
     }
 
@@ -1821,6 +2227,8 @@ impl MemFs {
             end_of_file: self.size(id),
             is_directory: self.is_dir(id),
             attributes: self.attributes(id),
+            number_of_links: self.node(id)?.link_count,
+            delete_pending: false,
         })
     }
 
@@ -1829,9 +2237,6 @@ impl MemFs {
     }
     fn attributes(&self, id: u64) -> u32 {
         self.node(id).map(|n| n.attributes).unwrap_or(0)
-    }
-    fn parent(&self, id: u64) -> u64 {
-        self.node(id).map(|n| n.parent).unwrap_or(0)
     }
     fn set_end_of_file(&mut self, id: u64, length: u64) -> u32 {
         let Some(n) = self.node(id) else {
@@ -1983,9 +2388,9 @@ impl MemFs {
                 self.make_directory_entry(1, "..", parent)
             }
             _ => {
-                let (_, name, child) = node.children.get(index - 2)?;
-                let target = self.node(*child)?;
-                self.make_directory_entry(index, name, target)
+                let child = node.children.get(index - 2)?;
+                let target = self.node(child.node_id)?;
+                self.make_directory_entry(index, &child.created_name, target)
             }
         }
     }
@@ -2468,6 +2873,7 @@ impl MemFs {
 /// An open file instance (a simplified `FILE_OBJECT` + MemFs open handle, spec §6.1, §12.4).
 struct FileObject {
     node_id: u64,
+    entry_id: u64,
     current_offset: u64,
     /// Handles referring to this file object. `NtDuplicateObject` adds one, `ZwClose` removes one;
     /// the object (and any pending delete) is actioned when the last one goes.
@@ -2485,6 +2891,8 @@ pub struct StandardInformation {
     pub end_of_file: u64,
     pub is_directory: bool,
     pub attributes: u32,
+    pub number_of_links: u32,
+    pub delete_pending: bool,
 }
 
 /// Canonical parse root for a file rename. This keeps process handles out of
@@ -2556,6 +2964,7 @@ impl FileSystem {
     fn publish_file_object(
         &mut self,
         node_id: u64,
+        entry_id: u64,
         information: u32,
         options: u32,
     ) -> CreateResult {
@@ -2568,6 +2977,7 @@ impl FileSystem {
         };
         self.handles[handle as usize] = Some(FileObject {
             node_id,
+            entry_id,
             current_offset: 0,
             references: 1,
             delete_pending: options & FILE_DELETE_ON_CLOSE != 0,
@@ -2647,6 +3057,24 @@ impl FileSystem {
         self.handles.get_mut(handle as usize)?.as_mut()
     }
 
+    fn reap_unlinked_nodes(&mut self) {
+        for node_id in 1..self.volume.nodes.len() as u64 {
+            if self
+                .volume
+                .node(node_id)
+                .is_none_or(|node| node.link_count != 0)
+                || self
+                    .handles
+                    .iter()
+                    .flatten()
+                    .any(|object| object.node_id == node_id)
+            {
+                continue;
+            }
+            self.volume.reap_unlinked(node_id);
+        }
+    }
+
     fn decode_utf16_name(bytes: &[u8]) -> Result<String, u32> {
         if bytes.is_empty() || bytes.len() % 2 != 0 {
             return Err(STATUS_INVALID_PARAMETER);
@@ -2695,19 +3123,26 @@ impl FileSystem {
         target: &str,
         replace_if_exists: bool,
     ) -> u32 {
-        let Some(source) = self.obj(handle).map(|object| object.node_id) else {
+        let Some((source, source_entry)) = self
+            .obj(handle)
+            .map(|object| (object.node_id, object.entry_id))
+        else {
             return STATUS_INVALID_HANDLE;
         };
         if target.is_empty() || self.to_relative(target).is_some() {
             return STATUS_INVALID_PARAMETER;
         }
-        match root {
+        let status = match root {
             FileRenameRoot::SourceParent => {
                 if target.starts_with('\\') {
                     return STATUS_INVALID_PARAMETER;
                 }
-                self.volume
-                    .rename_relative_to_source_parent(source, target, replace_if_exists)
+                self.volume.rename_relative_to_source_parent(
+                    source,
+                    source_entry,
+                    target,
+                    replace_if_exists,
+                )
             }
             FileRenameRoot::VolumeRoot => {
                 let target = target.trim_start_matches('\\');
@@ -2715,7 +3150,7 @@ impl FileSystem {
                     return STATUS_INVALID_PARAMETER;
                 }
                 self.volume
-                    .rename_relative(source, target, replace_if_exists)
+                    .rename_relative(source, source_entry, target, replace_if_exists)
             }
             FileRenameRoot::Directory(directory) => {
                 if target.starts_with('\\') {
@@ -2727,10 +3162,19 @@ impl FileSystem {
                 if !self.volume.is_dir(root_id) {
                     return STATUS_NOT_A_DIRECTORY;
                 }
-                self.volume
-                    .rename_relative_to_dir(source, root_id, target, replace_if_exists)
+                self.volume.rename_relative_to_dir(
+                    source,
+                    source_entry,
+                    root_id,
+                    target,
+                    replace_if_exists,
+                )
             }
+        };
+        if status == STATUS_SUCCESS {
+            self.reap_unlinked_nodes();
         }
+        status
     }
 
     /// Rename a live File using a canonical filesystem root and a UTF-16LE name.
@@ -2748,6 +3192,76 @@ impl FileSystem {
             Err(status) => return status,
         };
         self.rename_file_decoded(handle, root, &target, replace_if_exists)
+    }
+
+    fn link_file_decoded(
+        &mut self,
+        handle: u64,
+        root: FileRenameRoot,
+        target: &str,
+        replace_if_exists: bool,
+    ) -> u32 {
+        let Some((source, source_entry)) = self
+            .obj(handle)
+            .map(|object| (object.node_id, object.entry_id))
+        else {
+            return STATUS_INVALID_HANDLE;
+        };
+        if target.is_empty() || self.to_relative(target).is_some() {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let status = match root {
+            FileRenameRoot::SourceParent => {
+                if target.starts_with('\\') {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                self.volume.link_relative_to_source_parent(
+                    source,
+                    source_entry,
+                    target,
+                    replace_if_exists,
+                )
+            }
+            FileRenameRoot::VolumeRoot => {
+                let target = target.trim_start_matches('\\');
+                if target.is_empty() {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                self.volume.link_relative(source, target, replace_if_exists)
+            }
+            FileRenameRoot::Directory(directory) => {
+                if target.starts_with('\\') {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                let Some(root_id) = self.obj(directory).map(|object| object.node_id) else {
+                    return STATUS_INVALID_HANDLE;
+                };
+                if !self.volume.is_dir(root_id) {
+                    return STATUS_NOT_A_DIRECTORY;
+                }
+                self.volume
+                    .link_relative_to_dir(source, root_id, target, replace_if_exists)
+            }
+        };
+        if status == STATUS_SUCCESS {
+            self.reap_unlinked_nodes();
+        }
+        status
+    }
+
+    /// Create a hard link to a live non-directory File through a canonical filesystem parse root.
+    pub fn zw_link_file(
+        &mut self,
+        handle: u64,
+        root: FileRenameRoot,
+        target_name: &[u8],
+        replace_if_exists: bool,
+    ) -> u32 {
+        let target = match Self::decode_utf16_name(target_name) {
+            Ok(target) => normalize_separators(&target),
+            Err(status) => return status,
+        };
+        self.link_file_decoded(handle, root, &target, replace_if_exists)
     }
 
     /// `ZwCreateFile` (spec §8.1): resolve the path, apply the create disposition, and return a
@@ -2774,7 +3288,9 @@ impl FileSystem {
             .create(&rel, disposition, options, file_attributes)
         {
             // Directory/non-directory intent already validated in create().
-            Ok((node_id, information)) => self.publish_file_object(node_id, information, options),
+            Ok((node_id, entry_id, information)) => {
+                self.publish_file_object(node_id, entry_id, information, options)
+            }
             Err(status) => fail(status),
         }
     }
@@ -2801,7 +3317,9 @@ impl FileSystem {
             .volume
             .create_folded_relative(relative, disposition, options, file_attributes)
         {
-            Ok((node_id, information)) => self.publish_file_object(node_id, information, options),
+            Ok((node_id, entry_id, information)) => {
+                self.publish_file_object(node_id, entry_id, information, options)
+            }
             Err(status) => fail(status),
         }
     }
@@ -2842,7 +3360,9 @@ impl FileSystem {
             options,
             file_attributes,
         ) {
-            Ok((node_id, information)) => self.publish_file_object(node_id, information, options),
+            Ok((node_id, entry_id, information)) => {
+                self.publish_file_object(node_id, entry_id, information, options)
+            }
             Err(status) => fail(status),
         }
     }
@@ -2958,13 +3478,14 @@ impl FileSystem {
         let Some(rel) = self.to_relative(&normalize_separators(path)) else {
             return (STATUS_OBJECT_PATH_NOT_FOUND, 0);
         };
-        let (node_id, _) = match self
-            .volume
-            .create(&rel, FILE_OPEN_IF, FILE_NON_DIRECTORY_FILE, 0)
-        {
-            Ok(result) => result,
-            Err(status) => return (status, 0),
-        };
+        let (node_id, _, _) =
+            match self
+                .volume
+                .create(&rel, FILE_OPEN_IF, FILE_NON_DIRECTORY_FILE, 0)
+            {
+                Ok(result) => result,
+                Err(status) => return (status, 0),
+            };
         if self.volume.is_dir(node_id) {
             return (STATUS_FILE_IS_A_DIRECTORY, 0);
         }
@@ -3012,6 +3533,8 @@ impl FileSystem {
             end_of_file: self.volume.size(obj.node_id),
             is_directory: self.volume.is_dir(obj.node_id),
             attributes: self.volume.attributes(obj.node_id),
+            number_of_links: self.volume.node(obj.node_id)?.link_count,
+            delete_pending: obj.delete_pending,
         })
     }
 
@@ -3163,7 +3686,39 @@ impl FileSystem {
                     )
                 }
             }
-            FILE_LINK_INFORMATION => STATUS_NOT_SUPPORTED,
+            FILE_LINK_INFORMATION => {
+                let (replace_if_exists, root_directory, target) =
+                    match Self::decode_rename_information(data) {
+                        Ok(info) => info,
+                        Err(status) => return status,
+                    };
+                if root_directory == 0 {
+                    if let Some(target) = self.to_relative(&target) {
+                        self.link_file_decoded(
+                            handle,
+                            FileRenameRoot::VolumeRoot,
+                            &target,
+                            replace_if_exists,
+                        )
+                    } else if target.starts_with('\\') {
+                        STATUS_NOT_SAME_DEVICE
+                    } else {
+                        self.link_file_decoded(
+                            handle,
+                            FileRenameRoot::SourceParent,
+                            &target,
+                            replace_if_exists,
+                        )
+                    }
+                } else {
+                    self.link_file_decoded(
+                        handle,
+                        FileRenameRoot::Directory(root_directory),
+                        &target,
+                        replace_if_exists,
+                    )
+                }
+            }
             _ => STATUS_INVALID_INFO_CLASS,
         }
     }
@@ -3353,13 +3908,13 @@ impl FileSystem {
                 if obj.references != 0 {
                     return STATUS_SUCCESS;
                 }
-                let (node_id, delete_pending) = (obj.node_id, obj.delete_pending);
+                let (entry_id, delete_pending) = (obj.entry_id, obj.delete_pending);
                 // IRP_MJ_CLEANUP (last handle) then IRP_MJ_CLOSE → free the FILE_OBJECT.
                 self.handles[handle as usize] = None;
-                if delete_pending && node_id != 0 {
-                    let parent = self.volume.parent(node_id);
-                    let _ = self.volume.unlink(parent, node_id);
+                if delete_pending && entry_id != 0 {
+                    let _ = self.volume.unlink_entry(entry_id);
                 }
+                self.reap_unlinked_nodes();
                 STATUS_SUCCESS
             }
             None => STATUS_INVALID_HANDLE,

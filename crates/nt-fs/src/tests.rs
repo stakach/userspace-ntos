@@ -1135,6 +1135,48 @@ fn memfs_snapshot_rejects_corrupt_or_malformed_images() {
 }
 
 #[test]
+fn memfs_snapshot_v2_reader_accepts_v1_directory_records() {
+    fn crc32c(bytes: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in bytes {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0x82F6_3B78
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    let path = b"legacy";
+    let mut payload = alloc::vec::Vec::new();
+    payload.push(1); // SNAP_REC_DIR
+    payload.extend_from_slice(&FILE_ATTRIBUTE_DIRECTORY.to_le_bytes());
+    payload.extend_from_slice(&(path.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&0u64.to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(path);
+
+    let mut snapshot = alloc::vec![0u8; 32];
+    snapshot[0..8].copy_from_slice(b"USNTFS\0\x01");
+    snapshot[8..10].copy_from_slice(&32u16.to_le_bytes());
+    snapshot[10..12].copy_from_slice(&1u16.to_le_bytes());
+    snapshot[12..16].copy_from_slice(&1u32.to_le_bytes());
+    snapshot[16..24].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+    snapshot[24..28].copy_from_slice(&crc32c(&payload).to_le_bytes());
+    let header_crc = crc32c(&snapshot[..28]);
+    snapshot[28..32].copy_from_slice(&header_crc.to_le_bytes());
+    snapshot.extend_from_slice(&payload);
+
+    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 1);
+    let fs = FileSystem::from_volume_snapshot(&snapshot).unwrap();
+    assert!(fs.query_attributes(r"\??\C:\legacy").unwrap().is_directory);
+}
+
+#[test]
 fn snapshot_block_store_commits_latest_valid_slot() {
     let store = SnapshotBlockStore::new(2, 16);
     let mut dev = MemoryBlockDevice::new(512, 24);
@@ -2089,17 +2131,24 @@ fn writable_volume_set_information_and_delete() {
         fs.file_bytes(r"\??\C:\profiles\collision.txt"),
         Some(&b"0123"[..])
     );
-    // MemFs has one parent entry per node today; hardlinks require a real link-count/parent-entry
-    // model, so the class fails as unsupported instead of returning a fabricated link success.
     assert_eq!(
         fs.zw_set_information_file(
             f.handle,
             FILE_LINK_INFORMATION,
             &rename_information("alias.txt", dir.handle, false),
         ),
-        STATUS_NOT_SUPPORTED
+        STATUS_SUCCESS
     );
-    assert!(fs.query_attributes(r"\??\C:\profiles\alias.txt").is_none());
+    assert_eq!(
+        fs.file_bytes(r"\??\C:\profiles\alias.txt"),
+        Some(&b"0123"[..])
+    );
+    assert_eq!(
+        fs.zw_query_standard_information(f.handle)
+            .unwrap()
+            .number_of_links,
+        2
+    );
     // FileDispositionInformation deletes at close.
     assert_eq!(
         fs.zw_set_information_file(f.handle, FILE_DISPOSITION_INFORMATION, &[1u8]),
@@ -2109,9 +2158,187 @@ fn writable_volume_set_information_and_delete() {
     assert!(fs
         .query_attributes(r"\??\C:\profiles\collision.txt")
         .is_none());
+    assert_eq!(
+        fs.file_bytes(r"\??\C:\profiles\alias.txt"),
+        Some(&b"0123"[..])
+    );
     // The directory itself survived, and is still a directory.
     let d = fs.query_attributes(r"\??\C:\profiles").unwrap();
     assert!(d.is_directory && d.attributes & FILE_ATTRIBUTE_DIRECTORY != 0);
+}
+
+#[test]
+fn writable_volume_hardlinks_share_nodes_and_retain_exact_entries() {
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_directory(r"\??\C:\links"));
+    let source = fs.zw_create_file(
+        r"\??\C:\links\source.txt",
+        FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(source.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_write_file(source.handle, None, b"source"),
+        (STATUS_SUCCESS, 6)
+    );
+    let dir = fs.zw_create_file(
+        r"\??\C:\links",
+        FILE_READ_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE,
+    );
+    assert_eq!(dir.status, STATUS_SUCCESS);
+    let alias_name = rename_information("alias.txt", dir.handle, false);
+    assert_eq!(
+        fs.zw_link_file(
+            source.handle,
+            FileRenameRoot::Directory(dir.handle),
+            &alias_name[20..],
+            false,
+        ),
+        STATUS_SUCCESS
+    );
+
+    let alias = fs.zw_create_file(
+        r"\??\C:\links\alias.txt",
+        FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(alias.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_query_standard_information(alias.handle)
+            .unwrap()
+            .number_of_links,
+        2
+    );
+    assert_eq!(
+        fs.zw_write_file(alias.handle, Some(0), b"shared"),
+        (STATUS_SUCCESS, 6)
+    );
+    assert_eq!(
+        fs.file_bytes(r"\??\C:\links\source.txt"),
+        Some(&b"shared"[..])
+    );
+
+    let renamed = rename_information("renamed.txt", 0, false);
+    assert_eq!(
+        fs.zw_rename_file(
+            alias.handle,
+            FileRenameRoot::SourceParent,
+            &renamed[20..],
+            false,
+        ),
+        STATUS_SUCCESS
+    );
+    assert!(fs.query_attributes(r"\??\C:\links\alias.txt").is_none());
+    assert!(fs.query_attributes(r"\??\C:\links\source.txt").is_some());
+    assert!(fs.query_attributes(r"\??\C:\links\renamed.txt").is_some());
+
+    assert_eq!(
+        fs.zw_set_information_file(source.handle, FILE_DISPOSITION_INFORMATION, &[1]),
+        STATUS_SUCCESS
+    );
+    assert_eq!(fs.zw_close(source.handle), STATUS_SUCCESS);
+    assert!(fs.query_attributes(r"\??\C:\links\source.txt").is_none());
+    assert_eq!(
+        fs.zw_query_standard_information(alias.handle)
+            .unwrap()
+            .number_of_links,
+        1
+    );
+
+    let displaced = fs.zw_create_file(
+        r"\??\C:\links\target.txt",
+        FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(displaced.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_write_file(displaced.handle, None, b"old"),
+        (STATUS_SUCCESS, 3)
+    );
+    let target = rename_information("target.txt", dir.handle, true);
+    assert_eq!(
+        fs.zw_link_file(
+            alias.handle,
+            FileRenameRoot::Directory(dir.handle),
+            &target[20..],
+            true,
+        ),
+        STATUS_SUCCESS
+    );
+    assert_eq!(
+        fs.file_bytes(r"\??\C:\links\target.txt"),
+        Some(&b"shared"[..])
+    );
+    assert_eq!(
+        fs.zw_read_file(displaced.handle, Some(0), 8),
+        (STATUS_SUCCESS, b"old".to_vec())
+    );
+    assert_eq!(fs.zw_close(displaced.handle), STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_query_standard_information(alias.handle)
+            .unwrap()
+            .number_of_links,
+        2
+    );
+    assert_eq!(
+        fs.zw_link_file(
+            dir.handle,
+            FileRenameRoot::Directory(dir.handle),
+            &target[20..],
+            true,
+        ),
+        STATUS_INVALID_PARAMETER
+    );
+
+    let snapshot = fs.export_volume_snapshot().unwrap();
+    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 2);
+    let mut restored = FileSystem::from_volume_snapshot(&snapshot).unwrap();
+    let restored_alias = restored.zw_create_file(
+        r"\??\C:\links\renamed.txt",
+        FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    let restored_target = restored.zw_create_file(
+        r"\??\C:\links\target.txt",
+        FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(restored_alias.status, STATUS_SUCCESS);
+    assert_eq!(restored_target.status, STATUS_SUCCESS);
+    assert_eq!(
+        restored
+            .zw_query_standard_information(restored_alias.handle)
+            .unwrap()
+            .number_of_links,
+        2
+    );
+    assert_eq!(
+        restored.zw_write_file(restored_target.handle, Some(0), b"again!"),
+        (STATUS_SUCCESS, 6)
+    );
+    assert_eq!(
+        restored.file_bytes(r"\??\C:\links\renamed.txt"),
+        Some(&b"again!"[..])
+    );
 }
 
 #[test]

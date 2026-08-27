@@ -18892,7 +18892,7 @@ impl ExecNtHandler {
         Ok(length)
     }
 
-    unsafe fn resolve_local_rename_target(
+    unsafe fn resolve_local_set_file_name_target(
         &self,
         information: nt_fs::SetFileNameInformation<'_>,
         output: &mut [u8],
@@ -19062,6 +19062,8 @@ impl ExecNtHandler {
                     end_of_file: size as u64,
                     is_directory: attributes & nt_fs::FILE_ATTRIBUTE_DIRECTORY != 0,
                     attributes,
+                    number_of_links: 1,
+                    delete_pending: false,
                 })
             }
             FileParseRoot::NonDirectoryFile => Err(nt_fs::STATUS_NOT_A_DIRECTORY),
@@ -29839,17 +29841,24 @@ impl ExecNtHandler {
                         if open.first_cluster != first_cluster || open.size != size {
                             return nt_fs::STATUS_INVALID_HANDLE;
                         }
-                        Some((size as u64, false, open.current_offset))
+                        Some((size as u64, false, open.current_offset, 1, false))
                     }
-                    nt_process::HandleObject::Directory { .. } => Some((0, true, 0)),
+                    nt_process::HandleObject::Directory { .. } => Some((0, true, 0, 1, false)),
                     // ★ THE WRITABLE FILESYSTEM OVERLAY: the size/kind the volume really holds.
                     nt_process::HandleObject::OverlayFile(file_id) => {
                         let offset = crate::writable_fs::current_offset(file_id).unwrap_or(0);
-                        crate::writable_fs::standard_information(file_id)
-                            .map(|info| (info.end_of_file, info.is_directory, offset))
+                        crate::writable_fs::standard_information(file_id).map(|info| {
+                            (
+                                info.end_of_file,
+                                info.is_directory,
+                                offset,
+                                info.number_of_links,
+                                info.delete_pending,
+                            )
+                        })
                     }
                     nt_process::HandleObject::BootStatusFile => {
-                        Some((EXEC_BOOT_STATUS_FILE_SIZE as u64, false, 0))
+                        Some((EXEC_BOOT_STATUS_FILE_SIZE as u64, false, 0, 1, false))
                     }
                     nt_process::HandleObject::Opaque(_) => {
                         let ctx = match self.loop_ctx {
@@ -29860,13 +29869,13 @@ impl ExecNtHandler {
                         if let Some(index) = reg.index_for_file(self.pi, args[0]) {
                             ctx.dll_pes()[index]
                                 .as_ref()
-                                .map(|pe| (pe.bytes().len() as u64, false, 0))
+                                .map(|pe| (pe.bytes().len() as u64, false, 0, 1, false))
                         } else if let Some(index) =
                             (&*ctx.exe_images).index_for_file(self.pi, args[0])
                         {
                             (&*ctx.exe_images)
                                 .get(index)
-                                .map(|slot| (slot.metadata.file_size, false, 0))
+                                .map(|slot| (slot.metadata.file_size, false, 0, 1, false))
                         } else {
                             None
                         }
@@ -29877,16 +29886,17 @@ impl ExecNtHandler {
                     }
                     _ => return 0xC000_0024, // STATUS_OBJECT_TYPE_MISMATCH
                 };
-                let (size, directory, current_byte_offset) = match size_directory_and_position {
-                    Some(metadata) => metadata,
-                    None => return nt_fs::STATUS_INVALID_HANDLE,
-                };
+                let (size, directory, current_byte_offset, number_of_links, delete_pending) =
+                    match size_directory_and_position {
+                        Some(metadata) => metadata,
+                        None => return nt_fs::STATUS_INVALID_HANDLE,
+                    };
                 let metadata = nt_fs::QueryMetadata {
                     allocation_size: size.saturating_add(0xFFF) & !0xFFF,
                     end_of_file: size,
                     current_byte_offset,
-                    number_of_links: 1,
-                    delete_pending: false,
+                    number_of_links,
+                    delete_pending,
                     directory,
                 };
                 nt_fs::encode_query_information(class, metadata, &mut encoded)
@@ -31962,19 +31972,35 @@ impl ExecNtHandler {
                 // (position / end-of-file / disposition / basic). Checked first so an overlay handle
                 // never falls into the pipe-only classes below.
                 if let Some(file_id) = overlay_file {
-                    let status = if information_class == nt_fs::FILE_RENAME_INFORMATION {
+                    let status = if matches!(
+                        information_class,
+                        nt_fs::FILE_RENAME_INFORMATION | nt_fs::FILE_LINK_INFORMATION
+                    ) {
                         match nt_fs::parse_set_file_name_information(&payload) {
                             Err(status) => status,
-                            Ok(rename) => {
+                            Ok(set_name) => {
                                 let mut target = [0u8; FILE_VOLUME_RELATIVE_CAP * 2];
-                                match self.resolve_local_rename_target(rename, &mut target) {
+                                match self.resolve_local_set_file_name_target(set_name, &mut target)
+                                {
                                     Err(status) => status,
-                                    Ok((root, target_len)) => crate::writable_fs::rename(
-                                        file_id,
-                                        root,
-                                        &target[..target_len],
-                                        rename.replace_if_exists,
-                                    ),
+                                    Ok((root, target_len)) => {
+                                        let target = &target[..target_len];
+                                        if information_class == nt_fs::FILE_RENAME_INFORMATION {
+                                            crate::writable_fs::rename(
+                                                file_id,
+                                                root,
+                                                target,
+                                                set_name.replace_if_exists,
+                                            )
+                                        } else {
+                                            crate::writable_fs::link(
+                                                file_id,
+                                                root,
+                                                target,
+                                                set_name.replace_if_exists,
+                                            )
+                                        }
+                                    }
                                 }
                             }
                         }
