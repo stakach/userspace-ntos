@@ -18690,16 +18690,24 @@ impl ExecNtHandler {
         &self,
         captured: &CapturedFileObjectAttributes,
     ) -> Result<FileParseRoot, u32> {
-        if captured.root == 0 {
-            return if captured.name().first() == Some(&(b'\\' as u16)) {
+        self.resolve_file_parse_root_for(captured.root, captured.name())
+    }
+
+    fn resolve_file_parse_root_for(
+        &self,
+        root: u64,
+        name: &[u16],
+    ) -> Result<FileParseRoot, u32> {
+        if root == 0 {
+            return if name.first() == Some(&(b'\\' as u16)) {
                 Ok(FileParseRoot::Absolute)
             } else {
                 Err(STATUS_OBJECT_PATH_SYNTAX_BAD)
             };
         }
-        if captured.root >= OBJ_HANDLE_BASE {
+        if root >= OBJ_HANDLE_BASE {
             let index = self.object_namespace_index_for_handle(
-                captured.root,
+                root,
                 Some(OBJ_KIND_DIRECTORY),
                 DIRECTORY_TRAVERSE_ACCESS,
             )?;
@@ -18708,12 +18716,12 @@ impl ExecNtHandler {
         let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
         let object = self
             .pm
-            .lookup_handle(pid, captured.root as nt_process::Handle)
+            .lookup_handle(pid, root as nt_process::Handle)
             .ok_or(STATUS_INVALID_HANDLE)?;
         match object {
             nt_process::HandleObject::Opaque(_) => {
                 let index = self.object_namespace_index_for_handle(
-                    captured.root,
+                    root,
                     Some(OBJ_KIND_DIRECTORY),
                     DIRECTORY_TRAVERSE_ACCESS,
                 )?;
@@ -18808,6 +18816,154 @@ impl ExecNtHandler {
         }
         output[parent.len() + separator..length].copy_from_slice(child);
         Ok(length)
+    }
+
+    fn decode_set_file_name_units(
+        file_name: &[u8],
+        output: &mut [u16],
+    ) -> Result<usize, u32> {
+        if file_name.is_empty() || file_name.len() & 1 != 0 || file_name.len() / 2 > output.len() {
+            return Err(nt_fs::STATUS_OBJECT_NAME_INVALID);
+        }
+        for (index, word) in file_name.chunks_exact(2).enumerate() {
+            output[index] = u16::from_le_bytes([word[0], word[1]]);
+        }
+        Ok(file_name.len() / 2)
+    }
+
+    fn encode_ascii_path_utf16le(path: &[u8], output: &mut [u8]) -> Result<usize, u32> {
+        let length = path
+            .len()
+            .checked_mul(2)
+            .filter(|length| *length <= output.len())
+            .ok_or(nt_fs::STATUS_OBJECT_NAME_INVALID)?;
+        for (index, &byte) in path.iter().enumerate() {
+            if !byte.is_ascii() {
+                return Err(nt_fs::STATUS_OBJECT_NAME_INVALID);
+            }
+            output[index * 2..index * 2 + 2].copy_from_slice(&(byte as u16).to_le_bytes());
+        }
+        Ok(length)
+    }
+
+    unsafe fn resolve_local_rename_target(
+        &self,
+        information: nt_fs::SetFileNameInformation<'_>,
+        output: &mut [u8],
+    ) -> Result<(nt_fs::FileRenameRoot, usize), u32> {
+        let mut name_units = [0u16; FILE_OBJECT_NAME_CAP];
+        let name_len = Self::decode_set_file_name_units(information.file_name, &mut name_units)?;
+        let name = &name_units[..name_len];
+        if information.root_directory == 0 && name.first() != Some(&(b'\\' as u16)) {
+            if output.len() < information.file_name.len() {
+                return Err(nt_fs::STATUS_OBJECT_NAME_INVALID);
+            }
+            output[..information.file_name.len()].copy_from_slice(information.file_name);
+            return Ok((
+                nt_fs::FileRenameRoot::SourceParent,
+                information.file_name.len(),
+            ));
+        }
+
+        let root = self.resolve_file_parse_root_for(information.root_directory, name)?;
+        let mut namespace_path = [0u8; NAMED_OBJECT_PATH_CAP];
+        let mut absolute_name = [0u16; FILE_OBJECT_NAME_CAP];
+        let (root, name) = self.normalize_object_directory_file_name(
+            root,
+            name,
+            &mut namespace_path,
+            &mut absolute_name,
+        )?;
+        match root {
+            FileParseRoot::OverlayFile(root_file_id) => {
+                let Some(standard) = crate::writable_fs::standard_information(root_file_id) else {
+                    return Err(nt_fs::STATUS_INVALID_HANDLE);
+                };
+                if !standard.is_directory {
+                    return Err(nt_fs::STATUS_NOT_A_DIRECTORY);
+                }
+                if output.len() < information.file_name.len() {
+                    return Err(nt_fs::STATUS_OBJECT_NAME_INVALID);
+                }
+                output[..information.file_name.len()].copy_from_slice(information.file_name);
+                Ok((
+                    nt_fs::FileRenameRoot::Directory(root_file_id),
+                    information.file_name.len(),
+                ))
+            }
+            FileParseRoot::FatDirectory {
+                first_cluster,
+                object_id,
+            } => {
+                let mut folded = [0u8; FILE_OBJECT_NAME_CAP];
+                let mut relative = [0u8; FILE_OBJECT_NAME_CAP];
+                let child_len = Self::capture_relative_file_path(name, &mut folded, &mut relative)?;
+                let mut parent = [0u8; nt_fs::DIRECTORY_OPEN_PATH_CAP];
+                let parent_len = {
+                    let open = self.directory_opens.get(object_id)?;
+                    if open.first_cluster != first_cluster
+                        || open.volume_relative_path().len() > parent.len()
+                    {
+                        return Err(nt_fs::STATUS_INVALID_HANDLE);
+                    }
+                    let length = open.volume_relative_path().len();
+                    parent[..length].copy_from_slice(open.volume_relative_path());
+                    length
+                };
+                let mut target = [0u8; FILE_VOLUME_RELATIVE_CAP];
+                let target_len = Self::join_volume_relative_path(
+                    &parent[..parent_len],
+                    &relative[..child_len],
+                    &mut target,
+                )?;
+                let encoded = Self::encode_ascii_path_utf16le(&target[..target_len], output)?;
+                Ok((nt_fs::FileRenameRoot::VolumeRoot, encoded))
+            }
+            FileParseRoot::Absolute => {
+                let mut folded = [0u8; FILE_OBJECT_NAME_CAP];
+                let mut relative = [0u8; FILE_VOLUME_RELATIVE_CAP];
+                let length = crate::writable_fs::volume_path_into(name, &mut folded, &mut relative)
+                    .ok_or(nt_fs::STATUS_NOT_SAME_DEVICE)?;
+                let encoded = Self::encode_ascii_path_utf16le(&relative[..length], output)?;
+                Ok((nt_fs::FileRenameRoot::VolumeRoot, encoded))
+            }
+            FileParseRoot::HostedFile { .. } => Err(nt_fs::STATUS_NOT_SAME_DEVICE),
+            FileParseRoot::NonDirectoryFile => Err(nt_fs::STATUS_NOT_A_DIRECTORY),
+            FileParseRoot::ObjectDirectory { .. } => Err(nt_fs::STATUS_INVALID_HANDLE),
+        }
+    }
+
+    fn resolve_hosted_set_file_name_target(
+        &self,
+        source: HostedFileRoute,
+        information: nt_fs::SetFileNameInformation<'_>,
+    ) -> Result<Option<u64>, u32> {
+        let mut name_units = [0u16; FILE_OBJECT_NAME_CAP];
+        let name_len = Self::decode_set_file_name_units(information.file_name, &mut name_units)?;
+        let name = &name_units[..name_len];
+        if information.root_directory == 0 && name.first() != Some(&(b'\\' as u16)) {
+            return Ok(None);
+        }
+        match self.resolve_file_parse_root_for(information.root_directory, name)? {
+            FileParseRoot::HostedFile { file_id, device_id } => {
+                if name.first() == Some(&(b'\\' as u16)) {
+                    return Err(nt_fs::STATUS_INVALID_PARAMETER);
+                }
+                if device_id != source.device_id {
+                    return Err(nt_fs::STATUS_NOT_SAME_DEVICE);
+                }
+                Ok(Some(file_id))
+            }
+            FileParseRoot::OverlayFile(_) | FileParseRoot::FatDirectory { .. } => {
+                Err(nt_fs::STATUS_NOT_SAME_DEVICE)
+            }
+            FileParseRoot::NonDirectoryFile => Err(nt_fs::STATUS_NOT_A_DIRECTORY),
+            FileParseRoot::Absolute | FileParseRoot::ObjectDirectory { .. } => {
+                // NT opens an absolute target directory File before dispatch. That nested provider
+                // CREATE must exist before this form can cross an isolated-driver boundary.
+                Err(STATUS_NOT_SUPPORTED)
+            }
+        }
     }
 
     unsafe fn query_local_file_relative(
@@ -19623,6 +19779,118 @@ impl ExecNtHandler {
             information,
             pending_irp_id.map(|irp_id| irp_id.raw()).unwrap_or(0),
         ))
+    }
+
+    unsafe fn dispatch_hosted_file_set_information_for(
+        &mut self,
+        route: HostedFileRoute,
+        parameters: nt_io_manager::SetInformationParameters,
+        input: &[u8],
+    ) -> Result<(i32, u64, u64), u32> {
+        let (status, information, pending_irp_id, _) =
+            driver_launch::dispatch_hosted_file_set_information_irp_result_exact(
+                route.file_id,
+                self.current_tid,
+                parameters,
+                input,
+            )?;
+        if driver_launch::device_id_by_name("\\Device\\NamedPipe") == Some(route.device_id) {
+            NPFS_ROUTED_IRPS.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok((
+            status,
+            information,
+            pending_irp_id.map(|irp_id| irp_id.raw()).unwrap_or(0),
+        ))
+    }
+
+    unsafe fn service_hosted_set_information(
+        &mut self,
+        handle: u64,
+        iosb: u64,
+        route: HostedFileRoute,
+        parameters: nt_io_manager::SetInformationParameters,
+        input: &[u8],
+    ) -> (u32, u64) {
+        let file_id = route.file_id;
+        let synchronous_file = match self.file_completion.is_synchronous(file_id) {
+            Ok(synchronous) => synchronous,
+            Err(status) => return (status, 0),
+        };
+        if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
+            || !wait_reply_pool_has_free()
+            || !self.reserve_pending_file_io_owner()
+        {
+            return (nt_io_completion::STATUS_INSUFFICIENT_RESOURCES, 0);
+        }
+        let Some(granted_access) = self.hosted_file_access_for(handle) else {
+            return (nt_fs::STATUS_INVALID_HANDLE, 0);
+        };
+        match self.prepare_hosted_file_io(route, handle, granted_access) {
+            Ok(true) => {}
+            Ok(false) => return (STATUS_PENDING, 0),
+            Err(status) => return (status, 0),
+        }
+        if self.file_completion.set_signaled(file_id, false).is_err() {
+            self.release_file_reference(file_id);
+            return (nt_fs::STATUS_INVALID_HANDLE, 0);
+        }
+        let (mut status, mut information, pending_irp_id) =
+            match self.dispatch_hosted_file_set_information_for(route, parameters, input) {
+                Ok((driver_status, completed, irp_id)) => {
+                    (driver_status as u32, completed, irp_id)
+                }
+                Err(route_status) => (route_status, 0, 0),
+            };
+        if status == STATUS_PENDING {
+            if pending_irp_id == 0 {
+                status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
+                information = 0;
+                if synchronous_file {
+                    let _ = self.signal_file_completion(file_id, status);
+                }
+                self.release_file_reference(file_id);
+            } else {
+                self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
+                    file_id,
+                    irp_id: pending_irp_id,
+                    major: major::IRP_MJ_SET_INFORMATION,
+                    control_code: 0,
+                    operation: nt_io_manager::PendingFileIoOperation::Transfer,
+                    delivery_state: 0,
+                    pi: self.pi as u32,
+                    tid: self.current_tid,
+                    sync_lock_owner_tid: 0,
+                    badge: self.current_badge,
+                    consumer_abandoned: false,
+                    user_apc_interrupt_requested: false,
+                    output_va: 0,
+                    output_len: 0,
+                    output_offset: 0,
+                    iosb_va: iosb,
+                    apc_routine: 0,
+                    apc_context: 0,
+                    completion_port_suppressed: true,
+                    signal_file: synchronous_file,
+                    publish_iocp: false,
+                    event_obj_idx: u64::MAX,
+                    reply_cap: 0,
+                    reply_required: false,
+                    native_call_transport: false,
+                    reply_mrs: [0; 18],
+                    resume_ip: 0,
+                    resume_sp: 0,
+                    resume_flags: 0,
+                });
+                self.pending_file_io_wait = true;
+            }
+        } else {
+            if synchronous_file {
+                let _ = self.signal_file_completion(file_id, status);
+            }
+            self.release_file_reference(file_id);
+        }
+        (status, information)
     }
 
     /// Resolve a process-local typed file handle to its canonical hosted File identity.
@@ -31195,36 +31463,22 @@ impl ExecNtHandler {
                 let information_class = nt_ulong_arg(args[4]);
                 let length = nt_ulong_arg(args[3]) as usize;
                 let overlay_file = self.overlay_file_id_for(args[0]);
-                // ★ 64, not 32. The staging buffer TRUNCATES the caller's structure to its own
-                // size, so a 40-byte `FILE_BASIC_INFORMATION` (the class `kernel32!SetLastWriteTime`
-                // uses at the end of every `CopyFileW`) arrived as 32 bytes and the volume
-                // correctly rejected it with STATUS_INFO_LENGTH_MISMATCH => `GetLastError() == 24`
-                // (ERROR_BAD_LENGTH) — measured as the wall `CopyDirectory` hit at
-                // `userenv/directory.c:148` AFTER the file's bytes had already been copied.
-                let mut payload = [0u8; 64];
-                let payload_len = length.min(payload.len());
-                let payload_uses_scratch = overlay_file.is_some() && length > payload.len();
-                let payload_ok = if length == 0 {
-                    true
-                } else if args[2] == 0 {
-                    false
-                } else if payload_uses_scratch {
-                    if length > 64 * 1024 {
-                        false
-                    } else {
-                        let scratch = core::slice::from_raw_parts_mut(
-                            core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
-                            64 * 1024,
-                        );
-                        let ok = self.xas_read(args[2], &mut scratch[..length]);
-                        if ok {
-                            payload[..payload_len].copy_from_slice(&scratch[..payload_len]);
-                        }
-                        ok
+                if iosb == 0 || !self.probe_user_output(iosb, 16) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let mut payload = match try_zeroed_transfer_buffer(length) {
+                    Ok(payload) => payload,
+                    Err(status) => {
+                        self.xas_write_buf(iosb, &status.to_le_bytes());
+                        self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
+                        return status;
                     }
-                } else {
-                    self.xas_read(args[2], &mut payload[..payload_len])
                 };
+                if length != 0 && (args[2] == 0 || !self.xas_read(args[2], &mut payload)) {
+                    self.xas_write_buf(iosb, &STATUS_ACCESS_VIOLATION.to_le_bytes());
+                    self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
+                    return STATUS_ACCESS_VIOLATION;
+                }
                 if NT_SET_INFORMATION_FILE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8 {
                     print_str(b"[nt-set-information-file] pi=");
                     print_u64(self.pi as u64);
@@ -31234,74 +31488,55 @@ impl ExecNtHandler {
                     print_u64(information_class as u64);
                     print_str(b" length=");
                     print_u64(length as u64);
-                    print_str(b" payload_ok=");
-                    print_u64(payload_ok as u64);
-                    if information_class == 23 && payload_ok && payload_len >= 8 {
+                    if information_class == 23 && payload.len() >= 8 {
                         print_str(b" read_mode=");
                         print_u64(u32::from_le_bytes(payload[0..4].try_into().unwrap()) as u64);
                         print_str(b" completion_mode=");
                         print_u64(u32::from_le_bytes(payload[4..8].try_into().unwrap()) as u64);
                     }
                     print_str(b" payload=");
-                    if payload_ok {
-                        for &byte in &payload[..payload_len] {
-                            print_hex(byte as u32);
-                            debug_put_char(b' ');
-                        }
+                    for &byte in payload.iter().take(64) {
+                        print_hex(byte as u32);
+                        debug_put_char(b' ');
                     }
                     print_str(b"\n");
                 }
-                if iosb == 0 || !self.probe_user_output(iosb, 16) {
-                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                let Some(granted_access) = self.hosted_file_access_for(args[0]) else {
+                    self.xas_write_buf(iosb, &nt_fs::STATUS_INVALID_HANDLE.to_le_bytes());
+                    self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
+                    return nt_fs::STATUS_INVALID_HANDLE;
+                };
+                if !nt_io_manager::set_information_access_granted(
+                    nt_types::AccessMask::from_bits_retain(granted_access),
+                    information_class,
+                ) {
+                    self.xas_write_buf(iosb, &STATUS_ACCESS_DENIED.to_le_bytes());
+                    self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
+                    return STATUS_ACCESS_DENIED;
                 }
                 let mut information = 0u64;
                 // ★ THE WRITABLE FILESYSTEM OVERLAY owns its own file objects' information classes
                 // (position / end-of-file / disposition / basic). Checked first so an overlay handle
                 // never falls into the pipe-only classes below.
                 if let Some(file_id) = overlay_file {
-                    let status = if !payload_ok {
-                        0xC000_0005 // STATUS_ACCESS_VIOLATION
-                    } else {
-                        let mut translated_status = nt_fs::STATUS_SUCCESS;
-                        if information_class == nt_fs::FILE_RENAME_INFORMATION && length >= 20 {
-                            let rename = if payload_uses_scratch {
-                                core::slice::from_raw_parts_mut(
-                                    core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
-                                    length,
-                                )
-                            } else {
-                                &mut payload[..payload_len]
-                            };
-                            let root_directory =
-                                u64::from_le_bytes(rename[8..16].try_into().unwrap());
-                            if root_directory != 0 {
-                                match self.overlay_file_id_for(root_directory) {
-                                    Some(root_file_id) => {
-                                        rename[8..16].copy_from_slice(&root_file_id.to_le_bytes());
-                                    }
-                                    None => {
-                                        translated_status = nt_fs::STATUS_INVALID_HANDLE;
-                                    }
+                    let status = if information_class == nt_fs::FILE_RENAME_INFORMATION {
+                        match nt_fs::parse_set_file_name_information(&payload) {
+                            Err(status) => status,
+                            Ok(rename) => {
+                                let mut target = [0u8; FILE_VOLUME_RELATIVE_CAP * 2];
+                                match self.resolve_local_rename_target(rename, &mut target) {
+                                    Err(status) => status,
+                                    Ok((root, target_len)) => crate::writable_fs::rename(
+                                        file_id,
+                                        root,
+                                        &target[..target_len],
+                                        rename.replace_if_exists,
+                                    ),
                                 }
                             }
                         }
-                        if translated_status != nt_fs::STATUS_SUCCESS {
-                            translated_status
-                        } else {
-                            let overlay_payload = if payload_uses_scratch {
-                                core::slice::from_raw_parts(
-                                    core::ptr::addr_of!(OVERLAY_WRITE_SCRATCH) as *const u8,
-                                    length,
-                                )
-                            } else {
-                                &payload[..payload_len]
-                            };
-                            crate::writable_fs::set_information(
-                                file_id,
-                                information_class,
-                                overlay_payload,
-                            )
-                        }
+                    } else {
+                        crate::writable_fs::set_information(file_id, information_class, &payload)
                     };
                     if status == nt_fs::STATUS_SUCCESS {
                         self.writable_fs_dirty = true;
@@ -31311,21 +31546,21 @@ impl ExecNtHandler {
                     return status;
                 }
                 if information_class == nt_fs::FILE_POSITION_INFORMATION {
-                    let status = if length < 8 {
-                        0xC000_0004 // STATUS_INFO_LENGTH_MISMATCH
-                    } else if args[2] == 0 || !payload_ok {
-                        0xC000_0005 // STATUS_ACCESS_VIOLATION
-                    } else {
-                        let pid = match self.pm_pid_for_pi(self.pi) {
-                            Some(pid) => pid,
-                            None => return nt_fs::STATUS_INVALID_HANDLE,
-                        };
+                    let disk_file = self.pm_pid_for_pi(self.pi).and_then(|pid| {
                         match self.pm.lookup_handle(pid, args[0] as nt_process::Handle) {
                             Some(nt_process::HandleObject::DiskFile {
                                 first_cluster,
                                 size,
                                 object_id,
-                            }) => match self.readonly_file_opens.get_mut(object_id) {
+                            }) => Some((first_cluster, size, object_id)),
+                            _ => None,
+                        }
+                    });
+                    if let Some((first_cluster, size, object_id)) = disk_file {
+                        let status = if length < 8 {
+                            nt_fs::STATUS_INFO_LENGTH_MISMATCH
+                        } else {
+                            match self.readonly_file_opens.get_mut(object_id) {
                                 Ok(open)
                                     if open.first_cluster == first_cluster && open.size == size =>
                                 {
@@ -31334,127 +31569,19 @@ impl ExecNtHandler {
                                     nt_fs::STATUS_SUCCESS
                                 }
                                 _ => nt_fs::STATUS_INVALID_HANDLE,
-                            },
-                            Some(_) => 0xC000_0008, // STATUS_INVALID_HANDLE
-                            None => nt_fs::STATUS_INVALID_HANDLE,
-                        }
-                    };
-                    self.xas_write_buf(iosb, &status.to_le_bytes());
-                    self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
-                    return status;
+                            }
+                        };
+                        self.xas_write_buf(iosb, &status.to_le_bytes());
+                        self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
+                        return status;
+                    }
                 }
                 let status = match information_class {
-                    23 => {
-                        let route = self.hosted_file_route_for(args[0]);
-                        if length < 8 {
-                            0xC000_0004 // STATUS_INFO_LENGTH_MISMATCH
-                        } else if args[2] == 0 || !payload_ok {
-                            0xC000_0005 // STATUS_ACCESS_VIOLATION
-                        } else if route.is_none() {
-                            0xC000_0008 // STATUS_INVALID_HANDLE
-                        } else {
-                            let route = route.unwrap();
-                            let file_id = route.file_id;
-                            let synchronous_file =
-                                match self.file_completion.is_synchronous(file_id) {
-                                    Ok(synchronous) => synchronous,
-                                    Err(status) => return status,
-                                };
-                            if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
-                                || !wait_reply_pool_has_free()
-                                || !self.reserve_pending_file_io_owner()
-                            {
-                                return nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
-                            }
-                            let granted_access = match self.hosted_file_access_for(args[0]) {
-                                Some(access) => access,
-                                None => return nt_fs::STATUS_INVALID_HANDLE,
-                            };
-                            match self.prepare_hosted_file_io(route, args[0], granted_access) {
-                                Ok(true) => {}
-                                Ok(false) => return STATUS_PENDING,
-                                Err(status) => return status,
-                            }
-                            if self.file_completion.set_signaled(file_id, false).is_err() {
-                                self.release_file_reference(file_id);
-                                return nt_fs::STATUS_INVALID_HANDLE;
-                            }
-                            let mut output = [];
-                            let mut pending_irp_id = 0u64;
-                            let mut status = match self.dispatch_hosted_file_irp_for(
-                                route,
-                                major::IRP_MJ_SET_INFORMATION as u64,
-                                information_class as u64,
-                                &payload[..8],
-                                &mut output,
-                            ) {
-                                Ok((driver_status, completed, irp_id)) => {
-                                    information = completed;
-                                    pending_irp_id = irp_id;
-                                    driver_status as u32
-                                }
-                                Err(route_status) => route_status,
-                            };
-                            if status == STATUS_PENDING {
-                                if pending_irp_id == 0 {
-                                    status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
-                                    information = 0;
-                                    if synchronous_file {
-                                        let _ = self.signal_file_completion(file_id, status);
-                                    }
-                                    self.release_file_reference(file_id);
-                                } else {
-                                    self.pending_file_io_transfer =
-                                        Some(nt_io_manager::PendingFileIo {
-                                            file_id,
-                                            irp_id: pending_irp_id,
-                                            major: major::IRP_MJ_SET_INFORMATION,
-                                            control_code: 0,
-                                            operation:
-                                                nt_io_manager::PendingFileIoOperation::Transfer,
-                                            delivery_state: 0,
-                                            pi: self.pi as u32,
-                                            tid: self.current_tid,
-                                            sync_lock_owner_tid: 0,
-                                            badge: self.current_badge,
-                                            consumer_abandoned: false,
-                                            user_apc_interrupt_requested: false,
-                                            output_va: 0,
-                                            output_len: 0,
-                                            output_offset: 0,
-                                            iosb_va: iosb,
-                                            apc_routine: 0,
-                                            apc_context: 0,
-                                            completion_port_suppressed: true,
-                                            signal_file: synchronous_file,
-                                            publish_iocp: false,
-                                            event_obj_idx: u64::MAX,
-                                            reply_cap: 0,
-                                            reply_required: false,
-                                            native_call_transport: false,
-                                            reply_mrs: [0; 18],
-                                            resume_ip: 0,
-                                            resume_sp: 0,
-                                            resume_flags: 0,
-                                        });
-                                    self.pending_file_io_wait = true;
-                                    return STATUS_PENDING;
-                                }
-                            } else {
-                                if synchronous_file {
-                                    let _ = self.signal_file_completion(file_id, status);
-                                }
-                                self.release_file_reference(file_id);
-                            }
-                            status
-                        }
-                    }
+                    23 if length < 8 => nt_fs::STATUS_INFO_LENGTH_MISMATCH,
                     30 => {
                         const IO_COMPLETION_MODIFY_STATE: u32 = 0x2;
                         if length < 16 {
                             0xC000_0004 // STATUS_INFO_LENGTH_MISMATCH
-                        } else if args[2] == 0 || !payload_ok {
-                            0xC000_0005 // STATUS_ACCESS_VIOLATION
                         } else {
                             let file_id = self.hosted_file_id_for(args[0]);
                             if file_id == 0 {
@@ -31503,8 +31630,6 @@ impl ExecNtHandler {
                     41 => {
                         if length < 4 {
                             0xC000_0004 // STATUS_INFO_LENGTH_MISMATCH
-                        } else if args[2] == 0 || !payload_ok {
-                            0xC000_0005 // STATUS_ACCESS_VIOLATION
                         } else {
                             let file_id = self.hosted_file_id_for(args[0]);
                             if file_id == 0 {
@@ -31518,7 +31643,54 @@ impl ExecNtHandler {
                             }
                         }
                     }
-                    _ => 0xC000_0003, // STATUS_INVALID_INFO_CLASS
+                    _ => {
+                        let Some(route) = self.hosted_file_route_for(args[0]) else {
+                            return nt_fs::STATUS_INVALID_HANDLE;
+                        };
+                        let target = if matches!(
+                            information_class,
+                            nt_fs::FILE_RENAME_INFORMATION | nt_fs::FILE_LINK_INFORMATION
+                        ) {
+                            match nt_fs::parse_set_file_name_information(&payload) {
+                                Err(status) => Err(status),
+                                Ok(set_name) => self
+                                    .resolve_hosted_set_file_name_target(route, set_name)
+                                    .map(|target_file| (target_file, set_name.replace_if_exists)),
+                            }
+                        } else {
+                            Ok((None, false))
+                        };
+                        match target {
+                            Err(status) => status,
+                            Ok((target_file, replace_if_exists)) => {
+                                if matches!(
+                                    information_class,
+                                    nt_fs::FILE_RENAME_INFORMATION
+                                        | nt_fs::FILE_LINK_INFORMATION
+                                ) {
+                                    payload[8..16].fill(0);
+                                }
+                                let parameters = nt_io_manager::SetInformationParameters {
+                                    info_class: information_class,
+                                    length: length as u32,
+                                    target_file: target_file.map(nt_io_abi::FileId),
+                                    replace_if_exists,
+                                };
+                                let (status, completed) = self.service_hosted_set_information(
+                                    args[0],
+                                    iosb,
+                                    route,
+                                    parameters,
+                                    &payload,
+                                );
+                                information = completed;
+                                if status == STATUS_PENDING {
+                                    return STATUS_PENDING;
+                                }
+                                status
+                            }
+                        }
+                    }
                 };
                 if iosb != 0 {
                     self.xas_write_buf(iosb, &status.to_le_bytes());

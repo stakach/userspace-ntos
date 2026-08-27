@@ -13948,3 +13948,37 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     writable-FS private handle rewriting with typed volume-relative rename input. Route every
     provider-backed set-information class through the standard pending/ack path; unsupported link
     behavior must remain an explicit status, never a synthetic success or local-path fallback.
+
+    Rooted set-information resolution and generic provider dispatch (2026-08-27, accepted):
+    `NtSetInformationFile` now captures the caller buffer at its exact requested length and parses
+    the common x64 rename/link name structure once. The executive resolves `RootDirectory` through
+    the same canonical `FileParseRoot` authority used by CREATE and attribute queries. Caller
+    handles never enter the filesystem or provider boundary. Local writable-volume rename receives
+    a typed source-parent, volume-root, or retained-directory File root; the old private
+    filesystem-handle rewriting and fixed transfer-buffer cap were deleted. MemFs now implements
+    source-parent-relative rename directly and keeps cross-volume targets fail-closed.
+
+    Every provider-backed set-information class now uses the canonical File route and the normal
+    synchronous-lock, pending IRP, completion, and acknowledgement machinery. Rename/link calls
+    with a same-device hosted File root scrub the caller handle from the buffered structure and
+    carry only the retained target File through I/O ABI v7. Local/hosted cross-device roots return
+    `STATUS_NOT_SAME_DEVICE`; malformed names and non-directory roots fail before dispatch. The I/O
+    Manager enforces the NT5 per-class File access table against the granted source-File access both
+    at the syscall boundary and again when allocating the canonical SET_INFORMATION IRP.
+
+    Focused validation passes `nt-io-manager` `206/206` and `nt-fs` `70/70`; the freestanding
+    executive check remains green at the established 212-warning baseline. Serialized acceptance
+    `.tmp/run-headless-rooted-set-information-20260827.log` completed all five configured PnP
+    starts, exercised live FilePipeInformation plus allocation/end-of-file set operations, launched
+    genuine userinit and Explorer, and painted all 480,000 framebuffer pixels with at least 32
+    colors. All `295/295` gates passed and the sentinel matched. Scratch returned to zero after its
+    unchanged 278,112 B peak; final durable allocation was 14,824,752 B with 6,146,640 B reusable.
+
+    Review adjustment: rooted local rename and same-device hosted target transport are closed.
+    Absolute or Object Manager Directory names for provider rename/link still need the I/O Manager
+    to open the target parent as a canonical provider File before issuing SET_INFORMATION; keep
+    returning `STATUS_NOT_SUPPORTED` until that nested CREATE has a resumable owner. Local
+    `FileLinkInformation` also remains explicitly unsupported until MemFs owns multiple directory
+    entries and link counts. Next define and host-test that parent-target open/set transaction,
+    then resume the remaining file query/set capture inventory. The root service-loop mark/reset
+    compatibility boundary remains a separate lifetime-classification item.

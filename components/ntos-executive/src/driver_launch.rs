@@ -35035,6 +35035,7 @@ fn external_irp_parameters(
     input_len: u32,
     output_len: u32,
     create: Option<CreateParameters>,
+    set_information: Option<SetInformationParameters>,
 ) -> Option<IoParameters> {
     match major {
         major::IRP_MJ_CREATE | major::IRP_MJ_CREATE_NAMED_PIPE | major::IRP_MJ_CREATE_MAILSLOT => {
@@ -35059,11 +35060,13 @@ fn external_irp_parameters(
             }))
         }
         major::IRP_MJ_SET_INFORMATION => {
-            Some(IoParameters::SetInformation(SetInformationParameters {
+            let parameters = set_information.unwrap_or(SetInformationParameters {
                 info_class: external_code(fsctl)?,
                 length: input_len,
                 ..Default::default()
-            }))
+            });
+            (parameters.info_class == external_code(fsctl)? && parameters.length == input_len)
+                .then_some(IoParameters::SetInformation(parameters))
         }
         major::IRP_MJ_FLUSH_BUFFERS => Some(IoParameters::FlushBuffers),
         major::IRP_MJ_FILE_SYSTEM_CONTROL | major::IRP_MJ_DEVICE_CONTROL => {
@@ -35096,11 +35099,19 @@ fn dispatch_external_irp_to_device_record_result_exact(
     in_data: &[u8],
     out: &mut [u8],
     create: Option<CreateParameters>,
+    set_information: Option<SetInformationParameters>,
 ) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
     let major = external_major(major).ok_or(STATUS_INVALID_PARAMETER as u32)?;
     let (input_len, output_len, system_buffer_len) =
         external_dispatch_buffer_lengths(in_data.len(), out.len())?;
-    let params = external_irp_parameters(major, fsctl, input_len, output_len, create)
+    let params = external_irp_parameters(
+        major,
+        fsctl,
+        input_len,
+        output_len,
+        create,
+        set_information,
+    )
         .ok_or(STATUS_INVALID_PARAMETER as u32)?;
     let separate_output = matches!(
         control_transfer_method(major as u64, fsctl),
@@ -44918,6 +44929,40 @@ pub(crate) unsafe fn dispatch_hosted_file_irp_result_exact(
         in_data,
         out,
         None,
+        None,
+    )
+}
+
+/// Dispatch typed set-information metadata through a canonical source File.
+/// The optional target File is validated and retained by the I/O Manager.
+pub(crate) unsafe fn dispatch_hosted_file_set_information_irp_result_exact(
+    file_id: u64,
+    requestor_tid: u64,
+    parameters: SetInformationParameters,
+    in_data: &[u8],
+) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
+    if parameters.length as usize != in_data.len() {
+        return Err(STATUS_INVALID_PARAMETER as u32);
+    }
+    let canonical_file_id = FileId(file_id);
+    let device_id = io_manager_mut()
+        .file(canonical_file_id)
+        .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID))
+        .map(|file| file.device_id.raw())
+        .ok_or(STATUS_INVALID_HANDLE as u32)?;
+    require_hosted_device_ready_for_dispatch(device_id)?;
+    let mut output = [];
+    dispatch_external_irp_to_device_record_result_exact(
+        device_id,
+        Some(canonical_file_id),
+        major::IRP_MJ_SET_INFORMATION as u64,
+        parameters.info_class as u64,
+        0,
+        requestor_tid,
+        in_data,
+        &mut output,
+        None,
+        Some(parameters),
     )
 }
 
@@ -44956,6 +45001,7 @@ pub(crate) unsafe fn dispatch_hosted_file_create_irp_result_exact(
         in_data,
         out,
         Some(parameters),
+        None,
     )
 }
 

@@ -1648,6 +1648,32 @@ fn disposition_ex(flags: u32) -> [u8; 4] {
 }
 
 #[test]
+fn set_file_name_information_parser_validates_exact_name_extent() {
+    let data = rename_information("next.txt", 0x1234, true);
+    let parsed = parse_set_file_name_information(&data).unwrap();
+    assert!(parsed.replace_if_exists);
+    assert_eq!(parsed.root_directory, 0x1234);
+    assert_eq!(parsed.file_name, &data[20..]);
+
+    assert_eq!(
+        parse_set_file_name_information(&data[..19]),
+        Err(STATUS_INFO_LENGTH_MISMATCH)
+    );
+    let mut odd = data.clone();
+    odd[16..20].copy_from_slice(&3u32.to_le_bytes());
+    assert_eq!(
+        parse_set_file_name_information(&odd),
+        Err(STATUS_INFO_LENGTH_MISMATCH)
+    );
+    let mut oversized = data;
+    oversized[16..20].copy_from_slice(&0x1000u32.to_le_bytes());
+    assert_eq!(
+        parse_set_file_name_information(&oversized),
+        Err(STATUS_INFO_LENGTH_MISMATCH)
+    );
+}
+
+#[test]
 fn writable_mount_covers_a_prefix_subtree_only() {
     const PREFIXES: &[&[u8]] = &[b"profiles"];
     // At the prefix, and under it at any depth.
@@ -1981,6 +2007,23 @@ fn writable_volume_set_information_and_delete() {
             .end_of_file,
         4
     );
+    let typed_rename = rename_information("typed.txt", 0, false);
+    assert_eq!(
+        fs.zw_rename_file(
+            f.handle,
+            FileRenameRoot::SourceParent,
+            &typed_rename[20..],
+            false,
+        ),
+        STATUS_SUCCESS
+    );
+    assert!(fs.query_attributes(r"\??\C:\profiles\nested.txt").is_none());
+    assert_eq!(
+        fs.query_attributes(r"\??\C:\profiles\typed.txt")
+            .unwrap()
+            .end_of_file,
+        4
+    );
 
     let collision = fs.zw_create_file(
         r"\??\C:\profiles\collision.txt",
@@ -2016,7 +2059,7 @@ fn writable_volume_set_information_and_delete() {
         STATUS_NOT_SAME_DEVICE
     );
     assert_eq!(
-        fs.file_bytes(r"\??\C:\profiles\nested.txt"),
+        fs.file_bytes(r"\??\C:\profiles\typed.txt"),
         Some(&b"0123"[..])
     );
     assert!(fs.query_attributes(r"\??\D:\elsewhere.txt").is_none());

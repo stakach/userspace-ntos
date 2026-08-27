@@ -1539,6 +1539,18 @@ impl MemFs {
         self.rename_into_parent(source, parent, leaf, replace_if_exists)
     }
 
+    fn rename_relative_to_source_parent(
+        &mut self,
+        source: u64,
+        target_path: &str,
+        replace_if_exists: bool,
+    ) -> u32 {
+        let Some(parent) = self.node(source).map(|node| node.parent) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        self.rename_relative_to_dir(source, parent, target_path, replace_if_exists)
+    }
+
     fn can_mark_delete_pending(&self, id: u64, ignore_readonly: bool) -> u32 {
         let Some(node) = self.node(id) else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
@@ -2475,6 +2487,44 @@ pub struct StandardInformation {
     pub attributes: u32,
 }
 
+/// Canonical parse root for a file rename. This keeps process handles out of
+/// the filesystem API while preserving the three NT rename name forms.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FileRenameRoot {
+    /// A relative name is parsed from the source File's current parent.
+    SourceParent,
+    /// A volume-relative path is parsed from the mounted volume root.
+    VolumeRoot,
+    /// A relative name is parsed from this live directory File.
+    Directory(u64),
+}
+
+/// Validated common header used by `FILE_RENAME_INFORMATION` and
+/// `FILE_LINK_INFORMATION` on x64.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SetFileNameInformation<'a> {
+    pub replace_if_exists: bool,
+    pub root_directory: u64,
+    pub file_name: &'a [u8],
+}
+
+/// Parse the x64 set-file-name structure without interpreting its caller-owned
+/// `RootDirectory` handle.
+pub fn parse_set_file_name_information(data: &[u8]) -> Result<SetFileNameInformation<'_>, u32> {
+    if data.len() < 20 {
+        return Err(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    let name_len = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
+    if name_len == 0 || name_len & 1 != 0 || data.len().saturating_sub(20) < name_len {
+        return Err(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    Ok(SetFileNameInformation {
+        replace_if_exists: data[0] != 0,
+        root_directory: u64::from_le_bytes(data[8..16].try_into().unwrap()),
+        file_name: &data[20..20 + name_len],
+    })
+}
+
 /// The I/O-Manager-facing file system: the volume + mount manager + file-object/handle table,
 /// exposing the Zw* native file APIs (spec §8-§9).
 pub struct FileSystem {
@@ -2608,19 +2658,11 @@ impl FileSystem {
     }
 
     fn decode_rename_information(data: &[u8]) -> Result<(bool, u64, String), u32> {
-        if data.len() < 20 {
-            return Err(STATUS_INFO_LENGTH_MISMATCH);
-        }
-        let replace_if_exists = data[0] != 0;
-        let root_directory = u64::from_le_bytes(data[8..16].try_into().unwrap());
-        let name_len = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
-        if name_len == 0 || data.len().saturating_sub(20) < name_len {
-            return Err(STATUS_INFO_LENGTH_MISMATCH);
-        }
-        let name = Self::decode_utf16_name(&data[20..20 + name_len])?;
+        let information = parse_set_file_name_information(data)?;
+        let name = Self::decode_utf16_name(information.file_name)?;
         Ok((
-            replace_if_exists,
-            root_directory,
+            information.replace_if_exists,
+            information.root_directory,
             normalize_separators(&name),
         ))
     }
@@ -2636,14 +2678,66 @@ impl FileSystem {
         Ok(flags)
     }
 
-    fn rename_target_relative(&self, target: &str) -> Result<String, u32> {
-        if let Some(rel) = self.to_relative(target) {
-            return Ok(rel);
+    fn rename_file_decoded(
+        &mut self,
+        handle: u64,
+        root: FileRenameRoot,
+        target: &str,
+        replace_if_exists: bool,
+    ) -> u32 {
+        let Some(source) = self.obj(handle).map(|object| object.node_id) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        if target.is_empty() || self.to_relative(target).is_some() {
+            return STATUS_INVALID_PARAMETER;
         }
-        if target.starts_with('\\') {
-            return Err(STATUS_NOT_SAME_DEVICE);
+        match root {
+            FileRenameRoot::SourceParent => {
+                if target.starts_with('\\') {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                self.volume
+                    .rename_relative_to_source_parent(source, target, replace_if_exists)
+            }
+            FileRenameRoot::VolumeRoot => {
+                let target = target.trim_start_matches('\\');
+                if target.is_empty() {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                self.volume
+                    .rename_relative(source, target, replace_if_exists)
+            }
+            FileRenameRoot::Directory(directory) => {
+                if target.starts_with('\\') {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                let Some(root_id) = self.obj(directory).map(|object| object.node_id) else {
+                    return STATUS_INVALID_HANDLE;
+                };
+                if !self.volume.is_dir(root_id) {
+                    return STATUS_NOT_A_DIRECTORY;
+                }
+                self.volume
+                    .rename_relative_to_dir(source, root_id, target, replace_if_exists)
+            }
         }
-        Err(STATUS_OBJECT_PATH_NOT_FOUND)
+    }
+
+    /// Rename a live File using a canonical filesystem root and a UTF-16LE name.
+    /// Caller handles never enter this API; `Directory` is this filesystem's
+    /// retained File identity.
+    pub fn zw_rename_file(
+        &mut self,
+        handle: u64,
+        root: FileRenameRoot,
+        target_name: &[u8],
+        replace_if_exists: bool,
+    ) -> u32 {
+        let target = match Self::decode_utf16_name(target_name) {
+            Ok(target) => normalize_separators(&target),
+            Err(status) => return status,
+        };
+        self.rename_file_decoded(handle, root, &target, replace_if_exists)
     }
 
     /// `ZwCreateFile` (spec §8.1): resolve the path, apply the create disposition, and return a
@@ -3033,25 +3127,30 @@ impl FileSystem {
                         Err(status) => return status,
                     };
                 if root_directory == 0 {
-                    let target = match self.rename_target_relative(&target) {
-                        Ok(target) => target,
-                        Err(status) => return status,
-                    };
-                    self.volume
-                        .rename_relative(node_id, &target, replace_if_exists)
+                    if let Some(target) = self.to_relative(&target) {
+                        self.rename_file_decoded(
+                            handle,
+                            FileRenameRoot::VolumeRoot,
+                            &target,
+                            replace_if_exists,
+                        )
+                    } else if target.starts_with('\\') {
+                        STATUS_NOT_SAME_DEVICE
+                    } else {
+                        self.rename_file_decoded(
+                            handle,
+                            FileRenameRoot::SourceParent,
+                            &target,
+                            replace_if_exists,
+                        )
+                    }
                 } else {
-                    let Some(root) = self.obj(root_directory) else {
-                        return STATUS_INVALID_HANDLE;
-                    };
-                    let root_id = root.node_id;
-                    if !self.volume.is_dir(root_id) {
-                        return STATUS_NOT_A_DIRECTORY;
-                    }
-                    if self.to_relative(&target).is_some() || target.starts_with('\\') {
-                        return STATUS_INVALID_PARAMETER;
-                    }
-                    self.volume
-                        .rename_relative_to_dir(node_id, root_id, &target, replace_if_exists)
+                    self.rename_file_decoded(
+                        handle,
+                        FileRenameRoot::Directory(root_directory),
+                        &target,
+                        replace_if_exists,
+                    )
                 }
             }
             FILE_LINK_INFORMATION => STATUS_NOT_SUPPORTED,

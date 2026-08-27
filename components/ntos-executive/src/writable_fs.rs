@@ -1721,6 +1721,25 @@ pub(crate) unsafe fn set_information(file_id: u64, class: u32, data: &[u8]) -> u
     status
 }
 
+/// Rename a writable-volume File using a canonical filesystem parse root.
+/// Process handles are resolved by the executive before entering this boundary.
+pub(crate) unsafe fn rename(
+    file_id: u64,
+    root: nt_fs::FileRenameRoot,
+    target_name: &[u8],
+    replace_if_exists: bool,
+) -> u32 {
+    let Some(fs) = writable_fs() else {
+        return nt_fs::STATUS_INVALID_HANDLE;
+    };
+    let status = fs.zw_rename_file(file_id, root, target_name, replace_if_exists);
+    if status == nt_fs::STATUS_SUCCESS {
+        OVERLAY_SET_INFO.fetch_add(1, Ordering::Relaxed);
+        mark_snapshot_dirty();
+    }
+    status
+}
+
 /// `NtQueryDirectoryFile` on a writable-volume DIRECTORY file object.
 pub(crate) unsafe fn query_directory(
     file_id: u64,

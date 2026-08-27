@@ -15,7 +15,7 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use nt_status::NtStatus;
-use nt_types::{ClientId, NtPath, ObjectId};
+use nt_types::{AccessMask, ClientId, NtPath, ObjectId};
 
 mod banked_transfer;
 mod cancel;
@@ -147,6 +147,33 @@ pub(crate) const fn is_create_major(major: u8) -> bool {
             | nt_io_abi::major::IRP_MJ_CREATE_NAMED_PIPE
             | nt_io_abi::major::IRP_MJ_CREATE_MAILSLOT
     )
+}
+
+/// Apply the NT set-information access table to an already-granted File mask.
+/// Unknown classes carry no pre-dispatch requirement; the filesystem still
+/// decides whether the class itself is supported.
+pub fn set_information_access_granted(granted: AccessMask, information_class: u32) -> bool {
+    const FILE_WRITE_DATA: u32 = 0x0000_0002;
+    const FILE_WRITE_EA: u32 = 0x0000_0010;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+    let required = match information_class {
+        4 | 23 | 25 => FILE_WRITE_ATTRIBUTES,
+        10 | 13 | 40 | 64 => AccessMask::DELETE.bits(),
+        15 => FILE_WRITE_EA,
+        19 | 20 | 31 | 36 | 39 => FILE_WRITE_DATA,
+        _ => 0,
+    };
+    if required == 0 {
+        return true;
+    }
+    let granted = granted.bits();
+    if granted & AccessMask::GENERIC_ALL.bits() != 0 {
+        return true;
+    }
+    if required != AccessMask::DELETE.bits() && granted & AccessMask::GENERIC_WRITE.bits() != 0 {
+        return true;
+    }
+    granted & required == required
 }
 
 /// The canonical I/O Manager (spec §6): owns the driver / device / file / IRP
@@ -854,6 +881,13 @@ impl<P> IoManager<P> {
                 || !valid_state
             {
                 return Err(NtStatus::INVALID_PARAMETER);
+            }
+            if let Some(IoParameters::SetInformation(parameters)) =
+                record.current_stack().map(|stack| &stack.parameters)
+            {
+                if !set_information_access_granted(file.desired_access, parameters.info_class) {
+                    return Err(NtStatus::ACCESS_DENIED);
+                }
             }
             let (related_file, target_file) = match record
                 .current_stack()
@@ -3662,7 +3696,7 @@ mod tests {
                 .allocate_external_file(
                     client,
                     device,
-                    AccessMask::GENERIC_READ,
+                    AccessMask::DELETE,
                     ShareAccess::READ,
                     options,
                     nt_types::UnicodeString::from_str(name),
@@ -3739,7 +3773,7 @@ mod tests {
                 ObjectId::NULL,
                 owner,
                 device,
-                AccessMask::GENERIC_READ,
+                AccessMask::DELETE,
                 ShareAccess::READ,
                 CreateOptions::empty(),
                 path(name).to_unicode_string(),
@@ -3791,6 +3825,26 @@ mod tests {
         om.free_irp(irp).unwrap();
         assert_eq!(om.file(source).unwrap().outstanding_irp_refs, 0);
         assert_eq!(om.file(valid_target).unwrap().outstanding_irp_refs, 0);
+    }
+
+    #[test]
+    fn set_information_access_table_maps_file_and_generic_rights() {
+        let write_data = AccessMask::from_bits_retain(0x0000_0002);
+        let write_attributes = AccessMask::from_bits_retain(0x0000_0100);
+        assert!(set_information_access_granted(write_attributes, 4));
+        assert!(!set_information_access_granted(write_data, 4));
+        assert!(set_information_access_granted(write_data, 20));
+        assert!(set_information_access_granted(
+            AccessMask::GENERIC_WRITE,
+            20
+        ));
+        assert!(!set_information_access_granted(
+            AccessMask::GENERIC_WRITE,
+            10
+        ));
+        assert!(set_information_access_granted(AccessMask::DELETE, 10));
+        assert!(set_information_access_granted(AccessMask::GENERIC_ALL, 64));
+        assert!(set_information_access_granted(AccessMask::empty(), 11));
     }
 
     #[test]
@@ -5332,7 +5386,8 @@ mod tests {
     #[test]
     fn peer_set_information_wire_carries_canonical_target_and_flags() {
         let control = MockPeerControl::new();
-        let (mut om, client, handle, _) = peer_device(&control, AccessMask::GENERIC_READ);
+        let (mut om, client, handle, _) =
+            peer_device(&control, AccessMask::GENERIC_READ | AccessMask::DELETE);
         let (source, device, _) = om
             .reference_open_file_details(client, handle, AccessMask::GENERIC_READ)
             .unwrap();
