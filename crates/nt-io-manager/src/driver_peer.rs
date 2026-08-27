@@ -14,7 +14,7 @@ use core::cell::RefCell;
 
 use nt_io_abi::{
     ioctl, major, valid_ea_parameters, valid_quota_parameters, valid_set_information_control,
-    IrpDispatchRequest, IO_ABI_VERSION,
+    valid_volume_information_parameters, IrpDispatchRequest, IO_ABI_VERSION,
 };
 use nt_status::NtStatus;
 
@@ -172,6 +172,36 @@ fn build_dispatch_request(
             )
         }
         crate::irp::IoParameters::SetQuota(p) => (0, p.length, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        crate::irp::IoParameters::QueryVolumeInformation(p) => (
+            p.information_class,
+            0,
+            p.length,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ),
+        crate::irp::IoParameters::SetVolumeInformation(p) => (
+            p.information_class,
+            p.length,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ),
         crate::irp::IoParameters::Pnp(p) => match p.start {
             Some(start) => (
                 0,
@@ -439,6 +469,12 @@ impl DriverPeerTransport for MockDriverPeer {
                 request.ea_index,
                 request.input_len,
             )
+            || !valid_volume_information_parameters(
+                request.major,
+                request.ioctl_code,
+                request.input_len,
+                request.output_len,
+            )
             || (request.major != major::IRP_MJ_SET_INFORMATION
                 && (request.target_file_id != 0 || request.set_information_control != 0))
             || (request.target_file_id != 0 && !matches!(request.ioctl_code, 10 | 11 | 31))
@@ -455,6 +491,8 @@ impl DriverPeerTransport for MockDriverPeer {
                 | major::IRP_MJ_SET_EA
                 | major::IRP_MJ_QUERY_QUOTA
                 | major::IRP_MJ_SET_QUOTA
+                | major::IRP_MJ_QUERY_VOLUME_INFORMATION
+                | major::IRP_MJ_SET_VOLUME_INFORMATION
                 | major::IRP_MJ_DEVICE_CONTROL
                 | major::IRP_MJ_INTERNAL_DEVICE_CONTROL
         );
@@ -535,7 +573,9 @@ impl DriverPeerTransport for MockDriverPeer {
             | major::IRP_MJ_QUERY_EA
             | major::IRP_MJ_SET_EA
             | major::IRP_MJ_QUERY_QUOTA
-            | major::IRP_MJ_SET_QUOTA => DispatchOutcome::Completed {
+            | major::IRP_MJ_SET_QUOTA
+            | major::IRP_MJ_QUERY_VOLUME_INFORMATION
+            | major::IRP_MJ_SET_VOLUME_INFORMATION => DispatchOutcome::Completed {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,

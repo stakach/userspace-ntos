@@ -1196,6 +1196,7 @@ pub const SSN_NT_QUERY_ATTRIBUTES_FILE: u64 = 145;
 pub const SSN_NT_QUERY_FULL_ATTRIBUTES_FILE: u64 = 156;
 /// NtQueryVolumeInformationFile — CsrServerInitialization queries volume info for a file handle.
 pub const SSN_NT_QUERY_VOLUME_INFO_FILE: u64 = 187;
+pub const SSN_NT_SET_VOLUME_INFO_FILE: u64 = 257;
 pub const SSN_NT_QUERY_INFORMATION_FILE: u64 = 158;
 /// PnP manager syscalls imported by umpnpmgr. Routed to the executive's CM-backed PnP surface:
 /// devnode install events, root-bus relations, status/property queries, and control acknowledgements
@@ -12601,9 +12602,7 @@ unsafe fn vm_frame_return_to_free_list(frame: u64) {
     if frame == 0 {
         return;
     }
-    if let Err(frame) =
-        (&mut *core::ptr::addr_of_mut!(VM_FREE_FRAMES)).try_recycle(frame)
-    {
+    if let Err(frame) = (&mut *core::ptr::addr_of_mut!(VM_FREE_FRAMES)).try_recycle(frame) {
         let _ = cnode_delete_recycle_r(frame);
     }
 }
@@ -22519,12 +22518,7 @@ impl ExecReadOnlyFileOpens {
     ) -> Result<(), u32> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe {
-            (&*self.table).check_share(
-                volume_relative_path,
-                metadata,
-                desired_access,
-                share_access,
-            )
+            (&*self.table).check_share(volume_relative_path, metadata, desired_access, share_access)
         }
     }
 
@@ -23535,6 +23529,10 @@ fn build_nt_table() -> NativeServiceTable {
             (
                 NativeService::NtQueryVolumeInformationFile,
                 SSN_NT_QUERY_VOLUME_INFO_FILE as u32,
+            ),
+            (
+                NativeService::NtSetVolumeInformationFile,
+                SSN_NT_SET_VOLUME_INFO_FILE as u32,
             ),
             // ntdll closure batch: remaining direct ReactOS native imports.
             (
@@ -26047,9 +26045,12 @@ struct Fat32 {
     bps: u32,           // bytes per sector
     spc: u32,           // sectors per cluster
     total_sectors: u32, // FAT-visible sector count from the BPB
-    fat_start: u32,     // first FAT sector
-    data_start: u32,    // first data sector (cluster 2)
-    root_cl: u32,       // root directory cluster
+    fs_info_sector: u32,
+    volume_serial: u32,
+    volume_label: [u8; 11],
+    fat_start: u32,  // first FAT sector
+    data_start: u32, // first data sector (cluster 2)
+    root_cl: u32,    // root directory cluster
 }
 
 #[no_mangle]

@@ -9,6 +9,7 @@ use nt_types::{AccessMask, ClientId};
 use crate::ea::{QueryEaParameters, SetEaParameters};
 use crate::file::{CreateOptions, ShareAccess};
 use crate::quota::{QueryQuotaParameters, SetQuotaParameters};
+use crate::volume_information::{QueryVolumeInformationParameters, SetVolumeInformationParameters};
 
 /// How a driver peer may touch a registered buffer.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
@@ -206,6 +207,8 @@ pub enum IoParameters {
     SetEa(SetEaParameters),
     QueryQuota(QueryQuotaParameters),
     SetQuota(SetQuotaParameters),
+    QueryVolumeInformation(QueryVolumeInformationParameters),
+    SetVolumeInformation(SetVolumeInformationParameters),
     Pnp(PnpParameters),
     Power,
     #[default]
@@ -232,6 +235,8 @@ impl IoParameters {
                 p.length.min(cap),
             ),
             IoParameters::SetQuota(p) => (p.length.min(cap), 0),
+            IoParameters::QueryVolumeInformation(p) => (0, p.length.min(cap)),
+            IoParameters::SetVolumeInformation(p) => (p.length.min(cap), 0),
             IoParameters::Pnp(p) => (p.input_len().min(cap), 0),
             _ => (0, 0),
         }

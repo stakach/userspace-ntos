@@ -125,6 +125,14 @@ pub enum WdmIoStackParameters {
     SetQuota {
         length: u32,
     },
+    QueryVolumeInformation {
+        length: u32,
+        information_class: u32,
+    },
+    SetVolumeInformation {
+        length: u32,
+        information_class: u32,
+    },
     DeviceControl {
         output_buffer_length: u32,
         input_buffer_length: u32,
@@ -354,6 +362,17 @@ pub fn write_wdm_io_stack_location(
         }
         WdmIoStackParameters::SetQuota { length } => {
             put_u32(bytes, 0x08, length);
+        }
+        WdmIoStackParameters::QueryVolumeInformation {
+            length,
+            information_class,
+        }
+        | WdmIoStackParameters::SetVolumeInformation {
+            length,
+            information_class,
+        } => {
+            put_u32(bytes, 0x08, length);
+            put_u32(bytes, 0x10, information_class);
         }
         WdmIoStackParameters::DeviceControl {
             output_buffer_length,

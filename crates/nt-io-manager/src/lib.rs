@@ -50,6 +50,7 @@ mod read_write;
 mod retained_completion;
 mod store;
 mod synchronous_io;
+mod volume_information;
 mod wdm_x64;
 
 pub use banked_transfer::{BankedTransferCursor, BankedTransferError};
@@ -136,6 +137,11 @@ pub use retained_completion::{RetainedCompletion, RetainedCompletionError, Retai
 pub use store::{GenStore, IoId};
 pub use synchronous_io::{
     SynchronousFileWaitState, SynchronousFileWaitTable, SynchronousFileWaiter,
+};
+pub use volume_information::{
+    query_volume_information_contract, set_volume_information_contract,
+    validate_set_volume_information, QueryVolumeInformationParameters,
+    SetVolumeInformationParameters, VolumeInformationContract,
 };
 pub use wdm_x64::{
     write_wdm_device_object, write_wdm_driver_object, write_wdm_file_object,
@@ -391,6 +397,54 @@ impl<P> IoManager<P> {
         self.device(device)
             .map(|record| record.alignment_requirement)
             .ok_or(NtStatus::INVALID_PARAMETER)
+    }
+
+    /// NT5 `IopGetDriverPathInformation`: resolve a driver object name case-insensitively, then
+    /// inspect the exact attached device stack associated with a canonical File.
+    pub fn driver_in_file_path(
+        &self,
+        client: ClientId,
+        file: FileId,
+        driver_name: &[u16],
+    ) -> Result<bool, NtStatus> {
+        let file = self.file(file).ok_or(NtStatus::INVALID_HANDLE)?;
+        if file.client_id != client || !file.state.is_open() {
+            return Err(NtStatus::INVALID_HANDLE);
+        }
+        let equal_folded = |left: &[u16], right: &[u16]| {
+            left.len() == right.len()
+                && left.iter().zip(right).all(|(&left, &right)| {
+                    let fold = |unit: u16| {
+                        if (b'A' as u16..=b'Z' as u16).contains(&unit) {
+                            unit + 32
+                        } else {
+                            unit
+                        }
+                    };
+                    fold(left) == fold(right)
+                })
+        };
+        let driver_id = self
+            .drivers
+            .iter()
+            .find(|(_, driver)| {
+                let name = driver.name.to_unicode_string();
+                equal_folded(name.as_units(), driver_name)
+            })
+            .map(|(driver_id, _)| driver_id)
+            .ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?;
+
+        let mut current = self.top_of_device_stack(file.device_id)?;
+        loop {
+            let device = self.device(current).ok_or(NtStatus::INVALID_PARAMETER)?;
+            if device.driver_id == driver_id {
+                return Ok(true);
+            }
+            let Some(lower) = device.attached_to else {
+                return Ok(false);
+            };
+            current = lower;
+        }
     }
 
     /// Snapshot the live device stack from its current top down to the lowest attached device.
@@ -1163,6 +1217,77 @@ mod tests {
         assert_eq!(om.device(upper).unwrap().stack_size, 1);
         assert_eq!(om.device(lower).unwrap().top_of_stack, filter);
         assert_eq!(om.device(filter).unwrap().top_of_stack, filter);
+    }
+
+    #[test]
+    fn driver_path_information_resolves_names_across_the_live_attachment_stack() {
+        let mut om = io();
+        let client = om.register_client();
+        let lower_driver = om
+            .create_driver(
+                &path("\\Driver\\VolumeBase"),
+                Box::new(MockDriverBackend::new()),
+            )
+            .unwrap();
+        let filter_driver = om
+            .create_driver(
+                &path("\\Driver\\VolumeFilter"),
+                Box::new(MockDriverBackend::new()),
+            )
+            .unwrap();
+        om.create_driver(
+            &path("\\Driver\\Unrelated"),
+            Box::new(MockDriverBackend::new()),
+        )
+        .unwrap();
+        let lower = om
+            .create_device(
+                lower_driver,
+                Some(&path("\\Device\\Volume0")),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let filter = om
+            .create_device(
+                filter_driver,
+                Some(&path("\\Device\\VolumeFilter0")),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        assert_eq!(om.attach_device_to_stack(filter, lower), Ok(lower));
+
+        let handle = open_read(&mut om, client, "\\Device\\Volume0").unwrap();
+        let (file, _, _) = om
+            .reference_open_file_details(client, handle, AccessMask::GENERIC_READ)
+            .unwrap();
+        let utf16 = |name: &str| name.encode_utf16().collect::<Vec<_>>();
+
+        assert_eq!(
+            om.driver_in_file_path(client, file, &utf16("\\driver\\volumefilter")),
+            Ok(true)
+        );
+        assert_eq!(
+            om.driver_in_file_path(client, file, &utf16("\\DRIVER\\VOLUMEBASE")),
+            Ok(true)
+        );
+        assert_eq!(
+            om.driver_in_file_path(client, file, &utf16("\\Driver\\Unrelated")),
+            Ok(false)
+        );
+        assert_eq!(
+            om.driver_in_file_path(client, file, &utf16("\\Driver\\Missing")),
+            Err(NtStatus::OBJECT_NAME_NOT_FOUND)
+        );
+        assert_eq!(
+            om.driver_in_file_path(ClientId(client.0 + 1), file, &utf16("\\Driver\\VolumeBase")),
+            Err(NtStatus::INVALID_HANDLE)
+        );
     }
 
     #[test]
@@ -5494,6 +5619,113 @@ mod tests {
     }
 
     #[test]
+    fn peer_volume_information_wire_preserves_class_and_direction() {
+        let control = MockPeerControl::new();
+        let mut om = io();
+        let client = om.register_client();
+        let (backend, _) = peer_backend(&mut om, &control);
+        let mut dispatch = MajorFunctionTable::new();
+        for major in [
+            major::IRP_MJ_CREATE,
+            major::IRP_MJ_CLEANUP,
+            major::IRP_MJ_CLOSE,
+            major::IRP_MJ_QUERY_VOLUME_INFORMATION,
+            major::IRP_MJ_SET_VOLUME_INFORMATION,
+        ] {
+            dispatch.set(major, DispatchTarget::DriverPeer(DriverPeerId(0)));
+        }
+        let driver = om
+            .create_driver_peer_with_major_table(
+                &path("\\Driver\\VolumePeer"),
+                Box::new(backend),
+                dispatch,
+            )
+            .unwrap();
+        om.create_device(
+            driver,
+            Some(&path("\\Device\\VolumePeer")),
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        )
+        .unwrap();
+        let handle = om
+            .open(
+                client,
+                &path("\\Device\\VolumePeer"),
+                AccessMask::GENERIC_READ | AccessMask::GENERIC_WRITE,
+                ShareAccess::empty(),
+                CreateOptions::empty(),
+                0,
+            )
+            .unwrap();
+        let (file, device, _) = om
+            .reference_open_file_details(client, handle, AccessMask::GENERIC_READ)
+            .unwrap();
+
+        let mut query_buffer = [0u8; 16];
+        assert_eq!(
+            om.build_and_dispatch_external_to_device(
+                client,
+                device,
+                Some(file),
+                0,
+                21,
+                major::IRP_MJ_QUERY_VOLUME_INFORMATION,
+                IoParameters::QueryVolumeInformation(QueryVolumeInformationParameters {
+                    information_class: 5,
+                    length: query_buffer.len() as u32,
+                }),
+                0,
+                query_buffer.len() as u32,
+                &mut query_buffer,
+            ),
+            Ok(ExternalDispatchResult::Completed {
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: None,
+            })
+        );
+        let request = control.last_request().unwrap();
+        assert_eq!(request.major, major::IRP_MJ_QUERY_VOLUME_INFORMATION);
+        assert_eq!(request.ioctl_code, 5);
+        assert_eq!(request.input_len, 0);
+        assert_eq!(request.output_len, 16);
+        assert_eq!(request.buffer_len, 16);
+
+        let mut set_buffer = [0u8; 8];
+        assert_eq!(
+            om.build_and_dispatch_external_to_device(
+                client,
+                device,
+                Some(file),
+                0,
+                22,
+                major::IRP_MJ_SET_VOLUME_INFORMATION,
+                IoParameters::SetVolumeInformation(SetVolumeInformationParameters {
+                    information_class: 2,
+                    length: set_buffer.len() as u32,
+                }),
+                set_buffer.len() as u32,
+                0,
+                &mut set_buffer,
+            ),
+            Ok(ExternalDispatchResult::Completed {
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: None,
+            })
+        );
+        let request = control.last_request().unwrap();
+        assert_eq!(request.major, major::IRP_MJ_SET_VOLUME_INFORMATION);
+        assert_eq!(request.ioctl_code, 2);
+        assert_eq!(request.input_len, 8);
+        assert_eq!(request.output_len, 0);
+        assert_eq!(request.buffer_len, 8);
+    }
+
+    #[test]
     fn peer_ea_wire_preserves_name_list_index_and_stack_flags() {
         let control = MockPeerControl::new();
         let mut om = io();
@@ -6064,6 +6296,46 @@ mod tests {
         .unwrap();
         assert_eq!(stack[0x00], major::IRP_MJ_SET_EA);
         assert_eq!(le_u32(&stack, 0x08), 0x80);
+
+        write_wdm_io_stack_location(
+            &mut stack,
+            WdmIoStackLocationInit {
+                major: major::IRP_MJ_QUERY_VOLUME_INFORMATION,
+                minor: 0,
+                flags: 0,
+                control: 0,
+                device_object: 0x4444,
+                file_object: 0x5555,
+                parameters: WdmIoStackParameters::QueryVolumeInformation {
+                    length: 0x48,
+                    information_class: 8,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(stack[0x00], major::IRP_MJ_QUERY_VOLUME_INFORMATION);
+        assert_eq!(le_u32(&stack, 0x08), 0x48);
+        assert_eq!(le_u32(&stack, 0x10), 8);
+
+        write_wdm_io_stack_location(
+            &mut stack,
+            WdmIoStackLocationInit {
+                major: major::IRP_MJ_SET_VOLUME_INFORMATION,
+                minor: 0,
+                flags: 0,
+                control: 0,
+                device_object: 0x4444,
+                file_object: 0x5555,
+                parameters: WdmIoStackParameters::SetVolumeInformation {
+                    length: 0x40,
+                    information_class: 8,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(stack[0x00], major::IRP_MJ_SET_VOLUME_INFORMATION);
+        assert_eq!(le_u32(&stack, 0x08), 0x40);
+        assert_eq!(le_u32(&stack, 0x10), 8);
 
         write_wdm_io_stack_location(
             &mut stack,

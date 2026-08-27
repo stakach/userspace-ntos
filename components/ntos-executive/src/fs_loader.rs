@@ -237,6 +237,57 @@ pub(crate) fn writable_snapshot_reserve(fs: &Fat32) -> Option<(u32, u32)> {
     Some((fs.total_sectors, WRITABLE_SNAPSHOT_RESERVE_SECTORS))
 }
 
+/// Return the mounted FAT volume's BPB identity, trimming only the format-time
+/// space padding from its fixed eleven-byte label field.
+pub(crate) fn fat_volume_identity(fs: &Fat32) -> (u32, &[u8]) {
+    let label_len = fs
+        .volume_label
+        .iter()
+        .rposition(|byte| *byte != b' ' && *byte != 0)
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    (fs.volume_serial, &fs.volume_label[..label_len])
+}
+
+/// Read the FAT32 FSInfo sector and return the mounted volume's real allocation geometry.
+/// An unknown or invalid free-cluster count remains unavailable rather than becoming a guessed
+/// success result.
+pub(crate) unsafe fn fat_volume_size(fs: &Fat32) -> Option<nt_fs::VolumeSizeInformation> {
+    if fs.bps == 0
+        || fs.spc == 0
+        || fs.total_sectors <= fs.data_start
+        || fs.fs_info_sector == 0
+        || ahci_read_sector(
+            fs.ahci_vaddr,
+            fs.dma_vaddr,
+            fs.dma_paddr,
+            fs.fs_info_sector as u64,
+        ) == 0xff
+    {
+        return None;
+    }
+    let base = fs.dma_vaddr + AHCI_DMA_DATA_OFFSET;
+    let lead = core::ptr::read_unaligned(base as *const u32);
+    let structure = core::ptr::read_unaligned((base + 484) as *const u32);
+    let trail = core::ptr::read_unaligned((base + 508) as *const u32);
+    let available = core::ptr::read_unaligned((base + 488) as *const u32);
+    let total = (fs.total_sectors - fs.data_start) / fs.spc;
+    if lead != 0x4161_5252
+        || structure != 0x6141_7272
+        || trail != 0xaa55_0000
+        || available == u32::MAX
+        || available > total
+    {
+        return None;
+    }
+    Some(nt_fs::VolumeSizeInformation {
+        total_allocation_units: total as u64,
+        available_allocation_units: available as u64,
+        sectors_per_allocation_unit: fs.spc,
+        bytes_per_sector: fs.bps,
+    })
+}
+
 /// First disk sector of a cluster.
 pub(crate) fn fat_cluster_sector(fs: &Fat32, cluster: u32) -> u32 {
     fs.data_start + (cluster - 2) * fs.spc
@@ -945,9 +996,10 @@ fn name_to_83_into(comp: &[u8], out: &mut [u8; 11]) {
 
 fn fat_name_matches_ascii(name: &[u16], wanted: &[u8]) -> bool {
     name.len() == wanted.len()
-        && name.iter().zip(wanted).all(|(unit, byte)| {
-            *unit <= 0x7f && (*unit as u8).eq_ignore_ascii_case(byte)
-        })
+        && name
+            .iter()
+            .zip(wanted)
+            .all(|(unit, byte)| *unit <= 0x7f && (*unit as u8).eq_ignore_ascii_case(byte))
 }
 
 unsafe fn fat_find_open_metadata(
@@ -1034,10 +1086,7 @@ pub(crate) fn fat_root_metadata(fs: &Fat32) -> FatOpenMetadata {
     }
 }
 
-pub(crate) unsafe fn fat_open_path_metadata(
-    fs: &Fat32,
-    path: &[u8],
-) -> Option<FatOpenMetadata> {
+pub(crate) unsafe fn fat_open_path_metadata(fs: &Fat32, path: &[u8]) -> Option<FatOpenMetadata> {
     if path.is_empty() {
         Some(fat_root_metadata(fs))
     } else {
@@ -1068,8 +1117,7 @@ pub(crate) unsafe fn fat_open_path_entry_uncached(
     if path.is_empty() {
         Some(fat_root_metadata(fs).entry_tuple())
     } else {
-        fat_open_path_metadata_inner(fs, fs.root_cl, path, false)
-            .map(FatOpenMetadata::entry_tuple)
+        fat_open_path_metadata_inner(fs, fs.root_cl, path, false).map(FatOpenMetadata::entry_tuple)
     }
 }
 
@@ -1600,6 +1648,14 @@ pub(crate) unsafe fn fat32_mount(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64
     let total_sectors = if total16 != 0 { total16 } else { total32 };
     let spf32 = bp32(0x24);
     let root_cl = bp32(0x2C);
+    let fs_info_sector = bp16(0x30);
+    let volume_serial = bp32(0x43);
+    let mut volume_label = [0u8; 11];
+    let mut label_index = 0usize;
+    while label_index < volume_label.len() {
+        volume_label[label_index] = bp(0x47 + label_index as u64);
+        label_index += 1;
+    }
     let is_fat32 = bp(0x52) == b'F' && bp(0x53) == b'A' && bp(0x54) == b'T';
     if bps == 512 && spc >= 1 && is_fat32 {
         Some(Fat32 {
@@ -1611,6 +1667,9 @@ pub(crate) unsafe fn fat32_mount(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64
             bps,
             spc,
             total_sectors,
+            fs_info_sector,
+            volume_serial,
+            volume_label,
             fat_start: reserved,
             data_start: reserved + nfats * spf32,
             root_cl,

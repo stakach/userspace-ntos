@@ -80,6 +80,47 @@ pub const fn valid_ea_parameters(
     }
 }
 
+/// Validate the class and buffer direction carried by native volume-information IRPs.
+pub const fn valid_volume_information_parameters(
+    major_function: u8,
+    information_class: u32,
+    input_length: u32,
+    output_length: u32,
+) -> bool {
+    match major_function {
+        major::IRP_MJ_QUERY_VOLUME_INFORMATION => {
+            if input_length != 0 {
+                return false;
+            }
+            let minimum = match information_class {
+                1 => 24,
+                3 => 24,
+                4 => 8,
+                5 => 16,
+                6 => 48,
+                7 => 32,
+                8 => 64,
+                9 => 12,
+                _ => return false,
+            };
+            output_length >= minimum
+        }
+        major::IRP_MJ_SET_VOLUME_INFORMATION => {
+            if output_length != 0 {
+                return false;
+            }
+            let minimum = match information_class {
+                2 => 8,
+                6 => 48,
+                8 => 64,
+                _ => return false,
+            };
+            input_length >= minimum
+        }
+        _ => true,
+    }
+}
+
 /// Generation bits in an I/O id (spec §9: high 24 gen / low 40 slot).
 pub const IO_ID_GEN_BITS: u32 = 24;
 /// Slot-index bits in an I/O id.
@@ -220,6 +261,40 @@ mod tests {
         assert_eq!(major::IRP_MJ_PNP, 0x1b);
         assert!(major::is_valid_major(major::IRP_MJ_PNP));
         assert!(!major::is_valid_major(major::IO_MAJOR_FUNCTION_COUNT as u8));
+    }
+
+    #[test]
+    fn volume_information_parameters_match_native_classes_and_directions() {
+        assert!(valid_volume_information_parameters(
+            major::IRP_MJ_QUERY_VOLUME_INFORMATION,
+            4,
+            0,
+            8,
+        ));
+        assert!(!valid_volume_information_parameters(
+            major::IRP_MJ_QUERY_VOLUME_INFORMATION,
+            2,
+            0,
+            8,
+        ));
+        assert!(valid_volume_information_parameters(
+            major::IRP_MJ_SET_VOLUME_INFORMATION,
+            2,
+            8,
+            0,
+        ));
+        assert!(!valid_volume_information_parameters(
+            major::IRP_MJ_SET_VOLUME_INFORMATION,
+            2,
+            8,
+            1,
+        ));
+        assert!(valid_volume_information_parameters(
+            major::IRP_MJ_QUERY_INFORMATION,
+            0,
+            0,
+            0,
+        ));
     }
 
     #[test]

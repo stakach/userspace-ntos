@@ -76,6 +76,7 @@ pub enum NativeService {
     NtSetEaFile,
     NtQueryQuotaInformationFile,
     NtSetQuotaInformationFile,
+    NtSetVolumeInformationFile,
     NtFlushBuffersFile,
     NtCreateIoCompletion,
     NtOpenIoCompletion,
@@ -280,6 +281,7 @@ impl NativeService {
             NtSetEaFile => "NtSetEaFile",
             NtQueryQuotaInformationFile => "NtQueryQuotaInformationFile",
             NtSetQuotaInformationFile => "NtSetQuotaInformationFile",
+            NtSetVolumeInformationFile => "NtSetVolumeInformationFile",
             NtFlushBuffersFile => "NtFlushBuffersFile",
             NtCreateIoCompletion => "NtCreateIoCompletion",
             NtOpenIoCompletion => "NtOpenIoCompletion",
@@ -585,6 +587,7 @@ impl NativeService {
         NativeService::NtSetQuotaInformationFile,
         NativeService::NtQueryEaFile,
         NativeService::NtSetEaFile,
+        NativeService::NtSetVolumeInformationFile,
     ];
 }
 

@@ -59,6 +59,14 @@ pub(crate) unsafe fn storage_probe(
     let total_sectors = if total16 != 0 { total16 } else { total32 };
     let spf32 = bp32(0x24);
     let root_cl = bp32(0x2C);
+    let fs_info_sector = bp16(0x30);
+    let volume_serial = bp32(0x43);
+    let mut volume_label = [0u8; 11];
+    let mut label_index = 0usize;
+    while label_index < volume_label.len() {
+        volume_label[label_index] = bp(0x47 + label_index as u64);
+        label_index += 1;
+    }
     let is_fat32 = bp(0x52) == b'F' && bp(0x53) == b'A' && bp(0x54) == b'T';
     print_str(b"[storage-host] FAT32 bps=");
     print_u64(bps as u64);
@@ -88,6 +96,9 @@ pub(crate) unsafe fn storage_probe(
             bps,
             spc,
             total_sectors,
+            fs_info_sector,
+            volume_serial,
+            volume_label,
             fat_start: reserved,
             data_start: reserved + nfats * spf32,
             root_cl,

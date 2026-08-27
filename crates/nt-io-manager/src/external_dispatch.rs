@@ -615,6 +615,46 @@ impl<P> IoManager<P> {
             {
                 return Err(NtStatus::INVALID_PARAMETER)
             }
+            IoParameters::QueryVolumeInformation(parameters) => {
+                if major != nt_io_abi::major::IRP_MJ_QUERY_VOLUME_INFORMATION
+                    || input_len != 0
+                    || output_len != parameters.length
+                    || system_buffer.len() != parameters.length as usize
+                    || !stack_flags.is_empty()
+                    || !nt_io_abi::valid_volume_information_parameters(
+                        major,
+                        parameters.information_class,
+                        input_len,
+                        output_len,
+                    )
+                {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                }
+            }
+            IoParameters::SetVolumeInformation(parameters) => {
+                if major != nt_io_abi::major::IRP_MJ_SET_VOLUME_INFORMATION
+                    || input_len != parameters.length
+                    || output_len != 0
+                    || system_buffer.len() != parameters.length as usize
+                    || !stack_flags.is_empty()
+                    || !nt_io_abi::valid_volume_information_parameters(
+                        major,
+                        parameters.information_class,
+                        input_len,
+                        output_len,
+                    )
+                {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                }
+            }
+            _ if matches!(
+                major,
+                nt_io_abi::major::IRP_MJ_QUERY_VOLUME_INFORMATION
+                    | nt_io_abi::major::IRP_MJ_SET_VOLUME_INFORMATION
+            ) =>
+            {
+                return Err(NtStatus::INVALID_PARAMETER)
+            }
             _ => {}
         }
         if self.driver(driver_id).is_none() {

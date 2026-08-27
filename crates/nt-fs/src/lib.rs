@@ -20,6 +20,7 @@ mod path;
 mod query;
 mod snapshot_store;
 mod status;
+mod volume;
 
 pub use directory::*;
 pub use fat_directory::*;
@@ -44,6 +45,7 @@ pub use snapshot_store::{
     SnapshotBlockStoreError, SnapshotPayloadReader, SnapshotPayloadSink, StoredSnapshot,
 };
 pub use status::*;
+pub use volume::*;
 
 #[cfg(test)]
 mod tests;
