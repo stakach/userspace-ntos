@@ -867,6 +867,22 @@ fn group_b_query_and_namespace_services_register() {
 }
 
 #[test]
+fn signal_and_wait_uses_its_canonical_service_contract() {
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtSignalAndWaitForSingleObject, 259)],
+    );
+    let entry = table.lookup(259).unwrap();
+    assert_eq!(entry.service, NativeService::NtSignalAndWaitForSingleObject);
+    assert_eq!(entry.min_args, 4);
+    assert_eq!(entry.max_args, 4);
+    assert_eq!(
+        NativeService::NtSignalAndWaitForSingleObject.name(),
+        "NtSignalAndWaitForSingleObject"
+    );
+}
+
+#[test]
 fn migrated_services_dispatch_and_validate() {
     // Register on a test dispatcher and prove: (a) a bad arg count is rejected before the handler,
     // (b) a good call reaches the handler with the previous mode set.

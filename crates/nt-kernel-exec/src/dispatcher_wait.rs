@@ -1,12 +1,27 @@
 //! Atomic polling across the dispatcher object kinds shared by native waits.
 
-use crate::{EventStore, MutantStore, SemaphoreStore};
+use crate::{EventStore, MutantError, MutantStore, SemaphoreError, SemaphoreStore};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DispatcherObject {
     Event(u64),
     Semaphore(u64),
     Mutant { identity: u64, thread: u64 },
+}
+
+/// Dispatcher objects accepted by `NtSignalAndWaitForSingleObject` as its signal operand.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DispatcherSignalObject {
+    Event(u64),
+    Semaphore(u64),
+    Mutant { identity: u64, thread: u64 },
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DispatcherSignalError {
+    InvalidObject,
+    SemaphoreLimitExceeded,
+    MutantNotOwned,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -62,6 +77,38 @@ pub fn consume_dispatcher(
         DispatcherObject::Mutant { identity, thread } => {
             mutants.acquire(identity, thread) == Some(true)
         }
+    }
+}
+
+/// Apply the signal half of `NtSignalAndWaitForSingleObject` while the caller holds the dispatcher
+/// serialization boundary. The subsequent wait must be evaluated before that boundary is released.
+pub fn signal_dispatcher_for_wait(
+    events: &mut EventStore,
+    semaphores: &mut SemaphoreStore,
+    mutants: &mut MutantStore,
+    object: DispatcherSignalObject,
+) -> Result<(), DispatcherSignalError> {
+    match object {
+        DispatcherSignalObject::Event(identity) => events
+            .set_existing(identity)
+            .map(|_| ())
+            .ok_or(DispatcherSignalError::InvalidObject),
+        DispatcherSignalObject::Semaphore(identity) => semaphores
+            .release(identity, 1)
+            .map(|_| ())
+            .map_err(|error| match error {
+                SemaphoreError::LimitExceeded => DispatcherSignalError::SemaphoreLimitExceeded,
+                SemaphoreError::InvalidCount | SemaphoreError::NotFound => {
+                    DispatcherSignalError::InvalidObject
+                }
+            }),
+        DispatcherSignalObject::Mutant { identity, thread } => mutants
+            .release(identity, thread)
+            .map(|_| ())
+            .map_err(|error| match error {
+                MutantError::NotOwned => DispatcherSignalError::MutantNotOwned,
+                MutantError::NotFound => DispatcherSignalError::InvalidObject,
+            }),
     }
 }
 
@@ -239,6 +286,88 @@ mod tests {
         assert_eq!(
             poll_dispatchers(&mut events, &mut semaphores, &mut mutants, &second, false),
             DispatcherWaitResult::Signaled(0)
+        );
+    }
+
+    #[test]
+    fn signal_for_wait_supports_each_native_signal_object() {
+        let (mut events, mut semaphores, mut mutants) = stores();
+        events.initialize(1, EventKind::Notification, false);
+        semaphores.initialize(2, 0, 2).unwrap();
+        mutants.initialize(3, Some(30));
+
+        assert_eq!(
+            signal_dispatcher_for_wait(
+                &mut events,
+                &mut semaphores,
+                &mut mutants,
+                DispatcherSignalObject::Event(1),
+            ),
+            Ok(())
+        );
+        assert!(events.read_state(1));
+
+        assert_eq!(
+            signal_dispatcher_for_wait(
+                &mut events,
+                &mut semaphores,
+                &mut mutants,
+                DispatcherSignalObject::Semaphore(2),
+            ),
+            Ok(())
+        );
+        assert_eq!(semaphores.query(2), Some((1, 2)));
+
+        assert_eq!(
+            signal_dispatcher_for_wait(
+                &mut events,
+                &mut semaphores,
+                &mut mutants,
+                DispatcherSignalObject::Mutant {
+                    identity: 3,
+                    thread: 30,
+                },
+            ),
+            Ok(())
+        );
+        assert!(mutants.ready_for(3, 31));
+    }
+
+    #[test]
+    fn signal_for_wait_preserves_native_failure_modes() {
+        let (mut events, mut semaphores, mut mutants) = stores();
+        semaphores.initialize(2, 1, 1).unwrap();
+        mutants.initialize(3, Some(30));
+
+        assert_eq!(
+            signal_dispatcher_for_wait(
+                &mut events,
+                &mut semaphores,
+                &mut mutants,
+                DispatcherSignalObject::Event(99),
+            ),
+            Err(DispatcherSignalError::InvalidObject)
+        );
+        assert_eq!(
+            signal_dispatcher_for_wait(
+                &mut events,
+                &mut semaphores,
+                &mut mutants,
+                DispatcherSignalObject::Semaphore(2),
+            ),
+            Err(DispatcherSignalError::SemaphoreLimitExceeded)
+        );
+        assert_eq!(
+            signal_dispatcher_for_wait(
+                &mut events,
+                &mut semaphores,
+                &mut mutants,
+                DispatcherSignalObject::Mutant {
+                    identity: 3,
+                    thread: 31,
+                },
+            ),
+            Err(DispatcherSignalError::MutantNotOwned)
         );
     }
 }

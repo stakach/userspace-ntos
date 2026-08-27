@@ -43,7 +43,8 @@ mod work_item;
 pub use completion::{CancelResult, CompleteResult, CompletionState, CompletionTracker};
 pub use dispatcher_wait::{
     classify_dispatcher_wait_timeout, consume_dispatcher, dispatcher_ready, poll_dispatchers,
-    DispatcherObject, DispatcherWaitResult, DispatcherWaitTimeout,
+    signal_dispatcher_for_wait, DispatcherObject, DispatcherSignalError, DispatcherSignalObject,
+    DispatcherWaitResult, DispatcherWaitTimeout,
 };
 pub use dpc::{DpcImportance, DpcQueue};
 pub use driver_thread::{

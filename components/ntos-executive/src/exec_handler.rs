@@ -11022,6 +11022,139 @@ impl ExecNtHandler {
         })
     }
 
+    fn signal_object_for_wait_handle(
+        &self,
+        handle: u64,
+    ) -> Result<nt_kernel_exec::DispatcherSignalObject, u32> {
+        let mut saw_invalid_handle = false;
+        match self.event_index_for_handle(handle, EVENT_MODIFY_STATE) {
+            Ok(index) => return Ok(nt_kernel_exec::DispatcherSignalObject::Event(index as u64)),
+            Err(STATUS_ACCESS_DENIED) => return Err(STATUS_ACCESS_DENIED),
+            Err(STATUS_INVALID_HANDLE) => saw_invalid_handle = true,
+            Err(STATUS_OBJECT_TYPE_MISMATCH) => {}
+            Err(status) => return Err(status),
+        }
+        match self.semaphore_index_for_handle(handle, SEMAPHORE_MODIFY_STATE) {
+            Ok(index) => {
+                return Ok(nt_kernel_exec::DispatcherSignalObject::Semaphore(
+                    index as u64,
+                ));
+            }
+            Err(STATUS_ACCESS_DENIED) => return Err(STATUS_ACCESS_DENIED),
+            Err(STATUS_INVALID_HANDLE) => saw_invalid_handle = true,
+            Err(STATUS_OBJECT_TYPE_MISMATCH) => {}
+            Err(status) => return Err(status),
+        }
+        match self.mutant_index_for_handle(handle, 0) {
+            Ok(index) => {
+                return Ok(nt_kernel_exec::DispatcherSignalObject::Mutant {
+                    identity: index as u64,
+                    thread: self.current_tid,
+                });
+            }
+            Err(STATUS_ACCESS_DENIED) => return Err(STATUS_ACCESS_DENIED),
+            Err(STATUS_INVALID_HANDLE) => saw_invalid_handle = true,
+            Err(STATUS_OBJECT_TYPE_MISMATCH) => {}
+            Err(status) => return Err(status),
+        }
+        Err(if saw_invalid_handle {
+            STATUS_INVALID_HANDLE
+        } else {
+            STATUS_OBJECT_TYPE_MISMATCH
+        })
+    }
+
+    fn signal_dispatcher_for_wait(
+        &mut self,
+        object: nt_kernel_exec::DispatcherSignalObject,
+    ) -> u32 {
+        match nt_kernel_exec::signal_dispatcher_for_wait(
+            &mut self.events,
+            &mut self.semaphores,
+            &mut self.mutants,
+            object,
+        ) {
+            Ok(()) => {
+                // Native dispatch is serialized. Waking existing waiters and publishing this
+                // caller's wait below are one executive transition, so no signal-state mutation can
+                // interleave between the two halves of NtSignalAndWaitForSingleObject.
+                unsafe {
+                    wait_wake_dispatcher_set(self);
+                }
+                0
+            }
+            Err(nt_kernel_exec::DispatcherSignalError::InvalidObject) => STATUS_INVALID_HANDLE,
+            Err(nt_kernel_exec::DispatcherSignalError::SemaphoreLimitExceeded) => 0xC000_0047,
+            Err(nt_kernel_exec::DispatcherSignalError::MutantNotOwned) => 0xC000_0046,
+        }
+    }
+
+    fn begin_single_object_wait(
+        &mut self,
+        operation: &'static [u8],
+        handle: u64,
+        object: WaitObject,
+        alertable: bool,
+        timeout_ptr: u64,
+        timeout_interval: Option<i64>,
+    ) -> u32 {
+        if alertable {
+            match unsafe { self.try_deliver_current_user_apc() } {
+                Ok(true) => return 0x0000_00C0,
+                Ok(false) => {}
+                Err(status) => return status,
+            }
+        }
+        if self.wait_object_ready(object) {
+            trace_wait_object(self, b"ready", handle, object, timeout_ptr, 0);
+            print_str(b"[wait] pi=");
+            print_u64(self.pi as u64);
+            print_str(b" ");
+            print_str(operation);
+            print_str(b"(");
+            print_str(object.describe());
+            print_str(b" ");
+            print_u64(object.id());
+            print_str(b") already SIGNALLED -> immediate WAIT_0\n");
+            self.wait_object_consume(object);
+            return 0;
+        }
+        if let Some(timeout) = timeout_interval.map(PendingWaitTimeout::from_interval) {
+            let Some(due) = timeout.due_now() else {
+                unreachable!();
+            };
+            match due {
+                nt_delay_execution::Due::Immediate => {
+                    trace_wait_object(
+                        self,
+                        b"timeout-immediate",
+                        handle,
+                        object,
+                        timeout_ptr,
+                        0x102,
+                    );
+                    return 0x102;
+                }
+                nt_delay_execution::Due::Monotonic100ns(_) => {
+                    self.wait_timeout = timeout;
+                }
+            }
+        }
+        self.wait_park_event = object.raw() as i64;
+        self.wait_alertable = alertable;
+        trace_wait_object(self, b"park", handle, object, timeout_ptr, 0x102);
+        print_str(b"[wait] pi=");
+        print_u64(self.pi as u64);
+        print_str(b" ");
+        print_str(operation);
+        print_str(b"(");
+        print_str(object.describe());
+        print_str(b" ");
+        print_u64(object.id());
+        print_str(b") UNSIGNALLED -> PARK caller (reply-cap park)\n");
+        0x102
+    }
+
     fn process_thread_or_file_wait_object(
         &self,
         handle: u64,
@@ -30903,65 +31036,48 @@ impl ExecNtHandler {
                 match self.wait_object_for_handle(handle, SYNCHRONIZE_ACCESS) {
                     Ok(object) => {
                         let timeout_ptr = args[2];
-                        if alertable {
-                            match unsafe { self.try_deliver_current_user_apc() } {
-                                Ok(true) => return 0x0000_00C0,
-                                Ok(false) => {}
-                                Err(status) => return status,
-                            }
-                        }
-                        if self.wait_object_ready(object) {
-                            trace_wait_object(self, b"ready", handle, object, timeout_ptr, 0);
-                            print_str(b"[wait] pi=");
-                            print_u64(self.pi as u64);
-                            print_str(b" NtWaitForSingleObject(");
-                            print_str(object.describe());
-                            print_str(b" ");
-                            print_u64(object.id());
-                            print_str(b") already SIGNALLED -> immediate WAIT_0\n");
-                            self.wait_object_consume(object);
-                            return 0;
-                        }
                         let timeout = match self.wait_timeout_interval(timeout_ptr) {
-                            Ok(timeout) => timeout.map(PendingWaitTimeout::from_interval),
+                            Ok(timeout) => timeout,
                             Err(status) => return status,
                         };
-                        if let Some(timeout) = timeout {
-                            let Some(due) = timeout.due_now() else {
-                                unreachable!();
-                            };
-                            match due {
-                                nt_delay_execution::Due::Immediate => {
-                                    trace_wait_object(
-                                        self,
-                                        b"timeout-immediate",
-                                        handle,
-                                        object,
-                                        timeout_ptr,
-                                        0x102,
-                                    );
-                                    return 0x102;
-                                }
-                                nt_delay_execution::Due::Monotonic100ns(_) => {
-                                    self.wait_timeout = timeout;
-                                }
-                            }
-                        }
-                        // Unsignaled wait object → ask the loop to park this caller on it.
-                        self.wait_park_event = object.raw() as i64;
-                        self.wait_alertable = alertable;
-                        trace_wait_object(self, b"park", handle, object, timeout_ptr, 0x102);
-                        print_str(b"[wait] pi=");
-                        print_u64(self.pi as u64);
-                        print_str(b" NtWaitForSingleObject(");
-                        print_str(object.describe());
-                        print_str(b" ");
-                        print_u64(object.id());
-                        print_str(b") UNSIGNALLED -> PARK caller (reply-cap park)\n");
-                        0x102 // STATUS_TIMEOUT sentinel; the loop parks (ignores this)
+                        self.begin_single_object_wait(
+                            b"NtWaitForSingleObject",
+                            handle,
+                            object,
+                            alertable,
+                            timeout_ptr,
+                            timeout,
+                        )
                     }
                     Err(status) => status,
                 }
+            }
+            NativeService::NtSignalAndWaitForSingleObject => {
+                let timeout_ptr = args[3];
+                let timeout = match self.wait_timeout_interval(timeout_ptr) {
+                    Ok(timeout) => timeout,
+                    Err(status) => return status,
+                };
+                let signal_object = match self.signal_object_for_wait_handle(args[0]) {
+                    Ok(object) => object,
+                    Err(status) => return status,
+                };
+                let wait_object = match self.wait_object_for_handle(args[1], SYNCHRONIZE_ACCESS) {
+                    Ok(object) => object,
+                    Err(status) => return status,
+                };
+                let status = self.signal_dispatcher_for_wait(signal_object);
+                if status != 0 {
+                    return status;
+                }
+                self.begin_single_object_wait(
+                    b"NtSignalAndWaitForSingleObject",
+                    args[1],
+                    wait_object,
+                    nt_boolean_arg(args[2]),
+                    timeout_ptr,
+                    timeout,
+                )
             }
             // NtOpen/CreateDirectoryObject(*Handle[R10]=args[0], DesiredAccess, *OA[R8]=args[2]).
             // Resolve/insert in the executive object namespace, hand back a real handle.

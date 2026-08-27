@@ -1106,6 +1106,7 @@ pub const SSN_NT_CREATE_SEMAPHORE: u64 = 53;
 pub const SSN_NT_OPEN_SEMAPHORE: u64 = 132;
 pub const SSN_NT_QUERY_SEMAPHORE: u64 = 177;
 pub const SSN_NT_RELEASE_SEMAPHORE: u64 = 197;
+pub const SSN_NT_SIGNAL_AND_WAIT_FOR_SINGLE_OBJECT: u64 = 259;
 // NT LPC connection-rendezvous SSNs (ReactOS ntdll — the one smss/csrss run).
 pub const SSN_NT_ACCEPT_CONNECT_PORT: u64 = 0;
 pub const SSN_NT_COMPLETE_CONNECT_PORT: u64 = 31;
@@ -23685,6 +23686,10 @@ fn build_nt_table() -> NativeServiceTable {
             ),
             (NativeService::NtQueryObject, 170),
             (NativeService::NtWaitForSingleObject, 281),
+            (
+                NativeService::NtSignalAndWaitForSingleObject,
+                SSN_NT_SIGNAL_AND_WAIT_FOR_SINGLE_OBJECT as u32,
+            ),
             (
                 NativeService::NtOpenDirectoryObject,
                 SSN_NT_OPEN_DIRECTORY_OBJECT as u32,

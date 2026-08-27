@@ -14982,3 +14982,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     come from the measured ntdll/export-to-executive registration gap list. Prefer a missing core NT
     trait that unblocks general applications; do not add a boot-image identity branch or successful
     compatibility fallback.
+
+    Native-service registration audit (2026-08-27, in progress): the canonical ABI contains 222
+    `Nt*` exports, while the typed executive surface contains 162 services and `build_nt_table`
+    registers 160 distinct service variants. The two typed-but-unregistered variants are legacy
+    dispatch migrations (`NtDeviceIoControlFile` and `NtCreateThreadEx`); the ABI-to-typed-surface
+    difference is 61 exports and is now the measured source for subsequent kernel-trait selection.
+
+    The first selected gap is `NtSignalAndWaitForSingleObject` (SSN 259). It is a core object-manager
+    and dispatcher primitive, is used by general Win32 synchronization, and directly exercises the
+    exact wait-reference ownership just completed. Implement the event, semaphore, and mutant signal
+    types with native access/ownership/limit failures; validate the timeout and both handles before
+    changing signal state; then enter the existing alertable single-object wait path in the same
+    serialized executive transition. Do not emulate unsupported signal object types or split the
+    operation into user-visible `NtSetEvent` plus `NtWaitForSingleObject` calls.
