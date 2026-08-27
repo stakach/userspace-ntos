@@ -22,6 +22,8 @@ pub const FILE_ALL_INFORMATION: u32 = 18;
 pub const FILE_ALTERNATE_NAME_INFORMATION: u32 = 21;
 pub const FILE_STREAM_INFORMATION: u32 = 22;
 pub const FILE_COMPRESSION_INFORMATION: u32 = 28;
+pub const FILE_OBJECT_ID_INFORMATION: u32 = 29;
+pub const FILE_QUOTA_INFORMATION: u32 = 32;
 pub const FILE_REPARSE_POINT_INFORMATION: u32 = 33;
 
 pub const FILE_NAME_INFORMATION_MINIMUM_LENGTH: usize = 8;
@@ -224,6 +226,21 @@ pub fn encode_reparse_point_information(
     output[0..8].copy_from_slice(&metadata.file_id.to_le_bytes());
     output[8..12].copy_from_slice(&metadata.reparse_tag.to_le_bytes());
     Ok(FILE_REPARSE_POINT_INFORMATION_LENGTH)
+}
+
+/// Return the filesystem completion for an optional query facility absent from local FAT/MemFs.
+///
+/// These are valid native information classes, so `STATUS_INVALID_INFO_CLASS` would incorrectly
+/// attribute the failure to the I/O Manager contract. FastFAT rejects an unsupported query class
+/// after dispatch with `STATUS_INVALID_PARAMETER`; neither local filesystem has the persistent
+/// object-ID namespace or quota ledger required to return data instead.
+pub const fn absent_optional_query_facility_status(class: u32) -> Option<u32> {
+    match class {
+        FILE_OBJECT_ID_INFORMATION | FILE_QUOTA_INFORMATION => {
+            Some(crate::STATUS_INVALID_PARAMETER)
+        }
+        _ => None,
+    }
 }
 
 /// Encode the variable-length file-name query classes.

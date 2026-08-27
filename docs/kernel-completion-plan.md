@@ -14538,3 +14538,46 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     model is implemented; never substitute the internal file index, security token quotas, or an
     empty successful record. Provider-backed Files must retain FSD ownership. Then continue the
     remaining set-information inventory, starting with hard links and allocation/EOF ownership.
+
+    Optional object-ID/quota queries and allocation/EOF ownership (2026-08-27, accepted):
+    `FileObjectIdInformation` and `FileQuotaInformation` are valid I/O Manager query classes, but
+    neither local FAT nor MemFs owns the persistent object-ID namespace or quota ledger needed to
+    answer them. Local filesystem Files now complete those dispatched requests explicitly with
+    `STATUS_INVALID_PARAMETER`, matching the FastFAT unsupported-query boundary, and publish the
+    failed status through the caller's `IO_STATUS_BLOCK`. They no longer fall through to
+    `STATUS_INVALID_INFO_CLASS`, return invented identity or quota data, or write an output record.
+    Provider-backed Files remain ahead of this local completion and continue through their real
+    `IRP_MJ_QUERY_INFORMATION` provider route.
+
+    The writable filesystem now distinguishes allocated storage from logical end of file.
+    `FileAllocationInformation` changes allocation capacity and truncates EOF only when reducing
+    capacity below the current logical length; preallocation no longer grows EOF.
+    `FileEndOfFileInformation` changes logical length, retains existing allocation on shrink, and
+    grows allocation only when necessary. Writes, append, overwrite, supersede, installed-file
+    copy-up, metadata, directory records, streams, and hard-linked names all observe the same
+    node-owned allocation state. Negative native `LARGE_INTEGER` encodings fail with
+    `STATUS_INVALID_PARAMETER` without mutating the File.
+
+    Writable snapshot format version 4 persists allocation size independently. Its reader remains
+    compatible with versions 1 through 3, deriving allocation from EOF for legacy records, and
+    rejects malformed version-4 records whose allocation is unaligned or cannot contain EOF.
+    Direct tests cover preallocation, allocation-driven truncation, EOF shrink/growth, negative
+    values, hard node invariants, version-4 round trips, and legacy version-1 and version-3 restore.
+
+    Focused validation passes `nt-fs` `93/93`; the freestanding executive remains at the established
+    211-warning baseline. Serialized acceptance
+    `.tmp/run-headless-file-allocation-20260827.log` upgraded the existing writable snapshot,
+    reached quiescence in the normal desktop run, launched genuine userinit and Explorer, completed
+    692 Explorer api0 redirects with zero callback failures, painted `480000/480000` framebuffer
+    pixels with at least 32 colours, passed all `295/295` gates, and matched the sentinel. The
+    version-4 snapshot committed generation 5 at 1,751,080 bytes; scratch returned to zero and the
+    resource census reported no frame, mapping, registry, retype, or allocator failures.
+
+    Review adjustment: optional object-ID/quota absence and local allocation/EOF semantics are
+    closed. Hard-link namespace ownership was already completed and now shares the same allocation
+    state correctly. Continue the set-information inventory with `FileValidDataLengthInformation`
+    and `FileShortNameInformation`. Valid data length needs explicit initialized-data state plus its
+    native access and privilege contract; do not treat zero-filled sparse allocation as proof that
+    every byte is initialized. A writable short name needs a real MemFs alias namespace, collision
+    policy, persistence, rename/link integration, and query support; do not derive an executive-side
+    alias. Provider-backed Files must retain their FSD-owned set-information path throughout.

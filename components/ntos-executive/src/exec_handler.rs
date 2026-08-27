@@ -29961,6 +29961,19 @@ impl ExecNtHandler {
                     }
                     return status;
                 }
+                if let Some(status) = nt_fs::absent_optional_query_facility_status(class) {
+                    // Validate that this is one of the local filesystem File objects before
+                    // completing the valid-but-unsupported filesystem request.
+                    if let Err(handle_status) = self.local_file_query_state(args[0], false) {
+                        return handle_status;
+                    }
+                    let mut iosb_bytes = [0u8; 16];
+                    iosb_bytes[..4].copy_from_slice(&status.to_le_bytes());
+                    if !self.xas_try_write_buf(iosb, &iosb_bytes) {
+                        return nt_syscall::STATUS_ACCESS_VIOLATION;
+                    }
+                    return status;
+                }
                 if class == nt_fs::FILE_STREAM_INFORMATION {
                     let state = match self.local_file_query_state(args[0], false) {
                         Ok(state) => state,
