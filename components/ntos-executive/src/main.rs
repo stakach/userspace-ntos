@@ -1192,6 +1192,8 @@ pub const SSN_NT_CREATE_SYMBOLIC_LINK_OBJECT: u64 = 54;
 pub const SSN_NT_MAKE_TEMPORARY_OBJECT: u64 = 110;
 /// NtOpenSymbolicLinkObject SSN (SmpInit opens a link after DosDevices). sysfuncs 134 − 1.
 pub const SSN_NT_OPEN_SYMBOLIC_LINK_OBJECT: u64 = 133;
+/// NtQuerySymbolicLinkObject SSN. sysfuncs 179 - 1.
+pub const SSN_NT_QUERY_SYMBOLIC_LINK_OBJECT: u64 = 178;
 /// NtDisplayString SSN (smss prints a boot/status string). sysfuncs 71 − 1. Routed to serial.
 pub const SSN_NT_DISPLAY_STRING: u64 = 70;
 /// ntdll's NtOpenFile SSN for path-based file opens.
@@ -23730,6 +23732,10 @@ fn build_nt_table() -> NativeServiceTable {
             (
                 NativeService::NtOpenSymbolicLinkObject,
                 SSN_NT_OPEN_SYMBOLIC_LINK_OBJECT as u32,
+            ),
+            (
+                NativeService::NtQuerySymbolicLinkObject,
+                SSN_NT_QUERY_SYMBOLIC_LINK_OBJECT as u32,
             ),
             // Workstream A batch 4 (group B2): out-writing query services (queued-write drain).
             (

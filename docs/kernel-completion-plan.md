@@ -15080,3 +15080,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     transition the seL4 TCB only on the first suspension. As part of this slice, remove the
     executive's one-bit pool-thread suspended mask and make the `nt-process` ETHREAD suspend count
     authoritative for create-suspended, suspend, resume, spawn, and cleanup paths.
+
+    `NtSuspendThread` (2026-08-27, accepted): SSN 263 is now a typed registered service. The shared
+    thread-control resolver requires a real access-checked ETHREAD and hosted mechanism; the handler
+    probes the optional `ULONG` output before mutation, increments the nested ETHREAD suspend count,
+    and suspends the seL4 TCB only on the `0 -> 1` transition. `NtResumeThread` now uses the same count
+    and resumes the TCB only on `1 -> 0`, including CSR worker routing. TCB transition failure rolls
+    the ETHREAD count back. The duplicate per-process one-bit pool suspend masks and all their
+    create/spawn/cleanup bookkeeping have been deleted; resetting an abandoned pool ETHREAD to
+    `Initialized` clears its authoritative suspend count.
+
+    Focused validation passes `nt-process` `108/108` (including nested counts, overflow without
+    mutation, and abandoned-thread reset), `nt-syscall` `61/61`, `git diff --check`, the freestanding
+    executive, and the release build. Code checkpoint `fb8c5746` is pushed. Serialized acceptance
+    `.tmp/run-headless-suspend-thread-20260827.log` exercised 72 successful first resumes through the
+    new ETHREAD authority. It reached quiescence at 106,490 ms, launched genuine userinit and
+    Explorer, completed 668 Explorer api0 redirects with zero callback or dead-callback failures,
+    recorded paint begin/end `5/20`, 187 direct GDI returns, and 135 batch flushes covering 184
+    records, painted `480000/480000` framebuffer pixels with at least 32 colours, passed all
+    `295/295` gates, and matched the sentinel. The workload did not issue SSN 263, so direct suspend
+    semantics are proven by focused tests while the boot proves the replaced create/resume state
+    path. Scratch returned to zero and no VM, untyped-allocation, frame-registration, image-bank, or
+    allocator failure was reported.
+
+    Review adjustment: the typed surface now contains 165 services, the hosted table registers 164
+    numbered variants, and 58 canonical ABI exports remain absent. Select a bounded object-manager
+    trait next so the kernel surface continues to grow from general NT contracts rather than boot
+    identities. `NtQuerySymbolicLinkObject` is the leading candidate because create/open and the
+    namespace target object already exist; audit target ownership, query buffer semantics, access
+    rights, and any remaining numeric branch before implementation.

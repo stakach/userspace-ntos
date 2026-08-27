@@ -854,6 +854,7 @@ fn group_b_query_and_namespace_services_register() {
         (NativeService::NtCreateDirectoryObject, 36),
         (NativeService::NtCreateSymbolicLinkObject, 54),
         (NativeService::NtOpenSymbolicLinkObject, 133),
+        (NativeService::NtQuerySymbolicLinkObject, 178),
     ];
     let t = NativeServiceTable::from_numbers(UserlandAbiProfile::Windows7, &pairs);
     assert_eq!(t.len(), pairs.len());

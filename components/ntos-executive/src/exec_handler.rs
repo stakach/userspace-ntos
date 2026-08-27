@@ -31522,6 +31522,70 @@ impl ExecNtHandler {
                     _ => 0xC0000034, // STATUS_OBJECT_NAME_NOT_FOUND
                 }
             },
+            // NtQuerySymbolicLinkObject(LinkHandle, *LinkTarget, *ResultLength). The namespace
+            // entry is the handle-referenced symbolic-link body; return its exact target through
+            // the caller's UNICODE_STRING without following the link.
+            NativeService::NtQuerySymbolicLinkObject => unsafe {
+                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+
+                let link_target = args[1];
+                let result_length = args[2];
+                if link_target == 0 || !self.probe_user_output(link_target, 16) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let mut descriptor = [0u8; 16];
+                if !self.xas_read(link_target, &mut descriptor) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let maximum_length =
+                    u16::from_le_bytes([descriptor[2], descriptor[3]]) as usize;
+                let buffer = u64::from_le_bytes(descriptor[8..16].try_into().unwrap());
+                if (maximum_length != 0
+                    && (buffer & 1 != 0
+                        || !self.probe_user_output(buffer, maximum_length)))
+                    || (result_length != 0 && !self.probe_user_output(result_length, 4))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let index = match self.object_namespace_index_for_handle(
+                    args[0],
+                    Some(OBJ_KIND_SYMBOLIC_LINK),
+                    SYMBOLIC_LINK_QUERY_ACCESS,
+                ) {
+                    Ok(index) => index,
+                    Err(status) => return status,
+                };
+                let target = self.obj_ns[index].target();
+                let required_length = target.len() * 2;
+                let mut status = STATUS_BUFFER_TOO_SMALL;
+                if required_length <= maximum_length {
+                    let mut encoded = [0u8; OBJ_NAME_CAP * 2];
+                    for (unit, &byte) in encoded.chunks_exact_mut(2).zip(target) {
+                        unit.copy_from_slice(&(byte as u16).to_le_bytes());
+                    }
+                    if required_length != 0
+                        && !self.xas_try_write_buf(buffer, &encoded[..required_length])
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    if !self
+                        .xas_try_write_buf(link_target, &(required_length as u16).to_le_bytes())
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    status = 0;
+                }
+                if result_length != 0
+                    && !self.xas_try_write_buf(
+                        result_length,
+                        &(required_length as u32).to_le_bytes(),
+                    )
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                status
+            },
             // NtQuerySystemTime(*SystemTime[R10]=args[0]). Return a non-zero monotonic 64-bit clock
             // (rdtsc — a plain ring-3 instruction; do NOT `syscall` from the executive). The out-ptr
             // write is queued so the loop demand-fills it (csrss arbitrary VA vs smss stack local).
