@@ -2858,9 +2858,10 @@ existing synchronous DMA/PnP fixture so the two lifecycle modes remain independe
   replacement are now real. Writable-overlay delete disposition now also covers
   `FileDispositionInformationEx` with NT delete flags, validates readonly/non-empty-directory cases
   before setting delete-pending, cross-volume renames fail explicitly with `STATUS_NOT_SAME_DEVICE`,
-  and hard links are classified as a valid but unsupported operation until the filesystem owns a real
-  link-count/parent-entry model. D1 is closed for the listed audit surfaces; D4 still owns the
-  remaining volatile/journal/setup-profile durability semantics.
+  and hard links use stable directory-entry identities over shared file nodes with real link counts,
+  exact-entry rename/delete, open-unlinked lifetime, and durable snapshot identity. D1 is closed for
+  the listed audit surfaces; D4 still owns the remaining volatile/journal/setup-profile durability
+  semantics.
 - `[x]` D2: Make the Configuration Manager/Hive Manager the live authority for mutable hives rather
   than executive-local mirrors. Mounted boot/user hives are mirrored into `MutableHiveSet`, registry
   reads prefer that authority, and `NtCreateKey`/`NtSetValueKey`/`NtDeleteValueKey` now use
@@ -14110,3 +14111,43 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     lifetime-classification item. The executive namespace is still a compatibility projection; move
     additional native object kinds behind the isolated Object Manager incrementally rather than
     adding another mirroring path or reintroducing static namespace identities.
+
+    Local hard-link ownership and persistence (2026-08-27, accepted): writable MemFs directory
+    entries now have stable identities independent of their shared file node. `FileLinkInformation`
+    creates another entry to the same non-directory node, `FileStandardInformation` reports the real
+    link count and File-object delete-pending state, and rename/delete-on-close operate on the exact
+    entry through which the File was opened. A zero-link node remains alive while an open File object
+    references it and is reclaimed only after the final close. Replace-if-exists unlinks the precise
+    destination entry while an already-open destination File keeps its displaced node alive;
+    directory links, cross-volume targets, malformed roots, and allocation overflow fail explicitly.
+    The executive resolves local link targets through the same canonical source-parent, volume, or
+    retained-directory roots as rename and no caller handle crosses into the filesystem boundary.
+
+    MemFs snapshot schema 2 records the first file entry with its data and subsequent entries as
+    links to the same serialized node identity. Both allocating and block-streaming snapshot paths
+    preserve sharing and link counts, while the reader remains compatible with schema-1 snapshots.
+    Host coverage proves shared writes, exact-entry rename/delete, replace displacement with an open
+    handle, directory rejection, and snapshot-restored shared identity. Focused validation passes
+    `nt-fs` `73/73`; the freestanding executive remains at the established 212-warning baseline.
+    Serialized acceptance `.tmp/run-headless-memfs-hardlinks-no-rewind-20260827.log` selected, added,
+    and started all five configured PnP devices, observed both pending starts, launched genuine
+    userinit and Explorer, painted `480000/480000` pixels with at least 32 colours, passed all
+    `295/295` gates, and matched the sentinel. The committed writable snapshot was 1,693,432 bytes.
+
+    Root service-loop bulk-rewind removal (2026-08-27, accepted correctness checkpoint): the first
+    post-hardlink validation exposed the historical allocator rewind cutting through a live Vec that
+    had grown in place across dispatches. Its eventual destructor correctly tripped the allocator's
+    range-integrity guard instead of silently corrupting the free list. The root executive allocator
+    now relies on normal ownership-driven deallocation and its address-ordered reusable free list;
+    bulk dispatch scratch continues to use the independent scoped transient lane. The unsafe
+    `reset_to`, its free-list trimming helper, and the service-loop rewind call are removed. The
+    accepted boot above reports no allocator corruption with final durable watermark 16,354,528 B,
+    live allocation 14,822,152 B, and 6,149,240 B reusable, demonstrating that the rewind supplied no
+    required capacity benefit.
+
+    Review adjustment: local `FileLinkInformation` and the unsafe root service-loop rewind are
+    closed. Next remove the now-obsolete heap-mark pin parameter, durable-floor writes, and dirty
+    signals whose only consumer was rewind retention, while preserving filesystem checkpoint work
+    and dirty signals that carry real publication or persistence semantics. Then resume the remaining
+    file query/set capture inventory. Do not replace ownership-driven reclamation with another
+    watermark heuristic.

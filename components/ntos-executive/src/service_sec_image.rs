@@ -6080,10 +6080,9 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b"\n");
             }
         }
-        // The rewind boundary is the final authority: every durable owner published by the prior
-        // iteration must advance `heap_mark` here, regardless of which reply/park path received this
-        // message. Receive-edge finalizers preserve commit-before-block behavior, but this check is
-        // what makes an omitted edge unable to turn live kernel storage into transient memory.
+        // Complete durable publications and filesystem checkpoints before accepting the next
+        // dispatch. Ordinary temporary ownership is reclaimed by Drop/free-list reuse, while
+        // explicitly scoped scratch uses the allocator's independent transient lane.
         let rewind_durable_status =
             finalize_service_loop_durable_state(&mut nt_handler, &mut heap_mark);
         if rewind_durable_status != nt_fs::STATUS_SUCCESS {
@@ -6093,9 +6092,6 @@ pub(crate) unsafe fn service_sec_image(
             stop = rewind_durable_status as u64;
             break;
         }
-        // SAFETY: the finalizer above retained every allocation that entered durable state; all
-        // remaining allocations past `heap_mark` belong to the previous dispatch and are dead.
-        unsafe { allocator::reset_to(heap_mark) };
         iters += 1;
         // `iters` is diagnostic only. A real NT kernel does not stop a runnable hosted process set at a
         // historical boot-frontier count; quiesce is driven by wait/crash/stall predicates above.

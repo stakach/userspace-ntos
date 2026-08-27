@@ -558,33 +558,6 @@ unsafe fn release_top_free_blocks() {
     }
 }
 
-unsafe fn trim_free_list_to(limit: usize) {
-    let mut prev_link = FREE_HEAD;
-    let mut cur = unsafe { read_word(FREE_HEAD) };
-    while cur != 0 {
-        let size = unsafe { free_node_size(cur) };
-        let next = unsafe { free_node_next(cur) };
-        if cur >= limit {
-            unsafe { write_word(prev_link, next) };
-            cur = next;
-            continue;
-        }
-        if cur.checked_add(size).is_some_and(|end| end > limit) {
-            let trimmed = limit - cur;
-            if trimmed >= FREE_NODE_SIZE {
-                unsafe { set_free_node(cur, trimmed, next) };
-                prev_link = cur + WORD;
-            } else {
-                unsafe { write_word(prev_link, next) };
-            }
-            cur = next;
-            continue;
-        }
-        prev_link = cur + WORD;
-        cur = next;
-    }
-}
-
 unsafe fn alloc_from_free_list(layout: Layout, needed: usize) -> *mut u8 {
     let align = layout.align().max(ALLOC_GRANULE);
     let mut prev_link = FREE_HEAD;
@@ -854,13 +827,8 @@ unsafe impl GlobalAlloc for Bump {
 #[global_allocator]
 static ALLOC: Bump = Bump;
 
-/// Current bump offset — a heap "high-water mark".
-///
-/// The allocator reuses dropped blocks, but `mark`/[`reset_to`] is still the syscall loop's bulk
-/// transient reclamation tool. A caller that knows a region of work allocates only *transient*
-/// objects can snapshot the mark before it and reset after, reclaiming everything above the mark in
-/// one operation. SAFETY CONTRACT: nothing allocated after the mark may still be live when
-/// `reset_to` runs; it may be handed out again.
+/// Current durable bump offset. Dropped allocations are reused through the address-ordered free
+/// list; dispatch-local bulk scratch belongs in the independent transient lane.
 pub fn mark() -> usize {
     unsafe { read_word(CTR) }
 }
@@ -926,48 +894,5 @@ pub fn usage() -> HeapUsage {
         transient_used: unsafe { read_word(TRANSIENT_CTR) },
         transient_high_water: unsafe { read_word(TRANSIENT_HIGH_WATER) },
         transient_capacity: transient_heap_size(),
-    }
-}
-
-const fn rewind_target(requested: usize, current: usize, capacity: usize) -> usize {
-    let target = if requested < current {
-        requested
-    } else {
-        current
-    };
-    if target < capacity {
-        target
-    } else {
-        capacity
-    }
-}
-
-const fn rewind_target_with_floor(
-    requested: usize,
-    floor: usize,
-    current: usize,
-    capacity: usize,
-) -> usize {
-    let retained = if requested > floor { requested } else { floor };
-    rewind_target(retained, current, capacity)
-}
-
-const _: () = assert!(rewind_target(12, 8, 16) == 8);
-const _: () = assert!(rewind_target(4, 8, 16) == 4);
-const _: () = assert!(rewind_target(20, 24, 16) == 16);
-const _: () = assert!(rewind_target_with_floor(4, 12, 16, 32) == 12);
-const _: () = assert!(rewind_target_with_floor(20, 12, 16, 32) == 16);
-
-/// Rewind the bump counter to a [`mark`], reclaiming everything allocated since.
-///
-/// # Safety
-/// All allocations made after `m` must be dead (unreferenced) at this point.
-pub unsafe fn reset_to(m: usize) {
-    let current = unsafe { read_word(CTR) };
-    let floor = unsafe { read_word(DURABLE_FLOOR) };
-    let bounded = rewind_target_with_floor(m, floor, current, durable_heap_capacity());
-    unsafe {
-        trim_free_list_to(DATA + bounded);
-        write_word(CTR, bounded);
     }
 }
