@@ -22254,6 +22254,15 @@ impl ExecNtHandler {
         let desired_access = nt_ulong_arg(args[1]);
         let share_access = nt_ulong_arg(args[4]);
         let open_options = nt_ulong_arg(args[5]);
+        if let Err(status) = nt_fs::validate_file_create_parameters(
+            desired_access,
+            0,
+            share_access,
+            nt_fs::FILE_OPEN,
+            open_options,
+        ) {
+            return status;
+        }
         let captured = match self.capture_file_object_attributes(args[2]) {
             Ok(captured) => captured,
             Err(status) => return status,
@@ -30601,6 +30610,15 @@ impl ExecNtHandler {
                 let share_access = nt_ulong_arg(args[6]);
                 let create_disposition = nt_ulong_arg(args[7]);
                 let create_options = nt_ulong_arg(args[8]);
+                if let Err(status) = nt_fs::validate_file_create_parameters(
+                    desired_access,
+                    file_attributes,
+                    share_access,
+                    create_disposition,
+                    create_options,
+                ) {
+                    return status;
+                }
                 let ea_length = nt_ulong_arg(args[10]) as usize;
                 let ea = if args[9] != 0 && ea_length != 0 {
                     let mut bytes = match try_zeroed_transfer_buffer(ea_length) {

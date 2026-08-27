@@ -3149,6 +3149,54 @@ impl MemFs {
     }
 }
 
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct FileShareClaim {
+    read: bool,
+    write: bool,
+    delete: bool,
+    shared_read: bool,
+    shared_write: bool,
+    shared_delete: bool,
+}
+
+impl FileShareClaim {
+    fn new(desired_access: u32, share_access: u32) -> Self {
+        const GENERIC_ALL: u32 = 0x1000_0000;
+        const GENERIC_EXECUTE: u32 = 0x2000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+
+        let all = desired_access & (GENERIC_ALL | MAXIMUM_ALLOWED) != 0;
+        Self {
+            read: all
+                || desired_access & (FILE_READ_DATA | FILE_EXECUTE | GENERIC_READ | GENERIC_EXECUTE)
+                    != 0,
+            write: all
+                || desired_access & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE) != 0,
+            delete: all || desired_access & DELETE != 0,
+            shared_read: share_access & FILE_SHARE_READ != 0,
+            shared_write: share_access & FILE_SHARE_WRITE != 0,
+            shared_delete: share_access & FILE_SHARE_DELETE != 0,
+        }
+    }
+
+    fn participates(self) -> bool {
+        self.read || self.write || self.delete
+    }
+
+    fn compatible_with(self, existing: Self) -> bool {
+        !self.participates()
+            || !existing.participates()
+            || ((!self.read || existing.shared_read)
+                && (!self.write || existing.shared_write)
+                && (!self.delete || existing.shared_delete)
+                && (!existing.read || self.shared_read)
+                && (!existing.write || self.shared_write)
+                && (!existing.delete || self.shared_delete))
+    }
+}
+
 /// An open file instance (a simplified `FILE_OBJECT` + MemFs open handle, spec §6.1, §12.4).
 struct FileObject {
     node_id: u64,
@@ -3159,6 +3207,9 @@ struct FileObject {
     current_offset: u64,
     /// Create options retained as `FILE_OBJECT` mode flags for `FileModeInformation`.
     create_options: u32,
+    /// One share claim belongs to this open description. Duplicated handles only increase
+    /// `references`; the claim is released when the final reference closes.
+    share: FileShareClaim,
     /// Handles referring to this file object. `NtDuplicateObject` adds one, `ZwClose` removes one;
     /// the object (and any pending delete) is actioned when the last one goes.
     references: u32,
@@ -3206,6 +3257,57 @@ pub enum InstalledFileOpenAction {
     CopyContents,
     CopyMetadata,
     NameCollision,
+}
+
+/// Validate the common `NtCreateFile`/`NtOpenFile` contract before namespace lookup or mutation.
+/// This is the NT5 I/O Manager parameter policy; filesystem entry points call it defensively as
+/// well so kernel-mode users cannot bypass destructive-disposition ordering.
+pub fn validate_file_create_parameters(
+    desired_access: u32,
+    file_attributes: u32,
+    share_access: u32,
+    disposition: u32,
+    options: u32,
+) -> Result<(), u32> {
+    if file_attributes & !FILE_ATTRIBUTE_VALID_FLAGS != 0
+        || share_access & !FILE_SHARE_VALID_FLAGS != 0
+        || disposition > FILE_MAXIMUM_DISPOSITION
+        || options & !FILE_VALID_OPTION_FLAGS != 0
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+
+    let synchronous = options & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT);
+    if (synchronous != 0 && desired_access & SYNCHRONIZE == 0)
+        || synchronous == (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT)
+        || (options & FILE_DELETE_ON_CLOSE != 0 && desired_access & DELETE == 0)
+        || (options & FILE_DIRECTORY_FILE != 0 && options & FILE_NON_DIRECTORY_FILE != 0)
+        || (options & FILE_COMPLETE_IF_OPLOCKED != 0 && options & FILE_RESERVE_OPFILTER != 0)
+        || (options & FILE_NO_INTERMEDIATE_BUFFERING != 0
+            && desired_access & FILE_APPEND_DATA != 0)
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+
+    if options & FILE_DIRECTORY_FILE != 0 {
+        const DIRECTORY_OPTIONS: u32 = FILE_DIRECTORY_FILE
+            | FILE_SYNCHRONOUS_IO_ALERT
+            | FILE_SYNCHRONOUS_IO_NONALERT
+            | FILE_WRITE_THROUGH
+            | FILE_COMPLETE_IF_OPLOCKED
+            | FILE_OPEN_FOR_BACKUP_INTENT
+            | FILE_DELETE_ON_CLOSE
+            | FILE_OPEN_FOR_FREE_SPACE_QUERY
+            | FILE_OPEN_BY_FILE_ID
+            | FILE_NO_COMPRESSION
+            | FILE_OPEN_REPARSE_POINT;
+        if options & !DIRECTORY_OPTIONS != 0
+            || !matches!(disposition, FILE_CREATE | FILE_OPEN | FILE_OPEN_IF)
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+    }
+    Ok(())
 }
 
 /// Classify one open of a file known to exist on the installed read-only volume. This is kept in
@@ -3345,6 +3447,7 @@ impl FileSystem {
         entry_id: u64,
         information: u32,
         options: u32,
+        share: FileShareClaim,
     ) -> CreateResult {
         let Some(opened_name) = self.volume.opened_name(entry_id) else {
             return CreateResult {
@@ -3366,6 +3469,7 @@ impl FileSystem {
             opened_name,
             current_offset: 0,
             create_options: options,
+            share,
             references: 1,
             delete_pending: options & FILE_DELETE_ON_CLOSE != 0,
             query: DirectoryQueryState::new(),
@@ -3453,6 +3557,20 @@ impl FileSystem {
     }
     fn obj_mut(&mut self, handle: u64) -> Option<&mut FileObject> {
         self.handles.get_mut(handle as usize)?.as_mut()
+    }
+
+    fn check_share_access(&self, node_id: u64, requested: FileShareClaim) -> Result<(), u32> {
+        if self
+            .handles
+            .iter()
+            .flatten()
+            .filter(|object| object.node_id == node_id)
+            .all(|object| requested.compatible_with(object.share))
+        {
+            Ok(())
+        } else {
+            Err(STATUS_SHARING_VIOLATION)
+        }
     }
 
     fn reap_unlinked_nodes(&mut self) {
@@ -3676,9 +3794,9 @@ impl FileSystem {
     pub fn zw_create_file(
         &mut self,
         path: &str,
-        _desired_access: u32,
+        desired_access: u32,
         file_attributes: u32,
-        _share_access: u32,
+        share_access: u32,
         disposition: u32,
         options: u32,
     ) -> CreateResult {
@@ -3687,16 +3805,33 @@ impl FileSystem {
             handle: INVALID_HANDLE,
             information: 0,
         };
+        if let Err(status) = validate_file_create_parameters(
+            desired_access,
+            file_attributes,
+            share_access,
+            disposition,
+            options,
+        ) {
+            return fail(status);
+        }
         let Some(rel) = self.to_relative(&normalize_separators(path)) else {
             return fail(STATUS_OBJECT_PATH_NOT_FOUND);
         };
+        let share = FileShareClaim::new(desired_access, share_access);
+        if disposition != FILE_CREATE {
+            if let Some((node_id, _)) = self.volume.lookup_entry_from(0, &rel) {
+                if let Err(status) = self.check_share_access(node_id, share) {
+                    return fail(status);
+                }
+            }
+        }
         match self
             .volume
             .create(&rel, disposition, options, file_attributes)
         {
             // Directory/non-directory intent already validated in create().
             Ok((node_id, entry_id, information)) => {
-                self.publish_file_object(node_id, entry_id, information, options)
+                self.publish_file_object(node_id, entry_id, information, options, share)
             }
             Err(status) => fail(status),
         }
@@ -3709,9 +3844,9 @@ impl FileSystem {
     pub fn zw_create_file_relative(
         &mut self,
         relative: &[u8],
-        _desired_access: u32,
+        desired_access: u32,
         file_attributes: u32,
-        _share_access: u32,
+        share_access: u32,
         disposition: u32,
         options: u32,
     ) -> CreateResult {
@@ -3720,12 +3855,29 @@ impl FileSystem {
             handle: INVALID_HANDLE,
             information: 0,
         };
+        if let Err(status) = validate_file_create_parameters(
+            desired_access,
+            file_attributes,
+            share_access,
+            disposition,
+            options,
+        ) {
+            return fail(status);
+        }
+        let share = FileShareClaim::new(desired_access, share_access);
+        if disposition != FILE_CREATE {
+            if let Some((node_id, _)) = self.volume.lookup_folded_entry_from(0, relative) {
+                if let Err(status) = self.check_share_access(node_id, share) {
+                    return fail(status);
+                }
+            }
+        }
         match self
             .volume
             .create_folded_relative(relative, disposition, options, file_attributes)
         {
             Ok((node_id, entry_id, information)) => {
-                self.publish_file_object(node_id, entry_id, information, options)
+                self.publish_file_object(node_id, entry_id, information, options, share)
             }
             Err(status) => fail(status),
         }
@@ -3795,9 +3947,9 @@ impl FileSystem {
         &mut self,
         root_directory: u64,
         relative: &[u8],
-        _desired_access: u32,
+        desired_access: u32,
         file_attributes: u32,
-        _share_access: u32,
+        share_access: u32,
         disposition: u32,
         options: u32,
     ) -> CreateResult {
@@ -3806,6 +3958,15 @@ impl FileSystem {
             handle: INVALID_HANDLE,
             information: 0,
         };
+        if let Err(status) = validate_file_create_parameters(
+            desired_access,
+            file_attributes,
+            share_access,
+            disposition,
+            options,
+        ) {
+            return fail(status);
+        }
         let Some(root_node) = self.obj(root_directory).map(|object| object.node_id) else {
             return fail(STATUS_INVALID_HANDLE);
         };
@@ -3818,6 +3979,14 @@ impl FileSystem {
         if relative.is_empty() || relative.first() == Some(&b'\\') {
             return fail(STATUS_INVALID_PARAMETER);
         }
+        let share = FileShareClaim::new(desired_access, share_access);
+        if disposition != FILE_CREATE {
+            if let Some((node_id, _)) = self.volume.lookup_folded_entry_from(root_node, relative) {
+                if let Err(status) = self.check_share_access(node_id, share) {
+                    return fail(status);
+                }
+            }
+        }
         match self.volume.create_folded_from(
             root_node,
             relative,
@@ -3826,7 +3995,7 @@ impl FileSystem {
             file_attributes,
         ) {
             Ok((node_id, entry_id, information)) => {
-                self.publish_file_object(node_id, entry_id, information, options)
+                self.publish_file_object(node_id, entry_id, information, options, share)
             }
             Err(status) => fail(status),
         }

@@ -14362,3 +14362,34 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     before any create, truncate, supersede, or copy-up mutation, and the final close of the shared
     open description must release its claim. After that, resume the remaining file query/set
     information-class inventory.
+
+    Local create validation and MemFs share access (2026-08-27, accepted): the common
+    `NtCreateFile`/`NtOpenFile` entry boundary now validates NT5 file-attribute, share-access,
+    disposition, and create-option masks before namespace routing. It enforces the required
+    `SYNCHRONIZE` and `DELETE` rights, rejects mutually exclusive synchronous and file-kind modes,
+    and applies the directory, oplock, and no-buffering/append option constraints. Hosted FSD,
+    named-pipe, installed-volume, and writable-volume requests therefore receive one parameter
+    policy rather than route-specific acceptance.
+
+    MemFs owns one read/write/delete share claim per File open description. Compatibility is
+    symmetric with every live File for the same node, including opens through distinct hard-link
+    names, and is checked before a disposition may create, truncate, overwrite, or supersede
+    storage. Duplicated process handles retain that single claim; only final close releases it.
+    Metadata-only opens do not participate, matching `IoCheckShareAccess`. The mount proof was
+    corrected to close its first directory File before a second exclusive enumeration open and to
+    request `DELETE` for delete-on-close instead of depending on the former permissive stub.
+
+    Focused validation passes `nt-fs` `86/86`; the freestanding executive remains at the
+    established 211-warning baseline. Serialized acceptance
+    `.tmp/run-headless-file-share-access-final-20260827.log` passed the real filesystem self-test at
+    `0x1ff/0x1ff`, launched genuine userinit and Explorer, completed 697 Explorer api0 redirects
+    with zero callback failures, painted `480000/480000` framebuffer pixels with at least 32
+    colours, passed all `295/295` gates, and matched the sentinel. The writable snapshot committed
+    generation 5 at 1,750,162 bytes.
+
+    Review adjustment: local MemFs share accounting and common create-parameter validation are
+    closed. The installed FAT `DirectoryOpenTable` and `ReadOnlyFileOpenTable` still retain mode and
+    position but not their share claims. Next move the same tested claim primitive into those
+    filesystem-owned open descriptions, reject incompatible opens by stable FAT identity, and
+    check outstanding lower-volume claims before the first writable copy-up transaction. Then
+    resume the remaining file query/set information-class inventory.

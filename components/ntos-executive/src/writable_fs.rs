@@ -2378,6 +2378,9 @@ fn selftest(fs: &mut nt_fs::FileSystem) {
         }
         fs.zw_close(file.handle);
     }
+    if dir.status == nt_fs::STATUS_SUCCESS {
+        fs.zw_close(dir.handle);
+    }
     // (7) Enumeration through the native record encoder finds `.`, `..` and the file.
     let scan = fs.zw_create_file(
         DIR,
@@ -2431,14 +2434,11 @@ fn selftest(fs: &mut nt_fs::FileSystem) {
         }
         fs.zw_close(scan.handle);
     }
-    if dir.status == nt_fs::STATUS_SUCCESS {
-        fs.zw_close(dir.handle);
-    }
     // (8) Delete-on-close really unlinks: the file, then the (now empty) directory, and a
     // by-path attribute query for each must MISS afterwards.
     let del_file = fs.zw_create_file(
         FILE,
-        nt_fs::FILE_WRITE_DATA,
+        nt_fs::FILE_WRITE_DATA | nt_fs::DELETE,
         0,
         0,
         nt_fs::FILE_OPEN,
@@ -2449,7 +2449,7 @@ fn selftest(fs: &mut nt_fs::FileSystem) {
     }
     let del_dir = fs.zw_create_file(
         DIR,
-        nt_fs::FILE_WRITE_DATA,
+        nt_fs::FILE_WRITE_DATA | nt_fs::DELETE,
         0,
         0,
         nt_fs::FILE_OPEN,

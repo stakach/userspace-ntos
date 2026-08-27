@@ -542,7 +542,7 @@ fn file_mode_retains_only_file_object_mode_options() {
     let mut fs = FileSystem::new(MemFs::with_fixture());
     let opened = fs.zw_create_file(
         SYSTEM_HIVE,
-        FILE_READ_DATA | SYNCHRONIZE,
+        FILE_READ_DATA | DELETE | SYNCHRONIZE,
         0,
         0,
         FILE_OPEN,
@@ -962,6 +962,7 @@ fn create_dispositions() {
         0,
     );
     assert_eq!(dup.status, STATUS_OBJECT_NAME_COLLISION);
+    assert_eq!(fs.zw_close(c.handle), STATUS_SUCCESS);
     // OVERWRITE_IF an existing file truncates.
     let o = fs.zw_create_file(
         r"\??\C:\Temp\new.dat",
@@ -975,6 +976,213 @@ fn create_dispositions() {
     // A missing parent directory → path not found.
     let np = fs.zw_create_file(r"\??\C:\NoSuchDir\x", FILE_WRITE_DATA, 0, 0, FILE_CREATE, 0);
     assert_eq!(np.status, STATUS_OBJECT_PATH_NOT_FOUND);
+}
+
+#[test]
+fn create_parameter_validation_matches_nt5_io_manager_contract() {
+    let valid = |access, attributes, share, disposition, options| {
+        validate_file_create_parameters(access, attributes, share, disposition, options)
+    };
+    assert_eq!(valid(FILE_READ_DATA, 0, 0, FILE_OPEN, 0), Ok(()));
+    assert_eq!(
+        valid(
+            FILE_READ_DATA | SYNCHRONIZE,
+            FILE_ATTRIBUTE_HIDDEN,
+            FILE_SHARE_READ,
+            FILE_OPEN,
+            FILE_SYNCHRONOUS_IO_NONALERT,
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        valid(FILE_READ_DATA, 0x8000_0000, 0, FILE_OPEN, 0),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        valid(FILE_READ_DATA, 0, 0x8, FILE_OPEN, 0),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        valid(FILE_READ_DATA, 0, 0, FILE_MAXIMUM_DISPOSITION + 1, 0),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        valid(FILE_READ_DATA, 0, 0, FILE_OPEN, 0x0100_0000),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        valid(
+            FILE_READ_DATA,
+            0,
+            0,
+            FILE_OPEN,
+            FILE_SYNCHRONOUS_IO_NONALERT,
+        ),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        valid(
+            FILE_READ_DATA | SYNCHRONIZE,
+            0,
+            0,
+            FILE_OPEN,
+            FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT,
+        ),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        valid(FILE_READ_DATA, 0, 0, FILE_OPEN, FILE_DELETE_ON_CLOSE),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        valid(
+            FILE_READ_DATA,
+            0,
+            0,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE | FILE_NON_DIRECTORY_FILE,
+        ),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        valid(FILE_READ_DATA, 0, 0, FILE_OVERWRITE, FILE_DIRECTORY_FILE),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        valid(
+            FILE_READ_DATA,
+            0,
+            0,
+            FILE_OPEN,
+            FILE_COMPLETE_IF_OPLOCKED | FILE_RESERVE_OPFILTER,
+        ),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        valid(
+            FILE_APPEND_DATA,
+            0,
+            0,
+            FILE_OPEN,
+            FILE_NO_INTERMEDIATE_BUFFERING,
+        ),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+}
+
+#[test]
+fn share_access_is_symmetric_precedes_truncate_and_lives_until_final_close() {
+    let mut fs = FileSystem::new(MemFs::with_fixture());
+    assert!(fs.provision_file(r"\??\C:\Temp\shared.dat", b"payload"));
+
+    let reader = fs.zw_create_file(
+        r"\??\C:\Temp\shared.dat",
+        FILE_READ_DATA,
+        0,
+        FILE_SHARE_READ,
+        FILE_OPEN,
+        0,
+    );
+    assert_eq!(reader.status, STATUS_SUCCESS);
+    let denied_writer = fs.zw_create_file(
+        r"\??\C:\Temp\shared.dat",
+        FILE_WRITE_DATA,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_OVERWRITE,
+        0,
+    );
+    assert_eq!(denied_writer.status, STATUS_SHARING_VIOLATION);
+    assert_eq!(
+        fs.file_bytes(r"\??\C:\Temp\shared.dat"),
+        Some(&b"payload"[..])
+    );
+    assert_eq!(fs.zw_close(reader.handle), STATUS_SUCCESS);
+
+    let first = fs.zw_create_file(
+        r"\??\C:\Temp\shared.dat",
+        FILE_READ_DATA,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_OPEN,
+        0,
+    );
+    assert_eq!(first.status, STATUS_SUCCESS);
+    let symmetric_denial = fs.zw_create_file(
+        r"\??\C:\Temp\shared.dat",
+        FILE_WRITE_DATA,
+        0,
+        FILE_SHARE_WRITE,
+        FILE_OPEN,
+        0,
+    );
+    assert_eq!(symmetric_denial.status, STATUS_SHARING_VIOLATION);
+    let writer = fs.zw_create_file(
+        r"\??\C:\Temp\shared.dat",
+        FILE_WRITE_DATA,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_OPEN,
+        0,
+    );
+    assert_eq!(writer.status, STATUS_SUCCESS);
+    assert_eq!(fs.zw_close(writer.handle), STATUS_SUCCESS);
+
+    assert_eq!(fs.zw_retain(first.handle), STATUS_SUCCESS);
+    assert_eq!(fs.zw_close(first.handle), STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_create_file(
+            r"\??\C:\Temp\shared.dat",
+            FILE_WRITE_DATA,
+            0,
+            FILE_SHARE_WRITE,
+            FILE_OPEN,
+            0,
+        )
+        .status,
+        STATUS_SHARING_VIOLATION
+    );
+    assert_eq!(fs.zw_close(first.handle), STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_create_file(
+            r"\??\C:\Temp\shared.dat",
+            FILE_WRITE_DATA,
+            0,
+            FILE_SHARE_WRITE,
+            FILE_OPEN,
+            0,
+        )
+        .status,
+        STATUS_SUCCESS
+    );
+}
+
+#[test]
+fn metadata_only_open_does_not_participate_in_share_accounting() {
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    let mut fs = FileSystem::new(MemFs::with_fixture());
+    assert!(fs.provision_file(r"\??\C:\Temp\metadata.dat", b"x"));
+    let metadata = fs.zw_create_file(
+        r"\??\C:\Temp\metadata.dat",
+        FILE_READ_ATTRIBUTES,
+        0,
+        0,
+        FILE_OPEN,
+        0,
+    );
+    assert_eq!(metadata.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_create_file(
+            r"\??\C:\Temp\metadata.dat",
+            FILE_WRITE_DATA,
+            0,
+            0,
+            FILE_OPEN,
+            0,
+        )
+        .status,
+        STATUS_SUCCESS
+    );
 }
 
 #[test]
@@ -1238,7 +1446,7 @@ fn replace_file_data_owned_installs_complete_file_image() {
     let mut fs = FileSystem::new(MemFs::new());
     let file = fs.zw_create_file(
         r"\??\C:\checkpoint.bin",
-        FILE_READ_DATA | FILE_WRITE_DATA,
+        FILE_READ_DATA | FILE_WRITE_DATA | SYNCHRONIZE,
         0,
         0,
         FILE_CREATE,
@@ -1353,7 +1561,7 @@ fn memfs_snapshot_round_trips_volume_tree_sparse_data_and_attributes() {
 
     let stale = fs.zw_create_file(
         r"\??\C:\Profiles\Administrator\delete-me.tmp",
-        FILE_READ_DATA,
+        FILE_READ_DATA | DELETE,
         0,
         0,
         FILE_CREATE,
@@ -1925,7 +2133,7 @@ fn cache_manager_over_memfs_file() {
     // Create the backing file, then cache writes through to it (spec §22).
     {
         let mut f = fs.borrow_mut();
-        f.zw_create_file(
+        let created = f.zw_create_file(
             r"\??\C:\Temp\cached.bin",
             FILE_WRITE_DATA,
             0,
@@ -1933,6 +2141,8 @@ fn cache_manager_over_memfs_file() {
             FILE_CREATE,
             0,
         );
+        assert_eq!(created.status, STATUS_SUCCESS);
+        assert_eq!(f.zw_close(created.handle), STATUS_SUCCESS);
     }
     let sizes = FileSizes {
         allocation_size: 0,
@@ -2501,7 +2711,7 @@ fn writable_volume_hardlinks_share_nodes_and_retain_exact_entries() {
         r"\??\C:\links\source.txt",
         FILE_WRITE_DATA,
         0,
-        0,
+        FILE_SHARE_WRITE,
         FILE_CREATE,
         FILE_NON_DIRECTORY_FILE,
     );
@@ -2534,7 +2744,7 @@ fn writable_volume_hardlinks_share_nodes_and_retain_exact_entries() {
         r"\??\C:\links\alias.txt",
         FILE_WRITE_DATA,
         0,
-        0,
+        FILE_SHARE_WRITE,
         FILE_OPEN,
         FILE_NON_DIRECTORY_FILE,
     );
@@ -2662,7 +2872,7 @@ fn writable_volume_hardlinks_share_nodes_and_retain_exact_entries() {
         r"\??\C:\links\renamed.txt",
         FILE_WRITE_DATA,
         0,
-        0,
+        FILE_SHARE_WRITE,
         FILE_OPEN,
         FILE_NON_DIRECTORY_FILE,
     );
@@ -2670,7 +2880,7 @@ fn writable_volume_hardlinks_share_nodes_and_retain_exact_entries() {
         r"\??\C:\links\target.txt",
         FILE_WRITE_DATA,
         0,
-        0,
+        FILE_SHARE_WRITE,
         FILE_OPEN,
         FILE_NON_DIRECTORY_FILE,
     );
@@ -3004,7 +3214,7 @@ fn installed_file_import_preserves_state_before_normal_open() {
 
     let opened = fs.zw_create_file_relative(
         b"reactos\\system32\\installed.dat",
-        FILE_READ_DATA | FILE_WRITE_DATA,
+        FILE_READ_DATA | FILE_WRITE_DATA | SYNCHRONIZE,
         0,
         0,
         FILE_OPEN_IF,
