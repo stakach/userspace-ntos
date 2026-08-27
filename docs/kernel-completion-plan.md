@@ -14939,7 +14939,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Put generation-exact retain/release primitives in the owning object crates where possible and
     keep the executive responsible only for translating handles into typed wait identities.
 
-    Parked wait-object lifetime convergence (2026-08-27, implementation checkpoint): published
+    Parked wait-object lifetime convergence (2026-08-27, accepted): published
     single and multiple waits now retain every typed object identity transactionally before moving
     the caller's reply capability. A partial retain or waiter-publication failure unwinds the exact
     retained prefix in reverse order. Wake, timeout, queued user-APC interruption, and thread
@@ -14965,5 +14965,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
 
     Focused validation passes `nt-process` `107/107`, `nt-kernel-exec` `168/168`, `nt-fs`
     `119/119`, `nt-io-manager` `236/236`, `git diff --check`, and the freestanding executive at the
-    established 211-warning baseline. Release-build and serialized desktop acceptance remain the
-    final checks before this milestone is marked accepted.
+    established 211-warning baseline. The serialized release build succeeds. Code checkpoint
+    `ebdf4125` is pushed.
+
+    Serialized acceptance `.tmp/run-headless-wait-lifetime-20260827.log` reached quiescence at
+    102,123 ms, launched genuine userinit and Explorer, completed 669 Explorer api0 redirects with
+    zero callback or dead-callback failures, recorded paint begin/end `5/20`, 187 direct GDI
+    returns, and 135 batch flushes covering 184 records, painted `480000/480000` framebuffer pixels
+    with at least 32 colours, passed all `295/295` gates, and matched the sentinel. Snapshot
+    generation 5 committed 1,755,502 bytes; scratch returned to zero and the resource census
+    reported no page-table, frame, mapping, alias, registry, untyped-allocation,
+    frame-registration, image-bank, or allocator failures.
+
+    Review adjustment: wait records now own exact object lifetimes and all known terminal removal
+    paths, including post-park user APC delivery, release that ownership. The next selection must
+    come from the measured ntdll/export-to-executive registration gap list. Prefer a missing core NT
+    trait that unblocks general applications; do not add a boot-image identity branch or successful
+    compatibility fallback.
