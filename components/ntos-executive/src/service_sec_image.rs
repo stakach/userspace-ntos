@@ -5411,7 +5411,6 @@ pub(crate) unsafe fn service_sec_image(
     if pending_driver_start_redrive_needed(&nt_handler) {
         let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
     }
-    VM_FREE_FRAME_N = 0;
     if live_service {
         let resume_error = tcb_resume_r(main_tcb);
         if resume_error != 0 {

@@ -1603,12 +1603,15 @@ pub(crate) static mut COMMITTED_MAP_AFTER: nt_address_space::VmCommittedRangeTab
 const PRIVATE_VM_PT_COUNT: usize = ((PRIVATE_VM_LIMIT - SMSS_ALLOC_VA) / 0x20_0000) as usize;
 static PROCESS_VM_PT_CAP_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
 static mut PROCESS_VM_PT_CAPS: alloc::vec::Vec<[u64; PRIVATE_VM_PT_COUNT]> = alloc::vec::Vec::new();
-const VM_FREE_FRAME_CAPACITY: usize = 4096;
-static mut VM_FREE_FRAMES: [u64; VM_FREE_FRAME_CAPACITY] = [0; VM_FREE_FRAME_CAPACITY];
-static mut VM_FREE_FRAME_N: usize = 0;
+static mut VM_FREE_FRAMES: nt_address_space::RecycledFramePool =
+    nt_address_space::RecycledFramePool::new();
 static KUSER_PAGE_ALIAS_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
 static KUSER_PAGE_ALIAS_STORE_FAILURES: AtomicU64 = AtomicU64::new(0);
 static mut KUSER_PAGE_ALIASES: alloc::vec::Vec<AtomicU64> = alloc::vec::Vec::new();
+
+fn vm_free_frame_stats() -> nt_address_space::RecycledFramePoolStats {
+    unsafe { (&*core::ptr::addr_of!(VM_FREE_FRAMES)).stats() }
+}
 
 pub(crate) unsafe fn reset_process_private_pt_caps(slots: usize) -> bool {
     let caps = &mut *core::ptr::addr_of_mut!(PROCESS_VM_PT_CAPS);
@@ -5679,9 +5682,9 @@ fn image_writecopy_cow_spec(passed: &mut u64) {
 /// ═══ EVERY POOL THAT BACKS HOSTED PRIVATE MEMORY HAS MEASURED HEADROOM ══════════════════════════
 ///
 /// The recurring wall in this codebase is a bounded resource that answers "no" in silence: root
-/// CSpace, the executive bump heap, the VAD map, and the recycled-frame cache. Each real bound is
-/// measured with a HIGH-WATER mark next to its capacity and printed at the gate (`[pools]`).
-/// Bookkeeping registries grow instead; their allocation and consistency failures are gate errors.
+/// CSpace, the executive bump heap, and the VAD map. Each real bound is measured with a HIGH-WATER
+/// mark next to its capacity and printed at the gate (`[pools]`). Bookkeeping registries, including
+/// the recycled-frame cache, grow instead; their allocation and consistency failures are gate errors.
 /// This makes exhaustion a RED SPEC rather than a mystery.
 fn vm_pool_headroom_spec(passed: &mut u64) {
     let untyped_used = UT_RETYPE_LIVE_BYTES.load(Ordering::Relaxed);
@@ -5698,7 +5701,7 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
     let committed_mappings = VM_COMMITTED_MAPPING_HW.load(Ordering::Relaxed);
     let committed_mapping_fails = VM_COMMITTED_MAPPING_REGISTRATION_FAILS.load(Ordering::Relaxed);
     let protection_overrides = VM_PROTECTION_OVERRIDE_HW.load(Ordering::Relaxed);
-    let free_list = VM_FREE_FRAME_HW.load(Ordering::Relaxed);
+    let free_frame_store_failures = vm_free_frame_stats().allocation_failures;
     print_pool_census(b"gate");
     print_frame_registry_census(b"gate");
     check(
@@ -5718,7 +5721,6 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
             && committed_mappings * 4 < PROCESS_COMMITTED_MAPPING_CAPACITY as u64 * 3
             && protection_overrides * 4
                 < nt_address_space::VM_PROTECTION_OVERRIDE_CAPACITY as u64 * 3
-            && free_list * 4 < VM_FREE_FRAME_CAPACITY as u64 * 3
             // ROOT-CSPACE SLOTS ARE THE BINDING CONSTRAINT. Measure real availability: slots left in
             // the bump range plus deleted root slots returned through the recycle stack.
             && slots_available >= 2048
@@ -5726,6 +5728,7 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
             && frame_registry.allocation_failures == 0
             && frame_registry.frame_conflicts == 0
             && frame_registry.ownership_conflicts == 0
+            && free_frame_store_failures == 0
             && fsd_exports.allocation_failures == 0
             && win32k_exports.allocation_failures == 0
             && SHARED_IMAGE_MAPPING_FAILS.load(Ordering::Relaxed) == 0
@@ -9723,8 +9726,6 @@ pub(crate) static UT_LAST_FAIL_OBJ: AtomicU64 = AtomicU64::new(0);
 /// polluting the GUI/client frame registry.
 pub(crate) static SHARED_IMAGE_MAPPING_HW: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SHARED_IMAGE_MAPPING_FAILS: AtomicU64 = AtomicU64::new(0);
-/// High-water of the recycled-frame free list (`VM_FREE_FRAME_CAPACITY`).
-pub(crate) static VM_FREE_FRAME_HW: AtomicU64 = AtomicU64::new(0);
 /// Per-step failure tally for `vm_map_private_page`, so a refusal names its own sub-step.
 pub(crate) static VM_FAIL_PT: AtomicU64 = AtomicU64::new(0);
 pub(crate) static VM_FAIL_FRAME: AtomicU64 = AtomicU64::new(0);
@@ -10391,10 +10392,15 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(SEC_IMAGE_WRITECOPY_PREDICATE_LOAD_CONFIG_ERRORS.load(Ordering::Relaxed));
     print_str(b"/");
     print_u64(SEC_IMAGE_WRITECOPY_PREDICATE_TLS_ERRORS.load(Ordering::Relaxed));
+    let free_frames = vm_free_frame_stats();
     print_str(b" freelist=");
-    print_u64(VM_FREE_FRAME_HW.load(Ordering::Relaxed));
+    print_u64(free_frames.live as u64);
     print_str(b"/");
-    print_u64(VM_FREE_FRAME_CAPACITY as u64);
+    print_u64(free_frames.high_water as u64);
+    print_str(b"/");
+    print_u64(free_frames.capacity as u64);
+    print_str(b"/");
+    print_u64(free_frames.allocation_failures);
     print_str(b" vad=");
     print_u64(VM_REGION_HW.load(Ordering::Relaxed));
     print_str(b"/");
@@ -12569,8 +12575,8 @@ unsafe fn alloc_frame() -> u64 {
 }
 
 unsafe fn vm_frame_acquire(scratch_base: u64) -> Result<u64, u32> {
-    let count = core::ptr::read(core::ptr::addr_of!(VM_FREE_FRAME_N));
-    if count == 0 {
+    let cached = (&mut *core::ptr::addr_of_mut!(VM_FREE_FRAMES)).acquire();
+    let Some(frame) = cached else {
         let (frame, error) = alloc_frame_r();
         return if error == 0 {
             Ok(frame)
@@ -12578,16 +12584,16 @@ unsafe fn vm_frame_acquire(scratch_base: u64) -> Result<u64, u32> {
             let _ = cnode_delete_recycle_r(frame);
             Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES)
         };
-    }
-    let index = count - 1;
-    let frames = core::ptr::addr_of_mut!(VM_FREE_FRAMES) as *mut u64;
-    let frame = core::ptr::read(frames.add(index));
-    core::ptr::write(frames.add(index), 0);
-    core::ptr::write(core::ptr::addr_of_mut!(VM_FREE_FRAME_N), index);
+    };
     let scratch = scratch_base + DEMAND_SCRATCH_WINDOW - 0x2000;
     if page_map_r(frame, scratch, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
-        core::ptr::write(frames.add(index), frame);
-        core::ptr::write(core::ptr::addr_of_mut!(VM_FREE_FRAME_N), count);
+        // `acquire` retained the vector's capacity, so restoring this entry cannot allocate.
+        if (&mut *core::ptr::addr_of_mut!(VM_FREE_FRAMES))
+            .try_recycle(frame)
+            .is_err()
+        {
+            let _ = cnode_delete_recycle_r(frame);
+        }
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
     core::ptr::write_bytes(scratch as *mut u8, 0, 0x1000);
@@ -12599,15 +12605,9 @@ unsafe fn vm_frame_return_to_free_list(frame: u64) {
     if frame == 0 {
         return;
     }
-    let count = core::ptr::read(core::ptr::addr_of!(VM_FREE_FRAME_N));
-    if count < VM_FREE_FRAME_CAPACITY {
-        core::ptr::write(
-            (core::ptr::addr_of_mut!(VM_FREE_FRAMES) as *mut u64).add(count),
-            frame,
-        );
-        core::ptr::write(core::ptr::addr_of_mut!(VM_FREE_FRAME_N), count + 1);
-        note_high_water(&VM_FREE_FRAME_HW, (count + 1) as u64);
-    } else {
+    if let Err(frame) =
+        (&mut *core::ptr::addr_of_mut!(VM_FREE_FRAMES)).try_recycle(frame)
+    {
         let _ = cnode_delete_recycle_r(frame);
     }
 }
@@ -22429,10 +22429,16 @@ impl ExecDirectoryOpens {
         first_cluster: u32,
         volume_relative_path: &[u8],
         create_options: u32,
+        metadata: nt_fs::FileMetadata,
     ) -> Result<u32, u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe {
-            (&mut *self.table).create(first_cluster, volume_relative_path, create_options)
+            (&mut *self.table).create(
+                first_cluster,
+                volume_relative_path,
+                create_options,
+                metadata,
+            )
         }
     }
 
@@ -22471,9 +22477,15 @@ impl ExecReadOnlyFileOpens {
         Self { table }
     }
 
-    fn create(&mut self, first_cluster: u32, size: u32, create_options: u32) -> Result<u32, u32> {
+    fn create(
+        &mut self,
+        first_cluster: u32,
+        size: u32,
+        create_options: u32,
+        metadata: nt_fs::FileMetadata,
+    ) -> Result<u32, u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).create(first_cluster, size, create_options) }
+        unsafe { (&mut *self.table).create(first_cluster, size, create_options, metadata) }
     }
 
     fn get(&self, id: u32) -> Result<&nt_fs::ReadOnlyFileOpen, u32> {

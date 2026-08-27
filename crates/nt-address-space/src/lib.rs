@@ -25,6 +25,61 @@ use nt_cache_manager::{CachedStreamBacking, SharedCacheMap};
 pub const PAGE_SIZE: u64 = 4096;
 pub const ALLOCATION_GRANULARITY: u64 = 64 * 1024;
 
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecycledFramePoolStats {
+    pub live: usize,
+    pub capacity: usize,
+    pub high_water: usize,
+    pub allocation_failures: u64,
+}
+
+/// Growable ownership store for unmapped frame capabilities. The caller retains responsibility for
+/// deleting a capability returned by [`Self::try_recycle`] on allocation failure.
+pub struct RecycledFramePool {
+    frames: Vec<u64>,
+    high_water: usize,
+    allocation_failures: u64,
+}
+
+impl Default for RecycledFramePool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RecycledFramePool {
+    pub const fn new() -> Self {
+        Self {
+            frames: Vec::new(),
+            high_water: 0,
+            allocation_failures: 0,
+        }
+    }
+
+    pub fn acquire(&mut self) -> Option<u64> {
+        self.frames.pop()
+    }
+
+    pub fn try_recycle(&mut self, frame: u64) -> Result<(), u64> {
+        if self.frames.try_reserve(1).is_err() {
+            self.allocation_failures = self.allocation_failures.saturating_add(1);
+            return Err(frame);
+        }
+        self.frames.push(frame);
+        self.high_water = self.high_water.max(self.frames.len());
+        Ok(())
+    }
+
+    pub fn stats(&self) -> RecycledFramePoolStats {
+        RecycledFramePoolStats {
+            live: self.frames.len(),
+            capacity: self.frames.capacity(),
+            high_water: self.high_water,
+            allocation_failures: self.allocation_failures,
+        }
+    }
+}
+
 /// One contiguous part of a byte range that lies within a single native page.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PageChunk {

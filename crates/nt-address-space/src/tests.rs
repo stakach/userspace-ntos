@@ -1,6 +1,23 @@
 use super::*;
 
 #[test]
+fn recycled_frame_pool_grows_past_the_old_policy_limit_and_reuses_lifo() {
+    let mut pool = RecycledFramePool::new();
+    for frame in 1..=5_000 {
+        assert_eq!(pool.try_recycle(frame), Ok(()));
+    }
+    let stats = pool.stats();
+    assert_eq!(stats.live, 5_000);
+    assert_eq!(stats.high_water, 5_000);
+    assert!(stats.capacity >= 5_000);
+    assert_eq!(stats.allocation_failures, 0);
+    assert_eq!(pool.acquire(), Some(5_000));
+    assert_eq!(pool.acquire(), Some(4_999));
+    assert_eq!(pool.stats().live, 4_998);
+    assert_eq!(pool.stats().high_water, 5_000);
+}
+
+#[test]
 fn page_chunks_cover_in_page_boundary_and_cross_page_ranges() {
     assert_eq!(page_chunks(0x1234, 0).unwrap().next(), None);
     assert_eq!(
