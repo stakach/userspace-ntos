@@ -14736,3 +14736,43 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     exported service whose implementation is missing or bypasses its canonical IRP owner. Preserve
     the same rule: ntdll owns the ABI, the executive owns capture/security/completion, the I/O
     Manager owns IRPs, and filesystem or device providers own semantics.
+
+    Native extended-attribute service boundary (2026-08-27, accepted): the adjacent audit found
+    that `NtQueryEaFile` had an ntdll trap stub but
+    no registered native service, while `NtSetEaFile` was absent from the syscall/export set.
+    Both services now use their canonical ReactOS NT5 numbers and argument counts, including the
+    new Nt/Zw set-EA exports. Query capture preserves the optional
+    `FILE_GET_EA_INFORMATION` name-list chain, optional enumeration index, restart-scan,
+    return-single-entry, and index-specified state. Set capture validates the
+    `FILE_FULL_EA_INFORMATION` chain. Malformed lists publish
+    `STATUS_EA_LIST_INCONSISTENT` and the exact failing byte offset, and the File is referenced with
+    `FILE_READ_EA` or `FILE_WRITE_EA` access before route selection.
+
+    The I/O Manager owns typed query/set EA parameters and their exact buffer extents. Provider
+    Files issue genuine `IRP_MJ_QUERY_EA` and `IRP_MJ_SET_EA`; the hosted receiver constructs the
+    native x64 QueryEa/SetEa stack union, exposes query input through
+    `Irp.Tail.Overlay.AuxiliaryBuffer`, keeps the query result buffer distinct, and retains it
+    through canonical pending completion. Cross-domain I/O ABI version 10 carries the EA list
+    length and index and rejects inconsistent major/extent/flag combinations. FAT and MemFs do not
+    own persistent EA storage, so local requests return `STATUS_INVALID_DEVICE_REQUEST`; no empty
+    list, success result, or executive EA table is fabricated.
+
+    Focused validation passes `nt-status` `4/4`, `nt-io-abi` `8/8`, `nt-io-manager` `222/222`,
+    `nt-syscall-abi` `19/19`, `nt-ntdll` `709/709`, and `nt-syscall` `56/56`. The freestanding
+    executive compiles at the established 211-warning baseline. The dedicated ntdll DLL gate sees
+    all 222 Nt stubs, all 222 Zw aliases, valid relocations, and complete imports for the
+    boot-critical ReactOS images. Code checkpoint `ba2b8aca` is pushed.
+
+    Serialized acceptance `.tmp/run-headless-native-ea-20260827.log` reached quiescence at 108,978
+    ms, launched genuine userinit and Explorer, completed 668 Explorer api0 redirects with zero
+    callback failures, painted `480000/480000` framebuffer pixels with at least 32 colours, passed
+    all `295/295` gates, and matched the sentinel. Snapshot generation 5 committed the version-6
+    payload at 1,755,482 bytes; scratch returned to zero and the resource census reported no frame,
+    mapping, registry, retype, untyped-allocation, or allocator failures.
+
+    Review adjustment: native EA capture, access, IRP projection, provider dispatch, and completion
+    ownership are closed. Persistent local EAs remain a filesystem capability that neither mounted
+    local filesystem currently advertises. Continue the native filesystem-service inventory with
+    volume information, byte-range locks, and directory change notification. Prefer the next pair
+    whose provider IRP and local semantic owner can be completed without introducing executive
+    policy or a successful unsupported result.
