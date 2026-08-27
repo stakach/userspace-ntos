@@ -13982,3 +13982,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     entries and link counts. Next define and host-test that parent-target open/set transaction,
     then resume the remaining file query/set capture inventory. The root service-loop mark/reset
     compatibility boundary remains a separate lifetime-classification item.
+
+    Provider target-parent CREATE prerequisite (2026-08-27, accepted foundation): corrected the
+    typed `SL_*` stack-location constants to their NT5 values (`SL_OPEN_TARGET_DIRECTORY = 0x04`,
+    `SL_CASE_SENSITIVE = 0x80`) and completed the remaining defined create flags. External device
+    dispatch can now accept a typed `StackFlags` value and projects it through the existing I/O ABI
+    flags field into each attached WDM stack location; ordinary callers remain on the empty-flags
+    wrapper. `FILE_OPEN_FOR_BACKUP_INTENT` is now represented as a create option rather than an
+    untyped retained bit.
+
+    The provider set-information test no longer forces its target File directly into `Open`. It
+    allocates the canonical target, dispatches a real `IRP_MJ_CREATE` with
+    `SL_OPEN_TARGET_DIRECTORY`, verifies the raw provider request, observes the normal File state
+    transition, and only then dispatches `IRP_MJ_SET_INFORMATION` with that target. Focused
+    validation passes `nt-io-manager` `206/206`; the freestanding executive check remains green at
+    the established warning baseline.
+
+    Review adjustment: the provider boundary can now express the target-parent open accurately,
+    but absolute/Object Manager Directory rename and link still return `STATUS_NOT_SUPPORTED`.
+    Next add a durable, generation-protected owner for the two-phase target CREATE -> source SET
+    transaction. It must own the scrubbed set-information buffer while either IRP is pending, never
+    publish the temporary target File as a process handle, acquire the source synchronous lock only
+    after the target CREATE completes, and drive target CLEANUP/CLOSE through the canonical File
+    lifecycle on every terminal or abandoned path.

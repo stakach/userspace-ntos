@@ -26,6 +26,7 @@ bitflags::bitflags! {
         const SYNCHRONOUS_IO_NONALERT = 0x0000_0020;
         const NON_DIRECTORY_FILE = 0x0000_0040;
         const DELETE_ON_CLOSE = 0x0000_1000;
+        const OPEN_FOR_BACKUP_INTENT = 0x0000_4000;
     }
 }
 

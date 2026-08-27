@@ -5391,19 +5391,58 @@ mod tests {
         let (source, device, _) = om
             .reference_open_file_details(client, handle, AccessMask::GENERIC_READ)
             .unwrap();
+        let target_access = AccessMask::from_bits_retain(0x0000_0002) | AccessMask::SYNCHRONIZE;
         let target = om
             .allocate_external_file(
                 client,
                 device,
-                AccessMask::GENERIC_READ,
-                ShareAccess::READ,
-                CreateOptions::DIRECTORY_FILE,
-                nt_types::UnicodeString::from_str("target"),
+                target_access,
+                ShareAccess::READ | ShareAccess::WRITE,
+                CreateOptions::OPEN_FOR_BACKUP_INTENT,
+                nt_types::UnicodeString::from_str("target\\leaf"),
             )
             .unwrap();
-        let target_record = om.file_mut(target).unwrap();
-        assert!(target_record.transition(FileState::CreateIrpDispatched));
-        assert!(target_record.transition(FileState::Open));
+        let mut target_name: Vec<u8> = "target\\leaf"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(
+            om.build_and_dispatch_external_to_device_with_stack_flags(
+                client,
+                device,
+                Some(target),
+                0,
+                17,
+                major::IRP_MJ_CREATE,
+                IoParameters::Create(CreateParameters {
+                    desired_access: target_access,
+                    share_access: ShareAccess::READ | ShareAccess::WRITE,
+                    create_options: CreateOptions::OPEN_FOR_BACKUP_INTENT,
+                    create_disposition: 1,
+                    file_attributes: 0,
+                    ea_length: 0,
+                    related_file: None,
+                }),
+                StackFlags::OPEN_TARGET_DIRECTORY,
+                target_name.len() as u32,
+                0,
+                &mut target_name,
+            ),
+            Ok(ExternalDispatchResult::Completed {
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: None,
+            })
+        );
+        assert!(om.file(target).unwrap().state.is_open());
+        let create_request = control.last_request().unwrap();
+        assert_eq!(create_request.major, major::IRP_MJ_CREATE);
+        assert_eq!(
+            create_request.flags as u8,
+            StackFlags::OPEN_TARGET_DIRECTORY.bits()
+        );
+        assert_eq!(StackFlags::OPEN_TARGET_DIRECTORY.bits(), 0x04);
+        assert_eq!(StackFlags::CASE_SENSITIVE.bits(), 0x80);
         let mut rename = [0u8; 24];
 
         assert_eq!(

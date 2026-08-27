@@ -13,7 +13,7 @@ use nt_types::{AccessMask, ClientId, ObjectId, UnicodeString};
 
 use crate::dispatch::{DispatchContext, DispatchOutcome, IrpProjection, PnpBackendDispatch};
 use crate::file::{CreateOptions, FileRecord, FileState, ShareAccess};
-use crate::irp::{BufferAccess, IoBufferRef, IoParameters, IrpState, PnpParameters};
+use crate::irp::{BufferAccess, IoBufferRef, IoParameters, IrpState, PnpParameters, StackFlags};
 use crate::{DeviceId, DriverId, FileId, IoManager, IrpId};
 
 /// Result of dispatching an externally constructed IRP. A pending request stays
@@ -389,6 +389,38 @@ impl<P> IoManager<P> {
         output_len: u32,
         system_buffer: &mut [u8],
     ) -> Result<ExternalDispatchResult, NtStatus> {
+        self.build_and_dispatch_external_to_device_with_stack_flags(
+            client,
+            device_id,
+            file_id,
+            user_data,
+            requestor_tid,
+            major,
+            params,
+            StackFlags::empty(),
+            input_len,
+            output_len,
+            system_buffer,
+        )
+    }
+
+    /// Build one IRP with typed NT stack-location flags. Integration code uses
+    /// this for I/O Manager operations such as opening a rename target parent;
+    /// raw syscall flag values must not be forwarded here.
+    pub fn build_and_dispatch_external_to_device_with_stack_flags(
+        &mut self,
+        client: ClientId,
+        device_id: DeviceId,
+        file_id: Option<FileId>,
+        user_data: u64,
+        requestor_tid: u64,
+        major: u8,
+        params: IoParameters,
+        stack_flags: StackFlags,
+        input_len: u32,
+        output_len: u32,
+        system_buffer: &mut [u8],
+    ) -> Result<ExternalDispatchResult, NtStatus> {
         let driver_id = self
             .device(device_id)
             .ok_or(NtStatus::INVALID_PARAMETER)?
@@ -402,6 +434,7 @@ impl<P> IoManager<P> {
             requestor_tid,
             major,
             params,
+            stack_flags,
             input_len,
             output_len,
             system_buffer,
@@ -433,6 +466,7 @@ impl<P> IoManager<P> {
             requestor_tid,
             major,
             params,
+            StackFlags::empty(),
             input_len,
             output_len,
             system_buffer,
@@ -449,6 +483,7 @@ impl<P> IoManager<P> {
         requestor_tid: u64,
         major: u8,
         mut params: IoParameters,
+        stack_flags: StackFlags,
         input_len: u32,
         output_len: u32,
         system_buffer: &mut [u8],
@@ -497,6 +532,9 @@ impl<P> IoManager<P> {
         };
         let mut irp =
             self.build_irp_record(client, driver_id, device_id, file_id, major, params)?;
+        for location in &mut irp.stack {
+            location.flags = stack_flags;
+        }
         irp.user_data = user_data;
         irp.requestor_tid = requestor_tid;
         irp.buffer = Some(IoBufferRef {

@@ -82,7 +82,7 @@ use nt_io_manager::{
     HostedDevicePropertyTransferError, HostedDevicePropertyTransferTable, HostedDomainIdentity,
     InformationParameters, IoManager, IoParameters, IrpCompletionOrigin, IrpId, IrpProjection,
     MajorFunctionTable, ObjectManagerPort, PnpBackendDispatch, PnpParameters, ReadWriteParameters,
-    SetInformationParameters, ShareAccess, WdmDriverObjectInit, WdmFileObjectInit,
+    SetInformationParameters, ShareAccess, StackFlags, WdmDriverObjectInit, WdmFileObjectInit,
     WdmIoStackLocationInit,
     WdmIoStackParameters, WdmIrpInit, WDM_X64_DRIVER_EXTENSION_OFFSET,
     WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET,
@@ -35100,6 +35100,7 @@ fn dispatch_external_irp_to_device_record_result_exact(
     out: &mut [u8],
     create: Option<CreateParameters>,
     set_information: Option<SetInformationParameters>,
+    stack_flags: StackFlags,
 ) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
     let major = external_major(major).ok_or(STATUS_INVALID_PARAMETER as u32)?;
     let (input_len, output_len, system_buffer_len) =
@@ -35136,7 +35137,7 @@ fn dispatch_external_irp_to_device_record_result_exact(
         system_buffer[output_offset..output_offset + out.len()].copy_from_slice(out);
     }
     let result = io_manager_mut()
-        .build_and_dispatch_external_to_device(
+        .build_and_dispatch_external_to_device_with_stack_flags(
             ClientId(IO_MANAGER_COMPONENT_ID),
             nt_io_manager::DeviceId(device_id),
             canonical_file_id,
@@ -35144,6 +35145,7 @@ fn dispatch_external_irp_to_device_record_result_exact(
             requestor_tid,
             major,
             params,
+            stack_flags,
             input_len,
             output_len,
             &mut system_buffer,
@@ -44930,6 +44932,7 @@ pub(crate) unsafe fn dispatch_hosted_file_irp_result_exact(
         out,
         None,
         None,
+        StackFlags::empty(),
     )
 }
 
@@ -44963,6 +44966,7 @@ pub(crate) unsafe fn dispatch_hosted_file_set_information_irp_result_exact(
         &mut output,
         None,
         Some(parameters),
+        StackFlags::empty(),
     )
 }
 
@@ -45002,6 +45006,7 @@ pub(crate) unsafe fn dispatch_hosted_file_create_irp_result_exact(
         out,
         Some(parameters),
         None,
+        StackFlags::empty(),
     )
 }
 

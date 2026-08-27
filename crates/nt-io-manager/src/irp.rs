@@ -198,8 +198,11 @@ bitflags::bitflags! {
     #[repr(transparent)]
     #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Default)]
     pub struct StackFlags: u8 {
-        const CASE_SENSITIVE = 0x01;
-        const OPEN_TARGET_DIRECTORY = 0x02;
+        const FORCE_ACCESS_CHECK = 0x01;
+        const OPEN_PAGING_FILE = 0x02;
+        const OPEN_TARGET_DIRECTORY = 0x04;
+        const STOP_ON_SYMLINK = 0x08;
+        const CASE_SENSITIVE = 0x80;
     }
 }
 
