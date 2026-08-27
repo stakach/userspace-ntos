@@ -19,9 +19,11 @@ pub const FILE_STANDARD_INFORMATION: u32 = 5;
 pub const FILE_EA_INFORMATION: u32 = 7;
 pub const FILE_NAME_INFORMATION: u32 = 9;
 pub const FILE_ALL_INFORMATION: u32 = 18;
+pub const FILE_ALTERNATE_NAME_INFORMATION: u32 = 21;
 
 pub const FILE_NAME_INFORMATION_MINIMUM_LENGTH: usize = 8;
 pub const FILE_ALL_INFORMATION_MINIMUM_LENGTH: usize = 104;
+pub const FILE_ALTERNATE_NAME_INFORMATION_MINIMUM_LENGTH: usize = 8;
 const FILE_ALL_NAME_LENGTH_OFFSET: usize = 96;
 const FILE_ALL_NAME_OFFSET: usize = 100;
 
@@ -153,6 +155,9 @@ pub fn encode_named_query_information(
 ) -> Result<QueryInformationResult, u32> {
     let (minimum, name_length_offset, name_offset) = match class {
         FILE_NAME_INFORMATION => (FILE_NAME_INFORMATION_MINIMUM_LENGTH, 0, 4),
+        FILE_ALTERNATE_NAME_INFORMATION => {
+            (FILE_ALTERNATE_NAME_INFORMATION_MINIMUM_LENGTH, 0, 4)
+        }
         FILE_ALL_INFORMATION => (
             FILE_ALL_INFORMATION_MINIMUM_LENGTH,
             FILE_ALL_NAME_LENGTH_OFFSET,

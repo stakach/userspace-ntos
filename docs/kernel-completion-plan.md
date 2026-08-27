@@ -14470,3 +14470,38 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     real short-name policy and storage model exist. Provider-backed Files must continue through
     `IRP_MJ_QUERY_INFORMATION`; the remaining stream, compression, object-id, quota, and reparse
     classes stay explicit filesystem capability gaps until their owning filesystem implements them.
+
+    FAT alternate-name query ownership (2026-08-27, accepted): `nt-fs` now retains the exact
+    Unicode rendering of every physical FAT 8.3 directory entry separately from its primary opened
+    name. The decoder preserves that real short entry for both LFN-backed and short-only files;
+    `FatOpenMetadata`, the dynamically sized System32 lookup cache, and the shared directory/file
+    open descriptions carry it without deriving an alias from a path. Cache sizing and insertion
+    skip a second key when the primary and short names differ only by ASCII case, so retaining the
+    metadata does not recreate a duplicate-entry capacity cost.
+
+    `nt-fs` owns the class-21 `FILE_NAME_INFORMATION` ABI, including the eight-byte native minimum,
+    complete UTF-16 byte length, partial-prefix copies, and `STATUS_BUFFER_OVERFLOW`. Local FAT File
+    and Directory handles answer `FileAlternateNameInformation` from their retained filesystem
+    metadata, and duplicated handles naturally observe the same alias through their shared open
+    description. The FAT root has an honestly empty alternate name. Writable MemFs still returns
+    `STATUS_INVALID_DEVICE_REQUEST` because it has no short-name namespace or storage policy;
+    provider-backed Files still issue the real `IRP_MJ_QUERY_INFORMATION` to their FSD. No alias is
+    generated in the executive and no unsupported backend receives synthetic success.
+
+    Focused validation passes `nt-fs` `88/88`; the freestanding executive remains at the established
+    211-warning baseline. Serialized acceptance
+    `.tmp/run-headless-fat-alternate-name-20260827.log` reached quiescence at 108,911 ms, launched
+    genuine userinit and Explorer, completed 674 Explorer api0 redirects with zero callback
+    failures, painted `480000/480000` framebuffer pixels with at least 32 colours, passed all
+    `295/295` gates, and matched the sentinel. The writable snapshot committed generation 5 at
+    1,750,172 bytes; scratch returned to zero and the resource census reported no frame, mapping,
+    registry, retype, or allocator failures.
+
+    Review adjustment: `FileAlternateNameInformation` is closed for the mounted FAT filesystem and
+    remains explicitly unsupported for MemFs until that filesystem owns a real short-name model.
+    Continue the filesystem capability inventory with `FileStreamInformation`,
+    `FileCompressionInformation`, and `FileReparsePointInformation`. Model the unnamed data stream,
+    compression state, and reparse absence/presence in `nt-fs` first, distinguish regular files from
+    directories, and preserve FSD dispatch for provider-backed Files. Object IDs and quotas remain
+    separate optional filesystem facilities; do not substitute `FileInternalInformation` identity
+    for an object ID or report successful empty quota data without an owning quota implementation.

@@ -22423,6 +22423,7 @@ impl ExecDirectoryOpens {
         share_access: u32,
         create_options: u32,
         metadata: nt_fs::FileMetadata,
+        alternate_name: nt_fs::FatShortName,
     ) -> Result<u32, u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe {
@@ -22433,6 +22434,7 @@ impl ExecDirectoryOpens {
                 share_access,
                 create_options,
                 metadata,
+                alternate_name,
             )
         }
     }
@@ -22481,6 +22483,7 @@ impl ExecReadOnlyFileOpens {
         share_access: u32,
         create_options: u32,
         metadata: nt_fs::FileMetadata,
+        alternate_name: nt_fs::FatShortName,
     ) -> Result<u32, u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe {
@@ -22492,6 +22495,7 @@ impl ExecReadOnlyFileOpens {
                 share_access,
                 create_options,
                 metadata,
+                alternate_name,
             )
         }
     }

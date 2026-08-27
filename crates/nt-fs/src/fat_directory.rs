@@ -8,6 +8,37 @@ const LFN_LAST: u8 = 0x40;
 const LFN_ORDINAL_MASK: u8 = 0x1f;
 const LFN_OFFSETS: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
 
+/// The exact Unicode rendering of a physical FAT 8.3 directory entry.
+///
+/// This is retained separately from the opened long name so
+/// `FileAlternateNameInformation` never has to synthesize an alias.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FatShortName {
+    len: u8,
+    units: [u16; crate::MAX_SHORT_NAME],
+}
+
+impl FatShortName {
+    pub const EMPTY: Self = Self {
+        len: 0,
+        units: [0; crate::MAX_SHORT_NAME],
+    };
+
+    pub fn from_units(name: &[u16]) -> Option<Self> {
+        if name.len() > crate::MAX_SHORT_NAME {
+            return None;
+        }
+        let mut value = Self::EMPTY;
+        value.units[..name.len()].copy_from_slice(name);
+        value.len = name.len() as u8;
+        Some(value)
+    }
+
+    pub fn units(&self) -> &[u16] {
+        &self.units[..self.len as usize]
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FatDirectoryRecord {
     pub entry: DirectoryEntry,
@@ -131,11 +162,13 @@ impl FatDirectoryDecoder {
         record.entry.last_write_time = fat_timestamp(read_u16(slot, 24), read_u16(slot, 22), 0);
         record.entry.change_time = record.entry.last_write_time;
 
+        let mut short_name = [0u16; 12];
+        let short_name_len = decode_short_name(&short_raw, slot[12], false, &mut short_name);
+        let _ = record
+            .entry
+            .set_short_name(&short_name[..short_name_len]);
         if let Some(length) = long_name_len {
             let _ = record.entry.set_name(&self.long_name.name[..length]);
-            let mut alias = [0u16; 12];
-            let alias_len = decode_short_name(&short_raw, slot[12], false, &mut alias);
-            let _ = record.entry.set_short_name(&alias[..alias_len]);
         } else {
             let mut name = [0u16; 12];
             let name_len = decode_short_name(&short_raw, slot[12], true, &mut name);
@@ -400,6 +433,10 @@ mod tests {
         let FatDirectorySlot::Entry(record) = decoder.consume(&slot, 64, 4096) else {
             panic!()
         };
+        assert_eq!(
+            record.entry.short_name(),
+            "FILE.TXT".encode_utf16().collect::<std::vec::Vec<_>>()
+        );
         let metadata = record.with_parent_cluster(7).metadata();
         assert_eq!(metadata.file_id, (7u64 << 32) | 64);
         assert_eq!(metadata.end_of_file, 513);
@@ -434,7 +471,10 @@ mod tests {
             record.entry.name(),
             "readme.txt".encode_utf16().collect::<std::vec::Vec<_>>()
         );
-        assert!(record.entry.short_name().is_empty());
+        assert_eq!(
+            record.entry.short_name(),
+            "README.TXT".encode_utf16().collect::<std::vec::Vec<_>>()
+        );
     }
 
     #[test]

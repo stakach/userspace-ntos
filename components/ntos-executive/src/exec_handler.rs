@@ -2364,6 +2364,7 @@ fn utf16_file_name(name: &str) -> Result<alloc::vec::Vec<u16>, u32> {
 struct LocalFileQueryState {
     metadata: nt_fs::QueryMetadata,
     opened_name: Option<alloc::vec::Vec<u16>>,
+    alternate_name: Option<nt_fs::FatShortName>,
 }
 
 fn seed_time_zone(
@@ -9601,6 +9602,7 @@ impl ExecNtHandler {
                 share_access,
                 create_options,
                 file.metadata,
+                file.alternate_name,
             )?;
         let handle = match self.insert_process_handle(
             pid,
@@ -9741,6 +9743,7 @@ impl ExecNtHandler {
                 share_access,
                 create_options,
                 directory.metadata,
+                directory.alternate_name,
             )?;
         let handle = match self.insert_process_handle(
             pid,
@@ -20383,7 +20386,7 @@ impl ExecNtHandler {
             .pm
             .lookup_handle(pid, process_handle)
             .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
-        let (file_metadata, current_byte_offset, opened_name) = match object {
+        let (file_metadata, current_byte_offset, opened_name, alternate_name) = match object {
             nt_process::HandleObject::DiskFile {
                 first_cluster,
                 size,
@@ -20398,7 +20401,12 @@ impl ExecNtHandler {
                 } else {
                     None
                 };
-                (open.metadata, open.current_offset, name)
+                (
+                    open.metadata,
+                    open.current_offset,
+                    name,
+                    Some(open.alternate_name),
+                )
             }
             nt_process::HandleObject::Directory {
                 first_cluster,
@@ -20413,7 +20421,7 @@ impl ExecNtHandler {
                 } else {
                     None
                 };
-                (open.metadata, 0, name)
+                (open.metadata, 0, name, Some(open.alternate_name))
             }
             nt_process::HandleObject::OverlayFile(file_id) => {
                 let offset = crate::writable_fs::current_offset(file_id)
@@ -20427,7 +20435,7 @@ impl ExecNtHandler {
                 } else {
                     None
                 };
-                (metadata, offset, name)
+                (metadata, offset, name, None)
             }
             nt_process::HandleObject::File(_)
             | nt_process::HandleObject::RoutedFile { .. } => {
@@ -20443,6 +20451,7 @@ impl ExecNtHandler {
         Ok(LocalFileQueryState {
             metadata,
             opened_name,
+            alternate_name,
         })
     }
 
@@ -29716,7 +29725,9 @@ impl ExecNtHandler {
                 }
                 let named_query = matches!(
                     class,
-                    nt_fs::FILE_NAME_INFORMATION | nt_fs::FILE_ALL_INFORMATION
+                    nt_fs::FILE_NAME_INFORMATION
+                        | nt_fs::FILE_ALL_INFORMATION
+                        | nt_fs::FILE_ALTERNATE_NAME_INFORMATION
                 );
                 let named_minimum = match class {
                     nt_fs::FILE_NAME_INFORMATION => {
@@ -29724,6 +29735,9 @@ impl ExecNtHandler {
                     }
                     nt_fs::FILE_ALL_INFORMATION => {
                         Some(nt_fs::FILE_ALL_INFORMATION_MINIMUM_LENGTH)
+                    }
+                    nt_fs::FILE_ALTERNATE_NAME_INFORMATION => {
+                        Some(nt_fs::FILE_ALTERNATE_NAME_INFORMATION_MINIMUM_LENGTH)
                     }
                     _ => None,
                 };
@@ -29948,12 +29962,25 @@ impl ExecNtHandler {
                     return status;
                 }
                 if named_query {
-                    let state = match self.local_file_query_state(args[0], true) {
+                    let state = match self.local_file_query_state(
+                        args[0],
+                        class != nt_fs::FILE_ALTERNATE_NAME_INFORMATION,
+                    ) {
                         Ok(state) => state,
                         Err(status) => return status,
                     };
-                    let Some(name) = state.opened_name else {
-                        return nt_fs::STATUS_INVALID_DEVICE_REQUEST;
+                    let alternate_name;
+                    let name = if class == nt_fs::FILE_ALTERNATE_NAME_INFORMATION {
+                        let Some(value) = state.alternate_name else {
+                            return nt_fs::STATUS_INVALID_DEVICE_REQUEST;
+                        };
+                        alternate_name = value;
+                        alternate_name.units()
+                    } else {
+                        let Some(ref value) = state.opened_name else {
+                            return nt_fs::STATUS_INVALID_DEVICE_REQUEST;
+                        };
+                        value.as_slice()
                     };
                     let name_offset = if class == nt_fs::FILE_ALL_INFORMATION {
                         100usize

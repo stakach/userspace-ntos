@@ -33,6 +33,7 @@ struct System32CacheEntry {
     name_len: u8,
     cluster: u32,
     metadata: nt_fs::FileMetadata,
+    alternate_name: nt_fs::FatShortName,
     name: [u8; SYSTEM32_CACHE_NAME_CAP],
 }
 
@@ -54,6 +55,7 @@ impl System32CacheEntry {
             delete_pending: false,
             is_directory: false,
         },
+        alternate_name: nt_fs::FatShortName::EMPTY,
         name: [0; SYSTEM32_CACHE_NAME_CAP],
     };
 }
@@ -62,13 +64,17 @@ impl System32CacheEntry {
 pub(crate) struct FatOpenMetadata {
     pub(crate) first_cluster: u32,
     pub(crate) metadata: nt_fs::FileMetadata,
+    pub(crate) alternate_name: nt_fs::FatShortName,
 }
 
 impl FatOpenMetadata {
     fn from_record(record: nt_fs::FatDirectoryRecord) -> Self {
+        let alternate_name = nt_fs::FatShortName::from_units(record.entry.short_name())
+            .expect("FAT decoder bounds short names to its fixed 12-unit field");
         Self {
             first_cluster: record.first_cluster,
             metadata: record.metadata(),
+            alternate_name,
         }
     }
 
@@ -335,8 +341,7 @@ fn ascii_units_to_lower(units: &[u16], out: &mut [u8; SYSTEM32_CACHE_NAME_CAP]) 
 unsafe fn system32_cache_insert(
     cache: &mut [System32CacheEntry],
     name: &[u8],
-    cluster: u32,
-    metadata: nt_fs::FileMetadata,
+    file: FatOpenMetadata,
     next: &mut usize,
 ) {
     if name.is_empty() || name.len() > SYSTEM32_CACHE_NAME_CAP {
@@ -359,8 +364,9 @@ unsafe fn system32_cache_insert(
     let entry = &mut cache[*next];
     *entry = System32CacheEntry::EMPTY;
     entry.name_len = name.len() as u8;
-    entry.cluster = cluster;
-    entry.metadata = metadata;
+    entry.cluster = file.first_cluster;
+    entry.metadata = file.metadata;
+    entry.alternate_name = file.alternate_name;
     entry.name[..name.len()].copy_from_slice(name);
     *next += 1;
 }
@@ -373,12 +379,24 @@ fn system32_cache_count_name(units: &[u16], scratch: &mut [u8; SYSTEM32_CACHE_NA
     }
 }
 
+fn fat_names_equal_ignore_ascii_case(left: &[u16], right: &[u16]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left == right
+                || (*left <= 0x7f
+                    && *right <= 0x7f
+                    && (*left as u8).eq_ignore_ascii_case(&(*right as u8)))
+        })
+}
+
 unsafe fn system32_cache_candidate_count(fs: &Fat32, system32_cluster: u32) -> usize {
     let mut count = 0usize;
     fat_visit_directory(fs, system32_cluster, |record, _first_cluster| {
         let mut scratch = [0u8; SYSTEM32_CACHE_NAME_CAP];
         count = count.saturating_add(system32_cache_count_name(record.name(), &mut scratch));
-        if !record.short_name().is_empty() {
+        if !record.short_name().is_empty()
+            && !fat_names_equal_ignore_ascii_case(record.name(), record.short_name())
+        {
             count =
                 count.saturating_add(system32_cache_count_name(record.short_name(), &mut scratch));
         }
@@ -412,19 +430,20 @@ unsafe fn system32_cache_build(fs: &Fat32) -> bool {
     system32_cache_state_write(SYSTEM32_CACHE_STATE_OVERFLOW, 0);
     let mut next = 0usize;
     fat_visit_directory(fs, system32_cluster, |record, first_cluster| {
-        let metadata = nt_fs::FatDirectoryRecord {
+        let file = FatOpenMetadata::from_record(nt_fs::FatDirectoryRecord {
             entry: record,
             first_cluster,
-        }
-        .metadata();
+        });
         let mut name = [0u8; SYSTEM32_CACHE_NAME_CAP];
         if let Some(len) = ascii_units_to_lower(record.name(), &mut name) {
-            system32_cache_insert(cache, &name[..len], first_cluster, metadata, &mut next);
+            system32_cache_insert(cache, &name[..len], file, &mut next);
         }
-        if !record.short_name().is_empty() {
+        if !record.short_name().is_empty()
+            && !fat_names_equal_ignore_ascii_case(record.name(), record.short_name())
+        {
             let mut alias = [0u8; SYSTEM32_CACHE_NAME_CAP];
             if let Some(len) = ascii_units_to_lower(record.short_name(), &mut alias) {
-                system32_cache_insert(cache, &alias[..len], first_cluster, metadata, &mut next);
+                system32_cache_insert(cache, &alias[..len], file, &mut next);
             }
         }
         true
@@ -470,6 +489,7 @@ unsafe fn system32_cache_lookup_metadata(fs: &Fat32, leaf: &[u8]) -> Option<FatO
             return Some(FatOpenMetadata {
                 first_cluster: entry.cluster,
                 metadata: entry.metadata,
+                alternate_name: entry.alternate_name,
             });
         }
         index += 1;
@@ -1008,6 +1028,7 @@ pub(crate) fn fat_root_metadata(fs: &Fat32) -> FatOpenMetadata {
             delete_pending: false,
             is_directory: true,
         },
+        alternate_name: nt_fs::FatShortName::EMPTY,
     }
 }
 

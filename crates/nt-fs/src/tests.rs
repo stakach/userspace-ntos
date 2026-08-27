@@ -416,6 +416,49 @@ fn query_information_encodes_name_and_overflow_prefix() {
 }
 
 #[test]
+fn query_information_encodes_fat_alternate_name_and_overflow_prefix() {
+    let name = wide(r"LONGNA~1.TXT");
+    let full_len = 4 + name.len() * 2;
+    let mut full = alloc::vec![0xCC; full_len + 4];
+    assert_eq!(
+        encode_named_query_information(
+            FILE_ALTERNATE_NAME_INFORMATION,
+            QueryMetadata::default(),
+            &name,
+            &mut full,
+        ),
+        Ok(QueryInformationResult {
+            status: STATUS_SUCCESS,
+            information: full_len,
+        })
+    );
+    assert_eq!(
+        u32::from_le_bytes(full[..4].try_into().unwrap()),
+        (name.len() * 2) as u32
+    );
+    assert_eq!(&full[full_len..], &[0xCC; 4]);
+
+    let mut short = [0xCC; 11];
+    assert_eq!(
+        encode_named_query_information(
+            FILE_ALTERNATE_NAME_INFORMATION,
+            QueryMetadata::default(),
+            &name,
+            &mut short,
+        ),
+        Ok(QueryInformationResult {
+            status: STATUS_BUFFER_OVERFLOW,
+            information: short.len(),
+        })
+    );
+    assert_eq!(
+        u32::from_le_bytes(short[..4].try_into().unwrap()),
+        (name.len() * 2) as u32
+    );
+    assert_eq!(&short[4..], &full[4..short.len()]);
+}
+
+#[test]
 fn query_information_composes_file_all_information() {
     let metadata = QueryMetadata {
         creation_time: 1,
