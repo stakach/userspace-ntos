@@ -2364,7 +2364,7 @@ fn utf16_file_name(name: &str) -> Result<alloc::vec::Vec<u16>, u32> {
 struct LocalFileQueryState {
     metadata: nt_fs::QueryMetadata,
     opened_name: Option<alloc::vec::Vec<u16>>,
-    alternate_name: Option<nt_fs::FatShortName>,
+    alternate_name: Option<nt_fs::FileShortName>,
 }
 
 fn seed_time_zone(
@@ -20444,7 +20444,9 @@ impl ExecNtHandler {
                 } else {
                     None
                 };
-                (metadata, offset, name, None)
+                let alternate_name = crate::writable_fs::short_name(file_id)
+                    .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                (metadata, offset, name, Some(alternate_name))
             }
             nt_process::HandleObject::File(_)
             | nt_process::HandleObject::RoutedFile { .. } => {
@@ -32048,6 +32050,13 @@ impl ExecNtHandler {
                     self.xas_write_buf(iosb, &STATUS_ACCESS_DENIED.to_le_bytes());
                     self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
                     return STATUS_ACCESS_DENIED;
+                }
+                if information_class == nt_fs::FILE_SHORT_NAME_INFORMATION
+                    && !self.current_token_has_privilege(nt_security::SE_RESTORE)
+                {
+                    self.xas_write_buf(iosb, &STATUS_PRIVILEGE_NOT_HELD.to_le_bytes());
+                    self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
+                    return STATUS_PRIVILEGE_NOT_HELD;
                 }
                 let mut information = 0u64;
                 // ★ THE WRITABLE FILESYSTEM OVERLAY owns its own file objects' information classes

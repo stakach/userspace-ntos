@@ -475,8 +475,14 @@ fn query_information_encodes_the_local_unnamed_data_stream() {
     );
     assert_eq!(u32::from_le_bytes(output[0..4].try_into().unwrap()), 0);
     assert_eq!(u32::from_le_bytes(output[4..8].try_into().unwrap()), 14);
-    assert_eq!(u64::from_le_bytes(output[8..16].try_into().unwrap()), 0x1234);
-    assert_eq!(u64::from_le_bytes(output[16..24].try_into().unwrap()), 0x2000);
+    assert_eq!(
+        u64::from_le_bytes(output[8..16].try_into().unwrap()),
+        0x1234
+    );
+    assert_eq!(
+        u64::from_le_bytes(output[16..24].try_into().unwrap()),
+        0x2000
+    );
     assert_eq!(&output[24..38], b":\0:\0$\0D\0A\0T\0A\0");
     assert_eq!(&output[38..], &[0xCC; 4]);
 
@@ -532,8 +538,14 @@ fn query_information_encodes_uncompressed_and_reparse_capabilities() {
         encode_reparse_point_information(metadata, &mut reparse),
         Ok(FILE_REPARSE_POINT_INFORMATION_LENGTH)
     );
-    assert_eq!(u64::from_le_bytes(reparse[0..8].try_into().unwrap()), 0x5566);
-    assert_eq!(u32::from_le_bytes(reparse[8..12].try_into().unwrap()), 0xA000_000C);
+    assert_eq!(
+        u64::from_le_bytes(reparse[0..8].try_into().unwrap()),
+        0x5566
+    );
+    assert_eq!(
+        u32::from_le_bytes(reparse[8..12].try_into().unwrap()),
+        0xA000_000C
+    );
     assert_eq!(&reparse[12..], &[0; 4]);
     assert_eq!(
         encode_reparse_point_information(
@@ -1978,10 +1990,7 @@ fn memfs_snapshot_v5_reader_derives_valid_data_length_for_v4_files() {
     assert_eq!(metadata.end_of_file, 4);
     assert_eq!(metadata.allocation_size, 8192);
     assert_eq!(metadata.valid_data_length, 4);
-    assert_eq!(
-        fs.file_bytes_relative(b"version4.bin"),
-        Some(&b"data"[..])
-    );
+    assert_eq!(fs.file_bytes_relative(b"version4.bin"), Some(&b"data"[..]));
 }
 
 #[test]
@@ -3148,7 +3157,7 @@ fn writable_volume_hardlinks_share_nodes_and_retain_exact_entries() {
     );
 
     let snapshot = fs.export_volume_snapshot().unwrap();
-    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 5);
+    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 6);
     let mut restored = FileSystem::from_volume_snapshot(&snapshot).unwrap();
     assert!(!restored.initialize_timestamps(300));
     let restored_alias = restored.zw_create_file(
@@ -3227,7 +3236,7 @@ fn file_allocation_information_is_distinct_from_end_of_file_and_persists() {
     assert_eq!(preallocated.allocation_size, 16384);
 
     let snapshot = fs.export_volume_snapshot().unwrap();
-    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 5);
+    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 6);
     let mut restored = FileSystem::from_volume_snapshot(&snapshot).unwrap();
     let reopened = restored.zw_create_file(
         r"\??\C:\allocation\state.bin",
@@ -3353,7 +3362,7 @@ fn valid_data_length_is_privileged_monotonic_node_state_and_persists() {
     }
 
     let snapshot = fs.export_volume_snapshot().unwrap();
-    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 5);
+    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 6);
     let mut restored = FileSystem::from_volume_snapshot(&snapshot).unwrap();
     let reopened = restored.zw_create_file(
         r"\??\C:\vdl\state.bin",
@@ -3389,6 +3398,261 @@ fn valid_data_length_is_privileged_monotonic_node_state_and_persists() {
     let written = restored.zw_query_metadata(reopened.handle).unwrap();
     assert_eq!(written.end_of_file, 185);
     assert_eq!(written.valid_data_length, 185);
+}
+
+#[test]
+fn short_names_are_entry_owned_collision_checked_enumerated_and_persisted() {
+    fn short_name_information(name: &str) -> alloc::vec::Vec<u8> {
+        let units: alloc::vec::Vec<u16> = name.encode_utf16().collect();
+        let mut information = alloc::vec![0u8; (4 + units.len() * 2).max(8)];
+        information[..4].copy_from_slice(&((units.len() * 2) as u32).to_le_bytes());
+        for (index, unit) in units.iter().copied().enumerate() {
+            information[4 + index * 2..6 + index * 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        information
+    }
+
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_directory(r"\??\C:\aliases"));
+    let long = fs.zw_create_file(
+        r"\??\C:\aliases\Long Document.txt",
+        FILE_WRITE_DATA,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(long.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_set_information_file(
+            long.handle,
+            FILE_SHORT_NAME_INFORMATION,
+            &short_name_information("LONGDO~1.TXT"),
+        ),
+        STATUS_SUCCESS
+    );
+    assert_eq!(
+        fs.zw_query_short_name(long.handle).unwrap().units(),
+        &"LONGDO~1.TXT"
+            .encode_utf16()
+            .collect::<alloc::vec::Vec<_>>()
+    );
+
+    let by_alias = fs.zw_create_file(
+        r"\??\C:\aliases\longdo~1.txt",
+        FILE_READ_DATA,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(by_alias.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_query_metadata(by_alias.handle).unwrap().file_id,
+        fs.zw_query_metadata(long.handle).unwrap().file_id
+    );
+
+    let other = fs.zw_create_file(
+        r"\??\C:\aliases\other.txt",
+        FILE_WRITE_DATA,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(other.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_set_information_file(
+            other.handle,
+            FILE_SHORT_NAME_INFORMATION,
+            &short_name_information("longdo~1.txt"),
+        ),
+        STATUS_OBJECT_NAME_COLLISION
+    );
+    assert_eq!(
+        fs.zw_set_information_file(
+            other.handle,
+            FILE_SHORT_NAME_INFORMATION,
+            &short_name_information("Long Document.txt"),
+        ),
+        STATUS_INFO_LENGTH_MISMATCH
+    );
+    assert_eq!(
+        fs.zw_set_information_file(
+            other.handle,
+            FILE_SHORT_NAME_INFORMATION,
+            &short_name_information("BAD NAME.TXT"),
+        ),
+        STATUS_INVALID_PARAMETER
+    );
+
+    let directory = fs.zw_create_file(
+        r"\??\C:\aliases",
+        FILE_READ_DATA,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE,
+    );
+    let pattern: alloc::vec::Vec<u16> = "LONGDO~1.TXT".encode_utf16().collect();
+    let mut encoded = [0u8; 256];
+    let result = fs.zw_query_directory_file(
+        directory.handle,
+        FILE_BOTH_DIRECTORY_INFORMATION,
+        true,
+        Some(&pattern),
+        true,
+        &mut encoded,
+    );
+    assert_eq!(result.status, STATUS_SUCCESS);
+    assert_eq!(encoded[68], 24);
+    let enumerated_short: alloc::vec::Vec<u16> = encoded[70..94]
+        .chunks_exact(2)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+        .collect();
+    assert_eq!(enumerated_short, pattern);
+
+    let link_name = rename_information("Second Link.txt", directory.handle, false);
+    assert_eq!(
+        fs.zw_link_file(
+            long.handle,
+            FileRenameRoot::Directory(directory.handle),
+            &link_name[20..],
+            false,
+        ),
+        STATUS_SUCCESS
+    );
+    let second_link = fs.zw_create_file(
+        r"\??\C:\aliases\Second Link.txt",
+        FILE_WRITE_DATA,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(second_link.status, STATUS_SUCCESS);
+    assert!(fs
+        .zw_query_short_name(second_link.handle)
+        .unwrap()
+        .units()
+        .is_empty());
+    assert_eq!(
+        fs.zw_set_information_file(
+            second_link.handle,
+            FILE_SHORT_NAME_INFORMATION,
+            &short_name_information("LONGDO~2.TXT"),
+        ),
+        STATUS_SUCCESS
+    );
+    assert_eq!(
+        fs.zw_query_short_name(long.handle).unwrap().units(),
+        pattern
+    );
+
+    let snapshot = fs.export_volume_snapshot().unwrap();
+    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 6);
+    let mut restored = FileSystem::from_volume_snapshot(&snapshot).unwrap();
+    let restored_alias = restored.zw_create_file(
+        r"\??\C:\aliases\LONGDO~1.TXT",
+        FILE_WRITE_DATA,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(restored_alias.status, STATUS_SUCCESS);
+    let restored_second_alias = restored.zw_create_file(
+        r"\??\C:\aliases\LONGDO~2.TXT",
+        FILE_READ_DATA,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(restored_second_alias.status, STATUS_SUCCESS);
+    assert_eq!(
+        restored
+            .zw_query_metadata(restored_second_alias.handle)
+            .unwrap()
+            .file_id,
+        restored
+            .zw_query_metadata(restored_alias.handle)
+            .unwrap()
+            .file_id
+    );
+    assert_eq!(
+        restored
+            .zw_query_short_name(restored_alias.handle)
+            .unwrap()
+            .units(),
+        pattern
+    );
+    assert_eq!(
+        restored.zw_set_information_file(
+            restored_alias.handle,
+            FILE_SHORT_NAME_INFORMATION,
+            &short_name_information(""),
+        ),
+        STATUS_SUCCESS
+    );
+    assert!(restored
+        .zw_query_short_name(restored_alias.handle)
+        .unwrap()
+        .units()
+        .is_empty());
+    assert_eq!(
+        restored
+            .zw_create_file(
+                r"\??\C:\aliases\LONGDO~1.TXT",
+                FILE_READ_DATA,
+                0,
+                0,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE,
+            )
+            .status,
+        STATUS_OBJECT_NAME_NOT_FOUND
+    );
+}
+
+#[test]
+fn memfs_snapshot_v6_reader_accepts_version_five_without_short_name_storage() {
+    fn checksum(bytes: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in bytes {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0x82F6_3B78
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    let mut payload = alloc::vec![0u8; 77];
+    payload[0] = 1;
+    payload[1..5].copy_from_slice(&FILE_ATTRIBUTE_DIRECTORY.to_le_bytes());
+    let mut snapshot = alloc::vec![0u8; 32];
+    snapshot[0..8].copy_from_slice(b"USNTFS\0\x01");
+    snapshot[8..10].copy_from_slice(&32u16.to_le_bytes());
+    snapshot[10..12].copy_from_slice(&5u16.to_le_bytes());
+    snapshot[12..16].copy_from_slice(&1u32.to_le_bytes());
+    snapshot[16..24].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+    snapshot[24..28].copy_from_slice(&checksum(&payload).to_le_bytes());
+    let header_crc = checksum(&snapshot[..28]);
+    snapshot[28..32].copy_from_slice(&header_crc.to_le_bytes());
+    snapshot.extend_from_slice(&payload);
+
+    let fs = FileSystem::from_volume_snapshot(&snapshot).unwrap();
+    assert_eq!(
+        MemFs::snapshot_info(&fs.export_volume_snapshot().unwrap())
+            .unwrap()
+            .version,
+        6
+    );
 }
 
 #[test]

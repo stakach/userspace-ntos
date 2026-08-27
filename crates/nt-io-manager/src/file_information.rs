@@ -131,7 +131,7 @@ pub const fn set_information_contract(class: u32) -> Option<FileInformationContr
         32 => set(56, 0),                         // FileQuotaInformation
         36 => set(16, FILE_WRITE_DATA),           // FileTrackingInformation
         39 => set(8, FILE_WRITE_DATA),            // FileValidDataLengthInformation
-        40 => set(16, AccessMask::DELETE.bits()), // FileShortNameInformation
+        40 => set(8, AccessMask::DELETE.bits()),  // FileShortNameInformation
         // Later classes already implemented by this kernel.
         41 => set(4, 0), // FileIoCompletionNotificationInformation
         64 => set(4, AccessMask::DELETE.bits()), // FileDispositionInformationEx
@@ -190,6 +190,10 @@ mod tests {
 
         let link = set_information_contract(11).unwrap();
         assert!(link.access_granted(AccessMask::empty()));
+        let short_name = set_information_contract(40).unwrap();
+        assert_eq!(short_name.minimum_length(), 8);
+        assert!(short_name.access_granted(AccessMask::DELETE));
+        assert!(!short_name.access_granted(AccessMask::GENERIC_WRITE));
         assert_eq!(set_information_contract(64).unwrap().minimum_length(), 4);
     }
 

@@ -10,7 +10,9 @@ use alloc::vec::Vec;
 
 use crate::directory::{
     query_directory_by_index, DirectoryEntry, DirectoryQueryResult, DirectoryQueryState,
+    MAX_SHORT_NAME,
 };
+use crate::fat_directory::FileShortName;
 use crate::path::{normalize_separators, MountManager, MEMFS_VOLUME};
 use crate::snapshot_store::{
     SnapshotBlockDevice, SnapshotBlockStore, SnapshotBlockStoreError, SnapshotPayloadReader,
@@ -27,8 +29,10 @@ const MEMFS_SNAPSHOT_VERSION_V1: u16 = 1;
 const MEMFS_SNAPSHOT_VERSION_V2: u16 = 2;
 const MEMFS_SNAPSHOT_VERSION_V3: u16 = 3;
 const MEMFS_SNAPSHOT_VERSION_V4: u16 = 4;
-const MEMFS_SNAPSHOT_VERSION: u16 = 5;
+const MEMFS_SNAPSHOT_VERSION_V5: u16 = 5;
+const MEMFS_SNAPSHOT_VERSION: u16 = 6;
 const MEMFS_SNAPSHOT_HEADER_LEN: usize = 32;
+const SNAP_SHORT_NAME_STORAGE_LEN: usize = 1 + MAX_SHORT_NAME * 2;
 const MEMFS_ALLOCATION_UNIT: u64 = 0x1000;
 const SNAP_REC_DIR: u8 = 1;
 const SNAP_REC_FILE: u8 = 2;
@@ -403,6 +407,36 @@ fn put_u64_at(out: &mut [u8], value: u64) {
     out.copy_from_slice(&value.to_le_bytes());
 }
 
+fn write_snapshot_short_name(name: FileShortName, out: &mut Vec<u8>) {
+    let mut encoded = [0u8; SNAP_SHORT_NAME_STORAGE_LEN];
+    write_snapshot_short_name_at(name, &mut encoded);
+    out.extend_from_slice(&encoded);
+}
+
+fn write_snapshot_short_name_at(name: FileShortName, out: &mut [u8]) {
+    debug_assert_eq!(out.len(), SNAP_SHORT_NAME_STORAGE_LEN);
+    out.fill(0);
+    out[0] = name.units().len() as u8;
+    for (index, unit) in name.units().iter().copied().enumerate() {
+        put_u16_at(&mut out[1 + index * 2..3 + index * 2], unit);
+    }
+}
+
+fn decode_snapshot_short_name(bytes: &[u8]) -> Option<FileShortName> {
+    if bytes.len() != SNAP_SHORT_NAME_STORAGE_LEN || bytes[0] as usize > MAX_SHORT_NAME {
+        return None;
+    }
+    let len = bytes[0] as usize;
+    let mut units = [0u16; MAX_SHORT_NAME];
+    for (index, encoded) in bytes[1..].chunks_exact(2).enumerate() {
+        units[index] = u16::from_le_bytes([encoded[0], encoded[1]]);
+    }
+    if units[len..].iter().any(|unit| *unit != 0) || !valid_short_name(&units[..len]) {
+        return None;
+    }
+    FileShortName::from_units(&units[..len])
+}
+
 struct SnapshotReader<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -480,6 +514,8 @@ struct MemFsDirEntry {
     id: u64,
     folded_name: String,
     created_name: String,
+    folded_short_name: String,
+    short_name: FileShortName,
     node_id: u64,
 }
 
@@ -697,6 +733,7 @@ impl MemFs {
                 | MEMFS_SNAPSHOT_VERSION_V2
                 | MEMFS_SNAPSHOT_VERSION_V3
                 | MEMFS_SNAPSHOT_VERSION_V4
+                | MEMFS_SNAPSHOT_VERSION_V5
                 | MEMFS_SNAPSHOT_VERSION
         ) {
             return Err(MemFsSnapshotError::UnsupportedVersion);
@@ -760,7 +797,7 @@ impl MemFs {
         let mut path = String::new();
         let mut measured_files = Vec::new();
         let payload_len = self
-            .snapshot_record_len("", root, false)?
+            .snapshot_record_len("", root, false, FileShortName::EMPTY)?
             .checked_add(self.measure_snapshot_children(
                 0,
                 &mut path,
@@ -776,7 +813,7 @@ impl MemFs {
         out.try_reserve_exact(total_len)
             .map_err(|_| MemFsSnapshotError::OutOfMemory)?;
         out.resize(MEMFS_SNAPSHOT_HEADER_LEN, 0);
-        self.write_snapshot_record("", root, false, &mut out)?;
+        self.write_snapshot_record("", root, false, FileShortName::EMPTY, &mut out)?;
         let mut written_records = 1u32;
         let mut written_files = Vec::new();
         self.write_snapshot_children(
@@ -830,13 +867,19 @@ impl MemFs {
             } else {
                 allocation_size_for_eof(logical_len_u64)
             };
-            let valid_data_length = if info.version >= MEMFS_SNAPSHOT_VERSION {
+            let valid_data_length = if info.version >= MEMFS_SNAPSHOT_VERSION_V5 {
                 r.u64()?
             } else {
                 logical_len_u64
             };
             let extent_count =
                 usize::try_from(r.u32()?).map_err(|_| MemFsSnapshotError::InvalidRecord)?;
+            let short_name = if info.version >= MEMFS_SNAPSHOT_VERSION {
+                decode_snapshot_short_name(r.take(SNAP_SHORT_NAME_STORAGE_LEN)?)
+                    .ok_or(MemFsSnapshotError::InvalidRecord)?
+            } else {
+                FileShortName::EMPTY
+            };
             let path_bytes = r.take(path_len)?;
             let path =
                 core::str::from_utf8(path_bytes).map_err(|_| MemFsSnapshotError::InvalidPath)?;
@@ -849,6 +892,7 @@ impl MemFs {
                     || allocation_size != 0
                     || valid_data_length != 0
                     || extent_count != 0
+                    || !short_name.units().is_empty()
                 {
                     return Err(MemFsSnapshotError::InvalidRecord);
                 }
@@ -876,7 +920,8 @@ impl MemFs {
                     .find(|(key, _)| *key == node_key)
                     .map(|(_, id)| *id)
                     .ok_or(MemFsSnapshotError::InvalidRecord)?;
-                fs.restore_snapshot_link(path, target, attributes, times)?;
+                let entry_id = fs.restore_snapshot_link(path, target, attributes, times)?;
+                fs.restore_entry_short_name(entry_id, short_name)?;
                 seen = seen
                     .checked_add(1)
                     .ok_or(MemFsSnapshotError::InvalidRecord)?;
@@ -892,7 +937,9 @@ impl MemFs {
             } else {
                 None
             };
-            let id = fs.restore_snapshot_node(path, is_dir, attributes, times, file_id)?;
+            let (id, entry_id) =
+                fs.restore_snapshot_node(path, is_dir, attributes, times, file_id)?;
+            fs.restore_entry_short_name(entry_id, short_name)?;
             if is_dir {
                 if logical_len != 0
                     || allocation_size != 0
@@ -978,13 +1025,19 @@ impl MemFs {
             } else {
                 allocation_size_for_eof(logical_len_u64)
             };
-            let valid_data_length = if header.info.version >= MEMFS_SNAPSHOT_VERSION {
+            let valid_data_length = if header.info.version >= MEMFS_SNAPSHOT_VERSION_V5 {
                 r.u64()?
             } else {
                 logical_len_u64
             };
             let extent_count =
                 usize::try_from(r.u32()?).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
+            let short_name = if header.info.version >= MEMFS_SNAPSHOT_VERSION {
+                let encoded = r.vec(SNAP_SHORT_NAME_STORAGE_LEN)?;
+                decode_snapshot_short_name(&encoded).ok_or(SnapshotBlockStoreError::Corrupt)?
+            } else {
+                FileShortName::EMPTY
+            };
             let path_bytes = r.vec(path_len)?;
             let path =
                 core::str::from_utf8(&path_bytes).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
@@ -997,6 +1050,7 @@ impl MemFs {
                     || allocation_size != 0
                     || valid_data_length != 0
                     || extent_count != 0
+                    || !short_name.units().is_empty()
                 {
                     return Err(SnapshotBlockStoreError::Corrupt);
                 }
@@ -1024,7 +1078,10 @@ impl MemFs {
                     .find(|(key, _)| *key == node_key)
                     .map(|(_, id)| *id)
                     .ok_or(SnapshotBlockStoreError::Corrupt)?;
-                fs.restore_snapshot_link(path, target, attributes, times)
+                let entry_id = fs
+                    .restore_snapshot_link(path, target, attributes, times)
+                    .map_err(snapshot_error_to_store_error)?;
+                fs.restore_entry_short_name(entry_id, short_name)
                     .map_err(snapshot_error_to_store_error)?;
                 seen = seen
                     .checked_add(1)
@@ -1036,7 +1093,7 @@ impl MemFs {
                 SNAP_REC_FILE => false,
                 _ => return Err(SnapshotBlockStoreError::Corrupt),
             };
-            let id = fs
+            let (id, entry_id) = fs
                 .restore_snapshot_node(
                     path,
                     is_dir,
@@ -1044,6 +1101,8 @@ impl MemFs {
                     times,
                     (header.info.version >= MEMFS_SNAPSHOT_VERSION_V2).then_some(node_key),
                 )
+                .map_err(snapshot_error_to_store_error)?;
+            fs.restore_entry_short_name(entry_id, short_name)
                 .map_err(snapshot_error_to_store_error)?;
             if is_dir {
                 if logical_len != 0
@@ -1176,7 +1235,7 @@ impl MemFs {
                 seen_files.push(child_id);
                 false
             };
-            self.write_snapshot_record(path, child, link_only, out)?;
+            self.write_snapshot_record(path, child, link_only, entry.short_name, out)?;
             *record_count = record_count
                 .checked_add(1)
                 .ok_or(MemFsSnapshotError::InvalidRecord)?;
@@ -1193,7 +1252,7 @@ impl MemFs {
         sink: &mut S,
     ) -> Result<u32, SnapshotBlockStoreError> {
         let root = self.node(0).ok_or(SnapshotBlockStoreError::Corrupt)?;
-        self.write_snapshot_record_to_sink("", root, false, sink)?;
+        self.write_snapshot_record_to_sink("", root, false, FileShortName::EMPTY, sink)?;
         let mut record_count = 1u32;
         let mut path = String::new();
         let mut seen_files = Vec::new();
@@ -1246,7 +1305,7 @@ impl MemFs {
                 seen_files.push(child_id);
                 false
             };
-            self.write_snapshot_record_to_sink(path, child, link_only, sink)?;
+            self.write_snapshot_record_to_sink(path, child, link_only, entry.short_name, sink)?;
             *record_count = record_count
                 .checked_add(1)
                 .ok_or(SnapshotBlockStoreError::Corrupt)?;
@@ -1304,7 +1363,7 @@ impl MemFs {
                 false
             };
             total = total
-                .checked_add(self.snapshot_record_len(path, child, link_only)?)
+                .checked_add(self.snapshot_record_len(path, child, link_only, entry.short_name)?)
                 .ok_or(MemFsSnapshotError::InvalidRecord)?;
             *record_count = record_count
                 .checked_add(1)
@@ -1329,6 +1388,7 @@ impl MemFs {
         path: &str,
         node: &MemFsNode,
         link_only: bool,
+        short_name: FileShortName,
     ) -> Result<usize, MemFsSnapshotError> {
         let path_len = u32::try_from(path.len()).map_err(|_| MemFsSnapshotError::InvalidPath)?;
         let end_of_file = node.data.len(&self.blobs) as u64;
@@ -1345,6 +1405,9 @@ impl MemFs {
         } else {
             Self::snapshot_file_data_encoded_len(&self.blobs, &node.data)?
         };
+        if !valid_short_name(short_name.units()) {
+            return Err(MemFsSnapshotError::InvalidRecord);
+        }
         1usize
             .checked_add(4)
             .and_then(|n| n.checked_add(4))
@@ -1354,6 +1417,7 @@ impl MemFs {
             .and_then(|n| n.checked_add(8))
             .and_then(|n| n.checked_add(8))
             .and_then(|n| n.checked_add(4))
+            .and_then(|n| n.checked_add(SNAP_SHORT_NAME_STORAGE_LEN))
             .and_then(|n| n.checked_add(path_len as usize))
             .and_then(|n| n.checked_add(data_len))
             .ok_or(MemFsSnapshotError::InvalidRecord)
@@ -1364,6 +1428,7 @@ impl MemFs {
         path: &str,
         node: &MemFsNode,
         link_only: bool,
+        short_name: FileShortName,
         out: &mut Vec<u8>,
     ) -> Result<(), MemFsSnapshotError> {
         let path_len = u32::try_from(path.len()).map_err(|_| MemFsSnapshotError::InvalidPath)?;
@@ -1406,6 +1471,7 @@ impl MemFs {
         put_u64(out, allocation_size);
         put_u64(out, valid_data_length);
         put_u32(out, extent_count);
+        write_snapshot_short_name(short_name, out);
         out.extend_from_slice(path.as_bytes());
         if !node.is_dir && !link_only {
             self.write_snapshot_file_data(&node.data, out)?;
@@ -1418,6 +1484,7 @@ impl MemFs {
         path: &str,
         node: &MemFsNode,
         link_only: bool,
+        short_name: FileShortName,
         sink: &mut S,
     ) -> Result<(), SnapshotBlockStoreError> {
         let path_len = u32::try_from(path.len()).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
@@ -1443,7 +1510,7 @@ impl MemFs {
             u32::try_from(Self::snapshot_extent_count(&node.data))
                 .map_err(|_| SnapshotBlockStoreError::Corrupt)?
         };
-        let mut header = [0u8; 77];
+        let mut header = [0u8; 77 + SNAP_SHORT_NAME_STORAGE_LEN];
         header[0] = if link_only {
             SNAP_REC_LINK
         } else if node.is_dir {
@@ -1462,6 +1529,7 @@ impl MemFs {
         put_u64_at(&mut header[57..65], allocation_size);
         put_u64_at(&mut header[65..73], valid_data_length);
         put_u32_at(&mut header[73..77], extent_count);
+        write_snapshot_short_name_at(short_name, &mut header[77..]);
         sink.write_all(&header)?;
         sink.write_all(path.as_bytes())?;
         if !node.is_dir && !link_only {
@@ -1629,7 +1697,7 @@ impl MemFs {
         attributes: u32,
         times: [u64; 4],
         file_id: Option<u64>,
-    ) -> Result<u64, MemFsSnapshotError> {
+    ) -> Result<(u64, u64), MemFsSnapshotError> {
         if !Self::valid_snapshot_path(path) {
             return Err(MemFsSnapshotError::InvalidPath);
         }
@@ -1659,7 +1727,7 @@ impl MemFs {
                 return Err(MemFsSnapshotError::InvalidRecord);
             }
         }
-        let id = self.create_child(parent, leaf, is_dir);
+        let (id, entry_id) = self.create_child_with_entry(parent, leaf, is_dir);
         if let Some(file_id) = file_id {
             self.node_mut(id).unwrap().file_id = file_id;
             self.next_file_id = self.next_file_id.max(
@@ -1680,7 +1748,7 @@ impl MemFs {
         node.last_access_time = times[1];
         node.last_write_time = times[2];
         node.change_time = times[3];
-        Ok(id)
+        Ok((id, entry_id))
     }
 
     fn restore_snapshot_link(
@@ -1689,7 +1757,7 @@ impl MemFs {
         target: u64,
         attributes: u32,
         times: [u64; 4],
-    ) -> Result<(), MemFsSnapshotError> {
+    ) -> Result<u64, MemFsSnapshotError> {
         if !Self::valid_snapshot_path(path) || self.lookup(path).is_some() {
             return Err(MemFsSnapshotError::InvalidPath);
         }
@@ -1720,8 +1788,7 @@ impl MemFs {
             } else {
                 MemFsSnapshotError::InvalidRecord
             }
-        })?;
-        Ok(())
+        })
     }
 
     fn valid_snapshot_path(path: &str) -> bool {
@@ -1849,6 +1916,14 @@ impl MemFs {
 
     fn child_entry(&self, dir: u64, name: &str) -> Option<&MemFsDirEntry> {
         let folded = fold(name);
+        self.node(dir)?.children.iter().find(|entry| {
+            entry.folded_name == folded
+                || (!entry.folded_short_name.is_empty() && entry.folded_short_name == folded)
+        })
+    }
+
+    fn child_long_entry(&self, dir: u64, name: &str) -> Option<&MemFsDirEntry> {
+        let folded = fold(name);
         self.node(dir)?
             .children
             .iter()
@@ -1859,7 +1934,14 @@ impl MemFs {
         self.node(dir)?
             .children
             .iter()
-            .find(|entry| entry.folded_name.as_bytes().eq_ignore_ascii_case(name))
+            .find(|entry| {
+                entry.folded_name.as_bytes().eq_ignore_ascii_case(name)
+                    || (!entry.folded_short_name.is_empty()
+                        && entry
+                            .folded_short_name
+                            .as_bytes()
+                            .eq_ignore_ascii_case(name))
+            })
             .map(|entry| entry.node_id)
     }
 
@@ -1879,6 +1961,9 @@ impl MemFs {
         let Some(link_count) = self.node(node_id).map(|node| node.link_count) else {
             return Err(STATUS_OBJECT_NAME_NOT_FOUND);
         };
+        if self.child_entry(parent, name).is_some() {
+            return Err(STATUS_OBJECT_NAME_COLLISION);
+        }
         let next_link_count = link_count
             .checked_add(1)
             .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
@@ -1896,6 +1981,8 @@ impl MemFs {
             id: entry_id,
             folded_name: fold(name),
             created_name: String::from(name),
+            folded_short_name: String::new(),
+            short_name: FileShortName::EMPTY,
             node_id,
         });
         self.node_mut(node_id).unwrap().link_count = next_link_count;
@@ -1953,6 +2040,78 @@ impl MemFs {
             return Some((parent as u64, index, node.children[index].node_id));
         }
         None
+    }
+
+    fn entry_short_name(&self, entry_id: u64) -> Option<FileShortName> {
+        if entry_id == 0 {
+            return Some(FileShortName::EMPTY);
+        }
+        let (parent, index, _) = self.entry_location(entry_id)?;
+        Some(self.node(parent)?.children.get(index)?.short_name)
+    }
+
+    fn namespace_conflicts(
+        &self,
+        parent: u64,
+        folded: &str,
+        ignored_entry: u64,
+        second_ignored_entry: u64,
+    ) -> bool {
+        self.node(parent).is_none_or(|node| {
+            node.children.iter().any(|entry| {
+                entry.id != ignored_entry
+                    && entry.id != second_ignored_entry
+                    && (entry.folded_name == folded
+                        || (!entry.folded_short_name.is_empty()
+                            && entry.folded_short_name == folded))
+            })
+        })
+    }
+
+    fn set_entry_short_name(&mut self, entry_id: u64, name: FileShortName) -> u32 {
+        let Some((parent, index, node_id)) = self.entry_location(entry_id) else {
+            return STATUS_ACCESS_DENIED;
+        };
+        let folded = match String::from_utf16(name.units()) {
+            Ok(name) => fold(&name),
+            Err(_) => return STATUS_INVALID_PARAMETER,
+        };
+        if !folded.is_empty() && self.namespace_conflicts(parent, &folded, entry_id, 0) {
+            return STATUS_OBJECT_NAME_COLLISION;
+        }
+        let Some(entry) = self
+            .node_mut(parent)
+            .and_then(|node| node.children.get_mut(index))
+        else {
+            return STATUS_ACCESS_DENIED;
+        };
+        entry.folded_short_name = folded;
+        entry.short_name = name;
+        self.touch_change(node_id);
+        STATUS_SUCCESS
+    }
+
+    fn restore_entry_short_name(
+        &mut self,
+        entry_id: u64,
+        name: FileShortName,
+    ) -> Result<(), MemFsSnapshotError> {
+        let Some((parent, index, _)) = self.entry_location(entry_id) else {
+            return Err(MemFsSnapshotError::InvalidRecord);
+        };
+        let created =
+            String::from_utf16(name.units()).map_err(|_| MemFsSnapshotError::InvalidRecord)?;
+        let folded = fold(&created);
+        if !folded.is_empty() && self.namespace_conflicts(parent, &folded, entry_id, 0) {
+            return Err(MemFsSnapshotError::NameCollision);
+        }
+        let entry = self
+            .node_mut(parent)
+            .and_then(|node| node.children.get_mut(index))
+            .ok_or(MemFsSnapshotError::InvalidRecord)?;
+        entry.folded_short_name = folded;
+        entry.short_name = name;
+        Ok(())
     }
 
     fn opened_name(&self, entry_id: u64) -> Option<String> {
@@ -2078,9 +2237,29 @@ impl MemFs {
             }
         }
 
+        let namespace_entry = self.child_entry(target_parent, leaf).map(|entry| entry.id);
         let existing = self
-            .child_entry(target_parent, leaf)
+            .child_long_entry(target_parent, leaf)
             .map(|entry| (entry.id, entry.node_id));
+        if existing.is_none() && namespace_entry.is_some_and(|entry| entry != source_entry) {
+            return STATUS_OBJECT_NAME_COLLISION;
+        }
+        let source_short_name = self
+            .node(source_parent)
+            .and_then(|node| node.children.get(source_index))
+            .map(|entry| entry.folded_short_name.clone())
+            .unwrap_or_default();
+        if source_parent != target_parent
+            && !source_short_name.is_empty()
+            && self.namespace_conflicts(
+                target_parent,
+                &source_short_name,
+                source_entry,
+                existing.map_or(0, |(entry, _)| entry),
+            )
+        {
+            return STATUS_OBJECT_NAME_COLLISION;
+        }
         if let Some((existing_entry, existing_node_id)) = existing {
             if existing_entry == source_entry {
                 if let Some(parent_node) = self.node_mut(target_parent) {
@@ -2218,9 +2397,13 @@ impl MemFs {
         if !parent.is_dir {
             return STATUS_NOT_A_DIRECTORY;
         }
+        let namespace_entry = self.child_entry(target_parent, leaf).map(|entry| entry.id);
         let existing = self
-            .child_entry(target_parent, leaf)
+            .child_long_entry(target_parent, leaf)
             .map(|entry| (entry.id, entry.node_id));
+        if existing.is_none() && namespace_entry.is_some() {
+            return STATUS_OBJECT_NAME_COLLISION;
+        }
         if let Some((existing_entry, existing_node)) = existing {
             if existing_node == source {
                 return STATUS_SUCCESS;
@@ -2367,11 +2550,14 @@ impl MemFs {
         let mut cur = start;
         let mut entry_id = 0;
         for comp in path.split(|byte| *byte == b'\\').filter(|c| !c.is_empty()) {
-            let entry = self
-                .node(cur)?
-                .children
-                .iter()
-                .find(|entry| entry.folded_name.as_bytes().eq_ignore_ascii_case(comp))?;
+            let entry = self.node(cur)?.children.iter().find(|entry| {
+                entry.folded_name.as_bytes().eq_ignore_ascii_case(comp)
+                    || (!entry.folded_short_name.is_empty()
+                        && entry
+                            .folded_short_name
+                            .as_bytes()
+                            .eq_ignore_ascii_case(comp))
+            })?;
             cur = entry.node_id;
             entry_id = entry.id;
         }
@@ -2849,15 +3035,15 @@ impl MemFs {
             return None;
         }
         match index {
-            0 => self.make_directory_entry(0, ".", node),
+            0 => self.make_directory_entry(0, ".", FileShortName::EMPTY, node),
             1 => {
                 let parent = self.node(node.parent).unwrap_or(node);
-                self.make_directory_entry(1, "..", parent)
+                self.make_directory_entry(1, "..", FileShortName::EMPTY, parent)
             }
             _ => {
                 let child = node.children.get(index - 2)?;
                 let target = self.node(child.node_id)?;
-                self.make_directory_entry(index, &child.created_name, target)
+                self.make_directory_entry(index, &child.created_name, child.short_name, target)
             }
         }
     }
@@ -2866,6 +3052,7 @@ impl MemFs {
         &self,
         index: usize,
         name: &str,
+        short_name: FileShortName,
         target: &MemFsNode,
     ) -> Option<DirectoryEntry> {
         let size = target.data.len(&self.blobs) as u64;
@@ -2889,6 +3076,9 @@ impl MemFs {
             name_len += 1;
         }
         entry.name_len = name_len as u16;
+        if !entry.set_short_name(short_name.units()) {
+            return None;
+        }
         Some(entry)
     }
     fn size(&self, id: u64) -> u64 {
@@ -3502,8 +3692,7 @@ pub fn validate_file_create_parameters(
         || (options & FILE_DELETE_ON_CLOSE != 0 && desired_access & DELETE == 0)
         || (options & FILE_DIRECTORY_FILE != 0 && options & FILE_NON_DIRECTORY_FILE != 0)
         || (options & FILE_COMPLETE_IF_OPLOCKED != 0 && options & FILE_RESERVE_OPFILTER != 0)
-        || (options & FILE_NO_INTERMEDIATE_BUFFERING != 0
-            && desired_access & FILE_APPEND_DATA != 0)
+        || (options & FILE_NO_INTERMEDIATE_BUFFERING != 0 && desired_access & FILE_APPEND_DATA != 0)
     {
         return Err(STATUS_INVALID_PARAMETER);
     }
@@ -3615,6 +3804,71 @@ pub struct SetFileNameInformation<'a> {
     pub file_name: &'a [u8],
 }
 
+/// Parse and validate the variable-length `FILE_NAME_INFORMATION` payload used by
+/// `FileShortNameInformation`. An empty name removes the entry's existing alias.
+pub fn parse_short_name_information(data: &[u8]) -> Result<FileShortName, u32> {
+    if data.len() < 4 {
+        return Err(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    let byte_len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+    if byte_len & 1 != 0 || byte_len > MAX_SHORT_NAME * 2 || data.len() - 4 < byte_len {
+        return Err(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    let mut units = [0u16; MAX_SHORT_NAME];
+    for (index, bytes) in data[4..4 + byte_len].chunks_exact(2).enumerate() {
+        units[index] = u16::from_le_bytes([bytes[0], bytes[1]]);
+    }
+    let units = &units[..byte_len / 2];
+    if !valid_short_name(units) {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    FileShortName::from_units(units).ok_or(STATUS_INVALID_PARAMETER)
+}
+
+fn valid_short_name(name: &[u16]) -> bool {
+    if name.is_empty() {
+        return true;
+    }
+    if String::from_utf16(name).is_err() || name == [b'.' as u16] || name == [b'.' as u16; 2] {
+        return false;
+    }
+    let mut dot = None;
+    for (index, unit) in name.iter().copied().enumerate() {
+        if unit == b'.' as u16 {
+            if dot.replace(index).is_some() {
+                return false;
+            }
+            continue;
+        }
+        if unit <= b' ' as u16
+            || (unit <= 0x7f
+                && matches!(
+                    unit as u8,
+                    b'"' | b'*'
+                        | b'+'
+                        | b','
+                        | b'/'
+                        | b':'
+                        | b';'
+                        | b'<'
+                        | b'='
+                        | b'>'
+                        | b'?'
+                        | b'['
+                        | b'\\'
+                        | b']'
+                        | b'|'
+                ))
+        {
+            return false;
+        }
+    }
+    match dot {
+        Some(index) => (1..=8).contains(&index) && (1..=3).contains(&(name.len() - index - 1)),
+        None => name.len() <= 8,
+    }
+}
+
 /// Parse the x64 set-file-name structure without interpreting its caller-owned
 /// `RootDirectory` handle.
 pub fn parse_set_file_name_information(data: &[u8]) -> Result<SetFileNameInformation<'_>, u32> {
@@ -3717,11 +3971,7 @@ impl FileSystem {
 
     /// Complete the create path's security-context capture before the File object is published to
     /// user mode. Duplicated handles retain these flags through their shared open description.
-    pub fn capture_open_privileges(
-        &mut self,
-        handle: u64,
-        privileges: FileOpenPrivileges,
-    ) -> u32 {
+    pub fn capture_open_privileges(&mut self, handle: u64, privileges: FileOpenPrivileges) -> u32 {
         let Some(object) = self.obj_mut(handle) else {
             return STATUS_INVALID_HANDLE;
         };
@@ -4446,6 +4696,13 @@ impl FileSystem {
         Some(retained)
     }
 
+    /// Return the alternate 8.3 name of the exact directory entry used to open this File object.
+    /// An empty value means the filesystem supports short names but this entry has no alias.
+    pub fn zw_query_short_name(&self, handle: u64) -> Option<FileShortName> {
+        let object = self.obj(handle)?;
+        self.volume.entry_short_name(object.entry_id)
+    }
+
     /// `ZwQueryDirectoryFile` (spec §17): enumerate the directory this file object is open on,
     /// resuming from (and advancing) the file object's own cursor. `RestartScan` rewinds it. The
     /// record encoding is [`query_directory`] — the same encoder the read-only FAT volume uses.
@@ -4617,6 +4874,14 @@ impl FileSystem {
                     self.volume.touch_write(node_id);
                 }
                 status
+            }
+            FILE_SHORT_NAME_INFORMATION => {
+                let short_name = match parse_short_name_information(data) {
+                    Ok(name) => name,
+                    Err(status) => return status,
+                };
+                let entry_id = self.obj(handle).unwrap().entry_id;
+                self.volume.set_entry_short_name(entry_id, short_name)
             }
             FILE_RENAME_INFORMATION => {
                 let (replace_if_exists, root_directory, target) =

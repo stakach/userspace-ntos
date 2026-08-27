@@ -18,6 +18,10 @@ pub struct FatShortName {
     units: [u16; crate::MAX_SHORT_NAME],
 }
 
+/// A filesystem-owned alternate 8.3 name. FAT supplies this from its physical directory entry;
+/// writable filesystems may assign it to an individual directory entry.
+pub type FileShortName = FatShortName;
+
 impl FatShortName {
     pub const EMPTY: Self = Self {
         len: 0,
@@ -165,9 +169,7 @@ impl FatDirectoryDecoder {
 
         let mut short_name = [0u16; 12];
         let short_name_len = decode_short_name(&short_raw, slot[12], false, &mut short_name);
-        let _ = record
-            .entry
-            .set_short_name(&short_name[..short_name_len]);
+        let _ = record.entry.set_short_name(&short_name[..short_name_len]);
         if let Some(length) = long_name_len {
             let _ = record.entry.set_name(&self.long_name.name[..length]);
         } else {

@@ -14621,3 +14621,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     unlink, and persist them. Do not expose a generated executive-side alias. Installed FAT remains
     read-only and already reports the exact physical 8.3 entry; provider-backed Files remain FSD
     owned.
+
+    MemFs short-name namespace and native class-40 boundary (2026-08-27, focused implementation):
+    MemFs now stores an optional validated 8.3 alias on each directory entry. Long names and aliases
+    participate in one case-insensitive lookup and collision domain, so creates, opens, renames, and
+    hard links cannot shadow an existing name through a second namespace. Rename preserves the
+    source entry's alias and preflights it when moving between directories; a new hard-link entry
+    begins without an alias; unlink removes the entry-owned alias. Directory classes that carry a
+    short-name field now enumerate the real alias, wildcard matching can select it, and
+    `FileAlternateNameInformation` on a writable File returns that same stored value, including an
+    honest empty value when no alias exists.
+
+    `nt-fs` parses class 40's variable `FILE_NAME_INFORMATION`, rejects malformed UTF-16, illegal
+    DOS characters, invalid 8.3 component lengths, and long-name/alias collisions, and treats a
+    zero-length name as deletion. Snapshot version 6 persists a fixed bounded alias record for
+    every directory entry, including independent hard-link records. Both allocating and streaming
+    readers retain versions 1 through 5; version-6 restore validates aliases and rejects corrupt or
+    colliding namespace state before publishing a filesystem. The I/O Manager owns the native
+    eight-byte minimum and `DELETE` access check. The executive then requires live
+    `SeRestorePrivilege` before dispatching class 40 to either MemFs or a provider-backed FSD, so
+    the security boundary is uniform and no filesystem path receives a synthetic success.
+
+    Focused validation passes `nt-fs` `97/97`, `nt-io-manager` `214/214`, `git diff --check`, and
+    the freestanding executive at the established 211-warning baseline. A serialized desktop
+    acceptance run remains required before this item is marked accepted and the next capability is
+    selected.
