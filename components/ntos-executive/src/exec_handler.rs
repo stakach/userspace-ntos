@@ -9623,30 +9623,18 @@ impl ExecNtHandler {
         if !Self::readonly_disk_open_allowed(desired_access, open_options) {
             return None;
         }
-        nt_fs::nt_path_to_volume_relative(name16, b"reactos").and_then(|path| unsafe {
-            exec_fs().and_then(|fs| crate::fs_loader::fat_open_path_metadata(&fs, &path))
-        })
+        Self::readonly_volume_metadata(name16).filter(|entry| !entry.metadata.is_directory)
     }
 
     fn readonly_disk_open_allowed(desired_access: u32, open_options: u32) -> bool {
-        const FILE_EXECUTE: u32 = 0x0000_0020;
-        const GENERIC_READ: u32 = 0x8000_0000;
-        const GENERIC_WRITE: u32 = 0x4000_0000;
-        const GENERIC_EXECUTE: u32 = 0x2000_0000;
-        const GENERIC_ALL: u32 = 0x1000_0000;
-        let wants_read_or_execute = desired_access
-            & (nt_fs::FILE_READ_DATA | FILE_EXECUTE | GENERIC_READ | GENERIC_EXECUTE | GENERIC_ALL)
-            != 0;
-        let wants_write = desired_access
-            & (nt_fs::FILE_WRITE_DATA | nt_fs::FILE_APPEND_DATA | GENERIC_WRITE | GENERIC_ALL)
-            != 0;
-        let synchronous = open_options
-            & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
-            != 0;
-        !(open_options & nt_fs::FILE_DIRECTORY_FILE != 0
-            || !wants_read_or_execute
-            || wants_write
-            || !synchronous)
+        nt_fs::installed_file_open_action(desired_access, nt_fs::FILE_OPEN, open_options)
+            == Ok(nt_fs::InstalledFileOpenAction::ReadOnly)
+    }
+
+    fn readonly_volume_metadata(name16: &[u16]) -> Option<crate::fs_loader::FatOpenMetadata> {
+        nt_fs::nt_path_to_volume_relative(name16, b"reactos").and_then(|path| unsafe {
+            exec_fs().and_then(|fs| crate::fs_loader::fat_open_path_metadata(&fs, &path))
+        })
     }
 
     fn readonly_volume_entry(name16: &[u16]) -> Option<(u32, u32, u8)> {
@@ -9762,6 +9750,99 @@ impl ExecNtHandler {
         Some(handle as u64)
     }
 
+    unsafe fn create_overlay_file_relative(
+        &mut self,
+        relative: &[u8],
+        desired_access: u32,
+        file_attributes: u32,
+        share_access: u32,
+        disposition: u32,
+        options: u32,
+    ) -> (u32, u64, u64) {
+        let (mut status, file_id, information) = crate::writable_fs::create(
+            relative,
+            desired_access,
+            file_attributes,
+            share_access,
+            disposition,
+            options,
+        );
+        let Some(file_id) = file_id else {
+            return (status, 0, 0);
+        };
+        self.writable_fs_dirty = true;
+        match self.mint_overlay_file_handle(file_id, desired_access) {
+            Some(handle) => (status, information, handle),
+            None => {
+                status = STATUS_INSUFFICIENT_RESOURCES;
+                (status, 0, 0)
+            }
+        }
+    }
+
+    unsafe fn open_installed_file(
+        &mut self,
+        source: crate::fs_loader::FatOpenMetadata,
+        relative: &[u8],
+        desired_access: u32,
+        file_attributes: u32,
+        share_access: u32,
+        disposition: u32,
+        options: u32,
+    ) -> (u32, u64, u64) {
+        if source.metadata.is_directory {
+            return (nt_fs::STATUS_FILE_IS_A_DIRECTORY, 0, 0);
+        }
+        let action = match nt_fs::installed_file_open_action(desired_access, disposition, options) {
+            Ok(action) => action,
+            Err(status) => return (status, 0, 0),
+        };
+        let copy_mode = match action {
+            nt_fs::InstalledFileOpenAction::ReadOnly => {
+                return match self.mint_disk_file_handle(
+                    source,
+                    relative,
+                    desired_access,
+                    options,
+                ) {
+                    Some(handle) => (nt_fs::STATUS_SUCCESS, nt_fs::FILE_OPENED as u64, handle),
+                    None => (STATUS_INSUFFICIENT_RESOURCES, 0, 0),
+                };
+            }
+            nt_fs::InstalledFileOpenAction::CopyContents => {
+                crate::writable_fs::InstalledFileCopyUp::PreserveContents
+            }
+            nt_fs::InstalledFileOpenAction::CopyMetadata => {
+                crate::writable_fs::InstalledFileCopyUp::MetadataOnly
+            }
+            nt_fs::InstalledFileOpenAction::NameCollision => {
+                return (nt_fs::STATUS_OBJECT_NAME_COLLISION, 0, 0);
+            }
+        };
+        if let Some(parent) = Self::volume_relative_parent(relative) {
+            if !Self::readonly_volume_relative_is_dir(parent) {
+                return (nt_fs::STATUS_OBJECT_PATH_NOT_FOUND, 0, 0);
+            }
+            match crate::writable_fs::ensure_installed_directory_relative(parent) {
+                Ok(true) => self.writable_fs_dirty = true,
+                Ok(false) => {}
+                Err(status) => return (status, 0, 0),
+            }
+        }
+        if let Err(status) = crate::writable_fs::copy_up_installed_file(relative, source, copy_mode)
+        {
+            return (status, 0, 0);
+        }
+        self.create_overlay_file_relative(
+            relative,
+            desired_access,
+            file_attributes,
+            share_access,
+            disposition,
+            options,
+        )
+    }
+
     unsafe fn create_local_file_relative(
         &mut self,
         root: FileParseRoot,
@@ -9851,6 +9932,17 @@ impl ExecNtHandler {
                 let fat_entry = exec_fs().and_then(|fs| {
                     crate::fs_loader::fat_open_path_metadata_from(&fs, first_cluster, relative)
                 });
+                if let Some(source) = fat_entry.filter(|entry| !entry.metadata.is_directory) {
+                    return self.open_installed_file(
+                        source,
+                        full_path,
+                        desired_access,
+                        file_attributes,
+                        share_access,
+                        disposition,
+                        options,
+                    );
+                }
                 if disposition == nt_fs::FILE_OPEN
                     || (disposition == nt_fs::FILE_OPEN_IF && fat_entry.is_some())
                 {
@@ -22391,6 +22483,37 @@ impl ExecNtHandler {
                 nt_fs::FILE_OPEN,
                 open_options,
             );
+            if Self::overlay_open_missed(status) {
+                if let Some(source) = Self::readonly_volume_metadata(name16)
+                    .filter(|entry| !entry.metadata.is_directory)
+                {
+                    let (open_status, open_information, opened_handle) = self.open_installed_file(
+                        source,
+                        relative,
+                        desired_access,
+                        0,
+                        share_access,
+                        nt_fs::FILE_OPEN,
+                        open_options,
+                    );
+                    self.write_nt_open_file_handle_out(file_handle_out, opened_handle);
+                    let iosb = args[3];
+                    if iosb != 0 {
+                        self.xas_write_buf(iosb, &open_status.to_le_bytes());
+                        self.xas_write_buf(iosb + 8, &open_information.to_le_bytes());
+                    }
+                    loader_trace_record(
+                        self.pi,
+                        LoaderOp::OpenFile,
+                        open_status,
+                        None,
+                        0,
+                        opened_handle,
+                        &nb[..nlen],
+                    );
+                    return open_status;
+                }
+            }
             if !Self::overlay_open_missed(status) || Self::readonly_volume_entry(name16).is_none() {
                 let mut opened_handle = 0u64;
                 if let Some(file_id) = file_id {
@@ -22464,6 +22587,43 @@ impl ExecNtHandler {
                         0
                     };
                     self.xas_write_buf(iosb + 8, &info.to_le_bytes());
+                }
+                loader_trace_record(
+                    self.pi,
+                    LoaderOp::OpenFile,
+                    status,
+                    None,
+                    0,
+                    opened_handle,
+                    &nb[..nlen],
+                );
+                return status;
+            }
+        }
+        if let Some((relative, source)) = volume_relative_len.and_then(|length| {
+            Self::readonly_volume_metadata(name16)
+                .filter(|entry| !entry.metadata.is_directory)
+                .map(|entry| (&path_relative[..length], entry))
+        }) {
+            if nt_fs::installed_file_open_action(
+                desired_access,
+                nt_fs::FILE_OPEN,
+                open_options,
+            ) == Ok(nt_fs::InstalledFileOpenAction::CopyContents) {
+                let (status, information, opened_handle) = self.open_installed_file(
+                    source,
+                    relative,
+                    desired_access,
+                    0,
+                    share_access,
+                    nt_fs::FILE_OPEN,
+                    open_options,
+                );
+                self.write_nt_open_file_handle_out(file_handle_out, opened_handle);
+                let iosb = args[3];
+                if iosb != 0 {
+                    self.xas_write_buf(iosb, &status.to_le_bytes());
+                    self.xas_write_buf(iosb + 8, &information.to_le_bytes());
                 }
                 loader_trace_record(
                     self.pi,
@@ -30565,14 +30725,23 @@ impl ExecNtHandler {
                     &mut volume_folded,
                     &mut volume_relative,
                 );
+                let mut writable_folded = [0u8; FILE_OBJECT_NAME_CAP];
+                let mut writable_relative = [0u8; FILE_VOLUME_RELATIVE_CAP];
+                let writable_relative_len = crate::writable_fs::writable_path_into(
+                    name16,
+                    &mut writable_folded,
+                    &mut writable_relative,
+                );
+                if let Some(length) = writable_relative_len {
+                    let _ =
+                        crate::writable_fs::query_metadata_relative(&writable_relative[..length]);
+                }
                 let volume_overlay_hit = volume_relative_len.is_some_and(|length| {
                     crate::writable_fs::query_attributes_relative_if_mounted(
                         &volume_relative[..length],
                     )
                     .is_some()
                 });
-                let mut writable_folded = [0u8; FILE_OBJECT_NAME_CAP];
-                let mut writable_relative = [0u8; FILE_VOLUME_RELATIVE_CAP];
                 if Self::is_named_pipe_root_path(name16) {
                     if create_disposition != nt_fs::FILE_OPEN {
                         status = nt_fs::STATUS_INVALID_PARAMETER;
@@ -30669,11 +30838,29 @@ impl ExecNtHandler {
                             pending_pipe_create = true;
                         }
                     }
-                } else if let Some(relative_len) = crate::writable_fs::writable_path_into(
-                    name16,
-                    &mut writable_folded,
-                    &mut writable_relative,
-                ) {
+                } else if let Some((relative, source)) = volume_relative_len
+                    .filter(|_| !volume_overlay_hit)
+                    .and_then(|length| {
+                        Self::readonly_volume_metadata(name16)
+                            .filter(|entry| !entry.metadata.is_directory)
+                            .map(|entry| (&volume_relative[..length], entry))
+                    })
+                {
+                    let (open_status, information, handle) = self.open_installed_file(
+                        source,
+                        relative,
+                        desired_access,
+                        file_attributes,
+                        share_access,
+                        create_disposition,
+                        create_options,
+                    );
+                    status = open_status;
+                    info = information;
+                    if handle != 0 {
+                        self.queue_write(file_handle_out, handle);
+                    }
+                } else if let Some(relative_len) = writable_relative_len {
                     let relative = &writable_relative[..relative_len];
                     // ★ THE WRITABLE FILESYSTEM OVERLAY. The path resolved into a declared writable
                     // mount prefix (see `writable_fs::WRITABLE_PREFIXES`) — this is the boundary the
@@ -30690,97 +30877,27 @@ impl ExecNtHandler {
                         create_disposition,
                         create_options,
                     );
-                    let disposition = create_disposition;
-                    if disposition == nt_fs::FILE_OPEN && Self::overlay_open_missed(st) {
-                        if let (Some(file), Some(path_len)) = (
-                            Self::readonly_disk_open_entry(
-                                name16,
-                                desired_access,
-                                create_options,
-                            ),
-                            volume_relative_len,
-                        )
-                        {
-                            let file_size = file.metadata.end_of_file;
-                            status = nt_fs::STATUS_SUCCESS;
-                            info = nt_fs::FILE_OPENED as u64;
-                            match self.mint_disk_file_handle(
-                                file,
-                                &volume_relative[..path_len],
-                                desired_access,
-                                create_options,
-                            ) {
-                                Some(handle) => {
-                                    self.queue_write(file_handle_out, handle);
-                                    let count = NT_CREATE_FILE_READONLY_FAT_OPENS
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    if count < 8 {
-                                        print_str(b"[nt-create-file] pi=");
-                                        print_u64(self.pi as u64);
-                                        print_str(b" read-only FAT open size=");
-                                        print_u64(file_size);
-                                        print_str(b" name=\"");
-                                        for &unit in name16.iter().take(96) {
-                                            debug_put_char(if (0x20..0x7f).contains(&unit) {
-                                                unit as u8
-                                            } else {
-                                                b'?'
-                                            });
-                                        }
-                                        print_str(b"\"\n");
-                                    }
-                                }
-                                None => {
-                                    status = 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
-                                    info = 0;
-                                }
-                            }
-                        } else {
-                            status = Self::readonly_disk_open_miss_status(name16).unwrap_or(st);
-                            info = 0;
-                            let count =
-                                NT_CREATE_FILE_READONLY_FAT_MISSES.fetch_add(1, Ordering::Relaxed);
-                            if count < 8 {
-                                print_str(b"[nt-create-file] pi=");
-                                print_u64(self.pi as u64);
-                                print_str(b" read-only FAT miss status=0x");
-                                print_hex(status);
-                                print_str(b" name=\"");
-                                for &unit in name16.iter().take(96) {
-                                    debug_put_char(if (0x20..0x7f).contains(&unit) {
-                                        unit as u8
-                                    } else {
-                                        b'?'
-                                    });
-                                }
-                                print_str(b"\"\n");
-                            }
+                    status = st;
+                    info = information;
+                    if file_id.is_some() {
+                        self.writable_fs_dirty = true;
+                    }
+                    if create_options & nt_fs::FILE_DIRECTORY_FILE != 0 {
+                        if status == nt_fs::STATUS_SUCCESS && info == nt_fs::FILE_CREATED as u64 {
+                            crate::writable_fs::note_directory_create(self.pi, relative, true);
+                        } else if status == nt_fs::STATUS_OBJECT_NAME_COLLISION {
+                            crate::writable_fs::note_directory_create(self.pi, relative, false);
                         }
-                    } else {
-                        status = st;
-                        info = information;
-                        if file_id.is_some() {
-                            self.writable_fs_dirty = true;
-                        }
-                        if create_options & nt_fs::FILE_DIRECTORY_FILE != 0 {
-                            if status == nt_fs::STATUS_SUCCESS && info == nt_fs::FILE_CREATED as u64
-                            {
-                                crate::writable_fs::note_directory_create(self.pi, relative, true);
-                            } else if status == nt_fs::STATUS_OBJECT_NAME_COLLISION {
-                                crate::writable_fs::note_directory_create(self.pi, relative, false);
-                            }
-                        } else if status == nt_fs::STATUS_SUCCESS
-                            && info == nt_fs::FILE_CREATED as u64
-                        {
-                            crate::writable_fs::note_profile_file_create(self.pi, relative);
-                        }
-                        if let Some(file_id) = file_id {
-                            match self.mint_overlay_file_handle(file_id, desired_access) {
-                                Some(handle) => self.queue_write(file_handle_out, handle),
-                                None => {
-                                    status = 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
-                                    info = 0;
-                                }
+                    } else if status == nt_fs::STATUS_SUCCESS && info == nt_fs::FILE_CREATED as u64
+                    {
+                        crate::writable_fs::note_profile_file_create(self.pi, relative);
+                    }
+                    if let Some(file_id) = file_id {
+                        match self.mint_overlay_file_handle(file_id, desired_access) {
+                            Some(handle) => self.queue_write(file_handle_out, handle),
+                            None => {
+                                status = 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
+                                info = 0;
                             }
                         }
                     }
@@ -30861,64 +30978,8 @@ impl ExecNtHandler {
                         }
                     }
                 } else if create_disposition == nt_fs::FILE_OPEN {
-                    if let (Some(file), Some(path_len)) = (
-                        Self::readonly_disk_open_entry(name16, desired_access, create_options),
-                        volume_relative_len,
-                    )
-                    {
-                        let file_size = file.metadata.end_of_file;
-                        status = nt_fs::STATUS_SUCCESS;
-                        info = nt_fs::FILE_OPENED as u64;
-                        match self.mint_disk_file_handle(
-                            file,
-                            &volume_relative[..path_len],
-                            desired_access,
-                            create_options,
-                        ) {
-                            Some(handle) => {
-                                self.queue_write(file_handle_out, handle);
-                                let count = NT_CREATE_FILE_READONLY_FAT_OPENS
-                                    .fetch_add(1, Ordering::Relaxed);
-                                if count < 8 {
-                                    print_str(b"[nt-create-file] pi=");
-                                    print_u64(self.pi as u64);
-                                    print_str(b" read-only FAT open size=");
-                                    print_u64(file_size);
-                                    print_str(b" name=\"");
-                                    for &unit in name16.iter().take(96) {
-                                        debug_put_char(if (0x20..0x7f).contains(&unit) {
-                                            unit as u8
-                                        } else {
-                                            b'?'
-                                        });
-                                    }
-                                    print_str(b"\"\n");
-                                }
-                            }
-                            None => {
-                                status = 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
-                                info = 0;
-                            }
-                        }
-                    } else if let Some(miss_status) = Self::readonly_disk_open_miss_status(name16) {
+                    if let Some(miss_status) = Self::readonly_disk_open_miss_status(name16) {
                         status = miss_status;
-                        let count =
-                            NT_CREATE_FILE_READONLY_FAT_MISSES.fetch_add(1, Ordering::Relaxed);
-                        if count < 8 {
-                            print_str(b"[nt-create-file] pi=");
-                            print_u64(self.pi as u64);
-                            print_str(b" read-only FAT miss status=0x");
-                            print_hex(status);
-                            print_str(b" name=\"");
-                            for &unit in name16.iter().take(96) {
-                                debug_put_char(if (0x20..0x7f).contains(&unit) {
-                                    unit as u8
-                                } else {
-                                    b'?'
-                                });
-                            }
-                            print_str(b"\"\n");
-                        }
                     } else {
                         status = self.unserved_nt_create_file_namespace(name16);
                     }

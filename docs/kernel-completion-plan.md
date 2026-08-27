@@ -14331,3 +14331,34 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     before the caller can observe it. Remove any second lookup, duplicate handle publication,
     path-specific materialization, or partial-copy success path found during that audit. Then resume
     the remaining file query/set information-class inventory.
+
+    Fixed-drive installed-file copy-up ownership (2026-08-27, accepted): installed FAT files now
+    remain filesystem-owned read-only `DiskFile` opens for non-mutating `FILE_OPEN` and
+    `FILE_OPEN_IF` requests. A mutating open first materializes each proven installed parent in the
+    writable volume, imports the exact source bytes and real FAT metadata once, and then completes
+    through the ordinary MemFs create/open path. `FILE_OVERWRITE`, `FILE_OVERWRITE_IF`, and
+    `FILE_SUPERSEDE` import the source metadata without copying bytes that the disposition must
+    truncate before publication. An existing writable entry always wins and is never replaced by
+    the installed source.
+
+    Source reads are exact and fail closed: allocation failure returns
+    `STATUS_INSUFFICIENT_RESOURCES`, a short FAT read returns `STATUS_IO_DEVICE_ERROR`, and no
+    partially imported File is published. Every successful request now creates one explicit File
+    owner and one open description. The duplicate `NtCreateFile` FAT open/miss branches, their
+    second handle-publication path, and their historical counters are removed. The copy-up decision
+    is a host-tested `nt-fs` policy rather than an executive path-name exception.
+
+    Focused validation passes `nt-fs` `83/83`; the freestanding executive remains at the
+    established 211-warning baseline. Serialized acceptance
+    `.tmp/run-headless-fixed-drive-copy-up-final-20260827.log` launched genuine userinit and
+    Explorer, completed 668 Explorer api0 redirects with zero callback failures, painted
+    `480000/480000` framebuffer pixels with at least 32 colours, passed all `295/295` gates, and
+    matched the sentinel. The writable snapshot committed generation 5 at 1,750,162 bytes.
+
+    Review adjustment: the fixed-drive copy-up/open ownership audit is closed. It exposed a deeper
+    create-contract gap: the local `nt-fs` create paths currently accept but do not enforce
+    `DesiredAccess` or `ShareAccess`. Next implement I/O-Manager create-parameter validation and
+    filesystem-owned share-access/open accounting crate-first. Share compatibility must be checked
+    before any create, truncate, supersede, or copy-up mutation, and the final close of the shared
+    open description must release its claim. After that, resume the remaining file query/set
+    information-class inventory.

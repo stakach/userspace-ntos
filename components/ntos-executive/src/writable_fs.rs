@@ -1393,6 +1393,47 @@ pub(crate) unsafe fn open_existing_relative_if_mounted(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InstalledFileCopyUp {
+    PreserveContents,
+    MetadataOnly,
+}
+
+/// Import one installed FAT file into the writable volume before the caller's normal create/open.
+/// The import publishes no process handle or File object. An existing writable entry wins without
+/// modification, and a failed source read or filesystem import is returned to the caller rather
+/// than converted into a successful empty file.
+pub(crate) unsafe fn copy_up_installed_file(
+    relative: &[u8],
+    source: crate::fs_loader::FatOpenMetadata,
+    mode: InstalledFileCopyUp,
+) -> Result<bool, u32> {
+    if source.metadata.is_directory {
+        return Err(nt_fs::STATUS_FILE_IS_A_DIRECTORY);
+    }
+    let mut metadata = source.metadata;
+    let bytes = match mode {
+        InstalledFileCopyUp::PreserveContents => {
+            let size = u32::try_from(metadata.end_of_file)
+                .map_err(|_| nt_fs::STATUS_INSUFFICIENT_RESOURCES)?;
+            let fat = exec_fs().ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+            read_staged_file_result(&fat, source.first_cluster, size)?
+        }
+        InstalledFileCopyUp::MetadataOnly => {
+            metadata.allocation_size = 0;
+            metadata.end_of_file = 0;
+            alloc::vec::Vec::new()
+        }
+    };
+    let fs = writable_fs().ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+    let imported = fs.import_file_relative(relative, metadata, bytes)?;
+    if imported {
+        mark_runtime_dirty();
+        mark_snapshot_dirty();
+    }
+    Ok(imported)
+}
+
 /// Provision a writable-layer directory by already-folded volume-relative path. This is not a
 /// syscall success path; it materializes directory objects that the installed read-only image proves
 /// exist so later creates can allocate children in the writable layer.
@@ -1412,6 +1453,22 @@ pub(crate) unsafe fn provision_directory_relative_change(relative: &[u8]) -> Opt
         mark_snapshot_dirty();
     }
     Some(changed)
+}
+
+/// Materialize a directory whose existence was proved by the installed volume. Unlike the
+/// observational helper above, this preserves the filesystem's path/type error for callers that
+/// are about to publish a copied-up child.
+pub(crate) unsafe fn ensure_installed_directory_relative(relative: &[u8]) -> Result<bool, u32> {
+    let fs = writable_fs().ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+    let before = fs.node_count();
+    if !fs.provision_directory_relative(relative) {
+        return Err(nt_fs::STATUS_OBJECT_PATH_NOT_FOUND);
+    }
+    let changed = fs.node_count() != before;
+    if changed {
+        mark_snapshot_dirty();
+    }
+    Ok(changed)
 }
 
 /// `NtReadFile` on a writable-volume file object.
@@ -1972,19 +2029,31 @@ pub(crate) unsafe fn default_hive_bytes() -> Option<&'static [u8]> {
 /// Read a staged FAT file into temporary storage before handing it to the writable filesystem. The
 /// filesystem copies the bytes into its own file record, so this buffer is released after each file
 /// instead of becoming long-lived mounted state.
-unsafe fn read_staged_file(fat: &Fat32, cluster: u32, size: u32) -> Option<alloc::vec::Vec<u8>> {
+unsafe fn read_staged_file_result(
+    fat: &Fat32,
+    cluster: u32,
+    size: u32,
+) -> Result<alloc::vec::Vec<u8>, u32> {
+    const STATUS_IO_DEVICE_ERROR: u32 = 0xC000_0185;
+
     let len = size as usize;
     let mut data = alloc::vec::Vec::new();
-    if data.try_reserve_exact(len).is_err() {
-        return None;
-    }
+    data.try_reserve_exact(len)
+        .map_err(|_| nt_fs::STATUS_INSUFFICIENT_RESOURCES)?;
     data.resize(len, 0);
     let got = if size == 0 {
         0
     } else {
         crate::fs_loader::fat_read_file(fat, cluster, size, data.as_mut_ptr() as u64)
     };
-    (got == size).then_some(data)
+    if got != size {
+        return Err(STATUS_IO_DEVICE_ERROR);
+    }
+    Ok(data)
+}
+
+unsafe fn read_staged_file(fat: &Fat32, cluster: u32, size: u32) -> Option<alloc::vec::Vec<u8>> {
+    read_staged_file_result(fat, cluster, size).ok()
 }
 
 #[derive(Clone, Copy, Default)]

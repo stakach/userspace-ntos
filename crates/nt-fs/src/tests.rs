@@ -2959,6 +2959,145 @@ fn provisioning_replaces_bytes_and_refuses_non_files() {
 }
 
 #[test]
+fn installed_file_import_preserves_state_before_normal_open() {
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_directory_relative(b"reactos\\system32"));
+    let source = FileMetadata {
+        creation_time: 11,
+        last_access_time: 22,
+        last_write_time: 33,
+        change_time: 44,
+        allocation_size: 4096,
+        end_of_file: 7,
+        file_id: 0x1234_5678,
+        attributes: FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE,
+        reparse_tag: 0,
+        number_of_links: 1,
+        delete_pending: false,
+        is_directory: false,
+    };
+    assert_eq!(
+        fs.import_file_relative(
+            b"reactos\\system32\\installed.dat",
+            source,
+            b"payload".to_vec(),
+        ),
+        Ok(true)
+    );
+    let imported = fs
+        .query_metadata_relative(b"reactos\\system32\\installed.dat")
+        .unwrap();
+    assert_eq!(imported.creation_time, 11);
+    assert_eq!(imported.last_access_time, 22);
+    assert_eq!(imported.last_write_time, 33);
+    assert_eq!(imported.change_time, 44);
+    assert_eq!(
+        imported.attributes,
+        FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE
+    );
+    assert_ne!(imported.file_id, 0);
+    assert_ne!(imported.file_id, source.file_id);
+    assert_eq!(
+        fs.file_bytes_relative(b"reactos\\system32\\installed.dat"),
+        Some(&b"payload"[..])
+    );
+
+    let opened = fs.zw_create_file_relative(
+        b"reactos\\system32\\installed.dat",
+        FILE_READ_DATA | FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_OPEN_IF,
+        FILE_SYNCHRONOUS_IO_NONALERT,
+    );
+    assert_eq!(opened.status, STATUS_SUCCESS);
+    assert_eq!(opened.information, FILE_OPENED);
+    assert_eq!(
+        fs.zw_read_file(opened.handle, Some(0), 7),
+        (STATUS_SUCCESS, b"payload".to_vec())
+    );
+}
+
+#[test]
+fn installed_file_import_is_fail_closed_and_never_replaces_the_writable_winner() {
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_directory_relative(b"reactos"));
+    let metadata = FileMetadata {
+        end_of_file: 3,
+        attributes: FILE_ATTRIBUTE_ARCHIVE,
+        number_of_links: 1,
+        ..FileMetadata::default()
+    };
+    assert_eq!(
+        fs.import_file_relative(b"reactos\\state.dat", metadata, b"fat".to_vec()),
+        Ok(true)
+    );
+    assert_eq!(
+        fs.import_file_relative(b"reactos\\state.dat", metadata, b"new".to_vec()),
+        Ok(false)
+    );
+    assert_eq!(
+        fs.file_bytes_relative(b"reactos\\state.dat"),
+        Some(&b"fat"[..])
+    );
+
+    let invalid = FileMetadata {
+        end_of_file: 4,
+        ..metadata
+    };
+    assert_eq!(
+        fs.import_file_relative(b"reactos\\bad.dat", invalid, b"bad".to_vec()),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(fs.file_bytes_relative(b"reactos\\bad.dat"), None);
+    assert_eq!(
+        fs.import_file_relative(b"missing\\bad.dat", metadata, b"bad".to_vec()),
+        Err(STATUS_OBJECT_PATH_NOT_FOUND)
+    );
+    assert_eq!(fs.file_bytes_relative(b"missing\\bad.dat"), None);
+}
+
+#[test]
+fn installed_file_open_policy_has_one_owner_for_every_disposition() {
+    assert_eq!(
+        installed_file_open_action(FILE_READ_DATA, FILE_OPEN, 0),
+        Ok(InstalledFileOpenAction::ReadOnly)
+    );
+    assert_eq!(
+        installed_file_open_action(FILE_READ_DATA, FILE_OPEN_IF, 0),
+        Ok(InstalledFileOpenAction::ReadOnly)
+    );
+    for access in [FILE_WRITE_DATA, FILE_APPEND_DATA, 0x0001_0000, 0x0200_0000] {
+        assert_eq!(
+            installed_file_open_action(access, FILE_OPEN, 0),
+            Ok(InstalledFileOpenAction::CopyContents)
+        );
+    }
+    assert_eq!(
+        installed_file_open_action(FILE_READ_DATA, FILE_OPEN, FILE_DELETE_ON_CLOSE),
+        Ok(InstalledFileOpenAction::CopyContents)
+    );
+    for disposition in [FILE_OVERWRITE, FILE_OVERWRITE_IF, FILE_SUPERSEDE] {
+        assert_eq!(
+            installed_file_open_action(FILE_WRITE_DATA, disposition, 0),
+            Ok(InstalledFileOpenAction::CopyMetadata)
+        );
+    }
+    assert_eq!(
+        installed_file_open_action(FILE_READ_DATA, FILE_CREATE, 0),
+        Ok(InstalledFileOpenAction::NameCollision)
+    );
+    assert_eq!(
+        installed_file_open_action(FILE_READ_DATA, 6, 0),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        installed_file_open_action(FILE_READ_DATA, FILE_OPEN, FILE_DIRECTORY_FILE),
+        Err(STATUS_NOT_A_DIRECTORY)
+    );
+}
+
+#[test]
 fn provisioned_file_extend_reads_zeroes_and_materializes_on_write() {
     let mut fs = FileSystem::new(MemFs::new());
     assert!(fs.provision_file(r"\??\C:\profiles\AppEvent.Evt", b"evt"));

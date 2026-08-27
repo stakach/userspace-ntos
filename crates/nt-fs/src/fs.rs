@@ -3197,6 +3197,62 @@ pub struct FileMetadata {
     pub is_directory: bool,
 }
 
+/// Ownership transition for an installed read-only file at create/open time. The union namespace
+/// resolves source existence; this policy decides whether the caller can retain that source or must
+/// first publish a writable-volume node.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum InstalledFileOpenAction {
+    ReadOnly,
+    CopyContents,
+    CopyMetadata,
+    NameCollision,
+}
+
+/// Classify one open of a file known to exist on the installed read-only volume. This is kept in
+/// the host-testable filesystem crate so the executive does not grow a second disposition policy.
+pub fn installed_file_open_action(
+    desired_access: u32,
+    disposition: u32,
+    options: u32,
+) -> Result<InstalledFileOpenAction, u32> {
+    const FILE_WRITE_EA: u32 = 0x0000_0010;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+    const DELETE: u32 = 0x0001_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    const WRITE_OWNER: u32 = 0x0008_0000;
+    const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    const MUTATING_ACCESS: u32 = FILE_WRITE_DATA
+        | FILE_APPEND_DATA
+        | FILE_WRITE_EA
+        | FILE_WRITE_ATTRIBUTES
+        | DELETE
+        | WRITE_DAC
+        | WRITE_OWNER
+        | MAXIMUM_ALLOWED
+        | GENERIC_WRITE
+        | GENERIC_ALL;
+
+    if options & FILE_DIRECTORY_FILE != 0 {
+        return Err(STATUS_NOT_A_DIRECTORY);
+    }
+    match disposition {
+        FILE_CREATE => Ok(InstalledFileOpenAction::NameCollision),
+        FILE_OPEN | FILE_OPEN_IF => {
+            if desired_access & MUTATING_ACCESS != 0 || options & FILE_DELETE_ON_CLOSE != 0 {
+                Ok(InstalledFileOpenAction::CopyContents)
+            } else {
+                Ok(InstalledFileOpenAction::ReadOnly)
+            }
+        }
+        FILE_OVERWRITE | FILE_OVERWRITE_IF | FILE_SUPERSEDE => {
+            Ok(InstalledFileOpenAction::CopyMetadata)
+        }
+        _ => Err(STATUS_INVALID_PARAMETER),
+    }
+}
+
 impl FileMetadata {
     pub fn query_metadata(self) -> crate::QueryMetadata {
         crate::QueryMetadata {
@@ -3673,6 +3729,64 @@ impl FileSystem {
             }
             Err(status) => fail(status),
         }
+    }
+
+    /// Import a missing installed file into this volume before applying a caller's create
+    /// disposition. The source supplies durable contents and metadata, while MemFs allocates the
+    /// target volume's stable file identity. An existing writable entry always wins and is left
+    /// unchanged.
+    ///
+    /// This is a filesystem composition primitive, not a syscall success path: it publishes no
+    /// File object. The caller must subsequently use `zw_create_file_relative` so options,
+    /// disposition, and open-description lifetime are handled exactly once by the normal path.
+    pub fn import_file_relative(
+        &mut self,
+        relative: &[u8],
+        metadata: FileMetadata,
+        bytes: Vec<u8>,
+    ) -> Result<bool, u32> {
+        if self.volume.lookup_folded_relative(relative).is_some() {
+            return Ok(false);
+        }
+        if relative.is_empty()
+            || relative.first() == Some(&b'\\')
+            || metadata.is_directory
+            || metadata.delete_pending
+            || metadata.reparse_tag != 0
+            || metadata.attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+            || metadata.end_of_file != bytes.len() as u64
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let (parent_path, leaf) =
+            MemFs::parent_and_leaf_bytes(relative).ok_or(STATUS_INVALID_PARAMETER)?;
+        let parent = self
+            .volume
+            .lookup_folded_relative(parent_path)
+            .ok_or(STATUS_OBJECT_PATH_NOT_FOUND)?;
+        if !self.volume.is_dir(parent) {
+            return Err(STATUS_OBJECT_PATH_NOT_FOUND);
+        }
+        let leaf = core::str::from_utf8(leaf).map_err(|_| STATUS_INVALID_PARAMETER)?;
+        if leaf.is_empty() || leaf == "." || leaf == ".." {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let (node_id, entry_id) = self.volume.create_child_with_entry(parent, leaf, false);
+        if !self.volume.set_file_data_owned(node_id, bytes) {
+            let _ = self.volume.unlink_entry(entry_id);
+            self.volume.reap_unlinked(node_id);
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        let node = self.volume.node_mut(node_id).unwrap();
+        node.creation_time = metadata.creation_time;
+        node.last_access_time = metadata.last_access_time;
+        node.last_write_time = metadata.last_write_time;
+        node.change_time = metadata.change_time;
+        node.attributes = match metadata.attributes & FILE_ATTRIBUTE_SETTABLE {
+            0 => FILE_ATTRIBUTE_NORMAL,
+            attributes => attributes,
+        };
+        Ok(true)
     }
 
     /// Create or open a folded path beneath an existing directory FILE_OBJECT. The directory's

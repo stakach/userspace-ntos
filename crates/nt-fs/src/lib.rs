@@ -26,7 +26,8 @@ pub use fat_directory::*;
 pub use file_backing::FileBacking;
 pub use fs::{
     parse_file_basic_information_attributes, parse_set_file_name_information, CreateResult,
-    FileMetadata, FileRenameRoot, FileSystem, MemFs, MemFsBlobCompactError, MemFsBlobCompaction,
+    installed_file_open_action, FileMetadata, FileRenameRoot, FileSystem,
+    InstalledFileOpenAction, MemFs, MemFsBlobCompactError, MemFsBlobCompaction,
     MemFsSnapshotError, MemFsSnapshotInfo, SetFileNameInformation, StandardInformation,
     INVALID_HANDLE,
 };
