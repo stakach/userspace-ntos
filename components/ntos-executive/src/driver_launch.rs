@@ -69,9 +69,7 @@ use nt_hosted_runtime::{
     NDIS_MINIPORT_INTERRUPT_LEN_X64, NDIS_MINIPORT_TIMER_LEN_X64,
     NDIS_PROTOCOL_CHARACTERISTICS_NAME_OFFSET_X64,
 };
-use nt_io_abi::{
-    ioctl, major, IrpDispatchRequest, IO_ABI_VERSION, IRP_DISPATCH_SET_REPLACE_IF_EXISTS,
-};
+use nt_io_abi::{ioctl, major, valid_set_information_control, IrpDispatchRequest, IO_ABI_VERSION};
 use nt_io_manager::{
     write_wdm_driver_object, write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
     BankedTransferCursor, CreateOptions, CreateParameters, DeviceCharacteristics,
@@ -82,8 +80,8 @@ use nt_io_manager::{
     HostedDevicePropertyTransferError, HostedDevicePropertyTransferTable, HostedDomainIdentity,
     InformationParameters, IoManager, IoParameters, IrpCompletionOrigin, IrpId, IrpProjection,
     MajorFunctionTable, ObjectManagerPort, PnpBackendDispatch, PnpParameters, ReadWriteParameters,
-    SetInformationParameters, ShareAccess, StackFlags, WdmDriverObjectInit, WdmFileObjectInit,
-    WdmIoStackLocationInit,
+    SetInformationControl, SetInformationParameters, ShareAccess, StackFlags, WdmDriverObjectInit,
+    WdmFileObjectInit, WdmIoStackLocationInit,
     WdmIoStackParameters, WdmIrpInit, WDM_X64_DRIVER_EXTENSION_OFFSET,
     WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET,
     WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET, WDM_X64_FILE_OBJECT_SIZE,
@@ -30890,14 +30888,16 @@ const fn valid_related_file_relation(is_create: bool, file_id: u64, related_file
 }
 
 const fn valid_set_information_relation(
-    is_set_information: bool,
+    major_function: u8,
+    information_class: u32,
     file_id: u64,
     target_file_id: u64,
-    flags: u32,
+    control: u32,
 ) -> bool {
+    let is_set_information = major_function == major::IRP_MJ_SET_INFORMATION;
     (target_file_id == 0 || (is_set_information && target_file_id != file_id))
-        && flags & !IRP_DISPATCH_SET_REPLACE_IF_EXISTS == 0
-        && (is_set_information || flags == 0)
+        && (target_file_id == 0 || matches!(information_class, 10 | 11 | 31))
+        && valid_set_information_control(major_function, information_class, control)
 }
 
 const _: () = assert!(valid_related_file_relation(false, 0, 0));
@@ -30905,11 +30905,36 @@ const _: () = assert!(valid_related_file_relation(false, 7, 0));
 const _: () = assert!(valid_related_file_relation(true, 7, 6));
 const _: () = assert!(!valid_related_file_relation(false, 0, 6));
 const _: () = assert!(!valid_related_file_relation(true, 7, 7));
-const _: () = assert!(valid_set_information_relation(false, 7, 0, 0));
-const _: () = assert!(valid_set_information_relation(true, 7, 6, 1));
-const _: () = assert!(!valid_set_information_relation(false, 7, 6, 0));
-const _: () = assert!(!valid_set_information_relation(true, 7, 7, 0));
-const _: () = assert!(!valid_set_information_relation(true, 7, 0, 2));
+const _: () = assert!(valid_set_information_relation(major::IRP_MJ_READ, 0, 7, 0, 0));
+const _: () = assert!(valid_set_information_relation(
+    major::IRP_MJ_SET_INFORMATION,
+    10,
+    7,
+    6,
+    1
+));
+const _: () = assert!(valid_set_information_relation(
+    major::IRP_MJ_SET_INFORMATION,
+    31,
+    7,
+    6,
+    8
+));
+const _: () = assert!(!valid_set_information_relation(major::IRP_MJ_READ, 0, 7, 6, 0));
+const _: () = assert!(!valid_set_information_relation(
+    major::IRP_MJ_SET_INFORMATION,
+    10,
+    7,
+    7,
+    0
+));
+const _: () = assert!(!valid_set_information_relation(
+    major::IRP_MJ_SET_INFORMATION,
+    10,
+    7,
+    0,
+    2
+));
 
 unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     let devobj = read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64);
@@ -30945,7 +30970,6 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         major as u8,
         major::IRP_MJ_CREATE | major::IRP_MJ_CREATE_NAMED_PIPE | major::IRP_MJ_CREATE_MAILSLOT
     );
-    let is_set_information = major as u8 == major::IRP_MJ_SET_INFORMATION;
     let create_ea_len = request.create_ea_length as u64;
     let create_file_name_len = if is_create {
         match inlen.checked_sub(create_ea_len) {
@@ -30980,10 +31004,11 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         return (STATUS_INVALID_PARAMETER, 0);
     }
     if !valid_set_information_relation(
-        is_set_information,
+        major as u8,
+        request.ioctl_code,
         canonical_file_id,
         request.target_file_id,
-        request.set_information_flags,
+        request.set_information_control,
     ) {
         return (STATUS_INVALID_PARAMETER, 0);
     }
@@ -31388,9 +31413,13 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             length: inlen as u32,
             information_class: fsctl as u32,
             target_file_object,
-            replace_if_exists: request.set_information_flags
-                & IRP_DISPATCH_SET_REPLACE_IF_EXISTS
-                != 0,
+            control: match fsctl as u32 {
+                10 | 11 => SetInformationControl::ReplaceIfExists(
+                    request.set_information_control != 0,
+                ),
+                31 => SetInformationControl::ClusterCount(request.set_information_control),
+                _ => SetInformationControl::None,
+            },
         },
         IRP_MJ_FILE_SYSTEM_CONTROL | IRP_MJ_DEVICE_CONTROL | IRP_MJ_INTERNAL_DEVICE_CONTROL => {
             WdmIoStackParameters::DeviceControl {
@@ -34613,9 +34642,14 @@ fn hosted_irp_dispatch_request(
             }
             _ => 0,
         },
-        set_information_flags: match &irp.parameters {
-            IoParameters::SetInformation(parameters) if parameters.replace_if_exists => {
-                IRP_DISPATCH_SET_REPLACE_IF_EXISTS
+        set_information_control: match &irp.parameters {
+            IoParameters::SetInformation(parameters)
+                if parameters.control.valid_for_class(parameters.info_class) =>
+            {
+                parameters.control.wire_value()
+            }
+            IoParameters::SetInformation(_) => {
+                return Err(nt_status::NtStatus::INVALID_PARAMETER)
             }
             _ => 0,
         },

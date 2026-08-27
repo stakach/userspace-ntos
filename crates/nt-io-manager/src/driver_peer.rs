@@ -12,9 +12,7 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
-use nt_io_abi::{
-    ioctl, major, IrpDispatchRequest, IO_ABI_VERSION, IRP_DISPATCH_SET_REPLACE_IF_EXISTS,
-};
+use nt_io_abi::{ioctl, major, valid_set_information_control, IrpDispatchRequest, IO_ABI_VERSION};
 use nt_status::NtStatus;
 
 use crate::dispatch::{
@@ -160,6 +158,15 @@ fn build_dispatch_request(
         },
         _ => (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
     };
+    let set_information_control = match &irp.parameters {
+        crate::irp::IoParameters::SetInformation(parameters) => {
+            if !parameters.control.valid_for_class(parameters.info_class) {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            parameters.control.wire_value()
+        }
+        _ => 0,
+    };
     Ok(IrpDispatchRequest {
         abi_version: IO_ABI_VERSION as u16,
         abi_size: core::mem::size_of::<IrpDispatchRequest>() as u16,
@@ -167,14 +174,7 @@ fn build_dispatch_request(
         minor: irp.minor,
         _reserved0: 0,
         flags: irp.flags.bits() as u32 | ((irp.control.bits() as u32) << 8),
-        set_information_flags: match &irp.parameters {
-            crate::irp::IoParameters::SetInformation(parameters)
-                if parameters.replace_if_exists =>
-            {
-                IRP_DISPATCH_SET_REPLACE_IF_EXISTS
-            }
-            _ => 0,
-        },
+        set_information_control,
         target_domain_id: target.domain_id.raw(),
         target_domain_cookie: target.cookie,
         provider_domain_id: provider
@@ -378,9 +378,14 @@ impl DriverPeerTransport for MockDriverPeer {
         if request.abi_version != IO_ABI_VERSION as u16
             || request.abi_size as usize != core::mem::size_of::<IrpDispatchRequest>()
             || !request.has_well_formed_domain_route()
-            || request.set_information_flags & !IRP_DISPATCH_SET_REPLACE_IF_EXISTS != 0
+            || !valid_set_information_control(
+                request.major,
+                request.ioctl_code,
+                request.set_information_control,
+            )
             || (request.major != major::IRP_MJ_SET_INFORMATION
-                && (request.target_file_id != 0 || request.set_information_flags != 0))
+                && (request.target_file_id != 0 || request.set_information_control != 0))
+            || (request.target_file_id != 0 && !matches!(request.ioctl_code, 10 | 11 | 31))
         {
             return DispatchOutcome::Failed {
                 status: NtStatus::INVALID_PARAMETER,

@@ -18844,24 +18844,22 @@ impl ExecNtHandler {
 
     unsafe fn resolve_local_set_file_name_target(
         &self,
-        information: nt_fs::SetFileNameInformation<'_>,
+        root_directory: u64,
+        file_name: &[u8],
         output: &mut [u8],
     ) -> Result<(nt_fs::FileRenameRoot, usize), u32> {
         let mut name_units = [0u16; FILE_OBJECT_NAME_CAP];
-        let name_len = Self::decode_set_file_name_units(information.file_name, &mut name_units)?;
+        let name_len = Self::decode_set_file_name_units(file_name, &mut name_units)?;
         let name = &name_units[..name_len];
-        if information.root_directory == 0 && name.first() != Some(&(b'\\' as u16)) {
-            if output.len() < information.file_name.len() {
+        if root_directory == 0 && name.first() != Some(&(b'\\' as u16)) {
+            if output.len() < file_name.len() {
                 return Err(nt_fs::STATUS_OBJECT_NAME_INVALID);
             }
-            output[..information.file_name.len()].copy_from_slice(information.file_name);
-            return Ok((
-                nt_fs::FileRenameRoot::SourceParent,
-                information.file_name.len(),
-            ));
+            output[..file_name.len()].copy_from_slice(file_name);
+            return Ok((nt_fs::FileRenameRoot::SourceParent, file_name.len()));
         }
 
-        let root = self.resolve_file_parse_root_for(information.root_directory, name)?;
+        let root = self.resolve_file_parse_root_for(root_directory, name)?;
         let mut namespace_path = [0u8; NAMED_OBJECT_PATH_CAP];
         let mut absolute_name = [0u16; FILE_OBJECT_NAME_CAP];
         let (root, name) = self.normalize_object_directory_file_name(
@@ -18878,13 +18876,13 @@ impl ExecNtHandler {
                 if !standard.is_directory {
                     return Err(nt_fs::STATUS_NOT_A_DIRECTORY);
                 }
-                if output.len() < information.file_name.len() {
+                if output.len() < file_name.len() {
                     return Err(nt_fs::STATUS_OBJECT_NAME_INVALID);
                 }
-                output[..information.file_name.len()].copy_from_slice(information.file_name);
+                output[..file_name.len()].copy_from_slice(file_name);
                 Ok((
                     nt_fs::FileRenameRoot::Directory(root_file_id),
-                    information.file_name.len(),
+                    file_name.len(),
                 ))
             }
             FileParseRoot::FatDirectory {
@@ -18932,16 +18930,17 @@ impl ExecNtHandler {
     fn resolve_hosted_set_file_name_target(
         &self,
         source: HostedFileRoute,
-        information: nt_fs::SetFileNameInformation<'_>,
+        root_directory: u64,
+        file_name: &[u8],
         open_name: &mut [u16],
     ) -> Result<HostedSetFileNameTarget, u32> {
         let mut name_units = [0u16; FILE_OBJECT_NAME_CAP];
-        let name_len = Self::decode_set_file_name_units(information.file_name, &mut name_units)?;
+        let name_len = Self::decode_set_file_name_units(file_name, &mut name_units)?;
         let name = &name_units[..name_len];
-        if information.root_directory == 0 && name.first() != Some(&(b'\\' as u16)) {
+        if root_directory == 0 && name.first() != Some(&(b'\\' as u16)) {
             return Ok(HostedSetFileNameTarget::SourceParent);
         }
-        let root = self.resolve_file_parse_root_for(information.root_directory, name)?;
+        let root = self.resolve_file_parse_root_for(root_directory, name)?;
         let mut namespace_path = [0u8; NAMED_OBJECT_PATH_CAP];
         let mut absolute_name = [0u16; FILE_OBJECT_NAME_CAP];
         let (root, name) = self.normalize_object_directory_file_name(
@@ -19926,17 +19925,17 @@ impl ExecNtHandler {
         (status, information)
     }
 
-    /// Execute the I/O Manager's internal target-parent open before a provider rename/link. The
-    /// source File reference and synchronous Busy lock are retained across either pending IRP; the
-    /// target File remains kernel-only and is released after the source SET reaches a terminal
-    /// result.
+    /// Execute the I/O Manager's internal target-parent open before a provider rename, link, or
+    /// move-cluster request. The source File reference and synchronous Busy lock are retained across
+    /// either pending IRP; the target File remains kernel-only and is released after the source SET
+    /// reaches a terminal result.
     unsafe fn service_hosted_set_file_name_with_open_parent(
         &mut self,
         handle: u64,
         iosb: u64,
         route: HostedFileRoute,
         information_class: u32,
-        replace_if_exists: bool,
+        control: nt_io_manager::SetInformationControl,
         target_name: &[u16],
         payload: Vec<u8>,
     ) -> (u32, u64) {
@@ -19994,7 +19993,7 @@ impl ExecNtHandler {
         let Some(mut transaction) = nt_io_manager::PendingSetFileName::awaiting_source_query(
             route.file_id,
             information_class,
-            replace_if_exists,
+            control,
             target_name_bytes,
             payload,
         ) else {
@@ -20139,7 +20138,7 @@ impl ExecNtHandler {
                 if (create_status as i32) < 0 {
                     terminal = Some((create_status, create_information));
                 } else if information_class == nt_fs::FILE_LINK_INFORMATION
-                    && !replace_if_exists
+                    && !control.replace_if_exists()
                     && create_information == nt_fs::FILE_EXISTS as u64
                 {
                     terminal = Some((nt_fs::STATUS_OBJECT_NAME_COLLISION, 0));
@@ -20163,7 +20162,7 @@ impl ExecNtHandler {
                         info_class: information_class,
                         length: set_information_len,
                         target_file: Some(nt_io_manager::FileId(target_file_id)),
-                        replace_if_exists,
+                        control,
                     };
                     match self.dispatch_hosted_file_set_information_for(
                         route,
@@ -32071,8 +32070,11 @@ impl ExecNtHandler {
                             Err(status) => status,
                             Ok(set_name) => {
                                 let mut target = [0u8; FILE_VOLUME_RELATIVE_CAP * 2];
-                                match self.resolve_local_set_file_name_target(set_name, &mut target)
-                                {
+                                match self.resolve_local_set_file_name_target(
+                                    set_name.root_directory,
+                                    set_name.file_name,
+                                    &mut target,
+                                ) {
                                     Err(status) => status,
                                     Ok((root, target_len)) => {
                                         let target = &target[..target_len];
@@ -32208,30 +32210,60 @@ impl ExecNtHandler {
                             return nt_fs::STATUS_INVALID_HANDLE;
                         };
                         let mut open_parent_name = [0u16; FILE_OBJECT_NAME_CAP];
-                        let target = if matches!(
-                            information_class,
-                            nt_fs::FILE_RENAME_INFORMATION | nt_fs::FILE_LINK_INFORMATION
-                        ) {
-                            match nt_fs::parse_set_file_name_information(&payload) {
-                                Err(status) => Err(status),
-                                Ok(set_name) => self
-                                    .resolve_hosted_set_file_name_target(
-                                        route,
-                                        set_name,
-                                        &mut open_parent_name,
-                                    )
-                                    .map(|target| (target, set_name.replace_if_exists)),
+                        let target = match information_class {
+                            nt_fs::FILE_RENAME_INFORMATION | nt_fs::FILE_LINK_INFORMATION => {
+                                match nt_fs::parse_set_file_name_information(&payload) {
+                                    Err(status) => Err(status),
+                                    Ok(set_name) => self
+                                        .resolve_hosted_set_file_name_target(
+                                            route,
+                                            set_name.root_directory,
+                                            set_name.file_name,
+                                            &mut open_parent_name,
+                                        )
+                                        .map(|target| {
+                                            (
+                                                target,
+                                                nt_io_manager::SetInformationControl::ReplaceIfExists(
+                                                    set_name.replace_if_exists,
+                                                ),
+                                            )
+                                        }),
+                                }
                             }
-                        } else {
-                            Ok((HostedSetFileNameTarget::SourceParent, false))
+                            nt_fs::FILE_MOVE_CLUSTER_INFORMATION => {
+                                match nt_fs::parse_move_cluster_information(&payload) {
+                                    Err(status) => Err(status),
+                                    Ok(move_cluster) => self
+                                        .resolve_hosted_set_file_name_target(
+                                            route,
+                                            move_cluster.root_directory,
+                                            move_cluster.file_name,
+                                            &mut open_parent_name,
+                                        )
+                                        .map(|target| {
+                                            (
+                                                target,
+                                                nt_io_manager::SetInformationControl::ClusterCount(
+                                                    move_cluster.cluster_count,
+                                                ),
+                                            )
+                                        }),
+                                }
+                            }
+                            _ => Ok((
+                                HostedSetFileNameTarget::SourceParent,
+                                nt_io_manager::SetInformationControl::None,
+                            )),
                         };
                         match target {
                             Err(status) => status,
-                            Ok((target, replace_if_exists)) => {
+                            Ok((target, control)) => {
                                 if matches!(
                                     information_class,
                                     nt_fs::FILE_RENAME_INFORMATION
                                         | nt_fs::FILE_LINK_INFORMATION
+                                        | nt_fs::FILE_MOVE_CLUSTER_INFORMATION
                                 ) {
                                     payload[8..16].fill(0);
                                 }
@@ -32242,7 +32274,7 @@ impl ExecNtHandler {
                                             iosb,
                                             route,
                                             information_class,
-                                            replace_if_exists,
+                                            control,
                                             &open_parent_name[..name_len],
                                             payload,
                                         );
@@ -32261,7 +32293,7 @@ impl ExecNtHandler {
                                         info_class: information_class,
                                         length: length as u32,
                                         target_file: target_file.map(nt_io_abi::FileId),
-                                        replace_if_exists,
+                                        control,
                                     };
                                     let (status, completed) = self.service_hosted_set_information(
                                         args[0],

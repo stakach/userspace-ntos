@@ -24,10 +24,24 @@ pub use wire::{
 };
 
 /// ABI version of this wire contract; bumped on any incompatible change.
-pub const IO_ABI_VERSION: u32 = 7;
+pub const IO_ABI_VERSION: u32 = 8;
 
-/// `IRP_MJ_SET_INFORMATION` carries `SL_REPLACE_IF_EXISTS` in this bit.
-pub const IRP_DISPATCH_SET_REPLACE_IF_EXISTS: u32 = 0x0000_0001;
+/// Validate the raw `IO_STACK_LOCATION.Parameters.SetFile` control union.
+/// `information_class` is the class carried in `IrpDispatchRequest::ioctl_code`.
+pub const fn valid_set_information_control(
+    major_function: u8,
+    information_class: u32,
+    value: u32,
+) -> bool {
+    if major_function != major::IRP_MJ_SET_INFORMATION {
+        return value == 0;
+    }
+    match information_class {
+        10 | 11 => value <= 1,
+        31 => true,
+        _ => value == 0,
+    }
+}
 
 /// Generation bits in an I/O id (spec §9: high 24 gen / low 40 slot).
 pub const IO_ID_GEN_BITS: u32 = 24;
@@ -172,6 +186,31 @@ mod tests {
     }
 
     #[test]
+    fn set_information_control_union_is_class_specific() {
+        assert!(valid_set_information_control(
+            major::IRP_MJ_SET_INFORMATION,
+            10,
+            1
+        ));
+        assert!(!valid_set_information_control(
+            major::IRP_MJ_SET_INFORMATION,
+            10,
+            2
+        ));
+        assert!(valid_set_information_control(
+            major::IRP_MJ_SET_INFORMATION,
+            31,
+            u32::MAX
+        ));
+        assert!(!valid_set_information_control(
+            major::IRP_MJ_SET_INFORMATION,
+            32,
+            1
+        ));
+        assert!(!valid_set_information_control(major::IRP_MJ_READ, 31, 1));
+    }
+
+    #[test]
     fn wire_roundtrips_through_bytes() {
         let req = IoOpenRequest {
             abi_size: core::mem::size_of::<IoOpenRequest>() as u16,
@@ -200,7 +239,7 @@ mod tests {
             file_id: 0x400,
             related_file_id: 0x500,
             target_file_id: 0x600,
-            set_information_flags: IRP_DISPATCH_SET_REPLACE_IF_EXISTS,
+            set_information_control: 0x1234,
             stack_location: 1,
             stack_count: 3,
             ..Default::default()

@@ -2504,6 +2504,12 @@ fn rename_information(path: &str, root_directory: u64, replace: bool) -> alloc::
     data
 }
 
+fn move_cluster_information(path: &str, root_directory: u64, clusters: u32) -> alloc::vec::Vec<u8> {
+    let mut data = rename_information(path, root_directory, false);
+    data[0..4].copy_from_slice(&clusters.to_le_bytes());
+    data
+}
+
 fn disposition_ex(flags: u32) -> [u8; 4] {
     flags.to_le_bytes()
 }
@@ -2532,6 +2538,52 @@ fn set_file_name_information_parser_validates_exact_name_extent() {
         parse_set_file_name_information(&oversized),
         Err(STATUS_INFO_LENGTH_MISMATCH)
     );
+}
+
+#[test]
+fn move_cluster_information_parser_preserves_count_and_target_layout() {
+    let data = move_cluster_information("target.bin", 0x8877, 0x1234);
+    let parsed = parse_move_cluster_information(&data).unwrap();
+    assert_eq!(parsed.cluster_count, 0x1234);
+    assert_eq!(parsed.root_directory, 0x8877);
+    assert_eq!(parsed.file_name, &data[20..]);
+
+    assert_eq!(
+        parse_move_cluster_information(&data[..19]),
+        Err(STATUS_INFO_LENGTH_MISMATCH)
+    );
+    let mut odd = data;
+    odd[16..20].copy_from_slice(&3u32.to_le_bytes());
+    assert_eq!(
+        parse_move_cluster_information(&odd),
+        Err(STATUS_INFO_LENGTH_MISMATCH)
+    );
+}
+
+#[test]
+fn memfs_rejects_unowned_optional_set_facilities_after_dispatch() {
+    let mut fs = FileSystem::new(MemFs::with_fixture());
+    let file = fs.zw_create_file(
+        SYSTEM_HIVE,
+        FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(file.status, STATUS_SUCCESS);
+    for (class, length) in [
+        (29, 72),
+        (FILE_MOVE_CLUSTER_INFORMATION, 24),
+        (32, 56),
+        (FILE_TRACKING_INFORMATION, 16),
+    ] {
+        assert_eq!(
+            fs.zw_set_information_file(file.handle, class, &alloc::vec![0; length]),
+            STATUS_INVALID_PARAMETER,
+            "class {class}"
+        );
+    }
 }
 
 #[test]

@@ -103,7 +103,7 @@ pub enum WdmIoStackParameters {
         length: u32,
         information_class: u32,
         target_file_object: u64,
-        replace_if_exists: bool,
+        control: crate::SetInformationControl,
     },
     DeviceControl {
         output_buffer_length: u32,
@@ -299,12 +299,12 @@ pub fn write_wdm_io_stack_location(
             length,
             information_class,
             target_file_object,
-            replace_if_exists,
+            control,
         } => {
             put_u32(bytes, 0x08, length);
             put_u32(bytes, 0x10, information_class);
             put_u64(bytes, 0x18, target_file_object);
-            put_u8(bytes, 0x20, u8::from(replace_if_exists));
+            put_u32(bytes, 0x20, control.wire_value());
         }
         WdmIoStackParameters::DeviceControl {
             output_buffer_length,

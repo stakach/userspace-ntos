@@ -23620,7 +23620,7 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                                         terminal_information = create_information;
                                     } else if transaction.information_class
                                         == nt_fs::FILE_LINK_INFORMATION
-                                        && !transaction.replace_if_exists
+                                        && !transaction.replace_if_exists()
                                         && create_information == nt_fs::FILE_EXISTS as u64
                                     {
                                         terminal_status = nt_fs::STATUS_OBJECT_NAME_COLLISION;
@@ -23639,8 +23639,7 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                                                     target_file: Some(nt_io_manager::FileId(
                                                         target_file_id,
                                                     )),
-                                                    replace_if_exists: transaction
-                                                        .replace_if_exists,
+                                                    control: transaction.control,
                                                 },
                                                 transaction.set_information(),
                                             ),
@@ -23718,7 +23717,7 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                         .take_for_update(transaction_id)
                         .expect("set-file-name target CREATE lost its captured owner");
                     if transaction.information_class == nt_fs::FILE_LINK_INFORMATION
-                        && !transaction.replace_if_exists
+                        && !transaction.replace_if_exists()
                         && terminal_information == nt_fs::FILE_EXISTS as u64
                     {
                         assert!(transaction
@@ -23763,7 +23762,7 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                                     target_file: Some(nt_io_manager::FileId(
                                         transaction.target_file_id,
                                     )),
-                                    replace_if_exists: transaction.replace_if_exists,
+                                    control: transaction.control,
                                 },
                                 transaction.set_information(),
                             );

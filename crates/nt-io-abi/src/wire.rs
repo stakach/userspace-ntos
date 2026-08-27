@@ -90,8 +90,10 @@ pub struct IrpDispatchRequest {
     pub minor: u8,
     pub _reserved0: u16,
     pub flags: u32,
-    /// Set-information flags; zero for every other major function.
-    pub set_information_flags: u32,
+    /// Raw `Parameters.SetFile` control union. For rename/link this is the
+    /// replace Boolean; for move-cluster it is the cluster count. Zero for
+    /// every other major function.
+    pub set_information_control: u32,
     pub target_domain_id: u64,
     pub target_domain_cookie: u64,
     pub provider_domain_id: u64,
@@ -102,7 +104,8 @@ pub struct IrpDispatchRequest {
     pub file_id: u64,
     /// Canonical parent File for a handle-relative CREATE, or zero.
     pub related_file_id: u64,
-    /// Canonical target-directory File for rename/link SET_INFORMATION, or zero.
+    /// Canonical target-directory File for rename/link/move-cluster
+    /// SET_INFORMATION, or zero.
     pub target_file_id: u64,
     pub buffer_id: u64,
     pub buffer_offset: u64,

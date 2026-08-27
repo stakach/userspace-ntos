@@ -96,8 +96,8 @@ pub use hosted_domain::{HostedDomainIdentity, HostedDomainRecord, HostedProvider
 pub use irp::{
     BufferAccess, CancelState, CreateParameters, DeviceControlParameters, InformationParameters,
     IoBufferRef, IoParameters, IoStackLocation, IrpCompletionOrigin, IrpRecord, IrpState,
-    PnpParameters, PnpStartParameters, ReadWriteParameters, SetInformationParameters, StackControl,
-    StackFlags,
+    PnpParameters, PnpStartParameters, ReadWriteParameters, SetInformationControl,
+    SetInformationParameters, StackControl, StackFlags,
 };
 pub use mock_driver::{IoctlBehavior, MockDriverBackend};
 pub use object_port::{MockObjectPort, ObjectManagerPort};
@@ -807,6 +807,12 @@ impl<P> IoManager<P> {
             if let Some(IoParameters::SetInformation(parameters)) =
                 record.current_stack().map(|stack| &stack.parameters)
             {
+                if !parameters.control.valid_for_class(parameters.info_class)
+                    || (parameters.target_file.is_some()
+                        && !matches!(parameters.info_class, 10 | 11 | 31))
+                {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                }
                 if !set_information_access_granted(file.desired_access, parameters.info_class) {
                     return Err(NtStatus::ACCESS_DENIED);
                 }
@@ -3561,7 +3567,7 @@ mod tests {
                     info_class: 10,
                     length: rename.len() as u32,
                     target_file: Some(target),
-                    replace_if_exists: true,
+                    control: SetInformationControl::ReplaceIfExists(true),
                 }),
                 rename.len() as u32,
                 0,
@@ -3637,7 +3643,7 @@ mod tests {
                     info_class: 10,
                     length: 24,
                     target_file: Some(target_file),
-                    replace_if_exists: false,
+                    control: SetInformationControl::ReplaceIfExists(false),
                 }),
             )
             .unwrap()
@@ -5223,10 +5229,14 @@ mod tests {
     }
 
     #[test]
-    fn peer_set_information_wire_carries_canonical_target_and_flags() {
+    fn peer_set_information_wire_carries_canonical_target_and_control_union() {
         let control = MockPeerControl::new();
-        let (mut om, client, handle, _) =
-            peer_device(&control, AccessMask::GENERIC_READ | AccessMask::DELETE);
+        let (mut om, client, handle, _) = peer_device(
+            &control,
+            AccessMask::GENERIC_READ
+                | AccessMask::DELETE
+                | AccessMask::from_bits_retain(0x0000_0002),
+        );
         let (source, device, _) = om
             .reference_open_file_details(client, handle, AccessMask::GENERIC_READ)
             .unwrap();
@@ -5310,7 +5320,7 @@ mod tests {
                     info_class: 10,
                     length: rename.len() as u32,
                     target_file: Some(target),
-                    replace_if_exists: true,
+                    control: SetInformationControl::ReplaceIfExists(true),
                 }),
                 rename.len() as u32,
                 0,
@@ -5328,12 +5338,39 @@ mod tests {
         assert_eq!(request.input_len, rename.len() as u32);
         assert_eq!(request.output_len, 0);
         assert_eq!(request.target_file_id, target.raw());
-        assert_eq!(
-            request.set_information_flags,
-            nt_io_abi::IRP_DISPATCH_SET_REPLACE_IF_EXISTS
-        );
+        assert_eq!(request.set_information_control, 1);
         assert_eq!(om.file(source).unwrap().outstanding_irp_refs, 0);
         assert_eq!(om.file(target).unwrap().outstanding_irp_refs, 0);
+
+        let mut move_cluster = [0u8; 24];
+        assert_eq!(
+            om.build_and_dispatch_external_to_device(
+                client,
+                device,
+                Some(source),
+                0,
+                18,
+                major::IRP_MJ_SET_INFORMATION,
+                IoParameters::SetInformation(SetInformationParameters {
+                    info_class: 31,
+                    length: move_cluster.len() as u32,
+                    target_file: Some(target),
+                    control: SetInformationControl::ClusterCount(0x1234),
+                }),
+                move_cluster.len() as u32,
+                0,
+                &mut move_cluster,
+            ),
+            Ok(ExternalDispatchResult::Completed {
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: None,
+            })
+        );
+        let request = control.last_request().unwrap();
+        assert_eq!(request.ioctl_code, 31);
+        assert_eq!(request.target_file_id, target.raw());
+        assert_eq!(request.set_information_control, 0x1234);
     }
 
     #[test]
@@ -5767,7 +5804,7 @@ mod tests {
                     length: 0x30,
                     information_class: 10,
                     target_file_object: 0x7777,
-                    replace_if_exists: true,
+                    control: SetInformationControl::ReplaceIfExists(true),
                 },
             },
         )
@@ -5779,6 +5816,26 @@ mod tests {
         assert_eq!(stack[0x20], 1);
         assert_eq!(le_u64(&stack, 0x28), 0x4444);
         assert_eq!(le_u64(&stack, 0x30), 0x5555);
+
+        write_wdm_io_stack_location(
+            &mut stack,
+            WdmIoStackLocationInit {
+                major: major::IRP_MJ_SET_INFORMATION,
+                minor: 0,
+                flags: 0,
+                control: 0,
+                device_object: 0x4444,
+                file_object: 0x5555,
+                parameters: WdmIoStackParameters::SetInformation {
+                    length: 0x30,
+                    information_class: 31,
+                    target_file_object: 0x7777,
+                    control: SetInformationControl::ClusterCount(0x1234_5678),
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(le_u32(&stack, 0x20), 0x1234_5678);
 
         write_wdm_io_stack_location(
             &mut stack,

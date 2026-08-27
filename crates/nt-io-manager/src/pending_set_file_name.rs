@@ -6,6 +6,8 @@
 
 use alloc::vec::Vec;
 
+use crate::SetInformationControl;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PendingSetFileNamePhase {
     SourceQuery,
@@ -19,7 +21,7 @@ pub struct PendingSetFileName {
     pub source_file_id: u64,
     pub target_file_id: u64,
     pub information_class: u32,
-    pub replace_if_exists: bool,
+    pub control: SetInformationControl,
     phase: PendingSetFileNamePhase,
     terminal_status: u32,
     terminal_information: u64,
@@ -32,12 +34,14 @@ impl PendingSetFileName {
         source_file_id: u64,
         target_file_id: u64,
         information_class: u32,
+        control: SetInformationControl,
         target_name: &[u8],
         set_information: &[u8],
     ) -> bool {
         source_file_id != 0
             && (target_file_id == 0 || source_file_id != target_file_id)
-            && matches!(information_class, 10 | 11)
+            && matches!(information_class, 10 | 11 | 31)
+            && control.valid_for_class(information_class)
             && !target_name.is_empty()
             && target_name.len() & 1 == 0
             && !set_information.is_empty()
@@ -47,7 +51,7 @@ impl PendingSetFileName {
         source_file_id: u64,
         target_file_id: u64,
         information_class: u32,
-        replace_if_exists: bool,
+        control: SetInformationControl,
         target_name: Vec<u8>,
         set_information: Vec<u8>,
     ) -> Option<Self> {
@@ -56,6 +60,7 @@ impl PendingSetFileName {
                 source_file_id,
                 target_file_id,
                 information_class,
+                control,
                 &target_name,
                 &set_information,
             ))
@@ -63,7 +68,7 @@ impl PendingSetFileName {
             source_file_id,
             target_file_id,
             information_class,
-            replace_if_exists,
+            control,
             phase: PendingSetFileNamePhase::TargetCreate,
             terminal_status: nt_status::NtStatus::PENDING.raw() as u32,
             terminal_information: 0,
@@ -75,7 +80,7 @@ impl PendingSetFileName {
     pub fn awaiting_source_query(
         source_file_id: u64,
         information_class: u32,
-        replace_if_exists: bool,
+        control: SetInformationControl,
         target_name: Vec<u8>,
         set_information: Vec<u8>,
     ) -> Option<Self> {
@@ -83,6 +88,7 @@ impl PendingSetFileName {
             source_file_id,
             0,
             information_class,
+            control,
             &target_name,
             &set_information,
         )
@@ -90,7 +96,7 @@ impl PendingSetFileName {
             source_file_id,
             target_file_id: 0,
             information_class,
-            replace_if_exists,
+            control,
             phase: PendingSetFileNamePhase::SourceQuery,
             terminal_status: nt_status::NtStatus::PENDING.raw() as u32,
             terminal_information: 0,
@@ -109,6 +115,10 @@ impl PendingSetFileName {
 
     pub fn set_information(&self) -> &[u8] {
         &self.set_information
+    }
+
+    pub const fn replace_if_exists(&self) -> bool {
+        self.control.replace_if_exists()
     }
 
     pub fn terminal_result(&self) -> Option<(u32, u64)> {
@@ -357,7 +367,15 @@ mod tests {
     use super::*;
 
     fn record(source: u64, target: u64) -> PendingSetFileName {
-        PendingSetFileName::new(source, target, 10, true, vec![b'x', 0], vec![0; 24]).unwrap()
+        PendingSetFileName::new(
+            source,
+            target,
+            10,
+            SetInformationControl::ReplaceIfExists(true),
+            vec![b'x', 0],
+            vec![0; 24],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -395,10 +413,29 @@ mod tests {
 
     #[test]
     fn invalid_records_and_reservation_replays_fail_closed() {
-        assert!(PendingSetFileName::new(0, 2, 10, false, vec![1, 0], vec![0; 24]).is_none());
-        assert!(PendingSetFileName::new(2, 2, 10, false, vec![1, 0], vec![0; 24]).is_none());
-        assert!(PendingSetFileName::new(1, 2, 12, false, vec![1, 0], vec![0; 24]).is_none());
-        assert!(PendingSetFileName::new(1, 2, 10, false, vec![1], vec![0; 24]).is_none());
+        let rename = SetInformationControl::ReplaceIfExists(false);
+        assert!(PendingSetFileName::new(0, 2, 10, rename, vec![1, 0], vec![0; 24]).is_none());
+        assert!(PendingSetFileName::new(2, 2, 10, rename, vec![1, 0], vec![0; 24]).is_none());
+        assert!(PendingSetFileName::new(1, 2, 12, rename, vec![1, 0], vec![0; 24]).is_none());
+        assert!(PendingSetFileName::new(1, 2, 10, rename, vec![1], vec![0; 24]).is_none());
+        assert!(PendingSetFileName::new(
+            1,
+            2,
+            31,
+            SetInformationControl::ReplaceIfExists(false),
+            vec![1, 0],
+            vec![0; 24],
+        )
+        .is_none());
+        assert!(PendingSetFileName::new(
+            1,
+            2,
+            31,
+            SetInformationControl::ClusterCount(7),
+            vec![1, 0],
+            vec![0; 24],
+        )
+        .is_some());
 
         let mut table = PendingSetFileNameTable::new();
         let reservation = table.reserve().unwrap();
@@ -419,9 +456,14 @@ mod tests {
         assert!(pending.advance_to_source_set());
         assert!(!pending.complete_inline(0, 0));
 
-        let mut query =
-            PendingSetFileName::awaiting_source_query(5, 11, false, vec![b'y', 0], vec![0; 24])
-                .unwrap();
+        let mut query = PendingSetFileName::awaiting_source_query(
+            5,
+            11,
+            SetInformationControl::ReplaceIfExists(false),
+            vec![b'y', 0],
+            vec![0; 24],
+        )
+        .unwrap();
         assert_eq!(query.phase(), PendingSetFileNamePhase::SourceQuery);
         assert_eq!(query.target_file_id, 0);
         assert!(!query.advance_to_target_create(5));

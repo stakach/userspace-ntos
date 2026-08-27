@@ -3804,6 +3804,16 @@ pub struct SetFileNameInformation<'a> {
     pub file_name: &'a [u8],
 }
 
+/// Validated x64 `FILE_MOVE_CLUSTER_INFORMATION` payload. The target fields
+/// deliberately share the rename/link layout, while the first union member is
+/// a cluster count rather than a Boolean.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MoveClusterInformation<'a> {
+    pub cluster_count: u32,
+    pub root_directory: u64,
+    pub file_name: &'a [u8],
+}
+
 /// Parse and validate the variable-length `FILE_NAME_INFORMATION` payload used by
 /// `FileShortNameInformation`. An empty name removes the entry's existing alias.
 pub fn parse_short_name_information(data: &[u8]) -> Result<FileShortName, u32> {
@@ -3881,6 +3891,23 @@ pub fn parse_set_file_name_information(data: &[u8]) -> Result<SetFileNameInforma
     }
     Ok(SetFileNameInformation {
         replace_if_exists: data[0] != 0,
+        root_directory: u64::from_le_bytes(data[8..16].try_into().unwrap()),
+        file_name: &data[20..20 + name_len],
+    })
+}
+
+/// Parse the x64 move-cluster structure without interpreting its caller-owned
+/// `RootDirectory` handle.
+pub fn parse_move_cluster_information(data: &[u8]) -> Result<MoveClusterInformation<'_>, u32> {
+    if data.len() < 20 {
+        return Err(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    let name_len = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
+    if name_len == 0 || name_len & 1 != 0 || data.len().saturating_sub(20) < name_len {
+        return Err(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    Ok(MoveClusterInformation {
+        cluster_count: u32::from_le_bytes(data[0..4].try_into().unwrap()),
         root_directory: u64::from_le_bytes(data[8..16].try_into().unwrap()),
         file_name: &data[20..20 + name_len],
     })
@@ -4948,6 +4975,13 @@ impl FileSystem {
                         replace_if_exists,
                     )
                 }
+            }
+            // These are valid native classes, but MemFs has no object-ID
+            // namespace, physical cluster allocator, quota ledger, or link
+            // tracking service. The request reached the filesystem, so report
+            // an unsupported filesystem facility rather than an invalid class.
+            29 | FILE_MOVE_CLUSTER_INFORMATION | 32 | FILE_TRACKING_INFORMATION => {
+                STATUS_INVALID_PARAMETER
             }
             _ => STATUS_INVALID_INFO_CLASS,
         }

@@ -78,15 +78,47 @@ pub struct InformationParameters {
 
 /// `IRP_MJ_SET_INFORMATION` parameters.
 ///
-/// Rename/link requests may retain a second canonical File representing the
-/// target directory. This is the I/O Manager identity behind the WDM
-/// `Parameters.SetFile.FileObject`; it is never a caller handle or pointer.
+/// Rename, link, and move-cluster requests may retain a second canonical File
+/// representing the target directory. This is the I/O Manager identity behind
+/// the WDM `Parameters.SetFile.FileObject`; it is never a caller handle or
+/// pointer.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum SetInformationControl {
+    #[default]
+    None,
+    ReplaceIfExists(bool),
+    ClusterCount(u32),
+}
+
+impl SetInformationControl {
+    pub const fn valid_for_class(self, info_class: u32) -> bool {
+        match (info_class, self) {
+            (10 | 11, Self::ReplaceIfExists(_)) | (31, Self::ClusterCount(_)) => true,
+            (10 | 11 | 31, _) => false,
+            (_, Self::None) => true,
+            _ => false,
+        }
+    }
+
+    pub const fn wire_value(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::ReplaceIfExists(value) => value as u32,
+            Self::ClusterCount(value) => value,
+        }
+    }
+
+    pub const fn replace_if_exists(self) -> bool {
+        matches!(self, Self::ReplaceIfExists(true))
+    }
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub struct SetInformationParameters {
     pub info_class: u32,
     pub length: u32,
     pub target_file: Option<FileId>,
-    pub replace_if_exists: bool,
+    pub control: SetInformationControl,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
