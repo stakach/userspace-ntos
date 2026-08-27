@@ -2006,6 +2006,12 @@ pub(crate) unsafe fn retain(file_id: u64) -> Result<(), u32> {
     }
 }
 
+pub(crate) unsafe fn is_final_reference(file_id: u64) -> Result<bool, u32> {
+    writable_fs()
+        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
+        .zw_is_final_reference(file_id)
+}
+
 /// `NtClose` on a writable-volume file object (honours a pending delete).
 pub(crate) unsafe fn close(file_id: u64) {
     if let Some(fs) = writable_fs() {

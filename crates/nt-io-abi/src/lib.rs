@@ -24,7 +24,7 @@ pub use wire::{
 };
 
 /// ABI version of this wire contract; bumped on any incompatible change.
-pub const IO_ABI_VERSION: u32 = 11;
+pub const IO_ABI_VERSION: u32 = 12;
 
 /// Validate native byte-range lock parameters. Other major functions must not carry lock state.
 pub const fn valid_lock_control_parameters(
@@ -43,6 +43,11 @@ pub const fn valid_lock_control_parameters(
         2 => stack_flags == 0,
         _ => false,
     }
+}
+
+pub const fn valid_read_write_parameters(major_function: u8, byte_offset: u64, key: u32) -> bool {
+    matches!(major_function, major::IRP_MJ_READ | major::IRP_MJ_WRITE)
+        || (byte_offset == 0 && key == 0)
 }
 
 /// Validate the raw `IO_STACK_LOCATION.Parameters.SetFile` control union.
@@ -373,6 +378,26 @@ mod tests {
             0,
             1,
             0,
+            0,
+        ));
+    }
+
+    #[test]
+    fn read_write_parameters_are_major_specific() {
+        assert!(valid_read_write_parameters(
+            major::IRP_MJ_READ,
+            0x1234_5678_9abc_def0,
+            7,
+        ));
+        assert!(valid_read_write_parameters(
+            major::IRP_MJ_WRITE,
+            u64::MAX,
+            u32::MAX,
+        ));
+        assert!(valid_read_write_parameters(major::IRP_MJ_CLOSE, 0, 0));
+        assert!(!valid_read_write_parameters(
+            major::IRP_MJ_LOCK_CONTROL,
+            1,
             0,
         ));
     }

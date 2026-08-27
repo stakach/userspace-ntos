@@ -14,8 +14,8 @@ use core::cell::RefCell;
 
 use nt_io_abi::{
     ioctl, major, valid_ea_parameters, valid_lock_control_parameters, valid_quota_parameters,
-    valid_set_information_control, valid_volume_information_parameters, IrpDispatchRequest,
-    IO_ABI_VERSION,
+    valid_read_write_parameters, valid_set_information_control,
+    valid_volume_information_parameters, IrpDispatchRequest, IO_ABI_VERSION,
 };
 use nt_status::NtStatus;
 
@@ -144,6 +144,8 @@ fn build_dispatch_request(
             0,
             0,
         ),
+        crate::irp::IoParameters::Read(p) => (0, 0, p.length, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        crate::irp::IoParameters::Write(p) => (0, p.length, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
         crate::irp::IoParameters::QueryInformation(p) => {
             (p.info_class, 0, p.length, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
         }
@@ -239,12 +241,15 @@ fn build_dispatch_request(
         _ => (0, 0),
     };
     let (lock_byte_offset, lock_length, lock_key) = match &irp.parameters {
-        crate::irp::IoParameters::LockControl(parameters) => (
-            parameters.byte_offset,
-            parameters.length,
-            parameters.key,
-        ),
+        crate::irp::IoParameters::LockControl(parameters) => {
+            (parameters.byte_offset, parameters.length, parameters.key)
+        }
         _ => (0, 0, 0),
+    };
+    let (read_write_byte_offset, read_write_key) = match &irp.parameters {
+        crate::irp::IoParameters::Read(parameters)
+        | crate::irp::IoParameters::Write(parameters) => (parameters.offset, parameters.key),
+        _ => (0, 0),
     };
     if matches!(&irp.parameters, crate::irp::IoParameters::LockControl(parameters) if parameters.minor != irp.minor)
     {
@@ -310,6 +315,9 @@ fn build_dispatch_request(
         lock_length,
         lock_key,
         _reserved1: 0,
+        read_write_byte_offset,
+        read_write_key,
+        _reserved2: 0,
     })
 }
 
@@ -499,6 +507,11 @@ impl DriverPeerTransport for MockDriverPeer {
                 request.lock_byte_offset,
                 request.lock_length,
                 request.lock_key,
+            )
+            || !valid_read_write_parameters(
+                request.major,
+                request.read_write_byte_offset,
+                request.read_write_key,
             )
             || (request.major != major::IRP_MJ_SET_INFORMATION
                 && (request.target_file_id != 0 || request.set_information_control != 0))

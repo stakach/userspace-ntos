@@ -2367,6 +2367,21 @@ struct LocalFileQueryState {
     alternate_name: Option<nt_fs::FileShortName>,
 }
 
+#[derive(Clone, Copy)]
+struct LocalByteLockRoute {
+    file_id: u64,
+    file_object: u64,
+    synchronous: bool,
+    alertable: bool,
+}
+
+const LOCAL_FAT_FILE_OBJECT_TAG: u64 = 0x1000_0000_0000_0000;
+const LOCAL_OVERLAY_FILE_OBJECT_TAG: u64 = 0x2000_0000_0000_0000;
+const LOCAL_FAT_FILE_ID_TAG: u64 = 0x3000_0000_0000_0000;
+const LOCAL_OVERLAY_FILE_ID_TAG: u64 = 0x4000_0000_0000_0000;
+const LOCAL_BYTE_LOCK_IRP_TAG: u64 = 0x8000_0000_0000_0000;
+const LOCAL_ID_PAYLOAD_MASK: u64 = 0x0fff_ffff_ffff_ffff;
+
 fn seed_time_zone(
     hives: &nt_hive_core::MutableHiveSet,
 ) -> nt_kernel_exec::timezone::TimeZoneInformation {
@@ -2990,6 +3005,8 @@ impl ExecNtHandler {
         write_field!(file_completion, ExecFileCompletion::reset());
         write_field!(directory_opens, ExecDirectoryOpens::reset());
         write_field!(readonly_file_opens, ExecReadOnlyFileOpens::reset());
+        write_field!(byte_range_locks, nt_fs::ByteRangeLockTable::new());
+        write_field!(next_local_byte_lock_irp, 1);
         write_field!(pi, 0);
         write_field!(current_tid, 0);
         write_field!(current_badge, 0);
@@ -11813,13 +11830,23 @@ impl ExecNtHandler {
         (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
             .abandon_thread_transfers_with(tid, |pending| transfers.push(pending));
         for pending in transfers.iter().copied() {
-            let _ = driver_launch::cancel_irp_if_pending(pending.irp_id);
+            match pending.operation {
+                nt_io_manager::PendingFileIoOperation::LocalByteLock(operation) => {
+                    if let Some(wait_id) = nt_fs::ByteRangeWaitId::from_raw(operation.wait_id) {
+                        let _ = self.byte_range_locks.cancel_wait(wait_id);
+                    }
+                }
+                _ => {
+                    let _ = driver_launch::cancel_irp_if_pending(pending.irp_id);
+                }
+            }
             if pending.reply_cap != 0 {
                 release_reply_pool_cap(pending.reply_cap);
             }
             thread_wait_state_clear_badge_ready(self, pending.badge);
         }
         if !transfers.is_empty() {
+            self.publish_local_byte_lock_completions();
             crate::service_sec_image::FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
         }
 
@@ -11913,7 +11940,32 @@ impl ExecNtHandler {
         };
         let mut matched = 0usize;
         let mut terminal = 0usize;
-        if let Some(file_id) = file_id {
+        let local_route = if file_id.is_none() {
+            self.local_byte_lock_route_for(file_handle).ok().flatten()
+        } else {
+            None
+        };
+        if let Some(route) = local_route {
+            let waits: alloc::vec::Vec<_> = (&*core::ptr::addr_of!(PENDING_FILE_IO))
+                .drain_all()
+                .filter_map(|(_, pending)| {
+                    if pending.file_id != route.file_object || pending.tid != self.current_tid {
+                        return None;
+                    }
+                    match pending.operation {
+                        nt_io_manager::PendingFileIoOperation::LocalByteLock(operation) => {
+                            nt_fs::ByteRangeWaitId::from_raw(operation.wait_id)
+                        }
+                        _ => None,
+                    }
+                })
+                .collect();
+            matched = waits.len();
+            for wait_id in waits {
+                terminal += self.byte_range_locks.cancel_wait(wait_id) as usize;
+            }
+            self.publish_local_byte_lock_completions();
+        } else if let Some(file_id) = file_id {
             let initial = driver_launch::file_thread_io_drain_state(file_id, self.current_tid);
             matched = initial.total;
             terminal = initial.terminal_unacknowledged;
@@ -11990,7 +12042,11 @@ impl ExecNtHandler {
             print_str(b" handle=0x");
             print_hex(file_handle as u32);
             print_str(b" fid=0x");
-            print_hex(file_id.unwrap_or(0) as u32);
+            print_hex(
+                file_id
+                    .or(local_route.map(|route| route.file_object))
+                    .unwrap_or(0) as u32,
+            );
             print_str(b" cancelled=");
             print_u64(cancelled as u64);
             print_str(b" terminal=");
@@ -12004,6 +12060,384 @@ impl ExecNtHandler {
         } else {
             0
         }
+    }
+
+    unsafe fn nt_lock_file_service(&mut self, args: &[u64]) -> u32 {
+        const STATUS_PENDING: u32 = 0x0000_0103;
+        let handle = args[0];
+        let event = args[1];
+        let apc_routine = args[2];
+        let apc_context = args[3];
+        let iosb = args[4];
+        let mut offset_bytes = [0u8; 8];
+        let mut length_bytes = [0u8; 8];
+        if iosb == 0
+            || !self.probe_user_output(iosb, 16)
+            || args[5] == 0
+            || !self.xas_read(args[5], &mut offset_bytes)
+            || args[6] == 0
+            || !self.xas_read(args[6], &mut length_bytes)
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let byte_offset = u64::from_le_bytes(offset_bytes);
+        let length = u64::from_le_bytes(length_bytes);
+        let key = nt_ulong_arg(args[7]);
+        let fail_immediately = nt_boolean_arg(args[8]);
+        let exclusive = nt_boolean_arg(args[9]);
+        let pid = match self.pm_pid_for_pi(self.pi) {
+            Some(pid) => pid,
+            None => return nt_fs::STATUS_INVALID_HANDLE,
+        };
+        let local_route = match self.local_byte_lock_route_for(handle) {
+            Ok(route) => route,
+            Err(status) => return status,
+        };
+        let hosted_route = if local_route.is_none() {
+            match self.hosted_file_route_for(handle) {
+                Some(route) => Some(route),
+                None => return nt_fs::STATUS_INVALID_HANDLE,
+            }
+        } else {
+            None
+        };
+        if hosted_route.is_some_and(|route| {
+            apc_routine != 0 && self.file_completion.binding(route.file_id).is_some()
+        }) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let hosted_access = if hosted_route.is_some() {
+            match self.hosted_file_access_for(handle) {
+                Some(access)
+                    if access
+                        & (0x0000_0001 | 0x0000_0002 | 0x8000_0000 | 0x4000_0000 | 0x1000_0000)
+                        != 0 =>
+                {
+                    access
+                }
+                Some(_) => return STATUS_ACCESS_DENIED,
+                None => return nt_fs::STATUS_INVALID_HANDLE,
+            }
+        } else {
+            0
+        };
+        let event_obj_idx = match self.prepare_lock_event_for_request(event) {
+            Ok(index) => index.map_or(u64::MAX, |index| index as u64),
+            Err(status) => return status,
+        };
+        let completion_port_suppressed =
+            nt_io_completion::io_event_suppresses_completion_port(event);
+        let synchronous = local_route
+            .map(|route| route.synchronous)
+            .unwrap_or_else(|| {
+                self.file_completion
+                    .is_synchronous(hosted_route.unwrap().file_id)
+                    .unwrap_or(true)
+            });
+        if !self.reserve_pending_file_io_owner()
+            || (synchronous
+                && (REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free()))
+        {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        if let Some(route) = local_route {
+            let request_id = self.allocate_local_byte_lock_irp_id();
+            let request = nt_fs::ByteRangeLockRequest::new(
+                route.file_id,
+                nt_fs::ByteRangeLockOwner::new(route.file_object, pid as u64, key),
+                byte_offset,
+                length,
+                exclusive,
+            );
+            match self
+                .byte_range_locks
+                .lock(request, fail_immediately, request_id)
+            {
+                nt_fs::ByteRangeLockResult::Granted => {
+                    self.complete_terminal_file_io(
+                        0,
+                        event_obj_idx,
+                        self.current_tid,
+                        apc_routine,
+                        apc_context,
+                        iosb,
+                        nt_fs::STATUS_SUCCESS,
+                        0,
+                        true,
+                        completion_port_suppressed,
+                    );
+                    nt_fs::STATUS_SUCCESS
+                }
+                nt_fs::ByteRangeLockResult::Failed(status) => {
+                    self.complete_terminal_file_io(
+                        0,
+                        event_obj_idx,
+                        self.current_tid,
+                        apc_routine,
+                        apc_context,
+                        iosb,
+                        status,
+                        0,
+                        true,
+                        completion_port_suppressed,
+                    );
+                    status
+                }
+                nt_fs::ByteRangeLockResult::Pending(wait_id) => {
+                    self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
+                        file_id: route.file_object,
+                        irp_id: request_id,
+                        major: major::IRP_MJ_LOCK_CONTROL,
+                        control_code: 0,
+                        operation: nt_io_manager::PendingFileIoOperation::LocalByteLock(
+                            nt_io_manager::PendingLocalByteLock {
+                                wait_id: wait_id.raw(),
+                                status: STATUS_PENDING,
+                                alertable: route.alertable,
+                            },
+                        ),
+                        delivery_state: 0,
+                        pi: self.pi as u32,
+                        tid: self.current_tid,
+                        sync_lock_owner_tid: 0,
+                        badge: self.current_badge,
+                        consumer_abandoned: false,
+                        user_apc_interrupt_requested: false,
+                        output_va: 0,
+                        output_len: 0,
+                        output_offset: 0,
+                        iosb_va: iosb,
+                        apc_routine,
+                        apc_context,
+                        completion_port_suppressed,
+                        signal_file: false,
+                        publish_iocp: false,
+                        event_obj_idx,
+                        reply_cap: 0,
+                        reply_required: false,
+                        native_call_transport: false,
+                        reply_mrs: [0; 18],
+                        resume_ip: 0,
+                        resume_sp: 0,
+                        resume_flags: 0,
+                    });
+                    self.pending_file_io_wait = synchronous;
+                    STATUS_PENDING
+                }
+            }
+        } else {
+            let route = hosted_route.unwrap();
+            match self.prepare_hosted_file_io(route, handle, hosted_access) {
+                Ok(true) => {}
+                Ok(false) => return STATUS_PENDING,
+                Err(status) => return status,
+            }
+            if let Err(status) = self.file_completion.set_signaled(route.file_id, false) {
+                self.release_file_reference(route.file_id);
+                return status;
+            }
+            let mut flags = nt_io_manager::StackFlags::empty();
+            if fail_immediately {
+                flags |=
+                    nt_io_manager::StackFlags::from_bits_retain(nt_io_manager::SL_FAIL_IMMEDIATELY);
+            }
+            if exclusive {
+                flags |=
+                    nt_io_manager::StackFlags::from_bits_retain(nt_io_manager::SL_EXCLUSIVE_LOCK);
+            }
+            let (mut status, information, pending_irp_id) =
+                match driver_launch::dispatch_hosted_file_lock_control_irp_result_exact(
+                    route.file_id,
+                    self.current_tid,
+                    nt_io_manager::LockControlParameters {
+                        minor: nt_io_manager::IRP_MN_LOCK,
+                        byte_offset,
+                        length,
+                        key,
+                    },
+                    flags,
+                ) {
+                    Ok((status, information, irp, _)) => {
+                        (status as u32, information, irp.map_or(0, |irp| irp.raw()))
+                    }
+                    Err(status) => (status, 0, 0),
+                };
+            if status == STATUS_PENDING && pending_irp_id == 0 {
+                status = STATUS_INSUFFICIENT_RESOURCES;
+            }
+            if status == STATUS_PENDING {
+                self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
+                    file_id: route.file_id,
+                    irp_id: pending_irp_id,
+                    major: major::IRP_MJ_LOCK_CONTROL,
+                    control_code: 0,
+                    operation: nt_io_manager::PendingFileIoOperation::Transfer,
+                    delivery_state: 0,
+                    pi: self.pi as u32,
+                    tid: self.current_tid,
+                    sync_lock_owner_tid: 0,
+                    badge: self.current_badge,
+                    consumer_abandoned: false,
+                    user_apc_interrupt_requested: false,
+                    output_va: 0,
+                    output_len: 0,
+                    output_offset: 0,
+                    iosb_va: iosb,
+                    apc_routine,
+                    apc_context,
+                    completion_port_suppressed,
+                    signal_file: synchronous || event_obj_idx == u64::MAX,
+                    publish_iocp: apc_routine == 0,
+                    event_obj_idx,
+                    reply_cap: 0,
+                    reply_required: false,
+                    native_call_transport: false,
+                    reply_mrs: [0; 18],
+                    resume_ip: 0,
+                    resume_sp: 0,
+                    resume_flags: 0,
+                });
+                self.pending_file_io_wait = synchronous;
+            } else {
+                self.complete_terminal_file_io(
+                    route.file_id,
+                    event_obj_idx,
+                    self.current_tid,
+                    apc_routine,
+                    apc_context,
+                    iosb,
+                    status,
+                    information,
+                    true,
+                    completion_port_suppressed,
+                );
+                self.release_file_reference(route.file_id);
+            }
+            status
+        }
+    }
+
+    unsafe fn nt_unlock_file_service(&mut self, args: &[u64]) -> u32 {
+        const STATUS_PENDING: u32 = 0x0000_0103;
+        let handle = args[0];
+        let iosb = args[1];
+        let mut offset_bytes = [0u8; 8];
+        let mut length_bytes = [0u8; 8];
+        if iosb == 0
+            || !self.probe_user_output(iosb, 16)
+            || args[2] == 0
+            || !self.xas_read(args[2], &mut offset_bytes)
+            || args[3] == 0
+            || !self.xas_read(args[3], &mut length_bytes)
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let byte_offset = u64::from_le_bytes(offset_bytes);
+        let length = u64::from_le_bytes(length_bytes);
+        let key = nt_ulong_arg(args[4]);
+        let pid = match self.pm_pid_for_pi(self.pi) {
+            Some(pid) => pid,
+            None => return nt_fs::STATUS_INVALID_HANDLE,
+        };
+        let local_route = match self.local_byte_lock_route_for(handle) {
+            Ok(route) => route,
+            Err(status) => return status,
+        };
+        if let Some(route) = local_route {
+            let status = self
+                .byte_range_locks
+                .unlock_single(nt_fs::ByteRangeLockRequest::new(
+                    route.file_id,
+                    nt_fs::ByteRangeLockOwner::new(route.file_object, pid as u64, key),
+                    byte_offset,
+                    length,
+                    true,
+                ));
+            self.write_current_iosb(iosb, status, 0);
+            self.publish_local_byte_lock_completions();
+            return status;
+        }
+
+        let route = match self.hosted_file_route_for(handle) {
+            Some(route) => route,
+            None => return nt_fs::STATUS_INVALID_HANDLE,
+        };
+        if !self.reserve_pending_file_io_owner()
+            || REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
+            || !wait_reply_pool_has_free()
+        {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        let access = self.hosted_file_access_for(handle).unwrap();
+        match self.prepare_hosted_file_io(route, handle, access) {
+            Ok(true) => {}
+            Ok(false) => return STATUS_PENDING,
+            Err(status) => return status,
+        }
+        if let Err(status) = self.file_completion.set_signaled(route.file_id, false) {
+            self.release_file_reference(route.file_id);
+            return status;
+        }
+        let (mut status, information, pending_irp_id) =
+            match driver_launch::dispatch_hosted_file_lock_control_irp_result_exact(
+                route.file_id,
+                self.current_tid,
+                nt_io_manager::LockControlParameters {
+                    minor: nt_io_manager::IRP_MN_UNLOCK_SINGLE,
+                    byte_offset,
+                    length,
+                    key,
+                },
+                nt_io_manager::StackFlags::empty(),
+            ) {
+                Ok((status, information, irp, _)) => {
+                    (status as u32, information, irp.map_or(0, |irp| irp.raw()))
+                }
+                Err(status) => (status, 0, 0),
+            };
+        if status == STATUS_PENDING && pending_irp_id == 0 {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+        }
+        if status == STATUS_PENDING {
+            self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
+                file_id: route.file_id,
+                irp_id: pending_irp_id,
+                major: major::IRP_MJ_LOCK_CONTROL,
+                control_code: 0,
+                operation: nt_io_manager::PendingFileIoOperation::Transfer,
+                delivery_state: 0,
+                pi: self.pi as u32,
+                tid: self.current_tid,
+                sync_lock_owner_tid: 0,
+                badge: self.current_badge,
+                consumer_abandoned: false,
+                user_apc_interrupt_requested: false,
+                output_va: 0,
+                output_len: 0,
+                output_offset: 0,
+                iosb_va: iosb,
+                apc_routine: 0,
+                apc_context: 0,
+                completion_port_suppressed: true,
+                signal_file: true,
+                publish_iocp: false,
+                event_obj_idx: u64::MAX,
+                reply_cap: 0,
+                reply_required: false,
+                native_call_transport: false,
+                reply_mrs: [0; 18],
+                resume_ip: 0,
+                resume_sp: 0,
+                resume_flags: 0,
+            });
+            self.pending_file_io_wait = true;
+        } else {
+            self.write_current_iosb(iosb, status, information);
+            let _ = self.signal_file_completion(route.file_id, status);
+            self.release_file_reference(route.file_id);
+        }
+        status
     }
     /// ★ CROSS-VSPACE `NtCreateThread` — a genuine ADDITIONAL thread inside a FOREIGN process
     /// (`RtlCreateUserThread(ProcessHandle != NtCurrentProcess)`; `DbgUiIssueRemoteBreakin`'s
@@ -16648,6 +17082,15 @@ impl ExecNtHandler {
                 let _ = self.directory_opens.release(object_id);
             }
             nt_process::HandleObject::DiskFile { object_id, .. } => {
+                if self.readonly_file_opens.is_final_reference(object_id) == Ok(true) {
+                    let status = self
+                        .byte_range_locks
+                        .cleanup_file_object_all(LOCAL_FAT_FILE_OBJECT_TAG | object_id as u64);
+                    assert_eq!(status, nt_fs::STATUS_SUCCESS);
+                    unsafe {
+                        self.publish_local_byte_lock_completions();
+                    }
+                }
                 let _ = self.readonly_file_opens.release(object_id);
             }
             nt_process::HandleObject::Section(section) => {
@@ -16660,6 +17103,15 @@ impl ExecNtHandler {
             // The last handle on a writable-overlay file object: run the volume's cleanup/close
             // (which actions a pending delete) and free the FILE_OBJECT.
             nt_process::HandleObject::OverlayFile(file_id) => {
+                if unsafe { crate::writable_fs::is_final_reference(file_id) } == Ok(true) {
+                    let status = self.byte_range_locks.cleanup_file_object_all(
+                        LOCAL_OVERLAY_FILE_OBJECT_TAG | (file_id & LOCAL_ID_PAYLOAD_MASK),
+                    );
+                    assert_eq!(status, nt_fs::STATUS_SUCCESS);
+                    unsafe {
+                        self.publish_local_byte_lock_completions();
+                    }
+                }
                 unsafe { crate::writable_fs::close(file_id) };
                 self.writable_fs_dirty = true;
             }
@@ -19797,6 +20249,33 @@ impl ExecNtHandler {
         ))
     }
 
+    unsafe fn dispatch_hosted_file_read_write_for(
+        &mut self,
+        route: HostedFileRoute,
+        major: u8,
+        parameters: nt_io_manager::ReadWriteParameters,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<(i32, u64, u64), u32> {
+        let (status, information, pending_irp_id, _) =
+            driver_launch::dispatch_hosted_file_read_write_irp_result_exact(
+                route.file_id,
+                major,
+                self.current_tid,
+                parameters,
+                input,
+                output,
+            )?;
+        if driver_launch::device_id_by_name("\\Device\\NamedPipe") == Some(route.device_id) {
+            NPFS_ROUTED_IRPS.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok((
+            status,
+            information,
+            pending_irp_id.map_or(0, |irp_id| irp_id.raw()),
+        ))
+    }
+
     unsafe fn dispatch_hosted_file_set_information_for(
         &mut self,
         route: HostedFileRoute,
@@ -21038,6 +21517,117 @@ impl ExecNtHandler {
             alignment_requirement,
             ..nt_fs::QueryMetadata::default()
         })
+    }
+
+    fn allocate_local_byte_lock_irp_id(&mut self) -> u64 {
+        let sequence = self.next_local_byte_lock_irp.max(1) & LOCAL_ID_PAYLOAD_MASK;
+        self.next_local_byte_lock_irp = sequence.wrapping_add(1).max(1);
+        LOCAL_BYTE_LOCK_IRP_TAG | sequence
+    }
+
+    unsafe fn local_byte_lock_route_for(
+        &self,
+        handle: u64,
+    ) -> Result<Option<LocalByteLockRoute>, u32> {
+        const FILE_READ_DATA: u32 = 0x0000_0001;
+        const FILE_WRITE_DATA: u32 = 0x0000_0002;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const GENERIC_ALL: u32 = 0x1000_0000;
+        let pid = self
+            .pm_pid_for_pi(self.pi)
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        let process_handle =
+            nt_process::Handle::try_from(handle).map_err(|_| nt_fs::STATUS_INVALID_HANDLE)?;
+        let object = self
+            .pm
+            .lookup_handle(pid, process_handle)
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        let access = self
+            .pm
+            .handle_access(pid, process_handle)
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        if access & (FILE_READ_DATA | FILE_WRITE_DATA | GENERIC_READ | GENERIC_WRITE | GENERIC_ALL)
+            == 0
+        {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        let route = match object {
+            nt_process::HandleObject::DiskFile {
+                first_cluster,
+                size,
+                object_id,
+            } => {
+                let open = self.readonly_file_opens.get(object_id)?;
+                if open.first_cluster != first_cluster || open.size != size {
+                    return Err(nt_fs::STATUS_INVALID_HANDLE);
+                }
+                LocalByteLockRoute {
+                    file_id: LOCAL_FAT_FILE_ID_TAG
+                        | (open.metadata.file_id & LOCAL_ID_PAYLOAD_MASK),
+                    file_object: LOCAL_FAT_FILE_OBJECT_TAG | object_id as u64,
+                    synchronous: open.create_options
+                        & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
+                        != 0,
+                    alertable: open.create_options & nt_fs::FILE_SYNCHRONOUS_IO_ALERT != 0,
+                }
+            }
+            nt_process::HandleObject::OverlayFile(file_object) => {
+                let metadata = crate::writable_fs::metadata(file_object)
+                    .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                LocalByteLockRoute {
+                    file_id: LOCAL_OVERLAY_FILE_ID_TAG | (metadata.file_id & LOCAL_ID_PAYLOAD_MASK),
+                    file_object: LOCAL_OVERLAY_FILE_OBJECT_TAG
+                        | (file_object & LOCAL_ID_PAYLOAD_MASK),
+                    synchronous: crate::writable_fs::file_mode(file_object)
+                        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
+                        & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
+                        != 0,
+                    alertable: crate::writable_fs::file_mode(file_object)
+                        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
+                        & nt_fs::FILE_SYNCHRONOUS_IO_ALERT
+                        != 0,
+                }
+            }
+            nt_process::HandleObject::File(_) | nt_process::HandleObject::RoutedFile { .. } => {
+                return Ok(None)
+            }
+            nt_process::HandleObject::Directory { .. } => {
+                return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST)
+            }
+            _ => return Err(STATUS_OBJECT_TYPE_MISMATCH),
+        };
+        Ok(Some(route))
+    }
+
+    fn prepare_lock_event_for_request(&mut self, event_handle: u64) -> Result<Option<usize>, u32> {
+        self.prepare_io_event_for_request(event_handle)
+    }
+
+    pub(crate) unsafe fn publish_local_byte_lock_completions(&mut self) -> usize {
+        let mut published = 0;
+        while let Some(completion) = self.byte_range_locks.pop_completion() {
+            let matched = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                .complete_local_byte_lock_exact(
+                    completion.context,
+                    completion.wait_id.raw(),
+                    completion.status,
+                );
+            assert!(
+                matched,
+                "local byte-lock completion lost its pending I/O owner"
+            );
+            published += 1;
+        }
+        if published != 0 {
+            crate::service_sec_image::FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+        }
+        published
+    }
+
+    pub(crate) fn cancel_local_byte_lock_wait(&mut self, wait_id: u64) -> bool {
+        nt_fs::ByteRangeWaitId::from_raw(wait_id)
+            .is_some_and(|wait_id| self.byte_range_locks.cancel_wait(wait_id))
     }
 
     unsafe fn query_local_volume_information(
@@ -32381,6 +32971,8 @@ impl ExecNtHandler {
             // their own IOSBs/events/file objects with STATUS_CANCELLED; this syscall's IOSB reports
             // the cancel request itself as STATUS_SUCCESS, matching ReactOS IoMgr.
             NativeService::NtCancelIoFile => unsafe { self.nt_cancel_io_file_service(args) },
+            NativeService::NtLockFile => unsafe { self.nt_lock_file_service(args) },
+            NativeService::NtUnlockFile => unsafe { self.nt_unlock_file_service(args) },
             // NtWriteFile captured args: FileHandle=args[0], Event=args[1], ApcRoutine=args[2],
             // ApcContext=args[3], *IoStatusBlock=args[4], Buffer=args[5], Length=args[6],
             // ByteOffset=args[7], Key=args[8]. Route typed named-pipe handles through isolated npfs
@@ -32403,6 +32995,9 @@ impl ExecNtHandler {
                 let mut offset_bytes = [0u8; 8];
                 let offset_ok = byte_offset == 0 || self.xas_read(byte_offset, &mut offset_bytes);
                 let offset_value = u64::from_le_bytes(offset_bytes);
+                let offset_semantics_ok = byte_offset == 0
+                    || i64::from_le_bytes(offset_bytes)
+                        >= nt_io_manager::FILE_USE_FILE_POINTER_POSITION;
                 let mut key_bytes = [0u8; 4];
                 let key_ok = key == 0 || self.xas_read(key, &mut key_bytes);
                 let key_value = u32::from_le_bytes(key_bytes);
@@ -32419,6 +33014,11 @@ impl ExecNtHandler {
                 // stream arbitrary ULONG-sized requests through their per-instance transfer bank.
                 const OVERLAY_IO_CAP: usize = 64 * 1024;
                 let overlay_file = self.overlay_file_id_for(fh);
+                let overlay_access = overlay_file.and_then(|_| self.hosted_file_access_for(fh));
+                let overlay_write_access = overlay_file.is_none()
+                    || overlay_access.is_some_and(|access| {
+                        access & (0x0000_0002 | 0x0000_0004 | 0x4000_0000 | 0x1000_0000) != 0
+                    });
                 let write_capacity = if overlay_file.is_some() {
                     OVERLAY_IO_CAP
                 } else {
@@ -32456,10 +33056,16 @@ impl ExecNtHandler {
                 let mut operation_started = false;
                 let mut status = if !iosb_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
+                } else if !offset_ok || !key_ok {
+                    0xC000_0005 // STATUS_ACCESS_VIOLATION
+                } else if !offset_semantics_ok {
+                    STATUS_INVALID_PARAMETER
                 } else if len > write_capacity {
                     0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
                 } else if !payload_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
+                } else if !overlay_write_access {
+                    STATUS_ACCESS_DENIED
                 } else if apc_completion_conflict {
                     STATUS_INVALID_PARAMETER
                 } else {
@@ -32469,23 +33075,67 @@ impl ExecNtHandler {
                             completion_event_index = event_index;
                             if let Some(file_id) = overlay_file {
                                 operation_started = true;
-                                // ★ THE WRITABLE FILESYSTEM OVERLAY: a real write of the caller's real bytes.
-                                // `ByteOffset == NULL` (or the FILE_USE_FILE_POINTER_POSITION sentinel) uses and
-                                // advances the file object's own position, exactly like an FSD.
-                                let explicit = (byte_offset != 0 && offset_ok)
-                                    .then_some(offset_value)
-                                    .filter(|value| *value != u64::MAX);
-                                let scratch = core::slice::from_raw_parts(
-                                    core::ptr::addr_of!(OVERLAY_WRITE_SCRATCH) as *const u8,
-                                    len,
-                                );
-                                let (status, written) =
-                                    crate::writable_fs::write(file_id, explicit, scratch);
-                                if status == nt_fs::STATUS_SUCCESS {
-                                    self.writable_fs_dirty = true;
+                                let route = self.local_byte_lock_route_for(fh);
+                                let current = crate::writable_fs::current_offset(file_id);
+                                let metadata = crate::writable_fs::metadata(file_id);
+                                match (route, current, metadata) {
+                                    (Ok(Some(route)), Some(current), Some(metadata)) => {
+                                        let append_only = overlay_access.is_some_and(|access| {
+                                            access
+                                                & (0x0000_0002
+                                                    | 0x0000_0004
+                                                    | 0x4000_0000
+                                                    | 0x1000_0000)
+                                                == 0x0000_0004
+                                        });
+                                        let resolved =
+                                            nt_io_manager::resolve_regular_file_write_offset(
+                                                (byte_offset != 0)
+                                                    .then_some(i64::from_le_bytes(offset_bytes)),
+                                                route.synchronous,
+                                                current,
+                                                metadata.end_of_file,
+                                                append_only,
+                                            );
+                                        let resolved = match resolved {
+                                            Ok(resolved) => resolved,
+                                            Err(status) => return status.raw() as u32,
+                                        };
+                                        let actual_offset = resolved.value();
+                                        let explicit = (!resolved.advances_current_position())
+                                            .then_some(actual_offset);
+                                        let owner = nt_fs::ByteRangeLockOwner::new(
+                                            route.file_object,
+                                            self.pm_pid_for_pi(self.pi).unwrap() as u64,
+                                            key_value,
+                                        );
+                                        let lock_status = self.byte_range_locks.check_write(
+                                            route.file_id,
+                                            owner,
+                                            actual_offset,
+                                            len as u64,
+                                        );
+                                        if lock_status != nt_fs::STATUS_SUCCESS {
+                                            lock_status
+                                        } else {
+                                            let scratch = core::slice::from_raw_parts(
+                                                core::ptr::addr_of!(OVERLAY_WRITE_SCRATCH)
+                                                    as *const u8,
+                                                len,
+                                            );
+                                            let (status, written) = crate::writable_fs::write(
+                                                file_id, explicit, scratch,
+                                            );
+                                            if status == nt_fs::STATUS_SUCCESS {
+                                                self.writable_fs_dirty = true;
+                                            }
+                                            information = written as u64;
+                                            status
+                                        }
+                                    }
+                                    (Err(status), _, _) => status,
+                                    _ => nt_fs::STATUS_INVALID_HANDLE,
                                 }
-                                information = written as u64;
-                                status
                             } else {
                                 match self.npfs_write_file_route_for(fh) {
                                     Err(handle_status) => handle_status,
@@ -32540,10 +33190,14 @@ impl ExecNtHandler {
                                             Ok(()) => {
                                                 operation_started = true;
                                                 let mut output = [];
-                                                match self.dispatch_hosted_file_irp_for(
+                                                match self.dispatch_hosted_file_read_write_for(
                                                     route,
-                                                    major::IRP_MJ_WRITE as u64,
-                                                    0,
+                                                    major::IRP_MJ_WRITE,
+                                                    nt_io_manager::ReadWriteParameters {
+                                                        length: len as u32,
+                                                        key: key_value,
+                                                        offset: offset_value,
+                                                    },
                                                     &payload,
                                                     &mut output,
                                                 ) {
@@ -32764,6 +33418,7 @@ impl ExecNtHandler {
                 let buffer = args[5];
                 let len = nt_ulong_arg(args[6]) as usize;
                 let byte_offset = args[7];
+                let key = args[8];
                 let fh = args[0];
                 let event = args[1];
                 let apc_routine = args[2];
@@ -32771,6 +33426,17 @@ impl ExecNtHandler {
                 let completion_port_suppressed =
                     nt_io_completion::io_event_suppresses_completion_port(event);
                 let disk_file = self.disk_file_for(fh);
+                let mut captured_offset_bytes = [0u8; 8];
+                let offset_ok =
+                    byte_offset == 0 || self.xas_read(byte_offset, &mut captured_offset_bytes);
+                let offset_value = u64::from_le_bytes(captured_offset_bytes);
+                let signed_offset = i64::from_le_bytes(captured_offset_bytes);
+                let offset_semantics_ok = byte_offset == 0
+                    || signed_offset >= 0
+                    || signed_offset == nt_io_manager::FILE_USE_FILE_POINTER_POSITION;
+                let mut key_bytes = [0u8; 4];
+                let key_ok = key == 0 || self.xas_read(key, &mut key_bytes);
+                let key_value = u32::from_le_bytes(key_bytes);
                 let mut iosb_probe = [0u8; 16];
                 let iosb_ok = iosb != 0 && self.xas_read(iosb, &mut iosb_probe);
                 let apc_completion_conflict =
@@ -32780,6 +33446,10 @@ impl ExecNtHandler {
                 // Disk and overlay reads copy directly to user memory. Hosted drivers get a full
                 // request-sized destination which the component fills through the banked transport.
                 let overlay_file = self.overlay_file_id_for(fh);
+                let overlay_read_access = overlay_file.is_none()
+                    || self.hosted_file_access_for(fh).is_some_and(|access| {
+                        access & (0x0000_0001 | 0x8000_0000 | 0x1000_0000) != 0
+                    });
                 const OVERLAY_IO_CAP: usize = 64 * 1024;
                 let output_capacity = if matches!(disk_file, Ok(Some(_))) || overlay_file.is_some()
                 {
@@ -32803,12 +33473,18 @@ impl ExecNtHandler {
                 let mut operation_started = false;
                 let mut status = if !iosb_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
+                } else if !offset_ok || !key_ok {
+                    0xC000_0005 // STATUS_ACCESS_VIOLATION
+                } else if !offset_semantics_ok {
+                    STATUS_INVALID_PARAMETER
                 } else if overlay_file.is_some() && len > OVERLAY_IO_CAP {
                     0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
                 } else if len != 0 && buffer == 0 {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
                 } else if let Err(handle_status) = disk_file {
                     handle_status
+                } else if !overlay_read_access {
+                    STATUS_ACCESS_DENIED
                 } else if apc_completion_conflict {
                     STATUS_INVALID_PARAMETER
                 } else {
@@ -32824,41 +33500,47 @@ impl ExecNtHandler {
                                 disk_file.unwrap_or(None)
                             {
                                 operation_started = true;
-                                if len == 0 {
-                                    nt_fs::STATUS_SUCCESS
-                                } else {
-                                    let mut explicit_offset = None;
-                                    let mut offset_status = nt_fs::STATUS_SUCCESS;
-                                    if byte_offset != 0 {
-                                        let mut offset_bytes = [0u8; 8];
-                                        if !self.xas_read(byte_offset, &mut offset_bytes) {
-                                            offset_status = 0xC000_0005; // STATUS_ACCESS_VIOLATION
-                                        } else {
-                                            let raw_offset = u64::from_le_bytes(offset_bytes);
-                                            if raw_offset != u64::MAX {
-                                                let signed_offset =
-                                                    i64::from_le_bytes(offset_bytes);
-                                                if signed_offset < 0 || raw_offset > u32::MAX as u64
-                                                {
-                                                    offset_status = 0xC000_000D;
-                                                } else {
-                                                    explicit_offset = Some(raw_offset);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if offset_status != nt_fs::STATUS_SUCCESS {
-                                        offset_status
-                                    } else {
-                                        let offset = match explicit_offset {
-                                            Some(offset) => offset,
-                                            None => match self.readonly_file_opens.get(object_id) {
-                                                Ok(open) => open.current_offset,
-                                                Err(status) => return status,
-                                            },
-                                        };
-                                        if offset > u32::MAX as u64 {
+                                let (current, synchronous) =
+                                    match self.readonly_file_opens.get(object_id) {
+                                        Ok(open) => (
+                                            open.current_offset,
+                                            open.create_options
+                                                & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT
+                                                    | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
+                                                != 0,
+                                        ),
+                                        Err(status) => return status,
+                                    };
+                                let resolved = nt_io_manager::resolve_regular_file_read_offset(
+                                    (byte_offset != 0).then_some(signed_offset),
+                                    synchronous,
+                                    current,
+                                );
+                                match resolved {
+                                    Err(status) => status.raw() as u32,
+                                    Ok(resolved) => {
+                                        let offset = resolved.value();
+                                        let lock_status =
+                                            match self.local_byte_lock_route_for(fh).ok().flatten()
+                                            {
+                                                Some(route) => self.byte_range_locks.check_read(
+                                                    route.file_id,
+                                                    nt_fs::ByteRangeLockOwner::new(
+                                                        route.file_object,
+                                                        self.pm_pid_for_pi(self.pi).unwrap() as u64,
+                                                        key_value,
+                                                    ),
+                                                    offset,
+                                                    len as u64,
+                                                ),
+                                                None => nt_fs::STATUS_INVALID_HANDLE,
+                                            };
+                                        if lock_status != nt_fs::STATUS_SUCCESS {
+                                            lock_status
+                                        } else if offset > u32::MAX as u64 {
                                             0xC000_000D // STATUS_INVALID_PARAMETER
+                                        } else if len == 0 {
+                                            nt_fs::STATUS_SUCCESS
                                         } else if offset as u32 >= file_size {
                                             0xC000_0011 // STATUS_END_OF_FILE
                                         } else {
@@ -32871,7 +33553,7 @@ impl ExecNtHandler {
                                             ) {
                                                 Ok(read) => {
                                                     information = read as u64;
-                                                    if explicit_offset.is_none() {
+                                                    if resolved.advances_current_position() {
                                                         match self
                                                             .readonly_file_opens
                                                             .get_mut(object_id)
@@ -32892,41 +33574,67 @@ impl ExecNtHandler {
                                 }
                             } else if let Some(file_id) = overlay_file {
                                 operation_started = true;
-                                // ★ THE WRITABLE FILESYSTEM OVERLAY: read back what was really written.
-                                let mut explicit = None;
-                                let mut bad_offset = false;
-                                if byte_offset != 0 {
-                                    let mut offset_bytes = [0u8; 8];
-                                    if self.xas_read(byte_offset, &mut offset_bytes) {
-                                        let value = u64::from_le_bytes(offset_bytes);
-                                        if value != u64::MAX {
-                                            explicit = Some(value);
+                                let route = self.local_byte_lock_route_for(fh);
+                                let current = crate::writable_fs::current_offset(file_id);
+                                match (route, current) {
+                                    (Ok(Some(route)), Some(current)) => {
+                                        let resolved =
+                                            nt_io_manager::resolve_regular_file_read_offset(
+                                                (byte_offset != 0).then_some(signed_offset),
+                                                route.synchronous,
+                                                current,
+                                            );
+                                        match resolved {
+                                            Err(status) => status.raw() as u32,
+                                            Ok(resolved) => {
+                                                let actual_offset = resolved.value();
+                                                let explicit = (!resolved
+                                                    .advances_current_position())
+                                                .then_some(actual_offset);
+                                                let lock_status = self.byte_range_locks.check_read(
+                                                    route.file_id,
+                                                    nt_fs::ByteRangeLockOwner::new(
+                                                        route.file_object,
+                                                        self.pm_pid_for_pi(self.pi).unwrap() as u64,
+                                                        key_value,
+                                                    ),
+                                                    actual_offset,
+                                                    len as u64,
+                                                );
+                                                if lock_status != nt_fs::STATUS_SUCCESS {
+                                                    lock_status
+                                                } else {
+                                                    let scratch = core::slice::from_raw_parts_mut(
+                                                        core::ptr::addr_of_mut!(
+                                                            OVERLAY_WRITE_SCRATCH
+                                                        )
+                                                            as *mut u8,
+                                                        OVERLAY_IO_CAP,
+                                                    );
+                                                    let (status, read) =
+                                                        crate::writable_fs::read_into(
+                                                            file_id,
+                                                            explicit,
+                                                            &mut scratch[..len],
+                                                        );
+                                                    if status == nt_fs::STATUS_SUCCESS
+                                                        && read != 0
+                                                        && !self.xas_try_write_buf(
+                                                            buffer,
+                                                            &scratch[..read],
+                                                        )
+                                                    {
+                                                        0xC000_0005 // STATUS_ACCESS_VIOLATION
+                                                    } else {
+                                                        information = read as u64;
+                                                        status
+                                                    }
+                                                }
+                                            }
                                         }
-                                    } else {
-                                        bad_offset = true;
                                     }
-                                }
-                                if bad_offset {
-                                    0xC000_0005 // STATUS_ACCESS_VIOLATION
-                                } else {
-                                    let scratch = core::slice::from_raw_parts_mut(
-                                        core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
-                                        OVERLAY_IO_CAP,
-                                    );
-                                    let (status, read) = crate::writable_fs::read_into(
-                                        file_id,
-                                        explicit,
-                                        &mut scratch[..len],
-                                    );
-                                    if status == nt_fs::STATUS_SUCCESS
-                                        && read != 0
-                                        && !self.xas_try_write_buf(buffer, &scratch[..read])
-                                    {
-                                        0xC000_0005 // STATUS_ACCESS_VIOLATION
-                                    } else {
-                                        information = read as u64;
-                                        status
-                                    }
+                                    (Err(status), _) => status,
+                                    _ => nt_fs::STATUS_INVALID_HANDLE,
                                 }
                             } else {
                                 match self.npfs_read_file_route_for(fh) {
@@ -32985,10 +33693,14 @@ impl ExecNtHandler {
                                             Err(status) => status,
                                             Ok(()) => {
                                                 operation_started = true;
-                                                match self.dispatch_hosted_file_irp_for(
+                                                match self.dispatch_hosted_file_read_write_for(
                                                     route,
-                                                    major::IRP_MJ_READ as u64,
-                                                    0,
+                                                    major::IRP_MJ_READ,
+                                                    nt_io_manager::ReadWriteParameters {
+                                                        length: len as u32,
+                                                        key: key_value,
+                                                        offset: offset_value,
+                                                    },
                                                     &[],
                                                     &mut output,
                                                 ) {

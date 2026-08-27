@@ -93,9 +93,13 @@ pub enum WdmIoStackParameters {
     },
     Read {
         length: u32,
+        key: u32,
+        byte_offset: u64,
     },
     Write {
         length: u32,
+        key: u32,
+        byte_offset: u64,
     },
     QueryInformation {
         length: u32,
@@ -319,8 +323,19 @@ pub fn write_wdm_io_stack_location(
                 put_u64(bytes, 0x20, parameters);
             }
         }
-        WdmIoStackParameters::Read { length } | WdmIoStackParameters::Write { length } => {
+        WdmIoStackParameters::Read {
+            length,
+            key,
+            byte_offset,
+        }
+        | WdmIoStackParameters::Write {
+            length,
+            key,
+            byte_offset,
+        } => {
             put_u32(bytes, 0x08, length);
+            put_u32(bytes, 0x10, key);
+            put_u64(bytes, 0x18, byte_offset);
         }
         WdmIoStackParameters::QueryInformation {
             length,

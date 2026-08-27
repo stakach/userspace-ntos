@@ -17,6 +17,74 @@ use crate::irp::{BufferAccess, IoBufferRef, IoParameters, IrpState, ReadWritePar
 use crate::object_port::ObjectManagerPort;
 use crate::{DeviceId, FileId, IoManager, IrpId};
 
+pub const FILE_WRITE_TO_END_OF_FILE: i64 = -1;
+pub const FILE_USE_FILE_POINTER_POSITION: i64 = -2;
+
+/// Concrete offset selected by the I/O Manager for a regular local file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolvedFileOffset {
+    Absolute(u64),
+    Current(u64),
+    EndOfFile(u64),
+}
+
+impl ResolvedFileOffset {
+    pub const fn value(self) -> u64 {
+        match self {
+            Self::Absolute(value) | Self::Current(value) | Self::EndOfFile(value) => value,
+        }
+    }
+
+    pub const fn advances_current_position(self) -> bool {
+        matches!(self, Self::Current(_))
+    }
+}
+
+/// Resolve `NtReadFile.ByteOffset` after the FILE_OBJECT mode is known. An asynchronous regular
+/// file must supply an offset; the file-pointer sentinel is valid only for synchronous I/O.
+pub fn resolve_regular_file_read_offset(
+    byte_offset: Option<i64>,
+    synchronous: bool,
+    current: u64,
+) -> Result<ResolvedFileOffset, NtStatus> {
+    match byte_offset {
+        None if synchronous => Ok(ResolvedFileOffset::Current(current)),
+        None => Err(NtStatus::INVALID_PARAMETER),
+        Some(FILE_USE_FILE_POINTER_POSITION) if synchronous => {
+            Ok(ResolvedFileOffset::Current(current))
+        }
+        Some(value) if value >= 0 => Ok(ResolvedFileOffset::Absolute(value as u64)),
+        Some(_) => Err(NtStatus::INVALID_PARAMETER),
+    }
+}
+
+/// Resolve `NtWriteFile.ByteOffset` for a regular local file. Append-only access overrides the
+/// caller's otherwise-valid offset, matching the I/O Manager's `FILE_APPEND_DATA` contract.
+pub fn resolve_regular_file_write_offset(
+    byte_offset: Option<i64>,
+    synchronous: bool,
+    current: u64,
+    end_of_file: u64,
+    append_only: bool,
+) -> Result<ResolvedFileOffset, NtStatus> {
+    if byte_offset.is_some_and(|value| value < FILE_USE_FILE_POINTER_POSITION) {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
+    if append_only {
+        return Ok(ResolvedFileOffset::EndOfFile(end_of_file));
+    }
+    match byte_offset {
+        None if synchronous => Ok(ResolvedFileOffset::Current(current)),
+        None => Err(NtStatus::INVALID_PARAMETER),
+        Some(FILE_USE_FILE_POINTER_POSITION) if synchronous => {
+            Ok(ResolvedFileOffset::Current(current))
+        }
+        Some(FILE_WRITE_TO_END_OF_FILE) => Ok(ResolvedFileOffset::EndOfFile(end_of_file)),
+        Some(value) if value >= 0 => Ok(ResolvedFileOffset::Absolute(value as u64)),
+        Some(_) => Err(NtStatus::INVALID_PARAMETER),
+    }
+}
+
 /// Validate that a requested transfer can be represented by the NT `ULONG` length fields.
 pub(crate) fn validate_transfer(len: usize) -> Result<(), NtStatus> {
     u32::try_from(len)
@@ -301,5 +369,66 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .iter()
             .find(|(_, f)| f.object_id == obj)
             .map(|(id, _)| id)
+    }
+}
+
+#[cfg(test)]
+mod offset_tests {
+    use super::*;
+
+    #[test]
+    fn regular_read_offsets_require_nt_synchronous_file_pointer_semantics() {
+        assert_eq!(
+            resolve_regular_file_read_offset(None, true, 41),
+            Ok(ResolvedFileOffset::Current(41))
+        );
+        assert_eq!(
+            resolve_regular_file_read_offset(Some(-2), true, 42),
+            Ok(ResolvedFileOffset::Current(42))
+        );
+        assert_eq!(
+            resolve_regular_file_read_offset(Some(7), false, 42),
+            Ok(ResolvedFileOffset::Absolute(7))
+        );
+        assert_eq!(
+            resolve_regular_file_read_offset(None, false, 42),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        assert_eq!(
+            resolve_regular_file_read_offset(Some(-1), true, 42),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        assert_eq!(
+            resolve_regular_file_read_offset(Some(-2), false, 42),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
+    fn regular_write_offsets_distinguish_current_eof_and_append_only() {
+        assert_eq!(
+            resolve_regular_file_write_offset(None, true, 10, 20, false),
+            Ok(ResolvedFileOffset::Current(10))
+        );
+        assert_eq!(
+            resolve_regular_file_write_offset(Some(-2), true, 11, 20, false),
+            Ok(ResolvedFileOffset::Current(11))
+        );
+        assert_eq!(
+            resolve_regular_file_write_offset(Some(-1), false, 11, 21, false),
+            Ok(ResolvedFileOffset::EndOfFile(21))
+        );
+        assert_eq!(
+            resolve_regular_file_write_offset(Some(7), false, 11, 22, true),
+            Ok(ResolvedFileOffset::EndOfFile(22))
+        );
+        assert_eq!(
+            resolve_regular_file_write_offset(None, false, 11, 22, false),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        assert_eq!(
+            resolve_regular_file_write_offset(Some(-3), true, 11, 22, true),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
     }
 }

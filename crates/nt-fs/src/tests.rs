@@ -1290,7 +1290,9 @@ fn share_access_is_symmetric_precedes_truncate_and_lives_until_final_close() {
     assert_eq!(fs.zw_close(writer.handle), STATUS_SUCCESS);
 
     assert_eq!(fs.zw_retain(first.handle), STATUS_SUCCESS);
+    assert_eq!(fs.zw_is_final_reference(first.handle), Ok(false));
     assert_eq!(fs.zw_close(first.handle), STATUS_SUCCESS);
+    assert_eq!(fs.zw_is_final_reference(first.handle), Ok(true));
     assert_eq!(
         fs.zw_create_file(
             r"\??\C:\Temp\shared.dat",

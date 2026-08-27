@@ -113,11 +113,11 @@ pub use mock_driver::{IoctlBehavior, MockDriverBackend};
 pub use object_port::{MockObjectPort, ObjectManagerPort};
 pub use pending_io::{
     PendingFileCreate, PendingFileIo, PendingFileIoOperation, PendingFileIoReservation,
-    PendingFileIoTable, PendingSetFileNameOperation, IO_DELIVERY_APC_PUBLISHED,
-    IO_DELIVERY_BACKEND_ACKED, IO_DELIVERY_BUFFER_PUBLISHED, IO_DELIVERY_CREATE_COMMITTED,
-    IO_DELIVERY_EVENT_PUBLISHED, IO_DELIVERY_FILE_LOCK_RELEASED, IO_DELIVERY_FILE_PUBLISHED,
-    IO_DELIVERY_HANDLE_PUBLISHED, IO_DELIVERY_IOCP_PUBLISHED, IO_DELIVERY_IOSB_PUBLISHED,
-    IO_DELIVERY_REPLY_CLAIMED, IO_DELIVERY_REPLY_PUBLISHED,
+    PendingFileIoTable, PendingLocalByteLock, PendingSetFileNameOperation,
+    IO_DELIVERY_APC_PUBLISHED, IO_DELIVERY_BACKEND_ACKED, IO_DELIVERY_BUFFER_PUBLISHED,
+    IO_DELIVERY_CREATE_COMMITTED, IO_DELIVERY_EVENT_PUBLISHED, IO_DELIVERY_FILE_LOCK_RELEASED,
+    IO_DELIVERY_FILE_PUBLISHED, IO_DELIVERY_HANDLE_PUBLISHED, IO_DELIVERY_IOCP_PUBLISHED,
+    IO_DELIVERY_IOSB_PUBLISHED, IO_DELIVERY_REPLY_CLAIMED, IO_DELIVERY_REPLY_PUBLISHED,
 };
 pub use pending_set_file_name::{
     PendingSetFileName, PendingSetFileNameId, PendingSetFileNamePhase,
@@ -137,6 +137,10 @@ pub use pipe::{
 pub use quota::{
     set_quota_access_granted, sid_length, validate_get_quota_buffer, validate_set_quota_buffer,
     QueryQuotaParameters, QuotaValidationError, SetQuotaParameters,
+};
+pub use read_write::{
+    resolve_regular_file_read_offset, resolve_regular_file_write_offset, ResolvedFileOffset,
+    FILE_USE_FILE_POINTER_POSITION, FILE_WRITE_TO_END_OF_FILE,
 };
 pub use retained_completion::{RetainedCompletion, RetainedCompletionError, RetainedIrpCompletion};
 pub use store::{GenStore, IoId};
@@ -5812,7 +5816,47 @@ mod tests {
         assert_eq!(request.lock_byte_offset, 0x1234_5678_9abc_def0);
         assert_eq!(request.lock_length, 0x1000_0000_0000_0001);
         assert_eq!(request.lock_key, 0x7654_3210);
-        assert_eq!((request.input_len, request.output_len, request.buffer_len), (0, 0, 0));
+        assert_eq!(
+            (request.input_len, request.output_len, request.buffer_len),
+            (0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn peer_read_write_wire_preserves_offset_and_key() {
+        let control = MockPeerControl::new();
+        let (mut om, client, handle, _) = peer_device(
+            &control,
+            AccessMask::GENERIC_READ | AccessMask::GENERIC_WRITE,
+        );
+        let (file, device, _) = om
+            .reference_open_file_details(client, handle, AccessMask::GENERIC_READ)
+            .unwrap();
+        let mut buffer = [0x5au8; 16];
+        assert!(matches!(
+            om.build_and_dispatch_external_to_device(
+                client,
+                device,
+                Some(file),
+                0,
+                31,
+                major::IRP_MJ_WRITE,
+                IoParameters::Write(ReadWriteParameters {
+                    length: 16,
+                    key: 0x7654_3210,
+                    offset: 0x1234_5678_9abc_def0,
+                }),
+                16,
+                0,
+                &mut buffer,
+            ),
+            Ok(ExternalDispatchResult::Completed { .. })
+        ));
+        let request = control.last_request().unwrap();
+        assert_eq!(request.major, major::IRP_MJ_WRITE);
+        assert_eq!(request.read_write_byte_offset, 0x1234_5678_9abc_def0);
+        assert_eq!(request.read_write_key, 0x7654_3210);
+        assert_eq!((request.input_len, request.output_len), (16, 0));
     }
 
     #[test]
@@ -6430,6 +6474,27 @@ mod tests {
         assert_eq!(le_u64(&stack, 0x08), 0x6666);
         assert_eq!(le_u32(&stack, 0x10), 0x1234_5678);
         assert_eq!(le_u64(&stack, 0x18), 0x1122_3344_5566_7788);
+
+        write_wdm_io_stack_location(
+            &mut stack,
+            WdmIoStackLocationInit {
+                major: major::IRP_MJ_READ,
+                minor: 0,
+                flags: 0,
+                control: 0,
+                device_object: 0x4444,
+                file_object: 0x5555,
+                parameters: WdmIoStackParameters::Read {
+                    length: 0x80,
+                    key: 0x8765_4321,
+                    byte_offset: 0x1020_3040_5060_7080,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(le_u32(&stack, 0x08), 0x80);
+        assert_eq!(le_u32(&stack, 0x10), 0x8765_4321);
+        assert_eq!(le_u64(&stack, 0x18), 0x1020_3040_5060_7080);
 
         write_wdm_io_stack_location(
             &mut stack,

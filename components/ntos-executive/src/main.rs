@@ -1197,6 +1197,8 @@ pub const SSN_NT_QUERY_FULL_ATTRIBUTES_FILE: u64 = 156;
 /// NtQueryVolumeInformationFile — CsrServerInitialization queries volume info for a file handle.
 pub const SSN_NT_QUERY_VOLUME_INFO_FILE: u64 = 187;
 pub const SSN_NT_SET_VOLUME_INFO_FILE: u64 = 257;
+pub const SSN_NT_LOCK_FILE: u64 = 105;
+pub const SSN_NT_UNLOCK_FILE: u64 = 275;
 pub const SSN_NT_QUERY_INFORMATION_FILE: u64 = 158;
 /// PnP manager syscalls imported by umpnpmgr. Routed to the executive's CM-backed PnP surface:
 /// devnode install events, root-bus relations, status/property queries, and control acknowledgements
@@ -21432,6 +21434,10 @@ struct ExecNtHandler {
     /// Shared FILE_OBJECT-style state for read-only FAT file handles, including current byte
     /// offsets used by synchronous implicit-position reads.
     readonly_file_opens: ExecReadOnlyFileOpens,
+    /// Filesystem-owned byte ranges for local FAT and MemFs FILE_OBJECTs. Provider-backed Files
+    /// keep their lock state in the receiving FSD through `IRP_MJ_LOCK_CONTROL`.
+    byte_range_locks: nt_fs::ByteRangeLockTable<u64>,
+    next_local_byte_lock_irp: u64,
     /// Per-call context the dispatch loop refreshes before each `dispatch` (Workstream A: the
     /// converged table-driven path carries executive context on the handler rather than a parallel
     /// mechanism). `pi` = process index (0 = smss, 1 = csrss); `stop` = a side-signal a handler
@@ -22527,6 +22533,11 @@ impl ExecReadOnlyFileOpens {
         unsafe { (&mut *self.table).retain(id) }
     }
 
+    fn is_final_reference(&self, id: u32) -> Result<bool, u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).is_final_reference(id) }
+    }
+
     fn release(&mut self, id: u32) -> Result<(), u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe { (&mut *self.table).release(id) }
@@ -23534,6 +23545,8 @@ fn build_nt_table() -> NativeServiceTable {
                 NativeService::NtSetVolumeInformationFile,
                 SSN_NT_SET_VOLUME_INFO_FILE as u32,
             ),
+            (NativeService::NtLockFile, SSN_NT_LOCK_FILE as u32),
+            (NativeService::NtUnlockFile, SSN_NT_UNLOCK_FILE as u32),
             // ntdll closure batch: remaining direct ReactOS native imports.
             (
                 NativeService::NtGetPlugPlayEvent,

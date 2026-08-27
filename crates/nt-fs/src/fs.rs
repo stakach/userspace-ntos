@@ -5243,4 +5243,11 @@ impl FileSystem {
             None => STATUS_INVALID_HANDLE,
         }
     }
+
+    /// Whether one `ZwClose` will issue cleanup/close for this FILE_OBJECT.
+    pub fn zw_is_final_reference(&self, handle: u64) -> Result<bool, u32> {
+        self.obj(handle)
+            .map(|object| object.references == 1)
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
 }

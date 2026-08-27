@@ -55,12 +55,24 @@ pub struct PendingSetFileNameOperation {
     pub target_file_id: u64,
 }
 
+/// Terminal state for one local-filesystem byte-range lock wait. Provider-backed locks retain a
+/// canonical IRP and use [`PendingFileIoOperation::Transfer`]; this variant lets the same delivery
+/// owner publish local FSD completions without pretending that an executive IRP exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct PendingLocalByteLock {
+    pub wait_id: u64,
+    pub status: u32,
+    /// The owning FILE_OBJECT was opened for synchronous alertable I/O.
+    pub alertable: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum PendingFileIoOperation {
     #[default]
     Transfer,
     Create(PendingFileCreate),
     SetFileName(PendingSetFileNameOperation),
+    LocalByteLock(PendingLocalByteLock),
 }
 
 /// One pending File-bound operation and every completion surface owned by that exact IRP.
@@ -252,6 +264,16 @@ impl PendingFileIoTable {
                     && !pending.publish_iocp
                     && pending.event_obj_idx == u64::MAX
             }
+            PendingFileIoOperation::LocalByteLock(operation) => {
+                pending.major == nt_io_abi::major::IRP_MJ_LOCK_CONTROL
+                    && operation.wait_id != 0
+                    && operation.status == nt_status::NtStatus::PENDING.raw() as u32
+                    && pending.output_va == 0
+                    && pending.output_len == 0
+                    && pending.iosb_va != 0
+                    && !pending.signal_file
+                    && !pending.publish_iocp
+            }
         };
         let control_valid = matches!(
             pending.major,
@@ -393,7 +415,7 @@ impl PendingFileIoTable {
         self.slots.get(slot).copied().flatten()
     }
 
-    /// Find one synchronous transfer owner whose alertable wait can be
+    /// Find one synchronous operation owner whose alertable wait can be
     /// interrupted. File-mode alertability remains canonical in the File policy
     /// table and must be checked by the caller before marking this record.
     pub fn user_apc_interrupt_candidate(&self, tid: u64) -> Option<(usize, PendingFileIo)> {
@@ -406,7 +428,14 @@ impl PendingFileIoTable {
                         && !pending.consumer_abandoned
                         && !pending.user_apc_interrupt_requested
                         && pending.delivery_state == 0
-                        && matches!(pending.operation, PendingFileIoOperation::Transfer)
+                        && match pending.operation {
+                            PendingFileIoOperation::Transfer => true,
+                            PendingFileIoOperation::LocalByteLock(operation) => {
+                                operation.alertable
+                                    && operation.status == nt_status::NtStatus::PENDING.raw() as u32
+                            }
+                            _ => false,
+                        }
                 })
                 .map(|pending| (slot, pending))
         })
@@ -420,6 +449,13 @@ impl PendingFileIoTable {
         tid: u64,
     ) -> Option<()> {
         let pending = self.slots.get_mut(slot)?.as_mut()?;
+        let interruptible_operation = match pending.operation {
+            PendingFileIoOperation::Transfer => true,
+            PendingFileIoOperation::LocalByteLock(operation) => {
+                operation.alertable && operation.status == nt_status::NtStatus::PENDING.raw() as u32
+            }
+            _ => false,
+        };
         if pending.irp_id != irp_id
             || pending.file_id != file_id
             || pending.tid != tid
@@ -428,7 +464,7 @@ impl PendingFileIoTable {
             || pending.consumer_abandoned
             || pending.user_apc_interrupt_requested
             || pending.delivery_state != 0
-            || !matches!(pending.operation, PendingFileIoOperation::Transfer)
+            || !interruptible_operation
         {
             return None;
         }
@@ -529,6 +565,37 @@ impl PendingFileIoTable {
         pending.irp_id = new_irp_id;
         pending.major = new_major;
         Some(())
+    }
+
+    /// Publish the filesystem's terminal result into the exact generic completion owner.
+    pub fn complete_local_byte_lock_exact(
+        &mut self,
+        irp_id: u64,
+        wait_id: u64,
+        status: u32,
+    ) -> bool {
+        if irp_id == 0 || wait_id == 0 || status == nt_status::NtStatus::PENDING.raw() as u32 {
+            return false;
+        }
+        let Some(pending) = self.slots.iter_mut().flatten().find(|pending| {
+            pending.irp_id == irp_id
+                && matches!(
+                    pending.operation,
+                    PendingFileIoOperation::LocalByteLock(operation)
+                        if operation.wait_id == wait_id
+                )
+        }) else {
+            return false;
+        };
+        let PendingFileIoOperation::LocalByteLock(mut operation) = pending.operation else {
+            unreachable!();
+        };
+        if operation.status != nt_status::NtStatus::PENDING.raw() as u32 {
+            return operation.status == status;
+        }
+        operation.status = status;
+        pending.operation = PendingFileIoOperation::LocalByteLock(operation);
+        true
     }
 
     fn required_delivery_state(pending: PendingFileIo) -> u16 {
@@ -1567,5 +1634,42 @@ mod tests {
             .is_some());
         assert!(table.commit_create_exact(slot, 2, 0, 1, 0).is_none());
         table.mark_create_handle_published_exact(slot, 2).unwrap();
+    }
+
+    #[test]
+    fn local_byte_lock_uses_the_generic_delivery_owner() {
+        let mut table = PendingFileIoTable::new();
+        let mut request = pending(0x8000_0000_0000_0001, 0x8000_0000_0000_0002, 7);
+        request.major = nt_io_abi::major::IRP_MJ_LOCK_CONTROL;
+        request.operation = PendingFileIoOperation::LocalByteLock(PendingLocalByteLock {
+            wait_id: 9,
+            status: nt_status::NtStatus::PENDING.raw() as u32,
+            alertable: true,
+        });
+        request.output_va = 0;
+        request.output_len = 0;
+        request.apc_routine = 0;
+        request.signal_file = false;
+        request.publish_iocp = false;
+        request.event_obj_idx = u64::MAX;
+        let slot = table.park(request).unwrap();
+
+        let mut synchronous = table.get(slot).unwrap();
+        synchronous.sync_lock_owner_tid = synchronous.tid;
+        table.slots[slot] = Some(synchronous);
+        assert_eq!(table.user_apc_interrupt_candidate(7).unwrap().0, slot);
+
+        assert!(!table.complete_local_byte_lock_exact(request.irp_id, 8, 0));
+        assert!(table.complete_local_byte_lock_exact(request.irp_id, 9, 0));
+        assert!(table.complete_local_byte_lock_exact(request.irp_id, 9, 0));
+        assert!(!table.complete_local_byte_lock_exact(
+            request.irp_id,
+            9,
+            nt_status::NtStatus::PENDING.raw() as u32,
+        ));
+        assert!(matches!(
+            table.get(slot).unwrap().operation,
+            PendingFileIoOperation::LocalByteLock(PendingLocalByteLock { status: 0, .. })
+        ));
     }
 }
