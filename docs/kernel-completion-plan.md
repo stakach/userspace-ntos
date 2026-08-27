@@ -14819,3 +14819,45 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     (`NtLockFile` and `NtUnlockFile`): inventory the current native exports and dispatch first, then
     place conflict/wait ownership in a filesystem-level lock manager, route provider Files through
     `IRP_MJ_LOCK_CONTROL`, and preserve asynchronous event/APC/IOCP plus cancellation semantics.
+
+    Native byte-range locking boundary (2026-08-27, accepted): `NtLockFile` and `NtUnlockFile` now
+    use their canonical ReactOS NT5 service numbers and existing ntdll trap stubs, with executive
+    registration and native dispatch rather than an unimplemented-service result. The I/O Manager
+    owns handle/access capture, event reset, IOSB publication, APC and completion-port delivery,
+    cancellation, and the regular-file byte-offset contract. Synchronous Files resolve
+    `FILE_USE_FILE_POINTER_POSITION` against their current position, append-only Files force EOF,
+    and asynchronous regular Files require an explicit offset. Provider requests preserve the
+    read/write offset, key, and length needed for lock enforcement and issue genuine
+    `IRP_MJ_LOCK_CONTROL` requests with `IRP_MN_LOCK` or `IRP_MN_UNLOCK_SINGLE`. The hosted receiver
+    reconstructs the native x64 LockControl stack union. Cross-domain I/O ABI version 12 rejects
+    inconsistent lock operations and extents.
+
+    The local FAT/writable-overlay path owns a real filesystem-level lock table keyed by stable file
+    node plus open-description identity. It enforces shared/exclusive conflicts on reads, writes,
+    and new locks; supports fail-immediately and FIFO pending waits; requires an exact owner/range/key
+    match for unlock; cancels alertable and `NtCancelIoFile` waits; and releases the owner's locks
+    only when the final duplicated handle closes. Pending local locks use the same generic file-I/O
+    owner and completion publication machinery as provider operations, without manufacturing a
+    driver request or a successful fallback result.
+
+    Focused validation passes `nt-io-manager` `233/233`, `nt-fs` `111/111`, `nt-io-abi` `11/11`,
+    `nt-syscall` `57/57`, `nt-syscall-abi` `19/19`, and `nt-ntdll` `709/709`. The freestanding
+    executive compiles at the established 211-warning baseline, the release executive build
+    succeeds, and the dedicated DLL gate sees all 222 Nt stubs, all 222 Zw aliases, valid
+    relocations, and complete imports for the boot-critical ReactOS images. Code checkpoints
+    `8d7c51cf`, `973dccdd`, and `082f04f9` are pushed.
+
+    Serialized acceptance `.tmp/run-headless-byte-lock-20260827.log` reached quiescence at 124,332
+    ms, launched genuine userinit and Explorer, completed 668 Explorer api0 redirects with zero
+    callback failures, painted `480000/480000` framebuffer pixels with at least 32 colours, passed
+    all `295/295` gates, and matched the sentinel. Snapshot generation 5 committed the version-6
+    payload at 1,755,656 bytes; scratch returned to zero and the resource census reported no frame,
+    mapping, registry, retype, untyped-allocation, or allocator failures.
+
+    Review adjustment: native byte-range capture, access, local conflict/wait ownership, provider
+    IRP projection, cancellation, and completion are closed. Continue with
+    `NtNotifyChangeDirectoryFile`: first audit its existing export/service registration and the
+    namespace mutation points, then put notification registration, filtering, buffering, overflow,
+    cancellation, and cleanup in the filesystem owner. Provider-backed directories must receive
+    real `IRP_MJ_DIRECTORY_CONTROL`/`IRP_MN_NOTIFY_CHANGE_DIRECTORY` requests; the executive must
+    not poll directories, infer changes from syscall names, or synthesize successful notifications.
