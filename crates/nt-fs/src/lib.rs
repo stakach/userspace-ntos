@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+mod byte_lock;
 mod directory;
 mod fat_directory;
 mod file_backing;
@@ -23,6 +24,7 @@ mod status;
 mod volume;
 
 pub use directory::*;
+pub use byte_lock::*;
 pub use fat_directory::*;
 pub use file_backing::FileBacking;
 pub use fs::{
