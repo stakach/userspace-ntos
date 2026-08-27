@@ -3554,8 +3554,22 @@ unsafe fn observe_completed_dialog_modal_dispatch(
     if !owner_matches {
         return;
     }
-    let hwnd = smss_stack_read(dispatch.args[0]);
-    let message = smss_stack_read(dispatch.args[0] + 8) as u32;
+    let (hwnd, message) = if dispatch.ssn == nt_user_callback::NTUSER_DISPATCH_MESSAGE_SSN {
+        if dispatch.arg_snapshot_len as usize >= 12 {
+            (
+                u64::from_le_bytes(dispatch.arg_snapshot[0..8].try_into().unwrap()),
+                u32::from_le_bytes(dispatch.arg_snapshot[8..12].try_into().unwrap()),
+            )
+        } else {
+            print_str(b"[dialog-pump] ERROR completed DispatchMessage snapshot missing\n");
+            (0, 0)
+        }
+    } else {
+        (
+            smss_stack_read(dispatch.args[0]),
+            smss_stack_read(dispatch.args[0] + 8) as u32,
+        )
+    };
     let _ = winlogon_dialog_modal_observe(dispatch.ssn, dispatch.status, hwnd, message);
 }
 

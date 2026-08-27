@@ -15,7 +15,7 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use nt_status::NtStatus;
-use nt_types::{AccessMask, ClientId, NtPath, ObjectId};
+use nt_types::{ClientId, NtPath, ObjectId};
 
 mod banked_transfer;
 mod cancel;
@@ -35,6 +35,7 @@ mod ea;
 mod external_dispatch;
 mod fault;
 mod file;
+mod file_information;
 mod hosted_domain;
 mod irp;
 mod mock_driver;
@@ -87,6 +88,10 @@ pub use external_dispatch::{
     ExternalDispatchResult, ExternalPnpDispatchResult, PreparedExternalPnpIrp,
 };
 pub use file::{CreateOptions, FileFlags, FileRecord, FileState, ShareAccess};
+pub use file_information::{
+    query_information_contract, set_information_access_granted, set_information_contract,
+    FileInformationContract,
+};
 pub use hosted_domain::{HostedDomainIdentity, HostedDomainRecord, HostedProviderIdentity};
 pub use irp::{
     BufferAccess, CancelState, CreateParameters, DeviceControlParameters, InformationParameters,
@@ -152,33 +157,6 @@ pub(crate) const fn is_create_major(major: u8) -> bool {
             | nt_io_abi::major::IRP_MJ_CREATE_NAMED_PIPE
             | nt_io_abi::major::IRP_MJ_CREATE_MAILSLOT
     )
-}
-
-/// Apply the NT set-information access table to an already-granted File mask.
-/// Unknown classes carry no pre-dispatch requirement; the filesystem still
-/// decides whether the class itself is supported.
-pub fn set_information_access_granted(granted: AccessMask, information_class: u32) -> bool {
-    const FILE_WRITE_DATA: u32 = 0x0000_0002;
-    const FILE_WRITE_EA: u32 = 0x0000_0010;
-    const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
-    let required = match information_class {
-        4 | 23 | 25 => FILE_WRITE_ATTRIBUTES,
-        10 | 13 | 40 | 64 => AccessMask::DELETE.bits(),
-        15 => FILE_WRITE_EA,
-        19 | 20 | 31 | 36 | 39 => FILE_WRITE_DATA,
-        _ => 0,
-    };
-    if required == 0 {
-        return true;
-    }
-    let granted = granted.bits();
-    if granted & AccessMask::GENERIC_ALL.bits() != 0 {
-        return true;
-    }
-    if required != AccessMask::DELETE.bits() && granted & AccessMask::GENERIC_WRITE.bits() != 0 {
-        return true;
-    }
-    granted & required == required
 }
 
 /// The canonical I/O Manager (spec §6): owns the driver / device / file / IRP

@@ -14426,3 +14426,47 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     provider; implement and host-test the native ABI at that owning crate; then wire only capture,
     probing, dispatch, and completion in the executive. Unsupported operations must remain explicit
     errors until their real owner exists, with no fabricated metadata or success fallback.
+
+    File-information operation contract (2026-08-27, accepted): the I/O Manager now owns one
+    explicit ReactOS NT5 query/set class table, extended only for the later classes 41 and 64 that
+    the kernel already implements, with each valid operation's native minimum buffer length and
+    required File access. `NtQueryInformationFile` and `NtSetInformationFile` reject an invalid
+    information class before probing caller buffers or resolving a handle, reject a valid class's
+    short buffer as `STATUS_INFO_LENGTH_MISMATCH`, and enforce the operation's access contract for
+    local and provider-backed Files alike. Unknown set classes can no longer pass a zero-access
+    check and reach an FSD. Valid filesystem-owned classes still dispatch to the real provider or
+    return the local filesystem's explicit unsupported result; the table does not manufacture an
+    implementation or successful completion.
+
+    Query probing, alignment, typed File-handle validation, and access enforcement now happen once
+    before route selection. Five route-local copies of that boundary are removed. The same retained
+    I/O-Manager metadata supplies fixed query classes and the I/O-Manager fields seeded into a
+    provider `FileAllInformation` buffer. The existing set-access helper is now a compatibility
+    wrapper over the authoritative contract and fails closed for unknown classes.
+
+    The acceptance run also closed a real callback evidence race instead of weakening its gate.
+    `NtUserDispatchMessage` input is staged in win32k's shared argument page, which nested callbacks
+    can legitimately reuse while the outer dispatch is parked. The existing callback-frame argument
+    snapshot now retains that 48-byte MSG with its exact dispatch continuation, and the modal-pump
+    observer consumes the immutable completed-frame copy. The former post-return reread of the
+    caller's reused stack MSG is gone. The accepted run reports 12 dialog paints, a drained queue,
+    and zero modal-pump errors.
+
+    Focused validation passes `nt-io-manager` `214/214`; the freestanding executive remains at the
+    established 211-warning baseline. Serialized acceptance
+    `.tmp/run-headless-file-information-contract-final-20260827.log` launched genuine userinit and
+    Explorer, completed 668 Explorer api0 redirects with zero callback failures, painted
+    `480000/480000` framebuffer pixels with at least 32 colours, passed all `295/295` gates, and
+    matched the sentinel. The writable snapshot committed generation 5 at 1,749,998 bytes; scratch
+    returned to zero, and the resource census reported no frame, mapping, registry, retype, or
+    allocator failures.
+
+    Review adjustment: the common File-information validity, length, access, and probe boundary is
+    closed. The next real local query class is `FileAlternateNameInformation`, which ReactOS FastFAT
+    answers from the directory record's 8.3 alias. `nt-fs` already parses that alias but
+    `FatOpenMetadata` and the FAT open descriptions currently discard it. Retain the exact on-disk
+    alias with the FAT File object and add the variable-length ABI encoder crate-first. Do not
+    generate an alias for FAT entries that do not have one, and do not claim MemFs support until a
+    real short-name policy and storage model exist. Provider-backed Files must continue through
+    `IRP_MJ_QUERY_INFORMATION`; the remaining stream, compression, object-id, quota, and reparse
+    classes stay explicit filesystem capability gaps until their owning filesystem implements them.

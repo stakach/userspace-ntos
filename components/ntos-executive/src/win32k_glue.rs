@@ -1182,21 +1182,27 @@ fn staged_userconnect_has_sharedinfo(len: u64) -> bool {
         && staged_userconnect_u64(win32k_subsystem::UC_SI_AHELIST) != 0
 }
 
-/// If the dispatch currently parked behind this callback has already materialized an in/out
-/// USERCONNECT buffer, bind that buffer to the callback frame before a nested win32k dispatch can
-/// reuse `WIN32K_ARG_VADDR`.
+/// If the dispatch currently parked behind this callback has materialized arguments in the shared
+/// dispatch page, bind them to the callback frame before a nested win32k dispatch can reuse that
+/// page.
 unsafe fn remember_active_dispatch_arg_snapshot(
     request: &nt_user_callback::CallbackHeader,
 ) -> bool {
     let context = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
-    if context.ssn != win32k_subsystem::SSN_NT_USER_INITIALIZE {
-        return true;
+    let len = match context.ssn {
+        win32k_subsystem::SSN_NT_USER_INITIALIZE => context.args[2],
+        nt_user_callback::NTUSER_DISPATCH_MESSAGE_SSN => {
+            u64::from(nt_user_callback::DISPATCH_MESSAGE_OUTPUT_BYTES)
+        }
+        _ => return true,
     }
-    let len = context.args[2].min(win32k_subsystem::WIN32K_ARG_GENERAL_BYTES);
+    .min(win32k_subsystem::WIN32K_ARG_GENERAL_BYTES);
     if len == 0 || len as usize > nt_user_callback::DISPATCH_ARG_SNAPSHOT_BYTES {
         return false;
     }
-    if !staged_userconnect_has_sharedinfo(len) {
+    if context.ssn == win32k_subsystem::SSN_NT_USER_INITIALIZE
+        && !staged_userconnect_has_sharedinfo(len)
+    {
         return true;
     }
     let snapshot = core::slice::from_raw_parts(
@@ -3408,6 +3414,12 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             let _ = release_win32k_message_stage(stage);
         } else {
             outer_dispatch.provider_output_len = u32::MAX;
+        }
+    } else if dispatch_context.ssn == nt_user_callback::NTUSER_DISPATCH_MESSAGE_SSN {
+        let frame_snapshot_len = completed_frame.arg_snapshot_len() as usize;
+        if frame_snapshot_len != 0 {
+            let snapshot = &completed_frame.arg_snapshot()[..frame_snapshot_len];
+            let _ = outer_dispatch.set_arg_snapshot(snapshot);
         }
     } else if dispatch_context.ssn == win32k_subsystem::SSN_NT_USER_INITIALIZE
         && component.result == 0

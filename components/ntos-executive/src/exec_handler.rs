@@ -29690,6 +29690,30 @@ impl ExecNtHandler {
                 let output = args[2];
                 let length = nt_ulong_arg(args[3]) as usize;
                 let class = nt_ulong_arg(args[4]);
+                let Some(contract) = nt_io_manager::query_information_contract(class) else {
+                    return nt_fs::STATUS_INVALID_INFO_CLASS;
+                };
+                if length < contract.minimum_length() {
+                    return nt_fs::STATUS_INFO_LENGTH_MISMATCH;
+                }
+                if iosb == 0 || output == 0 {
+                    return nt_syscall::STATUS_ACCESS_VIOLATION;
+                }
+                if iosb & 7 != 0 || output & 3 != 0 {
+                    return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
+                }
+                if !self.probe_user_output(iosb, 16) || !self.probe_user_output(output, length) {
+                    return nt_syscall::STATUS_ACCESS_VIOLATION;
+                }
+                let io_metadata = match self.io_manager_file_query_metadata(args[0]) {
+                    Ok(metadata) => metadata,
+                    Err(status) => return status,
+                };
+                if !contract.access_granted(nt_types::AccessMask::from_bits_retain(
+                    io_metadata.access_flags,
+                )) {
+                    return STATUS_ACCESS_DENIED;
+                }
                 let named_query = matches!(
                     class,
                     nt_fs::FILE_NAME_INFORMATION | nt_fs::FILE_ALL_INFORMATION
@@ -29703,9 +29727,6 @@ impl ExecNtHandler {
                     }
                     _ => None,
                 };
-                if named_minimum.is_some_and(|minimum| length < minimum) {
-                    return nt_fs::STATUS_INFO_LENGTH_MISMATCH;
-                }
                 if matches!(
                     class,
                     nt_fs::FILE_ACCESS_INFORMATION
@@ -29722,21 +29743,7 @@ impl ExecNtHandler {
                         Ok(required) => required,
                         Err(status) => return status,
                     };
-                    if iosb == 0 || output == 0 {
-                        return nt_syscall::STATUS_ACCESS_VIOLATION;
-                    }
-                    if iosb & 7 != 0 || output & 3 != 0 {
-                        return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
-                    }
-                    if !self.probe_user_output(iosb, 16) || !self.probe_user_output(output, length)
-                    {
-                        return nt_syscall::STATUS_ACCESS_VIOLATION;
-                    }
-                    let metadata = match self.io_manager_file_query_metadata(args[0]) {
-                        Ok(metadata) => metadata,
-                        Err(status) => return status,
-                    };
-                    nt_fs::encode_query_information(class, metadata, &mut encoded)
+                    nt_fs::encode_query_information(class, io_metadata, &mut encoded)
                         .expect("validated I/O Manager file query class and length");
                     let mut iosb_bytes = [0u8; 16];
                     iosb_bytes[8..].copy_from_slice(&(required as u64).to_le_bytes());
@@ -29749,19 +29756,6 @@ impl ExecNtHandler {
                 }
                 if class == 41 {
                     const FILE_IO_COMPLETION_NOTIFICATION_INFORMATION_LEN: usize = 4;
-                    if length < FILE_IO_COMPLETION_NOTIFICATION_INFORMATION_LEN {
-                        return nt_io_completion::STATUS_INFO_LENGTH_MISMATCH;
-                    }
-                    if iosb == 0 || output == 0 {
-                        return nt_syscall::STATUS_ACCESS_VIOLATION;
-                    }
-                    if iosb & 7 != 0 || output & 3 != 0 {
-                        return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
-                    }
-                    if !self.probe_user_output(iosb, 16) || !self.probe_user_output(output, length)
-                    {
-                        return nt_syscall::STATUS_ACCESS_VIOLATION;
-                    }
                     let route = match self.hosted_file_route_for(args[0]) {
                         Some(route) => route,
                         None => return nt_fs::STATUS_INVALID_HANDLE,
@@ -29805,29 +29799,14 @@ impl ExecNtHandler {
                     return status;
                 }
                 if let Some(route) = self.hosted_file_route_for(args[0]) {
-                    if iosb == 0 || output == 0 {
-                        return nt_syscall::STATUS_ACCESS_VIOLATION;
-                    }
-                    if iosb & 7 != 0 || output & 3 != 0 {
-                        return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
-                    }
-                    if !self.probe_user_output(iosb, 16) || !self.probe_user_output(output, length)
-                    {
-                        return nt_syscall::STATUS_ACCESS_VIOLATION;
-                    }
-
                     let mut routed_output = match try_zeroed_transfer_buffer(length) {
                         Ok(output) => output,
                         Err(status) => return status,
                     };
                     let output_capacity = routed_output.len();
                     if class == nt_fs::FILE_ALL_INFORMATION {
-                        let metadata = match self.io_manager_file_query_metadata(args[0]) {
-                            Ok(metadata) => metadata,
-                            Err(status) => return status,
-                        };
                         if let Err(status) = nt_fs::encode_file_all_io_manager_information(
-                            metadata,
+                            io_metadata,
                             &mut routed_output,
                         ) {
                             return status;
@@ -29969,17 +29948,6 @@ impl ExecNtHandler {
                     return status;
                 }
                 if named_query {
-                    if iosb == 0 || output == 0 {
-                        return nt_syscall::STATUS_ACCESS_VIOLATION;
-                    }
-                    if iosb & 7 != 0 || output & 3 != 0 {
-                        return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
-                    }
-                    if !self.probe_user_output(iosb, 16)
-                        || !self.probe_user_output(output, length)
-                    {
-                        return nt_syscall::STATUS_ACCESS_VIOLATION;
-                    }
                     let state = match self.local_file_query_state(args[0], true) {
                         Ok(state) => state,
                         Err(status) => return status,
@@ -30039,15 +30007,6 @@ impl ExecNtHandler {
                     Ok(required) => required,
                     Err(status) => return status,
                 };
-                if iosb == 0 || output == 0 {
-                    return nt_syscall::STATUS_ACCESS_VIOLATION;
-                }
-                if iosb & 7 != 0 || output & 3 != 0 {
-                    return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
-                }
-                if !self.probe_user_output(iosb, 16) || !self.probe_user_output(output, length) {
-                    return nt_syscall::STATUS_ACCESS_VIOLATION;
-                }
                 let state = match self.local_file_query_state(args[0], false) {
                     Ok(state) => state,
                     Err(status) => return status,
@@ -31932,6 +31891,13 @@ impl ExecNtHandler {
                 let iosb = args[1]; // RDX = *IO_STATUS_BLOCK
                 let information_class = nt_ulong_arg(args[4]);
                 let length = nt_ulong_arg(args[3]) as usize;
+                let Some(contract) = nt_io_manager::set_information_contract(information_class)
+                else {
+                    return nt_fs::STATUS_INVALID_INFO_CLASS;
+                };
+                if length < contract.minimum_length() {
+                    return nt_fs::STATUS_INFO_LENGTH_MISMATCH;
+                }
                 let overlay_file = self.overlay_file_id_for(args[0]);
                 if iosb == 0 || !self.probe_user_output(iosb, 16) {
                     return STATUS_ACCESS_VIOLATION;
@@ -31976,10 +31942,7 @@ impl ExecNtHandler {
                     self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
                     return nt_fs::STATUS_INVALID_HANDLE;
                 };
-                if !nt_io_manager::set_information_access_granted(
-                    nt_types::AccessMask::from_bits_retain(granted_access),
-                    information_class,
-                ) {
+                if !contract.access_granted(nt_types::AccessMask::from_bits_retain(granted_access)) {
                     self.xas_write_buf(iosb, &STATUS_ACCESS_DENIED.to_le_bytes());
                     self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
                     return STATUS_ACCESS_DENIED;
