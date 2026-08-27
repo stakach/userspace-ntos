@@ -90,7 +90,8 @@ pub use hosted_domain::{HostedDomainIdentity, HostedDomainRecord, HostedProvider
 pub use irp::{
     BufferAccess, CancelState, CreateParameters, DeviceControlParameters, InformationParameters,
     IoBufferRef, IoParameters, IoStackLocation, IrpCompletionOrigin, IrpRecord, IrpState,
-    PnpParameters, PnpStartParameters, ReadWriteParameters, StackControl, StackFlags,
+    PnpParameters, PnpStartParameters, ReadWriteParameters, SetInformationParameters, StackControl,
+    StackFlags,
 };
 pub use mock_driver::{IoctlBehavior, MockDriverBackend};
 pub use object_port::{MockObjectPort, ObjectManagerPort};
@@ -823,6 +824,15 @@ impl<P> IoManager<P> {
             if current.file_id != record.file_id {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
+            if record.file_id.is_none()
+                && match &current.parameters {
+                    IoParameters::Create(parameters) => parameters.related_file.is_some(),
+                    IoParameters::SetInformation(parameters) => parameters.target_file.is_some(),
+                    _ => false,
+                }
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
         }
         if let Some(file_id) = record.file_id {
             let file = self.files.get(file_id).ok_or(NtStatus::INVALID_HANDLE)?;
@@ -845,11 +855,22 @@ impl<P> IoManager<P> {
             {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
-            let related_file = match record.current_stack().map(|stack| &stack.parameters) {
+            let (related_file, target_file) = match record
+                .current_stack()
+                .map(|stack| &stack.parameters)
+            {
                 Some(IoParameters::Create(parameters)) if is_create_major(record.origin_major) => {
-                    parameters.related_file
+                    (parameters.related_file, None)
                 }
-                _ => None,
+                Some(IoParameters::SetInformation(parameters))
+                    if record.origin_major == nt_io_abi::major::IRP_MJ_SET_INFORMATION =>
+                {
+                    (None, parameters.target_file)
+                }
+                Some(IoParameters::Create(_)) | Some(IoParameters::SetInformation(_)) => {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                }
+                _ => (None, None),
             };
             if let Some(related_file) = related_file {
                 let parent = self
@@ -869,6 +890,23 @@ impl<P> IoManager<P> {
                     .checked_add(1)
                     .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
             }
+            if let Some(target_file) = target_file {
+                let target = self
+                    .files
+                    .get(target_file)
+                    .ok_or(NtStatus::INVALID_HANDLE)?;
+                if target_file == file_id
+                    || target.client_id != record.client_id
+                    || target.device_id != file.device_id
+                    || !target.state.is_open()
+                {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                }
+                target
+                    .outstanding_irp_refs
+                    .checked_add(1)
+                    .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+            }
             if !is_create_major(record.origin_major) {
                 record.user_data = file.driver_context.unwrap_or(0);
             }
@@ -884,6 +922,12 @@ impl<P> IoManager<P> {
                 self.files
                     .get_mut(related_file)
                     .expect("validated related File")
+                    .outstanding_irp_refs += 1;
+            }
+            if let Some(target_file) = target_file {
+                self.files
+                    .get_mut(target_file)
+                    .expect("validated set-information target File")
                     .outstanding_irp_refs += 1;
             }
         }
@@ -933,6 +977,26 @@ impl<P> IoManager<P> {
             };
             if close_deferred {
                 self.queue_deferred_file_close(related_file);
+            }
+        }
+        let target_file = match record.current_stack().map(|stack| &stack.parameters) {
+            Some(IoParameters::SetInformation(parameters)) => parameters.target_file,
+            _ => None,
+        };
+        if let Some(target_file) = target_file {
+            let close_deferred = {
+                let target = self
+                    .files
+                    .get_mut(target_file)
+                    .expect("canonical target FILE_OBJECT disappeared before SET IRP");
+                target.outstanding_irp_refs = target
+                    .outstanding_irp_refs
+                    .checked_sub(1)
+                    .expect("canonical target FILE_OBJECT IRP reference underflow");
+                target.close_deferred
+            };
+            if close_deferred {
+                self.queue_deferred_file_close(target_file);
             }
         }
         Some(record)
@@ -2912,9 +2976,10 @@ mod tests {
             0,
         ));
         let mut buf = *b"input";
-        let params = IoParameters::SetInformation(InformationParameters {
+        let params = IoParameters::SetInformation(SetInformationParameters {
             info_class: 23,
             length: buf.len() as u32,
+            ..Default::default()
         });
 
         let result = om
@@ -3067,9 +3132,10 @@ mod tests {
                 0,
                 42,
                 major::IRP_MJ_SET_INFORMATION,
-                IoParameters::SetInformation(InformationParameters {
+                IoParameters::SetInformation(SetInformationParameters {
                     info_class: 4,
                     length: 0,
+                    ..Default::default()
                 }),
                 0,
                 0,
@@ -3567,6 +3633,167 @@ mod tests {
     }
 
     #[test]
+    fn pending_set_information_retains_target_until_irp_ack() {
+        let mut om = io();
+        let client = om.register_client();
+        let driver = om
+            .create_kernel_driver_with_majors(
+                &path("\\Driver\\PendingSetInformation"),
+                Box::new(PendingSetInformationBackend::default()),
+                &[
+                    major::IRP_MJ_SET_INFORMATION,
+                    major::IRP_MJ_CLEANUP,
+                    major::IRP_MJ_CLOSE,
+                ],
+            )
+            .unwrap();
+        let device = om
+            .create_device(
+                driver,
+                Some(&path("\\Device\\PendingSetInformation0")),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let open_file = |om: &mut IoManager<MockObjectPort>, name: &str, options| {
+            let file = om
+                .allocate_external_file(
+                    client,
+                    device,
+                    AccessMask::GENERIC_READ,
+                    ShareAccess::READ,
+                    options,
+                    nt_types::UnicodeString::from_str(name),
+                )
+                .unwrap();
+            let record = om.file_mut(file).unwrap();
+            assert!(record.transition(FileState::CreateIrpDispatched));
+            assert!(record.transition(FileState::Open));
+            file
+        };
+        let source = open_file(&mut om, "source", CreateOptions::empty());
+        let target = open_file(&mut om, "target", CreateOptions::DIRECTORY_FILE);
+        let mut rename = [0u8; 24];
+        let pending = om
+            .build_and_dispatch_external_to_device(
+                client,
+                device,
+                Some(source),
+                0,
+                93,
+                major::IRP_MJ_SET_INFORMATION,
+                IoParameters::SetInformation(SetInformationParameters {
+                    info_class: 10,
+                    length: rename.len() as u32,
+                    target_file: Some(target),
+                    replace_if_exists: true,
+                }),
+                rename.len() as u32,
+                0,
+                &mut rename,
+            )
+            .unwrap();
+        let ExternalDispatchResult::Pending { irp_id } = pending else {
+            panic!("expected pending SET_INFORMATION")
+        };
+        assert_eq!(om.file(source).unwrap().outstanding_irp_refs, 1);
+        assert_eq!(om.file(target).unwrap().outstanding_irp_refs, 1);
+
+        om.release_external_file(client, target).unwrap();
+        assert!(om.file(target).unwrap().close_deferred);
+        assert_eq!(om.file(target).unwrap().outstanding_irp_refs, 1);
+        assert!(om.publish_driver_completion(
+            driver,
+            DriverCompletion {
+                irp_id,
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: None,
+            }
+        ));
+        assert_eq!(om.file(target).unwrap().outstanding_irp_refs, 1);
+        om.acknowledge_completed_irp(irp_id).unwrap();
+        assert_eq!(om.file(source).unwrap().outstanding_irp_refs, 0);
+        assert_eq!(om.file(target).unwrap().outstanding_irp_refs, 0);
+        assert_eq!(om.pump(), 1);
+        assert!(om.file(target).is_none());
+    }
+
+    #[test]
+    fn set_information_target_rejects_stale_cross_client_and_cross_device_files() {
+        let mut om = io();
+        let client = ClientId(1);
+        let driver = a_driver(&mut om);
+        let device = a_device(&mut om, driver);
+        let other_driver = om
+            .create_driver(
+                &path("\\Driver\\OtherSetTarget"),
+                Box::new(MockDriverBackend::new()),
+            )
+            .unwrap();
+        let other_device = a_device(&mut om, other_driver);
+        let add_open = |om: &mut IoManager<MockObjectPort>, owner, device, name| {
+            let file = om.add_file(FileRecord::new(
+                ObjectId::NULL,
+                owner,
+                device,
+                AccessMask::GENERIC_READ,
+                ShareAccess::READ,
+                CreateOptions::empty(),
+                path(name).to_unicode_string(),
+            ));
+            let record = om.file_mut(file).unwrap();
+            assert!(record.transition(FileState::CreateIrpDispatched));
+            assert!(record.transition(FileState::Open));
+            file
+        };
+        let source = add_open(&mut om, client, device, "\\source");
+        let valid_target = add_open(&mut om, client, device, "\\target");
+        let foreign_target = add_open(&mut om, ClientId(2), device, "\\foreign");
+        let other_device_target = add_open(&mut om, client, other_device, "\\other");
+        let make_irp = |om: &IoManager<MockObjectPort>, target_file| {
+            om.build_irp_record(
+                client,
+                driver,
+                device,
+                Some(source),
+                major::IRP_MJ_SET_INFORMATION,
+                IoParameters::SetInformation(SetInformationParameters {
+                    info_class: 10,
+                    length: 24,
+                    target_file: Some(target_file),
+                    replace_if_exists: false,
+                }),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            om.allocate_irp(make_irp(&om, FileId::NULL)),
+            Err(NtStatus::INVALID_HANDLE)
+        );
+        assert_eq!(
+            om.allocate_irp(make_irp(&om, foreign_target)),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        assert_eq!(
+            om.allocate_irp(make_irp(&om, other_device_target)),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        assert_eq!(om.file(source).unwrap().outstanding_irp_refs, 0);
+        assert_eq!(om.file(valid_target).unwrap().outstanding_irp_refs, 0);
+
+        let irp = om.allocate_irp(make_irp(&om, valid_target)).unwrap();
+        assert_eq!(om.file(source).unwrap().outstanding_irp_refs, 1);
+        assert_eq!(om.file(valid_target).unwrap().outstanding_irp_refs, 1);
+        om.free_irp(irp).unwrap();
+        assert_eq!(om.file(source).unwrap().outstanding_irp_refs, 0);
+        assert_eq!(om.file(valid_target).unwrap().outstanding_irp_refs, 0);
+    }
+
+    #[test]
     fn external_named_pipe_create_uses_the_canonical_file_lifecycle() {
         let mut om = io();
         let client = ClientId(67);
@@ -3776,6 +4003,43 @@ mod tests {
     #[derive(Default)]
     struct PendingCreateBackend {
         ready: std::vec::Vec<DriverCompletion>,
+    }
+
+    #[derive(Default)]
+    struct PendingSetInformationBackend {
+        ready: std::vec::Vec<DriverCompletion>,
+    }
+
+    impl DriverDispatchBackend for PendingSetInformationBackend {
+        fn dispatch_irp(
+            &mut self,
+            _ctx: DispatchContext<'_>,
+            irp: &IrpProjection,
+        ) -> Result<DispatchOutcome, NtStatus> {
+            if irp.major == major::IRP_MJ_SET_INFORMATION {
+                Ok(DispatchOutcome::Pending)
+            } else {
+                Ok(DispatchOutcome::Completed {
+                    status: NtStatus::SUCCESS,
+                    information: 0,
+                    file_context: None,
+                })
+            }
+        }
+
+        fn cancel_irp(&mut self, irp_id: IrpId) -> Result<(), NtStatus> {
+            self.ready.push(DriverCompletion {
+                irp_id,
+                status: NtStatus::CANCELLED,
+                information: 0,
+                file_context: None,
+            });
+            Ok(())
+        }
+
+        fn poll_completion(&mut self) -> Option<DriverCompletion> {
+            self.ready.pop()
+        }
     }
 
     impl DriverDispatchBackend for PendingCreateBackend {
@@ -5066,6 +5330,66 @@ mod tests {
     }
 
     #[test]
+    fn peer_set_information_wire_carries_canonical_target_and_flags() {
+        let control = MockPeerControl::new();
+        let (mut om, client, handle, _) = peer_device(&control, AccessMask::GENERIC_READ);
+        let (source, device, _) = om
+            .reference_open_file_details(client, handle, AccessMask::GENERIC_READ)
+            .unwrap();
+        let target = om
+            .allocate_external_file(
+                client,
+                device,
+                AccessMask::GENERIC_READ,
+                ShareAccess::READ,
+                CreateOptions::DIRECTORY_FILE,
+                nt_types::UnicodeString::from_str("target"),
+            )
+            .unwrap();
+        let target_record = om.file_mut(target).unwrap();
+        assert!(target_record.transition(FileState::CreateIrpDispatched));
+        assert!(target_record.transition(FileState::Open));
+        let mut rename = [0u8; 24];
+
+        assert_eq!(
+            om.build_and_dispatch_external_to_device(
+                client,
+                device,
+                Some(source),
+                0,
+                17,
+                major::IRP_MJ_SET_INFORMATION,
+                IoParameters::SetInformation(SetInformationParameters {
+                    info_class: 10,
+                    length: rename.len() as u32,
+                    target_file: Some(target),
+                    replace_if_exists: true,
+                }),
+                rename.len() as u32,
+                0,
+                &mut rename,
+            ),
+            Ok(ExternalDispatchResult::Completed {
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: None,
+            })
+        );
+        let request = control.last_request().unwrap();
+        assert_eq!(request.major, major::IRP_MJ_SET_INFORMATION);
+        assert_eq!(request.ioctl_code, 10);
+        assert_eq!(request.input_len, rename.len() as u32);
+        assert_eq!(request.output_len, 0);
+        assert_eq!(request.target_file_id, target.raw());
+        assert_eq!(
+            request.set_information_flags,
+            nt_io_abi::IRP_DISPATCH_SET_REPLACE_IF_EXISTS
+        );
+        assert_eq!(om.file(source).unwrap().outstanding_irp_refs, 0);
+        assert_eq!(om.file(target).unwrap().outstanding_irp_refs, 0);
+    }
+
+    #[test]
     fn peer_direct_and_neither_ioctls_round_trip_split_buffers() {
         let ctrl = MockPeerControl::new();
         let (mut om, client, handle, _identity) =
@@ -5480,6 +5804,32 @@ mod tests {
         assert_eq!(le_u32(&stack, 0x10), 0x20);
         assert_eq!(le_u32(&stack, 0x18), 0x333000);
         assert_eq!(le_u64(&stack, 0x20), 0x6666);
+        assert_eq!(le_u64(&stack, 0x28), 0x4444);
+        assert_eq!(le_u64(&stack, 0x30), 0x5555);
+
+        write_wdm_io_stack_location(
+            &mut stack,
+            WdmIoStackLocationInit {
+                major: major::IRP_MJ_SET_INFORMATION,
+                minor: 0,
+                flags: 0,
+                control: 0,
+                device_object: 0x4444,
+                file_object: 0x5555,
+                parameters: WdmIoStackParameters::SetInformation {
+                    length: 0x30,
+                    information_class: 10,
+                    target_file_object: 0x7777,
+                    replace_if_exists: true,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(stack[0x00], major::IRP_MJ_SET_INFORMATION);
+        assert_eq!(le_u32(&stack, 0x08), 0x30);
+        assert_eq!(le_u32(&stack, 0x10), 10);
+        assert_eq!(le_u64(&stack, 0x18), 0x7777);
+        assert_eq!(stack[0x20], 1);
         assert_eq!(le_u64(&stack, 0x28), 0x4444);
         assert_eq!(le_u64(&stack, 0x30), 0x5555);
 

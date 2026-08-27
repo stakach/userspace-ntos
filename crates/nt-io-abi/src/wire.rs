@@ -90,7 +90,8 @@ pub struct IrpDispatchRequest {
     pub minor: u8,
     pub _reserved0: u16,
     pub flags: u32,
-    pub _reserved1: u32,
+    /// Set-information flags; zero for every other major function.
+    pub set_information_flags: u32,
     pub target_domain_id: u64,
     pub target_domain_cookie: u64,
     pub provider_domain_id: u64,
@@ -101,6 +102,8 @@ pub struct IrpDispatchRequest {
     pub file_id: u64,
     /// Canonical parent File for a handle-relative CREATE, or zero.
     pub related_file_id: u64,
+    /// Canonical target-directory File for rename/link SET_INFORMATION, or zero.
+    pub target_file_id: u64,
     pub buffer_id: u64,
     pub buffer_offset: u64,
     pub buffer_len: u32,
@@ -158,7 +161,7 @@ const _: () = {
     assert!(size_of::<IoDeviceControlRequest>() == 56);
     assert!(size_of::<IoFileRequest>() == 16);
     assert!(size_of::<IoCancelRequest>() == 16);
-    assert!(size_of::<IrpDispatchRequest>() == 184);
+    assert!(size_of::<IrpDispatchRequest>() == 192);
     assert!(size_of::<IoReply>() == 32);
     assert!(align_of::<IoReadWriteRequest>() == 8);
     assert!(align_of::<IrpDispatchRequest>() == 8);

@@ -24,7 +24,10 @@ pub use wire::{
 };
 
 /// ABI version of this wire contract; bumped on any incompatible change.
-pub const IO_ABI_VERSION: u32 = 6;
+pub const IO_ABI_VERSION: u32 = 7;
+
+/// `IRP_MJ_SET_INFORMATION` carries `SL_REPLACE_IF_EXISTS` in this bit.
+pub const IRP_DISPATCH_SET_REPLACE_IF_EXISTS: u32 = 0x0000_0001;
 
 /// Generation bits in an I/O id (spec §9: high 24 gen / low 40 slot).
 pub const IO_ID_GEN_BITS: u32 = 24;
@@ -196,6 +199,8 @@ mod tests {
             device_id: 0x300,
             file_id: 0x400,
             related_file_id: 0x500,
+            target_file_id: 0x600,
+            set_information_flags: IRP_DISPATCH_SET_REPLACE_IF_EXISTS,
             stack_location: 1,
             stack_count: 3,
             ..Default::default()

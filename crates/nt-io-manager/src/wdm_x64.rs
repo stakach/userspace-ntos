@@ -102,6 +102,8 @@ pub enum WdmIoStackParameters {
     SetInformation {
         length: u32,
         information_class: u32,
+        target_file_object: u64,
+        replace_if_exists: bool,
     },
     DeviceControl {
         output_buffer_length: u32,
@@ -289,13 +291,20 @@ pub fn write_wdm_io_stack_location(
         WdmIoStackParameters::QueryInformation {
             length,
             information_class,
-        }
-        | WdmIoStackParameters::SetInformation {
-            length,
-            information_class,
         } => {
             put_u32(bytes, 0x08, length);
             put_u32(bytes, 0x10, information_class);
+        }
+        WdmIoStackParameters::SetInformation {
+            length,
+            information_class,
+            target_file_object,
+            replace_if_exists,
+        } => {
+            put_u32(bytes, 0x08, length);
+            put_u32(bytes, 0x10, information_class);
+            put_u64(bytes, 0x18, target_file_object);
+            put_u8(bytes, 0x20, u8::from(replace_if_exists));
         }
         WdmIoStackParameters::DeviceControl {
             output_buffer_length,

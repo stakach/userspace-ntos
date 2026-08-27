@@ -69,7 +69,9 @@ use nt_hosted_runtime::{
     NDIS_MINIPORT_INTERRUPT_LEN_X64, NDIS_MINIPORT_TIMER_LEN_X64,
     NDIS_PROTOCOL_CHARACTERISTICS_NAME_OFFSET_X64,
 };
-use nt_io_abi::{ioctl, major, IrpDispatchRequest, IO_ABI_VERSION};
+use nt_io_abi::{
+    ioctl, major, IrpDispatchRequest, IO_ABI_VERSION, IRP_DISPATCH_SET_REPLACE_IF_EXISTS,
+};
 use nt_io_manager::{
     write_wdm_driver_object, write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
     BankedTransferCursor, CreateOptions, CreateParameters, DeviceCharacteristics,
@@ -80,7 +82,8 @@ use nt_io_manager::{
     HostedDevicePropertyTransferError, HostedDevicePropertyTransferTable, HostedDomainIdentity,
     InformationParameters, IoManager, IoParameters, IrpCompletionOrigin, IrpId, IrpProjection,
     MajorFunctionTable, ObjectManagerPort, PnpBackendDispatch, PnpParameters, ReadWriteParameters,
-    ShareAccess, WdmDriverObjectInit, WdmFileObjectInit, WdmIoStackLocationInit,
+    SetInformationParameters, ShareAccess, WdmDriverObjectInit, WdmFileObjectInit,
+    WdmIoStackLocationInit,
     WdmIoStackParameters, WdmIrpInit, WDM_X64_DRIVER_EXTENSION_OFFSET,
     WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET,
     WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET, WDM_X64_FILE_OBJECT_SIZE,
@@ -30890,11 +30893,27 @@ const fn valid_related_file_relation(is_create: bool, file_id: u64, related_file
     related_file_id == 0 || (is_create && related_file_id != file_id)
 }
 
+const fn valid_set_information_relation(
+    is_set_information: bool,
+    file_id: u64,
+    target_file_id: u64,
+    flags: u32,
+) -> bool {
+    (target_file_id == 0 || (is_set_information && target_file_id != file_id))
+        && flags & !IRP_DISPATCH_SET_REPLACE_IF_EXISTS == 0
+        && (is_set_information || flags == 0)
+}
+
 const _: () = assert!(valid_related_file_relation(false, 0, 0));
 const _: () = assert!(valid_related_file_relation(false, 7, 0));
 const _: () = assert!(valid_related_file_relation(true, 7, 6));
 const _: () = assert!(!valid_related_file_relation(false, 0, 6));
 const _: () = assert!(!valid_related_file_relation(true, 7, 7));
+const _: () = assert!(valid_set_information_relation(false, 7, 0, 0));
+const _: () = assert!(valid_set_information_relation(true, 7, 6, 1));
+const _: () = assert!(!valid_set_information_relation(false, 7, 6, 0));
+const _: () = assert!(!valid_set_information_relation(true, 7, 7, 0));
+const _: () = assert!(!valid_set_information_relation(true, 7, 0, 2));
 
 unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     let devobj = read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64);
@@ -30930,6 +30949,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         major as u8,
         major::IRP_MJ_CREATE | major::IRP_MJ_CREATE_NAMED_PIPE | major::IRP_MJ_CREATE_MAILSLOT
     );
+    let is_set_information = major as u8 == major::IRP_MJ_SET_INFORMATION;
     let create_ea_len = request.create_ea_length as u64;
     let create_file_name_len = if is_create {
         match inlen.checked_sub(create_ea_len) {
@@ -30963,6 +30983,14 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     if !valid_related_file_relation(is_create, canonical_file_id, request.related_file_id) {
         return (STATUS_INVALID_PARAMETER, 0);
     }
+    if !valid_set_information_relation(
+        is_set_information,
+        canonical_file_id,
+        request.target_file_id,
+        request.set_information_flags,
+    ) {
+        return (STATUS_INVALID_PARAMETER, 0);
+    }
     let related_file_object = if request.related_file_id == 0 {
         0
     } else {
@@ -30971,6 +30999,15 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             return (0xC000_0008u32 as i32, 0); // STATUS_INVALID_HANDLE
         }
         related
+    };
+    let target_file_object = if request.target_file_id == 0 {
+        0
+    } else {
+        let target = fo_lookup(request.target_file_id);
+        if target == 0 {
+            return (0xC000_0008u32 as i32, 0); // STATUS_INVALID_HANDLE
+        }
+        target
     };
     // A kernel-originated PnP/control request may legitimately have no FILE_OBJECT. Any request
     // carrying a canonical FileId, however, must use the exact component-local object bound by
@@ -31354,6 +31391,10 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         IRP_MJ_SET_INFORMATION => WdmIoStackParameters::SetInformation {
             length: inlen as u32,
             information_class: fsctl as u32,
+            target_file_object,
+            replace_if_exists: request.set_information_flags
+                & IRP_DISPATCH_SET_REPLACE_IF_EXISTS
+                != 0,
         },
         IRP_MJ_FILE_SYSTEM_CONTROL | IRP_MJ_DEVICE_CONTROL | IRP_MJ_INTERNAL_DEVICE_CONTROL => {
             WdmIoStackParameters::DeviceControl {
@@ -34508,7 +34549,8 @@ fn projection_fsctl(irp: &IrpProjection) -> u64 {
         IoParameters::DeviceControl(p) | IoParameters::InternalDeviceControl(p) => {
             p.ioctl_code as u64
         }
-        IoParameters::QueryInformation(p) | IoParameters::SetInformation(p) => p.info_class as u64,
+        IoParameters::QueryInformation(p) => p.info_class as u64,
+        IoParameters::SetInformation(p) => p.info_class as u64,
         _ => 0,
     }
 }
@@ -34578,6 +34620,18 @@ fn hosted_irp_dispatch_request(
         related_file_id: match &irp.parameters {
             IoParameters::Create(parameters) => {
                 parameters.related_file.map(FileId::raw).unwrap_or(0)
+            }
+            _ => 0,
+        },
+        target_file_id: match &irp.parameters {
+            IoParameters::SetInformation(parameters) => {
+                parameters.target_file.map(FileId::raw).unwrap_or(0)
+            }
+            _ => 0,
+        },
+        set_information_flags: match &irp.parameters {
+            IoParameters::SetInformation(parameters) if parameters.replace_if_exists => {
+                IRP_DISPATCH_SET_REPLACE_IF_EXISTS
             }
             _ => 0,
         },
@@ -35005,9 +35059,10 @@ fn external_irp_parameters(
             }))
         }
         major::IRP_MJ_SET_INFORMATION => {
-            Some(IoParameters::SetInformation(InformationParameters {
+            Some(IoParameters::SetInformation(SetInformationParameters {
                 info_class: external_code(fsctl)?,
                 length: input_len,
+                ..Default::default()
             }))
         }
         major::IRP_MJ_FLUSH_BUFFERS => Some(IoParameters::FlushBuffers),

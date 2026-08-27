@@ -23,7 +23,7 @@ use crate::object_port::ObjectManagerPort;
 use crate::{DeviceId, DriverId, FileId, IoManager, IrpId};
 
 /// The major functions a driver dispatches in v0.1 (spec §13.3).
-const SUPPORTED_MAJORS: [u8; 10] = [
+const SUPPORTED_MAJORS: [u8; 12] = [
     major::IRP_MJ_CREATE,
     major::IRP_MJ_CREATE_NAMED_PIPE,
     major::IRP_MJ_CREATE_MAILSLOT,
@@ -34,6 +34,8 @@ const SUPPORTED_MAJORS: [u8; 10] = [
     major::IRP_MJ_DEVICE_CONTROL,
     major::IRP_MJ_INTERNAL_DEVICE_CONTROL,
     major::IRP_MJ_FLUSH_BUFFERS,
+    major::IRP_MJ_QUERY_INFORMATION,
+    major::IRP_MJ_SET_INFORMATION,
 ];
 
 #[derive(Clone, Copy)]

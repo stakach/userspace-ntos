@@ -12,7 +12,9 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
-use nt_io_abi::{ioctl, major, IrpDispatchRequest, IO_ABI_VERSION};
+use nt_io_abi::{
+    ioctl, major, IrpDispatchRequest, IO_ABI_VERSION, IRP_DISPATCH_SET_REPLACE_IF_EXISTS,
+};
 use nt_status::NtStatus;
 
 use crate::dispatch::{
@@ -134,6 +136,12 @@ fn build_dispatch_request(
             0,
             0,
         ),
+        crate::irp::IoParameters::QueryInformation(p) => {
+            (p.info_class, 0, p.length, 0, 0, 0, 0, 0, 0, 0, 0)
+        }
+        crate::irp::IoParameters::SetInformation(p) => {
+            (p.info_class, p.length, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        }
         crate::irp::IoParameters::Pnp(p) => match p.start {
             Some(start) => (
                 0,
@@ -159,7 +167,14 @@ fn build_dispatch_request(
         minor: irp.minor,
         _reserved0: 0,
         flags: irp.flags.bits() as u32 | ((irp.control.bits() as u32) << 8),
-        _reserved1: 0,
+        set_information_flags: match &irp.parameters {
+            crate::irp::IoParameters::SetInformation(parameters)
+                if parameters.replace_if_exists =>
+            {
+                IRP_DISPATCH_SET_REPLACE_IF_EXISTS
+            }
+            _ => 0,
+        },
         target_domain_id: target.domain_id.raw(),
         target_domain_cookie: target.cookie,
         provider_domain_id: provider
@@ -173,6 +188,12 @@ fn build_dispatch_request(
         related_file_id: match &irp.parameters {
             crate::irp::IoParameters::Create(parameters) => {
                 parameters.related_file.map(FileId::raw).unwrap_or(0)
+            }
+            _ => 0,
+        },
+        target_file_id: match &irp.parameters {
+            crate::irp::IoParameters::SetInformation(parameters) => {
+                parameters.target_file.map(FileId::raw).unwrap_or(0)
             }
             _ => 0,
         },
@@ -357,6 +378,9 @@ impl DriverPeerTransport for MockDriverPeer {
         if request.abi_version != IO_ABI_VERSION as u16
             || request.abi_size as usize != core::mem::size_of::<IrpDispatchRequest>()
             || !request.has_well_formed_domain_route()
+            || request.set_information_flags & !IRP_DISPATCH_SET_REPLACE_IF_EXISTS != 0
+            || (request.major != major::IRP_MJ_SET_INFORMATION
+                && (request.target_file_id != 0 || request.set_information_flags != 0))
         {
             return DispatchOutcome::Failed {
                 status: NtStatus::INVALID_PARAMETER,
@@ -435,6 +459,13 @@ impl DriverPeerTransport for MockDriverPeer {
                 }
             }
             major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE | major::IRP_MJ_FLUSH_BUFFERS => {
+                DispatchOutcome::Completed {
+                    status: NtStatus::SUCCESS,
+                    information: 0,
+                    file_context: None,
+                }
+            }
+            major::IRP_MJ_QUERY_INFORMATION | major::IRP_MJ_SET_INFORMATION => {
                 DispatchOutcome::Completed {
                     status: NtStatus::SUCCESS,
                     information: 0,

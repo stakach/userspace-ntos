@@ -13922,3 +13922,29 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     a local path: add a real provider query/set-information IRP contract first. Continue removing
     obsolete capture helpers as each consumer moves to `CapturedFileObjectAttributes`. The root
     service-loop compatibility mark/reset remains a separate lifetime-classification item.
+
+    Canonical set-information target transport (2026-08-27, accepted foundation): the I/O Manager
+    no longer overloads query-information parameters for `IRP_MJ_SET_INFORMATION`. The typed set
+    contract carries an optional generation-protected target-directory File and
+    `ReplaceIfExists`. I/O ABI version 7 transports those fields independently of CREATE's related
+    File. The manager validates the target as a distinct, live File owned by the same client and
+    device, retains it for the complete IRP lifetime, and defers a concurrent final close until the
+    terminal completion is acknowledged. Stale, cross-client, cross-device, File-less, and
+    wrong-major relations fail closed without acquiring a reference.
+
+    Isolated driver peers now receive query/set-information through the normal major-function
+    table. The hosted component validates the version-7 relation and flags, resolves the exact
+    component-local target `FILE_OBJECT`, and writes the NT5 x64
+    `IO_STACK_LOCATION.Parameters.SetFile` fields at `FileObject +0x18` and
+    `ReplaceIfExists +0x20`. No caller handle or pointer is accepted as provider identity. Focused
+    validation passes `nt-io-abi` `5/5` and `nt-io-manager` `205/205`, including wire projection,
+    WDM layout, pending target close, and invalid-relation tests. The freestanding executive check
+    remains green at the established 212-warning baseline.
+
+    Review adjustment: the transport/lifetime half of rooted set-information is closed. Next parse
+    `FILE_RENAME_INFORMATION` and `FILE_LINK_INFORMATION` once in the executive, resolve their
+    caller `RootDirectory` through `CapturedFileObjectAttributes`/`FileParseRoot`, scrub the caller
+    handle from the provider buffer, and pass only the canonical target File into ABI v7. Replace
+    writable-FS private handle rewriting with typed volume-relative rename input. Route every
+    provider-backed set-information class through the standard pending/ack path; unsupported link
+    behavior must remain an explicit status, never a synthetic success or local-path fallback.

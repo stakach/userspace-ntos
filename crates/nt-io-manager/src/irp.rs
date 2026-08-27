@@ -69,11 +69,24 @@ pub struct DeviceControlParameters {
     pub output_len: u32,
 }
 
-/// `IRP_MJ_QUERY_INFORMATION` / `IRP_MJ_SET_INFORMATION` parameters.
+/// `IRP_MJ_QUERY_INFORMATION` parameters.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub struct InformationParameters {
     pub info_class: u32,
     pub length: u32,
+}
+
+/// `IRP_MJ_SET_INFORMATION` parameters.
+///
+/// Rename/link requests may retain a second canonical File representing the
+/// target directory. This is the I/O Manager identity behind the WDM
+/// `Parameters.SetFile.FileObject`; it is never a caller handle or pointer.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub struct SetInformationParameters {
+    pub info_class: u32,
+    pub length: u32,
+    pub target_file: Option<FileId>,
+    pub replace_if_exists: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -154,7 +167,7 @@ pub enum IoParameters {
     InternalDeviceControl(DeviceControlParameters),
     FlushBuffers,
     QueryInformation(InformationParameters),
-    SetInformation(InformationParameters),
+    SetInformation(SetInformationParameters),
     Pnp(PnpParameters),
     Power,
     #[default]
