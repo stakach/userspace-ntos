@@ -22481,11 +22481,20 @@ impl ExecReadOnlyFileOpens {
         &mut self,
         first_cluster: u32,
         size: u32,
+        volume_relative_path: &[u8],
         create_options: u32,
         metadata: nt_fs::FileMetadata,
     ) -> Result<u32, u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).create(first_cluster, size, create_options, metadata) }
+        unsafe {
+            (&mut *self.table).create(
+                first_cluster,
+                size,
+                volume_relative_path,
+                create_options,
+                metadata,
+            )
+        }
     }
 
     fn get(&self, id: u32) -> Result<&nt_fs::ReadOnlyFileOpen, u32> {

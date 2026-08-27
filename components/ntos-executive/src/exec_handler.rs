@@ -714,6 +714,7 @@ static NT_QUERY_ATTRIBUTES_FILE_SERVICE_ENTRY: ExecServiceHandler =
 const EXEC_BOOT_STATUS_FILE_SIZE: usize = 0x800;
 const EXEC_BSD_DATA_SIZE: usize = 0x88;
 const EXEC_BOOT_STATUS_PATH: &[u8] = b"\\systemroot\\bootstat.dat";
+const EXEC_BOOT_STATUS_VOLUME_PATH: &[u8] = b"reactos\\bootstat.dat";
 const SETUP_UNATTEND_PATH: &[u8] = b"reactos\\unattend.inf";
 const NT_DEFAULT_LOCALE_ID: u32 = 0x0409;
 const NT_BOGUS_LOCALE_ID: u32 = 0xffff_0000;
@@ -2362,6 +2363,33 @@ fn boot_status_path_matches(name: &[u16]) -> bool {
             .iter()
             .zip(EXEC_BOOT_STATUS_PATH.iter())
             .all(|(&wide, &ascii)| wide <= 0x7F && (wide as u8).to_ascii_lowercase() == ascii)
+}
+
+fn ascii_volume_relative_name(path: &[u8]) -> Result<alloc::vec::Vec<u16>, u32> {
+    if path.iter().any(|byte| !byte.is_ascii()) {
+        return Err(nt_fs::STATUS_OBJECT_NAME_INVALID);
+    }
+    let mut name = alloc::vec::Vec::new();
+    name.try_reserve_exact(path.len().saturating_add(1))
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    name.push(b'\\' as u16);
+    name.extend(path.iter().map(|byte| *byte as u16));
+    Ok(name)
+}
+
+fn utf16_file_name(name: &str) -> Result<alloc::vec::Vec<u16>, u32> {
+    let units = name.encode_utf16().count();
+    let mut encoded = alloc::vec::Vec::new();
+    encoded
+        .try_reserve_exact(units)
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    encoded.extend(name.encode_utf16());
+    Ok(encoded)
+}
+
+struct LocalFileQueryState {
+    metadata: nt_fs::QueryMetadata,
+    opened_name: Option<alloc::vec::Vec<u16>>,
 }
 
 unsafe fn reset_boot_status_data() {
@@ -9604,6 +9632,7 @@ impl ExecNtHandler {
     pub(crate) fn mint_disk_file_handle(
         &mut self,
         file: crate::fs_loader::FatOpenMetadata,
+        volume_relative_path: &[u8],
         access: u32,
         create_options: u32,
     ) -> Option<u64> {
@@ -9612,7 +9641,13 @@ impl ExecNtHandler {
         let size = u32::try_from(file.metadata.end_of_file).ok()?;
         let object_id = self
             .readonly_file_opens
-            .create(first_cluster, size, create_options, file.metadata)
+            .create(
+                first_cluster,
+                size,
+                volume_relative_path,
+                create_options,
+                file.metadata,
+            )
             .ok()?;
         let handle = match self.insert_process_handle(
             pid,
@@ -9884,7 +9919,7 @@ impl ExecNtHandler {
                     let handle = if is_directory {
                         self.mint_directory_handle(entry, full_path, desired_access, options)
                     } else if Self::readonly_disk_open_allowed(desired_access, options) {
-                        self.mint_disk_file_handle(entry, desired_access, options)
+                        self.mint_disk_file_handle(entry, full_path, desired_access, options)
                     } else {
                         return (nt_fs::STATUS_NOT_SUPPORTED, 0, 0);
                     };
@@ -20417,6 +20452,93 @@ impl ExecNtHandler {
         })
     }
 
+    unsafe fn local_file_query_state(
+        &self,
+        handle: u64,
+        include_opened_name: bool,
+    ) -> Result<LocalFileQueryState, u32> {
+        let io_metadata = self.io_manager_file_query_metadata(handle)?;
+        let pid = self
+            .pm_pid_for_pi(self.pi)
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        let process_handle = nt_process::Handle::try_from(handle)
+            .map_err(|_| nt_fs::STATUS_INVALID_HANDLE)?;
+        let object = self
+            .pm
+            .lookup_handle(pid, process_handle)
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        let (file_metadata, current_byte_offset, opened_name) = match object {
+            nt_process::HandleObject::DiskFile {
+                first_cluster,
+                size,
+                object_id,
+            } => {
+                let open = match self.readonly_file_opens.get(object_id) {
+                    Ok(open) if open.first_cluster == first_cluster && open.size == size => open,
+                    _ => return Err(nt_fs::STATUS_INVALID_HANDLE),
+                };
+                let name = if include_opened_name {
+                    Some(ascii_volume_relative_name(open.volume_relative_path())?)
+                } else {
+                    None
+                };
+                (open.metadata, open.current_offset, name)
+            }
+            nt_process::HandleObject::Directory {
+                first_cluster,
+                object_id,
+            } => {
+                let open = match self.directory_opens.get(object_id) {
+                    Ok(open) if open.first_cluster == first_cluster => open,
+                    _ => return Err(nt_fs::STATUS_INVALID_HANDLE),
+                };
+                let name = if include_opened_name {
+                    Some(ascii_volume_relative_name(open.volume_relative_path())?)
+                } else {
+                    None
+                };
+                (open.metadata, 0, name)
+            }
+            nt_process::HandleObject::OverlayFile(file_id) => {
+                let offset = crate::writable_fs::current_offset(file_id)
+                    .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                let metadata = crate::writable_fs::metadata(file_id)
+                    .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                let name = if include_opened_name {
+                    let opened_name = crate::writable_fs::opened_name(file_id)
+                        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                    Some(utf16_file_name(&opened_name)?)
+                } else {
+                    None
+                };
+                (metadata, offset, name)
+            }
+            nt_process::HandleObject::BootStatusFile { .. } => {
+                ensure_boot_status_data();
+                let name = if include_opened_name {
+                    Some(ascii_volume_relative_name(EXEC_BOOT_STATUS_VOLUME_PATH)?)
+                } else {
+                    None
+                };
+                (Self::boot_status_file_metadata(), 0, name)
+            }
+            nt_process::HandleObject::File(_)
+            | nt_process::HandleObject::RoutedFile { .. } => {
+                return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+            }
+            _ => return Err(0xC000_0024), // STATUS_OBJECT_TYPE_MISMATCH
+        };
+        let mut metadata = file_metadata.query_metadata();
+        metadata.current_byte_offset = current_byte_offset;
+        metadata.access_flags = io_metadata.access_flags;
+        metadata.mode = io_metadata.mode;
+        metadata.alignment_requirement = io_metadata.alignment_requirement;
+        Ok(LocalFileQueryState {
+            metadata,
+            opened_name,
+        })
+    }
+
     /// Retain and acquire a routed File before clearing its shared completion signal. `Ok(false)`
     /// means the exact syscall now owns a FIFO acquisition record and must park without dispatching
     /// an IRP. A promoted retry consumes its pre-held reference and lock grant instead of looking up
@@ -22757,8 +22879,8 @@ impl ExecNtHandler {
             .flatten();
         let loader_open = if let Some((path, directory)) = volume_directory {
             self.mint_directory_handle(directory, path, desired_access, open_options)
-        } else if let Some(file) = loader_file {
-            self.mint_disk_file_handle(file, desired_access, open_options)
+        } else if let (Some(file), Some(path)) = (loader_file, volume_path) {
+            self.mint_disk_file_handle(file, path, desired_access, open_options)
         } else {
             None
         };
@@ -22823,11 +22945,13 @@ impl ExecNtHandler {
                 smss_stack_write(iosb + 8, 1);
             }
             0
-        } else if let Some(file) =
-            Self::readonly_disk_open_entry(name16, desired_access, open_options)
+        } else if let (Some(file), Some(path)) = (
+            Self::readonly_disk_open_entry(name16, desired_access, open_options),
+            volume_path,
+        )
         {
             let mut status = nt_fs::STATUS_SUCCESS;
-            let opened = self.mint_disk_file_handle(file, desired_access, open_options);
+            let opened = self.mint_disk_file_handle(file, path, desired_access, open_options);
             let opened_handle = match opened {
                 Some(handle) => {
                     self.queue_write(file_handle_out, handle);
@@ -29603,6 +29727,22 @@ impl ExecNtHandler {
                 let output = args[2];
                 let length = nt_ulong_arg(args[3]) as usize;
                 let class = nt_ulong_arg(args[4]);
+                let named_query = matches!(
+                    class,
+                    nt_fs::FILE_NAME_INFORMATION | nt_fs::FILE_ALL_INFORMATION
+                );
+                let named_minimum = match class {
+                    nt_fs::FILE_NAME_INFORMATION => {
+                        Some(nt_fs::FILE_NAME_INFORMATION_MINIMUM_LENGTH)
+                    }
+                    nt_fs::FILE_ALL_INFORMATION => {
+                        Some(nt_fs::FILE_ALL_INFORMATION_MINIMUM_LENGTH)
+                    }
+                    _ => None,
+                };
+                if named_minimum.is_some_and(|minimum| length < minimum) {
+                    return nt_fs::STATUS_INFO_LENGTH_MISMATCH;
+                }
                 if matches!(
                     class,
                     nt_fs::FILE_ACCESS_INFORMATION
@@ -29718,6 +29858,18 @@ impl ExecNtHandler {
                         Err(status) => return status,
                     };
                     let output_capacity = routed_output.len();
+                    if class == nt_fs::FILE_ALL_INFORMATION {
+                        let metadata = match self.io_manager_file_query_metadata(args[0]) {
+                            Ok(metadata) => metadata,
+                            Err(status) => return status,
+                        };
+                        if let Err(status) = nt_fs::encode_file_all_io_manager_information(
+                            metadata,
+                            &mut routed_output,
+                        ) {
+                            return status;
+                        }
+                    }
 
                     let file_id = route.file_id;
                     let synchronous_file = match self.file_completion.is_synchronous(file_id) {
@@ -29853,6 +30005,66 @@ impl ExecNtHandler {
                     }
                     return status;
                 }
+                if named_query {
+                    if iosb == 0 || output == 0 {
+                        return nt_syscall::STATUS_ACCESS_VIOLATION;
+                    }
+                    if iosb & 7 != 0 || output & 3 != 0 {
+                        return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
+                    }
+                    if !self.probe_user_output(iosb, 16)
+                        || !self.probe_user_output(output, length)
+                    {
+                        return nt_syscall::STATUS_ACCESS_VIOLATION;
+                    }
+                    let state = match self.local_file_query_state(args[0], true) {
+                        Ok(state) => state,
+                        Err(status) => return status,
+                    };
+                    let Some(name) = state.opened_name else {
+                        return nt_fs::STATUS_INVALID_DEVICE_REQUEST;
+                    };
+                    let name_offset = if class == nt_fs::FILE_ALL_INFORMATION {
+                        100usize
+                    } else {
+                        4usize
+                    };
+                    let required = match name
+                        .len()
+                        .checked_mul(2)
+                        .and_then(|bytes| name_offset.checked_add(bytes))
+                    {
+                        Some(required) => required,
+                        None => return nt_fs::STATUS_INFO_LENGTH_MISMATCH,
+                    };
+                    let Some(minimum) = named_minimum else {
+                        return nt_fs::STATUS_INVALID_INFO_CLASS;
+                    };
+                    let encoded_len = length.min(required.max(minimum));
+                    let mut encoded = match try_zeroed_transfer_buffer(encoded_len) {
+                        Ok(output) => output,
+                        Err(status) => return status,
+                    };
+                    let result = match nt_fs::encode_named_query_information(
+                        class,
+                        state.metadata,
+                        &name,
+                        &mut encoded,
+                    ) {
+                        Ok(result) => result,
+                        Err(status) => return status,
+                    };
+                    let mut iosb_bytes = [0u8; 16];
+                    iosb_bytes[..4].copy_from_slice(&result.status.to_le_bytes());
+                    iosb_bytes[8..16]
+                        .copy_from_slice(&(result.information as u64).to_le_bytes());
+                    if !self.xas_try_write_buf(output, &encoded[..result.information])
+                        || !self.xas_try_write_buf(iosb, &iosb_bytes)
+                    {
+                        return nt_syscall::STATUS_ACCESS_VIOLATION;
+                    }
+                    return result.status;
+                }
                 // FILE_NETWORK_OPEN_INFORMATION is the largest fixed class emitted locally.
                 let mut encoded = [0u8; 56];
                 let encoded_capacity = encoded.len();
@@ -29873,73 +30085,11 @@ impl ExecNtHandler {
                 if !self.probe_user_output(iosb, 16) || !self.probe_user_output(output, length) {
                     return nt_syscall::STATUS_ACCESS_VIOLATION;
                 }
-                let pid = match self.pm_pid_for_pi(self.pi) {
-                    Some(pid) => pid,
-                    None => return nt_fs::STATUS_INVALID_HANDLE,
+                let state = match self.local_file_query_state(args[0], false) {
+                    Ok(state) => state,
+                    Err(status) => return status,
                 };
-                let process_handle = match nt_process::Handle::try_from(args[0]) {
-                    Ok(handle) => handle,
-                    Err(_) => return nt_fs::STATUS_INVALID_HANDLE,
-                };
-                let object = match self.pm.lookup_handle(pid, process_handle) {
-                    Some(object) => object,
-                    None => return nt_fs::STATUS_INVALID_HANDLE,
-                };
-                let access_flags = match self
-                    .pm
-                    .handle_access(pid, process_handle)
-                {
-                    Some(access) => access,
-                    None => return nt_fs::STATUS_INVALID_HANDLE,
-                };
-                let (file_metadata, current_byte_offset) = match object {
-                    nt_process::HandleObject::DiskFile {
-                        first_cluster,
-                        size,
-                        object_id,
-                    } => {
-                        let open = match self.readonly_file_opens.get(object_id) {
-                            Ok(open) => open,
-                            Err(status) => return status,
-                        };
-                        if open.first_cluster != first_cluster || open.size != size {
-                            return nt_fs::STATUS_INVALID_HANDLE;
-                        }
-                        (open.metadata, open.current_offset)
-                    }
-                    nt_process::HandleObject::Directory {
-                        first_cluster,
-                        object_id,
-                    } => {
-                        let open = match self.directory_opens.get(object_id) {
-                            Ok(open) if open.first_cluster == first_cluster => open,
-                            _ => return nt_fs::STATUS_INVALID_HANDLE,
-                        };
-                        (open.metadata, 0)
-                    }
-                    nt_process::HandleObject::OverlayFile(file_id) => {
-                        let Some(offset) = crate::writable_fs::current_offset(file_id) else {
-                            return nt_fs::STATUS_INVALID_HANDLE;
-                        };
-                        let Some(metadata) = crate::writable_fs::metadata(file_id) else {
-                            return nt_fs::STATUS_INVALID_HANDLE;
-                        };
-                        (metadata, offset)
-                    }
-                    nt_process::HandleObject::BootStatusFile { .. } => {
-                        ensure_boot_status_data();
-                        (Self::boot_status_file_metadata(), 0)
-                    }
-                    nt_process::HandleObject::File(_)
-                    | nt_process::HandleObject::RoutedFile { .. } => {
-                        return nt_fs::STATUS_INVALID_DEVICE_REQUEST;
-                    }
-                    _ => return 0xC000_0024, // STATUS_OBJECT_TYPE_MISMATCH
-                };
-                let mut metadata = file_metadata.query_metadata();
-                metadata.current_byte_offset = current_byte_offset;
-                metadata.access_flags = access_flags;
-                nt_fs::encode_query_information(class, metadata, &mut encoded)
+                nt_fs::encode_query_information(class, state.metadata, &mut encoded)
                     .expect("validated query class and length");
                 if !self.xas_try_write_buf(output, &encoded[..required]) {
                     return nt_syscall::STATUS_ACCESS_VIOLATION;
@@ -30843,13 +30993,24 @@ impl ExecNtHandler {
                     );
                     let disposition = create_disposition;
                     if disposition == nt_fs::FILE_OPEN && Self::overlay_open_missed(st) {
-                        if let Some(file) =
-                            Self::readonly_disk_open_entry(name16, desired_access, create_options)
+                        if let (Some(file), Some(path_len)) = (
+                            Self::readonly_disk_open_entry(
+                                name16,
+                                desired_access,
+                                create_options,
+                            ),
+                            volume_relative_len,
+                        )
                         {
                             let file_size = file.metadata.end_of_file;
                             status = nt_fs::STATUS_SUCCESS;
                             info = nt_fs::FILE_OPENED as u64;
-                            match self.mint_disk_file_handle(file, desired_access, create_options) {
+                            match self.mint_disk_file_handle(
+                                file,
+                                &volume_relative[..path_len],
+                                desired_access,
+                                create_options,
+                            ) {
                                 Some(handle) => {
                                     self.queue_write(file_handle_out, handle);
                                     let count = NT_CREATE_FILE_READONLY_FAT_OPENS
@@ -31001,13 +31162,20 @@ impl ExecNtHandler {
                         }
                     }
                 } else if create_disposition == nt_fs::FILE_OPEN {
-                    if let Some(file) =
-                        Self::readonly_disk_open_entry(name16, desired_access, create_options)
+                    if let (Some(file), Some(path_len)) = (
+                        Self::readonly_disk_open_entry(name16, desired_access, create_options),
+                        volume_relative_len,
+                    )
                     {
                         let file_size = file.metadata.end_of_file;
                         status = nt_fs::STATUS_SUCCESS;
                         info = nt_fs::FILE_OPENED as u64;
-                        match self.mint_disk_file_handle(file, desired_access, create_options) {
+                        match self.mint_disk_file_handle(
+                            file,
+                            &volume_relative[..path_len],
+                            desired_access,
+                            create_options,
+                        ) {
                             Some(handle) => {
                                 self.queue_write(file_handle_out, handle);
                                 let count = NT_CREATE_FILE_READONLY_FAT_OPENS

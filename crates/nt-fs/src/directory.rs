@@ -297,6 +297,14 @@ pub struct ReadOnlyFileOpen {
     pub current_offset: u64,
     pub create_options: u32,
     pub metadata: crate::FileMetadata,
+    path_len: u16,
+    path: [u8; DIRECTORY_OPEN_PATH_CAP],
+}
+
+impl ReadOnlyFileOpen {
+    pub fn volume_relative_path(&self) -> &[u8] {
+        &self.path[..self.path_len as usize]
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -330,6 +338,8 @@ impl ReadOnlyFileOpenSlot {
                     delete_pending: false,
                     is_directory: false,
                 },
+                path_len: 0,
+                path: [0; DIRECTORY_OPEN_PATH_CAP],
             },
         }
     }
@@ -351,15 +361,21 @@ impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
         &mut self,
         first_cluster: u32,
         size: u32,
+        volume_relative_path: &[u8],
         create_options: u32,
         metadata: crate::FileMetadata,
     ) -> Result<u32, u32> {
+        if volume_relative_path.len() > DIRECTORY_OPEN_PATH_CAP {
+            return Err(STATUS_OBJECT_NAME_INVALID);
+        }
         let (index, slot) = self
             .slots
             .iter_mut()
             .enumerate()
             .find(|(_, slot)| !slot.occupied)
             .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        let mut path = [0; DIRECTORY_OPEN_PATH_CAP];
+        path[..volume_relative_path.len()].copy_from_slice(volume_relative_path);
         *slot = ReadOnlyFileOpenSlot {
             occupied: true,
             references: 1,
@@ -369,6 +385,8 @@ impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
                 current_offset: 0,
                 create_options,
                 metadata,
+                path_len: volume_relative_path.len() as u16,
+                path,
             },
         };
         Ok(index as u32)
@@ -981,14 +999,30 @@ mod tests {
     fn readonly_file_open_references_share_position() {
         let mut table = ReadOnlyFileOpenTable::<2>::new();
         let shared = table
-            .create(41, 64, 0x20, crate::FileMetadata::default())
+            .create(
+                41,
+                64,
+                b"reactos\\system32\\ntdll.dll",
+                0x20,
+                crate::FileMetadata::default(),
+            )
             .unwrap();
         let independent = table
-            .create(41, 64, 0x10, crate::FileMetadata::default())
+            .create(
+                41,
+                64,
+                b"reactos\\system32\\ntdll.dll",
+                0x10,
+                crate::FileMetadata::default(),
+            )
             .unwrap();
         table.retain(shared).unwrap();
         table.get_mut(shared).unwrap().current_offset = 17;
         assert_eq!(table.get(shared).unwrap().current_offset, 17);
+        assert_eq!(
+            table.get(shared).unwrap().volume_relative_path(),
+            b"reactos\\system32\\ntdll.dll"
+        );
         assert_eq!(table.get(independent).unwrap().current_offset, 0);
         table.release(shared).unwrap();
         assert_eq!(table.get(shared).unwrap().first_cluster, 41);
@@ -997,7 +1031,7 @@ mod tests {
         assert_eq!(table.get(shared), Err(STATUS_INVALID_HANDLE));
         assert_eq!(
             table
-                .create(99, 128, 0, crate::FileMetadata::default())
+                .create(99, 128, b"reactos\\x", 0, crate::FileMetadata::default())
                 .unwrap(),
             shared
         );
@@ -1007,11 +1041,11 @@ mod tests {
     fn readonly_file_open_table_clear_reuses_fixed_storage() {
         let mut table = ReadOnlyFileOpenTable::<2>::new();
         let first = table
-            .create(41, 64, 0, crate::FileMetadata::default())
+            .create(41, 64, b"reactos\\a", 0, crate::FileMetadata::default())
             .unwrap();
         table.retain(first).unwrap();
         table
-            .create(42, 128, 0, crate::FileMetadata::default())
+            .create(42, 128, b"reactos\\b", 0, crate::FileMetadata::default())
             .unwrap();
 
         table.clear();
@@ -1019,13 +1053,13 @@ mod tests {
         assert_eq!(table.get(first), Err(STATUS_INVALID_HANDLE));
         assert_eq!(
             table
-                .create(99, 1, 0, crate::FileMetadata::default())
+                .create(99, 1, b"", 0, crate::FileMetadata::default())
                 .unwrap(),
             0
         );
         assert_eq!(
             table
-                .create(100, 2, 0, crate::FileMetadata::default())
+                .create(100, 2, b"reactos", 0, crate::FileMetadata::default())
                 .unwrap(),
             1
         );

@@ -14261,3 +14261,41 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and keep provider-backed objects on real FSD dispatch. After that, audit the special BootStatus
     provider and local copy-up/open lifetime so every non-device File has one explicit filesystem
     owner; do not add a cached-name, handle-number, or zero-metadata fallback.
+
+    Retained File names and composite query ownership (2026-08-27, accepted): `nt-fs` now owns the
+    exact variable-length ABI for `FileNameInformation` and `FileAllInformation`, including NT5's
+    8-byte and 104-byte minimum buffers, full UTF-16 byte-length publication, partial-prefix copy,
+    and `STATUS_BUFFER_OVERFLOW` completion. `FileAllInformation` is composed from the same live
+    File state as the individual classes. The I/O Manager supplies only granted access, retained
+    create mode, and related-device alignment at their native offsets; the filesystem owns basic,
+    standard, internal, EA, position, and opened-name information.
+
+    Writable MemFs File objects retain the exact directory-entry identity used to open them. A
+    live query resolves the current full path, so rename and parent-directory movement are visible;
+    a retained last-live name keeps an independently opened, subsequently unlinked or displaced
+    File queryable until its final close. Hard-link opens therefore preserve their distinct names
+    while sharing node identity and contents. FAT directory and read-only file open descriptions
+    retain their canonical volume-relative paths alongside metadata and current position, and
+    duplicated handles continue to share one open description. BootStatus publishes its explicit
+    volume-relative name rather than its Object Manager alias.
+
+    Hosted provider Files continue through real `IRP_MJ_QUERY_INFORMATION`. For provider
+    `FileAllInformation`, the executive seeds the three I/O-Manager-owned fields before dispatch;
+    the buffered cross-domain transport now preserves that initial system-buffer state for both
+    synchronous and pending provider completion instead of silently replacing it with zeroes. No
+    provider name, metadata, or success result is synthesized above the FSD.
+
+    Focused validation passes `nt-fs` `80/80`; the freestanding executive remains at the
+    established 211-warning baseline. Serialized acceptance
+    `.tmp/run-headless-file-name-all-final-20260827.log` reached quiescence at 109,853 ms, launched genuine
+    userinit and Explorer, completed 668 Explorer api0 redirects with zero callback failures,
+    painted `480000/480000` framebuffer pixels with at least 32 colours, passed all `295/295`
+    gates, and matched the sentinel. Scratch returned to zero after its unchanged 278,112-byte
+    peak; final allocated durable state was 14,910,200 bytes with 6,061,192 bytes reusable, and all
+    frame, mapping, registry, retype, and allocator failure counters remained zero.
+
+    Review adjustment: retained-name and composite query ownership are closed. Next audit the
+    special BootStatus File and the writable-overlay copy-up/open path. Every non-device File must
+    have exactly one explicit filesystem/provider owner, one open-description lifetime, and one
+    metadata/name source. Remove the special executive data path when an ordinary local filesystem
+    File can own it; do not preserve a compatibility handle variant or a second data store.

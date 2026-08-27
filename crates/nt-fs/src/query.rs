@@ -9,13 +9,27 @@ use crate::{
     FILE_BASIC_INFORMATION, FILE_DELETE_ON_CLOSE, FILE_INTERNAL_INFORMATION, FILE_MODE_INFORMATION,
     FILE_NETWORK_OPEN_INFORMATION, FILE_NO_INTERMEDIATE_BUFFERING, FILE_POSITION_INFORMATION,
     FILE_SEQUENTIAL_ONLY, FILE_SYNCHRONOUS_IO_ALERT, FILE_SYNCHRONOUS_IO_NONALERT,
-    FILE_WRITE_THROUGH, STATUS_INFO_LENGTH_MISMATCH, STATUS_INVALID_INFO_CLASS,
+    FILE_WRITE_THROUGH, STATUS_BUFFER_OVERFLOW, STATUS_INFO_LENGTH_MISMATCH,
+    STATUS_INVALID_INFO_CLASS, STATUS_SUCCESS,
 };
 
 pub const FILE_STANDARD_INFORMATION: u32 = 5;
 /// `FileEaInformation` — the second class `CreateDirectoryExW` queries (`dir.c:381`), to size the
 /// extended-attribute buffer it will hand `NtCreateFile`.
 pub const FILE_EA_INFORMATION: u32 = 7;
+pub const FILE_NAME_INFORMATION: u32 = 9;
+pub const FILE_ALL_INFORMATION: u32 = 18;
+
+pub const FILE_NAME_INFORMATION_MINIMUM_LENGTH: usize = 8;
+pub const FILE_ALL_INFORMATION_MINIMUM_LENGTH: usize = 104;
+const FILE_ALL_NAME_LENGTH_OFFSET: usize = 96;
+const FILE_ALL_NAME_OFFSET: usize = 100;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct QueryInformationResult {
+    pub status: u32,
+    pub information: usize,
+}
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct QueryMetadata {
@@ -123,6 +137,92 @@ pub fn encode_query_information(
         _ => unreachable!(),
     }
     Ok(required)
+}
+
+/// Encode the variable-length file-name query classes.
+///
+/// `name` is the filesystem's volume-relative name including its leading `\`. The length field
+/// always describes the complete UTF-16 name. When the caller's valid minimum-size buffer cannot
+/// contain all of it, NT returns the prefix that fits with `STATUS_BUFFER_OVERFLOW` and reports the
+/// number of bytes actually initialized.
+pub fn encode_named_query_information(
+    class: u32,
+    metadata: QueryMetadata,
+    name: &[u16],
+    output: &mut [u8],
+) -> Result<QueryInformationResult, u32> {
+    let (minimum, name_length_offset, name_offset) = match class {
+        FILE_NAME_INFORMATION => (FILE_NAME_INFORMATION_MINIMUM_LENGTH, 0, 4),
+        FILE_ALL_INFORMATION => (
+            FILE_ALL_INFORMATION_MINIMUM_LENGTH,
+            FILE_ALL_NAME_LENGTH_OFFSET,
+            FILE_ALL_NAME_OFFSET,
+        ),
+        _ => return Err(STATUS_INVALID_INFO_CLASS),
+    };
+    if output.len() < minimum {
+        return Err(STATUS_INFO_LENGTH_MISMATCH);
+    }
+
+    let name_bytes = name
+        .len()
+        .checked_mul(2)
+        .and_then(|length| u32::try_from(length).ok())
+        .ok_or(STATUS_INFO_LENGTH_MISMATCH)?;
+    let required = name_offset
+        .checked_add(name_bytes as usize)
+        .ok_or(STATUS_INFO_LENGTH_MISMATCH)?;
+    let information = output.len().min(required);
+    output[..information].fill(0);
+
+    if class == FILE_ALL_INFORMATION {
+        encode_query_information(FILE_BASIC_INFORMATION, metadata, &mut output[0..40])?;
+        encode_query_information(FILE_STANDARD_INFORMATION, metadata, &mut output[40..64])?;
+        encode_query_information(FILE_INTERNAL_INFORMATION, metadata, &mut output[64..72])?;
+        encode_query_information(FILE_EA_INFORMATION, metadata, &mut output[72..76])?;
+        encode_query_information(FILE_POSITION_INFORMATION, metadata, &mut output[80..88])?;
+        encode_file_all_io_manager_information(metadata, output)?;
+    }
+    output[name_length_offset..name_length_offset + 4].copy_from_slice(&name_bytes.to_le_bytes());
+
+    let mut cursor = name_offset;
+    for unit in name {
+        for byte in unit.to_le_bytes() {
+            if cursor == information {
+                break;
+            }
+            output[cursor] = byte;
+            cursor += 1;
+        }
+        if cursor == information {
+            break;
+        }
+    }
+
+    Ok(QueryInformationResult {
+        status: if information < required {
+            STATUS_BUFFER_OVERFLOW
+        } else {
+            STATUS_SUCCESS
+        },
+        information,
+    })
+}
+
+/// Seed the fields which the I/O Manager, rather than the filesystem provider, owns inside a
+/// caller's `FILE_ALL_INFORMATION` buffer. The provider fills every other field through its real
+/// `IRP_MJ_QUERY_INFORMATION` dispatch.
+pub fn encode_file_all_io_manager_information(
+    metadata: QueryMetadata,
+    output: &mut [u8],
+) -> Result<(), u32> {
+    if output.len() < FILE_ALL_INFORMATION_MINIMUM_LENGTH {
+        return Err(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    encode_query_information(FILE_ACCESS_INFORMATION, metadata, &mut output[76..80])?;
+    encode_query_information(FILE_MODE_INFORMATION, metadata, &mut output[88..92])?;
+    encode_query_information(FILE_ALIGNMENT_INFORMATION, metadata, &mut output[92..96])?;
+    Ok(())
 }
 
 const fn normalized_file_attributes(metadata: QueryMetadata) -> u32 {

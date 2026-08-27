@@ -35116,6 +35116,9 @@ fn dispatch_external_irp_to_device_record_result_exact(
         .try_reserve_exact(system_buffer_len)
         .map_err(|_| 0xC000_009Au32)?; // STATUS_INSUFFICIENT_RESOURCES
     system_buffer.resize(system_buffer_len, 0);
+    if major == major::IRP_MJ_QUERY_INFORMATION {
+        system_buffer[..out.len()].copy_from_slice(out);
+    }
     system_buffer[..in_data.len()].copy_from_slice(in_data);
     if separate_output {
         system_buffer[output_offset..output_offset + out.len()].copy_from_slice(out);

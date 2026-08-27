@@ -1845,6 +1845,58 @@ impl MemFs {
         None
     }
 
+    fn opened_name(&self, entry_id: u64) -> Option<String> {
+        if entry_id == 0 {
+            let mut root = String::new();
+            root.try_reserve_exact(1).ok()?;
+            root.push('\\');
+            return Some(root);
+        }
+        let (mut parent, index, _) = self.entry_location(entry_id)?;
+        let mut components = Vec::new();
+        components.try_reserve_exact(1).ok()?;
+        components.push(
+            self.node(parent)?
+                .children
+                .get(index)?
+                .created_name
+                .as_str(),
+        );
+        let mut remaining = self.nodes.len();
+        while parent != 0 {
+            if remaining == 0 {
+                return None;
+            }
+            remaining -= 1;
+            let grandparent = self.node(parent)?.parent;
+            let entry = self
+                .node(grandparent)?
+                .children
+                .iter()
+                .find(|entry| entry.node_id == parent)?;
+            components.try_reserve(1).ok()?;
+            components.push(entry.created_name.as_str());
+            parent = grandparent;
+        }
+
+        let byte_len = components
+            .iter()
+            .try_fold(1usize, |length, component| {
+                length.checked_add(component.len())
+            })?
+            .checked_add(components.len().saturating_sub(1))?;
+        let mut name = String::new();
+        name.try_reserve_exact(byte_len).ok()?;
+        name.push('\\');
+        for (index, component) in components.iter().rev().enumerate() {
+            if index != 0 {
+                name.push('\\');
+            }
+            name.push_str(component);
+        }
+        Some(name)
+    }
+
     /// Remove one exact directory entry. The node remains resident at link count zero until the
     /// FileSystem proves that no open File object still references it.
     fn unlink_entry(&mut self, entry_id: u64) -> Result<u64, u32> {
@@ -3101,6 +3153,9 @@ impl MemFs {
 struct FileObject {
     node_id: u64,
     entry_id: u64,
+    /// Last live path for this exact opened entry. Live entries are resolved from the tree so a
+    /// rename is immediately visible; the retained value remains authoritative after unlink.
+    opened_name: String,
     current_offset: u64,
     /// Create options retained as `FILE_OBJECT` mode flags for `FileModeInformation`.
     create_options: u32,
@@ -3235,6 +3290,13 @@ impl FileSystem {
         information: u32,
         options: u32,
     ) -> CreateResult {
+        let Some(opened_name) = self.volume.opened_name(entry_id) else {
+            return CreateResult {
+                status: STATUS_INSUFFICIENT_RESOURCES,
+                handle: INVALID_HANDLE,
+                information: 0,
+            };
+        };
         let handle = match self.handles.iter().position(|slot| slot.is_none()) {
             Some(free) => free as u64,
             None => {
@@ -3245,6 +3307,7 @@ impl FileSystem {
         self.handles[handle as usize] = Some(FileObject {
             node_id,
             entry_id,
+            opened_name,
             current_offset: 0,
             create_options: options,
             references: 1,
@@ -3452,6 +3515,13 @@ impl FileSystem {
         };
         if status == STATUS_SUCCESS {
             self.volume.touch_change(source);
+            if let Some(name) = self.volume.opened_name(source_entry) {
+                for object in self.handles.iter_mut().flatten() {
+                    if object.entry_id == source_entry {
+                        object.opened_name.clone_from(&name);
+                    }
+                }
+            }
             self.reap_unlinked_nodes();
         }
         status
@@ -3832,6 +3902,18 @@ impl FileSystem {
     pub fn zw_query_metadata(&self, handle: u64) -> Option<FileMetadata> {
         let obj = self.obj(handle)?;
         self.volume.metadata(obj.node_id, obj.delete_pending)
+    }
+
+    /// Return the volume-relative name of the exact entry used to open this File object.
+    pub fn zw_query_opened_name(&self, handle: u64) -> Option<String> {
+        let object = self.obj(handle)?;
+        if object.entry_id == 0 || self.volume.entry_location(object.entry_id).is_some() {
+            return self.volume.opened_name(object.entry_id);
+        }
+        let mut retained = String::new();
+        retained.try_reserve_exact(object.opened_name.len()).ok()?;
+        retained.push_str(&object.opened_name);
+        Some(retained)
     }
 
     /// `ZwQueryDirectoryFile` (spec §17): enumerate the directory this file object is open on,

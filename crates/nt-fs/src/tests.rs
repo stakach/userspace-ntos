@@ -360,6 +360,173 @@ fn query_information_encodes_io_manager_owned_fields() {
 }
 
 #[test]
+fn query_information_encodes_name_and_overflow_prefix() {
+    let name = wide(r"\ReactOS\System32\ntdll.dll");
+    let full_len = 4 + name.len() * 2;
+    let mut full = alloc::vec![0xCC; full_len + 4];
+    assert_eq!(
+        encode_named_query_information(
+            FILE_NAME_INFORMATION,
+            QueryMetadata::default(),
+            &name,
+            &mut full,
+        ),
+        Ok(QueryInformationResult {
+            status: STATUS_SUCCESS,
+            information: full_len,
+        })
+    );
+    assert_eq!(
+        u32::from_le_bytes(full[..4].try_into().unwrap()),
+        (name.len() * 2) as u32
+    );
+    assert_eq!(&full[full_len..], &[0xCC; 4]);
+
+    let mut short = [0xCC; 15];
+    assert_eq!(
+        encode_named_query_information(
+            FILE_NAME_INFORMATION,
+            QueryMetadata::default(),
+            &name,
+            &mut short,
+        ),
+        Ok(QueryInformationResult {
+            status: STATUS_BUFFER_OVERFLOW,
+            information: short.len(),
+        })
+    );
+    assert_eq!(
+        u32::from_le_bytes(short[..4].try_into().unwrap()),
+        (name.len() * 2) as u32
+    );
+    assert_eq!(&short[4..14], &full[4..14]);
+    assert_eq!(short[14], full[14]);
+
+    let mut too_short = [0xCC; 7];
+    assert_eq!(
+        encode_named_query_information(
+            FILE_NAME_INFORMATION,
+            QueryMetadata::default(),
+            &name,
+            &mut too_short,
+        ),
+        Err(STATUS_INFO_LENGTH_MISMATCH)
+    );
+    assert_eq!(too_short, [0xCC; 7]);
+}
+
+#[test]
+fn query_information_composes_file_all_information() {
+    let metadata = QueryMetadata {
+        creation_time: 1,
+        last_access_time: 2,
+        last_write_time: 3,
+        change_time: 4,
+        allocation_size: 0x2000,
+        end_of_file: 0x1234,
+        file_id: 0x5566,
+        file_attributes: FILE_ATTRIBUTE_ARCHIVE,
+        current_byte_offset: 0x88,
+        access_flags: 0x0012_0089,
+        mode: FILE_SYNCHRONOUS_IO_NONALERT,
+        alignment_requirement: 0x1ff,
+        number_of_links: 3,
+        delete_pending: true,
+        directory: false,
+        ..QueryMetadata::default()
+    };
+    let name = wide(r"\x");
+    let mut output = [0xCC; 104];
+    assert_eq!(
+        encode_named_query_information(FILE_ALL_INFORMATION, metadata, &name, &mut output),
+        Ok(QueryInformationResult {
+            status: STATUS_SUCCESS,
+            information: 104,
+        })
+    );
+    assert_eq!(u64::from_le_bytes(output[0..8].try_into().unwrap()), 1);
+    assert_eq!(
+        u64::from_le_bytes(output[40..48].try_into().unwrap()),
+        0x2000
+    );
+    assert_eq!(
+        u64::from_le_bytes(output[64..72].try_into().unwrap()),
+        0x5566
+    );
+    assert_eq!(
+        u32::from_le_bytes(output[76..80].try_into().unwrap()),
+        metadata.access_flags
+    );
+    assert_eq!(
+        u64::from_le_bytes(output[80..88].try_into().unwrap()),
+        metadata.current_byte_offset
+    );
+    assert_eq!(
+        u32::from_le_bytes(output[88..92].try_into().unwrap()),
+        metadata.mode
+    );
+    assert_eq!(
+        u32::from_le_bytes(output[92..96].try_into().unwrap()),
+        metadata.alignment_requirement
+    );
+    assert_eq!(u32::from_le_bytes(output[96..100].try_into().unwrap()), 4);
+    assert_eq!(&output[100..104], &[b'\\', 0, b'x', 0]);
+
+    let long_name = wide(r"\directory\file.txt");
+    let mut short = [0xCC; 105];
+    assert_eq!(
+        encode_named_query_information(FILE_ALL_INFORMATION, metadata, &long_name, &mut short),
+        Ok(QueryInformationResult {
+            status: STATUS_BUFFER_OVERFLOW,
+            information: short.len(),
+        })
+    );
+    assert_eq!(
+        u32::from_le_bytes(short[96..100].try_into().unwrap()),
+        (long_name.len() * 2) as u32
+    );
+    assert_eq!(&short[100..104], &[b'\\', 0, b'd', 0]);
+
+    let mut too_short = [0xCC; 103];
+    assert_eq!(
+        encode_named_query_information(FILE_ALL_INFORMATION, metadata, &long_name, &mut too_short,),
+        Err(STATUS_INFO_LENGTH_MISMATCH)
+    );
+    assert_eq!(too_short, [0xCC; 103]);
+}
+
+#[test]
+fn file_all_information_seeds_only_io_manager_owned_fields() {
+    let metadata = QueryMetadata {
+        access_flags: 0x0012_0089,
+        mode: FILE_SYNCHRONOUS_IO_NONALERT,
+        alignment_requirement: 0x1ff,
+        ..QueryMetadata::default()
+    };
+    let mut output = [0xCC; FILE_ALL_INFORMATION_MINIMUM_LENGTH];
+    assert_eq!(
+        encode_file_all_io_manager_information(metadata, &mut output),
+        Ok(())
+    );
+    assert!(output[..76].iter().all(|byte| *byte == 0xCC));
+    assert_eq!(&output[76..80], &metadata.access_flags.to_le_bytes());
+    assert!(output[80..88].iter().all(|byte| *byte == 0xCC));
+    assert_eq!(&output[88..92], &metadata.mode.to_le_bytes());
+    assert_eq!(
+        &output[92..96],
+        &metadata.alignment_requirement.to_le_bytes()
+    );
+    assert!(output[96..].iter().all(|byte| *byte == 0xCC));
+
+    let mut short = [0xCC; FILE_ALL_INFORMATION_MINIMUM_LENGTH - 1];
+    assert_eq!(
+        encode_file_all_io_manager_information(metadata, &mut short),
+        Err(STATUS_INFO_LENGTH_MISMATCH)
+    );
+    assert_eq!(short, [0xCC; FILE_ALL_INFORMATION_MINIMUM_LENGTH - 1]);
+}
+
+#[test]
 fn file_mode_retains_only_file_object_mode_options() {
     let persistent = FILE_WRITE_THROUGH
         | FILE_SEQUENTIAL_ONLY
@@ -2153,6 +2320,10 @@ fn writable_volume_set_information_and_delete() {
         fs.zw_write_file(f.handle, None, b"0123456789"),
         (STATUS_SUCCESS, 10)
     );
+    assert_eq!(
+        fs.zw_query_opened_name(f.handle).as_deref(),
+        Some(r"\profiles\a.txt")
+    );
     // FileEndOfFileInformation truncates.
     assert_eq!(
         fs.zw_set_information_file(f.handle, FILE_END_OF_FILE_INFORMATION, &4u64.to_le_bytes()),
@@ -2187,6 +2358,10 @@ fn writable_volume_set_information_and_delete() {
             .unwrap()
             .end_of_file,
         4
+    );
+    assert_eq!(
+        fs.zw_query_opened_name(f.handle).as_deref(),
+        Some(r"\profiles\b.txt")
     );
 
     let dir = fs.zw_create_file(
@@ -2364,6 +2539,14 @@ fn writable_volume_hardlinks_share_nodes_and_retain_exact_entries() {
         FILE_NON_DIRECTORY_FILE,
     );
     assert_eq!(alias.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_query_opened_name(source.handle).as_deref(),
+        Some(r"\links\source.txt")
+    );
+    assert_eq!(
+        fs.zw_query_opened_name(alias.handle).as_deref(),
+        Some(r"\links\alias.txt")
+    );
     let source_metadata = fs.zw_query_metadata(source.handle).unwrap();
     let alias_metadata = fs.zw_query_metadata(alias.handle).unwrap();
     assert_eq!(source_metadata.file_id, alias_metadata.file_id);
@@ -2401,6 +2584,10 @@ fn writable_volume_hardlinks_share_nodes_and_retain_exact_entries() {
     assert!(fs.query_attributes(r"\??\C:\links\alias.txt").is_none());
     assert!(fs.query_attributes(r"\??\C:\links\source.txt").is_some());
     assert!(fs.query_attributes(r"\??\C:\links\renamed.txt").is_some());
+    assert_eq!(
+        fs.zw_query_opened_name(alias.handle).as_deref(),
+        Some(r"\links\renamed.txt")
+    );
 
     assert_eq!(
         fs.zw_set_information_file(source.handle, FILE_DISPOSITION_INFORMATION, &[1]),
@@ -2445,6 +2632,10 @@ fn writable_volume_hardlinks_share_nodes_and_retain_exact_entries() {
     assert_eq!(
         fs.zw_read_file(displaced.handle, Some(0), 8),
         (STATUS_SUCCESS, b"old".to_vec())
+    );
+    assert_eq!(
+        fs.zw_query_opened_name(displaced.handle).as_deref(),
+        Some(r"\links\target.txt")
     );
     assert_eq!(fs.zw_close(displaced.handle), STATUS_SUCCESS);
     assert_eq!(

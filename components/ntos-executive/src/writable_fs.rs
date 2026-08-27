@@ -1717,6 +1717,10 @@ pub(crate) unsafe fn metadata(file_id: u64) -> Option<nt_fs::FileMetadata> {
     writable_fs()?.zw_query_metadata(file_id)
 }
 
+pub(crate) unsafe fn opened_name(file_id: u64) -> Option<alloc::string::String> {
+    writable_fs()?.zw_query_opened_name(file_id)
+}
+
 /// Current byte offset for a writable-volume file object.
 pub(crate) unsafe fn current_offset(file_id: u64) -> Option<u64> {
     writable_fs()?.current_offset(file_id)
