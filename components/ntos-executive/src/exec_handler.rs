@@ -28763,6 +28763,10 @@ impl ExecNtHandler {
             NativeService::NtOpenThreadTokenEx => unsafe { self.nt_open_thread_token(args, true) },
             NativeService::NtContinue => unsafe { self.nt_continue(args) },
             NativeService::NtRaiseException => unsafe { self.nt_raise_exception(args) },
+            // An active callback is consumed by the continuation path in `service_sec_image`
+            // before ordinary dispatch. Reaching the handler means this thread has no callback
+            // frame to return through.
+            NativeService::NtCallbackReturn => nt_syscall::STATUS_NO_CALLBACK_ACTIVE,
             NativeService::NtRaiseHardError => unsafe {
                 use nt_syscall::hard_error::{validate_request, RESPONSE_RETURN_TO_CALLER};
 

@@ -27,6 +27,7 @@ pub const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 pub const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
 pub const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+pub const STATUS_NO_CALLBACK_ACTIVE: u32 = 0xC000_0258;
 
 /// The processor mode a service runs on behalf of (spec §8.4).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -152,6 +153,10 @@ pub enum NativeService {
     // Structured exception handling (§16.6)
     NtContinue,
     NtRaiseException,
+    // Kernel-to-user callback return. The active-callback path resumes a parked kernel
+    // continuation before ordinary handler dispatch; a call without an active callback reaches the
+    // handler and returns STATUS_NO_CALLBACK_ACTIVE.
+    NtCallbackReturn,
     // Additional services the executive hosts for real binaries (smss/csrss). These are real
     // Win7-SP1 native services migrated off the executive's hand-wired dispatch ladder into this
     // registered table (Workstream A: converge all native dispatch onto the `NativeServiceTable`).
@@ -359,6 +364,7 @@ impl NativeService {
             NtRaiseHardError => "NtRaiseHardError",
             NtContinue => "NtContinue",
             NtRaiseException => "NtRaiseException",
+            NtCallbackReturn => "NtCallbackReturn",
             NtProtectVirtualMemory => "NtProtectVirtualMemory",
             NtDisplayString => "NtDisplayString",
             NtQueryDebugFilterState => "NtQueryDebugFilterState",
@@ -625,6 +631,7 @@ impl NativeService {
         NativeService::NtAdjustGroupsToken,
         NativeService::NtSetInformationToken,
         NativeService::NtFilterToken,
+        NativeService::NtCallbackReturn,
     ];
 }
 

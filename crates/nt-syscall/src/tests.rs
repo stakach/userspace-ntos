@@ -135,6 +135,23 @@ fn filter_token_keeps_native_six_argument_contract() {
 }
 
 #[test]
+fn callback_return_keeps_native_service_identity() {
+    assert_eq!(NativeService::NtCallbackReturn.name(), "NtCallbackReturn");
+    assert_eq!(NativeService::NtCallbackReturn.arg_count(), (3, 3));
+    assert_eq!(nt_syscall_abi::ssn_of("NtCallbackReturn"), Some(22));
+
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtCallbackReturn, 22)],
+    );
+    assert_eq!(
+        table.lookup(22).map(|entry| entry.service),
+        Some(NativeService::NtCallbackReturn)
+    );
+    assert_eq!(table.number_of(NativeService::NtCallbackReturn), Some(22));
+}
+
+#[test]
 fn flush_key_is_a_single_handle_registry_service() {
     // `NtFlushKey(IN HANDLE KeyHandle)` — ReactOS `ntoskrnl/config/ntapi.c:1085`, one argument,
     // SSN 83 (`sysfuncs.lst` line 84). rpcrt4's ncacn_np server handoff reaches it through

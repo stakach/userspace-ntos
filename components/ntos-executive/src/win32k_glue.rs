@@ -3238,7 +3238,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         return None;
     }
     if !unwind_controlled_callback(request) {
-        print_str(b"[user-callback] continuation correlation rejected SSN 22\n");
+        print_str(b"[user-callback] NtCallbackReturn continuation correlation rejected\n");
         abort_controlled_user_callbacks();
         return None;
     }
@@ -3250,7 +3250,9 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         USER_CALLBACK_SAS_SEQUENCE_ACTIVE.store(0, Ordering::Relaxed);
         USER_CALLBACK_SAS_SEQUENCE_CALLBACK_ID.store(0, Ordering::Relaxed);
     }
-    print_str(b"[user-callback] A real callback returned through SSN 22; resuming B component\n");
+    print_str(
+        b"[user-callback] A real callback completed through NtCallbackReturn; resuming B component\n",
+    );
     let Ok(completed_frame) = active.pop(correlation) else {
         abort_controlled_user_callbacks();
         return None;

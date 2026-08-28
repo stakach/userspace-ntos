@@ -8551,7 +8551,11 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"\n");
                 }
             }
-            if m0 == 22 {
+            if nt_dispatcher
+                .table()
+                .lookup(m0 as u32)
+                .is_some_and(|entry| entry.service == NativeService::NtCallbackReturn)
+            {
                 match win32k_glue::user_callback_return_readiness(pi as u32, badge, current_tid) {
                     win32k_glue::UserCallbackReturnReadiness::Deferred => {
                         if defer_user_callback_return(

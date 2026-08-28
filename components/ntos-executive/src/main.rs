@@ -1239,6 +1239,10 @@ pub const SSN_NT_SET_UUID_SEED: u64 = 255;
 /// `NtRaiseException` reports to Dbgk when a debugger is attached and otherwise tears the process down.
 pub const SSN_NT_CONTINUE: u64 = 34;
 pub const SSN_NT_RAISE_EXCEPTION: u64 = 189;
+/// NtCallbackReturn completes the innermost callback on the calling thread and resumes the parked
+/// kernel continuation. Unlike an ordinary native service, a successful call does not return to
+/// the syscall instruction that issued it.
+pub const SSN_NT_CALLBACK_RETURN: u64 = 22;
 /// **Dbgk — the user-mode debugging plane** (`ntoskrnl/dbgk`). The five debug-object services our
 /// ntdll's `DbgUi*` wrappers issue (`references/reactos/dll/ntdll/dbg/dbgui.c`), each with its
 /// `sysfuncs.lst`-derived SSN (0-based line index — `NtCreateDebugObject` is line 36, …). Serviced
@@ -23817,6 +23821,10 @@ fn build_nt_table() -> NativeServiceTable {
                 SSN_NT_SUSPEND_PROCESS as u32,
             ),
             (NativeService::NtContinue, SSN_NT_CONTINUE as u32),
+            (
+                NativeService::NtCallbackReturn,
+                SSN_NT_CALLBACK_RETURN as u32,
+            ),
             (
                 NativeService::NtRaiseException,
                 SSN_NT_RAISE_EXCEPTION as u32,
