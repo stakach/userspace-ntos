@@ -15446,3 +15446,33 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     must add its backing namespace reference exactly once on the first transition. Do not
     manufacture a name, restore an already-unlinked object, or turn repeated calls into extra
     references.
+
+    `NtMakePermanentObject` (2026-08-29, accepted): SSN 109 is now a typed registered one-argument
+    service with no numeric branch or fallback. User-mode callers must hold enabled
+    `SeCreatePermanentPrivilege`; that check deliberately precedes handle resolution. The executive
+    then resolves the handle's modeled object header and changes its permanence state through the
+    same `nt-object-manager` invariant used by permanent creation and `NtMakeTemporaryObject`.
+    Repeated calls are idempotent, unnamed objects retain no fabricated namespace state, and a named
+    I/O completion object acquires its backing namespace reference exactly once on the first
+    transition.
+
+    Focused validation passes `nt-object-manager` `69/69`, `nt-syscall` `65/65`, `git diff
+    --check`, the freestanding executive at the established 212-warning baseline, and the release
+    build/staging path. Code checkpoint `21659c55` is pushed. Serialized acceptance
+    `.tmp/run-headless-make-permanent-20260829.log` reached the final gate at 108,032 ms, launched
+    genuine userinit and Explorer, completed 668 Explorer api0 redirects with zero callback or
+    dead-callback failures, recorded paint begin/end `5/20`, 187 direct GDI returns, and 135 batch
+    flushes covering 184 records, and painted `480000/480000` framebuffer pixels with at least 32
+    colours. All `295/295` gates passed and the sentinel matched. Startup did not issue SSN 109, so
+    the boot is a full non-regression gate while focused object-manager tests prove named, unnamed,
+    repeated-transition, and last-handle lifetime behavior. Snapshot generation 5 committed
+    1,755,492 bytes, scratch returned to zero, and the census reported no page-table, frame,
+    mapping, alias, registry, untyped-allocation, frame-registration, image-bank, or allocator
+    failure.
+
+    Review adjustment: the typed surface now contains 176 services, the hosted table registers 175
+    numbered variants, and 47 canonical ABI exports remain absent. Audit `NtFlushVirtualMemory`
+    next as the next bounded Mm boundary. It must flush dirty shared or mapped-file pages through
+    the owning section/cache path, update the caller's base-address and region-size outputs with the
+    actual page-aligned range, preserve private-page semantics, propagate backing-store errors, and
+    reject invalid or unmapped ranges without treating a cache checkpoint as syscall success.
