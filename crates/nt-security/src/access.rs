@@ -1,7 +1,7 @@
 //! Security descriptors + ACLs/ACEs (spec §7.5-§7.7), access masks (spec §8), and the NT
 //! access-check algorithm (spec §9).
 
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 
 use crate::sid::Sid;
 use crate::token::{
@@ -78,6 +78,31 @@ pub fn map_token_access(desired: AccessMask) -> AccessMask {
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
 pub const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 pub const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+
+pub type ObjectTypeGuid = [u8; 16];
+pub const ACCESS_MAX_LEVEL: u16 = 4;
+
+/// One validated object or sub-object in an NT access-check hierarchy.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ObjectTypeEntry {
+    pub level: u16,
+    pub object_type: ObjectTypeGuid,
+}
+
+/// Validate the ordering rules shared by native `OBJECT_TYPE_LIST` callers and the access engine.
+pub fn validate_object_type_list(entries: &[ObjectTypeEntry]) -> Result<(), u32> {
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.level > ACCESS_MAX_LEVEL
+            || (index == 0 && entry.level != 0)
+            || (index != 0 && entry.level == 0)
+            || (index != 0 && entry.level > entries[index - 1].level + 1)
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+    }
+    Ok(())
+}
 
 /// Maps generic rights to object-specific rights (spec §8.3).
 #[derive(Copy, Clone, Debug)]
@@ -122,6 +147,8 @@ pub struct Ace {
     pub mask: AccessMask,
     pub sid: Sid,
     pub inherit_only: bool,
+    /// Object GUID carried by an object ACE. `None` means the ACE applies to the object generally.
+    pub object_type: Option<ObjectTypeGuid>,
 }
 
 impl Ace {
@@ -131,6 +158,7 @@ impl Ace {
             mask,
             sid,
             inherit_only: false,
+            object_type: None,
         }
     }
     pub fn deny(sid: Sid, mask: AccessMask) -> Self {
@@ -139,6 +167,27 @@ impl Ace {
             mask,
             sid,
             inherit_only: false,
+            object_type: None,
+        }
+    }
+
+    pub fn allow_object(sid: Sid, mask: AccessMask, object_type: ObjectTypeGuid) -> Self {
+        Ace {
+            ace_type: AceType::AccessAllowed,
+            mask,
+            sid,
+            inherit_only: false,
+            object_type: Some(object_type),
+        }
+    }
+
+    pub fn deny_object(sid: Sid, mask: AccessMask, object_type: ObjectTypeGuid) -> Self {
+        Ace {
+            ace_type: AceType::AccessDenied,
+            mask,
+            sid,
+            inherit_only: false,
+            object_type: Some(object_type),
         }
     }
 }
@@ -228,6 +277,97 @@ pub fn access_check(
     mapping: &GenericMapping,
     mode: ProcessorMode,
 ) -> AccessCheckResult {
+    access_check_internal(sd, token, None, desired_access, mapping, mode, None, false)
+}
+
+/// Evaluate access against an object-type hierarchy. The result-list form returns one entry for
+/// every object and preserves partial grants; the aggregate form returns one union result, matching
+/// the native API that has only one granted-access/status output pair.
+pub fn access_check_by_type(
+    sd: &SecurityDescriptor,
+    token: &AccessToken,
+    principal_self: Option<&Sid>,
+    desired_access: AccessMask,
+    object_types: &[ObjectTypeEntry],
+    mapping: &GenericMapping,
+    mode: ProcessorMode,
+    use_result_list: bool,
+) -> Result<Vec<AccessCheckResult>, u32> {
+    validate_object_type_list(object_types)?;
+    if use_result_list && object_types.is_empty() {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if object_types.is_empty() {
+        return Ok(vec![access_check_internal(
+            sd,
+            token,
+            principal_self,
+            desired_access,
+            mapping,
+            mode,
+            None,
+            false,
+        )]);
+    }
+
+    let mut per_object = Vec::new();
+    per_object
+        .try_reserve_exact(object_types.len())
+        .map_err(|_| crate::create_token::STATUS_INSUFFICIENT_RESOURCES)?;
+    for index in 0..object_types.len() {
+        per_object.push(access_check_internal(
+            sd,
+            token,
+            principal_self,
+            desired_access,
+            mapping,
+            mode,
+            Some((object_types, index)),
+            true,
+        ));
+    }
+    if use_result_list {
+        return Ok(per_object);
+    }
+
+    let granted = per_object
+        .iter()
+        .fold(0, |union, result| union | result.granted_access);
+    let maximum = desired_access & MAXIMUM_ALLOWED != 0;
+    let wanted = mapping.map(desired_access & !MAXIMUM_ALLOWED);
+    let success = if maximum {
+        granted != 0
+    } else {
+        desired_access != 0 && wanted & !granted == 0
+    };
+    let privileges_used = per_object
+        .first()
+        .map(|result| result.privileges_used.clone())
+        .unwrap_or_default();
+    Ok(vec![AccessCheckResult {
+        status: if success {
+            STATUS_SUCCESS
+        } else {
+            STATUS_ACCESS_DENIED
+        },
+        granted_access: if success { granted } else { 0 },
+        privileges_used,
+    }])
+}
+
+fn access_check_internal(
+    sd: &SecurityDescriptor,
+    token: &AccessToken,
+    principal_self: Option<&Sid>,
+    desired_access: AccessMask,
+    mapping: &GenericMapping,
+    mode: ProcessorMode,
+    object: Option<(&[ObjectTypeEntry], usize)>,
+    preserve_partial: bool,
+) -> AccessCheckResult {
+    if desired_access == 0 {
+        return denied();
+    }
     let maximum = desired_access & MAXIMUM_ALLOWED != 0;
     let want = mapping.map(desired_access & !MAXIMUM_ALLOWED);
     let mut privileges_used: Vec<&'static str> = Vec::new();
@@ -245,7 +385,11 @@ pub fn access_check(
     if mode == ProcessorMode::KernelMode {
         return AccessCheckResult {
             status: STATUS_SUCCESS,
-            granted_access: if maximum { all_rights() } else { want },
+            granted_access: if maximum {
+                mapping.generic_all | want
+            } else {
+                want
+            },
             privileges_used,
         };
     }
@@ -273,21 +417,41 @@ pub fn access_check(
                     .any(|sid| **sid == *owner))
     });
     if token_is_owner {
-        granted |= READ_CONTROL;
+        let owner_rights = READ_CONTROL | WRITE_DAC;
+        granted |= if maximum {
+            owner_rights
+        } else {
+            want & owner_rights
+        };
     }
 
     match &sd.dacl {
         None => {
             // Null DACL grants all access (spec §9.5).
-            granted |= if maximum { all_rights() } else { want };
+            granted |= if maximum {
+                mapping.generic_all | want
+            } else {
+                want
+            };
         }
         Some(acl) => {
             let allow_sids = token.allow_sids();
             let deny_sids = token.deny_sids();
-            let ordinary = match evaluate_dacl(acl, &allow_sids, &deny_sids, want, maximum, granted)
-            {
+            let ordinary = match evaluate_dacl(
+                acl,
+                &allow_sids,
+                &deny_sids,
+                principal_self,
+                object,
+                want,
+                maximum,
+                granted,
+                mapping,
+            ) {
                 Ok(result) => result,
-                Err(()) => return denied(),
+                Err(partial) => {
+                    return denied_with_partial(partial, privileges_used, preserve_partial)
+                }
             };
             if token.is_restricted() {
                 let restricted_allow_sids = token.restricted_allow_sids();
@@ -296,12 +460,17 @@ pub fn access_check(
                     acl,
                     &restricted_allow_sids,
                     &restricted_deny_sids,
+                    principal_self,
+                    object,
                     want,
                     maximum,
                     granted,
+                    mapping,
                 ) {
                     Ok(result) => result,
-                    Err(()) => return denied(),
+                    Err(partial) => {
+                        return denied_with_partial(partial, privileges_used, preserve_partial)
+                    }
                 };
                 // Privilege and owner grants precede the DACL. Rights granted by the ACL must pass
                 // both the ordinary SID set and the restricting SID set.
@@ -325,11 +494,11 @@ pub fn access_check(
     } else if want & !granted == 0 {
         AccessCheckResult {
             status: STATUS_SUCCESS,
-            granted_access: want,
+            granted_access: if preserve_partial { granted } else { want },
             privileges_used,
         }
     } else {
-        denied()
+        denied_with_partial(granted, privileges_used, preserve_partial)
     }
 }
 
@@ -337,29 +506,33 @@ fn evaluate_dacl(
     acl: &Acl,
     allow_sids: &[&Sid],
     deny_sids: &[&Sid],
+    principal_self: Option<&Sid>,
+    object: Option<(&[ObjectTypeEntry], usize)>,
     want: AccessMask,
     maximum: bool,
     previously_granted: AccessMask,
-) -> Result<AccessMask, ()> {
+    mapping: &GenericMapping,
+) -> Result<AccessMask, AccessMask> {
     let mut granted = previously_granted;
     let mut denied_bits: AccessMask = 0;
     for ace in &acl.aces {
-        if ace.inherit_only {
+        if ace.inherit_only || !ace_applies_to_object(ace, object) {
             continue;
         }
+        let mask = mapping.map(ace.mask);
         match ace.ace_type {
             AceType::AccessDenied => {
-                if deny_sids.iter().any(|sid| **sid == ace.sid) {
+                if sid_matches(deny_sids, &ace.sid, principal_self) {
                     if maximum {
-                        denied_bits |= ace.mask & !granted;
-                    } else if ace.mask & want & !granted != 0 {
-                        return Err(());
+                        denied_bits |= mask & !granted;
+                    } else if mask & want & !granted != 0 {
+                        return Err(granted);
                     }
                 }
             }
             AceType::AccessAllowed => {
-                if allow_sids.iter().any(|sid| **sid == ace.sid) {
-                    let add = ace.mask & !denied_bits;
+                if sid_matches(allow_sids, &ace.sid, principal_self) {
+                    let add = mask & !denied_bits;
                     granted |= if maximum { add } else { add & want };
                 }
             }
@@ -372,6 +545,41 @@ fn evaluate_dacl(
     Ok(granted)
 }
 
+fn sid_matches(candidates: &[&Sid], ace_sid: &Sid, principal_self: Option<&Sid>) -> bool {
+    let sid = if ace_sid.is_principal_self() {
+        let Some(principal_self) = principal_self else {
+            return false;
+        };
+        principal_self
+    } else {
+        ace_sid
+    };
+    candidates.iter().any(|candidate| **candidate == *sid)
+}
+
+fn ace_applies_to_object(ace: &Ace, object: Option<(&[ObjectTypeEntry], usize)>) -> bool {
+    let Some(guid) = ace.object_type else {
+        return true;
+    };
+    let Some((entries, candidate)) = object else {
+        // A by-type object ACE is an ordinary ACE when the caller supplies no type list.
+        return true;
+    };
+    let Some(target) = entries.iter().position(|entry| entry.object_type == guid) else {
+        return false;
+    };
+    if candidate == target {
+        return true;
+    }
+    if candidate < target {
+        return false;
+    }
+    let target_level = entries[target].level;
+    entries[target + 1..=candidate]
+        .iter()
+        .all(|entry| entry.level > target_level)
+}
+
 fn denied() -> AccessCheckResult {
     AccessCheckResult {
         status: STATUS_ACCESS_DENIED,
@@ -380,8 +588,16 @@ fn denied() -> AccessCheckResult {
     }
 }
 
-fn all_rights() -> AccessMask {
-    DELETE | READ_CONTROL | WRITE_DAC | WRITE_OWNER | SYNCHRONIZE | 0xFFFF
+fn denied_with_partial(
+    granted_access: AccessMask,
+    privileges_used: Vec<&'static str>,
+    preserve_partial: bool,
+) -> AccessCheckResult {
+    AccessCheckResult {
+        status: STATUS_ACCESS_DENIED,
+        granted_access: if preserve_partial { granted_access } else { 0 },
+        privileges_used,
+    }
 }
 
 /// A privilege-only check (spec §9.7), e.g. `SeLoadDriverPrivilege` for the driver-load path.

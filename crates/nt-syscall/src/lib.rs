@@ -141,6 +141,8 @@ pub enum NativeService {
     /// `NtCreateToken` — the 13-argument service lsass' `LsapLogonUser` mints a logon token with.
     NtCreateToken,
     NtAccessCheck,
+    NtAccessCheckByType,
+    NtAccessCheckByTypeResultList,
     // System information (§16.5, §7.1)
     NtQuerySystemInformation,
     NtQuerySystemTime,
@@ -355,6 +357,8 @@ impl NativeService {
             NtFilterToken => "NtFilterToken",
             NtCreateToken => "NtCreateToken",
             NtAccessCheck => "NtAccessCheck",
+            NtAccessCheckByType => "NtAccessCheckByType",
+            NtAccessCheckByTypeResultList => "NtAccessCheckByTypeResultList",
             NtQuerySystemInformation => "NtQuerySystemInformation",
             NtQuerySystemTime => "NtQuerySystemTime",
             NtDelayExecution => "NtDelayExecution",
@@ -635,6 +639,8 @@ impl NativeService {
         NativeService::NtFilterToken,
         NativeService::NtCallbackReturn,
         NativeService::NtImpersonateAnonymousToken,
+        NativeService::NtAccessCheckByType,
+        NativeService::NtAccessCheckByTypeResultList,
     ];
 }
 

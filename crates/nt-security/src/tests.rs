@@ -271,6 +271,7 @@ fn sid_wellknown_and_sddl() {
     assert_eq!(Sid::local_system().to_sddl(), "S-1-5-18");
     assert_eq!(Sid::everyone().to_sddl(), "S-1-1-0");
     assert_eq!(Sid::anonymous_logon().to_sddl(), "S-1-5-7");
+    assert_eq!(Sid::principal_self().to_sddl(), "S-1-5-10");
     assert_eq!(
         Sid::local_account(MACHINE, 1000).to_sddl(),
         "S-1-5-21-4660-1000"
@@ -470,10 +471,7 @@ fn anonymous_logon_store_selection_retains_identity_and_rejects_restricted_calle
         store.reference_anonymous_logon_token(anonymous, false, restricted),
         Err(STATUS_ACCESS_DENIED)
     );
-    assert_eq!(
-        store.reference_count(anonymous.without_everyone()),
-        Some(1)
-    );
+    assert_eq!(store.reference_count(anonymous.without_everyone()), Some(1));
 }
 
 fn acl_with_ace(revision: u8, ace: &[u8], trailing_free_bytes: usize) -> alloc::vec::Vec<u8> {
@@ -590,7 +588,11 @@ fn native_acl_validates_known_and_object_ace_sids() {
     ];
     object_with_guid.extend_from_slice(&[0x5a; 16]);
     object_with_guid.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 5]);
-    NativeAcl::from_bytes(&acl_with_ace(4, &object_with_guid, 0)).unwrap();
+    let native = NativeAcl::from_bytes(&acl_with_ace(4, &object_with_guid, 0)).unwrap();
+    let semantic = native_acl_to_acl(&native).unwrap();
+    assert_eq!(semantic.aces.len(), 1);
+    assert_eq!(semantic.aces[0].ace_type, AceType::AccessDenied);
+    assert_eq!(semantic.aces[0].object_type, Some([0x5a; 16]));
     object_with_guid[2] = 20;
     assert_eq!(
         NativeAcl::from_bytes(&acl_with_ace(4, &object_with_guid[..20], 0)),
@@ -1547,7 +1549,7 @@ fn null_and_empty_dacl() {
 }
 
 #[test]
-fn owner_gets_read_control_and_generic_maps() {
+fn owner_gets_read_control_write_dac_and_generic_maps() {
     let map = file_mapping();
     let user = AccessToken::user(MACHINE);
     // Empty DACL but the user is the owner → still gets READ_CONTROL (spec §9.6).
@@ -1557,6 +1559,7 @@ fn owner_gets_read_control_and_generic_maps() {
         ..Default::default()
     };
     assert!(access_check(&sd, &user, READ_CONTROL, &map, ProcessorMode::UserMode).granted());
+    assert!(access_check(&sd, &user, WRITE_DAC, &map, ProcessorMode::UserMode).granted());
     // GENERIC_READ maps to FILE_READ via the mapping.
     let sd = SecurityDescriptor {
         dacl: Some(Acl::new(vec![Ace::allow(
@@ -1567,6 +1570,197 @@ fn owner_gets_read_control_and_generic_maps() {
     };
     let r = access_check(&sd, &user, GENERIC_READ, &map, ProcessorMode::UserMode);
     assert!(r.granted() && r.granted_access & FILE_READ != 0);
+}
+
+#[test]
+fn access_check_by_type_applies_object_aces_to_the_matching_branch() {
+    const ROOT: ObjectTypeGuid = [1; 16];
+    const CHILD: ObjectTypeGuid = [2; 16];
+    const GRANDCHILD: ObjectTypeGuid = [3; 16];
+    const SIBLING: ObjectTypeGuid = [4; 16];
+    let objects = [
+        ObjectTypeEntry {
+            level: 0,
+            object_type: ROOT,
+        },
+        ObjectTypeEntry {
+            level: 1,
+            object_type: CHILD,
+        },
+        ObjectTypeEntry {
+            level: 2,
+            object_type: GRANDCHILD,
+        },
+        ObjectTypeEntry {
+            level: 1,
+            object_type: SIBLING,
+        },
+    ];
+    let sd = SecurityDescriptor {
+        owner: Some(Sid::administrators()),
+        dacl: Some(Acl::new(vec![Ace::allow_object(
+            Sid::everyone(),
+            FILE_WRITE,
+            CHILD,
+        )])),
+        ..Default::default()
+    };
+    let token = AccessToken::user(MACHINE);
+    let results = access_check_by_type(
+        &sd,
+        &token,
+        None,
+        FILE_WRITE,
+        &objects,
+        &file_mapping(),
+        ProcessorMode::UserMode,
+        true,
+    )
+    .unwrap();
+    assert_eq!(results.len(), 4);
+    assert_eq!(results[0].status, STATUS_ACCESS_DENIED);
+    assert!(results[1].granted());
+    assert!(results[2].granted());
+    assert_eq!(results[3].status, STATUS_ACCESS_DENIED);
+
+    let aggregate = access_check_by_type(
+        &sd,
+        &token,
+        None,
+        FILE_WRITE,
+        &objects,
+        &file_mapping(),
+        ProcessorMode::UserMode,
+        false,
+    )
+    .unwrap();
+    assert_eq!(aggregate.len(), 1);
+    assert!(aggregate[0].granted());
+    assert_eq!(aggregate[0].granted_access, FILE_WRITE);
+}
+
+#[test]
+fn access_check_by_type_preserves_ordered_denials_and_partial_owner_rights() {
+    const ROOT: ObjectTypeGuid = [11; 16];
+    const CHILD: ObjectTypeGuid = [12; 16];
+    const GRANDCHILD: ObjectTypeGuid = [13; 16];
+    const SIBLING: ObjectTypeGuid = [14; 16];
+    let objects = [
+        ObjectTypeEntry {
+            level: 0,
+            object_type: ROOT,
+        },
+        ObjectTypeEntry {
+            level: 1,
+            object_type: CHILD,
+        },
+        ObjectTypeEntry {
+            level: 2,
+            object_type: GRANDCHILD,
+        },
+        ObjectTypeEntry {
+            level: 1,
+            object_type: SIBLING,
+        },
+    ];
+    let token = AccessToken::user(MACHINE);
+    let sd = SecurityDescriptor {
+        owner: Some(token.user.clone()),
+        dacl: Some(Acl::new(vec![
+            Ace::deny_object(Sid::everyone(), FILE_READ, CHILD),
+            Ace::allow_object(Sid::everyone(), FILE_READ, ROOT),
+        ])),
+        ..Default::default()
+    };
+    let results = access_check_by_type(
+        &sd,
+        &token,
+        None,
+        FILE_READ | READ_CONTROL,
+        &objects,
+        &file_mapping(),
+        ProcessorMode::UserMode,
+        true,
+    )
+    .unwrap();
+    assert!(results[0].granted());
+    assert_eq!(results[1].status, STATUS_ACCESS_DENIED);
+    assert_eq!(results[2].status, STATUS_ACCESS_DENIED);
+    assert!(results[3].granted());
+    assert_eq!(results[1].granted_access, READ_CONTROL);
+    assert_eq!(results[2].granted_access, READ_CONTROL);
+}
+
+#[test]
+fn access_check_by_type_substitutes_principal_self() {
+    const ROOT: ObjectTypeGuid = [21; 16];
+    let objects = [ObjectTypeEntry {
+        level: 0,
+        object_type: ROOT,
+    }];
+    let token = AccessToken::user(MACHINE);
+    let sd = SecurityDescriptor {
+        owner: Some(Sid::administrators()),
+        dacl: Some(Acl::new(vec![Ace::allow_object(
+            Sid::principal_self(),
+            FILE_READ,
+            ROOT,
+        )])),
+        ..Default::default()
+    };
+    assert!(access_check_by_type(
+        &sd,
+        &token,
+        Some(&token.user),
+        FILE_READ,
+        &objects,
+        &file_mapping(),
+        ProcessorMode::UserMode,
+        true,
+    )
+    .unwrap()[0]
+        .granted());
+    assert_eq!(
+        access_check_by_type(
+            &sd,
+            &token,
+            None,
+            FILE_READ,
+            &objects,
+            &file_mapping(),
+            ProcessorMode::UserMode,
+            true,
+        )
+        .unwrap()[0]
+            .status,
+        STATUS_ACCESS_DENIED
+    );
+}
+
+#[test]
+fn object_type_list_validation_rejects_invalid_hierarchies() {
+    let guid = [1; 16];
+    assert_eq!(validate_object_type_list(&[]), Ok(()));
+    assert_eq!(
+        validate_object_type_list(&[ObjectTypeEntry {
+            level: 1,
+            object_type: guid,
+        }]),
+        Err(0xC000_000D)
+    );
+    assert_eq!(
+        validate_object_type_list(&[
+            ObjectTypeEntry {
+                level: 0,
+                object_type: guid,
+            },
+            ObjectTypeEntry {
+                level: 2,
+                object_type: guid,
+            },
+        ]),
+        Err(0xC000_000D)
+    );
 }
 
 #[test]
@@ -2205,6 +2399,55 @@ fn capture_acl_reads_exactly_acl_size_bytes() {
     client.map(0xA000, &[2, 0, 4, 0, 0, 0, 0, 0]);
     assert_eq!(capture_acl(&client, 0xA000), Err(STATUS_INVALID_ACL));
     assert_eq!(capture_acl(&client, 0), Err(STATUS_ACCESS_VIOLATION));
+}
+
+#[test]
+fn capture_object_type_list_reads_x64_entries_and_pointed_guids() {
+    const LIST_VA: u64 = 0x0000_0007_0002_0000;
+    const ROOT_GUID_VA: u64 = 0x0000_0007_0002_0100;
+    const CHILD_GUID_VA: u64 = 0x0000_0007_0002_0200;
+    let root = [0x11; 16];
+    let child = [0x22; 16];
+    let mut native = [0u8; 32];
+    native[0..2].copy_from_slice(&0u16.to_le_bytes());
+    native[8..16].copy_from_slice(&ROOT_GUID_VA.to_le_bytes());
+    native[16..18].copy_from_slice(&1u16.to_le_bytes());
+    native[24..32].copy_from_slice(&CHILD_GUID_VA.to_le_bytes());
+
+    let mut client = MockClient::default();
+    client.map(LIST_VA, &native);
+    client.map(ROOT_GUID_VA, &root);
+    client.map(CHILD_GUID_VA, &child);
+    assert_eq!(
+        capture_object_type_list(&client, LIST_VA, 2).unwrap(),
+        vec![
+            ObjectTypeEntry {
+                level: 0,
+                object_type: root,
+            },
+            ObjectTypeEntry {
+                level: 1,
+                object_type: child,
+            },
+        ]
+    );
+    assert_eq!(capture_object_type_list(&client, 0, 0), Ok(Vec::new()));
+    assert_eq!(
+        capture_object_type_list(&client, LIST_VA + 1, 2),
+        Err(STATUS_DATATYPE_MISALIGNMENT)
+    );
+    assert_eq!(
+        capture_object_type_list(&client, LIST_VA, MAX_CAPTURED_OBJECT_TYPES + 1),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+
+    native[0..2].copy_from_slice(&1u16.to_le_bytes());
+    let mut invalid = MockClient::default();
+    invalid.map(LIST_VA, &native);
+    assert_eq!(
+        capture_object_type_list(&invalid, LIST_VA, 2),
+        Err(STATUS_INVALID_PARAMETER)
+    );
 }
 
 #[test]

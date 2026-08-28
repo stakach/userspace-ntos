@@ -182,6 +182,26 @@ fn impersonate_anonymous_token_keeps_native_service_identity() {
 }
 
 #[test]
+fn access_check_by_type_services_keep_native_identities() {
+    for (service, name, ssn) in [
+        (NativeService::NtAccessCheckByType, "NtAccessCheckByType", 3),
+        (
+            NativeService::NtAccessCheckByTypeResultList,
+            "NtAccessCheckByTypeResultList",
+            5,
+        ),
+    ] {
+        assert_eq!(service.name(), name);
+        assert_eq!(service.arg_count(), (11, 11));
+        assert_eq!(nt_syscall_abi::ssn_of(name), Some(ssn));
+        let table =
+            NativeServiceTable::from_numbers(UserlandAbiProfile::Windows7, &[(service, ssn)]);
+        assert_eq!(table.lookup(ssn).map(|entry| entry.service), Some(service));
+        assert_eq!(table.number_of(service), Some(ssn));
+    }
+}
+
+#[test]
 fn flush_key_is_a_single_handle_registry_service() {
     // `NtFlushKey(IN HANDLE KeyHandle)` — ReactOS `ntoskrnl/config/ntapi.c:1085`, one argument,
     // SSN 83 (`sysfuncs.lst` line 84). rpcrt4's ncacn_np server handoff reaches it through

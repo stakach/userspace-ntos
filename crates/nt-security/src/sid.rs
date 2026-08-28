@@ -139,6 +139,13 @@ impl Sid {
     pub fn anonymous_logon() -> Self {
         Sid::new(5, &[7])
     }
+    /// `S-1-5-10` — Principal Self, substituted by access-check-by-type callers.
+    pub fn principal_self() -> Self {
+        Sid::new(5, &[10])
+    }
+    pub(crate) fn is_principal_self(&self) -> bool {
+        self.identifier_authority == [0, 0, 0, 0, 0, 5] && self.sub_authorities.as_slice() == [10]
+    }
     /// `S-1-5-11` — Authenticated Users.
     pub fn authenticated_users() -> Self {
         Sid::new(5, &[11])

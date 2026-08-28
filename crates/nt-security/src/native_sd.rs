@@ -6,7 +6,10 @@
 
 use alloc::vec::Vec;
 
-use crate::access::{Ace, AceType, Acl, SecurityDescriptor};
+use crate::access::{
+    validate_object_type_list, Ace, AceType, Acl, ObjectTypeEntry, SecurityDescriptor,
+    ACCESS_MAX_LEVEL,
+};
 use crate::create_token::{
     capture_acl, capture_sid, ClientMemory, STATUS_ACCESS_VIOLATION, STATUS_INSUFFICIENT_RESOURCES,
     STATUS_INVALID_PARAMETER,
@@ -16,10 +19,13 @@ use crate::sid::Sid;
 
 pub const STATUS_UNKNOWN_REVISION: u32 = 0xC000_0058;
 pub const STATUS_INVALID_SECURITY_DESCR: u32 = 0xC000_0079;
+pub const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+pub const MAX_CAPTURED_OBJECT_TYPES: u32 = 256;
 
 const SECURITY_DESCRIPTOR_REVISION: u8 = 1;
 const SECURITY_DESCRIPTOR_RELATIVE_SIZE: usize = 20;
 const SECURITY_DESCRIPTOR_ABSOLUTE_X64_SIZE: usize = 40;
+const OBJECT_TYPE_LIST_X64_SIZE: usize = 16;
 
 const SE_DACL_PRESENT: u16 = 0x0004;
 const SE_DACL_DEFAULTED: u16 = 0x0008;
@@ -87,6 +93,70 @@ const ACCESS_ALLOWED_OBJECT_ACE_TYPE: u8 = 0x05;
 const ACCESS_DENIED_OBJECT_ACE_TYPE: u8 = 0x06;
 const ACE_OBJECT_TYPE_PRESENT: u32 = 0x0000_0001;
 const ACE_INHERITED_OBJECT_TYPE_PRESENT: u32 = 0x0000_0002;
+
+/// Capture and validate the x64 native `OBJECT_TYPE_LIST` array and every pointed-to GUID.
+pub fn capture_object_type_list(
+    memory: &dyn ClientMemory,
+    address: u64,
+    count: u32,
+) -> Result<Vec<ObjectTypeEntry>, u32> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if count > MAX_CAPTURED_OBJECT_TYPES || address == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if address & 3 != 0 {
+        return Err(STATUS_DATATYPE_MISALIGNMENT);
+    }
+
+    let count = count as usize;
+    let byte_len = count
+        .checked_mul(OBJECT_TYPE_LIST_X64_SIZE)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let mut native = Vec::new();
+    native
+        .try_reserve_exact(byte_len)
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    native.resize(byte_len, 0);
+    if !memory.read(address, &mut native) {
+        return Err(STATUS_ACCESS_VIOLATION);
+    }
+
+    let mut captured: Vec<ObjectTypeEntry> = Vec::new();
+    captured
+        .try_reserve_exact(count)
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    for index in 0..count {
+        let offset = index * OBJECT_TYPE_LIST_X64_SIZE;
+        let level = u16::from_le_bytes([native[offset], native[offset + 1]]);
+        if level > ACCESS_MAX_LEVEL
+            || (index == 0 && level != 0)
+            || (index != 0 && level == 0)
+            || (index != 0 && level > captured[index - 1].level + 1)
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let guid_address = u64::from_le_bytes(
+            native[offset + 8..offset + 16]
+                .try_into()
+                .expect("native object-type pointer is in bounds"),
+        );
+        if guid_address == 0 {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        if guid_address & 3 != 0 {
+            return Err(STATUS_DATATYPE_MISALIGNMENT);
+        }
+        let mut object_type = [0u8; 16];
+        if !memory.read(guid_address, &mut object_type) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        captured.push(ObjectTypeEntry { level, object_type });
+    }
+    validate_object_type_list(&captured)?;
+    Ok(captured)
+}
 
 /// Capture a caller-supplied native `SECURITY_DESCRIPTOR`.
 ///
@@ -367,9 +437,9 @@ pub fn set_security_descriptor_bytes(
 /// Convert a validated native ACL into the semantic ACE list used by the access-check engine.
 ///
 /// Access-allowed, access-denied, and audit ACEs are represented directly. Object allow/deny ACEs
-/// contribute their mask and SID to the whole-object check; their GUID fields are skipped until the
-/// by-type access-check APIs model object-type lists. Unknown/callback ACEs are preserved by
-/// [`NativeAcl`] for token queries but ignored by this semantic evaluator.
+/// preserve their optional object GUID for access-check-by-type while still acting like ordinary
+/// ACEs when no type list is supplied. Unknown/callback ACEs are preserved by [`NativeAcl`] for
+/// token queries but ignored by this semantic evaluator.
 pub fn native_acl_to_acl(native: &NativeAcl) -> Result<Acl, u32> {
     let bytes = native.as_bytes();
     if bytes.len() < ACL_HEADER_SIZE {
@@ -397,13 +467,16 @@ pub fn native_acl_to_acl(native: &NativeAcl) -> Result<Acl, u32> {
             return Err(STATUS_INVALID_ACL);
         }
 
-        if let Some((semantic_type, sid_offset)) = semantic_ace(ace_type, bytes, offset, ace_end)? {
+        if let Some((semantic_type, sid_offset, object_type)) =
+            semantic_ace(ace_type, bytes, offset, ace_end)?
+        {
             let mask = read_u32(bytes, offset + 4);
             aces.push(Ace {
                 ace_type: semantic_type,
                 mask,
                 sid: Sid::from_native_bytes(&bytes[sid_offset..ace_end])?,
                 inherit_only: ace_flags & INHERIT_ONLY_ACE != 0,
+                object_type,
             });
         }
 
@@ -423,11 +496,11 @@ fn semantic_ace(
     bytes: &[u8],
     offset: usize,
     ace_end: usize,
-) -> Result<Option<(AceType, usize)>, u32> {
+) -> Result<Option<(AceType, usize, Option<crate::ObjectTypeGuid>)>, u32> {
     match ace_type {
-        ACCESS_ALLOWED_ACE_TYPE => Ok(Some((AceType::AccessAllowed, offset + 8))),
-        ACCESS_DENIED_ACE_TYPE => Ok(Some((AceType::AccessDenied, offset + 8))),
-        SYSTEM_AUDIT_ACE_TYPE => Ok(Some((AceType::SystemAudit, offset + 8))),
+        ACCESS_ALLOWED_ACE_TYPE => Ok(Some((AceType::AccessAllowed, offset + 8, None))),
+        ACCESS_DENIED_ACE_TYPE => Ok(Some((AceType::AccessDenied, offset + 8, None))),
+        SYSTEM_AUDIT_ACE_TYPE => Ok(Some((AceType::SystemAudit, offset + 8, None))),
         ACCESS_ALLOWED_OBJECT_ACE_TYPE | ACCESS_DENIED_OBJECT_ACE_TYPE => {
             let flags = read_u32(bytes, offset + 8);
             let guid_bytes = usize::from(flags & ACE_OBJECT_TYPE_PRESENT != 0) * 16
@@ -447,7 +520,16 @@ fn semantic_ace(
             } else {
                 AceType::AccessDenied
             };
-            Ok(Some((semantic_type, sid_offset)))
+            let object_type = if flags & ACE_OBJECT_TYPE_PRESENT != 0 {
+                Some(
+                    bytes[offset + 12..offset + 28]
+                        .try_into()
+                        .map_err(|_| STATUS_INVALID_ACL)?,
+                )
+            } else {
+                None
+            };
+            Ok(Some((semantic_type, sid_offset, object_type)))
         }
         _ => Ok(None),
     }

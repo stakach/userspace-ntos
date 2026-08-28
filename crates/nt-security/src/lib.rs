@@ -23,8 +23,9 @@ mod token_info;
 mod token_set;
 
 pub use access::{
-    access_check, check_token_privileges, map_token_access, privilege_check, AccessCheckResult,
-    AccessMask, Ace, AceType, Acl, GenericMapping, ProcessorMode, SecurityDescriptor,
+    access_check, access_check_by_type, check_token_privileges, map_token_access, privilege_check,
+    validate_object_type_list, AccessCheckResult, AccessMask, Ace, AceType, Acl, GenericMapping,
+    ObjectTypeEntry, ObjectTypeGuid, ProcessorMode, SecurityDescriptor, ACCESS_MAX_LEVEL,
     ACCESS_SYSTEM_SECURITY, DELETE, GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE,
     MAXIMUM_ALLOWED, READ_CONTROL, STATUS_ACCESS_DENIED, STATUS_PRIVILEGE_NOT_HELD, STATUS_SUCCESS,
     SYNCHRONIZE, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_GROUPS, TOKEN_ADJUST_PRIVILEGES,
@@ -40,12 +41,13 @@ pub use create_token::{
 };
 pub use native_acl::{NativeAcl, NativeAclError, STATUS_INVALID_ACL};
 pub use native_sd::{
-    capture_security_descriptor, capture_security_descriptor_bytes, native_acl_to_acl,
-    query_security_descriptor_bytes, set_security_descriptor_bytes, DACL_SECURITY_INFORMATION,
-    DEFAULT_KEY_SECURITY_DESCRIPTOR, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PROTECTED_SACL_SECURITY_INFORMATION,
-    SACL_SECURITY_INFORMATION, STATUS_INVALID_SECURITY_DESCR, STATUS_UNKNOWN_REVISION,
-    UNPROTECTED_DACL_SECURITY_INFORMATION, UNPROTECTED_SACL_SECURITY_INFORMATION,
+    capture_object_type_list, capture_security_descriptor, capture_security_descriptor_bytes,
+    native_acl_to_acl, query_security_descriptor_bytes, set_security_descriptor_bytes,
+    DACL_SECURITY_INFORMATION, DEFAULT_KEY_SECURITY_DESCRIPTOR, GROUP_SECURITY_INFORMATION,
+    MAX_CAPTURED_OBJECT_TYPES, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    PROTECTED_SACL_SECURITY_INFORMATION, SACL_SECURITY_INFORMATION, STATUS_DATATYPE_MISALIGNMENT,
+    STATUS_INVALID_SECURITY_DESCR, STATUS_UNKNOWN_REVISION, UNPROTECTED_DACL_SECURITY_INFORMATION,
+    UNPROTECTED_SACL_SECURITY_INFORMATION,
 };
 pub use sid::{write_native_sid_sddl_utf16, Luid, Sid};
 pub use token::{

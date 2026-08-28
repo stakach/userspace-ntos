@@ -17583,45 +17583,133 @@ impl ExecNtHandler {
     /// `NtAccessCheck(SecurityDescriptor, ClientToken, DesiredAccess, GenericMapping, PrivilegeSet,
     /// PrivilegeSetLength, GrantedAccess, AccessStatus)` — `ntoskrnl/se/accesschk.c:NtAccessCheck`.
     unsafe fn nt_access_check(&mut self, ctx: &NativeCallContext, args: &[u64]) -> u32 {
-        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        if args.len() < 8 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        self.nt_access_check_common(ctx, args, false, false)
+    }
+
+    unsafe fn nt_access_check_by_type(
+        &mut self,
+        ctx: &NativeCallContext,
+        args: &[u64],
+        use_result_list: bool,
+    ) -> u32 {
+        if args.len() < 11 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        self.nt_access_check_common(ctx, args, true, use_result_list)
+    }
+
+    unsafe fn nt_access_check_common(
+        &mut self,
+        ctx: &NativeCallContext,
+        args: &[u64],
+        by_type: bool,
+        use_result_list: bool,
+    ) -> u32 {
         const STATUS_GENERIC_NOT_MAPPED: u32 = 0xC000_00E6;
         const STATUS_NO_IMPERSONATION_TOKEN: u32 = 0xC000_005C;
-        const TOKEN_QUERY: u32 = 0x0008;
+        const TOKEN_QUERY: u32 = nt_security::TOKEN_QUERY;
         const GENERIC_MASK: u32 = nt_security::GENERIC_ALL
             | nt_security::GENERIC_EXECUTE
             | nt_security::GENERIC_READ
             | nt_security::GENERIC_WRITE;
 
-        if args.len() < 8 {
-            return STATUS_INVALID_PARAMETER;
+        let (
+            security_descriptor,
+            principal_self,
+            token_handle,
+            desired_access,
+            object_type_list,
+            object_type_count,
+            mapping_pointer,
+            privilege_set,
+            privilege_set_length,
+            granted_access,
+            access_status,
+        ) = if by_type {
+            (
+                args[0],
+                args[1],
+                args[2],
+                nt_ulong_arg(args[3]),
+                args[4],
+                nt_ulong_arg(args[5]),
+                args[6],
+                args[7],
+                args[8],
+                args[9],
+                args[10],
+            )
+        } else {
+            (
+                args[0],
+                0,
+                args[1],
+                nt_ulong_arg(args[2]),
+                0,
+                0,
+                args[3],
+                args[4],
+                args[5],
+                args[6],
+                args[7],
+            )
+        };
+
+        if mapping_pointer & 3 != 0
+            || privilege_set_length & 3 != 0
+            || granted_access & 3 != 0
+            || access_status & 3 != 0
+        {
+            return STATUS_DATATYPE_MISALIGNMENT;
         }
 
         let mut mapping_bytes = [0u8; 16];
-        if args[3] == 0 || !self.xas_read(args[3], &mut mapping_bytes) {
+        if mapping_pointer == 0 || !self.xas_read(mapping_pointer, &mut mapping_bytes) {
             return STATUS_ACCESS_VIOLATION;
         }
         let mut privilege_set_length_bytes = [0u8; 4];
-        if args[5] == 0 || !self.xas_read(args[5], &mut privilege_set_length_bytes) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        let captured_privilege_set_length = u32::from_le_bytes(privilege_set_length_bytes);
-        if captured_privilege_set_length != 0
-            && !self.probe_user_output(args[4], captured_privilege_set_length as usize)
+        if privilege_set_length == 0
+            || !self.xas_read(privilege_set_length, &mut privilege_set_length_bytes)
         {
             return STATUS_ACCESS_VIOLATION;
         }
-        if !self.probe_user_output(args[6], 4) || !self.probe_user_output(args[7], 4) {
+        let captured_privilege_set_length = u32::from_le_bytes(privilege_set_length_bytes);
+        if captured_privilege_set_length != 0 {
+            if privilege_set & 3 != 0 {
+                return STATUS_DATATYPE_MISALIGNMENT;
+            }
+            if !self.probe_user_output(privilege_set, captured_privilege_set_length as usize) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+        }
+        if use_result_list && object_type_count == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if object_type_count > nt_security::MAX_CAPTURED_OBJECT_TYPES {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let result_count = if use_result_list {
+            object_type_count as usize
+        } else {
+            1
+        };
+        let result_bytes = match result_count.checked_mul(4) {
+            Some(bytes) => bytes,
+            None => return STATUS_INVALID_PARAMETER,
+        };
+        if !self.probe_user_output(granted_access, result_bytes)
+            || !self.probe_user_output(access_status, result_bytes)
+        {
             return STATUS_ACCESS_VIOLATION;
         }
-
-        let desired_access = nt_ulong_arg(args[2]);
         if desired_access & GENERIC_MASK != 0 {
             return STATUS_GENERIC_NOT_MAPPED;
         }
 
-        let token_id = match self.token_id_for_handle(args[1], TOKEN_QUERY) {
+        let token_id = match self.token_id_for_handle(token_handle, TOKEN_QUERY) {
             Ok(token) => token,
             Err(status) => return status,
         };
@@ -17636,6 +17724,20 @@ impl ExecNtHandler {
             return nt_security::STATUS_BAD_IMPERSONATION_LEVEL;
         }
 
+        let object_types = if by_type {
+            let memory = ExecClientMemory { handler: &*self };
+            match nt_security::capture_object_type_list(
+                &memory,
+                object_type_list,
+                object_type_count,
+            ) {
+                Ok(list) => list,
+                Err(status) => return status,
+            }
+        } else {
+            alloc::vec::Vec::new()
+        };
+
         let mapping = nt_security::GenericMapping {
             generic_read: u32::from_le_bytes(mapping_bytes[0..4].try_into().unwrap()),
             generic_write: u32::from_le_bytes(mapping_bytes[4..8].try_into().unwrap()),
@@ -17644,7 +17746,7 @@ impl ExecNtHandler {
         };
         let sd = {
             let memory = ExecClientMemory { handler: &*self };
-            nt_security::capture_security_descriptor(&memory, args[0])
+            nt_security::capture_security_descriptor(&memory, security_descriptor)
         };
         let sd = match sd {
             Ok(sd) => sd,
@@ -17653,25 +17755,64 @@ impl ExecNtHandler {
         if sd.owner.is_none() || sd.group.is_none() {
             return nt_security::STATUS_INVALID_SECURITY_DESCR;
         }
+        let principal_self = if by_type && principal_self != 0 {
+            let memory = ExecClientMemory { handler: &*self };
+            match nt_security::capture_sid(&memory, principal_self) {
+                Ok(sid) => Some(sid),
+                Err(status) => return status,
+            }
+        } else {
+            None
+        };
 
         let mode = if ctx.previous_mode == nt_syscall::ProcessorMode::KernelMode {
             nt_security::ProcessorMode::KernelMode
         } else {
             nt_security::ProcessorMode::UserMode
         };
-        let result = nt_security::access_check(&sd, token, desired_access, &mapping, mode);
+        let results = if by_type {
+            match nt_security::access_check_by_type(
+                &sd,
+                token,
+                principal_self.as_ref(),
+                desired_access,
+                &object_types,
+                &mapping,
+                mode,
+                use_result_list,
+            ) {
+                Ok(results) => results,
+                Err(status) => return status,
+            }
+        } else {
+            let mut results = alloc::vec::Vec::with_capacity(1);
+            results.push(nt_security::access_check(
+                &sd,
+                token,
+                desired_access,
+                &mapping,
+                mode,
+            ));
+            results
+        };
+        let Some(first_result) = results.first() else {
+            return STATUS_INVALID_PARAMETER;
+        };
         if let Err(status) = self.write_access_check_privilege_set(
-            args[4],
-            args[5],
+            privilege_set,
+            privilege_set_length,
             captured_privilege_set_length,
-            &result.privileges_used,
+            &first_result.privileges_used,
         ) {
             return status;
         }
-        if !self.xas_write_u32(args[6], result.granted_access)
-            || !self.xas_write_u32(args[7], result.status)
-        {
-            return STATUS_ACCESS_VIOLATION;
+        for (index, result) in results.iter().enumerate() {
+            let offset = (index * 4) as u64;
+            if !self.xas_write_u32(granted_access + offset, result.granted_access)
+                || !self.xas_write_u32(access_status + offset, result.status)
+            {
+                return STATUS_ACCESS_VIOLATION;
+            }
         }
         0
     }
@@ -30638,6 +30779,12 @@ impl ExecNtHandler {
             // NtCreateToken — 13 args (4 register + 9 stack). See `nt_create_token`.
             NativeService::NtCreateToken => unsafe { self.nt_create_token(args) },
             NativeService::NtAccessCheck => unsafe { self.nt_access_check(ctx, args) },
+            NativeService::NtAccessCheckByType => unsafe {
+                self.nt_access_check_by_type(ctx, args, false)
+            },
+            NativeService::NtAccessCheckByTypeResultList => unsafe {
+                self.nt_access_check_by_type(ctx, args, true)
+            },
             NativeService::NtPrivilegeCheck => unsafe { self.nt_privilege_check(ctx, args) },
             NativeService::NtImpersonateAnonymousToken => unsafe {
                 self.nt_impersonate_anonymous_token(args[0])
