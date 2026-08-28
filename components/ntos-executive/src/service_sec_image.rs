@@ -8773,7 +8773,8 @@ pub(crate) unsafe fn service_sec_image(
             if m0 == SSN_NT_REPLY_WAIT_RECEIVE_PORT
                 && pi == csrss_pi
                 && csr_api_port_handle != 0
-                && get_recv_mr(9) == csr_api_port_handle
+                && (get_recv_mr(9) == csr_api_port_handle
+                    || csr_dynamic_worker_registered(badge))
             {
                 nt_handler.pi = pi;
                 nt_handler.current_badge = badge;
@@ -21722,6 +21723,30 @@ unsafe fn csr_dynamic_worker_available() -> bool {
     table.iter().copied().any(CsrDynamicApiWorker::is_parked)
 }
 
+unsafe fn csr_dynamic_worker_registered(badge: u64) -> bool {
+    let table = &*core::ptr::addr_of!(CSR_DYNAMIC_API_WORKERS);
+    table.iter().any(|worker| worker.badge == badge)
+}
+
+unsafe fn csr_dynamic_worker_accepts_client(
+    worker: CsrDynamicApiWorker,
+    client_port: u64,
+) -> bool {
+    let Some(lpc) = lpc_client() else {
+        return false;
+    };
+    let (Ok(client), Ok(server)) = (
+        lpc.query_handle(client_port),
+        lpc.query_handle(worker.port),
+    ) else {
+        return false;
+    };
+    client.endpoint == nt_lpc_abi::handle_endpoint::CLIENT_COMM_PORT
+        && (server.endpoint == nt_lpc_abi::handle_endpoint::LISTEN_PORT
+            || (server.endpoint == nt_lpc_abi::handle_endpoint::SERVER_COMM_PORT
+                && server.connection_id == client.connection_id))
+}
+
 pub(crate) fn csr_dynamic_client_pi_for_worker_badge(worker_badge: u64) -> Option<usize> {
     let table = unsafe { &*core::ptr::addr_of!(CSR_DYNAMIC_API_WORKERS) };
     table
@@ -21827,7 +21852,10 @@ unsafe fn csr_dynamic_deliver_request(
     client_reply: nt_syscall_abi::ParkedSyscallReply,
 ) -> CsrDynamicRoute {
     let table = csr_dynamic_workers_mut();
-    let Some(index) = (0..TP_WORKER_SLOT_COUNT).find(|&index| table[index].is_parked()) else {
+    let Some(index) = (0..TP_WORKER_SLOT_COUNT).find(|&index| {
+        table[index].is_parked()
+            && csr_dynamic_worker_accepts_client(table[index], client_port)
+    }) else {
         return CsrDynamicRoute::NotRouted;
     };
     let worker = table[index];
@@ -21919,6 +21947,7 @@ unsafe fn csr_dynamic_deliver_request(
 unsafe fn csr_dynamic_finish_request_reply(
     nt_handler: &mut ExecNtHandler,
     worker: CsrDynamicApiWorker,
+    reply_port: u64,
     replymsg: u64,
 ) -> bool {
     if worker.in_flight_kind != CSR_DYNAMIC_KIND_REQUEST || worker.client_cap == 0 {
@@ -21945,7 +21974,7 @@ unsafe fn csr_dynamic_finish_request_reply(
         status = 0xC000_0001;
     } else {
         let sent = lpc_client()
-            .map(|lpc| lpc.reply_port(worker.port, &reply[..reply_len]))
+            .map(|lpc| lpc.reply_port(reply_port, &reply[..reply_len]))
             .is_some_and(|result| result.is_ok());
         let received = sent
             .then(|| lpc_client().map(|lpc| lpc.reply_wait_receive(worker.client_port)))
@@ -22020,7 +22049,7 @@ unsafe fn csr_dynamic_reply_wait_receive(
     if let Some(index) = existing {
         let worker = table[index];
         if worker.in_flight_kind == CSR_DYNAMIC_KIND_REQUEST {
-            csr_dynamic_finish_request_reply(nt_handler, worker, replymsg);
+            csr_dynamic_finish_request_reply(nt_handler, worker, port, replymsg);
             table[index].clear_client();
         }
     }
