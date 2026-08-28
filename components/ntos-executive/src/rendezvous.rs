@@ -1796,6 +1796,36 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                 let rdx = m3;
                 let mut result = 0u64;
                 match ssn {
+                    ssn if ssn >= win32k_subsystem::WIN32K_SERVICE_BASE => {
+                        let Some(csrss_pi) = live_hosted_pi_for_role(
+                            nt_handler,
+                            nt_exe_image::HostedProcessRole::Win32Subsystem,
+                        ) else {
+                            print_str(b"[csr-api] missing live CSRSS identity for nested win32k syscall\n");
+                            return false;
+                        };
+                        let Some(status) = crate::service_sec_image::dispatch_csr_api_worker_win32k(
+                            nt_handler,
+                            csrss_pi,
+                            ssn,
+                            get_recv_mr(9),
+                            rdx,
+                            get_recv_mr(7),
+                            get_recv_mr(8),
+                            sp,
+                        ) else {
+                            print_str(b"[csr-api] nested win32k syscall did not complete ssn=0x");
+                            print_hex(ssn as u32);
+                            print_str(b"\n");
+                            return false;
+                        };
+                        result = status;
+                        print_str(b"[csr-api] serviced nested win32k syscall ssn=0x");
+                        print_hex(ssn as u32);
+                        print_str(b" status=0x");
+                        print_hex(status as u32);
+                        print_str(b"\n");
+                    }
                     SSN_NT_ALLOCATE_VM => {
                         let stack_arg4 = sp
                             .checked_add(0x28)

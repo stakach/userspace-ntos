@@ -2231,6 +2231,50 @@ unsafe fn dispatch_win32k_for_client(
     result
 }
 
+/// Dispatch a win32k syscall made by the private, real `CsrApiRequestThread` while an outer client
+/// is synchronously driving that worker through its dedicated rendezvous endpoint. The ordinary
+/// service loop cannot receive this call until the rendezvous returns, so the rendezvous uses this
+/// entry point to apply the same process/thread identity and win32k context synchronization as a
+/// top-level hosted syscall.
+pub(crate) unsafe fn dispatch_csr_api_worker_win32k(
+    nt_handler: &mut ExecNtHandler,
+    csrss_pi: usize,
+    ssn: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    caller_sp: u64,
+) -> Option<u64> {
+    let role = HostedThreadRole::CsrApi;
+    let (tid, tcb, badge) = nt_handler.hosted_thread_identity_for_role(csrss_pi, role)?;
+    let teb = nt_handler
+        .pm
+        .thread_teb(tid as nt_process::ThreadId)
+        .filter(|teb| *teb != 0)
+        .unwrap_or(CSR_TEB_VA);
+    let client = win32k_client_context_for_thread(
+        nt_handler,
+        csrss_pi,
+        badge,
+        tid,
+        tcb,
+        Some(role),
+        teb,
+        hosted_peb_mirror_for_pi(csrss_pi),
+        CSR_ENV_SCRATCH_VA,
+    );
+
+    W32_CLIENT_PI.store(csrss_pi as u64, Ordering::Relaxed);
+    bump_w32_total_dispatch(csrss_pi);
+    CSRSS_SSN_HIST[ssn_bucket(ssn)].fetch_add(1, Ordering::Relaxed);
+    w32_census_enter(ssn);
+    crate::ke_gdi_flush_user_batch(client, teb);
+    let (status, completed) =
+        dispatch_win32k_for_client(nt_handler, ssn, a0, a1, a2, a3, caller_sp, &[], client);
+    completed.then_some(status)
+}
+
 unsafe fn dispatch_win32k_for_client_with_completion_args(
     nt_handler: &mut ExecNtHandler,
     ssn: u64,
