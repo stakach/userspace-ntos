@@ -15402,3 +15402,44 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `NtAccessCheckByTypeResultList` (SSN 5). Reuse the existing security-descriptor and token access
     evaluator, add bounded native `OBJECT_TYPE_LIST` capture and hierarchy semantics in
     `nt-security`, and keep audit-alarm variants out until the kernel has a real audit event sink.
+
+    `NtAccessCheckByType` and `NtAccessCheckByTypeResultList` (2026-08-29, accepted): SSNs 3 and 5
+    are now typed registered eleven-argument services with no numeric branches or fallback results.
+    `nt-security` captures the native x64 `OBJECT_TYPE_LIST` and every pointed-to GUID into bounded
+    owned state, rejects malformed roots, duplicate roots, skipped hierarchy levels, excessive
+    depth, misalignment, and lists above 256 entries, and preserves object GUIDs from native object
+    allow/deny ACEs. Principal Self is substituted from the caller's captured SID rather than
+    treated as a token identity.
+
+    The reusable evaluator applies generic mappings to ACE masks, propagates object ACEs through
+    their hierarchy branches, preserves ordered deny behavior and legitimate partial grants for the
+    result-list API, performs both DACL passes for restricted tokens, and grants owner
+    `READ_CONTROL`/`WRITE_DAC` only when those rights were requested. The aggregate API returns the
+    union result through one output pair; the result-list API writes one checked granted-access and
+    status pair per captured object. The executive requires an identification-or-higher
+    impersonation token with `TOKEN_QUERY`, captures the descriptor, optional Principal Self SID,
+    mapping, privilege buffer, and result arrays before evaluation, and returns native alignment,
+    buffer, token-type, impersonation-level, and generic-mask failures rather than accepting
+    malformed input.
+
+    Focused validation passes `nt-security` `82/82`, `nt-syscall` `65/65`, `git diff --check`, the
+    freestanding executive at the established 212-warning baseline, and the release build/staging
+    path. Code checkpoint `f62e4ab7` is pushed. Serialized acceptance
+    `.tmp/run-headless-access-check-by-type-20260829.log` reached the final gate at 112,711 ms,
+    launched genuine userinit and Explorer, completed 668 Explorer api0 redirects with zero
+    callback or dead-callback failures, recorded paint begin/end `5/20`, 187 direct GDI returns,
+    and 135 batch flushes covering 184 records, and painted `480000/480000` framebuffer pixels with
+    at least 32 colours. All `295/295` gates passed and the sentinel matched. Startup did not issue
+    SSN 3 or 5, so the boot is a full non-regression gate while the native capture and hierarchy
+    semantics are covered by focused tests. Snapshot generation 5 committed 1,755,666 bytes,
+    scratch returned to zero, and the census reported no page-table, frame, mapping, alias,
+    registry, untyped-allocation, frame-registration, image-bank, or allocator failure.
+
+    Review adjustment: the typed surface now contains 175 services, the hosted table registers 174
+    numbered variants, and 48 canonical ABI exports remain absent. Keep the audit-alarm services
+    deferred until the kernel owns a real audit event sink. Complete the existing object-lifetime
+    boundary next with `NtMakePermanentObject` (SSN 109): reference the exact handle-owned namespace
+    body, reject unnamed or already-deleted objects, add the permanent namespace reference exactly
+    once, and share the same object-manager invariant used by `OBJ_PERMANENT` creation and
+    `NtMakeTemporaryObject`. Do not manufacture a name, restore an unlinked object, or turn repeated
+    calls into extra references.
