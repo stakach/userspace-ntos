@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-08-27
+Last updated: 2026-08-29
 
 ## Objective
 
@@ -15365,3 +15365,40 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `THREAD_IMPERSONATE` on the target thread, reject a restricted caller primary token, and install
     the impersonation context through the existing reference-owning ETHREAD replacement path at
     `SecurityImpersonation`. Do not synthesize a per-call token or bypass token/thread handle policy.
+
+    `NtImpersonateAnonymousToken` (2026-08-29, accepted): SSN 93 is now a typed registered
+    one-argument service with no numeric branch or fallback. The security subsystem creates the two
+    long-lived Anonymous Logon primary-token objects once, including their exact S-1-5-7 identity,
+    anonymous authentication ID, optional mandatory/default-enabled/enabled Everyone group, empty
+    privilege set, and shared Everyone/Anonymous `GENERIC_ALL` default ACL. An ETHREAD receives a
+    separately retained reference to one of those stable identities rather than a per-call clone.
+
+    The executive first resolves the caller's target handle with `THREAD_IMPERSONATE`, then reads
+    `EveryoneIncludesAnonymous` as an exact `REG_DWORD` from the mounted SYSTEM hive's
+    `CurrentControlSet\\Control\\Lsa` path. A missing or malformed policy value fails visibly. The
+    caller's current process primary token must exist and must not be restricted. Successful calls
+    install the selected object through the common reference-owning ETHREAD replacement path with
+    copy-on-open, a non-effective-only context, and `SecurityImpersonation`; replacement releases the
+    displaced token exactly once and retains the best-effort TEB mirror behavior shared with the
+    other impersonation services.
+
+    Focused validation passes `nt-security` `77/77`, `nt-syscall` `64/64`, `git diff --check`, the
+    freestanding executive at the established 212-warning baseline, and the release build/staging
+    path. Code checkpoint `3b71a8ee` is pushed. Serialized acceptance
+    `.tmp/run-headless-impersonate-anonymous-20260829.log` reached the final gate at approximately
+    109,440 ms, launched genuine userinit and Explorer, completed 668 Explorer api0 redirects with
+    zero callback or dead-callback failures, recorded paint begin/end `5/20`, 187 direct GDI
+    returns, and 135 batch flushes covering 184 records, and painted `480000/480000` framebuffer
+    pixels with at least 32 colours. All `295/295` gates passed and the sentinel matched. No SSN 93
+    call was observed during startup, so this is explicitly a full non-regression gate while the
+    direct identity, reference, policy-selection, and restricted-caller semantics are covered by
+    focused security tests. Snapshot generation 5 committed 1,755,492 bytes, scratch returned to
+    zero, and the census reported no page-table, frame, mapping, alias, registry,
+    untyped-allocation, frame-registration, image-bank, or allocator failure.
+
+    Review adjustment: the typed surface now contains 173 services, the hosted table registers 172
+    numbered variants, and 50 canonical ABI exports remain absent. Converge the non-auditing
+    access-check-by-type pair next, beginning with `NtAccessCheckByType` (SSN 3) and then
+    `NtAccessCheckByTypeResultList` (SSN 5). Reuse the existing security-descriptor and token access
+    evaluator, add bounded native `OBJECT_TYPE_LIST` capture and hierarchy semantics in
+    `nt-security`, and keep audit-alarm variants out until the kernel has a real audit event sink.
