@@ -18473,6 +18473,234 @@ impl ExecNtHandler {
         self.insert_owned_token_handle(caller_pid, owned, nt_ulong_arg(args[1]), out)
     }
 
+    /// Mirror authoritative ETHREAD impersonation state into the target thread's TEB. Like
+    /// `PspWriteTebImpersonationInfo`, this is best-effort bookkeeping and never owns the state.
+    unsafe fn write_thread_teb_impersonation_state(
+        &self,
+        tid: nt_process::ThreadId,
+        active: bool,
+    ) -> bool {
+        let Some(thread) = self.pm.thread(tid) else {
+            return false;
+        };
+        let pid = thread.process_id;
+        let teb = if thread.teb_base != 0 {
+            thread.teb_base
+        } else if tid == self.current_tid as nt_process::ThreadId {
+            if self.current_process_is_smss() {
+                SMSS_TEB_VA
+            } else {
+                TEB_VA
+            }
+        } else {
+            return true;
+        };
+        let Some(target_pi) = self.pi_for_pid(pid) else {
+            return false;
+        };
+        let mut state = [0u8; 8];
+        state[..4].copy_from_slice(&(if active { u32::MAX } else { 0 }).to_le_bytes());
+        state[4] = u8::from(active);
+        let address = teb + nt_ntdll_layout::TEB_IMPERSONATION_LOCALE_OFFSET;
+        if target_pi == self.pi {
+            return self.xas_try_write_buf(address, &state);
+        }
+        let (filled, faults, scratch_base) = match self.loop_ctx {
+            Some(ctx) => {
+                let procs = &*ctx.procs;
+                let per_process = &*ctx.pfilled;
+                (
+                    &per_process[target_pi][..],
+                    procs[target_pi].faults as usize,
+                    procs[target_pi].scratch_base,
+                )
+            }
+            None => (&[][..], 0, 0),
+        };
+        client_copyout_mapped(
+            target_pi as u64,
+            address,
+            &state,
+            filled,
+            faults,
+            scratch_base,
+        )
+    }
+
+    /// Install a retained/owned impersonation context and release the replaced token reference.
+    /// The ETHREAD context is authoritative; TEB fields are a best-effort user-mode mirror.
+    unsafe fn install_thread_impersonation_context(
+        &mut self,
+        tid: nt_process::ThreadId,
+        replacement: Option<nt_process::ImpersonationContext>,
+    ) -> u32 {
+        let old = match self.pm.replace_thread_impersonation(tid, replacement) {
+            Ok(old) => old,
+            Err(status) => {
+                if let Some(context) = replacement {
+                    let _ = self.token_store.release(context.token);
+                }
+                return status;
+            }
+        };
+        let _ = self.write_thread_teb_impersonation_state(tid, replacement.is_some());
+        if let Some(context) = old {
+            let _ = self.token_store.release(context.token);
+        }
+        0
+    }
+
+    unsafe fn nt_impersonate_thread(&mut self, args: &[u64]) -> u32 {
+        const THREAD_IMPERSONATE: u32 = 0x0100;
+        const THREAD_DIRECT_IMPERSONATION: u32 = 0x0200;
+        const QOS_SIZE: usize = 12;
+
+        let qos_pointer = args[2];
+        if qos_pointer & 3 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        if qos_pointer == 0 || !self.probe_user_input(qos_pointer, QOS_SIZE) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let mut qos_bytes = [0u8; QOS_SIZE];
+        if !self.xas_read(qos_pointer, &mut qos_bytes) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let qos = match nt_security::SecurityQualityOfService::from_native_bytes(&qos_bytes) {
+            Ok(qos) => qos,
+            Err(status) => return status,
+        };
+
+        let caller_pid = match self.pm_pid_for_pi(self.pi) {
+            Some(pid) => pid,
+            None => return STATUS_INVALID_HANDLE,
+        };
+        let current_tid = self.current_tid as nt_process::ThreadId;
+        let target_tid = match self.pm.resolve_thread_handle(
+            caller_pid,
+            current_tid,
+            args[0],
+            THREAD_DIRECT_IMPERSONATION,
+        ) {
+            Ok(tid) => tid,
+            Err(status) => return status,
+        };
+        let source_tid = match self.pm.resolve_thread_handle(
+            caller_pid,
+            current_tid,
+            args[1],
+            THREAD_IMPERSONATE,
+        ) {
+            Ok(tid) => tid,
+            Err(status) => return status,
+        };
+        let (source_token, source_type, source_effective_only, source_level) =
+            if let Some(context) = self.pm.thread_impersonation(source_tid) {
+                (
+                    context.token,
+                    nt_security::TokenType::Impersonation,
+                    context.effective_only,
+                    context.level,
+                )
+            } else {
+                let source_pid = match self.pm.thread(source_tid) {
+                    Some(thread) => thread.process_id,
+                    None => return STATUS_INVALID_HANDLE,
+                };
+                let token = match self.pm.process_primary_token(source_pid) {
+                    Some(token) => token,
+                    None => return STATUS_INVALID_HANDLE,
+                };
+                (
+                    token,
+                    nt_security::TokenType::Primary,
+                    false,
+                    nt_security::SecurityImpersonationLevel::Anonymous,
+                )
+            };
+        let plan = match nt_security::plan_client_impersonation(
+            source_type,
+            source_level,
+            source_effective_only,
+            qos,
+        ) {
+            Ok(plan) => plan,
+            Err(status) => return status,
+        };
+
+        let mut owned_token = if plan.static_tracking {
+            match self.token_store.duplicate(
+                source_token,
+                nt_security::TokenType::Impersonation,
+                plan.level,
+                false,
+            ) {
+                Ok(token) => token,
+                Err(status) => return status,
+            }
+        } else {
+            if let Err(status) = self.token_store.retain(source_token) {
+                return status;
+            }
+            source_token
+        };
+
+        let target_pid = match self.pm.thread(target_tid) {
+            Some(thread) => thread.process_id,
+            None => {
+                let _ = self.token_store.release(owned_token);
+                return STATUS_INVALID_HANDLE;
+            }
+        };
+        let target_primary = match self.pm.process_primary_token(target_pid) {
+            Some(token) => token,
+            None => {
+                let _ = self.token_store.release(owned_token);
+                return STATUS_INVALID_HANDLE;
+            }
+        };
+        let can_impersonate = match (
+            self.token_store.get(target_primary),
+            self.token_store.get(owned_token),
+        ) {
+            (Some(server), Some(client)) => {
+                nt_security::token_can_impersonate(server, client, plan.level)
+            }
+            _ => {
+                let _ = self.token_store.release(owned_token);
+                return STATUS_INVALID_HANDLE;
+            }
+        };
+        let mut level = plan.level;
+        if !can_impersonate {
+            let identified = match self.token_store.duplicate(
+                owned_token,
+                nt_security::TokenType::Impersonation,
+                nt_security::SecurityImpersonationLevel::Identification,
+                false,
+            ) {
+                Ok(token) => token,
+                Err(status) => {
+                    let _ = self.token_store.release(owned_token);
+                    return status;
+                }
+            };
+            let _ = self.token_store.release(owned_token);
+            owned_token = identified;
+            level = nt_security::SecurityImpersonationLevel::Identification;
+        }
+
+        self.install_thread_impersonation_context(
+            target_tid,
+            Some(nt_process::ImpersonationContext {
+                token: owned_token,
+                copy_on_open: true,
+                effective_only: plan.effective_only,
+                level,
+            }),
+        )
+    }
+
     unsafe fn nt_set_thread_impersonation_token(&mut self, args: &[u64]) -> u32 {
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
         const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
@@ -18527,52 +18755,7 @@ impl ExecNtHandler {
             })
         };
 
-        let old = match self.pm.replace_thread_impersonation(tid, replacement) {
-            Ok(old) => old,
-            Err(status) => {
-                if let Some(context) = replacement {
-                    let _ = self.token_store.release(context.token);
-                }
-                return status;
-            }
-        };
-
-        let teb = self
-            .pm
-            .thread(tid)
-            .map(|thread| thread.teb_base)
-            .unwrap_or(0);
-        let teb = if teb != 0 {
-            teb
-        } else if tid == self.current_tid as nt_process::ThreadId {
-            if self.current_process_is_smss() {
-                SMSS_TEB_VA
-            } else {
-                TEB_VA
-            }
-        } else {
-            0
-        };
-        if teb != 0 {
-            let mut state = [0u8; 8];
-            state[..4]
-                .copy_from_slice(&(if replacement.is_some() { u32::MAX } else { 0 }).to_le_bytes());
-            state[4] = u8::from(replacement.is_some());
-            if !self.xas_try_write_buf(
-                teb + nt_ntdll_layout::TEB_IMPERSONATION_LOCALE_OFFSET,
-                &state,
-            ) {
-                let _ = self.pm.replace_thread_impersonation(tid, old);
-                if let Some(context) = replacement {
-                    let _ = self.token_store.release(context.token);
-                }
-                return STATUS_ACCESS_VIOLATION;
-            }
-        }
-        if let Some(context) = old {
-            let _ = self.token_store.release(context.token);
-        }
-        0
+        self.install_thread_impersonation_context(tid, replacement)
     }
 
     unsafe fn nt_adjust_privileges_token(&mut self, args: &[u64]) -> u32 {
@@ -30006,6 +30189,7 @@ impl ExecNtHandler {
             NativeService::NtCreateToken => unsafe { self.nt_create_token(args) },
             NativeService::NtAccessCheck => unsafe { self.nt_access_check(ctx, args) },
             NativeService::NtPrivilegeCheck => unsafe { self.nt_privilege_check(ctx, args) },
+            NativeService::NtImpersonateThread => unsafe { self.nt_impersonate_thread(args) },
             NativeService::NtResumeThread => unsafe {
                 self.nt_resume_thread_with_user_memory(args, SyscallUserMemory::CurrentProcess)
             },

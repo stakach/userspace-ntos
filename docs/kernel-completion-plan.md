@@ -15172,3 +15172,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Ps/Se trait that builds on authoritative token/thread state; audit `NtImpersonateThread` next
     because both token objects and ETHREAD impersonation contexts already exist, while avoiding
     audit-only APIs until the kernel has a real audit event sink.
+
+    `NtImpersonateThread` (SSN 95, in progress): capture native QoS, require
+    `THREAD_DIRECT_IMPERSONATION` on the destination and `THREAD_IMPERSONATE` on the client thread,
+    implement static snapshot versus dynamic token tracking, inherit effective-only restrictions,
+    enforce the requested/source impersonation-level ceiling, and apply `SeTokenCanImpersonate`
+    authorization before installing an owned ETHREAD context. Share installation with
+    `ThreadImpersonationToken`; remove its caller-address-space TEB write and rollback behavior, and
+    mirror the advisory TEB fields through the target process mapping instead.

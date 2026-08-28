@@ -114,6 +114,141 @@ fn native_privilege_set_any_and_kernel_mode_follow_nt_semantics() {
 }
 
 #[test]
+fn client_impersonation_qos_capture_and_policy_are_exact() {
+    let mut bytes = [0u8; 12];
+    bytes[..4].copy_from_slice(&12u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&(SecurityImpersonationLevel::Impersonation as u32).to_le_bytes());
+    bytes[8] = 0;
+    bytes[9] = 1;
+    let qos = SecurityQualityOfService::from_native_bytes(&bytes).unwrap();
+    assert_eq!(qos.tracking_mode, SecurityContextTrackingMode::Static);
+    assert!(qos.effective_only);
+    assert_eq!(
+        plan_client_impersonation(
+            TokenType::Primary,
+            SecurityImpersonationLevel::Anonymous,
+            false,
+            qos,
+        ),
+        Ok(ClientImpersonationPlan {
+            level: SecurityImpersonationLevel::Impersonation,
+            effective_only: true,
+            static_tracking: true,
+        })
+    );
+
+    bytes[8] = 1;
+    bytes[9] = 0;
+    bytes[4..8].copy_from_slice(&(SecurityImpersonationLevel::Delegation as u32).to_le_bytes());
+    let qos = SecurityQualityOfService::from_native_bytes(&bytes).unwrap();
+    assert_eq!(qos.tracking_mode, SecurityContextTrackingMode::Dynamic);
+    assert_eq!(
+        plan_client_impersonation(
+            TokenType::Impersonation,
+            SecurityImpersonationLevel::Impersonation,
+            true,
+            qos,
+        ),
+        Err(STATUS_BAD_IMPERSONATION_LEVEL)
+    );
+
+    bytes[4..8].copy_from_slice(&(SecurityImpersonationLevel::Identification as u32).to_le_bytes());
+    let qos = SecurityQualityOfService::from_native_bytes(&bytes).unwrap();
+    assert_eq!(
+        plan_client_impersonation(
+            TokenType::Impersonation,
+            SecurityImpersonationLevel::Identification,
+            true,
+            qos,
+        ),
+        Err(STATUS_BAD_IMPERSONATION_LEVEL)
+    );
+    assert_eq!(
+        plan_client_impersonation(
+            TokenType::Impersonation,
+            SecurityImpersonationLevel::Impersonation,
+            true,
+            qos,
+        ),
+        Ok(ClientImpersonationPlan {
+            level: SecurityImpersonationLevel::Identification,
+            effective_only: true,
+            static_tracking: false,
+        })
+    );
+
+    bytes[4..8].copy_from_slice(&4u32.to_le_bytes());
+    assert_eq!(
+        SecurityQualityOfService::from_native_bytes(&bytes),
+        Err(0xC000_000D)
+    );
+    assert_eq!(
+        SecurityQualityOfService::from_native_bytes(&bytes[..11]),
+        Err(0xC000_000D)
+    );
+}
+
+#[test]
+fn token_impersonation_authorization_uses_privilege_session_or_user() {
+    let system = AccessToken::system();
+    let mut client = AccessToken::user(MACHINE);
+    client.authentication_id = Luid::new(0x2222);
+    assert!(token_can_impersonate(
+        &system,
+        &client,
+        SecurityImpersonationLevel::Impersonation,
+    ));
+
+    let mut server = AccessToken::user(MACHINE + 1);
+    server.authentication_id = Luid::new(0x1111);
+    assert!(!token_can_impersonate(
+        &server,
+        &client,
+        SecurityImpersonationLevel::Impersonation,
+    ));
+    server.authentication_id = client.authentication_id;
+    assert!(token_can_impersonate(
+        &server,
+        &client,
+        SecurityImpersonationLevel::Impersonation,
+    ));
+    server.authentication_id = Luid::new(0x1111);
+    server.user = client.user.clone();
+    assert!(token_can_impersonate(
+        &server,
+        &client,
+        SecurityImpersonationLevel::Impersonation,
+    ));
+
+    let mut anonymous = client.clone();
+    anonymous.authentication_id = Luid::new(0x3e6);
+    server.user = AccessToken::user(MACHINE + 2).user;
+    assert!(token_can_impersonate(
+        &server,
+        &anonymous,
+        SecurityImpersonationLevel::Impersonation,
+    ));
+    assert!(token_can_impersonate(
+        &server,
+        &client,
+        SecurityImpersonationLevel::Anonymous,
+    ));
+
+    let identified = client
+        .duplicate(
+            TokenType::Impersonation,
+            SecurityImpersonationLevel::Identification,
+            false,
+        )
+        .unwrap();
+    assert!(!token_can_impersonate(
+        &AccessToken::user(MACHINE + 3),
+        &identified,
+        SecurityImpersonationLevel::Impersonation,
+    ));
+}
+
+#[test]
 fn sid_wellknown_and_sddl() {
     assert_eq!(Sid::administrators().to_sddl(), "S-1-5-32-544");
     assert_eq!(Sid::local_system().to_sddl(), "S-1-5-18");

@@ -1166,6 +1166,8 @@ pub const SSN_NT_QUERY_INFO_TOKEN: u64 = 163;
 pub const SSN_NT_ADJUST_PRIV_TOKEN: u64 = 12;
 /// NtPrivilegeCheck — evaluates an in/out PRIVILEGE_SET against a queryable token handle.
 pub const SSN_NT_PRIVILEGE_CHECK: u64 = 140;
+/// NtImpersonateThread — installs one thread's effective client context on another ETHREAD.
+pub const SSN_NT_IMPERSONATE_THREAD: u64 = 95;
 /// Process/thread lifecycle SSNs (ReactOS numbering = sysfuncs.lst line − 1, cross-checked against
 /// NtClose=27/NtCreateProcess=49/NtCreateThread=55). ReactOS uses NtTerminateProcess in two shutdown
 /// phases, so the NULL-handle and handle-form semantics are both live behavior.
@@ -23605,6 +23607,10 @@ fn build_nt_table() -> NativeServiceTable {
             (
                 NativeService::NtPrivilegeCheck,
                 SSN_NT_PRIVILEGE_CHECK as u32,
+            ),
+            (
+                NativeService::NtImpersonateThread,
+                SSN_NT_IMPERSONATE_THREAD as u32,
             ),
             (NativeService::NtDeleteKey, SSN_NT_DELETE_KEY as u32),
             (

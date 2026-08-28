@@ -38,6 +38,96 @@ impl TryFrom<u32> for SecurityImpersonationLevel {
     }
 }
 
+/// Native `SECURITY_CONTEXT_TRACKING_MODE` from `SECURITY_QUALITY_OF_SERVICE`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SecurityContextTrackingMode {
+    Static,
+    Dynamic,
+}
+
+/// Captured native client-security quality of service.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SecurityQualityOfService {
+    pub impersonation_level: SecurityImpersonationLevel,
+    pub tracking_mode: SecurityContextTrackingMode,
+    pub effective_only: bool,
+}
+
+impl SecurityQualityOfService {
+    /// Decode the 12-byte native structure. NT captures but does not interpret the `Length` field;
+    /// a zero tracking byte is static and every nonzero value is dynamic.
+    pub fn from_native_bytes(bytes: &[u8]) -> Result<Self, u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        if bytes.len() != 12 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let level = SecurityImpersonationLevel::try_from(u32::from_le_bytes(
+            bytes[4..8].try_into().unwrap(),
+        ))
+        .map_err(|_| STATUS_INVALID_PARAMETER)?;
+        Ok(Self {
+            impersonation_level: level,
+            tracking_mode: if bytes[8] == 0 {
+                SecurityContextTrackingMode::Static
+            } else {
+                SecurityContextTrackingMode::Dynamic
+            },
+            effective_only: bytes[9] != 0,
+        })
+    }
+}
+
+/// Token ownership and context fields selected by `SeCreateClientSecurity`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ClientImpersonationPlan {
+    pub level: SecurityImpersonationLevel,
+    pub effective_only: bool,
+    pub static_tracking: bool,
+}
+
+/// Validate a source thread's effective-token context against the requested QoS.
+pub fn plan_client_impersonation(
+    source_type: TokenType,
+    source_level: SecurityImpersonationLevel,
+    source_effective_only: bool,
+    qos: SecurityQualityOfService,
+) -> Result<ClientImpersonationPlan, u32> {
+    if source_type == TokenType::Impersonation
+        && (qos.impersonation_level > source_level
+            || source_level < SecurityImpersonationLevel::Impersonation)
+    {
+        return Err(STATUS_BAD_IMPERSONATION_LEVEL);
+    }
+    Ok(ClientImpersonationPlan {
+        level: qos.impersonation_level,
+        effective_only: qos.effective_only
+            || (source_type == TokenType::Impersonation && source_effective_only),
+        static_tracking: qos.tracking_mode == SecurityContextTrackingMode::Static,
+    })
+}
+
+/// `SeTokenCanImpersonate` policy for the token properties modelled by this kernel. Restricted-token
+/// comparison is intentionally absent until tokens carry restricted SIDs; privilege, anonymous
+/// logon, authentication-session, and same-user authorization are all enforced.
+pub fn token_can_impersonate(
+    server: &AccessToken,
+    client: &AccessToken,
+    level: SecurityImpersonationLevel,
+) -> bool {
+    const ANONYMOUS_LOGON_LUID: Luid = Luid {
+        low: 0x3e6,
+        high: 0,
+    };
+    if client.token_type == TokenType::Impersonation && level > client.impersonation_level {
+        return false;
+    }
+    level < SecurityImpersonationLevel::Identification
+        || client.authentication_id == ANONYMOUS_LOGON_LUID
+        || server.has_privilege(SE_IMPERSONATE)
+        || server.authentication_id == client.authentication_id
+        || server.user == client.user
+}
+
 pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 pub const STATUS_INVALID_OWNER: u32 = 0xC000_005A;
 pub const STATUS_BAD_IMPERSONATION_LEVEL: u32 = 0xC000_00A5;
