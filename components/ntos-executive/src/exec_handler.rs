@@ -21303,6 +21303,35 @@ impl ExecNtHandler {
         // reference. The existing handle still owns the body; normal last-handle close deletes it.
         0
     }
+
+    fn nt_make_permanent_object(&mut self, ctx: &NativeCallContext, handle: u64) -> u32 {
+        if ctx.previous_mode != nt_syscall::ProcessorMode::KernelMode
+            && !self.current_token_has_privilege(nt_security::SE_CREATE_PERMANENT)
+        {
+            return STATUS_PRIVILEGE_NOT_HELD;
+        }
+        let (object, _, direct_index) = match self.query_object_resolve(handle) {
+            Ok(resolved) => resolved,
+            Err(status) => return status,
+        };
+        let Some(index) = self.query_object_namespace_index(object, direct_index) else {
+            return STATUS_OBJECT_TYPE_MISMATCH;
+        };
+        let (was_permanent, kind, payload) = match self.obj_ns.get(index) {
+            Some(entry) if entry.is_live() => (entry.permanent, entry.kind, entry.payload),
+            _ => return STATUS_INVALID_HANDLE,
+        };
+        if was_permanent {
+            return 0;
+        }
+        if kind == OBJ_KIND_IO_COMPLETION {
+            if let Err(status) = self.io_completion_ports.retain(payload as u32) {
+                return status;
+            }
+        }
+        self.obj_ns[index].permanent = true;
+        0
+    }
     /// Normalize a caller's pipe path (`\Device\NamedPipe\ntsvcs`, `\??\pipe\ntsvcs`, `\??\PIPE\ntsvcs`,
     /// or a relative `ntsvcs`) to npfs's leaf form `\ntsvcs` (UTF-16, leading backslash). npfs's
     /// NpFsdCreate strips the device prefix; the leaf is what the VCB prefix tree keys on.
@@ -30799,6 +30828,9 @@ impl ExecNtHandler {
             // NtMakeTemporaryObject(ObjectHandle): reference the object with DELETE access, clear
             // OBJ_PERMANENT, and run the normal name-delete check.
             NativeService::NtMakeTemporaryObject => self.nt_make_temporary_object(args[0]),
+            NativeService::NtMakePermanentObject => {
+                self.nt_make_permanent_object(ctx, args[0])
+            },
             // NtCreateKeyedEvent(*OutHandle, AccessMask, ObjectAttributes, Flags). ReactOS'
             // RtlpInitializeKeyedEvent ignores the returned status and later asserts that its
             // process-global keyed-event handle is non-NULL, so success must publish a real handle.
@@ -34034,9 +34066,22 @@ impl ExecNtHandler {
                         Ok(id) => id,
                         Err(status) => return status,
                     };
+                    let Some(index) = ObjEntry::push_kind(
+                        &mut this.obj_ns,
+                        &[],
+                        OBJ_PARENT_ANONYMOUS,
+                        OBJ_KIND_IO_COMPLETION,
+                        &[],
+                        false,
+                    ) else {
+                        this.release_io_completion_reference(object_id);
+                        return nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
+                    };
+                    this.obj_ns[index].payload = object_id as u64;
                     let handle = match this.mint_io_completion_handle(object_id, desired_access) {
                         Some(handle) => handle,
                         None => {
+                            this.rollback_new_namespace_object(index);
                             this.release_io_completion_reference(object_id);
                             return nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
                         }

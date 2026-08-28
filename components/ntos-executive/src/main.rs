@@ -1204,6 +1204,8 @@ pub const SSN_NT_OPEN_EVENT: u64 = 120;
 pub const SSN_NT_CREATE_SYMBOLIC_LINK_OBJECT: u64 = 54;
 /// NtMakeTemporaryObject SSN (SmpInit clears OBJ_PERMANENT on a colliding link). sysfuncs 111 − 1.
 pub const SSN_NT_MAKE_TEMPORARY_OBJECT: u64 = 110;
+/// NtMakePermanentObject SSN. sysfuncs 110 - 1.
+pub const SSN_NT_MAKE_PERMANENT_OBJECT: u64 = 109;
 /// NtOpenSymbolicLinkObject SSN (SmpInit opens a link after DosDevices). sysfuncs 134 − 1.
 pub const SSN_NT_OPEN_SYMBOLIC_LINK_OBJECT: u64 = 133;
 /// NtQuerySymbolicLinkObject SSN. sysfuncs 179 - 1.
@@ -23596,6 +23598,10 @@ fn build_nt_table() -> NativeServiceTable {
             (
                 NativeService::NtMakeTemporaryObject,
                 SSN_NT_MAKE_TEMPORARY_OBJECT as u32,
+            ),
+            (
+                NativeService::NtMakePermanentObject,
+                SSN_NT_MAKE_PERMANENT_OBJECT as u32,
             ),
             (NativeService::NtFreeVirtualMemory, SSN_NT_FREE_VM as u32),
             (NativeService::NtReadVirtualMemory, SSN_NT_READ_VM as u32),

@@ -428,6 +428,16 @@ impl ObjectManager {
         Ok(())
     }
 
+    /// Mark an object permanent. The transition is idempotent; `true` means the caller must add
+    /// any backing-store reference that its object body needs to keep a published name alive.
+    pub fn make_permanent(&mut self, obj: &ObjectRef) -> Result<bool, NtStatus> {
+        if obj.is_permanent() {
+            return Ok(false);
+        }
+        obj.set_permanent(true);
+        Ok(true)
+    }
+
     /// Reap after a handle close: a temporary named object with no remaining
     /// handles loses its name and its directory reference (spec §8.6 / §14).
     pub(crate) fn on_handle_closed(&mut self, obj: &ObjectRef) {

@@ -15438,8 +15438,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Review adjustment: the typed surface now contains 175 services, the hosted table registers 174
     numbered variants, and 48 canonical ABI exports remain absent. Keep the audit-alarm services
     deferred until the kernel owns a real audit event sink. Complete the existing object-lifetime
-    boundary next with `NtMakePermanentObject` (SSN 109): reference the exact handle-owned namespace
-    body, reject unnamed or already-deleted objects, add the permanent namespace reference exactly
-    once, and share the same object-manager invariant used by `OBJ_PERMANENT` creation and
-    `NtMakeTemporaryObject`. Do not manufacture a name, restore an unlinked object, or turn repeated
-    calls into extra references.
+    boundary next with `NtMakePermanentObject` (SSN 109): require the caller's enabled
+    `SeCreatePermanentPrivilege` before handle resolution, reference the exact handle-owned object
+    body, set its object-header permanence state idempotently, and share the same object-manager
+    invariant used by `OBJ_PERMANENT` creation and `NtMakeTemporaryObject`. An unnamed object may
+    carry the flag even though it has no namespace entry to retain. A named I/O completion object
+    must add its backing namespace reference exactly once on the first transition. Do not
+    manufacture a name, restore an already-unlinked object, or turn repeated calls into extra
+    references.

@@ -768,6 +768,43 @@ mod tests {
     }
 
     #[test]
+    fn temporary_object_can_be_made_permanent_idempotently() {
+        let mut om = bootstrapped();
+        let device = om.lookup_path(&path("\\Device"), CI).unwrap();
+        let ev = om.register_type(named_type_def("Event", None)).unwrap();
+        let client = test_client(&mut om);
+        let obj = om
+            .create_object(ev, ObjectBody::Event(EventBody::default()))
+            .unwrap();
+        om.insert_named_object(&device, &uni("Perm1"), &obj, false)
+            .unwrap();
+        let h = om
+            .open_handle(client, &obj, AccessMask::GENERIC_ALL, ObjAttrFlags::empty())
+            .unwrap();
+
+        assert!(om.make_permanent(&obj).unwrap());
+        assert!(!om.make_permanent(&obj).unwrap());
+        assert!(obj.is_permanent());
+        drop(obj);
+        om.close_handle(client, h).unwrap();
+        assert!(om.lookup_path(&path("\\Device\\Perm1"), CI).is_ok());
+    }
+
+    #[test]
+    fn unnamed_object_permanence_does_not_manufacture_a_name() {
+        let mut om = bootstrapped();
+        let ev = om.register_type(named_type_def("Event", None)).unwrap();
+        let obj = om
+            .create_object(ev, ObjectBody::Event(EventBody::default()))
+            .unwrap();
+
+        assert!(om.make_permanent(&obj).unwrap());
+        assert!(obj.is_permanent());
+        assert_eq!(obj.name(), None);
+        assert_eq!(obj.parent(), None);
+    }
+
+    #[test]
     fn remove_named_object_unlinks() {
         let mut om = bootstrapped();
         let device = om.lookup_path(&path("\\Device"), CI).unwrap();

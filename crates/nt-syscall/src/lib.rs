@@ -210,6 +210,7 @@ pub enum NativeService {
     NtListenPort,
     NtReplyWaitReceivePort,
     NtMakeTemporaryObject,
+    NtMakePermanentObject,
     // No-op-success services (the executive doesn't model these yet: bump allocator never frees,
     // no per-thread/process attribute sets, no per-object security).
     NtSetInformationThread,
@@ -405,6 +406,7 @@ impl NativeService {
             NtListenPort => "NtListenPort",
             NtReplyWaitReceivePort => "NtReplyWaitReceivePort",
             NtMakeTemporaryObject => "NtMakeTemporaryObject",
+            NtMakePermanentObject => "NtMakePermanentObject",
             NtSetInformationThread => "NtSetInformationThread",
             NtSetInformationProcess => "NtSetInformationProcess",
             NtTestAlert => "NtTestAlert",
@@ -641,6 +643,7 @@ impl NativeService {
         NativeService::NtImpersonateAnonymousToken,
         NativeService::NtAccessCheckByType,
         NativeService::NtAccessCheckByTypeResultList,
+        NativeService::NtMakePermanentObject,
     ];
 }
 
