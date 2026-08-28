@@ -15136,3 +15136,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     next selection. Continue favoring small, composable Ob/Ps/Se/Mm traits with independently
     testable state over compatibility-only behavior; do not reinterpret instrumentation values as
     live syscall proof.
+
+    The next selected trait is `NtPrivilegeCheck` (SSN 140). Keep the policy in `nt-security`: match
+    enabled privileges by complete LUID, implement ALL/ANY control, preserve caller attributes while
+    marking `SE_PRIVILEGE_USED_FOR_ACCESS`, and retain the kernel-mode bypass. The executive syscall
+    must capture and probe the complete in/out `PRIVILEGE_SET`, require `TOKEN_QUERY`, reject an
+    anonymous-level impersonation token, and copy the updated entries and one-byte BOOLEAN result
+    back only through checked cross-address-space writes. Use the token subsystem's existing native
+    privilege-count bound so malformed input cannot cause unbounded allocation or probing.

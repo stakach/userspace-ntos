@@ -212,6 +212,7 @@ pub enum NativeService {
     NtReleaseKeyedEvent,
     NtWaitForKeyedEvent,
     NtAdjustPrivilegesToken,
+    NtPrivilegeCheck,
     NtDeleteKey,
     NtDeleteValueKey,
     NtInitializeRegistry,
@@ -395,6 +396,7 @@ impl NativeService {
             NtReleaseKeyedEvent => "NtReleaseKeyedEvent",
             NtWaitForKeyedEvent => "NtWaitForKeyedEvent",
             NtAdjustPrivilegesToken => "NtAdjustPrivilegesToken",
+            NtPrivilegeCheck => "NtPrivilegeCheck",
             NtDeleteKey => "NtDeleteKey",
             NtDeleteValueKey => "NtDeleteValueKey",
             NtInitializeRegistry => "NtInitializeRegistry",
@@ -609,6 +611,7 @@ impl NativeService {
         NativeService::NtWaitForMultipleObjects,
         NativeService::NtSuspendThread,
         NativeService::NtQuerySymbolicLinkObject,
+        NativeService::NtPrivilegeCheck,
     ];
 }
 

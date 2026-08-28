@@ -125,6 +125,7 @@ pub struct TokenPrivilege {
 pub const SE_PRIVILEGE_ENABLED_BY_DEFAULT: u32 = 0x0000_0001;
 pub const SE_PRIVILEGE_ENABLED: u32 = 0x0000_0002;
 pub const SE_PRIVILEGE_REMOVED: u32 = 0x0000_0004;
+pub const SE_PRIVILEGE_USED_FOR_ACCESS: u32 = 0x8000_0000;
 
 /// One `LUID_AND_ATTRIBUTES` entry used by the native token APIs.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]

@@ -32,6 +32,88 @@ fn token_generic_access_mapping_matches_nt_object_policy() {
 }
 
 #[test]
+fn native_privilege_set_check_marks_only_enabled_full_luid_matches() {
+    let token = AccessToken::system();
+    let original = 0x40;
+    let mut required = [
+        PrivilegeAdjustment {
+            luid: Luid::new(23),
+            attributes: original,
+        },
+        PrivilegeAdjustment {
+            luid: Luid::new(19),
+            attributes: original,
+        },
+    ];
+
+    assert!(!check_token_privileges(
+        &token,
+        &mut required,
+        true,
+        ProcessorMode::UserMode,
+    ));
+    assert_eq!(
+        required[0].attributes,
+        original | SE_PRIVILEGE_USED_FOR_ACCESS
+    );
+    assert_eq!(required[1].attributes, original);
+
+    required[0].luid.high = 1;
+    required[0].attributes = original;
+    assert!(!check_token_privileges(
+        &token,
+        &mut required[..1],
+        true,
+        ProcessorMode::UserMode,
+    ));
+    assert_eq!(required[0].attributes, original);
+}
+
+#[test]
+fn native_privilege_set_any_and_kernel_mode_follow_nt_semantics() {
+    let token = AccessToken::system();
+    let mut any = [
+        PrivilegeAdjustment {
+            luid: Luid::new(19),
+            attributes: 0,
+        },
+        PrivilegeAdjustment {
+            luid: Luid::new(23),
+            attributes: 0,
+        },
+    ];
+    assert!(check_token_privileges(
+        &token,
+        &mut any,
+        false,
+        ProcessorMode::UserMode,
+    ));
+    assert_eq!(any[0].attributes, 0);
+    assert_eq!(any[1].attributes, SE_PRIVILEGE_USED_FOR_ACCESS);
+
+    let mut kernel = [PrivilegeAdjustment {
+        luid: Luid {
+            low: u32::MAX,
+            high: i32::MAX,
+        },
+        attributes: 0x80,
+    }];
+    assert!(check_token_privileges(
+        &token,
+        &mut kernel,
+        true,
+        ProcessorMode::KernelMode,
+    ));
+    assert_eq!(kernel[0].attributes, 0x80);
+    assert!(check_token_privileges(
+        &token,
+        &mut [],
+        true,
+        ProcessorMode::UserMode,
+    ));
+}
+
+#[test]
 fn sid_wellknown_and_sddl() {
     assert_eq!(Sid::administrators().to_sddl(), "S-1-5-32-544");
     assert_eq!(Sid::local_system().to_sddl(), "S-1-5-18");

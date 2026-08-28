@@ -616,6 +616,7 @@ fn group_a_services_register_with_exact_bounds() {
         (NativeService::NtSuspendThread, 263),
         (NativeService::NtSetInformationObject, 236),
         (NativeService::NtSetSecurityObject, 246),
+        (NativeService::NtPrivilegeCheck, 140),
     ];
     let t = NativeServiceTable::from_numbers(UserlandAbiProfile::Windows7, &pairs);
     assert_eq!(t.len(), pairs.len());

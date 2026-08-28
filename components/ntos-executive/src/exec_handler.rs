@@ -16900,6 +16900,9 @@ impl ExecNtHandler {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
         const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
         const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+        if handle > u32::MAX as u64 {
+            return Err(STATUS_INVALID_HANDLE);
+        }
         let caller = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
         let object = self
             .pm
@@ -17664,6 +17667,108 @@ impl ExecNtHandler {
         }
         if !self.xas_write_u32(args[6], result.granted_access)
             || !self.xas_write_u32(args[7], result.status)
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        0
+    }
+
+    /// `NtPrivilegeCheck(ClientToken, RequiredPrivileges, Result)` — capture the complete in/out
+    /// privilege set, check enabled privileges on the referenced token, and return both the
+    /// `SE_PRIVILEGE_USED_FOR_ACCESS` marks and the BOOLEAN decision.
+    unsafe fn nt_privilege_check(&mut self, ctx: &NativeCallContext, args: &[u64]) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+        const TOKEN_QUERY: u32 = nt_security::TOKEN_QUERY;
+        const HEADER_SIZE: usize = 8;
+        const ENTRY_SIZE: usize = 12;
+        const MAX_PRIVILEGES: usize = nt_security::MAX_CAPTURED_PRIVILEGES as usize;
+
+        let required_set = args[1];
+        let result_out = args[2];
+        if required_set & 3 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        if required_set == 0
+            || result_out == 0
+            || !self.probe_user_output(required_set, HEADER_SIZE)
+            || !self.probe_user_output(result_out, 1)
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let mut header = [0u8; HEADER_SIZE];
+        if !self.xas_read(required_set, &mut header) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let count = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+        let control = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        if count > MAX_PRIVILEGES {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let entries_size = match count.checked_mul(ENTRY_SIZE) {
+            Some(size) => size,
+            None => return STATUS_INVALID_PARAMETER,
+        };
+        let total_size = match HEADER_SIZE.checked_add(entries_size) {
+            Some(size) => size,
+            None => return STATUS_INVALID_PARAMETER,
+        };
+        if !self.probe_user_output(required_set, total_size) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        let mut required = [nt_security::PrivilegeAdjustment::default(); MAX_PRIVILEGES];
+        for (index, entry) in required[..count].iter_mut().enumerate() {
+            let mut encoded = [0u8; ENTRY_SIZE];
+            if !self.xas_read(
+                required_set + HEADER_SIZE as u64 + index as u64 * ENTRY_SIZE as u64,
+                &mut encoded,
+            ) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            entry.luid.low = u32::from_le_bytes(encoded[0..4].try_into().unwrap());
+            entry.luid.high = i32::from_le_bytes(encoded[4..8].try_into().unwrap());
+            entry.attributes = u32::from_le_bytes(encoded[8..12].try_into().unwrap());
+        }
+
+        let token_id = match self.token_id_for_handle(args[0], TOKEN_QUERY) {
+            Ok(token) => token,
+            Err(status) => return status,
+        };
+        let token = match self.token_store.get(token_id) {
+            Some(token) => token,
+            None => return STATUS_INVALID_HANDLE,
+        };
+        if token.token_type == nt_security::TokenType::Impersonation
+            && token.impersonation_level < nt_security::SecurityImpersonationLevel::Identification
+        {
+            return nt_security::STATUS_BAD_IMPERSONATION_LEVEL;
+        }
+        let mode = if ctx.previous_mode == nt_syscall::ProcessorMode::KernelMode {
+            nt_security::ProcessorMode::KernelMode
+        } else {
+            nt_security::ProcessorMode::UserMode
+        };
+        let all_necessary = control & nt_security::se_exports::PRIVILEGE_SET_ALL_NECESSARY != 0;
+        let passed = nt_security::check_token_privileges(
+            token,
+            &mut required[..count],
+            all_necessary,
+            mode,
+        );
+
+        let mut output = [0u8; MAX_PRIVILEGES * ENTRY_SIZE];
+        for (index, entry) in required[..count].iter().enumerate() {
+            let offset = index * ENTRY_SIZE;
+            output[offset..offset + 4].copy_from_slice(&entry.luid.low.to_le_bytes());
+            output[offset + 4..offset + 8].copy_from_slice(&entry.luid.high.to_le_bytes());
+            output[offset + 8..offset + 12].copy_from_slice(&entry.attributes.to_le_bytes());
+        }
+        if (entries_size != 0
+            && !self.xas_try_write_buf(required_set + HEADER_SIZE as u64, &output[..entries_size]))
+            || !self.xas_try_write_buf(result_out, &[u8::from(passed)])
         {
             return STATUS_ACCESS_VIOLATION;
         }
@@ -29900,6 +30005,7 @@ impl ExecNtHandler {
             // NtCreateToken — 13 args (4 register + 9 stack). See `nt_create_token`.
             NativeService::NtCreateToken => unsafe { self.nt_create_token(args) },
             NativeService::NtAccessCheck => unsafe { self.nt_access_check(ctx, args) },
+            NativeService::NtPrivilegeCheck => unsafe { self.nt_privilege_check(ctx, args) },
             NativeService::NtResumeThread => unsafe {
                 self.nt_resume_thread_with_user_memory(args, SyscallUserMemory::CurrentProcess)
             },

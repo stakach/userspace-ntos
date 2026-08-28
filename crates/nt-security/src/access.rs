@@ -4,7 +4,9 @@
 use alloc::vec::Vec;
 
 use crate::sid::Sid;
-use crate::token::{AccessToken, SE_SECURITY, SE_TAKE_OWNERSHIP};
+use crate::token::{
+    AccessToken, PrivilegeAdjustment, SE_PRIVILEGE_USED_FOR_ACCESS, SE_SECURITY, SE_TAKE_OWNERSHIP,
+};
 
 pub type AccessMask = u32;
 
@@ -170,6 +172,36 @@ pub struct SecurityDescriptor {
 pub enum ProcessorMode {
     KernelMode,
     UserMode,
+}
+
+/// Check a native `PRIVILEGE_SET` capture against a token. Enabled privileges are matched by their
+/// complete LUID, and each match used to satisfy the request is marked for the caller's in/out
+/// array. Kernel-mode callers bypass the token check without modifying that array.
+pub fn check_token_privileges(
+    token: &AccessToken,
+    required: &mut [PrivilegeAdjustment],
+    all_necessary: bool,
+    mode: ProcessorMode,
+) -> bool {
+    if mode == ProcessorMode::KernelMode || required.is_empty() {
+        return true;
+    }
+
+    let mut remaining = if all_necessary { required.len() } else { 1 };
+    for entry in required {
+        let enabled = token
+            .privileges
+            .iter()
+            .any(|privilege| privilege.luid == entry.luid && privilege.enabled);
+        if enabled {
+            entry.attributes |= SE_PRIVILEGE_USED_FOR_ACCESS;
+            remaining -= 1;
+            if remaining == 0 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The result of an access check (spec §9.2).
