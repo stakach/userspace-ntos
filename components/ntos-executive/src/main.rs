@@ -22973,6 +22973,7 @@ impl HostedThreadMechanismCaps {
 pub(crate) struct HostedThreadSpawnResult {
     tcb: u64,
     mechanism: HostedThreadMechanismCaps,
+    teb_alias: u64,
 }
 
 impl HostedThreadSpawnResult {
@@ -22980,11 +22981,16 @@ impl HostedThreadSpawnResult {
         Self {
             tcb: 0,
             mechanism: HostedThreadMechanismCaps::empty(),
+            teb_alias: 0,
         }
     }
 
-    const fn new(tcb: u64, mechanism: HostedThreadMechanismCaps) -> Self {
-        Self { tcb, mechanism }
+    const fn new(tcb: u64, mechanism: HostedThreadMechanismCaps, teb_alias: u64) -> Self {
+        Self {
+            tcb,
+            mechanism,
+            teb_alias,
+        }
     }
 
     pub(crate) const fn tcb(self) -> u64 {
@@ -22993,6 +22999,10 @@ impl HostedThreadSpawnResult {
 
     pub(crate) const fn mechanism(self) -> HostedThreadMechanismCaps {
         self.mechanism
+    }
+
+    pub(crate) const fn teb_alias(self) -> u64 {
+        self.teb_alias
     }
 }
 
@@ -23004,6 +23014,7 @@ pub(crate) struct HostedThreadRuntime {
     badge: u64,
     role: HostedThreadRole,
     mechanism: HostedThreadMechanismCaps,
+    teb_alias: u64,
     user_stack_allocation_base: u64,
     user_stack_base: u64,
 }
@@ -23017,6 +23028,7 @@ impl HostedThreadRuntime {
             badge: 0,
             role: HostedThreadRole::Main,
             mechanism: HostedThreadMechanismCaps::empty(),
+            teb_alias: 0,
             user_stack_allocation_base: 0,
             user_stack_base: 0,
         }
@@ -23110,11 +23122,13 @@ impl HostedThreadRuntimeTable {
             badge,
             role,
             mechanism: HostedThreadMechanismCaps::empty(),
+            teb_alias: 0,
             user_stack_allocation_base: 0,
             user_stack_base: 0,
         };
         if let Some(existing) = self.entries.iter_mut().find(|entry| entry.tid == tid) {
             runtime.mechanism = existing.mechanism;
+            runtime.teb_alias = existing.teb_alias;
             runtime.user_stack_allocation_base = existing.user_stack_allocation_base;
             runtime.user_stack_base = existing.user_stack_base;
             *existing = runtime;
@@ -23189,6 +23203,18 @@ impl HostedThreadRuntimeTable {
             .iter_mut()
             .find(|entry| entry.is_live() && entry.tid == tid)?;
         entry.mechanism = mechanism;
+        Some(*entry)
+    }
+
+    fn set_teb_alias(&mut self, tid: u64, teb_alias: u64) -> Option<HostedThreadRuntime> {
+        if tid == 0 || teb_alias == 0 {
+            return None;
+        }
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.is_live() && entry.tid == tid)?;
+        entry.teb_alias = teb_alias;
         Some(*entry)
     }
 
@@ -23326,6 +23352,11 @@ impl HostedThreadRuntimes {
     ) -> Option<HostedThreadRuntime> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe { (&mut *self.table).set_mechanism_caps(tid, mechanism) }
+    }
+
+    fn set_teb_alias(&mut self, tid: u64, teb_alias: u64) -> Option<HostedThreadRuntime> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).set_teb_alias(tid, teb_alias) }
     }
 
     fn tcb_by_tid(&self, tid: u64) -> Option<u64> {
@@ -24771,6 +24802,11 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
     HostedThreadSpawnResult::new(
         tcb,
         HostedThreadMechanismCaps::new(raw, cnode, sched_context),
+        if teb_live_alias != 0 && teb_live_map == 0 && teb2_live_map == 0 {
+            teb_live_alias
+        } else {
+            0
+        },
     )
 }
 

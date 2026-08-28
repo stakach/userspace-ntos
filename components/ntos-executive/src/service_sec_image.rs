@@ -2248,6 +2248,7 @@ pub(crate) unsafe fn dispatch_csr_api_worker_win32k(
 ) -> Option<u64> {
     let role = HostedThreadRole::CsrApi;
     let (tid, tcb, badge) = nt_handler.hosted_thread_identity_for_role(csrss_pi, role)?;
+    let teb_alias = nt_handler.hosted_thread_teb_alias_for_role(csrss_pi, role)?;
     let teb = nt_handler
         .pm
         .thread_teb(tid as nt_process::ThreadId)
@@ -2269,7 +2270,7 @@ pub(crate) unsafe fn dispatch_csr_api_worker_win32k(
     bump_w32_total_dispatch(csrss_pi);
     CSRSS_SSN_HIST[ssn_bucket(ssn)].fetch_add(1, Ordering::Relaxed);
     w32_census_enter(ssn);
-    crate::ke_gdi_flush_user_batch(client, teb);
+    crate::ke_gdi_flush_user_batch(client, teb_alias);
     let (status, completed) =
         dispatch_win32k_for_client(nt_handler, ssn, a0, a1, a2, a3, caller_sp, &[], client);
     completed.then_some(status)

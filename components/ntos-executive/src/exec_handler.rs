@@ -7960,6 +7960,12 @@ impl ExecNtHandler {
             unsafe { crate::release_unregistered_hosted_thread_spawn(spawn) };
             return false;
         }
+        let teb_alias = spawn.teb_alias();
+        if teb_alias != 0 && self.thread_runtime.set_teb_alias(tid, teb_alias).is_none() {
+            let _ = self.release_hosted_thread_runtime(tid);
+            unsafe { crate::release_unregistered_hosted_thread_spawn(spawn) };
+            return false;
+        }
         true
     }
 
@@ -8769,6 +8775,17 @@ impl ExecNtHandler {
     ) -> Option<(u64, u64, u64)> {
         let runtime = self.thread_runtime.get_by_role(pi, role)?;
         (runtime.tid != 0 && runtime.tcb > 1).then_some((runtime.tid, runtime.tcb, runtime.badge))
+    }
+
+    pub(crate) fn hosted_thread_teb_alias_for_role(
+        &self,
+        pi: usize,
+        role: HostedThreadRole,
+    ) -> Option<u64> {
+        self.thread_runtime
+            .get_by_role(pi, role)
+            .map(|runtime| runtime.teb_alias)
+            .filter(|&teb_alias| teb_alias != 0)
     }
 
     pub(crate) fn hosted_thread_tid_for_role(
