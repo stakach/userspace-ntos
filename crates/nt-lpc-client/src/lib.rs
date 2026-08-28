@@ -327,6 +327,13 @@ impl<B: Backend> LpcClient<B> {
             .map(|_| ())
     }
 
+    /// Kernel `LpcRequestPort` — enqueue a typed kernel message without converting it to an LPC
+    /// request or reply. This is used for messages such as `LPC_CLIENT_DIED`.
+    pub fn request_port(&mut self, port_handle: u64, message: &[u8]) -> Result<(), NtStatus> {
+        self.send_message(opcode::LPC_OP_REQUEST_PORT, port_handle, message)
+            .map(|_| ())
+    }
+
     fn send_message(
         &mut self,
         opcode: u16,

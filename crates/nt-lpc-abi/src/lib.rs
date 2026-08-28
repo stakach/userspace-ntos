@@ -11,9 +11,8 @@
 //! Rust references / raw pointers, explicit length fields, UTF-16 for names.
 //! Sizes/alignments are asserted at compile time.
 //!
-//! Only the CONNECT rendezvous ops (create/connect/accept/complete) are load-
-//! bearing today (path A); the request/reply message ops are defined so the
-//! message loop is a later fill-in, not an ABI change.
+//! The connection rendezvous and request/reply message operations are both live. Kernel-generated
+//! typed messages use a distinct request-port operation so they retain their kernel message type.
 
 #![no_std]
 
@@ -44,6 +43,9 @@ pub mod opcode {
     pub const LPC_OP_CLOSE_PORT: u16 = 0x2209;
 
     pub const LPC_OP_QUERY_HANDLE: u16 = 0x220a;
+
+    // Kernel-internal LpcRequestPort: preserve a kernel message type such as LPC_CLIENT_DIED.
+    pub const LPC_OP_REQUEST_PORT: u16 = 0x220b;
 }
 
 /// True if `op` is an LPC opcode.
@@ -209,7 +211,7 @@ pub struct LpcReceiveRequest {
     pub reply_msg_len_bytes: u32,
 }
 
-/// `LPC_OP_REQUEST_WAIT_REPLY` / `LPC_OP_REPLY_PORT` — send a request/reply.
+/// `LPC_OP_REQUEST_WAIT_REPLY` / `LPC_OP_REPLY_PORT` / `LPC_OP_REQUEST_PORT` — send a message.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct LpcMessageRequest {
@@ -309,6 +311,7 @@ mod tests {
         assert!(is_lpc_opcode(opcode::LPC_OP_CONNECT_PORT));
         assert!(is_lpc_opcode(opcode::LPC_OP_CLOSE_PORT));
         assert!(is_lpc_opcode(opcode::LPC_OP_QUERY_HANDLE));
+        assert!(is_lpc_opcode(opcode::LPC_OP_REQUEST_PORT));
         assert!(!is_lpc_opcode(0x21ff));
         assert!(!is_lpc_opcode(0x2300));
     }

@@ -21944,7 +21944,6 @@ unsafe fn csr_dynamic_finish_request_reply(
     if reply_len == 0 {
         status = 0xC000_0001;
     } else {
-        reply[4..6].copy_from_slice(&nt_lpc_abi::msg_type::LPC_REPLY.to_le_bytes());
         let sent = lpc_client()
             .map(|lpc| lpc.reply_port(worker.port, &reply[..reply_len]))
             .is_some_and(|result| result.is_ok());

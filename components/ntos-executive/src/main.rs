@@ -17455,7 +17455,7 @@ unsafe fn notify_thread_termination_ports(tid: u64, handler: &mut ExecNtHandler)
                 let csr_api_port = lpc
                     .query_handle(port)
                     .is_ok_and(|identity| lpc_name_is(&identity.name, b"\\windows\\apiport"));
-                let status = match lpc.reply_port(port, &message) {
+                let status = match lpc.request_port(port, &message) {
                     Ok(()) => 0,
                     Err(status) => status.raw() as u32,
                 };
