@@ -15330,3 +15330,38 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     non-returning continuation behavior, deferred out-of-order returns, nested callbacks, GDI batch
     flushes, and dead-client unwind; a call with no active callback must return the native failure
     status rather than falling through or fabricating success.
+
+    `NtCallbackReturn` (2026-08-29, accepted): SSN 22 is now a typed registered three-argument
+    service. The callback receive loop classifies the continuation operation by looking up
+    `NativeService::NtCallbackReturn` in the active native service table; the literal `m0 == 22`
+    exception and SSN-number diagnostics have been removed. A matching active frame still follows
+    the necessarily non-returning callback continuation path, while a call on a thread with no
+    active callback reaches ordinary typed dispatch and returns `STATUS_NO_CALLBACK_ACTIVE`.
+
+    The migration preserves per-calling-thread innermost-frame selection, global continuation
+    correlation, nested win32k dispatch, deferred out-of-order returns, GDI batch flush and reply
+    republishing, and dead-client unwind. Focused validation passes `nt-syscall` `63/63`,
+    `nt-user-callback` `58/58`, `nt-user-host` compilation, `git diff --check`, the freestanding
+    executive at the established 212-warning baseline, and the release build/staging path. Code
+    checkpoint `1bc1983c` is pushed.
+
+    Serialized acceptance `.tmp/run-headless-callback-return-20260829.log` reached the final gate at
+    109,237 ms. It completed 893 logged real `NtCallbackReturn` operations, including two
+    out-of-order returns that were parked and drained; the final syscall census recorded 212 SSN 22
+    calls from winlogon and 672 from Explorer, with no continuation-correlation rejection. Genuine
+    userinit and Explorer launched, Explorer completed 668 api0 redirects with zero callback or
+    dead-callback failures, paint begin/end reached `5/20` with 187 direct GDI returns and 135 batch
+    flushes covering 184 records, and the framebuffer contained `480000/480000` non-background
+    pixels with at least 32 colours. All `295/295` gates passed and the sentinel matched. Snapshot
+    generation 5 committed 1,755,666 bytes, scratch returned to zero, and the census reported no
+    page-table, frame, mapping, alias, registry, untyped-allocation, frame-registration, image-bank,
+    or allocator failure.
+
+    Review adjustment: the typed surface now contains 172 services, the hosted table registers 171
+    numbered variants, and 51 canonical ABI exports remain absent. Implement
+    `NtImpersonateAnonymousToken` (SSN 93) next as the next bounded Se/Ps lifecycle boundary. Add
+    the two kernel-owned anonymous logon token identities (with and without Everyone) to the reusable
+    token model, select them from the real `EveryoneIncludesAnonymous` LSA policy, require
+    `THREAD_IMPERSONATE` on the target thread, reject a restricted caller primary token, and install
+    the impersonation context through the existing reference-owning ETHREAD replacement path at
+    `SecurityImpersonation`. Do not synthesize a per-call token or bypass token/thread handle policy.

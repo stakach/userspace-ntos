@@ -139,6 +139,7 @@ fn callback_return_keeps_native_service_identity() {
     assert_eq!(NativeService::NtCallbackReturn.name(), "NtCallbackReturn");
     assert_eq!(NativeService::NtCallbackReturn.arg_count(), (3, 3));
     assert_eq!(nt_syscall_abi::ssn_of("NtCallbackReturn"), Some(22));
+    assert_eq!(STATUS_NO_CALLBACK_ACTIVE, 0xC000_0258);
 
     let table = NativeServiceTable::from_numbers(
         UserlandAbiProfile::Windows7,
