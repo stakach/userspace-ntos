@@ -361,19 +361,19 @@ fn read_u64(memory: &dyn ClientMemory, va: u64) -> Result<u64, u32> {
 
 /// Translate one captured `SID_AND_ATTRIBUTES` group entry into a [`TokenGroup`].
 ///
-/// `SE_GROUP_MANDATORY` forces the group enabled, exactly as `SepCreateToken` does
-/// (`ntoskrnl/se/tokenlif.c:134`).
+/// `SE_GROUP_MANDATORY` forces the group enabled and enabled-by-default, exactly as
+/// `SepCreateToken` does (`ntoskrnl/se/tokenlif.c:134`).
 pub fn group_from_attributes(sid: Sid, attributes: u32) -> TokenGroup {
     let mandatory = attributes & SE_GROUP_MANDATORY != 0;
-    TokenGroup {
+    TokenGroup::from_native_attributes(
         sid,
-        enabled: mandatory || attributes & SE_GROUP_ENABLED != 0,
-        deny_only: attributes & SE_GROUP_USE_FOR_DENY_ONLY != 0,
-        owner: attributes & SE_GROUP_OWNER != 0,
-        // `SE_GROUP_LOGON_ID` is a TWO-bit mask; test it whole, exactly as
-        // `winlogon!AllowAccessOnSession` does (`(Attributes & SE_GROUP_LOGON_ID) == SE_GROUP_LOGON_ID`).
-        logon_id: attributes & SE_GROUP_LOGON_ID == SE_GROUP_LOGON_ID,
-    }
+        attributes
+            | if mandatory {
+                SE_GROUP_ENABLED | SE_GROUP_ENABLED_BY_DEFAULT
+            } else {
+                0
+            },
+    )
 }
 
 /// Translate one captured `LUID_AND_ATTRIBUTES` privilege entry into a [`TokenPrivilege`].

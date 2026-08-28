@@ -18346,7 +18346,12 @@ impl ExecNtHandler {
         // `winlogon!AllowAccessOnSession` scans `TOKEN_GROUPS` for exactly this and dereferences an
         // UNINITIALISED local when it finds nothing (measured: a read fault at `RtlLengthSid+0x5`,
         // `ntdll+0x1acc5`, with a garbage `LogonSid`). Counted so the claim is a measurement.
-        let logon_sid_groups = captured.token.groups.iter().filter(|g| g.logon_id).count() as u64;
+        let logon_sid_groups = captured
+            .token
+            .groups
+            .iter()
+            .filter(|group| group.is_logon_id())
+            .count() as u64;
         SE_CREATE_TOKEN_LOGON_SIDS.store(logon_sid_groups, Ordering::Relaxed);
         let privilege_count = captured.token.privileges.len() as u64;
         let authentication_id = captured.token.authentication_id;
@@ -18868,6 +18873,141 @@ impl ExecNtHandler {
             STATUS_SUCCESS
         }
     }
+
+    unsafe fn nt_adjust_groups_token(&mut self, args: &[u64]) -> u32 {
+        const STATUS_SUCCESS: u32 = 0;
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+        const STATUS_NOT_ALL_ASSIGNED: u32 = 0x0000_0106;
+        const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+        const TOKEN_QUERY: u32 = 0x0008;
+        const TOKEN_ADJUST_GROUPS: u32 = 0x0040;
+        const TOKEN_GROUPS_HEADER_SIZE: usize = 24;
+
+        let reset_to_default = nt_boolean_arg(args[1]);
+        let new_state = args[2];
+        let buffer_length = nt_ulong_arg(args[3]) as usize;
+        let previous_state = args[4];
+        let return_length = args[5];
+        if !reset_to_default && new_state == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        let mut requested = alloc::vec::Vec::new();
+        if !reset_to_default {
+            if new_state & 3 != 0 {
+                return STATUS_DATATYPE_MISALIGNMENT;
+            }
+            let mut header = [0u8; TOKEN_GROUPS_HEADER_SIZE];
+            if !self.xas_read(new_state, &mut header) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            let count = u32::from_le_bytes(header[..4].try_into().unwrap());
+            let Some(groups_address) =
+                new_state.checked_add(nt_security::TOKEN_GROUPS_ARRAY_OFFSET)
+            else {
+                return STATUS_ACCESS_VIOLATION;
+            };
+            let captured = match nt_security::capture_sid_and_attributes_array(
+                &ExecClientMemory { handler: self },
+                groups_address,
+                count,
+            ) {
+                Ok(captured) => captured,
+                Err(status) => return status,
+            };
+            if requested.try_reserve_exact(captured.len()).is_err() {
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            requested.extend(
+                captured
+                    .into_iter()
+                    .map(|(sid, attributes)| nt_security::GroupAdjustment { sid, attributes }),
+            );
+        }
+
+        if previous_state != 0 {
+            if previous_state & 3 != 0 || return_length & 3 != 0 {
+                return STATUS_DATATYPE_MISALIGNMENT;
+            }
+            if return_length == 0
+                || !self.probe_user_output(previous_state, buffer_length)
+                || !self.probe_user_output(return_length, 4)
+            {
+                return STATUS_ACCESS_VIOLATION;
+            }
+        }
+
+        let required_access =
+            TOKEN_ADJUST_GROUPS | if previous_state != 0 { TOKEN_QUERY } else { 0 };
+        let token_id = match self.token_id_for_handle(args[0], required_access) {
+            Ok(token) => token,
+            Err(status) => return status,
+        };
+        let plan = match self.token_store.get(token_id) {
+            Some(token) => match token.plan_group_adjustment(reset_to_default, &requested) {
+                Ok(plan) => plan,
+                Err(status) => return status,
+            },
+            None => return nt_process::STATUS_INVALID_HANDLE,
+        };
+
+        let mut previous_output = alloc::vec::Vec::new();
+        if previous_state != 0 {
+            let sized = match nt_security::encode_token_group_entries(
+                &plan.previous,
+                previous_state,
+                &mut [],
+            ) {
+                Ok(sized) => sized,
+                Err(_) => return STATUS_INVALID_PARAMETER,
+            };
+            if sized.required_length > u32::MAX as usize {
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            if !self.xas_write_u32(return_length, sized.required_length as u32) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            if buffer_length < sized.required_length {
+                return STATUS_BUFFER_TOO_SMALL;
+            }
+            if previous_output
+                .try_reserve_exact(sized.required_length)
+                .is_err()
+            {
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            previous_output.resize(sized.required_length, 0);
+            match nt_security::encode_token_group_entries(
+                &plan.previous,
+                previous_state,
+                &mut previous_output,
+            ) {
+                Ok(encoded) if encoded.written => {}
+                Ok(_) | Err(_) => return STATUS_INVALID_PARAMETER,
+            }
+        }
+
+        let result = match self
+            .token_store
+            .adjust_groups(token_id, reset_to_default, &requested)
+        {
+            Ok(result) => result,
+            Err(status) => return status,
+        };
+        if previous_state != 0
+            && !self.xas_try_write_buf(previous_state, previous_output.as_slice())
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if !reset_to_default && result.matched < requested.len() {
+            STATUS_NOT_ALL_ASSIGNED
+        } else {
+            STATUS_SUCCESS
+        }
+    }
+
     /// Queue an 8-byte out-param write for the loop to perform after dispatch (group B2). Silently
     /// drops if the fixed queue is full (bounded per-syscall — no handler queues more than 6).
     pub(crate) fn queue_write(&mut self, ptr: u64, val: u64) {
@@ -31137,6 +31277,7 @@ impl ExecNtHandler {
             NativeService::NtAdjustPrivilegesToken => unsafe {
                 self.nt_adjust_privileges_token(args)
             },
+            NativeService::NtAdjustGroupsToken => unsafe { self.nt_adjust_groups_token(args) },
             NativeService::NtResumeProcess | NativeService::NtSuspendProcess => {
                 let handle = args.first().copied().unwrap_or(0);
                 if self.resolve_process_handle(handle).is_some() {

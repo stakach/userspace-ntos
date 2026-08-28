@@ -1161,6 +1161,8 @@ pub const SSN_NT_OPEN_PROCESS_TOKEN_EX: u64 = 130;
 /// NtQueryInformationToken — csrss's CsrServerInitialization queries its process token (identity,
 /// session, statistics) after opening it. Class in RDX; TOKEN_* struct copied out to R8.
 pub const SSN_NT_QUERY_INFO_TOKEN: u64 = 163;
+/// NtAdjustGroupsToken — changes the enabled state of groups on a mutable token object.
+pub const SSN_NT_ADJUST_GROUPS_TOKEN: u64 = 11;
 /// NtAdjustPrivilegesToken — adjusts the persistent primary-token privilege set with native
 /// previous-state, access-check, and buffer-size semantics.
 pub const SSN_NT_ADJUST_PRIV_TOKEN: u64 = 12;
@@ -23599,6 +23601,10 @@ fn build_nt_table() -> NativeServiceTable {
             (
                 NativeService::NtWaitForKeyedEvent,
                 SSN_NT_WAIT_FOR_KEYED_EVENT as u32,
+            ),
+            (
+                NativeService::NtAdjustGroupsToken,
+                SSN_NT_ADJUST_GROUPS_TOKEN as u32,
             ),
             (
                 NativeService::NtAdjustPrivilegesToken,

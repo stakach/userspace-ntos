@@ -372,7 +372,7 @@ fn system_token_has_reactos_owner_and_default_dacl() {
     assert!(token
         .groups
         .iter()
-        .any(|group| group.sid == Sid::administrators() && group.owner));
+        .any(|group| group.sid == Sid::administrators() && group.is_owner()));
     assert_eq!(
         token.default_dacl.as_ref().unwrap().as_bytes(),
         &[
@@ -545,7 +545,7 @@ fn token_groups_encoding_is_exact_relocatable_and_size_queryable() {
         let sid_va = u64::from_le_bytes(output[entry..entry + 8].try_into().unwrap());
         assert_eq!(sid_va, base + cursor as u64, "group {index} SID pointer");
         let attributes = u32::from_le_bytes(output[entry + 8..entry + 12].try_into().unwrap());
-        assert_eq!(attributes, group.attributes());
+        assert_eq!(attributes, group.native_attributes());
         let mut expected = alloc::vec![0u8; group.sid.native_len().unwrap()];
         group.sid.write_native(&mut expected).unwrap();
         assert_eq!(&output[cursor..cursor + expected.len()], &expected[..]);
@@ -554,10 +554,18 @@ fn token_groups_encoding_is_exact_relocatable_and_size_queryable() {
     assert_eq!(cursor, encoded.required_length);
 
     // The Administrators group is the token's OWNER group; the other two are plain enabled groups.
-    assert_eq!(system.groups[0].attributes() & 0x8, 0x8, "SE_GROUP_OWNER");
-    assert_eq!(system.groups[1].attributes() & 0x8, 0, "not an owner group");
     assert_eq!(
-        system.groups[1].attributes() & 0x7,
+        system.groups[0].native_attributes() & 0x8,
+        0x8,
+        "SE_GROUP_OWNER"
+    );
+    assert_eq!(
+        system.groups[1].native_attributes() & 0x8,
+        0,
+        "not an owner group"
+    );
+    assert_eq!(
+        system.groups[1].native_attributes() & 0x7,
         0x7,
         "mandatory|default|enabled"
     );
@@ -583,16 +591,19 @@ fn logon_sid_group_keeps_its_se_group_logon_id_through_capture_and_encode() {
     let logon_sid = Sid::new(5, &[5, 0, 0x3e7f]);
     let attributes = SE_GROUP_MANDATORY | SE_GROUP_ENABLED | SE_GROUP_LOGON_ID;
     let group = group_from_attributes(logon_sid.clone(), attributes);
-    assert!(group.logon_id, "capture must keep SE_GROUP_LOGON_ID");
-    assert_eq!(group.attributes() & SE_GROUP_LOGON_ID, SE_GROUP_LOGON_ID);
+    assert!(group.is_logon_id(), "capture must keep SE_GROUP_LOGON_ID");
+    assert_eq!(
+        group.native_attributes() & SE_GROUP_LOGON_ID,
+        SE_GROUP_LOGON_ID
+    );
 
     // A plain enabled group must NOT claim to be the logon SID (one bit of the two-bit mask being
     // set is not a match — the winlogon test compares the WHOLE mask).
     let plain = group_from_attributes(Sid::administrators(), SE_GROUP_MANDATORY | SE_GROUP_ENABLED);
-    assert!(!plain.logon_id);
+    assert!(!plain.is_logon_id());
     let half = group_from_attributes(Sid::everyone(), 0x4000_0000);
     assert!(
-        !half.logon_id,
+        !half.is_logon_id(),
         "half of SE_GROUP_LOGON_ID is not a logon SID"
     );
 
@@ -849,6 +860,100 @@ fn privilege_adjustment_plans_applies_and_reports_previous_state() {
 }
 
 #[test]
+fn group_adjustment_preserves_native_attributes_and_resets_defaults() {
+    use crate::create_token::{SE_GROUP_ENABLED, SE_GROUP_ENABLED_BY_DEFAULT};
+
+    let mut token = AccessToken::user(MACHINE);
+    token.groups = vec![
+        TokenGroup::from_native_attributes(Sid::users(), SE_GROUP_ENABLED_BY_DEFAULT | 0x20),
+        TokenGroup::from_native_attributes(Sid::everyone(), SE_GROUP_ENABLED | 0x40),
+    ];
+    let plan = token.plan_group_adjustment(true, &[]).unwrap();
+    assert_eq!(plan.matched, 0);
+    assert_eq!(plan.previous.len(), 2);
+    assert_eq!(plan.previous[0].native_attributes(), 0x22);
+    assert_eq!(plan.previous[1].native_attributes(), 0x44);
+
+    let mut encoded = [0u8; 128];
+    let base = 0x7000_0000;
+    let result = encode_token_group_entries(&plan.previous, base, &mut encoded).unwrap();
+    assert!(result.written);
+    assert_eq!(u32::from_le_bytes(encoded[..4].try_into().unwrap()), 2);
+    let first_sid = u64::from_le_bytes(encoded[8..16].try_into().unwrap());
+    assert!(first_sid >= base + 40 && first_sid < base + result.required_length as u64);
+
+    let mut store = TokenStore::new();
+    let id = store.insert(token);
+    let before = store.statistics(id).unwrap().modified_id;
+    let summary = store.adjust_groups(id, true, &[]).unwrap();
+    assert_eq!(summary.changed, 2);
+    assert!(store.get(id).unwrap().groups[0].is_enabled());
+    assert!(!store.get(id).unwrap().groups[1].is_enabled());
+    assert_eq!(
+        store.get(id).unwrap().groups[0].native_attributes(),
+        SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED | 0x20
+    );
+    let after = store.statistics(id).unwrap().modified_id;
+    assert_ne!(after, before);
+    assert_eq!(store.adjust_groups(id, true, &[]).unwrap().changed, 0);
+    assert_eq!(store.statistics(id).unwrap().modified_id, after);
+}
+
+#[test]
+fn group_adjustment_is_atomic_for_mandatory_and_deny_only_groups() {
+    use crate::create_token::{
+        SE_GROUP_ENABLED, SE_GROUP_ENABLED_BY_DEFAULT, SE_GROUP_MANDATORY,
+        SE_GROUP_USE_FOR_DENY_ONLY,
+    };
+
+    let mut token = AccessToken::user(MACHINE);
+    token.groups = vec![
+        TokenGroup::from_native_attributes(
+            Sid::users(),
+            SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED,
+        ),
+        TokenGroup::from_native_attributes(Sid::everyone(), SE_GROUP_USE_FOR_DENY_ONLY),
+    ];
+    let disable_mandatory = [GroupAdjustment {
+        sid: Sid::users(),
+        attributes: 0,
+    }];
+    assert_eq!(
+        token.plan_group_adjustment(false, &disable_mandatory),
+        Err(STATUS_CANT_DISABLE_MANDATORY)
+    );
+    let enable_deny_only = [GroupAdjustment {
+        sid: Sid::everyone(),
+        attributes: SE_GROUP_ENABLED,
+    }];
+    assert_eq!(
+        token.plan_group_adjustment(false, &enable_deny_only),
+        Err(STATUS_CANT_ENABLE_DENY_ONLY)
+    );
+
+    token.groups[0] = TokenGroup::from_native_attributes(Sid::users(), SE_GROUP_ENABLED);
+    let partial = [
+        GroupAdjustment {
+            sid: Sid::users(),
+            attributes: 0,
+        },
+        GroupAdjustment {
+            sid: Sid::local_account(MACHINE, 9999),
+            attributes: SE_GROUP_ENABLED,
+        },
+    ];
+    let plan = token.plan_group_adjustment(false, &partial).unwrap();
+    assert_eq!(plan.matched, 1);
+    assert_eq!(plan.previous.len(), 1);
+    let mut store = TokenStore::new();
+    let id = store.insert(token);
+    let summary = store.adjust_groups(id, false, &partial).unwrap();
+    assert_eq!(summary.matched, 1);
+    assert_eq!(summary.changed, 1);
+    assert!(!store.get(id).unwrap().groups[0].is_enabled());
+}
+
+#[test]
 fn disable_all_and_remove_privilege_follow_native_semantics() {
     let mut token = AccessToken::system();
     let plan = token.plan_privilege_adjustment(true, &[]);
@@ -1056,7 +1161,7 @@ fn privilege_overrides_and_kernel_bypass() {
 #[test]
 fn token_duplicate_is_independent_and_effective_only() {
     let mut source = AccessToken::system();
-    source.groups[0].enabled = false;
+    source.groups[0].set_enabled(false);
     let duplicate = source
         .duplicate(
             TokenType::Impersonation,
@@ -1070,14 +1175,14 @@ fn token_duplicate_is_independent_and_effective_only() {
         duplicate.impersonation_level,
         SecurityImpersonationLevel::Delegation
     );
-    assert!(duplicate.groups.iter().all(|group| group.enabled));
+    assert!(duplicate.groups.iter().all(TokenGroup::is_enabled));
     assert!(duplicate
         .privileges
         .iter()
         .all(|privilege| privilege.enabled));
 
-    source.groups[1].enabled = false;
-    assert!(duplicate.groups.iter().all(|group| group.enabled));
+    source.groups[1].set_enabled(false);
+    assert!(duplicate.groups.iter().all(TokenGroup::is_enabled));
 }
 
 #[test]
@@ -1387,14 +1492,15 @@ fn create_token_captures_the_real_logon_token_layout() {
 
     // SE_GROUP_MANDATORY forces enabled even with SE_GROUP_ENABLED absent (tokenlif.c:134).
     assert_eq!(captured.token.groups[0].sid, Sid::administrators());
-    assert!(captured.token.groups[0].enabled);
-    assert!(captured.token.groups[0].owner);
-    assert!(!captured.token.groups[0].deny_only);
+    assert!(captured.token.groups[0].is_enabled());
+    assert!(captured.token.groups[0].is_enabled_by_default());
+    assert!(captured.token.groups[0].is_owner());
+    assert!(!captured.token.groups[0].is_deny_only());
     assert_eq!(captured.token.groups[1].sid, Sid::users());
-    assert!(captured.token.groups[1].enabled);
+    assert!(captured.token.groups[1].is_enabled());
     assert_eq!(captured.token.groups[2].sid, Sid::everyone());
-    assert!(captured.token.groups[2].deny_only);
-    assert!(!captured.token.groups[2].enabled);
+    assert!(captured.token.groups[2].is_deny_only());
+    assert!(!captured.token.groups[2].is_enabled());
 
     assert_eq!(captured.token.privileges.len(), 2);
     assert_eq!(captured.token.privileges[0].name, SE_CHANGE_NOTIFY);

@@ -31,8 +31,9 @@ pub use access::{
     WRITE_OWNER,
 };
 pub use create_token::{
-    capture_token, luid_for_privilege_name, CapturedToken, ClientMemory, CreateTokenArgs,
-    MAX_CAPTURED_GROUPS, MAX_CAPTURED_PRIVILEGES,
+    capture_sid_and_attributes_array, capture_token, luid_for_privilege_name, CapturedToken,
+    ClientMemory, CreateTokenArgs, MAX_CAPTURED_GROUPS, MAX_CAPTURED_PRIVILEGES,
+    TOKEN_GROUPS_ARRAY_OFFSET,
 };
 pub use native_acl::{NativeAcl, NativeAclError, STATUS_INVALID_ACL};
 pub use native_sd::{
@@ -46,20 +47,22 @@ pub use native_sd::{
 pub use sid::{write_native_sid_sddl_utf16, Luid, Sid};
 pub use token::{
     plan_client_impersonation, token_can_impersonate, AccessToken, ClientImpersonationPlan,
-    PrivilegeAdjustment, PrivilegeAdjustmentSummary, SecurityContextTrackingMode,
-    SecurityImpersonationLevel, SecurityQualityOfService, TokenGroup, TokenId, TokenPrivilege,
-    TokenSource, TokenStatistics, TokenStore, TokenType, SE_ASSIGN_PRIMARY_TOKEN, SE_AUDIT,
-    SE_BACKUP, SE_CHANGE_NOTIFY, SE_CREATE_GLOBAL, SE_CREATE_PAGEFILE, SE_CREATE_PERMANENT,
-    SE_CREATE_TOKEN, SE_DEBUG, SE_IMPERSONATE, SE_INCREASE_BASE_PRIORITY, SE_INCREASE_QUOTA,
-    SE_LOAD_DRIVER, SE_LOCK_MEMORY, SE_MANAGE_VOLUME, SE_PRIVILEGE_ENABLED,
-    SE_PRIVILEGE_ENABLED_BY_DEFAULT, SE_PRIVILEGE_REMOVED, SE_PRIVILEGE_USED_FOR_ACCESS,
-    SE_PROFILE_SINGLE_PROCESS, SE_RESTORE, SE_SECURITY, SE_SHUTDOWN, SE_SYSTEM_ENVIRONMENT,
-    SE_SYSTEM_TIME, SE_TAKE_OWNERSHIP, SE_TCB, SE_UNDOCK, STATUS_ALLOTTED_SPACE_EXCEEDED,
-    STATUS_BAD_IMPERSONATION_LEVEL, STATUS_BAD_TOKEN_TYPE, STATUS_INVALID_OWNER,
+    GroupAdjustment, GroupAdjustmentPlan, GroupAdjustmentSummary, PrivilegeAdjustment,
+    PrivilegeAdjustmentSummary, SecurityContextTrackingMode, SecurityImpersonationLevel,
+    SecurityQualityOfService, TokenGroup, TokenId, TokenPrivilege, TokenSource, TokenStatistics,
+    TokenStore, TokenType, SE_ASSIGN_PRIMARY_TOKEN, SE_AUDIT, SE_BACKUP, SE_CHANGE_NOTIFY,
+    SE_CREATE_GLOBAL, SE_CREATE_PAGEFILE, SE_CREATE_PERMANENT, SE_CREATE_TOKEN, SE_DEBUG,
+    SE_IMPERSONATE, SE_INCREASE_BASE_PRIORITY, SE_INCREASE_QUOTA, SE_LOAD_DRIVER, SE_LOCK_MEMORY,
+    SE_MANAGE_VOLUME, SE_PRIVILEGE_ENABLED, SE_PRIVILEGE_ENABLED_BY_DEFAULT, SE_PRIVILEGE_REMOVED,
+    SE_PRIVILEGE_USED_FOR_ACCESS, SE_PROFILE_SINGLE_PROCESS, SE_RESTORE, SE_SECURITY, SE_SHUTDOWN,
+    SE_SYSTEM_ENVIRONMENT, SE_SYSTEM_TIME, SE_TAKE_OWNERSHIP, SE_TCB, SE_UNDOCK,
+    STATUS_ALLOTTED_SPACE_EXCEEDED, STATUS_BAD_IMPERSONATION_LEVEL, STATUS_BAD_TOKEN_TYPE,
+    STATUS_CANT_DISABLE_MANDATORY, STATUS_CANT_ENABLE_DENY_ONLY, STATUS_INVALID_OWNER,
 };
 pub use token_info::{
-    encode_token_default_dacl, encode_token_groups, encode_token_owner, encode_token_statistics,
-    InvalidTokenSid, TokenInformationEncoding, SID_AND_ATTRIBUTES_LENGTH, TOKEN_STATISTICS_LENGTH,
+    encode_token_default_dacl, encode_token_group_entries, encode_token_groups, encode_token_owner,
+    encode_token_statistics, InvalidTokenSid, TokenInformationEncoding, SID_AND_ATTRIBUTES_LENGTH,
+    TOKEN_STATISTICS_LENGTH,
 };
 
 #[cfg(test)]

@@ -133,74 +133,96 @@ pub const STATUS_INVALID_OWNER: u32 = 0xC000_005A;
 pub const STATUS_BAD_IMPERSONATION_LEVEL: u32 = 0xC000_00A5;
 pub const STATUS_BAD_TOKEN_TYPE: u32 = 0xC000_00A8;
 pub const STATUS_ALLOTTED_SPACE_EXCEEDED: u32 = 0xC000_0099;
+pub const STATUS_CANT_DISABLE_MANDATORY: u32 = 0xC000_005D;
+pub const STATUS_CANT_ENABLE_DENY_ONLY: u32 = 0xC000_02B3;
 
-/// A group in a token (spec §7.3). v0.1 attributes: enabled / deny-only / owner.
+/// A group in a token (spec §7.3), retaining the complete native attribute word losslessly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenGroup {
     pub sid: Sid,
-    pub enabled: bool,
-    pub deny_only: bool,
-    pub owner: bool,
-    /// `SE_GROUP_LOGON_ID` — this group is the LOGON SID of an interactive logon session. It is a
-    /// *distinguishing* bit, not a state bit: `winlogon!AllowAccessOnSession` (`security.c:1432`)
-    /// scans `TOKEN_GROUPS` for it to find the SID it grants window-station/desktop access to, and
-    /// dereferences whatever it finds — so dropping the bit does not merely lose information, it
-    /// leaves the caller's `LogonSid` local UNINITIALISED.
-    pub logon_id: bool,
+    attributes: u32,
 }
 
 impl TokenGroup {
     pub fn enabled(sid: Sid) -> Self {
-        TokenGroup {
+        use crate::create_token::{
+            SE_GROUP_ENABLED, SE_GROUP_ENABLED_BY_DEFAULT, SE_GROUP_MANDATORY,
+        };
+        Self::from_native_attributes(
             sid,
-            enabled: true,
-            deny_only: false,
-            owner: false,
-            logon_id: false,
-        }
+            SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED,
+        )
     }
+
     pub fn deny_only(sid: Sid) -> Self {
-        TokenGroup {
-            sid,
-            enabled: false,
-            deny_only: true,
-            owner: false,
-            logon_id: false,
-        }
+        Self::from_native_attributes(sid, crate::create_token::SE_GROUP_USE_FOR_DENY_ONLY)
     }
 
     pub fn enabled_owner(sid: Sid) -> Self {
-        TokenGroup {
-            sid,
-            enabled: true,
-            deny_only: false,
-            owner: true,
-            logon_id: false,
-        }
+        let mut group = Self::enabled(sid);
+        group.attributes |= crate::create_token::SE_GROUP_OWNER;
+        group
     }
 
-    /// The native `SID_AND_ATTRIBUTES.Attributes` bits for this group, as `TOKEN_GROUPS` reports
-    /// them. `SE_GROUP_MANDATORY` accompanies an enabled group that is not deny-only, matching how
-    /// the tokens modelled here are built (none of them are optional/enabled-by-request groups).
-    pub fn attributes(&self) -> u32 {
-        use crate::create_token::{
-            SE_GROUP_ENABLED, SE_GROUP_ENABLED_BY_DEFAULT, SE_GROUP_LOGON_ID, SE_GROUP_MANDATORY,
-            SE_GROUP_OWNER, SE_GROUP_USE_FOR_DENY_ONLY,
-        };
-        let mut attributes = 0;
-        if self.deny_only {
-            attributes |= SE_GROUP_USE_FOR_DENY_ONLY;
-        } else if self.enabled {
-            attributes |= SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED;
-        }
-        if self.owner {
-            attributes |= SE_GROUP_OWNER;
-        }
-        if self.logon_id {
-            attributes |= SE_GROUP_LOGON_ID;
-        }
-        attributes
+    pub const fn from_native_attributes(sid: Sid, attributes: u32) -> Self {
+        Self { sid, attributes }
     }
+
+    pub const fn native_attributes(&self) -> u32 {
+        self.attributes
+    }
+
+    pub const fn is_enabled(&self) -> bool {
+        self.attributes & crate::create_token::SE_GROUP_ENABLED != 0
+    }
+
+    pub const fn is_enabled_by_default(&self) -> bool {
+        self.attributes & crate::create_token::SE_GROUP_ENABLED_BY_DEFAULT != 0
+    }
+
+    pub const fn is_mandatory(&self) -> bool {
+        self.attributes & crate::create_token::SE_GROUP_MANDATORY != 0
+    }
+
+    pub const fn is_deny_only(&self) -> bool {
+        self.attributes & crate::create_token::SE_GROUP_USE_FOR_DENY_ONLY != 0
+    }
+
+    pub const fn is_owner(&self) -> bool {
+        self.attributes & crate::create_token::SE_GROUP_OWNER != 0
+    }
+
+    /// `SE_GROUP_LOGON_ID` is a two-bit distinguishing mask, not an enable-state bit.
+    pub const fn is_logon_id(&self) -> bool {
+        self.attributes & crate::create_token::SE_GROUP_LOGON_ID
+            == crate::create_token::SE_GROUP_LOGON_ID
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        if enabled {
+            self.attributes |= crate::create_token::SE_GROUP_ENABLED;
+        } else {
+            self.attributes &= !crate::create_token::SE_GROUP_ENABLED;
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupAdjustment {
+    pub sid: Sid,
+    pub attributes: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GroupAdjustmentPlan {
+    pub previous: Vec<TokenGroup>,
+    pub matched: usize,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct GroupAdjustmentSummary {
+    pub matched: usize,
+    pub changed: usize,
 }
 
 /// A privilege in a token (spec §7.4).
@@ -312,6 +334,67 @@ pub struct AccessToken {
 }
 
 impl AccessToken {
+    pub fn plan_group_adjustment(
+        &self,
+        reset_to_default: bool,
+        requested: &[GroupAdjustment],
+    ) -> Result<GroupAdjustmentPlan, u32> {
+        use crate::create_token::SE_GROUP_ENABLED;
+
+        let mut previous = Vec::new();
+        previous
+            .try_reserve_exact(self.groups.len())
+            .map_err(|_| crate::create_token::STATUS_INSUFFICIENT_RESOURCES)?;
+        let mut matched = 0;
+        for group in &self.groups {
+            let desired_enabled = if reset_to_default {
+                group.is_enabled_by_default()
+            } else {
+                let Some(adjustment) = requested.iter().find(|entry| entry.sid == group.sid) else {
+                    continue;
+                };
+                matched += 1;
+                adjustment.attributes & SE_GROUP_ENABLED != 0
+            };
+            if desired_enabled == group.is_enabled() {
+                continue;
+            }
+            if !desired_enabled && group.is_mandatory() {
+                return Err(STATUS_CANT_DISABLE_MANDATORY);
+            }
+            if desired_enabled && group.is_deny_only() {
+                return Err(STATUS_CANT_ENABLE_DENY_ONLY);
+            }
+            previous.push(group.clone());
+        }
+        Ok(GroupAdjustmentPlan { previous, matched })
+    }
+
+    fn adjust_groups(
+        &mut self,
+        reset_to_default: bool,
+        requested: &[GroupAdjustment],
+    ) -> Result<GroupAdjustmentSummary, u32> {
+        use crate::create_token::SE_GROUP_ENABLED;
+
+        let plan = self.plan_group_adjustment(reset_to_default, requested)?;
+        for group in &mut self.groups {
+            let desired_enabled = if reset_to_default {
+                group.is_enabled_by_default()
+            } else {
+                let Some(adjustment) = requested.iter().find(|entry| entry.sid == group.sid) else {
+                    continue;
+                };
+                adjustment.attributes & SE_GROUP_ENABLED != 0
+            };
+            group.set_enabled(desired_enabled);
+        }
+        Ok(GroupAdjustmentSummary {
+            matched: plan.matched,
+            changed: plan.previous.len(),
+        })
+    }
+
     /// Duplicate this token using the native token type, impersonation-level, and effective-only
     /// rules. The returned token owns independent group and privilege vectors.
     pub fn duplicate(
@@ -337,7 +420,7 @@ impl AccessToken {
             SecurityImpersonationLevel::Anonymous
         };
         if effective_only {
-            duplicate.groups.retain(|group| group.enabled);
+            duplicate.groups.retain(TokenGroup::is_enabled);
             duplicate.privileges.retain(|privilege| privilege.enabled);
         }
         Ok(duplicate)
@@ -352,7 +435,7 @@ impl AccessToken {
     pub fn allow_sids(&self) -> Vec<&Sid> {
         let mut sids = vec![&self.user];
         for g in &self.groups {
-            if g.enabled && !g.deny_only {
+            if g.is_enabled() && !g.is_deny_only() {
                 sids.push(&g.sid);
             }
         }
@@ -787,6 +870,30 @@ impl TokenStore {
         Ok(result)
     }
 
+    pub fn adjust_groups(
+        &mut self,
+        id: TokenId,
+        reset_to_default: bool,
+        requested: &[GroupAdjustment],
+    ) -> Result<GroupAdjustmentSummary, u32> {
+        let slot = id.slot();
+        let result = self
+            .objects
+            .get_mut(slot)
+            .and_then(Option::as_mut)
+            .ok_or(STATUS_INVALID_HANDLE)?
+            .token
+            .adjust_groups(reset_to_default, requested)?;
+        if result.changed != 0 {
+            let modified_luid = self.allocate_luid();
+            self.objects[slot]
+                .as_mut()
+                .expect("validated token object disappeared")
+                .modified_luid = modified_luid;
+        }
+        Ok(result)
+    }
+
     /// Set the token owner to the user or a group carrying `SE_GROUP_OWNER`.
     pub fn set_owner(&mut self, id: TokenId, owner: Sid) -> Result<(), u32> {
         let slot = id.slot();
@@ -801,7 +908,7 @@ impl TokenStore {
                 || token
                     .groups
                     .iter()
-                    .any(|group| group.owner && group.sid == owner);
+                    .any(|group| group.is_owner() && group.sid == owner);
             if !valid {
                 return Err(STATUS_INVALID_OWNER);
             }

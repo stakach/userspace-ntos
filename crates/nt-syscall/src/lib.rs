@@ -211,6 +211,7 @@ pub enum NativeService {
     NtCreateKeyedEvent,
     NtReleaseKeyedEvent,
     NtWaitForKeyedEvent,
+    NtAdjustGroupsToken,
     NtAdjustPrivilegesToken,
     NtPrivilegeCheck,
     NtImpersonateThread,
@@ -396,6 +397,7 @@ impl NativeService {
             NtCreateKeyedEvent => "NtCreateKeyedEvent",
             NtReleaseKeyedEvent => "NtReleaseKeyedEvent",
             NtWaitForKeyedEvent => "NtWaitForKeyedEvent",
+            NtAdjustGroupsToken => "NtAdjustGroupsToken",
             NtAdjustPrivilegesToken => "NtAdjustPrivilegesToken",
             NtPrivilegeCheck => "NtPrivilegeCheck",
             NtImpersonateThread => "NtImpersonateThread",
@@ -615,6 +617,7 @@ impl NativeService {
         NativeService::NtQuerySymbolicLinkObject,
         NativeService::NtPrivilegeCheck,
         NativeService::NtImpersonateThread,
+        NativeService::NtAdjustGroupsToken,
     ];
 }
 

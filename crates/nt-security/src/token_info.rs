@@ -1,6 +1,6 @@
 //! Native byte encoders for token information classes.
 
-use crate::{AccessToken, TokenStatistics};
+use crate::{AccessToken, TokenGroup, TokenStatistics};
 
 pub const TOKEN_STATISTICS_LENGTH: usize = 0x38;
 
@@ -59,11 +59,21 @@ pub fn encode_token_groups(
     caller_base: u64,
     output: &mut [u8],
 ) -> Result<TokenInformationEncoding, InvalidTokenSid> {
+    encode_token_group_entries(&token.groups, caller_base, output)
+}
+
+/// Encode an arbitrary owned group slice using the same relocatable `TOKEN_GROUPS` layout. This is
+/// shared by token queries and `NtAdjustGroupsToken` previous-state output.
+pub fn encode_token_group_entries(
+    groups: &[TokenGroup],
+    caller_base: u64,
+    output: &mut [u8],
+) -> Result<TokenInformationEncoding, InvalidTokenSid> {
     // GroupCount (4) + 4 bytes of padding so the array is 8-aligned, then the array, then the SIDs.
     let array_offset = 8;
-    let sid_offset = array_offset + token.groups.len() * SID_AND_ATTRIBUTES_LENGTH;
+    let sid_offset = array_offset + groups.len() * SID_AND_ATTRIBUTES_LENGTH;
     let mut required_length = sid_offset;
-    for group in &token.groups {
+    for group in groups {
         required_length += group.sid.native_len().ok_or(InvalidTokenSid)?;
     }
     let Some(output) = output.get_mut(..required_length) else {
@@ -74,13 +84,13 @@ pub fn encode_token_groups(
     };
 
     output.fill(0);
-    output[..4].copy_from_slice(&(token.groups.len() as u32).to_le_bytes());
+    output[..4].copy_from_slice(&(groups.len() as u32).to_le_bytes());
     let mut sid_cursor = sid_offset;
-    for (index, group) in token.groups.iter().enumerate() {
+    for (index, group) in groups.iter().enumerate() {
         let entry = array_offset + index * SID_AND_ATTRIBUTES_LENGTH;
         output[entry..entry + 8]
             .copy_from_slice(&caller_base.wrapping_add(sid_cursor as u64).to_le_bytes());
-        output[entry + 8..entry + 12].copy_from_slice(&group.attributes().to_le_bytes());
+        output[entry + 8..entry + 12].copy_from_slice(&group.native_attributes().to_le_bytes());
         let written = group
             .sid
             .write_native(&mut output[sid_cursor..])
