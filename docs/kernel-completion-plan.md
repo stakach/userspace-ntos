@@ -15539,3 +15539,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     complete caller `PORT_MESSAGE` through the existing bounded helper, send it through the broker,
     and propagate broker/type/handle failures. Do not add another message queue or retain a numeric
     service-loop exception.
+
+    `NtReplyPort` (2026-08-29, accepted): SSN 202 is now a typed registered two-argument service
+    with no numeric branch or fallback. The executive rejects a null message pointer, captures the
+    fixed header first, validates `TotalLength` and `DataLength` through the shared `nt-lpc-abi`
+    contract, captures exactly the bounded complete message, and sends it through the existing LPC
+    broker. Invalid port handles, malformed messages, and broker failures are returned to the
+    caller; the syscall does not create a parallel queue or wait for a reply.
+
+    Focused validation passes `nt-lpc-abi` `3/3`, `nt-syscall` `67/67`, `nt-lpc-client` `3/3`,
+    `nt-lpc-server` `12/12`, `git diff --check`, the freestanding executive at the established
+    212-warning baseline, and the release build/staging path. Code checkpoint `35b7b7c7` is pushed.
+    Serialized acceptance `.tmp/run-headless-reply-port-20260829.log` reached the final gate at
+    110,186 ms, launched genuine userinit and Explorer, completed 679 Explorer api0 redirects with
+    zero callback or dead-callback failures, recorded paint begin/end `5/20`, 187 direct GDI
+    returns, and 135 batch flushes covering 184 records, and painted `480000/480000` framebuffer
+    pixels with at least 32 colours. All `295/295` gates passed and the sentinel matched. Startup did
+    not issue SSN 202, so the boot is a full non-regression gate while focused LPC tests prove the
+    connected send-only message contract. Snapshot generation 5 committed 1,755,502 bytes, scratch
+    returned to zero, and the census reported no page-table, frame, mapping, alias, registry,
+    untyped-allocation, frame-registration, image-bank, or allocator failure.
+
+    Review adjustment: the typed surface now contains 178 services, the hosted table registers 177
+    numbered variants, and 45 canonical ABI exports remain absent. Remove the synthetic
+    `NtRegisterThreadTerminatePort` (SSN 195) service-loop success next. Registration must validate a
+    real LPC port, attach it to the current thread with the same LIFO and duplicate-registration
+    behavior as NT, and thread teardown must send one kernel-generated `LPC_CLIENT_DIED` message per
+    registration before releasing the thread. Teardown cannot fail back into a user thread, but it
+    must drain every reference and report broker delivery failures rather than silently retaining
+    them. The replacement must delete the literal SSN branch and reuse the existing LPC transport.
