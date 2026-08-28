@@ -58,6 +58,7 @@ pub mod msg_type {
     pub const LPC_REPLY: u16 = 2;
     pub const LPC_DATAGRAM: u16 = 3;
     pub const LPC_PORT_CLOSED: u16 = 5;
+    pub const LPC_CLIENT_DIED: u16 = 6;
     pub const LPC_CONNECTION_REQUEST: u16 = 10;
     pub const LPC_CONNECTION_REFUSED: u16 = 11;
 }
@@ -86,6 +87,8 @@ pub const LPC_QUERY_HANDLE_NAME_MAX_UNITS: usize = 64;
 pub const PORT_MESSAGE_HEADER_LEN: usize = 0x28;
 /// Largest complete native message carried by the current LPC data-frame ABI.
 pub const PORT_MESSAGE_MAX_LEN: usize = 512;
+/// Native x64 `CLIENT_DIED_MSG`: one `PORT_MESSAGE` followed by the thread create time.
+pub const CLIENT_DIED_MESSAGE_LEN: usize = PORT_MESSAGE_HEADER_LEN + core::mem::size_of::<i64>();
 
 /// Validate the length pair at the start of a native x64 `PORT_MESSAGE` and return the complete
 /// message length. `DataLength` may leave alignment padding before `TotalLength`, but it may not
@@ -99,6 +102,20 @@ pub fn port_message_total_length(header: [u8; 4]) -> Option<usize> {
         return None;
     }
     Some(total_length)
+}
+
+/// Build the kernel-generated message sent to every port registered through
+/// `NtRegisterThreadTerminatePort`. The unused `PORT_MESSAGE` identity and callback fields remain
+/// zero, matching `PspExitThread`; the only payload is the terminating thread's creation time.
+pub fn client_died_message(create_time_100ns: i64) -> [u8; CLIENT_DIED_MESSAGE_LEN] {
+    let mut message = [0u8; CLIENT_DIED_MESSAGE_LEN];
+    message[0..2].copy_from_slice(
+        &((CLIENT_DIED_MESSAGE_LEN - PORT_MESSAGE_HEADER_LEN) as u16).to_le_bytes(),
+    );
+    message[2..4].copy_from_slice(&(CLIENT_DIED_MESSAGE_LEN as u16).to_le_bytes());
+    message[4..6].copy_from_slice(&msg_type::LPC_CLIENT_DIED.to_le_bytes());
+    message[PORT_MESSAGE_HEADER_LEN..].copy_from_slice(&create_time_100ns.to_le_bytes());
+    message
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +301,26 @@ mod tests {
         assert_eq!(port_message_total_length([5, 0, 44, 0]), None);
         assert_eq!(port_message_total_length([0, 0, 39, 0]), None);
         assert_eq!(port_message_total_length([0, 0, 1, 2]), None);
+    }
+
+    #[test]
+    fn client_died_message_has_native_header_and_create_time() {
+        let create_time = 0x0123_4567_89ab_cdef_i64;
+        let message = client_died_message(create_time);
+        assert_eq!(message.len(), 48);
+        assert_eq!(u16::from_le_bytes(message[0..2].try_into().unwrap()), 8);
+        assert_eq!(u16::from_le_bytes(message[2..4].try_into().unwrap()), 48);
+        assert_eq!(
+            u16::from_le_bytes(message[4..6].try_into().unwrap()),
+            msg_type::LPC_CLIENT_DIED
+        );
+        assert!(message[6..PORT_MESSAGE_HEADER_LEN]
+            .iter()
+            .all(|byte| *byte == 0));
+        assert_eq!(
+            i64::from_le_bytes(message[PORT_MESSAGE_HEADER_LEN..].try_into().unwrap()),
+            create_time
+        );
     }
 
     #[test]

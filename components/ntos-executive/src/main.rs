@@ -1123,6 +1123,8 @@ pub const SSN_NT_LISTEN_PORT: u64 = 100;
 pub const SSN_NT_REQUEST_WAIT_REPLY_PORT: u64 = 208;
 /// NtReplyPort sends one captured reply without entering a receive wait.
 pub const SSN_NT_REPLY_PORT: u64 = 202;
+/// NtRegisterThreadTerminatePort attaches one referenced LPC port to the current ETHREAD.
+pub const SSN_NT_REGISTER_THREAD_TERMINATE_PORT: u64 = 195;
 /// NtReplyWaitReceivePort — the LPC SERVER receive. lsass' real `AuthPortThreadRoutine` blocks here on
 /// `\LsaAuthenticationPort`; the LSA rendezvous parks it wakeably and resumes it with a real message.
 pub const SSN_NT_REPLY_WAIT_RECEIVE_PORT: u64 = 203;
@@ -17426,6 +17428,48 @@ unsafe fn hosted_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
     thread_wait_state_clear_tid(handler, tid);
 }
 
+/// `PspExitThread` termination-port phase. Every registration owns one logical port reference and
+/// therefore produces one `LPC_CLIENT_DIED` message in reverse registration order. A dying thread
+/// cannot receive an error, so failed sends are diagnosed and the registration is still released.
+unsafe fn notify_thread_termination_ports(tid: u64, handler: &mut ExecNtHandler) {
+    let create_time = handler
+        .pm
+        .thread(tid as nt_process::ThreadId)
+        .map(|thread| thread.create_time_100ns)
+        .unwrap_or(0);
+    let message = nt_lpc_abi::client_died_message(create_time);
+    loop {
+        let port = match handler
+            .pm
+            .pop_thread_termination_port(tid as nt_process::ThreadId)
+        {
+            Ok(Some(port)) => port,
+            Ok(None) | Err(_) => break,
+        };
+        let status = match lpc_client() {
+            Some(lpc) => match lpc.reply_port(port, &message) {
+                Ok(()) => 0,
+                Err(status) => status.raw() as u32,
+            },
+            None => 0xC000_0001,
+        };
+        if status == 0 {
+            LPC_THREAD_TERMINATE_PORT_DELIVERIES.fetch_add(1, Ordering::Relaxed);
+        } else {
+            LPC_THREAD_TERMINATE_PORT_DELIVERY_FAILURES.fetch_add(1, Ordering::Relaxed);
+            if LPC_THREAD_TERMINATE_PORT_FAILURE_TRACE.fetch_add(1, Ordering::Relaxed) < 16 {
+                print_str(b"[thread-term-port] delivery failed tid=");
+                print_u64(tid);
+                print_str(b" port=0x");
+                print_hex_u64(port);
+                print_str(b" status=0x");
+                print_hex(status);
+                print_str(b"\n");
+            }
+        }
+    }
+}
+
 unsafe fn terminate_hosted_thread_mechanism(
     tid: u64,
     delay_queue: &mut nt_delay_execution::Queue,
@@ -17446,6 +17490,7 @@ unsafe fn terminate_hosted_thread_mechanism(
         print_u64(abandoned_mutants);
         print_str(b"\n");
     }
+    notify_thread_termination_ports(tid, handler);
     let tcb = match handler.hosted_thread_tcb(tid) {
         Some(tcb) if tcb > 1 => tcb,
         None => return false,
@@ -23542,6 +23587,10 @@ fn build_nt_table() -> NativeServiceTable {
                 SSN_NT_REQUEST_WAIT_REPLY_PORT as u32,
             ),
             (NativeService::NtReplyPort, SSN_NT_REPLY_PORT as u32),
+            (
+                NativeService::NtRegisterThreadTerminatePort,
+                SSN_NT_REGISTER_THREAD_TERMINATE_PORT as u32,
+            ),
             (NativeService::NtListenPort, SSN_NT_LISTEN_PORT as u32),
             (
                 NativeService::NtReplyWaitReceivePort,
@@ -24987,6 +25036,12 @@ static PM_TERMINATE_THREAD_LIVE: AtomicU64 = AtomicU64::new(0);
 static PM_TERMINATE_THREAD_STATE: AtomicU64 = AtomicU64::new(0);
 static PM_TERMINATE_THREAD_TRACE: AtomicU64 = AtomicU64::new(0);
 static PM_TERMINATE_THREAD_TCB_RECLAIMED: AtomicU64 = AtomicU64::new(0);
+/// Thread termination-port lifecycle counters: successful registrations, client-died messages
+/// accepted by the LPC transport, and delivery failures observed while draining registrations.
+static LPC_THREAD_TERMINATE_PORT_REGISTRATIONS: AtomicU64 = AtomicU64::new(0);
+static LPC_THREAD_TERMINATE_PORT_DELIVERIES: AtomicU64 = AtomicU64::new(0);
+static LPC_THREAD_TERMINATE_PORT_DELIVERY_FAILURES: AtomicU64 = AtomicU64::new(0);
+static LPC_THREAD_TERMINATE_PORT_FAILURE_TRACE: AtomicU64 = AtomicU64::new(0);
 /// Successful current-thread terminations whose bound syscall Reply object was deleted without a
 /// send before the exact caller TCB was suspended/deleted. This is the non-return contract proof.
 static PM_TERMINATE_THREAD_NO_REPLY: AtomicU64 = AtomicU64::new(0);
@@ -31499,6 +31554,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_hex(PM_TERMINATE_PROCESS_NO_REPLY.load(Ordering::Relaxed) as u32);
                     print_str(b" process-no-reply-pis=0x");
                     print_hex(PM_TERMINATE_PROCESS_NO_REPLY_PIS.load(Ordering::Relaxed) as u32);
+                    print_str(b" termination-ports=");
+                    print_u64(
+                        LPC_THREAD_TERMINATE_PORT_REGISTRATIONS.load(Ordering::Relaxed),
+                    );
+                    print_str(b"/");
+                    print_u64(LPC_THREAD_TERMINATE_PORT_DELIVERIES.load(Ordering::Relaxed));
+                    print_str(b"/");
+                    print_u64(
+                        LPC_THREAD_TERMINATE_PORT_DELIVERY_FAILURES.load(Ordering::Relaxed),
+                    );
                     print_str(b")\n");
                     // ITEM 2b — seL4 MECHANISM teardown (reclamation) proven end-to-end on a THROWAWAY
                     // untyped/caps: the kernel's CNodeDelete does full reclamation (TCB suspend, frame-

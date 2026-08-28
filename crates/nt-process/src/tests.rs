@@ -3231,6 +3231,54 @@ fn dbgk_wake_action_maps_every_continue_status_for_both_flavours() {
 }
 
 #[test]
+fn thread_termination_ports_are_bounded_duplicate_preserving_and_lifo() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("client.exe", None, None);
+    let tid = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+
+    let registrations = [0x11, 0x22, 0x11, 0x33];
+    for port in registrations {
+        assert_eq!(pm.register_thread_termination_port(tid, port), Ok(()));
+    }
+    assert_eq!(
+        pm.register_thread_termination_port(tid, 0x44),
+        Err(STATUS_INSUFFICIENT_RESOURCES)
+    );
+
+    assert_eq!(pm.pop_thread_termination_port(tid), Ok(Some(0x33)));
+    assert_eq!(pm.pop_thread_termination_port(tid), Ok(Some(0x11)));
+    assert_eq!(pm.pop_thread_termination_port(tid), Ok(Some(0x22)));
+    assert_eq!(pm.pop_thread_termination_port(tid), Ok(Some(0x11)));
+    assert_eq!(pm.pop_thread_termination_port(tid), Ok(None));
+}
+
+#[test]
+fn thread_termination_port_registration_obeys_thread_lifetime() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("client.exe", None, None);
+    let tid = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+
+    assert_eq!(
+        pm.register_thread_termination_port(tid, 0),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(
+        pm.register_thread_termination_port(tid + 4, 0x11),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    pm.exit_thread(tid, 0).unwrap();
+    assert_eq!(
+        pm.register_thread_termination_port(tid, 0x11),
+        Err(STATUS_THREAD_IS_TERMINATING)
+    );
+    assert_eq!(pm.pop_thread_termination_port(tid), Ok(None));
+    assert_eq!(
+        pm.pop_thread_termination_port(tid + 4),
+        Err(STATUS_INVALID_HANDLE)
+    );
+}
+
+#[test]
 fn dbgk_teardown_releases_every_blocked_reporter() {
     let mut pm = ProcessManager::new();
     let (target, main, debugger, object) = attach_debugger(&mut pm);

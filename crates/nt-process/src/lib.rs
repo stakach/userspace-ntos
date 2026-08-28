@@ -38,10 +38,14 @@ pub const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 pub const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 pub const STATUS_PORT_ALREADY_SET: u32 = 0xC000_0048;
 pub const STATUS_SUSPEND_COUNT_EXCEEDED: u32 = 0xC000_004A;
+pub const STATUS_THREAD_IS_TERMINATING: u32 = 0xC000_004B;
 pub const STATUS_HANDLE_NOT_CLOSABLE: u32 = 0xC000_0235;
 pub const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xC000_00E9;
 pub const STATUS_PROCESS_IS_TERMINATING: u32 = 0xC000_010A;
 pub const SEM_FAILCRITICALERRORS: u32 = 0x0001;
+/// Durable registrations preallocated with each ETHREAD. The executive uses a rewindable syscall
+/// heap, so registration consumes this kernel-owned reserve instead of reallocating during a call.
+pub const THREAD_TERMINATION_PORT_RESERVE: usize = 4;
 
 pub const PROCESS_GENERIC_READ: u32 = 0x0002_0410;
 pub const PROCESS_GENERIC_WRITE: u32 = 0x0002_0BEB;
@@ -717,6 +721,9 @@ pub struct NtThread {
     pub exit_time_100ns: i64,
     pub kernel_time_100ns: i64,
     pub user_time_100ns: i64,
+    /// LPC port objects referenced by `NtRegisterThreadTerminatePort`, in registration order.
+    /// `PspExitThread` drains this as a stack, so duplicates intentionally remain distinct.
+    termination_ports: Vec<u64>,
     /// Active impersonation context. The thread owns a token reference independently of the user
     /// handle that assigned it.
     impersonation: Option<ImpersonationContext>,
@@ -1503,6 +1510,10 @@ impl ProcessManager {
         }
         let affinity_mask = proc.affinity_mask;
         let base_priority = proc.base_priority;
+        let mut termination_ports = Vec::new();
+        termination_ports
+            .try_reserve_exact(THREAD_TERMINATION_PORT_RESERVE)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
         let tid = allocate_client_id(&mut self.next_cid);
         proc.threads.insert(tid);
         if proc.main_thread.is_none() {
@@ -1525,6 +1536,7 @@ impl ProcessManager {
                 exit_time_100ns: 0,
                 kernel_time_100ns: 0,
                 user_time_100ns: 0,
+                termination_ports,
                 impersonation: None,
                 security_descriptor: Vec::from(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..]),
                 suspend_count: 0,
@@ -2325,6 +2337,7 @@ impl ProcessManager {
         thread.exit_time_100ns = 0;
         thread.kernel_time_100ns = 0;
         thread.user_time_100ns = 0;
+        thread.termination_ports.clear();
         thread.suspend_count = create_suspended as u32;
         thread.win32_thread = None;
         thread.teb_base = 0;
@@ -2470,6 +2483,39 @@ impl ProcessManager {
     }
 
     // --- termination + signalling (spec §12.3, §21) --------------------------
+
+    /// Attach a referenced LPC port object to the current ETHREAD. Registrations are intentionally
+    /// not deduplicated: NT allocates one termination record per call and later delivers them LIFO.
+    /// Capacity is reserved when the thread object is created so this mutation is safe under a
+    /// rewindable syscall allocator.
+    pub fn register_thread_termination_port(
+        &mut self,
+        tid: ThreadId,
+        port: u64,
+    ) -> Result<(), u32> {
+        if port == 0 {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        if thread.state == ThreadState::Terminated {
+            return Err(STATUS_THREAD_IS_TERMINATING);
+        }
+        if thread.termination_ports.len() == thread.termination_ports.capacity() {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        thread.termination_ports.push(port);
+        Ok(())
+    }
+
+    /// Remove the most recently registered termination port. Teardown calls this until `None`,
+    /// which both enforces native LIFO delivery and releases every retained registration exactly
+    /// once even when delivery itself fails.
+    pub fn pop_thread_termination_port(&mut self, tid: ThreadId) -> Result<Option<u64>, u32> {
+        self.threads
+            .get_mut(&tid)
+            .map(|thread| thread.termination_ports.pop())
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
 
     /// `NtTerminateThread` (spec §21.1): set the exit status, mark terminated (signalled), and if
     /// this was the last non-system thread, initiate process exit.

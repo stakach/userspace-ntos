@@ -672,6 +672,18 @@ fn reply_port_registers_with_exact_contract() {
 }
 
 #[test]
+fn register_thread_terminate_port_registers_with_exact_contract() {
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtRegisterThreadTerminatePort, 195)],
+    );
+    let entry = table.lookup(195).unwrap();
+    assert_eq!(entry.service, NativeService::NtRegisterThreadTerminatePort);
+    assert_eq!((entry.min_args, entry.max_args), (1, 1));
+    assert_eq!(entry.service.name(), "NtRegisterThreadTerminatePort");
+}
+
+#[test]
 fn reactos_global_atom_family_registers_with_exact_contracts() {
     let pairs = [
         (NativeService::NtAddAtom, 8u32),

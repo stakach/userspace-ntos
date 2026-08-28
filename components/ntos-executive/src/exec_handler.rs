@@ -29669,6 +29669,25 @@ impl ExecNtHandler {
                     Err(status) => status.raw() as u32,
                 }
             },
+            NativeService::NtRegisterThreadTerminatePort => unsafe {
+                let Some(lpc) = lpc_client() else {
+                    return STATUS_UNSUCCESSFUL;
+                };
+                if let Err(status) = lpc.query_handle(args[0]) {
+                    return status.raw() as u32;
+                }
+                match self.pm.register_thread_termination_port(
+                    self.current_tid as nt_process::ThreadId,
+                    args[0],
+                ) {
+                    Ok(()) => {
+                        LPC_THREAD_TERMINATE_PORT_REGISTRATIONS
+                            .fetch_add(1, Ordering::Relaxed);
+                        nt_syscall::STATUS_SUCCESS
+                    }
+                    Err(status) => status,
+                }
+            }
             NativeService::NtListenPort => unsafe {
                 self.lpc_receive_or_park(args[0], 0, 0, args[1], true)
             },

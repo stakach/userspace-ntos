@@ -10224,13 +10224,6 @@ pub(crate) unsafe fn service_sec_image(
                 // modeled; SUCCESS is the "no shim needed" answer. (BasepShimCacheCheckBypass is a
                 // hardcoded FALSE in ReactOS, so this single SUCCESS short-circuits the whole path.)
                 result = 0;
-            } else if m0 == 195 {
-                // NtRegisterThreadTerminatePort(PortHandle=R10). kernel32's CsrNewThread() — the LAST
-                // step of BaseDllInitialize after the CSR connect — registers the thread's LPC
-                // terminate port (so CSR is told when the thread dies). No terminate-port model in the
-                // host → accept it (STATUS_SUCCESS) so winlogon's kernel32 DllMain completes + the
-                // loader runs the remaining DllMains toward winlogon's entry.
-                result = 0;
             } else if m0 >= win32k_subsystem::WIN32K_SERVICE_BASE
                 && (hosted_non_native_top_level_badge(&nt_handler, badge)
                     || is_wl_worker

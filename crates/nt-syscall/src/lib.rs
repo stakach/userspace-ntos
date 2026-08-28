@@ -134,6 +134,7 @@ pub enum NativeService {
     NtQueryInformationThread,
     NtIsProcessInJob,
     NtQueueApcThread,
+    NtRegisterThreadTerminatePort,
     // Security / token (§16.7)
     NtOpenProcessToken,
     NtOpenProcessTokenEx,
@@ -355,6 +356,7 @@ impl NativeService {
             NtQueryInformationThread => "NtQueryInformationThread",
             NtIsProcessInJob => "NtIsProcessInJob",
             NtQueueApcThread => "NtQueueApcThread",
+            NtRegisterThreadTerminatePort => "NtRegisterThreadTerminatePort",
             NtOpenProcessToken => "NtOpenProcessToken",
             NtOpenProcessTokenEx => "NtOpenProcessTokenEx",
             NtDuplicateToken => "NtDuplicateToken",
@@ -650,6 +652,7 @@ impl NativeService {
         NativeService::NtAccessCheckByTypeResultList,
         NativeService::NtMakePermanentObject,
         NativeService::NtReplyPort,
+        NativeService::NtRegisterThreadTerminatePort,
     ];
 }
 
