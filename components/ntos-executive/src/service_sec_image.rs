@@ -1582,12 +1582,31 @@ pub(crate) unsafe fn service_generic_section_writeback_view(
     let Some(section) = generic_sections.section(view.section_index) else {
         return Err(nt_fs::STATUS_INVALID_HANDLE);
     };
+    service_generic_section_writeback_plan(
+        generic_sections,
+        GenericSectionFlushPlan {
+            view,
+            section,
+            base: view.base,
+            size: view.size,
+            section_offset: view.section_offset,
+        },
+        scratch_base,
+    )
+}
+
+pub(crate) unsafe fn service_generic_section_writeback_plan(
+    generic_sections: &mut GenericSectionTable,
+    plan: GenericSectionFlushPlan,
+    scratch_base: u64,
+) -> Result<u64, u32> {
+    let section = plan.section;
     if !generic_section_writes_back(section) {
         return Ok(0);
     }
     let mut written_total = 0u64;
     while let Some((page_index, frame, file_offset, len)) =
-        generic_sections.next_dirty_page_for_view(view, section)
+        generic_sections.next_dirty_page_for_flush(plan)
     {
         match service_generic_section_writeback_page(
             section.backing.overlay_file_id,
@@ -1597,7 +1616,7 @@ pub(crate) unsafe fn service_generic_section_writeback_view(
             scratch_base,
         ) {
             Ok(written) => {
-                let _ = generic_sections.clear_page_dirty(view.section_index, page_index);
+                let _ = generic_sections.clear_page_dirty(plan.view.section_index, page_index);
                 GENERIC_SECTION_WRITEBACKS.fetch_add(1, Ordering::Relaxed);
                 GENERIC_SECTION_WRITEBACK_BYTES.fetch_add(written as u64, Ordering::Relaxed);
                 written_total = written_total.saturating_add(written as u64);

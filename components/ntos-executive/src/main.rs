@@ -97,10 +97,10 @@ use nt_lpc_abi::LpcReply;
 use nt_lpc_client::LpcClient;
 pub(crate) use nt_memory_manager::{
     ClientFrameInsert, ClientFrameRecord, ClientFrameRegistry, ClientFrameRegistryStats,
-    GenericSection, GenericSectionBacking, GenericSectionTable, GenericSectionTableStats,
-    GenericSectionView, GENERIC_SECTION_BACKING_ANON, GENERIC_SECTION_BACKING_DISK,
-    GENERIC_SECTION_BACKING_OVERLAY, SECTION_ATTR_SEC_COMMIT, SECTION_ATTR_SEC_FILE,
-    SECTION_ATTR_SEC_IMAGE, SECTION_ATTR_SEC_RESERVE,
+    GenericSection, GenericSectionBacking, GenericSectionFlushPlan, GenericSectionTable,
+    GenericSectionTableStats, GenericSectionView, GENERIC_SECTION_BACKING_ANON,
+    GENERIC_SECTION_BACKING_DISK, GENERIC_SECTION_BACKING_OVERLAY, SECTION_ATTR_SEC_COMMIT,
+    SECTION_ATTR_SEC_FILE, SECTION_ATTR_SEC_IMAGE, SECTION_ATTR_SEC_RESERVE,
 };
 use nt_object_abi::ObReply;
 use nt_object_client::ObjectClient;
@@ -947,6 +947,8 @@ const _: () = {
 
 /// ntdll's NtAllocateVirtualMemory system-service number (from its export stub).
 pub const SSN_NT_ALLOCATE_VM: u64 = 0x12;
+/// NtFlushVirtualMemory flushes dirty pages from one mapped data-file view.
+pub const SSN_NT_FLUSH_VM: u64 = 84;
 /// ReactOS x64 `ntoskrnl/sysfuncs.lst` zero-based service numbers for the global atom family.
 pub const SSN_NT_ADD_ATOM: u64 = 8;
 pub const SSN_NT_DELETE_ATOM: u64 = 62;
@@ -2664,12 +2666,7 @@ impl ObjectWaiterTable {
             .find(|(_, entry)| entry.is_live() && entry.alertable && entry.tid == tid)
     }
 
-    fn take_exact(
-        &mut self,
-        slot: usize,
-        tid: u64,
-        reply_cap: u64,
-    ) -> Option<ObjectWaiterRecord> {
+    fn take_exact(&mut self, slot: usize, tid: u64, reply_cap: u64) -> Option<ObjectWaiterRecord> {
         let entry = self.entries.get_mut(slot)?;
         if !entry.is_live() || entry.tid != tid || entry.reply_cap != reply_cap {
             return None;
@@ -16556,11 +16553,7 @@ fn object_waiter_alertable_for_tid(tid: u64) -> Option<(usize, ObjectWaiterRecor
     unsafe { (&*core::ptr::addr_of!(OBJECT_WAITERS)).alertable_for_tid(tid) }
 }
 
-fn object_waiter_take_exact(
-    slot: usize,
-    tid: u64,
-    reply_cap: u64,
-) -> Option<ObjectWaiterRecord> {
+fn object_waiter_take_exact(slot: usize, tid: u64, reply_cap: u64) -> Option<ObjectWaiterRecord> {
     unsafe { (&mut *core::ptr::addr_of_mut!(OBJECT_WAITERS)).take_exact(slot, tid, reply_cap) }
 }
 
@@ -23581,10 +23574,7 @@ fn build_nt_table() -> NativeServiceTable {
                 NativeService::NtDuplicateToken,
                 SSN_NT_DUPLICATE_TOKEN as u32,
             ),
-            (
-                NativeService::NtFilterToken,
-                SSN_NT_FILTER_TOKEN as u32,
-            ),
+            (NativeService::NtFilterToken, SSN_NT_FILTER_TOKEN as u32),
             (NativeService::NtCreateToken, SSN_NT_CREATE_TOKEN as u32),
             (NativeService::NtAccessCheck, SSN_NT_ACCESS_CHECK as u32),
             (
@@ -23603,6 +23593,7 @@ fn build_nt_table() -> NativeServiceTable {
                 NativeService::NtMakePermanentObject,
                 SSN_NT_MAKE_PERMANENT_OBJECT as u32,
             ),
+            (NativeService::NtFlushVirtualMemory, SSN_NT_FLUSH_VM as u32),
             (NativeService::NtFreeVirtualMemory, SSN_NT_FREE_VM as u32),
             (NativeService::NtReadVirtualMemory, SSN_NT_READ_VM as u32),
             (NativeService::NtWriteVirtualMemory, SSN_NT_WRITE_VM as u32),

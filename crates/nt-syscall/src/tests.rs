@@ -722,6 +722,21 @@ fn group_a_services_register_with_exact_bounds() {
 }
 
 #[test]
+fn flush_virtual_memory_keeps_its_native_four_argument_contract() {
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtFlushVirtualMemory, 84)],
+    );
+    let entry = table.lookup(84).unwrap();
+    assert_eq!(entry.service, NativeService::NtFlushVirtualMemory);
+    assert_eq!((entry.min_args, entry.max_args), (4, 4));
+    assert_eq!(
+        table.number_of(NativeService::NtFlushVirtualMemory),
+        Some(84)
+    );
+}
+
+#[test]
 fn virtual_memory_copy_services_use_exact_native_contracts() {
     let pairs = [
         (NativeService::NtFreeVirtualMemory, 87u32, 4u8),

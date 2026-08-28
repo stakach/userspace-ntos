@@ -11167,9 +11167,7 @@ impl ExecNtHandler {
         let wait_all = wait_type == 0;
         if wait_all {
             for left in 0..count {
-                if self.wait_park_objects[left + 1..count]
-                    .contains(&self.wait_park_objects[left])
-                {
+                if self.wait_park_objects[left + 1..count].contains(&self.wait_park_objects[left]) {
                     return STATUS_INVALID_PARAMETER_MIX;
                 }
             }
@@ -16815,6 +16813,80 @@ impl ExecNtHandler {
         }
     }
 
+    unsafe fn nt_flush_virtual_memory(&mut self, args: &[u64]) -> u32 {
+        const PROCESS_VM_OPERATION: u32 = 0x0008;
+        const STATUS_INVALID_PARAMETER_2: u32 = 0xC000_00F0;
+        let base_ptr = args.get(1).copied().unwrap_or(0);
+        let size_ptr = args.get(2).copied().unwrap_or(0);
+        let iosb = args.get(3).copied().unwrap_or(0);
+        if base_ptr & 7 != 0 || size_ptr & 7 != 0 || iosb & 7 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        if !self.probe_user_output(base_ptr, 8)
+            || !self.probe_user_output(size_ptr, 8)
+            || !self.probe_user_output(iosb, 16)
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let mut word = [0u8; 8];
+        if !self.xas_read(base_ptr, &mut word) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let base = u64::from_le_bytes(word);
+        if !self.xas_read(size_ptr, &mut word) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let size = u64::from_le_bytes(word);
+        if base > HIGHEST_USER_ADDRESS
+            || size > HIGHEST_USER_ADDRESS.saturating_add(1).saturating_sub(base)
+        {
+            return STATUS_INVALID_PARAMETER_2;
+        }
+
+        let (target_pid, target_pi) =
+            match self.resolve_process_for_access(args[0], PROCESS_VM_OPERATION) {
+                Ok(target) => target,
+                Err(status) => return status,
+            };
+        if self.pm.process(target_pid).is_some_and(|process| {
+            matches!(
+                process.state,
+                nt_process::ProcessState::Exiting | nt_process::ProcessState::Terminated
+            )
+        }) {
+            return nt_process::STATUS_PROCESS_IS_TERMINATING;
+        }
+        let Some(ctx) = self.loop_ctx else {
+            return STATUS_INVALID_HANDLE;
+        };
+        let generic_sections = &mut *ctx.generic_sections;
+        let plan = match generic_sections.plan_flush(target_pi, base, size) {
+            Ok(plan) => plan,
+            Err(status) => return status,
+        };
+        let (status, information) = match service_generic_section_writeback_plan(
+            generic_sections,
+            plan,
+            ctx.scratch_base,
+        ) {
+            Ok(written) => {
+                if written != 0 {
+                    self.writable_fs_dirty = true;
+                }
+                (0, plan.size)
+            }
+            Err(status) => (status, 0),
+        };
+
+        if !self.xas_try_write_buf(base_ptr, &plan.base.to_le_bytes())
+            || !self.xas_try_write_buf(size_ptr, &plan.size.to_le_bytes())
+            || !self.write_current_iosb(iosb, status, information)
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        status
+    }
+
     unsafe fn nt_free_virtual_memory(&mut self, args: &[u64]) -> u32 {
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
         const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
@@ -17896,12 +17968,8 @@ impl ExecNtHandler {
             nt_security::ProcessorMode::UserMode
         };
         let all_necessary = control & nt_security::se_exports::PRIVILEGE_SET_ALL_NECESSARY != 0;
-        let passed = nt_security::check_token_privileges(
-            token,
-            &mut required[..count],
-            all_necessary,
-            mode,
-        );
+        let passed =
+            nt_security::check_token_privileges(token, &mut required[..count], all_necessary, mode);
 
         let mut output = [0u8; MAX_PRIVILEGES * ENTRY_SIZE];
         for (index, entry) in required[..count].iter().enumerate() {
@@ -19113,10 +19181,7 @@ impl ExecNtHandler {
                 return STATUS_INSUFFICIENT_RESOURCES;
             }
             for (luid, attributes) in captured {
-                requested.push(nt_security::PrivilegeAdjustment {
-                    luid,
-                    attributes,
-                });
+                requested.push(nt_security::PrivilegeAdjustment { luid, attributes });
             }
         }
 
@@ -19305,13 +19370,11 @@ impl ExecNtHandler {
         let information_class = nt_ulong_arg(args[1]);
         let information = args[2];
         let information_length = nt_ulong_arg(args[3]) as usize;
-        let plan = match nt_security::plan_token_information_set(
-            information_class,
-            information_length,
-        ) {
-            Ok(plan) => plan,
-            Err(status) => return status,
-        };
+        let plan =
+            match nt_security::plan_token_information_set(information_class, information_length) {
+                Ok(plan) => plan,
+                Err(status) => return status,
+            };
         if information & 3 != 0 {
             return STATUS_DATATYPE_MISALIGNMENT;
         }
@@ -19334,7 +19397,10 @@ impl ExecNtHandler {
                     Ok(owner) => owner,
                     Err(status) => return status,
                 };
-                self.token_store.set_owner(token_id, owner).err().unwrap_or(0)
+                self.token_store
+                    .set_owner(token_id, owner)
+                    .err()
+                    .unwrap_or(0)
             }
             PrimaryGroup => {
                 let primary_group = match nt_security::capture_sid(
@@ -19407,27 +19473,21 @@ impl ExecNtHandler {
                 let mut entries = [(0u32, 0u8); nt_security::TOKEN_AUDIT_CATEGORY_COUNT];
                 for (index, entry) in entries[..count].iter_mut().enumerate() {
                     let mut bytes = [0u8; AUDIT_POLICY_ENTRY_SIZE];
-                    let Some(entry_address) = information
-                        .checked_add(4)
-                        .and_then(|address| {
-                            address.checked_add((index * AUDIT_POLICY_ENTRY_SIZE) as u64)
-                        })
-                    else {
+                    let Some(entry_address) = information.checked_add(4).and_then(|address| {
+                        address.checked_add((index * AUDIT_POLICY_ENTRY_SIZE) as u64)
+                    }) else {
                         return STATUS_ACCESS_VIOLATION;
                     };
                     if !self.xas_read(entry_address, &mut bytes) {
                         return STATUS_ACCESS_VIOLATION;
                     }
-                    *entry = (
-                        u32::from_le_bytes(bytes[..4].try_into().unwrap()),
-                        bytes[4],
-                    );
+                    *entry = (u32::from_le_bytes(bytes[..4].try_into().unwrap()), bytes[4]);
                 }
-                let audit_policy = match nt_security::TokenAuditPolicy::from_entries(&entries[..count])
-                {
-                    Ok(policy) => policy,
-                    Err(status) => return status,
-                };
+                let audit_policy =
+                    match nt_security::TokenAuditPolicy::from_entries(&entries[..count]) {
+                        Ok(policy) => policy,
+                        Err(status) => return status,
+                    };
                 if !self.current_token_has_privilege(nt_security::SE_TCB) {
                     return STATUS_PRIVILEGE_NOT_HELD;
                 }
@@ -23158,12 +23218,7 @@ impl ExecNtHandler {
         Ok(())
     }
 
-    fn finish_local_file_io(
-        &mut self,
-        file_object: u64,
-        synchronous: bool,
-        event_obj_idx: u64,
-    ) {
+    fn finish_local_file_io(&mut self, file_object: u64, synchronous: bool, event_obj_idx: u64) {
         if synchronous || event_obj_idx == u64::MAX {
             let result = self.signal_local_file_completion(file_object);
             assert_eq!(result, nt_fs::STATUS_SUCCESS);
@@ -23222,11 +23277,7 @@ impl ExecNtHandler {
             completed_inline,
             completion_port_suppressed,
         );
-        self.finish_local_file_io(
-            file_object,
-            synchronous,
-            event_obj_idx,
-        );
+        self.finish_local_file_io(file_object, synchronous, event_obj_idx);
     }
 
     unsafe fn local_directory_notify_route_for(
@@ -30828,9 +30879,7 @@ impl ExecNtHandler {
             // NtMakeTemporaryObject(ObjectHandle): reference the object with DELETE access, clear
             // OBJ_PERMANENT, and run the normal name-delete check.
             NativeService::NtMakeTemporaryObject => self.nt_make_temporary_object(args[0]),
-            NativeService::NtMakePermanentObject => {
-                self.nt_make_permanent_object(ctx, args[0])
-            },
+            NativeService::NtMakePermanentObject => self.nt_make_permanent_object(ctx, args[0]),
             // NtCreateKeyedEvent(*OutHandle, AccessMask, ObjectAttributes, Flags). ReactOS'
             // RtlpInitializeKeyedEvent ignores the returned status and later asserts that its
             // process-global keyed-event handle is non-NULL, so success must publish a real handle.
@@ -31259,6 +31308,7 @@ impl ExecNtHandler {
                 }
             },
             NativeService::NtFreeVirtualMemory => unsafe { self.nt_free_virtual_memory(args) },
+            NativeService::NtFlushVirtualMemory => unsafe { self.nt_flush_virtual_memory(args) },
             NativeService::NtReadVirtualMemory => unsafe {
                 self.nt_copy_virtual_memory(args, true)
             },
@@ -31929,8 +31979,7 @@ impl ExecNtHandler {
                     }
                     6 => {
                         // TOKEN_DEFAULT_DACL: null pointer or in-buffer lossless native ACL.
-                        nt_security::encode_token_default_dacl(token, buf, &mut [])
-                            .required_length
+                        nt_security::encode_token_default_dacl(token, buf, &mut []).required_length
                     }
                     7 => 16,
                     8 => 4,
@@ -32001,9 +32050,7 @@ impl ExecNtHandler {
                         output[..8].copy_from_slice(&buf.wrapping_add(8).to_le_bytes());
                         token.primary_group.write_native(&mut output[8..]).is_some()
                     }
-                    6 => {
-                        nt_security::encode_token_default_dacl(token, buf, &mut output).written
-                    }
+                    6 => nt_security::encode_token_default_dacl(token, buf, &mut output).written,
                     7 => {
                         let source = match self.token_store.source(token_id) {
                             Some(source) => source,
@@ -32035,10 +32082,8 @@ impl ExecNtHandler {
                         output[..4].copy_from_slice(&token.session_id.to_le_bytes());
                         true
                     }
-                    13 => {
-                        nt_security::encode_token_groups_and_privileges(token, buf, &mut output)
-                            .is_ok_and(|encoded| encoded.written)
-                    }
+                    13 => nt_security::encode_token_groups_and_privileges(token, buf, &mut output)
+                        .is_ok_and(|encoded| encoded.written),
                     15 => {
                         output[..4].copy_from_slice(&u32::from(token.sandbox_inert).to_le_bytes());
                         true
@@ -32536,12 +32581,10 @@ impl ExecNtHandler {
                 if !self.xas_read(link_target, &mut descriptor) {
                     return STATUS_ACCESS_VIOLATION;
                 }
-                let maximum_length =
-                    u16::from_le_bytes([descriptor[2], descriptor[3]]) as usize;
+                let maximum_length = u16::from_le_bytes([descriptor[2], descriptor[3]]) as usize;
                 let buffer = u64::from_le_bytes(descriptor[8..16].try_into().unwrap());
                 if (maximum_length != 0
-                    && (buffer & 1 != 0
-                        || !self.probe_user_output(buffer, maximum_length)))
+                    && (buffer & 1 != 0 || !self.probe_user_output(buffer, maximum_length)))
                     || (result_length != 0 && !self.probe_user_output(result_length, 4))
                 {
                     return STATUS_ACCESS_VIOLATION;
@@ -32567,18 +32610,15 @@ impl ExecNtHandler {
                     {
                         return STATUS_ACCESS_VIOLATION;
                     }
-                    if !self
-                        .xas_try_write_buf(link_target, &(required_length as u16).to_le_bytes())
+                    if !self.xas_try_write_buf(link_target, &(required_length as u16).to_le_bytes())
                     {
                         return STATUS_ACCESS_VIOLATION;
                     }
                     status = 0;
                 }
                 if result_length != 0
-                    && !self.xas_try_write_buf(
-                        result_length,
-                        &(required_length as u32).to_le_bytes(),
-                    )
+                    && !self
+                        .xas_try_write_buf(result_length, &(required_length as u32).to_le_bytes())
                 {
                     return STATUS_ACCESS_VIOLATION;
                 }
@@ -33045,11 +33085,7 @@ impl ExecNtHandler {
                         };
                         if let Some(index) = event_index {
                             if self.events.set_existing(index as u64).is_none() {
-                                self.finish_local_file_io(
-                                    file_object,
-                                    synchronous,
-                                    index as u64,
-                                );
+                                self.finish_local_file_io(file_object, synchronous, index as u64);
                                 return nt_fs::STATUS_INVALID_HANDLE;
                             }
                             let _ = wait_wake_dispatcher(self, None);
@@ -33117,8 +33153,7 @@ impl ExecNtHandler {
                 );
                 encoded.fill(0);
                 let synchronous = open.create_options
-                    & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT
-                        | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
+                    & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
                     != 0;
                 let file_object = LOCAL_FAT_DIRECTORY_OBJECT_TAG | object_id as u64;
                 let result = {
@@ -35204,12 +35239,13 @@ impl ExecNtHandler {
                                                     self.pm_pid_for_pi(self.pi).unwrap() as u64,
                                                     key_value,
                                                 );
-                                                let lock_status = self.byte_range_locks.check_write(
-                                                    route.file_id,
-                                                    owner,
-                                                    actual_offset,
-                                                    len as u64,
-                                                );
+                                                let lock_status =
+                                                    self.byte_range_locks.check_write(
+                                                        route.file_id,
+                                                        owner,
+                                                        actual_offset,
+                                                        len as u64,
+                                                    );
                                                 if lock_status != nt_fs::STATUS_SUCCESS {
                                                     lock_status
                                                 } else {
@@ -35402,11 +35438,7 @@ impl ExecNtHandler {
                 }
                 if let Some((file_object, synchronous)) = local_file_io.take() {
                     assert_ne!(status, STATUS_PENDING, "local write unexpectedly pended");
-                    self.finish_local_file_io(
-                        file_object,
-                        synchronous,
-                        event_obj_idx,
-                    );
+                    self.finish_local_file_io(file_object, synchronous, event_obj_idx);
                 }
                 // A dispatched write may have queued bytes or freed peer queue capacity even when
                 // its own IRP remains pending. The service loop uses this only as an endpoint
@@ -35636,9 +35668,8 @@ impl ExecNtHandler {
                                                             route.file_object,
                                                             route.synchronous,
                                                         ));
-                                                        let lock_status = self
-                                                            .byte_range_locks
-                                                            .check_read(
+                                                        let lock_status =
+                                                            self.byte_range_locks.check_read(
                                                                 route.file_id,
                                                                 nt_fs::ByteRangeLockOwner::new(
                                                                     route.file_object,
@@ -35713,18 +35744,15 @@ impl ExecNtHandler {
                                                 let explicit = (!resolved
                                                     .advances_current_position())
                                                 .then_some(actual_offset);
-                                                match self
-                                                    .begin_local_file_io(route.file_object)
-                                                {
+                                                match self.begin_local_file_io(route.file_object) {
                                                     Err(status) => status,
                                                     Ok(()) => {
                                                         local_file_io = Some((
                                                             route.file_object,
                                                             route.synchronous,
                                                         ));
-                                                        let lock_status = self
-                                                            .byte_range_locks
-                                                            .check_read(
+                                                        let lock_status =
+                                                            self.byte_range_locks.check_read(
                                                                 route.file_id,
                                                                 nt_fs::ByteRangeLockOwner::new(
                                                                     route.file_object,
@@ -35743,7 +35771,8 @@ impl ExecNtHandler {
                                                                 core::slice::from_raw_parts_mut(
                                                                     core::ptr::addr_of_mut!(
                                                                         OVERLAY_WRITE_SCRATCH
-                                                                    ) as *mut u8,
+                                                                    )
+                                                                        as *mut u8,
                                                                     OVERLAY_IO_CAP,
                                                                 );
                                                             let (status, read) =
