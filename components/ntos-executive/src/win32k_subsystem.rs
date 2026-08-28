@@ -3400,11 +3400,11 @@ const STATUS_OBJECT_TYPE_MISMATCH: i32 = 0xC000_0024u32 as i32;
 ///  - `Event` (`ExEventObjectType`) — winsrv's power/media request events, modeled as real `KEVENT`
 ///    objects when `NtUserInitialize` receives their handles (see [`register_event_object`]).
 ///
-/// The only unregistered process handles we resolve are win32k's narrow process-connect handle
-/// ([`FAKE_PROCESS_HANDLE`]) and `NtCurrentProcess()`'s pseudo handle, both to the selected dispatch
-/// EPROCESS. Every other typed reference to an unregistered handle is enforced honestly
-/// (`STATUS_OBJECT_TYPE_MISMATCH`); the service side must rewrite real process handles only after
-/// resolving them through ProcessManager.
+/// The only unregistered handles resolved here are win32k's narrow process-connect handle and NT's
+/// current-process/current-thread pseudo handles. They resolve to the EPROCESS/ETHREAD selected by
+/// the live dispatch context and still enforce the caller's expected object type. Every other typed
+/// reference to an unregistered handle fails visibly; the service side must rewrite real handles
+/// only after resolving them through ProcessManager.
 extern "win64" fn s_ob_reference_object_by_handle(
     handle: u64,
     _access: u64,
@@ -3435,6 +3435,7 @@ extern "win64" fn s_ob_reference_object_by_handle(
         }
         None => {
             let process_ty = nt_object_manager::object_type::process_object_type_addr();
+            let thread_ty = nt_object_manager::object_type::thread_object_type_addr();
             if handle == FAKE_PROCESS_HANDLE {
                 // win32k's process-connect handle → the current EPROCESS; enforce a specific
                 // ExpectedType against PsProcessType (NULL is polymorphic).
@@ -3446,6 +3447,9 @@ extern "win64" fn s_ob_reference_object_by_handle(
             } else if handle == 0xFFFF_FFFF_FFFF_FFFF && (obj_type == 0 || obj_type == process_ty) {
                 // NtCurrentProcess() pseudo handle → selected dispatch EPROCESS.
                 (unsafe { current_eprocess() }, u32::MAX)
+            } else if handle == 0xFFFF_FFFF_FFFF_FFFE && (obj_type == 0 || obj_type == thread_ty) {
+                // NtCurrentThread() pseudo handle → selected dispatch ETHREAD.
+                (unsafe { current_ethread() }, u32::MAX)
             } else {
                 // Every modeled typed object resolves above; reaching here is a real object-manager
                 // requirement we do not model, so fail visibly.
