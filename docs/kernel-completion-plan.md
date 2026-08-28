@@ -15476,3 +15476,41 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the owning section/cache path, update the caller's base-address and region-size outputs with the
     actual page-aligned range, preserve private-page semantics, propagate backing-store errors, and
     reject invalid or unmapped ranges without treating a cache checkpoint as syscall success.
+
+    `NtFlushVirtualMemory` (2026-08-29, accepted): SSN 84 is now a typed registered four-argument
+    service with no numeric branch or fallback. `nt-memory-manager` owns the immutable flush plan:
+    it resolves exactly one process data-file view, rounds the returned base and extent to host-page
+    boundaries, expands zero length from the supplied address to the view's end, rejects overflow,
+    anonymous/private mappings, unmapped addresses, and ranges crossing a view boundary, and limits
+    dirty-page enumeration to that plan.
+
+    The executive probes and captures all three in/out structures before mutation, resolves the
+    target with `PROCESS_VM_OPERATION`, rejects a terminating process, and sends only the selected
+    dirty mapped pages through that section's own overlay-file writeback path. Backing write and
+    flush errors are returned as the syscall and `IO_STATUS_BLOCK` status; success publishes the
+    actual aligned base and size and reports that size as `Information`. Clean disk-backed data views
+    succeed without a synthetic global checkpoint, while non-file and unrelated mappings fail as
+    `STATUS_NOT_MAPPED_VIEW`.
+
+    Focused validation passes `nt-memory-manager` `17/17`, `nt-syscall` `66/66`, `git diff
+    --check`, the freestanding executive at the established 212-warning baseline, and the release
+    build/staging path. Reusable range checkpoint `3fcbce81` and syscall checkpoint `26d05974` are
+    pushed. Serialized acceptance `.tmp/run-headless-flush-virtual-memory-20260829.log` reached the
+    final gate at 113,127 ms, launched genuine userinit and Explorer, completed 669 Explorer api0
+    redirects with zero callback or dead-callback failures, recorded paint begin/end `5/20`, 187
+    direct GDI returns, and 135 batch flushes covering 184 records, and painted `480000/480000`
+    framebuffer pixels with at least 32 colours. All `295/295` gates passed and the sentinel matched.
+    Startup did not issue SSN 84, so the boot is a full non-regression gate while focused tests prove
+    direct alignment, zero-length, containment, backing-type, and dirty-page selection behavior.
+    Snapshot generation 5 committed 1,755,502 bytes, scratch returned to zero, and the census
+    reported no page-table, frame, mapping, alias, registry, untyped-allocation, frame-registration,
+    image-bank, or allocator failure.
+
+    Review adjustment: the typed surface now contains 177 services, the hosted table registers 176
+    numbered variants, and 46 canonical ABI exports remain absent. Audit the paired
+    `NtLockVirtualMemory` (SSN 106) and `NtUnlockVirtualMemory` (SSN 276) boundary next. The reusable
+    VM model must own page-aligned locked-range accounting, distinguish `MAP_PROCESS` from the
+    privileged `MAP_SYSTEM` working-set class, fault committed pages resident through the normal
+    demand path, and prevent locked frames from entering mapped-view or private-page reclamation.
+    Unlock must remove only the requested class/range and return native partial/not-locked failures;
+    neither call may be reduced to a successful probe-only no-op.
