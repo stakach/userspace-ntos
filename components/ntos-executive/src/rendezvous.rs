@@ -1517,6 +1517,21 @@ fn copy_csr_broker_message(
     ))
 }
 
+/// Validate one kernel `LpcRequestPort` frame queued for CSR. The request-port contract admits the
+/// four kernel message types from `LPC_DATAGRAM` through `LPC_CLIENT_DIED`; the broker-reported type
+/// and the wire header must still agree exactly.
+fn copy_csr_broker_kernel_message(
+    received: &nt_lpc_client::ReceiveResult,
+    destination: &mut [u8],
+) -> Option<(usize, u64, u64)> {
+    if !(nt_lpc_abi::msg_type::LPC_DATAGRAM..=nt_lpc_abi::msg_type::LPC_CLIENT_DIED)
+        .contains(&received.msg_type)
+    {
+        return None;
+    }
+    copy_csr_broker_message(received, destination, received.msg_type)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn csr_api_request_rendezvous(
     client_port: u64,
@@ -1599,11 +1614,9 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                 return false;
             }
         };
-        let Some((total, client_pid, client_tid)) = copy_csr_broker_message(
-            &received,
-            &mut request,
-            nt_lpc_abi::msg_type::LPC_CLIENT_DIED,
-        ) else {
+        let Some((total, client_pid, client_tid)) =
+            copy_csr_broker_kernel_message(&received, &mut request)
+        else {
             CSR_KERNEL_MESSAGE_FAILURES.fetch_add(1, Ordering::Relaxed);
             CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
             return false;
@@ -2185,10 +2198,9 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                             match received {
                                 Some(Ok(received)) => {
                                     let mut next_message = [0u8; CSR_API_MSG_MAX];
-                                    let Some((total, _, _)) = copy_csr_broker_message(
+                                    let Some((total, _, _)) = copy_csr_broker_kernel_message(
                                         &received,
                                         &mut next_message,
-                                        nt_lpc_abi::msg_type::LPC_CLIENT_DIED,
                                     ) else {
                                         CSR_KERNEL_MESSAGE_FAILURES.fetch_add(1, Ordering::Relaxed);
                                         return false;

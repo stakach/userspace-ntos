@@ -243,9 +243,9 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("SeLockSubjectContext", Partial, "subject-context/privilege checks routed to nt-security"),
     e("SePrivilegeCheck", Partial, "subject-context/privilege checks routed to nt-security"),
     // --- Lpc ---
-    e("LpcRequestWaitReplyPort", TrapIfCalled, "LPC ports are Phase 4; traps until the port layer exists"),
-    e("LpcRequestPort", TrapIfCalled, "LPC ports are Phase 4; traps until the port layer exists"),
-    e("LpcPortObjectType", Partial, "data export: LPC port object-type pointer"),
+    e("LpcRequestWaitReplyPort", StubFailure, "fails explicitly until synchronous kernel LPC owns a parked continuation"),
+    e("LpcRequestPort", Partial, "typed kernel datagrams route through the isolated LPC broker"),
+    e("LpcPortObjectType", Partial, "data export: broker-validated LPC port object-type pointer"),
     // --- Probe ---
     e("ProbeForWrite", Partial, "user-buffer bounds check against MmUserProbeAddress"),
     e("ProbeForRead", Partial, "user-buffer bounds check against MmUserProbeAddress"),

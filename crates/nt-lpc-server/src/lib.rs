@@ -305,17 +305,21 @@ impl Server {
         Ok(ok())
     }
 
-    /// Kernel `LpcRequestPort` — preserve an explicitly typed kernel notification.
+    /// Kernel `LpcRequestPort` — preserve an explicitly typed kernel notification, or normalize
+    /// the type-zero form to `LPC_DATAGRAM` as the NT kernel does.
     fn op_request_port(&mut self, buf: &[u8]) -> Result<LpcReply, NtStatus> {
         let req: LpcMessageRequest = read_req(buf)?;
         let msg = read_blob(buf, req.msg_offset, req.msg_len_bytes)?;
         let msg_type = msg_type_of(msg);
-        if !(nt_lpc_abi::msg_type::LPC_DATAGRAM..=nt_lpc_abi::msg_type::LPC_CLIENT_DIED)
+        let msg = if msg_type == 0 {
+            message_with_type(msg, nt_lpc_abi::msg_type::LPC_DATAGRAM)?
+        } else if (nt_lpc_abi::msg_type::LPC_DATAGRAM..=nt_lpc_abi::msg_type::LPC_CLIENT_DIED)
             .contains(&msg_type)
         {
+            validated_port_message(msg)?
+        } else {
             return Err(NtStatus::INVALID_PARAMETER);
-        }
-        let msg = validated_port_message(msg)?;
+        };
         self.core
             .send_message(req.port_handle, &msg, MessageAttrs::default())?;
         Ok(ok())
@@ -857,6 +861,50 @@ mod tests {
         };
         assert_eq!(received.connection_id, 0);
         assert_eq!(received.msg_type, msg_type::LPC_CLIENT_DIED);
+        assert_eq!(received.port_context, 0x1234);
+        assert_eq!(received.connection_info, message);
+    }
+
+    #[test]
+    fn request_port_normalizes_type_zero_to_datagram() {
+        let mut s = Server::new();
+        s.set_accept_policy(AcceptPolicy::Manual);
+        let (listen, connection) = {
+            let mut c = LpcClient::new(Direct {
+                server: &mut s,
+                out: [0; 512],
+            });
+            let listen = c
+                .create_port(&utf16("\\Windows\\ApiPort"), 0, 0x148, 0)
+                .unwrap();
+            let pending = c
+                .connect_port(&utf16("\\Windows\\ApiPort"), 2, &[])
+                .unwrap();
+            (listen, pending.connection_id)
+        };
+        let client = {
+            let mut c = LpcClient::new(Direct {
+                server: &mut s,
+                out: [0; 512],
+            });
+            c.reply_wait_receive(listen).unwrap();
+            let server = c.accept_connect(connection, true, 0x1234).unwrap();
+            c.complete_connect(server).unwrap().0
+        };
+
+        let mut message = port_message(0, b"datagram");
+        message[8..16].copy_from_slice(&24u64.to_le_bytes());
+        message[16..24].copy_from_slice(&100u64.to_le_bytes());
+        let received = {
+            let mut c = LpcClient::new(Direct {
+                server: &mut s,
+                out: [0; 512],
+            });
+            c.request_port(client, &message).unwrap();
+            c.reply_wait_receive(listen).unwrap()
+        };
+        message[4..6].copy_from_slice(&msg_type::LPC_DATAGRAM.to_le_bytes());
+        assert_eq!(received.msg_type, msg_type::LPC_DATAGRAM);
         assert_eq!(received.port_context, 0x1234);
         assert_eq!(received.connection_info, message);
     }

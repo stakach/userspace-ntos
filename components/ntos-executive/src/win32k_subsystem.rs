@@ -1004,6 +1004,7 @@ const STATUS_INVALID_SECURITY_DESCR_I32: i32 = 0xC000_0079u32 as i32;
 const STATUS_ALLOTTED_SPACE_EXCEEDED_I32: i32 = 0xC000_0099u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES_I32: i32 = 0xC000_009Au32 as i32;
 const STATUS_BAD_DESCRIPTOR_FORMAT_I32: i32 = 0xC000_00E7u32 as i32;
+const STATUS_NOT_IMPLEMENTED_I32: i32 = 0xC000_0002u32 as i32;
 const WIN32K_PRIMARY_TOKEN_MAGIC: u64 = 0x544f_4b45_4e4c_5549; // "TOKENLUI"
 const WIN32K_PRIMARY_TOKEN_BYTES: u64 = 0x70;
 const TOKEN_AUTHENTICATION_ID_OFF: u64 = 0x08;
@@ -3400,11 +3401,11 @@ const STATUS_OBJECT_TYPE_MISMATCH: i32 = 0xC000_0024u32 as i32;
 ///  - `Event` (`ExEventObjectType`) — winsrv's power/media request events, modeled as real `KEVENT`
 ///    objects when `NtUserInitialize` receives their handles (see [`register_event_object`]).
 ///
-/// The only unregistered handles resolved here are win32k's narrow process-connect handle and NT's
-/// current-process/current-thread pseudo handles. They resolve to the EPROCESS/ETHREAD selected by
-/// the live dispatch context and still enforce the caller's expected object type. Every other typed
-/// reference to an unregistered handle fails visibly; the service side must rewrite real handles
-/// only after resolving them through ProcessManager.
+/// The unregistered handles resolved here are win32k's narrow process-connect handle, NT's
+/// current-process/current-thread pseudo handles, and broker-owned LPC port handles. Process/thread
+/// identities resolve to the live dispatch context. An LPC reference is validated by the isolated
+/// broker and retains that same opaque handle as the port object body; kernel LPC imports hand it
+/// back to the broker instead of manufacturing a parallel object identity.
 extern "win64" fn s_ob_reference_object_by_handle(
     handle: u64,
     _access: u64,
@@ -3436,6 +3437,7 @@ extern "win64" fn s_ob_reference_object_by_handle(
         None => {
             let process_ty = nt_object_manager::object_type::process_object_type_addr();
             let thread_ty = nt_object_manager::object_type::thread_object_type_addr();
+            let port_ty = nt_object_manager::object_type::port_object_type_addr();
             if handle == FAKE_PROCESS_HANDLE {
                 // win32k's process-connect handle → the current EPROCESS; enforce a specific
                 // ExpectedType against PsProcessType (NULL is polymorphic).
@@ -3450,6 +3452,19 @@ extern "win64" fn s_ob_reference_object_by_handle(
             } else if handle == 0xFFFF_FFFF_FFFF_FFFE && (obj_type == 0 || obj_type == thread_ty) {
                 // NtCurrentThread() pseudo handle → selected dispatch ETHREAD.
                 (unsafe { current_ethread() }, u32::MAX)
+            } else if obj_type == port_ty {
+                let status = unsafe {
+                    lpc_client()
+                        .ok_or(nt_status::NtStatus(0xC000_0001u32 as i32))
+                        .and_then(|lpc| lpc.query_handle(handle))
+                };
+                match status {
+                    Ok(_) => (handle, u32::MAX),
+                    Err(status) => {
+                        ob_type_mismatch_trace(handle, obj_type, b"invalid-lpc-handle");
+                        return status.raw();
+                    }
+                }
             } else {
                 // Every modeled typed object resolves above; reaching here is a real object-manager
                 // requirement we do not model, so fail visibly.
@@ -3469,6 +3484,75 @@ extern "win64" fn s_ob_reference_object_by_handle(
         }
     }
     0
+}
+
+/// `NTSTATUS LpcRequestPort(PVOID PortObject, PPORT_MESSAGE Message)`.
+///
+/// The Object Manager hands win32k the broker handle itself as the opaque port body. Capture the
+/// exact native frame, apply the kernel-owned type and ClientId fields, then enqueue it through the
+/// isolated LPC service. Type zero is the documented datagram form; explicitly typed kernel
+/// notifications retain their type after validation.
+extern "win64" fn s_lpc_request_port(port_object: u64, message: *const u8) -> i32 {
+    if port_object == 0 {
+        return STATUS_INVALID_HANDLE_I32;
+    }
+    if message.is_null() {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+
+    let mut frame = [0u8; nt_lpc_abi::PORT_MESSAGE_MAX_LEN];
+    let header = unsafe { read_unaligned(message as *const u32) }.to_le_bytes();
+    let Some(total) = nt_lpc_abi::port_message_total_length(header) else {
+        return STATUS_INVALID_PARAMETER_I32;
+    };
+    unsafe { core::ptr::copy_nonoverlapping(message, frame.as_mut_ptr(), total) };
+    if u16::from_le_bytes(frame[6..8].try_into().unwrap()) != 0 {
+        return STATUS_INVALID_PARAMETER_I32;
+    }
+    let raw_type = u16::from_le_bytes(frame[4..6].try_into().unwrap());
+    let message_type = if raw_type == 0 {
+        nt_lpc_abi::msg_type::LPC_DATAGRAM
+    } else if (nt_lpc_abi::msg_type::LPC_DATAGRAM
+        ..=nt_lpc_abi::msg_type::LPC_CLIENT_DIED)
+        .contains(&raw_type)
+    {
+        raw_type
+    } else {
+        return STATUS_INVALID_PARAMETER_I32;
+    };
+    frame[4..6].copy_from_slice(&message_type.to_le_bytes());
+    frame[8..16].copy_from_slice(&WIN32K_CURRENT_PROCESS_ID.load(Ordering::Relaxed).to_le_bytes());
+    frame[16..24].copy_from_slice(&WIN32K_CURRENT_THREAD_ID.load(Ordering::Relaxed).to_le_bytes());
+
+    let Some(lpc) = (unsafe { lpc_client() }) else {
+        return 0xC000_0001u32 as i32; // STATUS_UNSUCCESSFUL
+    };
+    let identity = match lpc.query_handle(port_object) {
+        Ok(identity) => identity,
+        Err(status) => return status.raw(),
+    };
+    match lpc.request_port(port_object, &frame[..total]) {
+        Ok(()) => {
+            if lpc_name_is(&identity.name, b"\\windows\\apiport") {
+                CSR_KERNEL_MESSAGES_PENDING.fetch_add(1, Ordering::Relaxed);
+            }
+            0
+        }
+        Err(status) => status.raw(),
+    }
+}
+
+/// The synchronous kernel-client form requires suspending the current win32k continuation while a
+/// user-mode port server runs. It is deliberately bound to an explicit failure until that shared
+/// LPC continuation path owns the exchange; leaving the import unbound used to return synthetic
+/// success through the loader's catch-all stub.
+extern "win64" fn s_lpc_request_wait_reply_port(
+    _port_object: u64,
+    _request: *const u8,
+    _reply: *mut u8,
+) -> i32 {
+    print_str(b"[win32k-lpc] LpcRequestWaitReplyPort requires a parked kernel continuation\n");
+    STATUS_NOT_IMPLEMENTED_I32
 }
 
 extern "win64" fn s_ps_get_process_winsta(process: u64) -> u64 {
@@ -9438,6 +9522,14 @@ fn register_trampolines() -> bool {
     reg.bind("NtDuplicateObject", s_zw_duplicate_object as usize as u64);
     reg.bind("ZwClose", s_zw_close as usize as u64);
     reg.bind("NtClose", s_zw_close as usize as u64);
+    reg.bind(
+        "LpcRequestPort",
+        s_lpc_request_port as *const () as usize as u64,
+    );
+    reg.bind(
+        "LpcRequestWaitReplyPort",
+        s_lpc_request_wait_reply_port as *const () as usize as u64,
+    );
     reg.bind("ZwCreateEvent", s_zw_create_event as usize as u64);
     reg.bind("NtCreateEvent", s_zw_create_event as usize as u64);
     reg.bind("KeInitializeEvent", s_ke_initialize_event as usize as u64);
