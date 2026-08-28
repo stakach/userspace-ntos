@@ -15144,3 +15144,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     anonymous-level impersonation token, and copy the updated entries and one-byte BOOLEAN result
     back only through checked cross-address-space writes. Use the token subsystem's existing native
     privilege-count bound so malformed input cannot cause unbounded allocation or probing.
+
+    `NtPrivilegeCheck` (2026-08-28, accepted): SSN 140 is now a typed registered service with no
+    numeric branch. `nt-security::check_token_privileges` owns the reusable policy: it compares
+    complete LUIDs, considers only enabled token privileges, implements ALL/ANY selection, preserves
+    input attributes while marking each privilege actually used, and retains the kernel-mode bypass.
+    The executive probes and captures the complete bounded in/out set before evaluation, requires
+    `TOKEN_QUERY`, rejects impersonation tokens below `SecurityIdentification`, rejects oversized
+    native handles instead of truncating them, and uses checked cross-address-space writes for both
+    the updated array and the one-byte result.
+
+    Focused validation passes `nt-security` `63/63`, `nt-syscall` `61/61`, `git diff --check`, the
+    freestanding executive at the established 212-warning baseline, and the release build/staging
+    path. Code checkpoint `ca7032f5` is pushed. Serialized acceptance
+    `.tmp/run-headless-privilege-check-20260828.log` reached quiescence at 106,475 ms, launched
+    genuine userinit and Explorer, completed 668 Explorer api0 redirects with zero callback or
+    dead-callback failures, recorded paint begin/end `5/20`, 187 direct GDI returns, and 135 batch
+    flushes covering 184 records, painted `480000/480000` framebuffer pixels with at least 32
+    colours, passed all `295/295` gates, and matched the sentinel. Startup did not issue SSN 140, so
+    this is explicitly a full non-regression gate; the direct syscall policy is covered by the
+    focused security tests. Snapshot generation 5 committed 1,755,482 bytes, scratch returned to
+    zero, and the census reported no page-table, frame, mapping, alias, registry, untyped-allocation,
+    frame-registration, image-bank, or allocator failure.
+
+    Review adjustment: the typed surface now contains 167 services, the hosted table registers 166
+    numbered variants, and 56 canonical ABI exports remain absent. Continue with another bounded
+    Ps/Se trait that builds on authoritative token/thread state; audit `NtImpersonateThread` next
+    because both token objects and ETHREAD impersonation contexts already exist, while avoiding
+    audit-only APIs until the kernel has a real audit event sink.
