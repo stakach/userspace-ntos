@@ -15173,10 +15173,42 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     because both token objects and ETHREAD impersonation contexts already exist, while avoiding
     audit-only APIs until the kernel has a real audit event sink.
 
-    `NtImpersonateThread` (SSN 95, in progress): capture native QoS, require
+    `NtImpersonateThread` (2026-08-28, accepted): SSN 95 is now a typed registered service with no
+    numeric branch. It captures the complete aligned native QoS, requires
     `THREAD_DIRECT_IMPERSONATION` on the destination and `THREAD_IMPERSONATE` on the client thread,
-    implement static snapshot versus dynamic token tracking, inherit effective-only restrictions,
-    enforce the requested/source impersonation-level ceiling, and apply `SeTokenCanImpersonate`
-    authorization before installing an owned ETHREAD context. Share installation with
-    `ThreadImpersonationToken`; remove its caller-address-space TEB write and rollback behavior, and
-    mirror the advisory TEB fields through the target process mapping instead.
+    enforces the requested/source impersonation-level ceiling, preserves inherited effective-only
+    restrictions, and implements static token snapshots versus retained dynamic token access.
+    `SeTokenCanImpersonate` policy now covers the token's permitted level, anonymous logon,
+    `SeImpersonatePrivilege`, the client token's distinct originating logon session, and same-user
+    authorization; an unauthorized full impersonation becomes an owned identification-level copy.
+    Token creation, constructors, and duplication now carry the origin identity explicitly.
+
+    The ETHREAD impersonation context owns the installed token reference and remains authoritative.
+    `NtImpersonateThread` and `ThreadImpersonationToken` share one replacement path that releases the
+    displaced reference exactly once. The old caller-address-space TEB write and transactional
+    rollback have been removed; `ImpersonationLocale` and `IsImpersonating` are advisory mirrors
+    written best-effort through the target process mapping, matching `PspWriteTebImpersonationInfo`.
+
+    Focused validation passes `nt-security` `65/65`, `nt-process` `108/108`, `nt-syscall` `61/61`,
+    `git diff --check`, the freestanding executive at the established 212-warning baseline, and the
+    release build/staging path. Implementation checkpoints `5194dc9b` and `7eb838f1` are pushed.
+    Serialized acceptance `.tmp/run-headless-impersonate-origin-20260828.log` reached quiescence at
+    110,064 ms, launched genuine userinit and Explorer, completed 668 Explorer api0 redirects with
+    zero callback or dead-callback failures, recorded paint begin/end `5/20`, 187 direct GDI
+    returns, and 135 batch flushes covering 184 records, painted `480000/480000` framebuffer pixels
+    with at least 32 colours, passed all `295/295` gates, and matched the sentinel. Startup did not
+    issue decimal SSN 95, so this is explicitly a full non-regression gate while direct policy is
+    covered by the focused tests. Snapshot generation 5 committed 1,755,502 bytes, scratch returned
+    to zero, and the census reported no page-table, frame, mapping, alias, registry,
+    untyped-allocation, frame-registration, image-bank, or allocator failure.
+
+    Review adjustment: the typed surface now contains 168 services, the hosted table registers 167
+    numbered variants, and 55 canonical ABI exports remain absent. Continue with
+    `NtAdjustGroupsToken` (SSN 11) as the next bounded Se trait. First make the token group model
+    preserve mandatory, enabled-by-default, enabled, deny-only, owner, and logon-ID attributes
+    independently; the current boolean projection cannot express reset-to-default semantics.
+    Capture a bounded native `TOKEN_GROUPS` by value, require `TOKEN_ADJUST_GROUPS` plus
+    `TOKEN_QUERY` when previous state is requested, preflight the exact relocatable previous-state
+    buffer before mutation, implement reset/default and partial `STATUS_NOT_ALL_ASSIGNED` behavior,
+    reject disabling mandatory or enabling deny-only groups, and advance the token modification ID
+    only when state genuinely changes.
