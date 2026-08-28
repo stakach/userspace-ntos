@@ -24306,10 +24306,8 @@ impl ExecNtHandler {
         if !self.xas_read(message, &mut header) {
             return Err(STATUS_ACCESS_VIOLATION);
         }
-        let total = u16::from_le_bytes([header[2], header[3]]) as usize;
-        if !(0x28..=512).contains(&total) {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
+        let total = nt_lpc_abi::port_message_total_length(header)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
         let mut bytes = alloc::vec![0u8; total];
         if !self.xas_read(message, &mut bytes) {
             return Err(STATUS_ACCESS_VIOLATION);
@@ -29654,6 +29652,22 @@ impl ExecNtHandler {
                 }
                 print_str(b"[lpc-msg] NtRequestWaitReplyPort on an unregistered LPC connection -> failing\n");
                 0xC000_0008 // STATUS_INVALID_HANDLE
+            },
+            NativeService::NtReplyPort => unsafe {
+                if args[1] == 0 {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let message = match self.lpc_capture_port_message(args[1]) {
+                    Ok(message) => message,
+                    Err(status) => return status,
+                };
+                let Some(lpc) = lpc_client() else {
+                    return STATUS_UNSUCCESSFUL;
+                };
+                match lpc.reply_port(args[0], &message) {
+                    Ok(()) => nt_syscall::STATUS_SUCCESS,
+                    Err(status) => status.raw() as u32,
+                }
             },
             NativeService::NtListenPort => unsafe {
                 self.lpc_receive_or_park(args[0], 0, 0, args[1], true)

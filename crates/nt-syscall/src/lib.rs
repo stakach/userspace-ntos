@@ -209,6 +209,7 @@ pub enum NativeService {
     // badge delivery against the cached connection — it does NOT round-trip to the isolated broker.
     NtRequestWaitReplyPort,
     NtListenPort,
+    NtReplyPort,
     NtReplyWaitReceivePort,
     NtMakeTemporaryObject,
     NtMakePermanentObject,
@@ -406,6 +407,7 @@ impl NativeService {
             NtCompleteConnectPort => "NtCompleteConnectPort",
             NtRequestWaitReplyPort => "NtRequestWaitReplyPort",
             NtListenPort => "NtListenPort",
+            NtReplyPort => "NtReplyPort",
             NtReplyWaitReceivePort => "NtReplyWaitReceivePort",
             NtMakeTemporaryObject => "NtMakeTemporaryObject",
             NtMakePermanentObject => "NtMakePermanentObject",
@@ -647,6 +649,7 @@ impl NativeService {
         NativeService::NtAccessCheckByType,
         NativeService::NtAccessCheckByTypeResultList,
         NativeService::NtMakePermanentObject,
+        NativeService::NtReplyPort,
     ];
 }
 

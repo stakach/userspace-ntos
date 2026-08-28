@@ -1121,6 +1121,8 @@ pub const SSN_NT_LISTEN_PORT: u64 = 100;
 /// NtRequestWaitReplyPort — the LPC message data plane (CSR API calls: kernel32's CsrClientCallServer
 /// → \Windows\ApiPort). Serviced by the executive's DIRECT cross-badge message plane.
 pub const SSN_NT_REQUEST_WAIT_REPLY_PORT: u64 = 208;
+/// NtReplyPort sends one captured reply without entering a receive wait.
+pub const SSN_NT_REPLY_PORT: u64 = 202;
 /// NtReplyWaitReceivePort — the LPC SERVER receive. lsass' real `AuthPortThreadRoutine` blocks here on
 /// `\LsaAuthenticationPort`; the LSA rendezvous parks it wakeably and resumes it with a real message.
 pub const SSN_NT_REPLY_WAIT_RECEIVE_PORT: u64 = 203;
@@ -23539,6 +23541,7 @@ fn build_nt_table() -> NativeServiceTable {
                 NativeService::NtRequestWaitReplyPort,
                 SSN_NT_REQUEST_WAIT_REPLY_PORT as u32,
             ),
+            (NativeService::NtReplyPort, SSN_NT_REPLY_PORT as u32),
             (NativeService::NtListenPort, SSN_NT_LISTEN_PORT as u32),
             (
                 NativeService::NtReplyWaitReceivePort,

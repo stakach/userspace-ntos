@@ -15514,3 +15514,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     demand path, and prevent locked frames from entering mapped-view or private-page reclamation.
     Unlock must remove only the requested class/range and return native partial/not-locked failures;
     neither call may be reduced to a successful probe-only no-op.
+
+    Review adjustment (2026-08-29): the lock/unlock audit exposed a prerequisite rather than an
+    honest bounded implementation. Private VAD pages, generic mapped-section pages, and SEC_IMAGE
+    pages are currently made resident by three different executive paths; the image path remains
+    embedded in the fault-endpoint receive loop and cannot be invoked by a native syscall. A lock
+    table alone would therefore let `NtLockVirtualMemory` report success for image pages it had not
+    faulted resident. Keep SSNs 106/276 queued behind a reusable Mm page-residency operation that
+    resolves all committed allocation types, invokes the same fill/map policy as a real fault, and
+    lets explicit free/unmap and final process teardown retire lock state without adding a second
+    frame owner.
+
+    The same review rejected taking `NtSetSystemTime` (SSN 251) as an isolated replacement target.
+    The system clock is currently an immutable boot epoch plus monotonic counter, while native
+    timers and the delay, object, keyed-event, I/O-completion, and driver wait queues retain only the
+    converted monotonic deadline. Setting the wall clock without retaining each absolute timeout's
+    system-time target would leave those waits on stale deadlines, contrary to `KeSetSystemTime`'s
+    timer-rebase contract. Queue SSN 251 behind a shared tagged deadline representation and one
+    adjustable system-clock authority; relative waits must remain monotonic while all live absolute
+    waits and timers are rebased atomically.
+
+    Continue canonical coverage at `NtReplyPort` (SSN 202), where the real LPC broker already owns
+    the send-only operation. Register the exact two-argument native service, capture and validate the
+    complete caller `PORT_MESSAGE` through the existing bounded helper, send it through the broker,
+    and propagate broker/type/handle failures. Do not add another message queue or retain a numeric
+    service-loop exception.

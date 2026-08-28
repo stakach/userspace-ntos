@@ -82,6 +82,25 @@ pub mod connection_state {
 
 pub const LPC_QUERY_HANDLE_NAME_MAX_UNITS: usize = 64;
 
+/// Native x64 `PORT_MESSAGE` fixed header size.
+pub const PORT_MESSAGE_HEADER_LEN: usize = 0x28;
+/// Largest complete native message carried by the current LPC data-frame ABI.
+pub const PORT_MESSAGE_MAX_LEN: usize = 512;
+
+/// Validate the length pair at the start of a native x64 `PORT_MESSAGE` and return the complete
+/// message length. `DataLength` may leave alignment padding before `TotalLength`, but it may not
+/// extend past the captured message.
+pub fn port_message_total_length(header: [u8; 4]) -> Option<usize> {
+    let data_length = u16::from_le_bytes([header[0], header[1]]) as usize;
+    let total_length = u16::from_le_bytes([header[2], header[3]]) as usize;
+    if !(PORT_MESSAGE_HEADER_LEN..=PORT_MESSAGE_MAX_LEN).contains(&total_length)
+        || data_length.checked_add(PORT_MESSAGE_HEADER_LEN)? > total_length
+    {
+        return None;
+    }
+    Some(total_length)
+}
+
 // ---------------------------------------------------------------------------
 // Request payloads. Names / blobs are at `*_offset` for `*_len_bytes` bytes in
 // the same buffer (names UTF-16, blobs raw).
@@ -256,6 +275,15 @@ mod tests {
         assert!(is_lpc_opcode(opcode::LPC_OP_QUERY_HANDLE));
         assert!(!is_lpc_opcode(0x21ff));
         assert!(!is_lpc_opcode(0x2300));
+    }
+
+    #[test]
+    fn native_port_message_lengths_are_bounded_and_self_consistent() {
+        assert_eq!(port_message_total_length([4, 0, 44, 0]), Some(44));
+        assert_eq!(port_message_total_length([0, 0, 40, 0]), Some(40));
+        assert_eq!(port_message_total_length([5, 0, 44, 0]), None);
+        assert_eq!(port_message_total_length([0, 0, 39, 0]), None);
+        assert_eq!(port_message_total_length([0, 0, 1, 2]), None);
     }
 
     #[test]
