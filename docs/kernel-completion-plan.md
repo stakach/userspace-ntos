@@ -15568,3 +15568,40 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     registration before releasing the thread. Teardown cannot fail back into a user thread, but it
     must drain every reference and report broker delivery failures rather than silently retaining
     them. The replacement must delete the literal SSN branch and reuse the existing LPC transport.
+
+    `NtRegisterThreadTerminatePort` (2026-08-29, accepted): SSN 195 is now a typed registered
+    one-argument service with no numeric branch or fallback. Registration resolves a live LPC broker
+    port identity, rejects a terminating thread, and records the port on the current ETHREAD with
+    NT's duplicate-preserving LIFO behavior. The bounded registration storage is reserved with the
+    ETHREAD below the rewindable syscall-heap mark, cleared on thread-record reuse, and reports
+    `STATUS_INSUFFICIENT_RESOURCES` rather than growing durable state from transient syscall memory.
+
+    The common thread-termination mechanism drains every registration, builds the native x64
+    48-byte `LPC_CLIENT_DIED` message with the thread creation time, and sends it through the real LPC
+    broker before reclaiming the thread. Delivery failures are counted and reported but cannot
+    unwind termination or leave a retained registration. `nt-lpc-abi` owns the message type and exact
+    frame constructor; `nt-process` owns registration lifetime and ordering.
+
+    Focused validation passes `nt-lpc-abi` `4/4`, `nt-process` `110/110`, `nt-syscall` `68/68`,
+    `nt-lpc-server` `12/12`, `git diff --check`, the freestanding executive at the established
+    212-warning baseline, and the release build/staging path. Code checkpoint `3229fc04` is pushed.
+    Serialized acceptance `.tmp/run-headless-thread-terminate-port-20260829.log` reached the final
+    gate at 111,555 ms, registered 15 termination ports, delivered four client-died messages, and
+    reported zero delivery failures. It launched genuine userinit and Explorer, completed 668
+    Explorer api0 redirects with zero callback or dead-callback failures, recorded paint begin/end
+    `5/20`, 187 direct GDI returns, and 135 batch flushes covering 184 records, and painted
+    `480000/480000` framebuffer pixels with at least 32 colours. All `295/295` gates passed and the
+    sentinel matched. Snapshot generation 5 committed 1,755,492 bytes, scratch returned to zero, and
+    the census reported no page-table, frame, mapping, alias, registry, untyped-allocation,
+    frame-registration, image-bank, or allocator failure.
+
+    Review adjustment: the service is functionally live, but two LPC ownership debts must be closed
+    before treating this as the final Object Manager boundary. Broker port identities are not yet
+    process-local typed handles carrying granted access, so the implementation can validate liveness
+    and port type but cannot honestly enforce ReactOS's `PORT_ALL_ACCESS` reference. Queue that
+    enforcement behind Object Manager convergence, including broker reference/close semantics.
+    Separately, the generic broker receive path can dequeue `LPC_CLIENT_DIED`, while the live CSR API
+    request path still wakes parked workers through a direct executive rendezvous. Converge those
+    paths next so kernel-generated LPC messages wake and run a server worker promptly instead of
+    merely remaining durable in the broker queue; remove the bypass machinery once the shared path
+    owns both ordinary requests and kernel messages.
