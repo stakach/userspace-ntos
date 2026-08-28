@@ -18,6 +18,7 @@ mod native_sd;
 pub mod se_exports;
 mod sid;
 mod token;
+mod token_filter;
 mod token_info;
 mod token_set;
 
@@ -32,9 +33,10 @@ pub use access::{
     WRITE_OWNER,
 };
 pub use create_token::{
-    capture_acl, capture_sid, capture_sid_and_attributes_array, capture_token,
-    luid_for_privilege_name, CapturedToken, ClientMemory, CreateTokenArgs, MAX_CAPTURED_GROUPS,
-    MAX_CAPTURED_PRIVILEGES, TOKEN_GROUPS_ARRAY_OFFSET,
+    capture_acl, capture_luid_and_attributes_array, capture_sid, capture_sid_and_attributes_array,
+    capture_token, luid_for_privilege_name, CapturedToken, ClientMemory, CreateTokenArgs,
+    MAX_CAPTURED_GROUPS, MAX_CAPTURED_PRIVILEGES, TOKEN_GROUPS_ARRAY_OFFSET,
+    TOKEN_PRIVILEGES_ARRAY_OFFSET,
 };
 pub use native_acl::{NativeAcl, NativeAclError, STATUS_INVALID_ACL};
 pub use native_sd::{
@@ -62,10 +64,15 @@ pub use token::{
     STATUS_INVALID_OWNER, STATUS_INVALID_PARAMETER, STATUS_INVALID_PRIMARY_GROUP,
     TOKEN_AUDIT_CATEGORY_COUNT,
 };
+pub use token_filter::{
+    filter_access_token, TokenFilterRequest, DISABLE_MAX_PRIVILEGE, SANDBOX_INERT,
+    TOKEN_FILTER_VALID_FLAGS,
+};
 pub use token_info::{
-    encode_token_default_dacl, encode_token_group_entries, encode_token_groups, encode_token_owner,
+    encode_token_default_dacl, encode_token_group_entries, encode_token_groups,
+    encode_token_groups_and_privileges, encode_token_owner, encode_token_restricted_sids,
     encode_token_statistics, InvalidTokenSid, TokenInformationEncoding, SID_AND_ATTRIBUTES_LENGTH,
-    TOKEN_STATISTICS_LENGTH,
+    TOKEN_GROUPS_AND_PRIVILEGES_LENGTH, TOKEN_STATISTICS_LENGTH,
 };
 pub use token_set::{
     plan_token_information_set, TokenSetInformationClass, TokenSetInformationPlan,

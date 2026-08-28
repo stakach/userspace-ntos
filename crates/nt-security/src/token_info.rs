@@ -3,6 +3,7 @@
 use crate::{AccessToken, TokenGroup, TokenStatistics};
 
 pub const TOKEN_STATISTICS_LENGTH: usize = 0x38;
+pub const TOKEN_GROUPS_AND_PRIVILEGES_LENGTH: usize = 0x38;
 
 /// Result of sizing and optionally writing one native token-information buffer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -62,6 +63,15 @@ pub fn encode_token_groups(
     encode_token_group_entries(&token.groups, caller_base, output)
 }
 
+/// Encode `TOKEN_RESTRICTED_SIDS` (class 11) from the token's restricting SID set.
+pub fn encode_token_restricted_sids(
+    token: &AccessToken,
+    caller_base: u64,
+    output: &mut [u8],
+) -> Result<TokenInformationEncoding, InvalidTokenSid> {
+    encode_token_group_entries(&token.restricted_sids, caller_base, output)
+}
+
 /// Encode an arbitrary owned group slice using the same relocatable `TOKEN_GROUPS` layout. This is
 /// shared by token queries and `NtAdjustGroupsToken` previous-state output.
 pub fn encode_token_group_entries(
@@ -69,8 +79,9 @@ pub fn encode_token_group_entries(
     caller_base: u64,
     output: &mut [u8],
 ) -> Result<TokenInformationEncoding, InvalidTokenSid> {
-    // GroupCount (4) + 4 bytes of padding so the array is 8-aligned, then the array, then the SIDs.
-    let array_offset = 8;
+    // A zero-entry query is only the ULONG count. With entries present, x64 aligns the pointer array
+    // to offset 8 before the SID bodies.
+    let array_offset = if groups.is_empty() { 4 } else { 8 };
     let sid_offset = array_offset + groups.len() * SID_AND_ATTRIBUTES_LENGTH;
     let mut required_length = sid_offset;
     for group in groups {
@@ -97,6 +108,131 @@ pub fn encode_token_group_entries(
             .ok_or(InvalidTokenSid)?;
         sid_cursor += written;
     }
+    Ok(TokenInformationEncoding {
+        required_length,
+        written: true,
+    })
+}
+
+/// Encode x64 `TOKEN_GROUPS_AND_PRIVILEGES` (class 13), including the user as the first SID entry.
+pub fn encode_token_groups_and_privileges(
+    token: &AccessToken,
+    caller_base: u64,
+    output: &mut [u8],
+) -> Result<TokenInformationEncoding, InvalidTokenSid> {
+    let sid_count = 1usize
+        .checked_add(token.groups.len())
+        .ok_or(InvalidTokenSid)?;
+    let sid_bodies_length = token
+        .user
+        .native_len()
+        .ok_or(InvalidTokenSid)?
+        .checked_add(token.groups.iter().try_fold(0usize, |length, group| {
+            length
+                .checked_add(group.sid.native_len().ok_or(InvalidTokenSid)?)
+                .ok_or(InvalidTokenSid)
+        })?)
+        .ok_or(InvalidTokenSid)?;
+    let sid_length = sid_count
+        .checked_mul(SID_AND_ATTRIBUTES_LENGTH)
+        .and_then(|length| length.checked_add(sid_bodies_length))
+        .ok_or(InvalidTokenSid)?;
+    let restricted_bodies_length =
+        token
+            .restricted_sids
+            .iter()
+            .try_fold(0usize, |length, group| {
+                length
+                    .checked_add(group.sid.native_len().ok_or(InvalidTokenSid)?)
+                    .ok_or(InvalidTokenSid)
+            })?;
+    let restricted_sid_length = token
+        .restricted_sids
+        .len()
+        .checked_mul(SID_AND_ATTRIBUTES_LENGTH)
+        .and_then(|length| length.checked_add(restricted_bodies_length))
+        .ok_or(InvalidTokenSid)?;
+    let privilege_length = token
+        .privileges
+        .len()
+        .checked_mul(12)
+        .ok_or(InvalidTokenSid)?;
+    let required_length = TOKEN_GROUPS_AND_PRIVILEGES_LENGTH
+        .checked_add(sid_length)
+        .and_then(|length| length.checked_add(restricted_sid_length))
+        .and_then(|length| length.checked_add(privilege_length))
+        .ok_or(InvalidTokenSid)?;
+    let Some(output) = output.get_mut(..required_length) else {
+        return Ok(TokenInformationEncoding {
+            required_length,
+            written: false,
+        });
+    };
+
+    output.fill(0);
+    let sids_offset = TOKEN_GROUPS_AND_PRIVILEGES_LENGTH;
+    let restricted_offset = sids_offset + sid_length;
+    let privileges_offset = restricted_offset + restricted_sid_length;
+    output[0..4].copy_from_slice(&(sid_count as u32).to_le_bytes());
+    output[4..8].copy_from_slice(&(sid_length as u32).to_le_bytes());
+    output[8..16].copy_from_slice(&caller_base.wrapping_add(sids_offset as u64).to_le_bytes());
+    output[16..20].copy_from_slice(&(token.restricted_sids.len() as u32).to_le_bytes());
+    output[20..24].copy_from_slice(&(restricted_sid_length as u32).to_le_bytes());
+    if !token.restricted_sids.is_empty() {
+        output[24..32].copy_from_slice(
+            &caller_base
+                .wrapping_add(restricted_offset as u64)
+                .to_le_bytes(),
+        );
+    }
+    output[32..36].copy_from_slice(&(token.privileges.len() as u32).to_le_bytes());
+    output[36..40].copy_from_slice(&(privilege_length as u32).to_le_bytes());
+    output[40..48].copy_from_slice(
+        &caller_base
+            .wrapping_add(privileges_offset as u64)
+            .to_le_bytes(),
+    );
+    write_luid(&mut output[48..56], token.authentication_id);
+
+    let mut sid_cursor = sids_offset + sid_count * SID_AND_ATTRIBUTES_LENGTH;
+    write_sid_and_attributes(
+        output,
+        sids_offset,
+        &token.user,
+        token.user_attributes,
+        caller_base,
+        &mut sid_cursor,
+    )?;
+    for (index, group) in token.groups.iter().enumerate() {
+        write_sid_and_attributes(
+            output,
+            sids_offset + (index + 1) * SID_AND_ATTRIBUTES_LENGTH,
+            &group.sid,
+            group.native_attributes(),
+            caller_base,
+            &mut sid_cursor,
+        )?;
+    }
+
+    let mut restricted_cursor =
+        restricted_offset + token.restricted_sids.len() * SID_AND_ATTRIBUTES_LENGTH;
+    for (index, group) in token.restricted_sids.iter().enumerate() {
+        write_sid_and_attributes(
+            output,
+            restricted_offset + index * SID_AND_ATTRIBUTES_LENGTH,
+            &group.sid,
+            group.native_attributes(),
+            caller_base,
+            &mut restricted_cursor,
+        )?;
+    }
+    for (index, privilege) in token.privileges.iter().enumerate() {
+        let entry = privileges_offset + index * 12;
+        write_luid(&mut output[entry..entry + 8], privilege.luid);
+        output[entry + 8..entry + 12]
+            .copy_from_slice(&AccessToken::privilege_attributes(privilege).to_le_bytes());
+    }
+
     Ok(TokenInformationEncoding {
         required_length,
         written: true,
@@ -165,4 +301,22 @@ pub fn encode_token_statistics(
 fn write_luid(output: &mut [u8], luid: crate::Luid) {
     output[..4].copy_from_slice(&luid.low.to_le_bytes());
     output[4..8].copy_from_slice(&luid.high.to_le_bytes());
+}
+
+fn write_sid_and_attributes(
+    output: &mut [u8],
+    entry: usize,
+    sid: &crate::Sid,
+    attributes: u32,
+    caller_base: u64,
+    sid_cursor: &mut usize,
+) -> Result<(), InvalidTokenSid> {
+    output[entry..entry + 8]
+        .copy_from_slice(&caller_base.wrapping_add(*sid_cursor as u64).to_le_bytes());
+    output[entry + 8..entry + 12].copy_from_slice(&attributes.to_le_bytes());
+    let written = sid
+        .write_native(&mut output[*sid_cursor..])
+        .ok_or(InvalidTokenSid)?;
+    *sid_cursor += written;
+    Ok(())
 }

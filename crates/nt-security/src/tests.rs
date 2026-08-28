@@ -220,6 +220,22 @@ fn token_impersonation_authorization_uses_privilege_session_or_user() {
         &client,
         SecurityImpersonationLevel::Impersonation,
     ));
+    client
+        .restricted_sids
+        .push(TokenGroup::enabled(Sid::everyone()));
+    assert!(!token_can_impersonate(
+        &server,
+        &client,
+        SecurityImpersonationLevel::Impersonation,
+    ));
+    server
+        .restricted_sids
+        .push(TokenGroup::enabled(Sid::everyone()));
+    assert!(token_can_impersonate(
+        &server,
+        &client,
+        SecurityImpersonationLevel::Impersonation,
+    ));
 
     let mut anonymous = client.clone();
     anonymous.authentication_id = Luid::new(0x3e6);
@@ -575,6 +591,55 @@ fn token_groups_encoding_is_exact_relocatable_and_size_queryable() {
     let sized = encode_token_groups(&system, base, &mut none).unwrap();
     assert_eq!(sized.required_length, expected_len);
     assert!(!sized.written);
+}
+
+#[test]
+fn restricted_sid_and_combined_token_queries_are_relocatable() {
+    let mut token = AccessToken::user(MACHINE);
+    token
+        .restricted_sids
+        .push(TokenGroup::enabled(Sid::everyone()));
+    token.sandbox_inert = true;
+    let base = 0x7000_0000u64;
+
+    let mut restricted = [0u8; 64];
+    let encoded = encode_token_restricted_sids(&token, base, &mut restricted).unwrap();
+    assert!(encoded.written);
+    assert_eq!(u32::from_le_bytes(restricted[..4].try_into().unwrap()), 1);
+    let restricted_sid = u64::from_le_bytes(restricted[8..16].try_into().unwrap());
+    assert!(restricted_sid >= base + 24 && restricted_sid < base + encoded.required_length as u64);
+
+    let mut combined = [0u8; 256];
+    let encoded = encode_token_groups_and_privileges(&token, base, &mut combined).unwrap();
+    assert!(encoded.written);
+    assert_eq!(
+        u32::from_le_bytes(combined[0..4].try_into().unwrap()),
+        (token.groups.len() + 1) as u32
+    );
+    assert_eq!(u32::from_le_bytes(combined[16..20].try_into().unwrap()), 1);
+    assert_eq!(
+        u32::from_le_bytes(combined[32..36].try_into().unwrap()),
+        token.privileges.len() as u32
+    );
+    assert_eq!(
+        u32::from_le_bytes(combined[48..52].try_into().unwrap()),
+        token.authentication_id.low
+    );
+    for pointer_offset in [8usize, 24, 40] {
+        let pointer = u64::from_le_bytes(
+            combined[pointer_offset..pointer_offset + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert!(pointer >= base && pointer < base + encoded.required_length as u64);
+    }
+
+    token.restricted_sids.clear();
+    let mut empty = [0xcc; 4];
+    let encoded = encode_token_restricted_sids(&token, base, &mut empty).unwrap();
+    assert_eq!(encoded.required_length, 4);
+    assert!(encoded.written);
+    assert_eq!(empty, [0; 4]);
 }
 
 /// `SE_GROUP_LOGON_ID` must SURVIVE capture and re-encoding. `winlogon!AllowAccessOnSession`
@@ -945,6 +1010,105 @@ fn token_store_owns_session_origin_and_audit_lifecycles() {
 }
 
 #[test]
+fn token_filter_owns_independent_state_identity_and_logon_reference() {
+    let mut store = TokenStore::new();
+    let source = TokenSource {
+        name: *b"Filter  ",
+        identifier: Luid::new(0x3456),
+    };
+    let source_id = store.insert_created(AccessToken::system(), 0x1234, source);
+    let authentication_id = store.get(source_id).unwrap().authentication_id;
+    let source_stats = store.statistics(source_id).unwrap();
+    let filtered_id = store
+        .filter(
+            source_id,
+            TokenFilterRequest {
+                flags: DISABLE_MAX_PRIVILEGE | SANDBOX_INERT,
+                sids_to_disable: &[(Sid::administrators(), 0)],
+                privileges_to_delete: &[(Luid::new(20), 0)],
+                restricted_sids: &[(Sid::everyone(), 0)],
+            },
+        )
+        .unwrap();
+    let filtered_stats = store.statistics(filtered_id).unwrap();
+    assert_ne!(filtered_stats.token_id, source_stats.token_id);
+    assert_ne!(filtered_stats.modified_id, source_stats.modified_id);
+    assert_eq!(store.source(filtered_id), Some(source));
+    assert_eq!(store.expiration_time(filtered_id), Some(0x1234));
+    assert_eq!(
+        store.logon_session_reference_count(authentication_id),
+        Some(2)
+    );
+
+    let filtered = store.get(filtered_id).unwrap();
+    assert!(filtered.sandbox_inert);
+    assert_eq!(filtered.restricted_sids.len(), 1);
+    assert!(filtered.restricted_sids[0].is_mandatory());
+    assert!(filtered.restricted_sids[0].is_enabled_by_default());
+    assert!(filtered.restricted_sids[0].is_enabled());
+    assert_eq!(filtered.privileges.len(), 1);
+    assert_eq!(filtered.privileges[0].name, SE_CHANGE_NOTIFY);
+    assert!(store.get(source_id).unwrap().privileges.len() > 1);
+
+    store.release(filtered_id).unwrap();
+    assert_eq!(
+        store.logon_session_reference_count(authentication_id),
+        Some(1)
+    );
+}
+
+#[test]
+fn token_filter_validates_flags_and_restricted_attributes() {
+    let source = AccessToken::user(MACHINE);
+    assert_eq!(
+        filter_access_token(
+            &source,
+            TokenFilterRequest {
+                flags: 0x4,
+                sids_to_disable: &[],
+                privileges_to_delete: &[],
+                restricted_sids: &[],
+            }
+        ),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        filter_access_token(
+            &source,
+            TokenFilterRequest {
+                flags: 0,
+                sids_to_disable: &[],
+                privileges_to_delete: &[],
+                restricted_sids: &[(Sid::everyone(), 1)],
+            }
+        ),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+
+    let once = filter_access_token(
+        &source,
+        TokenFilterRequest {
+            flags: 0,
+            sids_to_disable: &[],
+            privileges_to_delete: &[],
+            restricted_sids: &[(Sid::everyone(), 0)],
+        },
+    )
+    .unwrap();
+    let twice = filter_access_token(
+        &once,
+        TokenFilterRequest {
+            flags: 0,
+            sids_to_disable: &[],
+            privileges_to_delete: &[],
+            restricted_sids: &[(Sid::everyone(), 0)],
+        },
+    )
+    .unwrap();
+    assert_eq!(twice.restricted_sids.len(), 1);
+}
+
+#[test]
 fn token_information_set_planner_enforces_native_classes_lengths_and_access() {
     use TokenSetInformationClass::*;
 
@@ -1186,6 +1350,99 @@ fn deny_ace_beats_later_allow() {
     );
     // But read alone is granted by the Everyone allow ACE.
     assert!(access_check(&sd, &user, FILE_READ, &map, ProcessorMode::UserMode).granted());
+}
+
+#[test]
+fn restricted_token_requires_both_native_dacl_passes() {
+    let map = file_mapping();
+    let sd = SecurityDescriptor {
+        dacl: Some(Acl::new(vec![Ace::allow(
+            Sid::everyone(),
+            FILE_READ | FILE_WRITE,
+        )])),
+        ..Default::default()
+    };
+    let source = AccessToken::user(MACHINE);
+    let denied = filter_access_token(
+        &source,
+        TokenFilterRequest {
+            flags: 0,
+            sids_to_disable: &[],
+            privileges_to_delete: &[],
+            restricted_sids: &[(Sid::administrators(), 0)],
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        access_check(&sd, &denied, FILE_READ, &map, ProcessorMode::UserMode).status,
+        STATUS_ACCESS_DENIED
+    );
+
+    let allowed = filter_access_token(
+        &source,
+        TokenFilterRequest {
+            flags: 0,
+            sids_to_disable: &[],
+            privileges_to_delete: &[],
+            restricted_sids: &[(Sid::everyone(), 0)],
+        },
+    )
+    .unwrap();
+    assert!(access_check(&sd, &allowed, FILE_READ, &map, ProcessorMode::UserMode).granted());
+
+    let null_dacl = SecurityDescriptor::default();
+    assert!(access_check(
+        &null_dacl,
+        &denied,
+        FILE_READ,
+        &map,
+        ProcessorMode::UserMode,
+    )
+    .granted());
+}
+
+#[test]
+fn disabled_user_and_group_become_deny_only() {
+    let source = AccessToken::admin(MACHINE);
+    let filtered = filter_access_token(
+        &source,
+        TokenFilterRequest {
+            flags: 0,
+            sids_to_disable: &[(source.user.clone(), 0xfeed), (Sid::administrators(), 0)],
+            privileges_to_delete: &[],
+            restricted_sids: &[],
+        },
+    )
+    .unwrap();
+    assert_ne!(
+        filtered.user_attributes & create_token::SE_GROUP_USE_FOR_DENY_ONLY,
+        0
+    );
+    assert!(!filtered.allow_sids().contains(&&filtered.user));
+    let administrators = filtered
+        .groups
+        .iter()
+        .find(|group| group.sid == Sid::administrators())
+        .unwrap();
+    assert!(administrators.is_deny_only());
+    assert!(!administrators.is_enabled());
+    assert_eq!(filtered.owner, filtered.user);
+    let descriptor = SecurityDescriptor {
+        owner: Some(filtered.user.clone()),
+        dacl: Some(Acl::empty()),
+        ..Default::default()
+    };
+    assert_eq!(
+        access_check(
+            &descriptor,
+            &filtered,
+            READ_CONTROL,
+            &file_mapping(),
+            ProcessorMode::UserMode,
+        )
+        .status,
+        STATUS_ACCESS_DENIED
+    );
 }
 
 #[test]

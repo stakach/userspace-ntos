@@ -422,10 +422,9 @@ pub fn capture_token(
     };
 
     // TOKEN_USER — a single inline SID_AND_ATTRIBUTES.
-    let user = capture_sid_and_attributes_array(memory, args.token_user, 1)?
+    let (user, user_attributes) = capture_sid_and_attributes_array(memory, args.token_user, 1)?
         .pop()
-        .ok_or(STATUS_INVALID_PARAMETER)?
-        .0;
+        .ok_or(STATUS_INVALID_PARAMETER)?;
 
     // TOKEN_GROUPS — the count, then that many SID_AND_ATTRIBUTES.
     let requested_group_count = read_u32(memory, args.token_groups)?;
@@ -490,7 +489,9 @@ pub fn capture_token(
                 SecurityImpersonationLevel::Anonymous
             },
             user,
+            user_attributes,
             groups,
+            restricted_sids: Vec::new(),
             privileges,
             owner,
             primary_group,
@@ -501,6 +502,7 @@ pub fn capture_token(
             // origin later through TokenOrigin; duplication preserves it thereafter.
             originating_logon_session: Luid::new(0),
             audit_policy: crate::TokenAuditPolicy::default(),
+            sandbox_inert: false,
         },
         expiration_time,
         source,

@@ -262,8 +262,17 @@ pub fn access_check(
         granted |= ACCESS_SYSTEM_SECURITY;
     }
 
-    // Owner implicitly gets READ_CONTROL (spec §9.6).
-    if sd.owner.as_ref() == Some(&token.user) {
+    // Owner implicitly gets READ_CONTROL. Deny-only identities cannot establish ownership, and a
+    // restricted token must also satisfy ownership through its restricting SID set.
+    let token_is_owner = sd.owner.as_ref().is_some_and(|owner| {
+        token.allow_sids().iter().any(|sid| **sid == *owner)
+            && (!token.is_restricted()
+                || token
+                    .restricted_allow_sids()
+                    .iter()
+                    .any(|sid| **sid == *owner))
+    });
+    if token_is_owner {
         granted |= READ_CONTROL;
     }
 
@@ -275,33 +284,30 @@ pub fn access_check(
         Some(acl) => {
             let allow_sids = token.allow_sids();
             let deny_sids = token.deny_sids();
-            let mut denied_bits: AccessMask = 0;
-            for ace in &acl.aces {
-                if ace.inherit_only {
-                    continue;
-                }
-                match ace.ace_type {
-                    AceType::AccessDenied => {
-                        if deny_sids.iter().any(|s| **s == ace.sid) {
-                            if maximum {
-                                denied_bits |= ace.mask & !granted;
-                            } else if ace.mask & want & !granted != 0 {
-                                // A still-wanted, not-yet-granted right is explicitly denied.
-                                return denied();
-                            }
-                        }
-                    }
-                    AceType::AccessAllowed => {
-                        if allow_sids.iter().any(|s| **s == ace.sid) {
-                            let add = ace.mask & !denied_bits;
-                            granted |= if maximum { add } else { add & want };
-                        }
-                    }
-                    AceType::SystemAudit => {} // stored only (spec §7.7)
-                }
-                if !maximum && want & !granted == 0 {
-                    break;
-                }
+            let ordinary = match evaluate_dacl(acl, &allow_sids, &deny_sids, want, maximum, granted)
+            {
+                Ok(result) => result,
+                Err(()) => return denied(),
+            };
+            if token.is_restricted() {
+                let restricted_allow_sids = token.restricted_allow_sids();
+                let restricted_deny_sids = token.restricted_deny_sids();
+                let restricted = match evaluate_dacl(
+                    acl,
+                    &restricted_allow_sids,
+                    &restricted_deny_sids,
+                    want,
+                    maximum,
+                    granted,
+                ) {
+                    Ok(result) => result,
+                    Err(()) => return denied(),
+                };
+                // Privilege and owner grants precede the DACL. Rights granted by the ACL must pass
+                // both the ordinary SID set and the restricting SID set.
+                granted |= (ordinary & !granted) & (restricted & !granted);
+            } else {
+                granted = ordinary;
             }
         }
     }
@@ -325,6 +331,45 @@ pub fn access_check(
     } else {
         denied()
     }
+}
+
+fn evaluate_dacl(
+    acl: &Acl,
+    allow_sids: &[&Sid],
+    deny_sids: &[&Sid],
+    want: AccessMask,
+    maximum: bool,
+    previously_granted: AccessMask,
+) -> Result<AccessMask, ()> {
+    let mut granted = previously_granted;
+    let mut denied_bits: AccessMask = 0;
+    for ace in &acl.aces {
+        if ace.inherit_only {
+            continue;
+        }
+        match ace.ace_type {
+            AceType::AccessDenied => {
+                if deny_sids.iter().any(|sid| **sid == ace.sid) {
+                    if maximum {
+                        denied_bits |= ace.mask & !granted;
+                    } else if ace.mask & want & !granted != 0 {
+                        return Err(());
+                    }
+                }
+            }
+            AceType::AccessAllowed => {
+                if allow_sids.iter().any(|sid| **sid == ace.sid) {
+                    let add = ace.mask & !denied_bits;
+                    granted |= if maximum { add } else { add & want };
+                }
+            }
+            AceType::SystemAudit => {}
+        }
+        if !maximum && want & !granted == 0 {
+            break;
+        }
+    }
+    Ok(granted)
 }
 
 fn denied() -> AccessCheckResult {

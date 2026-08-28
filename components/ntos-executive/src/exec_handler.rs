@@ -18763,6 +18763,121 @@ impl ExecNtHandler {
         self.install_thread_impersonation_context(tid, replacement)
     }
 
+    unsafe fn capture_token_groups_input(
+        &self,
+        address: u64,
+    ) -> Result<alloc::vec::Vec<(nt_security::Sid, u32)>, u32> {
+        const TOKEN_GROUPS_HEADER_SIZE: usize = 24;
+        if address & 3 != 0 {
+            return Err(STATUS_DATATYPE_MISALIGNMENT);
+        }
+        let mut header = [0u8; TOKEN_GROUPS_HEADER_SIZE];
+        if address == 0 || !self.xas_read(address, &mut header) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let count = u32::from_le_bytes(header[..4].try_into().unwrap());
+        let groups_address = address
+            .checked_add(nt_security::TOKEN_GROUPS_ARRAY_OFFSET)
+            .ok_or(STATUS_ACCESS_VIOLATION)?;
+        nt_security::capture_sid_and_attributes_array(
+            &ExecClientMemory { handler: self },
+            groups_address,
+            count,
+        )
+    }
+
+    unsafe fn capture_token_privileges_input(
+        &self,
+        address: u64,
+    ) -> Result<alloc::vec::Vec<(nt_security::Luid, u32)>, u32> {
+        const TOKEN_PRIVILEGES_HEADER_SIZE: usize = 16;
+        if address & 3 != 0 {
+            return Err(STATUS_DATATYPE_MISALIGNMENT);
+        }
+        let mut header = [0u8; TOKEN_PRIVILEGES_HEADER_SIZE];
+        if address == 0 || !self.xas_read(address, &mut header) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let count = u32::from_le_bytes(header[..4].try_into().unwrap());
+        let privileges_address = address
+            .checked_add(nt_security::TOKEN_PRIVILEGES_ARRAY_OFFSET)
+            .ok_or(STATUS_ACCESS_VIOLATION)?;
+        nt_security::capture_luid_and_attributes_array(
+            &ExecClientMemory { handler: self },
+            privileges_address,
+            count,
+        )
+    }
+
+    unsafe fn nt_filter_token(&mut self, args: &[u64]) -> u32 {
+        const TOKEN_DUPLICATE: u32 = 0x0002;
+
+        let flags = nt_ulong_arg(args[1]);
+        if flags & !nt_security::TOKEN_FILTER_VALID_FLAGS != 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let sids_to_disable = if args[2] == 0 {
+            alloc::vec::Vec::new()
+        } else {
+            match self.capture_token_groups_input(args[2]) {
+                Ok(captured) => captured,
+                Err(status) => return status,
+            }
+        };
+        let privileges_to_delete = if args[3] == 0 {
+            alloc::vec::Vec::new()
+        } else {
+            match self.capture_token_privileges_input(args[3]) {
+                Ok(captured) => captured,
+                Err(status) => return status,
+            }
+        };
+        let restricted_sids = if args[4] == 0 {
+            alloc::vec::Vec::new()
+        } else {
+            match self.capture_token_groups_input(args[4]) {
+                Ok(captured) => captured,
+                Err(status) => return status,
+            }
+        };
+
+        let out = args[5];
+        if out & 7 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        if !self.probe_user_output(out, 8) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let source = match self.token_id_for_handle(args[0], TOKEN_DUPLICATE) {
+            Ok(token) => token,
+            Err(status) => return status,
+        };
+        let caller_pid = match self.pm_pid_for_pi(self.pi) {
+            Some(pid) => pid,
+            None => return nt_process::STATUS_INVALID_HANDLE,
+        };
+        let granted_access = match self
+            .pm
+            .handle_access(caller_pid, args[0] as nt_process::Handle)
+        {
+            Some(access) => access,
+            None => return nt_process::STATUS_INVALID_HANDLE,
+        };
+        let filtered = match self.token_store.filter(
+            source,
+            nt_security::TokenFilterRequest {
+                flags,
+                sids_to_disable: &sids_to_disable,
+                privileges_to_delete: &privileges_to_delete,
+                restricted_sids: &restricted_sids,
+            },
+        ) {
+            Ok(token) => token,
+            Err(status) => return status,
+        };
+        self.insert_owned_token_handle(caller_pid, filtered, granted_access, out)
+    }
+
     unsafe fn nt_adjust_privileges_token(&mut self, args: &[u64]) -> u32 {
         const STATUS_SUCCESS: u32 = 0;
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
@@ -18784,31 +18899,17 @@ impl ExecNtHandler {
 
         let mut requested = alloc::vec::Vec::new();
         if !disable_all {
-            let mut count_bytes = [0u8; 4];
-            if !self.xas_read(new_state, &mut count_bytes) {
-                return STATUS_ACCESS_VIOLATION;
-            }
-            let count = u32::from_le_bytes(count_bytes) as usize;
-            let captured_size = match count.checked_mul(12).and_then(|n| n.checked_add(4)) {
-                Some(size) => size,
-                None => return STATUS_INVALID_PARAMETER,
+            let captured = match self.capture_token_privileges_input(new_state) {
+                Ok(captured) => captured,
+                Err(status) => return status,
             };
-            if new_state.checked_add(captured_size as u64).is_none()
-                || requested.try_reserve_exact(count).is_err()
-            {
+            if requested.try_reserve_exact(captured.len()).is_err() {
                 return STATUS_INSUFFICIENT_RESOURCES;
             }
-            for index in 0..count {
-                let mut entry = [0u8; 12];
-                if !self.xas_read(new_state + 4 + index as u64 * 12, &mut entry) {
-                    return STATUS_ACCESS_VIOLATION;
-                }
+            for (luid, attributes) in captured {
                 requested.push(nt_security::PrivilegeAdjustment {
-                    luid: nt_security::Luid {
-                        low: u32::from_le_bytes(entry[0..4].try_into().unwrap()),
-                        high: i32::from_le_bytes(entry[4..8].try_into().unwrap()),
-                    },
-                    attributes: u32::from_le_bytes(entry[8..12].try_into().unwrap()),
+                    luid,
+                    attributes,
                 });
             }
         }
@@ -18883,7 +18984,6 @@ impl ExecNtHandler {
         const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
         const TOKEN_QUERY: u32 = 0x0008;
         const TOKEN_ADJUST_GROUPS: u32 = 0x0040;
-        const TOKEN_GROUPS_HEADER_SIZE: usize = 24;
 
         let reset_to_default = nt_boolean_arg(args[1]);
         let new_state = args[2];
@@ -18896,24 +18996,7 @@ impl ExecNtHandler {
 
         let mut requested = alloc::vec::Vec::new();
         if !reset_to_default {
-            if new_state & 3 != 0 {
-                return STATUS_DATATYPE_MISALIGNMENT;
-            }
-            let mut header = [0u8; TOKEN_GROUPS_HEADER_SIZE];
-            if !self.xas_read(new_state, &mut header) {
-                return STATUS_ACCESS_VIOLATION;
-            }
-            let count = u32::from_le_bytes(header[..4].try_into().unwrap());
-            let Some(groups_address) =
-                new_state.checked_add(nt_security::TOKEN_GROUPS_ARRAY_OFFSET)
-            else {
-                return STATUS_ACCESS_VIOLATION;
-            };
-            let captured = match nt_security::capture_sid_and_attributes_array(
-                &ExecClientMemory { handler: self },
-                groups_address,
-                count,
-            ) {
+            let captured = match self.capture_token_groups_input(new_state) {
                 Ok(captured) => captured,
                 Err(status) => return status,
             };
@@ -30482,6 +30565,7 @@ impl ExecNtHandler {
                 self.nt_open_process_token(args[0], nt_ulong_arg(args[1]), args[3])
             },
             NativeService::NtDuplicateToken => unsafe { self.nt_duplicate_token(args) },
+            NativeService::NtFilterToken => unsafe { self.nt_filter_token(args) },
             // NtCreateToken — 13 args (4 register + 9 stack). See `nt_create_token`.
             NativeService::NtCreateToken => unsafe { self.nt_create_token(args) },
             NativeService::NtAccessCheck => unsafe { self.nt_access_check(ctx, args) },
@@ -31535,7 +31619,7 @@ impl ExecNtHandler {
                 if retlen_ptr == 0 || !self.probe_user_output(retlen_ptr, 4) {
                     return STATUS_ACCESS_VIOLATION;
                 }
-                if (matches!(class, 9 | 12) && len != 4) || (class == 17 && len != 8) {
+                if (matches!(class, 9 | 12 | 15) && len != 4) || (class == 17 && len != 8) {
                     return STATUS_INFO_LENGTH_MISMATCH;
                 }
                 let required_access = if class == 7 { 0x0010 } else { TOKEN_QUERY };
@@ -31558,15 +31642,13 @@ impl ExecNtHandler {
                     Some(token) => token,
                     None => return 0xC000_0008,
                 };
-                // The modeled tokens have a 500-byte dynamic charge, which bounds a replacement
-                // default ACL query to 500 bytes including its pointer.
-                let mut output = [0u8; 512];
                 let needed = match class {
                     1 => {
                         // TOKEN_USER: aligned SID_AND_ATTRIBUTES followed by the user SID.
-                        let sid_length = token.user.write_native(&mut output[16..]).unwrap_or(0);
-                        output[..8].copy_from_slice(&buf.wrapping_add(16).to_le_bytes());
-                        16 + sid_length
+                        16 + match token.user.native_len() {
+                            Some(length) => length,
+                            None => return 0xC000_0078,
+                        }
                     }
                     2 => {
                         // TOKEN_GROUPS. `userenv!CheckForGuestsAndAdmins` (profile.c:365) and
@@ -31574,14 +31656,80 @@ impl ExecNtHandler {
                         // with a NULL/zero-length query and REQUIRE the `STATUS_BUFFER_TOO_SMALL`
                         // (⇒ ERROR_INSUFFICIENT_BUFFER) answer; returning INVALID_INFO_CLASS made
                         // them report `Error 87` and give up. Encoding lives in `nt-security`.
-                        match nt_security::encode_token_groups(token, buf, &mut output) {
+                        match nt_security::encode_token_groups(token, buf, &mut []) {
                             Ok(encoded) => encoded.required_length,
                             Err(_) => return 0xC000_0078, // STATUS_INVALID_SID
                         }
                     }
+                    3 => 4 + token.privileges.len() * 12,
+                    4 => {
+                        // TOKEN_OWNER: pointer followed immediately by the current owner SID.
+                        match nt_security::encode_token_owner(token, buf, &mut []) {
+                            Ok(encoded) => encoded.required_length,
+                            Err(_) => return 0xC000_0078, // STATUS_INVALID_SID
+                        }
+                    }
+                    5 => {
+                        // TOKEN_PRIMARY_GROUP: pointer followed immediately by the SID.
+                        8 + match token.primary_group.native_len() {
+                            Some(length) => length,
+                            None => return 0xC000_0078,
+                        }
+                    }
+                    6 => {
+                        // TOKEN_DEFAULT_DACL: null pointer or in-buffer lossless native ACL.
+                        nt_security::encode_token_default_dacl(token, buf, &mut [])
+                            .required_length
+                    }
+                    7 => 16,
+                    8 => 4,
+                    9 => {
+                        if token.token_type != nt_security::TokenType::Impersonation {
+                            return STATUS_INVALID_INFO_CLASS;
+                        }
+                        4
+                    }
+                    10 => nt_security::TOKEN_STATISTICS_LENGTH,
+                    11 => match nt_security::encode_token_restricted_sids(token, buf, &mut []) {
+                        Ok(encoded) => encoded.required_length,
+                        Err(_) => return 0xC000_0078,
+                    },
+                    12 => 4,
+                    13 => {
+                        match nt_security::encode_token_groups_and_privileges(token, buf, &mut []) {
+                            Ok(encoded) => encoded.required_length,
+                            Err(_) => return 0xC000_0078,
+                        }
+                    }
+                    15 => 4,
+                    17 => 8,
+                    _ => return STATUS_INVALID_INFO_CLASS,
+                };
+                if needed > u32::MAX as usize {
+                    return STATUS_INSUFFICIENT_RESOURCES;
+                }
+                if !self.xas_write_u32(retlen_ptr, needed as u32) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if len < needed {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+                if !self.probe_user_output(buf, needed) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let mut output = match try_zeroed_transfer_buffer(needed) {
+                    Ok(output) => output,
+                    Err(status) => return status,
+                };
+                let encoded = match class {
+                    1 => {
+                        output[..8].copy_from_slice(&buf.wrapping_add(16).to_le_bytes());
+                        output[8..12].copy_from_slice(&token.user_attributes.to_le_bytes());
+                        token.user.write_native(&mut output[16..]).is_some()
+                    }
+                    2 => nt_security::encode_token_groups(token, buf, &mut output)
+                        .is_ok_and(|encoded| encoded.written),
                     3 => {
-                        // TOKEN_PRIVILEGES: current attributes from the same mutable token adjusted
-                        // by NtAdjustPrivilegesToken.
                         output[..4].copy_from_slice(&(token.privileges.len() as u32).to_le_bytes());
                         for (index, privilege) in token.privileges.iter().enumerate() {
                             let offset = 4 + index * 12;
@@ -31594,28 +31742,16 @@ impl ExecNtHandler {
                                     .to_le_bytes(),
                             );
                         }
-                        4 + token.privileges.len() * 12
+                        true
                     }
-                    4 => {
-                        // TOKEN_OWNER: pointer followed immediately by the current owner SID.
-                        match nt_security::encode_token_owner(token, buf, &mut output) {
-                            Ok(encoded) => encoded.required_length,
-                            Err(_) => return 0xC000_0078, // STATUS_INVALID_SID
-                        }
-                    }
+                    4 => nt_security::encode_token_owner(token, buf, &mut output)
+                        .is_ok_and(|encoded| encoded.written),
                     5 => {
-                        // TOKEN_PRIMARY_GROUP: pointer followed immediately by the SID.
-                        let sid_length = token
-                            .primary_group
-                            .write_native(&mut output[8..])
-                            .unwrap_or(0);
                         output[..8].copy_from_slice(&buf.wrapping_add(8).to_le_bytes());
-                        8 + sid_length
+                        token.primary_group.write_native(&mut output[8..]).is_some()
                     }
                     6 => {
-                        // TOKEN_DEFAULT_DACL: null pointer or in-buffer lossless native ACL.
-                        nt_security::encode_token_default_dacl(token, buf, &mut output)
-                            .required_length
+                        nt_security::encode_token_default_dacl(token, buf, &mut output).written
                     }
                     7 => {
                         let source = match self.token_store.source(token_id) {
@@ -31625,53 +31761,53 @@ impl ExecNtHandler {
                         output[..8].copy_from_slice(&source.name);
                         output[8..12].copy_from_slice(&source.identifier.low.to_le_bytes());
                         output[12..16].copy_from_slice(&source.identifier.high.to_le_bytes());
-                        16
+                        true
                     }
                     8 => {
                         output[..4].copy_from_slice(&(token.token_type as u32).to_le_bytes());
-                        4
+                        true
                     }
                     9 => {
-                        if token.token_type != nt_security::TokenType::Impersonation {
-                            return STATUS_INVALID_INFO_CLASS;
-                        }
                         output[..4]
                             .copy_from_slice(&(token.impersonation_level as u32).to_le_bytes());
-                        4
+                        true
                     }
-                    10 => {
-                        let statistics = match self.token_store.statistics(token_id) {
-                            Some(statistics) => statistics,
-                            None => return 0xC000_0008,
-                        };
-                        nt_security::encode_token_statistics(statistics, &mut output)
-                            .required_length
-                    }
+                    10 => match self.token_store.statistics(token_id) {
+                        Some(statistics) => {
+                            nt_security::encode_token_statistics(statistics, &mut output).written
+                        }
+                        None => return 0xC000_0008,
+                    },
+                    11 => nt_security::encode_token_restricted_sids(token, buf, &mut output)
+                        .is_ok_and(|encoded| encoded.written),
                     12 => {
                         output[..4].copy_from_slice(&token.session_id.to_le_bytes());
-                        4
+                        true
+                    }
+                    13 => {
+                        nt_security::encode_token_groups_and_privileges(token, buf, &mut output)
+                            .is_ok_and(|encoded| encoded.written)
+                    }
+                    15 => {
+                        output[..4].copy_from_slice(&u32::from(token.sandbox_inert).to_le_bytes());
+                        true
                     }
                     17 => {
                         output[..4]
                             .copy_from_slice(&token.originating_logon_session.low.to_le_bytes());
                         output[4..8]
                             .copy_from_slice(&token.originating_logon_session.high.to_le_bytes());
-                        8
+                        true
                     }
-                    _ => return STATUS_INVALID_INFO_CLASS,
+                    _ => false,
                 };
-                if !self.xas_write_u32(retlen_ptr, needed as u32) {
-                    return STATUS_ACCESS_VIOLATION;
+                if !encoded {
+                    return 0xC000_0078;
                 }
-                if len < needed {
-                    return STATUS_BUFFER_TOO_SMALL;
-                }
-                if !self.probe_user_output(buf, needed)
-                    || !self.xas_try_write_buf(buf, &output[..needed])
-                {
-                    STATUS_ACCESS_VIOLATION
-                } else {
+                if self.xas_try_write_buf(buf, &output) {
                     0
+                } else {
+                    STATUS_ACCESS_VIOLATION
                 }
             },
             // NtQueryObject(Handle[R10]=args[0], class[RDX]=args[1], buf[R8]=args[2], len[R9]=args[3],

@@ -125,6 +125,16 @@ fn every_native_service_uses_the_canonical_exact_arity() {
 }
 
 #[test]
+fn filter_token_keeps_native_six_argument_contract() {
+    assert_eq!(NativeService::NtFilterToken.name(), "NtFilterToken");
+    assert_eq!(NativeService::NtFilterToken.arg_count(), (6, 6));
+    assert_eq!(nt_syscall_abi::ssn_of("NtFilterToken"), Some(79));
+    assert!(NativeServiceTable::test_profile()
+        .number_of(NativeService::NtFilterToken)
+        .is_some());
+}
+
+#[test]
 fn flush_key_is_a_single_handle_registry_service() {
     // `NtFlushKey(IN HANDLE KeyHandle)` — ReactOS `ntoskrnl/config/ntapi.c:1085`, one argument,
     // SSN 83 (`sysfuncs.lst` line 84). rpcrt4's ncacn_np server handoff reaches it through

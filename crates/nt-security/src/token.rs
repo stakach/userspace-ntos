@@ -106,9 +106,9 @@ pub fn plan_client_impersonation(
     })
 }
 
-/// `SeTokenCanImpersonate` policy for the token properties modelled by this kernel. Restricted-token
-/// comparison is intentionally absent until tokens carry restricted SIDs; privilege, anonymous
-/// logon, authentication-session, and same-user authorization are all enforced.
+/// `SeTokenCanImpersonate` policy for the token properties modelled by this kernel. Privilege,
+/// anonymous logon, authentication-session, same-user, and restricted-token authorization are all
+/// enforced.
 pub fn token_can_impersonate(
     server: &AccessToken,
     client: &AccessToken,
@@ -121,11 +121,14 @@ pub fn token_can_impersonate(
     if client.token_type == TokenType::Impersonation && level > client.impersonation_level {
         return false;
     }
-    level < SecurityImpersonationLevel::Identification
+    if level < SecurityImpersonationLevel::Identification
         || client.authentication_id == ANONYMOUS_LOGON_LUID
         || server.has_privilege(SE_IMPERSONATE)
         || server.authentication_id == client.originating_logon_session
-        || server.user == client.user
+    {
+        return true;
+    }
+    server.user == client.user && server.is_restricted() == client.is_restricted()
 }
 
 pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
@@ -241,6 +244,15 @@ impl TokenGroup {
             self.attributes &= !crate::create_token::SE_GROUP_ENABLED;
         }
     }
+
+    /// Convert a user/group entry into the deny-only form used by filtered tokens.
+    pub fn make_deny_only(&mut self) {
+        use crate::create_token::{
+            SE_GROUP_ENABLED, SE_GROUP_ENABLED_BY_DEFAULT, SE_GROUP_USE_FOR_DENY_ONLY,
+        };
+        self.attributes &= !(SE_GROUP_ENABLED | SE_GROUP_ENABLED_BY_DEFAULT);
+        self.attributes |= SE_GROUP_USE_FOR_DENY_ONLY;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -355,7 +367,12 @@ pub struct AccessToken {
     /// Meaningful for impersonation tokens; primary tokens keep this at `Anonymous`.
     pub impersonation_level: SecurityImpersonationLevel,
     pub user: Sid,
+    /// Native `TOKEN_USER.User.Attributes`, retained independently so filtering the user SID into
+    /// deny-only state is observable and affects access checks.
+    pub user_attributes: u32,
     pub groups: Vec<TokenGroup>,
+    /// Restricting SIDs. A non-empty set makes access checks perform the native second DACL pass.
+    pub restricted_sids: Vec<TokenGroup>,
     pub privileges: Vec<TokenPrivilege>,
     pub owner: Sid,
     pub primary_group: Sid,
@@ -369,6 +386,8 @@ pub struct AccessToken {
     pub originating_logon_session: Luid,
     /// Per-token audit policy. This remains token-owned even when no audit event sink is active.
     pub audit_policy: TokenAuditPolicy,
+    /// `TOKEN_SANDBOX_INERT`, set only by token filtering and inherited by duplication/filtering.
+    pub sandbox_inert: bool,
 }
 
 impl AccessToken {
@@ -471,7 +490,10 @@ impl AccessToken {
 
     /// The SIDs that can satisfy an *allow* ACE: the user + enabled, non-deny-only groups.
     pub fn allow_sids(&self) -> Vec<&Sid> {
-        let mut sids = vec![&self.user];
+        let mut sids = Vec::new();
+        if self.user_attributes & crate::create_token::SE_GROUP_USE_FOR_DENY_ONLY == 0 {
+            sids.push(&self.user);
+        }
         for g in &self.groups {
             if g.is_enabled() && !g.is_deny_only() {
                 sids.push(&g.sid);
@@ -487,6 +509,27 @@ impl AccessToken {
             sids.push(&g.sid);
         }
         sids
+    }
+
+    /// The enabled restricting SIDs used for the second allow-ACE pass.
+    pub fn restricted_allow_sids(&self) -> Vec<&Sid> {
+        self.restricted_sids
+            .iter()
+            .filter(|group| group.is_enabled() && !group.is_deny_only())
+            .map(|group| &group.sid)
+            .collect()
+    }
+
+    /// Every restricting SID can match a deny ACE.
+    pub fn restricted_deny_sids(&self) -> Vec<&Sid> {
+        self.restricted_sids
+            .iter()
+            .map(|group| &group.sid)
+            .collect()
+    }
+
+    pub fn is_restricted(&self) -> bool {
+        !self.restricted_sids.is_empty()
     }
 
     fn privilege(name: &'static str, low: u32, enabled: bool) -> TokenPrivilege {
@@ -596,11 +639,13 @@ impl AccessToken {
             token_type: TokenType::Primary,
             impersonation_level: SecurityImpersonationLevel::Anonymous,
             user: Sid::local_system(),
+            user_attributes: 0,
             groups: vec![
                 TokenGroup::enabled_owner(Sid::administrators()),
                 TokenGroup::enabled(Sid::authenticated_users()),
                 TokenGroup::enabled(Sid::everyone()),
             ],
+            restricted_sids: Vec::new(),
             privileges: vec![
                 Self::priv_enabled(SE_TCB, 7),
                 Self::privilege(SE_CREATE_TOKEN, 2, false),
@@ -634,6 +679,7 @@ impl AccessToken {
             authentication_id: Luid::new(0x3e7), // SYSTEM_LUID
             originating_logon_session: Luid::new(0x3e7),
             audit_policy: TokenAuditPolicy::default(),
+            sandbox_inert: false,
         }
     }
 
@@ -643,12 +689,14 @@ impl AccessToken {
             token_type: TokenType::Primary,
             impersonation_level: SecurityImpersonationLevel::Anonymous,
             user: Sid::local_account(machine, 1001),
+            user_attributes: 0,
             groups: vec![
                 TokenGroup::enabled(Sid::administrators()),
                 TokenGroup::enabled(Sid::users()),
                 TokenGroup::enabled(Sid::authenticated_users()),
                 TokenGroup::enabled(Sid::everyone()),
             ],
+            restricted_sids: Vec::new(),
             privileges: vec![
                 Self::priv_enabled(SE_LOAD_DRIVER, 10),
                 Self::priv_enabled(SE_TAKE_OWNERSHIP, 9),
@@ -662,6 +710,7 @@ impl AccessToken {
             authentication_id: Luid::new(0x1_0000),
             originating_logon_session: Luid::new(0x1_0000),
             audit_policy: TokenAuditPolicy::default(),
+            sandbox_inert: false,
         }
     }
 
@@ -671,11 +720,13 @@ impl AccessToken {
             token_type: TokenType::Primary,
             impersonation_level: SecurityImpersonationLevel::Anonymous,
             user: Sid::local_account(machine, 1000),
+            user_attributes: 0,
             groups: vec![
                 TokenGroup::enabled(Sid::users()),
                 TokenGroup::enabled(Sid::authenticated_users()),
                 TokenGroup::enabled(Sid::everyone()),
             ],
+            restricted_sids: Vec::new(),
             privileges: vec![Self::priv_enabled(SE_CHANGE_NOTIFY, 23)],
             owner: Sid::local_account(machine, 1000),
             primary_group: Sid::users(),
@@ -684,6 +735,7 @@ impl AccessToken {
             authentication_id: Luid::new(0x2_0000),
             originating_logon_session: Luid::new(0x2_0000),
             audit_policy: TokenAuditPolicy::default(),
+            sandbox_inert: false,
         }
     }
 }
@@ -893,6 +945,43 @@ impl TokenStore {
         let authentication_id = duplicate.authentication_id;
         self.objects.push(Some(TokenObject {
             token: duplicate,
+            references: 1,
+            token_luid,
+            modified_luid,
+            expiration_time,
+            dynamic_charged,
+            source: token_source,
+            session_referenced: true,
+        }));
+        self.reference_logon_session(authentication_id);
+        Ok(TokenId(self.objects.len() as u32))
+    }
+
+    /// Create the independent token object produced by `NtFilterToken`. Object metadata is
+    /// inherited from the source, while both object LUIDs and the logon-session reference are new.
+    pub fn filter(
+        &mut self,
+        source: TokenId,
+        request: crate::token_filter::TokenFilterRequest<'_>,
+    ) -> Result<TokenId, u32> {
+        let (filtered, expiration_time, dynamic_charged, token_source) = {
+            let source = self
+                .objects
+                .get(source.slot())
+                .and_then(Option::as_ref)
+                .ok_or(STATUS_INVALID_HANDLE)?;
+            (
+                crate::token_filter::filter_access_token(&source.token, request)?,
+                source.expiration_time,
+                source.dynamic_charged,
+                source.source,
+            )
+        };
+        let token_luid = self.allocate_luid();
+        let modified_luid = self.allocate_luid();
+        let authentication_id = filtered.authentication_id;
+        self.objects.push(Some(TokenObject {
+            token: filtered,
             references: 1,
             token_luid,
             modified_luid,

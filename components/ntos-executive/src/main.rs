@@ -1145,6 +1145,7 @@ pub const SSN_NT_DELETE_VALUE_KEY: u64 = 68;
 /// Security-token SSNs. The Ex opens differ only by their handle-attribute argument.
 pub const SSN_NT_ACCESS_CHECK: u64 = 1;
 pub const SSN_NT_DUPLICATE_TOKEN: u64 = 72;
+pub const SSN_NT_FILTER_TOKEN: u64 = 79;
 /// NtCreateToken — lsasrv's `LsapLogonUser` mints the interactive logon token here
 /// (`references/reactos/dll/win32/lsasrv/authpackage.c:1655`). THIRTEEN arguments: 4 in registers,
 /// nine off the caller's stack, and six of them point at variable-length `TOKEN_*` structures.
@@ -23565,6 +23566,10 @@ fn build_nt_table() -> NativeServiceTable {
             (
                 NativeService::NtDuplicateToken,
                 SSN_NT_DUPLICATE_TOKEN as u32,
+            ),
+            (
+                NativeService::NtFilterToken,
+                SSN_NT_FILTER_TOKEN as u32,
             ),
             (NativeService::NtCreateToken, SSN_NT_CREATE_TOKEN as u32),
             (NativeService::NtAccessCheck, SSN_NT_ACCESS_CHECK as u32),
