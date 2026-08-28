@@ -236,6 +236,8 @@ pub enum NativeService {
     NtCreateSymbolicLinkObject,
     NtOpenSymbolicLinkObject,
     NtQuerySymbolicLinkObject,
+    /// `NtSetInformationToken` mutates token-owned default, session, audit, and origin state.
+    NtSetInformationToken,
     // Group B2: out-writing query services whose out-ptr may be an arbitrary hosted VA (demand-
     // filled by the executive after dispatch via a queued-write side-channel).
     NtQueryPerformanceCounter,
@@ -419,6 +421,7 @@ impl NativeService {
             NtCreateSymbolicLinkObject => "NtCreateSymbolicLinkObject",
             NtOpenSymbolicLinkObject => "NtOpenSymbolicLinkObject",
             NtQuerySymbolicLinkObject => "NtQuerySymbolicLinkObject",
+            NtSetInformationToken => "NtSetInformationToken",
             NtQueryPerformanceCounter => "NtQueryPerformanceCounter",
             NtQueryVolumeInformationFile => "NtQueryVolumeInformationFile",
             NtOpenSection => "NtOpenSection",
@@ -618,6 +621,7 @@ impl NativeService {
         NativeService::NtPrivilegeCheck,
         NativeService::NtImpersonateThread,
         NativeService::NtAdjustGroupsToken,
+        NativeService::NtSetInformationToken,
     ];
 }
 

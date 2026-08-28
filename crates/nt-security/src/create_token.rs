@@ -500,6 +500,7 @@ pub fn capture_token(
             // `SepCreateToken` zero-initializes this field. A logon authority may publish the
             // origin later through TokenOrigin; duplication preserves it thereafter.
             originating_logon_session: Luid::new(0),
+            audit_policy: crate::TokenAuditPolicy::default(),
         },
         expiration_time,
         source,

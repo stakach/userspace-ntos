@@ -823,6 +823,166 @@ fn token_store_mutations_advance_modified_id_with_native_semantics() {
 }
 
 #[test]
+fn token_store_primary_group_enforces_membership_and_dynamic_charge() {
+    let mut token = AccessToken::system();
+    let mut long_sid = Sid::everyone();
+    long_sid.sub_authorities = (0..15).collect();
+    token.groups.push(TokenGroup::enabled(long_sid.clone()));
+
+    let mut acl = vec![0u8; 440];
+    acl[0] = 2;
+    acl[2..4].copy_from_slice(&440u16.to_le_bytes());
+    token.default_dacl = Some(NativeAcl::from_bytes(&acl).unwrap());
+
+    let mut store = TokenStore::new();
+    let id = store.insert(token);
+    let initial = store.statistics(id).unwrap().modified_id;
+    assert_eq!(
+        store.set_primary_group(id, Sid::users()),
+        Err(STATUS_INVALID_PRIMARY_GROUP)
+    );
+    assert_eq!(store.statistics(id).unwrap().modified_id, initial);
+    assert_eq!(
+        store.set_primary_group(id, long_sid),
+        Err(STATUS_ALLOTTED_SPACE_EXCEEDED)
+    );
+    assert_eq!(store.statistics(id).unwrap().modified_id, initial);
+
+    store.set_primary_group(id, Sid::administrators()).unwrap();
+    assert_eq!(store.get(id).unwrap().primary_group, Sid::administrators());
+    assert_ne!(store.statistics(id).unwrap().modified_id, initial);
+}
+
+#[test]
+fn token_store_owns_session_origin_and_audit_lifecycles() {
+    let mut token = AccessToken::user(MACHINE);
+    token.originating_logon_session = Luid::default();
+    let authentication_id = token.authentication_id;
+    let mut store = TokenStore::new();
+    let id = store.insert(token);
+    assert_eq!(
+        store.logon_session_reference_count(authentication_id),
+        Some(1)
+    );
+
+    let duplicate = store
+        .duplicate(
+            id,
+            TokenType::Impersonation,
+            SecurityImpersonationLevel::Impersonation,
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        store.logon_session_reference_count(authentication_id),
+        Some(2)
+    );
+    assert!(store.set_session_referenced(id, false).unwrap());
+    assert!(!store.set_session_referenced(id, false).unwrap());
+    assert_eq!(
+        store.set_session_referenced(id, true),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        store.logon_session_reference_count(authentication_id),
+        Some(1)
+    );
+    store.release(id).unwrap();
+    assert_eq!(
+        store.logon_session_reference_count(authentication_id),
+        Some(1)
+    );
+    store.release(duplicate).unwrap();
+    assert_eq!(
+        store.logon_session_reference_count(authentication_id),
+        Some(0)
+    );
+
+    let mut origin_token = AccessToken::user(MACHINE);
+    origin_token.originating_logon_session = Luid::default();
+    let origin_id = store.insert(origin_token);
+    let before = store.statistics(origin_id).unwrap().modified_id;
+    assert!(store.set_origin(origin_id, Luid::new(0x1234)).unwrap());
+    let after_origin = store.statistics(origin_id).unwrap().modified_id;
+    assert_ne!(after_origin, before);
+    assert!(!store.set_origin(origin_id, Luid::new(0x5678)).unwrap());
+    assert_eq!(
+        store.statistics(origin_id).unwrap().modified_id,
+        after_origin
+    );
+    assert_eq!(
+        store.get(origin_id).unwrap().originating_logon_session,
+        Luid::new(0x1234)
+    );
+
+    let policy = TokenAuditPolicy::from_entries(&[(0, 1), (4, 3), (8, 2)]).unwrap();
+    assert_eq!(policy.category(0), Some(1));
+    assert_eq!(policy.category(4), Some(3));
+    assert_eq!(policy.category(8), Some(2));
+    assert_eq!(policy.category(9), None);
+    assert_eq!(
+        TokenAuditPolicy::from_entries(&[(9, 1)]),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        TokenAuditPolicy::from_entries(&[(0, 0x10)]),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    store.set_audit_policy(origin_id, policy).unwrap();
+    assert_eq!(store.get(origin_id).unwrap().audit_policy, policy);
+    assert_ne!(
+        store.statistics(origin_id).unwrap().modified_id,
+        after_origin
+    );
+
+    let before_session = store.statistics(origin_id).unwrap().modified_id;
+    store.set_session_id(origin_id, 7).unwrap();
+    assert_eq!(store.get(origin_id).unwrap().session_id, 7);
+    assert_ne!(
+        store.statistics(origin_id).unwrap().modified_id,
+        before_session
+    );
+}
+
+#[test]
+fn token_information_set_planner_enforces_native_classes_lengths_and_access() {
+    use TokenSetInformationClass::*;
+
+    for (class, length, expected, access, tcb) in [
+        (4, 8, Owner, TOKEN_ADJUST_DEFAULT, false),
+        (5, 16, PrimaryGroup, TOKEN_ADJUST_DEFAULT, false),
+        (6, 8, DefaultDacl, TOKEN_ADJUST_DEFAULT, false),
+        (
+            12,
+            4,
+            SessionId,
+            TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID,
+            true,
+        ),
+        (14, 4, SessionReference, TOKEN_ADJUST_DEFAULT, true),
+        (16, 4, AuditPolicy, TOKEN_ADJUST_DEFAULT, true),
+        (17, 8, Origin, TOKEN_ADJUST_DEFAULT, true),
+    ] {
+        let plan = plan_token_information_set(class, length).unwrap();
+        assert_eq!(plan.class, expected);
+        assert_eq!(plan.required_access, access);
+        assert_eq!(plan.requires_tcb, tcb);
+    }
+    assert_eq!(
+        plan_token_information_set(4, 7),
+        Err(token_set::STATUS_INFO_LENGTH_MISMATCH)
+    );
+    assert_eq!(
+        plan_token_information_set(12, 8),
+        Err(token_set::STATUS_INFO_LENGTH_MISMATCH)
+    );
+    assert_eq!(
+        plan_token_information_set(15, 4),
+        Err(token_set::STATUS_INVALID_INFO_CLASS)
+    );
+}
+
+#[test]
 fn privilege_adjustment_plans_applies_and_reports_previous_state() {
     let mut token = AccessToken::system();
     let requested = [

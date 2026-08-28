@@ -130,11 +130,47 @@ pub fn token_can_impersonate(
 
 pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 pub const STATUS_INVALID_OWNER: u32 = 0xC000_005A;
+pub const STATUS_INVALID_PRIMARY_GROUP: u32 = 0xC000_005B;
 pub const STATUS_BAD_IMPERSONATION_LEVEL: u32 = 0xC000_00A5;
 pub const STATUS_BAD_TOKEN_TYPE: u32 = 0xC000_00A8;
 pub const STATUS_ALLOTTED_SPACE_EXCEEDED: u32 = 0xC000_0099;
 pub const STATUS_CANT_DISABLE_MANDATORY: u32 = 0xC000_005D;
 pub const STATUS_CANT_ENABLE_DENY_ONLY: u32 = 0xC000_02B3;
+pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+
+/// The nine NT5 audit categories stored in the token's packed `SEP_AUDIT_POLICY`.
+pub const TOKEN_AUDIT_CATEGORY_COUNT: usize = 9;
+
+/// Per-token audit selection. Each category owns the native four-bit success/failure policy value.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TokenAuditPolicy {
+    categories: [u8; TOKEN_AUDIT_CATEGORY_COUNT],
+}
+
+impl TokenAuditPolicy {
+    pub fn from_entries(entries: &[(u32, u8)]) -> Result<Self, u32> {
+        let mut policy = Self::default();
+        for &(category, value) in entries {
+            let slot = policy
+                .categories
+                .get_mut(category as usize)
+                .ok_or(STATUS_INVALID_PARAMETER)?;
+            if value & !0x0f != 0 {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            *slot = value;
+        }
+        Ok(policy)
+    }
+
+    pub const fn category(self, category: usize) -> Option<u8> {
+        if category < TOKEN_AUDIT_CATEGORY_COUNT {
+            Some(self.categories[category])
+        } else {
+            None
+        }
+    }
+}
 
 /// A group in a token (spec §7.3), retaining the complete native attribute word losslessly.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -331,6 +367,8 @@ pub struct AccessToken {
     /// authentication ID against this identity, which is distinct from the token's current logon
     /// session and is inherited unchanged by token duplication.
     pub originating_logon_session: Luid,
+    /// Per-token audit policy. This remains token-owned even when no audit event sink is active.
+    pub audit_policy: TokenAuditPolicy,
 }
 
 impl AccessToken {
@@ -595,6 +633,7 @@ impl AccessToken {
             session_id: 0,
             authentication_id: Luid::new(0x3e7), // SYSTEM_LUID
             originating_logon_session: Luid::new(0x3e7),
+            audit_policy: TokenAuditPolicy::default(),
         }
     }
 
@@ -622,6 +661,7 @@ impl AccessToken {
             session_id: 1,
             authentication_id: Luid::new(0x1_0000),
             originating_logon_session: Luid::new(0x1_0000),
+            audit_policy: TokenAuditPolicy::default(),
         }
     }
 
@@ -643,6 +683,7 @@ impl AccessToken {
             session_id: 1,
             authentication_id: Luid::new(0x2_0000),
             originating_logon_session: Luid::new(0x2_0000),
+            audit_policy: TokenAuditPolicy::default(),
         }
     }
 }
@@ -678,6 +719,13 @@ struct TokenObject {
     expiration_time: i64,
     dynamic_charged: u32,
     source: TokenSource,
+    session_referenced: bool,
+}
+
+#[derive(Clone, Debug)]
+struct LogonSessionReference {
+    authentication_id: Luid,
+    token_references: u32,
 }
 
 /// The fixed native fields returned for `TokenStatistics`.
@@ -701,6 +749,7 @@ pub struct TokenStatistics {
 #[derive(Clone, Debug)]
 pub struct TokenStore {
     objects: Vec<Option<TokenObject>>,
+    logon_sessions: Vec<LogonSessionReference>,
     next_luid: u64,
 }
 
@@ -708,6 +757,7 @@ impl Default for TokenStore {
     fn default() -> Self {
         Self {
             objects: Vec::new(),
+            logon_sessions: Vec::new(),
             next_luid: 1,
         }
     }
@@ -721,6 +771,7 @@ impl TokenStore {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             objects: Vec::with_capacity(capacity),
+            logon_sessions: Vec::new(),
             next_luid: 1,
         }
     }
@@ -738,6 +789,7 @@ impl TokenStore {
         expiration_time: i64,
         source: TokenSource,
     ) -> TokenId {
+        self.reference_logon_session(token.authentication_id);
         let token_luid = self.allocate_luid();
         let modified_luid = self.allocate_luid();
         let dynamic_charged = dynamic_usage(&token).max(500) as u32;
@@ -749,6 +801,7 @@ impl TokenStore {
             expiration_time,
             dynamic_charged,
             source,
+            session_referenced: true,
         }));
         TokenId(self.objects.len() as u32)
     }
@@ -803,7 +856,12 @@ impl TokenStore {
             entry.references -= 1;
             return Ok(false);
         }
+        let authentication_id = entry.token.authentication_id;
+        let session_referenced = entry.session_referenced;
         self.objects[slot] = None;
+        if session_referenced {
+            self.dereference_logon_session(authentication_id);
+        }
         Ok(true)
     }
 
@@ -832,6 +890,7 @@ impl TokenStore {
             )
         };
         let token_luid = self.allocate_luid();
+        let authentication_id = duplicate.authentication_id;
         self.objects.push(Some(TokenObject {
             token: duplicate,
             references: 1,
@@ -840,7 +899,9 @@ impl TokenStore {
             expiration_time,
             dynamic_charged,
             source: token_source,
+            session_referenced: true,
         }));
+        self.reference_logon_session(authentication_id);
         Ok(TokenId(self.objects.len() as u32))
     }
 
@@ -922,6 +983,43 @@ impl TokenStore {
         Ok(())
     }
 
+    /// Replace the primary group with a SID already present in the token.
+    pub fn set_primary_group(&mut self, id: TokenId, primary_group: Sid) -> Result<(), u32> {
+        let slot = id.slot();
+        let object = self
+            .objects
+            .get(slot)
+            .and_then(Option::as_ref)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if object.token.user != primary_group
+            && !object
+                .token
+                .groups
+                .iter()
+                .any(|group| group.sid == primary_group)
+        {
+            return Err(STATUS_INVALID_PRIMARY_GROUP);
+        }
+        let usage = primary_group.native_len().unwrap_or(0).saturating_add(
+            object
+                .token
+                .default_dacl
+                .as_ref()
+                .map_or(0, |acl| acl.acl_size() as usize),
+        );
+        if usage > object.dynamic_charged as usize {
+            return Err(STATUS_ALLOTTED_SPACE_EXCEEDED);
+        }
+
+        let modified_luid = self.allocate_luid();
+        let object = self.objects[slot]
+            .as_mut()
+            .expect("validated token object disappeared");
+        object.token.primary_group = primary_group;
+        object.modified_luid = modified_luid;
+        Ok(())
+    }
+
     /// Replace the token default DACL within its fixed dynamic-space charge.
     pub fn set_default_dacl(
         &mut self,
@@ -960,6 +1058,89 @@ impl TokenStore {
         Ok(())
     }
 
+    /// Replace the terminal-services session ID and advance `ModifiedId`.
+    pub fn set_session_id(&mut self, id: TokenId, session_id: u32) -> Result<(), u32> {
+        let slot = id.slot();
+        if self.objects.get(slot).and_then(Option::as_ref).is_none() {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let modified_luid = self.allocate_luid();
+        let object = self.objects[slot]
+            .as_mut()
+            .expect("validated token object disappeared");
+        object.token.session_id = session_id;
+        object.modified_luid = modified_luid;
+        Ok(())
+    }
+
+    /// Set the token origin once. A nonzero origin is immutable, matching `TokenOrigin`.
+    pub fn set_origin(&mut self, id: TokenId, origin: Luid) -> Result<bool, u32> {
+        let slot = id.slot();
+        let object = self
+            .objects
+            .get(slot)
+            .and_then(Option::as_ref)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if object.token.originating_logon_session != Luid::default() {
+            return Ok(false);
+        }
+        let modified_luid = self.allocate_luid();
+        let object = self.objects[slot]
+            .as_mut()
+            .expect("validated token object disappeared");
+        object.token.originating_logon_session = origin;
+        object.modified_luid = modified_luid;
+        Ok(true)
+    }
+
+    /// Replace the token-owned audit policy and advance `ModifiedId`.
+    pub fn set_audit_policy(
+        &mut self,
+        id: TokenId,
+        audit_policy: TokenAuditPolicy,
+    ) -> Result<(), u32> {
+        let slot = id.slot();
+        if self.objects.get(slot).and_then(Option::as_ref).is_none() {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let modified_luid = self.allocate_luid();
+        let object = self.objects[slot]
+            .as_mut()
+            .expect("validated token object disappeared");
+        object.token.audit_policy = audit_policy;
+        object.modified_luid = modified_luid;
+        Ok(())
+    }
+
+    /// Drop this token's authentication-session reference. This transition is one-way and
+    /// idempotent; setting a reference is not supported by the native information class.
+    pub fn set_session_referenced(&mut self, id: TokenId, referenced: bool) -> Result<bool, u32> {
+        if referenced {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let slot = id.slot();
+        let object = self
+            .objects
+            .get_mut(slot)
+            .and_then(Option::as_mut)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if !object.session_referenced {
+            return Ok(false);
+        }
+        object.session_referenced = false;
+        let authentication_id = object.token.authentication_id;
+        self.dereference_logon_session(authentication_id);
+        Ok(true)
+    }
+
+    /// Number of live token references held against a known authentication session.
+    pub fn logon_session_reference_count(&self, authentication_id: Luid) -> Option<u32> {
+        self.logon_sessions
+            .iter()
+            .find(|session| session.authentication_id == authentication_id)
+            .map(|session| session.token_references)
+    }
+
     /// Return the query-visible metadata and dynamic-space accounting for a token.
     pub fn statistics(&self, id: TokenId) -> Option<TokenStatistics> {
         let object = self.objects.get(id.slot())?.as_ref()?;
@@ -987,6 +1168,31 @@ impl TokenStore {
         Luid {
             low: value as u32,
             high: (value >> 32) as i32,
+        }
+    }
+
+    fn reference_logon_session(&mut self, authentication_id: Luid) {
+        if let Some(session) = self
+            .logon_sessions
+            .iter_mut()
+            .find(|session| session.authentication_id == authentication_id)
+        {
+            session.token_references = session.token_references.saturating_add(1);
+            return;
+        }
+        self.logon_sessions.push(LogonSessionReference {
+            authentication_id,
+            token_references: 1,
+        });
+    }
+
+    fn dereference_logon_session(&mut self, authentication_id: Luid) {
+        if let Some(session) = self
+            .logon_sessions
+            .iter_mut()
+            .find(|session| session.authentication_id == authentication_id)
+        {
+            session.token_references = session.token_references.saturating_sub(1);
         }
     }
 }

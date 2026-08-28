@@ -19008,6 +19008,163 @@ impl ExecNtHandler {
         }
     }
 
+    unsafe fn nt_set_information_token(&mut self, args: &[u64]) -> u32 {
+        const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+        const AUDIT_POLICY_ENTRY_SIZE: usize = 8;
+        use nt_security::TokenSetInformationClass::*;
+
+        let information_class = nt_ulong_arg(args[1]);
+        let information = args[2];
+        let information_length = nt_ulong_arg(args[3]) as usize;
+        let plan = match nt_security::plan_token_information_set(
+            information_class,
+            information_length,
+        ) {
+            Ok(plan) => plan,
+            Err(status) => return status,
+        };
+        if information & 3 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+
+        let mut captured = [0u8; 8];
+        if !self.xas_read(information, &mut captured[..plan.fixed_length]) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let token_id = match self.token_id_for_handle(args[0], plan.required_access) {
+            Ok(token) => token,
+            Err(status) => return status,
+        };
+
+        match plan.class {
+            Owner => {
+                let owner = match nt_security::capture_sid(
+                    &ExecClientMemory { handler: self },
+                    u64::from_le_bytes(captured),
+                ) {
+                    Ok(owner) => owner,
+                    Err(status) => return status,
+                };
+                self.token_store.set_owner(token_id, owner).err().unwrap_or(0)
+            }
+            PrimaryGroup => {
+                let primary_group = match nt_security::capture_sid(
+                    &ExecClientMemory { handler: self },
+                    u64::from_le_bytes(captured),
+                ) {
+                    Ok(primary_group) => primary_group,
+                    Err(status) => return status,
+                };
+                self.token_store
+                    .set_primary_group(token_id, primary_group)
+                    .err()
+                    .unwrap_or(0)
+            }
+            DefaultDacl => {
+                let acl_pointer = u64::from_le_bytes(captured);
+                let default_dacl = if acl_pointer == 0 {
+                    None
+                } else {
+                    match nt_security::capture_acl(&ExecClientMemory { handler: self }, acl_pointer)
+                    {
+                        Ok(acl) => Some(acl),
+                        Err(status) => return status,
+                    }
+                };
+                self.token_store
+                    .set_default_dacl(token_id, default_dacl)
+                    .err()
+                    .unwrap_or(0)
+            }
+            SessionId => {
+                if !self.current_token_has_privilege(nt_security::SE_TCB) {
+                    return STATUS_PRIVILEGE_NOT_HELD;
+                }
+                self.token_store
+                    .set_session_id(
+                        token_id,
+                        u32::from_le_bytes(captured[..4].try_into().unwrap()),
+                    )
+                    .err()
+                    .unwrap_or(0)
+            }
+            SessionReference => {
+                if !self.current_token_has_privilege(nt_security::SE_TCB) {
+                    return STATUS_PRIVILEGE_NOT_HELD;
+                }
+                self.token_store
+                    .set_session_referenced(
+                        token_id,
+                        u32::from_le_bytes(captured[..4].try_into().unwrap()) != 0,
+                    )
+                    .err()
+                    .unwrap_or(0)
+            }
+            AuditPolicy => {
+                let count = u32::from_le_bytes(captured[..4].try_into().unwrap()) as usize;
+                if count > nt_security::TOKEN_AUDIT_CATEGORY_COUNT {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                let required_length = match count
+                    .checked_mul(AUDIT_POLICY_ENTRY_SIZE)
+                    .and_then(|entries| entries.checked_add(4))
+                {
+                    Some(length) => length,
+                    None => return STATUS_INVALID_PARAMETER,
+                };
+                if information_length < required_length {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                let mut entries = [(0u32, 0u8); nt_security::TOKEN_AUDIT_CATEGORY_COUNT];
+                for (index, entry) in entries[..count].iter_mut().enumerate() {
+                    let mut bytes = [0u8; AUDIT_POLICY_ENTRY_SIZE];
+                    let Some(entry_address) = information
+                        .checked_add(4)
+                        .and_then(|address| {
+                            address.checked_add((index * AUDIT_POLICY_ENTRY_SIZE) as u64)
+                        })
+                    else {
+                        return STATUS_ACCESS_VIOLATION;
+                    };
+                    if !self.xas_read(entry_address, &mut bytes) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    *entry = (
+                        u32::from_le_bytes(bytes[..4].try_into().unwrap()),
+                        bytes[4],
+                    );
+                }
+                let audit_policy = match nt_security::TokenAuditPolicy::from_entries(&entries[..count])
+                {
+                    Ok(policy) => policy,
+                    Err(status) => return status,
+                };
+                if !self.current_token_has_privilege(nt_security::SE_TCB) {
+                    return STATUS_PRIVILEGE_NOT_HELD;
+                }
+                self.token_store
+                    .set_audit_policy(token_id, audit_policy)
+                    .err()
+                    .unwrap_or(0)
+            }
+            Origin => {
+                if !self.current_token_has_privilege(nt_security::SE_TCB) {
+                    return STATUS_PRIVILEGE_NOT_HELD;
+                }
+                self.token_store
+                    .set_origin(
+                        token_id,
+                        nt_security::Luid {
+                            low: u32::from_le_bytes(captured[..4].try_into().unwrap()),
+                            high: i32::from_le_bytes(captured[4..8].try_into().unwrap()),
+                        },
+                    )
+                    .map(|_| 0)
+                    .unwrap_or_else(|status| status)
+            }
+        }
+    }
+
     /// Queue an 8-byte out-param write for the loop to perform after dispatch (group B2). Silently
     /// drops if the fixed queue is full (bounded per-syscall — no handler queues more than 6).
     pub(crate) fn queue_write(&mut self, ptr: u64, val: u64) {
@@ -31278,6 +31435,7 @@ impl ExecNtHandler {
                 self.nt_adjust_privileges_token(args)
             },
             NativeService::NtAdjustGroupsToken => unsafe { self.nt_adjust_groups_token(args) },
+            NativeService::NtSetInformationToken => unsafe { self.nt_set_information_token(args) },
             NativeService::NtResumeProcess | NativeService::NtSuspendProcess => {
                 let handle = args.first().copied().unwrap_or(0);
                 if self.resolve_process_handle(handle).is_some() {
@@ -31377,10 +31535,11 @@ impl ExecNtHandler {
                 if retlen_ptr == 0 || !self.probe_user_output(retlen_ptr, 4) {
                     return STATUS_ACCESS_VIOLATION;
                 }
-                if class == 9 && len != 4 {
+                if (matches!(class, 9 | 12) && len != 4) || (class == 17 && len != 8) {
                     return STATUS_INFO_LENGTH_MISMATCH;
                 }
-                let token_id = match self.token_id_for_handle(args[0], TOKEN_QUERY) {
+                let required_access = if class == 7 { 0x0010 } else { TOKEN_QUERY };
+                let token_id = match self.token_id_for_handle(args[0], required_access) {
                     Ok(token) => token,
                     Err(status) => return status,
                 };
@@ -31458,6 +31617,16 @@ impl ExecNtHandler {
                         nt_security::encode_token_default_dacl(token, buf, &mut output)
                             .required_length
                     }
+                    7 => {
+                        let source = match self.token_store.source(token_id) {
+                            Some(source) => source,
+                            None => return 0xC000_0008,
+                        };
+                        output[..8].copy_from_slice(&source.name);
+                        output[8..12].copy_from_slice(&source.identifier.low.to_le_bytes());
+                        output[12..16].copy_from_slice(&source.identifier.high.to_le_bytes());
+                        16
+                    }
                     8 => {
                         output[..4].copy_from_slice(&(token.token_type as u32).to_le_bytes());
                         4
@@ -31477,6 +31646,17 @@ impl ExecNtHandler {
                         };
                         nt_security::encode_token_statistics(statistics, &mut output)
                             .required_length
+                    }
+                    12 => {
+                        output[..4].copy_from_slice(&token.session_id.to_le_bytes());
+                        4
+                    }
+                    17 => {
+                        output[..4]
+                            .copy_from_slice(&token.originating_logon_session.low.to_le_bytes());
+                        output[4..8]
+                            .copy_from_slice(&token.originating_logon_session.high.to_le_bytes());
+                        8
                     }
                     _ => return STATUS_INVALID_INFO_CLASS,
                 };
