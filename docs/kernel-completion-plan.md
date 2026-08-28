@@ -15291,3 +15291,42 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     three optional variable-length arrays before mutation and expose the resulting restricted and
     sandbox-inert state through native token queries. Unsupported filter flags must fail rather than
     being ignored.
+
+    `NtFilterToken` (2026-08-29, accepted): SSN 79 is now a typed registered six-argument service
+    with no numeric dispatch branch. The reusable security model owns restricted SIDs and
+    sandbox-inert state, creates an independent token object with fresh token and modification
+    identifiers, retains a real logon-session reference, converts selected groups to deny-only
+    state, deletes selected privileges (or all except `SeChangeNotifyPrivilege`), and validates,
+    normalizes, and deduplicates added restricted SIDs. Unsupported NT5 filter flags fail with
+    `STATUS_INVALID_PARAMETER` instead of being ignored.
+
+    Restricted tokens now participate in access checks through the native second DACL pass; ACL
+    rights must be granted by both the normal SID set and the restricting SID set. Deny-only users
+    cannot acquire implicit owner rights. Token queries expose `TokenRestrictedSids`,
+    `TokenGroupsAndPrivileges`, and `TokenSandBoxInert` from authoritative state, including exact
+    variable-size layouts and caller-space pointers. The executive captures all three optional
+    arrays before creating the token, requires `TOKEN_DUPLICATE`, preserves the source handle's
+    granted access, and transfers the new token's owned reference directly into the handle table.
+
+    Focused validation passes `nt-security` `75/75`, `nt-syscall` `62/62`, `git diff --check`, the
+    freestanding executive at the established 212-warning baseline, and the release build/staging
+    path. Code checkpoint `b9239742` is pushed. Serialized acceptance
+    `.tmp/run-headless-filter-token-20260829.log` reached the final gate at 111,747 ms, launched
+    genuine userinit and Explorer, completed 669 Explorer api0 redirects with zero callback or
+    dead-callback failures, recorded paint begin/end `5/20`, 187 direct GDI returns, and 135 batch
+    flushes covering 184 records, painted `480000/480000` framebuffer pixels with at least 32
+    colours, passed all `295/295` gates, and matched the sentinel. Startup did not issue SSN 79, so
+    this is explicitly a full non-regression gate while focused tests prove the direct filtering
+    contract. Snapshot generation 5 committed 1,755,492 bytes, scratch returned to zero, and the
+    census reported no page-table, frame, mapping, alias, registry, untyped-allocation,
+    frame-registration, image-bank, or allocator failure.
+
+    Review adjustment: the typed surface now contains 171 services, the hosted table registers 170
+    numbered variants, and 52 canonical ABI exports remain absent. Converge `NtCallbackReturn`
+    (SSN 22) next. Its callback continuation transport is already real and heavily exercised by the
+    desktop, but the executive still recognizes it through the literal `m0 == 22` before typed
+    dispatch. Register the canonical three-argument service, classify the continuation operation
+    through service-table identity, and remove the numeric exception. Preserve the necessarily
+    non-returning continuation behavior, deferred out-of-order returns, nested callbacks, GDI batch
+    flushes, and dead-client unwind; a call with no active callback must return the native failure
+    status rather than falling through or fabricating success.
