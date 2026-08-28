@@ -3138,7 +3138,10 @@ impl ExecNtHandler {
         write_field!(tp_worker_window_used, zeroed_process_slot_u64_vec());
         write_field!(thread_runtime, HostedThreadRuntimes::reset());
         write_field!(win32k_session, Win32kSessionRuntime::reset());
-        write_field!(token_store, nt_security::TokenStore::with_capacity(64));
+        let mut token_store = nt_security::TokenStore::with_capacity(64);
+        let anonymous_logon_tokens = token_store.insert_anonymous_logon_tokens();
+        write_field!(token_store, token_store);
+        write_field!(anonymous_logon_tokens, anonymous_logon_tokens);
         write_field!(overlay, nt_hive_core::RegistryOverlay::with_capacity(64));
         write_field!(writable_fs_dirty, false);
         write_field!(writable_fs_commit_required, false);
@@ -18706,6 +18709,68 @@ impl ExecNtHandler {
         )
     }
 
+    fn everyone_includes_anonymous(&self) -> Result<bool, u32> {
+        const LSA_CONTROL_PATH: &str =
+            "\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Lsa";
+        const POLICY_VALUE: &str = "EveryoneIncludesAnonymous";
+
+        let key = self
+            .mutable_registry_key_by_path(LSA_CONTROL_PATH)
+            .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+        let (value_type, data) = self
+            .mutable_hives
+            .query_value(key, POLICY_VALUE)
+            .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+        if value_type != nt_hive_core::RegistryValueType::Dword || data.len() != 4 {
+            return Err(STATUS_OBJECT_TYPE_MISMATCH);
+        }
+        Ok(u32::from_le_bytes([data[0], data[1], data[2], data[3]]) != 0)
+    }
+
+    unsafe fn nt_impersonate_anonymous_token(&mut self, thread_handle: u64) -> u32 {
+        const THREAD_IMPERSONATE: u32 = 0x0100;
+
+        let caller_pid = match self.pm_pid_for_pi(self.pi) {
+            Some(pid) => pid,
+            None => return STATUS_INVALID_HANDLE,
+        };
+        let target_tid = match self.pm.resolve_thread_handle(
+            caller_pid,
+            self.current_tid as nt_process::ThreadId,
+            thread_handle,
+            THREAD_IMPERSONATE,
+        ) {
+            Ok(tid) => tid,
+            Err(status) => return status,
+        };
+        let include_everyone = match self.everyone_includes_anonymous() {
+            Ok(include) => include,
+            Err(status) => return status,
+        };
+        let caller_primary = match self.pm.process_primary_token(caller_pid) {
+            Some(token) => token,
+            None => return STATUS_UNSUCCESSFUL,
+        };
+        let token = match self.token_store.reference_anonymous_logon_token(
+            self.anonymous_logon_tokens,
+            include_everyone,
+            caller_primary,
+        ) {
+            Ok(token) => token,
+            Err(status) => return status,
+        };
+
+        self.install_thread_impersonation_context(
+            target_tid,
+            Some(nt_process::ImpersonationContext {
+                token,
+                copy_on_open: true,
+                effective_only: false,
+                level: nt_security::SecurityImpersonationLevel::Impersonation,
+            }),
+        )
+    }
+
     unsafe fn nt_set_thread_impersonation_token(&mut self, args: &[u64]) -> u32 {
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
         const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
@@ -30574,6 +30639,9 @@ impl ExecNtHandler {
             NativeService::NtCreateToken => unsafe { self.nt_create_token(args) },
             NativeService::NtAccessCheck => unsafe { self.nt_access_check(ctx, args) },
             NativeService::NtPrivilegeCheck => unsafe { self.nt_privilege_check(ctx, args) },
+            NativeService::NtImpersonateAnonymousToken => unsafe {
+                self.nt_impersonate_anonymous_token(args[0])
+            },
             NativeService::NtImpersonateThread => unsafe { self.nt_impersonate_thread(args) },
             NativeService::NtResumeThread => unsafe {
                 self.nt_resume_thread_with_user_memory(args, SyscallUserMemory::CurrentProcess)

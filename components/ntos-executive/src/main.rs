@@ -1171,6 +1171,9 @@ pub const SSN_NT_ADJUST_GROUPS_TOKEN: u64 = 11;
 pub const SSN_NT_ADJUST_PRIV_TOKEN: u64 = 12;
 /// NtPrivilegeCheck — evaluates an in/out PRIVILEGE_SET against a queryable token handle.
 pub const SSN_NT_PRIVILEGE_CHECK: u64 = 140;
+/// NtImpersonateAnonymousToken — assigns one of the two kernel-owned Anonymous Logon identities
+/// to a target ETHREAD according to the LSA `EveryoneIncludesAnonymous` policy.
+pub const SSN_NT_IMPERSONATE_ANONYMOUS_TOKEN: u64 = 93;
 /// NtImpersonateThread — installs one thread's effective client context on another ETHREAD.
 pub const SSN_NT_IMPERSONATE_THREAD: u64 = 95;
 /// Process/thread lifecycle SSNs (ReactOS numbering = sysfuncs.lst line − 1, cross-checked against
@@ -21829,6 +21832,9 @@ struct ExecNtHandler {
     /// Stable, reference-counted token objects. Each EPROCESS records its primary `TokenId`; token
     /// handles and ETHREAD impersonation contexts retain independent references and their storage.
     token_store: nt_security::TokenStore,
+    /// The two security-subsystem-owned Anonymous Logon identities. Each syscall selects one by
+    /// current LSA policy and retains a separate reference for the target ETHREAD.
+    anonymous_logon_tokens: nt_security::AnonymousLogonTokenIds,
     /// Volatile registry write plane for keys that do not belong to a mounted mutable hive.
     /// Mounted hive paths use `mutable_hives`; this overlay remains for explicitly volatile state
     /// such as boot-created Control keys until D4 gives volatile keys first-class hive ownership.
@@ -23628,6 +23634,10 @@ fn build_nt_table() -> NativeServiceTable {
             (
                 NativeService::NtPrivilegeCheck,
                 SSN_NT_PRIVILEGE_CHECK as u32,
+            ),
+            (
+                NativeService::NtImpersonateAnonymousToken,
+                SSN_NT_IMPERSONATE_ANONYMOUS_TOKEN as u32,
             ),
             (
                 NativeService::NtImpersonateThread,

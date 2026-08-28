@@ -146,6 +146,20 @@ impl NativeAcl {
             bytes: bytes.to_vec(),
         }
     }
+
+    pub(crate) fn anonymous_logon_default() -> Self {
+        // ACL header followed by GENERIC_ALL ACEs for Everyone and Anonymous Logon.
+        let bytes = [
+            2, 0, 48, 0, 2, 0, 0, 0, // ACL
+            0, 0, 20, 0, 0, 0, 0, 16, // ACCESS_ALLOWED_ACE
+            1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, // Everyone
+            0, 0, 20, 0, 0, 0, 0, 16, // ACCESS_ALLOWED_ACE
+            1, 1, 0, 0, 0, 0, 0, 5, 7, 0, 0, 0, // Anonymous Logon
+        ];
+        Self {
+            bytes: bytes.to_vec(),
+        }
+    }
 }
 
 fn validate_sid(bytes: &[u8]) -> Result<(), NativeAclError> {

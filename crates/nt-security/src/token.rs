@@ -683,6 +683,34 @@ impl AccessToken {
         }
     }
 
+    /// One of the two kernel-owned Anonymous Logon primary tokens. NT keeps both identities alive
+    /// for the life of the security subsystem and selects between them using the
+    /// `EveryoneIncludesAnonymous` LSA policy.
+    pub fn anonymous_logon(include_everyone: bool) -> Self {
+        let anonymous = Sid::anonymous_logon();
+        AccessToken {
+            token_type: TokenType::Primary,
+            impersonation_level: SecurityImpersonationLevel::Anonymous,
+            user: anonymous.clone(),
+            user_attributes: 0,
+            groups: if include_everyone {
+                vec![TokenGroup::enabled(Sid::everyone())]
+            } else {
+                Vec::new()
+            },
+            restricted_sids: Vec::new(),
+            privileges: Vec::new(),
+            owner: anonymous.clone(),
+            primary_group: anonymous,
+            default_dacl: Some(NativeAcl::anonymous_logon_default()),
+            session_id: 0,
+            authentication_id: Luid::new(0x3e6),
+            originating_logon_session: Luid::new(0x3e6),
+            audit_policy: TokenAuditPolicy::default(),
+            sandbox_inert: false,
+        }
+    }
+
     /// An administrator token (spec §17.2): Administrators + Users groups, load-driver/debug.
     pub fn admin(machine: u32) -> Self {
         AccessToken {
@@ -762,6 +790,31 @@ impl TokenId {
     }
 }
 
+/// Stable identities of the two security-subsystem-owned Anonymous Logon token objects.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AnonymousLogonTokenIds {
+    with_everyone: TokenId,
+    without_everyone: TokenId,
+}
+
+impl AnonymousLogonTokenIds {
+    pub const fn select(self, everyone_includes_anonymous: bool) -> TokenId {
+        if everyone_includes_anonymous {
+            self.with_everyone
+        } else {
+            self.without_everyone
+        }
+    }
+
+    pub const fn with_everyone(self) -> TokenId {
+        self.with_everyone
+    }
+
+    pub const fn without_everyone(self) -> TokenId {
+        self.without_everyone
+    }
+}
+
 #[derive(Clone, Debug)]
 struct TokenObject {
     token: AccessToken,
@@ -826,6 +879,35 @@ impl TokenStore {
             logon_sessions: Vec::new(),
             next_luid: 1,
         }
+    }
+
+    /// Create the two long-lived Anonymous Logon objects owned by the security subsystem. Their
+    /// initial references are never transferred to callers; an ETHREAD receives a separately
+    /// retained reference through [`Self::reference_anonymous_logon_token`].
+    pub fn insert_anonymous_logon_tokens(&mut self) -> AnonymousLogonTokenIds {
+        let with_everyone = self.insert(AccessToken::anonymous_logon(true));
+        let without_everyone = self.insert(AccessToken::anonymous_logon(false));
+        AnonymousLogonTokenIds {
+            with_everyone,
+            without_everyone,
+        }
+    }
+
+    /// Enforce `SepImpersonateAnonymousToken` policy and acquire the reference an ETHREAD context
+    /// will own. A restricted caller primary token cannot initiate anonymous impersonation.
+    pub fn reference_anonymous_logon_token(
+        &mut self,
+        tokens: AnonymousLogonTokenIds,
+        everyone_includes_anonymous: bool,
+        caller_primary: TokenId,
+    ) -> Result<TokenId, u32> {
+        let caller = self.get(caller_primary).ok_or(STATUS_INVALID_HANDLE)?;
+        if caller.is_restricted() {
+            return Err(crate::access::STATUS_ACCESS_DENIED);
+        }
+        let selected = tokens.select(everyone_includes_anonymous);
+        self.retain(selected)?;
+        Ok(selected)
     }
 
     /// Insert a token with one owning reference, never expiring, sourced `"*SYSTEM*"`.

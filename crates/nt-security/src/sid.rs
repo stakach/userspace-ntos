@@ -135,6 +135,10 @@ impl Sid {
     pub fn local_service() -> Self {
         Sid::new(5, &[19])
     }
+    /// `S-1-5-7` — Anonymous Logon.
+    pub fn anonymous_logon() -> Self {
+        Sid::new(5, &[7])
+    }
     /// `S-1-5-11` — Authenticated Users.
     pub fn authenticated_users() -> Self {
         Sid::new(5, &[11])

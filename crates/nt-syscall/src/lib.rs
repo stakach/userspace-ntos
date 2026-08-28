@@ -220,6 +220,7 @@ pub enum NativeService {
     NtAdjustGroupsToken,
     NtAdjustPrivilegesToken,
     NtPrivilegeCheck,
+    NtImpersonateAnonymousToken,
     NtImpersonateThread,
     NtDeleteKey,
     NtDeleteValueKey,
@@ -410,6 +411,7 @@ impl NativeService {
             NtAdjustGroupsToken => "NtAdjustGroupsToken",
             NtAdjustPrivilegesToken => "NtAdjustPrivilegesToken",
             NtPrivilegeCheck => "NtPrivilegeCheck",
+            NtImpersonateAnonymousToken => "NtImpersonateAnonymousToken",
             NtImpersonateThread => "NtImpersonateThread",
             NtDeleteKey => "NtDeleteKey",
             NtDeleteValueKey => "NtDeleteValueKey",
@@ -632,6 +634,7 @@ impl NativeService {
         NativeService::NtSetInformationToken,
         NativeService::NtFilterToken,
         NativeService::NtCallbackReturn,
+        NativeService::NtImpersonateAnonymousToken,
     ];
 }
 

@@ -270,6 +270,7 @@ fn sid_wellknown_and_sddl() {
     assert_eq!(Sid::administrators().to_sddl(), "S-1-5-32-544");
     assert_eq!(Sid::local_system().to_sddl(), "S-1-5-18");
     assert_eq!(Sid::everyone().to_sddl(), "S-1-1-0");
+    assert_eq!(Sid::anonymous_logon().to_sddl(), "S-1-5-7");
     assert_eq!(
         Sid::local_account(MACHINE, 1000).to_sddl(),
         "S-1-5-21-4660-1000"
@@ -401,6 +402,78 @@ fn system_token_has_reactos_owner_and_default_dacl() {
     );
     assert!(AccessToken::admin(MACHINE).default_dacl.is_none());
     assert!(AccessToken::user(MACHINE).default_dacl.is_none());
+}
+
+#[test]
+fn anonymous_logon_tokens_match_the_two_kernel_owned_identities() {
+    let with_everyone = AccessToken::anonymous_logon(true);
+    let without_everyone = AccessToken::anonymous_logon(false);
+    for token in [&with_everyone, &without_everyone] {
+        assert_eq!(token.token_type, TokenType::Primary);
+        assert_eq!(
+            token.impersonation_level,
+            SecurityImpersonationLevel::Anonymous
+        );
+        assert_eq!(token.user, Sid::anonymous_logon());
+        assert_eq!(token.owner, Sid::anonymous_logon());
+        assert_eq!(token.primary_group, Sid::anonymous_logon());
+        assert_eq!(token.authentication_id, Luid::new(0x3e6));
+        assert_eq!(token.originating_logon_session, Luid::new(0x3e6));
+        assert!(token.privileges.is_empty());
+        assert!(!token.is_restricted());
+        assert_eq!(
+            token.default_dacl.as_ref().unwrap().as_bytes(),
+            &[
+                2, 0, 48, 0, 2, 0, 0, 0, // ACL
+                0, 0, 20, 0, 0, 0, 0, 16, // Everyone: GENERIC_ALL
+                1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 0, 16,
+                // Anonymous Logon: GENERIC_ALL
+                1, 1, 0, 0, 0, 0, 0, 5, 7, 0, 0, 0,
+            ]
+        );
+    }
+    assert_eq!(with_everyone.groups.len(), 1);
+    assert_eq!(with_everyone.groups[0].sid, Sid::everyone());
+    assert!(with_everyone.groups[0].is_enabled());
+    assert!(with_everyone.groups[0].is_enabled_by_default());
+    assert!(with_everyone.groups[0].is_mandatory());
+    assert!(without_everyone.groups.is_empty());
+}
+
+#[test]
+fn anonymous_logon_store_selection_retains_identity_and_rejects_restricted_callers() {
+    let mut store = TokenStore::new();
+    let anonymous = store.insert_anonymous_logon_tokens();
+    let caller = store.insert(AccessToken::user(MACHINE));
+    assert_ne!(anonymous.with_everyone(), anonymous.without_everyone());
+    assert_eq!(store.reference_count(anonymous.with_everyone()), Some(1));
+    assert_eq!(store.reference_count(anonymous.without_everyone()), Some(1));
+    assert_eq!(
+        store.logon_session_reference_count(Luid::new(0x3e6)),
+        Some(2)
+    );
+
+    let selected = store
+        .reference_anonymous_logon_token(anonymous, true, caller)
+        .unwrap();
+    assert_eq!(selected, anonymous.with_everyone());
+    assert_eq!(store.reference_count(selected), Some(2));
+    assert_eq!(store.release(selected), Ok(false));
+    assert_eq!(store.reference_count(selected), Some(1));
+
+    let mut restricted = AccessToken::user(MACHINE + 1);
+    restricted
+        .restricted_sids
+        .push(TokenGroup::enabled(Sid::everyone()));
+    let restricted = store.insert(restricted);
+    assert_eq!(
+        store.reference_anonymous_logon_token(anonymous, false, restricted),
+        Err(STATUS_ACCESS_DENIED)
+    );
+    assert_eq!(
+        store.reference_count(anonymous.without_everyone()),
+        Some(1)
+    );
 }
 
 fn acl_with_ace(revision: u8, ace: &[u8], trailing_free_bytes: usize) -> alloc::vec::Vec<u8> {
