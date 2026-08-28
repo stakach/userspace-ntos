@@ -15252,3 +15252,42 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     dynamic-charge rules, logon-session references, and audit-policy ownership; add missing reusable
     token-store traits first, and reject inapplicable classes with their real status instead of
     accepting or discarding state.
+
+    `NtSetInformationToken` (2026-08-29, accepted): SSN 239 is now a typed registered service with
+    no numeric branch. A reusable native planner enumerates the NT5 settable classes, their exact
+    lengths, access masks, and privilege requirements. The executive captures every pointer-bearing
+    value through `ClientMemory`, including complete owner/primary-group SIDs, default ACLs, and all
+    nine audit-policy categories, before applying a mutation. Owner, primary-group, default-DACL,
+    session-ID, session-reference, audit-policy, and originating-logon-session changes are backed by
+    token-store state; unsupported or query-only classes fail rather than accepting discarded data.
+
+    Primary-group replacement now enforces membership and the token's fixed dynamic charge. Token
+    origin is set-once, session-reference release is one-way and idempotent, and the token store owns
+    generic per-authentication-ID logon-session reference counts across insertion, duplication,
+    release, and destruction. Query support for TokenSource, TokenSessionId, and TokenOrigin exposes
+    the same authoritative state, with `TOKEN_QUERY_SOURCE` enforced separately. Audit-policy values
+    are validated as nine four-bit categories, and privileged classes require the real TCB privilege.
+
+    Focused validation passes `nt-security` `70/70`, `nt-syscall` `61/61`, `git diff --check`, the
+    freestanding executive at the established 212-warning baseline, and the release build/staging
+    path. Code checkpoint `62d2d8fd` is pushed. Serialized acceptance
+    `.tmp/run-headless-set-information-token-20260829.log` reached the final gate at 114,603 ms,
+    launched genuine userinit and Explorer, completed 668 Explorer api0 redirects with zero callback
+    or dead-callback failures, recorded paint begin/end `5/20`, 187 direct GDI returns, and 135 batch
+    flushes covering 184 records, painted `480000/480000` framebuffer pixels with at least 32
+    colours, passed all `295/295` gates, and matched the sentinel. Startup did not issue SSN 239, so
+    this is explicitly a full non-regression gate while focused tests prove the direct mutation
+    contract. Snapshot generation 5 committed 1,755,666 bytes, scratch returned to zero, and the
+    census reported no page-table, frame, mapping, alias, registry, untyped-allocation,
+    frame-registration, image-bank, or allocator failure.
+
+    Review adjustment: the typed surface now contains 170 services, the hosted table registers 169
+    numbered variants, and 53 canonical ABI exports remain absent. Continue with `NtFilterToken`
+    (SSN 79) as the next whole Se lifecycle boundary. Add restricted SIDs and sandbox-inert state to
+    the reusable token model first; clone immutable/token-owned state with a fresh token and modified
+    ID, retain a real logon-session reference, convert selected groups to deny-only state, delete
+    selected privileges or all except `SeChangeNotifyPrivilege`, validate and normalize added
+    restricted SIDs, and preserve the source handle's granted access on the new token. Capture all
+    three optional variable-length arrays before mutation and expose the resulting restricted and
+    sandbox-inert state through native token queries. Unsupported filter flags must fail rather than
+    being ignored.
