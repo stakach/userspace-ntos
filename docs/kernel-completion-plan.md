@@ -15605,3 +15605,37 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     paths next so kernel-generated LPC messages wake and run a server worker promptly instead of
     merely remaining durable in the broker queue; remove the bypass machinery once the shared path
     owns both ordinary requests and kernel messages.
+
+    CSR kernel-message delivery (2026-08-29, accepted): the thread-exit sender now reproduces the
+    `LpcRequestPort` move boundary by stamping the dying ETHREAD's real process/thread `ClientId`
+    into the otherwise kernel-built `LPC_CLIENT_DIED` frame before enqueueing it. CSR-bound sends are
+    identified from the broker's live connection metadata and counted as pending until the real
+    `CsrApiRequestThread` receives them. The parked worker is resumed with the exact broker frame,
+    runs csrsrv's native client-death branch, and issues a real `NtReplyWaitReceivePort` to re-park;
+    no client reply or modeled CSR result is manufactured. Multiple queued kernel messages drain in
+    broker order, and a notification queued while the worker is busy is retried as soon as an accept
+    or ordinary request leaves it parked again.
+
+    `nt-lpc-server` validation passes `13/13`, including an exact 48-byte client-death frame routed
+    from a client communication handle through the shared listen port with its port context intact.
+    `git diff --check`, targeted rustfmt validation, the freestanding executive at the established
+    212-warning baseline, and release build/staging all pass. Code checkpoint `5331524e` is pushed.
+    Serialized acceptance `.tmp/run-headless-csr-kernel-message-20260829.log` reached the final gate
+    at 113,048 ms. The boot registered 15 termination ports, sent four notifications, delivered all
+    four through the real CSR receive loop, and finished with zero queued messages, broker delivery
+    failures, or CSR kernel-message failures. Genuine userinit and Explorer launched, 668 Explorer
+    api0 redirects completed with zero callback or dead-callback failures, paint begin/end reached
+    `5/20` with 187 direct GDI returns and 135 batch flushes covering 184 records, and the framebuffer
+    held `480000/480000` non-background pixels with at least 32 colours. All `295/295` gates passed
+    and the sentinel matched. Snapshot generation 5 committed 1,755,656 bytes, scratch returned to
+    zero, and the census reported no page-table, frame, mapping, alias, registry, untyped-allocation,
+    frame-registration, image-bank, or allocator failure.
+
+    Review adjustment: kernel notifications now use the broker-owned data queue, but ordinary CSR
+    `NtRequestWaitReplyPort` calls still copy request and reply bytes directly between the hosted
+    client and CSR worker. They are also rewritten to `LPC_DATAGRAM` because hosted processes and
+    threads have not completed the SM -> SB -> `CsrSrvCreateProcess` registration plane, so csrsrv
+    cannot resolve a real `LPC_REQUEST` ClientId. Complete that registration plane next, then route
+    ordinary requests and replies through the same broker queue used here and delete the direct CSR
+    request latches and datagram rewrite together. Moving the bytes first while preserving the
+    rewrite would only relocate the fallback and is not an acceptable completion.
