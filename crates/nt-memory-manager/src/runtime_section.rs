@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use crate::PAGE_NOACCESS;
+use crate::{PAGE_NOACCESS, STATUS_INVALID_PARAMETER_2, STATUS_NOT_MAPPED_VIEW};
 
 pub const GENERIC_SECTION_BACKING_NONE: u8 = 0;
 pub const GENERIC_SECTION_BACKING_ANON: u8 = 1;
@@ -116,6 +116,16 @@ pub struct GenericSectionView {
     pub live: bool,
     pub pi: usize,
     pub section_index: usize,
+    pub base: u64,
+    pub size: u64,
+    pub section_offset: u64,
+}
+
+/// A page-aligned range within one data-file view, ready for backing-store writeback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GenericSectionFlushPlan {
+    pub view: GenericSectionView,
+    pub section: GenericSection,
     pub base: u64,
     pub size: u64,
     pub section_offset: u64,
@@ -448,6 +458,63 @@ impl GenericSectionTable {
             .map(|view| (view.section_index, *view))
     }
 
+    /// Resolve and page-align an `NtFlushVirtualMemory` range. A flush is confined to one
+    /// data-file view; a zero input size means from `base` to that view's end.
+    pub fn plan_flush(
+        &self,
+        pi: usize,
+        base: u64,
+        size: u64,
+    ) -> Result<GenericSectionFlushPlan, u32> {
+        const PAGE_MASK: u64 = 0xfff;
+
+        let (section_index, view) = self.view_for_page(pi, base).ok_or(STATUS_NOT_MAPPED_VIEW)?;
+        let section = self.section(section_index).ok_or(STATUS_NOT_MAPPED_VIEW)?;
+        if !matches!(
+            section.backing.kind,
+            GENERIC_SECTION_BACKING_DISK | GENERIC_SECTION_BACKING_OVERLAY
+        ) {
+            return Err(STATUS_NOT_MAPPED_VIEW);
+        }
+
+        let view_end = view
+            .base
+            .checked_add(view.size)
+            .ok_or(STATUS_INVALID_PARAMETER_2)?;
+        let flush_base = base & !PAGE_MASK;
+        if flush_base < view.base {
+            return Err(STATUS_NOT_MAPPED_VIEW);
+        }
+        let flush_end = if size == 0 {
+            view_end
+        } else {
+            let requested_end = base.checked_add(size).ok_or(STATUS_INVALID_PARAMETER_2)?;
+            if requested_end > view_end {
+                return Err(STATUS_NOT_MAPPED_VIEW);
+            }
+            requested_end
+                .checked_add(PAGE_MASK)
+                .ok_or(STATUS_INVALID_PARAMETER_2)?
+                & !PAGE_MASK
+        };
+        let flush_end = flush_end.min(view_end);
+        let flush_size = flush_end
+            .checked_sub(flush_base)
+            .filter(|size| *size != 0)
+            .ok_or(STATUS_INVALID_PARAMETER_2)?;
+        let section_offset = view
+            .section_offset
+            .checked_add(flush_base - view.base)
+            .ok_or(STATUS_INVALID_PARAMETER_2)?;
+        Ok(GenericSectionFlushPlan {
+            view,
+            section,
+            base: flush_base,
+            size: flush_size,
+            section_offset,
+        })
+    }
+
     pub fn page_frame(&self, section_index: usize, page_index: u64) -> Option<u64> {
         self.pages
             .iter()
@@ -510,14 +577,35 @@ impl GenericSectionTable {
         view: GenericSectionView,
         section: GenericSection,
     ) -> Option<(u64, u64, u64, usize)> {
-        let view_start = view.section_offset;
-        let view_end = view.section_offset.saturating_add(view.size);
+        self.next_dirty_page_in_range(view.section_index, section, view.section_offset, view.size)
+    }
+
+    pub fn next_dirty_page_for_flush(
+        &self,
+        plan: GenericSectionFlushPlan,
+    ) -> Option<(u64, u64, u64, usize)> {
+        self.next_dirty_page_in_range(
+            plan.view.section_index,
+            plan.section,
+            plan.section_offset,
+            plan.size,
+        )
+    }
+
+    fn next_dirty_page_in_range(
+        &self,
+        section_index: usize,
+        section: GenericSection,
+        range_start: u64,
+        range_size: u64,
+    ) -> Option<(u64, u64, u64, usize)> {
+        let range_end = range_start.saturating_add(range_size);
         for page in &self.pages {
-            if !page.live || !page.dirty || page.section_index != view.section_index {
+            if !page.live || !page.dirty || page.section_index != section_index {
                 continue;
             }
             let page_offset = page.page_index.saturating_mul(0x1000);
-            if page_offset < view_start || page_offset >= view_end {
+            if page_offset < range_start || page_offset >= range_end {
                 continue;
             }
             let len = section.size.saturating_sub(page_offset).min(0x1000) as usize;
@@ -646,6 +734,116 @@ mod tests {
         assert_eq!(
             table.next_dirty_page_for_view(view, section),
             Some((1, 0x200, 0x1000, 0x1000))
+        );
+    }
+
+    #[test]
+    fn flush_plan_rounds_one_data_view_range_to_pages() {
+        let mut table = GenericSectionTable::new();
+        assert!(table.reset_with_reserve(1, 1, 1));
+        let section = table
+            .create(
+                2,
+                0x40,
+                0x8000,
+                crate::PAGE_READWRITE,
+                SECTION_ATTR_SEC_COMMIT,
+                GenericSectionBacking::overlay(7),
+            )
+            .unwrap();
+        assert!(table.map_view(3, section, 0x1_0000, 0x4000, 0x2000));
+
+        let plan = table.plan_flush(3, 0x1_1080, 0x1010).unwrap();
+        assert_eq!(plan.base, 0x1_1000);
+        assert_eq!(plan.size, 0x2000);
+        assert_eq!(plan.section_offset, 0x3000);
+        assert_eq!(plan.view.section_index, section);
+    }
+
+    #[test]
+    fn zero_length_flush_extends_to_view_end() {
+        let mut table = GenericSectionTable::new();
+        assert!(table.reset_with_reserve(1, 1, 1));
+        let section = table
+            .create(
+                2,
+                0x40,
+                0x8000,
+                crate::PAGE_READWRITE,
+                SECTION_ATTR_SEC_COMMIT,
+                GenericSectionBacking::disk(4, 0x8000),
+            )
+            .unwrap();
+        assert!(table.map_view(4, section, 0x2_0000, 0x5000, 0x1000));
+
+        let plan = table.plan_flush(4, 0x2_2345, 0).unwrap();
+        assert_eq!(plan.base, 0x2_2000);
+        assert_eq!(plan.size, 0x3000);
+        assert_eq!(plan.section_offset, 0x3000);
+    }
+
+    #[test]
+    fn flush_rejects_unmapped_anonymous_and_cross_view_ranges() {
+        let mut table = GenericSectionTable::new();
+        assert!(table.reset_with_reserve(2, 2, 1));
+        let data = table
+            .create(
+                2,
+                0x40,
+                0x4000,
+                crate::PAGE_READWRITE,
+                SECTION_ATTR_SEC_COMMIT,
+                GenericSectionBacking::overlay(7),
+            )
+            .unwrap();
+        let anonymous = create_section(&mut table, 2, 0x44);
+        assert!(table.map_view(5, data, 0x3_0000, 0x2000, 0));
+        assert!(table.map_view(5, anonymous, 0x4_0000, 0x2000, 0));
+
+        assert_eq!(
+            table.plan_flush(5, 0x2_f000, 0x1000),
+            Err(STATUS_NOT_MAPPED_VIEW)
+        );
+        assert_eq!(
+            table.plan_flush(5, 0x4_0000, 0x1000),
+            Err(STATUS_NOT_MAPPED_VIEW)
+        );
+        assert_eq!(
+            table.plan_flush(5, 0x3_1000, 0x2000),
+            Err(STATUS_NOT_MAPPED_VIEW)
+        );
+    }
+
+    #[test]
+    fn flush_dirty_lookup_is_confined_to_the_planned_pages() {
+        let mut table = GenericSectionTable::new();
+        assert!(table.reset_with_reserve(1, 1, 4));
+        let section = table
+            .create(
+                2,
+                0x40,
+                0x4000,
+                crate::PAGE_READWRITE,
+                SECTION_ATTR_SEC_COMMIT,
+                GenericSectionBacking::overlay(7),
+            )
+            .unwrap();
+        assert!(table.map_view(6, section, 0x5_0000, 0x4000, 0));
+        for page in 0..4 {
+            assert!(table.set_page_frame(section, page, 0x100 + page));
+            assert!(table.mark_page_dirty(section, page));
+        }
+
+        let plan = table.plan_flush(6, 0x5_1001, 1).unwrap();
+        assert_eq!(
+            table.next_dirty_page_for_flush(plan),
+            Some((1, 0x101, 0x1000, 0x1000))
+        );
+        assert!(table.clear_page_dirty(section, 1));
+        assert_eq!(table.next_dirty_page_for_flush(plan), None);
+        assert_eq!(
+            table.next_dirty_page_for_view(plan.view, plan.section),
+            Some((0, 0x100, 0, 0x1000))
         );
     }
 }
