@@ -1488,17 +1488,14 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
     false
 }
 
-/// Drive one ordinary `\Windows\ApiPort` request through the real CsrApiRequestThread. The LPC
-/// broker owns connect/accept state, but CSR API message bytes stay on the executive data plane:
-/// copy the client's request directly into the parked worker's `ReceiveMsg`, run csrsrv's dispatcher,
-/// copy the worker's real reply bytes back to the parked client, and leave the worker parked for the
-/// next CSR API request.
-fn copy_csr_kernel_message(
+/// Validate and copy one exact broker-owned CSR `PORT_MESSAGE` frame.
+fn copy_csr_broker_message(
     received: &nt_lpc_client::ReceiveResult,
     destination: &mut [u8],
+    expected_type: u16,
 ) -> Option<(usize, u64, u64)> {
     if received.connection_id != 0
-        || received.msg_type != nt_lpc_abi::msg_type::LPC_CLIENT_DIED
+        || received.msg_type != expected_type
         || received.connection_info.len() < nt_lpc_abi::PORT_MESSAGE_HEADER_LEN
     {
         return None;
@@ -1522,7 +1519,7 @@ fn copy_csr_kernel_message(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn csr_api_request_rendezvous(
-    _client_port: u64,
+    client_port: u64,
     request_va: u64,
     reply_va: u64,
     broker_kernel_message: bool,
@@ -1582,7 +1579,7 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
     }
 
     let mut request = [0u8; CSR_API_MSG_MAX];
-    let (request_len, client_pid, client_tid) = if broker_kernel_message {
+    let (request_len, client_pid, _client_tid) = if broker_kernel_message {
         let port = CSR_API_RECVPORT.load(Ordering::Relaxed);
         let received = match lpc_client().map(|lpc| lpc.reply_wait_receive(port)) {
             Some(Ok(received)) => received,
@@ -1602,9 +1599,11 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                 return false;
             }
         };
-        let Some((total, client_pid, client_tid)) =
-            copy_csr_kernel_message(&received, &mut request)
-        else {
+        let Some((total, client_pid, client_tid)) = copy_csr_broker_message(
+            &received,
+            &mut request,
+            nt_lpc_abi::msg_type::LPC_CLIENT_DIED,
+        ) else {
             CSR_KERNEL_MESSAGE_FAILURES.fetch_add(1, Ordering::Relaxed);
             CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
             return false;
@@ -1640,10 +1639,36 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
         }
         let client_pid = nt_handler.pm_pid_for_pi(nt_handler.pi).unwrap_or(0) as u64;
         let client_tid = nt_handler.current_tid;
-        request[4..6].copy_from_slice(&nt_lpc_abi::msg_type::LPC_DATAGRAM.to_le_bytes());
+        request[4..6].copy_from_slice(&nt_lpc_abi::msg_type::LPC_REQUEST.to_le_bytes());
         request[8..16].copy_from_slice(&client_pid.to_le_bytes());
         request[16..24].copy_from_slice(&client_tid.to_le_bytes());
-        (request_len, client_pid, client_tid)
+        let sent = lpc_client()
+            .map(|lpc| lpc.request_wait_reply(client_port, &request[..request_len]))
+            .is_some_and(|result| matches!(result, Ok(reply) if reply.is_empty()));
+        if !sent {
+            CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+            print_str(b"[csr-api] broker request send failed\n");
+            return false;
+        }
+        let listen_port = CSR_API_RECVPORT.load(Ordering::Relaxed);
+        let Some(Ok(received)) = lpc_client().map(|lpc| lpc.reply_wait_receive(listen_port)) else {
+            CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+            print_str(b"[csr-api] broker request receive failed\n");
+            return false;
+        };
+        let Some((received_len, received_pid, received_tid)) =
+            copy_csr_broker_message(&received, &mut request, nt_lpc_abi::msg_type::LPC_REQUEST)
+        else {
+            CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+            print_str(b"[csr-api] broker returned an invalid request frame\n");
+            return false;
+        };
+        if received_len != request_len || received_pid != client_pid || received_tid != client_tid {
+            CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+            print_str(b"[csr-api] broker request identity/length mismatch\n");
+            return false;
+        }
+        (received_len, received_pid, received_tid)
     };
     let api_number = if request_len >= 0x34 {
         u32::from_le_bytes(request[0x30..0x34].try_into().unwrap())
@@ -1674,9 +1699,6 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
             .ok();
         CSR_KERNEL_MESSAGES_DELIVERED.fetch_add(1, Ordering::Relaxed);
     }
-    csr_stack_write16(delivered_recvmsg + 4, nt_lpc_abi::msg_type::LPC_DATAGRAM);
-    csr_stack_write(delivered_recvmsg + 8, client_pid);
-    csr_stack_write(delivered_recvmsg + 16, client_tid);
     let context_out = CSR_API_RECV_RDX.load(Ordering::Relaxed);
     if context_out != 0 {
         csr_stack_write(context_out, 0);
@@ -2133,9 +2155,11 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                             match received {
                                 Some(Ok(received)) => {
                                     let mut next_message = [0u8; CSR_API_MSG_MAX];
-                                    let Some((total, _, _)) =
-                                        copy_csr_kernel_message(&received, &mut next_message)
-                                    else {
+                                    let Some((total, _, _)) = copy_csr_broker_message(
+                                        &received,
+                                        &mut next_message,
+                                        nt_lpc_abi::msg_type::LPC_CLIENT_DIED,
+                                    ) else {
                                         CSR_KERNEL_MESSAGE_FAILURES.fetch_add(1, Ordering::Relaxed);
                                         return false;
                                     };
@@ -2188,63 +2212,64 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                             m3 = nm3;
                             continue;
                         }
-                        let mut reply_bytes = [0u8; CSR_API_MSG_MAX];
-                        let reply_source = if reply_msg != 0 {
-                            reply_msg
-                        } else {
-                            // Hosted clients are not CSR-registered yet, so requests are delivered as
-                            // LPC_DATAGRAM to avoid CsrLocateThreadByClientId rejecting them. ReactOS'
-                            // datagram branch runs the real dispatch but leaves ReplyMsg=NULL. Return
-                            // the worker-mutated ReceiveMsg frame so the parked client observes the real
-                            // csrsrv/basesrv side effects instead of the old blind success fallback.
-                            delivered_recvmsg
-                        };
-                        let reply_len = if reply_source != 0 {
-                            let Some(header_word) = csr_stack_read(reply_source) else {
-                                print_str(b"[csr-api] worker reply header unreadable source=0x");
-                                print_hex_u64(reply_source);
-                                print_str(b"\n");
-                                return false;
-                            };
-                            let total = ((header_word >> 16) as u16) as usize;
-                            if !(0x28..=CSR_API_MSG_MAX).contains(&total)
-                                || !csr_stack_copyin(reply_source, &mut reply_bytes[..total])
-                            {
-                                print_str(b"[csr-api] worker reply frame invalid source=0x");
-                                print_hex_u64(reply_source);
-                                print_str(b" total=");
-                                print_u64(total as u64);
-                                print_str(b"\n");
-                                return false;
-                            }
-                            reply_bytes[4..6]
-                                .copy_from_slice(&nt_lpc_abi::msg_type::LPC_REPLY.to_le_bytes());
-                            total
-                        } else {
-                            0
-                        };
                         if reply_msg == 0 {
-                            print_str(b"[csr-api] worker returned datagram ReplyMsg=NULL; using executed ReceiveMsg ApiNumber=0x");
-                            print_hex(api_number);
-                            print_str(b" bytes=");
-                            print_u64(reply_len as u64);
-                            print_str(b"\n");
-                        }
-                        CSR_API_RECVMSG.store(recv_msg, Ordering::Relaxed);
-                        CSR_API_RECVPORT.store(get_recv_mr(9), Ordering::Relaxed);
-                        CSR_API_RECV_RDX.store(rdx, Ordering::Relaxed);
-                        CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
-                        if reply_len == 0 {
-                            print_str(b"[csr-api] worker produced empty reply for ApiNumber=0x");
+                            print_str(b"[csr-api] real LPC request produced no reply ApiNumber=0x");
                             print_hex(api_number);
                             print_str(b"\n");
                             return false;
+                        }
+                        let mut reply_bytes = [0u8; CSR_API_MSG_MAX];
+                        let Some(header_word) = csr_stack_read(reply_msg) else {
+                            print_str(b"[csr-api] worker reply header unreadable source=0x");
+                            print_hex_u64(reply_msg);
+                            print_str(b"\n");
+                            return false;
                         };
-                        if !nt_handler.xas_try_write_buf(reply_va, &reply_bytes[..reply_len]) {
+                        let reply_len = ((header_word >> 16) as u16) as usize;
+                        if !(0x28..=CSR_API_MSG_MAX).contains(&reply_len)
+                            || !csr_stack_copyin(reply_msg, &mut reply_bytes[..reply_len])
+                        {
+                            print_str(b"[csr-api] worker reply frame invalid source=0x");
+                            print_hex_u64(reply_msg);
+                            print_str(b" total=");
+                            print_u64(reply_len as u64);
+                            print_str(b"\n");
+                            return false;
+                        }
+                        let port = get_recv_mr(9);
+                        let reply_sent = lpc_client()
+                            .map(|lpc| lpc.reply_port(port, &reply_bytes[..reply_len]))
+                            .is_some_and(|result| result.is_ok());
+                        if !reply_sent {
+                            print_str(b"[csr-api] broker reply send failed\n");
+                            return false;
+                        }
+                        let Some(Ok(received_reply)) =
+                            lpc_client().map(|lpc| lpc.reply_wait_receive(client_port))
+                        else {
+                            print_str(b"[csr-api] broker client reply receive failed\n");
+                            return false;
+                        };
+                        let mut client_reply = [0u8; CSR_API_MSG_MAX];
+                        let Some((client_reply_len, _, _)) = copy_csr_broker_message(
+                            &received_reply,
+                            &mut client_reply,
+                            nt_lpc_abi::msg_type::LPC_REPLY,
+                        ) else {
+                            print_str(b"[csr-api] broker returned an invalid reply frame\n");
+                            return false;
+                        };
+                        CSR_API_RECVMSG.store(recv_msg, Ordering::Relaxed);
+                        CSR_API_RECVPORT.store(port, Ordering::Relaxed);
+                        CSR_API_RECV_RDX.store(rdx, Ordering::Relaxed);
+                        CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+                        if !nt_handler
+                            .xas_try_write_buf(reply_va, &client_reply[..client_reply_len])
+                        {
                             print_str(b"[csr-api] client reply copyout failed va=0x");
                             print_hex_u64(reply_va);
                             print_str(b" len=");
-                            print_u64(reply_len as u64);
+                            print_u64(client_reply_len as u64);
                             print_str(b"\n");
                             return false;
                         }
@@ -2255,7 +2280,7 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                         );
                         print_hex(api_number);
                         print_str(b" bytes=");
-                        print_u64(reply_len as u64);
+                        print_u64(client_reply_len as u64);
                         print_str(b"\n");
                         return true;
                     }

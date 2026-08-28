@@ -21567,6 +21567,7 @@ struct CsrDynamicApiWorker {
     pi: u64,
     tid: u64,
     reply_cap: u64,
+    port: u64,
     recvmsg: u64,
     ctx_out: u64,
     reply: nt_syscall_abi::ParkedSyscallReply,
@@ -21574,10 +21575,10 @@ struct CsrDynamicApiWorker {
     client_cap: u64,
     client_badge: u64,
     client_pi: u64,
+    client_port: u64,
     client_reply_va: u64,
     client_reply: nt_syscall_abi::ParkedSyscallReply,
     api_number: u64,
-    delivered_recvmsg: u64,
 }
 
 impl CsrDynamicApiWorker {
@@ -21587,6 +21588,7 @@ impl CsrDynamicApiWorker {
             pi: CSR_DYNAMIC_CONTEXT_UNSET,
             tid: 0,
             reply_cap: 0,
+            port: 0,
             recvmsg: 0,
             ctx_out: 0,
             reply: nt_syscall_abi::ParkedSyscallReply::native_call(),
@@ -21594,10 +21596,10 @@ impl CsrDynamicApiWorker {
             client_cap: 0,
             client_badge: CSR_DYNAMIC_CONTEXT_UNSET,
             client_pi: CSR_DYNAMIC_CONTEXT_UNSET,
+            client_port: 0,
             client_reply_va: 0,
             client_reply: nt_syscall_abi::ParkedSyscallReply::native_call(),
             api_number: u64::MAX,
-            delivered_recvmsg: 0,
         }
     }
 
@@ -21614,10 +21616,10 @@ impl CsrDynamicApiWorker {
         self.client_cap = 0;
         self.client_badge = CSR_DYNAMIC_CONTEXT_UNSET;
         self.client_pi = CSR_DYNAMIC_CONTEXT_UNSET;
+        self.client_port = 0;
         self.client_reply_va = 0;
         self.client_reply = nt_syscall_abi::ParkedSyscallReply::native_call();
         self.api_number = u64::MAX;
-        self.delivered_recvmsg = 0;
     }
 }
 
@@ -21692,6 +21694,7 @@ unsafe fn csr_dynamic_worker_park(
     badge: u64,
     pi: usize,
     tid: u64,
+    port: u64,
     recvmsg: u64,
     ctx_out: u64,
     reply: nt_syscall_abi::ParkedSyscallReply,
@@ -21728,6 +21731,7 @@ unsafe fn csr_dynamic_worker_park(
         pi: pi as u64,
         tid,
         reply_cap: cap,
+        port,
         recvmsg,
         ctx_out,
         reply,
@@ -21742,10 +21746,34 @@ enum CsrDynamicRoute {
     Consumed,
 }
 
+fn copy_csr_dynamic_broker_frame(
+    received: &nt_lpc_client::ReceiveResult,
+    expected_type: u16,
+    destination: &mut [u8],
+) -> Option<usize> {
+    if received.connection_id != 0
+        || received.msg_type != expected_type
+        || received.connection_info.len() < LSA_PORT_MESSAGE_HEADER as usize
+    {
+        return None;
+    }
+    let total =
+        nt_lpc_abi::port_message_total_length(received.connection_info.get(..4)?.try_into().ok()?)?;
+    let wire_type = u16::from_le_bytes(received.connection_info.get(4..6)?.try_into().ok()?);
+    if total != received.connection_info.len()
+        || total > destination.len()
+        || wire_type != expected_type
+    {
+        return None;
+    }
+    destination[..total].copy_from_slice(&received.connection_info);
+    Some(total)
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn csr_dynamic_deliver_request(
     nt_handler: &mut ExecNtHandler,
-    _client_port: u64,
+    client_port: u64,
     request_va: u64,
     reply_va: u64,
     client_badge: u64,
@@ -21771,7 +21799,7 @@ unsafe fn csr_dynamic_deliver_request(
         return CsrDynamicRoute::NotRouted;
     }
     let client_pid = nt_handler.pm_pid_for_pi(client_pi).unwrap_or(0) as u64;
-    request[4..6].copy_from_slice(&nt_lpc_abi::msg_type::LPC_DATAGRAM.to_le_bytes());
+    request[4..6].copy_from_slice(&nt_lpc_abi::msg_type::LPC_REQUEST.to_le_bytes());
     request[8..16].copy_from_slice(&client_pid.to_le_bytes());
     request[16..24].copy_from_slice(&client_tid.to_le_bytes());
     let api_number = if request_len >= 0x34 {
@@ -21782,23 +21810,37 @@ unsafe fn csr_dynamic_deliver_request(
     let Some(client_cap) = steal_main_reply() else {
         return CsrDynamicRoute::NotRouted;
     };
+    let sent = lpc_client()
+        .map(|lpc| lpc.request_wait_reply(client_port, &request[..request_len]))
+        .is_some_and(|result| matches!(result, Ok(reply) if reply.is_empty()));
+    if !sent {
+        csr_dynamic_wake(client_cap, 0xC000_0001, client_reply);
+        return CsrDynamicRoute::Consumed;
+    }
+    let Some(Ok(received)) = lpc_client().map(|lpc| lpc.reply_wait_receive(worker.port)) else {
+        csr_dynamic_wake(client_cap, 0xC000_0001, client_reply);
+        return CsrDynamicRoute::Consumed;
+    };
+    let mut broker_request = [0u8; CSR_DYNAMIC_API_MSG_MAX];
+    let Some(broker_request_len) = copy_csr_dynamic_broker_frame(
+        &received,
+        nt_lpc_abi::msg_type::LPC_REQUEST,
+        &mut broker_request,
+    ) else {
+        csr_dynamic_wake(client_cap, 0xC000_0001, client_reply);
+        return CsrDynamicRoute::Consumed;
+    };
+    if broker_request_len != request_len || broker_request[..request_len] != request[..request_len]
+    {
+        csr_dynamic_wake(client_cap, 0xC000_0001, client_reply);
+        return CsrDynamicRoute::Consumed;
+    }
     let delivered =
         csr_dynamic_with_peer(nt_handler, worker.badge, worker.pi as usize, |handler| {
-            let mut ok = handler.xas_try_write_buf(worker.recvmsg, &request[..request_len]);
-            if ok {
-                ok = handler.xas_try_write_buf(
-                    worker.recvmsg + 4,
-                    &nt_lpc_abi::msg_type::LPC_DATAGRAM.to_le_bytes(),
-                );
-            }
-            if ok {
-                ok = handler.xas_write_u64(worker.recvmsg + 8, client_pid);
-            }
-            if ok {
-                ok = handler.xas_write_u64(worker.recvmsg + 16, client_tid);
-            }
+            let mut ok =
+                handler.xas_try_write_buf(worker.recvmsg, &broker_request[..broker_request_len]);
             if ok && worker.ctx_out != 0 {
-                ok = handler.xas_write_u64(worker.ctx_out, 0);
+                ok = handler.xas_write_u64(worker.ctx_out, received.port_context);
             }
             ok
         });
@@ -21811,10 +21853,10 @@ unsafe fn csr_dynamic_deliver_request(
     table[index].client_cap = client_cap;
     table[index].client_badge = client_badge;
     table[index].client_pi = client_pi as u64;
+    table[index].client_port = client_port;
     table[index].client_reply_va = reply_va;
     table[index].client_reply = client_reply;
     table[index].api_number = api_number;
-    table[index].delivered_recvmsg = worker.recvmsg;
     csr_dynamic_wake(worker.reply_cap, 0, worker.reply);
     thread_wait_state_clear_badge_ready(nt_handler, worker.badge);
     print_str(b"[csr-api-dyn] delivered ApiNumber=0x");
@@ -21837,25 +21879,19 @@ unsafe fn csr_dynamic_finish_request_reply(
     if worker.in_flight_kind != CSR_DYNAMIC_KIND_REQUEST || worker.client_cap == 0 {
         return true;
     }
-    let reply_source = if replymsg != 0 {
-        replymsg
-    } else {
-        worker.delivered_recvmsg
-    };
     let mut reply = [0u8; CSR_DYNAMIC_API_MSG_MAX];
     let mut reply_len = 0usize;
-    if reply_source != 0 {
+    if replymsg != 0 {
         csr_dynamic_with_peer(nt_handler, worker.badge, worker.pi as usize, |handler| {
             let mut header = [0u8; LSA_PORT_MESSAGE_HEADER as usize];
-            if !handler.xas_read(reply_source, &mut header) {
+            if !handler.xas_read(replymsg, &mut header) {
                 return;
             }
             let total = u16::from_le_bytes(header[2..4].try_into().unwrap()) as usize;
-            let want = total
-                .max(LSA_PORT_MESSAGE_HEADER as usize)
-                .min(CSR_DYNAMIC_API_MSG_MAX);
-            if handler.xas_read(reply_source, &mut reply[..want]) {
-                reply_len = want;
+            if (LSA_PORT_MESSAGE_HEADER as usize..=CSR_DYNAMIC_API_MSG_MAX).contains(&total)
+                && handler.xas_read(replymsg, &mut reply[..total])
+            {
+                reply_len = total;
             }
         });
     }
@@ -21864,13 +21900,41 @@ unsafe fn csr_dynamic_finish_request_reply(
         status = 0xC000_0001;
     } else {
         reply[4..6].copy_from_slice(&nt_lpc_abi::msg_type::LPC_REPLY.to_le_bytes());
-        let client_pi = worker.client_pi as usize;
-        let copy_ok =
-            csr_dynamic_with_peer(nt_handler, worker.client_badge, client_pi, |handler| {
-                handler.xas_try_write_buf(worker.client_reply_va, &reply[..reply_len])
-            });
-        if !copy_ok {
-            status = 0xC000_0005;
+        let sent = lpc_client()
+            .map(|lpc| lpc.reply_port(worker.port, &reply[..reply_len]))
+            .is_some_and(|result| result.is_ok());
+        let received = sent
+            .then(|| lpc_client().map(|lpc| lpc.reply_wait_receive(worker.client_port)))
+            .flatten();
+        let mut broker_reply = [0u8; CSR_DYNAMIC_API_MSG_MAX];
+        match received {
+            Some(Ok(received)) => {
+                if let Some(broker_reply_len) = copy_csr_dynamic_broker_frame(
+                    &received,
+                    nt_lpc_abi::msg_type::LPC_REPLY,
+                    &mut broker_reply,
+                ) {
+                    reply_len = broker_reply_len;
+                    let client_pi = worker.client_pi as usize;
+                    let copy_ok = csr_dynamic_with_peer(
+                        nt_handler,
+                        worker.client_badge,
+                        client_pi,
+                        |handler| {
+                            handler.xas_try_write_buf(
+                                worker.client_reply_va,
+                                &broker_reply[..broker_reply_len],
+                            )
+                        },
+                    );
+                    if !copy_ok {
+                        status = 0xC000_0005;
+                    }
+                } else {
+                    status = 0xC000_0001;
+                }
+            }
+            _ => status = 0xC000_0001,
         }
     }
     csr_dynamic_wake(worker.client_cap, status, worker.client_reply);
@@ -21916,7 +21980,7 @@ unsafe fn csr_dynamic_reply_wait_receive(
             table[index].clear_client();
         }
     }
-    if !csr_dynamic_worker_park(badge, pi, tid, recvmsg, ctx_out, reply) {
+    if !csr_dynamic_worker_park(badge, pi, tid, port, recvmsg, ctx_out, reply) {
         return false;
     }
     print_str(b"[csr-api-dyn] worker badge=");
