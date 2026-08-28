@@ -21,8 +21,8 @@ use core::mem::size_of;
 use bytemuck::Pod;
 use nt_lpc_abi::{
     msg_type, opcode, LpcAcceptConnectRequest, LpcCompleteConnectRequest, LpcConnectPortRequest,
-    LpcCreatePortRequest, LpcMessageRequest, LpcQueryHandleRequest, LpcQueryHandleResponse,
-    LpcReceiveRequest, LpcReply,
+    LpcConnectionRequestMetadata, LpcCreatePortRequest, LpcMessageRequest, LpcQueryHandleRequest,
+    LpcQueryHandleResponse, LpcReceiveRequest, LpcReply,
 };
 use nt_status::NtStatus;
 
@@ -47,6 +47,8 @@ pub struct ReceiveResult {
     pub connection_id: u64,
     pub msg_type: u16,
     pub subsystem_type: u32,
+    pub client_process: u64,
+    pub client_thread: u64,
     pub port_context: u64,
     pub connection_info: Vec<u8>,
 }
@@ -114,6 +116,18 @@ impl<B: Backend> LpcClient<B> {
         subsystem_type: u32,
         conn_info: &[u8],
     ) -> Result<ConnectResult, NtStatus> {
+        self.connect_port_with_client_id(name, subsystem_type, conn_info, 0, 0)
+    }
+
+    /// Connect while preserving the caller identity supplied by the kernel.
+    pub fn connect_port_with_client_id(
+        &mut self,
+        name: &[u16],
+        subsystem_type: u32,
+        conn_info: &[u8],
+        client_process: u64,
+        client_thread: u64,
+    ) -> Result<ConnectResult, NtStatus> {
         let hdr = size_of::<LpcConnectPortRequest>();
         let name_len = byte_len(name)?;
         let conn_info_len =
@@ -129,6 +143,8 @@ impl<B: Backend> LpcClient<B> {
                     .ok_or(NtStatus::BUFFER_TOO_SMALL)?,
             )?,
             conninfo_len_bytes: conn_info_len,
+            client_process,
+            client_thread,
         };
         let buf = pack_units_and_bytes::<LPC_CONTROL_BUF_LEN, _>(&req, name, conn_info)?;
         let r = self
@@ -254,12 +270,44 @@ impl<B: Backend> LpcClient<B> {
         NtStatus(r.status).to_result()?;
         let msg_type = r.detail1 as u16;
         let is_connection = msg_type == msg_type::LPC_CONNECTION_REQUEST;
+        let (subsystem_type, client_process, client_thread, connection_info) = if is_connection {
+            let metadata_size = size_of::<LpcConnectionRequestMetadata>();
+            let returned = r.information as usize;
+            if returned < metadata_size || returned > out.len() {
+                return Err(NtStatus::BUFFER_TOO_SMALL);
+            }
+            let metadata: LpcConnectionRequestMetadata =
+                bytemuck::try_pod_read_unaligned(&out[..metadata_size])
+                    .map_err(|_| NtStatus::INVALID_PARAMETER)?;
+            if metadata.abi_size as usize != metadata_size {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            let conninfo_len = metadata.conninfo_len_bytes as usize;
+            if metadata_size.checked_add(conninfo_len) != Some(returned) {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            (
+                metadata.subsystem_type,
+                metadata.client_process,
+                metadata.client_thread,
+                out[metadata_size..returned].to_vec(),
+            )
+        } else {
+            (
+                (r.detail1 >> 32) as u32,
+                0,
+                0,
+                out[..(r.information as usize).min(out.len())].to_vec(),
+            )
+        };
         Ok(ReceiveResult {
             connection_id: if is_connection { r.detail0 } else { 0 },
             msg_type,
-            subsystem_type: (r.detail1 >> 32) as u32,
+            subsystem_type,
+            client_process,
+            client_thread,
             port_context: if is_connection { 0 } else { r.detail0 },
-            connection_info: out[..(r.information as usize).min(out.len())].to_vec(),
+            connection_info,
         })
     }
 
@@ -503,7 +551,9 @@ mod tests {
         let name = wide(r"\Windows\ApiPort");
         let conn_info = [1u8, 2, 3, 4, 5];
 
-        let result = client.connect_port(&name, 3, &conn_info).unwrap();
+        let result = client
+            .connect_port_with_client_id(&name, 3, &conn_info, 0x44, 0x88)
+            .unwrap();
         assert!(result.pending);
         assert_eq!(result.connection_id, 42);
 
@@ -520,6 +570,8 @@ mod tests {
             size_of::<LpcConnectPortRequest>() + name.len() * 2
         );
         assert_eq!(req.conninfo_len_bytes as usize, conn_info.len());
+        assert_eq!(req.client_process, 0x44);
+        assert_eq!(req.client_thread, 0x88);
         assert_eq!(
             &payload[req.conninfo_offset as usize..],
             conn_info.as_slice()

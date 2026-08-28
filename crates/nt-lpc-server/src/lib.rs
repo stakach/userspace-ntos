@@ -38,9 +38,9 @@ use core::mem::size_of;
 use bytemuck::Pod;
 use nt_lpc_abi::{
     connection_state, handle_endpoint, opcode, LpcAcceptConnectRequest, LpcClosePortRequest,
-    LpcCompleteConnectRequest, LpcConnectPortRequest, LpcCreatePortRequest, LpcMessageRequest,
-    LpcQueryHandleRequest, LpcQueryHandleResponse, LpcReceiveRequest, LpcReply,
-    LPC_QUERY_HANDLE_NAME_MAX_UNITS,
+    LpcCompleteConnectRequest, LpcConnectPortRequest, LpcConnectionRequestMetadata,
+    LpcCreatePortRequest, LpcMessageRequest, LpcQueryHandleRequest, LpcQueryHandleResponse,
+    LpcReceiveRequest, LpcReply, LPC_QUERY_HANDLE_NAME_MAX_UNITS,
 };
 use nt_port_core::{
     ConnectOutcome, MessageAttrs, PortApi, PortCore, PortHandleEndpoint, ReceiveOutcome,
@@ -164,10 +164,16 @@ impl Server {
         let req: LpcConnectPortRequest = read_req(buf)?;
         let name = read_name(buf, req.name_offset, req.name_len_bytes)?;
         let conn_info = read_blob(buf, req.conninfo_offset, req.conninfo_len_bytes)?;
-        match self
-            .core
-            .connect(&name, PortApi::Lpc, req.subsystem_type, conn_info)?
-        {
+        match self.core.connect_with_client_id(
+            &name,
+            PortApi::Lpc,
+            req.subsystem_type,
+            conn_info,
+            nt_port_core::ClientId {
+                process: req.client_process,
+                thread: req.client_thread,
+            },
+        )? {
             ConnectOutcome::Completed {
                 client_handle,
                 connection_id,
@@ -208,15 +214,36 @@ impl Server {
         }) = conn_try
         {
             let info = self.core.connection_info(connection_id).unwrap_or(&[]);
-            let n = info.len().min(out_buf.len());
-            out_buf[..n].copy_from_slice(&info[..n]);
             let subsystem_type = self
                 .core
                 .connection_subsystem_type(connection_id)
                 .unwrap_or(0);
+            let client_id = self
+                .core
+                .connection_client_id(connection_id)
+                .unwrap_or_default();
+            let metadata = LpcConnectionRequestMetadata {
+                abi_size: core::mem::size_of::<LpcConnectionRequestMetadata>() as u16,
+                _reserved: 0,
+                subsystem_type,
+                client_process: client_id.process,
+                client_thread: client_id.thread,
+                conninfo_len_bytes: info.len() as u32,
+                _reserved2: 0,
+            };
+            let metadata_bytes = bytemuck::bytes_of(&metadata);
+            let total = metadata_bytes
+                .len()
+                .checked_add(info.len())
+                .ok_or(NtStatus::BUFFER_TOO_SMALL)?;
+            if total > out_buf.len() {
+                return Err(NtStatus::BUFFER_TOO_SMALL);
+            }
+            out_buf[..metadata_bytes.len()].copy_from_slice(metadata_bytes);
+            out_buf[metadata_bytes.len()..total].copy_from_slice(info);
             return Ok(reply(
                 NtStatus::SUCCESS,
-                n as u32,
+                total as u32,
                 connection_id,
                 msg_type as u64 | ((subsystem_type as u64) << 32),
             ));
@@ -534,7 +561,13 @@ mod tests {
                 .create_port(&utf16("\\SmApiPort"), 0x88, 0x148, 0)
                 .unwrap();
             let r = c
-                .connect_port(&utf16("\\SmApiPort"), 2, b"sb-connect-info")
+                .connect_port_with_client_id(
+                    &utf16("\\SmApiPort"),
+                    2,
+                    b"sb-connect-info",
+                    0x44,
+                    0x88,
+                )
                 .unwrap();
             assert!(r.pending, "manual policy must leave the connect pending");
             conn_id = r.connection_id;
@@ -550,6 +583,8 @@ mod tests {
             assert_eq!(recv.connection_id, conn_id);
             assert_eq!(recv.msg_type, msg_type::LPC_CONNECTION_REQUEST);
             assert_eq!(recv.subsystem_type, 2);
+            assert_eq!(recv.client_process, 0x44);
+            assert_eq!(recv.client_thread, 0x88);
             assert_eq!(recv.connection_info, b"sb-connect-info");
             let sh = c.accept_connect(conn_id, true, 0xC0DE).unwrap();
             assert_ne!(sh, 0);

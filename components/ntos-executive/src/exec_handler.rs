@@ -24099,12 +24099,20 @@ impl ExecNtHandler {
             print_str(b"[srm-rdv] \\SeRmCommandPort is not registered in the LPC broker\n");
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
+        let client_process = self.pm_pid_for_pi(self.pi).unwrap_or(0) as u64;
+        let client_thread = self.current_tid;
 
         let Some(lpc) = lpc_client() else {
             print_str(b"[srm-rdv] LPC broker unavailable for \\SeRmCommandPort connect\n");
             return STATUS_UNSUCCESSFUL;
         };
-        let connect = match lpc.connect_port(name16, subsystem_type, conn_info) {
+        let connect = match lpc.connect_port_with_client_id(
+            name16,
+            subsystem_type,
+            conn_info,
+            client_process,
+            client_thread,
+        ) {
             Ok(connect) if connect.pending && connect.connection_id != 0 => connect,
             Ok(connect) => {
                 print_str(b"[srm-rdv] expected a pending broker connection, got handle=0x");
@@ -24456,8 +24464,10 @@ impl ExecNtHandler {
             return 0xC000_0034;
         }
         let mut pending = false;
+        let client_process = self.pm_pid_for_pi(self.pi).unwrap_or(0) as u64;
+        let client_thread = self.current_tid;
         if let Some(c) = lpc_client() {
-            match c.connect_port(name16, 2, &[]) {
+            match c.connect_port_with_client_id(name16, 2, &[], client_process, client_thread) {
                 Ok(r) if r.pending && r.connection_id != 0 => {
                     self.csr_rendezvous_conn = r.connection_id;
                     self.csr_rendezvous_out = porthandle_ptr;
@@ -29749,9 +29759,17 @@ impl ExecNtHandler {
                     print_str(b" -> failing\n");
                     return 0xC000_0034;
                 }
-                match lpc_client()
-                    .map(|c| c.connect_port(&name16, subsystem_type, &conn_info[..conn_info_len]))
-                {
+                let client_process = self.pm_pid_for_pi(self.pi).unwrap_or(0) as u64;
+                let client_thread = self.current_tid;
+                match lpc_client().map(|c| {
+                    c.connect_port_with_client_id(
+                        &name16,
+                        subsystem_type,
+                        &conn_info[..conn_info_len],
+                        client_process,
+                        client_thread,
+                    )
+                }) {
                     Some(Ok(r)) => {
                         if !r.pending && r.handle != 0 {
                             // AutoAccept (interim): the broker modelled the acceptor — complete now.

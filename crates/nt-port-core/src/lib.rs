@@ -93,6 +93,13 @@ pub enum PortHandleEndpoint {
     ServerCommPort,
 }
 
+/// Kernel-supplied identity of the thread that initiated a port connection.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClientId {
+    pub process: u64,
+    pub thread: u64,
+}
+
 /// A borrowed description of a live port-core handle.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PortHandleInfo<'a> {
@@ -212,6 +219,7 @@ struct Connection {
     /// Folded name of the server port connected to.
     port_name: Vec<u16>,
     subsystem_type: u32,
+    client_id: ClientId,
     /// Opaque connection-info blob from the connector (SB_CONNECTION_INFO for an
     /// LPC connector, the ALPC ConnectionInformation blob for an ALPC connector).
     /// Passed through byte-for-byte to the acceptor — the bridge connection-info
@@ -282,6 +290,11 @@ impl PortCore {
     /// The subsystem type the connector advertised.
     pub fn connection_subsystem_type(&self, id: u64) -> Option<u32> {
         self.conn(id).map(|c| c.subsystem_type)
+    }
+
+    /// The kernel-supplied identity of the connecting thread.
+    pub fn connection_client_id(&self, id: u64) -> Option<ClientId> {
+        self.conn(id).map(|c| c.client_id)
     }
 
     /// The folded name of the port a connection targets.
@@ -377,6 +390,25 @@ impl PortCore {
         subsystem_type: u32,
         conn_info: &[u8],
     ) -> Result<ConnectOutcome, NtStatus> {
+        self.connect_with_client_id(
+            name,
+            client_api,
+            subsystem_type,
+            conn_info,
+            ClientId::default(),
+        )
+    }
+
+    /// Connect with the kernel-supplied process/thread identity that must appear in the server's
+    /// `LPC_CONNECTION_REQUEST` header.
+    pub fn connect_with_client_id(
+        &mut self,
+        name: &[u16],
+        client_api: PortApi,
+        subsystem_type: u32,
+        conn_info: &[u8],
+        client_id: ClientId,
+    ) -> Result<ConnectOutcome, NtStatus> {
         let name = fold_name(name);
         let port_idx = self
             .ports
@@ -397,6 +429,7 @@ impl PortCore {
                     id,
                     name,
                     subsystem_type,
+                    client_id,
                     stored,
                     ConnState::Connected,
                     client_api,
@@ -414,6 +447,7 @@ impl PortCore {
                     id,
                     name,
                     subsystem_type,
+                    client_id,
                     stored,
                     ConnState::Pending,
                     client_api,
@@ -616,6 +650,7 @@ impl Connection {
         id: u64,
         port_name: Vec<u16>,
         subsystem_type: u32,
+        client_id: ClientId,
         conn_info: Vec<u8>,
         state: ConnState,
         client_api: PortApi,
@@ -626,6 +661,7 @@ impl Connection {
             id,
             port_name,
             subsystem_type,
+            client_id,
             conn_info,
             state,
             client_api,
@@ -783,13 +819,20 @@ mod tests {
         let mut core = PortCore::new();
         core.create_port(&utf16("\\P"), PortApi::Lpc);
         let blob = [1u8, 2, 3, 4, 5];
-        let out = core.connect(&utf16("\\P"), PortApi::Lpc, 7, &blob).unwrap();
+        let client_id = ClientId {
+            process: 0x44,
+            thread: 0x88,
+        };
+        let out = core
+            .connect_with_client_id(&utf16("\\P"), PortApi::Lpc, 7, &blob, client_id)
+            .unwrap();
         let cid = match out {
             ConnectOutcome::Completed { connection_id, .. } => connection_id,
             ConnectOutcome::Pending { connection_id } => connection_id,
         };
         assert_eq!(core.connection_info(cid), Some(&blob[..]));
         assert_eq!(core.connection_subsystem_type(cid), Some(7));
+        assert_eq!(core.connection_client_id(cid), Some(client_id));
     }
 
     #[test]

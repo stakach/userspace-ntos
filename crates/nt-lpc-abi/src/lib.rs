@@ -150,6 +150,24 @@ pub struct LpcConnectPortRequest {
     pub name_len_bytes: u32,
     pub conninfo_offset: u32,
     pub conninfo_len_bytes: u32,
+    /// Kernel-supplied connector `CLIENT_ID.UniqueProcess`.
+    pub client_process: u64,
+    /// Kernel-supplied connector `CLIENT_ID.UniqueThread`.
+    pub client_thread: u64,
+}
+
+/// Broker transport metadata prepended to connection information returned by
+/// `LPC_OP_REPLY_WAIT_RECEIVE` for an `LPC_CONNECTION_REQUEST`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LpcConnectionRequestMetadata {
+    pub abi_size: u16,
+    pub _reserved: u16,
+    pub subsystem_type: u32,
+    pub client_process: u64,
+    pub client_thread: u64,
+    pub conninfo_len_bytes: u32,
+    pub _reserved2: u32,
 }
 
 /// `LPC_OP_ACCEPT_CONNECT` — the server accepts (or refuses) a pending connection.
@@ -266,7 +284,8 @@ pub struct LpcReply {
 const _: () = {
     use core::mem::{align_of, size_of};
     assert!(size_of::<LpcCreatePortRequest>() == 24);
-    assert!(size_of::<LpcConnectPortRequest>() == 24);
+    assert!(size_of::<LpcConnectPortRequest>() == 40);
+    assert!(size_of::<LpcConnectionRequestMetadata>() == 32);
     assert!(size_of::<LpcAcceptConnectRequest>() == 24);
     assert!(size_of::<LpcCompleteConnectRequest>() == 16);
     assert!(size_of::<LpcReceiveRequest>() == 24);

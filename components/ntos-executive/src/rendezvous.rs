@@ -798,7 +798,6 @@ pub(crate) unsafe fn sm_rendezvous(
     let mut client_handle = 0u64;
     let mut fill_idx = 0u64;
     let mut guard = 0u64;
-    let (connector_pid, connector_tid) = live_hosted_cid_for_pi(nt_handler, connector_pi);
     let (_b, mut mi, mut m0, mut m1, mut m2, mut m3) =
         if SM_RECEIVE_PARKED.swap(0, Ordering::Relaxed) != 0 {
             let recvmsg = SM_RECVMSG.load(Ordering::Relaxed);
@@ -812,8 +811,8 @@ pub(crate) unsafe fn sm_rendezvous(
                 return 0;
             }
             sm_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST);
-            sm_stack_write(recvmsg + 0x08, connector_pid);
-            sm_stack_write(recvmsg + 0x10, connector_tid);
+            sm_stack_write(recvmsg + 0x08, received.client_process);
+            sm_stack_write(recvmsg + 0x10, received.client_thread);
             sm_stack_write32(recvmsg + 0x28, received.subsystem_type);
             for (i, chunk) in received
                 .connection_info
@@ -829,9 +828,9 @@ pub(crate) unsafe fn sm_rendezvous(
             print_str(b"[sm-rdv] resumed parked receive for pi=");
             print_u64(connector_pi as u64);
             print_str(b" cid=");
-            print_u64(connector_pid);
+            print_u64(received.client_process);
             print_str(b"/");
-            print_u64(connector_tid);
+            print_u64(received.client_thread);
             print_str(b"\n");
             reply_native_rendezvous(reply, 0);
             rendezvous_recv_full_r12(ep, reply, b"[sm-rdv]")
@@ -1012,8 +1011,8 @@ pub(crate) unsafe fn sm_rendezvous(
                         Some(r) if r.connection_id != 0 => {
                             // Marshal the connection-request PORT_MESSAGE onto the SM-loop stack.
                             sm_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST); // u2.s2.Type
-                            sm_stack_write(recvmsg + 0x08, connector_pid);
-                            sm_stack_write(recvmsg + 0x10, connector_tid);
+                            sm_stack_write(recvmsg + 0x08, r.client_process);
+                            sm_stack_write(recvmsg + 0x10, r.client_thread);
                             sm_stack_write32(recvmsg + 0x28, r.subsystem_type);
                             for (i, chunk) in
                                 r.connection_info.chunks_exact(2).take(120).enumerate()
@@ -1024,9 +1023,9 @@ pub(crate) unsafe fn sm_rendezvous(
                                 );
                             }
                             print_str(b"[sm-rdv] delivered connection cid=");
-                            print_u64(connector_pid);
+                            print_u64(r.client_process);
                             print_str(b"/");
-                            print_u64(connector_tid);
+                            print_u64(r.client_thread);
                             print_str(b" subsystem=");
                             print_u64(r.subsystem_type as u64);
                             print_str(b" info_len=");
@@ -1065,7 +1064,11 @@ pub(crate) unsafe fn sm_rendezvous(
                     let out = get_recv_mr(9);
                     let sb_name: alloc::vec::Vec<u16> =
                         "\\Windows\\SbApiPort".encode_utf16().collect();
-                    let reverse = lpc_client().and_then(|c| c.connect_port(&sb_name, 0, &[]).ok());
+                    let (smss_pid, smss_tid) = live_hosted_cid_for_pi(nt_handler, 0);
+                    let reverse = lpc_client().and_then(|c| {
+                        c.connect_port_with_client_id(&sb_name, 0, &[], smss_pid, smss_tid)
+                            .ok()
+                    });
                     match reverse {
                         Some(r) if r.pending => {
                             let handle = csr_sb_accept_connection(
@@ -1078,7 +1081,6 @@ pub(crate) unsafe fn sm_rendezvous(
                                 ntdll_pe,
                                 reg,
                                 dll_pes,
-                                nt_handler,
                             );
                             if handle == 0 {
                                 result = 0xC000_0001;
@@ -3488,7 +3490,6 @@ unsafe fn csr_sb_accept_connection(
     ntdll_pe: Option<&nt_pe_loader::PeFile>,
     reg: &nt_dll_registry::Registry,
     dll_pes: &[Option<nt_pe_loader::PeFile>],
-    nt_handler: &ExecNtHandler,
 ) -> u64 {
     const SSN_REPLY_WAIT_RECV: u64 = 203;
     const SSN_ACCEPT_CONNECT: u64 = 0;
@@ -3500,17 +3501,17 @@ unsafe fn csr_sb_accept_connection(
     }
     let recvmsg = CSR_SB_RECVMSG.load(Ordering::Relaxed);
     let port = CSR_SB_RECVPORT.load(Ordering::Relaxed);
-    let (smss_pid, smss_tid) = live_hosted_cid_for_pi(nt_handler, 0);
-    let delivered = lpc_client()
-        .and_then(|c| c.reply_wait_receive(port).ok())
-        .is_some_and(|r| r.connection_id == conn_id);
-    if !delivered {
+    let Some(received) = lpc_client().and_then(|c| c.reply_wait_receive(port).ok()) else {
+        CSR_SB_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+        return 0;
+    };
+    if received.connection_id != conn_id {
         CSR_SB_RECEIVE_PARKED.store(1, Ordering::Relaxed);
         return 0;
     }
     csr_sb_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST);
-    csr_sb_stack_write(recvmsg + 0x08, smss_pid);
-    csr_sb_stack_write(recvmsg + 0x10, smss_tid);
+    csr_sb_stack_write(recvmsg + 0x08, received.client_process);
+    csr_sb_stack_write(recvmsg + 0x10, received.client_thread);
     reply_native_rendezvous(reply, 0);
 
     let mut client_handle = 0;
@@ -3998,12 +3999,9 @@ unsafe fn csr_sb_api_request_rendezvous(
 /// AUTHENTIC CSR accept: drive csrss's REAL `CsrApiRequestThread` through one pending client
 /// `NtSecureConnectPort(\Windows\ApiPort)`. Mirrors `sm_rendezvous`: a nested loop on
 /// `CSR_FAULT_EP`/`REPLY_CSRLOOP` services the thread's real syscalls until `NtCompleteConnectPort`.
-/// The thread's pre-loop `CsrConnectToUser` is in-process (no syscalls; ClientThreadSetup is a stub
-/// returning TRUE, and CsrLocateThreadInProcess returns non-NULL since csrss registered its static
-/// threads at init → no spin). On the connection: NtSetEvent (signal the real hRequestEvent) →
-/// NtReplyWaitReceivePort (drain the broker's pending connection + marshal the PORT_MESSAGE:
-/// Type=LPC_CONNECTION_REQUEST, ClientId = the CSR worker CID so CsrLocateThreadByClientId matches a
-/// registered CSR_THREAD → CsrProcess=CsrRootProcess → AllowConnection=TRUE) → [NtMapViewOfSection of
+/// On the connection: NtSetEvent (signal the real hRequestEvent) → NtReplyWaitReceivePort (drain the
+/// broker's pending connection + marshal the kernel-supplied connector `ClientId`) →
+/// [NtMapViewOfSection of
 /// the CSR shared section handled by this rendezvous path] → NtAcceptConnectPort (broker accept) → NtCompleteConnectPort
 /// (broker complete). Returns the client comm-port handle (0 on wall). After the accept reply, the
 /// worker is left to run into its next receive and the next rendezvous drains that state if needed.
@@ -4012,9 +4010,9 @@ unsafe fn csr_sb_api_request_rendezvous(
 /// real receive/accept syscalls): (a) THE ACCEPT DECISION — CsrApiHandleConnectionRequest's
 /// CsrLocateThreadByClientId (hash table, exact CID) finds no registered CSR_PROCESS for hosted
 /// clients yet (that needs the SM→SB→CsrSrvCreateProcess *session-registration* plane, a separate
-/// fork), so the real thread can compute AllowConnection=FALSE and pass Accept=FALSE. The
-/// executive OVERRIDES the broker to accept+complete at the NtAcceptConnectPort syscall so the client
-/// connects; (b) the CSR_API_CONNECTINFO reply payload + shared-section mapping into clients are still
+/// fork), so the real thread can compute AllowConnection=FALSE and pass Accept=FALSE. The executive
+/// still overrides the broker while this real decision is measured; (b) the CSR_API_CONNECTINFO reply
+/// payload + shared-section mapping into clients are still
 /// executive-modeled (in `csr_client_connect`) because the isolated LPC broker carries no message
 /// payload across the connect. (The marshaled connection-request ClientId is now cosmetic for hosted
 /// clients until CSR process registration lands.)
@@ -4044,9 +4042,6 @@ pub(crate) unsafe fn csr_rendezvous(
     let mut client_handle = 0u64;
     let mut fill_idx = 0u64;
     let mut guard = 0u64;
-    let csrss_pid =
-        live_hosted_pid_for_role(nt_handler, nt_exe_image::HostedProcessRole::Win32Subsystem)
-            .unwrap_or(0) as u64;
     let (_b, mut mi, mut m0, mut m1, mut m2, mut m3) =
         if CSR_API_RECEIVE_PARKED.swap(0, Ordering::Relaxed) != 0 {
             let recvmsg = CSR_API_RECVMSG.load(Ordering::Relaxed);
@@ -4061,11 +4056,8 @@ pub(crate) unsafe fn csr_rendezvous(
             }
             CSR_MSGS.fetch_add(1, Ordering::Relaxed);
             csr_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST);
-            csr_stack_write(recvmsg + 0x08, csrss_pid);
-            csr_stack_write(
-                recvmsg + 0x10,
-                hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi),
-            );
+            csr_stack_write(recvmsg + 0x08, r.client_process);
+            csr_stack_write(recvmsg + 0x10, r.client_thread);
             reply_native_rendezvous(reply, 0);
             rendezvous_recv_full_r12(ep, reply, b"[csr-rdv]")
         } else {
@@ -4280,11 +4272,8 @@ pub(crate) unsafe fn csr_rendezvous(
                                 recvmsg + 0x04,
                                 nt_lpc_client::LPC_CONNECTION_REQUEST,
                             );
-                            csr_stack_write(recvmsg + 0x08, csrss_pid);
-                            csr_stack_write(
-                                recvmsg + 0x10,
-                                hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi),
-                            );
+                            csr_stack_write(recvmsg + 0x08, r.client_process);
+                            csr_stack_write(recvmsg + 0x10, r.client_thread);
                         }
                         _ => {
                             // No pending connection (the re-park receive): leave the thread PARKED.
@@ -4305,6 +4294,14 @@ pub(crate) unsafe fn csr_rendezvous(
                     // and skip NtCompleteConnectPort. Force the broker accept+complete here and return
                     // the completed client comm-port handle to the blocked client.
                     let porthandle_out = get_recv_mr(9); // R10 = *ServerPort
+                    let requested_accept = get_recv_mr(8) != 0;
+                    print_str(b"[csr-rdv] real NtAcceptConnectPort accept=");
+                    print_u64(requested_accept as u64);
+                    print_str(b" connector-pid=");
+                    print_u64(csr_stack_read(get_recv_mr(7) + 8).unwrap_or(0));
+                    print_str(b" connector-tid=");
+                    print_u64(csr_stack_read(get_recv_mr(7) + 16).unwrap_or(0));
+                    print_str(b"\n");
                     let sh = lpc_client()
                         .and_then(|c| c.accept_connect(conn_id, true, rdx).ok())
                         .unwrap_or(0);

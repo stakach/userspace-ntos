@@ -168,6 +168,8 @@ pub fn run(chan: &mut RingChannel<'_>, passed: &mut u64) {
             name_len_bytes: nb,
             conninfo_offset: hdr + nb,
             conninfo_len_bytes: 6,
+            client_process: 0,
+            client_thread: 0,
         };
         let mut b = bytes(&req);
         push_utf16(&mut b, &bname);
