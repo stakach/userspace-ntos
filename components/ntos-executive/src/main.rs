@@ -17432,12 +17432,16 @@ unsafe fn hosted_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
 /// therefore produces one `LPC_CLIENT_DIED` message in reverse registration order. A dying thread
 /// cannot receive an error, so failed sends are diagnosed and the registration is still released.
 unsafe fn notify_thread_termination_ports(tid: u64, handler: &mut ExecNtHandler) {
-    let create_time = handler
+    let (process_id, create_time) = handler
         .pm
         .thread(tid as nt_process::ThreadId)
-        .map(|thread| thread.create_time_100ns)
-        .unwrap_or(0);
-    let message = nt_lpc_abi::client_died_message(create_time);
+        .map(|thread| (thread.process_id as u64, thread.create_time_100ns))
+        .unwrap_or((0, 0));
+    let mut message = nt_lpc_abi::client_died_message(create_time);
+    // `PspExitThread` leaves ClientId empty in its stack frame; `LpcRequestPort` stamps the current
+    // ETHREAD identity while moving the message into the port queue.
+    message[8..16].copy_from_slice(&process_id.to_le_bytes());
+    message[16..24].copy_from_slice(&tid.to_le_bytes());
     loop {
         let port = match handler
             .pm
@@ -17446,15 +17450,24 @@ unsafe fn notify_thread_termination_ports(tid: u64, handler: &mut ExecNtHandler)
             Ok(Some(port)) => port,
             Ok(None) | Err(_) => break,
         };
-        let status = match lpc_client() {
-            Some(lpc) => match lpc.reply_port(port, &message) {
-                Ok(()) => 0,
-                Err(status) => status.raw() as u32,
-            },
-            None => 0xC000_0001,
+        let (status, csr_api_port) = match lpc_client() {
+            Some(lpc) => {
+                let csr_api_port = lpc
+                    .query_handle(port)
+                    .is_ok_and(|identity| lpc_name_is(&identity.name, b"\\windows\\apiport"));
+                let status = match lpc.reply_port(port, &message) {
+                    Ok(()) => 0,
+                    Err(status) => status.raw() as u32,
+                };
+                (status, csr_api_port)
+            }
+            None => (0xC000_0001, false),
         };
         if status == 0 {
             LPC_THREAD_TERMINATE_PORT_DELIVERIES.fetch_add(1, Ordering::Relaxed);
+            if csr_api_port {
+                CSR_KERNEL_MESSAGES_PENDING.fetch_add(1, Ordering::Relaxed);
+            }
         } else {
             LPC_THREAD_TERMINATE_PORT_DELIVERY_FAILURES.fetch_add(1, Ordering::Relaxed);
             if LPC_THREAD_TERMINATE_PORT_FAILURE_TRACE.fetch_add(1, Ordering::Relaxed) < 16 {
@@ -17468,6 +17481,7 @@ unsafe fn notify_thread_termination_ports(tid: u64, handler: &mut ExecNtHandler)
             }
         }
     }
+    let _ = csr_kernel_message_rendezvous(handler);
 }
 
 unsafe fn terminate_hosted_thread_mechanism(
@@ -21373,6 +21387,8 @@ impl ObjEntry {
 struct ExecLoopCtx {
     /// The faulting process's PML4 (page_map target for COMMIT frames / demand-filled pages).
     pml4: u64,
+    /// Main hosted-process fault endpoint used when the CSR worker creates another hosted thread.
+    main_fault_ep: u64,
     /// Every hosted process's trusted mechanism state. Cross-process VM services select the target
     /// PML4/scratch through the access-checked target pid rather than the caller's active context.
     procs: *mut [ProcExec],
@@ -24926,6 +24942,12 @@ static CSR_CONNECTED_MASK: AtomicU64 = AtomicU64::new(0);
 static CSR_MSGS: AtomicU64 = AtomicU64::new(0);
 /// How many established-port CSR API requests completed through the real CsrApiRequestThread.
 static CSR_API_REAL_REPLIES: AtomicU64 = AtomicU64::new(0);
+/// Kernel-generated LPC messages queued for `CsrApiPort` but not yet handed to the real worker.
+static CSR_KERNEL_MESSAGES_PENDING: AtomicU64 = AtomicU64::new(0);
+/// Kernel-generated LPC messages consumed by the real `CsrApiRequestThread` receive loop.
+static CSR_KERNEL_MESSAGES_DELIVERED: AtomicU64 = AtomicU64::new(0);
+/// Broker, framing, or worker-delivery failures on the kernel-generated CSR message path.
+static CSR_KERNEL_MESSAGE_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// Count of pending CSR client connects completed by the real CsrApiRequestThread
 /// rendezvous. The boot path must not use the old modeled accept fallback.
 static CSR_AUTHENTIC_ACCEPTS: AtomicU64 = AtomicU64::new(0);
@@ -31028,6 +31050,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         b"exec_csr_message_plane",
                         CSR_MSGS.load(Ordering::Relaxed) >= 1
                             && CSR_API_REAL_REPLIES.load(Ordering::Relaxed) >= 1
+                            && CSR_KERNEL_MESSAGES_DELIVERED.load(Ordering::Relaxed) >= 1
+                            && CSR_KERNEL_MESSAGES_PENDING.load(Ordering::Relaxed) == 0
+                            && CSR_KERNEL_MESSAGE_FAILURES.load(Ordering::Relaxed) == 0
                             && CSR_AUTHENTIC_ACCEPTS.load(Ordering::Relaxed) >= 1
                             && CSR_AUTHENTIC_ACCEPT_MASK.load(Ordering::Relaxed) & (1 << 2) != 0
                             && CSR_RENDEZVOUS_FAILURES.load(Ordering::Relaxed) == 0,
@@ -31555,15 +31580,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_str(b" process-no-reply-pis=0x");
                     print_hex(PM_TERMINATE_PROCESS_NO_REPLY_PIS.load(Ordering::Relaxed) as u32);
                     print_str(b" termination-ports=");
-                    print_u64(
-                        LPC_THREAD_TERMINATE_PORT_REGISTRATIONS.load(Ordering::Relaxed),
-                    );
+                    print_u64(LPC_THREAD_TERMINATE_PORT_REGISTRATIONS.load(Ordering::Relaxed));
                     print_str(b"/");
                     print_u64(LPC_THREAD_TERMINATE_PORT_DELIVERIES.load(Ordering::Relaxed));
                     print_str(b"/");
-                    print_u64(
-                        LPC_THREAD_TERMINATE_PORT_DELIVERY_FAILURES.load(Ordering::Relaxed),
-                    );
+                    print_u64(LPC_THREAD_TERMINATE_PORT_DELIVERY_FAILURES.load(Ordering::Relaxed));
+                    print_str(b" csr-kernel-messages=");
+                    print_u64(CSR_KERNEL_MESSAGES_DELIVERED.load(Ordering::Relaxed));
+                    print_str(b"/");
+                    print_u64(CSR_KERNEL_MESSAGES_PENDING.load(Ordering::Relaxed));
+                    print_str(b"/");
+                    print_u64(CSR_KERNEL_MESSAGE_FAILURES.load(Ordering::Relaxed));
                     print_str(b")\n");
                     // ITEM 2b — seL4 MECHANISM teardown (reclamation) proven end-to-end on a THROWAWAY
                     // untyped/caps: the kernel's CNodeDelete does full reclamation (TCB suspend, frame-
@@ -31719,6 +31746,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_hex(CSR_AUTHENTIC_ACCEPT_MASK.load(Ordering::Relaxed) as u32);
                     print_str(b" real_replies=");
                     print_u64(CSR_API_REAL_REPLIES.load(Ordering::Relaxed));
+                    print_str(b" kernel_messages=");
+                    print_u64(CSR_KERNEL_MESSAGES_DELIVERED.load(Ordering::Relaxed));
+                    print_str(b"/");
+                    print_u64(CSR_KERNEL_MESSAGES_PENDING.load(Ordering::Relaxed));
+                    print_str(b"/");
+                    print_u64(CSR_KERNEL_MESSAGE_FAILURES.load(Ordering::Relaxed));
                     print_str(b"\n");
                     // ★ MILESTONE — services.exe is the 3rd win32k GUI client: its user32 DllMain
                     // NtUserProcessConnect (SSN 0x10FA) was routed to the win32k component (badge 6 /

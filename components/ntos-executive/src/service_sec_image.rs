@@ -9151,6 +9151,7 @@ pub(crate) unsafe fn service_sec_image(
                 // ctx of raw refs (rebuilt each iteration at the current loop locals).
                 nt_handler.loop_ctx = Some(ExecLoopCtx {
                     pml4,
+                    main_fault_ep: fault_ep,
                     procs,
                     pfilled,
                     nls_section_handle: &mut nls_section_handle as *mut u64,
@@ -10107,6 +10108,7 @@ pub(crate) unsafe fn service_sec_image(
                                 csr_request_port,
                                 csr_request_message,
                                 csr_reply_message,
+                                false,
                                 procs[csrss_pi].pml4,
                                 fault_ep,
                                 pe,
@@ -10208,6 +10210,10 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                 }
+                // A termination notification can be queued while the CSR worker is busy accepting
+                // a connection or dispatching a client request. Once that operation has re-parked
+                // the real worker, immediately drain the broker-owned kernel-message queue.
+                let _ = csr_kernel_message_rendezvous(&mut nt_handler);
             } else if m0 == 223 {
                 // NtSetDefaultHardErrorPort(PortHandle=R10). csrsrv's CsrServerInitialization registers
                 // its API port as the hard-error port right after SmConnectToSm succeeds

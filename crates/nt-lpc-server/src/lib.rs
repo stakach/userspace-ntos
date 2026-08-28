@@ -672,8 +672,7 @@ mod tests {
         );
     }
 
-    /// The core-backed LPC message plane (REPLY_PORT send + REPLY_WAIT_RECEIVE
-    /// data receive) — used by the bridge, bypassed by the live executive.
+    /// The core-backed LPC message plane (REPLY_PORT send + REPLY_WAIT_RECEIVE data receive).
     #[test]
     fn lpc_message_plane_roundtrip() {
         use nt_lpc_abi::LpcMessageRequest;
@@ -733,6 +732,50 @@ mod tests {
         assert_eq!(r.information, 4);
         assert_eq!(&out[..4], b"ping");
         assert_eq!(r.detail0, 0, "LPC surfaces no attributes");
+    }
+
+    #[test]
+    fn client_died_frame_reaches_the_listen_port_unchanged() {
+        let mut s = Server::new();
+        s.set_accept_policy(AcceptPolicy::Manual);
+        let (listen, connection) = {
+            let mut c = LpcClient::new(Direct {
+                server: &mut s,
+                out: [0; 512],
+            });
+            let listen = c
+                .create_port(&utf16("\\Windows\\ApiPort"), 0, 0x148, 0)
+                .unwrap();
+            let pending = c
+                .connect_port(&utf16("\\Windows\\ApiPort"), 2, &[])
+                .unwrap();
+            (listen, pending.connection_id)
+        };
+        let client = {
+            let mut c = LpcClient::new(Direct {
+                server: &mut s,
+                out: [0; 512],
+            });
+            c.reply_wait_receive(listen).unwrap();
+            let server = c.accept_connect(connection, true, 0x1234).unwrap();
+            c.complete_connect(server).unwrap().0
+        };
+
+        let mut message = nt_lpc_abi::client_died_message(0x1122_3344_5566_7788);
+        message[8..16].copy_from_slice(&24u64.to_le_bytes());
+        message[16..24].copy_from_slice(&872u64.to_le_bytes());
+        let received = {
+            let mut c = LpcClient::new(Direct {
+                server: &mut s,
+                out: [0; 512],
+            });
+            c.reply_port(client, &message).unwrap();
+            c.reply_wait_receive(listen).unwrap()
+        };
+        assert_eq!(received.connection_id, 0);
+        assert_eq!(received.msg_type, msg_type::LPC_CLIENT_DIED);
+        assert_eq!(received.port_context, 0x1234);
+        assert_eq!(received.connection_info, message);
     }
 
     #[test]
