@@ -15212,3 +15212,43 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     buffer before mutation, implement reset/default and partial `STATUS_NOT_ALL_ASSIGNED` behavior,
     reject disabling mandatory or enabling deny-only groups, and advance the token modification ID
     only when state genuinely changes.
+
+    `NtAdjustGroupsToken` (2026-08-29, accepted): SSN 11 is now a typed registered six-argument
+    service with no numeric branch. `TokenGroup` now owns the complete native attribute word rather
+    than reconstructing mandatory/default/owner/deny-only/logon-ID bits from the current enabled
+    state; token creation applies the native mandatory-group normalization while duplication,
+    access checks, owner validation, logon-SID discovery, and token queries consume explicit
+    predicates over that lossless state. The reusable adjustment policy performs a validation pass,
+    resets groups to their independent enabled-by-default bit, rejects disabling mandatory or
+    enabling deny-only groups without mutation, applies every assigned group while reporting
+    partial `STATUS_NOT_ALL_ASSIGNED`, and advances `ModifiedId` only for a real state change.
+
+    The executive requires `TOKEN_ADJUST_GROUPS` and conditionally `TOKEN_QUERY`, captures the
+    aligned native header plus every bounded SID through `ClientMemory`, probes the complete
+    previous-state buffer and return length before mutation, and returns an exact relocatable
+    `TOKEN_GROUPS` containing the changed groups' original attributes and caller-space SID pointers.
+    An undersized previous-state buffer receives its required length and leaves the token unchanged.
+
+    Focused validation passes `nt-security` `67/67`, `nt-syscall` `61/61`, `git diff --check`, the
+    freestanding executive at the established 212-warning baseline, and the release build/staging
+    path. Code checkpoint `4781864f` is pushed. Serialized acceptance
+    `.tmp/run-headless-adjust-groups-20260828.log` reached quiescence at 109,420 ms, launched genuine
+    userinit and Explorer, completed 668 Explorer api0 redirects with zero callback or dead-callback
+    failures, recorded paint begin/end `5/20`, 187 direct GDI returns, and 135 batch flushes covering
+    184 records, painted `480000/480000` framebuffer pixels with at least 32 colours, passed all
+    `295/295` gates, and matched the sentinel. Startup did not issue SSN 11, so this is explicitly a
+    full non-regression gate; the direct adjustment contract is covered by focused tests while boot
+    exercises lossless group capture/query through real logon-token creation. Snapshot generation 5
+    committed 1,755,492 bytes, scratch returned to zero, and the census reported no page-table,
+    frame, mapping, alias, registry, untyped-allocation, frame-registration, image-bank, or allocator
+    failure.
+
+    Review adjustment: the typed surface now contains 169 services, the hosted table registers 168
+    numbered variants, and 54 canonical ABI exports remain absent. Audit `NtSetInformationToken`
+    (SSN 239) next because the token store already owns real owner/default-DACL mutation and now has
+    a distinct originating-logon-session field, but user mode cannot yet complete the token lifecycle
+    after `NtCreateToken`. Implement the whole native mutation boundary rather than only TokenOrigin:
+    enumerate the NT5 settable classes, their exact lengths, access rights, privilege checks,
+    dynamic-charge rules, logon-session references, and audit-policy ownership; add missing reusable
+    token-store traits first, and reject inapplicable classes with their real status instead of
+    accepting or discarding state.
