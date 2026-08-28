@@ -497,6 +497,9 @@ pub fn capture_token(
             default_dacl,
             session_id: 0,
             authentication_id,
+            // `SepCreateToken` zero-initializes this field. A logon authority may publish the
+            // origin later through TokenOrigin; duplication preserves it thereafter.
+            originating_logon_session: Luid::new(0),
         },
         expiration_time,
         source,

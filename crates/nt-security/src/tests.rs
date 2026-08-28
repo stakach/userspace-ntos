@@ -206,7 +206,8 @@ fn token_impersonation_authorization_uses_privilege_session_or_user() {
         &client,
         SecurityImpersonationLevel::Impersonation,
     ));
-    server.authentication_id = client.authentication_id;
+    client.originating_logon_session = Luid::new(0x3333);
+    server.authentication_id = client.originating_logon_session;
     assert!(token_can_impersonate(
         &server,
         &client,

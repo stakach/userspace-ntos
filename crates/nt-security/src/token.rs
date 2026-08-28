@@ -124,7 +124,7 @@ pub fn token_can_impersonate(
     level < SecurityImpersonationLevel::Identification
         || client.authentication_id == ANONYMOUS_LOGON_LUID
         || server.has_privilege(SE_IMPERSONATE)
-        || server.authentication_id == client.authentication_id
+        || server.authentication_id == client.originating_logon_session
         || server.user == client.user
 }
 
@@ -305,6 +305,10 @@ pub struct AccessToken {
     pub default_dacl: Option<NativeAcl>,
     pub session_id: u32,
     pub authentication_id: Luid,
+    /// Logon session that originated this token. `SeTokenCanImpersonate` compares the server's
+    /// authentication ID against this identity, which is distinct from the token's current logon
+    /// session and is inherited unchanged by token duplication.
+    pub originating_logon_session: Luid,
 }
 
 impl AccessToken {
@@ -507,6 +511,7 @@ impl AccessToken {
             default_dacl: Some(NativeAcl::system_default()),
             session_id: 0,
             authentication_id: Luid::new(0x3e7), // SYSTEM_LUID
+            originating_logon_session: Luid::new(0x3e7),
         }
     }
 
@@ -533,6 +538,7 @@ impl AccessToken {
             default_dacl: None,
             session_id: 1,
             authentication_id: Luid::new(0x1_0000),
+            originating_logon_session: Luid::new(0x1_0000),
         }
     }
 
@@ -553,6 +559,7 @@ impl AccessToken {
             default_dacl: None,
             session_id: 1,
             authentication_id: Luid::new(0x2_0000),
+            originating_logon_session: Luid::new(0x2_0000),
         }
     }
 }
