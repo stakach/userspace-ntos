@@ -15962,8 +15962,59 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     broker request metadata with the real client process/thread identity and connection association,
     add a reference-owning static token snapshot in kernel security state, and implement the native
     service through the existing ETHREAD impersonation-token replacement path. Reject stale,
-    datagram, mismatched-message, anonymous-level, and unauthorized delegation cases; do not infer a
-    client from an image role or accept a raw caller-provided `ClientId`. After that boundary is
-    covered in host-testable LPC/security crates and passes the desktop gate, finish the independent
+    datagram, mismatched-message, insufficient source impersonation level, and unauthorized
+    delegation cases; a requested anonymous level is valid by itself. Do not infer a client from an
+    image role or accept a raw caller-provided `ClientId`. After that boundary is covered in
+    host-testable LPC/security crates and passes the desktop gate, finish the independent
     server-provided `REMOTE_PORT_VIEW` direction and decide whether `MaxPoolUsage` needs broker-side
     allocation accounting rather than remaining native policy metadata.
+
+    LPC request identity and client-impersonation convergence (2026-08-29, accepted): LPC ABI v5
+    makes the isolated broker authoritative for every synchronous request identity. The adapter
+    replaces caller-controlled header identity with the kernel-supplied client PID/TID, allocates a
+    nonzero message id, binds the request to the client communication endpoint selected by the
+    handle, and promotes it to the delivered-request set only after a real server receive. Replies
+    through either the accepted server endpoint or named listen port require an exact live
+    `ClientId` plus message-id match and consume that identity atomically, so mismatched, stale, and
+    double replies fail instead of using the old most-recent-connection route. A generic broker
+    request query exposes only delivered request identity, connection id, and captured QoS.
+
+    `NtImpersonateClientOfPort` is registered at native SSN 94 and exported by the Rust ntdll as
+    both `NtImpersonateClientOfPort` and `ZwImpersonateClientOfPort`. The executive probes and
+    captures the native message header, asks the broker to validate the exact delivered request and
+    server endpoint, then installs the client context through the existing reference-owning ETHREAD
+    impersonation path. Dynamic tracking resolves the sending ETHREAD's current effective token;
+    static tracking retains a duplicated token snapshot with the connection. The shared security
+    planner enforces source level and effective-only rules, and the server authorization check
+    follows the existing `SeTokenCanImpersonate` model, using an identification-level duplicate when
+    full impersonation is not authorized. Port close releases the retained static token and broker
+    request state. Code checkpoint `a7b42149` is pushed.
+
+    Review found one real endpoint-lifetime bug rather than weakening the new identity checks. A CSR
+    exit request can queue its reply and then close the accepted server communication endpoint
+    before the connector resumes. The core now owns independent client/server endpoint references:
+    server close blocks future traffic and invalidates outstanding server work but preserves a reply
+    already committed to the open client endpoint; after that reply is drained, the client observes
+    `STATUS_PORT_DISCONNECTED`. The regression is covered by a host test and code checkpoint
+    `02d3a024` is pushed.
+
+    Focused validation passes `nt-status` at `4/4`, `nt-port-core` at `13/13`, `nt-lpc-abi` at
+    `4/4`, `nt-lpc-client` at `5/5`, `nt-lpc-server` at `16/16`, `nt-alpc` at `12/12`,
+    `nt-syscall-abi` at `19/19`, `nt-syscall` at `69/69`, and `nt-ntdll` at `709/709`. The PE hard
+    gate reports all 223 native stubs and all 223 Zw aliases exported, complete Win32-stack import
+    coverage, and valid relocations. The release executive builds at the established 212-warning
+    baseline. Serialized acceptance `.tmp/run-headless-lpc-endpoint-lifetime-20260829.log` reaches
+    genuine userinit and Explorer, completes 668 Explorer api0 redirects with zero callback or
+    dead-callback failures, reaches paint begin/end `5/20` with 187 direct GDI returns and 135 batch
+    flushes covering 184 records, and holds `480000/480000` non-background framebuffer pixels with
+    at least 32 colours. All `295/295` gates pass and the sentinel matches.
+
+    Review adjustment: synchronous LPC request/reply and impersonation no longer depend on the
+    listen port's most-recent connection field. That field remains only in the separate generic
+    datagram/ALPC message API and must be replaced with explicit connection provenance before it is
+    deleted; it is not a compatibility fallback for synchronous LPC. The next connection frontier
+    is the independent server-authored `REMOTE_PORT_VIEW` transaction and real broker allocation
+    accounting for `MaxPoolUsage`. After those are host-tested and desktop-accepted, convert the
+    remaining numeric reply/wait/receive continuations to a typed blocked-service adapter and remove
+    the superseded routing state in the same slice. No image-role inference, zero-section view,
+    permissive quota path, or synthetic successful reply is acceptable.
