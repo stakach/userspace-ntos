@@ -15542,6 +15542,39 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     exclusive owner of SEC_IMAGE fill logic. Only after all three sources use that operation should
     the two native lock services add process/system lock accounting and reclamation exclusion.
 
+    Executive page-residency operation (2026-08-29, accepted): the generic mapped-section fault
+    owner now treats an already resident page as success for an explicit Mm lock probe, while
+    retaining its original read/write fault behavior. The mandatory SEC_IMAGE page path has been
+    extracted from the receive loop into `service_image_page_residency`: it validates the immutable
+    residency plan, preserves the real shared image cache and clean-writecopy predicate, remaps
+    retained loader-fixed private frames, promotes write-copy through the existing COW authority,
+    fills from the owning parsed PE, and publishes the actual process mapping before success. The
+    receive loop calls this operation for page zero of every fault and retains its old forward window
+    only for optional neighbour prefetch, so image correctness is no longer exclusive to the fault
+    endpoint.
+
+    `ExecNtHandler::ensure_residency_page` resolves private, mapped, and image plans through that
+    shared boundary. Cross-process requests select the target EPROCESS-linked PML4, scratch window,
+    image mirror, executable or DLL PE, fill count, and page ledger; none are borrowed from the
+    issuing process. Private pages use the existing zero-fill mapper only when no exact frame exists,
+    mapped pages invoke their section owner with `FaultAccess::Lock`, and image pages invoke the new
+    single-page operation without claiming that a fault was observed.
+
+    Validation passes `git diff --check`, the freestanding executive at the established 209-warning
+    baseline, and the complete staged release/desktop gate. Serialized acceptance
+    `.tmp/run-headless-mm-residency-extract-20260829.log` reached final quiescence at 116,348 ms,
+    launched genuine userinit and Explorer, completed 675 Explorer api0 redirects with zero callback
+    or dead-callback failures, recorded paint begin/end `5/20`, 187 direct GDI returns, and 135 batch
+    flushes covering 184 records, and painted `480000/480000` framebuffer pixels with at least 32
+    colours. All `295/295` gates passed and the sentinel matched. Image COW, mapped-section COW and
+    writeback self-tests remained fully green, and the census reported no page-table, frame, mapping,
+    alias, registry, untyped-allocation, frame-registration, image-bank, or allocator failure.
+
+    Review adjustment: the residency prerequisite is complete. Add host-tested per-process and
+    system lock-class accounting next, make every private/mapped/image reclamation path consult it,
+    then register SSNs 108/276 and exercise real range normalization, privilege, already-locked,
+    all-or-nothing unlock, explicit unmap/free, and process-teardown behavior.
+
     The same review rejected taking `NtSetSystemTime` (SSN 251) as an isolated replacement target.
     The system clock is currently an immutable boot epoch plus monotonic counter, while native
     timers and the delay, object, keyed-event, I/O-completion, and driver wait queues retain only the

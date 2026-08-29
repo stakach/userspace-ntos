@@ -1917,7 +1917,7 @@ pub(crate) unsafe fn service_generic_section_writeback_plan(
     Ok(written_total)
 }
 
-unsafe fn service_generic_section_fault(
+pub(crate) unsafe fn service_generic_section_fault(
     generic_sections: &mut GenericSectionTable,
     pi: usize,
     page: u64,
@@ -1942,6 +1942,9 @@ unsafe fn service_generic_section_fault(
     }
     nt_address_space::mapped_view_fault_access_status(view_info.protect, fault_access)?;
     if csrss_frame_get_exact(pi as u64, page).0 != 0 {
+        if fault_access == nt_address_space::FaultAccess::Lock {
+            return Ok(true);
+        }
         let fault_plan = nt_address_space::mapped_view_fault_plan(view_info.protect, write_fault);
         if write_fault && fault_plan.copy_on_write {
             let old_protection =
@@ -2040,6 +2043,211 @@ unsafe fn service_generic_section_fault(
         print_str(b"\n");
     }
     Ok(true)
+}
+
+/// Make one committed SEC_IMAGE page resident through the same cache, COW, fill, and registration
+/// authorities used by a real user fault. `fault_observed` requests a remap when a retained private
+/// source frame proves the page was previously filled but the user mapping faulted again.
+pub(crate) unsafe fn service_image_page_residency(
+    pi: usize,
+    page: u64,
+    base: u64,
+    pe: &nt_pe_loader::PeFile,
+    pml4: u64,
+    scratch_base: u64,
+    image_mirror: u64,
+    fault_access: nt_address_space::FaultAccess,
+    fault_observed: bool,
+    filled_pages: &mut [u64; 512],
+    faults: &mut u64,
+) -> Result<(), u32> {
+    let info = process_committed_mapping_basic_information(pi as u64, page)
+        .ok_or(nt_address_space::STATUS_NOT_COMMITTED)?;
+    let residency = nt_address_space::vm_residency_page_plan(page, info)?;
+    if residency.source != nt_address_space::VmResidencySource::Image {
+        return Err(nt_address_space::STATUS_CONFLICTING_ADDRESSES);
+    }
+    nt_address_space::image_view_fault_access_status(info.protect, fault_access)?;
+
+    let write_fault = fault_access == nt_address_space::FaultAccess::Write;
+    let fault_plan = nt_address_space::image_view_fault_plan(info.protect, write_fault);
+    let rights = vm_page_rights(fault_plan.map_protection);
+    if rights == 0 {
+        return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
+    }
+    let rva = page
+        .checked_sub(base)
+        .and_then(|offset| u32::try_from(offset).ok())
+        .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?;
+    let shared_mapping_registered = shared_image_mapping_contains(pi as u64, page);
+
+    if fault_plan.copy_on_write
+        && (csrss_frame_get_exact_record(pi as u64, page).is_some() || shared_mapping_registered)
+    {
+        let read_protection =
+            nt_address_space::image_view_fault_plan(info.protect, false).map_protection;
+        vm_promote_image_cow_page(
+            pi,
+            page,
+            read_protection,
+            fault_plan.map_protection,
+            pml4,
+            scratch_base,
+        )?;
+        let filled_count = (*faults as usize).min(filled_pages.len());
+        for filled_page in filled_pages.iter_mut().take(filled_count) {
+            if *filled_page == page {
+                *filled_page = 0;
+            }
+        }
+        return Ok(());
+    }
+
+    let clean_writecopy_shareable = base != PE_LOAD_BASE
+        && !fault_plan.copy_on_write
+        && (info.protect & 0xff) == nt_address_space::PAGE_WRITECOPY
+        && sec_image_clean_writecopy_shareable(pe, rva, base);
+    let shareable = base != PE_LOAD_BASE
+        && (nt_address_space::image_view_shared_cacheable(info.protect, fault_plan.map_protection)
+            || clean_writecopy_shareable);
+    let cached = if shareable { dll_cache_get(page) } else { 0 };
+
+    if !fault_observed
+        && (csrss_frame_get_exact_record(pi as u64, page).is_some() || shared_mapping_registered)
+    {
+        return Ok(());
+    }
+
+    if !shareable {
+        let existing = csrss_frame_get(pi as u64, page);
+        if existing != 0 && existing != dll_cache_get(page) {
+            if !fault_observed {
+                return Ok(());
+            }
+            let (map_cap, copy_error) = copy_cap_r(existing);
+            if copy_error != 0 {
+                if map_cap != 0 {
+                    let _ = cnode_delete_recycle_r(map_cap);
+                }
+                return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+            }
+            let map_error = page_map_r(map_cap, page, rights, pml4);
+            if map_error != 0 {
+                let _ = cnode_delete_recycle_r(map_cap);
+                return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+            }
+            let trace = FIXUP_REMAP_N.fetch_add(1, Ordering::Relaxed);
+            if trace < 16 {
+                print_str(b"[fixup-remap] pi=");
+                print_u64(pi as u64);
+                print_str(b" page=0x");
+                print_hex(page as u32);
+                print_str(b" frame preserved\n");
+            }
+            return Ok(());
+        }
+    }
+
+    let (frame, private_alias, private_source_cap) = if cached != 0 {
+        DLL_SHARED_HITS.fetch_add(1, Ordering::Relaxed);
+        (cached, 0, 0)
+    } else {
+        if *faults >= SEC_IMAGE_FAULT_CAP {
+            return Err(nt_address_space::STATUS_COMMITMENT_LIMIT);
+        }
+        let scratch = scratch_base
+            .checked_add(
+                faults
+                    .checked_mul(0x1000)
+                    .ok_or(nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?,
+            )
+            .ok_or(nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
+        let (frame, frame_error) = alloc_frame_r();
+        if frame_error != 0 {
+            if frame != 0 {
+                let _ = cnode_delete_recycle_r(frame);
+            }
+            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+        }
+        if page_map_r(frame, scratch, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+            let _ = cnode_delete_recycle_r(frame);
+            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+        }
+        let _ = fill_image_page(pe, rva, scratch);
+        if shareable {
+            if !dll_cache_put(page, frame) {
+                let _ = page_unmap_r(frame);
+                let _ = cnode_delete_recycle_r(frame);
+                return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+            }
+        } else if base == PE_LOAD_BASE {
+            let offset = page - PE_LOAD_BASE;
+            if offset < IMAGE_MIRROR_WINDOW {
+                let _ = page_map(
+                    copy_cap(frame),
+                    image_mirror + offset,
+                    RW_NX,
+                    CAP_INIT_THREAD_VSPACE,
+                );
+            }
+        }
+        *faults += 1;
+        bump_progress();
+        (
+            frame,
+            if shareable { 0 } else { scratch },
+            if shareable { 0 } else { frame },
+        )
+    };
+
+    let (map_cap, copy_error) = copy_cap_r(frame);
+    if copy_error != 0 {
+        if map_cap != 0 {
+            let _ = cnode_delete_recycle_r(map_cap);
+        }
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let map_error = page_map_r(map_cap, page, rights, pml4);
+    if map_error != 0 {
+        let _ = cnode_delete_recycle_r(map_cap);
+        let duplicate_shared_fault = fault_observed
+            && map_error == 8
+            && shareable
+            && (cached != 0 || shared_mapping_registered);
+        if duplicate_shared_fault {
+            return Ok(());
+        }
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+
+    if shareable {
+        if !shared_image_mapping_replace_banked_after_map(pi as u64, page, map_cap) {
+            let _ = page_unmap_r(map_cap);
+            let _ = cnode_delete_recycle_r(map_cap);
+            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+        }
+    } else if private_source_cap != 0 {
+        if !csrss_frame_put_at_cap_source_owned(
+            pi as u64,
+            page,
+            map_cap,
+            private_alias,
+            private_source_cap,
+            private_source_cap,
+            false,
+        ) {
+            let _ = page_unmap_r(map_cap);
+            let _ = cnode_delete_recycle_r(map_cap);
+            let _ = page_unmap_r(private_source_cap);
+            let _ = cnode_delete_recycle_r(private_source_cap);
+            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+        }
+        let filled_index = (*faults as usize).saturating_sub(1);
+        if filled_index < filled_pages.len() {
+            filled_pages[filled_index] = page;
+        }
+    }
+    Ok(())
 }
 
 fn vm_fault_access_from_x86_error(error_code: u64) -> nt_address_space::FaultAccess {
@@ -8029,13 +8237,9 @@ pub(crate) unsafe fn service_sec_image(
             // preservation — so when the process resumes it finds the next pages already present and
             // does NOT re-fault them. This cuts the per-process round-trip count by ~BATCH×.
             //
-            // The `img_hi` bound comes from the committed image allocation that owns the faulting
-            // page. Extra pages are only PRE-filled when they are genuinely unmapped in THIS process
-            // — a per-process page not yet in `filled_pages`, and a shared-text page not yet in the
-            // global `dll_cache` — so we never double-map. The FAULTING page (batch index 0) keeps
-            // the full original logic incl. the shared-cache HIT path; extra pages take the fresh-fill
-            // path (a shared page already cached is left to a normal later fault — correct, just
-            // unbatched).
+            // The mandatory faulting page is handled first by the reusable Mm residency operation.
+            // The `img_hi` bound then limits optional PRE-fill pages to this committed allocation.
+            // Prefetch pages are only installed when genuinely unmapped in this process.
             // Prefetch a bounded forward window from the page the process actually touched. Whole-image
             // eager mapping made every untouched section resident and retained one root-CNode cap for
             // each scratch mapping plus one for each process mapping. A broad LSASS dependency scan
@@ -8048,9 +8252,35 @@ pub(crate) unsafe fn service_sec_image(
             let (batch_start, batch_pages) = (page, forward_policy.pages);
             let mut allocation_failed = false;
             let mut image_protect_failed = false;
-            let mut fault_page_serviced = false;
-            let mut bi: u64 = 0;
-            while bi < batch_pages {
+            let mut fault_page_serviced = true;
+            let image_fault_access = vm_fault_access_from_x86_error(m3);
+            if let Err(status) = service_image_page_residency(
+                pi,
+                page,
+                base,
+                tpe,
+                pml4,
+                scratch_base,
+                ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed),
+                image_fault_access,
+                true,
+                filled_pages,
+                &mut faults,
+            ) {
+                print_str(b"[vmf-image] residency failed pi=");
+                print_u64(pi as u64);
+                print_str(b" page=0x");
+                print_hex((page >> 32) as u32);
+                print_hex(page as u32);
+                print_str(b" status=0x");
+                print_hex(status);
+                print_str(b"\n");
+                image_protect_failed = status == nt_address_space::STATUS_ACCESS_VIOLATION;
+                allocation_failed = true;
+                fault_page_serviced = false;
+            }
+            let mut bi: u64 = 1;
+            while !allocation_failed && bi < batch_pages {
                 let bpage = batch_start + bi * 0x1000;
                 if bpage >= img_hi || bpage < base {
                     break;

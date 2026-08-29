@@ -16486,6 +16486,89 @@ impl ExecNtHandler {
         0
     }
 
+    unsafe fn ensure_residency_page(
+        &mut self,
+        target_pi: usize,
+        plan: nt_address_space::VmResidencyPagePlan,
+    ) -> Result<(), u32> {
+        let ctx = self.loop_ctx.ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let procs = &mut *ctx.procs;
+        let target = procs
+            .get(target_pi)
+            .copied()
+            .filter(|target| target.pml4 != 0)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        match plan.source {
+            nt_address_space::VmResidencySource::Private => {
+                if csrss_frame_get_exact(target_pi as u64, plan.page).0 == 0 {
+                    vm_map_private_page(
+                        target_pi,
+                        plan.page,
+                        plan.map_protection,
+                        target.pml4,
+                        target.scratch_base,
+                    )?;
+                }
+                Ok(())
+            }
+            nt_address_space::VmResidencySource::Mapped => {
+                match service_generic_section_fault(
+                    &mut *ctx.generic_sections,
+                    target_pi,
+                    plan.page,
+                    target.pml4,
+                    target.scratch_base,
+                    nt_address_space::FaultAccess::Lock,
+                )? {
+                    true => Ok(()),
+                    false => Err(nt_address_space::STATUS_CONFLICTING_ADDRESSES),
+                }
+            }
+            nt_address_space::VmResidencySource::Image => {
+                let image = process_committed_image_allocation(target_pi as u64, plan.page)
+                    .ok_or(nt_address_space::STATUS_NOT_COMMITTED)?;
+                let base = image.allocation_base;
+                let pe = if base == PE_LOAD_BASE {
+                    (&*ctx.hosted_loaded_images)
+                        .pe_by_pi(target_pi)
+                        .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?
+                } else if !ctx.ntdll_pe.is_null() && base == ctx.nt_base {
+                    &*ctx.ntdll_pe
+                } else {
+                    let reg = &*ctx.reg;
+                    let (index, _) = reg
+                        .dll_for_page(target_pi, base)
+                        .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?;
+                    ctx.dll_pes()
+                        .get(index)
+                        .and_then(|slot| slot.as_ref())
+                        .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?
+                };
+                let (filled_pages, faults) = if target_pi == self.pi {
+                    (&mut *ctx.filled_pages, &mut *ctx.faults)
+                } else {
+                    (
+                        &mut (&mut *ctx.pfilled)[target_pi],
+                        &mut procs[target_pi].faults,
+                    )
+                };
+                service_image_page_residency(
+                    target_pi,
+                    plan.page,
+                    base,
+                    pe,
+                    target.pml4,
+                    target.scratch_base,
+                    hosted_active_image_mirror_for_pi(target_pi),
+                    nt_address_space::FaultAccess::Lock,
+                    false,
+                    filled_pages,
+                    faults,
+                )
+            }
+        }
+    }
+
     unsafe fn query_memory_basic_information(
         &self,
         target_pi: usize,
