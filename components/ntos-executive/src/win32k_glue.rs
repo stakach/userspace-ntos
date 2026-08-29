@@ -3438,6 +3438,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
 }
 
 unsafe fn map_win32k_arena_prefix_into_client(
+    handler: &mut ExecNtHandler,
     pml4: u64,
     pi: usize,
     frame_base: u64,
@@ -3469,7 +3470,14 @@ unsafe fn map_win32k_arena_prefix_into_client(
     }
 
     for p in (already_mapped + 511) / 512..(target_frames + 511) / 512 {
-        if !win32k_client_cap_bank_map_page_table(pml4, pi, client_base + p * 0x20_0000, label, p) {
+        if !win32k_client_cap_bank_map_page_table(
+            handler,
+            pml4,
+            pi,
+            client_base + p * 0x20_0000,
+            label,
+            p,
+        ) {
             return false;
         }
     }
@@ -3525,67 +3533,24 @@ unsafe fn map_win32k_arena_prefix_into_client(
 }
 
 unsafe fn win32k_client_cap_bank_map_page_table(
+    handler: &mut ExecNtHandler,
     pml4: u64,
     pi: usize,
     vaddr: u64,
     label: &[u8],
     index: u64,
 ) -> bool {
-    let Some(pt) = try_alloc_slot() else {
-        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
-        print_str(b"[win32k-svc] failed to allocate ");
-        print_str(label);
-        print_str(b" page table for pi=");
-        print_u64(pi as u64);
-        print_str(b" index=0x");
-        print_hex(index as u32);
-        print_str(b" error=4\n");
-        return false;
-    };
-    let retype_error = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-    if retype_error != 0 {
-        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
-        print_str(b"[win32k-svc] failed to retype ");
-        print_str(label);
-        print_str(b" page table for pi=");
-        print_u64(pi as u64);
-        print_str(b" index=0x");
-        print_hex(index as u32);
-        print_str(b" error=");
-        print_u64(retype_error);
-        print_str(b"\n");
-        recycle_deleted_root_slot(pt);
-        return false;
-    }
-    let map_error = paging_struct_map_r(pt, LBL_X86_PAGE_TABLE_MAP, vaddr, pml4);
-    if map_error == SEL4_DELETE_FIRST {
-        let _ = cnode_delete_recycle_r(pt);
-        return true;
-    }
-    if map_error != 0 {
+    if let Err(status) = ensure_process_user_page_table(handler, pi, vaddr, pml4) {
         WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
         print_str(b"[win32k-svc] failed to map ");
         print_str(label);
-        print_str(b" page table into pi=");
-        print_u64(pi as u64);
-        print_str(b" va=0x");
-        print_hex((vaddr >> 32) as u32);
-        print_hex(vaddr as u32);
-        print_str(b" error=");
-        print_u64(map_error);
-        print_str(b"\n");
-        let _ = cnode_delete_recycle_r(pt);
-        return false;
-    }
-    if !win32k_client_cap_bank_store(pi, pt) {
-        print_str(b"[win32k-svc] failed to retain ");
-        print_str(label);
-        print_str(b" page-table cap for pi=");
+        print_str(b" page table for pi=");
         print_u64(pi as u64);
         print_str(b" index=0x");
         print_hex(index as u32);
+        print_str(b" status=0x");
+        print_hex(status);
         print_str(b"\n");
-        let _ = cnode_delete_recycle_r(pt);
         return false;
     }
     true
@@ -3878,13 +3843,18 @@ pub(crate) unsafe fn release_win32k_client_cap_bank(pi: usize) -> Win32kClientCa
 /// gHandleTable, handle entries, desktop-heap data, and live WND/CLS objects can live) into the GUI
 /// client `pi`'s VSpace at [`win32k_subsystem::CSRSS_W32_SHARED_VA`]. Returns the server→client delta
 /// (`WIN32K_HEAP_VADDR - CSRSS_W32_SHARED_VA`) only after the mapping is actually installed.
-pub(crate) unsafe fn map_win32k_user_heap_into_client(pml4: u64, pi: usize) -> Option<u64> {
+pub(crate) unsafe fn map_win32k_user_heap_into_client(
+    handler: &mut ExecNtHandler,
+    pml4: u64,
+    pi: usize,
+) -> Option<u64> {
     let delta = win32k_subsystem::WIN32K_HEAP_VADDR - win32k_subsystem::CSRSS_W32_SHARED_VA;
     let heap_base = WIN32K_HEAP_FRAME_BASE.load(Ordering::Relaxed);
     let already_mapped = win32k_user_heap_mapped_row(pi)
         .is_some_and(|row| row.load(Ordering::Relaxed) != 0)
         || (pi < 64 && WIN32K_CLIENT_MAPPED.load(Ordering::Relaxed) & (1u64 << pi) != 0);
     if !map_win32k_arena_prefix_into_client(
+        handler,
         pml4,
         pi,
         heap_base,
@@ -3916,13 +3886,18 @@ pub(crate) unsafe fn map_win32k_user_heap_into_client(pml4: u64, pi: usize) -> O
 /// DESKTOPINFO is translated by the arena that actually owns the pointer; the current ReactOS desktop
 /// heap path places it in the USER heap, but pool-resident objects still need this window. Returns the
 /// pool server→client delta only after the mapping is actually installed.
-pub(crate) unsafe fn map_win32k_pool_into_client(pml4: u64, pi: usize) -> Option<u64> {
+pub(crate) unsafe fn map_win32k_pool_into_client(
+    handler: &mut ExecNtHandler,
+    pml4: u64,
+    pi: usize,
+) -> Option<u64> {
     let delta = win32k_subsystem::WIN32K_POOL_VADDR - win32k_subsystem::CSRSS_W32_POOL_VA;
     let pool_base = WIN32K_POOL_FRAME_BASE.load(Ordering::Relaxed);
     let already_mapped = win32k_pool_mapped_row(pi)
         .is_some_and(|row| row.load(Ordering::Relaxed) != 0)
         || (pi < 64 && WIN32K_POOL_CLIENT_MAPPED.load(Ordering::Relaxed) & (1u64 << pi) != 0);
     if !map_win32k_arena_prefix_into_client(
+        handler,
         pml4,
         pi,
         pool_base,
@@ -3956,7 +3931,11 @@ pub(crate) unsafe fn map_win32k_pool_into_client(pml4: u64, pi: usize) -> Option
 /// so the correct client pointer is the USER-heap alias of that allocation. The committed USER heap
 /// prefix mapping installed here covers the table pages; a second table window would retain duplicate
 /// frame caps for every GUI process.
-pub(crate) unsafe fn map_gdi_shared_handle_table_into_client(pml4: u64, pi: usize) -> u64 {
+pub(crate) unsafe fn map_gdi_shared_handle_table_into_client(
+    handler: &mut ExecNtHandler,
+    pml4: u64,
+    pi: usize,
+) -> u64 {
     let server_base = core::ptr::read_volatile(
         (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_GDI_TABLE_BASE) as *const u64,
     );
@@ -3981,7 +3960,7 @@ pub(crate) unsafe fn map_gdi_shared_handle_table_into_client(pml4: u64, pi: usiz
     if source_offset + frames > win32k_subsystem::WIN32K_HEAP_FRAMES {
         return 0;
     }
-    if map_win32k_user_heap_into_client(pml4, pi).is_none() {
+    if map_win32k_user_heap_into_client(handler, pml4, pi).is_none() {
         return 0;
     }
     GDI_SHARED_TABLE_FRAME_BASE.store(heap_frames + source_offset, Ordering::Relaxed);
@@ -4000,7 +3979,11 @@ pub(crate) unsafe fn map_gdi_shared_handle_table_into_client(pml4: u64, pi: usiz
     client_base
 }
 
-pub(crate) unsafe fn map_gdi_user_attributes_into_client(pml4: u64, pi: usize) -> bool {
+pub(crate) unsafe fn map_gdi_user_attributes_into_client(
+    handler: &mut ExecNtHandler,
+    pml4: u64,
+    pi: usize,
+) -> bool {
     let base = WIN32K_USERVM_FRAME_BASE.load(Ordering::Relaxed);
     if base == 0 {
         return false;
@@ -4008,6 +3991,7 @@ pub(crate) unsafe fn map_gdi_user_attributes_into_client(pml4: u64, pi: usize) -
     let already_mapped =
         gdi_uservm_mapped_row(pi).is_some_and(|row| row.load(Ordering::Relaxed) != 0);
     let mapped = map_win32k_arena_prefix_into_client(
+        handler,
         pml4,
         pi,
         base,

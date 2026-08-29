@@ -963,7 +963,7 @@ unsafe fn take_deferred_user_callback_return_for_top() -> Option<DeferredCallbac
 }
 
 unsafe fn process_completed_user_callback_outer_dispatch(
-    nt_handler: &ExecNtHandler,
+    nt_handler: &mut ExecNtHandler,
     completion_pi: usize,
     completion_pml4: u64,
     completion_badge: u64,
@@ -1081,6 +1081,7 @@ unsafe fn process_completed_user_callback_outer_dispatch(
         }
         let userconnect = &mut dispatch.arg_snapshot[..blen as usize];
         if complete_ntuser_process_connect_copyout(
+            nt_handler,
             completion_pi,
             completion_pml4,
             dispatch.args[1],
@@ -1919,6 +1920,7 @@ pub(crate) unsafe fn service_generic_section_writeback_plan(
 }
 
 pub(crate) unsafe fn service_generic_section_fault(
+    nt_handler: &mut ExecNtHandler,
     generic_sections: &mut GenericSectionTable,
     pi: usize,
     page: u64,
@@ -1951,6 +1953,7 @@ pub(crate) unsafe fn service_generic_section_fault(
             let old_protection =
                 nt_address_space::mapped_view_fault_plan(view_info.protect, false).map_protection;
             vm_promote_mapped_cow_page(
+                nt_handler,
                 pi,
                 page,
                 0,
@@ -1987,6 +1990,7 @@ pub(crate) unsafe fn service_generic_section_fault(
         let old_protection =
             nt_address_space::mapped_view_fault_plan(view_info.protect, false).map_protection;
         vm_promote_mapped_cow_page(
+            nt_handler,
             pi,
             page,
             frame,
@@ -1997,7 +2001,7 @@ pub(crate) unsafe fn service_generic_section_fault(
         )?;
         return Ok(true);
     }
-    vm_ensure_private_pt(pi, page, pml4)?;
+    vm_ensure_private_pt(nt_handler, pi, page, pml4)?;
     let (map_cap, copy_error) = copy_cap_r(frame);
     if copy_error != 0 {
         if map_cap != 0 {
@@ -2262,7 +2266,7 @@ fn vm_fault_access_from_x86_error(error_code: u64) -> nt_address_space::FaultAcc
 }
 
 unsafe fn service_private_guard_page_fault(
-    nt_handler: &ExecNtHandler,
+    nt_handler: &mut ExecNtHandler,
     pi: usize,
     badge: u64,
     page: u64,
@@ -2297,7 +2301,14 @@ unsafe fn service_private_guard_page_fault(
     let map_result = if csrss_frame_get_exact(pi as u64, page).0 != 0 {
         vm_reprotect_private_page(pi, page, old_protection, plan.new_protection, pml4)
     } else {
-        vm_map_private_page(pi, page, plan.new_protection, pml4, scratch_base)
+        vm_map_private_page(
+            nt_handler,
+            pi,
+            page,
+            plan.new_protection,
+            pml4,
+            scratch_base,
+        )
     };
     map_result?;
     *vm_map = *after;
@@ -3609,12 +3620,13 @@ unsafe fn spawn_requested_hosted_exe(
 /// win32k dispatch thread. `Win32ThreadInfo` is an opaque server THREADINFO identity; the inline
 /// CLIENTINFO stores the client mapping of DESKTOPINFO and the USER-heap pointer delta.
 unsafe fn seed_gui_thread_client_info(
+    nt_handler: &mut ExecNtHandler,
     pi: usize,
     teb_alias: u64,
     pml4: u64,
     pti: u64,
 ) -> Option<(u64, u64, u64, u64, u64)> {
-    let mapped_delta = win32k_glue::map_win32k_user_heap_into_client(pml4, pi)?;
+    let mapped_delta = win32k_glue::map_win32k_user_heap_into_client(nt_handler, pml4, pi)?;
     let (client_deskinfo, pti, desktop_delta, client_pcti) =
         win32k_subsystem::desktop_client_info_for_w32thread(pti)?;
     if desktop_delta != mapped_delta {
@@ -3699,7 +3711,7 @@ unsafe fn hosted_gui_thread_w32thread(nt_handler: &ExecNtHandler, current_tid: u
 }
 
 unsafe fn refresh_hosted_gui_thread_client_info(
-    nt_handler: &ExecNtHandler,
+    nt_handler: &mut ExecNtHandler,
     pi: usize,
     badge: u64,
     current_tid: u64,
@@ -3717,7 +3729,7 @@ unsafe fn refresh_hosted_gui_thread_client_info(
     )?;
     let pti = hosted_gui_thread_w32thread(nt_handler, current_tid)?;
     let (client_deskinfo, pti, delta, client_pcti, old_pti) =
-        seed_gui_thread_client_info(pi, teb_alias, pml4, pti)?;
+        seed_gui_thread_client_info(nt_handler, pi, teb_alias, pml4, pti)?;
     Some((teb_alias, client_deskinfo, pti, delta, client_pcti, old_pti))
 }
 
@@ -3786,6 +3798,7 @@ fn log_refreshed_gui_thread_client_info(
 }
 
 unsafe fn complete_ntuser_process_connect_copyout(
+    nt_handler: &mut ExecNtHandler,
     pi: usize,
     pml4: u64,
     client_buffer: u64,
@@ -3814,7 +3827,7 @@ unsafe fn complete_ntuser_process_connect_copyout(
     // siClient with pointers into its OWN session-space USER heap (gpsi / gHandleTable / the
     // handle-entry array). Map that USER heap into the GUI client and rewrite siClient to the
     // client-relative view before user32 resumes.
-    let Some(delta) = win32k_glue::map_win32k_user_heap_into_client(pml4, pi) else {
+    let Some(delta) = win32k_glue::map_win32k_user_heap_into_client(nt_handler, pml4, pi) else {
         let failures = USERCONNECT_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
         if failures < 8 {
             print_str(b"[win32k-svc] NtUserProcessConnect USER heap map failed pi=");
@@ -7438,7 +7451,7 @@ pub(crate) unsafe fn service_sec_image(
                     let repair_tid = nt_handler.hosted_thread_tid_for_badge(badge).unwrap_or(0);
                     if let Some((_teb_alias, client_deskinfo, pti, _, _, _old_pti)) =
                         refresh_hosted_gui_thread_client_info(
-                            &nt_handler,
+                            &mut nt_handler,
                             pi,
                             badge,
                             repair_tid,
@@ -7856,7 +7869,7 @@ pub(crate) unsafe fn service_sec_image(
                 }
             }
             match service_private_guard_page_fault(
-                &nt_handler,
+                &mut nt_handler,
                 pi,
                 badge,
                 page,
@@ -7898,6 +7911,7 @@ pub(crate) unsafe fn service_sec_image(
                 }
             }
             match service_generic_section_fault(
+                &mut nt_handler,
                 generic_sections,
                 pi,
                 page,
@@ -9119,7 +9133,7 @@ pub(crate) unsafe fn service_sec_image(
                             );
                             if let Some(dispatch) = completion.outer_dispatch {
                                 if !process_completed_user_callback_outer_dispatch(
-                                    &nt_handler,
+                                    nt_handler,
                                     pi,
                                     pml4,
                                     badge,
@@ -14714,6 +14728,7 @@ pub(crate) unsafe fn service_sec_image(
                         blen as usize,
                     );
                     if complete_ntuser_process_connect_copyout(
+                        &mut nt_handler,
                         pi,
                         pml4,
                         a1,
@@ -14785,7 +14800,7 @@ pub(crate) unsafe fn service_sec_image(
                 // GUI main thread must be restated after win32k can clear the fields.
                 if let Some((teb_alias, client_deskinfo, pti, delta, client_pcti, old_pti)) =
                     refresh_hosted_gui_thread_client_info(
-                        &nt_handler,
+                        &mut nt_handler,
                         pi,
                         badge,
                         current_tid,
@@ -14812,8 +14827,13 @@ pub(crate) unsafe fn service_sec_image(
                 // msgina dialog DC/font setup; later interactive shell clients use the same cataloged
                 // role path instead of fixed pi checks.
                 if uses_client_gdi {
-                    let gdi_va = win32k_glue::map_gdi_shared_handle_table_into_client(pml4, pi);
-                    let gdi_attributes = win32k_glue::map_gdi_user_attributes_into_client(pml4, pi);
+                    let gdi_va = win32k_glue::map_gdi_shared_handle_table_into_client(
+                        &mut nt_handler,
+                        pml4,
+                        pi,
+                    );
+                    let gdi_attributes =
+                        win32k_glue::map_gdi_user_attributes_into_client(&mut nt_handler, pml4, pi);
                     if gdi_va != 0 && gdi_attributes {
                         record_hosted_client_gdi_mapping(&nt_handler, pi, gdi_va);
                     }
@@ -15945,17 +15965,20 @@ pub(crate) unsafe fn service_sec_image(
         nt_exe_image::HostedProcessRole::InteractiveLogon,
     ) {
         crate::private_vm_unmap_selftest(
+            &mut nt_handler,
             logon_pi,
             procs[logon_pi].pml4,
             procs[logon_pi].scratch_base,
         );
         crate::mapped_section_writeback_selftest(procs[logon_pi].scratch_base);
         crate::mapped_section_writecopy_cow_selftest(
+            &mut nt_handler,
             logon_pi,
             procs[logon_pi].pml4,
             procs[logon_pi].scratch_base,
         );
         crate::image_writecopy_cow_selftest(
+            &mut nt_handler,
             logon_pi,
             procs[logon_pi].pml4,
             procs[logon_pi].scratch_base,

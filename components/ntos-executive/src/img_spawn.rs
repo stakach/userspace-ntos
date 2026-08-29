@@ -734,16 +734,14 @@ pub(crate) unsafe fn fill_image_page(pe: &nt_pe_loader::PeFile, rva: u32, dst: u
 /// image pages ABSENT), map a stack + IPC buffer, and prepare the entry point. The caller decides
 /// whether the initial TCB starts immediately; child processes normally remain suspended until their
 /// creator resumes the typed initial-thread handle returned by `NtResumeThread`.
-unsafe fn reserve_sec_image_page_tables(pml4: u64, image_va: u64, extent: u64) -> u64 {
+unsafe fn reserve_sec_image_page_tables(pi: u64, pml4: u64, image_va: u64, extent: u64) -> u64 {
     let span = extent.max(0x1000);
     let start = image_va & !0x1f_ffff;
     let end = image_va.saturating_add(span - 1) & !0x1f_ffff;
     let mut mapped = 0u64;
     let mut va = start;
     loop {
-        let pt = alloc_slot();
-        spawn_paging_retype(pt, OBJ_X86_PAGE_TABLE, b"image-pt");
-        checked_spawn_paging_map(pt, LBL_X86_PAGE_TABLE_MAP, va, pml4, b"pt");
+        map_initial_process_page_table(pi, pml4, va, b"image-pt");
         mapped += 1;
         if va == end {
             break;
@@ -777,6 +775,18 @@ pub(crate) unsafe fn spawn_sec_image(
     ldrpinit_rva: u64,
 ) -> SecImageSpawn {
     trace_spawn_phase(pi, b"begin");
+    // A hosted slot can first carry an unpublished diagnostic image and later a real process. End
+    // that old address-space lifetime before any new paging structure is installed; published
+    // process teardown uses the commitment-aware reclaim path instead.
+    let stale_page_tables = reclaim_unpublished_process_page_tables(pi as usize);
+    process_committed_mapping_reset(pi as usize);
+    if stale_page_tables != 0 {
+        print_str(b"[spawn-vspace] reclaimed unpublished page tables pi=");
+        print_u64(pi);
+        print_str(b" count=");
+        print_u64(stale_page_tables);
+        print_str(b"\n");
+    }
     let pml4 = alloc_slot();
     spawn_paging_retype(pml4, OBJ_X86_PML4, b"secimage-pml4");
     // ★ Give the VSpace a real ASID BEFORE anything is mapped into it. Without one, seL4's
@@ -784,10 +794,6 @@ pub(crate) unsafe fn spawn_sec_image(
     // this process's pages silently leaves the leaf PTE live — which surfaces much later as a
     // `seL4_DeleteFirst` phantom out-of-memory on the next commit at that VA. See `vspace_assign_asid`.
     checked_spawn_asid(pml4);
-    // A newly allocated hosted VSpace owns a fresh NT committed-view table. Hosted slots are reused by
-    // early diagnostics and later live processes, so stale ranges must be cleared at the address-space
-    // creation boundary before spawn registers image and environment views.
-    process_committed_mapping_reset(pi as usize);
     trace_spawn_phase(pi, b"vspace");
     let main_image_size = image_extent(pe);
     let mut dropped_image_frames =
@@ -813,7 +819,7 @@ pub(crate) unsafe fn spawn_sec_image(
     // The image VA's page tables — but NOT the image pages. Touching the image faults in.
     checked_spawn_paging_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4, b"pdpt");
     checked_spawn_paging_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4, b"pd");
-    let image_pts = reserve_sec_image_page_tables(pml4, PE_LOAD_BASE, main_image_size);
+    let image_pts = reserve_sec_image_page_tables(pi, pml4, PE_LOAD_BASE, main_image_size);
     if pi == 6 {
         EXPLORER_IMAGE_PAGE_TABLES.store(image_pts, Ordering::Relaxed);
     }
@@ -831,17 +837,15 @@ pub(crate) unsafe fn spawn_sec_image(
     }
     trace_spawn_phase(pi, b"image-vad");
     // The stack + IPC buffer live in the relocated cluster region (out of the ELF reserve).
-    map_cluster_pt(pml4);
-    map_tp_worker_target_lane_pts(pml4);
+    map_initial_process_cluster_pt(pi, pml4);
+    map_initial_process_tp_worker_target_lane_pts(pi, pml4);
     if setup_env {
-        map_hosted_client_env_pt(pml4);
+        map_initial_process_hosted_client_env_pt(pi, pml4);
     }
     // A second demand-mapped image (ntdll) — reserve its VA's page table too (same pdpt/pd
     // as the image since both are within one 1 GiB / 512 GiB slot; only the PT differs).
     if let Some((ntdll_base, ntdll_pe)) = ntdll {
-        let npt = alloc_slot();
-        spawn_paging_retype(npt, OBJ_X86_PAGE_TABLE, b"ntdll-pt");
-        checked_spawn_paging_map(npt, LBL_X86_PAGE_TABLE_MAP, ntdll_base, pml4, b"ntdll-pt");
+        map_initial_process_page_table(pi, pml4, ntdll_base, b"ntdll-pt");
         if !register_image_committed_mappings(pi, ntdll_pe, ntdll_base) {
             let ntdll_size = image_extent(ntdll_pe);
             print_str(b"[spawn-vad] ntdll committed mapping failed pi=");
@@ -1217,15 +1221,7 @@ pub(crate) unsafe fn spawn_sec_image(
         );
         // Share the NLS tables (read off disk into the shared buffers at storage bring-up) into
         // smss at their own page table (the 0xE0_0000 2 MiB region covers all three).
-        let nls_pt = alloc_slot();
-        spawn_paging_retype(nls_pt, OBJ_X86_PAGE_TABLE, b"nls-pt");
-        checked_spawn_paging_map(
-            nls_pt,
-            LBL_X86_PAGE_TABLE_MAP,
-            NLS_SMSS_ANSI_VA,
-            pml4,
-            b"nls-pt",
-        );
+        map_initial_process_page_table(pi, pml4, NLS_SMSS_ANSI_VA, b"nls-pt");
         for (start, va, frames) in [
             (
                 NLS_ANSI_START.load(Ordering::Relaxed),
@@ -1402,11 +1398,9 @@ pub(crate) unsafe fn spawn_sec_image(
         spawn_paging_retype(kpdpt, OBJ_X86_PDPT, b"kuser-pdpt");
         let kpd = alloc_slot();
         spawn_paging_retype(kpd, OBJ_X86_PAGE_DIRECTORY, b"kuser-pd");
-        let kpt = alloc_slot();
-        spawn_paging_retype(kpt, OBJ_X86_PAGE_TABLE, b"kuser-pt");
         checked_spawn_paging_map(kpdpt, LBL_X86_PDPT_MAP, KUSER_VA, pml4, b"kuser-pdpt");
         checked_spawn_paging_map(kpd, LBL_X86_PAGE_DIRECTORY_MAP, KUSER_VA, pml4, b"kuser-pd");
-        checked_spawn_paging_map(kpt, LBL_X86_PAGE_TABLE_MAP, KUSER_VA, pml4, b"kuser-pt");
+        map_initial_process_page_table(pi, pml4, KUSER_VA, b"kuser-pt");
         // Build the KUSER page via a scratch mapping so we can populate the fields the Win32 create
         // path reads. KUSER_SHARED_DATA.ImageNumberLow(@0x260)/ImageNumberHigh(@0x262) bound the
         // machine types kernel32's CreateProcessInternalW allows (proc.c:3474 —

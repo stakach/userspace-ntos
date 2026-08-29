@@ -1580,9 +1580,8 @@ pub(crate) static mut COMMITTED_MAP_BEFORE: nt_address_space::VmCommittedRangeTa
 pub(crate) static mut COMMITTED_MAP_AFTER: nt_address_space::VmCommittedRangeTable<
     PROCESS_COMMITTED_MAPPING_CAPACITY,
 > = nt_address_space::VmCommittedRangeTable::new();
-const PRIVATE_VM_PT_COUNT: usize = ((PRIVATE_VM_LIMIT - SMSS_ALLOC_VA) / 0x20_0000) as usize;
-static PROCESS_VM_PT_CAP_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
-static mut PROCESS_VM_PT_CAPS: alloc::vec::Vec<[u64; PRIVATE_VM_PT_COUNT]> = alloc::vec::Vec::new();
+static mut PROCESS_USER_PAGE_TABLES: nt_address_space::VmPageTableOwnership =
+    nt_address_space::VmPageTableOwnership::new();
 static mut VM_FREE_FRAMES: nt_address_space::RecycledFramePool =
     nt_address_space::RecycledFramePool::new();
 static mut VM_PAGE_LOCKS: nt_address_space::VmPageLockTable =
@@ -1649,42 +1648,44 @@ unsafe fn vm_page_is_resident(pi: usize, page: u64) -> bool {
         || shared_image_mapping_contains(pi as u64, page)
 }
 
-pub(crate) unsafe fn reset_process_private_pt_caps(slots: usize) -> bool {
-    let caps = &mut *core::ptr::addr_of_mut!(PROCESS_VM_PT_CAPS);
-    caps.clear();
-    if caps.try_reserve(slots).is_err() {
-        PROCESS_VM_PT_CAP_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    while caps.len() < slots {
-        caps.push([0; PRIVATE_VM_PT_COUNT]);
-    }
-    true
+fn process_user_page_table_stats() -> nt_address_space::VmPageTableOwnershipStats {
+    unsafe { (&*core::ptr::addr_of!(PROCESS_USER_PAGE_TABLES)).stats() }
 }
 
-unsafe fn process_private_pt_caps_mut(
-    pi: usize,
-) -> Option<&'static mut [u64; PRIVATE_VM_PT_COUNT]> {
-    (&mut *core::ptr::addr_of_mut!(PROCESS_VM_PT_CAPS)).get_mut(pi)
+pub(crate) unsafe fn process_user_page_table_commit_bytes(pi: usize) -> u64 {
+    (&*core::ptr::addr_of!(PROCESS_USER_PAGE_TABLES)).process_commit_bytes(pi as u64)
 }
 
-fn process_private_pt_cap_stats() -> (usize, usize, u64) {
-    unsafe {
-        let caps = &*core::ptr::addr_of!(PROCESS_VM_PT_CAPS);
-        (
-            caps.len(),
-            caps.capacity(),
-            PROCESS_VM_PT_CAP_ALLOCATION_FAILURES.load(Ordering::Relaxed),
-        )
+/// Reclaim leaf page tables left by an address space which never reached process publication.
+///
+/// `spawn_sec_image` uses this at the process-slot reuse boundary, before it constructs a new
+/// VSpace. Published address spaces must instead use `process_user_page_tables_release`, which also
+/// releases their MM/Ps commitment.
+pub(crate) unsafe fn reclaim_unpublished_process_page_tables(pi: usize) -> u64 {
+    let mut reclaimed = 0u64;
+    loop {
+        let Some(record) =
+            (&*core::ptr::addr_of!(PROCESS_USER_PAGE_TABLES)).first_for_process(pi as u64)
+        else {
+            break;
+        };
+        if cnode_delete_recycle_r(record.capability) != 0 {
+            panic!("unpublished process page-table capability could not be reclaimed");
+        }
+        (&mut *core::ptr::addr_of_mut!(PROCESS_USER_PAGE_TABLES))
+            .remove(pi as u64, record.base, record.capability)
+            .expect("the serialized unpublished page-table record remains exact through deletion");
+        reclaimed = reclaimed.saturating_add(1);
     }
+    reclaimed
 }
 
 pub(crate) unsafe fn reset_process_vm_state(slots: usize) -> bool {
     (&mut *core::ptr::addr_of_mut!(VM_PAGE_LOCKS)).reset();
+    (&mut *core::ptr::addr_of_mut!(PROCESS_USER_PAGE_TABLES)).clear();
     VM_LOCK_RECLAIM_REFUSALS.store(0, Ordering::Relaxed);
     reset_process_vm_region_maps(slots)
         && reset_process_committed_mappings(slots)
-        && reset_process_private_pt_caps(slots)
         && reset_kuser_page_aliases(slots)
 }
 
@@ -1778,10 +1779,8 @@ pub const DLL_ARENA_START: u64 = 0x0000_0000_8000_0000;
 pub const DLL_ARENA_END: u64 = 0x0000_0000_9800_0000;
 pub const DLL_ARENA_PT_COUNT: usize =
     ((DLL_ARENA_END - DLL_ARENA_START) / nt_dll_registry::PAGE_TABLE_SPAN) as usize;
-pub const DLL_ARENA_PT_WORDS: usize = (DLL_ARENA_PT_COUNT + 63) / 64;
 const _: () = assert!(DLL_ARENA_END == win32k_subsystem::CSRSS_W32_SHARED_VA);
 const _: () = assert!(DLL_ARENA_PT_COUNT == 192);
-const _: () = assert!(DLL_ARENA_PT_WORDS * 64 >= DLL_ARENA_PT_COUNT);
 const _: () = assert!(DLL_ARENA_START >= 0x8000_0000 && DLL_ARENA_END <= 0xC000_0000);
 const _: () = assert!(
     win32k_subsystem::CSRSS_W32_SHARED_VA + win32k_subsystem::WIN32K_HEAP_FRAMES * 0x1000
@@ -1875,17 +1874,12 @@ impl DllPeStore {
 #[derive(Clone, Copy)]
 struct DllArenaPagingRecord {
     pi: usize,
-    pd_created: bool,
-    pt_bits: [u64; DLL_ARENA_PT_WORDS],
+    pd_cap: u64,
 }
 
 impl DllArenaPagingRecord {
     const fn new(pi: usize) -> Self {
-        Self {
-            pi,
-            pd_created: false,
-            pt_bits: [0; DLL_ARENA_PT_WORDS],
-        }
+        Self { pi, pd_cap: 0 }
     }
 }
 
@@ -1934,45 +1928,29 @@ impl DllArenaPagingState {
         self.ensure_index(pi).map(|_| ())
     }
 
-    pub(crate) fn pd_created(&self, pi: usize) -> bool {
+    pub(crate) fn pd_cap(&self, pi: usize) -> u64 {
         self.index_for(pi)
-            .map(|index| self.records[index].pd_created)
-            .unwrap_or(false)
+            .map(|index| self.records[index].pd_cap)
+            .unwrap_or(0)
     }
 
-    pub(crate) fn mark_pd_created(&mut self, pi: usize) -> Result<(), u32> {
+    pub(crate) fn set_pd_cap(&mut self, pi: usize, cap: u64) -> Result<(), u32> {
+        if cap == 0 {
+            return Err(nt_address_space::STATUS_INVALID_PARAMETER);
+        }
         let index = self.ensure_index(pi)?;
-        self.records[index].pd_created = true;
+        if self.records[index].pd_cap != 0 {
+            return Err(nt_address_space::STATUS_CONFLICTING_ADDRESSES);
+        }
+        self.records[index].pd_cap = cap;
         Ok(())
     }
 
-    pub(crate) fn pt_created(&self, pi: usize, pt_index: usize) -> bool {
-        if pt_index >= DLL_ARENA_PT_COUNT {
-            return false;
-        }
-        let Some(index) = self.index_for(pi) else {
-            return false;
-        };
-        let word = pt_index / 64;
-        let bit = 1u64 << (pt_index % 64);
-        self.records[index].pt_bits[word] & bit != 0
-    }
-
-    pub(crate) fn mark_pt_created(&mut self, pi: usize, pt_index: usize) -> Result<(), u32> {
-        if pt_index >= DLL_ARENA_PT_COUNT {
-            return Err(nt_address_space::STATUS_INVALID_PARAMETER_3);
-        }
-        let index = self.ensure_index(pi)?;
-        let word = pt_index / 64;
-        let bit = 1u64 << (pt_index % 64);
-        self.records[index].pt_bits[word] |= bit;
-        Ok(())
-    }
-
-    pub(crate) fn clear_process(&mut self, pi: usize) {
+    pub(crate) fn clear_process(&mut self, pi: usize) -> u64 {
         if let Some(index) = self.index_for(pi) {
-            self.records.swap_remove(index);
+            return self.records.swap_remove(index).pd_cap;
         }
+        0
     }
 
     pub(crate) fn stats(&self) -> DllArenaPagingStats {
@@ -10235,7 +10213,7 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(tp_trace_misses);
     let (vm_region_len, vm_region_cap, vm_region_fails) = process_vm_region_map_stats();
     let (vm_commit_len, vm_commit_cap, vm_commit_fails) = process_committed_mapping_stats();
-    let (vm_pt_len, vm_pt_cap, vm_pt_fails) = process_private_pt_cap_stats();
+    let vm_pts = process_user_page_table_stats();
     print_str(b" process-vm=");
     print_u64(vm_region_len as u64);
     print_str(b"/");
@@ -10249,11 +10227,11 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_str(b"/");
     print_u64(vm_commit_fails);
     print_str(b":");
-    print_u64(vm_pt_len as u64);
+    print_u64(vm_pts.records as u64);
     print_str(b"/");
-    print_u64(vm_pt_cap as u64);
+    print_u64(vm_pts.capacity as u64);
     print_str(b"/");
-    print_u64(vm_pt_fails);
+    print_u64(vm_pts.allocation_failures);
     let vm_locks = vm_page_lock_stats();
     print_str(b" vm-locks=");
     print_u64(vm_locks.pages as u64);
@@ -11791,13 +11769,19 @@ fn vm_cross_authority_placement_retry_selftest() -> (u64, u64, u64) {
 /// (the very top of the private window — placements run upward from `SMSS_ALLOC_VA` and the boot's
 /// highest measured selection is `…305b0000`). This is the direct, bypass-sensitive proof that an
 /// unmap really clears the leaf PTE.
-pub(crate) unsafe fn private_vm_unmap_selftest(pi: usize, pml4: u64, scratch_base: u64) {
+pub(crate) unsafe fn private_vm_unmap_selftest(
+    handler: &mut ExecNtHandler,
+    pi: usize,
+    pml4: u64,
+    scratch_base: u64,
+) {
     if pml4 == 0 || scratch_base == 0 {
         return;
     }
     let page = PRIVATE_VM_LIMIT - 0x1000;
     let mut proof = 0u64;
     if vm_map_private_page(
+        handler,
         pi,
         page,
         nt_address_space::PAGE_READWRITE,
@@ -11817,6 +11801,7 @@ pub(crate) unsafe fn private_vm_unmap_selftest(pi: usize, pml4: u64, scratch_bas
         proof |= VM_UNMAP_SELFTEST_RELEASED;
     }
     if vm_map_private_page(
+        handler,
         pi,
         page,
         nt_address_space::PAGE_READWRITE,
@@ -12067,6 +12052,7 @@ unsafe fn finish_mapped_section_writecopy_cow_selftest(
 }
 
 pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
+    handler: &mut ExecNtHandler,
     pi: usize,
     pml4: u64,
     scratch_base: u64,
@@ -12163,7 +12149,7 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
         );
         return;
     }
-    if let Err(status) = vm_ensure_private_pt(pi, page, pml4) {
+    if let Err(status) = vm_ensure_private_pt(handler, pi, page, pml4) {
         finish_mapped_section_writecopy_cow_selftest(
             pi,
             page,
@@ -12227,6 +12213,7 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
     proof |= MAPPED_SECTION_WRITECOPY_COW_REGISTERED;
 
     if let Err(status) = vm_promote_mapped_cow_page(
+        handler,
         pi,
         page,
         0,
@@ -12466,7 +12453,12 @@ unsafe fn finish_image_writecopy_cow_selftest(
     print_str(b"\n");
 }
 
-pub(crate) unsafe fn image_writecopy_cow_selftest(pi: usize, pml4: u64, scratch_base: u64) {
+pub(crate) unsafe fn image_writecopy_cow_selftest(
+    handler: &mut ExecNtHandler,
+    pi: usize,
+    pml4: u64,
+    scratch_base: u64,
+) {
     const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
     if pml4 == 0
         || scratch_base == 0
@@ -12550,7 +12542,7 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(pi: usize, pml4: u64, scratch_
         );
         return;
     }
-    if let Err(status) = vm_ensure_private_pt(pi, page, pml4) {
+    if let Err(status) = vm_ensure_private_pt(handler, pi, page, pml4) {
         finish_image_writecopy_cow_selftest(pi, page, source_frame, loose_map_cap, proof, status);
         return;
     }
@@ -12769,27 +12761,27 @@ unsafe fn vm_frame_release(frame: u64, alias_cap: u64) {
     vm_frame_return_to_free_list(frame);
 }
 
-unsafe fn process_private_pt_caps_release(pi: usize) -> (u64, u64) {
-    let Some(slots) = process_private_pt_caps_mut(pi) else {
-        return (0, 0);
-    };
-    let slots = slots.as_mut_ptr();
+unsafe fn process_user_page_tables_release(pi: usize, handler: &mut ExecNtHandler) -> (u64, u64) {
     let mut released = 0u64;
     let mut failed = 0u64;
-    for index in 0..PRIVATE_VM_PT_COUNT {
-        let slot = slots.add(index);
-        let cap = core::ptr::read(slot);
-        if cap == 0 {
-            continue;
-        }
-        let status = cnode_delete_recycle_r(cap);
+    loop {
+        let Some(record) =
+            (&*core::ptr::addr_of!(PROCESS_USER_PAGE_TABLES)).first_for_process(pi as u64)
+        else {
+            break;
+        };
+        let status = cnode_delete_recycle_r(record.capability);
         if status == 0 {
-            core::ptr::write(slot, 0);
+            (&mut *core::ptr::addr_of_mut!(PROCESS_USER_PAGE_TABLES))
+                .remove(pi as u64, record.base, record.capability)
+                .expect("the serialized page-table capability remains owned through deletion");
             released = released.saturating_add(1);
         } else {
             failed = failed.saturating_add(1);
+            break;
         }
     }
+    handler.release_process_page_table_commitment(pi, released);
     (released, failed)
 }
 
@@ -12819,18 +12811,42 @@ fn vm_page_rights(protection: u32) -> u64 {
     }) | if executable { 0 } else { PAGE_EXECUTE_NEVER }
 }
 
-unsafe fn vm_ensure_private_pt(pi: usize, page: u64, pml4: u64) -> Result<(), u32> {
-    let offset = page
-        .checked_sub(SMSS_ALLOC_VA)
+unsafe fn vm_ensure_private_pt(
+    handler: &mut ExecNtHandler,
+    pi: usize,
+    page: u64,
+    pml4: u64,
+) -> Result<(), u32> {
+    page.checked_sub(SMSS_ALLOC_VA)
         .filter(|offset| *offset < PRIVATE_VM_LIMIT - SMSS_ALLOC_VA)
         .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?;
-    let index = (offset / 0x20_0000) as usize;
-    let caps =
-        process_private_pt_caps_mut(pi).ok_or(nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
-    let slot = caps.as_mut_ptr().add(index);
-    if core::ptr::read(slot) != 0 {
-        return Ok(());
+    ensure_process_user_page_table(handler, pi, page, pml4).map(|_| ())
+}
+
+pub(crate) unsafe fn ensure_process_user_page_table(
+    handler: &mut ExecNtHandler,
+    pi: usize,
+    page: u64,
+    pml4: u64,
+) -> Result<u64, u32> {
+    if pi >= MAX_PI || pml4 == 0 {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
     }
+    let base = page & !(nt_address_space::PAGE_TABLE_SPAN - 1);
+    let insert = {
+        let page_tables = &mut *core::ptr::addr_of_mut!(PROCESS_USER_PAGE_TABLES);
+        page_tables.prepare_insert(pi as u64, base)?
+    };
+    let Some(insert) = insert else {
+        return (&*core::ptr::addr_of!(PROCESS_USER_PAGE_TABLES))
+            .record(pi as u64, base)
+            .map(|record| record.capability)
+            .ok_or(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    };
+    let pid = handler
+        .pm_pid_for_pi(pi)
+        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let prepared = handler.prepare_process_commit_charge(pid, pi, nt_address_space::PAGE_SIZE)?;
     let pt = alloc_slot();
     if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt) != 0 {
         let _ = cnode_delete_recycle_r(pt);
@@ -12842,18 +12858,27 @@ unsafe fn vm_ensure_private_pt(pi: usize, page: u64, pml4: u64) -> Result<(), u3
         VM_FAIL_PT.fetch_add(1, Ordering::Relaxed);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
-    core::ptr::write(slot, pt);
-    Ok(())
+    if (&mut *core::ptr::addr_of_mut!(PROCESS_USER_PAGE_TABLES))
+        .commit_insert(insert, pt)
+        .is_err()
+    {
+        let _ = cnode_delete_recycle_r(pt);
+        VM_FAIL_PT.fetch_add(1, Ordering::Relaxed);
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    handler.commit_process_commit_charge(prepared);
+    Ok(pt)
 }
 
 unsafe fn vm_map_private_page(
+    handler: &mut ExecNtHandler,
     pi: usize,
     page: u64,
     protection: u32,
     pml4: u64,
     scratch_base: u64,
 ) -> Result<(), u32> {
-    vm_ensure_private_pt(pi, page, pml4)?;
+    vm_ensure_private_pt(handler, pi, page, pml4)?;
     let frame = match vm_frame_acquire(scratch_base) {
         Ok(frame) => frame,
         Err(status) => {
@@ -13303,6 +13328,7 @@ pub(crate) unsafe fn vm_promote_image_cow_for_kernel_write(
 }
 
 unsafe fn vm_promote_mapped_cow_page(
+    handler: &mut ExecNtHandler,
     pi: usize,
     page: u64,
     source_frame: u64,
@@ -13378,7 +13404,7 @@ unsafe fn vm_promote_mapped_cow_page(
         None
     };
 
-    if let Err(status) = vm_ensure_private_pt(pi, page, pml4) {
+    if let Err(status) = vm_ensure_private_pt(handler, pi, page, pml4) {
         restore_old_mapped_mapping(pi, page, old_mapping, retained_alias, old_protection, pml4);
         vm_frame_release(new_frame, 0);
         return Err(status);
@@ -14784,6 +14810,32 @@ unsafe fn map_required_page_table(pml4: u64, base: u64, stage: &[u8]) -> u64 {
     pt
 }
 
+/// Map and retain one leaf page table owned by a hosted process while its VSpace is still private
+/// to the spawn transaction. The MM/Ps commitment owner seeds from this exact table before the
+/// process becomes externally mutable.
+pub(crate) unsafe fn map_initial_process_page_table(
+    pi: u64,
+    pml4: u64,
+    base: u64,
+    stage: &[u8],
+) -> u64 {
+    let base = base & !(nt_address_space::PAGE_TABLE_SPAN - 1);
+    let insert = (&mut *core::ptr::addr_of_mut!(PROCESS_USER_PAGE_TABLES))
+        .prepare_insert(pi, base)
+        .unwrap_or_else(|_| panic!("process page-table ownership reservation failed"));
+    let Some(insert) = insert else {
+        return (&*core::ptr::addr_of!(PROCESS_USER_PAGE_TABLES))
+            .record(pi, base)
+            .expect("an existing process page-table identity owns a capability")
+            .capability;
+    };
+    let pt = map_required_page_table(pml4, base, stage);
+    (&mut *core::ptr::addr_of_mut!(PROCESS_USER_PAGE_TABLES))
+        .commit_insert(insert, pt)
+        .expect("reserved process page-table ownership remains current during spawn");
+    pt
+}
+
 unsafe fn map_required_paging_struct(
     pml4: u64,
     object_type: u64,
@@ -14834,6 +14886,10 @@ pub(crate) unsafe fn map_cluster_pt(pml4: u64) {
     map_required_page_table(pml4, WORK_CLUSTER_BASE, b"cluster-pt");
 }
 
+pub(crate) unsafe fn map_initial_process_cluster_pt(pi: u64, pml4: u64) {
+    map_initial_process_page_table(pi, pml4, WORK_CLUSTER_BASE, b"cluster-pt");
+}
+
 pub(crate) unsafe fn map_tp_worker_target_lane_pts(pml4: u64) {
     let mut base = TP_WORKER_SLOT0_REGION_BASE & !0x1f_ffff;
     let end =
@@ -14841,6 +14897,17 @@ pub(crate) unsafe fn map_tp_worker_target_lane_pts(pml4: u64) {
             & !0x1f_ffff;
     while base < end {
         map_required_page_table(pml4, base, b"tp-worker-lane-pt");
+        base += 0x20_0000;
+    }
+}
+
+pub(crate) unsafe fn map_initial_process_tp_worker_target_lane_pts(pi: u64, pml4: u64) {
+    let mut base = TP_WORKER_SLOT0_REGION_BASE & !0x1f_ffff;
+    let end =
+        (tp_worker_high_region_base(TP_WORKER_SLOT_COUNT - 1) + TP_WORKER_EXEC_STRIDE + 0x1f_ffff)
+            & !0x1f_ffff;
+    while base < end {
+        map_initial_process_page_table(pi, pml4, base, b"tp-worker-lane-pt");
         base += 0x20_0000;
     }
 }
@@ -14861,6 +14928,10 @@ unsafe fn map_heap_pts(pml4: u64, frames: u64) {
 
 pub(crate) unsafe fn map_hosted_client_env_pt(pml4: u64) {
     map_required_page_table(pml4, HOSTED_CLIENT_ENV_BASE, b"hosted-client-env-pt");
+}
+
+pub(crate) unsafe fn map_initial_process_hosted_client_env_pt(pi: u64, pml4: u64) {
+    map_initial_process_page_table(pi, pml4, HOSTED_CLIENT_ENV_BASE, b"hosted-client-env-pt");
 }
 
 unsafe fn map_user_alloc_pt(pml4: u64) {
@@ -17859,7 +17930,10 @@ unsafe fn reclaim_final_process_vm(
         stats.dll_views = (&mut *ctx.reg).clear_mapped_for_pi(pi) as u64;
         {
             let dll_arena_paging = &mut *ctx.dll_arena_paging;
-            dll_arena_paging.clear_process(pi);
+            let pd = dll_arena_paging.clear_process(pi);
+            if pd != 0 && cnode_delete_recycle_r(pd) != 0 {
+                stats.private_pt_failures = stats.private_pt_failures.saturating_add(1);
+            }
         }
         if pi < MAX_PI {
             let procs = &mut *ctx.procs;
@@ -17875,7 +17949,7 @@ unsafe fn reclaim_final_process_vm(
     stats.registered_frames = csrss_frame_drop_process_all(pi as u64);
     process_committed_mapping_reset(pi);
     process_vm_region_map_reset(pi);
-    let (private_pts, private_pt_failures) = process_private_pt_caps_release(pi);
+    let (private_pts, private_pt_failures) = process_user_page_tables_release(pi, handler);
     stats.private_pts = private_pts;
     stats.private_pt_failures = private_pt_failures;
     kuser_page_alias_clear(pi);

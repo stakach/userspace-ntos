@@ -7863,9 +7863,13 @@ impl ExecNtHandler {
         pi: usize,
         pml4: u64,
     ) -> Result<(), u32> {
-        if pi >= MAX_PI || pml4 == 0 || self.pm_pid_for_pi(pi).is_none() {
+        let Some(pid) = (pi < MAX_PI && pml4 != 0)
+            .then(|| self.pm_pid_for_pi(pi))
+            .flatten()
+        else {
             return Err(nt_process::STATUS_INVALID_PARAMETER);
-        }
+        };
+        unsafe { self.ensure_process_commit_owner(pid, pi)? };
         self.process_vspaces[pi] = pml4;
         if pi < 64 {
             PM_VSPACE_PUBLISHED_OK.fetch_or(1u64 << pi, Ordering::Relaxed);
@@ -15433,8 +15437,10 @@ impl ExecNtHandler {
             .private_committed_bytes();
         let fixed_mapping_bytes = process_committed_mapping_commit_bytes(pi as u64)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let page_table_bytes = process_user_page_table_commit_bytes(pi);
         let initial_bytes = private_vad_bytes
             .checked_add(fixed_mapping_bytes)
+            .and_then(|bytes| bytes.checked_add(page_table_bytes))
             .ok_or(nt_memory_manager::STATUS_COMMITMENT_LIMIT)?;
         self.process_commit.register(pid, initial_bytes)?;
         if let Some(job) = self.pm.process_job(pid) {
@@ -15551,6 +15557,16 @@ impl ExecNtHandler {
         self.pm
             .release_job_memory(pid, bytes)
             .expect("Ps job commit release matches the published address-space delta");
+    }
+
+    pub(crate) fn release_process_page_table_commitment(&mut self, pi: usize, tables: u64) {
+        if tables == 0 {
+            return;
+        }
+        let Some(pid) = self.pm_pid_for_pi(pi) else {
+            return;
+        };
+        self.release_process_commit(pid, tables.saturating_mul(nt_address_space::PAGE_SIZE));
     }
 
     pub(crate) unsafe fn prepare_hosted_thread_commitment(
@@ -16588,6 +16604,56 @@ impl ExecNtHandler {
         let commit_delta = after
             .private_committed_bytes()
             .saturating_sub(before.private_committed_bytes());
+
+        // Leaf page tables are independently committed MM resources. Materialise every table
+        // needed by the new committed extents before preparing the VAD charge, otherwise the first
+        // table charge would correctly stale the outer MM plan. If the later VAD admission fails,
+        // these tables remain owned and charged because the process genuinely retains them.
+        let region_end = plan.base + plan.size;
+        let mut page = plan.base;
+        while page < region_end {
+            let old = before.extent_at(page);
+            let new = after.extent_at(page);
+            let mut run_end = region_end;
+            match new {
+                Some(extent) => run_end = run_end.min(extent.end()),
+                None => {
+                    if let Some(next) = after.next_extent_base_after(page) {
+                        run_end = run_end.min(next);
+                    }
+                }
+            }
+            match old {
+                Some(extent) => run_end = run_end.min(extent.end()),
+                None => {
+                    if let Some(next) = before.next_extent_base_after(page) {
+                        run_end = run_end.min(next);
+                    }
+                }
+            }
+            let run_end = run_end
+                .max(page + nt_address_space::PAGE_SIZE)
+                .min(region_end);
+            if new.is_some_and(|extent| extent.state == nt_address_space::VmExtentState::Committed)
+                && old
+                    .is_none_or(|extent| extent.state != nt_address_space::VmExtentState::Committed)
+            {
+                let mut table_base = page & !(nt_address_space::PAGE_TABLE_SPAN - 1);
+                let final_table = (run_end - 1) & !(nt_address_space::PAGE_TABLE_SPAN - 1);
+                loop {
+                    if let Err(status) =
+                        ensure_process_user_page_table(self, target_pi, table_base, target.pml4)
+                    {
+                        return status;
+                    }
+                    if table_base == final_table {
+                        break;
+                    }
+                    table_base += nt_address_space::PAGE_TABLE_SPAN;
+                }
+            }
+            page = run_end;
+        }
         let prepared_commit =
             match self.prepare_process_commit_charge(target_pid, target_pi, commit_delta) {
                 Ok(prepared) => prepared,
@@ -16606,7 +16672,6 @@ impl ExecNtHandler {
         // extent boundary on either side. Advance a run at a time and do the per-page work only
         // inside runs that actually became committed (or changed protection). Behaviour per page is
         // identical — only the number of lookups changes.
-        let region_end = plan.base + plan.size;
         let mut page = plan.base;
         let mut changed_end = plan.base;
         let mut map_status = 0u32;
@@ -16640,6 +16705,7 @@ impl ExecNtHandler {
                 {
                     while page < run_end {
                         if let Err(status) = vm_map_private_page(
+                            self,
                             target_pi,
                             page,
                             new.unwrap().protection,
@@ -16997,6 +17063,7 @@ impl ExecNtHandler {
                 }
                 if csrss_frame_get_exact(target_pi as u64, plan.page).0 == 0 {
                     vm_map_private_page(
+                        self,
                         target_pi,
                         plan.page,
                         plan.map_protection,
@@ -17008,6 +17075,7 @@ impl ExecNtHandler {
             }
             nt_address_space::VmResidencySource::Mapped => {
                 match service_generic_section_fault(
+                    self,
                     &mut *ctx.generic_sections,
                     target_pi,
                     plan.page,
@@ -40606,6 +40674,52 @@ impl ExecNtHandler {
                             Some(pid) => pid,
                             None => return nt_process::STATUS_INVALID_HANDLE,
                         };
+                        let dll_arena_paging = &mut *ctx.dll_arena_paging;
+                        if let Err(status) = dll_arena_paging.reserve_process(pi) {
+                            return status;
+                        }
+                        if dll_arena_paging.pd_cap(pi) == 0 {
+                            let pd = alloc_slot();
+                            if untyped_retype_r(
+                                CAP_INIT_UNTYPED,
+                                OBJ_X86_PAGE_DIRECTORY,
+                                PAGING_BITS,
+                                1,
+                                pd,
+                            ) != 0
+                            {
+                                let _ = cnode_delete_recycle_r(pd);
+                                return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
+                            }
+                            if paging_struct_map_r(
+                                pd,
+                                LBL_X86_PAGE_DIRECTORY_MAP,
+                                DLL_ARENA_START,
+                                pml4,
+                            ) != 0
+                            {
+                                let _ = cnode_delete_recycle_r(pd);
+                                return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
+                            }
+                            if let Err(status) = dll_arena_paging.set_pd_cap(pi, pd) {
+                                let _ = cnode_delete_recycle_r(pd);
+                                return status;
+                            }
+                        }
+                        if let Some(pt_range) = reg.page_table_range(i) {
+                            for pt_index in pt_range {
+                                let pt_va = DLL_ARENA_START
+                                    + pt_index as u64 * nt_dll_registry::PAGE_TABLE_SPAN;
+                                if let Err(status) =
+                                    ensure_process_user_page_table(self, pi, pt_va, pml4)
+                                {
+                                    return status;
+                                }
+                            }
+                        }
+                        // Paging structures are separate committed resources and are published
+                        // first. Prepare the image write-copy charge only after their exact MM/Ps
+                        // charges have advanced the process accounting generation.
                         let prepared_commit = match self.prepare_process_commit_charge(
                             target_pid,
                             pi,
@@ -40614,52 +40728,6 @@ impl ExecNtHandler {
                             Ok(prepared) => prepared,
                             Err(status) => return status,
                         };
-                        let dll_arena_paging = &mut *ctx.dll_arena_paging;
-                        if let Err(status) = dll_arena_paging.reserve_process(pi) {
-                            return status;
-                        }
-                        if !dll_arena_paging.pd_created(pi) {
-                            let pd = alloc_slot();
-                            let _ = untyped_retype(
-                                CAP_INIT_UNTYPED,
-                                OBJ_X86_PAGE_DIRECTORY,
-                                PAGING_BITS,
-                                1,
-                                pd,
-                            );
-                            let _ = paging_struct_map(
-                                pd,
-                                LBL_X86_PAGE_DIRECTORY_MAP,
-                                DLL_ARENA_START,
-                                pml4,
-                            );
-                            if let Err(status) = dll_arena_paging.mark_pd_created(pi) {
-                                return status;
-                            }
-                        }
-                        if let Some(pt_range) = reg.page_table_range(i) {
-                            for pt_index in pt_range {
-                                if !dll_arena_paging.pt_created(pi, pt_index) {
-                                    let pt = alloc_slot();
-                                    let _ = untyped_retype(
-                                        CAP_INIT_UNTYPED,
-                                        OBJ_X86_PAGE_TABLE,
-                                        PAGING_BITS,
-                                        1,
-                                        pt,
-                                    );
-                                    let pt_va = DLL_ARENA_START
-                                        + pt_index as u64 * nt_dll_registry::PAGE_TABLE_SPAN;
-                                    let _ =
-                                        paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, pt_va, pml4);
-                                    if let Err(status) =
-                                        dll_arena_paging.mark_pt_created(pi, pt_index)
-                                    {
-                                        return status;
-                                    }
-                                }
-                            }
-                        }
                         let ext = image_extent(cpe);
                         reg.set_mapped(self.pi, i);
                         if !img_spawn::register_image_committed_mappings(self.pi as u64, cpe, dbase)
@@ -40751,12 +40819,13 @@ impl ExecNtHandler {
                         core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x74) as *const u32)
                             as u64;
                     let npages = (nls_size + 0xFFF) / 0x1000;
-                    // Reserve one PT (the DLL PD already covers this 1 GiB PDPT slot).
-                    let pt = alloc_slot();
-                    let _ =
-                        untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-                    let _ =
-                        paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, NLS_SECTION_CSRSS_VA, pml4);
+                    // The DLL arena PD covers this 1 GiB PDPT slot. The leaf table remains a
+                    // process-owned MM resource and must be charged before it becomes visible.
+                    if let Err(status) =
+                        ensure_process_user_page_table(self, self.pi, NLS_SECTION_CSRSS_VA, pml4)
+                    {
+                        return status;
+                    }
                     for i in 0..npages {
                         let _ = page_map(
                             copy_cap(nls_start + i),

@@ -24,6 +24,174 @@ use nt_cache_manager::{CachedStreamBacking, SharedCacheMap};
 
 pub const PAGE_SIZE: u64 = 4096;
 pub const ALLOCATION_GRANULARITY: u64 = 64 * 1024;
+pub const PAGE_TABLE_SPAN: u64 = 2 * 1024 * 1024;
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct VmPageTableOwnershipStats {
+    pub records: usize,
+    pub capacity: usize,
+    pub high_water: usize,
+    pub allocation_failures: u64,
+}
+
+/// One process-owned leaf page table and the capability which keeps it alive.
+///
+/// The Memory Manager owns the `(process, virtual window)` identity. The executive supplies the
+/// opaque capability value only after the paging object has been mapped successfully.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VmPageTableOwnershipRecord {
+    pub process: u64,
+    pub base: u64,
+    pub capability: u64,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VmPageTableInsertPlan {
+    process: u64,
+    base: u64,
+    generation: u64,
+}
+
+/// Dynamic authority for process-owned leaf page tables.
+///
+/// Insertion is a two-phase operation so the caller can reserve record storage before allocating
+/// and mapping a paging capability. A committed record is the authoritative commitment source and
+/// remains present until the capability owner confirms that teardown succeeded.
+pub struct VmPageTableOwnership {
+    records: Vec<VmPageTableOwnershipRecord>,
+    generation: u64,
+    high_water: usize,
+    allocation_failures: u64,
+}
+
+impl Default for VmPageTableOwnership {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VmPageTableOwnership {
+    pub const fn new() -> Self {
+        Self {
+            records: Vec::new(),
+            generation: 0,
+            high_water: 0,
+            allocation_failures: 0,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.records.clear();
+        self.generation = self.generation.wrapping_add(1);
+        self.high_water = 0;
+        self.allocation_failures = 0;
+    }
+
+    pub fn contains(&self, process: u64, address: u64) -> bool {
+        let base = address & !(PAGE_TABLE_SPAN - 1);
+        self.records
+            .iter()
+            .any(|record| record.process == process && record.base == base)
+    }
+
+    pub fn record(&self, process: u64, address: u64) -> Option<VmPageTableOwnershipRecord> {
+        let base = address & !(PAGE_TABLE_SPAN - 1);
+        self.records
+            .iter()
+            .copied()
+            .find(|record| record.process == process && record.base == base)
+    }
+
+    pub fn prepare_insert(
+        &mut self,
+        process: u64,
+        base: u64,
+    ) -> Result<Option<VmPageTableInsertPlan>, u32> {
+        if base & (PAGE_TABLE_SPAN - 1) != 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if self.contains(process, base) {
+            return Ok(None);
+        }
+        if self.records.try_reserve(1).is_err() {
+            self.allocation_failures = self.allocation_failures.saturating_add(1);
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        Ok(Some(VmPageTableInsertPlan {
+            process,
+            base,
+            generation: self.generation,
+        }))
+    }
+
+    pub fn commit_insert(
+        &mut self,
+        plan: VmPageTableInsertPlan,
+        capability: u64,
+    ) -> Result<VmPageTableOwnershipRecord, u32> {
+        if capability == 0
+            || plan.generation != self.generation
+            || self.contains(plan.process, plan.base)
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let record = VmPageTableOwnershipRecord {
+            process: plan.process,
+            base: plan.base,
+            capability,
+        };
+        self.records.push(record);
+        self.generation = self.generation.wrapping_add(1);
+        self.high_water = self.high_water.max(self.records.len());
+        Ok(record)
+    }
+
+    pub fn remove(
+        &mut self,
+        process: u64,
+        base: u64,
+        capability: u64,
+    ) -> Result<VmPageTableOwnershipRecord, u32> {
+        if base & (PAGE_TABLE_SPAN - 1) != 0 || capability == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let Some(index) = self.records.iter().position(|record| {
+            record.process == process && record.base == base && record.capability == capability
+        }) else {
+            return Err(STATUS_MEMORY_NOT_ALLOCATED);
+        };
+        let record = self.records.swap_remove(index);
+        self.generation = self.generation.wrapping_add(1);
+        Ok(record)
+    }
+
+    pub fn first_for_process(&self, process: u64) -> Option<VmPageTableOwnershipRecord> {
+        self.records
+            .iter()
+            .copied()
+            .find(|record| record.process == process)
+    }
+
+    pub fn process_count(&self, process: u64) -> usize {
+        self.records
+            .iter()
+            .filter(|record| record.process == process)
+            .count()
+    }
+
+    pub fn process_commit_bytes(&self, process: u64) -> u64 {
+        (self.process_count(process) as u64).saturating_mul(PAGE_SIZE)
+    }
+
+    pub fn stats(&self) -> VmPageTableOwnershipStats {
+        VmPageTableOwnershipStats {
+            records: self.records.len(),
+            capacity: self.records.capacity(),
+            high_water: self.high_water,
+            allocation_failures: self.allocation_failures,
+        }
+    }
+}
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecycledFramePoolStats {

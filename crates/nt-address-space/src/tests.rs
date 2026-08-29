@@ -1,6 +1,57 @@
 use super::*;
 
 #[test]
+fn page_table_ownership_is_transactional_and_process_scoped() {
+    let mut owner = VmPageTableOwnership::new();
+    let p1a = owner.prepare_insert(1, 0x1000_0000).unwrap().unwrap();
+    assert_eq!(owner.process_commit_bytes(1), 0);
+    let first = owner.commit_insert(p1a, 41).unwrap();
+    assert_eq!(first.base, 0x1000_0000);
+    assert!(owner.contains(1, 0x101f_ffff));
+    assert!(!owner.contains(2, 0x101f_ffff));
+    assert!(owner.prepare_insert(1, 0x1000_0000).unwrap().is_none());
+
+    let p1b = owner.prepare_insert(1, 0x1020_0000).unwrap().unwrap();
+    let p2a = owner.prepare_insert(2, 0x1000_0000).unwrap().unwrap();
+    owner.commit_insert(p1b, 42).unwrap();
+    assert_eq!(owner.commit_insert(p2a, 43), Err(STATUS_INVALID_PARAMETER));
+    let p2a = owner.prepare_insert(2, 0x1000_0000).unwrap().unwrap();
+    owner.commit_insert(p2a, 43).unwrap();
+
+    assert_eq!(owner.process_count(1), 2);
+    assert_eq!(owner.process_commit_bytes(1), 2 * PAGE_SIZE);
+    assert_eq!(owner.process_commit_bytes(2), PAGE_SIZE);
+    assert_eq!(owner.stats().high_water, 3);
+}
+
+#[test]
+fn page_table_ownership_releases_only_the_exact_capability() {
+    let mut owner = VmPageTableOwnership::new();
+    let plan = owner.prepare_insert(7, 0x2000_0000).unwrap().unwrap();
+    owner.commit_insert(plan, 99).unwrap();
+
+    assert_eq!(
+        owner.remove(7, 0x2000_0000, 100),
+        Err(STATUS_MEMORY_NOT_ALLOCATED)
+    );
+    assert_eq!(owner.process_commit_bytes(7), PAGE_SIZE);
+    assert_eq!(owner.remove(7, 0x2000_0000, 99).unwrap().capability, 99);
+    assert_eq!(owner.process_commit_bytes(7), 0);
+}
+
+#[test]
+fn page_table_ownership_rejects_unaligned_windows_and_zero_caps() {
+    let mut owner = VmPageTableOwnership::new();
+    assert_eq!(
+        owner.prepare_insert(1, 0x2000_1000),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    let plan = owner.prepare_insert(1, 0x2000_0000).unwrap().unwrap();
+    assert_eq!(owner.commit_insert(plan, 0), Err(STATUS_INVALID_PARAMETER));
+    assert_eq!(owner.stats().records, 0);
+}
+
+#[test]
 fn recycled_frame_pool_grows_past_the_old_policy_limit_and_reuses_lifo() {
     let mut pool = RecycledFramePool::new();
     for frame in 1..=5_000 {

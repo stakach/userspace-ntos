@@ -17209,14 +17209,50 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     sentinel.
 
     Review adjustment: fixed process pages, image/section write-copy reservation, private VADs, and
-    dynamically hosted thread pages now participate in one MM/Ps commitment model. User page-table
-    pages remain the last known live commitment source outside that model. Attach every process page-
-    table allocation and reclamation to the actual capability owner next, including image, fixed,
-    section, DLL, and VAD mappings rather than counting only private faults. Separately, make NT
-    thread-object publication and hosted-mechanism admission one rollback transaction so a quota or
-    allocation refusal cannot leave an ETHREAD/handle without a runnable mechanism. Keep
-    `PROCESS_MEMORY` and `JOB_MEMORY` disabled until page-table accounting and inherited-job process
-    publication are complete.
+    dynamically hosted thread pages now participate in one MM/Ps commitment model. The next accepted
+    checkpoint closes the remaining process leaf-page-table source and establishes the complete owner
+    at VSpace publication. NT thread-object publication and hosted-mechanism admission remain a
+    separate rollback transaction to close after the memory-limit surface.
+
+    Process leaf-page-table commitment and exact capability ownership (2026-08-30, accepted;
+    memory-limit enablement remains): `nt-address-space` now owns one dynamic authority keyed by
+    process and 2 MiB virtual window, retaining the exact mapped leaf-page-table capability. Its
+    two-phase insert reserves storage before kernel allocation, rejects stale publication, reports
+    process commitment from authoritative records, and removes only an exact capability identity.
+    Initial SEC_IMAGE construction registers image, ntdll, fixed environment, worker-lane, NLS, and
+    KUSER leaf tables before process publication. Later private VAD, DLL, NLS-section, and win32k
+    client mappings use the same owner and prepare the MM/Ps page-table charge before allocation;
+    teardown deletes each exact capability before releasing the corresponding charge.
+
+    This replaces `PROCESS_VM_PT_CAPS`, the fixed private-window table identity, DLL page-table
+    bitsets, and win32k's mixed frame/page-table cap bank. DLL arena page directories now retain their
+    exact capability as well. Fresh VSpace construction explicitly reclaims only unpublished records
+    left by diagnostic slot reuse, while published teardown goes through the commitment-aware path.
+    `publish_hosted_process_vspace` establishes the complete MM owner immediately from private VADs,
+    fixed/write-copy mappings, and leaf tables instead of waiting for a later VM call. Paging-resource
+    admission precedes outer VAD/image charge preparation, so nested table creation cannot stale a
+    prepared MM transaction; a later refusal retains and charges only paging structures which were
+    actually allocated.
+
+    Focused `nt-address-space` validation passes `65/65`; package formatting, `git diff --check`, the
+    freestanding executive check, and the release staging build pass at the established 209-warning
+    baseline. Serialized proof
+    `.tmp/run-headless-page-table-ownership-rerun-20260830.log` dynamically launches userinit,
+    Explorer, and kbswitch, reports `process-vm` leaf-table ownership `459/512/0`, completes 716
+    Explorer api0 redirects with zero callback failures, installs 18 client WndProcs without replay,
+    reaches Explorer paint begin/end `5/22` with 187 direct GDI returns and 144 batch flushes covering
+    195 records, paints `480000/480000` framebuffer pixels with at least 32 colours, reports zero VM
+    page-table/frame/map/alias/registry failures and zero VSpace unmap errors, passes all `295/295`
+    checks, and matches the sentinel.
+
+    Review adjustment: the known process-commitment sources and inherited-job publication boundary
+    are now complete. Next enable `PROCESS_MEMORY` and `JOB_MEMORY` through an all-or-nothing extended-
+    limit update: validate every active member's current complete MM charge, publish each effective MM
+    process limit without partial mutation, preserve exact Ps job aggregate admission, and prove the
+    one-shot completion messages and rollback edges. Keep working-set limits disabled until MM owns
+    resident-set trimming/pageout. After the memory flags, make ETHREAD/handle publication and hosted
+    mechanism admission one rollback transaction, then continue UI restrictions through the
+    registered Win32 job callout and token restrictions through the Security Manager.
 
     Ps job-memory owner foundation (2026-08-30, accepted; live composition remains in progress):
     each job member and job now own current commitment, high-water marks, and the NT one-shot memory
