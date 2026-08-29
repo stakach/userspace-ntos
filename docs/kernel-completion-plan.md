@@ -15883,3 +15883,42 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and delete the CSR-specific state as the generic transaction replaces it. Only after that
     should the remaining numeric reply/wait/receive lifecycle be reconsidered for a reusable
     blocked-continuation adapter; do not obscure its native LPC state transitions prematurely.
+
+    Secure LPC owner and connection-view convergence (2026-08-29, accepted): LPC ABI v3 now carries
+    the kernel-supplied creator process/thread identity into the isolated broker and reports that
+    identity for listen, client-communication, and server-communication handles. The port core owns
+    the identity rather than inferring it from a CSR image name. The host-testable security layer
+    decodes `SECURITY_QUALITY_OF_SERVICE`, captures and validates an optional SID, and compares a
+    required server SID against the named port owner's real primary-token user SID. Its malformed,
+    absent-owner, mismatch, and LocalSystem-success cases are covered by the `nt-security` suite.
+    The LPC ABI, client, server, port-core, ALPC, and security suites pass at `4/4`, `4/4`, `16/16`,
+    `10/10`, `12/12`, and `83/83`; broker checkpoint `5d71d31b` is pushed.
+
+    The executive now publishes the calling process and thread on every real `NtCreatePort`, probes
+    the required QoS and optional `REMOTE_PORT_VIEW`, captures the supplied SID without imposing
+    pointer alignment beyond native SID rules, resolves the named listen port's broker-owned
+    creator, and validates that creator's primary token before queuing a connection. Malformed QoS,
+    SID, view, wrong endpoint, missing token, or SID mismatch fails closed. The four encoded
+    CSR-specific pending-view scalars and `map_csr_port_views` entry point are deleted; one typed
+    `PendingLpcConnectionView` retains the already-resolved generic section transaction and the
+    target-process mapper takes explicit connector and server identities. Executive checkpoint
+    `36edcc3e` is pushed and release staging builds at the established 212-warning baseline.
+
+    Serialized acceptance `.tmp/run-headless-lpc-secure-owner-20260829.log` validates 15 secure
+    connections against the real CSRSS owner (PID 8, creator TID 20), all with the required
+    LocalSystem SID, impersonation level 2, and effective-only mode. It maps 15 real shared port
+    views, and the completed-connect and authentic-accept masks match exactly at `0x37ffc`. Genuine
+    userinit and Explorer launch, 668 Explorer api0 redirects complete with zero callback or
+    dead-callback failures, paint begin/end reaches `5/20` with 187 direct GDI returns and 135 batch
+    flushes covering 184 records, and the framebuffer holds `480000/480000` non-background pixels
+    with at least 32 colours. All `295/295` gates pass and the sentinel matches.
+
+    Review adjustment: server identity and the current secure-connect input boundary are closed.
+    Before abstracting blocked reply/wait/receive continuations, preserve each listen port's native
+    maximum connection-information and message lengths in broker metadata, enforce them on connect
+    and request paths, and return the real maximum through `NtSecureConnectPort`'s optional output.
+    Also retain the validated QoS on the completed connection so a future
+    `NtImpersonateClientOfPort` can derive impersonation level, tracking mode, and effective-only
+    behavior from connection state rather than re-reading caller memory. Extend the pointer-free LPC
+    ABI and port-core tests first, then wire the executive and repeat the full desktop gate. Do not
+    add CSR defaults or a permissive path for ports whose owner or limits are absent.
