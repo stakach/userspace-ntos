@@ -116,7 +116,12 @@ use surt_sel4::{CPtr, Sel4Env, Sel4Notify};
 #[derive(Clone, Copy)]
 pub(crate) enum SyscallUserMemory {
     CurrentProcess,
-    CsrThreadStack { sb: bool },
+    /// The CSRSS process address space while one of its private rendezvous workers is running.
+    /// The worker stack has a dedicated executive mirror; all other ranges resolve through
+    /// CSRSS's normal process frame registry.
+    CsrProcess {
+        sb: bool,
+    },
 }
 
 // SURT's wakeup contract: signal a notification / wait on it.

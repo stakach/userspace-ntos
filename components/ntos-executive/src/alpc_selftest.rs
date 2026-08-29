@@ -207,10 +207,14 @@ pub fn run(chan: &mut RingChannel<'_>, passed: &mut u64) {
     // LPC client sends "ping" (NO attributes) via the classic-LPC message plane;
     // the ALPC host must see it with ValidAttributes == 0 (LPC->ALPC degradation).
     let lmsg = port_message(REQUEST, b"lpc-ping");
-    lpc_send(chan, bclient_h, &lmsg, &mut out);
+    lpc_request(chan, bclient_h, &lmsg, &mut out);
     let (rs, _f, ri, valid, _mt) = alpc_recv(chan, bserver_h, &mut out);
     let degrade_ok = rs == STATUS_SUCCESS && &out[..ri as usize] == &lmsg[..] && valid == 0;
-    check(b"exec_bridge_lpc_msg_degrades_to_empty", degrade_ok, passed);
+    check(
+        b"exec_bridge_lpc_request_attributes_empty",
+        degrade_ok,
+        passed,
+    );
 
     // ALPC host replies carrying VIEW + CONTEXT; the LPC client sees ONLY the
     // PORT_MESSAGE body (the VIEW attribute does not bridge — it is dropped).
@@ -620,7 +624,7 @@ fn alpc_recv(chan: &mut RingChannel<'_>, port: u64, out: &mut [u8]) -> (i32, u32
 
 // --- LPC drive helpers (classic-LPC message plane, no attributes) ----------
 
-fn lpc_send(chan: &mut RingChannel<'_>, port: u64, msg: &[u8], out: &mut [u8]) {
+fn lpc_request(chan: &mut RingChannel<'_>, port: u64, msg: &[u8], out: &mut [u8]) {
     let hdr = core::mem::size_of::<LpcMessageRequest>() as u32;
     let req = LpcMessageRequest {
         abi_size: hdr as u16,
@@ -632,7 +636,7 @@ fn lpc_send(chan: &mut RingChannel<'_>, port: u64, msg: &[u8], out: &mut [u8]) {
     };
     let mut b = bytes(&req);
     b.extend_from_slice(msg);
-    let _ = chan.raw(lop::LPC_OP_REPLY_PORT, &b, out);
+    let _ = chan.raw(lop::LPC_OP_REQUEST_WAIT_REPLY, &b, out);
 }
 
 fn lpc_recv(chan: &mut RingChannel<'_>, port: u64, out: &mut [u8]) -> (i32, u32, u64, u64, u64) {

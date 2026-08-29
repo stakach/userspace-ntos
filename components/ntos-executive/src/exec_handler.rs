@@ -15231,14 +15231,49 @@ impl ExecNtHandler {
     unsafe fn user_memory_read(&self, memory: SyscallUserMemory, va: u64, dst: &mut [u8]) -> bool {
         match memory {
             SyscallUserMemory::CurrentProcess => self.xas_read(va, dst),
-            SyscallUserMemory::CsrThreadStack { sb } => csr_thread_stack_copyin(sb, va, dst),
+            SyscallUserMemory::CsrProcess { sb } => {
+                if csr_thread_stack_copyin(sb, va, dst) {
+                    return true;
+                }
+                let Some(ctx) = self.loop_ctx else {
+                    return false;
+                };
+                let procs = &*ctx.procs;
+                let filled = &*ctx.pfilled;
+                client_copyin_process_mapped(
+                    1,
+                    va,
+                    dst,
+                    &filled[1],
+                    procs[1].faults as usize,
+                    procs[1].scratch_base,
+                    false,
+                )
+            }
         }
     }
 
     unsafe fn user_memory_write(&self, memory: SyscallUserMemory, va: u64, src: &[u8]) -> bool {
         match memory {
             SyscallUserMemory::CurrentProcess => self.xas_try_write_buf(va, src),
-            SyscallUserMemory::CsrThreadStack { sb } => csr_thread_stack_copyout(sb, va, src),
+            SyscallUserMemory::CsrProcess { sb } => {
+                if csr_thread_stack_copyout(sb, va, src) {
+                    return true;
+                }
+                let Some(ctx) = self.loop_ctx else {
+                    return false;
+                };
+                let procs = &*ctx.procs;
+                let filled = &*ctx.pfilled;
+                client_copyout_mapped(
+                    1,
+                    va,
+                    src,
+                    &filled[1],
+                    procs[1].faults as usize,
+                    procs[1].scratch_base,
+                )
+            }
         }
     }
 
@@ -15250,7 +15285,67 @@ impl ExecNtHandler {
     ) -> bool {
         match memory {
             SyscallUserMemory::CurrentProcess => self.probe_user_output(va, len),
-            SyscallUserMemory::CsrThreadStack { sb } => csr_thread_stack_has_range(sb, va, len),
+            SyscallUserMemory::CsrProcess { sb } => {
+                if csr_thread_stack_has_range(sb, va, len) {
+                    return true;
+                }
+                if len == 0 {
+                    return true;
+                }
+                let Some(ctx) = self.loop_ctx else {
+                    return false;
+                };
+                let Some(chunks) = nt_address_space::page_chunks(va, len) else {
+                    return false;
+                };
+                let procs = &*ctx.procs;
+                for chunk in chunks {
+                    let Some(info) =
+                        process_committed_mapping_basic_information(1, chunk.page_base)
+                    else {
+                        return false;
+                    };
+                    let writable = match info.type_ {
+                        nt_address_space::MEM_IMAGE => {
+                            nt_address_space::image_view_fault_access_status(
+                                info.protect,
+                                nt_address_space::FaultAccess::Write,
+                            )
+                            .is_ok()
+                        }
+                        nt_address_space::MEM_MAPPED => {
+                            nt_address_space::mapped_view_fault_access_status(
+                                info.protect,
+                                nt_address_space::FaultAccess::Write,
+                            )
+                            .is_ok()
+                        }
+                        _ => false,
+                    };
+                    if !writable || csrss_frame_get_exact(1, chunk.page_base).0 == 0 {
+                        return false;
+                    }
+                }
+                let filled = &*ctx.pfilled;
+                let mut probe = [0u8; 64];
+                let mut copied = 0usize;
+                while copied < len {
+                    let part = (len - copied).min(probe.len());
+                    if !client_copyin_process_mapped(
+                        1,
+                        va + copied as u64,
+                        &mut probe[..part],
+                        &filled[1],
+                        procs[1].faults as usize,
+                        procs[1].scratch_base,
+                        false,
+                    ) {
+                        return false;
+                    }
+                    copied += part;
+                }
+                true
+            }
         }
     }
 
@@ -24496,21 +24591,46 @@ impl ExecNtHandler {
         0
     }
 
-    unsafe fn lpc_capture_port_message(&self, message: u64) -> Result<alloc::vec::Vec<u8>, u32> {
+    unsafe fn lpc_capture_port_message(
+        &self,
+        memory: SyscallUserMemory,
+        message: u64,
+    ) -> Result<alloc::vec::Vec<u8>, u32> {
         if message == 0 {
             return Ok(alloc::vec::Vec::new());
         }
         let mut header = [0u8; 4];
-        if !self.xas_read(message, &mut header) {
+        if !self.user_memory_read(memory, message, &mut header) {
             return Err(STATUS_ACCESS_VIOLATION);
         }
         let total = nt_lpc_abi::port_message_total_length(header)
             .ok_or(STATUS_INVALID_PARAMETER)?;
         let mut bytes = alloc::vec![0u8; total];
-        if !self.xas_read(message, &mut bytes) {
+        if !self.user_memory_read(memory, message, &mut bytes) {
             return Err(STATUS_ACCESS_VIOLATION);
         }
         Ok(bytes)
+    }
+
+    pub(crate) unsafe fn nt_reply_port_with_user_memory(
+        &mut self,
+        args: &[u64],
+        memory: SyscallUserMemory,
+    ) -> u32 {
+        if args[1] == 0 {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let message = match self.lpc_capture_port_message(memory, args[1]) {
+            Ok(message) => message,
+            Err(status) => return status,
+        };
+        let Some(lpc) = lpc_client() else {
+            return STATUS_UNSUCCESSFUL;
+        };
+        match lpc.reply_port(args[0], &message) {
+            Ok(()) => nt_syscall::STATUS_SUCCESS,
+            Err(status) => status.raw() as u32,
+        }
     }
 
     unsafe fn lpc_write_received_message(
@@ -24556,7 +24676,9 @@ impl ExecNtHandler {
         receive_message: u64,
         listen_only: bool,
     ) -> u32 {
-        let reply = match self.lpc_capture_port_message(reply_message) {
+        let reply = match self
+            .lpc_capture_port_message(SyscallUserMemory::CurrentProcess, reply_message)
+        {
             Ok(reply) => reply,
             Err(status) => return status,
         };
@@ -29854,20 +29976,7 @@ impl ExecNtHandler {
                 0xC000_0008 // STATUS_INVALID_HANDLE
             },
             NativeService::NtReplyPort => unsafe {
-                if args[1] == 0 {
-                    return STATUS_ACCESS_VIOLATION;
-                }
-                let message = match self.lpc_capture_port_message(args[1]) {
-                    Ok(message) => message,
-                    Err(status) => return status,
-                };
-                let Some(lpc) = lpc_client() else {
-                    return STATUS_UNSUCCESSFUL;
-                };
-                match lpc.reply_port(args[0], &message) {
-                    Ok(()) => nt_syscall::STATUS_SUCCESS,
-                    Err(status) => status.raw() as u32,
-                }
+                self.nt_reply_port_with_user_memory(args, SyscallUserMemory::CurrentProcess)
             },
             NativeService::NtRegisterThreadTerminatePort => unsafe {
                 let Some(lpc) = lpc_client() else {

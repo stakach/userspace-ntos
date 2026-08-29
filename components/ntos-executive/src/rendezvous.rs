@@ -1555,6 +1555,7 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
     const SSN_SET_EVENT: u64 = 228;
     const SSN_CLOSE: u64 = 27;
     const SSN_QUERY_OBJECT: u64 = 170;
+    const SSN_REPLY_PORT: u64 = 202;
     const SSN_SET_INFO_OBJECT: u64 = 236;
     const SSN_SET_INFO_PROCESS: u64 = 237;
     const SSN_RESUME_THREAD: u64 = 214;
@@ -1595,6 +1596,7 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
     }
 
     let mut request = [0u8; CSR_API_MSG_MAX];
+    let mut reply_sent_separately = false;
     let (request_len, client_pid, _client_tid) = if broker_kernel_message {
         let port = CSR_API_RECVPORT.load(Ordering::Relaxed);
         let received = match lpc_client().map(|lpc| lpc.reply_wait_receive(port)) {
@@ -1865,7 +1867,7 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                                 let status = nt_handler
                                     .nt_allocate_virtual_memory_with_user_memory(
                                         &alloc_args,
-                                        SyscallUserMemory::CsrThreadStack { sb: false },
+                                        SyscallUserMemory::CsrProcess { sb: false },
                                     );
                                 nt_handler.pi = saved_pi;
                                 nt_handler.current_tid = saved_tid;
@@ -1899,7 +1901,7 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                                     hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
                                 let status = nt_handler.nt_protect_virtual_memory_with_user_memory(
                                     &protect_args,
-                                    SyscallUserMemory::CsrThreadStack { sb: false },
+                                    SyscallUserMemory::CsrProcess { sb: false },
                                 );
                                 nt_handler.pi = saved_pi;
                                 nt_handler.current_tid = saved_tid;
@@ -1996,7 +1998,7 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                                     hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
                                 let status = nt_handler.nt_query_object_with_user_memory(
                                     &query_args,
-                                    SyscallUserMemory::CsrThreadStack { sb: false },
+                                    SyscallUserMemory::CsrProcess { sb: false },
                                 );
                                 nt_handler.pi = saved_pi;
                                 nt_handler.current_tid = saved_tid;
@@ -2017,7 +2019,7 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                             hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
                         let status = nt_handler.nt_set_information_object_with_user_memory(
                             &set_args,
-                            SyscallUserMemory::CsrThreadStack { sb: false },
+                            SyscallUserMemory::CsrProcess { sb: false },
                         );
                         nt_handler.pi = saved_pi;
                         nt_handler.current_tid = saved_tid;
@@ -2035,7 +2037,7 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                             hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
                         let status = nt_handler.nt_set_information_process_with_user_memory(
                             &set_args,
-                            SyscallUserMemory::CsrThreadStack { sb: false },
+                            SyscallUserMemory::CsrProcess { sb: false },
                         );
                         nt_handler.pi = saved_pi;
                         nt_handler.current_tid = saved_tid;
@@ -2055,7 +2057,7 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                             hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
                         let status = nt_handler.nt_resume_thread_with_user_memory(
                             &resume_args,
-                            SyscallUserMemory::CsrThreadStack { sb: false },
+                            SyscallUserMemory::CsrProcess { sb: false },
                         );
                         nt_handler.pi = saved_pi;
                         nt_handler.current_tid = saved_tid;
@@ -2073,7 +2075,7 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                             hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
                         let status = nt_handler.nt_suspend_thread_with_user_memory(
                             &suspend_args,
-                            SyscallUserMemory::CsrThreadStack { sb: false },
+                            SyscallUserMemory::CsrProcess { sb: false },
                         );
                         nt_handler.pi = saved_pi;
                         nt_handler.current_tid = saved_tid;
@@ -2192,6 +2194,25 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                         nt_handler.close_current_handle(get_recv_mr(9));
                         nt_handler.pi = saved_pi;
                     }
+                    SSN_REPLY_PORT => {
+                        let reply_args = [get_recv_mr(9), rdx];
+                        let saved_pi = nt_handler.pi;
+                        let saved_tid = nt_handler.current_tid;
+                        nt_handler.pi = 1;
+                        nt_handler.current_tid =
+                            hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
+                        let status = nt_handler.nt_reply_port_with_user_memory(
+                            &reply_args,
+                            SyscallUserMemory::CsrProcess { sb: false },
+                        );
+                        nt_handler.pi = saved_pi;
+                        nt_handler.current_tid = saved_tid;
+                        reply_sent_separately = status == nt_syscall::STATUS_SUCCESS;
+                        print_str(b"[csr-api] serviced worker NtReplyPort status=0x");
+                        print_hex(status);
+                        print_str(b"\n");
+                        result = status as u64;
+                    }
                     SSN_REPLY_WAIT_RECV => {
                         let reply_msg = get_recv_mr(7);
                         let recv_msg = get_recv_mr(8);
@@ -2275,37 +2296,39 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                             m3 = nm3;
                             continue;
                         }
-                        if reply_msg == 0 {
+                        if reply_msg == 0 && !reply_sent_separately {
                             print_str(b"[csr-api] real LPC request produced no reply ApiNumber=0x");
                             print_hex(api_number);
                             print_str(b"\n");
                             return false;
                         }
-                        let mut reply_bytes = [0u8; CSR_API_MSG_MAX];
-                        let Some(header_word) = csr_stack_read(reply_msg) else {
-                            print_str(b"[csr-api] worker reply header unreadable source=0x");
-                            print_hex_u64(reply_msg);
-                            print_str(b"\n");
-                            return false;
-                        };
-                        let reply_len = ((header_word >> 16) as u16) as usize;
-                        if !(0x28..=CSR_API_MSG_MAX).contains(&reply_len)
-                            || !csr_stack_copyin(reply_msg, &mut reply_bytes[..reply_len])
-                        {
-                            print_str(b"[csr-api] worker reply frame invalid source=0x");
-                            print_hex_u64(reply_msg);
-                            print_str(b" total=");
-                            print_u64(reply_len as u64);
-                            print_str(b"\n");
-                            return false;
-                        }
                         let port = get_recv_mr(9);
-                        let reply_sent = lpc_client()
-                            .map(|lpc| lpc.reply_port(port, &reply_bytes[..reply_len]))
-                            .is_some_and(|result| result.is_ok());
-                        if !reply_sent {
-                            print_str(b"[csr-api] broker reply send failed\n");
-                            return false;
+                        if !reply_sent_separately {
+                            let mut reply_bytes = [0u8; CSR_API_MSG_MAX];
+                            let Some(header_word) = csr_stack_read(reply_msg) else {
+                                print_str(b"[csr-api] worker reply header unreadable source=0x");
+                                print_hex_u64(reply_msg);
+                                print_str(b"\n");
+                                return false;
+                            };
+                            let reply_len = ((header_word >> 16) as u16) as usize;
+                            if !(0x28..=CSR_API_MSG_MAX).contains(&reply_len)
+                                || !csr_stack_copyin(reply_msg, &mut reply_bytes[..reply_len])
+                            {
+                                print_str(b"[csr-api] worker reply frame invalid source=0x");
+                                print_hex_u64(reply_msg);
+                                print_str(b" total=");
+                                print_u64(reply_len as u64);
+                                print_str(b"\n");
+                                return false;
+                            }
+                            let reply_sent = lpc_client()
+                                .map(|lpc| lpc.reply_port(port, &reply_bytes[..reply_len]))
+                                .is_some_and(|result| result.is_ok());
+                            if !reply_sent {
+                                print_str(b"[csr-api] broker reply send failed\n");
+                                return false;
+                            }
                         }
                         let Some(Ok(received_reply)) =
                             lpc_client().map(|lpc| lpc.reply_wait_receive(client_port))
@@ -3559,9 +3582,32 @@ pub(crate) unsafe fn csr_fill_page(
     let scratch = CSR_FILL_SCRATCH_BASE + scratch_index * 0x1000;
     *fill_idx += 1;
     let f = alloc_frame();
-    let _ = page_map(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
+    if page_map_r(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+        let _ = cnode_delete_recycle_r(f);
+        return false;
+    }
     let rights = fill_image_page(tpe, (page - base) as u32, scratch);
-    let _ = page_map(copy_cap(f), page, rights, csrss_pml4);
+    let (client_cap, copy_error) = copy_cap_r(f);
+    let map_error = if copy_error == 0 {
+        page_map_r(client_cap, page, rights, csrss_pml4)
+    } else {
+        copy_error
+    };
+    if map_error != 0 {
+        if copy_error == 0 {
+            let _ = cnode_delete_recycle_r(client_cap);
+        }
+        let _ = page_unmap_r(f);
+        let _ = cnode_delete_recycle_r(f);
+        return false;
+    }
+    if !csrss_frame_put_at_cap_source_owned(1, page, client_cap, scratch, f, f, false) {
+        let _ = page_unmap_r(client_cap);
+        let _ = cnode_delete_recycle_r(client_cap);
+        let _ = page_unmap_r(f);
+        let _ = cnode_delete_recycle_r(f);
+        return false;
+    }
     true
 }
 
@@ -3890,7 +3936,7 @@ unsafe fn csr_sb_api_request_rendezvous(
                                     hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrSbApi);
                                 let status = nt_handler.nt_protect_virtual_memory_with_user_memory(
                                     &protect_args,
-                                    SyscallUserMemory::CsrThreadStack { sb: true },
+                                    SyscallUserMemory::CsrProcess { sb: true },
                                 );
                                 nt_handler.pi = saved_pi;
                                 nt_handler.current_tid = saved_tid;
@@ -3951,7 +3997,7 @@ unsafe fn csr_sb_api_request_rendezvous(
                                     hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrSbApi);
                                 let status = nt_handler.nt_query_object_with_user_memory(
                                     &query_args,
-                                    SyscallUserMemory::CsrThreadStack { sb: true },
+                                    SyscallUserMemory::CsrProcess { sb: true },
                                 );
                                 nt_handler.pi = saved_pi;
                                 nt_handler.current_tid = saved_tid;
@@ -3972,7 +4018,7 @@ unsafe fn csr_sb_api_request_rendezvous(
                             hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrSbApi);
                         let status = nt_handler.nt_set_information_object_with_user_memory(
                             &set_args,
-                            SyscallUserMemory::CsrThreadStack { sb: true },
+                            SyscallUserMemory::CsrProcess { sb: true },
                         );
                         nt_handler.pi = saved_pi;
                         nt_handler.current_tid = saved_tid;
@@ -3990,7 +4036,7 @@ unsafe fn csr_sb_api_request_rendezvous(
                             hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrSbApi);
                         let status = nt_handler.nt_resume_thread_with_user_memory(
                             &resume_args,
-                            SyscallUserMemory::CsrThreadStack { sb: true },
+                            SyscallUserMemory::CsrProcess { sb: true },
                         );
                         nt_handler.pi = saved_pi;
                         nt_handler.current_tid = saved_tid;
@@ -4008,7 +4054,7 @@ unsafe fn csr_sb_api_request_rendezvous(
                             hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrSbApi);
                         let status = nt_handler.nt_suspend_thread_with_user_memory(
                             &suspend_args,
-                            SyscallUserMemory::CsrThreadStack { sb: true },
+                            SyscallUserMemory::CsrProcess { sb: true },
                         );
                         nt_handler.pi = saved_pi;
                         nt_handler.current_tid = saved_tid;
@@ -4303,7 +4349,7 @@ pub(crate) unsafe fn csr_rendezvous(
                                 hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
                             let status = nt_handler.nt_protect_virtual_memory_with_user_memory(
                                 &protect_args,
-                                SyscallUserMemory::CsrThreadStack { sb: false },
+                                SyscallUserMemory::CsrProcess { sb: false },
                             );
                             nt_handler.pi = saved_pi;
                             nt_handler.current_tid = saved_tid;
