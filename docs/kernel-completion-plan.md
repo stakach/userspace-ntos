@@ -15589,7 +15589,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     page except through the explicit free/unmap path that first retires the corresponding record,
     retire all records on final process teardown, and then expose the two native services.
 
-    Executive virtual-memory locks (2026-08-29, implemented; desktop acceptance pending): the
+    Executive virtual-memory locks (2026-08-29, accepted): the
     executive now owns one growable `VmPageLockTable` keyed by address-space slot and page. SSNs 108
     and 276 are registered as typed four-argument `NtLockVirtualMemory` and
     `NtUnlockVirtualMemory` services with no numeric exception or fallback. Both enforce
@@ -15613,8 +15613,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     reports live pages, capacity, each lock class, allocation failures, and reclamation refusals;
     the VM headroom gate requires the last two counters to remain zero. Focused validation passes
     `nt-address-space` `60/60`, `nt-syscall` `70/70`, `git diff --check`, and the freestanding
-    executive check at the established 209-warning baseline. Run the serialized release/desktop
-    acceptance next, then close this item or fix any real regression it exposes.
+    executive check at the established 209-warning baseline.
+
+    Serialized acceptance `.tmp/run-headless-vm-locks-20260829.log` reaches final quiescence in the
+    normal desktop window, launches genuine userinit and Explorer, completes 668 Explorer api0
+    redirects with zero callback or dead-callback failures, records paint begin/end `5/20`, 187
+    direct GDI returns, and 135 batch flushes covering 184 records, and paints `480000/480000`
+    framebuffer pixels with at least 32 colours. The final census reports
+    `vm-locks=0/0/0/0/0/0`: no leaked live lock, retained capacity, allocation failure, or attempted
+    reclamation of locked memory. Private remap, mapped-section writeback/COW, and image COW proofs
+    remain fully green; all `295/295` gates pass and the sentinel matches. This item is closed.
 
     The same review rejected taking `NtSetSystemTime` (SSN 251) as an isolated replacement target.
     The system clock is currently an immutable boot epoch plus monotonic counter, while native
