@@ -774,6 +774,7 @@ unsafe fn lpc_request_wait_park(
         badge,
         tid,
         memory: pending.memory,
+        completion: pending.completion,
         reply_cap: stolen,
         reply,
     };
@@ -10037,17 +10038,6 @@ pub(crate) unsafe fn service_sec_image(
                 if let Some(request) = nt_handler.remote_thread_request.take() {
                     spawn_requested_remote_thread(&mut nt_handler, &request, fault_ep);
                 }
-            } else if m0 == 223 {
-                // NtSetDefaultHardErrorPort(PortHandle=R10). csrsrv's CsrServerInitialization registers
-                // its API port as the hard-error port right after SmConnectToSm succeeds
-                // (init.c:1119). No kernel state to model in the host — accept it so CsrServerInit
-                // BasepCheckBadapp → BaseCheckAppcompatCache → BasepShimCacheSearch does
-                // NtApphelpCacheControl(ApphelpCacheServiceLookup). Returning SUCCESS means "the image
-                // is in the shim cache, known-good" → BaseCheckAppcompatCache returns TRUE → the app is
-                // allowed WITHOUT loading apphelp.dll or running the shim engine. No app-compat state is
-                // modeled; SUCCESS is the "no shim needed" answer. (BasepShimCacheCheckBypass is a
-                // hardcoded FALSE in ReactOS, so this single SUCCESS short-circuits the whole path.)
-                result = 0;
             } else if m0 >= win32k_subsystem::WIN32K_SERVICE_BASE
                 && (hosted_non_native_top_level_badge(&nt_handler, badge)
                     || is_wl_worker
@@ -15006,38 +14996,6 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
                     mark_wait_parked!(pi, m0);
-                    let _ = finalize_service_loop_state(&mut nt_handler);
-                    let (nb, nmi, nm0, nm1, nm2, nm3) =
-                        recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
-                    badge = nb;
-                    mi = nmi;
-                    m0 = nm0;
-                    m1 = nm1;
-                    m2 = nm2;
-                    m3 = nm3;
-                    continue;
-                }
-                // ★ N-processes multiplex (BATCH 17): smss' (badge 0) main thread terminating must NOT
-                // stop the whole boot while a HIGHER hosted process (winlogon) still has pending work.
-                // smss reaches NtRaiseHardError (SSN 190) via SmpTerminate (smss.c:SmpTerminate ->
-                // NtRaiseHardError(STATUS_SYSTEM_PROCESS_TERMINATED) -> NtTerminateProcess) — its death
-                // cry after it has finished spawning csrss + winlogon. In real NT smss then WAITS on the
-                // subsystem handles; here its main thread is done its bring-up job. PARK it (recv next
-                // WITHOUT replying, exactly like a server listener) so winlogon's user32 window-class /
-                // cursor init keeps being serviced instead of freezing at its 0x103d fetch. Behavior-
-                // preserving for smss (it was terminating regardless); unblocks the higher process. This
-                // is the same class of fix as BATCH 10 (a terminal syscall from one process killed the
-                // shared loop), generalized to smss' hard-error path.
-                if badge == 0 && m0 == 190 {
-                    print_str(b"[smss] NtRaiseHardError(190) = SmpTerminate -> PARK smss main; winlogon continues\n");
-                    // Terminal for smss (its bring-up job is done) — count it toward quiesce so the
-                    // loop can cleanly exit once every other live process is parked too.
-                    crash_parked |= 1u64 << owner_top_badge_for(&nt_handler, badge);
-                    service_watchdog_record_crash_parked(crash_parked);
-                    procs[pi].faults = faults;
-                    procs[pi].first = first;
-                    procs[pi].ntfaults = ntfaults;
-                    pfilled[pi] = *filled_pages;
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
@@ -21129,6 +21087,7 @@ unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                     pi,
                     continuation.memory,
                     wait.request,
+                    continuation.completion,
                     &reply,
                 ),
                 Err(status) => status,

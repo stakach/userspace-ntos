@@ -16833,3 +16833,47 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     policy/lifecycle owner and observable aggregate latency contract; merely storing and returning a
     requested value would be a fallback. Prefer a missing Ob/Ps/Se/Mm/I/O trait whose mechanism and
     teardown can be proved in a focused crate before executive wiring.
+
+    Retained default hard-error port and `NtSetDefaultHardErrorPort` (2026-08-30, accepted): SSN 223
+    is now a typed, registered one-argument service. The handler requires `SeTcbPrivilege`, resolves
+    the caller through the dynamic process manager, verifies that the supplied broker handle is the
+    caller's live LPC connection port, and publishes the authority exactly once. The isolated LPC
+    broker retains the underlying port object under a private kernel endpoint, so closing the
+    registering user handle cannot leave the executive holding a stale integer. A closed retained
+    port remains alive only for the kernel reference: it is neither connectable nor silently
+    recreated, and exact release drains its charged messages before destroying the object.
+
+    `NtRaiseHardError` now captures and validates the native parameter array and selected x64
+    `UNICODE_STRING` descriptors, applies process and TEB hard-error modes plus the explicit override,
+    enforces shutdown privilege, and encodes the real 112-byte `HARDERROR_MSG` with
+    `LPC_ERROR_EVENT`, trusted client identity, system time, status, options, mask, and parameters.
+    Both a process exception communication port and the retained default connection port use the
+    same typed broker request/reply plane. The existing generation-exact parked LPC continuation now
+    records its completion type, so a hard-error reply resumes only its requesting thread and writes
+    the sanitized `HARDERROR_RESPONSE` rather than treating it as an ordinary returned port message.
+    An error-severity status with no ready system handler, or a critical self-send by the default
+    handler process, enters the existing fatal bugcheck action with
+    `FATAL_UNHANDLED_HARD_ERROR`; it is not converted into a successful or invented failure return.
+
+    The old numeric SSN 223 unconditional-success branch and the smss-specific SSN 190 parking
+    shortcut are deleted. No process name, image identity, boot ordinal, manufactured response, or
+    hard-error-specific scheduling path remains. Focused validation passes `nt-port-core` `19/19`,
+    `nt-lpc-server` `18/18`, and `nt-syscall` `77/77`; the freestanding executive remains at the
+    established 209-warning baseline and the release staging build succeeds. The serialized live
+    gate observes CSRSS register the default port from dynamic owner PID 8, launches genuine
+    userinit and Explorer, balances `896/896` real callback redirects/returns with no failures,
+    reaches Explorer paint begin/end `2/20` with 185 direct GDI returns and 131 batch flushes covering
+    171 records, paints `480000/480000` framebuffer pixels with at least 32 colours, passes all
+    `295/295` checks, and matches the sentinel.
+
+    The typed surface now contains 187 services, the hosted table registers 186 numbered variants,
+    and 37 required canonical services remain absent.
+
+    Review adjustment: default hard-error authority and transport are closed. The independently
+    tested process exception-port route still depends on the live user communication handle stored
+    by `ProcessExceptionPort`; its setter does not yet acquire an object reference or release that
+    reference during process rundown. Close that lifetime debt next by adding a broker-owned exact
+    communication-endpoint reference, installing it with the existing one-shot process-manager
+    transition, and releasing it from the common process teardown path. Delete the raw-handle
+    storage once the referenced endpoint is authoritative. After that, return to the regenerated
+    37-service inventory and select the next bounded canonical trait.

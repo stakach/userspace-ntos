@@ -329,6 +329,42 @@ impl<B: Backend> LpcClient<B> {
         NtStatus(reply.status).to_result()
     }
 
+    /// Acquire a broker-owned kernel endpoint referencing one live connection port. The returned
+    /// handle is not a user handle and is released only through [`Self::release_connection_port`].
+    pub fn retain_connection_port(&mut self, port_handle: u64) -> Result<u64, NtStatus> {
+        let req = nt_lpc_abi::LpcClosePortRequest {
+            abi_size: size_of::<nt_lpc_abi::LpcClosePortRequest>() as u16,
+            _reserved: 0,
+            _reserved2: 0,
+            port_handle,
+        };
+        let reply = self.backend.call(
+            opcode::LPC_OP_RETAIN_CONNECTION_PORT,
+            bytemuck::bytes_of(&req),
+            &mut [],
+        );
+        NtStatus(reply.status).to_result()?;
+        (reply.detail0 != 0)
+            .then_some(reply.detail0)
+            .ok_or(NtStatus::UNSUCCESSFUL)
+    }
+
+    /// Release one exact broker-owned kernel endpoint.
+    pub fn release_connection_port(&mut self, endpoint_handle: u64) -> Result<(), NtStatus> {
+        let req = nt_lpc_abi::LpcClosePortRequest {
+            abi_size: size_of::<nt_lpc_abi::LpcClosePortRequest>() as u16,
+            _reserved: 0,
+            _reserved2: 0,
+            port_handle: endpoint_handle,
+        };
+        let reply = self.backend.call(
+            opcode::LPC_OP_RELEASE_CONNECTION_PORT,
+            bytemuck::bytes_of(&req),
+            &mut [],
+        );
+        NtStatus(reply.status).to_result()
+    }
+
     /// Resolve a broker handle to the live endpoint identity recorded by the port core.
     pub fn query_handle(&mut self, port_handle: u64) -> Result<HandleQueryResult, NtStatus> {
         let req = LpcQueryHandleRequest {
@@ -500,7 +536,7 @@ impl<B: Backend> LpcClient<B> {
                 bytemuck::try_pod_read_unaligned(&out[message_len..returned])
                     .map_err(|_| NtStatus::INVALID_PARAMETER)?;
             if metadata.abi_size as usize != metadata_size
-                || metadata.connection_id == 0
+                || metadata.connection_id == 0 && msg_type != msg_type::LPC_ERROR_EVENT
                 || metadata.port_context != r.detail0
             {
                 return Err(NtStatus::INVALID_PARAMETER);
@@ -577,6 +613,43 @@ impl<B: Backend> LpcClient<B> {
         let reply = self
             .backend
             .call(opcode::LPC_OP_REQUEST_WAIT_REPLY, buf.as_slice(), &mut out);
+        if reply.status != NtStatus::PENDING.raw() && reply.status != NtStatus::SUCCESS.raw() {
+            return Err(NtStatus(reply.status));
+        }
+        u32::try_from(reply.detail0)
+            .ok()
+            .filter(|message_id| *message_id != 0)
+            .ok_or(NtStatus::UNSUCCESSFUL)
+    }
+
+    /// Queue one typed synchronous request from a kernel-retained connection port. The broker
+    /// preserves the native message type and supplies the exact client/message identity used by
+    /// the ordinary server receive/reply path.
+    pub fn begin_kernel_request_wait_reply(
+        &mut self,
+        endpoint_handle: u64,
+        message: &[u8],
+        client_process: u64,
+        client_thread: u64,
+    ) -> Result<u32, NtStatus> {
+        let header = size_of::<LpcMessageRequest>();
+        let request = LpcMessageRequest {
+            abi_size: header as u16,
+            _reserved: 0,
+            _reserved2: 0,
+            port_handle: endpoint_handle,
+            msg_offset: header as u32,
+            msg_len_bytes: u32_len(message.len())?,
+            client_process,
+            client_thread,
+        };
+        let buf = pack_bytes::<LPC_MESSAGE_BUF_LEN, _>(&request, message)?;
+        let mut out = [0u8; 512];
+        let reply = self.backend.call(
+            opcode::LPC_OP_KERNEL_REQUEST_WAIT_REPLY,
+            buf.as_slice(),
+            &mut out,
+        );
         if reply.status != NtStatus::PENDING.raw() && reply.status != NtStatus::SUCCESS.raw() {
             return Err(NtStatus(reply.status));
         }

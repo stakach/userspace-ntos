@@ -152,6 +152,11 @@ impl Server {
             opcode::LPC_OP_QUERY_REQUEST => self.op_query_request(in_buf, out_buf),
             opcode::LPC_OP_RECEIVE_REPLY => self.op_receive_reply(in_buf, out_buf),
             opcode::LPC_OP_CANCEL_REQUEST => self.op_cancel_request(in_buf),
+            opcode::LPC_OP_RETAIN_CONNECTION_PORT => self.op_retain_connection_port(in_buf),
+            opcode::LPC_OP_RELEASE_CONNECTION_PORT => self.op_release_connection_port(in_buf),
+            opcode::LPC_OP_KERNEL_REQUEST_WAIT_REPLY => {
+                self.op_kernel_request_wait_reply(in_buf, out_buf)
+            }
             _ => Err(NtStatus::NOT_IMPLEMENTED),
         }
     }
@@ -382,6 +387,42 @@ impl Server {
         }
     }
 
+    fn op_kernel_request_wait_reply(
+        &mut self,
+        buf: &[u8],
+        out_buf: &mut [u8],
+    ) -> Result<LpcReply, NtStatus> {
+        let req: LpcMessageRequest = read_req(buf)?;
+        let msg = read_blob(buf, req.msg_offset, req.msg_len_bytes)?;
+        let identity = MessageIdentity {
+            client: ClientId {
+                process: req.client_process,
+                thread: req.client_thread,
+            },
+            message_id: self.allocate_message_id(),
+        };
+        let msg = message_with_kernel_request_identity(msg, identity)?;
+        self.core.send_kernel_request_message(
+            req.port_handle,
+            &msg,
+            MessageAttrs::default(),
+            identity,
+        )?;
+        match self.core.receive_reply_message(req.port_handle, identity)? {
+            Some(message) => {
+                let n = message.bytes.len().min(out_buf.len());
+                out_buf[..n].copy_from_slice(&message.bytes[..n]);
+                Ok(reply(
+                    NtStatus::SUCCESS,
+                    n as u32,
+                    identity.message_id as u64,
+                    msg_type_of(&message.bytes) as u64,
+                ))
+            }
+            None => Ok(reply(NtStatus::PENDING, 0, identity.message_id as u64, 0)),
+        }
+    }
+
     fn op_receive_reply(&mut self, buf: &[u8], out_buf: &mut [u8]) -> Result<LpcReply, NtStatus> {
         let req: LpcRequestIdentityRequest = read_req(buf)?;
         let identity = MessageIdentity {
@@ -460,6 +501,18 @@ impl Server {
     fn op_close_port(&mut self, buf: &[u8]) -> Result<LpcReply, NtStatus> {
         let req: LpcClosePortRequest = read_req(buf)?;
         self.core.close_port(req.port_handle);
+        Ok(ok())
+    }
+
+    fn op_retain_connection_port(&mut self, buf: &[u8]) -> Result<LpcReply, NtStatus> {
+        let req: LpcClosePortRequest = read_req(buf)?;
+        let retained = self.core.retain_connection_port(req.port_handle)?;
+        Ok(reply(NtStatus::SUCCESS, 0, retained, 0))
+    }
+
+    fn op_release_connection_port(&mut self, buf: &[u8]) -> Result<LpcReply, NtStatus> {
+        let req: LpcClosePortRequest = read_req(buf)?;
+        self.core.release_connection_port(req.port_handle)?;
         Ok(ok())
     }
 
@@ -652,6 +705,21 @@ fn message_with_request_identity(
     identity: MessageIdentity,
 ) -> Result<Vec<u8>, NtStatus> {
     let mut message = message_with_type(bytes, nt_lpc_abi::msg_type::LPC_REQUEST)?;
+    message[8..16].copy_from_slice(&identity.client.process.to_le_bytes());
+    message[16..24].copy_from_slice(&identity.client.thread.to_le_bytes());
+    message[24..28].copy_from_slice(&identity.message_id.to_le_bytes());
+    message[28..32].fill(0);
+    Ok(message)
+}
+
+fn message_with_kernel_request_identity(
+    bytes: &[u8],
+    identity: MessageIdentity,
+) -> Result<Vec<u8>, NtStatus> {
+    let mut message = validated_port_message(bytes)?;
+    if msg_type_of(&message) != nt_lpc_abi::msg_type::LPC_ERROR_EVENT {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
     message[8..16].copy_from_slice(&identity.client.process.to_le_bytes());
     message[16..24].copy_from_slice(&identity.client.thread.to_le_bytes());
     message[24..28].copy_from_slice(&identity.message_id.to_le_bytes());
@@ -1309,6 +1377,106 @@ mod tests {
                 b"response"
             );
         }
+    }
+
+    #[test]
+    fn retained_connection_port_preserves_typed_kernel_request() {
+        let mut server = Server::new();
+        server.set_accept_policy(AcceptPolicy::Manual);
+        let mut client = LpcClient::new(Direct {
+            server: &mut server,
+            out: [0; 512],
+        });
+        let listen = client
+            .create_port(&utf16("\\Windows\\ApiPort"), 0, 0x148, 0)
+            .unwrap();
+        let retained = client.retain_connection_port(listen).unwrap();
+        let request = port_message(msg_type::LPC_ERROR_EVENT, b"hard-error");
+        let message_id = client
+            .begin_kernel_request_wait_reply(retained, &request, 0x220, 0x224)
+            .unwrap();
+
+        let received = client.reply_wait_receive(listen).unwrap();
+        assert_eq!(received.connection_id, 0);
+        assert_eq!(received.client_process, 0x220);
+        assert_eq!(received.client_thread, 0x224);
+        assert_eq!(received.msg_type, msg_type::LPC_ERROR_EVENT);
+        assert_eq!(
+            u32::from_le_bytes(received.connection_info[24..28].try_into().unwrap()),
+            message_id
+        );
+        let mut reply = received.connection_info;
+        reply[4..6].copy_from_slice(&msg_type::LPC_REPLY.to_le_bytes());
+        assert_eq!(
+            client.reply_wait_receive_with_reply(listen, &reply),
+            Err(NtStatus::PENDING)
+        );
+        assert_eq!(
+            client
+                .receive_reply(retained, 0x220, 0x224, message_id)
+                .unwrap(),
+            Some(reply)
+        );
+        client.close_port(listen).unwrap();
+        client.release_connection_port(retained).unwrap();
+        assert_eq!(server.port_count(), 0);
+    }
+
+    #[test]
+    fn communication_port_preserves_typed_kernel_request() {
+        let mut server = Server::new();
+        server.set_accept_policy(AcceptPolicy::Manual);
+        let mut client = LpcClient::new(Direct {
+            server: &mut server,
+            out: [0; 512],
+        });
+        let listen = client
+            .create_port(&utf16("\\ProcessExceptionPort"), 0, 0x148, 0)
+            .unwrap();
+        let pending = client
+            .connect_port_with_client_id(&utf16("\\ProcessExceptionPort"), 0, &[], 0x330, 0x334)
+            .unwrap();
+        client.reply_wait_receive(listen).unwrap();
+        let server_port = client
+            .accept_connect(pending.connection_id, true, 0x7788)
+            .unwrap();
+        let client_port = client
+            .complete_connect(pending.connection_id)
+            .unwrap()
+            .handle;
+
+        let request = port_message(msg_type::LPC_ERROR_EVENT, b"process-hard-error");
+        let message_id = client
+            .begin_kernel_request_wait_reply(client_port, &request, 0x330, 0x334)
+            .unwrap();
+        let received = client.reply_wait_receive(listen).unwrap();
+        assert_eq!(received.connection_id, pending.connection_id);
+        assert_eq!(received.client_process, 0x330);
+        assert_eq!(received.client_thread, 0x334);
+        assert_eq!(received.msg_type, msg_type::LPC_ERROR_EVENT);
+        assert_eq!(received.port_context, 0x7788);
+        assert_eq!(
+            u32::from_le_bytes(received.connection_info[24..28].try_into().unwrap()),
+            message_id
+        );
+
+        let mut reply = received.connection_info;
+        reply[4..6].copy_from_slice(&msg_type::LPC_REPLY.to_le_bytes());
+        assert_eq!(
+            client.reply_wait_receive_with_reply(listen, &reply),
+            Err(NtStatus::PENDING)
+        );
+        assert_eq!(
+            client
+                .receive_reply(client_port, 0x330, 0x334, message_id)
+                .unwrap(),
+            Some(reply)
+        );
+
+        client.close_port(client_port).unwrap();
+        client.close_port(server_port).unwrap();
+        client.close_port(listen).unwrap();
+        assert_eq!(server.port_count(), 0);
     }
 
     #[test]

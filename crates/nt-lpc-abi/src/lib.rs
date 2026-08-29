@@ -17,7 +17,7 @@
 #![no_std]
 
 /// ABI version. Bump on any incompatible wire change.
-pub const LPC_ABI_VERSION: u32 = 7;
+pub const LPC_ABI_VERSION: u32 = 8;
 
 /// The reserved SURT opcode range for the LPC protocol (fresh block after
 /// object 0x2000 / config 0x2100).
@@ -53,6 +53,13 @@ pub mod opcode {
     // Complete or cancel one synchronous request by its kernel-authored message identity.
     pub const LPC_OP_RECEIVE_REPLY: u16 = 0x220d;
     pub const LPC_OP_CANCEL_REQUEST: u16 = 0x220e;
+
+    // Kernel-held connection-port reference and typed synchronous request plane. These operations
+    // are not exposed as native user services; the executive uses them for facilities such as the
+    // default hard-error port, whose kernel reference survives the registering user handle.
+    pub const LPC_OP_RETAIN_CONNECTION_PORT: u16 = 0x220f;
+    pub const LPC_OP_RELEASE_CONNECTION_PORT: u16 = 0x2210;
+    pub const LPC_OP_KERNEL_REQUEST_WAIT_REPLY: u16 = 0x2211;
 }
 
 /// True if `op` is an LPC opcode.
@@ -68,6 +75,9 @@ pub mod msg_type {
     pub const LPC_DATAGRAM: u16 = 3;
     pub const LPC_PORT_CLOSED: u16 = 5;
     pub const LPC_CLIENT_DIED: u16 = 6;
+    pub const LPC_EXCEPTION: u16 = 7;
+    pub const LPC_DEBUG_EVENT: u16 = 8;
+    pub const LPC_ERROR_EVENT: u16 = 9;
     pub const LPC_CONNECTION_REQUEST: u16 = 10;
     pub const LPC_CONNECTION_REFUSED: u16 = 11;
 }
@@ -486,7 +496,8 @@ pub struct LpcQueryRequestResponse {
     pub _reserved2: u16,
 }
 
-/// `LPC_OP_CLOSE_PORT` — close a port handle.
+/// `LPC_OP_CLOSE_PORT`, `LPC_OP_RETAIN_CONNECTION_PORT`, or
+/// `LPC_OP_RELEASE_CONNECTION_PORT` — identify one port endpoint.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct LpcClosePortRequest {
@@ -798,6 +809,6 @@ mod tests {
 
     #[test]
     fn version_is_current() {
-        assert_eq!(LPC_ABI_VERSION, 7);
+        assert_eq!(LPC_ABI_VERSION, 8);
     }
 }

@@ -1018,6 +1018,21 @@ fn set_thread_execution_state_uses_its_canonical_service_contract() {
 }
 
 #[test]
+fn set_default_hard_error_port_uses_its_canonical_service_contract() {
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtSetDefaultHardErrorPort, 223)],
+    );
+    let entry = table.lookup(223).unwrap();
+    assert_eq!(entry.service, NativeService::NtSetDefaultHardErrorPort);
+    assert_eq!((entry.min_args, entry.max_args), (1, 1));
+    assert_eq!(
+        table.number_of(NativeService::NtSetDefaultHardErrorPort),
+        Some(223)
+    );
+}
+
+#[test]
 fn delay_execution_registers_with_native_abi() {
     let table = NativeServiceTable::from_numbers(
         UserlandAbiProfile::Windows7,

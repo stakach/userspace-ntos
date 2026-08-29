@@ -60,6 +60,7 @@ pub(crate) use device_io::*;
 mod pnp;
 pub(crate) use pnp::*;
 mod power_manager;
+mod hard_error;
 mod hosted_pnp_context;
 pub(crate) use hosted_pnp_context::*;
 mod hosted_pnp_start;
@@ -1191,6 +1192,7 @@ pub const SSN_NT_QUERY_INFORMATION_FILE: u64 = 158;
 pub const SSN_NT_GET_PLUG_PLAY_EVENT: u64 = 91;
 pub const SSN_NT_GET_DEVICE_POWER_STATE: u64 = 90;
 pub const SSN_NT_SET_THREAD_EXECUTION_STATE: u64 = 252;
+pub const SSN_NT_SET_DEFAULT_HARD_ERROR_PORT: u64 = 223;
 pub const SSN_NT_PLUG_PLAY_CONTROL: u64 = 138;
 /// Obsolete event-pair object type imported by legacy shell extensions. No event-pair object
 /// manager type exists here yet, so opens fail as a missing named object.
@@ -21798,6 +21800,13 @@ struct PendingLpcRequestPark {
     reservation: nt_lpc_continuation::Reservation,
     request: nt_lpc_continuation::RequestWaitRequest,
     memory: SyscallUserMemory,
+    completion: LpcRequestCompletion,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LpcRequestCompletion {
+    PortMessage,
+    HardErrorResponse,
 }
 
 /// Full kernel continuation retained until the exact broker reply arrives or the port terminates.
@@ -21807,6 +21816,7 @@ struct LpcRequestContinuation {
     badge: u64,
     tid: u64,
     memory: SyscallUserMemory,
+    completion: LpcRequestCompletion,
     reply_cap: u64,
     reply: nt_syscall_abi::ParkedSyscallReply,
 }
@@ -23925,6 +23935,10 @@ fn build_nt_table() -> NativeServiceTable {
                 SSN_NT_OPEN_THREAD_TOKEN_EX as u32,
             ),
             (NativeService::NtRaiseHardError, 190),
+            (
+                NativeService::NtSetDefaultHardErrorPort,
+                SSN_NT_SET_DEFAULT_HARD_ERROR_PORT as u32,
+            ),
             // Workstream A batch 2 (group A): create-handle + no-op services.
             (NativeService::NtCreatePort, SSN_NT_CREATE_PORT as u32),
             (NativeService::NtCreateThread, SSN_NT_CREATE_THREAD as u32),

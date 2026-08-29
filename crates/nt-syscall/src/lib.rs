@@ -282,6 +282,8 @@ pub enum NativeService {
     NtGetDevicePowerState,
     /// Track persistent and one-shot execution-state assertions for the current thread.
     NtSetThreadExecutionState,
+    /// Register the privileged, one-shot default LPC connection port for hard errors.
+    NtSetDefaultHardErrorPort,
     /// `ExAllocateLocallyUniqueId` (`ntoskrnl/ex/uuid.c:335`) — the monotonic LUID allocator every
     /// logon session identity comes from (`AllocateLocallyUniqueId` in msgina's `MyLogonUser`).
     NtAllocateLocallyUniqueId,
@@ -476,6 +478,7 @@ impl NativeService {
             NtWaitForDebugEvent => "NtWaitForDebugEvent",
             NtGetDevicePowerState => "NtGetDevicePowerState",
             NtSetThreadExecutionState => "NtSetThreadExecutionState",
+            NtSetDefaultHardErrorPort => "NtSetDefaultHardErrorPort",
             NtAllocateLocallyUniqueId => "NtAllocateLocallyUniqueId",
             NtImpersonateClientOfPort => "NtImpersonateClientOfPort",
         }
@@ -677,6 +680,7 @@ impl NativeService {
         NativeService::NtSetInformationDebugObject,
         NativeService::NtGetDevicePowerState,
         NativeService::NtSetThreadExecutionState,
+        NativeService::NtSetDefaultHardErrorPort,
     ];
 }
 

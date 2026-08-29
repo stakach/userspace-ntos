@@ -25514,8 +25514,25 @@ impl ExecNtHandler {
         pi: usize,
         memory: SyscallUserMemory,
         request: nt_lpc_continuation::RequestWaitRequest,
+        completion: LpcRequestCompletion,
         reply: &[u8],
     ) -> u32 {
+        if completion == LpcRequestCompletion::HardErrorResponse {
+            let response = match nt_syscall::hard_error::response_from_reply(reply) {
+                Ok(response) => response,
+                Err(status) => return status,
+            };
+            return if self.lpc_user_memory_write(
+                pi,
+                memory,
+                request.reply_message,
+                &response.to_le_bytes(),
+            ) {
+                nt_syscall::STATUS_SUCCESS
+            } else {
+                STATUS_ACCESS_VIOLATION
+            };
+        }
         if reply.len() < nt_lpc_abi::PORT_MESSAGE_HEADER_LEN
             || nt_lpc_abi::port_message_total_length(reply[..4].try_into().unwrap())
                 != Some(reply.len())
@@ -25584,6 +25601,54 @@ impl ExecNtHandler {
                 message_id,
             },
             memory: self.current_user_memory,
+            completion: LpcRequestCompletion::PortMessage,
+        });
+        self.lpc_endpoint_progress = true;
+        STATUS_PENDING
+    }
+
+    unsafe fn hard_error_request_or_park(
+        &mut self,
+        port_handle: u64,
+        message: &[u8],
+        response: u64,
+    ) -> u32 {
+        let reservation = match crate::service_sec_image::lpc_request_wait_reserve() {
+            Ok(reservation) => reservation,
+            Err(status) => return status,
+        };
+        let Some(client_process) = self.pm_pid_for_pi(self.pi).map(|pid| pid as u64) else {
+            crate::service_sec_image::lpc_request_wait_cancel_reservation(reservation);
+            return nt_process::STATUS_INVALID_HANDLE;
+        };
+        let client_thread = self.current_tid;
+        let Some(lpc) = lpc_client() else {
+            crate::service_sec_image::lpc_request_wait_cancel_reservation(reservation);
+            return STATUS_UNSUCCESSFUL;
+        };
+        let message_id = match lpc.begin_kernel_request_wait_reply(
+            port_handle,
+            message,
+            client_process,
+            client_thread,
+        ) {
+            Ok(message_id) => message_id,
+            Err(status) => {
+                crate::service_sec_image::lpc_request_wait_cancel_reservation(reservation);
+                return status.raw() as u32;
+            }
+        };
+        self.lpc_request_park = Some(PendingLpcRequestPark {
+            reservation,
+            request: nt_lpc_continuation::RequestWaitRequest {
+                port_handle,
+                reply_message: response,
+                client_process,
+                client_thread,
+                message_id,
+            },
+            memory: self.current_user_memory,
+            completion: LpcRequestCompletion::HardErrorResponse,
         });
         self.lpc_endpoint_progress = true;
         STATUS_PENDING
@@ -30834,6 +30899,42 @@ impl ExecNtHandler {
             // before ordinary dispatch. Reaching the handler means this thread has no callback
             // frame to return through.
             NativeService::NtCallbackReturn => nt_syscall::STATUS_NO_CALLBACK_ACTIVE,
+            NativeService::NtSetDefaultHardErrorPort => unsafe {
+                if ctx.previous_mode != nt_syscall::ProcessorMode::KernelMode
+                    && !self.current_token_has_privilege(nt_security::SE_TCB)
+                {
+                    return STATUS_PRIVILEGE_NOT_HELD;
+                }
+                if crate::hard_error::is_ready() {
+                    return STATUS_UNSUCCESSFUL;
+                }
+                let Some(owner_process) = self.pm_pid_for_pi(self.pi).map(|pid| pid as u64) else {
+                    return STATUS_INVALID_HANDLE;
+                };
+                let Some(lpc) = lpc_client() else {
+                    return STATUS_UNSUCCESSFUL;
+                };
+                let metadata = match lpc.query_handle(args[0]) {
+                    Ok(metadata) => metadata,
+                    Err(status) => return status.raw() as u32,
+                };
+                if metadata.endpoint != nt_lpc_abi::handle_endpoint::LISTEN_PORT
+                    || metadata.server_process != owner_process
+                {
+                    return nt_status::NtStatus::INVALID_PORT_HANDLE.raw() as u32;
+                }
+                match crate::hard_error::register(args[0], owner_process) {
+                    Ok(()) => {
+                        print_str(b"[hard-error] registered default LPC port owner=");
+                        print_u64(owner_process);
+                        print_str(b" handle=0x");
+                        print_hex_u64(args[0]);
+                        print_str(b"\n");
+                        nt_syscall::STATUS_SUCCESS
+                    }
+                    Err(status) => status.raw() as u32,
+                }
+            },
             NativeService::NtRaiseHardError => unsafe {
                 use nt_syscall::hard_error::{validate_request, RESPONSE_RETURN_TO_CALLER};
 
@@ -30845,6 +30946,11 @@ impl ExecNtHandler {
                     validate_request(number_of_parameters, parameters != 0, nt_ulong_arg(args[4]))
                 {
                     return status;
+                }
+                if ctx.previous_mode != nt_syscall::ProcessorMode::KernelMode
+                    && (response & 3 != 0 || parameters != 0 && parameters & 7 != 0)
+                {
+                    return STATUS_DATATYPE_MISALIGNMENT;
                 }
                 if response == 0 || !self.probe_user_output(response, 4) {
                     return nt_syscall::STATUS_ACCESS_VIOLATION;
@@ -30864,6 +30970,11 @@ impl ExecNtHandler {
                             continue;
                         }
                         let mut descriptor = [0u8; 16];
+                        if ctx.previous_mode != nt_syscall::ProcessorMode::KernelMode
+                            && captured[i] & 7 != 0
+                        {
+                            return STATUS_DATATYPE_MISALIGNMENT;
+                        }
                         if captured[i] == 0 || !self.xas_read(captured[i], &mut descriptor) {
                             return nt_syscall::STATUS_ACCESS_VIOLATION;
                         }
@@ -30908,12 +31019,87 @@ impl ExecNtHandler {
                 }
                 print_str(b"\n");
 
-                // No executive hard-error LPC port is registered yet. ReactOS' ExpRaiseHardError
-                // returns directly to the caller in that state and reports ResponseReturnToCaller.
                 if !self.xas_write_u32(response, RESPONSE_RETURN_TO_CALLER) {
                     return nt_syscall::STATUS_ACCESS_VIOLATION;
                 }
-                nt_syscall::STATUS_SUCCESS
+
+                let default_registration = crate::hard_error::registration();
+                if args[4] as u32 == nt_syscall::hard_error::OPTION_SHUTDOWN_SYSTEM {
+                    if ctx.previous_mode != nt_syscall::ProcessorMode::KernelMode
+                        && !self.current_token_has_privilege(nt_security::SE_SHUTDOWN)
+                    {
+                        return STATUS_PRIVILEGE_NOT_HELD;
+                    }
+                    crate::hard_error::disable();
+                }
+
+                let error_status = args[0] as u32
+                    & !nt_syscall::hard_error::HARDERROR_OVERRIDE_ERRORMODE;
+                if nt_syscall::hard_error::requires_system_error_handler(
+                    crate::hard_error::is_ready(),
+                    error_status,
+                ) {
+                    self.post_action = ExecPostAction::CriticalTermination {
+                        code: nt_syscall::hard_error::FATAL_UNHANDLED_HARD_ERROR,
+                        object: error_status as u64,
+                    };
+                    return nt_syscall::STATUS_SUCCESS;
+                }
+
+                let Some(pid) = self.pm_pid_for_pi(self.pi) else {
+                    return STATUS_INVALID_HANDLE;
+                };
+                let process_mode = self
+                    .pm
+                    .process_default_hard_error_processing(pid)
+                    .unwrap_or(0);
+                let forced = args[0] as u32
+                    & nt_syscall::hard_error::HARDERROR_OVERRIDE_ERRORMODE
+                    != 0;
+                if process_mode & 1 == 0 && !forced {
+                    return nt_syscall::STATUS_SUCCESS;
+                }
+                let teb_disabled = self
+                    .pm
+                    .thread_teb(self.current_tid as nt_process::ThreadId)
+                    .filter(|teb| *teb != 0)
+                    .is_some_and(|teb| {
+                        let mut mode = [0u8; 4];
+                        self.xas_read(teb + 0x16b0, &mut mode)
+                            && u32::from_le_bytes(mode) & 1 != 0
+                    });
+                if teb_disabled {
+                    return nt_syscall::STATUS_SUCCESS;
+                }
+
+                let process_port = self.pm.process_exception_port(pid).filter(|port| *port != 0);
+                let selected = process_port
+                    .map(|port| (port, None))
+                    .or_else(|| default_registration.map(|(port, owner)| (port, Some(owner))));
+                let Some((port, default_owner)) = selected else {
+                    return nt_syscall::STATUS_SUCCESS;
+                };
+                if default_owner == Some(pid as u64) {
+                    if nt_syscall::hard_error::is_error_status(error_status) {
+                        self.post_action = ExecPostAction::CriticalTermination {
+                            code: nt_syscall::hard_error::FATAL_UNHANDLED_HARD_ERROR,
+                            object: error_status as u64,
+                        };
+                    }
+                    return nt_syscall::STATUS_SUCCESS;
+                }
+                let message = match nt_syscall::hard_error::encode_message(
+                    error_status,
+                    nt_system_time_100ns() as i64,
+                    args[4] as u32,
+                    unicode_mask,
+                    number_of_parameters,
+                    captured,
+                ) {
+                    Ok(message) => message,
+                    Err(status) => return status,
+                };
+                self.hard_error_request_or_park(port, &message, response)
             },
             // NtCreatePort(*PortHandle[R10=args[0]], *ObjectAttributes[RDX=args[1]],
             // MaxConnInfo[R8=args[2]], MaxMsg[R9=args[3]], MaxPool[stack]). Create a REAL named port
