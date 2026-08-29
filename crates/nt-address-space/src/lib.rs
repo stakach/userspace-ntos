@@ -145,6 +145,11 @@ pub const STATUS_INVALID_PARAMETER_4: u32 = 0xC000_00F2;
 pub const STATUS_INVALID_PARAMETER_5: u32 = 0xC000_00F3;
 pub const STATUS_INVALID_PARAMETER_6: u32 = 0xC000_00F4;
 pub const STATUS_NOT_COMMITTED: u32 = 0xC000_002D;
+pub const STATUS_NOT_LOCKED: u32 = 0xC000_002A;
+pub const STATUS_WAS_LOCKED: u32 = 0x4000_0019;
+
+pub const MAP_PROCESS: u32 = 0x1;
+pub const MAP_SYSTEM: u32 = 0x2;
 
 pub const MEM_COMMIT: u32 = 0x1000;
 pub const MEM_RESERVE: u32 = 0x2000;
@@ -485,6 +490,171 @@ impl Iterator for VmResidencyPages {
         let page = self.next;
         self.next += PAGE_SIZE;
         Some(page)
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct VmPageLock {
+    owner: u64,
+    page: u64,
+    classes: u8,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct VmPageLockStats {
+    pub pages: usize,
+    pub capacity: usize,
+    pub process_locks: usize,
+    pub system_locks: usize,
+    pub allocation_failures: u64,
+}
+
+/// The process-address-space lock authority used by `NtLockVirtualMemory` and reclamation.
+pub struct VmPageLockTable {
+    locks: Vec<VmPageLock>,
+    allocation_failures: u64,
+}
+
+impl Default for VmPageLockTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VmPageLockTable {
+    pub const fn new() -> Self {
+        Self {
+            locks: Vec::new(),
+            allocation_failures: 0,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.locks.clear();
+        self.allocation_failures = 0;
+    }
+
+    pub fn validate_map_type(map_type: u32) -> Result<u8, u32> {
+        if map_type == 0 || map_type & !(MAP_PROCESS | MAP_SYSTEM) != 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok(map_type as u8)
+    }
+
+    fn find(&self, owner: u64, page: u64) -> Option<usize> {
+        self.locks
+            .iter()
+            .position(|lock| lock.owner == owner && lock.page == page)
+    }
+
+    /// Add the requested lock classes to every page. The caller must make the entire range resident
+    /// before publishing this mutation.
+    pub fn lock_range(
+        &mut self,
+        owner: u64,
+        range: VmResidencyRangePlan,
+        map_type: u32,
+    ) -> Result<u32, u32> {
+        let classes = Self::validate_map_type(map_type)?;
+        let mut missing = 0usize;
+        let mut was_locked = false;
+        for page in range.pages() {
+            match self.find(owner, page) {
+                Some(index) => was_locked |= self.locks[index].classes & classes != 0,
+                None => missing = missing.saturating_add(1),
+            }
+        }
+        if self.locks.try_reserve(missing).is_err() {
+            self.allocation_failures = self.allocation_failures.saturating_add(1);
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        for page in range.pages() {
+            if let Some(index) = self.find(owner, page) {
+                self.locks[index].classes |= classes;
+            } else {
+                self.locks.push(VmPageLock {
+                    owner,
+                    page,
+                    classes,
+                });
+            }
+        }
+        Ok(if was_locked {
+            STATUS_WAS_LOCKED
+        } else {
+            STATUS_SUCCESS
+        })
+    }
+
+    /// Remove only the requested lock classes. Validation precedes mutation, so a missing page or
+    /// class leaves the complete range unchanged.
+    pub fn unlock_range(
+        &mut self,
+        owner: u64,
+        range: VmResidencyRangePlan,
+        map_type: u32,
+    ) -> Result<(), u32> {
+        let classes = Self::validate_map_type(map_type)?;
+        if range.pages().any(|page| {
+            self.find(owner, page)
+                .is_none_or(|index| self.locks[index].classes & classes != classes)
+        }) {
+            return Err(STATUS_NOT_LOCKED);
+        }
+        for page in range.pages() {
+            let index = self
+                .find(owner, page)
+                .expect("validated page lock disappeared");
+            self.locks[index].classes &= !classes;
+            if self.locks[index].classes == 0 {
+                self.locks.swap_remove(index);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn classes_at(&self, owner: u64, page: u64) -> u32 {
+        self.find(owner, page)
+            .map(|index| self.locks[index].classes as u32)
+            .unwrap_or(0)
+    }
+
+    pub fn is_locked(&self, owner: u64, page: u64) -> bool {
+        self.classes_at(owner, page) != 0
+    }
+
+    pub fn retire_range(&mut self, owner: u64, base: u64, size: u64) -> usize {
+        let Some(end) = base.checked_add(size) else {
+            return 0;
+        };
+        let before = self.locks.len();
+        self.locks
+            .retain(|lock| lock.owner != owner || lock.page < base || lock.page >= end);
+        before - self.locks.len()
+    }
+
+    pub fn retire_owner(&mut self, owner: u64) -> usize {
+        let before = self.locks.len();
+        self.locks.retain(|lock| lock.owner != owner);
+        before - self.locks.len()
+    }
+
+    pub fn stats(&self) -> VmPageLockStats {
+        VmPageLockStats {
+            pages: self.locks.len(),
+            capacity: self.locks.capacity(),
+            process_locks: self
+                .locks
+                .iter()
+                .filter(|lock| lock.classes & MAP_PROCESS as u8 != 0)
+                .count(),
+            system_locks: self
+                .locks
+                .iter()
+                .filter(|lock| lock.classes & MAP_SYSTEM as u8 != 0)
+                .count(),
+            allocation_failures: self.allocation_failures,
+        }
     }
 }
 

@@ -15575,6 +15575,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     then register SSNs 108/276 and exercise real range normalization, privilege, already-locked,
     all-or-nothing unlock, explicit unmap/free, and process-teardown behavior.
 
+    Lock accounting model (2026-08-29, host-tested): `nt-address-space` now owns the growable
+    `VmPageLockTable`, keyed by stable process owner plus page rather than frame-cap aliases. Each
+    page carries independent `MAP_PROCESS` and `MAP_SYSTEM` classes; adding a class across a range
+    reserves all missing storage before mutation, reports native `STATUS_WAS_LOCKED` when any
+    requested class was already present, and still applies the request to every page. Unlock first
+    proves every requested class across the complete range and otherwise returns
+    `STATUS_NOT_LOCKED` without partial mutation. Explicit range release and final process teardown
+    have exact retirement operations, and stats expose pages, each class, capacity, and allocation
+    failures. Focused validation passes `nt-address-space` `60/60` and `git diff --check`.
+
+    Next install this as the executive's single VM lock authority, reject reclamation of a locked
+    page except through the explicit free/unmap path that first retires the corresponding record,
+    retire all records on final process teardown, and then expose the two native services.
+
     The same review rejected taking `NtSetSystemTime` (SSN 251) as an isolated replacement target.
     The system clock is currently an immutable boot epoch plus monotonic counter, while native
     timers and the delay, object, keyed-event, I/O-completion, and driver wait queues retain only the

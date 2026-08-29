@@ -1826,6 +1826,88 @@ fn residency_page_plan_rejects_holes_protection_and_mismatched_queries() {
 }
 
 #[test]
+fn page_lock_table_tracks_independent_process_and_system_classes() {
+    let range = VmResidencyRangePlan::new(0x4100, 0x1800, 0x1_0000).unwrap();
+    let mut locks = VmPageLockTable::new();
+
+    assert_eq!(locks.lock_range(7, range, MAP_PROCESS), Ok(STATUS_SUCCESS));
+    assert_eq!(locks.classes_at(7, 0x4000), MAP_PROCESS);
+    assert_eq!(locks.classes_at(7, 0x5000), MAP_PROCESS);
+    assert_eq!(locks.classes_at(8, 0x4000), 0);
+    assert_eq!(locks.lock_range(7, range, MAP_SYSTEM), Ok(STATUS_SUCCESS));
+    assert_eq!(locks.classes_at(7, 0x4000), MAP_PROCESS | MAP_SYSTEM);
+    assert_eq!(
+        locks.lock_range(7, range, MAP_PROCESS | MAP_SYSTEM),
+        Ok(STATUS_WAS_LOCKED)
+    );
+    assert_eq!(
+        locks.stats(),
+        VmPageLockStats {
+            pages: 2,
+            capacity: locks.stats().capacity,
+            process_locks: 2,
+            system_locks: 2,
+            allocation_failures: 0,
+        }
+    );
+
+    assert_eq!(locks.unlock_range(7, range, MAP_PROCESS), Ok(()));
+    assert_eq!(locks.classes_at(7, 0x4000), MAP_SYSTEM);
+    assert_eq!(locks.unlock_range(7, range, MAP_SYSTEM), Ok(()));
+    assert_eq!(locks.stats().pages, 0);
+}
+
+#[test]
+fn page_lock_table_unlock_is_all_or_nothing() {
+    let first_two = VmResidencyRangePlan::new(0x4000, 0x2000, 0x1_0000).unwrap();
+    let last_two = VmResidencyRangePlan::new(0x5000, 0x2000, 0x1_0000).unwrap();
+    let mut locks = VmPageLockTable::new();
+    assert_eq!(
+        locks.lock_range(9, first_two, MAP_PROCESS),
+        Ok(STATUS_SUCCESS)
+    );
+    assert_eq!(
+        locks.unlock_range(9, last_two, MAP_PROCESS),
+        Err(STATUS_NOT_LOCKED)
+    );
+    assert!(locks.is_locked(9, 0x4000));
+    assert!(locks.is_locked(9, 0x5000));
+    assert!(!locks.is_locked(9, 0x6000));
+
+    assert_eq!(
+        locks.unlock_range(9, first_two, MAP_SYSTEM),
+        Err(STATUS_NOT_LOCKED)
+    );
+    assert_eq!(locks.classes_at(9, 0x4000), MAP_PROCESS);
+    assert_eq!(
+        VmPageLockTable::validate_map_type(0),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        VmPageLockTable::validate_map_type(4),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+}
+
+#[test]
+fn page_lock_table_retires_explicit_ranges_and_processes() {
+    let three = VmResidencyRangePlan::new(0x4000, 0x3000, 0x1_0000).unwrap();
+    let mut locks = VmPageLockTable::new();
+    locks.lock_range(10, three, MAP_PROCESS).unwrap();
+    locks.lock_range(11, three, MAP_SYSTEM).unwrap();
+
+    assert_eq!(locks.retire_range(10, 0x5000, 0x1000), 1);
+    assert!(locks.is_locked(10, 0x4000));
+    assert!(!locks.is_locked(10, 0x5000));
+    assert!(locks.is_locked(10, 0x6000));
+    assert_eq!(locks.retire_owner(10), 2);
+    assert_eq!(locks.retire_owner(10), 0);
+    assert_eq!(locks.stats().pages, 3);
+    assert_eq!(locks.retire_owner(11), 3);
+    assert_eq!(locks.stats().pages, 0);
+}
+
+#[test]
 fn mapped_view_fault_access_denies_protection_violations_before_mapping() {
     assert_eq!(
         mapped_view_fault_access_status(PAGE_READONLY, FaultAccess::Read),
