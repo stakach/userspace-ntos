@@ -3129,10 +3129,7 @@ impl ExecNtHandler {
         write_field!(csr_rendezvous_out, 0);
         write_field!(csr_rendezvous_conn_info, 0);
         write_field!(csr_rendezvous_conn_info_len, 0);
-        write_field!(csr_rendezvous_client_view, 0);
-        write_field!(csr_rendezvous_section, 0);
-        write_field!(csr_rendezvous_section_offset, 0);
-        write_field!(csr_rendezvous_view_size, 0);
+        write_field!(pending_lpc_connection_view, None);
         write_field!(lpc_connections, alloc::vec::Vec::with_capacity(16));
         write_field!(pm, pm);
         write_field!(process_mechanisms, ExecProcessMechanisms::reset());
@@ -24939,31 +24936,30 @@ impl ExecNtHandler {
         Ok((plan.base, plan.size))
     }
 
-    pub(crate) unsafe fn map_csr_port_views(
+    pub(crate) unsafe fn map_lpc_connection_views(
         &mut self,
+        client_pi: usize,
         server_pi: usize,
     ) -> Result<(u64, u64, u64), u32> {
-        let section_index = self
-            .csr_rendezvous_section
-            .checked_sub(1)
-            .ok_or(nt_fs::STATUS_INVALID_HANDLE)? as usize;
-        let client_pi = self.pi;
+        let pending = self
+            .pending_lpc_connection_view
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
         let (server_base, server_size) = self.map_generic_section_view_internal(
-            section_index,
+            pending.section_index,
             server_pi,
             0,
-            self.csr_rendezvous_view_size,
-            self.csr_rendezvous_section_offset,
+            pending.view_size,
+            pending.section_offset,
             0,
             0,
             nt_address_space::PAGE_READWRITE,
         )?;
         let (client_base, client_size) = match self.map_generic_section_view_internal(
-            section_index,
+            pending.section_index,
             client_pi,
             0,
-            self.csr_rendezvous_view_size,
-            self.csr_rendezvous_section_offset,
+            pending.view_size,
+            pending.section_offset,
             0,
             0,
             nt_address_space::PAGE_READWRITE,
@@ -24979,7 +24975,7 @@ impl ExecNtHandler {
             self.rollback_generic_section_view(server_pi, server_base);
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let view = self.csr_rendezvous_client_view;
+        let view = pending.client_view;
         if view == 0
             || !self.xas_write_u64(view + 0x18, client_size)
             || !self.xas_write_u64(view + 0x20, client_base)
@@ -24994,7 +24990,7 @@ impl ExecNtHandler {
         print_str(b" server-pi=");
         print_u64(server_pi as u64);
         print_str(b" section=");
-        print_u64(section_index as u64);
+        print_u64(pending.section_index as u64);
         print_str(b" client=0x");
         print_hex((client_base >> 32) as u32);
         print_hex(client_base as u32);
@@ -25033,6 +25029,70 @@ impl ExecNtHandler {
         let _ = generic_sections.unmap_view(pi, view.base);
     }
 
+    unsafe fn validate_secure_lpc_connect(
+        &mut self,
+        listen_handle: u64,
+        qos_pointer: u64,
+        server_sid_pointer: u64,
+    ) -> Result<(), u32> {
+        const QOS_SIZE: usize = 12;
+        if qos_pointer & 3 != 0 {
+            return Err(STATUS_DATATYPE_MISALIGNMENT);
+        }
+        if qos_pointer == 0 {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let mut qos = [0u8; QOS_SIZE];
+        if !self.xas_read(qos_pointer, &mut qos) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+
+        let mut server_sid = [0u8; 68];
+        let server_sid = if server_sid_pointer == 0 {
+            None
+        } else {
+            let mut header = [0u8; 8];
+            if !self.xas_read(server_sid_pointer, &mut header) {
+                return Err(STATUS_ACCESS_VIOLATION);
+            }
+            let length = 8usize
+                .checked_add(
+                    (header[1] as usize)
+                        .checked_mul(4)
+                        .ok_or(STATUS_INVALID_PARAMETER)?,
+                )
+                .filter(|&length| length <= server_sid.len())
+                .ok_or(nt_security::STATUS_INVALID_SID)?;
+            server_sid[..8].copy_from_slice(&header);
+            if length > 8 && !self.xas_read(server_sid_pointer + 8, &mut server_sid[8..length]) {
+                return Err(STATUS_ACCESS_VIOLATION);
+            }
+            Some(&server_sid[..length])
+        };
+
+        let port = lpc_client()
+            .and_then(|client| client.query_handle(listen_handle).ok())
+            .filter(|port| port.endpoint == nt_lpc_abi::handle_endpoint::LISTEN_PORT)
+            .ok_or(0xC000_0042u32)?;
+        let server_token = u32::try_from(port.server_process)
+            .ok()
+            .and_then(|pid| self.pm.process_primary_token(pid))
+            .and_then(|token| self.token_store.get(token));
+        let security = nt_security::validate_secure_port_connect(&qos, server_sid, server_token)?;
+        print_str(b"[lpc-secure] server-pid=");
+        print_u64(port.server_process);
+        print_str(b" server-tid=");
+        print_u64(port.server_thread);
+        print_str(b" required-sid=");
+        print_u64(security.required_server_sid.is_some() as u64);
+        print_str(b" impersonation-level=");
+        print_u64(security.qos.impersonation_level as u64);
+        print_str(b" effective-only=");
+        print_u64(security.qos.effective_only as u64);
+        print_str(b"\n");
+        Ok(())
+    }
+
     /// Service a Win32 process' kernel32 CSR client connect (NtSecureConnectPort → \Windows\ApiPort).
     ///
     /// csrss owns \Windows\ApiPort and pending connects are completed by the real
@@ -25045,7 +25105,10 @@ impl ExecNtHandler {
         &mut self,
         name16: &[u16],
         porthandle_ptr: u64,
+        qos_pointer: u64,
         clientview_ptr: u64,
+        server_sid_pointer: u64,
+        serverview_ptr: u64,
         conninfo_ptr: u64,
         conninfo_len_ptr: u64,
     ) -> u32 {
@@ -25059,10 +25122,25 @@ impl ExecNtHandler {
             CSR_RENDEZVOUS_FAILURES.fetch_add(1, Ordering::Relaxed);
             return 0xC000_0001;
         }
-        if self.lpc_port_handle_for_name16(name16).is_none() {
+        let Some(listen_handle) = self.lpc_port_handle_for_name16(name16) else {
             print_str(b"[csr] NtSecureConnectPort(\\Windows\\ApiPort) has no named port object -> failing\n");
             CSR_RENDEZVOUS_FAILURES.fetch_add(1, Ordering::Relaxed);
             return 0xC000_0034;
+        };
+        if let Err(status) =
+            self.validate_secure_lpc_connect(listen_handle, qos_pointer, server_sid_pointer)
+        {
+            return status;
+        }
+        if serverview_ptr != 0 {
+            let mut server_view = [0u8; 0x18];
+            if !self.xas_read(serverview_ptr, &mut server_view) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            if u32::from_le_bytes(server_view[0..4].try_into().unwrap()) != server_view.len() as u32
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
         }
         const SECTION_MAP_WRITE: u32 = 0x0002;
         const SECTION_MAP_READ: u32 = 0x0004;
@@ -25142,10 +25220,12 @@ impl ExecNtHandler {
                     self.csr_rendezvous_out = porthandle_ptr;
                     self.csr_rendezvous_conn_info = conninfo_ptr;
                     self.csr_rendezvous_conn_info_len = conninfo_len_ptr;
-                    self.csr_rendezvous_client_view = clientview_ptr;
-                    self.csr_rendezvous_section = section_index as u64 + 1;
-                    self.csr_rendezvous_section_offset = section_offset;
-                    self.csr_rendezvous_view_size = view_size;
+                    self.pending_lpc_connection_view = Some(PendingLpcConnectionView {
+                        client_view: clientview_ptr,
+                        section_index,
+                        section_offset,
+                        view_size,
+                    });
                     pending = true;
                 }
                 Ok(r) => {
@@ -29754,11 +29834,16 @@ impl ExecNtHandler {
                     print_u64(args[3]);
                     print_str(b"\n");
                 }
-                let handle = match client.create_port(
+                let Some(server_process) = self.pm_pid_for_pi(self.pi) else {
+                    return nt_process::STATUS_INVALID_HANDLE;
+                };
+                let handle = match client.create_port_with_owner(
                     &name16,
                     nt_ulong_arg(args[2]),
                     nt_ulong_arg(args[3]),
                     0,
+                    server_process as u64,
+                    self.current_tid,
                 ) {
                     Ok(handle) if handle != 0 => {
                         if trace < 32 {
@@ -30186,7 +30271,10 @@ impl ExecNtHandler {
                 self.csr_client_connect(
                     &name16,
                     porthandle_ptr,
+                    args[2],
                     clientview_ptr,
+                    args[4],
+                    args[5],
                     conninfo_ptr,
                     conninfo_len_ptr,
                 )

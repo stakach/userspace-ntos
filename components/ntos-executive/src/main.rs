@@ -21553,6 +21553,17 @@ impl PendingWaitTimeout {
     }
 }
 
+/// Kernel-owned state for one client-supplied LPC connection section while the accepting server
+/// decides the request. The section handle has already been resolved in the connector's process;
+/// only the generic section identity and native `PORT_VIEW` output address survive the park.
+#[derive(Clone, Copy)]
+struct PendingLpcConnectionView {
+    client_view: u64,
+    section_index: usize,
+    section_offset: u64,
+    view_size: u64,
+}
+
 struct ExecNtHandler {
     /// The REAL ReactOS SYSTEM hive (root = \Registry\Machine\System), parsed read-only by
     /// borrowing the regf bytes the storage host read off the disk into HIVEBUF (no 204 KiB copy —
@@ -21845,10 +21856,7 @@ struct ExecNtHandler {
     csr_rendezvous_out: u64,
     csr_rendezvous_conn_info: u64,
     csr_rendezvous_conn_info_len: u64,
-    csr_rendezvous_client_view: u64,
-    csr_rendezvous_section: u64,
-    csr_rendezvous_section_offset: u64,
-    csr_rendezvous_view_size: u64,
+    pending_lpc_connection_view: Option<PendingLpcConnectionView>,
     /// The DATA-plane cache of established LPC connections (control/data-plane split): the isolated
     /// nt-lpc-server owns the namespace + rendezvous, but is NOT on the message path. When a CONNECT
     /// completes through the server, the executive records the connection here so the future message

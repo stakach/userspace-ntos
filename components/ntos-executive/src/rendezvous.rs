@@ -3316,7 +3316,7 @@ pub(crate) unsafe fn csr_rendezvous(
                             break;
                         };
                         if requested_accept {
-                            match nt_handler.map_csr_port_views(server_pi) {
+                            match nt_handler.map_lpc_connection_views(nt_handler.pi, server_pi) {
                                 Ok((client_base, server_base, view_size)) => {
                                     let remote_view = csr_stack_read(sp + 0x30).unwrap_or(0);
                                     let remote_view_length = csr_stack_read(remote_view)

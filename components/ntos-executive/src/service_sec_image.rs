@@ -9162,10 +9162,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.csr_rendezvous_out = 0;
                 nt_handler.csr_rendezvous_conn_info = 0;
                 nt_handler.csr_rendezvous_conn_info_len = 0;
-                nt_handler.csr_rendezvous_client_view = 0;
-                nt_handler.csr_rendezvous_section = 0;
-                nt_handler.csr_rendezvous_section_offset = 0;
-                nt_handler.csr_rendezvous_view_size = 0;
+                nt_handler.pending_lpc_connection_view = None;
                 // Group-C handlers reach the loop's section/registry/demand-fill state through this
                 // ctx of raw refs (rebuilt each iteration at the current loop locals).
                 nt_handler.loop_ctx = Some(ExecLoopCtx {
