@@ -95,6 +95,161 @@ pub const PORT_MESSAGE_MAX_LEN: usize = 512;
 /// Native x64 `CLIENT_DIED_MSG`: one `PORT_MESSAGE` followed by the thread create time.
 pub const CLIENT_DIED_MESSAGE_LEN: usize = PORT_MESSAGE_HEADER_LEN + core::mem::size_of::<i64>();
 
+/// Native x64 `PORT_VIEW` size.
+pub const PORT_VIEW_LEN: usize = 0x30;
+/// Native x64 `REMOTE_PORT_VIEW` size.
+pub const REMOTE_PORT_VIEW_LEN: usize = 0x18;
+
+/// Kernel-captured input fields from a native x64 `PORT_VIEW`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PortViewCapture {
+    pub section_handle: u64,
+    pub section_offset: u64,
+    pub view_size: u64,
+}
+
+/// Bases produced after one offered section is mapped into its owner and peer processes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MappedPortView {
+    pub owner_base: u64,
+    pub peer_base: u64,
+    pub view_size: u64,
+}
+
+/// Native result fields for a full `PORT_VIEW`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PortViewResult {
+    pub view_size: u64,
+    pub view_base: u64,
+    pub view_remote_base: u64,
+}
+
+/// Native result fields for a `REMOTE_PORT_VIEW`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RemotePortViewResult {
+    pub view_size: u64,
+    pub view_base: u64,
+}
+
+/// Results returned to the two participants after both independently optional views are mapped.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConnectionViewResults {
+    pub connector_view: Option<PortViewResult>,
+    pub acceptor_client_view: Option<RemotePortViewResult>,
+    pub acceptor_view: Option<PortViewResult>,
+    pub connector_server_view: Option<RemotePortViewResult>,
+}
+
+/// Associate owner and peer bases with the four native LPC view outputs.
+pub const fn connection_view_results(
+    connector_offered: Option<MappedPortView>,
+    acceptor_offered: Option<MappedPortView>,
+) -> ConnectionViewResults {
+    let (connector_view, acceptor_client_view) = match connector_offered {
+        Some(mapped) => (
+            Some(PortViewResult {
+                view_size: mapped.view_size,
+                view_base: mapped.owner_base,
+                view_remote_base: mapped.peer_base,
+            }),
+            Some(RemotePortViewResult {
+                view_size: mapped.view_size,
+                view_base: mapped.peer_base,
+            }),
+        ),
+        None => (None, None),
+    };
+    let (acceptor_view, connector_server_view) = match acceptor_offered {
+        Some(mapped) => (
+            Some(PortViewResult {
+                view_size: mapped.view_size,
+                view_base: mapped.owner_base,
+                view_remote_base: mapped.peer_base,
+            }),
+            Some(RemotePortViewResult {
+                view_size: mapped.view_size,
+                view_base: mapped.peer_base,
+            }),
+        ),
+        None => (None, None),
+    };
+    ConnectionViewResults {
+        connector_view,
+        acceptor_client_view,
+        acceptor_view,
+        connector_server_view,
+    }
+}
+
+/// Structural or section-geometry failure while capturing a native LPC view.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PortViewError {
+    InvalidLength,
+    MisalignedSectionOffset,
+    ViewOutsideSection,
+}
+
+/// Capture and validate the pointer-free fields of a native x64 `PORT_VIEW`.
+///
+/// Handle lookup and access checks remain kernel responsibilities. This helper validates the
+/// fixed native layout and the geometry after the kernel has resolved the referenced section.
+pub fn capture_port_view(
+    bytes: &[u8; PORT_VIEW_LEN],
+    section_size: u64,
+) -> Result<PortViewCapture, PortViewError> {
+    if u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != PORT_VIEW_LEN as u32 {
+        return Err(PortViewError::InvalidLength);
+    }
+    let section_offset = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as u64;
+    let requested_size = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+    if section_offset & 0xfff != 0 {
+        return Err(PortViewError::MisalignedSectionOffset);
+    }
+    if section_offset >= section_size {
+        return Err(PortViewError::ViewOutsideSection);
+    }
+    let remaining = section_size - section_offset;
+    let view_size = if requested_size == 0 {
+        remaining
+    } else if requested_size <= remaining {
+        requested_size
+    } else {
+        return Err(PortViewError::ViewOutsideSection);
+    };
+    Ok(PortViewCapture {
+        section_handle: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+        section_offset,
+        view_size,
+    })
+}
+
+/// Validate the caller-initialized header of a native x64 `REMOTE_PORT_VIEW` output.
+pub fn validate_remote_port_view(bytes: &[u8; REMOTE_PORT_VIEW_LEN]) -> bool {
+    u32::from_le_bytes(bytes[0..4].try_into().unwrap()) == REMOTE_PORT_VIEW_LEN as u32
+}
+
+/// Publish the mapping result fields in a captured native x64 `PORT_VIEW`.
+pub fn publish_port_view(
+    bytes: &mut [u8; PORT_VIEW_LEN],
+    view_size: u64,
+    view_base: u64,
+    view_remote_base: u64,
+) {
+    bytes[24..32].copy_from_slice(&view_size.to_le_bytes());
+    bytes[32..40].copy_from_slice(&view_base.to_le_bytes());
+    bytes[40..48].copy_from_slice(&view_remote_base.to_le_bytes());
+}
+
+/// Publish the mapping result fields in a native x64 `REMOTE_PORT_VIEW`.
+pub fn publish_remote_port_view(
+    bytes: &mut [u8; REMOTE_PORT_VIEW_LEN],
+    view_size: u64,
+    view_base: u64,
+) {
+    bytes[8..16].copy_from_slice(&view_size.to_le_bytes());
+    bytes[16..24].copy_from_slice(&view_base.to_le_bytes());
+}
+
 /// Validate the length pair at the start of a native x64 `PORT_MESSAGE` and return the complete
 /// message length. `DataLength` may leave alignment padding before `TotalLength`, but it may not
 /// extend past the captured message.
@@ -424,6 +579,135 @@ mod tests {
         assert_eq!(
             i64::from_le_bytes(message[PORT_MESSAGE_HEADER_LEN..].try_into().unwrap()),
             create_time
+        );
+    }
+
+    #[test]
+    fn native_port_view_capture_validates_layout_and_section_geometry() {
+        let mut bytes = [0u8; PORT_VIEW_LEN];
+        bytes[0..4].copy_from_slice(&(PORT_VIEW_LEN as u32).to_le_bytes());
+        bytes[8..16].copy_from_slice(&0x44_u64.to_le_bytes());
+        bytes[16..20].copy_from_slice(&0x2000_u32.to_le_bytes());
+        bytes[24..32].copy_from_slice(&0x3000_u64.to_le_bytes());
+        assert_eq!(
+            capture_port_view(&bytes, 0x8000),
+            Ok(PortViewCapture {
+                section_handle: 0x44,
+                section_offset: 0x2000,
+                view_size: 0x3000,
+            })
+        );
+
+        bytes[0..4].copy_from_slice(&0x28_u32.to_le_bytes());
+        assert_eq!(
+            capture_port_view(&bytes, 0x8000),
+            Err(PortViewError::InvalidLength)
+        );
+        bytes[0..4].copy_from_slice(&(PORT_VIEW_LEN as u32).to_le_bytes());
+        bytes[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        assert_eq!(
+            capture_port_view(&bytes, 0x8000),
+            Err(PortViewError::MisalignedSectionOffset)
+        );
+        bytes[16..20].copy_from_slice(&0x2000_u32.to_le_bytes());
+        bytes[24..32].copy_from_slice(&0_u64.to_le_bytes());
+        assert_eq!(
+            capture_port_view(&bytes, 0x8000),
+            Ok(PortViewCapture {
+                section_handle: 0x44,
+                section_offset: 0x2000,
+                view_size: 0x6000,
+            })
+        );
+        bytes[24..32].copy_from_slice(&0x7000_u64.to_le_bytes());
+        assert_eq!(
+            capture_port_view(&bytes, 0x8000),
+            Err(PortViewError::ViewOutsideSection)
+        );
+    }
+
+    #[test]
+    fn native_port_view_results_update_only_output_fields() {
+        let mut port = [0x5a; PORT_VIEW_LEN];
+        publish_port_view(&mut port, 0x4000, 0x1000_0000, 0x2000_0000);
+        assert!(port[..24].iter().all(|byte| *byte == 0x5a));
+        assert_eq!(u64::from_le_bytes(port[24..32].try_into().unwrap()), 0x4000);
+        assert_eq!(
+            u64::from_le_bytes(port[32..40].try_into().unwrap()),
+            0x1000_0000
+        );
+        assert_eq!(
+            u64::from_le_bytes(port[40..48].try_into().unwrap()),
+            0x2000_0000
+        );
+
+        let mut remote = [0x6b; REMOTE_PORT_VIEW_LEN];
+        remote[0..4].copy_from_slice(&(REMOTE_PORT_VIEW_LEN as u32).to_le_bytes());
+        assert!(validate_remote_port_view(&remote));
+        publish_remote_port_view(&mut remote, 0x5000, 0x3000_0000);
+        assert_eq!(
+            &remote[..8],
+            &[REMOTE_PORT_VIEW_LEN as u8, 0, 0, 0, 0x6b, 0x6b, 0x6b, 0x6b,]
+        );
+        assert_eq!(
+            u64::from_le_bytes(remote[8..16].try_into().unwrap()),
+            0x5000
+        );
+        assert_eq!(
+            u64::from_le_bytes(remote[16..24].try_into().unwrap()),
+            0x3000_0000
+        );
+        remote[0] = 0;
+        assert!(!validate_remote_port_view(&remote));
+    }
+
+    #[test]
+    fn bidirectional_connection_views_preserve_owner_and_peer_orientation() {
+        let results = connection_view_results(
+            Some(MappedPortView {
+                owner_base: 0x1000_0000,
+                peer_base: 0x2000_0000,
+                view_size: 0x4000,
+            }),
+            Some(MappedPortView {
+                owner_base: 0x3000_0000,
+                peer_base: 0x4000_0000,
+                view_size: 0x8000,
+            }),
+        );
+        assert_eq!(
+            results.connector_view,
+            Some(PortViewResult {
+                view_size: 0x4000,
+                view_base: 0x1000_0000,
+                view_remote_base: 0x2000_0000,
+            })
+        );
+        assert_eq!(
+            results.acceptor_client_view,
+            Some(RemotePortViewResult {
+                view_size: 0x4000,
+                view_base: 0x2000_0000,
+            })
+        );
+        assert_eq!(
+            results.acceptor_view,
+            Some(PortViewResult {
+                view_size: 0x8000,
+                view_base: 0x3000_0000,
+                view_remote_base: 0x4000_0000,
+            })
+        );
+        assert_eq!(
+            results.connector_server_view,
+            Some(RemotePortViewResult {
+                view_size: 0x8000,
+                view_base: 0x4000_0000,
+            })
+        );
+        assert_eq!(
+            connection_view_results(None, None),
+            ConnectionViewResults::default()
         );
     }
 

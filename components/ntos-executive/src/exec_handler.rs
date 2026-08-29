@@ -3129,7 +3129,7 @@ impl ExecNtHandler {
         write_field!(csr_rendezvous_out, 0);
         write_field!(csr_rendezvous_conn_info, 0);
         write_field!(csr_rendezvous_conn_info_len, 0);
-        write_field!(pending_lpc_connection_view, None);
+        write_field!(lpc_connection_views, alloc::vec::Vec::with_capacity(32));
         write_field!(lpc_connections, alloc::vec::Vec::with_capacity(16));
         write_field!(pm, pm);
         write_field!(process_mechanisms, ExecProcessMechanisms::reset());
@@ -19135,14 +19135,9 @@ impl ExecNtHandler {
         let client_thread = u64::from_le_bytes(header[16..24].try_into().unwrap());
         let message_id = u32::from_le_bytes(header[24..28].try_into().unwrap());
 
-        let request = match lpc_client().map(|client| {
-            client.query_request(
-                args[0],
-                client_process,
-                client_thread,
-                message_id,
-            )
-        }) {
+        let request = match lpc_client()
+            .map(|client| client.query_request(args[0], client_process, client_thread, message_id))
+        {
             Some(Ok(request)) => request,
             Some(Err(status)) => return status.raw() as u32,
             None => return STATUS_UNSUCCESSFUL,
@@ -19152,17 +19147,12 @@ impl ExecNtHandler {
             dynamic_tracking: request.dynamic_tracking,
             effective_only: request.effective_only,
         };
-        let Some(connection) = self
-            .lpc_connections
-            .iter()
-            .copied()
-            .find(|connection| {
-                connection.connection_id == request.connection_id
-                    && connection.client_process == request.client_process
-                    && connection.client_thread == request.client_thread
-                    && connection.security == security
-            })
-        else {
+        let Some(connection) = self.lpc_connections.iter().copied().find(|connection| {
+            connection.connection_id == request.connection_id
+                && connection.client_process == request.client_process
+                && connection.client_thread == request.client_thread
+                && connection.security == security
+        }) else {
             return nt_status::NtStatus::REPLY_MESSAGE_MISMATCH.raw() as u32;
         };
 
@@ -24590,7 +24580,8 @@ impl ExecNtHandler {
             connection.client_thread = metadata.client_thread;
             connection.limits = limits;
             connection.security = security;
-            let replaced_static = core::mem::replace(&mut connection.static_security, static_security);
+            let replaced_static =
+                core::mem::replace(&mut connection.static_security, static_security);
             let n = name.len().min(connection.name.len());
             connection.name = [0; 32];
             connection.name[..n].copy_from_slice(&name[..n]);
@@ -24704,6 +24695,9 @@ impl ExecNtHandler {
             .close_port(handle)
             .map_err(|status| status.raw() as u32)?;
         let _ = client;
+        if metadata.connection_id != 0 {
+            unsafe { self.abort_lpc_connection_views(metadata.connection_id) };
+        }
         if let Some(index) = self.lpc_connections.iter().position(|connection| {
             connection.client_handle == handle && connection.connector_pi as usize == self.pi
         }) {
@@ -24843,12 +24837,24 @@ impl ExecNtHandler {
                 return status.raw() as u32;
             }
         };
+        if let Err(status) = self.stage_lpc_connection_views(
+            connect.connection_id,
+            self.pi,
+            SyscallUserMemory::CurrentProcess,
+            None,
+            None,
+        ) {
+            let _ = lpc.accept_connect(connect.connection_id, false, 0);
+            return status;
+        }
 
         match lpc.reply_wait_receive(listen_handle) {
             Ok(received)
                 if received.connection_id == connect.connection_id
                     && received.msg_type == nt_lpc_client::LPC_CONNECTION_REQUEST => {}
             Ok(received) => {
+                self.abort_lpc_connection_views(connect.connection_id);
+                let _ = lpc.accept_connect(connect.connection_id, false, 0);
                 print_str(b"[srm-rdv] broker receive returned unexpected conn=");
                 print_u64(received.connection_id);
                 print_str(b" type=");
@@ -24857,6 +24863,8 @@ impl ExecNtHandler {
                 return STATUS_UNSUCCESSFUL;
             }
             Err(status) => {
+                self.abort_lpc_connection_views(connect.connection_id);
+                let _ = lpc.accept_connect(connect.connection_id, false, 0);
                 print_str(b"[srm-rdv] broker receive failed status=0x");
                 print_hex(status.raw() as u32);
                 print_str(b"\n");
@@ -24867,26 +24875,46 @@ impl ExecNtHandler {
         let server_handle = match lpc.accept_connect(connect.connection_id, true, 0) {
             Ok(handle) if handle != 0 => handle,
             Ok(_) => {
+                self.abort_lpc_connection_views(connect.connection_id);
                 print_str(
                     b"[srm-rdv] broker accepted \\SeRmCommandPort with a null server handle\n",
                 );
                 return STATUS_UNSUCCESSFUL;
             }
             Err(status) => {
+                self.abort_lpc_connection_views(connect.connection_id);
                 print_str(b"[srm-rdv] broker accept failed status=0x");
                 print_hex(status.raw() as u32);
                 print_str(b"\n");
                 return status.raw() as u32;
             }
         };
+        if let Err(status) = self.accept_lpc_connection_views(
+            connect.connection_id,
+            0,
+            SyscallUserMemory::SmProcess,
+            0,
+            0,
+        ) {
+            let _ = lpc.close_port(server_handle);
+            self.abort_lpc_connection_views(connect.connection_id);
+            return status;
+        }
 
         let client_handle = match lpc.complete_connect(connect.connection_id) {
             Ok(completed)
                 if completed.handle != 0 && completed.connection_id == connect.connection_id =>
             {
+                if let Err(status) = self.complete_lpc_connection_views(connect.connection_id) {
+                    let _ = lpc.close_port(completed.handle);
+                    let _ = lpc.close_port(server_handle);
+                    return status;
+                }
                 completed.handle
             }
             Ok(completed) => {
+                self.abort_lpc_connection_views(connect.connection_id);
+                let _ = lpc.close_port(server_handle);
                 print_str(b"[srm-rdv] broker complete returned client=0x");
                 print_hex((completed.handle >> 32) as u32);
                 print_hex(completed.handle as u32);
@@ -24896,6 +24924,8 @@ impl ExecNtHandler {
                 return STATUS_UNSUCCESSFUL;
             }
             Err(status) => {
+                self.abort_lpc_connection_views(connect.connection_id);
+                let _ = lpc.close_port(server_handle);
                 print_str(b"[srm-rdv] broker complete failed status=0x");
                 print_hex(status.raw() as u32);
                 print_str(b"\n");
@@ -24930,6 +24960,16 @@ impl ExecNtHandler {
             true,
         ) {
             Ok(reverse) if reverse.pending && reverse.connection_id != 0 => {
+                if let Err(status) = self.stage_lpc_connection_views(
+                    reverse.connection_id,
+                    0,
+                    SyscallUserMemory::SmProcess,
+                    None,
+                    None,
+                ) {
+                    let _ = lpc.accept_connect(reverse.connection_id, false, 0);
+                    return status;
+                }
                 print_str(b"[srm-rdv] kernel SRM queued \\SeLsaCommandPort reverse connect conn=");
                 print_u64(reverse.connection_id);
                 print_str(b"\n");
@@ -25060,8 +25100,8 @@ impl ExecNtHandler {
         if !self.user_memory_read(memory, message, &mut header) {
             return Err(STATUS_ACCESS_VIOLATION);
         }
-        let total = nt_lpc_abi::port_message_total_length(header)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
+        let total =
+            nt_lpc_abi::port_message_total_length(header).ok_or(STATUS_INVALID_PARAMETER)?;
         let mut bytes = alloc::vec![0u8; total];
         if !self.user_memory_read(memory, message, &mut bytes) {
             return Err(STATUS_ACCESS_VIOLATION);
@@ -25133,12 +25173,11 @@ impl ExecNtHandler {
         receive_message: u64,
         listen_only: bool,
     ) -> u32 {
-        let reply = match self
-            .lpc_capture_port_message(SyscallUserMemory::CurrentProcess, reply_message)
-        {
-            Ok(reply) => reply,
-            Err(status) => return status,
-        };
+        let reply =
+            match self.lpc_capture_port_message(SyscallUserMemory::CurrentProcess, reply_message) {
+                Ok(reply) => reply,
+                Err(status) => return status,
+            };
         let Some(lpc) = lpc_client() else {
             return STATUS_UNSUCCESSFUL;
         };
@@ -25305,71 +25344,401 @@ impl ExecNtHandler {
         Ok((plan.base, plan.size))
     }
 
-    pub(crate) unsafe fn map_lpc_connection_views(
+    unsafe fn lpc_user_memory_read(
+        &self,
+        pi: usize,
+        memory: SyscallUserMemory,
+        va: u64,
+        dst: &mut [u8],
+    ) -> bool {
+        match memory {
+            SyscallUserMemory::SmProcess | SyscallUserMemory::CsrProcess { .. } => {
+                self.hosted_server_memory_read(memory, va, dst)
+            }
+            SyscallUserMemory::CurrentProcess if pi == self.pi => self.xas_read(va, dst),
+            SyscallUserMemory::CurrentProcess => {
+                let Some(ctx) = self.loop_ctx else {
+                    return false;
+                };
+                let procs = &*ctx.procs;
+                let filled = &*ctx.pfilled;
+                pi < MAX_PI
+                    && client_copyin_process_mapped(
+                        pi as u64,
+                        va,
+                        dst,
+                        &filled[pi],
+                        procs[pi].faults as usize,
+                        procs[pi].scratch_base,
+                        false,
+                    )
+            }
+        }
+    }
+
+    unsafe fn lpc_user_memory_write(
+        &self,
+        pi: usize,
+        memory: SyscallUserMemory,
+        va: u64,
+        src: &[u8],
+    ) -> bool {
+        match memory {
+            SyscallUserMemory::SmProcess | SyscallUserMemory::CsrProcess { .. } => {
+                self.hosted_server_memory_write(memory, va, src)
+            }
+            SyscallUserMemory::CurrentProcess if pi == self.pi => self.xas_try_write_buf(va, src),
+            SyscallUserMemory::CurrentProcess => {
+                let Some(ctx) = self.loop_ctx else {
+                    return false;
+                };
+                let procs = &*ctx.procs;
+                let filled = &*ctx.pfilled;
+                pi < MAX_PI
+                    && client_copyout_mapped(
+                        pi as u64,
+                        va,
+                        src,
+                        &filled[pi],
+                        procs[pi].faults as usize,
+                        procs[pi].scratch_base,
+                    )
+            }
+        }
+    }
+
+    unsafe fn capture_lpc_port_view(
+        &self,
+        owner_pi: usize,
+        memory: SyscallUserMemory,
+        pointer: u64,
+    ) -> Result<Option<CapturedLpcPortView>, u32> {
+        if pointer == 0 {
+            return Ok(None);
+        }
+        if pointer & 3 != 0 {
+            return Err(STATUS_DATATYPE_MISALIGNMENT);
+        }
+        let mut native = [0u8; nt_lpc_abi::PORT_VIEW_LEN];
+        if !self.lpc_user_memory_read(owner_pi, memory, pointer, &mut native)
+            || !self.lpc_user_memory_write(owner_pi, memory, pointer, &native)
+        {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let raw_handle = u64::from_le_bytes(native[8..16].try_into().unwrap());
+        let handle = nt_process::Handle::try_from(raw_handle)
+            .map_err(|_| nt_process::STATUS_INVALID_HANDLE)?;
+        let owner_pid = self
+            .pm_pid_for_pi(owner_pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let section_index = match self.pm.lookup_handle(owner_pid, handle) {
+            Some(nt_process::HandleObject::Section(section)) => section as usize,
+            _ => return Err(nt_process::STATUS_INVALID_HANDLE),
+        };
+        const SECTION_MAP_WRITE: u32 = 0x0002;
+        const SECTION_MAP_READ: u32 = 0x0004;
+        let required_access = SECTION_MAP_READ | SECTION_MAP_WRITE;
+        if self
+            .pm
+            .handle_access(owner_pid, handle)
+            .is_none_or(|access| access & required_access != required_access)
+        {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        let section_size = self
+            .loop_ctx
+            .and_then(|ctx| (&*ctx.generic_sections).section(section_index))
+            .map(|section| section.size)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let captured = nt_lpc_abi::capture_port_view(&native, section_size)
+            .map_err(|_| STATUS_INVALID_PARAMETER)?;
+        Ok(Some(CapturedLpcPortView {
+            pointer,
+            native,
+            section_index,
+            section_offset: captured.section_offset,
+            view_size: captured.view_size,
+        }))
+    }
+
+    unsafe fn capture_lpc_remote_view(
+        &self,
+        owner_pi: usize,
+        memory: SyscallUserMemory,
+        pointer: u64,
+    ) -> Result<Option<CapturedLpcRemoteView>, u32> {
+        if pointer == 0 {
+            return Ok(None);
+        }
+        if pointer & 3 != 0 {
+            return Err(STATUS_DATATYPE_MISALIGNMENT);
+        }
+        let mut native = [0u8; nt_lpc_abi::REMOTE_PORT_VIEW_LEN];
+        if !self.lpc_user_memory_read(owner_pi, memory, pointer, &mut native)
+            || !self.lpc_user_memory_write(owner_pi, memory, pointer, &native)
+        {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        if !nt_lpc_abi::validate_remote_port_view(&native) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok(Some(CapturedLpcRemoteView { pointer, native }))
+    }
+
+    fn stage_lpc_connection_views(
         &mut self,
-        client_pi: usize,
-        server_pi: usize,
-    ) -> Result<(u64, u64, u64), u32> {
-        let pending = self
-            .pending_lpc_connection_view
-            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
-        let (server_base, server_size) = self.map_generic_section_view_internal(
-            pending.section_index,
-            server_pi,
+        connection_id: u64,
+        connector_pi: usize,
+        connector_memory: SyscallUserMemory,
+        connector_view: Option<CapturedLpcPortView>,
+        connector_remote_view: Option<CapturedLpcRemoteView>,
+    ) -> Result<(), u32> {
+        if connection_id == 0
+            || self
+                .lpc_connection_views
+                .iter()
+                .any(|pending| pending.connection_id == connection_id)
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        self.lpc_connection_views
+            .try_reserve(1)
+            .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
+        self.lpc_connection_views.push(PendingLpcConnectionViews {
+            connection_id,
+            connector_pi,
+            connector_memory,
+            connector_view,
+            connector_remote_view,
+            connector_mapping: None,
+            acceptor_mapping: None,
+        });
+        Ok(())
+    }
+
+    unsafe fn map_lpc_port_view(
+        &mut self,
+        captured: CapturedLpcPortView,
+        owner_pi: usize,
+        peer_pi: usize,
+    ) -> Result<MappedLpcPortView, u32> {
+        let (peer_base, peer_size) = self.map_generic_section_view_internal(
+            captured.section_index,
+            peer_pi,
             0,
-            pending.view_size,
-            pending.section_offset,
+            captured.view_size,
+            captured.section_offset,
             0,
             0,
             nt_address_space::PAGE_READWRITE,
         )?;
-        let (client_base, client_size) = match self.map_generic_section_view_internal(
-            pending.section_index,
-            client_pi,
+        let (owner_base, owner_size) = match self.map_generic_section_view_internal(
+            captured.section_index,
+            owner_pi,
             0,
-            pending.view_size,
-            pending.section_offset,
+            captured.view_size,
+            captured.section_offset,
             0,
             0,
             nt_address_space::PAGE_READWRITE,
         ) {
             Ok(view) => view,
             Err(status) => {
-                self.rollback_generic_section_view(server_pi, server_base);
+                self.rollback_generic_section_view(peer_pi, peer_base);
                 return Err(status);
             }
         };
-        if client_size != server_size {
-            self.rollback_generic_section_view(client_pi, client_base);
-            self.rollback_generic_section_view(server_pi, server_base);
+        if owner_size != peer_size {
+            self.rollback_generic_section_view(owner_pi, owner_base);
+            self.rollback_generic_section_view(peer_pi, peer_base);
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let view = pending.client_view;
-        if view == 0
-            || !self.xas_write_u64(view + 0x18, client_size)
-            || !self.xas_write_u64(view + 0x20, client_base)
-            || !self.xas_write_u64(view + 0x28, server_base)
-        {
-            self.rollback_generic_section_view(client_pi, client_base);
-            self.rollback_generic_section_view(server_pi, server_base);
+        Ok(MappedLpcPortView {
+            owner_pi,
+            owner_base,
+            peer_pi,
+            peer_base,
+            view_size: owner_size,
+        })
+    }
+
+    unsafe fn rollback_lpc_port_view(&mut self, mapped: MappedLpcPortView) {
+        self.rollback_generic_section_view(mapped.owner_pi, mapped.owner_base);
+        self.rollback_generic_section_view(mapped.peer_pi, mapped.peer_base);
+    }
+
+    pub(crate) unsafe fn abort_lpc_connection_views(&mut self, connection_id: u64) {
+        let Some(index) = self
+            .lpc_connection_views
+            .iter()
+            .position(|pending| pending.connection_id == connection_id)
+        else {
+            return;
+        };
+        let pending = self.lpc_connection_views.swap_remove(index);
+        if let Some(mapped) = pending.connector_mapping {
+            self.rollback_lpc_port_view(mapped);
+        }
+        if let Some(mapped) = pending.acceptor_mapping {
+            self.rollback_lpc_port_view(mapped);
+        }
+    }
+
+    pub(crate) unsafe fn accept_lpc_connection_views(
+        &mut self,
+        connection_id: u64,
+        acceptor_pi: usize,
+        acceptor_memory: SyscallUserMemory,
+        server_view_pointer: u64,
+        client_view_pointer: u64,
+    ) -> Result<(), u32> {
+        let index = self
+            .lpc_connection_views
+            .iter()
+            .position(|pending| pending.connection_id == connection_id)
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        let mut pending = self.lpc_connection_views[index];
+        if pending.connector_mapping.is_some() || pending.acceptor_mapping.is_some() {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let server_view =
+            self.capture_lpc_port_view(acceptor_pi, acceptor_memory, server_view_pointer)?;
+        let client_view =
+            self.capture_lpc_remote_view(acceptor_pi, acceptor_memory, client_view_pointer)?;
+
+        if let Some(connector_view) = pending.connector_view {
+            match self.map_lpc_port_view(connector_view, pending.connector_pi, acceptor_pi) {
+                Ok(mapped) => pending.connector_mapping = Some(mapped),
+                Err(status) => return Err(status),
+            }
+        }
+        if let Some(server_view) = server_view {
+            match self.map_lpc_port_view(server_view, acceptor_pi, pending.connector_pi) {
+                Ok(mapped) => pending.acceptor_mapping = Some(mapped),
+                Err(status) => {
+                    if let Some(mapped) = pending.connector_mapping {
+                        self.rollback_lpc_port_view(mapped);
+                    }
+                    return Err(status);
+                }
+            }
+        }
+
+        let results = nt_lpc_abi::connection_view_results(
+            pending.connector_mapping.map(MappedLpcPortView::abi),
+            pending.acceptor_mapping.map(MappedLpcPortView::abi),
+        );
+        let mut outputs_ok = true;
+        if let Some(mut server_view) = server_view {
+            let mapped = results.acceptor_view.unwrap();
+            nt_lpc_abi::publish_port_view(
+                &mut server_view.native,
+                mapped.view_size,
+                mapped.view_base,
+                mapped.view_remote_base,
+            );
+            outputs_ok &= self.lpc_user_memory_write(
+                acceptor_pi,
+                acceptor_memory,
+                server_view.pointer,
+                &server_view.native,
+            );
+        }
+        if let Some(mut client_view) = client_view {
+            let (view_size, view_base) = results
+                .acceptor_client_view
+                .map(|mapped| (mapped.view_size, mapped.view_base))
+                .unwrap_or((0, 0));
+            nt_lpc_abi::publish_remote_port_view(&mut client_view.native, view_size, view_base);
+            outputs_ok &= self.lpc_user_memory_write(
+                acceptor_pi,
+                acceptor_memory,
+                client_view.pointer,
+                &client_view.native,
+            );
+        }
+        if !outputs_ok {
+            if let Some(mapped) = pending.acceptor_mapping {
+                self.rollback_lpc_port_view(mapped);
+            }
+            if let Some(mapped) = pending.connector_mapping {
+                self.rollback_lpc_port_view(mapped);
+            }
             return Err(STATUS_ACCESS_VIOLATION);
         }
-        print_str(b"[lpc-view] client-pi=");
-        print_u64(client_pi as u64);
-        print_str(b" server-pi=");
-        print_u64(server_pi as u64);
-        print_str(b" section=");
-        print_u64(pending.section_index as u64);
-        print_str(b" client=0x");
-        print_hex((client_base >> 32) as u32);
-        print_hex(client_base as u32);
-        print_str(b" server=0x");
-        print_hex((server_base >> 32) as u32);
-        print_hex(server_base as u32);
-        print_str(b" size=0x");
-        print_hex(client_size as u32);
+
+        self.lpc_connection_views[index] = pending;
+        print_str(b"[lpc-view] accepted conn=");
+        print_u64(connection_id);
+        print_str(b" connector-pi=");
+        print_u64(pending.connector_pi as u64);
+        print_str(b" acceptor-pi=");
+        print_u64(acceptor_pi as u64);
+        print_str(b" connector-view=");
+        print_u64(pending.connector_mapping.is_some() as u64);
+        print_str(b" acceptor-view=");
+        print_u64(pending.acceptor_mapping.is_some() as u64);
         print_str(b"\n");
-        Ok((client_base, server_base, client_size))
+        Ok(())
+    }
+
+    pub(crate) unsafe fn complete_lpc_connection_views(
+        &mut self,
+        connection_id: u64,
+    ) -> Result<(), u32> {
+        let Some(index) = self
+            .lpc_connection_views
+            .iter()
+            .position(|pending| pending.connection_id == connection_id)
+        else {
+            return Ok(());
+        };
+        let pending = self.lpc_connection_views[index];
+        let results = nt_lpc_abi::connection_view_results(
+            pending.connector_mapping.map(MappedLpcPortView::abi),
+            pending.acceptor_mapping.map(MappedLpcPortView::abi),
+        );
+        let mut outputs_ok = true;
+        if let Some(mut connector_view) = pending.connector_view {
+            let Some(mapped) = results.connector_view else {
+                self.abort_lpc_connection_views(connection_id);
+                return Err(STATUS_INVALID_PARAMETER);
+            };
+            nt_lpc_abi::publish_port_view(
+                &mut connector_view.native,
+                mapped.view_size,
+                mapped.view_base,
+                mapped.view_remote_base,
+            );
+            outputs_ok &= self.lpc_user_memory_write(
+                pending.connector_pi,
+                pending.connector_memory,
+                connector_view.pointer,
+                &connector_view.native,
+            );
+        }
+        if let Some(mut remote_view) = pending.connector_remote_view {
+            let (view_size, view_base) = results
+                .connector_server_view
+                .map(|mapped| (mapped.view_size, mapped.view_base))
+                .unwrap_or((0, 0));
+            nt_lpc_abi::publish_remote_port_view(&mut remote_view.native, view_size, view_base);
+            outputs_ok &= self.lpc_user_memory_write(
+                pending.connector_pi,
+                pending.connector_memory,
+                remote_view.pointer,
+                &remote_view.native,
+            );
+        }
+        if !outputs_ok {
+            self.abort_lpc_connection_views(connection_id);
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        self.lpc_connection_views.swap_remove(index);
+        print_str(b"[lpc-view] completed conn=");
+        print_u64(connection_id);
+        print_str(b"\n");
+        Ok(())
     }
 
     pub(crate) unsafe fn rollback_generic_section_view(&mut self, pi: usize, base: u64) {
@@ -25513,63 +25882,21 @@ impl ExecNtHandler {
             Ok(validated) => validated,
             Err(status) => return status,
         };
-        if serverview_ptr != 0 {
-            let mut server_view = [0u8; 0x18];
-            if !self.xas_read(serverview_ptr, &mut server_view) {
-                return STATUS_ACCESS_VIOLATION;
-            }
-            if u32::from_le_bytes(server_view[0..4].try_into().unwrap()) != server_view.len() as u32
-            {
-                return STATUS_INVALID_PARAMETER;
-            }
-        }
+        let connector_remote_view =
+            match self.capture_lpc_remote_view(self.pi, self.current_user_memory, serverview_ptr) {
+                Ok(view) => view,
+                Err(status) => return status,
+            };
         if max_message_length_ptr != 0
             && !self.xas_write_u32(max_message_length_ptr, max_message_length)
         {
             return STATUS_ACCESS_VIOLATION;
         }
-        const SECTION_MAP_WRITE: u32 = 0x0002;
-        const SECTION_MAP_READ: u32 = 0x0004;
-        let Some(client_pid) = self.pm_pid_for_pi(self.pi) else {
-            return nt_process::STATUS_INVALID_HANDLE;
-        };
-        let mut port_view = [0u8; 0x30];
-        if clientview_ptr == 0 || !self.xas_read(clientview_ptr, &mut port_view) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        if u32::from_le_bytes(port_view[0..4].try_into().unwrap()) != port_view.len() as u32 {
-            return STATUS_INVALID_PARAMETER;
-        }
-        let section_handle = u64::from_le_bytes(port_view[8..16].try_into().unwrap());
-        let Ok(section_handle) = nt_process::Handle::try_from(section_handle) else {
-            return nt_process::STATUS_INVALID_HANDLE;
-        };
-        let section_offset = u32::from_le_bytes(port_view[16..20].try_into().unwrap()) as u64;
-        let view_size = u64::from_le_bytes(port_view[24..32].try_into().unwrap());
-        let section_index = match self.pm.lookup_handle(client_pid, section_handle) {
-            Some(nt_process::HandleObject::Section(section)) => section as usize,
-            _ => return nt_process::STATUS_INVALID_HANDLE,
-        };
-        let required_access = SECTION_MAP_READ | SECTION_MAP_WRITE;
-        if self
-            .pm
-            .handle_access(client_pid, section_handle)
-            .is_none_or(|access| access & required_access != required_access)
-        {
-            return STATUS_ACCESS_DENIED;
-        }
-        if section_offset & 0xfff != 0 || view_size == 0 {
-            return STATUS_INVALID_PARAMETER;
-        }
-        let Some(section) = self
-            .loop_ctx
-            .and_then(|ctx| (&*ctx.generic_sections).section(section_index))
-        else {
-            return nt_process::STATUS_INVALID_HANDLE;
-        };
-        if section_offset >= section.size || view_size > section.size - section_offset {
-            return STATUS_INVALID_PARAMETER;
-        }
+        let connector_view =
+            match self.capture_lpc_port_view(self.pi, self.current_user_memory, clientview_ptr) {
+                Ok(view) => view,
+                Err(status) => return status,
+            };
         let mut connection_info = alloc::vec::Vec::new();
         if conninfo_ptr != 0 || conninfo_len_ptr != 0 {
             if conninfo_ptr == 0 || conninfo_len_ptr == 0 {
@@ -25605,16 +25932,22 @@ impl ExecNtHandler {
                 security.effective_only,
             ) {
                 Ok(r) if r.pending && r.connection_id != 0 => {
+                    if let Err(status) = self.stage_lpc_connection_views(
+                        r.connection_id,
+                        self.pi,
+                        self.current_user_memory,
+                        connector_view,
+                        connector_remote_view,
+                    ) {
+                        if let Some(client) = lpc_client() {
+                            let _ = client.accept_connect(r.connection_id, false, 0);
+                        }
+                        return status;
+                    }
                     self.csr_rendezvous_conn = r.connection_id;
                     self.csr_rendezvous_out = porthandle_ptr;
                     self.csr_rendezvous_conn_info = conninfo_ptr;
                     self.csr_rendezvous_conn_info_len = conninfo_len_ptr;
-                    self.pending_lpc_connection_view = Some(PendingLpcConnectionView {
-                        client_view: clientview_ptr,
-                        section_index,
-                        section_offset,
-                        view_size,
-                    });
                     pending = true;
                 }
                 Ok(r) => {
@@ -25646,10 +25979,12 @@ impl ExecNtHandler {
             b" NtSecureConnectPort(\\Windows\\ApiPort) -> queued REAL CsrApiRequestThread accept; conn=",
         );
         print_u64(self.csr_rendezvous_conn);
-        print_str(b" section=");
-        print_u64(section_index as u64);
+        print_str(b" connector-view=");
+        print_u64(connector_view.is_some() as u64);
+        print_str(b" remote-view=");
+        print_u64(connector_remote_view.is_some() as u64);
         print_str(b" view-size=0x");
-        print_hex(view_size as u32);
+        print_hex(connector_view.map(|view| view.view_size).unwrap_or(0) as u32);
         print_str(b"\n");
         0
     }
@@ -27627,8 +27962,7 @@ impl ExecNtHandler {
 
                 if options & DUPLICATE_CLOSE_SOURCE != 0 {
                     if close_source_pid.is_none() {
-                        close_source_pid =
-                            self.csr_client_source_pid_for_handle(source_handle);
+                        close_source_pid = self.csr_client_source_pid_for_handle(source_handle);
                     }
                     let closed_native = close_source_pid
                         .map(|pid| self.close_process_handle(pid, args[1]))
@@ -30725,13 +31059,12 @@ impl ExecNtHandler {
                     args[0],
                 ) {
                     Ok(()) => {
-                        LPC_THREAD_TERMINATE_PORT_REGISTRATIONS
-                            .fetch_add(1, Ordering::Relaxed);
+                        LPC_THREAD_TERMINATE_PORT_REGISTRATIONS.fetch_add(1, Ordering::Relaxed);
                         nt_syscall::STATUS_SUCCESS
                     }
                     Err(status) => status,
                 }
-            }
+            },
             NativeService::NtListenPort => unsafe {
                 self.lpc_receive_or_park(args[0], 0, 0, args[1], true)
             },
@@ -30784,6 +31117,19 @@ impl ExecNtHandler {
                         Ok(validated) => validated,
                         Err(status) => return status,
                     };
+                let connector_view =
+                    match self.capture_lpc_port_view(self.pi, self.current_user_memory, args[3]) {
+                        Ok(view) => view,
+                        Err(status) => return status,
+                    };
+                let connector_remote_view = match self.capture_lpc_remote_view(
+                    self.pi,
+                    self.current_user_memory,
+                    args[4],
+                ) {
+                    Ok(view) => view,
+                    Err(status) => return status,
+                };
                 if args[5] != 0 && !self.xas_write_u32(args[5], max_message_length) {
                     return STATUS_ACCESS_VIOLATION;
                 }
@@ -30794,6 +31140,9 @@ impl ExecNtHandler {
                 if self.current_process_is_lsass()
                     && Self::lpc_name_equals_ascii(&name16, b"\\sermcommandport")
                 {
+                    if connector_view.is_some() || connector_remote_view.is_some() {
+                        return STATUS_INVALID_PARAMETER;
+                    }
                     return self.connect_srm_command_port(
                         &name16,
                         subsystem_type,
@@ -30818,6 +31167,12 @@ impl ExecNtHandler {
                 }) {
                     Some(Ok(r)) => {
                         if !r.pending && r.handle != 0 {
+                            if connector_view.is_some() || connector_remote_view.is_some() {
+                                if let Some(client) = lpc_client() {
+                                    let _ = client.close_port(r.handle);
+                                }
+                                return STATUS_INVALID_PARAMETER;
+                            }
                             // AutoAccept (interim): the broker modelled the acceptor — complete now.
                             if self.cache_lpc_connection(r.connection_id, r.handle, &name16) {
                                 self.queue_write(args[0], r.handle);
@@ -30826,6 +31181,18 @@ impl ExecNtHandler {
                                 STATUS_UNSUCCESSFUL
                             }
                         } else if r.pending {
+                            if let Err(status) = self.stage_lpc_connection_views(
+                                r.connection_id,
+                                self.pi,
+                                self.current_user_memory,
+                                connector_view,
+                                connector_remote_view,
+                            ) {
+                                if let Some(client) = lpc_client() {
+                                    let _ = client.accept_connect(r.connection_id, false, 0);
+                                }
+                                return status;
+                            }
                             // Manual (path B, authentic): the connection is Pending in the broker.
                             // Signal the LOOP to drive `sm_rendezvous` (the REAL SmpApiLoop accept)
                             // synchronously, write the completed client comm-port handle to *PortHandle
@@ -30856,14 +31223,11 @@ impl ExecNtHandler {
                     None => 0xC000_0001,              // STATUS_UNSUCCESSFUL (broker absent)
                 }
             },
-            // NtAcceptConnectPort/NtCompleteConnectPort — the server-side rendezvous (path B). Under
-            // AutoAccept these are not reached (the server models the acceptor at connect); wired to
-            // the broker so path B is a policy swap, not new plumbing.
+            // NtAcceptConnectPort/NtCompleteConnectPort — the server-side rendezvous. Connection
+            // identity comes from the broker-authored request header. Optional client/server views
+            // are resolved in their owning processes and retained until this exact connection
+            // completes; no most-recent-port or image-role routing participates.
             NativeService::NtAcceptConnectPort => unsafe {
-                // (*PortHandle[R10], PortContext[RDX], *ConnReq[R8], Accept[R9], ...). We don't yet
-                // decode the connection id from the received PORT_MESSAGE (path B), so accept the most
-                // recent pending connection is a bulk concern — return success placeholder for now.
-                //
                 // ★ LSA RENDEZVOUS. lsass' REAL `LsapHandlePortConnection`
                 // (`references/reactos/dll/win32/lsasrv/authport.c:196`) reaches this syscall after the
                 // loop woke its `AuthPortThreadRoutine` with winlogon's connection request. The
@@ -30877,6 +31241,27 @@ impl ExecNtHandler {
                     let server_handle = lpc_client()
                         .and_then(|c| c.accept_connect(lsa_conn, accept, port_context).ok())
                         .unwrap_or(0);
+                    if accept {
+                        if server_handle == 0 {
+                            self.abort_lpc_connection_views(lsa_conn);
+                            return STATUS_UNSUCCESSFUL;
+                        }
+                        if let Err(status) = self.accept_lpc_connection_views(
+                            lsa_conn,
+                            self.pi,
+                            self.current_user_memory,
+                            args[4],
+                            args[5],
+                        ) {
+                            if let Some(client) = lpc_client() {
+                                let _ = client.close_port(server_handle);
+                            }
+                            self.abort_lpc_connection_views(lsa_conn);
+                            return status;
+                        }
+                    } else {
+                        self.abort_lpc_connection_views(lsa_conn);
+                    }
                     self.queue_write(args[0], server_handle);
                     LSA_PORT_CONTEXT.store(port_context, Ordering::Relaxed);
                     LSA_ACCEPT_DECISION.store(1 + u64::from(accept), Ordering::Relaxed);
@@ -30907,6 +31292,27 @@ impl ExecNtHandler {
                     .and_then(|c| c.accept_connect(conn_id, accept, port_context).ok())
                 {
                     Some(server_handle) => {
+                        if accept {
+                            if server_handle == 0 {
+                                self.abort_lpc_connection_views(conn_id);
+                                return STATUS_UNSUCCESSFUL;
+                            }
+                            if let Err(status) = self.accept_lpc_connection_views(
+                                conn_id,
+                                self.pi,
+                                self.current_user_memory,
+                                args[4],
+                                args[5],
+                            ) {
+                                if let Some(client) = lpc_client() {
+                                    let _ = client.close_port(server_handle);
+                                }
+                                self.abort_lpc_connection_views(conn_id);
+                                return status;
+                            }
+                        } else {
+                            self.abort_lpc_connection_views(conn_id);
+                        }
                         self.queue_write(args[0], server_handle);
                         0
                     }
@@ -30920,6 +31326,13 @@ impl ExecNtHandler {
                 if self.current_process_is_lsass() && lsa_conn != 0 {
                     return match lpc_client().and_then(|c| c.complete_connect(lsa_conn).ok()) {
                         Some(completed) => {
+                            if let Err(status) = self.complete_lpc_connection_views(lsa_conn) {
+                                if let Some(client) = lpc_client() {
+                                    let _ = client.close_port(completed.handle);
+                                    let _ = client.close_port(args[0]);
+                                }
+                                return status;
+                            }
                             LSA_CLIENT_HANDLE.store(completed.handle, Ordering::Relaxed);
                             LSA_COMPLETE_PENDING.store(1, Ordering::Relaxed);
                             0
@@ -30930,9 +31343,26 @@ impl ExecNtHandler {
                         }
                     };
                 }
+                let connection_id = match lpc_client().and_then(|c| c.query_handle(args[0]).ok()) {
+                    Some(port) if port.connection_id != 0 => port.connection_id,
+                    _ => return nt_process::STATUS_INVALID_HANDLE,
+                };
                 match lpc_client().and_then(|c| c.complete_connect(args[0]).ok()) {
-                    Some(_) => 0,
-                    None => STATUS_UNSUCCESSFUL,
+                    Some(completed) => {
+                        if let Err(status) = self.complete_lpc_connection_views(connection_id) {
+                            if let Some(client) = lpc_client() {
+                                let _ = client.close_port(completed.handle);
+                                let _ = client.close_port(args[0]);
+                            }
+                            status
+                        } else {
+                            0
+                        }
+                    }
+                    None => {
+                        self.abort_lpc_connection_views(connection_id);
+                        STATUS_UNSUCCESSFUL
+                    }
                 }
             },
             // NtCreateEvent(*EventHandle[R10], ACCESS, *OA, EVENT_TYPE, InitialState). winsrv's

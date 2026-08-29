@@ -660,6 +660,7 @@ pub(crate) unsafe fn sm_rendezvous(
         return 0;
     }
     let mut client_handle = 0u64;
+    let mut server_handle = 0u64;
     let mut fill_idx = 0u64;
     let mut guard = 0u64;
     let (_b, mut mi, mut m0, mut m1, mut m2, mut m3) =
@@ -869,16 +870,54 @@ pub(crate) unsafe fn sm_rendezvous(
                     SSN_ACCEPT_CONNECT => {
                         let porthandle_out = get_recv_mr(9); // R10 = *PortHandle
                         let accept = get_recv_mr(8); // R9 = Accept BOOLEAN
-                        let sh = lpc_client()
+                        let mut sh = lpc_client()
                             .and_then(|c| c.accept_connect(conn_id, accept != 0, rdx).ok())
                             .unwrap_or(0);
+                        if accept != 0 && sh != 0 {
+                            let server_view = sm_stack_read(sp + 0x28);
+                            let client_view = sm_stack_read(sp + 0x30);
+                            match nt_handler.accept_lpc_connection_views(
+                                conn_id,
+                                0,
+                                SyscallUserMemory::SmProcess,
+                                server_view,
+                                client_view,
+                            ) {
+                                Ok(()) => server_handle = sh,
+                                Err(status) => {
+                                    if let Some(client) = lpc_client() {
+                                        let _ = client.close_port(sh);
+                                    }
+                                    nt_handler.abort_lpc_connection_views(conn_id);
+                                    result = status as u64;
+                                    sh = 0;
+                                }
+                            }
+                        } else if accept == 0 || sh == 0 {
+                            nt_handler.abort_lpc_connection_views(conn_id);
+                            if accept != 0 {
+                                result = 0xC000_0001;
+                            }
+                        }
                         sm_stack_write(porthandle_out, sh);
                     }
                     SSN_COMPLETE_CONNECT => {
                         if let Some(completed) =
                             lpc_client().and_then(|c| c.complete_connect(conn_id).ok())
                         {
-                            client_handle = completed.handle;
+                            match nt_handler.complete_lpc_connection_views(conn_id) {
+                                Ok(()) => client_handle = completed.handle,
+                                Err(status) => {
+                                    if let Some(client) = lpc_client() {
+                                        let _ = client.close_port(completed.handle);
+                                        let _ = client.close_port(server_handle);
+                                    }
+                                    result = status as u64;
+                                }
+                            }
+                        } else {
+                            nt_handler.abort_lpc_connection_views(conn_id);
+                            result = 0xC000_0001;
                         }
                         print_str(b"[sm-rdv] forward NtCompleteConnectPort replied; awaiting reverse connect\n");
                         // Continue into SmpHandleConnectionRequest's reverse connection and real event set.
@@ -975,6 +1014,9 @@ pub(crate) unsafe fn sm_rendezvous(
         print_u64(label);
         print_str(b"\n");
         break;
+    }
+    if client_handle == 0 {
+        nt_handler.abort_lpc_connection_views(conn_id);
     }
     client_handle
 }
@@ -3172,8 +3214,8 @@ pub(crate) unsafe fn csr_rendezvous(
         return None;
     }
     let mut client_handle = 0u64;
+    let mut server_handle = 0u64;
     let mut connection_info = alloc::vec::Vec::new();
-    let mut mapped_views = None;
     let mut server_client_pid = 0u32;
     let mut fill_idx = 0u64;
     let mut guard = 0u64;
@@ -3364,43 +3406,7 @@ pub(crate) unsafe fn csr_rendezvous(
                             );
                             break;
                         };
-                        if requested_accept {
-                            match nt_handler.map_lpc_connection_views(nt_handler.pi, server_pi) {
-                                Ok((client_base, server_base, view_size)) => {
-                                    let remote_view = csr_stack_read(sp + 0x30).unwrap_or(0);
-                                    let remote_view_length = csr_stack_read(remote_view)
-                                        .map(|header| header as u32)
-                                        .unwrap_or(0);
-                                    if remote_view == 0 || remote_view_length != 0x18 {
-                                        nt_handler.rollback_generic_section_view(
-                                            nt_handler.pi,
-                                            client_base,
-                                        );
-                                        nt_handler
-                                            .rollback_generic_section_view(server_pi, server_base);
-                                        result = 0xC000_000D;
-                                    } else if csr_stack_copyout(
-                                        remote_view + 0x08,
-                                        &view_size.to_le_bytes(),
-                                    ) && csr_stack_copyout(
-                                        remote_view + 0x10,
-                                        &server_base.to_le_bytes(),
-                                    ) {
-                                        mapped_views = Some((client_base, server_base));
-                                    } else {
-                                        nt_handler.rollback_generic_section_view(
-                                            nt_handler.pi,
-                                            client_base,
-                                        );
-                                        nt_handler
-                                            .rollback_generic_section_view(server_pi, server_base);
-                                        result = 0xC000_0005;
-                                    }
-                                }
-                                Err(status) => result = status as u64,
-                            }
-                        }
-                        let sh = if result == 0 {
+                        let mut sh = if result == 0 {
                             match lpc_client().map(|client| {
                                 client.accept_connect_with_info(
                                     conn_id,
@@ -3422,12 +3428,28 @@ pub(crate) unsafe fn csr_rendezvous(
                         } else {
                             0
                         };
-                        if result != 0 {
-                            if let Some((client_base, server_base)) = mapped_views.take() {
-                                nt_handler
-                                    .rollback_generic_section_view(nt_handler.pi, client_base);
-                                nt_handler.rollback_generic_section_view(server_pi, server_base);
+                        if result == 0 && requested_accept {
+                            let server_view = csr_stack_read(sp + 0x28).unwrap_or(0);
+                            let client_view = csr_stack_read(sp + 0x30).unwrap_or(0);
+                            match nt_handler.accept_lpc_connection_views(
+                                conn_id,
+                                server_pi,
+                                SyscallUserMemory::CsrProcess { sb: false },
+                                server_view,
+                                client_view,
+                            ) {
+                                Ok(()) => server_handle = sh,
+                                Err(status) => {
+                                    if let Some(client) = lpc_client() {
+                                        let _ = client.close_port(sh);
+                                    }
+                                    nt_handler.abort_lpc_connection_views(conn_id);
+                                    result = status as u64;
+                                    sh = 0;
+                                }
                             }
+                        } else if !requested_accept || result != 0 {
+                            nt_handler.abort_lpc_connection_views(conn_id);
                         }
                         csr_stack_write(porthandle_out, sh);
                     }
@@ -3436,8 +3458,22 @@ pub(crate) unsafe fn csr_rendezvous(
                             if let Some(completed) =
                                 lpc_client().and_then(|c| c.complete_connect(conn_id).ok())
                             {
-                                client_handle = completed.handle;
-                                connection_info = completed.connection_info;
+                                match nt_handler.complete_lpc_connection_views(conn_id) {
+                                    Ok(()) => {
+                                        client_handle = completed.handle;
+                                        connection_info = completed.connection_info;
+                                    }
+                                    Err(status) => {
+                                        if let Some(client) = lpc_client() {
+                                            let _ = client.close_port(completed.handle);
+                                            let _ = client.close_port(server_handle);
+                                        }
+                                        result = status as u64;
+                                    }
+                                }
+                            } else {
+                                nt_handler.abort_lpc_connection_views(conn_id);
+                                result = 0xC000_0001;
                             }
                         }
                     }
@@ -3475,10 +3511,7 @@ pub(crate) unsafe fn csr_rendezvous(
         break;
     }
     if client_handle == 0 {
-        if let Some((client_base, server_base)) = mapped_views {
-            nt_handler.rollback_generic_section_view(nt_handler.pi, client_base);
-            nt_handler.rollback_generic_section_view(server_pi, server_base);
-        }
+        nt_handler.abort_lpc_connection_views(conn_id);
     }
     (client_handle != 0).then_some(CsrConnectCompletion {
         client_handle,

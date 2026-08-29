@@ -21555,15 +21555,55 @@ impl PendingWaitTimeout {
     }
 }
 
-/// Kernel-owned state for one client-supplied LPC connection section while the accepting server
-/// decides the request. The section handle has already been resolved in the connector's process;
-/// only the generic section identity and native `PORT_VIEW` output address survive the park.
+/// Kernel-captured native `PORT_VIEW` and resolved section identity. The user buffer is retained
+/// only as an output destination; all input fields come from the captured bytes.
 #[derive(Clone, Copy)]
-struct PendingLpcConnectionView {
-    client_view: u64,
+struct CapturedLpcPortView {
+    pointer: u64,
+    native: [u8; nt_lpc_abi::PORT_VIEW_LEN],
     section_index: usize,
     section_offset: u64,
     view_size: u64,
+}
+
+/// Kernel-captured native `REMOTE_PORT_VIEW` output descriptor.
+#[derive(Clone, Copy)]
+struct CapturedLpcRemoteView {
+    pointer: u64,
+    native: [u8; nt_lpc_abi::REMOTE_PORT_VIEW_LEN],
+}
+
+/// One offered section mapped into its owner and peer processes.
+#[derive(Clone, Copy)]
+struct MappedLpcPortView {
+    owner_pi: usize,
+    owner_base: u64,
+    peer_pi: usize,
+    peer_base: u64,
+    view_size: u64,
+}
+
+impl MappedLpcPortView {
+    fn abi(self) -> nt_lpc_abi::MappedPortView {
+        nt_lpc_abi::MappedPortView {
+            owner_base: self.owner_base,
+            peer_base: self.peer_base,
+            view_size: self.view_size,
+        }
+    }
+}
+
+/// Kernel-owned connection-view transaction. A broker connection id, never an image role or a
+/// most-recent slot, is the durable identity across connect, accept, and complete.
+#[derive(Clone, Copy)]
+struct PendingLpcConnectionViews {
+    connection_id: u64,
+    connector_pi: usize,
+    connector_memory: SyscallUserMemory,
+    connector_view: Option<CapturedLpcPortView>,
+    connector_remote_view: Option<CapturedLpcRemoteView>,
+    connector_mapping: Option<MappedLpcPortView>,
+    acceptor_mapping: Option<MappedLpcPortView>,
 }
 
 struct ExecNtHandler {
@@ -21858,7 +21898,7 @@ struct ExecNtHandler {
     csr_rendezvous_out: u64,
     csr_rendezvous_conn_info: u64,
     csr_rendezvous_conn_info_len: u64,
-    pending_lpc_connection_view: Option<PendingLpcConnectionView>,
+    lpc_connection_views: alloc::vec::Vec<PendingLpcConnectionViews>,
     /// The DATA-plane cache of established LPC connections (control/data-plane split): the isolated
     /// nt-lpc-server owns the namespace + rendezvous, but is NOT on the message path. When a CONNECT
     /// completes through the server, the executive records the connection here so the future message
