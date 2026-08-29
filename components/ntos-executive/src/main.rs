@@ -2531,7 +2531,7 @@ struct ObjectWaiterRecord {
     resume_ip: u64,
     resume_sp: u64,
     resume_flags: u64,
-    deadline: u64,
+    deadline: nt_delay_execution::Deadline,
     reply: nt_syscall_abi::ParkedSyscallReply,
     pending_wake_index: u64,
     pending_wake_object: WaitObject,
@@ -2552,7 +2552,7 @@ impl ObjectWaiterRecord {
             resume_ip: 0,
             resume_sp: 0,
             resume_flags: 0,
-            deadline: u64::MAX,
+            deadline: nt_delay_execution::Deadline::Infinite,
             reply: nt_syscall_abi::ParkedSyscallReply::native_call(),
             pending_wake_index: u64::MAX,
             pending_wake_object: WaitObject::FREE,
@@ -2576,7 +2576,7 @@ impl ObjectWaiterRecord {
         resume_ip: u64,
         resume_sp: u64,
         resume_flags: u64,
-        deadline: Option<u64>,
+        deadline: nt_delay_execution::Deadline,
         reply: nt_syscall_abi::ParkedSyscallReply,
     ) -> Self {
         let mut record = Self::empty();
@@ -2594,7 +2594,7 @@ impl ObjectWaiterRecord {
         record.resume_ip = resume_ip;
         record.resume_sp = resume_sp;
         record.resume_flags = resume_flags;
-        record.deadline = deadline.unwrap_or(u64::MAX);
+        record.deadline = deadline;
         record.reply = reply;
         record
     }
@@ -2713,12 +2713,12 @@ impl ObjectWaiterTable {
         ))
     }
 
-    fn next_deadline(&self) -> Option<u64> {
+    fn next_deadline(&self, now: nt_delay_execution::TimeSnapshot) -> Option<u64> {
         self.entries
             .iter()
             .copied()
-            .filter(|entry| entry.is_live() && entry.deadline != u64::MAX)
-            .map(|entry| entry.deadline)
+            .filter(|entry| entry.is_live())
+            .filter_map(|entry| entry.deadline.monotonic_target(now))
             .min()
     }
 
@@ -2776,7 +2776,7 @@ struct KeyedWaiterRecord {
     key: u64,
     reply_cap: u64,
     tid: u64,
-    deadline: u64,
+    deadline: nt_delay_execution::Deadline,
     reply: nt_syscall_abi::ParkedSyscallReply,
 }
 
@@ -2786,7 +2786,7 @@ impl KeyedWaiterRecord {
             key: u64::MAX,
             reply_cap: 0,
             tid: 0,
-            deadline: u64::MAX,
+            deadline: nt_delay_execution::Deadline::Infinite,
             reply: nt_syscall_abi::ParkedSyscallReply::native_call(),
         }
     }
@@ -2865,12 +2865,12 @@ impl KeyedWaiterTable {
             .position(|entry| entry.is_live() && entry.key == key)
     }
 
-    fn next_deadline(&self) -> Option<u64> {
+    fn next_deadline(&self, now: nt_delay_execution::TimeSnapshot) -> Option<u64> {
         self.entries
             .iter()
             .copied()
-            .filter(|entry| entry.is_live() && entry.deadline != u64::MAX)
-            .map(|entry| entry.deadline)
+            .filter(|entry| entry.is_live())
+            .filter_map(|entry| entry.deadline.monotonic_target(now))
             .min()
     }
 
@@ -3168,6 +3168,29 @@ unsafe fn watchdog_take_timer_work(now_100ns: u64) -> u64 {
     ticks
 }
 
+fn print_tagged_deadline(
+    deadline: nt_delay_execution::Deadline,
+    now: nt_delay_execution::TimeSnapshot,
+) {
+    match deadline {
+        nt_delay_execution::Deadline::Infinite => print_str(b"infinite"),
+        nt_delay_execution::Deadline::Relative { monotonic_100ns } => {
+            print_str(b"relative-mono/");
+            print_u64(monotonic_100ns);
+        }
+        nt_delay_execution::Deadline::Absolute { system_time_100ns } => {
+            print_str(b"absolute-system/");
+            print_u64(system_time_100ns);
+            print_str(b" projected-mono/");
+            print_u64(
+                deadline
+                    .monotonic_target(now)
+                    .expect("absolute deadline always has a projection"),
+            );
+        }
+    }
+}
+
 /// What a deadlock now SAYS about itself, instead of a silent tail.
 unsafe fn watchdog_report(messages: u64) {
     print_str(
@@ -3195,6 +3218,7 @@ unsafe fn watchdog_report(messages: u64) {
         win32k_subsystem::trace_win32k_request_context();
         win32k_glue::win32k_dispatch_backtrace();
     }
+    let now = nt_time_snapshot();
     for slot in 0..object_waiter_len() {
         let Some(record) = object_waiter_record(slot) else {
             continue;
@@ -3206,7 +3230,7 @@ unsafe fn watchdog_report(messages: u64) {
         print_str(b" wait-all=");
         print_u64(record.wait_all as u64);
         print_str(b" deadline=");
-        print_u64(record.deadline);
+        print_tagged_deadline(record.deadline, now);
         print_str(b" resume-ip=0x");
         print_hex_u64(record.reply.resume_ip());
         print_str(b"\n");
@@ -3219,6 +3243,8 @@ unsafe fn watchdog_report(messages: u64) {
         print_u64(record.tid);
         print_str(b" key=0x");
         print_hex_u64(record.key);
+        print_str(b" deadline=");
+        print_tagged_deadline(record.deadline, now);
         print_str(b"\n");
     }
     for slot in 0..keyed_release_waiter_len() {
@@ -3229,6 +3255,8 @@ unsafe fn watchdog_report(messages: u64) {
         print_u64(record.tid);
         print_str(b" key=0x");
         print_hex_u64(record.key);
+        print_str(b" deadline=");
+        print_tagged_deadline(record.deadline, now);
         print_str(b"\n");
     }
     driver_launch::print_active_driver_dispatch_for_deadman();
@@ -16211,10 +16239,10 @@ unsafe fn delay_timer_init() -> bool {
 unsafe fn delay_timer_next_deadline(queue: &nt_delay_execution::Queue) -> Option<(u64, u64)> {
     let now = nt_time_snapshot();
     let delay_deadline = queue.next_deadline(now);
-    let event_deadline = object_waiter_next_deadline();
-    let keyed_deadline = unsafe { (&*core::ptr::addr_of!(KEYED_WAITERS)).next_deadline() };
+    let event_deadline = object_waiter_next_deadline(now);
+    let keyed_deadline = unsafe { (&*core::ptr::addr_of!(KEYED_WAITERS)).next_deadline(now) };
     let keyed_release_deadline =
-        unsafe { (&*core::ptr::addr_of!(KEYED_RELEASE_WAITERS)).next_deadline() };
+        unsafe { (&*core::ptr::addr_of!(KEYED_RELEASE_WAITERS)).next_deadline(now) };
     let io_completion_deadline =
         unsafe { (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)).next_deadline(now) };
     let user_timer_deadline = match USER_TIMER_NEXT_DEADLINE.load(Ordering::Relaxed) {
@@ -16581,8 +16609,8 @@ fn object_waiter_take_exact(slot: usize, tid: u64, reply_cap: u64) -> Option<Obj
     unsafe { (&mut *core::ptr::addr_of_mut!(OBJECT_WAITERS)).take_exact(slot, tid, reply_cap) }
 }
 
-fn object_waiter_next_deadline() -> Option<u64> {
-    unsafe { (&*core::ptr::addr_of!(OBJECT_WAITERS)).next_deadline() }
+fn object_waiter_next_deadline(now: nt_delay_execution::TimeSnapshot) -> Option<u64> {
+    unsafe { (&*core::ptr::addr_of!(OBJECT_WAITERS)).next_deadline(now) }
 }
 
 fn object_waiter_park(record: ObjectWaiterRecord) -> bool {
@@ -16919,7 +16947,7 @@ unsafe fn wait_park(
     alertable: bool,
     reply: nt_syscall_abi::ParkedSyscallReply,
     tid: u64,
-    deadline: Option<u64>,
+    deadline: nt_delay_execution::Deadline,
 ) -> bool {
     // Single-object wait = a 1-object WaitAny set.
     wait_park_multi(
@@ -17149,7 +17177,7 @@ unsafe fn keyed_wait_park(
     key: u64,
     reply: nt_syscall_abi::ParkedSyscallReply,
     tid: u64,
-    deadline: Option<u64>,
+    deadline: nt_delay_execution::Deadline,
 ) -> bool {
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     if stolen == 0 {
@@ -17163,7 +17191,7 @@ unsafe fn keyed_wait_park(
         key,
         reply_cap: stolen,
         tid,
-        deadline: deadline.unwrap_or(u64::MAX),
+        deadline,
         reply,
     }) {
         return false;
@@ -17208,7 +17236,7 @@ unsafe fn keyed_release_wait_park(
     key: u64,
     reply: nt_syscall_abi::ParkedSyscallReply,
     tid: u64,
-    deadline: Option<u64>,
+    deadline: nt_delay_execution::Deadline,
 ) -> bool {
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     if stolen == 0 {
@@ -17222,7 +17250,7 @@ unsafe fn keyed_release_wait_park(
         key,
         reply_cap: stolen,
         tid,
-        deadline: deadline.unwrap_or(u64::MAX),
+        deadline,
         reply,
     }) {
         return false;
@@ -17257,11 +17285,12 @@ unsafe fn keyed_release_wake_one(handler: &mut ExecNtHandler, key: u64, status: 
 
 unsafe fn keyed_wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
     let mut woken = 0;
+    let now = nt_time_snapshot_at(now);
     for slot in 0..keyed_waiter_len() {
         let Some(record) = keyed_waiter_record(slot) else {
             continue;
         };
-        if record.deadline > now {
+        if !record.deadline.is_due(now) {
             continue;
         }
         let cap = record.reply_cap;
@@ -17278,11 +17307,12 @@ unsafe fn keyed_wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
 
 unsafe fn keyed_release_wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
     let mut woken = 0;
+    let now = nt_time_snapshot_at(now);
     for slot in 0..keyed_release_waiter_len() {
         let Some(record) = keyed_release_waiter_record(slot) else {
             continue;
         };
-        if record.deadline > now {
+        if !record.deadline.is_due(now) {
             continue;
         }
         let cap = record.reply_cap;
@@ -17715,7 +17745,7 @@ unsafe fn wait_park_multi(
     alertable: bool,
     reply: nt_syscall_abi::ParkedSyscallReply,
     tid: u64,
-    deadline: Option<u64>,
+    deadline: nt_delay_execution::Deadline,
 ) -> bool {
     if objects.is_empty()
         || objects.len() > WAITER_MAX_EVENTS
@@ -17922,11 +17952,12 @@ unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<
 
 unsafe fn wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
     let mut woken = 0;
+    let now = nt_time_snapshot_at(now);
     for slot in 0..object_waiter_len() {
         let Some(record) = object_waiter_record(slot) else {
             continue;
         };
-        if record.deadline > now {
+        if !record.deadline.is_due(now) {
             continue;
         }
         let cap = record.reply_cap;
@@ -21520,8 +21551,7 @@ struct UserTimerRecord {
 
 #[derive(Clone, Copy)]
 struct PendingWaitTimeout {
-    specified: bool,
-    interval_100ns: i64,
+    deadline: nt_delay_execution::Deadline,
 }
 
 /// Allocation-safe handoff from native dispatch to the service-loop reply-cap owner after the LPC
@@ -21600,59 +21630,31 @@ struct LpcRequestContinuation {
 impl PendingWaitTimeout {
     const fn none() -> Self {
         Self {
-            specified: false,
-            interval_100ns: 0,
+            deadline: nt_delay_execution::Deadline::Infinite,
         }
     }
 
-    const fn from_interval(interval_100ns: i64) -> Self {
+    fn from_interval(interval_100ns: i64) -> Self {
+        let now = nt_time_snapshot();
         Self {
-            specified: true,
-            interval_100ns,
+            deadline: nt_delay_execution::Deadline::from_nt_timeout(Some(interval_100ns), now),
         }
     }
 
     fn is_none(self) -> bool {
-        !self.specified
+        self.deadline == nt_delay_execution::Deadline::Infinite
     }
 
     fn is_due_now(self) -> Option<bool> {
-        if self.specified {
-            let now = nt_time_snapshot();
-            Some(
-                nt_delay_execution::due_time(
-                    self.interval_100ns,
-                    now.monotonic_100ns,
-                    now.system_time_100ns,
-                )
-                .is_due(now),
-            )
-        } else {
+        if self.is_none() {
             None
+        } else {
+            Some(self.deadline.is_due(nt_time_snapshot()))
         }
     }
 
-    fn deadline_at_park(self) -> Option<u64> {
-        if self.specified {
-            let now = nt_time_snapshot();
-            nt_delay_execution::due_time(
-                self.interval_100ns,
-                now.monotonic_100ns,
-                now.system_time_100ns,
-            )
-            .monotonic_target(now)
-        } else {
-            None
-        }
-    }
-
-    fn tagged_deadline_at_park(self) -> nt_delay_execution::Deadline {
-        if self.specified {
-            let now = nt_time_snapshot();
-            nt_delay_execution::Deadline::from_nt_timeout(Some(self.interval_100ns), now)
-        } else {
-            nt_delay_execution::Deadline::Infinite
-        }
+    const fn deadline(self) -> nt_delay_execution::Deadline {
+        self.deadline
     }
 }
 

@@ -16565,3 +16565,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `Deadline`, remove `deadline_at_park` and its scalar projection, then make all three queues
     snapshot-driven in the same accepted slice. Preserve wait-all object consumption, keyed pairing,
     alertable/APC behavior, cancellation, and existing timeout statuses.
+
+    Tagged object and keyed-event waits (2026-08-30, focused validation complete): native timeout
+    capture now produces one `Deadline` at syscall admission. `PendingWaitTimeout` retains that tag
+    across handler dispatch and reply-cap transfer instead of retaining the original interval and
+    recomputing a later park deadline. This closes a real semantic error for relative waits: time
+    spent between user-memory capture and publication can no longer be added to the requested wait.
+
+    General single- and multiple-object waiter records and both keyed-event rendezvous tables store
+    the tag directly. Their shared HPET minimum and timeout drains use one coherent snapshot,
+    reproject absolute waits from current system time, and ignore explicit infinite waits. Normal
+    dispatcher wake, WaitAll consumption, keyed pairing, alertable/APC interruption, exact-thread
+    cancellation, timeout status, retained object references, and reply-cap ownership remain on the
+    same records. The obsolete `specified + interval`, `deadline_at_park`, `Option<u64>` handoffs,
+    `u64::MAX` sentinels, and due comparisons are deleted. Deadlock diagnostics now report each
+    retained deadline domain and the current monotonic projection of absolute deadlines. The
+    freestanding executive passes at the accepted 209-warning baseline.
+
+    Review adjustment: migrate native user waitable timers next. Replace `UserTimerRecord::due_100ns`
+    with `Deadline`, delete the scalar `USER_TIMER_NEXT_DEADLINE` cache, and make minimum discovery,
+    first-fire expiry, cancellation, and APC delivery snapshot-driven. Absolute first fires must
+    follow system-clock movement; periodic rearms become relative monotonic deadlines after the first
+    fire. Do not install the adjustable clock authority while this final native timer owner can still
+    retain a stale scalar projection.

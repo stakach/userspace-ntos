@@ -9222,11 +9222,11 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_wait_set_n: usize = 0;
             let mut park_wait_set_all = false;
             let mut park_wait_alertable = false;
-            let mut park_wait_deadline: Option<u64> = None;
+            let mut park_wait_deadline = nt_delay_execution::Deadline::Infinite;
             let mut park_keyed_wait_key: u64 = u64::MAX;
-            let mut park_keyed_wait_deadline: Option<u64> = None;
+            let mut park_keyed_wait_deadline = nt_delay_execution::Deadline::Infinite;
             let mut park_keyed_release_wait_key: u64 = u64::MAX;
-            let mut park_keyed_release_wait_deadline: Option<u64> = None;
+            let mut park_keyed_release_wait_deadline = nt_delay_execution::Deadline::Infinite;
             let mut park_delay_deadline: Option<nt_delay_execution::Deadline> = None;
             let mut park_io_completion_port: i64 = -1;
             let mut park_io_completion_key_out: u64 = 0;
@@ -9802,13 +9802,13 @@ pub(crate) unsafe fn service_sec_image(
                 if nt_handler.wait_park_event >= 0 {
                     park_wait_event = nt_handler.wait_park_event;
                     park_wait_alertable = nt_handler.wait_alertable;
-                    park_wait_deadline = nt_handler.wait_timeout.deadline_at_park();
+                    park_wait_deadline = nt_handler.wait_timeout.deadline();
                 }
                 if nt_handler.wait_park_count > 0 {
                     park_wait_set_n = nt_handler.wait_park_count;
                     park_wait_set_all = nt_handler.wait_park_all;
                     park_wait_alertable = nt_handler.wait_alertable;
-                    park_wait_deadline = nt_handler.wait_timeout.deadline_at_park();
+                    park_wait_deadline = nt_handler.wait_timeout.deadline();
                     park_wait_set[..park_wait_set_n]
                         .copy_from_slice(&nt_handler.wait_park_objects[..park_wait_set_n]);
                     park_wait_indices[..park_wait_set_n]
@@ -9816,12 +9816,12 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 if nt_handler.keyed_wait_key != u64::MAX {
                     park_keyed_wait_key = nt_handler.keyed_wait_key;
-                    park_keyed_wait_deadline = nt_handler.keyed_wait_timeout.deadline_at_park();
+                    park_keyed_wait_deadline = nt_handler.keyed_wait_timeout.deadline();
                 }
                 if nt_handler.keyed_release_wait_key != u64::MAX {
                     park_keyed_release_wait_key = nt_handler.keyed_release_wait_key;
                     park_keyed_release_wait_deadline =
-                        nt_handler.keyed_release_wait_timeout.deadline_at_park();
+                        nt_handler.keyed_release_wait_timeout.deadline();
                 }
                 if nt_handler.delay_requested {
                     let now = nt_time_snapshot();
@@ -9839,8 +9839,7 @@ pub(crate) unsafe fn service_sec_image(
                     park_io_completion_key_out = nt_handler.io_completion_key_out;
                     park_io_completion_apc_out = nt_handler.io_completion_apc_out;
                     park_io_completion_iosb_out = nt_handler.io_completion_iosb_out;
-                    park_io_completion_deadline =
-                        nt_handler.io_completion_timeout.tagged_deadline_at_park();
+                    park_io_completion_deadline = nt_handler.io_completion_timeout.deadline();
                 }
                 if nt_handler.io_completion_wake.is_some() {
                     let _ = unsafe { io_completion_deliver(&mut nt_handler) };
@@ -15413,7 +15412,9 @@ pub(crate) unsafe fn service_sec_image(
             // Keyed-event release park (`NtReleaseKeyedEvent`): if no wait side is already parked,
             // the release side waits for a future `NtWaitForKeyedEvent` on the same key.
             if park_keyed_release_wait_key != u64::MAX && reply_main != 0 {
-                if park_keyed_release_wait_deadline.is_some() && !delay_timer_init() {
+                let timed = park_keyed_release_wait_deadline
+                    != nt_delay_execution::Deadline::Infinite;
+                if timed && !delay_timer_init() {
                     result = 0xC000_009A;
                 } else if keyed_release_wait_park(
                     park_keyed_release_wait_key,
@@ -15424,12 +15425,12 @@ pub(crate) unsafe fn service_sec_image(
                     delay_timer_rearm_after_park(
                         delay_queue,
                         &mut nt_handler,
-                        park_keyed_release_wait_deadline.is_some(),
+                        timed,
                     );
                     print_str(b"[keyed] NtReleaseKeyedEvent key=0x");
                     print_hex_u64(park_keyed_release_wait_key);
                     print_str(b" -> PARK releaser\n");
-                    if park_keyed_release_wait_deadline.is_none() {
+                    if !timed {
                         trace_indefinite_wait_park(
                             &nt_handler,
                             badge,
@@ -15459,7 +15460,8 @@ pub(crate) unsafe fn service_sec_image(
             // Keyed-event wait park (`NtWaitForKeyedEvent`): used by ReactOS condition variables and
             // run-once state. The matching `NtReleaseKeyedEvent` wakes via keyed_wait_wake_one.
             if park_keyed_wait_key != u64::MAX && reply_main != 0 {
-                if park_keyed_wait_deadline.is_some() && !delay_timer_init() {
+                let timed = park_keyed_wait_deadline != nt_delay_execution::Deadline::Infinite;
+                if timed && !delay_timer_init() {
                     result = 0xC000_009A;
                 } else if keyed_wait_park(
                     park_keyed_wait_key,
@@ -15470,12 +15472,12 @@ pub(crate) unsafe fn service_sec_image(
                     delay_timer_rearm_after_park(
                         delay_queue,
                         &mut nt_handler,
-                        park_keyed_wait_deadline.is_some(),
+                        timed,
                     );
                     print_str(b"[keyed] NtWaitForKeyedEvent key=0x");
                     print_hex_u64(park_keyed_wait_key);
                     print_str(b" -> PARK caller\n");
-                    if park_keyed_wait_deadline.is_none() {
+                    if !timed {
                         trace_indefinite_wait_park(
                             &nt_handler,
                             badge,
@@ -15526,6 +15528,7 @@ pub(crate) unsafe fn service_sec_image(
                 && WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) == 0;
             let park_wait_tid = nt_handler.current_tid;
             if park_wait_event >= 0 && reply_main != 0 {
+                let timed = park_wait_deadline != nt_delay_execution::Deadline::Infinite;
                 let park_object = match WaitObject::from_raw(park_wait_event as u64) {
                     Some(object) => object,
                     None => {
@@ -15535,7 +15538,7 @@ pub(crate) unsafe fn service_sec_image(
                 };
                 if park_object == WaitObject::FREE {
                     // Invalid handoff; return STATUS_INVALID_HANDLE through the normal reply path.
-                } else if park_wait_deadline.is_some() && !delay_timer_init() {
+                } else if timed && !delay_timer_init() {
                     result = 0xC000_009A;
                 } else if wait_park(
                     &mut nt_handler,
@@ -15550,13 +15553,13 @@ pub(crate) unsafe fn service_sec_image(
                     delay_timer_rearm_after_park(
                         delay_queue,
                         &mut nt_handler,
-                        park_wait_deadline.is_some(),
+                        timed,
                     );
                     if winlogon_worker_can_signal && wait_still_parked {
                         WINLOGON_MAIN_EVENT_WAIT_PARKED.store(1, Ordering::Relaxed);
                         print_str(b"[wl-main] parked on worker-ready event; runnable worker remains a signaler\n");
                     }
-                    if park_wait_deadline.is_none() && wait_still_parked {
+                    if !timed && wait_still_parked {
                         trace_indefinite_wait_park(
                             &nt_handler,
                             badge,
@@ -15584,7 +15587,8 @@ pub(crate) unsafe fn service_sec_image(
             // Array-wait park: retain the exact typed set and park the reply capability. Any matching
             // owner transition wakes it through the shared dispatcher path with WAIT_0+index.
             if park_wait_set_n > 0 && reply_main != 0 {
-                if park_wait_deadline.is_some() && !delay_timer_init() {
+                let timed = park_wait_deadline != nt_delay_execution::Deadline::Infinite;
+                if timed && !delay_timer_init() {
                     result = 0xC000_009A;
                 } else if wait_park_multi(
                     &mut nt_handler,
@@ -15601,7 +15605,7 @@ pub(crate) unsafe fn service_sec_image(
                     delay_timer_rearm_after_park(
                         delay_queue,
                         &mut nt_handler,
-                        park_wait_deadline.is_some(),
+                        timed,
                     );
                     print_str(b"[wait] pi=");
                     print_u64(pi as u64);
@@ -15612,7 +15616,7 @@ pub(crate) unsafe fn service_sec_image(
                     } else {
                         b" objects, WaitAny) UNSIGNALLED -> PARK caller\n"
                     });
-                    if park_wait_deadline.is_none() && wait_still_parked {
+                    if !timed && wait_still_parked {
                         trace_indefinite_wait_park(
                             &nt_handler,
                             badge,
@@ -18829,7 +18833,7 @@ pub(crate) unsafe fn service_sec_image(
                             false,
                             w_reply,
                             0xD1D1_0001,
-                            None,
+                            nt_delay_execution::Deadline::Infinite,
                         )
                         && marker_d() == 0;
                     // A queue-side post through the very entry the fault path uses SETS the
