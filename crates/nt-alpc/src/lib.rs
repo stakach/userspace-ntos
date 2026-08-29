@@ -58,7 +58,8 @@ use nt_alpc_abi::{
     AlpcViewIoRequest,
 };
 use nt_port_core::{
-    ConnectOutcome, DataView, MessageAttrs, PortApi, PortCore, QueuedMessage, ReceiveOutcome,
+    ConnectOutcome, DataView, MessageAttrs, PortApi, PortCore, PortLimits, QueuedMessage,
+    ReceiveOutcome, MAX_CONNINFO,
 };
 use nt_status::NtStatus;
 
@@ -245,7 +246,15 @@ impl AlpcServer {
     fn op_create_port(&mut self, core: &mut PortCore, buf: &[u8]) -> Result<AlpcReply, NtStatus> {
         let req: AlpcCreatePortRequest = read_req(buf)?;
         let name = read_name(buf, req.name_offset, req.name_len_bytes)?;
-        let handle = core.create_port(&name, PortApi::Alpc);
+        let handle = core.create_port_with_limits(
+            &name,
+            PortApi::Alpc,
+            PortLimits {
+                max_connection_info: MAX_CONNINFO as u32,
+                max_message: req.max_message_length,
+                max_pool_usage: 0,
+            },
+        )?;
         Ok(reply(NtStatus::SUCCESS, 0, handle, 0))
     }
 

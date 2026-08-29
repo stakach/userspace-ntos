@@ -23408,12 +23408,10 @@ fn hosted_thread_runtime_table_stats() -> (usize, usize, usize, u64, u64) {
     unsafe { (&*core::ptr::addr_of!(HOSTED_THREAD_RUNTIME_WORK)).stats() }
 }
 
-/// One established LPC connection cached executive-side (the data-plane record — see
-/// `ExecNtHandler::lpc_connections`). Identity + peer refs only; the message queues will live here
-/// when the data plane lands. `Copy`/inline (no nested heap) so it survives the per-syscall bump reset.
-// Fields are populated now (control plane) and consumed when the direct message data plane lands
-// (path B / bulk) — write-only until then.
-#[allow(dead_code)]
+/// One established LPC connection cached executive-side (see
+/// `ExecNtHandler::lpc_connections`). The isolated broker owns transport state; this bounded record
+/// retains only the kernel-side process association and broker-authored connection metadata needed
+/// to validate native service boundaries. `Copy`/inline storage survives the per-syscall bump reset.
 #[derive(Clone, Copy)]
 struct LpcConnRecord {
     /// The broker's connection id (ties back to the nt-lpc-server connection).
@@ -23422,6 +23420,10 @@ struct LpcConnRecord {
     client_handle: u64,
     /// Which hosted process connected (0 = smss, 1 = csrss) — the connector badge for direct delivery.
     connector_pi: u8,
+    /// Broker-owned limits inherited from the named connection port.
+    limits: nt_port_core::PortLimits,
+    /// QoS captured by the kernel before the broker connection was queued.
+    security: nt_port_core::ConnectionSecurity,
     /// Folded port name (inline; `\SmApiPort` etc. fit in 32 units).
     name: [u16; 32],
     name_len: u8,

@@ -127,6 +127,8 @@ statuses! {
     FILE_CLOSED = 0xC000_0128u32;
     /// The output buffer is too small for the result.
     BUFFER_TOO_SMALL = 0xC000_0023u32;
+    /// A native port message exceeds the maximum length configured on its connection port.
+    PORT_MESSAGE_TOO_LONG = 0xC000_002Fu32;
     /// The end of the file / device stream was reached.
     END_OF_FILE = 0xC000_0011u32;
     /// A view size (e.g. an ALPC section view) exceeds the underlying section.

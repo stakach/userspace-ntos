@@ -24311,12 +24311,35 @@ impl ExecNtHandler {
         if client_handle == 0 {
             return false;
         }
+        let Some(metadata) = (unsafe { lpc_client() })
+            .and_then(|client| client.query_handle(client_handle).ok())
+            .filter(|metadata| {
+                metadata.endpoint == nt_lpc_abi::handle_endpoint::CLIENT_COMM_PORT
+                    && metadata.connection_id == connection_id
+                    && metadata.security_present
+            })
+        else {
+            print_str(b"[lpc-cache] broker metadata unavailable for completed connection\n");
+            return false;
+        };
+        let limits = nt_port_core::PortLimits {
+            max_connection_info: metadata.max_connection_info,
+            max_message: metadata.max_message,
+            max_pool_usage: metadata.max_pool_usage,
+        };
+        let security = nt_port_core::ConnectionSecurity {
+            impersonation_level: metadata.impersonation_level,
+            dynamic_tracking: metadata.dynamic_tracking,
+            effective_only: metadata.effective_only,
+        };
         let connector_pi = connector_pi.min(u8::MAX as usize) as u8;
         let trace_lsa = Self::lpc_name_equals_ascii(name, b"\\lsaauthenticationport");
         if let Some(connection) = self.lpc_connections.iter_mut().find(|connection| {
             connection.client_handle == client_handle && connection.connector_pi == connector_pi
         }) {
             connection.connection_id = connection_id;
+            connection.limits = limits;
+            connection.security = security;
             let n = name.len().min(connection.name.len());
             connection.name = [0; 32];
             connection.name[..n].copy_from_slice(&name[..n]);
@@ -24353,6 +24376,8 @@ impl ExecNtHandler {
             connection_id,
             client_handle,
             connector_pi,
+            limits,
+            security,
             name: buf,
             name_len: n as u8,
         });
@@ -24402,6 +24427,16 @@ impl ExecNtHandler {
                             && (wide as u8).to_ascii_lowercase() == ascii.to_ascii_lowercase()
                     })
         })
+    }
+
+    fn lpc_connection_max_message(&self, handle: u64, connector_pi: usize) -> Option<u32> {
+        self.lpc_connections
+            .iter()
+            .find(|connection| {
+                connection.client_handle == handle
+                    && connection.connector_pi as usize == connector_pi
+            })
+            .map(|connection| connection.limits.max_message)
     }
 
     fn trace_lpc_connection_miss(&self, handle: u64, connector_pi: usize, name: &[u8]) {
@@ -24464,6 +24499,7 @@ impl ExecNtHandler {
         subsystem_type: u32,
         conn_info: &[u8],
         port_handle_out: u64,
+        security: nt_port_core::ConnectionSecurity,
     ) -> u32 {
         const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
         const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
@@ -24479,12 +24515,15 @@ impl ExecNtHandler {
             print_str(b"[srm-rdv] LPC broker unavailable for \\SeRmCommandPort connect\n");
             return STATUS_UNSUCCESSFUL;
         };
-        let connect = match lpc.connect_port_with_client_id(
+        let connect = match lpc.connect_port_with_client_security(
             name16,
             subsystem_type,
             conn_info,
             client_process,
             client_thread,
+            security.impersonation_level,
+            security.dynamic_tracking,
+            security.effective_only,
         ) {
             Ok(connect) if connect.pending && connect.connection_id != 0 => connect,
             Ok(connect) => {
@@ -24563,8 +24602,11 @@ impl ExecNtHandler {
             }
         };
 
+        let _ = lpc;
+        if !self.cache_lpc_connection(connect.connection_id, client_handle, name16) {
+            return STATUS_UNSUCCESSFUL;
+        }
         self.queue_write(port_handle_out, client_handle);
-        self.cache_lpc_connection(connect.connection_id, client_handle, name16);
 
         let lsa_command_name: alloc::vec::Vec<u16> = "\\SeLsaCommandPort".encode_utf16().collect();
         if self.lpc_port_handle_for_name16(&lsa_command_name).is_none() {
@@ -24573,7 +24615,19 @@ impl ExecNtHandler {
             );
             return STATUS_OBJECT_NAME_NOT_FOUND;
         }
-        match lpc.connect_port(&lsa_command_name, 0, &[]) {
+        let Some(lpc) = lpc_client() else {
+            return STATUS_UNSUCCESSFUL;
+        };
+        match lpc.connect_port_with_client_security(
+            &lsa_command_name,
+            0,
+            &[],
+            0,
+            0,
+            nt_security::SecurityImpersonationLevel::Impersonation as u32,
+            true,
+            true,
+        ) {
             Ok(reverse) if reverse.pending && reverse.connection_id != 0 => {
                 print_str(b"[srm-rdv] kernel SRM queued \\SeLsaCommandPort reverse connect conn=");
                 print_u64(reverse.connection_id);
@@ -24613,7 +24667,12 @@ impl ExecNtHandler {
         0
     }
 
-    pub(crate) unsafe fn service_srm_request_reply(&mut self, reqmsg: u64, replymsg: u64) -> u32 {
+    pub(crate) unsafe fn service_srm_request_reply(
+        &mut self,
+        port_handle: u64,
+        reqmsg: u64,
+        replymsg: u64,
+    ) -> u32 {
         const PORT_MESSAGE_HEADER_LEN: u64 = 0x28;
         const SRM_API_OFFSET: u64 = PORT_MESSAGE_HEADER_LEN;
         const SRM_RESULT_OFFSET: u64 = PORT_MESSAGE_HEADER_LEN + 4;
@@ -24628,7 +24687,16 @@ impl ExecNtHandler {
         if !self.xas_read(reqmsg, &mut header) {
             return STATUS_ACCESS_VIOLATION;
         }
-        let total_len = u16::from_le_bytes([header[2], header[3]]) as u64;
+        let Some(total_len) = nt_lpc_abi::port_message_total_length(header).map(|len| len as u64)
+        else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let Some(max_message) = self.lpc_connection_max_message(port_handle, self.pi) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        if total_len > max_message as u64 {
+            return nt_status::NtStatus::PORT_MESSAGE_TOO_LONG.raw() as u32;
+        }
         let mut api_bytes = [0u8; 4];
         if total_len < SRM_API_OFFSET + 4 || !self.xas_read(reqmsg + SRM_API_OFFSET, &mut api_bytes)
         {
@@ -25034,7 +25102,7 @@ impl ExecNtHandler {
         listen_handle: u64,
         qos_pointer: u64,
         server_sid_pointer: u64,
-    ) -> Result<(), u32> {
+    ) -> Result<(nt_port_core::ConnectionSecurity, u32), u32> {
         const QOS_SIZE: usize = 12;
         if qos_pointer & 3 != 0 {
             return Err(STATUS_DATATYPE_MISALIGNMENT);
@@ -25090,7 +25158,15 @@ impl ExecNtHandler {
         print_str(b" effective-only=");
         print_u64(security.qos.effective_only as u64);
         print_str(b"\n");
-        Ok(())
+        Ok((
+            nt_port_core::ConnectionSecurity {
+                impersonation_level: security.qos.impersonation_level as u32,
+                dynamic_tracking: security.qos.tracking_mode
+                    == nt_security::SecurityContextTrackingMode::Dynamic,
+                effective_only: security.qos.effective_only,
+            },
+            port.max_message,
+        ))
     }
 
     /// Service a Win32 process' kernel32 CSR client connect (NtSecureConnectPort → \Windows\ApiPort).
@@ -25109,6 +25185,7 @@ impl ExecNtHandler {
         clientview_ptr: u64,
         server_sid_pointer: u64,
         serverview_ptr: u64,
+        max_message_length_ptr: u64,
         conninfo_ptr: u64,
         conninfo_len_ptr: u64,
     ) -> u32 {
@@ -25127,11 +25204,14 @@ impl ExecNtHandler {
             CSR_RENDEZVOUS_FAILURES.fetch_add(1, Ordering::Relaxed);
             return 0xC000_0034;
         };
-        if let Err(status) =
-            self.validate_secure_lpc_connect(listen_handle, qos_pointer, server_sid_pointer)
-        {
-            return status;
-        }
+        let (security, max_message_length) = match self.validate_secure_lpc_connect(
+            listen_handle,
+            qos_pointer,
+            server_sid_pointer,
+        ) {
+            Ok(validated) => validated,
+            Err(status) => return status,
+        };
         if serverview_ptr != 0 {
             let mut server_view = [0u8; 0x18];
             if !self.xas_read(serverview_ptr, &mut server_view) {
@@ -25141,6 +25221,11 @@ impl ExecNtHandler {
             {
                 return STATUS_INVALID_PARAMETER;
             }
+        }
+        if max_message_length_ptr != 0
+            && !self.xas_write_u32(max_message_length_ptr, max_message_length)
+        {
+            return STATUS_ACCESS_VIOLATION;
         }
         const SECTION_MAP_WRITE: u32 = 0x0002;
         const SECTION_MAP_READ: u32 = 0x0004;
@@ -25208,12 +25293,15 @@ impl ExecNtHandler {
         let client_process = self.pm_pid_for_pi(self.pi).unwrap_or(0) as u64;
         let client_thread = self.current_tid;
         if let Some(c) = lpc_client() {
-            match c.connect_port_with_client_id(
+            match c.connect_port_with_client_security(
                 name16,
                 2,
                 &connection_info,
                 client_process,
                 client_thread,
+                security.impersonation_level,
+                security.dynamic_tracking,
+                security.effective_only,
             ) {
                 Ok(r) if r.pending && r.connection_id != 0 => {
                     self.csr_rendezvous_conn = r.connection_id;
@@ -30275,6 +30363,7 @@ impl ExecNtHandler {
                     clientview_ptr,
                     args[4],
                     args[5],
+                    args[6],
                     conninfo_ptr,
                     conninfo_len_ptr,
                 )
@@ -30307,7 +30396,7 @@ impl ExecNtHandler {
                     return 0xC000_0001;
                 }
                 if self.lpc_connection_is(args[0], self.pi, b"\\sermcommandport") {
-                    return self.service_srm_request_reply(args[1], args[2]);
+                    return self.service_srm_request_reply(args[0], args[1], args[2]);
                 }
                 print_str(b"[lpc-msg] NtRequestWaitReplyPort on an unregistered LPC connection -> failing\n");
                 0xC000_0008 // STATUS_INVALID_HANDLE
@@ -30368,6 +30457,27 @@ impl ExecNtHandler {
                 } else {
                     0
                 };
+                let Some(listen_handle) = self.lpc_port_handle_for_name16(&name16) else {
+                    print_str(b"[lpc-connect] no named LPC port object for ");
+                    for &unit in name16.iter().take(64) {
+                        let byte = if (0x20..=0x7e).contains(&unit) {
+                            unit as u8
+                        } else {
+                            b'?'
+                        };
+                        print_str(core::slice::from_ref(&byte));
+                    }
+                    print_str(b" -> failing\n");
+                    return 0xC000_0034;
+                };
+                let (security, max_message_length) =
+                    match self.validate_secure_lpc_connect(listen_handle, args[2], 0) {
+                        Ok(validated) => validated,
+                        Err(status) => return status,
+                    };
+                if args[5] != 0 && !self.xas_write_u32(args[5], max_message_length) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
                 // \SeRmCommandPort — ReactOS' kernel SRM creates this command port before LSASS.
                 // LSASS connects during LsapRmInitializeServer; the executive owns the SRM side, drains
                 // the broker's connection request, accepts it, and completes it through the same LPC
@@ -30380,38 +30490,32 @@ impl ExecNtHandler {
                         subsystem_type,
                         &conn_info[..conn_info_len],
                         args[0],
+                        security,
                     );
-                }
-                if self.lpc_port_handle_for_name16(&name16).is_none() {
-                    print_str(b"[lpc-connect] no named LPC port object for ");
-                    for &unit in name16.iter().take(64) {
-                        let byte = if (0x20..=0x7e).contains(&unit) {
-                            unit as u8
-                        } else {
-                            b'?'
-                        };
-                        print_str(core::slice::from_ref(&byte));
-                    }
-                    print_str(b" -> failing\n");
-                    return 0xC000_0034;
                 }
                 let client_process = self.pm_pid_for_pi(self.pi).unwrap_or(0) as u64;
                 let client_thread = self.current_tid;
                 match lpc_client().map(|c| {
-                    c.connect_port_with_client_id(
+                    c.connect_port_with_client_security(
                         &name16,
                         subsystem_type,
                         &conn_info[..conn_info_len],
                         client_process,
                         client_thread,
+                        security.impersonation_level,
+                        security.dynamic_tracking,
+                        security.effective_only,
                     )
                 }) {
                     Some(Ok(r)) => {
                         if !r.pending && r.handle != 0 {
                             // AutoAccept (interim): the broker modelled the acceptor — complete now.
-                            self.queue_write(args[0], r.handle);
-                            self.cache_lpc_connection(r.connection_id, r.handle, &name16);
-                            0 // STATUS_SUCCESS
+                            if self.cache_lpc_connection(r.connection_id, r.handle, &name16) {
+                                self.queue_write(args[0], r.handle);
+                                0 // STATUS_SUCCESS
+                            } else {
+                                STATUS_UNSUCCESSFUL
+                            }
                         } else if r.pending {
                             // Manual (path B, authentic): the connection is Pending in the broker.
                             // Signal the LOOP to drive `sm_rendezvous` (the REAL SmpApiLoop accept)

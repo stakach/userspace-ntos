@@ -41,7 +41,8 @@ use nt_lpc_abi::{
     LpcReceiveRequest, LpcReply, LPC_ACCEPT_RESPONSE_INFO, LPC_QUERY_HANDLE_NAME_MAX_UNITS,
 };
 use nt_port_core::{
-    ConnectOutcome, MessageAttrs, PortApi, PortCore, PortHandleEndpoint, ReceiveOutcome,
+    ConnectOutcome, ConnectionSecurity, MessageAttrs, PortApi, PortCore, PortHandleEndpoint,
+    PortLimits, ReceiveOutcome,
 };
 use nt_status::NtStatus;
 
@@ -151,14 +152,19 @@ impl Server {
     fn op_create_port(&mut self, buf: &[u8]) -> Result<LpcReply, NtStatus> {
         let req: LpcCreatePortRequest = read_req(buf)?;
         let name = read_name(buf, req.name_offset, req.name_len_bytes)?;
-        let handle = self.core.create_port_with_owner(
+        let handle = self.core.create_port_with_owner_and_limits(
             &name,
             PortApi::Lpc,
             nt_port_core::ClientId {
                 process: req.server_process,
                 thread: req.server_thread,
             },
-        );
+            PortLimits {
+                max_connection_info: req.max_connection_info,
+                max_message: req.max_message,
+                max_pool_usage: req.max_pool,
+            },
+        )?;
         Ok(reply(NtStatus::SUCCESS, 0, handle, 0))
     }
 
@@ -166,7 +172,7 @@ impl Server {
         let req: LpcConnectPortRequest = read_req(buf)?;
         let name = read_name(buf, req.name_offset, req.name_len_bytes)?;
         let conn_info = read_blob(buf, req.conninfo_offset, req.conninfo_len_bytes)?;
-        match self.core.connect_with_client_id(
+        match self.core.connect_with_client_id_and_security(
             &name,
             PortApi::Lpc,
             req.subsystem_type,
@@ -174,6 +180,11 @@ impl Server {
             nt_port_core::ClientId {
                 process: req.client_process,
                 thread: req.client_thread,
+            },
+            ConnectionSecurity {
+                impersonation_level: req.impersonation_level,
+                dynamic_tracking: req.dynamic_tracking != 0,
+                effective_only: req.effective_only != 0,
             },
         )? {
             ConnectOutcome::Completed {
@@ -390,6 +401,24 @@ impl Server {
             connection_id: info.connection_id,
             server_process: info.server_id.process,
             server_thread: info.server_id.thread,
+            max_connection_info: info.limits.max_connection_info,
+            max_message: info.limits.max_message,
+            max_pool_usage: info.limits.max_pool_usage,
+            impersonation_level: info
+                .security
+                .map(|security| security.impersonation_level)
+                .unwrap_or(0),
+            dynamic_tracking: info
+                .security
+                .map(|security| u8::from(security.dynamic_tracking))
+                .unwrap_or(0),
+            effective_only: info
+                .security
+                .map(|security| u8::from(security.effective_only))
+                .unwrap_or(0),
+            security_present: u8::from(info.security.is_some()),
+            _reserved3: 0,
+            _reserved4: 0,
             name: [0; LPC_QUERY_HANDLE_NAME_MAX_UNITS],
         };
         response.name[..info.port_name.len()].copy_from_slice(info.port_name);
@@ -787,10 +816,26 @@ mod tests {
                 out: [0; 512],
             });
             listen = c
-                .create_port_with_owner(&utf16("\\LsaAuthenticationPort"), 0, 0, 0, 0x120, 0x124)
+                .create_port_with_owner(
+                    &utf16("\\LsaAuthenticationPort"),
+                    0x88,
+                    0x148,
+                    0x2400,
+                    0x120,
+                    0x124,
+                )
                 .unwrap();
             conn_id = c
-                .connect_port(&utf16("\\LSAAUTHENTICATIONPORT"), 0, &[])
+                .connect_port_with_client_security(
+                    &utf16("\\LSAAUTHENTICATIONPORT"),
+                    0,
+                    &[],
+                    0x44,
+                    0x48,
+                    2,
+                    true,
+                    true,
+                )
                 .unwrap()
                 .connection_id;
         }
@@ -815,6 +860,10 @@ mod tests {
         assert_eq!(listen_info.name, utf16("\\lsaauthenticationport"));
         assert_eq!(listen_info.server_process, 0x120);
         assert_eq!(listen_info.server_thread, 0x124);
+        assert_eq!(listen_info.max_connection_info, 0x88);
+        assert_eq!(listen_info.max_message, 0x148);
+        assert_eq!(listen_info.max_pool_usage, 0x2400);
+        assert!(!listen_info.security_present);
 
         let client_info = c.query_handle(client).unwrap();
         assert_eq!(client_info.endpoint, handle_endpoint::CLIENT_COMM_PORT);
@@ -823,6 +872,13 @@ mod tests {
         assert_eq!(client_info.name, utf16("\\lsaauthenticationport"));
         assert_eq!(client_info.server_process, 0x120);
         assert_eq!(client_info.server_thread, 0x124);
+        assert_eq!(client_info.max_connection_info, 0x88);
+        assert_eq!(client_info.max_message, 0x148);
+        assert_eq!(client_info.max_pool_usage, 0x2400);
+        assert_eq!(client_info.impersonation_level, 2);
+        assert!(client_info.dynamic_tracking);
+        assert!(client_info.effective_only);
+        assert!(client_info.security_present);
 
         let server_info = c.query_handle(server).unwrap();
         assert_eq!(server_info.endpoint, handle_endpoint::SERVER_COMM_PORT);
@@ -831,6 +887,11 @@ mod tests {
         assert_eq!(server_info.name, utf16("\\lsaauthenticationport"));
         assert_eq!(server_info.server_process, 0x120);
         assert_eq!(server_info.server_thread, 0x124);
+        assert_eq!(server_info.max_message, 0x148);
+        assert_eq!(server_info.impersonation_level, 2);
+        assert!(server_info.dynamic_tracking);
+        assert!(server_info.effective_only);
+        assert!(server_info.security_present);
 
         assert_eq!(
             c.query_handle(0xfeed).unwrap_err(),
@@ -850,7 +911,7 @@ mod tests {
                 server: &mut s,
                 out: [0; 512],
             });
-            let ph = c.create_port(&utf16("\\P"), 0, 0, 0).unwrap();
+            let ph = c.create_port(&utf16("\\P"), 0, 0x148, 0).unwrap();
             let r = c.connect_port(&utf16("\\P"), 0, &[]).unwrap();
             (ph, r.connection_id)
         };

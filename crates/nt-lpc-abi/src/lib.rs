@@ -17,7 +17,7 @@
 #![no_std]
 
 /// ABI version. Bump on any incompatible wire change.
-pub const LPC_ABI_VERSION: u32 = 3;
+pub const LPC_ABI_VERSION: u32 = 4;
 
 /// The reserved SURT opcode range for the LPC protocol (fresh block after
 /// object 0x2000 / config 0x2100).
@@ -160,6 +160,13 @@ pub struct LpcConnectPortRequest {
     pub client_process: u64,
     /// Kernel-supplied connector `CLIENT_ID.UniqueThread`.
     pub client_thread: u64,
+    /// Kernel-captured `SECURITY_QUALITY_OF_SERVICE.ImpersonationLevel`.
+    pub impersonation_level: u32,
+    /// Normalized non-zero when the captured tracking mode is dynamic.
+    pub dynamic_tracking: u8,
+    /// Normalized non-zero when only enabled privileges/groups may be used.
+    pub effective_only: u8,
+    pub _reserved2: u16,
 }
 
 /// Broker transport metadata prepended to connection information returned by
@@ -265,6 +272,16 @@ pub struct LpcQueryHandleResponse {
     pub connection_id: u64,
     pub server_process: u64,
     pub server_thread: u64,
+    pub max_connection_info: u32,
+    pub max_message: u32,
+    pub max_pool_usage: u32,
+    pub impersonation_level: u32,
+    pub dynamic_tracking: u8,
+    pub effective_only: u8,
+    /// Non-zero for communication ports whose connector QoS is present.
+    pub security_present: u8,
+    pub _reserved3: u8,
+    pub _reserved4: u32,
     pub name: [u16; LPC_QUERY_HANDLE_NAME_MAX_UNITS],
 }
 
@@ -278,6 +295,15 @@ impl Default for LpcQueryHandleResponse {
             connection_id: 0,
             server_process: 0,
             server_thread: 0,
+            max_connection_info: 0,
+            max_message: 0,
+            max_pool_usage: 0,
+            impersonation_level: 0,
+            dynamic_tracking: 0,
+            effective_only: 0,
+            security_present: 0,
+            _reserved3: 0,
+            _reserved4: 0,
             name: [0; LPC_QUERY_HANDLE_NAME_MAX_UNITS],
         }
     }
@@ -301,7 +327,7 @@ pub struct LpcReply {
 const _: () = {
     use core::mem::{align_of, size_of};
     assert!(size_of::<LpcCreatePortRequest>() == 40);
-    assert!(size_of::<LpcConnectPortRequest>() == 40);
+    assert!(size_of::<LpcConnectPortRequest>() == 48);
     assert!(size_of::<LpcConnectionRequestMetadata>() == 32);
     assert!(size_of::<LpcAcceptConnectRequest>() == 32);
     assert!(size_of::<LpcCompleteConnectRequest>() == 16);
@@ -309,7 +335,7 @@ const _: () = {
     assert!(size_of::<LpcMessageRequest>() == 24);
     assert!(size_of::<LpcClosePortRequest>() == 16);
     assert!(size_of::<LpcQueryHandleRequest>() == 16);
-    assert!(size_of::<LpcQueryHandleResponse>() == 160);
+    assert!(size_of::<LpcQueryHandleResponse>() == 184);
     assert!(size_of::<LpcReply>() == 24);
     assert!(align_of::<LpcAcceptConnectRequest>() == 8);
     assert!(align_of::<LpcCreatePortRequest>() == 8);
@@ -362,6 +388,6 @@ mod tests {
 
     #[test]
     fn version_is_current() {
-        assert_eq!(LPC_ABI_VERSION, 3);
+        assert_eq!(LPC_ABI_VERSION, 4);
     }
 }

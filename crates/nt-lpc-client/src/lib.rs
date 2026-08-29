@@ -69,6 +69,13 @@ pub struct HandleQueryResult {
     pub connection_id: u64,
     pub server_process: u64,
     pub server_thread: u64,
+    pub max_connection_info: u32,
+    pub max_message: u32,
+    pub max_pool_usage: u32,
+    pub impersonation_level: u32,
+    pub dynamic_tracking: bool,
+    pub effective_only: bool,
+    pub security_present: bool,
     pub name: Vec<u16>,
 }
 
@@ -153,6 +160,31 @@ impl<B: Backend> LpcClient<B> {
         client_process: u64,
         client_thread: u64,
     ) -> Result<ConnectResult, NtStatus> {
+        self.connect_port_with_client_security(
+            name,
+            subsystem_type,
+            conn_info,
+            client_process,
+            client_thread,
+            0,
+            false,
+            false,
+        )
+    }
+
+    /// Connect while preserving caller identity and kernel-captured security QoS.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_port_with_client_security(
+        &mut self,
+        name: &[u16],
+        subsystem_type: u32,
+        conn_info: &[u8],
+        client_process: u64,
+        client_thread: u64,
+        impersonation_level: u32,
+        dynamic_tracking: bool,
+        effective_only: bool,
+    ) -> Result<ConnectResult, NtStatus> {
         let hdr = size_of::<LpcConnectPortRequest>();
         let name_len = byte_len(name)?;
         let conn_info_len =
@@ -170,6 +202,10 @@ impl<B: Backend> LpcClient<B> {
             conninfo_len_bytes: conn_info_len,
             client_process,
             client_thread,
+            impersonation_level,
+            dynamic_tracking: u8::from(dynamic_tracking),
+            effective_only: u8::from(effective_only),
+            _reserved2: 0,
         };
         let buf = pack_units_and_bytes::<LPC_CONTROL_BUF_LEN, _>(&req, name, conn_info)?;
         let r = self
@@ -297,6 +333,13 @@ impl<B: Backend> LpcClient<B> {
             connection_id: response.connection_id,
             server_process: response.server_process,
             server_thread: response.server_thread,
+            max_connection_info: response.max_connection_info,
+            max_message: response.max_message,
+            max_pool_usage: response.max_pool_usage,
+            impersonation_level: response.impersonation_level,
+            dynamic_tracking: response.dynamic_tracking != 0,
+            effective_only: response.effective_only != 0,
+            security_present: response.security_present != 0,
             name: response.name[..name_len].to_vec(),
         })
     }
@@ -672,9 +715,44 @@ mod tests {
         assert_eq!(req.conninfo_len_bytes as usize, conn_info.len());
         assert_eq!(req.client_process, 0x44);
         assert_eq!(req.client_thread, 0x88);
+        assert_eq!(req.impersonation_level, 0);
+        assert_eq!(req.dynamic_tracking, 0);
+        assert_eq!(req.effective_only, 0);
         assert_eq!(
             &payload[req.conninfo_offset as usize..],
             conn_info.as_slice()
         );
+    }
+
+    #[test]
+    fn secure_connect_preserves_kernel_captured_qos() {
+        let backend = CaptureBackend {
+            calls: Vec::new(),
+            reply: LpcReply {
+                status: NtStatus::PENDING.raw(),
+                detail1: 7,
+                ..Default::default()
+            },
+        };
+        let mut client = LpcClient::new(backend);
+        client
+            .connect_port_with_client_security(
+                &wide(r"\Windows\ApiPort"),
+                2,
+                &[],
+                12,
+                24,
+                2,
+                true,
+                true,
+            )
+            .unwrap();
+        let payload = &client.backend_mut().calls[0].1;
+        let req = bytemuck::from_bytes::<LpcConnectPortRequest>(
+            &payload[..size_of::<LpcConnectPortRequest>()],
+        );
+        assert_eq!(req.impersonation_level, 2);
+        assert_eq!(req.dynamic_tracking, 1);
+        assert_eq!(req.effective_only, 1);
     }
 }

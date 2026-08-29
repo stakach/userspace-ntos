@@ -10033,12 +10033,17 @@ pub(crate) unsafe fn service_sec_image(
                     if client_handle != 0 {
                         if nt_handler.xas_write_u64(out_ptr, client_handle) {
                             let name16 = nt_handler.read_lpc_name(m3); // RDX = PortName
-                            nt_handler.cache_lpc_connection(conn_id, client_handle, &name16);
-                            result = 0; // STATUS_SUCCESS
-                            print_str(b"[sm-rdv] AUTHENTIC accept complete: client handle=0x");
-                            print_hex((client_handle >> 32) as u32);
-                            print_hex(client_handle as u32);
-                            print_str(b" -> caller NtConnectPort SUCCESS\n");
+                            if nt_handler.cache_lpc_connection(conn_id, client_handle, &name16) {
+                                result = 0; // STATUS_SUCCESS
+                                print_str(b"[sm-rdv] AUTHENTIC accept complete: client handle=0x");
+                                print_hex((client_handle >> 32) as u32);
+                                print_hex(client_handle as u32);
+                                print_str(b" -> caller NtConnectPort SUCCESS\n");
+                            } else {
+                                print_str(b"[sm-rdv] completed connection has no broker metadata\n");
+                                handled = false;
+                                result = 0xC0000001;
+                            }
                         } else {
                             print_str(b"[sm-rdv] WALL: failed client handle copyout\n");
                             handled = false;
@@ -10221,6 +10226,19 @@ pub(crate) unsafe fn service_sec_image(
                                     print_str(b"[csr-rdv] client port-handle copyout failed -> failing completed connect\n");
                                     result = 0xC000_0005;
                                     handled = false;
+                                } else if !nt_handler.cache_lpc_connection(
+                                    conn_id,
+                                    completion.client_handle,
+                                    b"\\Windows\\ApiPort"
+                                        .iter()
+                                        .map(|&b| b as u16)
+                                        .collect::<alloc::vec::Vec<u16>>()
+                                        .as_slice(),
+                                ) {
+                                    CSR_RENDEZVOUS_FAILURES.fetch_add(1, Ordering::Relaxed);
+                                    print_str(b"[csr-rdv] completed connection has no broker metadata\n");
+                                    result = 0xC000_0001;
+                                    handled = false;
                                 } else {
                                     // AUTHENTIC: the real CSR thread accepted + completed the connection.
                                     CSR_AUTHENTIC_ACCEPTS.fetch_add(1, Ordering::Relaxed);
@@ -10232,15 +10250,6 @@ pub(crate) unsafe fn service_sec_image(
                                     {
                                         WINLOGON_CSR_CONNECTED.store(1, Ordering::Relaxed);
                                     }
-                                    nt_handler.cache_lpc_connection(
-                                        conn_id,
-                                        completion.client_handle,
-                                        b"\\Windows\\ApiPort"
-                                            .iter()
-                                            .map(|&b| b as u16)
-                                            .collect::<alloc::vec::Vec<u16>>()
-                                            .as_slice(),
-                                    );
                                     print_str(
                                         b"[csr-rdv] AUTHENTIC accept complete: client handle=0x",
                                     );
@@ -22525,9 +22534,7 @@ unsafe fn lsa_complete_connect(
         print_hex_u64(conninfo);
         print_str(b"\n");
     }
-    if outcome == 1 && copyout_ok {
-        LSA_CONNECT_COMPLETED.fetch_add(1, Ordering::Relaxed);
-        LSA_OPERATIONAL_MODE.store(operational_mode, Ordering::Relaxed);
+    let cached = if outcome == 1 && copyout_ok {
         let lsa_name16 = b"\\LsaAuthenticationPort"
             .iter()
             .map(|&b| b as u16)
@@ -22537,7 +22544,13 @@ unsafe fn lsa_complete_connect(
             client_handle,
             cli_pi,
             &lsa_name16,
-        );
+        )
+    } else {
+        false
+    };
+    if outcome == 1 && copyout_ok && cached {
+        LSA_CONNECT_COMPLETED.fetch_add(1, Ordering::Relaxed);
+        LSA_OPERATIONAL_MODE.store(operational_mode, Ordering::Relaxed);
         if hosted_pi_has_role(
             nt_handler,
             cli_pi,
@@ -22555,8 +22568,10 @@ unsafe fn lsa_complete_connect(
         print_hex(operational_mode as u32);
         print_str(b"\n");
     } else {
-        status = if outcome == 1 {
-            0xC000_0005
+        status = if outcome == 1 && !copyout_ok {
+            0xC000_0005 // STATUS_ACCESS_VIOLATION
+        } else if outcome == 1 {
+            0xC000_0001 // STATUS_UNSUCCESSFUL — broker metadata was not authoritative
         } else {
             print_str(b"[lsa-rdv] CONNECT REFUSED by the real LSA server\n");
             status

@@ -885,14 +885,46 @@ pub(crate) unsafe fn sm_rendezvous(
                     }
                     SSN_CONNECT_PORT => {
                         let out = get_recv_mr(9);
-                        let sb_name: alloc::vec::Vec<u16> =
-                            "\\Windows\\SbApiPort".encode_utf16().collect();
-                        let (smss_pid, smss_tid) = live_hosted_cid_for_pi(nt_handler, 0);
-                        let reverse = lpc_client().and_then(|c| {
-                            c.connect_port_with_client_id(&sb_name, 0, &[], smss_pid, smss_tid)
+                        let qos_pointer = get_recv_mr(7);
+                        let mut qos_bytes = [0u8; 12];
+                        let qos =
+                            if qos_pointer == 0 || !sm_stack_copyin(qos_pointer, &mut qos_bytes) {
+                                result = 0xC000_0005;
+                                stop_rdv = true;
+                                None
+                            } else {
+                                match nt_security::SecurityQualityOfService::from_native_bytes(
+                                    &qos_bytes,
+                                ) {
+                                    Ok(qos) => Some(qos),
+                                    Err(status) => {
+                                        result = status as u64;
+                                        stop_rdv = true;
+                                        None
+                                    }
+                                }
+                            };
+                        let reverse = qos.and_then(|qos| {
+                            let sb_name: alloc::vec::Vec<u16> =
+                                "\\Windows\\SbApiPort".encode_utf16().collect();
+                            let (smss_pid, smss_tid) = live_hosted_cid_for_pi(nt_handler, 0);
+                            lpc_client().and_then(|c| {
+                                c.connect_port_with_client_security(
+                                    &sb_name,
+                                    0,
+                                    &[],
+                                    smss_pid,
+                                    smss_tid,
+                                    qos.impersonation_level as u32,
+                                    qos.tracking_mode
+                                        == nt_security::SecurityContextTrackingMode::Dynamic,
+                                    qos.effective_only,
+                                )
                                 .ok()
+                            })
                         });
                         match reverse {
+                            None if stop_rdv => {}
                             Some(r) if r.pending => {
                                 let handle = csr_sb_accept_connection(
                                     r.connection_id,

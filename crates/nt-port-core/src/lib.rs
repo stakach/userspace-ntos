@@ -100,6 +100,34 @@ pub struct ClientId {
     pub thread: u64,
 }
 
+/// Limits fixed by the server when it creates a connection port and inherited by every
+/// communication-port endpoint accepted from it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PortLimits {
+    pub max_connection_info: u32,
+    pub max_message: u32,
+    pub max_pool_usage: u32,
+}
+
+impl Default for PortLimits {
+    fn default() -> Self {
+        Self {
+            max_connection_info: MAX_CONNINFO as u32,
+            max_message: DEFAULT_MAX_MESSAGE_LENGTH,
+            max_pool_usage: 0,
+        }
+    }
+}
+
+/// Security quality of service captured when a client connects. This is connection state, not a
+/// caller pointer: a later impersonation request must use the values captured at connect time.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConnectionSecurity {
+    pub impersonation_level: u32,
+    pub dynamic_tracking: bool,
+    pub effective_only: bool,
+}
+
 /// A borrowed description of a live port-core handle.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PortHandleInfo<'a> {
@@ -112,6 +140,10 @@ pub struct PortHandleInfo<'a> {
     pub port_name: &'a [u16],
     /// Kernel-supplied identity of the process/thread that created the named listen port.
     pub server_id: ClientId,
+    /// Limits inherited from the named connection port.
+    pub limits: PortLimits,
+    /// Captured connector QoS. Listen ports have no connector and therefore report `None`.
+    pub security: Option<ConnectionSecurity>,
 }
 
 /// The outcome of [`PortCore::connect`].
@@ -201,6 +233,8 @@ const PORT_HANDLE_BASE: u64 = 0x0000_4C50_0000_0001;
 /// The maximum length of a stored connection-info blob (guards against an
 /// oversized connect payload growing core state without bound).
 pub const MAX_CONNINFO: usize = 512;
+/// Default used by API-neutral test helpers. Native adapters always provide their caller's limit.
+pub const DEFAULT_MAX_MESSAGE_LENGTH: u32 = 512;
 
 struct Port {
     handle: u64,
@@ -209,6 +243,7 @@ struct Port {
     named: bool,
     api: PortApi,
     owner: ClientId,
+    limits: PortLimits,
     /// Connection ids awaiting a receiver (Manual-policy FIFO).
     pending: Vec<u64>,
     /// Connection whose request was most recently received through this listen port. LPC's
@@ -224,6 +259,8 @@ struct Connection {
     subsystem_type: u32,
     client_id: ClientId,
     server_id: ClientId,
+    limits: PortLimits,
+    security: ConnectionSecurity,
     /// Opaque connection-info blob from the connector (SB_CONNECTION_INFO for an
     /// LPC connector, the ALPC ConnectionInformation blob for an ALPC connector).
     /// Passed through byte-for-byte to the acceptor — the bridge connection-info
@@ -310,6 +347,16 @@ impl PortCore {
         self.conn(id).map(|c| c.port_name.as_slice())
     }
 
+    /// Limits inherited by a connection from its named server port.
+    pub fn connection_limits(&self, id: u64) -> Option<PortLimits> {
+        self.conn(id).map(|c| c.limits)
+    }
+
+    /// Security quality of service captured when the connection was initiated.
+    pub fn connection_security(&self, id: u64) -> Option<ConnectionSecurity> {
+        self.conn(id).map(|c| c.security)
+    }
+
     /// The opaque connection-info blob (the bridge connection-info passthrough).
     pub fn connection_info(&self, id: u64) -> Option<&[u8]> {
         self.conn(id).map(|c| c.conn_info.as_slice())
@@ -347,6 +394,8 @@ impl PortCore {
                 state: None,
                 port_name: port.name.as_slice(),
                 server_id: port.owner,
+                limits: port.limits,
+                security: None,
             });
         }
         self.connections.iter().find_map(|conn| {
@@ -357,6 +406,8 @@ impl PortCore {
                     state: Some(conn.state),
                     port_name: conn.port_name.as_slice(),
                     server_id: conn.server_id,
+                    limits: conn.limits,
+                    security: Some(conn.security),
                 })
             } else if conn.server_handle == handle {
                 Some(PortHandleInfo {
@@ -365,6 +416,8 @@ impl PortCore {
                     state: Some(conn.state),
                     port_name: conn.port_name.as_slice(),
                     server_id: conn.server_id,
+                    limits: conn.limits,
+                    security: Some(conn.security),
                 })
             } else {
                 None
@@ -382,11 +435,38 @@ impl PortCore {
 
     /// Create a port while preserving the kernel-supplied identity of its owning server.
     pub fn create_port_with_owner(&mut self, name: &[u16], api: PortApi, owner: ClientId) -> u64 {
+        self.create_port_with_owner_and_limits(name, api, owner, PortLimits::default())
+            .expect("default port limits are valid")
+    }
+
+    /// Create a port with explicit server limits.
+    pub fn create_port_with_limits(
+        &mut self,
+        name: &[u16],
+        api: PortApi,
+        limits: PortLimits,
+    ) -> Result<u64, NtStatus> {
+        self.create_port_with_owner_and_limits(name, api, ClientId::default(), limits)
+    }
+
+    /// Create a port while preserving both its kernel-supplied owner and native limits.
+    pub fn create_port_with_owner_and_limits(
+        &mut self,
+        name: &[u16],
+        api: PortApi,
+        owner: ClientId,
+        limits: PortLimits,
+    ) -> Result<u64, NtStatus> {
+        if limits.max_connection_info as usize > MAX_CONNINFO
+            || limits.max_message > u16::MAX as u32
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         let name = fold_name(name);
         let named = !name.is_empty();
         if named {
             if let Some(p) = self.ports.iter().find(|p| p.name == name) {
-                return p.handle;
+                return Ok(p.handle);
             }
         }
         let handle = self.alloc_handle();
@@ -396,10 +476,11 @@ impl PortCore {
             named,
             api,
             owner,
+            limits,
             pending: Vec::new(),
             reply_connection: None,
         });
-        handle
+        Ok(handle)
     }
 
     /// Connect to a named port as `client_api`, carrying the subsystem type and
@@ -431,6 +512,26 @@ impl PortCore {
         conn_info: &[u8],
         client_id: ClientId,
     ) -> Result<ConnectOutcome, NtStatus> {
+        self.connect_with_client_id_and_security(
+            name,
+            client_api,
+            subsystem_type,
+            conn_info,
+            client_id,
+            ConnectionSecurity::default(),
+        )
+    }
+
+    /// Connect while preserving the caller identity and QoS already captured by the kernel.
+    pub fn connect_with_client_id_and_security(
+        &mut self,
+        name: &[u16],
+        client_api: PortApi,
+        subsystem_type: u32,
+        conn_info: &[u8],
+        client_id: ClientId,
+        security: ConnectionSecurity,
+    ) -> Result<ConnectOutcome, NtStatus> {
         let name = fold_name(name);
         let port_idx = self
             .ports
@@ -439,11 +540,16 @@ impl PortCore {
             .ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?;
         let server_api = self.ports[port_idx].api;
         let server_id = self.ports[port_idx].owner;
+        let limits = self.ports[port_idx].limits;
 
         let id = self.next_conn_id;
         self.next_conn_id += 1;
 
-        let stored: Vec<u8> = conn_info.iter().take(MAX_CONNINFO).copied().collect();
+        let stored: Vec<u8> = conn_info
+            .iter()
+            .take(limits.max_connection_info as usize)
+            .copied()
+            .collect();
 
         match self.accept_policy {
             AcceptPolicy::AutoAccept => {
@@ -454,6 +560,8 @@ impl PortCore {
                     subsystem_type,
                     client_id,
                     server_id,
+                    limits,
+                    security,
                     stored,
                     ConnState::Connected,
                     client_api,
@@ -473,6 +581,8 @@ impl PortCore {
                     subsystem_type,
                     client_id,
                     server_id,
+                    limits,
+                    security,
                     stored,
                     ConnState::Pending,
                     client_api,
@@ -528,7 +638,12 @@ impl PortCore {
         port_context: u64,
         response_info: &[u8],
     ) -> Result<u64, NtStatus> {
-        if response_info.len() > MAX_CONNINFO {
+        let max_connection_info = self
+            .conn(connection_id)
+            .ok_or(NtStatus::INVALID_PARAMETER)?
+            .limits
+            .max_connection_info as usize;
+        if response_info.len() > max_connection_info {
             return Err(NtStatus::BUFFER_TOO_SMALL);
         }
         self.accept_inner(connection_id, accept, port_context, Some(response_info))
@@ -621,11 +736,17 @@ impl PortCore {
                 continue;
             }
             if from_handle != 0 && conn.client_handle == from_handle {
+                if bytes.len() > conn.limits.max_message as usize {
+                    return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
+                }
                 msg.port_context = conn.port_context;
                 conn.server_inbox.push(msg);
                 return Ok(());
             }
             if from_handle != 0 && conn.server_handle == from_handle {
+                if bytes.len() > conn.limits.max_message as usize {
+                    return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
+                }
                 conn.client_inbox.push(msg);
                 return Ok(());
             }
@@ -644,6 +765,9 @@ impl PortCore {
                 .iter_mut()
                 .find(|conn| conn.id == connection_id && conn.state == ConnState::Connected)
                 .ok_or(NtStatus::INVALID_HANDLE)?;
+            if bytes.len() > conn.limits.max_message as usize {
+                return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
+            }
             conn.client_inbox.push(msg);
             return Ok(());
         }
@@ -719,6 +843,8 @@ impl Connection {
         subsystem_type: u32,
         client_id: ClientId,
         server_id: ClientId,
+        limits: PortLimits,
+        security: ConnectionSecurity,
         conn_info: Vec<u8>,
         state: ConnState,
         client_api: PortApi,
@@ -732,6 +858,8 @@ impl Connection {
             subsystem_type,
             client_id,
             server_id,
+            limits,
+            security,
             conn_info,
             response_info,
             state,
@@ -847,6 +975,8 @@ mod tests {
             process: 0x120,
             thread: 0x124,
         };
+        let limits = PortLimits::default();
+        let security = ConnectionSecurity::default();
         let listen =
             core.create_port_with_owner(&utf16("\\LsaAuthenticationPort"), PortApi::Lpc, owner);
         let cid = match core
@@ -868,6 +998,8 @@ mod tests {
                 state: None,
                 port_name: &utf16("\\lsaauthenticationport"),
                 server_id: owner,
+                limits,
+                security: None,
             })
         );
         assert_eq!(
@@ -878,6 +1010,8 @@ mod tests {
                 state: Some(ConnState::Connected),
                 port_name: &utf16("\\lsaauthenticationport"),
                 server_id: owner,
+                limits,
+                security: Some(security),
             })
         );
         assert_eq!(
@@ -888,6 +1022,8 @@ mod tests {
                 state: Some(ConnState::Connected),
                 port_name: &utf16("\\lsaauthenticationport"),
                 server_id: owner,
+                limits,
+                security: Some(security),
             })
         );
         assert_eq!(core.handle_info(0xdead), None);
@@ -938,6 +1074,54 @@ mod tests {
             core.connection_response_info(cid),
             Some(response.as_slice())
         );
+    }
+
+    #[test]
+    fn port_limits_and_connection_security_are_inherited_and_enforced() {
+        let mut core = PortCore::new();
+        core.set_accept_policy(AcceptPolicy::Manual);
+        let limits = PortLimits {
+            max_connection_info: 4,
+            max_message: 44,
+            max_pool_usage: 0x2400,
+        };
+        let security = ConnectionSecurity {
+            impersonation_level: 2,
+            dynamic_tracking: true,
+            effective_only: true,
+        };
+        let listen = core
+            .create_port_with_limits(&utf16("\\P"), PortApi::Lpc, limits)
+            .unwrap();
+        let connection = match core
+            .connect_with_client_id_and_security(
+                &utf16("\\P"),
+                PortApi::Lpc,
+                0,
+                b"truncated",
+                ClientId::default(),
+                security,
+            )
+            .unwrap()
+        {
+            ConnectOutcome::Pending { connection_id } => connection_id,
+            _ => unreachable!(),
+        };
+        assert_eq!(core.connection_info(connection), Some(&b"trun"[..]));
+        assert_eq!(core.connection_limits(connection), Some(limits));
+        assert_eq!(core.connection_security(connection), Some(security));
+
+        core.receive(listen).unwrap();
+        let server = core.accept(connection, true, 0).unwrap();
+        let client = core.complete(connection).unwrap().0;
+        assert_eq!(core.handle_info(client).unwrap().limits, limits);
+        assert_eq!(core.handle_info(server).unwrap().security, Some(security));
+        assert_eq!(
+            core.send_message(client, &[0; 45], MessageAttrs::default()),
+            Err(NtStatus::PORT_MESSAGE_TOO_LONG)
+        );
+        core.send_message(client, &[0; 44], MessageAttrs::default())
+            .unwrap();
     }
 
     #[test]
