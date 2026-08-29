@@ -15639,3 +15639,57 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     ordinary requests and replies through the same broker queue used here and delete the direct CSR
     request latches and datagram rewrite together. Moving the bytes first while preserving the
     rewrite would only relocate the fallback and is not an acceptable completion.
+
+    CSR broker and process-registration convergence (2026-08-29, accepted): ordinary CSR requests
+    now enter the isolated LPC broker as genuine `LPC_REQUEST` frames, are received from the named
+    connection-port queue by either the static or a dynamically claimed real CSR worker, and return
+    as broker-owned `LPC_REPLY` frames. Server communication handles receive from their associated
+    connection port while retaining their own reply identity, matching the native
+    `NtReplyWaitReceivePortEx` boundary. Win32k kernel LPC imports also cross a dedicated pointer-free
+    component page and executive service pump; the win32k CSpace no longer calls the executive-owned
+    LPC client directly. These transport checkpoints are pushed as `4f86d248`, `738441e9`,
+    `727494bc`, and `8c21401b`.
+
+    The real static `CsrApiRequestThread` now services `NtSetInformationProcess` through the same
+    typed executive implementation as an ordinary hosted thread. Its user-memory policy covers the
+    complete CSRSS address space: private CSR/SB stacks retain their dedicated mirrors, while DLL
+    data, image pages, mapped views, and runtime-writable globals resolve through CSRSS's canonical
+    process frame registry. Pages first faulted by a private rendezvous worker are registered in that
+    same ownership table with both the process mapping cap and executive alias; the former parallel
+    untracked CSR scratch mapping is gone. This lets ReactOS pass the real csrsrv `.data`
+    `CsrApiPort` value to `ProcessExceptionPort` instead of failing its probe or substituting a
+    kernel-known handle.
+
+    `NtReplyPort` is likewise shared between the normal typed service and private CSR workers. A
+    `CsrReplyDeadClient` path now captures the real worker `PORT_MESSAGE`, replies through the broker,
+    remembers that the separate send completed, and lets the following null-reply
+    `NtReplyWaitReceivePort` re-park the worker while completing the original client continuation.
+    No empty reply, direct byte transfer, or synthetic CSR result is manufactured. The accompanying
+    LPC-to-ALPC live test was corrected to issue `LPC_OP_REQUEST_WAIT_REPLY` from the client rather
+    than incorrectly using reply-port as a request; it now proves that the request body and type are
+    preserved while LPC contributes no ALPC attributes. Implementation checkpoints `1db25d7d` and
+    `2ce1e5c2` are pushed.
+
+    Validation passes `nt-port-core` `9/9`, `nt-lpc-server` `15/15`, `git diff --check`, and the
+    freestanding executive at the established 212-warning baseline. Serialized acceptance
+    `.tmp/run-headless-csr-full-memory-final-20260829.log` reached the final gate at 108,790 ms. It
+    completed 17 authentic CSR accepts, 69 real static-worker replies, eleven successful
+    `ProcessExceptionPort` updates, and three real separate `NtReplyPort` dead-client replies. Both
+    `exec_csr_message_plane` and `exec_services_csr_connect` passed. Genuine userinit and Explorer
+    launched, 668 Explorer api0 redirects completed with zero callback or dead-callback failures,
+    paint begin/end reached `5/20` with 187 direct GDI returns and 135 batch flushes covering 184
+    records, and the framebuffer held `480000/480000` non-background pixels with at least 32
+    colours. All `295/295` gates passed and the sentinel matched. Scratch returned to zero, with no
+    page-table, frame, mapping, alias, registry, untyped-allocation, frame-registration, image-bank,
+    or allocator failure.
+
+    Review adjustment: the broker now owns connection and message transport, and real CSR process
+    registration is no longer blocked by a stack-only memory view. The remaining static-worker debt
+    is structural: `csr_api_request_rendezvous` and the SB counterpart still contain bespoke numeric
+    nested-syscall switches. Adding the next observed SSN there would recreate the hardcoded kernel
+    surface this plan is removing. Next introduce a reusable hosted-server execution context that
+    binds a worker's process/thread identity, user-memory policy, and parked continuation to the
+    normal typed `NativeSyscallDispatcher`. Route CSR and SB nested calls through it, retain only
+    rendezvous-specific fault/receive/reply state in `rendezvous.rs`, then delete each superseded
+    numeric syscall arm. Completion requires the same authentic accept/request/kernel-message proof
+    and full desktop gate with no private-worker syscall exceptions.
