@@ -21,9 +21,9 @@ use core::mem::size_of;
 use bytemuck::Pod;
 use nt_lpc_abi::{
     msg_type, opcode, LpcAcceptConnectRequest, LpcCompleteConnectRequest, LpcConnectPortRequest,
-    LpcConnectionRequestMetadata, LpcCreatePortRequest, LpcMessageRequest, LpcQueryHandleRequest,
-    LpcQueryHandleResponse, LpcQueryRequestRequest, LpcQueryRequestResponse, LpcReceiveRequest,
-    LpcReply, LpcRequestIdentityRequest, LPC_ACCEPT_RESPONSE_INFO,
+    LpcConnectionRequestMetadata, LpcCreatePortRequest, LpcDataMessageMetadata, LpcMessageRequest,
+    LpcQueryHandleRequest, LpcQueryHandleResponse, LpcQueryRequestRequest, LpcQueryRequestResponse,
+    LpcReceiveRequest, LpcReply, LpcRequestIdentityRequest, LPC_ACCEPT_RESPONSE_INFO,
 };
 use nt_status::NtStatus;
 
@@ -448,7 +448,7 @@ impl<B: Backend> LpcClient<B> {
             reply_msg_len_bytes: reply_msg_len,
         };
         let buf = pack_bytes::<LPC_CONTROL_BUF_LEN, _>(&req, reply_msg)?;
-        let mut out = [0u8; 512];
+        let mut out = [0u8; nt_lpc_abi::PORT_MESSAGE_MAX_LEN + size_of::<LpcDataMessageMetadata>()];
         let r = self
             .backend
             .call(opcode::LPC_OP_REPLY_WAIT_RECEIVE, buf.as_slice(), &mut out);
@@ -458,7 +458,14 @@ impl<B: Backend> LpcClient<B> {
         NtStatus(r.status).to_result()?;
         let msg_type = r.detail1 as u16;
         let is_connection = msg_type == msg_type::LPC_CONNECTION_REQUEST;
-        let (subsystem_type, client_process, client_thread, connection_info) = if is_connection {
+        let (
+            subsystem_type,
+            client_process,
+            client_thread,
+            connection_id,
+            port_context,
+            connection_info,
+        ) = if is_connection {
             let metadata_size = size_of::<LpcConnectionRequestMetadata>();
             let returned = r.information as usize;
             if returned < metadata_size || returned > out.len() {
@@ -478,23 +485,42 @@ impl<B: Backend> LpcClient<B> {
                 metadata.subsystem_type,
                 metadata.client_process,
                 metadata.client_thread,
+                r.detail0,
+                0,
                 out[metadata_size..returned].to_vec(),
             )
         } else {
+            let metadata_size = size_of::<LpcDataMessageMetadata>();
+            let returned = r.information as usize;
+            if returned < metadata_size || returned > out.len() {
+                return Err(NtStatus::BUFFER_TOO_SMALL);
+            }
+            let message_len = returned - metadata_size;
+            let metadata: LpcDataMessageMetadata =
+                bytemuck::try_pod_read_unaligned(&out[message_len..returned])
+                    .map_err(|_| NtStatus::INVALID_PARAMETER)?;
+            if metadata.abi_size as usize != metadata_size
+                || metadata.connection_id == 0
+                || metadata.port_context != r.detail0
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
             (
                 (r.detail1 >> 32) as u32,
-                0,
-                0,
-                out[..(r.information as usize).min(out.len())].to_vec(),
+                metadata.client_process,
+                metadata.client_thread,
+                metadata.connection_id,
+                metadata.port_context,
+                out[..message_len].to_vec(),
             )
         };
         Ok(ReceiveResult {
-            connection_id: if is_connection { r.detail0 } else { 0 },
+            connection_id,
             msg_type,
             subsystem_type,
             client_process,
             client_thread,
-            port_context: if is_connection { 0 } else { r.detail0 },
+            port_context,
             connection_info,
         })
     }

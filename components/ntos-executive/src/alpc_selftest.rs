@@ -18,7 +18,10 @@ use nt_alpc_abi::{
     AlpcCreateSectionViewRequest, AlpcDataViewAttr, AlpcMessageAttributes, AlpcSendReceiveRequest,
     AlpcViewIoRequest, PortMessage,
 };
-use nt_lpc_abi::{opcode as lop, LpcConnectPortRequest, LpcMessageRequest, LpcReceiveRequest};
+use nt_lpc_abi::{
+    opcode as lop, LpcConnectPortRequest, LpcDataMessageMetadata, LpcMessageRequest,
+    LpcReceiveRequest,
+};
 use nt_port_core::MessageAttrs;
 
 const CONNECTION_REQUEST: u16 = 10;
@@ -249,7 +252,19 @@ pub fn run(chan: &mut RingChannel<'_>, passed: &mut u64) {
     );
     // LPC client receives via the classic-LPC receive (no attribute surface).
     let (ls, _f, li, ldetail0, _lmt) = lpc_recv(chan, bclient_h, &mut out);
-    let reply_ok = ls == STATUS_SUCCESS && &out[..li as usize] == &rmsg[..] && ldetail0 == 0;
+    let metadata_size = core::mem::size_of::<LpcDataMessageMetadata>();
+    let returned = li as usize;
+    let reply_ok = if ls == STATUS_SUCCESS && returned == rmsg.len() + metadata_size {
+        let metadata: LpcDataMessageMetadata =
+            bytemuck::pod_read_unaligned(&out[rmsg.len()..returned]);
+        &out[..rmsg.len()] == &rmsg[..]
+            && metadata.abi_size as usize == metadata_size
+            && metadata.connection_id == lpc_conn_id
+            && metadata.port_context == ldetail0
+            && ldetail0 == 0
+    } else {
+        false
+    };
     check(b"exec_bridge_alpc_reply_body_only", reply_ok, passed);
 
     // ================= C. item (a): NtAlpc* SSN registration + routing =================

@@ -17,7 +17,7 @@
 #![no_std]
 
 /// ABI version. Bump on any incompatible wire change.
-pub const LPC_ABI_VERSION: u32 = 6;
+pub const LPC_ABI_VERSION: u32 = 7;
 
 /// The reserved SURT opcode range for the LPC protocol (fresh block after
 /// object 0x2000 / config 0x2100).
@@ -369,6 +369,20 @@ pub struct LpcConnectionRequestMetadata {
     pub _reserved2: u32,
 }
 
+/// Broker-authored trailer returned after an ordinary received `PORT_MESSAGE`. It carries exact
+/// connection provenance without changing the native message bytes or exposing a broker pointer.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LpcDataMessageMetadata {
+    pub abi_size: u16,
+    pub _reserved: u16,
+    pub _reserved2: u32,
+    pub connection_id: u64,
+    pub client_process: u64,
+    pub client_thread: u64,
+    pub port_context: u64,
+}
+
 /// `LPC_OP_ACCEPT_CONNECT` — the server accepts (or refuses) a pending connection.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -564,6 +578,7 @@ const _: () = {
     assert!(size_of::<LpcCreatePortRequest>() == 40);
     assert!(size_of::<LpcConnectPortRequest>() == 48);
     assert!(size_of::<LpcConnectionRequestMetadata>() == 32);
+    assert!(size_of::<LpcDataMessageMetadata>() == 40);
     assert!(size_of::<LpcAcceptConnectRequest>() == 32);
     assert!(size_of::<LpcCompleteConnectRequest>() == 16);
     assert!(size_of::<LpcReceiveRequest>() == 24);
@@ -783,6 +798,6 @@ mod tests {
 
     #[test]
     fn version_is_current() {
-        assert_eq!(LPC_ABI_VERSION, 6);
+        assert_eq!(LPC_ABI_VERSION, 7);
     }
 }

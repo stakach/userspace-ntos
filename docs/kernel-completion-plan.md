@@ -16302,3 +16302,40 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and every implicit routing branch. Synchronous request/reply must continue using its existing
     exact `ClientId` plus message-id identity; do not merge the two mechanisms or introduce a default
     connection.
+
+    Exact LPC message provenance and reply-cursor deletion (2026-08-29, accepted): every broker
+    `QueuedMessage` now carries the immutable connection id and connector `ClientId` that produced
+    it. Generic sends accept only the exact client or server communication handle; sending through a
+    listen port fails instead of selecting whichever connection happened to be received most
+    recently. Disconnect invalidates that communication handle, so a stale reply cannot cross into
+    a later or concurrent connection. Synchronous request/reply retains its separate broker-authored
+    message-id identity and exact `ClientId` matching.
+
+    LPC service ABI v7 appends a fixed, pointer-free 40-byte provenance trailer to ordinary broker
+    receives. The client validates the trailer, exposes the exact connection, client process/thread,
+    and port context to the executive, and strips it before publishing the native `PORT_MESSAGE`.
+    Connection-request metadata remains a distinct wire shape. Concurrent two-client core coverage
+    proves each datagram retains its own connection and context, listen-port sends fail closed,
+    exact server handles reply to the correct client, and a disconnected server handle is rejected.
+    The listen-port-wide `Port.reply_connection` field and every implicit send branch are deleted;
+    an audit finds no live reference in `crates/` or `components/`.
+
+    Focused validation passes `nt-lpc-abi` at `8/8`, `nt-port-core` at `17/17`, `nt-lpc-client` at
+    `5/5`, `nt-lpc-server` at `16/16`, and `nt-alpc` at `12/12`; the freestanding executive builds
+    at the established 209-warning baseline. Serialized acceptance
+    `.tmp/run-headless-lpc-message-provenance-rerun-20260829.log` reaches genuine userinit and
+    Explorer launch and completes all `295/295` gates. Explorer records 665 real api0 redirects with
+    zero callback or dead-callback failures, paint begin/end reaches `2/20` with 185 direct GDI
+    returns and 131 batch flushes covering 171 records, and the framebuffer holds `480000/480000`
+    non-background pixels with at least 32 colours. Both real LSA connections and all three real LSA
+    requests/replies complete, and the sentinel matches.
+
+    Review adjustment: the implicit LPC broker cursor and all service-specific blocked transports
+    are closed. The remaining `nt-alpc::PeerDirect` executive-local mailbox is used only by a
+    synthetic integration check, duplicates `PortCore` queues, bypasses the isolated port service,
+    and cannot carry the newly authoritative broker connection provenance. Delete that cache and its
+    duplicate queue tests next. Replace the counted check with a live two-connection ALPC broker
+    proof that sends and receives through exact communication handles and rejects listen and stale
+    handles. After that cleanup, return to the deferred `NtLockVirtualMemory` /
+    `NtUnlockVirtualMemory` prerequisite: one reusable Mm page-residency operation shared by private,
+    mapped-section, and image mappings.

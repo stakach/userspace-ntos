@@ -596,6 +596,7 @@ impl PeerDirect {
         let msg = QueuedMessage {
             bytes: bytes.to_vec(),
             attrs,
+            provenance: Default::default(),
             port_context: 0,
             request_identity: None,
         };

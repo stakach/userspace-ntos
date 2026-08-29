@@ -21,11 +21,11 @@
 //!
 //! ## Where the message model is (and is NOT) used
 //!
-//! In the live executive the steady-state LPC message plane is served by DIRECT
-//! cross-badge delivery against a cached connection record (the broker is not a
-//! relay). The [`PortCore`] message queues here are the API-neutral model the
-//! adapters share and the **host-tested bridge** exercises; the executive's
-//! direct path is an optimization layered on top and does not route through them.
+//! In the live executive the isolated broker owns connection identity and the
+//! queued message plane. Typed executive continuations retain blocked native
+//! callers while real user-mode server threads receive and reply through these
+//! queues. Every queued message therefore carries immutable source-connection
+//! provenance; no adapter may infer a peer from a port-wide cursor.
 
 #![no_std]
 
@@ -219,12 +219,22 @@ pub struct DataView {
     pub view_size: u64,
 }
 
-/// A queued `PORT_MESSAGE`: the framed bytes plus the API-neutral attributes.
+/// Immutable broker provenance attached when a message enters a connection queue.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct MessageProvenance {
+    pub connection_id: u64,
+    /// The connector identity for this connection. Server-side receives use it as the native
+    /// `CLIENT_ID`; client-side receives retain it for correlation with the same transaction.
+    pub client: ClientId,
+}
+
+/// A queued `PORT_MESSAGE`: the framed bytes, API-neutral attributes, and exact source connection.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct QueuedMessage {
     pub bytes: Vec<u8>,
     pub attrs: MessageAttrs,
-    /// Accepted connection PortContext used only for classic LPC listen-port routing.
+    pub provenance: MessageProvenance,
+    /// Accepted connection PortContext returned to classic LPC server receives.
     pub port_context: u64,
     /// Kernel-authored identity for a synchronous client request. Attribute-only ALPC traffic and
     /// kernel datagrams carry `None`.
@@ -309,10 +319,6 @@ struct Port {
     pool_account: usize,
     /// Connection ids awaiting a receiver (Manual-policy FIFO).
     pending: Vec<u64>,
-    /// Connection whose request was most recently received through this listen port. LPC's
-    /// `NtReplyWaitReceivePort` replies through the listen handle, so the core retains this routing
-    /// identity until the server sends that reply.
-    reply_connection: Option<u64>,
 }
 
 struct Connection {
@@ -568,7 +574,6 @@ impl PortCore {
             limits,
             pool_account,
             pending: Vec::new(),
-            reply_connection: None,
         });
         Ok(handle)
     }
@@ -835,9 +840,10 @@ impl PortCore {
 
     // --- message model ----------------------------------------------------
 
-    /// Send a `PORT_MESSAGE` from the endpoint identified by `from_handle` (a
-    /// client or server comm-port handle) to the peer, carrying `attrs`. The
-    /// message is enqueued on the peer's inbox; [`receive_message`] pops it.
+    /// Send a `PORT_MESSAGE` from the communication endpoint identified by `from_handle` to its
+    /// exact peer, carrying `attrs`. Listen-port handles are rejected: they identify a namespace
+    /// endpoint, not one connection, and must never acquire implicit routing state from a receive.
+    /// The message is enqueued on the peer's inbox; [`receive_message`] pops it.
     ///
     /// [`receive_message`]: PortCore::receive_message
     pub fn send_message(
@@ -860,9 +866,20 @@ impl PortCore {
             }
             let from_client = connection.client_handle == from_handle;
             let account = connection.pool_account;
+            let provenance = MessageProvenance {
+                connection_id: connection.id,
+                client: connection.client_id,
+            };
             let port_context = from_client.then_some(connection.port_context).unwrap_or(0);
-            let stored =
-                self.allocate_stored_message(account, 0, bytes, attrs, port_context, None)?;
+            let stored = self.allocate_stored_message(
+                account,
+                0,
+                bytes,
+                attrs,
+                provenance,
+                port_context,
+                None,
+            )?;
             if from_client {
                 self.connections[connection_index].server_inbox.push(stored);
             } else {
@@ -870,35 +887,7 @@ impl PortCore {
             }
             return Ok(());
         }
-        if let Some(port_index) = self
-            .ports
-            .iter()
-            .position(|port| port.handle == from_handle)
-        {
-            let connection_id = self.ports[port_index]
-                .reply_connection
-                .ok_or(NtStatus::INVALID_HANDLE)?;
-            let connection_index = self
-                .connections
-                .iter()
-                .position(|conn| {
-                    conn.id == connection_id
-                        && conn.state == ConnState::Connected
-                        && conn.client_open
-                        && conn.server_open
-                })
-                .ok_or(NtStatus::INVALID_HANDLE)?;
-            let connection = &self.connections[connection_index];
-            if bytes.len() > connection.limits.max_message as usize {
-                return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
-            }
-            let account = connection.pool_account;
-            let stored = self.allocate_stored_message(account, 0, bytes, attrs, 0, None)?;
-            self.connections[connection_index].client_inbox.push(stored);
-            self.ports[port_index].reply_connection = None;
-            return Ok(());
-        }
-        Err(NtStatus::INVALID_HANDLE)
+        Err(NtStatus::INVALID_PORT_HANDLE)
     }
 
     /// Queue a synchronous request from a client communication port. The adapter has already
@@ -933,9 +922,20 @@ impl PortCore {
             return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
         }
         let account = conn.pool_account;
+        let provenance = MessageProvenance {
+            connection_id: conn.id,
+            client: conn.client_id,
+        };
         let port_context = conn.port_context;
-        let stored =
-            self.allocate_stored_message(account, 0, bytes, attrs, port_context, Some(identity))?;
+        let stored = self.allocate_stored_message(
+            account,
+            0,
+            bytes,
+            attrs,
+            provenance,
+            port_context,
+            Some(identity),
+        )?;
         self.connections[connection_index].server_inbox.push(stored);
         Ok(())
     }
@@ -1070,8 +1070,19 @@ impl PortCore {
             }
             let old_charge = connection.delivered_requests[delivered_index].pool_charge;
             let account = connection.pool_account;
-            let stored =
-                self.allocate_stored_message(account, old_charge, bytes, attrs, 0, Some(identity))?;
+            let provenance = MessageProvenance {
+                connection_id: connection.id,
+                client: connection.client_id,
+            };
+            let stored = self.allocate_stored_message(
+                account,
+                old_charge,
+                bytes,
+                attrs,
+                provenance,
+                0,
+                Some(identity),
+            )?;
             let connection = &mut self.connections[connection_index];
             connection.delivered_requests.remove(delivered_index);
             connection.client_inbox.push(stored);
@@ -1109,8 +1120,19 @@ impl PortCore {
             .expect("matching delivered request was selected");
         let old_charge = connection.delivered_requests[delivered_index].pool_charge;
         let account = connection.pool_account;
-        let stored =
-            self.allocate_stored_message(account, old_charge, bytes, attrs, 0, Some(identity))?;
+        let provenance = MessageProvenance {
+            connection_id: connection.id,
+            client: connection.client_id,
+        };
+        let stored = self.allocate_stored_message(
+            account,
+            old_charge,
+            bytes,
+            attrs,
+            provenance,
+            0,
+            Some(identity),
+        )?;
         let connection = &mut self.connections[connection_index];
         connection.delivered_requests.remove(delivered_index);
         connection.client_inbox.push(stored);
@@ -1211,7 +1233,6 @@ impl PortCore {
                     && !conn.server_inbox.is_empty()
             });
             if let Some(connection_index) = connection_index {
-                let connection_id = self.connections[connection_index].id;
                 let stored = self.connections[connection_index].server_inbox.remove(0);
                 let account = self.connections[connection_index].pool_account;
                 if let Some(identity) = stored.message.request_identity {
@@ -1239,7 +1260,6 @@ impl PortCore {
                     self.replace_pool_charge(account, stored.pool_charge, 0)
                         .expect("dequeued broker datagram was previously charged");
                 }
-                self.ports[port_index].reply_connection = Some(connection_id);
                 return Ok(Some(stored.message));
             }
             return Ok(None);
@@ -1293,6 +1313,7 @@ impl PortCore {
         replaced_charge: u32,
         bytes: &[u8],
         attrs: MessageAttrs,
+        provenance: MessageProvenance,
         port_context: u64,
         request_identity: Option<MessageIdentity>,
     ) -> Result<StoredMessage, NtStatus> {
@@ -1310,6 +1331,7 @@ impl PortCore {
             message: QueuedMessage {
                 bytes: owned_bytes,
                 attrs,
+                provenance,
                 port_context,
                 request_identity,
             },
@@ -2055,34 +2077,67 @@ mod tests {
     }
 
     #[test]
-    fn listen_port_reply_routes_to_the_requesting_connection() {
+    fn concurrent_datagrams_carry_exact_provenance_without_a_listen_port_cursor() {
         let mut core = PortCore::new();
         core.set_accept_policy(AcceptPolicy::Manual);
         let ph = core.create_port(&utf16("\\P"), PortApi::Lpc);
         let mut clients = [0u64; 2];
+        let mut servers = [0u64; 2];
+        let mut connections = [0u64; 2];
         for (index, context) in [0x1111, 0x2222].into_iter().enumerate() {
             let cid = match core.connect(&utf16("\\P"), PortApi::Lpc, 0, &[]).unwrap() {
                 ConnectOutcome::Pending { connection_id } => connection_id,
                 _ => unreachable!(),
             };
             core.receive(ph).unwrap();
-            core.accept(cid, true, context).unwrap();
+            servers[index] = core.accept(cid, true, context).unwrap();
             clients[index] = core.complete(cid).unwrap().0;
+            connections[index] = cid;
         }
 
-        core.send_message(clients[1], b"second", MessageAttrs::default())
+        core.send_message(clients[1], b"from-b", MessageAttrs::default())
             .unwrap();
-        let request = core.receive_message(ph).unwrap().unwrap();
-        assert_eq!(request.bytes, b"second");
-        assert_eq!(request.attrs.context, None);
-        assert_eq!(request.port_context, 0x2222);
-        core.send_message(ph, b"reply", MessageAttrs::default())
+        core.send_message(clients[0], b"from-a", MessageAttrs::default())
+            .unwrap();
+        let received = [
+            core.receive_message(ph).unwrap().unwrap(),
+            core.receive_message(ph).unwrap().unwrap(),
+        ];
+        for message in received {
+            let (connection, context) = if message.bytes == b"from-a" {
+                (connections[0], 0x1111)
+            } else {
+                assert_eq!(message.bytes, b"from-b");
+                (connections[1], 0x2222)
+            };
+            assert_eq!(message.provenance.connection_id, connection);
+            assert_eq!(message.port_context, context);
+        }
+
+        assert_eq!(
+            core.send_message(ph, b"ambiguous", MessageAttrs::default()),
+            Err(NtStatus::INVALID_PORT_HANDLE),
+            "a listen handle never acquires an implicit reply target"
+        );
+        core.send_message(servers[0], b"reply-a", MessageAttrs::default())
+            .unwrap();
+        core.send_message(servers[1], b"reply-b", MessageAttrs::default())
             .unwrap();
 
-        assert!(core.receive_message(clients[0]).unwrap().is_none());
+        assert_eq!(
+            core.receive_message(clients[0]).unwrap().unwrap().bytes,
+            b"reply-a"
+        );
         assert_eq!(
             core.receive_message(clients[1]).unwrap().unwrap().bytes,
-            b"reply"
+            b"reply-b"
+        );
+
+        core.disconnect(connections[1]);
+        assert_eq!(
+            core.send_message(servers[1], b"stale", MessageAttrs::default()),
+            Err(NtStatus::INVALID_PORT_HANDLE),
+            "a stale communication handle cannot reuse prior receive provenance"
         );
     }
 
@@ -2116,14 +2171,14 @@ mod tests {
 
         core.send_message(first_client, b"first", MessageAttrs::default())
             .unwrap();
-        assert_eq!(
-            core.receive_message(first_server).unwrap().unwrap().bytes,
-            b"first"
-        );
+        let received = core.receive_message(first_server).unwrap().unwrap();
+        assert_eq!(received.bytes, b"first");
+        assert_eq!(received.provenance.connection_id, first_connection);
         core.send_message(second_client, b"second", MessageAttrs::default())
             .unwrap();
         let received = core.receive_message(first_server).unwrap().unwrap();
         assert_eq!(received.bytes, b"second");
+        assert_eq!(received.provenance.connection_id, second_connection);
         assert_eq!(received.port_context, 0x2222);
 
         core.send_message(second_server, b"reply", MessageAttrs::default())

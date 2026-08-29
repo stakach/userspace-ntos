@@ -37,9 +37,9 @@ use bytemuck::Pod;
 use nt_lpc_abi::{
     connection_state, handle_endpoint, opcode, LpcAcceptConnectRequest, LpcClosePortRequest,
     LpcCompleteConnectRequest, LpcConnectPortRequest, LpcConnectionRequestMetadata,
-    LpcCreatePortRequest, LpcMessageRequest, LpcQueryHandleRequest, LpcQueryHandleResponse,
-    LpcQueryRequestRequest, LpcQueryRequestResponse, LpcReceiveRequest, LpcReply,
-    LpcRequestIdentityRequest, LPC_ACCEPT_RESPONSE_INFO, LPC_QUERY_HANDLE_NAME_MAX_UNITS,
+    LpcCreatePortRequest, LpcDataMessageMetadata, LpcMessageRequest, LpcQueryHandleRequest,
+    LpcQueryHandleResponse, LpcQueryRequestRequest, LpcQueryRequestResponse, LpcReceiveRequest,
+    LpcReply, LpcRequestIdentityRequest, LPC_ACCEPT_RESPONSE_INFO, LPC_QUERY_HANDLE_NAME_MAX_UNITS,
 };
 use nt_port_core::{
     ClientId, ConnectOutcome, ConnectionSecurity, MessageAttrs, MessageIdentity, PortApi, PortCore,
@@ -308,23 +308,39 @@ impl Server {
                 msg_type as u64 | ((subsystem_type as u64) << 32),
             ));
         }
-        let is_listen_port = conn_try.is_ok(); // valid listen port, nothing pending
+        let valid_receive_port = conn_try.is_ok();
         match self.core.receive_message(req.port_handle) {
             Ok(Some(m)) => {
-                let n = m.bytes.len().min(out_buf.len());
-                out_buf[..n].copy_from_slice(&m.bytes[..n]);
-                // Listen-port receives expose the accepted PortContext for reply routing. Comm-port
-                // receives remain classic LPC and do not surface ALPC message attributes.
+                let metadata = LpcDataMessageMetadata {
+                    abi_size: core::mem::size_of::<LpcDataMessageMetadata>() as u16,
+                    _reserved: 0,
+                    _reserved2: 0,
+                    connection_id: m.provenance.connection_id,
+                    client_process: m.provenance.client.process,
+                    client_thread: m.provenance.client.thread,
+                    port_context: m.port_context,
+                };
+                let metadata = bytemuck::bytes_of(&metadata);
+                let total = m
+                    .bytes
+                    .len()
+                    .checked_add(metadata.len())
+                    .ok_or(NtStatus::BUFFER_TOO_SMALL)?;
+                if total > out_buf.len() {
+                    return Err(NtStatus::BUFFER_TOO_SMALL);
+                }
+                out_buf[..m.bytes.len()].copy_from_slice(&m.bytes);
+                out_buf[m.bytes.len()..total].copy_from_slice(metadata);
                 Ok(reply(
                     NtStatus::SUCCESS,
-                    n as u32,
-                    if is_listen_port { m.port_context } else { 0 },
+                    total as u32,
+                    m.port_context,
                     msg_type_of(&m.bytes) as u64,
                 ))
             }
             Ok(None) => Ok(reply(NtStatus::PENDING, 0, 0, 0)),
             Err(e) => {
-                if is_listen_port {
+                if valid_receive_port {
                     Ok(reply(NtStatus::PENDING, 0, 0, 0))
                 } else {
                     Err(e)
@@ -1102,19 +1118,26 @@ mod tests {
             reply_msg_len_bytes: 0,
         };
         let rbuf = bytemuck::bytes_of(&recv).to_vec();
-        let mut out = [0u8; 64];
+        let mut out = [0u8; 128];
         let r = c
             .backend_mut()
             .server
             .dispatch(opcode::LPC_OP_REPLY_WAIT_RECEIVE, &rbuf, &mut out);
         assert_eq!(r.status, NtStatus::SUCCESS.raw());
-        assert_eq!(r.information, message.len() as u32);
+        assert_eq!(
+            r.information,
+            (message.len() + size_of::<LpcDataMessageMetadata>()) as u32
+        );
         assert_eq!(msg_type_of(&out), msg_type::LPC_REQUEST);
         assert_ne!(u32::from_le_bytes(out[24..28].try_into().unwrap()), 0);
         assert_eq!(
             &out[nt_lpc_abi::PORT_MESSAGE_HEADER_LEN..message.len()],
             b"ping"
         );
+        let metadata: LpcDataMessageMetadata = bytemuck::pod_read_unaligned(
+            &out[message.len()..message.len() + size_of::<LpcDataMessageMetadata>()],
+        );
+        assert_eq!(metadata.connection_id, cid);
         assert_eq!(r.detail0, 0, "LPC surfaces no attributes");
     }
 
@@ -1156,7 +1179,7 @@ mod tests {
             c.request_port(client, &message).unwrap();
             c.reply_wait_receive(listen).unwrap()
         };
-        assert_eq!(received.connection_id, 0);
+        assert_eq!(received.connection_id, connection);
         assert_eq!(received.msg_type, msg_type::LPC_CLIENT_DIED);
         assert_eq!(received.port_context, 0x1234);
         assert_eq!(received.connection_info, message);
@@ -1201,6 +1224,7 @@ mod tests {
             c.reply_wait_receive(listen).unwrap()
         };
         message[4..6].copy_from_slice(&msg_type::LPC_DATAGRAM.to_le_bytes());
+        assert_eq!(received.connection_id, connection);
         assert_eq!(received.msg_type, msg_type::LPC_DATAGRAM);
         assert_eq!(received.port_context, 0x1234);
         assert_eq!(received.connection_info, message);
@@ -1243,6 +1267,9 @@ mod tests {
                 .begin_request_wait_reply_with_client_id(client, &request_message, 0x120, 0x124)
                 .unwrap();
             let request = c.reply_wait_receive(listen).unwrap();
+            assert_eq!(request.connection_id, connection);
+            assert_eq!(request.client_process, 0x120);
+            assert_eq!(request.client_thread, 0x124);
             assert_eq!(request.msg_type, msg_type::LPC_REQUEST);
             assert_eq!(
                 &request.connection_info[nt_lpc_abi::PORT_MESSAGE_HEADER_LEN..],
