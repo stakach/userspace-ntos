@@ -15693,3 +15693,44 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     rendezvous-specific fault/receive/reply state in `rendezvous.rs`, then delete each superseded
     numeric syscall arm. Completion requires the same authentic accept/request/kernel-message proof
     and full desktop gate with no private-worker syscall exceptions.
+
+    Private hosted-server native dispatch (2026-08-29, accepted): the executive service loop now
+    owns one `NativeSyscallDispatcher` and lends that exact table to private CSR and SB workers
+    through a scoped hosted-server execution context. The context binds the worker's real
+    process/thread/badge/register state, the complete CSRSS address-space memory policy, the
+    broker-delivered client process identity, and the parked continuation while a typed service is
+    executing; the outer hosted caller state is restored before returning to the rendezvous loop.
+    Static and dynamically claimed workers therefore use the same registered service metadata and
+    typed handlers as ordinary hosted threads.
+
+    The CSR and SB request loops now dispatch `NtAllocateVirtualMemory`, `NtProtectVirtualMemory`,
+    `NtSetEvent`, `NtSetInformationThread`, `NtQueryObject`, `NtSetInformationObject`,
+    `NtSetInformationProcess`, `NtResumeThread`, `NtSuspendThread`, `NtDuplicateObject`, `NtClose`,
+    and `NtReplyPort` through that shared boundary. Every superseded numeric implementation was
+    deleted, including SB's unconditional `NtSetInformationProcess` success, along with the old
+    private query-thread helpers. `rendezvous.rs` retains only the genuinely private mechanisms:
+    worker faults, debug interrupts, win32k dispatch, thread creation, section mapping, and the
+    reply/wait/receive transition. Code checkpoint `25bf82ed` removes 758 lines of parallel syscall
+    machinery and is pushed.
+
+    Freestanding `cargo check`, release build/staging, and `git diff --check` pass at the established
+    212-warning baseline. Serialized acceptance
+    `.tmp/run-headless-hosted-worker-dispatch-20260829.log` exercised 377 nested calls through the
+    shared dispatcher across ten observed services: two VM allocations, one VM protect, 73 object
+    duplicates, 68 object queries, 68 object-information updates, 126 thread-information queries,
+    two thread resumes, 24 process-information updates, ten closes, and three separate LPC replies.
+    Genuine userinit and Explorer launched, 668 Explorer api0 redirects completed with zero callback
+    or dead-callback failures, paint begin/end reached `5/20` with 187 direct GDI returns and 135
+    batch flushes covering 184 records, and the framebuffer held `480000/480000` non-background
+    pixels with at least 32 colours. All `295/295` gates passed and the sentinel matched.
+
+    Review adjustment: no private CSR/SB synchronous-service switch remains. The next structural LPC
+    frontier is the connection and receive lifecycle around those workers: `csr_rendezvous` still
+    spells out the accept/complete/receive service sequence, while SM/SB private loops retain their
+    own numeric accept and reply/wait/receive cases. Introduce a small reusable hosted-server LPC
+    transition adapter backed by the broker and typed dispatcher, preserving only the state-machine
+    decisions that are specific to a listening port or parked worker. Convert CSR, SM, and SB one
+    loop at a time, delete each old numeric arm immediately, and require authentic process
+    registration, kernel-message delivery, dynamic-worker routing, and the full desktop proof after
+    each accepted slice. Do not hide connection lifecycle behind a synthetic successful syscall or
+    weaken the broker's port/message type checks.
