@@ -166,14 +166,24 @@ const _: () =
 pub const WIN32K_VIDEO_IOCTL_VADDR: u64 = 0x0000_0100_071C_0000;
 pub const WIN32K_VIDEO_IOCTL_FRAMES: u64 = 4;
 pub const WIN32K_VIDEO_IOCTL_BYTES: usize = (WIN32K_VIDEO_IOCTL_FRAMES as usize) * 0x1000;
+/// Dedicated cross-address-space LPC request window. Kernel LPC imports execute inside the win32k
+/// component, while the isolated LPC broker channel belongs to the executive's CSpace. The
+/// component therefore stages one bounded, pointer-free request here and calls the executive pump.
+pub const WIN32K_LPC_VADDR: u64 =
+    WIN32K_VIDEO_IOCTL_VADDR + WIN32K_VIDEO_IOCTL_FRAMES * 0x1000;
+pub const WIN32K_LPC_FRAMES: u64 = 1;
+pub const WIN32K_LPC_BYTES: usize = (WIN32K_LPC_FRAMES as usize) * 0x1000;
 /// Bulk client-buffer staging for provider-dispatched win32k calls whose input is data, not just
 /// scalar argument tails. `NtGdiStretchDIBitsInternal` can receive DIB payloads far larger than the
 /// generic ARG window, so it gets a dedicated shared 2 MiB PT window between AUX and the session heap.
 pub const WIN32K_BULK_ARG_VADDR: u64 = 0x0000_0100_0720_0000;
 pub const WIN32K_BULK_ARG_FRAMES: u64 = 512;
 const _: () = assert!(WIN32K_ARG_VADDR + WIN32K_ARG_FRAMES * 0x1000 <= WIN32K_VIDEO_IOCTL_VADDR);
+const _: () = assert!(
+    WIN32K_VIDEO_IOCTL_VADDR + WIN32K_VIDEO_IOCTL_FRAMES * 0x1000 <= WIN32K_LPC_VADDR
+);
 const _: () =
-    assert!(WIN32K_VIDEO_IOCTL_VADDR + WIN32K_VIDEO_IOCTL_FRAMES * 0x1000 <= WIN32K_BULK_ARG_VADDR);
+    assert!(WIN32K_LPC_VADDR + WIN32K_LPC_FRAMES * 0x1000 <= WIN32K_BULK_ARG_VADDR);
 /// Kernel-mode KUSER_SHARED_DATA mapping used by win32k's direct `SharedUserData` reads. User
 /// processes also see the low 0x7FFE0000 alias; win32k, as a kernel driver, reads the canonical
 /// high VA directly (for example TickCount at +0x320).
@@ -652,6 +662,9 @@ pub const W32_GDI_LOAD_LABEL: u64 = 0x774;
 /// A component-side `EngDeviceIoControl` request. The display driver and win32k run in the win32k
 /// component, while hosted video miniport IRPs belong to the executive's generic IO manager.
 pub const W32_VIDEO_IOCTL_LABEL: u64 = 0x775;
+/// A component-side kernel LPC request. Broker capabilities stay executive-owned; the component
+/// passes only an operation, an opaque broker handle, and a bounded native PORT_MESSAGE frame.
+pub const W32_LPC_LABEL: u64 = 0x776;
 
 const VIDEO_IOCTL_HDEV: u64 = 0x00;
 const VIDEO_IOCTL_CODE: u64 = 0x08;
@@ -668,6 +681,16 @@ const _: () =
 static WIN32K_VIDEO_IOCTL_TRACE: AtomicU64 = AtomicU64::new(0);
 static WIN32K_VIDEO_IOCTL_REQUEST_TRACE: AtomicU64 = AtomicU64::new(0);
 static GDI_DRIVER_IMPORT_TRACE: AtomicU64 = AtomicU64::new(0);
+
+const LPC_SERVICE_PORT_HANDLE: u64 = 0x00;
+const LPC_SERVICE_OPERATION: u64 = 0x08;
+const LPC_SERVICE_STATUS: u64 = 0x0c;
+const LPC_SERVICE_MESSAGE_LEN: u64 = 0x10;
+const LPC_SERVICE_MESSAGE: u64 = 0x100;
+const LPC_SERVICE_QUERY_HANDLE: u32 = 1;
+const LPC_SERVICE_REQUEST_PORT: u32 = 2;
+const LPC_SERVICE_MESSAGE_CAP: usize = nt_lpc_abi::PORT_MESSAGE_MAX_LEN;
+const _: () = assert!(LPC_SERVICE_MESSAGE as usize + LPC_SERVICE_MESSAGE_CAP <= WIN32K_LPC_BYTES);
 
 // --- pool allocator (host-side; the trampolines run in the component) ------------------------
 //
@@ -3453,17 +3476,12 @@ extern "win64" fn s_ob_reference_object_by_handle(
                 // NtCurrentThread() pseudo handle → selected dispatch ETHREAD.
                 (unsafe { current_ethread() }, u32::MAX)
             } else if obj_type == port_ty {
-                let status = unsafe {
-                    lpc_client()
-                        .ok_or(nt_status::NtStatus(0xC000_0001u32 as i32))
-                        .and_then(|lpc| lpc.query_handle(handle))
-                };
-                match status {
-                    Ok(_) => (handle, u32::MAX),
-                    Err(status) => {
-                        ob_type_mismatch_trace(handle, obj_type, b"invalid-lpc-handle");
-                        return status.raw();
-                    }
+                let status = unsafe { request_lpc_service(LPC_SERVICE_QUERY_HANDLE, handle, &[]) };
+                if status == 0 {
+                    (handle, u32::MAX)
+                } else {
+                    ob_type_mismatch_trace(handle, obj_type, b"invalid-lpc-handle");
+                    return status;
                 }
             } else {
                 // Every modeled typed object resolves above; reaching here is a real object-manager
@@ -3524,22 +3542,83 @@ extern "win64" fn s_lpc_request_port(port_object: u64, message: *const u8) -> i3
     frame[8..16].copy_from_slice(&WIN32K_CURRENT_PROCESS_ID.load(Ordering::Relaxed).to_le_bytes());
     frame[16..24].copy_from_slice(&WIN32K_CURRENT_THREAD_ID.load(Ordering::Relaxed).to_le_bytes());
 
-    let Some(lpc) = (unsafe { lpc_client() }) else {
-        return 0xC000_0001u32 as i32; // STATUS_UNSUCCESSFUL
-    };
-    let identity = match lpc.query_handle(port_object) {
-        Ok(identity) => identity,
-        Err(status) => return status.raw(),
-    };
-    match lpc.request_port(port_object, &frame[..total]) {
-        Ok(()) => {
-            if lpc_name_is(&identity.name, b"\\windows\\apiport") {
-                CSR_KERNEL_MESSAGES_PENDING.fetch_add(1, Ordering::Relaxed);
-            }
-            0
-        }
-        Err(status) => status.raw(),
+    unsafe { request_lpc_service(LPC_SERVICE_REQUEST_PORT, port_object, &frame[..total]) }
+}
+
+/// Invoke an executive-owned LPC operation from the win32k component. The shared window contains
+/// no pointers and the component cannot access the broker channel directly because its capabilities
+/// are meaningful only in the executive's CSpace.
+#[inline(never)]
+unsafe fn request_lpc_service(operation: u32, port_handle: u64, message: &[u8]) -> i32 {
+    if message.len() > LPC_SERVICE_MESSAGE_CAP {
+        return STATUS_INVALID_PARAMETER_I32;
     }
+    let sh = WIN32K_LPC_VADDR;
+    write_volatile((sh + LPC_SERVICE_PORT_HANDLE) as *mut u64, port_handle);
+    write_volatile((sh + LPC_SERVICE_OPERATION) as *mut u32, operation);
+    write_volatile(
+        (sh + LPC_SERVICE_STATUS) as *mut i32,
+        0xC000_0001u32 as i32,
+    );
+    write_volatile(
+        (sh + LPC_SERVICE_MESSAGE_LEN) as *mut u32,
+        message.len() as u32,
+    );
+    for (index, byte) in message.iter().enumerate() {
+        write_volatile((sh + LPC_SERVICE_MESSAGE + index as u64) as *mut u8, *byte);
+    }
+    let _ = crate::driver_launch::call_on(W32_LPC_LABEL << 12);
+    read_volatile((sh + LPC_SERVICE_STATUS) as *const i32)
+}
+
+/// Execute a bounded request against the isolated LPC broker from the executive component pump.
+/// This is the sole half of the win32k LPC bridge that touches [`lpc_client`], so broker channel
+/// capabilities never cross into the win32k CSpace.
+#[inline(never)]
+pub(crate) unsafe fn service_lpc_request() -> i32 {
+    let sh = WIN32K_LPC_VADDR;
+    let operation = read_volatile((sh + LPC_SERVICE_OPERATION) as *const u32);
+    let port_handle = read_volatile((sh + LPC_SERVICE_PORT_HANDLE) as *const u64);
+    let message_len = read_volatile((sh + LPC_SERVICE_MESSAGE_LEN) as *const u32) as usize;
+
+    let status = match operation {
+        LPC_SERVICE_QUERY_HANDLE if message_len == 0 => match lpc_client() {
+            Some(lpc) => lpc.query_handle(port_handle).map(|_| 0).unwrap_or_else(|s| s.raw()),
+            None => 0xC000_0001u32 as i32,
+        },
+        LPC_SERVICE_REQUEST_PORT if message_len <= LPC_SERVICE_MESSAGE_CAP => {
+            let bytes = core::slice::from_raw_parts(
+                (sh + LPC_SERVICE_MESSAGE) as *const u8,
+                message_len,
+            );
+            let header = bytes.get(..4).and_then(|header| header.try_into().ok());
+            let valid = header
+                .and_then(nt_lpc_abi::port_message_total_length)
+                .is_some_and(|total| total == message_len);
+            if !valid {
+                STATUS_INVALID_PARAMETER_I32
+            } else {
+                match lpc_client() {
+                    Some(lpc) => match lpc.query_handle(port_handle) {
+                        Ok(identity) => match lpc.request_port(port_handle, bytes) {
+                            Ok(()) => {
+                                if lpc_name_is(&identity.name, b"\\windows\\apiport") {
+                                    CSR_KERNEL_MESSAGES_PENDING.fetch_add(1, Ordering::Relaxed);
+                                }
+                                0
+                            }
+                            Err(status) => status.raw(),
+                        },
+                        Err(status) => status.raw(),
+                    },
+                    None => 0xC000_0001u32 as i32,
+                }
+            }
+        }
+        _ => STATUS_INVALID_PARAMETER_I32,
+    };
+    write_volatile((sh + LPC_SERVICE_STATUS) as *mut i32, status);
+    status
 }
 
 /// The synchronous kernel-client form requires suspending the current win32k continuation while a

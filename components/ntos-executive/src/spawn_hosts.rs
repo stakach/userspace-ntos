@@ -1322,6 +1322,7 @@ fn pump_label_can_arrive_after_timer(ch: &PumpChannel, label: u64) -> bool {
             && ch.caps.kind == ReqKind::Syscall)
         || (label == crate::win32k_subsystem::W32_VIDEO_IOCTL_LABEL
             && ch.caps.kind == ReqKind::Syscall)
+        || (label == crate::win32k_subsystem::W32_LPC_LABEL && ch.caps.kind == ReqKind::Syscall)
         || label == 6
         || (label == 3 && (ch.caps.io_port_faults || ch.caps.assert_skip))
 }
@@ -1915,6 +1916,12 @@ unsafe fn component_pump_loop(
             let status = pump_service_video_device_io_control();
             pump_reply_recv_into!(ch, *reply_cap, msg, REQUEST_TAG_LEN, status as u64);
             continue;
+        } else if label == crate::win32k_subsystem::W32_LPC_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let status = pump_service_lpc_request();
+            pump_reply_recv_into!(ch, *reply_cap, msg, REQUEST_TAG_LEN, status as u32 as u64);
+            continue;
         } else if label == crate::driver_launch::FSD_SERVICE_PS_CREATE_SYSTEM_THREAD_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
@@ -2197,6 +2204,11 @@ unsafe fn pump_service_gdi_driver_load() -> i32 {
 #[inline(never)]
 unsafe fn pump_service_video_device_io_control() -> u32 {
     crate::win32k_subsystem::service_video_device_io_control()
+}
+
+#[inline(never)]
+unsafe fn pump_service_lpc_request() -> i32 {
+    crate::win32k_subsystem::service_lpc_request()
 }
 
 #[inline(never)]

@@ -28469,6 +28469,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             for _ in 1..win32k_subsystem::WIN32K_VIDEO_IOCTL_FRAMES {
                 let _ = alloc_frame();
             }
+            // Pointer-free kernel LPC staging. The executive owns the isolated LPC broker caps;
+            // win32k reaches them only through its component-pump service boundary.
+            let lpc_request_base = alloc_frame();
+            for _ in 1..win32k_subsystem::WIN32K_LPC_FRAMES {
+                let _ = alloc_frame();
+            }
             // Bulk provider argument staging for large GDI client buffers.
             let bulk_arg_base = alloc_frame();
             for _ in 1..win32k_subsystem::WIN32K_BULK_ARG_FRAMES {
@@ -28541,6 +28547,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let _ = page_map(
                     copy_cap(video_ioctl_base + i),
                     win32k_subsystem::WIN32K_VIDEO_IOCTL_VADDR + i * 0x1000,
+                    RW_NX,
+                    CAP_INIT_THREAD_VSPACE,
+                );
+            }
+            for i in 0..win32k_subsystem::WIN32K_LPC_FRAMES {
+                let _ = page_map(
+                    copy_cap(lpc_request_base + i),
+                    win32k_subsystem::WIN32K_LPC_VADDR + i * 0x1000,
                     RW_NX,
                     CAP_INIT_THREAD_VSPACE,
                 );
@@ -28789,6 +28803,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     source: FrameSource::Alias(video_ioctl_base),
                     base_va: win32k_subsystem::WIN32K_VIDEO_IOCTL_VADDR,
                     count: win32k_subsystem::WIN32K_VIDEO_IOCTL_FRAMES,
+                    rights: Rights::Uniform(RW_NX),
+                    pts: 0,
+                };
+                n += 1;
+                // Kernel LPC request staging (aux PT window).
+                regions[n] = Region {
+                    source: FrameSource::Alias(lpc_request_base),
+                    base_va: win32k_subsystem::WIN32K_LPC_VADDR,
+                    count: win32k_subsystem::WIN32K_LPC_FRAMES,
                     rights: Rights::Uniform(RW_NX),
                     pts: 0,
                 };
