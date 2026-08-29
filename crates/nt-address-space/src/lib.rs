@@ -952,6 +952,38 @@ impl<const N: usize> VmCommittedRangeTable<N> {
         self.ranges.iter().filter(|range| range.is_some()).count()
     }
 
+    /// Commitment charged to a process for fixed mappings outside its private VAD allocator.
+    /// Private mappings consume their full range; mapped/image ranges consume only their reserved
+    /// copy-on-write charge. Shared writable/read-only section pages belong to the control area.
+    pub fn process_commit_bytes(&self) -> u64 {
+        self.ranges
+            .iter()
+            .flatten()
+            .filter(|range| {
+                range.type_ == MEM_PRIVATE
+                    || matches!(
+                        base_protection(range.protect),
+                        PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY
+                    )
+            })
+            .fold(0u64, |total, range| total.saturating_add(range.size))
+    }
+
+    pub fn allocation_process_commit_bytes(&self, allocation_base: u64) -> u64 {
+        self.ranges
+            .iter()
+            .flatten()
+            .filter(|range| {
+                range.allocation_base == allocation_base
+                    && (range.type_ == MEM_PRIVATE
+                        || matches!(
+                            base_protection(range.protect),
+                            PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY
+                        ))
+            })
+            .fold(0u64, |total, range| total.saturating_add(range.size))
+    }
+
     pub fn register(&mut self, range: VmCommittedRange) -> Result<(), u32> {
         let Some(end) = range.base.checked_add(range.size) else {
             return Err(STATUS_INVALID_PARAMETER);

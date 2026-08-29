@@ -309,6 +309,22 @@ pub(crate) fn image_rva_protection(pe: &nt_pe_loader::PeFile, rva: u32) -> u32 {
     }
 }
 
+pub(crate) unsafe fn image_writecopy_commit_bytes(pe: &nt_pe_loader::PeFile) -> u64 {
+    let image_size = image_extent(pe);
+    let mut bytes = 0u64;
+    let mut rva = 0u64;
+    while rva < image_size {
+        if matches!(
+            image_rva_protection(pe, rva as u32) & 0xff,
+            nt_address_space::PAGE_WRITECOPY | nt_address_space::PAGE_EXECUTE_WRITECOPY
+        ) {
+            bytes = bytes.saturating_add(0x1000);
+        }
+        rva += 0x1000;
+    }
+    bytes
+}
+
 pub(crate) unsafe fn register_image_committed_mappings(
     pi: u64,
     pe: &nt_pe_loader::PeFile,

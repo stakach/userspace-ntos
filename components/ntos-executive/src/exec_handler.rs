@@ -1638,6 +1638,12 @@ enum VmVadKind {
     Mapped,
 }
 
+#[derive(Default)]
+struct PreparedProcessCommitCharge {
+    mm: Option<nt_memory_manager::CommitChargePlan>,
+    job: Option<nt_process::job::JobMemoryChargePlan>,
+}
+
 fn allocate_vad_between(
     map: &mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>,
     kind: VmVadKind,
@@ -15398,9 +15404,14 @@ impl ExecNtHandler {
         if self.process_commit.contains(pid) {
             return Ok(());
         }
-        let initial_bytes = process_vm_region_map(pi)
+        let private_vad_bytes = process_vm_region_map(pi)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?
             .private_committed_bytes();
+        let fixed_mapping_bytes = process_committed_mapping_commit_bytes(pi as u64)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let initial_bytes = private_vad_bytes
+            .checked_add(fixed_mapping_bytes)
+            .ok_or(nt_memory_manager::STATUS_COMMITMENT_LIMIT)?;
         self.process_commit.register(pid, initial_bytes)?;
         if let Some(job) = self.pm.process_job(pid) {
             let limits = self.pm.job_extended_limits(job)?;
@@ -15459,6 +15470,64 @@ impl ExecNtHandler {
             None => 0,
         };
         self.process_commit.set_limit(pid, limit)
+    }
+
+    unsafe fn prepare_process_commit_charge(
+        &mut self,
+        pid: nt_process::ProcessId,
+        pi: usize,
+        bytes: u64,
+    ) -> Result<PreparedProcessCommitCharge, u32> {
+        if bytes == 0 {
+            return Ok(PreparedProcessCommitCharge::default());
+        }
+        if let Err(status) = self.ensure_process_commit_owner(pid, pi) {
+            self.drain_job_notifications();
+            return Err(status);
+        }
+        let mm = match self.process_commit.prepare_charge(pid, bytes) {
+            Ok(plan) => plan,
+            Err(status) => {
+                if status == nt_memory_manager::STATUS_COMMITMENT_LIMIT {
+                    let _ = self.pm.report_process_memory_limit_violation(pid);
+                    self.drain_job_notifications();
+                }
+                return Err(status);
+            }
+        };
+        let job = match self.pm.prepare_job_memory_charge(pid, bytes) {
+            Ok(plan) => plan,
+            Err(status) => {
+                self.drain_job_notifications();
+                return Err(status);
+            }
+        };
+        Ok(PreparedProcessCommitCharge { mm: Some(mm), job })
+    }
+
+    fn commit_process_commit_charge(&mut self, prepared: PreparedProcessCommitCharge) {
+        if let Some(plan) = prepared.job {
+            self.pm
+                .commit_job_memory_charge(plan)
+                .expect("serialized Ps job charge plan remains current through MM publication");
+        }
+        if let Some(plan) = prepared.mm {
+            self.process_commit
+                .commit_charge(plan)
+                .expect("serialized MM charge plan remains current through MM publication");
+        }
+    }
+
+    fn release_process_commit(&mut self, pid: nt_process::ProcessId, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.process_commit
+            .release(pid, bytes)
+            .expect("MM commit release matches the published address-space delta");
+        self.pm
+            .release_job_memory(pid, bytes)
+            .expect("Ps job commit release matches the published address-space delta");
     }
 
     pub(crate) fn resolve_process_for_access(
@@ -16413,31 +16482,11 @@ impl ExecNtHandler {
         let commit_delta = after
             .private_committed_bytes()
             .saturating_sub(before.private_committed_bytes());
-        let mut mm_charge = None;
-        let mut job_charge = None;
-        if commit_delta != 0 {
-            if let Err(status) = self.ensure_process_commit_owner(target_pid, target_pi) {
-                self.drain_job_notifications();
-                return status;
-            }
-            match self.process_commit.prepare_charge(target_pid, commit_delta) {
-                Ok(plan) => mm_charge = Some(plan),
-                Err(status) => {
-                    if status == nt_memory_manager::STATUS_COMMITMENT_LIMIT {
-                        let _ = self.pm.report_process_memory_limit_violation(target_pid);
-                        self.drain_job_notifications();
-                    }
-                    return status;
-                }
-            }
-            match self.pm.prepare_job_memory_charge(target_pid, commit_delta) {
-                Ok(plan) => job_charge = plan,
-                Err(status) => {
-                    self.drain_job_notifications();
-                    return status;
-                }
-            }
-        }
+        let prepared_commit =
+            match self.prepare_process_commit_charge(target_pid, target_pi, commit_delta) {
+                Ok(prepared) => prepared,
+                Err(status) => return status,
+            };
 
         // Commit the plan EXTENT-WISE, not page-wise.
         //
@@ -16551,16 +16600,7 @@ impl ExecNtHandler {
             return map_status;
         }
         *vm_map = *after;
-        if let Some(plan) = job_charge {
-            self.pm
-                .commit_job_memory_charge(plan)
-                .expect("serialized Ps job charge plan remains current through VAD publication");
-        }
-        if let Some(plan) = mm_charge {
-            self.process_commit
-                .commit_charge(plan)
-                .expect("serialized MM charge plan remains current through VAD publication");
-        }
+        self.commit_process_commit_charge(prepared_commit);
         let size_written = self.user_memory_write(memory, size_ptr, &plan.size.to_le_bytes());
         let base_written = self.user_memory_write(memory, base_ptr, &plan.base.to_le_bytes());
         if !created_vad && (!size_written || !base_written) {
@@ -16643,6 +16683,21 @@ impl ExecNtHandler {
                 Ok(plan) => plan,
                 Err(status) => return status,
             };
+            let before_commit = before_committed.process_commit_bytes();
+            let after_commit = after_committed.process_commit_bytes();
+            let added_commit = after_commit.saturating_sub(before_commit);
+            let released_commit = before_commit.saturating_sub(after_commit);
+            let prepared_commit =
+                match self.prepare_process_commit_charge(target_pid, target_pi, added_commit) {
+                    Ok(prepared) => prepared,
+                    Err(status) => return status,
+                };
+            if released_commit != 0 {
+                if let Err(status) = self.ensure_process_commit_owner(target_pid, target_pi) {
+                    self.drain_job_notifications();
+                    return status;
+                }
+            }
             let mut page = plan.base;
             let mut changed_end = plan.base;
             let mut map_status = 0u32;
@@ -16717,9 +16772,12 @@ impl ExecNtHandler {
                 }
                 return map_status;
             }
-            if !process_committed_mapping_replace(target_pi as u64, *after_committed) {
-                return nt_process::STATUS_INVALID_HANDLE;
-            }
+            assert!(
+                process_committed_mapping_replace(target_pi as u64, *after_committed),
+                "validated process mapping table remains present through protection publication"
+            );
+            self.commit_process_commit_charge(prepared_commit);
+            self.release_process_commit(target_pid, released_commit);
             loader_trace_record(
                 self.pi,
                 LoaderOp::ProtectVirtualMemory,
@@ -17517,12 +17575,7 @@ impl ExecNtHandler {
         }
         *vm_map = *after;
         if released_commit != 0 {
-            self.process_commit
-                .release(target_pid, released_commit)
-                .expect("MM commit release matches the published VAD delta");
-            self.pm
-                .release_job_memory(target_pid, released_commit)
-                .expect("Ps job commit release matches the published VAD delta");
+            self.release_process_commit(target_pid, released_commit);
         }
         let _ = self.xas_write_u64(size_ptr, plan.size);
         let _ = self.xas_write_u64(base_ptr, plan.base);
@@ -27260,6 +27313,16 @@ impl ExecNtHandler {
             view_protection,
             placement_limit,
         )?;
+        let mapped_commit = if matches!(
+            view_protection & 0xff,
+            nt_address_space::PAGE_WRITECOPY | nt_address_space::PAGE_EXECUTE_WRITECOPY
+        ) {
+            plan.size
+        } else {
+            0
+        };
+        let prepared_commit =
+            self.prepare_process_commit_charge(target_pid, target_pi, mapped_commit)?;
         if !generic_sections.map_view(
             target_pi,
             section_index,
@@ -27279,6 +27342,7 @@ impl ExecNtHandler {
             return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
         }
         *vm_map = *after;
+        self.commit_process_commit_charge(prepared_commit);
         crate::note_high_water(&crate::VM_REGION_HW, after.extent_count() as u64);
         Ok((plan.base, plan.size))
     }
@@ -27685,6 +27749,14 @@ impl ExecNtHandler {
         let Some(vm_map) = process_vm_region_map_mut(pi) else {
             return;
         };
+        let mapped_commit =
+            process_committed_allocation_commit_bytes(pi as u64, view.base).unwrap_or(0);
+        let target_pid = self.pm_pid_for_pi(pi);
+        if mapped_commit != 0 {
+            let pid = target_pid.expect("a charged mapped view has a live EPROCESS");
+            self.ensure_process_commit_owner(pid, pi)
+                .expect("a charged mapped view has a live MM commit owner");
+        }
         let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
         let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
         *before = *vm_map;
@@ -27695,6 +27767,9 @@ impl ExecNtHandler {
         *vm_map = *after;
         let _ = process_committed_mapping_unregister_range(pi as u64, view.base, view.size);
         let _ = generic_sections.unmap_view(pi, view.base);
+        if let Some(pid) = target_pid {
+            self.release_process_commit(pid, mapped_commit);
+        }
     }
 
     unsafe fn validate_secure_lpc_connect(
@@ -34660,7 +34735,7 @@ impl ExecNtHandler {
                 if base > 0x0000_07ff_fffe_ffff {
                     return STATUS_NOT_MAPPED_VIEW;
                 }
-                let (_target_pid, target_pi) =
+                let (target_pid, target_pi) =
                     match self.resolve_process_for_access(args[0], PROCESS_VM_OPERATION) {
                         Ok(target) => target,
                         Err(status) => return status,
@@ -34670,6 +34745,18 @@ impl ExecNtHandler {
                     if let Some((_section_index, view)) =
                         generic_sections.view_for_page(target_pi, base)
                     {
+                        let mapped_commit = process_committed_allocation_commit_bytes(
+                            target_pi as u64,
+                            view.base,
+                        )
+                        .unwrap_or(0);
+                        if mapped_commit != 0 {
+                            if let Err(status) = self.ensure_process_commit_owner(target_pid, target_pi)
+                            {
+                                self.drain_job_notifications();
+                                return status;
+                            }
+                        }
                         let writeback = match service_generic_section_writeback_view(
                             generic_sections,
                             view,
@@ -34713,6 +34800,7 @@ impl ExecNtHandler {
                             view.size,
                         );
                         let _ = generic_sections.unmap_view(target_pi, view.base);
+                        self.release_process_commit(target_pid, mapped_commit);
                         return 0;
                     }
                 }
@@ -34722,6 +34810,19 @@ impl ExecNtHandler {
                         let image_base = reg.get(slot).map(|dll| dll.base).unwrap_or(base);
                         let allocation =
                             process_committed_image_allocation(target_pi as u64, image_base);
+                        let image_commit = process_committed_allocation_commit_bytes(
+                            target_pi as u64,
+                            image_base,
+                        )
+                        .unwrap_or(0);
+                        if image_commit != 0 {
+                            if let Err(status) =
+                                self.ensure_process_commit_owner(target_pid, target_pi)
+                            {
+                                self.drain_job_notifications();
+                                return status;
+                            }
+                        }
                         if reg.clear_mapped(target_pi, slot) {
                             if let Some(allocation) = allocation {
                                 let _ = vm_page_lock_retire_range(
@@ -34741,6 +34842,7 @@ impl ExecNtHandler {
                                 target_pi as u64,
                                 image_base,
                             );
+                            self.release_process_commit(target_pid, image_commit);
                             self.dbgk_module_unload(target_pi, image_base);
                             return 0;
                         }
@@ -40406,6 +40508,18 @@ impl ExecNtHandler {
                         // an overlapping DLL set at identical bases into distinct VSpaces, so gate the
                         // reservation on this process's bitmask, not any other process's image view.
                         let pi = self.pi;
+                        let target_pid = match self.pm_pid_for_pi(pi) {
+                            Some(pid) => pid,
+                            None => return nt_process::STATUS_INVALID_HANDLE,
+                        };
+                        let prepared_commit = match self.prepare_process_commit_charge(
+                            target_pid,
+                            pi,
+                            img_spawn::image_writecopy_commit_bytes(cpe),
+                        ) {
+                            Ok(prepared) => prepared,
+                            Err(status) => return status,
+                        };
                         let dll_arena_paging = &mut *ctx.dll_arena_paging;
                         if let Err(status) = dll_arena_paging.reserve_process(pi) {
                             return status;
@@ -40459,6 +40573,7 @@ impl ExecNtHandler {
                             let _ = reg.clear_mapped(self.pi, i);
                             return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
                         }
+                        self.commit_process_commit_charge(prepared_commit);
                         csrss_out_write(
                             self.pi as u64,
                             args[2],

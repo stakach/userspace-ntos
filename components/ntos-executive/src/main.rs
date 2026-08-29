@@ -1509,6 +1509,19 @@ pub(crate) unsafe fn process_committed_mapping_snapshot(
     process_committed_mapping_table(pi as usize).copied()
 }
 
+pub(crate) unsafe fn process_committed_mapping_commit_bytes(pi: u64) -> Option<u64> {
+    process_committed_mapping_table(pi as usize)
+        .map(nt_address_space::VmCommittedRangeTable::process_commit_bytes)
+}
+
+pub(crate) unsafe fn process_committed_allocation_commit_bytes(
+    pi: u64,
+    allocation_base: u64,
+) -> Option<u64> {
+    process_committed_mapping_table(pi as usize)
+        .map(|table| table.allocation_process_commit_bytes(allocation_base))
+}
+
 pub(crate) unsafe fn process_committed_mapping_replace(
     pi: u64,
     replacement: nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>,

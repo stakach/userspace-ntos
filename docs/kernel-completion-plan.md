@@ -17163,6 +17163,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     flags only after all of those paths and their rollback edges are transactional; do not revert to
     `VmRegionMap::committed_bytes()` as an approximate process total.
 
+    Fixed-private and copy-on-write commitment (2026-08-30, accepted; thread/page-table sources
+    remain): the fixed committed-range authority now calculates process charge using NT ownership:
+    every `MEM_PRIVATE` byte is charged, ordinary shared image/data views are not, and
+    `MEM_IMAGE`/`MEM_MAPPED` ranges reserve commitment only while protected write-copy. The MM owner
+    seeds from this value plus private VAD commitment. Later DLL and generic-section mappings prepare
+    MM/Ps write-copy charges before publication and commit only after the authoritative range is
+    registered; output rollback and `NtUnmapViewOfSection` remove the range before releasing both
+    ledgers. `NtProtectVirtualMemory` computes the before/after range-table charge and applies the
+    same transaction when protection introduces or removes write-copy. The shared range table also
+    reports allocation-local charge so unmap never infers quota from resident frames.
+
+    Focused validation passes `nt-address-space` `62/62`; the freestanding executive remains at the
+    established 209-warning baseline. Review adjustment: fixed main-process pages and image COW are
+    now explicit, but dynamically created thread stacks, TEBs, and activation-context pages still
+    bypass the committed-range authority, and user page-table commitment is not yet attached to a
+    process MM ledger. Wire thread create/teardown transactionally next, then make every process page
+    table allocation/reclamation publish an exact MM charge. Inherited-job creation must establish
+    the complete owner at process publication rather than waiting for a later VM call. Keep the
+    public process/job memory-limit flags disabled until those sources are closed.
+
     Ps job-memory owner foundation (2026-08-30, accepted; live composition remains in progress):
     each job member and job now own current commitment, high-water marks, and the NT one-shot memory
     violation state. Admission and later charges use prepare/commit plans, accept a charge exactly at

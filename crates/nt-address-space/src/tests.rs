@@ -2111,3 +2111,48 @@ fn committed_range_table_rejects_unbounded_or_unaligned_ranges() {
     );
     assert_eq!(table.range_count(), 0);
 }
+
+#[test]
+fn committed_range_table_reports_only_private_and_writecopy_commitment() {
+    let mut table = VmCommittedRangeTable::<8>::new();
+    table
+        .register(VmCommittedRange::private(
+            0x1000_0000,
+            0x2000,
+            PAGE_READWRITE,
+        ))
+        .unwrap();
+    table
+        .register(VmCommittedRange::mapped(
+            0x2000_0000,
+            0x3000,
+            PAGE_READWRITE,
+        ))
+        .unwrap();
+    table
+        .register(VmCommittedRange::mapped(
+            0x3000_0000,
+            0x1000,
+            PAGE_WRITECOPY,
+        ))
+        .unwrap();
+    table
+        .register(VmCommittedRange::image(
+            0x4000_0000,
+            0x2000,
+            PAGE_EXECUTE_WRITECOPY,
+        ))
+        .unwrap();
+    table
+        .register(VmCommittedRange::image(
+            0x5000_0000,
+            0x4000,
+            PAGE_EXECUTE_READ,
+        ))
+        .unwrap();
+
+    assert_eq!(table.process_commit_bytes(), 0x5000);
+    assert_eq!(table.allocation_process_commit_bytes(0x1000_0000), 0x2000);
+    assert_eq!(table.allocation_process_commit_bytes(0x2000_0000), 0);
+    assert_eq!(table.allocation_process_commit_bytes(0x4000_0000), 0x2000);
+}
