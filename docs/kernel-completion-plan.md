@@ -16099,3 +16099,44 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     datagram/ALPC use of `Port.reply_connection` with explicit connection provenance and delete the
     field. A missing transaction, stale message, or disconnected endpoint must fail closed; do not
     add a most-recent-connection route or synthetic successful completion.
+
+    Typed LPC receive continuation, first slice (2026-08-29, accepted): generic `NtListenPort` and
+    `NtReplyWaitReceivePort` no longer reduce a blocked call to four transient scalar fields and no
+    longer delete the only reply capability that can resume the caller. The new host-testable
+    `nt-lpc-continuation` crate owns a growable, generation-exact reservation table. Storage is
+    reserved before the broker's atomic reply/wait transition; publication and completion cannot
+    allocate. Each retained entry records the exact listen versus reply/wait operation, broker port
+    handle, native receive and context outputs, process address-space policy, PID slot, TID, badge,
+    saved syscall registers, and bound reply capability.
+
+    Immediate and deferred receive completion now share one copyout path. It publishes the
+    broker-authored connection id and client PID/TID, rejects oversized connection information
+    instead of truncating it, writes the server context for ordinary messages, and resumes the exact
+    parked syscall with the terminal status. Thread teardown removes its receive by TID and retires
+    the bound reply object. Broker redrive is producer-edge-triggered: an LPC reply or combined
+    reply/wait causes one FIFO pass over pending receives; unrelated syscalls do not poll the broker.
+    Code checkpoint `506520df` is committed.
+
+    `nt-lpc-continuation` passes `5/5` host tests covering stale generations, same-endpoint
+    concurrency, invalid publication rollback, reset/preallocation, and FIFO order after slot reuse.
+    The staged release executive builds at the established 212-warning baseline. Serialized
+    acceptance `.tmp/run-headless-lpc-receive-edge-20260829.log` records three real generic receive
+    parks, reaches the first CSRSS `\SmApiPort` connection at the normal frontier, and performs 104
+    broker receive calls, exactly matching the preceding accepted desktop run rather than the
+    unbounded polling regression caught during development. Genuine userinit and Explorer launch;
+    Explorer completes 669 api0 redirects with zero callback or dead-callback failures, paint
+    begin/end reaches `5/20` with 187 direct GDI returns and 135 batch flushes covering 184 records,
+    and the framebuffer holds `480000/480000` non-background pixels with at least 32 colours. All
+    `295/295` gates pass and the sentinel matches.
+
+    Review adjustment: this closes durable generic receive storage, exact resume, cancellation, and
+    non-polling redrive, but not the producer half of the blocked-service conversion. The three live
+    receives remain parked because SM, CSR/SB, and LSA traffic is still consumed by their older
+    synchronous rendezvous loops. Convert `\SmApiPort` first: reserve a typed pending-connect
+    continuation before queueing the broker connection, let the real generic SmpApiLoop receive and
+    accept it, resume the connector only after that exact connection completes, then delete
+    `lpc_rendezvous_conn`, `lpc_rendezvous_out`, `sm_rendezvous`, `SM_RECEIVE_PARKED`, the `SM_RECV*`
+    fields, and the duplicate private SM worker transport. Apply the same adapter to
+    `\Windows\SbApiPort`, `\Windows\ApiPort`, and LSA one port at a time, deleting each replaced
+    worker loop and numeric continuation branch in its acceptance slice. Only then replace the
+    remaining datagram/ALPC `Port.reply_connection` routing with explicit connection provenance.
