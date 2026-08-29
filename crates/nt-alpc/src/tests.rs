@@ -693,38 +693,152 @@ fn recv_with_attrs(port: u64, allocated: u32) -> Vec<u8> {
     })
 }
 
-/// Step 4: peer-direct delivery — messages flow endpoint↔endpoint against the
-/// executive-local cache, carrying attributes, with no broker on the path.
 #[test]
-fn peer_direct_delivery() {
-    let mut pd = PeerDirect::new();
-    pd.register(0x100, 0x200);
-    pd.register(0x100, 0x200); // idempotent
-    assert_eq!(pd.connection_count(), 1);
+fn exact_alpc_connections_do_not_share_receive_or_disconnect_state() {
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let name = utf16("\\AlpcExact");
+    let listen = alpc
+        .dispatch(
+            &mut core,
+            aop::ALPC_OP_CREATE_PORT,
+            &enc_create_port(&name, port_flag::NONE),
+            &mut [],
+        )
+        .detail0;
+    let mut clients = [0u64; 2];
+    let mut servers = [0u64; 2];
 
-    // client → server, carrying a CONTEXT attribute.
-    pd.send(
-        0x100,
-        b"request",
-        MessageAttrs {
-            context: Some(0x7),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let m = pd.recv(0x200).unwrap().unwrap();
-    assert_eq!(m.bytes, b"request");
-    assert_eq!(m.attrs.context, Some(0x7));
-    // drained
-    assert!(pd.recv(0x200).unwrap().is_none());
+    for index in 0..2 {
+        let connect = alpc.dispatch(
+            &mut core,
+            aop::ALPC_OP_CONNECT_PORT,
+            &enc_connect(
+                &name,
+                0,
+                &port_message(msg_type::CONNECTION_REQUEST, b"connect"),
+            ),
+            &mut [],
+        );
+        assert_eq!(connect.status, NtStatus::PENDING.raw());
+        let connection_id = connect.detail1;
+        let mut out = [0u8; 128];
+        let received = alpc.dispatch(
+            &mut core,
+            aop::ALPC_OP_RECEIVE,
+            &enc_send_receive(listen, None, 0, &[]),
+            &mut out,
+        );
+        assert_eq!(received.detail0, connection_id);
+        let accepted = alpc.dispatch(
+            &mut core,
+            aop::ALPC_OP_ACCEPT_CONNECT,
+            &enc_accept(connection_id, true, index as u64),
+            &mut [],
+        );
+        assert_eq!(accepted.status, SUCCESS);
+        servers[index] = accepted.detail0;
+        clients[index] = accepted.detail1;
+    }
 
-    // server → client
-    pd.send(0x200, b"reply", MessageAttrs::default()).unwrap();
-    assert_eq!(pd.recv(0x100).unwrap().unwrap().bytes, b"reply");
+    let first = port_message(msg_type::REQUEST, b"first");
+    let second = port_message(msg_type::REQUEST, b"second");
+    for (client, message) in [(clients[0], &first), (clients[1], &second)] {
+        let send = enc_send_receive(client, Some(message), 0, &[]);
+        assert_eq!(
+            alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &send, &mut [])
+                .status,
+            NtStatus::PENDING.raw()
+        );
+    }
 
-    // an unknown endpoint is rejected.
-    assert!(pd.send(0xDEAD, b"x", MessageAttrs::default()).is_err());
-    assert!(pd.recv(0xDEAD).is_err());
+    let mut out = [0u8; 128];
+    let receive_second = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_RECEIVE,
+        &enc_send_receive(servers[1], None, 0, &[]),
+        &mut out,
+    );
+    assert_eq!(&out[..receive_second.information as usize], &second);
+    let receive_first = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_RECEIVE,
+        &enc_send_receive(servers[0], None, 0, &[]),
+        &mut out,
+    );
+    assert_eq!(&out[..receive_first.information as usize], &first);
+
+    let listen_send = enc_send_receive(listen, Some(&first), 0, &[]);
+    assert_eq!(
+        alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &listen_send, &mut out)
+            .status,
+        NtStatus::INVALID_PORT_HANDLE.raw()
+    );
+    assert_eq!(
+        alpc.dispatch(
+            &mut core,
+            aop::ALPC_OP_DISCONNECT_PORT,
+            &enc_handle_req(clients[0]),
+            &mut [],
+        )
+        .status,
+        SUCCESS
+    );
+    let stale_send = enc_send_receive(servers[0], Some(&first), 0, &[]);
+    assert_eq!(
+        alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &stale_send, &mut [])
+            .status,
+        NtStatus::INVALID_PORT_HANDLE.raw()
+    );
+
+    let live_reply = port_message(msg_type::REPLY, b"live");
+    let live_send = enc_send_receive(servers[1], Some(&live_reply), 0, &[]);
+    assert_eq!(
+        alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &live_send, &mut [])
+            .status,
+        NtStatus::PENDING.raw()
+    );
+    let live_receive = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_RECEIVE,
+        &enc_send_receive(clients[1], None, 0, &[]),
+        &mut out,
+    );
+    assert_eq!(
+        &out[..live_receive.information as usize],
+        &live_reply,
+        "disconnecting one connection must not affect its sibling"
+    );
+
+    let lpc_listen = core.create_port(&utf16("\\Classic"), PortApi::Lpc);
+    let lpc_connection = match core
+        .connect(&utf16("\\Classic"), PortApi::Lpc, 0, &[])
+        .unwrap()
+    {
+        ConnectOutcome::Pending { connection_id } => connection_id,
+        _ => unreachable!(),
+    };
+    core.receive(lpc_listen).unwrap();
+    let lpc_server = core.accept(lpc_connection, true, 0).unwrap();
+    let lpc_client = core.complete(lpc_connection).unwrap().0;
+    assert_eq!(
+        alpc.dispatch(
+            &mut core,
+            aop::ALPC_OP_DISCONNECT_PORT,
+            &enc_handle_req(lpc_client),
+            &mut [],
+        )
+        .status,
+        NtStatus::INVALID_PORT_HANDLE.raw(),
+        "the ALPC adapter must not disconnect a classic-LPC endpoint"
+    );
+    core.send_message(lpc_client, b"still-connected", MessageAttrs::default())
+        .unwrap();
+    assert_eq!(
+        core.receive_message(lpc_server).unwrap().unwrap().bytes,
+        b"still-connected"
+    );
 }
 
 // --- LPC direct backend for driving the classic-LPC adapter in the test ----

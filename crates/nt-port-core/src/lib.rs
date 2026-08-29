@@ -132,6 +132,9 @@ pub struct ConnectionSecurity {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PortHandleInfo<'a> {
     pub endpoint: PortHandleEndpoint,
+    /// API surface spoken by this endpoint. Cross-API connections may report different values for
+    /// their client and server communication handles.
+    pub api: PortApi,
     /// Zero for listen ports; the broker connection id for communication ports.
     pub connection_id: u64,
     /// `None` for listen ports.
@@ -477,6 +480,7 @@ impl PortCore {
         if let Some(port) = self.ports.iter().find(|port| port.handle == handle) {
             return Some(PortHandleInfo {
                 endpoint: PortHandleEndpoint::ListenPort,
+                api: port.api,
                 connection_id: 0,
                 state: None,
                 port_name: port.name.as_slice(),
@@ -490,6 +494,7 @@ impl PortCore {
             if conn.client_open && conn.client_handle == handle {
                 Some(PortHandleInfo {
                     endpoint: PortHandleEndpoint::ClientCommPort,
+                    api: conn.client_api,
                     connection_id: conn.id,
                     state: Some(conn.state),
                     port_name: conn.port_name.as_slice(),
@@ -501,6 +506,7 @@ impl PortCore {
             } else if conn.server_open && conn.server_handle == handle {
                 Some(PortHandleInfo {
                     endpoint: PortHandleEndpoint::ServerCommPort,
+                    api: conn.server_api,
                     connection_id: conn.id,
                     state: Some(conn.state),
                     port_name: conn.port_name.as_slice(),
@@ -694,6 +700,14 @@ impl PortCore {
 
     /// Receive the next pending connection request on a server port.
     pub fn receive(&mut self, port_handle: u64) -> Result<ReceiveOutcome, NtStatus> {
+        if self.connections.iter().any(|connection| {
+            port_handle != 0
+                && connection.server_open
+                && connection.server_handle == port_handle
+                && connection.server_api == PortApi::Alpc
+        }) {
+            return Ok(ReceiveOutcome::WouldBlock);
+        }
         let port_index = self
             .ports
             .iter()
@@ -1218,6 +1232,22 @@ impl PortCore {
                 Err(NtStatus::PORT_DISCONNECTED)
             };
         }
+        if let Some(connection_index) = self.connections.iter().position(|connection| {
+            handle != 0
+                && connection.server_open
+                && connection.server_handle == handle
+                && connection.server_api == PortApi::Alpc
+        }) {
+            if !self.connections[connection_index].server_inbox.is_empty() {
+                return Ok(self.dequeue_server_message(connection_index));
+            }
+            let connection = &self.connections[connection_index];
+            return if connection.state == ConnState::Connected && connection.client_open {
+                Ok(None)
+            } else {
+                Err(NtStatus::PORT_DISCONNECTED)
+            };
+        }
         let port_index = self
             .ports
             .iter()
@@ -1233,50 +1263,57 @@ impl PortCore {
                     && !conn.server_inbox.is_empty()
             });
             if let Some(connection_index) = connection_index {
-                let stored = self.connections[connection_index].server_inbox.remove(0);
-                let account = self.connections[connection_index].pool_account;
-                if let Some(identity) = stored.message.request_identity {
-                    if !self.connections[connection_index]
-                        .delivered_requests
-                        .iter()
-                        .any(|request| request.identity == identity)
-                    {
-                        let delivered_charge = delivered_request_pool_charge();
-                        self.replace_pool_charge(account, stored.pool_charge, delivered_charge)
-                            .expect(
-                                "a delivered request record is smaller than its queued message",
-                            );
-                        self.connections[connection_index].delivered_requests.push(
-                            DeliveredRequest {
-                                identity,
-                                pool_charge: delivered_charge,
-                            },
-                        );
-                    } else {
-                        self.replace_pool_charge(account, stored.pool_charge, 0)
-                            .expect("dequeued duplicate request was previously charged");
-                    }
-                } else {
-                    self.replace_pool_charge(account, stored.pool_charge, 0)
-                        .expect("dequeued broker datagram was previously charged");
-                }
-                return Ok(Some(stored.message));
+                return Ok(self.dequeue_server_message(connection_index));
             }
             return Ok(None);
         }
         Err(NtStatus::INVALID_HANDLE)
     }
 
-    /// NT server communication ports reply to one client but receive from their associated named
-    /// connection port. Resolve that shared receive queue without exposing a second identity to API
-    /// adapters.
+    /// Classic LPC server communication ports reply to one client but receive from their associated
+    /// named connection port. ALPC server handles are exact endpoints and never use this alias.
     fn connection_port_index_for_server_handle(&self, handle: u64) -> Option<usize> {
         let connection = self.connections.iter().find(|connection| {
-            handle != 0 && connection.server_open && connection.server_handle == handle
+            handle != 0
+                && connection.server_open
+                && connection.server_handle == handle
+                && connection.server_api == PortApi::Lpc
         })?;
         self.ports
             .iter()
             .position(|port| port.api == connection.server_api && port.name == connection.port_name)
+    }
+
+    fn dequeue_server_message(&mut self, connection_index: usize) -> Option<QueuedMessage> {
+        if self.connections[connection_index].server_inbox.is_empty() {
+            return None;
+        }
+        let stored = self.connections[connection_index].server_inbox.remove(0);
+        let account = self.connections[connection_index].pool_account;
+        if let Some(identity) = stored.message.request_identity {
+            if !self.connections[connection_index]
+                .delivered_requests
+                .iter()
+                .any(|request| request.identity == identity)
+            {
+                let delivered_charge = delivered_request_pool_charge();
+                self.replace_pool_charge(account, stored.pool_charge, delivered_charge)
+                    .expect("a delivered request record is smaller than its queued message");
+                self.connections[connection_index]
+                    .delivered_requests
+                    .push(DeliveredRequest {
+                        identity,
+                        pool_charge: delivered_charge,
+                    });
+            } else {
+                self.replace_pool_charge(account, stored.pool_charge, 0)
+                    .expect("dequeued duplicate request was previously charged");
+            }
+        } else {
+            self.replace_pool_charge(account, stored.pool_charge, 0)
+                .expect("dequeued broker datagram was previously charged");
+        }
+        Some(stored.message)
     }
 
     // --- internals --------------------------------------------------------
@@ -1560,6 +1597,7 @@ mod tests {
             core.handle_info(listen),
             Some(PortHandleInfo {
                 endpoint: PortHandleEndpoint::ListenPort,
+                api: PortApi::Lpc,
                 connection_id: 0,
                 state: None,
                 port_name: &utf16("\\lsaauthenticationport"),
@@ -1573,6 +1611,7 @@ mod tests {
             core.handle_info(client),
             Some(PortHandleInfo {
                 endpoint: PortHandleEndpoint::ClientCommPort,
+                api: PortApi::Lpc,
                 connection_id: cid,
                 state: Some(ConnState::Connected),
                 port_name: &utf16("\\lsaauthenticationport"),
@@ -1586,6 +1625,7 @@ mod tests {
             core.handle_info(server),
             Some(PortHandleInfo {
                 endpoint: PortHandleEndpoint::ServerCommPort,
+                api: PortApi::Lpc,
                 connection_id: cid,
                 state: Some(ConnState::Connected),
                 port_name: &utf16("\\lsaauthenticationport"),
@@ -2186,6 +2226,60 @@ mod tests {
         assert_eq!(
             core.receive_message(second_client).unwrap().unwrap().bytes,
             b"reply"
+        );
+    }
+
+    #[test]
+    fn alpc_server_comm_ports_receive_only_their_connection() {
+        let mut core = PortCore::new();
+        core.set_accept_policy(AcceptPolicy::Manual);
+        let listen = core.create_port(&utf16("\\A"), PortApi::Alpc);
+        let mut connections = [0u64; 2];
+        let mut clients = [0u64; 2];
+        let mut servers = [0u64; 2];
+
+        for index in 0..2 {
+            let connection = match core.connect(&utf16("\\A"), PortApi::Alpc, 0, &[]).unwrap() {
+                ConnectOutcome::Pending { connection_id } => connection_id,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                core.receive(listen).unwrap(),
+                ReceiveOutcome::ConnectionRequest {
+                    connection_id: connection,
+                    msg_type: port_message_type::CONNECTION_REQUEST,
+                }
+            );
+            servers[index] = core.accept(connection, true, 0).unwrap();
+            clients[index] = core.complete(connection).unwrap().0;
+            connections[index] = connection;
+        }
+
+        core.send_message(clients[0], b"first", MessageAttrs::default())
+            .unwrap();
+        core.send_message(clients[1], b"second", MessageAttrs::default())
+            .unwrap();
+        let second = core.receive_message(servers[1]).unwrap().unwrap();
+        assert_eq!(second.bytes, b"second");
+        assert_eq!(second.provenance.connection_id, connections[1]);
+        let first = core.receive_message(servers[0]).unwrap().unwrap();
+        assert_eq!(first.bytes, b"first");
+        assert_eq!(first.provenance.connection_id, connections[0]);
+
+        let third_connection = match core.connect(&utf16("\\A"), PortApi::Alpc, 0, &[]).unwrap() {
+            ConnectOutcome::Pending { connection_id } => connection_id,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            core.receive(servers[0]).unwrap(),
+            ReceiveOutcome::WouldBlock
+        );
+        assert_eq!(
+            core.receive(listen).unwrap(),
+            ReceiveOutcome::ConnectionRequest {
+                connection_id: third_connection,
+                msg_type: port_message_type::CONNECTION_REQUEST,
+            }
         );
     }
 }

@@ -58,8 +58,8 @@ use nt_alpc_abi::{
     AlpcViewIoRequest,
 };
 use nt_port_core::{
-    ConnectOutcome, DataView, MessageAttrs, PortApi, PortCore, PortLimits, QueuedMessage,
-    ReceiveOutcome, MAX_CONNINFO,
+    ConnectOutcome, DataView, MessageAttrs, PortApi, PortCore, PortHandleEndpoint, PortLimits,
+    QueuedMessage, ReceiveOutcome, MAX_CONNINFO,
 };
 use nt_status::NtStatus;
 
@@ -377,7 +377,14 @@ impl AlpcServer {
 
     fn op_disconnect(&mut self, core: &mut PortCore, buf: &[u8]) -> Result<AlpcReply, NtStatus> {
         let req: AlpcHandleRequest = read_req(buf)?;
-        core.disconnect(req.handle);
+        let info = core
+            .handle_info(req.handle)
+            .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+        if info.endpoint == PortHandleEndpoint::ListenPort || info.api != PortApi::Alpc {
+            return Err(NtStatus::INVALID_PORT_HANDLE);
+        }
+        let connection_id = info.connection_id;
+        core.disconnect(connection_id);
         Ok(ok())
     }
 
@@ -531,104 +538,6 @@ impl AlpcServer {
     /// True if a port section is registered for `port_handle` (diagnostics).
     pub fn has_section_for(&self, port_handle: u64) -> bool {
         self.sections.iter().any(|s| s.port_handle == port_handle)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Peer-direct data plane — the executive-local cross-endpoint mailbox.
-// ---------------------------------------------------------------------------
-
-/// One broker-completed connection cached for PEER-DIRECT delivery.
-struct DirectConn {
-    client_handle: u64,
-    server_handle: u64,
-    /// Messages destined for the SERVER (sent by the client).
-    to_server: Vec<QueuedMessage>,
-    /// Messages destined for the CLIENT (sent by the server).
-    to_client: Vec<QueuedMessage>,
-}
-
-/// The ALPC **peer-direct** data plane — the executive-local analog of classic
-/// LPC's cached-connection direct delivery (the control/data-plane split). The
-/// port-service (broker) owns the namespace + the connect rendezvous, but is NOT
-/// on the message path: once a connect + accept completes through the broker, the
-/// executive registers the connection's two comm-port handles here, and every
-/// subsequent endpoint↔endpoint message is delivered DIRECTLY against this cache —
-/// never a per-message round-trip to the broker. This mirrors [`nt-lpc-server`]'s
-/// `LpcConnRecord` executive cache; it deliberately does NOT touch [`PortCore`].
-#[derive(Default)]
-pub struct PeerDirect {
-    conns: Vec<DirectConn>,
-}
-
-impl PeerDirect {
-    /// An empty peer-direct cache.
-    pub fn new() -> Self {
-        Self { conns: Vec::new() }
-    }
-
-    /// Register a broker-completed connection (its two comm-port handles) for
-    /// peer-direct delivery. Idempotent.
-    pub fn register(&mut self, client_handle: u64, server_handle: u64) {
-        if self
-            .conns
-            .iter()
-            .any(|c| c.client_handle == client_handle && c.server_handle == server_handle)
-        {
-            return;
-        }
-        self.conns.push(DirectConn {
-            client_handle,
-            server_handle,
-            to_server: Vec::new(),
-            to_client: Vec::new(),
-        });
-    }
-
-    /// Deliver a message from an endpoint (its client or server comm-port handle)
-    /// to its peer — executive-local, no broker involvement.
-    pub fn send(
-        &mut self,
-        from_handle: u64,
-        bytes: &[u8],
-        attrs: MessageAttrs,
-    ) -> Result<(), NtStatus> {
-        let msg = QueuedMessage {
-            bytes: bytes.to_vec(),
-            attrs,
-            provenance: Default::default(),
-            port_context: 0,
-            request_identity: None,
-        };
-        for c in self.conns.iter_mut() {
-            if from_handle == c.client_handle {
-                c.to_server.push(msg);
-                return Ok(());
-            }
-            if from_handle == c.server_handle {
-                c.to_client.push(msg);
-                return Ok(());
-            }
-        }
-        Err(NtStatus::INVALID_HANDLE)
-    }
-
-    /// Receive the next peer-direct message for an endpoint (`None` = would-block).
-    pub fn recv(&mut self, handle: u64) -> Result<Option<QueuedMessage>, NtStatus> {
-        for c in self.conns.iter_mut() {
-            if handle == c.client_handle {
-                return Ok((!c.to_client.is_empty()).then(|| c.to_client.remove(0)));
-            }
-            if handle == c.server_handle {
-                return Ok((!c.to_server.is_empty()).then(|| c.to_server.remove(0)));
-            }
-        }
-        Err(NtStatus::INVALID_HANDLE)
-    }
-
-    /// Number of cached connections (diagnostics/tests).
-    pub fn connection_count(&self) -> usize {
-        self.conns.len()
     }
 }
 

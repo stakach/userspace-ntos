@@ -11,18 +11,16 @@
 use crate::{check, print_str, RingChannel};
 
 use bytemuck::Pod;
-use nt_alpc::PeerDirect;
 use nt_alpc_abi::{
     msg_attr_flag, opcode as aop, port_flag, send_flag, AlpcAcceptConnectRequest,
     AlpcConnectPortRequest, AlpcContextAttr, AlpcCreatePortRequest, AlpcCreatePortSectionRequest,
-    AlpcCreateSectionViewRequest, AlpcDataViewAttr, AlpcMessageAttributes, AlpcSendReceiveRequest,
-    AlpcViewIoRequest, PortMessage,
+    AlpcCreateSectionViewRequest, AlpcDataViewAttr, AlpcHandleRequest, AlpcMessageAttributes,
+    AlpcSendReceiveRequest, AlpcViewIoRequest, PortMessage,
 };
 use nt_lpc_abi::{
     opcode as lop, LpcConnectPortRequest, LpcDataMessageMetadata, LpcMessageRequest,
     LpcReceiveRequest,
 };
-use nt_port_core::MessageAttrs;
 
 const CONNECTION_REQUEST: u16 = 10;
 const REQUEST: u16 = 1;
@@ -128,12 +126,11 @@ pub fn run(chan: &mut RingChannel<'_>, passed: &mut u64) {
         passed,
     );
 
-    // Step 4: peer-direct data plane — the broker (port-service ring) completes
-    // the connect, then endpoint↔endpoint messages are delivered DIRECTLY against
-    // the executive-local cache with the broker OFF the per-message path.
+    // Step 4: two broker-owned ALPC connections retain exact endpoint identity
+    // across interleaved traffic and independent disconnect.
     check(
-        b"exec_alpc_peer_direct",
-        peer_direct(chan, &mut out),
+        b"exec_alpc_exact_peer_routing",
+        exact_peer_routing(chan, &mut out),
         passed,
     );
 
@@ -486,10 +483,9 @@ fn message_attributes_roundtrip(chan: &mut RingChannel<'_>, client_h: u64, serve
         && &out[body_off..total] == &body[..]
 }
 
-/// Step 4 driver: the broker (ring) completes a connect; then a message is
-/// delivered peer-direct (executive-local) with the ring untouched per-message.
-fn peer_direct(chan: &mut RingChannel<'_>, out: &mut [u8]) -> bool {
-    // Broker a fresh connection over the ring.
+/// Step 4 driver: two broker-owned ALPC connections exchange interleaved traffic without sharing
+/// receive or disconnect state.
+fn exact_peer_routing(chan: &mut RingChannel<'_>, out: &mut [u8]) -> bool {
     let name = utf16("\\AlpcDirect");
     let cp = {
         let hdr = core::mem::size_of::<AlpcCreatePortRequest>() as u32;
@@ -509,53 +505,83 @@ fn peer_direct(chan: &mut RingChannel<'_>, out: &mut [u8]) -> bool {
     if s != STATUS_SUCCESS || listen == 0 {
         return false;
     }
-    let (server_h, client_h, ok) = alpc_rendezvous(chan, &name, listen, out);
-    if !ok {
+    let (server_a, client_a, first_ok) = alpc_rendezvous(chan, &name, listen, out);
+    let (server_b, client_b, second_ok) = alpc_rendezvous(chan, &name, listen, out);
+    if !first_ok || !second_ok {
         return false;
     }
 
-    // Register the broker-completed connection for peer-direct delivery.
-    let mut pd = PeerDirect::new();
-    pd.register(client_h, server_h);
+    let message_a = port_message(REQUEST, b"exact-a");
+    let message_b = port_message(REQUEST, b"exact-b");
+    let context_a = bytes(&AlpcContextAttr {
+        port_context: 0xA,
+        ..Default::default()
+    });
+    let context_b = bytes(&AlpcContextAttr {
+        port_context: 0xB,
+        ..Default::default()
+    });
+    let sent_a = alpc_send(
+        chan,
+        client_a,
+        &message_a,
+        msg_attr_flag::CONTEXT,
+        &context_a,
+        out,
+    )
+    .0 == STATUS_PENDING;
+    let sent_b = alpc_send(
+        chan,
+        client_b,
+        &message_b,
+        msg_attr_flag::CONTEXT,
+        &context_b,
+        out,
+    )
+    .0 == STATUS_PENDING;
 
-    // Snapshot the ring op counter — peer-direct delivery must not advance it.
-    let ring_before = chan.next_id;
+    let (status_b, _f, len_b, attrs_b, type_b) = alpc_recv(chan, server_b, out);
+    let received_b = status_b == STATUS_SUCCESS
+        && len_b as usize == message_b.len()
+        && &out[..message_b.len()] == &message_b
+        && attrs_b as u32 == msg_attr_flag::CONTEXT
+        && type_b as u16 == REQUEST;
+    let (status_a, _f, len_a, attrs_a, type_a) = alpc_recv(chan, server_a, out);
+    let received_a = status_a == STATUS_SUCCESS
+        && len_a as usize == message_a.len()
+        && &out[..message_a.len()] == &message_a
+        && attrs_a as u32 == msg_attr_flag::CONTEXT
+        && type_a as u16 == REQUEST;
 
-    // Deliver a message client → server DIRECTLY (no ring), carrying CONTEXT.
-    if pd
-        .send(
-            client_h,
-            b"direct-payload",
-            MessageAttrs {
-                context: Some(0x00AB_CDEF),
-                ..Default::default()
-            },
-        )
-        .is_err()
-    {
-        return false;
-    }
-    let got = match pd.recv(server_h) {
-        Ok(Some(m)) => m,
-        _ => return false,
+    let listen_rejected = alpc_send(chan, listen, &message_a, 0, &[], out).0 != STATUS_SUCCESS;
+    let disconnect = AlpcHandleRequest {
+        abi_size: core::mem::size_of::<AlpcHandleRequest>() as u16,
+        handle: client_a,
+        ..Default::default()
     };
-    // And a reply server → client, also peer-direct.
-    if pd
-        .send(server_h, b"direct-reply", MessageAttrs::default())
-        .is_err()
-    {
-        return false;
-    }
-    let reply_ok = matches!(pd.recv(client_h), Ok(Some(m)) if m.bytes == b"direct-reply");
+    let disconnected = chan
+        .raw(aop::ALPC_OP_DISCONNECT_PORT, &bytes(&disconnect), out)
+        .0
+        == STATUS_SUCCESS;
+    let stale_rejected = alpc_send(chan, server_a, &message_a, 0, &[], out).0 != STATUS_SUCCESS;
 
-    let ring_after = chan.next_id;
+    let live_reply = port_message(REPLY, b"still-live");
+    let live_sent = alpc_send(chan, server_b, &live_reply, 0, &[], out).0 == STATUS_PENDING;
+    let (live_status, _f, live_len, _attrs, live_type) = alpc_recv(chan, client_b, out);
+    let sibling_live = live_status == STATUS_SUCCESS
+        && live_len as usize == live_reply.len()
+        && &out[..live_reply.len()] == &live_reply
+        && live_type as u16 == REPLY;
 
-    // The broker was NOT on the message path: the ring counter is unchanged across
-    // both peer-direct sends/receives.
-    got.bytes == b"direct-payload"
-        && got.attrs.context == Some(0x00AB_CDEF)
-        && reply_ok
-        && ring_after == ring_before
+    sent_a
+        && sent_b
+        && received_b
+        && received_a
+        && listen_rejected
+        && disconnected
+        && stale_rejected
+        && live_sent
+        && sibling_live
 }
 
 fn read_pod<T: Pod + Default>(buf: &[u8]) -> T {
@@ -616,7 +642,7 @@ fn alpc_send(
     valid: u32,
     attrs: &[u8],
     out: &mut [u8],
-) {
+) -> (i32, u32, u64, u64, u64) {
     let hdr = core::mem::size_of::<AlpcSendReceiveRequest>() as u32;
     let req = AlpcSendReceiveRequest {
         abi_size: hdr as u16,
@@ -631,8 +657,8 @@ fn alpc_send(
     let mut b = bytes(&req);
     b.extend_from_slice(msg);
     b.extend_from_slice(attrs);
-    // Send half enqueues; the receive half parks (nothing inbound) — that's fine.
-    let _ = chan.raw(aop::ALPC_OP_SEND_RECEIVE, &b, out);
+    // Send half enqueues; the receive half parks when nothing is already inbound.
+    chan.raw(aop::ALPC_OP_SEND_RECEIVE, &b, out)
 }
 
 fn alpc_recv(chan: &mut RingChannel<'_>, port: u64, out: &mut [u8]) -> (i32, u32, u64, u64, u64) {

@@ -16339,3 +16339,37 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     handles. After that cleanup, return to the deferred `NtLockVirtualMemory` /
     `NtUnlockVirtualMemory` prerequisite: one reusable Mm page-residency operation shared by private,
     mapped-section, and image mappings.
+
+    Exact ALPC broker routing and duplicate-mailbox deletion (2026-08-29, accepted): ALPC server
+    communication handles are now exact receive endpoints in `PortCore`. Interleaved messages on two
+    accepted connections remain in their respective server inboxes, and a server communication
+    handle cannot consume a later connection request from the named listen port. Classic LPC keeps
+    its separate native contract in which a server communication port receives from the associated
+    connection-port queue. The distinction is derived from the broker's `PortApi`, not a caller,
+    process, or port-name special case.
+
+    `ALPC_OP_DISCONNECT_PORT` now resolves the supplied live communication handle through broker
+    metadata, verifies the handle's own API surface, and disconnects exactly that connection. Listen,
+    classic-LPC, and stale handles fail closed; disconnecting one connection leaves sibling
+    connections operational. The self-test-only
+    `nt_alpc::PeerDirect` cache, its private connection records, both duplicate message queues, and
+    its host test are deleted. There is no executive-local ALPC message path left outside the
+    isolated port service.
+
+    Focused validation passes `nt-port-core` at `18/18` and `nt-alpc` at `12/12`; the freestanding
+    executive builds at the established 209-warning baseline. The replacement counted integration
+    gate creates two real connections over SURT, sends both requests through broker communication
+    handles, receives them in the opposite connection order, rejects a listen-port send, disconnects
+    by the first client handle, rejects its stale server handle, and proves the second connection can
+    still reply. Host coverage also proves the ALPC adapter cannot disconnect a valid classic-LPC
+    endpoint. Serialized acceptance `.tmp/run-headless-alpc-exact-routing-final-20260829.log`
+    reaches genuine userinit and Explorer launch and completes all `295/295` gates. Explorer records
+    668 real api0 redirects with zero callback or dead-callback failures, paint begin/end reaches
+    `5/20` with 187 direct GDI returns and 135 batch flushes covering 184 records, and the framebuffer
+    holds `480000/480000` non-background pixels with at least 32 colours. The sentinel matches.
+
+    Review adjustment: the LPC/ALPC transport cleanup is closed. Resume the deferred virtual-memory
+    frontier by extracting one host-testable page-residency plan and executive operation that covers
+    committed private pages, mapped data sections, and image pages through the same fill/map policy
+    used by a real fault. `NtLockVirtualMemory` and `NtUnlockVirtualMemory` remain queued behind that
+    prerequisite; do not add lock accounting that can claim nonresident image pages were locked.
