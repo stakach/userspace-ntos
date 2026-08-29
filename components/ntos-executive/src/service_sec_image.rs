@@ -9232,7 +9232,7 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_io_completion_key_out: u64 = 0;
             let mut park_io_completion_apc_out: u64 = 0;
             let mut park_io_completion_iosb_out: u64 = 0;
-            let mut park_io_completion_deadline: Option<u64> = None;
+            let mut park_io_completion_deadline = nt_delay_execution::Deadline::Infinite;
             let mut transfer_pending_file_io: Option<(
                 nt_io_manager::PendingFileIo,
                 bool,
@@ -9840,7 +9840,7 @@ pub(crate) unsafe fn service_sec_image(
                     park_io_completion_apc_out = nt_handler.io_completion_apc_out;
                     park_io_completion_iosb_out = nt_handler.io_completion_iosb_out;
                     park_io_completion_deadline =
-                        nt_handler.io_completion_timeout.deadline_at_park();
+                        nt_handler.io_completion_timeout.tagged_deadline_at_park();
                 }
                 if nt_handler.io_completion_wake.is_some() {
                     let _ = unsafe { io_completion_deliver(&mut nt_handler) };
@@ -15337,7 +15337,8 @@ pub(crate) unsafe fn service_sec_image(
                 result = 0xC000_009A;
             }
             if park_io_completion_port >= 0 && reply_main != 0 {
-                if park_io_completion_deadline.is_some() && !delay_timer_init() {
+                let timed = park_io_completion_deadline != nt_delay_execution::Deadline::Infinite;
+                if timed && !delay_timer_init() {
                     result = 0xC000_009A;
                 } else if io_completion_park(
                     &mut nt_handler,
@@ -15345,20 +15346,20 @@ pub(crate) unsafe fn service_sec_image(
                     park_io_completion_key_out,
                     park_io_completion_apc_out,
                     park_io_completion_iosb_out,
-                    park_io_completion_deadline.unwrap_or(u64::MAX),
+                    park_io_completion_deadline,
                     parked_syscall_reply,
                 ) {
                     delay_timer_rearm_after_park(
                         delay_queue,
                         &mut nt_handler,
-                        park_io_completion_deadline.is_some(),
+                        timed,
                     );
                     print_str(b"[io-completion] pi=");
                     print_u64(pi as u64);
                     print_str(b" port=");
                     print_u64(park_io_completion_port as u64);
                     print_str(b" -> PARK remover\n");
-                    if park_io_completion_deadline.is_none() {
+                    if !timed {
                         trace_indefinite_wait_park(
                             &nt_handler,
                             badge,
@@ -21727,7 +21728,7 @@ unsafe fn io_completion_park(
     key_context_out: u64,
     apc_context_out: u64,
     io_status_block_out: u64,
-    deadline_100ns: u64,
+    deadline: nt_delay_execution::Deadline,
     reply: nt_syscall_abi::ParkedSyscallReply,
 ) -> bool {
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
@@ -21750,7 +21751,7 @@ unsafe fn io_completion_park(
     waiter.key_context_out = key_context_out;
     waiter.apc_context_out = apc_context_out;
     waiter.io_status_block_out = io_status_block_out;
-    waiter.deadline_100ns = deadline_100ns;
+    waiter.deadline = deadline;
     let waiters = unsafe { &mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS) };
     if waiters.insert(waiter).is_err() {
         nt_handler.release_io_completion_reference(port_id);

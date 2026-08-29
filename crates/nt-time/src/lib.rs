@@ -111,6 +111,12 @@ pub enum Deadline {
     Absolute { system_time_100ns: u64 },
 }
 
+impl Default for Deadline {
+    fn default() -> Self {
+        Self::Infinite
+    }
+}
+
 impl Deadline {
     pub fn from_nt_timeout(interval_100ns: Option<i64>, now: TimeSnapshot) -> Self {
         match interval_100ns {
@@ -283,6 +289,7 @@ mod tests {
         let zero = Deadline::from_nt_timeout(Some(0), now);
 
         assert_eq!(infinite, Deadline::Infinite);
+        assert_eq!(Deadline::default(), Deadline::Infinite);
         assert!(!infinite.is_due(now));
         assert_eq!(infinite.monotonic_target(now), None);
         assert_eq!(infinite.remaining_100ns(now), None);

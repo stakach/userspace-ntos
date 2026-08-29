@@ -16209,13 +16209,14 @@ unsafe fn delay_timer_init() -> bool {
 }
 
 unsafe fn delay_timer_next_deadline(queue: &nt_delay_execution::Queue) -> Option<(u64, u64)> {
-    let delay_deadline = queue.next_deadline(nt_time_snapshot());
+    let now = nt_time_snapshot();
+    let delay_deadline = queue.next_deadline(now);
     let event_deadline = object_waiter_next_deadline();
     let keyed_deadline = unsafe { (&*core::ptr::addr_of!(KEYED_WAITERS)).next_deadline() };
     let keyed_release_deadline =
         unsafe { (&*core::ptr::addr_of!(KEYED_RELEASE_WAITERS)).next_deadline() };
     let io_completion_deadline =
-        unsafe { (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)).next_deadline() };
+        unsafe { (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)).next_deadline(now) };
     let user_timer_deadline = match USER_TIMER_NEXT_DEADLINE.load(Ordering::Relaxed) {
         u64::MAX => None,
         deadline => Some(deadline),
@@ -16399,8 +16400,9 @@ unsafe fn delay_wake_due(
 
 unsafe fn io_completion_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
     let mut woken = 0;
+    let now_snapshot = nt_time_snapshot_at(now);
     while let Some(waiter) =
-        unsafe { (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).pop_due(now) }
+        unsafe { (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).pop_due(now_snapshot) }
     {
         let trace = IO_COMPLETION_TIMEOUT_TRACE_N.fetch_add(1, Ordering::Relaxed);
         if trace < 32 {
@@ -16413,7 +16415,12 @@ unsafe fn io_completion_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
             print_str(b" port=");
             print_u64(waiter.port_id as u64);
             print_str(b" deadline=");
-            print_u64(waiter.deadline_100ns);
+            print_u64(
+                waiter
+                    .deadline
+                    .monotonic_target(now_snapshot)
+                    .unwrap_or(u64::MAX),
+            );
             print_str(b" now=");
             print_u64(now);
             print_str(b"\n");
@@ -16806,7 +16813,7 @@ unsafe fn delay_timer_interrupt(
             print_u64(queue.len() as u64);
             let completion_waiters = &*core::ptr::addr_of!(IO_COMPLETION_WAITERS);
             print_str(b" iocp-deadline=");
-            match completion_waiters.next_deadline() {
+            match completion_waiters.next_deadline(nt_time_snapshot()) {
                 Some(deadline) => print_u64(deadline),
                 None => print_str(b"none"),
             }
@@ -21636,6 +21643,15 @@ impl PendingWaitTimeout {
             .monotonic_target(now)
         } else {
             None
+        }
+    }
+
+    fn tagged_deadline_at_park(self) -> nt_delay_execution::Deadline {
+        if self.specified {
+            let now = nt_time_snapshot();
+            nt_delay_execution::Deadline::from_nt_timeout(Some(self.interval_100ns), now)
+        } else {
+            nt_delay_execution::Deadline::Infinite
         }
     }
 }

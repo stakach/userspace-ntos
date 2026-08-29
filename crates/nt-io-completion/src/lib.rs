@@ -801,8 +801,6 @@ pub enum RemoveResult {
     Empty(u32),
 }
 
-pub const INFINITE_DEADLINE: u64 = u64::MAX;
-
 /// Executive-owned state for one blocking `NtRemoveIoCompletion` call. Addresses are kept opaque;
 /// the executive validates them before parking and writes them in the waiter's process on wake.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -817,7 +815,7 @@ pub struct CompletionWaiter {
     pub key_context_out: u64,
     pub apc_context_out: u64,
     pub io_status_block_out: u64,
-    pub deadline_100ns: u64,
+    pub deadline: nt_time::Deadline,
     sequence: u64,
 }
 
@@ -905,26 +903,23 @@ impl CompletionWaiterTable {
     }
 
     /// Remove the earliest expired waiter. Equal deadlines retain park order.
-    pub fn pop_due(&mut self, now_100ns: u64) -> Option<CompletionWaiter> {
+    pub fn pop_due(&mut self, now: nt_time::TimeSnapshot) -> Option<CompletionWaiter> {
         let index = self
             .slots
             .iter()
             .enumerate()
             .filter_map(|(index, waiter)| waiter.map(|waiter| (index, waiter)))
-            .filter(|(_, waiter)| {
-                waiter.deadline_100ns != INFINITE_DEADLINE && waiter.deadline_100ns <= now_100ns
-            })
-            .min_by_key(|(_, waiter)| (waiter.deadline_100ns, waiter.sequence))
+            .filter(|(_, waiter)| waiter.deadline.is_due(now))
+            .min_by_key(|(_, waiter)| (waiter.deadline.ordering_key(now), waiter.sequence))
             .map(|(index, _)| index)?;
         self.slots[index].take()
     }
 
-    pub fn next_deadline(&self) -> Option<u64> {
+    pub fn next_deadline(&self, now: nt_time::TimeSnapshot) -> Option<u64> {
         self.slots
             .iter()
             .flatten()
-            .map(|waiter| waiter.deadline_100ns)
-            .filter(|deadline| *deadline != INFINITE_DEADLINE)
+            .filter_map(|waiter| waiter.deadline.monotonic_target(now))
             .min()
     }
 
@@ -1164,14 +1159,22 @@ mod tests {
         }
     }
 
-    fn waiter(port_id: u32, value: u64, deadline_100ns: u64) -> CompletionWaiter {
+    fn snapshot(monotonic_100ns: u64, system_time_100ns: u64) -> nt_time::TimeSnapshot {
+        nt_time::TimeSnapshot {
+            monotonic_100ns,
+            system_time_100ns,
+            clock_generation: 0,
+        }
+    }
+
+    fn waiter(port_id: u32, value: u64, deadline: nt_time::Deadline) -> CompletionWaiter {
         CompletionWaiter {
             port_id,
             process_index: value as u8,
             reply_cap: value,
             thread_id: value + 100,
             key_context_out: value + 200,
-            deadline_100ns,
+            deadline,
             ..CompletionWaiter::default()
         }
     }
@@ -1770,9 +1773,15 @@ mod tests {
     #[test]
     fn completion_packets_are_fifo_but_waiters_are_lifo_per_port() {
         let mut waiters = CompletionWaiterTable::new();
-        waiters.insert(waiter(1, 10, INFINITE_DEADLINE)).unwrap();
-        waiters.insert(waiter(2, 20, INFINITE_DEADLINE)).unwrap();
-        waiters.insert(waiter(1, 30, INFINITE_DEADLINE)).unwrap();
+        waiters
+            .insert(waiter(1, 10, nt_time::Deadline::Infinite))
+            .unwrap();
+        waiters
+            .insert(waiter(2, 20, nt_time::Deadline::Infinite))
+            .unwrap();
+        waiters
+            .insert(waiter(1, 30, nt_time::Deadline::Infinite))
+            .unwrap();
         assert_eq!(waiters.pop_port(1).unwrap().reply_cap, 30);
         assert_eq!(waiters.pop_port(1).unwrap().reply_cap, 10);
         assert_eq!(waiters.pop_port(1), None);
@@ -1784,16 +1793,22 @@ mod tests {
     fn completion_waiter_reply_identity_and_dynamic_growth_are_enforced() {
         let mut waiters = CompletionWaiterTable::new();
         assert_eq!(
-            waiters.insert(waiter(1, 0, INFINITE_DEADLINE)),
+            waiters.insert(waiter(1, 0, nt_time::Deadline::Infinite)),
             Err(STATUS_INVALID_PARAMETER)
         );
-        waiters.insert(waiter(1, 1, INFINITE_DEADLINE)).unwrap();
+        waiters
+            .insert(waiter(1, 1, nt_time::Deadline::Infinite))
+            .unwrap();
         assert_eq!(
-            waiters.insert(waiter(2, 1, INFINITE_DEADLINE)),
+            waiters.insert(waiter(2, 1, nt_time::Deadline::Infinite)),
             Err(STATUS_INVALID_PARAMETER)
         );
-        waiters.insert(waiter(2, 2, INFINITE_DEADLINE)).unwrap();
-        waiters.insert(waiter(3, 3, INFINITE_DEADLINE)).unwrap();
+        waiters
+            .insert(waiter(2, 2, nt_time::Deadline::Infinite))
+            .unwrap();
+        waiters
+            .insert(waiter(3, 3, nt_time::Deadline::Infinite))
+            .unwrap();
         assert_eq!(waiters.len(), 3);
         assert!(waiters.records() >= 3);
         assert!(waiters.capacity() >= waiters.records());
@@ -1804,28 +1819,86 @@ mod tests {
     #[test]
     fn completion_waiter_deadlines_are_ordered_and_infinite_is_ignored() {
         let mut waiters = CompletionWaiterTable::new();
-        waiters.insert(waiter(1, 1, INFINITE_DEADLINE)).unwrap();
-        waiters.insert(waiter(1, 2, 200)).unwrap();
-        waiters.insert(waiter(2, 3, 100)).unwrap();
-        waiters.insert(waiter(3, 4, 100)).unwrap();
-        assert_eq!(waiters.next_deadline(), Some(100));
-        assert_eq!(waiters.pop_due(99), None);
-        assert_eq!(waiters.pop_due(100).unwrap().reply_cap, 3);
-        assert_eq!(waiters.pop_due(100).unwrap().reply_cap, 4);
-        assert_eq!(waiters.next_deadline(), Some(200));
-        assert_eq!(waiters.pop_due(200).unwrap().reply_cap, 2);
-        assert_eq!(waiters.next_deadline(), None);
+        waiters
+            .insert(waiter(1, 1, nt_time::Deadline::Infinite))
+            .unwrap();
+        waiters
+            .insert(waiter(
+                1,
+                2,
+                nt_time::Deadline::Relative {
+                    monotonic_100ns: 200,
+                },
+            ))
+            .unwrap();
+        waiters
+            .insert(waiter(
+                2,
+                3,
+                nt_time::Deadline::Relative {
+                    monotonic_100ns: 100,
+                },
+            ))
+            .unwrap();
+        waiters
+            .insert(waiter(
+                3,
+                4,
+                nt_time::Deadline::Relative {
+                    monotonic_100ns: 100,
+                },
+            ))
+            .unwrap();
+        assert_eq!(waiters.next_deadline(snapshot(0, 1_000)), Some(100));
+        assert_eq!(waiters.pop_due(snapshot(99, 1_099)), None);
+        assert_eq!(waiters.pop_due(snapshot(100, 1_100)).unwrap().reply_cap, 3);
+        assert_eq!(waiters.pop_due(snapshot(100, 1_100)).unwrap().reply_cap, 4);
+        assert_eq!(waiters.next_deadline(snapshot(100, 1_100)), Some(200));
+        assert_eq!(waiters.pop_due(snapshot(200, 1_200)).unwrap().reply_cap, 2);
+        assert_eq!(waiters.next_deadline(snapshot(200, 1_200)), None);
         assert_eq!(waiters.len(), 1);
+    }
+
+    #[test]
+    fn completion_waiter_absolute_deadlines_follow_system_clock_changes() {
+        let mut waiters = CompletionWaiterTable::new();
+        waiters
+            .insert(waiter(
+                1,
+                1,
+                nt_time::Deadline::Absolute {
+                    system_time_100ns: 2_000,
+                },
+            ))
+            .unwrap();
+        waiters
+            .insert(waiter(
+                1,
+                2,
+                nt_time::Deadline::Absolute {
+                    system_time_100ns: 3_000,
+                },
+            ))
+            .unwrap();
+
+        assert_eq!(waiters.next_deadline(snapshot(100, 1_000)), Some(1_100));
+        assert_eq!(waiters.next_deadline(snapshot(200, 4_000)), Some(200));
+        assert_eq!(waiters.pop_due(snapshot(200, 4_000)).unwrap().reply_cap, 1);
+        assert_eq!(waiters.pop_due(snapshot(200, 4_000)).unwrap().reply_cap, 2);
     }
 
     #[test]
     fn completion_waiters_cancel_by_thread_without_disturbing_others() {
         let mut waiters = CompletionWaiterTable::new();
-        waiters.insert(waiter(1, 1, INFINITE_DEADLINE)).unwrap();
-        let mut second = waiter(1, 2, INFINITE_DEADLINE);
+        waiters
+            .insert(waiter(1, 1, nt_time::Deadline::Infinite))
+            .unwrap();
+        let mut second = waiter(1, 2, nt_time::Deadline::Infinite);
         second.thread_id = 101;
         waiters.insert(second).unwrap();
-        waiters.insert(waiter(2, 3, INFINITE_DEADLINE)).unwrap();
+        waiters
+            .insert(waiter(2, 3, nt_time::Deadline::Infinite))
+            .unwrap();
         assert_eq!(waiters.pop_thread(101).unwrap().reply_cap, 1);
         assert_eq!(waiters.pop_thread(101).unwrap().reply_cap, 2);
         assert_eq!(waiters.pop_thread(101), None);
@@ -1835,13 +1908,13 @@ mod tests {
     #[test]
     fn completion_waiters_cancel_by_process_without_disturbing_others() {
         let mut waiters = CompletionWaiterTable::new();
-        let mut first = waiter(1, 1, INFINITE_DEADLINE);
+        let mut first = waiter(1, 1, nt_time::Deadline::Infinite);
         first.process_index = 2;
         waiters.insert(first).unwrap();
-        let mut second = waiter(2, 2, INFINITE_DEADLINE);
+        let mut second = waiter(2, 2, nt_time::Deadline::Infinite);
         second.process_index = 3;
         waiters.insert(second).unwrap();
-        let mut third = waiter(1, 3, INFINITE_DEADLINE);
+        let mut third = waiter(1, 3, nt_time::Deadline::Infinite);
         third.process_index = 2;
         waiters.insert(third).unwrap();
         assert_eq!(waiters.pop_process(2).unwrap().reply_cap, 1);

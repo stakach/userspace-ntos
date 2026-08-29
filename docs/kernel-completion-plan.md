@@ -16544,3 +16544,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `INFINITE_DEADLINE` sentinel and scalar timeout field. Wire its executive park, minimum, timeout
     trace, cancellation, and port-reference release around the tagged record before moving to the
     general object and keyed-event tables.
+
+    Tagged I/O-completion waits (2026-08-30, focused validation complete):
+    `nt-io-completion::CompletionWaiter` now stores `Deadline`; the `u64::MAX`
+    `INFINITE_DEADLINE` sentinel and scalar field are deleted. Queue minimum and expiry scans require
+    a coherent snapshot, ignore explicit infinite waits, reproject absolute system-time waits, and
+    use retained-domain ordering plus park sequence. Host coverage proves forward clock-jump expiry
+    and ordering alongside LIFO per-port wake, FIFO packets, duplicate reply rejection, dynamic
+    growth, and exact thread/process cancellation; the crate passes `33/33`.
+
+    The real `NtRemoveIoCompletion` path now carries the tag from the captured native interval into
+    the parked reply record. Packet delivery and failed-delivery reinsertion preserve that record;
+    timeout wake releases the retained completion-port reference, and thread/process cancellation
+    releases both the reply object and port reference before the common HPET rearm. The shared timer
+    minimum and timeout drain sample tagged I/O-completion state directly. The freestanding
+    executive remains at the accepted 209-warning baseline.
+
+    Review adjustment: migrate the general object wait table and both keyed-event sides next. These
+    records share `PendingWaitTimeout`, so replace its `specified + interval` handoff with a captured
+    `Deadline`, remove `deadline_at_park` and its scalar projection, then make all three queues
+    snapshot-driven in the same accepted slice. Preserve wait-all object consumption, keyed pairing,
+    alertable/APC behavior, cancellation, and existing timeout statuses.
