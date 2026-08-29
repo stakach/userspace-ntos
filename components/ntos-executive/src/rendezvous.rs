@@ -107,13 +107,46 @@ struct HostedWorkerNativeResult {
     status: u64,
 }
 
-/// Dispatch a synchronous native call made by one of CSRSS's private server workers through the
+#[derive(Clone, Copy)]
+enum HostedServerWorker {
+    Sm,
+    CsrApi,
+    CsrSb,
+}
+
+impl HostedServerWorker {
+    fn execution_context(self) -> (usize, HostedThreadRole, SyscallUserMemory) {
+        match self {
+            Self::Sm => (0, HostedThreadRole::SmLoop, SyscallUserMemory::SmProcess),
+            Self::CsrApi => (
+                1,
+                HostedThreadRole::CsrApi,
+                SyscallUserMemory::CsrProcess { sb: false },
+            ),
+            Self::CsrSb => (
+                1,
+                HostedThreadRole::CsrSbApi,
+                SyscallUserMemory::CsrProcess { sb: true },
+            ),
+        }
+    }
+
+    unsafe fn stack_copyin(self, address: u64, bytes: &mut [u8]) -> bool {
+        match self {
+            Self::Sm => sm_stack_copyin(address, bytes),
+            Self::CsrApi => csr_thread_stack_copyin(false, address, bytes),
+            Self::CsrSb => csr_thread_stack_copyin(true, address, bytes),
+        }
+    }
+}
+
+/// Dispatch a synchronous native call made by a private hosted-server worker through the
 /// same service table and handler as an ordinary hosted thread. The rendezvous retains ownership of
 /// worker faults and blocking LPC receives; this adapter supplies only the scoped process/thread
-/// identity, native arguments, and CSRSS address-space policy needed by the typed syscall layer.
-unsafe fn dispatch_csr_worker_native_service(
+/// identity, native arguments, and server address-space policy needed by the typed syscall layer.
+unsafe fn dispatch_hosted_server_native_service(
     nt_handler: &mut ExecNtHandler,
-    sb: bool,
+    worker: HostedServerWorker,
     client_pid: u32,
     ssn: u64,
     resume_ip: u64,
@@ -132,6 +165,9 @@ unsafe fn dispatch_csr_worker_native_service(
         NativeService::NtAllocateVirtualMemory
             | NativeService::NtProtectVirtualMemory
             | NativeService::NtSetEvent
+            | NativeService::NtOpenProcess
+            | NativeService::NtOpenThread
+            | NativeService::NtQueryInformationProcess
             | NativeService::NtSetInformationThread
             | NativeService::NtQueryInformationThread
             | NativeService::NtQueryObject
@@ -163,7 +199,7 @@ unsafe fn dispatch_csr_worker_native_service(
             });
         };
         let mut bytes = [0u8; 8];
-        if !csr_thread_stack_copyin(sb, address, &mut bytes) {
+        if !worker.stack_copyin(address, &mut bytes) {
             return Some(HostedWorkerNativeResult {
                 service: entry.service,
                 status: 0xC000_0005,
@@ -172,13 +208,9 @@ unsafe fn dispatch_csr_worker_native_service(
         args[index] = u64::from_le_bytes(bytes);
     }
 
-    let role = if sb {
-        HostedThreadRole::CsrSbApi
-    } else {
-        HostedThreadRole::CsrApi
-    };
-    let tid = hosted_role_tid(nt_handler, 1, role);
-    let Some(pid) = nt_handler.pm_pid_for_pi(1) else {
+    let (pi, role, memory) = worker.execution_context();
+    let tid = hosted_role_tid(nt_handler, pi, role);
+    let Some(pid) = nt_handler.pm_pid_for_pi(pi) else {
         return Some(HostedWorkerNativeResult {
             service: entry.service,
             status: nt_process::STATUS_INVALID_HANDLE as u64,
@@ -203,7 +235,7 @@ unsafe fn dispatch_csr_worker_native_service(
         nt_handler.current_user_memory,
         nt_handler.current_server_client_pid,
     );
-    nt_handler.pi = 1;
+    nt_handler.pi = pi;
     nt_handler.current_tid = tid;
     nt_handler.current_badge = badge;
     nt_handler.current_resume_ip = resume_ip;
@@ -211,7 +243,7 @@ unsafe fn dispatch_csr_worker_native_service(
     nt_handler.current_flags = 0;
     nt_handler.current_service_number = ssn;
     nt_handler.current_native_call_transport = true;
-    nt_handler.current_user_memory = SyscallUserMemory::CsrProcess { sb };
+    nt_handler.current_user_memory = memory;
     nt_handler.current_server_client_pid = client_pid;
     let origin = SyscallOrigin {
         process_id: pid,
@@ -508,7 +540,7 @@ pub(crate) unsafe fn sm_stack_read(va: u64) -> u64 {
         0
     }
 }
-fn sm_stack_has_range(va: u64, len: usize) -> bool {
+pub(crate) fn sm_stack_has_range(va: u64, len: usize) -> bool {
     let Some(end) = va.checked_add(len as u64) else {
         return false;
     };
@@ -516,7 +548,7 @@ fn sm_stack_has_range(va: u64, len: usize) -> bool {
         || va >= SMSS_ALLOC_VA && end <= SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW
 }
 
-unsafe fn sm_stack_copyout(va: u64, bytes: &[u8]) -> bool {
+pub(crate) unsafe fn sm_stack_copyout(va: u64, bytes: &[u8]) -> bool {
     if !sm_stack_has_range(va, bytes.len()) {
         return false;
     }
@@ -528,7 +560,7 @@ unsafe fn sm_stack_copyout(va: u64, bytes: &[u8]) -> bool {
     core::ptr::copy_nonoverlapping(bytes.as_ptr(), mirror as *mut u8, bytes.len());
     true
 }
-unsafe fn sm_stack_copyin(va: u64, bytes: &mut [u8]) -> bool {
+pub(crate) unsafe fn sm_stack_copyin(va: u64, bytes: &mut [u8]) -> bool {
     if !sm_stack_has_range(va, bytes.len()) {
         return false;
     }
@@ -1311,15 +1343,8 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
     dll_pes: &[Option<nt_pe_loader::PeFile>],
     nt_handler: &mut ExecNtHandler,
 ) -> bool {
-    const SSN_QUERY_INFO_PROCESS: u64 = 161;
-    const SSN_DUPLICATE_OBJECT: u64 = 71;
     const SSN_REQUEST_WAIT_REPLY: u64 = 208;
     const SSN_REPLY_WAIT_RECV: u64 = 203;
-    const SSN_CLOSE: u64 = 27;
-    const SSN_SET_INFO_THREAD: u64 = 238;
-    const SSN_QUERY_INFO_THREAD: u64 = 162;
-    const DUPLICATE_CLOSE_SOURCE: u32 = 1;
-    const DUPLICATE_SAME_ACCESS: u32 = 2;
 
     let ep = SM_FAULT_EP.load(Ordering::Relaxed);
     let reply = REPLY_SMLOOP_SLOT.load(Ordering::Relaxed);
@@ -1448,164 +1473,91 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
                 print_str(b"[sm-api] worker SSN=");
                 print_u64(ssn);
                 print_str(b"\n");
-                match ssn {
-                    SSN_SET_INFO_THREAD => {
-                        result = sm_set_thread_information_call(
-                            nt_handler,
-                            get_recv_mr(9),
-                            rdx as u32,
-                            get_recv_mr(7),
-                            get_recv_mr(8) as u32,
-                        );
-                    }
-                    SSN_QUERY_INFO_THREAD => {
-                        result = match sp
-                            .checked_add(0x28)
-                            .filter(|address| sm_stack_has_range(*address, 8))
-                        {
-                            Some(address) => sm_query_thread_information_call(
-                                nt_handler,
+                if let Some(dispatched) = dispatch_hosted_server_native_service(
+                    nt_handler,
+                    HostedServerWorker::Sm,
+                    smss_pid as u32,
+                    ssn,
+                    m2,
+                    sp,
+                    get_recv_mr(9),
+                    rdx,
+                    get_recv_mr(7),
+                    get_recv_mr(8),
+                ) {
+                    result = dispatched.status;
+                    print_str(b"[sm-api] dispatched worker ");
+                    print_str(dispatched.service.name().as_bytes());
+                    print_str(b" status=0x");
+                    print_hex(result as u32);
+                    print_str(b"\n");
+                } else {
+                    match ssn {
+                        SSN_REQUEST_WAIT_REPLY => {
+                            print_str(b"[sm-api] driving nested SbpCreateSession request\n");
+                            if !csr_sb_api_request_rendezvous(
                                 get_recv_mr(9),
-                                rdx as u32,
+                                rdx,
                                 get_recv_mr(7),
-                                get_recv_mr(8) as u32,
-                                sm_stack_read(address),
-                            ),
-                            None => 0xC000_0005,
-                        };
-                    }
-                    SSN_NT_OPEN_PROCESS => {
-                        result = sm_open_process_call(
-                            nt_handler,
-                            get_recv_mr(9),
-                            rdx as u32,
-                            get_recv_mr(7),
-                            get_recv_mr(8),
-                        );
-                    }
-                    SSN_NT_OPEN_THREAD => {
-                        result = sm_open_thread_call(
-                            nt_handler,
-                            get_recv_mr(9),
-                            rdx as u32,
-                            get_recv_mr(7),
-                            get_recv_mr(8),
-                        );
-                    }
-                    SSN_QUERY_INFO_PROCESS => {
-                        let class = rdx;
-                        let buffer = get_recv_mr(7);
-                        if class == 0 {
-                            sm_stack_write(buffer + 0x20, smss_pid);
-                        } else if class == 24 {
-                            sm_stack_write32(buffer, 0);
+                                csrss_pml4,
+                                csrss_pe,
+                                csrss_img_end,
+                                nt_base,
+                                nt_end,
+                                ntdll_pe,
+                                reg,
+                                dll_pes,
+                                nt_handler,
+                            ) {
+                                return false;
+                            }
                         }
-                    }
-                    SSN_DUPLICATE_OBJECT => {
-                        let saved_pi = nt_handler.pi;
-                        nt_handler.pi = 0;
-                        let source_process = get_recv_mr(9);
-                        let source_handle = rdx;
-                        let target_process = get_recv_mr(7);
-                        let target_out = get_recv_mr(8);
-                        let options = sm_stack_read(sp + 0x38) as u32;
-                        let source_pid = nt_handler.resolve_process_handle(source_process);
-                        let target_pid = nt_handler.resolve_process_handle(target_process);
-                        result = match (source_pid, target_pid) {
-                            (Some(source_pid), Some(target_pid)) => {
-                                let desired_access = (options & DUPLICATE_SAME_ACCESS == 0)
-                                    .then_some(sm_stack_read(sp + 0x28) as u32);
-                                match nt_handler.duplicate_process_handle_with_access(
-                                    source_pid,
-                                    source_handle as nt_process::Handle,
-                                    target_pid,
-                                    desired_access,
-                                ) {
-                                    Ok(handle) => {
-                                        sm_stack_write(target_out, handle as u64);
-                                        0
-                                    }
-                                    Err(status) => status as u64,
+                        SSN_REPLY_WAIT_RECV => {
+                            let reply_msg = get_recv_mr(7);
+                            let mut reply_bytes = [0u8; 0x148];
+                            let reply_len = if reply_msg != 0 {
+                                let total = ((sm_stack_read(reply_msg) >> 16) as u16) as usize;
+                                if !(0x28..=0x148).contains(&total)
+                                    || !sm_stack_copyin(reply_msg, &mut reply_bytes[..total])
+                                {
+                                    return false;
                                 }
-                            }
-                            _ => nt_process::STATUS_INVALID_HANDLE as u64,
-                        };
-                        if options & DUPLICATE_CLOSE_SOURCE != 0 {
-                            if let Some(source_pid) = source_pid {
-                                let _ = nt_handler.close_process_handle(source_pid, source_handle);
-                            }
-                        }
-                        nt_handler.pi = saved_pi;
-                    }
-                    SSN_CLOSE => {
-                        let saved_pi = nt_handler.pi;
-                        nt_handler.pi = 0;
-                        nt_handler.close_current_handle(get_recv_mr(9));
-                        nt_handler.pi = saved_pi;
-                    }
-                    SSN_REQUEST_WAIT_REPLY => {
-                        print_str(b"[sm-api] driving nested SbpCreateSession request\n");
-                        if !csr_sb_api_request_rendezvous(
-                            get_recv_mr(9),
-                            rdx,
-                            get_recv_mr(7),
-                            csrss_pml4,
-                            csrss_pe,
-                            csrss_img_end,
-                            nt_base,
-                            nt_end,
-                            ntdll_pe,
-                            reg,
-                            dll_pes,
-                            nt_handler,
-                        ) {
-                            return false;
-                        }
-                    }
-                    SSN_REPLY_WAIT_RECV => {
-                        let reply_msg = get_recv_mr(7);
-                        let mut reply_bytes = [0u8; 0x148];
-                        let reply_len = if reply_msg != 0 {
-                            let total = ((sm_stack_read(reply_msg) >> 16) as u16) as usize;
-                            if !(0x28..=0x148).contains(&total)
-                                || !sm_stack_copyin(reply_msg, &mut reply_bytes[..total])
+                                total
+                            } else {
+                                0
+                            };
+                            let _ = lpc_client().and_then(|client| {
+                                client
+                                    .reply_wait_receive_with_reply(
+                                        listen_port,
+                                        &reply_bytes[..reply_len],
+                                    )
+                                    .ok()
+                            });
+                            let Some(response) = lpc_client()
+                                .and_then(|client| client.reply_wait_receive(client_port).ok())
+                            else {
+                                return false;
+                            };
+                            if response.connection_info.is_empty()
+                                || !nt_handler
+                                    .xas_try_write_buf(reply_va, &response.connection_info)
                             {
                                 return false;
                             }
-                            total
-                        } else {
-                            0
-                        };
-                        let _ = lpc_client().and_then(|client| {
-                            client
-                                .reply_wait_receive_with_reply(
-                                    listen_port,
-                                    &reply_bytes[..reply_len],
-                                )
-                                .ok()
-                        });
-                        let Some(response) = lpc_client()
-                            .and_then(|client| client.reply_wait_receive(client_port).ok())
-                        else {
-                            return false;
-                        };
-                        if response.connection_info.is_empty()
-                            || !nt_handler.xas_try_write_buf(reply_va, &response.connection_info)
-                        {
+                            SM_RECVMSG.store(get_recv_mr(8), Ordering::Relaxed);
+                            SM_RECVPORT.store(get_recv_mr(9), Ordering::Relaxed);
+                            SM_RECV_RDX.store(rdx, Ordering::Relaxed);
+                            SM_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+                            print_str(b"[sm-api] real SmpApiLoop reply completed\n");
+                            return true;
+                        }
+                        _ => {
+                            print_str(b"[sm-api] unexpected worker SSN=");
+                            print_u64(ssn);
+                            print_str(b"\n");
                             return false;
                         }
-                        SM_RECVMSG.store(get_recv_mr(8), Ordering::Relaxed);
-                        SM_RECVPORT.store(get_recv_mr(9), Ordering::Relaxed);
-                        SM_RECV_RDX.store(rdx, Ordering::Relaxed);
-                        SM_RECEIVE_PARKED.store(1, Ordering::Relaxed);
-                        print_str(b"[sm-api] real SmpApiLoop reply completed\n");
-                        return true;
-                    }
-                    _ => {
-                        print_str(b"[sm-api] unexpected worker SSN=");
-                        print_u64(ssn);
-                        print_str(b"\n");
-                        return false;
                     }
                 }
                 reply_native_rendezvous(reply, result);
@@ -1939,9 +1891,9 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                 let rdx = m3;
                 let mut result = 0u64;
                 if ssn < win32k_subsystem::WIN32K_SERVICE_BASE {
-                    if let Some(dispatched) = dispatch_csr_worker_native_service(
+                    if let Some(dispatched) = dispatch_hosted_server_native_service(
                         nt_handler,
-                        false,
+                        HostedServerWorker::CsrApi,
                         client_pid as u32,
                         ssn,
                         resume_ip,
@@ -3584,9 +3536,9 @@ unsafe fn csr_sb_api_request_rendezvous(
                 print_str(b"[csr-sb-api] worker SSN=");
                 print_u64(ssn);
                 print_str(b"\n");
-                if let Some(dispatched) = dispatch_csr_worker_native_service(
+                if let Some(dispatched) = dispatch_hosted_server_native_service(
                     nt_handler,
-                    true,
+                    HostedServerWorker::CsrSb,
                     smss_pid as u32,
                     ssn,
                     resume_ip,

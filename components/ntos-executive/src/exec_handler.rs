@@ -15237,14 +15237,18 @@ impl ExecNtHandler {
     unsafe fn user_memory_read(&self, memory: SyscallUserMemory, va: u64, dst: &mut [u8]) -> bool {
         match memory {
             SyscallUserMemory::CurrentProcess => self.xas_read(va, dst),
-            SyscallUserMemory::CsrProcess { sb } => self.csr_process_memory_read(sb, va, dst),
+            SyscallUserMemory::SmProcess | SyscallUserMemory::CsrProcess { .. } => {
+                self.hosted_server_memory_read(memory, va, dst)
+            }
         }
     }
 
     unsafe fn user_memory_write(&self, memory: SyscallUserMemory, va: u64, src: &[u8]) -> bool {
         match memory {
             SyscallUserMemory::CurrentProcess => self.xas_try_write_buf(va, src),
-            SyscallUserMemory::CsrProcess { sb } => self.csr_process_memory_write(sb, va, src),
+            SyscallUserMemory::SmProcess | SyscallUserMemory::CsrProcess { .. } => {
+                self.hosted_server_memory_write(memory, va, src)
+            }
         }
     }
 
@@ -15256,58 +15260,118 @@ impl ExecNtHandler {
     ) -> bool {
         match memory {
             SyscallUserMemory::CurrentProcess => self.probe_user_output(va, len),
-            SyscallUserMemory::CsrProcess { sb } => {
-                self.csr_process_memory_probe_output(sb, va, len)
+            SyscallUserMemory::SmProcess | SyscallUserMemory::CsrProcess { .. } => {
+                self.hosted_server_memory_probe_output(memory, va, len)
             }
         }
     }
 
-    unsafe fn csr_process_memory_read(&self, sb: bool, va: u64, dst: &mut [u8]) -> bool {
-        if csr_thread_stack_copyin(sb, va, dst) {
+    fn hosted_server_memory_pi(memory: SyscallUserMemory) -> Option<usize> {
+        match memory {
+            SyscallUserMemory::CurrentProcess => None,
+            SyscallUserMemory::SmProcess => Some(0),
+            SyscallUserMemory::CsrProcess { .. } => Some(1),
+        }
+    }
+
+    unsafe fn hosted_server_stack_copyin(
+        memory: SyscallUserMemory,
+        va: u64,
+        dst: &mut [u8],
+    ) -> bool {
+        match memory {
+            SyscallUserMemory::CurrentProcess => false,
+            SyscallUserMemory::SmProcess => sm_stack_copyin(va, dst),
+            SyscallUserMemory::CsrProcess { sb } => csr_thread_stack_copyin(sb, va, dst),
+        }
+    }
+
+    unsafe fn hosted_server_stack_copyout(memory: SyscallUserMemory, va: u64, src: &[u8]) -> bool {
+        match memory {
+            SyscallUserMemory::CurrentProcess => false,
+            SyscallUserMemory::SmProcess => sm_stack_copyout(va, src),
+            SyscallUserMemory::CsrProcess { sb } => csr_thread_stack_copyout(sb, va, src),
+        }
+    }
+
+    fn hosted_server_stack_has_range(memory: SyscallUserMemory, va: u64, len: usize) -> bool {
+        match memory {
+            SyscallUserMemory::CurrentProcess => false,
+            SyscallUserMemory::SmProcess => sm_stack_has_range(va, len),
+            SyscallUserMemory::CsrProcess { sb } => csr_thread_stack_has_range(sb, va, len),
+        }
+    }
+
+    unsafe fn hosted_server_memory_read(
+        &self,
+        memory: SyscallUserMemory,
+        va: u64,
+        dst: &mut [u8],
+    ) -> bool {
+        if Self::hosted_server_stack_copyin(memory, va, dst) {
             return true;
         }
+        let Some(pi) = Self::hosted_server_memory_pi(memory) else {
+            return false;
+        };
         let Some(ctx) = self.loop_ctx else {
             return false;
         };
         let procs = &*ctx.procs;
         let filled = &*ctx.pfilled;
         client_copyin_process_mapped(
-            1,
+            pi as u64,
             va,
             dst,
-            &filled[1],
-            procs[1].faults as usize,
-            procs[1].scratch_base,
+            &filled[pi],
+            procs[pi].faults as usize,
+            procs[pi].scratch_base,
             false,
         )
     }
 
-    unsafe fn csr_process_memory_write(&self, sb: bool, va: u64, src: &[u8]) -> bool {
-        if csr_thread_stack_copyout(sb, va, src) {
+    unsafe fn hosted_server_memory_write(
+        &self,
+        memory: SyscallUserMemory,
+        va: u64,
+        src: &[u8],
+    ) -> bool {
+        if Self::hosted_server_stack_copyout(memory, va, src) {
             return true;
         }
+        let Some(pi) = Self::hosted_server_memory_pi(memory) else {
+            return false;
+        };
         let Some(ctx) = self.loop_ctx else {
             return false;
         };
         let procs = &*ctx.procs;
         let filled = &*ctx.pfilled;
         client_copyout_mapped(
-            1,
+            pi as u64,
             va,
             src,
-            &filled[1],
-            procs[1].faults as usize,
-            procs[1].scratch_base,
+            &filled[pi],
+            procs[pi].faults as usize,
+            procs[pi].scratch_base,
         )
     }
 
-    unsafe fn csr_process_memory_probe_output(&self, sb: bool, va: u64, len: usize) -> bool {
-        if csr_thread_stack_has_range(sb, va, len) {
+    unsafe fn hosted_server_memory_probe_output(
+        &self,
+        memory: SyscallUserMemory,
+        va: u64,
+        len: usize,
+    ) -> bool {
+        if Self::hosted_server_stack_has_range(memory, va, len) {
             return true;
         }
         if len == 0 {
             return true;
         }
+        let Some(pi) = Self::hosted_server_memory_pi(memory) else {
+            return false;
+        };
         let Some(ctx) = self.loop_ctx else {
             return false;
         };
@@ -15316,7 +15380,9 @@ impl ExecNtHandler {
         };
         let procs = &*ctx.procs;
         for chunk in chunks {
-            let Some(info) = process_committed_mapping_basic_information(1, chunk.page_base) else {
+            let Some(info) =
+                process_committed_mapping_basic_information(pi as u64, chunk.page_base)
+            else {
                 return false;
             };
             let writable = match info.type_ {
@@ -15332,7 +15398,7 @@ impl ExecNtHandler {
                 .is_ok(),
                 _ => false,
             };
-            if !writable || csrss_frame_get_exact(1, chunk.page_base).0 == 0 {
+            if !writable || csrss_frame_get_exact(pi as u64, chunk.page_base).0 == 0 {
                 return false;
             }
         }
@@ -15342,12 +15408,12 @@ impl ExecNtHandler {
         while copied < len {
             let part = (len - copied).min(probe.len());
             if !client_copyin_process_mapped(
-                1,
+                pi as u64,
                 va + copied as u64,
                 &mut probe[..part],
-                &filled[1],
-                procs[1].faults as usize,
-                procs[1].scratch_base,
+                &filled[pi],
+                procs[pi].faults as usize,
+                procs[pi].scratch_base,
                 false,
             ) {
                 return false;
@@ -19898,8 +19964,8 @@ impl ExecNtHandler {
     /// frame table — but its bytes are exactly the (relocation-free) `.rdata` file content, which we
     /// read via the loaded PE. Handles a read that spans a page boundary.
     pub(crate) unsafe fn xas_read(&self, va: u64, dst: &mut [u8]) -> bool {
-        if let SyscallUserMemory::CsrProcess { sb } = self.current_user_memory {
-            return self.csr_process_memory_read(sb, va, dst);
+        if !matches!(self.current_user_memory, SyscallUserMemory::CurrentProcess) {
+            return self.hosted_server_memory_read(self.current_user_memory, va, dst);
         }
         if va.checked_add(dst.len() as u64).is_none() {
             return false;
@@ -20060,8 +20126,12 @@ impl ExecNtHandler {
     /// [`client_copyout_or_fill_mapped`] (mirror → backed page alias → demand-fill from the DLL PE).
     /// No-op if there is no loop context. Used for hosted-process NtOpenKey handle copyout.
     pub(crate) unsafe fn xas_write_u64(&self, va: u64, val: u64) -> bool {
-        if let SyscallUserMemory::CsrProcess { sb } = self.current_user_memory {
-            return self.csr_process_memory_write(sb, va, &val.to_le_bytes());
+        if !matches!(self.current_user_memory, SyscallUserMemory::CurrentProcess) {
+            return self.hosted_server_memory_write(
+                self.current_user_memory,
+                va,
+                &val.to_le_bytes(),
+            );
         }
         if let Some(ctx) = self.loop_ctx {
             if !self.promote_current_image_cow_for_write(va, 8) {
@@ -20112,8 +20182,12 @@ impl ExecNtHandler {
 
     /// Cross-address-space DWORD copyout without imposing 8-byte alignment on the user pointer.
     pub(crate) unsafe fn xas_write_u32(&self, va: u64, val: u32) -> bool {
-        if let SyscallUserMemory::CsrProcess { sb } = self.current_user_memory {
-            return self.csr_process_memory_write(sb, va, &val.to_le_bytes());
+        if !matches!(self.current_user_memory, SyscallUserMemory::CurrentProcess) {
+            return self.hosted_server_memory_write(
+                self.current_user_memory,
+                va,
+                &val.to_le_bytes(),
+            );
         }
         if let Some(ctx) = self.loop_ctx {
             if !self.promote_current_image_cow_for_write(va, 4) {
@@ -20169,8 +20243,8 @@ impl ExecNtHandler {
 
     /// Probe an arbitrary user output range without changing its contents.
     pub(crate) unsafe fn probe_user_output(&self, va: u64, len: usize) -> bool {
-        if let SyscallUserMemory::CsrProcess { sb } = self.current_user_memory {
-            return self.csr_process_memory_probe_output(sb, va, len);
+        if !matches!(self.current_user_memory, SyscallUserMemory::CurrentProcess) {
+            return self.hosted_server_memory_probe_output(self.current_user_memory, va, len);
         }
         if len == 0 {
             return true;
@@ -20830,8 +20904,8 @@ impl ExecNtHandler {
     }
 
     pub(crate) unsafe fn xas_try_write_buf(&self, va: u64, src: &[u8]) -> bool {
-        if let SyscallUserMemory::CsrProcess { sb } = self.current_user_memory {
-            return self.csr_process_memory_write(sb, va, src);
+        if !matches!(self.current_user_memory, SyscallUserMemory::CurrentProcess) {
+            return self.hosted_server_memory_write(self.current_user_memory, va, src);
         }
         if let Some(ctx) = self
             .loop_ctx
