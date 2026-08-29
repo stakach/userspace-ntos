@@ -366,6 +366,7 @@ fn fixed_vm_map_reserves_commits_and_reuses_without_allocation() {
         }
     );
     assert!(!map.is_committed(first.base));
+    assert_eq!(map.committed_bytes(), 0);
     map.allocate(
         Some(first.base + 0x1000),
         0x1000,
@@ -375,6 +376,7 @@ fn fixed_vm_map_reserves_commits_and_reuses_without_allocation() {
     .unwrap();
     assert!(!map.is_committed(first.base));
     assert!(map.is_committed(first.base + 0x1000));
+    assert_eq!(map.committed_bytes(), 0x1000);
     assert_eq!(map.extent_count(), 3);
 
     let freed = map.free(first.base, 0, MEM_RELEASE).unwrap();

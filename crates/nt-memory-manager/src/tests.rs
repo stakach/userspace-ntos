@@ -15,6 +15,53 @@ fn file_cache(bytes: &[u8]) -> SharedCacheMap<MemoryBacking> {
 }
 
 #[test]
+fn process_commit_ledger_is_transactional_and_limit_checked() {
+    let mut ledger = ProcessCommitLedger::new();
+    ledger.register(4, 0x2000).unwrap();
+    ledger.set_limit(4, 0x5000).unwrap();
+
+    let plan = ledger.prepare_charge(4, 0x3000).unwrap();
+    assert_eq!(ledger.accounting(4).unwrap().current_bytes, 0x2000);
+    let accounting = ledger.commit_charge(plan).unwrap();
+    assert_eq!(accounting.current_bytes, 0x5000);
+    assert_eq!(accounting.peak_bytes, 0x5000);
+    assert_eq!(
+        ledger.prepare_charge(4, 0x1000),
+        Err(STATUS_COMMITMENT_LIMIT)
+    );
+
+    let accounting = ledger.release(4, 0x4000).unwrap();
+    assert_eq!(accounting.current_bytes, 0x1000);
+    assert_eq!(accounting.peak_bytes, 0x5000);
+    assert_eq!(ledger.unregister(4), Some(accounting));
+}
+
+#[test]
+fn process_commit_ledger_rejects_stale_plans_and_scales_by_owner() {
+    let mut ledger = ProcessCommitLedger::new();
+    for owner in 1..=40 {
+        ledger.register(owner, 0).unwrap();
+    }
+    assert_eq!(ledger.owner_count(), 40);
+
+    let stale = ledger.prepare_charge(40, 0x1000).unwrap();
+    let current = ledger.prepare_charge(40, 0x2000).unwrap();
+    ledger.commit_charge(current).unwrap();
+    assert_eq!(
+        ledger.commit_charge(stale),
+        Err(commit::STATUS_CONFLICTING_ADDRESSES)
+    );
+    assert_eq!(
+        ledger.set_limit(40, 1),
+        Err(commit::STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        ledger.release(40, 0x3000),
+        Err(commit::STATUS_INVALID_PARAMETER)
+    );
+}
+
+#[test]
 fn acceptance_mapped_file_edit_flushes_back() {
     // Spec §24: map a file-backed section, edit through the view, unmap, flush → file reflects it.
     let mut cache = file_cache(b"abcdef");

@@ -1294,6 +1294,14 @@ impl<const N: usize> VmRegionMap<N> {
             .count()
     }
 
+    pub fn committed_bytes(&self) -> u64 {
+        self.extents
+            .iter()
+            .flatten()
+            .filter(|extent| extent.state == VmExtentState::Committed)
+            .fold(0u64, |total, extent| total.saturating_add(extent.size))
+    }
+
     pub fn extent_at(&self, address: u64) -> Option<VmExtent> {
         self.extents
             .iter()

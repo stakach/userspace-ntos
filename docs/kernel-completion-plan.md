@@ -17117,3 +17117,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     restrictions through the Security Manager. Unsupported memory, UI, and security flags must
     continue to fail without mutating job state. Do not introduce executive-local MM counters,
     direct win32k identity checks, or permissive token-policy stand-ins.
+
+    MM commit-quota owner foundation (2026-08-30, accepted; memory-limit slice in progress):
+    `nt-memory-manager` now owns a dynamic per-process commitment ledger with page-granular current,
+    peak, and optional limit state. Charges use an explicit prepare/commit token: preparing validates
+    the process limit without mutating accounting, address-space and Ps job admission can run next,
+    and only a successful mapping commits the MM charge. Stale plans, under-release, unaligned
+    values, duplicate owners, and allocation failure are explicit errors. `VmRegionMap` now reports
+    exact committed bytes from its authoritative extents, allowing an existing hosted address space
+    to seed the MM owner without an executive-maintained shadow counter. Focused validation passes
+    `nt-memory-manager` `19/19` and `nt-address-space` `60/60`.
+
+    Review adjustment: this foundation does not enable any job memory flag yet. Next add the Ps-owned
+    current/peak job-memory ledger and one-shot process/job memory-limit notifications, then compose
+    the MM and Ps prepare/commit transactions around private VAD commit/decommit and process teardown.
+    Enable `PROCESS_MEMORY` and `JOB_MEMORY` only after assignment, inherited-job creation, limit
+    updates, and rollback all use that composition. Working-set limits remain separate until MM owns
+    resident-set trimming/pageout; committed bytes must not be relabelled as a working set.

@@ -21,11 +21,16 @@ use alloc::vec::Vec;
 use nt_cache_manager::{CachedStreamBacking, SharedCacheMap};
 
 mod client_frame;
+mod commit;
 mod runtime_section;
 
 pub use client_frame::{
     ClientFrameInsert, ClientFrameInsertError, ClientFrameRecord, ClientFrameRegistry,
     ClientFrameRegistryStats,
+};
+pub use commit::{
+    CommitChargePlan, CommitOwnerId, ProcessCommitAccounting, ProcessCommitLedger,
+    PAGE_SIZE as COMMIT_PAGE_SIZE, STATUS_COMMITMENT_LIMIT,
 };
 
 pub use runtime_section::{
