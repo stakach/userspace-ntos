@@ -16588,3 +16588,36 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     follow system-clock movement; periodic rearms become relative monotonic deadlines after the first
     fire. Do not install the adjustable clock authority while this final native timer owner can still
     retain a stale scalar projection.
+
+    Tagged native user timers and owned APC lifecycle (2026-08-30, focused validation complete):
+    the new `no_std` `nt-user-timer` crate owns the growable waitable-timer table. Inactive, relative,
+    and absolute state are represented only by `Deadline`; the redundant `active` flag, scalar
+    `due_100ns`, and `u64::MAX` sentinel are deleted. Minimum discovery and expiry take one coherent
+    `TimeSnapshot`, absolute first fires follow system-clock movement, and a periodic timer becomes a
+    relative monotonic deadline after its first fire. Due timers are drained by retained deadline
+    order, and the expiration record carries current system time for the native timer APC low/high
+    arguments as ReactOS's `KiTimerExpiration` does.
+
+    The executive's HPET arbiter now reads the handler-owned timer table directly. The scalar
+    `USER_TIMER_NEXT_DEADLINE` mirror is deleted, and the authoritative handler is passed through
+    ordinary rearm, nested-pump rearm, watchdog arming, cancellation, thread/process teardown, and
+    shutdown. An immediate-due `NtSetTimer` now uses the same expiry path as an HPET delivery, so it
+    signals the dispatcher object, queues its APC, wakes waiters, and initializes/rearms a periodic
+    timer instead of bypassing those mechanisms.
+
+    Kernel APC queues now retain optional owner provenance separately from the public `UserApc`
+    payload. Timer APC insertion is unique per timer object, matching one queued KAPC rather than
+    accumulating periodic duplicates; reset, cancel, and object deletion remove exactly that owned
+    APC without touching ordinary user APCs or another timer. Thread rundown cancels only timers
+    with an APC associated to that thread, while APC-free dispatcher timers remain independent.
+    `nt-user-timer` passes `8/8`, `nt-process` passes `111/111`, and the freestanding executive
+    remains at the accepted 209-warning baseline.
+
+    Review adjustment: every live NT timeout/timer owner now retains its deadline domain. Install one
+    executive `AdjustableClock` authority next and make `nt_time_snapshot_at` read it. Then implement
+    and register real `NtSetSystemTime`: capture/probe the new and optional previous-time pointers,
+    require enabled `SeSystemtimePrivilege`, validate the native time bound, update KUSER_SHARED_DATA
+    and timezone publication from the same generation, drain absolute deadlines made due by a
+    forward jump, and re-arm the shared HPET so backward jumps defer rather than prematurely expire
+    absolute waits. Relative waits, periodic timers, interrupt time, and scheduler accounting must
+    remain monotonic and unchanged.

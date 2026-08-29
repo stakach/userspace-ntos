@@ -166,6 +166,17 @@ pub struct UserApc {
     pub system_argument2: u64,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum KernelUserApcSource {
+    Timer(u64),
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct QueuedUserApc {
+    apc: UserApc,
+    source: Option<KernelUserApcSource>,
+}
+
 struct IdTable<T> {
     entries: Vec<(u32, T)>,
 }
@@ -759,7 +770,7 @@ pub struct NtThread {
     hide_from_debugger: bool,
     thread_name_len: u16,
     thread_name: Vec<u16>,
-    user_apc_queue: VecDeque<UserApc>,
+    user_apc_queue: VecDeque<QueuedUserApc>,
 }
 
 /// Per-thread state installed through `ThreadImpersonationToken`.
@@ -2005,7 +2016,7 @@ impl ProcessManager {
     ) -> Result<ThreadId, u32> {
         let tid =
             self.resolve_thread_handle(caller_pid, current_tid, thread_handle, THREAD_SET_CONTEXT)?;
-        self.queue_user_apc_to_thread(tid, apc)?;
+        self.queue_user_apc_to_thread(tid, apc, None)?;
         Ok(tid)
     }
 
@@ -2013,11 +2024,63 @@ impl ProcessManager {
     /// thread. This bypasses user handle access checks, but still applies the same lifetime,
     /// system-thread, and bounded-queue rules as `NtQueueApcThread`.
     pub fn queue_kernel_user_apc(&mut self, tid: ThreadId, apc: UserApc) -> Result<ThreadId, u32> {
-        self.queue_user_apc_to_thread(tid, apc)?;
+        self.queue_user_apc_to_thread(tid, apc, None)?;
         Ok(tid)
     }
 
-    fn queue_user_apc_to_thread(&mut self, tid: ThreadId, apc: UserApc) -> Result<(), u32> {
+    /// Queue one kernel APC for a stable owner. A queued owner cannot be inserted twice; after the
+    /// APC is delivered or removed, the same owner may queue its next completion.
+    pub fn queue_kernel_user_apc_once(
+        &mut self,
+        tid: ThreadId,
+        source: KernelUserApcSource,
+        apc: UserApc,
+    ) -> Result<bool, u32> {
+        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        if thread.is_system_thread {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        if thread.state == ThreadState::Terminated {
+            return Err(STATUS_UNSUCCESSFUL);
+        }
+        if thread
+            .user_apc_queue
+            .iter()
+            .any(|queued| queued.source == Some(source))
+        {
+            return Ok(false);
+        }
+        thread
+            .user_apc_queue
+            .try_reserve(1)
+            .map_err(|_| STATUS_NO_MEMORY)?;
+        thread.user_apc_queue.push_back(QueuedUserApc {
+            apc,
+            source: Some(source),
+        });
+        Ok(true)
+    }
+
+    pub fn remove_kernel_user_apc(&mut self, tid: ThreadId, source: KernelUserApcSource) -> bool {
+        let Some(thread) = self.threads.get_mut(&tid) else {
+            return false;
+        };
+        let Some(position) = thread
+            .user_apc_queue
+            .iter()
+            .position(|queued| queued.source == Some(source))
+        else {
+            return false;
+        };
+        thread.user_apc_queue.remove(position).is_some()
+    }
+
+    fn queue_user_apc_to_thread(
+        &mut self,
+        tid: ThreadId,
+        apc: UserApc,
+        source: Option<KernelUserApcSource>,
+    ) -> Result<(), u32> {
         let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
         if thread.is_system_thread {
             return Err(STATUS_INVALID_HANDLE);
@@ -2029,7 +2092,9 @@ impl ProcessManager {
             .user_apc_queue
             .try_reserve(1)
             .map_err(|_| STATUS_NO_MEMORY)?;
-        thread.user_apc_queue.push_back(apc);
+        thread
+            .user_apc_queue
+            .push_back(QueuedUserApc { apc, source });
         Ok(())
     }
 
@@ -2041,11 +2106,15 @@ impl ProcessManager {
 
     pub fn peek_user_apc(&self, tid: ThreadId) -> Option<UserApc> {
         let thread = self.threads.get(&tid)?;
-        thread.user_apc_queue.front().copied()
+        thread.user_apc_queue.front().map(|queued| queued.apc)
     }
 
     pub fn take_user_apc(&mut self, tid: ThreadId) -> Option<UserApc> {
-        self.threads.get_mut(&tid)?.user_apc_queue.pop_front()
+        self.threads
+            .get_mut(&tid)?
+            .user_apc_queue
+            .pop_front()
+            .map(|queued| queued.apc)
     }
 
     pub fn clear_user_apcs(&mut self, tid: ThreadId) -> bool {

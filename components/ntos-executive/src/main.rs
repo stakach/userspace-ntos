@@ -2759,9 +2759,8 @@ static IO_COMPLETION_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static IO_COMPLETION_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 static IO_COMPLETION_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Native waitable timers share the delay HPET one-shot. The authoritative timer records live in
-/// `ExecNtHandler`; this atomic lets the common rearm path include their current minimum deadline.
-static USER_TIMER_NEXT_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Native waitable timers share the delay HPET one-shot. The authoritative tagged timer records live
+/// in `ExecNtHandler` and are sampled directly by the common rearm path.
 static USER_TIMER_FIRED_COUNT: AtomicU64 = AtomicU64::new(0);
 static USER_TIMER_APC_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -3079,7 +3078,10 @@ fn watchdog_deadline() -> Option<u64> {
 /// Arm the deadman. Scoped ON once the GUI stack has produced authentic desktop pixels. From there
 /// the boot frontier includes SCM/EventLog/shell work that can block inside nested component receives;
 /// any true silence must produce diagnostics instead of leaving the run to hang.
-pub(crate) unsafe fn watchdog_arm(queue: &nt_delay_execution::Queue) {
+pub(crate) unsafe fn watchdog_arm(
+    queue: &nt_delay_execution::Queue,
+    handler: &ExecNtHandler,
+) {
     if !EXEC_DEADMAN_WATCHDOG || WATCHDOG_ARMED.swap(1, Ordering::Relaxed) != 0 {
         return;
     }
@@ -3092,7 +3094,7 @@ pub(crate) unsafe fn watchdog_arm(queue: &nt_delay_execution::Queue) {
         Ordering::Relaxed,
     );
     WATCHDOG_LAST_SEEN_MSGS.store(u64::MAX, Ordering::Relaxed);
-    delay_timer_rearm(queue);
+    delay_timer_rearm(queue, handler);
     print_str(b"[deadman] in-recv watchdog ARMED (period 20s, trip = two silent periods)\n");
 }
 
@@ -16236,7 +16238,10 @@ unsafe fn delay_timer_init() -> bool {
     true
 }
 
-unsafe fn delay_timer_next_deadline(queue: &nt_delay_execution::Queue) -> Option<(u64, u64)> {
+unsafe fn delay_timer_next_deadline(
+    queue: &nt_delay_execution::Queue,
+    handler: &ExecNtHandler,
+) -> Option<(u64, u64)> {
     let now = nt_time_snapshot();
     let delay_deadline = queue.next_deadline(now);
     let event_deadline = object_waiter_next_deadline(now);
@@ -16245,10 +16250,7 @@ unsafe fn delay_timer_next_deadline(queue: &nt_delay_execution::Queue) -> Option
         unsafe { (&*core::ptr::addr_of!(KEYED_RELEASE_WAITERS)).next_deadline(now) };
     let io_completion_deadline =
         unsafe { (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)).next_deadline(now) };
-    let user_timer_deadline = match USER_TIMER_NEXT_DEADLINE.load(Ordering::Relaxed) {
-        u64::MAX => None,
-        deadline => Some(deadline),
-    };
+    let user_timer_deadline = handler.user_timer_next_deadline(now);
     let hosted_kernel_timer_deadline = driver_launch::hosted_driver_timer_next_deadline();
     let hosted_driver_deadline = driver_launch::hosted_driver_wait_next_deadline();
     let deadman_deadline = watchdog_deadline();
@@ -16285,16 +16287,16 @@ unsafe fn delay_timer_next_deadline(queue: &nt_delay_execution::Queue) -> Option
     Some((deadline, source))
 }
 
-unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue) {
-    let handler = DELAY_TIMER_HANDLER.load(Ordering::Relaxed);
-    if handler == 0 {
+unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue, handler: &ExecNtHandler) {
+    let timer_handler = DELAY_TIMER_HANDLER.load(Ordering::Relaxed);
+    if timer_handler == 0 {
         return;
     }
     let mut config = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
     config &= !HPET_TN_INT_ENB;
     core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
-    if let Some((deadline, source)) = delay_timer_next_deadline(queue) {
+    if let Some((deadline, source)) = delay_timer_next_deadline(queue, handler) {
         let period = HPET_PERIOD_FS.load(Ordering::Relaxed);
         let guard_ticks = delay_timer_min_arm_ticks(period);
         let now = core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64);
@@ -16356,7 +16358,7 @@ unsafe fn delay_timer_rearm_and_drain_overdue(
     queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
 ) -> u64 {
-    delay_timer_rearm(queue);
+    delay_timer_rearm(queue, handler);
     delay_timer_drain_overdue_without_badge(queue, handler)
 }
 
@@ -16468,7 +16470,7 @@ unsafe fn io_completion_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
 }
 
 unsafe fn user_timer_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
-    let fired = handler.user_timer_fire_due(now);
+    let fired = handler.user_timer_fire_due(nt_time_snapshot_at(now));
     if fired != 0 {
         let woken = wait_wake_dispatcher_set(handler);
         USER_TIMER_FIRED_COUNT.fetch_add(fired, Ordering::Relaxed);
@@ -16504,7 +16506,7 @@ pub(crate) unsafe fn delay_timer_drain_overdue_without_badge(
     }
     DRAIN_CALLS.fetch_add(1, Ordering::Relaxed);
     let scan_started = disk_census_ticks();
-    let next = delay_timer_next_deadline(queue);
+    let next = delay_timer_next_deadline(queue, handler);
     let now_100ns = monotonic_time_100ns();
     DRAIN_SCAN_TICKS.fetch_add(
         disk_census_ticks().wrapping_sub(scan_started),
@@ -16560,7 +16562,7 @@ pub(crate) unsafe fn delay_timer_drain_overdue_without_badge(
     }
     TIMER_DUE_WORK_DRAINS.fetch_add(1, Ordering::Relaxed);
     let rearm_started = disk_census_ticks();
-    delay_timer_rearm(queue);
+    delay_timer_rearm(queue, handler);
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
     delay_timer_ack_irq();
     DRAIN_REARM_TICKS.fetch_add(
@@ -16802,7 +16804,7 @@ unsafe fn delay_timer_interrupt(
         // ahead of the enable edge.
         let now_100ns = monotonic_time_100ns();
         let _ = delay_timer_drain_due_work(queue, handler, now_100ns);
-        delay_timer_rearm(queue);
+        delay_timer_rearm(queue, handler);
         return;
     }
     // A delivery the DEADMAN's own deadline produced did real work (it ran the deadlock check), so
@@ -16850,16 +16852,16 @@ unsafe fn delay_timer_interrupt(
             print_str(b"\n");
         }
     }
-    delay_timer_rearm(queue);
+    delay_timer_rearm(queue, handler);
     // Timer 0 is level-triggered. Disable/rearm the comparator and clear the status before Ack
     // unmasks the IOAPIC line; acknowledging first lets the still-asserted line immediately storm.
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
     delay_timer_ack_irq();
 }
 
-unsafe fn delay_timer_shutdown(queue: &nt_delay_execution::Queue) {
+unsafe fn delay_timer_shutdown(queue: &nt_delay_execution::Queue, handler: &ExecNtHandler) {
     if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0
-        || delay_timer_next_deadline(queue).is_some()
+        || delay_timer_next_deadline(queue, handler).is_some()
     {
         return;
     }
@@ -16871,7 +16873,11 @@ unsafe fn delay_timer_shutdown(queue: &nt_delay_execution::Queue) {
     let _ = syscall5(SYS_SEND, 1, LBL_TCB_UNBIND_NOTIFICATION << 12, 0, 0, 0);
 }
 
-unsafe fn delay_cancel_thread(queue: &mut nt_delay_execution::Queue, thread_id: u64) {
+unsafe fn delay_cancel_thread(
+    queue: &mut nt_delay_execution::Queue,
+    handler: &ExecNtHandler,
+    thread_id: u64,
+) {
     while let Some(waiter) = queue.pop_thread(thread_id) {
         let cap = waiter.reply_cap;
         let deleted = cnode_delete_r(cap);
@@ -16893,7 +16899,7 @@ unsafe fn delay_cancel_thread(queue: &mut nt_delay_execution::Queue, thread_id: 
         print_u64(retyped);
         print_str(b"\n");
     }
-    delay_timer_rearm(queue);
+    delay_timer_rearm(queue, handler);
 }
 
 unsafe fn io_completion_cancel_thread(handler: &mut ExecNtHandler, thread_id: u64) {
@@ -17542,9 +17548,10 @@ unsafe fn terminate_hosted_thread_mechanism(
     delay_queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
 ) -> bool {
-    delay_cancel_thread(delay_queue, tid);
+    delay_cancel_thread(delay_queue, handler, tid);
     io_completion_cancel_thread(handler, tid);
-    delay_timer_rearm(delay_queue);
+    let _ = handler.user_timer_cancel_thread(tid);
+    delay_timer_rearm(delay_queue, handler);
     wait_cancel_thread(handler, tid);
     keyed_wait_cancel_thread(handler, tid);
     keyed_release_wait_cancel_thread(handler, tid);
@@ -17727,7 +17734,7 @@ unsafe fn terminate_hosted_process_mechanisms(
     }
     handler.clear_hosted_tp_worker_windows(process_index as usize);
     io_completion_cancel_process(handler, process_index);
-    delay_timer_rearm(delay_queue);
+    delay_timer_rearm(delay_queue, handler);
     reclaimed
 }
 
@@ -21539,17 +21546,6 @@ enum HostedThreadSpawnRequest {
 }
 
 #[derive(Clone, Copy)]
-struct UserTimerRecord {
-    object_index: u64,
-    due_100ns: u64,
-    period_100ns: u64,
-    active: bool,
-    apc_tid: u64,
-    apc_routine: u64,
-    apc_context: u64,
-}
-
-#[derive(Clone, Copy)]
 struct PendingWaitTimeout {
     deadline: nt_delay_execution::Deadline,
 }
@@ -21786,7 +21782,7 @@ struct ExecNtHandler {
     events: nt_kernel_exec::EventStore,
     /// Native waitable timers, keyed by `obj_ns` timer entries. Dispatcher signal state is stored in
     /// `events`; this table holds due-time, period, and optional APC metadata.
-    user_timers: alloc::vec::Vec<UserTimerRecord>,
+    user_timers: nt_user_timer::TimerTable,
     user_timer_rearm_requested: bool,
     /// Counting semaphore state keyed by the same stable namespace indices.
     semaphores: nt_kernel_exec::SemaphoreStore,

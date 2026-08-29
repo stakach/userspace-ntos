@@ -3030,7 +3030,7 @@ impl ExecNtHandler {
         write_field!(time_zone_information, time_zone_information);
         write_field!(obj_ns, build_initial_object_namespace());
         write_field!(events, nt_kernel_exec::EventStore::with_capacity(192));
-        write_field!(user_timers, alloc::vec::Vec::with_capacity(32));
+        write_field!(user_timers, nt_user_timer::TimerTable::with_capacity(32));
         write_field!(user_timer_rearm_requested, false);
         write_field!(
             semaphores,
@@ -26518,50 +26518,37 @@ impl ExecNtHandler {
             .then_some(index)
     }
 
-    fn user_timer_pos(&self, object_index: u64) -> Option<usize> {
+    fn user_timer_ensure(&mut self, object_index: u64) -> Result<(), u32> {
         self.user_timers
-            .iter()
-            .position(|timer| timer.object_index == object_index)
-    }
-
-    fn user_timer_ensure(&mut self, object_index: u64) -> Result<usize, u32> {
-        if let Some(pos) = self.user_timer_pos(object_index) {
-            return Ok(pos);
-        }
-        if self.user_timers.len() == self.user_timers.capacity() {
-            self.user_timers
-                .try_reserve(self.user_timers.capacity().max(16))
-                .map_err(|_| 0xC000_009A_u32)?;
-        }
-        self.user_timers.push(UserTimerRecord {
-            object_index,
-            due_100ns: u64::MAX,
-            period_100ns: 0,
-            active: false,
-            apc_tid: 0,
-            apc_routine: 0,
-            apc_context: 0,
-        });
-        Ok(self.user_timers.len() - 1)
+            .ensure(object_index)
+            .map_err(|_| 0xC000_009A)
     }
 
     fn user_timer_remove(&mut self, object_index: u64) {
-        if let Some(pos) = self.user_timer_pos(object_index) {
-            self.user_timers.remove(pos);
-            self.user_timer_refresh_next_deadline();
+        self.user_timer_remove_queued_apc(object_index);
+        if self.user_timers.remove(object_index) {
             self.user_timer_rearm_requested = true;
         }
     }
 
-    fn user_timer_refresh_next_deadline(&self) {
-        let deadline = self
-            .user_timers
-            .iter()
-            .filter(|timer| timer.active)
-            .map(|timer| timer.due_100ns)
-            .min()
-            .unwrap_or(u64::MAX);
-        USER_TIMER_NEXT_DEADLINE.store(deadline, Ordering::Relaxed);
+    fn user_timer_remove_queued_apc(&mut self, object_index: u64) {
+        let Some(apc) = self.user_timers.apc_target(object_index) else {
+            return;
+        };
+        let Ok(thread_id) = nt_process::ThreadId::try_from(apc.thread_id) else {
+            return;
+        };
+        let _ = self.pm.remove_kernel_user_apc(
+            thread_id,
+            nt_process::KernelUserApcSource::Timer(object_index),
+        );
+    }
+
+    pub(crate) fn user_timer_next_deadline(
+        &self,
+        now: nt_delay_execution::TimeSnapshot,
+    ) -> Option<u64> {
+        self.user_timers.next_deadline(now)
     }
 
     fn user_timer_previous_state(&self, object_index: u64) -> bool {
@@ -26572,107 +26559,100 @@ impl ExecNtHandler {
     }
 
     fn user_timer_cancel(&mut self, object_index: u64) -> bool {
-        let was_active = self
-            .user_timer_pos(object_index)
-            .map(|pos| {
-                let was_active = self.user_timers[pos].active;
-                self.user_timers[pos].active = false;
-                self.user_timers[pos].due_100ns = u64::MAX;
-                was_active
-            })
-            .unwrap_or(false);
-        self.user_timer_refresh_next_deadline();
+        self.user_timer_remove_queued_apc(object_index);
+        let was_active = self.user_timers.cancel(object_index);
         self.user_timer_rearm_requested = true;
         was_active
+    }
+
+    pub(crate) fn user_timer_cancel_thread(&mut self, thread_id: u64) -> usize {
+        let cancelled = self.user_timers.cancel_apcs_for_thread(thread_id);
+        if cancelled != 0 {
+            self.user_timer_rearm_requested = true;
+        }
+        cancelled
     }
 
     fn user_timer_set(
         &mut self,
         object_index: u64,
-        due_100ns: u64,
+        deadline: nt_delay_execution::Deadline,
         period_ms: u32,
         apc_tid: u64,
         apc_routine: u64,
         apc_context: u64,
     ) -> Result<bool, u32> {
-        let pos = self.user_timer_ensure(object_index)?;
-        let was_active = self.user_timers[pos].active;
-        let period_100ns = period_ms as u64 * 10_000;
-        self.user_timers[pos] = UserTimerRecord {
-            object_index,
-            due_100ns,
-            period_100ns,
-            active: due_100ns != u64::MAX,
-            apc_tid,
-            apc_routine,
-            apc_context,
-        };
-        self.user_timer_refresh_next_deadline();
+        let was_active = self
+            .user_timers
+            .set(
+                object_index,
+                deadline,
+                period_ms as u64 * 10_000,
+                nt_user_timer::ApcTarget {
+                    thread_id: apc_tid,
+                    routine: apc_routine,
+                    context: apc_context,
+                },
+            )
+            .map_err(|_| 0xC000_009A_u32)?;
         self.user_timer_rearm_requested = true;
         Ok(was_active)
     }
 
-    pub(crate) fn user_timer_fire_due(&mut self, now_100ns: u64) -> u64 {
+    pub(crate) fn user_timer_fire_due(
+        &mut self,
+        now: nt_delay_execution::TimeSnapshot,
+    ) -> u64 {
         let mut fired = 0u64;
-        let len = self.user_timers.len();
-        for pos in 0..len {
-            if !self.user_timers[pos].active || self.user_timers[pos].due_100ns > now_100ns {
-                continue;
-            }
-            let object_index = self.user_timers[pos].object_index;
-            let period = self.user_timers[pos].period_100ns;
-            let apc_tid = self.user_timers[pos].apc_tid;
-            let apc_routine = self.user_timers[pos].apc_routine;
-            let apc_context = self.user_timers[pos].apc_context;
-            if period == 0 {
-                self.user_timers[pos].active = false;
-                self.user_timers[pos].due_100ns = u64::MAX;
-            } else {
-                self.user_timers[pos].due_100ns = now_100ns.saturating_add(period);
-            }
-            if self.events.set_existing(object_index).is_some() {
-                fired += 1;
-            }
-            if apc_routine != 0 {
-                let status = match nt_process::ThreadId::try_from(apc_tid) {
-                    Ok(tid) => self
-                        .pm
-                        .queue_kernel_user_apc(
-                            tid,
-                            nt_process::UserApc {
-                                routine: apc_routine,
-                                normal_context: apc_context,
-                                system_argument1: now_100ns & 0xffff_ffff,
-                                system_argument2: (now_100ns >> 32) & 0xffff_ffff,
-                            },
-                        )
-                        .map(|_| nt_fs::STATUS_SUCCESS)
-                        .unwrap_or_else(|status| status),
-                    Err(_) => STATUS_INVALID_HANDLE,
+        while let Some(expiration) = self.user_timers.expire_next_due(now) {
+            let _ = self.events.set_existing(expiration.object_id);
+            fired += 1;
+            if expiration.apc.routine != 0 {
+                let (status, inserted) = match nt_process::ThreadId::try_from(
+                    expiration.apc.thread_id,
+                ) {
+                    Ok(tid) => match self.pm.queue_kernel_user_apc_once(
+                        tid,
+                        nt_process::KernelUserApcSource::Timer(expiration.object_id),
+                        nt_process::UserApc {
+                            routine: expiration.apc.routine,
+                            normal_context: expiration.apc.context,
+                            system_argument1: expiration.system_time_100ns & 0xffff_ffff,
+                            system_argument2: (expiration.system_time_100ns >> 32) & 0xffff_ffff,
+                        },
+                    ) {
+                        Ok(inserted) => (nt_fs::STATUS_SUCCESS, inserted),
+                        Err(status) => (status, false),
+                    },
+                    Err(_) => (STATUS_INVALID_HANDLE, false),
                 };
                 let trace = USER_TIMER_APC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if trace < 16 {
                     print_str(b"[timer] due object=");
-                    print_u64(object_index);
+                    print_u64(expiration.object_id);
                     print_str(b" tid=");
-                    print_u64(apc_tid);
+                    print_u64(expiration.apc.thread_id);
                     print_str(b" apc=0x");
-                    print_hex_u64(apc_routine);
+                    print_hex_u64(expiration.apc.routine);
                     print_str(b" context=0x");
-                    print_hex_u64(apc_context);
+                    print_hex_u64(expiration.apc.context);
                     print_str(b" status=0x");
                     print_hex(status);
+                    print_str(b" inserted=");
+                    print_u64(inserted as u64);
                     print_str(b"\n");
                 }
-                if status == nt_fs::STATUS_SUCCESS {
+                if inserted {
                     let _ = unsafe {
-                        crate::service_sec_image::reconcile_user_apc_waits(self, apc_tid)
+                        crate::service_sec_image::reconcile_user_apc_waits(
+                            self,
+                            expiration.apc.thread_id,
+                        )
                     };
                 }
             }
         }
         if fired != 0 {
-            self.user_timer_refresh_next_deadline();
             self.user_timer_rearm_requested = true;
         }
         fired
@@ -32152,58 +32132,30 @@ impl ExecNtHandler {
                     return 0xC000_0005;
                 }
                 let due_time = i64::from_le_bytes(due_bytes);
+                let now = nt_time_snapshot();
+                let deadline = nt_delay_execution::Deadline::from_nt_timeout(Some(due_time), now);
+                let due_now = deadline.is_due(now);
+                if (!due_now || period != 0) && !delay_timer_init() {
+                    return 0xC000_009A;
+                }
                 let previous = self.user_timer_previous_state(index as u64);
                 let _was_active = self.user_timer_cancel(index as u64);
                 let _ = self.events.reset_existing(index as u64);
-                let now = nt_time_snapshot();
-                let deadline = nt_delay_execution::due_time(
-                    due_time,
-                    now.monotonic_100ns,
-                    now.system_time_100ns,
-                );
-                if deadline.is_due(now) {
-                    let _ = self.events.set_existing(index as u64);
-                    let period_ms = period as u32;
-                    if period_ms != 0 {
-                        let deadline = now
-                            .monotonic_100ns
-                            .saturating_add(period_ms as u64 * 10_000);
-                        if self
-                            .user_timer_set(
-                                index as u64,
-                                deadline,
-                                period_ms,
-                                self.current_tid,
-                                apc_routine,
-                                apc_context,
-                            )
-                            .is_err()
-                        {
-                            return 0xC000_009A;
-                        }
-                    }
+                if self
+                    .user_timer_set(
+                        index as u64,
+                        deadline,
+                        period as u32,
+                        self.current_tid,
+                        apc_routine,
+                        apc_context,
+                    )
+                    .is_err()
+                {
+                    return 0xC000_009A;
+                }
+                if due_now && self.user_timer_fire_due(now) != 0 {
                     wait_wake_dispatcher_set(self);
-                } else {
-                    let Some(deadline) = deadline.monotonic_target(now) else {
-                        unreachable!("finite native timer produced an infinite deadline");
-                    };
-                    if self
-                        .user_timer_set(
-                            index as u64,
-                            deadline,
-                            period as u32,
-                            self.current_tid,
-                            apc_routine,
-                            apc_context,
-                        )
-                        .is_err()
-                    {
-                        return 0xC000_009A;
-                    }
-                    if !delay_timer_init() {
-                        self.user_timer_cancel(index as u64);
-                        return 0xC000_009A;
-                    }
                 }
                 if previous_state != 0
                     && !self.xas_try_write_buf(previous_state, &[u8::from(previous)])

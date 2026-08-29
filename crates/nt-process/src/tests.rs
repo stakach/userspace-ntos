@@ -433,6 +433,37 @@ fn kernel_user_apc_targets_resolved_thread_without_user_handle() {
 }
 
 #[test]
+fn kernel_owned_user_apc_is_unique_and_exactly_removable() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("owned-apc.exe", None, None);
+    let tid = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+    let timer_1 = KernelUserApcSource::Timer(1);
+    let timer_2 = KernelUserApcSource::Timer(2);
+    let apc_1 = UserApc {
+        routine: 0x1110,
+        normal_context: 0x2220,
+        system_argument1: 0x3330,
+        system_argument2: 0x4440,
+    };
+    let apc_2 = UserApc {
+        routine: 0x5550,
+        ..apc_1
+    };
+
+    assert_eq!(pm.queue_kernel_user_apc_once(tid, timer_1, apc_1), Ok(true));
+    assert_eq!(
+        pm.queue_kernel_user_apc_once(tid, timer_1, apc_2),
+        Ok(false)
+    );
+    assert_eq!(pm.queue_kernel_user_apc_once(tid, timer_2, apc_2), Ok(true));
+    assert!(pm.remove_kernel_user_apc(tid, timer_1));
+    assert!(!pm.remove_kernel_user_apc(tid, timer_1));
+    assert_eq!(pm.take_user_apc(tid), Some(apc_2));
+    assert_eq!(pm.take_user_apc(tid), None);
+    assert_eq!(pm.queue_kernel_user_apc_once(tid, timer_1, apc_1), Ok(true));
+}
+
+#[test]
 fn user_apc_queue_is_growable_fifo() {
     let mut pm = ProcessManager::new();
     let pid = pm.create_process("fifo.exe", None, None);

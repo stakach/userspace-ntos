@@ -85,6 +85,7 @@ nt-hosted-runtime = { path = "../../crates/nt-hosted-runtime" }
 nt-dll-registry = { path = "../../crates/nt-dll-registry" }
 nt-exe-image = { path = "../../crates/nt-exe-image" }
 nt-loader-trace = { path = "../../crates/nt-loader-trace" }
+nt-user-timer = { path = "../../crates/nt-user-timer" }
 nt-delay-execution = { path = "../../crates/nt-delay-execution" }
 nt-thread-start = { path = "../../crates/nt-thread-start" }
 nt-user-callback = { path = "../../crates/nt-user-callback" }

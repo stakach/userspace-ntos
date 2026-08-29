@@ -2388,7 +2388,7 @@ pub(crate) unsafe fn rearm_registered_delay_timer() -> bool {
     if handler_ptr.is_null() || queue_ptr.is_null() || !delay_timer_init() {
         return false;
     }
-    delay_timer_rearm(&*queue_ptr);
+    delay_timer_rearm(&*queue_ptr, &*handler_ptr);
     true
 }
 
@@ -2400,7 +2400,7 @@ unsafe fn delay_timer_rearm_after_park(
     if has_deadline {
         let _ = delay_timer_rearm_and_drain_overdue(queue, handler);
     } else {
-        delay_timer_rearm(queue);
+        delay_timer_rearm(queue, handler);
     }
 }
 
@@ -6391,7 +6391,7 @@ pub(crate) unsafe fn service_sec_image(
                 || WINLOGON_DIALOG_FB_VERIFIED.load(Ordering::Relaxed) != 0
                 || WINLOGON_LOGON_TOKEN_QUERIES.load(Ordering::Relaxed) != 0)
         {
-            crate::watchdog_arm(delay_queue);
+            crate::watchdog_arm(delay_queue, &nt_handler);
         }
         // ★ DRAIN timer ticks a COMPONENT PUMP absorbed. The HPET notification is bound to the root
         // TCB, so it can cancel ANY blocking recv the executive makes — including `pump_recv`'s,
@@ -9957,7 +9957,7 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.release_file_reference(file_id);
                 }
                 if nt_handler.user_timer_rearm_requested {
-                    delay_timer_rearm(delay_queue);
+                    delay_timer_rearm(delay_queue, &nt_handler);
                 }
                 park_lpc_receive = nt_handler.lpc_receive_park.take();
                 park_lpc_connect = nt_handler.lpc_connect_park.take();
@@ -17788,7 +17788,7 @@ pub(crate) unsafe fn service_sec_image(
 
         // The hosted receive loop is finished and has no delay waiter outstanding. Disable timer 0
         // and unbind its notification so a stale HPET signal cannot intercept later self-test recvs.
-        delay_timer_shutdown(delay_queue);
+        delay_timer_shutdown(delay_queue, &nt_handler);
         clear_service_delay_drain_context();
 
         // === Dbgk TARGET-SIDE BLOCKING SELF-TEST (POST-LOOP) — the keystone deferred item ==========
