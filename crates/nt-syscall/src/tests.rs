@@ -953,6 +953,7 @@ fn group_b2_out_writing_query_services_register() {
     // their queued out-writes after dispatch. QueryVolumeInformationFile reads a stack arg5.
     let pairs = [
         (NativeService::NtQuerySystemTime, 182u32),
+        (NativeService::NtSetSystemTime, 251),
         (NativeService::NtQueryPerformanceCounter, 173),
         (NativeService::NtQueryVolumeInformationFile, 187),
     ];
@@ -962,6 +963,7 @@ fn group_b2_out_writing_query_services_register() {
         assert_eq!(t.lookup(num).unwrap().service, svc);
     }
     assert_eq!(NativeService::NtQuerySystemTime.arg_count(), (1, 1));
+    assert_eq!(NativeService::NtSetSystemTime.arg_count(), (2, 2));
     assert_eq!(NativeService::NtQueryPerformanceCounter.arg_count(), (2, 2));
     assert_eq!(
         NativeService::NtQueryVolumeInformationFile.arg_count(),

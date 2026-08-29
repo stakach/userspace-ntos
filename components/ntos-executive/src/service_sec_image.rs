@@ -9331,6 +9331,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.user_apc_redirected = false;
                 nt_handler.context_continue_redirected = false;
                 nt_handler.user_timer_rearm_requested = false;
+                nt_handler.system_time_change = None;
                 nt_handler.out_writes_n = 0;
                 nt_handler.exe_spawn_request = None;
                 nt_handler.thread_spawn_request = None;
@@ -9956,7 +9957,14 @@ pub(crate) unsafe fn service_sec_image(
                     let _ = synchronous_file_release_and_wake(&mut nt_handler, file_id, owner_tid);
                     nt_handler.release_file_reference(file_id);
                 }
-                if nt_handler.user_timer_rearm_requested {
+                if nt_handler.system_time_change.take().is_some() {
+                    publish_kuser_clocks();
+                    exec_handler::publish_time_zone(
+                        &nt_handler.time_zone_information,
+                        nt_system_time_100ns(),
+                    );
+                    let _ = delay_timer_rearm_and_drain_overdue(delay_queue, &mut nt_handler);
+                } else if nt_handler.user_timer_rearm_requested {
                     delay_timer_rearm(delay_queue, &nt_handler);
                 }
                 park_lpc_receive = nt_handler.lpc_receive_park.take();

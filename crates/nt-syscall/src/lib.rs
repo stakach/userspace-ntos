@@ -150,6 +150,7 @@ pub enum NativeService {
     // System information (§16.5, §7.1)
     NtQuerySystemInformation,
     NtQuerySystemTime,
+    NtSetSystemTime,
     NtDelayExecution,
     NtYieldExecution,
     NtGetPlugPlayEvent,
@@ -372,6 +373,7 @@ impl NativeService {
             NtAccessCheckByTypeResultList => "NtAccessCheckByTypeResultList",
             NtQuerySystemInformation => "NtQuerySystemInformation",
             NtQuerySystemTime => "NtQuerySystemTime",
+            NtSetSystemTime => "NtSetSystemTime",
             NtDelayExecution => "NtDelayExecution",
             NtYieldExecution => "NtYieldExecution",
             NtGetPlugPlayEvent => "NtGetPlugPlayEvent",
@@ -648,6 +650,7 @@ impl NativeService {
         NativeService::NtSuspendThread,
         NativeService::NtQuerySymbolicLinkObject,
         NativeService::NtPrivilegeCheck,
+        NativeService::NtSetSystemTime,
         NativeService::NtImpersonateThread,
         NativeService::NtAdjustGroupsToken,
         NativeService::NtSetInformationToken,

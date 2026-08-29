@@ -2461,25 +2461,22 @@ fn effective_time_zone(
     )
 }
 
-unsafe fn publish_time_zone(
+pub(crate) unsafe fn publish_time_zone(
     information: &nt_kernel_exec::timezone::TimeZoneInformation,
     current_time: u64,
 ) {
     let effective = effective_time_zone(information, current_time);
     SYSTEM_TIME_ZONE_BIAS_100NS.store(effective.bias_100ns as u64, Ordering::Relaxed);
     SYSTEM_TIME_ZONE_ID.store(effective.id, Ordering::Relaxed);
-    for pi in 0..MAX_PI {
-        let alias = unsafe { kuser_page_alias_get(pi) };
-        if alias != 0 {
-            unsafe {
-                nt_ntdll_layout::kuser::publish_time_zone(
-                    alias as *mut u8,
-                    effective.bias_100ns,
-                    effective.id,
-                )
-            };
-        }
-    }
+    unsafe {
+        for_each_kuser_page_alias(|alias| {
+            nt_ntdll_layout::kuser::publish_time_zone(
+                alias as *mut u8,
+                effective.bias_100ns,
+                effective.id,
+            );
+        })
+    };
 }
 
 #[inline(never)]
@@ -3032,6 +3029,7 @@ impl ExecNtHandler {
         write_field!(events, nt_kernel_exec::EventStore::with_capacity(192));
         write_field!(user_timers, nt_user_timer::TimerTable::with_capacity(32));
         write_field!(user_timer_rearm_requested, false);
+        write_field!(system_time_change, None);
         write_field!(
             semaphores,
             nt_kernel_exec::SemaphoreStore::with_capacity(192)
@@ -17222,6 +17220,67 @@ impl ExecNtHandler {
             .is_some_and(|token| token.has_privilege(name))
     }
 
+    unsafe fn nt_set_system_time(&mut self, ctx: &NativeCallContext, args: &[u64]) -> u32 {
+        let new_time = args[0];
+        let previous_time = args[1];
+        if ctx.previous_mode != nt_syscall::ProcessorMode::KernelMode
+            && (new_time & 7 != 0 || previous_time != 0 && previous_time & 7 != 0)
+        {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        if new_time == 0
+            || !self.probe_user_input(new_time, 8)
+            || previous_time != 0 && !self.probe_user_output(previous_time, 8)
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let mut encoded = [0u8; 8];
+        if !self.xas_read(new_time, &mut encoded) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let captured = i64::from_le_bytes(encoded);
+        if captured < 0
+            || nt_time::validate_system_time(captured as u64)
+                == Err(nt_time::ClockError::InvalidSystemTime)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if ctx.previous_mode != nt_syscall::ProcessorMode::KernelMode
+            && !self.current_token_has_privilege(nt_security::SE_SYSTEM_TIME)
+        {
+            return STATUS_PRIVILEGE_NOT_HELD;
+        }
+
+        let change = match nt_set_system_time_100ns(captured as u64) {
+            Ok(change) => change,
+            Err(nt_time::ClockError::InvalidSystemTime) => return STATUS_INVALID_PARAMETER,
+            Err(nt_time::ClockError::MonotonicRegression) => return STATUS_UNSUCCESSFUL,
+        };
+        // Latch this before the optional copyout: NT has already moved the clock if that later
+        // write faults, so the service-loop tail must still publish and re-evaluate deadlines.
+        self.system_time_change = Some(change);
+        if previous_time != 0
+            && !self.xas_try_write_buf(previous_time, &change.previous_100ns.to_le_bytes())
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        print_str(b"[system-time] generation=");
+        print_u64(change.clock_generation);
+        print_str(b" previous=");
+        print_u64(change.previous_100ns);
+        print_str(b" current=");
+        print_u64(change.current_100ns);
+        print_str(b" delta=");
+        if change.delta_100ns < 0 {
+            print_str(b"-");
+            print_u64(change.delta_100ns.unsigned_abs().min(u64::MAX as u128) as u64);
+        } else {
+            print_u64((change.delta_100ns as u128).min(u64::MAX as u128) as u64);
+        }
+        print_str(b"\n");
+        0
+    }
+
     fn pnp_query(
         query_kind: u16,
         selector: u32,
@@ -30587,7 +30646,7 @@ impl ExecNtHandler {
                             publish_time_zone(&self.time_zone_information, current_time);
                         }
                         let output = SystemTimeOfDayInformation {
-                            boot_time_100ns: NT_SYSTEM_TIME_BOOT_100NS,
+                            boot_time_100ns: nt_system_boot_time_100ns(),
                             current_time_100ns: current_time,
                             time_zone_bias_100ns: effective.bias_100ns,
                             time_zone_id: effective.id,
@@ -34152,6 +34211,7 @@ impl ExecNtHandler {
                 self.queue_write(out, now);
                 0
             }
+            NativeService::NtSetSystemTime => unsafe { self.nt_set_system_time(ctx, args) },
             NativeService::NtDelayExecution => {
                 let alertable = nt_boolean_arg(args[0]);
                 let interval_ptr = args[1];

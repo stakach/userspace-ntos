@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-08-29
+Last updated: 2026-08-30
 
 ## Objective
 
@@ -16621,3 +16621,39 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     forward jump, and re-arm the shared HPET so backward jumps defer rather than prematurely expire
     absolute waits. Relative waits, periodic timers, interrupt time, and scheduler accounting must
     remain monotonic and unchanged.
+
+    Adjustable system-clock authority and `NtSetSystemTime` (2026-08-30, focused validation
+    complete): the executive now owns one generation-tracked `nt_time::AdjustableClock` anchored to
+    the independent HPET/TSC monotonic epoch. Every system-time snapshot reads that authority;
+    interrupt time, relative waits, scheduler accounting, and post-first-fire periodic timers remain
+    monotonic. `KeBootTime`-equivalent state moves by the same signed adjustment delta so
+    `SystemTimeOfDayInformation` continues to report invariant uptime.
+
+    SSN 251 is a typed, registered two-argument service. The handler probes and captures the new
+    `LARGE_INTEGER`, write-probes the optional previous-time output, enforces native alignment and
+    time bounds, and requires the effective token's enabled `SeSystemtimePrivilege` for user-mode
+    callers. A successful adjustment returns the exact previous time. Once the clock moves, an
+    explicit service-loop post-action publishes the new generation to KUSER_SHARED_DATA and current
+    timezone state before replying, then re-evaluates every tagged timeout/timer owner through the
+    shared HPET arbiter. Forward jumps drain newly due absolute waits in retained deadline order;
+    backward jumps move their comparator targets later. No scalar deadline or successful fallback
+    path was added.
+
+    KUSER publication now includes a growable, component-agnostic registry for persistent kernel
+    personality aliases in addition to dynamically indexed process aliases. Win32k registers its
+    writable high-canonical KUSER backing alias at load time, so its clock and timezone view no
+    longer freezes at DriverEntry; later kernel personalities use the same registration boundary
+    without another component-name branch. New process KUSER pages initialize from the authoritative
+    clock rather than reconstructing `boot + interrupt` independently.
+
+    Focused validation passes `nt-syscall` `70/70`, `nt-time` `7/7`, `nt-user-timer` `8/8`,
+    `git diff --check`, and the freestanding executive at the established 209-warning baseline.
+
+    Review adjustment: runtime wall-clock adjustment and absolute-deadline rebasing are closed. The
+    remaining time-system debt is the compile-time initial wall-clock epoch and the absent platform
+    persistent-clock boundary. Next define a small HAL/bootstrap real-time clock provider contract,
+    seed the executive clock from authoritative boot/platform data, and publish successful native
+    adjustments back through that provider when present. Implement the `NtSetSystemTime(NULL)`
+    timezone-refresh contract against the same authority rather than copying ReactOS's unimplemented
+    branch. Keep CMOS/bootloader policy outside the executive and do not replace the current constant
+    with another build-time date or silent fallback.

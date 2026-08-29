@@ -911,6 +911,8 @@ pub const SSN_NT_QUERY_SYSTEM_INFO: u64 = 0xb5;
 pub const SSN_NT_QUERY_VIRTUAL_MEM: u64 = 186;
 /// ntdll's NtQuerySystemTime SSN (csrss init reads the clock during CsrServerInitialization).
 pub const SSN_NT_QUERY_SYSTEM_TIME_SVC: u64 = 182;
+/// ReactOS x64 NtSetSystemTime(*NewTime, *PreviousTime).
+pub const SSN_NT_SET_SYSTEM_TIME: u64 = 251;
 /// ReactOS x64 NtDelayExecution(Alertable, *DelayInterval).
 pub const SSN_NT_DELAY_EXECUTION: u64 = 61;
 /// ReactOS x64 NtYieldExecution().
@@ -1604,6 +1606,10 @@ static VM_LOCK_RECLAIM_REFUSALS: AtomicU64 = AtomicU64::new(0);
 static KUSER_PAGE_ALIAS_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
 static KUSER_PAGE_ALIAS_STORE_FAILURES: AtomicU64 = AtomicU64::new(0);
 static mut KUSER_PAGE_ALIASES: alloc::vec::Vec<AtomicU64> = alloc::vec::Vec::new();
+/// Executive-visible aliases for persistent kernel personalities which map KUSER_SHARED_DATA.
+/// This registry is component-agnostic; a newly loaded personality registers its writable alias
+/// instead of adding another clock-publication special case.
+static mut KERNEL_KUSER_PAGE_ALIASES: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
 
 fn vm_free_frame_stats() -> nt_address_space::RecycledFramePoolStats {
     unsafe { (&*core::ptr::addr_of!(VM_FREE_FRAMES)).stats() }
@@ -1699,8 +1705,14 @@ pub(crate) unsafe fn reset_process_vm_state(slots: usize) -> bool {
 
 pub(crate) unsafe fn reset_kuser_page_aliases(slots: usize) -> bool {
     let aliases = &mut *core::ptr::addr_of_mut!(KUSER_PAGE_ALIASES);
+    let kernel_aliases = &mut *core::ptr::addr_of_mut!(KERNEL_KUSER_PAGE_ALIASES);
     aliases.clear();
+    kernel_aliases.clear();
     if aliases.try_reserve(slots).is_err() {
+        KUSER_PAGE_ALIAS_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    if kernel_aliases.try_reserve(4).is_err() {
         KUSER_PAGE_ALIAS_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
         return false;
     }
@@ -1708,6 +1720,35 @@ pub(crate) unsafe fn reset_kuser_page_aliases(slots: usize) -> bool {
         aliases.push(AtomicU64::new(0));
     }
     true
+}
+
+unsafe fn kuser_kernel_alias_register(alias: u64) -> bool {
+    if alias == 0 {
+        KUSER_PAGE_ALIAS_STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    let aliases = &mut *core::ptr::addr_of_mut!(KERNEL_KUSER_PAGE_ALIASES);
+    if aliases.contains(&alias) {
+        return true;
+    }
+    if aliases.try_reserve(1).is_err() {
+        KUSER_PAGE_ALIAS_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    aliases.push(alias);
+    true
+}
+
+unsafe fn for_each_kuser_page_alias(mut publish: impl FnMut(u64)) {
+    for pi in 0..MAX_PI {
+        let alias = kuser_page_alias_get(pi);
+        if alias != 0 {
+            publish(alias);
+        }
+    }
+    for &alias in &*core::ptr::addr_of!(KERNEL_KUSER_PAGE_ALIASES) {
+        publish(alias);
+    }
 }
 
 unsafe fn kuser_page_alias_put(pi: u64, alias: u64) -> bool {
@@ -3364,6 +3405,14 @@ const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_TCB_UNBIND_NOTIFICATION: u64 = 15;
 const LBL_IRQ_ACK: u64 = 31;
 const NT_SYSTEM_TIME_BOOT_100NS: u64 = 0x01DA_0000_0000_0000;
+/// System time is adjustable, while interrupt time remains monotonic. The executive service loop
+/// is the sole owner of this state, including nested dispatches, so all snapshots and adjustments
+/// are serialized through this one clock authority.
+static mut NT_SYSTEM_CLOCK: nt_time::AdjustableClock =
+    nt_time::AdjustableClock::new(0, NT_SYSTEM_TIME_BOOT_100NS);
+/// Like NT's KeBootTime, this moves by the same delta as a system-time adjustment so reported
+/// uptime remains invariant.
+static NT_SYSTEM_BOOT_TIME_100NS: AtomicI64 = AtomicI64::new(NT_SYSTEM_TIME_BOOT_100NS as i64);
 
 /// ADAPTIVE minimum arm distance, in 100ns units.
 ///
@@ -15910,11 +15959,7 @@ fn monotonic_time_100ns() -> u64 {
 }
 
 fn nt_time_snapshot_at(monotonic_100ns: u64) -> nt_delay_execution::TimeSnapshot {
-    nt_delay_execution::TimeSnapshot {
-        monotonic_100ns,
-        system_time_100ns: NT_SYSTEM_TIME_BOOT_100NS.saturating_add(monotonic_100ns),
-        clock_generation: 0,
-    }
+    unsafe { (&*core::ptr::addr_of!(NT_SYSTEM_CLOCK)).snapshot(monotonic_100ns) }
 }
 
 fn nt_time_snapshot() -> nt_delay_execution::TimeSnapshot {
@@ -15925,18 +15970,32 @@ fn nt_system_time_100ns() -> u64 {
     nt_time_snapshot().system_time_100ns
 }
 
+fn nt_system_boot_time_100ns() -> u64 {
+    NT_SYSTEM_BOOT_TIME_100NS.load(Ordering::Acquire) as u64
+}
+
+unsafe fn nt_set_system_time_100ns(
+    new_system_time_100ns: u64,
+) -> Result<nt_time::SystemTimeChange, nt_time::ClockError> {
+    let monotonic_100ns = monotonic_time_100ns();
+    let change = (&mut *core::ptr::addr_of_mut!(NT_SYSTEM_CLOCK))
+        .set_system_time(monotonic_100ns, new_system_time_100ns)?;
+    let previous_boot = NT_SYSTEM_BOOT_TIME_100NS.load(Ordering::Relaxed) as i128;
+    let adjusted_boot = previous_boot + change.delta_100ns;
+    debug_assert!(adjusted_boot >= i64::MIN as i128 && adjusted_boot <= i64::MAX as i128);
+    NT_SYSTEM_BOOT_TIME_100NS.store(adjusted_boot as i64, Ordering::Release);
+    Ok(change)
+}
+
 unsafe fn publish_kuser_clocks() {
     let now = nt_time_snapshot();
-    for pi in 0..MAX_PI {
-        let alias = kuser_page_alias_get(pi);
-        if alias != 0 {
-            nt_ntdll_layout::kuser::publish_clocks(
-                alias as *mut u8,
-                now.monotonic_100ns,
-                now.system_time_100ns,
-            );
-        }
-    }
+    for_each_kuser_page_alias(|alias| {
+        nt_ntdll_layout::kuser::publish_clocks(
+            alias as *mut u8,
+            now.monotonic_100ns,
+            now.system_time_100ns,
+        );
+    });
     KUSER_CLOCK_PUBLISH_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -21784,6 +21843,10 @@ struct ExecNtHandler {
     /// `events`; this table holds due-time, period, and optional APC metadata.
     user_timers: nt_user_timer::TimerTable,
     user_timer_rearm_requested: bool,
+    /// Set only after the authoritative system clock moved. The service-loop tail consumes this
+    /// before replying so KUSER publication and absolute-deadline re-evaluation are inseparable
+    /// from a successful clock adjustment.
+    system_time_change: Option<nt_time::SystemTimeChange>,
     /// Counting semaphore state keyed by the same stable namespace indices.
     semaphores: nt_kernel_exec::SemaphoreStore,
     /// Mutant state keyed by the same stable namespace indices.
@@ -24045,6 +24108,10 @@ fn build_nt_table() -> NativeServiceTable {
             (
                 NativeService::NtQuerySystemTime,
                 SSN_NT_QUERY_SYSTEM_TIME_SVC as u32,
+            ),
+            (
+                NativeService::NtSetSystemTime,
+                SSN_NT_SET_SYSTEM_TIME as u32,
             ),
             (
                 NativeService::NtDelayExecution,
@@ -28689,6 +28756,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 CAP_INIT_THREAD_VSPACE,
             );
             img_spawn::initialize_kuser_snapshot(win32k_subsystem::WIN32K_KUSER_SCRATCH_VA);
+            if !kuser_kernel_alias_register(win32k_subsystem::WIN32K_KUSER_SCRATCH_VA) {
+                panic!("win32k KUSER publisher registration failed");
+            }
             // Parse + copy sections + relocate + patch IAT. Fully HEAP-FREE + STACK-light: the
             // 128 KiB bump heap is exhausted by this point (after smss/csrss) and the rootserver
             // stack is only 16 KiB — load_into parses win32k.sys manually and records the W^X

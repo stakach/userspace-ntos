@@ -474,6 +474,7 @@ pub(crate) unsafe fn build_sec_image_text() -> alloc::vec::Vec<u8> {
 
 pub(crate) unsafe fn initialize_kuser_snapshot(scratch_va: u64) {
     let interrupt_time = monotonic_time_100ns();
+    let time = nt_time_snapshot_at(interrupt_time);
     let processor = exec_handler::native_processor_information();
     let page = unsafe { &mut *(scratch_va as *mut [u8; nt_ntdll_layout::kuser::PAGE_SIZE]) };
     nt_ntdll_layout::kuser::initialize_page(
@@ -492,7 +493,7 @@ pub(crate) unsafe fn initialize_kuser_snapshot(scratch_va: u64) {
             cookie: SYSTEM_POINTER_COOKIE,
         },
         interrupt_time,
-        NT_SYSTEM_TIME_BOOT_100NS.saturating_add(interrupt_time),
+        time.system_time_100ns,
     );
     nt_ntdll_layout::kuser::update_time_zone(
         page,
