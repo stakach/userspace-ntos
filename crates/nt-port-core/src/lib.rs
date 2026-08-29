@@ -296,8 +296,10 @@ struct Connection {
     server_api: PortApi,
     /// Client-side comm-port handle (returned to the connector on complete).
     client_handle: u64,
+    client_open: bool,
     /// Server-side comm-port handle (from accept).
     server_handle: u64,
+    server_open: bool,
     port_context: u64,
     /// Messages destined FOR the client (sent BY the server).
     client_inbox: Vec<QueuedMessage>,
@@ -423,7 +425,7 @@ impl PortCore {
             });
         }
         self.connections.iter().find_map(|conn| {
-            if conn.client_handle == handle {
+            if conn.client_open && conn.client_handle == handle {
                 Some(PortHandleInfo {
                     endpoint: PortHandleEndpoint::ClientCommPort,
                     connection_id: conn.id,
@@ -434,7 +436,7 @@ impl PortCore {
                     limits: conn.limits,
                     security: Some(conn.security),
                 })
-            } else if conn.server_handle == handle {
+            } else if conn.server_open && conn.server_handle == handle {
                 Some(PortHandleInfo {
                     endpoint: PortHandleEndpoint::ServerCommPort,
                     connection_id: conn.id,
@@ -702,6 +704,7 @@ impl PortCore {
             conn.server_handle = next;
             self.next_handle += 1;
         }
+        conn.server_open = true;
         Ok(self
             .conn(connection_id)
             .map(|c| c.server_handle)
@@ -722,23 +725,33 @@ impl PortCore {
             conn.client_handle = next;
             self.next_handle += 1;
         }
+        conn.client_open = true;
         Ok((conn.client_handle, conn.id))
     }
 
-    /// Close a listen or communication-port handle. Closing either communication endpoint
-    /// disconnects the connection and invalidates queued/delivered request state.
+    /// Close a listen or communication-port handle. Communication endpoints own independent
+    /// references: closing the server endpoint disconnects future traffic but does not discard a
+    /// reply that was already committed to the still-open client endpoint.
     pub fn close_port(&mut self, port_handle: u64) {
         if let Some(pos) = self.ports.iter().position(|p| p.handle == port_handle) {
             self.ports.remove(pos);
             return;
         }
         if let Some(connection) = self.connections.iter_mut().find(|connection| {
-            port_handle != 0
-                && (connection.client_handle == port_handle
-                    || connection.server_handle == port_handle)
+            port_handle != 0 && connection.client_open && connection.client_handle == port_handle
         }) {
+            connection.client_open = false;
             connection.state = ConnState::Refused;
             connection.client_inbox.clear();
+            connection.server_inbox.clear();
+            connection.delivered_requests.clear();
+            return;
+        }
+        if let Some(connection) = self.connections.iter_mut().find(|connection| {
+            port_handle != 0 && connection.server_open && connection.server_handle == port_handle
+        }) {
+            connection.server_open = false;
+            connection.state = ConnState::Refused;
             connection.server_inbox.clear();
             connection.delivered_requests.clear();
         }
@@ -748,6 +761,11 @@ impl PortCore {
     pub fn disconnect(&mut self, connection_id: u64) {
         if let Some(conn) = self.connections.iter_mut().find(|c| c.id == connection_id) {
             conn.state = ConnState::Refused;
+            conn.client_open = false;
+            conn.server_open = false;
+            conn.client_inbox.clear();
+            conn.server_inbox.clear();
+            conn.delivered_requests.clear();
         }
     }
 
@@ -771,7 +789,7 @@ impl PortCore {
             request_identity: None,
         };
         for conn in self.connections.iter_mut() {
-            if conn.state != ConnState::Connected {
+            if conn.state != ConnState::Connected || !conn.client_open || !conn.server_open {
                 continue;
             }
             if from_handle != 0 && conn.client_handle == from_handle {
@@ -802,7 +820,12 @@ impl PortCore {
             let conn = self
                 .connections
                 .iter_mut()
-                .find(|conn| conn.id == connection_id && conn.state == ConnState::Connected)
+                .find(|conn| {
+                    conn.id == connection_id
+                        && conn.state == ConnState::Connected
+                        && conn.client_open
+                        && conn.server_open
+                })
                 .ok_or(NtStatus::INVALID_HANDLE)?;
             if bytes.len() > conn.limits.max_message as usize {
                 return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
@@ -831,6 +854,8 @@ impl PortCore {
             .iter_mut()
             .find(|connection| {
                 connection.state == ConnState::Connected
+                    && connection.client_open
+                    && connection.server_open
                     && from_handle != 0
                     && connection.client_handle == from_handle
             })
@@ -864,6 +889,8 @@ impl PortCore {
         }
         if let Some(connection) = self.connections.iter_mut().find(|connection| {
             connection.state == ConnState::Connected
+                && connection.client_open
+                && connection.server_open
                 && from_handle != 0
                 && connection.server_handle == from_handle
         }) {
@@ -895,6 +922,8 @@ impl PortCore {
             .iter_mut()
             .find(|connection| {
                 connection.state == ConnState::Connected
+                    && connection.client_open
+                    && connection.server_open
                     && connection.server_api == port.api
                     && connection.port_name == port.name
                     && connection
@@ -932,18 +961,14 @@ impl PortCore {
         if identity.message_id == 0 {
             return Err(NtStatus::REPLY_MESSAGE_MISMATCH);
         }
-        if self
-            .connections
-            .iter()
-            .any(|connection| port_handle != 0 && connection.client_handle == port_handle)
-        {
+        if self.connections.iter().any(|connection| {
+            port_handle != 0 && connection.client_open && connection.client_handle == port_handle
+        }) {
             return Err(NtStatus::INVALID_PORT_HANDLE);
         }
-        if let Some(connection) = self
-            .connections
-            .iter()
-            .find(|connection| port_handle != 0 && connection.server_handle == port_handle)
-        {
+        if let Some(connection) = self.connections.iter().find(|connection| {
+            port_handle != 0 && connection.server_open && connection.server_handle == port_handle
+        }) {
             if connection.state != ConnState::Connected {
                 return Err(NtStatus::PORT_DISCONNECTED);
             }
@@ -967,6 +992,8 @@ impl PortCore {
             .iter()
             .find(|connection| {
                 connection.state == ConnState::Connected
+                    && connection.client_open
+                    && connection.server_open
                     && connection.server_api == port.api
                     && connection.port_name == port.name
                     && connection
@@ -986,12 +1013,15 @@ impl PortCore {
     /// Returns `Ok(None)` when the inbox is empty (would-block).
     pub fn receive_message(&mut self, handle: u64) -> Result<Option<QueuedMessage>, NtStatus> {
         for conn in self.connections.iter_mut() {
-            if handle != 0 && conn.client_handle == handle {
-                return Ok(if conn.client_inbox.is_empty() {
-                    None
+            if handle != 0 && conn.client_open && conn.client_handle == handle {
+                if !conn.client_inbox.is_empty() {
+                    return Ok(Some(conn.client_inbox.remove(0)));
+                }
+                return if conn.state == ConnState::Connected && conn.server_open {
+                    Ok(None)
                 } else {
-                    Some(conn.client_inbox.remove(0))
-                });
+                    Err(NtStatus::PORT_DISCONNECTED)
+                };
             }
         }
         let port_index = self
@@ -1002,6 +1032,8 @@ impl PortCore {
         if let Some(port_index) = port_index {
             let connection_index = self.connections.iter().position(|conn| {
                 conn.state == ConnState::Connected
+                    && conn.client_open
+                    && conn.server_open
                     && conn.server_api == self.ports[port_index].api
                     && conn.port_name == self.ports[port_index].name
                     && !conn.server_inbox.is_empty()
@@ -1031,10 +1063,9 @@ impl PortCore {
     /// connection port. Resolve that shared receive queue without exposing a second identity to API
     /// adapters.
     fn connection_port_index_for_server_handle(&self, handle: u64) -> Option<usize> {
-        let connection = self
-            .connections
-            .iter()
-            .find(|connection| handle != 0 && connection.server_handle == handle)?;
+        let connection = self.connections.iter().find(|connection| {
+            handle != 0 && connection.server_open && connection.server_handle == handle
+        })?;
         self.ports
             .iter()
             .position(|port| port.api == connection.server_api && port.name == connection.port_name)
@@ -1084,7 +1115,9 @@ impl Connection {
             client_api,
             server_api,
             client_handle,
+            client_open: client_handle != 0,
             server_handle: 0,
+            server_open: state == ConnState::Connected,
             port_context: 0,
             client_inbox: Vec::new(),
             server_inbox: Vec::new(),
@@ -1462,6 +1495,48 @@ mod tests {
         assert_eq!(core.connection_state(connection), Some(ConnState::Refused));
         assert_eq!(
             core.delivered_request(server, identity),
+            Err(NtStatus::PORT_DISCONNECTED)
+        );
+    }
+
+    #[test]
+    fn server_close_preserves_an_already_committed_client_reply() {
+        let mut core = PortCore::new();
+        core.set_accept_policy(AcceptPolicy::Manual);
+        let client_id = ClientId {
+            process: 0x120,
+            thread: 0x124,
+        };
+        let listen = core.create_port(&utf16("\\P"), PortApi::Lpc);
+        let connection = match core
+            .connect_with_client_id(&utf16("\\P"), PortApi::Lpc, 0, &[], client_id)
+            .unwrap()
+        {
+            ConnectOutcome::Pending { connection_id } => connection_id,
+            _ => unreachable!(),
+        };
+        core.receive(listen).unwrap();
+        let server = core.accept(connection, true, 0).unwrap();
+        let client = core.complete(connection).unwrap().0;
+        let identity = MessageIdentity {
+            client: client_id,
+            message_id: 9,
+        };
+        core.send_request_message(client, b"request", MessageAttrs::default(), identity)
+            .unwrap();
+        core.receive_message(server).unwrap().unwrap();
+        core.send_reply_message(server, b"reply", MessageAttrs::default(), identity)
+            .unwrap();
+
+        core.close_port(server);
+        assert!(core.handle_info(server).is_none());
+        assert!(core.handle_info(client).is_some());
+        assert_eq!(
+            core.receive_message(client).unwrap().unwrap().bytes,
+            b"reply"
+        );
+        assert_eq!(
+            core.receive_message(client),
             Err(NtStatus::PORT_DISCONNECTED)
         );
     }
