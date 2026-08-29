@@ -11,7 +11,6 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
     cid_proc: u64,
     cid_thread: u64,
     main_fault_ep: u64,
-    resume: bool,
 ) -> HostedThreadSpawnResult {
     let (scr, teb_va, stack_base, stack_frames, ipcbuf_va, tramp_va, stack_mirror_va, badge) =
         match slot {
@@ -71,7 +70,6 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
             fault_ep: worker_ep,
             cid_proc,
             cid_thread,
-            resume,
             prio: 106, // above winlogon-main(102) so it runs when winlogon's main parks/blocks
             // BATCH 19: winlogon (pi 2) runs on OUR ntdll's NATIVE seL4-Call transport, so its rpcrt4
             // server WORKER thread must too. All three worker slots run in winlogon's VSpace (pi 2) with
@@ -110,7 +108,6 @@ pub(crate) unsafe fn spawn_tp_worker_thread(
     cid_proc: u64,
     cid_thread: u64,
     main_fault_ep: u64,
-    resume: bool,
 ) -> HostedThreadSpawnResult {
     if pi >= MAX_PI || worker_slot >= TP_WORKER_SLOT_COUNT {
         return HostedThreadSpawnResult::failed();
@@ -131,7 +128,6 @@ pub(crate) unsafe fn spawn_tp_worker_thread(
             fault_ep: worker_ep,
             use_loader: true,
             native: true,
-            resume,
         },
     )
 }
@@ -157,8 +153,6 @@ pub(crate) struct RemoteThreadSpawn {
     /// NATIVE seL4-Call transport (our ntdll). Hosted threads still get rust-micro's hybrid
     /// hosted-syscalls flag; this tells the executive-side spawn which ntdll entry path to use.
     pub native: bool,
-    /// Resume immediately, or leave suspended (`CreateSuspended`).
-    pub resume: bool,
 }
 
 /// ★ THE GENERAL CROSS-VSPACE THREAD SPAWN — `PspCreateThread`'s mechanism half.
@@ -193,7 +187,6 @@ pub(crate) unsafe fn spawn_slot_thread(
         fault_ep,
         use_loader,
         native,
-        resume,
     } = *spawn;
     if target_pi >= MAX_PI || slot >= TP_WORKER_SLOT_COUNT || pml4 == 0 || fault_ep == 0 {
         return HostedThreadSpawnResult::failed();
@@ -240,7 +233,6 @@ pub(crate) unsafe fn spawn_slot_thread(
             fault_ep,
             cid_proc,
             cid_thread,
-            resume,
             prio: 106,
             native,
             diag: false,
@@ -262,7 +254,6 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
     cid_proc: u64,
     cid_thread: u64,
     main_fault_ep: u64,
-    resume: bool,
 ) -> HostedThreadSpawnResult {
     let listener_ep = mint_badged(main_fault_ep, SVC_LISTENER_BADGE);
     let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
@@ -288,7 +279,6 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
             fault_ep: listener_ep,
             cid_proc,
             cid_thread,
-            resume,
             prio: 104, // above winlogon(102)/services(103) so it runs when services' main parks
             // BATCH 33: services (pi 3) runs on OUR ntdll's NATIVE seL4-Call transport, so its SCM RPC
             // listener thread must too. native:true plus its TEB-derived private IPC buffer makes its
@@ -315,7 +305,6 @@ pub(crate) unsafe fn spawn_lsass_listener_thread(
     cid_proc: u64,
     cid_thread: u64,
     main_fault_ep: u64,
-    resume: bool,
 ) -> HostedThreadSpawnResult {
     let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER_BADGE);
     let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
@@ -341,7 +330,6 @@ pub(crate) unsafe fn spawn_lsass_listener_thread(
             fault_ep: listener_ep,
             cid_proc,
             cid_thread,
-            resume,
             prio: 105, // above winlogon(102)/services(103)/svc-listener(104) so it runs once lsass' main parks/blocks
             // BATCH 24: lsass (pi 4) runs on OUR ntdll's NATIVE seL4-Call transport, so its LSA server
             // thread must too. native:true makes its Call dispatch (MR0=SSN) through its TEB-derived
@@ -365,7 +353,6 @@ pub(crate) unsafe fn spawn_lsass_listener2_thread(
     cid_proc: u64,
     cid_thread: u64,
     main_fault_ep: u64,
-    resume: bool,
 ) -> HostedThreadSpawnResult {
     let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER2_BADGE);
     let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
@@ -391,7 +378,6 @@ pub(crate) unsafe fn spawn_lsass_listener2_thread(
             fault_ep: listener_ep,
             cid_proc,
             cid_thread,
-            resume,
             prio: 105,
             // BATCH 24: native transport (mirror listener1) — lsass runs on our native ntdll.
             native: true,
@@ -408,7 +394,6 @@ pub(crate) unsafe fn spawn_lsass_listener3_thread(
     cid_proc: u64,
     cid_thread: u64,
     main_fault_ep: u64,
-    resume: bool,
 ) -> HostedThreadSpawnResult {
     let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER3_BADGE);
     let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
@@ -434,7 +419,6 @@ pub(crate) unsafe fn spawn_lsass_listener3_thread(
             fault_ep: listener_ep,
             cid_proc,
             cid_thread,
-            resume,
             prio: 105,
             // BATCH 24: native transport (mirror listener1) — lsass runs on our native ntdll.
             native: true,

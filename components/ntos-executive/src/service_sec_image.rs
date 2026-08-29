@@ -3447,18 +3447,11 @@ enum HostedMultiplexedThreadSpawner {
 }
 
 #[derive(Clone, Copy)]
-enum HostedThreadResumeMode {
-    PoolState,
-}
-
-#[derive(Clone, Copy)]
 struct HostedThreadSpawnSpec {
     owner_role: nt_exe_image::HostedProcessRole,
-    teb: u64,
     badge: u64,
     role: HostedThreadRole,
     spawner: HostedMultiplexedThreadSpawner,
-    resume: HostedThreadResumeMode,
     spawn_prefix: &'static [u8],
     spawned_prefix: &'static [u8],
     spawned_suffix: &'static [u8],
@@ -3470,44 +3463,36 @@ fn hosted_multiplexed_thread_spawn_for(
     match kind {
         HostedMultiplexedThreadKind::ServicesListener => Some(HostedThreadSpawnSpec {
             owner_role: nt_exe_image::HostedProcessRole::ServiceControlManager,
-            teb: SVC_LISTENER_TEB_VA,
             badge: SVC_LISTENER_BADGE,
             role: HostedThreadRole::ServicesListener,
             spawner: HostedMultiplexedThreadSpawner::ServicesListener,
-            resume: HostedThreadResumeMode::PoolState,
             spawn_prefix: b"[svc-thread] spawning + RESUMING REAL RPC listener thread: entry=0x",
             spawned_prefix: b"[svc-thread] spawned + resumed tcb=0x",
             spawned_suffix: b" (runs into the main multiplex, badge 7)\n",
         }),
         HostedMultiplexedThreadKind::LsassListener { slot: 0 } => Some(HostedThreadSpawnSpec {
             owner_role: nt_exe_image::HostedProcessRole::LocalSecurityAuthority,
-            teb: LSASS_LISTENER_TEB_VA,
             badge: LSASS_LISTENER_BADGE,
             role: HostedThreadRole::LsassListener,
             spawner: HostedMultiplexedThreadSpawner::LsassListener,
-            resume: HostedThreadResumeMode::PoolState,
             spawn_prefix: b"[lsass-thread] spawning + RESUMING REAL LSA server thread: entry=0x",
             spawned_prefix: b"[lsass-thread] spawned + resumed tcb=0x",
             spawned_suffix: b" (runs into the main multiplex, badge 9)\n",
         }),
         HostedMultiplexedThreadKind::LsassListener { slot: 1 } => Some(HostedThreadSpawnSpec {
             owner_role: nt_exe_image::HostedProcessRole::LocalSecurityAuthority,
-            teb: LSASS_LISTENER2_TEB_VA,
             badge: LSASS_LISTENER2_BADGE,
             role: HostedThreadRole::LsassListener2,
             spawner: HostedMultiplexedThreadSpawner::LsassListener2,
-            resume: HostedThreadResumeMode::PoolState,
             spawn_prefix: b"[lsass-thread2] spawning + RESUMING 2nd LSA server thread: entry=0x",
             spawned_prefix: b"[lsass-thread2] spawned + resumed tcb=0x",
             spawned_suffix: b" (runs into the main multiplex, badge 10)\n",
         }),
         HostedMultiplexedThreadKind::LsassListener { slot: 2 } => Some(HostedThreadSpawnSpec {
             owner_role: nt_exe_image::HostedProcessRole::LocalSecurityAuthority,
-            teb: LSASS_LISTENER3_TEB_VA,
             badge: LSASS_LISTENER3_BADGE,
             role: HostedThreadRole::LsassListener3,
             spawner: HostedMultiplexedThreadSpawner::LsassListener3,
-            resume: HostedThreadResumeMode::PoolState,
             spawn_prefix: b"[lsass-thread3] spawning + RESUMING 3rd LSA worker: entry=0x",
             spawned_prefix: b"[lsass-thread3] spawned + resumed tcb=0x",
             spawned_suffix: b" (runs into the main multiplex, badge 14)\n",
@@ -9840,6 +9825,23 @@ pub(crate) unsafe fn service_sec_image(
                     print_u64(allocator::HEAP_FRAMES * 0x1000);
                     print_str(b"\n");
                 }
+                // Thread creation is a cross-subsystem transaction. Mechanism admission, MM/Ps
+                // commitment, ETHREAD activation, and handle publication all complete before any
+                // success out-param is copied to the caller.
+                if let Some(request) = nt_handler.thread_spawn_request.take() {
+                    if let Err(status) =
+                        spawn_requested_local_thread(&mut nt_handler, request, &*procs, fault_ep)
+                    {
+                        result = u64::from(status);
+                    }
+                }
+                if let Some(request) = nt_handler.remote_thread_request.take() {
+                    if let Err(status) =
+                        spawn_requested_remote_thread(&mut nt_handler, &request, fault_ep)
+                    {
+                        result = u64::from(status);
+                    }
+                }
                 // Drain queued out-param writes (group B2): csrss out-ptrs may be arbitrary VAs that
                 // need a persistent image-page alias; other hosted processes can also return values
                 // to DLL globals. Use the handler's common cross-address-space writer for both.
@@ -10086,15 +10088,6 @@ pub(crate) unsafe fn service_sec_image(
                         let _ = exe_images.rollback_spawn(request);
                         result = u64::from(nt_process::STATUS_INVALID_PARAMETER);
                     }
-                }
-                if let Some(request) = nt_handler.thread_spawn_request.take() {
-                    spawn_requested_local_thread(&mut nt_handler, request, &*procs, fault_ep);
-                }
-                // ★ CROSS-VSPACE NtCreateThread: the handler decided the policy; build the REAL
-                // thread inside the TARGET's address space here, where the main fault endpoint the
-                // new thread must be badged onto is in scope. `None` on every boot today.
-                if let Some(request) = nt_handler.remote_thread_request.take() {
-                    spawn_requested_remote_thread(&mut nt_handler, &request, fault_ep);
                 }
             } else if m0 >= win32k_subsystem::WIN32K_SERVICE_BASE
                 && (hosted_non_native_top_level_badge(&nt_handler, badge)
@@ -19152,10 +19145,7 @@ pub(crate) unsafe fn service_sec_image(
                 .unwrap_or(0);
             // The target's pre-created spare ETHREAD pool — the same reset-safe pool every hosted
             // process gets at boot, and what a runtime thread create draws from.
-            let pool_tid = nt_handler
-                .pm
-                .create_thread(target, 0, 0, false)
-                .unwrap_or(0);
+            let pool_tid = nt_handler.pm.create_dormant_thread(target).unwrap_or(0);
             let target_registered = nt_handler
                 .register_temporary_process_slot(BRK_TEST_PI, target, target_pml4)
                 .is_ok();
@@ -19227,7 +19217,8 @@ pub(crate) unsafe fn service_sec_image(
                     let marks_before = DBGK_PEB_MARKS.load(Ordering::Relaxed);
                     let attached = sysc!(SSN_NT_DEBUG_ACTIVE_PROCESS, &[h_target, dbg_handle]) == 0
                         && nt_handler.pm.process_debug_port(target) == Some(object);
-                    // `DbgkpPostFakeProcessCreateMessages` posts one message per live thread.
+                    // Drain every fake thread/module message. Dormant pool identities are not live
+                    // threads and therefore do not contribute to this cardinality.
                     let mut drained = 0u64;
                     while attached && drained < 8 {
                         if sysc!(
@@ -19252,7 +19243,7 @@ pub(crate) unsafe fn service_sec_image(
                         drained += 1;
                     }
                     if attached
-                        && drained == 2
+                        && drained != 0
                         && nt_handler
                             .pm
                             .debug_object(object)
@@ -19325,31 +19316,81 @@ pub(crate) unsafe fn service_sec_image(
                             0,
                         ]
                     );
+                    let request = nt_handler.remote_thread_request.take();
+                    let publication_invisible = request.is_some_and(|request| {
+                        smss_stack_read(A_THREAD_HANDLE) == 0
+                            && smss_stack_read(A_CID_OUT) == 0
+                            && smss_stack_read(A_CID_OUT + 8) == 0
+                            && nt_handler
+                                .pm
+                                .lookup_handle(
+                                    debugger_pid,
+                                    request.publication.handle() as nt_process::Handle,
+                                )
+                                .is_none()
+                    });
+
+                    // ── 0x0010 — ★ THE REMOTE THREAD REALLY RUNS IN THE TARGET'S VSPACE.
+                    // Build the mechanism through the same entry the loop uses; the thread's own
+                    // stack/TEB/IPC buffer are mapped in the TARGET's pml4, and the marker it writes
+                    // lands in a page that exists ONLY there.
+                    let mut spawned_tcb = 0u64;
+                    let mut breakin_runtime_slot = 0usize;
+                    if let Some(request) = request {
+                        breakin_runtime_slot = request.slot;
+                        let spawned = rendezvous::spawn_slot_thread(
+                            &mut nt_handler,
+                            &rendezvous::RemoteThreadSpawn {
+                                target_pi: request.target_pi,
+                                slot: request.slot,
+                                pml4: request.pml4,
+                                start: request.start,
+                                cid_proc: request.cid_proc,
+                                cid_thread: request.cid_thread,
+                                fault_ep: brk_ep,
+                                // The throwaway target has no ntdll mapped, so enter the start routine
+                                // directly and keep the hosted-syscalls trap (its exit `syscall` is
+                                // delivered here as an UnknownSyscall fault).
+                                use_loader: false,
+                                native: false,
+                            },
+                        );
+                        spawned_tcb = spawned.tcb();
+                        if spawned_tcb != 0 {
+                            let registered = nt_handler.register_hosted_thread_spawn(
+                                BRK_TEST_PI,
+                                request.cid_thread,
+                                spawned,
+                                tp_worker_badge(BRK_TEST_PI, request.slot),
+                                HostedThreadRole::TpWorker { slot: request.slot },
+                            );
+                            if registered {
+                                if request.resume {
+                                    assert_eq!(tcb_resume(spawned_tcb), 0);
+                                }
+                                nt_handler.commit_hosted_thread_publication(request.publication);
+                                for k in 0..nt_handler.out_writes_n {
+                                    let (ptr, val) = nt_handler.out_writes[k];
+                                    let _ = nt_handler.xas_write_u64(ptr, val);
+                                }
+                                nt_handler.out_writes_n = 0;
+                                spawned_breakin_tid = request.cid_thread;
+                                PM_REMOTE_THREADS_SPAWNED.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
                     let thread_handle = smss_stack_read(A_THREAD_HANDLE);
                     let cid_proc = smss_stack_read(A_CID_OUT);
                     let breakin_tid = smss_stack_read(A_CID_OUT + 8);
                     breakin_runtime_tid = breakin_tid;
-                    let request = nt_handler.remote_thread_request.take();
-                    print_str(b"[dbgk-brk] denied=0x");
-                    print_hex(denied);
-                    print_str(b" create=0x");
-                    print_hex(create_status);
-                    print_str(b" ctx_ok=");
-                    print_u64(ctx_ok as u64);
-                    print_str(b" h=0x");
-                    print_hex(thread_handle as u32);
-                    print_str(b" tid=");
-                    print_u64(breakin_tid);
-                    print_str(b" req=");
-                    print_u64(request.is_some() as u64);
-                    print_str(b"\n");
                     let handle_ok = matches!(
                         nt_handler
                             .pm
                             .lookup_handle(debugger_pid, thread_handle as nt_process::Handle),
                         Some(nt_process::HandleObject::Thread(t)) if t as u64 == breakin_tid
                     );
-                    if ctx_ok
+                    if publication_invisible
+                        && ctx_ok
                         && denied == STATUS_ACCESS_DENIED
                         && create_status == 0
                         && PM_REMOTE_THREADS_CREATED.load(Ordering::Relaxed) == created_before + 1
@@ -19368,46 +19409,22 @@ pub(crate) unsafe fn service_sec_image(
                     {
                         br_ok |= 0x0008;
                     }
-
-                    // ── 0x0010 — ★ THE REMOTE THREAD REALLY RUNS IN THE TARGET'S VSPACE.
-                    // Build the mechanism through the same entry the loop uses; the thread's own
-                    // stack/TEB/IPC buffer are mapped in the TARGET's pml4, and the marker it writes
-                    // lands in a page that exists ONLY there.
-                    let mut spawned = HostedThreadSpawnResult::failed();
-                    let mut breakin_runtime_slot = 0usize;
-                    if let Some(request) = request {
-                        breakin_runtime_slot = request.slot;
-                        spawned = rendezvous::spawn_slot_thread(
-                            &mut nt_handler,
-                            &rendezvous::RemoteThreadSpawn {
-                                target_pi: request.target_pi,
-                                slot: request.slot,
-                                pml4: request.pml4,
-                                start: request.start,
-                                cid_proc: request.cid_proc,
-                                cid_thread: request.cid_thread,
-                                fault_ep: brk_ep,
-                                // The throwaway target has no ntdll mapped, so enter the start routine
-                                // directly and keep the hosted-syscalls trap (its exit `syscall` is
-                                // delivered here as an UnknownSyscall fault).
-                                use_loader: false,
-                                native: false,
-                                resume: request.resume,
-                            },
-                        );
-                        if spawned.tcb() != 0 {
-                            nt_handler.register_hosted_thread_spawn(
-                                BRK_TEST_PI,
-                                request.cid_thread,
-                                spawned,
-                                tp_worker_badge(BRK_TEST_PI, request.slot),
-                                HostedThreadRole::TpWorker { slot: request.slot },
-                            );
-                            spawned_breakin_tid = request.cid_thread;
-                            PM_REMOTE_THREADS_SPAWNED.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    if spawned.tcb() != 0 {
+                    print_str(b"[dbgk-brk] denied=0x");
+                    print_hex(denied);
+                    print_str(b" create=0x");
+                    print_hex(create_status);
+                    print_str(b" ctx_ok=");
+                    print_u64(ctx_ok as u64);
+                    print_str(b" invisible=");
+                    print_u64(publication_invisible as u64);
+                    print_str(b" h=0x");
+                    print_hex(thread_handle as u32);
+                    print_str(b" tid=");
+                    print_u64(breakin_tid);
+                    print_str(b" req=");
+                    print_u64(request.is_some() as u64);
+                    print_str(b"\n");
+                    if spawned_tcb != 0 {
                         // Its first fault: the `int3` if it read BeingDebugged = 1, else its exit
                         // syscall. Either way it must have RUN — the marker proves the thread
                         // executed in the target's address space with a correct TEB/PEB.
@@ -19908,20 +19925,23 @@ unsafe fn spawn_requested_multiplexed_thread(
     procs: &[ProcExec],
     start: nt_thread_start::Amd64ThreadContext,
     initial_teb: nt_thread_start::InitialTeb64,
+    publication: PreparedHostedThreadPublication,
     fault_ep: u64,
-) {
+) -> Result<(), u32> {
     let (owner_pi, cid_proc, pml4) =
         live_process_context_for_role(nt_handler, procs, spec.owner_role)
             .expect("hosted EPROCESS missing before multiplexed thread spawn");
-    let Some(tid) = nt_handler.hosted_thread_tid_for_role(owner_pi, spec.role) else {
-        print_str(b"[thread-life] missing reserved runtime role before spawn\n");
-        return;
-    };
+    let tid = publication.tid();
+    if publication.pid() != cid_proc
+        || nt_handler.hosted_thread_tid_for_role(owner_pi, spec.role) != Some(tid)
+    {
+        let _ = nt_handler.release_hosted_thread_runtime(tid);
+        nt_handler.abort_hosted_thread_publication(publication);
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
 
-    let suspended = hosted_thread_suspended(nt_handler, tid);
-    let resume = match spec.resume {
-        HostedThreadResumeMode::PoolState => !suspended,
-    };
+    let suspended = publication.create_suspended();
+    let resume = !suspended;
 
     print_str(spec.spawn_prefix);
     print_hex_u64(start.rip);
@@ -19954,7 +19974,6 @@ unsafe fn spawn_requested_multiplexed_thread(
             cid_proc,
             tid,
             fault_ep,
-            resume,
         ),
         HostedMultiplexedThreadSpawner::LsassListener => spawn_lsass_listener_thread(
             nt_handler,
@@ -19964,7 +19983,6 @@ unsafe fn spawn_requested_multiplexed_thread(
             cid_proc,
             tid,
             fault_ep,
-            resume,
         ),
         HostedMultiplexedThreadSpawner::LsassListener2 => spawn_lsass_listener2_thread(
             nt_handler,
@@ -19974,7 +19992,6 @@ unsafe fn spawn_requested_multiplexed_thread(
             cid_proc,
             tid,
             fault_ep,
-            resume,
         ),
         HostedMultiplexedThreadSpawner::LsassListener3 => spawn_lsass_listener3_thread(
             nt_handler,
@@ -19984,30 +20001,34 @@ unsafe fn spawn_requested_multiplexed_thread(
             cid_proc,
             tid,
             fault_ep,
-            resume,
         ),
     };
+    let tcb = spawned.tcb();
 
     let registered =
         nt_handler.register_hosted_thread_spawn(owner_pi, tid, spawned, spec.badge, spec.role);
-    let remembered = if registered {
-        nt_handler.remember_hosted_thread_user_stack(tid, initial_teb)
-    } else {
-        false
-    };
-    nt_handler
-        .pm
-        .set_thread_teb(tid as nt_process::ThreadId, spec.teb);
+    if !registered {
+        let _ = nt_handler.release_hosted_thread_runtime(tid);
+        nt_handler.abort_hosted_thread_publication(publication);
+        return Err(nt_process::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    if resume && tcb_resume(tcb) != 0 {
+        let _ = nt_handler.abort_registered_hosted_thread_spawn(tid);
+        nt_handler.abort_hosted_thread_publication(publication);
+        return Err(nt_process::STATUS_UNSUCCESSFUL);
+    }
+    nt_handler.commit_hosted_thread_publication(publication);
 
     print_str(spec.spawned_prefix);
-    print_hex(spawned.tcb() as u32);
+    print_hex(tcb as u32);
     print_str(b" registered=");
     print_u64(registered as u64);
     print_str(b" stack-record=");
-    print_u64(remembered as u64);
+    print_u64(1);
     print_str(b" resume=");
     print_u64(resume as u64);
     print_str(spec.spawned_suffix);
+    Ok(())
 }
 
 #[inline(never)]
@@ -20562,14 +20583,6 @@ unsafe fn print_quiesce_addr(
 }
 
 #[inline]
-fn hosted_thread_suspended(nt_handler: &ExecNtHandler, tid: u64) -> bool {
-    nt_handler
-        .pm
-        .thread(tid as nt_process::ThreadId)
-        .is_some_and(|thread| thread.suspend_count != 0)
-}
-
-#[inline]
 fn live_process_context_for_role(
     nt_handler: &ExecNtHandler,
     procs: &[ProcExec],
@@ -20587,15 +20600,18 @@ unsafe fn spawn_requested_local_thread(
     request: HostedThreadSpawnRequest,
     procs: &[ProcExec],
     fault_ep: u64,
-) {
+) -> Result<(), u32> {
     match request {
         HostedThreadSpawnRequest::Multiplexed {
             kind,
             start,
             initial_teb,
+            publication,
         } => {
             let Some(spec) = hosted_multiplexed_thread_spawn_for(kind) else {
-                return;
+                let _ = nt_handler.release_hosted_thread_runtime(publication.tid());
+                nt_handler.abort_hosted_thread_publication(publication);
+                return Err(nt_process::STATUS_INVALID_PARAMETER);
             };
             spawn_requested_multiplexed_thread(
                 nt_handler,
@@ -20603,13 +20619,15 @@ unsafe fn spawn_requested_local_thread(
                 procs,
                 start,
                 initial_teb,
+                publication,
                 fault_ep,
-            );
+            )
         }
         HostedThreadSpawnRequest::Winlogon {
             slot,
             start,
             initial_teb,
+            publication,
         } => {
             let (role, badge, teb) = match slot {
                 0 => (
@@ -20627,7 +20645,11 @@ unsafe fn spawn_requested_local_thread(
                     WINLOGON_WORKER3_BADGE,
                     WL_WORKER3_TEB_VA,
                 ),
-                _ => return,
+                _ => {
+                    let _ = nt_handler.release_hosted_thread_runtime(publication.tid());
+                    nt_handler.abort_hosted_thread_publication(publication);
+                    return Err(nt_process::STATUS_INVALID_PARAMETER);
+                }
             };
             let (wl_pi, cid_proc, pml4) = live_process_context_for_role(
                 nt_handler,
@@ -20635,10 +20657,15 @@ unsafe fn spawn_requested_local_thread(
                 nt_exe_image::HostedProcessRole::InteractiveLogon,
             )
             .expect("winlogon EPROCESS missing before worker spawn");
-            let Some(tid) = nt_handler.hosted_thread_tid_for_role(wl_pi, role) else {
+            let tid = publication.tid();
+            if publication.pid() != cid_proc
+                || nt_handler.hosted_thread_tid_for_role(wl_pi, role) != Some(tid)
+            {
                 print_str(b"[wl-thread] missing reserved runtime role before spawn\n");
-                return;
-            };
+                let _ = nt_handler.release_hosted_thread_runtime(tid);
+                nt_handler.abort_hosted_thread_publication(publication);
+                return Err(nt_process::STATUS_INVALID_PARAMETER);
+            }
             print_str(b"[wl-thread] spawning REAL worker slot=");
             print_u64(slot as u64);
             print_str(b" (multiplexed): entry=0x");
@@ -20653,7 +20680,7 @@ unsafe fn spawn_requested_local_thread(
             print_str(b" tid=");
             print_u64(tid);
             print_str(b"\n");
-            let suspended = hosted_thread_suspended(nt_handler, tid);
+            let suspended = publication.create_suspended();
             let spawned = spawn_wl_listener_thread(
                 nt_handler,
                 slot,
@@ -20663,8 +20690,19 @@ unsafe fn spawn_requested_local_thread(
                 cid_proc,
                 tid,
                 fault_ep,
-                false,
             );
+            let tcb = spawned.tcb();
+            if !nt_handler.register_hosted_thread_spawn(wl_pi, tid, spawned, badge, role) {
+                let _ = nt_handler.release_hosted_thread_runtime(tid);
+                nt_handler.abort_hosted_thread_publication(publication);
+                return Err(nt_process::STATUS_INSUFFICIENT_RESOURCES);
+            }
+            if !suspended && tcb_resume(tcb) != 0 {
+                let _ = nt_handler.abort_registered_hosted_thread_spawn(tid);
+                nt_handler.abort_hosted_thread_publication(publication);
+                return Err(nt_process::STATUS_UNSUCCESSFUL);
+            }
+            nt_handler.commit_hosted_thread_publication(publication);
             if slot == 0 {
                 let mapped_low = initial_teb
                     .stack_limit
@@ -20688,19 +20726,10 @@ unsafe fn spawn_requested_local_thread(
                     WL_LISTENER_STACK_MAPPED_LOW.store(0, Ordering::Release);
                     print_str(b"[wl-thread] real stack reservation could not be armed\n");
                 }
-            }
-            nt_handler.register_hosted_thread_spawn(wl_pi, tid, spawned, badge, role);
-            if slot == 0 {
                 WL_LISTENER_THREAD_MINTED.store(1, Ordering::Relaxed);
             }
-            nt_handler
-                .pm
-                .set_thread_teb(tid as nt_process::ThreadId, teb);
-            if !suspended {
-                let _ = tcb_resume(spawned.tcb());
-            }
             print_str(b"[wl-thread] spawned tcb=0x");
-            print_hex(spawned.tcb() as u32);
+            print_hex(tcb as u32);
             print_str(b" TEB=0x");
             print_hex((teb >> 32) as u32);
             print_hex(teb as u32);
@@ -20709,10 +20738,28 @@ unsafe fn spawn_requested_local_thread(
             } else {
                 b" (RESUMED into multiplex; real ETHREAD + TEB)\n"
             });
+            Ok(())
         }
-        HostedThreadSpawnRequest::TpWorker { pi, slot, start } => {
+        HostedThreadSpawnRequest::TpWorker {
+            pi,
+            slot,
+            start,
+            publication,
+        } => {
             if pi < MAX_PI && slot < TP_WORKER_SLOT_COUNT {
-                spawn_requested_tp_worker(nt_handler, pi, slot, procs[pi].pml4, start, fault_ep);
+                spawn_requested_tp_worker(
+                    nt_handler,
+                    pi,
+                    slot,
+                    procs[pi].pml4,
+                    start,
+                    publication,
+                    fault_ep,
+                )
+            } else {
+                nt_handler.release_unmapped_hosted_tp_worker_slot(pi, slot, publication.tid());
+                nt_handler.abort_hosted_thread_publication(publication);
+                Err(nt_process::STATUS_INVALID_PARAMETER)
             }
         }
     }
@@ -20725,21 +20772,27 @@ unsafe fn spawn_requested_tp_worker(
     worker_slot: usize,
     pml4: u64,
     start: nt_thread_start::Amd64ThreadContext,
+    publication: PreparedHostedThreadPublication,
     fault_ep: u64,
-) {
+) -> Result<(), u32> {
     let badge = tp_worker_badge(pi, worker_slot);
     if nt_handler.hosted_thread_tcb_for_badge(badge).is_some() {
-        return;
+        nt_handler.release_unmapped_hosted_tp_worker_slot(pi, worker_slot, publication.tid());
+        nt_handler.abort_hosted_thread_publication(publication);
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
     }
 
-    let Some(tid) = nt_handler.hosted_thread_tid_for_badge(badge) else {
-        return;
-    };
+    let tid = publication.tid();
+    if nt_handler.hosted_thread_tid_for_badge(badge) != Some(tid) {
+        nt_handler.release_unmapped_hosted_tp_worker_slot(pi, worker_slot, tid);
+        nt_handler.abort_hosted_thread_publication(publication);
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
     let role = nt_handler
         .hosted_thread_role_for_badge(badge)
         .unwrap_or(HostedThreadRole::TpWorker { slot: worker_slot });
     let cid_proc = nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64;
-    let suspended = hosted_thread_suspended(nt_handler, tid);
+    let suspended = publication.create_suspended();
     let rpc_worker = role.is_scm_rpc_worker() || role.is_lsa_rpc_worker();
     let spawned = spawn_tp_worker_thread(
         nt_handler,
@@ -20750,33 +20803,25 @@ unsafe fn spawn_requested_tp_worker(
         cid_proc,
         tid,
         fault_ep,
-        !suspended,
     );
+    let tcb = spawned.tcb();
     if spawned.tcb() == 0 {
         nt_handler.release_unmapped_hosted_tp_worker_slot(pi, worker_slot, tid);
-        if let Some((pool_pi, pool_slot)) = nt_handler.pm_pool_slot_for_tid(tid) {
-            let _ = nt_handler.pm.set_thread_state(
-                tid as nt_process::ThreadId,
-                nt_process::ThreadState::Initialized,
-            );
-            let _ = nt_handler.release_pool_usage_slot(pool_pi, pool_slot);
-        }
-        return;
+        nt_handler.abort_hosted_thread_publication(publication);
+        return Err(nt_process::STATUS_INSUFFICIENT_RESOURCES);
     }
     if !nt_handler.register_hosted_thread_spawn(pi, tid, spawned, badge, role) {
         nt_handler.release_unmapped_hosted_tp_worker_slot(pi, worker_slot, tid);
-        if let Some((pool_pi, pool_slot)) = nt_handler.pm_pool_slot_for_tid(tid) {
-            let _ = nt_handler.pm.set_thread_state(
-                tid as nt_process::ThreadId,
-                nt_process::ThreadState::Initialized,
-            );
-            let _ = nt_handler.release_pool_usage_slot(pool_pi, pool_slot);
-        }
-        return;
+        nt_handler.abort_hosted_thread_publication(publication);
+        return Err(nt_process::STATUS_INSUFFICIENT_RESOURCES);
     }
-    nt_handler
-        .pm
-        .set_thread_teb(tid as nt_process::ThreadId, tp_worker_teb_va(worker_slot));
+    if !suspended && tcb_resume(tcb) != 0 {
+        let _ = nt_handler.abort_registered_hosted_thread_spawn(tid);
+        nt_handler.clear_hosted_tp_worker_window_slot(pi, worker_slot);
+        nt_handler.abort_hosted_thread_publication(publication);
+        return Err(nt_process::STATUS_UNSUCCESSFUL);
+    }
+    nt_handler.commit_hosted_thread_publication(publication);
 
     print_str(if rpc_worker {
         b"[rpc-worker] spawned pi="
@@ -20789,7 +20834,7 @@ unsafe fn spawn_requested_tp_worker(
     print_str(b" tid=");
     print_u64(tid);
     print_str(b" tcb=0x");
-    print_hex(spawned.tcb() as u32);
+    print_hex(tcb as u32);
     if let Some(kind) = role.rpc_worker_kind() {
         print_str(b" role=");
         print_str(kind.trace_role());
@@ -20803,6 +20848,7 @@ unsafe fn spawn_requested_tp_worker(
     } else {
         b" resumed into generic multiplex\n"
     });
+    Ok(())
 }
 
 /// ★ Build the seL4 thread for a pending cross-VSpace `NtCreateThread`: the MECHANISM half of
@@ -20816,9 +20862,15 @@ pub(crate) unsafe fn spawn_requested_remote_thread(
     nt_handler: &mut ExecNtHandler,
     request: &RemoteThreadRequest,
     fault_ep: u64,
-) -> u64 {
+) -> Result<u64, u32> {
     if request.target_pi >= MAX_PI || request.slot >= TP_WORKER_SLOT_COUNT {
-        return 0;
+        nt_handler.release_unmapped_hosted_tp_worker_slot(
+            request.target_pi,
+            request.slot,
+            request.cid_thread,
+        );
+        nt_handler.abort_hosted_thread_publication(request.publication);
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
     }
     let badged = mint_badged(fault_ep, tp_worker_badge(request.target_pi, request.slot));
     let spawned = rendezvous::spawn_slot_thread(
@@ -20833,10 +20885,10 @@ pub(crate) unsafe fn spawn_requested_remote_thread(
             fault_ep: badged,
             use_loader: true,
             native: true,
-            resume: request.resume,
         },
     );
-    if spawned.tcb() != 0 {
+    let tcb = spawned.tcb();
+    if tcb != 0 {
         if !nt_handler.register_hosted_thread_spawn(
             request.target_pi,
             request.cid_thread,
@@ -20849,7 +20901,18 @@ pub(crate) unsafe fn spawn_requested_remote_thread(
                 request.slot,
                 request.cid_thread,
             );
+            nt_handler.abort_hosted_thread_publication(request.publication);
+            return Err(nt_process::STATUS_INSUFFICIENT_RESOURCES);
         } else {
+            if request.resume {
+                if tcb_resume(tcb) != 0 {
+                    let _ = nt_handler.abort_registered_hosted_thread_spawn(request.cid_thread);
+                    nt_handler.clear_hosted_tp_worker_window_slot(request.target_pi, request.slot);
+                    nt_handler.abort_hosted_thread_publication(request.publication);
+                    return Err(nt_process::STATUS_UNSUCCESSFUL);
+                }
+            }
+            nt_handler.commit_hosted_thread_publication(request.publication);
             PM_REMOTE_THREADS_SPAWNED.fetch_add(1, Ordering::Relaxed);
         }
     } else {
@@ -20858,6 +20921,8 @@ pub(crate) unsafe fn spawn_requested_remote_thread(
             request.slot,
             request.cid_thread,
         );
+        nt_handler.abort_hosted_thread_publication(request.publication);
+        return Err(nt_process::STATUS_INSUFFICIENT_RESOURCES);
     }
     print_str(b"[remote-thread] spawned target_pi=");
     print_u64(request.target_pi as u64);
@@ -20866,9 +20931,9 @@ pub(crate) unsafe fn spawn_requested_remote_thread(
     print_str(b" tid=");
     print_u64(request.cid_thread);
     print_str(b" tcb=0x");
-    print_hex(spawned.tcb() as u32);
+    print_hex(tcb as u32);
     print_str(b"\n");
-    spawned.tcb()
+    Ok(tcb)
 }
 
 /// The active memory context for the thread identified by `badge`: stack base/size/mirror, process

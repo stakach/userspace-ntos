@@ -17733,6 +17733,15 @@ pub(crate) unsafe fn release_unregistered_hosted_thread_spawn(spawn: HostedThrea
     release_hosted_thread_mechanism_caps(0, spawn.mechanism());
 }
 
+pub(crate) unsafe fn release_unpublished_hosted_thread_runtime(runtime: HostedThreadRuntime) {
+    if runtime.tcb > 1 {
+        let _ = tcb_suspend_r(runtime.tcb);
+        let _ = cnode_delete_recycle_r(runtime.tcb);
+    }
+    release_hosted_thread_resources(runtime.resources);
+    release_hosted_thread_mechanism_caps(runtime.tid, runtime.mechanism);
+}
+
 unsafe fn hosted_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
     let _ = power_manager::remove_thread_execution_state(tid);
     let _ = crate::service_sec_image::pending_driver_load_abandon_thread(handler, tid);
@@ -21807,6 +21816,43 @@ pub(crate) struct RemoteThreadRequest {
     pub cid_thread: u64,
     /// `CreateSuspended = FALSE` ⇒ resume it as soon as it is built.
     pub resume: bool,
+    /// Invisible Ps/handle publication committed only after the hosted mechanism is registered.
+    pub publication: PreparedHostedThreadPublication,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostedThreadPublicationKind {
+    General,
+    Remote,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedHostedThreadPublication {
+    owner_pi: usize,
+    pool_slot: usize,
+    activation: nt_process::ThreadActivationPlan,
+    handle: nt_process::HandleReservation,
+    handle_out: u64,
+    client_id_out: u64,
+    kind: HostedThreadPublicationKind,
+}
+
+impl PreparedHostedThreadPublication {
+    pub(crate) const fn tid(self) -> u64 {
+        self.activation.thread_id() as u64
+    }
+
+    pub(crate) const fn pid(self) -> u64 {
+        self.activation.process_id() as u64
+    }
+
+    pub(crate) const fn handle(self) -> u64 {
+        self.handle.handle as u64
+    }
+
+    pub(crate) const fn create_suspended(self) -> bool {
+        self.activation.create_suspended()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21821,16 +21867,19 @@ enum HostedThreadSpawnRequest {
         slot: usize,
         start: nt_thread_start::Amd64ThreadContext,
         initial_teb: nt_thread_start::InitialTeb64,
+        publication: PreparedHostedThreadPublication,
     },
     Multiplexed {
         kind: HostedMultiplexedThreadKind,
         start: nt_thread_start::Amd64ThreadContext,
         initial_teb: nt_thread_start::InitialTeb64,
+        publication: PreparedHostedThreadPublication,
     },
     TpWorker {
         pi: usize,
         slot: usize,
         start: nt_thread_start::Amd64ThreadContext,
+        publication: PreparedHostedThreadPublication,
     },
 }
 
@@ -23414,12 +23463,12 @@ impl HostedThreadMechanismCaps {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HostedThreadSpawnResult {
     tcb: u64,
     mechanism: HostedThreadMechanismCaps,
     teb_alias: u64,
     resources: HostedThreadResources,
+    commitment: Option<exec_handler::PreparedHostedThreadCommitment>,
 }
 
 impl HostedThreadSpawnResult {
@@ -23429,6 +23478,7 @@ impl HostedThreadSpawnResult {
             mechanism: HostedThreadMechanismCaps::empty(),
             teb_alias: 0,
             resources: HostedThreadResources::empty(),
+            commitment: None,
         }
     }
 
@@ -23443,23 +23493,33 @@ impl HostedThreadSpawnResult {
             mechanism,
             teb_alias,
             resources,
+            commitment: None,
         }
     }
 
-    pub(crate) const fn tcb(self) -> u64 {
+    pub(crate) const fn tcb(&self) -> u64 {
         self.tcb
     }
 
-    pub(crate) const fn mechanism(self) -> HostedThreadMechanismCaps {
+    pub(crate) const fn mechanism(&self) -> HostedThreadMechanismCaps {
         self.mechanism
     }
 
-    pub(crate) const fn teb_alias(self) -> u64 {
+    pub(crate) const fn teb_alias(&self) -> u64 {
         self.teb_alias
     }
 
-    const fn resources(self) -> HostedThreadResources {
+    const fn resources(&self) -> HostedThreadResources {
         self.resources
+    }
+
+    fn attach_commitment(&mut self, commitment: exec_handler::PreparedHostedThreadCommitment) {
+        debug_assert!(self.commitment.is_none());
+        self.commitment = Some(commitment);
+    }
+
+    fn take_commitment(&mut self) -> Option<exec_handler::PreparedHostedThreadCommitment> {
+        self.commitment.take()
     }
 }
 
@@ -23556,6 +23616,47 @@ impl HostedThreadRuntimeTable {
             return None;
         }
         self.store(pi, tid, tcb, badge, role)
+    }
+
+    fn register_spawn(
+        &mut self,
+        pi: usize,
+        tid: u64,
+        tcb: u64,
+        badge: u64,
+        role: HostedThreadRole,
+        mechanism: HostedThreadMechanismCaps,
+        teb_alias: u64,
+        resources: HostedThreadResources,
+    ) -> Option<HostedThreadRuntime> {
+        if tid == 0 || tcb <= 1 || !mechanism.is_live() || !resources.live {
+            return None;
+        }
+        let index = self.entries.iter().position(|entry| {
+            entry.is_live()
+                && entry.tid == tid
+                && entry.tcb == 1
+                && entry.pi == pi
+                && entry.badge == badge
+                && entry.role == role
+        })?;
+        let previous = self.entries[index];
+        let runtime = HostedThreadRuntime {
+            pi,
+            tid,
+            tcb,
+            badge,
+            role,
+            mechanism,
+            teb_alias,
+            resources,
+            user_stack_allocation_base: previous.user_stack_allocation_base,
+            user_stack_base: previous.user_stack_base,
+            lpc_server_port: previous.lpc_server_port,
+            lpc_client_process: previous.lpc_client_process,
+        };
+        self.entries[index] = runtime;
+        Some(runtime)
     }
 
     fn reserve(
@@ -23671,50 +23772,6 @@ impl HostedThreadRuntimeTable {
         Some(*entry)
     }
 
-    fn set_mechanism_caps(
-        &mut self,
-        tid: u64,
-        mechanism: HostedThreadMechanismCaps,
-    ) -> Option<HostedThreadRuntime> {
-        if tid == 0 || !mechanism.is_live() {
-            return None;
-        }
-        let entry = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.is_live() && entry.tid == tid)?;
-        entry.mechanism = mechanism;
-        Some(*entry)
-    }
-
-    fn set_teb_alias(&mut self, tid: u64, teb_alias: u64) -> Option<HostedThreadRuntime> {
-        if tid == 0 || teb_alias == 0 {
-            return None;
-        }
-        let entry = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.is_live() && entry.tid == tid)?;
-        entry.teb_alias = teb_alias;
-        Some(*entry)
-    }
-
-    fn set_resources(
-        &mut self,
-        tid: u64,
-        resources: HostedThreadResources,
-    ) -> Option<HostedThreadRuntime> {
-        if tid == 0 || !resources.live {
-            return None;
-        }
-        let entry = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.is_live() && entry.tid == tid)?;
-        entry.resources = resources;
-        Some(*entry)
-    }
-
     fn tcb_by_tid(&self, tid: u64) -> Option<u64> {
         self.get_by_tid(tid)
             .map(|entry| entry.tcb)
@@ -23810,6 +23867,28 @@ impl HostedThreadRuntimes {
         unsafe { (&mut *self.table).register(pi, tid, tcb, badge, role) }
     }
 
+    fn register_spawn(
+        &mut self,
+        pi: usize,
+        tid: u64,
+        spawn: &HostedThreadSpawnResult,
+        badge: u64,
+        role: HostedThreadRole,
+    ) -> Option<HostedThreadRuntime> {
+        unsafe {
+            (&mut *self.table).register_spawn(
+                pi,
+                tid,
+                spawn.tcb(),
+                badge,
+                role,
+                spawn.mechanism(),
+                spawn.teb_alias(),
+                spawn.resources(),
+            )
+        }
+    }
+
     fn reserve(
         &mut self,
         pi: usize,
@@ -23849,29 +23928,6 @@ impl HostedThreadRuntimes {
     ) -> Option<HostedThreadRuntime> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe { (&mut *self.table).set_user_stack(tid, allocation_base, stack_base) }
-    }
-
-    fn set_mechanism_caps(
-        &mut self,
-        tid: u64,
-        mechanism: HostedThreadMechanismCaps,
-    ) -> Option<HostedThreadRuntime> {
-        // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).set_mechanism_caps(tid, mechanism) }
-    }
-
-    fn set_teb_alias(&mut self, tid: u64, teb_alias: u64) -> Option<HostedThreadRuntime> {
-        // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).set_teb_alias(tid, teb_alias) }
-    }
-
-    fn set_resources(
-        &mut self,
-        tid: u64,
-        resources: HostedThreadResources,
-    ) -> Option<HostedThreadRuntime> {
-        // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).set_resources(tid, resources) }
     }
 
     fn tcb_by_tid(&self, tid: u64) -> Option<u64> {
@@ -24817,8 +24873,6 @@ struct HostedThread {
     /// The `ClientId` written into the TEB (`0,0` leaves the TEB's zero-fill).
     cid_proc: u64,
     cid_thread: u64,
-    /// Resume immediately (SM/listener) or leave suspended for a lazy rendezvous-time resume (CSR).
-    resume: bool,
     /// Scheduling priority (default 100). The services RPC listener uses a value above the hosted
     /// processes so that, once services' main thread parks (NtTerminateThread), the listener is the
     /// highest runnable thread → it faults into the main multiplex (proving the N-threads mechanism).
@@ -24879,11 +24933,11 @@ unsafe fn spawn_hosted_thread(
         Ok(prepared) => prepared,
         Err(_) => return HostedThreadSpawnResult::failed(),
     };
-    let spawned = spawn_hosted_thread_mechanism(t);
+    let mut spawned = spawn_hosted_thread_mechanism(t);
     if spawned.tcb() == 0 {
         return spawned;
     }
-    handler.commit_hosted_thread_commitment(t.client_pi as usize, prepared);
+    spawned.attach_commitment(prepared);
     spawned
 }
 
@@ -25372,9 +25426,6 @@ unsafe fn spawn_hosted_thread_mechanism(t: &HostedThread) -> HostedThreadSpawnRe
             return HostedThreadSpawnResult::failed();
         }
     };
-    if t.resume {
-        let _ = tcb_resume(tcb);
-    }
     HostedThreadSpawnResult::new(
         tcb,
         HostedThreadMechanismCaps::new(raw, cnode, sched_context),

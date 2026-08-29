@@ -17313,3 +17313,51 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     object and failed Ps publication cannot leak a completed mechanism. After that, connect nonzero
     UI restrictions through the registered Win32 job callout and token restrictions through the
     Security Manager. Remove the superseded partial-publication machinery as each owner lands.
+
+    Transactional hosted ETHREAD/mechanism publication (2026-08-30, accepted; UI/security job
+    mechanisms remain): additional hosted threads now begin as explicit dormant Ps identities.
+    `nt-process::create_dormant_thread` creates a non-runnable, non-debugger-reportable ETHREAD only
+    after the process has a real main thread; bootstrap, dynamic-process, and diagnostic pools no
+    longer create an ordinary Ready thread and force its state to `Initialized` afterward. A
+    generation-checked activation plan validates the dormant or fully reclaimable ETHREAD without
+    mutation. In parallel, the caller's exact typed handle slot is reserved and bound while remaining
+    invisible. The pool bit, worker window, runtime role, start context, TEB, handle, and copyout
+    destinations travel as one prepared publication object.
+
+    The service-loop owner constructs every seL4 mechanism suspended. It installs the TCB,
+    scheduling-context/CNode capabilities, TEB alias, and exact stack/TEB/ACS/IPC/trampoline resources
+    into the pre-reserved runtime record with one allocation-free replacement, then commits the
+    previously prepared MM/Ps commitment. A non-suspended create must resume successfully before Ps
+    activates the ETHREAD, publishes the typed handle, reports the Dbgk create-thread event, or queues
+    the ThreadHandle/CLIENT_ID copyouts. Any construction, registration, or resume failure removes the
+    exact runtime record and mechanism capabilities, releases the MM/Ps charge, cancels the invisible
+    handle, returns the dormant pool identity, clears the worker window, zeros the user outputs, and
+    changes the native syscall result to failure. Suspended creates publish the complete but suspended
+    mechanism and remain owned by the normal `NtResumeThread` path.
+
+    Cross-process `NtCreateThread`, `NtCreateThreadEx`, generic thread-pool workers, services and LSASS
+    role-owned listeners, winlogon workers, and the debugger remote-breakin path all use this boundary.
+    The old mutate-first pool claim, visible-handle-first create helpers, partial runtime setters,
+    low-level resume flags, and abandon-by-reset rollback paths are deleted. The Dbgk proof now checks
+    that ThreadHandle and CLIENT_ID remain zero and the bound handle cannot be resolved before the
+    mechanism commits; dormant pool identities are correctly excluded from fake attach messages.
+
+    Focused `nt-process` validation passes `141/141`, covering dormant-main rejection, invisible bound
+    handles, stale activation plans, visible-handle rejection, and explicit commit/publication. Package
+    formatting, `git diff --check`, the freestanding executive check, and the release staging build pass
+    at the established 209-warning baseline. Serialized proof
+    `.tmp/run-headless-thread-publication-final-20260830.log` completes the remote-breakin transaction
+    with proof `0x7f`, one remote create/spawn, and a real breakpoint/continue/exit; dynamically launches
+    userinit and Explorer; completes 668 Explorer api0 redirects with zero callback failures; installs
+    18 client WndProcs without replay; reaches Explorer paint begin/end `5/20` with 187 direct GDI
+    returns and 135 batch flushes covering 184 records; paints `480000/480000` framebuffer pixels with
+    at least 32 colours; passes all `295/295` checks; and matches the sentinel.
+
+    Review adjustment: hosted thread identity, handle, MM/Ps commitment, runtime, mechanism, resume,
+    debugger notification, and user copyout now have one rollback boundary. The next bounded job-family
+    target is nonzero UI restrictions through the already registered Win32 job callout. Ps must own the
+    job policy and process membership; win32k must enforce only the restriction mask delivered through
+    its callout boundary, with assignment/update/rundown rollback and no executable-name checks or
+    executive shadow state. After that, connect token restrictions through the Security Manager. Keep
+    `JOB_OBJECT_LIMIT_WORKINGSET` disabled until Memory Manager has resident-set accounting, trimming,
+    and pageout.

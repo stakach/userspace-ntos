@@ -145,11 +145,19 @@ fn dormant_pool_thread_does_not_keep_process_alive() {
     let mut pm = ProcessManager::new();
     let pid = pm.create_process("host.exe", None, None);
     let main = pm.create_thread(pid, 0x1000, 0, false).unwrap();
-    let pool = pm.create_thread(pid, 0, 0, false).unwrap();
-    pm.set_thread_state(pool, ThreadState::Initialized).unwrap();
+    let pool = pm.create_dormant_thread(pid).unwrap();
     pm.terminate_thread(main, 7).unwrap();
     assert_eq!(pm.process(pid).unwrap().state, ProcessState::Terminated);
     assert_eq!(pm.thread(pool).unwrap().state, ThreadState::Terminated);
+}
+
+#[test]
+fn dormant_thread_cannot_become_the_process_main_thread() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("host.exe", None, None);
+
+    assert_eq!(pm.create_dormant_thread(pid), Err(STATUS_INVALID_PARAMETER));
+    assert_eq!(pm.create_thread(pid, 0x1000, 0, false), Ok(8));
 }
 
 #[test]
@@ -541,7 +549,10 @@ fn user_apc_queue_rejects_system_and_terminated_threads() {
         pm.queue_user_apc(pid, main, worker_handle as u64, apc),
         Err(STATUS_INVALID_HANDLE)
     );
-    pm.reuse_reclaimed_thread(worker, 0x4000, false).unwrap();
+    let activation = pm
+        .prepare_thread_activation(worker, 0x4000, 0, false, 0x7000, 0, false)
+        .unwrap();
+    pm.commit_thread_activation(activation).unwrap();
     assert_eq!(pm.take_user_apc(worker), None);
 }
 
@@ -1616,7 +1627,7 @@ fn terminated_thread_is_reclaimable_only_after_handles_close() {
 }
 
 #[test]
-fn reclaimed_runtime_thread_can_be_reused_only_after_handle_close() {
+fn reclaimed_runtime_thread_activation_requires_all_visible_handles_closed() {
     let mut pm = ProcessManager::new();
     let pid = pm.create_process("host.exe", None, None);
     let _main = pm.create_thread(pid, 0x1000, 0, false).unwrap();
@@ -1628,24 +1639,87 @@ fn reclaimed_runtime_thread_can_be_reused_only_after_handle_close() {
 
     pm.terminate_thread(worker, 0x1234).unwrap();
     assert_eq!(
-        pm.reuse_reclaimed_thread(worker, 0x3000, true),
+        pm.prepare_thread_activation(worker, 0x3000, 0, true, 0x7000, 0, false),
         Err(STATUS_INVALID_PARAMETER)
     );
     pm.close_handle(pid, handle).unwrap();
-    pm.reuse_reclaimed_thread(worker, 0x3000, true).unwrap();
+    let activation = pm
+        .prepare_thread_activation(worker, 0x3000, 0, true, 0x7000, 0, false)
+        .unwrap();
+    pm.commit_thread_activation(activation).unwrap();
 
     let thread = pm.thread(worker).unwrap();
     assert_eq!(thread.start_address, 0x3000);
     assert_eq!(thread.state, ThreadState::Suspended);
     assert_eq!(thread.exit_status, None);
     assert_eq!(thread.suspend_count, 1);
-    assert_eq!(thread.teb_base, 0);
+    assert_eq!(thread.teb_base, 0x7000);
     assert_eq!(thread.security_descriptor.as_ptr(), security_buffer);
     assert_eq!(
         thread.security_descriptor,
         nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR
     );
     assert!(!pm.can_reclaim_thread(worker));
+}
+
+#[test]
+fn hosted_thread_activation_stays_invisible_until_explicit_commit_and_handle_publish() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("host.exe", None, None);
+    let _main = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+    let worker = pm.create_dormant_thread(pid).unwrap();
+
+    let activation = pm
+        .prepare_thread_activation(worker, 0x4000, 0x55, true, 0x7000, 123, true)
+        .unwrap();
+    let reservation = pm.try_reserve_handle_slot(pid).unwrap();
+    pm.bind_reserved_handle(reservation, HandleObject::Thread(worker), THREAD_ALL_ACCESS)
+        .unwrap();
+
+    assert_eq!(pm.thread(worker).unwrap().state, ThreadState::Initialized);
+    assert_eq!(pm.lookup_handle(pid, reservation.handle), None);
+    pm.commit_thread_activation(activation).unwrap();
+    assert_eq!(
+        pm.publish_reserved_handle(reservation),
+        Ok(reservation.handle)
+    );
+
+    let thread = pm.thread(worker).unwrap();
+    assert_eq!(thread.start_address, 0x4000);
+    assert_eq!(thread.parameter, 0x55);
+    assert_eq!(thread.state, ThreadState::Suspended);
+    assert_eq!(thread.suspend_count, 1);
+    assert_eq!(thread.teb_base, 0x7000);
+    assert_eq!(thread.create_time_100ns, 123);
+    assert_eq!(
+        pm.lookup_handle(pid, reservation.handle),
+        Some(HandleObject::Thread(worker))
+    );
+    assert_eq!(
+        pm.commit_thread_activation(activation),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+}
+
+#[test]
+fn hosted_thread_activation_rejects_visible_and_unreclaimable_slots_without_mutation() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("host.exe", None, None);
+    let _main = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+    let worker = pm.create_dormant_thread(pid).unwrap();
+    let handle = pm
+        .insert_handle(pid, HandleObject::Thread(worker), THREAD_ALL_ACCESS)
+        .unwrap();
+
+    assert_eq!(
+        pm.prepare_thread_activation(worker, 0x4000, 0, false, 0x7000, 0, false),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(pm.thread(worker).unwrap().state, ThreadState::Initialized);
+    pm.close_handle(pid, handle).unwrap();
+    assert!(pm
+        .prepare_thread_activation(worker, 0x4000, 0, false, 0x7000, 0, false)
+        .is_ok());
 }
 
 #[test]
@@ -2800,9 +2874,7 @@ fn dbgk_attach_does_not_report_initialized_pool_threads() {
     let dbg_thread = pm.create_thread(debugger, 0x100, 0, false).unwrap();
     let target = pm.create_process("target.exe", None, None);
     let main = pm.create_thread(target, 0x2000, 0, false).unwrap();
-    let dormant = pm.create_thread(target, 0, 0, false).unwrap();
-    pm.set_thread_state(dormant, ThreadState::Initialized)
-        .unwrap();
+    let dormant = pm.create_dormant_thread(target).unwrap();
 
     assert_eq!(
         pm.debug_active_process(
@@ -2834,9 +2906,7 @@ fn dbgk_existing_thread_create_reports_claimed_pool_thread() {
     let dbg_thread = pm.create_thread(debugger, 0x100, 0, false).unwrap();
     let target = pm.create_process("target.exe", None, None);
     let main = pm.create_thread(target, 0x2000, 0, false).unwrap();
-    let dormant = pm.create_thread(target, 0, 0, false).unwrap();
-    pm.set_thread_state(dormant, ThreadState::Initialized)
-        .unwrap();
+    let dormant = pm.create_dormant_thread(target).unwrap();
 
     assert_eq!(
         pm.debug_active_process(

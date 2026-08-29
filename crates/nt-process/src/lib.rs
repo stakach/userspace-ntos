@@ -854,6 +854,8 @@ pub struct NtThread {
     pub exit_time_100ns: i64,
     pub kernel_time_100ns: i64,
     pub user_time_100ns: i64,
+    /// Generation of the dormant/reclaimed-thread activation boundary.
+    activation_generation: u64,
     /// LPC port objects referenced by `NtRegisterThreadTerminatePort`, in registration order.
     /// `PspExitThread` drains this as a stack, so duplicates intentionally remain distinct.
     termination_ports: Vec<u64>,
@@ -893,6 +895,36 @@ pub struct NtThread {
     thread_name_len: u16,
     thread_name: Vec<u16>,
     user_apc_queue: VecDeque<QueuedUserApc>,
+}
+
+/// Allocation-free, invisible activation of a dormant hosted ETHREAD. The host prepares this
+/// before constructing its scheduler mechanism and commits it only after mechanism admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadActivationPlan {
+    tid: ThreadId,
+    process_id: ProcessId,
+    generation: u64,
+    expected_state: ThreadState,
+    start_address: u64,
+    parameter: u64,
+    create_suspended: bool,
+    teb_base: u64,
+    create_time_100ns: i64,
+    hide_from_debugger: bool,
+}
+
+impl ThreadActivationPlan {
+    pub const fn thread_id(self) -> ThreadId {
+        self.tid
+    }
+
+    pub const fn process_id(self) -> ProcessId {
+        self.process_id
+    }
+
+    pub const fn create_suspended(self) -> bool {
+        self.create_suspended
+    }
 }
 
 /// Per-thread state installed through `ThreadImpersonationToken`.
@@ -1804,9 +1836,50 @@ impl ProcessManager {
         parameter: u64,
         is_system_thread: bool,
     ) -> Result<ThreadId, u32> {
+        let tid = self.insert_thread_object(
+            pid,
+            start_address,
+            parameter,
+            is_system_thread,
+            ThreadState::Ready,
+            true,
+        )?;
+        let _ = self.report_existing_thread_create(tid);
+        Ok(tid)
+    }
+
+    /// Pre-create one dormant ETHREAD identity for a bounded hosted mechanism pool. A dormant
+    /// identity is neither runnable nor debugger-reportable and cannot become a process's main
+    /// thread; [`prepare_thread_activation`](Self::prepare_thread_activation) is its only route into
+    /// the live thread state machine.
+    pub fn create_dormant_thread(&mut self, pid: ProcessId) -> Result<ThreadId, u32> {
+        if self
+            .processes
+            .get(&pid)
+            .ok_or(STATUS_INVALID_HANDLE)?
+            .main_thread
+            .is_none()
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        self.insert_thread_object(pid, 0, 0, false, ThreadState::Initialized, false)
+    }
+
+    fn insert_thread_object(
+        &mut self,
+        pid: ProcessId,
+        start_address: u64,
+        parameter: u64,
+        is_system_thread: bool,
+        state: ThreadState,
+        may_become_main: bool,
+    ) -> Result<ThreadId, u32> {
         let proc = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
         if matches!(proc.state, ProcessState::Exiting | ProcessState::Terminated) {
             return Err(STATUS_PROCESS_IS_TERMINATING);
+        }
+        if proc.main_thread.is_none() && !may_become_main {
+            return Err(STATUS_INVALID_PARAMETER);
         }
         let affinity_mask = proc.affinity_mask;
         let base_priority = proc.base_priority;
@@ -1828,7 +1901,7 @@ impl ProcessManager {
                 start_address,
                 win32_start_address: start_address,
                 parameter,
-                state: ThreadState::Ready,
+                state,
                 is_system_thread,
                 exit_status: None,
                 wait_references: 0,
@@ -1836,6 +1909,7 @@ impl ProcessManager {
                 exit_time_100ns: 0,
                 kernel_time_100ns: 0,
                 user_time_100ns: 0,
+                activation_generation: 1,
                 termination_ports,
                 impersonation: None,
                 security_descriptor: Vec::from(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..]),
@@ -1855,7 +1929,6 @@ impl ProcessManager {
                 user_apc_queue: VecDeque::new(),
             },
         );
-        let _ = self.report_existing_thread_create(tid);
         Ok(tid)
     }
 
@@ -2686,27 +2759,83 @@ impl ProcessManager {
         })
     }
 
-    /// Reset a preallocated runtime-thread identity after its terminated object is no longer
-    /// reachable through any handle. This is intentionally narrower than creating a new NT thread:
-    /// hosts use it to recycle bounded, allocation-free worker slots after deleting the old backing
-    /// mechanism.
-    pub fn reuse_reclaimed_thread(
-        &mut self,
+    /// Validate an activation without changing the ETHREAD or making it debugger-reportable.
+    pub fn prepare_thread_activation(
+        &self,
         tid: ThreadId,
         start_address: u64,
+        parameter: u64,
         create_suspended: bool,
-    ) -> Result<(), u32> {
-        if !self.can_reclaim_thread(tid) {
+        teb_base: u64,
+        create_time_100ns: i64,
+        hide_from_debugger: bool,
+    ) -> Result<ThreadActivationPlan, u32> {
+        if start_address == 0 || teb_base == 0 {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let process_id = self
-            .threads
-            .get(&tid)
-            .map(|thread| thread.process_id)
-            .ok_or(STATUS_INVALID_HANDLE)?;
+        let thread = self.threads.get(&tid).ok_or(STATUS_INVALID_HANDLE)?;
         let process = self
             .processes
-            .get(&process_id)
+            .get(&thread.process_id)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if matches!(
+            process.state,
+            ProcessState::Exiting | ProcessState::Terminated
+        ) {
+            return Err(STATUS_PROCESS_IS_TERMINATING);
+        }
+        let reusable = match thread.state {
+            ThreadState::Initialized => {
+                thread.wait_references == 0
+                    && thread.termination_ports.is_empty()
+                    && thread.impersonation.is_none()
+                    && thread.user_apc_queue.is_empty()
+                    && !self.processes.values().any(|process| {
+                        process.handles.iter().any(|entry| {
+                            entry
+                                .entry()
+                                .is_some_and(|entry| entry.object == HandleObject::Thread(tid))
+                        })
+                    })
+            }
+            ThreadState::Terminated => self.can_reclaim_thread(tid),
+            _ => false,
+        };
+        if !reusable {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if thread.security_descriptor.capacity()
+            < nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR.len()
+        {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        Ok(ThreadActivationPlan {
+            tid,
+            process_id: thread.process_id,
+            generation: thread.activation_generation,
+            expected_state: thread.state,
+            start_address,
+            parameter,
+            create_suspended,
+            teb_base,
+            create_time_100ns,
+            hide_from_debugger,
+        })
+    }
+
+    /// Publish a prepared hosted ETHREAD activation. Debug notification remains a separate final
+    /// step so the host can make the already-bound user handle visible first.
+    pub fn commit_thread_activation(&mut self, plan: ThreadActivationPlan) -> Result<(), u32> {
+        let current = self.threads.get(&plan.tid).ok_or(STATUS_INVALID_HANDLE)?;
+        if current.process_id != plan.process_id
+            || current.activation_generation != plan.generation
+            || current.state != plan.expected_state
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let process = self
+            .processes
+            .get(&plan.process_id)
             .ok_or(STATUS_INVALID_HANDLE)?;
         if matches!(
             process.state,
@@ -2716,31 +2845,52 @@ impl ProcessManager {
         }
         let affinity_mask = process.affinity_mask;
         let base_priority = process.base_priority;
-        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
-        if thread.impersonation.is_some() {
+        let reusable = match current.state {
+            ThreadState::Initialized => {
+                current.wait_references == 0
+                    && current.termination_ports.is_empty()
+                    && current.impersonation.is_none()
+                    && current.user_apc_queue.is_empty()
+                    && !self.processes.values().any(|process| {
+                        process.handles.iter().any(|entry| {
+                            entry
+                                .entry()
+                                .is_some_and(|entry| entry.object == HandleObject::Thread(plan.tid))
+                        })
+                    })
+            }
+            ThreadState::Terminated => self.can_reclaim_thread(plan.tid),
+            _ => false,
+        };
+        if !reusable {
             return Err(STATUS_INVALID_PARAMETER);
         }
+
         let default_security = &nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..];
+        let thread = self
+            .threads
+            .get_mut(&plan.tid)
+            .ok_or(STATUS_INVALID_HANDLE)?;
         if thread.security_descriptor.capacity() < default_security.len() {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
-        thread.start_address = start_address;
-        thread.win32_start_address = start_address;
-        thread.parameter = 0;
-        thread.state = if create_suspended {
+        thread.start_address = plan.start_address;
+        thread.win32_start_address = plan.start_address;
+        thread.parameter = plan.parameter;
+        thread.state = if plan.create_suspended {
             ThreadState::Suspended
         } else {
             ThreadState::Running
         };
         thread.exit_status = None;
-        thread.create_time_100ns = 0;
+        thread.create_time_100ns = plan.create_time_100ns;
         thread.exit_time_100ns = 0;
         thread.kernel_time_100ns = 0;
         thread.user_time_100ns = 0;
         thread.termination_ports.clear();
-        thread.suspend_count = create_suspended as u32;
+        thread.suspend_count = plan.create_suspended as u32;
         thread.win32_thread = None;
-        thread.teb_base = 0;
+        thread.teb_base = plan.teb_base;
         thread.affinity_mask = affinity_mask;
         thread.priority = base_priority;
         thread.base_priority = base_priority;
@@ -2751,10 +2901,11 @@ impl ProcessManager {
             .extend_from_slice(default_security);
         thread.break_on_termination = false;
         thread.disable_boost = false;
-        thread.hide_from_debugger = false;
+        thread.hide_from_debugger = plan.hide_from_debugger;
         thread.thread_name_len = 0;
         thread.thread_name.clear();
         thread.user_apc_queue.clear();
+        thread.activation_generation = thread.activation_generation.wrapping_add(1).max(1);
         Ok(())
     }
 

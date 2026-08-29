@@ -2675,8 +2675,7 @@ fn seed_bootstrap_process_manager() -> BootstrapProcessManagerSeed {
     }
     for (pi, &pid) in bootstrap_pids.iter().enumerate() {
         for slot in 0..PM_RUNTIME_THREAD_SLOTS {
-            if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
-                let _ = pm.set_thread_state(tid, nt_process::ThreadState::Initialized);
+            if let Ok(tid) = pm.create_dormant_thread(pid) {
                 bootstrap_pool_tids[pi][slot] = tid;
             }
         }
@@ -8025,45 +8024,23 @@ impl ExecNtHandler {
         &mut self,
         pi: usize,
         tid: u64,
-        spawn: HostedThreadSpawnResult,
+        mut spawn: HostedThreadSpawnResult,
         badge: u64,
         role: HostedThreadRole,
     ) -> bool {
-        if !self.register_hosted_thread_tcb(pi, tid, spawn.tcb(), badge, role) {
-            let _ = self.release_hosted_thread_runtime(tid);
-            unsafe { self.release_hosted_thread_commitment(spawn.resources()) };
-            unsafe { crate::release_unregistered_hosted_thread_spawn(spawn) };
-            return false;
-        }
-        let mechanism = spawn.mechanism();
-        if mechanism.is_live()
-            && self
-                .thread_runtime
-                .set_mechanism_caps(tid, mechanism)
-                .is_none()
-        {
-            let _ = self.release_hosted_thread_runtime(tid);
-            unsafe { self.release_hosted_thread_commitment(spawn.resources()) };
-            unsafe { crate::release_unregistered_hosted_thread_spawn(spawn) };
-            return false;
-        }
-        let teb_alias = spawn.teb_alias();
-        if teb_alias != 0 && self.thread_runtime.set_teb_alias(tid, teb_alias).is_none() {
-            let _ = self.release_hosted_thread_runtime(tid);
-            unsafe { self.release_hosted_thread_commitment(spawn.resources()) };
-            unsafe { crate::release_unregistered_hosted_thread_spawn(spawn) };
-            return false;
-        }
         if self
             .thread_runtime
-            .set_resources(tid, spawn.resources())
+            .register_spawn(pi, tid, &spawn, badge, role)
             .is_none()
         {
-            let _ = self.release_hosted_thread_runtime(tid);
-            unsafe { self.release_hosted_thread_commitment(spawn.resources()) };
             unsafe { crate::release_unregistered_hosted_thread_spawn(spawn) };
             return false;
         }
+        let commitment = spawn
+            .take_commitment()
+            .expect("live hosted spawn carries its prepared MM/Ps commitment");
+        unsafe { self.commit_hosted_thread_commitment(pi, commitment) };
+        publish_hosted_thread_runtime_gate(pi, role);
         true
     }
 
@@ -9079,57 +9056,22 @@ impl ExecNtHandler {
         self.tp_worker_window_used.get(pi).copied().unwrap_or(0)
     }
 
-    fn abandon_created_hosted_thread(&mut self, pool_slot: usize, tid: u64, handle: u64) {
-        let _ = self.release_hosted_thread_runtime(tid);
-        if let Some(pid) = self.pm_pid_for_pi(self.pi) {
-            let _ = self.close_process_handle(pid, handle);
-        }
-        let thread = tid as nt_process::ThreadId;
-        let _ = self
-            .pm
-            .set_thread_state(thread, nt_process::ThreadState::Initialized);
-        self.release_pool_usage_slot(self.pi, pool_slot);
-    }
-
-    fn abandon_created_hosted_thread_for(
-        &mut self,
-        owner_pi: usize,
-        pool_slot: usize,
-        tid: u64,
-        caller_pid: nt_process::ProcessId,
-        handle: u64,
-    ) {
-        let _ = self.release_hosted_thread_runtime(tid);
-        let _ = self.close_process_handle(caller_pid, handle);
-        let thread = tid as nt_process::ThreadId;
-        let _ = self
-            .pm
-            .set_thread_state(thread, nt_process::ThreadState::Initialized);
-        self.release_pool_usage_slot(owner_pi, pool_slot);
-    }
-
-    fn reserve_created_hosted_thread_role(
-        &mut self,
-        pool_slot: usize,
-        tid: u64,
-        handle: u64,
-        badge: u64,
-        role: HostedThreadRole,
-    ) -> bool {
-        if self.hosted_thread_tid_for_role(self.pi, role).is_some()
-            || !self.reserve_hosted_thread_runtime(self.pi, tid, badge, role)
-        {
-            self.abandon_created_hosted_thread(pool_slot, tid, handle);
-            return false;
-        }
-        true
-    }
-
     pub(crate) fn release_hosted_thread_runtime(
         &mut self,
         tid: u64,
     ) -> Option<HostedThreadRuntime> {
         self.thread_runtime.release_tid(tid)
+    }
+
+    pub(crate) fn abort_registered_hosted_thread_spawn(&mut self, tid: u64) -> bool {
+        let Some(runtime) = self.release_hosted_thread_runtime(tid) else {
+            return false;
+        };
+        unsafe {
+            self.release_hosted_thread_commitment(runtime.resources);
+            crate::release_unpublished_hosted_thread_runtime(runtime);
+        }
+        true
     }
 
     fn hosted_thread_mechanism_for_tid(&self, tid: u64) -> Option<nt_user_host::ThreadMechanism> {
@@ -9531,20 +9473,13 @@ impl ExecNtHandler {
             return Err(status);
         }
         for slot in 0..PM_RUNTIME_THREAD_SLOTS {
-            let tid = match self.pm.create_thread(pid, 0, 0, false) {
+            let tid = match self.pm.create_dormant_thread(pid) {
                 Ok(tid) => tid,
                 Err(status) => {
                     self.rollback_hosted_process_creation(child_pi, pid);
                     return Err(status);
                 }
             };
-            if let Err(status) = self
-                .pm
-                .set_thread_state(tid, nt_process::ThreadState::Initialized)
-            {
-                self.rollback_hosted_process_creation(child_pi, pid);
-                return Err(status);
-            }
             if let Err(status) = self.register_hosted_pool_thread_identity(child_pi, slot, tid) {
                 self.rollback_hosted_process_creation(child_pi, pid);
                 return Err(status);
@@ -13468,46 +13403,28 @@ impl ExecNtHandler {
         let Some(slot) = self.first_free_hosted_tp_worker_slot(target_pi) else {
             reject!(b"no-free-thread-slot", STATUS_INSUFFICIENT_RESOURCES);
         };
-        let Some((pool_slot, tid)) = self.claim_pool_thread(target_pi, start.rip, create_suspended)
-        else {
-            reject!(b"no-pool-ethread", STATUS_INSUFFICIENT_RESOURCES);
+        let publication = match self.prepare_hosted_thread_publication(
+            target_pi,
+            caller_pid,
+            start,
+            create_suspended,
+            false,
+            tp_worker_teb_va(slot),
+            nt_ulong_arg(args[1]),
+            args[0],
+            cid_ptr,
+            HostedThreadPublicationKind::Remote,
+        ) {
+            Ok(publication) => publication,
+            Err(status) => reject!(b"prepare-publication", status),
         };
-        let thread = tid as nt_process::ThreadId;
+        let tid = publication.tid();
         if !self.reserve_hosted_tp_worker_slot(target_pi, slot, tid) {
-            let _ = self
-                .pm
-                .set_thread_state(thread, nt_process::ThreadState::Initialized);
-            self.release_pool_usage_slot(target_pi, pool_slot);
+            self.abort_hosted_thread_publication(publication);
             reject!(b"reserve-thread-slot", STATUS_INSUFFICIENT_RESOURCES);
         }
-        let handle = match self.insert_process_handle(
-            caller_pid,
-            nt_process::HandleObject::Thread(thread),
-            nt_ulong_arg(args[1]),
-        ) {
-            Ok(handle) => handle as u64,
-            Err(status) => {
-                self.release_unmapped_hosted_tp_worker_slot(target_pi, slot, tid);
-                let _ = self
-                    .pm
-                    .set_thread_state(thread, nt_process::ThreadState::Initialized);
-                self.release_pool_usage_slot(target_pi, pool_slot);
-                reject!(b"handle-insert", status);
-            }
-        };
         if let Some(initial_teb) = initial_teb {
             let _ = self.remember_hosted_thread_user_stack(tid, initial_teb);
-        }
-        self.pm.set_thread_teb(thread, tp_worker_teb_va(slot));
-        let _ = self
-            .pm
-            .set_thread_create_time(thread, nt_system_time_100ns() as i64);
-        let _ = self.pm.report_existing_thread_create(thread);
-        PM_REMOTE_THREADS_CREATED.fetch_add(1, Ordering::Relaxed);
-        self.queue_write(args[0], handle);
-        if cid_ptr != 0 {
-            self.queue_write(cid_ptr, target_pid as u64);
-            self.queue_write(cid_ptr + 8, tid);
         }
         self.remote_thread_request = Some(RemoteThreadRequest {
             target_pi,
@@ -13517,6 +13434,7 @@ impl ExecNtHandler {
             cid_proc: target_pid as u64,
             cid_thread: tid,
             resume: !create_suspended,
+            publication,
         });
         print_str(b"[remote-thread] cross-vspace create caller_pi=");
         print_u64(self.pi as u64);
@@ -13545,51 +13463,32 @@ impl ExecNtHandler {
         start: nt_thread_start::Amd64ThreadContext,
         create_suspended: bool,
         hide_from_debugger: bool,
-    ) -> Result<(usize, u64, u64), u32> {
+        handle_out: u64,
+        client_id_out: u64,
+    ) -> Result<(usize, PreparedHostedThreadPublication), u32> {
         if owner_pi >= MAX_PI || start.rip == 0 {
             return Err(nt_process::STATUS_INVALID_PARAMETER);
         }
         let worker_slot = self
             .first_free_hosted_tp_worker_slot(owner_pi)
             .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
-        let (pool_slot, tid) = self
-            .claim_pool_thread(owner_pi, start.rip, create_suspended)
-            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
-        let thread = tid as nt_process::ThreadId;
-        let handle = match self.insert_process_handle(
+        let publication = self.prepare_hosted_thread_publication(
+            owner_pi,
             caller_pid,
-            nt_process::HandleObject::Thread(thread),
+            start,
+            create_suspended,
+            hide_from_debugger,
+            tp_worker_teb_va(worker_slot),
             desired_access,
-        ) {
-            Ok(handle) => handle as u64,
-            Err(status) => {
-                let _ = self
-                    .pm
-                    .set_thread_state(thread, nt_process::ThreadState::Initialized);
-                self.release_pool_usage_slot(owner_pi, pool_slot);
-                return Err(status);
-            }
-        };
-        if !self.reserve_hosted_tp_worker_slot(owner_pi, worker_slot, tid) {
-            self.abandon_created_hosted_thread_for(owner_pi, pool_slot, tid, caller_pid, handle);
+            handle_out,
+            client_id_out,
+            HostedThreadPublicationKind::General,
+        )?;
+        if !self.reserve_hosted_tp_worker_slot(owner_pi, worker_slot, publication.tid()) {
+            self.abort_hosted_thread_publication(publication);
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
-        if hide_from_debugger {
-            if let Err(status) = self.pm.set_thread_hide_from_debugger(thread) {
-                self.abandon_created_hosted_thread_for(
-                    owner_pi, pool_slot, tid, caller_pid, handle,
-                );
-                return Err(status);
-            }
-        }
-        self.pm
-            .set_thread_teb(thread, tp_worker_teb_va(worker_slot));
-        let _ = self
-            .pm
-            .set_thread_create_time(thread, nt_system_time_100ns() as i64);
-        let _ = self.pm.report_existing_thread_create(thread);
-        PM_GENERAL_THREADS_CREATED.fetch_add(1, Ordering::Relaxed);
-        Ok((worker_slot, tid, handle))
+        Ok((worker_slot, publication))
     }
 
     unsafe fn nt_create_thread_ex_service(&mut self, args: &[u64]) -> u32 {
@@ -13656,13 +13555,15 @@ impl ExecNtHandler {
 
         let create_suspended = create_flags & THREAD_CREATE_FLAGS_CREATE_SUSPENDED != 0;
         let hide_from_debugger = create_flags & THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER != 0;
-        let (slot, tid, handle) = match self.create_hosted_worker_thread_from_start(
+        let (slot, publication) = match self.create_hosted_worker_thread_from_start(
             target_pi,
             caller_pid,
             nt_ulong_arg(args[1]),
             start,
             create_suspended,
             hide_from_debugger,
+            thread_handle_out,
+            0,
         ) {
             Ok(created) => created,
             Err(status) => {
@@ -13670,11 +13571,11 @@ impl ExecNtHandler {
                 return status;
             }
         };
-        self.queue_write(thread_handle_out, handle);
         self.thread_spawn_request = Some(HostedThreadSpawnRequest::TpWorker {
             pi: target_pi,
             slot,
             start,
+            publication,
         });
 
         print_str(b"[thread-ex] create caller_pi=");
@@ -13684,7 +13585,7 @@ impl ExecNtHandler {
         print_str(b" slot=");
         print_u64(slot as u64);
         print_str(b" tid=");
-        print_u64(tid);
+        print_u64(publication.tid());
         print_str(b" entry=0x");
         print_hex((start.rip >> 32) as u32);
         print_hex(start.rip as u32);
@@ -13696,130 +13597,154 @@ impl ExecNtHandler {
         print_str(b" hide-debug=");
         print_u64(hide_from_debugger as u64);
         print_str(b" handle=0x");
-        print_hex(handle as u32);
+        print_hex(publication.handle() as u32);
         print_str(b"\n");
         0
     }
 
-    /// Claim the next free pre-created pool ETHREAD belonging to hosted process `pi` and bind the
-    /// caller-supplied start routine (alloc-free field writes, reset-safe — the pool exists so
-    /// runtime thread creation never allocates under the per-syscall bump heap). Returns
-    /// `(pool slot, tid)`, releasing the slot again on any failure. `pi` is a PARAMETER, not
-    /// `self.pi`: a cross-VSpace `NtCreateThread` creates a thread that belongs to the TARGET
-    /// process, so it must come out of the TARGET's pool.
-    pub(crate) fn claim_pool_thread(
+    /// Reserve a dormant ETHREAD identity and an exact caller handle slot without publishing either.
+    /// The service-loop owner commits this plan only after the seL4 mechanism and runtime record exist.
+    fn prepare_hosted_thread_publication(
         &mut self,
-        pi: usize,
-        entry: u64,
+        owner_pi: usize,
+        caller_pid: nt_process::ProcessId,
+        start: nt_thread_start::Amd64ThreadContext,
         create_suspended: bool,
-    ) -> Option<(usize, u64)> {
-        let mut skipped = 0u64;
-        loop {
-            let slot = self.claim_pool_usage_slot_excluding(pi, skipped)?;
-            let Some(tid32) = self.pm_pool_tid_for_slot(pi, slot) else {
-                self.release_pool_usage_slot(pi, slot);
-                skipped |= 1u64 << slot;
-                crate::PM_POOL_UNRECLAIMABLE_SKIPS.fetch_add(1, Ordering::Relaxed);
-                continue;
-            };
-            let tid = tid32 as u64;
-            let t = tid as nt_process::ThreadId;
-            let prepared = if self
-                .pm
-                .thread(t)
-                .is_some_and(|thread| thread.state == nt_process::ThreadState::Terminated)
-            {
-                self.pm
-                    .reuse_reclaimed_thread(t, entry, create_suspended)
-                    .is_ok()
-            } else {
-                self.pm.set_thread_start_address(t, entry)
-                    && if create_suspended {
-                        self.pm.suspend_thread(t).is_ok()
-                    } else {
-                        self.pm
-                            .set_thread_state(t, nt_process::ThreadState::Running)
-                            .is_ok()
-                    }
-            };
-            if prepared {
-                return Some((slot, tid));
-            }
-            self.release_pool_usage_slot(pi, slot);
-            skipped |= 1u64 << slot;
-            crate::PM_POOL_UNRECLAIMABLE_SKIPS.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// General NtCreateThread: claim the next real pool ETHREAD for the caller (`self.pi`) — bind the
-    /// caller-supplied start routine + parameter (all alloc-free field writes, reset-safe),
-    /// and mint a TYPED `Thread(tid)` handle in the caller's EPROCESS handle table (dense value, so
-    /// `NtQueryInformationThread` resolves the handle VALUE → the real ETHREAD). Returns
-    /// `(slot, tid, handle)`
-    /// or `None` if the caller has no free pool ETHREAD. The seL4 TCB is spawned separately by the loop.
-    pub(crate) fn nt_create_thread_handle(
-        &mut self,
-        entry: u64,
-        create_suspended: bool,
+        hide_from_debugger: bool,
+        teb_base: u64,
         desired_access: u32,
-    ) -> Option<(usize, u64, u64)> {
-        let pid = self.pm_pid_for_pi(self.pi)?;
-        let (slot, tid) = match self.claim_pool_thread(self.pi, entry, create_suspended) {
-            Some(claimed) => claimed,
-            None => {
-                // A refused runtime thread create surfaces to the caller only as
-                // STATUS_INSUFFICIENT_RESOURCES (rpcrt4 prints `error=5aa` and drops the
-                // connection), so NAME the reason: which pool, how full, and whether the pre-created
-                // ETHREAD pool had a slot at all.
+        handle_out: u64,
+        client_id_out: u64,
+        kind: HostedThreadPublicationKind,
+    ) -> Result<PreparedHostedThreadPublication, u32> {
+        let mut skipped = 0u64;
+        let (pool_slot, activation) = loop {
+            let Some(slot) = self.claim_pool_usage_slot_excluding(owner_pi, skipped) else {
                 if crate::PM_POOL_REFUSALS.fetch_add(1, Ordering::Relaxed) < 8 {
                     unsafe {
                         print_str(b"[thread-pool] REFUSED NtCreateThread pi=");
-                        print_u64(self.pi as u64);
+                        print_u64(owner_pi as u64);
                         print_str(b" used-mask=0x");
-                        print_hex(self.pool_used_mask(self.pi) as u32);
+                        print_hex(self.pool_used_mask(owner_pi) as u32);
                         print_str(b" slots=");
                         print_u64(PM_RUNTIME_THREAD_SLOTS as u64);
                         print_str(b" skipped=");
                         print_u64(crate::PM_POOL_UNRECLAIMABLE_SKIPS.load(Ordering::Relaxed));
-                        print_str(b" pool-tids:");
-                        for index in 0..PM_RUNTIME_THREAD_SLOTS {
-                            print_str(b" ");
-                            print_u64(
-                                self.pm_pool_tid_for_slot(self.pi, index)
-                                    .map(u64::from)
-                                    .unwrap_or(0),
-                            );
-                        }
                         print_str(b"\n");
                     }
                 }
-                return None;
+                return Err(STATUS_INSUFFICIENT_RESOURCES);
+            };
+            let Some(tid) = self.pm_pool_tid_for_slot(owner_pi, slot) else {
+                self.release_pool_usage_slot(owner_pi, slot);
+                skipped |= 1u64 << slot;
+                crate::PM_POOL_UNRECLAIMABLE_SKIPS.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            match self.pm.prepare_thread_activation(
+                tid,
+                start.rip,
+                start.rcx,
+                create_suspended,
+                teb_base,
+                nt_system_time_100ns() as i64,
+                hide_from_debugger,
+            ) {
+                Ok(activation) => break (slot, activation),
+                Err(_) => {
+                    self.release_pool_usage_slot(owner_pi, slot);
+                    skipped |= 1u64 << slot;
+                    crate::PM_POOL_UNRECLAIMABLE_SKIPS.fetch_add(1, Ordering::Relaxed);
+                }
             }
         };
-        let t = tid as nt_process::ThreadId;
-        let h = match self.insert_process_handle(
-            pid,
-            nt_process::HandleObject::Thread(t),
+
+        let capacity = self.pm.handle_capacity(caller_pid);
+        let handle = match self.pm.try_reserve_handle_slot(caller_pid) {
+            Ok(reservation) => reservation,
+            Err(status) => {
+                self.release_pool_usage_slot(owner_pi, pool_slot);
+                return Err(status);
+            }
+        };
+        if self.pm.handle_capacity(caller_pid) > capacity {
+            PM_HANDLE_CAP_GROWTHS.fetch_add(1, Ordering::Relaxed);
+            PM_HANDLE_CAP_MAX.fetch_max(
+                self.pm.handle_capacity(caller_pid) as u64,
+                Ordering::Relaxed,
+            );
+        }
+        if let Err(status) = self.pm.bind_reserved_handle(
+            handle,
+            nt_process::HandleObject::Thread(activation.thread_id()),
             desired_access,
         ) {
-            Ok(handle) => handle,
-            Err(_) => {
-                if create_suspended {
-                    let _ = self.pm.resume_thread(t);
-                }
-                let _ = self
-                    .pm
-                    .set_thread_state(t, nt_process::ThreadState::Initialized);
-                self.release_pool_usage_slot(self.pi, slot);
-                return None;
-            }
-        };
-        let _ = self
+            let _ = self.pm.cancel_reserved_handle(handle);
+            self.release_pool_usage_slot(owner_pi, pool_slot);
+            return Err(status);
+        }
+        Ok(PreparedHostedThreadPublication {
+            owner_pi,
+            pool_slot,
+            activation,
+            handle,
+            handle_out,
+            client_id_out,
+            kind,
+        })
+    }
+
+    pub(crate) fn abort_hosted_thread_publication(
+        &mut self,
+        publication: PreparedHostedThreadPublication,
+    ) {
+        let _ = self.pm.cancel_bound_handle(publication.handle);
+        self.release_pool_usage_slot(publication.owner_pi, publication.pool_slot);
+        if publication.handle_out != 0 {
+            self.queue_write(publication.handle_out, 0);
+        }
+        if publication.client_id_out != 0 {
+            self.queue_write(publication.client_id_out, 0);
+            self.queue_write(publication.client_id_out + 8, 0);
+        }
+    }
+
+    pub(crate) fn commit_hosted_thread_publication(
+        &mut self,
+        publication: PreparedHostedThreadPublication,
+    ) {
+        self.pm
+            .commit_thread_activation(publication.activation)
+            .expect(
+                "serialized hosted ETHREAD activation remains current through mechanism admission",
+            );
+        let handle = self
             .pm
-            .set_thread_create_time(t, nt_system_time_100ns() as i64);
-        let _ = self.pm.report_existing_thread_create(t);
-        PM_GENERAL_THREADS_CREATED.fetch_add(1, Ordering::Relaxed);
-        Some((slot, tid, h as u64))
+            .publish_reserved_handle(publication.handle)
+            .expect("bound hosted thread handle remains reserved through ETHREAD activation");
+        PM_HANDLE_PEAK.fetch_max(
+            self.pm.handle_count(publication.handle.process_id) as u64,
+            Ordering::Relaxed,
+        );
+        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+        match publication.kind {
+            HostedThreadPublicationKind::General => {
+                PM_GENERAL_THREADS_CREATED.fetch_add(1, Ordering::Relaxed);
+            }
+            HostedThreadPublicationKind::Remote => {
+                PM_REMOTE_THREADS_CREATED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let tid = publication.activation.thread_id();
+        let _ = self.pm.report_existing_thread_create(tid);
+        self.queue_write(publication.handle_out, handle as u64);
+        if publication.client_id_out != 0 {
+            self.queue_write(
+                publication.client_id_out,
+                publication.activation.process_id() as u64,
+            );
+            self.queue_write(publication.client_id_out + 8, tid as u64);
+        }
     }
 
     fn next_role_owned_local_thread_spec(&self) -> Option<RoleOwnedLocalThreadSpec> {
@@ -13890,29 +13815,53 @@ impl ExecNtHandler {
         let initial_teb =
             nt_thread_start::InitialTeb64::read(|address| smss_stack_read(address), initial_teb_va);
         let create_suspended = nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
-        let Some((slot, tid, handle)) =
-            self.nt_create_thread_handle(start.rip, create_suspended, nt_ulong_arg(args[1]))
-        else {
-            return STATUS_INSUFFICIENT_RESOURCES;
+        let pid = self.current_pm_pid().ok_or(STATUS_INVALID_HANDLE);
+        let pid = match pid {
+            Ok(pid) => pid,
+            Err(status) => return status,
         };
-        if !self.reserve_created_hosted_thread_role(slot, tid, handle, spec.badge, spec.role) {
+        let publication = match self.prepare_hosted_thread_publication(
+            self.pi,
+            pid,
+            start,
+            create_suspended,
+            false,
+            spec.teb,
+            nt_ulong_arg(args[1]),
+            args[0],
+            args[NT_CREATE_THREAD_CLIENT_ID_ARG],
+            HostedThreadPublicationKind::General,
+        ) {
+            Ok(publication) => publication,
+            Err(status) => return status,
+        };
+        if self
+            .hosted_thread_tid_for_role(self.pi, spec.role)
+            .is_some()
+            || !self.reserve_hosted_thread_runtime(
+                self.pi,
+                publication.tid(),
+                spec.badge,
+                spec.role,
+            )
+        {
+            self.abort_hosted_thread_publication(publication);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
-        self.pm
-            .set_thread_teb(tid as nt_process::ThreadId, spec.teb);
-        let pid = self.current_pm_pid().unwrap_or(0);
-        self.queue_write(args[0], handle);
-        let cid_ptr = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
-        if cid_ptr != 0 {
-            self.queue_write(cid_ptr, pid as u64);
-            self.queue_write(cid_ptr + 8, tid);
-        }
+        let _ = self.remember_hosted_thread_user_stack(publication.tid(), initial_teb);
         self.thread_spawn_request = Some(HostedThreadSpawnRequest::Multiplexed {
             kind: spec.spawn_kind,
             start,
             initial_teb,
+            publication,
         });
-        self.trace_role_owned_local_thread_create(args, spec, start, handle, tid);
+        self.trace_role_owned_local_thread_create(
+            args,
+            spec,
+            start,
+            publication.handle(),
+            publication.tid(),
+        );
         0
     }
 
@@ -14116,30 +14065,34 @@ impl ExecNtHandler {
             .map(|spec| spec.worker_kind.worker_role(tp_slot))
             .unwrap_or(HostedThreadRole::TpWorker { slot: tp_slot });
 
-        let Some((pool_slot, tid, handle)) =
-            self.nt_create_thread_handle(start.rip, create_suspended, nt_ulong_arg(args[1]))
-        else {
-            return Some(0xC000_009A);
+        let publication = match self.prepare_hosted_thread_publication(
+            self.pi,
+            pid,
+            start,
+            create_suspended,
+            false,
+            tp_worker_teb_va(tp_slot),
+            nt_ulong_arg(args[1]),
+            args[0],
+            args[NT_CREATE_THREAD_CLIENT_ID_ARG],
+            HostedThreadPublicationKind::General,
+        ) {
+            Ok(publication) => publication,
+            Err(status) => return Some(status),
         };
+        let tid = publication.tid();
         if !self.reserve_hosted_worker_window_slot(self.pi, tp_slot, tid, hosted_role) {
-            self.abandon_created_hosted_thread(pool_slot, tid, handle);
+            self.abort_hosted_thread_publication(publication);
             return Some(0xC000_009A);
         }
         if let Some(initial_teb) = initial_teb {
             let _ = self.remember_hosted_thread_user_stack(tid, initial_teb);
         }
-        self.pm
-            .set_thread_teb(tid as nt_process::ThreadId, tp_worker_teb_va(tp_slot));
-        self.queue_write(args[0], handle);
-        let cid_ptr = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
-        if cid_ptr != 0 {
-            self.queue_write(cid_ptr, pid as u64);
-            self.queue_write(cid_ptr + 8, tid);
-        }
         self.thread_spawn_request = Some(HostedThreadSpawnRequest::TpWorker {
             pi: self.pi,
             slot: tp_slot,
             start,
+            publication,
         });
         print_str(b"[tp-worker] claimed pi=");
         print_u64(self.pi as u64);
@@ -33014,44 +32967,47 @@ impl ExecNtHandler {
                             |address| smss_stack_read(address),
                             ctx_va,
                         );
-                        if let Some((slot, tid, handle)) = self.nt_create_thread_handle(
-                            start.rip,
-                            create_suspended,
-                            nt_ulong_arg(args[1]),
-                        ) {
+                        if let Some(slot) = self.first_free_hosted_tp_worker_slot(self.pi) {
                             let (role, teb) = match slot {
                                 0 => (HostedThreadRole::CsrApi, tp_worker_teb_va(slot)),
                                 1 => (HostedThreadRole::CsrSbApi, tp_worker_teb_va(slot)),
-                                _ => {
-                                    self.abandon_created_hosted_thread(slot, tid, handle);
-                                    return 0xC000_009A;
-                                }
+                                _ => return 0xC000_009A,
                             };
+                            let pid = self.current_pm_pid().unwrap_or(0);
+                            let publication = match self.prepare_hosted_thread_publication(
+                                self.pi,
+                                pid,
+                                start,
+                                create_suspended,
+                                false,
+                                teb,
+                                nt_ulong_arg(args[1]),
+                                args[0],
+                                args[NT_CREATE_THREAD_CLIENT_ID_ARG],
+                                HostedThreadPublicationKind::General,
+                            ) {
+                                Ok(publication) => publication,
+                                Err(status) => return status,
+                            };
+                            let tid = publication.tid();
                             let reserved =
                                 self.reserve_hosted_worker_window_slot(self.pi, slot, tid, role);
                             if !reserved {
-                                self.abandon_created_hosted_thread(slot, tid, handle);
+                                self.abort_hosted_thread_publication(publication);
                                 return 0xC000_009A;
-                            }
-                            self.pm.set_thread_teb(tid as nt_process::ThreadId, teb);
-                            let pid = self.current_pm_pid().unwrap_or(0);
-                            self.queue_write(args[0], handle);
-                            let cid_ptr = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
-                            if cid_ptr != 0 {
-                                self.queue_write(cid_ptr, pid as u64);
-                                self.queue_write(cid_ptr + 8, tid);
                             }
                             self.thread_spawn_request = Some(HostedThreadSpawnRequest::TpWorker {
                                 pi: self.pi,
                                 slot,
                                 start,
+                                publication,
                             });
                             print_str(b"[csr-thread] create slot=");
                             print_u64(slot as u64);
                             print_str(b" tid=");
                             print_u64(tid);
                             print_str(b" handle=0x");
-                            print_hex(handle as u32);
+                            print_hex(publication.handle() as u32);
                             print_str(b" suspended=");
                             print_u64(create_suspended as u64);
                             print_str(b"\n");
@@ -33099,32 +33055,44 @@ impl ExecNtHandler {
                         };
                         let create_suspended =
                             nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
-                        let handle = match self.insert_process_handle(
-                            caller_pid,
+                        let handle_capacity = self.pm.handle_capacity(caller_pid);
+                        let handle_reservation = match self.pm.try_reserve_handle_slot(caller_pid) {
+                            Ok(reservation) => reservation,
+                            Err(status) => return status,
+                        };
+                        if let Err(status) = self.pm.bind_reserved_handle(
+                            handle_reservation,
                             nt_process::HandleObject::Thread(tid),
                             nt_ulong_arg(args[1]),
                         ) {
-                            Ok(handle) => handle as u64,
-                            Err(status) => return status,
-                        };
-                        self.queue_write(args[0], handle);
-                        let cid_ptr = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
-                        if cid_ptr != 0 {
-                            self.queue_write(cid_ptr, target_pid as u64);
-                            self.queue_write(cid_ptr + 8, tid as u64);
+                            let _ = self.pm.cancel_reserved_handle(handle_reservation);
+                            return status;
                         }
                         if create_suspended {
                             if let Err(status) = self.pm.suspend_thread(tid) {
+                                let _ = self.pm.cancel_bound_handle(handle_reservation);
                                 return status;
                             }
                         } else if let Some(target_pi) = self.pi_for_pid(target_pid) {
                             let tcb = self.hosted_main_thread_tcb_for_pi(target_pi).unwrap_or(0);
                             if tcb <= 1 || tcb_resume(tcb) != 0 {
+                                let _ = self.pm.cancel_bound_handle(handle_reservation);
                                 return 0xC000_0001;
                             }
                             let _ = self
                                 .pm
                                 .set_thread_state(tid, nt_process::ThreadState::Ready);
+                        }
+                        let handle =
+                            self.pm.publish_reserved_handle(handle_reservation).expect(
+                                "main hosted TCB admission preserves its bound thread handle",
+                            ) as u64;
+                        self.record_process_handle_insert(caller_pid, handle_capacity);
+                        self.queue_write(args[0], handle);
+                        let cid_ptr = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
+                        if cid_ptr != 0 {
+                            self.queue_write(cid_ptr, target_pid as u64);
+                            self.queue_write(cid_ptr + 8, tid as u64);
                         }
                         let trace = THREAD_LIFECYCLE_TRACE_N.fetch_add(1, Ordering::Relaxed);
                         if trace < 4 {
@@ -33184,11 +33152,14 @@ impl ExecNtHandler {
                             |address| smss_stack_read(address),
                             ctx_va,
                         );
-                        if let Some((slot, tid, handle)) = self.nt_create_thread_handle(
-                            start.rip,
-                            create_suspended,
-                            nt_ulong_arg(args[1]),
-                        ) {
+                        if let Some(slot) = (0..3).find(|slot| {
+                            let role = if *slot == 0 {
+                                HostedThreadRole::WinlogonListener
+                            } else {
+                                HostedThreadRole::WinlogonWorker { slot: *slot }
+                            };
+                            self.hosted_thread_tid_for_role(self.pi, role).is_none()
+                        }) {
                             let (role, badge, teb) = match slot {
                                 0 => (
                                     HostedThreadRole::WinlogonListener,
@@ -33205,28 +33176,35 @@ impl ExecNtHandler {
                                     WINLOGON_WORKER3_BADGE,
                                     WL_WORKER3_TEB_VA,
                                 ),
-                                _ => {
-                                    self.abandon_created_hosted_thread(slot, tid, handle);
-                                    return 0xC000_009A;
-                                }
+                                _ => return 0xC000_009A,
                             };
-                            if !self
-                                .reserve_created_hosted_thread_role(slot, tid, handle, badge, role)
-                            {
+                            let pid = self.current_pm_pid().unwrap_or(0);
+                            let publication = match self.prepare_hosted_thread_publication(
+                                self.pi,
+                                pid,
+                                start,
+                                create_suspended,
+                                false,
+                                teb,
+                                nt_ulong_arg(args[1]),
+                                args[0],
+                                cid_ptr,
+                                HostedThreadPublicationKind::General,
+                            ) {
+                                Ok(publication) => publication,
+                                Err(status) => return status,
+                            };
+                            let tid = publication.tid();
+                            if !self.reserve_hosted_thread_runtime(self.pi, tid, badge, role) {
+                                self.abort_hosted_thread_publication(publication);
                                 return 0xC000_009A;
                             }
                             let _ = self.remember_hosted_thread_user_stack(tid, initial_stack);
-                            self.pm.set_thread_teb(tid as nt_process::ThreadId, teb);
-                            let pid = self.current_pm_pid().unwrap_or(0);
-                            self.queue_write(args[0], handle); // *ThreadHandle = R10
-                            if cid_ptr != 0 {
-                                self.queue_write(cid_ptr, pid as u64); // ClientId.UniqueProcess
-                                self.queue_write(cid_ptr + 8, tid); // ClientId.UniqueThread
-                            }
                             self.thread_spawn_request = Some(HostedThreadSpawnRequest::Winlogon {
                                 slot,
                                 start,
                                 initial_teb: initial_stack,
+                                publication,
                             });
                             let trace = THREAD_LIFECYCLE_TRACE_N.fetch_add(1, Ordering::Relaxed);
                             if trace < 4 {
@@ -33260,7 +33238,7 @@ impl ExecNtHandler {
                                 print_str(b" alloc_base=0x");
                                 print_hex(initial_stack.allocated_stack_base as u32);
                                 print_str(b" handle=0x");
-                                print_hex(handle as u32);
+                                print_hex(publication.handle() as u32);
                                 print_str(b" tid=");
                                 print_u64(tid);
                                 print_str(b" suspended=");
