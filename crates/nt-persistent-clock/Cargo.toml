@@ -1,0 +1,11 @@
+[package]
+name = "nt-persistent-clock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nt-time.workspace = true
+
+[lib]
+path = "src/lib.rs"

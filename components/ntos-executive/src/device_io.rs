@@ -726,6 +726,44 @@ pub(crate) unsafe fn issue_ioport_cap(dest_slot: u64, first: u16, last: u16) -> 
     reply >> 12
 }
 
+/// `out dx, al` via an I/O-port cap. Returns the kernel invocation label (0 = success).
+pub(crate) unsafe fn io_out8(ioport: u64, port: u16, value: u8) -> u64 {
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") ioport => _,
+        inout("rsi") (LBL_IOPORT_OUT8 << 12) | 2 => reply,
+        inout("r10") port as u64 => _,
+        inout("r8") value as u64 => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
+        lateout("r9") _, lateout("r15") _,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+
+/// `in al, dx` via an I/O-port cap. Returns `(value, kernel invocation label)`.
+pub(crate) unsafe fn io_in8_r(ioport: u64, port: u16) -> (u8, u64) {
+    let value: u64;
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        in("rdx") SYS_CALL as u64,
+        inout("rdi") ioport => _,
+        inout("rsi") ((LBL_IOPORT_IN8 << 12) | 1) => reply,
+        inout("r10") port as u64 => value,
+        in("r12") 0u64,
+        in("r13") 0u64,
+        lateout("r8") _, lateout("r9") _, lateout("r15") _,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    (value as u8, reply >> 12)
+}
+
 /// `out dx, ax` via an I/O-port cap. Returns the kernel invocation label (0 = success).
 pub(crate) unsafe fn io_out16(ioport: u64, port: u16, value: u16) -> u64 {
     let reply: u64;

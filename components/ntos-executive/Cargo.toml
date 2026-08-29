@@ -88,6 +88,7 @@ nt-loader-trace = { path = "../../crates/nt-loader-trace" }
 nt-user-timer = { path = "../../crates/nt-user-timer" }
 nt-delay-execution = { path = "../../crates/nt-delay-execution" }
 nt-time = { path = "../../crates/nt-time" }
+nt-persistent-clock = { path = "../../crates/nt-persistent-clock" }
 nt-thread-start = { path = "../../crates/nt-thread-start" }
 nt-user-callback = { path = "../../crates/nt-user-callback" }
 nt-user-host = { path = "../../crates/nt-user-host" }

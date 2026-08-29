@@ -9,6 +9,18 @@ pub const UNIX_EPOCH_IN_NT_SECONDS: i64 = 11_644_473_600;
 pub const TICKS_PER_SECOND: u64 = 10_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UtcDateTime {
+    pub year: i32,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+    /// Sunday is zero, matching NT's `TIME_FIELDS.Weekday`.
+    pub weekday: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimeSnapshot {
     pub monotonic_100ns: u64,
     pub system_time_100ns: u64,
@@ -112,6 +124,89 @@ pub fn system_time_from_unix_seconds(unix_seconds: i64) -> Result<u64, ClockErro
         return Err(ClockError::InvalidSystemTime);
     }
     Ok(ticks as u64)
+}
+
+pub fn unix_seconds_from_system_time(system_time_100ns: u64) -> Result<i64, ClockError> {
+    validate_system_time(system_time_100ns)?;
+    let nt_seconds = system_time_100ns / TICKS_PER_SECOND;
+    i64::try_from(nt_seconds)
+        .ok()
+        .and_then(|seconds| seconds.checked_sub(UNIX_EPOCH_IN_NT_SECONDS))
+        .ok_or(ClockError::InvalidSystemTime)
+}
+
+pub fn system_time_from_utc_date_time(value: UtcDateTime) -> Result<u64, ClockError> {
+    if value.year < 1601
+        || !(1..=12).contains(&value.month)
+        || value.day == 0
+        || value.day > days_in_month(value.year, value.month)
+        || value.hour > 23
+        || value.minute > 59
+        || value.second > 59
+    {
+        return Err(ClockError::InvalidSystemTime);
+    }
+    let days = days_from_civil(value.year, value.month, value.day);
+    let seconds = i128::from(days) * 86_400
+        + i128::from(value.hour) * 3_600
+        + i128::from(value.minute) * 60
+        + i128::from(value.second);
+    let seconds = i64::try_from(seconds).map_err(|_| ClockError::InvalidSystemTime)?;
+    system_time_from_unix_seconds(seconds)
+}
+
+pub fn utc_date_time_from_system_time(system_time_100ns: u64) -> Result<UtcDateTime, ClockError> {
+    let unix_seconds = unix_seconds_from_system_time(system_time_100ns)?;
+    let days = unix_seconds.div_euclid(86_400);
+    let seconds = unix_seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    Ok(UtcDateTime {
+        year,
+        month,
+        day,
+        hour: (seconds / 3_600) as u8,
+        minute: (seconds % 3_600 / 60) as u8,
+        second: (seconds % 60) as u8,
+        weekday: (days + 4).rem_euclid(7) as u8,
+    })
+}
+
+const fn is_leap_year(year: i32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+const fn days_in_month(year: i32, month: u8) -> u8 {
+    match month {
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+fn days_from_civil(year: i32, month: u8, day: u8) -> i64 {
+    let adjusted_year = i64::from(year) - i64::from(month <= 2);
+    let era = adjusted_year.div_euclid(400);
+    let year_of_era = adjusted_year - era * 400;
+    let shifted_month = i64::from(month) + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+fn civil_from_days(days: i64) -> (i32, u8, u8) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = shifted_month + if shifted_month < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year as i32, month as u8, day as u8)
 }
 
 /// Deadline domain retained for the full lifetime of an NT wait or timer.
@@ -240,6 +335,67 @@ mod tests {
         );
         assert_eq!(
             system_time_from_unix_seconds(i64::MAX),
+            Err(ClockError::InvalidSystemTime)
+        );
+        assert_eq!(
+            unix_seconds_from_system_time(116_444_736_000_000_000),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn utc_calendar_conversion_handles_epoch_and_gregorian_boundaries() {
+        for value in [
+            UtcDateTime {
+                year: 1601,
+                month: 1,
+                day: 1,
+                hour: 0,
+                minute: 0,
+                second: 0,
+                weekday: 1,
+            },
+            UtcDateTime {
+                year: 1970,
+                month: 1,
+                day: 1,
+                hour: 0,
+                minute: 0,
+                second: 0,
+                weekday: 4,
+            },
+            UtcDateTime {
+                year: 2000,
+                month: 2,
+                day: 29,
+                hour: 23,
+                minute: 59,
+                second: 58,
+                weekday: 2,
+            },
+            UtcDateTime {
+                year: 2100,
+                month: 3,
+                day: 1,
+                hour: 12,
+                minute: 34,
+                second: 56,
+                weekday: 1,
+            },
+        ] {
+            let encoded = system_time_from_utc_date_time(value).unwrap();
+            assert_eq!(utc_date_time_from_system_time(encoded).unwrap(), value);
+        }
+        assert_eq!(
+            system_time_from_utc_date_time(UtcDateTime {
+                year: 2100,
+                month: 2,
+                day: 29,
+                hour: 0,
+                minute: 0,
+                second: 0,
+                weekday: 0,
+            }),
             Err(ClockError::InvalidSystemTime)
         );
     }

@@ -16682,3 +16682,43 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     transaction that re-reads authoritative platform time and republishes/re-arms through the same
     clock-change post-action. Absence and I/O failure must remain explicit statuses, never a cached or
     synthetic success.
+
+    Dynamic persistent-clock authority and durable system-time updates (2026-08-30, accepted): the
+    new host-tested, `no_std` `nt-persistent-clock` crate owns a growable provider registry with
+    generation/cookie identities, explicit activation and removal, and active-provider-only I/O.
+    A failed active provider never retries an alternate. Its first provider is a capability-neutral
+    PC CMOS codec with bounded update polling, stable double reads, binary/BCD and 12/24-hour
+    support, optional FADT century-register support, preserved NMI/RTC mode, and validated Gregorian
+    conversion through `nt-time`.
+
+    rust-micro now validates the ACPI FADT checksum and IA-PC boot-architecture RTC-present flag,
+    then publishes a typed persistent-clock resource descriptor in BootInfo. The executive does not
+    know CMOS port numbers: it consumes that descriptor, obtains only the advertised I/O-port
+    capability window, dynamically registers and probes the provider, and fails explicitly when the
+    platform resource is absent or invalid. The bootstrap clock remains the initial authority;
+    successful provider discovery adds persistence without becoming a silent boot fallback.
+
+    `NtSetSystemTime` now writes a non-null UTC adjustment to the active provider before moving the
+    adjustable system clock. It applies the effective timezone bias when the SYSTEM hive says the
+    hardware clock is local, while `RealTimeIsUniversal` leaves UTC unchanged. The null form
+    transactionally re-reads both the provider and current SYSTEM-hive timezone policy, committing
+    those values only with a successful clock change, then uses the same generation publication,
+    absolute-deadline drain, and HPET re-arm post-action as an explicit adjustment. Missing
+    providers, transport failures, invalid clock data, and out-of-range times return distinct
+    failures; no cached or synthetic success remains.
+
+    Focused validation passes `nt-time` `9/9`, `nt-persistent-clock` `5/5`, the production
+    rust-micro external-rootserver build, the freestanding executive at the established 209-warning
+    baseline, the executive release build/staging path, and `git diff --check`. The serialized live
+    gate registers provider identity `1/1`, reads RTC time `134324897510000000` matching the
+    authoritative bootstrap timestamp exactly, launches genuine userinit and Explorer, records 687
+    real api0 redirects with zero callback failures, paints `480000/480000` framebuffer pixels with
+    at least 32 colours, passes all `295/295` gates, and matches the sentinel.
+
+    Review adjustment: the shared time model, bootstrap epoch, dynamic persistent-clock provider,
+    durable writeback, and null refresh transaction are closed. `NtSetSystemTime` reduces the
+    canonical typed-service gap to 44 exports. Return to the general canonical ABI inventory and
+    select the next bounded Ob/Ps/Se/Mm/I/O trait from the pinned ReactOS target, keeping policy in
+    user mode and implementing its independently testable mechanism in a focused crate before
+    executive wiring. Do not expand the executive with another boot-specific probe while a general
+    NT trait remains missing.

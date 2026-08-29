@@ -34,8 +34,10 @@ const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 const STATUS_OBJECT_PATH_SYNTAX_BAD: u32 = 0xC000_003B;
 const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+const STATUS_DEVICE_DATA_ERROR: u32 = 0xC000_009C;
 const STATUS_UNHANDLED_EXCEPTION: u32 = 0xC000_0144;
 const STATUS_DEVICE_NOT_READY: u32 = 0xC000_00A3;
+const STATUS_IO_DEVICE_ERROR: u32 = 0xC000_0185;
 const HIGHEST_USER_ADDRESS: u64 = 0x0000_07ff_fffe_ffff;
 const NT_CREATE_THREAD_CLIENT_ID_ARG: usize = 4;
 const NT_CREATE_THREAD_CONTEXT_ARG: usize = 5;
@@ -2449,6 +2451,15 @@ fn seed_time_zone(
     information
 }
 
+fn seed_real_time_is_universal(hives: &nt_hive_core::MutableHiveSet) -> bool {
+    const REG_DWORD: u32 = 4;
+    hives
+        .resolve_key(r"\Registry\Machine\System\CurrentControlSet\Control\TimeZoneInformation")
+        .and_then(|key| hives.query_value(key, "RealTimeIsUniversal"))
+        .filter(|(value_type, data)| *value_type as u32 == REG_DWORD && data.len() == 4)
+        .is_some_and(|(_, data)| u32::from_le_bytes(data.try_into().unwrap()) != 0)
+}
+
 fn effective_time_zone(
     information: &nt_kernel_exec::timezone::TimeZoneInformation,
     current_time: u64,
@@ -2477,6 +2488,23 @@ pub(crate) unsafe fn publish_time_zone(
             );
         })
     };
+}
+
+fn adjusted_native_time(time_100ns: u64, delta_100ns: i64) -> Option<u64> {
+    let adjusted = i128::from(time_100ns) + i128::from(delta_100ns);
+    (adjusted >= 0 && adjusted <= i128::from(nt_time::MAX_SYSTEM_TIME_100NS))
+        .then_some(adjusted as u64)
+}
+
+fn persistent_clock_error_status(error: nt_persistent_clock::ClockError) -> u32 {
+    match error {
+        nt_persistent_clock::ClockError::NoProvider => STATUS_NOT_SUPPORTED,
+        nt_persistent_clock::ClockError::Transport
+        | nt_persistent_clock::ClockError::UpdateInProgress
+        | nt_persistent_clock::ClockError::UnstableRead => STATUS_IO_DEVICE_ERROR,
+        nt_persistent_clock::ClockError::InvalidClock
+        | nt_persistent_clock::ClockError::TimeOutOfRange => STATUS_DEVICE_DATA_ERROR,
+    }
 }
 
 #[inline(never)]
@@ -2988,6 +3016,7 @@ impl ExecNtHandler {
             print_str(b")\n");
         }
         let time_zone_information = seed_time_zone(&mutable_hives);
+        let real_time_is_universal = seed_real_time_is_universal(&mutable_hives);
         unsafe { publish_time_zone(&time_zone_information, nt_system_time_100ns()) };
         let BootstrapProcessManagerSeed {
             pm,
@@ -3025,6 +3054,7 @@ impl ExecNtHandler {
         write_field!(registry_machine_root_security_descriptor, None);
         write_field!(registry_user_root_security_descriptor, None);
         write_field!(time_zone_information, time_zone_information);
+        write_field!(real_time_is_universal, real_time_is_universal);
         write_field!(obj_ns, build_initial_object_namespace());
         write_field!(events, nt_kernel_exec::EventStore::with_capacity(192));
         write_field!(user_timers, nt_user_timer::TimerTable::with_capacity(32));
@@ -17224,26 +17254,14 @@ impl ExecNtHandler {
         let new_time = args[0];
         let previous_time = args[1];
         if ctx.previous_mode != nt_syscall::ProcessorMode::KernelMode
-            && (new_time & 7 != 0 || previous_time != 0 && previous_time & 7 != 0)
+            && (new_time != 0 && new_time & 7 != 0 || previous_time != 0 && previous_time & 7 != 0)
         {
             return STATUS_DATATYPE_MISALIGNMENT;
         }
-        if new_time == 0
-            || !self.probe_user_input(new_time, 8)
+        if new_time != 0 && !self.probe_user_input(new_time, 8)
             || previous_time != 0 && !self.probe_user_output(previous_time, 8)
         {
             return STATUS_ACCESS_VIOLATION;
-        }
-        let mut encoded = [0u8; 8];
-        if !self.xas_read(new_time, &mut encoded) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        let captured = i64::from_le_bytes(encoded);
-        if captured < 0
-            || nt_time::validate_system_time(captured as u64)
-                == Err(nt_time::ClockError::InvalidSystemTime)
-        {
-            return STATUS_INVALID_PARAMETER;
         }
         if ctx.previous_mode != nt_syscall::ProcessorMode::KernelMode
             && !self.current_token_has_privilege(nt_security::SE_SYSTEM_TIME)
@@ -17251,11 +17269,66 @@ impl ExecNtHandler {
             return STATUS_PRIVILEGE_NOT_HELD;
         }
 
-        let change = match nt_set_system_time_100ns(captured as u64) {
+        let refreshed_time_zone =
+            (new_time == 0).then(|| seed_time_zone(&self.mutable_hives));
+        let refreshed_real_time_is_universal =
+            (new_time == 0).then(|| seed_real_time_is_universal(&self.mutable_hives));
+        let requested_system_time = if new_time == 0 {
+            let persistent_time = match persistent_clock_read_100ns() {
+                Ok(time) => time,
+                Err(error) => return persistent_clock_error_status(error),
+            };
+            if refreshed_real_time_is_universal.unwrap() {
+                persistent_time
+            } else {
+                let current = nt_system_time_100ns();
+                let bias = effective_time_zone(refreshed_time_zone.as_ref().unwrap(), current)
+                    .bias_100ns;
+                let Some(system_time) = adjusted_native_time(persistent_time, bias) else {
+                    return STATUS_INVALID_PARAMETER;
+                };
+                system_time
+            }
+        } else {
+            let mut encoded = [0u8; 8];
+            if !self.xas_read(new_time, &mut encoded) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            let captured = i64::from_le_bytes(encoded);
+            if captured < 0
+                || nt_time::validate_system_time(captured as u64)
+                    == Err(nt_time::ClockError::InvalidSystemTime)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+            captured as u64
+        };
+
+        if new_time != 0 {
+            let persistent_time = if self.real_time_is_universal {
+                requested_system_time
+            } else {
+                let bias = effective_time_zone(&self.time_zone_information, requested_system_time)
+                    .bias_100ns;
+                let Some(local_time) = adjusted_native_time(requested_system_time, -bias) else {
+                    return STATUS_INVALID_PARAMETER;
+                };
+                local_time
+            };
+            if let Err(error) = persistent_clock_write_100ns(persistent_time) {
+                return persistent_clock_error_status(error);
+            }
+        }
+
+        let change = match nt_set_system_time_100ns(requested_system_time) {
             Ok(change) => change,
             Err(nt_time::ClockError::InvalidSystemTime) => return STATUS_INVALID_PARAMETER,
             Err(nt_time::ClockError::MonotonicRegression) => return STATUS_UNSUCCESSFUL,
         };
+        if let Some(information) = refreshed_time_zone {
+            self.time_zone_information = information;
+            self.real_time_is_universal = refreshed_real_time_is_universal.unwrap();
+        }
         // Latch this before the optional copyout: NT has already moved the clock if that later
         // write faults, so the service-loop tail must still publish and re-evaluate deadlines.
         self.system_time_change = Some(change);
@@ -17277,6 +17350,12 @@ impl ExecNtHandler {
         } else {
             print_u64((change.delta_100ns as u128).min(u64::MAX as u128) as u64);
         }
+        print_str(b" source=");
+        print_str(if new_time == 0 {
+            b"persistent-refresh"
+        } else {
+            b"caller-writeback"
+        });
         print_str(b"\n");
         0
     }

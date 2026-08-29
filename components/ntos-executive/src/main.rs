@@ -2129,8 +2129,10 @@ const IRQ_VECTOR: u64 = 11;
 // x86 I/O-port invocation labels + the IOPortControl cap slot (canonical slot 7).
 const SLOT_IO_PORT_CONTROL: u64 = 7;
 const LBL_IOPORT_CONTROL_ISSUE: u64 = 57;
+const LBL_IOPORT_IN8: u64 = 58;
 const LBL_IOPORT_IN16: u64 = 59;
 const LBL_IOPORT_IN32: u64 = 60;
+const LBL_IOPORT_OUT8: u64 = 61;
 const LBL_IOPORT_OUT16: u64 = 62;
 const LBL_IOPORT_OUT32: u64 = 63;
 // PCI configuration-space access ports (0xCF8 address, 0xCFC data).
@@ -3409,6 +3411,8 @@ const LBL_IRQ_ACK: u64 = 31;
 /// are serialized through this one clock authority.
 static mut NT_SYSTEM_CLOCK: nt_time::AdjustableClock = nt_time::AdjustableClock::new(0, 0);
 static NT_SYSTEM_CLOCK_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static mut NT_PERSISTENT_CLOCKS: nt_persistent_clock::ClockProviderRegistry =
+    nt_persistent_clock::ClockProviderRegistry::new();
 /// Like NT's KeBootTime, this moves by the same delta as a system-time adjustment so reported
 /// uptime remains invariant.
 static NT_SYSTEM_BOOT_TIME_100NS: AtomicI64 = AtomicI64::new(0);
@@ -16007,6 +16011,93 @@ unsafe fn initialize_nt_system_clock(boot_info: &BootInfo) {
     print_str(b"\n");
 }
 
+struct ExecutiveClockPortIo;
+
+impl nt_persistent_clock::PortIo for ExecutiveClockPortIo {
+    fn read8(&mut self, capability: u64, port: u16) -> Result<u8, ()> {
+        let (value, label) = unsafe { crate::device_io::io_in8_r(capability, port) };
+        (label == 0).then_some(value).ok_or(())
+    }
+
+    fn write8(&mut self, capability: u64, port: u16, value: u8) -> Result<(), ()> {
+        (unsafe { crate::device_io::io_out8(capability, port, value) } == 0)
+            .then_some(())
+            .ok_or(())
+    }
+}
+
+unsafe fn register_boot_persistent_clock(boot_info: &BootInfo) {
+    let Some(resource) = boot_info.persistent_pc_cmos_clock() else {
+        print_str(b"[persistent-clock] no ACPI platform provider\n");
+        return;
+    };
+    let Some(capability) = try_alloc_slot() else {
+        print_str(b"[persistent-clock] no root CSpace slot for platform provider\n");
+        return;
+    };
+    let first_port = resource.index_port.min(resource.data_port);
+    let last_port = resource.index_port.max(resource.data_port);
+    let issue_status = issue_ioport_cap(capability, first_port, last_port);
+    if issue_status != 0 {
+        recycle_deleted_root_slot(capability);
+        print_str(b"[persistent-clock] I/O capability issue failed label=");
+        print_u64(issue_status);
+        print_str(b"\n");
+        return;
+    }
+    let year_hint = nt_time::utc_date_time_from_system_time(nt_system_time_100ns())
+        .expect("bootstrap time must have calendar representation")
+        .year;
+    let descriptor =
+        nt_persistent_clock::ProviderDescriptor::PcCmos(nt_persistent_clock::PcCmosProvider {
+            io_capability: capability,
+            index_port: resource.index_port,
+            data_port: resource.data_port,
+            century_register: resource.century_register,
+            year_hint,
+        });
+    let identity = match (&mut *core::ptr::addr_of_mut!(NT_PERSISTENT_CLOCKS)).register(descriptor)
+    {
+        Ok(identity) => identity,
+        Err(_) => {
+            let _ = cnode_delete_recycle_r(capability);
+            print_str(b"[persistent-clock] provider registration failed\n");
+            return;
+        }
+    };
+    let mut io = ExecutiveClockPortIo;
+    match (&mut *core::ptr::addr_of_mut!(NT_PERSISTENT_CLOCKS)).probe_active(&mut io) {
+        Ok(clock_time) => {
+            print_str(b"[persistent-clock] registered id/cookie=");
+            print_u64(identity.id);
+            print_str(b"/");
+            print_u64(identity.cookie);
+            print_str(b" rtc=");
+            print_u64(clock_time);
+            print_str(b" century=");
+            print_u64(resource.century_register.map_or(0, u64::from));
+            print_str(b"\n");
+        }
+        Err(_) => {
+            let _ = (&mut *core::ptr::addr_of_mut!(NT_PERSISTENT_CLOCKS)).unregister(identity);
+            let _ = cnode_delete_recycle_r(capability);
+            print_str(b"[persistent-clock] ACPI provider probe failed\n");
+        }
+    }
+}
+
+unsafe fn persistent_clock_read_100ns() -> Result<u64, nt_persistent_clock::ClockError> {
+    let mut io = ExecutiveClockPortIo;
+    (&mut *core::ptr::addr_of_mut!(NT_PERSISTENT_CLOCKS)).read_active(&mut io)
+}
+
+unsafe fn persistent_clock_write_100ns(
+    time_100ns: u64,
+) -> Result<(), nt_persistent_clock::ClockError> {
+    let mut io = ExecutiveClockPortIo;
+    (&mut *core::ptr::addr_of_mut!(NT_PERSISTENT_CLOCKS)).write_active(&mut io, time_100ns)
+}
+
 unsafe fn nt_set_system_time_100ns(
     new_system_time_100ns: u64,
 ) -> Result<nt_time::SystemTimeChange, nt_time::ClockError> {
@@ -21866,6 +21957,8 @@ struct ExecNtHandler {
     registry_user_root_security_descriptor: Option<alloc::vec::Vec<u8>>,
     /// Live system timezone state returned by class 44 and used to derive class 3's current bias.
     time_zone_information: nt_kernel_exec::timezone::TimeZoneInformation,
+    /// SYSTEM-hive policy describing whether the platform RTC stores UTC rather than local time.
+    real_time_is_universal: bool,
     /// The minimal object-manager namespace (index 0 = root `\`). Entries are inline and the owned
     /// vector grows beyond its boot reserve when required.
     obj_ns: alloc::vec::Vec<ObjEntry>,
@@ -26793,6 +26886,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     // The executive front-end allocates (ObjectClient etc.), so give it its own heap.
     map_own_heap();
+    register_boot_persistent_clock(bi);
     if !client_frame_registry_reserve_initial() {
         panic!("client frame registry allocation failed");
     }
