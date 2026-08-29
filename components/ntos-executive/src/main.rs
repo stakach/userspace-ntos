@@ -116,16 +116,9 @@ use surt_sel4::{CPtr, Sel4Env, Sel4Notify};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SyscallUserMemory {
     CurrentProcess,
-    /// The SMSS address space while the private `SmpApiLoop` worker is running. Its dedicated
-    /// stack/heap mirrors are separate from the ordinary hosted-thread mirror, while other ranges
-    /// resolve through SMSS's canonical process frame registry.
-    SmProcess,
-    /// The CSRSS process address space while one of its private rendezvous workers is running.
-    /// The worker stack has a dedicated executive mirror; all other ranges resolve through
-    /// CSRSS's normal process frame registry.
-    CsrProcess {
-        sb: bool,
-    },
+    /// The CSRSS address space while its remaining private API worker is running. Its stack has a
+    /// dedicated executive mirror; all other ranges resolve through CSRSS's process frame registry.
+    CsrProcess,
 }
 
 // SURT's wakeup contract: signal a notification / wait on it.
@@ -314,35 +307,23 @@ const _: () = {
     assert!(EXPLORER_HEAP_MIRROR_VA + 0x20_0000 <= EXPLORER_IMAGE_MIRROR_VA);
     assert!(EXPLORER_IMAGE_MIRROR_VA + 0x20_0000 <= PRIVATE_VM_LIMIT);
 };
-// --- Authentic SM-loop thread (path B): a REAL 2nd thread in smss's VSpace running SmpApiLoop. ---
-// Its per-thread env (stack/IPC/TEB/trampoline) lives at free VAs in smss's cluster PT (0x1040-0x105B;
-// smss itself only uses 0x105C stack + 0x105F ipc there, and the LPC rings 0x1040-43 are
-// executive-side, so 0x1044-0x104B are free in smss's VSpace).
-pub const SM_STACK_BASE: u64 = 0x0000_0100_1044_0000; // 4 frames (16 KiB)
-pub const SM_STACK_FRAMES: u64 = 4;
-pub const SM_IPCBUF_VA: u64 = 0x0000_0100_1048_0000;
-pub const SM_TEB_VA: u64 = 0x0000_0100_1049_0000; // 2 pages (TEB + ACS/StaticUnicode)
-pub const SM_TRAMP_VA: u64 = 0x0000_0100_104B_0000;
-/// The executive's mirror of the SM-loop thread's stack (same frames), so the rendezvous can write
-/// its syscall out-params (the received PORT_MESSAGE, PROCESS_BASIC_INFORMATION, the accepted port
-/// handle) onto its stack. In the FILEBUF PT (0x60-0x80), beside the smss/csrss stack mirrors.
-pub const SM_STACK_MIRROR_VA: u64 = 0x0000_0100_106A_0000;
-/// Executive scratch (3 pages) to populate the SM-loop thread's TEB/trampoline frames before they
-/// are copy_cap'd into smss. In the FILEBUF PT, clear of the smss (0x74) / csrss (0x78) env scratch.
-pub const SM_ENV_SCRATCH_VA: u64 = 0x0000_0100_1070_0000;
-/// Isolated executive scratch (its own PT) for demand-filling the SM-loop thread's code pages
-/// (SmpApiLoop/SmpHandleConnectionRequest in smss's .text + ntdll stubs) during the rendezvous.
-pub const SM_FILL_SCRATCH_BASE: u64 = 0x0000_0100_1300_0000;
+// Common bootstrap layout for the first ordinary hosted worker in a process. Each process has its
+// own VSpace, so CSR, SCM, LSA, and generic workers may reuse these numeric addresses safely.
+pub const HOSTED_THREAD_STACK_BASE: u64 = 0x0000_0100_1044_0000;
+pub const HOSTED_THREAD_STACK_FRAMES: u64 = 8;
+pub const HOSTED_THREAD_IPCBUF_VA: u64 = 0x0000_0100_1048_0000;
+pub const HOSTED_THREAD_TEB_VA: u64 = 0x0000_0100_1049_0000;
+pub const HOSTED_THREAD_TRAMP_VA: u64 = 0x0000_0100_104B_0000;
 // --- Authentic CSR accept: the REAL CsrApiRequestThread runs in CSRSS's VSpace (a 2nd csrss thread),
 // mirroring the SM-loop thread. The csrss-VSpace VAs (stack/ipc/teb/tramp) REUSE the SM numeric
 // values — safe because they land in csrss's OWN pml4 (isolated from smss's, where the SM thread
 // uses the same VAs); both fall in the STACK_BASE 2 MiB PT (0x1040_0000) that csrss's spawn already
 // created. Only the EXECUTIVE-side aliases (mirror/env/fill, in CAP_INIT_THREAD_VSPACE) must be
 // DISTINCT from the SM ones.
-pub const CSR_STACK_BASE: u64 = SM_STACK_BASE; // csrss VSpace (4 frames)
-pub const CSR_IPCBUF_VA: u64 = SM_IPCBUF_VA; // csrss VSpace
-pub const CSR_TEB_VA: u64 = SM_TEB_VA; // csrss VSpace (2 pages)
-pub const CSR_TRAMP_VA: u64 = SM_TRAMP_VA; // csrss VSpace
+pub const CSR_STACK_BASE: u64 = HOSTED_THREAD_STACK_BASE; // csrss VSpace (4 frames)
+pub const CSR_IPCBUF_VA: u64 = HOSTED_THREAD_IPCBUF_VA; // csrss VSpace
+pub const CSR_TEB_VA: u64 = HOSTED_THREAD_TEB_VA; // csrss VSpace (2 pages)
+pub const CSR_TRAMP_VA: u64 = HOSTED_THREAD_TRAMP_VA; // csrss VSpace
 /// Executive mirror of the CSR thread's stack (same frames) for syscall out-params. FILEBUF PT,
 /// beside SM (0x106A) / winlogon (0x106B) stack mirrors.
 pub const CSR_STACK_MIRROR_VA: u64 = 0x0000_0100_106C_0000;
@@ -352,28 +333,20 @@ pub const CSR_ENV_SCRATCH_VA: u64 = 0x0000_0100_1071_0000;
 /// Isolated executive scratch (its own PT) for demand-filling the CSR thread's code pages
 /// (CsrApiRequestThread/CsrApiHandleConnectionRequest in csrsrv + ntdll/csrss) during the rendezvous.
 pub const CSR_FILL_SCRATCH_BASE: u64 = 0x0000_0100_1310_0000;
-// CSRSS's second startup thread runs CsrSbApiRequestThread. It shares the process image/PEB and
-// native IPC mapping with the API worker, but needs distinct stack/TEB/trampoline and fault objects.
-pub const CSR_SB_STACK_BASE: u64 = 0x0000_0100_104C_0000;
-pub const CSR_SB_STACK_FRAMES: u64 = 8;
-pub const CSR_SB_IPCBUF_VA: u64 = 0x0000_0100_104E_0000;
-pub const CSR_SB_TEB_VA: u64 = 0x0000_0100_104F_0000;
-pub const CSR_SB_TRAMP_VA: u64 = 0x0000_0100_1051_0000;
-pub const CSR_SB_STACK_MIRROR_VA: u64 = 0x0000_0100_106F_0000;
-pub const CSR_SB_ENV_SCRATCH_VA: u64 = 0x0000_0100_107F_0000;
+/// Scratch identity attached to executive-originated win32k probes, which have no hosted caller.
+pub const EXECUTIVE_WIN32K_SCRATCH_BASE: u64 = 0x0000_0100_1300_0000;
 // --- General NtCreateThread: a REAL Nth thread in ANY hosted process (first live user: winlogon's
 // RPC listener thread). Reuses the SM numeric VSpace VAs (0x1044-0x104B) in the TARGET process's OWN
 // pml4 (isolated from smss/csrss's threads at the same VAs) — they fall in the STACK_BASE 2 MiB PT
 // that every spawn_sec_image already created. The EXECUTIVE-side env scratch must be DISTINCT from
 // SM (0x1070) / CSR (0x1071) / smss-spawn (0x1074) / csrss-spawn (0x1078) / winlogon-spawn (0x107C).
-pub const WL_LISTENER_STACK_BASE: u64 = SM_STACK_BASE; // target VSpace
-                                                       // LdrInitializeThread builds the bounded module/attach plan on this bootstrap stack before it
-                                                       // restores the caller's INITIAL_TEB stack. Four pages let __chkstk probe below the mapping once a
-                                                       // process has the full winlogon dependency set; match the later worker slots' eight-page floor.
+pub const WL_LISTENER_STACK_BASE: u64 = HOSTED_THREAD_STACK_BASE; // target VSpace
+// LdrInitializeThread builds the bounded module/attach plan on this bootstrap stack before it
+// restores the caller's INITIAL_TEB stack. Match the later worker slots' eight-page floor.
 pub const WL_LISTENER_STACK_FRAMES: u64 = 8;
-pub const WL_LISTENER_IPCBUF_VA: u64 = SM_IPCBUF_VA; // target VSpace
-pub const WL_LISTENER_TEB_VA: u64 = SM_TEB_VA; // target VSpace (2 pages)
-pub const WL_LISTENER_TRAMP_VA: u64 = SM_TRAMP_VA; // target VSpace
+pub const WL_LISTENER_IPCBUF_VA: u64 = HOSTED_THREAD_IPCBUF_VA; // target VSpace
+pub const WL_LISTENER_TEB_VA: u64 = HOSTED_THREAD_TEB_VA; // target VSpace (2 pages)
+pub const WL_LISTENER_TRAMP_VA: u64 = HOSTED_THREAD_TRAMP_VA; // target VSpace
 /// Executive scratch (3 pages) to build the listener thread's TEB/trampoline before copy_cap into
 /// the target VSpace. FILEBUF PT, clear of every other env-scratch VA.
 pub const WL_LISTENER_ENV_SCRATCH_VA: u64 = 0x0000_0100_1072_0000;
@@ -407,11 +380,11 @@ pub const WINLOGON_WORKER3_STACK_MIRROR_VA: u64 = 0x0000_0100_1388_0000;
 // pml4 (pi 3) at the SAME target VSpace VAs as WL_LISTENER (isolated per-VSpace); its executive-side
 // env-scratch + stack-mirror must be DISTINCT. Unlike WL_LISTENER (suspended), this one RESUMES and
 // its faults route into the main service loop keyed by SVC_LISTENER_BADGE (the N-threads multiplex).
-pub const SVC_LISTENER_STACK_BASE: u64 = SM_STACK_BASE; // services VSpace (own pml4)
+pub const SVC_LISTENER_STACK_BASE: u64 = HOSTED_THREAD_STACK_BASE; // services VSpace (own pml4)
 pub const SVC_LISTENER_STACK_FRAMES: u64 = 8;
-pub const SVC_LISTENER_IPCBUF_VA: u64 = SM_IPCBUF_VA;
-pub const SVC_LISTENER_TEB_VA: u64 = SM_TEB_VA;
-pub const SVC_LISTENER_TRAMP_VA: u64 = SM_TRAMP_VA;
+pub const SVC_LISTENER_IPCBUF_VA: u64 = HOSTED_THREAD_IPCBUF_VA;
+pub const SVC_LISTENER_TEB_VA: u64 = HOSTED_THREAD_TEB_VA;
+pub const SVC_LISTENER_TRAMP_VA: u64 = HOSTED_THREAD_TRAMP_VA;
 /// Executive scratch (3 pages) — distinct from WL_LISTENER (0x1072). FILEBUF PT.
 pub const SVC_LISTENER_ENV_SCRATCH_VA: u64 = 0x0000_0100_1073_0000;
 /// Executive-side stack mirror for services' listener (so its syscall out-params / arg reads route to
@@ -425,11 +398,11 @@ pub const SVC_LISTENER_BADGE: u64 = 7;
 // as the SM/SVC listeners (isolated per-VSpace); its executive-side env-scratch + stack-mirror must be
 // DISTINCT. RESUMES + faults route into the main service loop keyed by LSASS_LISTENER_BADGE (the
 // N-threads multiplex — the SERVICE-9 C-c pattern replicated for lsass).
-pub const LSASS_LISTENER_STACK_BASE: u64 = SM_STACK_BASE; // lsass VSpace (own pml4)
+pub const LSASS_LISTENER_STACK_BASE: u64 = HOSTED_THREAD_STACK_BASE; // lsass VSpace (own pml4)
 pub const LSASS_LISTENER_STACK_FRAMES: u64 = 8;
-pub const LSASS_LISTENER_IPCBUF_VA: u64 = SM_IPCBUF_VA;
-pub const LSASS_LISTENER_TEB_VA: u64 = SM_TEB_VA;
-pub const LSASS_LISTENER_TRAMP_VA: u64 = SM_TRAMP_VA;
+pub const LSASS_LISTENER_IPCBUF_VA: u64 = HOSTED_THREAD_IPCBUF_VA;
+pub const LSASS_LISTENER_TEB_VA: u64 = HOSTED_THREAD_TEB_VA;
+pub const LSASS_LISTENER_TRAMP_VA: u64 = HOSTED_THREAD_TRAMP_VA;
 /// Executive scratch (3 pages) — distinct from SVC_LISTENER (0x1073) / lsass-main env (0x1077). FILEBUF PT.
 pub const LSASS_LISTENER_ENV_SCRATCH_VA: u64 = 0x0000_0100_1079_0000;
 /// Executive-side stack mirror for lsass' listener (its syscall out-params / arg reads route to its OWN
@@ -808,9 +781,8 @@ const _: () = {
     assert!(WL_LISTENER_STACK_FRAMES >= 8);
     assert!(nt_syscall_abi::native_ipc_buffer_va(SMSS_TEB_VA) == IPCBUF_VADDR);
     assert!(nt_syscall_abi::native_ipc_buffer_va(TEB_VA) == IPCBUF_VADDR);
-    assert!(nt_syscall_abi::native_ipc_buffer_va(SM_TEB_VA) == SM_IPCBUF_VA);
+    assert!(nt_syscall_abi::native_ipc_buffer_va(HOSTED_THREAD_TEB_VA) == HOSTED_THREAD_IPCBUF_VA);
     assert!(nt_syscall_abi::native_ipc_buffer_va(CSR_TEB_VA) == CSR_IPCBUF_VA);
-    assert!(nt_syscall_abi::native_ipc_buffer_va(CSR_SB_TEB_VA) == CSR_SB_IPCBUF_VA);
     assert!(nt_syscall_abi::native_ipc_buffer_va(WL_LISTENER_TEB_VA) == WL_LISTENER_IPCBUF_VA);
     assert!(nt_syscall_abi::native_ipc_buffer_va(WL_WORKER2_TEB_VA) == WL_WORKER2_IPCBUF_VA);
     assert!(nt_syscall_abi::native_ipc_buffer_va(WL_WORKER3_TEB_VA) == WL_WORKER3_IPCBUF_VA);
@@ -829,15 +801,15 @@ const _: () = {
         nt_syscall_abi::native_ipc_buffer_va(TP_WORKER_SLOT1_TEB_VA) == TP_WORKER_SLOT1_IPCBUF_VA
     );
     assert!(nt_syscall_abi::native_ipc_buffer_va(tp_worker_teb_va(4)) == tp_worker_ipcbuf_va(4));
-    assert!(SM_IPCBUF_VA != WL_WORKER2_IPCBUF_VA);
-    assert!(SM_IPCBUF_VA != WL_WORKER3_IPCBUF_VA);
+    assert!(HOSTED_THREAD_IPCBUF_VA != WL_WORKER2_IPCBUF_VA);
+    assert!(HOSTED_THREAD_IPCBUF_VA != WL_WORKER3_IPCBUF_VA);
     assert!(WL_WORKER2_IPCBUF_VA != WL_WORKER3_IPCBUF_VA);
     assert!(hosted_thread_layout_is_disjoint(
-        SM_STACK_BASE,
-        SM_STACK_FRAMES,
-        SM_IPCBUF_VA,
-        SM_TEB_VA,
-        SM_TRAMP_VA,
+        HOSTED_THREAD_STACK_BASE,
+        HOSTED_THREAD_STACK_FRAMES,
+        HOSTED_THREAD_IPCBUF_VA,
+        HOSTED_THREAD_TEB_VA,
+        HOSTED_THREAD_TRAMP_VA,
     ));
     assert!(hosted_thread_layout_is_disjoint(
         SVC_LISTENER_STACK_BASE,
@@ -3399,21 +3371,6 @@ static DELAY_TIMER_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// parks that thread) instead of stopping the boot — lsass has already done its job for the milestone
 /// (winlogon's WaitForLsass can now wake), so the boot advances to winlogon's login path.
 static LSA_RPC_SERVER_ACTIVE_SIGNALLED: AtomicU64 = AtomicU64::new(0);
-/// Path B (authentic SM accept): the SM-loop thread's dedicated fault endpoint (the executive recvs
-/// its real NtReplyWaitReceivePort/NtAcceptConnectPort/NtCompleteConnectPort faults here during the
-/// nested `sm_rendezvous`; no standing receiver otherwise, so the thread parks) + its own MCS reply
-/// object (REPLY_SMLOOP), mirroring REPLY_W32. 0 = not yet retyped.
-static SM_FAULT_EP: AtomicU64 = AtomicU64::new(0);
-static REPLY_SMLOOP_SLOT: AtomicU64 = AtomicU64::new(0);
-/// The real SmpApiLoop's outstanding empty `NtReplyWaitReceivePort`. A completed rendezvous leaves
-/// the worker blocked here; the next connector is injected through this saved continuation instead
-/// of waiting for a new fault that cannot occur while the worker is parked.
-static SM_RECEIVE_PARKED: AtomicU64 = AtomicU64::new(0);
-static SM_RECVMSG: AtomicU64 = AtomicU64::new(0);
-static SM_RECVPORT: AtomicU64 = AtomicU64::new(0);
-static SM_RECV_RDX: AtomicU64 = AtomicU64::new(0);
-/// Set once the SM_FILL_SCRATCH_BASE page table is created (lazily, in the first rendezvous).
-static SM_FILL_PT_DONE: AtomicU64 = AtomicU64::new(0);
 /// Authentic CSR accept (mirrors the SM triad): the REAL CsrApiRequestThread's dedicated fault EP
 /// (the executive recvs its NtSetEvent/NtReplyWaitReceivePort/NtAcceptConnectPort/NtCompleteConnectPort
 /// faults here during `csr_rendezvous`; no standing receiver otherwise → the thread parks) + its own
@@ -3422,18 +3379,10 @@ static CSR_FAULT_EP: AtomicU64 = AtomicU64::new(0);
 static REPLY_CSRLOOP_SLOT: AtomicU64 = AtomicU64::new(0);
 /// CsrApiRequestThread re-parks on NtReplyWaitReceivePort and accepts later hosted Win32 client
 /// connects.
-/// CsrSbApiRequestThread has its own endpoint. It initially parks on its first code fault;
-/// the SB message-plane rendezvous can drive that endpoint independently of the API worker.
-static CSR_SB_FAULT_EP: AtomicU64 = AtomicU64::new(0);
-static REPLY_CSR_SB_SLOT: AtomicU64 = AtomicU64::new(0);
 static CSR_API_RECEIVE_PARKED: AtomicU64 = AtomicU64::new(0);
 static CSR_API_RECVMSG: AtomicU64 = AtomicU64::new(0);
 static CSR_API_RECVPORT: AtomicU64 = AtomicU64::new(0);
 static CSR_API_RECV_RDX: AtomicU64 = AtomicU64::new(0);
-static CSR_SB_RECEIVE_PARKED: AtomicU64 = AtomicU64::new(0);
-static CSR_SB_RECVMSG: AtomicU64 = AtomicU64::new(0);
-static CSR_SB_RECVPORT: AtomicU64 = AtomicU64::new(0);
-static CSR_SB_RECV_RDX: AtomicU64 = AtomicU64::new(0);
 /// Set once the CSR_FILL_SCRATCH_BASE page table is created (lazily, in the first rendezvous).
 static CSR_FILL_PT_DONE: AtomicU64 = AtomicU64::new(0);
 static CSR_FILL_NEXT: AtomicU64 = AtomicU64::new(0);
@@ -3658,11 +3607,6 @@ pub(crate) static WINLOGON_CRED_POST_RETURN_SSNS: AtomicU64 = AtomicU64::new(0);
 /// validation reaching lsass. Only reachable if `DoLogon`'s own `GetTextboxText` reads found a
 /// non-empty user name and domain in the real controls.
 pub(crate) static WINLOGON_CRED_LSA_CONNECT: AtomicU64 = AtomicU64::new(0);
-
-/// Did the real message queue deliver the injected RETURN key to the dialog?
-pub(crate) fn winlogon_credential_return_delivered() -> bool {
-    WINLOGON_CRED_RETRIEVED_RETURN.load(Ordering::Relaxed) != 0
-}
 
 /// Case-sensitive compare of an NT object-name (UTF-16) against an ASCII literal.
 pub(crate) fn lpc_name_is(name16: &[u16], ascii: &[u8]) -> bool {
@@ -21472,10 +21416,7 @@ pub(crate) struct RemoteThreadRequest {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostedThreadSpawnRequest {
-    SmLoop,
-    Csr {
-        slot: usize,
-    },
+    CsrApi,
     Winlogon {
         slot: usize,
     },
@@ -21842,11 +21783,10 @@ struct ExecNtHandler {
     /// loop after dispatch. The handler owns NT policy (ETHREAD, TEB, handles, ClientId copyout);
     /// the loop owns seL4 TCB construction because it holds the target VSpace + fault endpoint.
     thread_spawn_request: Option<HostedThreadSpawnRequest>,
-    /// Path B: when csrss's `NtConnectPort` leaves the connection Pending (Manual policy), the handler
-    /// records the broker connection id + the caller's `*PortHandle` VA (arg0) here; the loop then
-    /// drives `sm_rendezvous`, writes the completed client comm-port handle, and replies csrss. 0 = none.
-    lpc_rendezvous_conn: u64,
-    lpc_rendezvous_out: u64,
+    /// Pending legacy LSA connect handed to the LSA-owned accept path. Generic SM/SB connections use
+    /// typed continuations and unrelated ports are never redirected to an image-specific acceptor.
+    lsa_connect_conn: u64,
+    lsa_connect_out: u64,
     /// Allocation-reserved generic LPC receive that the service loop must bind to the current reply
     /// object. The durable wait moves into `LPC_RECEIVE_WAITS`; no scalar state survives dispatch.
     lpc_receive_park: Option<PendingLpcReceivePark>,
@@ -21861,12 +21801,6 @@ struct ExecNtHandler {
     /// edge once to redrive generic receive continuations without polling every parked port after
     /// every unrelated syscall.
     lpc_endpoint_progress: bool,
-    /// Legacy private SM request rendezvous. Generic typed request continuations replace this for
-    /// established `\\SmApiPort` and `\\Windows\\SbApiPort` connections; delete these scalars with
-    /// the remaining private SM worker.
-    sm_request_port: u64,
-    sm_request_message: u64,
-    sm_reply_message: u64,
     /// A synchronous CSR API request on an established `\\Windows\\ApiPort` client connection. The
     /// loop delivers it to the parked real CsrApiRequestThread and resumes the client once the worker
     /// emits its LPC reply. Missing worker/rendezvous state fails visibly; CSR has no modeled
@@ -22989,7 +22923,6 @@ enum HostedThreadRole {
     TpWorker { slot: usize },
     ScmWorkerSlot { slot: usize },
     LsaWorkerSlot { slot: usize },
-    SmLoop,
     CsrApi,
     CsrSbApi,
     WinlogonListener,
@@ -25061,11 +24994,10 @@ static LSASS_SRM_CONNECTED: AtomicU64 = AtomicU64::new(0);
 /// Runtime routing resolves the handle from `ExecNtHandler::obj_ns`, not from this cell.
 static SRM_COMMAND_PORT_OBJECT_HANDLE: AtomicU64 = AtomicU64::new(0);
 // ═══ `\LsaAuthenticationPort` RENDEZVOUS ══════════════════════════════════════════════════════
-// The THIRD authentic LPC rendezvous in this system, after `sm_rendezvous` (smss' real `SmpApiLoop`
-// accepting `\SmApiPort`) and `csr_rendezvous` (csrss' real `CsrApiRequestThread` accepting
-// `\Windows\ApiPort`). Here the server is lsass' REAL `AuthPortThreadRoutine`
+// The remaining image-specific LPC rendezvous. SM and SB now use generic typed continuations; CSR
+// still uses `csr_rendezvous`. Here the server is lsass' REAL `AuthPortThreadRoutine`
 // (`references/reactos/dll/win32/lsasrv/authport.c:227`), which runs in the N-threads multiplex on
-// the MAIN fault endpoint — so unlike the SM/CSR pair (nested loops on a private endpoint) the LSA
+// the MAIN fault endpoint, so unlike the remaining private CSR loop the LSA
 // rendezvous is driven ENTIRELY by the main service loop: the server thread genuinely BLOCKS in
 // `NtReplyWaitReceivePort` with its reply capability retained, the connecting/ requesting client
 // genuinely BLOCKS in `NtConnectPort`/`NtRequestWaitReplyPort`, and each side is woken by the other's
@@ -25112,10 +25044,6 @@ pub(crate) static WINLOGON_LSA_PORT_HANDLE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WINLOGON_LSA_CONNECTED: AtomicU64 = AtomicU64::new(0);
 /// The `OperationalMode` the real server wrote into its own `ConnectInfo` (NT's `0x43218765`).
 pub(crate) static LSA_OPERATIONAL_MODE: AtomicU64 = AtomicU64::new(0);
-/// ★ BYPASS SWITCH. Setting this to `false` disables the whole LSA rendezvous: winlogon's connect
-/// falls back to the pre-batch `sm_rendezvous` WALL + milestone park and every `exec_lsa_*` spec
-/// FAILs. Used for the batch's bypass experiment; must ship `true`.
-pub(crate) const LSA_RENDEZVOUS_ENABLED: bool = true;
 /// Set once winlogon's kernel32 CSR client connect (NtSecureConnectPort → \Windows\ApiPort) is
 /// serviced through real section views and server-authored connection information.
 static WINLOGON_CSR_CONNECTED: AtomicU64 = AtomicU64::new(0);
@@ -26686,14 +26614,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         REPLY_TRANSPORT_PROBE_SLOT.store(rprobe, Ordering::Relaxed);
     }
     // Component-dispatch reply caps are allocated on demand by hosted driver launch.
-    // Path B: a dedicated fault endpoint + reply object for the real SM-loop thread's rendezvous.
-    let sm_ep = make_object(OBJ_ENDPOINT);
-    SM_FAULT_EP.store(sm_ep, Ordering::Relaxed);
-    let rs = alloc_slot();
-    let e_rs = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, rs);
-    if e_rs == 0 {
-        REPLY_SMLOOP_SLOT.store(rs, Ordering::Relaxed);
-    }
     // Authentic CSR accept: a dedicated fault endpoint + reply object for the real CsrApiRequestThread
     // (mirrors the SM triad above).
     let csr_ep = make_object(OBJ_ENDPOINT);
@@ -26702,13 +26622,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let e_rc = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, rc);
     if e_rc == 0 {
         REPLY_CSRLOOP_SLOT.store(rc, Ordering::Relaxed);
-    }
-    // The SB worker is resumed by ReactOS during CsrSbApiPortInitialize. Keep its early faults
-    // isolated from the API rendezvous until the session-registration message plane drives it.
-    CSR_SB_FAULT_EP.store(make_object(OBJ_ENDPOINT), Ordering::Relaxed);
-    let rcsb = alloc_slot();
-    if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, rcsb) == 0 {
-        REPLY_CSR_SB_SLOT.store(rcsb, Ordering::Relaxed);
     }
     // General NtCreateThread: a dedicated fault endpoint (no standing receiver) that the RPC-listener
     // and any future park-only Nth thread faults to → it PARKS on its first fault, its real TEB left

@@ -16182,3 +16182,39 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     after deletion. Then apply the same typed connect/request conversion to `\Windows\ApiPort` and
     LSA, deleting each older continuation adapter in its accepted slice. Explicit connection
     provenance replacing `Port.reply_connection` remains the final LPC broker cleanup.
+
+    Private SM/SB rendezvous deletion (2026-08-29, accepted): the typed broker path is now the only
+    SM/SB path. The executive no longer defines a private `SmLoop` role or spawn request, dedicated
+    SM endpoint/reply object, SM stack/TEB/trampoline mirror, `SM_RECV*` state, scalar SM request
+    handoff, `sm_rendezvous`, or `sm_api_request_rendezvous`. Both ReactOS-created `SmpApiLoop`
+    threads enter the ordinary growable hosted-worker window; the accepted run records them as
+    independent workers at badges 16 and 21. The private CSR-SB endpoint, reply object, stack mirror,
+    startup driver, connection acceptor, and synchronous request loop are also deleted.
+    `CsrSbApiRequestThread` remains a real role-owned ETHREAD but executes through the generic worker
+    transport and common LPC continuation tables.
+
+    Plain pending LPC connects now use typed continuations by default. `\LsaAuthenticationPort` is
+    the sole explicit exception until its real server adapter is converted; its handoff fields are
+    named `lsa_connect_conn` / `lsa_connect_out`. There is no longer a catch-all branch that sends an
+    unrelated pending connection to SMSS. The always-enabled LSA path also no longer has a bypass
+    switch or a fallback-to-SM comment. This slice removes 2,073 lines while retaining fail-closed
+    broker and copyout behavior.
+
+    The staged freestanding executive builds with 211 warnings, improving on the previous accepted
+    212-warning baseline. Serialized acceptance `.tmp/run-headless-20260829-154907.log` records three
+    exact connect parks/wakes and two exact request parks/wakes, with the nested SB message id 3
+    completing before outer SM message id 2. It contains no `[sm-loop]`, `[sm-rdv]`, `[sm-api]`, or
+    `[csr-sb]` event. Genuine userinit and Explorer launch; Explorer completes 668 api0 redirects with
+    zero callback or dead-callback failures, paint begin/end reaches `5/20` with 187 direct GDI
+    returns and 135 batch flushes covering 184 records, and the framebuffer holds `480000/480000`
+    non-background pixels with at least 32 colours. All `295/295` gates pass and the sentinel matches.
+
+    Review adjustment: SM and SB blocked-service conversion and old-transport deletion are closed.
+    The next active slice is `\Windows\ApiPort`: move `NtSecureConnectPort` and established CSR
+    request/reply traffic onto the typed connect/request continuations, run the real
+    `CsrApiRequestThread` through the generic hosted-worker window, then delete `csr_rendezvous`, the
+    private CSR endpoint/reply/stack memory policy, `CSR_API_RECV*`, `CSR_API_RECEIVE_PARKED`, and the
+    scalar CSR request/connect handoffs in the same accepted change. Convert LSA next, retaining its
+    real authentication-port server semantics while replacing its numeric continuation state. Only
+    after those two ports are accepted should `Port.reply_connection` be replaced with explicit
+    datagram/ALPC connection provenance.

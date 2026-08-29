@@ -729,7 +729,6 @@ pub(crate) unsafe fn take_matching_published_win32k_context(
 
 const CALLBACK_ROLE_NONE: u32 = 0;
 const CALLBACK_ROLE_MAIN: u32 = 1;
-const CALLBACK_ROLE_SM_LOOP: u32 = 2;
 const CALLBACK_ROLE_CSR_API: u32 = 3;
 const CALLBACK_ROLE_CSR_SB_API: u32 = 4;
 const CALLBACK_ROLE_WINLOGON_LISTENER: u32 = 5;
@@ -759,7 +758,6 @@ fn callback_runtime_role_code(role: Option<HostedThreadRole>) -> u32 {
         {
             CALLBACK_ROLE_LSA_WORKER_SLOT_BASE | slot as u32
         }
-        Some(HostedThreadRole::SmLoop) => CALLBACK_ROLE_SM_LOOP,
         Some(HostedThreadRole::CsrApi) => CALLBACK_ROLE_CSR_API,
         Some(HostedThreadRole::CsrSbApi) => CALLBACK_ROLE_CSR_SB_API,
         Some(HostedThreadRole::WinlogonListener) => CALLBACK_ROLE_WINLOGON_LISTENER,
@@ -779,7 +777,6 @@ fn callback_runtime_role_code(role: Option<HostedThreadRole>) -> u32 {
 fn callback_runtime_role_from_code(code: u32) -> Option<HostedThreadRole> {
     match code {
         CALLBACK_ROLE_MAIN => Some(HostedThreadRole::Main),
-        CALLBACK_ROLE_SM_LOOP => Some(HostedThreadRole::SmLoop),
         CALLBACK_ROLE_CSR_API => Some(HostedThreadRole::CsrApi),
         CALLBACK_ROLE_CSR_SB_API => Some(HostedThreadRole::CsrSbApi),
         CALLBACK_ROLE_WINLOGON_LISTENER => Some(HostedThreadRole::WinlogonListener),
@@ -1278,7 +1275,6 @@ fn callback_client_owner_pi(client: crate::spawn_hosts::UserCallbackClient) -> O
     match client.role {
         Some(
             HostedThreadRole::Main
-            | HostedThreadRole::SmLoop
             | HostedThreadRole::CsrApi
             | HostedThreadRole::CsrSbApi
             | HostedThreadRole::WinlogonListener
@@ -5590,7 +5586,7 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
             // deriving a new client from SMSS' TEB.
             teb: 0,
             peb_mirror: 0,
-            scratch_base: crate::SM_FILL_SCRATCH_BASE,
+            scratch_base: crate::EXECUTIVE_WIN32K_SCRATCH_BASE,
             token_authentication_id: SYSTEM_TOKEN_AUTHENTICATION_ID,
             token_user_sid: system_sid,
             token_user_sid_len: system_sid_len,

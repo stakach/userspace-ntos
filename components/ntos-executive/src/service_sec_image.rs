@@ -9067,8 +9067,7 @@ pub(crate) unsafe fn service_sec_image(
             let lsa_auth_port_handle = nt_handler
                 .lpc_port_handle_by_ascii(b"\\lsaauthenticationport")
                 .unwrap_or(0);
-            if LSA_RENDEZVOUS_ENABLED
-                && m0 == SSN_NT_REPLY_WAIT_RECEIVE_PORT
+            if m0 == SSN_NT_REPLY_WAIT_RECEIVE_PORT
                 && (is_lsass_listener || is_lsass_listener2 || is_lsass_listener3)
                 && lsa_auth_port_handle != 0
                 && get_recv_mr(9) == lsa_auth_port_handle
@@ -9122,8 +9121,7 @@ pub(crate) unsafe fn service_sec_image(
             // real server's `RequestMsg` and BLOCK this caller until the server replies. The handle
             // check is the generic LPC connection cache, not winlogon's diagnostic milestone latch, so
             // dynamically launched services use the same LSA data plane.
-            if LSA_RENDEZVOUS_ENABLED
-                && m0 == SSN_NT_REQUEST_WAIT_REPLY_PORT
+            if m0 == SSN_NT_REQUEST_WAIT_REPLY_PORT
                 && LSA_CLI_REPLY_CAP.load(Ordering::Relaxed) == 0
                 && nt_handler.lpc_connection_is(get_recv_mr(9), pi, b"\\lsaauthenticationport")
             {
@@ -9265,10 +9263,6 @@ pub(crate) unsafe fn service_sec_image(
             let mut redirected_user_apc = false;
             let mut redirected_context_continue = false;
             let mut active_callback_bad_resume = false;
-            // Broker-only terminal waits (currently smss waiting forever for csrss/winlogon) park
-            // by withholding a reply. Self-termination does not use this flag: its explicit post
-            // action deletes the bound Reply cap and caller TCB before receiving again.
-            let mut park_caller = false;
             // Checkpoint B: -1 = no wait-park; >=0 = NtWaitForSingleObject asked to park this caller on
             // the encoded WaitObject in nt_handler.wait_park_event after dispatch.
             let mut park_wait_event: i64 = -1;
@@ -9431,7 +9425,8 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.dbgk_block_request = false;
                 nt_handler.pipe_endpoint_progress = false;
                 nt_handler.lpc_endpoint_progress = false;
-                nt_handler.lpc_rendezvous_conn = 0;
+                nt_handler.lsa_connect_conn = 0;
+                nt_handler.lsa_connect_out = 0;
                 if let Some(stale) = nt_handler.lpc_receive_park.take() {
                     lpc_receive_wait_cancel_reservation(stale.reservation);
                     panic!("previous syscall leaked an LPC receive continuation reservation");
@@ -9448,9 +9443,6 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.lpc_connect_completion.is_none(),
                     "previous syscall leaked an LPC connect completion"
                 );
-                nt_handler.sm_request_port = 0;
-                nt_handler.sm_request_message = 0;
-                nt_handler.sm_reply_message = 0;
                 nt_handler.csr_request_port = 0;
                 nt_handler.csr_request_message = 0;
                 nt_handler.csr_reply_message = 0;
@@ -9601,40 +9593,6 @@ pub(crate) unsafe fn service_sec_image(
                                 if let Some(tid) = nt_handler
                                     .hosted_thread_tid_for_role(csrss_pi, HostedThreadRole::CsrApi)
                                 {
-                                    let _ = nt_handler.pm.set_thread_state(
-                                        tid as nt_process::ThreadId,
-                                        nt_process::ThreadState::Running,
-                                    );
-                                } else {
-                                    result = 0xC000_0001;
-                                }
-                            }
-                        } else {
-                            result = 0xC000_0001;
-                        }
-                    } else if nt_handler.csr_start_request == 2 {
-                        let tcb = nt_handler
-                            .hosted_thread_tcb_for_role(csrss_pi, HostedThreadRole::CsrSbApi)
-                            .unwrap_or(0);
-                        if tcb > 1 {
-                            let _ = tcb_resume(tcb);
-                            if !csr_sb_startup(
-                                procs[csrss_pi].pml4,
-                                loaded_hosted_pe_by_pi(&*hosted_loaded_images, csrss_pi)
-                                    .expect("CSRSS PE must be registered before CSR SB startup"),
-                                procs[csrss_pi].img_end,
-                                nt_base,
-                                nt_end,
-                                ntdll.map(|(_, p)| p),
-                                &reg,
-                                dll_pe_store.as_slice(),
-                            ) {
-                                result = 0xC000_0001;
-                            } else {
-                                if let Some(tid) = nt_handler.hosted_thread_tid_for_role(
-                                    csrss_pi,
-                                    HostedThreadRole::CsrSbApi,
-                                ) {
                                     let _ = nt_handler.pm.set_thread_state(
                                         tid as nt_process::ThreadId,
                                         nt_process::ThreadState::Running,
@@ -10179,7 +10137,6 @@ pub(crate) unsafe fn service_sec_image(
                         &mut nt_handler,
                         request,
                         &*procs,
-                        pml4,
                         sp,
                         fault_ep,
                     );
@@ -10217,16 +10174,15 @@ pub(crate) unsafe fn service_sec_image(
                 // `TrustedCaller`) and its real `CLIENT_ID` — into the server's `RequestMsg` and BLOCK
                 // the connector until the server's `NtAcceptConnectPort`/`NtCompleteConnectPort` runs
                 // (`references/reactos/dll/win32/lsasrv/authport.c:163`).
-                if LSA_RENDEZVOUS_ENABLED
-                    && nt_handler.lpc_rendezvous_conn != 0
+                if nt_handler.lsa_connect_conn != 0
                     && LSA_CLI_REPLY_CAP.load(Ordering::Relaxed) == 0
                     && LSA_PENDING_CONN.load(Ordering::Relaxed) == 0
                 {
                     let name16 = nt_handler.read_lpc_name(m3);
                     if lpc_name_is(&name16, b"\\LsaAuthenticationPort") {
-                        let conn_id = nt_handler.lpc_rendezvous_conn;
-                        let out_ptr = nt_handler.lpc_rendezvous_out;
-                        nt_handler.lpc_rendezvous_conn = 0;
+                        let conn_id = nt_handler.lsa_connect_conn;
+                        let out_ptr = nt_handler.lsa_connect_out;
+                        nt_handler.lsa_connect_conn = 0;
                         // NtConnectPort arg7 = *ConnectionInformation, arg8 = *ConnectionInformationLength.
                         let conn_info_ptr = smss_stack_read(sp + 0x38);
                         let conn_info_len_ptr = smss_stack_read(sp + 0x40);
@@ -10298,106 +10254,7 @@ pub(crate) unsafe fn service_sec_image(
                         // The reply pool is exhausted — restore the pending connect so the legacy
                         // path below reports the wall instead of losing the connection silently.
                         LSA_PENDING_CONN.store(0, Ordering::Relaxed);
-                        nt_handler.lpc_rendezvous_conn = conn_id;
-                    }
-                }
-                // Path B (authentic accept): csrss's NtConnectPort left the broker connection Pending
-                // (Manual). Drive the REAL SmpApiLoop thread through the connection rendezvous (it runs
-                // in smss's VSpace = procs[0].pml4, demand-filling from smss's image + ntdll), then write the
-                // completed client comm-port handle to csrss's *PortHandle + reply csrss via REPLY_MAIN.
-                if nt_handler.lpc_rendezvous_conn != 0 {
-                    let conn_id = nt_handler.lpc_rendezvous_conn;
-                    let out_ptr = nt_handler.lpc_rendezvous_out;
-                    print_str(b"[sm-rdv] caller pi=");
-                    print_u64(pi as u64);
-                    print_str(b" NtConnectPort pending (conn=");
-                    print_u64(conn_id);
-                    print_str(b") -> driving the real SmpApiLoop accept\n");
-                    let client_handle = sm_rendezvous(
-                        conn_id,
-                        pi,
-                        procs[0].pml4,
-                        primary_pe,
-                        procs[0].img_end,
-                        nt_base,
-                        nt_end,
-                        ntdll.map(|(_, p)| p),
-                        procs[csrss_pi].pml4,
-                        loaded_hosted_pe_by_pi(&*hosted_loaded_images, csrss_pi)
-                            .expect("CSRSS PE must be registered before SM rendezvous"),
-                        procs[csrss_pi].img_end,
-                        &reg,
-                        dll_pe_store.as_slice(),
-                        &mut nt_handler,
-                    );
-                    if client_handle != 0 {
-                        if nt_handler.xas_write_u64(out_ptr, client_handle) {
-                            let name16 = nt_handler.read_lpc_name(m3); // RDX = PortName
-                            if nt_handler.cache_lpc_connection(conn_id, client_handle, &name16) {
-                                result = 0; // STATUS_SUCCESS
-                                print_str(b"[sm-rdv] AUTHENTIC accept complete: client handle=0x");
-                                print_hex((client_handle >> 32) as u32);
-                                print_hex(client_handle as u32);
-                                print_str(b" -> caller NtConnectPort SUCCESS\n");
-                            } else {
-                                print_str(b"[sm-rdv] completed connection has no broker metadata\n");
-                                handled = false;
-                                result = 0xC0000001;
-                            }
-                        } else {
-                            print_str(b"[sm-rdv] WALL: failed client handle copyout\n");
-                            handled = false;
-                            result = 0xC0000005;
-                        }
-                    } else {
-                        // The rendezvous walled — stop cleanly with a diagnostic (don't hand csrss junk).
-                        print_str(b"[sm-rdv] WALL: rendezvous produced no client handle\n");
-                        handled = false;
-                        result = 0xC0000001;
-                        // ★ CREDENTIAL FRONTIER MILESTONE PARK. winlogon arriving here after the
-                        // logon dialog took the injected credentials is msgina's
-                        // `DoLogon → DoLoginTasks → ConnectToLsa → LsaRegisterLogonProcess`
-                        // connecting to `\LsaAuthenticationPort`. Nothing on this boot ACCEPTS that
-                        // port (lsass never publishes it), so winlogon would block forever waiting
-                        // for the LSA server — a COOPERATIVE wait, not a crash. Park it as a
-                        // milestone so its TCB stays live (a crash-park marks the process a dead
-                        // win32k callback client and strands the callback plane) and the boot
-                        // quiesces at the furthest proven point of the logon.
-                        if pi == 2 && winlogon_credential_return_delivered() {
-                            let name16 = nt_handler.read_lpc_name(m3);
-                            if lpc_name_is(&name16, b"\\LsaAuthenticationPort") {
-                                print_str(b"[cred-frontier] msgina DoLogon reached ConnectToLsa(\\LsaAuthenticationPort) with the typed credentials -> MILESTONE park\n");
-                                WINLOGON_CRED_LSA_CONNECT.store(1, Ordering::Relaxed);
-                                wl_milestone_park = true;
-                            }
-                        }
-                    }
-                }
-                if nt_handler.sm_request_port != 0 {
-                    let completed = sm_api_request_rendezvous(
-                        nt_handler.sm_request_port,
-                        nt_handler.sm_request_message,
-                        nt_handler.sm_reply_message,
-                        procs[0].pml4,
-                        primary_pe,
-                        procs[0].img_end,
-                        nt_base,
-                        nt_end,
-                        ntdll.map(|(_, p)| p),
-                        procs[csrss_pi].pml4,
-                        loaded_hosted_pe_by_pi(&*hosted_loaded_images, csrss_pi)
-                            .expect("CSRSS PE must be registered before SM API rendezvous"),
-                        procs[csrss_pi].img_end,
-                        &reg,
-                        dll_pe_store.as_slice(),
-                        &mut nt_handler,
-                    );
-                    if completed {
-                        result = 0;
-                    } else {
-                        print_str(b"[sm-api] WALL: synchronous SM request did not complete\n");
-                        result = 0xC0000001;
-                        handled = false;
+                        nt_handler.lsa_connect_conn = conn_id;
                     }
                 }
                 if nt_handler.csr_request_port != 0 {
@@ -16398,9 +16255,6 @@ pub(crate) unsafe fn service_sec_image(
                     flags,
                 );
                 reply_recv_badge(fault_ep, 18, r0, r1, r2, r3)
-            } else if park_caller {
-                // The caller's binding was STOLEN into a park slot — do not reply, just recv.
-                recv_full_r12(fault_ep, reply_main)
             } else {
                 // A client redirected into a win32k user-mode callback resumes with the length-0
                 // fault reply the redirect staged, not with a syscall result. User APC delivery uses
@@ -21120,7 +20974,6 @@ unsafe fn spawn_requested_local_thread(
     nt_handler: &mut ExecNtHandler,
     request: HostedThreadSpawnRequest,
     procs: &[ProcExec],
-    current_pml4: u64,
     caller_sp: u64,
     fault_ep: u64,
 ) {
@@ -21130,90 +20983,37 @@ unsafe fn spawn_requested_local_thread(
     }
 
     match request {
-        HostedThreadSpawnRequest::SmLoop => {
-            let Some(tid) = nt_handler.hosted_thread_tid_for_role(0, HostedThreadRole::SmLoop)
-            else {
-                print_str(b"[sm-loop] missing reserved runtime role before spawn\n");
-                return;
-            };
-            let (ctx_va, start) = requested_thread_start(caller_sp);
-            print_str(b"[sm-loop] spawning REAL SmpApiLoop thread: ctx=0x");
-            print_hex((ctx_va >> 32) as u32);
-            print_hex(ctx_va as u32);
-            print_str(b" entry=0x");
-            print_hex((start.rip >> 32) as u32);
-            print_hex(start.rip as u32);
-            print_str(b" port=0x");
-            print_hex((start.rcx >> 32) as u32);
-            print_hex(start.rcx as u32);
-            print_str(b"\n");
-            let cid_proc = nt_handler.pm_pid_for_pi(0).unwrap_or(0) as u64;
-            let pml4 = if procs[0].pml4 != 0 {
-                procs[0].pml4
-            } else {
-                current_pml4
-            };
-            let spawned = spawn_sm_loop_thread(pml4, start.rip, start.rcx, cid_proc, tid);
-            nt_handler.register_hosted_thread_spawn(
-                0,
-                tid,
-                spawned,
-                hosted_top_badge_for_pi(nt_handler, 0),
-                HostedThreadRole::SmLoop,
-            );
-            print_str(b"[sm-loop] spawned tcb=0x");
-            print_hex(spawned.tcb() as u32);
-            print_str(b" (parks on its first fault to sm_fault_ep)\n");
-        }
-        HostedThreadSpawnRequest::Csr { slot } => {
-            let role = match slot {
-                0 => HostedThreadRole::CsrApi,
-                1 => HostedThreadRole::CsrSbApi,
-                _ => return,
-            };
+        HostedThreadSpawnRequest::CsrApi => {
             let (csrss_pi, pid, pml4) = live_process_context_for_role(
                 nt_handler,
                 procs,
                 nt_exe_image::HostedProcessRole::Win32Subsystem,
             )
             .expect("CSRSS EPROCESS missing before CSR thread spawn");
-            let Some(tid) = nt_handler.hosted_thread_tid_for_role(csrss_pi, role) else {
+            let Some(tid) = nt_handler
+                .hosted_thread_tid_for_role(csrss_pi, HostedThreadRole::CsrApi)
+            else {
                 print_str(b"[csr-thread] missing reserved runtime role before spawn\n");
                 return;
             };
             let (_ctx_va, start) = requested_thread_start(caller_sp);
-            if slot == 0 {
-                print_str(b"[csr-loop] spawning REAL CsrApiRequestThread: entry=0x");
-            } else {
-                print_str(b"[csr-sb] spawning REAL CsrSbApiRequestThread: entry=0x");
-            }
+            print_str(b"[csr-loop] spawning REAL CsrApiRequestThread: entry=0x");
             print_hex((start.rip >> 32) as u32);
             print_hex(start.rip as u32);
-            if slot == 0 {
-                print_str(b" param=0x");
-                print_hex(start.rcx as u32);
-            } else {
-                print_str(b" tid=");
-                print_u64(tid);
-            }
+            print_str(b" param=0x");
+            print_hex(start.rcx as u32);
             print_str(b"\n");
-            let spawned = if slot == 0 {
-                spawn_csr_loop_thread(pml4, start.rip, start.rcx, pid, tid)
-            } else {
-                spawn_csr_sb_loop_thread(pml4, start.rip, start.rcx, pid, tid)
-            };
+            let spawned = spawn_csr_loop_thread(pml4, start.rip, start.rcx, pid, tid);
             nt_handler.register_hosted_thread_spawn(
                 csrss_pi,
                 tid,
                 spawned,
                 hosted_top_badge_for_pi(nt_handler, csrss_pi),
-                role,
+                HostedThreadRole::CsrApi,
             );
-            if slot == 0 {
-                print_str(b"[csr-loop] spawned tcb=0x");
-                print_hex(spawned.tcb() as u32);
-                print_str(b" (parks on its first fault to csr_fault_ep)\n");
-            }
+            print_str(b"[csr-loop] spawned tcb=0x");
+            print_hex(spawned.tcb() as u32);
+            print_str(b" (parks on its first fault to csr_fault_ep)\n");
         }
         HostedThreadSpawnRequest::Winlogon { slot } => {
             let (role, badge, teb) = match slot {

@@ -3112,16 +3112,13 @@ impl ExecNtHandler {
         write_field!(pnp_event_cursor, 0);
         write_field!(pnp_notify_event, 0);
         write_field!(pnp_status, PnpRuntimeStatusTable::new());
-        write_field!(lpc_rendezvous_conn, 0);
-        write_field!(lpc_rendezvous_out, 0);
+        write_field!(lsa_connect_conn, 0);
+        write_field!(lsa_connect_out, 0);
         write_field!(lpc_receive_park, None);
         write_field!(lpc_connect_park, None);
         write_field!(lpc_connect_completion, None);
         write_field!(lpc_request_park, None);
         write_field!(lpc_endpoint_progress, false);
-        write_field!(sm_request_port, 0);
-        write_field!(sm_request_message, 0);
-        write_field!(sm_reply_message, 0);
         write_field!(csr_request_port, 0);
         write_field!(csr_request_message, 0);
         write_field!(csr_reply_message, 0);
@@ -15234,7 +15231,7 @@ impl ExecNtHandler {
     unsafe fn user_memory_read(&self, memory: SyscallUserMemory, va: u64, dst: &mut [u8]) -> bool {
         match memory {
             SyscallUserMemory::CurrentProcess => self.xas_read(va, dst),
-            SyscallUserMemory::SmProcess | SyscallUserMemory::CsrProcess { .. } => {
+            SyscallUserMemory::CsrProcess => {
                 self.hosted_server_memory_read(memory, va, dst)
             }
         }
@@ -15243,7 +15240,7 @@ impl ExecNtHandler {
     unsafe fn user_memory_write(&self, memory: SyscallUserMemory, va: u64, src: &[u8]) -> bool {
         match memory {
             SyscallUserMemory::CurrentProcess => self.xas_try_write_buf(va, src),
-            SyscallUserMemory::SmProcess | SyscallUserMemory::CsrProcess { .. } => {
+            SyscallUserMemory::CsrProcess => {
                 self.hosted_server_memory_write(memory, va, src)
             }
         }
@@ -15257,7 +15254,7 @@ impl ExecNtHandler {
     ) -> bool {
         match memory {
             SyscallUserMemory::CurrentProcess => self.probe_user_output(va, len),
-            SyscallUserMemory::SmProcess | SyscallUserMemory::CsrProcess { .. } => {
+            SyscallUserMemory::CsrProcess => {
                 self.hosted_server_memory_probe_output(memory, va, len)
             }
         }
@@ -15266,8 +15263,7 @@ impl ExecNtHandler {
     fn hosted_server_memory_pi(memory: SyscallUserMemory) -> Option<usize> {
         match memory {
             SyscallUserMemory::CurrentProcess => None,
-            SyscallUserMemory::SmProcess => Some(0),
-            SyscallUserMemory::CsrProcess { .. } => Some(1),
+            SyscallUserMemory::CsrProcess => Some(1),
         }
     }
 
@@ -15278,24 +15274,21 @@ impl ExecNtHandler {
     ) -> bool {
         match memory {
             SyscallUserMemory::CurrentProcess => false,
-            SyscallUserMemory::SmProcess => sm_stack_copyin(va, dst),
-            SyscallUserMemory::CsrProcess { sb } => csr_thread_stack_copyin(sb, va, dst),
+            SyscallUserMemory::CsrProcess => csr_thread_stack_copyin(va, dst),
         }
     }
 
     unsafe fn hosted_server_stack_copyout(memory: SyscallUserMemory, va: u64, src: &[u8]) -> bool {
         match memory {
             SyscallUserMemory::CurrentProcess => false,
-            SyscallUserMemory::SmProcess => sm_stack_copyout(va, src),
-            SyscallUserMemory::CsrProcess { sb } => csr_thread_stack_copyout(sb, va, src),
+            SyscallUserMemory::CsrProcess => csr_thread_stack_copyout(va, src),
         }
     }
 
     fn hosted_server_stack_has_range(memory: SyscallUserMemory, va: u64, len: usize) -> bool {
         match memory {
             SyscallUserMemory::CurrentProcess => false,
-            SyscallUserMemory::SmProcess => sm_stack_has_range(va, len),
-            SyscallUserMemory::CsrProcess { sb } => csr_thread_stack_has_range(sb, va, len),
+            SyscallUserMemory::CsrProcess => csr_thread_stack_has_range(va, len),
         }
     }
 
@@ -24978,7 +24971,7 @@ impl ExecNtHandler {
         if let Err(status) = self.accept_lpc_connection_views(
             connect.connection_id,
             0,
-            SyscallUserMemory::SmProcess,
+            SyscallUserMemory::CurrentProcess,
             0,
             0,
         ) {
@@ -25049,7 +25042,7 @@ impl ExecNtHandler {
                 if let Err(status) = self.stage_lpc_connection_views(
                     reverse.connection_id,
                     0,
-                    SyscallUserMemory::SmProcess,
+                    SyscallUserMemory::CurrentProcess,
                     None,
                     None,
                 ) {
@@ -25559,7 +25552,7 @@ impl ExecNtHandler {
         dst: &mut [u8],
     ) -> bool {
         match memory {
-            SyscallUserMemory::SmProcess | SyscallUserMemory::CsrProcess { .. } => {
+            SyscallUserMemory::CsrProcess => {
                 self.hosted_server_memory_read(memory, va, dst)
             }
             SyscallUserMemory::CurrentProcess if pi == self.pi => self.xas_read(va, dst),
@@ -25591,7 +25584,7 @@ impl ExecNtHandler {
         src: &[u8],
     ) -> bool {
         match memory {
-            SyscallUserMemory::SmProcess | SyscallUserMemory::CsrProcess { .. } => {
+            SyscallUserMemory::CsrProcess => {
                 self.hosted_server_memory_write(memory, va, src)
             }
             SyscallUserMemory::CurrentProcess if pi == self.pi => self.xas_try_write_buf(va, src),
@@ -30909,7 +30902,7 @@ impl ExecNtHandler {
                             self.thread_spawn_request = Some(if slot == 1 {
                                 HostedThreadSpawnRequest::TpWorker { pi: self.pi, slot }
                             } else {
-                                HostedThreadSpawnRequest::Csr { slot }
+                                HostedThreadSpawnRequest::CsrApi
                             });
                             print_str(b"[csr-thread] create slot=");
                             print_u64(slot as u64);
@@ -31146,53 +31139,10 @@ impl ExecNtHandler {
                 // LSA per-connection RPC workers use the same dynamic worker-window mechanism.
                 // The route proof counter is incremented when the listener-owned create is
                 // classified in `create_generic_local_tp_worker_thread`.
-                if matches!(ctx.service, NativeService::NtCreateThread)
-                    && self.current_process_is_smss()
-                    && self
-                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::SmLoop)
-                        .is_none()
-                {
-                    unsafe {
-                        let context = args[NT_CREATE_THREAD_CONTEXT_ARG];
-                        let start = nt_thread_start::Amd64ThreadContext::read(
-                            |address| smss_stack_read(address),
-                            context,
-                        );
-                        let create_suspended =
-                            nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
-                        if let Some((slot, tid, handle)) = self.nt_create_thread_handle(
-                            start.rip,
-                            create_suspended,
-                            nt_ulong_arg(args[1]),
-                        ) {
-                            if !self.reserve_created_hosted_thread_role(
-                                slot,
-                                tid,
-                                handle,
-                                self.hosted_process_top_badge(self.pi).unwrap_or(0),
-                                HostedThreadRole::SmLoop,
-                            ) {
-                                return 0xC000_009A;
-                            }
-                            self.pm
-                                .set_thread_teb(tid as nt_process::ThreadId, SM_TEB_VA);
-                            self.queue_write(args[0], handle);
-                            let client_id = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
-                            if client_id != 0 {
-                                self.queue_write(
-                                    client_id,
-                                    self.current_pm_pid().unwrap_or(0) as u64,
-                                );
-                                self.queue_write(client_id + 8, tid);
-                            }
-                            self.thread_spawn_request = Some(HostedThreadSpawnRequest::SmLoop);
-                            return 0;
-                        }
-                        return 0xC000_009A;
-                    }
-                }
-                // Generic same-process NtCreateThread route. Named SM/CSR/RPC routes above keep
-                // their custom layouts; every remaining local hosted thread gets a real generic
+                // Generic same-process NtCreateThread route. The two ReactOS `SmpApiLoop` threads
+                // are ordinary concurrent server workers and use this same growable worker window.
+                // Named CSR/RPC routes above keep only the layouts they still require; every remaining
+                // local hosted thread gets a real generic
                 // ETHREAD, TEB, ClientId, fault badge, and seL4 TCB.
                 if let Some(status) =
                     unsafe { self.create_generic_local_tp_worker_thread(args, false) }
@@ -31234,7 +31184,7 @@ impl ExecNtHandler {
                 )
             },
             // NtRequestWaitReplyPort(PortHandle=R10, RequestMessage=RDX, ReplyMessage=R8) — the LPC
-            // message DATA plane. SM requests are already driven through real SmpApiLoop. CSR API
+            // message DATA plane. SM requests are driven through ordinary real SmpApiLoop workers. CSR API
             // requests now use the same shape when csrss's CsrApiRequestThread is parked on
             // \Windows\ApiPort. If the real worker is unavailable, fail visibly instead of writing a
             // modeled CSR success reply.
@@ -31302,8 +31252,9 @@ impl ExecNtHandler {
             // *ServerView, *MaxMsg, *ConnInfo, *ConnInfoLen). The SM connect (SmConnectToSm →
             // \SmApiPort). Route to the LPC broker; on the interim AutoAccept path the connect completes
             // synchronously → write the client comm-port handle to the caller's *PortHandle (arg1=R10)
-            // + cache the connection; on Manual (path B) the loop drives the authentic SmpApiLoop accept
-            // via sm_rendezvous. This is what unblocks csrss's SmConnectToSm.
+            // + cache the connection. Pending connects retain a typed continuation and are consumed by
+            // whichever real server worker receives from the named listen port. LSA remains on its
+            // explicit legacy adapter until that server is converted in the next slice.
             NativeService::NtConnectPort => unsafe {
                 let name16 = self.read_lpc_name(args[1]);
                 let conn_info_ptr = args[6];
@@ -31378,8 +31329,9 @@ impl ExecNtHandler {
                         security,
                     );
                 }
-                let use_generic_connect_wait = Self::lpc_name_equals_ascii(&name16, b"\\smapiport")
-                    || Self::lpc_name_equals_ascii(&name16, b"\\windows\\sbapiport");
+                let use_legacy_lsa_connect =
+                    Self::lpc_name_equals_ascii(&name16, b"\\lsaauthenticationport");
+                let use_generic_connect_wait = !use_legacy_lsa_connect;
                 let connect_reservation = if use_generic_connect_wait {
                     match crate::service_sec_image::lpc_connect_wait_reserve() {
                         Ok(reservation) => Some(reservation),
@@ -31462,8 +31414,8 @@ impl ExecNtHandler {
                                 // reply/wait/receive immediately. Consume this producer edge once.
                                 self.lpc_endpoint_progress = true;
                             } else {
-                                self.lpc_rendezvous_conn = r.connection_id;
-                                self.lpc_rendezvous_out = args[0];
+                                self.lsa_connect_conn = r.connection_id;
+                                self.lsa_connect_out = args[0];
                             }
                             print_str(b"[lpc-connect] pending pi=");
                             print_u64(self.pi as u64);

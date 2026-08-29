@@ -69,10 +69,9 @@ pub unsafe extern "C" fn lpc_server_entry(heap_frames: u64) -> ! {
     let wait_requests = Sel4Notify::new(&ENV, CT_N_SUB);
     let signal_completion = Sel4Notify::new(&ENV, CT_N_COMP);
 
-    // Path B (authentic): Manual accept — a connect leaves the connection Pending for a REAL
-    // receiver (smss's SmpApiLoop thread, driven by the executive's `sm_rendezvous`) to drain via
-    // receive → accept → complete. Replaces the interim AutoAccept where the server modelled the
-    // acceptor. The full receive/accept/complete machinery is unchanged (host-tested under both).
+    // Manual accept: a connect remains pending until a real server receiver drains it through
+    // receive -> accept -> complete. The broker owns identity and state; the executive only retains
+    // typed blocked-syscall continuations.
     let mut server = Server::new();
     server.set_accept_policy(AcceptPolicy::Manual);
     // The ALPC adapter over the SAME port core (via server.core_mut()). Holds only
