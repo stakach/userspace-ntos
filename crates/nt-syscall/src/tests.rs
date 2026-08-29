@@ -972,6 +972,21 @@ fn group_b2_out_writing_query_services_register() {
 }
 
 #[test]
+fn set_information_debug_object_uses_its_canonical_service_contract() {
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtSetInformationDebugObject, 232)],
+    );
+    let entry = table.lookup(232).unwrap();
+    assert_eq!(entry.service, NativeService::NtSetInformationDebugObject);
+    assert_eq!((entry.min_args, entry.max_args), (5, 5));
+    assert_eq!(
+        table.number_of(NativeService::NtSetInformationDebugObject),
+        Some(232)
+    );
+}
+
+#[test]
 fn delay_execution_registers_with_native_abi() {
     let table = NativeServiceTable::from_numbers(
         UserlandAbiProfile::Windows7,

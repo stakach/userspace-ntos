@@ -39272,6 +39272,68 @@ impl ExecNtHandler {
                 }
             },
 
+            // NtSetInformationDebugObject(DebugHandle, InformationClass, DebugInformation,
+            //                             DebugInformationLength, ReturnLength OPTIONAL).
+            NativeService::NtSetInformationDebugObject => unsafe {
+                let information_class = nt_ulong_arg(args[1]);
+                let required = match nt_process::dbgk::debug_object_set_information_size(
+                    information_class,
+                ) {
+                    Ok(required) => required,
+                    Err(status) => return status,
+                };
+                if nt_ulong_arg(args[3]) as usize != required {
+                    return nt_process::STATUS_INFO_LENGTH_MISMATCH;
+                }
+                let information = args[2];
+                if ctx.previous_mode != nt_syscall::ProcessorMode::KernelMode
+                    && information & 3 != 0
+                {
+                    return STATUS_DATATYPE_MISALIGNMENT;
+                }
+                if information == 0 || !self.probe_user_input(information, required) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let mut encoded = [0u8; 4];
+                if !self.xas_read(information, &mut encoded) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let information = match nt_process::dbgk::decode_debug_object_set_information(
+                    information_class,
+                    &encoded,
+                ) {
+                    Ok(information) => information,
+                    Err(status) => return status,
+                };
+
+                let return_length = args[4];
+                if return_length != 0 {
+                    if ctx.previous_mode != nt_syscall::ProcessorMode::KernelMode
+                        && return_length & 3 != 0
+                    {
+                        return STATUS_DATATYPE_MISALIGNMENT;
+                    }
+                    if !self.probe_user_output(return_length, 4)
+                        || !self.xas_write_u32(return_length, required as u32)
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                }
+
+                let object = match self.debug_object_for_handle(
+                    args[0],
+                    nt_process::dbgk::DEBUG_OBJECT_SET_INFORMATION,
+                ) {
+                    Ok(object) => object,
+                    Err(status) => return status,
+                };
+                let Some(debug_object) = self.pm.debug_object_mut(object) else {
+                    return STATUS_INVALID_HANDLE;
+                };
+                debug_object.set_information(information);
+                0
+            },
+
             // NtRemoveProcessDebug(ProcessHandle[R10]=args[0], DebugHandle=args[1]).
             NativeService::NtRemoveProcessDebug => {
                 let object = match self.debug_object_for_handle(

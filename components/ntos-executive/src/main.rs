@@ -1210,7 +1210,7 @@ pub const SSN_NT_RAISE_EXCEPTION: u64 = 189;
 /// kernel continuation. Unlike an ordinary native service, a successful call does not return to
 /// the syscall instruction that issued it.
 pub const SSN_NT_CALLBACK_RETURN: u64 = 22;
-/// **Dbgk — the user-mode debugging plane** (`ntoskrnl/dbgk`). The five debug-object services our
+/// **Dbgk — the user-mode debugging plane** (`ntoskrnl/dbgk`). The debug-object services our
 /// ntdll's `DbgUi*` wrappers issue (`references/reactos/dll/ntdll/dbg/dbgui.c`), each with its
 /// `sysfuncs.lst`-derived SSN (0-based line index — `NtCreateDebugObject` is line 36, …). Serviced
 /// by the real `DEBUG_OBJECT` plane in `nt_process::dbgk` (create / attach / wait / continue /
@@ -1219,6 +1219,7 @@ pub const SSN_NT_CREATE_DEBUG_OBJECT: u64 = 35;
 pub const SSN_NT_DEBUG_ACTIVE_PROCESS: u64 = 59;
 pub const SSN_NT_DEBUG_CONTINUE: u64 = 60;
 pub const SSN_NT_REMOVE_PROCESS_DEBUG: u64 = 199;
+pub const SSN_NT_SET_INFORMATION_DEBUG_OBJECT: u64 = 232;
 pub const SSN_NT_WAIT_FOR_DEBUG_EVENT: u64 = 279;
 const NT_HIVE_IMAGE_MAGIC_LE: u64 = 0x3145_5649_4854_4E55; // "UNTHIVE1"
 /// NtAllocateLocallyUniqueId — line 16 of `sysfuncs.lst` (0-based index 15). msgina's `MyLogonUser`
@@ -24306,6 +24307,10 @@ fn build_nt_table() -> NativeServiceTable {
             (
                 NativeService::NtRemoveProcessDebug,
                 SSN_NT_REMOVE_PROCESS_DEBUG as u32,
+            ),
+            (
+                NativeService::NtSetInformationDebugObject,
+                SSN_NT_SET_INFORMATION_DEBUG_OBJECT as u32,
             ),
             (
                 NativeService::NtWaitForDebugEvent,

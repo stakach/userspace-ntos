@@ -16716,9 +16716,43 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     at least 32 colours, passes all `295/295` gates, and matches the sentinel.
 
     Review adjustment: the shared time model, bootstrap epoch, dynamic persistent-clock provider,
-    durable writeback, and null refresh transaction are closed. `NtSetSystemTime` reduces the
-    canonical typed-service gap to 44 exports. Return to the general canonical ABI inventory and
-    select the next bounded Ob/Ps/Se/Mm/I/O trait from the pinned ReactOS target, keeping policy in
-    user mode and implementing its independently testable mechanism in a focused crate before
-    executive wiring. Do not expand the executive with another boot-specific probe while a general
-    NT trait remains missing.
+    durable writeback, and null refresh transaction are closed. A regenerated comparison of the 223
+    required-import services against the typed surface corrects the stale running count: 41 canonical
+    services remained at this checkpoint. (`NtSetSystemTime` was already typed and numbered by the
+    adjustable-clock slice, so persistence did not reduce that count.) Return to the general
+    canonical ABI inventory and select the next bounded Ob/Ps/Se/Mm/I/O trait from the pinned
+    ReactOS target, keeping policy in user mode and implementing its independently testable mechanism
+    in a focused crate before executive wiring. Do not expand the executive with another
+    boot-specific probe while a general NT trait remains missing.
+
+    `NtSetInformationDebugObject` (2026-08-30, accepted): SSN 232 is now a typed, registered
+    five-argument service over the existing real `DEBUG_OBJECT`; no new executive object state or
+    numeric dispatch branch was added. `nt-process::dbgk` owns the host-tested information-class
+    decoder for the sole pinned class, `DebugObjectKillProcessOnExitInformation`, including exact
+    four-byte sizing and nonzero-ULONG boolean semantics. It also owns the flag mutation.
+
+    The executive validates the class and fixed size before touching user memory, captures the
+    aligned input once, probes and writes the optional required-length output before resolving the
+    handle, and then requires the dedicated `DEBUG_OBJECT_SET_INFORMATION` access right. Wrong-type,
+    stale, and underprivileged handles fail through the normal process-local handle table. This
+    intentionally fixes ReactOS's use of the wait-state-change right for this setter rather than
+    copying that access-control bug.
+
+    Focused validation passes `nt-process` `112/112`, `nt-syscall` `71/71`, `git diff --check`, the
+    freestanding executive at the established 209-warning baseline, and the executive release
+    build/staging path. The serialized non-regression gate launches genuine userinit and Explorer,
+    records 669 real api0 redirects with zero callback failures, reaches paint begin/end `5/20` with
+    187 direct GDI returns and 135 batch flushes covering 184 records, paints `480000/480000`
+    framebuffer pixels with at least 32 colours, passes all `295/295` gates, and matches the
+    sentinel. The normal shell workload does not issue SSN 232; focused tests prove its mutation and
+    ABI contract. The typed surface now contains 184 services, the hosted table registers 183
+    numbered variants, and 40 required canonical services remain absent.
+
+    Review adjustment: implement `NtGetDevicePowerState` (SSN 90) next as the bounded Po/I/O trait,
+    but do not expose the current `HOSTED_DRIVER_DEVICE_POWER_STATE` singleton. First install the
+    existing host-tested `nt-power-manager::PowerManager` as the authoritative growable per-devnode
+    state store. Make `PoSetPowerState` resolve the exact hosted device object to its devnode and
+    update that record; make `NtGetDevicePowerState` resolve an access-checked file/device handle and
+    return the same record. Delete the singleton and any device-agnostic summary behavior in the
+    accepted slice so multiple drivers and repeated devices cannot overwrite one another's power
+    state.

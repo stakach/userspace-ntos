@@ -29,7 +29,10 @@
 
 use alloc::vec::Vec;
 
-use crate::{ClientId, ProcessId, ThreadId, STATUS_NO_MEMORY};
+use crate::{
+    ClientId, ProcessId, ThreadId, STATUS_INFO_LENGTH_MISMATCH, STATUS_INVALID_INFO_CLASS,
+    STATUS_NO_MEMORY,
+};
 
 /// Identity of a `DEBUG_OBJECT` inside a [`DebugObjectStore`].
 pub type DebugObjectId = u32;
@@ -53,6 +56,37 @@ pub const DEBUG_OBJECT_ADD_REMOVE_PROCESS: u32 = 0x0002;
 pub const DEBUG_OBJECT_SET_INFORMATION: u32 = 0x0004;
 /// `DEBUG_OBJECT_ALL_ACCESS` = `STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0xF`.
 pub const DEBUG_OBJECT_ALL_ACCESS: u32 = 0x001F_000F;
+
+/// The sole settable `DEBUGOBJECTINFOCLASS` on the pinned NT target.
+pub const DEBUG_OBJECT_KILL_PROCESS_ON_EXIT_INFORMATION_CLASS: u32 = 1;
+pub const DEBUG_OBJECT_KILL_PROCESS_ON_EXIT_INFORMATION_SIZE: usize = 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DebugObjectSetInformation {
+    KillProcessOnExit(bool),
+}
+
+pub fn debug_object_set_information_size(information_class: u32) -> Result<usize, u32> {
+    match information_class {
+        DEBUG_OBJECT_KILL_PROCESS_ON_EXIT_INFORMATION_CLASS => {
+            Ok(DEBUG_OBJECT_KILL_PROCESS_ON_EXIT_INFORMATION_SIZE)
+        }
+        _ => Err(STATUS_INVALID_INFO_CLASS),
+    }
+}
+
+pub fn decode_debug_object_set_information(
+    information_class: u32,
+    data: &[u8],
+) -> Result<DebugObjectSetInformation, u32> {
+    let required = debug_object_set_information_size(information_class)?;
+    if data.len() != required {
+        return Err(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    Ok(DebugObjectSetInformation::KillProcessOnExit(
+        u32::from_le_bytes(data.try_into().unwrap()) != 0,
+    ))
+}
 
 /// Expand generic access bits with the `DbgkDebugObjectMapping` generic mapping.
 pub fn map_debug_object_access(desired: u32) -> u32 {
@@ -677,6 +711,14 @@ impl DebugObject {
         }
     }
 
+    pub fn set_information(&mut self, information: DebugObjectSetInformation) {
+        match information {
+            DebugObjectSetInformation::KillProcessOnExit(kill) => {
+                self.set_kill_process_on_exit(kill)
+            }
+        }
+    }
+
     /// `DbgkpCloseObject` — the debugger handle went away; no further events may be queued.
     pub fn mark_debugger_inactive(&mut self) {
         self.flags |= DEBUG_OBJECT_DEBUGGER_INACTIVE;
@@ -1266,6 +1308,37 @@ mod tests {
         assert_eq!(store.len(), 2);
         // Ids are never zero, so a host can use 0 as "no object".
         assert!(plain != 0 && killer != 0);
+    }
+
+    #[test]
+    fn set_information_validates_class_and_size_and_toggles_kill_on_exit() {
+        assert_eq!(
+            debug_object_set_information_size(0),
+            Err(STATUS_INVALID_INFO_CLASS)
+        );
+        assert_eq!(
+            decode_debug_object_set_information(
+                DEBUG_OBJECT_KILL_PROCESS_ON_EXIT_INFORMATION_CLASS,
+                &[0; 3],
+            ),
+            Err(STATUS_INFO_LENGTH_MISMATCH)
+        );
+
+        let mut object = DebugObject::new(0);
+        let enabled = decode_debug_object_set_information(
+            DEBUG_OBJECT_KILL_PROCESS_ON_EXIT_INFORMATION_CLASS,
+            &2u32.to_le_bytes(),
+        )
+        .unwrap();
+        object.set_information(enabled);
+        assert!(object.kill_process_on_exit());
+        let disabled = decode_debug_object_set_information(
+            DEBUG_OBJECT_KILL_PROCESS_ON_EXIT_INFORMATION_CLASS,
+            &0u32.to_le_bytes(),
+        )
+        .unwrap();
+        object.set_information(disabled);
+        assert!(!object.kill_process_on_exit());
     }
 
     #[test]
