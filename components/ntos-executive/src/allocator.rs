@@ -442,11 +442,7 @@ unsafe fn validate_free_list(operation: &'static [u8], owner_start: usize, owner
     let mut guard = 0usize;
     let max_nodes = durable_heap_capacity() / FREE_NODE_SIZE;
     while node != 0 {
-        if node < DATA
-            || node >= top
-            || node % ALLOC_GRANULE != 0
-            || guard >= max_nodes
-        {
+        if node < DATA || node >= top || node % ALLOC_GRANULE != 0 || guard >= max_nodes {
             allocator_corruption(operation, owner_start, owner_size, node, 0, 0);
         }
         let size = unsafe { free_node_size(node) };
@@ -459,10 +455,7 @@ unsafe fn validate_free_list(operation: &'static [u8], owner_start: usize, owner
             || size % ALLOC_GRANULE != 0
             || end > top
             || (next != 0
-                && (next <= node
-                    || next < end
-                    || next >= top
-                    || next % ALLOC_GRANULE != 0))
+                && (next <= node || next < end || next >= top || next % ALLOC_GRANULE != 0))
         {
             allocator_corruption(operation, owner_start, owner_size, node, size, next);
         }

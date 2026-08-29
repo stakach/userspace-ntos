@@ -277,6 +277,10 @@ pub enum NativeService {
     NtQueryInstallUILanguage,
     NtSetDefaultUILanguage,
     NtCreateProcess,
+    /// Extended process creation carries the canonical ninth `JobMemberLevel` argument. It is a
+    /// distinct service-table identity even when it shares the same executive implementation as
+    /// `NtCreateProcess`.
+    NtCreateProcessEx,
     // Dbgk — the user-mode debugging plane (`ntoskrnl/dbgk`). Backed by the real DEBUG_OBJECT in
     // `nt_process::dbgk`: create/attach/wait/continue/detach.
     NtCreateDebugObject,
@@ -486,6 +490,7 @@ impl NativeService {
             NtQueryInstallUILanguage => "NtQueryInstallUILanguage",
             NtSetDefaultUILanguage => "NtSetDefaultUILanguage",
             NtCreateProcess => "NtCreateProcess",
+            NtCreateProcessEx => "NtCreateProcessEx",
             NtCreateDebugObject => "NtCreateDebugObject",
             NtDebugActiveProcess => "NtDebugActiveProcess",
             NtDebugContinue => "NtDebugContinue",
@@ -706,6 +711,7 @@ impl NativeService {
         NativeService::NtSetThreadExecutionState,
         NativeService::NtRequestWakeupLatency,
         NativeService::NtSetDefaultHardErrorPort,
+        NativeService::NtCreateProcessEx,
     ];
 }
 

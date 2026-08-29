@@ -646,8 +646,7 @@ mod tests {
         message[2..4].copy_from_slice(&total_length.to_le_bytes());
         message[4..6].copy_from_slice(&msg_type::LPC_CONNECTION_REQUEST.to_le_bytes());
         message[0x18..0x1c].copy_from_slice(&0x1234_u32.to_le_bytes());
-        message[PORT_MESSAGE_HEADER_LEN..PORT_MESSAGE_HEADER_LEN + 8]
-            .copy_from_slice(b"response");
+        message[PORT_MESSAGE_HEADER_LEN..PORT_MESSAGE_HEADER_LEN + 8].copy_from_slice(b"response");
         message[PORT_MESSAGE_HEADER_LEN + 8..].fill(0xcc);
 
         assert_eq!(
@@ -660,7 +659,10 @@ mod tests {
         message[4..6].copy_from_slice(&msg_type::LPC_CONNECTION_REQUEST.to_le_bytes());
         message[0x18..0x1c].fill(0);
         assert_eq!(connection_request_response(&message), None);
-        assert_eq!(connection_request_response(&message[..message.len() - 1]), None);
+        assert_eq!(
+            connection_request_response(&message[..message.len() - 1]),
+            None
+        );
     }
 
     #[test]

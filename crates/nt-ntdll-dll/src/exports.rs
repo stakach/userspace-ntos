@@ -2408,12 +2408,7 @@ pub unsafe extern "system" fn rtl_try_acquire_srw_lock_exclusive(srw_lock: *mut 
         if current != 0 && current != SRW_CONTENDED {
             return 0;
         }
-        match word.compare_exchange_weak(
-            current,
-            SRW_OWNED,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ) {
+        match word.compare_exchange_weak(current, SRW_OWNED, Ordering::Acquire, Ordering::Relaxed) {
             Ok(_) => return 1,
             Err(actual) => current = actual,
         }
@@ -2441,12 +2436,7 @@ pub unsafe extern "system" fn rtl_try_acquire_srw_lock_shared(srw_lock: *mut c_v
         }
         let next_count = if shared { srw_shared_count(current) } else { 0 }.wrapping_add(1);
         let next = (next_count << SRW_SHARED_SHIFT) | SRW_OWNED | SRW_SHARED;
-        match word.compare_exchange_weak(
-            current,
-            next,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ) {
+        match word.compare_exchange_weak(current, next, Ordering::Acquire, Ordering::Relaxed) {
             Ok(_) => return 1,
             Err(actual) => current = actual,
         }
@@ -2537,17 +2527,9 @@ pub unsafe extern "system" fn rtl_release_srw_lock_shared(srw_lock: *mut c_void)
         let next = if next_count == 0 {
             0
         } else {
-            (next_count << SRW_SHARED_SHIFT)
-                | SRW_OWNED
-                | SRW_SHARED
-                | (current & SRW_CONTENDED)
+            (next_count << SRW_SHARED_SHIFT) | SRW_OWNED | SRW_SHARED | (current & SRW_CONTENDED)
         };
-        match word.compare_exchange_weak(
-            current,
-            next,
-            Ordering::Release,
-            Ordering::Relaxed,
-        ) {
+        match word.compare_exchange_weak(current, next, Ordering::Release, Ordering::Relaxed) {
             Ok(_) => {
                 if contended && next_count == 0 {
                     unsafe { srw_wake_contended_waiters(srw_lock) };
@@ -9500,7 +9482,9 @@ pub(crate) unsafe fn ldr_publish_process_locks(peb: u64) -> NtStatus {
         return status;
     }
     status = unsafe {
-        initialize_loader_critical_section(core::ptr::addr_of_mut!(LDR_DLL_NOTIFICATION_LOCK).cast())
+        initialize_loader_critical_section(
+            core::ptr::addr_of_mut!(LDR_DLL_NOTIFICATION_LOCK).cast(),
+        )
     };
     if !nt_success(status) {
         return status;
@@ -23183,8 +23167,7 @@ pub unsafe extern "system" fn rtl_raise_status(_status: NtStatus) {
 /// Host builds do not run the live software-SEH dispatcher.
 #[cfg(not(target_arch = "x86_64"))]
 #[export_name = "RtlRaiseStatus"]
-pub unsafe extern "system" fn rtl_raise_status(_status: NtStatus) {
-}
+pub unsafe extern "system" fn rtl_raise_status(_status: NtStatus) {}
 
 /// `RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord)` — BATCH 42: the REAL software raise
 /// ([`crate::seh::rtl_raise_exception`]): capture the CONTEXT at the raise site, set
@@ -23211,8 +23194,7 @@ pub unsafe extern "system" fn rtl_raise_exception(_exception_record: *mut c_void
 /// Host builds do not run the live software-SEH dispatcher.
 #[cfg(not(target_arch = "x86_64"))]
 #[export_name = "RtlRaiseException"]
-pub unsafe extern "system" fn rtl_raise_exception(_exception_record: *mut c_void) {
-}
+pub unsafe extern "system" fn rtl_raise_exception(_exception_record: *mut c_void) {}
 
 /// `RtlDispatchException(PEXCEPTION_RECORD, PCONTEXT) -> BOOLEAN` — BATCH 42: the REAL first-pass
 /// dispatch ([`crate::seh::rtl_dispatch_exception`]) over the live stack. Returns TRUE if a handler

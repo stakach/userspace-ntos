@@ -12,15 +12,16 @@
 //! but keeping the layout here — one source of truth shared by the ntdll stub side AND cross-checked
 //! against the executive's decode — is the discipline that keeps the two ends from drifting.
 //!
-//! ## REQUEST (ntdll → executive), msginfo label = [`NT_NATIVE_SYSCALL_LABEL`], length 6
+//! ## REQUEST (ntdll → executive), msginfo label = [`NT_NATIVE_SYSCALL_LABEL`]
 //! | MR | contents |
 //! |----|----------|
 //! | 0  | SSN (Windows service number) |
-//! | 1  | caller RSP (so the executive reads stack args 5+ AND writes stack out-params via its stack mirror — a native `Call` transfers no rsp/stack) |
+//! | 1  | caller RSP (for diagnostics and stack-resident pointer validation) |
 //! | 2  | arg1 (RCX in the Windows ABI; `mov r10,rcx` on the trap path) |
 //! | 3  | arg2 (RDX) |
 //! | 4  | arg3 (R8) |
 //! | 5  | arg4 (R9) |
+//! | 6+ | args 5+ (gathered from the Windows ABI stack by the ntdll stub) |
 //!
 //! ## REPLY (executive → ntdll), length 1
 //! | MR | contents |
@@ -41,9 +42,6 @@ pub use nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL;
 /// This is the SAME `CT_FAULT` slot the executive's `spawn_sec_image` already populates with a cap to
 /// the fault EP — we reuse the fault EP as the service channel (no second endpoint, no extra grant).
 pub const CT_FAULT: u64 = 6;
-
-/// REQUEST message length in MRs (SSN + rsp + 4 register args).
-pub const NT_REQUEST_LEN: u64 = 6;
 
 /// REPLY message length in MRs (NTSTATUS).
 pub const NT_REPLY_LEN: u64 = 1;
@@ -100,9 +98,10 @@ mod tests {
         assert_ne!(NT_NATIVE_SYSCALL_LABEL, 3);
         assert_ne!(NT_NATIVE_SYSCALL_LABEL, 6);
         // And it round-trips through the msginfo pack/unpack.
-        let mi = pack_msginfo(NT_NATIVE_SYSCALL_LABEL, NT_REQUEST_LEN);
+        let len = nt_syscall_abi::native_syscall_request_len(4);
+        let mi = pack_msginfo(NT_NATIVE_SYSCALL_LABEL, len);
         assert_eq!(msginfo_label(mi), NT_NATIVE_SYSCALL_LABEL);
-        assert_eq!(msginfo_length(mi), NT_REQUEST_LEN);
+        assert_eq!(msginfo_length(mi), len);
     }
 
     #[test]
@@ -125,8 +124,11 @@ mod tests {
         assert_eq!(req::RSP, 1);
         assert_eq!(req::ARG1, 2);
         assert_eq!(req::ARG4, 5);
-        // The declared length covers exactly MR0..=MR5.
-        assert_eq!(NT_REQUEST_LEN, req::ARG4 as u64 + 1);
+        assert_eq!(
+            nt_syscall_abi::native_syscall_request_len(4),
+            req::ARG4 as u64 + 1
+        );
+        assert_eq!(nt_syscall_abi::native_syscall_request_len(14), 16);
     }
 
     #[test]

@@ -66,8 +66,21 @@ pub const ALPC_SSN_BASE: u32 = 0x1000;
 /// (`UnknownSyscall`=2, `UserException`=3, `VMFault`=6), so the executive's service loop tells a
 /// native-syscall message from a fault message by `mi>>12`. The single source of truth shared by OUR
 /// ntdll (the stub side) and the executive (the recv side). See `nt_ntdll::native_call` for the full
-/// wire layout (MR0=SSN, MR1=rsp, MR2..5=args; reply MR0=NTSTATUS).
+/// wire layout (MR0=SSN, MR1=rsp, MR2..=argc+1=args; reply MR0=NTSTATUS).
 pub const NT_NATIVE_SYSCALL_LABEL: u64 = 0x4E54;
+
+/// Fixed words before the native syscall argument vector.
+pub const NT_NATIVE_SYSCALL_PREFIX_WORDS: u64 = 2;
+
+/// Exact native-call request length for a service with `argc` arguments.
+pub const fn native_syscall_request_len(argc: u8) -> u64 {
+    NT_NATIVE_SYSCALL_PREFIX_WORDS + argc as u64
+}
+
+/// seL4 message-info word for an exact native syscall request.
+pub const fn native_syscall_message_info(argc: u8) -> u64 {
+    (NT_NATIVE_SYSCALL_LABEL << 12) | native_syscall_request_len(argc)
+}
 
 /// Private executive-to-ntdll reply marker requesting that a parked native seL4-Call syscall be
 /// reissued with the restored request MRs. It is deliberately outside the 32-bit NTSTATUS domain.

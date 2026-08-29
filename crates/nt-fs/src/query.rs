@@ -257,9 +257,7 @@ pub fn encode_named_query_information(
 ) -> Result<QueryInformationResult, u32> {
     let (minimum, name_length_offset, name_offset) = match class {
         FILE_NAME_INFORMATION => (FILE_NAME_INFORMATION_MINIMUM_LENGTH, 0, 4),
-        FILE_ALTERNATE_NAME_INFORMATION => {
-            (FILE_ALTERNATE_NAME_INFORMATION_MINIMUM_LENGTH, 0, 4)
-        }
+        FILE_ALTERNATE_NAME_INFORMATION => (FILE_ALTERNATE_NAME_INFORMATION_MINIMUM_LENGTH, 0, 4),
         FILE_ALL_INFORMATION => (
             FILE_ALL_INFORMATION_MINIMUM_LENGTH,
             FILE_ALL_NAME_LENGTH_OFFSET,

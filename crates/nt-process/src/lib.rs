@@ -54,6 +54,7 @@ pub const PROCESS_GENERIC_WRITE: u32 = 0x0002_0BEB;
 pub const PROCESS_GENERIC_EXECUTE: u32 = 0x0012_0000;
 pub const PROCESS_ALL_ACCESS: u32 = 0x001F_FFFF;
 pub const PROCESS_TERMINATE: u32 = 0x0001;
+pub const PROCESS_CREATE_PROCESS: u32 = 0x0080;
 pub const PROCESS_SET_QUOTA: u32 = 0x0100;
 pub const PROCESS_SET_INFORMATION: u32 = 0x0200;
 pub const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
@@ -79,6 +80,75 @@ pub const THREAD_BASE_PRIORITY_MAX: i32 = 2;
 pub const THREAD_BASE_PRIORITY_MIN: i32 = -2;
 pub const THREAD_BASE_PRIORITY_IDLE: i32 = -15;
 pub const MAXIMUM_PROCESSORS: u64 = 64;
+
+pub const PROCESS_CREATE_FLAGS_BREAKAWAY: u32 = 0x0000_0001;
+pub const PROCESS_CREATE_FLAGS_NO_DEBUG_INHERIT: u32 = 0x0000_0002;
+pub const PROCESS_CREATE_FLAGS_INHERIT_HANDLES: u32 = 0x0000_0004;
+pub const PROCESS_CREATE_FLAGS_OVERRIDE_ADDRESS_SPACE: u32 = 0x0000_0008;
+pub const PROCESS_CREATE_FLAGS_LARGE_PAGES: u32 = 0x0000_0010;
+pub const PROCESS_CREATE_FLAGS_LEGAL_MASK: u32 = PROCESS_CREATE_FLAGS_BREAKAWAY
+    | PROCESS_CREATE_FLAGS_NO_DEBUG_INHERIT
+    | PROCESS_CREATE_FLAGS_INHERIT_HANDLES
+    | PROCESS_CREATE_FLAGS_OVERRIDE_ADDRESS_SPACE
+    | PROCESS_CREATE_FLAGS_LARGE_PAGES;
+
+/// The process-creation arguments after the legacy `NtCreateProcess` ABI has been translated to
+/// the `NtCreateProcessEx` contract used by `PspCreateProcess`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ProcessCreateInput {
+    pub flags: u32,
+    pub section_handle: u64,
+    pub debug_port: u64,
+    pub exception_port: u64,
+    pub job_member_level: u32,
+}
+
+/// Decode the two native process-creation ABIs without reading beyond the registered service
+/// contract. Legacy NT encodes BREAKAWAY and NO_DEBUG_INHERIT in the low handle bits and supplies
+/// an `InheritObjectTable` BOOLEAN in argument five.
+pub fn decode_process_create_input(
+    args: &[u64],
+    extended: bool,
+) -> Result<ProcessCreateInput, u32> {
+    let required = if extended { 9 } else { 8 };
+    if args.len() < required {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if extended {
+        let flags = args[4] as u32;
+        if flags & !PROCESS_CREATE_FLAGS_LEGAL_MASK != 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        return Ok(ProcessCreateInput {
+            flags,
+            section_handle: args[5],
+            debug_port: args[6],
+            exception_port: args[7],
+            // ReactOS/NT5 declares the final NtCreateProcessEx argument as BOOLEAN. The Win64
+            // caller is only required to define the low byte of a stack argument this narrow, so
+            // the remaining seven bytes must never participate in process or job policy.
+            job_member_level: args[8] as u8 as u32,
+        });
+    }
+
+    let mut flags = 0;
+    if args[5] & 1 != 0 {
+        flags |= PROCESS_CREATE_FLAGS_BREAKAWAY;
+    }
+    if args[6] & 1 != 0 {
+        flags |= PROCESS_CREATE_FLAGS_NO_DEBUG_INHERIT;
+    }
+    if args[4] != 0 {
+        flags |= PROCESS_CREATE_FLAGS_INHERIT_HANDLES;
+    }
+    Ok(ProcessCreateInput {
+        flags,
+        section_handle: args[5] & !3,
+        debug_port: args[6] & !3,
+        exception_port: args[7],
+        job_member_level: 0,
+    })
+}
 
 /// Expand generic process access bits using the NT process-object generic mapping. Until process
 /// security descriptors are modelled, `MAXIMUM_ALLOWED` grants the full process mask.
@@ -248,6 +318,12 @@ impl<T> IdTable<T> {
 
     fn contains_key(&self, key: &u32) -> bool {
         self.position(*key).is_ok()
+    }
+
+    fn remove(&mut self, key: &u32) -> Option<T> {
+        self.position(*key)
+            .ok()
+            .map(|index| self.entries.remove(index).1)
     }
 
     fn len(&self) -> usize {
@@ -598,6 +674,17 @@ pub struct NtProcess {
     next_handle_reservation_generation: u64,
 }
 
+/// References returned by the Process Manager's EPROCESS delete procedure. Their backing stores
+/// live outside this crate, so the executive releases them after the policy object is no longer
+/// reachable. Job membership is released internally because Ps owns both sides of that relation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProcessObjectDeletion {
+    pub primary_token: Option<TokenId>,
+    pub exception_port: Option<ExceptionPortEndpoint>,
+    pub job: Option<job::JobId>,
+    pub deleted_threads: usize,
+}
+
 impl NtProcess {
     /// `EPROCESS.DebugPort`.
     pub fn debug_port(&self) -> Option<DebugObjectId> {
@@ -680,6 +767,16 @@ pub enum HandleObject {
 pub struct HandleFlags {
     pub inherit: bool,
     pub protect_from_close: bool,
+}
+
+/// One parent handle selected by `ObInitProcess` for inheritance into a new child. NT preserves
+/// the handle value and granted access while copying only entries carrying `OBJ_INHERIT`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct InheritedHandle {
+    pub handle: Handle,
+    pub object: HandleObject,
+    pub granted_access: u32,
+    pub flags: HandleFlags,
 }
 
 struct HandleEntry {
@@ -1031,6 +1128,156 @@ impl ProcessManager {
             },
         );
         pid
+    }
+
+    /// `PspCreateProcess` job admission. The child is inserted only for the duration of this
+    /// transaction until its inherited job accepts it; a failed assignment runs the process delete
+    /// side of the transaction before returning the failure, so no PID or membership is published.
+    ///
+    /// Other creation-flag semantics (handle/debug inheritance and address-space policy) belong to
+    /// their respective owners. This method validates the NT5 legal mask and consumes only the job
+    /// policy bits.
+    pub fn create_process_with_job_policy(
+        &mut self,
+        image_file_name: &str,
+        parent: Option<ProcessId>,
+        image_section: Option<SectionId>,
+        flags: u32,
+        job_member_level: u32,
+    ) -> Result<ProcessId, u32> {
+        if flags & !PROCESS_CREATE_FLAGS_LEGAL_MASK != 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+
+        let inherited_job = self.select_child_job(parent, flags, job_member_level)?;
+
+        let pid = self.create_process(image_file_name, parent, image_section);
+        let Some(job_id) = inherited_job else {
+            return Ok(pid);
+        };
+        let session_id = self
+            .process(pid)
+            .expect("new process remains private during job admission")
+            .session_id;
+        let assignment = match self.jobs.assign(job_id, pid, session_id) {
+            Ok(assignment) => assignment,
+            Err(status) => {
+                self.rollback_unpublished_process(pid);
+                return Err(status);
+            }
+        };
+        self.jobs.queue_notification(assignment.notification);
+        if assignment.status != STATUS_SUCCESS {
+            self.rollback_unpublished_process(pid);
+            return Err(assignment.status);
+        }
+        if let Err(status) = self.apply_job_limits_to_process(job_id, pid) {
+            self.rollback_unpublished_process(pid);
+            return Err(status);
+        }
+        Ok(pid)
+    }
+
+    /// Resolve the job a new child would inherit without changing process or job state. Hosts use
+    /// this to validate an idempotent in-flight create before reusing its reserved mechanism slot.
+    pub fn select_child_job(
+        &self,
+        parent: Option<ProcessId>,
+        flags: u32,
+        job_member_level: u32,
+    ) -> Result<Option<job::JobId>, u32> {
+        if flags & !PROCESS_CREATE_FLAGS_LEGAL_MASK != 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let parent_job = match parent {
+            Some(parent) => {
+                self.process(parent).ok_or(STATUS_INVALID_HANDLE)?;
+                self.jobs.job_for_process(parent)
+            }
+            None => None,
+        };
+        if parent_job.is_none() && job_member_level != 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        match parent_job {
+            None => Ok(None),
+            Some(job_id) => {
+                let limits = self.jobs.basic_limits(job_id)?;
+                if limits.limit_flags & job::JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK != 0 {
+                    Ok(None)
+                } else if flags & PROCESS_CREATE_FLAGS_BREAKAWAY != 0 {
+                    if limits.limit_flags & job::JOB_OBJECT_LIMIT_BREAKAWAY_OK == 0 {
+                        Err(STATUS_ACCESS_DENIED)
+                    } else {
+                        Ok(None)
+                    }
+                } else {
+                    self.jobs
+                        .select_from_set(job_id, job_member_level)
+                        .map(Some)
+                }
+            }
+        }
+    }
+
+    fn rollback_unpublished_process(&mut self, pid: ProcessId) {
+        let _ = self.jobs.remove_process_reference(pid);
+        let Some(process) = self.processes.remove(&pid) else {
+            return;
+        };
+        if let Some(section) = process.image_section {
+            if let Some(section) = self
+                .sections
+                .get_mut(section as usize)
+                .and_then(Option::as_mut)
+            {
+                section.map_refs = section.map_refs.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Abort a process-creation transaction before its PID or handles have been returned to a
+    /// caller. External handle owners must release their references and empty the new handle table
+    /// first; Ps then removes job membership and the private process record.
+    pub fn abort_process_creation(&mut self, pid: ProcessId) -> Option<ProcessObjectDeletion> {
+        let Some(process) = self.processes.get(&pid) else {
+            return None;
+        };
+        if process.handles.iter().any(|slot| !slot.is_free()) {
+            return None;
+        }
+        for tid in &process.threads {
+            let thread = self.threads.get(tid)?;
+            if thread.wait_references != 0
+                || !thread.termination_ports.is_empty()
+                || thread.impersonation.is_some()
+            {
+                return None;
+            }
+        }
+        let process = self.processes.remove(&pid)?;
+        let deleted_threads = process.threads.len();
+        for tid in &process.threads {
+            let removed = self.threads.remove(tid);
+            debug_assert!(removed.is_some());
+        }
+        self.modules.retain(|module| module.pid != pid);
+        let job = self.jobs.remove_process_reference(pid);
+        if let Some(section) = process.image_section {
+            if let Some(section) = self
+                .sections
+                .get_mut(section as usize)
+                .and_then(Option::as_mut)
+            {
+                section.map_refs = section.map_refs.saturating_sub(1);
+            }
+        }
+        Some(ProcessObjectDeletion {
+            primary_token: process.primary_token,
+            exception_port: process.exception_port_endpoint,
+            job,
+            deleted_threads,
+        })
     }
 
     /// Pre-reserve `pid`'s handle-table capacity so subsequent [`insert_handle`](Self::insert_handle)
@@ -2903,21 +3150,26 @@ impl ProcessManager {
         let assignment = self.jobs.assign(id, pid, session_id)?;
         self.jobs.queue_notification(assignment.notification);
         if assignment.status == STATUS_SUCCESS {
-            let limits = self.jobs.basic_limits(id)?;
-            let process = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
-            if limits.limit_flags & job::JOB_OBJECT_LIMIT_PRIORITY_CLASS != 0 {
-                process.priority_class = limits.priority_class as u8;
-            }
-            if limits.limit_flags & job::JOB_OBJECT_LIMIT_AFFINITY != 0 {
-                process.affinity_mask = limits.affinity;
-                for tid in &process.threads {
-                    if let Some(thread) = self.threads.get_mut(tid) {
-                        thread.affinity_mask = limits.affinity;
-                    }
+            self.apply_job_limits_to_process(id, pid)?;
+        }
+        Ok(assignment.status)
+    }
+
+    fn apply_job_limits_to_process(&mut self, id: job::JobId, pid: ProcessId) -> Result<(), u32> {
+        let limits = self.jobs.basic_limits(id)?;
+        let process = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        if limits.limit_flags & job::JOB_OBJECT_LIMIT_PRIORITY_CLASS != 0 {
+            process.priority_class = limits.priority_class as u8;
+        }
+        if limits.limit_flags & job::JOB_OBJECT_LIMIT_AFFINITY != 0 {
+            process.affinity_mask = limits.affinity;
+            for tid in &process.threads {
+                if let Some(thread) = self.threads.get_mut(tid) {
+                    thread.affinity_mask = limits.affinity;
                 }
             }
         }
-        Ok(assignment.status)
+        Ok(())
     }
 
     pub fn process_job(&self, pid: ProcessId) -> Option<job::JobId> {
@@ -2942,6 +3194,74 @@ impl ProcessManager {
 
     pub fn remove_process_job_reference(&mut self, pid: ProcessId) -> Option<job::JobId> {
         self.jobs.remove_process_reference(pid)
+    }
+
+    /// Run the Process object type's delete procedure once no Object Manager or dispatcher
+    /// reference can still expose this EPROCESS or one of its ETHREADs. Termination only signals the
+    /// objects; deletion is deliberately later. Thread impersonation and termination-port references
+    /// must already have been returned by thread rundown.
+    pub fn delete_process_object_if_unreferenced(
+        &mut self,
+        pid: ProcessId,
+    ) -> Option<ProcessObjectDeletion> {
+        if !self.process_object_delete_ready(pid) {
+            return None;
+        }
+        let process = self.processes.get(&pid)?;
+        for tid in &process.threads {
+            let thread = self.threads.get(tid)?;
+            if thread.impersonation.is_some() {
+                return None;
+            }
+        }
+
+        let process = self
+            .processes
+            .remove(&pid)
+            .expect("validated process remains present until deletion");
+        let deleted_threads = process.threads.len();
+        for tid in &process.threads {
+            let removed = self.threads.remove(tid);
+            debug_assert!(removed.is_some());
+        }
+        self.modules.retain(|module| module.pid != pid);
+        let job = self.jobs.remove_process_reference(pid);
+        Some(ProcessObjectDeletion {
+            primary_token: process.primary_token,
+            exception_port: process.exception_port_endpoint,
+            job,
+            deleted_threads,
+        })
+    }
+
+    /// Whether only Ps-owned token/port references remain before the process delete procedure can
+    /// run. The debug port is detached here once its final event has been continued.
+    pub fn process_object_delete_ready(&mut self, pid: ProcessId) -> bool {
+        let _ = self.clear_deleted_process_debug_object_if_unreferenced(pid);
+        let Some(process) = self.processes.get(&pid) else {
+            return false;
+        };
+        if process.state != ProcessState::Terminated
+            || process.wait_references != 0
+            || process.debug_port.is_some()
+            || process.handles.iter().any(|slot| !slot.is_free())
+            || self.handle_object_count(HandleObject::Process(pid)) != 0
+        {
+            return false;
+        }
+        for tid in &process.threads {
+            let Some(thread) = self.threads.get(tid) else {
+                return false;
+            };
+            if thread.state != ThreadState::Terminated
+                || thread.wait_references != 0
+                || !thread.termination_ports.is_empty()
+                || self.handle_object_count(HandleObject::Thread(*tid)) != 0
+            {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn job_active_process_ids(
@@ -3822,6 +4142,91 @@ impl ProcessManager {
             }
         }
         Ok(slot_to_handle(slot))
+    }
+
+    /// Snapshot the inheritable portion of a process handle table in handle-value order. The
+    /// returned records own no references; a process-creation transaction must either install each
+    /// record into the child or discard the snapshot.
+    pub fn inheritable_handles(&self, pid: ProcessId) -> Result<Vec<InheritedHandle>, u32> {
+        let process = self.processes.get(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        let count = process
+            .handles
+            .iter()
+            .filter(|slot| slot.entry().is_some_and(|entry| entry.flags.inherit))
+            .count();
+        let mut inherited = Vec::new();
+        inherited
+            .try_reserve(count)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        for (slot, entry) in process
+            .handles
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, entry)| entry.entry().map(|entry| (slot, entry)))
+        {
+            if entry.flags.inherit {
+                inherited.push(InheritedHandle {
+                    handle: slot_to_handle(slot),
+                    object: entry.object,
+                    granted_access: entry.granted_access,
+                    flags: entry.flags,
+                });
+            }
+        }
+        Ok(inherited)
+    }
+
+    /// Install one inherited handle at its exact parent-table value. Object kinds owned by Ps
+    /// acquire their handle reference here; backing stores owned by another executive subsystem
+    /// must be retained by the caller before this publication step.
+    pub fn insert_inherited_handle(
+        &mut self,
+        pid: ProcessId,
+        inherited: InheritedHandle,
+    ) -> Result<Handle, u32> {
+        match inherited.object {
+            HandleObject::Process(target) if !self.processes.contains_key(&target) => {
+                return Err(STATUS_INVALID_HANDLE);
+            }
+            HandleObject::Thread(target) if !self.threads.contains_key(&target) => {
+                return Err(STATUS_INVALID_HANDLE);
+            }
+            HandleObject::Job(target) if !self.jobs.contains(target) => {
+                return Err(STATUS_INVALID_HANDLE);
+            }
+            _ => {}
+        }
+        let slot = handle_to_slot(inherited.handle).ok_or(STATUS_INVALID_HANDLE)?;
+        {
+            let process = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+            if process.handles.len() <= slot {
+                process
+                    .handles
+                    .try_reserve(slot + 1 - process.handles.len())
+                    .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+                process.handles.resize_with(slot + 1, || HandleSlot::Free);
+            }
+            if !process.handles[slot].is_free() {
+                return Err(STATUS_INVALID_HANDLE);
+            }
+        }
+        if let HandleObject::Job(job) = inherited.object {
+            self.jobs.retain_handle(job)?;
+        }
+        self.processes
+            .get_mut(&pid)
+            .expect("validated inherited handle-table owner")
+            .handles[slot] = HandleSlot::Occupied(HandleEntry {
+            object: inherited.object,
+            granted_access: inherited.granted_access,
+            flags: inherited.flags,
+        });
+        if let HandleObject::DebugObject(object) = inherited.object {
+            if let Some(debug_object) = self.dbgk.get_mut(object) {
+                debug_object.add_handle();
+            }
+        }
+        Ok(inherited.handle)
     }
     /// Resolve a handle in `pid`'s table (spec §8.1).
     pub fn lookup_handle(&self, pid: ProcessId, handle: Handle) -> Option<HandleObject> {

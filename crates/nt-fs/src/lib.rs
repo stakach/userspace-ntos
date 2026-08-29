@@ -24,8 +24,8 @@ mod snapshot_store;
 mod status;
 mod volume;
 
-pub use directory::*;
 pub use byte_lock::*;
+pub use directory::*;
 pub use fat_directory::*;
 pub use file_backing::FileBacking;
 pub use fs::{

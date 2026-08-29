@@ -17010,3 +17010,59 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     restrictions through the Security Manager. Only after those owners and their teardown paths are
     live should this family be marked complete; no executive-local counters or permissive stand-ins
     should bridge the remaining gaps.
+
+    Ps process-creation/job inheritance and final object deletion (2026-08-30, accepted; family
+    remains in progress): `nt-process` now owns the complete job-admission transaction for both
+    `NtCreateProcess` ABIs. Ordinary children inherit the parent's job; silent and explicit
+    breakaway follow the job's real limit flags; a nonzero member level selects the exact later
+    object in an ordered job set; and invalid policy or failed admission removes the private PID,
+    section reference, and membership before publication. The executive validates
+    `PROCESS_CREATE_PROCESS` on the parent handle, snapshots only `OBJ_INHERIT` handles, retains each
+    external backing object, and installs the inherited entry at the same process-local handle value
+    with its original access and flags. Every partial failure unwinds those references and the
+    unpublished process instead of leaving a reserved hosted slot.
+
+    Final EPROCESS deletion is now distinct from termination. Ps waits for process/thread dispatcher
+    references, handles, termination ports, impersonation, and debug teardown, then removes the
+    EPROCESS and ETHREAD records and returns only externally owned token and LPC references to the
+    executive. The common hosted teardown releases the exact seL4 mechanisms and VSpace first, runs
+    the Ps delete procedure, releases job membership, and allows the job object to delete when its
+    final handle/wait/process reference is gone. Focused `nt-process` coverage includes inherited
+    jobs, breakaway, job-set selection, handle inheritance, failed admission, aborted creation, and
+    final membership release.
+
+    Completing that path exposed and removed two obsolete transport assumptions. Native ntdll stubs
+    now gather their exact canonical argument count into the caller's per-thread IPC buffer, and the
+    rust-micro syscall entry accepts the bounded NT message vector rather than only the old six-word
+    prefix. The executive consumes the complete IPC vector directly. Hosted thread spawn requests
+    carry typed start/TEB data decoded by the syscall handler; all reconstruction from the caller's
+    raw stack at `caller_sp + 0x30` is deleted. `NtCreateProcessEx` also decodes its NT5 final
+    `BOOLEAN` from the low byte, so undefined Win64 stack padding cannot become a job member level.
+    The PE verifier proves all 223 Nt stubs preserve nonvolatile registers, publish the exact SSN and
+    message length, gather every stack argument, and select a per-thread IPC buffer.
+
+    The post-loop process proof no longer compares live EPROCESS state with a historical mask of
+    every executable ever admitted to the image catalog. It independently reconciles the live hosted
+    mechanism count with `ProcessManager::process_count`, then requires every live badge identity to
+    resolve to a distinct, image-name-matched EPROCESS. The historical mask and temporary raw-stack
+    process-create diagnostics are deleted.
+
+    Focused validation passes `nt-process` `130/130`, `nt-syscall` `79/79`, `nt-syscall-abi`
+    `19/19`, `nt-ntdll` `709/709`, `nt-fs` `119/119`, and `nt-io-manager` `236/236`; `nt-lpc-abi`
+    remains green at `8/8`. The freestanding executive remains at the established 209-warning
+    baseline. The rebuilt 1,841,152-byte PE32+ ntdll exports all 223 Nt stubs and Zw aliases and
+    covers every checked ReactOS import. Serialized proof
+    `.tmp/run-desktop-live-process-gates-20260830.log` dynamically launches the service/session,
+    userinit, Explorer, and auxiliary process set, completes 666 Explorer api0 redirects with zero
+    callback failures, installs 18 client WndProcs without replay, reaches Explorer paint begin/end
+    `5/20` with 185 direct GDI returns and 131 batch flushes covering 171 records, paints
+    `480000/480000` framebuffer pixels with at least 32 colours, passes all `295/295` gates, and
+    matches the sentinel.
+
+    Review adjustment: inherited job admission, exact handle inheritance, rollback, and final
+    membership release are closed. Keep the family in progress at mechanisms with real subsystem
+    owners: first connect process/job user-time accounting to authoritative scheduler runtime and
+    enforce the corresponding time limits; then connect working-set and memory limits to the Memory
+    Manager/quota owner, UI restrictions to the registered Win32 job callout, and token restrictions
+    to the Security Manager. Unsupported limit classes must continue to fail without partial state;
+    do not add executive-local quota clocks, memory counters, or permissive success paths.

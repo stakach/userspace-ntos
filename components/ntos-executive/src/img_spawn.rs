@@ -210,8 +210,18 @@ unsafe fn checked_spawn_tcb_op(error: u64, tcb: u64, stage: &[u8]) {
     }
 }
 
-unsafe fn checked_spawn_frame_put_at(pi: u64, page: u64, fr: u64, alias: u64, stage: &[u8]) {
-    if !csrss_frame_put_at(pi, page, fr, alias) {
+unsafe fn checked_spawn_frame_put_at(
+    pi: u64,
+    page: u64,
+    mapped_cap: u64,
+    alias: u64,
+    alias_cap: u64,
+    source_cap: u64,
+    stage: &[u8],
+) {
+    if !csrss_frame_put_at_cap_source_owned(
+        pi, page, mapped_cap, alias, alias_cap, source_cap, true,
+    ) {
         print_str(b"[spawn-frame] register ");
         print_str(stage);
         print_str(b" failed pi=");
@@ -220,8 +230,8 @@ unsafe fn checked_spawn_frame_put_at(pi: u64, page: u64, fr: u64, alias: u64, st
         print_hex((page >> 32) as u32);
         print_hex(page as u32);
         print_str(b" frame=0x");
-        print_hex((fr >> 32) as u32);
-        print_hex(fr as u32);
+        print_hex((mapped_cap >> 32) as u32);
+        print_hex(mapped_cap as u32);
         print_str(b"\n");
         panic!("spawn frame registration failed");
     }
@@ -847,7 +857,7 @@ pub(crate) unsafe fn spawn_sec_image(
         let _ = checked_spawn_page_map(stack_cap, STACK_BASE + i * 0x1000, RW_NX, pml4, b"stack");
         // Mirror the stack into the executive so it can read/write a syscall's stack-based
         // pointer args (copyin/copyout).
-        if setup_env {
+        let (stack_alias, stack_alias_cap) = if setup_env {
             let mirror_cap = checked_spawn_copy_cap(f, b"stack-mirror");
             let _ = checked_spawn_page_map(
                 mirror_cap,
@@ -856,13 +866,24 @@ pub(crate) unsafe fn spawn_sec_image(
                 CAP_INIT_THREAD_VSPACE,
                 b"stack-mirror",
             );
-        }
+            (stack_mirror + i * 0x1000, mirror_cap)
+        } else {
+            (0, 0)
+        };
         // Retain every process's initial stack frames for generic executive copyin/copyout. GUI
         // clients also use the same record for win32k's per-client address-space attachment. The
         // early transport diagnostic has `setup_env == false` and reuses pi 0 temporarily; do not
         // let its throwaway frames occupy the real smss keys.
         if setup_env {
-            checked_spawn_frame_put_at(pi, STACK_BASE + i * 0x1000, f, 0, b"stack-frame");
+            checked_spawn_frame_put_at(
+                pi,
+                STACK_BASE + i * 0x1000,
+                stack_cap,
+                stack_alias,
+                stack_alias_cap,
+                f,
+                b"stack-frame",
+            );
         }
     }
     if setup_env {
@@ -939,7 +960,7 @@ pub(crate) unsafe fn spawn_sec_image(
         core::ptr::write_volatile((scr + 0x2c8) as *mut u64, acs_va);
         let teb_client = checked_spawn_copy_cap(teb, b"teb-target");
         let _ = checked_spawn_page_map(teb_client, SMSS_TEB_VA, RW_NX, pml4, b"teb-target");
-        checked_spawn_frame_put_at(pi, SMSS_TEB_VA, teb, 0, b"teb-head");
+        checked_spawn_frame_put_at(pi, SMSS_TEB_VA, teb_client, scr, teb, teb, b"teb-head");
         // The x64 TEB is ~0x1818 bytes (TLS slots, ActiveFrame, FlsData …) — map a second page for
         // the TEB tail (StaticUnicodeString/Buffer), shared into the process like the first.
         let teb2 = alloc_frame();
@@ -1042,7 +1063,15 @@ pub(crate) unsafe fn spawn_sec_image(
             pml4,
             b"teb-tail-target",
         );
-        checked_spawn_frame_put_at(pi, SMSS_TEB_VA + 0x1000, teb2, 0, b"teb-tail");
+        checked_spawn_frame_put_at(
+            pi,
+            SMSS_TEB_VA + 0x1000,
+            teb2_client_cap,
+            scr + 0x5000,
+            teb2,
+            teb2,
+            b"teb-tail",
+        );
         checked_register_spawn_private_mapping(
             pi,
             SMSS_TEB_VA,
@@ -1162,7 +1191,7 @@ pub(crate) unsafe fn spawn_sec_image(
         // NtWriteVirtualMemory. Register the live PEB frame and its persistent executive alias so
         // the generic remote-copy path updates the child rather than requiring an SSN-specific
         // synthetic success.
-        checked_spawn_frame_put_at(pi, SMSS_PEB_VA, peb, scr + 0x1000, b"peb");
+        checked_spawn_frame_put_at(pi, SMSS_PEB_VA, peb_client, scr + 0x1000, peb, peb, b"peb");
         checked_register_spawn_private_mapping(
             pi,
             SMSS_PEB_VA,
@@ -1325,8 +1354,24 @@ pub(crate) unsafe fn spawn_sec_image(
         // win32k reads PsGetCurrentProcess()->Peb->ProcessParameters while attached to the
         // caller. Register the process parameters and environment alongside the PEB so those
         // dereferences resolve to this process's real pages.
-        checked_spawn_frame_put_at(pi, SMSS_PARAMS_VA, params, pp, b"params");
-        checked_spawn_frame_put_at(pi, SMSS_PARAMS_VA + 0x1000, env_frame, env_scr, b"env");
+        checked_spawn_frame_put_at(
+            pi,
+            SMSS_PARAMS_VA,
+            params_client,
+            pp,
+            params,
+            params,
+            b"params",
+        );
+        checked_spawn_frame_put_at(
+            pi,
+            SMSS_PARAMS_VA + 0x1000,
+            env_client,
+            env_scr,
+            env_frame,
+            env_frame,
+            b"env",
+        );
         checked_register_spawn_private_mapping(
             pi,
             SMSS_PARAMS_VA,

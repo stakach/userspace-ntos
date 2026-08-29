@@ -72,8 +72,8 @@ use nt_hosted_runtime::{
 use nt_io_abi::{
     ioctl, major, valid_directory_notify_parameters, valid_ea_parameters,
     valid_lock_control_parameters, valid_quota_parameters, valid_read_write_parameters,
-    valid_set_information_control,
-    valid_volume_information_parameters, IrpDispatchRequest, IO_ABI_VERSION,
+    valid_set_information_control, valid_volume_information_parameters, IrpDispatchRequest,
+    IO_ABI_VERSION,
 };
 use nt_io_manager::{
     write_wdm_driver_object, write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
@@ -10648,8 +10648,7 @@ fn hosted_driver_deadline_from_timeout(
         DispatcherWaitTimeout::Infinite => Ok(nt_kernel_exec::Deadline::Infinite),
         DispatcherWaitTimeout::Blocking => {
             let now = crate::nt_time_snapshot();
-            let deadline =
-                nt_kernel_exec::Deadline::from_nt_timeout(Some(timeout_arg as i64), now);
+            let deadline = nt_kernel_exec::Deadline::from_nt_timeout(Some(timeout_arg as i64), now);
             if deadline.is_due(now) {
                 Err(STATUS_TIMEOUT_I32)
             } else {
@@ -11077,9 +11076,7 @@ pub(crate) unsafe fn hosted_driver_wait_wake_due(now_100ns: u64) -> u64 {
                 .iter()
                 .enumerate()
                 .filter(|(_, waiter)| waiter.deadline.is_due(now))
-                .min_by_key(|(_, waiter)| {
-                    (waiter.deadline.ordering_key(now), waiter.sequence)
-                })
+                .min_by_key(|(_, waiter)| (waiter.deadline.ordering_key(now), waiter.sequence))
                 .map(|(index, _)| index)
         };
         let Some(index) = due_index else {
@@ -37164,12 +37161,8 @@ unsafe fn hosted_power_devnode_by_device_object(device_object: u64) -> Option<u6
         return Some(binding.pdo_device_id);
     }
 
-    let devnode_id = read_volatile(core::ptr::addr_of!(
-        HOSTED_ADD_DEVICE_POWER_DEVNODE_ID
-    ));
-    let expected_driver = read_volatile(core::ptr::addr_of!(
-        HOSTED_ADD_DEVICE_POWER_DRIVER_OBJECT
-    ));
+    let devnode_id = read_volatile(core::ptr::addr_of!(HOSTED_ADD_DEVICE_POWER_DEVNODE_ID));
+    let expected_driver = read_volatile(core::ptr::addr_of!(HOSTED_ADD_DEVICE_POWER_DRIVER_OBJECT));
     if device_object == 0 || devnode_id == 0 || expected_driver == 0 {
         return None;
     }
@@ -41596,16 +41589,16 @@ pub(crate) fn service_hosted_driver_ke_wait_single(
             Ok(false) => {
                 let deadline = match hosted_driver_deadline_from_timeout(timeout_code, timeout_arg)
                 {
-                        Ok(deadline) => deadline,
-                        Err(status) => {
-                            if status == STATUS_TIMEOUT_I32 {
-                                HOSTED_DRIVER_WAIT_SINGLE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
-                            }
-                            return HostedDriverWaitServiceResult::Reply(status);
+                    Ok(deadline) => deadline,
+                    Err(status) => {
+                        if status == STATUS_TIMEOUT_I32 {
+                            HOSTED_DRIVER_WAIT_SINGLE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
                         }
-                    };
+                        return HostedDriverWaitServiceResult::Reply(status);
+                    }
+                };
                 HOSTED_DRIVER_WAIT_SINGLE_BLOCKING.fetch_add(1, Ordering::Relaxed);
                 let Some(runtime) = runtime else {
                     HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
@@ -41769,17 +41762,16 @@ pub(crate) fn service_hosted_driver_ke_wait_multiple(
             Ok(None) => {
                 let deadline = match hosted_driver_deadline_from_timeout(timeout_code, timeout_arg)
                 {
-                        Ok(deadline) => deadline,
-                        Err(status) => {
-                            if status == STATUS_TIMEOUT_I32 {
-                                HOSTED_DRIVER_WAIT_MULTIPLE_TIMEOUTS
-                                    .fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                HOSTED_DRIVER_WAIT_MULTIPLE_REJECTS.fetch_add(1, Ordering::Relaxed);
-                            }
-                            return HostedDriverWaitServiceResult::Reply(status);
+                    Ok(deadline) => deadline,
+                    Err(status) => {
+                        if status == STATUS_TIMEOUT_I32 {
+                            HOSTED_DRIVER_WAIT_MULTIPLE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            HOSTED_DRIVER_WAIT_MULTIPLE_REJECTS.fetch_add(1, Ordering::Relaxed);
                         }
-                    };
+                        return HostedDriverWaitServiceResult::Reply(status);
+                    }
+                };
                 HOSTED_DRIVER_WAIT_MULTIPLE_BLOCKING.fetch_add(1, Ordering::Relaxed);
                 let Some(runtime) = runtime else {
                     HOSTED_DRIVER_WAIT_MULTIPLE_REJECTS.fetch_add(1, Ordering::Relaxed);

@@ -25,6 +25,14 @@ const SUB_RAX_WORKER_DELTA_ACC: &[u8] = &[0x48, 0x2d, 0x00, 0x00, 0x01, 0x00];
 const SUB_RAX_WORKER_DELTA_RM: &[u8] = &[0x48, 0x81, 0xe8, 0x00, 0x00, 0x01, 0x00];
 const STORE_MR4_FROM_R8: &[u8] = &[0x4c, 0x89, 0x40, 0x28];
 const STORE_MR5_FROM_R9: &[u8] = &[0x4c, 0x89, 0x48, 0x30];
+const SAVE_NATIVE_NONVOLATILES: &[u8] = &[0x57, 0x56, 0x41, 0x57];
+const RESTORE_NATIVE_NONVOLATILES: &[u8] = &[0x41, 0x5f, 0x5e, 0x5f, 0x4c, 0x89, 0xd0, 0xc3];
+const CAPTURE_ENTRY_RSP: &[u8] = &[0x4c, 0x8d, 0x5c, 0x24, 0x18];
+const LOAD_STACK_TAIL: &[u8] = &[0x49, 0x8d, 0x73, 0x28];
+const LOAD_IPC_TAIL: &[u8] = &[0x48, 0x8d, 0x78, 0x38];
+const SUB_REGISTER_ARGS: &[u8] = &[0x83, 0xe9, 0x04];
+const COPY_STACK_TAIL: &[u8] = &[0xf3, 0x48, 0xa5];
+const SEL4_SYSCALL: &[u8] = &[0x0f, 0x05];
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
@@ -36,6 +44,12 @@ fn find_movabs(stub: &[u8], opcode: [u8; 2], immediate: u64) -> Option<usize> {
     let immediate = immediate.to_le_bytes();
     stub.windows(10)
         .position(|window| window[..2] == opcode[..] && window[2..] == immediate[..])
+}
+
+fn find_mov_imm32(stub: &[u8], opcode: &[u8], immediate: u32) -> Option<usize> {
+    let immediate = immediate.to_le_bytes();
+    stub.windows(opcode.len() + immediate.len())
+        .position(|window| window[..opcode.len()] == *opcode && window[opcode.len()..] == immediate)
 }
 
 fn find_gs_self_load(stub: &[u8]) -> Option<usize> {
@@ -211,20 +225,11 @@ fn main() -> ExitCode {
     let zw_callback_return = exports.iter().find(|e| e.name == "ZwCallbackReturn");
     if let (Some(nt), Some(zw)) = (nt_callback_return, zw_callback_return) {
         let image = pe.map(pe.image_base()).expect("map emitted ntdll");
-        let nt_stub = &image.bytes[nt.rva as usize..nt.rva as usize + 96];
-        let moves_rcx_to_r10 =
-            nt_stub.starts_with(&[0x4c, 0x8b, 0xd1]) || nt_stub.starts_with(&[0x49, 0x89, 0xca]);
-        let trap_ssn = moves_rcx_to_r10
-            && nt_stub
-                .get(3..8)
-                .is_some_and(|bytes| bytes == [0xb8, 22, 0, 0, 0])
-            && nt_stub
-                .get(8..10)
-                .is_some_and(|bytes| bytes == [0x0f, 0x05]);
-        let native_ssn = nt_stub
-            .windows(6)
-            .any(|window| window == [0x41, 0xba, 22, 0, 0, 0]);
-        check(trap_ssn || native_ssn, "NtCallbackReturn encodes SSN 22");
+        let nt_stub = &image.bytes[nt.rva as usize..nt.rva as usize + 192];
+        check(
+            find_mov_imm32(nt_stub, &[0x41, 0xba], 22).is_some(),
+            "NtCallbackReturn encodes SSN 22",
+        );
         let zw_stub = &image.bytes[zw.rva as usize..zw.rva as usize + 5];
         check(
             zw_stub.first() == Some(&0xe9),
@@ -234,25 +239,70 @@ fn main() -> ExitCode {
 
     // Native seL4 message registers overlap Windows x64 nonvolatile rdi/rsi/r15. Every naked Nt*
     // export must save and restore them because arbitrary ReactOS callers keep live state there.
+    // The complete request also carries every stack argument in the caller's per-thread IPC buffer;
+    // the executive must never dereference a private user stack from another component.
     let image = pe.map(pe.image_base()).expect("map emitted ntdll");
     let mut bad_native_abi = Vec::new();
+    let mut bad_native_requests = Vec::new();
     for syscall in NT_SYSCALLS {
         let Some(export) = exports.iter().find(|export| export.name == syscall.name) else {
             continue;
         };
         let Some(stub) = image
             .bytes
-            .get(export.rva as usize..export.rva as usize + 128)
+            .get(export.rva as usize..export.rva as usize + 192)
         else {
             bad_native_abi.push(syscall.name);
+            bad_native_requests.push(syscall.name);
             continue;
         };
-        let saves = stub.starts_with(&[0x57, 0x56, 0x41, 0x57]);
-        let restores = stub
-            .windows(8)
-            .any(|bytes| bytes == [0x41, 0x5f, 0x5e, 0x5f, 0x4c, 0x89, 0xd0, 0xc3]);
+        let saves = stub.starts_with(SAVE_NATIVE_NONVOLATILES);
+        let restores = find_bytes(stub, RESTORE_NATIVE_NONVOLATILES).is_some();
         if !saves || !restores {
             bad_native_abi.push(syscall.name);
+        }
+
+        let argc = nt_syscall_abi::exact_argc_of(syscall.name)
+            .expect("every canonical syscall has an exact argument count");
+        let msginfo = nt_syscall_abi::native_syscall_message_info(argc);
+        let Some(msginfo) = u32::try_from(msginfo).ok() else {
+            bad_native_requests.push(syscall.name);
+            continue;
+        };
+        let positions = (
+            find_bytes(stub, CAPTURE_ENTRY_RSP),
+            find_bytes(stub, LOAD_STACK_TAIL),
+            find_bytes(stub, LOAD_IPC_TAIL),
+            find_mov_imm32(stub, &[0xb9], u32::from(argc)),
+            find_bytes(stub, SUB_REGISTER_ARGS),
+            find_bytes(stub, COPY_STACK_TAIL),
+            find_mov_imm32(stub, &[0x41, 0xba], syscall.ssn),
+            find_mov_imm32(stub, &[0xbe], msginfo),
+            find_bytes(stub, SEL4_SYSCALL),
+        );
+        let complete_request = matches!(
+            positions,
+            (
+                Some(entry_rsp),
+                Some(stack_tail),
+                Some(ipc_tail),
+                Some(argc_pos),
+                Some(sub_registers),
+                Some(copy_tail),
+                Some(ssn),
+                Some(msginfo_pos),
+                Some(syscall_pos),
+            ) if entry_rsp < stack_tail
+                && stack_tail < ipc_tail
+                && ipc_tail < argc_pos
+                && argc_pos < sub_registers
+                && sub_registers < copy_tail
+                && copy_tail < ssn
+                && ssn < msginfo_pos
+                && msginfo_pos < syscall_pos
+        );
+        if !complete_request {
+            bad_native_requests.push(syscall.name);
         }
     }
     check(
@@ -266,6 +316,17 @@ fn main() -> ExitCode {
     if !bad_native_abi.is_empty() {
         eprintln!("   native ABI violations: {bad_native_abi:?}");
     }
+    check(
+        bad_native_requests.is_empty(),
+        &format!(
+            "all {} native Nt* stubs marshal their exact complete argument vector ({} violations)",
+            NT_SYSCALLS.len(),
+            bad_native_requests.len()
+        ),
+    );
+    if !bad_native_requests.is_empty() {
+        eprintln!("   native request-marshalling violations: {bad_native_requests:?}");
+    }
 
     // Every native Nt* stub must select the caller TCB's bound IPC buffer from the standard TEB
     // self pointer. The two main-thread TEB layouts retain the historical fixed IPC VA; workers use
@@ -278,7 +339,7 @@ fn main() -> ExitCode {
         };
         let Some(stub) = image
             .bytes
-            .get(export.rva as usize..export.rva as usize + 128)
+            .get(export.rva as usize..export.rva as usize + 192)
         else {
             bad_native_ipc.push(syscall.name);
             continue;

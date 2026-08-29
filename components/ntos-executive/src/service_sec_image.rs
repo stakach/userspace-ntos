@@ -3454,10 +3454,10 @@ struct HostedThreadSpawnSpec {
 }
 
 fn hosted_multiplexed_thread_spawn_for(
-    request: HostedThreadSpawnRequest,
+    kind: HostedMultiplexedThreadKind,
 ) -> Option<HostedThreadSpawnSpec> {
-    match request {
-        HostedThreadSpawnRequest::ServicesListener => Some(HostedThreadSpawnSpec {
+    match kind {
+        HostedMultiplexedThreadKind::ServicesListener => Some(HostedThreadSpawnSpec {
             owner_role: nt_exe_image::HostedProcessRole::ServiceControlManager,
             teb: SVC_LISTENER_TEB_VA,
             badge: SVC_LISTENER_BADGE,
@@ -3468,7 +3468,7 @@ fn hosted_multiplexed_thread_spawn_for(
             spawned_prefix: b"[svc-thread] spawned + resumed tcb=0x",
             spawned_suffix: b" (runs into the main multiplex, badge 7)\n",
         }),
-        HostedThreadSpawnRequest::LsassListener { slot: 0 } => Some(HostedThreadSpawnSpec {
+        HostedMultiplexedThreadKind::LsassListener { slot: 0 } => Some(HostedThreadSpawnSpec {
             owner_role: nt_exe_image::HostedProcessRole::LocalSecurityAuthority,
             teb: LSASS_LISTENER_TEB_VA,
             badge: LSASS_LISTENER_BADGE,
@@ -3479,7 +3479,7 @@ fn hosted_multiplexed_thread_spawn_for(
             spawned_prefix: b"[lsass-thread] spawned + resumed tcb=0x",
             spawned_suffix: b" (runs into the main multiplex, badge 9)\n",
         }),
-        HostedThreadSpawnRequest::LsassListener { slot: 1 } => Some(HostedThreadSpawnSpec {
+        HostedMultiplexedThreadKind::LsassListener { slot: 1 } => Some(HostedThreadSpawnSpec {
             owner_role: nt_exe_image::HostedProcessRole::LocalSecurityAuthority,
             teb: LSASS_LISTENER2_TEB_VA,
             badge: LSASS_LISTENER2_BADGE,
@@ -3490,7 +3490,7 @@ fn hosted_multiplexed_thread_spawn_for(
             spawned_prefix: b"[lsass-thread2] spawned + resumed tcb=0x",
             spawned_suffix: b" (runs into the main multiplex, badge 10)\n",
         }),
-        HostedThreadSpawnRequest::LsassListener { slot: 2 } => Some(HostedThreadSpawnSpec {
+        HostedMultiplexedThreadKind::LsassListener { slot: 2 } => Some(HostedThreadSpawnSpec {
             owner_role: nt_exe_image::HostedProcessRole::LocalSecurityAuthority,
             teb: LSASS_LISTENER3_TEB_VA,
             badge: LSASS_LISTENER3_BADGE,
@@ -8711,8 +8711,7 @@ pub(crate) unsafe fn service_sec_image(
         }
         // ntdll_plan Step 6.A — NATIVE seL4-Call transport. OUR ntdll (native-transport smss) does a
         // real seL4 `Call(CT_FAULT)` instead of a Windows-`syscall` UnknownSyscall trap. The request
-        // carries: MR0=SSN(m0), MR1=caller-rsp(m1), MR2=arg1(m2), MR3=arg2(m3), MR4=arg3(recv_mr[4]),
-        // MR5=arg4(recv_mr[5]); args5+ stay on the caller's stack (read via the mirror using rsp). We
+        // carries MR0=SSN, MR1=caller RSP, and the complete argument vector in MR2 onward. We
         // NORMALIZE it into the fault-frame register slots the `(mi>>12)==2` arm reads, then re-label
         // the message as UnknownSyscall (2) so it flows through that arm's FULL servicing body
         // unchanged (dispatch + out-writes + spawn/park/delay post-actions). The reply is a NORMAL IPC
@@ -8720,14 +8719,22 @@ pub(crate) unsafe fn service_sec_image(
         // result→MR0→the caller's r10, which our native stub reads as NTSTATUS.
         let native_call_transport = (mi >> 12) == nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL;
         if native_call_transport {
+            const NATIVE_TAIL_STAGE_MR: usize = 32;
             let ssn = m0; // MR0
-            let rsp = m1; // MR1 = caller rsp (for stack args + stack out-param mirror writes)
+            let rsp = m1; // MR1 = caller rsp (diagnostics and stack-resident pointer validation)
             let arg1 = m2; // MR2
             let arg2 = m3; // MR3
             let arg3 = get_recv_mr(4); // MR4 (IPC buffer)
             let arg4 = get_recv_mr(5); // MR5 (IPC buffer)
-                                       // Stage the fault-frame register slots the `==2` arm reads: R10@9=arg1, R8@7=arg3,
-                                       // R9@8=arg4, SP@16=rsp, FLAGS@17=0. (arg2 is read directly from `m3`.)
+            let request_len = (mi & 0x7f) as usize;
+            for request_mr in 6..request_len {
+                set_recv_mr(
+                    NATIVE_TAIL_STAGE_MR + request_mr - 6,
+                    get_recv_mr(request_mr),
+                );
+            }
+            // Stage the fault-frame register slots the `==2` arm reads: R10@9=arg1, R8@7=arg3,
+            // R9@8=arg4, SP@16=rsp, FLAGS@17=0. (arg2 is read directly from `m3`.)
             set_recv_mr(9, arg1);
             set_recv_mr(7, arg3);
             set_recv_mr(8, arg4);
@@ -9305,24 +9312,35 @@ pub(crate) unsafe fn service_sec_image(
                 argv[3] = get_recv_mr(8); // R9
                 let n = (entry.max_args as usize).min(16);
                 let mut stack_args_valid = true;
-                for i in 4..n {
-                    let Some(argument_va) = sp.checked_add(0x28 + (i as u64 - 4) * 8) else {
+                if native_call_transport {
+                    const NATIVE_TAIL_STAGE_MR: usize = 32;
+                    if (mi & 0x7f) < nt_syscall_abi::native_syscall_request_len(n as u8) {
                         stack_args_valid = false;
-                        break;
-                    };
-                    let mut bytes = [0u8; 8];
-                    if client_copyin_mapped(
-                        pi as u64,
-                        argument_va,
-                        &mut bytes,
-                        filled_pages,
-                        faults as usize,
-                        scratch_base,
-                    ) {
-                        argv[i] = u64::from_le_bytes(bytes);
                     } else {
-                        stack_args_valid = false;
-                        break;
+                        for i in 4..n {
+                            argv[i] = get_recv_mr(NATIVE_TAIL_STAGE_MR + i - 4);
+                        }
+                    }
+                } else {
+                    for i in 4..n {
+                        let Some(argument_va) = sp.checked_add(0x28 + (i as u64 - 4) * 8) else {
+                            stack_args_valid = false;
+                            break;
+                        };
+                        let mut bytes = [0u8; 8];
+                        if client_copyin_mapped(
+                            pi as u64,
+                            argument_va,
+                            &mut bytes,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        ) {
+                            argv[i] = u64::from_le_bytes(bytes);
+                        } else {
+                            stack_args_valid = false;
+                            break;
+                        }
                     }
                 }
                 // Refresh the handler's per-call executive context, then clear the stop side-signal
@@ -9683,6 +9701,9 @@ pub(crate) unsafe fn service_sec_image(
                             let _ = win32k_glue::unwind_dead_client_user_callbacks(
                                 process_index as u32,
                             );
+                            if let Some(pid) = nt_handler.pm_pid_for_pi(process_index as usize) {
+                                let _ = nt_handler.try_delete_hosted_process_object(pid);
+                            }
                         }
                         nt_handler.refresh_process_manager_gates();
                         if drop_reply && reply_dropped && current_deleted {
@@ -10054,7 +10075,7 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
                 if let Some(request) = nt_handler.thread_spawn_request.take() {
-                    spawn_requested_local_thread(&mut nt_handler, request, &*procs, sp, fault_ep);
+                    spawn_requested_local_thread(&mut nt_handler, request, &*procs, fault_ep);
                 }
                 // ★ CROSS-VSPACE NtCreateThread: the handler decided the policy; build the REAL
                 // thread inside the TARGET's address space here, where the main fault endpoint the
@@ -15338,11 +15359,7 @@ pub(crate) unsafe fn service_sec_image(
                     park_io_completion_deadline,
                     parked_syscall_reply,
                 ) {
-                    delay_timer_rearm_after_park(
-                        delay_queue,
-                        &mut nt_handler,
-                        timed,
-                    );
+                    delay_timer_rearm_after_park(delay_queue, &mut nt_handler, timed);
                     print_str(b"[io-completion] pi=");
                     print_u64(pi as u64);
                     print_str(b" port=");
@@ -15402,8 +15419,8 @@ pub(crate) unsafe fn service_sec_image(
             // Keyed-event release park (`NtReleaseKeyedEvent`): if no wait side is already parked,
             // the release side waits for a future `NtWaitForKeyedEvent` on the same key.
             if park_keyed_release_wait_key != u64::MAX && reply_main != 0 {
-                let timed = park_keyed_release_wait_deadline
-                    != nt_delay_execution::Deadline::Infinite;
+                let timed =
+                    park_keyed_release_wait_deadline != nt_delay_execution::Deadline::Infinite;
                 if timed && !delay_timer_init() {
                     result = 0xC000_009A;
                 } else if keyed_release_wait_park(
@@ -15412,11 +15429,7 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.current_tid,
                     park_keyed_release_wait_deadline,
                 ) {
-                    delay_timer_rearm_after_park(
-                        delay_queue,
-                        &mut nt_handler,
-                        timed,
-                    );
+                    delay_timer_rearm_after_park(delay_queue, &mut nt_handler, timed);
                     print_str(b"[keyed] NtReleaseKeyedEvent key=0x");
                     print_hex_u64(park_keyed_release_wait_key);
                     print_str(b" -> PARK releaser\n");
@@ -15459,11 +15472,7 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.current_tid,
                     park_keyed_wait_deadline,
                 ) {
-                    delay_timer_rearm_after_park(
-                        delay_queue,
-                        &mut nt_handler,
-                        timed,
-                    );
+                    delay_timer_rearm_after_park(delay_queue, &mut nt_handler, timed);
                     print_str(b"[keyed] NtWaitForKeyedEvent key=0x");
                     print_hex_u64(park_keyed_wait_key);
                     print_str(b" -> PARK caller\n");
@@ -15540,11 +15549,7 @@ pub(crate) unsafe fn service_sec_image(
                 ) {
                     let current_tid = nt_handler.current_tid;
                     let wait_still_parked = wait_recheck_after_park(&mut nt_handler, current_tid);
-                    delay_timer_rearm_after_park(
-                        delay_queue,
-                        &mut nt_handler,
-                        timed,
-                    );
+                    delay_timer_rearm_after_park(delay_queue, &mut nt_handler, timed);
                     if winlogon_worker_can_signal && wait_still_parked {
                         WINLOGON_MAIN_EVENT_WAIT_PARKED.store(1, Ordering::Relaxed);
                         print_str(b"[wl-main] parked on worker-ready event; runnable worker remains a signaler\n");
@@ -15592,11 +15597,7 @@ pub(crate) unsafe fn service_sec_image(
                 ) {
                     let current_tid = nt_handler.current_tid;
                     let wait_still_parked = wait_recheck_after_park(&mut nt_handler, current_tid);
-                    delay_timer_rearm_after_park(
-                        delay_queue,
-                        &mut nt_handler,
-                        timed,
-                    );
+                    delay_timer_rearm_after_park(delay_queue, &mut nt_handler, timed);
                     print_str(b"[wait] pi=");
                     print_u64(pi as u64);
                     print_str(b" NtWaitForMultipleObjects(");
@@ -19878,7 +19879,8 @@ unsafe fn spawn_requested_multiplexed_thread(
     nt_handler: &mut ExecNtHandler,
     spec: HostedThreadSpawnSpec,
     procs: &[ProcExec],
-    caller_sp: u64,
+    start: nt_thread_start::Amd64ThreadContext,
+    initial_teb: nt_thread_start::InitialTeb64,
     fault_ep: u64,
 ) {
     let (owner_pi, cid_proc, pml4) =
@@ -19889,12 +19891,6 @@ unsafe fn spawn_requested_multiplexed_thread(
         return;
     };
 
-    let (_ctx_va, start) = requested_thread_start(caller_sp);
-    let initial_teb_va = smss_stack_read(caller_sp + 0x38);
-    let initial_teb = nt_thread_start::InitialTeb64::read(
-        |address| unsafe { smss_stack_read(address) },
-        initial_teb_va,
-    );
     let suspended = hosted_thread_suspended(nt_handler, tid);
     let resume = match spec.resume {
         HostedThreadResumeMode::PoolState => !suspended,
@@ -19910,8 +19906,6 @@ unsafe fn spawn_requested_multiplexed_thread(
     print_hex_u64(start.rsp);
     print_str(b" tid=");
     print_u64(tid);
-    print_str(b" initial_teb=0x");
-    print_hex_u64(initial_teb_va);
     print_str(b" stack=(");
     print_hex_u64(initial_teb.stack_base);
     print_str(b",");
@@ -19959,18 +19953,6 @@ unsafe fn spawn_requested_multiplexed_thread(
     print_str(b" resume=");
     print_u64(resume as u64);
     print_str(spec.spawned_suffix);
-}
-
-#[inline(never)]
-unsafe fn requested_thread_start(caller_sp: u64) -> (u64, nt_thread_start::Amd64ThreadContext) {
-    let context_va = smss_stack_read(caller_sp + 0x30);
-    (
-        context_va,
-        nt_thread_start::Amd64ThreadContext::read(
-            |address| unsafe { smss_stack_read(address) },
-            context_va,
-        ),
-    )
 }
 
 #[inline(never)]
@@ -20549,16 +20531,31 @@ unsafe fn spawn_requested_local_thread(
     nt_handler: &mut ExecNtHandler,
     request: HostedThreadSpawnRequest,
     procs: &[ProcExec],
-    caller_sp: u64,
     fault_ep: u64,
 ) {
-    if let Some(spec) = hosted_multiplexed_thread_spawn_for(request) {
-        spawn_requested_multiplexed_thread(nt_handler, spec, procs, caller_sp, fault_ep);
-        return;
-    }
-
     match request {
-        HostedThreadSpawnRequest::Winlogon { slot } => {
+        HostedThreadSpawnRequest::Multiplexed {
+            kind,
+            start,
+            initial_teb,
+        } => {
+            let Some(spec) = hosted_multiplexed_thread_spawn_for(kind) else {
+                return;
+            };
+            spawn_requested_multiplexed_thread(
+                nt_handler,
+                spec,
+                procs,
+                start,
+                initial_teb,
+                fault_ep,
+            );
+        }
+        HostedThreadSpawnRequest::Winlogon {
+            slot,
+            start,
+            initial_teb,
+        } => {
             let (role, badge, teb) = match slot {
                 0 => (
                     HostedThreadRole::WinlogonListener,
@@ -20587,12 +20584,6 @@ unsafe fn spawn_requested_local_thread(
                 print_str(b"[wl-thread] missing reserved runtime role before spawn\n");
                 return;
             };
-            let (_ctx_va, start) = requested_thread_start(caller_sp);
-            let initial_teb_va = smss_stack_read(caller_sp + 0x38);
-            let initial_teb = nt_thread_start::InitialTeb64::read(
-                |address| unsafe { smss_stack_read(address) },
-                initial_teb_va,
-            );
             print_str(b"[wl-thread] spawning REAL worker slot=");
             print_u64(slot as u64);
             print_str(b" (multiplexed): entry=0x");
@@ -20663,33 +20654,11 @@ unsafe fn spawn_requested_local_thread(
                 b" (RESUMED into multiplex; real ETHREAD + TEB)\n"
             });
         }
-        HostedThreadSpawnRequest::TpWorker { pi, slot } => {
+        HostedThreadSpawnRequest::TpWorker { pi, slot, start } => {
             if pi < MAX_PI && slot < TP_WORKER_SLOT_COUNT {
-                spawn_requested_tp_worker(
-                    nt_handler,
-                    pi,
-                    slot,
-                    procs[pi].pml4,
-                    caller_sp,
-                    fault_ep,
-                    None,
-                );
+                spawn_requested_tp_worker(nt_handler, pi, slot, procs[pi].pml4, start, fault_ep);
             }
         }
-        HostedThreadSpawnRequest::ThreadEx { pi, slot, start } => {
-            if pi < MAX_PI && slot < TP_WORKER_SLOT_COUNT {
-                spawn_requested_tp_worker(
-                    nt_handler,
-                    pi,
-                    slot,
-                    procs[pi].pml4,
-                    caller_sp,
-                    fault_ep,
-                    Some(start),
-                );
-            }
-        }
-        _ => {}
     }
 }
 
@@ -20699,22 +20668,14 @@ unsafe fn spawn_requested_tp_worker(
     pi: usize,
     worker_slot: usize,
     pml4: u64,
-    caller_sp: u64,
+    start: nt_thread_start::Amd64ThreadContext,
     fault_ep: u64,
-    explicit_start: Option<nt_thread_start::Amd64ThreadContext>,
 ) {
     let badge = tp_worker_badge(pi, worker_slot);
     if nt_handler.hosted_thread_tcb_for_badge(badge).is_some() {
         return;
     }
 
-    let start = explicit_start.unwrap_or_else(|| {
-        let context_va = smss_stack_read(caller_sp + 0x30);
-        nt_thread_start::Amd64ThreadContext::read(
-            |address| unsafe { smss_stack_read(address) },
-            context_va,
-        )
-    });
     let Some(tid) = nt_handler.hosted_thread_tid_for_badge(badge) else {
         return;
     };

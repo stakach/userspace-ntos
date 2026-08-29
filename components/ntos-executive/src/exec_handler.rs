@@ -238,7 +238,7 @@ struct RoleOwnedLocalThreadSpec {
     role: HostedThreadRole,
     badge: u64,
     teb: u64,
-    request: HostedThreadSpawnRequest,
+    spawn_kind: HostedMultiplexedThreadKind,
     trace: RoleOwnedLocalThreadTrace,
 }
 
@@ -261,7 +261,7 @@ const ROLE_OWNED_LOCAL_THREAD_SPECS: [RoleOwnedLocalThreadSpec; 4] = [
         role: HostedThreadRole::ServicesListener,
         badge: SVC_LISTENER_BADGE,
         teb: SVC_LISTENER_TEB_VA,
-        request: HostedThreadSpawnRequest::ServicesListener,
+        spawn_kind: HostedMultiplexedThreadKind::ServicesListener,
         trace: RoleOwnedLocalThreadTrace::None,
     },
     RoleOwnedLocalThreadSpec {
@@ -271,7 +271,7 @@ const ROLE_OWNED_LOCAL_THREAD_SPECS: [RoleOwnedLocalThreadSpec; 4] = [
         role: HostedThreadRole::LsassListener,
         badge: LSASS_LISTENER_BADGE,
         teb: LSASS_LISTENER_TEB_VA,
-        request: HostedThreadSpawnRequest::LsassListener { slot: 0 },
+        spawn_kind: HostedMultiplexedThreadKind::LsassListener { slot: 0 },
         trace: RoleOwnedLocalThreadTrace::None,
     },
     RoleOwnedLocalThreadSpec {
@@ -281,7 +281,7 @@ const ROLE_OWNED_LOCAL_THREAD_SPECS: [RoleOwnedLocalThreadSpec; 4] = [
         role: HostedThreadRole::LsassListener2,
         badge: LSASS_LISTENER2_BADGE,
         teb: LSASS_LISTENER2_TEB_VA,
-        request: HostedThreadSpawnRequest::LsassListener { slot: 1 },
+        spawn_kind: HostedMultiplexedThreadKind::LsassListener { slot: 1 },
         trace: RoleOwnedLocalThreadTrace::None,
     },
     RoleOwnedLocalThreadSpec {
@@ -291,7 +291,7 @@ const ROLE_OWNED_LOCAL_THREAD_SPECS: [RoleOwnedLocalThreadSpec; 4] = [
         role: HostedThreadRole::LsassListener3,
         badge: LSASS_LISTENER3_BADGE,
         teb: LSASS_LISTENER3_TEB_VA,
-        request: HostedThreadSpawnRequest::LsassListener { slot: 2 },
+        spawn_kind: HostedMultiplexedThreadKind::LsassListener { slot: 2 },
         trace: RoleOwnedLocalThreadTrace::LsassThird,
     },
 ];
@@ -2587,6 +2587,7 @@ fn seed_bootstrap_process_manager() -> BootstrapProcessManagerSeed {
     pm.reserve_debug_objects(PM_DEBUG_OBJECT_SLOTS, PM_DEBUG_EVENTS_PER_OBJECT)
         .expect("reserve bootstrap Dbgk object/event storage");
     PM_PROC_COUNT.store(0, Ordering::Relaxed);
+    PM_OBJECT_COUNT.store(0, Ordering::Relaxed);
     PM_DYNAMIC_PROCESS_ALLOCATIONS.store(0, Ordering::Relaxed);
     PM_IDENTITY_OK.store(0, Ordering::Relaxed);
     PM_VSPACE_PUBLISHED_OK.store(0, Ordering::Relaxed);
@@ -9305,6 +9306,7 @@ impl ExecNtHandler {
             }
         }
         PM_PROC_COUNT.store(process_count, Ordering::Relaxed);
+        PM_OBJECT_COUNT.store(self.pm.process_count() as u64, Ordering::Relaxed);
         PM_IDENTITY_OK.store(identity_ok, Ordering::Relaxed);
         PM_RUNNING_PROCESS_MASK.store(running_process_mask, Ordering::Relaxed);
         PM_MAIN_THREADS_OK.store(main_threads_ok, Ordering::Relaxed);
@@ -9327,6 +9329,22 @@ impl ExecNtHandler {
     ) -> Result<nt_process::Handle, u32> {
         let cap_before = self.pm.handle_capacity(pid);
         let handle = self.pm.insert_handle(pid, object, granted_access)?;
+        self.record_process_handle_insert(pid, cap_before);
+        Ok(handle)
+    }
+
+    fn insert_inherited_process_handle(
+        &mut self,
+        pid: nt_process::ProcessId,
+        inherited: nt_process::InheritedHandle,
+    ) -> Result<nt_process::Handle, u32> {
+        let cap_before = self.pm.handle_capacity(pid);
+        let handle = self.pm.insert_inherited_handle(pid, inherited)?;
+        self.record_process_handle_insert(pid, cap_before);
+        Ok(handle)
+    }
+
+    fn record_process_handle_insert(&mut self, pid: nt_process::ProcessId, cap_before: usize) {
         let cap_after = self.pm.handle_capacity(pid);
         if cap_after > cap_before {
             PM_HANDLE_CAP_GROWTHS.fetch_add(1, Ordering::Relaxed);
@@ -9339,66 +9357,119 @@ impl ExecNtHandler {
             PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
         }
         PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
-        Ok(handle)
     }
 
     fn allocate_hosted_process_slot(
         &mut self,
-        creator_pi: usize,
+        parent: nt_process::ProcessId,
         image: nt_exe_image::HostedProcessImageRef<'_>,
+        flags: u32,
+        job_member_level: u32,
     ) -> Result<usize, u32> {
         let child_pi = image.pi;
         let name = image.process_name;
+        let selected_job = self
+            .pm
+            .select_child_job(Some(parent), flags, job_member_level)?;
+        let inherited_handles = if flags & nt_process::PROCESS_CREATE_FLAGS_INHERIT_HANDLES != 0 {
+            self.pm.inheritable_handles(parent)?
+        } else {
+            Vec::new()
+        };
         if let Some(existing_pid) = self.pm_pid_for_pi(child_pi) {
-            let matches_existing = self
-                .pm
-                .process(existing_pid)
-                .is_some_and(|process| process.image_file_name.eq_ignore_ascii_case(name));
+            let matches_existing = self.pm.process(existing_pid).is_some_and(|process| {
+                process.image_file_name.eq_ignore_ascii_case(name)
+                    && process.parent == Some(parent)
+                    && self.pm.process_job(existing_pid) == selected_job
+            });
             if matches_existing {
                 return Ok(child_pi);
             }
             return Err(nt_process::STATUS_INVALID_PARAMETER);
         }
-        let parent = self
-            .pm_pid_for_pi(creator_pi)
+        let token = self
+            .pm
+            .process_primary_token(parent)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        self.publish_registered_hosted_process_metadata(image)?;
-        let pid = self.pm.create_process(name, Some(parent), None);
+        self.token_store
+            .retain(token)
+            .map_err(|_| nt_process::STATUS_INVALID_HANDLE)?;
+        if let Err(status) = self.publish_registered_hosted_process_metadata(image) {
+            let _ = self.token_store.release(token);
+            return Err(status);
+        }
+        let pid = match self.pm.create_process_with_job_policy(
+            name,
+            Some(parent),
+            None,
+            flags,
+            job_member_level,
+        ) {
+            Ok(pid) => pid,
+            Err(status) => {
+                let _ = self.token_store.release(token);
+                self.drain_job_notifications();
+                self.drain_job_destructions();
+                return Err(status);
+            }
+        };
+        self.drain_job_notifications();
+        for inherited in inherited_handles {
+            if let Err(status) = self.retain_external_handle_reference(inherited.object) {
+                let _ = self.token_store.release(token);
+                self.rollback_hosted_process_creation(child_pi, pid);
+                return Err(status);
+            }
+            if let Err(status) = self.insert_inherited_process_handle(pid, inherited) {
+                self.release_external_handle_reference(inherited.object);
+                let _ = self.token_store.release(token);
+                self.rollback_hosted_process_creation(child_pi, pid);
+                return Err(status);
+            }
+        }
+        if let Err(status) = self.pm.replace_process_primary_token(pid, Some(token)) {
+            let _ = self.token_store.release(token);
+            self.rollback_hosted_process_creation(child_pi, pid);
+            return Err(status);
+        }
         self.pm
             .reserve_process_threads(pid, 1 + PM_RUNTIME_THREAD_SLOTS);
         self.process_vspaces[child_pi] = 0;
         self.clear_hosted_tp_worker_windows(child_pi);
-        let main_tid = self.pm.create_thread(pid, 0, 0, false)?;
-        self.register_hosted_process_identity(child_pi, pid, main_tid, image.top_badge)?;
+        let main_tid = match self.pm.create_thread(pid, 0, 0, false) {
+            Ok(tid) => tid,
+            Err(status) => {
+                self.rollback_hosted_process_creation(child_pi, pid);
+                return Err(status);
+            }
+        };
+        if let Err(status) =
+            self.register_hosted_process_identity(child_pi, pid, main_tid, image.top_badge)
+        {
+            self.rollback_hosted_process_creation(child_pi, pid);
+            return Err(status);
+        }
         for slot in 0..PM_RUNTIME_THREAD_SLOTS {
-            if let Ok(tid) = self.pm.create_thread(pid, 0, 0, false) {
-                let _ = self
-                    .pm
-                    .set_thread_state(tid, nt_process::ThreadState::Initialized);
-                self.register_hosted_pool_thread_identity(child_pi, slot, tid)?;
+            let tid = match self.pm.create_thread(pid, 0, 0, false) {
+                Ok(tid) => tid,
+                Err(status) => {
+                    self.rollback_hosted_process_creation(child_pi, pid);
+                    return Err(status);
+                }
+            };
+            if let Err(status) = self
+                .pm
+                .set_thread_state(tid, nt_process::ThreadState::Initialized)
+            {
+                self.rollback_hosted_process_creation(child_pi, pid);
+                return Err(status);
+            }
+            if let Err(status) = self.register_hosted_pool_thread_identity(child_pi, slot, tid) {
+                self.rollback_hosted_process_creation(child_pi, pid);
+                return Err(status);
             }
         }
         self.pm.reserve_handles(pid, PM_HANDLE_RESERVE);
-        let (token, inherited_token) =
-            if let Some(parent_token) = self.pm.process_primary_token(parent) {
-                if self.token_store.retain(parent_token).is_ok() {
-                    (parent_token, true)
-                } else {
-                    (
-                        self.token_store.insert(nt_security::AccessToken::system()),
-                        false,
-                    )
-                }
-            } else {
-                (
-                    self.token_store.insert(nt_security::AccessToken::system()),
-                    false,
-                )
-            };
-        if let Err(status) = self.pm.replace_process_primary_token(pid, Some(token)) {
-            let _ = self.token_store.release(token);
-            return Err(status);
-        }
         PM_DYNAMIC_PROCESS_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         self.refresh_process_manager_gates();
         unsafe {
@@ -9412,13 +9483,34 @@ impl ExecNtHandler {
             print_str(name.as_bytes());
             print_str(b" token=");
             print_u64(token.raw() as u64);
-            print_str(if inherited_token {
-                b" inherited\n" as &[u8]
-            } else {
-                b" system\n" as &[u8]
-            });
+            print_str(b" inherited\n");
         }
         Ok(child_pi)
+    }
+
+    fn rollback_hosted_process_creation(&mut self, pi: usize, pid: nt_process::ProcessId) {
+        while let Some(object) = self.pm.take_any_handle(pid) {
+            self.release_handle_object(object);
+        }
+        let _ = self.thread_mechanisms.release_main(pi);
+        for slot in 0..PM_RUNTIME_THREAD_SLOTS {
+            let _ = self.thread_mechanisms.release_pool(pi, slot);
+        }
+        let _ = self.process_mechanisms.release_pi(pi);
+        let deletion = self
+            .pm
+            .abort_process_creation(pid)
+            .expect("unpublished process creation remains privately owned");
+        if let Some(token) = deletion.primary_token {
+            let _ = self.token_store.release(token);
+        }
+        debug_assert!(deletion.exception_port.is_none());
+        self.process_vspaces[pi] = 0;
+        self.pool_used[pi] = 0;
+        self.clear_hosted_tp_worker_windows(pi);
+        self.drain_job_notifications();
+        self.drain_job_destructions();
+        self.refresh_process_manager_gates();
     }
     /// Mint an executive handle for the CURRENT process (`self.pi`) and record it in that process's
     /// real EPROCESS handle table. The returned value is the process-local NT handle
@@ -11548,12 +11640,21 @@ impl ExecNtHandler {
             WaitObject::KIND_DISPATCHER => {
                 self.release_dispatcher_wait_reference(object.id() as usize)
             }
-            WaitObject::KIND_PROCESS => self
-                .pm
-                .release_process_wait_reference(object.id() as nt_process::ProcessId),
-            WaitObject::KIND_THREAD => self
-                .pm
-                .release_thread_wait_reference(object.id() as nt_process::ThreadId),
+            WaitObject::KIND_PROCESS => {
+                let pid = object.id() as nt_process::ProcessId;
+                self.pm.release_process_wait_reference(pid)?;
+                let _ = self.try_delete_hosted_process_object(pid);
+                Ok(())
+            }
+            WaitObject::KIND_THREAD => {
+                let tid = object.id() as nt_process::ThreadId;
+                let pid = self.pm.thread(tid).map(|thread| thread.process_id);
+                self.pm.release_thread_wait_reference(tid)?;
+                if let Some(pid) = pid {
+                    let _ = self.try_delete_hosted_process_object(pid);
+                }
+                Ok(())
+            }
             WaitObject::KIND_WIN32K_EVENT if object.id() != 0 => Ok(()),
             WaitObject::KIND_FILE => {
                 let release = self.file_completion.release_file(object.id())?;
@@ -13485,7 +13586,7 @@ impl ExecNtHandler {
             }
         };
         self.queue_write(thread_handle_out, handle);
-        self.thread_spawn_request = Some(HostedThreadSpawnRequest::ThreadEx {
+        self.thread_spawn_request = Some(HostedThreadSpawnRequest::TpWorker {
             pi: target_pi,
             slot,
             start,
@@ -13697,6 +13798,12 @@ impl ExecNtHandler {
         let ctx_va = args[NT_CREATE_THREAD_CONTEXT_ARG];
         let start =
             nt_thread_start::Amd64ThreadContext::read(|address| smss_stack_read(address), ctx_va);
+        let initial_teb_va = args[NT_CREATE_THREAD_INITIAL_TEB_ARG];
+        if initial_teb_va == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let initial_teb =
+            nt_thread_start::InitialTeb64::read(|address| smss_stack_read(address), initial_teb_va);
         let create_suspended = nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
         let Some((slot, tid, handle)) =
             self.nt_create_thread_handle(start.rip, create_suspended, nt_ulong_arg(args[1]))
@@ -13715,7 +13822,11 @@ impl ExecNtHandler {
             self.queue_write(cid_ptr, pid as u64);
             self.queue_write(cid_ptr + 8, tid);
         }
-        self.thread_spawn_request = Some(spec.request);
+        self.thread_spawn_request = Some(HostedThreadSpawnRequest::Multiplexed {
+            kind: spec.spawn_kind,
+            start,
+            initial_teb,
+        });
         self.trace_role_owned_local_thread_create(args, spec, start, handle, tid);
         0
     }
@@ -13735,8 +13846,8 @@ impl ExecNtHandler {
         }
         let initial_teb = args[NT_CREATE_THREAD_INITIAL_TEB_ARG];
         let create_suspended = nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
-        let slot = match spec.request {
-            HostedThreadSpawnRequest::LsassListener { slot } => slot,
+        let slot = match spec.spawn_kind {
+            HostedMultiplexedThreadKind::LsassListener { slot } => slot,
             _ => usize::MAX,
         };
         print_str(b"[thread-life] create caller=lsass badge=8 process=0x");
@@ -13943,6 +14054,7 @@ impl ExecNtHandler {
         self.thread_spawn_request = Some(HostedThreadSpawnRequest::TpWorker {
             pi: self.pi,
             slot: tp_slot,
+            start,
         });
         print_str(b"[tp-worker] claimed pi=");
         print_u64(self.pi as u64);
@@ -17301,8 +17413,7 @@ impl ExecNtHandler {
             return STATUS_PRIVILEGE_NOT_HELD;
         }
 
-        let refreshed_time_zone =
-            (new_time == 0).then(|| seed_time_zone(&self.mutable_hives));
+        let refreshed_time_zone = (new_time == 0).then(|| seed_time_zone(&self.mutable_hives));
         let refreshed_real_time_is_universal =
             (new_time == 0).then(|| seed_real_time_is_universal(&self.mutable_hives));
         let requested_system_time = if new_time == 0 {
@@ -17314,8 +17425,8 @@ impl ExecNtHandler {
                 persistent_time
             } else {
                 let current = nt_system_time_100ns();
-                let bias = effective_time_zone(refreshed_time_zone.as_ref().unwrap(), current)
-                    .bias_100ns;
+                let bias =
+                    effective_time_zone(refreshed_time_zone.as_ref().unwrap(), current).bias_100ns;
                 let Some(system_time) = adjusted_native_time(persistent_time, bias) else {
                     return STATUS_INVALID_PARAMETER;
                 };
@@ -18512,8 +18623,7 @@ impl ExecNtHandler {
                             Err(status) => return status.raw() as u32,
                         };
                         if metadata.endpoint != nt_lpc_abi::handle_endpoint::LISTEN_PORT
-                            && metadata.endpoint
-                                != nt_lpc_abi::handle_endpoint::CLIENT_COMM_PORT
+                            && metadata.endpoint != nt_lpc_abi::handle_endpoint::CLIENT_COMM_PORT
                         {
                             return STATUS_OBJECT_TYPE_MISMATCH;
                         }
@@ -18541,7 +18651,9 @@ impl ExecNtHandler {
                             .ok_or(nt_status::NtStatus::UNSUCCESSFUL)
                             .and_then(|client| client.release_port_object(retained));
                         if let Err(release_status) = release_status {
-                            print_str(b"[lpc-invariant] exception-port rollback failed endpoint=0x");
+                            print_str(
+                                b"[lpc-invariant] exception-port rollback failed endpoint=0x",
+                            );
                             print_hex_u64(retained);
                             print_str(b" status=0x");
                             print_hex(release_status.raw() as u32);
@@ -18640,6 +18752,62 @@ impl ExecNtHandler {
         }
     }
 
+    fn retain_external_handle_reference(
+        &mut self,
+        object: nt_process::HandleObject,
+    ) -> Result<(), u32> {
+        match object {
+            nt_process::HandleObject::TokenObject(token) => self
+                .token_store
+                .retain(token)
+                .map_err(|_| nt_process::STATUS_INVALID_HANDLE),
+            nt_process::HandleObject::IoCompletion(id) => self.io_completion_ports.retain(id),
+            nt_process::HandleObject::File(file_id)
+            | nt_process::HandleObject::RoutedFile { file_id, .. } => {
+                self.file_completion.retain_handle(file_id)
+            }
+            nt_process::HandleObject::Directory { object_id, .. } => {
+                self.directory_opens.retain(object_id)
+            }
+            nt_process::HandleObject::DiskFile { object_id, .. } => {
+                self.readonly_file_opens.retain(object_id)
+            }
+            nt_process::HandleObject::OverlayFile(file_id) => {
+                self.writable_fs_dirty = true;
+                unsafe { crate::writable_fs::retain(file_id) }
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Undo only a reference acquired by `retain_external_handle_reference`. Ps-owned Job/Debug
+    /// references do not enter this path because they are acquired by handle-table publication.
+    fn release_external_handle_reference(&mut self, object: nt_process::HandleObject) {
+        match object {
+            nt_process::HandleObject::TokenObject(token) => {
+                let _ = self.token_store.release(token);
+            }
+            nt_process::HandleObject::IoCompletion(id) => {
+                self.release_io_completion_reference(id);
+            }
+            nt_process::HandleObject::File(file_id)
+            | nt_process::HandleObject::RoutedFile { file_id, .. } => {
+                self.release_file_handle_reference(file_id);
+            }
+            nt_process::HandleObject::Directory { object_id, .. } => {
+                let _ = self.directory_opens.release(object_id);
+            }
+            nt_process::HandleObject::DiskFile { object_id, .. } => {
+                let _ = self.readonly_file_opens.release(object_id);
+            }
+            nt_process::HandleObject::OverlayFile(file_id) => {
+                unsafe { crate::writable_fs::close(file_id) };
+                self.writable_fs_dirty = true;
+            }
+            _ => {}
+        }
+    }
+
     fn release_handle_object(&mut self, object: nt_process::HandleObject) {
         match object {
             nt_process::HandleObject::TokenObject(token) => {
@@ -18679,9 +18847,16 @@ impl ExecNtHandler {
                 let _ = self.readonly_file_opens.release(object_id);
             }
             nt_process::HandleObject::Section(section) => {
-                if let Some(loop_ctx) = self.loop_ctx {
-                    unsafe {
-                        let _ = (&mut *loop_ctx.generic_sections).release_handle(section as usize);
+                if self
+                    .pm
+                    .handle_object_count(nt_process::HandleObject::Section(section))
+                    == 0
+                {
+                    if let Some(loop_ctx) = self.loop_ctx {
+                        unsafe {
+                            let _ =
+                                (&mut *loop_ctx.generic_sections).release_handle(section as usize);
+                        }
                     }
                 }
             }
@@ -18706,6 +18881,12 @@ impl ExecNtHandler {
                 let _ = self
                     .pm
                     .clear_deleted_process_debug_object_if_unreferenced(pid);
+                let _ = self.try_delete_hosted_process_object(pid);
+            }
+            nt_process::HandleObject::Thread(tid) => {
+                if let Some(pid) = self.pm.thread(tid).map(|thread| thread.process_id) {
+                    let _ = self.try_delete_hosted_process_object(pid);
+                }
             }
             // DbgkpCloseObject: the debugger's last handle went away — mark the object inactive,
             // detach every debuggee, and drop it.
@@ -18791,6 +18972,79 @@ impl ExecNtHandler {
         assert_eq!(released, Some(endpoint));
     }
 
+    /// Complete the Object Manager's EPROCESS delete procedure after hosted mechanism/VM teardown
+    /// and the last process/thread handle or wait reference. Ps removes ETHREADs and job membership;
+    /// the executive returns only the external Security Manager and LPC references from the deletion
+    /// record, then frees the pi identity for a later genuine process.
+    pub(crate) fn try_delete_hosted_process_object(&mut self, pid: nt_process::ProcessId) -> bool {
+        let Some(pi) = self.process_mechanisms.pi_for_pid(pid) else {
+            return false;
+        };
+        if self.process_vspaces.get(pi).copied().unwrap_or(1) != 0
+            || !self.pm.process_object_delete_ready(pid)
+        {
+            return false;
+        }
+
+        let thread_count = self
+            .pm
+            .process(pid)
+            .map(|process| process.threads.len())
+            .unwrap_or(0);
+        for index in 0..thread_count {
+            let tid = self
+                .pm
+                .process(pid)
+                .and_then(|process| process.threads.get(index).copied());
+            let Some(tid) = tid else {
+                return false;
+            };
+            if let Ok(Some(context)) = self.pm.replace_thread_impersonation(tid, None) {
+                let _ = self.token_store.release(context.token);
+            }
+        }
+
+        let Some(deletion) = self.pm.delete_process_object_if_unreferenced(pid) else {
+            return false;
+        };
+        if let Some(token) = deletion.primary_token {
+            let _ = self.token_store.release(token);
+        }
+        if let Some(endpoint) = deletion.exception_port {
+            let client = unsafe { lpc_client() };
+            match client {
+                Some(client) => {
+                    if let Err(status) = client.release_port_object(endpoint.get()) {
+                        print_str(
+                            b"[lpc-invariant] deleted process port release failed endpoint=0x",
+                        );
+                        print_hex_u64(endpoint.get());
+                        print_str(b" status=0x");
+                        print_hex(status.raw() as u32);
+                        print_str(b"\n");
+                    }
+                }
+                None => {
+                    print_str(
+                        b"[lpc-invariant] deleted process retained port without broker endpoint=0x",
+                    );
+                    print_hex_u64(endpoint.get());
+                    print_str(b"\n");
+                }
+            }
+        }
+        let _ = self.thread_mechanisms.release_main(pi);
+        for slot in 0..PM_RUNTIME_THREAD_SLOTS {
+            let _ = self.thread_mechanisms.release_pool(pi, slot);
+        }
+        let released = self.process_mechanisms.release_pi(pi);
+        debug_assert!(released.is_some_and(|mechanism| mechanism.pid == pid));
+        self.pool_used[pi] = 0;
+        self.drain_job_destructions();
+        self.refresh_process_manager_gates();
+        true
+    }
+
     pub(crate) fn duplicate_process_handle_with_access(
         &mut self,
         source_pid: nt_process::ProcessId,
@@ -18817,40 +19071,22 @@ impl ExecNtHandler {
             nt_process::HandleObject::Job(_) => nt_process::job::map_job_access(access),
             _ => access,
         });
-        let handle = self.insert_process_handle(
+        self.retain_external_handle_reference(object)?;
+        let handle = match self.insert_process_handle(
             target_pid,
             object,
             desired_access.unwrap_or(source_access),
-        )?;
-        if let Err(status) = self.pm.set_handle_flags(target_pid, handle, source_flags) {
-            let _ = self.pm.take_handle(target_pid, handle);
-            return Err(status);
-        }
-        let retained = match object {
-            nt_process::HandleObject::TokenObject(token) => self
-                .token_store
-                .retain(token)
-                .map_err(|_| nt_process::STATUS_INVALID_HANDLE),
-            nt_process::HandleObject::IoCompletion(id) => self.io_completion_ports.retain(id),
-            nt_process::HandleObject::File(file_id)
-            | nt_process::HandleObject::RoutedFile { file_id, .. } => {
-                self.file_completion.retain_handle(file_id)
+        ) {
+            Ok(handle) => handle,
+            Err(status) => {
+                self.release_external_handle_reference(object);
+                return Err(status);
             }
-            nt_process::HandleObject::Directory { object_id, .. } => {
-                self.directory_opens.retain(object_id)
-            }
-            nt_process::HandleObject::DiskFile { object_id, .. } => {
-                self.readonly_file_opens.retain(object_id)
-            }
-            nt_process::HandleObject::OverlayFile(file_id) => {
-                self.writable_fs_dirty = true;
-                unsafe { crate::writable_fs::retain(file_id) }
-            }
-            _ => Ok(()),
         };
-        if let Err(status) = retained {
-            // The table copy does not own the backing object until retain succeeds.
-            let _ = self.pm.take_handle(target_pid, handle);
+        if let Err(status) = self.pm.set_handle_flags(target_pid, handle, source_flags) {
+            if let Ok(object) = self.pm.take_handle(target_pid, handle) {
+                self.release_handle_object(object);
+            }
             return Err(status);
         }
         // ★ Record the logon token crossing into winlogon: `LsapLogonUser`'s closing
@@ -27637,33 +27873,30 @@ impl ExecNtHandler {
         Ok(was_active)
     }
 
-    pub(crate) fn user_timer_fire_due(
-        &mut self,
-        now: nt_delay_execution::TimeSnapshot,
-    ) -> u64 {
+    pub(crate) fn user_timer_fire_due(&mut self, now: nt_delay_execution::TimeSnapshot) -> u64 {
         let mut fired = 0u64;
         while let Some(expiration) = self.user_timers.expire_next_due(now) {
             let _ = self.events.set_existing(expiration.object_id);
             fired += 1;
             if expiration.apc.routine != 0 {
-                let (status, inserted) = match nt_process::ThreadId::try_from(
-                    expiration.apc.thread_id,
-                ) {
-                    Ok(tid) => match self.pm.queue_kernel_user_apc_once(
-                        tid,
-                        nt_process::KernelUserApcSource::Timer(expiration.object_id),
-                        nt_process::UserApc {
-                            routine: expiration.apc.routine,
-                            normal_context: expiration.apc.context,
-                            system_argument1: expiration.system_time_100ns & 0xffff_ffff,
-                            system_argument2: (expiration.system_time_100ns >> 32) & 0xffff_ffff,
+                let (status, inserted) =
+                    match nt_process::ThreadId::try_from(expiration.apc.thread_id) {
+                        Ok(tid) => match self.pm.queue_kernel_user_apc_once(
+                            tid,
+                            nt_process::KernelUserApcSource::Timer(expiration.object_id),
+                            nt_process::UserApc {
+                                routine: expiration.apc.routine,
+                                normal_context: expiration.apc.context,
+                                system_argument1: expiration.system_time_100ns & 0xffff_ffff,
+                                system_argument2: (expiration.system_time_100ns >> 32)
+                                    & 0xffff_ffff,
+                            },
+                        ) {
+                            Ok(inserted) => (nt_fs::STATUS_SUCCESS, inserted),
+                            Err(status) => (status, false),
                         },
-                    ) {
-                        Ok(inserted) => (nt_fs::STATUS_SUCCESS, inserted),
-                        Err(status) => (status, false),
-                    },
-                    Err(_) => (STATUS_INVALID_HANDLE, false),
-                };
+                        Err(_) => (STATUS_INVALID_HANDLE, false),
+                    };
                 let trace = USER_TIMER_APC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if trace < 16 {
                     print_str(b"[timer] due object=");
@@ -28840,8 +29073,38 @@ impl ExecNtHandler {
 
     #[inline(never)]
     unsafe fn nt_create_process_service(&mut self, args: &[u64]) -> u32 {
+        let legacy = self.current_service_number == SSN_NT_CREATE_PROCESS as u32;
+        let create = match nt_process::decode_process_create_input(args, !legacy) {
+            Ok(create) => create,
+            Err(status) => return status,
+        };
+        if args[0] & 7 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        if !self.probe_user_output(args[0], 8) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let Some(caller_pid) = self.pm_pid_for_pi(self.pi) else {
+            return nt_process::STATUS_INVALID_HANDLE;
+        };
+        let parent = match self.pm.resolve_process_handle(
+            caller_pid,
+            args[3],
+            nt_process::PROCESS_CREATE_PROCESS,
+        ) {
+            Ok(parent) => parent,
+            Err(status) => return status,
+        };
+        const SUPPORTED_PROCESS_CREATE_FLAGS: u32 = nt_process::PROCESS_CREATE_FLAGS_BREAKAWAY
+            | nt_process::PROCESS_CREATE_FLAGS_INHERIT_HANDLES;
+        if create.flags & !SUPPORTED_PROCESS_CREATE_FLAGS != 0
+            || create.debug_port != 0
+            || create.exception_port != 0
+        {
+            return STATUS_NOT_SUPPORTED;
+        }
         let ctx = self.loop_ctx.unwrap();
-        let sect = args[5];
+        let sect = create.section_handle;
         let slot_info = {
             let table = &*ctx.exe_images;
             table.index_for_section(self.pi, sect).and_then(|index| {
@@ -28889,7 +29152,9 @@ impl ExecNtHandler {
             };
             image
         };
-        if let Err(status) = self.allocate_hosted_process_slot(self.pi, image) {
+        if let Err(status) =
+            self.allocate_hosted_process_slot(parent, image, create.flags, create.job_member_level)
+        {
             return status;
         }
         match image.role {
@@ -28900,9 +29165,6 @@ impl ExecNtHandler {
                 EXPLORER_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
             }
             _ => {}
-        }
-        if self.resolve_process_handle(args[3]) != self.pm_pid_for_pi(self.pi) {
-            return nt_process::STATUS_INVALID_HANDLE;
         }
         let table = &mut *ctx.exe_images;
         match table.reserve_spawn_owned_registered(
@@ -31837,8 +32099,8 @@ impl ExecNtHandler {
                     crate::hard_error::disable();
                 }
 
-                let error_status = args[0] as u32
-                    & !nt_syscall::hard_error::HARDERROR_OVERRIDE_ERRORMODE;
+                let error_status =
+                    args[0] as u32 & !nt_syscall::hard_error::HARDERROR_OVERRIDE_ERRORMODE;
                 if nt_syscall::hard_error::requires_system_error_handler(
                     crate::hard_error::is_ready(),
                     error_status,
@@ -31857,9 +32119,8 @@ impl ExecNtHandler {
                     .pm
                     .process_default_hard_error_processing(pid)
                     .unwrap_or(0);
-                let forced = args[0] as u32
-                    & nt_syscall::hard_error::HARDERROR_OVERRIDE_ERRORMODE
-                    != 0;
+                let forced =
+                    args[0] as u32 & nt_syscall::hard_error::HARDERROR_OVERRIDE_ERRORMODE != 0;
                 if process_mode & 1 == 0 && !forced {
                     return nt_syscall::STATUS_SUCCESS;
                 }
@@ -31869,8 +32130,7 @@ impl ExecNtHandler {
                     .filter(|teb| *teb != 0)
                     .is_some_and(|teb| {
                         let mut mode = [0u8; 4];
-                        self.xas_read(teb + 0x16b0, &mut mode)
-                            && u32::from_le_bytes(mode) & 1 != 0
+                        self.xas_read(teb + 0x16b0, &mut mode) && u32::from_le_bytes(mode) & 1 != 0
                     });
                 if teb_disabled {
                     return nt_syscall::STATUS_SUCCESS;
@@ -32091,8 +32351,11 @@ impl ExecNtHandler {
                                 self.queue_write(cid_ptr, pid as u64);
                                 self.queue_write(cid_ptr + 8, tid);
                             }
-                            self.thread_spawn_request =
-                                Some(HostedThreadSpawnRequest::TpWorker { pi: self.pi, slot });
+                            self.thread_spawn_request = Some(HostedThreadSpawnRequest::TpWorker {
+                                pi: self.pi,
+                                slot,
+                                start,
+                            });
                             print_str(b"[csr-thread] create slot=");
                             print_u64(slot as u64);
                             print_str(b" tid=");
@@ -32270,8 +32533,11 @@ impl ExecNtHandler {
                                 self.queue_write(cid_ptr, pid as u64); // ClientId.UniqueProcess
                                 self.queue_write(cid_ptr + 8, tid); // ClientId.UniqueThread
                             }
-                            self.thread_spawn_request =
-                                Some(HostedThreadSpawnRequest::Winlogon { slot });
+                            self.thread_spawn_request = Some(HostedThreadSpawnRequest::Winlogon {
+                                slot,
+                                start,
+                                initial_teb: initial_stack,
+                            });
                             let trace = THREAD_LIFECYCLE_TRACE_N.fetch_add(1, Ordering::Relaxed);
                             if trace < 4 {
                                 print_str(
@@ -40046,7 +40312,7 @@ impl ExecNtHandler {
             // Control-flow case: validate the SectionHandle through the executable image table, reserve
             // the process publication, then let the loop build the seL4 mechanism from the same
             // SpawnRequest used by Win32 children.
-            NativeService::NtCreateProcess => unsafe {
+            NativeService::NtCreateProcess | NativeService::NtCreateProcessEx => unsafe {
                 let service =
                     core::ptr::read_volatile(core::ptr::addr_of!(NT_CREATE_PROCESS_SERVICE_ENTRY));
                 service(self as *mut ExecNtHandler, args.as_ptr(), args.len())
@@ -40365,6 +40631,8 @@ impl ExecNtHandler {
                             nt_ulong_arg(args[2]),
                         );
                         self.sync_debug_object_signal(object);
+                        let _ =
+                            self.try_delete_hosted_process_object(event.client_id.unique_process);
                         DBGK_CONTINUES.fetch_add(1, Ordering::Relaxed);
                         0
                     }
@@ -40376,12 +40644,11 @@ impl ExecNtHandler {
             //                             DebugInformationLength, ReturnLength OPTIONAL).
             NativeService::NtSetInformationDebugObject => unsafe {
                 let information_class = nt_ulong_arg(args[1]);
-                let required = match nt_process::dbgk::debug_object_set_information_size(
-                    information_class,
-                ) {
-                    Ok(required) => required,
-                    Err(status) => return status,
-                };
+                let required =
+                    match nt_process::dbgk::debug_object_set_information_size(information_class) {
+                        Ok(required) => required,
+                        Err(status) => return status,
+                    };
                 if nt_ulong_arg(args[3]) as usize != required {
                     return nt_process::STATUS_INFO_LENGTH_MISMATCH;
                 }
@@ -40457,6 +40724,7 @@ impl ExecNtHandler {
                         // `DbgkClearProcessDebugObject` → `DbgkpMarkProcessPeb(Process, FALSE)`.
                         unsafe { self.dbgk_mark_process_peb(target_pi, false) };
                         self.sync_debug_object_signal(object);
+                        let _ = self.try_delete_hosted_process_object(target);
                         DBGK_DETACHES.fetch_add(1, Ordering::Relaxed);
                         0
                     }

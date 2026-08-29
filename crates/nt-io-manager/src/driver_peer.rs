@@ -15,8 +15,8 @@ use core::cell::RefCell;
 use nt_io_abi::{
     ioctl, major, valid_directory_notify_parameters, valid_ea_parameters,
     valid_lock_control_parameters, valid_quota_parameters, valid_read_write_parameters,
-    valid_set_information_control,
-    valid_volume_information_parameters, IrpDispatchRequest, IO_ABI_VERSION,
+    valid_set_information_control, valid_volume_information_parameters, IrpDispatchRequest,
+    IO_ABI_VERSION,
 };
 use nt_status::NtStatus;
 

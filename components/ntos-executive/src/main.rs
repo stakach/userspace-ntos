@@ -59,9 +59,9 @@ mod device_io;
 pub(crate) use device_io::*;
 mod pnp;
 pub(crate) use pnp::*;
-mod power_manager;
 mod hard_error;
 mod hosted_pnp_context;
+mod power_manager;
 pub(crate) use hosted_pnp_context::*;
 mod hosted_pnp_start;
 pub(crate) use hosted_pnp_start::*;
@@ -321,8 +321,8 @@ pub const EXECUTIVE_WIN32K_SCRATCH_BASE: u64 = 0x0000_0100_1300_0000;
 // that every spawn_sec_image already created. The EXECUTIVE-side env scratch must be DISTINCT from
 // SM (0x1070) / CSR (0x1071) / smss-spawn (0x1074) / csrss-spawn (0x1078) / winlogon-spawn (0x107C).
 pub const WL_LISTENER_STACK_BASE: u64 = HOSTED_THREAD_STACK_BASE; // target VSpace
-// LdrInitializeThread builds the bounded module/attach plan on this bootstrap stack before it
-// restores the caller's INITIAL_TEB stack. Match the later worker slots' eight-page floor.
+                                                                  // LdrInitializeThread builds the bounded module/attach plan on this bootstrap stack before it
+                                                                  // restores the caller's INITIAL_TEB stack. Match the later worker slots' eight-page floor.
 pub const WL_LISTENER_STACK_FRAMES: u64 = 8;
 pub const WL_LISTENER_IPCBUF_VA: u64 = HOSTED_THREAD_IPCBUF_VA; // target VSpace
 pub const WL_LISTENER_TEB_VA: u64 = HOSTED_THREAD_TEB_VA; // target VSpace (2 pages)
@@ -3141,10 +3141,7 @@ fn watchdog_deadline() -> Option<u64> {
 /// Arm the deadman. Scoped ON once the GUI stack has produced authentic desktop pixels. From there
 /// the boot frontier includes SCM/EventLog/shell work that can block inside nested component receives;
 /// any true silence must produce diagnostics instead of leaving the run to hang.
-pub(crate) unsafe fn watchdog_arm(
-    queue: &nt_delay_execution::Queue,
-    handler: &ExecNtHandler,
-) {
+pub(crate) unsafe fn watchdog_arm(queue: &nt_delay_execution::Queue, handler: &ExecNtHandler) {
     if !EXEC_DEADMAN_WATCHDOG || WATCHDOG_ARMED.swap(1, Ordering::Relaxed) != 0 {
         return;
     }
@@ -3731,12 +3728,9 @@ pub(crate) static WINLOGON_CRED_LSA_CONNECT: AtomicU64 = AtomicU64::new(0);
 /// names follow the object manager's case-insensitive lookup contract.
 pub(crate) fn lpc_name_is(name16: &[u16], ascii: &[u8]) -> bool {
     name16.len() == ascii.len()
-        && name16
-            .iter()
-            .zip(ascii.iter())
-            .all(|(unit, byte)| {
-                u8::try_from(*unit).is_ok_and(|unit| unit.eq_ignore_ascii_case(byte))
-            })
+        && name16.iter().zip(ascii.iter()).all(|(unit, byte)| {
+            u8::try_from(*unit).is_ok_and(|unit| unit.eq_ignore_ascii_case(byte))
+        })
 }
 
 unsafe fn winlogon_credential_load() -> nt_user_callback::CredentialInjectionSequence {
@@ -8653,7 +8647,7 @@ pub(crate) unsafe fn csrss_frame_put_section_mapping(
     csrss_frame_put_at_cap_source_owned(pi, page, fr, 0, 0, source_cap, false)
 }
 
-unsafe fn csrss_frame_put_at_cap_source_owned(
+pub(crate) unsafe fn csrss_frame_put_at_cap_source_owned(
     pi: u64,
     page: u64,
     fr: u64,
@@ -8695,7 +8689,8 @@ pub(crate) unsafe fn csrss_frame_drop_process_range(pi: u64, base: u64, size: u6
         if vm_page_lock_is_locked(pi, page) {
             VM_LOCK_RECLAIM_REFUSALS.fetch_add(1, Ordering::Relaxed);
         } else {
-            while let Some((frame, alias_cap, source_cap, owns_frame)) = csrss_frame_take(pi, page) {
+            while let Some((frame, alias_cap, source_cap, owns_frame)) = csrss_frame_take(pi, page)
+            {
                 if owns_frame {
                     vm_frame_release(frame, alias_cap);
                 } else {
@@ -17959,6 +17954,9 @@ unsafe fn teardown_job_terminated_processes(
             terminate_hosted_process_mechanisms(process_index, None, delay_queue, handler);
         let vm_reclaim = reclaim_final_process_vm(process_index, handler);
         let _ = win32k_glue::unwind_dead_client_user_callbacks(process_index as u32);
+        if let Some(pid) = handler.pm_pid_for_pi(process_index as usize) {
+            let _ = handler.try_delete_hosted_process_object(pid);
+        }
         print_str(b"[job-process-term] pi=");
         print_u64(process_index as u64);
         print_str(b" mechanisms=");
@@ -21759,19 +21757,24 @@ pub(crate) struct RemoteThreadRequest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostedMultiplexedThreadKind {
+    ServicesListener,
+    LsassListener { slot: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostedThreadSpawnRequest {
     Winlogon {
         slot: usize,
+        start: nt_thread_start::Amd64ThreadContext,
+        initial_teb: nt_thread_start::InitialTeb64,
     },
-    ServicesListener,
-    LsassListener {
-        slot: usize,
+    Multiplexed {
+        kind: HostedMultiplexedThreadKind,
+        start: nt_thread_start::Amd64ThreadContext,
+        initial_teb: nt_thread_start::InitialTeb64,
     },
     TpWorker {
-        pi: usize,
-        slot: usize,
-    },
-    ThreadEx {
         pi: usize,
         slot: usize,
         start: nt_thread_start::Amd64ThreadContext,
@@ -22945,6 +22948,11 @@ impl ExecProcessMechanisms {
     fn pi_for_pid(&self, pid: u32) -> Option<usize> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).pi_for_pid(pid) }
+    }
+
+    fn release_pi(&mut self, pi: usize) -> Option<nt_user_host::ProcessMechanism> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).release_pi(pi) }
     }
 }
 
@@ -24466,11 +24474,9 @@ fn build_nt_table() -> NativeServiceTable {
             // Workstream A batch 10 (group C): csrss spawn (table-dispatched-with-post-action).
             (NativeService::NtCreateProcess, SSN_NT_CREATE_PROCESS as u32),
             // ntdll port BATCH 1: our Rust ntdll's RtlCreateUserProcess issues the IMPORTED stub
-            // NtCreateProcessEx (SSN 50) — the ntdll export ReactOS binaries actually link — where the
-            // real ntdll would issue NtCreateProcess (49). 49's args are a prefix of 50's (50 adds a
-            // trailing JobMemberLevel, which smss passes as 0), so route SSN 50 to the SAME
-            // NtCreateProcess handler. See ntdll_plan.md Step 2c reconciliation.
-            (NativeService::NtCreateProcess, 50),
+            // NtCreateProcessEx uses the same implementation as NtCreateProcess, but keeps its own
+            // service identity so the dispatcher marshals the canonical ninth JobMemberLevel arg.
+            (NativeService::NtCreateProcessEx, 50),
             // ITEM 2a — live terminate-dispatch. NtTerminateProcess is table-dispatched because real
             // ReactOS shutdown depends on both NT forms: NULL current-process termination returns after
             // stopping peer threads, while NtCurrentProcess/real Process handles are final and do not
@@ -25425,6 +25431,9 @@ static CSR_AUTHENTIC_ACCEPT_MASK: AtomicU64 = AtomicU64::new(0);
 // have not yet moved behind owned records.
 /// How many hosted EPROCESS objects the live ProcessManager holds once the boot frontier is reached.
 static PM_PROC_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Total EPROCESS objects owned by ProcessManager. At quiescence this must match the hosted
+/// mechanism table exactly; an unmatched object is a leaked or unpublished process identity.
+static PM_OBJECT_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Hosted EPROCESS allocations performed by real `NtCreateProcess[Ex]` calls after the SMSS
 /// bootstrap trio.
 static PM_DYNAMIC_PROCESS_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
@@ -31629,14 +31638,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         WL_LISTENER_TEB_QUERIED.load(Ordering::Relaxed) >= 1,
                         &mut passed,
                     );
-                    // nt-process convergence: the real Process Manager backs every cataloged hosted
-                    // image with an EPROCESS. The expected identity mask comes from `nt_exe_image`,
-                    // not from a hand-maintained boot-history constant.
-                    let hosted_process_count = hosted_gate_count();
-                    let hosted_process_mask = hosted_gate_mask();
+                    // nt-process convergence: the live hosted mechanism table and ProcessManager
+                    // must describe the same object set. Executable-catalog admissions are
+                    // historical and may outlive a short-lived process, so they are not process
+                    // lifecycle authority.
+                    let hosted_process_count = PM_PROC_COUNT.load(Ordering::Relaxed);
                     check(
                         b"exec_process_manager_up",
-                        PM_PROC_COUNT.load(Ordering::Relaxed) == hosted_process_count,
+                        hosted_process_count != 0
+                            && PM_OBJECT_COUNT.load(Ordering::Relaxed) == hosted_process_count,
                         &mut passed,
                     );
                     check(
@@ -31647,7 +31657,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     );
                     check(
                         b"exec_eprocess_backs_badges",
-                        PM_IDENTITY_OK.load(Ordering::Relaxed) == hosted_process_mask,
+                        PM_IDENTITY_OK.load(Ordering::Relaxed).count_ones() as u64
+                            == hosted_process_count,
                         &mut passed,
                     );
                     check(

@@ -3424,3 +3424,323 @@ fn dbgk_block_reporter_refuses_nowait_and_unblocked_events() {
     assert_eq!(pm.blocked_reporter_count(object + 99), 0);
     assert!(pm.drain_blocked_reporters(object + 99, None).is_empty());
 }
+
+#[test]
+fn process_creation_inherits_jobs_and_enforces_breakaway_policy() {
+    let mut pm = ProcessManager::new();
+    let parent = pm.create_process("parent.exe", None, None);
+    let job = pm.create_job(0).unwrap();
+    assert_eq!(pm.assign_process_to_job(job, parent), Ok(STATUS_SUCCESS));
+
+    let child = pm
+        .create_process_with_job_policy("child.exe", Some(parent), None, 0, 0)
+        .unwrap();
+    assert_eq!(pm.process_job(child), Some(job));
+
+    let before = pm.process_count();
+    assert_eq!(
+        pm.create_process_with_job_policy(
+            "denied.exe",
+            Some(parent),
+            None,
+            PROCESS_CREATE_FLAGS_BREAKAWAY,
+            0,
+        ),
+        Err(STATUS_ACCESS_DENIED)
+    );
+    assert_eq!(pm.process_count(), before);
+
+    pm.set_job_extended_limits(
+        job,
+        job::JobExtendedLimits {
+            basic: job::JobBasicLimits {
+                limit_flags: job::JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+                scheduling_class: 5,
+                ..job::JobBasicLimits::default()
+            },
+            ..job::JobExtendedLimits::default()
+        },
+    )
+    .unwrap();
+    let breakaway = pm
+        .create_process_with_job_policy(
+            "breakaway.exe",
+            Some(parent),
+            None,
+            PROCESS_CREATE_FLAGS_BREAKAWAY,
+            0,
+        )
+        .unwrap();
+    assert_eq!(pm.process_job(breakaway), None);
+
+    pm.set_job_extended_limits(
+        job,
+        job::JobExtendedLimits {
+            basic: job::JobBasicLimits {
+                limit_flags: job::JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+                scheduling_class: 5,
+                ..job::JobBasicLimits::default()
+            },
+            ..job::JobExtendedLimits::default()
+        },
+    )
+    .unwrap();
+    let silent = pm
+        .create_process_with_job_policy("silent.exe", Some(parent), None, 0, 0)
+        .unwrap();
+    assert_eq!(pm.process_job(silent), None);
+}
+
+#[test]
+fn process_creation_selects_a_later_job_set_member() {
+    let mut pm = ProcessManager::new();
+    let first = pm.create_job(0).unwrap();
+    let second = pm.create_job(0).unwrap();
+    let third = pm.create_job(0).unwrap();
+    pm.create_job_set(&[(first, 1), (second, 2), (third, 3)])
+        .unwrap();
+    let parent = pm.create_process("parent.exe", None, None);
+    assert_eq!(pm.assign_process_to_job(first, parent), Ok(STATUS_SUCCESS));
+
+    let child = pm
+        .create_process_with_job_policy("level2.exe", Some(parent), None, 0, 2)
+        .unwrap();
+    assert_eq!(pm.process_job(child), Some(second));
+    let before = pm.process_count();
+    assert_eq!(
+        pm.create_process_with_job_policy("same-level.exe", Some(parent), None, 0, 1),
+        Err(STATUS_ACCESS_DENIED)
+    );
+    assert_eq!(pm.process_count(), before);
+}
+
+#[test]
+fn process_creation_inherits_only_marked_handles_at_the_same_values() {
+    let mut pm = ProcessManager::new();
+    let parent = pm.create_process("parent.exe", None, None);
+    let child = pm
+        .create_process_with_job_policy(
+            "child.exe",
+            Some(parent),
+            None,
+            PROCESS_CREATE_FLAGS_INHERIT_HANDLES,
+            0,
+        )
+        .unwrap();
+    let skipped = pm
+        .insert_handle(parent, HandleObject::Opaque(0x10), 0x111)
+        .unwrap();
+    let inherited = pm
+        .insert_handle(parent, HandleObject::Opaque(0x20), 0x222)
+        .unwrap();
+    let protected = pm
+        .insert_handle(parent, HandleObject::Opaque(0x30), 0x333)
+        .unwrap();
+    pm.set_handle_flags(
+        parent,
+        inherited,
+        HandleFlags {
+            inherit: true,
+            protect_from_close: false,
+        },
+    )
+    .unwrap();
+    pm.set_handle_flags(
+        parent,
+        protected,
+        HandleFlags {
+            inherit: true,
+            protect_from_close: true,
+        },
+    )
+    .unwrap();
+
+    let snapshot = pm.inheritable_handles(parent).unwrap();
+    assert_eq!(snapshot.len(), 2);
+    for entry in snapshot {
+        assert_eq!(pm.insert_inherited_handle(child, entry), Ok(entry.handle));
+    }
+    assert_eq!(pm.lookup_handle(child, skipped), None);
+    assert_eq!(
+        pm.lookup_handle(child, inherited),
+        Some(HandleObject::Opaque(0x20))
+    );
+    assert_eq!(pm.handle_access(child, inherited), Some(0x222));
+    assert_eq!(
+        pm.handle_flags(child, protected),
+        Some(HandleFlags {
+            inherit: true,
+            protect_from_close: true,
+        })
+    );
+}
+
+#[test]
+fn aborted_process_creation_removes_inherited_job_membership() {
+    let mut pm = ProcessManager::new();
+    let parent = pm.create_process("parent.exe", None, None);
+    let job = pm.create_job(0).unwrap();
+    assert_eq!(pm.assign_process_to_job(job, parent), Ok(STATUS_SUCCESS));
+    let child = pm
+        .create_process_with_job_policy("child.exe", Some(parent), None, 0, 0)
+        .unwrap();
+    assert_eq!(pm.process_job(child), Some(job));
+
+    assert_eq!(pm.abort_process_creation(child).unwrap().job, Some(job));
+    assert!(pm.process(child).is_none());
+    assert_eq!(pm.job_accounting(job).unwrap().active_processes, 1);
+}
+
+#[test]
+fn failed_job_admission_never_publishes_the_child() {
+    let mut pm = ProcessManager::new();
+    let parent = pm.create_process("parent.exe", None, None);
+    let job = pm.create_job(0).unwrap();
+    pm.associate_job_completion_port(
+        job,
+        job::CompletionPortAssociation {
+            port_id: 1,
+            completion_key: 0xCAFE,
+        },
+    )
+    .unwrap();
+    assert_eq!(pm.assign_process_to_job(job, parent), Ok(STATUS_SUCCESS));
+    pm.set_job_basic_limits(
+        job,
+        job::JobBasicLimits {
+            limit_flags: job::JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+            active_process_limit: 1,
+            scheduling_class: 5,
+            ..job::JobBasicLimits::default()
+        },
+    )
+    .unwrap();
+    let before = pm.process_count();
+
+    assert_eq!(
+        pm.create_process_with_job_policy("over-limit.exe", Some(parent), None, 0, 0),
+        Err(job::STATUS_QUOTA_EXCEEDED)
+    );
+    assert_eq!(pm.process_count(), before);
+    let accounting = pm.job_accounting(job).unwrap();
+    assert_eq!(accounting.total_processes, 2);
+    assert_eq!(accounting.active_processes, 1);
+    assert_eq!(
+        pm.take_job_notification().unwrap().message,
+        job::JOB_OBJECT_MSG_NEW_PROCESS
+    );
+    assert_eq!(
+        pm.take_job_notification().unwrap().message,
+        job::JOB_OBJECT_MSG_ACTIVE_PROCESS_LIMIT
+    );
+}
+
+#[test]
+fn final_process_object_deletion_releases_job_membership() {
+    let mut pm = ProcessManager::new();
+    let owner = pm.create_process("owner.exe", None, None);
+    let target = pm.create_process("target.exe", None, None);
+    let tid = pm.create_thread(target, 0x1000, 0, false).unwrap();
+    let job = pm.create_job(0).unwrap();
+    assert_eq!(pm.assign_process_to_job(job, target), Ok(STATUS_SUCCESS));
+    let process_handle = pm
+        .insert_handle(owner, HandleObject::Process(target), PROCESS_ALL_ACCESS)
+        .unwrap();
+    pm.retain_process_wait_reference(target).unwrap();
+    pm.terminate_process(target, 0x55).unwrap();
+
+    assert_eq!(pm.delete_process_object_if_unreferenced(target), None);
+    pm.release_process_wait_reference(target).unwrap();
+    pm.close_handle(owner, process_handle).unwrap();
+    let deleted = pm
+        .delete_process_object_if_unreferenced(target)
+        .expect("the last process and dispatcher references are gone");
+    assert_eq!(deleted.job, Some(job));
+    assert_eq!(deleted.deleted_threads, 1);
+    assert!(pm.process(target).is_none());
+    assert!(pm.thread(tid).is_none());
+    assert!(!pm.job_exists(job));
+    assert_eq!(pm.take_job_destruction().unwrap().id, job);
+}
+
+#[test]
+fn process_create_abis_decode_to_one_internal_contract() {
+    let legacy =
+        decode_process_create_input(&[0, 0, 0, 0x40, 1, 0x101, 0x205, 0x300], false).unwrap();
+    assert_eq!(
+        legacy,
+        ProcessCreateInput {
+            flags: PROCESS_CREATE_FLAGS_BREAKAWAY
+                | PROCESS_CREATE_FLAGS_NO_DEBUG_INHERIT
+                | PROCESS_CREATE_FLAGS_INHERIT_HANDLES,
+            section_handle: 0x100,
+            debug_port: 0x204,
+            exception_port: 0x300,
+            job_member_level: 0,
+        }
+    );
+
+    let extended = decode_process_create_input(
+        &[
+            0,
+            0,
+            0,
+            0x40,
+            PROCESS_CREATE_FLAGS_INHERIT_HANDLES as u64,
+            0x100,
+            0x200,
+            0x300,
+            7,
+        ],
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        extended,
+        ProcessCreateInput {
+            flags: PROCESS_CREATE_FLAGS_INHERIT_HANDLES,
+            section_handle: 0x100,
+            debug_port: 0x200,
+            exception_port: 0x300,
+            job_member_level: 7,
+        }
+    );
+}
+
+#[test]
+fn process_create_abi_rejects_truncated_or_unknown_extended_input() {
+    assert_eq!(
+        decode_process_create_input(&[0; 7], false),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        decode_process_create_input(&[0; 8], true),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    let mut args = [0; 9];
+    args[4] = (PROCESS_CREATE_FLAGS_LEGAL_MASK | 0x20) as u64;
+    assert_eq!(
+        decode_process_create_input(&args, true),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+}
+
+#[test]
+fn process_create_ex_decodes_boolean_without_consuming_dirty_stack_padding() {
+    let mut args = [0; 9];
+    args[8] = 0xfeed_face_105c_3100;
+    assert_eq!(
+        decode_process_create_input(&args, true)
+            .unwrap()
+            .job_member_level,
+        0
+    );
+
+    args[8] = 0xfeed_face_105c_3101;
+    assert_eq!(
+        decode_process_create_input(&args, true)
+            .unwrap()
+            .job_member_level,
+        1
+    );
+}

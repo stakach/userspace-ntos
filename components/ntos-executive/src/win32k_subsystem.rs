@@ -169,8 +169,7 @@ pub const WIN32K_VIDEO_IOCTL_BYTES: usize = (WIN32K_VIDEO_IOCTL_FRAMES as usize)
 /// Dedicated cross-address-space LPC request window. Kernel LPC imports execute inside the win32k
 /// component, while the isolated LPC broker channel belongs to the executive's CSpace. The
 /// component therefore stages one bounded, pointer-free request here and calls the executive pump.
-pub const WIN32K_LPC_VADDR: u64 =
-    WIN32K_VIDEO_IOCTL_VADDR + WIN32K_VIDEO_IOCTL_FRAMES * 0x1000;
+pub const WIN32K_LPC_VADDR: u64 = WIN32K_VIDEO_IOCTL_VADDR + WIN32K_VIDEO_IOCTL_FRAMES * 0x1000;
 pub const WIN32K_LPC_FRAMES: u64 = 1;
 pub const WIN32K_LPC_BYTES: usize = (WIN32K_LPC_FRAMES as usize) * 0x1000;
 /// Bulk client-buffer staging for provider-dispatched win32k calls whose input is data, not just
@@ -179,11 +178,9 @@ pub const WIN32K_LPC_BYTES: usize = (WIN32K_LPC_FRAMES as usize) * 0x1000;
 pub const WIN32K_BULK_ARG_VADDR: u64 = 0x0000_0100_0720_0000;
 pub const WIN32K_BULK_ARG_FRAMES: u64 = 512;
 const _: () = assert!(WIN32K_ARG_VADDR + WIN32K_ARG_FRAMES * 0x1000 <= WIN32K_VIDEO_IOCTL_VADDR);
-const _: () = assert!(
-    WIN32K_VIDEO_IOCTL_VADDR + WIN32K_VIDEO_IOCTL_FRAMES * 0x1000 <= WIN32K_LPC_VADDR
-);
 const _: () =
-    assert!(WIN32K_LPC_VADDR + WIN32K_LPC_FRAMES * 0x1000 <= WIN32K_BULK_ARG_VADDR);
+    assert!(WIN32K_VIDEO_IOCTL_VADDR + WIN32K_VIDEO_IOCTL_FRAMES * 0x1000 <= WIN32K_LPC_VADDR);
+const _: () = assert!(WIN32K_LPC_VADDR + WIN32K_LPC_FRAMES * 0x1000 <= WIN32K_BULK_ARG_VADDR);
 /// Kernel-mode KUSER_SHARED_DATA mapping used by win32k's direct `SharedUserData` reads. User
 /// processes also see the low 0x7FFE0000 alias; win32k, as a kernel driver, reads the canonical
 /// high VA directly (for example TickCount at +0x320).
@@ -3530,8 +3527,7 @@ extern "win64" fn s_lpc_request_port(port_object: u64, message: *const u8) -> i3
     let raw_type = u16::from_le_bytes(frame[4..6].try_into().unwrap());
     let message_type = if raw_type == 0 {
         nt_lpc_abi::msg_type::LPC_DATAGRAM
-    } else if (nt_lpc_abi::msg_type::LPC_DATAGRAM
-        ..=nt_lpc_abi::msg_type::LPC_CLIENT_DIED)
+    } else if (nt_lpc_abi::msg_type::LPC_DATAGRAM..=nt_lpc_abi::msg_type::LPC_CLIENT_DIED)
         .contains(&raw_type)
     {
         raw_type
@@ -3539,8 +3535,16 @@ extern "win64" fn s_lpc_request_port(port_object: u64, message: *const u8) -> i3
         return STATUS_INVALID_PARAMETER_I32;
     };
     frame[4..6].copy_from_slice(&message_type.to_le_bytes());
-    frame[8..16].copy_from_slice(&WIN32K_CURRENT_PROCESS_ID.load(Ordering::Relaxed).to_le_bytes());
-    frame[16..24].copy_from_slice(&WIN32K_CURRENT_THREAD_ID.load(Ordering::Relaxed).to_le_bytes());
+    frame[8..16].copy_from_slice(
+        &WIN32K_CURRENT_PROCESS_ID
+            .load(Ordering::Relaxed)
+            .to_le_bytes(),
+    );
+    frame[16..24].copy_from_slice(
+        &WIN32K_CURRENT_THREAD_ID
+            .load(Ordering::Relaxed)
+            .to_le_bytes(),
+    );
 
     unsafe { request_lpc_service(LPC_SERVICE_REQUEST_PORT, port_object, &frame[..total]) }
 }
@@ -3556,10 +3560,7 @@ unsafe fn request_lpc_service(operation: u32, port_handle: u64, message: &[u8]) 
     let sh = WIN32K_LPC_VADDR;
     write_volatile((sh + LPC_SERVICE_PORT_HANDLE) as *mut u64, port_handle);
     write_volatile((sh + LPC_SERVICE_OPERATION) as *mut u32, operation);
-    write_volatile(
-        (sh + LPC_SERVICE_STATUS) as *mut i32,
-        0xC000_0001u32 as i32,
-    );
+    write_volatile((sh + LPC_SERVICE_STATUS) as *mut i32, 0xC000_0001u32 as i32);
     write_volatile(
         (sh + LPC_SERVICE_MESSAGE_LEN) as *mut u32,
         message.len() as u32,
@@ -3583,14 +3584,15 @@ pub(crate) unsafe fn service_lpc_request() -> i32 {
 
     let status = match operation {
         LPC_SERVICE_QUERY_HANDLE if message_len == 0 => match lpc_client() {
-            Some(lpc) => lpc.query_handle(port_handle).map(|_| 0).unwrap_or_else(|s| s.raw()),
+            Some(lpc) => lpc
+                .query_handle(port_handle)
+                .map(|_| 0)
+                .unwrap_or_else(|s| s.raw()),
             None => 0xC000_0001u32 as i32,
         },
         LPC_SERVICE_REQUEST_PORT if message_len <= LPC_SERVICE_MESSAGE_CAP => {
-            let bytes = core::slice::from_raw_parts(
-                (sh + LPC_SERVICE_MESSAGE) as *const u8,
-                message_len,
-            );
+            let bytes =
+                core::slice::from_raw_parts((sh + LPC_SERVICE_MESSAGE) as *const u8, message_len);
             let header = bytes.get(..4).and_then(|header| header.try_into().ok());
             let valid = header
                 .and_then(nt_lpc_abi::port_message_total_length)

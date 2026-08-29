@@ -867,7 +867,11 @@ impl JobStore {
         self.jobs
             .iter()
             .flatten()
-            .find(|job| job.set_head == Some(head) && job.member_level == requested_level)
+            .find(|job| {
+                job.id != parent
+                    && job.set_head == Some(head)
+                    && job.member_level == requested_level
+            })
             .map(|job| job.id)
             .ok_or(STATUS_ACCESS_DENIED)
     }

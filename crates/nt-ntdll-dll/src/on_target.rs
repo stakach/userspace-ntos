@@ -1661,9 +1661,7 @@ unsafe fn allocate_static_tls_block(
         };
     }
     if entry.zero_fill_size != 0 {
-        unsafe {
-            core::ptr::write_bytes(block.add(entry.raw_data_size), 0, entry.zero_fill_size)
-        };
+        unsafe { core::ptr::write_bytes(block.add(entry.raw_data_size), 0, entry.zero_fill_size) };
     }
     Ok(block)
 }
@@ -1769,8 +1767,7 @@ pub unsafe fn free_current_thread_static_tls() {
 #[cfg(target_arch = "x86_64")]
 unsafe fn forget_unloaded_module_static_tls(base: u64) {
     let removed = unsafe {
-        (&mut *core::ptr::addr_of_mut!(STATIC_TLS_CATALOG))
-            .forget_module_preserving_index(base)
+        (&mut *core::ptr::addr_of_mut!(STATIC_TLS_CATALOG)).forget_module_preserving_index(base)
     };
     let Some(entry) = removed else {
         return;
@@ -2148,15 +2145,7 @@ unsafe fn snap_descriptor_against(
             } else {
                 // by ordinal.
                 let ord = (thunk & 0xffff) as u32;
-                resolve_export_addr(
-                    dep_base,
-                    true,
-                    &[],
-                    ord,
-                    table,
-                    &mut out.status,
-                    0,
-                )
+                resolve_export_addr(dep_base, true, &[], ord, table, &mut out.status, 0)
             };
             if out.status != 0 {
                 core::ptr::write_unaligned(
@@ -2357,25 +2346,9 @@ unsafe fn resolve_export_addr(
                 }
                 ord = ord * 10 + (c - b'0') as u32;
             }
-            resolve_export_addr(
-                tbase,
-                true,
-                &[],
-                ord,
-                table,
-                load_status,
-                depth + 1,
-            )
+            resolve_export_addr(tbase, true, &[], ord, table, load_status, depth + 1)
         } else {
-            resolve_export_addr(
-                tbase,
-                false,
-                sym_part,
-                0,
-                table,
-                load_status,
-                depth + 1,
-            )
+            resolve_export_addr(tbase, false, sym_part, 0, table, load_status, depth + 1)
         }
     }
 }
@@ -2516,14 +2489,15 @@ impl ImportReferenceLedgerBox {
             return Err(STATUS_NO_MEMORY as u32);
         }
         unsafe {
-            core::ptr::write(ptr, nt_ntdll::loader::lifecycle::ImportReferenceLedger::new());
+            core::ptr::write(
+                ptr,
+                nt_ntdll::loader::lifecycle::ImportReferenceLedger::new(),
+            );
         }
         Ok(Self { ptr })
     }
 
-    fn as_ref(
-        &self,
-    ) -> &nt_ntdll::loader::lifecycle::ImportReferenceLedger<MODULE_TABLE_CAP> {
+    fn as_ref(&self) -> &nt_ntdll::loader::lifecycle::ImportReferenceLedger<MODULE_TABLE_CAP> {
         unsafe { &*self.ptr }
     }
 
@@ -2634,12 +2608,11 @@ unsafe fn publish_import_reference_edges(
             deferred += 1;
             continue;
         }
-        let (count_ptr, next) = match unsafe {
-            crate::exports::ldr_plan_module_reference(base, false)
-        } {
-            Ok(plan) => plan,
-            Err(status) => return status,
-        };
+        let (count_ptr, next) =
+            match unsafe { crate::exports::ldr_plan_module_reference(base, false) } {
+                Ok(plan) => plan,
+                Err(status) => return status,
+            };
         unsafe {
             core::ptr::write(count_ptrs.add(planned), count_ptr as u64);
             core::ptr::write(next_counts.add(planned), next);
@@ -3073,8 +3046,7 @@ unsafe fn snap_module(
                     increment_existing_reference: dep_base != 0,
                 };
                 if dep_base == 0 {
-                    edge =
-                        load_and_snap_dependency(dep_name, ntdll_base, table, out, depth + 1);
+                    edge = load_and_snap_dependency(dep_name, ntdll_base, table, out, depth + 1);
                     dep_base = edge.base;
                     if out.status != 0 {
                         core::ptr::write_unaligned(
@@ -3086,14 +3058,7 @@ unsafe fn snap_module(
                     }
                 }
                 if dep_base != 0 {
-                    snap_descriptor_against(
-                        image_base,
-                        ilt_rva,
-                        ft,
-                        dep_base,
-                        table,
-                        out,
-                    );
+                    snap_descriptor_against(image_base, ilt_rva, ft, dep_base, table, out);
                     if out.status != 0 {
                         return;
                     }
@@ -4158,9 +4123,7 @@ unsafe fn collect_reference_releases(
             let mut name = [0u8; 32];
             let length = unsafe { import_desc_basename(base, name_rva, &mut name) };
             let dependency = unsafe { (&*table).find(&name[..length]) };
-            if dependency >= 0x1_0000
-                && !dependencies[..dependency_count].contains(&dependency)
-            {
+            if dependency >= 0x1_0000 && !dependencies[..dependency_count].contains(&dependency) {
                 if dependency_count == MODULE_TABLE_CAP {
                     return 0xC000_0017;
                 }
@@ -4180,8 +4143,9 @@ unsafe fn collect_reference_releases(
         if !ledger.record(dependency) {
             return 0xC000_0017;
         }
-        let status =
-            unsafe { collect_reference_releases(table, dependency, ledger, visited, visited_count) };
+        let status = unsafe {
+            collect_reference_releases(table, dependency, ledger, visited, visited_count)
+        };
         if status != 0 {
             return status;
         }
@@ -4431,15 +4395,9 @@ pub unsafe fn data_directory_pub(base: u64, idx: u64) -> (u32, u32) {
 
 /// The NATIVE seL4-Call transport primitive (ntdll_plan Step 6.A). Builds the NT_NATIVE_SYSCALL
 /// REQUEST message and issues a real native seL4 `Call(CT_FAULT)`:
-///   MR0=SSN, MR1=caller-rsp, MR2=a1, MR3=a2, MR4=a3, MR5=a4  (a5/a6 → stack at [rsp+0x28/0x30]).
-/// The executive Recv's it (label 0x4E54), decodes SSN+args (reading a5+ AND writing stack out-params
-/// through its stack mirror — hence MR1=rsp), services via ExecNtHandler, and replies MR0=NTSTATUS.
-///
-/// The stack args a5/a6 are placed at `[rsp+0x28]/[rsp+0x30]` exactly as the Windows x64 ABI + the
-/// trap path do, and `rsp` is captured into MR1 AFTER reserving that frame — so the executive's
-/// `smss_stack_read(rsp+0x28+…)` finds them. All register out-params (`&base`/`&handle`/…) are
-/// pointers into the caller's mapped stack, written by the executive through the same mirror — no
-/// out-param-in-reply needed for this transport cut (that layers on later).
+///   MR0=SSN, MR1=caller-rsp, MR2 onward=the complete argument vector.
+/// The native transport gathers stack arguments into the IPC buffer before calling the executive;
+/// it never relies on a cross-address-space stack alias for syscall values.
 ///
 /// # Safety
 /// On-target hosted-process; args satisfy the service contract; register out-param pointers are
@@ -4465,13 +4423,58 @@ unsafe fn current_native_ipc_buffer_va() -> u64 {
     nt_ntdll::abi::native_ipc_buffer_va(teb)
 }
 
+#[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
+#[inline]
+unsafe fn stage_native_arguments(ipcbuf: u64, a3: u64, a4: u64, tail: &[u64]) {
+    // IPC word 0 is msginfo; MR i starts at word i+1.
+    unsafe {
+        core::ptr::write_volatile((ipcbuf + 0x28) as *mut u64, a3);
+        core::ptr::write_volatile((ipcbuf + 0x30) as *mut u64, a4);
+        for (index, argument) in tail.iter().copied().enumerate() {
+            core::ptr::write_volatile((ipcbuf + 0x38 + index as u64 * 8) as *mut u64, argument);
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
+#[inline]
+unsafe fn native_call_marshaled(ssn: u32, a1: u64, a2: u64, argc: u8) -> u64 {
+    let request = [
+        ssn as u64,
+        a1,
+        a2,
+        nt_ntdll::abi::native_syscall_message_info(argc),
+    ];
+    let status: u64;
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "mov r10, [{request} + 0x00]", // MR0 = SSN
+            "mov r9,  [{request} + 0x08]", // MR2 = a1
+            "mov r15, [{request} + 0x10]", // MR3 = a2
+            "mov rsi, [{request} + 0x18]", // exact message info
+            "mov r8, rsp",                 // MR1 = current caller stack
+            "mov edi, 6",                  // rdi = CT_FAULT cap slot
+            "mov rdx, -1",                 // rdx = SysCall
+            "syscall",
+            "movabs rax, {retry_reply}",
+            "cmp r10, rax",
+            "je 2b",
+            "mov {status}, r10",
+            request = in(reg) request.as_ptr(),
+            status = out(reg) status,
+            retry_reply = const nt_ntdll::abi::NT_NATIVE_RETRY_REPLY,
+            out("rax") _, out("rcx") _, out("r11") _, out("r8") _, out("r9") _,
+            out("r10") _, out("rsi") _, out("rdi") _, out("rdx") _, out("r15") _,
+        );
+    }
+    status
+}
+
 /// The general NATIVE seL4-Call transport primitive (ntdll_plan Step 6.A) — up to 8 args.
 ///
-/// Register-pressure discipline: only the essential values are held live across the asm. MR4/MR5
-/// (a3/a4) are written to the IPC buffer with plain Rust BEFORE the asm; the 4 register message
-/// words + the stack args (a5..a8) are passed through a small on-stack `req` array which the asm
-/// reads (a single `in(reg)` pointer), and the asm copies a5..a8 to `[rsp+0x28..0x40]` (the Windows
-/// x64 ABI stack-arg slots the executive's mirror reads) then Calls.
+/// MR4 onward is staged in the thread's bound IPC buffer before the Call. The common primitive keeps
+/// only SSN, arg1, arg2, and exact message length live across the assembly boundary.
 ///
 /// # Safety
 /// On-target hosted-process; the register out-param pointers (in a1..a4) are valid stack locals.
@@ -4489,62 +4492,15 @@ unsafe fn native_syscall8(
     a7: u64,
     a8: u64,
 ) -> u64 {
-    // MR4/MR5 = a3/a4 into this thread's IPC buffer (plain Rust — no live registers across Call).
-    // SAFETY: GS names this thread's initialized TEB; the derived VA is its bound IPC-buffer frame.
     let ipcbuf = unsafe { current_native_ipc_buffer_va() };
     unsafe {
-        core::ptr::write_volatile((ipcbuf + 0x28) as *mut u64, a3);
-        core::ptr::write_volatile((ipcbuf + 0x30) as *mut u64, a4);
+        stage_native_arguments(ipcbuf, a3, a4, &[a5, a6, a7, a8]);
+        native_call_marshaled(ssn, a1, a2, 8)
     }
-    // The register message words + the stack args, laid out for the asm to consume via ONE pointer:
-    //   [0]=SSN(MR0)  [1]=a1(MR2)  [2]=a2(MR3)  [3]=a5  [4]=a6  [5]=a7  [6]=a8
-    let req: [u64; 7] = [ssn as u64, a1, a2, a5, a6, a7, a8];
-    let status: u64;
-    // SAFETY: a native seL4 Call serviced by the executive. `req` is a valid readable stack array;
-    // the asm reserves the ABI stack frame, copies a5..a8 to [rsp+0x28..0x40] (the mirror-read
-    // slots), sets the register message (MR0=r10, MR1=rsp, MR2=r9, MR3=r15), and Calls. rsp (MR1) is
-    // captured AFTER the frame reservation so the executive's `sp+0x28` reads land on a5..a8.
-    unsafe {
-        core::arch::asm!(
-            "sub rsp, 0x48",
-            "mov rax, [{req} + 0x18]",          // a5
-            "mov [rsp+0x28], rax",
-            "mov rax, [{req} + 0x20]",          // a6
-            "mov [rsp+0x30], rax",
-            "mov rax, [{req} + 0x28]",          // a7
-            "mov [rsp+0x38], rax",
-            "mov rax, [{req} + 0x30]",          // a8
-            "mov [rsp+0x40], rax",
-            "2:",
-            "mov r10, [{req} + 0x00]",          // MR0 = SSN
-            "mov r9,  [{req} + 0x08]",          // MR2 = a1
-            "mov r15, [{req} + 0x10]",          // MR3 = a2
-            "mov r8, rsp",                      // MR1 = caller rsp (points at the reserved frame)
-            "mov edi, 6",                       // rdi = CT_FAULT cap slot
-            "mov esi, 0x04E54006",              // rsi = (0x4E54<<12)|6 = label 0x4E54, length 6
-            "mov rdx, -1",                      // rdx = SysCall
-            "syscall",
-            "movabs rax, {retry_reply}",
-            "cmp r10, rax",
-            "je 2b",
-            "add rsp, 0x48",
-            "mov {status}, r10",                // reply MR0 = NTSTATUS (IPC return ABI: r10)
-            req = in(reg) req.as_ptr(),
-            status = out(reg) status,
-            retry_reply = const nt_ntdll::abi::NT_NATIVE_RETRY_REPLY,
-            out("rax") _, out("rcx") _, out("r11") _, out("r8") _, out("r9") _,
-            out("r10") _, out("rsi") _, out("rdi") _, out("rdx") _, out("r15") _,
-        );
-    }
-    status
 }
 
 /// `NtMapViewOfSection` (10 args) over the NATIVE seL4-Call transport. Same message shape as
-/// [`native_syscall8`] (MR0=SSN, MR1=rsp, MR2=a1, MR3=a2, MR4=a3, MR5=a4) but the SIX tail args
-/// (a5..a10 = commit_size/section_offset/view_size/inherit/alloc_type/protect) go on the stack at
-/// `[rsp+0x28..0x50]` — the exact slots the executive's map handler reads (a5=`sp+0x28`,
-/// a6/SectionOffset=`sp+0x30`, a7/ViewSize=`sp+0x38`, …). a3 (*BaseAddress) lands in MR4 →
-/// `set_recv_mr(7)` → the `get_recv_mr(7)` the handler reads.
+/// [`native_syscall8`] with the six tail arguments staged as MR6..MR11.
 ///
 /// # Safety
 /// On-target hosted-process; the out-param pointers (base_address/view_size) are valid stack locals.
@@ -4552,73 +4508,15 @@ unsafe fn native_syscall8(
 #[inline]
 #[allow(clippy::too_many_arguments)]
 unsafe fn native_map_view(a1: u64, a2: u64, a3: u64, a4: u64, tail: [u64; 6]) -> u64 {
-    // MR4/MR5 = a3/a4 into this thread's IPC buffer (plain Rust — no live registers across Call).
-    // SAFETY: GS names this thread's initialized TEB; the derived VA is its bound IPC-buffer frame.
     let ipcbuf = unsafe { current_native_ipc_buffer_va() };
     unsafe {
-        core::ptr::write_volatile((ipcbuf + 0x28) as *mut u64, a3);
-        core::ptr::write_volatile((ipcbuf + 0x30) as *mut u64, a4);
+        stage_native_arguments(ipcbuf, a3, a4, &tail);
+        native_call_marshaled(SSN_NT_MAP_VIEW_OF_SECTION, a1, a2, 10)
     }
-    // req: [0]=SSN(MR0) [1]=a1(MR2) [2]=a2(MR3) [3..9]=the six stack tail args.
-    let req: [u64; 9] = [
-        SSN_NT_MAP_VIEW_OF_SECTION as u64,
-        a1,
-        a2,
-        tail[0],
-        tail[1],
-        tail[2],
-        tail[3],
-        tail[4],
-        tail[5],
-    ];
-    let status: u64;
-    // SAFETY: a native seL4 Call serviced by the executive. `req` is a valid readable stack array;
-    // the asm reserves the ABI frame, copies the 6 tail args to [rsp+0x28..0x50] (the mirror-read
-    // slots), sets the register message (MR0=r10, MR1=rsp, MR2=r9, MR3=r15), and Calls.
-    unsafe {
-        core::arch::asm!(
-            "sub rsp, 0x58",
-            "mov rax, [{req} + 0x18]", // tail[0] (a5)
-            "mov [rsp+0x28], rax",
-            "mov rax, [{req} + 0x20]", // tail[1] (a6)
-            "mov [rsp+0x30], rax",
-            "mov rax, [{req} + 0x28]", // tail[2] (a7)
-            "mov [rsp+0x38], rax",
-            "mov rax, [{req} + 0x30]", // tail[3] (a8)
-            "mov [rsp+0x40], rax",
-            "mov rax, [{req} + 0x38]", // tail[4] (a9)
-            "mov [rsp+0x48], rax",
-            "mov rax, [{req} + 0x40]", // tail[5] (a10)
-            "mov [rsp+0x50], rax",
-            "2:",
-            "mov r10, [{req} + 0x00]", // MR0 = SSN
-            "mov r9,  [{req} + 0x08]", // MR2 = a1
-            "mov r15, [{req} + 0x10]", // MR3 = a2
-            "mov r8, rsp",             // MR1 = caller rsp
-            "mov edi, 6",              // rdi = CT_FAULT cap slot
-            "mov esi, 0x04E54006",     // rsi = (0x4E54<<12)|6
-            "mov rdx, -1",             // rdx = SysCall
-            "syscall",
-            "movabs rax, {retry_reply}",
-            "cmp r10, rax",
-            "je 2b",
-            "add rsp, 0x58",
-            "mov {status}, r10",
-            req = in(reg) req.as_ptr(),
-            status = out(reg) status,
-            retry_reply = const nt_ntdll::abi::NT_NATIVE_RETRY_REPLY,
-            out("rax") _, out("rcx") _, out("r11") _, out("r8") _, out("r9") _,
-            out("r10") _, out("rsi") _, out("rdi") _, out("rdx") _, out("r15") _,
-        );
-    }
-    status
 }
 
 /// `NtSecureConnectPort` (9 args) over the NATIVE seL4-Call transport. Same message shape as
-/// [`native_syscall8`] / [`native_map_view`] (MR0=SSN, MR1=rsp, MR2=a1, MR3=a2, MR4=a3, MR5=a4) but
-/// the FIVE tail args (a5..a9 = ServerSid/ServerView/MaxMessageLength/ConnectionInformation/
-/// ConnectionInformationLength) go on the stack at `[rsp+0x28..0x50]` — the exact slots the
-/// executive's generic native dispatcher reads (a8/ConnectionInformation = `sp+0x40`).
+/// [`native_syscall8`] / [`native_map_view`] with the five tail arguments staged as MR6..MR10.
 ///
 /// # Safety
 /// On-target hosted-process; the pointer args (PortHandle/PortName/Qos/ClientView/ConnInfo) are valid
@@ -4627,63 +4525,11 @@ unsafe fn native_map_view(a1: u64, a2: u64, a3: u64, a4: u64, tail: [u64; 6]) ->
 #[inline]
 #[allow(clippy::too_many_arguments)]
 unsafe fn native_secure_connect_port(a1: u64, a2: u64, a3: u64, a4: u64, tail: [u64; 5]) -> u64 {
-    // MR4/MR5 = a3/a4 into this thread's IPC buffer (plain Rust — no live registers across Call).
-    // SAFETY: GS names this thread's initialized TEB; the derived VA is its bound IPC-buffer frame.
     let ipcbuf = unsafe { current_native_ipc_buffer_va() };
     unsafe {
-        core::ptr::write_volatile((ipcbuf + 0x28) as *mut u64, a3);
-        core::ptr::write_volatile((ipcbuf + 0x30) as *mut u64, a4);
+        stage_native_arguments(ipcbuf, a3, a4, &tail);
+        native_call_marshaled(SSN_NT_SECURE_CONNECT_PORT, a1, a2, 9)
     }
-    // req: [0]=SSN(MR0) [1]=a1(MR2) [2]=a2(MR3) [3..8]=the five stack tail args (a5..a9).
-    let req: [u64; 8] = [
-        SSN_NT_SECURE_CONNECT_PORT as u64,
-        a1,
-        a2,
-        tail[0],
-        tail[1],
-        tail[2],
-        tail[3],
-        tail[4],
-    ];
-    let status: u64;
-    // SAFETY: a native seL4 Call serviced by the executive. `req` is a valid readable stack array;
-    // the asm reserves the ABI frame, copies the 5 tail args to [rsp+0x28..0x50] (the mirror-read
-    // slots), sets the register message (MR0=r10, MR1=rsp, MR2=r9, MR3=r15), and Calls.
-    unsafe {
-        core::arch::asm!(
-            "sub rsp, 0x58",
-            "mov rax, [{req} + 0x18]", // tail[0] (a5)
-            "mov [rsp+0x28], rax",
-            "mov rax, [{req} + 0x20]", // tail[1] (a6)
-            "mov [rsp+0x30], rax",
-            "mov rax, [{req} + 0x28]", // tail[2] (a7)
-            "mov [rsp+0x38], rax",
-            "mov rax, [{req} + 0x30]", // tail[3] (a8 = ConnectionInformation)
-            "mov [rsp+0x40], rax",
-            "mov rax, [{req} + 0x38]", // tail[4] (a9 = ConnectionInformationLength)
-            "mov [rsp+0x48], rax",
-            "2:",
-            "mov r10, [{req} + 0x00]", // MR0 = SSN
-            "mov r9,  [{req} + 0x08]", // MR2 = a1
-            "mov r15, [{req} + 0x10]", // MR3 = a2
-            "mov r8, rsp",             // MR1 = caller rsp
-            "mov edi, 6",              // rdi = CT_FAULT cap slot
-            "mov esi, 0x04E54006",     // rsi = (0x4E54<<12)|6
-            "mov rdx, -1",             // rdx = SysCall
-            "syscall",
-            "movabs rax, {retry_reply}",
-            "cmp r10, rax",
-            "je 2b",
-            "add rsp, 0x58",
-            "mov {status}, r10",
-            req = in(reg) req.as_ptr(),
-            status = out(reg) status,
-            retry_reply = const nt_ntdll::abi::NT_NATIVE_RETRY_REPLY,
-            out("rax") _, out("rcx") _, out("r11") _, out("r8") _, out("r9") _,
-            out("r10") _, out("rsi") _, out("rdi") _, out("rdx") _, out("r15") _,
-        );
-    }
-    status
 }
 
 /// `NtSecureConnectPort` over the TRAP transport. This is the same Windows x64 ABI shape as
@@ -11988,9 +11834,6 @@ const SSN_NT_CREATE_SECTION: u32 = 52;
 /// `NtOpenFile` SSN.
 #[cfg(target_arch = "x86_64")]
 const SSN_NT_OPEN_FILE: u32 = 122;
-/// `NtCreateProcessEx` SSN (the imported create; 49's args are a prefix — see ntdll_plan Step 2c).
-#[cfg(target_arch = "x86_64")]
-const SSN_NT_CREATE_PROCESS_EX: u32 = 50;
 /// `NtQuerySection` SSN.
 #[cfg(target_arch = "x86_64")]
 const SSN_NT_QUERY_SECTION: u32 = 175;
@@ -12157,23 +12000,26 @@ pub unsafe fn rtl_create_user_process(
     //     SectionHandle, DebugPort, ExceptionPort, JobMemberLevel=0). ---
     // (ZwCreateProcess in process.c maps to NtCreateProcessEx=50, the imported stub — the executive's
     // SSN-50 arm reads these; 49's args are a prefix.)
-    // SAFETY: on-target syscall; ph_ptr is the caller's out-handle slot (written via the mirror).
+    type NtCreateProcessEx =
+        unsafe extern "system" fn(*mut u64, u32, u64, u64, u32, u64, u64, u64, u32) -> u32;
+    // SAFETY: forward the exact Windows x64 ABI to our canonical generated NtCreateProcessEx stub.
+    // The naked stub preserves the compiler-built caller frame, including JobMemberLevel at the
+    // fifth stack-argument slot, across both native seL4-Call and UnknownSyscall transports.
     let st = unsafe {
-        native_syscall_ge5(
-            SSN_NT_CREATE_PROCESS_EX,
-            &[
-                ph_ptr as u64,
-                PROCESS_ALL_ACCESS,
-                0, // ObjectAttributes
-                parent,
-                (inherit_handles != 0) as u64, // Flags: InheritHandles → PS_INHERIT_HANDLES bit path
-                h_section,
-                debug_port,
-                exception_port,
-                0, // JobMemberLevel
-            ],
+        core::mem::transmute::<unsafe extern "C" fn(), NtCreateProcessEx>(
+            nt_ntdll::trap_stubs::nt_create_process_ex,
+        )(
+            ph_ptr,
+            PROCESS_ALL_ACCESS as u32,
+            0,
+            parent,
+            if inherit_handles != 0 { 0x4 } else { 0 },
+            h_section,
+            debug_port,
+            exception_port,
+            0,
         )
-    } as u32;
+    };
     if (st as i32) < 0 {
         // SAFETY: close the section on failure.
         unsafe { syscall4(27, h_section, 0, 0, 0) };
@@ -12410,21 +12256,6 @@ unsafe fn nt_write_virtual_memory(
 /// `NtWriteVirtualMemory` SSN (shared table).
 #[cfg(target_arch = "x86_64")]
 const SSN_NT_WRITE_VIRTUAL_MEMORY_REAL: u32 = 287;
-
-/// `NtCreateProcessEx` has 9 args (the 9th = JobMemberLevel). We drive it via [`syscall8`] with the
-/// first 8 args; the executive's SSN-50 arm reads args 1..8 (JobMemberLevel=0 is the common case and
-/// the 8-arg window carries SectionHandle/DebugPort/ExceptionPort). If a non-zero JobMemberLevel is
-/// ever needed a 9-arg native stub can be added; smss always passes 0.
-///
-/// # Safety
-/// On-target syscall; `args` satisfies the target's contract (≥ 8 entries expected).
-#[cfg(target_arch = "x86_64")]
-unsafe fn native_syscall_ge5(ssn: u32, args: &[u64]) -> u64 {
-    let a = |i: usize| *args.get(i).unwrap_or(&0);
-    // SAFETY: on-target; a1..a4 → registers, a5..a8 → stack tail (the mirror-read slots). arg 9
-    // (JobMemberLevel) is 0 for every smss create — not carried.
-    unsafe { syscall8(ssn, a(0), a(1), a(2), a(3), a(4), a(5), a(6), a(7)) }
-}
 
 /// Suppress "unused" for the c_void alias on non-target hosts (the module is target-gated in use).
 #[allow(dead_code)]

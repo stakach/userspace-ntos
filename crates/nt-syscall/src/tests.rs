@@ -680,6 +680,7 @@ fn group_c_ladder_migrations_register() {
         (NativeService::NtCreateSection, 52),
         (NativeService::NtMapViewOfSection, 113),
         (NativeService::NtCreateProcess, 49),
+        (NativeService::NtCreateProcessEx, 50),
     ];
     let t = NativeServiceTable::from_numbers(UserlandAbiProfile::Windows7, &pairs);
     assert_eq!(t.len(), pairs.len());
