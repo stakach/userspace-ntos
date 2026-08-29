@@ -559,25 +559,17 @@ impl JobStore {
                 notification: job.notification(JOB_OBJECT_MSG_ACTIVE_PROCESS_LIMIT, 0),
             });
         }
-        let process_memory_over = job.basic_limits.limit_flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY
-            != 0
-            && initial_commit_bytes > job.extended_limits.process_memory_limit;
         let job_memory_over = job.basic_limits.limit_flags & JOB_OBJECT_LIMIT_JOB_MEMORY != 0
             && next_job_memory > job.extended_limits.job_memory_limit;
-        if process_memory_over || job_memory_over {
+        if job_memory_over {
             let member = job.members.last_mut().expect("just inserted job member");
             member.active = false;
             member.forced_termination = true;
             member.memory_limit_reported = true;
             job.accounting.active_processes -= 1;
-            let message = if process_memory_over {
-                JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT
-            } else {
-                JOB_OBJECT_MSG_JOB_MEMORY_LIMIT
-            };
             return Ok(JobAssignment {
                 status: STATUS_QUOTA_EXCEEDED,
-                notification: job.notification(message, process_id),
+                notification: job.notification(JOB_OBJECT_MSG_JOB_MEMORY_LIMIT, process_id),
             });
         }
         let member = job.members.last_mut().expect("just inserted job member");
@@ -1043,23 +1035,13 @@ impl JobStore {
             let next_job_bytes = previous_job_bytes
                 .checked_add(bytes)
                 .ok_or(STATUS_COMMITMENT_LIMIT)?;
-            let process_limit_reached =
-                job.basic_limits.limit_flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY != 0
-                    && next_process_bytes > job.extended_limits.process_memory_limit;
             let job_limit_reached = job.basic_limits.limit_flags & JOB_OBJECT_LIMIT_JOB_MEMORY != 0
                 && next_job_bytes > job.extended_limits.job_memory_limit;
-            if process_limit_reached || job_limit_reached {
+            if job_limit_reached {
                 let member = &mut job.members[member_index];
                 if !member.memory_limit_reported {
                     member.memory_limit_reported = true;
-                    notification = job.notification(
-                        if process_limit_reached {
-                            JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT
-                        } else {
-                            JOB_OBJECT_MSG_JOB_MEMORY_LIMIT
-                        },
-                        process_id,
-                    );
+                    notification = job.notification(JOB_OBJECT_MSG_JOB_MEMORY_LIMIT, process_id);
                 }
                 Err(STATUS_COMMITMENT_LIMIT)
             } else {
@@ -1075,6 +1057,29 @@ impl JobStore {
         };
         self.queue_notification(notification);
         result
+    }
+
+    pub fn report_process_memory_limit(&mut self, process_id: ProcessId) -> Result<(), u32> {
+        let id = self
+            .job_for_process(process_id)
+            .ok_or(crate::STATUS_INVALID_HANDLE)?;
+        let mut notification = None;
+        {
+            let job = self.get_mut(id).ok_or(crate::STATUS_INVALID_HANDLE)?;
+            let member_index = job
+                .members
+                .iter()
+                .position(|member| member.process_id == process_id && member.active)
+                .ok_or(crate::STATUS_INVALID_HANDLE)?;
+            if job.basic_limits.limit_flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY != 0
+                && !job.members[member_index].memory_limit_reported
+            {
+                job.members[member_index].memory_limit_reported = true;
+                notification = job.notification(JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT, process_id);
+            }
+        }
+        self.queue_notification(notification);
+        Ok(())
     }
 
     pub fn commit_memory_charge(&mut self, plan: JobMemoryChargePlan) -> Result<(), u32> {

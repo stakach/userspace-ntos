@@ -3956,10 +3956,7 @@ fn job_memory_charges_are_transactional_dynamic_and_kernel_accounted() {
     pm.commit_job_memory_charge(first_charge).unwrap();
     assert_eq!(pm.job_memory_usage(first), Ok((0x4000, 0x4000)));
 
-    assert_eq!(
-        pm.prepare_job_memory_charge(first, 0x1000),
-        Err(job::STATUS_COMMITMENT_LIMIT)
-    );
+    pm.report_process_memory_limit_violation(first).unwrap();
     assert_eq!(pm.job_memory_usage(first), Ok((0x4000, 0x4000)));
     let notification = pm.take_job_notification().unwrap();
     assert_eq!(

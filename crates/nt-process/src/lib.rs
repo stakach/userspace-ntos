@@ -3450,6 +3450,13 @@ impl ProcessManager {
         self.jobs.prepare_memory_charge(pid, bytes)
     }
 
+    pub fn report_process_memory_limit_violation(&mut self, pid: ProcessId) -> Result<(), u32> {
+        if !self.processes.contains_key(&pid) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        self.jobs.report_process_memory_limit(pid)
+    }
+
     pub fn commit_job_memory_charge(&mut self, plan: job::JobMemoryChargePlan) -> Result<(), u32> {
         self.jobs.commit_memory_charge(plan)
     }
