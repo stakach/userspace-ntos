@@ -15589,6 +15589,33 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     page except through the explicit free/unmap path that first retires the corresponding record,
     retire all records on final process teardown, and then expose the two native services.
 
+    Executive virtual-memory locks (2026-08-29, implemented; desktop acceptance pending): the
+    executive now owns one growable `VmPageLockTable` keyed by address-space slot and page. SSNs 108
+    and 276 are registered as typed four-argument `NtLockVirtualMemory` and
+    `NtUnlockVirtualMemory` services with no numeric exception or fallback. Both enforce
+    `PROCESS_VM_OPERATION`; `MAP_SYSTEM` additionally checks the caller's enabled
+    `SeLockMemoryPrivilege`. The syscall boundary captures and write-probes the caller's in/out
+    pointers, rejects empty, overflowing, or non-user ranges, and publishes the normalized page
+    range after the internal operation.
+
+    Locking validates the entire mapping before side effects, then makes every private,
+    mapped-section, or image page resident through the shared Mm residency operation before adding
+    either lock class. Repeated classes return `STATUS_WAS_LOCKED` while completing the full range.
+    Unlocking proves that every requested class is still present and resident before clearing any
+    class; incomplete ranges return `STATUS_NOT_LOCKED` without partial mutation. Guarded/no-access
+    pages cannot be newly locked, while an existing lock can still be removed after a protection
+    change.
+
+    Private-frame unmap and image-range unmap now refuse unretired locked pages. Explicit private
+    free/decommit, generic-section unmap, image unmap, and thread-stack release retire the exact
+    range first. Final process teardown retires the owner before releasing views or caps, and the
+    committed-mapping reset boundary does the same before a process slot is reused. Census output
+    reports live pages, capacity, each lock class, allocation failures, and reclamation refusals;
+    the VM headroom gate requires the last two counters to remain zero. Focused validation passes
+    `nt-address-space` `60/60`, `nt-syscall` `70/70`, `git diff --check`, and the freestanding
+    executive check at the established 209-warning baseline. Run the serialized release/desktop
+    acceptance next, then close this item or fix any real regression it exposes.
+
     The same review rejected taking `NtSetSystemTime` (SSN 251) as an isolated replacement target.
     The system clock is currently an immutable boot epoch plus monotonic counter, while native
     timers and the delay, object, keyed-event, I/O-completion, and driver wait queues retain only the

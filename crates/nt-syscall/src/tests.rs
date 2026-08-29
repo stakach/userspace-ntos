@@ -135,6 +135,29 @@ fn filter_token_keeps_native_six_argument_contract() {
 }
 
 #[test]
+fn virtual_memory_lock_services_keep_native_identity() {
+    assert_eq!(NativeService::NtLockVirtualMemory.arg_count(), (4, 4));
+    assert_eq!(NativeService::NtUnlockVirtualMemory.arg_count(), (4, 4));
+    assert_eq!(nt_syscall_abi::ssn_of("NtLockVirtualMemory"), Some(108));
+    assert_eq!(nt_syscall_abi::ssn_of("NtUnlockVirtualMemory"), Some(276));
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[
+            (NativeService::NtLockVirtualMemory, 108),
+            (NativeService::NtUnlockVirtualMemory, 276),
+        ],
+    );
+    assert_eq!(
+        table.lookup(108).map(|entry| entry.service),
+        Some(NativeService::NtLockVirtualMemory)
+    );
+    assert_eq!(
+        table.lookup(276).map(|entry| entry.service),
+        Some(NativeService::NtUnlockVirtualMemory)
+    );
+}
+
+#[test]
 fn callback_return_keeps_native_service_identity() {
     assert_eq!(NativeService::NtCallbackReturn.name(), "NtCallbackReturn");
     assert_eq!(NativeService::NtCallbackReturn.arg_count(), (3, 3));

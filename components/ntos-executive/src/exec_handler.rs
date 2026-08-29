@@ -8757,6 +8757,7 @@ impl ExecNtHandler {
                 return;
             }
         };
+        let _ = vm_page_lock_retire_range(runtime.pi as u64, plan.base, plan.size);
         let mut page = plan.base;
         while page < plan.base + plan.size {
             let old = before.extent_at(page);
@@ -16500,6 +16501,9 @@ impl ExecNtHandler {
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         match plan.source {
             nt_address_space::VmResidencySource::Private => {
+                if plan.page == KUSER_VA && kuser_page_alias_get(target_pi) != 0 {
+                    return Ok(());
+                }
                 if csrss_frame_get_exact(target_pi as u64, plan.page).0 == 0 {
                     vm_map_private_page(
                         target_pi,
@@ -16567,6 +16571,144 @@ impl ExecNtHandler {
                 )
             }
         }
+    }
+
+    unsafe fn capture_virtual_memory_lock_request(
+        &self,
+        args: &[u64],
+        memory: SyscallUserMemory,
+    ) -> Result<(usize, nt_address_space::VmResidencyRangePlan, u32, u64, u64), u32> {
+        const PROCESS_VM_OPERATION: u32 = 0x0008;
+
+        let map_type = nt_ulong_arg(args[3]);
+        nt_address_space::VmPageLockTable::validate_map_type(map_type)?;
+        let base_pointer = args[1];
+        let size_pointer = args[2];
+        if !self.user_memory_probe_output(memory, base_pointer, 8)
+            || !self.user_memory_probe_output(memory, size_pointer, 8)
+        {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let mut encoded = [0u8; 8];
+        if !self.user_memory_read(memory, base_pointer, &mut encoded) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let address = u64::from_le_bytes(encoded);
+        if !self.user_memory_read(memory, size_pointer, &mut encoded) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let size = u64::from_le_bytes(encoded);
+        let range = nt_address_space::VmResidencyRangePlan::new(address, size, USER_ADDRESS_LIMIT)?;
+        let (target_pid, target_pi) =
+            self.resolve_process_for_access(args[0], PROCESS_VM_OPERATION)?;
+        if self.pm.process(target_pid).is_some_and(|process| {
+            matches!(
+                process.state,
+                nt_process::ProcessState::Exiting | nt_process::ProcessState::Terminated
+            )
+        }) {
+            return Err(nt_process::STATUS_PROCESS_IS_TERMINATING);
+        }
+        if map_type & nt_address_space::MAP_SYSTEM != 0
+            && !self.current_token_has_privilege(nt_security::SE_LOCK_MEMORY)
+        {
+            return Err(STATUS_PRIVILEGE_NOT_HELD);
+        }
+        Ok((target_pi, range, map_type, base_pointer, size_pointer))
+    }
+
+    pub(crate) unsafe fn nt_lock_virtual_memory_with_user_memory(
+        &mut self,
+        args: &[u64],
+        memory: SyscallUserMemory,
+    ) -> u32 {
+        let (target_pi, range, map_type, base_pointer, size_pointer) =
+            match self.capture_virtual_memory_lock_request(args, memory) {
+                Ok(request) => request,
+                Err(status) => return status,
+            };
+
+        let status = 'operation: {
+            // Validate the complete mapping before causing any residency side effects. This is the
+            // address-space-lock phase of MiLockVirtualMemory, expressed through the common mapping
+            // classifier instead of separate private/image/section rules.
+            for page in range.pages() {
+                let information = match self.query_memory_basic_information(target_pi, page) {
+                    Ok(information) => information,
+                    Err(status) => break 'operation status,
+                };
+                if let Err(status) = nt_address_space::vm_residency_page_plan(page, information) {
+                    break 'operation status;
+                }
+            }
+            for page in range.pages() {
+                let information = match self.query_memory_basic_information(target_pi, page) {
+                    Ok(information) => information,
+                    Err(status) => break 'operation status,
+                };
+                let plan = match nt_address_space::vm_residency_page_plan(page, information) {
+                    Ok(plan) => plan,
+                    Err(status) => break 'operation status,
+                };
+                if let Err(status) = self.ensure_residency_page(target_pi, plan) {
+                    break 'operation status;
+                }
+            }
+            match vm_page_lock_range(target_pi as u64, range, map_type) {
+                Ok(status) => status,
+                Err(status) => status,
+            }
+        };
+        if !self.user_memory_write(memory, base_pointer, &range.base.to_le_bytes())
+            || !self.user_memory_write(memory, size_pointer, &range.size.to_le_bytes())
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        status
+    }
+
+    pub(crate) unsafe fn nt_unlock_virtual_memory_with_user_memory(
+        &mut self,
+        args: &[u64],
+        memory: SyscallUserMemory,
+    ) -> u32 {
+        let (target_pi, range, map_type, base_pointer, size_pointer) =
+            match self.capture_virtual_memory_lock_request(args, memory) {
+                Ok(request) => request,
+                Err(status) => return status,
+            };
+
+        let status = 'operation: {
+            // Lock exclusion guarantees residency until unlock. Still validate the whole range
+            // first so stale or corrupted lock state cannot permit a partial mutation.
+            for page in range.pages() {
+                let information = match self.query_memory_basic_information(target_pi, page) {
+                    Ok(information) => information,
+                    Err(_) => break 'operation nt_address_space::STATUS_NOT_LOCKED,
+                };
+                if information.state != nt_address_space::MEM_COMMIT
+                    || !matches!(
+                        information.type_,
+                        nt_address_space::MEM_PRIVATE
+                            | nt_address_space::MEM_MAPPED
+                            | nt_address_space::MEM_IMAGE
+                    )
+                    || !vm_page_is_resident(target_pi, page)
+                {
+                    break 'operation nt_address_space::STATUS_NOT_LOCKED;
+                }
+            }
+            match vm_page_unlock_range(target_pi as u64, range, map_type) {
+                Ok(()) => 0,
+                Err(status) => status,
+            }
+        };
+        if !self.user_memory_write(memory, base_pointer, &range.base.to_le_bytes())
+            || !self.user_memory_write(memory, size_pointer, &range.size.to_le_bytes())
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        status
     }
 
     unsafe fn query_memory_basic_information(
@@ -17024,6 +17166,7 @@ impl ExecNtHandler {
             Ok(plan) => plan,
             Err(status) => return status,
         };
+        let _ = vm_page_lock_retire_range(target_pi as u64, plan.base, plan.size);
         let mut page = plan.base;
         while page < plan.base + plan.size {
             let old = before.extent_at(page);
@@ -32730,6 +32873,18 @@ impl ExecNtHandler {
             },
             NativeService::NtFreeVirtualMemory => unsafe { self.nt_free_virtual_memory(args) },
             NativeService::NtFlushVirtualMemory => unsafe { self.nt_flush_virtual_memory(args) },
+            NativeService::NtLockVirtualMemory => unsafe {
+                self.nt_lock_virtual_memory_with_user_memory(
+                    args,
+                    SyscallUserMemory::CurrentProcess,
+                )
+            },
+            NativeService::NtUnlockVirtualMemory => unsafe {
+                self.nt_unlock_virtual_memory_with_user_memory(
+                    args,
+                    SyscallUserMemory::CurrentProcess,
+                )
+            },
             NativeService::NtReadVirtualMemory => unsafe {
                 self.nt_copy_virtual_memory(args, true)
             },
@@ -32778,6 +32933,7 @@ impl ExecNtHandler {
                             Ok(plan) => plan,
                             Err(status) => return status,
                         };
+                        let _ = vm_page_lock_retire_range(target_pi as u64, plan.base, plan.size);
                         let mut page = plan.base;
                         while page < plan.base + plan.size {
                             let old = before.extent_at(page);
@@ -32809,7 +32965,14 @@ impl ExecNtHandler {
                             process_committed_image_allocation(target_pi as u64, image_base);
                         if reg.clear_mapped(target_pi, slot) {
                             if let Some(allocation) = allocation {
-                                vm_unmap_shared_image_mapping_range(
+                                let _ = vm_page_lock_retire_range(
+                                    target_pi as u64,
+                                    allocation.allocation_base,
+                                    allocation
+                                        .allocation_end
+                                        .saturating_sub(allocation.allocation_base),
+                                );
+                                let _ = vm_unmap_shared_image_mapping_range(
                                     target_pi,
                                     allocation.allocation_base,
                                     allocation.allocation_end,

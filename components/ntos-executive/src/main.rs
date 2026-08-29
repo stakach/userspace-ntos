@@ -897,6 +897,7 @@ const _: () = {
 pub const SSN_NT_ALLOCATE_VM: u64 = 0x12;
 /// NtFlushVirtualMemory flushes dirty pages from one mapped data-file view.
 pub const SSN_NT_FLUSH_VM: u64 = 84;
+pub const SSN_NT_LOCK_VM: u64 = 108;
 /// ReactOS x64 `ntoskrnl/sysfuncs.lst` zero-based service numbers for the global atom family.
 pub const SSN_NT_ADD_ATOM: u64 = 8;
 pub const SSN_NT_DELETE_ATOM: u64 = 62;
@@ -969,6 +970,7 @@ pub const SSN_NT_SET_DEBUG_FILTER_STATE: u64 = 222;
 /// Native virtual-memory and process/thread information setters. Process/thread setters are backed
 /// by ProcessManager state; unsupported information classes fail instead of falling back to success.
 pub const SSN_NT_FREE_VM: u64 = 87;
+pub const SSN_NT_UNLOCK_VM: u64 = 276;
 pub const SSN_NT_READ_VM: u64 = 194;
 pub const SSN_NT_WRITE_VM: u64 = 287;
 pub const SSN_NT_SET_INFO_THREAD: u64 = 238;
@@ -1477,6 +1479,9 @@ pub(crate) unsafe fn process_committed_mapping_register(
 }
 
 pub(crate) unsafe fn process_committed_mapping_reset(pi: usize) {
+    // This is an address-space lifetime boundary (fresh VSpace, temporary-slot release, or final
+    // teardown), so no virtual lock may survive into the next owner of this process slot.
+    let _ = vm_page_lock_retire_owner(pi as u64);
     if let Some(table) = process_committed_mapping_table_mut(pi) {
         *table = nt_address_space::VmCommittedRangeTable::new();
     }
@@ -1593,12 +1598,64 @@ static PROCESS_VM_PT_CAP_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
 static mut PROCESS_VM_PT_CAPS: alloc::vec::Vec<[u64; PRIVATE_VM_PT_COUNT]> = alloc::vec::Vec::new();
 static mut VM_FREE_FRAMES: nt_address_space::RecycledFramePool =
     nt_address_space::RecycledFramePool::new();
+static mut VM_PAGE_LOCKS: nt_address_space::VmPageLockTable =
+    nt_address_space::VmPageLockTable::new();
+static VM_LOCK_RECLAIM_REFUSALS: AtomicU64 = AtomicU64::new(0);
 static KUSER_PAGE_ALIAS_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
 static KUSER_PAGE_ALIAS_STORE_FAILURES: AtomicU64 = AtomicU64::new(0);
 static mut KUSER_PAGE_ALIASES: alloc::vec::Vec<AtomicU64> = alloc::vec::Vec::new();
 
 fn vm_free_frame_stats() -> nt_address_space::RecycledFramePoolStats {
     unsafe { (&*core::ptr::addr_of!(VM_FREE_FRAMES)).stats() }
+}
+
+fn vm_page_lock_stats() -> nt_address_space::VmPageLockStats {
+    unsafe { (&*core::ptr::addr_of!(VM_PAGE_LOCKS)).stats() }
+}
+
+unsafe fn vm_page_lock_range(
+    owner: u64,
+    range: nt_address_space::VmResidencyRangePlan,
+    map_type: u32,
+) -> Result<u32, u32> {
+    (&mut *core::ptr::addr_of_mut!(VM_PAGE_LOCKS)).lock_range(owner, range, map_type)
+}
+
+unsafe fn vm_page_unlock_range(
+    owner: u64,
+    range: nt_address_space::VmResidencyRangePlan,
+    map_type: u32,
+) -> Result<(), u32> {
+    (&mut *core::ptr::addr_of_mut!(VM_PAGE_LOCKS)).unlock_range(owner, range, map_type)
+}
+
+unsafe fn vm_page_lock_is_locked(owner: u64, page: u64) -> bool {
+    (&*core::ptr::addr_of!(VM_PAGE_LOCKS)).is_locked(owner, page)
+}
+
+unsafe fn vm_page_lock_range_is_locked(owner: u64, base: u64, end: u64) -> bool {
+    let mut page = base & !(nt_address_space::PAGE_SIZE - 1);
+    while page < end {
+        if vm_page_lock_is_locked(owner, page) {
+            return true;
+        }
+        page = page.saturating_add(nt_address_space::PAGE_SIZE);
+    }
+    false
+}
+
+unsafe fn vm_page_lock_retire_range(owner: u64, base: u64, size: u64) -> usize {
+    (&mut *core::ptr::addr_of_mut!(VM_PAGE_LOCKS)).retire_range(owner, base, size)
+}
+
+unsafe fn vm_page_lock_retire_owner(owner: u64) -> usize {
+    (&mut *core::ptr::addr_of_mut!(VM_PAGE_LOCKS)).retire_owner(owner)
+}
+
+unsafe fn vm_page_is_resident(pi: usize, page: u64) -> bool {
+    page == KUSER_VA && kuser_page_alias_get(pi) != 0
+        || csrss_frame_get_exact(pi as u64, page).0 != 0
+        || shared_image_mapping_contains(pi as u64, page)
 }
 
 pub(crate) unsafe fn reset_process_private_pt_caps(slots: usize) -> bool {
@@ -1632,6 +1689,8 @@ fn process_private_pt_cap_stats() -> (usize, usize, u64) {
 }
 
 pub(crate) unsafe fn reset_process_vm_state(slots: usize) -> bool {
+    (&mut *core::ptr::addr_of_mut!(VM_PAGE_LOCKS)).reset();
+    VM_LOCK_RECLAIM_REFUSALS.store(0, Ordering::Relaxed);
     reset_process_vm_region_maps(slots)
         && reset_process_committed_mappings(slots)
         && reset_process_private_pt_caps(slots)
@@ -5706,6 +5765,7 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
     let committed_mapping_fails = VM_COMMITTED_MAPPING_REGISTRATION_FAILS.load(Ordering::Relaxed);
     let protection_overrides = VM_PROTECTION_OVERRIDE_HW.load(Ordering::Relaxed);
     let free_frame_store_failures = vm_free_frame_stats().allocation_failures;
+    let page_locks = vm_page_lock_stats();
     print_pool_census(b"gate");
     print_frame_registry_census(b"gate");
     check(
@@ -5733,6 +5793,8 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
             && frame_registry.frame_conflicts == 0
             && frame_registry.ownership_conflicts == 0
             && free_frame_store_failures == 0
+            && page_locks.allocation_failures == 0
+            && VM_LOCK_RECLAIM_REFUSALS.load(Ordering::Relaxed) == 0
             && fsd_exports.allocation_failures == 0
             && win32k_exports.allocation_failures == 0
             && SHARED_IMAGE_MAPPING_FAILS.load(Ordering::Relaxed) == 0
@@ -8528,19 +8590,23 @@ pub(crate) unsafe fn csrss_frame_drop_process_range(pi: u64, base: u64, size: u6
     let mut page = start;
     let mut dropped = 0u64;
     loop {
-        while let Some((frame, alias_cap, source_cap, owns_frame)) = csrss_frame_take(pi, page) {
-            if owns_frame {
-                vm_frame_release(frame, alias_cap);
-            } else {
-                recycle_mapped_cap(frame);
-                if alias_cap != frame {
-                    recycle_mapped_cap(alias_cap);
+        if vm_page_lock_is_locked(pi, page) {
+            VM_LOCK_RECLAIM_REFUSALS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            while let Some((frame, alias_cap, source_cap, owns_frame)) = csrss_frame_take(pi, page) {
+                if owns_frame {
+                    vm_frame_release(frame, alias_cap);
+                } else {
+                    recycle_mapped_cap(frame);
+                    if alias_cap != frame {
+                        recycle_mapped_cap(alias_cap);
+                    }
                 }
+                if source_cap != 0 && source_cap != frame && source_cap != alias_cap {
+                    recycle_plain_cap(source_cap);
+                }
+                dropped = dropped.saturating_add(1);
             }
-            if source_cap != 0 && source_cap != frame && source_cap != alias_cap {
-                recycle_plain_cap(source_cap);
-            }
-            dropped = dropped.saturating_add(1);
         }
         if page >= end {
             break;
@@ -8561,6 +8627,10 @@ pub(crate) unsafe fn csrss_frame_drop_process_all(pi: u64) -> u64 {
         else {
             break;
         };
+        if vm_page_lock_is_locked(pi, page) {
+            VM_LOCK_RECLAIM_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
         detach_win32k_attached_page_for_thread_release(pi as usize, page);
         while let Some((frame, alias_cap, source_cap, owns_frame)) = csrss_frame_take(pi, page) {
             if owns_frame {
@@ -10120,6 +10190,19 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(vm_pt_cap as u64);
     print_str(b"/");
     print_u64(vm_pt_fails);
+    let vm_locks = vm_page_lock_stats();
+    print_str(b" vm-locks=");
+    print_u64(vm_locks.pages as u64);
+    print_str(b"/");
+    print_u64(vm_locks.capacity as u64);
+    print_str(b"/");
+    print_u64(vm_locks.process_locks as u64);
+    print_str(b"/");
+    print_u64(vm_locks.system_locks as u64);
+    print_str(b"/");
+    print_u64(vm_locks.allocation_failures);
+    print_str(b"/");
+    print_u64(VM_LOCK_RECLAIM_REFUSALS.load(Ordering::Relaxed));
     let (kuser_len, kuser_cap, kuser_alloc_fails, kuser_store_fails) = kuser_page_alias_stats();
     print_str(b" kuser-alias=");
     print_u64(kuser_len as u64);
@@ -12782,7 +12865,11 @@ fn vm_watch(what: &[u8], pi: usize, page: u64, frame: u64) {
     print_str(b"\n");
 }
 
-unsafe fn vm_unmap_private_page(pi: usize, page: u64) {
+unsafe fn vm_unmap_private_page(pi: usize, page: u64) -> bool {
+    if vm_page_lock_is_locked(pi as u64, page) {
+        VM_LOCK_RECLAIM_REFUSALS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
     if let Some((frame, alias_cap, source_cap, owns_frame)) = csrss_frame_take(pi as u64, page) {
         vm_watch(b"unmap", pi, page, frame);
         if owns_frame {
@@ -12801,6 +12888,7 @@ unsafe fn vm_unmap_private_page(pi: usize, page: u64) {
     } else {
         vm_watch(b"unmap-miss", pi, page, 0);
     }
+    true
 }
 
 fn vm_protection_writable(protection: u32) -> bool {
@@ -12887,13 +12975,18 @@ unsafe fn recycle_unmapped_frame_record_caps(
     }
 }
 
-unsafe fn vm_unmap_shared_image_mapping_range(pi: usize, base: u64, end: u64) {
+unsafe fn vm_unmap_shared_image_mapping_range(pi: usize, base: u64, end: u64) -> bool {
+    if vm_page_lock_range_is_locked(pi as u64, base, end) {
+        VM_LOCK_RECLAIM_REFUSALS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
     let mut page = base;
     while page < end {
-        vm_unmap_private_page(pi, page);
+        let _ = vm_unmap_private_page(pi, page);
         page += 0x1000;
     }
     shared_image_mapping_unmap_range(pi as u64, base, end);
+    true
 }
 
 unsafe fn vm_reprotect_shared_image_mapping(
@@ -17480,6 +17573,9 @@ unsafe fn reclaim_final_process_vm(
         return ProcessVmReclaimStats::default();
     }
 
+    // Process teardown ends every virtual lock before any backing cap can be reclaimed. The lock
+    // owner is the address-space slot, whose lifetime ends at this exact boundary.
+    let _ = vm_page_lock_retire_owner(pi as u64);
     let mut stats = ProcessVmReclaimStats::default();
     revoke_process_teb_tail_alias(pi);
     if let Some(ctx) = handler.loop_ctx {
@@ -23711,6 +23807,11 @@ fn build_nt_table() -> NativeServiceTable {
             ),
             (NativeService::NtFlushVirtualMemory, SSN_NT_FLUSH_VM as u32),
             (NativeService::NtFreeVirtualMemory, SSN_NT_FREE_VM as u32),
+            (NativeService::NtLockVirtualMemory, SSN_NT_LOCK_VM as u32),
+            (
+                NativeService::NtUnlockVirtualMemory,
+                SSN_NT_UNLOCK_VM as u32,
+            ),
             (NativeService::NtReadVirtualMemory, SSN_NT_READ_VM as u32),
             (NativeService::NtWriteVirtualMemory, SSN_NT_WRITE_VM as u32),
             (

@@ -120,6 +120,8 @@ pub enum NativeService {
     NtMapViewOfSection,
     NtUnmapViewOfSection,
     NtFlushVirtualMemory,
+    NtLockVirtualMemory,
+    NtUnlockVirtualMemory,
     // Process / thread (§16.5)
     NtCreateThreadEx,
     NtTerminateProcess,
@@ -344,6 +346,8 @@ impl NativeService {
             NtMapViewOfSection => "NtMapViewOfSection",
             NtUnmapViewOfSection => "NtUnmapViewOfSection",
             NtFlushVirtualMemory => "NtFlushVirtualMemory",
+            NtLockVirtualMemory => "NtLockVirtualMemory",
+            NtUnlockVirtualMemory => "NtUnlockVirtualMemory",
             NtCreateThreadEx => "NtCreateThreadEx",
             NtTerminateProcess => "NtTerminateProcess",
             NtTerminateThread => "NtTerminateThread",
@@ -656,6 +660,8 @@ impl NativeService {
         NativeService::NtReplyPort,
         NativeService::NtRegisterThreadTerminatePort,
         NativeService::NtImpersonateClientOfPort,
+        NativeService::NtLockVirtualMemory,
+        NativeService::NtUnlockVirtualMemory,
     ];
 }
 
