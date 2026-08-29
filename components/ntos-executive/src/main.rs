@@ -100,7 +100,7 @@ pub(crate) use nt_memory_manager::{
     GenericSection, GenericSectionBacking, GenericSectionFlushPlan, GenericSectionTable,
     GenericSectionTableStats, GenericSectionView, GENERIC_SECTION_BACKING_ANON,
     GENERIC_SECTION_BACKING_DISK, GENERIC_SECTION_BACKING_OVERLAY, SECTION_ATTR_SEC_COMMIT,
-    SECTION_ATTR_SEC_FILE, SECTION_ATTR_SEC_IMAGE, SECTION_ATTR_SEC_RESERVE,
+    SECTION_ATTR_SEC_FILE, SECTION_ATTR_SEC_IMAGE,
 };
 use nt_object_abi::ObReply;
 use nt_object_client::ObjectClient;
@@ -21441,18 +21441,12 @@ struct ExecLoopCtx {
     /// stack). The demand-load path writes freshly parsed PEs here, and `dll_pes()` derives a live
     /// slice from the current vector so runtime slot growth cannot leave a stale reference table.
     dll_pe_store: *mut DllPeStore,
-    /// csrss's ANONYMOUS (no-file) section — its CSR SharedSection shared memory: the handle
-    /// NtCreateSection records + the requested size NtMapViewOfSection backs. Point at the locals.
-    csrss_anon_section_handle: *mut u64,
-    csrss_anon_size: *mut u64,
     /// Generic data/pagefile section objects and mapped views. This is the real section-object path
     /// for non-SEC_IMAGE mappings: NtCreateSection records backing, NtMapViewOfSection reserves a
     /// VAD, and the fault router materialises pages on demand.
     generic_sections: *mut GenericSectionTable,
-    /// The base NtMapViewOfSection assigned the anonymous CSR section (0 until first mapped) and
-    /// the per-hosted-process DLL arena paging state. Each hosted VSpace needs its own PD covering
-    /// the compact DLL range plus PT windows for every mapped DLL.
-    csrss_anon_base: *mut u64,
+    /// Per-hosted-process DLL arena paging state. Each hosted VSpace needs its own PD covering the
+    /// compact DLL range plus PT windows for every mapped DLL.
     dll_arena_paging: *mut DllArenaPagingState,
 }
 

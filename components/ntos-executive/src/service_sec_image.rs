@@ -5229,12 +5229,6 @@ pub(crate) unsafe fn service_sec_image(
     // nt-dll-registry, built below once their PEs are parsed. Each hosted VSpace gets its own
     // growable DLL arena paging record as images map into the compact 0x8000_0000 range.
     let dll_arena_paging = reset_service_dll_arena_paging_work();
-    // csrss's ANONYMOUS section (no file backing) — its CSR SharedSection shared memory. Tracked by
-    // handle + requested size; NtMapViewOfSection reserves a VA range and the fault router
-    // demand-pages ZERO frames into it (commit-on-touch).
-    let mut csrss_anon_section_handle = 0u64;
-    let mut csrss_anon_base = 0u64;
-    let mut csrss_anon_size = 0u64;
     // The named NLS section \Nls\NlsSectionCP20127 (US-ASCII code-page table) csrss's Win32 client
     // stack maps during a DllMain. NtOpenSection records the handle; NtMapViewOfSection maps the
     // staged c_20127.nls frames into csrss.
@@ -7455,36 +7449,6 @@ pub(crate) unsafe fn service_sec_image(
                     park_and_log!(pi, b"guard-page", m0, addr);
                 }
             }
-            // csrss's anonymous section (CSR shared memory): commit a ZERO frame on touch.
-            if pi == 1
-                && csrss_anon_base != 0
-                && page >= csrss_anon_base
-                && page < csrss_anon_base + ((csrss_anon_size + 0xFFF) & !0xFFFu64)
-            {
-                let f = alloc_frame();
-                let map_cap = copy_cap(f);
-                let _ = page_map(map_cap, page, RW_NX, pml4);
-                let source_cap =
-                    csrss_frame_create_source_copy(map_cap, pi as u64, page, b"csr-anon");
-                if source_cap != 0 {
-                    csrss_frame_put_with_source(pi as u64, page, map_cap, source_cap);
-                    // CSR shared section (pi 1) — shareable into win32k
-                }
-                faults += 1;
-                procs[pi].faults = faults;
-                procs[pi].first = first;
-                procs[pi].ntfaults = ntfaults;
-                pfilled[pi] = *filled_pages;
-                let _ = finalize_service_loop_state(&mut nt_handler);
-                let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
-                badge = nb;
-                mi = nmi;
-                m0 = nm0;
-                m1 = nm1;
-                m2 = nm2;
-                m3 = nm3;
-                continue;
-            }
             match service_generic_section_fault(
                 generic_sections,
                 pi,
@@ -9228,10 +9192,7 @@ pub(crate) unsafe fn service_sec_image(
                     nt_base,
                     nt_end,
                     dll_pe_store: dll_pe_store as *mut DllPeStore,
-                    csrss_anon_section_handle: &mut csrss_anon_section_handle as *mut u64,
-                    csrss_anon_size: &mut csrss_anon_size as *mut u64,
                     generic_sections: generic_sections as *mut GenericSectionTable,
-                    csrss_anon_base: &mut csrss_anon_base as *mut u64,
                     dll_arena_paging: dll_arena_paging as *mut DllArenaPagingState,
                 });
                 // ALPC last-mile item (a): NtAlpc* SSNs are registered in the dispatcher via this

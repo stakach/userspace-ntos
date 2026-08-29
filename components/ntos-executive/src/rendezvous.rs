@@ -178,6 +178,7 @@ unsafe fn dispatch_hosted_server_native_service(
             | NativeService::NtDuplicateObject
             | NativeService::NtClose
             | NativeService::NtReplyPort
+            | NativeService::NtMapViewOfSection
     ) {
         return None;
     }
@@ -1266,7 +1267,6 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
 ) -> bool {
     const CSR_API_MSG_MAX: usize = 0x178;
     const SSN_REPLY_WAIT_RECV: u64 = 203;
-    const SSN_MAP_VIEW: u64 = 113;
 
     let ep = CSR_FAULT_EP.load(Ordering::Relaxed);
     let reply = REPLY_CSRLOOP_SLOT.load(Ordering::Relaxed);
@@ -1514,7 +1514,7 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                 let resume_ip = m2;
                 let sp = get_recv_mr(16);
                 let rdx = m3;
-                let mut result = 0u64;
+                let result;
                 if ssn < win32k_subsystem::WIN32K_SERVICE_BASE {
                     if let Some(dispatched) = dispatch_hosted_server_native_service(
                         nt_handler,
@@ -1592,7 +1592,6 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                         print_hex(result as u32);
                         print_str(b"\n");
                     }
-                    SSN_MAP_VIEW => {}
                     SSN_REPLY_WAIT_RECV => {
                         let reply_msg = get_recv_mr(7);
                         let recv_msg = get_recv_mr(8);
@@ -3063,7 +3062,6 @@ pub(crate) unsafe fn csr_rendezvous(
     dll_pes: &[Option<nt_pe_loader::PeFile>],
     nt_handler: &mut ExecNtHandler,
 ) -> u64 {
-    const SSN_MAP_VIEW: u64 = 113;
     const SSN_REPLY_WAIT_RECV: u64 = 203;
     const SSN_ACCEPT_CONNECT: u64 = 0;
     const SSN_COMPLETE_CONNECT: u64 = 31;
@@ -3211,7 +3209,6 @@ pub(crate) unsafe fn csr_rendezvous(
                 print_str(b"\n");
             } else {
                 match ssn {
-                    SSN_MAP_VIEW => {} // NtMapViewOfSection (CSR shared section into CsrRootProcess) — success
                     SSN_REPLY_WAIT_RECV => {
                         let recvmsg = get_recv_mr(8); // R9 = &ReceiveMsg.Header
                         let port = get_recv_mr(9); // R10 = CsrApiPort handle

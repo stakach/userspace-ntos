@@ -36936,11 +36936,6 @@ impl ExecNtHandler {
                         basic_info[8..12]
                             .copy_from_slice(&section.basic_attributes().to_le_bytes());
                         basic_info[16..24].copy_from_slice(&section.size.to_le_bytes());
-                    } else if *ctx.csrss_anon_section_handle != 0
-                        && sect == *ctx.csrss_anon_section_handle
-                    {
-                        basic_info[8..12].copy_from_slice(&SECTION_ATTR_SEC_RESERVE.to_le_bytes());
-                        basic_info[16..24].copy_from_slice(&(*ctx.csrss_anon_size).to_le_bytes());
                     } else if *ctx.nls_section_handle != 0 && sect == *ctx.nls_section_handle {
                         let nls_size =
                             core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x74) as *const u32)
@@ -37132,47 +37127,6 @@ impl ExecNtHandler {
                     return STATUS_INVALID_FILE_FOR_SECTION;
                 }
 
-                // Anonymous (no FileHandle) section from csrss — its CSR SharedSection shared memory.
-                // Record the requested size (from *MaximumSize = R9) so NtMapViewOfSection can back it.
-                if sec_file == 0
-                    && self.current_process_is_csrss()
-                    && *ctx.csrss_anon_section_handle == 0
-                {
-                    let h = self.mint_handle();
-                    *ctx.csrss_anon_section_handle = h;
-                    // SEC_RESERVE with MaximumSize==0 gives no size here; reserve a default 1 MiB
-                    // window (demand-paged on touch, so unused pages cost nothing).
-                    *ctx.csrss_anon_size = if maxsize == 0 { 0x10_0000 } else { maxsize };
-                    if !csrss_out_write(
-                        self.pi as u64,
-                        out,
-                        h,
-                        filled_pages,
-                        faults,
-                        ctx.scratch_base,
-                        reg,
-                        dll_pes,
-                        ctx.pml4,
-                    ) {
-                        return STATUS_ACCESS_VIOLATION;
-                    }
-                    print_str(b"[ntos-exec] NtCreateSection(anonymous) size=0x");
-                    print_hex(*ctx.csrss_anon_size as u32);
-                    print_str(b" -> handle 0x");
-                    print_hex(h as u32);
-                    print_str(b"\n");
-                    loader_trace_record(
-                        self.pi,
-                        LoaderOp::CreateSection,
-                        0,
-                        registry_slot,
-                        sec_file,
-                        h,
-                        b"",
-                    );
-                    return 0;
-                }
-
                 if let Err(status) = nt_address_space::validate_allocate_parameters(
                     0,
                     nt_address_space::MEM_COMMIT,
@@ -37289,9 +37243,10 @@ impl ExecNtHandler {
             // *BaseAddress=args[2], ZeroBits=args[3], CommitSize=args[4],
             // *SectionOffset=args[5], *ViewSize=args[6], InheritDisposition=args[7],
             // AllocationType=args[8], Win32Protect=args[9].
-            // Map a registry DLL SEC_IMAGE at its (fixed) registry base, the anonymous CSR shared
-            // section, or the named NLS section into csrss's VSpace; the fault router demand-pages
-            // the DLL/anon views and the NLS frames are mapped eagerly here.
+            // Map a registry DLL SEC_IMAGE at its fixed registry base, a generic data/pagefile
+            // section into an access-checked target process, or the named NLS section into CSRSS.
+            // The common fault router materialises generic section pages and preserves shared frame
+            // identity across every mapped process view.
             NativeService::NtMapViewOfSection => unsafe {
                 const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xC000_007B;
                 let ctx = self.loop_ctx.unwrap();
@@ -37438,94 +37393,6 @@ impl ExecNtHandler {
                         );
                         STATUS_INVALID_IMAGE_FORMAT
                     }
-                } else if self.current_process_is_csrss()
-                    && *ctx.csrss_anon_section_handle != 0
-                    && sect == *ctx.csrss_anon_section_handle
-                {
-                    // Anonymous section (CSR shared memory): reserve a VA range in csrss's VSpace
-                    // (page tables only) and let the fault router demand-page zero frames on touch.
-                    const CSRSS_ANON_BASE: u64 = 0x0000_0100_0300_0000;
-                    if *ctx.csrss_anon_base == 0 {
-                        let npts = ((*ctx.csrss_anon_size + 0x1F_FFFF) / 0x20_0000).max(1);
-                        let mut k = 0u64;
-                        while k < npts {
-                            let pt = alloc_slot();
-                            let _ = untyped_retype(
-                                CAP_INIT_UNTYPED,
-                                OBJ_X86_PAGE_TABLE,
-                                PAGING_BITS,
-                                1,
-                                pt,
-                            );
-                            let _ = paging_struct_map(
-                                pt,
-                                LBL_X86_PAGE_TABLE_MAP,
-                                CSRSS_ANON_BASE + k * 0x20_0000,
-                                pml4,
-                            );
-                            k += 1;
-                        }
-                        *ctx.csrss_anon_base = CSRSS_ANON_BASE;
-                    }
-                    let anon_size = *ctx.csrss_anon_size;
-                    let Some(mapped_size) =
-                        anon_size.checked_add(0xFFF).map(|size| size & !0xFFFu64)
-                    else {
-                        return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
-                    };
-                    if mapped_size == 0
-                        || !process_committed_mapping_register(
-                            self.pi as u64,
-                            nt_address_space::VmCommittedRange::mapped(
-                                *ctx.csrss_anon_base,
-                                mapped_size,
-                                nt_address_space::PAGE_READWRITE,
-                            ),
-                        )
-                    {
-                        return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
-                    }
-                    // *BaseAddress / *ViewSize are csrsrv globals (CsrSrvSharedSectionBase) — write via
-                    // the general path so they don't silently miss (NULL base → RtlAllocateHeap(NULL)).
-                    csrss_out_write(
-                        self.pi as u64,
-                        args[2],
-                        *ctx.csrss_anon_base,
-                        filled_pages,
-                        faults,
-                        scratch_base,
-                        reg,
-                        dll_pes,
-                        pml4,
-                    );
-                    let vs_ptr = args[6];
-                    if vs_ptr != 0 {
-                        csrss_out_write(
-                            self.pi as u64,
-                            vs_ptr,
-                            *ctx.csrss_anon_size,
-                            filled_pages,
-                            faults,
-                            scratch_base,
-                            reg,
-                            dll_pes,
-                            pml4,
-                        );
-                    }
-                    print_str(b"[ntos-exec] NtMapViewOfSection(anonymous) -> base 0x");
-                    print_hex((*ctx.csrss_anon_base >> 32) as u32);
-                    print_hex(*ctx.csrss_anon_base as u32);
-                    print_str(b"\n");
-                    loader_trace_record(
-                        self.pi,
-                        LoaderOp::MapViewOfSection,
-                        0,
-                        None,
-                        sect,
-                        *ctx.csrss_anon_base,
-                        b"",
-                    );
-                    0
                 } else if *ctx.nls_section_handle != 0 && sect == *ctx.nls_section_handle {
                     // The named NLS section \Nls\NlsSectionCP20127: map the staged c_20127.nls frames
                     // into csrss at a VA past the DLL bases (same 0x8000_0000 PDPT slot, whose PD the
@@ -37741,27 +37608,9 @@ impl ExecNtHandler {
                     }
                     *vm_map = *after;
                     crate::note_high_water(&crate::VM_REGION_HW, after.extent_count() as u64);
-                    if !csrss_out_write(
-                        self.pi as u64,
-                        base_ptr,
-                        plan.base,
-                        filled_pages,
-                        faults,
-                        scratch_base,
-                        reg,
-                        dll_pes,
-                        pml4,
-                    ) || !csrss_out_write(
-                        self.pi as u64,
-                        view_size_ptr,
-                        plan.size,
-                        filled_pages,
-                        faults,
-                        scratch_base,
-                        reg,
-                        dll_pes,
-                        pml4,
-                    ) {
+                    if !self.xas_write_u64(base_ptr, plan.base)
+                        || !self.xas_write_u64(view_size_ptr, plan.size)
+                    {
                         return STATUS_ACCESS_VIOLATION;
                     }
                     print_str(b"[section] map generic owner-pi=");
