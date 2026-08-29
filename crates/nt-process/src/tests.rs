@@ -3900,6 +3900,129 @@ fn preserve_job_time_and_post_without_port_follow_nt5_policy() {
 }
 
 #[test]
+fn job_memory_charges_are_transactional_dynamic_and_kernel_accounted() {
+    let mut pm = ProcessManager::new();
+    let first = pm.create_process("memory-a.exe", None, None);
+    let second = pm.create_process("memory-b.exe", None, None);
+    let job = pm.create_job(0).unwrap();
+    pm.associate_job_completion_port(
+        job,
+        job::CompletionPortAssociation {
+            port_id: 9,
+            completion_key: 0xCAFE,
+        },
+    )
+    .unwrap();
+    pm.set_job_extended_limits(
+        job,
+        job::JobExtendedLimits {
+            basic: job::JobBasicLimits {
+                limit_flags: job::JOB_OBJECT_LIMIT_PROCESS_MEMORY
+                    | job::JOB_OBJECT_LIMIT_JOB_MEMORY,
+                scheduling_class: 5,
+                ..job::JobBasicLimits::default()
+            },
+            io: job::IoCounters {
+                read_operation_count: u64::MAX,
+                ..job::IoCounters::default()
+            },
+            process_memory_limit: 0x4fff,
+            job_memory_limit: 0x6fff,
+            peak_process_memory_used: u64::MAX,
+            peak_job_memory_used: u64::MAX,
+        },
+    )
+    .unwrap();
+    let limits = pm.job_extended_limits(job).unwrap();
+    assert_eq!(limits.process_memory_limit, 0x4000);
+    assert_eq!(limits.job_memory_limit, 0x6000);
+    assert_eq!(limits.io, job::IoCounters::default());
+    assert_eq!(limits.peak_process_memory_used, 0);
+    assert_eq!(limits.peak_job_memory_used, 0);
+
+    assert_eq!(
+        pm.assign_process_to_job_with_commit(job, first, 0x2000),
+        Ok(STATUS_SUCCESS)
+    );
+    assert_eq!(
+        pm.take_job_notification().unwrap().message,
+        job::JOB_OBJECT_MSG_NEW_PROCESS
+    );
+    let first_charge = pm
+        .prepare_job_memory_charge(first, 0x2000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(pm.job_memory_usage(first), Ok((0x2000, 0x2000)));
+    pm.commit_job_memory_charge(first_charge).unwrap();
+    assert_eq!(pm.job_memory_usage(first), Ok((0x4000, 0x4000)));
+
+    assert_eq!(
+        pm.prepare_job_memory_charge(first, 0x1000),
+        Err(job::STATUS_COMMITMENT_LIMIT)
+    );
+    assert_eq!(pm.job_memory_usage(first), Ok((0x4000, 0x4000)));
+    let notification = pm.take_job_notification().unwrap();
+    assert_eq!(
+        notification.message,
+        job::JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT
+    );
+    assert_eq!(notification.process_id, first);
+
+    assert_eq!(
+        pm.assign_process_to_job_with_commit(job, second, 0x2000),
+        Ok(STATUS_SUCCESS)
+    );
+    let _ = pm.take_job_notification();
+    assert_eq!(pm.job_memory_usage(second), Ok((0x2000, 0x6000)));
+    assert_eq!(
+        pm.prepare_job_memory_charge(second, 0x1000),
+        Err(job::STATUS_COMMITMENT_LIMIT)
+    );
+    let notification = pm.take_job_notification().unwrap();
+    assert_eq!(notification.message, job::JOB_OBJECT_MSG_JOB_MEMORY_LIMIT);
+    assert_eq!(notification.process_id, second);
+
+    pm.release_job_memory(first, 0x3000).unwrap();
+    assert_eq!(pm.job_memory_usage(first), Ok((0x1000, 0x3000)));
+    let stale = pm
+        .prepare_job_memory_charge(second, 0x1000)
+        .unwrap()
+        .unwrap();
+    let current = pm
+        .prepare_job_memory_charge(first, 0x1000)
+        .unwrap()
+        .unwrap();
+    pm.commit_job_memory_charge(current).unwrap();
+    assert_eq!(
+        pm.commit_job_memory_charge(stale),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+
+    let limits = pm.job_extended_limits(job).unwrap();
+    assert_eq!(limits.peak_process_memory_used, 0x4000);
+    assert_eq!(limits.peak_job_memory_used, 0x6000);
+    pm.set_job_basic_limits(
+        job,
+        job::JobBasicLimits {
+            priority_class: 2,
+            limit_flags: job::JOB_OBJECT_LIMIT_PRIORITY_CLASS,
+            scheduling_class: 5,
+            ..job::JobBasicLimits::default()
+        },
+    )
+    .unwrap();
+    let limits = pm.job_extended_limits(job).unwrap();
+    assert_eq!(
+        limits.basic.limit_flags,
+        job::JOB_OBJECT_LIMIT_PRIORITY_CLASS
+            | job::JOB_OBJECT_LIMIT_PROCESS_MEMORY
+            | job::JOB_OBJECT_LIMIT_JOB_MEMORY
+    );
+    assert_eq!(limits.process_memory_limit, 0x4000);
+    assert_eq!(limits.job_memory_limit, 0x6000);
+}
+
+#[test]
 fn process_create_abis_decode_to_one_internal_contract() {
     let legacy =
         decode_process_create_input(&[0, 0, 0, 0x40, 1, 0x101, 0x205, 0x300], false).unwrap();

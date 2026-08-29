@@ -1159,7 +1159,7 @@ impl ProcessManager {
             .process(pid)
             .expect("new process remains private during job admission")
             .session_id;
-        let assignment = match self.jobs.assign(job_id, pid, session_id) {
+        let assignment = match self.jobs.assign(job_id, pid, session_id, 0) {
             Ok(assignment) => assignment,
             Err(status) => {
                 self.rollback_unpublished_process(pid);
@@ -3184,12 +3184,23 @@ impl ProcessManager {
     }
 
     pub fn assign_process_to_job(&mut self, id: job::JobId, pid: ProcessId) -> Result<u32, u32> {
+        self.assign_process_to_job_with_commit(id, pid, 0)
+    }
+
+    pub fn assign_process_to_job_with_commit(
+        &mut self,
+        id: job::JobId,
+        pid: ProcessId,
+        initial_commit_bytes: u64,
+    ) -> Result<u32, u32> {
         let process = self.process(pid).ok_or(STATUS_INVALID_HANDLE)?;
         if process.state == ProcessState::Terminated {
             return Err(STATUS_PROCESS_IS_TERMINATING);
         }
         let session_id = process.session_id;
-        let assignment = self.jobs.assign(id, pid, session_id)?;
+        let assignment = self
+            .jobs
+            .assign(id, pid, session_id, initial_commit_bytes)?;
         self.jobs.queue_notification(assignment.notification);
         if assignment.status == STATUS_SUCCESS {
             self.apply_job_limits_to_process(id, pid)?;
@@ -3426,6 +3437,32 @@ impl ProcessManager {
         delivered: bool,
     ) -> Result<bool, u32> {
         self.jobs.complete_job_time_notification(id, delivered)
+    }
+
+    pub fn prepare_job_memory_charge(
+        &mut self,
+        pid: ProcessId,
+        bytes: u64,
+    ) -> Result<Option<job::JobMemoryChargePlan>, u32> {
+        if !self.processes.contains_key(&pid) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        self.jobs.prepare_memory_charge(pid, bytes)
+    }
+
+    pub fn commit_job_memory_charge(&mut self, plan: job::JobMemoryChargePlan) -> Result<(), u32> {
+        self.jobs.commit_memory_charge(plan)
+    }
+
+    pub fn release_job_memory(&mut self, pid: ProcessId, bytes: u64) -> Result<(), u32> {
+        if !self.processes.contains_key(&pid) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        self.jobs.release_memory(pid, bytes)
+    }
+
+    pub fn job_memory_usage(&self, pid: ProcessId) -> Result<(u64, u64), u32> {
+        self.jobs.memory_usage(pid)
     }
 
     pub fn job_completion_port(

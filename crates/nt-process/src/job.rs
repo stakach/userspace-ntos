@@ -16,6 +16,7 @@ pub type JobId = u32;
 pub const STATUS_PROCESS_NOT_IN_JOB: u32 = 0x0000_0123;
 pub const STATUS_PROCESS_IN_JOB: u32 = 0x0000_0124;
 pub const STATUS_QUOTA_EXCEEDED: u32 = 0xC000_0044;
+pub const STATUS_COMMITMENT_LIMIT: u32 = 0xC000_012D;
 
 pub const JOB_OBJECT_ASSIGN_PROCESS: u32 = 0x0001;
 pub const JOB_OBJECT_SET_ATTRIBUTES: u32 = 0x0002;
@@ -58,8 +59,11 @@ pub const JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO: u32 = 4;
 pub const JOB_OBJECT_MSG_NEW_PROCESS: u32 = 6;
 pub const JOB_OBJECT_MSG_EXIT_PROCESS: u32 = 7;
 pub const JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS: u32 = 8;
+pub const JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT: u32 = 9;
+pub const JOB_OBJECT_MSG_JOB_MEMORY_LIMIT: u32 = 10;
 
 const MAXIMUM_SCHEDULING_CLASS: u32 = 9;
+const PAGE_SIZE: u64 = 0x1000;
 
 /// Expand generic job access bits using the NT job-object generic mapping.
 pub fn map_job_access(desired: u32) -> u32 {
@@ -178,6 +182,16 @@ pub struct JobTimeLimitActions {
     pub terminate_job: Option<JobId>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobMemoryChargePlan {
+    job_id: JobId,
+    process_id: ProcessId,
+    previous_process_bytes: u64,
+    next_process_bytes: u64,
+    previous_job_bytes: u64,
+    next_job_bytes: u64,
+}
+
 impl JobNotifications {
     fn push(&mut self, notification: Option<JobNotification>) {
         let Some(notification) = notification else {
@@ -218,6 +232,9 @@ struct JobMember {
     accounting_folded: bool,
     forced_termination: bool,
     process_time_limit_reached: bool,
+    current_memory_used: u64,
+    peak_memory_used: u64,
+    memory_limit_reported: bool,
 }
 
 #[derive(Debug)]
@@ -237,6 +254,7 @@ struct Job {
     period_start_total_user_time: i64,
     period_start_total_kernel_time: i64,
     job_time_limit_reached: bool,
+    current_job_memory_used: u64,
     completion_port: Option<CompletionPortAssociation>,
     member_level: u32,
     set_head: Option<JobId>,
@@ -386,6 +404,7 @@ impl JobStore {
             period_start_total_user_time: 0,
             period_start_total_kernel_time: 0,
             job_time_limit_reached: false,
+            current_job_memory_used: 0,
             completion_port: None,
             member_level: 0,
             set_head: None,
@@ -493,7 +512,11 @@ impl JobStore {
         id: JobId,
         process_id: ProcessId,
         process_session_id: u32,
+        initial_commit_bytes: u64,
     ) -> Result<JobAssignment, u32> {
+        if initial_commit_bytes & (PAGE_SIZE - 1) != 0 {
+            return Err(crate::STATUS_INVALID_PARAMETER);
+        }
         if self.job_for_process(process_id).is_some() {
             return Err(STATUS_ACCESS_DENIED);
         }
@@ -505,6 +528,10 @@ impl JobStore {
         {
             return Err(crate::STATUS_INVALID_PARAMETER);
         }
+        let next_job_memory = job
+            .current_job_memory_used
+            .checked_add(initial_commit_bytes)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
         job.members
             .try_reserve(1)
             .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
@@ -514,6 +541,9 @@ impl JobStore {
             accounting_folded: false,
             forced_termination: false,
             process_time_limit_reached: false,
+            current_memory_used: 0,
+            peak_memory_used: 0,
+            memory_limit_reported: false,
         });
         job.accounting.total_processes = job.accounting.total_processes.saturating_add(1);
         job.accounting.active_processes = job.accounting.active_processes.saturating_add(1);
@@ -529,6 +559,39 @@ impl JobStore {
                 notification: job.notification(JOB_OBJECT_MSG_ACTIVE_PROCESS_LIMIT, 0),
             });
         }
+        let process_memory_over = job.basic_limits.limit_flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY
+            != 0
+            && initial_commit_bytes > job.extended_limits.process_memory_limit;
+        let job_memory_over = job.basic_limits.limit_flags & JOB_OBJECT_LIMIT_JOB_MEMORY != 0
+            && next_job_memory > job.extended_limits.job_memory_limit;
+        if process_memory_over || job_memory_over {
+            let member = job.members.last_mut().expect("just inserted job member");
+            member.active = false;
+            member.forced_termination = true;
+            member.memory_limit_reported = true;
+            job.accounting.active_processes -= 1;
+            let message = if process_memory_over {
+                JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT
+            } else {
+                JOB_OBJECT_MSG_JOB_MEMORY_LIMIT
+            };
+            return Ok(JobAssignment {
+                status: STATUS_QUOTA_EXCEEDED,
+                notification: job.notification(message, process_id),
+            });
+        }
+        let member = job.members.last_mut().expect("just inserted job member");
+        member.current_memory_used = initial_commit_bytes;
+        member.peak_memory_used = initial_commit_bytes;
+        job.current_job_memory_used = next_job_memory;
+        job.extended_limits.peak_process_memory_used = job
+            .extended_limits
+            .peak_process_memory_used
+            .max(initial_commit_bytes);
+        job.extended_limits.peak_job_memory_used = job
+            .extended_limits
+            .peak_job_memory_used
+            .max(next_job_memory);
         Ok(JobAssignment {
             status: 0,
             notification: job.notification(JOB_OBJECT_MSG_NEW_PROCESS, process_id),
@@ -630,6 +693,9 @@ impl JobStore {
         if job.members[member].active {
             job.accounting.active_processes = job.accounting.active_processes.saturating_sub(1);
         }
+        job.current_job_memory_used = job
+            .current_job_memory_used
+            .saturating_sub(job.members[member].current_memory_used);
         job.members.remove(member);
         if job.can_destroy() {
             self.destroy_cascade(id);
@@ -734,7 +800,10 @@ impl JobStore {
         let previous_period_kernel = job.accounting.this_period_total_kernel_time;
         let set_job_time = limits.limit_flags & JOB_OBJECT_LIMIT_JOB_TIME != 0;
         let preserve_job_time = limits.limit_flags & JOB_OBJECT_LIMIT_PRESERVE_JOB_TIME != 0;
+        let extended_only_flags =
+            job.basic_limits.limit_flags & !JOB_OBJECT_BASIC_LIMIT_VALID_FLAGS;
         limits.limit_flags &= !JOB_OBJECT_LIMIT_PRESERVE_JOB_TIME;
+        limits.limit_flags |= extended_only_flags;
         job.basic_limits = limits;
         if set_job_time {
             job.accounting.this_period_total_user_time = 0;
@@ -777,6 +846,22 @@ impl JobStore {
             return Err(crate::STATUS_INVALID_PARAMETER);
         }
         Self::validate_limits(&limits.basic)?;
+        if limits.basic.limit_flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY != 0 {
+            if limits.process_memory_limit < PAGE_SIZE {
+                return Err(crate::STATUS_INVALID_PARAMETER);
+            }
+            limits.process_memory_limit &= !(PAGE_SIZE - 1);
+        } else {
+            limits.process_memory_limit = 0;
+        }
+        if limits.basic.limit_flags & JOB_OBJECT_LIMIT_JOB_MEMORY != 0 {
+            if limits.job_memory_limit < PAGE_SIZE {
+                return Err(crate::STATUS_INVALID_PARAMETER);
+            }
+            limits.job_memory_limit &= !(PAGE_SIZE - 1);
+        } else {
+            limits.job_memory_limit = 0;
+        }
         if limits.basic.limit_flags & JOB_OBJECT_LIMIT_SCHEDULING_CLASS == 0 {
             limits.basic.scheduling_class = 5;
         }
@@ -786,9 +871,15 @@ impl JobStore {
         let previous_job_time = job.basic_limits.per_job_user_time_limit;
         let previous_period_user = job.accounting.this_period_total_user_time;
         let previous_period_kernel = job.accounting.this_period_total_kernel_time;
+        let previous_io = job.extended_limits.io;
+        let previous_peak_process_memory_used = job.extended_limits.peak_process_memory_used;
+        let previous_peak_job_memory_used = job.extended_limits.peak_job_memory_used;
         let set_job_time = limits.basic.limit_flags & JOB_OBJECT_LIMIT_JOB_TIME != 0;
         let preserve_job_time = limits.basic.limit_flags & JOB_OBJECT_LIMIT_PRESERVE_JOB_TIME != 0;
         limits.basic.limit_flags &= !JOB_OBJECT_LIMIT_PRESERVE_JOB_TIME;
+        limits.io = previous_io;
+        limits.peak_process_memory_used = previous_peak_process_memory_used;
+        limits.peak_job_memory_used = previous_peak_job_memory_used;
         job.basic_limits = limits.basic;
         job.extended_limits = limits;
         if set_job_time {
@@ -925,6 +1016,132 @@ impl JobStore {
         Ok(delivered)
     }
 
+    pub fn prepare_memory_charge(
+        &mut self,
+        process_id: ProcessId,
+        bytes: u64,
+    ) -> Result<Option<JobMemoryChargePlan>, u32> {
+        if bytes == 0 || bytes & (PAGE_SIZE - 1) != 0 {
+            return Err(crate::STATUS_INVALID_PARAMETER);
+        }
+        let Some(id) = self.job_for_process(process_id) else {
+            return Ok(None);
+        };
+        let mut notification = None;
+        let result = {
+            let job = self.get_mut(id).ok_or(crate::STATUS_INVALID_HANDLE)?;
+            let member_index = job
+                .members
+                .iter()
+                .position(|member| member.process_id == process_id && member.active)
+                .ok_or(crate::STATUS_INVALID_HANDLE)?;
+            let previous_process_bytes = job.members[member_index].current_memory_used;
+            let next_process_bytes = previous_process_bytes
+                .checked_add(bytes)
+                .ok_or(STATUS_COMMITMENT_LIMIT)?;
+            let previous_job_bytes = job.current_job_memory_used;
+            let next_job_bytes = previous_job_bytes
+                .checked_add(bytes)
+                .ok_or(STATUS_COMMITMENT_LIMIT)?;
+            let process_limit_reached =
+                job.basic_limits.limit_flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY != 0
+                    && next_process_bytes > job.extended_limits.process_memory_limit;
+            let job_limit_reached = job.basic_limits.limit_flags & JOB_OBJECT_LIMIT_JOB_MEMORY != 0
+                && next_job_bytes > job.extended_limits.job_memory_limit;
+            if process_limit_reached || job_limit_reached {
+                let member = &mut job.members[member_index];
+                if !member.memory_limit_reported {
+                    member.memory_limit_reported = true;
+                    notification = job.notification(
+                        if process_limit_reached {
+                            JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT
+                        } else {
+                            JOB_OBJECT_MSG_JOB_MEMORY_LIMIT
+                        },
+                        process_id,
+                    );
+                }
+                Err(STATUS_COMMITMENT_LIMIT)
+            } else {
+                Ok(Some(JobMemoryChargePlan {
+                    job_id: id,
+                    process_id,
+                    previous_process_bytes,
+                    next_process_bytes,
+                    previous_job_bytes,
+                    next_job_bytes,
+                }))
+            }
+        };
+        self.queue_notification(notification);
+        result
+    }
+
+    pub fn commit_memory_charge(&mut self, plan: JobMemoryChargePlan) -> Result<(), u32> {
+        let job = self
+            .get_mut(plan.job_id)
+            .ok_or(crate::STATUS_INVALID_HANDLE)?;
+        let member = job
+            .members
+            .iter_mut()
+            .find(|member| member.process_id == plan.process_id && member.active)
+            .ok_or(crate::STATUS_INVALID_HANDLE)?;
+        if member.current_memory_used != plan.previous_process_bytes
+            || job.current_job_memory_used != plan.previous_job_bytes
+        {
+            return Err(crate::STATUS_INVALID_PARAMETER);
+        }
+        member.current_memory_used = plan.next_process_bytes;
+        member.peak_memory_used = member.peak_memory_used.max(plan.next_process_bytes);
+        job.current_job_memory_used = plan.next_job_bytes;
+        job.extended_limits.peak_process_memory_used = job
+            .extended_limits
+            .peak_process_memory_used
+            .max(plan.next_process_bytes);
+        job.extended_limits.peak_job_memory_used = job
+            .extended_limits
+            .peak_job_memory_used
+            .max(plan.next_job_bytes);
+        Ok(())
+    }
+
+    pub fn release_memory(&mut self, process_id: ProcessId, bytes: u64) -> Result<(), u32> {
+        if bytes & (PAGE_SIZE - 1) != 0 {
+            return Err(crate::STATUS_INVALID_PARAMETER);
+        }
+        let Some(id) = self.job_for_process(process_id) else {
+            return Ok(());
+        };
+        let job = self.get_mut(id).ok_or(crate::STATUS_INVALID_HANDLE)?;
+        let member = job
+            .members
+            .iter_mut()
+            .find(|member| member.process_id == process_id)
+            .ok_or(crate::STATUS_INVALID_HANDLE)?;
+        member.current_memory_used = member
+            .current_memory_used
+            .checked_sub(bytes)
+            .ok_or(crate::STATUS_INVALID_PARAMETER)?;
+        job.current_job_memory_used = job
+            .current_job_memory_used
+            .checked_sub(bytes)
+            .ok_or(crate::STATUS_INVALID_PARAMETER)?;
+        Ok(())
+    }
+
+    pub fn memory_usage(&self, process_id: ProcessId) -> Result<(u64, u64), u32> {
+        let id = self
+            .job_for_process(process_id)
+            .ok_or(crate::STATUS_INVALID_HANDLE)?;
+        let job = self.get(id).ok_or(crate::STATUS_INVALID_HANDLE)?;
+        let member = job
+            .members
+            .iter()
+            .find(|member| member.process_id == process_id)
+            .ok_or(crate::STATUS_INVALID_HANDLE)?;
+        Ok((member.current_memory_used, job.current_job_memory_used))
+    }
+
     pub fn ui_restrictions(&self, id: JobId) -> Result<u32, u32> {
         self.get(id)
             .map(|job| job.ui_restrictions)
@@ -987,6 +1204,9 @@ impl JobStore {
         let job = self.get_mut(id).ok_or(crate::STATUS_INVALID_HANDLE)?;
         if association.port_id == 0 || job.completion_port.is_some() || job.close_done {
             return Err(crate::STATUS_INVALID_PARAMETER);
+        }
+        for member in &mut job.members {
+            member.memory_limit_reported = false;
         }
         job.completion_port = Some(association);
         Ok(())
@@ -1069,9 +1289,9 @@ mod tests {
         let mut jobs = JobStore::new();
         let first = jobs.create(3).unwrap();
         let other = jobs.create(3).unwrap();
-        assert_eq!(jobs.assign(first, 40, 4), Err(STATUS_ACCESS_DENIED));
-        assert_eq!(jobs.assign(first, 40, 3).unwrap().status, 0);
-        assert_eq!(jobs.assign(other, 40, 3), Err(STATUS_ACCESS_DENIED));
+        assert_eq!(jobs.assign(first, 40, 4, 0), Err(STATUS_ACCESS_DENIED));
+        assert_eq!(jobs.assign(first, 40, 3, 0).unwrap().status, 0);
+        assert_eq!(jobs.assign(other, 40, 3, 0), Err(STATUS_ACCESS_DENIED));
         assert_eq!(jobs.job_for_process(40), Some(first));
         let notices = jobs.exit_process(40, zero_times(12, 7), 5);
         assert_eq!(notices.iter().count(), 0);
@@ -1103,9 +1323,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(jobs.assign(job, 4, 0).unwrap().status, 0);
+        assert_eq!(jobs.assign(job, 4, 0, 0).unwrap().status, 0);
         assert_eq!(
-            jobs.assign(job, 8, 0).unwrap().status,
+            jobs.assign(job, 8, 0, 0).unwrap().status,
             STATUS_QUOTA_EXCEEDED
         );
         assert_eq!(jobs.job_for_process(8), Some(job));
@@ -1133,7 +1353,7 @@ mod tests {
             completion_key: 0xCAFE,
         };
         jobs.associate_completion_port(job, association).unwrap();
-        let assignment = jobs.assign(job, 44, 0).unwrap();
+        let assignment = jobs.assign(job, 44, 0, 0).unwrap();
         assert_eq!(
             assignment.notification.unwrap().message,
             JOB_OBJECT_MSG_NEW_PROCESS
@@ -1197,7 +1417,7 @@ mod tests {
         )
         .unwrap();
         jobs.retain_handle(job).unwrap();
-        jobs.assign(job, 12, 0).unwrap();
+        jobs.assign(job, 12, 0, 0).unwrap();
         assert!(jobs.release_handle(job).unwrap().kill_active_processes);
     }
 

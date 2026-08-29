@@ -17134,3 +17134,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Enable `PROCESS_MEMORY` and `JOB_MEMORY` only after assignment, inherited-job creation, limit
     updates, and rollback all use that composition. Working-set limits remain separate until MM owns
     resident-set trimming/pageout; committed bytes must not be relabelled as a working set.
+
+    Ps job-memory owner foundation (2026-08-30, accepted; live composition remains in progress):
+    each job member and job now own current commitment, high-water marks, and the NT one-shot memory
+    violation state. Admission and later charges use prepare/commit plans, accept a charge exactly at
+    the limit, reject only the first byte beyond it without changing usage, and reject stale plans.
+    Process and job violations queue the standard completion messages 9 and 10 against the exact PID;
+    associating the first completion port resets the report latch as NT5 does. Member deletion returns
+    any unreleased commitment defensively. Extended-limit setters round memory limits down to pages,
+    reject sub-page limits, preserve extended-only flags across a BasicLimit update, and ignore
+    user-supplied I/O/peak fields so queries expose only kernel accounting. Focused validation passes
+    `nt-process` `136/136`; the freestanding executive remains at the established 209-warning
+    baseline.
+
+    Review adjustment: MM per-process and Ps per-job owners are independently complete, but the
+    native memory flags remain disabled until their transaction is composed around live VAD changes.
+    The next step is to seed a process's MM ledger from `VmRegionMap::committed_bytes`, prepare both
+    charges before physical mapping, commit both only after the new VAD is published, release both
+    after successful decommit/release, and remove both records during final EPROCESS teardown. Job
+    assignment must pass the target's existing MM charge, and ExtendedLimit updates must publish the
+    effective process limit into every active member's MM record before the flags are accepted.
