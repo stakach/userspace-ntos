@@ -1,6 +1,6 @@
 [package]
 name = "nt-lpc-continuation"
-description = "Generation-exact kernel continuation state for blocking NT LPC receives (no_std + alloc, host-testable)."
+description = "Generation-exact kernel continuation state for blocking NT LPC services (no_std + alloc, host-testable)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

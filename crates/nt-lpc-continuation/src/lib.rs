@@ -1,9 +1,9 @@
-//! Kernel-owned continuation state for blocking NT LPC receive services.
+//! Kernel-owned continuation state for blocking NT LPC services.
 //!
 //! The broker owns ports, messages, and connection identity. This crate owns the small piece of
 //! kernel policy needed between a broker `STATUS_PENDING` result and the eventual syscall resume:
-//! reserve storage before the reply/wait transition, publish exactly one typed receive, and take it
-//! exactly once when data, disconnect, cancellation, or copyout completes the wait.
+//! reserve storage before the broker transition, publish exactly one typed wait, and take it
+//! exactly once when completion, refusal, disconnect, cancellation, or copyout ends the wait.
 
 #![no_std]
 
@@ -58,39 +58,20 @@ pub enum TableError {
     StaleReservation,
 }
 
-enum Slot<C> {
+enum Slot<T> {
     Empty,
-    Reserved {
-        generation: u64,
-    },
-    Occupied {
-        generation: u64,
-        value: PendingReceive<C>,
-    },
+    Reserved { generation: u64 },
+    Occupied { generation: u64, value: T },
 }
 
-/// Growable, generation-exact ownership table for pending LPC receives.
-///
-/// Allocation happens only in [`Self::reserve`], before the broker is allowed to commit the reply
-/// half of `NtReplyWaitReceivePort`. Publishing and completing a wait cannot allocate.
-pub struct ReceiveWaitTable<C> {
-    slots: Vec<Slot<C>>,
+struct GenerationTable<T> {
+    slots: Vec<Slot<T>>,
     initial_reserve: usize,
     next_generation: u64,
 }
 
-impl<C> Default for ReceiveWaitTable<C> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<C> ReceiveWaitTable<C> {
-    pub const fn new() -> Self {
-        Self::with_initial_reserve(DEFAULT_INITIAL_RESERVE)
-    }
-
-    pub const fn with_initial_reserve(initial_reserve: usize) -> Self {
+impl<T> GenerationTable<T> {
+    const fn with_initial_reserve(initial_reserve: usize) -> Self {
         Self {
             slots: Vec::new(),
             initial_reserve,
@@ -98,7 +79,7 @@ impl<C> ReceiveWaitTable<C> {
         }
     }
 
-    pub fn reset(&mut self) -> Result<(), TableError> {
+    fn reset(&mut self) -> Result<(), TableError> {
         self.slots.clear();
         if self.slots.capacity() < self.initial_reserve {
             self.slots
@@ -111,7 +92,7 @@ impl<C> ReceiveWaitTable<C> {
         Ok(())
     }
 
-    pub fn reserve(&mut self) -> Result<Reservation, TableError> {
+    fn reserve(&mut self) -> Result<Reservation, TableError> {
         let available = self
             .slots
             .iter()
@@ -130,7 +111,7 @@ impl<C> ReceiveWaitTable<C> {
         Ok(Reservation { slot, generation })
     }
 
-    pub fn cancel(&mut self, reservation: Reservation) -> Result<(), TableError> {
+    fn cancel(&mut self, reservation: Reservation) -> Result<(), TableError> {
         match self.slots.get(reservation.slot) {
             Some(Slot::Reserved { generation }) if *generation == reservation.generation => {
                 self.slots[reservation.slot] = Slot::Empty;
@@ -140,14 +121,7 @@ impl<C> ReceiveWaitTable<C> {
         }
     }
 
-    pub fn publish(
-        &mut self,
-        reservation: Reservation,
-        value: PendingReceive<C>,
-    ) -> Result<usize, TableError> {
-        if !value.request.is_valid() {
-            return Err(TableError::InvalidRequest);
-        }
+    fn publish(&mut self, reservation: Reservation, value: T) -> Result<usize, TableError> {
         match self.slots.get(reservation.slot) {
             Some(Slot::Reserved { generation }) if *generation == reservation.generation => {
                 self.slots[reservation.slot] = Slot::Occupied {
@@ -160,23 +134,21 @@ impl<C> ReceiveWaitTable<C> {
         }
     }
 
-    pub fn get(&self, slot: usize) -> Option<&PendingReceive<C>> {
+    fn get(&self, slot: usize) -> Option<&T> {
         match self.slots.get(slot) {
             Some(Slot::Occupied { value, .. }) => Some(value),
             _ => None,
         }
     }
 
-    pub fn occupied_slots(&self) -> impl Iterator<Item = usize> + '_ {
+    fn occupied_slots(&self) -> impl Iterator<Item = usize> + '_ {
         self.slots
             .iter()
             .enumerate()
             .filter_map(|(slot, entry)| matches!(entry, Slot::Occupied { .. }).then_some(slot))
     }
 
-    /// Return the next occupied slot in reservation order. This keeps receive polling FIFO even
-    /// after a low-numbered slot has been freed and reused by a newer waiter.
-    pub fn next_occupied_after(&self, generation: u64) -> Option<(usize, u64, &PendingReceive<C>)> {
+    fn next_occupied_after(&self, generation: u64) -> Option<(usize, u64, &T)> {
         self.slots
             .iter()
             .enumerate()
@@ -190,7 +162,7 @@ impl<C> ReceiveWaitTable<C> {
             .min_by_key(|(_, current, _)| *current)
     }
 
-    pub fn take(&mut self, slot: usize) -> Option<PendingReceive<C>> {
+    fn take(&mut self, slot: usize) -> Option<T> {
         let entry = self.slots.get_mut(slot)?;
         if !matches!(entry, Slot::Occupied { .. }) {
             return None;
@@ -202,16 +174,210 @@ impl<C> ReceiveWaitTable<C> {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.slots.iter().all(|slot| matches!(slot, Slot::Empty))
     }
 
-    pub fn slot_count(&self) -> usize {
+    fn slot_count(&self) -> usize {
         self.slots.len()
     }
 
-    pub fn allocation_capacity(&self) -> usize {
+    fn allocation_capacity(&self) -> usize {
         self.slots.capacity()
+    }
+}
+
+/// Growable, generation-exact ownership table for pending LPC receives.
+///
+/// Allocation happens only in [`Self::reserve`], before the broker is allowed to commit the reply
+/// half of `NtReplyWaitReceivePort`. Publishing and completing a wait cannot allocate.
+pub struct ReceiveWaitTable<C> {
+    inner: GenerationTable<PendingReceive<C>>,
+}
+
+impl<C> Default for ReceiveWaitTable<C> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<C> ReceiveWaitTable<C> {
+    pub const fn new() -> Self {
+        Self::with_initial_reserve(DEFAULT_INITIAL_RESERVE)
+    }
+
+    pub const fn with_initial_reserve(initial_reserve: usize) -> Self {
+        Self {
+            inner: GenerationTable::with_initial_reserve(initial_reserve),
+        }
+    }
+
+    pub fn reset(&mut self) -> Result<(), TableError> {
+        self.inner.reset()
+    }
+
+    pub fn reserve(&mut self) -> Result<Reservation, TableError> {
+        self.inner.reserve()
+    }
+
+    pub fn cancel(&mut self, reservation: Reservation) -> Result<(), TableError> {
+        self.inner.cancel(reservation)
+    }
+
+    pub fn publish(
+        &mut self,
+        reservation: Reservation,
+        value: PendingReceive<C>,
+    ) -> Result<usize, TableError> {
+        if !value.request.is_valid() {
+            return Err(TableError::InvalidRequest);
+        }
+        self.inner.publish(reservation, value)
+    }
+
+    pub fn get(&self, slot: usize) -> Option<&PendingReceive<C>> {
+        self.inner.get(slot)
+    }
+
+    pub fn occupied_slots(&self) -> impl Iterator<Item = usize> + '_ {
+        self.inner.occupied_slots()
+    }
+
+    /// Return the next occupied slot in reservation order. This keeps receive polling FIFO even
+    /// after a low-numbered slot has been freed and reused by a newer waiter.
+    pub fn next_occupied_after(&self, generation: u64) -> Option<(usize, u64, &PendingReceive<C>)> {
+        self.inner.next_occupied_after(generation)
+    }
+
+    pub fn take(&mut self, slot: usize) -> Option<PendingReceive<C>> {
+        self.inner.take(slot)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.inner.slot_count()
+    }
+
+    pub fn allocation_capacity(&self) -> usize {
+        self.inner.allocation_capacity()
+    }
+}
+
+/// Native connect operation represented by a blocked continuation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectOperation {
+    Connect,
+    SecureConnect,
+}
+
+/// Broker connection identity and caller output addresses retained while a connect is blocked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectRequest {
+    pub connection_id: u64,
+    pub port_handle: u64,
+    pub connection_information: u64,
+    pub connection_information_length: u64,
+    pub connection_information_capacity: u32,
+    pub operation: ConnectOperation,
+}
+
+impl ConnectRequest {
+    pub const fn is_valid(self) -> bool {
+        self.connection_id != 0 && self.port_handle != 0
+    }
+}
+
+/// One typed blocked connect plus the executive-specific continuation needed to resume it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingConnect<C> {
+    pub request: ConnectRequest,
+    pub continuation: C,
+}
+
+/// Growable, generation-exact ownership table for pending LPC connects.
+pub struct ConnectWaitTable<C> {
+    inner: GenerationTable<PendingConnect<C>>,
+}
+
+impl<C> Default for ConnectWaitTable<C> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<C> ConnectWaitTable<C> {
+    pub const fn new() -> Self {
+        Self::with_initial_reserve(DEFAULT_INITIAL_RESERVE)
+    }
+
+    pub const fn with_initial_reserve(initial_reserve: usize) -> Self {
+        Self {
+            inner: GenerationTable::with_initial_reserve(initial_reserve),
+        }
+    }
+
+    pub fn reset(&mut self) -> Result<(), TableError> {
+        self.inner.reset()
+    }
+
+    pub fn reserve(&mut self) -> Result<Reservation, TableError> {
+        self.inner.reserve()
+    }
+
+    pub fn cancel(&mut self, reservation: Reservation) -> Result<(), TableError> {
+        self.inner.cancel(reservation)
+    }
+
+    pub fn publish(
+        &mut self,
+        reservation: Reservation,
+        value: PendingConnect<C>,
+    ) -> Result<usize, TableError> {
+        if !value.request.is_valid() {
+            return Err(TableError::InvalidRequest);
+        }
+        if self.inner.occupied_slots().any(|slot| {
+            self.inner
+                .get(slot)
+                .is_some_and(|wait| wait.request.connection_id == value.request.connection_id)
+        }) {
+            return Err(TableError::InvalidRequest);
+        }
+        self.inner.publish(reservation, value)
+    }
+
+    pub fn get(&self, slot: usize) -> Option<&PendingConnect<C>> {
+        self.inner.get(slot)
+    }
+
+    pub fn occupied_slots(&self) -> impl Iterator<Item = usize> + '_ {
+        self.inner.occupied_slots()
+    }
+
+    pub fn find_connection(&self, connection_id: u64) -> Option<(usize, &PendingConnect<C>)> {
+        self.inner.occupied_slots().find_map(|slot| {
+            let wait = self.inner.get(slot)?;
+            (wait.request.connection_id == connection_id).then_some((slot, wait))
+        })
+    }
+
+    pub fn take(&mut self, slot: usize) -> Option<PendingConnect<C>> {
+        self.inner.take(slot)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.inner.slot_count()
+    }
+
+    pub fn allocation_capacity(&self) -> usize {
+        self.inner.allocation_capacity()
     }
 }
 
@@ -313,5 +479,72 @@ mod tests {
             tokens.push(wait.continuation);
         }
         assert_eq!(tokens, [2, 3, 4]);
+    }
+
+    fn connect(connection_id: u64, token: u64) -> PendingConnect<u64> {
+        PendingConnect {
+            request: ConnectRequest {
+                connection_id,
+                port_handle: 0x4000 + token,
+                connection_information: 0x5000 + token,
+                connection_information_length: 0x6000 + token,
+                connection_information_capacity: 32,
+                operation: ConnectOperation::Connect,
+            },
+            continuation: token,
+        }
+    }
+
+    #[test]
+    fn connect_reservation_is_generation_exact() {
+        let mut table = ConnectWaitTable::with_initial_reserve(1);
+        table.reset().unwrap();
+        let stale = table.reserve().unwrap();
+        table.cancel(stale).unwrap();
+        let current = table.reserve().unwrap();
+        assert_eq!(
+            table.publish(stale, connect(7, 10)),
+            Err(TableError::StaleReservation)
+        );
+        assert_eq!(table.publish(current, connect(7, 11)), Ok(0));
+        assert_eq!(table.find_connection(7).unwrap().1.continuation, 11);
+    }
+
+    #[test]
+    fn connect_completion_is_selected_by_broker_identity() {
+        let mut table = ConnectWaitTable::new();
+        for (connection_id, token) in [(41, 1), (43, 2), (42, 3)] {
+            let reservation = table.reserve().unwrap();
+            table
+                .publish(reservation, connect(connection_id, token))
+                .unwrap();
+        }
+        let (slot, wait) = table.find_connection(42).unwrap();
+        assert_eq!(wait.continuation, 3);
+        assert_eq!(table.take(slot).unwrap().request.connection_id, 42);
+        assert!(table.find_connection(42).is_none());
+        assert!(table.find_connection(41).is_some());
+        assert!(table.find_connection(43).is_some());
+    }
+
+    #[test]
+    fn duplicate_or_invalid_connect_identity_is_rejected() {
+        let mut table = ConnectWaitTable::new();
+        let first = table.reserve().unwrap();
+        table.publish(first, connect(9, 1)).unwrap();
+
+        let duplicate = table.reserve().unwrap();
+        assert_eq!(
+            table.publish(duplicate, connect(9, 2)),
+            Err(TableError::InvalidRequest)
+        );
+        table.cancel(duplicate).unwrap();
+
+        let invalid = table.reserve().unwrap();
+        assert_eq!(
+            table.publish(invalid, connect(0, 3)),
+            Err(TableError::InvalidRequest)
+        );
+        table.cancel(invalid).unwrap();
     }
 }
