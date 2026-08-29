@@ -21854,6 +21854,8 @@ struct ExecNtHandler {
     /// accept), writes the completed client comm-port handle, and replies winlogon. 0 = none.
     csr_rendezvous_conn: u64,
     csr_rendezvous_out: u64,
+    csr_rendezvous_conn_info: u64,
+    csr_rendezvous_conn_info_len: u64,
     /// The DATA-plane cache of established LPC connections (control/data-plane split): the isolated
     /// nt-lpc-server owns the namespace + rendezvous, but is NOT on the message path. When a CONNECT
     /// completes through the server, the executive records the connection here so the future message

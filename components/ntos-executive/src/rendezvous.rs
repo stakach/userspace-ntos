@@ -2484,9 +2484,64 @@ unsafe fn csr_stack_read(va: u64) -> Option<u64> {
 pub(crate) unsafe fn csr_stack_write(va: u64, v: u64) {
     let _ = csr_stack_copyout(va, &v.to_le_bytes());
 }
-/// Write a u16 to the CSR thread's stack (for PORT_MESSAGE.Type@0x04).
-pub(crate) unsafe fn csr_stack_write16(va: u64, v: u16) {
-    let _ = csr_stack_copyout(va, &v.to_le_bytes());
+fn build_csr_connection_request(
+    received: &nt_lpc_client::ReceiveResult,
+) -> Option<alloc::vec::Vec<u8>> {
+    if received.connection_id == 0
+        || received.msg_type != nt_lpc_client::LPC_CONNECTION_REQUEST
+        || received.connection_info.len() > nt_port_core::MAX_CONNINFO
+    {
+        return None;
+    }
+    let total = nt_lpc_abi::PORT_MESSAGE_HEADER_LEN.checked_add(received.connection_info.len())?;
+    let mut message = alloc::vec![0u8; total];
+    message[0..2].copy_from_slice(&(received.connection_info.len() as u16).to_le_bytes());
+    message[2..4].copy_from_slice(&(total as u16).to_le_bytes());
+    message[4..6].copy_from_slice(&received.msg_type.to_le_bytes());
+    message[8..16].copy_from_slice(&received.client_process.to_le_bytes());
+    message[16..24].copy_from_slice(&received.client_thread.to_le_bytes());
+    message[0x18..0x1c].copy_from_slice(&(received.connection_id as u32).to_le_bytes());
+    message[nt_lpc_abi::PORT_MESSAGE_HEADER_LEN..]
+        .copy_from_slice(&received.connection_info);
+    Some(message)
+}
+
+unsafe fn write_csr_connection_request(
+    receive_message: u64,
+    received: &nt_lpc_client::ReceiveResult,
+) -> bool {
+    build_csr_connection_request(received)
+        .is_some_and(|message| csr_stack_copyout(receive_message, &message))
+}
+
+unsafe fn capture_csr_connection_response(
+    message: u64,
+    expected_connection_id: u64,
+) -> Option<alloc::vec::Vec<u8>> {
+    let mut header = [0u8; 4];
+    if !csr_stack_copyin(message, &mut header) {
+        return None;
+    }
+    let data_len = u16::from_le_bytes(header[0..2].try_into().ok()?) as usize;
+    let total = nt_lpc_abi::port_message_total_length(header)?;
+    if data_len > nt_port_core::MAX_CONNINFO {
+        return None;
+    }
+    let mut bytes = alloc::vec![0u8; total];
+    if !csr_stack_copyin(message, &mut bytes)
+        || u16::from_le_bytes(bytes[4..6].try_into().ok()?)
+            != nt_lpc_client::LPC_CONNECTION_REQUEST
+        || u32::from_le_bytes(bytes[0x18..0x1c].try_into().ok()?) as u64
+            != expected_connection_id
+    {
+        return None;
+    }
+    Some(bytes[nt_lpc_abi::PORT_MESSAGE_HEADER_LEN..][..data_len].to_vec())
+}
+
+pub(crate) struct CsrConnectCompletion {
+    pub(crate) client_handle: u64,
+    pub(crate) connection_info: alloc::vec::Vec<u8>,
 }
 unsafe fn csr_sb_stack_write(va: u64, v: u64) {
     if va >= CSR_SB_STACK_BASE && va + 8 <= CSR_SB_STACK_BASE + CSR_SB_STACK_FRAMES * 0x1000 {
@@ -3042,13 +3097,9 @@ unsafe fn csr_sb_api_request_rendezvous(
 /// broker's pending connection + marshal the kernel-supplied connector `ClientId`) →
 /// [NtMapViewOfSection of
 /// the CSR shared section handled by this rendezvous path] → NtAcceptConnectPort (broker accept) → NtCompleteConnectPort
-/// (broker complete). Returns the client comm-port handle (0 on wall). After the accept reply, the
-/// worker is left to run into its next receive and the next rendezvous drains that state if needed.
-///
-/// The CSR_API_CONNECTINFO reply payload + shared-section mapping into clients are still
-/// executive-modeled (in `csr_client_connect`) because the isolated LPC broker carries no message
-/// payload across the connect. The accept decision itself is owned by the real CSR worker and is
-/// passed unchanged to the broker.
+/// (broker complete). Returns the client comm-port handle and the exact server-authored connection
+/// information (or `None` on a wall). After the accept reply, the worker is left to run into its
+/// next receive and the next rendezvous drains that state if needed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn csr_rendezvous(
     conn_id: u64,
@@ -3061,16 +3112,17 @@ pub(crate) unsafe fn csr_rendezvous(
     reg: &nt_dll_registry::Registry,
     dll_pes: &[Option<nt_pe_loader::PeFile>],
     nt_handler: &mut ExecNtHandler,
-) -> u64 {
+) -> Option<CsrConnectCompletion> {
     const SSN_REPLY_WAIT_RECV: u64 = 203;
     const SSN_ACCEPT_CONNECT: u64 = 0;
     const SSN_COMPLETE_CONNECT: u64 = 31;
     let ep = CSR_FAULT_EP.load(Ordering::Relaxed);
     let reply = REPLY_CSRLOOP_SLOT.load(Ordering::Relaxed);
     if ep == 0 || reply == 0 {
-        return 0;
+        return None;
     }
     let mut client_handle = 0u64;
+    let mut connection_info = alloc::vec::Vec::new();
     let mut server_client_pid = 0u32;
     let mut fill_idx = 0u64;
     let mut guard = 0u64;
@@ -3080,17 +3132,18 @@ pub(crate) unsafe fn csr_rendezvous(
             let port = CSR_API_RECVPORT.load(Ordering::Relaxed);
             let Some(r) = lpc_client().and_then(|c| c.reply_wait_receive(port).ok()) else {
                 CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
-                return 0;
+                return None;
             };
             if r.connection_id == 0 {
                 CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
-                return 0;
+                return None;
             }
             server_client_pid = r.client_process as u32;
             CSR_MSGS.fetch_add(1, Ordering::Relaxed);
-            csr_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST);
-            csr_stack_write(recvmsg + 0x08, r.client_process);
-            csr_stack_write(recvmsg + 0x10, r.client_thread);
+            if !write_csr_connection_request(recvmsg, &r) {
+                CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+                return None;
+            }
             reply_native_rendezvous(reply, 0);
             rendezvous_recv_full_r12(ep, reply, b"[csr-rdv]")
         } else {
@@ -3221,12 +3274,10 @@ pub(crate) unsafe fn csr_rendezvous(
                                 // real path (NtReplyWaitReceivePort returning a real connection) — count it.
                                 CSR_MSGS.fetch_add(1, Ordering::Relaxed);
                                 server_client_pid = r.client_process as u32;
-                                csr_stack_write16(
-                                    recvmsg + 0x04,
-                                    nt_lpc_client::LPC_CONNECTION_REQUEST,
-                                );
-                                csr_stack_write(recvmsg + 0x08, r.client_process);
-                                csr_stack_write(recvmsg + 0x10, r.client_thread);
+                                if !write_csr_connection_request(recvmsg, &r) {
+                                    print_str(b"[csr-rdv] WALL: invalid broker connection request\n");
+                                    break;
+                                }
                             }
                             _ => {
                                 // No pending connection (the re-park receive): leave the thread PARKED.
@@ -3254,8 +3305,23 @@ pub(crate) unsafe fn csr_rendezvous(
                         print_str(b" connector-tid=");
                         print_u64(csr_stack_read(get_recv_mr(7) + 16).unwrap_or(0));
                         print_str(b"\n");
+                        let Some(response_info) = capture_csr_connection_response(
+                            get_recv_mr(7),
+                            conn_id,
+                        ) else {
+                            print_str(b"[csr-rdv] WALL: could not capture accepted connection payload\n");
+                            break;
+                        };
                         let sh = lpc_client()
-                            .and_then(|c| c.accept_connect(conn_id, requested_accept, rdx).ok())
+                            .and_then(|c| {
+                                c.accept_connect_with_info(
+                                    conn_id,
+                                    requested_accept,
+                                    rdx,
+                                    &response_info,
+                                )
+                                .ok()
+                            })
                             .unwrap_or(0);
                         csr_stack_write(porthandle_out, sh);
                     }
@@ -3265,6 +3331,7 @@ pub(crate) unsafe fn csr_rendezvous(
                                 lpc_client().and_then(|c| c.complete_connect(conn_id).ok())
                             {
                                 client_handle = completed.handle;
+                                connection_info = completed.connection_info;
                             }
                         }
                     }
@@ -3301,5 +3368,8 @@ pub(crate) unsafe fn csr_rendezvous(
         print_str(b"\n");
         break;
     }
-    client_handle
+    (client_handle != 0).then_some(CsrConnectCompletion {
+        client_handle,
+        connection_info,
+    })
 }

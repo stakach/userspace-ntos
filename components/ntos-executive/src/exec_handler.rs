@@ -3127,6 +3127,8 @@ impl ExecNtHandler {
         write_field!(csr_start_request, 0);
         write_field!(csr_rendezvous_conn, 0);
         write_field!(csr_rendezvous_out, 0);
+        write_field!(csr_rendezvous_conn_info, 0);
+        write_field!(csr_rendezvous_conn_info_len, 0);
         write_field!(lpc_connections, alloc::vec::Vec::with_capacity(16));
         write_field!(winlogon_csr_view, 0);
         write_field!(csr_view_mask, 0);
@@ -24823,8 +24825,8 @@ impl ExecNtHandler {
     /// Service a Win32 process' kernel32 CSR client connect (NtSecureConnectPort → \Windows\ApiPort).
     ///
     /// csrss owns \Windows\ApiPort and pending connects are completed by the real
-    /// CsrApiRequestThread rendezvous. The executive still fills the CSR connect reply payload the
-    /// client reads back, because the isolated LPC broker does not carry that payload yet.
+    /// CsrApiRequestThread rendezvous. The broker returns the connection information authored by
+    /// that worker; the executive only retains the still-outstanding LPC client-view mapping.
     /// kernel32's BaseDllInitialize is FATAL on a failed connect and then
     /// dereferences the shared static server data (`Peb->ReadOnlyStaticServerData[BASESRV]->
     /// WindowsDirectory`), so this must hand back real, mapped memory:
@@ -24841,6 +24843,7 @@ impl ExecNtHandler {
         porthandle_ptr: u64,
         clientview_ptr: u64,
         conninfo_ptr: u64,
+        conninfo_len_ptr: u64,
     ) -> u32 {
         let ctx = match self.loop_ctx {
             Some(c) => c,
@@ -24862,14 +24865,42 @@ impl ExecNtHandler {
             CSR_RENDEZVOUS_FAILURES.fetch_add(1, Ordering::Relaxed);
             return 0xC000_0034;
         }
+        let mut connection_info = alloc::vec::Vec::new();
+        if conninfo_ptr != 0 || conninfo_len_ptr != 0 {
+            if conninfo_ptr == 0 || conninfo_len_ptr == 0 {
+                return STATUS_INVALID_PARAMETER;
+            }
+            let mut length = [0u8; 4];
+            if !self.xas_read(conninfo_len_ptr, &mut length) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            let length = u32::from_le_bytes(length) as usize;
+            if length > nt_port_core::MAX_CONNINFO {
+                return STATUS_INVALID_PARAMETER;
+            }
+            connection_info.resize(length, 0);
+            if !connection_info.is_empty()
+                && !self.xas_read(conninfo_ptr, connection_info.as_mut_slice())
+            {
+                return STATUS_ACCESS_VIOLATION;
+            }
+        }
         let mut pending = false;
         let client_process = self.pm_pid_for_pi(self.pi).unwrap_or(0) as u64;
         let client_thread = self.current_tid;
         if let Some(c) = lpc_client() {
-            match c.connect_port_with_client_id(name16, 2, &[], client_process, client_thread) {
+            match c.connect_port_with_client_id(
+                name16,
+                2,
+                &connection_info,
+                client_process,
+                client_thread,
+            ) {
                 Ok(r) if r.pending && r.connection_id != 0 => {
                     self.csr_rendezvous_conn = r.connection_id;
                     self.csr_rendezvous_out = porthandle_ptr;
+                    self.csr_rendezvous_conn_info = conninfo_ptr;
+                    self.csr_rendezvous_conn_info_len = conninfo_len_ptr;
                     pending = true;
                 }
                 Ok(r) => {
@@ -24996,21 +25027,7 @@ impl ExecNtHandler {
                 return 0xC000_0005;
             }
         }
-        // (4) Fill CSR_API_CONNECTINFO: kernel32 copies these into the PEB (ReadOnlySharedMemoryBase/
-        // Heap, ReadOnlyStaticServerData) + records ServerProcessId.
-        if conninfo_ptr != 0 {
-            if !self.xas_write_u64(conninfo_ptr + 0x08, WINLOGON_CSR_HEAP_VA) // SharedSectionBase
-                || !self.xas_write_u64(conninfo_ptr + 0x10, WINLOGON_CSR_STATIC_VA)
-                // SharedStaticServerData
-                || !self.xas_write_u64(conninfo_ptr + 0x18, WINLOGON_CSR_HEAP_VA)
-                // SharedSectionHeap
-                || !self.xas_write_u64(conninfo_ptr + 0x30, 8)
-            // ServerProcessId (csrss — plausible)
-            {
-                return 0xC000_0005;
-            }
-        }
-        // (5) *PortHandle = &CsrApiPort (an ntdll .data global). The loop writes the real client
+        // (4) *PortHandle = &CsrApiPort (an ntdll .data global). The loop writes the real client
         // communication-port handle after `csr_rendezvous` completes the pending connection.
         WINLOGON_CSR_CONNECTED.store(1, Ordering::Relaxed);
         CSR_CONNECTED_MASK.fetch_or(1u64 << self.pi, Ordering::Relaxed);
@@ -30027,7 +30044,14 @@ impl ExecNtHandler {
                 let porthandle_ptr = args[0];
                 let clientview_ptr = args[3];
                 let conninfo_ptr = args[7];
-                self.csr_client_connect(&name16, porthandle_ptr, clientview_ptr, conninfo_ptr)
+                let conninfo_len_ptr = args[8];
+                self.csr_client_connect(
+                    &name16,
+                    porthandle_ptr,
+                    clientview_ptr,
+                    conninfo_ptr,
+                    conninfo_len_ptr,
+                )
             },
             // NtRequestWaitReplyPort(PortHandle=R10, RequestMessage=RDX, ReplyMessage=R8) — the LPC
             // message DATA plane. SM requests are already driven through real SmpApiLoop. CSR API
