@@ -1632,9 +1632,46 @@ fn align_up_allocation_granularity(value: u64) -> Option<u64> {
         .map(|value| value & !(nt_address_space::ALLOCATION_GRANULARITY - 1))
 }
 
-unsafe fn allocate_private_vad_avoiding_fixed_authorities(
+#[derive(Clone, Copy)]
+enum VmVadKind {
+    Private,
+    Mapped,
+}
+
+fn allocate_vad_between(
+    map: &mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>,
+    kind: VmVadKind,
+    requested_base: Option<u64>,
+    requested_size: u64,
+    allocation_type: u32,
+    protection: u32,
+    lower_bound: u64,
+    upper_bound: u64,
+) -> Result<nt_address_space::VmAllocatePlan, u32> {
+    match kind {
+        VmVadKind::Private => map.allocate_between(
+            requested_base,
+            requested_size,
+            allocation_type,
+            protection,
+            lower_bound,
+            upper_bound,
+        ),
+        VmVadKind::Mapped => map.allocate_mapped_between(
+            requested_base,
+            requested_size,
+            allocation_type,
+            protection,
+            lower_bound,
+            upper_bound,
+        ),
+    }
+}
+
+unsafe fn allocate_vad_avoiding_fixed_authorities(
     before: &nt_address_space::VmRegionMap<VM_REGION_CAPACITY>,
     after: &mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>,
+    kind: VmVadKind,
     target_pi: usize,
     requested_base: Option<u64>,
     requested_size: u64,
@@ -1648,11 +1685,14 @@ unsafe fn allocate_private_vad_avoiding_fixed_authorities(
     let auto_placement = requested_base.is_none();
     if !auto_placement {
         *after = *before;
-        let plan = after.allocate_below(
+        let plan = allocate_vad_between(
+            after,
+            kind,
             requested_base,
             requested_size,
             allocation_type,
             protection,
+            0,
             placement_limit,
         )?;
         if fixed_mapping_authority_range_overlaps(before, target_pi, plan.base, plan.size) {
@@ -1666,7 +1706,9 @@ unsafe fn allocate_private_vad_avoiding_fixed_authorities(
     let mut upper_bound = placement_limit;
     for _ in 0..=FIXED_AUTHORITY_PLACEMENT_RETRY_LIMIT {
         *after = *before;
-        let plan = after.allocate_between(
+        let plan = allocate_vad_between(
+            after,
+            kind,
             None,
             requested_size,
             allocation_type,
@@ -3153,6 +3195,7 @@ impl ExecNtHandler {
         write_field!(lpc_connection_views, alloc::vec::Vec::with_capacity(32));
         write_field!(lpc_connections, alloc::vec::Vec::with_capacity(16));
         write_field!(pm, pm);
+        write_field!(process_commit, nt_memory_manager::ProcessCommitLedger::new());
         write_field!(process_mechanisms, ExecProcessMechanisms::reset());
         write_field!(hosted_images, hosted_images);
         write_field!(process_vspaces, zeroed_process_slot_u64_vec());
@@ -15347,6 +15390,77 @@ impl ExecNtHandler {
             .or_else(|| self.temporary_pi_for_pid(pid))
     }
 
+    unsafe fn ensure_process_commit_owner(
+        &mut self,
+        pid: nt_process::ProcessId,
+        pi: usize,
+    ) -> Result<(), u32> {
+        if self.process_commit.contains(pid) {
+            return Ok(());
+        }
+        let initial_bytes = process_vm_region_map(pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?
+            .private_committed_bytes();
+        self.process_commit.register(pid, initial_bytes)?;
+        if let Some(job) = self.pm.process_job(pid) {
+            let limits = self.pm.job_extended_limits(job)?;
+            let limit = if limits.basic.limit_flags
+                & nt_process::job::JOB_OBJECT_LIMIT_PROCESS_MEMORY
+                != 0
+            {
+                limits.process_memory_limit
+            } else {
+                0
+            };
+            if let Err(status) = self.process_commit.set_limit(pid, limit) {
+                let _ = self.process_commit.unregister(pid);
+                return Err(status);
+            }
+            let (recorded_process_bytes, _) = match self.pm.job_memory_usage(pid) {
+                Ok(usage) => usage,
+                Err(status) => {
+                    let _ = self.process_commit.unregister(pid);
+                    return Err(status);
+                }
+            };
+            let Some(delta) = initial_bytes.checked_sub(recorded_process_bytes) else {
+                let _ = self.process_commit.unregister(pid);
+                return Err(nt_process::STATUS_INVALID_PARAMETER);
+            };
+            if delta != 0 {
+                let plan = match self.pm.prepare_job_memory_charge(pid, delta) {
+                    Ok(Some(plan)) => plan,
+                    Ok(None) => unreachable!("a process with a job has a Ps memory owner"),
+                    Err(status) => {
+                        let _ = self.process_commit.unregister(pid);
+                        return Err(status);
+                    }
+                };
+                if let Err(status) = self.pm.commit_job_memory_charge(plan) {
+                    let _ = self.process_commit.unregister(pid);
+                    return Err(status);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_process_commit_limit(&mut self, pid: nt_process::ProcessId) -> Result<(), u32> {
+        let limit = match self.pm.process_job(pid) {
+            Some(job) => {
+                let limits = self.pm.job_extended_limits(job)?;
+                if limits.basic.limit_flags & nt_process::job::JOB_OBJECT_LIMIT_PROCESS_MEMORY != 0
+                {
+                    limits.process_memory_limit
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        };
+        self.process_commit.set_limit(pid, limit)
+    }
+
     pub(crate) fn resolve_process_for_access(
         &self,
         handle: u64,
@@ -16277,9 +16391,10 @@ impl ExecNtHandler {
         let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
         let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
         *before = *vm_map;
-        let plan = match allocate_private_vad_avoiding_fixed_authorities(
+        let plan = match allocate_vad_avoiding_fixed_authorities(
             before,
             after,
+            VmVadKind::Private,
             target_pi,
             (base_in != 0).then_some(base_in),
             want,
@@ -16293,6 +16408,35 @@ impl ExecNtHandler {
         crate::note_high_water(&crate::VM_REGION_HW, after.extent_count() as u64);
         if !created_vad && allocation_type != nt_address_space::MEM_RESET && copy_on_write {
             return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
+        }
+
+        let commit_delta = after
+            .private_committed_bytes()
+            .saturating_sub(before.private_committed_bytes());
+        let mut mm_charge = None;
+        let mut job_charge = None;
+        if commit_delta != 0 {
+            if let Err(status) = self.ensure_process_commit_owner(target_pid, target_pi) {
+                self.drain_job_notifications();
+                return status;
+            }
+            match self.process_commit.prepare_charge(target_pid, commit_delta) {
+                Ok(plan) => mm_charge = Some(plan),
+                Err(status) => {
+                    if status == nt_memory_manager::STATUS_COMMITMENT_LIMIT {
+                        let _ = self.pm.report_process_memory_limit_violation(target_pid);
+                        self.drain_job_notifications();
+                    }
+                    return status;
+                }
+            }
+            match self.pm.prepare_job_memory_charge(target_pid, commit_delta) {
+                Ok(plan) => job_charge = plan,
+                Err(status) => {
+                    self.drain_job_notifications();
+                    return status;
+                }
+            }
         }
 
         // Commit the plan EXTENT-WISE, not page-wise.
@@ -16407,6 +16551,16 @@ impl ExecNtHandler {
             return map_status;
         }
         *vm_map = *after;
+        if let Some(plan) = job_charge {
+            self.pm
+                .commit_job_memory_charge(plan)
+                .expect("serialized Ps job charge plan remains current through VAD publication");
+        }
+        if let Some(plan) = mm_charge {
+            self.process_commit
+                .commit_charge(plan)
+                .expect("serialized MM charge plan remains current through VAD publication");
+        }
         let size_written = self.user_memory_write(memory, size_ptr, &plan.size.to_le_bytes());
         let base_written = self.user_memory_write(memory, base_ptr, &plan.base.to_le_bytes());
         if !created_vad && (!size_written || !base_written) {
@@ -17339,6 +17493,15 @@ impl ExecNtHandler {
             Ok(plan) => plan,
             Err(status) => return status,
         };
+        let released_commit = before
+            .private_committed_bytes()
+            .saturating_sub(after.private_committed_bytes());
+        if released_commit != 0 {
+            if let Err(status) = self.ensure_process_commit_owner(target_pid, target_pi) {
+                self.drain_job_notifications();
+                return status;
+            }
+        }
         let _ = vm_page_lock_retire_range(target_pi as u64, plan.base, plan.size);
         let mut page = plan.base;
         while page < plan.base + plan.size {
@@ -17353,6 +17516,14 @@ impl ExecNtHandler {
             page += 0x1000;
         }
         *vm_map = *after;
+        if released_commit != 0 {
+            self.process_commit
+                .release(target_pid, released_commit)
+                .expect("MM commit release matches the published VAD delta");
+            self.pm
+                .release_job_memory(target_pid, released_commit)
+                .expect("Ps job commit release matches the published VAD delta");
+        }
         let _ = self.xas_write_u64(size_ptr, plan.size);
         let _ = self.xas_write_u64(base_ptr, plan.base);
         0
@@ -19010,6 +19181,16 @@ impl ExecNtHandler {
             if let Ok(Some(context)) = self.pm.replace_thread_impersonation(tid, None) {
                 let _ = self.token_store.release(context.token);
             }
+        }
+
+        if let Some(accounting) = self.process_commit.accounting(pid) {
+            if accounting.current_bytes != 0 {
+                self.pm
+                    .release_job_memory(pid, accounting.current_bytes)
+                    .expect("final MM commitment remains attached to the live Ps job member");
+            }
+            let removed = self.process_commit.unregister(pid);
+            debug_assert_eq!(removed, Some(accounting));
         }
 
         let Some(deletion) = self.pm.delete_process_object_if_unreferenced(pid) else {
@@ -22834,10 +23015,29 @@ impl ExecNtHandler {
         if self.pm.job_security_limits(id).unwrap_or(0) != 0 {
             return STATUS_NOT_SUPPORTED;
         }
-        let status = match self.pm.assign_process_to_job(id, pid) {
+        let Some(target_pi) = self.pi_for_pid(pid) else {
+            return nt_process::STATUS_INVALID_HANDLE;
+        };
+        if let Err(status) = unsafe { self.ensure_process_commit_owner(pid, target_pi) } {
+            self.drain_job_notifications();
+            return status;
+        }
+        let initial_commit_bytes = self
+            .process_commit
+            .accounting(pid)
+            .expect("registered process has MM commit accounting")
+            .current_bytes;
+        let status = match self
+            .pm
+            .assign_process_to_job_with_commit(id, pid, initial_commit_bytes)
+        {
             Ok(status) => status,
             Err(status) => return status,
         };
+        if status == 0 {
+            self.sync_process_commit_limit(pid)
+                .expect("accepted job memory limit is page-normalized for a registered process");
+        }
         self.refresh_job_time_sampling();
         self.drain_job_notifications();
         if status == nt_process::job::STATUS_QUOTA_EXCEEDED {
@@ -27047,9 +27247,10 @@ impl ExecNtHandler {
         let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
         let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
         *before = *vm_map;
-        let plan = allocate_private_vad_avoiding_fixed_authorities(
+        let plan = allocate_vad_avoiding_fixed_authorities(
             before,
             after,
+            VmVadKind::Mapped,
             target_pi,
             (base_in != 0).then_some(base_in),
             map_size,
@@ -27488,10 +27689,7 @@ impl ExecNtHandler {
         let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
         *before = *vm_map;
         *after = *before;
-        if after
-            .free(view.base, 0, nt_address_space::MEM_RELEASE)
-            .is_err()
-        {
+        if after.unmap_mapped(view.base).is_err() {
             return;
         }
         *vm_map = *after;
@@ -34490,7 +34688,7 @@ impl ExecNtHandler {
                         let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
                         *before = *vm_map;
                         *after = *before;
-                        let plan = match after.free(view.base, 0, nt_address_space::MEM_RELEASE) {
+                        let plan = match after.unmap_mapped(view.base) {
                             Ok(plan) => plan,
                             Err(status) => return status,
                         };

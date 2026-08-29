@@ -22258,6 +22258,9 @@ struct ExecNtHandler {
     /// VSpace/CSpace/TCB caps + mirror/scratch VAs stay executive-side because only the trusted root
     /// task holds those caps, linked to an EPROCESS through the process mechanism table.
     pm: nt_process::ProcessManager,
+    /// Per-process private commitment owned by the Memory Manager. Ps owns only aggregate job
+    /// admission; the executive composes their prepare/commit transactions around VAD mutation.
+    process_commit: nt_memory_manager::ProcessCommitLedger,
     /// Allocation-free hosted process mechanism slots keyed by NT PID/TID/badge. Backed by BSS;
     /// the handler owns only the exclusive wrapper while it is live.
     process_mechanisms: ExecProcessMechanisms,

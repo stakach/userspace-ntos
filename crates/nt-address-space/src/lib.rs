@@ -136,6 +136,7 @@ pub const STATUS_COMMITMENT_LIMIT: u32 = 0xC000_012D;
 pub const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 pub const STATUS_UNABLE_TO_FREE_VM: u32 = 0xC000_001A;
+pub const STATUS_UNABLE_TO_DELETE_SECTION: u32 = 0xC000_001B;
 pub const STATUS_FREE_VM_NOT_AT_BASE: u32 = 0xC000_009F;
 pub const STATUS_MEMORY_NOT_ALLOCATED: u32 = 0xC000_00A0;
 pub const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
@@ -351,8 +352,9 @@ pub enum VmExtentState {
     Committed,
 }
 
-/// One contiguous part of a private allocation. Splitting an allocation preserves its original
-/// `allocation_base`, which lets release/decommit apply ReactOS VAD rules without heap allocation.
+/// One contiguous part of a private allocation or mapped section view. Splitting an allocation
+/// preserves its original `allocation_base` and mapping type, which lets release/decommit and
+/// section unmap apply their distinct NT VAD rules without heap allocation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct VmExtent {
     pub base: u64,
@@ -360,6 +362,7 @@ pub struct VmExtent {
     pub allocation_base: u64,
     pub protection: u32,
     pub state: VmExtentState,
+    pub type_: u32,
 }
 
 impl VmExtent {
@@ -1302,6 +1305,16 @@ impl<const N: usize> VmRegionMap<N> {
             .fold(0u64, |total, extent| total.saturating_add(extent.size))
     }
 
+    pub fn private_committed_bytes(&self) -> u64 {
+        self.extents
+            .iter()
+            .flatten()
+            .filter(|extent| {
+                extent.state == VmExtentState::Committed && extent.type_ == MEM_PRIVATE
+            })
+            .fold(0u64, |total, extent| total.saturating_add(extent.size))
+    }
+
     pub fn extent_at(&self, address: u64) -> Option<VmExtent> {
         self.extents
             .iter()
@@ -1412,7 +1425,7 @@ impl<const N: usize> VmRegionMap<N> {
                 region_size: end - base,
                 state,
                 protect,
-                type_: MEM_PRIVATE,
+                type_: extent.type_,
             })
         } else {
             let next = self
@@ -1476,6 +1489,7 @@ impl<const N: usize> VmRegionMap<N> {
                     || current.allocation_base != next.allocation_base
                     || current.protection != next.protection
                     || current.state != next.state
+                    || current.type_ != next.type_
                 {
                     break;
                 }
@@ -1494,6 +1508,7 @@ impl<const N: usize> VmRegionMap<N> {
                 && last.allocation_base == extent.allocation_base
                 && last.protection == extent.protection
                 && last.state == extent.state
+                && last.type_ == extent.type_
             {
                 last.size += extent.size;
                 return Ok(());
@@ -1728,6 +1743,50 @@ impl<const N: usize> VmRegionMap<N> {
         lower_bound: u64,
         upper_bound: u64,
     ) -> Result<VmAllocatePlan, u32> {
+        self.allocate_between_type(
+            requested_base,
+            requested_size,
+            allocation_type,
+            protection,
+            lower_bound,
+            upper_bound,
+            MEM_PRIVATE,
+        )
+    }
+
+    /// Reserve and commit a mapped-section VAD while sharing the private allocator's placement and
+    /// overlap policy. Mapped VADs can be removed only through [`Self::unmap_mapped`].
+    pub fn allocate_mapped_between(
+        &mut self,
+        requested_base: Option<u64>,
+        requested_size: u64,
+        allocation_type: u32,
+        protection: u32,
+        lower_bound: u64,
+        upper_bound: u64,
+    ) -> Result<VmAllocatePlan, u32> {
+        self.allocate_between_type(
+            requested_base,
+            requested_size,
+            allocation_type,
+            protection,
+            lower_bound,
+            upper_bound,
+            MEM_MAPPED,
+        )
+    }
+
+    fn allocate_between_type(
+        &mut self,
+        requested_base: Option<u64>,
+        requested_size: u64,
+        allocation_type: u32,
+        protection: u32,
+        lower_bound: u64,
+        upper_bound: u64,
+        type_: u32,
+    ) -> Result<VmAllocatePlan, u32> {
+        debug_assert!(matches!(type_, MEM_PRIVATE | MEM_MAPPED));
         validate_allocate_parameters(0, allocation_type, protection)?;
         let lower_bound = lower_bound.max(self.lower_bound);
         let upper_bound = upper_bound.min(self.upper_bound);
@@ -1807,6 +1866,7 @@ impl<const N: usize> VmRegionMap<N> {
                 } else {
                     VmExtentState::Reserved
                 },
+                type_,
             })?;
             self.normalize();
             self.clear_protection_overrides(base, end);
@@ -1828,6 +1888,12 @@ impl<const N: usize> VmRegionMap<N> {
                 return Err(STATUS_CONFLICTING_ADDRESSES);
             }
             if self.allocation_for_range(base, end).is_err() {
+                return Err(STATUS_CONFLICTING_ADDRESSES);
+            }
+            if self
+                .extent_at(base)
+                .is_none_or(|extent| extent.type_ != type_)
+            {
                 return Err(STATUS_CONFLICTING_ADDRESSES);
             }
             self.rewrite_range(
@@ -1855,6 +1921,9 @@ impl<const N: usize> VmRegionMap<N> {
         }
         let base = requested_base & !(PAGE_SIZE - 1);
         let first = self.extent_at(base).ok_or(STATUS_MEMORY_NOT_ALLOCATED)?;
+        if first.type_ != MEM_PRIVATE {
+            return Err(STATUS_UNABLE_TO_DELETE_SECTION);
+        }
         let allocation_base = first.allocation_base;
         let end = if requested_size == 0 {
             if base != first.base || first.base != allocation_base {
@@ -1890,6 +1959,27 @@ impl<const N: usize> VmRegionMap<N> {
             base,
             size: end - base,
             free_type,
+        })
+    }
+
+    /// Remove an entire mapped section allocation. `NtUnmapViewOfSection` accepts an address within
+    /// the view, while `NtFreeVirtualMemory` must refuse the same VAD.
+    pub fn unmap_mapped(&mut self, address: u64) -> Result<VmFreePlan, u32> {
+        let base = address & !(PAGE_SIZE - 1);
+        let first = self.extent_at(base).ok_or(STATUS_MEMORY_NOT_ALLOCATED)?;
+        if first.type_ != MEM_MAPPED {
+            return Err(STATUS_UNABLE_TO_DELETE_SECTION);
+        }
+        let allocation_base = first.allocation_base;
+        let end = self
+            .allocation_end(allocation_base)
+            .ok_or(STATUS_MEMORY_NOT_ALLOCATED)?;
+        self.rewrite_range(allocation_base, end, None)?;
+        self.clear_protection_overrides(allocation_base, end);
+        Ok(VmFreePlan {
+            base: allocation_base,
+            size: end - allocation_base,
+            free_type: MEM_RELEASE,
         })
     }
 

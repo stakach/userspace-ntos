@@ -392,6 +392,42 @@ fn fixed_vm_map_reserves_commits_and_reuses_without_allocation() {
 }
 
 #[test]
+fn fixed_vm_map_keeps_mapped_views_out_of_private_commitment() {
+    let mut map = VmRegionMap::<8>::new(0x10000, 0x20_0000);
+    let private = map
+        .allocate(None, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        .unwrap();
+    let mapped = map
+        .allocate_mapped_between(
+            None,
+            0x3000,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READONLY,
+            0x10000,
+            0x20_0000,
+        )
+        .unwrap();
+
+    assert_eq!(map.committed_bytes(), 0x5000);
+    assert_eq!(map.private_committed_bytes(), 0x2000);
+    assert_eq!(
+        map.query_basic(mapped.base, 0x20_0000).unwrap().type_,
+        MEM_MAPPED
+    );
+    assert_eq!(
+        map.free(mapped.base, 0, MEM_RELEASE),
+        Err(STATUS_UNABLE_TO_DELETE_SECTION)
+    );
+
+    let unmapped = map.unmap_mapped(mapped.base + 0x1000).unwrap();
+    assert_eq!(unmapped.base, mapped.base);
+    assert_eq!(unmapped.size, mapped.size);
+    assert!(map.extent_at(mapped.base).is_none());
+    assert!(map.extent_at(private.base).is_some());
+    assert_eq!(map.private_committed_bytes(), 0x2000);
+}
+
+#[test]
 fn fixed_vm_map_decommit_and_partial_release_split_vad() {
     let mut map = VmRegionMap::<8>::new(0x10000, 0x20_0000);
     let allocation = map

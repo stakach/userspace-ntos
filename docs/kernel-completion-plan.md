@@ -17135,6 +17135,34 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     updates, and rollback all use that composition. Working-set limits remain separate until MM owns
     resident-set trimming/pageout; committed bytes must not be relabelled as a working set.
 
+    Private-VAD MM/Ps composition and mapped-VAD classification (2026-08-30, accepted; complete
+    process commitment remains in progress): Ps now enforces only aggregate job commitment and owns
+    its completion-port report latches. The MM ledger is the sole per-process limit authority and
+    explicitly asks Ps to publish message 9 after an MM refusal; Ps no longer duplicates the MM
+    comparison. `NtAllocateVirtualMemory` prepares the MM and Ps charges before mapping any page and
+    commits both only after publishing the changed private VAD. `NtFreeVirtualMemory` releases both
+    owners only after the decommit/release is published, assignment carries the existing MM charge,
+    and final EPROCESS deletion removes the ledgers before Ps drops job membership.
+
+    The address-space owner now records whether each allocatable VAD is `MEM_PRIVATE` or
+    `MEM_MAPPED`. Private commitment excludes mapped views, `NtFreeVirtualMemory` rejects a section
+    VAD with `STATUS_UNABLE_TO_DELETE_SECTION`, and generic-section rollback plus
+    `NtUnmapViewOfSection` use a dedicated whole-view unmap operation. This removes the prior
+    ambiguity where a shared section view looked like private commitment solely because both used
+    the same placement map. Focused validation passes `nt-process` `136/136` and
+    `nt-address-space` `61/61`; the freestanding executive remains at the established 209-warning
+    baseline.
+
+    Review adjustment: `PROCESS_MEMORY` and `JOB_MEMORY` deliberately remain unsupported at the
+    native setter. The NT5 audit shows that authoritative `EPROCESS.CommitCharge` also includes
+    fixed private process pages (PEB/TEB and committed stacks), copy-on-write reservation charged at
+    image/section map time, and committed user page-table pages. The next slice must make those
+    sources explicit MM charge owners, include later thread creation and teardown, and seed job
+    assignment from that complete ledger. Shared non-writecopy section commitment belongs to the
+    section/control-area owner and must not be charged once per mapped process. Enable the two job
+    flags only after all of those paths and their rollback edges are transactional; do not revert to
+    `VmRegionMap::committed_bytes()` as an approximate process total.
+
     Ps job-memory owner foundation (2026-08-30, accepted; live composition remains in progress):
     each job member and job now own current commitment, high-water marks, and the NT one-shot memory
     violation state. Admission and later charges use prepare/commit plans, accept a charge exactly at
