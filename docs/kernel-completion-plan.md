@@ -15782,3 +15782,37 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     both map calls through the typed service and delete the synthetic map-success arms and client
     projection together. The generic map handler must not be reused unchanged: its current anonymous
     CSR branch maps into CSRSS's active address space even when the syscall names another process.
+
+    CSR shared-section VM convergence (2026-08-29, accepted): CSRSS's anonymous CSR section now uses
+    the ordinary generic section-object table, process-local typed `Section` handle, target-process
+    VAD allocation, committed-view registration, and shared-frame fault path. The former fixed
+    `CSRSS_ANON_BASE`, one-off anonymous page-fault handler, loop-local section identity, query
+    special case, and both private-worker empty-success `NtMapViewOfSection` arms are deleted. The
+    private CSR worker dispatches its real ten-argument map call through the registered native
+    service. Generic section copyout now follows the dispatcher's scoped `SyscallUserMemory` policy,
+    so ordinary CSRSS globals and private worker stacks share one implementation instead of ending
+    in a CSRSS-only copy helper. Host validation keeps `nt-memory-manager` green at `17/17`; the
+    freestanding executive and release staging build pass at the established 212-warning baseline.
+    Code checkpoint `1ddaf6cb` is pushed.
+
+    Serialized acceptance `.tmp/run-headless-csr-shared-copyout-20260829.log` maps the same real
+    12 MiB section into CSRSS and 14 client views. Every observed private-worker
+    `NtMapViewOfSection` returns `STATUS_SUCCESS`, every real CSRSS connection decision remains
+    `AllowConnection=TRUE`, and no rejected connection or rendezvous wall occurs. Genuine userinit
+    and Explorer launch, 668 Explorer api0 redirects complete with zero callback or dead-callback
+    failures, paint begin/end reaches `5/20` with 187 direct GDI returns and 135 batch flushes
+    covering 184 records, and the framebuffer holds `480000/480000` non-background pixels with at
+    least 32 colours. All `295/295` gates pass and the sentinel matches. The census reports generic
+    section objects/views/shared pages without page-table, frame, mapping, alias, registry,
+    untyped-allocation, frame-registration, image-bank, or allocator failure.
+
+    Review adjustment: server-side shared-section creation, mapping, target-process VAD ownership,
+    and page sharing are now canonical. The remaining CSR connection-view debt is exclusively the
+    client boundary: `csr_client_connect` still installs a separate fixed 64 KiB heap plus static
+    server-data pages and fabricates `PORT_VIEW`/`CSR_API_CONNECTINFO` fields after the broker
+    connection completes. Extend the LPC connection transaction so CSRSS's captured and mutated
+    connection-request payload is committed by `NtAcceptConnectPort`/`NtCompleteConnectPort` and
+    returned to the connecting client. Then make ntdll submit the real client `PORT_VIEW`, consume
+    the returned server view/connect payload, and delete the executive projection in the same
+    accepted slice. Do not preserve the fixed client mappings or synthesize a successful payload if
+    the server did not publish one.
