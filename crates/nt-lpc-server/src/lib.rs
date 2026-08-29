@@ -964,4 +964,48 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn server_comm_reply_then_receive_uses_shared_connection_port() {
+        let mut s = Server::new();
+        s.set_accept_policy(AcceptPolicy::Manual);
+        let (listen, first_connection) = {
+            let mut c = LpcClient::new(Direct {
+                server: &mut s,
+                out: [0; 512],
+            });
+            let listen = c.create_port(&utf16("\\Windows\\ApiPort"), 0, 0x148, 0).unwrap();
+            let pending = c
+                .connect_port(&utf16("\\Windows\\ApiPort"), 2, &[])
+                .unwrap();
+            (listen, pending.connection_id)
+        };
+        let first_server = {
+            let mut c = LpcClient::new(Direct {
+                server: &mut s,
+                out: [0; 512],
+            });
+            c.reply_wait_receive(listen).unwrap();
+            let server = c.accept_connect(first_connection, true, 0x1111).unwrap();
+            c.complete_connect(server).unwrap();
+            server
+        };
+        let second_connection = {
+            let mut c = LpcClient::new(Direct {
+                server: &mut s,
+                out: [0; 512],
+            });
+            c.connect_port(&utf16("\\Windows\\ApiPort"), 2, &[])
+                .unwrap()
+                .connection_id
+        };
+
+        let mut c = LpcClient::new(Direct {
+            server: &mut s,
+            out: [0; 512],
+        });
+        let received = c.reply_wait_receive(first_server).unwrap();
+        assert_eq!(received.connection_id, second_connection);
+        assert_eq!(received.msg_type, msg_type::LPC_CONNECTION_REQUEST);
+    }
 }

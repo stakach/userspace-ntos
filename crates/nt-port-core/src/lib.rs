@@ -461,11 +461,13 @@ impl PortCore {
 
     /// Receive the next pending connection request on a server port.
     pub fn receive(&mut self, port_handle: u64) -> Result<ReceiveOutcome, NtStatus> {
-        let port = self
+        let port_index = self
             .ports
-            .iter_mut()
-            .find(|p| p.handle == port_handle)
+            .iter()
+            .position(|port| port.handle == port_handle)
+            .or_else(|| self.connection_port_index_for_server_handle(port_handle))
             .ok_or(NtStatus::INVALID_HANDLE)?;
+        let port = &mut self.ports[port_index];
         if port.pending.is_empty() {
             return Ok(ReceiveOutcome::WouldBlock);
         }
@@ -605,15 +607,13 @@ impl PortCore {
                     Some(conn.client_inbox.remove(0))
                 });
             }
-            if handle != 0 && conn.server_handle == handle {
-                return Ok(if conn.server_inbox.is_empty() {
-                    None
-                } else {
-                    Some(conn.server_inbox.remove(0))
-                });
-            }
         }
-        if let Some(port_index) = self.ports.iter().position(|port| port.handle == handle) {
+        let port_index = self
+            .ports
+            .iter()
+            .position(|port| port.handle == handle)
+            .or_else(|| self.connection_port_index_for_server_handle(handle));
+        if let Some(port_index) = port_index {
             let connection_index = self.connections.iter().position(|conn| {
                 conn.state == ConnState::Connected
                     && conn.server_api == self.ports[port_index].api
@@ -629,6 +629,19 @@ impl PortCore {
             return Ok(None);
         }
         Err(NtStatus::INVALID_HANDLE)
+    }
+
+    /// NT server communication ports reply to one client but receive from their associated named
+    /// connection port. Resolve that shared receive queue without exposing a second identity to API
+    /// adapters.
+    fn connection_port_index_for_server_handle(&self, handle: u64) -> Option<usize> {
+        let connection = self
+            .connections
+            .iter()
+            .find(|connection| handle != 0 && connection.server_handle == handle)?;
+        self.ports.iter().position(|port| {
+            port.api == connection.server_api && port.name == connection.port_name
+        })
     }
 
     // --- internals --------------------------------------------------------
@@ -891,6 +904,54 @@ mod tests {
         assert!(core.receive_message(clients[0]).unwrap().is_none());
         assert_eq!(
             core.receive_message(clients[1]).unwrap().unwrap().bytes,
+            b"reply"
+        );
+    }
+
+    #[test]
+    fn server_comm_port_receives_from_its_connection_port() {
+        let mut core = PortCore::new();
+        core.set_accept_policy(AcceptPolicy::Manual);
+        let listen = core.create_port(&utf16("\\P"), PortApi::Lpc);
+
+        let first_connection = match core.connect(&utf16("\\P"), PortApi::Lpc, 0, &[]).unwrap() {
+            ConnectOutcome::Pending { connection_id } => connection_id,
+            _ => unreachable!(),
+        };
+        core.receive(listen).unwrap();
+        let first_server = core.accept(first_connection, true, 0x1111).unwrap();
+        let first_client = core.complete(first_connection).unwrap().0;
+
+        let second_connection = match core.connect(&utf16("\\P"), PortApi::Lpc, 0, &[]).unwrap() {
+            ConnectOutcome::Pending { connection_id } => connection_id,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            core.receive(first_server).unwrap(),
+            ReceiveOutcome::ConnectionRequest {
+                connection_id: second_connection,
+                msg_type: port_message_type::CONNECTION_REQUEST,
+            }
+        );
+        let second_server = core.accept(second_connection, true, 0x2222).unwrap();
+        let second_client = core.complete(second_connection).unwrap().0;
+
+        core.send_message(first_client, b"first", MessageAttrs::default())
+            .unwrap();
+        assert_eq!(
+            core.receive_message(first_server).unwrap().unwrap().bytes,
+            b"first"
+        );
+        core.send_message(second_client, b"second", MessageAttrs::default())
+            .unwrap();
+        let received = core.receive_message(first_server).unwrap().unwrap();
+        assert_eq!(received.bytes, b"second");
+        assert_eq!(received.port_context, 0x2222);
+
+        core.send_message(second_server, b"reply", MessageAttrs::default())
+            .unwrap();
+        assert_eq!(
+            core.receive_message(second_client).unwrap().unwrap().bytes,
             b"reply"
         );
     }
