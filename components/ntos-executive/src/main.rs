@@ -562,9 +562,13 @@ pub const fn tp_worker_env_scratch_va(pi: usize, slot: usize) -> u64 {
 
 pub const TP_WORKER_STACK_FRAME_COUNT: usize = TP_WORKER_STACK_FRAMES as usize;
 
-#[derive(Clone, Copy)]
-struct HostedTpWorkerWindowResources {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HostedThreadResources {
     live: bool,
+    client_pi: usize,
+    stack_base: u64,
+    stack_frames: u64,
+    teb_va: u64,
     stack_owner: [u64; TP_WORKER_STACK_FRAME_COUNT],
     stack_target: [u64; TP_WORKER_STACK_FRAME_COUNT],
     stack_mirror: [u64; TP_WORKER_STACK_FRAME_COUNT],
@@ -581,10 +585,14 @@ struct HostedTpWorkerWindowResources {
     tramp_target: u64,
 }
 
-impl HostedTpWorkerWindowResources {
+impl HostedThreadResources {
     const fn empty() -> Self {
         Self {
             live: false,
+            client_pi: 0,
+            stack_base: 0,
+            stack_frames: 0,
+            teb_va: 0,
             stack_owner: [0; TP_WORKER_STACK_FRAME_COUNT],
             stack_target: [0; TP_WORKER_STACK_FRAME_COUNT],
             stack_mirror: [0; TP_WORKER_STACK_FRAME_COUNT],
@@ -601,53 +609,16 @@ impl HostedTpWorkerWindowResources {
             tramp_target: 0,
         }
     }
-}
 
-static HOSTED_TP_WORKER_WINDOW_RESOURCE_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
-static mut HOSTED_TP_WORKER_WINDOW_RESOURCES: alloc::vec::Vec<
-    [HostedTpWorkerWindowResources; TP_WORKER_SLOT_COUNT],
-> = alloc::vec::Vec::new();
-
-pub(crate) unsafe fn reset_hosted_tp_worker_window_resources(slots: usize) -> bool {
-    let table = &mut *core::ptr::addr_of_mut!(HOSTED_TP_WORKER_WINDOW_RESOURCES);
-    table.clear();
-    if table.try_reserve(slots).is_err() {
-        HOSTED_TP_WORKER_WINDOW_RESOURCE_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
-        return false;
+    const fn new(client_pi: usize, stack_base: u64, stack_frames: u64, teb_va: u64) -> Self {
+        let mut resources = Self::empty();
+        resources.live = true;
+        resources.client_pi = client_pi;
+        resources.stack_base = stack_base;
+        resources.stack_frames = stack_frames;
+        resources.teb_va = teb_va;
+        resources
     }
-    while table.len() < slots {
-        table.push([HostedTpWorkerWindowResources::empty(); TP_WORKER_SLOT_COUNT]);
-    }
-    true
-}
-
-fn hosted_tp_worker_window_resource_stats() -> (usize, usize, u64) {
-    unsafe {
-        let table = &*core::ptr::addr_of!(HOSTED_TP_WORKER_WINDOW_RESOURCES);
-        (
-            table.len(),
-            table.capacity(),
-            HOSTED_TP_WORKER_WINDOW_RESOURCE_ALLOCATION_FAILURES.load(Ordering::Relaxed),
-        )
-    }
-}
-
-fn hosted_tp_worker_slot_from_layout(
-    pi: usize,
-    stack_base: u64,
-    teb_va: u64,
-    ipcbuf_va: u64,
-    tramp_va: u64,
-) -> Option<usize> {
-    if pi >= MAX_PI {
-        return None;
-    }
-    (0..TP_WORKER_SLOT_COUNT).find(|&slot| {
-        stack_base == tp_worker_stack_base(slot)
-            && teb_va == tp_worker_teb_va(slot)
-            && ipcbuf_va == tp_worker_ipcbuf_va(slot)
-            && tramp_va == tp_worker_tramp_va(slot)
-    })
 }
 
 unsafe fn recycle_mapped_cap(cap: u64) {
@@ -693,42 +664,29 @@ unsafe fn release_mapped_owned_thread_frame(owner: u64) {
     }
 }
 
-unsafe fn store_hosted_tp_worker_window_resources(
-    pi: usize,
-    slot: usize,
-    resources: HostedTpWorkerWindowResources,
-) {
-    let table = &mut *core::ptr::addr_of_mut!(HOSTED_TP_WORKER_WINDOW_RESOURCES);
-    if pi < table.len() && slot < TP_WORKER_SLOT_COUNT {
-        table[pi][slot] = resources;
-    }
-}
-
-pub(crate) unsafe fn release_hosted_tp_worker_window_resources(pi: usize, slot: usize) {
-    let table = &mut *core::ptr::addr_of_mut!(HOSTED_TP_WORKER_WINDOW_RESOURCES);
-    if pi >= table.len() || slot >= TP_WORKER_SLOT_COUNT {
-        return;
-    }
-    let resources = table[pi][slot];
+unsafe fn release_hosted_thread_resources(resources: HostedThreadResources) {
     if !resources.live {
         return;
     }
-    table[pi][slot] = HostedTpWorkerWindowResources::empty();
 
-    for index in 0..TP_WORKER_STACK_FRAME_COUNT {
-        let page = tp_worker_stack_base(slot) + index as u64 * 0x1000;
-        take_registered_thread_page(pi, page, resources.stack_owner[index]);
+    for index in 0..resources.stack_frames.min(TP_WORKER_STACK_FRAMES) as usize {
+        let page = resources.stack_base + index as u64 * 0x1000;
+        take_registered_thread_page(resources.client_pi, page, resources.stack_owner[index]);
         recycle_mapped_cap(resources.stack_target[index]);
         recycle_mapped_cap(resources.stack_mirror[index]);
         release_unmapped_owned_thread_frame(resources.stack_owner[index]);
     }
 
-    take_registered_thread_page(pi, tp_worker_teb_va(slot), resources.teb_owner);
+    take_registered_thread_page(resources.client_pi, resources.teb_va, resources.teb_owner);
     recycle_mapped_cap(resources.teb_target);
     recycle_mapped_cap(resources.teb_scratch);
     release_unmapped_owned_thread_frame(resources.teb_owner);
 
-    take_registered_thread_page(pi, tp_worker_teb_va(slot) + 0x1000, resources.teb2_owner);
+    take_registered_thread_page(
+        resources.client_pi,
+        resources.teb_va + 0x1000,
+        resources.teb2_owner,
+    );
     recycle_mapped_cap(resources.teb2_target);
     recycle_mapped_cap(resources.teb2_scratch);
     release_unmapped_owned_thread_frame(resources.teb2_owner);
@@ -10265,13 +10223,6 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(pfilled_cap as u64);
     print_str(b"/");
     print_u64(pfilled_fails);
-    let (tp_win_len, tp_win_cap, tp_win_fails) = hosted_tp_worker_window_resource_stats();
-    print_str(b" tp-worker-win=");
-    print_u64(tp_win_len as u64);
-    print_str(b"/");
-    print_u64(tp_win_cap as u64);
-    print_str(b"/");
-    print_u64(tp_win_fails);
     let (tp_trace_len, tp_trace_cap, tp_trace_fails, tp_trace_misses) =
         tp_worker_slot_event_trace_row_stats();
     print_str(b" tp-worker-event-rows=");
@@ -17707,6 +17658,7 @@ pub(crate) unsafe fn release_unregistered_hosted_thread_spawn(spawn: HostedThrea
         let _ = tcb_suspend_r(spawn.tcb());
         let _ = cnode_delete_recycle_r(spawn.tcb());
     }
+    release_hosted_thread_resources(spawn.resources());
     release_hosted_thread_mechanism_caps(0, spawn.mechanism());
 }
 
@@ -17830,10 +17782,11 @@ unsafe fn terminate_hosted_thread_mechanism(
         }
         if let Some(runtime) = runtime {
             handler.release_hosted_thread_user_stack_vad(runtime);
+            release_hosted_thread_resources(runtime.resources);
+            handler.release_hosted_thread_commitment(runtime.resources);
             release_hosted_thread_mechanism_cnodes(runtime);
         }
         if let Some((pi, slot)) = worker_slot {
-            release_hosted_tp_worker_window_resources(pi, slot);
             handler.clear_hosted_tp_worker_window_slot(pi, slot);
         }
         PM_TERMINATE_THREAD_TCB_RECLAIMED.fetch_add(1, Ordering::Relaxed);
@@ -23392,6 +23345,7 @@ pub(crate) struct HostedThreadSpawnResult {
     tcb: u64,
     mechanism: HostedThreadMechanismCaps,
     teb_alias: u64,
+    resources: HostedThreadResources,
 }
 
 impl HostedThreadSpawnResult {
@@ -23400,14 +23354,21 @@ impl HostedThreadSpawnResult {
             tcb: 0,
             mechanism: HostedThreadMechanismCaps::empty(),
             teb_alias: 0,
+            resources: HostedThreadResources::empty(),
         }
     }
 
-    const fn new(tcb: u64, mechanism: HostedThreadMechanismCaps, teb_alias: u64) -> Self {
+    const fn new(
+        tcb: u64,
+        mechanism: HostedThreadMechanismCaps,
+        teb_alias: u64,
+        resources: HostedThreadResources,
+    ) -> Self {
         Self {
             tcb,
             mechanism,
             teb_alias,
+            resources,
         }
     }
 
@@ -23422,6 +23383,10 @@ impl HostedThreadSpawnResult {
     pub(crate) const fn teb_alias(self) -> u64 {
         self.teb_alias
     }
+
+    const fn resources(self) -> HostedThreadResources {
+        self.resources
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23433,6 +23398,7 @@ pub(crate) struct HostedThreadRuntime {
     role: HostedThreadRole,
     mechanism: HostedThreadMechanismCaps,
     teb_alias: u64,
+    resources: HostedThreadResources,
     user_stack_allocation_base: u64,
     user_stack_base: u64,
     /// Broker port handle that delivered the server thread's current LPC message.
@@ -23450,6 +23416,7 @@ impl HostedThreadRuntime {
             role: HostedThreadRole::Main,
             mechanism: HostedThreadMechanismCaps::empty(),
             teb_alias: 0,
+            resources: HostedThreadResources::empty(),
             user_stack_allocation_base: 0,
             user_stack_base: 0,
             lpc_server_port: 0,
@@ -23546,6 +23513,7 @@ impl HostedThreadRuntimeTable {
             role,
             mechanism: HostedThreadMechanismCaps::empty(),
             teb_alias: 0,
+            resources: HostedThreadResources::empty(),
             user_stack_allocation_base: 0,
             user_stack_base: 0,
             lpc_server_port: 0,
@@ -23554,6 +23522,7 @@ impl HostedThreadRuntimeTable {
         if let Some(existing) = self.entries.iter_mut().find(|entry| entry.tid == tid) {
             runtime.mechanism = existing.mechanism;
             runtime.teb_alias = existing.teb_alias;
+            runtime.resources = existing.resources;
             runtime.user_stack_allocation_base = existing.user_stack_allocation_base;
             runtime.user_stack_base = existing.user_stack_base;
             runtime.lpc_server_port = existing.lpc_server_port;
@@ -23653,6 +23622,22 @@ impl HostedThreadRuntimeTable {
             .iter_mut()
             .find(|entry| entry.is_live() && entry.tid == tid)?;
         entry.teb_alias = teb_alias;
+        Some(*entry)
+    }
+
+    fn set_resources(
+        &mut self,
+        tid: u64,
+        resources: HostedThreadResources,
+    ) -> Option<HostedThreadRuntime> {
+        if tid == 0 || !resources.live {
+            return None;
+        }
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.is_live() && entry.tid == tid)?;
+        entry.resources = resources;
         Some(*entry)
     }
 
@@ -23804,6 +23789,15 @@ impl HostedThreadRuntimes {
     fn set_teb_alias(&mut self, tid: u64, teb_alias: u64) -> Option<HostedThreadRuntime> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe { (&mut *self.table).set_teb_alias(tid, teb_alias) }
+    }
+
+    fn set_resources(
+        &mut self,
+        tid: u64,
+        resources: HostedThreadResources,
+    ) -> Option<HostedThreadRuntime> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).set_resources(tid, resources) }
     }
 
     fn tcb_by_tid(&self, tid: u64) -> Option<u64> {
@@ -24798,24 +24792,37 @@ unsafe fn ensure_hosted_thread_exec_alias_paging(t: &HostedThread, scr: u64) -> 
     ok
 }
 
-unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
+unsafe fn spawn_hosted_thread(
+    handler: &mut ExecNtHandler,
+    t: &HostedThread,
+) -> HostedThreadSpawnResult {
+    let prepared = match handler.prepare_hosted_thread_commitment(
+        t.client_pi as usize,
+        t.stack_base,
+        t.stack_frames,
+        t.teb_va,
+    ) {
+        Ok(prepared) => prepared,
+        Err(_) => return HostedThreadSpawnResult::failed(),
+    };
+    let spawned = spawn_hosted_thread_mechanism(t);
+    if spawned.tcb() == 0 {
+        return spawned;
+    }
+    handler.commit_hosted_thread_commitment(t.client_pi as usize, prepared);
+    spawned
+}
+
+unsafe fn spawn_hosted_thread_mechanism(t: &HostedThread) -> HostedThreadSpawnResult {
     let scr = t.scr;
     let resource_pi = t.client_pi as usize;
-    let resource_slot = hosted_tp_worker_slot_from_layout(
-        resource_pi,
-        t.stack_base,
-        t.teb_va,
-        t.ipcbuf_va,
-        t.tramp_va,
-    );
-    let mut window_resources = HostedTpWorkerWindowResources::empty();
-    if resource_slot.is_some() {
-        window_resources.live = true;
+    if t.stack_frames > TP_WORKER_STACK_FRAMES {
+        return HostedThreadSpawnResult::failed();
     }
+    let mut resources =
+        HostedThreadResources::new(resource_pi, t.stack_base, t.stack_frames, t.teb_va);
     if !ensure_hosted_thread_exec_alias_paging(t, scr) {
-        if let Some(slot) = resource_slot {
-            release_hosted_tp_worker_window_resources(resource_pi, slot);
-        }
+        release_hosted_thread_resources(resources);
         return HostedThreadSpawnResult::failed();
     }
     // Stack, mapped into the target VSpace AND (optionally) mirrored into the executive for a
@@ -24837,12 +24844,10 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
                 CAP_INIT_THREAD_VSPACE,
             );
         }
-        if window_resources.live && (i as usize) < TP_WORKER_STACK_FRAME_COUNT {
-            let index = i as usize;
-            window_resources.stack_owner[index] = f;
-            window_resources.stack_target[index] = target_cap;
-            window_resources.stack_mirror[index] = mirror_cap;
-        }
+        let index = i as usize;
+        resources.stack_owner[index] = f;
+        resources.stack_target[index] = target_cap;
+        resources.stack_mirror[index] = mirror_cap;
         if t.client_pi != 0 {
             csrss_frame_put(t.client_pi, page, f);
         }
@@ -24870,11 +24875,9 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
     } else {
         0
     };
-    if window_resources.live {
-        window_resources.teb_owner = teb;
-        window_resources.teb_target = teb_client;
-        window_resources.teb_scratch = teb_scratch;
-    }
+    resources.teb_owner = teb;
+    resources.teb_target = teb_client;
+    resources.teb_scratch = teb_scratch;
     if t.client_pi != 0 {
         let source_cap =
             csrss_frame_create_source_copy(teb_client, t.client_pi, t.teb_va, b"thread-teb");
@@ -24899,6 +24902,11 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
             if source_cap != 0 {
                 let _ = cnode_delete_recycle_r(source_cap);
             }
+            if teb_live_alias != 0 && teb_live_map == 0 {
+                recycle_mapped_cap(teb_live_mirror);
+            } else {
+                recycle_plain_cap(teb_live_mirror);
+            }
             print_str(b"[thread-life] failed to register thread TEB client frame pi=");
             print_u64(t.client_pi);
             print_str(b" page=0x");
@@ -24906,6 +24914,8 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
             print_hex(t.teb_va as u32);
             print_str(b"\n");
         }
+    } else {
+        recycle_plain_cap(teb_live_mirror);
     }
     core::ptr::write_volatile((scr + 0x30) as *mut u64, t.teb_va);
     core::ptr::write_volatile((scr + 0x40) as *mut u64, t.cid_proc);
@@ -24958,11 +24968,9 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
     } else {
         0
     };
-    if window_resources.live {
-        window_resources.teb2_owner = teb2;
-        window_resources.teb2_target = teb2_client;
-        window_resources.teb2_scratch = teb2_scratch;
-    }
+    resources.teb2_owner = teb2;
+    resources.teb2_target = teb2_client;
+    resources.teb2_scratch = teb2_scratch;
     if t.client_pi != 0 {
         let source_cap = csrss_frame_create_source_copy(
             teb2_client,
@@ -25000,6 +25008,11 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
             if source_cap != 0 {
                 let _ = cnode_delete_recycle_r(source_cap);
             }
+            if teb2_live_alias != 0 && teb2_live_map == 0 {
+                recycle_mapped_cap(teb2_live_mirror);
+            } else {
+                recycle_plain_cap(teb2_live_mirror);
+            }
             print_str(b"[thread-life] failed to register thread TEB tail client frame pi=");
             print_u64(t.client_pi);
             print_str(b" page=0x");
@@ -25018,6 +25031,8 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
             print_hex(tail_page as u32);
             print_str(b"\n");
         }
+    } else {
+        recycle_plain_cap(teb2_live_mirror);
     }
     // The private ACS page: written through its own scratch alias, then mapped at `acs_va` in the
     // target VSpace. Deliberately NOT `csrss_frame_put`-registered — win32k has no business with a
@@ -25034,10 +25049,8 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
     core::ptr::write_volatile((acs + 0x20) as *mut u32, 1);
     let acs_target_cap = copy_cap(acs_frame);
     let acs_target_map = page_map(acs_target_cap, acs_va, RW_NX, t.pml4);
-    if window_resources.live {
-        window_resources.acs_owner = acs_frame;
-        window_resources.acs_target = acs_target_cap;
-    }
+    resources.acs_owner = acs_frame;
+    resources.acs_target = acs_target_cap;
     if acs_scratch_map != 0 || acs_target_map != 0 {
         print_str(b"[thread-life] ACS map failure scratch/target=");
         print_u64(acs_scratch_map);
@@ -25077,9 +25090,7 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
     } else {
         page_map(ipcbuf, t.ipcbuf_va, RW_NX, t.pml4)
     };
-    if window_resources.live {
-        window_resources.ipc_target = ipcbuf;
-    }
+    resources.ipc_target = ipcbuf;
     // Trampoline: restore the Windows x64 thread-entry ABI, then call CONTEXT.Rip.
     let (tramp, e_tramp_frame) = if t.diag {
         alloc_frame_r()
@@ -25137,13 +25148,8 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
     } else {
         page_map(tramp_tgt_cap, t.tramp_va, /* RX */ 2, t.pml4)
     };
-    if window_resources.live {
-        window_resources.tramp_owner = tramp;
-        window_resources.tramp_target = tramp_tgt_cap;
-    }
-    if let Some(slot) = resource_slot {
-        store_hosted_tp_worker_window_resources(resource_pi, slot, window_resources);
-    }
+    resources.tramp_owner = tramp;
+    resources.tramp_target = tramp_tgt_cap;
     if t.diag {
         // Read the FIRST 8 bytes back through what we WROTE (executive alias) AND through a FRESH,
         // independent alias of the SAME `tramp` frame mapped at a throwaway VA — if these disagree, the
@@ -25176,33 +25182,25 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
     }
     // CNode (PML4 + the dedicated fault EP) + TCB.
     let Some(raw) = try_alloc_slot() else {
-        if let Some(slot) = resource_slot {
-            release_hosted_tp_worker_window_resources(resource_pi, slot);
-        }
+        release_hosted_thread_resources(resources);
         return HostedThreadSpawnResult::failed();
     };
     let e_cn = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
     if e_cn != 0 {
         recycle_deleted_root_slot(raw);
-        if let Some(slot) = resource_slot {
-            release_hosted_tp_worker_window_resources(resource_pi, slot);
-        }
+        release_hosted_thread_resources(resources);
         return HostedThreadSpawnResult::failed();
     }
     let Some(cnode) = try_alloc_slot() else {
         let _ = cnode_delete_recycle_r(raw);
-        if let Some(slot) = resource_slot {
-            release_hosted_tp_worker_window_resources(resource_pi, slot);
-        }
+        release_hosted_thread_resources(resources);
         return HostedThreadSpawnResult::failed();
     };
     let e_cnode_mint = cnode_mint_r(CAP_INIT_THREAD_CNODE, cnode, raw, CN_GUARD_BADGE);
     if e_cnode_mint != 0 {
         recycle_deleted_root_slot(cnode);
         let _ = cnode_delete_recycle_r(raw);
-        if let Some(slot) = resource_slot {
-            release_hosted_tp_worker_window_resources(resource_pi, slot);
-        }
+        release_hosted_thread_resources(resources);
         return HostedThreadSpawnResult::failed();
     }
     let e_cnode_pml4 = cnode_copy_at_r(cnode, CT_PML4, t.pml4);
@@ -25210,17 +25208,13 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
     if e_cnode_pml4 != 0 || e_cnode_fault != 0 {
         let _ = cnode_delete_recycle_r(cnode);
         let _ = cnode_delete_recycle_r(raw);
-        if let Some(slot) = resource_slot {
-            release_hosted_tp_worker_window_resources(resource_pi, slot);
-        }
+        release_hosted_thread_resources(resources);
         return HostedThreadSpawnResult::failed();
     }
     let Some(tcb) = try_alloc_slot() else {
         let _ = cnode_delete_recycle_r(cnode);
         let _ = cnode_delete_recycle_r(raw);
-        if let Some(slot) = resource_slot {
-            release_hosted_tp_worker_window_resources(resource_pi, slot);
-        }
+        release_hosted_thread_resources(resources);
         return HostedThreadSpawnResult::failed();
     };
     let new_sp = t.stack_base + t.stack_frames * 0x1000 - 16;
@@ -25248,9 +25242,7 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
         }
         let _ = cnode_delete_recycle_r(cnode);
         let _ = cnode_delete_recycle_r(raw);
-        if let Some(slot) = resource_slot {
-            release_hosted_tp_worker_window_resources(resource_pi, slot);
-        }
+        release_hosted_thread_resources(resources);
         return HostedThreadSpawnResult::failed();
     }
     let _ = tcb_set_gs_base(tcb, t.teb_va);
@@ -25302,9 +25294,7 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
             let _ = cnode_delete_recycle_r(tcb);
             let _ = cnode_delete_recycle_r(cnode);
             let _ = cnode_delete_recycle_r(raw);
-            if let Some(slot) = resource_slot {
-                release_hosted_tp_worker_window_resources(resource_pi, slot);
-            }
+            release_hosted_thread_resources(resources);
             return HostedThreadSpawnResult::failed();
         }
     };
@@ -25319,6 +25309,7 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
         } else {
             0
         },
+        resources,
     )
 }
 

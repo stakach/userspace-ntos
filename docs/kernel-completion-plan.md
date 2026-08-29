@@ -17183,6 +17183,41 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the complete owner at process publication rather than waiting for a later VM call. Keep the
     public process/job memory-limit flags disabled until those sources are closed.
 
+    Dynamic hosted-thread commitment and owned teardown (2026-08-30, accepted; page-table source
+    remains): every additional hosted thread now prepares the combined MM/Ps commitment transaction
+    before allocating or mapping its actual private mechanism stack, two TEB pages, and activation-
+    context page. The committed-range authority and both ledgers are published only after the thread
+    mechanism is complete. Spawn rollback and normal termination remove the ranges and release the
+    exact charge after tearing down the mappings. Teardown of a ReactOS VAD-backed caller stack now
+    likewise releases the authoritative MM/Ps delta instead of only removing its VAD and frames.
+
+    `HostedThreadRuntime` now carries the exact owner, target, and mirror capabilities for every
+    per-thread stack, TEB, activation-context, IPC-buffer, and trampoline allocation. Named listener
+    threads and generic worker slots use the same release path. This replaces the worker-only,
+    process-indexed resource side table and removes its bounded slot identity from rollback and
+    termination. The first full proof correctly exposed duplicate ownership of the two live TEB
+    aliases as 24 VSpace unmap errors; those aliases remain owned solely by the client-frame registry
+    and the duplicate release path is gone.
+
+    Focused validation passes `nt-address-space` `62/62`; package formatting and the freestanding
+    executive check/build pass at the established 209-warning baseline. Serialized proof
+    `.tmp/run-headless-thread-commitment-rerun-20260830.log` dynamically launches userinit and
+    Explorer, completes 668 Explorer api0 redirects with zero callback failures, installs 18 client
+    WndProcs without replay, reaches Explorer paint begin/end `5/20` with 187 direct GDI returns and
+    135 batch flushes covering 184 records, paints `480000/480000` framebuffer pixels with at least
+    32 colours, reports zero VSpace unmap errors, passes all `295/295` checks, and matches the
+    sentinel.
+
+    Review adjustment: fixed process pages, image/section write-copy reservation, private VADs, and
+    dynamically hosted thread pages now participate in one MM/Ps commitment model. User page-table
+    pages remain the last known live commitment source outside that model. Attach every process page-
+    table allocation and reclamation to the actual capability owner next, including image, fixed,
+    section, DLL, and VAD mappings rather than counting only private faults. Separately, make NT
+    thread-object publication and hosted-mechanism admission one rollback transaction so a quota or
+    allocation refusal cannot leave an ETHREAD/handle without a runnable mechanism. Keep
+    `PROCESS_MEMORY` and `JOB_MEMORY` disabled until page-table accounting and inherited-job process
+    publication are complete.
+
     Ps job-memory owner foundation (2026-08-30, accepted; live composition remains in progress):
     each job member and job now own current commitment, high-water marks, and the NT one-shot memory
     violation state. Admission and later charges use prepare/commit plans, accept a charge exactly at

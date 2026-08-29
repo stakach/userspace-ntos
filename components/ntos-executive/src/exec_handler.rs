@@ -1639,9 +1639,14 @@ enum VmVadKind {
 }
 
 #[derive(Default)]
-struct PreparedProcessCommitCharge {
+pub(crate) struct PreparedProcessCommitCharge {
     mm: Option<nt_memory_manager::CommitChargePlan>,
     job: Option<nt_process::job::JobMemoryChargePlan>,
+}
+
+pub(crate) struct PreparedHostedThreadCommitment {
+    charge: PreparedProcessCommitCharge,
+    mappings: nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>,
 }
 
 fn allocate_vad_between(
@@ -3201,7 +3206,10 @@ impl ExecNtHandler {
         write_field!(lpc_connection_views, alloc::vec::Vec::with_capacity(32));
         write_field!(lpc_connections, alloc::vec::Vec::with_capacity(16));
         write_field!(pm, pm);
-        write_field!(process_commit, nt_memory_manager::ProcessCommitLedger::new());
+        write_field!(
+            process_commit,
+            nt_memory_manager::ProcessCommitLedger::new()
+        );
         write_field!(process_mechanisms, ExecProcessMechanisms::reset());
         write_field!(hosted_images, hosted_images);
         write_field!(process_vspaces, zeroed_process_slot_u64_vec());
@@ -8019,6 +8027,7 @@ impl ExecNtHandler {
     ) -> bool {
         if !self.register_hosted_thread_tcb(pi, tid, spawn.tcb(), badge, role) {
             let _ = self.release_hosted_thread_runtime(tid);
+            unsafe { self.release_hosted_thread_commitment(spawn.resources()) };
             unsafe { crate::release_unregistered_hosted_thread_spawn(spawn) };
             return false;
         }
@@ -8030,12 +8039,24 @@ impl ExecNtHandler {
                 .is_none()
         {
             let _ = self.release_hosted_thread_runtime(tid);
+            unsafe { self.release_hosted_thread_commitment(spawn.resources()) };
             unsafe { crate::release_unregistered_hosted_thread_spawn(spawn) };
             return false;
         }
         let teb_alias = spawn.teb_alias();
         if teb_alias != 0 && self.thread_runtime.set_teb_alias(tid, teb_alias).is_none() {
             let _ = self.release_hosted_thread_runtime(tid);
+            unsafe { self.release_hosted_thread_commitment(spawn.resources()) };
+            unsafe { crate::release_unregistered_hosted_thread_spawn(spawn) };
+            return false;
+        }
+        if self
+            .thread_runtime
+            .set_resources(tid, spawn.resources())
+            .is_none()
+        {
+            let _ = self.release_hosted_thread_runtime(tid);
+            unsafe { self.release_hosted_thread_commitment(spawn.resources()) };
             unsafe { crate::release_unregistered_hosted_thread_spawn(spawn) };
             return false;
         }
@@ -8812,6 +8833,9 @@ impl ExecNtHandler {
         if runtime.pi >= MAX_PI || runtime.user_stack_allocation_base == 0 {
             return;
         }
+        let Some(pid) = self.pm_pid_for_pi(runtime.pi) else {
+            return;
+        };
         let Some(vm_map) = process_vm_region_map_mut(runtime.pi) else {
             return;
         };
@@ -8841,6 +8865,9 @@ impl ExecNtHandler {
                 return;
             }
         };
+        let released_commit = before
+            .private_committed_bytes()
+            .saturating_sub(after.private_committed_bytes());
         let _ = vm_page_lock_retire_range(runtime.pi as u64, plan.base, plan.size);
         let mut page = plan.base;
         while page < plan.base + plan.size {
@@ -8855,6 +8882,7 @@ impl ExecNtHandler {
             page += nt_address_space::PAGE_SIZE;
         }
         *vm_map = *after;
+        self.release_process_commit(pid, released_commit);
         USER_STACK_VAD_RELEASES.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -9026,7 +9054,6 @@ impl ExecNtHandler {
         tid: u64,
     ) {
         let _ = self.release_hosted_thread_runtime(tid);
-        unsafe { release_hosted_tp_worker_window_resources(pi, slot) };
         self.clear_hosted_tp_worker_window_slot(pi, slot);
     }
 
@@ -9040,9 +9067,6 @@ impl ExecNtHandler {
 
     pub(crate) fn clear_hosted_tp_worker_windows(&mut self, pi: usize) {
         if pi < MAX_PI {
-            for slot in 0..TP_WORKER_SLOT_COUNT {
-                unsafe { release_hosted_tp_worker_window_resources(pi, slot) };
-            }
             self.tp_worker_window_used[pi] = 0;
         }
     }
@@ -15415,14 +15439,13 @@ impl ExecNtHandler {
         self.process_commit.register(pid, initial_bytes)?;
         if let Some(job) = self.pm.process_job(pid) {
             let limits = self.pm.job_extended_limits(job)?;
-            let limit = if limits.basic.limit_flags
-                & nt_process::job::JOB_OBJECT_LIMIT_PROCESS_MEMORY
-                != 0
-            {
-                limits.process_memory_limit
-            } else {
-                0
-            };
+            let limit =
+                if limits.basic.limit_flags & nt_process::job::JOB_OBJECT_LIMIT_PROCESS_MEMORY != 0
+                {
+                    limits.process_memory_limit
+                } else {
+                    0
+                };
             if let Err(status) = self.process_commit.set_limit(pid, limit) {
                 let _ = self.process_commit.unregister(pid);
                 return Err(status);
@@ -15472,7 +15495,7 @@ impl ExecNtHandler {
         self.process_commit.set_limit(pid, limit)
     }
 
-    unsafe fn prepare_process_commit_charge(
+    pub(crate) unsafe fn prepare_process_commit_charge(
         &mut self,
         pid: nt_process::ProcessId,
         pi: usize,
@@ -15505,7 +15528,7 @@ impl ExecNtHandler {
         Ok(PreparedProcessCommitCharge { mm: Some(mm), job })
     }
 
-    fn commit_process_commit_charge(&mut self, prepared: PreparedProcessCommitCharge) {
+    pub(crate) fn commit_process_commit_charge(&mut self, prepared: PreparedProcessCommitCharge) {
         if let Some(plan) = prepared.job {
             self.pm
                 .commit_job_memory_charge(plan)
@@ -15528,6 +15551,89 @@ impl ExecNtHandler {
         self.pm
             .release_job_memory(pid, bytes)
             .expect("Ps job commit release matches the published address-space delta");
+    }
+
+    pub(crate) unsafe fn prepare_hosted_thread_commitment(
+        &mut self,
+        pi: usize,
+        stack_base: u64,
+        stack_frames: u64,
+        teb_va: u64,
+    ) -> Result<PreparedHostedThreadCommitment, u32> {
+        let stack_size = stack_frames
+            .checked_mul(nt_address_space::PAGE_SIZE)
+            .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        if pi >= MAX_PI
+            || stack_size == 0
+            || stack_base & (nt_address_space::PAGE_SIZE - 1) != 0
+            || teb_va & (nt_address_space::PAGE_SIZE - 1) != 0
+        {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        }
+        let pid = self
+            .pm_pid_for_pi(pi)
+            .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        let mut mappings = process_committed_mapping_snapshot(pi as u64)
+            .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        mappings.register(nt_address_space::VmCommittedRange::private(
+            stack_base,
+            stack_size,
+            nt_address_space::PAGE_READWRITE,
+        ))?;
+        mappings.register(nt_address_space::VmCommittedRange::private(
+            teb_va,
+            3 * nt_address_space::PAGE_SIZE,
+            nt_address_space::PAGE_READWRITE,
+        ))?;
+        let bytes = stack_size + 3 * nt_address_space::PAGE_SIZE;
+        let charge = self.prepare_process_commit_charge(pid, pi, bytes)?;
+        Ok(PreparedHostedThreadCommitment { charge, mappings })
+    }
+
+    pub(crate) unsafe fn commit_hosted_thread_commitment(
+        &mut self,
+        pi: usize,
+        prepared: PreparedHostedThreadCommitment,
+    ) {
+        assert!(process_committed_mapping_replace(
+            pi as u64,
+            prepared.mappings
+        ));
+        self.commit_process_commit_charge(prepared.charge);
+    }
+
+    pub(crate) unsafe fn release_hosted_thread_commitment(
+        &mut self,
+        resources: HostedThreadResources,
+    ) {
+        if !resources.live || resources.client_pi >= MAX_PI {
+            return;
+        }
+        let Some(pid) = self.pm_pid_for_pi(resources.client_pi) else {
+            return;
+        };
+        let Some(before) = process_committed_mapping_snapshot(resources.client_pi as u64) else {
+            return;
+        };
+        let mut after = before;
+        let stack_size = resources.stack_frames * nt_address_space::PAGE_SIZE;
+        let stack_removed = after
+            .unregister_range(resources.stack_base, stack_size)
+            .is_ok_and(|count| count != 0);
+        let teb_removed = after
+            .unregister_range(resources.teb_va, 3 * nt_address_space::PAGE_SIZE)
+            .is_ok_and(|count| count != 0);
+        if !stack_removed && !teb_removed {
+            return;
+        }
+        let released = before
+            .process_commit_bytes()
+            .saturating_sub(after.process_commit_bytes());
+        assert!(process_committed_mapping_replace(
+            resources.client_pi as u64,
+            after
+        ));
+        self.release_process_commit(pid, released);
     }
 
     pub(crate) fn resolve_process_for_access(
@@ -22654,11 +22760,8 @@ impl ExecNtHandler {
             return Err(nt_process::STATUS_INVALID_HANDLE as u64);
         }
         let runtime = sel4_rt::sched_context_read_runtime(sched_context)?;
-        let to_100ns = |microseconds: u64| {
-            microseconds
-                .saturating_mul(10)
-                .min(i64::MAX as u64) as i64
-        };
+        let to_100ns =
+            |microseconds: u64| microseconds.saturating_mul(10).min(i64::MAX as u64) as i64;
         Ok((
             to_100ns(runtime.donated_time_us),
             to_100ns(runtime.bound_time_us),
@@ -22718,8 +22821,7 @@ impl ExecNtHandler {
             if let Some(job) = actions.terminate_job {
                 let _ = self.terminate_job_members(job, nt_process::job::STATUS_QUOTA_EXCEEDED);
             } else if let Some(process) = actions.terminate_process {
-                let _ =
-                    self.terminate_job_process(process, nt_process::job::STATUS_QUOTA_EXCEEDED);
+                let _ = self.terminate_job_process(process, nt_process::job::STATUS_QUOTA_EXCEEDED);
             }
         }
         self.drain_job_notifications();
@@ -23284,16 +23386,11 @@ impl ExecNtHandler {
                     return nt_process::STATUS_INSUFFICIENT_RESOURCES;
                 }
                 variable.resize(length, 0);
-                match nt_process::job_abi::encode_process_ids(
-                    assigned,
-                    &pids,
-                    &mut variable,
-                ) {
+                match nt_process::job_abi::encode_process_ids(assigned, &pids, &mut variable) {
                     Ok(actual) => (0, actual, &variable[..actual]),
                     Err(status) => {
                         let actual = nt_process::job_abi::BASIC_PROCESS_ID_LIST_HEADER_SIZE
-                            + ((length
-                                - nt_process::job_abi::BASIC_PROCESS_ID_LIST_HEADER_SIZE)
+                            + ((length - nt_process::job_abi::BASIC_PROCESS_ID_LIST_HEADER_SIZE)
                                 / 8)
                             .min(pids.len())
                                 * 8;
@@ -34745,13 +34842,12 @@ impl ExecNtHandler {
                     if let Some((_section_index, view)) =
                         generic_sections.view_for_page(target_pi, base)
                     {
-                        let mapped_commit = process_committed_allocation_commit_bytes(
-                            target_pi as u64,
-                            view.base,
-                        )
-                        .unwrap_or(0);
+                        let mapped_commit =
+                            process_committed_allocation_commit_bytes(target_pi as u64, view.base)
+                                .unwrap_or(0);
                         if mapped_commit != 0 {
-                            if let Err(status) = self.ensure_process_commit_owner(target_pid, target_pi)
+                            if let Err(status) =
+                                self.ensure_process_commit_owner(target_pid, target_pi)
                             {
                                 self.drain_job_notifications();
                                 return status;
@@ -34810,11 +34906,9 @@ impl ExecNtHandler {
                         let image_base = reg.get(slot).map(|dll| dll.base).unwrap_or(base);
                         let allocation =
                             process_committed_image_allocation(target_pi as u64, image_base);
-                        let image_commit = process_committed_allocation_commit_bytes(
-                            target_pi as u64,
-                            image_base,
-                        )
-                        .unwrap_or(0);
+                        let image_commit =
+                            process_committed_allocation_commit_bytes(target_pi as u64, image_base)
+                                .unwrap_or(0);
                         if image_commit != 0 {
                             if let Err(status) =
                                 self.ensure_process_commit_owner(target_pid, target_pi)

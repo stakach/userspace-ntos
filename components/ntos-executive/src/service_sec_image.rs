@@ -5881,9 +5881,6 @@ pub(crate) unsafe fn service_sec_image(
     // Per-process demand-fill bookkeeping is kept out of the bounded rootserver stack. It is now a
     // heap-backed slice sized for the runtime process-index window instead of a fixed BSS matrix.
     let pfilled = reset_pfilled_work(MAX_PI).expect("process fault scratch allocation failed");
-    if !reset_hosted_tp_worker_window_resources(MAX_PI) {
-        panic!("hosted TP worker window resource allocation failed");
-    }
     if !reset_process_vm_region_maps(MAX_PI) {
         panic!("process VAD map allocation failed");
     }
@@ -9524,8 +9521,7 @@ pub(crate) unsafe fn service_sec_image(
                 // resume it), then suspend/delete the exact badge-selected TCB, and receive the next
                 // caller immediately. Remote termination tears down its target but still replies to
                 // the caller through the normal tail below.
-                let job_terminations =
-                    core::mem::take(&mut nt_handler.pending_job_terminations);
+                let job_terminations = core::mem::take(&mut nt_handler.pending_job_terminations);
                 let caller_job_terminated = job_terminations.contains(&(pi as u8));
                 let mut post_action = nt_handler.post_action;
                 if caller_job_terminated
@@ -19358,21 +19354,24 @@ pub(crate) unsafe fn service_sec_image(
                     let mut breakin_runtime_slot = 0usize;
                     if let Some(request) = request {
                         breakin_runtime_slot = request.slot;
-                        spawned = rendezvous::spawn_slot_thread(&rendezvous::RemoteThreadSpawn {
-                            target_pi: request.target_pi,
-                            slot: request.slot,
-                            pml4: request.pml4,
-                            start: request.start,
-                            cid_proc: request.cid_proc,
-                            cid_thread: request.cid_thread,
-                            fault_ep: brk_ep,
-                            // The throwaway target has no ntdll mapped, so enter the start routine
-                            // directly and keep the hosted-syscalls trap (its exit `syscall` is
-                            // delivered here as an UnknownSyscall fault).
-                            use_loader: false,
-                            native: false,
-                            resume: request.resume,
-                        });
+                        spawned = rendezvous::spawn_slot_thread(
+                            &mut nt_handler,
+                            &rendezvous::RemoteThreadSpawn {
+                                target_pi: request.target_pi,
+                                slot: request.slot,
+                                pml4: request.pml4,
+                                start: request.start,
+                                cid_proc: request.cid_proc,
+                                cid_thread: request.cid_thread,
+                                fault_ep: brk_ep,
+                                // The throwaway target has no ntdll mapped, so enter the start routine
+                                // directly and keep the hosted-syscalls trap (its exit `syscall` is
+                                // delivered here as an UnknownSyscall fault).
+                                use_loader: false,
+                                native: false,
+                                resume: request.resume,
+                            },
+                        );
                         if spawned.tcb() != 0 {
                             nt_handler.register_hosted_thread_spawn(
                                 BRK_TEST_PI,
@@ -19587,6 +19586,8 @@ pub(crate) unsafe fn service_sec_image(
             if breakin_runtime_tid != 0 {
                 if let Some(runtime) = nt_handler.release_hosted_thread_runtime(breakin_runtime_tid)
                 {
+                    release_hosted_thread_resources(runtime.resources);
+                    nt_handler.release_hosted_thread_commitment(runtime.resources);
                     release_hosted_thread_mechanism_cnodes(runtime);
                 }
             }
@@ -19922,18 +19923,46 @@ unsafe fn spawn_requested_multiplexed_thread(
     print_str(b"\n");
 
     let spawned = match spec.spawner {
-        HostedMultiplexedThreadSpawner::ServicesListener => {
-            spawn_svc_listener_thread(pml4, start, initial_teb, cid_proc, tid, fault_ep, resume)
-        }
-        HostedMultiplexedThreadSpawner::LsassListener => {
-            spawn_lsass_listener_thread(pml4, start, initial_teb, cid_proc, tid, fault_ep, resume)
-        }
-        HostedMultiplexedThreadSpawner::LsassListener2 => {
-            spawn_lsass_listener2_thread(pml4, start, initial_teb, cid_proc, tid, fault_ep, resume)
-        }
-        HostedMultiplexedThreadSpawner::LsassListener3 => {
-            spawn_lsass_listener3_thread(pml4, start, initial_teb, cid_proc, tid, fault_ep, resume)
-        }
+        HostedMultiplexedThreadSpawner::ServicesListener => spawn_svc_listener_thread(
+            nt_handler,
+            pml4,
+            start,
+            initial_teb,
+            cid_proc,
+            tid,
+            fault_ep,
+            resume,
+        ),
+        HostedMultiplexedThreadSpawner::LsassListener => spawn_lsass_listener_thread(
+            nt_handler,
+            pml4,
+            start,
+            initial_teb,
+            cid_proc,
+            tid,
+            fault_ep,
+            resume,
+        ),
+        HostedMultiplexedThreadSpawner::LsassListener2 => spawn_lsass_listener2_thread(
+            nt_handler,
+            pml4,
+            start,
+            initial_teb,
+            cid_proc,
+            tid,
+            fault_ep,
+            resume,
+        ),
+        HostedMultiplexedThreadSpawner::LsassListener3 => spawn_lsass_listener3_thread(
+            nt_handler,
+            pml4,
+            start,
+            initial_teb,
+            cid_proc,
+            tid,
+            fault_ep,
+            resume,
+        ),
     };
 
     let registered =
@@ -20603,6 +20632,7 @@ unsafe fn spawn_requested_local_thread(
             print_str(b"\n");
             let suspended = hosted_thread_suspended(nt_handler, tid);
             let spawned = spawn_wl_listener_thread(
+                nt_handler,
                 slot,
                 pml4,
                 start,
@@ -20689,6 +20719,7 @@ unsafe fn spawn_requested_tp_worker(
     let suspended = hosted_thread_suspended(nt_handler, tid);
     let rpc_worker = role.is_scm_rpc_worker() || role.is_lsa_rpc_worker();
     let spawned = spawn_tp_worker_thread(
+        nt_handler,
         pi,
         worker_slot,
         pml4,
@@ -20767,18 +20798,21 @@ pub(crate) unsafe fn spawn_requested_remote_thread(
         return 0;
     }
     let badged = mint_badged(fault_ep, tp_worker_badge(request.target_pi, request.slot));
-    let spawned = rendezvous::spawn_slot_thread(&rendezvous::RemoteThreadSpawn {
-        target_pi: request.target_pi,
-        slot: request.slot,
-        pml4: request.pml4,
-        start: request.start,
-        cid_proc: request.cid_proc,
-        cid_thread: request.cid_thread,
-        fault_ep: badged,
-        use_loader: true,
-        native: true,
-        resume: request.resume,
-    });
+    let spawned = rendezvous::spawn_slot_thread(
+        nt_handler,
+        &rendezvous::RemoteThreadSpawn {
+            target_pi: request.target_pi,
+            slot: request.slot,
+            pml4: request.pml4,
+            start: request.start,
+            cid_proc: request.cid_proc,
+            cid_thread: request.cid_thread,
+            fault_ep: badged,
+            use_loader: true,
+            native: true,
+            resume: request.resume,
+        },
+    );
     if spawned.tcb() != 0 {
         if !nt_handler.register_hosted_thread_spawn(
             request.target_pi,
