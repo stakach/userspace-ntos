@@ -81,6 +81,7 @@ members = [
     "crates/nt-exe-image",
     "crates/nt-hosted-runtime",
     "crates/nt-loader-trace",
+    "crates/nt-time",
     "crates/nt-delay-execution",
     "crates/nt-thread-start",
     "crates/nt-rtl-work-item",
@@ -182,6 +183,7 @@ nt-driver-runtime = { path = "crates/nt-driver-runtime" }
 nt-driver-test-fixtures = { path = "crates/nt-driver-test-fixtures" }
 nt-hosted-runtime = { path = "crates/nt-hosted-runtime" }
 nt-loader-trace = { path = "crates/nt-loader-trace" }
+nt-time = { path = "crates/nt-time" }
 nt-delay-execution = { path = "crates/nt-delay-execution" }
 nt-thread-start = { path = "crates/nt-thread-start" }
 nt-rtl-work-item = { path = "crates/nt-rtl-work-item" }

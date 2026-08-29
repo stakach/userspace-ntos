@@ -16467,8 +16467,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `5/20` with 187 direct GDI returns and 135 batch flushes covering 184 records, and the framebuffer
     holds `480000/480000` non-background pixels with at least 32 colours. The sentinel matches.
 
-    Review adjustment: the LPC/ALPC transport cleanup is closed. Resume the deferred virtual-memory
-    frontier by extracting one host-testable page-residency plan and executive operation that covers
-    committed private pages, mapped data sections, and image pages through the same fill/map policy
-    used by a real fault. `NtLockVirtualMemory` and `NtUnlockVirtualMemory` remain queued behind that
-    prerequisite; do not add lock accounting that can claim nonresident image pages were locked.
+    Review adjustment: the LPC/ALPC transport cleanup is closed. The page-residency prerequisite and
+    real `NtLockVirtualMemory` / `NtUnlockVirtualMemory` services have since been accepted and are
+    recorded above. The active frontier is the shared time model required by `NtSetSystemTime`:
+    preserve every timeout's absolute or relative domain instead of converting absolute system time
+    once and retaining a stale monotonic scalar.
+
+    Tagged deadline and adjustable-clock foundation (2026-08-29, host-tested): the new `no_std`
+    `nt-time` crate defines the shared NT time snapshot, a generation-tracked adjustable system clock
+    anchored to an independent monotonic counter, and explicit infinite, relative-monotonic, and
+    absolute-system deadline domains. Relative deadlines retain the same monotonic target across
+    forward and backward system-clock changes. Absolute deadlines are reprojected whenever the clock
+    moves, including immediate expiry after a forward jump and later expiry after a backward jump.
+    A signed ordering projection preserves the order of multiple absolute deadlines made overdue by
+    the same forward jump instead of collapsing them onto an arbitrary FIFO boundary. Native time
+    bounds, monotonic regression, saturating arithmetic, zero/past deadlines, and `i64::MIN` relative
+    intervals are covered by seven focused host tests.
+
+    Next replace `nt-delay-execution`'s `Due` conversion and scalar waiter deadline with this tagged
+    type, then migrate `nt-kernel-exec::TimerQueue`. Migrate driver-thread, I/O-completion, object,
+    keyed-event, and remaining executive waiter/timer records in bounded slices, deleting each old
+    scalar representation as its owner moves. Only after every live absolute deadline can observe a
+    clock-generation change should the executive install the single adjustable clock authority,
+    publish it through KUSER_SHARED_DATA, register SSN 251, enforce `SeSystemtimePrivilege`, return
+    the previous time, and atomically expire/re-arm affected waits and timers.
