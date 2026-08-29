@@ -16657,3 +16657,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     timezone-refresh contract against the same authority rather than copying ReactOS's unimplemented
     branch. Keep CMOS/bootloader policy outside the executive and do not replace the current constant
     with another build-time date or silent fallback.
+
+    Authoritative bootstrap wall clock (2026-08-30, focused validation complete): rust-micro now
+    decodes BOOTBOOT's BCD UTC date through the host-tested, `no_std` `bootstrap-clock` crate. The
+    decoder validates every BCD digit, Gregorian day and leap-year rules, and the supplied timezone
+    range before producing a generic Unix-seconds snapshot. Rootserver publication carries Unix
+    seconds, timezone minutes, and explicit valid/UTC flags in `seL4_BootInfo`; `sel4-rt` exposes the
+    same data as an optional typed `BootWallClock`. Invalid or absent platform data does not acquire
+    clock authority.
+
+    The executive deletes the compiled `NT_SYSTEM_TIME_BOOT_100NS` epoch. Before constructing any
+    kernel state, it requires the typed bootstrap snapshot, converts the Unix epoch into bounded NT
+    100ns time in `nt-time`, and anchors the adjustable clock and boot-time state to the same
+    monotonic sample. Any use before initialization or boot without a valid UTC source fails closed;
+    there is no build-date, fixed-epoch, or zero-time fallback. `bootstrap-clock` passes `3/3`,
+    `nt-time` passes `8/8`, the production rust-micro external-rootserver image build succeeds,
+    `git diff --check` is clean, and the freestanding executive remains at the established
+    209-warning baseline.
+
+    Review adjustment: bootstrap ownership is closed; persistence is deliberately still open. Next
+    define a device-neutral persistent-clock provider interface owned below the executive, register
+    the discovered platform provider dynamically, and make successful `NtSetSystemTime` adjustments
+    request durable writeback through it. Then implement `NtSetSystemTime(NULL)` as a provider refresh
+    transaction that re-reads authoritative platform time and republishes/re-arms through the same
+    clock-change post-action. Absence and I/O failure must remain explicit statuses, never a cached or
+    synthetic success.

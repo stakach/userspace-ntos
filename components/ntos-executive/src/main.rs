@@ -3404,15 +3404,14 @@ const DELAY_TIMER_SOURCE_HOSTED_DRIVER: u64 = 9;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_TCB_UNBIND_NOTIFICATION: u64 = 15;
 const LBL_IRQ_ACK: u64 = 31;
-const NT_SYSTEM_TIME_BOOT_100NS: u64 = 0x01DA_0000_0000_0000;
 /// System time is adjustable, while interrupt time remains monotonic. The executive service loop
 /// is the sole owner of this state, including nested dispatches, so all snapshots and adjustments
 /// are serialized through this one clock authority.
-static mut NT_SYSTEM_CLOCK: nt_time::AdjustableClock =
-    nt_time::AdjustableClock::new(0, NT_SYSTEM_TIME_BOOT_100NS);
+static mut NT_SYSTEM_CLOCK: nt_time::AdjustableClock = nt_time::AdjustableClock::new(0, 0);
+static NT_SYSTEM_CLOCK_INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// Like NT's KeBootTime, this moves by the same delta as a system-time adjustment so reported
 /// uptime remains invariant.
-static NT_SYSTEM_BOOT_TIME_100NS: AtomicI64 = AtomicI64::new(NT_SYSTEM_TIME_BOOT_100NS as i64);
+static NT_SYSTEM_BOOT_TIME_100NS: AtomicI64 = AtomicI64::new(0);
 
 /// ADAPTIVE minimum arm distance, in 100ns units.
 ///
@@ -15959,6 +15958,9 @@ fn monotonic_time_100ns() -> u64 {
 }
 
 fn nt_time_snapshot_at(monotonic_100ns: u64) -> nt_delay_execution::TimeSnapshot {
+    if !NT_SYSTEM_CLOCK_INITIALIZED.load(Ordering::Acquire) {
+        panic!("system clock used before bootstrap authority was installed");
+    }
     unsafe { (&*core::ptr::addr_of!(NT_SYSTEM_CLOCK)).snapshot(monotonic_100ns) }
 }
 
@@ -15972,6 +15974,37 @@ fn nt_system_time_100ns() -> u64 {
 
 fn nt_system_boot_time_100ns() -> u64 {
     NT_SYSTEM_BOOT_TIME_100NS.load(Ordering::Acquire) as u64
+}
+
+unsafe fn initialize_nt_system_clock(boot_info: &BootInfo) {
+    let Some(wall_clock) = boot_info.wall_clock() else {
+        panic!("platform did not publish a valid UTC wall clock");
+    };
+    let system_time_100ns = nt_time::system_time_from_unix_seconds(wall_clock.unix_seconds)
+        .expect("platform wall clock is outside native NT bounds");
+    let monotonic_100ns = monotonic_time_100ns();
+    *core::ptr::addr_of_mut!(NT_SYSTEM_CLOCK) =
+        nt_time::AdjustableClock::try_new(monotonic_100ns, system_time_100ns)
+            .expect("validated platform wall clock must initialize");
+    NT_SYSTEM_BOOT_TIME_100NS.store(system_time_100ns as i64, Ordering::Release);
+    NT_SYSTEM_CLOCK_INITIALIZED.store(true, Ordering::Release);
+    print_str(b"[system-time] bootstrap unix=");
+    if wall_clock.unix_seconds < 0 {
+        print_str(b"-");
+        print_u64(wall_clock.unix_seconds.unsigned_abs());
+    } else {
+        print_u64(wall_clock.unix_seconds as u64);
+    }
+    print_str(b" timezone-minutes=");
+    if wall_clock.timezone_minutes < 0 {
+        print_str(b"-");
+        print_u64(wall_clock.timezone_minutes.unsigned_abs() as u64);
+    } else {
+        print_u64(wall_clock.timezone_minutes as u64);
+    }
+    print_str(b" nt=");
+    print_u64(system_time_100ns);
+    print_str(b"\n");
 }
 
 unsafe fn nt_set_system_time_100ns(
@@ -26649,6 +26682,7 @@ struct Fat32 {
 #[link_section = ".text._start"]
 unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let bi = &*bootinfo;
+    initialize_nt_system_clock(bi);
     NEXT_SLOT.store(bi.empty.start, Ordering::Relaxed);
     ROOT_CSPACE_START.store(bi.empty.start, Ordering::Relaxed);
     ROOT_CSPACE_END.store(bi.empty.end, Ordering::Relaxed);

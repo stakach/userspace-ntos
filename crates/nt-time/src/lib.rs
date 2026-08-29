@@ -5,6 +5,8 @@
 /// The native kernel requires the high nibble of the signed `LARGE_INTEGER`
 /// system time to be clear before publishing it through shared user data.
 pub const MAX_SYSTEM_TIME_100NS: u64 = 0x0fff_ffff_ffff_ffff;
+pub const UNIX_EPOCH_IN_NT_SECONDS: i64 = 11_644_473_600;
+pub const TICKS_PER_SECOND: u64 = 10_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimeSnapshot {
@@ -98,6 +100,18 @@ pub fn validate_system_time(system_time_100ns: u64) -> Result<(), ClockError> {
     } else {
         Ok(())
     }
+}
+
+/// Convert a UTC Unix timestamp into NT's 100ns epoch (1601-01-01).
+pub fn system_time_from_unix_seconds(unix_seconds: i64) -> Result<u64, ClockError> {
+    let nt_seconds = i128::from(unix_seconds) + i128::from(UNIX_EPOCH_IN_NT_SECONDS);
+    let ticks = nt_seconds
+        .checked_mul(i128::from(TICKS_PER_SECOND))
+        .ok_or(ClockError::InvalidSystemTime)?;
+    if ticks < 0 || ticks > i128::from(MAX_SYSTEM_TIME_100NS) {
+        return Err(ClockError::InvalidSystemTime);
+    }
+    Ok(ticks as u64)
 }
 
 /// Deadline domain retained for the full lifetime of an NT wait or timer.
@@ -208,6 +222,26 @@ mod tests {
         assert_eq!(change.clock_generation, 1);
         assert_eq!(clock.snapshot(175).system_time_100ns, 5_025);
         assert_eq!(clock.snapshot(175).monotonic_100ns, 175);
+    }
+
+    #[test]
+    fn unix_epoch_conversion_enforces_nt_bounds() {
+        assert_eq!(
+            system_time_from_unix_seconds(0),
+            Ok(116_444_736_000_000_000)
+        );
+        assert_eq!(
+            system_time_from_unix_seconds(-UNIX_EPOCH_IN_NT_SECONDS),
+            Ok(0)
+        );
+        assert_eq!(
+            system_time_from_unix_seconds(-UNIX_EPOCH_IN_NT_SECONDS - 1),
+            Err(ClockError::InvalidSystemTime)
+        );
+        assert_eq!(
+            system_time_from_unix_seconds(i64::MAX),
+            Err(ClockError::InvalidSystemTime)
+        );
     }
 
     #[test]
