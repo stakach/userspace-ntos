@@ -573,308 +573,6 @@ pub(crate) unsafe fn sm_stack_copyin(va: u64, bytes: &mut [u8]) -> bool {
     true
 }
 
-unsafe fn sm_capture_object_attributes(address: u64) -> Option<nt_ntdll_layout::ObjectAttributes> {
-    let mut value = core::mem::MaybeUninit::<nt_ntdll_layout::ObjectAttributes>::uninit();
-    let bytes = core::slice::from_raw_parts_mut(
-        value.as_mut_ptr().cast::<u8>(),
-        core::mem::size_of::<nt_ntdll_layout::ObjectAttributes>(),
-    );
-    sm_stack_copyin(address, bytes).then(|| value.assume_init())
-}
-
-unsafe fn sm_capture_client_id(address: u64) -> Option<nt_ntdll_layout::ClientId> {
-    let mut value = core::mem::MaybeUninit::<nt_ntdll_layout::ClientId>::uninit();
-    let bytes = core::slice::from_raw_parts_mut(
-        value.as_mut_ptr().cast::<u8>(),
-        core::mem::size_of::<nt_ntdll_layout::ClientId>(),
-    );
-    sm_stack_copyin(address, bytes).then(|| value.assume_init())
-}
-
-unsafe fn sm_open_process_call(
-    nt_handler: &mut ExecNtHandler,
-    process_handle: u64,
-    desired_access: u32,
-    object_attributes: u64,
-    client_id: u64,
-) -> u64 {
-    const STATUS_ACCESS_VIOLATION: u64 = 0xC000_0005;
-    const STATUS_DATATYPE_MISALIGNMENT: u64 = 0x8000_0002;
-    if !sm_stack_has_range(process_handle, core::mem::size_of::<u64>()) {
-        return STATUS_ACCESS_VIOLATION;
-    }
-    let client_id = if client_id == 0 {
-        None
-    } else {
-        if client_id & 3 != 0 {
-            return STATUS_DATATYPE_MISALIGNMENT;
-        }
-        let Some(client_id) = sm_capture_client_id(client_id) else {
-            return STATUS_ACCESS_VIOLATION;
-        };
-        Some(client_id)
-    };
-    if object_attributes & 3 != 0 {
-        return STATUS_DATATYPE_MISALIGNMENT;
-    }
-    let Some(object_attributes) = sm_capture_object_attributes(object_attributes) else {
-        return STATUS_ACCESS_VIOLATION;
-    };
-    let saved_pi = nt_handler.pi;
-    nt_handler.pi = 0;
-    let result =
-        match nt_handler.open_process_captured(object_attributes, client_id, desired_access) {
-            Ok((owner, handle)) => {
-                if sm_stack_copyout(process_handle, &(handle as u64).to_le_bytes()) {
-                    let _ = owner;
-                    0
-                } else {
-                    let _ = nt_handler.pm.take_handle(owner, handle);
-                    STATUS_ACCESS_VIOLATION
-                }
-            }
-            Err(status) => status as u64,
-        };
-    nt_handler.pi = saved_pi;
-    result
-}
-
-unsafe fn sm_open_thread_call(
-    nt_handler: &mut ExecNtHandler,
-    thread_handle: u64,
-    desired_access: u32,
-    object_attributes: u64,
-    client_id: u64,
-) -> u64 {
-    const STATUS_ACCESS_VIOLATION: u64 = 0xC000_0005;
-    const STATUS_DATATYPE_MISALIGNMENT: u64 = 0x8000_0002;
-    if !sm_stack_has_range(thread_handle, core::mem::size_of::<u64>()) {
-        return STATUS_ACCESS_VIOLATION;
-    }
-    let client_id = if client_id == 0 {
-        None
-    } else {
-        if client_id & 3 != 0 {
-            return STATUS_DATATYPE_MISALIGNMENT;
-        }
-        let Some(client_id) = sm_capture_client_id(client_id) else {
-            return STATUS_ACCESS_VIOLATION;
-        };
-        Some(client_id)
-    };
-    if object_attributes & 3 != 0 {
-        return STATUS_DATATYPE_MISALIGNMENT;
-    }
-    let Some(object_attributes) = sm_capture_object_attributes(object_attributes) else {
-        return STATUS_ACCESS_VIOLATION;
-    };
-    let saved_pi = nt_handler.pi;
-    nt_handler.pi = 0;
-    let result = match nt_handler.open_thread_captured(object_attributes, client_id, desired_access)
-    {
-        Ok((owner, handle)) => {
-            if sm_stack_copyout(thread_handle, &(handle as u64).to_le_bytes()) {
-                let _ = owner;
-                0
-            } else {
-                let _ = nt_handler.pm.take_handle(owner, handle);
-                STATUS_ACCESS_VIOLATION
-            }
-        }
-        Err(status) => status as u64,
-    };
-    nt_handler.pi = saved_pi;
-    result
-}
-
-unsafe fn sm_set_thread_information_call(
-    nt_handler: &mut ExecNtHandler,
-    handle: u64,
-    information_class: u32,
-    information: u64,
-    information_length: u32,
-) -> u64 {
-    const STATUS_ACCESS_VIOLATION: u64 = 0xC000_0005;
-    const STATUS_DATATYPE_MISALIGNMENT: u64 = 0x8000_0002;
-    let expected = match ExecNtHandler::thread_set_length(information_class) {
-        Ok(length) => length,
-        Err(status) => return status as u64,
-    };
-    if information_length as usize != expected {
-        return nt_process::STATUS_INFO_LENGTH_MISMATCH as u64;
-    }
-    let mut value = [0u8; 0x10];
-    if expected != 0 {
-        let alignment_mask = if information_class == 38 { 7 } else { 3 };
-        if information & alignment_mask != 0 {
-            return STATUS_DATATYPE_MISALIGNMENT;
-        }
-        if !sm_stack_copyin(information, &mut value[..expected]) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-    }
-    if information_class == 38 {
-        let raw_byte_length = u16::from_le_bytes(value[..2].try_into().unwrap()) as usize;
-        let mut byte_length = raw_byte_length & !1;
-        let buffer = u64::from_le_bytes(value[8..16].try_into().unwrap());
-        if buffer == 0 {
-            byte_length = 0;
-        }
-        let saved_pi = nt_handler.pi;
-        let saved_tid = nt_handler.current_tid;
-        nt_handler.pi = 0;
-        nt_handler.current_tid = hosted_role_tid(nt_handler, 0, HostedThreadRole::SmLoop);
-        let target = nt_handler.resolve_thread_for_set(handle);
-        nt_handler.pi = saved_pi;
-        nt_handler.current_tid = saved_tid;
-        let target = match target {
-            Ok(tid) => tid,
-            Err(status) => return status as u64,
-        };
-        if buffer != 0 && raw_byte_length != 0 {
-            if buffer & 1 != 0 {
-                return STATUS_DATATYPE_MISALIGNMENT;
-            }
-            let mut last = [0u8; 1];
-            let Some(last_address) = buffer.checked_add(raw_byte_length as u64 - 1) else {
-                return STATUS_ACCESS_VIOLATION;
-            };
-            if !sm_stack_copyin(last_address, &mut last) {
-                return STATUS_ACCESS_VIOLATION;
-            }
-        }
-        if byte_length > nt_process::THREAD_NAME_MAX_UNITS * 2 {
-            return 0xC000_009A;
-        }
-        let mut bytes = [0u8; nt_process::THREAD_NAME_MAX_UNITS * 2];
-        if byte_length != 0 && !sm_stack_copyin(buffer, &mut bytes[..byte_length]) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        let mut name = [0u16; nt_process::THREAD_NAME_MAX_UNITS];
-        for (index, chunk) in bytes[..byte_length].chunks_exact(2).enumerate() {
-            name[index] = u16::from_le_bytes([chunk[0], chunk[1]]);
-        }
-        return nt_handler.set_thread_name_resolved(target, &name[..byte_length / 2]) as u64;
-    }
-    let saved_pi = nt_handler.pi;
-    let saved_tid = nt_handler.current_tid;
-    nt_handler.pi = 0;
-    nt_handler.current_tid = hosted_role_tid(nt_handler, 0, HostedThreadRole::SmLoop);
-    let status = nt_handler.set_thread_information_captured(
-        handle,
-        information_class,
-        u64::from_le_bytes(value[..8].try_into().unwrap()),
-    );
-    nt_handler.pi = saved_pi;
-    nt_handler.current_tid = saved_tid;
-    status as u64
-}
-
-unsafe fn sm_query_thread_information_call(
-    nt_handler: &mut ExecNtHandler,
-    handle: u64,
-    information_class: u32,
-    information: u64,
-    information_length: u32,
-    return_length: u64,
-) -> u64 {
-    const STATUS_ACCESS_VIOLATION: u64 = 0xC000_0005;
-    const STATUS_DATATYPE_MISALIGNMENT: u64 = 0x8000_0002;
-    const STATUS_BUFFER_TOO_SMALL: u64 = 0xC000_0023;
-    if information_class == 38 {
-        if information != 0 {
-            if information & 7 != 0 {
-                return STATUS_DATATYPE_MISALIGNMENT;
-            }
-            if !sm_stack_has_range(information, information_length as usize) {
-                return STATUS_ACCESS_VIOLATION;
-            }
-        }
-        if return_length != 0 && !sm_stack_has_range(return_length, 4) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        let saved_pi = nt_handler.pi;
-        let saved_tid = nt_handler.current_tid;
-        nt_handler.pi = 0;
-        nt_handler.current_tid = hosted_role_tid(nt_handler, 0, HostedThreadRole::SmLoop);
-        let mut name = [0u16; nt_process::THREAD_NAME_MAX_UNITS];
-        let query = nt_handler.query_thread_name_captured(handle, &mut name);
-        nt_handler.pi = saved_pi;
-        nt_handler.current_tid = saved_tid;
-        let mut required = 0u32;
-        let mut status = match query {
-            Ok(units) => {
-                required = (0x10 + units * 2) as u32;
-                if information_length < required {
-                    STATUS_BUFFER_TOO_SMALL
-                } else {
-                    let mut output = [0u8; 0x10 + nt_process::THREAD_NAME_MAX_UNITS * 2];
-                    if units != 0 {
-                        let bytes = (units * 2) as u16;
-                        output[..2].copy_from_slice(&bytes.to_le_bytes());
-                        output[2..4].copy_from_slice(&bytes.to_le_bytes());
-                        output[8..16].copy_from_slice(&(information + 0x10).to_le_bytes());
-                        for (index, unit) in name[..units].iter().enumerate() {
-                            output[0x10 + index * 2..0x12 + index * 2]
-                                .copy_from_slice(&unit.to_le_bytes());
-                        }
-                    }
-                    if sm_stack_copyout(information, &output[..required as usize]) {
-                        0
-                    } else {
-                        STATUS_ACCESS_VIOLATION
-                    }
-                }
-            }
-            Err(status) => status as u64,
-        };
-        if return_length != 0 && !sm_stack_copyout(return_length, &required.to_le_bytes()) {
-            status = STATUS_ACCESS_VIOLATION;
-        }
-        return status;
-    }
-
-    let expected = match ExecNtHandler::thread_query_length(information_class) {
-        Ok(length) => length,
-        Err(status) => return status as u64,
-    };
-    if information_length as usize != expected {
-        return nt_process::STATUS_INFO_LENGTH_MISMATCH as u64;
-    }
-    if information != 0 {
-        if information & 3 != 0 {
-            return STATUS_DATATYPE_MISALIGNMENT;
-        }
-        let mut probe = [0u8; 0x30];
-        if !sm_stack_copyin(information, &mut probe[..expected]) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-    }
-    if return_length != 0 && !sm_stack_has_range(return_length, 4) {
-        return STATUS_ACCESS_VIOLATION;
-    }
-    let saved_pi = nt_handler.pi;
-    let saved_tid = nt_handler.current_tid;
-    nt_handler.pi = 0;
-    nt_handler.current_tid = hosted_role_tid(nt_handler, 0, HostedThreadRole::SmLoop);
-    let mut status = match nt_handler.query_thread_information_captured(handle, information_class) {
-        Ok((output, length)) => {
-            if sm_stack_copyout(information, &output[..length]) {
-                0
-            } else {
-                STATUS_ACCESS_VIOLATION
-            }
-        }
-        Err(status) => status as u64,
-    };
-    nt_handler.pi = saved_pi;
-    nt_handler.current_tid = saved_tid;
-    if return_length != 0 && !sm_stack_copyout(return_length, &(expected as u32).to_le_bytes()) {
-        status = STATUS_ACCESS_VIOLATION;
-    }
-    status
-}
-
 /// Demand-fill one code/data page for the SM-loop thread during the rendezvous. The page is in smss's
 /// own image (PE_LOAD_BASE..img_end → `smss_pe`) or ntdll (nt_base..nt_end → `ntdll_pe`); it is filled
 /// through an isolated executive scratch (SM_FILL_SCRATCH_BASE, its own PT) then mapped into smss's
@@ -951,15 +649,10 @@ pub(crate) unsafe fn sm_rendezvous(
     dll_pes: &[Option<nt_pe_loader::PeFile>],
     nt_handler: &mut ExecNtHandler,
 ) -> u64 {
-    const SSN_SET_INFO_THREAD: u64 = 238;
-    const SSN_QUERY_INFO_THREAD: u64 = 162;
-    const SSN_QUERY_INFO_PROCESS: u64 = 161;
     const SSN_REPLY_WAIT_RECV: u64 = 203;
     const SSN_ACCEPT_CONNECT: u64 = 0;
     const SSN_COMPLETE_CONNECT: u64 = 31;
     const SSN_CONNECT_PORT: u64 = 33;
-    const SSN_SET_EVENT: u64 = 228;
-    const SSN_CLOSE: u64 = 27;
     let ep = SM_FAULT_EP.load(Ordering::Relaxed);
     let reply = REPLY_SMLOOP_SLOT.load(Ordering::Relaxed);
     if ep == 0 || reply == 0 {
@@ -1108,197 +801,129 @@ pub(crate) unsafe fn sm_rendezvous(
                 print_u64(ssn);
                 print_str(b"\n");
             }
-            match ssn {
-                SSN_SET_INFO_THREAD => {
-                    result = sm_set_thread_information_call(
-                        nt_handler,
-                        get_recv_mr(9),
-                        rdx as u32,
-                        get_recv_mr(7),
-                        get_recv_mr(8) as u32,
-                    );
-                }
-                SSN_QUERY_INFO_THREAD => {
-                    result = match sp
-                        .checked_add(0x28)
-                        .filter(|address| sm_stack_has_range(*address, 8))
-                    {
-                        Some(address) => sm_query_thread_information_call(
-                            nt_handler,
-                            get_recv_mr(9),
-                            rdx as u32,
-                            get_recv_mr(7),
-                            get_recv_mr(8) as u32,
-                            sm_stack_read(address),
-                        ),
-                        None => 0xC000_0005,
-                    };
-                }
-                SSN_NT_OPEN_PROCESS => {
-                    // SmpHandleConnectionRequest opens the connecting CSRSS process by the real CID.
-                    // Mint the handle in SMSS's real table; SmpSbCreateSession later uses the saved
-                    // CSRSS process handle as NtDuplicateObject's target process.
-                    result = sm_open_process_call(
-                        nt_handler,
-                        get_recv_mr(9),
-                        rdx as u32,
-                        get_recv_mr(7),
-                        get_recv_mr(8),
-                    );
-                }
-                SSN_NT_OPEN_THREAD => {
-                    result = sm_open_thread_call(
-                        nt_handler,
-                        get_recv_mr(9),
-                        rdx as u32,
-                        get_recv_mr(7),
-                        get_recv_mr(8),
-                    );
-                }
-                SSN_QUERY_INFO_PROCESS => {
-                    // ProcessBasicInformation initializes SmUniqueProcessId from the real SMSS
-                    // EPROCESS identity; the later SMSS connection request carries the same CID.
-                    let class = rdx;
-                    let buf = get_recv_mr(7); // R8 = buffer
-                    if class == 0 {
-                        sm_stack_write(
-                            buf + 0x20,
-                            live_hosted_pid_for_role(
-                                nt_handler,
-                                nt_exe_image::HostedProcessRole::NativeSession,
-                            )
-                            .unwrap_or(0) as u64,
-                        );
-                    } else if class == 24 {
-                        sm_stack_write32(buf, 0); // ProcessSessionInformation: session 0
-                    }
-                }
-                SSN_REPLY_WAIT_RECV => {
-                    let recvmsg = get_recv_mr(8); // R9 = &RequestMsg.h
-                    let port = get_recv_mr(9); // R10 = SmApiPort handle
-                    let got = lpc_client().and_then(|c| c.reply_wait_receive(port).ok());
-                    match got {
-                        Some(r) if r.connection_id != 0 => {
-                            // Marshal the connection-request PORT_MESSAGE onto the SM-loop stack.
-                            sm_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST); // u2.s2.Type
-                            sm_stack_write(recvmsg + 0x08, r.client_process);
-                            sm_stack_write(recvmsg + 0x10, r.client_thread);
-                            sm_stack_write32(recvmsg + 0x28, r.subsystem_type);
-                            for (i, chunk) in
-                                r.connection_info.chunks_exact(2).take(120).enumerate()
-                            {
+            let connector_pid = nt_handler.pm_pid_for_pi(connector_pi).unwrap_or(0);
+            if let Some(dispatched) = dispatch_hosted_server_native_service(
+                nt_handler,
+                HostedServerWorker::Sm,
+                connector_pid,
+                ssn,
+                m2,
+                sp,
+                get_recv_mr(9),
+                rdx,
+                get_recv_mr(7),
+                get_recv_mr(8),
+            ) {
+                result = dispatched.status;
+                print_str(b"[sm-rdv] dispatched worker ");
+                print_str(dispatched.service.name().as_bytes());
+                print_str(b" status=0x");
+                print_hex(result as u32);
+                print_str(b"\n");
+            } else {
+                match ssn {
+                    SSN_REPLY_WAIT_RECV => {
+                        let recvmsg = get_recv_mr(8); // R9 = &RequestMsg.h
+                        let port = get_recv_mr(9); // R10 = SmApiPort handle
+                        let got = lpc_client().and_then(|c| c.reply_wait_receive(port).ok());
+                        match got {
+                            Some(r) if r.connection_id != 0 => {
+                                // Marshal the connection-request PORT_MESSAGE onto the SM-loop stack.
                                 sm_stack_write16(
-                                    recvmsg + 0x2c + i as u64 * 2,
-                                    u16::from_le_bytes([chunk[0], chunk[1]]),
-                                );
+                                    recvmsg + 0x04,
+                                    nt_lpc_client::LPC_CONNECTION_REQUEST,
+                                ); // u2.s2.Type
+                                sm_stack_write(recvmsg + 0x08, r.client_process);
+                                sm_stack_write(recvmsg + 0x10, r.client_thread);
+                                sm_stack_write32(recvmsg + 0x28, r.subsystem_type);
+                                for (i, chunk) in
+                                    r.connection_info.chunks_exact(2).take(120).enumerate()
+                                {
+                                    sm_stack_write16(
+                                        recvmsg + 0x2c + i as u64 * 2,
+                                        u16::from_le_bytes([chunk[0], chunk[1]]),
+                                    );
+                                }
+                                print_str(b"[sm-rdv] delivered connection cid=");
+                                print_u64(r.client_process);
+                                print_str(b"/");
+                                print_u64(r.client_thread);
+                                print_str(b" subsystem=");
+                                print_u64(r.subsystem_type as u64);
+                                print_str(b" info_len=");
+                                print_u64(r.connection_info.len() as u64);
+                                print_str(b"\n");
                             }
-                            print_str(b"[sm-rdv] delivered connection cid=");
-                            print_u64(r.client_process);
-                            print_str(b"/");
-                            print_u64(r.client_thread);
-                            print_str(b" subsystem=");
-                            print_u64(r.subsystem_type as u64);
-                            print_str(b" info_len=");
-                            print_u64(r.connection_info.len() as u64);
-                            print_str(b"\n");
-                        }
-                        _ => {
-                            // No pending connection (the 2nd receive): leave the thread PARKED — do NOT
-                            // reply. It re-blocks on this NtReplyWaitReceivePort until the next connect.
-                            SM_RECVMSG.store(recvmsg, Ordering::Relaxed);
-                            SM_RECVPORT.store(port, Ordering::Relaxed);
-                            SM_RECV_RDX.store(rdx, Ordering::Relaxed);
-                            SM_RECEIVE_PARKED.store(1, Ordering::Relaxed);
-                            stop_rdv = true;
+                            _ => {
+                                // No pending connection (the 2nd receive): leave the thread PARKED — do NOT
+                                // reply. It re-blocks on this NtReplyWaitReceivePort until the next connect.
+                                SM_RECVMSG.store(recvmsg, Ordering::Relaxed);
+                                SM_RECVPORT.store(port, Ordering::Relaxed);
+                                SM_RECV_RDX.store(rdx, Ordering::Relaxed);
+                                SM_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+                                stop_rdv = true;
+                            }
                         }
                     }
-                }
-                SSN_ACCEPT_CONNECT => {
-                    let porthandle_out = get_recv_mr(9); // R10 = *PortHandle
-                    let accept = get_recv_mr(8); // R9 = Accept BOOLEAN
-                    let sh = lpc_client()
-                        .and_then(|c| c.accept_connect(conn_id, accept != 0, rdx).ok())
-                        .unwrap_or(0);
-                    sm_stack_write(porthandle_out, sh);
-                }
-                SSN_COMPLETE_CONNECT => {
-                    if let Some((ch, _)) =
-                        lpc_client().and_then(|c| c.complete_connect(conn_id).ok())
-                    {
-                        client_handle = ch;
+                    SSN_ACCEPT_CONNECT => {
+                        let porthandle_out = get_recv_mr(9); // R10 = *PortHandle
+                        let accept = get_recv_mr(8); // R9 = Accept BOOLEAN
+                        let sh = lpc_client()
+                            .and_then(|c| c.accept_connect(conn_id, accept != 0, rdx).ok())
+                            .unwrap_or(0);
+                        sm_stack_write(porthandle_out, sh);
                     }
-                    print_str(b"[sm-rdv] forward NtCompleteConnectPort replied; awaiting reverse connect\n");
-                    // Continue into SmpHandleConnectionRequest's reverse connection and real event set.
-                }
-                SSN_CONNECT_PORT => {
-                    let out = get_recv_mr(9);
-                    let sb_name: alloc::vec::Vec<u16> =
-                        "\\Windows\\SbApiPort".encode_utf16().collect();
-                    let (smss_pid, smss_tid) = live_hosted_cid_for_pi(nt_handler, 0);
-                    let reverse = lpc_client().and_then(|c| {
-                        c.connect_port_with_client_id(&sb_name, 0, &[], smss_pid, smss_tid)
-                            .ok()
-                    });
-                    match reverse {
-                        Some(r) if r.pending => {
-                            let handle = csr_sb_accept_connection(
-                                r.connection_id,
-                                csrss_pml4,
-                                csrss_pe,
-                                csrss_img_end,
-                                nt_base,
-                                nt_end,
-                                ntdll_pe,
-                                reg,
-                                dll_pes,
-                            );
-                            if handle == 0 {
+                    SSN_COMPLETE_CONNECT => {
+                        if let Some((ch, _)) =
+                            lpc_client().and_then(|c| c.complete_connect(conn_id).ok())
+                        {
+                            client_handle = ch;
+                        }
+                        print_str(b"[sm-rdv] forward NtCompleteConnectPort replied; awaiting reverse connect\n");
+                        // Continue into SmpHandleConnectionRequest's reverse connection and real event set.
+                    }
+                    SSN_CONNECT_PORT => {
+                        let out = get_recv_mr(9);
+                        let sb_name: alloc::vec::Vec<u16> =
+                            "\\Windows\\SbApiPort".encode_utf16().collect();
+                        let (smss_pid, smss_tid) = live_hosted_cid_for_pi(nt_handler, 0);
+                        let reverse = lpc_client().and_then(|c| {
+                            c.connect_port_with_client_id(&sb_name, 0, &[], smss_pid, smss_tid)
+                                .ok()
+                        });
+                        match reverse {
+                            Some(r) if r.pending => {
+                                let handle = csr_sb_accept_connection(
+                                    r.connection_id,
+                                    csrss_pml4,
+                                    csrss_pe,
+                                    csrss_img_end,
+                                    nt_base,
+                                    nt_end,
+                                    ntdll_pe,
+                                    reg,
+                                    dll_pes,
+                                );
+                                if handle == 0 {
+                                    result = 0xC000_0001;
+                                    stop_rdv = true;
+                                } else {
+                                    sm_stack_write(out, handle);
+                                }
+                            }
+                            Some(r) if r.handle != 0 => sm_stack_write(out, r.handle),
+                            _ => {
                                 result = 0xC000_0001;
                                 stop_rdv = true;
-                            } else {
-                                sm_stack_write(out, handle);
                             }
                         }
-                        Some(r) if r.handle != 0 => sm_stack_write(out, r.handle),
-                        _ => {
-                            result = 0xC000_0001;
-                            stop_rdv = true;
-                        }
                     }
-                }
-                SSN_SET_EVENT => {
-                    let event_handle = get_recv_mr(9);
-                    let saved_pi = nt_handler.pi;
-                    nt_handler.pi = 0;
-                    result =
-                        match nt_handler.event_index_for_handle(event_handle, EVENT_MODIFY_STATE) {
-                            Ok(index) => match nt_handler.events.set_existing(index as u64) {
-                                Some(previous) => {
-                                    if !previous {
-                                        wait_wake_dispatcher_set(nt_handler);
-                                    }
-                                    print_str(
-                                        b"[sm-rdv] real NtSetEvent completed subsystem readiness\n",
-                                    );
-                                    0
-                                }
-                                None => 0xC000_0008,
-                            },
-                            Err(status) => status as u64,
-                        };
-                    nt_handler.pi = saved_pi;
-                }
-                SSN_CLOSE => {
-                    let saved_pi = nt_handler.pi;
-                    nt_handler.pi = 0;
-                    nt_handler.close_current_handle(get_recv_mr(9));
-                    nt_handler.pi = saved_pi;
-                }
-                _ => {
-                    print_str(b"[sm-rdv] WALL: unexpected SSN=");
-                    print_u64(ssn);
-                    print_str(b"\n");
-                    stop_rdv = true;
+                    _ => {
+                        print_str(b"[sm-rdv] WALL: unexpected SSN=");
+                        print_u64(ssn);
+                        print_str(b"\n");
+                        stop_rdv = true;
+                    }
                 }
             }
             if stop_rdv {
