@@ -17,7 +17,7 @@
 #![no_std]
 
 /// ABI version. Bump on any incompatible wire change.
-pub const LPC_ABI_VERSION: u32 = 8;
+pub const LPC_ABI_VERSION: u32 = 9;
 
 /// The reserved SURT opcode range for the LPC protocol (fresh block after
 /// object 0x2000 / config 0x2100).
@@ -60,6 +60,11 @@ pub mod opcode {
     pub const LPC_OP_RETAIN_CONNECTION_PORT: u16 = 0x220f;
     pub const LPC_OP_RELEASE_CONNECTION_PORT: u16 = 0x2210;
     pub const LPC_OP_KERNEL_REQUEST_WAIT_REPLY: u16 = 0x2211;
+
+    // Kernel-held reference to the concrete connection or client communication-port object named
+    // by a user handle. This is used for process exception-port ownership.
+    pub const LPC_OP_RETAIN_PORT_OBJECT: u16 = 0x2212;
+    pub const LPC_OP_RELEASE_PORT_OBJECT: u16 = 0x2213;
 }
 
 /// True if `op` is an LPC opcode.
@@ -496,8 +501,8 @@ pub struct LpcQueryRequestResponse {
     pub _reserved2: u16,
 }
 
-/// `LPC_OP_CLOSE_PORT`, `LPC_OP_RETAIN_CONNECTION_PORT`, or
-/// `LPC_OP_RELEASE_CONNECTION_PORT` — identify one port endpoint.
+/// `LPC_OP_CLOSE_PORT` or one of the kernel retain/release operations — identify one port
+/// endpoint.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct LpcClosePortRequest {
@@ -809,6 +814,6 @@ mod tests {
 
     #[test]
     fn version_is_current() {
-        assert_eq!(LPC_ABI_VERSION, 8);
+        assert_eq!(LPC_ABI_VERSION, 9);
     }
 }

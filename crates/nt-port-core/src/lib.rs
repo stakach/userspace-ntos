@@ -341,6 +341,15 @@ struct KernelPortEndpoint {
     delivered_requests: Vec<DeliveredRequest>,
 }
 
+/// A kernel reference to one exact client communication-port object. Unlike a user handle this
+/// endpoint survives handle-table teardown; synchronous requests owned by it are identified
+/// explicitly so releasing one reference cannot consume another reference's traffic.
+struct KernelCommunicationEndpoint {
+    handle: u64,
+    connection_id: u64,
+    outstanding_requests: Vec<MessageIdentity>,
+}
+
 struct Connection {
     id: u64,
     /// Folded name of the server port connected to.
@@ -366,6 +375,7 @@ struct Connection {
     /// Client-side comm-port handle (returned to the connector on complete).
     client_handle: u64,
     client_open: bool,
+    client_kernel_refs: u32,
     /// Server-side comm-port handle (from accept).
     server_handle: u64,
     server_open: bool,
@@ -389,6 +399,7 @@ pub struct PortCore {
     ports: Vec<Port>,
     connections: Vec<Connection>,
     kernel_endpoints: Vec<KernelPortEndpoint>,
+    kernel_communication_endpoints: Vec<KernelCommunicationEndpoint>,
     pool_accounts: Vec<PoolAccount>,
     next_handle: u64,
     next_port_object_id: u64,
@@ -409,6 +420,7 @@ impl PortCore {
             ports: Vec::new(),
             connections: Vec::new(),
             kernel_endpoints: Vec::new(),
+            kernel_communication_endpoints: Vec::new(),
             pool_accounts: Vec::new(),
             next_handle: PORT_HANDLE_BASE,
             next_port_object_id: 1,
@@ -868,10 +880,11 @@ impl PortCore {
         if let Some(connection_index) = self.connections.iter().position(|connection| {
             port_handle != 0 && connection.client_open && connection.client_handle == port_handle
         }) {
-            self.release_connection_storage(connection_index, true, true, true);
-            let connection = &mut self.connections[connection_index];
-            connection.client_open = false;
-            connection.state = ConnState::Refused;
+            self.connections[connection_index].client_open = false;
+            if self.connections[connection_index].client_kernel_refs == 0 {
+                self.release_connection_storage(connection_index, true, true, true);
+                self.connections[connection_index].state = ConnState::Refused;
+            }
             return;
         }
         if let Some(connection_index) = self.connections.iter().position(|connection| {
@@ -946,6 +959,153 @@ impl PortCore {
         Ok(())
     }
 
+    /// Retain one live client communication-port object for a kernel owner and return a private
+    /// endpoint handle. The reference is bound to the exact connection, not to the caller's user
+    /// handle value, and therefore survives closing that handle.
+    pub fn retain_communication_port(&mut self, port_handle: u64) -> Result<u64, NtStatus> {
+        let connection_index = self
+            .connections
+            .iter()
+            .position(|connection| {
+                connection.state == ConnState::Connected
+                    && connection.client_open
+                    && connection.server_open
+                    && port_handle != 0
+                    && connection.client_handle == port_handle
+            })
+            .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+        let refs = self.connections[connection_index]
+            .client_kernel_refs
+            .checked_add(1)
+            .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+        let connection_id = self.connections[connection_index].id;
+        let handle = self.alloc_handle();
+        self.connections[connection_index].client_kernel_refs = refs;
+        self.kernel_communication_endpoints
+            .push(KernelCommunicationEndpoint {
+                handle,
+                connection_id,
+                outstanding_requests: Vec::new(),
+            });
+        Ok(handle)
+    }
+
+    /// Release one exact retained communication endpoint. Its in-flight requests are cancelled,
+    /// while traffic belonging to other references on the same connection remains intact.
+    pub fn release_communication_port(&mut self, endpoint_handle: u64) -> Result<(), NtStatus> {
+        let endpoint_index = self
+            .kernel_communication_endpoints
+            .iter()
+            .position(|endpoint| endpoint.handle == endpoint_handle)
+            .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+        let connection_id = self.kernel_communication_endpoints[endpoint_index].connection_id;
+        let connection_index = self
+            .connections
+            .iter()
+            .position(|connection| connection.id == connection_id)
+            .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+        let released_charge = {
+            let identities = self.kernel_communication_endpoints[endpoint_index]
+                .outstanding_requests
+                .as_slice();
+            let connection = &self.connections[connection_index];
+            connection
+                .server_inbox
+                .iter()
+                .chain(connection.client_inbox.iter())
+                .filter(|message| {
+                    message
+                        .message
+                        .request_identity
+                        .is_some_and(|identity| identities.contains(&identity))
+                })
+                .map(|message| message.pool_charge)
+                .chain(
+                    connection
+                        .delivered_requests
+                        .iter()
+                        .filter(|request| identities.contains(&request.identity))
+                        .map(|request| request.pool_charge),
+                )
+                .try_fold(0u32, |total, charge| total.checked_add(charge))
+                .ok_or(NtStatus::INVALID_PARAMETER)?
+        };
+        let account = self.connections[connection_index].pool_account;
+        self.replace_pool_charge(account, released_charge, 0)?;
+        let identities = self.kernel_communication_endpoints[endpoint_index]
+            .outstanding_requests
+            .as_slice();
+        let connection = &mut self.connections[connection_index];
+        connection.server_inbox.retain(|message| {
+            !message
+                .message
+                .request_identity
+                .is_some_and(|identity| identities.contains(&identity))
+        });
+        connection.client_inbox.retain(|message| {
+            !message
+                .message
+                .request_identity
+                .is_some_and(|identity| identities.contains(&identity))
+        });
+        connection
+            .delivered_requests
+            .retain(|request| !identities.contains(&request.identity));
+        self.kernel_communication_endpoints.remove(endpoint_index);
+        self.connections[connection_index].client_kernel_refs -= 1;
+        if !self.connections[connection_index].client_open
+            && self.connections[connection_index].client_kernel_refs == 0
+        {
+            self.release_connection_storage(connection_index, true, true, true);
+            self.connections[connection_index].state = ConnState::Refused;
+        }
+        Ok(())
+    }
+
+    /// Retain the concrete LPC port object named by a user handle. Connection ports and client
+    /// communication ports use different message planes internally, but the kernel object
+    /// reference returned here is intentionally opaque to its owner.
+    pub fn retain_port_object(&mut self, port_handle: u64) -> Result<u64, NtStatus> {
+        if self
+            .ports
+            .iter()
+            .any(|port| port.user_open && port.handle == port_handle)
+        {
+            self.retain_connection_port(port_handle)
+        } else if self.connections.iter().any(|connection| {
+            connection.state == ConnState::Connected
+                && connection.client_open
+                && connection.server_open
+                && port_handle != 0
+                && connection.client_handle == port_handle
+        }) {
+            self.retain_communication_port(port_handle)
+        } else {
+            Err(NtStatus::INVALID_PORT_HANDLE)
+        }
+    }
+
+    /// Release one opaque retained port-object endpoint by its broker identity. Endpoint handles
+    /// are allocated from one namespace, so this resolves one concrete object without probing or
+    /// falling through to a different user handle.
+    pub fn release_port_object(&mut self, endpoint_handle: u64) -> Result<(), NtStatus> {
+        if self
+            .kernel_endpoints
+            .iter()
+            .any(|endpoint| endpoint.handle == endpoint_handle)
+        {
+            self.release_connection_port(endpoint_handle)
+        } else if self
+            .kernel_communication_endpoints
+            .iter()
+            .any(|endpoint| endpoint.handle == endpoint_handle)
+        {
+            self.release_communication_port(endpoint_handle)
+        } else {
+            Err(NtStatus::INVALID_PORT_HANDLE)
+        }
+    }
+
     /// Disconnect a connection by id (marks it refused/closed). Idempotent.
     pub fn disconnect(&mut self, connection_id: u64) {
         if let Some(connection_index) = self.connections.iter().position(|c| c.id == connection_id)
@@ -974,11 +1134,10 @@ impl PortCore {
     ) -> Result<(), NtStatus> {
         if let Some(connection_index) = self.connections.iter().position(|connection| {
             connection.state == ConnState::Connected
-                && connection.client_open
                 && connection.server_open
                 && from_handle != 0
-                && (connection.client_handle == from_handle
-                    || connection.server_handle == from_handle)
+                && ((connection.client_open && connection.client_handle == from_handle)
+                    || (connection.client_live() && connection.server_handle == from_handle))
         }) {
             let connection = &self.connections[connection_index];
             if bytes.len() > connection.limits.max_message as usize {
@@ -1060,9 +1219,9 @@ impl PortCore {
         Ok(())
     }
 
-    /// Queue a typed synchronous request from a kernel-retained connection port. Unlike an LPC
-    /// client request this preserves the caller-supplied message type (for example
-    /// `LPC_ERROR_EVENT`) and reaches server receive without manufacturing a user connection.
+    /// Queue a typed synchronous request from a kernel-retained connection or communication port.
+    /// Unlike an LPC client request this preserves the caller-supplied message type (for example
+    /// `LPC_ERROR_EVENT`). Raw user communication handles are deliberately not accepted here.
     pub fn send_kernel_request_message(
         &mut self,
         endpoint_handle: u64,
@@ -1073,36 +1232,79 @@ impl PortCore {
         if identity.message_id == 0 {
             return Err(NtStatus::INVALID_PARAMETER);
         }
-        let Some(endpoint_index) = self
+        if let Some(endpoint_index) = self
             .kernel_endpoints
             .iter()
             .position(|endpoint| endpoint.handle == endpoint_handle)
-        else {
-            return self.send_request_message(endpoint_handle, bytes, attrs, identity);
-        };
-        let port = self
-            .ports
+        {
+            let port = self
+                .ports
+                .iter()
+                .find(|port| port.object_id == self.kernel_endpoints[endpoint_index].port_object_id)
+                .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+            if bytes.len() > port.limits.max_message as usize {
+                return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
+            }
+            let stored = self.allocate_stored_message(
+                port.pool_account,
+                0,
+                bytes,
+                attrs,
+                MessageProvenance {
+                    connection_id: 0,
+                    client: identity.client,
+                },
+                0,
+                Some(identity),
+            )?;
+            self.kernel_endpoints[endpoint_index]
+                .server_inbox
+                .push(stored);
+            return Ok(());
+        }
+
+        let endpoint_index = self
+            .kernel_communication_endpoints
             .iter()
-            .find(|port| port.object_id == self.kernel_endpoints[endpoint_index].port_object_id)
+            .position(|endpoint| endpoint.handle == endpoint_handle)
             .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
-        if bytes.len() > port.limits.max_message as usize {
+        if self.kernel_communication_endpoints[endpoint_index]
+            .outstanding_requests
+            .contains(&identity)
+        {
+            return Err(NtStatus::REPLY_MESSAGE_MISMATCH);
+        }
+        let connection_id = self.kernel_communication_endpoints[endpoint_index].connection_id;
+        let connection_index = self
+            .connections
+            .iter()
+            .position(|connection| {
+                connection.id == connection_id
+                    && connection.state == ConnState::Connected
+                    && connection.client_kernel_refs != 0
+                    && connection.server_open
+            })
+            .ok_or(NtStatus::PORT_DISCONNECTED)?;
+        let connection = &self.connections[connection_index];
+        if bytes.len() > connection.limits.max_message as usize {
             return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
         }
         let stored = self.allocate_stored_message(
-            port.pool_account,
+            connection.pool_account,
             0,
             bytes,
             attrs,
             MessageProvenance {
-                connection_id: 0,
+                connection_id,
                 client: identity.client,
             },
-            0,
+            connection.port_context,
             Some(identity),
         )?;
-        self.kernel_endpoints[endpoint_index]
-            .server_inbox
-            .push(stored);
+        self.connections[connection_index].server_inbox.push(stored);
+        self.kernel_communication_endpoints[endpoint_index]
+            .outstanding_requests
+            .push(identity);
         Ok(())
     }
 
@@ -1142,6 +1344,50 @@ impl PortCore {
                 return Ok(Some(stored.message));
             }
             return Ok(None);
+        }
+        if let Some(endpoint_index) = self
+            .kernel_communication_endpoints
+            .iter()
+            .position(|endpoint| endpoint.handle == from_handle)
+        {
+            if !self.kernel_communication_endpoints[endpoint_index]
+                .outstanding_requests
+                .contains(&identity)
+            {
+                return Err(NtStatus::REPLY_MESSAGE_MISMATCH);
+            }
+            let connection_id = self.kernel_communication_endpoints[endpoint_index].connection_id;
+            let connection_index = self
+                .connections
+                .iter()
+                .position(|connection| connection.id == connection_id)
+                .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+            if let Some(message_index) = self.connections[connection_index]
+                .client_inbox
+                .iter()
+                .position(|message| message.message.request_identity == Some(identity))
+            {
+                let stored = self.connections[connection_index]
+                    .client_inbox
+                    .remove(message_index);
+                let account = self.connections[connection_index].pool_account;
+                self.replace_pool_charge(account, stored.pool_charge, 0)?;
+                let request_index = self.kernel_communication_endpoints[endpoint_index]
+                    .outstanding_requests
+                    .iter()
+                    .position(|request| *request == identity)
+                    .expect("the retained endpoint owns the matched reply");
+                self.kernel_communication_endpoints[endpoint_index]
+                    .outstanding_requests
+                    .remove(request_index);
+                return Ok(Some(stored.message));
+            }
+            let connection = &self.connections[connection_index];
+            return if connection.state == ConnState::Connected && connection.server_open {
+                Ok(None)
+            } else {
+                Err(NtStatus::PORT_DISCONNECTED)
+            };
         }
         let connection_index = self
             .connections
@@ -1228,6 +1474,38 @@ impl PortCore {
             }
             return Ok(false);
         }
+        if let Some(endpoint_index) = self
+            .kernel_communication_endpoints
+            .iter()
+            .position(|endpoint| endpoint.handle == from_handle)
+        {
+            let Some(request_index) = self.kernel_communication_endpoints[endpoint_index]
+                .outstanding_requests
+                .iter()
+                .position(|request| *request == identity)
+            else {
+                return Ok(false);
+            };
+            let connection_id = self.kernel_communication_endpoints[endpoint_index].connection_id;
+            let connection_index = self
+                .connections
+                .iter()
+                .position(|connection| connection.id == connection_id)
+                .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+            let removed_charge = Self::remove_request_from_connection(
+                &mut self.connections[connection_index],
+                identity,
+            );
+            self.kernel_communication_endpoints[endpoint_index]
+                .outstanding_requests
+                .remove(request_index);
+            if let Some(charge) = removed_charge {
+                let account = self.connections[connection_index].pool_account;
+                self.replace_pool_charge(account, charge, 0)?;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
         let connection_index = self
             .connections
             .iter()
@@ -1287,7 +1565,7 @@ impl PortCore {
         }
         if let Some(connection_index) = self.connections.iter().position(|connection| {
             connection.state == ConnState::Connected
-                && connection.client_open
+                && connection.client_live()
                 && connection.server_open
                 && from_handle != 0
                 && connection.server_handle == from_handle
@@ -1305,7 +1583,7 @@ impl PortCore {
             let account = connection.pool_account;
             let provenance = MessageProvenance {
                 connection_id: connection.id,
-                client: connection.client_id,
+                client: identity.client,
             };
             let stored = self.allocate_stored_message(
                 account,
@@ -1371,7 +1649,7 @@ impl PortCore {
             .iter()
             .position(|connection| {
                 connection.state == ConnState::Connected
-                    && connection.client_open
+                    && connection.client_live()
                     && connection.server_open
                     && connection.server_api == port.api
                     && connection.port_name == port.name
@@ -1394,7 +1672,7 @@ impl PortCore {
         let account = connection.pool_account;
         let provenance = MessageProvenance {
             connection_id: connection.id,
-            client: connection.client_id,
+            client: identity.client,
         };
         let stored = self.allocate_stored_message(
             account,
@@ -1466,7 +1744,7 @@ impl PortCore {
             .iter()
             .find(|connection| {
                 connection.state == ConnState::Connected
-                    && connection.client_open
+                    && connection.client_live()
                     && connection.server_open
                     && connection.server_api == port.api
                     && connection.port_name == port.name
@@ -1513,7 +1791,7 @@ impl PortCore {
                 return Ok(self.dequeue_server_message(connection_index));
             }
             let connection = &self.connections[connection_index];
-            return if connection.state == ConnState::Connected && connection.client_open {
+            return if connection.state == ConnState::Connected && connection.client_live() {
                 Ok(None)
             } else {
                 Err(NtStatus::PORT_DISCONNECTED)
@@ -1533,7 +1811,7 @@ impl PortCore {
             }
             let connection_index = self.connections.iter().position(|conn| {
                 conn.state == ConnState::Connected
-                    && conn.client_open
+                    && conn.client_live()
                     && conn.server_open
                     && conn.server_api == self.ports[port_index].api
                     && conn.port_name == self.ports[port_index].name
@@ -1740,6 +2018,31 @@ impl PortCore {
             .expect("released broker allocations were previously charged");
     }
 
+    fn remove_request_from_connection(
+        connection: &mut Connection,
+        identity: MessageIdentity,
+    ) -> Option<u32> {
+        if let Some(index) = connection
+            .server_inbox
+            .iter()
+            .position(|message| message.message.request_identity == Some(identity))
+        {
+            Some(connection.server_inbox.remove(index).pool_charge)
+        } else if let Some(index) = connection
+            .delivered_requests
+            .iter()
+            .position(|request| request.identity == identity)
+        {
+            Some(connection.delivered_requests.remove(index).pool_charge)
+        } else {
+            connection
+                .client_inbox
+                .iter()
+                .position(|message| message.message.request_identity == Some(identity))
+                .map(|index| connection.client_inbox.remove(index).pool_charge)
+        }
+    }
+
     fn conn(&self, id: u64) -> Option<&Connection> {
         self.connections.iter().find(|c| c.id == id)
     }
@@ -1785,6 +2088,7 @@ impl Connection {
             server_api,
             client_handle,
             client_open: client_handle != 0,
+            client_kernel_refs: 0,
             server_handle: 0,
             server_open: state == ConnState::Connected,
             port_context: 0,
@@ -1792,6 +2096,10 @@ impl Connection {
             server_inbox: Vec::new(),
             delivered_requests: Vec::new(),
         }
+    }
+
+    fn client_live(&self) -> bool {
+        self.client_open || self.client_kernel_refs != 0
     }
 }
 
@@ -2487,6 +2795,87 @@ mod tests {
         assert_eq!(core.port_count(), 0);
         assert_eq!(
             core.release_connection_port(kernel),
+            Err(NtStatus::INVALID_PORT_HANDLE)
+        );
+    }
+
+    #[test]
+    fn retained_communication_port_survives_user_close_and_releases_exact_requests() {
+        let mut core = PortCore::new();
+        core.set_accept_policy(AcceptPolicy::Manual);
+        let listen = core.create_port(&utf16("\\ProcessExceptionPort"), PortApi::Lpc);
+        let connection = match core
+            .connect(&utf16("\\ProcessExceptionPort"), PortApi::Lpc, 0, &[])
+            .unwrap()
+        {
+            ConnectOutcome::Pending { connection_id } => connection_id,
+            _ => unreachable!(),
+        };
+        core.receive(listen).unwrap();
+        let server = core.accept(connection, true, 0x7788).unwrap();
+        let client = core.complete(connection).unwrap().0;
+        let first_endpoint = core.retain_communication_port(client).unwrap();
+        let second_endpoint = core.retain_communication_port(client).unwrap();
+        core.close_port(client);
+        assert!(core.handle_info(client).is_none());
+        assert_eq!(
+            core.connection_state(connection),
+            Some(ConnState::Connected)
+        );
+
+        let first = MessageIdentity {
+            client: ClientId {
+                process: 0x330,
+                thread: 0x334,
+            },
+            message_id: 17,
+        };
+        let second = MessageIdentity {
+            client: ClientId {
+                process: 0x440,
+                thread: 0x444,
+            },
+            message_id: 18,
+        };
+        core.send_kernel_request_message(first_endpoint, b"first", MessageAttrs::default(), first)
+            .unwrap();
+        core.send_kernel_request_message(
+            second_endpoint,
+            b"second",
+            MessageAttrs::default(),
+            second,
+        )
+        .unwrap();
+        let received = core.receive_message(server).unwrap().unwrap();
+        assert_eq!(received.bytes, b"first");
+        assert_eq!(received.port_context, 0x7788);
+        assert_eq!(received.provenance.client, first.client);
+        core.send_reply_message(server, b"reply", MessageAttrs::default(), first)
+            .unwrap();
+
+        core.release_communication_port(second_endpoint).unwrap();
+        assert_eq!(
+            core.connection_state(connection),
+            Some(ConnState::Connected)
+        );
+        assert!(core.receive_message(server).unwrap().is_none());
+        assert_eq!(
+            core.receive_reply_message(first_endpoint, first)
+                .unwrap()
+                .unwrap()
+                .bytes,
+            b"reply"
+        );
+        assert_eq!(core.connection_pool_usage(connection), Some(0));
+        assert_eq!(
+            core.release_communication_port(second_endpoint),
+            Err(NtStatus::INVALID_PORT_HANDLE)
+        );
+
+        core.release_communication_port(first_endpoint).unwrap();
+        assert_eq!(core.connection_state(connection), Some(ConnState::Refused));
+        assert_eq!(
+            core.send_message(server, b"stale", MessageAttrs::default()),
             Err(NtStatus::INVALID_PORT_HANDLE)
         );
     }

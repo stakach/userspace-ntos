@@ -1454,11 +1454,25 @@ fn process_query_classes_use_access_checked_state_and_real_times() {
         pm.set_process_priority_class(target, PROCESS_PRIORITY_CLASS_ABOVE_NORMAL + 1),
         Err(STATUS_INVALID_PARAMETER)
     );
-    assert_eq!(pm.process_exception_port(target), None);
-    pm.set_process_exception_port(target, 0xCAFE).unwrap();
-    assert_eq!(pm.process_exception_port(target), Some(0xCAFE));
+    assert_eq!(pm.process_exception_port_endpoint(target), None);
+    let endpoint = ExceptionPortEndpoint::new(0xCAFE).unwrap();
+    pm.install_process_exception_port_endpoint(target, endpoint)
+        .unwrap();
+    assert_eq!(pm.process_exception_port_endpoint(target), Some(endpoint));
     assert_eq!(
-        pm.set_process_exception_port(target, 0xBEEF),
+        pm.install_process_exception_port_endpoint(
+            target,
+            ExceptionPortEndpoint::new(0xBEEF).unwrap()
+        ),
+        Err(STATUS_PORT_ALREADY_SET)
+    );
+    assert_eq!(
+        pm.take_process_exception_port_endpoint(target),
+        Ok(Some(endpoint))
+    );
+    assert_eq!(pm.take_process_exception_port_endpoint(target), Ok(None));
+    assert_eq!(
+        pm.install_process_exception_port_endpoint(target, endpoint),
         Err(STATUS_PORT_ALREADY_SET)
     );
 

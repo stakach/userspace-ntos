@@ -134,6 +134,22 @@ pub type Handle = u32;
 pub type SectionId = u32;
 pub type AddressSpaceId = u32;
 
+/// Broker-owned reference to one exact LPC port object. This is deliberately distinct from a
+/// process-local user handle: it remains valid after that handle table entry is closed and must be
+/// returned to the broker during process teardown.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ExceptionPortEndpoint(u64);
+
+impl ExceptionPortEndpoint {
+    pub fn new(value: u64) -> Option<Self> {
+        (value != 0).then_some(Self(value))
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Opaque ownership token for one exact, process-local handle slot that is not yet visible.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct HandleReservation {
@@ -552,8 +568,11 @@ pub struct NtProcess {
     /// Foreground/background priority mode carried by `PROCESS_PRIORITY_CLASS.Foreground` and
     /// `ProcessForegroundInformation`.
     foreground: bool,
-    /// `EPROCESS.ExceptionPort`, represented by the executive's broker-owned LPC port handle.
-    exception_port: Option<u64>,
+    /// `EPROCESS.ExceptionPort`, represented by an exact broker-owned LPC object reference.
+    exception_port_endpoint: Option<ExceptionPortEndpoint>,
+    /// Sticky one-shot state: teardown may release the reference but can never make the process
+    /// eligible to install another exception port.
+    exception_port_was_set: bool,
     /// `EPROCESS.DebugPort` — the `DEBUG_OBJECT` a debugger attached to this process, if any.
     debug_port: Option<DebugObjectId>,
     /// `PEB.BeingDebugged` — mirrors `DebugPort != NULL` (`DbgkpMarkProcessPeb`).
@@ -601,8 +620,8 @@ impl NtProcess {
         self.foreground
     }
     /// `EPROCESS.ExceptionPort`.
-    pub fn exception_port(&self) -> Option<u64> {
-        self.exception_port
+    pub fn exception_port_endpoint(&self) -> Option<ExceptionPortEndpoint> {
+        self.exception_port_endpoint
     }
 }
 
@@ -993,7 +1012,8 @@ impl ProcessManager {
                 base_priority,
                 priority_class,
                 foreground,
-                exception_port: None,
+                exception_port_endpoint: None,
+                exception_port_was_set: false,
                 debug_port: None,
                 being_debugged: false,
                 create_reported: false,
@@ -1377,24 +1397,34 @@ impl ProcessManager {
         Ok(())
     }
 
-    pub fn set_process_exception_port(
+    /// Install the one permitted `EPROCESS.ExceptionPort` object reference.
+    pub fn install_process_exception_port_endpoint(
         &mut self,
         pid: ProcessId,
-        port_handle: u64,
+        endpoint: ExceptionPortEndpoint,
     ) -> Result<(), u32> {
-        if port_handle == 0 {
-            return Err(STATUS_INVALID_HANDLE);
-        }
         let process = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
-        if process.exception_port.is_some() {
+        if process.exception_port_was_set {
             return Err(STATUS_PORT_ALREADY_SET);
         }
-        process.exception_port = Some(port_handle);
+        process.exception_port_endpoint = Some(endpoint);
+        process.exception_port_was_set = true;
         Ok(())
     }
 
-    pub fn process_exception_port(&self, pid: ProcessId) -> Option<u64> {
-        self.process(pid).and_then(|process| process.exception_port)
+    pub fn process_exception_port_endpoint(&self, pid: ProcessId) -> Option<ExceptionPortEndpoint> {
+        self.process(pid)
+            .and_then(|process| process.exception_port_endpoint)
+    }
+
+    /// Remove the broker reference only as part of common process teardown. Runtime callers cannot
+    /// replace an installed exception port; the native one-shot invariant remains intact.
+    pub fn take_process_exception_port_endpoint(
+        &mut self,
+        pid: ProcessId,
+    ) -> Result<Option<ExceptionPortEndpoint>, u32> {
+        let process = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        Ok(process.exception_port_endpoint.take())
     }
     pub fn thread(&self, tid: ThreadId) -> Option<&NtThread> {
         self.threads.get(&tid)

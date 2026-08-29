@@ -18473,17 +18473,51 @@ impl ExecNtHandler {
                     return STATUS_PRIVILEGE_NOT_HELD;
                 }
                 let port_handle = u64::from_le_bytes(value);
-                match lpc_client() {
+                let retained = match lpc_client() {
                     Some(client) => {
-                        if let Err(status) = client.query_handle(port_handle) {
-                            return status.raw() as u32;
+                        let metadata = match client.query_handle(port_handle) {
+                            Ok(metadata) => metadata,
+                            Err(status) => return status.raw() as u32,
+                        };
+                        if metadata.endpoint != nt_lpc_abi::handle_endpoint::LISTEN_PORT
+                            && metadata.endpoint
+                                != nt_lpc_abi::handle_endpoint::CLIENT_COMM_PORT
+                        {
+                            return STATUS_OBJECT_TYPE_MISMATCH;
+                        }
+                        if metadata.endpoint == nt_lpc_abi::handle_endpoint::CLIENT_COMM_PORT
+                            && metadata.state != nt_lpc_abi::connection_state::CONNECTED
+                        {
+                            return nt_status::NtStatus::PORT_DISCONNECTED.raw() as u32;
+                        }
+                        match client.retain_port_object(port_handle) {
+                            Ok(retained) => retained,
+                            Err(status) => return status.raw() as u32,
                         }
                     }
                     None => return STATUS_UNSUCCESSFUL,
+                };
+                let endpoint = nt_process::ExceptionPortEndpoint::new(retained)
+                    .expect("the LPC broker never returns a null retained endpoint");
+                match self
+                    .pm
+                    .install_process_exception_port_endpoint(pid, endpoint)
+                {
+                    Ok(()) => 0,
+                    Err(status) => {
+                        let release_status = lpc_client()
+                            .ok_or(nt_status::NtStatus::UNSUCCESSFUL)
+                            .and_then(|client| client.release_port_object(retained));
+                        if let Err(release_status) = release_status {
+                            print_str(b"[lpc-invariant] exception-port rollback failed endpoint=0x");
+                            print_hex_u64(retained);
+                            print_str(b" status=0x");
+                            print_hex(release_status.raw() as u32);
+                            print_str(b"\n");
+                        }
+                        status
+                    }
                 }
-                self.pm
-                    .set_process_exception_port(pid, port_handle)
-                    .map_or_else(|status| status, |()| 0)
             }
             12 => {
                 if information_length != 4 {
@@ -18695,6 +18729,28 @@ impl ExecNtHandler {
             self.release_handle_object(object);
             PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
         }
+        let Some(endpoint) = self.pm.process_exception_port_endpoint(pid) else {
+            return;
+        };
+        let Some(client) = (unsafe { lpc_client() }) else {
+            print_str(b"[lpc-invariant] exception-port teardown has no broker endpoint=0x");
+            print_hex_u64(endpoint.get());
+            print_str(b"\n");
+            return;
+        };
+        if let Err(status) = client.release_port_object(endpoint.get()) {
+            print_str(b"[lpc-invariant] exception-port release failed endpoint=0x");
+            print_hex_u64(endpoint.get());
+            print_str(b" status=0x");
+            print_hex(status.raw() as u32);
+            print_str(b"\n");
+            return;
+        }
+        let released = self
+            .pm
+            .take_process_exception_port_endpoint(pid)
+            .expect("a process with a retained exception port remains live through teardown");
+        assert_eq!(released, Some(endpoint));
     }
 
     pub(crate) fn duplicate_process_handle_with_access(
@@ -31072,7 +31128,10 @@ impl ExecNtHandler {
                     return nt_syscall::STATUS_SUCCESS;
                 }
 
-                let process_port = self.pm.process_exception_port(pid).filter(|port| *port != 0);
+                let process_port = self
+                    .pm
+                    .process_exception_port_endpoint(pid)
+                    .map(nt_process::ExceptionPortEndpoint::get);
                 let selected = process_port
                     .map(|port| (port, None))
                     .or_else(|| default_registration.map(|(port, owner)| (port, Some(owner))));

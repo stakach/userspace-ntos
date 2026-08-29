@@ -365,6 +365,42 @@ impl<B: Backend> LpcClient<B> {
         NtStatus(reply.status).to_result()
     }
 
+    /// Acquire a broker-owned reference to the concrete port object named by a live user handle.
+    /// The returned endpoint is independent of the registering process's handle table.
+    pub fn retain_port_object(&mut self, port_handle: u64) -> Result<u64, NtStatus> {
+        let req = nt_lpc_abi::LpcClosePortRequest {
+            abi_size: size_of::<nt_lpc_abi::LpcClosePortRequest>() as u16,
+            _reserved: 0,
+            _reserved2: 0,
+            port_handle,
+        };
+        let reply = self.backend.call(
+            opcode::LPC_OP_RETAIN_PORT_OBJECT,
+            bytemuck::bytes_of(&req),
+            &mut [],
+        );
+        NtStatus(reply.status).to_result()?;
+        (reply.detail0 != 0)
+            .then_some(reply.detail0)
+            .ok_or(NtStatus::UNSUCCESSFUL)
+    }
+
+    /// Release one exact broker-owned port-object endpoint.
+    pub fn release_port_object(&mut self, endpoint_handle: u64) -> Result<(), NtStatus> {
+        let req = nt_lpc_abi::LpcClosePortRequest {
+            abi_size: size_of::<nt_lpc_abi::LpcClosePortRequest>() as u16,
+            _reserved: 0,
+            _reserved2: 0,
+            port_handle: endpoint_handle,
+        };
+        let reply = self.backend.call(
+            opcode::LPC_OP_RELEASE_PORT_OBJECT,
+            bytemuck::bytes_of(&req),
+            &mut [],
+        );
+        NtStatus(reply.status).to_result()
+    }
+
     /// Resolve a broker handle to the live endpoint identity recorded by the port core.
     pub fn query_handle(&mut self, port_handle: u64) -> Result<HandleQueryResult, NtStatus> {
         let req = LpcQueryHandleRequest {

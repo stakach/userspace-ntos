@@ -16877,3 +16877,47 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     transition, and releasing it from the common process teardown path. Delete the raw-handle
     storage once the referenced endpoint is authoritative. After that, return to the regenerated
     37-service inventory and select the next bounded canonical trait.
+
+    Broker-retained process exception-port object lifetime (2026-08-30, accepted):
+    `ProcessExceptionPort` no longer stores a process-local user handle. The isolated LPC broker
+    now resolves a live user handle once and returns an opaque kernel endpoint that retains the
+    exact underlying port object. `nt-process` stores only the typed retained endpoint, preserves
+    the native one-shot install rule even after teardown takes the reference, and exposes a
+    teardown-only transition. The common process rundown path releases the broker endpoint after
+    closing the process's executive handles; a failed broker release leaves the process-manager
+    reference intact for diagnosis instead of reporting successful cleanup.
+
+    Review of the first live run corrected an overly narrow assumption in the preceding plan item.
+    The pinned NT contract references the generic LPC port object, and ReactOS CSRSS installs its
+    `CsrApiPort` connection/listen port as a process exception port. Restricting the setter to a
+    client communication port rejected that legitimate path and suspended winlogon before shell
+    activation. The accepted broker boundary therefore retains either a connection/listen port or
+    the exact connected client communication port and keeps the concrete routing plane private.
+    No endpoint-kind fallback exists in the executive: unsupported, stale, disconnected, or
+    wrong-type handles fail before process state is published.
+
+    A retained client communication endpoint now has an independent reference count and remains
+    live after its registering user handle closes. Multiple retained references own disjoint
+    request identities; releasing one cancels and uncharges only its queued, delivered, or replied
+    synchronous traffic. Releasing the last reference after user close tears down that connection.
+    Connection/listen endpoints continue through the already retained object plane. Kernel request,
+    exact reply, cancellation, and release all address the private endpoint, so no raw handle or
+    implicit handle-value lookup remains after publication.
+
+    Focused validation passes `nt-port-core` `20/20`, `nt-lpc-abi` `8/8`, `nt-lpc-server` `19/19`,
+    and `nt-process` `112/112`; the freestanding executive remains at the established 209-warning
+    baseline and the release staging path succeeds. The corrected serialized live gate registers
+    the retained default hard-error port, launches genuine userinit and Explorer, records 665 real
+    api0 redirects with zero callback failures, installs 18 client WndProcs without replay, reaches
+    Explorer paint begin/end `2/20` with 185 direct GDI returns and 131 batch flushes covering 171
+    records, paints `480000/480000` framebuffer pixels with at least 32 colours, passes all
+    `295/295` checks, and matches the sentinel.
+
+    The typed surface remains at 187 services, the hosted table at 186 numbered variants, and 37
+    required canonical services absent because this step closed object lifetime rather than adding
+    a syscall.
+
+    Review adjustment: the raw process exception-port handle and its handle-lifetime dependency are
+    closed. Regenerate the 37-service inventory and select the next bounded canonical Ob/Ps/Se/Mm or
+    I/O trait. Keep the mechanism in a focused host-tested owner, add only typed executive wiring,
+    and remove any old scalar or boot-specific machinery replaced by the real authority.
