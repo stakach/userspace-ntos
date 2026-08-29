@@ -9350,6 +9350,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.user_apc_redirected = false;
                 nt_handler.context_continue_redirected = false;
                 nt_handler.user_timer_rearm_requested = false;
+                nt_handler.job_time_rearm_requested = false;
                 nt_handler.system_time_change = None;
                 nt_handler.out_writes_n = 0;
                 nt_handler.exe_spawn_request = None;
@@ -9523,9 +9524,9 @@ pub(crate) unsafe fn service_sec_image(
                 // resume it), then suspend/delete the exact badge-selected TCB, and receive the next
                 // caller immediately. Remote termination tears down its target but still replies to
                 // the caller through the normal tail below.
-                let job_termination_mask =
-                    core::mem::take(&mut nt_handler.pending_job_termination_mask);
-                let caller_job_terminated = pi < 32 && job_termination_mask & (1u32 << pi) != 0;
+                let job_terminations =
+                    core::mem::take(&mut nt_handler.pending_job_terminations);
+                let caller_job_terminated = job_terminations.contains(&(pi as u8));
                 let mut post_action = nt_handler.post_action;
                 if caller_job_terminated
                     && !matches!(post_action, ExecPostAction::CriticalTermination { .. })
@@ -9541,7 +9542,7 @@ pub(crate) unsafe fn service_sec_image(
                     _ => None,
                 };
                 teardown_job_terminated_processes(
-                    job_termination_mask,
+                    job_terminations,
                     pi as u8,
                     post_action_process,
                     delay_queue,
@@ -10010,7 +10011,9 @@ pub(crate) unsafe fn service_sec_image(
                         nt_system_time_100ns(),
                     );
                     let _ = delay_timer_rearm_and_drain_overdue(delay_queue, &mut nt_handler);
-                } else if nt_handler.user_timer_rearm_requested {
+                } else if nt_handler.user_timer_rearm_requested
+                    || nt_handler.job_time_rearm_requested
+                {
                     delay_timer_rearm(delay_queue, &nt_handler);
                 }
                 park_lpc_receive = nt_handler.lpc_receive_park.take();

@@ -3061,6 +3061,8 @@ impl ExecNtHandler {
         write_field!(events, nt_kernel_exec::EventStore::with_capacity(192));
         write_field!(user_timers, nt_user_timer::TimerTable::with_capacity(32));
         write_field!(user_timer_rearm_requested, false);
+        write_field!(job_time_sample_deadline, u64::MAX);
+        write_field!(job_time_rearm_requested, false);
         write_field!(system_time_change, None);
         write_field!(
             semaphores,
@@ -3097,7 +3099,7 @@ impl ExecNtHandler {
         write_field!(user_apc_redirected, false);
         write_field!(context_continue_redirected, false);
         write_field!(post_action, ExecPostAction::None);
-        write_field!(pending_job_termination_mask, 0);
+        write_field!(pending_job_terminations, Vec::new());
         write_field!(stop, false);
         write_field!(next_handle, FAKE_HANDLE);
         write_field!(out_writes, [(0, 0); 8]);
@@ -8629,9 +8631,11 @@ impl ExecNtHandler {
         }
         let exit_time = nt_system_time_100ns() as i64;
         let exit_status = if code == 0 { STATUS_UNSUCCESSFUL } else { code };
+        self.sample_hosted_process_scheduler_times(pid);
         match self.pm.terminate_process_at(pid, exit_status, exit_time) {
             Ok(()) => {
                 self.release_process_handles(pid);
+                self.refresh_job_time_sampling();
                 self.post_action = ExecPostAction::TerminateProcess {
                     process_index: self.pi as u8,
                     current_tid: self.current_tid,
@@ -10835,20 +10839,24 @@ impl ExecNtHandler {
             }
             WakeAction::TerminateThread => {
                 dbgk_reporter_abandon(&block);
+                self.sample_hosted_process_scheduler_times(client_id.unique_process);
                 let _ = self.pm.terminate_thread_at(
                     client_id.unique_thread,
                     nt_process::dbgk::DBG_TERMINATE_THREAD,
                     nt_system_time_100ns() as i64,
                 );
+                self.refresh_job_time_sampling();
                 DBGK_TERMINATES_ENFORCED.fetch_add(1, Ordering::Relaxed);
             }
             WakeAction::TerminateProcess => {
                 dbgk_reporter_abandon(&block);
+                self.sample_hosted_process_scheduler_times(client_id.unique_process);
                 let _ = self.pm.terminate_process_at(
                     client_id.unique_process,
                     nt_process::dbgk::DBG_TERMINATE_PROCESS,
                     nt_system_time_100ns() as i64,
                 );
+                self.refresh_job_time_sampling();
                 DBGK_TERMINATES_ENFORCED.fetch_add(1, Ordering::Relaxed);
                 if block.is_blocked() {
                     crate::win32k_glue::unwind_dead_client_user_callbacks(block.pi);
@@ -22374,8 +22382,9 @@ impl ExecNtHandler {
     }
 
     fn drain_job_notifications(&mut self) {
+        let mut job_time_state_changed = false;
         while let Some(notification) = self.pm.take_job_notification() {
-            let _ = self.post_io_completion_packet(
+            let status = self.post_io_completion_packet(
                 notification.association.port_id,
                 nt_io_completion::CompletionPacket {
                     key_context: notification.association.completion_key,
@@ -22384,6 +22393,15 @@ impl ExecNtHandler {
                     information: notification.message as u64,
                 },
             );
+            if notification.message == nt_process::job::JOB_OBJECT_MSG_END_OF_JOB_TIME {
+                job_time_state_changed |= self
+                    .pm
+                    .complete_job_time_notification(notification.job_id, status == 0)
+                    .unwrap_or(false);
+            }
+        }
+        if job_time_state_changed {
+            self.refresh_job_time_sampling();
         }
     }
 
@@ -22393,6 +22411,154 @@ impl ExecNtHandler {
                 let _ = self.io_completion_ports.release(association.port_id);
             }
             self.unlink_job_namespace(destruction.id);
+        }
+    }
+
+    fn scheduler_runtime_100ns(runtime: HostedThreadRuntime) -> Result<(i64, i64), u64> {
+        let sched_context = runtime.mechanism.sched_context;
+        if sched_context <= 1 {
+            return Err(nt_process::STATUS_INVALID_HANDLE as u64);
+        }
+        let runtime = sel4_rt::sched_context_read_runtime(sched_context)?;
+        let to_100ns = |microseconds: u64| {
+            microseconds
+                .saturating_mul(10)
+                .min(i64::MAX as u64) as i64
+        };
+        Ok((
+            to_100ns(runtime.donated_time_us),
+            to_100ns(runtime.bound_time_us),
+        ))
+    }
+
+    fn log_scheduler_runtime_read_failure(runtime: HostedThreadRuntime, error: u64) {
+        let count = SCHED_RUNTIME_READ_FAILURES.fetch_add(1, Ordering::Relaxed);
+        if count >= 8 {
+            return;
+        }
+        print_str(b"[ps-time] sched-context read failed tid=");
+        print_u64(runtime.tid);
+        print_str(b" sc=0x");
+        print_hex_u64(runtime.mechanism.sched_context);
+        print_str(b" error=0x");
+        print_hex_u64(error);
+        print_str(b"\n");
+    }
+
+    /// Sample every live hosted ETHREAD from its scheduler context and enforce
+    /// job CPU limits against those authoritative counters.
+    pub(crate) fn sample_hosted_scheduler_times(&mut self) -> u64 {
+        let records = self.thread_runtime.record_count();
+        let mut sampled = 0u64;
+        for index in 0..records {
+            let Some(runtime) = self.thread_runtime.get_by_index(index) else {
+                continue;
+            };
+            let Ok(tid) = nt_process::ThreadId::try_from(runtime.tid) else {
+                continue;
+            };
+            if matches!(
+                self.pm.thread(tid).map(|thread| thread.state),
+                None | Some(nt_process::ThreadState::Terminated)
+            ) {
+                continue;
+            }
+            let (kernel_time, user_time) = match Self::scheduler_runtime_100ns(runtime) {
+                Ok(times) => times,
+                Err(error) => {
+                    Self::log_scheduler_runtime_read_failure(runtime, error);
+                    continue;
+                }
+            };
+            let actions = match self
+                .pm
+                .publish_thread_cpu_times(tid, kernel_time, user_time)
+            {
+                Ok(actions) => actions,
+                Err(status) => {
+                    Self::log_scheduler_runtime_read_failure(runtime, status as u64);
+                    continue;
+                }
+            };
+            sampled = sampled.saturating_add(1);
+            if let Some(job) = actions.terminate_job {
+                let _ = self.terminate_job_members(job, nt_process::job::STATUS_QUOTA_EXCEEDED);
+            } else if let Some(process) = actions.terminate_process {
+                let _ =
+                    self.terminate_job_process(process, nt_process::job::STATUS_QUOTA_EXCEEDED);
+            }
+        }
+        self.drain_job_notifications();
+        sampled
+    }
+
+    fn refresh_job_time_sampling(&mut self) {
+        if self.pm.has_active_job_time_limits() {
+            if self.job_time_sample_deadline == u64::MAX {
+                self.job_time_sample_deadline =
+                    monotonic_time_100ns().saturating_add(JOB_TIME_SAMPLE_INTERVAL_100NS);
+            }
+        } else {
+            self.job_time_sample_deadline = u64::MAX;
+        }
+        self.job_time_rearm_requested = true;
+    }
+
+    pub(crate) fn job_time_sample_next_deadline(&self) -> Option<u64> {
+        (self.pm.has_active_job_time_limits() && self.job_time_sample_deadline != u64::MAX)
+            .then_some(self.job_time_sample_deadline)
+    }
+
+    pub(crate) fn job_time_sample_due(&mut self, now_100ns: u64) -> u64 {
+        if !self.pm.has_active_job_time_limits() {
+            self.job_time_sample_deadline = u64::MAX;
+            return 0;
+        }
+        if self.job_time_sample_deadline == u64::MAX {
+            self.job_time_sample_deadline =
+                now_100ns.saturating_add(JOB_TIME_SAMPLE_INTERVAL_100NS);
+            return 0;
+        }
+        if now_100ns < self.job_time_sample_deadline {
+            return 0;
+        }
+        let sampled = self.sample_hosted_scheduler_times();
+        if self.pm.has_active_job_time_limits() {
+            let elapsed = now_100ns.saturating_sub(self.job_time_sample_deadline);
+            let periods = elapsed / JOB_TIME_SAMPLE_INTERVAL_100NS + 1;
+            self.job_time_sample_deadline = self
+                .job_time_sample_deadline
+                .saturating_add(periods.saturating_mul(JOB_TIME_SAMPLE_INTERVAL_100NS));
+        } else {
+            self.job_time_sample_deadline = u64::MAX;
+        }
+        sampled.max(1)
+    }
+
+    /// Preserve the final scheduler snapshot during teardown without firing a
+    /// second policy action for an object that is already terminating.
+    fn sample_hosted_process_scheduler_times(&mut self, pid: nt_process::ProcessId) {
+        let records = self.thread_runtime.record_count();
+        for index in 0..records {
+            let Some(runtime) = self.thread_runtime.get_by_index(index) else {
+                continue;
+            };
+            let Ok(tid) = nt_process::ThreadId::try_from(runtime.tid) else {
+                continue;
+            };
+            if self.pm.thread(tid).map(|thread| thread.process_id) != Some(pid) {
+                continue;
+            }
+            let (kernel_time, user_time) = match Self::scheduler_runtime_100ns(runtime) {
+                Ok(times) => times,
+                Err(error) => {
+                    Self::log_scheduler_runtime_read_failure(runtime, error);
+                    continue;
+                }
+            };
+            if let Err(status) = self.pm.update_thread_cpu_times(tid, kernel_time, user_time) {
+                Self::log_scheduler_runtime_read_failure(runtime, status as u64);
+            }
         }
     }
 
@@ -22411,15 +22577,27 @@ impl ExecNtHandler {
             };
             return Ok(());
         }
+        let process_index = self
+            .pi_for_pid(pid)
+            .map(u8::try_from)
+            .transpose()
+            .map_err(|_| nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
+        if let Some(process_index) = process_index {
+            if !self.pending_job_terminations.contains(&process_index) {
+                self.pending_job_terminations
+                    .try_reserve(1)
+                    .map_err(|_| nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
+            }
+        }
+        self.sample_hosted_process_scheduler_times(pid);
         self.pm.mark_job_process_forced_termination(pid)?;
         self.pm
             .terminate_process_at(pid, exit_status, nt_system_time_100ns() as i64)?;
         self.release_process_handles(pid);
-        if let Some(process_index) = self.pi_for_pid(pid) {
-            let Some(bit) = 1u32.checked_shl(process_index as u32) else {
-                return Err(nt_process::STATUS_INSUFFICIENT_RESOURCES);
-            };
-            self.pending_job_termination_mask |= bit;
+        if let Some(process_index) = process_index {
+            if !self.pending_job_terminations.contains(&process_index) {
+                self.pending_job_terminations.push(process_index);
+            }
         }
         self.drain_job_notifications();
         Ok(())
@@ -22430,11 +22608,11 @@ impl ExecNtHandler {
         id: nt_process::job::JobId,
         exit_status: u32,
     ) -> Result<(), u32> {
-        let mut pids = [0u32; MAX_PI];
-        let count = self.pm.job_active_process_ids(id, &mut pids)?;
-        for &pid in &pids[..count] {
+        let pids = self.pm.job_active_process_ids_owned(id)?;
+        for pid in pids {
             self.terminate_job_process(pid, exit_status)?;
         }
+        self.refresh_job_time_sampling();
         Ok(())
     }
 
@@ -22660,6 +22838,7 @@ impl ExecNtHandler {
             Ok(status) => status,
             Err(status) => return status,
         };
+        self.refresh_job_time_sampling();
         self.drain_job_notifications();
         if status == nt_process::job::STATUS_QUOTA_EXCEEDED {
             if let Err(error) = self.terminate_job_process(pid, 0x0000_0008) {
@@ -22768,7 +22947,8 @@ impl ExecNtHandler {
             }
         };
 
-        let mut fixed = [0u8; nt_process::job_abi::BASIC_PROCESS_ID_LIST_HEADER_SIZE + MAX_PI * 8];
+        let mut fixed = [0u8; nt_process::job_abi::EXTENDED_LIMIT_SIZE];
+        let mut variable = alloc::vec::Vec::new();
         let (status, actual, output): (u32, usize, &[u8]) = match class {
             nt_process::job_abi::JobInformationClass::BasicAccounting => {
                 let accounting = match self.pm.job_accounting(id) {
@@ -22843,26 +23023,28 @@ impl ExecNtHandler {
                 return nt_process::STATUS_INVALID_INFO_CLASS;
             }
             nt_process::job_abi::JobInformationClass::BasicProcessIdList => {
-                let mut pids = [0u32; MAX_PI];
-                let (assigned, count) = match self.pm.job_process_ids(id, &mut pids) {
+                let (assigned, pids) = match self.pm.job_process_ids_owned(id) {
                     Ok(value) => value,
                     Err(status) => return status,
                 };
-                let available = length.min(fixed.len());
+                if variable.try_reserve_exact(length).is_err() {
+                    return nt_process::STATUS_INSUFFICIENT_RESOURCES;
+                }
+                variable.resize(length, 0);
                 match nt_process::job_abi::encode_process_ids(
                     assigned,
-                    &pids[..count],
-                    &mut fixed[..available],
+                    &pids,
+                    &mut variable,
                 ) {
-                    Ok(actual) => (0, actual, &fixed[..actual]),
+                    Ok(actual) => (0, actual, &variable[..actual]),
                     Err(status) => {
                         let actual = nt_process::job_abi::BASIC_PROCESS_ID_LIST_HEADER_SIZE
-                            + ((available
+                            + ((length
                                 - nt_process::job_abi::BASIC_PROCESS_ID_LIST_HEADER_SIZE)
                                 / 8)
-                            .min(count)
+                            .min(pids.len())
                                 * 8;
-                        (status, actual, &fixed[..actual])
+                        (status, actual, &variable[..actual])
                     }
                 }
             }
@@ -22882,9 +23064,15 @@ impl ExecNtHandler {
     unsafe fn nt_set_information_job_object(&mut self, args: &[u64]) -> u32 {
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
         const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
-        const SUPPORTED_LIMIT_FLAGS: u32 = nt_process::job::JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+        const SUPPORTED_BASIC_LIMIT_FLAGS: u32 = nt_process::job::JOB_OBJECT_LIMIT_PROCESS_TIME
+            | nt_process::job::JOB_OBJECT_LIMIT_JOB_TIME
+            | nt_process::job::JOB_OBJECT_LIMIT_ACTIVE_PROCESS
             | nt_process::job::JOB_OBJECT_LIMIT_AFFINITY
             | nt_process::job::JOB_OBJECT_LIMIT_PRIORITY_CLASS
+            | nt_process::job::JOB_OBJECT_LIMIT_PRESERVE_JOB_TIME;
+        const SUPPORTED_EXTENDED_LIMIT_FLAGS: u32 = SUPPORTED_BASIC_LIMIT_FLAGS
+            | nt_process::job::JOB_OBJECT_LIMIT_BREAKAWAY_OK
+            | nt_process::job::JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
             | nt_process::job::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 
         let class = match nt_process::job_abi::JobInformationClass::from_u32(nt_ulong_arg(args[1]))
@@ -22918,21 +23106,29 @@ impl ExecNtHandler {
         match class {
             nt_process::job_abi::JobInformationClass::BasicLimit => {
                 let limits = nt_process::job_abi::decode_basic_limits(&input[..length]).unwrap();
-                if limits.limit_flags & !SUPPORTED_LIMIT_FLAGS != 0 {
+                if limits.limit_flags & !SUPPORTED_BASIC_LIMIT_FLAGS != 0 {
                     return STATUS_NOT_SUPPORTED;
                 }
-                self.pm
-                    .set_job_basic_limits(id, limits)
-                    .map_or_else(|status| status, |()| 0)
+                match self.pm.set_job_basic_limits(id, limits) {
+                    Ok(()) => {
+                        self.refresh_job_time_sampling();
+                        0
+                    }
+                    Err(status) => status,
+                }
             }
             nt_process::job_abi::JobInformationClass::ExtendedLimit => {
                 let limits = nt_process::job_abi::decode_extended_limits(&input[..length]).unwrap();
-                if limits.basic.limit_flags & !SUPPORTED_LIMIT_FLAGS != 0 {
+                if limits.basic.limit_flags & !SUPPORTED_EXTENDED_LIMIT_FLAGS != 0 {
                     return STATUS_NOT_SUPPORTED;
                 }
-                self.pm
-                    .set_job_extended_limits(id, limits)
-                    .map_or_else(|status| status, |()| 0)
+                match self.pm.set_job_extended_limits(id, limits) {
+                    Ok(()) => {
+                        self.refresh_job_time_sampling();
+                        0
+                    }
+                    Err(status) => status,
+                }
             }
             nt_process::job_abi::JobInformationClass::BasicUiRestrictions => {
                 let value = u32::from_le_bytes(input[..4].try_into().unwrap());
@@ -22976,12 +23172,11 @@ impl ExecNtHandler {
                     let _ = self.io_completion_ports.release(port_id);
                     return status;
                 }
-                let mut pids = [0u32; MAX_PI];
-                let (_, count) = match self.pm.job_process_ids(id, &mut pids) {
+                let (_, pids) = match self.pm.job_process_ids_owned(id) {
                     Ok(value) => value,
                     Err(status) => return status,
                 };
-                for &pid in &pids[..count] {
+                for pid in pids {
                     let status = self.post_io_completion_packet(
                         port_id,
                         nt_io_completion::CompletionPacket {
@@ -40348,6 +40543,7 @@ impl ExecNtHandler {
                 let process_index = self.pi_for_pid(pid).map(|pi| pi as u8);
                 let current_tid = self.current_tid as nt_process::ThreadId;
                 let exit_time = nt_system_time_100ns() as i64;
+                self.sample_hosted_process_scheduler_times(pid);
                 if !kill_by_handle && pid == caller_pid {
                     if let Err(status) = self.pm.terminate_process_other_threads_at(
                         pid,
@@ -40378,6 +40574,7 @@ impl ExecNtHandler {
                         };
                     }
                 }
+                self.refresh_job_time_sampling();
                 unsafe { wait_wake_dispatcher_set(self) };
                 0 // STATUS_SUCCESS
             }
@@ -40439,6 +40636,7 @@ impl ExecNtHandler {
                     };
                     return 0;
                 }
+                self.sample_hosted_process_scheduler_times(target_pid);
                 let exit_time = nt_system_time_100ns() as i64;
                 let outcome = if self.current_process_is_csrss()
                     && self.pm.main_thread(caller_pid) == Some(target)
@@ -40461,6 +40659,7 @@ impl ExecNtHandler {
                 if self.pm.is_process_signaled(target_pid) {
                     self.release_process_handles(target_pid);
                 }
+                self.refresh_job_time_sampling();
                 unsafe { wait_wake_dispatcher_set(self) };
                 self.post_action = if is_current {
                     ExecPostAction::TerminateCurrentThread { tid: target as u64 }

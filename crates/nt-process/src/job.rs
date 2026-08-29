@@ -161,6 +161,7 @@ pub struct CompletionPortAssociation {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JobNotification {
+    pub job_id: JobId,
     pub association: CompletionPortAssociation,
     pub message: u32,
     pub process_id: ProcessId,
@@ -169,6 +170,12 @@ pub struct JobNotification {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct JobNotifications {
     entries: [Option<JobNotification>; 2],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JobTimeLimitActions {
+    pub terminate_process: Option<ProcessId>,
+    pub terminate_job: Option<JobId>,
 }
 
 impl JobNotifications {
@@ -210,6 +217,7 @@ struct JobMember {
     active: bool,
     accounting_folded: bool,
     forced_termination: bool,
+    process_time_limit_reached: bool,
 }
 
 #[derive(Debug)]
@@ -226,6 +234,9 @@ struct Job {
     ui_restrictions: u32,
     security_limits: u32,
     end_of_job_time_action: u32,
+    period_start_total_user_time: i64,
+    period_start_total_kernel_time: i64,
+    job_time_limit_reached: bool,
     completion_port: Option<CompletionPortAssociation>,
     member_level: u32,
     set_head: Option<JobId>,
@@ -237,6 +248,7 @@ struct Job {
 impl Job {
     fn notification(&self, message: u32, process_id: ProcessId) -> Option<JobNotification> {
         self.completion_port.map(|association| JobNotification {
+            job_id: self.id,
             association,
             message,
             process_id,
@@ -371,6 +383,9 @@ impl JobStore {
             ui_restrictions: 0,
             security_limits: 0,
             end_of_job_time_action: JOB_OBJECT_TERMINATE_AT_END_OF_JOB,
+            period_start_total_user_time: 0,
+            period_start_total_kernel_time: 0,
+            job_time_limit_reached: false,
             completion_port: None,
             member_level: 0,
             set_head: None,
@@ -498,6 +513,7 @@ impl JobStore {
             active: true,
             accounting_folded: false,
             forced_termination: false,
+            process_time_limit_reached: false,
         });
         job.accounting.total_processes = job.accounting.total_processes.saturating_add(1);
         job.accounting.active_processes = job.accounting.active_processes.saturating_add(1);
@@ -583,6 +599,7 @@ impl JobStore {
             process_id,
         ));
         if job.accounting.active_processes == 0 {
+            job.signaled = true;
             notifications.push(job.notification(JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO, 0));
         }
         notifications
@@ -620,37 +637,53 @@ impl JobStore {
         Some(id)
     }
 
-    pub fn active_process_ids(&self, id: JobId, out: &mut [ProcessId]) -> Result<usize, u32> {
+    pub fn active_process_ids_owned(&self, id: JobId) -> Result<Vec<ProcessId>, u32> {
         let job = self.get(id).ok_or(crate::STATUS_INVALID_HANDLE)?;
-        let mut count = 0;
-        for member in job.members.iter().filter(|member| member.active) {
-            if count == out.len() {
-                break;
-            }
-            out[count] = member.process_id;
-            count += 1;
-        }
-        Ok(count)
+        let count = job.members.iter().filter(|member| member.active).count();
+        let mut process_ids = Vec::new();
+        process_ids
+            .try_reserve_exact(count)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        process_ids.extend(
+            job.members
+                .iter()
+                .filter(|member| member.active)
+                .map(|member| member.process_id),
+        );
+        Ok(process_ids)
     }
 
-    pub fn process_ids(&self, id: JobId, out: &mut [ProcessId]) -> Result<(u32, usize), u32> {
+    pub fn process_ids_owned(&self, id: JobId) -> Result<(u32, Vec<ProcessId>), u32> {
         let job = self.get(id).ok_or(crate::STATUS_INVALID_HANDLE)?;
         let assigned = job.accounting.active_processes;
-        let mut count = 0;
-        for member in job.members.iter().filter(|member| member.active) {
-            if count == out.len() {
-                break;
-            }
-            out[count] = member.process_id;
-            count += 1;
-        }
-        Ok((assigned, count))
+        let process_ids = self.active_process_ids_owned(id)?;
+        Ok((assigned, process_ids))
     }
 
     pub fn accounting(&self, id: JobId) -> Result<JobAccounting, u32> {
         self.get(id)
             .map(|job| job.accounting)
             .ok_or(crate::STATUS_INVALID_HANDLE)
+    }
+
+    pub fn time_period_start(&self, id: JobId) -> Result<(i64, i64), u32> {
+        self.get(id)
+            .map(|job| {
+                (
+                    job.period_start_total_user_time,
+                    job.period_start_total_kernel_time,
+                )
+            })
+            .ok_or(crate::STATUS_INVALID_HANDLE)
+    }
+
+    pub fn has_time_limits(&self) -> bool {
+        self.jobs.iter().flatten().any(|job| {
+            job.basic_limits.limit_flags
+                & (JOB_OBJECT_LIMIT_PROCESS_TIME | JOB_OBJECT_LIMIT_JOB_TIME)
+                != 0
+                && job.accounting.active_processes != 0
+        })
     }
 
     pub fn basic_limits(&self, id: JobId) -> Result<JobBasicLimits, u32> {
@@ -669,7 +702,23 @@ impl JobStore {
             .ok_or(crate::STATUS_INVALID_HANDLE)
     }
 
-    pub fn set_basic_limits(&mut self, id: JobId, mut limits: JobBasicLimits) -> Result<(), u32> {
+    pub fn set_basic_limits(&mut self, id: JobId, limits: JobBasicLimits) -> Result<(), u32> {
+        let accounting = self.accounting(id)?;
+        self.set_basic_limits_at(
+            id,
+            limits,
+            accounting.total_user_time,
+            accounting.total_kernel_time,
+        )
+    }
+
+    pub fn set_basic_limits_at(
+        &mut self,
+        id: JobId,
+        mut limits: JobBasicLimits,
+        total_user_time: i64,
+        total_kernel_time: i64,
+    ) -> Result<(), u32> {
         if limits.limit_flags & !JOB_OBJECT_BASIC_LIMIT_VALID_FLAGS != 0 {
             return Err(crate::STATUS_INVALID_PARAMETER);
         }
@@ -678,25 +727,51 @@ impl JobStore {
             limits.scheduling_class = 5;
         }
         let job = self.get_mut(id).ok_or(crate::STATUS_INVALID_HANDLE)?;
+        let previous_job_time_enabled =
+            job.basic_limits.limit_flags & JOB_OBJECT_LIMIT_JOB_TIME != 0;
         let previous_job_time = job.basic_limits.per_job_user_time_limit;
         let previous_period_user = job.accounting.this_period_total_user_time;
+        let previous_period_kernel = job.accounting.this_period_total_kernel_time;
+        let set_job_time = limits.limit_flags & JOB_OBJECT_LIMIT_JOB_TIME != 0;
+        let preserve_job_time = limits.limit_flags & JOB_OBJECT_LIMIT_PRESERVE_JOB_TIME != 0;
+        limits.limit_flags &= !JOB_OBJECT_LIMIT_PRESERVE_JOB_TIME;
         job.basic_limits = limits;
-        if limits.limit_flags & JOB_OBJECT_LIMIT_PRESERVE_JOB_TIME != 0 {
-            job.basic_limits.per_job_user_time_limit = previous_job_time;
-            job.accounting.this_period_total_user_time = previous_period_user;
-        } else if limits.limit_flags & JOB_OBJECT_LIMIT_JOB_TIME != 0 {
+        if set_job_time {
             job.accounting.this_period_total_user_time = 0;
             job.accounting.this_period_total_kernel_time = 0;
+            job.period_start_total_user_time = total_user_time;
+            job.period_start_total_kernel_time = total_kernel_time;
+            job.job_time_limit_reached = false;
             job.signaled = false;
+        } else if preserve_job_time && previous_job_time_enabled {
+            job.basic_limits.limit_flags |= JOB_OBJECT_LIMIT_JOB_TIME;
+            job.basic_limits.per_job_user_time_limit = previous_job_time;
+            job.accounting.this_period_total_user_time = previous_period_user;
+            job.accounting.this_period_total_kernel_time = previous_period_kernel;
+        }
+        for member in job.members.iter_mut().filter(|member| member.active) {
+            member.process_time_limit_reached = false;
         }
         job.extended_limits.basic = job.basic_limits;
         Ok(())
     }
 
-    pub fn set_extended_limits(
+    pub fn set_extended_limits(&mut self, id: JobId, limits: JobExtendedLimits) -> Result<(), u32> {
+        let accounting = self.accounting(id)?;
+        self.set_extended_limits_at(
+            id,
+            limits,
+            accounting.total_user_time,
+            accounting.total_kernel_time,
+        )
+    }
+
+    pub fn set_extended_limits_at(
         &mut self,
         id: JobId,
         mut limits: JobExtendedLimits,
+        total_user_time: i64,
+        total_kernel_time: i64,
     ) -> Result<(), u32> {
         if limits.basic.limit_flags & !JOB_OBJECT_EXTENDED_LIMIT_VALID_FLAGS != 0 {
             return Err(crate::STATUS_INVALID_PARAMETER);
@@ -706,23 +781,47 @@ impl JobStore {
             limits.basic.scheduling_class = 5;
         }
         let job = self.get_mut(id).ok_or(crate::STATUS_INVALID_HANDLE)?;
+        let previous_job_time_enabled =
+            job.basic_limits.limit_flags & JOB_OBJECT_LIMIT_JOB_TIME != 0;
         let previous_job_time = job.basic_limits.per_job_user_time_limit;
         let previous_period_user = job.accounting.this_period_total_user_time;
+        let previous_period_kernel = job.accounting.this_period_total_kernel_time;
+        let set_job_time = limits.basic.limit_flags & JOB_OBJECT_LIMIT_JOB_TIME != 0;
+        let preserve_job_time = limits.basic.limit_flags & JOB_OBJECT_LIMIT_PRESERVE_JOB_TIME != 0;
+        limits.basic.limit_flags &= !JOB_OBJECT_LIMIT_PRESERVE_JOB_TIME;
         job.basic_limits = limits.basic;
         job.extended_limits = limits;
-        if limits.basic.limit_flags & JOB_OBJECT_LIMIT_PRESERVE_JOB_TIME != 0 {
+        if set_job_time {
+            job.accounting.this_period_total_user_time = 0;
+            job.accounting.this_period_total_kernel_time = 0;
+            job.period_start_total_user_time = total_user_time;
+            job.period_start_total_kernel_time = total_kernel_time;
+            job.job_time_limit_reached = false;
+            job.signaled = false;
+        } else if preserve_job_time && previous_job_time_enabled {
+            job.basic_limits.limit_flags |= JOB_OBJECT_LIMIT_JOB_TIME;
             job.basic_limits.per_job_user_time_limit = previous_job_time;
             job.extended_limits.basic = job.basic_limits;
             job.accounting.this_period_total_user_time = previous_period_user;
-        } else if limits.basic.limit_flags & JOB_OBJECT_LIMIT_JOB_TIME != 0 {
-            job.accounting.this_period_total_user_time = 0;
-            job.accounting.this_period_total_kernel_time = 0;
-            job.signaled = false;
+            job.accounting.this_period_total_kernel_time = previous_period_kernel;
+        }
+        for member in job.members.iter_mut().filter(|member| member.active) {
+            member.process_time_limit_reached = false;
         }
         Ok(())
     }
 
     fn validate_limits(limits: &JobBasicLimits) -> Result<(), u32> {
+        if limits.limit_flags & JOB_OBJECT_LIMIT_PROCESS_TIME != 0
+            && limits.per_process_user_time_limit <= 0
+        {
+            return Err(crate::STATUS_INVALID_PARAMETER);
+        }
+        if limits.limit_flags & JOB_OBJECT_LIMIT_JOB_TIME != 0
+            && limits.per_job_user_time_limit <= 0
+        {
+            return Err(crate::STATUS_INVALID_PARAMETER);
+        }
         if limits.limit_flags & JOB_OBJECT_LIMIT_WORKINGSET != 0
             && (limits.minimum_working_set_size == 0
                 || limits.maximum_working_set_size == 0
@@ -749,6 +848,81 @@ impl JobStore {
             return Err(crate::STATUS_INVALID_PARAMETER);
         }
         Ok(())
+    }
+
+    pub fn evaluate_time_limits(
+        &mut self,
+        id: JobId,
+        process_id: ProcessId,
+        process_user_time: i64,
+        this_period_job_user_time: i64,
+    ) -> Result<JobTimeLimitActions, u32> {
+        let mut process_notification = None;
+        let mut job_notification = None;
+        let actions = {
+            let job = self.get_mut(id).ok_or(crate::STATUS_INVALID_HANDLE)?;
+            let member_index = job
+                .members
+                .iter()
+                .position(|member| member.process_id == process_id && member.active)
+                .ok_or(crate::STATUS_INVALID_HANDLE)?;
+            let job_limit_reached = job.basic_limits.limit_flags & JOB_OBJECT_LIMIT_JOB_TIME != 0
+                && !job.job_time_limit_reached
+                && this_period_job_user_time > job.basic_limits.per_job_user_time_limit;
+            let mut actions = JobTimeLimitActions::default();
+            if job_limit_reached {
+                job.job_time_limit_reached = true;
+                job_notification = job.notification(JOB_OBJECT_MSG_END_OF_JOB_TIME, 0);
+                if job.end_of_job_time_action == JOB_OBJECT_TERMINATE_AT_END_OF_JOB
+                    || job.completion_port.is_none()
+                {
+                    for member in job.members.iter_mut().filter(|member| member.active) {
+                        member.forced_termination = true;
+                    }
+                    actions.terminate_job = Some(id);
+                }
+            }
+            let process_limit_reached =
+                job.basic_limits.limit_flags & JOB_OBJECT_LIMIT_PROCESS_TIME != 0
+                    && !job.members[member_index].process_time_limit_reached
+                    && process_user_time > job.basic_limits.per_process_user_time_limit;
+            if process_limit_reached {
+                let member = &mut job.members[member_index];
+                member.process_time_limit_reached = true;
+                member.forced_termination = true;
+                process_notification =
+                    job.notification(JOB_OBJECT_MSG_END_OF_PROCESS_TIME, process_id);
+                if actions.terminate_job.is_none() {
+                    actions.terminate_process = Some(process_id);
+                }
+            }
+            actions
+        };
+        self.queue_notification(process_notification);
+        self.queue_notification(job_notification);
+        Ok(actions)
+    }
+
+    pub fn complete_job_time_notification(
+        &mut self,
+        id: JobId,
+        delivered: bool,
+    ) -> Result<bool, u32> {
+        let job = self.get_mut(id).ok_or(crate::STATUS_INVALID_HANDLE)?;
+        if job.end_of_job_time_action != JOB_OBJECT_POST_AT_END_OF_JOB
+            || job.basic_limits.limit_flags & JOB_OBJECT_LIMIT_JOB_TIME == 0
+            || !job.job_time_limit_reached
+        {
+            return Ok(false);
+        }
+        if delivered {
+            job.basic_limits.limit_flags &= !JOB_OBJECT_LIMIT_JOB_TIME;
+            job.basic_limits.per_job_user_time_limit = 0;
+            job.extended_limits.basic = job.basic_limits;
+        } else {
+            job.job_time_limit_reached = false;
+        }
+        Ok(delivered)
     }
 
     pub fn ui_restrictions(&self, id: JobId) -> Result<u32, u32> {

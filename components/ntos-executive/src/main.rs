@@ -3420,6 +3420,8 @@ const DELAY_TIMER_SOURCE_HOSTED_KERNEL_TIMER: u64 = 6;
 const DELAY_TIMER_SOURCE_USER_TIMER: u64 = 7;
 const DELAY_TIMER_SOURCE_KEYED_RELEASE: u64 = 8;
 const DELAY_TIMER_SOURCE_HOSTED_DRIVER: u64 = 9;
+const DELAY_TIMER_SOURCE_JOB_TIME: u64 = 10;
+const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_TCB_UNBIND_NOTIFICATION: u64 = 15;
 const LBL_IRQ_ACK: u64 = 31;
@@ -7304,9 +7306,10 @@ pub(crate) static DRAIN_WORK_TICKS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static DRAIN_REARM_TICKS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static DRAIN_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static DRAIN_DUE_HITS: AtomicU64 = AtomicU64::new(0);
-/// Per-sub-drain cost. `delay_timer_drain_due_work` fans out to nine wake paths; one of them owns
+pub(crate) static SCHED_RUNTIME_READ_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// Per-sub-drain cost. `delay_timer_drain_due_work` fans out to ten wake paths; one of them owns
 /// the whole boot, so they are timed individually.
-pub(crate) const SUBDRAIN_N: usize = 9;
+pub(crate) const SUBDRAIN_N: usize = 10;
 pub(crate) static SUBDRAIN_TICKS: [AtomicU64; SUBDRAIN_N] =
     [const { AtomicU64::new(0) }; SUBDRAIN_N];
 pub(crate) static SUBDRAIN_WOKEN: [AtomicU64; SUBDRAIN_N] =
@@ -16451,6 +16454,7 @@ unsafe fn delay_timer_next_deadline(
     let user_timer_deadline = handler.user_timer_next_deadline(now);
     let hosted_kernel_timer_deadline = driver_launch::hosted_driver_timer_next_deadline();
     let hosted_driver_deadline = driver_launch::hosted_driver_wait_next_deadline();
+    let job_time_deadline = handler.job_time_sample_next_deadline();
     let deadman_deadline = watchdog_deadline();
     let deadline = delay_deadline
         .into_iter()
@@ -16461,6 +16465,7 @@ unsafe fn delay_timer_next_deadline(
         .chain(user_timer_deadline)
         .chain(hosted_kernel_timer_deadline)
         .chain(hosted_driver_deadline)
+        .chain(job_time_deadline)
         .chain(deadman_deadline)
         .min()?;
     let source = if delay_deadline == Some(deadline) {
@@ -16479,6 +16484,8 @@ unsafe fn delay_timer_next_deadline(
         DELAY_TIMER_SOURCE_HOSTED_KERNEL_TIMER
     } else if hosted_driver_deadline == Some(deadline) {
         DELAY_TIMER_SOURCE_HOSTED_DRIVER
+    } else if job_time_deadline == Some(deadline) {
+        DELAY_TIMER_SOURCE_JOB_TIME
     } else {
         DELAY_TIMER_SOURCE_WATCHDOG
     };
@@ -16692,6 +16699,7 @@ unsafe fn delay_timer_drain_due_work(
         + subdrain!(5, user_timer_wake_due(handler, now_100ns))
         + subdrain!(6, driver_launch::hosted_driver_timer_wake_due(now_100ns))
         + subdrain!(7, driver_launch::hosted_driver_wait_wake_due(now_100ns))
+        + subdrain!(9, handler.job_time_sample_due(now_100ns))
         + watchdog_tick
 }
 
@@ -16725,6 +16733,7 @@ pub(crate) unsafe fn delay_timer_drain_overdue_without_badge(
     }
     let work_started = disk_census_ticks();
     let woken = delay_timer_drain_due_work(queue, handler, now_100ns);
+    teardown_pending_job_time_terminations(queue, handler);
     let work_ticks = disk_census_ticks().wrapping_sub(work_started);
     DRAIN_WORK_TICKS.fetch_add(work_ticks, Ordering::Relaxed);
     // Print EVERY due drain, not just slow ones: the path fires only a handful of times per boot,
@@ -16956,6 +16965,16 @@ fn thread_wait_state_stats() -> (usize, usize, usize, u64, u64) {
     unsafe { (&*core::ptr::addr_of!(THREAD_WAIT_PARKED)).stats() }
 }
 
+unsafe fn teardown_pending_job_time_terminations(
+    queue: &mut nt_delay_execution::Queue,
+    handler: &mut ExecNtHandler,
+) {
+    let process_indices = core::mem::take(&mut handler.pending_job_terminations);
+    if !process_indices.is_empty() {
+        teardown_job_terminated_processes(process_indices, u8::MAX, None, queue, handler);
+    }
+}
+
 unsafe fn delay_timer_interrupt(
     queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
@@ -17002,6 +17021,7 @@ unsafe fn delay_timer_interrupt(
         // ahead of the enable edge.
         let now_100ns = monotonic_time_100ns();
         let _ = delay_timer_drain_due_work(queue, handler, now_100ns);
+        teardown_pending_job_time_terminations(queue, handler);
         delay_timer_rearm(queue, handler);
         return;
     }
@@ -17013,6 +17033,7 @@ unsafe fn delay_timer_interrupt(
     // deadline as the minimum effective time for this non-stale delivery.
     let now_100ns = monotonic_time_100ns().max(LAST_REARM_DEADLINE.load(Ordering::Relaxed));
     let woken = delay_timer_drain_due_work(queue, handler, now_100ns);
+    teardown_pending_job_time_terminations(queue, handler);
     TIMER_TICKS_SEEN.fetch_add(1, Ordering::Relaxed);
     if woken == 0 {
         delay_timer_widen_arm_guard();
@@ -17904,26 +17925,20 @@ unsafe fn terminate_hosted_process_mechanisms(
     delay_queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
 ) -> usize {
-    const MAX_PROCESS_TERMINATE_TIDS: usize = 64;
-    let mut tids = [0u64; MAX_PROCESS_TERMINATE_TIDS];
-    let mut count = 0usize;
-    if let Some(pid) = handler.pm_pid_for_pi(process_index as usize) {
-        if let Some(process) = handler.pm.process(pid) {
-            for tid in process.threads.iter().copied() {
-                if count == tids.len() {
-                    print_str(b"[process-term] tid-list-full pi=");
-                    print_u64(process_index as u64);
-                    print_str(b"\n");
-                    break;
-                }
-                tids[count] = tid as u64;
-                count += 1;
-            }
-        }
-    }
-
     let mut reclaimed = 0usize;
-    for tid in tids.iter().copied().take(count) {
+    let pid = handler.pm_pid_for_pi(process_index as usize);
+    let thread_count = pid
+        .and_then(|pid| handler.pm.process(pid))
+        .map_or(0, |process| process.threads.len());
+    for index in 0..thread_count {
+        let Some(tid) = pid
+            .and_then(|pid| handler.pm.process(pid))
+            .and_then(|process| process.threads.get(index))
+            .copied()
+            .map(u64::from)
+        else {
+            continue;
+        };
         if preserve_tid == Some(tid) {
             continue;
         }
@@ -17938,15 +17953,13 @@ unsafe fn terminate_hosted_process_mechanisms(
 }
 
 unsafe fn teardown_job_terminated_processes(
-    mut mask: u32,
+    process_indices: Vec<u8>,
     caller_process_index: u8,
     skip_process_index: Option<u8>,
     delay_queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
 ) {
-    while mask != 0 {
-        let process_index = mask.trailing_zeros() as u8;
-        mask &= !(1u32 << process_index);
+    for process_index in process_indices {
         if process_index == caller_process_index || skip_process_index == Some(process_index) {
             continue;
         }
@@ -22030,6 +22043,8 @@ struct ExecNtHandler {
     /// `events`; this table holds due-time, period, and optional APC metadata.
     user_timers: nt_user_timer::TimerTable,
     user_timer_rearm_requested: bool,
+    job_time_sample_deadline: u64,
+    job_time_rearm_requested: bool,
     /// Set only after the authoritative system clock moved. The service-loop tail consumes this
     /// before replying so KUSER publication and absolute-deadline re-evaluation are inseparable
     /// from a successful clock adjustment.
@@ -22091,7 +22106,7 @@ struct ExecNtHandler {
     post_action: ExecPostAction,
     /// Hosted processes whose Ps state was terminated by a job operation during this syscall.
     /// The service-loop owner drains the matching seL4 mechanisms after native dispatch returns.
-    pending_job_termination_mask: u32,
+    pending_job_terminations: Vec<u8>,
     stop: bool,
     /// Monotonic fake-handle allocator for objects the executive doesn't model yet (ports, threads,
     /// events, sections, tokens, files). Persistent across smss + csrss (single source of truth —
@@ -23568,6 +23583,17 @@ impl HostedThreadRuntimeTable {
             .find(|entry| entry.is_live() && entry.tid == tid)
     }
 
+    fn get_by_index(&self, index: usize) -> Option<HostedThreadRuntime> {
+        self.entries
+            .get(index)
+            .copied()
+            .filter(|entry| entry.is_live())
+    }
+
+    fn record_count(&self) -> usize {
+        self.entries.len()
+    }
+
     fn set_user_stack(
         &mut self,
         tid: u64,
@@ -23728,6 +23754,16 @@ impl HostedThreadRuntimes {
     fn get_by_tid(&self, tid: u64) -> Option<HostedThreadRuntime> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).get_by_tid(tid) }
+    }
+
+    fn get_by_index(&self, index: usize) -> Option<HostedThreadRuntime> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).get_by_index(index) }
+    }
+
+    fn record_count(&self) -> usize {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).record_count() }
     }
 
     fn set_user_stack(

@@ -17066,3 +17066,54 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Manager/quota owner, UI restrictions to the registered Win32 job callout, and token restrictions
     to the Security Manager. Unsupported limit classes must continue to fail without partial state;
     do not add executive-local quota clocks, memory counters, or permissive success paths.
+
+    Scheduler-authoritative job time accounting (2026-08-30, accepted; family remains in
+    progress): rust-micro scheduling contexts now own cumulative bound and donated runtime. The
+    scheduler charges the bound owner while its own SC executes and donated runtime while a server
+    executes on a caller's SC. Standard `SchedContextConsumed` reports and resets only the interval
+    counter used by MCS budget consumers; the append-only `SchedContextReadRuntime` capability
+    method returns cumulative bound/donated totals without changing any existing invocation label.
+    Timeout delivery likewise resets only the interval report. This keeps CPU ownership in the
+    scheduler and exposes it through the SC capability instead of reconstructing time in the NT
+    executive.
+
+    The executive samples those SC counters only while Ps reports an active job time limit. It uses
+    the existing shared HPET arbiter at a 10 ms target interval, publishes bound runtime as user time
+    and donated runtime as kernel time to the owning ETHREAD, then leaves accumulation, exact-period
+    baselines, one-shot crossing latches, completion messages, and terminate-versus-post policy in
+    `nt-process`. Final teardown takes a non-enforcing scheduler snapshot before deleting the
+    process. Setting or clearing the time limits arms or disarms the shared deadline; ordinary
+    desktop boots create no job and therefore add no polling source. The supported job limit surface
+    now includes per-process time, per-job time, preserve-job-time, active-process, affinity,
+    priority-class, breakaway, silent-breakaway, and kill-on-close.
+
+    Review removed capacity artifacts exposed by this path. Job member enumeration now returns a
+    complete Ps-owned vector, `BasicProcessIdList` sizes storage to the caller's real buffer, and
+    completion-port association replays every active member without a `MAX_PI` array. Deferred job
+    teardown uses a dynamically owned process-index queue instead of a 32-bit mask, and process
+    mechanism teardown walks every ETHREAD instead of truncating at 64. Allocation failure is
+    returned before Ps state is terminated; there is no partial or fallback teardown.
+
+    The time-limit edge semantics were checked against the NT5 `psjob.c` owner: enforcement occurs
+    only after a limit is exceeded, `PRESERVE_JOB_TIME` carries the prior effective job-time limit
+    without becoming a stored limit flag, POST without a completion port terminates the job, and a
+    successful completion-port packet clears the POST limit while a failed packet leaves it armed
+    for retry.
+
+    Focused validation passes `nt-process` `135/135`; the freestanding executive remains at the
+    established 209-warning baseline. Standalone rust-micro specs pass, including
+    `SchedContext consumed reset + cumulative runtime split`, and its freestanding build succeeds.
+    Serialized proof `.tmp/run-headless-job-scheduler-time-20260830.log` dynamically launches
+    userinit and Explorer, completes 669 Explorer api0 redirects with zero callback failures,
+    installs 18 client WndProcs without replay, reaches Explorer paint begin/end `5/20` with 187
+    direct GDI returns and 135 batch flushes covering 184 records, paints `480000/480000`
+    framebuffer pixels with at least 32 colours, passes all `295/295` checks, and matches the
+    sentinel.
+
+    Review adjustment: process and job user-time limits are closed. Keep the job-object family in
+    progress at subsystem-owned mechanisms only. Next connect working-set and process/job memory
+    limits to the Memory Manager and quota owner, including peak accounting and transactional
+    admission; then connect UI restrictions through the registered Win32 job callout and token
+    restrictions through the Security Manager. Unsupported memory, UI, and security flags must
+    continue to fail without mutating job state. Do not introduce executive-local MM counters,
+    direct win32k identity checks, or permissive token-policy stand-ins.

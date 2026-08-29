@@ -2145,6 +2145,48 @@ impl ProcessManager {
         true
     }
 
+    /// Publish monotonic scheduler-owned CPU counters for one ETHREAD. The
+    /// values are absolute 100 ns counts, not executive wall-clock deltas.
+    pub fn update_thread_cpu_times(
+        &mut self,
+        tid: ThreadId,
+        kernel_time_100ns: i64,
+        user_time_100ns: i64,
+    ) -> Result<ProcessId, u32> {
+        if kernel_time_100ns < 0 || user_time_100ns < 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        if kernel_time_100ns < thread.kernel_time_100ns || user_time_100ns < thread.user_time_100ns
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        thread.kernel_time_100ns = kernel_time_100ns;
+        thread.user_time_100ns = user_time_100ns;
+        Ok(thread.process_id)
+    }
+
+    /// Publish scheduler-owned CPU counters and evaluate any job time limits
+    /// affected by the new sample.
+    pub fn publish_thread_cpu_times(
+        &mut self,
+        tid: ThreadId,
+        kernel_time_100ns: i64,
+        user_time_100ns: i64,
+    ) -> Result<job::JobTimeLimitActions, u32> {
+        let pid = self.update_thread_cpu_times(tid, kernel_time_100ns, user_time_100ns)?;
+        let Some(job_id) = self.jobs.job_for_process(pid) else {
+            return Ok(job::JobTimeLimitActions::default());
+        };
+        let process_user_time = self
+            .process_times(pid)
+            .ok_or(STATUS_INVALID_HANDLE)?
+            .user_time;
+        let this_period_job_user_time = self.job_accounting(job_id)?.this_period_total_user_time;
+        self.jobs
+            .evaluate_time_limits(job_id, pid, process_user_time, this_period_job_user_time)
+    }
+
     pub fn set_thread_create_time(&mut self, tid: ThreadId, create_time_100ns: i64) -> bool {
         let Some(thread) = self.threads.get_mut(&tid) else {
             return false;
@@ -3264,20 +3306,12 @@ impl ProcessManager {
         true
     }
 
-    pub fn job_active_process_ids(
-        &self,
-        id: job::JobId,
-        out: &mut [ProcessId],
-    ) -> Result<usize, u32> {
-        self.jobs.active_process_ids(id, out)
+    pub fn job_active_process_ids_owned(&self, id: job::JobId) -> Result<Vec<ProcessId>, u32> {
+        self.jobs.active_process_ids_owned(id)
     }
 
-    pub fn job_process_ids(
-        &self,
-        id: job::JobId,
-        out: &mut [ProcessId],
-    ) -> Result<(u32, usize), u32> {
-        self.jobs.process_ids(id, out)
+    pub fn job_process_ids_owned(&self, id: job::JobId) -> Result<(u32, Vec<ProcessId>), u32> {
+        self.jobs.process_ids_owned(id)
     }
 
     pub fn job_accounting(&self, id: job::JobId) -> Result<job::JobAccounting, u32> {
@@ -3302,6 +3336,15 @@ impl ProcessManager {
                     .saturating_add(times.kernel_time);
             }
         }
+        let (period_start_user, period_start_kernel) = self.jobs.time_period_start(id)?;
+        accounting.this_period_total_user_time = accounting
+            .total_user_time
+            .saturating_sub(period_start_user)
+            .max(0);
+        accounting.this_period_total_kernel_time = accounting
+            .total_kernel_time
+            .saturating_sub(period_start_kernel)
+            .max(0);
         Ok(accounting)
     }
 
@@ -3318,7 +3361,13 @@ impl ProcessManager {
         id: job::JobId,
         limits: job::JobBasicLimits,
     ) -> Result<(), u32> {
-        self.jobs.set_basic_limits(id, limits)
+        let accounting = self.job_accounting(id)?;
+        self.jobs.set_basic_limits_at(
+            id,
+            limits,
+            accounting.total_user_time,
+            accounting.total_kernel_time,
+        )
     }
 
     pub fn set_job_extended_limits(
@@ -3326,7 +3375,17 @@ impl ProcessManager {
         id: job::JobId,
         limits: job::JobExtendedLimits,
     ) -> Result<(), u32> {
-        self.jobs.set_extended_limits(id, limits)
+        let accounting = self.job_accounting(id)?;
+        self.jobs.set_extended_limits_at(
+            id,
+            limits,
+            accounting.total_user_time,
+            accounting.total_kernel_time,
+        )
+    }
+
+    pub fn has_active_job_time_limits(&self) -> bool {
+        self.jobs.has_time_limits()
     }
 
     pub fn job_ui_restrictions(&self, id: job::JobId) -> Result<u32, u32> {
@@ -3359,6 +3418,14 @@ impl ProcessManager {
         action: u32,
     ) -> Result<(), u32> {
         self.jobs.set_end_of_job_time_action(id, action)
+    }
+
+    pub fn complete_job_time_notification(
+        &mut self,
+        id: job::JobId,
+        delivered: bool,
+    ) -> Result<bool, u32> {
+        self.jobs.complete_job_time_notification(id, delivered)
     }
 
     pub fn job_completion_port(

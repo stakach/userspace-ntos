@@ -1,4 +1,5 @@
 use super::*;
+use alloc::format;
 use nt_driver_test_fixtures::{minimal_pe, DEFAULT_IMAGE_BASE};
 
 #[test]
@@ -3661,6 +3662,241 @@ fn final_process_object_deletion_releases_job_membership() {
     assert!(pm.thread(tid).is_none());
     assert!(!pm.job_exists(job));
     assert_eq!(pm.take_job_destruction().unwrap().id, job);
+}
+
+#[test]
+fn scheduler_cpu_publication_enforces_per_process_job_limit_once() {
+    let mut pm = ProcessManager::new();
+    let process = pm.create_process("limited.exe", None, None);
+    let thread = pm.create_thread(process, 0x1000, 0, false).unwrap();
+    let job = pm.create_job(0).unwrap();
+    pm.associate_job_completion_port(
+        job,
+        job::CompletionPortAssociation {
+            port_id: 7,
+            completion_key: 0xCAFE,
+        },
+    )
+    .unwrap();
+    assert_eq!(pm.assign_process_to_job(job, process), Ok(STATUS_SUCCESS));
+    assert_eq!(
+        pm.take_job_notification().unwrap().message,
+        job::JOB_OBJECT_MSG_NEW_PROCESS
+    );
+    pm.set_job_basic_limits(
+        job,
+        job::JobBasicLimits {
+            per_process_user_time_limit: 50,
+            limit_flags: job::JOB_OBJECT_LIMIT_PROCESS_TIME,
+            scheduling_class: 5,
+            ..job::JobBasicLimits::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        pm.publish_thread_cpu_times(thread, 10, 50).unwrap(),
+        job::JobTimeLimitActions::default()
+    );
+    let crossed = pm.publish_thread_cpu_times(thread, 11, 51).unwrap();
+    assert_eq!(crossed.terminate_process, Some(process));
+    assert_eq!(crossed.terminate_job, None);
+    let notification = pm.take_job_notification().unwrap();
+    assert_eq!(
+        notification.message,
+        job::JOB_OBJECT_MSG_END_OF_PROCESS_TIME
+    );
+    assert_eq!(notification.process_id, process);
+
+    assert_eq!(
+        pm.publish_thread_cpu_times(thread, 12, 52).unwrap(),
+        job::JobTimeLimitActions::default()
+    );
+    assert!(pm.take_job_notification().is_none());
+    assert_eq!(
+        pm.publish_thread_cpu_times(thread, 11, 52),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+}
+
+#[test]
+fn scheduler_cpu_update_preserves_final_accounting_without_policy_evaluation() {
+    let mut pm = ProcessManager::new();
+    let process = pm.create_process("final.exe", None, None);
+    let thread = pm.create_thread(process, 0x1000, 0, false).unwrap();
+    let job = pm.create_job(0).unwrap();
+    assert_eq!(pm.assign_process_to_job(job, process), Ok(STATUS_SUCCESS));
+    pm.set_job_basic_limits(
+        job,
+        job::JobBasicLimits {
+            per_process_user_time_limit: 50,
+            limit_flags: job::JOB_OBJECT_LIMIT_PROCESS_TIME,
+            scheduling_class: 5,
+            ..job::JobBasicLimits::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(pm.update_thread_cpu_times(thread, 25, 75), Ok(process));
+    assert_eq!(pm.process_times(process).unwrap().kernel_time, 25);
+    assert_eq!(pm.process_times(process).unwrap().user_time, 75);
+    assert!(pm.take_job_notification().is_none());
+    assert_eq!(
+        pm.update_thread_cpu_times(thread, 24, 75),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+}
+
+#[test]
+fn owned_job_member_enumeration_is_not_process_index_bounded() {
+    let mut pm = ProcessManager::new();
+    let job = pm.create_job(0).unwrap();
+    let mut expected = Vec::new();
+    for index in 0..40 {
+        let image = format!("member-{index}.exe");
+        let process = pm.create_process(&image, None, None);
+        assert_eq!(pm.assign_process_to_job(job, process), Ok(STATUS_SUCCESS));
+        expected.push(process);
+    }
+    assert_eq!(pm.job_active_process_ids_owned(job).unwrap(), expected);
+    assert_eq!(
+        pm.job_process_ids_owned(job).unwrap(),
+        (expected.len() as u32, expected)
+    );
+}
+
+#[test]
+fn job_time_period_uses_snapshot_and_honors_end_action() {
+    let mut pm = ProcessManager::new();
+    let first = pm.create_process("first.exe", None, None);
+    let second = pm.create_process("second.exe", None, None);
+    let first_thread = pm.create_thread(first, 0x1000, 0, false).unwrap();
+    let second_thread = pm.create_thread(second, 0x2000, 0, false).unwrap();
+    pm.publish_thread_cpu_times(first_thread, 10, 100).unwrap();
+    pm.publish_thread_cpu_times(second_thread, 20, 200).unwrap();
+    let job = pm.create_job(0).unwrap();
+    pm.associate_job_completion_port(
+        job,
+        job::CompletionPortAssociation {
+            port_id: 8,
+            completion_key: 0xBEEF,
+        },
+    )
+    .unwrap();
+    assert_eq!(pm.assign_process_to_job(job, first), Ok(STATUS_SUCCESS));
+    assert_eq!(pm.assign_process_to_job(job, second), Ok(STATUS_SUCCESS));
+    let _ = pm.take_job_notification();
+    let _ = pm.take_job_notification();
+
+    pm.set_job_basic_limits(
+        job,
+        job::JobBasicLimits {
+            per_job_user_time_limit: 50,
+            limit_flags: job::JOB_OBJECT_LIMIT_JOB_TIME,
+            scheduling_class: 5,
+            ..job::JobBasicLimits::default()
+        },
+    )
+    .unwrap();
+    assert!(pm.has_active_job_time_limits());
+    assert_eq!(
+        pm.job_accounting(job).unwrap().this_period_total_user_time,
+        0
+    );
+    assert_eq!(
+        pm.publish_thread_cpu_times(first_thread, 11, 120).unwrap(),
+        job::JobTimeLimitActions::default()
+    );
+    assert_eq!(
+        pm.publish_thread_cpu_times(second_thread, 21, 230).unwrap(),
+        job::JobTimeLimitActions::default()
+    );
+    let crossed = pm.publish_thread_cpu_times(second_thread, 22, 231).unwrap();
+    assert_eq!(crossed.terminate_job, Some(job));
+    assert_eq!(crossed.terminate_process, None);
+    assert_eq!(
+        pm.take_job_notification().unwrap().message,
+        job::JOB_OBJECT_MSG_END_OF_JOB_TIME
+    );
+
+    pm.set_job_end_of_job_time_action(job, job::JOB_OBJECT_POST_AT_END_OF_JOB)
+        .unwrap();
+    pm.set_job_basic_limits(
+        job,
+        job::JobBasicLimits {
+            per_job_user_time_limit: 10,
+            limit_flags: job::JOB_OBJECT_LIMIT_JOB_TIME,
+            scheduling_class: 5,
+            ..job::JobBasicLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        pm.publish_thread_cpu_times(first_thread, 12, 130).unwrap(),
+        job::JobTimeLimitActions::default()
+    );
+    let posted = pm.publish_thread_cpu_times(first_thread, 13, 131).unwrap();
+    assert_eq!(posted, job::JobTimeLimitActions::default());
+    let notification = pm.take_job_notification().unwrap();
+    assert_eq!(notification.message, job::JOB_OBJECT_MSG_END_OF_JOB_TIME);
+    assert_eq!(notification.job_id, job);
+    assert_eq!(pm.complete_job_time_notification(job, true), Ok(true));
+    assert!(!pm.has_active_job_time_limits());
+    assert_eq!(
+        pm.job_accounting(job).unwrap().this_period_total_user_time,
+        11
+    );
+}
+
+#[test]
+fn preserve_job_time_and_post_without_port_follow_nt5_policy() {
+    let mut pm = ProcessManager::new();
+    let process = pm.create_process("preserve.exe", None, None);
+    let thread = pm.create_thread(process, 0x1000, 0, false).unwrap();
+    let job = pm.create_job(0).unwrap();
+    assert_eq!(pm.assign_process_to_job(job, process), Ok(STATUS_SUCCESS));
+    pm.set_job_basic_limits(
+        job,
+        job::JobBasicLimits {
+            per_job_user_time_limit: 20,
+            limit_flags: job::JOB_OBJECT_LIMIT_JOB_TIME,
+            scheduling_class: 5,
+            ..job::JobBasicLimits::default()
+        },
+    )
+    .unwrap();
+    pm.publish_thread_cpu_times(thread, 1, 9).unwrap();
+    pm.set_job_basic_limits(
+        job,
+        job::JobBasicLimits {
+            active_process_limit: 2,
+            limit_flags: job::JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+                | job::JOB_OBJECT_LIMIT_PRESERVE_JOB_TIME,
+            scheduling_class: 5,
+            ..job::JobBasicLimits::default()
+        },
+    )
+    .unwrap();
+    let limits = pm.job_basic_limits(job).unwrap();
+    assert_eq!(
+        limits.limit_flags,
+        job::JOB_OBJECT_LIMIT_ACTIVE_PROCESS | job::JOB_OBJECT_LIMIT_JOB_TIME
+    );
+    assert_eq!(limits.per_job_user_time_limit, 20);
+    assert_eq!(
+        pm.job_accounting(job).unwrap().this_period_total_user_time,
+        9
+    );
+
+    pm.set_job_end_of_job_time_action(job, job::JOB_OBJECT_POST_AT_END_OF_JOB)
+        .unwrap();
+    assert_eq!(
+        pm.publish_thread_cpu_times(thread, 2, 20).unwrap(),
+        job::JobTimeLimitActions::default()
+    );
+    let crossed = pm.publish_thread_cpu_times(thread, 3, 21).unwrap();
+    assert_eq!(crossed.terminate_job, Some(job));
+    assert!(pm.take_job_notification().is_none());
 }
 
 #[test]
