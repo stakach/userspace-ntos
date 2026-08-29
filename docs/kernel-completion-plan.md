@@ -15922,3 +15922,48 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     behavior from connection state rather than re-reading caller memory. Extend the pointer-free LPC
     ABI and port-core tests first, then wire the executive and repeat the full desktop gate. Do not
     add CSR defaults or a permissive path for ports whose owner or limits are absent.
+
+    LPC connection-limit and QoS convergence (2026-08-29, accepted): LPC ABI v4 now carries each
+    named port's native maximum connection-information length, maximum message length, and maximum
+    pool usage from `NtCreatePort` into the isolated broker. Completed client/server communication
+    endpoints inherit those immutable limits. The port core truncates connection information to the
+    advertised native bound, rejects oversized accept payloads, and returns
+    `STATUS_PORT_MESSAGE_TOO_LONG` when any client, server, or listen-reply data path exceeds the
+    inherited message limit. ALPC-created ports publish their configured maximum message length
+    through the same core contract; the pool-usage value is preserved as policy metadata but is not
+    yet treated as a private broker allocation quota.
+
+    The pointer-free connect request also carries the kernel-captured impersonation level,
+    context-tracking mode, and effective-only bit. The broker retains those fields on the connection
+    and reports them, together with the inherited limits and endpoint identity, through its generic
+    handle query. Every executive connect path now supplies explicit captured security state,
+    including SMSS's real user buffer and both directions of the kernel SRM/LSA handshake. A
+    completed connection is not published as successful unless its client communication handle,
+    connection id, limits, and security metadata can be read back authoritatively from the broker.
+    `NtConnectPort` and `NtSecureConnectPort` return the broker-owned maximum through the optional
+    `MaxMessageLength` output, and the remaining direct SRM request adapter validates the complete
+    native `PORT_MESSAGE` against the same cached limit. Code checkpoint `2b0bd2c4` is pushed.
+
+    Focused validation passes `nt-status` at `4/4`, `nt-lpc-abi` at `4/4`, `nt-lpc-client` at
+    `5/5`, `nt-port-core` at `11/11`, `nt-lpc-server` at `16/16`, and `nt-alpc` at `12/12`.
+    The release executive rebuild remains at the established 212-warning baseline. Serialized
+    acceptance `.tmp/run-headless-lpc-connection-metadata-20260829.log` captures 20 real connections:
+    15 owned by CSRSS, two by SMSS, two by LSASS, and one kernel-owned SRM command port. No completed
+    connection lacks broker metadata. Genuine userinit and Explorer launch, 668 Explorer api0
+    redirects complete with zero callback or dead-callback failures, paint begin/end reaches `5/20`
+    with 187 direct GDI returns and 135 batch flushes covering 184 records, and the framebuffer holds
+    `480000/480000` non-background pixels with at least 32 colours. All `295/295` gates pass and the
+    sentinel matches.
+
+    Review adjustment: retained QoS is necessary but not sufficient to implement
+    `NtImpersonateClientOfPort`. Dynamic tracking must resolve the sending thread's live effective
+    token when the server impersonates a specific broker-owned request, while static tracking must
+    use a token security context captured and referenced when the connection is established. Extend
+    broker request metadata with the real client process/thread identity and connection association,
+    add a reference-owning static token snapshot in kernel security state, and implement the native
+    service through the existing ETHREAD impersonation-token replacement path. Reject stale,
+    datagram, mismatched-message, anonymous-level, and unauthorized delegation cases; do not infer a
+    client from an image role or accept a raw caller-provided `ClientId`. After that boundary is
+    covered in host-testable LPC/security crates and passes the desktop gate, finish the independent
+    server-provided `REMOTE_PORT_VIEW` direction and decide whether `MaxPoolUsage` needs broker-side
+    allocation accounting rather than remaining native policy metadata.
