@@ -3060,6 +3060,8 @@ impl ExecNtHandler {
         write_field!(current_flags, 0);
         write_field!(current_service_number, 0);
         write_field!(current_native_call_transport, false);
+        write_field!(current_user_memory, SyscallUserMemory::CurrentProcess);
+        write_field!(current_server_client_pid, 0);
         write_field!(active_synchronous_file_retry, None);
         write_field!(current_synchronous_file_lock, 0);
         write_field!(user_apc_redirected, false);
@@ -15150,12 +15152,16 @@ impl ExecNtHandler {
         }
     }
 
-    fn csr_dynamic_client_source_pid_for_handle(
+    fn csr_client_source_pid_for_handle(
         &self,
         handle: nt_process::Handle,
     ) -> Option<nt_process::ProcessId> {
-        let client_pi = csr_dynamic_client_pi_for_worker_badge(self.current_badge)?;
-        let client_pid = self.pm_pid_for_pi(client_pi)?;
+        let client_pid = if self.current_server_client_pid != 0 {
+            self.current_server_client_pid
+        } else {
+            let client_pi = csr_dynamic_client_pi_for_worker_badge(self.current_badge)?;
+            self.pm_pid_for_pi(client_pi)?
+        };
         self.pm
             .lookup_handle(client_pid, handle)
             .is_some()
@@ -15231,49 +15237,14 @@ impl ExecNtHandler {
     unsafe fn user_memory_read(&self, memory: SyscallUserMemory, va: u64, dst: &mut [u8]) -> bool {
         match memory {
             SyscallUserMemory::CurrentProcess => self.xas_read(va, dst),
-            SyscallUserMemory::CsrProcess { sb } => {
-                if csr_thread_stack_copyin(sb, va, dst) {
-                    return true;
-                }
-                let Some(ctx) = self.loop_ctx else {
-                    return false;
-                };
-                let procs = &*ctx.procs;
-                let filled = &*ctx.pfilled;
-                client_copyin_process_mapped(
-                    1,
-                    va,
-                    dst,
-                    &filled[1],
-                    procs[1].faults as usize,
-                    procs[1].scratch_base,
-                    false,
-                )
-            }
+            SyscallUserMemory::CsrProcess { sb } => self.csr_process_memory_read(sb, va, dst),
         }
     }
 
     unsafe fn user_memory_write(&self, memory: SyscallUserMemory, va: u64, src: &[u8]) -> bool {
         match memory {
             SyscallUserMemory::CurrentProcess => self.xas_try_write_buf(va, src),
-            SyscallUserMemory::CsrProcess { sb } => {
-                if csr_thread_stack_copyout(sb, va, src) {
-                    return true;
-                }
-                let Some(ctx) = self.loop_ctx else {
-                    return false;
-                };
-                let procs = &*ctx.procs;
-                let filled = &*ctx.pfilled;
-                client_copyout_mapped(
-                    1,
-                    va,
-                    src,
-                    &filled[1],
-                    procs[1].faults as usize,
-                    procs[1].scratch_base,
-                )
-            }
+            SyscallUserMemory::CsrProcess { sb } => self.csr_process_memory_write(sb, va, src),
         }
     }
 
@@ -15286,67 +15257,104 @@ impl ExecNtHandler {
         match memory {
             SyscallUserMemory::CurrentProcess => self.probe_user_output(va, len),
             SyscallUserMemory::CsrProcess { sb } => {
-                if csr_thread_stack_has_range(sb, va, len) {
-                    return true;
-                }
-                if len == 0 {
-                    return true;
-                }
-                let Some(ctx) = self.loop_ctx else {
-                    return false;
-                };
-                let Some(chunks) = nt_address_space::page_chunks(va, len) else {
-                    return false;
-                };
-                let procs = &*ctx.procs;
-                for chunk in chunks {
-                    let Some(info) =
-                        process_committed_mapping_basic_information(1, chunk.page_base)
-                    else {
-                        return false;
-                    };
-                    let writable = match info.type_ {
-                        nt_address_space::MEM_IMAGE => {
-                            nt_address_space::image_view_fault_access_status(
-                                info.protect,
-                                nt_address_space::FaultAccess::Write,
-                            )
-                            .is_ok()
-                        }
-                        nt_address_space::MEM_MAPPED => {
-                            nt_address_space::mapped_view_fault_access_status(
-                                info.protect,
-                                nt_address_space::FaultAccess::Write,
-                            )
-                            .is_ok()
-                        }
-                        _ => false,
-                    };
-                    if !writable || csrss_frame_get_exact(1, chunk.page_base).0 == 0 {
-                        return false;
-                    }
-                }
-                let filled = &*ctx.pfilled;
-                let mut probe = [0u8; 64];
-                let mut copied = 0usize;
-                while copied < len {
-                    let part = (len - copied).min(probe.len());
-                    if !client_copyin_process_mapped(
-                        1,
-                        va + copied as u64,
-                        &mut probe[..part],
-                        &filled[1],
-                        procs[1].faults as usize,
-                        procs[1].scratch_base,
-                        false,
-                    ) {
-                        return false;
-                    }
-                    copied += part;
-                }
-                true
+                self.csr_process_memory_probe_output(sb, va, len)
             }
         }
+    }
+
+    unsafe fn csr_process_memory_read(&self, sb: bool, va: u64, dst: &mut [u8]) -> bool {
+        if csr_thread_stack_copyin(sb, va, dst) {
+            return true;
+        }
+        let Some(ctx) = self.loop_ctx else {
+            return false;
+        };
+        let procs = &*ctx.procs;
+        let filled = &*ctx.pfilled;
+        client_copyin_process_mapped(
+            1,
+            va,
+            dst,
+            &filled[1],
+            procs[1].faults as usize,
+            procs[1].scratch_base,
+            false,
+        )
+    }
+
+    unsafe fn csr_process_memory_write(&self, sb: bool, va: u64, src: &[u8]) -> bool {
+        if csr_thread_stack_copyout(sb, va, src) {
+            return true;
+        }
+        let Some(ctx) = self.loop_ctx else {
+            return false;
+        };
+        let procs = &*ctx.procs;
+        let filled = &*ctx.pfilled;
+        client_copyout_mapped(
+            1,
+            va,
+            src,
+            &filled[1],
+            procs[1].faults as usize,
+            procs[1].scratch_base,
+        )
+    }
+
+    unsafe fn csr_process_memory_probe_output(&self, sb: bool, va: u64, len: usize) -> bool {
+        if csr_thread_stack_has_range(sb, va, len) {
+            return true;
+        }
+        if len == 0 {
+            return true;
+        }
+        let Some(ctx) = self.loop_ctx else {
+            return false;
+        };
+        let Some(chunks) = nt_address_space::page_chunks(va, len) else {
+            return false;
+        };
+        let procs = &*ctx.procs;
+        for chunk in chunks {
+            let Some(info) = process_committed_mapping_basic_information(1, chunk.page_base) else {
+                return false;
+            };
+            let writable = match info.type_ {
+                nt_address_space::MEM_IMAGE => nt_address_space::image_view_fault_access_status(
+                    info.protect,
+                    nt_address_space::FaultAccess::Write,
+                )
+                .is_ok(),
+                nt_address_space::MEM_MAPPED => nt_address_space::mapped_view_fault_access_status(
+                    info.protect,
+                    nt_address_space::FaultAccess::Write,
+                )
+                .is_ok(),
+                _ => false,
+            };
+            if !writable || csrss_frame_get_exact(1, chunk.page_base).0 == 0 {
+                return false;
+            }
+        }
+        let filled = &*ctx.pfilled;
+        let mut probe = [0u8; 64];
+        let mut copied = 0usize;
+        while copied < len {
+            let part = (len - copied).min(probe.len());
+            if !client_copyin_process_mapped(
+                1,
+                va + copied as u64,
+                &mut probe[..part],
+                &filled[1],
+                procs[1].faults as usize,
+                procs[1].scratch_base,
+                false,
+            ) {
+                return false;
+            }
+            copied += part;
+        }
+        true
     }
 
     pub(crate) unsafe fn nt_resume_thread_with_user_memory(
@@ -18557,7 +18565,7 @@ impl ExecNtHandler {
             }
         }
 
-        let Some(client_pid) = self.csr_dynamic_client_source_pid_for_handle(source_handle) else {
+        let Some(client_pid) = self.csr_client_source_pid_for_handle(source_handle) else {
             return Err(invalid_status);
         };
         if Some(client_pid) == source_pid {
@@ -19890,6 +19898,9 @@ impl ExecNtHandler {
     /// frame table — but its bytes are exactly the (relocation-free) `.rdata` file content, which we
     /// read via the loaded PE. Handles a read that spans a page boundary.
     pub(crate) unsafe fn xas_read(&self, va: u64, dst: &mut [u8]) -> bool {
+        if let SyscallUserMemory::CsrProcess { sb } = self.current_user_memory {
+            return self.csr_process_memory_read(sb, va, dst);
+        }
         if va.checked_add(dst.len() as u64).is_none() {
             return false;
         }
@@ -20049,6 +20060,9 @@ impl ExecNtHandler {
     /// [`client_copyout_or_fill_mapped`] (mirror → backed page alias → demand-fill from the DLL PE).
     /// No-op if there is no loop context. Used for hosted-process NtOpenKey handle copyout.
     pub(crate) unsafe fn xas_write_u64(&self, va: u64, val: u64) -> bool {
+        if let SyscallUserMemory::CsrProcess { sb } = self.current_user_memory {
+            return self.csr_process_memory_write(sb, va, &val.to_le_bytes());
+        }
         if let Some(ctx) = self.loop_ctx {
             if !self.promote_current_image_cow_for_write(va, 8) {
                 return false;
@@ -20098,6 +20112,9 @@ impl ExecNtHandler {
 
     /// Cross-address-space DWORD copyout without imposing 8-byte alignment on the user pointer.
     pub(crate) unsafe fn xas_write_u32(&self, va: u64, val: u32) -> bool {
+        if let SyscallUserMemory::CsrProcess { sb } = self.current_user_memory {
+            return self.csr_process_memory_write(sb, va, &val.to_le_bytes());
+        }
         if let Some(ctx) = self.loop_ctx {
             if !self.promote_current_image_cow_for_write(va, 4) {
                 return false;
@@ -20152,6 +20169,9 @@ impl ExecNtHandler {
 
     /// Probe an arbitrary user output range without changing its contents.
     pub(crate) unsafe fn probe_user_output(&self, va: u64, len: usize) -> bool {
+        if let SyscallUserMemory::CsrProcess { sb } = self.current_user_memory {
+            return self.csr_process_memory_probe_output(sb, va, len);
+        }
         if len == 0 {
             return true;
         }
@@ -20810,6 +20830,9 @@ impl ExecNtHandler {
     }
 
     pub(crate) unsafe fn xas_try_write_buf(&self, va: u64, src: &[u8]) -> bool {
+        if let SyscallUserMemory::CsrProcess { sb } = self.current_user_memory {
+            return self.csr_process_memory_write(sb, va, src);
+        }
         if let Some(ctx) = self
             .loop_ctx
             .as_ref()
@@ -26911,7 +26934,7 @@ impl ExecNtHandler {
                 if options & DUPLICATE_CLOSE_SOURCE != 0 {
                     if close_source_pid.is_none() {
                         close_source_pid =
-                            self.csr_dynamic_client_source_pid_for_handle(source_handle);
+                            self.csr_client_source_pid_for_handle(source_handle);
                     }
                     let closed_native = close_source_pid
                         .map(|pid| self.close_process_handle(pid, args[1]))

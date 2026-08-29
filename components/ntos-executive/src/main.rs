@@ -21390,6 +21390,10 @@ impl ObjEntry {
 /// cases migrate (reg / dll_pes / csrss handle-tracking / image PEs / demand-fill state).
 #[derive(Clone, Copy)]
 struct ExecLoopCtx {
+    /// The one native service dispatcher owned by the hosted-process loop. Private server workers
+    /// borrow it while their outer client syscall is parked, so nested native calls use the same
+    /// registered service metadata and typed handler as ordinary hosted threads.
+    nt_dispatcher: *const NativeSyscallDispatcher,
     /// The faulting process's PML4 (page_map target for COMMIT frames / demand-filled pages).
     pml4: u64,
     /// Main hosted-process fault endpoint used when the CSR worker creates another hosted thread.
@@ -21683,6 +21687,14 @@ struct ExecNtHandler {
     current_service_number: u32,
     /// Whether the current service arrived as our ntdll's native seL4-Call request.
     current_native_call_transport: bool,
+    /// Address-space policy for the currently dispatched native call. Ordinary hosted calls use
+    /// their process's active loop mappings; private CSR workers use their dedicated stack mirror
+    /// plus CSRSS's canonical process frame registry.
+    current_user_memory: SyscallUserMemory,
+    /// Client process whose LPC request the current CSR worker is servicing. This is scoped with
+    /// the nested worker call so generic object services can resolve client-owned handles without
+    /// depending on a particular static or dynamic worker transport.
+    current_server_client_pid: u32,
     /// Promoted acquisition whose retained route replaces process-handle lookup on retry.
     active_synchronous_file_retry: Option<nt_io_manager::SynchronousFileWaiter>,
     /// File lock acquired by this call; inline completion releases it at the dispatch boundary.

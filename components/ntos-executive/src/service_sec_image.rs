@@ -9088,6 +9088,8 @@ pub(crate) unsafe fn service_sec_image(
             nt_handler.current_flags = flags;
             nt_handler.current_service_number = m0 as u32;
             nt_handler.current_native_call_transport = native_call_transport;
+            nt_handler.current_user_memory = SyscallUserMemory::CurrentProcess;
+            nt_handler.current_server_client_pid = 0;
             nt_handler.current_synchronous_file_lock = 0;
             nt_handler.active_synchronous_file_retry = (&mut *core::ptr::addr_of_mut!(
                 SYNCHRONOUS_FILE_WAITERS
@@ -9196,6 +9198,7 @@ pub(crate) unsafe fn service_sec_image(
                 // Group-C handlers reach the loop's section/registry/demand-fill state through this
                 // ctx of raw refs (rebuilt each iteration at the current loop locals).
                 nt_handler.loop_ctx = Some(ExecLoopCtx {
+                    nt_dispatcher: &nt_dispatcher,
                     pml4,
                     main_fault_ep: fault_ep,
                     procs,

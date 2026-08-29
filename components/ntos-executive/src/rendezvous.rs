@@ -101,6 +101,144 @@ fn hosted_role_tid(nt_handler: &ExecNtHandler, pi: usize, role: HostedThreadRole
     nt_handler.hosted_thread_tid_for_role(pi, role).unwrap_or(0)
 }
 
+#[derive(Clone, Copy)]
+struct HostedWorkerNativeResult {
+    service: NativeService,
+    status: u64,
+}
+
+/// Dispatch a synchronous native call made by one of CSRSS's private server workers through the
+/// same service table and handler as an ordinary hosted thread. The rendezvous retains ownership of
+/// worker faults and blocking LPC receives; this adapter supplies only the scoped process/thread
+/// identity, native arguments, and CSRSS address-space policy needed by the typed syscall layer.
+unsafe fn dispatch_csr_worker_native_service(
+    nt_handler: &mut ExecNtHandler,
+    sb: bool,
+    client_pid: u32,
+    ssn: u64,
+    resume_ip: u64,
+    sp: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+) -> Option<HostedWorkerNativeResult> {
+    let ssn = u32::try_from(ssn).ok()?;
+    let loop_ctx = nt_handler.loop_ctx?;
+    let dispatcher = loop_ctx.nt_dispatcher.as_ref()?;
+    let entry = dispatcher.table().lookup(ssn)?;
+    if !matches!(
+        entry.service,
+        NativeService::NtAllocateVirtualMemory
+            | NativeService::NtProtectVirtualMemory
+            | NativeService::NtSetEvent
+            | NativeService::NtSetInformationThread
+            | NativeService::NtQueryInformationThread
+            | NativeService::NtQueryObject
+            | NativeService::NtSetInformationObject
+            | NativeService::NtSetInformationProcess
+            | NativeService::NtResumeThread
+            | NativeService::NtSuspendThread
+            | NativeService::NtDuplicateObject
+            | NativeService::NtClose
+            | NativeService::NtReplyPort
+    ) {
+        return None;
+    }
+
+    let argument_count = entry.max_args as usize;
+    if argument_count > 16 {
+        return Some(HostedWorkerNativeResult {
+            service: entry.service,
+            status: nt_syscall::STATUS_INVALID_PARAMETER as u64,
+        });
+    }
+    let mut args = [0u64; 16];
+    args[..4].copy_from_slice(&[arg1, arg2, arg3, arg4]);
+    for index in 4..argument_count {
+        let Some(address) = sp.checked_add(0x28 + (index as u64 - 4) * 8) else {
+            return Some(HostedWorkerNativeResult {
+                service: entry.service,
+                status: 0xC000_0005,
+            });
+        };
+        let mut bytes = [0u8; 8];
+        if !csr_thread_stack_copyin(sb, address, &mut bytes) {
+            return Some(HostedWorkerNativeResult {
+                service: entry.service,
+                status: 0xC000_0005,
+            });
+        }
+        args[index] = u64::from_le_bytes(bytes);
+    }
+
+    let role = if sb {
+        HostedThreadRole::CsrSbApi
+    } else {
+        HostedThreadRole::CsrApi
+    };
+    let tid = hosted_role_tid(nt_handler, 1, role);
+    let Some(pid) = nt_handler.pm_pid_for_pi(1) else {
+        return Some(HostedWorkerNativeResult {
+            service: entry.service,
+            status: nt_process::STATUS_INVALID_HANDLE as u64,
+        });
+    };
+    let Some(badge) = nt_handler.hosted_thread_badge_for_tid(tid) else {
+        return Some(HostedWorkerNativeResult {
+            service: entry.service,
+            status: nt_process::STATUS_INVALID_HANDLE as u64,
+        });
+    };
+
+    let saved = (
+        nt_handler.pi,
+        nt_handler.current_tid,
+        nt_handler.current_badge,
+        nt_handler.current_resume_ip,
+        nt_handler.current_sp,
+        nt_handler.current_flags,
+        nt_handler.current_service_number,
+        nt_handler.current_native_call_transport,
+        nt_handler.current_user_memory,
+        nt_handler.current_server_client_pid,
+    );
+    nt_handler.pi = 1;
+    nt_handler.current_tid = tid;
+    nt_handler.current_badge = badge;
+    nt_handler.current_resume_ip = resume_ip;
+    nt_handler.current_sp = sp;
+    nt_handler.current_flags = 0;
+    nt_handler.current_service_number = ssn;
+    nt_handler.current_native_call_transport = true;
+    nt_handler.current_user_memory = SyscallUserMemory::CsrProcess { sb };
+    nt_handler.current_server_client_pid = client_pid;
+    let origin = SyscallOrigin {
+        process_id: pid,
+        thread_id: tid as u32,
+        previous_mode: ProcessorMode::UserMode,
+        user_ip: resume_ip,
+        user_sp: sp,
+    };
+    let result = dispatcher.dispatch(ssn, &args[..argument_count], &origin, nt_handler);
+    (
+        nt_handler.pi,
+        nt_handler.current_tid,
+        nt_handler.current_badge,
+        nt_handler.current_resume_ip,
+        nt_handler.current_sp,
+        nt_handler.current_flags,
+        nt_handler.current_service_number,
+        nt_handler.current_native_call_transport,
+        nt_handler.current_user_memory,
+        nt_handler.current_server_client_pid,
+    ) = saved;
+    Some(HostedWorkerNativeResult {
+        service: entry.service,
+        status: result.status as u64,
+    })
+}
+
 unsafe fn csr_api_worker_create_thread(
     nt_handler: &mut ExecNtHandler,
     main_fault_ep: u64,
@@ -1552,17 +1690,6 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
     const CSR_API_MSG_MAX: usize = 0x178;
     const SSN_REPLY_WAIT_RECV: u64 = 203;
     const SSN_MAP_VIEW: u64 = 113;
-    const SSN_SET_EVENT: u64 = 228;
-    const SSN_CLOSE: u64 = 27;
-    const SSN_QUERY_OBJECT: u64 = 170;
-    const SSN_REPLY_PORT: u64 = 202;
-    const SSN_SET_INFO_OBJECT: u64 = 236;
-    const SSN_SET_INFO_PROCESS: u64 = 237;
-    const SSN_RESUME_THREAD: u64 = 214;
-    const SSN_SUSPEND_THREAD: u64 = 263;
-    const SSN_DUPLICATE_OBJECT: u64 = 71;
-    const DUPLICATE_CLOSE_SOURCE: u32 = 1;
-    const DUPLICATE_SAME_ACCESS: u32 = 2;
 
     let ep = CSR_FAULT_EP.load(Ordering::Relaxed);
     let reply = REPLY_CSRLOOP_SLOT.load(Ordering::Relaxed);
@@ -1811,6 +1938,39 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                 let sp = get_recv_mr(16);
                 let rdx = m3;
                 let mut result = 0u64;
+                if ssn < win32k_subsystem::WIN32K_SERVICE_BASE {
+                    if let Some(dispatched) = dispatch_csr_worker_native_service(
+                        nt_handler,
+                        false,
+                        client_pid as u32,
+                        ssn,
+                        resume_ip,
+                        sp,
+                        get_recv_mr(9),
+                        rdx,
+                        get_recv_mr(7),
+                        get_recv_mr(8),
+                    ) {
+                        result = dispatched.status;
+                        if dispatched.service == NativeService::NtReplyPort {
+                            reply_sent_separately = result == nt_syscall::STATUS_SUCCESS as u64;
+                        }
+                        print_str(b"[csr-api] dispatched worker ");
+                        print_str(dispatched.service.name().as_bytes());
+                        print_str(b" status=0x");
+                        print_hex(result as u32);
+                        print_str(b"\n");
+                        reply_native_rendezvous(reply, result);
+                        let (_badge, nmi, nm0, nm1, nm2, nm3) =
+                            rendezvous_recv_full_r12(ep, reply, b"[csr-api]");
+                        mi = nmi;
+                        m0 = nm0;
+                        m1 = nm1;
+                        m2 = nm2;
+                        m3 = nm3;
+                        continue;
+                    }
+                }
                 match ssn {
                     ssn if ssn >= win32k_subsystem::WIN32K_SERVICE_BASE => {
                         let Some(csrss_pi) = live_hosted_pi_for_role(
@@ -1842,79 +2002,6 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                         print_hex(status as u32);
                         print_str(b"\n");
                     }
-                    SSN_NT_ALLOCATE_VM => {
-                        let stack_arg4 = sp
-                            .checked_add(0x28)
-                            .and_then(|address| csr_stack_read(address));
-                        let stack_arg5 = sp
-                            .checked_add(0x30)
-                            .and_then(|address| csr_stack_read(address));
-                        result = match (stack_arg4, stack_arg5) {
-                            (Some(allocation_type), Some(protection)) => {
-                                let alloc_args = [
-                                    get_recv_mr(9),
-                                    rdx,
-                                    get_recv_mr(7),
-                                    get_recv_mr(8),
-                                    allocation_type,
-                                    protection,
-                                ];
-                                let saved_pi = nt_handler.pi;
-                                let saved_tid = nt_handler.current_tid;
-                                nt_handler.pi = 1;
-                                nt_handler.current_tid =
-                                    hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
-                                let status = nt_handler
-                                    .nt_allocate_virtual_memory_with_user_memory(
-                                        &alloc_args,
-                                        SyscallUserMemory::CsrProcess { sb: false },
-                                    );
-                                nt_handler.pi = saved_pi;
-                                nt_handler.current_tid = saved_tid;
-                                print_str(
-                                    b"[csr-api] serviced worker NtAllocateVirtualMemory status=0x",
-                                );
-                                print_hex(status);
-                                print_str(b"\n");
-                                status as u64
-                            }
-                            _ => 0xC000_0005,
-                        };
-                    }
-                    SSN_NT_PROTECT_VM => {
-                        let stack_arg4 = sp
-                            .checked_add(0x28)
-                            .and_then(|address| csr_stack_read(address));
-                        result = match stack_arg4 {
-                            Some(old_protect) => {
-                                let protect_args = [
-                                    get_recv_mr(9),
-                                    rdx,
-                                    get_recv_mr(7),
-                                    get_recv_mr(8),
-                                    old_protect,
-                                ];
-                                let saved_pi = nt_handler.pi;
-                                let saved_tid = nt_handler.current_tid;
-                                nt_handler.pi = 1;
-                                nt_handler.current_tid =
-                                    hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
-                                let status = nt_handler.nt_protect_virtual_memory_with_user_memory(
-                                    &protect_args,
-                                    SyscallUserMemory::CsrProcess { sb: false },
-                                );
-                                nt_handler.pi = saved_pi;
-                                nt_handler.current_tid = saved_tid;
-                                print_str(
-                                    b"[csr-api] serviced worker NtProtectVirtualMemory status=0x",
-                                );
-                                print_hex(status);
-                                print_str(b"\n");
-                                status as u64
-                            }
-                            None => 0xC000_0005,
-                        };
-                    }
                     SSN_NT_CREATE_THREAD => {
                         result = csr_api_worker_create_thread(
                             nt_handler,
@@ -1928,291 +2015,7 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                         print_hex(result as u32);
                         print_str(b"\n");
                     }
-                    SSN_SET_EVENT => {
-                        let event_handle = get_recv_mr(9);
-                        let saved_pi = nt_handler.pi;
-                        nt_handler.pi = 1;
-                        result = match nt_handler
-                            .event_index_for_handle(event_handle, EVENT_MODIFY_STATE)
-                        {
-                            Ok(index) => match nt_handler.events.set_existing(index as u64) {
-                                Some(previous) => {
-                                    if rdx != 0 {
-                                        let _ = csr_stack_write32(rdx, previous as u32);
-                                    }
-                                    if !previous {
-                                        wait_wake_dispatcher_set(nt_handler);
-                                    }
-                                    0
-                                }
-                                None => 0xC000_0008,
-                            },
-                            Err(status) => status as u64,
-                        };
-                        nt_handler.pi = saved_pi;
-                    }
-                    SSN_NT_SET_INFO_THREAD => {
-                        result = csr_set_thread_information_call(
-                            nt_handler,
-                            false,
-                            hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi),
-                            get_recv_mr(9),
-                            rdx as u32,
-                            get_recv_mr(7),
-                            get_recv_mr(8) as u32,
-                        );
-                    }
-                    SSN_NT_QUERY_INFORMATION_THREAD => {
-                        result = match sp
-                            .checked_add(0x28)
-                            .and_then(|address| csr_stack_read(address))
-                        {
-                            Some(return_length) => csr_query_thread_call(
-                                nt_handler,
-                                get_recv_mr(9),
-                                rdx as u32,
-                                get_recv_mr(7),
-                                get_recv_mr(8) as u32,
-                                return_length,
-                            ),
-                            None => 0xC000_0005,
-                        };
-                    }
-                    SSN_QUERY_OBJECT => {
-                        result = match sp
-                            .checked_add(0x28)
-                            .and_then(|address| csr_stack_read(address))
-                        {
-                            Some(return_length) => {
-                                let query_args = [
-                                    get_recv_mr(9),
-                                    rdx,
-                                    get_recv_mr(7),
-                                    get_recv_mr(8),
-                                    return_length,
-                                ];
-                                let saved_pi = nt_handler.pi;
-                                let saved_tid = nt_handler.current_tid;
-                                nt_handler.pi = 1;
-                                nt_handler.current_tid =
-                                    hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
-                                let status = nt_handler.nt_query_object_with_user_memory(
-                                    &query_args,
-                                    SyscallUserMemory::CsrProcess { sb: false },
-                                );
-                                nt_handler.pi = saved_pi;
-                                nt_handler.current_tid = saved_tid;
-                                print_str(b"[csr-api] serviced worker NtQueryObject status=0x");
-                                print_hex(status);
-                                print_str(b"\n");
-                                status as u64
-                            }
-                            None => 0xC000_0005,
-                        };
-                    }
-                    SSN_SET_INFO_OBJECT => {
-                        let set_args = [get_recv_mr(9), rdx, get_recv_mr(7), get_recv_mr(8)];
-                        let saved_pi = nt_handler.pi;
-                        let saved_tid = nt_handler.current_tid;
-                        nt_handler.pi = 1;
-                        nt_handler.current_tid =
-                            hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
-                        let status = nt_handler.nt_set_information_object_with_user_memory(
-                            &set_args,
-                            SyscallUserMemory::CsrProcess { sb: false },
-                        );
-                        nt_handler.pi = saved_pi;
-                        nt_handler.current_tid = saved_tid;
-                        print_str(b"[csr-api] serviced worker NtSetInformationObject status=0x");
-                        print_hex(status);
-                        print_str(b"\n");
-                        result = status as u64;
-                    }
-                    SSN_SET_INFO_PROCESS => {
-                        let set_args = [get_recv_mr(9), rdx, get_recv_mr(7), get_recv_mr(8)];
-                        let saved_pi = nt_handler.pi;
-                        let saved_tid = nt_handler.current_tid;
-                        nt_handler.pi = 1;
-                        nt_handler.current_tid =
-                            hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
-                        let status = nt_handler.nt_set_information_process_with_user_memory(
-                            &set_args,
-                            SyscallUserMemory::CsrProcess { sb: false },
-                        );
-                        nt_handler.pi = saved_pi;
-                        nt_handler.current_tid = saved_tid;
-                        print_str(b"[csr-api] serviced worker NtSetInformationProcess class=");
-                        print_u64(rdx);
-                        print_str(b" status=0x");
-                        print_hex(status);
-                        print_str(b"\n");
-                        result = status as u64;
-                    }
-                    SSN_RESUME_THREAD => {
-                        let resume_args = [get_recv_mr(9), rdx];
-                        let saved_pi = nt_handler.pi;
-                        let saved_tid = nt_handler.current_tid;
-                        nt_handler.pi = 1;
-                        nt_handler.current_tid =
-                            hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
-                        let status = nt_handler.nt_resume_thread_with_user_memory(
-                            &resume_args,
-                            SyscallUserMemory::CsrProcess { sb: false },
-                        );
-                        nt_handler.pi = saved_pi;
-                        nt_handler.current_tid = saved_tid;
-                        print_str(b"[csr-api] serviced worker NtResumeThread status=0x");
-                        print_hex(status);
-                        print_str(b"\n");
-                        result = status as u64;
-                    }
-                    SSN_SUSPEND_THREAD => {
-                        let suspend_args = [get_recv_mr(9), rdx];
-                        let saved_pi = nt_handler.pi;
-                        let saved_tid = nt_handler.current_tid;
-                        nt_handler.pi = 1;
-                        nt_handler.current_tid =
-                            hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
-                        let status = nt_handler.nt_suspend_thread_with_user_memory(
-                            &suspend_args,
-                            SyscallUserMemory::CsrProcess { sb: false },
-                        );
-                        nt_handler.pi = saved_pi;
-                        nt_handler.current_tid = saved_tid;
-                        print_str(b"[csr-api] serviced worker NtSuspendThread status=0x");
-                        print_hex(status);
-                        print_str(b"\n");
-                        result = status as u64;
-                    }
-                    SSN_DUPLICATE_OBJECT => {
-                        let source_process = get_recv_mr(9);
-                        let source_handle = rdx;
-                        let target_process = get_recv_mr(7);
-                        let target_out = get_recv_mr(8);
-                        let desired_access = sp
-                            .checked_add(0x28)
-                            .and_then(|address| csr_stack_read(address));
-                        let options = sp
-                            .checked_add(0x38)
-                            .and_then(|address| csr_stack_read(address))
-                            .unwrap_or(0) as u32;
-                        let saved_pi = nt_handler.pi;
-                        let saved_tid = nt_handler.current_tid;
-                        nt_handler.pi = 1;
-                        nt_handler.current_tid =
-                            hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
-                        let source_pid = nt_handler.resolve_process_handle(source_process);
-                        let target_pid = nt_handler.resolve_process_handle(target_process);
-                        let mut close_source_pid = source_pid;
-                        let mut recovered_from_client = false;
-                        result = match target_pid {
-                            Some(target_pid) => {
-                                if options & DUPLICATE_SAME_ACCESS == 0 && desired_access.is_none()
-                                {
-                                    0xC000_0005
-                                } else {
-                                    let desired_access = (options & DUPLICATE_SAME_ACCESS == 0)
-                                        .then_some(desired_access.unwrap_or(0) as u32);
-                                    let mut duplicate_result: Option<
-                                        Result<nt_process::Handle, u32>,
-                                    > = None;
-                                    if let Some(source_pid) = source_pid {
-                                        duplicate_result =
-                                            Some(nt_handler.duplicate_process_handle_with_access(
-                                                source_pid,
-                                                source_handle as nt_process::Handle,
-                                                target_pid,
-                                                desired_access,
-                                            ));
-                                    }
-                                    if matches!(
-                                        duplicate_result,
-                                        None | Some(Err(nt_process::STATUS_INVALID_HANDLE))
-                                    ) {
-                                        let client_source_pid = client_pid as nt_process::ProcessId;
-                                        if client_source_pid != 0
-                                            && Some(client_source_pid) != source_pid
-                                            && nt_handler
-                                                .pm
-                                                .lookup_handle(
-                                                    client_source_pid,
-                                                    source_handle as nt_process::Handle,
-                                                )
-                                                .is_some()
-                                        {
-                                            duplicate_result = Some(
-                                                nt_handler.duplicate_process_handle_with_access(
-                                                    client_source_pid,
-                                                    source_handle as nt_process::Handle,
-                                                    target_pid,
-                                                    desired_access,
-                                                ),
-                                            );
-                                            close_source_pid = Some(client_source_pid);
-                                            recovered_from_client = true;
-                                        }
-                                    }
-                                    match duplicate_result
-                                        .unwrap_or(Err(nt_process::STATUS_INVALID_HANDLE))
-                                    {
-                                        Ok(handle) if csr_stack_has_range(target_out, 8) => {
-                                            let _ = csr_stack_copyout(
-                                                target_out,
-                                                &(handle as u64).to_le_bytes(),
-                                            );
-                                            0
-                                        }
-                                        Ok(handle) => {
-                                            let _ = nt_handler
-                                                .close_process_handle(target_pid, handle as u64);
-                                            0xC000_0005
-                                        }
-                                        Err(status) => status as u64,
-                                    }
-                                }
-                            }
-                            None => nt_process::STATUS_INVALID_HANDLE as u64,
-                        };
-                        if options & DUPLICATE_CLOSE_SOURCE != 0 {
-                            if let Some(source_pid) = close_source_pid {
-                                let _ = nt_handler.close_process_handle(source_pid, source_handle);
-                            }
-                        }
-                        nt_handler.pi = saved_pi;
-                        nt_handler.current_tid = saved_tid;
-                        print_str(b"[csr-api] serviced worker NtDuplicateObject status=0x");
-                        print_hex(result as u32);
-                        if recovered_from_client {
-                            print_str(b" source=client");
-                        }
-                        print_str(b"\n");
-                    }
                     SSN_MAP_VIEW => {}
-                    SSN_CLOSE => {
-                        let saved_pi = nt_handler.pi;
-                        nt_handler.pi = 1;
-                        nt_handler.close_current_handle(get_recv_mr(9));
-                        nt_handler.pi = saved_pi;
-                    }
-                    SSN_REPLY_PORT => {
-                        let reply_args = [get_recv_mr(9), rdx];
-                        let saved_pi = nt_handler.pi;
-                        let saved_tid = nt_handler.current_tid;
-                        nt_handler.pi = 1;
-                        nt_handler.current_tid =
-                            hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
-                        let status = nt_handler.nt_reply_port_with_user_memory(
-                            &reply_args,
-                            SyscallUserMemory::CsrProcess { sb: false },
-                        );
-                        nt_handler.pi = saved_pi;
-                        nt_handler.current_tid = saved_tid;
-                        reply_sent_separately = status == nt_syscall::STATUS_SUCCESS;
-                        print_str(b"[csr-api] serviced worker NtReplyPort status=0x");
-                        print_hex(status);
-                        print_str(b"\n");
-                        result = status as u64;
-                    }
                     SSN_REPLY_WAIT_RECV => {
                         let reply_msg = get_recv_mr(7);
                         let recv_msg = get_recv_mr(8);
@@ -3280,133 +3083,6 @@ unsafe fn csr_set_thread_information_call(
     status as u64
 }
 
-unsafe fn csr_sb_query_thread_call(
-    nt_handler: &mut ExecNtHandler,
-    handle: u64,
-    information_class: u32,
-    information: u64,
-    information_length: u32,
-    return_length: u64,
-) -> u64 {
-    if information_class == 38 {
-        return csr_sb_query_thread_name_call(
-            nt_handler,
-            handle,
-            information,
-            information_length,
-            return_length,
-        );
-    }
-    const STATUS_ACCESS_VIOLATION: u64 = 0xC000_0005;
-    const STATUS_DATATYPE_MISALIGNMENT: u64 = 0x8000_0002;
-    let expected = match ExecNtHandler::thread_query_length(information_class) {
-        Ok(length) => length,
-        Err(status) => return status as u64,
-    };
-    if information_length as usize != expected {
-        return nt_process::STATUS_INFO_LENGTH_MISMATCH as u64;
-    }
-    if information != 0 {
-        if information & 3 != 0 {
-            return STATUS_DATATYPE_MISALIGNMENT;
-        }
-        let mut probe = [0u8; 0x30];
-        if !csr_sb_stack_copyin(information, &mut probe[..expected]) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-    }
-    if return_length != 0 && !csr_sb_stack_has_range(return_length, 4) {
-        return STATUS_ACCESS_VIOLATION;
-    }
-    let saved_pi = nt_handler.pi;
-    let saved_tid = nt_handler.current_tid;
-    nt_handler.pi = 1;
-    nt_handler.current_tid = hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrSbApi);
-    let mut status = match nt_handler.query_thread_information_captured(handle, information_class) {
-        Ok((output, length)) => {
-            if csr_sb_stack_copyout(information, &output[..length]) {
-                if information_class == 0 {
-                    WL_LISTENER_TEB_QUERIED.fetch_add(1, Ordering::Relaxed);
-                }
-                0
-            } else {
-                STATUS_ACCESS_VIOLATION
-            }
-        }
-        Err(status) => status as u64,
-    };
-    if return_length != 0 && !csr_sb_stack_copyout(return_length, &(expected as u32).to_le_bytes())
-    {
-        status = STATUS_ACCESS_VIOLATION;
-    }
-    nt_handler.pi = saved_pi;
-    nt_handler.current_tid = saved_tid;
-    status
-}
-
-unsafe fn csr_sb_query_thread_name_call(
-    nt_handler: &mut ExecNtHandler,
-    handle: u64,
-    information: u64,
-    information_length: u32,
-    return_length: u64,
-) -> u64 {
-    const STATUS_ACCESS_VIOLATION: u64 = 0xC000_0005;
-    const STATUS_DATATYPE_MISALIGNMENT: u64 = 0x8000_0002;
-    const STATUS_BUFFER_TOO_SMALL: u64 = 0xC000_0023;
-    if information != 0 {
-        if information & 7 != 0 {
-            return STATUS_DATATYPE_MISALIGNMENT;
-        }
-        if !csr_sb_stack_has_range(information, information_length as usize) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-    }
-    if return_length != 0 && !csr_sb_stack_has_range(return_length, 4) {
-        return STATUS_ACCESS_VIOLATION;
-    }
-    let saved_pi = nt_handler.pi;
-    let saved_tid = nt_handler.current_tid;
-    nt_handler.pi = 1;
-    nt_handler.current_tid = hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrSbApi);
-    let mut name = [0u16; nt_process::THREAD_NAME_MAX_UNITS];
-    let query = nt_handler.query_thread_name_captured(handle, &mut name);
-    nt_handler.pi = saved_pi;
-    nt_handler.current_tid = saved_tid;
-
-    let mut required = 0u32;
-    let mut status = match query {
-        Ok(units) => {
-            required = (0x10 + units * 2) as u32;
-            if information_length < required {
-                STATUS_BUFFER_TOO_SMALL
-            } else {
-                let mut output = [0u8; 0x10 + nt_process::THREAD_NAME_MAX_UNITS * 2];
-                if units != 0 {
-                    let bytes = (units * 2) as u16;
-                    output[..2].copy_from_slice(&bytes.to_le_bytes());
-                    output[2..4].copy_from_slice(&bytes.to_le_bytes());
-                    output[8..16].copy_from_slice(&(information + 0x10).to_le_bytes());
-                    for (index, unit) in name[..units].iter().enumerate() {
-                        output[0x10 + index * 2..0x12 + index * 2]
-                            .copy_from_slice(&unit.to_le_bytes());
-                    }
-                }
-                if csr_sb_stack_copyout(information, &output[..required as usize]) {
-                    0
-                } else {
-                    STATUS_ACCESS_VIOLATION
-                }
-            }
-        }
-        Err(status) => status as u64,
-    };
-    if return_length != 0 && !csr_sb_stack_copyout(return_length, &required.to_le_bytes()) {
-        status = STATUS_ACCESS_VIOLATION;
-    }
-    status
-}
-
 unsafe fn csr_query_thread_call(
     nt_handler: &mut ExecNtHandler,
     handle: u64,
@@ -3768,13 +3444,7 @@ unsafe fn csr_sb_api_request_rendezvous(
     dll_pes: &[Option<nt_pe_loader::PeFile>],
     nt_handler: &mut ExecNtHandler,
 ) -> bool {
-    const SSN_SET_INFO_PROCESS: u64 = 237;
-    const SSN_QUERY_OBJECT: u64 = 170;
-    const SSN_SET_INFO_OBJECT: u64 = 236;
-    const SSN_RESUME_THREAD: u64 = 214;
-    const SSN_SUSPEND_THREAD: u64 = 263;
     const SSN_REPLY_WAIT_RECV: u64 = 203;
-    const SSN_CLOSE: u64 = 27;
 
     let ep = CSR_SB_FAULT_EP.load(Ordering::Relaxed);
     let reply = REPLY_CSR_SB_SLOT.load(Ordering::Relaxed);
@@ -3908,167 +3578,40 @@ unsafe fn csr_sb_api_request_rendezvous(
             }
             2 => {
                 let ssn = m0;
+                let resume_ip = m2;
                 let sp = get_recv_mr(16);
                 let rdx = m3;
-                let mut result = 0u64;
                 print_str(b"[csr-sb-api] worker SSN=");
                 print_u64(ssn);
                 print_str(b"\n");
+                if let Some(dispatched) = dispatch_csr_worker_native_service(
+                    nt_handler,
+                    true,
+                    smss_pid as u32,
+                    ssn,
+                    resume_ip,
+                    sp,
+                    get_recv_mr(9),
+                    rdx,
+                    get_recv_mr(7),
+                    get_recv_mr(8),
+                ) {
+                    print_str(b"[csr-sb-api] dispatched worker ");
+                    print_str(dispatched.service.name().as_bytes());
+                    print_str(b" status=0x");
+                    print_hex(dispatched.status as u32);
+                    print_str(b"\n");
+                    reply_native_rendezvous(reply, dispatched.status);
+                    let (_badge, nmi, nm0, nm1, nm2, nm3) =
+                        rendezvous_recv_full_r12(ep, reply, b"[csr-sb-api]");
+                    mi = nmi;
+                    m0 = nm0;
+                    m1 = nm1;
+                    m2 = nm2;
+                    m3 = nm3;
+                    continue;
+                }
                 match ssn {
-                    SSN_SET_INFO_PROCESS => {}
-                    SSN_NT_PROTECT_VM => {
-                        let stack_arg4 = sp
-                            .checked_add(0x28)
-                            .and_then(|address| csr_sb_stack_read_checked(address));
-                        result = match stack_arg4 {
-                            Some(old_protect) => {
-                                let protect_args = [
-                                    get_recv_mr(9),
-                                    rdx,
-                                    get_recv_mr(7),
-                                    get_recv_mr(8),
-                                    old_protect,
-                                ];
-                                let saved_pi = nt_handler.pi;
-                                let saved_tid = nt_handler.current_tid;
-                                nt_handler.pi = 1;
-                                nt_handler.current_tid =
-                                    hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrSbApi);
-                                let status = nt_handler.nt_protect_virtual_memory_with_user_memory(
-                                    &protect_args,
-                                    SyscallUserMemory::CsrProcess { sb: true },
-                                );
-                                nt_handler.pi = saved_pi;
-                                nt_handler.current_tid = saved_tid;
-                                print_str(
-                                    b"[csr-sb-api] serviced worker NtProtectVirtualMemory status=0x",
-                                );
-                                print_hex(status);
-                                print_str(b"\n");
-                                status as u64
-                            }
-                            None => 0xC000_0005,
-                        };
-                    }
-                    SSN_NT_SET_INFO_THREAD => {
-                        result = csr_set_thread_information_call(
-                            nt_handler,
-                            true,
-                            hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrSbApi),
-                            get_recv_mr(9),
-                            rdx as u32,
-                            get_recv_mr(7),
-                            get_recv_mr(8) as u32,
-                        );
-                    }
-                    SSN_NT_QUERY_INFORMATION_THREAD => {
-                        result = match sp
-                            .checked_add(0x28)
-                            .and_then(|address| csr_sb_stack_read_checked(address))
-                        {
-                            Some(return_length) => csr_sb_query_thread_call(
-                                nt_handler,
-                                get_recv_mr(9),
-                                rdx as u32,
-                                get_recv_mr(7),
-                                get_recv_mr(8) as u32,
-                                return_length,
-                            ),
-                            None => 0xC000_0005,
-                        };
-                    }
-                    SSN_QUERY_OBJECT => {
-                        result = match sp
-                            .checked_add(0x28)
-                            .and_then(|address| csr_sb_stack_read_checked(address))
-                        {
-                            Some(return_length) => {
-                                let query_args = [
-                                    get_recv_mr(9),
-                                    rdx,
-                                    get_recv_mr(7),
-                                    get_recv_mr(8),
-                                    return_length,
-                                ];
-                                let saved_pi = nt_handler.pi;
-                                let saved_tid = nt_handler.current_tid;
-                                nt_handler.pi = 1;
-                                nt_handler.current_tid =
-                                    hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrSbApi);
-                                let status = nt_handler.nt_query_object_with_user_memory(
-                                    &query_args,
-                                    SyscallUserMemory::CsrProcess { sb: true },
-                                );
-                                nt_handler.pi = saved_pi;
-                                nt_handler.current_tid = saved_tid;
-                                print_str(b"[csr-sb-api] serviced worker NtQueryObject status=0x");
-                                print_hex(status);
-                                print_str(b"\n");
-                                status as u64
-                            }
-                            None => 0xC000_0005,
-                        };
-                    }
-                    SSN_SET_INFO_OBJECT => {
-                        let set_args = [get_recv_mr(9), rdx, get_recv_mr(7), get_recv_mr(8)];
-                        let saved_pi = nt_handler.pi;
-                        let saved_tid = nt_handler.current_tid;
-                        nt_handler.pi = 1;
-                        nt_handler.current_tid =
-                            hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrSbApi);
-                        let status = nt_handler.nt_set_information_object_with_user_memory(
-                            &set_args,
-                            SyscallUserMemory::CsrProcess { sb: true },
-                        );
-                        nt_handler.pi = saved_pi;
-                        nt_handler.current_tid = saved_tid;
-                        print_str(b"[csr-sb-api] serviced worker NtSetInformationObject status=0x");
-                        print_hex(status);
-                        print_str(b"\n");
-                        result = status as u64;
-                    }
-                    SSN_RESUME_THREAD => {
-                        let resume_args = [get_recv_mr(9), rdx];
-                        let saved_pi = nt_handler.pi;
-                        let saved_tid = nt_handler.current_tid;
-                        nt_handler.pi = 1;
-                        nt_handler.current_tid =
-                            hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrSbApi);
-                        let status = nt_handler.nt_resume_thread_with_user_memory(
-                            &resume_args,
-                            SyscallUserMemory::CsrProcess { sb: true },
-                        );
-                        nt_handler.pi = saved_pi;
-                        nt_handler.current_tid = saved_tid;
-                        print_str(b"[csr-sb-api] serviced worker NtResumeThread status=0x");
-                        print_hex(status);
-                        print_str(b"\n");
-                        result = status as u64;
-                    }
-                    SSN_SUSPEND_THREAD => {
-                        let suspend_args = [get_recv_mr(9), rdx];
-                        let saved_pi = nt_handler.pi;
-                        let saved_tid = nt_handler.current_tid;
-                        nt_handler.pi = 1;
-                        nt_handler.current_tid =
-                            hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrSbApi);
-                        let status = nt_handler.nt_suspend_thread_with_user_memory(
-                            &suspend_args,
-                            SyscallUserMemory::CsrProcess { sb: true },
-                        );
-                        nt_handler.pi = saved_pi;
-                        nt_handler.current_tid = saved_tid;
-                        print_str(b"[csr-sb-api] serviced worker NtSuspendThread status=0x");
-                        print_hex(status);
-                        print_str(b"\n");
-                        result = status as u64;
-                    }
-                    SSN_CLOSE => {
-                        let saved_pi = nt_handler.pi;
-                        nt_handler.pi = 1;
-                        nt_handler.close_current_handle(get_recv_mr(9));
-                        nt_handler.pi = saved_pi;
-                    }
                     SSN_REPLY_WAIT_RECV => {
                         let reply_msg = get_recv_mr(7);
                         let mut reply_bytes = [0u8; 0x120];
@@ -4115,7 +3658,6 @@ unsafe fn csr_sb_api_request_rendezvous(
                         return false;
                     }
                 }
-                reply_native_rendezvous(reply, result);
             }
             _ => return false,
         }
