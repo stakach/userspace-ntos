@@ -82,6 +82,13 @@ static LPC_RECEIVE_WAIT_PARKED: AtomicU64 = AtomicU64::new(0);
 static LPC_RECEIVE_WAIT_WOKEN: AtomicU64 = AtomicU64::new(0);
 static LPC_RECEIVE_WAIT_REDRIVES: AtomicU64 = AtomicU64::new(0);
 static LPC_RECEIVE_WAIT_FAILURES: AtomicU64 = AtomicU64::new(0);
+static LPC_CONNECT_WAIT_PARKED: AtomicU64 = AtomicU64::new(0);
+static LPC_CONNECT_WAIT_WOKEN: AtomicU64 = AtomicU64::new(0);
+static LPC_CONNECT_WAIT_FAILURES: AtomicU64 = AtomicU64::new(0);
+static LPC_REQUEST_WAIT_PARKED: AtomicU64 = AtomicU64::new(0);
+static LPC_REQUEST_WAIT_WOKEN: AtomicU64 = AtomicU64::new(0);
+static LPC_REQUEST_WAIT_REDRIVES: AtomicU64 = AtomicU64::new(0);
+static LPC_REQUEST_WAIT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static USERCONNECT_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_MSG_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static BUILD_HWND_LIST_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -282,6 +289,10 @@ static GUI_MESSAGE_WAITER_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
 static GUI_MESSAGE_WAITER_STORE_FAILURES: AtomicU64 = AtomicU64::new(0);
 static mut LPC_RECEIVE_WAITS: nt_lpc_continuation::ReceiveWaitTable<LpcReceiveContinuation> =
     nt_lpc_continuation::ReceiveWaitTable::new();
+static mut LPC_CONNECT_WAITS: nt_lpc_continuation::ConnectWaitTable<LpcConnectContinuation> =
+    nt_lpc_continuation::ConnectWaitTable::new();
+static mut LPC_REQUEST_WAITS: nt_lpc_continuation::RequestWaitTable<LpcRequestContinuation> =
+    nt_lpc_continuation::RequestWaitTable::new();
 
 #[derive(Clone, Copy)]
 struct SyscallReplyContext {
@@ -538,6 +549,67 @@ unsafe fn reset_lpc_receive_waits() -> bool {
         .is_ok()
 }
 
+unsafe fn reset_lpc_connect_waits() -> bool {
+    (&mut *core::ptr::addr_of_mut!(LPC_CONNECT_WAITS))
+        .reset()
+        .is_ok()
+}
+
+unsafe fn reset_lpc_request_waits() -> bool {
+    (&mut *core::ptr::addr_of_mut!(LPC_REQUEST_WAITS))
+        .reset()
+        .is_ok()
+}
+
+pub(crate) unsafe fn lpc_request_wait_reserve() -> Result<nt_lpc_continuation::Reservation, u32> {
+    (&mut *core::ptr::addr_of_mut!(LPC_REQUEST_WAITS))
+        .reserve()
+        .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)
+}
+
+pub(crate) unsafe fn lpc_request_wait_cancel_reservation(
+    reservation: nt_lpc_continuation::Reservation,
+) {
+    let _ = (&mut *core::ptr::addr_of_mut!(LPC_REQUEST_WAITS)).cancel(reservation);
+}
+
+pub(crate) unsafe fn lpc_connect_wait_reserve() -> Result<nt_lpc_continuation::Reservation, u32> {
+    (&mut *core::ptr::addr_of_mut!(LPC_CONNECT_WAITS))
+        .reserve()
+        .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)
+}
+
+pub(crate) unsafe fn lpc_connect_wait_cancel_reservation(
+    reservation: nt_lpc_continuation::Reservation,
+) {
+    let _ = (&mut *core::ptr::addr_of_mut!(LPC_CONNECT_WAITS)).cancel(reservation);
+}
+
+pub(crate) unsafe fn lpc_connect_wait_is_pending(connection_id: u64) -> bool {
+    (&*core::ptr::addr_of!(LPC_CONNECT_WAITS))
+        .find_connection(connection_id)
+        .is_some()
+}
+
+unsafe fn lpc_thread_has_wait(tid: u64, badge: u64) -> bool {
+    let receives = &*core::ptr::addr_of!(LPC_RECEIVE_WAITS);
+    let connects = &*core::ptr::addr_of!(LPC_CONNECT_WAITS);
+    let requests = &*core::ptr::addr_of!(LPC_REQUEST_WAITS);
+    (0..receives.slot_count()).any(|slot| {
+        receives.get(slot).is_some_and(|wait| {
+            wait.continuation.tid == tid || wait.continuation.badge == badge
+        })
+    }) || (0..connects.slot_count()).any(|slot| {
+        connects.get(slot).is_some_and(|wait| {
+            wait.continuation.tid == tid || wait.continuation.badge == badge
+        })
+    }) || (0..requests.slot_count()).any(|slot| {
+        requests.get(slot).is_some_and(|wait| {
+            wait.continuation.tid == tid || wait.continuation.badge == badge
+        })
+    })
+}
+
 pub(crate) unsafe fn lpc_receive_wait_reserve() -> Result<nt_lpc_continuation::Reservation, u32> {
     (&mut *core::ptr::addr_of_mut!(LPC_RECEIVE_WAITS))
         .reserve()
@@ -557,15 +629,11 @@ unsafe fn lpc_receive_wait_park(
     tid: u64,
     reply: nt_syscall_abi::ParkedSyscallReply,
 ) -> bool {
-    if tid == 0 || badge == 0 {
+    if tid == 0 {
         return false;
     }
     let table = &mut *core::ptr::addr_of_mut!(LPC_RECEIVE_WAITS);
-    if (0..table.slot_count()).any(|slot| {
-        table
-            .get(slot)
-            .is_some_and(|wait| wait.continuation.tid == tid || wait.continuation.badge == badge)
-    }) {
+    if lpc_thread_has_wait(tid, badge) {
         return false;
     }
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
@@ -623,6 +691,114 @@ unsafe fn lpc_receive_wait_park(
         },
     );
     print_str(b" -> PARK LPC receiver\n");
+    true
+}
+
+unsafe fn lpc_connect_wait_park(
+    pending: PendingLpcConnectPark,
+    pi: u32,
+    badge: u64,
+    tid: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
+) -> bool {
+    if tid == 0 || lpc_thread_has_wait(tid, badge) {
+        return false;
+    }
+    let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
+        return false;
+    };
+    if stolen == 0 {
+        return false;
+    }
+    let continuation = LpcConnectContinuation {
+        pi,
+        badge,
+        tid,
+        memory: pending.memory,
+        name: pending.name,
+        name_len: pending.name_len,
+        reply_cap: stolen,
+        reply,
+    };
+    if (&mut *core::ptr::addr_of_mut!(LPC_CONNECT_WAITS))
+        .publish(
+            pending.reservation,
+            nt_lpc_continuation::PendingConnect {
+                request: pending.request,
+                continuation,
+            },
+        )
+        .is_err()
+    {
+        return false;
+    }
+    wait_reply_pool_mark_used(fresh_index);
+    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    LPC_CONNECT_WAIT_PARKED.fetch_add(1, Ordering::Relaxed);
+    print_str(b"[lpc-connect-wait] pi=");
+    print_u64(pi as u64);
+    print_str(b" badge=");
+    print_u64(badge);
+    print_str(b" tid=");
+    print_u64(tid);
+    print_str(b" conn=");
+    print_u64(pending.request.connection_id);
+    print_str(b" -> PARK connector\n");
+    true
+}
+
+unsafe fn lpc_request_wait_park(
+    pending: PendingLpcRequestPark,
+    pi: u32,
+    badge: u64,
+    tid: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
+) -> bool {
+    if tid == 0 || lpc_thread_has_wait(tid, badge) {
+        return false;
+    }
+    let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
+        return false;
+    };
+    if stolen == 0 {
+        return false;
+    }
+    let continuation = LpcRequestContinuation {
+        pi,
+        badge,
+        tid,
+        memory: pending.memory,
+        reply_cap: stolen,
+        reply,
+    };
+    if (&mut *core::ptr::addr_of_mut!(LPC_REQUEST_WAITS))
+        .publish(
+            pending.reservation,
+            nt_lpc_continuation::PendingRequestWait {
+                request: pending.request,
+                continuation,
+            },
+        )
+        .is_err()
+    {
+        return false;
+    }
+    wait_reply_pool_mark_used(fresh_index);
+    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    LPC_REQUEST_WAIT_PARKED.fetch_add(1, Ordering::Relaxed);
+    print_str(b"[lpc-request-wait] pi=");
+    print_u64(pi as u64);
+    print_str(b" badge=");
+    print_u64(badge);
+    print_str(b" tid=");
+    print_u64(tid);
+    print_str(b" port=0x");
+    print_hex_u64(pending.request.port_handle);
+    print_str(b" msgid=");
+    print_u64(pending.request.message_id as u64);
+    print_str(b" -> PARK requester\n");
     true
 }
 
@@ -5575,6 +5751,12 @@ pub(crate) unsafe fn service_sec_image(
     if !reset_lpc_receive_waits() {
         panic!("LPC receive waiter table allocation failed");
     }
+    if !reset_lpc_connect_waits() {
+        panic!("LPC connect waiter table allocation failed");
+    }
+    if !reset_lpc_request_waits() {
+        panic!("LPC request waiter table allocation failed");
+    }
     // Driver import catalogs are durable and may be consulted from later PnP or win32k loads.
     // Populate their expected boot footprint before entering the service loop.
     if !initialize_fsd_export_registry() {
@@ -9128,6 +9310,8 @@ pub(crate) unsafe fn service_sec_image(
             )> = None;
             let mut synchronous_file_wait_parked = false;
             let mut park_lpc_receive: Option<PendingLpcReceivePark> = None;
+            let mut park_lpc_connect: Option<PendingLpcConnectPark> = None;
+            let mut park_lpc_request: Option<PendingLpcRequestPark> = None;
             let mut gui_message_wait_park_request = false;
             let mut gui_message_wait_queue_event_body: u64 = 0;
             let mut gui_message_wait_msg_ptr: u64 = 0;
@@ -9252,6 +9436,18 @@ pub(crate) unsafe fn service_sec_image(
                     lpc_receive_wait_cancel_reservation(stale.reservation);
                     panic!("previous syscall leaked an LPC receive continuation reservation");
                 }
+                if let Some(stale) = nt_handler.lpc_connect_park.take() {
+                    lpc_connect_wait_cancel_reservation(stale.reservation);
+                    panic!("previous syscall leaked an LPC connect continuation reservation");
+                }
+                if let Some(stale) = nt_handler.lpc_request_park.take() {
+                    lpc_request_wait_cancel_reservation(stale.reservation);
+                    panic!("previous syscall leaked an LPC request continuation reservation");
+                }
+                assert!(
+                    nt_handler.lpc_connect_completion.is_none(),
+                    "previous syscall leaked an LPC connect completion"
+                );
                 nt_handler.sm_request_port = 0;
                 nt_handler.sm_request_message = 0;
                 nt_handler.sm_reply_message = 0;
@@ -9918,6 +10114,8 @@ pub(crate) unsafe fn service_sec_image(
                     delay_timer_rearm(delay_queue);
                 }
                 park_lpc_receive = nt_handler.lpc_receive_park.take();
+                park_lpc_connect = nt_handler.lpc_connect_park.take();
+                park_lpc_request = nt_handler.lpc_request_park.take();
                 if nt_handler.dbgk_block_request {
                     park_dbgk_reporter = true;
                 }
@@ -9937,6 +10135,10 @@ pub(crate) unsafe fn service_sec_image(
                 let _ = file_irp_drain_redrive_all(&mut nt_handler);
                 if nt_handler.lpc_endpoint_progress {
                     let _ = lpc_receive_wait_redrive_all(&mut nt_handler);
+                    let _ = lpc_request_wait_redrive_all(&mut nt_handler);
+                }
+                if let Some(completion) = nt_handler.lpc_connect_completion.take() {
+                    let _ = lpc_connect_wait_complete(&mut nt_handler, completion);
                 }
                 // The hosted-exe lane reserved a spawn after validating the owner-local file ->
                 // section -> process transition in `exe_images`. The remaining per-image policy is
@@ -15593,6 +15795,90 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 lpc_receive_wait_cancel_reservation(pending.reservation);
                 print_str(b"[lpc-recv] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n");
+                result = 0xC000_009A;
+            }
+            if let Some(pending) = park_lpc_connect.take() {
+                if reply_main != 0
+                    && lpc_connect_wait_park(
+                        pending,
+                        pi as u32,
+                        badge,
+                        nt_handler.current_tid,
+                        parked_syscall_reply,
+                    )
+                {
+                    procs[pi].faults = faults;
+                    procs[pi].first = first;
+                    procs[pi].ntfaults = ntfaults;
+                    pfilled[pi] = *filled_pages;
+                    trace_indefinite_wait_park(
+                        &nt_handler,
+                        badge,
+                        live_top_badges(&nt_handler),
+                        crash_parked,
+                        wait_parked,
+                    );
+                    mark_wait_parked!(pi, resume_ip);
+                    let _ = finalize_service_loop_state(&mut nt_handler);
+                    let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    badge = received.0;
+                    mi = received.1;
+                    m0 = received.2;
+                    m1 = received.3;
+                    m2 = received.4;
+                    m3 = received.5;
+                    continue;
+                }
+                lpc_connect_wait_cancel_reservation(pending.reservation);
+                if let Some(client) = lpc_client() {
+                    let _ = client.accept_connect(pending.request.connection_id, false, 0);
+                }
+                nt_handler.abort_lpc_connection_views(pending.request.connection_id);
+                print_str(b"[lpc-connect-wait] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n");
+                result = 0xC000_009A;
+            }
+            if let Some(pending) = park_lpc_request.take() {
+                if reply_main != 0
+                    && lpc_request_wait_park(
+                        pending,
+                        pi as u32,
+                        badge,
+                        nt_handler.current_tid,
+                        parked_syscall_reply,
+                    )
+                {
+                    procs[pi].faults = faults;
+                    procs[pi].first = first;
+                    procs[pi].ntfaults = ntfaults;
+                    pfilled[pi] = *filled_pages;
+                    trace_indefinite_wait_park(
+                        &nt_handler,
+                        badge,
+                        live_top_badges(&nt_handler),
+                        crash_parked,
+                        wait_parked,
+                    );
+                    mark_wait_parked!(pi, resume_ip);
+                    let _ = finalize_service_loop_state(&mut nt_handler);
+                    let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    badge = received.0;
+                    mi = received.1;
+                    m0 = received.2;
+                    m1 = received.3;
+                    m2 = received.4;
+                    m3 = received.5;
+                    continue;
+                }
+                lpc_request_wait_cancel_reservation(pending.reservation);
+                if let Some(client) = lpc_client() {
+                    let _ = client.cancel_request(
+                        pending.request.port_handle,
+                        pending.request.client_process,
+                        pending.request.client_thread,
+                        pending.request.message_id,
+                    );
+                }
+                print_str(b"[lpc-request-wait] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n");
                 result = 0xC000_009A;
             }
             if park_io_completion_port >= 0 && reply_main != 0 {
@@ -21401,6 +21687,224 @@ unsafe fn lpc_receive_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     woken
 }
 
+unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
+    let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
+    let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
+    let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
+    let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
+    let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
+    let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
+    let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+    let saved_w32_client_pi = W32_CLIENT_PI.load(Ordering::Relaxed);
+    let saved_pi = nt_handler.pi;
+    let saved_tid = nt_handler.current_tid;
+    let saved_badge = nt_handler.current_badge;
+    let saved_user_memory = nt_handler.current_user_memory;
+    let mut woken = 0u64;
+
+    let mut generation = 0u64;
+    while let Some((slot, current_generation, wait)) = (&*core::ptr::addr_of!(LPC_REQUEST_WAITS))
+        .next_occupied_after(generation)
+        .map(|(slot, generation, wait)| (slot, generation, *wait))
+    {
+        generation = current_generation;
+        LPC_REQUEST_WAIT_REDRIVES.fetch_add(1, Ordering::Relaxed);
+        let completion = match lpc_client().map(|lpc| {
+            lpc.receive_reply(
+                wait.request.port_handle,
+                wait.request.client_process,
+                wait.request.client_thread,
+                wait.request.message_id,
+            )
+        }) {
+            Some(Ok(Some(reply))) => Some(Ok(reply)),
+            Some(Ok(None)) => None,
+            Some(Err(status)) => Some(Err(status.raw() as u32)),
+            None => Some(Err(nt_status::NtStatus::UNSUCCESSFUL.raw() as u32)),
+        };
+        let Some(completion) = completion else {
+            continue;
+        };
+
+        let continuation = wait.continuation;
+        let pi = continuation.pi as usize;
+        let status = if pi >= MAX_PI {
+            nt_status::NtStatus::UNSUCCESSFUL.raw() as u32
+        } else {
+            let (sb, ss, smv, hmv, imv, scratch_base) = mirror_ctx_for(continuation.badge, pi);
+            ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
+            ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
+            ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
+            ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
+            ACTIVE_IMAGE_MIRROR.store(imv, Ordering::Relaxed);
+            ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
+            ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
+            W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
+            nt_handler.pi = pi;
+            nt_handler.current_tid = continuation.tid;
+            nt_handler.current_badge = continuation.badge;
+            nt_handler.current_user_memory = continuation.memory;
+            match completion {
+                Ok(reply) => nt_handler.lpc_publish_request_reply(
+                    pi,
+                    continuation.memory,
+                    wait.request,
+                    &reply,
+                ),
+                Err(status) => status,
+            }
+        };
+
+        let Some(completed) = (&mut *core::ptr::addr_of_mut!(LPC_REQUEST_WAITS)).take(slot) else {
+            continue;
+        };
+        let replied = reply_parked_syscall(
+            completed.continuation.reply_cap,
+            completed.continuation.reply,
+            status as u64,
+        );
+        release_reply_pool_cap(completed.continuation.reply_cap);
+        thread_wait_state_clear_badge_ready(nt_handler, completed.continuation.badge);
+        if replied {
+            LPC_REQUEST_WAIT_WOKEN.fetch_add(1, Ordering::Relaxed);
+            bump_progress();
+            woken += 1;
+        } else {
+            LPC_REQUEST_WAIT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        }
+        print_str(b"[lpc-request-wait] WAKE pi=");
+        print_u64(completed.continuation.pi as u64);
+        print_str(b" badge=");
+        print_u64(completed.continuation.badge);
+        print_str(b" tid=");
+        print_u64(completed.continuation.tid);
+        print_str(b" msgid=");
+        print_u64(completed.request.message_id as u64);
+        print_str(b" status=0x");
+        print_hex(status);
+        print_str(b" replied=");
+        print_u64(replied as u64);
+        print_str(b"\n");
+    }
+
+    ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
+    ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
+    ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
+    ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
+    ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
+    ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
+    ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
+    W32_CLIENT_PI.store(saved_w32_client_pi, Ordering::Relaxed);
+    nt_handler.pi = saved_pi;
+    nt_handler.current_tid = saved_tid;
+    nt_handler.current_badge = saved_badge;
+    nt_handler.current_user_memory = saved_user_memory;
+    woken
+}
+
+unsafe fn lpc_connect_wait_complete(
+    nt_handler: &mut ExecNtHandler,
+    completion: PendingLpcConnectCompletion,
+) -> bool {
+    let Some((slot, wait)) = (&*core::ptr::addr_of!(LPC_CONNECT_WAITS))
+        .find_connection(completion.connection_id)
+        .map(|(slot, wait)| (slot, *wait))
+    else {
+        LPC_CONNECT_WAIT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        print_str(b"[lpc-connect-wait] terminal result has no connector conn=");
+        print_u64(completion.connection_id);
+        print_str(b" status=0x");
+        print_hex(completion.status);
+        print_str(b"\n");
+        return false;
+    };
+
+    let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
+    let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
+    let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
+    let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
+    let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
+    let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
+    let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+    let saved_w32_client_pi = W32_CLIENT_PI.load(Ordering::Relaxed);
+    let saved_pi = nt_handler.pi;
+    let saved_tid = nt_handler.current_tid;
+    let saved_badge = nt_handler.current_badge;
+    let saved_user_memory = nt_handler.current_user_memory;
+
+    let continuation = wait.continuation;
+    let pi = continuation.pi as usize;
+    let status = if pi >= MAX_PI {
+        nt_status::NtStatus::UNSUCCESSFUL.raw() as u32
+    } else {
+        let (sb, ss, smv, hmv, imv, scratch_base) = mirror_ctx_for(continuation.badge, pi);
+        ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
+        ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
+        ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
+        ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
+        ACTIVE_IMAGE_MIRROR.store(imv, Ordering::Relaxed);
+        ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
+        ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
+        W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
+        nt_handler.pi = pi;
+        nt_handler.current_tid = continuation.tid;
+        nt_handler.current_badge = continuation.badge;
+        nt_handler.current_user_memory = continuation.memory;
+        nt_handler.lpc_publish_connect_completion(
+            pi,
+            continuation.memory,
+            wait.request,
+            &continuation.name[..continuation.name_len as usize],
+            &completion,
+        )
+    };
+
+    ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
+    ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
+    ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
+    ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
+    ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
+    ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
+    ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
+    W32_CLIENT_PI.store(saved_w32_client_pi, Ordering::Relaxed);
+    nt_handler.pi = saved_pi;
+    nt_handler.current_tid = saved_tid;
+    nt_handler.current_badge = saved_badge;
+    nt_handler.current_user_memory = saved_user_memory;
+
+    let Some(completed) = (&mut *core::ptr::addr_of_mut!(LPC_CONNECT_WAITS)).take(slot) else {
+        LPC_CONNECT_WAIT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    let replied = reply_parked_syscall(
+        completed.continuation.reply_cap,
+        completed.continuation.reply,
+        status as u64,
+    );
+    release_reply_pool_cap(completed.continuation.reply_cap);
+    thread_wait_state_clear_badge_ready(nt_handler, completed.continuation.badge);
+    if replied {
+        LPC_CONNECT_WAIT_WOKEN.fetch_add(1, Ordering::Relaxed);
+        bump_progress();
+    } else {
+        LPC_CONNECT_WAIT_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+    print_str(b"[lpc-connect-wait] WAKE pi=");
+    print_u64(completed.continuation.pi as u64);
+    print_str(b" badge=");
+    print_u64(completed.continuation.badge);
+    print_str(b" tid=");
+    print_u64(completed.continuation.tid);
+    print_str(b" conn=");
+    print_u64(completed.request.connection_id);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b" replied=");
+    print_u64(replied as u64);
+    print_str(b"\n");
+    replied
+}
+
 pub(crate) unsafe fn lpc_receive_wait_abandon_thread(
     nt_handler: &mut ExecNtHandler,
     tid: u64,
@@ -21415,6 +21919,82 @@ pub(crate) unsafe fn lpc_receive_wait_abandon_thread(
             continue;
         }
         let removed = table.take(slot).unwrap();
+        let cap = removed.continuation.reply_cap;
+        let deleted = cnode_delete_r(cap);
+        let retyped = if deleted == 0 {
+            untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
+        } else {
+            u64::MAX
+        };
+        if deleted == 0 && retyped == 0 {
+            release_reply_pool_cap(cap);
+        }
+        abandoned += 1;
+    }
+    if abandoned != 0 {
+        thread_wait_state_clear_tid(nt_handler, tid);
+    }
+    abandoned
+}
+
+pub(crate) unsafe fn lpc_connect_wait_abandon_thread(
+    nt_handler: &mut ExecNtHandler,
+    tid: u64,
+) -> u64 {
+    let table = &mut *core::ptr::addr_of_mut!(LPC_CONNECT_WAITS);
+    let mut abandoned = 0u64;
+    for slot in 0..table.slot_count() {
+        let Some(wait) = table.get(slot).copied() else {
+            continue;
+        };
+        if wait.continuation.tid != tid {
+            continue;
+        }
+        let removed = table.take(slot).unwrap();
+        if let Some(client) = lpc_client() {
+            let _ = client.accept_connect(removed.request.connection_id, false, 0);
+        }
+        nt_handler.abort_lpc_connection_views(removed.request.connection_id);
+        let cap = removed.continuation.reply_cap;
+        let deleted = cnode_delete_r(cap);
+        let retyped = if deleted == 0 {
+            untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
+        } else {
+            u64::MAX
+        };
+        if deleted == 0 && retyped == 0 {
+            release_reply_pool_cap(cap);
+        }
+        abandoned += 1;
+    }
+    if abandoned != 0 {
+        thread_wait_state_clear_tid(nt_handler, tid);
+    }
+    abandoned
+}
+
+pub(crate) unsafe fn lpc_request_wait_abandon_thread(
+    nt_handler: &mut ExecNtHandler,
+    tid: u64,
+) -> u64 {
+    let table = &mut *core::ptr::addr_of_mut!(LPC_REQUEST_WAITS);
+    let mut abandoned = 0u64;
+    for slot in 0..table.slot_count() {
+        let Some(wait) = table.get(slot).copied() else {
+            continue;
+        };
+        if wait.continuation.tid != tid {
+            continue;
+        }
+        let removed = table.take(slot).unwrap();
+        if let Some(client) = lpc_client() {
+            let _ = client.cancel_request(
+                removed.request.port_handle,
+                removed.request.client_process,
+                removed.request.client_thread,
+                removed.request.message_id,
+            );
+        }
         let cap = removed.continuation.reply_cap;
         let deleted = cnode_delete_r(cap);
         let retyped = if deleted == 0 {

@@ -17,7 +17,7 @@
 #![no_std]
 
 /// ABI version. Bump on any incompatible wire change.
-pub const LPC_ABI_VERSION: u32 = 5;
+pub const LPC_ABI_VERSION: u32 = 6;
 
 /// The reserved SURT opcode range for the LPC protocol (fresh block after
 /// object 0x2000 / config 0x2100).
@@ -49,6 +49,10 @@ pub mod opcode {
 
     // Validate a server-held request before native LPC client impersonation.
     pub const LPC_OP_QUERY_REQUEST: u16 = 0x220c;
+
+    // Complete or cancel one synchronous request by its kernel-authored message identity.
+    pub const LPC_OP_RECEIVE_REPLY: u16 = 0x220d;
+    pub const LPC_OP_CANCEL_REQUEST: u16 = 0x220e;
 }
 
 /// True if `op` is an LPC opcode.
@@ -414,6 +418,20 @@ pub struct LpcQueryRequestRequest {
     pub client_thread: u64,
 }
 
+/// `LPC_OP_RECEIVE_REPLY` / `LPC_OP_CANCEL_REQUEST` — identify one client-side synchronous
+/// request. The kernel obtains `message_id` from the reply to `LPC_OP_REQUEST_WAIT_REPLY`; user
+/// mode never chooses it.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LpcRequestIdentityRequest {
+    pub abi_size: u16,
+    pub _reserved: u16,
+    pub message_id: u32,
+    pub port_handle: u64,
+    pub client_process: u64,
+    pub client_thread: u64,
+}
+
 /// Broker-authored connection and QoS state for a validated server-held request.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -527,6 +545,7 @@ const _: () = {
     assert!(size_of::<LpcReceiveRequest>() == 24);
     assert!(size_of::<LpcMessageRequest>() == 40);
     assert!(size_of::<LpcQueryRequestRequest>() == 32);
+    assert!(size_of::<LpcRequestIdentityRequest>() == 32);
     assert!(size_of::<LpcQueryRequestResponse>() == 40);
     assert!(size_of::<LpcClosePortRequest>() == 16);
     assert!(size_of::<LpcQueryHandleRequest>() == 16);
@@ -549,6 +568,8 @@ mod tests {
         assert!(is_lpc_opcode(opcode::LPC_OP_QUERY_HANDLE));
         assert!(is_lpc_opcode(opcode::LPC_OP_REQUEST_PORT));
         assert!(is_lpc_opcode(opcode::LPC_OP_QUERY_REQUEST));
+        assert!(is_lpc_opcode(opcode::LPC_OP_RECEIVE_REPLY));
+        assert!(is_lpc_opcode(opcode::LPC_OP_CANCEL_REQUEST));
         assert!(!is_lpc_opcode(0x21ff));
         assert!(!is_lpc_opcode(0x2300));
     }

@@ -16140,3 +16140,45 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `\Windows\SbApiPort`, `\Windows\ApiPort`, and LSA one port at a time, deleting each replaced
     worker loop and numeric continuation branch in its acceptance slice. Only then replace the
     remaining datagram/ALPC `Port.reply_connection` routing with explicit connection provenance.
+
+    Typed LPC connect and synchronous-request continuations (2026-08-29, accepted): pending
+    `NtConnectPort` calls for `\SmApiPort` and `\Windows\SbApiPort` now reserve durable continuation
+    storage before the broker creates the connection. Generic `NtListenPort` /
+    `NtReplyWaitReceivePort` workers receive, accept, and complete that exact broker connection;
+    refusal and completion resume only its connector. Connector output pointers, original
+    connection-information capacity, process memory policy, PID slot, TID, badge, syscall register
+    state, and reply capability remain bound to the typed connection id until terminal copyout.
+    Server-authored connection information may shorten but cannot grow the connector's native
+    buffer. Copyout or continuation failure closes the new communication handle and unwinds both
+    connection-view directions.
+
+    The request data plane now returns the broker-authored `PORT_MESSAGE.MessageId` when a
+    synchronous request is queued. A second broker operation receives only that identity's reply;
+    unrelated replies and datagrams remain queued. Exact cancellation removes the named request
+    whether it is still queued, held by the server, or already answered, which makes continuation
+    allocation rollback and thread teardown transactional. The executive's growable request-wait
+    table retains that identity with the caller's reply buffer and seL4 continuation. Producer-edge
+    redrive wakes a generic server receive after request publication and wakes the exact client only
+    after the server commits its matching reply. Both the outer `\SmApiPort` request and SmpApiLoop's
+    nested `\Windows\SbApiPort` request now use this path.
+
+    Focused host validation passes `nt-lpc-continuation` at `10/10`, `nt-port-core` at `17/17`, and
+    `nt-lpc-server` at `16/16`; the staged release executive remains at the established 212-warning
+    baseline. Serialized acceptance `.tmp/run-headless-lpc-request-wait-20260829.log` records three
+    exact connect parks/wakes and two synchronous request parks/wakes. The nested SB reply (message
+    id 3) resumes SmpApiLoop before the outer SM reply (message id 2) resumes the SMSS main thread.
+    No legacy `[sm-rdv]` event or `[sm-api] WALL` occurs. Genuine userinit and Explorer launch;
+    Explorer completes 668 api0 redirects with zero callback or dead-callback failures, paint
+    begin/end reaches `5/20` with 187 direct GDI returns and 135 batch flushes covering 184 records,
+    and the framebuffer holds `480000/480000` non-background pixels with at least 32 colours. All
+    `295/295` gates pass and the sentinel matches.
+
+    Review adjustment: the live SM/SB connection and synchronous request paths no longer depend on
+    either private rendezvous. Delete the superseded SM request scalars, `sm_api_request_rendezvous`,
+    the duplicate private SM worker endpoint/reply slot/stack state, and the corresponding `SM_RECV*`
+    and `SM_RECEIVE_PARKED` state. Delete the private CSR SB endpoint/reply slot/stack state and
+    `csr_sb_api_request_rendezvous` now that CsrSbApiRequestThread runs in the generic hosted-worker
+    window and receives through the common LPC wait table. Rebuild and repeat the full desktop gate
+    after deletion. Then apply the same typed connect/request conversion to `\Windows\ApiPort` and
+    LSA, deleting each older continuation adapter in its accepted slice. Explicit connection
+    provenance replacing `Port.reply_connection` remains the final LPC broker cleanup.

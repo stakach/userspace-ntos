@@ -297,6 +297,120 @@ pub struct PendingConnect<C> {
     pub continuation: C,
 }
 
+/// Broker identity and native reply address retained while `NtRequestWaitReplyPort` is blocked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestWaitRequest {
+    pub port_handle: u64,
+    pub reply_message: u64,
+    pub client_process: u64,
+    pub client_thread: u64,
+    pub message_id: u32,
+}
+
+impl RequestWaitRequest {
+    pub const fn is_valid(self) -> bool {
+        self.port_handle != 0
+            && self.reply_message != 0
+            && self.client_process != 0
+            && self.client_thread != 0
+            && self.message_id != 0
+    }
+}
+
+/// One typed blocked synchronous request plus the executive continuation needed to resume it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingRequestWait<C> {
+    pub request: RequestWaitRequest,
+    pub continuation: C,
+}
+
+/// Growable, generation-exact ownership table for synchronous LPC request waiters.
+pub struct RequestWaitTable<C> {
+    inner: GenerationTable<PendingRequestWait<C>>,
+}
+
+impl<C> Default for RequestWaitTable<C> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<C> RequestWaitTable<C> {
+    pub const fn new() -> Self {
+        Self::with_initial_reserve(DEFAULT_INITIAL_RESERVE)
+    }
+
+    pub const fn with_initial_reserve(initial_reserve: usize) -> Self {
+        Self {
+            inner: GenerationTable::with_initial_reserve(initial_reserve),
+        }
+    }
+
+    pub fn reset(&mut self) -> Result<(), TableError> {
+        self.inner.reset()
+    }
+
+    pub fn reserve(&mut self) -> Result<Reservation, TableError> {
+        self.inner.reserve()
+    }
+
+    pub fn cancel(&mut self, reservation: Reservation) -> Result<(), TableError> {
+        self.inner.cancel(reservation)
+    }
+
+    pub fn publish(
+        &mut self,
+        reservation: Reservation,
+        value: PendingRequestWait<C>,
+    ) -> Result<usize, TableError> {
+        if !value.request.is_valid() {
+            return Err(TableError::InvalidRequest);
+        }
+        if self.inner.occupied_slots().any(|slot| {
+            self.inner.get(slot).is_some_and(|wait| {
+                wait.request.port_handle == value.request.port_handle
+                    && wait.request.client_process == value.request.client_process
+                    && wait.request.client_thread == value.request.client_thread
+                    && wait.request.message_id == value.request.message_id
+            })
+        }) {
+            return Err(TableError::InvalidRequest);
+        }
+        self.inner.publish(reservation, value)
+    }
+
+    pub fn get(&self, slot: usize) -> Option<&PendingRequestWait<C>> {
+        self.inner.get(slot)
+    }
+
+    pub fn occupied_slots(&self) -> impl Iterator<Item = usize> + '_ {
+        self.inner.occupied_slots()
+    }
+
+    pub fn next_occupied_after(
+        &self,
+        generation: u64,
+    ) -> Option<(usize, u64, &PendingRequestWait<C>)> {
+        self.inner.next_occupied_after(generation)
+    }
+
+    pub fn take(&mut self, slot: usize) -> Option<PendingRequestWait<C>> {
+        self.inner.take(slot)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.inner.slot_count()
+    }
+
+    pub fn allocation_capacity(&self) -> usize {
+        self.inner.allocation_capacity()
+    }
+}
+
 /// Growable, generation-exact ownership table for pending LPC connects.
 pub struct ConnectWaitTable<C> {
     inner: GenerationTable<PendingConnect<C>>,
@@ -543,6 +657,64 @@ mod tests {
         let invalid = table.reserve().unwrap();
         assert_eq!(
             table.publish(invalid, connect(0, 3)),
+            Err(TableError::InvalidRequest)
+        );
+        table.cancel(invalid).unwrap();
+    }
+
+    fn request_wait(message_id: u32, token: u64) -> PendingRequestWait<u64> {
+        PendingRequestWait {
+            request: RequestWaitRequest {
+                port_handle: 0x7000,
+                reply_message: 0x8000 + token,
+                client_process: 4,
+                client_thread: 8 + token,
+                message_id,
+            },
+            continuation: token,
+        }
+    }
+
+    #[test]
+    fn request_waiters_preserve_broker_identity_and_fifo_order() {
+        let mut table = RequestWaitTable::with_initial_reserve(2);
+        table.reset().unwrap();
+        for (message_id, token) in [(7, 1), (8, 2), (9, 3)] {
+            let reservation = table.reserve().unwrap();
+            table
+                .publish(reservation, request_wait(message_id, token))
+                .unwrap();
+        }
+        let mut generation = 0;
+        let mut identities = alloc::vec::Vec::new();
+        while let Some((_, current, wait)) = table.next_occupied_after(generation) {
+            generation = current;
+            identities.push(wait.request.message_id);
+        }
+        assert_eq!(identities, [7, 8, 9]);
+        assert!(table.allocation_capacity() >= 3);
+    }
+
+    #[test]
+    fn duplicate_or_invalid_request_wait_identity_is_rejected() {
+        let mut table = RequestWaitTable::new();
+        let first = table.reserve().unwrap();
+        table.publish(first, request_wait(7, 1)).unwrap();
+
+        let duplicate = table.reserve().unwrap();
+        let mut same_identity = request_wait(7, 2);
+        same_identity.request.client_thread = 9;
+        assert_eq!(
+            table.publish(duplicate, same_identity),
+            Err(TableError::InvalidRequest)
+        );
+        table.cancel(duplicate).unwrap();
+
+        let invalid = table.reserve().unwrap();
+        let mut missing_reply = request_wait(8, 3);
+        missing_reply.request.reply_message = 0;
+        assert_eq!(
+            table.publish(invalid, missing_reply),
             Err(TableError::InvalidRequest)
         );
         table.cancel(invalid).unwrap();

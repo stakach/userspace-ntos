@@ -17425,6 +17425,8 @@ pub(crate) unsafe fn release_unregistered_hosted_thread_spawn(spawn: HostedThrea
 unsafe fn hosted_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
     let _ = crate::service_sec_image::pending_driver_load_abandon_thread(handler, tid);
     let _ = crate::service_sec_image::lpc_receive_wait_abandon_thread(handler, tid);
+    let _ = crate::service_sec_image::lpc_connect_wait_abandon_thread(handler, tid);
+    let _ = crate::service_sec_image::lpc_request_wait_abandon_thread(handler, tid);
     let _ = handler.cancel_file_io_for_thread_teardown(tid);
     thread_wait_state_clear_tid(handler, tid);
 }
@@ -21529,6 +21531,59 @@ struct LpcReceiveContinuation {
     reply: nt_syscall_abi::ParkedSyscallReply,
 }
 
+/// Allocation-safe handoff for a broker connection that has become pending. The table reservation
+/// is acquired before the broker mutates connection state; the service loop binds the live reply
+/// object only after dispatch returns.
+#[derive(Clone, Copy)]
+struct PendingLpcConnectPark {
+    reservation: nt_lpc_continuation::Reservation,
+    request: nt_lpc_continuation::ConnectRequest,
+    memory: SyscallUserMemory,
+    name: [u16; 32],
+    name_len: u8,
+}
+
+/// Full kernel continuation retained until the exact broker connection completes or terminates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LpcConnectContinuation {
+    pi: u32,
+    badge: u64,
+    tid: u64,
+    memory: SyscallUserMemory,
+    name: [u16; 32],
+    name_len: u8,
+    reply_cap: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
+}
+
+/// Terminal broker result transferred from accept/complete dispatch to the reply-cap owner.
+struct PendingLpcConnectCompletion {
+    connection_id: u64,
+    status: u32,
+    client_handle: u64,
+    connection_information: alloc::vec::Vec<u8>,
+}
+
+/// Allocation-safe handoff for a queued synchronous request. The broker has already assigned the
+/// message identity; the service loop binds the current reply object before the caller is parked.
+#[derive(Clone, Copy)]
+struct PendingLpcRequestPark {
+    reservation: nt_lpc_continuation::Reservation,
+    request: nt_lpc_continuation::RequestWaitRequest,
+    memory: SyscallUserMemory,
+}
+
+/// Full kernel continuation retained until the exact broker reply arrives or the port terminates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LpcRequestContinuation {
+    pi: u32,
+    badge: u64,
+    tid: u64,
+    memory: SyscallUserMemory,
+    reply_cap: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
+}
+
 impl PendingWaitTimeout {
     const fn none() -> Self {
         Self {
@@ -21795,13 +21850,20 @@ struct ExecNtHandler {
     /// Allocation-reserved generic LPC receive that the service loop must bind to the current reply
     /// object. The durable wait moves into `LPC_RECEIVE_WAITS`; no scalar state survives dispatch.
     lpc_receive_park: Option<PendingLpcReceivePark>,
+    /// Allocation-reserved generic LPC connect that the service loop must bind to the current reply
+    /// object. Completion is keyed only by the broker-authored connection id.
+    lpc_connect_park: Option<PendingLpcConnectPark>,
+    /// Accepted, refused, or disconnected connect outcome waiting for exact connector copyout.
+    lpc_connect_completion: Option<PendingLpcConnectCompletion>,
+    /// Allocation-reserved synchronous request keyed by broker-authored message identity.
+    lpc_request_park: Option<PendingLpcRequestPark>,
     /// A reply was published to the LPC broker during this dispatch. The service loop consumes the
     /// edge once to redrive generic receive continuations without polling every parked port after
     /// every unrelated syscall.
     lpc_endpoint_progress: bool,
-    /// A synchronous SMSS request on its established `\\SmApiPort` client connection. The loop
-    /// delivers it to the parked real SmpApiLoop and resumes this caller only after the worker's
-    /// reply is available.
+    /// Legacy private SM request rendezvous. Generic typed request continuations replace this for
+    /// established `\\SmApiPort` and `\\Windows\\SbApiPort` connections; delete these scalars with
+    /// the remaining private SM worker.
     sm_request_port: u64,
     sm_request_message: u64,
     sm_reply_message: u64,

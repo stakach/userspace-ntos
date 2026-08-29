@@ -731,12 +731,12 @@ impl PortCore {
         port_context: u64,
         response_info: &[u8],
     ) -> Result<u64, NtStatus> {
-        let max_connection_info = self
+        let connection = self
             .conn(connection_id)
-            .ok_or(NtStatus::INVALID_PARAMETER)?
-            .limits
-            .max_connection_info as usize;
-        if response_info.len() > max_connection_info {
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        // NT returns the server-authored bytes through the connector's original connection
+        // message. The acceptor may shorten that payload, but it cannot grow the allocation.
+        if response_info.len() > connection.conn_info.len() {
             return Err(NtStatus::BUFFER_TOO_SMALL);
         }
         self.accept_inner(connection_id, accept, port_context, Some(response_info))
@@ -938,6 +938,106 @@ impl PortCore {
             self.allocate_stored_message(account, 0, bytes, attrs, port_context, Some(identity))?;
         self.connections[connection_index].server_inbox.push(stored);
         Ok(())
+    }
+
+    /// Receive only the reply for one kernel-authored synchronous request. Unrelated datagrams and
+    /// replies remain queued, so concurrent waiters on one communication port cannot consume each
+    /// other's completion.
+    pub fn receive_reply_message(
+        &mut self,
+        from_handle: u64,
+        identity: MessageIdentity,
+    ) -> Result<Option<QueuedMessage>, NtStatus> {
+        if identity.message_id == 0 {
+            return Err(NtStatus::REPLY_MESSAGE_MISMATCH);
+        }
+        let connection_index = self
+            .connections
+            .iter()
+            .position(|connection| {
+                connection.client_open
+                    && from_handle != 0
+                    && connection.client_handle == from_handle
+            })
+            .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+        if self.connections[connection_index].client_id.process != identity.client.process {
+            return Err(NtStatus::REPLY_MESSAGE_MISMATCH);
+        }
+        if let Some(message_index) = self.connections[connection_index]
+            .client_inbox
+            .iter()
+            .position(|message| message.message.request_identity == Some(identity))
+        {
+            let stored = self.connections[connection_index]
+                .client_inbox
+                .remove(message_index);
+            let account = self.connections[connection_index].pool_account;
+            self.replace_pool_charge(account, stored.pool_charge, 0)
+                .expect("dequeued broker reply was previously charged");
+            return Ok(Some(stored.message));
+        }
+        let connection = &self.connections[connection_index];
+        if connection.state == ConnState::Connected && connection.server_open {
+            Ok(None)
+        } else {
+            Err(NtStatus::PORT_DISCONNECTED)
+        }
+    }
+
+    /// Roll back one synchronous request when its kernel continuation cannot be retained. The
+    /// request may still be queued, held by the server, or already answered; exactly that identity
+    /// is removed without disturbing other traffic on the connection.
+    pub fn cancel_request_message(
+        &mut self,
+        from_handle: u64,
+        identity: MessageIdentity,
+    ) -> Result<bool, NtStatus> {
+        if identity.message_id == 0 {
+            return Err(NtStatus::REPLY_MESSAGE_MISMATCH);
+        }
+        let connection_index = self
+            .connections
+            .iter()
+            .position(|connection| {
+                connection.client_open
+                    && from_handle != 0
+                    && connection.client_handle == from_handle
+            })
+            .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+        if self.connections[connection_index].client_id.process != identity.client.process {
+            return Err(NtStatus::REPLY_MESSAGE_MISMATCH);
+        }
+
+        let removed_charge = {
+            let connection = &mut self.connections[connection_index];
+            if let Some(index) = connection
+                .server_inbox
+                .iter()
+                .position(|message| message.message.request_identity == Some(identity))
+            {
+                Some(connection.server_inbox.remove(index).pool_charge)
+            } else if let Some(index) = connection
+                .delivered_requests
+                .iter()
+                .position(|request| request.identity == identity)
+            {
+                Some(connection.delivered_requests.remove(index).pool_charge)
+            } else {
+                connection
+                    .client_inbox
+                    .iter()
+                    .position(|message| message.message.request_identity == Some(identity))
+                    .map(|index| connection.client_inbox.remove(index).pool_charge)
+            }
+        };
+        if let Some(charge) = removed_charge {
+            let account = self.connections[connection_index].pool_account;
+            self.replace_pool_charge(account, charge, 0)
+                .expect("cancelled broker request was previously charged");
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Send a reply only when its client/message identity names a request that this server endpoint
@@ -1503,7 +1603,7 @@ mod tests {
         core.set_accept_policy(AcceptPolicy::Manual);
         let port = core.create_port(&utf16("\\P"), PortApi::Lpc);
         let request = b"client request";
-        let response = b"server response";
+        let response = b"server reply";
         let cid = match core
             .connect(&utf16("\\P"), PortApi::Lpc, 0, request)
             .unwrap()
@@ -1521,6 +1621,26 @@ mod tests {
             core.connection_response_info(cid),
             Some(response.as_slice())
         );
+    }
+
+    #[test]
+    fn accepted_connection_info_cannot_grow_connectors_message() {
+        let mut core = PortCore::new();
+        core.set_accept_policy(AcceptPolicy::Manual);
+        let port = core.create_port(&utf16("\\SmApiPort"), PortApi::Lpc);
+        let cid = match core
+            .connect(&utf16("\\SmApiPort"), PortApi::Lpc, 0, b"four")
+            .unwrap()
+        {
+            ConnectOutcome::Pending { connection_id } => connection_id,
+            _ => unreachable!(),
+        };
+        core.receive(port).unwrap();
+        assert_eq!(
+            core.accept_with_connection_info(cid, true, 0, b"too-long"),
+            Err(NtStatus::BUFFER_TOO_SMALL)
+        );
+        assert_eq!(core.connection_state(cid), Some(ConnState::Received));
     }
 
     #[test]
@@ -1867,6 +1987,71 @@ mod tests {
             core.receive_message(client),
             Err(NtStatus::PORT_DISCONNECTED)
         );
+    }
+
+    #[test]
+    fn synchronous_replies_are_received_and_cancelled_by_exact_identity() {
+        let mut core = PortCore::new();
+        core.set_accept_policy(AcceptPolicy::Manual);
+        let client_id = ClientId {
+            process: 0x120,
+            thread: 0x124,
+        };
+        let listen = core.create_port(&utf16("\\P"), PortApi::Lpc);
+        let connection = match core
+            .connect_with_client_id(&utf16("\\P"), PortApi::Lpc, 0, &[], client_id)
+            .unwrap()
+        {
+            ConnectOutcome::Pending { connection_id } => connection_id,
+            _ => unreachable!(),
+        };
+        core.receive(listen).unwrap();
+        let server = core.accept(connection, true, 0).unwrap();
+        let client = core.complete(connection).unwrap().0;
+        let first = MessageIdentity {
+            client: ClientId {
+                thread: 0x130,
+                ..client_id
+            },
+            message_id: 7,
+        };
+        let second = MessageIdentity {
+            client: ClientId {
+                thread: 0x134,
+                ..client_id
+            },
+            message_id: 8,
+        };
+        core.send_request_message(client, b"first", MessageAttrs::default(), first)
+            .unwrap();
+        core.send_request_message(client, b"second", MessageAttrs::default(), second)
+            .unwrap();
+        assert_eq!(
+            core.receive_message(server).unwrap().unwrap().bytes,
+            b"first"
+        );
+        assert_eq!(
+            core.receive_message(server).unwrap().unwrap().bytes,
+            b"second"
+        );
+        core.send_reply_message(server, b"second-reply", MessageAttrs::default(), second)
+            .unwrap();
+        core.send_reply_message(server, b"first-reply", MessageAttrs::default(), first)
+            .unwrap();
+
+        assert_eq!(
+            core.receive_reply_message(client, first)
+                .unwrap()
+                .unwrap()
+                .bytes,
+            b"first-reply"
+        );
+        assert!(core.cancel_request_message(client, second).unwrap());
+        assert!(core
+            .receive_reply_message(client, second)
+            .unwrap()
+            .is_none());
+        assert!(!core.cancel_request_message(client, second).unwrap());
     }
 
     #[test]

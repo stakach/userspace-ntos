@@ -23,7 +23,7 @@ use nt_lpc_abi::{
     msg_type, opcode, LpcAcceptConnectRequest, LpcCompleteConnectRequest, LpcConnectPortRequest,
     LpcConnectionRequestMetadata, LpcCreatePortRequest, LpcMessageRequest, LpcQueryHandleRequest,
     LpcQueryHandleResponse, LpcQueryRequestRequest, LpcQueryRequestResponse, LpcReceiveRequest,
-    LpcReply, LPC_ACCEPT_RESPONSE_INFO,
+    LpcReply, LpcRequestIdentityRequest, LPC_ACCEPT_RESPONSE_INFO,
 };
 use nt_status::NtStatus;
 
@@ -517,13 +517,104 @@ impl<B: Backend> LpcClient<B> {
         client_process: u64,
         client_thread: u64,
     ) -> Result<Vec<u8>, NtStatus> {
-        self.send_message(
-            opcode::LPC_OP_REQUEST_WAIT_REPLY,
+        self.begin_request_wait_reply_with_client_id(
             port_handle,
             message,
             client_process,
             client_thread,
         )
+        .map(|_| Vec::new())
+    }
+
+    /// Queue one synchronous request and return the broker-authored message id that owns its
+    /// eventual reply. The executive must retain this identity with the blocked syscall.
+    pub fn begin_request_wait_reply_with_client_id(
+        &mut self,
+        port_handle: u64,
+        message: &[u8],
+        client_process: u64,
+        client_thread: u64,
+    ) -> Result<u32, NtStatus> {
+        let header = size_of::<LpcMessageRequest>();
+        let request = LpcMessageRequest {
+            abi_size: header as u16,
+            _reserved: 0,
+            _reserved2: 0,
+            port_handle,
+            msg_offset: header as u32,
+            msg_len_bytes: u32_len(message.len())?,
+            client_process,
+            client_thread,
+        };
+        let buf = pack_bytes::<LPC_MESSAGE_BUF_LEN, _>(&request, message)?;
+        let mut out = [0u8; 512];
+        let reply = self
+            .backend
+            .call(opcode::LPC_OP_REQUEST_WAIT_REPLY, buf.as_slice(), &mut out);
+        if reply.status != NtStatus::PENDING.raw() && reply.status != NtStatus::SUCCESS.raw() {
+            return Err(NtStatus(reply.status));
+        }
+        u32::try_from(reply.detail0)
+            .ok()
+            .filter(|message_id| *message_id != 0)
+            .ok_or(NtStatus::UNSUCCESSFUL)
+    }
+
+    /// Poll one exact synchronous request reply without consuming other traffic on the client
+    /// communication port.
+    pub fn receive_reply(
+        &mut self,
+        port_handle: u64,
+        client_process: u64,
+        client_thread: u64,
+        message_id: u32,
+    ) -> Result<Option<Vec<u8>>, NtStatus> {
+        let request = LpcRequestIdentityRequest {
+            abi_size: size_of::<LpcRequestIdentityRequest>() as u16,
+            _reserved: 0,
+            message_id,
+            port_handle,
+            client_process,
+            client_thread,
+        };
+        let mut out = [0u8; 512];
+        let reply = self.backend.call(
+            opcode::LPC_OP_RECEIVE_REPLY,
+            bytemuck::bytes_of(&request),
+            &mut out,
+        );
+        if reply.status == NtStatus::PENDING.raw() {
+            return Ok(None);
+        }
+        NtStatus(reply.status).to_result()?;
+        Ok(Some(
+            out[..(reply.information as usize).min(out.len())].to_vec(),
+        ))
+    }
+
+    /// Cancel one exact request during continuation rollback or thread teardown.
+    pub fn cancel_request(
+        &mut self,
+        port_handle: u64,
+        client_process: u64,
+        client_thread: u64,
+        message_id: u32,
+    ) -> Result<bool, NtStatus> {
+        let request = LpcRequestIdentityRequest {
+            abi_size: size_of::<LpcRequestIdentityRequest>() as u16,
+            _reserved: 0,
+            message_id,
+            port_handle,
+            client_process,
+            client_thread,
+        };
+        let reply = self.backend.call(
+            opcode::LPC_OP_CANCEL_REQUEST,
+            bytemuck::bytes_of(&request),
+            &mut [],
+        );
+        NtStatus(reply.status).to_result()?;
+        Ok(reply.detail0 != 0)
     }
 
     /// Send an LPC reply without receiving another message.

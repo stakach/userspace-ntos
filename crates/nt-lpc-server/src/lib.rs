@@ -39,7 +39,7 @@ use nt_lpc_abi::{
     LpcCompleteConnectRequest, LpcConnectPortRequest, LpcConnectionRequestMetadata,
     LpcCreatePortRequest, LpcMessageRequest, LpcQueryHandleRequest, LpcQueryHandleResponse,
     LpcQueryRequestRequest, LpcQueryRequestResponse, LpcReceiveRequest, LpcReply,
-    LPC_ACCEPT_RESPONSE_INFO, LPC_QUERY_HANDLE_NAME_MAX_UNITS,
+    LpcRequestIdentityRequest, LPC_ACCEPT_RESPONSE_INFO, LPC_QUERY_HANDLE_NAME_MAX_UNITS,
 };
 use nt_port_core::{
     ClientId, ConnectOutcome, ConnectionSecurity, MessageAttrs, MessageIdentity, PortApi, PortCore,
@@ -150,6 +150,8 @@ impl Server {
             opcode::LPC_OP_REQUEST_PORT => self.op_request_port(in_buf),
             opcode::LPC_OP_QUERY_HANDLE => self.op_query_handle(in_buf, out_buf),
             opcode::LPC_OP_QUERY_REQUEST => self.op_query_request(in_buf, out_buf),
+            opcode::LPC_OP_RECEIVE_REPLY => self.op_receive_reply(in_buf, out_buf),
+            opcode::LPC_OP_CANCEL_REQUEST => self.op_cancel_request(in_buf),
             _ => Err(NtStatus::NOT_IMPLEMENTED),
         }
     }
@@ -349,19 +351,63 @@ impl Server {
         let msg = message_with_request_identity(msg, identity)?;
         self.core
             .send_request_message(req.port_handle, &msg, MessageAttrs::default(), identity)?;
-        match self.core.receive_message(req.port_handle)? {
+        match self.core.receive_reply_message(req.port_handle, identity)? {
             Some(m) => {
                 let n = m.bytes.len().min(out_buf.len());
                 out_buf[..n].copy_from_slice(&m.bytes[..n]);
                 Ok(reply(
                     NtStatus::SUCCESS,
                     n as u32,
-                    0,
+                    identity.message_id as u64,
                     msg_type_of(&m.bytes) as u64,
                 ))
             }
-            None => Ok(reply(NtStatus::PENDING, 0, 0, 0)),
+            None => Ok(reply(NtStatus::PENDING, 0, identity.message_id as u64, 0)),
         }
+    }
+
+    fn op_receive_reply(&mut self, buf: &[u8], out_buf: &mut [u8]) -> Result<LpcReply, NtStatus> {
+        let req: LpcRequestIdentityRequest = read_req(buf)?;
+        let identity = MessageIdentity {
+            client: ClientId {
+                process: req.client_process,
+                thread: req.client_thread,
+            },
+            message_id: req.message_id,
+        };
+        match self.core.receive_reply_message(req.port_handle, identity)? {
+            Some(message) => {
+                let n = message.bytes.len().min(out_buf.len());
+                out_buf[..n].copy_from_slice(&message.bytes[..n]);
+                Ok(reply(
+                    NtStatus::SUCCESS,
+                    n as u32,
+                    identity.message_id as u64,
+                    msg_type_of(&message.bytes) as u64,
+                ))
+            }
+            None => Ok(reply(NtStatus::PENDING, 0, identity.message_id as u64, 0)),
+        }
+    }
+
+    fn op_cancel_request(&mut self, buf: &[u8]) -> Result<LpcReply, NtStatus> {
+        let req: LpcRequestIdentityRequest = read_req(buf)?;
+        let identity = MessageIdentity {
+            client: ClientId {
+                process: req.client_process,
+                thread: req.client_thread,
+            },
+            message_id: req.message_id,
+        };
+        let cancelled = self
+            .core
+            .cancel_request_message(req.port_handle, identity)?;
+        Ok(reply(
+            NtStatus::SUCCESS,
+            0,
+            u64::from(cancelled),
+            identity.message_id as u64,
+        ))
     }
 
     /// `NtReplyPort` — send a message (no receive).
@@ -1193,10 +1239,9 @@ mod tests {
                 out: [0; 512],
             });
             let request_message = port_message(0, b"request");
-            assert!(c
-                .request_wait_reply_with_client_id(client, &request_message, 0x120, 0x124)
-                .unwrap()
-                .is_empty());
+            let queued_message_id = c
+                .begin_request_wait_reply_with_client_id(client, &request_message, 0x120, 0x124)
+                .unwrap();
             let request = c.reply_wait_receive(listen).unwrap();
             assert_eq!(request.msg_type, msg_type::LPC_REQUEST);
             assert_eq!(
@@ -1214,7 +1259,7 @@ mod tests {
             );
             let message_id =
                 u32::from_le_bytes(request.connection_info[24..28].try_into().unwrap());
-            assert_ne!(message_id, 0);
+            assert_eq!(message_id, queued_message_id);
             let query = c.query_request(listen, 0x120, 0x124, message_id).unwrap();
             assert_eq!(query.connection_id, connection);
 
@@ -1228,10 +1273,12 @@ mod tests {
                 c.query_request(listen, 0x120, 0x124, message_id),
                 Err(NtStatus::REPLY_MESSAGE_MISMATCH)
             );
-            let response = c.reply_wait_receive(client).unwrap();
-            assert_eq!(response.msg_type, msg_type::LPC_REPLY);
+            let response = c
+                .receive_reply(client, 0x120, 0x124, message_id)
+                .unwrap()
+                .unwrap();
             assert_eq!(
-                &response.connection_info[nt_lpc_abi::PORT_MESSAGE_HEADER_LEN..],
+                &response[nt_lpc_abi::PORT_MESSAGE_HEADER_LEN..],
                 b"response"
             );
         }

@@ -3115,6 +3115,9 @@ impl ExecNtHandler {
         write_field!(lpc_rendezvous_conn, 0);
         write_field!(lpc_rendezvous_out, 0);
         write_field!(lpc_receive_park, None);
+        write_field!(lpc_connect_park, None);
+        write_field!(lpc_connect_completion, None);
+        write_field!(lpc_request_park, None);
         write_field!(lpc_endpoint_progress, false);
         write_field!(sm_request_port, 0);
         write_field!(sm_request_message, 0);
@@ -8909,7 +8912,12 @@ impl ExecNtHandler {
         if pi >= MAX_PI || slot >= TP_WORKER_SLOT_COUNT {
             return false;
         }
-        if role.worker_window_slot() != Some(slot) {
+        if role
+            .worker_window_slot()
+            .is_some_and(|role_slot| role_slot != slot)
+            || (role.worker_window_slot().is_none()
+                && !matches!(role, HostedThreadRole::CsrSbApi))
+        {
             return false;
         }
         let Some(bit) = Self::tp_worker_slot_bit(slot) else {
@@ -15451,11 +15459,8 @@ impl ExecNtHandler {
             Err(status) => return status,
         };
         if previous == 1 {
-            let csr_role = match self.hosted_thread_role(tid) {
-                Some(HostedThreadRole::CsrApi) => 1,
-                Some(HostedThreadRole::CsrSbApi) => 2,
-                _ => 0,
-            };
+            let csr_role =
+                matches!(self.hosted_thread_role(tid), Some(HostedThreadRole::CsrApi)) as u8;
             if csr_role != 0 {
                 self.csr_start_request = csr_role;
             } else {
@@ -24646,6 +24651,89 @@ impl ExecNtHandler {
         true
     }
 
+    fn discard_lpc_connection_for_pi(&mut self, client_handle: u64, connector_pi: usize) {
+        if let Some(index) = self.lpc_connections.iter().position(|connection| {
+            connection.client_handle == client_handle
+                && connection.connector_pi as usize == connector_pi
+        }) {
+            let connection = self.lpc_connections.swap_remove(index);
+            if let Some(context) = connection.static_security {
+                let _ = self.token_store.release(context.token);
+            }
+        }
+    }
+
+    /// Publish one terminal connect result into the original connector's address space. The caller
+    /// has already selected that process's mirror context and validated the broker connection id.
+    pub(crate) unsafe fn lpc_publish_connect_completion(
+        &mut self,
+        pi: usize,
+        memory: SyscallUserMemory,
+        request: nt_lpc_continuation::ConnectRequest,
+        name: &[u16],
+        completion: &PendingLpcConnectCompletion,
+    ) -> u32 {
+        if completion.status != nt_syscall::STATUS_SUCCESS {
+            return completion.status;
+        }
+        if completion.connection_id != request.connection_id || completion.client_handle == 0 {
+            return STATUS_UNSUCCESSFUL;
+        }
+        if completion.connection_information.len() > request.connection_information_capacity as usize
+            || (request.connection_information == 0
+                && !completion.connection_information.is_empty())
+        {
+            if let Some(client) = lpc_client() {
+                let _ = client.close_port(completion.client_handle);
+            }
+            return nt_status::NtStatus::BUFFER_TOO_SMALL.raw() as u32;
+        }
+        if !self.cache_lpc_connection_for_pi(
+            request.connection_id,
+            completion.client_handle,
+            pi,
+            name,
+        ) {
+            if let Some(client) = lpc_client() {
+                let _ = client.close_port(completion.client_handle);
+            }
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        let mut copyout_ok = true;
+        if request.connection_information != 0 {
+            copyout_ok &= self.lpc_user_memory_write(
+                pi,
+                memory,
+                request.connection_information,
+                &completion.connection_information,
+            );
+            if request.connection_information_length != 0 {
+                copyout_ok &= self.lpc_user_memory_write(
+                    pi,
+                    memory,
+                    request.connection_information_length,
+                    &(completion.connection_information.len() as u32).to_le_bytes(),
+                );
+            }
+        }
+        copyout_ok &= self.lpc_user_memory_write(
+            pi,
+            memory,
+            request.port_handle,
+            &completion.client_handle.to_le_bytes(),
+        );
+        if copyout_ok {
+            nt_syscall::STATUS_SUCCESS
+        } else {
+            self.discard_lpc_connection_for_pi(completion.client_handle, pi);
+            if let Some(client) = lpc_client() {
+                let _ = client.close_port(completion.client_handle);
+            }
+            STATUS_ACCESS_VIOLATION
+        }
+    }
+
     pub(crate) fn lpc_connection_is(
         &mut self,
         handle: u64,
@@ -25187,6 +25275,86 @@ impl ExecNtHandler {
         Ok(())
     }
 
+    pub(crate) unsafe fn lpc_publish_request_reply(
+        &self,
+        pi: usize,
+        memory: SyscallUserMemory,
+        request: nt_lpc_continuation::RequestWaitRequest,
+        reply: &[u8],
+    ) -> u32 {
+        if reply.len() < nt_lpc_abi::PORT_MESSAGE_HEADER_LEN
+            || nt_lpc_abi::port_message_total_length(reply[..4].try_into().unwrap())
+                != Some(reply.len())
+            || u16::from_le_bytes(reply[4..6].try_into().unwrap())
+                != nt_lpc_abi::msg_type::LPC_REPLY
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if self.lpc_user_memory_write(pi, memory, request.reply_message, reply) {
+            nt_syscall::STATUS_SUCCESS
+        } else {
+            STATUS_ACCESS_VIOLATION
+        }
+    }
+
+    unsafe fn lpc_request_wait_or_park(
+        &mut self,
+        port_handle: u64,
+        request_message: u64,
+        reply_message: u64,
+    ) -> u32 {
+        if request_message == 0 || reply_message == 0 {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let message = match self
+            .lpc_capture_port_message(SyscallUserMemory::CurrentProcess, request_message)
+        {
+            Ok(message) => message,
+            Err(status) => return status,
+        };
+        let Some(max_message) = self.lpc_connection_max_message(port_handle, self.pi) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        if message.len() > max_message as usize {
+            return nt_status::NtStatus::PORT_MESSAGE_TOO_LONG.raw() as u32;
+        }
+        let reservation = match crate::service_sec_image::lpc_request_wait_reserve() {
+            Ok(reservation) => reservation,
+            Err(status) => return status,
+        };
+        let client_process = self.pm_pid_for_pi(self.pi).unwrap_or(0) as u64;
+        let client_thread = self.current_tid;
+        let Some(lpc) = lpc_client() else {
+            crate::service_sec_image::lpc_request_wait_cancel_reservation(reservation);
+            return STATUS_UNSUCCESSFUL;
+        };
+        let message_id = match lpc.begin_request_wait_reply_with_client_id(
+            port_handle,
+            &message,
+            client_process,
+            client_thread,
+        ) {
+            Ok(message_id) => message_id,
+            Err(status) => {
+                crate::service_sec_image::lpc_request_wait_cancel_reservation(reservation);
+                return status.raw() as u32;
+            }
+        };
+        self.lpc_request_park = Some(PendingLpcRequestPark {
+            reservation,
+            request: nt_lpc_continuation::RequestWaitRequest {
+                port_handle,
+                reply_message,
+                client_process,
+                client_thread,
+                message_id,
+            },
+            memory: self.current_user_memory,
+        });
+        self.lpc_endpoint_progress = true;
+        STATUS_PENDING
+    }
+
     unsafe fn lpc_receive_or_park(
         &mut self,
         port_handle: u64,
@@ -25415,7 +25583,7 @@ impl ExecNtHandler {
         }
     }
 
-    unsafe fn lpc_user_memory_write(
+    pub(crate) unsafe fn lpc_user_memory_write(
         &self,
         pi: usize,
         memory: SyscallUserMemory,
@@ -30707,15 +30875,27 @@ impl ExecNtHandler {
                             let top_badge = self.hosted_process_top_badge(self.pi).unwrap_or(0);
                             let (role, badge, teb) = match slot {
                                 0 => (HostedThreadRole::CsrApi, top_badge, CSR_TEB_VA),
-                                1 => (HostedThreadRole::CsrSbApi, top_badge, CSR_SB_TEB_VA),
+                                1 => (
+                                    HostedThreadRole::CsrSbApi,
+                                    tp_worker_badge(self.pi, slot),
+                                    tp_worker_teb_va(slot),
+                                ),
                                 _ => {
                                     self.abandon_created_hosted_thread(slot, tid, handle);
                                     return 0xC000_009A;
                                 }
                             };
-                            if !self
-                                .reserve_created_hosted_thread_role(slot, tid, handle, badge, role)
-                            {
+                            let reserved = if slot == 1 {
+                                self.reserve_hosted_worker_window_slot(self.pi, slot, tid, role)
+                            } else {
+                                self.reserve_created_hosted_thread_role(
+                                    slot, tid, handle, badge, role,
+                                )
+                            };
+                            if !reserved {
+                                if slot == 1 {
+                                    self.abandon_created_hosted_thread(slot, tid, handle);
+                                }
                                 return 0xC000_009A;
                             }
                             self.pm.set_thread_teb(tid as nt_process::ThreadId, teb);
@@ -30726,8 +30906,11 @@ impl ExecNtHandler {
                                 self.queue_write(cid_ptr, pid as u64);
                                 self.queue_write(cid_ptr + 8, tid);
                             }
-                            self.thread_spawn_request =
-                                Some(HostedThreadSpawnRequest::Csr { slot });
+                            self.thread_spawn_request = Some(if slot == 1 {
+                                HostedThreadSpawnRequest::TpWorker { pi: self.pi, slot }
+                            } else {
+                                HostedThreadSpawnRequest::Csr { slot }
+                            });
                             print_str(b"[csr-thread] create slot=");
                             print_u64(slot as u64);
                             print_str(b" tid=");
@@ -31059,11 +31242,16 @@ impl ExecNtHandler {
                 if self.current_process_is_smss()
                     && self.lpc_connection_is(args[0], 0, b"\\smapiport")
                 {
-                    self.sm_request_port = args[0];
-                    self.sm_request_message = args[1];
-                    self.sm_reply_message = args[2];
-                    print_str(b"[sm-api] routing SMSS request to real SmpApiLoop\n");
-                    return 0;
+                    print_str(
+                        b"[lpc-request-wait] routing \\SmApiPort through typed continuation\n",
+                    );
+                    return self.lpc_request_wait_or_park(args[0], args[1], args[2]);
+                }
+                if self.current_process_is_smss()
+                    && self.lpc_connection_is(args[0], 0, b"\\windows\\sbapiport")
+                {
+                    print_str(b"[lpc-request-wait] routing \\Windows\\SbApiPort through typed continuation\n");
+                    return self.lpc_request_wait_or_park(args[0], args[1], args[2]);
                 }
                 if self.lpc_connection_is(args[0], self.pi, b"\\windows\\apiport") {
                     if CSR_API_RECEIVE_PARKED.load(Ordering::Relaxed) != 0 {
@@ -31190,6 +31378,16 @@ impl ExecNtHandler {
                         security,
                     );
                 }
+                let use_generic_connect_wait = Self::lpc_name_equals_ascii(&name16, b"\\smapiport")
+                    || Self::lpc_name_equals_ascii(&name16, b"\\windows\\sbapiport");
+                let connect_reservation = if use_generic_connect_wait {
+                    match crate::service_sec_image::lpc_connect_wait_reserve() {
+                        Ok(reservation) => Some(reservation),
+                        Err(status) => return status,
+                    }
+                } else {
+                    None
+                };
                 let client_process = self.pm_pid_for_pi(self.pi).unwrap_or(0) as u64;
                 let client_thread = self.current_tid;
                 match lpc_client().map(|c| {
@@ -31206,6 +31404,11 @@ impl ExecNtHandler {
                 }) {
                     Some(Ok(r)) => {
                         if !r.pending && r.handle != 0 {
+                            if let Some(reservation) = connect_reservation {
+                                crate::service_sec_image::lpc_connect_wait_cancel_reservation(
+                                    reservation,
+                                );
+                            }
                             if connector_view.is_some() || connector_remote_view.is_some() {
                                 if let Some(client) = lpc_client() {
                                     let _ = client.close_port(r.handle);
@@ -31227,18 +31430,41 @@ impl ExecNtHandler {
                                 connector_view,
                                 connector_remote_view,
                             ) {
+                                if let Some(reservation) = connect_reservation {
+                                    crate::service_sec_image::lpc_connect_wait_cancel_reservation(
+                                        reservation,
+                                    );
+                                }
                                 if let Some(client) = lpc_client() {
                                     let _ = client.accept_connect(r.connection_id, false, 0);
                                 }
                                 return status;
                             }
-                            // Manual (path B, authentic): the connection is Pending in the broker.
-                            // Signal the LOOP to drive `sm_rendezvous` (the REAL SmpApiLoop accept)
-                            // synchronously, write the completed client comm-port handle to *PortHandle
-                            // (args[0]=R10), and reply csrss. The loop needs smss's PML4 + the smss
-                            // image/ntdll refs (loop-resident), so it can't run here.
-                            self.lpc_rendezvous_conn = r.connection_id;
-                            self.lpc_rendezvous_out = args[0];
+                            if let Some(reservation) = connect_reservation {
+                                let mut name = [0u16; 32];
+                                let name_len = name16.len().min(name.len());
+                                name[..name_len].copy_from_slice(&name16[..name_len]);
+                                self.lpc_connect_park = Some(PendingLpcConnectPark {
+                                    reservation,
+                                    request: nt_lpc_continuation::ConnectRequest {
+                                        connection_id: r.connection_id,
+                                        port_handle: args[0],
+                                        connection_information: conn_info_ptr,
+                                        connection_information_length: conn_info_len_ptr,
+                                        connection_information_capacity: conn_info_len as u32,
+                                        operation: nt_lpc_continuation::ConnectOperation::Connect,
+                                    },
+                                    memory: self.current_user_memory,
+                                    name,
+                                    name_len: name_len as u8,
+                                });
+                                // A newly queued connection can satisfy a parked generic listen or
+                                // reply/wait/receive immediately. Consume this producer edge once.
+                                self.lpc_endpoint_progress = true;
+                            } else {
+                                self.lpc_rendezvous_conn = r.connection_id;
+                                self.lpc_rendezvous_out = args[0];
+                            }
                             print_str(b"[lpc-connect] pending pi=");
                             print_u64(self.pi as u64);
                             print_str(b" conn=");
@@ -31255,11 +31481,30 @@ impl ExecNtHandler {
                             print_str(b"\n");
                             0 // SUCCESS (the loop overrides with the rendezvous outcome)
                         } else {
+                            if let Some(reservation) = connect_reservation {
+                                crate::service_sec_image::lpc_connect_wait_cancel_reservation(
+                                    reservation,
+                                );
+                            }
                             0x0000_0103 // STATUS_PENDING (broker returned no handle + not pending)
                         }
                     }
-                    Some(Err(st)) => st.raw() as u32, // e.g. OBJECT_NAME_NOT_FOUND
-                    None => 0xC000_0001,              // STATUS_UNSUCCESSFUL (broker absent)
+                    Some(Err(st)) => {
+                        if let Some(reservation) = connect_reservation {
+                            crate::service_sec_image::lpc_connect_wait_cancel_reservation(
+                                reservation,
+                            );
+                        }
+                        st.raw() as u32
+                    }
+                    None => {
+                        if let Some(reservation) = connect_reservation {
+                            crate::service_sec_image::lpc_connect_wait_cancel_reservation(
+                                reservation,
+                            );
+                        }
+                        0xC000_0001
+                    }
                 }
             },
             // NtAcceptConnectPort/NtCompleteConnectPort — the server-side rendezvous. Connection
@@ -31351,6 +31596,15 @@ impl ExecNtHandler {
                             }
                         } else {
                             self.abort_lpc_connection_views(conn_id);
+                            if crate::service_sec_image::lpc_connect_wait_is_pending(conn_id) {
+                                self.lpc_connect_completion = Some(PendingLpcConnectCompletion {
+                                    connection_id: conn_id,
+                                    status: nt_status::NtStatus::PORT_CONNECTION_REFUSED.raw()
+                                        as u32,
+                                    client_handle: 0,
+                                    connection_information: alloc::vec::Vec::new(),
+                                });
+                            }
                         }
                         self.queue_write(args[0], server_handle);
                         0
@@ -31395,6 +31649,14 @@ impl ExecNtHandler {
                             }
                             status
                         } else {
+                            if crate::service_sec_image::lpc_connect_wait_is_pending(connection_id) {
+                                self.lpc_connect_completion = Some(PendingLpcConnectCompletion {
+                                    connection_id,
+                                    status: nt_syscall::STATUS_SUCCESS,
+                                    client_handle: completed.handle,
+                                    connection_information: completed.connection_info,
+                                });
+                            }
                             0
                         }
                     }
