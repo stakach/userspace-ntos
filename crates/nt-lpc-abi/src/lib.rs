@@ -268,6 +268,30 @@ pub fn port_message_total_length(header: [u8; 4]) -> Option<usize> {
     Some(total_length)
 }
 
+/// Validate a native connection-request message supplied to `NtAcceptConnectPort` and return the
+/// broker connection identity plus the exact server-authored connection-information bytes. The
+/// payload excludes any alignment padding between `DataLength` and `TotalLength`.
+pub fn connection_request_response(message: &[u8]) -> Option<(u64, &[u8])> {
+    let header: [u8; 4] = message.get(..4)?.try_into().ok()?;
+    let total_length = port_message_total_length(header)?;
+    if total_length != message.len()
+        || u16::from_le_bytes(message.get(4..6)?.try_into().ok()?)
+            != msg_type::LPC_CONNECTION_REQUEST
+    {
+        return None;
+    }
+    let connection_id = u32::from_le_bytes(message.get(0x18..0x1c)?.try_into().ok()?) as u64;
+    if connection_id == 0 {
+        return None;
+    }
+    let data_length = u16::from_le_bytes(header[..2].try_into().ok()?) as usize;
+    let data_end = PORT_MESSAGE_HEADER_LEN.checked_add(data_length)?;
+    Some((
+        connection_id,
+        message.get(PORT_MESSAGE_HEADER_LEN..data_end)?,
+    ))
+}
+
 /// Build the kernel-generated message sent to every port registered through
 /// `NtRegisterThreadTerminatePort`. The unused `PORT_MESSAGE` identity and callback fields remain
 /// zero, matching `PspExitThread`; the only payload is the terminating thread's creation time.
@@ -584,6 +608,31 @@ mod tests {
     }
 
     #[test]
+    fn connection_response_uses_server_payload_and_excludes_padding() {
+        let mut message = [0u8; PORT_MESSAGE_HEADER_LEN + 12];
+        let total_length = message.len() as u16;
+        message[0..2].copy_from_slice(&8_u16.to_le_bytes());
+        message[2..4].copy_from_slice(&total_length.to_le_bytes());
+        message[4..6].copy_from_slice(&msg_type::LPC_CONNECTION_REQUEST.to_le_bytes());
+        message[0x18..0x1c].copy_from_slice(&0x1234_u32.to_le_bytes());
+        message[PORT_MESSAGE_HEADER_LEN..PORT_MESSAGE_HEADER_LEN + 8]
+            .copy_from_slice(b"response");
+        message[PORT_MESSAGE_HEADER_LEN + 8..].fill(0xcc);
+
+        assert_eq!(
+            connection_request_response(&message),
+            Some((0x1234, &b"response"[..]))
+        );
+
+        message[4..6].copy_from_slice(&msg_type::LPC_REQUEST.to_le_bytes());
+        assert_eq!(connection_request_response(&message), None);
+        message[4..6].copy_from_slice(&msg_type::LPC_CONNECTION_REQUEST.to_le_bytes());
+        message[0x18..0x1c].fill(0);
+        assert_eq!(connection_request_response(&message), None);
+        assert_eq!(connection_request_response(&message[..message.len() - 1]), None);
+    }
+
+    #[test]
     fn client_died_message_has_native_header_and_create_time() {
         let create_time = 0x0123_4567_89ab_cdef_i64;
         let message = client_died_message(create_time);
@@ -734,6 +783,6 @@ mod tests {
 
     #[test]
     fn version_is_current() {
-        assert_eq!(LPC_ABI_VERSION, 5);
+        assert_eq!(LPC_ABI_VERSION, 6);
     }
 }

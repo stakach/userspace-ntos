@@ -16218,3 +16218,41 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     real authentication-port server semantics while replacing its numeric continuation state. Only
     after those two ports are accepted should `Port.reply_connection` be replaced with explicit
     datagram/ALPC connection provenance.
+
+    Typed CSR ApiPort continuation and private-transport deletion (2026-08-29, accepted):
+    `NtSecureConnectPort` now uses the same durable typed connect continuation as ordinary LPC
+    connects. Established `\Windows\ApiPort` requests use the broker-authored message id and the
+    common synchronous request-wait continuation. The real `CsrApiRequestThread` and
+    `CsrSbApiRequestThread` both run in the growable hosted-worker window, while per-worker runtime
+    state carries the exact client-process provenance of the received LPC request. Reply routing no
+    longer depends on a CSR-only side table.
+
+    Generic accept processing now preserves the server-authored native connection-information
+    payload. The LPC ABI validates the returned connection request and separates that payload from
+    native message padding before the broker completes the exact pending connection. This restores
+    the real CSRSS-published shared-data pointers consumed by ntdll and keeps PEB publication in the
+    client runtime where it belongs. ApiPort proof classification is derived from the broker's
+    completed client handle rather than executable-name spelling, and object-name comparison follows
+    the NT case-insensitive lookup contract.
+
+    The private CSR request/connect/start scalar handoffs, dedicated endpoint and reply object,
+    private stack/TEB/environment/fill policy, private dynamic-worker scheduler, hosted-server memory
+    branches, and duplicate rendezvous loops are deleted. The change removes over 3,000 lines while
+    retaining exact cancellation and fail-closed continuation behavior. Focused host validation
+    passes `nt-lpc-abi` at `8/8`, `nt-lpc-continuation` at `10/10`, `nt-port-core` at `17/17`, and
+    `nt-lpc-server` at `16/16`; the staged freestanding executive builds with 209 warnings.
+
+    Serialized acceptance `.tmp/run-headless-lpc-csr-typed-accepted-20260829.log` reaches genuine
+    userinit and Explorer launch and completes all `295/295` gates. CSR records 78 real replies and
+    one delivered kernel message with no kernel-message failure. Explorer completes 668 api0
+    redirects with zero callback or dead-callback failures, paint begin/end reaches `5/20` with 187
+    direct GDI returns and 135 batch flushes covering 184 records, and the framebuffer holds
+    `480000/480000` non-background pixels with at least 32 colours. The sentinel matches.
+
+    Review adjustment: `\Windows\ApiPort` conversion and old-transport deletion are closed. The next
+    active slice is LSA: retain the real authentication-port server and authentication semantics,
+    but replace `lsa_connect_conn`, `lsa_connect_out`, `LSA_PENDING_CONN`, and
+    `LSA_COMPLETE_PENDING` with the typed connect continuation and generic completion redrive, then
+    delete the superseded numeric scheduling and routing state in the same accepted change. After
+    LSA is closed, replace `Port.reply_connection` with explicit connection provenance for the
+    remaining datagram/ALPC routing and delete that last implicit broker cursor.

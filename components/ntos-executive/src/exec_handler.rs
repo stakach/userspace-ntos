@@ -3119,14 +3119,6 @@ impl ExecNtHandler {
         write_field!(lpc_connect_completion, None);
         write_field!(lpc_request_park, None);
         write_field!(lpc_endpoint_progress, false);
-        write_field!(csr_request_port, 0);
-        write_field!(csr_request_message, 0);
-        write_field!(csr_reply_message, 0);
-        write_field!(csr_start_request, 0);
-        write_field!(csr_rendezvous_conn, 0);
-        write_field!(csr_rendezvous_out, 0);
-        write_field!(csr_rendezvous_conn_info, 0);
-        write_field!(csr_rendezvous_conn_info_len, 0);
         write_field!(lpc_connection_views, alloc::vec::Vec::with_capacity(32));
         write_field!(lpc_connections, alloc::vec::Vec::with_capacity(16));
         write_field!(pm, pm);
@@ -8635,6 +8627,21 @@ impl ExecNtHandler {
             .map(|runtime| runtime.role)
     }
 
+    pub(crate) fn hosted_thread_lpc_client_process(&self, badge: u64) -> u32 {
+        self.thread_runtime
+            .get_by_badge(badge)
+            .map(|runtime| runtime.lpc_client_process)
+            .unwrap_or(0)
+    }
+
+    fn set_current_thread_lpc_client_process(&mut self, process: u64) {
+        let process = u32::try_from(process).unwrap_or(0);
+        let _ = self
+            .thread_runtime
+            .set_lpc_client_process(self.current_badge, process);
+        self.current_server_client_pid = process;
+    }
+
     pub(crate) fn hosted_thread_teb_for_badge(&self, badge: u64) -> Option<u64> {
         let runtime = self.thread_runtime.get_by_badge(badge)?;
         self.pm
@@ -8778,17 +8785,6 @@ impl ExecNtHandler {
         (runtime.tid != 0 && runtime.tcb > 1).then_some((runtime.tid, runtime.tcb, runtime.badge))
     }
 
-    pub(crate) fn hosted_thread_teb_alias_for_role(
-        &self,
-        pi: usize,
-        role: HostedThreadRole,
-    ) -> Option<u64> {
-        self.thread_runtime
-            .get_by_role(pi, role)
-            .map(|runtime| runtime.teb_alias)
-            .filter(|&teb_alias| teb_alias != 0)
-    }
-
     pub(crate) fn hosted_thread_tid_for_role(
         &self,
         pi: usize,
@@ -8911,9 +8907,7 @@ impl ExecNtHandler {
         }
         if role
             .worker_window_slot()
-            .is_some_and(|role_slot| role_slot != slot)
-            || (role.worker_window_slot().is_none()
-                && !matches!(role, HostedThreadRole::CsrSbApi))
+            .is_none_or(|role_slot| role_slot != slot)
         {
             return false;
         }
@@ -9195,20 +9189,6 @@ impl ExecNtHandler {
     }
 
     fn current_process_uses_pe_backed_registry_strings(&self) -> bool {
-        matches!(
-            self.current_hosted_process_role(),
-            Some(
-                nt_exe_image::HostedProcessRole::InteractiveLogon
-                    | nt_exe_image::HostedProcessRole::ServiceControlManager
-                    | nt_exe_image::HostedProcessRole::LocalSecurityAuthority
-                    | nt_exe_image::HostedProcessRole::NonInteractiveService
-                    | nt_exe_image::HostedProcessRole::InteractiveShellBootstrap
-                    | nt_exe_image::HostedProcessRole::InteractiveShell
-            )
-        )
-    }
-
-    fn current_process_uses_csr_client_connect(&self) -> bool {
         matches!(
             self.current_hosted_process_role(),
             Some(
@@ -15150,12 +15130,10 @@ impl ExecNtHandler {
         &self,
         handle: nt_process::Handle,
     ) -> Option<nt_process::ProcessId> {
-        let client_pid = if self.current_server_client_pid != 0 {
-            self.current_server_client_pid
-        } else {
-            let client_pi = csr_dynamic_client_pi_for_worker_badge(self.current_badge)?;
-            self.pm_pid_for_pi(client_pi)?
-        };
+        let client_pid = self.current_server_client_pid;
+        if client_pid == 0 {
+            return None;
+        }
         self.pm
             .lookup_handle(client_pid, handle)
             .is_some()
@@ -15231,18 +15209,12 @@ impl ExecNtHandler {
     unsafe fn user_memory_read(&self, memory: SyscallUserMemory, va: u64, dst: &mut [u8]) -> bool {
         match memory {
             SyscallUserMemory::CurrentProcess => self.xas_read(va, dst),
-            SyscallUserMemory::CsrProcess => {
-                self.hosted_server_memory_read(memory, va, dst)
-            }
         }
     }
 
     unsafe fn user_memory_write(&self, memory: SyscallUserMemory, va: u64, src: &[u8]) -> bool {
         match memory {
             SyscallUserMemory::CurrentProcess => self.xas_try_write_buf(va, src),
-            SyscallUserMemory::CsrProcess => {
-                self.hosted_server_memory_write(memory, va, src)
-            }
         }
     }
 
@@ -15254,163 +15226,7 @@ impl ExecNtHandler {
     ) -> bool {
         match memory {
             SyscallUserMemory::CurrentProcess => self.probe_user_output(va, len),
-            SyscallUserMemory::CsrProcess => {
-                self.hosted_server_memory_probe_output(memory, va, len)
-            }
         }
-    }
-
-    fn hosted_server_memory_pi(memory: SyscallUserMemory) -> Option<usize> {
-        match memory {
-            SyscallUserMemory::CurrentProcess => None,
-            SyscallUserMemory::CsrProcess => Some(1),
-        }
-    }
-
-    unsafe fn hosted_server_stack_copyin(
-        memory: SyscallUserMemory,
-        va: u64,
-        dst: &mut [u8],
-    ) -> bool {
-        match memory {
-            SyscallUserMemory::CurrentProcess => false,
-            SyscallUserMemory::CsrProcess => csr_thread_stack_copyin(va, dst),
-        }
-    }
-
-    unsafe fn hosted_server_stack_copyout(memory: SyscallUserMemory, va: u64, src: &[u8]) -> bool {
-        match memory {
-            SyscallUserMemory::CurrentProcess => false,
-            SyscallUserMemory::CsrProcess => csr_thread_stack_copyout(va, src),
-        }
-    }
-
-    fn hosted_server_stack_has_range(memory: SyscallUserMemory, va: u64, len: usize) -> bool {
-        match memory {
-            SyscallUserMemory::CurrentProcess => false,
-            SyscallUserMemory::CsrProcess => csr_thread_stack_has_range(va, len),
-        }
-    }
-
-    unsafe fn hosted_server_memory_read(
-        &self,
-        memory: SyscallUserMemory,
-        va: u64,
-        dst: &mut [u8],
-    ) -> bool {
-        if Self::hosted_server_stack_copyin(memory, va, dst) {
-            return true;
-        }
-        let Some(pi) = Self::hosted_server_memory_pi(memory) else {
-            return false;
-        };
-        let Some(ctx) = self.loop_ctx else {
-            return false;
-        };
-        let procs = &*ctx.procs;
-        let filled = &*ctx.pfilled;
-        client_copyin_process_mapped(
-            pi as u64,
-            va,
-            dst,
-            &filled[pi],
-            procs[pi].faults as usize,
-            procs[pi].scratch_base,
-            false,
-        )
-    }
-
-    unsafe fn hosted_server_memory_write(
-        &self,
-        memory: SyscallUserMemory,
-        va: u64,
-        src: &[u8],
-    ) -> bool {
-        if Self::hosted_server_stack_copyout(memory, va, src) {
-            return true;
-        }
-        let Some(pi) = Self::hosted_server_memory_pi(memory) else {
-            return false;
-        };
-        let Some(ctx) = self.loop_ctx else {
-            return false;
-        };
-        let procs = &*ctx.procs;
-        let filled = &*ctx.pfilled;
-        client_copyout_mapped(
-            pi as u64,
-            va,
-            src,
-            &filled[pi],
-            procs[pi].faults as usize,
-            procs[pi].scratch_base,
-        )
-    }
-
-    unsafe fn hosted_server_memory_probe_output(
-        &self,
-        memory: SyscallUserMemory,
-        va: u64,
-        len: usize,
-    ) -> bool {
-        if Self::hosted_server_stack_has_range(memory, va, len) {
-            return true;
-        }
-        if len == 0 {
-            return true;
-        }
-        let Some(pi) = Self::hosted_server_memory_pi(memory) else {
-            return false;
-        };
-        let Some(ctx) = self.loop_ctx else {
-            return false;
-        };
-        let Some(chunks) = nt_address_space::page_chunks(va, len) else {
-            return false;
-        };
-        let procs = &*ctx.procs;
-        for chunk in chunks {
-            let Some(info) =
-                process_committed_mapping_basic_information(pi as u64, chunk.page_base)
-            else {
-                return false;
-            };
-            let writable = match info.type_ {
-                nt_address_space::MEM_IMAGE => nt_address_space::image_view_fault_access_status(
-                    info.protect,
-                    nt_address_space::FaultAccess::Write,
-                )
-                .is_ok(),
-                nt_address_space::MEM_MAPPED => nt_address_space::mapped_view_fault_access_status(
-                    info.protect,
-                    nt_address_space::FaultAccess::Write,
-                )
-                .is_ok(),
-                _ => false,
-            };
-            if !writable || csrss_frame_get_exact(pi as u64, chunk.page_base).0 == 0 {
-                return false;
-            }
-        }
-        let filled = &*ctx.pfilled;
-        let mut probe = [0u8; 64];
-        let mut copied = 0usize;
-        while copied < len {
-            let part = (len - copied).min(probe.len());
-            if !client_copyin_process_mapped(
-                pi as u64,
-                va + copied as u64,
-                &mut probe[..part],
-                &filled[pi],
-                procs[pi].faults as usize,
-                procs[pi].scratch_base,
-                false,
-            ) {
-                return false;
-            }
-            copied += part;
-        }
-        true
     }
 
     pub(crate) unsafe fn nt_resume_thread_with_user_memory(
@@ -15452,16 +15268,10 @@ impl ExecNtHandler {
             Err(status) => return status,
         };
         if previous == 1 {
-            let csr_role =
-                matches!(self.hosted_thread_role(tid), Some(HostedThreadRole::CsrApi)) as u8;
-            if csr_role != 0 {
-                self.csr_start_request = csr_role;
-            } else {
-                let tcb = self.hosted_thread_tcb(tid).unwrap_or(0);
-                if tcb <= 1 || tcb_resume(tcb) != 0 {
-                    let _ = self.pm.suspend_thread(tid as nt_process::ThreadId);
-                    return STATUS_UNSUCCESSFUL;
-                }
+            let tcb = self.hosted_thread_tcb(tid).unwrap_or(0);
+            if tcb <= 1 || tcb_resume(tcb) != 0 {
+                let _ = self.pm.suspend_thread(tid as nt_process::ThreadId);
+                return STATUS_UNSUCCESSFUL;
             }
         }
         print_str(b"[thread-life] resume tid=");
@@ -20083,9 +19893,6 @@ impl ExecNtHandler {
     /// frame table — but its bytes are exactly the (relocation-free) `.rdata` file content, which we
     /// read via the loaded PE. Handles a read that spans a page boundary.
     pub(crate) unsafe fn xas_read(&self, va: u64, dst: &mut [u8]) -> bool {
-        if !matches!(self.current_user_memory, SyscallUserMemory::CurrentProcess) {
-            return self.hosted_server_memory_read(self.current_user_memory, va, dst);
-        }
         if va.checked_add(dst.len() as u64).is_none() {
             return false;
         }
@@ -20245,13 +20052,6 @@ impl ExecNtHandler {
     /// [`client_copyout_or_fill_mapped`] (mirror → backed page alias → demand-fill from the DLL PE).
     /// No-op if there is no loop context. Used for hosted-process NtOpenKey handle copyout.
     pub(crate) unsafe fn xas_write_u64(&self, va: u64, val: u64) -> bool {
-        if !matches!(self.current_user_memory, SyscallUserMemory::CurrentProcess) {
-            return self.hosted_server_memory_write(
-                self.current_user_memory,
-                va,
-                &val.to_le_bytes(),
-            );
-        }
         if let Some(ctx) = self.loop_ctx {
             if !self.promote_current_image_cow_for_write(va, 8) {
                 return false;
@@ -20301,13 +20101,6 @@ impl ExecNtHandler {
 
     /// Cross-address-space DWORD copyout without imposing 8-byte alignment on the user pointer.
     pub(crate) unsafe fn xas_write_u32(&self, va: u64, val: u32) -> bool {
-        if !matches!(self.current_user_memory, SyscallUserMemory::CurrentProcess) {
-            return self.hosted_server_memory_write(
-                self.current_user_memory,
-                va,
-                &val.to_le_bytes(),
-            );
-        }
         if let Some(ctx) = self.loop_ctx {
             if !self.promote_current_image_cow_for_write(va, 4) {
                 return false;
@@ -20362,9 +20155,6 @@ impl ExecNtHandler {
 
     /// Probe an arbitrary user output range without changing its contents.
     pub(crate) unsafe fn probe_user_output(&self, va: u64, len: usize) -> bool {
-        if !matches!(self.current_user_memory, SyscallUserMemory::CurrentProcess) {
-            return self.hosted_server_memory_probe_output(self.current_user_memory, va, len);
-        }
         if len == 0 {
             return true;
         }
@@ -21023,9 +20813,6 @@ impl ExecNtHandler {
     }
 
     pub(crate) unsafe fn xas_try_write_buf(&self, va: u64, src: &[u8]) -> bool {
-        if !matches!(self.current_user_memory, SyscallUserMemory::CurrentProcess) {
-            return self.hosted_server_memory_write(self.current_user_memory, va, src);
-        }
         if let Some(ctx) = self
             .loop_ctx
             .as_ref()
@@ -24672,7 +24459,8 @@ impl ExecNtHandler {
         if completion.connection_id != request.connection_id || completion.client_handle == 0 {
             return STATUS_UNSUCCESSFUL;
         }
-        if completion.connection_information.len() > request.connection_information_capacity as usize
+        if completion.connection_information.len()
+            > request.connection_information_capacity as usize
             || (request.connection_information == 0
                 && !completion.connection_information.is_empty())
         {
@@ -25213,7 +25001,7 @@ impl ExecNtHandler {
     }
 
     pub(crate) unsafe fn lpc_publish_received_message(
-        &self,
+        &mut self,
         pi: usize,
         memory: SyscallUserMemory,
         request: nt_lpc_continuation::ReceiveRequest,
@@ -25263,6 +25051,25 @@ impl ExecNtHandler {
             if !self.lpc_user_memory_write(pi, memory, request.port_context, &context.to_le_bytes())
             {
                 return Err(STATUS_ACCESS_VIOLATION);
+            }
+        }
+        self.set_current_thread_lpc_client_process(
+            (received.msg_type == nt_lpc_abi::msg_type::LPC_REQUEST)
+                .then_some(received.client_process)
+                .unwrap_or(0),
+        );
+        let is_csr_api_port = lpc_client()
+            .and_then(|lpc| lpc.query_handle(request.port_handle).ok())
+            .is_some_and(|port| lpc_name_is(&port.name, b"\\windows\\apiport"));
+        if is_csr_api_port {
+            CSR_MSGS.fetch_add(1, Ordering::Relaxed);
+            if received.msg_type == nt_lpc_abi::msg_type::LPC_CLIENT_DIED {
+                let _ = CSR_KERNEL_MESSAGES_PENDING.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |pending| Some(pending.saturating_sub(1)),
+                );
+                CSR_KERNEL_MESSAGES_DELIVERED.fetch_add(1, Ordering::Relaxed);
             }
         }
         Ok(())
@@ -25399,6 +25206,9 @@ impl ExecNtHandler {
             }
             Err(status) if status.raw() as u32 == STATUS_PENDING => {
                 self.lpc_endpoint_progress |= !reply.is_empty();
+                if !reply.is_empty() {
+                    self.set_current_thread_lpc_client_process(0);
+                }
                 self.lpc_receive_park = Some(PendingLpcReceivePark {
                     reservation,
                     request,
@@ -25413,20 +25223,17 @@ impl ExecNtHandler {
         }
     }
 
-    unsafe fn lpc_connection_id_from_port_message(&self, message: u64) -> Result<u64, u32> {
+    unsafe fn lpc_capture_connection_response(
+        &self,
+        message: u64,
+    ) -> Result<(u64, alloc::vec::Vec<u8>), u32> {
         if message == 0 {
             return Err(STATUS_ACCESS_VIOLATION);
         }
-        let mut bytes = [0u8; 4];
-        if !self.xas_read(message + 0x18, &mut bytes) {
-            return Err(STATUS_ACCESS_VIOLATION);
-        }
-        let id = u32::from_le_bytes(bytes) as u64;
-        if id == 0 {
-            Err(STATUS_INVALID_PARAMETER)
-        } else {
-            Ok(id)
-        }
+        let message = self.lpc_capture_port_message(self.current_user_memory, message)?;
+        let (connection_id, response) =
+            nt_lpc_abi::connection_request_response(&message).ok_or(STATUS_INVALID_PARAMETER)?;
+        Ok((connection_id, response.to_vec()))
     }
 
     unsafe fn map_generic_section_view_internal(
@@ -25552,9 +25359,6 @@ impl ExecNtHandler {
         dst: &mut [u8],
     ) -> bool {
         match memory {
-            SyscallUserMemory::CsrProcess => {
-                self.hosted_server_memory_read(memory, va, dst)
-            }
             SyscallUserMemory::CurrentProcess if pi == self.pi => self.xas_read(va, dst),
             SyscallUserMemory::CurrentProcess => {
                 let Some(ctx) = self.loop_ctx else {
@@ -25584,9 +25388,6 @@ impl ExecNtHandler {
         src: &[u8],
     ) -> bool {
         match memory {
-            SyscallUserMemory::CsrProcess => {
-                self.hosted_server_memory_write(memory, va, src)
-            }
             SyscallUserMemory::CurrentProcess if pi == self.pi => self.xas_try_write_buf(va, src),
             SyscallUserMemory::CurrentProcess => {
                 let Some(ctx) = self.loop_ctx else {
@@ -26039,15 +25840,9 @@ impl ExecNtHandler {
         ))
     }
 
-    /// Service a Win32 process' kernel32 CSR client connect (NtSecureConnectPort → \Windows\ApiPort).
-    ///
-    /// csrss owns \Windows\ApiPort and pending connects are completed by the real
-    /// CsrApiRequestThread rendezvous. The broker returns the connection information authored by
-    /// that worker; the executive only retains the still-outstanding LPC client-view mapping.
-    /// The client supplies a typed anonymous section in `PORT_VIEW`; accept maps it into both client
-    /// and CSRSS. CSRSS separately maps and reports its shared read-only section through the returned
-    /// `CSR_API_CONNECTINFO`. No address or server identity is manufactured here.
-    pub(crate) unsafe fn csr_client_connect(
+    /// Begin a secure LPC connection and retain the complete native continuation until the named
+    /// port's real server accepts or refuses the broker-authored connection request.
+    pub(crate) unsafe fn secure_lpc_client_connect(
         &mut self,
         name16: &[u16],
         porthandle_ptr: u64,
@@ -26059,19 +25854,7 @@ impl ExecNtHandler {
         conninfo_ptr: u64,
         conninfo_len_ptr: u64,
     ) -> u32 {
-        // (1) Connect through the broker (Pending under Manual). Authentic accept mirrors the SM path:
-        // record the pending connection id + caller *PortHandle so the loop drives `csr_rendezvous`.
-        // csrss's real CsrApiRequestThread must issue NtReplyWaitReceivePort →
-        // CsrApiHandleConnectionRequest → NtAcceptConnectPort → NtCompleteConnectPort. Synchronous
-        // broker handles and locally minted handles bypass that server boundary and are rejected.
-        if !self.current_process_uses_csr_client_connect() {
-            print_str(b"[csr] NtSecureConnectPort(\\Windows\\ApiPort) from non-CSR client role -> failing\n");
-            CSR_RENDEZVOUS_FAILURES.fetch_add(1, Ordering::Relaxed);
-            return 0xC000_0001;
-        }
         let Some(listen_handle) = self.lpc_port_handle_for_name16(name16) else {
-            print_str(b"[csr] NtSecureConnectPort(\\Windows\\ApiPort) has no named port object -> failing\n");
-            CSR_RENDEZVOUS_FAILURES.fetch_add(1, Ordering::Relaxed);
             return 0xC000_0034;
         };
         let (security, max_message_length) = match self.validate_secure_lpc_connect(
@@ -26117,11 +25900,14 @@ impl ExecNtHandler {
                 return STATUS_ACCESS_VIOLATION;
             }
         }
-        let mut pending = false;
+        let reservation = match crate::service_sec_image::lpc_connect_wait_reserve() {
+            Ok(reservation) => reservation,
+            Err(status) => return status,
+        };
         let client_process = self.pm_pid_for_pi(self.pi).unwrap_or(0) as u64;
         let client_thread = self.current_tid;
-        if let Some(c) = lpc_client() {
-            match c.connect_port_with_client_security(
+        let result = lpc_client().map(|client| {
+            client.connect_port_with_client_security(
                 name16,
                 2,
                 &connection_info,
@@ -26130,63 +25916,76 @@ impl ExecNtHandler {
                 security.impersonation_level,
                 security.dynamic_tracking,
                 security.effective_only,
-            ) {
-                Ok(r) if r.pending && r.connection_id != 0 => {
-                    if let Err(status) = self.stage_lpc_connection_views(
-                        r.connection_id,
-                        self.pi,
-                        self.current_user_memory,
-                        connector_view,
-                        connector_remote_view,
-                    ) {
-                        if let Some(client) = lpc_client() {
-                            let _ = client.accept_connect(r.connection_id, false, 0);
-                        }
-                        return status;
+            )
+        });
+        match result {
+            Some(Ok(result)) if result.pending && result.connection_id != 0 => {
+                if let Err(status) = self.stage_lpc_connection_views(
+                    result.connection_id,
+                    self.pi,
+                    self.current_user_memory,
+                    connector_view,
+                    connector_remote_view,
+                ) {
+                    crate::service_sec_image::lpc_connect_wait_cancel_reservation(reservation);
+                    if let Some(client) = lpc_client() {
+                        let _ = client.accept_connect(result.connection_id, false, 0);
                     }
-                    self.csr_rendezvous_conn = r.connection_id;
-                    self.csr_rendezvous_out = porthandle_ptr;
-                    self.csr_rendezvous_conn_info = conninfo_ptr;
-                    self.csr_rendezvous_conn_info_len = conninfo_len_ptr;
-                    pending = true;
+                    return status;
                 }
-                Ok(r) => {
-                    print_str(b"[csr] broker returned non-pending ApiPort connect; handle=0x");
-                    print_hex((r.handle >> 32) as u32);
-                    print_hex(r.handle as u32);
-                    print_str(b" conn=");
-                    print_u64(r.connection_id);
-                    print_str(b" -> failing, CSR accept must be real\n");
+                let mut name = [0u16; 32];
+                let name_len = name16.len().min(name.len());
+                name[..name_len].copy_from_slice(&name16[..name_len]);
+                self.lpc_connect_park = Some(PendingLpcConnectPark {
+                    reservation,
+                    request: nt_lpc_continuation::ConnectRequest {
+                        connection_id: result.connection_id,
+                        port_handle: porthandle_ptr,
+                        connection_information: conninfo_ptr,
+                        connection_information_length: conninfo_len_ptr,
+                        connection_information_capacity: connection_info.len() as u32,
+                        operation: nt_lpc_continuation::ConnectOperation::SecureConnect,
+                    },
+                    memory: self.current_user_memory,
+                    name,
+                    name_len: name_len as u8,
+                });
+                self.lpc_endpoint_progress = true;
+                print_str(b"[lpc-secure-connect] pending pi=");
+                print_u64(self.pi as u64);
+                print_str(b" conn=");
+                print_u64(result.connection_id);
+                print_str(b"\n");
+                STATUS_PENDING
+            }
+            Some(Ok(result)) if result.handle != 0 => {
+                crate::service_sec_image::lpc_connect_wait_cancel_reservation(reservation);
+                if connector_view.is_some() || connector_remote_view.is_some() {
+                    if let Some(client) = lpc_client() {
+                        let _ = client.close_port(result.handle);
+                    }
+                    return STATUS_INVALID_PARAMETER;
                 }
-                Err(_) => {
-                    print_str(
-                        b"[csr] broker failed NtSecureConnectPort(\\Windows\\ApiPort) -> failing\n",
-                    );
+                if self.cache_lpc_connection(result.connection_id, result.handle, name16) {
+                    self.queue_write(porthandle_ptr, result.handle);
+                    nt_syscall::STATUS_SUCCESS
+                } else {
+                    STATUS_UNSUCCESSFUL
                 }
             }
-        } else {
-            print_str(b"[csr] LPC broker unavailable for NtSecureConnectPort(\\Windows\\ApiPort) -> failing\n");
+            Some(Ok(_)) => {
+                crate::service_sec_image::lpc_connect_wait_cancel_reservation(reservation);
+                STATUS_PENDING
+            }
+            Some(Err(status)) => {
+                crate::service_sec_image::lpc_connect_wait_cancel_reservation(reservation);
+                status.raw() as u32
+            }
+            None => {
+                crate::service_sec_image::lpc_connect_wait_cancel_reservation(reservation);
+                STATUS_UNSUCCESSFUL
+            }
         }
-        if !pending {
-            CSR_RENDEZVOUS_FAILURES.fetch_add(1, Ordering::Relaxed);
-            return 0xC000_0001;
-        }
-        // *PortHandle = &CsrApiPort (an ntdll .data global). The loop writes the real client
-        // communication-port handle after `csr_rendezvous` completes the pending connection.
-        print_str(b"[csr] pi=");
-        print_u64(self.pi as u64);
-        print_str(
-            b" NtSecureConnectPort(\\Windows\\ApiPort) -> queued REAL CsrApiRequestThread accept; conn=",
-        );
-        print_u64(self.csr_rendezvous_conn);
-        print_str(b" connector-view=");
-        print_u64(connector_view.is_some() as u64);
-        print_str(b" remote-view=");
-        print_u64(connector_remote_view.is_some() as u64);
-        print_str(b" view-size=0x");
-        print_hex(connector_view.map(|view| view.view_size).unwrap_or(0) as u32);
-        print_str(b"\n");
-        0
     }
     /// Lowercase-ASCII a UTF-16 name into a fixed buffer (object names are case-insensitive);
     /// returns the filled length. Non-ASCII code units are truncated to their low byte.
@@ -30865,30 +30664,18 @@ impl ExecNtHandler {
                             create_suspended,
                             nt_ulong_arg(args[1]),
                         ) {
-                            let top_badge = self.hosted_process_top_badge(self.pi).unwrap_or(0);
-                            let (role, badge, teb) = match slot {
-                                0 => (HostedThreadRole::CsrApi, top_badge, CSR_TEB_VA),
-                                1 => (
-                                    HostedThreadRole::CsrSbApi,
-                                    tp_worker_badge(self.pi, slot),
-                                    tp_worker_teb_va(slot),
-                                ),
+                            let (role, teb) = match slot {
+                                0 => (HostedThreadRole::CsrApi, tp_worker_teb_va(slot)),
+                                1 => (HostedThreadRole::CsrSbApi, tp_worker_teb_va(slot)),
                                 _ => {
                                     self.abandon_created_hosted_thread(slot, tid, handle);
                                     return 0xC000_009A;
                                 }
                             };
-                            let reserved = if slot == 1 {
-                                self.reserve_hosted_worker_window_slot(self.pi, slot, tid, role)
-                            } else {
-                                self.reserve_created_hosted_thread_role(
-                                    slot, tid, handle, badge, role,
-                                )
-                            };
+                            let reserved =
+                                self.reserve_hosted_worker_window_slot(self.pi, slot, tid, role);
                             if !reserved {
-                                if slot == 1 {
-                                    self.abandon_created_hosted_thread(slot, tid, handle);
-                                }
+                                self.abandon_created_hosted_thread(slot, tid, handle);
                                 return 0xC000_009A;
                             }
                             self.pm.set_thread_teb(tid as nt_process::ThreadId, teb);
@@ -30899,11 +30686,8 @@ impl ExecNtHandler {
                                 self.queue_write(cid_ptr, pid as u64);
                                 self.queue_write(cid_ptr + 8, tid);
                             }
-                            self.thread_spawn_request = Some(if slot == 1 {
-                                HostedThreadSpawnRequest::TpWorker { pi: self.pi, slot }
-                            } else {
-                                HostedThreadSpawnRequest::CsrApi
-                            });
+                            self.thread_spawn_request =
+                                Some(HostedThreadSpawnRequest::TpWorker { pi: self.pi, slot });
                             print_str(b"[csr-thread] create slot=");
                             print_u64(slot as u64);
                             print_str(b" tid=");
@@ -31155,13 +30939,9 @@ impl ExecNtHandler {
                 // the failure to STATUS_INVALID_HANDLE while corrupting their control flow.
                 0xC000_009A // STATUS_INSUFFICIENT_RESOURCES
             }
-            // NtSecureConnectPort — the CSR client connect (kernel32's CsrClientConnectToServer →
-            // \Windows\ApiPort, from each Win32 client's BaseDllInitialize). The SECURE variant (SecurityQos +
-            // ServerSid) is CSR-only in this system: SmConnectToSm uses plain NtConnectPort(33), so 218
-            // unambiguously means "a Win32 client connecting to CSR". A client's pending broker
-            // connect is completed by the real CsrApiRequestThread rendezvous; the kernel maps the
-            // client-supplied PORT_VIEW section, while the broker returns CSRSS's exact connection
-            // information mutation.
+            // NtSecureConnectPort shares the generic broker connect continuation. Security QoS,
+            // optional server SID, connection views, and server-authored connection information are
+            // retained until the real named-port server accepts or refuses the exact connection.
             // Captured ABI args: PortHandle=args[0], PortName=args[1], SecurityQos=args[2],
             // ClientView=args[3], ServerSid=args[4], ServerView=args[5], MaxMsgLen=args[6],
             // ConnInfo=args[7], ConnInfoLen=args[8].
@@ -31171,7 +30951,7 @@ impl ExecNtHandler {
                 let clientview_ptr = args[3];
                 let conninfo_ptr = args[7];
                 let conninfo_len_ptr = args[8];
-                self.csr_client_connect(
+                self.secure_lpc_client_connect(
                     &name16,
                     porthandle_ptr,
                     args[2],
@@ -31204,16 +30984,10 @@ impl ExecNtHandler {
                     return self.lpc_request_wait_or_park(args[0], args[1], args[2]);
                 }
                 if self.lpc_connection_is(args[0], self.pi, b"\\windows\\apiport") {
-                    if CSR_API_RECEIVE_PARKED.load(Ordering::Relaxed) != 0 {
-                        self.csr_request_port = args[0];
-                        self.csr_request_message = args[1];
-                        self.csr_reply_message = args[2];
-                        print_str(b"[csr-api] routing CSR request to real CsrApiRequestThread\n");
-                        return 0;
-                    }
-                    CSR_RENDEZVOUS_FAILURES.fetch_add(1, Ordering::Relaxed);
-                    print_str(b"[csr-api] no parked real CsrApiRequestThread for \\Windows\\ApiPort request -> failing\n");
-                    return 0xC000_0001;
+                    print_str(
+                        b"[lpc-request-wait] routing \\Windows\\ApiPort through typed continuation\n",
+                    );
+                    return self.lpc_request_wait_or_park(args[0], args[1], args[2]);
                 }
                 if self.lpc_connection_is(args[0], self.pi, b"\\sermcommandport") {
                     return self.service_srm_request_reply(args[0], args[1], args[2]);
@@ -31518,15 +31292,27 @@ impl ExecNtHandler {
                     }
                     return if server_handle != 0 { 0 } else { 0xC000_0001 };
                 }
-                let conn_id = match self.lpc_connection_id_from_port_message(args[2]) {
-                    Ok(conn_id) => conn_id,
+                let (conn_id, response_info) = match self.lpc_capture_connection_response(args[2]) {
+                    Ok(response) => response,
                     Err(status) => return status,
                 };
                 let accept = nt_boolean_arg(args[3]);
                 let port_context = args[1];
-                match lpc_client()
-                    .and_then(|c| c.accept_connect(conn_id, accept, port_context).ok())
-                {
+                let server_handle = lpc_client().and_then(|client| {
+                    if accept {
+                        client
+                            .accept_connect_with_info(
+                                conn_id,
+                                true,
+                                port_context,
+                                &response_info,
+                            )
+                            .ok()
+                    } else {
+                        client.accept_connect(conn_id, false, port_context).ok()
+                    }
+                });
+                match server_handle {
                     Some(server_handle) => {
                         if accept {
                             if server_handle == 0 {
@@ -31601,7 +31387,8 @@ impl ExecNtHandler {
                             }
                             status
                         } else {
-                            if crate::service_sec_image::lpc_connect_wait_is_pending(connection_id) {
+                            if crate::service_sec_image::lpc_connect_wait_is_pending(connection_id)
+                            {
                                 self.lpc_connect_completion = Some(PendingLpcConnectCompletion {
                                     connection_id,
                                     status: nt_syscall::STATUS_SUCCESS,

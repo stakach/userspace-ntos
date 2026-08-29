@@ -28689,7 +28689,7 @@ pub unsafe extern "system" fn csr_get_process_id() -> *mut c_void {
 /// `CsrClientConnectToServer(PCWSTR ObjectDirectory, ULONG ServerId, PVOID ConnectionInfo,
 /// PULONG ConnectionInfoSize, PBOOLEAN ServerToServerCall) -> NTSTATUS`. Port of ReactOS
 /// `CsrpConnectToServer` (`subsystems/csr/csrlib/connect.c`): on target it issues the 9-arg
-/// `NtSecureConnectPort(\Windows\ApiPort)` (serviced by the executive's `csr_client_connect`) and
+/// `NtSecureConnectPort(\Windows\ApiPort)` (serviced by the generic LPC dispatcher) and
 /// copies the returned CSR section data into the PEB (`ReadOnlyStaticServerData` etc.), so kernel32's
 /// `DllMain` proceeds past `InitCommandLines()`. On the host (no syscalls) returns
 /// STATUS_NOT_IMPLEMENTED — never a fabricated connection.

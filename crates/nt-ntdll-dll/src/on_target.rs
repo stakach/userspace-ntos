@@ -4618,7 +4618,7 @@ unsafe fn native_map_view(a1: u64, a2: u64, a3: u64, a4: u64, tail: [u64; 6]) ->
 /// [`native_syscall8`] / [`native_map_view`] (MR0=SSN, MR1=rsp, MR2=a1, MR3=a2, MR4=a3, MR5=a4) but
 /// the FIVE tail args (a5..a9 = ServerSid/ServerView/MaxMessageLength/ConnectionInformation/
 /// ConnectionInformationLength) go on the stack at `[rsp+0x28..0x50]` — the exact slots the
-/// executive's `csr_client_connect` reads (a8/ConnectionInformation = `sp+0x40`).
+/// executive's generic native dispatcher reads (a8/ConnectionInformation = `sp+0x40`).
 ///
 /// # Safety
 /// On-target hosted-process; the pointer args (PortHandle/PortName/Qos/ClientView/ConnInfo) are valid

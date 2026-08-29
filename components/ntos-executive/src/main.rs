@@ -116,9 +116,6 @@ use surt_sel4::{CPtr, Sel4Env, Sel4Notify};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SyscallUserMemory {
     CurrentProcess,
-    /// The CSRSS address space while its remaining private API worker is running. Its stack has a
-    /// dedicated executive mirror; all other ranges resolve through CSRSS's process frame registry.
-    CsrProcess,
 }
 
 // SURT's wakeup contract: signal a notification / wait on it.
@@ -314,25 +311,6 @@ pub const HOSTED_THREAD_STACK_FRAMES: u64 = 8;
 pub const HOSTED_THREAD_IPCBUF_VA: u64 = 0x0000_0100_1048_0000;
 pub const HOSTED_THREAD_TEB_VA: u64 = 0x0000_0100_1049_0000;
 pub const HOSTED_THREAD_TRAMP_VA: u64 = 0x0000_0100_104B_0000;
-// --- Authentic CSR accept: the REAL CsrApiRequestThread runs in CSRSS's VSpace (a 2nd csrss thread),
-// mirroring the SM-loop thread. The csrss-VSpace VAs (stack/ipc/teb/tramp) REUSE the SM numeric
-// values — safe because they land in csrss's OWN pml4 (isolated from smss's, where the SM thread
-// uses the same VAs); both fall in the STACK_BASE 2 MiB PT (0x1040_0000) that csrss's spawn already
-// created. Only the EXECUTIVE-side aliases (mirror/env/fill, in CAP_INIT_THREAD_VSPACE) must be
-// DISTINCT from the SM ones.
-pub const CSR_STACK_BASE: u64 = HOSTED_THREAD_STACK_BASE; // csrss VSpace (4 frames)
-pub const CSR_IPCBUF_VA: u64 = HOSTED_THREAD_IPCBUF_VA; // csrss VSpace
-pub const CSR_TEB_VA: u64 = HOSTED_THREAD_TEB_VA; // csrss VSpace (2 pages)
-pub const CSR_TRAMP_VA: u64 = HOSTED_THREAD_TRAMP_VA; // csrss VSpace
-/// Executive mirror of the CSR thread's stack (same frames) for syscall out-params. FILEBUF PT,
-/// beside SM (0x106A) / winlogon (0x106B) stack mirrors.
-pub const CSR_STACK_MIRROR_VA: u64 = 0x0000_0100_106C_0000;
-/// Executive scratch (3 pages) to populate the CSR thread's TEB/trampoline before copy_cap into
-/// csrss. FILEBUF PT, clear of the SM (0x1070) / smss (0x1074) / csrss (0x1078) env scratch.
-pub const CSR_ENV_SCRATCH_VA: u64 = 0x0000_0100_1071_0000;
-/// Isolated executive scratch (its own PT) for demand-filling the CSR thread's code pages
-/// (CsrApiRequestThread/CsrApiHandleConnectionRequest in csrsrv + ntdll/csrss) during the rendezvous.
-pub const CSR_FILL_SCRATCH_BASE: u64 = 0x0000_0100_1310_0000;
 /// Scratch identity attached to executive-originated win32k probes, which have no hosted caller.
 pub const EXECUTIVE_WIN32K_SCRATCH_BASE: u64 = 0x0000_0100_1300_0000;
 // --- General NtCreateThread: a REAL Nth thread in ANY hosted process (first live user: winlogon's
@@ -782,7 +760,6 @@ const _: () = {
     assert!(nt_syscall_abi::native_ipc_buffer_va(SMSS_TEB_VA) == IPCBUF_VADDR);
     assert!(nt_syscall_abi::native_ipc_buffer_va(TEB_VA) == IPCBUF_VADDR);
     assert!(nt_syscall_abi::native_ipc_buffer_va(HOSTED_THREAD_TEB_VA) == HOSTED_THREAD_IPCBUF_VA);
-    assert!(nt_syscall_abi::native_ipc_buffer_va(CSR_TEB_VA) == CSR_IPCBUF_VA);
     assert!(nt_syscall_abi::native_ipc_buffer_va(WL_LISTENER_TEB_VA) == WL_LISTENER_IPCBUF_VA);
     assert!(nt_syscall_abi::native_ipc_buffer_va(WL_WORKER2_TEB_VA) == WL_WORKER2_IPCBUF_VA);
     assert!(nt_syscall_abi::native_ipc_buffer_va(WL_WORKER3_TEB_VA) == WL_WORKER3_IPCBUF_VA);
@@ -3371,25 +3348,6 @@ static DELAY_TIMER_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// parks that thread) instead of stopping the boot — lsass has already done its job for the milestone
 /// (winlogon's WaitForLsass can now wake), so the boot advances to winlogon's login path.
 static LSA_RPC_SERVER_ACTIVE_SIGNALLED: AtomicU64 = AtomicU64::new(0);
-/// Authentic CSR accept (mirrors the SM triad): the REAL CsrApiRequestThread's dedicated fault EP
-/// (the executive recvs its NtSetEvent/NtReplyWaitReceivePort/NtAcceptConnectPort/NtCompleteConnectPort
-/// faults here during `csr_rendezvous`; no standing receiver otherwise → the thread parks) + its own
-/// MCS reply object (REPLY_CSRLOOP). 0 = not yet retyped.
-static CSR_FAULT_EP: AtomicU64 = AtomicU64::new(0);
-static REPLY_CSRLOOP_SLOT: AtomicU64 = AtomicU64::new(0);
-/// CsrApiRequestThread re-parks on NtReplyWaitReceivePort and accepts later hosted Win32 client
-/// connects.
-static CSR_API_RECEIVE_PARKED: AtomicU64 = AtomicU64::new(0);
-static CSR_API_RECVMSG: AtomicU64 = AtomicU64::new(0);
-static CSR_API_RECVPORT: AtomicU64 = AtomicU64::new(0);
-static CSR_API_RECV_RDX: AtomicU64 = AtomicU64::new(0);
-/// Set once the CSR_FILL_SCRATCH_BASE page table is created (lazily, in the first rendezvous).
-static CSR_FILL_PT_DONE: AtomicU64 = AtomicU64::new(0);
-static CSR_FILL_NEXT: AtomicU64 = AtomicU64::new(0);
-/// The self-connect ClientId uses the real csrss EPROCESS/ETHREAD identity written to
-/// CsrApiRequestThread's *ClientId out-param (so csrss's CsrAddStaticServerThread registers a
-/// CSR_THREAD with this CID) AND marshaled into the connection-request PORT_MESSAGE, so csrss's real
-/// CsrLocateThreadByClientId finds it → CsrProcess=CsrRootProcess → AllowConnection=TRUE → accept.
 /// General NtCreateThread: a dedicated fault endpoint the RPC-listener (and any future park-only Nth
 /// thread) faults to — NO standing receiver, so the thread PARKS on its first fault (its real TEB
 /// stays mapped + queryable by the main thread). 0 = not yet retyped. Distinct from SM/CSR EPs so a
@@ -3608,13 +3566,16 @@ pub(crate) static WINLOGON_CRED_POST_RETURN_SSNS: AtomicU64 = AtomicU64::new(0);
 /// non-empty user name and domain in the real controls.
 pub(crate) static WINLOGON_CRED_LSA_CONNECT: AtomicU64 = AtomicU64::new(0);
 
-/// Case-sensitive compare of an NT object-name (UTF-16) against an ASCII literal.
+/// Case-insensitive compare of an NT object-name (UTF-16) against an ASCII literal. LPC object
+/// names follow the object manager's case-insensitive lookup contract.
 pub(crate) fn lpc_name_is(name16: &[u16], ascii: &[u8]) -> bool {
     name16.len() == ascii.len()
         && name16
             .iter()
             .zip(ascii.iter())
-            .all(|(unit, byte)| *unit == *byte as u16)
+            .all(|(unit, byte)| {
+                u8::try_from(*unit).is_ok_and(|unit| unit.eq_ignore_ascii_case(byte))
+            })
 }
 
 unsafe fn winlogon_credential_load() -> nt_user_callback::CredentialInjectionSequence {
@@ -17412,6 +17373,7 @@ unsafe fn notify_thread_termination_ports(tid: u64, handler: &mut ExecNtHandler)
         };
         if status == 0 {
             LPC_THREAD_TERMINATE_PORT_DELIVERIES.fetch_add(1, Ordering::Relaxed);
+            handler.lpc_endpoint_progress = true;
             if csr_api_port {
                 CSR_KERNEL_MESSAGES_PENDING.fetch_add(1, Ordering::Relaxed);
             }
@@ -17428,7 +17390,6 @@ unsafe fn notify_thread_termination_ports(tid: u64, handler: &mut ExecNtHandler)
             }
         }
     }
-    let _ = csr_kernel_message_rendezvous(handler);
 }
 
 unsafe fn terminate_hosted_thread_mechanism(
@@ -21332,14 +21293,8 @@ impl ObjEntry {
 /// cases migrate (reg / dll_pes / csrss handle-tracking / image PEs / demand-fill state).
 #[derive(Clone, Copy)]
 struct ExecLoopCtx {
-    /// The one native service dispatcher owned by the hosted-process loop. Private server workers
-    /// borrow it while their outer client syscall is parked, so nested native calls use the same
-    /// registered service metadata and typed handler as ordinary hosted threads.
-    nt_dispatcher: *const NativeSyscallDispatcher,
     /// The faulting process's PML4 (page_map target for COMMIT frames / demand-filled pages).
     pml4: u64,
-    /// Main hosted-process fault endpoint used when the CSR worker creates another hosted thread.
-    main_fault_ep: u64,
     /// Every hosted process's trusted mechanism state. Cross-process VM services select the target
     /// PML4/scratch through the access-checked target pid rather than the caller's active context.
     procs: *mut [ProcExec],
@@ -21416,7 +21371,6 @@ pub(crate) struct RemoteThreadRequest {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostedThreadSpawnRequest {
-    CsrApi,
     Winlogon {
         slot: usize,
     },
@@ -21744,13 +21698,11 @@ struct ExecNtHandler {
     current_service_number: u32,
     /// Whether the current service arrived as our ntdll's native seL4-Call request.
     current_native_call_transport: bool,
-    /// Address-space policy for the currently dispatched native call. Ordinary hosted calls use
-    /// their process's active loop mappings; private CSR workers use their dedicated stack mirror
-    /// plus CSRSS's canonical process frame registry.
+    /// Address-space policy for the currently dispatched native call.
     current_user_memory: SyscallUserMemory,
-    /// Client process whose LPC request the current CSR worker is servicing. This is scoped with
-    /// the nested worker call so generic object services can resolve client-owned handles without
-    /// depending on a particular static or dynamic worker transport.
+    /// Client process whose LPC request the current server thread is servicing. The generic receive
+    /// path binds this to the worker until it replies, allowing object services to resolve
+    /// client-owned handles without an image-specific transport.
     current_server_client_pid: u32,
     /// Promoted acquisition whose retained route replaces process-handle lookup on retry.
     active_synchronous_file_retry: Option<nt_io_manager::SynchronousFileWaiter>,
@@ -21801,15 +21753,6 @@ struct ExecNtHandler {
     /// edge once to redrive generic receive continuations without polling every parked port after
     /// every unrelated syscall.
     lpc_endpoint_progress: bool,
-    /// A synchronous CSR API request on an established `\\Windows\\ApiPort` client connection. The
-    /// loop delivers it to the parked real CsrApiRequestThread and resumes the client once the worker
-    /// emits its LPC reply. Missing worker/rendezvous state fails visibly; CSR has no modeled
-    /// established-port success path.
-    csr_request_port: u64,
-    csr_request_message: u64,
-    csr_reply_message: u64,
-    /// One-based CSRSS worker to run, serialized, from its initial resume to its first port receive.
-    csr_start_request: u8,
     /// ★ CROSS-VSPACE `NtCreateThread` (`RtlCreateUserThread(ProcessHandle != NtCurrentProcess)`):
     /// the handler did the POLICY (handle + `PROCESS_CREATE_THREAD` access check, the target's real
     /// ETHREAD, the `*ThreadHandle`/`*ClientId` out-params) and asks the LOOP to build the
@@ -21908,14 +21851,6 @@ struct ExecNtHandler {
     /// Runtime `DN_*` / `CM_PROB_*` status owned by PnP control calls. Devnode identity still comes
     /// from CM; this table only records mutable status overlays requested by umpnpmgr.
     pnp_status: PnpRuntimeStatusTable,
-    /// Authentic CSR accept: when a hosted Win32 client's `NtSecureConnectPort(\Windows\ApiPort)`
-    /// leaves the broker connection Pending (Manual), the handler records the broker connection id + the caller's
-    /// `*PortHandle` VA here; the loop then drives `csr_rendezvous` (the REAL CsrApiRequestThread
-    /// accept), writes the completed client comm-port handle, and replies winlogon. 0 = none.
-    csr_rendezvous_conn: u64,
-    csr_rendezvous_out: u64,
-    csr_rendezvous_conn_info: u64,
-    csr_rendezvous_conn_info_len: u64,
     lpc_connection_views: alloc::vec::Vec<PendingLpcConnectionViews>,
     /// The DATA-plane cache of established LPC connections (control/data-plane split): the isolated
     /// nt-lpc-server owns the namespace + rendezvous, but is NOT on the message path. When a CONNECT
@@ -22962,6 +22897,8 @@ impl HostedThreadRole {
             Self::TpWorker { slot }
             | Self::ScmWorkerSlot { slot }
             | Self::LsaWorkerSlot { slot } => Some(slot),
+            Self::CsrApi => Some(0),
+            Self::CsrSbApi => Some(1),
             _ => None,
         }
     }
@@ -23085,6 +23022,7 @@ pub(crate) struct HostedThreadRuntime {
     teb_alias: u64,
     user_stack_allocation_base: u64,
     user_stack_base: u64,
+    lpc_client_process: u32,
 }
 
 impl HostedThreadRuntime {
@@ -23099,6 +23037,7 @@ impl HostedThreadRuntime {
             teb_alias: 0,
             user_stack_allocation_base: 0,
             user_stack_base: 0,
+            lpc_client_process: 0,
         }
     }
 
@@ -23193,12 +23132,14 @@ impl HostedThreadRuntimeTable {
             teb_alias: 0,
             user_stack_allocation_base: 0,
             user_stack_base: 0,
+            lpc_client_process: 0,
         };
         if let Some(existing) = self.entries.iter_mut().find(|entry| entry.tid == tid) {
             runtime.mechanism = existing.mechanism;
             runtime.teb_alias = existing.teb_alias;
             runtime.user_stack_allocation_base = existing.user_stack_allocation_base;
             runtime.user_stack_base = existing.user_stack_base;
+            runtime.lpc_client_process = existing.lpc_client_process;
             *existing = runtime;
             return Some(runtime);
         }
@@ -23318,23 +23259,16 @@ impl HostedThreadRuntimeTable {
             .find(|entry| entry.is_live() && entry.badge == badge)
     }
 
-    fn live_badges_for_pi(&self, pi: usize, out: &mut [u64]) -> usize {
-        let mut count = 0usize;
-        for entry in self.entries.iter().copied() {
-            if !entry.is_live()
-                || entry.tcb <= 1
-                || entry.pi != pi
-                || out[..count].contains(&entry.badge)
-            {
-                continue;
-            }
-            if count == out.len() {
-                break;
-            }
-            out[count] = entry.badge;
-            count += 1;
-        }
-        count
+    fn set_lpc_client_process(&mut self, badge: u64, process: u32) -> bool {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.is_live() && entry.badge == badge)
+        else {
+            return false;
+        };
+        entry.lpc_client_process = process;
+        true
     }
 
     fn tcb_for_role(&self, pi: usize, role: HostedThreadRole) -> Option<u64> {
@@ -23398,6 +23332,11 @@ impl HostedThreadRuntimes {
         unsafe { (&mut *self.table).reserve(pi, tid, badge, role) }
     }
 
+    fn set_lpc_client_process(&mut self, badge: u64, process: u32) -> bool {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).set_lpc_client_process(badge, process) }
+    }
+
     fn get_by_tid(&self, tid: u64) -> Option<HostedThreadRuntime> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).get_by_tid(tid) }
@@ -23440,11 +23379,6 @@ impl HostedThreadRuntimes {
     fn get_by_badge(&self, badge: u64) -> Option<HostedThreadRuntime> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).get_by_badge(badge) }
-    }
-
-    fn live_badges_for_pi(&self, pi: usize, out: &mut [u64]) -> usize {
-        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
-        unsafe { (&*self.table).live_badges_for_pi(pi, out) }
     }
 
     fn tcb_for_main_pi(&self, pi: usize) -> Option<u64> {
@@ -24994,11 +24928,11 @@ static LSASS_SRM_CONNECTED: AtomicU64 = AtomicU64::new(0);
 /// Runtime routing resolves the handle from `ExecNtHandler::obj_ns`, not from this cell.
 static SRM_COMMAND_PORT_OBJECT_HANDLE: AtomicU64 = AtomicU64::new(0);
 // ═══ `\LsaAuthenticationPort` RENDEZVOUS ══════════════════════════════════════════════════════
-// The remaining image-specific LPC rendezvous. SM and SB now use generic typed continuations; CSR
-// still uses `csr_rendezvous`. Here the server is lsass' REAL `AuthPortThreadRoutine`
+// The remaining image-specific LPC rendezvous. SM, SB, and CSR now use generic typed
+// continuations. Here the server is lsass' REAL `AuthPortThreadRoutine`
 // (`references/reactos/dll/win32/lsasrv/authport.c:227`), which runs in the N-threads multiplex on
-// the MAIN fault endpoint, so unlike the remaining private CSR loop the LSA
-// rendezvous is driven ENTIRELY by the main service loop: the server thread genuinely BLOCKS in
+// the MAIN fault endpoint. The LSA rendezvous is driven by the main service loop: the server thread
+// genuinely BLOCKS in
 // `NtReplyWaitReceivePort` with its reply capability retained, the connecting/ requesting client
 // genuinely BLOCKS in `NtConnectPort`/`NtRequestWaitReplyPort`, and each side is woken by the other's
 // real progress. Nothing about the accept decision, the port handles or the reply payload is modelled.
@@ -25059,18 +24993,12 @@ static CSR_API_REAL_REPLIES: AtomicU64 = AtomicU64::new(0);
 static CSR_KERNEL_MESSAGES_PENDING: AtomicU64 = AtomicU64::new(0);
 /// Kernel-generated LPC messages consumed by the real `CsrApiRequestThread` receive loop.
 static CSR_KERNEL_MESSAGES_DELIVERED: AtomicU64 = AtomicU64::new(0);
-/// Broker, framing, or worker-delivery failures on the kernel-generated CSR message path.
-static CSR_KERNEL_MESSAGE_FAILURES: AtomicU64 = AtomicU64::new(0);
-/// Count of pending CSR client connects completed by the real CsrApiRequestThread
-/// rendezvous. The boot path must not use the old modeled accept fallback.
+/// Count of pending CSR client connects completed by the real CsrApiRequestThread through the
+/// generic LPC continuation path.
 static CSR_AUTHENTIC_ACCEPTS: AtomicU64 = AtomicU64::new(0);
 /// Bitmask of hosted processes whose pending CSR connect was accepted by the real
-/// CsrApiRequestThread rendezvous. This distinguishes the authentic accept path from the modeled
-/// CSR view/connect-info fill.
+/// CsrApiRequestThread. This distinguishes server acceptance from client-side publication.
 static CSR_AUTHENTIC_ACCEPT_MASK: AtomicU64 = AtomicU64::new(0);
-/// Count of failed real CSR rendezvous attempts. Kept as a gate input so the old modeled fallback
-/// cannot silently return.
-static CSR_RENDEZVOUS_FAILURES: AtomicU64 = AtomicU64::new(0);
 // === nt-process convergence (policy/mechanism split) ===================================
 // The live executive is converging its remaining per-pi mechanism state onto handler-owned lookup
 // APIs. Hosted PID/TID identity is now authoritative in ProcessManager plus the process/thread
@@ -26614,15 +26542,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         REPLY_TRANSPORT_PROBE_SLOT.store(rprobe, Ordering::Relaxed);
     }
     // Component-dispatch reply caps are allocated on demand by hosted driver launch.
-    // Authentic CSR accept: a dedicated fault endpoint + reply object for the real CsrApiRequestThread
-    // (mirrors the SM triad above).
-    let csr_ep = make_object(OBJ_ENDPOINT);
-    CSR_FAULT_EP.store(csr_ep, Ordering::Relaxed);
-    let rc = alloc_slot();
-    let e_rc = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, rc);
-    if e_rc == 0 {
-        REPLY_CSRLOOP_SLOT.store(rc, Ordering::Relaxed);
-    }
     // General NtCreateThread: a dedicated fault endpoint (no standing receiver) that the RPC-listener
     // and any future park-only Nth thread faults to → it PARKS on its first fault, its real TEB left
     // mapped + queryable by the process's main thread.
@@ -31161,22 +31080,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         WINLOGON_CSR_CONNECTED.load(Ordering::Relaxed) == 1,
                         &mut passed,
                     );
-                    // The REAL CSR message plane carried live winlogon↔csrss CSR API traffic: csrss's
-                    // genuine CsrApiRequestThread (driven by csr_rendezvous, mirroring the SM triad) issued
-                    // NtReplyWaitReceivePort and RECEIVED a live LPC_CONNECTION_REQUEST message off
-                    // \Windows\ApiPort (winlogon's kernel32 CSR client connect). CSR_MSGS counts that real
-                    // received-message event in the rendezvous. The accept/failure counters prove the loop
-                    // used the real worker and failed closed on a missing or walled rendezvous.
+                    // The real CSR message plane carried live winlogon↔csrss CSR API traffic. CSRSS's
+                    // CsrApiRequestThread issued NtReplyWaitReceivePort and received messages from
+                    // \Windows\ApiPort through the same typed LPC continuations and hosted-worker window
+                    // used by every other port server. Pending kernel notifications must also be drained.
                     check(
                         b"exec_csr_message_plane",
                         CSR_MSGS.load(Ordering::Relaxed) >= 1
                             && CSR_API_REAL_REPLIES.load(Ordering::Relaxed) >= 1
                             && CSR_KERNEL_MESSAGES_DELIVERED.load(Ordering::Relaxed) >= 1
                             && CSR_KERNEL_MESSAGES_PENDING.load(Ordering::Relaxed) == 0
-                            && CSR_KERNEL_MESSAGE_FAILURES.load(Ordering::Relaxed) == 0
                             && CSR_AUTHENTIC_ACCEPTS.load(Ordering::Relaxed) >= 1
-                            && CSR_AUTHENTIC_ACCEPT_MASK.load(Ordering::Relaxed) & (1 << 2) != 0
-                            && CSR_RENDEZVOUS_FAILURES.load(Ordering::Relaxed) == 0,
+                            && CSR_AUTHENTIC_ACCEPT_MASK.load(Ordering::Relaxed) & (1 << 2) != 0,
                         &mut passed,
                     );
                     // P5 — ReactOS keyboard initialization reached its real SYSTEM-hive layout key.
@@ -31710,8 +31625,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_u64(CSR_KERNEL_MESSAGES_DELIVERED.load(Ordering::Relaxed));
                     print_str(b"/");
                     print_u64(CSR_KERNEL_MESSAGES_PENDING.load(Ordering::Relaxed));
-                    print_str(b"/");
-                    print_u64(CSR_KERNEL_MESSAGE_FAILURES.load(Ordering::Relaxed));
                     print_str(b")\n");
                     // ITEM 2b — seL4 MECHANISM teardown (reclamation) proven end-to-end on a THROWAWAY
                     // untyped/caps: the kernel's CNodeDelete does full reclamation (TCB suspend, frame-
@@ -31857,8 +31770,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     check(
                         b"exec_services_csr_connect",
                         CSR_CONNECTED_MASK.load(Ordering::Relaxed) & (1 << 3) != 0
-                            && CSR_AUTHENTIC_ACCEPT_MASK.load(Ordering::Relaxed) & (1 << 3) != 0
-                            && CSR_RENDEZVOUS_FAILURES.load(Ordering::Relaxed) == 0,
+                            && CSR_AUTHENTIC_ACCEPT_MASK.load(Ordering::Relaxed) & (1 << 3) != 0,
                         &mut passed,
                     );
                     print_str(b"[ntos-exec] CSR per-process connect mask=0x");
@@ -31871,8 +31783,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_u64(CSR_KERNEL_MESSAGES_DELIVERED.load(Ordering::Relaxed));
                     print_str(b"/");
                     print_u64(CSR_KERNEL_MESSAGES_PENDING.load(Ordering::Relaxed));
-                    print_str(b"/");
-                    print_u64(CSR_KERNEL_MESSAGE_FAILURES.load(Ordering::Relaxed));
                     print_str(b"\n");
                     // ★ MILESTONE — services.exe is the 3rd win32k GUI client: its user32 DllMain
                     // NtUserProcessConnect (SSN 0x10FA) was routed to the win32k component (badge 6 /
