@@ -15816,3 +15816,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the returned server view/connect payload, and delete the executive projection in the same
     accepted slice. Do not preserve the fixed client mappings or synthesize a successful payload if
     the server did not publish one.
+
+    CSR connection-information convergence (2026-08-29, accepted): LPC ABI v2 now preserves the
+    connection request and server-approved response as distinct broker state. The accept operation
+    can commit the exact mutated connection bytes, and complete returns those bytes with the client
+    communication handle. The port core, LPC client/server adapter, and ALPC bridge suites pass;
+    code checkpoint `6254cf0f` is pushed.
+
+    The executive now sends ntdll's real 56-byte `CSR_API_CONNECTINFO` input through that contract,
+    writes a complete `LPC_CONNECTION_REQUEST` into the real CSRSS worker's receive buffer, captures
+    the message after `CsrApiHandleConnectionRequest` mutates it, and copies the completed payload
+    back to the connecting process. The old executive-written shared-section/static-data fields and
+    fabricated CSRSS PID are deleted. Serialized acceptance
+    `.tmp/run-headless-csr-server-conninfo-20260829.log` observed 15 authentic accepts, each returning
+    56 server-authored bytes. Genuine userinit and Explorer launched, 632 Explorer api0 redirects
+    completed with zero callback or dead-callback failures, paint begin/end reached `4/13` with 176
+    direct GDI returns and 104 batch flushes covering 124 records, and the framebuffer held
+    `480000/480000` non-background pixels with at least 32 colours. All `295/295` gates passed and
+    the sentinel matched. Code checkpoint `d6cac38b` is pushed.
+
+    Review adjustment: CSRSS now exclusively authors its shared-section pointers, so the remaining
+    connection debt is the independent 64 KiB LPC port-memory section. ntdll must create that
+    anonymous section and submit its real handle in `PORT_VIEW`; the kernel must resolve the
+    client-owned section object, map shared views into both connector and accepting server, and
+    return `PORT_VIEW.ViewBase/ViewRemoteBase` plus CSRSS's `REMOTE_PORT_VIEW`. Delete
+    `WINLOGON_CSR_HEAP_VA`, `WINLOGON_CSR_STATIC_VA`, the hand-built static pages, and the
+    per-process CSR view mask in the same accepted slice. A refused connection must unwind any
+    provisional view and no zero-section or fixed-address compatibility path may remain.
