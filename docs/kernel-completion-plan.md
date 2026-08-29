@@ -16959,3 +16959,54 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     notifications, and rundown must share one host-tested authority. Delete that synthetic handler
     when the real membership query is installed; do not add isolated job-shaped state in the
     executive or claim individual service completion while their shared lifecycle is missing.
+
+    Ps/Ob job-object core lifecycle checkpoint (2026-08-30, accepted; family remains in progress):
+    `nt-process` now owns one growable job-object authority with stable identities, NT generic access
+    mapping, creating-session ownership, one-job process membership, active/total/terminated process
+    accounting, accumulated process times, exact handle/wait/process references, completion-port
+    association and messages, active-process limits, priority/affinity application, kill-on-close,
+    explicit job termination, wait signalling state, and ordered job-set membership. Job-set object
+    pins follow the NT5 forward-passing chain: all but the head remain referenced, deleting the head
+    passes the pin to its successor, and an unreferenced chain deletes iteratively without recursive
+    stack growth. Completion-port references remain owned by the object through kill-on-close and are
+    released only by object deletion.
+
+    The exact Windows x64 information layouts and class rules live beside that owner in
+    `nt-process::job_abi`. The executive adds only native capture, Object Manager namespace/handle
+    integration, I/O completion delivery, and hosted mechanism teardown. `NtCreateJobObject`,
+    `NtOpenJobObject`, `NtCreateJobSet`, `NtAssignProcessToJobObject`,
+    `NtQueryInformationJobObject`, `NtSetInformationJobObject`, and `NtTerminateJobObject` are now
+    typed and registered at their canonical service numbers; the existing `NtIsProcessInJob` entry
+    now returns the Process Manager's real `STATUS_PROCESS_IN_JOB`/`STATUS_PROCESS_NOT_IN_JOB`
+    result. The old unconditional synthetic not-assigned handler is deleted. Job-triggered process
+    termination first transitions Ps state, then the sole service-loop owner tears down every
+    addressed seL4 TCB/vspace. If the caller belongs to the terminated job, its Reply object is
+    dropped and it cannot resume after deletion.
+
+    Limit setting currently accepts only mechanisms whose owners are connected end to end:
+    active-process count, process affinity, priority class, and kill-on-close. Unsupported working
+    set, process/job time, scheduling-class, process/job memory, nonzero UI, and token-security limits
+    fail with `STATUS_NOT_SUPPORTED`; they do not mutate partial state or return fallback success.
+    Focused validation passes `nt-process` `121/121` and `nt-syscall` `79/79`; the freestanding
+    executive remains at the established 209-warning baseline and the release/staging path succeeds.
+    Serialized proof `.tmp/run-headless-job-objects-final-20260830.log` launches genuine userinit and
+    Explorer, completes 668 real api0 redirects with zero callback failures, installs 18 client
+    WndProcs without replay, reaches Explorer paint begin/end `5/20` with 187 direct GDI returns and
+    135 batch flushes covering 184 records, paints `480000/480000` framebuffer pixels with at least
+    32 colours, passes all `295/295` checks, and matches the sentinel. The normal desktop workload
+    does not create a job; focused tests prove the new state, ABI, pin, notification, and rundown
+    contracts.
+
+    The typed surface now contains 195 services, the hosted table registers 194 numbered variants,
+    and 29 required canonical services remain absent.
+
+    Review adjustment: keep the job-object family in progress. Next connect Ps process creation and
+    final EPROCESS deletion to job membership: ordinary children must enter the parent's job unless
+    real breakaway policy permits otherwise, job-set member-level selection must participate in that
+    transaction, a failed assignment must roll back process publication, and final process-object
+    deletion must release the membership reference and allow object deletion. Then enforce job and
+    per-process user-time limits from scheduler accounting, working-set and memory limits through the
+    Memory Manager/quota owner, UI restrictions through the registered Win32 job callout, and token
+    restrictions through the Security Manager. Only after those owners and their teardown paths are
+    live should this family be marked complete; no executive-local counters or permissive stand-ins
+    should bridge the remaining gaps.

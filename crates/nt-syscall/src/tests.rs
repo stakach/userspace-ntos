@@ -1033,6 +1033,31 @@ fn request_wakeup_latency_uses_its_canonical_service_contract() {
 }
 
 #[test]
+fn job_object_family_uses_its_canonical_service_contracts() {
+    let services = [
+        (NativeService::NtAssignProcessToJobObject, 21, 2),
+        (NativeService::NtCreateJobObject, 41, 3),
+        (NativeService::NtCreateJobSet, 42, 3),
+        (NativeService::NtIsProcessInJob, 98, 2),
+        (NativeService::NtOpenJobObject, 124, 3),
+        (NativeService::NtQueryInformationJobObject, 159, 5),
+        (NativeService::NtSetInformationJobObject, 234, 4),
+        (NativeService::NtTerminateJobObject, 265, 2),
+    ];
+    let numbered: alloc::vec::Vec<_> = services
+        .iter()
+        .map(|(service, number, _)| (*service, *number))
+        .collect();
+    let table = NativeServiceTable::from_numbers(UserlandAbiProfile::Windows7, &numbered);
+    for (service, number, arguments) in services {
+        let entry = table.lookup(number).unwrap();
+        assert_eq!(entry.service, service);
+        assert_eq!((entry.min_args, entry.max_args), (arguments, arguments));
+        assert_eq!(table.number_of(service), Some(number));
+    }
+}
+
+#[test]
 fn set_default_hard_error_port_uses_its_canonical_service_contract() {
     let table = NativeServiceTable::from_numbers(
         UserlandAbiProfile::Windows7,

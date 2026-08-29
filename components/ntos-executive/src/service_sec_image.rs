@@ -9505,7 +9505,31 @@ pub(crate) unsafe fn service_sec_image(
                 // resume it), then suspend/delete the exact badge-selected TCB, and receive the next
                 // caller immediately. Remote termination tears down its target but still replies to
                 // the caller through the normal tail below.
-                match nt_handler.post_action {
+                let job_termination_mask =
+                    core::mem::take(&mut nt_handler.pending_job_termination_mask);
+                let caller_job_terminated = pi < 32 && job_termination_mask & (1u32 << pi) != 0;
+                let mut post_action = nt_handler.post_action;
+                if caller_job_terminated
+                    && !matches!(post_action, ExecPostAction::CriticalTermination { .. })
+                {
+                    post_action = ExecPostAction::TerminateProcess {
+                        process_index: pi as u8,
+                        current_tid: nt_handler.current_tid,
+                        drop_reply: true,
+                    };
+                }
+                let post_action_process = match post_action {
+                    ExecPostAction::TerminateProcess { process_index, .. } => Some(process_index),
+                    _ => None,
+                };
+                teardown_job_terminated_processes(
+                    job_termination_mask,
+                    pi as u8,
+                    post_action_process,
+                    delay_queue,
+                    &mut nt_handler,
+                );
+                match post_action {
                     ExecPostAction::ContinueCurrentThread {
                         tid,
                         tcb,

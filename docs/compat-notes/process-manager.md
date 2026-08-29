@@ -30,3 +30,21 @@ process, and closes; and termination signalling — terminating the last non-sys
 signals the process (wait returns the exit status) and terminates its system thread, leaving an
 unrelated process untouched. (Image-section loading is host-tested; nt-pe-loader is already
 QEMU-proven by the driver hosts.)
+
+## Job objects (core lifecycle implemented; policy enforcement in progress)
+
+- `nt-process::job::JobStore` owns stable job identities, creating-session affinity, handle/wait/
+  process references, one-job process membership, accounting, completion associations, and pending
+  completion messages. The executive owns only native buffer capture, namespace handles, completion
+  packet delivery, and teardown of hosted seL4 mechanisms.
+- Named/unnamed create and open, access-checked assignment/query/set/termination, wait references,
+  kill-on-close, active-process limits, process priority/affinity application, completion messages,
+  and NT5 job-set pin passing are implemented. The exact x64 information layouts are encoded and
+  decoded by `nt-process::job_abi`.
+- The native family is registered at its canonical service numbers. `NtIsProcessInJob` returns the
+  real `STATUS_PROCESS_IN_JOB` (`0x124`) or `STATUS_PROCESS_NOT_IN_JOB` (`0x123`); the previous
+  unconditional successful not-assigned response has been removed.
+- Remaining work is explicit: child creation inheritance/breakaway and final EPROCESS membership
+  release, scheduler-enforced process/job time limits, Memory Manager working-set and memory quotas,
+  Win32 job UI callouts, and Security Manager token restrictions. Requests for an unconnected limit
+  mechanism fail with `STATUS_NOT_SUPPORTED` rather than installing inert policy.

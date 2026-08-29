@@ -925,6 +925,13 @@ pub const SSN_NT_QUERY_PERF_COUNTER: u64 = 173;
 pub const SSN_NT_QUERY_INFO_PROCESS: u64 = 161;
 /// ntdll's NtIsProcessInJob SSN (kernel32 CreateProcessInternalW job-membership probe).
 pub const SSN_NT_IS_PROCESS_IN_JOB: u64 = 98;
+pub const SSN_NT_ASSIGN_PROCESS_TO_JOB_OBJECT: u64 = 21;
+pub const SSN_NT_CREATE_JOB_OBJECT: u64 = 41;
+pub const SSN_NT_CREATE_JOB_SET: u64 = 42;
+pub const SSN_NT_OPEN_JOB_OBJECT: u64 = 124;
+pub const SSN_NT_QUERY_INFORMATION_JOB_OBJECT: u64 = 159;
+pub const SSN_NT_SET_INFORMATION_JOB_OBJECT: u64 = 234;
+pub const SSN_NT_TERMINATE_JOB_OBJECT: u64 = 265;
 /// ntdll's NtOpenKey SSN (LdrpInitialize opens IFEO/options; we have no registry → not-found).
 pub const SSN_NT_OPEN_KEY: u64 = 125;
 /// ntdll's NtQueryValueKey SSN (registry value lookups; not-found → LdrpInitialize uses defaults).
@@ -2487,6 +2494,7 @@ impl WaitObject {
     pub(crate) const KIND_FAT_FILE: u64 = 5;
     pub(crate) const KIND_FAT_DIRECTORY: u64 = 6;
     pub(crate) const KIND_OVERLAY_FILE: u64 = 7;
+    pub(crate) const KIND_JOB: u64 = 8;
 
     pub(crate) const FREE: Self = Self(u64::MAX);
 
@@ -2522,6 +2530,10 @@ impl WaitObject {
         Self((Self::KIND_OVERLAY_FILE << Self::KIND_SHIFT) | (file_id & Self::ID_MASK))
     }
 
+    pub(crate) const fn job(id: nt_process::job::JobId) -> Self {
+        Self((Self::KIND_JOB << Self::KIND_SHIFT) | id as u64)
+    }
+
     pub(crate) const fn raw(self) -> u64 {
         self.0
     }
@@ -2552,6 +2564,7 @@ impl WaitObject {
             Self::KIND_FAT_FILE => b"fat-file",
             Self::KIND_FAT_DIRECTORY => b"fat-directory",
             Self::KIND_OVERLAY_FILE => b"overlay-file",
+            Self::KIND_JOB => b"job",
             _ => b"unknown",
         }
     }
@@ -17929,6 +17942,34 @@ unsafe fn terminate_hosted_process_mechanisms(
     reclaimed
 }
 
+unsafe fn teardown_job_terminated_processes(
+    mut mask: u32,
+    caller_process_index: u8,
+    skip_process_index: Option<u8>,
+    delay_queue: &mut nt_delay_execution::Queue,
+    handler: &mut ExecNtHandler,
+) {
+    while mask != 0 {
+        let process_index = mask.trailing_zeros() as u8;
+        mask &= !(1u32 << process_index);
+        if process_index == caller_process_index || skip_process_index == Some(process_index) {
+            continue;
+        }
+        let reclaimed =
+            terminate_hosted_process_mechanisms(process_index, None, delay_queue, handler);
+        let vm_reclaim = reclaim_final_process_vm(process_index, handler);
+        let _ = win32k_glue::unwind_dead_client_user_callbacks(process_index as u32);
+        print_str(b"[job-process-term] pi=");
+        print_u64(process_index as u64);
+        print_str(b" mechanisms=");
+        print_u64(reclaimed as u64);
+        print_str(b" vm-frames=");
+        print_u64(vm_reclaim.registered_frames);
+        print_str(b"\n");
+    }
+    handler.refresh_process_manager_gates();
+}
+
 /// GENERAL park: block the current caller on a SET of wait objects (`objects`), with `wait_all`
 /// selecting WaitAll (wake when all signalled → WAIT_0) vs WaitAny (wake on the first signalled →
 /// WAIT_0+index). Steals this caller's bound reply object (REPLY_MAIN) into a free waiter slot and
@@ -21492,6 +21533,7 @@ const OBJ_KIND_MUTANT: u8 = 4;
 const OBJ_KIND_LPC_PORT: u8 = 5;
 const OBJ_KIND_TIMER: u8 = 6;
 const OBJ_KIND_IO_COMPLETION: u8 = 7;
+const OBJ_KIND_JOB: u8 = 8;
 const OBJ_KIND_DELETED: u8 = 0xff;
 const OBJ_NAME_CAP: usize = 128;
 const OBJ_PARENT_ROOT: usize = usize::MAX;
@@ -22044,6 +22086,9 @@ struct ExecNtHandler {
     user_apc_redirected: bool,
     context_continue_redirected: bool,
     post_action: ExecPostAction,
+    /// Hosted processes whose Ps state was terminated by a job operation during this syscall.
+    /// The service-loop owner drains the matching seL4 mechanisms after native dispatch returns.
+    pending_job_termination_mask: u32,
     stop: bool,
     /// Monotonic fake-handle allocator for objects the executive doesn't model yet (ports, threads,
     /// events, sections, tokens, files). Persistent across smss + csrss (single source of truth —
@@ -24015,6 +24060,31 @@ fn build_nt_table() -> NativeServiceTable {
             (
                 NativeService::NtIsProcessInJob,
                 SSN_NT_IS_PROCESS_IN_JOB as u32,
+            ),
+            (
+                NativeService::NtAssignProcessToJobObject,
+                SSN_NT_ASSIGN_PROCESS_TO_JOB_OBJECT as u32,
+            ),
+            (
+                NativeService::NtCreateJobObject,
+                SSN_NT_CREATE_JOB_OBJECT as u32,
+            ),
+            (NativeService::NtCreateJobSet, SSN_NT_CREATE_JOB_SET as u32),
+            (
+                NativeService::NtOpenJobObject,
+                SSN_NT_OPEN_JOB_OBJECT as u32,
+            ),
+            (
+                NativeService::NtQueryInformationJobObject,
+                SSN_NT_QUERY_INFORMATION_JOB_OBJECT as u32,
+            ),
+            (
+                NativeService::NtSetInformationJobObject,
+                SSN_NT_SET_INFORMATION_JOB_OBJECT as u32,
+            ),
+            (
+                NativeService::NtTerminateJobObject,
+                SSN_NT_TERMINATE_JOB_OBJECT as u32,
             ),
             (
                 NativeService::NtOpenProcessToken,

@@ -20,6 +20,8 @@ use nt_pe_loader::{MappedImage, PeError, PeFile};
 use nt_security::TokenId;
 
 pub mod dbgk;
+pub mod job;
+pub mod job_abi;
 
 use dbgk::{DbgKmMessage, DebugEvent, DebugObjectId, DebugObjectStore};
 
@@ -51,6 +53,8 @@ pub const PROCESS_GENERIC_READ: u32 = 0x0002_0410;
 pub const PROCESS_GENERIC_WRITE: u32 = 0x0002_0BEB;
 pub const PROCESS_GENERIC_EXECUTE: u32 = 0x0012_0000;
 pub const PROCESS_ALL_ACCESS: u32 = 0x001F_FFFF;
+pub const PROCESS_TERMINATE: u32 = 0x0001;
+pub const PROCESS_SET_QUOTA: u32 = 0x0100;
 pub const PROCESS_SET_INFORMATION: u32 = 0x0200;
 pub const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
 pub const THREAD_GENERIC_READ: u32 = 0x0002_0048;
@@ -663,6 +667,8 @@ pub enum HandleObject {
     TokenObject(TokenId),
     /// A `DEBUG_OBJECT` (the user-mode debugging plane's event port).
     DebugObject(DebugObjectId),
+    /// A Process Manager job object.
+    Job(job::JobId),
     /// An object the executive still models ad-hoc (port/event/file/token/key/…) during the
     /// process-hosting convergence — the handle-table entry is real (per-process, closable) even
     /// though the target isn't yet an `nt-process` object. The `u64` is the executive's opaque tag.
@@ -830,6 +836,8 @@ pub struct ProcessManager {
     win32_callouts: Option<Win32Callouts>,
     /// The live `DEBUG_OBJECT` table (the user-mode debugging plane). See [`dbgk`].
     dbgk: DebugObjectStore,
+    /// Ps job objects and their exact process membership, accounting, and limit policy.
+    jobs: job::JobStore,
     /// The IMAGE views mapped into each process — the modelled `PEB->Ldr` module list. A `pid` of
     /// `0` marks a free slot, so an unmap never shifts the table (and never reallocates).
     ///
@@ -1272,7 +1280,11 @@ impl ProcessManager {
         handle: u64,
     ) -> Result<ProcessTimes, u32> {
         let pid = self.resolve_process_handle(caller_pid, handle, PROCESS_QUERY_INFORMATION)?;
-        let process = self.process(pid).ok_or(STATUS_INVALID_HANDLE)?;
+        self.process_times(pid).ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    pub fn process_times(&self, pid: ProcessId) -> Option<ProcessTimes> {
+        let process = self.process(pid)?;
         let mut create_time = 0;
         let mut exit_time = 0;
         let mut kernel_time = 0i64;
@@ -1292,7 +1304,7 @@ impl ProcessManager {
             kernel_time = kernel_time.saturating_add(thread.kernel_time_100ns);
             user_time = user_time.saturating_add(thread.user_time_100ns);
         }
-        Ok(ProcessTimes {
+        Some(ProcessTimes {
             create_time,
             exit_time,
             kernel_time,
@@ -2741,6 +2753,10 @@ impl ProcessManager {
                 }
             }
         }
+        if let Some(times) = self.process_times(pid) {
+            let notifications = self.jobs.exit_process(pid, times, exit_status);
+            self.jobs.queue_notifications(notifications);
+        }
         if let Some(sid) = section {
             if let Some(s) = self.sections.get_mut(sid as usize).and_then(|s| s.as_mut()) {
                 s.map_refs = s.map_refs.saturating_sub(1);
@@ -2854,6 +2870,222 @@ impl ProcessManager {
     pub fn wait_process(&self, pid: ProcessId) -> Option<u32> {
         let p = self.processes.get(&pid)?;
         (p.state == ProcessState::Terminated).then_some(p.exit_status.unwrap_or(0))
+    }
+
+    // --- Ps job objects ------------------------------------------------------
+
+    pub fn create_job(&mut self, session_id: u32) -> Result<job::JobId, u32> {
+        self.jobs.create(session_id)
+    }
+
+    pub fn discard_unreferenced_job(&mut self, id: job::JobId) -> bool {
+        self.jobs.discard_unreferenced(id)
+    }
+
+    pub fn job_exists(&self, id: job::JobId) -> bool {
+        self.jobs.contains(id)
+    }
+
+    pub fn release_job_handle(&mut self, id: job::JobId) -> Result<job::JobCloseAction, u32> {
+        self.jobs.release_handle(id)
+    }
+
+    pub fn take_job_destruction(&mut self) -> Option<job::JobDestruction> {
+        self.jobs.take_destruction()
+    }
+
+    pub fn assign_process_to_job(&mut self, id: job::JobId, pid: ProcessId) -> Result<u32, u32> {
+        let process = self.process(pid).ok_or(STATUS_INVALID_HANDLE)?;
+        if process.state == ProcessState::Terminated {
+            return Err(STATUS_PROCESS_IS_TERMINATING);
+        }
+        let session_id = process.session_id;
+        let assignment = self.jobs.assign(id, pid, session_id)?;
+        self.jobs.queue_notification(assignment.notification);
+        if assignment.status == STATUS_SUCCESS {
+            let limits = self.jobs.basic_limits(id)?;
+            let process = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+            if limits.limit_flags & job::JOB_OBJECT_LIMIT_PRIORITY_CLASS != 0 {
+                process.priority_class = limits.priority_class as u8;
+            }
+            if limits.limit_flags & job::JOB_OBJECT_LIMIT_AFFINITY != 0 {
+                process.affinity_mask = limits.affinity;
+                for tid in &process.threads {
+                    if let Some(thread) = self.threads.get_mut(tid) {
+                        thread.affinity_mask = limits.affinity;
+                    }
+                }
+            }
+        }
+        Ok(assignment.status)
+    }
+
+    pub fn process_job(&self, pid: ProcessId) -> Option<job::JobId> {
+        self.jobs.job_for_process(pid)
+    }
+
+    pub fn mark_job_process_forced_termination(&mut self, pid: ProcessId) -> Result<(), u32> {
+        self.jobs.mark_process_forced_termination(pid)
+    }
+
+    pub fn is_process_in_job(&self, pid: ProcessId, id: Option<job::JobId>) -> Result<u32, u32> {
+        self.process(pid).ok_or(STATUS_INVALID_HANDLE)?;
+        let process_job = self.jobs.job_for_process(pid);
+        Ok(
+            if process_job.is_some() && id.is_none_or(|id| process_job == Some(id)) {
+                job::STATUS_PROCESS_IN_JOB
+            } else {
+                job::STATUS_PROCESS_NOT_IN_JOB
+            },
+        )
+    }
+
+    pub fn remove_process_job_reference(&mut self, pid: ProcessId) -> Option<job::JobId> {
+        self.jobs.remove_process_reference(pid)
+    }
+
+    pub fn job_active_process_ids(
+        &self,
+        id: job::JobId,
+        out: &mut [ProcessId],
+    ) -> Result<usize, u32> {
+        self.jobs.active_process_ids(id, out)
+    }
+
+    pub fn job_process_ids(
+        &self,
+        id: job::JobId,
+        out: &mut [ProcessId],
+    ) -> Result<(u32, usize), u32> {
+        self.jobs.process_ids(id, out)
+    }
+
+    pub fn job_accounting(&self, id: job::JobId) -> Result<job::JobAccounting, u32> {
+        let mut accounting = self.jobs.accounting(id)?;
+        for (pid, process) in self.processes.iter() {
+            if process.state == ProcessState::Terminated
+                || self.jobs.job_for_process(*pid) != Some(id)
+            {
+                continue;
+            }
+            if let Some(times) = self.process_times(*pid) {
+                accounting.total_user_time =
+                    accounting.total_user_time.saturating_add(times.user_time);
+                accounting.total_kernel_time = accounting
+                    .total_kernel_time
+                    .saturating_add(times.kernel_time);
+                accounting.this_period_total_user_time = accounting
+                    .this_period_total_user_time
+                    .saturating_add(times.user_time);
+                accounting.this_period_total_kernel_time = accounting
+                    .this_period_total_kernel_time
+                    .saturating_add(times.kernel_time);
+            }
+        }
+        Ok(accounting)
+    }
+
+    pub fn job_basic_limits(&self, id: job::JobId) -> Result<job::JobBasicLimits, u32> {
+        self.jobs.basic_limits(id)
+    }
+
+    pub fn job_extended_limits(&self, id: job::JobId) -> Result<job::JobExtendedLimits, u32> {
+        self.jobs.extended_limits(id)
+    }
+
+    pub fn set_job_basic_limits(
+        &mut self,
+        id: job::JobId,
+        limits: job::JobBasicLimits,
+    ) -> Result<(), u32> {
+        self.jobs.set_basic_limits(id, limits)
+    }
+
+    pub fn set_job_extended_limits(
+        &mut self,
+        id: job::JobId,
+        limits: job::JobExtendedLimits,
+    ) -> Result<(), u32> {
+        self.jobs.set_extended_limits(id, limits)
+    }
+
+    pub fn job_ui_restrictions(&self, id: job::JobId) -> Result<u32, u32> {
+        self.jobs.ui_restrictions(id)
+    }
+
+    pub fn set_job_ui_restrictions(
+        &mut self,
+        id: job::JobId,
+        restrictions: u32,
+    ) -> Result<(), u32> {
+        self.jobs.set_ui_restrictions(id, restrictions)
+    }
+
+    pub fn job_security_limits(&self, id: job::JobId) -> Result<u32, u32> {
+        self.jobs.security_limits(id)
+    }
+
+    pub fn set_job_security_limits(&mut self, id: job::JobId, limits: u32) -> Result<(), u32> {
+        self.jobs.set_security_limits(id, limits)
+    }
+
+    pub fn job_end_of_job_time_action(&self, id: job::JobId) -> Result<u32, u32> {
+        self.jobs.end_of_job_time_action(id)
+    }
+
+    pub fn set_job_end_of_job_time_action(
+        &mut self,
+        id: job::JobId,
+        action: u32,
+    ) -> Result<(), u32> {
+        self.jobs.set_end_of_job_time_action(id, action)
+    }
+
+    pub fn job_completion_port(
+        &self,
+        id: job::JobId,
+    ) -> Result<Option<job::CompletionPortAssociation>, u32> {
+        self.jobs.completion_port(id)
+    }
+
+    pub fn associate_job_completion_port(
+        &mut self,
+        id: job::JobId,
+        association: job::CompletionPortAssociation,
+    ) -> Result<(), u32> {
+        self.jobs.associate_completion_port(id, association)
+    }
+
+    pub fn job_member_level(&self, id: job::JobId) -> Result<u32, u32> {
+        self.jobs.member_level(id)
+    }
+
+    pub fn create_job_set(&mut self, members: &[(job::JobId, u32)]) -> Result<(), u32> {
+        self.jobs.create_set(members)
+    }
+
+    pub fn select_job_from_set(
+        &self,
+        parent: job::JobId,
+        requested_level: u32,
+    ) -> Result<job::JobId, u32> {
+        self.jobs.select_from_set(parent, requested_level)
+    }
+
+    pub fn take_job_notification(&mut self) -> Option<job::JobNotification> {
+        self.jobs.take_notification()
+    }
+
+    pub fn retain_job_wait_reference(&mut self, id: job::JobId) -> Result<(), u32> {
+        self.jobs.retain_wait(id)
+    }
+
+    pub fn release_job_wait_reference(&mut self, id: job::JobId) -> Result<bool, u32> {
+        self.jobs.release_wait(id)
+    }
+
+    pub fn is_job_signaled(&self, id: job::JobId) -> bool {
+        self.jobs.is_signaled(id)
     }
 
     // --- Dbgk: the user-mode debugging plane (ntoskrnl/dbgk) -----------------
@@ -3544,6 +3776,9 @@ impl ProcessManager {
         object: HandleObject,
         granted_access: u32,
     ) -> Result<Handle, u32> {
+        if !self.processes.contains_key(&pid) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
         match object {
             HandleObject::Process(target) if !self.processes.contains_key(&target) => {
                 return Err(STATUS_INVALID_HANDLE);
@@ -3551,10 +3786,19 @@ impl ProcessManager {
             HandleObject::Thread(target) if !self.threads.contains_key(&target) => {
                 return Err(STATUS_INVALID_HANDLE);
             }
+            HandleObject::Job(target) if !self.jobs.contains(target) => {
+                return Err(STATUS_INVALID_HANDLE);
+            }
             _ => {}
         }
+        if let HandleObject::Job(object) = object {
+            self.jobs.retain_handle(object)?;
+        }
         let slot = {
-            let proc = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+            let proc = self
+                .processes
+                .get_mut(&pid)
+                .expect("validated handle-table owner");
             let entry = HandleEntry {
                 object,
                 granted_access,
@@ -3657,8 +3901,14 @@ impl ProcessManager {
     /// `NtClose` (spec §8.1): remove a handle from `pid`'s table (frees the slot for reuse).
     pub fn close_handle(&mut self, pid: ProcessId, handle: Handle) -> Result<(), u32> {
         let object = self.take_handle_for_close(pid, handle)?;
-        if let HandleObject::Process(target) = object {
-            let _ = self.clear_deleted_process_debug_object_if_unreferenced(target);
+        match object {
+            HandleObject::Process(target) => {
+                let _ = self.clear_deleted_process_debug_object_if_unreferenced(target);
+            }
+            HandleObject::Job(target) => {
+                let _ = self.jobs.release_handle(target);
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -3685,8 +3935,14 @@ impl ProcessManager {
             .position(|e| e.entry().is_some_and(|h| h.object == object))
         {
             proc.handles[slot] = HandleSlot::Free;
-            if let HandleObject::Process(target) = object {
-                let _ = self.clear_deleted_process_debug_object_if_unreferenced(target);
+            match object {
+                HandleObject::Process(target) => {
+                    let _ = self.clear_deleted_process_debug_object_if_unreferenced(target);
+                }
+                HandleObject::Job(target) => {
+                    let _ = self.jobs.release_handle(target);
+                }
+                _ => {}
             }
             true
         } else {

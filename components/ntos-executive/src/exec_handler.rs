@@ -962,6 +962,7 @@ fn trace_handle_object_for(nt: &ExecNtHandler, handle: u64) {
         Some(nt_process::HandleObject::Token(_)) => print_str(b"token"),
         Some(nt_process::HandleObject::TokenObject(_)) => print_str(b"token-object"),
         Some(nt_process::HandleObject::DebugObject(_)) => print_str(b"debug-object"),
+        Some(nt_process::HandleObject::Job(_)) => print_str(b"job"),
         None => print_str(b"missing"),
     }
 }
@@ -3095,6 +3096,7 @@ impl ExecNtHandler {
         write_field!(user_apc_redirected, false);
         write_field!(context_continue_redirected, false);
         write_field!(post_action, ExecPostAction::None);
+        write_field!(pending_job_termination_mask, 0);
         write_field!(stop, false);
         write_field!(next_handle, FAKE_HANDLE);
         write_field!(out_writes, [(0, 0); 8]);
@@ -11366,6 +11368,19 @@ impl ExecNtHandler {
                 unsafe { crate::writable_fs::is_file_signaled(file_id)? };
                 Ok(Some(WaitObject::overlay_file(file_id)))
             }
+            Some(nt_process::HandleObject::Job(id)) => {
+                let granted = self
+                    .pm
+                    .handle_access(caller, handle as nt_process::Handle)
+                    .ok_or(STATUS_INVALID_HANDLE)?;
+                if required_access != 0 && granted & required_access != required_access {
+                    return Err(STATUS_ACCESS_DENIED);
+                }
+                if !self.pm.job_exists(id) {
+                    return Err(STATUS_INVALID_HANDLE);
+                }
+                Ok(Some(WaitObject::job(id)))
+            }
             Some(_) | None => Ok(None),
         }
     }
@@ -11520,6 +11535,9 @@ impl ExecNtHandler {
             WaitObject::KIND_OVERLAY_FILE => unsafe {
                 crate::writable_fs::retain_io_reference(object.id())
             },
+            WaitObject::KIND_JOB => self
+                .pm
+                .retain_job_wait_reference(object.id() as nt_process::job::JobId),
             _ => Err(STATUS_INVALID_HANDLE),
         }
     }
@@ -11547,6 +11565,12 @@ impl ExecNtHandler {
             WaitObject::KIND_OVERLAY_FILE => unsafe {
                 crate::writable_fs::release_io_reference(object.id())
             },
+            WaitObject::KIND_JOB => {
+                let id = object.id() as nt_process::job::JobId;
+                let _ = self.pm.release_job_wait_reference(id)?;
+                self.drain_job_destructions();
+                Ok(())
+            }
             _ => Err(STATUS_INVALID_HANDLE),
         }
     }
@@ -11572,6 +11596,9 @@ impl ExecNtHandler {
             WaitObject::KIND_OVERLAY_FILE => unsafe {
                 crate::writable_fs::is_file_signaled(object.id()).unwrap_or(false)
             },
+            WaitObject::KIND_JOB => self
+                .pm
+                .is_job_signaled(object.id() as nt_process::job::JobId),
             _ => false,
         }
     }
@@ -11592,7 +11619,8 @@ impl ExecNtHandler {
             WaitObject::KIND_FILE
             | WaitObject::KIND_FAT_FILE
             | WaitObject::KIND_FAT_DIRECTORY
-            | WaitObject::KIND_OVERLAY_FILE => true,
+            | WaitObject::KIND_OVERLAY_FILE
+            | WaitObject::KIND_JOB => true,
             _ => false,
         }
     }
@@ -15393,6 +15421,7 @@ impl ExecNtHandler {
                     b"Token"
                 }
                 nt_process::HandleObject::DebugObject(_) => b"DebugObject",
+                nt_process::HandleObject::Job(_) => b"Job",
                 nt_process::HandleObject::Opaque(tag)
                     if tag & EVENT_HANDLE_TAG_MASK == EVENT_HANDLE_TAG =>
                 {
@@ -15445,6 +15474,9 @@ impl ExecNtHandler {
         }
         if let nt_process::HandleObject::IoCompletion(id) = object {
             return self.io_completion_namespace_index(id);
+        }
+        if let nt_process::HandleObject::Job(id) = object {
+            return self.job_namespace_index(id);
         }
         let tag = match object {
             nt_process::HandleObject::Opaque(tag) => tag,
@@ -18690,6 +18722,9 @@ impl ExecNtHandler {
                     self.pm.destroy_debug_object(object);
                 }
             }
+            nt_process::HandleObject::Job(object) => {
+                self.release_job_reference(object);
+            }
             nt_process::HandleObject::Opaque(tag) => {
                 self.release_opaque_namespace_reference(tag);
             }
@@ -18779,6 +18814,7 @@ impl ExecNtHandler {
             nt_process::HandleObject::TokenObject(_) | nt_process::HandleObject::Token(_) => {
                 nt_security::map_token_access(access)
             }
+            nt_process::HandleObject::Job(_) => nt_process::job::map_job_access(access),
             _ => access,
         });
         let handle = self.insert_process_handle(
@@ -22047,6 +22083,697 @@ impl ExecNtHandler {
         }
     }
 
+    fn job_id_for_handle(
+        &self,
+        handle: u64,
+        required_access: u32,
+    ) -> Result<nt_process::job::JobId, u32> {
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+        let caller = self
+            .pm_pid_for_pi(self.pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let handle = u32::try_from(handle).map_err(|_| nt_process::STATUS_INVALID_HANDLE)?;
+        let id = match self.pm.lookup_handle(caller, handle) {
+            Some(nt_process::HandleObject::Job(id)) if self.pm.job_exists(id) => id,
+            _ => return Err(nt_process::STATUS_INVALID_HANDLE),
+        };
+        let granted = self
+            .pm
+            .handle_access(caller, handle)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        if required_access != 0 && granted & required_access != required_access {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        Ok(id)
+    }
+
+    fn job_namespace_index(&self, id: nt_process::job::JobId) -> Option<usize> {
+        self.obj_ns.iter().position(|entry| {
+            entry.is_live() && entry.kind == OBJ_KIND_JOB && entry.payload == id as u64
+        })
+    }
+
+    fn unlink_job_namespace(&mut self, id: nt_process::job::JobId) {
+        if let Some(index) = self.job_namespace_index(id) {
+            if !self.obj_ns[index].permanent {
+                self.obj_ns[index].unlink();
+            }
+        }
+    }
+
+    fn mint_job_handle(
+        &mut self,
+        id: nt_process::job::JobId,
+        desired_access: u32,
+    ) -> Result<u64, u32> {
+        let owner = self
+            .pm_pid_for_pi(self.pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        self.insert_process_handle(
+            owner,
+            nt_process::HandleObject::Job(id),
+            nt_process::job::map_job_access(desired_access),
+        )
+        .map(u64::from)
+    }
+
+    fn drain_job_notifications(&mut self) {
+        while let Some(notification) = self.pm.take_job_notification() {
+            let _ = self.post_io_completion_packet(
+                notification.association.port_id,
+                nt_io_completion::CompletionPacket {
+                    key_context: notification.association.completion_key,
+                    apc_context: notification.process_id as u64,
+                    status: 0,
+                    information: notification.message as u64,
+                },
+            );
+        }
+    }
+
+    fn drain_job_destructions(&mut self) {
+        while let Some(destruction) = self.pm.take_job_destruction() {
+            if let Some(association) = destruction.released_completion_port {
+                let _ = self.io_completion_ports.release(association.port_id);
+            }
+            self.unlink_job_namespace(destruction.id);
+        }
+    }
+
+    fn terminate_job_process(
+        &mut self,
+        pid: nt_process::ProcessId,
+        exit_status: u32,
+    ) -> Result<(), u32> {
+        if self.pm.is_process_signaled(pid) {
+            return Ok(());
+        }
+        if let Some(code) = self.pm.critical_process_termination_code(pid) {
+            self.post_action = ExecPostAction::CriticalTermination {
+                code,
+                object: pid as u64,
+            };
+            return Ok(());
+        }
+        self.pm.mark_job_process_forced_termination(pid)?;
+        self.pm
+            .terminate_process_at(pid, exit_status, nt_system_time_100ns() as i64)?;
+        self.release_process_handles(pid);
+        if let Some(process_index) = self.pi_for_pid(pid) {
+            let Some(bit) = 1u32.checked_shl(process_index as u32) else {
+                return Err(nt_process::STATUS_INSUFFICIENT_RESOURCES);
+            };
+            self.pending_job_termination_mask |= bit;
+        }
+        self.drain_job_notifications();
+        Ok(())
+    }
+
+    fn terminate_job_members(
+        &mut self,
+        id: nt_process::job::JobId,
+        exit_status: u32,
+    ) -> Result<(), u32> {
+        let mut pids = [0u32; MAX_PI];
+        let count = self.pm.job_active_process_ids(id, &mut pids)?;
+        for &pid in &pids[..count] {
+            self.terminate_job_process(pid, exit_status)?;
+        }
+        Ok(())
+    }
+
+    fn release_job_reference(&mut self, id: nt_process::job::JobId) {
+        let Ok(action) = self.pm.release_job_handle(id) else {
+            return;
+        };
+        if action.kill_active_processes {
+            let _ = self.terminate_job_members(id, 0);
+        }
+        self.drain_job_destructions();
+    }
+
+    unsafe fn nt_create_job_object(&mut self, args: &[u64]) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+        const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+        const STATUS_OBJECT_NAME_EXISTS: u32 = 0x4000_0000;
+        const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
+        const STATUS_OBJECT_PATH_NOT_FOUND: u32 = 0xC000_003A;
+        const OBJ_OPENIF: u32 = 0x0000_0080;
+
+        let output = args[0];
+        if output == 0 || !self.probe_user_output(output, 8) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if output & 7 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        let desired_access = nt_ulong_arg(args[1]);
+        let captured = if args[2] == 0 {
+            None
+        } else {
+            match self.capture_named_object_attributes(args[2]) {
+                Ok(captured) => Some(captured),
+                Err(status) => return status,
+            }
+        };
+
+        let mut namespace = None;
+        let mut permanent = false;
+        if let Some(captured) = captured.as_ref() {
+            permanent = captured.attributes & OBJ_PERMANENT != 0;
+            if let Some(path) = captured.path() {
+                let (root, path) = match self.event_root_and_path(captured.root, path) {
+                    Ok(value) => value,
+                    Err(status) => return status,
+                };
+                if let Some(index) = self.obj_resolve(path, root) {
+                    if self.obj_ns[index].kind != OBJ_KIND_JOB {
+                        return STATUS_OBJECT_TYPE_MISMATCH;
+                    }
+                    if captured.attributes & OBJ_OPENIF == 0 {
+                        return STATUS_OBJECT_NAME_COLLISION;
+                    }
+                    let id = self.obj_ns[index].payload as nt_process::job::JobId;
+                    if !self.pm.job_exists(id) {
+                        return nt_process::STATUS_INVALID_HANDLE;
+                    }
+                    let handle = match self.mint_job_handle(id, desired_access) {
+                        Ok(handle) => handle,
+                        Err(status) => return status,
+                    };
+                    if !self.xas_write_u64(output, handle) {
+                        self.close_current_handle(handle);
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    return STATUS_OBJECT_NAME_EXISTS;
+                }
+                namespace = Some((root, path));
+            }
+        }
+
+        let caller = match self.pm_pid_for_pi(self.pi) {
+            Some(pid) => pid,
+            None => return nt_process::STATUS_INVALID_HANDLE,
+        };
+        let session_id = match self.pm.process(caller) {
+            Some(process) => process.session_id,
+            None => return nt_process::STATUS_INVALID_HANDLE,
+        };
+        let id = match self.pm.create_job(session_id) {
+            Ok(id) => id,
+            Err(status) => return status,
+        };
+        let namespace_index = if let Some((root, path)) = namespace {
+            let Some(index) = self.obj_create(path, root, OBJ_KIND_JOB, &[], permanent) else {
+                self.pm.discard_unreferenced_job(id);
+                self.drain_job_destructions();
+                return STATUS_OBJECT_PATH_NOT_FOUND;
+            };
+            self.obj_ns[index].payload = id as u64;
+            if permanent {
+                if let Err(status) = self.pm.retain_job_wait_reference(id) {
+                    self.obj_ns[index].unlink();
+                    self.pm.discard_unreferenced_job(id);
+                    self.drain_job_destructions();
+                    return status;
+                }
+            }
+            Some(index)
+        } else {
+            None
+        };
+        let handle = match self.mint_job_handle(id, desired_access) {
+            Ok(handle) => handle,
+            Err(status) => {
+                if permanent {
+                    let _ = self.pm.release_job_wait_reference(id);
+                }
+                if let Some(index) = namespace_index {
+                    self.obj_ns[index].unlink();
+                }
+                self.pm.discard_unreferenced_job(id);
+                self.drain_job_destructions();
+                return status;
+            }
+        };
+        if !self.xas_write_u64(output, handle) {
+            self.close_current_handle(handle);
+            if let Some(index) = namespace_index {
+                if self.obj_ns[index].is_live() && !self.obj_ns[index].permanent {
+                    self.obj_ns[index].unlink();
+                }
+            }
+            return STATUS_ACCESS_VIOLATION;
+        }
+        0
+    }
+
+    unsafe fn nt_open_job_object(&mut self, args: &[u64]) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+        const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+        const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+
+        let output = args[0];
+        if output == 0 || !self.probe_user_output(output, 8) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if output & 7 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        let captured = match self.capture_named_object_attributes(args[2]) {
+            Ok(captured) => captured,
+            Err(status) => return status,
+        };
+        let Some(path) = captured.path() else {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        };
+        let (root, path) = match self.event_root_and_path(captured.root, path) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let Some(index) = self.obj_resolve(path, root) else {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        };
+        if self.obj_ns[index].kind != OBJ_KIND_JOB {
+            return STATUS_OBJECT_TYPE_MISMATCH;
+        }
+        let id = self.obj_ns[index].payload as nt_process::job::JobId;
+        if !self.pm.job_exists(id) {
+            return nt_process::STATUS_INVALID_HANDLE;
+        }
+        let handle = match self.mint_job_handle(id, nt_ulong_arg(args[1])) {
+            Ok(handle) => handle,
+            Err(status) => return status,
+        };
+        if !self.xas_write_u64(output, handle) {
+            self.close_current_handle(handle);
+            return STATUS_ACCESS_VIOLATION;
+        }
+        0
+    }
+
+    fn nt_is_process_in_job(&self, args: &[u64]) -> u32 {
+        let caller = match self.pm_pid_for_pi(self.pi) {
+            Some(pid) => pid,
+            None => return nt_process::STATUS_INVALID_HANDLE,
+        };
+        let pid = match self.pm.resolve_process_handle(
+            caller,
+            args[0],
+            nt_process::PROCESS_QUERY_INFORMATION,
+        ) {
+            Ok(pid) => pid,
+            Err(status) => return status,
+        };
+        let job = if args[1] == 0 {
+            None
+        } else {
+            match self.job_id_for_handle(args[1], nt_process::job::JOB_OBJECT_QUERY) {
+                Ok(id) => Some(id),
+                Err(status) => return status,
+            }
+        };
+        self.pm
+            .is_process_in_job(pid, job)
+            .unwrap_or_else(|status| status)
+    }
+
+    fn nt_assign_process_to_job_object(&mut self, args: &[u64]) -> u32 {
+        let id = match self.job_id_for_handle(args[0], nt_process::job::JOB_OBJECT_ASSIGN_PROCESS) {
+            Ok(id) => id,
+            Err(status) => return status,
+        };
+        let caller = match self.pm_pid_for_pi(self.pi) {
+            Some(pid) => pid,
+            None => return nt_process::STATUS_INVALID_HANDLE,
+        };
+        let pid = match self.pm.resolve_process_handle(
+            caller,
+            args[1],
+            nt_process::PROCESS_SET_QUOTA | nt_process::PROCESS_TERMINATE,
+        ) {
+            Ok(pid) => pid,
+            Err(status) => return status,
+        };
+        if self.pm.job_security_limits(id).unwrap_or(0) != 0 {
+            return STATUS_NOT_SUPPORTED;
+        }
+        let status = match self.pm.assign_process_to_job(id, pid) {
+            Ok(status) => status,
+            Err(status) => return status,
+        };
+        self.drain_job_notifications();
+        if status == nt_process::job::STATUS_QUOTA_EXCEEDED {
+            if let Err(error) = self.terminate_job_process(pid, 0x0000_0008) {
+                return error;
+            }
+        }
+        status
+    }
+
+    unsafe fn nt_create_job_set(&mut self, args: &[u64]) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+        let count = nt_ulong_arg(args[0]) as usize;
+        if nt_ulong_arg(args[2]) != 0 || count <= 1 {
+            return nt_process::STATUS_INVALID_PARAMETER;
+        }
+        let Some(length) = count.checked_mul(nt_process::job_abi::JOB_SET_ARRAY_ENTRY_SIZE) else {
+            return nt_process::STATUS_INVALID_PARAMETER;
+        };
+        if args[1] == 0 {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if args[1] & 7 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        let mut bytes = alloc::vec::Vec::new();
+        if bytes.try_reserve_exact(length).is_err() {
+            return nt_process::STATUS_INSUFFICIENT_RESOURCES;
+        }
+        bytes.resize(length, 0);
+        if !self.xas_read(args[1], &mut bytes) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let mut members = alloc::vec::Vec::new();
+        if members.try_reserve_exact(count).is_err() {
+            return nt_process::STATUS_INSUFFICIENT_RESOURCES;
+        }
+        for entry in bytes.chunks_exact(nt_process::job_abi::JOB_SET_ARRAY_ENTRY_SIZE) {
+            let handle = u64::from_le_bytes(entry[0..8].try_into().unwrap());
+            let level = u32::from_le_bytes(entry[8..12].try_into().unwrap());
+            let flags = u32::from_le_bytes(entry[12..16].try_into().unwrap());
+            if flags != 0 {
+                return nt_process::STATUS_INVALID_PARAMETER;
+            }
+            let id = match self.job_id_for_handle(handle, nt_process::job::JOB_OBJECT_QUERY) {
+                Ok(id) => id,
+                Err(status) => return status,
+            };
+            members.push((id, level));
+        }
+        self.pm
+            .create_job_set(&members)
+            .map_or_else(|status| status, |()| 0)
+    }
+
+    unsafe fn nt_query_information_job_object(&mut self, args: &[u64]) -> u32 {
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+
+        let class = match nt_process::job_abi::JobInformationClass::from_u32(nt_ulong_arg(args[1]))
+        {
+            Some(class) => class,
+            None => return nt_process::STATUS_INVALID_INFO_CLASS,
+        };
+        let length = nt_ulong_arg(args[3]) as usize;
+        let minimum = class.minimum_length();
+        if if class.variable_length() {
+            length < minimum
+        } else {
+            length != minimum
+        } {
+            return nt_process::STATUS_INFO_LENGTH_MISMATCH;
+        }
+        if args[2] == 0 || args[2] & (class.alignment() as u64 - 1) != 0 {
+            return if args[2] == 0 {
+                STATUS_ACCESS_VIOLATION
+            } else {
+                STATUS_DATATYPE_MISALIGNMENT
+            };
+        }
+        if !self.probe_user_output(args[2], length) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if args[4] != 0 {
+            if args[4] & 3 != 0 {
+                return STATUS_DATATYPE_MISALIGNMENT;
+            }
+            if !self.probe_user_output(args[4], 4) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+        }
+        let id = if args[0] == 0 {
+            let caller = match self.pm_pid_for_pi(self.pi) {
+                Some(pid) => pid,
+                None => return nt_process::STATUS_INVALID_HANDLE,
+            };
+            match self.pm.process_job(caller) {
+                Some(id) => id,
+                None => return STATUS_ACCESS_DENIED,
+            }
+        } else {
+            match self.job_id_for_handle(args[0], nt_process::job::JOB_OBJECT_QUERY) {
+                Ok(id) => id,
+                Err(status) => return status,
+            }
+        };
+
+        let mut fixed = [0u8; nt_process::job_abi::BASIC_PROCESS_ID_LIST_HEADER_SIZE + MAX_PI * 8];
+        let (status, actual, output): (u32, usize, &[u8]) = match class {
+            nt_process::job_abi::JobInformationClass::BasicAccounting => {
+                let accounting = match self.pm.job_accounting(id) {
+                    Ok(value) => value,
+                    Err(status) => return status,
+                };
+                let actual =
+                    nt_process::job_abi::encode_accounting(accounting, &mut fixed).unwrap();
+                (0, actual, &fixed[..actual])
+            }
+            nt_process::job_abi::JobInformationClass::BasicAndIoAccounting => {
+                let accounting = match self.pm.job_accounting(id) {
+                    Ok(value) => value,
+                    Err(status) => return status,
+                };
+                let actual =
+                    nt_process::job_abi::encode_basic_and_io_accounting(accounting, &mut fixed)
+                        .unwrap();
+                (0, actual, &fixed[..actual])
+            }
+            nt_process::job_abi::JobInformationClass::BasicLimit => {
+                let limits = match self.pm.job_basic_limits(id) {
+                    Ok(value) => value,
+                    Err(status) => return status,
+                };
+                let actual = nt_process::job_abi::encode_basic_limits(limits, &mut fixed).unwrap();
+                (0, actual, &fixed[..actual])
+            }
+            nt_process::job_abi::JobInformationClass::ExtendedLimit => {
+                let limits = match self.pm.job_extended_limits(id) {
+                    Ok(value) => value,
+                    Err(status) => return status,
+                };
+                let actual =
+                    nt_process::job_abi::encode_extended_limits(limits, &mut fixed).unwrap();
+                (0, actual, &fixed[..actual])
+            }
+            nt_process::job_abi::JobInformationClass::BasicUiRestrictions => {
+                let value = match self.pm.job_ui_restrictions(id) {
+                    Ok(value) => value,
+                    Err(status) => return status,
+                };
+                fixed[..4].copy_from_slice(&value.to_le_bytes());
+                (0, 4, &fixed[..4])
+            }
+            nt_process::job_abi::JobInformationClass::SecurityLimit => {
+                let value = match self.pm.job_security_limits(id) {
+                    Ok(value) => value,
+                    Err(status) => return status,
+                };
+                fixed[..40].fill(0);
+                fixed[..4].copy_from_slice(&value.to_le_bytes());
+                (0, 40, &fixed[..40])
+            }
+            nt_process::job_abi::JobInformationClass::EndOfJobTime => {
+                let value = match self.pm.job_end_of_job_time_action(id) {
+                    Ok(value) => value,
+                    Err(status) => return status,
+                };
+                fixed[..4].copy_from_slice(&value.to_le_bytes());
+                (0, 4, &fixed[..4])
+            }
+            nt_process::job_abi::JobInformationClass::JobSet => {
+                let value = match self.pm.job_member_level(id) {
+                    Ok(value) => value,
+                    Err(status) => return status,
+                };
+                fixed[..4].copy_from_slice(&value.to_le_bytes());
+                (0, 4, &fixed[..4])
+            }
+            nt_process::job_abi::JobInformationClass::AssociateCompletionPort => {
+                return nt_process::STATUS_INVALID_INFO_CLASS;
+            }
+            nt_process::job_abi::JobInformationClass::BasicProcessIdList => {
+                let mut pids = [0u32; MAX_PI];
+                let (assigned, count) = match self.pm.job_process_ids(id, &mut pids) {
+                    Ok(value) => value,
+                    Err(status) => return status,
+                };
+                let available = length.min(fixed.len());
+                match nt_process::job_abi::encode_process_ids(
+                    assigned,
+                    &pids[..count],
+                    &mut fixed[..available],
+                ) {
+                    Ok(actual) => (0, actual, &fixed[..actual]),
+                    Err(status) => {
+                        let actual = nt_process::job_abi::BASIC_PROCESS_ID_LIST_HEADER_SIZE
+                            + ((available
+                                - nt_process::job_abi::BASIC_PROCESS_ID_LIST_HEADER_SIZE)
+                                / 8)
+                            .min(count)
+                                * 8;
+                        (status, actual, &fixed[..actual])
+                    }
+                }
+            }
+        };
+        if !self.xas_try_write_buf(args[2], output) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if status == 0
+            && args[4] != 0
+            && !self.xas_try_write_buf(args[4], &(actual as u32).to_le_bytes())
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        status
+    }
+
+    unsafe fn nt_set_information_job_object(&mut self, args: &[u64]) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+        const SUPPORTED_LIMIT_FLAGS: u32 = nt_process::job::JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+            | nt_process::job::JOB_OBJECT_LIMIT_AFFINITY
+            | nt_process::job::JOB_OBJECT_LIMIT_PRIORITY_CLASS
+            | nt_process::job::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+        let class = match nt_process::job_abi::JobInformationClass::from_u32(nt_ulong_arg(args[1]))
+        {
+            Some(class) => class,
+            None => return nt_process::STATUS_INVALID_INFO_CLASS,
+        };
+        let required_access = if class == nt_process::job_abi::JobInformationClass::SecurityLimit {
+            nt_process::job::JOB_OBJECT_SET_SECURITY_ATTRIBUTES
+        } else {
+            nt_process::job::JOB_OBJECT_SET_ATTRIBUTES
+        };
+        let id = match self.job_id_for_handle(args[0], required_access) {
+            Ok(id) => id,
+            Err(status) => return status,
+        };
+        let length = nt_ulong_arg(args[3]) as usize;
+        if length != class.minimum_length() {
+            return nt_process::STATUS_INFO_LENGTH_MISMATCH;
+        }
+        if args[2] == 0 {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if args[2] & (class.alignment() as u64 - 1) != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        let mut input = [0u8; nt_process::job_abi::EXTENDED_LIMIT_SIZE];
+        if !self.xas_read(args[2], &mut input[..length]) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        match class {
+            nt_process::job_abi::JobInformationClass::BasicLimit => {
+                let limits = nt_process::job_abi::decode_basic_limits(&input[..length]).unwrap();
+                if limits.limit_flags & !SUPPORTED_LIMIT_FLAGS != 0 {
+                    return STATUS_NOT_SUPPORTED;
+                }
+                self.pm
+                    .set_job_basic_limits(id, limits)
+                    .map_or_else(|status| status, |()| 0)
+            }
+            nt_process::job_abi::JobInformationClass::ExtendedLimit => {
+                let limits = nt_process::job_abi::decode_extended_limits(&input[..length]).unwrap();
+                if limits.basic.limit_flags & !SUPPORTED_LIMIT_FLAGS != 0 {
+                    return STATUS_NOT_SUPPORTED;
+                }
+                self.pm
+                    .set_job_extended_limits(id, limits)
+                    .map_or_else(|status| status, |()| 0)
+            }
+            nt_process::job_abi::JobInformationClass::BasicUiRestrictions => {
+                let value = u32::from_le_bytes(input[..4].try_into().unwrap());
+                if value != 0 {
+                    return STATUS_NOT_SUPPORTED;
+                }
+                self.pm
+                    .set_job_ui_restrictions(id, value)
+                    .map_or_else(|status| status, |()| 0)
+            }
+            nt_process::job_abi::JobInformationClass::SecurityLimit => {
+                let value = u32::from_le_bytes(input[..4].try_into().unwrap());
+                if value != 0 {
+                    return STATUS_NOT_SUPPORTED;
+                }
+                self.pm
+                    .set_job_security_limits(id, value)
+                    .map_or_else(|status| status, |()| 0)
+            }
+            nt_process::job_abi::JobInformationClass::EndOfJobTime => {
+                let value = u32::from_le_bytes(input[..4].try_into().unwrap());
+                self.pm
+                    .set_job_end_of_job_time_action(id, value)
+                    .map_or_else(|status| status, |()| 0)
+            }
+            nt_process::job_abi::JobInformationClass::AssociateCompletionPort => {
+                let completion_key = u64::from_le_bytes(input[..8].try_into().unwrap());
+                let port_handle = u64::from_le_bytes(input[8..16].try_into().unwrap());
+                let port_id = match self.io_completion_id_for(port_handle, 0x0002) {
+                    Ok(id) => id,
+                    Err(status) => return status,
+                };
+                if let Err(status) = self.io_completion_ports.retain(port_id) {
+                    return status;
+                }
+                let association = nt_process::job::CompletionPortAssociation {
+                    port_id,
+                    completion_key,
+                };
+                if let Err(status) = self.pm.associate_job_completion_port(id, association) {
+                    let _ = self.io_completion_ports.release(port_id);
+                    return status;
+                }
+                let mut pids = [0u32; MAX_PI];
+                let (_, count) = match self.pm.job_process_ids(id, &mut pids) {
+                    Ok(value) => value,
+                    Err(status) => return status,
+                };
+                for &pid in &pids[..count] {
+                    let status = self.post_io_completion_packet(
+                        port_id,
+                        nt_io_completion::CompletionPacket {
+                            key_context: completion_key,
+                            apc_context: pid as u64,
+                            status: 0,
+                            information: nt_process::job::JOB_OBJECT_MSG_NEW_PROCESS as u64,
+                        },
+                    );
+                    if status != 0 {
+                        return status;
+                    }
+                }
+                0
+            }
+            _ => nt_process::STATUS_INVALID_INFO_CLASS,
+        }
+    }
+
+    fn nt_terminate_job_object(&mut self, args: &[u64]) -> u32 {
+        let id = match self.job_id_for_handle(args[0], nt_process::job::JOB_OBJECT_TERMINATE) {
+            Ok(id) => id,
+            Err(status) => return status,
+        };
+        self.terminate_job_members(id, args[1] as u32)
+            .map_or_else(|status| status, |()| 0)
+    }
+
     fn nt_make_temporary_object(&mut self, handle: u64) -> u32 {
         const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
         const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
@@ -22070,6 +22797,13 @@ impl ExecNtHandler {
         };
         if was_permanent && kind == OBJ_KIND_IO_COMPLETION {
             self.release_io_completion_reference(payload as u32);
+            return 0;
+        }
+        if was_permanent && kind == OBJ_KIND_JOB {
+            let _ = self
+                .pm
+                .release_job_wait_reference(payload as nt_process::job::JobId);
+            self.drain_job_destructions();
             return 0;
         }
         // For ordinary objects, removing OBJ_PERMANENT drops only the namespace's permanent
@@ -22099,6 +22833,14 @@ impl ExecNtHandler {
         }
         if kind == OBJ_KIND_IO_COMPLETION {
             if let Err(status) = self.io_completion_ports.retain(payload as u32) {
+                return status;
+            }
+        }
+        if kind == OBJ_KIND_JOB {
+            if let Err(status) = self
+                .pm
+                .retain_job_wait_reference(payload as nt_process::job::JobId)
+            {
                 return status;
             }
         }
@@ -28401,15 +29143,18 @@ impl ExecNtHandler {
                     args[4],
                 )
             },
-            NativeService::NtIsProcessInJob => {
-                // No hosted process is currently assigned to a job object. Still validate the process
-                // handle so callers get a real handle-table answer before the "not in job" result.
-                const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
-                match self.resolve_process_for_access(args[0], PROCESS_QUERY_INFORMATION) {
-                    Ok(_) => 0,
-                    Err(status) => status,
-                }
-            }
+            NativeService::NtAssignProcessToJobObject => self.nt_assign_process_to_job_object(args),
+            NativeService::NtCreateJobObject => unsafe { self.nt_create_job_object(args) },
+            NativeService::NtCreateJobSet => unsafe { self.nt_create_job_set(args) },
+            NativeService::NtIsProcessInJob => self.nt_is_process_in_job(args),
+            NativeService::NtOpenJobObject => unsafe { self.nt_open_job_object(args) },
+            NativeService::NtQueryInformationJobObject => unsafe {
+                self.nt_query_information_job_object(args)
+            },
+            NativeService::NtSetInformationJobObject => unsafe {
+                self.nt_set_information_job_object(args)
+            },
+            NativeService::NtTerminateJobObject => self.nt_terminate_job_object(args),
             // NtDuplicateObject(SourceProcess, SourceHandle, TargetProcess, *TargetHandle,
             // DesiredAccess, HandleAttributes, Options). Resolve process handles in the caller's
             // table and duplicate the typed object into the target EPROCESS table. When a real CSR
@@ -34336,6 +35081,7 @@ impl ExecNtHandler {
                             OBJ_KIND_LPC_PORT => "Port",
                             OBJ_KIND_TIMER => "Timer",
                             OBJ_KIND_IO_COMPLETION => "IoCompletion",
+                            OBJ_KIND_JOB => "Job",
                             _ => "Directory",
                         };
                         records.push((name16, type_name));
