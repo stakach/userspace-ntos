@@ -15,6 +15,7 @@ mod access;
 pub mod create_token;
 mod native_acl;
 mod native_sd;
+mod port;
 pub mod se_exports;
 mod sid;
 mod token;
@@ -49,7 +50,10 @@ pub use native_sd::{
     STATUS_INVALID_SECURITY_DESCR, STATUS_UNKNOWN_REVISION, UNPROTECTED_DACL_SECURITY_INFORMATION,
     UNPROTECTED_SACL_SECURITY_INFORMATION,
 };
-pub use sid::{write_native_sid_sddl_utf16, Luid, Sid};
+pub use port::{
+    validate_secure_port_connect, SecurePortConnectSecurity, STATUS_SERVER_SID_MISMATCH,
+};
+pub use sid::{write_native_sid_sddl_utf16, Luid, Sid, STATUS_INVALID_SID};
 pub use token::{
     plan_client_impersonation, token_can_impersonate, AccessToken, AnonymousLogonTokenIds,
     ClientImpersonationPlan, GroupAdjustment, GroupAdjustmentPlan, GroupAdjustmentSummary,

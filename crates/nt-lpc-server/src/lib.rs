@@ -151,7 +151,14 @@ impl Server {
     fn op_create_port(&mut self, buf: &[u8]) -> Result<LpcReply, NtStatus> {
         let req: LpcCreatePortRequest = read_req(buf)?;
         let name = read_name(buf, req.name_offset, req.name_len_bytes)?;
-        let handle = self.core.create_port(&name, PortApi::Lpc);
+        let handle = self.core.create_port_with_owner(
+            &name,
+            PortApi::Lpc,
+            nt_port_core::ClientId {
+                process: req.server_process,
+                thread: req.server_thread,
+            },
+        );
         Ok(reply(NtStatus::SUCCESS, 0, handle, 0))
     }
 
@@ -381,6 +388,8 @@ impl Server {
             state: state_code(info.state),
             name_len_units: info.port_name.len() as u16,
             connection_id: info.connection_id,
+            server_process: info.server_id.process,
+            server_thread: info.server_id.thread,
             name: [0; LPC_QUERY_HANDLE_NAME_MAX_UNITS],
         };
         response.name[..info.port_name.len()].copy_from_slice(info.port_name);
@@ -559,6 +568,8 @@ mod tests {
             max_pool: 0,
             name_offset: 1000,
             name_len_bytes: 8,
+            server_process: 0,
+            server_thread: 0,
         };
         let buf = bytemuck::bytes_of(&bad).to_vec();
         assert_eq!(
@@ -776,7 +787,7 @@ mod tests {
                 out: [0; 512],
             });
             listen = c
-                .create_port(&utf16("\\LsaAuthenticationPort"), 0, 0, 0)
+                .create_port_with_owner(&utf16("\\LsaAuthenticationPort"), 0, 0, 0, 0x120, 0x124)
                 .unwrap();
             conn_id = c
                 .connect_port(&utf16("\\LSAAUTHENTICATIONPORT"), 0, &[])
@@ -802,18 +813,24 @@ mod tests {
         assert_eq!(listen_info.connection_id, 0);
         assert_eq!(listen_info.state, connection_state::NONE);
         assert_eq!(listen_info.name, utf16("\\lsaauthenticationport"));
+        assert_eq!(listen_info.server_process, 0x120);
+        assert_eq!(listen_info.server_thread, 0x124);
 
         let client_info = c.query_handle(client).unwrap();
         assert_eq!(client_info.endpoint, handle_endpoint::CLIENT_COMM_PORT);
         assert_eq!(client_info.connection_id, conn_id);
         assert_eq!(client_info.state, connection_state::CONNECTED);
         assert_eq!(client_info.name, utf16("\\lsaauthenticationport"));
+        assert_eq!(client_info.server_process, 0x120);
+        assert_eq!(client_info.server_thread, 0x124);
 
         let server_info = c.query_handle(server).unwrap();
         assert_eq!(server_info.endpoint, handle_endpoint::SERVER_COMM_PORT);
         assert_eq!(server_info.connection_id, conn_id);
         assert_eq!(server_info.state, connection_state::CONNECTED);
         assert_eq!(server_info.name, utf16("\\lsaauthenticationport"));
+        assert_eq!(server_info.server_process, 0x120);
+        assert_eq!(server_info.server_thread, 0x124);
 
         assert_eq!(
             c.query_handle(0xfeed).unwrap_err(),

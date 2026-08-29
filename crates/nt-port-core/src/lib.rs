@@ -110,6 +110,8 @@ pub struct PortHandleInfo<'a> {
     pub state: Option<ConnState>,
     /// Folded target/listen port name.
     pub port_name: &'a [u16],
+    /// Kernel-supplied identity of the process/thread that created the named listen port.
+    pub server_id: ClientId,
 }
 
 /// The outcome of [`PortCore::connect`].
@@ -206,6 +208,7 @@ struct Port {
     name: Vec<u16>,
     named: bool,
     api: PortApi,
+    owner: ClientId,
     /// Connection ids awaiting a receiver (Manual-policy FIFO).
     pending: Vec<u64>,
     /// Connection whose request was most recently received through this listen port. LPC's
@@ -220,6 +223,7 @@ struct Connection {
     port_name: Vec<u16>,
     subsystem_type: u32,
     client_id: ClientId,
+    server_id: ClientId,
     /// Opaque connection-info blob from the connector (SB_CONNECTION_INFO for an
     /// LPC connector, the ALPC ConnectionInformation blob for an ALPC connector).
     /// Passed through byte-for-byte to the acceptor — the bridge connection-info
@@ -342,6 +346,7 @@ impl PortCore {
                 connection_id: 0,
                 state: None,
                 port_name: port.name.as_slice(),
+                server_id: port.owner,
             });
         }
         self.connections.iter().find_map(|conn| {
@@ -351,6 +356,7 @@ impl PortCore {
                     connection_id: conn.id,
                     state: Some(conn.state),
                     port_name: conn.port_name.as_slice(),
+                    server_id: conn.server_id,
                 })
             } else if conn.server_handle == handle {
                 Some(PortHandleInfo {
@@ -358,6 +364,7 @@ impl PortCore {
                     connection_id: conn.id,
                     state: Some(conn.state),
                     port_name: conn.port_name.as_slice(),
+                    server_id: conn.server_id,
                 })
             } else {
                 None
@@ -370,6 +377,11 @@ impl PortCore {
     /// Create a (named or unnamed) port under `api`; returns its handle. Named
     /// ports are idempotent (re-create returns the existing handle).
     pub fn create_port(&mut self, name: &[u16], api: PortApi) -> u64 {
+        self.create_port_with_owner(name, api, ClientId::default())
+    }
+
+    /// Create a port while preserving the kernel-supplied identity of its owning server.
+    pub fn create_port_with_owner(&mut self, name: &[u16], api: PortApi, owner: ClientId) -> u64 {
         let name = fold_name(name);
         let named = !name.is_empty();
         if named {
@@ -383,6 +395,7 @@ impl PortCore {
             name,
             named,
             api,
+            owner,
             pending: Vec::new(),
             reply_connection: None,
         });
@@ -425,6 +438,7 @@ impl PortCore {
             .position(|p| p.named && p.name == name)
             .ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?;
         let server_api = self.ports[port_idx].api;
+        let server_id = self.ports[port_idx].owner;
 
         let id = self.next_conn_id;
         self.next_conn_id += 1;
@@ -439,6 +453,7 @@ impl PortCore {
                     name,
                     subsystem_type,
                     client_id,
+                    server_id,
                     stored,
                     ConnState::Connected,
                     client_api,
@@ -457,6 +472,7 @@ impl PortCore {
                     name,
                     subsystem_type,
                     client_id,
+                    server_id,
                     stored,
                     ConnState::Pending,
                     client_api,
@@ -702,6 +718,7 @@ impl Connection {
         port_name: Vec<u16>,
         subsystem_type: u32,
         client_id: ClientId,
+        server_id: ClientId,
         conn_info: Vec<u8>,
         state: ConnState,
         client_api: PortApi,
@@ -714,6 +731,7 @@ impl Connection {
             port_name,
             subsystem_type,
             client_id,
+            server_id,
             conn_info,
             response_info,
             state,
@@ -825,7 +843,12 @@ mod tests {
     fn handle_info_resolves_listen_client_and_server_handles() {
         let mut core = PortCore::new();
         core.set_accept_policy(AcceptPolicy::Manual);
-        let listen = core.create_port(&utf16("\\LsaAuthenticationPort"), PortApi::Lpc);
+        let owner = ClientId {
+            process: 0x120,
+            thread: 0x124,
+        };
+        let listen =
+            core.create_port_with_owner(&utf16("\\LsaAuthenticationPort"), PortApi::Lpc, owner);
         let cid = match core
             .connect(&utf16("\\LSAAUTHENTICATIONPORT"), PortApi::Lpc, 0, &[])
             .unwrap()
@@ -844,6 +867,7 @@ mod tests {
                 connection_id: 0,
                 state: None,
                 port_name: &utf16("\\lsaauthenticationport"),
+                server_id: owner,
             })
         );
         assert_eq!(
@@ -853,6 +877,7 @@ mod tests {
                 connection_id: cid,
                 state: Some(ConnState::Connected),
                 port_name: &utf16("\\lsaauthenticationport"),
+                server_id: owner,
             })
         );
         assert_eq!(
@@ -862,6 +887,7 @@ mod tests {
                 connection_id: cid,
                 state: Some(ConnState::Connected),
                 port_name: &utf16("\\lsaauthenticationport"),
+                server_id: owner,
             })
         );
         assert_eq!(core.handle_info(0xdead), None);

@@ -67,6 +67,8 @@ pub struct HandleQueryResult {
     pub endpoint: u16,
     pub state: u16,
     pub connection_id: u64,
+    pub server_process: u64,
+    pub server_thread: u64,
     pub name: Vec<u16>,
 }
 
@@ -99,6 +101,19 @@ impl<B: Backend> LpcClient<B> {
         max_message: u32,
         max_pool: u32,
     ) -> Result<u64, NtStatus> {
+        self.create_port_with_owner(name, max_connection_info, max_message, max_pool, 0, 0)
+    }
+
+    /// Create a named port while preserving the creator identity supplied by the kernel.
+    pub fn create_port_with_owner(
+        &mut self,
+        name: &[u16],
+        max_connection_info: u32,
+        max_message: u32,
+        max_pool: u32,
+        server_process: u64,
+        server_thread: u64,
+    ) -> Result<u64, NtStatus> {
         let hdr = size_of::<LpcCreatePortRequest>();
         let req = LpcCreatePortRequest {
             abi_size: hdr as u16,
@@ -108,6 +123,8 @@ impl<B: Backend> LpcClient<B> {
             max_pool,
             name_offset: hdr as u32,
             name_len_bytes: byte_len(name)?,
+            server_process,
+            server_thread,
         };
         let buf = pack_units::<LPC_CONTROL_BUF_LEN, _>(&req, name)?;
         let r = self
@@ -278,6 +295,8 @@ impl<B: Backend> LpcClient<B> {
             endpoint: response.endpoint,
             state: response.state,
             connection_id: response.connection_id,
+            server_process: response.server_process,
+            server_thread: response.server_thread,
             name: response.name[..name_len].to_vec(),
         })
     }
@@ -572,12 +591,37 @@ mod tests {
         assert_eq!(req.max_message, 512);
         assert_eq!(req.name_offset as usize, size_of::<LpcCreatePortRequest>());
         assert_eq!(req.name_len_bytes as usize, name.len() * 2);
+        assert_eq!(req.server_process, 0);
+        assert_eq!(req.server_thread, 0);
 
         let mut encoded = Vec::new();
         for unit in &name {
             encoded.extend_from_slice(&unit.to_le_bytes());
         }
         assert_eq!(&payload[req.name_offset as usize..], encoded.as_slice());
+    }
+
+    #[test]
+    fn create_port_preserves_kernel_supplied_owner_identity() {
+        let backend = CaptureBackend {
+            calls: Vec::new(),
+            reply: LpcReply {
+                status: NtStatus::SUCCESS.raw(),
+                detail0: 0x4c50_0000_0001,
+                ..Default::default()
+            },
+        };
+        let mut client = LpcClient::new(backend);
+        let name = wide(r"\Windows\ApiPort");
+        assert!(client
+            .create_port_with_owner(&name, 0x88, 0x148, 0, 12, 24)
+            .is_ok());
+        let payload = &client.backend_mut().calls[0].1;
+        let req = bytemuck::from_bytes::<LpcCreatePortRequest>(
+            &payload[..size_of::<LpcCreatePortRequest>()],
+        );
+        assert_eq!(req.server_process, 12);
+        assert_eq!(req.server_thread, 24);
     }
 
     #[test]

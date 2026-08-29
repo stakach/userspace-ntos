@@ -17,7 +17,7 @@
 #![no_std]
 
 /// ABI version. Bump on any incompatible wire change.
-pub const LPC_ABI_VERSION: u32 = 2;
+pub const LPC_ABI_VERSION: u32 = 3;
 
 /// The reserved SURT opcode range for the LPC protocol (fresh block after
 /// object 0x2000 / config 0x2100).
@@ -138,6 +138,10 @@ pub struct LpcCreatePortRequest {
     /// Byte offset of the UTF-16 port name (0-length = unnamed communication port).
     pub name_offset: u32,
     pub name_len_bytes: u32,
+    /// Kernel-supplied creator `CLIENT_ID.UniqueProcess`.
+    pub server_process: u64,
+    /// Kernel-supplied creator `CLIENT_ID.UniqueThread`.
+    pub server_thread: u64,
 }
 
 /// `LPC_OP_CONNECT_PORT` — connect to a named port; carries the connection-info blob.
@@ -259,6 +263,8 @@ pub struct LpcQueryHandleResponse {
     pub state: u16,
     pub name_len_units: u16,
     pub connection_id: u64,
+    pub server_process: u64,
+    pub server_thread: u64,
     pub name: [u16; LPC_QUERY_HANDLE_NAME_MAX_UNITS],
 }
 
@@ -270,6 +276,8 @@ impl Default for LpcQueryHandleResponse {
             state: connection_state::NONE,
             name_len_units: 0,
             connection_id: 0,
+            server_process: 0,
+            server_thread: 0,
             name: [0; LPC_QUERY_HANDLE_NAME_MAX_UNITS],
         }
     }
@@ -292,7 +300,7 @@ pub struct LpcReply {
 // ---------------------------------------------------------------------------
 const _: () = {
     use core::mem::{align_of, size_of};
-    assert!(size_of::<LpcCreatePortRequest>() == 24);
+    assert!(size_of::<LpcCreatePortRequest>() == 40);
     assert!(size_of::<LpcConnectPortRequest>() == 40);
     assert!(size_of::<LpcConnectionRequestMetadata>() == 32);
     assert!(size_of::<LpcAcceptConnectRequest>() == 32);
@@ -301,10 +309,10 @@ const _: () = {
     assert!(size_of::<LpcMessageRequest>() == 24);
     assert!(size_of::<LpcClosePortRequest>() == 16);
     assert!(size_of::<LpcQueryHandleRequest>() == 16);
-    assert!(size_of::<LpcQueryHandleResponse>() == 144);
+    assert!(size_of::<LpcQueryHandleResponse>() == 160);
     assert!(size_of::<LpcReply>() == 24);
     assert!(align_of::<LpcAcceptConnectRequest>() == 8);
-    assert!(align_of::<LpcCreatePortRequest>() == 4);
+    assert!(align_of::<LpcCreatePortRequest>() == 8);
     assert!(align_of::<LpcQueryHandleResponse>() == 8);
 };
 
@@ -353,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn version_is_one() {
-        assert_eq!(LPC_ABI_VERSION, 2);
+    fn version_is_current() {
+        assert_eq!(LPC_ABI_VERSION, 3);
     }
 }

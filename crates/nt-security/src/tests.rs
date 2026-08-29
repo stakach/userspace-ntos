@@ -2649,3 +2649,44 @@ fn create_token_insufficient_resources_is_reachable_only_by_allocation_failure()
     assert_ne!(STATUS_INVALID_PARAMETER, STATUS_INSUFFICIENT_RESOURCES);
     assert_eq!(STATUS_INSUFFICIENT_RESOURCES, 0xC000_009A);
 }
+
+#[test]
+fn secure_port_connect_validates_the_named_port_owner_sid() {
+    let mut qos = [0u8; 12];
+    qos[..4].copy_from_slice(&12u32.to_le_bytes());
+    qos[4..8].copy_from_slice(&(SecurityImpersonationLevel::Impersonation as u32).to_le_bytes());
+    qos[8] = 1;
+    qos[9] = 1;
+    let mut system_sid = [0u8; 12];
+    assert_eq!(Sid::local_system().write_native(&mut system_sid), Some(12));
+
+    let captured =
+        validate_secure_port_connect(&qos, Some(&system_sid), Some(&AccessToken::system()))
+            .unwrap();
+    assert_eq!(captured.required_server_sid, Some(Sid::local_system()));
+    assert_eq!(
+        captured.qos.tracking_mode,
+        SecurityContextTrackingMode::Dynamic
+    );
+    assert!(captured.qos.effective_only);
+
+    assert_eq!(
+        validate_secure_port_connect(&qos, Some(&system_sid), Some(&AccessToken::user(MACHINE)),),
+        Err(STATUS_SERVER_SID_MISMATCH)
+    );
+    assert_eq!(
+        validate_secure_port_connect(&qos, Some(&system_sid), None),
+        Err(STATUS_SERVER_SID_MISMATCH)
+    );
+    assert!(validate_secure_port_connect(&qos, None, None).is_ok());
+
+    let malformed_sid = [1u8, 1, 0, 0, 0, 0, 0, 5];
+    assert_eq!(
+        validate_secure_port_connect(&qos, Some(&malformed_sid), Some(&AccessToken::system())),
+        Err(STATUS_INVALID_SID)
+    );
+    assert_eq!(
+        validate_secure_port_connect(&qos[..11], None, None),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+}
