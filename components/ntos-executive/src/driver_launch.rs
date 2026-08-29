@@ -10627,21 +10627,18 @@ fn hosted_wait_timeout_from_code(code: u64) -> DispatcherWaitTimeout {
 fn hosted_driver_deadline_from_timeout(
     timeout_code: u64,
     timeout_arg: u64,
-) -> Result<Option<u64>, i32> {
+) -> Result<nt_kernel_exec::Deadline, i32> {
     match hosted_wait_timeout_from_code(timeout_code) {
         DispatcherWaitTimeout::Poll => Err(STATUS_TIMEOUT_I32),
-        DispatcherWaitTimeout::Infinite => Ok(None),
+        DispatcherWaitTimeout::Infinite => Ok(nt_kernel_exec::Deadline::Infinite),
         DispatcherWaitTimeout::Blocking => {
             let now = crate::nt_time_snapshot();
-            let deadline = nt_delay_execution::due_time(
-                timeout_arg as i64,
-                now.monotonic_100ns,
-                now.system_time_100ns,
-            );
+            let deadline =
+                nt_kernel_exec::Deadline::from_nt_timeout(Some(timeout_arg as i64), now);
             if deadline.is_due(now) {
                 Err(STATUS_TIMEOUT_I32)
             } else {
-                Ok(deadline.monotonic_target(now))
+                Ok(deadline)
             }
         }
     }
@@ -10795,12 +10792,12 @@ fn park_hosted_driver_wait(
     objects: Vec<u64>,
     wait_all: bool,
     api_multiple: bool,
-    deadline_100ns: Option<u64>,
+    deadline: nt_kernel_exec::Deadline,
 ) -> Option<u64> {
     if objects.is_empty() || objects.len() > HOSTED_DRIVER_WAIT_OBJECT_MAX as usize {
         return None;
     }
-    if deadline_100ns.is_some()
+    if deadline != nt_kernel_exec::Deadline::Infinite
         && !unsafe { crate::service_sec_image::rearm_registered_delay_timer() }
     {
         return None;
@@ -10833,7 +10830,7 @@ fn park_hosted_driver_wait(
         objects,
         wait_all,
         api_multiple,
-        deadline_100ns,
+        deadline,
         sequence: HOSTED_DRIVER_WAIT_SEQUENCE.fetch_add(1, Ordering::Relaxed),
     });
     if !rotate_hosted_driver_active_reply(instance, active_reply_cap, fresh) {
@@ -10851,7 +10848,7 @@ fn park_hosted_driver_wait(
     } else {
         HOSTED_DRIVER_WAIT_SINGLE_PARKED.fetch_add(1, Ordering::Relaxed);
     }
-    if deadline_100ns.is_some() {
+    if deadline != nt_kernel_exec::Deadline::Infinite {
         let _ = unsafe { crate::service_sec_image::rearm_registered_delay_timer() };
     }
     Some(fresh)
@@ -10915,11 +10912,12 @@ pub(crate) fn hosted_driver_wait_census() -> (u64, u64, u64, u64, u64) {
 }
 
 pub(crate) fn hosted_driver_wait_next_deadline() -> Option<u64> {
+    let now = crate::nt_time_snapshot();
     unsafe {
         (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS))
             .as_ref()?
             .iter()
-            .filter_map(|waiter| waiter.deadline_100ns)
+            .filter_map(|waiter| waiter.deadline.monotonic_target(now))
             .min()
     }
 }
@@ -11053,6 +11051,7 @@ pub(crate) unsafe fn drain_hosted_driver_dpc_activations() -> u64 {
 }
 
 pub(crate) unsafe fn hosted_driver_wait_wake_due(now_100ns: u64) -> u64 {
+    let now = crate::nt_time_snapshot_at(now_100ns);
     let mut woken = 0u64;
     loop {
         let due_index = {
@@ -11062,14 +11061,11 @@ pub(crate) unsafe fn hosted_driver_wait_wake_due(now_100ns: u64) -> u64 {
             waiters
                 .iter()
                 .enumerate()
-                .filter_map(|(index, waiter)| {
-                    waiter
-                        .deadline_100ns
-                        .filter(|deadline| *deadline <= now_100ns)
-                        .map(|deadline| (index, deadline, waiter.sequence))
+                .filter(|(_, waiter)| waiter.deadline.is_due(now))
+                .min_by_key(|(_, waiter)| {
+                    (waiter.deadline.ordering_key(now), waiter.sequence)
                 })
-                .min_by_key(|(_, deadline, sequence)| (*deadline, *sequence))
-                .map(|(index, _, _)| index)
+                .map(|(index, _)| index)
         };
         let Some(index) = due_index else {
             break;
@@ -39837,7 +39833,7 @@ struct HostedDriverRawWaiter {
     objects: Vec<u64>,
     wait_all: bool,
     api_multiple: bool,
-    deadline_100ns: Option<u64>,
+    deadline: nt_kernel_exec::Deadline,
     sequence: u64,
 }
 
@@ -40078,7 +40074,7 @@ unsafe fn cancel_hosted_driver_waits_for_thread(instance: usize, thread_handle: 
             {
                 let waiter = waiters.remove(index);
                 removed += 1;
-                removed_timed |= waiter.deadline_100ns.is_some();
+                removed_timed |= waiter.deadline != nt_kernel_exec::Deadline::Infinite;
                 if waiter.reply_cap != 0 {
                     let _ = cnode_delete_recycle_r(waiter.reply_cap);
                 }
@@ -40142,7 +40138,7 @@ fn clear_hosted_driver_waits_for_instance(instance: usize) {
             while index < waiters.len() {
                 if waiters[index].instance == instance {
                     let waiter = waiters.remove(index);
-                    removed |= waiter.deadline_100ns.is_some();
+                    removed |= waiter.deadline != nt_kernel_exec::Deadline::Infinite;
                     if waiter.reply_cap != 0 {
                         let _ = cnode_delete_recycle_r(waiter.reply_cap);
                     }
@@ -41527,8 +41523,8 @@ pub(crate) fn service_hosted_driver_ke_wait_single(
                 HostedDriverWaitServiceResult::Reply(STATUS_SUCCESS)
             }
             Ok(false) => {
-                let deadline_100ns =
-                    match hosted_driver_deadline_from_timeout(timeout_code, timeout_arg) {
+                let deadline = match hosted_driver_deadline_from_timeout(timeout_code, timeout_arg)
+                {
                         Ok(deadline) => deadline,
                         Err(status) => {
                             if status == STATUS_TIMEOUT_I32 {
@@ -41557,7 +41553,7 @@ pub(crate) fn service_hosted_driver_ke_wait_single(
                     objects,
                     false,
                     false,
-                    deadline_100ns,
+                    deadline,
                 ) else {
                     HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
                     return HostedDriverWaitServiceResult::Reply(STATUS_INSUFFICIENT_RESOURCES);
@@ -41573,7 +41569,7 @@ pub(crate) fn service_hosted_driver_ke_wait_single(
                     print_str(b" object=0x");
                     print_hex((object >> 32) as u32);
                     print_hex(object as u32);
-                    if let Some(deadline) = deadline_100ns {
+                    if let Some(deadline) = deadline.monotonic_target(crate::nt_time_snapshot()) {
                         print_str(b" deadline=");
                         print_u64(deadline);
                     }
@@ -41700,8 +41696,8 @@ pub(crate) fn service_hosted_driver_ke_wait_multiple(
                 HostedDriverWaitServiceResult::Reply(status as i32)
             }
             Ok(None) => {
-                let deadline_100ns =
-                    match hosted_driver_deadline_from_timeout(timeout_code, timeout_arg) {
+                let deadline = match hosted_driver_deadline_from_timeout(timeout_code, timeout_arg)
+                {
                         Ok(deadline) => deadline,
                         Err(status) => {
                             if status == STATUS_TIMEOUT_I32 {
@@ -41725,7 +41721,7 @@ pub(crate) fn service_hosted_driver_ke_wait_multiple(
                     objects,
                     wait_all,
                     true,
-                    deadline_100ns,
+                    deadline,
                 ) else {
                     HOSTED_DRIVER_WAIT_MULTIPLE_REJECTS.fetch_add(1, Ordering::Relaxed);
                     return HostedDriverWaitServiceResult::Reply(STATUS_INSUFFICIENT_RESOURCES);
@@ -41745,7 +41741,7 @@ pub(crate) fn service_hosted_driver_ke_wait_multiple(
                     } else {
                         print_str(b" wait=any");
                     }
-                    if let Some(deadline) = deadline_100ns {
+                    if let Some(deadline) = deadline.monotonic_target(crate::nt_time_snapshot()) {
                         print_str(b" deadline=");
                         print_u64(deadline);
                     }

@@ -6,6 +6,7 @@
 //! successful wait.
 
 use alloc::vec::Vec;
+use nt_time::{Deadline, TimeSnapshot};
 
 use crate::{
     dispatcher_ready, poll_dispatchers, DispatcherObject, DispatcherWaitResult,
@@ -197,7 +198,7 @@ pub struct HostedDispatcherWaiter {
     pub reply_cap: u64,
     pub objects: Vec<DispatcherObject>,
     pub wait_all: bool,
-    pub deadline_100ns: Option<u64>,
+    pub deadline: Deadline,
     sequence: u64,
 }
 
@@ -212,7 +213,7 @@ pub struct HostedDispatcherWake {
 pub struct HostedDispatcherTimeout {
     pub thread_handle: u64,
     pub reply_cap: u64,
-    pub deadline_100ns: u64,
+    pub deadline: Deadline,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -270,7 +271,7 @@ impl HostedDispatcherWaitQueue {
             objects,
             wait_all,
             timeout,
-            None,
+            Deadline::Infinite,
         )
     }
 
@@ -284,7 +285,7 @@ impl HostedDispatcherWaitQueue {
         objects: &[DispatcherObject],
         wait_all: bool,
         timeout: DispatcherWaitTimeout,
-        deadline_100ns: Option<u64>,
+        deadline: Deadline,
     ) -> Result<HostedDispatcherWaitAdmission, HostedDispatcherWaitError> {
         if thread_handle == 0 {
             return Err(HostedDispatcherWaitError::InvalidThread);
@@ -329,9 +330,9 @@ impl HostedDispatcherWaitQueue {
             reply_cap,
             objects: parked_objects,
             wait_all,
-            deadline_100ns: match timeout {
-                DispatcherWaitTimeout::Blocking => deadline_100ns,
-                DispatcherWaitTimeout::Infinite | DispatcherWaitTimeout::Poll => None,
+            deadline: match timeout {
+                DispatcherWaitTimeout::Blocking => deadline,
+                DispatcherWaitTimeout::Infinite | DispatcherWaitTimeout::Poll => Deadline::Infinite,
             },
             sequence: self.next_sequence,
         });
@@ -384,31 +385,26 @@ impl HostedDispatcherWaitQueue {
         Some(self.waiters.remove(index))
     }
 
-    pub fn next_deadline(&self) -> Option<u64> {
+    pub fn next_deadline(&self, now: TimeSnapshot) -> Option<u64> {
         self.waiters
             .iter()
-            .filter_map(|waiter| waiter.deadline_100ns)
+            .filter_map(|waiter| waiter.deadline.monotonic_target(now))
             .min()
     }
 
-    pub fn pop_due(&mut self, now_100ns: u64) -> Option<HostedDispatcherTimeout> {
+    pub fn pop_due(&mut self, now: TimeSnapshot) -> Option<HostedDispatcherTimeout> {
         let index = self
             .waiters
             .iter()
             .enumerate()
-            .filter_map(|(index, waiter)| {
-                waiter
-                    .deadline_100ns
-                    .filter(|deadline| *deadline <= now_100ns)
-                    .map(|deadline| (index, deadline, waiter.sequence))
-            })
-            .min_by_key(|(_, deadline, sequence)| (*deadline, *sequence))
-            .map(|(index, _, _)| index)?;
+            .filter(|(_, waiter)| waiter.deadline.is_due(now))
+            .min_by_key(|(_, waiter)| (waiter.deadline.ordering_key(now), waiter.sequence))
+            .map(|(index, _)| index)?;
         let waiter = self.waiters.remove(index);
         Some(HostedDispatcherTimeout {
             thread_handle: waiter.thread_handle,
             reply_cap: waiter.reply_cap,
-            deadline_100ns: waiter.deadline_100ns.unwrap_or(u64::MAX),
+            deadline: waiter.deadline,
         })
     }
 
@@ -428,6 +424,14 @@ mod tests {
 
     fn stores() -> (EventStore, SemaphoreStore, MutantStore) {
         (EventStore::new(), SemaphoreStore::new(), MutantStore::new())
+    }
+
+    fn snapshot(monotonic_100ns: u64, system_time_100ns: u64) -> TimeSnapshot {
+        TimeSnapshot {
+            monotonic_100ns,
+            system_time_100ns,
+            clock_generation: 0,
+        }
     }
 
     #[test]
@@ -594,7 +598,9 @@ mod tests {
                 &[DispatcherObject::Event(1)],
                 false,
                 DispatcherWaitTimeout::Blocking,
-                Some(30),
+                Deadline::Relative {
+                    monotonic_100ns: 30,
+                },
             ),
             Ok(HostedDispatcherWaitAdmission::Parked)
         );
@@ -608,7 +614,9 @@ mod tests {
                 &[DispatcherObject::Event(2)],
                 false,
                 DispatcherWaitTimeout::Blocking,
-                Some(20),
+                Deadline::Relative {
+                    monotonic_100ns: 20,
+                },
             ),
             Ok(HostedDispatcherWaitAdmission::Parked)
         );
@@ -622,29 +630,71 @@ mod tests {
                 &[DispatcherObject::Event(1)],
                 false,
                 DispatcherWaitTimeout::Blocking,
-                Some(20),
+                Deadline::Relative {
+                    monotonic_100ns: 20,
+                },
             ),
             Ok(HostedDispatcherWaitAdmission::Parked)
         );
-        assert_eq!(waits.next_deadline(), Some(20));
-        assert_eq!(waits.pop_due(19), None);
+        assert_eq!(waits.next_deadline(snapshot(0, 100)), Some(20));
+        assert_eq!(waits.pop_due(snapshot(19, 119)), None);
         assert_eq!(
-            waits.pop_due(20),
+            waits.pop_due(snapshot(20, 120)),
             Some(HostedDispatcherTimeout {
                 thread_handle: 0x9001,
                 reply_cap: 0x61,
-                deadline_100ns: 20,
+                deadline: Deadline::Relative {
+                    monotonic_100ns: 20,
+                },
             })
         );
         assert_eq!(
-            waits.pop_due(20),
+            waits.pop_due(snapshot(20, 120)),
             Some(HostedDispatcherTimeout {
                 thread_handle: 0x9002,
                 reply_cap: 0x62,
-                deadline_100ns: 20,
+                deadline: Deadline::Relative {
+                    monotonic_100ns: 20,
+                },
             })
         );
-        assert_eq!(waits.next_deadline(), Some(30));
+        assert_eq!(waits.next_deadline(snapshot(20, 120)), Some(30));
+    }
+
+    #[test]
+    fn absolute_waits_reproject_and_keep_order_after_a_forward_clock_jump() {
+        let (mut events, mut semaphores, mut mutants) = stores();
+        events.initialize(1, EventKind::Notification, false);
+        let mut waits = HostedDispatcherWaitQueue::new();
+        for (thread_handle, reply_cap, system_time_100ns) in
+            [(0x9000, 0x60, 2_000), (0x9001, 0x61, 3_000)]
+        {
+            assert_eq!(
+                waits.admit_with_deadline(
+                    &mut events,
+                    &mut semaphores,
+                    &mut mutants,
+                    thread_handle,
+                    reply_cap,
+                    &[DispatcherObject::Event(1)],
+                    false,
+                    DispatcherWaitTimeout::Blocking,
+                    Deadline::Absolute { system_time_100ns },
+                ),
+                Ok(HostedDispatcherWaitAdmission::Parked)
+            );
+        }
+
+        assert_eq!(waits.next_deadline(snapshot(100, 1_000)), Some(1_100));
+        assert_eq!(waits.next_deadline(snapshot(200, 4_000)), Some(200));
+        assert_eq!(
+            waits.pop_due(snapshot(200, 4_000)).unwrap().thread_handle,
+            0x9000
+        );
+        assert_eq!(
+            waits.pop_due(snapshot(200, 4_000)).unwrap().thread_handle,
+            0x9001
+        );
     }
 
     #[test]
@@ -662,7 +712,9 @@ mod tests {
                 &[DispatcherObject::Event(1)],
                 false,
                 DispatcherWaitTimeout::Blocking,
-                Some(50),
+                Deadline::Relative {
+                    monotonic_100ns: 50,
+                },
             ),
             Ok(HostedDispatcherWaitAdmission::Parked)
         );
@@ -675,8 +727,8 @@ mod tests {
                 wait_status_index: 0,
             })
         );
-        assert_eq!(waits.pop_due(50), None);
-        assert_eq!(waits.next_deadline(), None);
+        assert_eq!(waits.pop_due(snapshot(50, 150)), None);
+        assert_eq!(waits.next_deadline(snapshot(50, 150)), None);
     }
 
     #[test]

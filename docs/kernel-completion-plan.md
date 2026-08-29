@@ -16525,3 +16525,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     waiter mirror as one slice. The timeout tag must survive the component request, table record,
     shared HPET minimum, normal signal wake, cancellation, and timeout completion. Delete both
     `Option<u64>` deadline fields and do not retain a converted-deadline adapter.
+
+    Tagged hosted-driver waits (2026-08-30, focused validation complete): both the host-tested
+    `HostedDispatcherWaitQueue` and the executive's parked-reply record now store `Deadline`.
+    Infinite waits are an explicit deadline domain rather than `None`; blocking requests construct
+    the tag directly from the driver-supplied native interval and never project it at admission.
+    The cross-driver HPET minimum and timeout drain use one snapshot, reproject absolute waits after
+    clock movement, and retain deadline ordering plus FIFO sequence when a forward jump makes
+    several waits overdue. Signal wake, exact thread cancellation, driver-instance teardown, reply
+    rotation, and timeout completion all remove the same tagged record.
+
+    Focused host coverage adds absolute-wait clock-jump ordering and keeps the existing normal wake,
+    wait-all, duplicate-object, poll, reply-identity, cancellation, and thread-lifecycle tests green.
+    The complete `nt-kernel-exec` suite passes `173/173`; the freestanding executive remains at the
+    accepted 209-warning baseline. Neither targeted owner retains `deadline_100ns` or `Option<u64>`.
+
+    Review adjustment: migrate `nt-io-completion::CompletionWaiter` next, deleting both its
+    `INFINITE_DEADLINE` sentinel and scalar timeout field. Wire its executive park, minimum, timeout
+    trace, cancellation, and port-reference release around the tagged record before moving to the
+    general object and keyed-event tables.
