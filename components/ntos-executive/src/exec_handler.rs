@@ -3114,10 +3114,8 @@ impl ExecNtHandler {
         write_field!(pnp_status, PnpRuntimeStatusTable::new());
         write_field!(lpc_rendezvous_conn, 0);
         write_field!(lpc_rendezvous_out, 0);
-        write_field!(lpc_receive_park_port, 0);
-        write_field!(lpc_receive_park_msg, 0);
-        write_field!(lpc_receive_park_ctx, 0);
-        write_field!(lpc_receive_park_listen_only, false);
+        write_field!(lpc_receive_park, None);
+        write_field!(lpc_endpoint_progress, false);
         write_field!(sm_request_port, 0);
         write_field!(sm_request_message, 0);
         write_field!(sm_reply_message, 0);
@@ -25125,30 +25123,44 @@ impl ExecNtHandler {
             return STATUS_UNSUCCESSFUL;
         };
         match lpc.reply_port(args[0], &message) {
-            Ok(()) => nt_syscall::STATUS_SUCCESS,
+            Ok(()) => {
+                self.lpc_endpoint_progress = true;
+                nt_syscall::STATUS_SUCCESS
+            }
             Err(status) => status.raw() as u32,
         }
     }
 
-    unsafe fn lpc_write_received_message(
+    pub(crate) unsafe fn lpc_publish_received_message(
         &self,
-        receive_message: u64,
+        pi: usize,
+        memory: SyscallUserMemory,
+        request: nt_lpc_continuation::ReceiveRequest,
         received: &nt_lpc_client::ReceiveResult,
     ) -> Result<(), u32> {
         const PORT_MESSAGE_HEADER_LEN: usize = 0x28;
-        if receive_message == 0 {
+        if matches!(
+            request.operation,
+            nt_lpc_continuation::ReceiveOperation::Listen
+        ) && received.msg_type != nt_lpc_client::LPC_CONNECTION_REQUEST
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if request.receive_message == 0 {
             return Err(STATUS_ACCESS_VIOLATION);
         }
         let bytes = if received.msg_type == nt_lpc_client::LPC_CONNECTION_REQUEST {
-            let data_len = received
-                .connection_info
-                .len()
-                .min(512 - PORT_MESSAGE_HEADER_LEN);
+            let data_len = received.connection_info.len();
+            if data_len > 512 - PORT_MESSAGE_HEADER_LEN {
+                return Err(nt_status::NtStatus::PORT_MESSAGE_TOO_LONG.raw() as u32);
+            }
             let total = PORT_MESSAGE_HEADER_LEN + data_len;
             let mut message = alloc::vec![0u8; total];
             message[0..2].copy_from_slice(&(data_len as u16).to_le_bytes());
             message[2..4].copy_from_slice(&(total as u16).to_le_bytes());
             message[4..6].copy_from_slice(&received.msg_type.to_le_bytes());
+            message[8..16].copy_from_slice(&received.client_process.to_le_bytes());
+            message[16..24].copy_from_slice(&received.client_thread.to_le_bytes());
             message[0x18..0x1c].copy_from_slice(&(received.connection_id as u32).to_le_bytes());
             message[PORT_MESSAGE_HEADER_LEN..]
                 .copy_from_slice(&received.connection_info[..data_len]);
@@ -25157,10 +25169,20 @@ impl ExecNtHandler {
             received.connection_info.clone()
         };
         if bytes.is_empty()
-            || !self.probe_user_output(receive_message, bytes.len())
-            || !self.xas_try_write_buf(receive_message, &bytes)
+            || !self.lpc_user_memory_write(pi, memory, request.receive_message, &bytes)
         {
             return Err(STATUS_ACCESS_VIOLATION);
+        }
+        if request.port_context != 0 {
+            let context = if received.msg_type == nt_lpc_client::LPC_CONNECTION_REQUEST {
+                0
+            } else {
+                received.port_context
+            };
+            if !self.lpc_user_memory_write(pi, memory, request.port_context, &context.to_le_bytes())
+            {
+                return Err(STATUS_ACCESS_VIOLATION);
+            }
         }
         Ok(())
     }
@@ -25178,38 +25200,55 @@ impl ExecNtHandler {
                 Ok(reply) => reply,
                 Err(status) => return status,
             };
+        let request = nt_lpc_continuation::ReceiveRequest {
+            port_handle,
+            receive_message,
+            port_context,
+            operation: if listen_only {
+                nt_lpc_continuation::ReceiveOperation::Listen
+            } else {
+                nt_lpc_continuation::ReceiveOperation::ReplyWaitReceive
+            },
+        };
+        if receive_message == 0 {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let reservation = match crate::service_sec_image::lpc_receive_wait_reserve() {
+            Ok(reservation) => reservation,
+            Err(status) => return status,
+        };
         let Some(lpc) = lpc_client() else {
+            crate::service_sec_image::lpc_receive_wait_cancel_reservation(reservation);
             return STATUS_UNSUCCESSFUL;
         };
         match lpc.reply_wait_receive_with_reply(port_handle, &reply) {
             Ok(received) => {
-                if listen_only && received.msg_type != nt_lpc_client::LPC_CONNECTION_REQUEST {
-                    return STATUS_INVALID_PARAMETER;
-                }
-                if let Err(status) = self.lpc_write_received_message(receive_message, &received) {
+                self.lpc_endpoint_progress |= !reply.is_empty();
+                crate::service_sec_image::lpc_receive_wait_cancel_reservation(reservation);
+                if let Err(status) = self.lpc_publish_received_message(
+                    self.pi,
+                    self.current_user_memory,
+                    request,
+                    &received,
+                ) {
                     return status;
-                }
-                if port_context != 0 {
-                    let context = if received.msg_type == nt_lpc_client::LPC_CONNECTION_REQUEST {
-                        0
-                    } else {
-                        received.port_context
-                    };
-                    if !self.xas_write_u64(port_context, context) {
-                        return STATUS_ACCESS_VIOLATION;
-                    }
                 }
                 bump_progress();
                 0
             }
             Err(status) if status.raw() as u32 == STATUS_PENDING => {
-                self.lpc_receive_park_port = port_handle;
-                self.lpc_receive_park_msg = receive_message;
-                self.lpc_receive_park_ctx = port_context;
-                self.lpc_receive_park_listen_only = listen_only;
+                self.lpc_endpoint_progress |= !reply.is_empty();
+                self.lpc_receive_park = Some(PendingLpcReceivePark {
+                    reservation,
+                    request,
+                    memory: self.current_user_memory,
+                });
                 0x102
             }
-            Err(status) => status.raw() as u32,
+            Err(status) => {
+                crate::service_sec_image::lpc_receive_wait_cancel_reservation(reservation);
+                status.raw() as u32
+            }
         }
     }
 

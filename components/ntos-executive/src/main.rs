@@ -113,7 +113,7 @@ use surt_sel4::surt_core::surt_abi::{feature, role, SurtCqe, SurtSqe};
 use surt_sel4::surt_core::{init_ring, Consumer, Producer, RingConfig, WaitDecision};
 use surt_sel4::{CPtr, Sel4Env, Sel4Notify};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SyscallUserMemory {
     CurrentProcess,
     /// The SMSS address space while the private `SmpApiLoop` worker is running. Its dedicated
@@ -17424,6 +17424,7 @@ pub(crate) unsafe fn release_unregistered_hosted_thread_spawn(spawn: HostedThrea
 
 unsafe fn hosted_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
     let _ = crate::service_sec_image::pending_driver_load_abandon_thread(handler, tid);
+    let _ = crate::service_sec_image::lpc_receive_wait_abandon_thread(handler, tid);
     let _ = handler.cancel_file_io_for_thread_teardown(tid);
     thread_wait_state_clear_tid(handler, tid);
 }
@@ -21508,6 +21509,26 @@ struct PendingWaitTimeout {
     interval_100ns: i64,
 }
 
+/// Allocation-safe handoff from native dispatch to the service-loop reply-cap owner after the LPC
+/// broker atomically commits a reply and reports that the receive must block.
+#[derive(Clone, Copy)]
+struct PendingLpcReceivePark {
+    reservation: nt_lpc_continuation::Reservation,
+    request: nt_lpc_continuation::ReceiveRequest,
+    memory: SyscallUserMemory,
+}
+
+/// Full kernel continuation retained for one wakeable LPC receive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LpcReceiveContinuation {
+    pi: u32,
+    badge: u64,
+    tid: u64,
+    memory: SyscallUserMemory,
+    reply_cap: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
+}
+
 impl PendingWaitTimeout {
     const fn none() -> Self {
         Self {
@@ -21771,12 +21792,13 @@ struct ExecNtHandler {
     /// drives `sm_rendezvous`, writes the completed client comm-port handle, and replies csrss. 0 = none.
     lpc_rendezvous_conn: u64,
     lpc_rendezvous_out: u64,
-    /// Generic LPC server receive that found no pending broker message. The loop parks this caller as
-    /// a typed LPC receiver instead of sending a spurious status or falling into unserviced handling.
-    lpc_receive_park_port: u64,
-    lpc_receive_park_msg: u64,
-    lpc_receive_park_ctx: u64,
-    lpc_receive_park_listen_only: bool,
+    /// Allocation-reserved generic LPC receive that the service loop must bind to the current reply
+    /// object. The durable wait moves into `LPC_RECEIVE_WAITS`; no scalar state survives dispatch.
+    lpc_receive_park: Option<PendingLpcReceivePark>,
+    /// A reply was published to the LPC broker during this dispatch. The service loop consumes the
+    /// edge once to redrive generic receive continuations without polling every parked port after
+    /// every unrelated syscall.
+    lpc_endpoint_progress: bool,
     /// A synchronous SMSS request on its established `\\SmApiPort` client connection. The loop
     /// delivers it to the parked real SmpApiLoop and resumes this caller only after the worker's
     /// reply is available.
