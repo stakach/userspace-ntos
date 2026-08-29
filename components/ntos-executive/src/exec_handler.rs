@@ -15442,20 +15442,29 @@ impl ExecNtHandler {
             .checked_add(fixed_mapping_bytes)
             .and_then(|bytes| bytes.checked_add(page_table_bytes))
             .ok_or(nt_memory_manager::STATUS_COMMITMENT_LIMIT)?;
-        self.process_commit.register(pid, initial_bytes)?;
-        if let Some(job) = self.pm.process_job(pid) {
-            let limits = self.pm.job_extended_limits(job)?;
-            let limit =
+        let job = self.pm.process_job(pid);
+        let limit = match job {
+            Some(job) => {
+                let limits = self.pm.job_extended_limits(job)?;
                 if limits.basic.limit_flags & nt_process::job::JOB_OBJECT_LIMIT_PROCESS_MEMORY != 0
                 {
                     limits.process_memory_limit
                 } else {
                     0
-                };
-            if let Err(status) = self.process_commit.set_limit(pid, limit) {
-                let _ = self.process_commit.unregister(pid);
-                return Err(status);
+                }
             }
+            None => 0,
+        };
+        if let Err(status) = self
+            .process_commit
+            .register_with_limit(pid, initial_bytes, limit)
+        {
+            if status == nt_memory_manager::STATUS_COMMITMENT_LIMIT && job.is_some() {
+                let _ = self.pm.report_process_memory_limit_violation(pid);
+            }
+            return Err(status);
+        }
+        if job.is_some() {
             let (recorded_process_bytes, _) = match self.pm.job_memory_usage(pid) {
                 Ok(usage) => usage,
                 Err(status) => {
@@ -15499,6 +15508,57 @@ impl ExecNtHandler {
             None => 0,
         };
         self.process_commit.set_limit(pid, limit)
+    }
+
+    unsafe fn set_job_extended_limits_transactional(
+        &mut self,
+        id: nt_process::job::JobId,
+        limits: nt_process::job::JobExtendedLimits,
+    ) -> Result<(), u32> {
+        let ps_plan = self.pm.prepare_job_extended_limits(id, limits)?;
+        let process_ids = self.pm.job_active_process_ids_owned(id)?;
+        let mut mm_plans = alloc::vec::Vec::new();
+        mm_plans
+            .try_reserve_exact(process_ids.len())
+            .map_err(|_| nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
+
+        for pid in process_ids.iter().copied() {
+            if self.pi_for_pid(pid).is_none() {
+                return Err(nt_process::STATUS_INVALID_HANDLE);
+            }
+        }
+        for pid in process_ids.iter().copied() {
+            let pi = self
+                .pi_for_pid(pid)
+                .expect("validated hosted process remains published during syscall");
+            if let Err(status) = self.ensure_process_commit_owner(pid, pi) {
+                self.drain_job_notifications();
+                return Err(status);
+            }
+        }
+
+        let effective = ps_plan.limits();
+        let process_limit = if effective.basic.limit_flags
+            & nt_process::job::JOB_OBJECT_LIMIT_PROCESS_MEMORY
+            != 0
+        {
+            effective.process_memory_limit
+        } else {
+            0
+        };
+        for pid in process_ids {
+            mm_plans.push(
+                self.process_commit
+                    .prepare_limit_update(pid, process_limit)?,
+            );
+        }
+
+        self.pm.commit_job_extended_limits(ps_plan)?;
+        self.process_commit
+            .commit_limit_updates(&mm_plans)
+            .expect("serialized job-limit plans remain current through publication");
+        self.refresh_job_time_sampling();
+        Ok(())
     }
 
     pub(crate) unsafe fn prepare_process_commit_charge(
@@ -23489,6 +23549,8 @@ impl ExecNtHandler {
             | nt_process::job::JOB_OBJECT_LIMIT_PRIORITY_CLASS
             | nt_process::job::JOB_OBJECT_LIMIT_PRESERVE_JOB_TIME;
         const SUPPORTED_EXTENDED_LIMIT_FLAGS: u32 = SUPPORTED_BASIC_LIMIT_FLAGS
+            | nt_process::job::JOB_OBJECT_LIMIT_PROCESS_MEMORY
+            | nt_process::job::JOB_OBJECT_LIMIT_JOB_MEMORY
             | nt_process::job::JOB_OBJECT_LIMIT_BREAKAWAY_OK
             | nt_process::job::JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
             | nt_process::job::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -23540,13 +23602,8 @@ impl ExecNtHandler {
                 if limits.basic.limit_flags & !SUPPORTED_EXTENDED_LIMIT_FLAGS != 0 {
                     return STATUS_NOT_SUPPORTED;
                 }
-                match self.pm.set_job_extended_limits(id, limits) {
-                    Ok(()) => {
-                        self.refresh_job_time_sampling();
-                        0
-                    }
-                    Err(status) => status,
-                }
+                self.set_job_extended_limits_transactional(id, limits)
+                    .map_or_else(|status| status, |()| 0)
             }
             nt_process::job_abi::JobInformationClass::BasicUiRestrictions => {
                 let value = u32::from_le_bytes(input[..4].try_into().unwrap());

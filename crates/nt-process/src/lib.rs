@@ -3386,13 +3386,29 @@ impl ProcessManager {
         id: job::JobId,
         limits: job::JobExtendedLimits,
     ) -> Result<(), u32> {
+        let plan = self.prepare_job_extended_limits(id, limits)?;
+        self.commit_job_extended_limits(plan)
+    }
+
+    pub fn prepare_job_extended_limits(
+        &self,
+        id: job::JobId,
+        limits: job::JobExtendedLimits,
+    ) -> Result<job::JobExtendedLimitPlan, u32> {
         let accounting = self.job_accounting(id)?;
-        self.jobs.set_extended_limits_at(
+        self.jobs.prepare_extended_limits_at(
             id,
             limits,
             accounting.total_user_time,
             accounting.total_kernel_time,
         )
+    }
+
+    pub fn commit_job_extended_limits(
+        &mut self,
+        plan: job::JobExtendedLimitPlan,
+    ) -> Result<(), u32> {
+        self.jobs.commit_extended_limits(plan)
     }
 
     pub fn has_active_job_time_limits(&self) -> bool {

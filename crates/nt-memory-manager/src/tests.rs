@@ -62,6 +62,56 @@ fn process_commit_ledger_rejects_stale_plans_and_scales_by_owner() {
 }
 
 #[test]
+fn process_commit_limit_updates_prepare_without_partial_mutation() {
+    let mut ledger = ProcessCommitLedger::new();
+    ledger.register_with_limit(4, 0x3000, 0x5000).unwrap();
+    ledger.register(8, 0x1000).unwrap();
+
+    let first = ledger.prepare_limit_update(4, 0x2000).unwrap();
+    let second = ledger.prepare_limit_update(8, 0x4000).unwrap();
+    assert_eq!(ledger.accounting(4).unwrap().limit_bytes, 0x5000);
+    assert_eq!(ledger.accounting(8).unwrap().limit_bytes, 0);
+
+    ledger.commit_limit_updates(&[first, second]).unwrap();
+    assert_eq!(ledger.accounting(4).unwrap().limit_bytes, 0x2000);
+    assert_eq!(ledger.accounting(8).unwrap().limit_bytes, 0x4000);
+    assert_eq!(
+        ledger.prepare_charge(4, 0x1000),
+        Err(STATUS_COMMITMENT_LIMIT)
+    );
+
+    let stale = ledger.prepare_limit_update(8, 0x6000).unwrap();
+    ledger.set_limit(8, 0x7000).unwrap();
+    assert_eq!(
+        ledger.commit_limit_update(stale),
+        Err(commit::STATUS_CONFLICTING_ADDRESSES)
+    );
+
+    let duplicate_a = ledger.prepare_limit_update(4, 0x5000).unwrap();
+    let duplicate_b = ledger.prepare_limit_update(4, 0x6000).unwrap();
+    assert_eq!(
+        ledger.commit_limit_updates(&[duplicate_a, duplicate_b]),
+        Err(commit::STATUS_CONFLICTING_ADDRESSES)
+    );
+    assert_eq!(ledger.accounting(4).unwrap().limit_bytes, 0x2000);
+}
+
+#[test]
+fn process_commit_registration_validates_initial_limit_atomically() {
+    let mut ledger = ProcessCommitLedger::new();
+    assert_eq!(
+        ledger.register_with_limit(4, 0x3000, 0x2000),
+        Err(STATUS_COMMITMENT_LIMIT)
+    );
+    assert!(!ledger.contains(4));
+    assert_eq!(
+        ledger.register_with_limit(4, 0x2000, 1),
+        Err(commit::STATUS_INVALID_PARAMETER)
+    );
+    assert!(!ledger.contains(4));
+}
+
+#[test]
 fn acceptance_mapped_file_edit_flushes_back() {
     // Spec §24: map a file-backed section, edit through the view, unmap, flush → file reflects it.
     let mut cache = file_cache(b"abcdef");

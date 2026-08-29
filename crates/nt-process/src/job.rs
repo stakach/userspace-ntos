@@ -192,6 +192,21 @@ pub struct JobMemoryChargePlan {
     next_job_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobExtendedLimitPlan {
+    job_id: JobId,
+    limits_generation: u64,
+    limits: JobExtendedLimits,
+    total_user_time: i64,
+    total_kernel_time: i64,
+}
+
+impl JobExtendedLimitPlan {
+    pub const fn limits(&self) -> JobExtendedLimits {
+        self.limits
+    }
+}
+
 impl JobNotifications {
     fn push(&mut self, notification: Option<JobNotification>) {
         let Some(notification) = notification else {
@@ -245,6 +260,7 @@ struct Job {
     wait_references: u32,
     close_done: bool,
     signaled: bool,
+    limits_generation: u64,
     basic_limits: JobBasicLimits,
     extended_limits: JobExtendedLimits,
     accounting: JobAccounting,
@@ -392,6 +408,7 @@ impl JobStore {
             wait_references: 0,
             close_done: false,
             signaled: false,
+            limits_generation: 0,
             basic_limits: JobBasicLimits {
                 scheduling_class: 5,
                 ..JobBasicLimits::default()
@@ -785,6 +802,10 @@ impl JobStore {
             limits.scheduling_class = 5;
         }
         let job = self.get_mut(id).ok_or(crate::STATUS_INVALID_HANDLE)?;
+        let next_limits_generation = job
+            .limits_generation
+            .checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
         let previous_job_time_enabled =
             job.basic_limits.limit_flags & JOB_OBJECT_LIMIT_JOB_TIME != 0;
         let previous_job_time = job.basic_limits.per_job_user_time_limit;
@@ -814,6 +835,7 @@ impl JobStore {
             member.process_time_limit_reached = false;
         }
         job.extended_limits.basic = job.basic_limits;
+        job.limits_generation = next_limits_generation;
         Ok(())
     }
 
@@ -830,10 +852,22 @@ impl JobStore {
     pub fn set_extended_limits_at(
         &mut self,
         id: JobId,
-        mut limits: JobExtendedLimits,
+        limits: JobExtendedLimits,
         total_user_time: i64,
         total_kernel_time: i64,
     ) -> Result<(), u32> {
+        let plan =
+            self.prepare_extended_limits_at(id, limits, total_user_time, total_kernel_time)?;
+        self.commit_extended_limits(plan)
+    }
+
+    pub fn prepare_extended_limits_at(
+        &self,
+        id: JobId,
+        mut limits: JobExtendedLimits,
+        total_user_time: i64,
+        total_kernel_time: i64,
+    ) -> Result<JobExtendedLimitPlan, u32> {
         if limits.basic.limit_flags & !JOB_OBJECT_EXTENDED_LIMIT_VALID_FLAGS != 0 {
             return Err(crate::STATUS_INVALID_PARAMETER);
         }
@@ -857,7 +891,30 @@ impl JobStore {
         if limits.basic.limit_flags & JOB_OBJECT_LIMIT_SCHEDULING_CLASS == 0 {
             limits.basic.scheduling_class = 5;
         }
-        let job = self.get_mut(id).ok_or(crate::STATUS_INVALID_HANDLE)?;
+        let job = self.get(id).ok_or(crate::STATUS_INVALID_HANDLE)?;
+        Ok(JobExtendedLimitPlan {
+            job_id: id,
+            limits_generation: job.limits_generation,
+            limits,
+            total_user_time,
+            total_kernel_time,
+        })
+    }
+
+    pub fn commit_extended_limits(&mut self, plan: JobExtendedLimitPlan) -> Result<(), u32> {
+        let mut limits = plan.limits;
+        let total_user_time = plan.total_user_time;
+        let total_kernel_time = plan.total_kernel_time;
+        let job = self
+            .get_mut(plan.job_id)
+            .ok_or(crate::STATUS_INVALID_HANDLE)?;
+        if job.limits_generation != plan.limits_generation {
+            return Err(crate::STATUS_INVALID_PARAMETER);
+        }
+        let next_limits_generation = job
+            .limits_generation
+            .checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
         let previous_job_time_enabled =
             job.basic_limits.limit_flags & JOB_OBJECT_LIMIT_JOB_TIME != 0;
         let previous_job_time = job.basic_limits.per_job_user_time_limit;
@@ -891,6 +948,7 @@ impl JobStore {
         for member in job.members.iter_mut().filter(|member| member.active) {
             member.process_time_limit_reached = false;
         }
+        job.limits_generation = next_limits_generation;
         Ok(())
     }
 
@@ -999,9 +1057,14 @@ impl JobStore {
             return Ok(false);
         }
         if delivered {
+            let next_limits_generation = job
+                .limits_generation
+                .checked_add(1)
+                .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
             job.basic_limits.limit_flags &= !JOB_OBJECT_LIMIT_JOB_TIME;
             job.basic_limits.per_job_user_time_limit = 0;
             job.extended_limits.basic = job.basic_limits;
+            job.limits_generation = next_limits_generation;
         } else {
             job.job_time_limit_reached = false;
         }

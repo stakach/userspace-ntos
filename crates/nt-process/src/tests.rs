@@ -3964,6 +3964,8 @@ fn job_memory_charges_are_transactional_dynamic_and_kernel_accounted() {
         job::JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT
     );
     assert_eq!(notification.process_id, first);
+    pm.report_process_memory_limit_violation(first).unwrap();
+    assert!(pm.take_job_notification().is_none());
 
     assert_eq!(
         pm.assign_process_to_job_with_commit(job, second, 0x2000),
@@ -3978,6 +3980,11 @@ fn job_memory_charges_are_transactional_dynamic_and_kernel_accounted() {
     let notification = pm.take_job_notification().unwrap();
     assert_eq!(notification.message, job::JOB_OBJECT_MSG_JOB_MEMORY_LIMIT);
     assert_eq!(notification.process_id, second);
+    assert_eq!(
+        pm.prepare_job_memory_charge(second, 0x1000),
+        Err(job::STATUS_COMMITMENT_LIMIT)
+    );
+    assert!(pm.take_job_notification().is_none());
 
     pm.release_job_memory(first, 0x3000).unwrap();
     assert_eq!(pm.job_memory_usage(first), Ok((0x1000, 0x3000)));
@@ -4017,6 +4024,82 @@ fn job_memory_charges_are_transactional_dynamic_and_kernel_accounted() {
     );
     assert_eq!(limits.process_memory_limit, 0x4000);
     assert_eq!(limits.job_memory_limit, 0x6000);
+}
+
+#[test]
+fn job_extended_limit_plans_normalize_and_reject_stale_publication() {
+    let mut pm = ProcessManager::new();
+    let process = pm.create_process("memory-plan.exe", None, None);
+    let job = pm.create_job(0).unwrap();
+    assert_eq!(pm.assign_process_to_job(job, process), Ok(STATUS_SUCCESS));
+    let _ = pm.take_job_notification();
+
+    let requested = job::JobExtendedLimits {
+        basic: job::JobBasicLimits {
+            limit_flags: job::JOB_OBJECT_LIMIT_PROCESS_MEMORY | job::JOB_OBJECT_LIMIT_JOB_MEMORY,
+            ..job::JobBasicLimits::default()
+        },
+        process_memory_limit: 0x4fff,
+        job_memory_limit: 0x8fff,
+        ..job::JobExtendedLimits::default()
+    };
+    let stale = pm.prepare_job_extended_limits(job, requested).unwrap();
+    assert_eq!(stale.limits().process_memory_limit, 0x4000);
+    assert_eq!(stale.limits().job_memory_limit, 0x8000);
+    assert_eq!(pm.job_extended_limits(job).unwrap().basic.limit_flags, 0);
+
+    pm.set_job_basic_limits(
+        job,
+        job::JobBasicLimits {
+            limit_flags: job::JOB_OBJECT_LIMIT_PRIORITY_CLASS,
+            priority_class: 2,
+            ..job::JobBasicLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        pm.commit_job_extended_limits(stale),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        pm.job_extended_limits(job).unwrap().basic.limit_flags,
+        job::JOB_OBJECT_LIMIT_PRIORITY_CLASS
+    );
+
+    let current = pm.prepare_job_extended_limits(job, requested).unwrap();
+    pm.commit_job_extended_limits(current).unwrap();
+    let limits = pm.job_extended_limits(job).unwrap();
+    assert_eq!(
+        limits.basic.limit_flags,
+        job::JOB_OBJECT_LIMIT_PROCESS_MEMORY | job::JOB_OBJECT_LIMIT_JOB_MEMORY
+    );
+    assert_eq!(limits.process_memory_limit, 0x4000);
+    assert_eq!(limits.job_memory_limit, 0x8000);
+}
+
+#[test]
+fn assigning_existing_process_applies_lower_process_memory_limit_for_future_growth() {
+    let mut pm = ProcessManager::new();
+    let process = pm.create_process("memory-existing.exe", None, None);
+    let job = pm.create_job(0).unwrap();
+    pm.set_job_extended_limits(
+        job,
+        job::JobExtendedLimits {
+            basic: job::JobBasicLimits {
+                limit_flags: job::JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+                ..job::JobBasicLimits::default()
+            },
+            process_memory_limit: 0x1000,
+            ..job::JobExtendedLimits::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        pm.assign_process_to_job_with_commit(job, process, 0x3000),
+        Ok(STATUS_SUCCESS)
+    );
+    assert_eq!(pm.job_memory_usage(process), Ok((0x3000, 0x3000)));
 }
 
 #[test]

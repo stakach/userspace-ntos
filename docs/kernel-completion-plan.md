@@ -17273,3 +17273,43 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     after successful decommit/release, and remove both records during final EPROCESS teardown. Job
     assignment must pass the target's existing MM charge, and ExtendedLimit updates must publish the
     effective process limit into every active member's MM record before the flags are accepted.
+
+    Native process/job memory-limit publication (2026-08-30, accepted; working-set/UI/security
+    mechanisms remain): `NtSetInformationJobObject(ExtendedLimit)` now accepts
+    `JOB_OBJECT_LIMIT_PROCESS_MEMORY` and `JOB_OBJECT_LIMIT_JOB_MEMORY` through one composed Ps/MM
+    transaction. Ps prepares a normalized, generation-checked job-limit plan without changing the
+    job. The executive then enumerates every active member from Ps, verifies that each has a hosted
+    address-space owner, establishes any missing complete commitment owner, and prepares the same
+    effective per-process MM limit for every member. Only after every expected failure edge has been
+    checked does Ps publish the job limits and MM atomically publish the prevalidated owner batch.
+    Duplicate or stale MM plans fail before any owner is changed; stale Ps plans likewise leave the
+    job untouched.
+
+    The initial-owner path now installs an inherited process limit while registering the complete
+    image/VAD/fixed/write-copy/page-table charge, so a newly created job child cannot publish an
+    address space already beyond its inherited limit. Assigning an existing process deliberately
+    retains NT5 semantics: a new process limit may be below current commitment, but the next growth
+    fails. Aggregate job admission remains Ps-owned, and Memory Manager refusals continue to ask Ps
+    for the standard one-shot process-memory completion message. No executive shadow commitment,
+    image identity, or permissive fallback was added.
+
+    Focused validation passes `nt-memory-manager` `21/21` and `nt-process` `138/138`. The tests cover
+    limit normalization, multi-owner atomic publication, duplicate and stale-plan rejection,
+    inherited registration refusal without a partial owner, lower-than-current NT behavior, and
+    one-shot process/job completion notifications. Formatting, `git diff --check`, the freestanding
+    executive check, and the release staging build pass at the established 209-warning baseline.
+    Serialized proof `.tmp/run-headless-job-memory-limits-20260830.log` dynamically launches
+    userinit, Explorer, and kbswitch, completes 704 Explorer api0 redirects with zero callback
+    failures, installs 18 client WndProcs without replay, reaches Explorer paint begin/end `7/21`
+    with 187 direct GDI returns and 137 batch flushes covering 186 records, paints
+    `480000/480000` framebuffer pixels with at least 32 colours, reports zero VM and unmap failures,
+    passes all `295/295` checks, and matches the sentinel.
+
+    Review adjustment: process and aggregate job commitment limits are closed. Keep
+    `JOB_OBJECT_LIMIT_WORKINGSET` disabled until Memory Manager owns resident-set accounting,
+    trimming, and pageout; commitment is not a working-set substitute. The next bounded job-family
+    dependency is to make Ps ETHREAD/handle publication and hosted mechanism admission a single
+    rollback transaction, so failed stack/TEB/capability construction cannot leave a visible thread
+    object and failed Ps publication cannot leak a completed mechanism. After that, connect nonzero
+    UI restrictions through the registered Win32 job callout and token restrictions through the
+    Security Manager. Remove the superseded partial-publication machinery as each owner lands.

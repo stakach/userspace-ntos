@@ -29,7 +29,7 @@ pub use client_frame::{
     ClientFrameRegistryStats,
 };
 pub use commit::{
-    CommitChargePlan, CommitOwnerId, ProcessCommitAccounting, ProcessCommitLedger,
+    CommitChargePlan, CommitLimitPlan, CommitOwnerId, ProcessCommitAccounting, ProcessCommitLedger,
     PAGE_SIZE as COMMIT_PAGE_SIZE, STATUS_COMMITMENT_LIMIT,
 };
 

@@ -25,6 +25,13 @@ pub struct CommitChargePlan {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommitLimitPlan {
+    owner: CommitOwnerId,
+    previous_limit_bytes: u64,
+    next_limit_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ProcessCommitRecord {
     owner: CommitOwnerId,
     accounting: ProcessCommitAccounting,
@@ -60,7 +67,20 @@ impl ProcessCommitLedger {
     }
 
     pub fn register(&mut self, owner: CommitOwnerId, initial_bytes: u64) -> Result<(), u32> {
+        self.register_with_limit(owner, initial_bytes, 0)
+    }
+
+    pub fn register_with_limit(
+        &mut self,
+        owner: CommitOwnerId,
+        initial_bytes: u64,
+        limit_bytes: u64,
+    ) -> Result<(), u32> {
         Self::validate_page_bytes(initial_bytes)?;
+        Self::validate_page_bytes(limit_bytes)?;
+        if limit_bytes != 0 && initial_bytes > limit_bytes {
+            return Err(STATUS_COMMITMENT_LIMIT);
+        }
         if self.index(owner).is_some() {
             return Err(STATUS_CONFLICTING_ADDRESSES);
         }
@@ -72,7 +92,7 @@ impl ProcessCommitLedger {
             accounting: ProcessCommitAccounting {
                 current_bytes: initial_bytes,
                 peak_bytes: initial_bytes,
-                limit_bytes: 0,
+                limit_bytes,
             },
         });
         Ok(())
@@ -88,9 +108,50 @@ impl ProcessCommitLedger {
     }
 
     pub fn set_limit(&mut self, owner: CommitOwnerId, limit_bytes: u64) -> Result<(), u32> {
+        let plan = self.prepare_limit_update(owner, limit_bytes)?;
+        self.commit_limit_update(plan).map(|_| ())
+    }
+
+    pub fn prepare_limit_update(
+        &self,
+        owner: CommitOwnerId,
+        limit_bytes: u64,
+    ) -> Result<CommitLimitPlan, u32> {
         Self::validate_page_bytes(limit_bytes)?;
         let index = self.index(owner).ok_or(STATUS_INVALID_HANDLE)?;
-        self.records[index].accounting.limit_bytes = limit_bytes;
+        Ok(CommitLimitPlan {
+            owner,
+            previous_limit_bytes: self.records[index].accounting.limit_bytes,
+            next_limit_bytes: limit_bytes,
+        })
+    }
+
+    pub fn commit_limit_update(
+        &mut self,
+        plan: CommitLimitPlan,
+    ) -> Result<ProcessCommitAccounting, u32> {
+        let owner = plan.owner;
+        self.commit_limit_updates(&[plan])?;
+        self.accounting(owner).ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    pub fn commit_limit_updates(&mut self, plans: &[CommitLimitPlan]) -> Result<(), u32> {
+        for (position, plan) in plans.iter().enumerate() {
+            let index = self.index(plan.owner).ok_or(STATUS_INVALID_HANDLE)?;
+            if self.records[index].accounting.limit_bytes != plan.previous_limit_bytes
+                || plans[..position]
+                    .iter()
+                    .any(|previous| previous.owner == plan.owner)
+            {
+                return Err(STATUS_CONFLICTING_ADDRESSES);
+            }
+        }
+        for plan in plans {
+            let index = self
+                .index(plan.owner)
+                .expect("validated commit owner remains present during serialized publication");
+            self.records[index].accounting.limit_bytes = plan.next_limit_bytes;
+        }
         Ok(())
     }
 
