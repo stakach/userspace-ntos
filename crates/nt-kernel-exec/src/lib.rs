@@ -60,6 +60,7 @@ pub use lookaside::{
     POOL_TYPE_PAGED,
 };
 pub use mutant::{map_mutant_access, MutantError, MutantStore};
+pub use nt_time::{Deadline, TimeSnapshot};
 pub use runtime::{KernelExecRuntime, ReadyCallback};
 pub use semaphore::{
     init_ksemaphore, ksemaphore_read_state, ksemaphore_release, ksemaphore_try_wait,

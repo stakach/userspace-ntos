@@ -4,13 +4,11 @@
 //! at the API boundary are Windows 100ns intervals.
 
 use alloc::vec::Vec;
+use nt_time::{AdjustableClock, Deadline, TimeSnapshot};
 
 /// A monotonic + system time source (spec §10). Host tests use [`FakeClock`].
 pub trait Clock {
-    /// Monotonic time in 100ns units (for relative timers).
-    fn now_100ns(&self) -> u64;
-    /// System time in 100ns units (for absolute timers).
-    fn system_time_100ns(&self) -> i64;
+    fn snapshot(&self) -> TimeSnapshot;
 }
 
 /// Expand Win32 generic access bits into the timer object's native access mask.
@@ -36,42 +34,47 @@ pub fn map_timer_access(mut access: u32) -> u32 {
 }
 
 /// A deterministic fake clock for tests (spec §10.3).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct FakeClock {
     mono: u64,
-    system: i64,
+    system: AdjustableClock,
 }
 
 impl FakeClock {
     pub fn new() -> Self {
-        Self { mono: 0, system: 0 }
+        Self {
+            mono: 0,
+            system: AdjustableClock::new(0, 0),
+        }
     }
     /// Advance monotonic + system time by `d` 100ns units.
     pub fn advance_100ns(&mut self, d: u64) {
-        self.mono += d;
-        self.system += d as i64;
+        self.mono = self.mono.saturating_add(d);
     }
     /// Advance by `ms` milliseconds.
     pub fn advance_ms(&mut self, ms: u64) {
         self.advance_100ns(ms * 10_000);
     }
-    pub fn set_system_time(&mut self, t: i64) {
-        self.system = t;
+    pub fn set_system_time(&mut self, t: u64) {
+        self.system.set_system_time(self.mono, t).unwrap();
     }
 }
 
 impl Clock for FakeClock {
-    fn now_100ns(&self) -> u64 {
-        self.mono
+    fn snapshot(&self) -> TimeSnapshot {
+        self.system.snapshot(self.mono)
     }
-    fn system_time_100ns(&self) -> i64 {
-        self.system
+}
+
+impl Default for FakeClock {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 struct Timer {
     ptr: u64,
-    due_mono: u64,
+    deadline: Deadline,
     period_100ns: u64,
     dpc_ptr: Option<u64>,
     active: bool,
@@ -110,7 +113,7 @@ impl TimerQueue {
         }
         self.timers.push(Timer {
             ptr,
-            due_mono: 0,
+            deadline: Deadline::Infinite,
             period_100ns: 0,
             dpc_ptr: None,
             active: false,
@@ -142,19 +145,13 @@ impl TimerQueue {
         dpc_ptr: Option<u64>,
         clock: &dyn Clock,
     ) -> bool {
-        let now = clock.now_100ns();
-        let due_mono = if due_time < 0 {
-            now + (due_time.unsigned_abs())
-        } else {
-            // Absolute system time → monotonic offset (facade; drift not modelled).
-            let ahead = (due_time - clock.system_time_100ns()).max(0) as u64;
-            now + ahead
-        };
+        let now = clock.snapshot();
+        let deadline = Deadline::from_nt_timeout(Some(due_time), now);
         let gen = self.next_gen;
         self.next_gen += 1;
         let was_active = self.slot(ptr).active;
         let t = self.slot(ptr);
-        t.due_mono = due_mono;
+        t.deadline = deadline;
         t.period_100ns = period_ms as u64 * 10_000;
         t.dpc_ptr = dpc_ptr;
         t.active = true;
@@ -191,12 +188,16 @@ impl TimerQueue {
         self.timers.capacity()
     }
 
-    /// Earliest active monotonic deadline, in 100ns units.
-    pub fn next_deadline(&self) -> Option<u64> {
+    /// Earliest active comparator target at the clock's current snapshot.
+    pub fn next_deadline(&self, clock: &dyn Clock) -> Option<u64> {
+        self.next_deadline_at(clock.snapshot())
+    }
+
+    pub fn next_deadline_at(&self, now: TimeSnapshot) -> Option<u64> {
         self.timers
             .iter()
             .filter(|timer| timer.active)
-            .map(|timer| timer.due_mono)
+            .filter_map(|timer| timer.deadline.monotonic_target(now))
             .min()
     }
 
@@ -218,7 +219,7 @@ impl TimerQueue {
     /// Expire all due timers: set their signaled state, reschedule periodic
     /// ones, and return both the timer and optional `KDPC` identities.
     pub fn run_due_expirations(&mut self, clock: &dyn Clock) -> Vec<TimerExpiry> {
-        self.run_due_expirations_at(clock.now_100ns())
+        self.run_due_expirations_at(clock.snapshot())
     }
 
     /// Expire all timers due at the caller's authoritative monotonic time.
@@ -227,17 +228,19 @@ impl TimerQueue {
     /// clock quantum ahead of a subsequent counter read. The interrupt owner
     /// must be able to preserve that deadline rather than miss the expiry and
     /// wait for an unrelated later interrupt.
-    pub fn run_due_expirations_at(&mut self, now_100ns: u64) -> Vec<TimerExpiry> {
+    pub fn run_due_expirations_at(&mut self, now: TimeSnapshot) -> Vec<TimerExpiry> {
         let mut fired = Vec::new();
         for t in self.timers.iter_mut() {
-            if t.active && t.due_mono <= now_100ns {
+            if t.active && t.deadline.is_due(now) {
                 t.signaled = true;
                 fired.push(TimerExpiry {
                     timer_ptr: t.ptr,
                     dpc_ptr: t.dpc_ptr,
                 });
                 if t.period_100ns > 0 {
-                    t.due_mono = now_100ns + t.period_100ns; // periodic: reschedule
+                    t.deadline = Deadline::Relative {
+                        monotonic_100ns: now.monotonic_100ns.saturating_add(t.period_100ns),
+                    };
                 } else {
                     t.active = false;
                 }
@@ -338,7 +341,7 @@ mod tests {
         let mut tq = TimerQueue::new();
         tq.set(0x700, -1_000, 0, None, &clk);
         tq.set(0x800, -2_000, 0, Some(0xD2), &clk);
-        assert_eq!(tq.next_deadline(), Some(1_000));
+        assert_eq!(tq.next_deadline(&clk), Some(1_000));
 
         clk.advance_100ns(1_000);
         assert_eq!(
@@ -348,10 +351,10 @@ mod tests {
                 dpc_ptr: None,
             }]
         );
-        assert_eq!(tq.next_deadline(), Some(2_000));
+        assert_eq!(tq.next_deadline(&clk), Some(2_000));
 
         tq.clear();
-        assert_eq!(tq.next_deadline(), None);
+        assert_eq!(tq.next_deadline(&clk), None);
         assert_eq!(tq.active_count(), 0);
     }
 
@@ -364,14 +367,62 @@ mod tests {
         // The sampled clock is still one quantum behind, but the interrupt
         // owner knows that the armed deadline produced this delivery.
         assert!(tq.run_due_expirations(&clk).is_empty());
+        let now = TimeSnapshot {
+            monotonic_100ns: 1_000,
+            system_time_100ns: 1_000,
+            clock_generation: 0,
+        };
         assert_eq!(
-            tq.run_due_expirations_at(1_000),
+            tq.run_due_expirations_at(now),
             vec![TimerExpiry {
                 timer_ptr: 0x700,
                 dpc_ptr: Some(0xD1),
             }]
         );
-        assert!(tq.run_due_expirations_at(1_000).is_empty());
+        assert!(tq.run_due_expirations_at(now).is_empty());
+    }
+
+    #[test]
+    fn absolute_timer_follows_forward_and_backward_system_clock_changes() {
+        let mut clk = FakeClock::new();
+        clk.set_system_time(1_000);
+        let mut tq = TimerQueue::new();
+        tq.set(0x700, 5_000, 0, None, &clk);
+        assert_eq!(tq.next_deadline(&clk), Some(4_000));
+
+        clk.advance_100ns(1_000);
+        clk.set_system_time(6_000);
+        assert_eq!(tq.next_deadline(&clk), Some(1_000));
+        assert_eq!(tq.run_due_expirations(&clk).len(), 1);
+
+        tq.set(0x800, 8_000, 0, None, &clk);
+        assert_eq!(tq.next_deadline(&clk), Some(3_000));
+        clk.set_system_time(2_000);
+        assert_eq!(tq.next_deadline(&clk), Some(7_000));
+        clk.advance_100ns(5_999);
+        assert!(tq.run_due_expirations(&clk).is_empty());
+        clk.advance_100ns(1);
+        assert_eq!(tq.run_due_expirations(&clk).len(), 1);
+    }
+
+    #[test]
+    fn relative_and_periodic_deadlines_ignore_later_system_clock_changes() {
+        let mut clk = FakeClock::new();
+        clk.set_system_time(10_000);
+        let mut tq = TimerQueue::new();
+        tq.set(0x700, -1_000, 1, None, &clk);
+
+        clk.set_system_time(100);
+        assert_eq!(tq.next_deadline(&clk), Some(1_000));
+        clk.advance_100ns(1_000);
+        assert_eq!(tq.run_due_expirations(&clk).len(), 1);
+        assert_eq!(tq.next_deadline(&clk), Some(11_000));
+
+        clk.set_system_time(50_000);
+        clk.advance_100ns(9_999);
+        assert!(tq.run_due_expirations(&clk).is_empty());
+        clk.advance_100ns(1);
+        assert_eq!(tq.run_due_expirations(&clk).len(), 1);
     }
 
     #[test]

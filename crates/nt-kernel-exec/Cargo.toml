@@ -13,3 +13,6 @@ std = []
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
+
+[dependencies]
+nt-time.workspace = true

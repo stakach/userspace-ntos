@@ -10925,16 +10925,18 @@ pub(crate) fn hosted_driver_wait_next_deadline() -> Option<u64> {
 }
 
 pub(crate) fn hosted_driver_timer_next_deadline() -> Option<u64> {
+    let now = crate::nt_time_snapshot();
     unsafe {
         (*core::ptr::addr_of!(HOSTED_DRIVER_TIMERS))
             .as_ref()?
             .iter()
-            .filter_map(nt_kernel_exec::TimerQueue::next_deadline)
+            .filter_map(|queue| queue.next_deadline_at(now))
             .min()
     }
 }
 
 pub(crate) unsafe fn hosted_driver_timer_wake_due(now_100ns: u64) -> u64 {
+    let now = crate::nt_time_snapshot_at(now_100ns);
     let queue_count = (*core::ptr::addr_of!(HOSTED_DRIVER_TIMERS))
         .as_ref()
         .map(Vec::len)
@@ -10945,7 +10947,7 @@ pub(crate) unsafe fn hosted_driver_timer_wake_due(now_100ns: u64) -> u64 {
             let queues = (*core::ptr::addr_of_mut!(HOSTED_DRIVER_TIMERS))
                 .as_mut()
                 .unwrap();
-            queues[instance_index].run_due_expirations_at(now_100ns)
+            queues[instance_index].run_due_expirations_at(now)
         };
         if expirations.is_empty() {
             continue;
@@ -39866,12 +39868,8 @@ static mut HOSTED_DRIVER_DPC_ACTIVATIONS: Option<Vec<HostedDriverDpcActivation>>
 struct ExecutiveClock;
 
 impl nt_kernel_exec::Clock for ExecutiveClock {
-    fn now_100ns(&self) -> u64 {
-        crate::monotonic_time_100ns()
-    }
-
-    fn system_time_100ns(&self) -> i64 {
-        crate::nt_system_time_100ns() as i64
+    fn snapshot(&self) -> nt_kernel_exec::TimeSnapshot {
+        crate::nt_time_snapshot()
     }
 }
 

@@ -16505,3 +16505,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     identity and making periodic re-arms relative to monotonic time after that fire. Then migrate the
     driver dispatcher wait table that shares the same crate. Do not add runtime clock adjustment
     until both driver timer owners can be reprojected from tagged state.
+
+    Tagged kernel timer queue (2026-08-30, focused validation complete):
+    `nt-kernel-exec::TimerQueue` now stores `Deadline` rather than the one-time `due_mono`
+    conversion. Its clock contract supplies one coherent `TimeSnapshot`; deadline discovery and
+    expiry both reproject absolute timers from that snapshot. The hosted-driver timer aggregator
+    samples once across every driver instance, and the interrupt drain passes a complete snapshot
+    rather than resampling system time behind an authoritative monotonic boundary. After the first
+    expiry, a periodic timer deliberately rearms as a relative monotonic deadline, so later wall
+    clock changes cannot distort its period.
+
+    The fake clock itself uses the adjustable-clock model. Focused coverage proves forward and
+    backward rebasing of absolute timers, wall-clock invariance for relative timers and post-fire
+    periods, authoritative interrupt-boundary expiry, cancellation, reset generations, and DPC
+    delivery. `nt-kernel-exec` passes `172/172`; the freestanding executive remains at the accepted
+    209-warning baseline, and the old `due_mono` field and split clock reads have no remaining use.
+
+    Review adjustment: migrate `nt-kernel-exec::HostedDispatcherWaitTable` and its executive raw
+    waiter mirror as one slice. The timeout tag must survive the component request, table record,
+    shared HPET minimum, normal signal wake, cancellation, and timeout completion. Delete both
+    `Option<u64>` deadline fields and do not retain a converted-deadline adapter.
