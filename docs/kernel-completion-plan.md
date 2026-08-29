@@ -16018,3 +16018,43 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     remaining numeric reply/wait/receive continuations to a typed blocked-service adapter and remove
     the superseded routing state in the same slice. No image-role inference, zero-section view,
     permissive quota path, or synthetic successful reply is acceptable.
+
+    LPC broker allocation accounting (2026-08-29, accepted): `MaxPoolUsage` is now an enforced
+    property of the broker object created for each listen port, not inert connection metadata.
+    Every descendant communication port shares that account. Queued messages are charged for a
+    16-byte-aligned broker record, owned payload, and owned handle-attribute storage; a synchronous
+    request that leaves the queue exchanges that charge for the smaller delivered-request identity
+    retained for exact reply and impersonation. Receive, endpoint close, and disconnect release the
+    corresponding charges. Reply replacement is transactional: the broker checks the replacement
+    against the shared limit before consuming the delivered request, and a quota or allocation
+    failure restores the prior charge and leaves that request replyable. A native zero limit means
+    no caller-selected private cap, but usage remains accounted rather than taking a separate
+    untracked path.
+
+    The executive's `NtCreatePort` dispatcher now forwards the real fifth `ULONG` argument instead
+    of publishing a literal zero. Host tests prove shared exhaustion across two connections,
+    recovery after dequeue, exact usage convergence to zero, and preservation of a delivered
+    request across a rejected oversized reply. Focused validation passes `nt-port-core` at `15/15`,
+    `nt-lpc-server` at `16/16`, and `nt-alpc` at `12/12`; the freestanding check and staged release
+    build remain at the established 212-warning baseline.
+
+    Serialized acceptance `.tmp/run-headless-lpc-pool-accounting-20260829.log` observes six native
+    connection ports with caller-authored pool limits, including 64 KiB for `\Windows\ApiPort`,
+    9 KiB for `\SmApiPort` and `\Windows\SbApiPort`, 6 KiB for
+    `\LsaAuthenticationPort`, and 8 KiB for both `\SeLsaCommandPort` and `\ErrorLogPort`. No live
+    message exhausts its port account. Genuine userinit and Explorer launch, 668 Explorer api0
+    redirects complete with zero callback or dead-callback failures, paint begin/end reaches
+    `5/20` with 187 direct GDI returns and 135 batch flushes covering 184 records, and the
+    framebuffer holds `480000/480000` non-background pixels with at least 32 colours. All `295/295`
+    gates pass and the sentinel matches.
+
+    Review adjustment: the remaining connection-view debt is now isolated to the independent
+    acceptor-provided direction. Replace the single pending connector-view slot with a generic
+    connection-id-keyed kernel transaction. `NtAcceptConnectPort` must validate and resolve its
+    optional server `PORT_VIEW` in the accepting process, map that section into both acceptor and
+    connector through the ordinary target-process mapper, publish the acceptor's local/remote bases,
+    and return the connector's `REMOTE_PORT_VIEW` only after the same accepted connection completes.
+    Refusal, malformed descriptors, mapping failure, copyout failure, or broker failure must unwind
+    both directions. Once this is host-tested and desktop-accepted, convert the remaining numeric
+    reply/wait/receive continuations to the typed blocked-service adapter and delete
+    `Port.reply_connection` with its superseded routing state.

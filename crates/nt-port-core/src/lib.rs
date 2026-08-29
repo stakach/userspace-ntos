@@ -231,12 +231,25 @@ pub struct QueuedMessage {
     pub request_identity: Option<MessageIdentity>,
 }
 
+/// Broker-owned storage for a queued message. The charge is fixed when the message enters the
+/// broker so later queue capacity changes cannot silently alter the port's accounted usage.
+struct StoredMessage {
+    message: QueuedMessage,
+    pool_charge: u32,
+}
+
 /// Identity stamped into a synchronous request by the trusted API adapter. The connection id is
 /// derived by the core from the client communication handle and is never supplied by user mode.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct MessageIdentity {
     pub client: ClientId,
     pub message_id: u32,
+}
+
+#[derive(Copy, Clone)]
+struct DeliveredRequest {
+    identity: MessageIdentity,
+    pool_charge: u32,
 }
 
 /// Broker-owned security and connection identity for one request currently held by a server.
@@ -257,6 +270,34 @@ pub const MAX_CONNINFO: usize = 512;
 /// Default used by API-neutral test helpers. Native adapters always provide their caller's limit.
 pub const DEFAULT_MAX_MESSAGE_LENGTH: u32 = 512;
 
+const POOL_ALLOCATION_ALIGNMENT: usize = 16;
+
+fn aligned_pool_charge(bytes: usize) -> Result<u32, NtStatus> {
+    let aligned = bytes
+        .checked_add(POOL_ALLOCATION_ALIGNMENT - 1)
+        .map(|value| value & !(POOL_ALLOCATION_ALIGNMENT - 1))
+        .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+    u32::try_from(aligned).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)
+}
+
+fn queued_message_pool_charge(bytes: usize, attrs: &MessageAttrs) -> Result<u32, NtStatus> {
+    let handle_bytes = attrs
+        .handles
+        .len()
+        .checked_mul(core::mem::size_of::<u64>())
+        .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+    core::mem::size_of::<QueuedMessage>()
+        .checked_add(bytes)
+        .and_then(|bytes| bytes.checked_add(handle_bytes))
+        .ok_or(NtStatus::INSUFFICIENT_RESOURCES)
+        .and_then(aligned_pool_charge)
+}
+
+fn delivered_request_pool_charge() -> u32 {
+    aligned_pool_charge(core::mem::size_of::<DeliveredRequest>())
+        .expect("a fixed broker request record fits in ULONG accounting")
+}
+
 struct Port {
     handle: u64,
     /// Folded (lowercase) UTF-16 name; empty = unnamed communication port.
@@ -265,6 +306,7 @@ struct Port {
     api: PortApi,
     owner: ClientId,
     limits: PortLimits,
+    pool_account: usize,
     /// Connection ids awaiting a receiver (Manual-policy FIFO).
     pending: Vec<u64>,
     /// Connection whose request was most recently received through this listen port. LPC's
@@ -281,6 +323,7 @@ struct Connection {
     client_id: ClientId,
     server_id: ClientId,
     limits: PortLimits,
+    pool_account: usize,
     security: ConnectionSecurity,
     /// Opaque connection-info blob from the connector (SB_CONNECTION_INFO for an
     /// LPC connector, the ALPC ConnectionInformation blob for an ALPC connector).
@@ -302,11 +345,16 @@ struct Connection {
     server_open: bool,
     port_context: u64,
     /// Messages destined FOR the client (sent BY the server).
-    client_inbox: Vec<QueuedMessage>,
+    client_inbox: Vec<StoredMessage>,
     /// Messages destined FOR the server (sent BY the client).
-    server_inbox: Vec<QueuedMessage>,
+    server_inbox: Vec<StoredMessage>,
     /// Requests actually delivered to a server thread and still awaiting a matching reply.
-    delivered_requests: Vec<MessageIdentity>,
+    delivered_requests: Vec<DeliveredRequest>,
+}
+
+struct PoolAccount {
+    limit: u32,
+    usage: u32,
 }
 
 /// The unified port core: a port namespace + connection rendezvous + message
@@ -314,6 +362,7 @@ struct Connection {
 pub struct PortCore {
     ports: Vec<Port>,
     connections: Vec<Connection>,
+    pool_accounts: Vec<PoolAccount>,
     next_handle: u64,
     next_conn_id: u64,
     accept_policy: AcceptPolicy,
@@ -331,6 +380,7 @@ impl PortCore {
         Self {
             ports: Vec::new(),
             connections: Vec::new(),
+            pool_accounts: Vec::new(),
             next_handle: PORT_HANDLE_BASE,
             next_conn_id: 1,
             accept_policy: AcceptPolicy::AutoAccept,
@@ -375,6 +425,12 @@ impl PortCore {
     /// Limits inherited by a connection from its named server port.
     pub fn connection_limits(&self, id: u64) -> Option<PortLimits> {
         self.conn(id).map(|c| c.limits)
+    }
+
+    /// Current broker allocation charge against the listen port inherited by this connection.
+    pub fn connection_pool_usage(&self, id: u64) -> Option<u32> {
+        let account = self.conn(id)?.pool_account;
+        self.pool_accounts.get(account).map(|account| account.usage)
     }
 
     /// Security quality of service captured when the connection was initiated.
@@ -498,6 +554,11 @@ impl PortCore {
             }
         }
         let handle = self.alloc_handle();
+        let pool_account = self.pool_accounts.len();
+        self.pool_accounts.push(PoolAccount {
+            limit: limits.max_pool_usage,
+            usage: 0,
+        });
         self.ports.push(Port {
             handle,
             name,
@@ -505,6 +566,7 @@ impl PortCore {
             api,
             owner,
             limits,
+            pool_account,
             pending: Vec::new(),
             reply_connection: None,
         });
@@ -569,6 +631,7 @@ impl PortCore {
         let server_api = self.ports[port_idx].api;
         let server_id = self.ports[port_idx].owner;
         let limits = self.ports[port_idx].limits;
+        let pool_account = self.ports[port_idx].pool_account;
 
         let id = self.next_conn_id;
         self.next_conn_id += 1;
@@ -589,6 +652,7 @@ impl PortCore {
                     client_id,
                     server_id,
                     limits,
+                    pool_account,
                     security,
                     stored,
                     ConnState::Connected,
@@ -610,6 +674,7 @@ impl PortCore {
                     client_id,
                     server_id,
                     limits,
+                    pool_account,
                     security,
                     stored,
                     ConnState::Pending,
@@ -737,35 +802,34 @@ impl PortCore {
             self.ports.remove(pos);
             return;
         }
-        if let Some(connection) = self.connections.iter_mut().find(|connection| {
+        if let Some(connection_index) = self.connections.iter().position(|connection| {
             port_handle != 0 && connection.client_open && connection.client_handle == port_handle
         }) {
+            self.release_connection_storage(connection_index, true, true, true);
+            let connection = &mut self.connections[connection_index];
             connection.client_open = false;
             connection.state = ConnState::Refused;
-            connection.client_inbox.clear();
-            connection.server_inbox.clear();
-            connection.delivered_requests.clear();
             return;
         }
-        if let Some(connection) = self.connections.iter_mut().find(|connection| {
+        if let Some(connection_index) = self.connections.iter().position(|connection| {
             port_handle != 0 && connection.server_open && connection.server_handle == port_handle
         }) {
+            self.release_connection_storage(connection_index, false, true, true);
+            let connection = &mut self.connections[connection_index];
             connection.server_open = false;
             connection.state = ConnState::Refused;
-            connection.server_inbox.clear();
-            connection.delivered_requests.clear();
         }
     }
 
     /// Disconnect a connection by id (marks it refused/closed). Idempotent.
     pub fn disconnect(&mut self, connection_id: u64) {
-        if let Some(conn) = self.connections.iter_mut().find(|c| c.id == connection_id) {
+        if let Some(connection_index) = self.connections.iter().position(|c| c.id == connection_id)
+        {
+            self.release_connection_storage(connection_index, true, true, true);
+            let conn = &mut self.connections[connection_index];
             conn.state = ConnState::Refused;
             conn.client_open = false;
             conn.server_open = false;
-            conn.client_inbox.clear();
-            conn.server_inbox.clear();
-            conn.delivered_requests.clear();
         }
     }
 
@@ -782,55 +846,56 @@ impl PortCore {
         bytes: &[u8],
         attrs: MessageAttrs,
     ) -> Result<(), NtStatus> {
-        let mut msg = QueuedMessage {
-            bytes: bytes.to_vec(),
-            attrs,
-            port_context: 0,
-            request_identity: None,
-        };
-        for conn in self.connections.iter_mut() {
-            if conn.state != ConnState::Connected || !conn.client_open || !conn.server_open {
-                continue;
+        if let Some(connection_index) = self.connections.iter().position(|connection| {
+            connection.state == ConnState::Connected
+                && connection.client_open
+                && connection.server_open
+                && from_handle != 0
+                && (connection.client_handle == from_handle
+                    || connection.server_handle == from_handle)
+        }) {
+            let connection = &self.connections[connection_index];
+            if bytes.len() > connection.limits.max_message as usize {
+                return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
             }
-            if from_handle != 0 && conn.client_handle == from_handle {
-                if bytes.len() > conn.limits.max_message as usize {
-                    return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
-                }
-                msg.port_context = conn.port_context;
-                conn.server_inbox.push(msg);
-                return Ok(());
+            let from_client = connection.client_handle == from_handle;
+            let account = connection.pool_account;
+            let port_context = from_client.then_some(connection.port_context).unwrap_or(0);
+            let stored =
+                self.allocate_stored_message(account, 0, bytes, attrs, port_context, None)?;
+            if from_client {
+                self.connections[connection_index].server_inbox.push(stored);
+            } else {
+                self.connections[connection_index].client_inbox.push(stored);
             }
-            if from_handle != 0 && conn.server_handle == from_handle {
-                if bytes.len() > conn.limits.max_message as usize {
-                    return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
-                }
-                conn.client_inbox.push(msg);
-                return Ok(());
-            }
+            return Ok(());
         }
-        if let Some(port) = self
+        if let Some(port_index) = self
             .ports
-            .iter_mut()
-            .find(|port| port.handle == from_handle)
+            .iter()
+            .position(|port| port.handle == from_handle)
         {
-            let connection_id = port
+            let connection_id = self.ports[port_index]
                 .reply_connection
-                .take()
                 .ok_or(NtStatus::INVALID_HANDLE)?;
-            let conn = self
+            let connection_index = self
                 .connections
-                .iter_mut()
-                .find(|conn| {
+                .iter()
+                .position(|conn| {
                     conn.id == connection_id
                         && conn.state == ConnState::Connected
                         && conn.client_open
                         && conn.server_open
                 })
                 .ok_or(NtStatus::INVALID_HANDLE)?;
-            if bytes.len() > conn.limits.max_message as usize {
+            let connection = &self.connections[connection_index];
+            if bytes.len() > connection.limits.max_message as usize {
                 return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
             }
-            conn.client_inbox.push(msg);
+            let account = connection.pool_account;
+            let stored = self.allocate_stored_message(account, 0, bytes, attrs, 0, None)?;
+            self.connections[connection_index].client_inbox.push(stored);
+            self.ports[port_index].reply_connection = None;
             return Ok(());
         }
         Err(NtStatus::INVALID_HANDLE)
@@ -849,10 +914,10 @@ impl PortCore {
         if identity.message_id == 0 {
             return Err(NtStatus::INVALID_PARAMETER);
         }
-        let conn = self
+        let connection_index = self
             .connections
-            .iter_mut()
-            .find(|connection| {
+            .iter()
+            .position(|connection| {
                 connection.state == ConnState::Connected
                     && connection.client_open
                     && connection.server_open
@@ -860,18 +925,18 @@ impl PortCore {
                     && connection.client_handle == from_handle
             })
             .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+        let conn = &self.connections[connection_index];
         if identity.client.process != conn.client_id.process {
             return Err(NtStatus::REPLY_MESSAGE_MISMATCH);
         }
         if bytes.len() > conn.limits.max_message as usize {
             return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
         }
-        conn.server_inbox.push(QueuedMessage {
-            bytes: bytes.to_vec(),
-            attrs,
-            port_context: conn.port_context,
-            request_identity: Some(identity),
-        });
+        let account = conn.pool_account;
+        let port_context = conn.port_context;
+        let stored =
+            self.allocate_stored_message(account, 0, bytes, attrs, port_context, Some(identity))?;
+        self.connections[connection_index].server_inbox.push(stored);
         Ok(())
     }
 
@@ -887,28 +952,29 @@ impl PortCore {
         if identity.message_id == 0 {
             return Err(NtStatus::REPLY_MESSAGE_MISMATCH);
         }
-        if let Some(connection) = self.connections.iter_mut().find(|connection| {
+        if let Some(connection_index) = self.connections.iter().position(|connection| {
             connection.state == ConnState::Connected
                 && connection.client_open
                 && connection.server_open
                 && from_handle != 0
                 && connection.server_handle == from_handle
         }) {
-            let index = connection
+            let connection = &self.connections[connection_index];
+            let delivered_index = connection
                 .delivered_requests
                 .iter()
-                .position(|request| *request == identity)
+                .position(|request| request.identity == identity)
                 .ok_or(NtStatus::REPLY_MESSAGE_MISMATCH)?;
             if bytes.len() > connection.limits.max_message as usize {
                 return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
             }
-            connection.delivered_requests.remove(index);
-            connection.client_inbox.push(QueuedMessage {
-                bytes: bytes.to_vec(),
-                attrs,
-                port_context: 0,
-                request_identity: Some(identity),
-            });
+            let old_charge = connection.delivered_requests[delivered_index].pool_charge;
+            let account = connection.pool_account;
+            let stored =
+                self.allocate_stored_message(account, old_charge, bytes, attrs, 0, Some(identity))?;
+            let connection = &mut self.connections[connection_index];
+            connection.delivered_requests.remove(delivered_index);
+            connection.client_inbox.push(stored);
             return Ok(());
         }
 
@@ -917,10 +983,10 @@ impl PortCore {
             .iter()
             .find(|port| port.handle == from_handle)
             .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
-        let connection = self
+        let connection_index = self
             .connections
-            .iter_mut()
-            .find(|connection| {
+            .iter()
+            .position(|connection| {
                 connection.state == ConnState::Connected
                     && connection.client_open
                     && connection.server_open
@@ -929,24 +995,25 @@ impl PortCore {
                     && connection
                         .delivered_requests
                         .iter()
-                        .any(|request| *request == identity)
+                        .any(|request| request.identity == identity)
             })
             .ok_or(NtStatus::REPLY_MESSAGE_MISMATCH)?;
+        let connection = &self.connections[connection_index];
         if bytes.len() > connection.limits.max_message as usize {
             return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
         }
-        let index = connection
+        let delivered_index = connection
             .delivered_requests
             .iter()
-            .position(|request| *request == identity)
+            .position(|request| request.identity == identity)
             .expect("matching delivered request was selected");
-        connection.delivered_requests.remove(index);
-        connection.client_inbox.push(QueuedMessage {
-            bytes: bytes.to_vec(),
-            attrs,
-            port_context: 0,
-            request_identity: Some(identity),
-        });
+        let old_charge = connection.delivered_requests[delivered_index].pool_charge;
+        let account = connection.pool_account;
+        let stored =
+            self.allocate_stored_message(account, old_charge, bytes, attrs, 0, Some(identity))?;
+        let connection = &mut self.connections[connection_index];
+        connection.delivered_requests.remove(delivered_index);
+        connection.client_inbox.push(stored);
         Ok(())
     }
 
@@ -975,7 +1042,7 @@ impl PortCore {
             return connection
                 .delivered_requests
                 .iter()
-                .any(|request| *request == identity)
+                .any(|request| request.identity == identity)
                 .then_some(DeliveredRequestInfo {
                     connection_id: connection.id,
                     client: identity.client,
@@ -999,7 +1066,7 @@ impl PortCore {
                     && connection
                         .delivered_requests
                         .iter()
-                        .any(|request| *request == identity)
+                        .any(|request| request.identity == identity)
             })
             .map(|connection| DeliveredRequestInfo {
                 connection_id: connection.id,
@@ -1012,17 +1079,22 @@ impl PortCore {
     /// Receive the next `PORT_MESSAGE` for the endpoint identified by `handle`.
     /// Returns `Ok(None)` when the inbox is empty (would-block).
     pub fn receive_message(&mut self, handle: u64) -> Result<Option<QueuedMessage>, NtStatus> {
-        for conn in self.connections.iter_mut() {
-            if handle != 0 && conn.client_open && conn.client_handle == handle {
-                if !conn.client_inbox.is_empty() {
-                    return Ok(Some(conn.client_inbox.remove(0)));
-                }
-                return if conn.state == ConnState::Connected && conn.server_open {
-                    Ok(None)
-                } else {
-                    Err(NtStatus::PORT_DISCONNECTED)
-                };
+        if let Some(connection_index) = self.connections.iter().position(|connection| {
+            handle != 0 && connection.client_open && connection.client_handle == handle
+        }) {
+            if !self.connections[connection_index].client_inbox.is_empty() {
+                let stored = self.connections[connection_index].client_inbox.remove(0);
+                let account = self.connections[connection_index].pool_account;
+                self.replace_pool_charge(account, stored.pool_charge, 0)
+                    .expect("dequeued broker message was previously charged");
+                return Ok(Some(stored.message));
             }
+            let conn = &self.connections[connection_index];
+            return if conn.state == ConnState::Connected && conn.server_open {
+                Ok(None)
+            } else {
+                Err(NtStatus::PORT_DISCONNECTED)
+            };
         }
         let port_index = self
             .ports
@@ -1040,19 +1112,35 @@ impl PortCore {
             });
             if let Some(connection_index) = connection_index {
                 let connection_id = self.connections[connection_index].id;
-                let message = self.connections[connection_index].server_inbox.remove(0);
-                if let Some(identity) = message.request_identity {
+                let stored = self.connections[connection_index].server_inbox.remove(0);
+                let account = self.connections[connection_index].pool_account;
+                if let Some(identity) = stored.message.request_identity {
                     if !self.connections[connection_index]
                         .delivered_requests
-                        .contains(&identity)
+                        .iter()
+                        .any(|request| request.identity == identity)
                     {
-                        self.connections[connection_index]
-                            .delivered_requests
-                            .push(identity);
+                        let delivered_charge = delivered_request_pool_charge();
+                        self.replace_pool_charge(account, stored.pool_charge, delivered_charge)
+                            .expect(
+                                "a delivered request record is smaller than its queued message",
+                            );
+                        self.connections[connection_index].delivered_requests.push(
+                            DeliveredRequest {
+                                identity,
+                                pool_charge: delivered_charge,
+                            },
+                        );
+                    } else {
+                        self.replace_pool_charge(account, stored.pool_charge, 0)
+                            .expect("dequeued duplicate request was previously charged");
                     }
+                } else {
+                    self.replace_pool_charge(account, stored.pool_charge, 0)
+                        .expect("dequeued broker datagram was previously charged");
                 }
                 self.ports[port_index].reply_connection = Some(connection_id);
-                return Ok(Some(message));
+                return Ok(Some(stored.message));
             }
             return Ok(None);
         }
@@ -1072,6 +1160,108 @@ impl PortCore {
     }
 
     // --- internals --------------------------------------------------------
+
+    fn replace_pool_charge(
+        &mut self,
+        account_index: usize,
+        old_charge: u32,
+        new_charge: u32,
+    ) -> Result<(), NtStatus> {
+        let account = self
+            .pool_accounts
+            .get_mut(account_index)
+            .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+        let without_old = account
+            .usage
+            .checked_sub(old_charge)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        let usage = without_old
+            .checked_add(new_charge)
+            .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+        // Native callers use zero when they do not request a private port quota. Such ports still
+        // participate in accounting; only the explicit upper-bound check is disabled.
+        if account.limit != 0 && usage > account.limit {
+            return Err(NtStatus::INSUFFICIENT_RESOURCES);
+        }
+        account.usage = usage;
+        Ok(())
+    }
+
+    fn allocate_stored_message(
+        &mut self,
+        account_index: usize,
+        replaced_charge: u32,
+        bytes: &[u8],
+        attrs: MessageAttrs,
+        port_context: u64,
+        request_identity: Option<MessageIdentity>,
+    ) -> Result<StoredMessage, NtStatus> {
+        let pool_charge = queued_message_pool_charge(bytes.len(), &attrs)?;
+        self.replace_pool_charge(account_index, replaced_charge, pool_charge)?;
+
+        let mut owned_bytes = Vec::new();
+        if owned_bytes.try_reserve_exact(bytes.len()).is_err() {
+            self.replace_pool_charge(account_index, pool_charge, replaced_charge)
+                .expect("failed allocation leaves the previous broker charge intact");
+            return Err(NtStatus::INSUFFICIENT_RESOURCES);
+        }
+        owned_bytes.extend_from_slice(bytes);
+        Ok(StoredMessage {
+            message: QueuedMessage {
+                bytes: owned_bytes,
+                attrs,
+                port_context,
+                request_identity,
+            },
+            pool_charge,
+        })
+    }
+
+    fn release_connection_storage(
+        &mut self,
+        connection_index: usize,
+        clear_client: bool,
+        clear_server: bool,
+        clear_delivered: bool,
+    ) {
+        let (account, charge) = {
+            let connection = &mut self.connections[connection_index];
+            let mut charge = 0u32;
+            if clear_client {
+                charge = charge.saturating_add(
+                    connection
+                        .client_inbox
+                        .iter()
+                        .map(|message| message.pool_charge)
+                        .sum(),
+                );
+                connection.client_inbox.clear();
+            }
+            if clear_server {
+                charge = charge.saturating_add(
+                    connection
+                        .server_inbox
+                        .iter()
+                        .map(|message| message.pool_charge)
+                        .sum(),
+                );
+                connection.server_inbox.clear();
+            }
+            if clear_delivered {
+                charge = charge.saturating_add(
+                    connection
+                        .delivered_requests
+                        .iter()
+                        .map(|request| request.pool_charge)
+                        .sum(),
+                );
+                connection.delivered_requests.clear();
+            }
+            (connection.pool_account, charge)
+        };
+        self.replace_pool_charge(account, charge, 0)
+            .expect("released broker allocations were previously charged");
+    }
 
     fn conn(&self, id: u64) -> Option<&Connection> {
         self.connections.iter().find(|c| c.id == id)
@@ -1093,6 +1283,7 @@ impl Connection {
         client_id: ClientId,
         server_id: ClientId,
         limits: PortLimits,
+        pool_account: usize,
         security: ConnectionSecurity,
         conn_info: Vec<u8>,
         state: ConnState,
@@ -1108,6 +1299,7 @@ impl Connection {
             client_id,
             server_id,
             limits,
+            pool_account,
             security,
             conn_info,
             response_info,
@@ -1377,6 +1569,142 @@ mod tests {
         );
         core.send_message(client, &[0; 44], MessageAttrs::default())
             .unwrap();
+    }
+
+    #[test]
+    fn max_pool_usage_is_shared_and_released_when_messages_leave_the_broker() {
+        fn connect(core: &mut PortCore, listen: u64) -> (u64, u64) {
+            let connection = match core.connect(&utf16("\\P"), PortApi::Lpc, 0, &[]).unwrap() {
+                ConnectOutcome::Pending { connection_id } => connection_id,
+                _ => unreachable!(),
+            };
+            core.receive(listen).unwrap();
+            let server = core.accept(connection, true, 0).unwrap();
+            let client = core.complete(connection).unwrap().0;
+            (server, client)
+        }
+
+        // Measure the broker's aligned allocation charge rather than encoding a host layout in
+        // the test. The limited port below must permit exactly one such allocation.
+        let mut probe = PortCore::new();
+        probe.set_accept_policy(AcceptPolicy::Manual);
+        let probe_listen = probe.create_port(&utf16("\\P"), PortApi::Lpc);
+        let (_, probe_client) = connect(&mut probe, probe_listen);
+        probe
+            .send_message(probe_client, b"one", MessageAttrs::default())
+            .unwrap();
+        let one_message_charge = probe.connection_pool_usage(1).unwrap();
+        assert_ne!(one_message_charge, 0);
+
+        let mut core = PortCore::new();
+        core.set_accept_policy(AcceptPolicy::Manual);
+        let listen = core
+            .create_port_with_limits(
+                &utf16("\\P"),
+                PortApi::Lpc,
+                PortLimits {
+                    max_connection_info: 0,
+                    max_message: 64,
+                    max_pool_usage: one_message_charge,
+                },
+            )
+            .unwrap();
+        let (server_a, client_a) = connect(&mut core, listen);
+        let (_, client_b) = connect(&mut core, listen);
+
+        core.send_message(client_a, b"one", MessageAttrs::default())
+            .unwrap();
+        assert_eq!(core.connection_pool_usage(1), Some(one_message_charge));
+        assert_eq!(core.connection_pool_usage(2), Some(one_message_charge));
+        assert_eq!(
+            core.send_message(client_b, b"two", MessageAttrs::default()),
+            Err(NtStatus::INSUFFICIENT_RESOURCES)
+        );
+        assert_eq!(core.connection_pool_usage(1), Some(one_message_charge));
+
+        assert_eq!(
+            core.receive_message(server_a).unwrap().unwrap().bytes,
+            b"one"
+        );
+        assert_eq!(core.connection_pool_usage(1), Some(0));
+        core.send_message(client_b, b"two", MessageAttrs::default())
+            .unwrap();
+    }
+
+    #[test]
+    fn quota_failed_reply_preserves_the_delivered_request() {
+        let client_id = ClientId {
+            process: 0x120,
+            thread: 0x124,
+        };
+
+        // Obtain the exact charge of the queued request so the limited port can admit it while a
+        // materially larger reply cannot fit.
+        let mut probe = PortCore::new();
+        probe.set_accept_policy(AcceptPolicy::Manual);
+        let probe_listen = probe.create_port(&utf16("\\P"), PortApi::Lpc);
+        let probe_connection = match probe
+            .connect_with_client_id(&utf16("\\P"), PortApi::Lpc, 0, &[], client_id)
+            .unwrap()
+        {
+            ConnectOutcome::Pending { connection_id } => connection_id,
+            _ => unreachable!(),
+        };
+        probe.receive(probe_listen).unwrap();
+        let _probe_server = probe.accept(probe_connection, true, 0).unwrap();
+        let probe_client = probe.complete(probe_connection).unwrap().0;
+        let identity = MessageIdentity {
+            client: client_id,
+            message_id: 7,
+        };
+        probe
+            .send_request_message(probe_client, b"request", MessageAttrs::default(), identity)
+            .unwrap();
+        let request_charge = probe.connection_pool_usage(probe_connection).unwrap();
+
+        let mut core = PortCore::new();
+        core.set_accept_policy(AcceptPolicy::Manual);
+        let listen = core
+            .create_port_with_limits(
+                &utf16("\\P"),
+                PortApi::Lpc,
+                PortLimits {
+                    max_connection_info: 0,
+                    max_message: 512,
+                    max_pool_usage: request_charge,
+                },
+            )
+            .unwrap();
+        let connection = match core
+            .connect_with_client_id(&utf16("\\P"), PortApi::Lpc, 0, &[], client_id)
+            .unwrap()
+        {
+            ConnectOutcome::Pending { connection_id } => connection_id,
+            _ => unreachable!(),
+        };
+        core.receive(listen).unwrap();
+        let server = core.accept(connection, true, 0).unwrap();
+        let client = core.complete(connection).unwrap().0;
+        core.send_request_message(client, b"request", MessageAttrs::default(), identity)
+            .unwrap();
+        core.receive_message(server).unwrap().unwrap();
+        let delivered_charge = core.connection_pool_usage(connection).unwrap();
+        assert!(delivered_charge < request_charge);
+
+        assert_eq!(
+            core.send_reply_message(server, &[0; 512], MessageAttrs::default(), identity),
+            Err(NtStatus::INSUFFICIENT_RESOURCES)
+        );
+        assert_eq!(
+            core.connection_pool_usage(connection),
+            Some(delivered_charge)
+        );
+        assert!(core.delivered_request(server, identity).is_ok());
+
+        core.send_reply_message(server, b"ok", MessageAttrs::default(), identity)
+            .unwrap();
+        assert_eq!(core.receive_message(client).unwrap().unwrap().bytes, b"ok");
+        assert_eq!(core.connection_pool_usage(connection), Some(0));
     }
 
     #[test]

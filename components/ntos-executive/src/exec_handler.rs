@@ -30227,6 +30227,8 @@ impl ExecNtHandler {
                     print_u64(args[2]);
                     print_str(b" maxmsg=");
                     print_u64(args[3]);
+                    print_str(b" maxpool=");
+                    print_u64(nt_ulong_arg(args[4]) as u64);
                     print_str(b"\n");
                 }
                 let Some(server_process) = self.pm_pid_for_pi(self.pi) else {
@@ -30236,7 +30238,7 @@ impl ExecNtHandler {
                     &name16,
                     nt_ulong_arg(args[2]),
                     nt_ulong_arg(args[3]),
-                    0,
+                    nt_ulong_arg(args[4]),
                     server_process as u64,
                     self.current_tid,
                 ) {
