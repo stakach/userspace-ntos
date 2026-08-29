@@ -18009,7 +18009,11 @@ impl ExecNtHandler {
     /// ignores it (`ntoskrnl/ps/query.c`, ProcessAccessToken), so resolving that handle here would
     /// reject valid callers. TokenStore does not yet model token ancestry; require the real enabled
     /// assignment privilege for the independent interactive logon token used by CreateProcessAsUser.
-    unsafe fn nt_set_process_access_token(&mut self, args: &[u64]) -> u32 {
+    unsafe fn nt_set_process_access_token_with_user_memory(
+        &mut self,
+        args: &[u64],
+        memory: SyscallUserMemory,
+    ) -> u32 {
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
         const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
@@ -18021,7 +18025,7 @@ impl ExecNtHandler {
             return STATUS_INFO_LENGTH_MISMATCH;
         }
         let mut captured = [0u8; 16];
-        if args[2] == 0 || !self.xas_read(args[2], &mut captured) {
+        if args[2] == 0 || !self.user_memory_read(memory, args[2], &mut captured) {
             return STATUS_ACCESS_VIOLATION;
         }
         let token_handle = u64::from_le_bytes(captured[..8].try_into().unwrap());
@@ -18067,6 +18071,175 @@ impl ExecNtHandler {
             USERINIT_PRIMARY_TOKEN_ASSIGNED.fetch_add(1, Ordering::Relaxed);
         }
         0
+    }
+
+    /// Apply `NtSetInformationProcess` through one kernel implementation while allowing private
+    /// CSR workers to name stack-backed input buffers in their own address space.
+    pub(crate) unsafe fn nt_set_information_process_with_user_memory(
+        &mut self,
+        args: &[u64],
+        memory: SyscallUserMemory,
+    ) -> u32 {
+        let information_class = nt_ulong_arg(args[1]);
+        let information_length = nt_ulong_arg(args[3]) as usize;
+        if information_class == 9 {
+            return self.nt_set_process_access_token_with_user_memory(args, memory);
+        }
+        const PROCESS_SET_INFORMATION: u32 = 0x0200;
+        let caller = match self.pm_pid_for_pi(self.pi) {
+            Some(pid) => pid,
+            None => return STATUS_INVALID_HANDLE,
+        };
+        let pid = match self
+            .pm
+            .resolve_process_handle(caller, args[0], PROCESS_SET_INFORMATION)
+        {
+            Ok(pid) => pid,
+            Err(status) => return status,
+        };
+
+        match information_class {
+            5 => {
+                if information_length != 4 {
+                    return nt_process::STATUS_INFO_LENGTH_MISMATCH;
+                }
+                if args[2] & 3 != 0 {
+                    return STATUS_DATATYPE_MISALIGNMENT;
+                }
+                let mut value = [0u8; 4];
+                if args[2] == 0 || !self.user_memory_read(memory, args[2], &mut value) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let raw = u32::from_le_bytes(value);
+                let base_priority = (raw & !0x8000_0000) as i32;
+                let current = self
+                    .pm
+                    .process(pid)
+                    .map(|process| process.base_priority())
+                    .unwrap_or(nt_process::DEFAULT_PROCESS_BASE_PRIORITY);
+                if base_priority > current
+                    && !self.current_token_has_privilege(nt_security::SE_INCREASE_BASE_PRIORITY)
+                {
+                    return STATUS_PRIVILEGE_NOT_HELD;
+                }
+                self.pm
+                    .set_process_base_priority(pid, base_priority)
+                    .map_or_else(|status| status, |()| 0)
+            }
+            8 => {
+                if information_length != 8 {
+                    return nt_process::STATUS_INFO_LENGTH_MISMATCH;
+                }
+                if args[2] & 7 != 0 {
+                    return STATUS_DATATYPE_MISALIGNMENT;
+                }
+                let mut value = [0u8; 8];
+                if args[2] == 0 || !self.user_memory_read(memory, args[2], &mut value) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if !self.current_token_has_privilege(nt_security::SE_TCB) {
+                    return STATUS_PRIVILEGE_NOT_HELD;
+                }
+                let port_handle = u64::from_le_bytes(value);
+                match lpc_client() {
+                    Some(client) => {
+                        if let Err(status) = client.query_handle(port_handle) {
+                            return status.raw() as u32;
+                        }
+                    }
+                    None => return STATUS_UNSUCCESSFUL,
+                }
+                self.pm
+                    .set_process_exception_port(pid, port_handle)
+                    .map_or_else(|status| status, |()| 0)
+            }
+            12 => {
+                if information_length != 4 {
+                    return nt_process::STATUS_INFO_LENGTH_MISMATCH;
+                }
+                if args[2] & 3 != 0 {
+                    return STATUS_DATATYPE_MISALIGNMENT;
+                }
+                let mut value = [0u8; 4];
+                if args[2] == 0 || !self.user_memory_read(memory, args[2], &mut value) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                self.pm
+                    .set_process_default_hard_error_processing(pid, u32::from_le_bytes(value))
+                    .map_or_else(|status| status, |()| 0)
+            }
+            18 => {
+                if information_length != 2 {
+                    return nt_process::STATUS_INFO_LENGTH_MISMATCH;
+                }
+                let mut value = [0u8; 2];
+                if args[2] == 0 || !self.user_memory_read(memory, args[2], &mut value) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let priority_class = value[1];
+                if priority_class == nt_process::PROCESS_PRIORITY_CLASS_REALTIME
+                    && !self.current_token_has_privilege(nt_security::SE_INCREASE_BASE_PRIORITY)
+                {
+                    return STATUS_PRIVILEGE_NOT_HELD;
+                }
+                match self.pm.set_process_priority_class(pid, priority_class) {
+                    Ok(()) => self
+                        .pm
+                        .set_process_foreground(pid, value[0] != 0)
+                        .map_or_else(|status| status, |()| 0),
+                    Err(status) => status,
+                }
+            }
+            24 => {
+                if information_length != 4 {
+                    return nt_process::STATUS_INFO_LENGTH_MISMATCH;
+                }
+                if args[2] & 3 != 0 {
+                    return STATUS_DATATYPE_MISALIGNMENT;
+                }
+                let mut value = [0u8; 4];
+                if args[2] == 0 || !self.user_memory_read(memory, args[2], &mut value) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if !self.current_token_has_privilege(nt_security::SE_TCB) {
+                    return STATUS_PRIVILEGE_NOT_HELD;
+                }
+                self.pm
+                    .set_process_session_id(pid, u32::from_le_bytes(value))
+                    .map_or_else(|status| status, |()| 0)
+            }
+            25 => {
+                if information_length != 1 {
+                    return nt_process::STATUS_INFO_LENGTH_MISMATCH;
+                }
+                let mut value = [0u8; 1];
+                if args[2] == 0 || !self.user_memory_read(memory, args[2], &mut value) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                self.pm
+                    .set_process_foreground(pid, value[0] != 0)
+                    .map_or_else(|status| status, |()| 0)
+            }
+            29 => {
+                if information_length != 4 {
+                    return nt_process::STATUS_INFO_LENGTH_MISMATCH;
+                }
+                if args[2] & 3 != 0 {
+                    return STATUS_DATATYPE_MISALIGNMENT;
+                }
+                let mut value = [0u8; 4];
+                if args[2] == 0 || !self.user_memory_read(memory, args[2], &mut value) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if !self.current_token_has_privilege(nt_security::SE_DEBUG) {
+                    return STATUS_PRIVILEGE_NOT_HELD;
+                }
+                self.pm
+                    .set_process_break_on_termination(pid, u32::from_le_bytes(value) != 0)
+                    .map_or_else(|status| status, |()| 0)
+            }
+            _ => nt_process::STATUS_INVALID_INFO_CLASS,
+        }
     }
 
     fn release_handle_object(&mut self, object: nt_process::HandleObject) {
@@ -31047,172 +31220,10 @@ impl ExecNtHandler {
             // Model process information setters through real EPROCESS state. Unsupported classes fail
             // visibly so new callers add the missing mechanism instead of relying on fallback success.
             NativeService::NtSetInformationProcess => unsafe {
-                let information_class = nt_ulong_arg(args[1]);
-                let information_length = nt_ulong_arg(args[3]) as usize;
-                if information_class == 9 {
-                    return self.nt_set_process_access_token(args);
-                }
-                const PROCESS_SET_INFORMATION: u32 = 0x0200;
-                let caller = match self.pm_pid_for_pi(self.pi) {
-                    Some(pid) => pid,
-                    None => return STATUS_INVALID_HANDLE,
-                };
-                let pid =
-                    match self
-                        .pm
-                        .resolve_process_handle(caller, args[0], PROCESS_SET_INFORMATION)
-                    {
-                        Ok(pid) => pid,
-                        Err(status) => return status,
-                    };
-
-                match information_class {
-                    5 => {
-                        if information_length != 4 {
-                            return nt_process::STATUS_INFO_LENGTH_MISMATCH;
-                        }
-                        if args[2] & 3 != 0 {
-                            return STATUS_DATATYPE_MISALIGNMENT;
-                        }
-                        let mut value = [0u8; 4];
-                        if args[2] == 0 || !self.xas_read(args[2], &mut value) {
-                            return STATUS_ACCESS_VIOLATION;
-                        }
-                        let raw = u32::from_le_bytes(value);
-                        let base_priority = (raw & !0x8000_0000) as i32;
-                        let current = self
-                            .pm
-                            .process(pid)
-                            .map(|process| process.base_priority())
-                            .unwrap_or(nt_process::DEFAULT_PROCESS_BASE_PRIORITY);
-                        if base_priority > current
-                            && !self
-                                .current_token_has_privilege(nt_security::SE_INCREASE_BASE_PRIORITY)
-                        {
-                            return STATUS_PRIVILEGE_NOT_HELD;
-                        }
-                        self.pm
-                            .set_process_base_priority(pid, base_priority)
-                            .map_or_else(|status| status, |()| 0)
-                    }
-                    8 => {
-                        if information_length != 8 {
-                            return nt_process::STATUS_INFO_LENGTH_MISMATCH;
-                        }
-                        if args[2] & 7 != 0 {
-                            return STATUS_DATATYPE_MISALIGNMENT;
-                        }
-                        let mut value = [0u8; 8];
-                        if args[2] == 0 || !self.xas_read(args[2], &mut value) {
-                            return STATUS_ACCESS_VIOLATION;
-                        }
-                        if !self.current_token_has_privilege(nt_security::SE_TCB) {
-                            return STATUS_PRIVILEGE_NOT_HELD;
-                        }
-                        let port_handle = u64::from_le_bytes(value);
-                        match lpc_client() {
-                            Some(client) => {
-                                if let Err(status) = client.query_handle(port_handle) {
-                                    return status.raw() as u32;
-                                }
-                            }
-                            None => return STATUS_UNSUCCESSFUL,
-                        }
-                        self.pm
-                            .set_process_exception_port(pid, port_handle)
-                            .map_or_else(|status| status, |()| 0)
-                    }
-                    12 => {
-                        if information_length != 4 {
-                            return nt_process::STATUS_INFO_LENGTH_MISMATCH;
-                        }
-                        if args[2] & 3 != 0 {
-                            return STATUS_DATATYPE_MISALIGNMENT;
-                        }
-                        let mut value = [0u8; 4];
-                        if args[2] == 0 || !self.xas_read(args[2], &mut value) {
-                            return STATUS_ACCESS_VIOLATION;
-                        }
-                        self.pm
-                            .set_process_default_hard_error_processing(
-                                pid,
-                                u32::from_le_bytes(value),
-                            )
-                            .map_or_else(|status| status, |()| 0)
-                    }
-                    18 => {
-                        if information_length != 2 {
-                            return nt_process::STATUS_INFO_LENGTH_MISMATCH;
-                        }
-                        let mut value = [0u8; 2];
-                        if args[2] == 0 || !self.xas_read(args[2], &mut value) {
-                            return STATUS_ACCESS_VIOLATION;
-                        }
-                        let priority_class = value[1];
-                        if priority_class == nt_process::PROCESS_PRIORITY_CLASS_REALTIME
-                            && !self
-                                .current_token_has_privilege(nt_security::SE_INCREASE_BASE_PRIORITY)
-                        {
-                            return STATUS_PRIVILEGE_NOT_HELD;
-                        }
-                        match self.pm.set_process_priority_class(pid, priority_class) {
-                            Ok(()) => self
-                                .pm
-                                .set_process_foreground(pid, value[0] != 0)
-                                .map_or_else(|status| status, |()| 0),
-                            Err(status) => status,
-                        }
-                    }
-                    24 => {
-                        if information_length != 4 {
-                            return nt_process::STATUS_INFO_LENGTH_MISMATCH;
-                        }
-                        if args[2] & 3 != 0 {
-                            return STATUS_DATATYPE_MISALIGNMENT;
-                        }
-                        let mut value = [0u8; 4];
-                        if args[2] == 0 || !self.xas_read(args[2], &mut value) {
-                            return STATUS_ACCESS_VIOLATION;
-                        }
-                        if !self.current_token_has_privilege(nt_security::SE_TCB) {
-                            return STATUS_PRIVILEGE_NOT_HELD;
-                        }
-                        self.pm
-                            .set_process_session_id(pid, u32::from_le_bytes(value))
-                            .map_or_else(|status| status, |()| 0)
-                    }
-                    25 => {
-                        if information_length != 1 {
-                            return nt_process::STATUS_INFO_LENGTH_MISMATCH;
-                        }
-                        let mut value = [0u8; 1];
-                        if args[2] == 0 || !self.xas_read(args[2], &mut value) {
-                            return STATUS_ACCESS_VIOLATION;
-                        }
-                        self.pm
-                            .set_process_foreground(pid, value[0] != 0)
-                            .map_or_else(|status| status, |()| 0)
-                    }
-                    29 => {
-                        if information_length != 4 {
-                            return nt_process::STATUS_INFO_LENGTH_MISMATCH;
-                        }
-                        if args[2] & 3 != 0 {
-                            return STATUS_DATATYPE_MISALIGNMENT;
-                        }
-                        let mut value = [0u8; 4];
-                        if args[2] == 0 || !self.xas_read(args[2], &mut value) {
-                            return STATUS_ACCESS_VIOLATION;
-                        }
-                        if !self.current_token_has_privilege(nt_security::SE_DEBUG) {
-                            return STATUS_PRIVILEGE_NOT_HELD;
-                        }
-                        self.pm
-                            .set_process_break_on_termination(pid, u32::from_le_bytes(value) != 0)
-                            .map_or_else(|status| status, |()| 0)
-                    }
-                    _ => nt_process::STATUS_INVALID_INFO_CLASS,
-                }
+                self.nt_set_information_process_with_user_memory(
+                    args,
+                    SyscallUserMemory::CurrentProcess,
+                )
             },
             NativeService::NtSetInformationThread => unsafe {
                 let information_class = nt_ulong_arg(args[1]);

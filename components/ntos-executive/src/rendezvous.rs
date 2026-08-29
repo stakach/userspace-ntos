@@ -1556,6 +1556,7 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
     const SSN_CLOSE: u64 = 27;
     const SSN_QUERY_OBJECT: u64 = 170;
     const SSN_SET_INFO_OBJECT: u64 = 236;
+    const SSN_SET_INFO_PROCESS: u64 = 237;
     const SSN_RESUME_THREAD: u64 = 214;
     const SSN_SUSPEND_THREAD: u64 = 263;
     const SSN_DUPLICATE_OBJECT: u64 = 71;
@@ -2021,6 +2022,26 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                         nt_handler.pi = saved_pi;
                         nt_handler.current_tid = saved_tid;
                         print_str(b"[csr-api] serviced worker NtSetInformationObject status=0x");
+                        print_hex(status);
+                        print_str(b"\n");
+                        result = status as u64;
+                    }
+                    SSN_SET_INFO_PROCESS => {
+                        let set_args = [get_recv_mr(9), rdx, get_recv_mr(7), get_recv_mr(8)];
+                        let saved_pi = nt_handler.pi;
+                        let saved_tid = nt_handler.current_tid;
+                        nt_handler.pi = 1;
+                        nt_handler.current_tid =
+                            hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
+                        let status = nt_handler.nt_set_information_process_with_user_memory(
+                            &set_args,
+                            SyscallUserMemory::CsrThreadStack { sb: false },
+                        );
+                        nt_handler.pi = saved_pi;
+                        nt_handler.current_tid = saved_tid;
+                        print_str(b"[csr-api] serviced worker NtSetInformationProcess class=");
+                        print_u64(rdx);
+                        print_str(b" status=0x");
                         print_hex(status);
                         print_str(b"\n");
                         result = status as u64;
