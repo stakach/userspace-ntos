@@ -212,6 +212,7 @@ pub enum NativeService {
     NtListenPort,
     NtReplyPort,
     NtReplyWaitReceivePort,
+    NtImpersonateClientOfPort,
     NtMakeTemporaryObject,
     NtMakePermanentObject,
     // No-op-success services (the executive doesn't model these yet: bump allocator never frees,
@@ -462,6 +463,7 @@ impl NativeService {
             NtRemoveProcessDebug => "NtRemoveProcessDebug",
             NtWaitForDebugEvent => "NtWaitForDebugEvent",
             NtAllocateLocallyUniqueId => "NtAllocateLocallyUniqueId",
+            NtImpersonateClientOfPort => "NtImpersonateClientOfPort",
         }
     }
 
@@ -653,6 +655,7 @@ impl NativeService {
         NativeService::NtMakePermanentObject,
         NativeService::NtReplyPort,
         NativeService::NtRegisterThreadTerminatePort,
+        NativeService::NtImpersonateClientOfPort,
     ];
 }
 

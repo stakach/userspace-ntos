@@ -129,6 +129,12 @@ statuses! {
     BUFFER_TOO_SMALL = 0xC000_0023u32;
     /// A native port message exceeds the maximum length configured on its connection port.
     PORT_MESSAGE_TOO_LONG = 0xC000_002Fu32;
+    /// A communication port has lost its connected peer.
+    PORT_DISCONNECTED = 0xC000_0037u32;
+    /// A handle does not name a valid LPC communication/connection port for the requested operation.
+    INVALID_PORT_HANDLE = 0xC000_0042u32;
+    /// A reply or impersonation request does not match a live delivered LPC request.
+    REPLY_MESSAGE_MISMATCH = 0xC000_021Fu32;
     /// The end of the file / device stream was reached.
     END_OF_FILE = 0xC000_0011u32;
     /// A view size (e.g. an ALPC section view) exceeds the underlying section.

@@ -5,8 +5,8 @@ use super::*;
 /// The exact count of `Nt*` services in the shared table: the current hosted ReactOS import set,
 /// ntdll-internal services (`NtSecureConnectPort`, `NtCallbackReturn`), and registry hive
 /// load/unload variants that route to real executive CM functionality.
-const REQUIRED_NT_COUNT: usize = 222;
-const REQUIRED_ZW_COUNT: usize = 222;
+const REQUIRED_NT_COUNT: usize = 223;
+const REQUIRED_ZW_COUNT: usize = 223;
 
 #[test]
 fn required_counts() {

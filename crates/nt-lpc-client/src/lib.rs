@@ -22,7 +22,8 @@ use bytemuck::Pod;
 use nt_lpc_abi::{
     msg_type, opcode, LpcAcceptConnectRequest, LpcCompleteConnectRequest, LpcConnectPortRequest,
     LpcConnectionRequestMetadata, LpcCreatePortRequest, LpcMessageRequest, LpcQueryHandleRequest,
-    LpcQueryHandleResponse, LpcReceiveRequest, LpcReply, LPC_ACCEPT_RESPONSE_INFO,
+    LpcQueryHandleResponse, LpcQueryRequestRequest, LpcQueryRequestResponse, LpcReceiveRequest,
+    LpcReply, LPC_ACCEPT_RESPONSE_INFO,
 };
 use nt_status::NtStatus;
 
@@ -69,6 +70,8 @@ pub struct HandleQueryResult {
     pub connection_id: u64,
     pub server_process: u64,
     pub server_thread: u64,
+    pub client_process: u64,
+    pub client_thread: u64,
     pub max_connection_info: u32,
     pub max_message: u32,
     pub max_pool_usage: u32,
@@ -77,6 +80,18 @@ pub struct HandleQueryResult {
     pub effective_only: bool,
     pub security_present: bool,
     pub name: Vec<u16>,
+}
+
+/// Broker-authored state for a synchronous request currently held by a server.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RequestQueryResult {
+    pub connection_id: u64,
+    pub client_process: u64,
+    pub client_thread: u64,
+    pub message_id: u32,
+    pub impersonation_level: u32,
+    pub dynamic_tracking: bool,
+    pub effective_only: bool,
 }
 
 /// The LPC client.
@@ -300,6 +315,20 @@ impl<B: Backend> LpcClient<B> {
         })
     }
 
+    /// Close a broker-owned listen or communication-port handle.
+    pub fn close_port(&mut self, port_handle: u64) -> Result<(), NtStatus> {
+        let req = nt_lpc_abi::LpcClosePortRequest {
+            abi_size: size_of::<nt_lpc_abi::LpcClosePortRequest>() as u16,
+            _reserved: 0,
+            _reserved2: 0,
+            port_handle,
+        };
+        let reply = self
+            .backend
+            .call(opcode::LPC_OP_CLOSE_PORT, bytemuck::bytes_of(&req), &mut []);
+        NtStatus(reply.status).to_result()
+    }
+
     /// Resolve a broker handle to the live endpoint identity recorded by the port core.
     pub fn query_handle(&mut self, port_handle: u64) -> Result<HandleQueryResult, NtStatus> {
         let req = LpcQueryHandleRequest {
@@ -333,6 +362,8 @@ impl<B: Backend> LpcClient<B> {
             connection_id: response.connection_id,
             server_process: response.server_process,
             server_thread: response.server_thread,
+            client_process: response.client_process,
+            client_thread: response.client_thread,
             max_connection_info: response.max_connection_info,
             max_message: response.max_message,
             max_pool_usage: response.max_pool_usage,
@@ -341,6 +372,52 @@ impl<B: Backend> LpcClient<B> {
             effective_only: response.effective_only != 0,
             security_present: response.security_present != 0,
             name: response.name[..name_len].to_vec(),
+        })
+    }
+
+    /// Validate that a native request identity is currently held by the supplied server port.
+    pub fn query_request(
+        &mut self,
+        port_handle: u64,
+        client_process: u64,
+        client_thread: u64,
+        message_id: u32,
+    ) -> Result<RequestQueryResult, NtStatus> {
+        let req = LpcQueryRequestRequest {
+            abi_size: size_of::<LpcQueryRequestRequest>() as u16,
+            _reserved: 0,
+            message_id,
+            port_handle,
+            client_process,
+            client_thread,
+        };
+        let mut out = [0u8; size_of::<LpcQueryRequestResponse>()];
+        let reply = self.backend.call(
+            opcode::LPC_OP_QUERY_REQUEST,
+            bytemuck::bytes_of(&req),
+            &mut out,
+        );
+        NtStatus(reply.status).to_result()?;
+        if reply.information as usize != size_of::<LpcQueryRequestResponse>() {
+            return Err(NtStatus::BUFFER_TOO_SMALL);
+        }
+        let response: LpcQueryRequestResponse =
+            bytemuck::try_pod_read_unaligned(&out).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+        if response.abi_size as usize != size_of::<LpcQueryRequestResponse>()
+            || response.message_id != message_id
+            || response.client_process != client_process
+            || response.client_thread != client_thread
+        {
+            return Err(NtStatus::REPLY_MESSAGE_MISMATCH);
+        }
+        Ok(RequestQueryResult {
+            connection_id: response.connection_id,
+            client_process: response.client_process,
+            client_thread: response.client_thread,
+            message_id: response.message_id,
+            impersonation_level: response.impersonation_level,
+            dynamic_tracking: response.dynamic_tracking != 0,
+            effective_only: response.effective_only != 0,
         })
     }
 
@@ -429,19 +506,36 @@ impl<B: Backend> LpcClient<B> {
         port_handle: u64,
         message: &[u8],
     ) -> Result<Vec<u8>, NtStatus> {
-        self.send_message(opcode::LPC_OP_REQUEST_WAIT_REPLY, port_handle, message)
+        self.request_wait_reply_with_client_id(port_handle, message, 0, 0)
+    }
+
+    /// Send a synchronous request with the kernel-supplied identity of the calling thread.
+    pub fn request_wait_reply_with_client_id(
+        &mut self,
+        port_handle: u64,
+        message: &[u8],
+        client_process: u64,
+        client_thread: u64,
+    ) -> Result<Vec<u8>, NtStatus> {
+        self.send_message(
+            opcode::LPC_OP_REQUEST_WAIT_REPLY,
+            port_handle,
+            message,
+            client_process,
+            client_thread,
+        )
     }
 
     /// Send an LPC reply without receiving another message.
     pub fn reply_port(&mut self, port_handle: u64, message: &[u8]) -> Result<(), NtStatus> {
-        self.send_message(opcode::LPC_OP_REPLY_PORT, port_handle, message)
+        self.send_message(opcode::LPC_OP_REPLY_PORT, port_handle, message, 0, 0)
             .map(|_| ())
     }
 
     /// Kernel `LpcRequestPort` — enqueue a typed kernel message without converting it to an LPC
     /// request or reply. This is used for messages such as `LPC_CLIENT_DIED`.
     pub fn request_port(&mut self, port_handle: u64, message: &[u8]) -> Result<(), NtStatus> {
-        self.send_message(opcode::LPC_OP_REQUEST_PORT, port_handle, message)
+        self.send_message(opcode::LPC_OP_REQUEST_PORT, port_handle, message, 0, 0)
             .map(|_| ())
     }
 
@@ -450,6 +544,8 @@ impl<B: Backend> LpcClient<B> {
         opcode: u16,
         port_handle: u64,
         message: &[u8],
+        client_process: u64,
+        client_thread: u64,
     ) -> Result<Vec<u8>, NtStatus> {
         let header = size_of::<LpcMessageRequest>();
         let message_len = u32_len(message.len())?;
@@ -460,6 +556,8 @@ impl<B: Backend> LpcClient<B> {
             port_handle,
             msg_offset: header as u32,
             msg_len_bytes: message_len,
+            client_process,
+            client_thread,
         };
         let buf = pack_bytes::<LPC_MESSAGE_BUF_LEN, _>(&req, message)?;
         let mut out = [0u8; 512];

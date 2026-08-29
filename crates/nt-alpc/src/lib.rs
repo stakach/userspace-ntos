@@ -597,6 +597,7 @@ impl PeerDirect {
             bytes: bytes.to_vec(),
             attrs,
             port_context: 0,
+            request_identity: None,
         };
         for c in self.conns.iter_mut() {
             if from_handle == c.client_handle {

@@ -224,6 +224,7 @@ generate_trap_stubs! {
     (nt_get_plug_play_event, "NtGetPlugPlayEvent", 91),
     (nt_get_write_watch, "NtGetWriteWatch", 92),
     (nt_impersonate_anonymous_token, "NtImpersonateAnonymousToken", 93),
+    (nt_impersonate_client_of_port, "NtImpersonateClientOfPort", 94),
     (nt_impersonate_thread, "NtImpersonateThread", 95),
     (nt_initialize_registry, "NtInitializeRegistry", 96),
     (nt_initiate_power_action, "NtInitiatePowerAction", 97),

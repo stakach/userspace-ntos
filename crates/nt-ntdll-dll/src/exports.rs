@@ -24968,6 +24968,11 @@ zw_alias!(
     nt_impersonate_anonymous_token
 );
 zw_alias!(
+    zw_impersonate_client_of_port,
+    "ZwImpersonateClientOfPort",
+    nt_impersonate_client_of_port
+);
+zw_alias!(
     zw_impersonate_thread,
     "ZwImpersonateThread",
     nt_impersonate_thread

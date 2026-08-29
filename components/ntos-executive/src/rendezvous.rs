@@ -1042,7 +1042,12 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
     let sent = lpc_client()
         .and_then(|client| {
             client
-                .request_wait_reply(client_port, &request[..request_len])
+                .request_wait_reply_with_client_id(
+                    client_port,
+                    &request[..request_len],
+                    smss_pid,
+                    smss_tid,
+                )
                 .ok()
         })
         .is_some();
@@ -1395,7 +1400,14 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
         request[8..16].copy_from_slice(&client_pid.to_le_bytes());
         request[16..24].copy_from_slice(&client_tid.to_le_bytes());
         let sent = lpc_client()
-            .map(|lpc| lpc.request_wait_reply(client_port, &request[..request_len]))
+            .map(|lpc| {
+                lpc.request_wait_reply_with_client_id(
+                    client_port,
+                    &request[..request_len],
+                    client_pid,
+                    client_tid,
+                )
+            })
             .is_some_and(|result| matches!(result, Ok(reply) if reply.is_empty()));
         if !sent {
             CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
@@ -2939,7 +2951,12 @@ unsafe fn csr_sb_api_request_rendezvous(
     if lpc_client()
         .and_then(|client| {
             client
-                .request_wait_reply(client_port, &request[..request_len])
+                .request_wait_reply_with_client_id(
+                    client_port,
+                    &request[..request_len],
+                    smss_pid,
+                    smss_tid,
+                )
                 .ok()
         })
         .is_none()

@@ -1181,6 +1181,8 @@ pub const SSN_NT_PRIVILEGE_CHECK: u64 = 140;
 /// NtImpersonateAnonymousToken — assigns one of the two kernel-owned Anonymous Logon identities
 /// to a target ETHREAD according to the LSA `EveryoneIncludesAnonymous` policy.
 pub const SSN_NT_IMPERSONATE_ANONYMOUS_TOKEN: u64 = 93;
+/// NtImpersonateClientOfPort — validates a live LPC request before installing its client context.
+pub const SSN_NT_IMPERSONATE_CLIENT_OF_PORT: u64 = 94;
 /// NtImpersonateThread — installs one thread's effective client context on another ETHREAD.
 pub const SSN_NT_IMPERSONATE_THREAD: u64 = 95;
 /// Process/thread lifecycle SSNs (ReactOS numbering = sysfuncs.lst line − 1, cross-checked against
@@ -23420,13 +23422,25 @@ struct LpcConnRecord {
     client_handle: u64,
     /// Which hosted process connected (0 = smss, 1 = csrss) — the connector badge for direct delivery.
     connector_pi: u8,
+    /// Broker-authored connector identity used to validate request provenance.
+    client_process: u64,
+    client_thread: u64,
     /// Broker-owned limits inherited from the named connection port.
     limits: nt_port_core::PortLimits,
     /// QoS captured by the kernel before the broker connection was queued.
     security: nt_port_core::ConnectionSecurity,
+    /// Reference-owning token copy captured at connect completion for static tracking.
+    static_security: Option<LpcStaticSecurityContext>,
     /// Folded port name (inline; `\SmApiPort` etc. fit in 32 units).
     name: [u16; 32],
     name_len: u8,
+}
+
+#[derive(Clone, Copy)]
+struct LpcStaticSecurityContext {
+    token: nt_security::TokenId,
+    effective_only: bool,
+    level: nt_security::SecurityImpersonationLevel,
 }
 
 // ===================== ALPC last-mile item (a): register the NtAlpc* SSNs =========================
@@ -23755,6 +23769,10 @@ fn build_nt_table() -> NativeServiceTable {
             (
                 NativeService::NtImpersonateAnonymousToken,
                 SSN_NT_IMPERSONATE_ANONYMOUS_TOKEN as u32,
+            ),
+            (
+                NativeService::NtImpersonateClientOfPort,
+                SSN_NT_IMPERSONATE_CLIENT_OF_PORT as u32,
             ),
             (
                 NativeService::NtImpersonateThread,

@@ -17,7 +17,7 @@
 #![no_std]
 
 /// ABI version. Bump on any incompatible wire change.
-pub const LPC_ABI_VERSION: u32 = 4;
+pub const LPC_ABI_VERSION: u32 = 5;
 
 /// The reserved SURT opcode range for the LPC protocol (fresh block after
 /// object 0x2000 / config 0x2100).
@@ -46,6 +46,9 @@ pub mod opcode {
 
     // Kernel-internal LpcRequestPort: preserve a kernel message type such as LPC_CLIENT_DIED.
     pub const LPC_OP_REQUEST_PORT: u16 = 0x220b;
+
+    // Validate a server-held request before native LPC client impersonation.
+    pub const LPC_OP_QUERY_REQUEST: u16 = 0x220c;
 }
 
 /// True if `op` is an LPC opcode.
@@ -239,6 +242,37 @@ pub struct LpcMessageRequest {
     pub port_handle: u64,
     pub msg_offset: u32,
     pub msg_len_bytes: u32,
+    /// Kernel-supplied sender identity. The broker overwrites request headers with these fields.
+    pub client_process: u64,
+    pub client_thread: u64,
+}
+
+/// `LPC_OP_QUERY_REQUEST` — validate a server-held request by its native header identity.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LpcQueryRequestRequest {
+    pub abi_size: u16,
+    pub _reserved: u16,
+    pub message_id: u32,
+    pub port_handle: u64,
+    pub client_process: u64,
+    pub client_thread: u64,
+}
+
+/// Broker-authored connection and QoS state for a validated server-held request.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LpcQueryRequestResponse {
+    pub abi_size: u16,
+    pub _reserved: u16,
+    pub message_id: u32,
+    pub connection_id: u64,
+    pub client_process: u64,
+    pub client_thread: u64,
+    pub impersonation_level: u32,
+    pub dynamic_tracking: u8,
+    pub effective_only: u8,
+    pub _reserved2: u16,
 }
 
 /// `LPC_OP_CLOSE_PORT` — close a port handle.
@@ -272,6 +306,8 @@ pub struct LpcQueryHandleResponse {
     pub connection_id: u64,
     pub server_process: u64,
     pub server_thread: u64,
+    pub client_process: u64,
+    pub client_thread: u64,
     pub max_connection_info: u32,
     pub max_message: u32,
     pub max_pool_usage: u32,
@@ -295,6 +331,8 @@ impl Default for LpcQueryHandleResponse {
             connection_id: 0,
             server_process: 0,
             server_thread: 0,
+            client_process: 0,
+            client_thread: 0,
             max_connection_info: 0,
             max_message: 0,
             max_pool_usage: 0,
@@ -332,10 +370,12 @@ const _: () = {
     assert!(size_of::<LpcAcceptConnectRequest>() == 32);
     assert!(size_of::<LpcCompleteConnectRequest>() == 16);
     assert!(size_of::<LpcReceiveRequest>() == 24);
-    assert!(size_of::<LpcMessageRequest>() == 24);
+    assert!(size_of::<LpcMessageRequest>() == 40);
+    assert!(size_of::<LpcQueryRequestRequest>() == 32);
+    assert!(size_of::<LpcQueryRequestResponse>() == 40);
     assert!(size_of::<LpcClosePortRequest>() == 16);
     assert!(size_of::<LpcQueryHandleRequest>() == 16);
-    assert!(size_of::<LpcQueryHandleResponse>() == 184);
+    assert!(size_of::<LpcQueryHandleResponse>() == 200);
     assert!(size_of::<LpcReply>() == 24);
     assert!(align_of::<LpcAcceptConnectRequest>() == 8);
     assert!(align_of::<LpcCreatePortRequest>() == 8);
@@ -353,6 +393,7 @@ mod tests {
         assert!(is_lpc_opcode(opcode::LPC_OP_CLOSE_PORT));
         assert!(is_lpc_opcode(opcode::LPC_OP_QUERY_HANDLE));
         assert!(is_lpc_opcode(opcode::LPC_OP_REQUEST_PORT));
+        assert!(is_lpc_opcode(opcode::LPC_OP_QUERY_REQUEST));
         assert!(!is_lpc_opcode(0x21ff));
         assert!(!is_lpc_opcode(0x2300));
     }
@@ -388,6 +429,6 @@ mod tests {
 
     #[test]
     fn version_is_current() {
-        assert_eq!(LPC_ABI_VERSION, 4);
+        assert_eq!(LPC_ABI_VERSION, 5);
     }
 }

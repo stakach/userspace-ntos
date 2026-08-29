@@ -140,6 +140,8 @@ pub struct PortHandleInfo<'a> {
     pub port_name: &'a [u16],
     /// Kernel-supplied identity of the process/thread that created the named listen port.
     pub server_id: ClientId,
+    /// Kernel-supplied connector identity. Listen ports have no connector.
+    pub client_id: Option<ClientId>,
     /// Limits inherited from the named connection port.
     pub limits: PortLimits,
     /// Captured connector QoS. Listen ports have no connector and therefore report `None`.
@@ -224,6 +226,25 @@ pub struct QueuedMessage {
     pub attrs: MessageAttrs,
     /// Accepted connection PortContext used only for classic LPC listen-port routing.
     pub port_context: u64,
+    /// Kernel-authored identity for a synchronous client request. Attribute-only ALPC traffic and
+    /// kernel datagrams carry `None`.
+    pub request_identity: Option<MessageIdentity>,
+}
+
+/// Identity stamped into a synchronous request by the trusted API adapter. The connection id is
+/// derived by the core from the client communication handle and is never supplied by user mode.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MessageIdentity {
+    pub client: ClientId,
+    pub message_id: u32,
+}
+
+/// Broker-owned security and connection identity for one request currently held by a server.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DeliveredRequestInfo {
+    pub connection_id: u64,
+    pub client: ClientId,
+    pub security: ConnectionSecurity,
 }
 
 /// Base for allocated port / comm-port handles (a distinct, recognizable range —
@@ -282,6 +303,8 @@ struct Connection {
     client_inbox: Vec<QueuedMessage>,
     /// Messages destined FOR the server (sent BY the client).
     server_inbox: Vec<QueuedMessage>,
+    /// Requests actually delivered to a server thread and still awaiting a matching reply.
+    delivered_requests: Vec<MessageIdentity>,
 }
 
 /// The unified port core: a port namespace + connection rendezvous + message
@@ -394,6 +417,7 @@ impl PortCore {
                 state: None,
                 port_name: port.name.as_slice(),
                 server_id: port.owner,
+                client_id: None,
                 limits: port.limits,
                 security: None,
             });
@@ -406,6 +430,7 @@ impl PortCore {
                     state: Some(conn.state),
                     port_name: conn.port_name.as_slice(),
                     server_id: conn.server_id,
+                    client_id: Some(conn.client_id),
                     limits: conn.limits,
                     security: Some(conn.security),
                 })
@@ -416,6 +441,7 @@ impl PortCore {
                     state: Some(conn.state),
                     port_name: conn.port_name.as_slice(),
                     server_id: conn.server_id,
+                    client_id: Some(conn.client_id),
                     limits: conn.limits,
                     security: Some(conn.security),
                 })
@@ -699,10 +725,22 @@ impl PortCore {
         Ok((conn.client_handle, conn.id))
     }
 
-    /// Close a port handle (idempotent). Does not tear down live connections.
+    /// Close a listen or communication-port handle. Closing either communication endpoint
+    /// disconnects the connection and invalidates queued/delivered request state.
     pub fn close_port(&mut self, port_handle: u64) {
         if let Some(pos) = self.ports.iter().position(|p| p.handle == port_handle) {
             self.ports.remove(pos);
+            return;
+        }
+        if let Some(connection) = self.connections.iter_mut().find(|connection| {
+            port_handle != 0
+                && (connection.client_handle == port_handle
+                    || connection.server_handle == port_handle)
+        }) {
+            connection.state = ConnState::Refused;
+            connection.client_inbox.clear();
+            connection.server_inbox.clear();
+            connection.delivered_requests.clear();
         }
     }
 
@@ -730,6 +768,7 @@ impl PortCore {
             bytes: bytes.to_vec(),
             attrs,
             port_context: 0,
+            request_identity: None,
         };
         for conn in self.connections.iter_mut() {
             if conn.state != ConnState::Connected {
@@ -774,6 +813,175 @@ impl PortCore {
         Err(NtStatus::INVALID_HANDLE)
     }
 
+    /// Queue a synchronous request from a client communication port. The adapter has already
+    /// replaced the user header with `identity`; the core verifies that its process matches the
+    /// connection owner and binds it to the connection selected by `from_handle`.
+    pub fn send_request_message(
+        &mut self,
+        from_handle: u64,
+        bytes: &[u8],
+        attrs: MessageAttrs,
+        identity: MessageIdentity,
+    ) -> Result<(), NtStatus> {
+        if identity.message_id == 0 {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let conn = self
+            .connections
+            .iter_mut()
+            .find(|connection| {
+                connection.state == ConnState::Connected
+                    && from_handle != 0
+                    && connection.client_handle == from_handle
+            })
+            .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+        if identity.client.process != conn.client_id.process {
+            return Err(NtStatus::REPLY_MESSAGE_MISMATCH);
+        }
+        if bytes.len() > conn.limits.max_message as usize {
+            return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
+        }
+        conn.server_inbox.push(QueuedMessage {
+            bytes: bytes.to_vec(),
+            attrs,
+            port_context: conn.port_context,
+            request_identity: Some(identity),
+        });
+        Ok(())
+    }
+
+    /// Send a reply only when its client/message identity names a request that this server endpoint
+    /// actually received and has not already answered.
+    pub fn send_reply_message(
+        &mut self,
+        from_handle: u64,
+        bytes: &[u8],
+        attrs: MessageAttrs,
+        identity: MessageIdentity,
+    ) -> Result<(), NtStatus> {
+        if identity.message_id == 0 {
+            return Err(NtStatus::REPLY_MESSAGE_MISMATCH);
+        }
+        if let Some(connection) = self.connections.iter_mut().find(|connection| {
+            connection.state == ConnState::Connected
+                && from_handle != 0
+                && connection.server_handle == from_handle
+        }) {
+            let index = connection
+                .delivered_requests
+                .iter()
+                .position(|request| *request == identity)
+                .ok_or(NtStatus::REPLY_MESSAGE_MISMATCH)?;
+            if bytes.len() > connection.limits.max_message as usize {
+                return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
+            }
+            connection.delivered_requests.remove(index);
+            connection.client_inbox.push(QueuedMessage {
+                bytes: bytes.to_vec(),
+                attrs,
+                port_context: 0,
+                request_identity: Some(identity),
+            });
+            return Ok(());
+        }
+
+        let port = self
+            .ports
+            .iter()
+            .find(|port| port.handle == from_handle)
+            .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+        let connection = self
+            .connections
+            .iter_mut()
+            .find(|connection| {
+                connection.state == ConnState::Connected
+                    && connection.server_api == port.api
+                    && connection.port_name == port.name
+                    && connection
+                        .delivered_requests
+                        .iter()
+                        .any(|request| *request == identity)
+            })
+            .ok_or(NtStatus::REPLY_MESSAGE_MISMATCH)?;
+        if bytes.len() > connection.limits.max_message as usize {
+            return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
+        }
+        let index = connection
+            .delivered_requests
+            .iter()
+            .position(|request| *request == identity)
+            .expect("matching delivered request was selected");
+        connection.delivered_requests.remove(index);
+        connection.client_inbox.push(QueuedMessage {
+            bytes: bytes.to_vec(),
+            attrs,
+            port_context: 0,
+            request_identity: Some(identity),
+        });
+        Ok(())
+    }
+
+    /// Resolve one request currently held by a server. Client communication handles are rejected;
+    /// a listen port may match any accepted connection created from it, while a server communication
+    /// handle may match only its own connection.
+    pub fn delivered_request(
+        &self,
+        port_handle: u64,
+        identity: MessageIdentity,
+    ) -> Result<DeliveredRequestInfo, NtStatus> {
+        if identity.message_id == 0 {
+            return Err(NtStatus::REPLY_MESSAGE_MISMATCH);
+        }
+        if self
+            .connections
+            .iter()
+            .any(|connection| port_handle != 0 && connection.client_handle == port_handle)
+        {
+            return Err(NtStatus::INVALID_PORT_HANDLE);
+        }
+        if let Some(connection) = self
+            .connections
+            .iter()
+            .find(|connection| port_handle != 0 && connection.server_handle == port_handle)
+        {
+            if connection.state != ConnState::Connected {
+                return Err(NtStatus::PORT_DISCONNECTED);
+            }
+            return connection
+                .delivered_requests
+                .iter()
+                .any(|request| *request == identity)
+                .then_some(DeliveredRequestInfo {
+                    connection_id: connection.id,
+                    client: identity.client,
+                    security: connection.security,
+                })
+                .ok_or(NtStatus::REPLY_MESSAGE_MISMATCH);
+        }
+        let port = self
+            .ports
+            .iter()
+            .find(|port| port.handle == port_handle)
+            .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+        self.connections
+            .iter()
+            .find(|connection| {
+                connection.state == ConnState::Connected
+                    && connection.server_api == port.api
+                    && connection.port_name == port.name
+                    && connection
+                        .delivered_requests
+                        .iter()
+                        .any(|request| *request == identity)
+            })
+            .map(|connection| DeliveredRequestInfo {
+                connection_id: connection.id,
+                client: identity.client,
+                security: connection.security,
+            })
+            .ok_or(NtStatus::REPLY_MESSAGE_MISMATCH)
+    }
+
     /// Receive the next `PORT_MESSAGE` for the endpoint identified by `handle`.
     /// Returns `Ok(None)` when the inbox is empty (would-block).
     pub fn receive_message(&mut self, handle: u64) -> Result<Option<QueuedMessage>, NtStatus> {
@@ -801,6 +1009,16 @@ impl PortCore {
             if let Some(connection_index) = connection_index {
                 let connection_id = self.connections[connection_index].id;
                 let message = self.connections[connection_index].server_inbox.remove(0);
+                if let Some(identity) = message.request_identity {
+                    if !self.connections[connection_index]
+                        .delivered_requests
+                        .contains(&identity)
+                    {
+                        self.connections[connection_index]
+                            .delivered_requests
+                            .push(identity);
+                    }
+                }
                 self.ports[port_index].reply_connection = Some(connection_id);
                 return Ok(Some(message));
             }
@@ -870,6 +1088,7 @@ impl Connection {
             port_context: 0,
             client_inbox: Vec::new(),
             server_inbox: Vec::new(),
+            delivered_requests: Vec::new(),
         }
     }
 }
@@ -998,6 +1217,7 @@ mod tests {
                 state: None,
                 port_name: &utf16("\\lsaauthenticationport"),
                 server_id: owner,
+                client_id: None,
                 limits,
                 security: None,
             })
@@ -1010,6 +1230,7 @@ mod tests {
                 state: Some(ConnState::Connected),
                 port_name: &utf16("\\lsaauthenticationport"),
                 server_id: owner,
+                client_id: Some(ClientId::default()),
                 limits,
                 security: Some(security),
             })
@@ -1022,6 +1243,7 @@ mod tests {
                 state: Some(ConnState::Connected),
                 port_name: &utf16("\\lsaauthenticationport"),
                 server_id: owner,
+                client_id: Some(ClientId::default()),
                 limits,
                 security: Some(security),
             })
@@ -1150,6 +1372,98 @@ mod tests {
         assert_eq!(got.bytes, b"pong");
         // drained
         assert!(core.receive_message(ch).unwrap().is_none());
+    }
+
+    #[test]
+    fn delivered_request_identity_controls_impersonation_and_reply() {
+        let mut core = PortCore::new();
+        core.set_accept_policy(AcceptPolicy::Manual);
+        let security = ConnectionSecurity {
+            impersonation_level: 2,
+            dynamic_tracking: true,
+            effective_only: true,
+        };
+        let client_id = ClientId {
+            process: 0x120,
+            thread: 0x124,
+        };
+        let listen = core.create_port(&utf16("\\P"), PortApi::Lpc);
+        let connection = match core
+            .connect_with_client_id_and_security(
+                &utf16("\\P"),
+                PortApi::Lpc,
+                0,
+                &[],
+                client_id,
+                security,
+            )
+            .unwrap()
+        {
+            ConnectOutcome::Pending { connection_id } => connection_id,
+            _ => unreachable!(),
+        };
+        core.receive(listen).unwrap();
+        let server = core.accept(connection, true, 0).unwrap();
+        let client = core.complete(connection).unwrap().0;
+        let identity = MessageIdentity {
+            client: client_id,
+            message_id: 7,
+        };
+
+        core.send_request_message(client, b"request", MessageAttrs::default(), identity)
+            .unwrap();
+        assert_eq!(
+            core.delivered_request(listen, identity),
+            Err(NtStatus::REPLY_MESSAGE_MISMATCH),
+            "queued requests are not impersonable before a server receives them"
+        );
+        assert_eq!(
+            core.receive_message(server)
+                .unwrap()
+                .unwrap()
+                .request_identity,
+            Some(identity)
+        );
+        assert_eq!(
+            core.delivered_request(server, identity).unwrap(),
+            DeliveredRequestInfo {
+                connection_id: connection,
+                client: client_id,
+                security,
+            }
+        );
+        assert_eq!(
+            core.delivered_request(
+                server,
+                MessageIdentity {
+                    message_id: 8,
+                    ..identity
+                }
+            ),
+            Err(NtStatus::REPLY_MESSAGE_MISMATCH)
+        );
+        assert_eq!(
+            core.delivered_request(client, identity),
+            Err(NtStatus::INVALID_PORT_HANDLE)
+        );
+
+        core.send_reply_message(server, b"reply", MessageAttrs::default(), identity)
+            .unwrap();
+        assert_eq!(
+            core.delivered_request(server, identity),
+            Err(NtStatus::REPLY_MESSAGE_MISMATCH),
+            "a completed request cannot be impersonated or replied to again"
+        );
+        assert_eq!(
+            core.receive_message(client).unwrap().unwrap().bytes,
+            b"reply"
+        );
+        core.close_port(client);
+        assert_eq!(core.connection_state(connection), Some(ConnState::Refused));
+        assert_eq!(
+            core.delivered_request(server, identity),
+            Err(NtStatus::PORT_DISCONNECTED)
+        );
     }
 
     #[test]

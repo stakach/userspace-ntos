@@ -213,7 +213,13 @@ pub fn run(chan: &mut RingChannel<'_>, passed: &mut u64) {
     let lmsg = port_message(REQUEST, b"lpc-ping");
     lpc_request(chan, bclient_h, &lmsg, &mut out);
     let (rs, _f, ri, valid, _mt) = alpc_recv(chan, bserver_h, &mut out);
-    let degrade_ok = rs == STATUS_SUCCESS && &out[..ri as usize] == &lmsg[..] && valid == 0;
+    let received_len = ri as usize;
+    let degrade_ok = rs == STATUS_SUCCESS
+        && received_len == lmsg.len()
+        && out[..24] == lmsg[..24]
+        && u32::from_le_bytes(out[24..28].try_into().unwrap()) != 0
+        && out[28..received_len] == lmsg[28..]
+        && valid == 0;
     check(
         b"exec_bridge_lpc_request_attributes_empty",
         degrade_ok,
@@ -637,6 +643,8 @@ fn lpc_request(chan: &mut RingChannel<'_>, port: u64, msg: &[u8], out: &mut [u8]
         port_handle: port,
         msg_offset: hdr,
         msg_len_bytes: msg.len() as u32,
+        client_process: 0,
+        client_thread: 0,
     };
     let mut b = bytes(&req);
     b.extend_from_slice(msg);

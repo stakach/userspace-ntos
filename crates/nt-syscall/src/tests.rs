@@ -182,6 +182,32 @@ fn impersonate_anonymous_token_keeps_native_service_identity() {
 }
 
 #[test]
+fn impersonate_client_of_port_keeps_native_service_identity() {
+    assert_eq!(
+        NativeService::NtImpersonateClientOfPort.name(),
+        "NtImpersonateClientOfPort"
+    );
+    assert_eq!(NativeService::NtImpersonateClientOfPort.arg_count(), (2, 2));
+    assert_eq!(
+        nt_syscall_abi::ssn_of("NtImpersonateClientOfPort"),
+        Some(94)
+    );
+    assert_eq!(
+        nt_syscall_abi::ssn_of("ZwImpersonateClientOfPort"),
+        Some(94)
+    );
+
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtImpersonateClientOfPort, 94)],
+    );
+    assert_eq!(
+        table.lookup(94).map(|entry| entry.service),
+        Some(NativeService::NtImpersonateClientOfPort)
+    );
+}
+
+#[test]
 fn access_check_by_type_services_keep_native_identities() {
     for (service, name, ssn) in [
         (NativeService::NtAccessCheckByType, "NtAccessCheckByType", 3),

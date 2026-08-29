@@ -21897,7 +21897,14 @@ unsafe fn csr_dynamic_deliver_request(
         return CsrDynamicRoute::NotRouted;
     };
     let sent = lpc_client()
-        .map(|lpc| lpc.request_wait_reply(client_port, &request[..request_len]))
+        .map(|lpc| {
+            lpc.request_wait_reply_with_client_id(
+                client_port,
+                &request[..request_len],
+                client_pid,
+                client_tid,
+            )
+        })
         .is_some_and(|result| matches!(result, Ok(reply) if reply.is_empty()));
     if !sent {
         csr_dynamic_wake(client_cap, 0xC000_0001, client_reply);
@@ -21916,8 +21923,14 @@ unsafe fn csr_dynamic_deliver_request(
         csr_dynamic_wake(client_cap, 0xC000_0001, client_reply);
         return CsrDynamicRoute::Consumed;
     };
-    if broker_request_len != request_len || broker_request[..request_len] != request[..request_len]
-    {
+    let broker_identity_ok = broker_request_len == request_len
+        && broker_request[..8] == request[..8]
+        && broker_request[8..16] == client_pid.to_le_bytes()
+        && broker_request[16..24] == client_tid.to_le_bytes()
+        && u32::from_le_bytes(broker_request[24..28].try_into().unwrap()) != 0
+        && broker_request[28..32] == [0; 4]
+        && broker_request[32..request_len] == request[32..request_len];
+    if !broker_identity_ok {
         csr_dynamic_wake(client_cap, 0xC000_0001, client_reply);
         return CsrDynamicRoute::Consumed;
     }

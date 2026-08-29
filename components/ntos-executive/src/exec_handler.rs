@@ -19117,6 +19117,148 @@ impl ExecNtHandler {
         0
     }
 
+    unsafe fn nt_impersonate_client_of_port(&mut self, args: &[u64]) -> u32 {
+        const PORT_MESSAGE_HEADER_LEN: usize = nt_lpc_abi::PORT_MESSAGE_HEADER_LEN;
+
+        let message = args[1];
+        if message & 7 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        if message == 0 || !self.probe_user_input(message, PORT_MESSAGE_HEADER_LEN) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let mut header = [0u8; PORT_MESSAGE_HEADER_LEN];
+        if !self.xas_read(message, &mut header) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let client_process = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        let client_thread = u64::from_le_bytes(header[16..24].try_into().unwrap());
+        let message_id = u32::from_le_bytes(header[24..28].try_into().unwrap());
+
+        let request = match lpc_client().map(|client| {
+            client.query_request(
+                args[0],
+                client_process,
+                client_thread,
+                message_id,
+            )
+        }) {
+            Some(Ok(request)) => request,
+            Some(Err(status)) => return status.raw() as u32,
+            None => return STATUS_UNSUCCESSFUL,
+        };
+        let security = nt_port_core::ConnectionSecurity {
+            impersonation_level: request.impersonation_level,
+            dynamic_tracking: request.dynamic_tracking,
+            effective_only: request.effective_only,
+        };
+        let Some(connection) = self
+            .lpc_connections
+            .iter()
+            .copied()
+            .find(|connection| {
+                connection.connection_id == request.connection_id
+                    && connection.client_process == request.client_process
+                    && connection.client_thread == request.client_thread
+                    && connection.security == security
+            })
+        else {
+            return nt_status::NtStatus::REPLY_MESSAGE_MISMATCH.raw() as u32;
+        };
+
+        let (mut owned_token, effective_only, mut level) = if request.dynamic_tracking {
+            let qos = match Self::lpc_security_qos(security) {
+                Ok(qos) => qos,
+                Err(status) => return status,
+            };
+            let (source_token, source_type, source_effective_only, source_level) =
+                match self.lpc_effective_token_source(client_process, client_thread) {
+                    Ok(source) => source,
+                    Err(status) => return status,
+                };
+            let plan = match nt_security::plan_client_impersonation(
+                source_type,
+                source_level,
+                source_effective_only,
+                qos,
+            ) {
+                Ok(plan) if !plan.static_tracking => plan,
+                Ok(_) => return STATUS_UNSUCCESSFUL,
+                Err(status) => return status,
+            };
+            if let Err(status) = self.token_store.retain(source_token) {
+                return status;
+            }
+            (source_token, plan.effective_only, plan.level)
+        } else {
+            let Some(context) = connection.static_security else {
+                return nt_status::NtStatus::REPLY_MESSAGE_MISMATCH.raw() as u32;
+            };
+            if let Err(status) = self.token_store.retain(context.token) {
+                return status;
+            }
+            (context.token, context.effective_only, context.level)
+        };
+
+        let server_pid = match self
+            .pm
+            .thread(self.current_tid as nt_process::ThreadId)
+            .map(|thread| thread.process_id)
+        {
+            Some(pid) => pid,
+            None => {
+                let _ = self.token_store.release(owned_token);
+                return STATUS_INVALID_HANDLE;
+            }
+        };
+        let server_primary = match self.pm.process_primary_token(server_pid) {
+            Some(token) => token,
+            None => {
+                let _ = self.token_store.release(owned_token);
+                return STATUS_INVALID_HANDLE;
+            }
+        };
+        let can_impersonate = match (
+            self.token_store.get(server_primary),
+            self.token_store.get(owned_token),
+        ) {
+            (Some(server), Some(client)) => {
+                nt_security::token_can_impersonate(server, client, level)
+            }
+            _ => {
+                let _ = self.token_store.release(owned_token);
+                return STATUS_INVALID_HANDLE;
+            }
+        };
+        if !can_impersonate {
+            let identified = match self.token_store.duplicate(
+                owned_token,
+                nt_security::TokenType::Impersonation,
+                nt_security::SecurityImpersonationLevel::Identification,
+                false,
+            ) {
+                Ok(token) => token,
+                Err(status) => {
+                    let _ = self.token_store.release(owned_token);
+                    return status;
+                }
+            };
+            let _ = self.token_store.release(owned_token);
+            owned_token = identified;
+            level = nt_security::SecurityImpersonationLevel::Identification;
+        }
+
+        self.install_thread_impersonation_context(
+            self.current_tid as nt_process::ThreadId,
+            Some(nt_process::ImpersonationContext {
+                token: owned_token,
+                copy_on_open: true,
+                effective_only,
+                level,
+            }),
+        )
+    }
+
     unsafe fn nt_impersonate_thread(&mut self, args: &[u64]) -> u32 {
         const THREAD_IMPERSONATE: u32 = 0x0100;
         const THREAD_DIRECT_IMPERSONATION: u32 = 0x0200;
@@ -24289,6 +24431,95 @@ impl ExecNtHandler {
     /// Cache an established LPC connection (the data-plane record). Bounded by the pre-reserved
     /// capacity so the push never reallocates across the per-syscall bump reset. `connector_pi` =
     /// the current process.
+    fn lpc_security_qos(
+        security: nt_port_core::ConnectionSecurity,
+    ) -> Result<nt_security::SecurityQualityOfService, u32> {
+        Ok(nt_security::SecurityQualityOfService {
+            impersonation_level: nt_security::SecurityImpersonationLevel::try_from(
+                security.impersonation_level,
+            )?,
+            tracking_mode: if security.dynamic_tracking {
+                nt_security::SecurityContextTrackingMode::Dynamic
+            } else {
+                nt_security::SecurityContextTrackingMode::Static
+            },
+            effective_only: security.effective_only,
+        })
+    }
+
+    fn lpc_effective_token_source(
+        &self,
+        process: u64,
+        thread: u64,
+    ) -> Result<
+        (
+            nt_security::TokenId,
+            nt_security::TokenType,
+            bool,
+            nt_security::SecurityImpersonationLevel,
+        ),
+        u32,
+    > {
+        let thread_id = thread as nt_process::ThreadId;
+        let ethread = self
+            .pm
+            .thread(thread_id)
+            .filter(|ethread| ethread.process_id as u64 == process)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if let Some(context) = self.pm.thread_impersonation(thread_id) {
+            return Ok((
+                context.token,
+                nt_security::TokenType::Impersonation,
+                context.effective_only,
+                context.level,
+            ));
+        }
+        let token = self
+            .pm
+            .process_primary_token(ethread.process_id)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        Ok((
+            token,
+            nt_security::TokenType::Primary,
+            false,
+            nt_security::SecurityImpersonationLevel::Anonymous,
+        ))
+    }
+
+    fn capture_lpc_static_security(
+        &mut self,
+        metadata: &nt_lpc_client::HandleQueryResult,
+    ) -> Result<Option<LpcStaticSecurityContext>, u32> {
+        if metadata.dynamic_tracking {
+            return Ok(None);
+        }
+        let security = nt_port_core::ConnectionSecurity {
+            impersonation_level: metadata.impersonation_level,
+            dynamic_tracking: metadata.dynamic_tracking,
+            effective_only: metadata.effective_only,
+        };
+        let qos = Self::lpc_security_qos(security)?;
+        let (source_token, source_type, source_effective_only, source_level) =
+            self.lpc_effective_token_source(metadata.client_process, metadata.client_thread)?;
+        let plan = nt_security::plan_client_impersonation(
+            source_type,
+            source_level,
+            source_effective_only,
+            qos,
+        )?;
+        let token = self.token_store.duplicate(
+            source_token,
+            nt_security::TokenType::Impersonation,
+            plan.level,
+            false,
+        )?;
+        Ok(Some(LpcStaticSecurityContext {
+            token,
+            effective_only: plan.effective_only,
+            level: plan.level,
+        }))
+    }
+
     pub(crate) fn cache_lpc_connection(
         &mut self,
         connection_id: u64,
@@ -24332,18 +24563,41 @@ impl ExecNtHandler {
             dynamic_tracking: metadata.dynamic_tracking,
             effective_only: metadata.effective_only,
         };
+        if metadata.client_process != 0
+            && self.pm_pid_for_pi(connector_pi).map(|pid| pid as u64)
+                != Some(metadata.client_process)
+        {
+            print_str(b"[lpc-cache] broker connector process does not match the target process\n");
+            return false;
+        }
+        let static_security = match self.capture_lpc_static_security(&metadata) {
+            Ok(context) => context,
+            Err(status) => {
+                print_str(b"[lpc-cache] static client-security capture failed status=0x");
+                print_hex(status);
+                print_str(b"\n");
+                return false;
+            }
+        };
         let connector_pi = connector_pi.min(u8::MAX as usize) as u8;
         let trace_lsa = Self::lpc_name_equals_ascii(name, b"\\lsaauthenticationport");
-        if let Some(connection) = self.lpc_connections.iter_mut().find(|connection| {
+        if let Some(index) = self.lpc_connections.iter().position(|connection| {
             connection.client_handle == client_handle && connection.connector_pi == connector_pi
         }) {
+            let connection = &mut self.lpc_connections[index];
             connection.connection_id = connection_id;
+            connection.client_process = metadata.client_process;
+            connection.client_thread = metadata.client_thread;
             connection.limits = limits;
             connection.security = security;
+            let replaced_static = core::mem::replace(&mut connection.static_security, static_security);
             let n = name.len().min(connection.name.len());
             connection.name = [0; 32];
             connection.name[..n].copy_from_slice(&name[..n]);
             connection.name_len = n as u8;
+            if let Some(replaced) = replaced_static {
+                let _ = self.token_store.release(replaced.token);
+            }
             if trace_lsa && LPC_CACHE_TRACE_N.fetch_add(1, Ordering::Relaxed) < 8 {
                 print_str(b"[lpc-cache] update \\LsaAuthenticationPort conn=");
                 print_u64(connection_id);
@@ -24363,6 +24617,9 @@ impl ExecNtHandler {
             let additional = self.lpc_connections.capacity().max(16);
             if self.lpc_connections.try_reserve(additional).is_err() {
                 print_str(b"[lpc-cache] failed to grow established LPC connection table\n");
+                if let Some(context) = static_security {
+                    let _ = self.token_store.release(context.token);
+                }
                 return false;
             }
             print_str(b"[lpc-cache] grew established LPC connection table capacity=");
@@ -24376,8 +24633,11 @@ impl ExecNtHandler {
             connection_id,
             client_handle,
             connector_pi,
+            client_process: metadata.client_process,
+            client_thread: metadata.client_thread,
             limits,
             security,
+            static_security,
             name: buf,
             name_len: n as u8,
         });
@@ -24412,6 +24672,47 @@ impl ExecNtHandler {
         // broker may itself be waiting behind the message path we are trying to dispatch.
         self.trace_lpc_connection_miss(handle, connector_pi, name);
         false
+    }
+
+    fn close_lpc_handle_for_current_process(&mut self, handle: u64) -> Result<bool, u32> {
+        let Some(client) = (unsafe { lpc_client() }) else {
+            return Ok(false);
+        };
+        let metadata = match client.query_handle(handle) {
+            Ok(metadata) => metadata,
+            Err(status) if status == nt_status::NtStatus::INVALID_HANDLE => return Ok(false),
+            Err(status) => return Err(status.raw() as u32),
+        };
+        let current_process = self
+            .pm_pid_for_pi(self.pi)
+            .map(|pid| pid as u64)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let owned = match metadata.endpoint {
+            nt_lpc_abi::handle_endpoint::LISTEN_PORT
+            | nt_lpc_abi::handle_endpoint::SERVER_COMM_PORT => {
+                metadata.server_process == current_process
+            }
+            nt_lpc_abi::handle_endpoint::CLIENT_COMM_PORT => {
+                metadata.client_process == current_process
+            }
+            _ => false,
+        };
+        if !owned {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        client
+            .close_port(handle)
+            .map_err(|status| status.raw() as u32)?;
+        let _ = client;
+        if let Some(index) = self.lpc_connections.iter().position(|connection| {
+            connection.client_handle == handle && connection.connector_pi as usize == self.pi
+        }) {
+            let connection = self.lpc_connections.swap_remove(index);
+            if let Some(context) = connection.static_security {
+                let _ = self.token_store.release(context.token);
+            }
+        }
+        Ok(true)
     }
 
     fn lpc_connection_cache_is(&self, handle: u64, connector_pi: usize, name: &[u8]) -> bool {
@@ -27120,6 +27421,12 @@ impl ExecNtHandler {
                             }
                             return status;
                         }
+                    }
+                }
+                if !closed {
+                    match self.close_lpc_handle_for_current_process(args[0]) {
+                        Ok(was_closed) => closed = was_closed,
+                        Err(status) => return status,
                     }
                 }
                 if !closed {
@@ -31659,6 +31966,9 @@ impl ExecNtHandler {
             NativeService::NtPrivilegeCheck => unsafe { self.nt_privilege_check(ctx, args) },
             NativeService::NtImpersonateAnonymousToken => unsafe {
                 self.nt_impersonate_anonymous_token(args[0])
+            },
+            NativeService::NtImpersonateClientOfPort => unsafe {
+                self.nt_impersonate_client_of_port(args)
             },
             NativeService::NtImpersonateThread => unsafe { self.nt_impersonate_thread(args) },
             NativeService::NtResumeThread => unsafe {
