@@ -15879,17 +15879,32 @@ fn monotonic_time_100ns() -> u64 {
     }
 }
 
+fn nt_time_snapshot_at(monotonic_100ns: u64) -> nt_delay_execution::TimeSnapshot {
+    nt_delay_execution::TimeSnapshot {
+        monotonic_100ns,
+        system_time_100ns: NT_SYSTEM_TIME_BOOT_100NS.saturating_add(monotonic_100ns),
+        clock_generation: 0,
+    }
+}
+
+fn nt_time_snapshot() -> nt_delay_execution::TimeSnapshot {
+    nt_time_snapshot_at(monotonic_time_100ns())
+}
+
 fn nt_system_time_100ns() -> u64 {
-    NT_SYSTEM_TIME_BOOT_100NS.saturating_add(monotonic_time_100ns())
+    nt_time_snapshot().system_time_100ns
 }
 
 unsafe fn publish_kuser_clocks() {
-    let interrupt_time = monotonic_time_100ns();
-    let system_time = NT_SYSTEM_TIME_BOOT_100NS.saturating_add(interrupt_time);
+    let now = nt_time_snapshot();
     for pi in 0..MAX_PI {
         let alias = kuser_page_alias_get(pi);
         if alias != 0 {
-            nt_ntdll_layout::kuser::publish_clocks(alias as *mut u8, interrupt_time, system_time);
+            nt_ntdll_layout::kuser::publish_clocks(
+                alias as *mut u8,
+                now.monotonic_100ns,
+                now.system_time_100ns,
+            );
         }
     }
     KUSER_CLOCK_PUBLISH_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -16194,7 +16209,7 @@ unsafe fn delay_timer_init() -> bool {
 }
 
 unsafe fn delay_timer_next_deadline(queue: &nt_delay_execution::Queue) -> Option<(u64, u64)> {
-    let delay_deadline = queue.next_deadline();
+    let delay_deadline = queue.next_deadline(nt_time_snapshot());
     let event_deadline = object_waiter_next_deadline();
     let keyed_deadline = unsafe { (&*core::ptr::addr_of!(KEYED_WAITERS)).next_deadline() };
     let keyed_release_deadline =
@@ -16319,7 +16334,7 @@ unsafe fn delay_timer_rearm_and_drain_overdue(
 unsafe fn delay_park(
     handler: &mut ExecNtHandler,
     queue: &mut nt_delay_execution::Queue,
-    deadline_100ns: u64,
+    deadline: nt_delay_execution::Deadline,
     reply_cap: u64,
     reply: nt_syscall_abi::ParkedSyscallReply,
     thread_id: u64,
@@ -16332,7 +16347,7 @@ unsafe fn delay_park(
         return false;
     };
     let waiter = nt_delay_execution::Waiter {
-        deadline_100ns,
+        deadline,
         sequence: 0,
         reply_cap,
         reply,
@@ -16346,9 +16361,9 @@ unsafe fn delay_park(
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
     DELAY_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
     thread_wait_state_mark_badge_waiting(handler, badge);
-    let now = monotonic_time_100ns();
-    if deadline_100ns <= now {
-        let _ = delay_wake_due(handler, queue, now);
+    let now = nt_time_snapshot();
+    if deadline.is_due(now) {
+        let _ = delay_wake_due(handler, queue, now.monotonic_100ns);
     }
     let _ = delay_timer_rearm_and_drain_overdue(queue, handler);
     true
@@ -16360,6 +16375,7 @@ unsafe fn delay_wake_due(
     now: u64,
 ) -> u64 {
     let mut woken = 0;
+    let now = nt_time_snapshot_at(now);
     while let Some(waiter) = queue.pop_due(now) {
         let other_started = disk_census_ticks();
         DELAY_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -21593,28 +21609,31 @@ impl PendingWaitTimeout {
         !self.specified
     }
 
-    fn due_now(self) -> Option<nt_delay_execution::Due> {
+    fn is_due_now(self) -> Option<bool> {
         if self.specified {
-            Some(nt_delay_execution::due_time(
-                self.interval_100ns,
-                monotonic_time_100ns(),
-                nt_system_time_100ns(),
-            ))
+            let now = nt_time_snapshot();
+            Some(
+                nt_delay_execution::due_time(
+                    self.interval_100ns,
+                    now.monotonic_100ns,
+                    now.system_time_100ns,
+                )
+                .is_due(now),
+            )
         } else {
             None
         }
     }
 
     fn deadline_at_park(self) -> Option<u64> {
-        let now = monotonic_time_100ns();
         if self.specified {
-            Some(
-                match nt_delay_execution::due_time(self.interval_100ns, now, nt_system_time_100ns())
-                {
-                    nt_delay_execution::Due::Immediate => now,
-                    nt_delay_execution::Due::Monotonic100ns(deadline) => deadline,
-                },
+            let now = nt_time_snapshot();
+            nt_delay_execution::due_time(
+                self.interval_100ns,
+                now.monotonic_100ns,
+                now.system_time_100ns,
             )
+            .monotonic_target(now)
         } else {
             None
         }
@@ -32004,16 +32023,26 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // trajectory-fragile — they went red when winlogon's worker started deadlocking earlier (before
     // any delay fired). The counters below remain as a diagnostic of whether the LIVE path was hit.
     let delay_park_wake_ok = {
-        use nt_delay_execution::{due_time, Due, Queue, Waiter};
+        use nt_delay_execution::{due_time, Deadline, Queue, TimeSnapshot, Waiter};
+        let at = |monotonic_100ns, system_time_100ns| TimeSnapshot {
+            monotonic_100ns,
+            system_time_100ns,
+            clock_generation: 0,
+        };
         // Deadline arithmetic: interval 0 fires immediately; a relative (negative) interval parks
         // at now + |interval| on the monotonic clock.
-        let immediate = matches!(due_time(0, 1000, 2000), Due::Immediate);
-        let future = matches!(due_time(-500, 1000, 2000), Due::Monotonic100ns(1500));
+        let immediate = due_time(0, 1000, 2000).is_due(at(1000, 2000));
+        let future = due_time(-500, 1000, 2000)
+            == Deadline::Relative {
+                monotonic_100ns: 1500,
+            };
         // Park/wake: a waiter is NOT due before its deadline (parked) and pops exactly at/after it
         // (woken), leaving the queue empty.
         let mut q = Queue::new();
         let w = Waiter {
-            deadline_100ns: 1500,
+            deadline: Deadline::Relative {
+                monotonic_100ns: 1500,
+            },
             sequence: 0,
             reply_cap: 1,
             reply: nt_syscall_abi::ParkedSyscallReply::native_call(),
@@ -32021,8 +32050,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             badge: 3,
         };
         let inserted = q.insert(w).is_ok();
-        let parked = q.next_deadline() == Some(1500) && q.pop_due(1499).is_none();
-        let woken = q.pop_due(1500).map(|x| x.thread_id) == Some(7) && q.len() == 0;
+        let parked =
+            q.next_deadline(at(1000, 2000)) == Some(1500) && q.pop_due(at(1499, 2499)).is_none();
+        let woken = q.pop_due(at(1500, 2500)).map(|x| x.thread_id) == Some(7) && q.len() == 0;
         immediate && future && inserted && parked && woken
     };
     check(
@@ -32031,9 +32061,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         &mut passed,
     );
     let delay_multiplex_ok = {
-        use nt_delay_execution::{Queue, Waiter};
+        use nt_delay_execution::{Deadline, Queue, TimeSnapshot, Waiter};
+        let at = |monotonic_100ns| TimeSnapshot {
+            monotonic_100ns,
+            system_time_100ns: 2000 + monotonic_100ns,
+            clock_generation: 0,
+        };
         let mk = |deadline_100ns: u64, thread_id: u64, badge: u64| Waiter {
-            deadline_100ns,
+            deadline: Deadline::Relative {
+                monotonic_100ns: deadline_100ns,
+            },
             sequence: 0,
             reply_cap: 1,
             reply: nt_syscall_abi::ParkedSyscallReply::native_call(),
@@ -32047,9 +32084,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         let ins1 = q.insert(mk(2000, 1, 3)).is_ok();
         let ins2 = q.insert(mk(1000, 2, 5)).is_ok();
         let cross = q.has_badge_other_than(3) && q.has_badge_other_than(5);
-        let first = q.pop_due(1000).map(|w| (w.thread_id, w.badge)) == Some((2, 5));
-        let second_not_yet = q.pop_due(1500).is_none();
-        let second = q.pop_due(2000).map(|w| (w.thread_id, w.badge)) == Some((1, 3));
+        let first = q.pop_due(at(1000)).map(|w| (w.thread_id, w.badge)) == Some((2, 5));
+        let second_not_yet = q.pop_due(at(1500)).is_none();
+        let second = q.pop_due(at(2000)).map(|w| (w.thread_id, w.badge)) == Some((1, 3));
         ins1 && ins2 && cross && first && second_not_yet && second
     };
     check(

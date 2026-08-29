@@ -9,3 +9,4 @@ path = "src/lib.rs"
 
 [dependencies]
 nt-syscall-abi.workspace = true
+nt-time.workspace = true

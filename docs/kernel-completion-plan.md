@@ -16491,3 +16491,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     clock-generation change should the executive install the single adjustable clock authority,
     publish it through KUSER_SHARED_DATA, register SSN 251, enforce `SeSystemtimePrivilege`, return
     the previous time, and atomically expire/re-arm affected waits and timers.
+
+    Tagged delay queue (2026-08-29, focused validation complete): `nt-delay-execution::Waiter` now
+    stores the shared `Deadline` directly. Queue scans require a coherent time snapshot, project the
+    current comparator target for HPET arming, and select due entries by their retained deadline
+    domain plus insertion sequence. The obsolete `Due` enum and every scalar deadline in this queue
+    are deleted. The executive's real `NtDelayExecution` park path carries the tag through service
+    dispatch, and the shared timer arbiter resamples system time whenever it finds or drains the
+    queue. Focused tests cover clock jumps, ordering, infinite waits, deadline saturation, and queue
+    growth at `12/12`; the freestanding executive remains at the accepted 209-warning baseline.
+
+    Review adjustment: migrate `nt-kernel-exec::TimerQueue` next, retaining absolute first-fire
+    identity and making periodic re-arms relative to monotonic time after that fire. Then migrate the
+    driver dispatcher wait table that shares the same crate. Do not add runtime clock adjustment
+    until both driver timer owners can be reprojected from tagged state.

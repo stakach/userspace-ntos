@@ -9227,7 +9227,7 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_keyed_wait_deadline: Option<u64> = None;
             let mut park_keyed_release_wait_key: u64 = u64::MAX;
             let mut park_keyed_release_wait_deadline: Option<u64> = None;
-            let mut park_delay_deadline: Option<u64> = None;
+            let mut park_delay_deadline: Option<nt_delay_execution::Deadline> = None;
             let mut park_io_completion_port: i64 = -1;
             let mut park_io_completion_key_out: u64 = 0;
             let mut park_io_completion_apc_out: u64 = 0;
@@ -9824,17 +9824,14 @@ pub(crate) unsafe fn service_sec_image(
                         nt_handler.keyed_release_wait_timeout.deadline_at_park();
                 }
                 if nt_handler.delay_requested {
-                    let monotonic_now = monotonic_time_100ns();
-                    let system_now = nt_system_time_100ns();
-                    match nt_delay_execution::due_time(
+                    let now = nt_time_snapshot();
+                    let deadline = nt_delay_execution::due_time(
                         nt_handler.delay_interval_100ns,
-                        monotonic_now,
-                        system_now,
-                    ) {
-                        nt_delay_execution::Due::Immediate => {}
-                        nt_delay_execution::Due::Monotonic100ns(deadline) => {
-                            park_delay_deadline = Some(deadline);
-                        }
+                        now.monotonic_100ns,
+                        now.system_time_100ns,
+                    );
+                    if !deadline.is_due(now) {
+                        park_delay_deadline = Some(deadline);
                     }
                 }
                 if nt_handler.io_completion_park_port >= 0 {

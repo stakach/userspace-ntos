@@ -11094,25 +11094,18 @@ impl ExecNtHandler {
             return 0;
         }
         if let Some(timeout) = timeout_interval.map(PendingWaitTimeout::from_interval) {
-            let Some(due) = timeout.due_now() else {
-                unreachable!();
-            };
-            match due {
-                nt_delay_execution::Due::Immediate => {
-                    trace_wait_object(
-                        self,
-                        b"timeout-immediate",
-                        handle,
-                        object,
-                        timeout_ptr,
-                        0x102,
-                    );
-                    return 0x102;
-                }
-                nt_delay_execution::Due::Monotonic100ns(_) => {
-                    self.wait_timeout = timeout;
-                }
+            if timeout.is_due_now() == Some(true) {
+                trace_wait_object(
+                    self,
+                    b"timeout-immediate",
+                    handle,
+                    object,
+                    timeout_ptr,
+                    0x102,
+                );
+                return 0x102;
             }
+            self.wait_timeout = timeout;
         }
         self.wait_park_event = object.raw() as i64;
         self.wait_alertable = alertable;
@@ -11219,10 +11212,10 @@ impl ExecNtHandler {
         }
 
         if let Some(timeout) = timeout_interval.map(PendingWaitTimeout::from_interval) {
-            match timeout.due_now().expect("captured timeout has a due time") {
-                nt_delay_execution::Due::Immediate => return 0x102,
-                nt_delay_execution::Due::Monotonic100ns(_) => self.wait_timeout = timeout,
+            if timeout.is_due_now() == Some(true) {
+                return 0x102;
             }
+            self.wait_timeout = timeout;
         }
         for (index, result_index) in self.wait_park_result_indices[..count]
             .iter_mut()
@@ -27946,13 +27939,10 @@ impl ExecNtHandler {
             Err(status) => return status,
         };
         if let Some(timeout) = timeout {
-            let Some(due) = timeout.due_now() else {
-                unreachable!();
-            };
-            match due {
-                nt_delay_execution::Due::Immediate => return 0x102,
-                nt_delay_execution::Due::Monotonic100ns(_) => self.wait_timeout = timeout,
+            if timeout.is_due_now() == Some(true) {
+                return 0x102;
             }
+            self.wait_timeout = timeout;
         }
         match self.pm.debug_object(object).map(|o| o.host_event) {
             Some(key) if key != 0 => {
@@ -32165,39 +32155,24 @@ impl ExecNtHandler {
                 let previous = self.user_timer_previous_state(index as u64);
                 let _was_active = self.user_timer_cancel(index as u64);
                 let _ = self.events.reset_existing(index as u64);
-                match nt_delay_execution::due_time(
+                let now = nt_time_snapshot();
+                let deadline = nt_delay_execution::due_time(
                     due_time,
-                    monotonic_time_100ns(),
-                    nt_system_time_100ns(),
-                ) {
-                    nt_delay_execution::Due::Immediate => {
-                        let _ = self.events.set_existing(index as u64);
-                        let period_ms = period as u32;
-                        if period_ms != 0 {
-                            let deadline =
-                                monotonic_time_100ns().saturating_add(period_ms as u64 * 10_000);
-                            if self
-                                .user_timer_set(
-                                    index as u64,
-                                    deadline,
-                                    period_ms,
-                                    self.current_tid,
-                                    apc_routine,
-                                    apc_context,
-                                )
-                                .is_err()
-                            {
-                                return 0xC000_009A;
-                            }
-                        }
-                        wait_wake_dispatcher_set(self);
-                    }
-                    nt_delay_execution::Due::Monotonic100ns(deadline) => {
+                    now.monotonic_100ns,
+                    now.system_time_100ns,
+                );
+                if deadline.is_due(now) {
+                    let _ = self.events.set_existing(index as u64);
+                    let period_ms = period as u32;
+                    if period_ms != 0 {
+                        let deadline = now
+                            .monotonic_100ns
+                            .saturating_add(period_ms as u64 * 10_000);
                         if self
                             .user_timer_set(
                                 index as u64,
                                 deadline,
-                                period as u32,
+                                period_ms,
                                 self.current_tid,
                                 apc_routine,
                                 apc_context,
@@ -32206,10 +32181,28 @@ impl ExecNtHandler {
                         {
                             return 0xC000_009A;
                         }
-                        if !delay_timer_init() {
-                            self.user_timer_cancel(index as u64);
-                            return 0xC000_009A;
-                        }
+                    }
+                    wait_wake_dispatcher_set(self);
+                } else {
+                    let Some(deadline) = deadline.monotonic_target(now) else {
+                        unreachable!("finite native timer produced an infinite deadline");
+                    };
+                    if self
+                        .user_timer_set(
+                            index as u64,
+                            deadline,
+                            period as u32,
+                            self.current_tid,
+                            apc_routine,
+                            apc_context,
+                        )
+                        .is_err()
+                    {
+                        return 0xC000_009A;
+                    }
+                    if !delay_timer_init() {
+                        self.user_timer_cancel(index as u64);
+                        return 0xC000_009A;
                     }
                 }
                 if previous_state != 0
@@ -32656,15 +32649,10 @@ impl ExecNtHandler {
                         Err(status) => return status,
                     };
                     if let Some(timeout) = timeout {
-                        let Some(due) = timeout.due_now() else {
-                            unreachable!();
-                        };
-                        match due {
-                            nt_delay_execution::Due::Immediate => return 0x102,
-                            nt_delay_execution::Due::Monotonic100ns(_) => {
-                                self.keyed_release_wait_timeout = timeout;
-                            }
+                        if timeout.is_due_now() == Some(true) {
+                            return 0x102;
                         }
+                        self.keyed_release_wait_timeout = timeout;
                     }
                     self.keyed_release_wait_key = key;
                     0x102
@@ -32689,15 +32677,10 @@ impl ExecNtHandler {
                     Err(status) => return status,
                 };
                 if let Some(timeout) = timeout {
-                    let Some(due) = timeout.due_now() else {
-                        unreachable!();
-                    };
-                    match due {
-                        nt_delay_execution::Due::Immediate => return 0x102,
-                        nt_delay_execution::Due::Monotonic100ns(_) => {
-                            self.keyed_wait_timeout = timeout;
-                        }
+                    if timeout.is_due_now() == Some(true) {
+                        return 0x102;
                     }
+                    self.keyed_wait_timeout = timeout;
                 }
                 self.keyed_wait_key = key;
                 0x102
@@ -36059,25 +36042,22 @@ impl ExecNtHandler {
                             None => PendingWaitTimeout::none(),
                             Some(interval) => {
                                 let timeout = PendingWaitTimeout::from_interval(interval);
-                                match timeout.due_now() {
-                                    Some(nt_delay_execution::Due::Immediate) => {
-                                        trace_io_completion(
-                                            self.pi,
-                                            b"remove-timeout-immediate",
-                                            args[0],
-                                            Some(object_id),
-                                            nt_io_completion::STATUS_TIMEOUT,
-                                            self.io_completion_ports.depth(object_id).ok(),
-                                            interval,
-                                            args[1],
-                                            args[2],
-                                            args[3],
-                                        );
-                                        return nt_io_completion::STATUS_TIMEOUT;
-                                    }
-                                    Some(nt_delay_execution::Due::Monotonic100ns(_)) => timeout,
-                                    None => PendingWaitTimeout::none(),
+                                if timeout.is_due_now() == Some(true) {
+                                    trace_io_completion(
+                                        self.pi,
+                                        b"remove-timeout-immediate",
+                                        args[0],
+                                        Some(object_id),
+                                        nt_io_completion::STATUS_TIMEOUT,
+                                        self.io_completion_ports.depth(object_id).ok(),
+                                        interval,
+                                        args[1],
+                                        args[2],
+                                        args[3],
+                                    );
+                                    return nt_io_completion::STATUS_TIMEOUT;
                                 }
+                                timeout
                             }
                         };
                         self.io_completion_park_port = object_id as i64;

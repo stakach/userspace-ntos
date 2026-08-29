@@ -10632,13 +10632,16 @@ fn hosted_driver_deadline_from_timeout(
         DispatcherWaitTimeout::Poll => Err(STATUS_TIMEOUT_I32),
         DispatcherWaitTimeout::Infinite => Ok(None),
         DispatcherWaitTimeout::Blocking => {
-            match nt_delay_execution::due_time(
+            let now = crate::nt_time_snapshot();
+            let deadline = nt_delay_execution::due_time(
                 timeout_arg as i64,
-                crate::monotonic_time_100ns(),
-                crate::nt_system_time_100ns(),
-            ) {
-                nt_delay_execution::Due::Immediate => Err(STATUS_TIMEOUT_I32),
-                nt_delay_execution::Due::Monotonic100ns(deadline) => Ok(Some(deadline)),
+                now.monotonic_100ns,
+                now.system_time_100ns,
+            );
+            if deadline.is_due(now) {
+                Err(STATUS_TIMEOUT_I32)
+            } else {
+                Ok(deadline.monotonic_target(now))
             }
         }
     }

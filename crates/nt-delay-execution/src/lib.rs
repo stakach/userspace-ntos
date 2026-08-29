@@ -4,26 +4,17 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Due {
-    Immediate,
-    Monotonic100ns(u64),
-}
+pub use nt_time::{Deadline, TimeSnapshot};
 
-pub fn due_time(interval: i64, monotonic_now: u64, system_now: u64) -> Due {
-    if interval == 0 {
-        return Due::Immediate;
-    }
-    if interval < 0 {
-        let delta = interval.unsigned_abs();
-        return Due::Monotonic100ns(monotonic_now.saturating_add(delta));
-    }
-    let absolute = interval as u64;
-    if absolute <= system_now {
-        Due::Immediate
-    } else {
-        Due::Monotonic100ns(monotonic_now.saturating_add(absolute - system_now))
-    }
+pub fn due_time(interval: i64, monotonic_now: u64, system_now: u64) -> Deadline {
+    Deadline::from_nt_timeout(
+        Some(interval),
+        TimeSnapshot {
+            monotonic_100ns: monotonic_now,
+            system_time_100ns: system_now,
+            clock_generation: 0,
+        },
+    )
 }
 
 pub fn ticks_to_100ns(ticks: u64, period_fs: u64) -> u64 {
@@ -83,7 +74,7 @@ pub fn timer_min_delta_ticks(min_delta_100ns: u64, period_fs: u64, floor_ticks: 
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Waiter {
-    pub deadline_100ns: u64,
+    pub deadline: Deadline,
     pub sequence: u64,
     pub reply_cap: u64,
     pub reply: nt_syscall_abi::ParkedSyscallReply,
@@ -139,22 +130,22 @@ impl Queue {
         Ok(())
     }
 
-    pub fn next_deadline(&self) -> Option<u64> {
+    pub fn next_deadline(&self, now: TimeSnapshot) -> Option<u64> {
         self.slots
             .iter()
             .flatten()
-            .map(|waiter| waiter.deadline_100ns)
+            .filter_map(|waiter| waiter.deadline.monotonic_target(now))
             .min()
     }
 
-    pub fn pop_due(&mut self, now_100ns: u64) -> Option<Waiter> {
+    pub fn pop_due(&mut self, now: TimeSnapshot) -> Option<Waiter> {
         let index = self
             .slots
             .iter()
             .enumerate()
             .filter_map(|(index, waiter)| waiter.map(|waiter| (index, waiter)))
-            .filter(|(_, waiter)| waiter.deadline_100ns <= now_100ns)
-            .min_by_key(|(_, waiter)| (waiter.deadline_100ns, waiter.sequence))
+            .filter(|(_, waiter)| waiter.deadline.is_due(now))
+            .min_by_key(|(_, waiter)| (waiter.deadline.ordering_key(now), waiter.sequence))
             .map(|(index, _)| index)?;
         self.slots[index].take()
     }
@@ -205,9 +196,17 @@ impl Default for Queue {
 mod tests {
     use super::*;
 
-    fn waiter(deadline: u64, thread_id: u64) -> Waiter {
+    fn snapshot(monotonic_100ns: u64, system_time_100ns: u64) -> TimeSnapshot {
+        TimeSnapshot {
+            monotonic_100ns,
+            system_time_100ns,
+            clock_generation: 0,
+        }
+    }
+
+    fn waiter(deadline: Deadline, thread_id: u64) -> Waiter {
         Waiter {
-            deadline_100ns: deadline,
+            deadline,
             sequence: 99,
             reply_cap: thread_id + 100,
             reply: nt_syscall_abi::ParkedSyscallReply::unknown_syscall(
@@ -223,18 +222,31 @@ mod tests {
 
     #[test]
     fn zero_and_past_absolute_are_immediate() {
-        assert_eq!(due_time(0, 10, 100), Due::Immediate);
-        assert_eq!(due_time(99, 10, 100), Due::Immediate);
-        assert_eq!(due_time(100, 10, 100), Due::Immediate);
+        let now = snapshot(10, 100);
+        assert!(due_time(0, 10, 100).is_due(now));
+        assert!(due_time(99, 10, 100).is_due(now));
+        assert!(due_time(100, 10, 100).is_due(now));
     }
 
     #[test]
-    fn relative_and_future_absolute_use_monotonic_deadlines() {
-        assert_eq!(due_time(-25, 10, 100), Due::Monotonic100ns(35));
-        assert_eq!(due_time(125, 10, 100), Due::Monotonic100ns(35));
+    fn relative_and_future_absolute_retain_their_domains() {
+        assert_eq!(
+            due_time(-25, 10, 100),
+            Deadline::Relative {
+                monotonic_100ns: 35
+            }
+        );
+        assert_eq!(
+            due_time(125, 10, 100),
+            Deadline::Absolute {
+                system_time_100ns: 125
+            }
+        );
         assert_eq!(
             due_time(i64::MIN, 1, 100),
-            Due::Monotonic100ns(1 + (1u64 << 63))
+            Deadline::Relative {
+                monotonic_100ns: 1 + (1u64 << 63)
+            }
         );
     }
 
@@ -294,24 +306,45 @@ mod tests {
     #[test]
     fn queue_returns_due_waiters_in_deadline_then_fifo_order() {
         let mut queue = Queue::new();
-        queue.insert(waiter(20, 1)).unwrap();
-        queue.insert(waiter(10, 2)).unwrap();
-        queue.insert(waiter(10, 3)).unwrap();
-        assert_eq!(queue.next_deadline(), Some(10));
-        assert_eq!(queue.pop_due(9), None);
-        assert_eq!(queue.pop_due(10).unwrap().thread_id, 2);
-        assert_eq!(queue.pop_due(10).unwrap().thread_id, 3);
-        assert_eq!(queue.pop_due(20).unwrap().thread_id, 1);
+        queue
+            .insert(waiter(
+                Deadline::Relative {
+                    monotonic_100ns: 20,
+                },
+                1,
+            ))
+            .unwrap();
+        queue
+            .insert(waiter(
+                Deadline::Relative {
+                    monotonic_100ns: 10,
+                },
+                2,
+            ))
+            .unwrap();
+        queue
+            .insert(waiter(
+                Deadline::Relative {
+                    monotonic_100ns: 10,
+                },
+                3,
+            ))
+            .unwrap();
+        assert_eq!(queue.next_deadline(snapshot(0, 100)), Some(10));
+        assert_eq!(queue.pop_due(snapshot(9, 109)), None);
+        assert_eq!(queue.pop_due(snapshot(10, 110)).unwrap().thread_id, 2);
+        assert_eq!(queue.pop_due(snapshot(10, 110)).unwrap().thread_id, 3);
+        assert_eq!(queue.pop_due(snapshot(20, 120)).unwrap().thread_id, 1);
     }
 
     #[test]
     fn queue_grows_and_cancels_terminated_threads() {
         let mut queue = Queue::new();
         assert!(queue.reset(1));
-        queue.insert(waiter(10, 1)).unwrap();
-        queue.insert(waiter(20, 1)).unwrap();
-        queue.insert(waiter(30, 2)).unwrap();
-        queue.insert(waiter(40, 3)).unwrap();
+        queue.insert(waiter(due_time(-10, 0, 100), 1)).unwrap();
+        queue.insert(waiter(due_time(-20, 0, 100), 1)).unwrap();
+        queue.insert(waiter(due_time(-30, 0, 100), 2)).unwrap();
+        queue.insert(waiter(due_time(-40, 0, 100), 3)).unwrap();
         assert_eq!(queue.records(), 4);
         assert!(queue.capacity() >= 4);
         assert_eq!(queue.allocation_failures(), 0);
@@ -320,7 +353,32 @@ mod tests {
         assert_eq!(queue.pop_thread(1).unwrap().thread_id, 1);
         assert_eq!(queue.pop_thread(1), None);
         assert_eq!(queue.len(), 2);
-        assert_eq!(queue.pop_due(30).unwrap().thread_id, 2);
-        assert_eq!(queue.pop_due(40).unwrap().thread_id, 3);
+        assert_eq!(queue.pop_due(snapshot(30, 130)).unwrap().thread_id, 2);
+        assert_eq!(queue.pop_due(snapshot(40, 140)).unwrap().thread_id, 3);
+    }
+
+    #[test]
+    fn absolute_queue_deadlines_follow_system_clock_changes() {
+        let mut queue = Queue::new();
+        queue
+            .insert(waiter(due_time(2_000, 100, 1_000), 1))
+            .unwrap();
+        queue
+            .insert(waiter(due_time(3_000, 100, 1_000), 2))
+            .unwrap();
+        assert_eq!(queue.next_deadline(snapshot(100, 1_000)), Some(1_100));
+
+        assert_eq!(queue.next_deadline(snapshot(200, 4_000)), Some(200));
+        assert_eq!(queue.pop_due(snapshot(200, 4_000)).unwrap().thread_id, 1);
+        assert_eq!(queue.pop_due(snapshot(200, 4_000)).unwrap().thread_id, 2);
+    }
+
+    #[test]
+    fn infinite_waiter_does_not_arm_or_expire() {
+        let mut queue = Queue::new();
+        queue.insert(waiter(Deadline::Infinite, 1)).unwrap();
+        assert_eq!(queue.next_deadline(snapshot(10, 100)), None);
+        assert_eq!(queue.pop_due(snapshot(u64::MAX, u64::MAX)), None);
+        assert_eq!(queue.len(), 1);
     }
 }
