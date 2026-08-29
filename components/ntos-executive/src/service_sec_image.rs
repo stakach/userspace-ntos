@@ -9162,6 +9162,10 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.csr_rendezvous_out = 0;
                 nt_handler.csr_rendezvous_conn_info = 0;
                 nt_handler.csr_rendezvous_conn_info_len = 0;
+                nt_handler.csr_rendezvous_client_view = 0;
+                nt_handler.csr_rendezvous_section = 0;
+                nt_handler.csr_rendezvous_section_offset = 0;
+                nt_handler.csr_rendezvous_view_size = 0;
                 // Group-C handlers reach the loop's section/registry/demand-fill state through this
                 // ctx of raw refs (rebuilt each iteration at the current loop locals).
                 nt_handler.loop_ctx = Some(ExecLoopCtx {
@@ -9286,6 +9290,7 @@ pub(crate) unsafe fn service_sec_image(
                             let _ = tcb_resume(tcb);
                             let _ = csr_rendezvous(
                                 0,
+                                csrss_pi,
                                 procs[csrss_pi].pml4,
                                 loaded_hosted_pe_by_pi(&*hosted_loaded_images, csrss_pi)
                                     .expect("CSRSS PE must be registered before CSR API start"),
@@ -10174,6 +10179,7 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b") -> driving the real CsrApiRequestThread accept\n");
                         let completion = csr_rendezvous(
                             conn_id,
+                            csrss_pi,
                             procs[csrss_pi].pml4,
                             loaded_hosted_pe_by_pi(&*hosted_loaded_images, csrss_pi)
                                 .expect("CSRSS PE must be registered before CSR rendezvous"),
@@ -10201,27 +10207,8 @@ pub(crate) unsafe fn service_sec_image(
                                 result = 0xC000_0005;
                                 handled = false;
                             } else {
-                                // AUTHENTIC: the real CSR thread accepted + completed the connection.
-                                CSR_AUTHENTIC_ACCEPTS.fetch_add(1, Ordering::Relaxed);
-                                CSR_AUTHENTIC_ACCEPT_MASK.fetch_or(1u64 << pi, Ordering::Relaxed);
-                                nt_handler.cache_lpc_connection(
-                                    conn_id,
-                                    completion.client_handle,
-                                    b"\\Windows\\ApiPort"
-                                        .iter()
-                                        .map(|&b| b as u16)
-                                        .collect::<alloc::vec::Vec<u16>>()
-                                        .as_slice(),
-                                );
-                                print_str(b"[csr-rdv] AUTHENTIC accept complete: client handle=0x");
-                                print_hex((completion.client_handle >> 32) as u32);
-                                print_hex(completion.client_handle as u32);
-                                print_str(b" conninfo=");
-                                print_u64(completion.connection_info.len() as u64);
-                                print_str(b" -> client NtSecureConnectPort SUCCESS\n");
-                                if out_ptr != 0 {
-                                    // Client *PortHandle (&CsrApiPort, an ntdll .data global) — demand-fill window.
-                                    csrss_out_write(
+                                let handle_written = out_ptr != 0
+                                    && csrss_out_write(
                                         pi as u64,
                                         out_ptr,
                                         completion.client_handle,
@@ -10232,8 +10219,41 @@ pub(crate) unsafe fn service_sec_image(
                                         dll_pe_store.as_slice(),
                                         pml4,
                                     );
+                                if !handle_written {
+                                    CSR_RENDEZVOUS_FAILURES.fetch_add(1, Ordering::Relaxed);
+                                    print_str(b"[csr-rdv] client port-handle copyout failed -> failing completed connect\n");
+                                    result = 0xC000_0005;
+                                    handled = false;
+                                } else {
+                                    // AUTHENTIC: the real CSR thread accepted + completed the connection.
+                                    CSR_AUTHENTIC_ACCEPTS.fetch_add(1, Ordering::Relaxed);
+                                    CSR_AUTHENTIC_ACCEPT_MASK
+                                        .fetch_or(1u64 << pi, Ordering::Relaxed);
+                                    CSR_CONNECTED_MASK.fetch_or(1u64 << pi, Ordering::Relaxed);
+                                    if nt_handler.hosted_process_role(pi)
+                                        == Some(nt_exe_image::HostedProcessRole::InteractiveLogon)
+                                    {
+                                        WINLOGON_CSR_CONNECTED.store(1, Ordering::Relaxed);
+                                    }
+                                    nt_handler.cache_lpc_connection(
+                                        conn_id,
+                                        completion.client_handle,
+                                        b"\\Windows\\ApiPort"
+                                            .iter()
+                                            .map(|&b| b as u16)
+                                            .collect::<alloc::vec::Vec<u16>>()
+                                            .as_slice(),
+                                    );
+                                    print_str(
+                                        b"[csr-rdv] AUTHENTIC accept complete: client handle=0x",
+                                    );
+                                    print_hex((completion.client_handle >> 32) as u32);
+                                    print_hex(completion.client_handle as u32);
+                                    print_str(b" conninfo=");
+                                    print_u64(completion.connection_info.len() as u64);
+                                    print_str(b" -> client NtSecureConnectPort SUCCESS\n");
+                                    result = 0; // STATUS_SUCCESS
                                 }
-                                result = 0; // STATUS_SUCCESS
                             }
                         } else {
                             CSR_RENDEZVOUS_FAILURES.fetch_add(1, Ordering::Relaxed);

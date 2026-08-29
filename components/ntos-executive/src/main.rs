@@ -268,16 +268,6 @@ pub const WINLOGON_STACK_MIRROR_VA: u64 = 0x0000_0100_106B_0000; // FILEBUF PT, 
 pub const WINLOGON_MAIN_TEB_MIRROR_VA: u64 = 0x0000_0100_107C_0000;
 pub const WINLOGON_HEAP_MIRROR_VA: u64 = 0x0000_0100_1220_0000; // own PT (spawn_sec_image creates it)
 pub const WINLOGON_IMAGE_MIRROR_VA: u64 = 0x0000_0100_1240_0000; // own PT (spawn_sec_image creates it)
-/// winlogon's CSR client-connect regions (mapped into winlogon's OWN VSpace by the NtSecureConnectPort
-/// handler, lazily). One 2 MiB PT holds both: the LpcWrite heap VIEW (16 pages / 64 KiB — kernel32
-/// RtlCreateHeaps over it as CsrPortHeap; ViewBase in the returned PORT_VIEW) and the CSR shared
-/// STATIC server data (4 pages — ConnectionInfo.SharedStaticServerData → an array of per-ServerDll
-/// pointers; [BASESRV=1] → a BASE_STATIC_SERVER_DATA whose WindowsDirectory/WindowsSystemDirectory
-/// kernel32's BaseDllInitialize dereferences). Free in winlogon (DLLs at 0x8000_0000+, image/ntdll/
-/// stack/heap elsewhere). Executive-side fill via a dedicated scratch PT.
-pub const WINLOGON_CSR_HEAP_VA: u64 = 0x0000_0100_0400_0000; // 64 KiB LpcWrite view (ViewBase)
-pub const WINLOGON_CSR_STATIC_VA: u64 = 0x0000_0100_0401_0000; // 16 KiB shared static server data
-pub const WINLOGON_CSR_FILL_SCRATCH: u64 = 0x0000_0100_1320_0000; // exec-side fill alias (own PT)
 /// The 4th hosted process — services.exe (badge 6, pi 3), spawned by winlogon's Win32 CreateProcessW
 /// (StartServicesManager). Same env VAs (SMSS_*) in its own VSpace; only the EXECUTIVE-side mirrors +
 /// the demand-fill scratch must be distinct from smss/csrss/winlogon. STACK mirror is in the FILEBUF
@@ -1318,7 +1308,6 @@ pub const BOOT_PROOF_ALIAS_END: u64 = BOOT_PROOF_ALIAS_BASE + 0x20_0000;
 pub const BOOT_SEC_IMAGE_SCRATCH_BASE: u64 = BOOT_PROOF_ALIAS_BASE;
 const _: () = assert!(STORAGE_SHARED_VADDR >= WORK_CLUSTER_BASE);
 const _: () = assert!(STORAGE_SHARED_END <= WORK_CLUSTER_BASE + 0x20_0000);
-const _: () = assert!(BOOT_PROOF_ALIAS_BASE >= WINLOGON_CSR_FILL_SCRATCH + 0x20_0000);
 const _: () = assert!(BOOT_PROOF_ALIAS_END <= SVC_LISTENER_STACK_MIRROR_VA);
 static NEXT_BOOT_PROOF_ALIAS: AtomicU64 = AtomicU64::new(BOOT_PROOF_ALIAS_END - 0x1000);
 /// A multi-frame file buffer shared between the executive and the storage host: the host reads
@@ -21856,6 +21845,10 @@ struct ExecNtHandler {
     csr_rendezvous_out: u64,
     csr_rendezvous_conn_info: u64,
     csr_rendezvous_conn_info_len: u64,
+    csr_rendezvous_client_view: u64,
+    csr_rendezvous_section: u64,
+    csr_rendezvous_section_offset: u64,
+    csr_rendezvous_view_size: u64,
     /// The DATA-plane cache of established LPC connections (control/data-plane split): the isolated
     /// nt-lpc-server owns the namespace + rendezvous, but is NOT on the message path. When a CONNECT
     /// completes through the server, the executive records the connection here so the future message
@@ -21863,15 +21856,6 @@ struct ExecNtHandler {
     /// badge delivery against this cache — never a per-message round-trip to the server. Records are
     /// `Copy` (inline name, no nested heap), and the vector owns any growth beyond its boot reserve.
     lpc_connections: alloc::vec::Vec<LpcConnRecord>,
-    /// winlogon's CSR client-connect LpcWrite heap-view base (0 = the CSR regions haven't been mapped
-    /// yet). Set the first time NtSecureConnectPort services winlogon's kernel32 → \Windows\ApiPort
-    /// connect; guards the one-time region mapping (heap view + static server data) in that handler.
-    winlogon_csr_view: u64,
-    /// Per-process CSR-connect region guard (bit `pi` = process pi's CSR heap-view + static-server-data
-    /// regions have been mapped into ITS VSpace). GENERAL per-process CSR/LPC connect plane: EVERY
-    /// hosted Win32 process (winlogon pi 2, services pi 3, …) gets its OWN copy of the CSR regions at
-    /// the shared CSR VAs in its own PML4. Was a single `winlogon_csr_view` guard (winlogon-only).
-    csr_view_mask: u32,
     /// The real NT Process Manager (nt-process): EPROCESS/ETHREAD, per-process handle tables, and the
     /// process/thread lifecycle. FIRST convergence increment — each hosted process (smss/csrss/
     /// winlogon) is backed by a real EPROCESS created in `new()`. This increment only CREATES + LOOKS UP the
@@ -24981,14 +24965,10 @@ pub(crate) static LSA_OPERATIONAL_MODE: AtomicU64 = AtomicU64::new(0);
 /// FAILs. Used for the batch's bypass experiment; must ship `true`.
 pub(crate) const LSA_RENDEZVOUS_ENABLED: bool = true;
 /// Set once winlogon's kernel32 CSR client connect (NtSecureConnectPort → \Windows\ApiPort) is
-/// serviced (regions mapped + CSR_API_CONNECTINFO filled). Read by the milestone spec check.
+/// serviced through real section views and server-authored connection information.
 static WINLOGON_CSR_CONNECTED: AtomicU64 = AtomicU64::new(0);
-/// Set once the exec-side CSR fill-scratch page table (WINLOGON_CSR_FILL_SCRATCH) is mapped (once,
-/// shared across all hosted processes' CSR-region fills — the executive is single-threaded).
-static CSR_FILL_SCRATCH_PT: AtomicU64 = AtomicU64::new(0);
-/// Bitmask of hosted processes (bit `pi`) whose GENERAL per-process CSR client connect completed
-/// (NtSecureConnectPort → \Windows\ApiPort serviced + their own CSR regions mapped). bit 2 = winlogon,
-/// bit 3 = services. Proves the CSR connect is a per-process service, not winlogon-specific.
+/// Bitmask of hosted processes (bit `pi`) whose CSR client connect completed with real LPC and CSR
+/// shared-section views. Proves the service is process-generic rather than winlogon-specific.
 static CSR_CONNECTED_MASK: AtomicU64 = AtomicU64::new(0);
 /// How many CSR API messages (NtRequestWaitReplyPort → \Windows\ApiPort) the direct message plane
 /// has serviced — proves winlogon↔csrss live traffic over the peer-direct plane.

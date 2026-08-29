@@ -3103,6 +3103,7 @@ unsafe fn csr_sb_api_request_rendezvous(
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn csr_rendezvous(
     conn_id: u64,
+    server_pi: usize,
     csrss_pml4: u64,
     csrss_pe: &nt_pe_loader::PeFile,
     img_end: u64,
@@ -3123,6 +3124,7 @@ pub(crate) unsafe fn csr_rendezvous(
     }
     let mut client_handle = 0u64;
     let mut connection_info = alloc::vec::Vec::new();
+    let mut mapped_views = None;
     let mut server_client_pid = 0u32;
     let mut fill_idx = 0u64;
     let mut guard = 0u64;
@@ -3305,24 +3307,79 @@ pub(crate) unsafe fn csr_rendezvous(
                         print_str(b" connector-tid=");
                         print_u64(csr_stack_read(get_recv_mr(7) + 16).unwrap_or(0));
                         print_str(b"\n");
-                        let Some(response_info) = capture_csr_connection_response(
-                            get_recv_mr(7),
-                            conn_id,
-                        ) else {
-                            print_str(b"[csr-rdv] WALL: could not capture accepted connection payload\n");
+                        let Some(response_info) =
+                            capture_csr_connection_response(get_recv_mr(7), conn_id)
+                        else {
+                            print_str(
+                                b"[csr-rdv] WALL: could not capture accepted connection payload\n",
+                            );
                             break;
                         };
-                        let sh = lpc_client()
-                            .and_then(|c| {
-                                c.accept_connect_with_info(
+                        if requested_accept {
+                            match nt_handler.map_csr_port_views(server_pi) {
+                                Ok((client_base, server_base, view_size)) => {
+                                    let remote_view = csr_stack_read(sp + 0x30).unwrap_or(0);
+                                    let remote_view_length = csr_stack_read(remote_view)
+                                        .map(|header| header as u32)
+                                        .unwrap_or(0);
+                                    if remote_view == 0 || remote_view_length != 0x18 {
+                                        nt_handler.rollback_generic_section_view(
+                                            nt_handler.pi,
+                                            client_base,
+                                        );
+                                        nt_handler
+                                            .rollback_generic_section_view(server_pi, server_base);
+                                        result = 0xC000_000D;
+                                    } else if csr_stack_copyout(
+                                        remote_view + 0x08,
+                                        &view_size.to_le_bytes(),
+                                    ) && csr_stack_copyout(
+                                        remote_view + 0x10,
+                                        &server_base.to_le_bytes(),
+                                    ) {
+                                        mapped_views = Some((client_base, server_base));
+                                    } else {
+                                        nt_handler.rollback_generic_section_view(
+                                            nt_handler.pi,
+                                            client_base,
+                                        );
+                                        nt_handler
+                                            .rollback_generic_section_view(server_pi, server_base);
+                                        result = 0xC000_0005;
+                                    }
+                                }
+                                Err(status) => result = status as u64,
+                            }
+                        }
+                        let sh = if result == 0 {
+                            match lpc_client().map(|client| {
+                                client.accept_connect_with_info(
                                     conn_id,
                                     requested_accept,
                                     rdx,
                                     &response_info,
                                 )
-                                .ok()
-                            })
-                            .unwrap_or(0);
+                            }) {
+                                Some(Ok(handle)) => handle,
+                                Some(Err(status)) => {
+                                    result = status.raw() as u32 as u64;
+                                    0
+                                }
+                                None => {
+                                    result = 0xC000_0001;
+                                    0
+                                }
+                            }
+                        } else {
+                            0
+                        };
+                        if result != 0 {
+                            if let Some((client_base, server_base)) = mapped_views.take() {
+                                nt_handler
+                                    .rollback_generic_section_view(nt_handler.pi, client_base);
+                                nt_handler.rollback_generic_section_view(server_pi, server_base);
+                            }
+                        }
                         csr_stack_write(porthandle_out, sh);
                     }
                     SSN_COMPLETE_CONNECT => {
@@ -3367,6 +3424,12 @@ pub(crate) unsafe fn csr_rendezvous(
         print_u64(label);
         print_str(b"\n");
         break;
+    }
+    if client_handle == 0 {
+        if let Some((client_base, server_base)) = mapped_views {
+            nt_handler.rollback_generic_section_view(nt_handler.pi, client_base);
+            nt_handler.rollback_generic_section_view(server_pi, server_base);
+        }
     }
     (client_handle != 0).then_some(CsrConnectCompletion {
         client_handle,

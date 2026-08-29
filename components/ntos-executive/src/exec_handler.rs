@@ -3129,9 +3129,11 @@ impl ExecNtHandler {
         write_field!(csr_rendezvous_out, 0);
         write_field!(csr_rendezvous_conn_info, 0);
         write_field!(csr_rendezvous_conn_info_len, 0);
+        write_field!(csr_rendezvous_client_view, 0);
+        write_field!(csr_rendezvous_section, 0);
+        write_field!(csr_rendezvous_section_offset, 0);
+        write_field!(csr_rendezvous_view_size, 0);
         write_field!(lpc_connections, alloc::vec::Vec::with_capacity(16));
-        write_field!(winlogon_csr_view, 0);
-        write_field!(csr_view_mask, 0);
         write_field!(pm, pm);
         write_field!(process_mechanisms, ExecProcessMechanisms::reset());
         write_field!(hosted_images, hosted_images);
@@ -24822,21 +24824,223 @@ impl ExecNtHandler {
         }
     }
 
+    unsafe fn map_generic_section_view_internal(
+        &mut self,
+        section_index: usize,
+        target_pi: usize,
+        base_in: u64,
+        view_size_in: u64,
+        section_offset: u64,
+        zero_bits: u64,
+        allocation_type: u32,
+        win32_protect: u32,
+    ) -> Result<(u64, u64), u32> {
+        const STATUS_INVALID_VIEW_SIZE: u32 = 0xC000_001F;
+        const HIGHEST_VAD_ADDRESS: u64 = 0x0000_07ff_fffd_ffff;
+        let ctx = self.loop_ctx.ok_or(STATUS_UNSUCCESSFUL)?;
+        let generic_sections = &mut *ctx.generic_sections;
+        let section = generic_sections
+            .section(section_index)
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        let target_pid = self
+            .pm_pid_for_pi(target_pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        if self.pm.process(target_pid).is_some_and(|process| {
+            matches!(
+                process.state,
+                nt_process::ProcessState::Exiting | nt_process::ProcessState::Terminated
+            )
+        }) {
+            return Err(nt_process::STATUS_PROCESS_IS_TERMINATING);
+        }
+        if base_in > HIGHEST_VAD_ADDRESS
+            || section_offset & 0xfff != 0
+            || section_offset > section.size
+        {
+            return Err(STATUS_INVALID_VIEW_SIZE);
+        }
+        let remaining = section.size - section_offset;
+        let wanted = if view_size_in == 0 {
+            remaining
+        } else {
+            view_size_in.min(remaining)
+        };
+        let map_size = wanted
+            .checked_add(0xfff)
+            .map(|value| value & !0xfff)
+            .filter(|&value| value != 0)
+            .ok_or(STATUS_INVALID_VIEW_SIZE)?;
+        if zero_bits > 53 {
+            return Err(nt_address_space::STATUS_INVALID_PARAMETER_3);
+        }
+        let placement_limit = if base_in == 0 && zero_bits != 0 {
+            let highest = u64::MAX >> zero_bits;
+            if highest > HIGHEST_VAD_ADDRESS {
+                return Err(nt_address_space::STATUS_INVALID_PARAMETER_3);
+            }
+            PRIVATE_VM_LIMIT.min(highest + 1)
+        } else {
+            PRIVATE_VM_LIMIT
+        };
+        let view_protection = if win32_protect == 0 {
+            section.protection
+        } else {
+            win32_protect
+        };
+        nt_address_space::validate_allocate_parameters(
+            zero_bits,
+            nt_address_space::MEM_RESERVE
+                | nt_address_space::MEM_COMMIT
+                | (allocation_type & nt_address_space::MEM_TOP_DOWN),
+            view_protection,
+        )?;
+        let procs = &mut *ctx.procs;
+        let target = procs[target_pi];
+        if target.pml4 == 0 || target.scratch_base == 0 {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        let vm_map =
+            process_vm_region_map_mut(target_pi).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
+        let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
+        *before = *vm_map;
+        let plan = allocate_private_vad_avoiding_fixed_authorities(
+            before,
+            after,
+            target_pi,
+            (base_in != 0).then_some(base_in),
+            map_size,
+            nt_address_space::MEM_RESERVE
+                | nt_address_space::MEM_COMMIT
+                | (allocation_type & nt_address_space::MEM_TOP_DOWN),
+            view_protection,
+            placement_limit,
+        )?;
+        if !generic_sections.map_view(
+            target_pi,
+            section_index,
+            plan.base,
+            plan.size,
+            section_offset,
+        ) {
+            *vm_map = *before;
+            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+        }
+        if !process_committed_mapping_register(
+            target_pi as u64,
+            nt_address_space::VmCommittedRange::mapped(plan.base, plan.size, view_protection),
+        ) {
+            let _ = generic_sections.unmap_view(target_pi, plan.base);
+            *vm_map = *before;
+            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+        }
+        *vm_map = *after;
+        crate::note_high_water(&crate::VM_REGION_HW, after.extent_count() as u64);
+        Ok((plan.base, plan.size))
+    }
+
+    pub(crate) unsafe fn map_csr_port_views(
+        &mut self,
+        server_pi: usize,
+    ) -> Result<(u64, u64, u64), u32> {
+        let section_index = self
+            .csr_rendezvous_section
+            .checked_sub(1)
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)? as usize;
+        let client_pi = self.pi;
+        let (server_base, server_size) = self.map_generic_section_view_internal(
+            section_index,
+            server_pi,
+            0,
+            self.csr_rendezvous_view_size,
+            self.csr_rendezvous_section_offset,
+            0,
+            0,
+            nt_address_space::PAGE_READWRITE,
+        )?;
+        let (client_base, client_size) = match self.map_generic_section_view_internal(
+            section_index,
+            client_pi,
+            0,
+            self.csr_rendezvous_view_size,
+            self.csr_rendezvous_section_offset,
+            0,
+            0,
+            nt_address_space::PAGE_READWRITE,
+        ) {
+            Ok(view) => view,
+            Err(status) => {
+                self.rollback_generic_section_view(server_pi, server_base);
+                return Err(status);
+            }
+        };
+        if client_size != server_size {
+            self.rollback_generic_section_view(client_pi, client_base);
+            self.rollback_generic_section_view(server_pi, server_base);
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let view = self.csr_rendezvous_client_view;
+        if view == 0
+            || !self.xas_write_u64(view + 0x18, client_size)
+            || !self.xas_write_u64(view + 0x20, client_base)
+            || !self.xas_write_u64(view + 0x28, server_base)
+        {
+            self.rollback_generic_section_view(client_pi, client_base);
+            self.rollback_generic_section_view(server_pi, server_base);
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        print_str(b"[lpc-view] client-pi=");
+        print_u64(client_pi as u64);
+        print_str(b" server-pi=");
+        print_u64(server_pi as u64);
+        print_str(b" section=");
+        print_u64(section_index as u64);
+        print_str(b" client=0x");
+        print_hex((client_base >> 32) as u32);
+        print_hex(client_base as u32);
+        print_str(b" server=0x");
+        print_hex((server_base >> 32) as u32);
+        print_hex(server_base as u32);
+        print_str(b" size=0x");
+        print_hex(client_size as u32);
+        print_str(b"\n");
+        Ok((client_base, server_base, client_size))
+    }
+
+    pub(crate) unsafe fn rollback_generic_section_view(&mut self, pi: usize, base: u64) {
+        let Some(ctx) = self.loop_ctx else {
+            return;
+        };
+        let generic_sections = &mut *ctx.generic_sections;
+        let Some((_section_index, view)) = generic_sections.view_for_page(pi, base) else {
+            return;
+        };
+        let Some(vm_map) = process_vm_region_map_mut(pi) else {
+            return;
+        };
+        let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
+        let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
+        *before = *vm_map;
+        *after = *before;
+        if after
+            .free(view.base, 0, nt_address_space::MEM_RELEASE)
+            .is_err()
+        {
+            return;
+        }
+        *vm_map = *after;
+        let _ = process_committed_mapping_unregister_range(pi as u64, view.base, view.size);
+        let _ = generic_sections.unmap_view(pi, view.base);
+    }
+
     /// Service a Win32 process' kernel32 CSR client connect (NtSecureConnectPort → \Windows\ApiPort).
     ///
     /// csrss owns \Windows\ApiPort and pending connects are completed by the real
     /// CsrApiRequestThread rendezvous. The broker returns the connection information authored by
     /// that worker; the executive only retains the still-outstanding LPC client-view mapping.
-    /// kernel32's BaseDllInitialize is FATAL on a failed connect and then
-    /// dereferences the shared static server data (`Peb->ReadOnlyStaticServerData[BASESRV]->
-    /// WindowsDirectory`), so this must hand back real, mapped memory:
-    ///  - `ClientView` (PORT_VIEW LpcWrite) ViewBase = a 64 KiB RW region kernel32 RtlCreateHeaps over.
-    ///  - `ConnectionInfo` (CSR_API_CONNECTINFO) SharedSectionBase/Heap, SharedStaticServerData (→ an
-    ///    array whose [BASESRV=1] slot points at a BASE_STATIC_SERVER_DATA with valid Windows dirs),
-    ///    and ServerProcessId.
-    /// Output parameters are ordinary client locals (ConnectionInfo/LpcWrite); write them through the
-    /// current hosted process address-space path so stack, heap, and demand-filled pages all work. The
-    /// backing regions are mapped into the client's own VSpace (lazily, once). Returns STATUS_SUCCESS.
+    /// The client supplies a typed anonymous section in `PORT_VIEW`; accept maps it into both client
+    /// and CSRSS. CSRSS separately maps and reports its shared read-only section through the returned
+    /// `CSR_API_CONNECTINFO`. No address or server identity is manufactured here.
     pub(crate) unsafe fn csr_client_connect(
         &mut self,
         name16: &[u16],
@@ -24845,11 +25049,6 @@ impl ExecNtHandler {
         conninfo_ptr: u64,
         conninfo_len_ptr: u64,
     ) -> u32 {
-        let ctx = match self.loop_ctx {
-            Some(c) => c,
-            None => return 0xC000_0001,
-        };
-        let pml4 = ctx.pml4;
         // (1) Connect through the broker (Pending under Manual). Authentic accept mirrors the SM path:
         // record the pending connection id + caller *PortHandle so the loop drives `csr_rendezvous`.
         // csrss's real CsrApiRequestThread must issue NtReplyWaitReceivePort →
@@ -24864,6 +25063,48 @@ impl ExecNtHandler {
             print_str(b"[csr] NtSecureConnectPort(\\Windows\\ApiPort) has no named port object -> failing\n");
             CSR_RENDEZVOUS_FAILURES.fetch_add(1, Ordering::Relaxed);
             return 0xC000_0034;
+        }
+        const SECTION_MAP_WRITE: u32 = 0x0002;
+        const SECTION_MAP_READ: u32 = 0x0004;
+        let Some(client_pid) = self.pm_pid_for_pi(self.pi) else {
+            return nt_process::STATUS_INVALID_HANDLE;
+        };
+        let mut port_view = [0u8; 0x30];
+        if clientview_ptr == 0 || !self.xas_read(clientview_ptr, &mut port_view) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if u32::from_le_bytes(port_view[0..4].try_into().unwrap()) != port_view.len() as u32 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let section_handle = u64::from_le_bytes(port_view[8..16].try_into().unwrap());
+        let Ok(section_handle) = nt_process::Handle::try_from(section_handle) else {
+            return nt_process::STATUS_INVALID_HANDLE;
+        };
+        let section_offset = u32::from_le_bytes(port_view[16..20].try_into().unwrap()) as u64;
+        let view_size = u64::from_le_bytes(port_view[24..32].try_into().unwrap());
+        let section_index = match self.pm.lookup_handle(client_pid, section_handle) {
+            Some(nt_process::HandleObject::Section(section)) => section as usize,
+            _ => return nt_process::STATUS_INVALID_HANDLE,
+        };
+        let required_access = SECTION_MAP_READ | SECTION_MAP_WRITE;
+        if self
+            .pm
+            .handle_access(client_pid, section_handle)
+            .is_none_or(|access| access & required_access != required_access)
+        {
+            return STATUS_ACCESS_DENIED;
+        }
+        if section_offset & 0xfff != 0 || view_size == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let Some(section) = self
+            .loop_ctx
+            .and_then(|ctx| (&*ctx.generic_sections).section(section_index))
+        else {
+            return nt_process::STATUS_INVALID_HANDLE;
+        };
+        if section_offset >= section.size || view_size > section.size - section_offset {
+            return STATUS_INVALID_PARAMETER;
         }
         let mut connection_info = alloc::vec::Vec::new();
         if conninfo_ptr != 0 || conninfo_len_ptr != 0 {
@@ -24901,6 +25142,10 @@ impl ExecNtHandler {
                     self.csr_rendezvous_out = porthandle_ptr;
                     self.csr_rendezvous_conn_info = conninfo_ptr;
                     self.csr_rendezvous_conn_info_len = conninfo_len_ptr;
+                    self.csr_rendezvous_client_view = clientview_ptr;
+                    self.csr_rendezvous_section = section_index as u64 + 1;
+                    self.csr_rendezvous_section_offset = section_offset;
+                    self.csr_rendezvous_view_size = view_size;
                     pending = true;
                 }
                 Ok(r) => {
@@ -24924,125 +25169,18 @@ impl ExecNtHandler {
             CSR_RENDEZVOUS_FAILURES.fetch_add(1, Ordering::Relaxed);
             return 0xC000_0001;
         }
-        // (2) Map THIS process's CSR regions once (heap view + static server data) — per-pi. GENERAL
-        // per-process plane: winlogon (pi 2), services (pi 3), and every later Win32 process each get
-        // their OWN copy of the CSR heap-view + static-server-data at the shared CSR VAs, in their OWN
-        // VSpace (`pml4`). The regions are IDENTICAL content-wise across processes (like the DLL bases),
-        // so the same VAs are reused per-VSpace; only the guard is per-pi.
-        let pibit = 1u32 << self.pi;
-        if self.csr_view_mask & pibit == 0 {
-            // One 2 MiB PT in THIS process covers both regions.
-            let wpt = alloc_slot();
-            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, wpt);
-            let _ = paging_struct_map(wpt, LBL_X86_PAGE_TABLE_MAP, WINLOGON_CSR_HEAP_VA, pml4);
-            // The exec-side fill-scratch alias PT is mapped ONCE (shared across all processes — the
-            // executive services one syscall at a time, so its frames are filled-then-copied-then-
-            // unmapped within THIS call, leaving the scratch VAs free for the next process).
-            if CSR_FILL_SCRATCH_PT.swap(1, Ordering::Relaxed) == 0 {
-                let spt = alloc_slot();
-                let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, spt);
-                let _ = paging_struct_map(
-                    spt,
-                    LBL_X86_PAGE_TABLE_MAP,
-                    WINLOGON_CSR_FILL_SCRATCH,
-                    CAP_INIT_THREAD_VSPACE,
-                );
-            }
-            // LpcWrite heap view: 16 committed RW frames (kernel32 RtlCreateHeaps over ViewBase).
-            for i in 0..16u64 {
-                let f = alloc_frame();
-                let page = WINLOGON_CSR_HEAP_VA + i * 0x1000;
-                let _ = page_map(copy_cap(f), page, RW_NX, pml4);
-                csrss_frame_put(self.pi as u64, page, f);
-            }
-            // Static server data (4 frames): fill via the exec scratch alias, then map into THIS
-            // process, then UNMAP the scratch alias so the next process reuses the same scratch VAs.
-            //   page0 +0x0000: ReadOnlyStaticServerData[4]; [1] -> BASE_STATIC_SERVER_DATA
-            //   page0 +0x0100: BASE_STATIC_SERVER_DATA (WindowsDirectory@0, WindowsSystemDirectory@0x10,
-            //                  NamedObjectDirectory@0x20 — all x64 UNICODE_STRINGs)
-            //   page3 (+0x3000 in-region): the WCHAR name buffers
-            for i in 0..4u64 {
-                let f = alloc_frame();
-                let sc = WINLOGON_CSR_FILL_SCRATCH + i * 0x1000;
-                let _ = page_map(f, sc, RW_NX, CAP_INIT_THREAD_VSPACE);
-                if i == 0 {
-                    core::ptr::write_volatile(
-                        (sc + 0x08) as *mut u64,
-                        WINLOGON_CSR_STATIC_VA + 0x0100,
-                    );
-                    let bssd = sc + 0x0100;
-                    // WindowsDirectory = L"C:\Windows" (10 wchars)
-                    core::ptr::write_volatile((bssd + 0x00) as *mut u16, 10 * 2);
-                    core::ptr::write_volatile((bssd + 0x02) as *mut u16, 11 * 2);
-                    core::ptr::write_volatile(
-                        (bssd + 0x08) as *mut u64,
-                        WINLOGON_CSR_STATIC_VA + 0x3000,
-                    );
-                    // WindowsSystemDirectory = L"C:\Windows\System32" (19 wchars)
-                    core::ptr::write_volatile((bssd + 0x10) as *mut u16, 19 * 2);
-                    core::ptr::write_volatile((bssd + 0x12) as *mut u16, 20 * 2);
-                    core::ptr::write_volatile(
-                        (bssd + 0x18) as *mut u64,
-                        WINLOGON_CSR_STATIC_VA + 0x3020,
-                    );
-                    // NamedObjectDirectory = L"\BaseNamedObjects" (17 wchars)
-                    core::ptr::write_volatile((bssd + 0x20) as *mut u16, 17 * 2);
-                    core::ptr::write_volatile((bssd + 0x22) as *mut u16, 18 * 2);
-                    core::ptr::write_volatile(
-                        (bssd + 0x28) as *mut u64,
-                        WINLOGON_CSR_STATIC_VA + 0x3060,
-                    );
-                    // BASE_STATIC_SERVER_DATA.SysInfo starts at +0x140 on x64. ReactOS kernel32
-                    // consumes PageSize and AllocationGranularity here when creating every thread
-                    // stack, so publish the same record as NtQuerySystemInformation class 0.
-                    let sysinfo = native_basic_system_information().encode();
-                    core::ptr::copy_nonoverlapping(
-                        sysinfo.as_ptr(),
-                        (bssd + 0x140) as *mut u8,
-                        sysinfo.len(),
-                    );
-                } else if i == 3 {
-                    write_wstr(sc + 0x000, "C:\\Windows");
-                    write_wstr(sc + 0x020, "C:\\Windows\\System32");
-                    write_wstr(sc + 0x060, "\\BaseNamedObjects");
-                }
-                let page = WINLOGON_CSR_STATIC_VA + i * 0x1000;
-                let _ = page_map(copy_cap(f), page, RW_NX, pml4);
-                csrss_frame_put(self.pi as u64, page, f);
-                // Release the scratch alias mapping of `f` (the target copy_cap is a distinct cap →
-                // unaffected) so the next process's fill can remap the same scratch VA.
-                let _ = page_unmap(f);
-            }
-            self.csr_view_mask |= pibit;
-            self.winlogon_csr_view = WINLOGON_CSR_HEAP_VA;
-        }
-        // (3) Fill the client PORT_VIEW (LpcWrite): ViewBase/ViewRemoteBase (delta 0 → capture pointers
-        // are client pointers, which the direct message plane reads via the mirror) + ViewSize.
-        if clientview_ptr != 0 {
-            if !self.xas_write_u64(clientview_ptr + 0x18, 0x1_0000) // ViewSize = 64 KiB
-                || !self.xas_write_u64(clientview_ptr + 0x20, WINLOGON_CSR_HEAP_VA) // ViewBase
-                || !self.xas_write_u64(clientview_ptr + 0x28, WINLOGON_CSR_HEAP_VA)
-            // ViewRemoteBase
-            {
-                return 0xC000_0005;
-            }
-        }
-        // (4) *PortHandle = &CsrApiPort (an ntdll .data global). The loop writes the real client
+        // *PortHandle = &CsrApiPort (an ntdll .data global). The loop writes the real client
         // communication-port handle after `csr_rendezvous` completes the pending connection.
-        WINLOGON_CSR_CONNECTED.store(1, Ordering::Relaxed);
-        CSR_CONNECTED_MASK.fetch_or(1u64 << self.pi, Ordering::Relaxed);
         print_str(b"[csr] pi=");
         print_u64(self.pi as u64);
         print_str(
             b" NtSecureConnectPort(\\Windows\\ApiPort) -> queued REAL CsrApiRequestThread accept; conn=",
         );
         print_u64(self.csr_rendezvous_conn);
-        print_str(b" ViewBase=0x");
-        print_hex((WINLOGON_CSR_HEAP_VA >> 32) as u32);
-        print_hex(WINLOGON_CSR_HEAP_VA as u32);
-        print_str(b" StaticData=0x");
-        print_hex((WINLOGON_CSR_STATIC_VA >> 32) as u32);
-        print_hex(WINLOGON_CSR_STATIC_VA as u32);
+        print_str(b" section=");
+        print_u64(section_index as u64);
+        print_str(b" view-size=0x");
+        print_hex(view_size as u32);
         print_str(b"\n");
         0
     }
@@ -30033,9 +30171,9 @@ impl ExecNtHandler {
             // \Windows\ApiPort, from each Win32 client's BaseDllInitialize). The SECURE variant (SecurityQos +
             // ServerSid) is CSR-only in this system: SmConnectToSm uses plain NtConnectPort(33), so 218
             // unambiguously means "a Win32 client connecting to CSR". A client's pending broker
-            // connect is completed by the real CsrApiRequestThread rendezvous; the executive fills
-            // CSR_API_CONNECTINFO (SharedSection pointers + BASE_STATIC_SERVER_DATA) and the LpcWrite
-            // PORT_VIEW because that connect payload is not carried by the isolated broker yet.
+            // connect is completed by the real CsrApiRequestThread rendezvous; the kernel maps the
+            // client-supplied PORT_VIEW section, while the broker returns CSRSS's exact connection
+            // information mutation.
             // Captured ABI args: PortHandle=args[0], PortName=args[1], SecurityQos=args[2],
             // ClientView=args[3], ServerSid=args[4], ServerView=args[5], MaxMsgLen=args[6],
             // ConnInfo=args[7], ConnInfoLen=args[8].
@@ -37488,27 +37626,12 @@ impl ExecNtHandler {
                     .or_else(|| (&*ctx.generic_sections).index_for_handle(self.pi, sect))
                 {
                     const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-                    const STATUS_INVALID_VIEW_SIZE: u32 = 0xC000_001F;
                     const PROCESS_VM_OPERATION: u32 = 0x0008;
-                    const HIGHEST_VAD_ADDRESS: u64 = 0x0000_07ff_fffd_ffff;
-                    let generic_sections = &mut *ctx.generic_sections;
-                    let Some(section) = generic_sections.section(section_index) else {
-                        return nt_fs::STATUS_INVALID_HANDLE;
-                    };
-                    let (target_pid, target_pi) =
+                    let (_target_pid, target_pi) =
                         match self.resolve_process_for_access(args[1], PROCESS_VM_OPERATION) {
                             Ok(target) => target,
                             Err(status) => return status,
                         };
-                    if self.pm.process(target_pid).is_some_and(|process| {
-                        matches!(
-                            process.state,
-                            nt_process::ProcessState::Exiting
-                                | nt_process::ProcessState::Terminated
-                        )
-                    }) {
-                        return nt_process::STATUS_PROCESS_IS_TERMINATING;
-                    }
                     let base_ptr = args[2];
                     let view_size_ptr = args[6];
                     if base_ptr == 0
@@ -37535,106 +37658,25 @@ impl ExecNtHandler {
                         }
                         section_offset = u64::from_le_bytes(word);
                     }
-                    if base_in > HIGHEST_VAD_ADDRESS
-                        || section_offset & 0xfff != 0
-                        || section_offset > section.size
-                    {
-                        return STATUS_INVALID_VIEW_SIZE;
-                    }
-                    let remaining = section.size - section_offset;
-                    let wanted = if view_size_in == 0 {
-                        remaining
-                    } else {
-                        view_size_in.min(remaining)
-                    };
-                    let Some(map_size) = wanted.checked_add(0xfff).map(|v| v & !0xfff) else {
-                        return STATUS_INVALID_VIEW_SIZE;
-                    };
-                    if map_size == 0 {
-                        return STATUS_INVALID_VIEW_SIZE;
-                    }
-                    let zero_bits = args[3];
-                    if zero_bits > 53 {
-                        return nt_address_space::STATUS_INVALID_PARAMETER_3;
-                    }
-                    let placement_limit = if base_in == 0 && zero_bits != 0 {
-                        let highest = u64::MAX >> zero_bits;
-                        if highest > HIGHEST_VAD_ADDRESS {
-                            return nt_address_space::STATUS_INVALID_PARAMETER_3;
-                        }
-                        PRIVATE_VM_LIMIT.min(highest + 1)
-                    } else {
-                        PRIVATE_VM_LIMIT
-                    };
                     let allocation_type = nt_ulong_arg(args[8]);
                     let win32_protect = nt_ulong_arg(args[9]);
-                    let view_protection = if win32_protect == 0 {
-                        section.protection
-                    } else {
-                        win32_protect
-                    };
-                    if let Err(status) = nt_address_space::validate_allocate_parameters(
-                        zero_bits,
-                        nt_address_space::MEM_RESERVE
-                            | nt_address_space::MEM_COMMIT
-                            | (allocation_type & nt_address_space::MEM_TOP_DOWN),
-                        view_protection,
-                    ) {
-                        return status;
-                    }
-                    let procs = &mut *ctx.procs;
-                    let target = procs[target_pi];
-                    if target.pml4 == 0 || target.scratch_base == 0 {
-                        return nt_process::STATUS_INVALID_HANDLE;
-                    }
-                    let Some(vm_map) = process_vm_region_map_mut(target_pi) else {
-                        return nt_process::STATUS_INVALID_HANDLE;
-                    };
-                    let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
-                    let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
-                    *before = *vm_map;
-                    let plan = match allocate_private_vad_avoiding_fixed_authorities(
-                        before,
-                        after,
+                    let (mapped_base, mapped_size) = match self.map_generic_section_view_internal(
+                        section_index,
                         target_pi,
-                        (base_in != 0).then_some(base_in),
-                        map_size,
-                        nt_address_space::MEM_RESERVE
-                            | nt_address_space::MEM_COMMIT
-                            | (allocation_type & nt_address_space::MEM_TOP_DOWN),
-                        view_protection,
-                        placement_limit,
+                        base_in,
+                        view_size_in,
+                        section_offset,
+                        args[3],
+                        allocation_type,
+                        win32_protect,
                     ) {
-                        Ok(plan) => plan,
+                        Ok(mapped) => mapped,
                         Err(status) => return status,
                     };
-                    if !generic_sections.map_view(
-                        target_pi,
-                        section_index,
-                        plan.base,
-                        plan.size,
-                        section_offset,
-                    ) {
-                        *vm_map = *before;
-                        return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
-                    }
-                    if !process_committed_mapping_register(
-                        target_pi as u64,
-                        nt_address_space::VmCommittedRange::mapped(
-                            plan.base,
-                            plan.size,
-                            view_protection,
-                        ),
-                    ) {
-                        let _ = generic_sections.unmap_view(target_pi, plan.base);
-                        *vm_map = *before;
-                        return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
-                    }
-                    *vm_map = *after;
-                    crate::note_high_water(&crate::VM_REGION_HW, after.extent_count() as u64);
-                    if !self.xas_write_u64(base_ptr, plan.base)
-                        || !self.xas_write_u64(view_size_ptr, plan.size)
+                    if !self.xas_write_u64(base_ptr, mapped_base)
+                        || !self.xas_write_u64(view_size_ptr, mapped_size)
                     {
+                        self.rollback_generic_section_view(target_pi, mapped_base);
                         return STATUS_ACCESS_VIOLATION;
                     }
                     print_str(b"[section] map generic owner-pi=");
@@ -37644,11 +37686,11 @@ impl ExecNtHandler {
                     print_str(b" handle=0x");
                     print_hex(sect as u32);
                     print_str(b" base=0x");
-                    print_hex((plan.base >> 32) as u32);
-                    print_hex(plan.base as u32);
+                    print_hex((mapped_base >> 32) as u32);
+                    print_hex(mapped_base as u32);
                     print_str(b" size=0x");
-                    print_hex((plan.size >> 32) as u32);
-                    print_hex(plan.size as u32);
+                    print_hex((mapped_size >> 32) as u32);
+                    print_hex(mapped_size as u32);
                     print_str(b" off=0x");
                     print_hex((section_offset >> 32) as u32);
                     print_hex(section_offset as u32);
@@ -37659,7 +37701,7 @@ impl ExecNtHandler {
                         0,
                         None,
                         sect,
-                        plan.base,
+                        mapped_base,
                         b"",
                     );
                     0

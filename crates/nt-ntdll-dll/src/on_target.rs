@@ -4759,11 +4759,9 @@ const SSN_NT_SECURE_CONNECT_PORT: u32 = 218;
 /// kernel32's `DllMain` reads next (`ASSERT(Peb->ReadOnlyStaticServerData)` +
 /// `BaseStaticServerData = Peb->ReadOnlyStaticServerData[BASESRV=1]`).
 ///
-/// ★ All the out-param structs are STACK locals so the executive's stack-mirror writes land (same
-/// discipline as [`nt_allocate_virtual_memory`]). We skip the real `NtCreateSection` for the CSR
-/// section (the executive owns + maps the CSR heap view at a fixed VA regardless) and pass a NULL
-/// SectionHandle + NULL SystemSid — cosmetic on the modeled accept path; faithful to the connect
-/// shape otherwise.
+/// All out-param structs are stack locals, matching ReactOS. The 64 KiB capture heap is a real
+/// anonymous section passed through `PORT_VIEW`; the kernel maps shared views into this client and
+/// CSRSS during the LPC connection transaction.
 ///
 /// # Safety
 /// On-target hosted process; issues a real syscall. `object_directory` is a NUL-terminated UTF-16
@@ -4898,10 +4896,32 @@ pub unsafe fn csr_client_connect_to_server(
         effective_only: 1,
         _pad: [0; 2],
     };
+    // SID S-1-5-18 (LocalSystem), matching ReactOS's NtSecureConnectPort server identity check.
+    let system_sid = [1u8, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+
+    let mut csr_section_handle = 0u64;
+    let mut csr_section_size = 0x1_0000u64;
+    const SEC_RESERVE: u64 = 0x0400_0000;
+    // NtCreateSection(&Section, SECTION_ALL_ACCESS, NULL, &Size, PAGE_READWRITE, SEC_RESERVE, NULL).
+    let create_status = unsafe {
+        syscall8(
+            SSN_NT_CREATE_SECTION,
+            core::ptr::addr_of_mut!(csr_section_handle) as u64,
+            SECTION_ALL_ACCESS,
+            0,
+            core::ptr::addr_of_mut!(csr_section_size) as u64,
+            PAGE_READWRITE as u64,
+            SEC_RESERVE,
+            0,
+            0,
+        )
+    };
+    if create_status != 0 {
+        CSR_CONNECTED.store(false, Ordering::Relaxed);
+        return create_status;
+    }
 
     // PORT_VIEW LpcWrite { Length, SectionHandle, SectionOffset, ViewSize, ViewBase, ViewRemoteBase }.
-    // The executive fills ViewSize@0x18 / ViewBase@0x20 / ViewRemoteBase@0x28. NULL SectionHandle (the
-    // executive maps the CSR heap view itself — we skip the real NtCreateSection).
     #[repr(C)]
     struct PortView {
         length: u32,
@@ -4916,7 +4936,7 @@ pub unsafe fn csr_client_connect_to_server(
     let mut lpc_write = PortView {
         length: 0x30,
         _pad0: 0,
-        section_handle: 0,
+        section_handle: csr_section_handle,
         section_offset: 0,
         _pad1: 0,
         view_size: 0x1_0000,
@@ -4969,7 +4989,7 @@ pub unsafe fn csr_client_connect_to_server(
     // *CsrApiPort — the returned client comm-port handle (stack local, executive writes it).
     let mut csr_api_port: u64 = 0;
 
-    // NtSecureConnectPort(&CsrApiPort, &PortName, &Qos, &LpcWrite, SystemSid=NULL, &LpcRead,
+    // NtSecureConnectPort(&CsrApiPort, &PortName, &Qos, &LpcWrite, SystemSid, &LpcRead,
     //                     MaxMessageLength=NULL, &ConnectionInfo, &ConnectionInfoLength).
     // SAFETY: all pointer args are valid stack locals; the executive services SSN 218.
     let status = unsafe {
@@ -4979,22 +4999,22 @@ pub unsafe fn csr_client_connect_to_server(
             &qos as *const SecurityQos as u64,         // a3 = SecurityQos
             &mut lpc_write as *mut PortView as u64,    // a4 = ClientView (LpcWrite)
             [
-                0,                                               // a5 = ServerSid (NULL)
-                &mut lpc_read as *mut RemotePortView as u64,     // a6 = ServerView (LpcRead)
-                0,                                               // a7 = MaxMessageLength (NULL)
+                system_sid.as_ptr() as u64, // a5 = ServerSid (LocalSystem)
+                &mut lpc_read as *mut RemotePortView as u64, // a6 = ServerView (LpcRead)
+                0,                          // a7 = MaxMessageLength (NULL)
                 &mut conn_info as *mut CsrApiConnectInfo as u64, // a8 = ConnectionInformation
-                &mut conn_info_len as *mut u32 as u64,           // a9 = ConnectionInformationLength
+                &mut conn_info_len as *mut u32 as u64, // a9 = ConnectionInformationLength
             ],
         )
     };
+    let _ = unsafe { syscall4(SSN_NT_CLOSE, csr_section_handle, 0, 0, 0) };
     if status != 0 {
+        CSR_CONNECTED.store(false, Ordering::Relaxed);
         return status;
     }
 
     // Publish ReactOS's CSR ntdll globals for later CsrClientCallServer/CsrGetProcessId calls.
-    // The executive currently maps the client and server CSR views at the same VA, so the delta is
-    // zero; keep the real formula so a non-zero remote view starts working without changing the
-    // capture-buffer conversion code.
+    // Preserve the actual client/server mapping delta for capture-buffer pointer conversion.
     unsafe {
         core::ptr::write_volatile(core::ptr::addr_of_mut!(CSR_API_PORT), csr_api_port);
         core::ptr::write_volatile(

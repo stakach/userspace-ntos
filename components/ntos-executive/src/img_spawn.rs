@@ -2147,17 +2147,6 @@ pub(crate) unsafe fn smss_stack_write16(stack_va: u64, v: u16) {
     let _ = smss_copyout(stack_va, &v.to_le_bytes());
 }
 
-/// Write an ASCII string as a NUL-terminated UTF-16LE buffer at an executive scratch VA (for building
-/// the CSR shared static server data's WCHAR name buffers before they are mapped into winlogon).
-pub(crate) unsafe fn write_wstr(exec_va: u64, s: &str) {
-    let mut off = 0u64;
-    for u in s.encode_utf16() {
-        core::ptr::write_volatile((exec_va + off) as *mut u16, u);
-        off += 2;
-    }
-    core::ptr::write_volatile((exec_va + off) as *mut u16, 0);
-}
-
 /// The file byte at image RVA `rva` (translated via the section table). For reading a faulting
 /// instruction's opcode from the mapped PE.
 pub(crate) unsafe fn pe_byte_at_rva(pe: &nt_pe_loader::PeFile, rva: u32) -> Option<u8> {
