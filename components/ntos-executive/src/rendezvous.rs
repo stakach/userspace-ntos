@@ -2485,10 +2485,6 @@ unsafe fn csr_stack_read(va: u64) -> Option<u64> {
 pub(crate) unsafe fn csr_stack_write(va: u64, v: u64) {
     let _ = csr_stack_copyout(va, &v.to_le_bytes());
 }
-/// Write a u32 to the CSR thread's stack, returning false for an invalid output pointer.
-pub(crate) unsafe fn csr_stack_write32(va: u64, v: u32) -> bool {
-    csr_stack_copyout(va, &v.to_le_bytes())
-}
 /// Write a u16 to the CSR thread's stack (for PORT_MESSAGE.Type@0x04).
 pub(crate) unsafe fn csr_stack_write16(va: u64, v: u16) {
     let _ = csr_stack_copyout(va, &v.to_le_bytes());
@@ -2575,215 +2571,6 @@ pub(crate) unsafe fn csr_thread_stack_copyout(sb: bool, va: u64, bytes: &[u8]) -
     } else {
         csr_stack_copyout(va, bytes)
     }
-}
-
-unsafe fn csr_set_thread_information_call(
-    nt_handler: &mut ExecNtHandler,
-    sb: bool,
-    tid: u64,
-    handle: u64,
-    information_class: u32,
-    information: u64,
-    information_length: u32,
-) -> u64 {
-    const STATUS_ACCESS_VIOLATION: u64 = 0xC000_0005;
-    const STATUS_DATATYPE_MISALIGNMENT: u64 = 0x8000_0002;
-    let expected = match ExecNtHandler::thread_set_length(information_class) {
-        Ok(length) => length,
-        Err(status) => return status as u64,
-    };
-    if information_length as usize != expected {
-        return nt_process::STATUS_INFO_LENGTH_MISMATCH as u64;
-    }
-    let mut value = [0u8; 0x10];
-    if expected != 0 {
-        let alignment_mask = if information_class == 38 { 7 } else { 3 };
-        if information & alignment_mask != 0 {
-            return STATUS_DATATYPE_MISALIGNMENT;
-        }
-        if !csr_thread_stack_copyin(sb, information, &mut value[..expected]) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-    }
-    let saved_pi = nt_handler.pi;
-    let saved_tid = nt_handler.current_tid;
-    nt_handler.pi = 1;
-    nt_handler.current_tid = tid;
-    let status = if information_class == 38 {
-        match nt_handler.resolve_thread_for_set(handle) {
-            Err(status) => status,
-            Ok(target) => {
-                let raw_byte_length = u16::from_le_bytes(value[..2].try_into().unwrap()) as usize;
-                let buffer = u64::from_le_bytes(value[8..16].try_into().unwrap());
-                let byte_length = if buffer == 0 { 0 } else { raw_byte_length & !1 };
-                let source_valid = if buffer == 0 || raw_byte_length == 0 {
-                    true
-                } else if buffer & 1 != 0 {
-                    false
-                } else {
-                    let mut last = [0u8; 1];
-                    buffer
-                        .checked_add(raw_byte_length as u64 - 1)
-                        .is_some_and(|address| csr_thread_stack_copyin(sb, address, &mut last))
-                };
-                if buffer != 0 && raw_byte_length != 0 && buffer & 1 != 0 {
-                    STATUS_DATATYPE_MISALIGNMENT as u32
-                } else if !source_valid {
-                    STATUS_ACCESS_VIOLATION as u32
-                } else if byte_length > nt_process::THREAD_NAME_MAX_UNITS * 2 {
-                    0xC000_009A
-                } else {
-                    let mut bytes = [0u8; nt_process::THREAD_NAME_MAX_UNITS * 2];
-                    if byte_length != 0
-                        && !csr_thread_stack_copyin(sb, buffer, &mut bytes[..byte_length])
-                    {
-                        STATUS_ACCESS_VIOLATION as u32
-                    } else {
-                        let mut name = [0u16; nt_process::THREAD_NAME_MAX_UNITS];
-                        for (index, chunk) in bytes[..byte_length].chunks_exact(2).enumerate() {
-                            name[index] = u16::from_le_bytes([chunk[0], chunk[1]]);
-                        }
-                        nt_handler.set_thread_name_resolved(target, &name[..byte_length / 2])
-                    }
-                }
-            }
-        }
-    } else {
-        nt_handler.set_thread_information_captured(
-            handle,
-            information_class,
-            u64::from_le_bytes(value[..8].try_into().unwrap()),
-        )
-    };
-    nt_handler.pi = saved_pi;
-    nt_handler.current_tid = saved_tid;
-    status as u64
-}
-
-unsafe fn csr_query_thread_call(
-    nt_handler: &mut ExecNtHandler,
-    handle: u64,
-    information_class: u32,
-    information: u64,
-    information_length: u32,
-    return_length: u64,
-) -> u64 {
-    if information_class == 38 {
-        return csr_query_thread_name_call(
-            nt_handler,
-            handle,
-            information,
-            information_length,
-            return_length,
-        );
-    }
-    const STATUS_ACCESS_VIOLATION: u64 = 0xC000_0005;
-    const STATUS_DATATYPE_MISALIGNMENT: u64 = 0x8000_0002;
-    let expected = match ExecNtHandler::thread_query_length(information_class) {
-        Ok(length) => length,
-        Err(status) => return status as u64,
-    };
-    if information_length as usize != expected {
-        return nt_process::STATUS_INFO_LENGTH_MISMATCH as u64;
-    }
-    if information != 0 {
-        if information & 3 != 0 {
-            return STATUS_DATATYPE_MISALIGNMENT;
-        }
-        let mut probe = [0u8; 0x30];
-        if !csr_stack_copyin(information, &mut probe[..expected]) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-    }
-    if return_length != 0 && !csr_stack_has_range(return_length, 4) {
-        return STATUS_ACCESS_VIOLATION;
-    }
-    let saved_pi = nt_handler.pi;
-    let saved_tid = nt_handler.current_tid;
-    nt_handler.pi = 1;
-    nt_handler.current_tid = hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
-    let mut status = match nt_handler.query_thread_information_captured(handle, information_class) {
-        Ok((output, length)) => {
-            if csr_stack_copyout(information, &output[..length]) {
-                if information_class == 0 {
-                    WL_LISTENER_TEB_QUERIED.fetch_add(1, Ordering::Relaxed);
-                }
-                0
-            } else {
-                STATUS_ACCESS_VIOLATION
-            }
-        }
-        Err(status) => status as u64,
-    };
-    if return_length != 0 && !csr_stack_copyout(return_length, &(expected as u32).to_le_bytes()) {
-        status = STATUS_ACCESS_VIOLATION;
-    }
-    nt_handler.pi = saved_pi;
-    nt_handler.current_tid = saved_tid;
-    status
-}
-
-unsafe fn csr_query_thread_name_call(
-    nt_handler: &mut ExecNtHandler,
-    handle: u64,
-    information: u64,
-    information_length: u32,
-    return_length: u64,
-) -> u64 {
-    const STATUS_ACCESS_VIOLATION: u64 = 0xC000_0005;
-    const STATUS_DATATYPE_MISALIGNMENT: u64 = 0x8000_0002;
-    const STATUS_BUFFER_TOO_SMALL: u64 = 0xC000_0023;
-    if information != 0 {
-        if information & 7 != 0 {
-            return STATUS_DATATYPE_MISALIGNMENT;
-        }
-        if !csr_stack_has_range(information, information_length as usize) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-    }
-    if return_length != 0 && !csr_stack_has_range(return_length, 4) {
-        return STATUS_ACCESS_VIOLATION;
-    }
-    let saved_pi = nt_handler.pi;
-    let saved_tid = nt_handler.current_tid;
-    nt_handler.pi = 1;
-    nt_handler.current_tid = hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
-    let mut name = [0u16; nt_process::THREAD_NAME_MAX_UNITS];
-    let query = nt_handler.query_thread_name_captured(handle, &mut name);
-    nt_handler.pi = saved_pi;
-    nt_handler.current_tid = saved_tid;
-
-    let mut required = 0u32;
-    let mut status = match query {
-        Ok(units) => {
-            required = (0x10 + units * 2) as u32;
-            if information_length < required {
-                STATUS_BUFFER_TOO_SMALL
-            } else {
-                let mut output = [0u8; 0x10 + nt_process::THREAD_NAME_MAX_UNITS * 2];
-                if units != 0 {
-                    let bytes = (units * 2) as u16;
-                    output[..2].copy_from_slice(&bytes.to_le_bytes());
-                    output[2..4].copy_from_slice(&bytes.to_le_bytes());
-                    output[8..16].copy_from_slice(&(information + 0x10).to_le_bytes());
-                    for (index, unit) in name[..units].iter().enumerate() {
-                        output[0x10 + index * 2..0x12 + index * 2]
-                            .copy_from_slice(&unit.to_le_bytes());
-                    }
-                }
-                if csr_stack_copyout(information, &output[..required as usize]) {
-                    0
-                } else {
-                    STATUS_ACCESS_VIOLATION
-                }
-            }
-        }
-        Err(status) => status as u64,
-    };
-    if return_length != 0 && !csr_stack_copyout(return_length, &required.to_le_bytes()) {
-        status = STATUS_ACCESS_VIOLATION;
-    }
-    status
 }
 
 /// Demand-fill one code/data page for the CSR API thread during the rendezvous. The page is in
@@ -3259,16 +3046,10 @@ unsafe fn csr_sb_api_request_rendezvous(
 /// (broker complete). Returns the client comm-port handle (0 on wall). After the accept reply, the
 /// worker is left to run into its next receive and the next rendezvous drains that state if needed.
 ///
-/// ★ FLAGGED RESIDUALS (host limitations, NOT the accept mechanism — the real thread runs + issues the
-/// real receive/accept syscalls): (a) THE ACCEPT DECISION — CsrApiHandleConnectionRequest's
-/// CsrLocateThreadByClientId (hash table, exact CID) finds no registered CSR_PROCESS for hosted
-/// clients yet (that needs the SM→SB→CsrSrvCreateProcess *session-registration* plane, a separate
-/// fork), so the real thread can compute AllowConnection=FALSE and pass Accept=FALSE. The executive
-/// still overrides the broker while this real decision is measured; (b) the CSR_API_CONNECTINFO reply
-/// payload + shared-section mapping into clients are still
+/// The CSR_API_CONNECTINFO reply payload + shared-section mapping into clients are still
 /// executive-modeled (in `csr_client_connect`) because the isolated LPC broker carries no message
-/// payload across the connect. (The marshaled connection-request ClientId is now cosmetic for hosted
-/// clients until CSR process registration lands.)
+/// payload across the connect. The accept decision itself is owned by the real CSR worker and is
+/// passed unchanged to the broker.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn csr_rendezvous(
     conn_id: u64,
@@ -3282,7 +3063,6 @@ pub(crate) unsafe fn csr_rendezvous(
     dll_pes: &[Option<nt_pe_loader::PeFile>],
     nt_handler: &mut ExecNtHandler,
 ) -> u64 {
-    const SSN_SET_EVENT: u64 = 228;
     const SSN_MAP_VIEW: u64 = 113;
     const SSN_REPLY_WAIT_RECV: u64 = 203;
     const SSN_ACCEPT_CONNECT: u64 = 0;
@@ -3293,6 +3073,7 @@ pub(crate) unsafe fn csr_rendezvous(
         return 0;
     }
     let mut client_handle = 0u64;
+    let mut server_client_pid = 0u32;
     let mut fill_idx = 0u64;
     let mut guard = 0u64;
     let (_b, mut mi, mut m0, mut m1, mut m2, mut m3) =
@@ -3307,6 +3088,7 @@ pub(crate) unsafe fn csr_rendezvous(
                 CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
                 return 0;
             }
+            server_client_pid = r.client_process as u32;
             CSR_MSGS.fetch_add(1, Ordering::Relaxed);
             csr_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST);
             csr_stack_write(recvmsg + 0x08, r.client_process);
@@ -3409,178 +3191,92 @@ pub(crate) unsafe fn csr_rendezvous(
             let sp = get_recv_mr(16);
             let rdx = m3;
             let mut result = 0u64;
-            match ssn {
-                SSN_SET_EVENT => {
-                    let event_handle = get_recv_mr(9); // R10
-                    print_str(b"[csr-rdv] real NtSetEvent handle=0x");
-                    print_hex(event_handle as u32);
-                    print_str(b"\n");
-                    if rdx != 0
-                        && (rdx & 3 != 0
-                            || rdx < CSR_STACK_BASE
-                            || rdx > CSR_STACK_BASE + CSR_STACK_FRAMES * 0x1000 - 4)
-                    {
-                        result = if rdx & 3 != 0 {
-                            0x8000_0002
-                        } else {
-                            0xC000_0005
-                        };
-                    } else {
-                        let saved_pi = nt_handler.pi;
-                        nt_handler.pi = 1;
-                        result = match nt_handler
-                            .event_index_for_handle(event_handle, EVENT_MODIFY_STATE)
-                        {
-                            Ok(index) => match nt_handler.events.set_existing(index as u64) {
-                                Some(previous) => {
-                                    if rdx != 0 {
-                                        let _ = csr_stack_write32(rdx, previous as u32);
-                                    }
-                                    if !previous {
-                                        wait_wake_dispatcher_set(nt_handler);
-                                    }
-                                    0
-                                }
-                                None => 0xC000_0008, // STATUS_INVALID_HANDLE
-                            },
-                            Err(status) => status as u64,
-                        };
-                        nt_handler.pi = saved_pi;
-                    }
-                }
-                SSN_NT_PROTECT_VM => {
-                    let stack_arg4 = sp
-                        .checked_add(0x28)
-                        .and_then(|address| csr_stack_read(address));
-                    result = match stack_arg4 {
-                        Some(old_protect) => {
-                            let protect_args = [
-                                get_recv_mr(9),
-                                rdx,
-                                get_recv_mr(7),
-                                get_recv_mr(8),
-                                old_protect,
-                            ];
-                            let saved_pi = nt_handler.pi;
-                            let saved_tid = nt_handler.current_tid;
-                            nt_handler.pi = 1;
-                            nt_handler.current_tid =
-                                hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
-                            let status = nt_handler.nt_protect_virtual_memory_with_user_memory(
-                                &protect_args,
-                                SyscallUserMemory::CsrProcess { sb: false },
-                            );
-                            nt_handler.pi = saved_pi;
-                            nt_handler.current_tid = saved_tid;
-                            print_str(
-                                b"[csr-rdv] serviced worker NtProtectVirtualMemory status=0x",
-                            );
-                            print_hex(status);
-                            print_str(b"\n");
-                            status as u64
-                        }
-                        None => 0xC000_0005,
-                    };
-                }
-                SSN_NT_SET_INFO_THREAD => {
-                    result = csr_set_thread_information_call(
-                        nt_handler,
-                        false,
-                        hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi),
-                        get_recv_mr(9),
-                        rdx as u32,
-                        get_recv_mr(7),
-                        get_recv_mr(8) as u32,
-                    );
-                }
-                SSN_NT_QUERY_INFORMATION_THREAD => {
-                    result = match sp
-                        .checked_add(0x28)
-                        .and_then(|address| csr_stack_read(address))
-                    {
-                        Some(return_length) => csr_query_thread_call(
-                            nt_handler,
-                            get_recv_mr(9),
-                            rdx as u32,
-                            get_recv_mr(7),
-                            get_recv_mr(8) as u32,
-                            return_length,
-                        ),
-                        None => 0xC000_0005,
-                    };
-                }
-                SSN_MAP_VIEW => {} // NtMapViewOfSection (CSR shared section into CsrRootProcess) — success
-                SSN_REPLY_WAIT_RECV => {
-                    let recvmsg = get_recv_mr(8); // R9 = &ReceiveMsg.Header
-                    let port = get_recv_mr(9); // R10 = CsrApiPort handle
-                    let got = lpc_client().and_then(|c| c.reply_wait_receive(port).ok());
-                    match got {
-                        Some(r) if r.connection_id != 0 => {
-                            // The REAL CsrApiRequestThread received a live CSR API message off
-                            // \Windows\ApiPort (an LPC_CONNECTION_REQUEST from winlogon's kernel32 CSR
-                            // client). This is genuine winlogon↔csrss CSR message-plane traffic on the
-                            // real path (NtReplyWaitReceivePort returning a real connection) — count it.
-                            CSR_MSGS.fetch_add(1, Ordering::Relaxed);
-                            csr_stack_write16(
-                                recvmsg + 0x04,
-                                nt_lpc_client::LPC_CONNECTION_REQUEST,
-                            );
-                            csr_stack_write(recvmsg + 0x08, r.client_process);
-                            csr_stack_write(recvmsg + 0x10, r.client_thread);
-                        }
-                        _ => {
-                            // No pending connection (the re-park receive): leave the thread PARKED.
-                            CSR_API_RECVMSG.store(recvmsg, Ordering::Relaxed);
-                            CSR_API_RECVPORT.store(port, Ordering::Relaxed);
-                            CSR_API_RECV_RDX.store(rdx, Ordering::Relaxed);
-                            CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
-                            print_str(b"[csr-rdv] real API worker parked on NtReplyWaitReceivePort port=0x");
-                            print_hex(port as u32);
-                            print_str(b"\n");
-                            break;
+            if let Some(dispatched) = dispatch_hosted_server_native_service(
+                nt_handler,
+                HostedServerWorker::CsrApi,
+                server_client_pid,
+                ssn,
+                m2,
+                sp,
+                get_recv_mr(9),
+                rdx,
+                get_recv_mr(7),
+                get_recv_mr(8),
+            ) {
+                result = dispatched.status;
+                print_str(b"[csr-rdv] dispatched worker ");
+                print_str(dispatched.service.name().as_bytes());
+                print_str(b" status=0x");
+                print_hex(result as u32);
+                print_str(b"\n");
+            } else {
+                match ssn {
+                    SSN_MAP_VIEW => {} // NtMapViewOfSection (CSR shared section into CsrRootProcess) — success
+                    SSN_REPLY_WAIT_RECV => {
+                        let recvmsg = get_recv_mr(8); // R9 = &ReceiveMsg.Header
+                        let port = get_recv_mr(9); // R10 = CsrApiPort handle
+                        let got = lpc_client().and_then(|c| c.reply_wait_receive(port).ok());
+                        match got {
+                            Some(r) if r.connection_id != 0 => {
+                                // The REAL CsrApiRequestThread received a live CSR API message off
+                                // \Windows\ApiPort (an LPC_CONNECTION_REQUEST from winlogon's kernel32 CSR
+                                // client). This is genuine winlogon↔csrss CSR message-plane traffic on the
+                                // real path (NtReplyWaitReceivePort returning a real connection) — count it.
+                                CSR_MSGS.fetch_add(1, Ordering::Relaxed);
+                                server_client_pid = r.client_process as u32;
+                                csr_stack_write16(
+                                    recvmsg + 0x04,
+                                    nt_lpc_client::LPC_CONNECTION_REQUEST,
+                                );
+                                csr_stack_write(recvmsg + 0x08, r.client_process);
+                                csr_stack_write(recvmsg + 0x10, r.client_thread);
+                            }
+                            _ => {
+                                // No pending connection (the re-park receive): leave the thread PARKED.
+                                CSR_API_RECVMSG.store(recvmsg, Ordering::Relaxed);
+                                CSR_API_RECVPORT.store(port, Ordering::Relaxed);
+                                CSR_API_RECV_RDX.store(rdx, Ordering::Relaxed);
+                                CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+                                print_str(b"[csr-rdv] real API worker parked on NtReplyWaitReceivePort port=0x");
+                                print_hex(port as u32);
+                                print_str(b"\n");
+                                break;
+                            }
                         }
                     }
-                }
-                SSN_ACCEPT_CONNECT => {
-                    // The REAL CsrApiHandleConnectionRequest reached NtAcceptConnectPort. Hosted
-                    // clients are not registered CSR_PROCESSes yet, so ReactOS may pass Accept=FALSE
-                    // and skip NtCompleteConnectPort. Force the broker accept+complete here and return
-                    // the completed client comm-port handle to the blocked client.
-                    let porthandle_out = get_recv_mr(9); // R10 = *ServerPort
-                    let requested_accept = get_recv_mr(8) != 0;
-                    print_str(b"[csr-rdv] real NtAcceptConnectPort accept=");
-                    print_u64(requested_accept as u64);
-                    print_str(b" connector-pid=");
-                    print_u64(csr_stack_read(get_recv_mr(7) + 8).unwrap_or(0));
-                    print_str(b" connector-tid=");
-                    print_u64(csr_stack_read(get_recv_mr(7) + 16).unwrap_or(0));
-                    print_str(b"\n");
-                    let sh = lpc_client()
-                        .and_then(|c| c.accept_connect(conn_id, true, rdx).ok())
-                        .unwrap_or(0);
-                    csr_stack_write(porthandle_out, sh);
-                    if client_handle == 0 {
-                        if let Some((ch, _)) =
-                            lpc_client().and_then(|c| c.complete_connect(conn_id).ok())
-                        {
-                            client_handle = ch;
+                    SSN_ACCEPT_CONNECT => {
+                        // The real CsrApiHandleConnectionRequest owns the accept decision. Preserve it
+                        // exactly; a rejected connection is not completed and cannot receive a server
+                        // communication handle.
+                        let porthandle_out = get_recv_mr(9); // R10 = *ServerPort
+                        let requested_accept = get_recv_mr(8) != 0;
+                        print_str(b"[csr-rdv] real NtAcceptConnectPort accept=");
+                        print_u64(requested_accept as u64);
+                        print_str(b" connector-pid=");
+                        print_u64(csr_stack_read(get_recv_mr(7) + 8).unwrap_or(0));
+                        print_str(b" connector-tid=");
+                        print_u64(csr_stack_read(get_recv_mr(7) + 16).unwrap_or(0));
+                        print_str(b"\n");
+                        let sh = lpc_client()
+                            .and_then(|c| c.accept_connect(conn_id, requested_accept, rdx).ok())
+                            .unwrap_or(0);
+                        csr_stack_write(porthandle_out, sh);
+                    }
+                    SSN_COMPLETE_CONNECT => {
+                        if client_handle == 0 {
+                            if let Some((ch, _)) =
+                                lpc_client().and_then(|c| c.complete_connect(conn_id).ok())
+                            {
+                                client_handle = ch;
+                            }
                         }
                     }
-                }
-                SSN_COMPLETE_CONNECT => {
-                    if client_handle == 0 {
-                        if let Some((ch, _)) =
-                            lpc_client().and_then(|c| c.complete_connect(conn_id).ok())
-                        {
-                            client_handle = ch;
-                        }
+                    _ => {
+                        print_str(b"[csr-rdv] WALL: unsupported accept-path SSN=");
+                        print_u64(ssn);
+                        print_str(b"\n");
+                        break;
                     }
-                }
-                _ => {
-                    print_str(b"[csr-rdv] WALL: unsupported accept-path SSN=");
-                    print_u64(ssn);
-                    print_str(b"\n");
-                    break;
                 }
             }
             reply_native_rendezvous(reply, result);

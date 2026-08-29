@@ -14228,7 +14228,7 @@ impl ExecNtHandler {
         update.map_or_else(|status| status, |()| 0)
     }
 
-    pub(crate) fn resolve_thread_for_set(&self, handle: u64) -> Result<nt_process::ThreadId, u32> {
+    fn resolve_thread_for_set(&self, handle: u64) -> Result<nt_process::ThreadId, u32> {
         const THREAD_SET_INFORMATION: u32 = 0x0020;
         let caller = self
             .pm_pid_for_pi(self.pi)
@@ -14239,16 +14239,6 @@ impl ExecNtHandler {
             handle,
             THREAD_SET_INFORMATION,
         )
-    }
-
-    pub(crate) fn set_thread_name_resolved(
-        &mut self,
-        tid: nt_process::ThreadId,
-        name: &[u16],
-    ) -> u32 {
-        self.pm
-            .set_thread_name(tid, name)
-            .map_or_else(|status| status, |()| 0)
     }
 
     unsafe fn nt_set_thread_name(
