@@ -1073,8 +1073,8 @@ pub const SSN_NT_REQUEST_WAIT_REPLY_PORT: u64 = 208;
 pub const SSN_NT_REPLY_PORT: u64 = 202;
 /// NtRegisterThreadTerminatePort attaches one referenced LPC port to the current ETHREAD.
 pub const SSN_NT_REGISTER_THREAD_TERMINATE_PORT: u64 = 195;
-/// NtReplyWaitReceivePort — the LPC SERVER receive. lsass' real `AuthPortThreadRoutine` blocks here on
-/// `\LsaAuthenticationPort`; the LSA rendezvous parks it wakeably and resumes it with a real message.
+/// NtReplyWaitReceivePort — the LPC server receive. lsass' real `AuthPortThreadRoutine` blocks here on
+/// `\LsaAuthenticationPort`; the typed continuation resumes it with the broker-authored message.
 pub const SSN_NT_REPLY_WAIT_RECEIVE_PORT: u64 = 203;
 pub const SSN_NT_CREATE_SECTION: u64 = 52;
 /// NtOpenSection — CsrServerInitialization opens named sections (NLS, \KnownDlls\*, CSR shared mem).
@@ -4312,7 +4312,7 @@ unsafe fn check_logon_dialog_gates(passed: &mut u64) {
     lsa_authentication_port_specs(passed);
 }
 
-/// ═══ `\LsaAuthenticationPort` RENDEZVOUS specs ══════════════════════════════════════════════════
+/// ═══ `\LsaAuthenticationPort` transport specs ═══════════════════════════════════════════════════
 ///
 /// Every value below is produced by REAL code running on the real paths: lsass' own `NtCreatePort`,
 /// its `AuthPortThreadRoutine` genuinely blocked in `NtReplyWaitReceivePort`, its
@@ -7061,9 +7061,8 @@ static SCM_WORKER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// `NtCreateNamedPipeFile(\samr)` — samsrv publishes its own RPC endpoint. The real LSA server now
 /// runs the WHOLE `LsapLogonUser` -> MSV1_0 -> `SamValidateNormalUser` chain.
 ///
-/// **The next wall is `NtCreateToken` (SSN 57)**, which the executive does not service: the LSA
-/// server thread walls there and `lsa_release_client_on_server_wall` releases winlogon with
-/// `STATUS_UNSUCCESSFUL`, which msgina reports as the real `LsaLogonUser failed (Status 0xc0000001)`.
+/// **The historical next wall was `NtCreateToken` (SSN 57)**. At that checkpoint the LSA server
+/// returned `STATUS_UNSUCCESSFUL`, which msgina reported as a real `LsaLogonUser` failure.
 /// **Nothing is fabricated**: `Administrator` is not validated, no token is minted, and
 /// `WLX_SAS_ACTION_LOGON` is not returned.
 pub(crate) const LSA_WORKER_ROUTE_ENABLED: bool = true;
@@ -21735,10 +21734,6 @@ struct ExecNtHandler {
     /// loop after dispatch. The handler owns NT policy (ETHREAD, TEB, handles, ClientId copyout);
     /// the loop owns seL4 TCB construction because it holds the target VSpace + fault endpoint.
     thread_spawn_request: Option<HostedThreadSpawnRequest>,
-    /// Pending legacy LSA connect handed to the LSA-owned accept path. Generic SM/SB connections use
-    /// typed continuations and unrelated ports are never redirected to an image-specific acceptor.
-    lsa_connect_conn: u64,
-    lsa_connect_out: u64,
     /// Allocation-reserved generic LPC receive that the service loop must bind to the current reply
     /// object. The durable wait moves into `LPC_RECEIVE_WAITS`; no scalar state survives dispatch.
     lpc_receive_park: Option<PendingLpcReceivePark>,
@@ -23022,6 +23017,8 @@ pub(crate) struct HostedThreadRuntime {
     teb_alias: u64,
     user_stack_allocation_base: u64,
     user_stack_base: u64,
+    /// Broker port handle that delivered the server thread's current LPC message.
+    lpc_server_port: u64,
     lpc_client_process: u32,
 }
 
@@ -23037,6 +23034,7 @@ impl HostedThreadRuntime {
             teb_alias: 0,
             user_stack_allocation_base: 0,
             user_stack_base: 0,
+            lpc_server_port: 0,
             lpc_client_process: 0,
         }
     }
@@ -23132,6 +23130,7 @@ impl HostedThreadRuntimeTable {
             teb_alias: 0,
             user_stack_allocation_base: 0,
             user_stack_base: 0,
+            lpc_server_port: 0,
             lpc_client_process: 0,
         };
         if let Some(existing) = self.entries.iter_mut().find(|entry| entry.tid == tid) {
@@ -23139,6 +23138,7 @@ impl HostedThreadRuntimeTable {
             runtime.teb_alias = existing.teb_alias;
             runtime.user_stack_allocation_base = existing.user_stack_allocation_base;
             runtime.user_stack_base = existing.user_stack_base;
+            runtime.lpc_server_port = existing.lpc_server_port;
             runtime.lpc_client_process = existing.lpc_client_process;
             *existing = runtime;
             return Some(runtime);
@@ -23259,7 +23259,7 @@ impl HostedThreadRuntimeTable {
             .find(|entry| entry.is_live() && entry.badge == badge)
     }
 
-    fn set_lpc_client_process(&mut self, badge: u64, process: u32) -> bool {
+    fn set_lpc_server_context(&mut self, badge: u64, port: u64, process: u32) -> bool {
         let Some(entry) = self
             .entries
             .iter_mut()
@@ -23267,6 +23267,7 @@ impl HostedThreadRuntimeTable {
         else {
             return false;
         };
+        entry.lpc_server_port = port;
         entry.lpc_client_process = process;
         true
     }
@@ -23332,9 +23333,9 @@ impl HostedThreadRuntimes {
         unsafe { (&mut *self.table).reserve(pi, tid, badge, role) }
     }
 
-    fn set_lpc_client_process(&mut self, badge: u64, process: u32) -> bool {
+    fn set_lpc_server_context(&mut self, badge: u64, port: u64, process: u32) -> bool {
         // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).set_lpc_client_process(badge, process) }
+        unsafe { (&mut *self.table).set_lpc_server_context(badge, port, process) }
     }
 
     fn get_by_tid(&self, tid: u64) -> Option<HostedThreadRuntime> {
@@ -24927,36 +24928,21 @@ static LSASS_SRM_CONNECTED: AtomicU64 = AtomicU64::new(0);
 /// Diagnostic proof only: set after `\SeRmCommandPort` is registered as an object-manager LPC port.
 /// Runtime routing resolves the handle from `ExecNtHandler::obj_ns`, not from this cell.
 static SRM_COMMAND_PORT_OBJECT_HANDLE: AtomicU64 = AtomicU64::new(0);
-// ═══ `\LsaAuthenticationPort` RENDEZVOUS ══════════════════════════════════════════════════════
-// The remaining image-specific LPC rendezvous. SM, SB, and CSR now use generic typed
-// continuations. Here the server is lsass' REAL `AuthPortThreadRoutine`
-// (`references/reactos/dll/win32/lsasrv/authport.c:227`), which runs in the N-threads multiplex on
-// the MAIN fault endpoint. The LSA rendezvous is driven by the main service loop: the server thread
-// genuinely BLOCKS in
-// `NtReplyWaitReceivePort` with its reply capability retained, the connecting/ requesting client
-// genuinely BLOCKS in `NtConnectPort`/`NtRequestWaitReplyPort`, and each side is woken by the other's
-// real progress. Nothing about the accept decision, the port handles or the reply payload is modelled.
 /// Diagnostic proof only: set after LSASS' `NtCreatePort(\LsaAuthenticationPort)` registers the
 /// broker listen handle as an object-manager LPC port. Runtime routing resolves `obj_ns`.
 pub(crate) static LSA_AUTH_PORT_OBJECT_HANDLE: AtomicU64 = AtomicU64::new(0);
-/// The broker connection id currently being accepted by the real server (0 = none in flight).
-pub(crate) static LSA_PENDING_CONN: AtomicU64 = AtomicU64::new(0);
-/// `PortContext` the real `NtAcceptConnectPort` passed (its `LSAP_LOGON_CONTEXT`), replayed to the
-/// server as the `*PortContext` out-param of every later `NtReplyWaitReceivePort`.
-pub(crate) static LSA_PORT_CONTEXT: AtomicU64 = AtomicU64::new(0);
 /// The server's OWN accept decision: 0 = none yet, 1 = REFUSED (Accept=FALSE), 2 = ACCEPTED.
 pub(crate) static LSA_ACCEPT_DECISION: AtomicU64 = AtomicU64::new(0);
-/// Handshake from the handler to the loop: 1 = `NtCompleteConnectPort` succeeded (wake the connector
-/// with SUCCESS + the client handle), 2 = the connection was refused/failed (wake it with the error).
-pub(crate) static LSA_COMPLETE_PENDING: AtomicU64 = AtomicU64::new(0);
-/// The client comm-port handle the broker produced for winlogon's LSA connection.
-pub(crate) static LSA_CLIENT_HANDLE: AtomicU64 = AtomicU64::new(0);
 /// Proof counters (read by the gate specs).
 pub(crate) static LSA_SERVER_PARKS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LSA_CONNECT_DELIVERED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LSA_CONNECT_COMPLETED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LSA_REQUESTS_DELIVERED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LSA_REPLIES_DELIVERED: AtomicU64 = AtomicU64::new(0);
+/// Bounded trace counter for native services executed while a worker owns an authentication-port
+/// request, and the first unsupported service observed in that state.
+pub(crate) static LSA_SRV_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LSA_SERVER_WALL_SSN: AtomicU64 = AtomicU64::new(u64::MAX);
 /// The LSA `ApiNumber` of the last request the real server received (see `LSA_API_NUMBER`).
 pub(crate) static LSA_LAST_API_NUMBER: AtomicU64 = AtomicU64::new(u64::MAX);
 /// `LSA_API_MSG.Status` the real server put in its reply to `LSASS_REQUEST_LOOKUP_AUTHENTICATION_PACKAGE`

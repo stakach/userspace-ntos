@@ -3112,8 +3112,6 @@ impl ExecNtHandler {
         write_field!(pnp_event_cursor, 0);
         write_field!(pnp_notify_event, 0);
         write_field!(pnp_status, PnpRuntimeStatusTable::new());
-        write_field!(lsa_connect_conn, 0);
-        write_field!(lsa_connect_out, 0);
         write_field!(lpc_receive_park, None);
         write_field!(lpc_connect_park, None);
         write_field!(lpc_connect_completion, None);
@@ -8634,11 +8632,22 @@ impl ExecNtHandler {
             .unwrap_or(0)
     }
 
-    fn set_current_thread_lpc_client_process(&mut self, process: u64) {
+    pub(crate) fn hosted_thread_lpc_server_port(&self, badge: u64) -> u64 {
+        self.thread_runtime
+            .get_by_badge(badge)
+            .map(|runtime| runtime.lpc_server_port)
+            .unwrap_or(0)
+    }
+
+    fn current_thread_lpc_server_port(&self) -> u64 {
+        self.hosted_thread_lpc_server_port(self.current_badge)
+    }
+
+    fn set_current_thread_lpc_server_context(&mut self, port: u64, process: u64) {
         let process = u32::try_from(process).unwrap_or(0);
         let _ = self
             .thread_runtime
-            .set_lpc_client_process(self.current_badge, process);
+            .set_lpc_server_context(self.current_badge, port, process);
         self.current_server_client_pid = process;
     }
 
@@ -24303,8 +24312,7 @@ impl ExecNtHandler {
     }
 
     /// Cache a connection whose server-side accept completed while another hosted process was
-    /// running. Manual LSA/CSR rendezvous paths finish in the server thread, but the client comm-port
-    /// handle still belongs to the original connector process.
+    /// running. The client communication-port handle still belongs to the original connector.
     pub(crate) fn cache_lpc_connection_for_pi(
         &mut self,
         connection_id: u64,
@@ -24994,6 +25002,7 @@ impl ExecNtHandler {
         match lpc.reply_port(args[0], &message) {
             Ok(()) => {
                 self.lpc_endpoint_progress = true;
+                self.set_current_thread_lpc_server_context(0, 0);
                 nt_syscall::STATUS_SUCCESS
             }
             Err(status) => status.raw() as u32,
@@ -25053,13 +25062,15 @@ impl ExecNtHandler {
                 return Err(STATUS_ACCESS_VIOLATION);
             }
         }
-        self.set_current_thread_lpc_client_process(
+        self.set_current_thread_lpc_server_context(
+            request.port_handle,
             (received.msg_type == nt_lpc_abi::msg_type::LPC_REQUEST)
                 .then_some(received.client_process)
                 .unwrap_or(0),
         );
-        let is_csr_api_port = lpc_client()
-            .and_then(|lpc| lpc.query_handle(request.port_handle).ok())
+        let server_port = lpc_client().and_then(|lpc| lpc.query_handle(request.port_handle).ok());
+        let is_csr_api_port = server_port
+            .as_ref()
             .is_some_and(|port| lpc_name_is(&port.name, b"\\windows\\apiport"));
         if is_csr_api_port {
             CSR_MSGS.fetch_add(1, Ordering::Relaxed);
@@ -25070,6 +25081,38 @@ impl ExecNtHandler {
                     |pending| Some(pending.saturating_sub(1)),
                 );
                 CSR_KERNEL_MESSAGES_DELIVERED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let is_lsa_auth_port = server_port
+            .as_ref()
+            .is_some_and(|port| lpc_name_is(&port.name, b"\\lsaauthenticationport"));
+        if is_lsa_auth_port {
+            if received.msg_type == nt_lpc_abi::msg_type::LPC_CONNECTION_REQUEST {
+                LSA_CONNECT_DELIVERED.fetch_add(1, Ordering::Relaxed);
+                if u32::try_from(received.client_process)
+                    .ok()
+                    .and_then(|pid| self.pi_for_pid(pid))
+                    .is_some_and(|client_pi| {
+                        self.hosted_process_role(client_pi)
+                            == Some(nt_exe_image::HostedProcessRole::InteractiveLogon)
+                    })
+                {
+                    WINLOGON_CRED_LSA_CONNECT.store(1, Ordering::Relaxed);
+                }
+            } else if received.msg_type == nt_lpc_abi::msg_type::LPC_REQUEST
+                && bytes.len() >= PORT_MESSAGE_HEADER_LEN + 4
+            {
+                let api_number = u32::from_le_bytes(
+                    bytes[PORT_MESSAGE_HEADER_LEN..PORT_MESSAGE_HEADER_LEN + 4]
+                        .try_into()
+                        .unwrap(),
+                ) as u64;
+                LSA_REQUESTS_DELIVERED.fetch_add(1, Ordering::Relaxed);
+                LSA_LAST_API_NUMBER.store(api_number, Ordering::Relaxed);
+                LSA_LOGON_IN_FLIGHT.store(u64::from(api_number == 2), Ordering::Relaxed);
+                if api_number < 64 {
+                    LSA_API_MASK.fetch_or(1u64 << api_number, Ordering::Relaxed);
+                }
             }
         }
         Ok(())
@@ -25207,7 +25250,7 @@ impl ExecNtHandler {
             Err(status) if status.raw() as u32 == STATUS_PENDING => {
                 self.lpc_endpoint_progress |= !reply.is_empty();
                 if !reply.is_empty() {
-                    self.set_current_thread_lpc_client_process(0);
+                    self.set_current_thread_lpc_server_context(0, 0);
                 }
                 self.lpc_receive_park = Some(PendingLpcReceivePark {
                     reservation,
@@ -30604,7 +30647,8 @@ impl ExecNtHandler {
                     Err(status) => return status,
                 }
                 self.queue_write(args[0], handle);
-                // ★ LSA RENDEZVOUS (identify the server port). lsass' lsasrv `StartAuthenticationPort`
+                // Record the authentication port identity for the acceptance proof. lsass' lsasrv
+                // `StartAuthenticationPort`
                 // (`references/reactos/dll/win32/lsasrv/authport.c:364`) creates `\LsaAuthenticationPort`
                 // and hands the handle to its `AuthPortThreadRoutine`, which then blocks in
                 // `NtReplyWaitReceivePort(AuthPortHandle, …)`. The loop recognizes that handle by
@@ -30618,7 +30662,7 @@ impl ExecNtHandler {
                             .any(|w| w == b"lsaauthenticationport")
                     {
                         LSA_AUTH_PORT_OBJECT_HANDLE.store(handle, Ordering::Relaxed);
-                        print_str(b"[lsa-rdv] lsass NtCreatePort(\\LsaAuthenticationPort) -> broker port handle=0x");
+                        print_str(b"[lsa-port] lsass NtCreatePort(\\LsaAuthenticationPort) -> broker port handle=0x");
                         print_hex((handle >> 32) as u32);
                         print_hex(handle as u32);
                         print_str(b"\n");
@@ -30964,36 +31008,14 @@ impl ExecNtHandler {
                 )
             },
             // NtRequestWaitReplyPort(PortHandle=R10, RequestMessage=RDX, ReplyMessage=R8) — the LPC
-            // message DATA plane. SM requests are driven through ordinary real SmpApiLoop workers. CSR API
-            // requests now use the same shape when csrss's CsrApiRequestThread is parked on
-            // \Windows\ApiPort. If the real worker is unavailable, fail visibly instead of writing a
-            // modeled CSR success reply.
+            // message data plane. Every connected user-mode LPC port uses the same broker-authored
+            // message identity and typed request continuation. The kernel-owned SRM command port is
+            // the sole local service endpoint.
             NativeService::NtRequestWaitReplyPort => unsafe {
-                if self.current_process_is_smss()
-                    && self.lpc_connection_is(args[0], 0, b"\\smapiport")
-                {
-                    print_str(
-                        b"[lpc-request-wait] routing \\SmApiPort through typed continuation\n",
-                    );
-                    return self.lpc_request_wait_or_park(args[0], args[1], args[2]);
-                }
-                if self.current_process_is_smss()
-                    && self.lpc_connection_is(args[0], 0, b"\\windows\\sbapiport")
-                {
-                    print_str(b"[lpc-request-wait] routing \\Windows\\SbApiPort through typed continuation\n");
-                    return self.lpc_request_wait_or_park(args[0], args[1], args[2]);
-                }
-                if self.lpc_connection_is(args[0], self.pi, b"\\windows\\apiport") {
-                    print_str(
-                        b"[lpc-request-wait] routing \\Windows\\ApiPort through typed continuation\n",
-                    );
-                    return self.lpc_request_wait_or_park(args[0], args[1], args[2]);
-                }
                 if self.lpc_connection_is(args[0], self.pi, b"\\sermcommandport") {
                     return self.service_srm_request_reply(args[0], args[1], args[2]);
                 }
-                print_str(b"[lpc-msg] NtRequestWaitReplyPort on an unregistered LPC connection -> failing\n");
-                0xC000_0008 // STATUS_INVALID_HANDLE
+                self.lpc_request_wait_or_park(args[0], args[1], args[2])
             },
             NativeService::NtReplyPort => unsafe {
                 self.nt_reply_port_with_user_memory(args, SyscallUserMemory::CurrentProcess)
@@ -31103,16 +31125,10 @@ impl ExecNtHandler {
                         security,
                     );
                 }
-                let use_legacy_lsa_connect =
-                    Self::lpc_name_equals_ascii(&name16, b"\\lsaauthenticationport");
-                let use_generic_connect_wait = !use_legacy_lsa_connect;
-                let connect_reservation = if use_generic_connect_wait {
-                    match crate::service_sec_image::lpc_connect_wait_reserve() {
-                        Ok(reservation) => Some(reservation),
-                        Err(status) => return status,
-                    }
-                } else {
-                    None
+                let connect_reservation = match crate::service_sec_image::lpc_connect_wait_reserve()
+                {
+                    Ok(reservation) => reservation,
+                    Err(status) => return status,
                 };
                 let client_process = self.pm_pid_for_pi(self.pi).unwrap_or(0) as u64;
                 let client_thread = self.current_tid;
@@ -31130,11 +31146,9 @@ impl ExecNtHandler {
                 }) {
                     Some(Ok(r)) => {
                         if !r.pending && r.handle != 0 {
-                            if let Some(reservation) = connect_reservation {
-                                crate::service_sec_image::lpc_connect_wait_cancel_reservation(
-                                    reservation,
-                                );
-                            }
+                            crate::service_sec_image::lpc_connect_wait_cancel_reservation(
+                                connect_reservation,
+                            );
                             if connector_view.is_some() || connector_remote_view.is_some() {
                                 if let Some(client) = lpc_client() {
                                     let _ = client.close_port(r.handle);
@@ -31156,41 +31170,34 @@ impl ExecNtHandler {
                                 connector_view,
                                 connector_remote_view,
                             ) {
-                                if let Some(reservation) = connect_reservation {
-                                    crate::service_sec_image::lpc_connect_wait_cancel_reservation(
-                                        reservation,
-                                    );
-                                }
+                                crate::service_sec_image::lpc_connect_wait_cancel_reservation(
+                                    connect_reservation,
+                                );
                                 if let Some(client) = lpc_client() {
                                     let _ = client.accept_connect(r.connection_id, false, 0);
                                 }
                                 return status;
                             }
-                            if let Some(reservation) = connect_reservation {
-                                let mut name = [0u16; 32];
-                                let name_len = name16.len().min(name.len());
-                                name[..name_len].copy_from_slice(&name16[..name_len]);
-                                self.lpc_connect_park = Some(PendingLpcConnectPark {
-                                    reservation,
-                                    request: nt_lpc_continuation::ConnectRequest {
-                                        connection_id: r.connection_id,
-                                        port_handle: args[0],
-                                        connection_information: conn_info_ptr,
-                                        connection_information_length: conn_info_len_ptr,
-                                        connection_information_capacity: conn_info_len as u32,
-                                        operation: nt_lpc_continuation::ConnectOperation::Connect,
-                                    },
-                                    memory: self.current_user_memory,
-                                    name,
-                                    name_len: name_len as u8,
-                                });
-                                // A newly queued connection can satisfy a parked generic listen or
-                                // reply/wait/receive immediately. Consume this producer edge once.
-                                self.lpc_endpoint_progress = true;
-                            } else {
-                                self.lsa_connect_conn = r.connection_id;
-                                self.lsa_connect_out = args[0];
-                            }
+                            let mut name = [0u16; 32];
+                            let name_len = name16.len().min(name.len());
+                            name[..name_len].copy_from_slice(&name16[..name_len]);
+                            self.lpc_connect_park = Some(PendingLpcConnectPark {
+                                reservation: connect_reservation,
+                                request: nt_lpc_continuation::ConnectRequest {
+                                    connection_id: r.connection_id,
+                                    port_handle: args[0],
+                                    connection_information: conn_info_ptr,
+                                    connection_information_length: conn_info_len_ptr,
+                                    connection_information_capacity: conn_info_len as u32,
+                                    operation: nt_lpc_continuation::ConnectOperation::Connect,
+                                },
+                                memory: self.current_user_memory,
+                                name,
+                                name_len: name_len as u8,
+                            });
+                            // A newly queued connection can satisfy a parked generic listen or
+                            // reply/wait/receive immediately. Consume this producer edge once.
+                            self.lpc_endpoint_progress = true;
                             print_str(b"[lpc-connect] pending pi=");
                             print_u64(self.pi as u64);
                             print_str(b" conn=");
@@ -31207,28 +31214,22 @@ impl ExecNtHandler {
                             print_str(b"\n");
                             0 // SUCCESS (the loop overrides with the rendezvous outcome)
                         } else {
-                            if let Some(reservation) = connect_reservation {
-                                crate::service_sec_image::lpc_connect_wait_cancel_reservation(
-                                    reservation,
-                                );
-                            }
+                            crate::service_sec_image::lpc_connect_wait_cancel_reservation(
+                                connect_reservation,
+                            );
                             0x0000_0103 // STATUS_PENDING (broker returned no handle + not pending)
                         }
                     }
                     Some(Err(st)) => {
-                        if let Some(reservation) = connect_reservation {
-                            crate::service_sec_image::lpc_connect_wait_cancel_reservation(
-                                reservation,
-                            );
-                        }
+                        crate::service_sec_image::lpc_connect_wait_cancel_reservation(
+                            connect_reservation,
+                        );
                         st.raw() as u32
                     }
                     None => {
-                        if let Some(reservation) = connect_reservation {
-                            crate::service_sec_image::lpc_connect_wait_cancel_reservation(
-                                reservation,
-                            );
-                        }
+                        crate::service_sec_image::lpc_connect_wait_cancel_reservation(
+                            connect_reservation,
+                        );
                         0xC000_0001
                     }
                 }
@@ -31238,75 +31239,21 @@ impl ExecNtHandler {
             // are resolved in their owning processes and retained until this exact connection
             // completes; no most-recent-port or image-role routing participates.
             NativeService::NtAcceptConnectPort => unsafe {
-                // ★ LSA RENDEZVOUS. lsass' REAL `LsapHandlePortConnection`
-                // (`references/reactos/dll/win32/lsasrv/authport.c:196`) reaches this syscall after the
-                // loop woke its `AuthPortThreadRoutine` with winlogon's connection request. The
-                // connection id is the one the loop parked the connector on, so this is a REAL broker
-                // accept carrying the server's OWN Accept decision (R9) and PortContext (RDX = the
-                // LSAP_LOGON_CONTEXT it just built). No override, no fabricated handle.
-                let lsa_conn = LSA_PENDING_CONN.load(Ordering::Relaxed);
-                if self.current_process_is_lsass() && lsa_conn != 0 {
-                    let accept = nt_boolean_arg(args[3]);
-                    let port_context = args[1];
-                    let server_handle = lpc_client()
-                        .and_then(|c| c.accept_connect(lsa_conn, accept, port_context).ok())
-                        .unwrap_or(0);
-                    if accept {
-                        if server_handle == 0 {
-                            self.abort_lpc_connection_views(lsa_conn);
-                            return STATUS_UNSUCCESSFUL;
-                        }
-                        if let Err(status) = self.accept_lpc_connection_views(
-                            lsa_conn,
-                            self.pi,
-                            self.current_user_memory,
-                            args[4],
-                            args[5],
-                        ) {
-                            if let Some(client) = lpc_client() {
-                                let _ = client.close_port(server_handle);
-                            }
-                            self.abort_lpc_connection_views(lsa_conn);
-                            return status;
-                        }
-                    } else {
-                        self.abort_lpc_connection_views(lsa_conn);
-                    }
-                    self.queue_write(args[0], server_handle);
-                    LSA_PORT_CONTEXT.store(port_context, Ordering::Relaxed);
-                    LSA_ACCEPT_DECISION.store(1 + u64::from(accept), Ordering::Relaxed);
-                    print_str(
-                        b"[lsa-rdv] real LsapHandlePortConnection NtAcceptConnectPort accept=",
-                    );
-                    print_u64(accept as u64);
-                    print_str(b" server-port=0x");
-                    print_hex(server_handle as u32);
-                    print_str(b" context=0x");
-                    print_hex((port_context >> 32) as u32);
-                    print_hex(port_context as u32);
-                    print_str(b"\n");
-                    if !accept {
-                        // The server REFUSED. Do not fabricate a completion — the loop wakes the
-                        // connector with the refusal status the real server produced.
-                        LSA_COMPLETE_PENDING.store(2, Ordering::Relaxed);
-                    }
-                    return if server_handle != 0 { 0 } else { 0xC000_0001 };
-                }
                 let (conn_id, response_info) = match self.lpc_capture_connection_response(args[2]) {
                     Ok(response) => response,
                     Err(status) => return status,
                 };
                 let accept = nt_boolean_arg(args[3]);
                 let port_context = args[1];
+                let server_receive_port = self.current_thread_lpc_server_port();
+                let is_lsa_auth_port = self.current_process_is_lsass()
+                    && lpc_client()
+                        .and_then(|client| client.query_handle(server_receive_port).ok())
+                        .is_some_and(|port| lpc_name_is(&port.name, b"\\lsaauthenticationport"));
                 let server_handle = lpc_client().and_then(|client| {
                     if accept {
                         client
-                            .accept_connect_with_info(
-                                conn_id,
-                                true,
-                                port_context,
-                                &response_info,
-                            )
+                            .accept_connect_with_info(conn_id, true, port_context, &response_info)
                             .ok()
                     } else {
                         client.accept_connect(conn_id, false, port_context).ok()
@@ -31314,6 +31261,9 @@ impl ExecNtHandler {
                 });
                 match server_handle {
                     Some(server_handle) => {
+                        if is_lsa_auth_port {
+                            LSA_ACCEPT_DECISION.store(1 + u64::from(accept), Ordering::Relaxed);
+                        }
                         if accept {
                             if server_handle == 0 {
                                 self.abort_lpc_connection_views(conn_id);
@@ -31351,29 +31301,6 @@ impl ExecNtHandler {
                 }
             },
             NativeService::NtCompleteConnectPort => unsafe {
-                // ★ LSA RENDEZVOUS: the real server finished its accept — complete through the broker
-                // and hand the LOOP the client comm-port handle to publish into winlogon's *PortHandle.
-                let lsa_conn = LSA_PENDING_CONN.load(Ordering::Relaxed);
-                if self.current_process_is_lsass() && lsa_conn != 0 {
-                    return match lpc_client().and_then(|c| c.complete_connect(lsa_conn).ok()) {
-                        Some(completed) => {
-                            if let Err(status) = self.complete_lpc_connection_views(lsa_conn) {
-                                if let Some(client) = lpc_client() {
-                                    let _ = client.close_port(completed.handle);
-                                    let _ = client.close_port(args[0]);
-                                }
-                                return status;
-                            }
-                            LSA_CLIENT_HANDLE.store(completed.handle, Ordering::Relaxed);
-                            LSA_COMPLETE_PENDING.store(1, Ordering::Relaxed);
-                            0
-                        }
-                        None => {
-                            LSA_COMPLETE_PENDING.store(2, Ordering::Relaxed);
-                            0xC000_0001
-                        }
-                    };
-                }
                 let connection_id = match lpc_client().and_then(|c| c.query_handle(args[0]).ok()) {
                     Some(port) if port.connection_id != 0 => port.connection_id,
                     _ => return nt_process::STATUS_INVALID_HANDLE,

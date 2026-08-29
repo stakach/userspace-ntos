@@ -16256,3 +16256,49 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     delete the superseded numeric scheduling and routing state in the same accepted change. After
     LSA is closed, replace `Port.reply_connection` with explicit connection provenance for the
     remaining datagram/ALPC routing and delete that last implicit broker cursor.
+
+    Typed LSA authentication-port continuation and private-transport deletion (2026-08-29,
+    accepted): `\LsaAuthenticationPort` now uses the same typed connect, receive, and synchronous
+    request continuations as SM, SB, and CSR. `NtConnectPort` reserves durable connector state before
+    broker publication; the real LSASS `AuthPortThreadRoutine` receives, accepts, and completes the
+    broker-owned connection; and only that connection's continuation resumes winlogon. Real API 3
+    package lookup and API 2 interactive logon requests retain their broker-authored message ids
+    through exact request/reply redrive. The kernel-owned `\SeRmCommandPort` remains a separate local
+    security-monitor service, not a user-mode LPC exception or fallback.
+
+    Hosted worker runtime now records the broker server-port handle and requesting process for the
+    message currently owned by that worker. Publication occurs only after a successful generic
+    receive, successful reply clears the provenance, and a combined reply/receive atomically replaces
+    it with the next broker message. LSA accept and proof classification resolve that explicit port
+    identity through broker metadata rather than a listener badge, executable launch order, or the
+    most recently connected client. The real API 2 proof counts LSASS-role
+    `NtReadVirtualMemory` calls only while that request is in flight, demonstrating that lsasrv copied
+    winlogon's interactive-logon structure before returning the real token.
+
+    The private LSA connector buffers, scalar continuation outputs, copied request slots, manual
+    `PORT_MESSAGE` construction, private server/client reply capabilities, cross-VSpace marshalling,
+    wall-release path, park/wake loops, and service-loop intercepts are deleted. The implementation
+    change removes 1,090 lines while adding 211 lines of common provenance and proof wiring. An audit
+    finds no live `lsa_connect_conn`, `lsa_connect_out`, `LSA_PENDING_CONN`,
+    `LSA_COMPLETE_PENDING`, `LSA_PORT_CONTEXT`, private LSA reply slot, or private LSA park/delivery
+    function.
+
+    Focused validation passes `nt-lpc-abi` at `8/8`, `nt-lpc-continuation` at `10/10`,
+    `nt-port-core` at `17/17`, and `nt-lpc-server` at `16/16`; the freestanding executive builds at
+    the established 209-warning baseline. Serialized acceptance
+    `.tmp/run-headless-lsa-typed-accepted-20260829.log` records two real LSA connections delivered
+    and completed, three exact requests and replies, successful API 3 and API 2 statuses, six client
+    memory reads during API 2, a minted/transferred primary token, and no LSA server wall. Genuine
+    userinit and Explorer launch; Explorer completes 669 api0 redirects with zero callback or
+    dead-callback failures, paint begin/end reaches `5/20` with 187 direct GDI returns and 135 batch
+    flushes covering 184 records, and the framebuffer holds `480000/480000` non-background pixels
+    with at least 32 colours. All `295/295` gates pass and the sentinel matches.
+
+    Review adjustment: all user-mode service-specific blocked LPC transports are closed. The next
+    active LPC cleanup is the remaining generic datagram/ALPC use of `Port.reply_connection`.
+    Replace that listen-port-wide most-recent-connection cursor with connection provenance carried by
+    the received message or an exact receive transaction, cover concurrent connections and stale
+    reply attempts in `nt-port-core` first, then wire the pointer-free broker ABI and delete the field
+    and every implicit routing branch. Synchronous request/reply must continue using its existing
+    exact `ClientId` plus message-id identity; do not merge the two mechanisms or introduce a default
+    connection.
