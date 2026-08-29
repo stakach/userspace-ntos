@@ -16058,3 +16058,44 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     both directions. Once this is host-tested and desktop-accepted, convert the remaining numeric
     reply/wait/receive continuations to the typed blocked-service adapter and delete
     `Port.reply_connection` with its superseded routing state.
+
+    Bidirectional LPC connection-view convergence (2026-08-29, accepted): the single
+    `PendingLpcConnectionView` slot is replaced by a connection-id-keyed kernel transaction that
+    retains the connector's captured `PORT_VIEW` and `REMOTE_PORT_VIEW`, the two process identities,
+    and both optional mapped directions until the broker completes that exact connection. Native
+    x64 view layouts, section geometry, zero-size normalization, remote-view headers, result
+    publication, and owner/peer orientation live in the pointer-free `nt-lpc-abi` crate. Section
+    handles are resolved in the offering process with read/write mapping access, and both offered
+    sections use the ordinary generic-section target-process mapper.
+
+    `NtAcceptConnectPort` now captures an acceptor-authored `PORT_VIEW`, maps it into the acceptor
+    and connector, and publishes the acceptor's local and remote bases. The acceptor's
+    `REMOTE_PORT_VIEW` receives the connector-authored mapping at accept time. Connector outputs,
+    including the server-authored mapping, are published only after `NtCompleteConnectPort`
+    completes the same broker connection. Refusal, endpoint close, malformed input, either mapping
+    failure, either copyout failure, and broker accept/complete failure unwind every mapping owned by
+    the transaction. The old CSR-local `mapped_views` tuple and per-syscall pending-view reset are
+    deleted. SM, CSR, LSA, generic native, and both kernel-owned SRM directions now use the same
+    lifecycle; code checkpoint `2a74ec61` is committed.
+
+    Focused validation passes `nt-lpc-abi` at `7/7`, `nt-port-core` at `15/15`, `nt-lpc-server` at
+    `16/16`, and `nt-alpc` at `12/12`. The freestanding executive check and staged release build
+    remain at the established 212-warning baseline. Serialized acceptance
+    `.tmp/run-headless-lpc-bidirectional-views-srm-20260829.log` records 21 keyed accept/complete
+    transactions, including 15 real connector-supplied section views and the two no-view SRM
+    connections. This ReactOS workload did not supply an acceptor section view; that independent
+    direction is covered by the pointer-free ABI orientation tests and the shared executive mapping
+    path rather than a synthetic boot request. Genuine userinit and Explorer launch, 665 Explorer
+    api0 redirects complete with zero callback or dead-callback failures, paint begin/end reaches
+    `2/20` with 185 direct GDI returns and 131 batch flushes covering 171 records, and the framebuffer
+    holds `480000/480000` non-background pixels with at least 32 colours. All `295/295` gates pass
+    and the sentinel matches.
+
+    Review adjustment: connection views no longer depend on a singleton or image-specific mapping
+    path. The next active boundary is the typed blocked-service adapter for LPC listen,
+    reply/wait/receive, connect, accept, and complete continuations. Preserve native state transitions
+    and broker-authored identities while replacing numeric continuation tags, then delete each
+    superseded field and dispatcher branch in the same slice. After that, replace the remaining
+    datagram/ALPC use of `Port.reply_connection` with explicit connection provenance and delete the
+    field. A missing transaction, stale message, or disconnected endpoint must fail closed; do not
+    add a most-recent-connection route or synthetic successful completion.
