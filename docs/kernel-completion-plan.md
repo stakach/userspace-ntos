@@ -15734,3 +15734,51 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     registration, kernel-message delivery, dynamic-worker routing, and the full desktop proof after
     each accepted slice. Do not hide connection lifecycle behind a synthetic successful syscall or
     weaken the broker's port/message type checks.
+
+    SM private-worker native dispatch (2026-08-29, accepted): both SMSS private execution lanes now
+    use the same typed `NativeSyscallDispatcher` adapter as ordinary hosted threads and CSR/SB
+    workers. The adapter gained an SMSS process-memory policy, while the complete hosted-process
+    memory helper now serves both SMSS and CSRSS instead of being CSR-specific. The request worker
+    routes its observed open/query/duplicate/close services through registered metadata; serialized
+    proof `.tmp/run-headless-sm-worker-dispatch-20260829.log` exercised nine such calls and reached
+    the complete Explorer framebuffer with all `295/295` gates passing. Code checkpoint `40ab13ff`
+    is pushed.
+
+    The SMSS connection worker now routes its synchronous process, event, and information calls
+    through the same boundary. The conversion deleted the superseded SM-only object-attribute,
+    client-ID, open-process, open-thread, set-thread-information, and query-thread-information
+    implementations instead of retaining parallel machinery. Serialized proof
+    `.tmp/run-headless-sm-accept-dispatch-20260829.log` exercised `NtOpenProcess`, two
+    `NtQueryInformationProcess` calls, and `NtSetEvent` from the real worker, then launched genuine
+    userinit and Explorer and passed `295/295` with complete shell pixels. Code checkpoint
+    `dc670950` is pushed.
+
+    CSR connection lifecycle cleanup (2026-08-29, accepted): the real
+    `CsrApiHandleConnectionRequest` accept decision is now passed unchanged to the LPC broker. The
+    executive no longer forces every connection accepted or calls complete on behalf of CSRSS;
+    the real worker's later `NtCompleteConnectPort` exclusively completes an accepted connection.
+    Synchronous accept-worker services use the shared typed dispatcher, and the old CSR-specific
+    set/query-thread and event implementations are deleted. Code checkpoint `b7ec4406` removes 401
+    lines of superseded machinery and is pushed.
+
+    Freestanding `cargo check`, release build/staging, and `git diff --check` pass at the established
+    212-warning baseline. Serialized acceptance
+    `.tmp/run-headless-csr-accept-dispatch-20260829.log` observed 15 real
+    `NtAcceptConnectPort(AllowConnection=TRUE)` decisions, the real worker's `NtSetEvent` through the
+    typed dispatcher, no CSR rendezvous wall, and no rejected connection. Genuine userinit and
+    Explorer launched, 668 Explorer api0 redirects completed with zero callback or dead-callback
+    failures, paint begin/end reached `5/20` with 187 direct GDI returns and 135 batch flushes
+    covering 184 records, and the framebuffer held `480000/480000` non-background pixels with at
+    least 32 colours. All `295/295` gates passed and the sentinel matched.
+
+    Review adjustment: the synchronous private-worker syscall switches are removed for CSR, SB, and
+    both SMSS lanes, and CSR accept/complete ownership is real. Do not abstract the remaining
+    numeric reply/wait/receive cases until the adapter can represent a blocked continuation and
+    broker reply state without changing native LPC semantics. The immediate correctness debt is the
+    CSR connection view itself: `csr_rendezvous` and `csr_api_request_rendezvous` still contain an
+    empty-success `NtMapViewOfSection` arm, while `csr_client_connect` directly creates the client
+    CSR heap/static-server regions and `CSR_API_CONNECTINFO` reply. Implement target-process section
+    mapping over the section's real frames and make CSRSS own the connect payload first; then route
+    both map calls through the typed service and delete the synthetic map-success arms and client
+    projection together. The generic map handler must not be reused unchanged: its current anonymous
+    CSR branch maps into CSRSS's active address space even when the syscall names another process.
