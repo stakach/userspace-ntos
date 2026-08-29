@@ -26812,7 +26812,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             .unwrap_or(false)
         && lpc
             .complete_connect(conn_id)
-            .map(|(ch, _)| ch != 0)
+            .map(|completed| completed.handle != 0)
             .unwrap_or(false);
     check(b"exec_lpc_connect_rendezvous", lpc_rdv_ok, &mut passed);
     // Live ALPC + LPC↔ALPC bridge self-test over the SAME ring/component/core (the

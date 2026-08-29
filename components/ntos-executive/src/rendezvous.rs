@@ -875,10 +875,10 @@ pub(crate) unsafe fn sm_rendezvous(
                         sm_stack_write(porthandle_out, sh);
                     }
                     SSN_COMPLETE_CONNECT => {
-                        if let Some((ch, _)) =
+                        if let Some(completed) =
                             lpc_client().and_then(|c| c.complete_connect(conn_id).ok())
                         {
-                            client_handle = ch;
+                            client_handle = completed.handle;
                         }
                         print_str(b"[sm-rdv] forward NtCompleteConnectPort replied; awaiting reverse connect\n");
                         // Continue into SmpHandleConnectionRequest's reverse connection and real event set.
@@ -2751,10 +2751,10 @@ unsafe fn csr_sb_accept_connection(
                         csr_sb_stack_write(out, server_handle);
                     }
                     SSN_COMPLETE_CONNECT => {
-                        if let Some((handle, _)) =
+                        if let Some(completed) =
                             lpc_client().and_then(|c| c.complete_connect(conn_id).ok())
                         {
-                            client_handle = handle;
+                            client_handle = completed.handle;
                         }
                     }
                     SSN_REPLY_WAIT_RECV => {
@@ -3261,10 +3261,10 @@ pub(crate) unsafe fn csr_rendezvous(
                     }
                     SSN_COMPLETE_CONNECT => {
                         if client_handle == 0 {
-                            if let Some((ch, _)) =
+                            if let Some(completed) =
                                 lpc_client().and_then(|c| c.complete_connect(conn_id).ok())
                             {
-                                client_handle = ch;
+                                client_handle = completed.handle;
                             }
                         }
                     }

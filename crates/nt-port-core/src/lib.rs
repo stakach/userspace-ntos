@@ -225,6 +225,10 @@ struct Connection {
     /// Passed through byte-for-byte to the acceptor — the bridge connection-info
     /// mapping.
     conn_info: Vec<u8>,
+    /// Connection-information returned to the connector after the server accepts the request.
+    /// This starts as an exact copy of the request and is replaced when the acceptor commits a
+    /// mutated connection message.
+    response_info: Vec<u8>,
     state: ConnState,
     client_api: PortApi,
     server_api: PortApi,
@@ -305,6 +309,11 @@ impl PortCore {
     /// The opaque connection-info blob (the bridge connection-info passthrough).
     pub fn connection_info(&self, id: u64) -> Option<&[u8]> {
         self.conn(id).map(|c| c.conn_info.as_slice())
+    }
+
+    /// The server-approved connection-information returned when the connection completes.
+    pub fn connection_response_info(&self, id: u64) -> Option<&[u8]> {
+        self.conn(id).map(|c| c.response_info.as_slice())
     }
 
     /// The `(client_api, server_api)` of a connection — a cross-API pair means
@@ -491,6 +500,31 @@ impl PortCore {
         accept: bool,
         port_context: u64,
     ) -> Result<u64, NtStatus> {
+        self.accept_inner(connection_id, accept, port_context, None)
+    }
+
+    /// Accept (or refuse) a pending connection and commit the connection-information bytes
+    /// authored by the server. Those exact bytes are returned to the connector on complete.
+    pub fn accept_with_connection_info(
+        &mut self,
+        connection_id: u64,
+        accept: bool,
+        port_context: u64,
+        response_info: &[u8],
+    ) -> Result<u64, NtStatus> {
+        if response_info.len() > MAX_CONNINFO {
+            return Err(NtStatus::BUFFER_TOO_SMALL);
+        }
+        self.accept_inner(connection_id, accept, port_context, Some(response_info))
+    }
+
+    fn accept_inner(
+        &mut self,
+        connection_id: u64,
+        accept: bool,
+        port_context: u64,
+        response_info: Option<&[u8]>,
+    ) -> Result<u64, NtStatus> {
         let next = self.next_handle;
         let conn = self
             .connections
@@ -503,6 +537,10 @@ impl PortCore {
         }
         conn.state = ConnState::Accepted;
         conn.port_context = port_context;
+        if let Some(response_info) = response_info {
+            conn.response_info.clear();
+            conn.response_info.extend_from_slice(response_info);
+        }
         if conn.server_handle == 0 {
             conn.server_handle = next;
             self.next_handle += 1;
@@ -639,9 +677,9 @@ impl PortCore {
             .connections
             .iter()
             .find(|connection| handle != 0 && connection.server_handle == handle)?;
-        self.ports.iter().position(|port| {
-            port.api == connection.server_api && port.name == connection.port_name
-        })
+        self.ports
+            .iter()
+            .position(|port| port.api == connection.server_api && port.name == connection.port_name)
     }
 
     // --- internals --------------------------------------------------------
@@ -670,12 +708,14 @@ impl Connection {
         server_api: PortApi,
         client_handle: u64,
     ) -> Self {
+        let response_info = conn_info.clone();
         Self {
             id,
             port_name,
             subsystem_type,
             client_id,
             conn_info,
+            response_info,
             state,
             client_api,
             server_api,
@@ -846,6 +886,32 @@ mod tests {
         assert_eq!(core.connection_info(cid), Some(&blob[..]));
         assert_eq!(core.connection_subsystem_type(cid), Some(7));
         assert_eq!(core.connection_client_id(cid), Some(client_id));
+    }
+
+    #[test]
+    fn accepted_connection_info_is_committed_separately_from_request() {
+        let mut core = PortCore::new();
+        core.set_accept_policy(AcceptPolicy::Manual);
+        let port = core.create_port(&utf16("\\P"), PortApi::Lpc);
+        let request = b"client request";
+        let response = b"server response";
+        let cid = match core
+            .connect(&utf16("\\P"), PortApi::Lpc, 0, request)
+            .unwrap()
+        {
+            ConnectOutcome::Pending { connection_id } => connection_id,
+            _ => unreachable!(),
+        };
+        core.receive(port).unwrap();
+        core.accept_with_connection_info(cid, true, 0, response)
+            .unwrap();
+        core.complete(cid).unwrap();
+
+        assert_eq!(core.connection_info(cid), Some(request.as_slice()));
+        assert_eq!(
+            core.connection_response_info(cid),
+            Some(response.as_slice())
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@ use bytemuck::Pod;
 use nt_lpc_abi::{
     msg_type, opcode, LpcAcceptConnectRequest, LpcCompleteConnectRequest, LpcConnectPortRequest,
     LpcConnectionRequestMetadata, LpcCreatePortRequest, LpcMessageRequest, LpcQueryHandleRequest,
-    LpcQueryHandleResponse, LpcReceiveRequest, LpcReply,
+    LpcQueryHandleResponse, LpcReceiveRequest, LpcReply, LPC_ACCEPT_RESPONSE_INFO,
 };
 use nt_status::NtStatus;
 
@@ -39,6 +39,14 @@ pub struct ConnectResult {
     pub handle: u64,
     pub connection_id: u64,
     pub pending: bool,
+}
+
+/// A completed connection and the exact connection-information accepted by the server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompleteConnectResult {
+    pub handle: u64,
+    pub connection_id: u64,
+    pub connection_info: Vec<u8>,
 }
 
 /// The outcome of a receive: a delivered connection request (or message).
@@ -168,9 +176,11 @@ impl<B: Backend> LpcClient<B> {
         let req = LpcAcceptConnectRequest {
             abi_size: size_of::<LpcAcceptConnectRequest>() as u16,
             accept: u16::from(accept),
-            _reserved: 0,
+            flags: 0,
             connection_id,
             port_context,
+            conninfo_offset: 0,
+            conninfo_len_bytes: 0,
         };
         let r = self.backend.call(
             opcode::LPC_OP_ACCEPT_CONNECT,
@@ -181,21 +191,60 @@ impl<B: Backend> LpcClient<B> {
         Ok(r.detail0)
     }
 
-    /// Complete an accepted connection; returns `(client_handle, connection_id)`.
-    pub fn complete_connect(&mut self, connection_id: u64) -> Result<(u64, u64), NtStatus> {
+    /// Accept (or refuse) a pending connection and commit the connection-information bytes
+    /// authored by the server.
+    pub fn accept_connect_with_info(
+        &mut self,
+        connection_id: u64,
+        accept: bool,
+        port_context: u64,
+        connection_info: &[u8],
+    ) -> Result<u64, NtStatus> {
+        let header = size_of::<LpcAcceptConnectRequest>();
+        let req = LpcAcceptConnectRequest {
+            abi_size: header as u16,
+            accept: u16::from(accept),
+            flags: LPC_ACCEPT_RESPONSE_INFO,
+            connection_id,
+            port_context,
+            conninfo_offset: header as u32,
+            conninfo_len_bytes: u32_len(connection_info.len())?,
+        };
+        let buf = pack_bytes::<LPC_CONTROL_BUF_LEN, _>(&req, connection_info)?;
+        let r = self
+            .backend
+            .call(opcode::LPC_OP_ACCEPT_CONNECT, buf.as_slice(), &mut []);
+        NtStatus(r.status).to_result()?;
+        Ok(r.detail0)
+    }
+
+    /// Complete an accepted connection and return the server-approved connection information.
+    pub fn complete_connect(
+        &mut self,
+        connection_id: u64,
+    ) -> Result<CompleteConnectResult, NtStatus> {
         let req = LpcCompleteConnectRequest {
             abi_size: size_of::<LpcCompleteConnectRequest>() as u16,
             _reserved: 0,
             _reserved2: 0,
             connection_id,
         };
+        let mut out = [0u8; 512];
         let r = self.backend.call(
             opcode::LPC_OP_COMPLETE_CONNECT,
             bytemuck::bytes_of(&req),
-            &mut [],
+            &mut out,
         );
         NtStatus(r.status).to_result()?;
-        Ok((r.detail0, r.detail1))
+        let returned = r.information as usize;
+        if returned > out.len() {
+            return Err(NtStatus::BUFFER_TOO_SMALL);
+        }
+        Ok(CompleteConnectResult {
+            handle: r.detail0,
+            connection_id: r.detail1,
+            connection_info: out[..returned].to_vec(),
+        })
     }
 
     /// Resolve a broker handle to the live endpoint identity recorded by the port core.

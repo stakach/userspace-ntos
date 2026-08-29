@@ -38,7 +38,7 @@ use nt_lpc_abi::{
     connection_state, handle_endpoint, opcode, LpcAcceptConnectRequest, LpcClosePortRequest,
     LpcCompleteConnectRequest, LpcConnectPortRequest, LpcConnectionRequestMetadata,
     LpcCreatePortRequest, LpcMessageRequest, LpcQueryHandleRequest, LpcQueryHandleResponse,
-    LpcReceiveRequest, LpcReply, LPC_QUERY_HANDLE_NAME_MAX_UNITS,
+    LpcReceiveRequest, LpcReply, LPC_ACCEPT_RESPONSE_INFO, LPC_QUERY_HANDLE_NAME_MAX_UNITS,
 };
 use nt_port_core::{
     ConnectOutcome, MessageAttrs, PortApi, PortCore, PortHandleEndpoint, ReceiveOutcome,
@@ -132,7 +132,7 @@ impl Server {
             opcode::LPC_OP_CREATE_PORT => self.op_create_port(in_buf),
             opcode::LPC_OP_CONNECT_PORT => self.op_connect_port(in_buf),
             opcode::LPC_OP_ACCEPT_CONNECT => self.op_accept_connect(in_buf),
-            opcode::LPC_OP_COMPLETE_CONNECT => self.op_complete_connect(in_buf),
+            opcode::LPC_OP_COMPLETE_CONNECT => self.op_complete_connect(in_buf, out_buf),
             opcode::LPC_OP_REPLY_WAIT_RECEIVE | opcode::LPC_OP_LISTEN_PORT => {
                 self.op_receive(in_buf, out_buf)
             }
@@ -181,16 +181,48 @@ impl Server {
 
     fn op_accept_connect(&mut self, buf: &[u8]) -> Result<LpcReply, NtStatus> {
         let req: LpcAcceptConnectRequest = read_req(buf)?;
-        let sh = self
-            .core
-            .accept(req.connection_id, req.accept != 0, req.port_context)?;
+        let sh = if req.flags & LPC_ACCEPT_RESPONSE_INFO != 0 {
+            if req.flags != LPC_ACCEPT_RESPONSE_INFO {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            let response_info = read_blob(buf, req.conninfo_offset, req.conninfo_len_bytes)?;
+            self.core.accept_with_connection_info(
+                req.connection_id,
+                req.accept != 0,
+                req.port_context,
+                response_info,
+            )?
+        } else {
+            if req.flags != 0 || req.conninfo_offset != 0 || req.conninfo_len_bytes != 0 {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            self.core
+                .accept(req.connection_id, req.accept != 0, req.port_context)?
+        };
         Ok(reply(NtStatus::SUCCESS, 0, sh, req.connection_id))
     }
 
-    fn op_complete_connect(&mut self, buf: &[u8]) -> Result<LpcReply, NtStatus> {
+    fn op_complete_connect(
+        &mut self,
+        buf: &[u8],
+        out_buf: &mut [u8],
+    ) -> Result<LpcReply, NtStatus> {
         let req: LpcCompleteConnectRequest = read_req(buf)?;
         let (client_handle, conn_id) = self.core.complete(req.connection_id)?;
-        Ok(reply(NtStatus::SUCCESS, 0, client_handle, conn_id))
+        let response_info = self
+            .core
+            .connection_response_info(conn_id)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        if response_info.len() > out_buf.len() {
+            return Err(NtStatus::BUFFER_TOO_SMALL);
+        }
+        out_buf[..response_info.len()].copy_from_slice(response_info);
+        Ok(reply(
+            NtStatus::SUCCESS,
+            response_info.len() as u32,
+            client_handle,
+            conn_id,
+        ))
     }
 
     fn op_receive(&mut self, buf: &[u8], out_buf: &mut [u8]) -> Result<LpcReply, NtStatus> {
@@ -635,11 +667,46 @@ mod tests {
             assert_eq!(recv.connection_info, b"sb-connect-info");
             let sh = c.accept_connect(conn_id, true, 0xC0DE).unwrap();
             assert_ne!(sh, 0);
-            let (client_handle, done_id) = c.complete_connect(conn_id).unwrap();
-            assert_eq!(done_id, conn_id);
-            assert_ne!(client_handle, 0);
+            let completed = c.complete_connect(conn_id).unwrap();
+            assert_eq!(completed.connection_id, conn_id);
+            assert_ne!(completed.handle, 0);
+            assert_eq!(completed.connection_info, b"sb-connect-info");
         }
         assert_eq!(s.connection_state(conn_id), Some(ConnState::Connected));
+    }
+
+    #[test]
+    fn accept_returns_server_authored_connection_information_on_complete() {
+        let mut s = Server::new();
+        s.set_accept_policy(AcceptPolicy::Manual);
+        let (port, conn_id) = {
+            let mut c = LpcClient::new(Direct {
+                server: &mut s,
+                out: [0; 512],
+            });
+            let port = c
+                .create_port(&utf16("\\Windows\\ApiPort"), 0x88, 0x148, 0)
+                .unwrap();
+            let pending = c
+                .connect_port(&utf16("\\Windows\\ApiPort"), 0, b"client")
+                .unwrap();
+            (port, pending.connection_id)
+        };
+
+        let mut c = LpcClient::new(Direct {
+            server: &mut s,
+            out: [0; 512],
+        });
+        assert_eq!(
+            c.reply_wait_receive(port).unwrap().connection_info,
+            b"client"
+        );
+        c.accept_connect_with_info(conn_id, true, 0x44, b"server")
+            .unwrap();
+        let completed = c.complete_connect(conn_id).unwrap();
+        assert_eq!(completed.connection_id, conn_id);
+        assert_ne!(completed.handle, 0);
+        assert_eq!(completed.connection_info, b"server");
     }
 
     #[test]
@@ -673,9 +740,9 @@ mod tests {
             assert_eq!(rm_request.msg_type, msg_type::LPC_CONNECTION_REQUEST);
             let rm_server = c.accept_connect(rm_conn, true, 0).unwrap();
             assert_ne!(rm_server, 0);
-            let (rm_client, completed) = c.complete_connect(rm_server).unwrap();
-            assert_ne!(rm_client, 0);
-            assert_eq!(completed, rm_conn);
+            let completed = c.complete_connect(rm_server).unwrap();
+            assert_ne!(completed.handle, 0);
+            assert_eq!(completed.connection_id, rm_conn);
 
             let lsa = c
                 .connect_port(&utf16("\\SeLsaCommandPort"), 0, &[])
@@ -687,9 +754,9 @@ mod tests {
             assert_eq!(lsa_request.msg_type, msg_type::LPC_CONNECTION_REQUEST);
             let lsa_server = c.accept_connect(lsa.connection_id, true, 0).unwrap();
             assert_ne!(lsa_server, 0);
-            let (lsa_client, lsa_completed) = c.complete_connect(lsa_server).unwrap();
-            assert_ne!(lsa_client, 0);
-            assert_eq!(lsa_completed, lsa.connection_id);
+            let completed = c.complete_connect(lsa_server).unwrap();
+            assert_ne!(completed.handle, 0);
+            assert_eq!(completed.connection_id, lsa.connection_id);
             assert_eq!(
                 c.reply_wait_receive(lsa_server).unwrap_err(),
                 NtStatus::PENDING
@@ -723,7 +790,7 @@ mod tests {
             });
             c.reply_wait_receive(listen).unwrap();
             let server = c.accept_connect(conn_id, true, 0).unwrap();
-            let client = c.complete_connect(server).unwrap().0;
+            let client = c.complete_connect(server).unwrap().handle;
             (client, server)
         };
         let mut c = LpcClient::new(Direct {
@@ -777,7 +844,7 @@ mod tests {
             });
             c.reply_wait_receive(ph).unwrap();
             let sh = c.accept_connect(cid, true, 0).unwrap();
-            let (ch, _) = c.complete_connect(cid).unwrap();
+            let ch = c.complete_connect(cid).unwrap().handle;
             assert_ne!(ch, 0);
             sh
         };
@@ -845,7 +912,7 @@ mod tests {
             });
             c.reply_wait_receive(listen).unwrap();
             let server = c.accept_connect(connection, true, 0x1234).unwrap();
-            c.complete_connect(server).unwrap().0
+            c.complete_connect(server).unwrap().handle
         };
 
         let mut message = nt_lpc_abi::client_died_message(0x1122_3344_5566_7788);
@@ -889,7 +956,7 @@ mod tests {
             });
             c.reply_wait_receive(listen).unwrap();
             let server = c.accept_connect(connection, true, 0x1234).unwrap();
-            c.complete_connect(server).unwrap().0
+            c.complete_connect(server).unwrap().handle
         };
 
         let mut message = port_message(0, b"datagram");
@@ -929,7 +996,7 @@ mod tests {
             });
             c.reply_wait_receive(listen).unwrap();
             let server = c.accept_connect(connection, true, 0x5a5a).unwrap();
-            let client = c.complete_connect(connection).unwrap().0;
+            let client = c.complete_connect(connection).unwrap().handle;
             (client, server)
         };
         assert_ne!(server, 0);
@@ -974,7 +1041,9 @@ mod tests {
                 server: &mut s,
                 out: [0; 512],
             });
-            let listen = c.create_port(&utf16("\\Windows\\ApiPort"), 0, 0x148, 0).unwrap();
+            let listen = c
+                .create_port(&utf16("\\Windows\\ApiPort"), 0, 0x148, 0)
+                .unwrap();
             let pending = c
                 .connect_port(&utf16("\\Windows\\ApiPort"), 2, &[])
                 .unwrap();

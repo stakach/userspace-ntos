@@ -894,7 +894,7 @@ fn bridge_alpc_client_to_lpc_host() {
         assert_eq!(rc.connection_id, conn_id);
         assert_eq!(rc.msg_type, msg_type::CONNECTION_REQUEST);
         let sh = c.accept_connect(conn_id, true, 0).unwrap();
-        let (ch, _) = c.complete_connect(conn_id).unwrap();
+        let ch = c.complete_connect(conn_id).unwrap().handle;
         (sh, ch)
     };
     assert_ne!(server_h, 0);

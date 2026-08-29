@@ -17,7 +17,7 @@
 #![no_std]
 
 /// ABI version. Bump on any incompatible wire change.
-pub const LPC_ABI_VERSION: u32 = 1;
+pub const LPC_ABI_VERSION: u32 = 2;
 
 /// The reserved SURT opcode range for the LPC protocol (fresh block after
 /// object 0x2000 / config 0x2100).
@@ -179,11 +179,18 @@ pub struct LpcAcceptConnectRequest {
     pub abi_size: u16,
     /// Non-zero = accept, zero = refuse.
     pub accept: u16,
-    pub _reserved: u32,
+    /// [`LPC_ACCEPT_RESPONSE_INFO`] means the inline blob replaces the original request bytes.
+    pub flags: u32,
     pub connection_id: u64,
     /// Opaque server cookie returned by future receives on this connection.
     pub port_context: u64,
+    pub conninfo_offset: u32,
+    pub conninfo_len_bytes: u32,
 }
+
+/// The accept request carries server-authored connection information, including an intentional
+/// empty response. Without this flag the original request bytes are returned unchanged.
+pub const LPC_ACCEPT_RESPONSE_INFO: u32 = 1;
 
 /// `LPC_OP_COMPLETE_CONNECT` — the server completes an accepted connection,
 /// unblocking the connector.
@@ -288,7 +295,7 @@ const _: () = {
     assert!(size_of::<LpcCreatePortRequest>() == 24);
     assert!(size_of::<LpcConnectPortRequest>() == 40);
     assert!(size_of::<LpcConnectionRequestMetadata>() == 32);
-    assert!(size_of::<LpcAcceptConnectRequest>() == 24);
+    assert!(size_of::<LpcAcceptConnectRequest>() == 32);
     assert!(size_of::<LpcCompleteConnectRequest>() == 16);
     assert!(size_of::<LpcReceiveRequest>() == 24);
     assert!(size_of::<LpcMessageRequest>() == 24);
@@ -347,6 +354,6 @@ mod tests {
 
     #[test]
     fn version_is_one() {
-        assert_eq!(LPC_ABI_VERSION, 1);
+        assert_eq!(LPC_ABI_VERSION, 2);
     }
 }

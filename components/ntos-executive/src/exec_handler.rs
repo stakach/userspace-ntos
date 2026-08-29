@@ -24540,17 +24540,17 @@ impl ExecNtHandler {
         };
 
         let client_handle = match lpc.complete_connect(connect.connection_id) {
-            Ok((client_handle, completed_id))
-                if client_handle != 0 && completed_id == connect.connection_id =>
+            Ok(completed)
+                if completed.handle != 0 && completed.connection_id == connect.connection_id =>
             {
-                client_handle
+                completed.handle
             }
-            Ok((client_handle, completed_id)) => {
+            Ok(completed) => {
                 print_str(b"[srm-rdv] broker complete returned client=0x");
-                print_hex((client_handle >> 32) as u32);
-                print_hex(client_handle as u32);
+                print_hex((completed.handle >> 32) as u32);
+                print_hex(completed.handle as u32);
                 print_str(b" conn=");
-                print_u64(completed_id);
+                print_u64(completed.connection_id);
                 print_str(b"\n");
                 return STATUS_UNSUCCESSFUL;
             }
@@ -30256,8 +30256,8 @@ impl ExecNtHandler {
                 let lsa_conn = LSA_PENDING_CONN.load(Ordering::Relaxed);
                 if self.current_process_is_lsass() && lsa_conn != 0 {
                     return match lpc_client().and_then(|c| c.complete_connect(lsa_conn).ok()) {
-                        Some((client_handle, _)) => {
-                            LSA_CLIENT_HANDLE.store(client_handle, Ordering::Relaxed);
+                        Some(completed) => {
+                            LSA_CLIENT_HANDLE.store(completed.handle, Ordering::Relaxed);
                             LSA_COMPLETE_PENDING.store(1, Ordering::Relaxed);
                             0
                         }
@@ -30268,7 +30268,7 @@ impl ExecNtHandler {
                     };
                 }
                 match lpc_client().and_then(|c| c.complete_connect(args[0]).ok()) {
-                    Some((_client_handle, _connection_id)) => 0,
+                    Some(_) => 0,
                     None => STATUS_UNSUCCESSFUL,
                 }
             },
