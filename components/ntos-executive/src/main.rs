@@ -1191,6 +1191,7 @@ pub const SSN_NT_QUERY_INFORMATION_FILE: u64 = 158;
 /// are answered from real registry-indexed device state.
 pub const SSN_NT_GET_PLUG_PLAY_EVENT: u64 = 91;
 pub const SSN_NT_GET_DEVICE_POWER_STATE: u64 = 90;
+pub const SSN_NT_REQUEST_WAKEUP_LATENCY: u64 = 209;
 pub const SSN_NT_SET_THREAD_EXECUTION_STATE: u64 = 252;
 pub const SSN_NT_SET_DEFAULT_HARD_ERROR_PORT: u64 = 223;
 pub const SSN_NT_PLUG_PLAY_CONTROL: u64 = 138;
@@ -24305,6 +24306,10 @@ fn build_nt_table() -> NativeServiceTable {
             (
                 NativeService::NtSetThreadExecutionState,
                 SSN_NT_SET_THREAD_EXECUTION_STATE as u32,
+            ),
+            (
+                NativeService::NtRequestWakeupLatency,
+                SSN_NT_REQUEST_WAKEUP_LATENCY as u32,
             ),
             (NativeService::NtSetUuidSeed, SSN_NT_SET_UUID_SEED as u32),
             (

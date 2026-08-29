@@ -19,6 +19,24 @@ pub const ES_CONTINUOUS: u32 = 0x8000_0000;
 pub const THREAD_EXECUTION_STATE_MASK: u32 = ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED;
 pub const THREAD_EXECUTION_STATE_VALID_MASK: u32 = THREAD_EXECUTION_STATE_MASK | ES_CONTINUOUS;
 
+/// `LATENCY_TIME`, the process-scoped wakeup-latency policy accepted by NT5.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum WakeupLatency {
+    DontCare = 0,
+    LowestLatency = 1,
+}
+
+impl WakeupLatency {
+    pub fn from_u32(value: u32) -> Option<Self> {
+        Some(match value {
+            0 => Self::DontCare,
+            1 => Self::LowestLatency,
+            _ => return None,
+        })
+    }
+}
+
 /// `SYSTEM_POWER_STATE` (spec §6.2).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -129,6 +147,18 @@ mod tests {
         assert_eq!(ES_USER_PRESENT, 4);
         assert_eq!(ES_CONTINUOUS, 0x8000_0000);
         assert_eq!(THREAD_EXECUTION_STATE_VALID_MASK, 0x8000_0003);
+    }
+
+    #[test]
+    fn wakeup_latency_values_match_nt5() {
+        assert_eq!(WakeupLatency::DontCare as u32, 0);
+        assert_eq!(WakeupLatency::LowestLatency as u32, 1);
+        assert_eq!(WakeupLatency::from_u32(0), Some(WakeupLatency::DontCare));
+        assert_eq!(
+            WakeupLatency::from_u32(1),
+            Some(WakeupLatency::LowestLatency)
+        );
+        assert_eq!(WakeupLatency::from_u32(2), None);
     }
 
     #[test]

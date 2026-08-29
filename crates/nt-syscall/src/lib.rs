@@ -282,6 +282,8 @@ pub enum NativeService {
     NtGetDevicePowerState,
     /// Track persistent and one-shot execution-state assertions for the current thread.
     NtSetThreadExecutionState,
+    /// Track the calling process's contribution to the global wakeup-latency policy.
+    NtRequestWakeupLatency,
     /// Register the privileged, one-shot default LPC connection port for hard errors.
     NtSetDefaultHardErrorPort,
     /// `ExAllocateLocallyUniqueId` (`ntoskrnl/ex/uuid.c:335`) — the monotonic LUID allocator every
@@ -478,6 +480,7 @@ impl NativeService {
             NtWaitForDebugEvent => "NtWaitForDebugEvent",
             NtGetDevicePowerState => "NtGetDevicePowerState",
             NtSetThreadExecutionState => "NtSetThreadExecutionState",
+            NtRequestWakeupLatency => "NtRequestWakeupLatency",
             NtSetDefaultHardErrorPort => "NtSetDefaultHardErrorPort",
             NtAllocateLocallyUniqueId => "NtAllocateLocallyUniqueId",
             NtImpersonateClientOfPort => "NtImpersonateClientOfPort",
@@ -680,6 +683,7 @@ impl NativeService {
         NativeService::NtSetInformationDebugObject,
         NativeService::NtGetDevicePowerState,
         NativeService::NtSetThreadExecutionState,
+        NativeService::NtRequestWakeupLatency,
         NativeService::NtSetDefaultHardErrorPort,
     ];
 }

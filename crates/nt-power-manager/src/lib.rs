@@ -12,8 +12,9 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 pub use nt_power_types::{
-    DevicePowerState, SystemPowerState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED,
-    ES_USER_PRESENT, THREAD_EXECUTION_STATE_MASK, THREAD_EXECUTION_STATE_VALID_MASK,
+    DevicePowerState, SystemPowerState, WakeupLatency, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
+    ES_SYSTEM_REQUIRED, ES_USER_PRESENT, THREAD_EXECUTION_STATE_MASK,
+    THREAD_EXECUTION_STATE_VALID_MASK,
 };
 
 /// Why a power operation was rejected (spec §16, §19.3).
@@ -48,6 +49,11 @@ struct ThreadExecutionRecord {
     persistent_flags: u32,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct ProcessWakeupLatencyRecord {
+    process_id: u64,
+}
+
 /// Aggregate policy state produced by current thread assertions and one-shot pulses.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ExecutionStateSnapshot {
@@ -59,12 +65,22 @@ pub struct ExecutionStateSnapshot {
     pub display_activity_generation: u64,
 }
 
+/// Aggregate policy produced by the process-scoped `LT_LOWEST_LATENCY` attribute.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct WakeupLatencySnapshot {
+    pub lowest_latency_count: u64,
+    /// Advances when the effective low-latency constraint changes between clear and asserted.
+    pub policy_generation: u64,
+}
+
 /// The Power Manager: a table of per-devnode power records.
 #[derive(Default)]
 pub struct PowerManager {
     records: Vec<Record>,
     thread_execution_records: Vec<ThreadExecutionRecord>,
+    process_wakeup_latency_records: Vec<ProcessWakeupLatencyRecord>,
     execution_state: ExecutionStateSnapshot,
+    wakeup_latency: WakeupLatencySnapshot,
 }
 
 impl PowerManager {
@@ -72,7 +88,9 @@ impl PowerManager {
         Self {
             records: Vec::new(),
             thread_execution_records: Vec::new(),
+            process_wakeup_latency_records: Vec::new(),
             execution_state: ExecutionStateSnapshot::default(),
+            wakeup_latency: WakeupLatencySnapshot::default(),
         }
     }
 
@@ -209,6 +227,100 @@ impl PowerManager {
 
     pub fn execution_state_snapshot(&self) -> ExecutionStateSnapshot {
         self.execution_state
+    }
+
+    /// Apply `NtRequestWakeupLatency` for one current process. Repeating the same request is
+    /// idempotent: the global attribute count tracks owning processes, not syscall calls.
+    pub fn set_process_wakeup_latency(
+        &mut self,
+        process_id: u64,
+        latency: WakeupLatency,
+    ) -> Result<(), PowerError> {
+        if process_id == 0 {
+            return Err(PowerError::InvalidState);
+        }
+        let position = self
+            .process_wakeup_latency_records
+            .iter()
+            .position(|record| record.process_id == process_id);
+        match (position, latency) {
+            (Some(_), WakeupLatency::LowestLatency) | (None, WakeupLatency::DontCare) => Ok(()),
+            (Some(index), WakeupLatency::DontCare) => {
+                self.process_wakeup_latency_records.remove(index);
+                debug_assert!(self.wakeup_latency.lowest_latency_count != 0);
+                self.wakeup_latency.lowest_latency_count -= 1;
+                if self.wakeup_latency.lowest_latency_count == 0 {
+                    self.wakeup_latency.policy_generation =
+                        self.wakeup_latency.policy_generation.wrapping_add(1);
+                }
+                Ok(())
+            }
+            (None, WakeupLatency::LowestLatency) => {
+                self.process_wakeup_latency_records
+                    .try_reserve(1)
+                    .map_err(|_| PowerError::InsufficientResources)?;
+                self.process_wakeup_latency_records
+                    .push(ProcessWakeupLatencyRecord { process_id });
+                if self.wakeup_latency.lowest_latency_count == 0 {
+                    self.wakeup_latency.policy_generation =
+                        self.wakeup_latency.policy_generation.wrapping_add(1);
+                }
+                self.wakeup_latency.lowest_latency_count += 1;
+                Ok(())
+            }
+        }
+    }
+
+    /// Release a process's low-latency assertion during process rundown. This is exact and
+    /// idempotent, so a repeated teardown cannot decrement another process's request.
+    pub fn remove_process_wakeup_latency(&mut self, process_id: u64) -> bool {
+        let Some(index) = self
+            .process_wakeup_latency_records
+            .iter()
+            .position(|record| record.process_id == process_id)
+        else {
+            return false;
+        };
+        self.process_wakeup_latency_records.remove(index);
+        debug_assert!(self.wakeup_latency.lowest_latency_count != 0);
+        self.wakeup_latency.lowest_latency_count -= 1;
+        if self.wakeup_latency.lowest_latency_count == 0 {
+            self.wakeup_latency.policy_generation =
+                self.wakeup_latency.policy_generation.wrapping_add(1);
+        }
+        true
+    }
+
+    pub fn process_wakeup_latency(&self, process_id: u64) -> WakeupLatency {
+        if self
+            .process_wakeup_latency_records
+            .iter()
+            .any(|record| record.process_id == process_id)
+        {
+            WakeupLatency::LowestLatency
+        } else {
+            WakeupLatency::DontCare
+        }
+    }
+
+    pub fn wakeup_latency_snapshot(&self) -> WakeupLatencySnapshot {
+        self.wakeup_latency
+    }
+
+    /// Apply NT5's low-latency sleep-policy bound. An asserted request can make the selected sleep
+    /// state shallower, but can never deepen a policy maximum that is already more restrictive.
+    pub fn constrain_deepest_sleep(
+        &self,
+        policy_maximum: SystemPowerState,
+        reduced_latency_sleep: SystemPowerState,
+    ) -> SystemPowerState {
+        if self.wakeup_latency.lowest_latency_count != 0
+            && policy_maximum as u32 >= reduced_latency_sleep as u32
+        {
+            reduced_latency_sleep
+        } else {
+            policy_maximum
+        }
     }
 
     fn find(&self, id: u64) -> Option<&Record> {
@@ -611,6 +723,72 @@ mod tests {
         assert_eq!(
             p.set_thread_execution_state(20, ES_USER_PRESENT),
             Err(PowerError::InvalidState)
+        );
+    }
+
+    #[test]
+    fn wakeup_latency_is_process_scoped_and_reference_counted() {
+        let mut p = PowerManager::new();
+        assert_eq!(
+            p.set_process_wakeup_latency(10, WakeupLatency::LowestLatency),
+            Ok(())
+        );
+        assert_eq!(
+            p.set_process_wakeup_latency(10, WakeupLatency::LowestLatency),
+            Ok(())
+        );
+        assert_eq!(
+            p.set_process_wakeup_latency(20, WakeupLatency::LowestLatency),
+            Ok(())
+        );
+        assert_eq!(
+            p.wakeup_latency_snapshot(),
+            WakeupLatencySnapshot {
+                lowest_latency_count: 2,
+                policy_generation: 1,
+            }
+        );
+        assert_eq!(p.process_wakeup_latency(10), WakeupLatency::LowestLatency);
+
+        assert_eq!(
+            p.set_process_wakeup_latency(10, WakeupLatency::DontCare),
+            Ok(())
+        );
+        assert_eq!(p.wakeup_latency_snapshot().lowest_latency_count, 1);
+        assert_eq!(p.wakeup_latency_snapshot().policy_generation, 1);
+        assert_eq!(p.process_wakeup_latency(10), WakeupLatency::DontCare);
+
+        assert!(p.remove_process_wakeup_latency(20));
+        assert!(!p.remove_process_wakeup_latency(20));
+        assert_eq!(
+            p.wakeup_latency_snapshot(),
+            WakeupLatencySnapshot {
+                lowest_latency_count: 0,
+                policy_generation: 2,
+            }
+        );
+        assert_eq!(
+            p.set_process_wakeup_latency(0, WakeupLatency::LowestLatency),
+            Err(PowerError::InvalidState)
+        );
+    }
+
+    #[test]
+    fn low_latency_attribute_constrains_only_deeper_sleep_policy() {
+        let mut p = PowerManager::new();
+        assert_eq!(
+            p.constrain_deepest_sleep(SystemPowerState::Hibernate, SystemPowerState::Sleeping2),
+            SystemPowerState::Hibernate
+        );
+        p.set_process_wakeup_latency(10, WakeupLatency::LowestLatency)
+            .unwrap();
+        assert_eq!(
+            p.constrain_deepest_sleep(SystemPowerState::Hibernate, SystemPowerState::Sleeping2),
+            SystemPowerState::Sleeping2
+        );
+        assert_eq!(
+            p.constrain_deepest_sleep(SystemPowerState::Sleeping1, SystemPowerState::Sleeping2),
+            SystemPowerState::Sleeping1
         );
     }
 }

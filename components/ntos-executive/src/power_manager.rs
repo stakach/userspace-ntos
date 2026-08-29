@@ -1,7 +1,8 @@
 //! Executive ownership boundary for the NT Power Manager.
 //!
 //! Device-stack discovery remains in `driver_launch`, but policy state lives here. This keeps one
-//! component-neutral authority for per-devnode power and per-thread execution-state accounting.
+//! component-neutral authority for per-devnode power, per-thread execution-state accounting, and
+//! process-scoped wakeup-latency requests.
 
 static mut POWER_MANAGER: Option<nt_power_manager::PowerManager> = None;
 
@@ -83,4 +84,19 @@ pub(crate) unsafe fn remove_thread_execution_state(thread_id: u64) -> bool {
     (*core::ptr::addr_of_mut!(POWER_MANAGER))
         .as_mut()
         .is_some_and(|manager| manager.remove_thread_execution_state(thread_id))
+}
+
+pub(crate) unsafe fn set_process_wakeup_latency(
+    process_id: u64,
+    latency: nt_power_manager::WakeupLatency,
+) -> Result<(), nt_status::NtStatus> {
+    manager_mut()
+        .set_process_wakeup_latency(process_id, latency)
+        .map_err(status)
+}
+
+pub(crate) unsafe fn remove_process_wakeup_latency(process_id: u64) -> bool {
+    (*core::ptr::addr_of_mut!(POWER_MANAGER))
+        .as_mut()
+        .is_some_and(|manager| manager.remove_process_wakeup_latency(process_id))
 }

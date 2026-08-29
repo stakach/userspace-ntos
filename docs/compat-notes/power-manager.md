@@ -36,6 +36,11 @@ IOCTLs + interrupt delivery are gated on `Powered`.
   overwrite that record. Thread rundown removes the exact record and releases only its
   assertions; repeated rundown is idempotent. Activity generations expose real policy
   transitions without storing a process/image-specific summary.
+- Process wakeup-latency records are keyed by dynamic process ID. `LT_LOWEST_LATENCY`
+  contributes one idempotent process reference to the aggregate low-latency attribute;
+  `LT_DONT_CARE` and process rundown remove only that process's reference. The resulting
+  policy constrains a deeper normal sleep maximum to the configured reduced-latency state
+  without deepening an already stricter policy.
 - `begin_device_transition(devnode, target)` validates the devnode is registered, not
   removing, and has no power IRP in flight (one-in-flight, §16.1) — else
   `NotRegistered`/`Removed`/`Busy`/`InvalidState` — and marks it in-flight, returning
@@ -45,7 +50,9 @@ IOCTLs + interrupt delivery are gated on `Powered`.
   gating). Nine device-lifecycle tests cover prepared/start lifecycle, AddDevice report
   preservation, independent per-devnode reporting, D0→D3→D0, one-in-flight,
   transition failure, removal, invalid states, and stale devnodes. Three execution-state
-  tests cover independent thread assertions, pulse behavior, and exact thread rundown.
+  tests cover independent thread assertions, pulse behavior, and exact thread rundown. Two
+  wakeup-latency tests cover process ownership, aggregate accounting, exact rundown, and the
+  effective sleep-policy constraint.
 
 ## Po exports + full lifecycle in QEMU (implemented, Milestones 13.3-13.7 — `driver-host-power`)
 
@@ -65,6 +72,10 @@ IOCTLs + interrupt delivery are gated on `Powered`.
   same focused Power Manager authority. It returns the thread's prior persistent flags
   with `ES_CONTINUOUS`, implements one-shot pulse semantics, and relies on common thread
   teardown for assertion rundown. The executive owns no parallel execution-state cache.
+- Native `NtRequestWakeupLatency` (SSN 209) accepts only the NT5 `LATENCY_TIME` values,
+  resolves the current live process dynamically, and mutates that same Power Manager.
+  Repeated requests are idempotent and common process teardown releases the exact process
+  contribution. No image-specific policy or executive-side scalar cache exists.
 - **`Parameters.Power` layout (discovered)**: the `Power` fields are `POINTER_ALIGNMENT`
   8-byte slots (same as `DeviceIoControl`): `Type`@**16**, `State`@**24** within the
   `IO_STACK_LOCATION` — *not* 12/16 (packed) as a naive reading suggests.

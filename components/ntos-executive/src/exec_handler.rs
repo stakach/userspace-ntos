@@ -18729,6 +18729,9 @@ impl ExecNtHandler {
             self.release_handle_object(object);
             PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
         }
+        unsafe {
+            crate::power_manager::remove_process_wakeup_latency(pid as u64);
+        }
         let Some(endpoint) = self.pm.process_exception_port_endpoint(pid) else {
             return;
         };
@@ -33807,6 +33810,23 @@ impl ExecNtHandler {
                     0
                 } else {
                     STATUS_ACCESS_VIOLATION
+                }
+            },
+            NativeService::NtRequestWakeupLatency => unsafe {
+                let Some(latency) =
+                    nt_power_manager::WakeupLatency::from_u32(nt_ulong_arg(args[0]))
+                else {
+                    return STATUS_INVALID_PARAMETER;
+                };
+                let Some(pid) = self.pm_pid_for_pi(self.pi) else {
+                    return nt_process::STATUS_INVALID_HANDLE;
+                };
+                if self.pm.process(pid).is_none() {
+                    return nt_process::STATUS_INVALID_HANDLE;
+                }
+                match crate::power_manager::set_process_wakeup_latency(pid as u64, latency) {
+                    Ok(()) => 0,
+                    Err(status) => status.raw() as u32,
                 }
             },
             NativeService::NtGetDevicePowerState => unsafe {

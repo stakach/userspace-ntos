@@ -1018,6 +1018,21 @@ fn set_thread_execution_state_uses_its_canonical_service_contract() {
 }
 
 #[test]
+fn request_wakeup_latency_uses_its_canonical_service_contract() {
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtRequestWakeupLatency, 209)],
+    );
+    let entry = table.lookup(209).unwrap();
+    assert_eq!(entry.service, NativeService::NtRequestWakeupLatency);
+    assert_eq!((entry.min_args, entry.max_args), (1, 1));
+    assert_eq!(
+        table.number_of(NativeService::NtRequestWakeupLatency),
+        Some(209)
+    );
+}
+
+#[test]
 fn set_default_hard_error_port_uses_its_canonical_service_contract() {
     let table = NativeServiceTable::from_numbers(
         UserlandAbiProfile::Windows7,

@@ -16921,3 +16921,41 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     closed. Regenerate the 37-service inventory and select the next bounded canonical Ob/Ps/Se/Mm or
     I/O trait. Keep the mechanism in a focused host-tested owner, add only typed executive wiring,
     and remove any old scalar or boot-specific machinery replaced by the real authority.
+
+    Process wakeup-latency policy and `NtRequestWakeupLatency` (2026-08-30, accepted): SSN 209 is
+    now a typed, registered one-argument service backed by the existing focused Power Manager. The
+    contract follows the pinned NT5 implementation rather than ReactOS's gap: `LT_DONT_CARE` clears
+    the calling process's request, `LT_LOWEST_LATENCY` installs it, and every other value returns
+    `STATUS_INVALID_PARAMETER`. The handler resolves a live current process dynamically; it has no
+    image identity, boot ordinal, scalar cache, or unconditional-success branch.
+
+    The Power Manager owns growable exact process records plus the aggregate low-latency attribute
+    count. Repeating the same request is idempotent, independent processes contribute separate
+    references, and common process rundown removes only the exiting process's contribution. The
+    effective-policy generation changes only across clear/asserted transitions. Its tested sleep
+    policy operation applies NT5's reduced-latency bound only when the normal deepest state is deep
+    enough, so a request can make sleep shallower but can never deepen an already stricter policy.
+    This is the real policy input consumed by future system power transitions, not an unobserved
+    stored value.
+
+    Focused validation passes `nt-power-types` `5/5`, `nt-power-manager` `14/14`, `nt-syscall`
+    `78/78`, focused formatting, and `git diff --check`. The freestanding executive remains at the
+    established 209-warning baseline and the release staging path succeeds. The serialized live
+    gate launches genuine userinit and Explorer, records 633 real api0 redirects with zero callback
+    failures, installs 17 client WndProcs without replay, reaches Explorer paint begin/end `4/13`
+    with 176 direct GDI returns and 104 batch flushes covering 124 records, paints
+    `480000/480000` framebuffer pixels with at least 32 colours, passes all `295/295` checks, and
+    matches the sentinel. The ordinary desktop workload does not issue SSN 209; its native mutation,
+    aggregate accounting, sleep constraint, and rundown behavior are proved by the focused tests.
+
+    The typed surface now contains 188 services, the hosted table registers 187 numbered variants,
+    and 36 required canonical services remain absent.
+
+    Review adjustment: process wakeup-latency policy is closed. The inventory review also exposed
+    that the already typed `NtIsProcessInJob` handler still returns a synthetic successful
+    not-assigned answer after only validating the process handle. Treat the complete Ps/Ob job
+    object family as the next coherent subsystem: create/open identity, access-checked handles,
+    one-job process membership, limits/accounting, query/set, termination, signalling, completion
+    notifications, and rundown must share one host-tested authority. Delete that synthetic handler
+    when the real membership query is installed; do not add isolated job-shaped state in the
+    executive or claim individual service completion while their shared lifecycle is missing.
