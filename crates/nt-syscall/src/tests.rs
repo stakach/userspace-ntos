@@ -1002,6 +1002,22 @@ fn get_device_power_state_uses_its_canonical_service_contract() {
 }
 
 #[test]
+fn set_thread_execution_state_uses_its_canonical_service_contract() {
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtSetThreadExecutionState, 252)],
+    );
+    let entry = table.lookup(252).unwrap();
+    assert_eq!(entry.service, NativeService::NtSetThreadExecutionState);
+    assert_eq!((entry.min_args, entry.max_args), (2, 2));
+    assert_eq!(
+        table.number_of(NativeService::NtSetThreadExecutionState),
+        Some(252)
+    );
+    assert!(NativeService::ALL.contains(&NativeService::NtQueryKey));
+}
+
+#[test]
 fn delay_execution_registers_with_native_abi() {
     let table = NativeServiceTable::from_numbers(
         UserlandAbiProfile::Windows7,

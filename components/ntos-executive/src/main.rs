@@ -59,6 +59,7 @@ mod device_io;
 pub(crate) use device_io::*;
 mod pnp;
 pub(crate) use pnp::*;
+mod power_manager;
 mod hosted_pnp_context;
 pub(crate) use hosted_pnp_context::*;
 mod hosted_pnp_start;
@@ -1189,6 +1190,7 @@ pub const SSN_NT_QUERY_INFORMATION_FILE: u64 = 158;
 /// are answered from real registry-indexed device state.
 pub const SSN_NT_GET_PLUG_PLAY_EVENT: u64 = 91;
 pub const SSN_NT_GET_DEVICE_POWER_STATE: u64 = 90;
+pub const SSN_NT_SET_THREAD_EXECUTION_STATE: u64 = 252;
 pub const SSN_NT_PLUG_PLAY_CONTROL: u64 = 138;
 /// Obsolete event-pair object type imported by legacy shell extensions. No event-pair object
 /// manager type exists here yet, so opens fail as a missing named object.
@@ -17664,6 +17666,7 @@ pub(crate) unsafe fn release_unregistered_hosted_thread_spawn(spawn: HostedThrea
 }
 
 unsafe fn hosted_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
+    let _ = power_manager::remove_thread_execution_state(tid);
     let _ = crate::service_sec_image::pending_driver_load_abandon_thread(handler, tid);
     let _ = crate::service_sec_image::lpc_receive_wait_abandon_thread(handler, tid);
     let _ = crate::service_sec_image::lpc_connect_wait_abandon_thread(handler, tid);
@@ -24284,6 +24287,10 @@ fn build_nt_table() -> NativeServiceTable {
             (
                 NativeService::NtSetSystemPowerState,
                 SSN_NT_SET_SYSTEM_POWER_STATE as u32,
+            ),
+            (
+                NativeService::NtSetThreadExecutionState,
+                SSN_NT_SET_THREAD_EXECUTION_STATE as u32,
             ),
             (NativeService::NtSetUuidSeed, SSN_NT_SET_UUID_SEED as u32),
             (

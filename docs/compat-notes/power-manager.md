@@ -11,7 +11,10 @@ IOCTLs + interrupt delivery are gated on `Powered`.
   (D0=1 … D3=4), both `#[repr(u32)]`; `IRP_MJ_POWER`=0x16, minors (WAIT_WAKE=0,
   POWER_SEQUENCE=1, SET_POWER=2, QUERY_POWER=3); the `Parameters.Power` stack layout
   (`Type`@16, `State`@24 within an `IO_STACK_LOCATION`); `STATUS_DEVICE_POWERED_OFF`.
-  `DevicePowerState::is_on()` is true only for D0.
+  `DevicePowerState::is_on()` is true only for D0. The crate also owns the exact NT5
+  execution-state flags and distinguishes the native accepted mask
+  (`ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED | ES_CONTINUOUS`) from the internal
+  `ES_USER_PRESENT` flag.
 - `nt-power-abi`: opcodes `POWER_OP_*` (0x7000..=0x70ff); `#[repr(C)]`
   `PowerStateWire`, `PowerSetDeviceReq`, `PowerRegisterDeviceReq`. Responses use
   `detail0` = old state, `detail1` = new state. 6 layout tests.
@@ -27,15 +30,22 @@ IOCTLs + interrupt delivery are gated on `Powered`.
 - `report_device_state` and `report_system_state` update only the addressed devnode and
   return its previous state. Invalid or absent records fail explicitly; one device can
   never overwrite another device's state.
+- Per-thread execution-state records are keyed by dynamic thread ID. Continuous requests
+  replace only the current thread's persistent system/display assertions and update
+  aggregate reference counts. Noncontinuous requests are one-shot pulses and do not
+  overwrite that record. Thread rundown removes the exact record and releases only its
+  assertions; repeated rundown is idempotent. Activity generations expose real policy
+  transitions without storing a process/image-specific summary.
 - `begin_device_transition(devnode, target)` validates the devnode is registered, not
   removing, and has no power IRP in flight (one-in-flight, §16.1) — else
   `NotRegistered`/`Removed`/`Busy`/`InvalidState` — and marks it in-flight, returning
   the old state. `complete_device_transition(devnode, target, success)` moves to
   `target` on success or preserves the old state on failure (§9.4), always clearing
   in-flight. `is_on` is true only for a started device in D0 (§8.1 I/O + interrupt
-  gating). 9 unit tests cover prepared/start lifecycle, AddDevice report preservation,
-  independent per-devnode reporting, D0→D3→D0, one-in-flight, transition failure,
-  removal, invalid states, and stale devnodes.
+  gating). Nine device-lifecycle tests cover prepared/start lifecycle, AddDevice report
+  preservation, independent per-devnode reporting, D0→D3→D0, one-in-flight,
+  transition failure, removal, invalid states, and stale devnodes. Three execution-state
+  tests cover independent thread assertions, pulse behavior, and exact thread rundown.
 
 ## Po exports + full lifecycle in QEMU (implemented, Milestones 13.3-13.7 — `driver-host-power`)
 
@@ -50,6 +60,11 @@ IOCTLs + interrupt delivery are gated on `Powered`.
   resolves its live I/O Manager route to the related hosted PDO. It returns only the
   authoritative state of a successfully started devnode. Non-device files, stale
   handles, unstarted devices, and absent bindings fail explicitly.
+- Native `NtSetThreadExecutionState` (SSN 252) validates the exact NT5 flag mask, probes
+  the aligned previous-state output, resolves the current dynamic thread, and mutates the
+  same focused Power Manager authority. It returns the thread's prior persistent flags
+  with `ES_CONTINUOUS`, implements one-shot pulse semantics, and relies on common thread
+  teardown for assertion rundown. The executive owns no parallel execution-state cache.
 - **`Parameters.Power` layout (discovered)**: the `Power` fields are `POINTER_ALIGNMENT`
   8-byte slots (same as `DeviceIoControl`): `Type`@**16**, `State`@**24** within the
   `IO_STACK_LOCATION` — *not* 12/16 (packed) as a naive reading suggests.

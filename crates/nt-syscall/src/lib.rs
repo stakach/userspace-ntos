@@ -280,6 +280,8 @@ pub enum NativeService {
     NtWaitForDebugEvent,
     /// Query the Power Manager record for the PDO related to a typed File handle.
     NtGetDevicePowerState,
+    /// Track persistent and one-shot execution-state assertions for the current thread.
+    NtSetThreadExecutionState,
     /// `ExAllocateLocallyUniqueId` (`ntoskrnl/ex/uuid.c:335`) — the monotonic LUID allocator every
     /// logon session identity comes from (`AllocateLocallyUniqueId` in msgina's `MyLogonUser`).
     NtAllocateLocallyUniqueId,
@@ -473,6 +475,7 @@ impl NativeService {
             NtSetInformationDebugObject => "NtSetInformationDebugObject",
             NtWaitForDebugEvent => "NtWaitForDebugEvent",
             NtGetDevicePowerState => "NtGetDevicePowerState",
+            NtSetThreadExecutionState => "NtSetThreadExecutionState",
             NtAllocateLocallyUniqueId => "NtAllocateLocallyUniqueId",
             NtImpersonateClientOfPort => "NtImpersonateClientOfPort",
         }
@@ -516,6 +519,7 @@ impl NativeService {
         NativeService::NtSetValueKey,
         NativeService::NtEnumerateKey,
         NativeService::NtEnumerateValueKey,
+        NativeService::NtQueryKey,
         NativeService::NtFlushKey,
         NativeService::NtAllocateVirtualMemory,
         NativeService::NtFreeVirtualMemory,
@@ -672,6 +676,7 @@ impl NativeService {
         NativeService::NtUnlockVirtualMemory,
         NativeService::NtSetInformationDebugObject,
         NativeService::NtGetDevicePowerState,
+        NativeService::NtSetThreadExecutionState,
     ];
 }
 

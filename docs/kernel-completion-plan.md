@@ -16793,3 +16793,43 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Ob/Ps/Se/Mm/I/O trait. Prefer a mechanism with a focused host-testable owner, keep policy out of
     the executive, and delete any scalar or hosted-image-specific state that the real implementation
     replaces.
+
+    Per-thread execution-state authority and `NtSetThreadExecutionState` (2026-08-30, accepted):
+    SSN 252 is now a typed, registered two-argument service backed by the same focused Power Manager
+    authority as per-devnode power state. The previous Power Manager singleton and status mapping
+    have moved out of the oversized driver-launch module into a component-neutral executive boundary;
+    device discovery remains in the I/O/PnP owner and no parallel cache was introduced.
+
+    `nt-power-manager` now owns growable execution-state records keyed by dynamic thread ID. A
+    continuous request replaces only that thread's persistent system/display assertions and updates
+    aggregate reference counts. A noncontinuous request is a one-shot pulse only when no persistent
+    assertion already covers the attribute, and it never overwrites the thread record. The common
+    hosted-thread teardown path performs exact, idempotent rundown, so terminating one thread cannot
+    release another thread's assertion. Activity generations retain policy-relevant transitions
+    without adding a process name, image identity, device ordinal, or synthetic success path.
+
+    The handler follows the pinned NT5 contract rather than ReactOS's incomplete implementation: it
+    accepts only `ES_SYSTEM_REQUIRED`, `ES_DISPLAY_REQUIRED`, and `ES_CONTINUOUS`; rejects
+    `ES_USER_PRESENT` and unknown bits; probes the aligned previous-state output; validates the
+    current live thread; and returns its prior persistent flags with `ES_CONTINUOUS`. The focused
+    implementation preserves fallible allocation and explicit failure status throughout.
+
+    Focused validation passes `nt-power-types` `4/4`, `nt-power-manager` `12/12`, `nt-syscall`
+    `73/73`, `git diff --check`, the freestanding executive at the established 209-warning baseline,
+    and the executive release build/staging path. The serialized live gate launches genuine userinit
+    and Explorer, balances `893/893` real callback redirects/returns with zero callback failures,
+    reaches Explorer paint begin/end `5/20` with 187 direct GDI returns and 135 batch flushes covering
+    184 records, paints `480000/480000` framebuffer pixels with at least 32 colours, passes all
+    `295/295` gates, and matches the sentinel. The normal desktop workload does not issue SSN 252;
+    focused tests prove its native ABI, per-thread accounting, pulse, and rundown contracts.
+
+    The canonical inventory audit also repaired `NativeService::ALL`, which had omitted the already
+    implemented `NtQueryKey`. The typed surface now contains 186 services, all 186 appear in that
+    inventory, the hosted table registers 185 numbered variants, and 38 required canonical services
+    remain absent.
+
+    Review adjustment: select the next bounded canonical trait from the regenerated 38-service list.
+    `NtRequestWakeupLatency` is the closest related candidate, but it must wait for a real process
+    policy/lifecycle owner and observable aggregate latency contract; merely storing and returning a
+    requested value would be a fallback. Prefer a missing Ob/Ps/Se/Mm/I/O trait whose mechanism and
+    teardown can be proved in a focused crate before executive wiring.

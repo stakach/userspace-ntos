@@ -11,6 +11,14 @@
 pub const POWER_STATE_TYPE_SYSTEM: u32 = 0;
 pub const POWER_STATE_TYPE_DEVICE: u32 = 1;
 
+/// `EXECUTION_STATE` flags accepted by NT5's `NtSetThreadExecutionState`.
+pub const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
+pub const ES_DISPLAY_REQUIRED: u32 = 0x0000_0002;
+pub const ES_USER_PRESENT: u32 = 0x0000_0004;
+pub const ES_CONTINUOUS: u32 = 0x8000_0000;
+pub const THREAD_EXECUTION_STATE_MASK: u32 = ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED;
+pub const THREAD_EXECUTION_STATE_VALID_MASK: u32 = THREAD_EXECUTION_STATE_MASK | ES_CONTINUOUS;
+
 /// `SYSTEM_POWER_STATE` (spec §6.2).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -112,6 +120,15 @@ mod tests {
         assert_eq!(IRP_MJ_POWER, 0x16);
         assert_eq!(IRP_MN_SET_POWER, 2);
         assert_eq!(IRP_MN_QUERY_POWER, 3);
+    }
+
+    #[test]
+    fn execution_state_flags_match_nt5() {
+        assert_eq!(ES_SYSTEM_REQUIRED, 1);
+        assert_eq!(ES_DISPLAY_REQUIRED, 2);
+        assert_eq!(ES_USER_PRESENT, 4);
+        assert_eq!(ES_CONTINUOUS, 0x8000_0000);
+        assert_eq!(THREAD_EXECUTION_STATE_VALID_MASK, 0x8000_0003);
     }
 
     #[test]

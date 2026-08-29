@@ -33531,6 +33531,39 @@ impl ExecNtHandler {
                 }
             }
             NativeService::NtGetPlugPlayEvent => unsafe { self.nt_get_plug_play_event(args) },
+            NativeService::NtSetThreadExecutionState => unsafe {
+                let requested_flags = args[0] as u32;
+                let previous_flags = args[1];
+                if requested_flags & !nt_power_types::THREAD_EXECUTION_STATE_VALID_MASK != 0 {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                if ctx.previous_mode != nt_syscall::ProcessorMode::KernelMode
+                    && previous_flags & 3 != 0
+                {
+                    return STATUS_DATATYPE_MISALIGNMENT;
+                }
+                if previous_flags == 0 || !self.probe_user_output(previous_flags, 4) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let Ok(thread_id) = nt_process::ThreadId::try_from(self.current_tid) else {
+                    return nt_process::STATUS_INVALID_HANDLE;
+                };
+                if self.pm.thread(thread_id).is_none() {
+                    return nt_process::STATUS_INVALID_HANDLE;
+                }
+                let previous = match crate::power_manager::set_thread_execution_state(
+                    self.current_tid,
+                    requested_flags,
+                ) {
+                    Ok(previous) => previous,
+                    Err(status) => return status.raw() as u32,
+                };
+                if self.xas_write_u32(previous_flags, previous) {
+                    0
+                } else {
+                    STATUS_ACCESS_VIOLATION
+                }
+            },
             NativeService::NtGetDevicePowerState => unsafe {
                 let state = args[1];
                 if ctx.previous_mode != nt_syscall::ProcessorMode::KernelMode && state & 3 != 0 {

@@ -7958,8 +7958,7 @@ extern "win64" fn s_po_set_power_state(device: u64, power_type: u32, state: u32)
                 let Some(state) = nt_power_manager::DevicePowerState::from_u32(state) else {
                     return nt_power_manager::DevicePowerState::Unspecified as u32;
                 };
-                hosted_power_manager_mut()
-                    .report_device_state(devnode_id, state)
+                crate::power_manager::report_device_state(devnode_id, state)
                     .map(|previous| previous as u32)
                     .unwrap_or(nt_power_manager::DevicePowerState::Unspecified as u32)
             }
@@ -7967,8 +7966,7 @@ extern "win64" fn s_po_set_power_state(device: u64, power_type: u32, state: u32)
                 let Some(state) = nt_power_manager::SystemPowerState::from_u32(state) else {
                     return nt_power_manager::SystemPowerState::Unspecified as u32;
                 };
-                hosted_power_manager_mut()
-                    .report_system_state(devnode_id, state)
+                crate::power_manager::report_system_state(devnode_id, state)
                     .map(|previous| previous as u32)
                     .unwrap_or(nt_power_manager::SystemPowerState::Unspecified as u32)
             }
@@ -35881,7 +35879,6 @@ pub(crate) struct HostedIoPortFaultGrant {
 static mut HOSTED_DEVICE_BINDINGS: Option<Vec<HostedDeviceBinding>> = None;
 static mut HOSTED_ROOT_BUS: Option<nt_root_bus::RootBus> = None;
 static mut HOSTED_PNP_MANAGER: Option<nt_pnp_manager::PnpManager> = None;
-static mut HOSTED_POWER_MANAGER: Option<nt_power_manager::PowerManager> = None;
 static mut HOSTED_RESOURCE_MANAGER: Option<ResourceManager> = None;
 static mut HOSTED_DMA_MANAGER: Option<HostedDmaManager> = None;
 static mut HOSTED_MDL_REGISTRY: Option<MdlRegistry> = None;
@@ -36226,31 +36223,6 @@ unsafe fn hosted_pnp_manager_mut() -> &'static mut nt_pnp_manager::PnpManager {
     slot.as_mut().unwrap()
 }
 
-unsafe fn hosted_power_manager_mut() -> &'static mut nt_power_manager::PowerManager {
-    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_POWER_MANAGER);
-    if slot.is_none() {
-        *slot = Some(nt_power_manager::PowerManager::new());
-    }
-    slot.as_mut().unwrap()
-}
-
-fn hosted_power_status(error: nt_power_manager::PowerError) -> nt_status::NtStatus {
-    match error {
-        nt_power_manager::PowerError::InsufficientResources => {
-            nt_status::NtStatus::INSUFFICIENT_RESOURCES
-        }
-        nt_power_manager::PowerError::NotRegistered => {
-            nt_status::NtStatus(0xC000_00A3u32 as i32) // STATUS_DEVICE_NOT_READY
-        }
-        nt_power_manager::PowerError::NotStarted => {
-            nt_status::NtStatus(0xC000_00A3u32 as i32) // STATUS_DEVICE_NOT_READY
-        }
-        nt_power_manager::PowerError::Removed => nt_status::NtStatus::DELETE_PENDING,
-        nt_power_manager::PowerError::Busy => nt_status::NtStatus::DEVICE_BUSY,
-        nt_power_manager::PowerError::InvalidState => nt_status::NtStatus::INVALID_PARAMETER,
-    }
-}
-
 unsafe fn hosted_pnp_transactions_mut() -> &'static mut Vec<HostedPnpTransaction> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_PNP_TRANSACTIONS);
     if slot.is_none() {
@@ -36487,9 +36459,7 @@ unsafe fn finish_hosted_start_publication(irp_id: IrpId) -> Result<(), nt_status
             .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
             .power_state_published;
         if !power_state_published {
-            hosted_power_manager_mut()
-                .complete_start(binding.pdo_device_id)
-                .map_err(hosted_power_status)?;
+            crate::power_manager::complete_start(binding.pdo_device_id)?;
             hosted_pnp_transactions_mut()
                 .iter_mut()
                 .find(|transaction| transaction.irp_id == irp_id)
@@ -37224,11 +37194,7 @@ pub(crate) fn hosted_device_power_state(
 ) -> Result<nt_power_manager::DevicePowerState, nt_status::NtStatus> {
     let binding = hosted_device_binding_by_stack_device_id(device_id)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    let manager = unsafe { (*core::ptr::addr_of!(HOSTED_POWER_MANAGER)).as_ref() }
-        .ok_or(nt_status::NtStatus(0xC000_00A3u32 as i32))?; // STATUS_DEVICE_NOT_READY
-    manager
-        .started_device_state(binding.pdo_device_id)
-        .ok_or(nt_status::NtStatus(0xC000_00A3u32 as i32))
+    unsafe { crate::power_manager::started_device_state(binding.pdo_device_id) }
 }
 
 unsafe fn read_hosted_hardware_evidence_from_shared(
@@ -39638,11 +39604,7 @@ fn teardown_hosted_device_binding(binding: HostedDeviceBinding) -> bool {
     ) {
         return false;
     }
-    unsafe {
-        if let Some(manager) = (*core::ptr::addr_of_mut!(HOSTED_POWER_MANAGER)).as_mut() {
-            manager.unregister_device(binding.pdo_device_id);
-        }
-    }
+    unsafe { crate::power_manager::unregister_device(binding.pdo_device_id) };
     unsafe { release_hosted_registry_identity(binding.registry_identity_id) };
     true
 }
@@ -42928,9 +42890,7 @@ where
             core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_REGISTRY_IDENTITY_ID),
             registry_identity_id,
         );
-        hosted_power_manager_mut()
-            .prepare_device(pdo_device_id)
-            .map_err(hosted_power_status)?;
+        crate::power_manager::prepare_device(pdo_device_id)?;
         power_record_prepared = true;
         let power_driver_object = provider_route
             .map(|route| route.provider_driver_object)
@@ -43040,7 +43000,7 @@ where
         }
         Err(status) => {
             if power_record_prepared {
-                hosted_power_manager_mut().unregister_device(pdo_device_id);
+                crate::power_manager::unregister_device(pdo_device_id);
             }
             clear_shared_registry_identity_at(inst.exec_shared_va);
             if let Some(provider_shared) = provider_add_device_shared {

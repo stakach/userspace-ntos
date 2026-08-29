@@ -1,10 +1,9 @@
 //! # `nt-power-manager` — the Power Manager core
 //!
-//! Per-devnode power records + the D0/D3 device power transition state machine
-//! (spec: NT Power Manager, Milestone 13, §7, §10, §16). It enforces one power IRP
-//! in flight per devnode, rejects transitions after remove, and (with the caller's
-//! query result) implements query-fails-prevents-set / set-fails-preserves-old.
-//! `no_std` + `alloc`; holds no driver pointers — only IDs + power states.
+//! Per-devnode power records, the D0/D3 device power transition state machine, and
+//! per-thread execution-state accounting (spec: NT Power Manager, Milestone 13,
+//! §7, §10, §16). `no_std` + `alloc`; holds no driver pointers, only stable IDs and
+//! power-policy state.
 
 #![no_std]
 
@@ -12,7 +11,10 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-pub use nt_power_types::{DevicePowerState, SystemPowerState};
+pub use nt_power_types::{
+    DevicePowerState, SystemPowerState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED,
+    ES_USER_PRESENT, THREAD_EXECUTION_STATE_MASK, THREAD_EXECUTION_STATE_VALID_MASK,
+};
 
 /// Why a power operation was rejected (spec §16, §19.3).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -40,17 +42,173 @@ struct Record {
     remove_in_progress: bool,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct ThreadExecutionRecord {
+    thread_id: u64,
+    persistent_flags: u32,
+}
+
+/// Aggregate policy state produced by current thread assertions and one-shot pulses.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExecutionStateSnapshot {
+    pub system_required_count: u64,
+    pub display_required_count: u64,
+    /// Changes when a zero-count system assertion is first set or pulsed.
+    pub system_activity_generation: u64,
+    /// Changes when the effective display-required state changes or is pulsed while clear.
+    pub display_activity_generation: u64,
+}
+
 /// The Power Manager: a table of per-devnode power records.
 #[derive(Default)]
 pub struct PowerManager {
     records: Vec<Record>,
+    thread_execution_records: Vec<ThreadExecutionRecord>,
+    execution_state: ExecutionStateSnapshot,
 }
 
 impl PowerManager {
     pub fn new() -> Self {
         Self {
             records: Vec::new(),
+            thread_execution_records: Vec::new(),
+            execution_state: ExecutionStateSnapshot::default(),
         }
+    }
+
+    fn thread_execution_record(&self, thread_id: u64) -> Option<&ThreadExecutionRecord> {
+        self.thread_execution_records
+            .iter()
+            .find(|record| record.thread_id == thread_id)
+    }
+
+    fn apply_persistent_execution_change(&mut self, old_flags: u32, new_flags: u32) {
+        let changed = (old_flags ^ new_flags) & THREAD_EXECUTION_STATE_MASK;
+        if changed & ES_SYSTEM_REQUIRED != 0 {
+            if new_flags & ES_SYSTEM_REQUIRED != 0 {
+                if self.execution_state.system_required_count == 0 {
+                    self.execution_state.system_activity_generation = self
+                        .execution_state
+                        .system_activity_generation
+                        .wrapping_add(1);
+                }
+                self.execution_state.system_required_count += 1;
+            } else {
+                debug_assert!(self.execution_state.system_required_count != 0);
+                self.execution_state.system_required_count -= 1;
+            }
+        }
+        if changed & ES_DISPLAY_REQUIRED != 0 {
+            if new_flags & ES_DISPLAY_REQUIRED != 0 {
+                if self.execution_state.display_required_count == 0 {
+                    self.execution_state.display_activity_generation = self
+                        .execution_state
+                        .display_activity_generation
+                        .wrapping_add(1);
+                }
+                self.execution_state.display_required_count += 1;
+            } else {
+                debug_assert!(self.execution_state.display_required_count != 0);
+                self.execution_state.display_required_count -= 1;
+                if self.execution_state.display_required_count == 0 {
+                    self.execution_state.display_activity_generation = self
+                        .execution_state
+                        .display_activity_generation
+                        .wrapping_add(1);
+                }
+            }
+        }
+    }
+
+    /// Apply `NtSetThreadExecutionState` for one current thread and return its previous persistent
+    /// assertions with `ES_CONTINUOUS` set, as the native API requires.
+    ///
+    /// A request without `ES_CONTINUOUS` is a pulse: it leaves the thread record unchanged and
+    /// advances an activity generation only when no persistent owner already holds that attribute.
+    pub fn set_thread_execution_state(
+        &mut self,
+        thread_id: u64,
+        requested_flags: u32,
+    ) -> Result<u32, PowerError> {
+        if thread_id == 0 || requested_flags & !THREAD_EXECUTION_STATE_VALID_MASK != 0 {
+            return Err(PowerError::InvalidState);
+        }
+        let old_flags = self
+            .thread_execution_record(thread_id)
+            .map_or(0, |record| record.persistent_flags);
+        let previous = old_flags | ES_CONTINUOUS;
+
+        if requested_flags & ES_CONTINUOUS == 0 {
+            if requested_flags & ES_SYSTEM_REQUIRED != 0
+                && self.execution_state.system_required_count == 0
+            {
+                self.execution_state.system_activity_generation = self
+                    .execution_state
+                    .system_activity_generation
+                    .wrapping_add(1);
+            }
+            if requested_flags & ES_DISPLAY_REQUIRED != 0
+                && self.execution_state.display_required_count == 0
+            {
+                self.execution_state.display_activity_generation = self
+                    .execution_state
+                    .display_activity_generation
+                    .wrapping_add(1);
+            }
+            return Ok(previous);
+        }
+
+        let new_flags = requested_flags & THREAD_EXECUTION_STATE_MASK;
+        let position = self
+            .thread_execution_records
+            .iter()
+            .position(|record| record.thread_id == thread_id);
+        match (position, new_flags) {
+            (Some(index), 0) => {
+                self.thread_execution_records.remove(index);
+            }
+            (Some(index), _) => {
+                self.thread_execution_records[index].persistent_flags = new_flags;
+            }
+            (None, 0) => {}
+            (None, _) => {
+                self.thread_execution_records
+                    .try_reserve(1)
+                    .map_err(|_| PowerError::InsufficientResources)?;
+                self.thread_execution_records.push(ThreadExecutionRecord {
+                    thread_id,
+                    persistent_flags: new_flags,
+                });
+            }
+        }
+        self.apply_persistent_execution_change(old_flags, new_flags);
+        Ok(previous)
+    }
+
+    /// Release persistent assertions when a thread leaves the kernel thread namespace.
+    /// Repeated rundown is harmless and cannot decrement another thread's counts.
+    pub fn remove_thread_execution_state(&mut self, thread_id: u64) -> bool {
+        let Some(index) = self
+            .thread_execution_records
+            .iter()
+            .position(|record| record.thread_id == thread_id)
+        else {
+            return false;
+        };
+        let old_flags = self.thread_execution_records.remove(index).persistent_flags;
+        self.apply_persistent_execution_change(old_flags, 0);
+        true
+    }
+
+    pub fn thread_execution_state(&self, thread_id: u64) -> u32 {
+        self.thread_execution_record(thread_id)
+            .map_or(ES_CONTINUOUS, |record| {
+                record.persistent_flags | ES_CONTINUOUS
+            })
+    }
+
+    pub fn execution_state_snapshot(&self) -> ExecutionStateSnapshot {
+        self.execution_state
     }
 
     fn find(&self, id: u64) -> Option<&Record> {
@@ -360,5 +518,99 @@ mod tests {
         );
         assert_eq!(p.device_state(DN), Some(D0));
         assert_eq!(p.system_state(DN), Some(SystemPowerState::Working));
+    }
+
+    #[test]
+    fn continuous_execution_state_is_per_thread_and_counted() {
+        let mut p = PowerManager::new();
+        assert_eq!(
+            p.set_thread_execution_state(10, ES_CONTINUOUS | ES_SYSTEM_REQUIRED),
+            Ok(ES_CONTINUOUS)
+        );
+        assert_eq!(
+            p.set_thread_execution_state(
+                20,
+                ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+            ),
+            Ok(ES_CONTINUOUS)
+        );
+        assert_eq!(
+            p.thread_execution_state(10),
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+        );
+        assert_eq!(
+            p.thread_execution_state(20),
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+        );
+        assert_eq!(
+            p.execution_state_snapshot(),
+            ExecutionStateSnapshot {
+                system_required_count: 2,
+                display_required_count: 1,
+                system_activity_generation: 1,
+                display_activity_generation: 1,
+            }
+        );
+
+        assert_eq!(
+            p.set_thread_execution_state(10, ES_CONTINUOUS | ES_DISPLAY_REQUIRED),
+            Ok(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+        );
+        let snapshot = p.execution_state_snapshot();
+        assert_eq!(snapshot.system_required_count, 1);
+        assert_eq!(snapshot.display_required_count, 2);
+    }
+
+    #[test]
+    fn execution_state_pulses_do_not_replace_persistent_state() {
+        let mut p = PowerManager::new();
+        p.set_thread_execution_state(10, ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+            .unwrap();
+        let before = p.execution_state_snapshot();
+
+        assert_eq!(
+            p.set_thread_execution_state(10, ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED),
+            Ok(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+        );
+        assert_eq!(
+            p.thread_execution_state(10),
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+        );
+        let after = p.execution_state_snapshot();
+        assert_eq!(
+            after.system_activity_generation,
+            before.system_activity_generation
+        );
+        assert_eq!(
+            after.display_activity_generation,
+            before.display_activity_generation + 1
+        );
+        assert_eq!(after.display_required_count, 0);
+    }
+
+    #[test]
+    fn thread_rundown_releases_only_its_assertions() {
+        let mut p = PowerManager::new();
+        p.set_thread_execution_state(10, ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+            .unwrap();
+        p.set_thread_execution_state(20, ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+            .unwrap();
+
+        assert!(p.remove_thread_execution_state(10));
+        assert!(!p.remove_thread_execution_state(10));
+        assert_eq!(p.thread_execution_state(10), ES_CONTINUOUS);
+        assert_eq!(
+            p.thread_execution_state(20),
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+        );
+        let snapshot = p.execution_state_snapshot();
+        assert_eq!(snapshot.system_required_count, 1);
+        assert_eq!(snapshot.display_required_count, 0);
+        assert_eq!(snapshot.display_activity_generation, 2);
+
+        assert_eq!(
+            p.set_thread_execution_state(20, ES_USER_PRESENT),
+            Err(PowerError::InvalidState)
+        );
     }
 }
