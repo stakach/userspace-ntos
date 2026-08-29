@@ -10,7 +10,7 @@ IOCTLs + interrupt delivery are gated on `Powered`.
 - `nt-power-types`: `SystemPowerState` (Working=1 … Shutdown=6) + `DevicePowerState`
   (D0=1 … D3=4), both `#[repr(u32)]`; `IRP_MJ_POWER`=0x16, minors (WAIT_WAKE=0,
   POWER_SEQUENCE=1, SET_POWER=2, QUERY_POWER=3); the `Parameters.Power` stack layout
-  (`Type`@12, `State`@16 within an `IO_STACK_LOCATION`); `STATUS_DEVICE_POWERED_OFF`.
+  (`Type`@16, `State`@24 within an `IO_STACK_LOCATION`); `STATUS_DEVICE_POWERED_OFF`.
   `DevicePowerState::is_on()` is true only for D0.
 - `nt-power-abi`: opcodes `POWER_OP_*` (0x7000..=0x70ff); `#[repr(C)]`
   `PowerStateWire`, `PowerSetDeviceReq`, `PowerRegisterDeviceReq`. Responses use
@@ -18,25 +18,38 @@ IOCTLs + interrupt delivery are gated on `Powered`.
 
 ## Power Manager core (implemented, Milestone 13.2 — `nt-power-manager`)
 
-- `PowerManager`: per-devnode power records; no driver pointers, only IDs + states.
-  `register_device` (D0 at Working on START), `unregister_device` (on REMOVE),
-  `mark_remove` (rejects new transitions, §11.3).
+- `PowerManager`: growable per-devnode power records; no driver pointers, only IDs +
+  states. `prepare_device` creates a non-queryable record before `AddDevice` so a
+  driver's initial `PoSetPowerState` report is retained. `complete_start` makes that
+  exact record queryable after successful `IRP_MN_START_DEVICE`, preserving a reported
+  initial state and otherwise initializing it to D0/Working. `unregister_device` removes
+  the record on teardown; `mark_remove` rejects new transitions (§11.3).
+- `report_device_state` and `report_system_state` update only the addressed devnode and
+  return its previous state. Invalid or absent records fail explicitly; one device can
+  never overwrite another device's state.
 - `begin_device_transition(devnode, target)` validates the devnode is registered, not
   removing, and has no power IRP in flight (one-in-flight, §16.1) — else
   `NotRegistered`/`Removed`/`Busy`/`InvalidState` — and marks it in-flight, returning
   the old state. `complete_device_transition(devnode, target, success)` moves to
   `target` on success or preserves the old state on failure (§9.4), always clearing
-  in-flight. `is_on` is true only in D0 (§8.1 I/O + interrupt gating). 6 unit tests
-  (register→D0, D0→D3→D0, one-in-flight, set-failure-preserves-old, no-transition-
-  after-remove, stale-devnode).
+  in-flight. `is_on` is true only for a started device in D0 (§8.1 I/O + interrupt
+  gating). 9 unit tests cover prepared/start lifecycle, AddDevice report preservation,
+  independent per-devnode reporting, D0→D3→D0, one-in-flight, transition failure,
+  removal, invalid states, and stale devnodes.
 
 ## Po exports + full lifecycle in QEMU (implemented, Milestones 13.3-13.7 — `driver-host-power`)
 
 - Po exports: `PoCallDriver` = `IoCallDriver` (the PDO completes a forwarded power
   IRP with success, non-pending so the driver's synchronous forward proceeds);
   `PoStartNextPowerIrp` a no-op with a call count (spec §14.3); `PoSetPowerState`
-  updates the HAL power gate from the driver's reported `DevicePowerState` (D0 ⇒
-  powered, else gated) and returns the previous state.
+  resolves the exact FDO/PDO binding, updates that devnode's reported system or device
+  state, and returns the previous state. During `AddDevice`, a bounded call context
+  validates the new device object's provider and associates its report with the PDO
+  being prepared; there is no global device-state fallback.
+- Native `NtGetDevicePowerState` (SSN 90) validates the process-local file handle and
+  resolves its live I/O Manager route to the related hosted PDO. It returns only the
+  authoritative state of a successfully started devnode. Non-device files, stale
+  handles, unstarted devices, and absent bindings fail explicitly.
 - **`Parameters.Power` layout (discovered)**: the `Power` fields are `POINTER_ALIGNMENT`
   8-byte slots (same as `DeviceIoControl`): `Type`@**16**, `State`@**24** within the
   `IO_STACK_LOCATION` — *not* 12/16 (packed) as a naive reading suggests.

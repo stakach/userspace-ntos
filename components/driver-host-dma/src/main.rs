@@ -1148,7 +1148,7 @@ unsafe fn run() {
     // START success → device D0, power record registered (spec §11.1).
     dh().powered = true;
     dh().reported_device_state = DevicePowerState::D0 as u32;
-    pwr().register_device(devnode);
+    let _ = pwr().register_device(devnode);
     check(b"registered_d0", pwr().is_on(devnode) && dh().powered);
     // The driver acquired a DMA adapter + common buffer during START (spec §20.1).
     check(

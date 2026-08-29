@@ -1188,6 +1188,7 @@ pub const SSN_NT_QUERY_INFORMATION_FILE: u64 = 158;
 /// devnode install events, root-bus relations, status/property queries, and control acknowledgements
 /// are answered from real registry-indexed device state.
 pub const SSN_NT_GET_PLUG_PLAY_EVENT: u64 = 91;
+pub const SSN_NT_GET_DEVICE_POWER_STATE: u64 = 90;
 pub const SSN_NT_PLUG_PLAY_CONTROL: u64 = 138;
 /// Obsolete event-pair object type imported by legacy shell extensions. No event-pair object
 /// manager type exists here yet, so opens fail as a missing named object.
@@ -24266,6 +24267,10 @@ fn build_nt_table() -> NativeServiceTable {
             (
                 NativeService::NtGetPlugPlayEvent,
                 SSN_NT_GET_PLUG_PLAY_EVENT as u32,
+            ),
+            (
+                NativeService::NtGetDevicePowerState,
+                SSN_NT_GET_DEVICE_POWER_STATE as u32,
             ),
             (
                 NativeService::NtOpenEventPair,

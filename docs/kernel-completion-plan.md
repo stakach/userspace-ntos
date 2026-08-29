@@ -16756,3 +16756,40 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     return the same record. Delete the singleton and any device-agnostic summary behavior in the
     accepted slice so multiple drivers and repeated devices cannot overwrite one another's power
     state.
+
+    Per-devnode power-state authority and `NtGetDevicePowerState` (2026-08-30, accepted): the
+    executive now owns one growable `nt-power-manager::PowerManager` rather than the deleted
+    `HOSTED_DRIVER_DEVICE_POWER_STATE` singleton. A devnode record is prepared before its real
+    `AddDevice` call, so a provider's initial `PoSetPowerState` report is retained, but it becomes
+    queryable and usable only after successful `IRP_MN_START_DEVICE`. Failed starts roll the record
+    back. Successful hosted-device teardown unregisters the exact PDO record after identity unbind;
+    another driver or repeated device remains untouched.
+
+    `PoSetPowerState` resolves an FDO or PDO through the dynamic hosted binding and reports the
+    addressed system or device state. The only pre-binding path is a bounded `AddDevice` call
+    context containing the actual PDO devnode and provider `DRIVER_OBJECT`; a newly created device
+    object must name that same provider. No component name, device ordinal, global state, or
+    successful fallback participates in the result.
+
+    SSN 90 is a typed, registered two-argument service. Its handler first probes the aligned output,
+    validates the process-local handle generation and File type with the native zero-extra-access
+    contract, resolves the live I/O Manager route to its related hosted PDO, and returns only the
+    started record's authoritative device state. Non-routed files, wrong object types, stale handles,
+    unstarted devnodes, and absent bindings fail explicitly rather than synthesizing D0.
+
+    Focused validation passes `nt-power-manager` `9/9`, `nt-syscall` `72/72`, `git diff --check`,
+    the freestanding executive at the established 209-warning baseline, and the executive release
+    build/staging path. The serialized live gate starts all five dynamically selected PnP devices,
+    launches genuine userinit and Explorer, completes `697/697` real callback redirects/returns with
+    zero callback failures, reaches Explorer paint begin/end `1/14` with 52 direct GDI returns and
+    66 batch flushes covering 91 records, paints `480000/480000` framebuffer pixels with at least
+    32 colours, passes all `295/295` gates, and matches the sentinel. The ordinary desktop workload
+    does not issue SSN 90; the focused tests prove its ABI and per-devnode lifecycle.
+
+    The typed surface now contains 185 services, the hosted table registers 184 numbered variants,
+    and 39 required canonical services remain absent.
+
+    Review adjustment: regenerate the required-import comparison and select the next bounded missing
+    Ob/Ps/Se/Mm/I/O trait. Prefer a mechanism with a focused host-testable owner, keep policy out of
+    the executive, and delete any scalar or hosted-image-specific state that the real implementation
+    replaces.

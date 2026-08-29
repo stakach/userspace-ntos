@@ -23742,6 +23742,40 @@ impl ExecNtHandler {
         })
     }
 
+    /// Resolve the File-object handle accepted by `NtGetDevicePowerState` to its live canonical
+    /// device route. NT5 requests no additional access mask for this query, but still requires an
+    /// extant File handle of the right type and a generation-exact I/O Manager File record.
+    fn power_device_id_for_file_handle(&self, handle: u64) -> Result<u64, u32> {
+        let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
+        let process_handle =
+            nt_process::Handle::try_from(handle).map_err(|_| STATUS_INVALID_HANDLE)?;
+        let object = self
+            .pm
+            .lookup_handle(pid, process_handle)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        self.pm
+            .handle_access(pid, process_handle)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+
+        match object {
+            nt_process::HandleObject::RoutedFile { file_id, device_id } => {
+                let (live_device_id, _) =
+                    driver_launch::hosted_file_route(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+                if live_device_id != device_id {
+                    return Err(STATUS_INVALID_HANDLE);
+                }
+                Ok(device_id)
+            }
+            nt_process::HandleObject::File(file_id) => driver_launch::hosted_file_route(file_id)
+                .map(|(device_id, _)| device_id)
+                .ok_or(STATUS_INVALID_HANDLE),
+            nt_process::HandleObject::DiskFile { .. }
+            | nt_process::HandleObject::Directory { .. }
+            | nt_process::HandleObject::OverlayFile(_) => Err(STATUS_INVALID_DEVICE_REQUEST),
+            _ => Err(STATUS_OBJECT_TYPE_MISMATCH),
+        }
+    }
+
     fn hosted_file_access_for(&self, handle: u64) -> Option<u32> {
         if let Some(retry) = self.active_synchronous_file_retry {
             if retry.handle as u64 == handle
@@ -33497,6 +33531,28 @@ impl ExecNtHandler {
                 }
             }
             NativeService::NtGetPlugPlayEvent => unsafe { self.nt_get_plug_play_event(args) },
+            NativeService::NtGetDevicePowerState => unsafe {
+                let state = args[1];
+                if ctx.previous_mode != nt_syscall::ProcessorMode::KernelMode && state & 3 != 0 {
+                    return STATUS_DATATYPE_MISALIGNMENT;
+                }
+                if state == 0 || !self.probe_user_output(state, 4) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let device_id = match self.power_device_id_for_file_handle(args[0]) {
+                    Ok(device_id) => device_id,
+                    Err(status) => return status,
+                };
+                let power_state = match driver_launch::hosted_device_power_state(device_id) {
+                    Ok(power_state) => power_state,
+                    Err(status) => return status.raw() as u32,
+                };
+                if self.xas_write_u32(state, power_state as u32) {
+                    0
+                } else {
+                    STATUS_ACCESS_VIOLATION
+                }
+            },
             NativeService::NtPlugPlayControl => unsafe { self.nt_plug_play_control(args) },
             NativeService::NtSetSystemPowerState => {
                 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;

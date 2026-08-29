@@ -4780,6 +4780,8 @@ static mut DRIVER_REGISTRY_HANDLES: Option<Vec<DriverRegistryHandleSlot>> = None
 static mut HOSTED_REGISTRY_IDENTITIES: Option<Vec<HostedRegistryIdentitySlot>> = None;
 static mut HOSTED_ADD_DEVICE_REGISTRY_IDENTITY_ID: HostedRegistryIdentityId =
     INVALID_HOSTED_REGISTRY_IDENTITY_ID;
+static mut HOSTED_ADD_DEVICE_POWER_DEVNODE_ID: u64 = 0;
+static mut HOSTED_ADD_DEVICE_POWER_DRIVER_OBJECT: u64 = 0;
 static mut HOSTED_DEVICE_INTERFACE_REGISTRATIONS: Option<Vec<HostedDeviceInterfaceRegistration>> =
     None;
 
@@ -7944,19 +7946,34 @@ extern "win64" fn s_po_call_driver(device: u64, irp: u64) -> i32 {
 /// `void PoStartNextPowerIrp(PIRP)`.
 extern "win64" fn s_po_start_next_power_irp(_irp: u64) {}
 
-/// `POWER_STATE PoSetPowerState(PDEVICE_OBJECT, POWER_STATE_TYPE, POWER_STATE)` — record the
-/// device power state the hosted driver reports and return the previous state.
-extern "win64" fn s_po_set_power_state(_device: u64, power_type: u32, state: u32) -> u32 {
-    const POWER_STATE_TYPE_DEVICE: u32 = 1;
+/// `POWER_STATE PoSetPowerState(PDEVICE_OBJECT, POWER_STATE_TYPE, POWER_STATE)` — update the
+/// authoritative record for this exact device stack and return that record's previous state.
+extern "win64" fn s_po_set_power_state(device: u64, power_type: u32, state: u32) -> u32 {
     unsafe {
-        let previous = read_volatile(core::ptr::addr_of!(HOSTED_DRIVER_DEVICE_POWER_STATE));
-        if power_type == POWER_STATE_TYPE_DEVICE {
-            write_volatile(
-                core::ptr::addr_of_mut!(HOSTED_DRIVER_DEVICE_POWER_STATE),
-                state,
-            );
+        let Some(devnode_id) = hosted_power_devnode_by_device_object(device) else {
+            return nt_power_manager::DevicePowerState::Unspecified as u32;
+        };
+        match power_type {
+            nt_power_types::POWER_STATE_TYPE_DEVICE => {
+                let Some(state) = nt_power_manager::DevicePowerState::from_u32(state) else {
+                    return nt_power_manager::DevicePowerState::Unspecified as u32;
+                };
+                hosted_power_manager_mut()
+                    .report_device_state(devnode_id, state)
+                    .map(|previous| previous as u32)
+                    .unwrap_or(nt_power_manager::DevicePowerState::Unspecified as u32)
+            }
+            nt_power_types::POWER_STATE_TYPE_SYSTEM => {
+                let Some(state) = nt_power_manager::SystemPowerState::from_u32(state) else {
+                    return nt_power_manager::SystemPowerState::Unspecified as u32;
+                };
+                hosted_power_manager_mut()
+                    .report_system_state(devnode_id, state)
+                    .map(|previous| previous as u32)
+                    .unwrap_or(nt_power_manager::SystemPowerState::Unspecified as u32)
+            }
+            _ => nt_power_manager::DevicePowerState::Unspecified as u32,
         }
-        previous
     }
 }
 
@@ -35864,13 +35881,13 @@ pub(crate) struct HostedIoPortFaultGrant {
 static mut HOSTED_DEVICE_BINDINGS: Option<Vec<HostedDeviceBinding>> = None;
 static mut HOSTED_ROOT_BUS: Option<nt_root_bus::RootBus> = None;
 static mut HOSTED_PNP_MANAGER: Option<nt_pnp_manager::PnpManager> = None;
+static mut HOSTED_POWER_MANAGER: Option<nt_power_manager::PowerManager> = None;
 static mut HOSTED_RESOURCE_MANAGER: Option<ResourceManager> = None;
 static mut HOSTED_DMA_MANAGER: Option<HostedDmaManager> = None;
 static mut HOSTED_MDL_REGISTRY: Option<MdlRegistry> = None;
 static mut HOSTED_DEVICE_RESOURCE_STATES: Option<Vec<HostedDeviceResourceState>> = None;
 static mut HOSTED_DEVICE_PROPERTY_TRANSFERS: Option<HostedDevicePropertyTransferTable> = None;
 static mut HOSTED_PNP_TRANSACTIONS: Option<Vec<HostedPnpTransaction>> = None;
-static mut HOSTED_DRIVER_DEVICE_POWER_STATE: u32 = 1; // PowerDeviceD0
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum HostedPnpTransactionPhase {
@@ -35901,6 +35918,7 @@ struct HostedPnpTransaction {
     dma_usage_published: bool,
     interface_state_published: bool,
     resource_snapshot_published: bool,
+    power_state_published: bool,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -36208,6 +36226,31 @@ unsafe fn hosted_pnp_manager_mut() -> &'static mut nt_pnp_manager::PnpManager {
     slot.as_mut().unwrap()
 }
 
+unsafe fn hosted_power_manager_mut() -> &'static mut nt_power_manager::PowerManager {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_POWER_MANAGER);
+    if slot.is_none() {
+        *slot = Some(nt_power_manager::PowerManager::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+fn hosted_power_status(error: nt_power_manager::PowerError) -> nt_status::NtStatus {
+    match error {
+        nt_power_manager::PowerError::InsufficientResources => {
+            nt_status::NtStatus::INSUFFICIENT_RESOURCES
+        }
+        nt_power_manager::PowerError::NotRegistered => {
+            nt_status::NtStatus(0xC000_00A3u32 as i32) // STATUS_DEVICE_NOT_READY
+        }
+        nt_power_manager::PowerError::NotStarted => {
+            nt_status::NtStatus(0xC000_00A3u32 as i32) // STATUS_DEVICE_NOT_READY
+        }
+        nt_power_manager::PowerError::Removed => nt_status::NtStatus::DELETE_PENDING,
+        nt_power_manager::PowerError::Busy => nt_status::NtStatus::DEVICE_BUSY,
+        nt_power_manager::PowerError::InvalidState => nt_status::NtStatus::INVALID_PARAMETER,
+    }
+}
+
 unsafe fn hosted_pnp_transactions_mut() -> &'static mut Vec<HostedPnpTransaction> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_PNP_TRANSACTIONS);
     if slot.is_none() {
@@ -36436,6 +36479,23 @@ unsafe fn finish_hosted_start_publication(irp_id: IrpId) -> Result<(), nt_status
             .find(|transaction| transaction.irp_id == irp_id)
             .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
             .resource_snapshot_published = true;
+    }
+    if terminal_status.is_success() {
+        let power_state_published = hosted_pnp_transactions_mut()
+            .iter()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            .power_state_published;
+        if !power_state_published {
+            hosted_power_manager_mut()
+                .complete_start(binding.pdo_device_id)
+                .map_err(hosted_power_status)?;
+            hosted_pnp_transactions_mut()
+                .iter_mut()
+                .find(|transaction| transaction.irp_id == irp_id)
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+                .power_state_published = true;
+        }
     }
     Ok(())
 }
@@ -37125,6 +37185,50 @@ fn hosted_device_binding_by_pdo_object(pdo_object: u64) -> Option<HostedDeviceBi
         .iter()
         .copied()
         .find(|slot| slot.used && slot.pdo_object != 0 && slot.pdo_object == pdo_object)
+}
+
+unsafe fn hosted_power_devnode_by_device_object(device_object: u64) -> Option<u64> {
+    if let Some(binding) = hosted_device_binding_by_device_object(device_object)
+        .or_else(|| hosted_device_binding_by_pdo_object(device_object))
+    {
+        return Some(binding.pdo_device_id);
+    }
+
+    let devnode_id = read_volatile(core::ptr::addr_of!(
+        HOSTED_ADD_DEVICE_POWER_DEVNODE_ID
+    ));
+    let expected_driver = read_volatile(core::ptr::addr_of!(
+        HOSTED_ADD_DEVICE_POWER_DRIVER_OBJECT
+    ));
+    if device_object == 0 || devnode_id == 0 || expected_driver == 0 {
+        return None;
+    }
+    let actual_driver = read_unaligned((device_object + 0x08) as *const u64);
+    (actual_driver == expected_driver).then_some(devnode_id)
+}
+
+fn hosted_device_binding_by_stack_device_id(device_id: u64) -> Option<HostedDeviceBinding> {
+    let bindings = unsafe { hosted_device_bindings()? };
+    bindings.iter().copied().find(|binding| {
+        binding.used
+            && device_id != 0
+            && (binding.device_id == device_id || binding.pdo_device_id == device_id)
+    })
+}
+
+/// Resolve a canonical I/O Manager device route to the current power state of its related PDO.
+/// Missing bindings and unstarted/removed devnodes fail explicitly; callers never receive a
+/// process-global or synthesized device state.
+pub(crate) fn hosted_device_power_state(
+    device_id: u64,
+) -> Result<nt_power_manager::DevicePowerState, nt_status::NtStatus> {
+    let binding = hosted_device_binding_by_stack_device_id(device_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let manager = unsafe { (*core::ptr::addr_of!(HOSTED_POWER_MANAGER)).as_ref() }
+        .ok_or(nt_status::NtStatus(0xC000_00A3u32 as i32))?; // STATUS_DEVICE_NOT_READY
+    manager
+        .started_device_state(binding.pdo_device_id)
+        .ok_or(nt_status::NtStatus(0xC000_00A3u32 as i32))
 }
 
 unsafe fn read_hosted_hardware_evidence_from_shared(
@@ -39533,6 +39637,11 @@ fn teardown_hosted_device_binding(binding: HostedDeviceBinding) -> bool {
         nt_io_manager::DeviceId(binding.device_id),
     ) {
         return false;
+    }
+    unsafe {
+        if let Some(manager) = (*core::ptr::addr_of_mut!(HOSTED_POWER_MANAGER)).as_mut() {
+            manager.unregister_device(binding.pdo_device_id);
+        }
     }
     unsafe { release_hosted_registry_identity(binding.registry_identity_id) };
     true
@@ -42806,6 +42915,7 @@ where
     let mut fdo_device_id = None;
     let mut canonical_fdo_attached = false;
     let mut pnp_stack_committed = false;
+    let mut power_record_prepared = false;
 
     let result = (|| -> Result<u64, nt_status::NtStatus> {
         registry_identity_id = allocate_hosted_registry_identity(registry_identity)?;
@@ -42818,7 +42928,30 @@ where
             core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_REGISTRY_IDENTITY_ID),
             registry_identity_id,
         );
+        hosted_power_manager_mut()
+            .prepare_device(pdo_device_id)
+            .map_err(hosted_power_status)?;
+        power_record_prepared = true;
+        let power_driver_object = provider_route
+            .map(|route| route.provider_driver_object)
+            .unwrap_or(inst.driver_object);
+        write_volatile(
+            core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_POWER_DEVNODE_ID),
+            pdo_device_id,
+        );
+        write_volatile(
+            core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_POWER_DRIVER_OBJECT),
+            power_driver_object,
+        );
         let dispatch = dispatch_add_device_for_instance(index, inst, pdo_object);
+        write_volatile(
+            core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_POWER_DEVNODE_ID),
+            0,
+        );
+        write_volatile(
+            core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_POWER_DRIVER_OBJECT),
+            0,
+        );
         write_volatile(
             core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_REGISTRY_IDENTITY_ID),
             INVALID_HOSTED_REGISTRY_IDENTITY_ID,
@@ -42890,6 +43023,14 @@ where
         core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_REGISTRY_IDENTITY_ID),
         INVALID_HOSTED_REGISTRY_IDENTITY_ID,
     );
+    write_volatile(
+        core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_POWER_DEVNODE_ID),
+        0,
+    );
+    write_volatile(
+        core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_POWER_DRIVER_OBJECT),
+        0,
+    );
     match result {
         Ok(device_id) => {
             if let Some(provider_shared) = provider_add_device_shared {
@@ -42898,6 +43039,9 @@ where
             Ok(device_id)
         }
         Err(status) => {
+            if power_record_prepared {
+                hosted_power_manager_mut().unregister_device(pdo_device_id);
+            }
             clear_shared_registry_identity_at(inst.exec_shared_va);
             if let Some(provider_shared) = provider_add_device_shared {
                 clear_shared_registry_identity_at(provider_shared);
@@ -44294,6 +44438,7 @@ pub(crate) unsafe fn start_hosted_device_canonical(
         dma_usage_published: false,
         interface_state_published: false,
         resource_snapshot_published: false,
+        power_state_published: false,
     };
     if let Err(status) = reserve_hosted_pnp_transaction(transaction) {
         let _ = io_manager_mut().discard_prepared_external_pnp(prepared);

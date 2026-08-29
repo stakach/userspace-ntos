@@ -987,6 +987,21 @@ fn set_information_debug_object_uses_its_canonical_service_contract() {
 }
 
 #[test]
+fn get_device_power_state_uses_its_canonical_service_contract() {
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtGetDevicePowerState, 90)],
+    );
+    let entry = table.lookup(90).unwrap();
+    assert_eq!(entry.service, NativeService::NtGetDevicePowerState);
+    assert_eq!((entry.min_args, entry.max_args), (2, 2));
+    assert_eq!(
+        table.number_of(NativeService::NtGetDevicePowerState),
+        Some(90)
+    );
+}
+
+#[test]
 fn delay_execution_registers_with_native_abi() {
     let table = NativeServiceTable::from_numbers(
         UserlandAbiProfile::Windows7,
