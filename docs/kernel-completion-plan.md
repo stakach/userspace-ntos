@@ -15843,3 +15843,43 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `WINLOGON_CSR_HEAP_VA`, `WINLOGON_CSR_STATIC_VA`, the hand-built static pages, and the
     per-process CSR view mask in the same accepted slice. A refused connection must unwind any
     provisional view and no zero-section or fixed-address compatibility path may remain.
+
+    CSR LPC port-view convergence (2026-08-29, accepted): ntdll now creates the real 64 KiB
+    anonymous capture section with `NtCreateSection`, supplies its typed handle and the LocalSystem
+    SID to `NtSecureConnectPort`, preserves the actual client/server mapping delta, and closes the
+    handle only after the connection transaction returns. The executive resolves that process
+    handle with both section-map rights, allocates ordinary VAD-backed views into the connector and
+    accepting CSRSS process, returns `PORT_VIEW.ViewBase/ViewRemoteBase`, and writes the validated
+    24-byte `REMOTE_PORT_VIEW` observed from the real server worker. Both mappings refer to the same
+    generic section object and therefore use the canonical shared-frame fault and last-handle/view
+    lifetime rules. Refusal, malformed-view, copyout, and broker failures unwind the provisional
+    views instead of reporting a compatible success.
+
+    The old `WINLOGON_CSR_HEAP_VA`, `WINLOGON_CSR_STATIC_VA`, fill-scratch page table, hand-built
+    static-server pages, fixed per-process view mask, and their private UTF-16 page builder are
+    deleted. Ordinary `NtMapViewOfSection` and LPC port-view mapping now share one checked generic
+    target-process mapper. Connection milestone bits are published only after the real worker has
+    accepted and completed the connection and both server-authored payload and client port handle
+    have been copied out. `nt-memory-manager` remains green at `17/17`, the staged ntdll validates
+    all 222 Nt exports and 222 Zw aliases, and the release executive builds at the established
+    212-warning baseline. Code checkpoint `7a319fcd` is pushed.
+
+    Serialized acceptance `.tmp/run-headless-csr-port-view-accepted-20260829.log` observes 15 real
+    section-backed `[lpc-view]` transactions and 15 authentic accepts. Each client receives a
+    dynamically allocated 64 KiB view while CSRSS receives a separate dynamic address; the
+    completed-connect mask exactly matches the authentic-accept mask (`0x37ffc`). Genuine userinit
+    and Explorer launch, 668 Explorer api0 redirects complete with zero callback or dead-callback
+    failures, paint begin/end reaches `5/20` with 187 direct GDI returns and 135 batch flushes
+    covering 184 records, and the framebuffer holds `480000/480000` non-background pixels with at
+    least 32 colours. All `295/295` gates pass and the sentinel matches.
+
+    Review adjustment: no fixed, zero-section, or executive-authored CSR connection view remains.
+    The next LPC boundary cleanup is to replace the CSR-named pending-view fields and mapping entry
+    point with a reusable kernel LPC connection-view transaction that other port servers can use,
+    while keeping section-handle resolution and address-space ownership inside the kernel. In the
+    same frontier, validate `NtSecureConnectPort`'s security QoS and supplied server SID against the
+    named port owner's real process token before a broker connection is queued. Build the SID/QoS
+    verdict in host-testable security/LPC code first, fail closed on malformed or mismatched input,
+    and delete the CSR-specific state as the generic transaction replaces it. Only after that
+    should the remaining numeric reply/wait/receive lifecycle be reconsidered for a reusable
+    blocked-continuation adapter; do not obscure its native LPC state transitions prematurely.
