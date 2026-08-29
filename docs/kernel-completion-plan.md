@@ -15508,7 +15508,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
 
     Review adjustment: the typed surface now contains 177 services, the hosted table registers 176
     numbered variants, and 46 canonical ABI exports remain absent. Audit the paired
-    `NtLockVirtualMemory` (SSN 106) and `NtUnlockVirtualMemory` (SSN 276) boundary next. The reusable
+    `NtLockVirtualMemory` (SSN 108) and `NtUnlockVirtualMemory` (SSN 276) boundary next. The reusable
     VM model must own page-aligned locked-range accounting, distinguish `MAP_PROCESS` from the
     privileged `MAP_SYSTEM` working-set class, fault committed pages resident through the normal
     demand path, and prevent locked frames from entering mapped-view or private-page reclamation.
@@ -15524,6 +15524,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     resolves all committed allocation types, invokes the same fill/map policy as a real fault, and
     lets explicit free/unmap and final process teardown retire lock state without adding a second
     frame owner.
+
+    Page-residency planning prerequisite (2026-08-29, in progress): `nt-address-space` now owns an
+    allocation-free `VmResidencyRangePlan` that validates overflow and the exclusive user limit,
+    rounds a non-empty byte range to exact pages, and exposes a stable page iterator. Its
+    `vm_residency_page_plan` validates the complete `MEM_COMMIT` query result and classifies each
+    page as private, mapped, or image while reusing that owner's real read-fault protection policy.
+    In particular, mapped read/write and write-copy pages retain their read-only first mapping and
+    image execute-writecopy pages retain execute-read until a real write fault requests COW. Holes,
+    guard/no-access pages, unsupported mapping types, malformed query extents, overflow, and ranges
+    beyond the user limit fail rather than becoming lockable synthetic pages. Focused validation
+    passes `nt-address-space` `57/57` and `git diff --check`.
+
+    Next extract one executive `Mm` residency operation around the existing private, generic
+    section, and image demand-fill owners. It must consume the immutable page plan, return only
+    after the actual frame is mapped, and leave the fault-endpoint loop as a caller rather than the
+    exclusive owner of SEC_IMAGE fill logic. Only after all three sources use that operation should
+    the two native lock services add process/system lock accounting and reclamation exclusion.
 
     The same review rejected taking `NtSetSystemTime` (SSN 251) as an isolated replacement target.
     The system clock is currently an immutable boot epoch plus monotonic counter, while native

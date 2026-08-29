@@ -1708,6 +1708,124 @@ fn mapped_view_fault_plan_tracks_write_fault_promotion() {
 }
 
 #[test]
+fn residency_range_plan_normalizes_without_allocating() {
+    let plan = VmResidencyRangePlan::new(0x20ff, 0x2002, 0x1_0000).unwrap();
+    assert_eq!(
+        plan,
+        VmResidencyRangePlan {
+            base: 0x2000,
+            size: 0x3000,
+        }
+    );
+    assert_eq!(
+        plan.pages().collect::<Vec<_>>(),
+        vec![0x2000, 0x3000, 0x4000]
+    );
+
+    assert_eq!(
+        VmResidencyRangePlan::new(0x2000, 0, 0x1_0000),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        VmResidencyRangePlan::new(0xffff, 2, 0x1_0000),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        VmResidencyRangePlan::new(u64::MAX - 0x100, 0x200, u64::MAX & !0xfff),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        VmResidencyRangePlan::new(0x2000, 0x1000, 0xffff),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+}
+
+#[test]
+fn residency_page_plan_uses_each_backing_owners_read_fault_policy() {
+    let info = |type_, protect| VmBasicInformation {
+        base_address: 0x4000,
+        allocation_base: 0x4000,
+        allocation_protect: protect,
+        region_size: 0x3000,
+        state: MEM_COMMIT,
+        protect,
+        type_,
+    };
+
+    assert_eq!(
+        vm_residency_page_plan(0x5000, info(MEM_PRIVATE, PAGE_READWRITE)),
+        Ok(VmResidencyPagePlan {
+            page: 0x5000,
+            source: VmResidencySource::Private,
+            protection: PAGE_READWRITE,
+            map_protection: PAGE_READWRITE,
+        })
+    );
+    assert_eq!(
+        vm_residency_page_plan(0x5000, info(MEM_MAPPED, PAGE_EXECUTE_READWRITE)),
+        Ok(VmResidencyPagePlan {
+            page: 0x5000,
+            source: VmResidencySource::Mapped,
+            protection: PAGE_EXECUTE_READWRITE,
+            map_protection: PAGE_EXECUTE_READ,
+        })
+    );
+    assert_eq!(
+        vm_residency_page_plan(0x5000, info(MEM_IMAGE, PAGE_EXECUTE_WRITECOPY)),
+        Ok(VmResidencyPagePlan {
+            page: 0x5000,
+            source: VmResidencySource::Image,
+            protection: PAGE_EXECUTE_WRITECOPY,
+            map_protection: PAGE_EXECUTE_READ,
+        })
+    );
+}
+
+#[test]
+fn residency_page_plan_rejects_holes_protection_and_mismatched_queries() {
+    let mut info = VmBasicInformation {
+        base_address: 0x8000,
+        allocation_base: 0x8000,
+        allocation_protect: PAGE_READONLY,
+        region_size: 0x1000,
+        state: MEM_RESERVE,
+        protect: PAGE_READONLY,
+        type_: MEM_PRIVATE,
+    };
+    assert_eq!(
+        vm_residency_page_plan(0x8000, info),
+        Err(STATUS_NOT_COMMITTED)
+    );
+
+    info.state = MEM_COMMIT;
+    info.protect = PAGE_NOACCESS;
+    assert_eq!(
+        vm_residency_page_plan(0x8000, info),
+        Err(STATUS_ACCESS_VIOLATION)
+    );
+    info.protect = PAGE_READWRITE | PAGE_GUARD;
+    assert_eq!(
+        vm_residency_page_plan(0x8000, info),
+        Err(STATUS_ACCESS_VIOLATION)
+    );
+    info.protect = PAGE_READONLY;
+    info.type_ = 0;
+    assert_eq!(
+        vm_residency_page_plan(0x8000, info),
+        Err(STATUS_ACCESS_VIOLATION)
+    );
+    info.type_ = MEM_PRIVATE;
+    assert_eq!(
+        vm_residency_page_plan(0x9000, info),
+        Err(STATUS_ACCESS_VIOLATION)
+    );
+    assert_eq!(
+        vm_residency_page_plan(0x8001, info),
+        Err(STATUS_ACCESS_VIOLATION)
+    );
+}
+
+#[test]
 fn mapped_view_fault_access_denies_protection_violations_before_mapping() {
     assert_eq!(
         mapped_view_fault_access_status(PAGE_READONLY, FaultAccess::Read),

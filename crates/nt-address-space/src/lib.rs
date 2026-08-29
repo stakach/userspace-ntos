@@ -413,6 +413,134 @@ impl VmBasicInformation {
     }
 }
 
+/// The backing owner that must make a committed virtual page resident.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VmResidencySource {
+    Private,
+    Mapped,
+    Image,
+}
+
+/// One page in a normalized virtual-memory residency operation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VmResidencyPagePlan {
+    pub page: u64,
+    pub source: VmResidencySource,
+    pub protection: u32,
+    pub map_protection: u32,
+}
+
+/// An allocation-free, page-aligned range for a residency or lock operation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VmResidencyRangePlan {
+    pub base: u64,
+    pub size: u64,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VmResidencyPages {
+    next: u64,
+    end: u64,
+}
+
+impl VmResidencyRangePlan {
+    /// Normalize a non-empty user range against an exclusive, page-aligned user limit.
+    pub fn new(address: u64, size: u64, user_limit: u64) -> Result<Self, u32> {
+        if size == 0 || user_limit == 0 || user_limit & (PAGE_SIZE - 1) != 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let requested_end = address.checked_add(size).ok_or(STATUS_INVALID_PARAMETER)?;
+        if address >= user_limit || requested_end > user_limit {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let base = address & !(PAGE_SIZE - 1);
+        let end = requested_end
+            .checked_add(PAGE_SIZE - 1)
+            .ok_or(STATUS_INVALID_PARAMETER)?
+            & !(PAGE_SIZE - 1);
+        if end > user_limit || end <= base {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok(Self {
+            base,
+            size: end - base,
+        })
+    }
+
+    pub fn pages(self) -> VmResidencyPages {
+        VmResidencyPages {
+            next: self.base,
+            end: self.base + self.size,
+        }
+    }
+}
+
+impl Iterator for VmResidencyPages {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next >= self.end {
+            return None;
+        }
+        let page = self.next;
+        self.next += PAGE_SIZE;
+        Some(page)
+    }
+}
+
+/// Validate and classify one page before its backing owner is asked to make it resident.
+pub fn vm_residency_page_plan(
+    page: u64,
+    info: VmBasicInformation,
+) -> Result<VmResidencyPagePlan, u32> {
+    let info_end = info
+        .base_address
+        .checked_add(info.region_size)
+        .ok_or(STATUS_ACCESS_VIOLATION)?;
+    if page & (PAGE_SIZE - 1) != 0
+        || info.base_address & (PAGE_SIZE - 1) != 0
+        || info.region_size == 0
+        || page < info.base_address
+        || page >= info_end
+    {
+        return Err(STATUS_ACCESS_VIOLATION);
+    }
+    if info.state != MEM_COMMIT {
+        return Err(STATUS_NOT_COMMITTED);
+    }
+
+    let (source, map_protection) = match info.type_ {
+        MEM_PRIVATE => {
+            if !protection_allows_fault_access(info.protect, FaultAccess::Lock) {
+                return Err(STATUS_ACCESS_VIOLATION);
+            }
+            (VmResidencySource::Private, info.protect)
+        }
+        MEM_MAPPED => {
+            mapped_view_fault_access_status(info.protect, FaultAccess::Lock)?;
+            (
+                VmResidencySource::Mapped,
+                mapped_view_fault_plan(info.protect, false).map_protection,
+            )
+        }
+        MEM_IMAGE => {
+            image_view_fault_access_status(info.protect, FaultAccess::Lock)?;
+            (
+                VmResidencySource::Image,
+                image_view_fault_plan(info.protect, false).map_protection,
+            )
+        }
+        _ => return Err(STATUS_ACCESS_VIOLATION),
+    };
+
+    Ok(VmResidencyPagePlan {
+        page,
+        source,
+        protection: info.protect,
+        map_protection,
+    })
+}
+
 /// A committed user mapping that is not owned by the private VAD allocator.
 ///
 /// This records process-lifetime runtime pages, mapped sections, and other fixed VA mappings at
