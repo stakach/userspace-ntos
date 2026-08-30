@@ -1119,6 +1119,11 @@ pub(crate) enum PreparedHostedResourcePlan {
         window: HostedPnpRootResourceDescriptor,
         lease: nt_pnp_context::ContextLease,
     },
+    Platform {
+        grant: DevnodeRootResourceGrant,
+        window: HostedPnpPlatformResourceDescriptor,
+        lease: nt_pnp_context::ContextLease,
+    },
     None,
 }
 
@@ -1129,7 +1134,7 @@ impl PreparedHostedResourcePlan {
                 Some(&bus_resources.raw_boot_resources),
                 Some(&bus_resources.resource_requirements),
             ),
-            Self::Root { grant, .. } => (
+            Self::Root { grant, .. } | Self::Platform { grant, .. } => (
                 Some(&grant.raw_boot_resources),
                 Some(&grant.resource_requirements),
             ),
@@ -1139,7 +1144,9 @@ impl PreparedHostedResourcePlan {
 
     unsafe fn release_context_lease(self) -> Result<(), nt_status::NtStatus> {
         let lease = match self {
-            Self::Pci { lease, .. } | Self::Root { lease, .. } => lease,
+            Self::Pci { lease, .. }
+            | Self::Root { lease, .. }
+            | Self::Platform { lease, .. } => lease,
             Self::None => return Ok(()),
         };
         release_hosted_pnp_context_lease(lease.into_identity())
@@ -1294,6 +1301,81 @@ where
                 ),
             },
             resource_plan: PreparedHostedResourcePlan::Root {
+                grant,
+                window,
+                lease,
+            },
+        });
+    }
+
+    if let Some(window) = context
+        .platform_windows
+        .iter()
+        .find(|window| window.matches_devnode(instance_id, hardware_ids, compatible_ids))
+        .cloned()
+    {
+        let mut platform_memory = Vec::new();
+        platform_memory
+            .try_reserve_exact(window.memory.len())
+            .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+        for resource in &window.memory {
+            platform_memory.push(nt_pnp::PlatformMemoryResource {
+                start: resource.phys,
+                length: u32::try_from(resource.len)
+                    .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?,
+                writable: resource.writable,
+            });
+        }
+        let mut platform_ports = Vec::new();
+        platform_ports
+            .try_reserve_exact(window.ports.len())
+            .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+        for resource in &window.ports {
+            platform_ports.push(nt_pnp::PlatformPortResource {
+                start: resource.base,
+                length: resource.len,
+            });
+        }
+        let profile = nt_pnp::PlatformResourceProfile {
+            memory: platform_memory,
+            ports: platform_ports,
+            interrupt: nt_pnp::PlatformInterruptResource {
+                level: window.interrupt_vector,
+                vector: window.interrupt_vector,
+                affinity: 1,
+                latched: window.interrupt_latched,
+                shared: window.interrupt_shared,
+            },
+        };
+        let grant = build_devnode_platform_resources(&profile)
+            .map_err(hosted_resource_requirements_status)?;
+        let resource_publication = nt_root_bus::PdoResourcePublication {
+            raw_boot_resources: nt_root_bus::BusResourceState::Present(
+                grant.raw_boot_resources.clone(),
+            ),
+            resource_requirements: nt_root_bus::BusResourceState::Present(
+                grant.resource_requirements.clone(),
+            ),
+        };
+        return Ok(PreparedHostedDevnode {
+            pdo_description: driver_launch::HostedPdoDescription {
+                bus_information: nt_pnp_manager::PnpBusInformation {
+                    bus_type_guid: nt_pnp_manager::GUID_BUS_TYPE_INTERNAL,
+                    legacy_bus_type: nt_pnp_manager::INTERFACE_TYPE_PNP_BUS,
+                    bus_number: 0,
+                },
+                capabilities: nt_pnp_manager::PdoCapabilities {
+                    removable: false,
+                    eject_supported: false,
+                    surprise_removal_ok: false,
+                    address: nt_pnp_manager::DEVICE_ADDRESS_UNAVAILABLE,
+                },
+                resource_publication,
+                translated_boot_resources: nt_pnp_manager::PropertyBlobState::Present(
+                    grant.translated_boot_resources.clone(),
+                ),
+            },
+            resource_plan: PreparedHostedResourcePlan::Platform {
                 grant,
                 window,
                 lease,

@@ -19429,3 +19429,39 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     RSDP discovery sequence. It must still map those frames from the same retained canonical cap set
     used for table validation and the eventual hosted-driver grant; a failed/ambiguous physical
     claim remains a boot-driver barrier rather than a request to fabricate discovery bytes.
+
+    B3 executive ACPI platform-authority checkpoint (2026-08-31, implementation green): the
+    executive now consumes only the validated ACPI root descriptor and unique device-untyped
+    capabilities published in BootInfo. A bounded physical reader retypes each containing device
+    untyped once, verifies every canonical frame's physical address through seL4, and maps
+    read-only validation aliases. The same retained frame set covers the selected RSDT/XSDT, every
+    checksum-validated SDT, the FADT-selected DSDT/FACS, the real BIOS Data Area word at `0x40e`,
+    the derived EBDA search window, and `0xe0000..0xfffff`; no RSDP or table bytes are synthesized.
+
+    Firmware resources now enter the ordinary root-bus PDO resource path. BIOS/table pages are
+    read-only, while FACS and SystemMemory fixed-event pages are writable; a page shared by a FACS
+    and an SDT is promoted at page granularity instead of rejecting valid firmware or granting all
+    tables write access. SystemIO fixed-event blocks are exact port resources and the FADT SCI is a
+    shared level-sensitive interrupt. The generic hosted-resource ABI carries per-memory-resource
+    write rights, accepts physical address zero as a real extent, supports sixteen memory and
+    sixteen port descriptors, validates the complete raw/translated assignment against its retained
+    lease, and maps the driver/broker aliases with matching seL4 rights.
+
+    The standard `*PNP0C08` compatible identity is resolved through
+    `CriticalDeviceDatabase`; its service and class are required registry policy, not compiled-in
+    driver names. The executive durably and idempotently publishes the canonical ACPI root devnode
+    before taking the boot-driver launch snapshot, after which normal registry binding,
+    AddDevice, function-stack requirements filtering, and START own the driver lifecycle. All ACPI,
+    PCI, root-proof, and DMA authority is retained by the same generation-fenced hosted PnP context.
+    Focused validation passes `nt-acpi` 8/8, `nt-pnp` 34/34, and `nt-cm-resources` 16/16; formatting
+    and `git diff --check` are clean, and the freestanding executive check remains green at the
+    unchanged 209-warning baseline.
+
+    Review adjustment: this closes executive table mapping, platform-resource minting, and dynamic
+    ACPI root publication, but not runtime driver acceptance. The active serialized desktop VM
+    predates this checkpoint and remains undisturbed. The next serialized boot must prove the
+    registry-selected ReactOS ACPI driver reaches DriverEntry, AddDevice, and START using these real
+    resources. Resolve only genuine imports or NT mechanism failures observed there, then connect
+    the driver's real SCI/GPE notification and bus-relation invalidation path to the prepared live
+    PCI census transaction. Do not add an executive hotplug stimulus, polling loop, service-name
+    branch, or ACPI-success fallback.

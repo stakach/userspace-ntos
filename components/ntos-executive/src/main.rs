@@ -21,6 +21,8 @@ pub use sel4_rt::*;
 
 mod allocator;
 mod alpc_selftest;
+mod acpi_platform;
+pub(crate) use acpi_platform::*;
 mod cm_server;
 mod io_server;
 mod isr;
@@ -14519,6 +14521,7 @@ unsafe fn grant_hosted_pci_devnode_resources(
             translated_start: translated.start,
             length: translated.length as u64,
             flags: translated.flags,
+            writable: true,
             share: translated.share,
             pci_flags: (u32::from(bar.is_64bit) << 2) | (u32::from(bar.prefetchable) << 3),
             component_va: mapped.va,
@@ -14665,6 +14668,7 @@ unsafe fn grant_hosted_root_devnode_resources(
             translated_start: memory.start,
             length: mmio_len,
             flags: memory.flags,
+            writable: true,
             share: memory.share,
             pci_flags: 0,
             component_va: window.mmio_va,
@@ -14709,6 +14713,180 @@ unsafe fn grant_hosted_root_devnode_resources(
     }))
 }
 
+unsafe fn grant_hosted_platform_devnode_resources(
+    device_id: u64,
+    grant: DevnodeRootResourceGrant,
+    window: HostedPnpPlatformResourceDescriptor,
+    context_lease: nt_pnp_context::ContextLeaseIdentity,
+    filtered_resource_requirements: alloc::vec::Vec<u8>,
+) -> Result<Option<HostedDevnodeGrant>, nt_status::NtStatus> {
+    let grant = filter_devnode_root_resource_grant(grant, filtered_resource_requirements)
+        .map_err(hosted_resource_requirements_status)?;
+    let mut raw_memory = Vec::new();
+    raw_memory
+        .try_reserve_exact(window.memory.len())
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    raw_memory.extend(
+        grant
+            .assignment
+            .memory_resources(nt_pnp::ResourceView::Raw),
+    );
+    let mut translated_memory = Vec::new();
+    translated_memory
+        .try_reserve_exact(window.memory.len())
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    translated_memory.extend(
+        grant
+            .assignment
+            .memory_resources(nt_pnp::ResourceView::Translated),
+    );
+    let mut raw_ports = Vec::new();
+    raw_ports
+        .try_reserve_exact(window.ports.len())
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    raw_ports.extend(
+        grant
+            .assignment
+            .port_resources(nt_pnp::ResourceView::Raw),
+    );
+    let mut translated_ports = Vec::new();
+    translated_ports
+        .try_reserve_exact(window.ports.len())
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    translated_ports.extend(
+        grant
+            .assignment
+            .port_resources(nt_pnp::ResourceView::Translated),
+    );
+    let raw_interrupt = grant
+        .assignment
+        .interrupt_resource(nt_pnp::ResourceView::Raw)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let interrupt = grant
+        .assignment
+        .interrupt_resource(nt_pnp::ResourceView::Translated)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if raw_memory.len() != translated_memory.len()
+        || raw_ports.len() != translated_ports.len()
+        || raw_interrupt.level != window.interrupt_vector
+        || raw_interrupt.vector != window.interrupt_vector
+        || raw_interrupt.affinity != u64::MAX
+        || raw_interrupt.flags != interrupt.flags
+        || raw_interrupt.share != interrupt.share
+        || interrupt.level != window.interrupt_vector
+        || interrupt.vector != window.interrupt_vector
+        || interrupt.affinity != 1
+        || interrupt.flags
+            != if window.interrupt_latched {
+                nt_pnp::CM_RESOURCE_INTERRUPT_LATCHED
+            } else {
+                nt_pnp::CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE
+            }
+        || (interrupt.share == nt_cm_resources::CM_RESOURCE_SHARE_SHARED)
+            != window.interrupt_shared
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+
+    let mut memory_grants = Vec::new();
+    memory_grants
+        .try_reserve_exact(translated_memory.len())
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    for (raw, translated) in raw_memory.iter().zip(&translated_memory) {
+        let resource = window
+            .memory
+            .iter()
+            .find(|resource| {
+                resource.phys == translated.start && resource.len == translated.length as u64
+            })
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        let expected_flags = if resource.writable {
+            nt_cm_resources::CM_RESOURCE_MEMORY_READ_WRITE
+        } else {
+            nt_cm_resources::CM_RESOURCE_MEMORY_READ_ONLY
+        };
+        if raw.start != translated.start
+            || raw.length != translated.length
+            || translated.flags != expected_flags
+        {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        memory_grants.push(driver_launch::HostedMemoryResourceGrant {
+            resource_index: resource.resource_index,
+            raw_start: raw.start,
+            translated_start: translated.start,
+            length: translated.length as u64,
+            flags: translated.flags,
+            writable: resource.writable,
+            share: translated.share,
+            pci_flags: 0,
+            component_va: resource.va,
+            broker_va: resource.seed_va,
+            frame_base: resource.frame_base,
+            map_pages: resource.pages,
+            video_memory_caller_va: 0,
+        });
+    }
+
+    let mut port_grants = Vec::new();
+    port_grants
+        .try_reserve_exact(translated_ports.len())
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    for (raw, translated) in raw_ports.iter().zip(&translated_ports) {
+        let resource = window
+            .ports
+            .iter()
+            .find(|resource| {
+                resource.base == translated.start && resource.len == translated.length
+            })
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        if raw.start != translated.start || raw.length != translated.length {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        port_grants.push(driver_launch::HostedPortResourceGrant {
+            resource_index: resource.resource_index,
+            raw_start: raw.start,
+            translated_start: translated.start,
+            length: translated.length,
+            flags: translated.flags,
+            share: translated.share,
+            pci_flags: 0,
+        });
+    }
+    driver_launch::grant_hosted_device_resources(
+        device_id,
+        driver_launch::HostedBusIdentity::root_bus(),
+        &memory_grants,
+        &port_grants,
+        interrupt.vector,
+        window.interrupt_shared,
+        window.interrupt_latched,
+        interrupt.affinity,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        context_lease,
+    )?;
+    Ok(Some(HostedDevnodeGrant {
+        kind: HostedDevnodeGrantKind::RootBus,
+        pci_interrupt_line: None,
+        raw_resource_list: grant.raw_resource_list,
+        translated_resource_list: grant.translated_resource_list,
+        mmio_phys: translated_memory.first().map(|memory| memory.start).unwrap_or(0),
+        mmio_len: translated_memory
+            .first()
+            .map(|memory| memory.length as u64)
+            .unwrap_or(0),
+        io_port_base: translated_ports.first().map(|port| port.start).unwrap_or(0),
+        io_port_len: translated_ports.first().map(|port| port.length).unwrap_or(0),
+        vector: interrupt.vector,
+        dma_len: 0,
+    }))
+}
+
 unsafe fn grant_hosted_devnode_resources(
     device_id: u64,
     plan: PreparedHostedResourcePlan,
@@ -14737,6 +14915,21 @@ unsafe fn grant_hosted_devnode_resources(
         } => {
             let context_lease = lease.into_identity();
             let result = grant_hosted_root_devnode_resources(
+                device_id,
+                grant,
+                window,
+                context_lease,
+                filtered_resource_requirements,
+            );
+            settle_hosted_pnp_context_grant(device_id, context_lease, result)
+        }
+        PreparedHostedResourcePlan::Platform {
+            grant,
+            window,
+            lease,
+        } => {
+            let context_lease = lease.into_identity();
+            let result = grant_hosted_platform_devnode_resources(
                 device_id,
                 grant,
                 window,
@@ -20818,23 +21011,82 @@ struct HostedPciWindowPublishReport {
     published_root_windows: u64,
     missing_root_grants: u64,
     root_va_exhausted: bool,
+    selected_platform_devnodes: u64,
+    published_platform_windows: u64,
+    missing_platform_grants: u64,
 }
 
 unsafe fn publish_hosted_pnp_context_for_launch_plans(
     pci_devices: &[nt_pnp::PciDevice],
     plans: &[&InlineDriverLaunchPlan],
     grants: &[HostedPciHardwareGrant],
+    acpi_authority: PreparedAcpiPlatformAuthority,
 ) -> HostedPciWindowPublishReport {
     let mut report = HostedPciWindowPublishReport::default();
+    let PreparedAcpiPlatformAuthority {
+        discovery,
+        memory: acpi_memory,
+        ports: acpi_ports,
+        owner: mut context_owner,
+    } = acpi_authority;
     let mut devices = Vec::new();
     if devices.try_reserve_exact(pci_devices.len()).is_err() {
         report.missing_grants += 1;
+        report.missing_platform_grants += 1;
+        let _ = retire_hosted_pnp_context_owner(context_owner);
         return report;
     }
     devices.extend_from_slice(pci_devices);
     let mut windows: Vec<HostedPnpPciResourceDescriptor> = Vec::new();
     let mut root_windows: Vec<HostedPnpRootResourceDescriptor> = Vec::new();
-    let mut context_owner = HostedPnpContextOwner::new();
+    let mut platform_windows = Vec::new();
+    let mut platform_memory = Vec::new();
+    if platform_memory.try_reserve_exact(acpi_memory.len()).is_err() {
+        report.missing_platform_grants += 1;
+        let _ = retire_hosted_pnp_context_owner(context_owner);
+        return report;
+    }
+    for resource in acpi_memory {
+        platform_memory.push(HostedPnpPlatformMemoryDescriptor {
+            resource_index: resource.resource_index,
+            phys: resource.paddr,
+            len: resource.length,
+            writable: resource.writable,
+            frame_base: resource.frame_base,
+            pages: resource.pages,
+            va: resource.component_va,
+            seed_va: resource.broker_va,
+        });
+    }
+    let mut platform_ports = Vec::new();
+    if platform_ports.try_reserve_exact(acpi_ports.len()).is_err() {
+        report.missing_platform_grants += 1;
+        let _ = retire_hosted_pnp_context_owner(context_owner);
+        return report;
+    }
+    for resource in acpi_ports {
+        platform_ports.push(HostedPnpPlatformPortDescriptor {
+            resource_index: resource.resource_index,
+            base: resource.base,
+            len: resource.length,
+        });
+    }
+    if let Some(window) = HostedPnpPlatformResourceDescriptor::new(
+        ACPI_ROOT_INSTANCE_PATH,
+        ACPI_ROOT_HARDWARE_ID,
+        ACPI_ROOT_COMPATIBLE_ID,
+        platform_memory,
+        platform_ports,
+        discovery.fixed.sci_interrupt as u32,
+        false,
+        true,
+    ) {
+        platform_windows.push(window);
+    } else {
+        report.missing_platform_grants += 1;
+        let _ = retire_hosted_pnp_context_owner(context_owner);
+        return report;
+    }
     for plan in plans {
         for spec in plan.as_slice() {
             for devnode in plan.devnodes_for(spec) {
@@ -20986,6 +21238,17 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                     continue;
                 }
 
+                if platform_windows.iter().any(|window| {
+                    window.matches_devnode(
+                        devnode.instance_id.as_str(),
+                        hardware_refs,
+                        compatible_refs,
+                    )
+                }) {
+                    report.selected_platform_devnodes += 1;
+                    continue;
+                }
+
                 let Some(profile) = root_bus_resource_profile_for_devnode(
                     devnode.instance_id.as_str(),
                     hardware_refs,
@@ -21066,8 +21329,18 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
     }
     report.published_windows = windows.len() as u64;
     report.published_root_windows = root_windows.len() as u64;
-    if publish_hosted_pnp_resource_context(devices, windows, root_windows, context_owner).is_err() {
+    report.published_platform_windows = platform_windows.len() as u64;
+    if publish_hosted_pnp_resource_context(
+        devices,
+        windows,
+        root_windows,
+        platform_windows,
+        context_owner,
+    )
+    .is_err()
+    {
         report.missing_grants += 1;
+        report.missing_platform_grants += 1;
     }
     report
 }
@@ -27689,6 +27962,7 @@ fn existing_boot_framebuffer_bar_cap_run(
 
 #[derive(Clone, Copy)]
 struct DeviceUntypedRegion {
+    cap: u64,
     paddr: u64,
     pages: u64,
 }
@@ -27718,6 +27992,7 @@ fn unique_device_untyped_containing(
                 return None;
             }
             result = Some(DeviceUntypedRegion {
+                cap: bi.untyped.start + index,
                 paddr: descriptor.paddr,
                 pages: size / 0x1000,
             });
@@ -30849,6 +31124,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         }
     }
 
+    let acpi_platform_authority =
+        discover_acpi_platform_authority(bi).expect("discover authorized ACPI platform resources");
+    publish_acpi_root_devnode_from_registry_policy()
+        .expect("publish registry-selected ACPI root devnode");
+
     let boot_driver_snapshot = config_manager_query_driver_launch_plan(
         nt_config_abi::launch_plan_kind::BOOT_SYSTEM_DRIVERS,
     )
@@ -30999,6 +31279,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             config_demand_pnp_plan,
         ],
         hosted_pci_hardware_grants.as_slice(),
+        acpi_platform_authority,
     );
     print_str(b"[driver-launch] hosted resource windows pci-selected=");
     print_u64(hosted_pci_window_publish.selected_devnodes);
@@ -31016,6 +31297,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_u64(hosted_pci_window_publish.missing_root_grants);
     print_str(b" root-va-exhausted=");
     print_u64(hosted_pci_window_publish.root_va_exhausted as u64);
+    print_str(b" platform-selected=");
+    print_u64(hosted_pci_window_publish.selected_platform_devnodes);
+    print_str(b" platform-published=");
+    print_u64(hosted_pci_window_publish.published_platform_windows);
+    print_str(b" platform-missing-grants=");
+    print_u64(hosted_pci_window_publish.missing_platform_grants);
     print_str(b"\n");
     check(
         b"exec_hosted_pci_windows_selected_from_registry",
@@ -31030,6 +31317,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             || (hosted_pci_window_publish.published_root_windows != 0
                 && hosted_pci_window_publish.missing_root_grants == 0
                 && !hosted_pci_window_publish.root_va_exhausted),
+        &mut passed,
+    );
+    check(
+        b"exec_hosted_acpi_platform_selected_from_registry",
+        hosted_pci_window_publish.selected_platform_devnodes == 1
+            && hosted_pci_window_publish.published_platform_windows == 1
+            && hosted_pci_window_publish.missing_platform_grants == 0,
         &mut passed,
     );
 

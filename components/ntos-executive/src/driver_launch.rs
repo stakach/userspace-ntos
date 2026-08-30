@@ -48266,6 +48266,7 @@ pub(crate) struct HostedMemoryResourceGrant {
     pub translated_start: u64,
     pub length: u64,
     pub flags: u16,
+    pub writable: bool,
     pub share: u8,
     pub pci_flags: u32,
     pub component_va: u64,
@@ -48334,8 +48335,6 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             || memory[..index]
                 .iter()
                 .any(|prior| prior.resource_index == grant.resource_index)
-            || grant.raw_start == 0
-            || grant.translated_start == 0
             || grant.length == 0
             || grant.component_va == 0
             || grant.broker_va == 0
@@ -48376,8 +48375,6 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             || ports[..index]
                 .iter()
                 .any(|prior| prior.resource_index == grant.resource_index)
-            || grant.raw_start == 0
-            || grant.translated_start == 0
             || grant.length == 0
             || last > u16::MAX as u64
             || !matches!(
@@ -48498,7 +48495,8 @@ pub(crate) unsafe fn grant_hosted_device_resources(
                 return Err(nt_status::NtStatus::UNSUCCESSFUL);
             }
             let map_va = grant.component_va + page * 0x1000;
-            let error = page_map_r(map_cap, map_va, RW_NX, inst.pml4);
+            let rights = if grant.writable { RW_NX } else { RO_NX };
+            let error = page_map_r(map_cap, map_va, rights, inst.pml4);
             if error != 0 {
                 let _ = cnode_delete_recycle_r(map_cap);
                 rollback_staged_hosted_resource_grant(
@@ -48703,7 +48701,16 @@ pub(crate) unsafe fn grant_hosted_device_resources(
                 nt_hal_abi::RIGHT_READ | nt_hal_abi::RIGHT_WRITE
             },
             arg1: if resource.kind == SH_RESOURCE_ADDRESS_KIND_MEMORY {
-                nt_hal_abi::RIGHT_READ | nt_hal_abi::RIGHT_WRITE
+                let writable = memory
+                    .iter()
+                    .find(|grant| grant.resource_index == resource.resource_index)
+                    .is_some_and(|grant| grant.writable);
+                nt_hal_abi::RIGHT_READ
+                    | if writable {
+                        nt_hal_abi::RIGHT_WRITE
+                    } else {
+                        0
+                    }
             } else {
                 0
             },

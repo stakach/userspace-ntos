@@ -365,7 +365,7 @@ pub fn discover_platform_resources<R: PhysicalMemoryReader>(
         tables,
         facs,
         fixed_registers: normalized_fixed_registers(&fixed)?,
-        firmware_memory: normalize_page_ranges(&firmware_extents)?,
+        firmware_memory: normalize_physical_ranges(&firmware_extents)?,
         fixed,
     })
 }
@@ -484,7 +484,13 @@ fn normalized_fixed_registers(
     Ok(normalized)
 }
 
-fn normalize_page_ranges(ranges: &[PhysicalRange]) -> Result<Vec<PhysicalRange>, AcpiError> {
+/// Normalize physical byte extents into sorted, non-overlapping ACPI-page ranges.
+///
+/// The executive uses this for additional firmware discovery windows while retaining all
+/// capability allocation and mapping policy outside this crate.
+pub fn normalize_physical_ranges(
+    ranges: &[PhysicalRange],
+) -> Result<Vec<PhysicalRange>, AcpiError> {
     let mut pages = Vec::new();
     pages
         .try_reserve_exact(ranges.len())
@@ -530,6 +536,57 @@ fn normalize_page_ranges(ranges: &[PhysicalRange]) -> Result<Vec<PhysicalRange>,
         normalized.push(range);
     }
     Ok(normalized)
+}
+
+/// Remove page-normalized exclusions from physical ranges.
+///
+/// This is useful when one firmware object within a shared page must be writable: the whole page
+/// belongs to the writable grant, while the non-overlapping table pages can remain read-only.
+pub fn subtract_physical_ranges(
+    ranges: &[PhysicalRange],
+    exclusions: &[PhysicalRange],
+) -> Result<Vec<PhysicalRange>, AcpiError> {
+    let ranges = normalize_physical_ranges(ranges)?;
+    let exclusions = normalize_physical_ranges(exclusions)?;
+    let mut result = Vec::new();
+    for range in ranges {
+        let range_end = range
+            .start
+            .checked_add(range.length)
+            .ok_or(AcpiError::InvalidLength)?;
+        let mut cursor = range.start;
+        for exclusion in &exclusions {
+            let exclusion_end = exclusion
+                .start
+                .checked_add(exclusion.length)
+                .ok_or(AcpiError::InvalidLength)?;
+            if exclusion_end <= cursor {
+                continue;
+            }
+            if exclusion.start >= range_end {
+                break;
+            }
+            if exclusion.start > cursor {
+                result.try_reserve(1).map_err(|_| AcpiError::Allocation)?;
+                result.push(PhysicalRange {
+                    start: cursor,
+                    length: exclusion.start.min(range_end) - cursor,
+                });
+            }
+            cursor = cursor.max(exclusion_end);
+            if cursor >= range_end {
+                break;
+            }
+        }
+        if cursor < range_end {
+            result.try_reserve(1).map_err(|_| AcpiError::Allocation)?;
+            result.push(PhysicalRange {
+                start: cursor,
+                length: range_end - cursor,
+            });
+        }
+    }
+    Ok(result)
 }
 
 fn parse_event_pair(
@@ -776,6 +833,31 @@ mod tests {
         assert_eq!(
             active_event_bits(&[0], &[0, 0]),
             Err(AcpiError::InvalidRegisterBlock)
+        );
+    }
+
+    #[test]
+    fn writable_firmware_pages_are_removed_from_read_only_extents() {
+        let read_only = [PhysicalRange {
+            start: 0x1800,
+            length: 0x4800,
+        }];
+        let writable = [PhysicalRange {
+            start: 0x2f80,
+            length: 64,
+        }];
+        assert_eq!(
+            subtract_physical_ranges(&read_only, &writable).unwrap(),
+            vec![
+                PhysicalRange {
+                    start: 0x1000,
+                    length: 0x1000,
+                },
+                PhysicalRange {
+                    start: 0x3000,
+                    length: 0x3000,
+                },
+            ]
         );
     }
 

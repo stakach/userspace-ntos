@@ -39,10 +39,10 @@ pub use nt_cm_resources::{
     CmResourceDescriptor, InterruptDescriptor, IoAddressRequirement, IoInterruptRequirement,
     IoResourceRequirement, MemoryDescriptor, PortDescriptor, CM_RESOURCE_INTERRUPT_LATCHED,
     CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE, CM_RESOURCE_MEMORY_BAR, CM_RESOURCE_MEMORY_PREFETCHABLE,
-    CM_RESOURCE_MEMORY_READ_WRITE, CM_RESOURCE_PORT_16_BIT_DECODE, CM_RESOURCE_PORT_BAR,
-    CM_RESOURCE_PORT_IO, CM_RESOURCE_PORT_POSITIVE_DECODE, CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
-    CM_RESOURCE_SHARE_SHARED, INTERFACE_TYPE_PCI_BUS, INTERFACE_TYPE_PNP_BUS,
-    IO_RESOURCE_ALTERNATIVE, IO_RESOURCE_PREFERRED, IO_RESOURCE_REQUIRED,
+    CM_RESOURCE_MEMORY_READ_ONLY, CM_RESOURCE_MEMORY_READ_WRITE, CM_RESOURCE_PORT_16_BIT_DECODE,
+    CM_RESOURCE_PORT_BAR, CM_RESOURCE_PORT_IO, CM_RESOURCE_PORT_POSITIVE_DECODE,
+    CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE, CM_RESOURCE_SHARE_SHARED, INTERFACE_TYPE_PCI_BUS,
+    INTERFACE_TYPE_PNP_BUS, IO_RESOURCE_ALTERNATIVE, IO_RESOURCE_PREFERRED, IO_RESOURCE_REQUIRED,
     MEMORY_INTERRUPT_LIST_SIZE, MEMORY_LIST_SIZE, MEMORY_PORT_INTERRUPT_LIST_SIZE,
     MEMORY_PORT_LIST_SIZE, PORT_INTERRUPT_LIST_SIZE, PORT_LIST_SIZE,
 };
@@ -955,6 +955,194 @@ pub const ROOT_DMA_TEST_RESOURCE_PROFILE: RootBusResourceProfile = RootBusResour
     interrupt_latched: false,
 };
 
+/// One page-normalized platform memory extent. Address zero is valid firmware memory.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PlatformMemoryResource {
+    pub start: u64,
+    pub length: u32,
+    pub writable: bool,
+}
+
+/// One fixed platform I/O-port extent.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PlatformPortResource {
+    pub start: u64,
+    pub length: u32,
+}
+
+/// One platform interrupt route, including the translated processor affinity.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PlatformInterruptResource {
+    pub level: u32,
+    pub vector: u32,
+    pub affinity: u64,
+    pub latched: bool,
+    pub shared: bool,
+}
+
+/// Dynamic resources published by a firmware-described root-bus PDO.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlatformResourceProfile {
+    pub memory: Vec<PlatformMemoryResource>,
+    pub ports: Vec<PlatformPortResource>,
+    pub interrupt: PlatformInterruptResource,
+}
+
+fn platform_memory_flags(resource: PlatformMemoryResource) -> u16 {
+    if resource.writable {
+        CM_RESOURCE_MEMORY_READ_WRITE
+    } else {
+        CM_RESOURCE_MEMORY_READ_ONLY
+    }
+}
+
+fn platform_share(interrupt: PlatformInterruptResource) -> u8 {
+    if interrupt.shared {
+        CM_RESOURCE_SHARE_SHARED
+    } else {
+        CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE
+    }
+}
+
+fn validate_platform_profile(
+    profile: &PlatformResourceProfile,
+) -> Result<(), ResourceRequirementsError> {
+    if profile.memory.is_empty() && profile.ports.is_empty() || profile.interrupt.vector == 0 {
+        return Err(ResourceRequirementsError::UnassignedBar);
+    }
+    for resource in &profile.memory {
+        if resource.length == 0
+            || resource
+                .start
+                .checked_add(resource.length as u64 - 1)
+                .is_none()
+        {
+            return Err(ResourceRequirementsError::AddressOverflow);
+        }
+    }
+    for resource in &profile.ports {
+        let end = resource
+            .start
+            .checked_add(resource.length as u64)
+            .and_then(|end| end.checked_sub(1))
+            .ok_or(ResourceRequirementsError::AddressOverflow)?;
+        if resource.length == 0 || end > u16::MAX as u64 {
+            return Err(ResourceRequirementsError::UnsupportedBarLength);
+        }
+    }
+    Ok(())
+}
+
+/// Build the immutable bus requirements for a dynamic firmware-described platform device.
+pub fn platform_resource_requirements(
+    profile: &PlatformResourceProfile,
+) -> Result<Vec<u8>, ResourceRequirementsError> {
+    validate_platform_profile(profile)?;
+    let count = profile.memory.len() + profile.ports.len() + 1;
+    let mut descriptors = Vec::new();
+    descriptors
+        .try_reserve_exact(count)
+        .map_err(|_| ResourceRequirementsError::OutOfMemory)?;
+    for resource in &profile.memory {
+        descriptors.push(IoResourceRequirement::Memory(IoAddressRequirement {
+            option: IO_RESOURCE_REQUIRED,
+            share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            flags: platform_memory_flags(*resource),
+            length: resource.length,
+            alignment: 1,
+            minimum: resource.start,
+            maximum: resource.start + resource.length as u64 - 1,
+        }));
+    }
+    for resource in &profile.ports {
+        descriptors.push(IoResourceRequirement::Port(IoAddressRequirement {
+            option: IO_RESOURCE_REQUIRED,
+            share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            flags: CM_RESOURCE_PORT_IO
+                | CM_RESOURCE_PORT_16_BIT_DECODE
+                | CM_RESOURCE_PORT_POSITIVE_DECODE,
+            length: resource.length,
+            alignment: 1,
+            minimum: resource.start,
+            maximum: resource.start + resource.length as u64 - 1,
+        }));
+    }
+    descriptors.push(IoResourceRequirement::Interrupt(IoInterruptRequirement {
+        option: IO_RESOURCE_REQUIRED,
+        share: platform_share(profile.interrupt),
+        flags: if profile.interrupt.latched {
+            CM_RESOURCE_INTERRUPT_LATCHED
+        } else {
+            CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE
+        },
+        minimum_vector: profile.interrupt.level,
+        maximum_vector: profile.interrupt.level,
+        affinity_policy: 0,
+        priority_policy: 0,
+        targeted_processors: 0,
+    }));
+    encode_resource_requirements(INTERFACE_TYPE_PNP_BUS, 0, 0, &descriptors)?
+        .ok_or(ResourceRequirementsError::UnassignedBar)
+}
+
+/// Build the paired raw and translated resources that the platform broker can mint.
+pub fn assign_platform_resources(
+    profile: &PlatformResourceProfile,
+) -> Result<ResourceAssignment, ResourceRequirementsError> {
+    validate_platform_profile(profile)?;
+    let count = profile.memory.len() + profile.ports.len() + 1;
+    let mut raw = Vec::new();
+    raw.try_reserve_exact(count)
+        .map_err(|_| ResourceRequirementsError::OutOfMemory)?;
+    let mut translated = Vec::new();
+    translated
+        .try_reserve_exact(count)
+        .map_err(|_| ResourceRequirementsError::OutOfMemory)?;
+    for resource in &profile.memory {
+        let descriptor = CmResourceDescriptor::Memory(MemoryDescriptor {
+            start: resource.start,
+            length: resource.length,
+            flags: platform_memory_flags(*resource),
+            share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+        });
+        raw.push(descriptor);
+        translated.push(descriptor);
+    }
+    for resource in &profile.ports {
+        let descriptor = CmResourceDescriptor::Port(PortDescriptor {
+            start: resource.start,
+            length: resource.length,
+            flags: CM_RESOURCE_PORT_IO
+                | CM_RESOURCE_PORT_16_BIT_DECODE
+                | CM_RESOURCE_PORT_POSITIVE_DECODE,
+            share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+        });
+        raw.push(descriptor);
+        translated.push(descriptor);
+    }
+    let interrupt_flags = if profile.interrupt.latched {
+        CM_RESOURCE_INTERRUPT_LATCHED
+    } else {
+        CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE
+    };
+    let share = platform_share(profile.interrupt);
+    raw.push(CmResourceDescriptor::Interrupt(InterruptDescriptor {
+        level: profile.interrupt.level,
+        vector: profile.interrupt.level,
+        affinity: u64::MAX,
+        flags: interrupt_flags,
+        share,
+    }));
+    translated.push(CmResourceDescriptor::Interrupt(InterruptDescriptor {
+        level: profile.interrupt.vector,
+        vector: profile.interrupt.vector,
+        affinity: profile.interrupt.affinity,
+        flags: interrupt_flags,
+        share,
+    }));
+    ResourceAssignment::new(raw, translated, 0)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResourceRequirementsError {
     UnassignedBar,
@@ -1537,7 +1725,9 @@ pub fn assign_resources(
 }
 
 /// The largest `CM_RESOURCE_LIST` this crate currently emits for one device.
-pub const ASSIGNMENT_CM_LIST_MAX_SIZE: usize = 20 + (PCI_NUM_BARS + 1) * 20;
+/// Maximum resource-list image accepted by the generic hosted-resource ABI: sixteen memory,
+/// sixteen port, and one interrupt descriptor.
+pub const ASSIGNMENT_CM_LIST_MAX_SIZE: usize = 20 + (16 + 16 + 1) * 20;
 
 /// Encode a [`ResourceAssignment`] as the `CM_RESOURCE_LIST` a WDK driver reads at
 /// `IRP_MN_START_DEVICE`. The selected side preserves the bus descriptor order exactly.
@@ -2616,6 +2806,79 @@ mod tests {
         assert_eq!(interrupt.affinity, 1);
         assert_eq!(interrupt.share, CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE);
         assert_eq!(assignment.dma_len, 0x1000);
+    }
+
+    #[test]
+    fn platform_resources_preserve_zero_based_firmware_rights_ports_and_sci() {
+        let profile = PlatformResourceProfile {
+            memory: vec![
+                PlatformMemoryResource {
+                    start: 0,
+                    length: 0x1000,
+                    writable: false,
+                },
+                PlatformMemoryResource {
+                    start: 0xfed0_0000,
+                    length: 0x1000,
+                    writable: true,
+                },
+            ],
+            ports: vec![PlatformPortResource {
+                start: 0x1000,
+                length: 8,
+            }],
+            interrupt: PlatformInterruptResource {
+                level: 9,
+                vector: 9,
+                affinity: 1,
+                latched: false,
+                shared: true,
+            },
+        };
+        let requirements = platform_resource_requirements(&profile).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(requirements[36..40].try_into().unwrap()),
+            4
+        );
+
+        let assignment = assign_platform_resources(&profile).unwrap();
+        let memory: vec::Vec<_> = assignment
+            .memory_resources(ResourceView::Translated)
+            .collect();
+        assert_eq!(memory.len(), 2);
+        assert_eq!(memory[0].start, 0);
+        assert_eq!(memory[0].flags, CM_RESOURCE_MEMORY_READ_ONLY);
+        assert_eq!(memory[1].flags, CM_RESOURCE_MEMORY_READ_WRITE);
+        assert_eq!(
+            assignment
+                .port_resources(ResourceView::Translated)
+                .next()
+                .unwrap()
+                .start,
+            0x1000
+        );
+        let interrupt = assignment
+            .interrupt_resource(ResourceView::Translated)
+            .unwrap();
+        assert_eq!(interrupt.vector, 9);
+        assert_eq!(interrupt.affinity, 1);
+        assert_eq!(interrupt.share, CM_RESOURCE_SHARE_SHARED);
+
+        let mut bytes = [0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
+        let written = assignment_to_cm_list(
+            &mut bytes,
+            INTERFACE_TYPE_PNP_BUS,
+            0,
+            &assignment,
+            ResourceView::Translated,
+        )
+        .unwrap();
+        assert_eq!(written, 100);
+        assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 4);
+        assert_eq!(bytes[20], nt_cm_resources::CM_RESOURCE_TYPE_MEMORY);
+        assert_eq!(u16::from_le_bytes(bytes[22..24].try_into().unwrap()), 1);
+        assert_eq!(bytes[60], nt_cm_resources::CM_RESOURCE_TYPE_PORT);
+        assert_eq!(bytes[80], nt_cm_resources::CM_RESOURCE_TYPE_INTERRUPT);
     }
 
     #[test]

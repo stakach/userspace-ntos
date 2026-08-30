@@ -21,11 +21,12 @@ use alloc::vec::Vec;
 
 use crate::*;
 use nt_pnp::{
-    assign_resources, assign_root_bus_resources, assignment_to_cm_list, enumerate_hierarchy,
-    pci_boot_resources, pci_resource_requirements, root_bus_resource_requirements,
-    select_resource_assignment, PciDevice, PciInterruptAssignment, ResourceAssignment, ResourceView,
-    RootBusResourceCatalog, RootBusResourceProfile, ASSIGNMENT_CM_LIST_MAX_SIZE, INTERFACE_TYPE_PCI_BUS,
-    INTERFACE_TYPE_PNP_BUS, ROOT_DMA_TEST_RESOURCE_PROFILE,
+    assign_platform_resources, assign_resources, assign_root_bus_resources, assignment_to_cm_list,
+    enumerate_hierarchy, pci_boot_resources, pci_resource_requirements,
+    platform_resource_requirements, root_bus_resource_requirements, select_resource_assignment,
+    PciDevice, PciInterruptAssignment, PlatformResourceProfile, ResourceAssignment, ResourceView,
+    RootBusResourceCatalog, RootBusResourceProfile, ASSIGNMENT_CM_LIST_MAX_SIZE,
+    INTERFACE_TYPE_PCI_BUS, INTERFACE_TYPE_PNP_BUS, ROOT_DMA_TEST_RESOURCE_PROFILE,
 };
 
 static mut ROOT_BUS_RESOURCE_CATALOG: Option<RootBusResourceCatalog> = None;
@@ -366,6 +367,42 @@ where
     .ok()?;
     raw_resource_list.truncate(raw_len);
     Some(DevnodeRootResourceGrant {
+        assignment,
+        resource_requirements,
+        raw_boot_resources: raw_resource_list.clone(),
+        translated_boot_resources: translated_resource_list.clone(),
+        raw_resource_list,
+        translated_resource_list,
+    })
+}
+
+/// Build boot/requirements/START snapshots for a firmware-derived platform resource profile.
+pub(crate) fn build_devnode_platform_resources(
+    profile: &PlatformResourceProfile,
+) -> Result<DevnodeRootResourceGrant, nt_pnp::ResourceRequirementsError> {
+    let assignment = assign_platform_resources(profile)?;
+    let resource_requirements = platform_resource_requirements(profile)?;
+    let mut translated_resource_list = vec![0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
+    let translated_len = assignment_to_cm_list(
+        &mut translated_resource_list,
+        INTERFACE_TYPE_PNP_BUS,
+        0,
+        &assignment,
+        ResourceView::Translated,
+    )
+    .map_err(nt_pnp::ResourceRequirementsError::EncodeCm)?;
+    translated_resource_list.truncate(translated_len);
+    let mut raw_resource_list = vec![0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
+    let raw_len = assignment_to_cm_list(
+        &mut raw_resource_list,
+        INTERFACE_TYPE_PNP_BUS,
+        0,
+        &assignment,
+        ResourceView::Raw,
+    )
+    .map_err(nt_pnp::ResourceRequirementsError::EncodeCm)?;
+    raw_resource_list.truncate(raw_len);
+    Ok(DevnodeRootResourceGrant {
         assignment,
         resource_requirements,
         raw_boot_resources: raw_resource_list.clone(),

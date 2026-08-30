@@ -173,6 +173,117 @@ pub(crate) struct HostedPnpRootResourceDescriptor {
     pub(crate) dma_len: u64,
 }
 
+#[derive(Clone)]
+pub(crate) struct HostedPnpPlatformMemoryDescriptor {
+    pub(crate) resource_index: u8,
+    pub(crate) phys: u64,
+    pub(crate) len: u64,
+    pub(crate) writable: bool,
+    pub(crate) frame_base: u64,
+    pub(crate) pages: u64,
+    pub(crate) va: u64,
+    pub(crate) seed_va: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct HostedPnpPlatformPortDescriptor {
+    pub(crate) resource_index: u8,
+    pub(crate) base: u64,
+    pub(crate) len: u32,
+}
+
+#[derive(Clone)]
+pub(crate) struct HostedPnpPlatformResourceDescriptor {
+    pub(crate) instance_path: &'static str,
+    pub(crate) hardware_id: &'static str,
+    pub(crate) compatible_id: &'static str,
+    pub(crate) memory: Vec<HostedPnpPlatformMemoryDescriptor>,
+    pub(crate) ports: Vec<HostedPnpPlatformPortDescriptor>,
+    pub(crate) interrupt_vector: u32,
+    pub(crate) interrupt_latched: bool,
+    pub(crate) interrupt_shared: bool,
+}
+
+impl HostedPnpPlatformResourceDescriptor {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        instance_path: &'static str,
+        hardware_id: &'static str,
+        compatible_id: &'static str,
+        memory: Vec<HostedPnpPlatformMemoryDescriptor>,
+        ports: Vec<HostedPnpPlatformPortDescriptor>,
+        interrupt_vector: u32,
+        interrupt_latched: bool,
+        interrupt_shared: bool,
+    ) -> Option<Self> {
+        if instance_path.is_empty()
+            || hardware_id.is_empty()
+            || interrupt_vector == 0
+            || memory.len() > driver_launch::SH_RESOURCE_KIND_CAPACITY as usize
+            || ports.len() > driver_launch::SH_RESOURCE_KIND_CAPACITY as usize
+            || memory.iter().enumerate().any(|(index, resource)| {
+                resource.resource_index >= driver_launch::SH_RESOURCE_KIND_CAPACITY
+                    || memory[..index].iter().any(|previous| {
+                        previous.resource_index == resource.resource_index
+                    })
+                    || resource.len == 0
+                    || resource.frame_base == 0
+                    || resource.pages == 0
+                    || resource.len > resource.pages.saturating_mul(0x1000)
+                    || resource.phys & 0xfff != 0
+                    || resource.len & 0xfff != 0
+                    || resource.va & 0xfff != 0
+                    || resource.seed_va & 0xfff != 0
+                    || resource.va == 0
+                    || resource.seed_va == 0
+            })
+            || ports.iter().enumerate().any(|(index, resource)| {
+                resource.resource_index >= driver_launch::SH_RESOURCE_KIND_CAPACITY
+                    || ports[..index].iter().any(|previous| {
+                        previous.resource_index == resource.resource_index
+                    })
+                    || resource.len == 0
+                    || resource
+                        .base
+                        .checked_add(resource.len as u64)
+                        .and_then(|end| end.checked_sub(1))
+                        .is_none_or(|end| end > u16::MAX as u64)
+            })
+        {
+            return None;
+        }
+        Some(Self {
+            instance_path,
+            hardware_id,
+            compatible_id,
+            memory,
+            ports,
+            interrupt_vector,
+            interrupt_latched,
+            interrupt_shared,
+        })
+    }
+
+    pub(crate) fn matches_devnode<H, C>(
+        &self,
+        instance_path: &str,
+        hardware_ids: &[H],
+        compatible_ids: &[C],
+    ) -> bool
+    where
+        H: AsRef<str>,
+        C: AsRef<str>,
+    {
+        instance_path.eq_ignore_ascii_case(self.instance_path)
+            || hardware_ids
+                .iter()
+                .any(|id| id.as_ref().eq_ignore_ascii_case(self.hardware_id))
+            || compatible_ids
+                .iter()
+                .any(|id| id.as_ref().eq_ignore_ascii_case(self.compatible_id))
+    }
+}
+
 impl HostedPnpRootResourceDescriptor {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -227,6 +338,7 @@ pub(crate) struct HostedPnpContextDescription {
     pub(crate) pci_devices: Vec<nt_pnp::PciDevice>,
     pub(crate) pci_windows: Vec<HostedPnpPciResourceDescriptor>,
     pub(crate) root_windows: Vec<HostedPnpRootResourceDescriptor>,
+    pub(crate) platform_windows: Vec<HostedPnpPlatformResourceDescriptor>,
 }
 
 impl HostedPnpContextDescription {
@@ -234,6 +346,7 @@ impl HostedPnpContextDescription {
         pci_devices: Vec<nt_pnp::PciDevice>,
         pci_windows: Vec<HostedPnpPciResourceDescriptor>,
         root_windows: Vec<HostedPnpRootResourceDescriptor>,
+        platform_windows: Vec<HostedPnpPlatformResourceDescriptor>,
     ) -> Option<Self> {
         if pci_windows.iter().enumerate().any(|(index, window)| {
             pci_windows[..index].iter().any(|previous| {
@@ -245,6 +358,15 @@ impl HostedPnpContextDescription {
             root_windows[..index]
                 .iter()
                 .any(|previous| previous.device_id.eq_ignore_ascii_case(window.device_id))
+        }) || platform_windows.iter().enumerate().any(|(index, window)| {
+            window.instance_path.is_empty()
+                || window.hardware_id.is_empty()
+                || window.interrupt_vector == 0
+                || platform_windows[..index].iter().any(|previous| {
+                    previous
+                        .instance_path
+                        .eq_ignore_ascii_case(window.instance_path)
+                })
         }) {
             return None;
         }
@@ -252,6 +374,7 @@ impl HostedPnpContextDescription {
             pci_devices,
             pci_windows,
             root_windows,
+            platform_windows,
         })
     }
 }
@@ -535,6 +658,12 @@ unsafe fn retire_or_retain(owner: HostedPnpContextOwner) -> Result<(), nt_status
     }
 }
 
+pub(crate) unsafe fn retire_hosted_pnp_context_owner(
+    owner: HostedPnpContextOwner,
+) -> Result<(), nt_status::NtStatus> {
+    retire_or_retain(owner)
+}
+
 pub(crate) unsafe fn retry_hosted_pnp_context_retirements() -> usize {
     let pending_count = hosted_pnp_context_authority_mut().pending_retirements.len();
     let mut failures = Vec::new();
@@ -555,6 +684,7 @@ pub(crate) unsafe fn publish_hosted_pnp_resource_context(
     pci_devices: Vec<nt_pnp::PciDevice>,
     pci_windows: Vec<HostedPnpPciResourceDescriptor>,
     root_windows: Vec<HostedPnpRootResourceDescriptor>,
+    platform_windows: Vec<HostedPnpPlatformResourceDescriptor>,
     owner: HostedPnpContextOwner,
 ) -> Result<ContextId, nt_status::NtStatus> {
     let _ = retry_hosted_pnp_context_retirements();
@@ -563,7 +693,12 @@ pub(crate) unsafe fn publish_hosted_pnp_resource_context(
         .try_reserve(1)
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     let Some(description) =
-        HostedPnpContextDescription::new(pci_devices, pci_windows, root_windows)
+        HostedPnpContextDescription::new(
+            pci_devices,
+            pci_windows,
+            root_windows,
+            platform_windows,
+        )
     else {
         retire_or_retain(owner)?;
         return Err(nt_status::NtStatus::INVALID_PARAMETER);

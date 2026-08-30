@@ -77,6 +77,8 @@ nt-power-manager = { path = "../../crates/nt-power-manager" }
 nt-power-types = { path = "../../crates/nt-power-types" }
 nt-pnp-context = { path = "../../crates/nt-pnp-context" }
 nt-driver-start = { path = "../../crates/nt-driver-start" }
+# Checked firmware-table discovery remains policy-only; seL4 physical authority lives here.
+nt-acpi = { path = "../../crates/nt-acpi" }
 # PE loader — load + map + relocate a real Windows .sys binary in the isolated host.
 nt-pe-loader = { path = "../../crates/nt-pe-loader" }
 # Process Manager — real EPROCESS/ETHREAD + per-process handle tables + lifecycle. The live
