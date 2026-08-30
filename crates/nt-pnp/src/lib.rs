@@ -26,9 +26,15 @@
 
 extern crate alloc;
 
+mod acpi_pci_scope_catalog;
 mod pci_interrupt_routes;
 mod pci_inventory;
 
+pub use acpi_pci_scope_catalog::{
+    AcpiPciBridgeScopeFact, AcpiPciResolvedScope, AcpiPciRootScopeFact, AcpiPciScopeCatalog,
+    AcpiPciScopeError, AcpiPciScopeSource, PreparedAcpiPciScopeCatalogUpdate,
+    PreparedAcpiPciScopeResolution,
+};
 pub use pci_interrupt_routes::{
     PciInterruptRoute, PciInterruptRouteClaim, PciInterruptRouteError, PciInterruptRouteOwner,
     PciRouteFunction, PreparedPciInterruptRoutePublication, PreparedPciInterruptRouteRevocation,
@@ -131,6 +137,10 @@ pub struct PciDevice {
     pub device: u16,
     /// The 24-bit class code `(base_class << 16) | (sub_class << 8) | prog_if`.
     pub class: u32,
+    /// PCI header layout after masking the multifunction bit.
+    pub header_type: u8,
+    /// Bus window owned by a PCI-to-PCI bridge. Non-bridge functions never carry one.
+    pub bridge: Option<PciBridgeBusNumbers>,
     /// Observed PCI config `InterruptLine` byte. This is inventory data, never route authority.
     pub irq_line: u8,
     /// The PCI interrupt pin (0 = none/MSI-only, 1 = INTA .. 4 = INTD).
@@ -143,6 +153,16 @@ impl PciDevice {
     /// The high byte of the class code — the PCI *base class* (e.g. `PCI_CLASS_NETWORK`).
     pub fn base_class(&self) -> u8 {
         (self.class >> 16) as u8
+    }
+
+    pub fn subclass(&self) -> u8 {
+        (self.class >> 8) as u8
+    }
+
+    pub fn is_pci_bridge(&self) -> bool {
+        self.header_type == PCI_HEADER_TYPE_BRIDGE
+            && self.base_class() == PCI_CLASS_BRIDGE
+            && self.subclass() == PCI_SUBCLASS_PCI_TO_PCI
     }
 
     /// The first assigned memory BAR — the device's primary MMIO register file (a NIC's BAR0).
@@ -161,6 +181,14 @@ impl PciDevice {
     }
 }
 
+/// Primary/secondary/subordinate bus ownership published by one PCI-to-PCI bridge.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PciBridgeBusNumbers {
+    pub primary: u8,
+    pub secondary: u8,
+    pub subordinate: u8,
+}
+
 /// Read-only PCI function snapshot used to detect topology changes without disabling decode or
 /// writing BAR sizing values into an already-started device.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -175,6 +203,7 @@ pub struct PciFunctionSnapshot {
     pub irq_line: u8,
     pub irq_pin: u8,
     pub header_type: u8,
+    pub bridge: Option<PciBridgeBusNumbers>,
     pub bar_count: u8,
     pub raw_bars: [u32; PCI_NUM_BARS],
 }
@@ -193,7 +222,9 @@ impl PciFunctionSnapshot {
     }
 
     pub fn is_pci_bridge(&self) -> bool {
-        self.base_class() == PCI_CLASS_BRIDGE && self.subclass() == PCI_SUBCLASS_PCI_TO_PCI
+        self.header_type == PCI_HEADER_TYPE_BRIDGE
+            && self.base_class() == PCI_CLASS_BRIDGE
+            && self.subclass() == PCI_SUBCLASS_PCI_TO_PCI
     }
 
     pub fn same_hardware_identity(&self, device: &PciDevice) -> bool {
@@ -201,6 +232,7 @@ impl PciFunctionSnapshot {
             && self.vendor == device.vendor
             && self.device == device.device
             && self.class == device.class
+            && self.header_type == device.header_type
     }
 }
 
@@ -324,6 +356,17 @@ where
     let intr = read(PCI_CFG_INTERRUPT);
     let irq_line = (intr & 0xFF) as u8;
     let irq_pin = ((intr >> 8) & 0xFF) as u8;
+    let bridge = (header_type == PCI_HEADER_TYPE_BRIDGE
+        && (class >> 16) as u8 == PCI_CLASS_BRIDGE
+        && (class >> 8) as u8 == PCI_SUBCLASS_PCI_TO_PCI)
+        .then(|| {
+            let numbers = read(PCI_CFG_BUS_NUMBERS);
+            PciBridgeBusNumbers {
+                primary: numbers as u8,
+                secondary: (numbers >> 8) as u8,
+                subordinate: (numbers >> 16) as u8,
+            }
+        });
     let mut bars = Vec::new();
     let command = read(PCI_CFG_COMMAND_STATUS) as u16;
     if bar_count != 0 {
@@ -354,6 +397,8 @@ where
         vendor,
         device,
         class,
+        header_type,
+        bridge,
         irq_line,
         irq_pin,
         bars,
@@ -380,6 +425,17 @@ where
         _ => 0,
     };
     let interrupt = read(PCI_CFG_INTERRUPT);
+    let bridge = (header_type == PCI_HEADER_TYPE_BRIDGE
+        && (class >> 16) as u8 == PCI_CLASS_BRIDGE
+        && (class >> 8) as u8 == PCI_SUBCLASS_PCI_TO_PCI)
+        .then(|| {
+            let numbers = read(PCI_CFG_BUS_NUMBERS);
+            PciBridgeBusNumbers {
+                primary: numbers as u8,
+                secondary: (numbers >> 8) as u8,
+                subordinate: (numbers >> 16) as u8,
+            }
+        });
     let mut raw_bars = [0; PCI_NUM_BARS];
     for index in 0..bar_count {
         raw_bars[index as usize] = read(PCI_CFG_BAR0 + index * 4);
@@ -394,6 +450,7 @@ where
         irq_line: interrupt as u8,
         irq_pin: (interrupt >> 8) as u8,
         header_type,
+        bridge,
         bar_count,
         raw_bars,
     })
@@ -496,10 +553,12 @@ where
                 continue;
             }
             let bridge = PciLocation::from(device);
-            let numbers = read(device.bus, device.dev, device.func, PCI_CFG_BUS_NUMBERS);
-            let primary = numbers as u8;
-            let secondary = (numbers >> 8) as u8;
-            let subordinate = (numbers >> 16) as u8;
+            let numbers = device
+                .bridge
+                .expect("PCI bridge classification lost its bus window");
+            let primary = numbers.primary;
+            let secondary = numbers.secondary;
+            let subordinate = numbers.subordinate;
             if primary != bus || secondary == 0 || secondary > subordinate {
                 return Err(PciTopologyError::InvalidBridgeWindow {
                     bridge,
@@ -546,15 +605,12 @@ where
                 continue;
             }
             let bridge = snapshot.location();
-            let numbers = read(
-                snapshot.bus,
-                snapshot.dev,
-                snapshot.func,
-                PCI_CFG_BUS_NUMBERS,
-            );
-            let primary = numbers as u8;
-            let secondary = (numbers >> 8) as u8;
-            let subordinate = (numbers >> 16) as u8;
+            let numbers = snapshot
+                .bridge
+                .expect("PCI bridge snapshot lost its bus window");
+            let primary = numbers.primary;
+            let secondary = numbers.secondary;
+            let subordinate = numbers.subordinate;
             if primary != bus || secondary == 0 || secondary > subordinate {
                 return Err(PciTopologyError::InvalidBridgeWindow {
                     bridge,
@@ -1977,6 +2033,14 @@ mod tests {
         .unwrap();
         assert_eq!(devices.len(), 2);
         assert_eq!(PciLocation::from(&devices[0]), PciLocation::new(0, 1, 0));
+        assert_eq!(
+            devices[0].bridge,
+            Some(PciBridgeBusNumbers {
+                primary: 0,
+                secondary: 2,
+                subordinate: 2,
+            })
+        );
         assert_eq!(PciLocation::from(&devices[1]), PciLocation::new(2, 4, 0));
     }
 
@@ -2300,6 +2364,8 @@ mod tests {
                 vendor: 0x8086,
                 device: 0x29C0,
                 class: 0x060000,
+                header_type: 0,
+                bridge: None,
                 irq_line: 0,
                 irq_pin: 0,
                 bars: vec![],
@@ -2311,6 +2377,8 @@ mod tests {
                 vendor: 0x8086,
                 device: 0x100E,
                 class: 0x020000,
+                header_type: 0,
+                bridge: None,
                 irq_line: 11,
                 irq_pin: 1,
                 bars: vec![Bar {
@@ -2364,6 +2432,8 @@ mod tests {
                 vendor: 0x8086,
                 device: 0x100E,
                 class: 0x020000,
+                header_type: 0,
+                bridge: None,
                 irq_line: 11,
                 irq_pin: 1,
                 bars: vec![Bar {
@@ -2383,6 +2453,8 @@ mod tests {
                 vendor: 0x8086,
                 device: 0x100E,
                 class: 0x020000,
+                header_type: 0,
+                bridge: None,
                 irq_line: 10,
                 irq_pin: 1,
                 bars: vec![Bar {
@@ -2621,6 +2693,8 @@ mod tests {
             vendor: 0x1234,
             device: 0x5678,
             class: 0x020000,
+            header_type: 0,
+            bridge: None,
             irq_line: 10,
             irq_pin: 1,
             bars: vec![],
@@ -2711,6 +2785,8 @@ mod tests {
             vendor: 0x8086,
             device: 0x100e,
             class: 0x020000,
+            header_type: 0,
+            bridge: None,
             irq_line: 11,
             irq_pin: 1,
             bars: vec![Bar {

@@ -35,7 +35,7 @@ impl PciInterruptRoute {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PciInterruptRouteError {
     UnacceptedInventory,
-    UnacceptedProviderRelations,
+    UnacceptedProviderScopes,
     InvalidAddress(PciInterruptRoute),
     DuplicateRoute(PciInterruptRoute),
     ConflictingSharedGsi(u32),
@@ -44,7 +44,7 @@ pub enum PciInterruptRouteError {
     GenerationExhausted,
     StaleOwner,
     StaleInventory,
-    StaleProviderRelations,
+    StaleProviderScopes,
 }
 
 /// Exact authority retained with a downstream interrupt resource assignment.
@@ -52,7 +52,7 @@ pub enum PciInterruptRouteError {
 pub struct PciInterruptRouteClaim {
     publication_generation: u64,
     inventory_generation: u64,
-    provider_relation_generation: u64,
+    provider_scope_generation: u64,
     route: PciInterruptRoute,
 }
 
@@ -65,8 +65,8 @@ impl PciInterruptRouteClaim {
         self.inventory_generation
     }
 
-    pub fn provider_relation_generation(self) -> u64 {
-        self.provider_relation_generation
+    pub fn provider_scope_generation(self) -> u64 {
+        self.provider_scope_generation
     }
 
     pub fn route(self) -> PciInterruptRoute {
@@ -81,7 +81,7 @@ pub struct PreparedPciInterruptRoutePublication {
     base_generation: u64,
     target_generation: u64,
     inventory_generation: u64,
-    provider_relation_generation: u64,
+    provider_scope_generation: u64,
     segment: u16,
     routes: Vec<PciInterruptRoute>,
 }
@@ -99,8 +99,8 @@ impl PreparedPciInterruptRoutePublication {
         self.inventory_generation
     }
 
-    pub fn provider_relation_generation(&self) -> u64 {
-        self.provider_relation_generation
+    pub fn provider_scope_generation(&self) -> u64 {
+        self.provider_scope_generation
     }
 
     pub fn segment(&self) -> u16 {
@@ -117,7 +117,7 @@ impl PreparedPciInterruptRoutePublication {
 pub struct PreparedPciInterruptRouteRevocation {
     base_generation: u64,
     target_generation: u64,
-    provider_relation_generation: u64,
+    provider_scope_generation: u64,
 }
 
 impl PreparedPciInterruptRouteRevocation {
@@ -129,8 +129,8 @@ impl PreparedPciInterruptRouteRevocation {
         self.target_generation
     }
 
-    pub fn provider_relation_generation(self) -> u64 {
-        self.provider_relation_generation
+    pub fn provider_scope_generation(self) -> u64 {
+        self.provider_scope_generation
     }
 }
 
@@ -140,7 +140,7 @@ impl PreparedPciInterruptRouteRevocation {
 pub struct PciInterruptRouteOwner {
     generation: u64,
     inventory_generation: Option<u64>,
-    provider_relation_generation: Option<u64>,
+    provider_scope_generation: Option<u64>,
     segment: Option<u16>,
     routes: Vec<PciInterruptRoute>,
 }
@@ -150,7 +150,7 @@ impl Default for PciInterruptRouteOwner {
         Self {
             generation: 0,
             inventory_generation: None,
-            provider_relation_generation: None,
+            provider_scope_generation: None,
             segment: None,
             routes: Vec::new(),
         }
@@ -166,8 +166,8 @@ impl PciInterruptRouteOwner {
         self.inventory_generation
     }
 
-    pub fn provider_relation_generation(&self) -> Option<u64> {
-        self.provider_relation_generation
+    pub fn provider_scope_generation(&self) -> Option<u64> {
+        self.provider_scope_generation
     }
 
     pub fn segment(&self) -> Option<u16> {
@@ -182,13 +182,13 @@ impl PciInterruptRouteOwner {
     /// INTx pin must be covered; extra firmware routes for empty slots remain valid for hotplug.
     pub fn prepare_replace(
         &self,
-        provider_relation_generation: u64,
+        provider_scope_generation: u64,
         segment: u16,
         inventory: &PciInventory,
         routes: Vec<PciInterruptRoute>,
     ) -> Result<PreparedPciInterruptRoutePublication, PciInterruptRouteError> {
         self.prepare_for_generation(
-            provider_relation_generation,
+            provider_scope_generation,
             segment,
             inventory.generation(),
             inventory.devices(),
@@ -200,13 +200,13 @@ impl PciInterruptRouteOwner {
     /// the serialized bus transaction still owns both generations.
     pub fn prepare_replace_for_update(
         &self,
-        provider_relation_generation: u64,
+        provider_scope_generation: u64,
         segment: u16,
         inventory: &PreparedPciInventoryUpdate,
         routes: Vec<PciInterruptRoute>,
     ) -> Result<PreparedPciInterruptRoutePublication, PciInterruptRouteError> {
         self.prepare_for_generation(
-            provider_relation_generation,
+            provider_scope_generation,
             segment,
             inventory.target_generation(),
             inventory.devices(),
@@ -216,7 +216,7 @@ impl PciInterruptRouteOwner {
 
     fn prepare_for_generation(
         &self,
-        provider_relation_generation: u64,
+        provider_scope_generation: u64,
         segment: u16,
         inventory_generation: u64,
         devices: &[PciDevice],
@@ -225,8 +225,8 @@ impl PciInterruptRouteOwner {
         if inventory_generation == 0 {
             return Err(PciInterruptRouteError::UnacceptedInventory);
         }
-        if provider_relation_generation == 0 {
-            return Err(PciInterruptRouteError::UnacceptedProviderRelations);
+        if provider_scope_generation == 0 {
+            return Err(PciInterruptRouteError::UnacceptedProviderScopes);
         }
         let target_generation = self
             .generation
@@ -238,7 +238,7 @@ impl PciInterruptRouteOwner {
             base_generation: self.generation,
             target_generation,
             inventory_generation,
-            provider_relation_generation,
+            provider_scope_generation,
             segment,
             routes,
         })
@@ -249,7 +249,7 @@ impl PciInterruptRouteOwner {
         &mut self,
         prepared: PreparedPciInterruptRoutePublication,
         inventory: &PciInventory,
-        provider_relation_generation: u64,
+        provider_scope_generation: u64,
     ) -> Result<u64, PciInterruptRouteError> {
         if prepared.base_generation != self.generation
             || prepared.target_generation != self.generation.wrapping_add(1)
@@ -259,27 +259,27 @@ impl PciInterruptRouteOwner {
         if prepared.inventory_generation != inventory.generation() {
             return Err(PciInterruptRouteError::StaleInventory);
         }
-        if prepared.provider_relation_generation != provider_relation_generation {
-            return Err(PciInterruptRouteError::StaleProviderRelations);
+        if prepared.provider_scope_generation != provider_scope_generation {
+            return Err(PciInterruptRouteError::StaleProviderScopes);
         }
         self.generation = prepared.target_generation;
         self.inventory_generation = Some(prepared.inventory_generation);
-        self.provider_relation_generation = Some(prepared.provider_relation_generation);
+        self.provider_scope_generation = Some(prepared.provider_scope_generation);
         self.segment = Some(prepared.segment);
         self.routes = prepared.routes;
         Ok(self.generation)
     }
 
-    /// Prepare complete revocation against the exact provider relation generation that owns it.
+    /// Prepare complete revocation against the exact provider scope generation that owns it.
     pub fn prepare_revoke(
         &self,
-        provider_relation_generation: u64,
+        provider_scope_generation: u64,
     ) -> Result<PreparedPciInterruptRouteRevocation, PciInterruptRouteError> {
-        if provider_relation_generation == 0 {
-            return Err(PciInterruptRouteError::UnacceptedProviderRelations);
+        if provider_scope_generation == 0 {
+            return Err(PciInterruptRouteError::UnacceptedProviderScopes);
         }
-        if self.provider_relation_generation != Some(provider_relation_generation) {
-            return Err(PciInterruptRouteError::StaleProviderRelations);
+        if self.provider_scope_generation != Some(provider_scope_generation) {
+            return Err(PciInterruptRouteError::StaleProviderScopes);
         }
         let target_generation = self
             .generation
@@ -288,7 +288,7 @@ impl PciInterruptRouteOwner {
         Ok(PreparedPciInterruptRouteRevocation {
             base_generation: self.generation,
             target_generation,
-            provider_relation_generation,
+            provider_scope_generation,
         })
     }
 
@@ -296,21 +296,21 @@ impl PciInterruptRouteOwner {
     pub fn commit_revoke(
         &mut self,
         prepared: PreparedPciInterruptRouteRevocation,
-        provider_relation_generation: u64,
+        provider_scope_generation: u64,
     ) -> Result<u64, PciInterruptRouteError> {
         if prepared.base_generation != self.generation
             || prepared.target_generation != self.generation.wrapping_add(1)
         {
             return Err(PciInterruptRouteError::StaleOwner);
         }
-        if prepared.provider_relation_generation != provider_relation_generation
-            || self.provider_relation_generation != Some(provider_relation_generation)
+        if prepared.provider_scope_generation != provider_scope_generation
+            || self.provider_scope_generation != Some(provider_scope_generation)
         {
-            return Err(PciInterruptRouteError::StaleProviderRelations);
+            return Err(PciInterruptRouteError::StaleProviderScopes);
         }
         self.generation = prepared.target_generation;
         self.inventory_generation = None;
-        self.provider_relation_generation = None;
+        self.provider_scope_generation = None;
         self.segment = None;
         self.routes.clear();
         Ok(self.generation)
@@ -321,17 +321,17 @@ impl PciInterruptRouteOwner {
     pub fn resolve(
         &self,
         inventory: &PciInventory,
-        provider_relation_generation: u64,
+        provider_scope_generation: u64,
         segment: u16,
         location: PciLocation,
     ) -> Result<Option<PciInterruptRouteClaim>, PciInterruptRouteError> {
         if self.inventory_generation != Some(inventory.generation())
-            || self.provider_relation_generation != Some(provider_relation_generation)
+            || self.provider_scope_generation != Some(provider_scope_generation)
             || self.segment != Some(segment)
         {
             return Err(
-                if self.provider_relation_generation != Some(provider_relation_generation) {
-                    PciInterruptRouteError::StaleProviderRelations
+                if self.provider_scope_generation != Some(provider_scope_generation) {
+                    PciInterruptRouteError::StaleProviderScopes
                 } else {
                     PciInterruptRouteError::StaleInventory
                 },
@@ -363,7 +363,7 @@ impl PciInterruptRouteOwner {
         Ok(route.map(|route| PciInterruptRouteClaim {
             publication_generation: self.generation,
             inventory_generation: inventory.generation(),
-            provider_relation_generation,
+            provider_scope_generation,
             route,
         }))
     }
@@ -372,7 +372,7 @@ impl PciInterruptRouteOwner {
     pub fn validate(
         &self,
         inventory: &PciInventory,
-        provider_relation_generation: u64,
+        provider_scope_generation: u64,
         claim: PciInterruptRouteClaim,
     ) -> Result<PciInterruptRoute, PciInterruptRouteError> {
         if claim.publication_generation != self.generation {
@@ -384,10 +384,10 @@ impl PciInterruptRouteOwner {
         {
             return Err(PciInterruptRouteError::StaleInventory);
         }
-        if claim.provider_relation_generation != provider_relation_generation
-            || self.provider_relation_generation != Some(provider_relation_generation)
+        if claim.provider_scope_generation != provider_scope_generation
+            || self.provider_scope_generation != Some(provider_scope_generation)
         {
-            return Err(PciInterruptRouteError::StaleProviderRelations);
+            return Err(PciInterruptRouteError::StaleProviderScopes);
         }
         if self
             .routes
@@ -488,6 +488,8 @@ mod tests {
             vendor: 0x8086,
             device: 0x100e,
             class: 0x020000,
+            header_type: 0,
+            bridge: None,
             irq_line: 0xff,
             irq_pin: pin,
             bars: vec![],
@@ -874,12 +876,12 @@ mod tests {
                 0,
                 PciLocation::new(0, 3, 0),
             ),
-            Err(PciInterruptRouteError::StaleProviderRelations)
+            Err(PciInterruptRouteError::StaleProviderScopes)
         );
     }
 
     #[test]
-    fn provider_relation_generation_fences_publish_resolve_and_revocation() {
+    fn provider_scope_generation_fences_publish_resolve_and_revocation() {
         let inventory = PciInventory::try_from_initial(vec![device(0, 3, 0, 1)]).unwrap();
         let mut owner = PciInterruptRouteOwner::default();
         assert_eq!(
@@ -889,7 +891,7 @@ mod tests {
                 &inventory,
                 vec![route(0, 3, PciRouteFunction::Any, 0, 17)],
             ),
-            Err(PciInterruptRouteError::UnacceptedProviderRelations)
+            Err(PciInterruptRouteError::UnacceptedProviderScopes)
         );
 
         let publication = owner
@@ -906,7 +908,7 @@ mod tests {
                 &inventory,
                 PROVIDER_RELATION_GENERATION + 1,
             ),
-            Err(PciInterruptRouteError::StaleProviderRelations)
+            Err(PciInterruptRouteError::StaleProviderScopes)
         );
         assert_eq!(owner.generation(), 0);
         owner
@@ -919,7 +921,7 @@ mod tests {
                 0,
                 PciLocation::new(0, 3, 0),
             ),
-            Err(PciInterruptRouteError::StaleProviderRelations)
+            Err(PciInterruptRouteError::StaleProviderScopes)
         );
 
         {
@@ -928,7 +930,7 @@ mod tests {
         assert_eq!(owner.routes().len(), 1);
         assert_eq!(
             owner.prepare_revoke(PROVIDER_RELATION_GENERATION + 1),
-            Err(PciInterruptRouteError::StaleProviderRelations)
+            Err(PciInterruptRouteError::StaleProviderScopes)
         );
     }
 }

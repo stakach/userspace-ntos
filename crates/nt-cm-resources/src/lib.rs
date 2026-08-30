@@ -120,6 +120,15 @@ fn read_u32(buf: &[u8], offset: usize) -> Result<u32, NativeResourceListError> {
     ))
 }
 
+fn read_u16(buf: &[u8], offset: usize) -> Result<u16, NativeResourceListError> {
+    let bytes = buf
+        .get(offset..offset.saturating_add(2))
+        .ok_or(NativeResourceListError::Truncated)?;
+    Ok(u16::from_le_bytes(
+        bytes.try_into().expect("two-byte native resource field"),
+    ))
+}
+
 fn read_u64(buf: &[u8], offset: usize) -> Result<u64, NativeResourceListError> {
     let bytes = buf
         .get(offset..offset.saturating_add(8))
@@ -191,6 +200,45 @@ pub fn validate_cm_resource_list_extent(buf: &[u8]) -> Result<usize, NativeResou
         }
     }
     Ok(cursor)
+}
+
+/// Exact native representation of a single `CmResourceTypeBusNumber` descriptor.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BusNumberResourceDescriptor {
+    pub interface_type: i32,
+    pub bus_number: u32,
+    pub version: u16,
+    pub revision: u16,
+    pub share: u8,
+    pub flags: u16,
+    pub start: u32,
+    pub length: u32,
+    pub reserved: u32,
+}
+
+/// Decode a complete `CM_RESOURCE_LIST` containing exactly one full descriptor and exactly one
+/// BusNumber partial descriptor. Trailing allocator capacity and mixed resource lists are rejected.
+pub fn decode_single_bus_number_resource(
+    buf: &[u8],
+) -> Result<BusNumberResourceDescriptor, NativeResourceListError> {
+    if validate_cm_resource_list_extent(buf)? != buf.len()
+        || read_u32(buf, 0)? != 1
+        || read_u32(buf, 16)? != 1
+        || buf.get(20).copied() != Some(CM_RESOURCE_TYPE_BUS_NUMBER)
+    {
+        return Err(NativeResourceListError::InvalidDescriptor);
+    }
+    Ok(BusNumberResourceDescriptor {
+        interface_type: read_u32(buf, 4)? as i32,
+        bus_number: read_u32(buf, 8)?,
+        version: read_u16(buf, 12)?,
+        revision: read_u16(buf, 14)?,
+        share: *buf.get(21).ok_or(NativeResourceListError::Truncated)?,
+        flags: read_u16(buf, 22)?,
+        start: read_u32(buf, 24)?,
+        length: read_u32(buf, 28)?,
+        reserved: read_u32(buf, 32)?,
+    })
 }
 
 /// Return the exact self-described prefix of a native `IO_RESOURCE_REQUIREMENTS_LIST` allocation.
@@ -1140,6 +1188,48 @@ pub fn decode_port_interrupt_list(buf: &[u8]) -> Option<(PortDescriptor, Interru
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_single_bus_number_resource_decodes_without_trailing_capacity() {
+        let mut bytes = [0u8; 40];
+        w32(&mut bytes, 0, 1);
+        w32(&mut bytes, 4, INTERFACE_TYPE_INTERNAL as u32);
+        w32(&mut bytes, 8, 0);
+        w16(&mut bytes, 12, 1);
+        w16(&mut bytes, 14, 1);
+        w32(&mut bytes, 16, 1);
+        bytes[20] = CM_RESOURCE_TYPE_BUS_NUMBER;
+        bytes[21] = CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE;
+        w32(&mut bytes, 24, 7);
+        w32(&mut bytes, 28, 1);
+
+        assert_eq!(
+            decode_single_bus_number_resource(&bytes),
+            Ok(BusNumberResourceDescriptor {
+                interface_type: INTERFACE_TYPE_INTERNAL,
+                bus_number: 0,
+                version: 1,
+                revision: 1,
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+                flags: 0,
+                start: 7,
+                length: 1,
+                reserved: 0,
+            })
+        );
+
+        let mut with_capacity = [0u8; 41];
+        with_capacity[..40].copy_from_slice(&bytes);
+        assert_eq!(
+            decode_single_bus_number_resource(&with_capacity),
+            Err(NativeResourceListError::InvalidDescriptor)
+        );
+        bytes[20] = CM_RESOURCE_TYPE_MEMORY;
+        assert_eq!(
+            decode_single_bus_number_resource(&bytes),
+            Err(NativeResourceListError::InvalidDescriptor)
+        );
+    }
 
     #[test]
     fn generic_cm_list_preserves_descriptor_order_and_irq_zero() {

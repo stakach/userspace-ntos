@@ -36458,10 +36458,16 @@ unsafe fn classify_hosted_acpi_namespace_result(
     child_index: usize,
     output_len: usize,
     status: nt_status::NtStatus,
+    information: u64,
     payload: &[u8],
 ) -> HostedNamespaceDisposition {
     if output_len == HOSTED_ACPI_NAMESPACE_HEADER_LEN {
         if status == nt_status::NtStatus::INVALID_DEVICE_REQUEST {
+            if information != 0 {
+                return HostedNamespaceDisposition::Barrier(
+                    nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                );
+            }
             return match store_hosted_acpi_namespace(
                 child_index,
                 HostedAcpiNamespaceState::NotApplicable,
@@ -36470,7 +36476,7 @@ unsafe fn classify_hosted_acpi_namespace_result(
                 Err(status) => HostedNamespaceDisposition::Barrier(status),
             };
         }
-        if status.raw() as u32 != STATUS_BUFFER_OVERFLOW {
+        if status.raw() as u32 != STATUS_BUFFER_OVERFLOW || information != 0 {
             return HostedNamespaceDisposition::Barrier(if status.is_success() {
                 nt_status::NtStatus::INVALID_DEVICE_REQUEST
             } else {
@@ -36489,7 +36495,10 @@ unsafe fn classify_hosted_acpi_namespace_result(
             ),
         };
     }
-    if !status.is_success() || output_len > HOSTED_ACPI_NAMESPACE_MAX_BYTES {
+    if !status.is_success()
+        || information != output_len as u64
+        || output_len > HOSTED_ACPI_NAMESPACE_MAX_BYTES
+    {
         return HostedNamespaceDisposition::Barrier(if status.is_success() {
             nt_status::NtStatus::INVALID_DEVICE_REQUEST
         } else {
@@ -36613,11 +36622,16 @@ unsafe fn dispatch_hosted_acpi_namespace(child_index: usize, output_len: usize) 
         }
     };
     match result {
-        ExternalDispatchResult::Completed { status, .. } => {
+        ExternalDispatchResult::Completed {
+            status,
+            information,
+            ..
+        } => {
             let disposition = classify_hosted_acpi_namespace_result(
                 child_index,
                 output_len,
                 status,
+                information,
                 &output,
             );
             apply_hosted_acpi_namespace_disposition(child_index, disposition);
@@ -37816,6 +37830,7 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     child_index,
                     output_len,
                     status: completion.status,
+                    information: completion.information,
                 };
                 progress = progress.saturating_add(1);
             }
@@ -37823,6 +37838,7 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                 child_index,
                 output_len,
                 status,
+                information,
             } => {
                 let irp_id = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
                     .as_ref()
@@ -37840,6 +37856,7 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                         child_index,
                         output_len,
                         status,
+                        information,
                         &payload,
                     ),
                     Ok(_) => HostedNamespaceDisposition::Barrier(
@@ -40080,6 +40097,7 @@ enum HostedDeviceRelationQueryPhase {
         child_index: usize,
         output_len: usize,
         status: nt_status::NtStatus,
+        information: u64,
     },
     AwaitingNamespaceAck {
         child_index: usize,

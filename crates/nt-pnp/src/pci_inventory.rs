@@ -31,6 +31,8 @@ pub enum PciInventoryError {
     Allocation,
     InvalidLocation(PciLocation),
     DuplicateLocation(PciLocation),
+    InvalidBridgeWindow(PciLocation),
+    DuplicateSecondaryBus(u8),
     GenerationExhausted,
     StaleUpdate,
 }
@@ -338,6 +340,7 @@ impl PciInventory {
 fn canonicalize(devices: &mut [PciDevice]) -> Result<(), PciInventoryError> {
     devices.sort_unstable_by_key(|device| PciLocation::from(device));
     let mut previous = None;
+    let mut secondary_bus_owners = [None; 256];
     for device in devices {
         let location = PciLocation::from(&*device);
         if location.device >= 32 || location.function >= 8 {
@@ -345,6 +348,23 @@ fn canonicalize(devices: &mut [PciDevice]) -> Result<(), PciInventoryError> {
         }
         if previous == Some(location) {
             return Err(PciInventoryError::DuplicateLocation(location));
+        }
+        match device.bridge {
+            Some(bridge)
+                if device.is_pci_bridge()
+                    && bridge.primary == device.bus
+                    && bridge.secondary != 0
+                    && bridge.secondary <= bridge.subordinate =>
+            {
+                if secondary_bus_owners[bridge.secondary as usize]
+                    .replace(location)
+                    .is_some()
+                {
+                    return Err(PciInventoryError::DuplicateSecondaryBus(bridge.secondary));
+                }
+            }
+            None if !device.is_pci_bridge() => {}
+            Some(_) | None => return Err(PciInventoryError::InvalidBridgeWindow(location)),
         }
         previous = Some(location);
     }
@@ -354,6 +374,7 @@ fn canonicalize(devices: &mut [PciDevice]) -> Result<(), PciInventoryError> {
 fn canonicalize_snapshots(snapshots: &mut [PciFunctionSnapshot]) -> Result<(), PciInventoryError> {
     snapshots.sort_unstable_by_key(|snapshot| snapshot.location());
     let mut previous = None;
+    let mut secondary_bus_owners = [None; 256];
     for snapshot in snapshots {
         let location = snapshot.location();
         if location.device >= 32 || location.function >= 8 {
@@ -361,6 +382,23 @@ fn canonicalize_snapshots(snapshots: &mut [PciFunctionSnapshot]) -> Result<(), P
         }
         if previous == Some(location) {
             return Err(PciInventoryError::DuplicateLocation(location));
+        }
+        match snapshot.bridge {
+            Some(bridge)
+                if snapshot.is_pci_bridge()
+                    && bridge.primary == snapshot.bus
+                    && bridge.secondary != 0
+                    && bridge.secondary <= bridge.subordinate =>
+            {
+                if secondary_bus_owners[bridge.secondary as usize]
+                    .replace(location)
+                    .is_some()
+                {
+                    return Err(PciInventoryError::DuplicateSecondaryBus(bridge.secondary));
+                }
+            }
+            None if !snapshot.is_pci_bridge() => {}
+            Some(_) | None => return Err(PciInventoryError::InvalidBridgeWindow(location)),
         }
         previous = Some(location);
     }
@@ -374,7 +412,10 @@ fn same_hardware_identity(previous: &PciDevice, current: &PciDevice) -> bool {
 }
 
 fn bus_owned_resources_changed(previous: &PciDevice, current: &PciDevice) -> bool {
-    previous.irq_pin != current.irq_pin || previous.bars != current.bars
+    previous.header_type != current.header_type
+        || previous.bridge != current.bridge
+        || previous.irq_pin != current.irq_pin
+        || previous.bars != current.bars
 }
 
 #[cfg(test)]
@@ -390,6 +431,8 @@ mod tests {
             vendor,
             device: product,
             class: 0x020000,
+            header_type: 0,
+            bridge: None,
             irq_line: 11,
             irq_pin: 1,
             bars: vec![crate::Bar {
@@ -424,9 +467,30 @@ mod tests {
             class: device.class,
             irq_line: device.irq_line,
             irq_pin: device.irq_pin,
-            header_type: 0,
+            header_type: device.header_type,
+            bridge: device.bridge,
             bar_count: 6,
             raw_bars,
+        }
+    }
+
+    fn bridge(device: u8, secondary: u8) -> PciDevice {
+        PciDevice {
+            bus: 0,
+            dev: device,
+            func: 0,
+            vendor: 0x8086,
+            device: 0x1111,
+            class: 0x060400,
+            header_type: 1,
+            bridge: Some(crate::PciBridgeBusNumbers {
+                primary: 0,
+                secondary,
+                subordinate: secondary,
+            }),
+            irq_line: 0xff,
+            irq_pin: 0,
+            bars: vec![],
         }
     }
 
@@ -487,6 +551,18 @@ mod tests {
     }
 
     #[test]
+    fn bridge_window_change_is_a_generation_owned_resource_change() {
+        let old = bridge(1, 2);
+        let moved = bridge(1, 3);
+        let inventory = PciInventory::try_from_initial(vec![old]).unwrap();
+        let prepared = inventory.prepare_rescan(vec![moved.clone()]).unwrap();
+        assert_eq!(prepared.resource_changes().len(), 1);
+        assert_eq!(prepared.resource_changes()[0].current, moved);
+        assert!(prepared.departures().is_empty());
+        assert!(prepared.arrivals().is_empty());
+    }
+
+    #[test]
     fn stale_prepared_update_cannot_replace_newer_accepted_state() {
         let first = function(0, 3, 0x8086, 0x100e, 0xfebc_0000);
         let sibling = function(0, 4, 0x8086, 0x100e, 0xfeba_0000);
@@ -515,6 +591,18 @@ mod tests {
             Err(PciInventoryError::InvalidLocation(PciLocation::new(
                 0, 32, 0
             )))
+        );
+        let mut invalid_bridge = bridge(1, 2);
+        invalid_bridge.bridge.as_mut().unwrap().primary = 1;
+        assert_eq!(
+            PciInventory::try_from_initial(vec![invalid_bridge]),
+            Err(PciInventoryError::InvalidBridgeWindow(PciLocation::new(
+                0, 1, 0
+            )))
+        );
+        assert_eq!(
+            PciInventory::try_from_initial(vec![bridge(1, 2), bridge(2, 2)]),
+            Err(PciInventoryError::DuplicateSecondaryBus(2))
         );
     }
 

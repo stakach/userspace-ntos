@@ -8,6 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+nt-acpi = { workspace = true }
 nt-cm-resources = { workspace = true }
 
 [lints.clippy]

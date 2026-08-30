@@ -19966,3 +19966,40 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     complete route set. Root `_SEG`/`_BBN`, filtered `_ADR`/`_PRT`, exact link `_CRS`, bridge BDF and
     SecondaryBus correlation, route electrical attributes, and GSI ownership must all agree before
     publication. Missing or stale facts remain a hard barrier, with no swizzle or partial route.
+
+    B3 ACPI/PCI scope-ownership crate checkpoint (2026-08-31, implementation green): live PCI
+    enumeration and read-only census snapshots now retain the masked header type and the exact
+    primary/secondary/subordinate bus-number window for every PCI-to-PCI bridge. `PciInventory`
+    validates those windows before publication, rejects duplicate SecondaryBus ownership, and treats
+    a changed bridge window as a generation-owned resource change. Hierarchy discovery consumes the
+    retained snapshot instead of rereading bridge configuration after the observation boundary.
+
+    The new `AcpiPciScopeCatalog` accepts complete per-root provider facts independently of PCI
+    arrival order, owns a semantic generation separate from the global BusRelations generation, and
+    prepares inert replace/remove transactions. Its pure reconciler correlates each parent-first
+    canonical ACPI path and exact `_ADR` with a unique live PCI bridge BDF and that bridge's retained
+    SecondaryBus. Unsupported segments, missing or non-bridge functions, duplicate bus ownership,
+    stale catalog/inventory generations, and any interrupt-bearing PCI bus without a resolved ACPI
+    scope are hard barriers. There is no swizzle, root-only, config-line, or partial-scope fallback.
+    `PciInterruptRouteOwner` terminology now reflects this independent provider-scope generation
+    instead of implying that a transient relation query owns route identity.
+
+    Configuration Manager resource decoding now has an exact single-BusNumber parser for root `_BBN`
+    cross-checking: it requires one complete `CM_RESOURCE_LIST`, one full descriptor, one BusNumber
+    partial descriptor, and no trailing allocator capacity or mixed resources. The executive's live
+    `IOCTL_ACPI_ENUM_CHILDREN` state machine now also validates `IoStatus.Information`: overflow and
+    structurally-not-applicable probes require zero, while successful retries require the exact
+    output length. Focused validation passes `nt-cm-resources` 17/17, `nt-pnp` 51/51, and `nt-acpi`
+    31/31; the freestanding executive check is green at the unchanged 209-warning baseline.
+
+    Review adjustment: this checkpoint establishes the host-testable authorities but does not yet
+    install them in the executive. Before live publication, make the catalog source key the complete
+    authenticated PDO endpoint (device identity, hosted-domain identity/cookie, and PDO object), add
+    an invalidation fence so old claims become unusable as soon as a relevant relation is queued,
+    and place the live inventory/catalog/route owner behind one focused executive topology authority.
+    Then extend the existing resumable relation transaction to evaluate exact root `_SEG`/`_BBN`,
+    filtered descendant `_ADR`/`_PRT`, and resolved link `_CRS`; prepare all fallible catalog and CM
+    work before the existing durable relation commit; commit catalog facts after devnodes/relations
+    and before invalidation completion; and schedule one serialized generation-fenced reconciler.
+    Runtime ACPI/SCI/desktop acceptance remains open because the active older desktop VM still owns
+    the serialized boot lane and was not disturbed.
