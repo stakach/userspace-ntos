@@ -19415,3 +19415,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     BIOS RSDP search windows required by the shipped ACPICA `AcpiFindRootPointer`, and publish the
     resulting memory/port/SCI resources on the canonical ACPI root PDO selected from registry/PnP
     identity. Do not select `acpi.sys` by service name and do not synthesize an RSDP or table bytes.
+
+    B3 BIOS ACPI-discovery authority checkpoint (2026-08-31, implementation green): source audit of
+    the shipped ACPICA found that `AcpiFindRootPointer` unconditionally maps the BIOS Data Area
+    pointer at physical `0x40e` before it searches either EBDA or `0xe0000..0xfffff`. rust-micro now
+    publishes page zero as an explicit device untyped alongside the existing upper-BIOS window;
+    zero is treated as a valid physical base within length-tracked device catalogs rather than as an
+    empty-entry sentinel. The range builder and spec prove that `0x40e` is covered. Both
+    `extern-rootserver` and `extern-rootserver,spec` freestanding checks pass with `core,alloc` built
+    for the target, and the microkernel commit was pushed before advancing the parent pointer.
+
+    Review adjustment: the executive reader can now authorize ACPICA's genuine BDA/EBDA/high-BIOS
+    RSDP discovery sequence. It must still map those frames from the same retained canonical cap set
+    used for table validation and the eventual hosted-driver grant; a failed/ambiguous physical
+    claim remains a boot-driver barrier rather than a request to fabricate discovery bytes.
