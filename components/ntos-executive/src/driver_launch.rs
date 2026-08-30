@@ -36206,7 +36206,10 @@ unsafe fn advance_hosted_device_capabilities(child_index: usize) {
             properties.capabilities != HostedDeviceCapabilitiesState::Unqueried
         })
     {
-        query.phase = HostedDeviceRelationQueryPhase::PropertiesCopied;
+        query.phase = HostedDeviceRelationQueryPhase::DispatchNamespace {
+            child_index: 0,
+            output_len: HOSTED_ACPI_NAMESPACE_HEADER_LEN,
+        };
         query.barrier_status = None;
     } else {
         query.phase = HostedDeviceRelationQueryPhase::Barrier;
@@ -36378,6 +36381,276 @@ unsafe fn dispatch_hosted_device_capabilities(child_index: usize) -> bool {
             set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
                 transport_status,
             ));
+        }
+    }
+    true
+}
+
+fn hosted_child_requires_acpi_namespace(child: &nt_pnp_manager::BusReportedChild) -> bool {
+    child
+        .device_id
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ACPI\\"))
+}
+
+unsafe fn store_hosted_acpi_namespace(
+    child_index: usize,
+    value: HostedAcpiNamespaceState,
+) -> Result<(), nt_status::NtStatus> {
+    let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+        .as_mut()
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if query
+        .child_properties
+        .get(child_index)
+        .is_none_or(|properties| properties.acpi_namespace != HostedAcpiNamespaceState::Unqueried)
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    if let HostedAcpiNamespaceState::Present(namespace) = &value {
+        let self_path = namespace.self_path().as_str();
+        if query
+            .child_properties
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != child_index)
+            .any(|(_, properties)| {
+                matches!(
+                    &properties.acpi_namespace,
+                    HostedAcpiNamespaceState::Present(existing)
+                        if existing.self_path().as_str() == self_path
+                )
+            })
+        {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+    }
+    query.child_properties[child_index].acpi_namespace = value;
+    Ok(())
+}
+
+unsafe fn advance_hosted_acpi_namespace(child_index: usize) {
+    let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+        .as_mut()
+        .expect("hosted relation query disappeared while advancing ACPI namespace discovery");
+    let next_child = child_index.saturating_add(1);
+    if next_child < query.reported_children.len() {
+        query.phase = HostedDeviceRelationQueryPhase::DispatchNamespace {
+            child_index: next_child,
+            output_len: HOSTED_ACPI_NAMESPACE_HEADER_LEN,
+        };
+        return;
+    }
+    if query.child_properties.len() == query.reported_children.len()
+        && query.child_properties.iter().all(|properties| {
+            properties.acpi_namespace != HostedAcpiNamespaceState::Unqueried
+        })
+    {
+        query.phase = HostedDeviceRelationQueryPhase::NamespacesCopied;
+        query.barrier_status = None;
+    } else {
+        query.phase = HostedDeviceRelationQueryPhase::Barrier;
+        query.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+}
+
+unsafe fn classify_hosted_acpi_namespace_result(
+    child_index: usize,
+    output_len: usize,
+    status: nt_status::NtStatus,
+    payload: &[u8],
+) -> HostedNamespaceDisposition {
+    if output_len == HOSTED_ACPI_NAMESPACE_HEADER_LEN {
+        if status.raw() as u32 != STATUS_BUFFER_OVERFLOW {
+            return HostedNamespaceDisposition::Barrier(if status.is_success() {
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST
+            } else {
+                status
+            });
+        }
+        return match nt_acpi::namespace_children_required_len(
+            payload,
+            HOSTED_ACPI_NAMESPACE_MAX_BYTES,
+        ) {
+            Ok(required) if required > HOSTED_ACPI_NAMESPACE_HEADER_LEN => {
+                HostedNamespaceDisposition::RetryExact(required)
+            }
+            Ok(_) | Err(_) => HostedNamespaceDisposition::Barrier(
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            ),
+        };
+    }
+    if !status.is_success() || output_len > HOSTED_ACPI_NAMESPACE_MAX_BYTES {
+        return HostedNamespaceDisposition::Barrier(if status.is_success() {
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST
+        } else {
+            status
+        });
+    }
+    match nt_acpi::parse_namespace_children(payload, HOSTED_ACPI_NAMESPACE_MAX_CHILDREN)
+        .map(HostedAcpiNamespaceState::Present)
+        .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+        .and_then(|value| store_hosted_acpi_namespace(child_index, value))
+    {
+        Ok(()) => HostedNamespaceDisposition::Advance,
+        Err(status) => HostedNamespaceDisposition::Barrier(status),
+    }
+}
+
+unsafe fn apply_hosted_acpi_namespace_disposition(
+    child_index: usize,
+    disposition: HostedNamespaceDisposition,
+) {
+    match disposition {
+        HostedNamespaceDisposition::RetryExact(output_len) => {
+            let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                .as_mut()
+                .expect("hosted relation query disappeared before exact ACPI namespace retry");
+            query.phase = HostedDeviceRelationQueryPhase::DispatchNamespace {
+                child_index,
+                output_len,
+            };
+        }
+        HostedNamespaceDisposition::Advance => advance_hosted_acpi_namespace(child_index),
+        HostedNamespaceDisposition::Barrier(status) => {
+            let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                .as_mut()
+                .expect("hosted relation query disappeared while applying ACPI namespace result");
+            query.phase = HostedDeviceRelationQueryPhase::Barrier;
+            query.barrier_status = Some(status);
+        }
+    }
+}
+
+unsafe fn dispatch_hosted_acpi_namespace(child_index: usize, output_len: usize) -> bool {
+    if !(HOSTED_ACPI_NAMESPACE_HEADER_LEN..=HOSTED_ACPI_NAMESPACE_MAX_BYTES)
+        .contains(&output_len)
+    {
+        set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
+        return true;
+    }
+    let requires_namespace = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+        .as_ref()
+        .and_then(|query| query.reported_children.get(child_index))
+        .map(hosted_child_requires_acpi_namespace);
+    match requires_namespace {
+        Some(false) => {
+            let disposition = match store_hosted_acpi_namespace(
+                child_index,
+                HostedAcpiNamespaceState::NotApplicable,
+            ) {
+                Ok(()) => HostedNamespaceDisposition::Advance,
+                Err(status) => HostedNamespaceDisposition::Barrier(status),
+            };
+            apply_hosted_acpi_namespace_disposition(child_index, disposition);
+            return true;
+        }
+        Some(true) => {}
+        None => {
+            set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            ));
+            return true;
+        }
+    }
+    let child_identity = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+        .as_ref()
+        .and_then(|query| {
+            Some((
+                nt_io_manager::DeviceId(query.reported_children.get(child_index)?.pdo_object_id),
+                query.relation_domain?,
+                *query.child_pdo_objects.get(child_index)?,
+            ))
+        });
+    let pdo_device_id = match child_identity {
+        Some((pdo_device_id, relation_domain, pdo_object))
+            if io_manager_mut().hosted_device_by_identity(relation_domain, pdo_object)
+                == Some(pdo_device_id)
+                && io_manager_mut()
+                    .device(pdo_device_id)
+                    .is_some_and(|device| !device.delete_pending) =>
+        {
+            pdo_device_id
+        }
+        None | Some(_) => {
+            set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            ));
+            return true;
+        }
+    };
+    let mut output = Vec::new();
+    if output.try_reserve_exact(output_len).is_err() {
+        return false;
+    }
+    output.resize(output_len, 0);
+    let input = nt_acpi::immediate_namespace_children_input();
+    let result = match io_manager_mut().buffered_device_control_device_payload(
+        ClientId(IO_MANAGER_COMPONENT_ID),
+        pdo_device_id,
+        nt_acpi::IOCTL_ACPI_ENUM_CHILDREN,
+        &input,
+        &mut output,
+    ) {
+        Ok(result) => result,
+        Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES) => return false,
+        Err(status) => {
+            set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
+                status,
+            ));
+            return true;
+        }
+    };
+    match result {
+        ExternalDispatchResult::Completed { status, .. } => {
+            let disposition = classify_hosted_acpi_namespace_result(
+                child_index,
+                output_len,
+                status,
+                &output,
+            );
+            apply_hosted_acpi_namespace_disposition(child_index, disposition);
+        }
+        ExternalDispatchResult::Pending { irp_id } => {
+            let identities = io_manager_mut().irp(irp_id).and_then(|irp| {
+                let current = irp.current_stack()?;
+                let valid_parameters = matches!(
+                    &current.parameters,
+                    IoParameters::DeviceControl(parameters)
+                        if parameters.ioctl_code == nt_acpi::IOCTL_ACPI_ENUM_CHILDREN
+                            && parameters.input_len as usize
+                                == nt_acpi::ACPI_ENUM_CHILDREN_INPUT_LEN
+                            && parameters.output_len as usize == output_len
+                );
+                valid_parameters.then_some((
+                    irp.origin_driver_id,
+                    current.driver_id,
+                    current.device_id,
+                ))
+            });
+            let Some((origin_driver_id, completion_driver_id, completion_device_id)) = identities
+            else {
+                set_hosted_relation_query_disposition(
+                    HostedDeviceRelationQueryDisposition::Barrier(
+                        nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                    ),
+                );
+                return true;
+            };
+            let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                .as_mut()
+                .expect("hosted relation query disappeared before namespace completion");
+            query.irp_id = irp_id;
+            query.origin_driver_id = origin_driver_id;
+            query.completion_driver_id = completion_driver_id;
+            query.completion_device_id = completion_device_id;
+            query.driver_status = None;
+            query.phase = HostedDeviceRelationQueryPhase::AwaitingNamespaceCompletion {
+                child_index,
+                output_len,
+            };
         }
     }
     true
@@ -36831,6 +37104,10 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
         ))?;
     if query.reported_children.len() != query.child_pdo_objects.len()
         || query.reported_children.len() != query.child_properties.len()
+        || query
+            .child_properties
+            .iter()
+            .any(|properties| properties.acpi_namespace == HostedAcpiNamespaceState::Unqueried)
         || query
             .reported_children
             .iter()
@@ -37444,6 +37721,156 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     }
                 }
             }
+            HostedDeviceRelationQueryPhase::DispatchNamespace {
+                child_index,
+                output_len,
+            } => {
+                if !dispatch_hosted_acpi_namespace(child_index, output_len) {
+                    return progress;
+                }
+                progress = progress.saturating_add(1);
+            }
+            HostedDeviceRelationQueryPhase::AwaitingNamespaceCompletion {
+                child_index,
+                output_len,
+            } => {
+                let (
+                    irp_id,
+                    origin_driver_id,
+                    completion_driver_id,
+                    completion_device_id,
+                    pdo_device_id,
+                ) = {
+                    let query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+                        .as_ref()
+                        .unwrap();
+                    let Some(child) = query.reported_children.get(child_index) else {
+                        set_hosted_relation_query_disposition(
+                            HostedDeviceRelationQueryDisposition::Barrier(
+                                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                            ),
+                        );
+                        return progress.saturating_add(1);
+                    };
+                    (
+                        query.irp_id,
+                        query.origin_driver_id,
+                        query.completion_driver_id,
+                        query.completion_device_id,
+                        nt_io_manager::DeviceId(child.pdo_object_id),
+                    )
+                };
+                let Some(completion) = io_manager_mut().completed_irp(irp_id) else {
+                    return progress;
+                };
+                let request_valid = io_manager_mut().irp(irp_id).is_some_and(|irp| {
+                    irp.current_stack().is_some_and(|stack| {
+                        stack.driver_id == completion_driver_id
+                            && stack.device_id == completion_device_id
+                            && matches!(
+                                &stack.parameters,
+                                IoParameters::DeviceControl(parameters)
+                                    if parameters.ioctl_code
+                                        == nt_acpi::IOCTL_ACPI_ENUM_CHILDREN
+                                        && parameters.input_len as usize
+                                            == nt_acpi::ACPI_ENUM_CHILDREN_INPUT_LEN
+                                        && parameters.output_len as usize == output_len
+                            )
+                    })
+                });
+                let identity_valid = completion.id == irp_id
+                    && completion.client_id == ClientId(IO_MANAGER_COMPONENT_ID)
+                    && completion.file_id.is_none()
+                    && completion.driver_id == origin_driver_id
+                    && completion.device_id == pdo_device_id
+                    && completion.major == major::IRP_MJ_DEVICE_CONTROL
+                    && completion.minor == 0
+                    && completion.completion_driver_id == completion_driver_id
+                    && completion.completion_device_id == completion_device_id
+                    && completion.user_data == 0
+                    && completion.requestor_tid == 0
+                    && completion.completion_origin == IrpCompletionOrigin::Driver
+                    && request_valid;
+                if !identity_valid {
+                    set_hosted_relation_query_disposition(
+                        HostedDeviceRelationQueryDisposition::Barrier(
+                            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                        ),
+                    );
+                    return progress.saturating_add(1);
+                }
+                let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                    .as_mut()
+                    .unwrap();
+                query.driver_status = Some(completion.status);
+                query.phase = HostedDeviceRelationQueryPhase::AwaitingNamespaceCopy {
+                    child_index,
+                    output_len,
+                    status: completion.status,
+                };
+                progress = progress.saturating_add(1);
+            }
+            HostedDeviceRelationQueryPhase::AwaitingNamespaceCopy {
+                child_index,
+                output_len,
+                status,
+            } => {
+                let irp_id = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+                    .as_ref()
+                    .unwrap()
+                    .irp_id;
+                let mut payload = Vec::new();
+                if payload.try_reserve_exact(output_len).is_err() {
+                    return progress;
+                }
+                payload.resize(output_len, 0);
+                let disposition = match io_manager_mut()
+                    .copy_completed_buffered_device_control_payload(irp_id, 0, &mut payload)
+                {
+                    Ok(copied) if copied == output_len => classify_hosted_acpi_namespace_result(
+                        child_index,
+                        output_len,
+                        status,
+                        &payload,
+                    ),
+                    Ok(_) => HostedNamespaceDisposition::Barrier(
+                        nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                    ),
+                    Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES)
+                    | Err(nt_status::NtStatus::DEVICE_NOT_READY) => return progress,
+                    Err(copy_status) => HostedNamespaceDisposition::Barrier(copy_status),
+                };
+                (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                    .as_mut()
+                    .unwrap()
+                    .phase = HostedDeviceRelationQueryPhase::AwaitingNamespaceAck {
+                    child_index,
+                    disposition,
+                };
+                progress = progress.saturating_add(1);
+            }
+            HostedDeviceRelationQueryPhase::AwaitingNamespaceAck {
+                child_index,
+                disposition,
+            } => {
+                let irp_id = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+                    .as_ref()
+                    .unwrap()
+                    .irp_id;
+                match io_manager_mut().acknowledge_completed_irp_strict(irp_id) {
+                    Ok(_) => {
+                        apply_hosted_acpi_namespace_disposition(child_index, disposition);
+                        progress = progress.saturating_add(1);
+                    }
+                    Err(status) => {
+                        (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                            .as_mut()
+                            .unwrap()
+                            .barrier_status = Some(status);
+                        return progress;
+                    }
+                }
+            }
             HostedDeviceRelationQueryPhase::IdsCopied => match publish_hosted_bus_relations() {
                 Ok(()) => return progress.saturating_add(1),
                 Err(HostedRelationPublishError::Retry) => return progress,
@@ -37454,7 +37881,7 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     return progress.saturating_add(1);
                 }
             },
-            HostedDeviceRelationQueryPhase::PropertiesCopied => {
+            HostedDeviceRelationQueryPhase::NamespacesCopied => {
                 match publish_hosted_bus_relations() {
                     Ok(()) => return progress.saturating_add(1),
                     Err(HostedRelationPublishError::Retry) => return progress,
@@ -39558,6 +39985,10 @@ static HOSTED_DEVICE_RELATION_INVALIDATION_QUEUED: AtomicU64 = AtomicU64::new(0)
 static HOSTED_DEVICE_RELATION_INVALIDATION_COALESCED: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DEVICE_RELATION_INVALIDATION_REQUEUED: AtomicU64 = AtomicU64::new(0);
 
+const HOSTED_ACPI_NAMESPACE_HEADER_LEN: usize = 8;
+const HOSTED_ACPI_NAMESPACE_MAX_BYTES: usize = 64 * 1024;
+const HOSTED_ACPI_NAMESPACE_MAX_CHILDREN: usize = 4096;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostedDeviceRelationQueryDisposition {
     Copied,
@@ -39628,7 +40059,24 @@ enum HostedDeviceRelationQueryPhase {
         child_index: usize,
         disposition: HostedQueryPropertyDisposition,
     },
-    PropertiesCopied,
+    DispatchNamespace {
+        child_index: usize,
+        output_len: usize,
+    },
+    AwaitingNamespaceCompletion {
+        child_index: usize,
+        output_len: usize,
+    },
+    AwaitingNamespaceCopy {
+        child_index: usize,
+        output_len: usize,
+        status: nt_status::NtStatus,
+    },
+    AwaitingNamespaceAck {
+        child_index: usize,
+        disposition: HostedNamespaceDisposition,
+    },
+    NamespacesCopied,
     Barrier,
 }
 
@@ -39640,6 +40088,13 @@ enum HostedQueryIdDisposition {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostedQueryPropertyDisposition {
+    Advance,
+    Barrier(nt_status::NtStatus),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostedNamespaceDisposition {
+    RetryExact(usize),
     Advance,
     Barrier(nt_status::NtStatus),
 }
@@ -39658,6 +40113,13 @@ enum HostedDeviceCapabilitiesState {
     Present(nt_pnp_manager::PdoCapabilities),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HostedAcpiNamespaceState {
+    Unqueried,
+    NotApplicable,
+    Present(nt_acpi::AcpiNamespaceChildren),
+}
+
 impl Default for HostedDeviceCapabilitiesState {
     fn default() -> Self {
         Self::Unqueried
@@ -39670,12 +40132,19 @@ impl Default for HostedBusInformationState {
     }
 }
 
+impl Default for HostedAcpiNamespaceState {
+    fn default() -> Self {
+        Self::Unqueried
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct HostedBusChildProperties {
     bus_information: HostedBusInformationState,
     capabilities: HostedDeviceCapabilitiesState,
     boot_resources_raw: nt_pnp_manager::PropertyBlobState,
     resource_requirements: nt_pnp_manager::PropertyBlobState,
+    acpi_namespace: HostedAcpiNamespaceState,
 }
 
 impl Default for HostedBusChildProperties {
@@ -39685,6 +40154,7 @@ impl Default for HostedBusChildProperties {
             capabilities: HostedDeviceCapabilitiesState::Unqueried,
             boot_resources_raw: nt_pnp_manager::PropertyBlobState::Unqueried,
             resource_requirements: nt_pnp_manager::PropertyBlobState::Unqueried,
+            acpi_namespace: HostedAcpiNamespaceState::Unqueried,
         }
     }
 }

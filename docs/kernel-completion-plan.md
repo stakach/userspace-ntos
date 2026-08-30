@@ -19817,3 +19817,34 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     than 61 distinct live routes requires notification sharding rather than another fixed bitmap.
     Remove the remaining HPET boot-proof reservation from ordinary production policy once a generic
     timer resource owner provides the same hardware acceptance evidence.
+
+    B3 serialized ACPI namespace-owner checkpoint (2026-08-31, implementation green): the retained
+    bus-relations transaction now queries namespace identity one exact canonical ACPI PDO at a time
+    before any registry, Configuration Manager, devnode, or bus-generation publication. PDOs outside
+    the provider-published `ACPI\\` enumerator namespace are marked structurally not applicable and
+    do not receive an unrelated control request. Each ACPI PDO receives a File-less METHOD_BUFFERED
+    `IOCTL_ACPI_ENUM_CHILDREN` immediate-only probe with the exact 16-byte input and 8-byte output
+    header, followed only after a valid `STATUS_BUFFER_OVERFLOW` header by one exact bounded retry.
+    Missing provider support, malformed framing, allocation-limit violations, duplicate self paths,
+    and any success that does not decode completely are hard publication barriers; there is no
+    executive namespace reconstruction or HID/order fallback.
+
+    Pending completions retain the canonical IRP and revalidate the component client, absence of a
+    File object, origin and current driver/device identities, hosted-domain PDO identity, dispatch
+    origin, major/minor, IOCTL code, and exact input/output lengths before copying the complete
+    retained system buffer. The result is acknowledged strictly only after classification, and the
+    relation publisher independently rejects any child whose namespace state remains unqueried.
+    Canonical self-first namespace results remain owned by the relation transaction for the next
+    `_PRT`/link-resolution phase. Focused `nt-acpi` validation passes 24/24; formatting and
+    `git diff --check` are clean; and the executive freestanding check passes at the unchanged
+    209-warning baseline.
+
+    Review adjustment: the kernel-side standard transaction is complete, but runtime acceptance is
+    deliberately blocked on provider conformance. Make the ReactOS `acpi.sys` build reproducible in
+    this tree, implement complete immediate/multilevel `IOCTL_ACPI_ENUM_CHILDREN` semantics there,
+    and enumerate every ACPICA handle with a stable unique instance identity even when `_UID` is
+    absent. Then add the 20-byte `_PRT` probe/exact retry on each namespace-identified PCI root or
+    bridge, resolve every link NamePath by retained ACPI scope to its exact PDO, query only those
+    link PDOs for `_CRS`, and atomically prepare/commit the complete route set with the accepted PCI
+    inventory/devnode generation. The active older desktop QEMU still owns the serialized boot lane,
+    so no runtime build or launch was started for this checkpoint.
