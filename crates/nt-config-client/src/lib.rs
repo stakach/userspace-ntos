@@ -14,8 +14,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use nt_config_abi::{
-    device_action_kind, device_action_transfer, device_property_transfer, driver_service_class,
-    driver_service_transfer, hive_checkpoint_transfer, hive_import_transfer,
+    device_action_kind, device_action_service, device_action_transfer, device_property_transfer,
+    driver_service_class, driver_service_transfer, hive_checkpoint_transfer, hive_import_transfer,
     hive_key_lease_operation, hive_key_transfer, hive_mount, hive_mutation_flags,
     hive_mutation_kind, hive_mutation_transfer, launch_plan_kind, launch_plan_transfer,
     leased_hive_record_kind, network_plan_kind, opcode, pnp_query_kind, pnp_query_transfer,
@@ -94,6 +94,12 @@ pub enum SystemHiveMutation<'a> {
         path: &'a str,
         descriptor: &'a [u8],
     },
+    /// Publish one explicit bus/PnP topology transition in the same CM generation as the
+    /// accompanying Enum mutations. This marker does not directly modify a registry cell.
+    PublishDeviceAction {
+        kind: DeviceActionKind,
+        instance_id: &'a str,
+    },
 }
 
 /// One fully validated SYSTEM mutation whose CM-owned replay records must be made durable before
@@ -106,6 +112,12 @@ pub struct PreparedSystemHiveMutation {
     pub lease_token: u64,
     pub semantic_journal_len: u32,
     pub durable_journal: Vec<u8>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SystemHivePublishOutcome {
+    pub generation: u64,
+    pub has_pending_device_action: bool,
 }
 
 /// One immutable CM-owned SYSTEM checkpoint image. The image is not acknowledged by CM until the
@@ -208,22 +220,9 @@ pub enum DeviceActionKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeviceActionDriverService {
-    pub service_name: String,
-    pub image_path: String,
-    pub driver_object_path: String,
-    pub class_guid: Option<String>,
-    pub class: DriverServiceClass,
-    pub start_type: u32,
-    pub error_control: Option<u32>,
-    pub load_order_group: Option<String>,
-    pub tag: Option<u32>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceActionPublication {
     pub instance_id: String,
-    pub service: Option<DeviceActionDriverService>,
+    pub service_name: Option<String>,
     pub pdo_name: Option<String>,
     pub driver_key: Option<String>,
     pub linkage_export: Option<String>,
@@ -235,6 +234,7 @@ pub struct DeviceActionPublication {
 pub struct DeviceActionEvent {
     pub mount_generation: u64,
     pub sequence: u64,
+    pub claim_token: u64,
     pub kind: DeviceActionKind,
     pub publication: DeviceActionPublication,
 }
@@ -418,6 +418,10 @@ impl<'a> SnapshotReader<'a> {
 
     fn finished(&self) -> bool {
         self.offset == self.bytes.len()
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
     }
 }
 
@@ -764,7 +768,7 @@ fn decode_device_action_identity(bytes: &[u8]) -> Option<(u64, u64)> {
     let kind = reader.u16()?;
     let mount_generation = reader.u64()?;
     let sequence = reader.u64()?;
-    let service_class = reader.u16()?;
+    let service_present = reader.u16()?;
     let reserved0 = reader.u16()?;
     let reserved1 = reader.u32()?;
     if !matches!(
@@ -773,8 +777,8 @@ fn decode_device_action_identity(bytes: &[u8]) -> Option<(u64, u64)> {
     ) || mount_generation == 0
         || sequence == 0
         || !matches!(
-            service_class,
-            0 | driver_service_class::DEVICE | driver_service_class::FILE_SYSTEM
+            service_present,
+            device_action_service::ABSENT | device_action_service::PRESENT
         )
         || reserved0 != 0
         || reserved1 != 0
@@ -801,12 +805,13 @@ fn decode_device_action_event(bytes: &[u8]) -> Option<DeviceActionEvent> {
     if reader.u64()? != mount_generation || reader.u64()? != sequence {
         return None;
     }
-    let service_class = match reader.u16()? {
-        0 => None,
-        driver_service_class::DEVICE => Some(DriverServiceClass::Device),
-        driver_service_class::FILE_SYSTEM => Some(DriverServiceClass::FileSystem),
-        _ => return None,
-    };
+    let service_present = reader.u16()?;
+    if !matches!(
+        service_present,
+        device_action_service::ABSENT | device_action_service::PRESENT
+    ) {
+        return None;
+    }
     if reader.u16()? != 0 || reader.u32()? != 0 {
         return None;
     }
@@ -814,18 +819,12 @@ fn decode_device_action_event(bytes: &[u8]) -> Option<DeviceActionEvent> {
     if instance_id.is_empty() {
         return None;
     }
-    let service = if let Some(class) = service_class {
-        Some(DeviceActionDriverService {
-            service_name: reader.string()?,
-            image_path: reader.string()?,
-            driver_object_path: reader.string()?,
-            class_guid: reader.optional_string()?,
-            class,
-            start_type: reader.u32()?,
-            error_control: reader.optional_u32()?,
-            load_order_group: reader.optional_string()?,
-            tag: reader.optional_u32()?,
-        })
+    let service_name = if service_present == device_action_service::PRESENT {
+        let service_name = reader.string()?;
+        if service_name.is_empty() {
+            return None;
+        }
+        Some(service_name)
     } else {
         None
     };
@@ -833,12 +832,18 @@ fn decode_device_action_event(bytes: &[u8]) -> Option<DeviceActionEvent> {
     let driver_key = reader.optional_string()?;
     let linkage_export = reader.optional_string()?;
     let hardware_count = usize::try_from(reader.u32()?).ok()?;
+    if hardware_count > reader.remaining() / core::mem::size_of::<u32>() {
+        return None;
+    }
     let mut hardware_ids = Vec::new();
     hardware_ids.try_reserve_exact(hardware_count).ok()?;
     for _ in 0..hardware_count {
         hardware_ids.push(reader.string()?);
     }
     let compatible_count = usize::try_from(reader.u32()?).ok()?;
+    if compatible_count > reader.remaining() / core::mem::size_of::<u32>() {
+        return None;
+    }
     let mut compatible_ids = Vec::new();
     compatible_ids.try_reserve_exact(compatible_count).ok()?;
     for _ in 0..compatible_count {
@@ -847,10 +852,11 @@ fn decode_device_action_event(bytes: &[u8]) -> Option<DeviceActionEvent> {
     reader.finished().then_some(DeviceActionEvent {
         mount_generation,
         sequence,
+        claim_token: 0,
         kind,
         publication: DeviceActionPublication {
             instance_id,
-            service,
+            service_name,
             pdo_name,
             driver_key,
             linkage_export,
@@ -1046,6 +1052,22 @@ fn encode_hive_mutation_journal(mutations: &[SystemHiveMutation<'_>]) -> Result<
                     path,
                     "",
                     descriptor,
+                )?;
+            }
+            SystemHiveMutation::PublishDeviceAction { kind, instance_id } => {
+                let kind = match kind {
+                    DeviceActionKind::Arrival => device_action_kind::ARRIVAL,
+                    DeviceActionKind::Change => device_action_kind::CHANGE,
+                    DeviceActionKind::Removal => device_action_kind::REMOVAL,
+                };
+                append_hive_mutation_record(
+                    &mut journal,
+                    hive_mutation_kind::PUBLISH_DEVICE_ACTION,
+                    0,
+                    u32::from(kind),
+                    instance_id,
+                    "",
+                    &[],
                 )?;
             }
         }
@@ -1635,7 +1657,7 @@ impl<B: Backend> ConfigClient<B> {
     pub fn publish_system_hive_mutation(
         &mut self,
         prepared: &PreparedSystemHiveMutation,
-    ) -> Result<u64, i32> {
+    ) -> Result<SystemHivePublishOutcome, i32> {
         let response = self.hive_mutation_call(
             hive_mutation_transfer::COMMIT,
             prepared.lease_token,
@@ -1645,7 +1667,7 @@ impl<B: Backend> ConfigClient<B> {
             &[],
         )?;
         if response.status != STATUS_SUCCESS
-            || response.information != 0
+            || response.information > 1
             || response.detail0 != prepared.next_generation
             || response.detail1 != prepared.lease_token
         {
@@ -1655,7 +1677,10 @@ impl<B: Backend> ConfigClient<B> {
                 response.status
             });
         }
-        Ok(response.detail0)
+        Ok(SystemHivePublishOutcome {
+            generation: response.detail0,
+            has_pending_device_action: response.information != 0,
+        })
     }
 
     /// Discard an uploaded or prepared mutation that has not been published.
@@ -2005,8 +2030,7 @@ impl<B: Backend> ConfigClient<B> {
             let total = usize::try_from(response.detail0).map_err(|_| STATUS_INVALID_PARAMETER)?;
             let written = response.information as usize;
             let reply_token_valid = if token == 0 {
-                (written == total && response.detail1 == 0)
-                    || (written < total && response.detail1 != 0)
+                response.detail1 != 0
             } else {
                 response.detail1 == token
             };
@@ -2469,8 +2493,7 @@ impl<B: Backend> ConfigClient<B> {
             let total = usize::try_from(response.detail0).map_err(|_| STATUS_INVALID_PARAMETER)?;
             let written = response.information as usize;
             let reply_token_valid = if token == 0 {
-                (written == total && response.detail1 == 0)
-                    || (written < total && response.detail1 != 0)
+                response.detail1 != 0
             } else {
                 response.detail1 == token
             };
@@ -2500,31 +2523,31 @@ impl<B: Backend> ConfigClient<B> {
                 }
                 identity = Some(first_identity);
                 expected_total = Some(total);
+                token = response.detail1;
             }
             value.extend_from_slice(&reply_bytes[..written]);
             if value.len() == total {
-                let event = decode_device_action_event(&value).ok_or(STATUS_INVALID_PARAMETER)?;
+                let mut event =
+                    decode_device_action_event(&value).ok_or(STATUS_INVALID_PARAMETER)?;
                 if Some((event.mount_generation, event.sequence)) != identity {
                     return Err(STATUS_INVALID_PARAMETER);
                 }
+                event.claim_token = token;
                 return Ok(Some(event));
-            }
-            if token == 0 {
-                token = response.detail1;
             }
         }
     }
 
     /// Retire only the exact journal head after its PnP action has reached a terminal state.
-    pub fn acknowledge_device_action(&mut self, event: &DeviceActionEvent) -> Result<usize, i32> {
-        if event.mount_generation == 0 || event.sequence == 0 {
+    pub fn acknowledge_device_action(&mut self, event: &DeviceActionEvent) -> Result<bool, i32> {
+        if event.mount_generation == 0 || event.sequence == 0 || event.claim_token == 0 {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let response = self.device_action_call(
             device_action_transfer::ACK,
             event.mount_generation,
             event.sequence,
-            0,
+            event.claim_token,
             0,
             0,
             &mut [],
@@ -2535,7 +2558,10 @@ impl<B: Backend> ConfigClient<B> {
         if response.detail0 < event.mount_generation || response.detail1 != event.sequence {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        Ok(response.information as usize)
+        if response.information > 1 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok(response.information != 0)
     }
 
     fn query_launch_plan_bytes(
@@ -3785,8 +3811,9 @@ mod tests {
                 ],
             )
             .unwrap();
-        let generation = client.publish_system_hive_mutation(&prepared).unwrap();
-        assert_eq!(generation, 2);
+        let outcome = client.publish_system_hive_mutation(&prepared).unwrap();
+        assert_eq!(outcome.generation, 2);
+        assert!(!outcome.has_pending_device_action);
         let resolved_after_selection_change = client
             .resolve_system_hive_path(r"\Registry\Machine\System\CurrentControlSet\Services\Absent")
             .unwrap();
@@ -3940,8 +3967,9 @@ mod tests {
             .open_key(r"ControlSet001\Services\Obsolete")
             .is_none());
 
-        let generation = client.publish_system_hive_mutation(&prepared).unwrap();
-        assert_eq!(generation, 2);
+        let outcome = client.publish_system_hive_mutation(&prepared).unwrap();
+        assert_eq!(outcome.generation, 2);
+        assert!(!outcome.has_pending_device_action);
 
         let snapshot = client.query_system_hive_key(service_path).unwrap();
         assert_eq!(snapshot.mount_generation, 2);
@@ -4734,10 +4762,20 @@ mod tests {
                         value_type: RegistryValueType::MultiSz as u32,
                         data: &hardware,
                     },
+                    SystemHiveMutation::PublishDeviceAction {
+                        kind: DeviceActionKind::Arrival,
+                        instance_id: r"ROOT\LATE\0000",
+                    },
                 ],
             )
             .unwrap();
-        assert_eq!(client.publish_system_hive_mutation(&prepared), Ok(2));
+        assert_eq!(
+            client.publish_system_hive_mutation(&prepared),
+            Ok(SystemHivePublishOutcome {
+                generation: 2,
+                has_pending_device_action: true,
+            })
+        );
 
         let event = client.next_device_action().unwrap().unwrap();
         assert_eq!(event.mount_generation, 2);
@@ -4745,17 +4783,17 @@ mod tests {
         assert_eq!(event.kind, DeviceActionKind::Arrival);
         assert_eq!(event.publication.instance_id, r"ROOT\LATE\0000");
         assert_eq!(event.publication.hardware_ids, hardware_ids);
-        let service = event.publication.service.as_ref().unwrap();
-        assert_eq!(service.service_name, "LateDriver");
-        assert_eq!(service.start_type, SERVICE_DEMAND_START);
-        assert_eq!(service.class, DriverServiceClass::Device);
+        assert_eq!(
+            event.publication.service_name.as_deref(),
+            Some("LateDriver")
+        );
 
-        assert_eq!(client.next_device_action(), Ok(Some(event.clone())));
+        assert_eq!(client.next_device_action(), Err(STATUS_DEVICE_BUSY));
         let mut stale = event.clone();
         stale.sequence += 1;
         assert!(client.acknowledge_device_action(&stale).is_err());
-        assert_eq!(client.next_device_action(), Ok(Some(event.clone())));
-        assert_eq!(client.acknowledge_device_action(&event), Ok(0));
+        assert_eq!(client.next_device_action(), Err(STATUS_DEVICE_BUSY));
+        assert_eq!(client.acknowledge_device_action(&event), Ok(false));
         assert_eq!(client.next_device_action(), Ok(None));
 
         let updated_image = encode_sz(r"system32\drivers\late-updated.sys");
@@ -4770,35 +4808,76 @@ mod tests {
                 }],
             )
             .unwrap();
-        assert_eq!(client.publish_system_hive_mutation(&prepared), Ok(3));
+        assert_eq!(
+            client.publish_system_hive_mutation(&prepared),
+            Ok(SystemHivePublishOutcome {
+                generation: 3,
+                has_pending_device_action: false,
+            })
+        );
+        assert_eq!(client.next_device_action(), Ok(None));
+
+        let updated_pdo = encode_sz(r"\Device\LatePdo1");
+        let prepared = client
+            .prepare_system_hive_mutation(
+                3,
+                &[
+                    SystemHiveMutation::SetValue {
+                        path: instance_path,
+                        name: "PdoName",
+                        value_type: RegistryValueType::Sz as u32,
+                        data: &updated_pdo,
+                    },
+                    SystemHiveMutation::PublishDeviceAction {
+                        kind: DeviceActionKind::Change,
+                        instance_id: r"ROOT\LATE\0000",
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            client.publish_system_hive_mutation(&prepared),
+            Ok(SystemHivePublishOutcome {
+                generation: 4,
+                has_pending_device_action: true,
+            })
+        );
         let changed = client.next_device_action().unwrap().unwrap();
         assert_eq!(changed.sequence, 2);
         assert_eq!(changed.kind, DeviceActionKind::Change);
         assert_eq!(
-            changed
-                .publication
-                .service
-                .as_ref()
-                .map(|service| service.image_path.as_str()),
-            Some(r"system32\drivers\late-updated.sys")
+            changed.publication.pdo_name.as_deref(),
+            Some(r"\Device\LatePdo1")
         );
-        assert_eq!(client.acknowledge_device_action(&changed), Ok(0));
+        assert_eq!(client.acknowledge_device_action(&changed), Ok(false));
 
         let prepared = client
             .prepare_system_hive_mutation(
-                3,
-                &[SystemHiveMutation::DeleteKey {
-                    path: instance_path,
-                }],
+                4,
+                &[
+                    SystemHiveMutation::DeleteKey {
+                        path: instance_path,
+                    },
+                    SystemHiveMutation::PublishDeviceAction {
+                        kind: DeviceActionKind::Removal,
+                        instance_id: r"ROOT\LATE\0000",
+                    },
+                ],
             )
             .unwrap();
-        assert_eq!(client.publish_system_hive_mutation(&prepared), Ok(4));
+        assert_eq!(
+            client.publish_system_hive_mutation(&prepared),
+            Ok(SystemHivePublishOutcome {
+                generation: 5,
+                has_pending_device_action: true,
+            })
+        );
         let removal = client.next_device_action().unwrap().unwrap();
         assert_eq!(removal.sequence, 3);
         assert_eq!(removal.kind, DeviceActionKind::Removal);
         assert_eq!(removal.publication.instance_id, r"ROOT\LATE\0000");
         assert_eq!(removal.publication.hardware_ids, hardware_ids);
-        assert_eq!(client.acknowledge_device_action(&removal), Ok(0));
+        assert_eq!(client.acknowledge_device_action(&removal), Ok(false));
         assert_eq!(client.next_device_action(), Ok(None));
     }
 }

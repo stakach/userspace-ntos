@@ -180,7 +180,7 @@ pub struct DriverServiceBinding {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DevnodePublication {
     pub instance_id: String,
-    pub service: Option<DriverServiceLaunchSpec>,
+    pub service_name: Option<String>,
     pub pdo_name: Option<String>,
     pub driver_key: Option<String>,
     pub linkage_export: Option<String>,
@@ -193,6 +193,12 @@ pub enum DeviceActionKind {
     Arrival,
     Change,
     Removal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceActionIntent {
+    pub kind: DeviceActionKind,
+    pub instance_id: String,
 }
 
 /// One immutable topology change. `publication` is the new identity for arrival/change and the
@@ -210,16 +216,17 @@ pub enum DeviceActionJournalError {
     InvalidGeneration,
     AlreadySeeded,
     DuplicateInstance,
+    InvalidTransition,
     StaleAcknowledgement,
     InsufficientResources,
 }
 
 /// Generation-exact change journal between the CM registry authority and the PnP action owner.
 ///
-/// The initial mounted hive seeds `known` without producing fake arrivals. Every later publication
-/// diffs a complete semantic snapshot, appends ordered immutable events, and advances the baseline
-/// only after all growable table storage has been reserved. Consumers may acknowledge only the
-/// exact head sequence, preventing a retry from skipping or duplicating a device action.
+/// The initial mounted hive seeds `known` without producing fake arrivals. Later actions are
+/// published only through an explicit bus/PnP intent; ordinary registry writes never manufacture
+/// device lifecycle. Consumers may acknowledge only the exact head sequence, preventing a retry
+/// from skipping or duplicating a device action.
 pub struct DeviceActionJournal {
     known: Vec<DevnodePublication>,
     pending: Vec<DeviceActionEvent>,
@@ -265,37 +272,29 @@ impl DeviceActionJournal {
         Ok(())
     }
 
-    pub fn publish(
+    pub fn publish_actions(
         &mut self,
         mount_generation: u64,
         current: &[DevnodePublication],
+        actions: &[DeviceActionIntent],
     ) -> Result<usize, DeviceActionJournalError> {
         if self.last_mount_generation == 0 || mount_generation <= self.last_mount_generation {
             return Err(DeviceActionJournalError::InvalidGeneration);
         }
         validate_publication_set(current)?;
+        for (index, action) in actions.iter().enumerate() {
+            if action.instance_id.is_empty()
+                || actions[..index].iter().any(|previous| {
+                    previous
+                        .instance_id
+                        .eq_ignore_ascii_case(&action.instance_id)
+                })
+            {
+                return Err(DeviceActionJournalError::DuplicateInstance);
+            }
+        }
 
-        let changed_or_added = current
-            .iter()
-            .filter(|publication| {
-                self.known
-                    .iter()
-                    .find(|known| same_instance(known, publication))
-                    .is_none_or(|known| known != *publication)
-            })
-            .count();
-        let removed = self
-            .known
-            .iter()
-            .filter(|known| {
-                !current
-                    .iter()
-                    .any(|publication| same_instance(known, publication))
-            })
-            .count();
-        let event_count = changed_or_added
-            .checked_add(removed)
-            .ok_or(DeviceActionJournalError::InsufficientResources)?;
+        let event_count = actions.len();
         let event_count_u64 = u64::try_from(event_count)
             .map_err(|_| DeviceActionJournalError::InsufficientResources)?;
         let next_sequence = self
@@ -305,48 +304,45 @@ impl DeviceActionJournal {
 
         let mut next_known = Vec::new();
         next_known
-            .try_reserve_exact(current.len())
+            .try_reserve_exact(self.known.len().saturating_add(actions.len()))
             .map_err(|_| DeviceActionJournalError::InsufficientResources)?;
-        next_known.extend_from_slice(current);
+        next_known.extend_from_slice(&self.known);
 
         let mut events = Vec::new();
         events
             .try_reserve_exact(event_count)
             .map_err(|_| DeviceActionJournalError::InsufficientResources)?;
         let mut sequence = self.next_sequence;
-        for publication in current {
-            let previous = self
-                .known
+        for action in actions {
+            let kind = action.kind;
+            let instance = action.instance_id.as_str();
+            let previous_index = next_known
                 .iter()
-                .find(|known| same_instance(known, publication));
-            let kind = match previous {
-                None => Some(DeviceActionKind::Arrival),
-                Some(previous) if previous != publication => Some(DeviceActionKind::Change),
-                Some(_) => None,
+                .position(|known| known.instance_id.eq_ignore_ascii_case(instance));
+            let current_publication = current
+                .iter()
+                .find(|publication| publication.instance_id.eq_ignore_ascii_case(instance));
+            let publication = match (kind, previous_index, current_publication) {
+                (DeviceActionKind::Arrival, None, Some(publication)) => {
+                    next_known.push(publication.clone());
+                    publication.clone()
+                }
+                (DeviceActionKind::Change, Some(index), Some(publication))
+                    if next_known[index] != *publication =>
+                {
+                    next_known[index] = publication.clone();
+                    publication.clone()
+                }
+                (DeviceActionKind::Removal, Some(index), None) => next_known.remove(index),
+                _ => return Err(DeviceActionJournalError::InvalidTransition),
             };
-            if let Some(kind) = kind {
-                events.push(DeviceActionEvent {
-                    sequence,
-                    mount_generation,
-                    kind,
-                    publication: publication.clone(),
-                });
-                sequence += 1;
-            }
-        }
-        for publication in &self.known {
-            if !current
-                .iter()
-                .any(|current| same_instance(publication, current))
-            {
-                events.push(DeviceActionEvent {
-                    sequence,
-                    mount_generation,
-                    kind: DeviceActionKind::Removal,
-                    publication: publication.clone(),
-                });
-                sequence += 1;
-            }
+            events.push(DeviceActionEvent {
+                sequence,
+                mount_generation,
+                kind,
+                publication,
+            });
+            sequence += 1;
         }
         debug_assert_eq!(events.len(), event_count);
         debug_assert_eq!(sequence, next_sequence);
@@ -1688,24 +1684,14 @@ impl ConfigManager {
         self.refresh_registry_devnodes();
         self.devnodes
             .iter()
-            .map(|devnode| {
-                let service = devnode.service.as_deref().and_then(|service_name| {
-                    let ServiceStartSpec::Driver(service) =
-                        self.service_start_spec(service_name)?
-                    else {
-                        return None;
-                    };
-                    Some(service)
-                });
-                DevnodePublication {
-                    instance_id: devnode.instance_id.clone(),
-                    service,
-                    pdo_name: devnode.pdo_name.clone(),
-                    driver_key: devnode.driver_key.clone(),
-                    linkage_export: self.devnode_linkage_export(devnode),
-                    hardware_ids: devnode.hardware_ids.clone(),
-                    compatible_ids: devnode.compatible_ids.clone(),
-                }
+            .map(|devnode| DevnodePublication {
+                instance_id: devnode.instance_id.clone(),
+                service_name: devnode.service.clone(),
+                pdo_name: devnode.pdo_name.clone(),
+                driver_key: devnode.driver_key.clone(),
+                linkage_export: self.devnode_linkage_export(devnode),
+                hardware_ids: devnode.hardware_ids.clone(),
+                compatible_ids: devnode.compatible_ids.clone(),
             })
             .collect()
     }
@@ -4184,7 +4170,23 @@ mod tests {
             &[],
         );
 
-        assert_eq!(journal.publish(2, &cm.devnode_publications()), Ok(2));
+        assert_eq!(
+            journal.publish_actions(
+                2,
+                &cm.devnode_publications(),
+                &[
+                    DeviceActionIntent {
+                        kind: DeviceActionKind::Change,
+                        instance_id: String::from(r"ROOT\LATE\0000"),
+                    },
+                    DeviceActionIntent {
+                        kind: DeviceActionKind::Arrival,
+                        instance_id: String::from(r"ROOT\LATE\0001"),
+                    },
+                ],
+            ),
+            Ok(2)
+        );
         let changed = journal.peek().unwrap();
         assert_eq!(changed.sequence, 1);
         assert_eq!(changed.mount_generation, 2);
@@ -4205,18 +4207,23 @@ mod tests {
         assert_eq!(arrival.kind, DeviceActionKind::Arrival);
         assert_eq!(arrival.publication.instance_id, r"ROOT\LATE\0001");
         assert_eq!(
-            arrival
-                .publication
-                .service
-                .as_ref()
-                .map(|service| service.start_type),
-            Some(SERVICE_DEMAND_START)
+            arrival.publication.service_name.as_deref(),
+            Some("LateDriver")
         );
         journal.acknowledge(2).unwrap();
-        assert_eq!(journal.publish(3, &cm.devnode_publications()), Ok(0));
 
         assert!(cm.registry_mut().delete_key(first, true));
-        assert_eq!(journal.publish(4, &cm.devnode_publications()), Ok(1));
+        assert_eq!(
+            journal.publish_actions(
+                4,
+                &cm.devnode_publications(),
+                &[DeviceActionIntent {
+                    kind: DeviceActionKind::Removal,
+                    instance_id: String::from(r"ROOT\LATE\0000"),
+                }],
+            ),
+            Ok(1)
+        );
         let removal = journal.peek().unwrap();
         assert_eq!(removal.sequence, 3);
         assert_eq!(removal.mount_generation, 4);
@@ -4229,7 +4236,7 @@ mod tests {
     }
 
     #[test]
-    fn device_action_journal_tracks_binding_changes_without_skips() {
+    fn device_action_journal_requires_explicit_topology_transitions() {
         let mut cm = ConfigManager::new();
         cm.register_service(
             "LateDriver",
@@ -4252,23 +4259,52 @@ mod tests {
         let service = cm.registry().open_key(&service_path("LateDriver")).unwrap();
         cm.registry_mut()
             .set_string(service, "ImagePath", r"system32\drivers\late-updated.sys");
-        assert_eq!(journal.publish(11, &cm.devnode_publications()), Ok(1));
         assert_eq!(
-            journal
-                .peek()
-                .and_then(|event| event.publication.service.as_ref())
-                .map(|service| service.image_path.as_str()),
-            Some(r"system32\drivers\late-updated.sys")
-        );
-        assert_eq!(
-            journal.publish(11, &cm.devnode_publications()),
-            Err(DeviceActionJournalError::InvalidGeneration)
+            journal.publish_actions(
+                11,
+                &cm.devnode_publications(),
+                &[DeviceActionIntent {
+                    kind: DeviceActionKind::Change,
+                    instance_id: String::from(r"ROOT\LATE\0000"),
+                }],
+            ),
+            Err(DeviceActionJournalError::InvalidTransition)
         );
 
-        let mut duplicate = cm.devnode_publications();
-        duplicate.push(duplicate[0].clone());
+        let devnode = cm
+            .registry()
+            .open_key(&devnode_path(r"ROOT\LATE\0000"))
+            .unwrap();
+        cm.registry_mut()
+            .set_string(devnode, "PdoName", r"\Device\LatePdoChanged");
         assert_eq!(
-            journal.publish(12, &duplicate),
+            journal.publish_actions(
+                11,
+                &cm.devnode_publications(),
+                &[DeviceActionIntent {
+                    kind: DeviceActionKind::Change,
+                    instance_id: String::from(r"ROOT\LATE\0000"),
+                }],
+            ),
+            Ok(1)
+        );
+        assert_eq!(journal.peek().unwrap().sequence, 1);
+
+        assert_eq!(
+            journal.publish_actions(
+                12,
+                &cm.devnode_publications(),
+                &[
+                    DeviceActionIntent {
+                        kind: DeviceActionKind::Change,
+                        instance_id: String::from(r"ROOT\LATE\0000"),
+                    },
+                    DeviceActionIntent {
+                        kind: DeviceActionKind::Removal,
+                        instance_id: String::from(r"root\late\0000"),
+                    },
+                ],
+            ),
             Err(DeviceActionJournalError::DuplicateInstance)
         );
         assert_eq!(journal.last_mount_generation(), 11);

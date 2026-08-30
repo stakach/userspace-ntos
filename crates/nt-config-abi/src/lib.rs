@@ -194,6 +194,9 @@ pub mod hive_mutation_kind {
     pub const DELETE_KEY: u16 = 4;
     pub const SET_KEY_CLASS: u16 = 5;
     pub const SET_KEY_SECURITY: u16 = 6;
+    /// Explicit bus/PnP publication intent. `path` carries the device instance and `value_type`
+    /// carries one [`device_action_kind`] value; it does not directly mutate registry cells.
+    pub const PUBLISH_DEVICE_ACTION: u16 = 7;
 }
 
 pub mod hive_mutation_flags {
@@ -253,6 +256,11 @@ pub mod device_action_kind {
     pub const ARRIVAL: u16 = 1;
     pub const CHANGE: u16 = 2;
     pub const REMOVAL: u16 = 3;
+}
+
+pub mod device_action_service {
+    pub const ABSENT: u16 = 0;
+    pub const PRESENT: u16 = 1;
 }
 
 pub mod network_plan_kind {

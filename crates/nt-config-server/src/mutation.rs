@@ -2,7 +2,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use nt_config_abi::{
-    hive_mutation_flags, hive_mutation_kind, CmHiveMutationRecord,
+    device_action_kind, hive_mutation_flags, hive_mutation_kind, CmHiveMutationRecord,
     CM_HIVE_MUTATION_RECORD_HEADER_BYTES, CM_MAX_HIVE_PATH_UNITS, CM_MAX_HIVE_VALUE_NAME_UNITS,
 };
 
@@ -31,6 +31,10 @@ pub(crate) enum HiveMutation {
     SetKeySecurity {
         path: String,
         descriptor: Vec<u8>,
+    },
+    PublishDeviceAction {
+        kind: u16,
+        instance_id: String,
     },
 }
 
@@ -243,6 +247,24 @@ pub(crate) fn decode_mutation_journal(bytes: &[u8]) -> Option<Vec<HiveMutation>>
                 HiveMutation::SetKeySecurity {
                     path,
                     descriptor: data.to_vec(),
+                }
+            }
+            hive_mutation_kind::PUBLISH_DEVICE_ACTION
+                if header.flags == 0
+                    && [
+                        device_action_kind::ARRIVAL,
+                        device_action_kind::CHANGE,
+                        device_action_kind::REMOVAL,
+                    ]
+                    .iter()
+                    .any(|kind| header.value_type == u32::from(*kind))
+                    && !path.is_empty()
+                    && name.is_empty()
+                    && data.is_empty() =>
+            {
+                HiveMutation::PublishDeviceAction {
+                    kind: header.value_type as u16,
+                    instance_id: path,
                 }
             }
             _ => return None,

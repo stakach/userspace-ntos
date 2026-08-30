@@ -16,14 +16,15 @@ mod snapshot;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use key_lease::{SystemKeyLeaseBank, SystemKeyLeaseError};
 use mutation::{decode_mutation_journal, HiveMutation, MutationLeaseBank, MutationLeaseError};
 use snapshot::{SnapshotBank, SnapshotChunk, SnapshotPool};
 
 use nt_config_abi::{
-    device_action_kind, device_action_transfer, device_property_transfer, driver_service_class,
-    driver_service_transfer, hive_checkpoint_transfer, hive_import_transfer,
+    device_action_kind, device_action_service, device_action_transfer, device_property_transfer,
+    driver_service_class, driver_service_transfer, hive_checkpoint_transfer, hive_import_transfer,
     hive_key_lease_operation, hive_key_transfer, hive_mount, hive_mutation_transfer,
     launch_plan_kind, launch_plan_transfer, leased_hive_record_kind, network_plan_kind, opcode,
     pnp_query_kind, pnp_query_transfer, read_utf16, win32_service_plan_kind,
@@ -52,7 +53,7 @@ use nt_config_abi::{
     CM_WIN32_SERVICE_PLAN_SNAPSHOT_MAGIC, CM_WIN32_SERVICE_PLAN_SNAPSHOT_VERSION,
 };
 use nt_config_manager::{
-    device_property, ConfigManager, DeviceActionEvent, DeviceActionJournal,
+    device_property, ConfigManager, DeviceActionEvent, DeviceActionIntent, DeviceActionJournal,
     DeviceActionJournalError, DeviceActionKind, DevicePropertySource, DriverServiceBinding,
     DriverServiceClass, RegistryTransaction, RegistryValueType, Win32ServiceProcessKind,
     Win32ServiceProcessLaunch, SERVICE_BOOT_START, SERVICE_DEMAND_START, SERVICE_SYSTEM_START,
@@ -109,6 +110,7 @@ fn device_action_journal_status(error: DeviceActionJournalError) -> i32 {
         DeviceActionJournalError::InsufficientResources => STATUS_INSUFFICIENT_RESOURCES,
         DeviceActionJournalError::AlreadySeeded
         | DeviceActionJournalError::DuplicateInstance
+        | DeviceActionJournalError::InvalidTransition
         | DeviceActionJournalError::StaleAcknowledgement => STATUS_INVALID_PARAMETER,
     }
 }
@@ -308,6 +310,7 @@ fn apply_system_hive_mutation(
                 .then_some(())
                 .ok_or(STATUS_INVALID_PARAMETER)
         }
+        HiveMutation::PublishDeviceAction { .. } => Ok(()),
     }
 }
 
@@ -371,6 +374,7 @@ fn project_system_hive_mutations(
             | HiveMutation::DeleteKey { path }
             | HiveMutation::SetKeyClass { path, .. }
             | HiveMutation::SetKeySecurity { path, .. } => path,
+            HiveMutation::PublishDeviceAction { .. } => continue,
         };
         let Some((path, affects_enum)) = semantic_system_registry_path(path, current_control_set)?
         else {
@@ -410,6 +414,7 @@ fn project_system_hive_mutations(
                 // Class and security metadata remain authoritative in the mounted hive. The
                 // semantic ConfigManager registry does not model either attribute.
             }
+            HiveMutation::PublishDeviceAction { .. } => unreachable!(),
         }
     }
     Ok(enum_changed)
@@ -755,15 +760,10 @@ fn encode_device_action_event(event: &DeviceActionEvent) -> Option<Vec<u8>> {
         DeviceActionKind::Change => device_action_kind::CHANGE,
         DeviceActionKind::Removal => device_action_kind::REMOVAL,
     };
-    let service_class = match event
-        .publication
-        .service
-        .as_ref()
-        .map(|service| service.class)
-    {
-        None => 0,
-        Some(DriverServiceClass::Device) => driver_service_class::DEVICE,
-        Some(DriverServiceClass::FileSystem) => driver_service_class::FILE_SYSTEM,
+    let service_present = if event.publication.service_name.is_some() {
+        device_action_service::PRESENT
+    } else {
+        device_action_service::ABSENT
     };
     let mut out = Vec::new();
     push_u32(&mut out, CM_DEVICE_ACTION_SNAPSHOT_MAGIC);
@@ -771,21 +771,14 @@ fn encode_device_action_event(event: &DeviceActionEvent) -> Option<Vec<u8>> {
     push_u16(&mut out, kind);
     out.extend_from_slice(&event.mount_generation.to_le_bytes());
     out.extend_from_slice(&event.sequence.to_le_bytes());
-    push_u16(&mut out, service_class);
+    push_u16(&mut out, service_present);
     push_u16(&mut out, 0);
     push_u32(&mut out, 0);
     debug_assert_eq!(out.len(), CM_DEVICE_ACTION_SNAPSHOT_HEADER_BYTES);
 
     push_string(&mut out, &event.publication.instance_id)?;
-    if let Some(service) = &event.publication.service {
-        push_string(&mut out, &service.service_name)?;
-        push_string(&mut out, &service.image_path)?;
-        push_string(&mut out, &service.driver_object_path)?;
-        push_optional_string(&mut out, service.class_guid.as_deref())?;
-        push_u32(&mut out, service.start_type);
-        push_optional_u32(&mut out, service.error_control);
-        push_optional_string(&mut out, service.load_order_group.as_deref())?;
-        push_optional_u32(&mut out, service.tag);
+    if let Some(service_name) = &event.publication.service_name {
+        push_string(&mut out, service_name)?;
     }
     push_optional_string(&mut out, event.publication.pdo_name.as_deref())?;
     push_optional_string(&mut out, event.publication.driver_key.as_deref())?;
@@ -805,6 +798,29 @@ fn encode_device_action_event(event: &DeviceActionEvent) -> Option<Vec<u8>> {
         push_string(&mut out, id)?;
     }
     Some(out)
+}
+
+fn device_action_intents(mutations: &[HiveMutation]) -> Result<Vec<DeviceActionIntent>, i32> {
+    let mut actions = Vec::new();
+    for mutation in mutations {
+        let HiveMutation::PublishDeviceAction { kind, instance_id } = mutation else {
+            continue;
+        };
+        let kind = match *kind {
+            device_action_kind::ARRIVAL => DeviceActionKind::Arrival,
+            device_action_kind::CHANGE => DeviceActionKind::Change,
+            device_action_kind::REMOVAL => DeviceActionKind::Removal,
+            _ => return Err(STATUS_INVALID_PARAMETER),
+        };
+        actions
+            .try_reserve(1)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        actions.push(DeviceActionIntent {
+            kind,
+            instance_id: instance_id.clone(),
+        });
+    }
+    Ok(actions)
 }
 
 struct DevicePropertySnapshotKey {
@@ -847,6 +863,25 @@ struct PnpQuerySnapshotKey {
 struct DeviceActionSnapshotKey {
     mount_generation: u64,
     sequence: u64,
+}
+
+struct DeviceActionClaim {
+    token: u64,
+    key: DeviceActionSnapshotKey,
+    value: Vec<u8>,
+    offset: usize,
+    complete: bool,
+}
+
+static NEXT_DEVICE_ACTION_CLAIM_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+fn take_device_action_claim_token() -> Option<u64> {
+    NEXT_DEVICE_ACTION_CLAIM_TOKEN
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
+            token.checked_add(1)
+        })
+        .ok()
+        .filter(|token| *token != 0)
 }
 
 struct MountedSystemHive {
@@ -893,7 +928,7 @@ pub struct CmServer {
     pnp_query_snapshots: SnapshotBank<PnpQuerySnapshotKey>,
     network_adapter_plan_snapshots: SnapshotBank<u16>,
     device_action_journal: DeviceActionJournal,
-    device_action_snapshot: SnapshotBank<DeviceActionSnapshotKey>,
+    device_action_claim: Option<DeviceActionClaim>,
 }
 
 impl Default for CmServer {
@@ -929,7 +964,7 @@ impl CmServer {
             pnp_query_snapshots: SnapshotBank::new(),
             network_adapter_plan_snapshots: SnapshotBank::new(),
             device_action_journal: DeviceActionJournal::new(),
-            device_action_snapshot: SnapshotBank::new(),
+            device_action_claim: None,
         }
     }
 
@@ -960,7 +995,7 @@ impl CmServer {
             pnp_query_snapshots: SnapshotBank::new(),
             network_adapter_plan_snapshots: SnapshotBank::new(),
             device_action_journal: DeviceActionJournal::new(),
-            device_action_snapshot: SnapshotBank::new(),
+            device_action_claim: None,
         }
     }
 
@@ -1485,16 +1520,11 @@ impl CmServer {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
                 };
                 let mut cm = config_manager_from_system_hive(&hive, &current_control_set);
-                let publications = cm.devnode_publications();
-                let journal_result = if current_generation == 0 {
-                    self.device_action_journal.seed(generation, &publications)
-                } else {
-                    self.device_action_journal
-                        .publish(generation, &publications)
-                        .map(|_| ())
-                };
-                if let Err(error) = journal_result {
-                    return reply(device_action_journal_status(error), current_generation);
+                if current_generation == 0 {
+                    let publications = cm.devnode_publications();
+                    if let Err(error) = self.device_action_journal.seed(generation, &publications) {
+                        return reply(device_action_journal_status(error), current_generation);
+                    }
                 }
                 self.system_mutation_leases.invalidate();
                 self.system_key_leases.invalidate();
@@ -1542,6 +1572,7 @@ impl CmServer {
             | HiveMutation::DeleteKey { path }
             | HiveMutation::SetKeyClass { path, .. }
             | HiveMutation::SetKeySecurity { path, .. } => path,
+            HiveMutation::PublishDeviceAction { .. } => return Err(STATUS_INVALID_PARAMETER),
         };
         let relative =
             system_hive_relative_path(path, current_control_set).ok_or(STATUS_INVALID_PARAMETER)?;
@@ -1591,6 +1622,7 @@ impl CmServer {
                 },
                 sequence,
             ),
+            HiveMutation::PublishDeviceAction { .. } => return Err(STATUS_INVALID_PARAMETER),
         };
         Ok(record)
     }
@@ -1640,7 +1672,7 @@ impl CmServer {
         &mut self,
         mutations: &[HiveMutation],
         next_generation: u64,
-    ) -> Result<(), i32> {
+    ) -> Result<bool, i32> {
         let mounted = self.system_hive.as_mut().ok_or(STATUS_DEVICE_NOT_READY)?;
         let previous_control_set = mounted.current_control_set.clone();
         let mut transaction = mounted.hive.begin_transaction();
@@ -1651,32 +1683,38 @@ impl CmServer {
             .current_control_set()
             .map_err(|_| STATUS_REGISTRY_CORRUPT)?;
 
-        let mut topology =
-            config_manager_from_system_hive(transaction.hive(), &current_control_set);
-        let publications = topology.devnode_publications();
+        let actions = device_action_intents(mutations)?;
+        let mut topology = if previous_control_set != current_control_set || !actions.is_empty() {
+            Some(config_manager_from_system_hive(
+                transaction.hive(),
+                &current_control_set,
+            ))
+        } else {
+            None
+        };
+        if !actions.is_empty() {
+            let publications = topology.as_mut().unwrap().devnode_publications();
+            self.device_action_journal
+                .publish_actions(next_generation, &publications, &actions)
+                .map_err(device_action_journal_status)?;
+        }
 
         if previous_control_set == current_control_set {
             let mut registry = self.cm.registry_mut().begin_transaction();
             let enum_changed =
                 project_system_hive_mutations(&mut registry, &current_control_set, mutations)?;
-            self.device_action_journal
-                .publish(next_generation, &publications)
-                .map_err(device_action_journal_status)?;
             transaction.commit();
             registry.commit();
             if enum_changed {
                 self.cm.refresh_registry_devnodes();
             }
         } else {
-            self.device_action_journal
-                .publish(next_generation, &publications)
-                .map_err(device_action_journal_status)?;
             transaction.commit();
-            self.cm = topology;
+            self.cm = topology.unwrap();
         }
         mounted.generation = next_generation;
         mounted.current_control_set = current_control_set;
-        Ok(())
+        Ok(self.device_action_journal.pending_len() != 0)
     }
 
     fn op_mutate_system_hive(&mut self, buf: &[u8], out_buf: &mut [u8]) -> CmReply {
@@ -1884,13 +1922,21 @@ impl CmServer {
                     self.prepared_system_mutation = Some(prepared);
                     return reply(STATUS_INVALID_PARAMETER, current_generation);
                 }
-                if let Err(status) =
-                    self.commit_system_hive_mutations(&prepared.mutations, prepared.next_generation)
+                let has_pending_device_action = match self
+                    .commit_system_hive_mutations(&prepared.mutations, prepared.next_generation)
                 {
-                    self.prepared_system_mutation = Some(prepared);
-                    return reply(status, current_generation);
-                }
-                reply_with_info(STATUS_SUCCESS, 0, prepared.next_generation, prepared.token)
+                    Ok(has_pending) => has_pending,
+                    Err(status) => {
+                        self.prepared_system_mutation = Some(prepared);
+                        return reply(status, current_generation);
+                    }
+                };
+                reply_with_info(
+                    STATUS_SUCCESS,
+                    u32::from(has_pending_device_action),
+                    prepared.next_generation,
+                    prepared.token,
+                )
             }
             hive_mutation_transfer::ABORT => {
                 if req.lease_token == 0
@@ -3018,6 +3064,9 @@ impl CmServer {
                 {
                     return reply(STATUS_INVALID_PARAMETER, current_generation);
                 }
+                if self.device_action_claim.is_some() {
+                    return reply(STATUS_DEVICE_BUSY, current_generation);
+                }
                 let Some(event) = self.device_action_journal.peek() else {
                     return reply(STATUS_NO_MORE_ENTRIES, current_generation);
                 };
@@ -3028,13 +3077,21 @@ impl CmServer {
                 let Some(value) = encode_device_action_event(event) else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, current_generation);
                 };
-                let Some(chunk) =
-                    self.device_action_snapshot
-                        .begin(key, value, chunk_capacity, out_buf)
-                else {
+                let Some(token) = take_device_action_claim_token() else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, current_generation);
                 };
-                snapshot_reply(chunk)
+                let needed = value.len();
+                let written = core::cmp::min(needed, chunk_capacity);
+                out_buf[..written].copy_from_slice(&value[..written]);
+                let complete = written == needed;
+                self.device_action_claim = Some(DeviceActionClaim {
+                    token,
+                    key,
+                    value: if complete { Vec::new() } else { value },
+                    offset: written,
+                    complete,
+                });
+                reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, token)
             }
             device_action_transfer::PULL => {
                 if chunk_capacity == 0
@@ -3044,19 +3101,27 @@ impl CmServer {
                 {
                     return reply(STATUS_INVALID_PARAMETER, current_generation);
                 }
-                let Some(chunk) = self.device_action_snapshot.pull(
-                    req.transfer_token,
-                    req.value_offset as usize,
-                    chunk_capacity,
-                    out_buf,
-                    |key| {
-                        key.mount_generation == req.mount_generation
-                            && key.sequence == req.event_sequence
-                    },
-                ) else {
+                let Some(claim) = self.device_action_claim.as_mut() else {
                     return reply(STATUS_INVALID_PARAMETER, current_generation);
                 };
-                snapshot_reply(chunk)
+                if claim.token != req.transfer_token
+                    || claim.key.mount_generation != req.mount_generation
+                    || claim.key.sequence != req.event_sequence
+                    || claim.complete
+                    || claim.offset != req.value_offset as usize
+                {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                let needed = claim.value.len();
+                let written = core::cmp::min(needed - claim.offset, chunk_capacity);
+                out_buf[..written]
+                    .copy_from_slice(&claim.value[claim.offset..claim.offset + written]);
+                claim.offset += written;
+                if claim.offset == needed {
+                    claim.complete = true;
+                    claim.value = Vec::new();
+                }
+                reply_with_info(STATUS_SUCCESS, written as u32, needed as u64, claim.token)
             }
             device_action_transfer::ABORT => {
                 if req.value_offset != 0
@@ -3064,15 +3129,18 @@ impl CmServer {
                     || req.mount_generation == 0
                     || req.event_sequence == 0
                     || req.transfer_token == 0
-                    || !self
-                        .device_action_snapshot
-                        .abort(req.transfer_token, |key| {
-                            key.mount_generation == req.mount_generation
-                                && key.sequence == req.event_sequence
-                        })
                 {
                     return reply(STATUS_INVALID_PARAMETER, current_generation);
                 }
+                let matches = self.device_action_claim.as_ref().is_some_and(|claim| {
+                    claim.token == req.transfer_token
+                        && claim.key.mount_generation == req.mount_generation
+                        && claim.key.sequence == req.event_sequence
+                });
+                if !matches {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                self.device_action_claim = None;
                 reply(STATUS_SUCCESS, current_generation)
             }
             device_action_transfer::ACK => {
@@ -3080,8 +3148,17 @@ impl CmServer {
                     || chunk_capacity != 0
                     || req.mount_generation == 0
                     || req.event_sequence == 0
-                    || req.transfer_token != 0
+                    || req.transfer_token == 0
                 {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                let claim_matches = self.device_action_claim.as_ref().is_some_and(|claim| {
+                    claim.token == req.transfer_token
+                        && claim.key.mount_generation == req.mount_generation
+                        && claim.key.sequence == req.event_sequence
+                        && claim.complete
+                });
+                if !claim_matches {
                     return reply(STATUS_INVALID_PARAMETER, current_generation);
                 }
                 let head_matches = self.device_action_journal.peek().is_some_and(|event| {
@@ -3094,10 +3171,10 @@ impl CmServer {
                 if let Err(error) = self.device_action_journal.acknowledge(req.event_sequence) {
                     return reply(device_action_journal_status(error), current_generation);
                 }
-                self.device_action_snapshot.clear();
+                self.device_action_claim = None;
                 reply_with_info(
                     STATUS_SUCCESS,
-                    self.device_action_journal.pending_len() as u32,
+                    u32::from(self.device_action_journal.pending_len() != 0),
                     current_generation,
                     req.event_sequence,
                 )
@@ -3527,6 +3604,48 @@ mod tests {
         commit_hive_import(server, token, image)
     }
 
+    fn device_action_request(
+        operation: u16,
+        mount_generation: u64,
+        event_sequence: u64,
+        transfer_token: u64,
+        value_offset: u32,
+        chunk_capacity: u32,
+    ) -> CmDeviceActionRequest {
+        CmDeviceActionRequest {
+            abi_size: core::mem::size_of::<CmDeviceActionRequest>() as u16,
+            abi_version: CM_ABI_VERSION,
+            operation,
+            _reserved: 0,
+            value_offset,
+            chunk_capacity,
+            mount_generation,
+            event_sequence,
+            transfer_token,
+        }
+    }
+
+    fn publish_test_device_action(server: &mut CmServer) {
+        let instance_path =
+            String::from(r"\Registry\Machine\System\ControlSet001\Enum\ROOT\CLAIM\0000");
+        let mutations = [
+            HiveMutation::CreateKey {
+                path: instance_path.clone(),
+            },
+            HiveMutation::SetValue {
+                path: instance_path,
+                name: String::from("PdoName"),
+                value_type: RegistryValueType::Sz as u32,
+                data: encode_sz(r"\Device\ClaimPdo0"),
+            },
+            HiveMutation::PublishDeviceAction {
+                kind: device_action_kind::ARRIVAL,
+                instance_id: String::from(r"ROOT\CLAIM\0000"),
+            },
+        ];
+        assert_eq!(server.commit_system_hive_mutations(&mutations, 2), Ok(true));
+    }
+
     fn selected_system_hive(number: u32) -> Hive {
         let mut hive = Hive::new(HiveKind::System);
         let select = hive.create_key("Select");
@@ -3589,6 +3708,112 @@ mod tests {
         assert_eq!(response.status, STATUS_INVALID_PARAMETER);
         assert_eq!(response.information, 0);
         assert_eq!(out, [0xa5; 2]);
+    }
+
+    #[test]
+    fn device_action_claim_is_exclusive_completed_and_restart_distinct() {
+        let image = encode_image(&selected_system_hive(1));
+        let mut server = CmServer::new();
+        assert_eq!(publish_hive(&mut server, &image), 1);
+        publish_test_device_action(&mut server);
+
+        let mut first = [0u8; CM_DEVICE_ACTION_SNAPSHOT_HEADER_BYTES];
+        let begin = server.dispatch(
+            opcode::CM_OP_DEVICE_ACTION,
+            device_action_request(
+                device_action_transfer::BEGIN,
+                0,
+                0,
+                0,
+                0,
+                first.len() as u32,
+            )
+            .as_bytes(),
+            &mut first,
+        );
+        assert_eq!(begin.status, STATUS_SUCCESS);
+        assert_ne!(begin.detail1, 0);
+        assert!(begin.detail0 as usize > first.len());
+
+        let competing = server.dispatch(
+            opcode::CM_OP_DEVICE_ACTION,
+            device_action_request(device_action_transfer::BEGIN, 0, 0, 0, 0, 32).as_bytes(),
+            &mut [0u8; 32],
+        );
+        assert_eq!(competing.status, STATUS_DEVICE_BUSY);
+
+        let wrong_abort = server.dispatch(
+            opcode::CM_OP_DEVICE_ACTION,
+            device_action_request(device_action_transfer::ABORT, 2, 2, begin.detail1, 0, 0)
+                .as_bytes(),
+            &mut [],
+        );
+        assert_eq!(wrong_abort.status, STATUS_INVALID_PARAMETER);
+        let abort = server.dispatch(
+            opcode::CM_OP_DEVICE_ACTION,
+            device_action_request(device_action_transfer::ABORT, 2, 1, begin.detail1, 0, 0)
+                .as_bytes(),
+            &mut [],
+        );
+        assert_eq!(abort.status, STATUS_SUCCESS);
+
+        let begin = server.dispatch(
+            opcode::CM_OP_DEVICE_ACTION,
+            device_action_request(device_action_transfer::BEGIN, 0, 0, 0, 0, 32).as_bytes(),
+            &mut [0u8; 32],
+        );
+        assert_eq!(begin.status, STATUS_SUCCESS);
+        let premature_ack = server.dispatch(
+            opcode::CM_OP_DEVICE_ACTION,
+            device_action_request(device_action_transfer::ACK, 2, 1, begin.detail1, 0, 0)
+                .as_bytes(),
+            &mut [],
+        );
+        assert_eq!(premature_ack.status, STATUS_INVALID_PARAMETER);
+
+        let total = begin.detail0 as usize;
+        let mut tail = vec![0u8; total - 32];
+        let pull = server.dispatch(
+            opcode::CM_OP_DEVICE_ACTION,
+            device_action_request(
+                device_action_transfer::PULL,
+                2,
+                1,
+                begin.detail1,
+                32,
+                tail.len() as u32,
+            )
+            .as_bytes(),
+            &mut tail,
+        );
+        assert_eq!(pull.status, STATUS_SUCCESS);
+        assert_eq!(pull.information as usize, tail.len());
+        let ack = server.dispatch(
+            opcode::CM_OP_DEVICE_ACTION,
+            device_action_request(device_action_transfer::ACK, 2, 1, begin.detail1, 0, 0)
+                .as_bytes(),
+            &mut [],
+        );
+        assert_eq!(ack.status, STATUS_SUCCESS);
+        assert_eq!(ack.information, 0);
+
+        let mut replacement = CmServer::new();
+        assert_eq!(publish_hive(&mut replacement, &image), 1);
+        publish_test_device_action(&mut replacement);
+        let replacement_begin = replacement.dispatch(
+            opcode::CM_OP_DEVICE_ACTION,
+            device_action_request(device_action_transfer::BEGIN, 0, 0, 0, 0, 4096).as_bytes(),
+            &mut [0u8; 4096],
+        );
+        assert_eq!(replacement_begin.status, STATUS_SUCCESS);
+        assert_ne!(replacement_begin.detail1, begin.detail1);
+        let stale_ack = replacement.dispatch(
+            opcode::CM_OP_DEVICE_ACTION,
+            device_action_request(device_action_transfer::ACK, 2, 1, begin.detail1, 0, 0)
+                .as_bytes(),
+            &mut [],
+        );
+        assert_eq!(stale_ack.status, STATUS_INVALID_PARAMETER);
     }
 
     #[test]
@@ -3998,7 +4223,10 @@ mod tests {
             value_type: RegistryValueType::Dword as u32,
             data: 2u32.to_le_bytes().to_vec(),
         }];
-        assert_eq!(server.commit_system_hive_mutations(&mutations, 2), Ok(()));
+        assert_eq!(
+            server.commit_system_hive_mutations(&mutations, 2),
+            Ok(false)
+        );
 
         let mut first = [0u8; 257];
         let begin = server.dispatch(
@@ -4464,7 +4692,10 @@ mod tests {
                 ),
             },
         ];
-        assert_eq!(server.commit_system_hive_mutations(&mutations, 2), Ok(()));
+        assert_eq!(
+            server.commit_system_hive_mutations(&mutations, 2),
+            Ok(false)
+        );
 
         let mounted = server.system_hive.as_ref().unwrap();
         assert_eq!(mounted.generation, 2);

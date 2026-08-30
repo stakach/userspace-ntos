@@ -15731,6 +15731,7 @@ impl nt_config_client::Backend for CmChan<'_> {
 
 static mut CONFIG_CLIENT_PTR: *mut ConfigClient<CmChan<'static>> = core::ptr::null_mut();
 static LIVE_CONFIG_MANAGER_SYSTEM_GENERATION: AtomicU64 = AtomicU64::new(0);
+static CONFIG_DEVICE_ACTION_PENDING: AtomicBool = AtomicBool::new(false);
 const CONFIG_STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 
 unsafe fn install_config_manager_client(client: &mut ConfigClient<CmChan<'static>>) {
@@ -16084,12 +16085,15 @@ pub(crate) unsafe fn config_manager_publish_system_hive_mutation(
     let client = CONFIG_CLIENT_PTR
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
-    let generation = client.publish_system_hive_mutation(prepared)?;
-    if generation != prepared.next_generation {
+    let outcome = client.publish_system_hive_mutation(prepared)?;
+    if outcome.generation != prepared.next_generation {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
-    LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.store(generation, Ordering::Release);
-    Ok(generation)
+    LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.store(outcome.generation, Ordering::Release);
+    if outcome.has_pending_device_action {
+        CONFIG_DEVICE_ACTION_PENDING.store(true, Ordering::Release);
+    }
+    Ok(outcome.generation)
 }
 
 pub(crate) unsafe fn config_manager_abort_system_hive_mutation(
