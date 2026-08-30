@@ -18529,3 +18529,35 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     exact allocation/provider domain, dispatch one typed QUERY_ID IRP at a time, retain synchronous
     or pending output pointers until copied, free each exact provider-pool allocation only after a
     successful owned copy, and ACK pending completions before advancing to the next ID or child.
+
+    B3 hosted QUERY_ID transaction checkpoint (2026-08-30, implementation green): the retained
+    bus-relations owner now resolves every returned raw PDO through the exact generation-bearing
+    domain of the provider that produced `DEVICE_RELATIONS`. Each mapping must still name a live,
+    non-delete-pending canonical I/O Manager device, and aliases that collapse distinct raw PDOs onto
+    one canonical identity are rejected. The relation transaction keeps both the authenticated raw
+    identity and the canonical `DeviceId`; every later dispatch revalidates that mapping so teardown
+    or domain reuse cannot redirect an in-flight enumeration.
+
+    The worker issues `BusQueryDeviceID`, `BusQueryInstanceID`, `BusQueryHardwareIDs`, and
+    `BusQueryCompatibleIDs` sequentially for each child through the canonical top-of-stack PnP path.
+    Every request snapshots its origin driver, completion driver/device, provider allocation owner,
+    and IRP identity. Pending completion must reproduce that entire identity and the native PnP
+    major/minor before the result is consumed. Successful driver allocations remain live until the
+    terminator-bounded UTF-16 or `MULTI_SZ` value has been copied into PnP-owned storage and the exact
+    provider-pool allocation has been freed. Transient owned-copy allocation failure retries without
+    redispatch or ACK; pending completion is acknowledged strictly only after copy/free. Device,
+    instance, and a nonempty hardware-ID set are mandatory. A zero-pointer compatible-ID result is
+    represented as the native optional empty set whether the query returned success or a driver
+    failure; a nonzero pointer still must decode normally. Malformed values, invalid pointers,
+    release failure, stale topology, failed required queries, and indeterminate transport retain the
+    invalidation as a barrier. No Enum or Config Manager state is mutated yet.
+
+    Focused `nt-pnp-manager` validation remains `39/39`; formatting, `git diff --check`, and the
+    freestanding executive check pass at the unchanged 209-warning baseline. Serialized desktop
+    acceptance remains blocked by the independently running QEMU process that owns the repository's
+    boot lane; it was not interrupted. Review adjustment: QUERY_DEVICE_RELATIONS and all four
+    QUERY_ID allocation/completion lifetimes are now closed through PnP-owned child descriptions.
+    Next prepare a `BusRelationTable` transaction from those descriptions, resolve each semantic
+    arrival/change/removal through Config Manager policy, durably publish the resulting Enum and
+    device-action changes, then commit the exact relation owner and complete the invalidation only
+    after CM accepts the whole transaction.
