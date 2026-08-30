@@ -2539,9 +2539,6 @@ unsafe fn pump_service_io_port_fault(
     exception_number: u64,
 ) -> Option<u64> {
     const X86_GP_EXCEPTION: u64 = 13;
-    const IN_DX_EAX: u8 = 0xED;
-    const OUT_DX_EAX: u8 = 0xEF;
-    const OPERAND_SIZE_PREFIX: u8 = 0x66;
 
     if exception_number != X86_GP_EXCEPTION || ch.tcb == 0 {
         return None;
@@ -2559,13 +2556,16 @@ unsafe fn pump_service_io_port_fault(
         return None;
     };
     let image_len = image_frames.checked_mul(0x1000)?;
-    let exec_ip =
+    let (exec_ip, exec_limit) =
         if fault_ip >= component_code_va && fault_ip < component_code_va.checked_add(image_len)? {
             if ch.exec_code_va == 0 {
                 return None;
             }
             let offset = fault_ip - component_code_va;
-            ch.exec_code_va.checked_add(offset)?
+            (
+                ch.exec_code_va.checked_add(offset)?,
+                ch.exec_code_va.checked_add(image_len)?,
+            )
         } else {
             let executive_len = crate::IMAGE_FRAMES_COUNT
                 .load(Ordering::Relaxed)
@@ -2575,39 +2575,45 @@ unsafe fn pump_service_io_port_fault(
             {
                 return None;
             }
-            fault_ip
+            (fault_ip, crate::IMAGE_BASE.checked_add(executive_len)?)
         };
-    let b0 = core::ptr::read_volatile(exec_ip as *const u8);
-    let b1 = core::ptr::read_volatile((exec_ip + 1) as *const u8);
-    let (is_in, bits, insn_len) = match (b0, b1) {
-        (OUT_DX_EAX, _) => (false, 32u8, 1u64),
-        (IN_DX_EAX, _) => (true, 32u8, 1u64),
-        (OPERAND_SIZE_PREFIX, OUT_DX_EAX) => (false, 16u8, 2u64),
-        (OPERAND_SIZE_PREFIX, IN_DX_EAX) => (true, 16u8, 2u64),
-        _ => {
-            let count = HOSTED_IO_PORT_UNHANDLED_GPS.fetch_add(1, Ordering::Relaxed);
-            if count < 8 {
-                let b2 = core::ptr::read_volatile((exec_ip + 2) as *const u8);
-                let b3 = core::ptr::read_volatile((exec_ip + 3) as *const u8);
-                crate::print_str(b"[pump] unhandled IOPort GP ip=0x");
-                crate::print_hex((fault_ip >> 32) as u32);
-                crate::print_hex(fault_ip as u32);
-                crate::print_str(b" exec=0x");
-                crate::print_hex((exec_ip >> 32) as u32);
-                crate::print_hex(exec_ip as u32);
-                crate::print_str(b" bytes=0x");
-                crate::print_hex(
-                    ((b0 as u32) << 24) | ((b1 as u32) << 16) | ((b2 as u32) << 8) | b3 as u32,
-                );
-                crate::print_str(b"\n");
-            }
-            return None;
+    let available = usize::try_from(exec_limit.checked_sub(exec_ip)?).ok()?.min(4);
+    let mut instruction_bytes = [0u8; 4];
+    for (index, byte) in instruction_bytes[..available].iter_mut().enumerate() {
+        *byte = core::ptr::read_volatile((exec_ip + index as u64) as *const u8);
+    }
+    let Some(instruction) = nt_kernel_exec::x86_io::decode_port_io_instruction(
+        &instruction_bytes[..available],
+    ) else {
+        let count = HOSTED_IO_PORT_UNHANDLED_GPS.fetch_add(1, Ordering::Relaxed);
+        if count < 8 {
+            crate::print_str(b"[pump] unhandled IOPort GP ip=0x");
+            crate::print_hex((fault_ip >> 32) as u32);
+            crate::print_hex(fault_ip as u32);
+            crate::print_str(b" exec=0x");
+            crate::print_hex((exec_ip >> 32) as u32);
+            crate::print_hex(exec_ip as u32);
+            crate::print_str(b" bytes=0x");
+            crate::print_hex(
+                ((instruction_bytes[0] as u32) << 24)
+                    | ((instruction_bytes[1] as u32) << 16)
+                    | ((instruction_bytes[2] as u32) << 8)
+                    | instruction_bytes[3] as u32,
+            );
+            crate::print_str(b"\n");
         }
+        return None;
     };
+    let is_in = instruction.direction == nt_kernel_exec::x86_io::PortIoDirection::Read;
+    let bits = instruction.width_bits;
+    let insn_len = instruction.len as u64;
 
     let mut regs = [0u64; 20];
     crate::win32k_glue::tcb_read_regs20(ch.tcb, &mut regs);
-    let port = (regs[6] & 0xFFFF) as u16;
+    let port = match instruction.port {
+        nt_kernel_exec::x86_io::PortIoPort::Dx => (regs[6] & 0xFFFF) as u16,
+        nt_kernel_exec::x86_io::PortIoPort::Immediate(port) => port as u16,
+    };
     let grant = crate::driver_launch::hosted_io_port_fault_grant(sh, port)?;
     let port_cap = grant.cap;
     let port_base = grant.base;
@@ -2631,7 +2637,36 @@ unsafe fn pump_service_io_port_fault(
         return None;
     }
 
-    if bits == 16 {
+    if bits == 8 {
+        if is_in {
+            let (value, io) = crate::io_in8_r(port_cap, port);
+            if io != 0 {
+                crate::print_str(b"[pump] IOPortIn8 failed label=");
+                crate::print_u64(io);
+                crate::print_str(b" port=0x");
+                crate::print_hex(port as u32);
+                crate::print_str(b"\n");
+                return None;
+            }
+            regs[3] = (regs[3] & !0xFF) | value as u64;
+            if crate::win32k_glue::tcb_write_regs20(ch.tcb, &regs, false) != 0 {
+                return None;
+            }
+        } else {
+            let value = regs[3] as u8;
+            let io = crate::io_out8(port_cap, port, value);
+            if io != 0 {
+                crate::print_str(b"[pump] IOPortOut8 failed label=");
+                crate::print_u64(io);
+                crate::print_str(b" port=0x");
+                crate::print_hex(port as u32);
+                crate::print_str(b" value=0x");
+                crate::print_hex(value as u32);
+                crate::print_str(b"\n");
+                return None;
+            }
+        }
+    } else if bits == 16 {
         let call_offset = if is_in {
             crate::driver_launch::SH_RESOURCE_IO_PORT_IN16_CALLS
         } else {

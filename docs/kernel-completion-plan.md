@@ -19494,3 +19494,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the driver's real SCI/GPE notification and bus-relation invalidation path to the prepared live
     PCI census transaction. Do not add an executive hotplug stimulus, polling loop, service-name
     branch, or ACPI-success fallback.
+
+    B3 hosted port-I/O fault checkpoint (2026-08-31, implementation green): the generic isolated-
+    driver #GP path now decodes every x86 accumulator port-I/O width used by NT drivers. A small
+    host-tested `nt-kernel-exec::x86_io` decoder covers byte, word, and dword `IN`/`OUT`, both `DX`
+    and immediate-port forms, the operand-size override, and the inert x64 REX prefix. The fault
+    pump reads only bytes remaining in the mapped image, selects the exact granted port capability,
+    validates the complete width against that resource, and preserves the unaffected portion of
+    `RAX` on byte/word reads. Byte accesses now use the same seL4 I/O-capability invocation as the
+    existing wider operations; an ungranted or failed operation remains a fatal driver fault.
+
+    This closes a concrete ACPICA blocker: the shipped `acpi.sys` emits `in al,dx` and `out dx,al`
+    for the FADT PM1/GPE SystemIO blocks, and those opcodes previously reached the unhandled-#GP
+    suspension path. Host validation passes `nt-kernel-exec` 176/176, formatting and
+    `git diff --check` are clean, and the freestanding executive check passes at the unchanged
+    209-warning baseline. Platform memory review also confirms that each retained ACPI frame is
+    mapped for its full page span and that `MmMapIoSpace` admits only a range contained in that
+    generation-owned grant with its published read/write rights.
+
+    Review adjustment: runtime ACPI acceptance remains serialized behind the existing desktop VM.
+    Before that boot, replace the capped loop-count `KeStallExecutionProcessor` implementation with
+    a real calibrated monotonic timing authority. Also remove test-interrupt injection from the
+    ordinary registry-selected PnP launch cohort: fixture-only evidence must not impersonate an SCI
+    or device interrupt. Real SCI delivery must originate from the microkernel IRQ capability,
+    invoke the driver-registered ISR, and reach the prepared PCI census only through the driver's
+    genuine GPE/bus-relation invalidation path.

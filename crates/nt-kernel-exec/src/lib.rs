@@ -39,6 +39,7 @@ pub mod timezone;
 pub mod user_class;
 pub mod user_cursor;
 mod work_item;
+pub mod x86_io;
 
 pub use completion::{CancelResult, CompleteResult, CompletionState, CompletionTracker};
 pub use dispatcher_wait::{
