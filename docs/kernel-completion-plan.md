@@ -17975,3 +17975,33 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the same slice. Then move the runtime system-locale read/match path to narrow CM values. Once
     those control-flow consumers are gone, re-audit overlay shadowing and enumeration before
     deleting post-publish SYSTEM replay and the SYSTEM `MutableHiveSet` mount together.
+
+    Native SYSTEM discovery and locale acceptance (2026-08-30): native absolute and relative SYSTEM
+    opens now route directly from the registry namespace to CM without first resolving an executive
+    cell. `NtCreateKey` checks parents through a transient exact CM lease, opens an existing target
+    through one owned CM lease, and treats only CM's real `STATUS_OBJECT_NAME_NOT_FOUND` as the
+    create case. Persistent creates publish the generation-checked CM transaction and acquire the
+    resulting key lease; volatile overlay keys retain precedence and remain volatile. The superseded
+    SYSTEM arms in mutable-key discovery and persistent subkey creation have been deleted. Ordinary
+    missing-name probes are native namespace outcomes rather than lease-transport failures.
+
+    `NtQueryDefaultLocale` and the system half of `NtSetDefaultLocale` now read and compare the
+    narrow CM-owned NLS value, verify the required key with an exact CM lease, and preserve CM
+    failures. Current-user locale behavior remains with the independently mounted user/default hive.
+    The freestanding executive release check remains at the established 209-warning baseline.
+
+    Serialized acceptance `.tmp/run-headless-cm-native-discovery-final-20260830.log` reaches the
+    genuine Explorer desktop with all `299/299` checks passing and the sentinel matched. CM reaches
+    generation 2535 after 2532 accepted runtime transactions with zero rejection or compatibility
+    projection failure. Native SYSTEM handle leases remain balanced at `1337/1335/2/0`; Explorer
+    completes 668 real api0 redirects with zero callback or dead-callback failures, installs 18
+    client WndProcs without replay, reaches paint begin/end `5/20` with 187 direct GDI returns and
+    135 batch flushes covering 184 records, and paints all `786432/786432` framebuffer pixels with
+    at least 32 colours.
+
+    Review adjustment: native SYSTEM discovery and runtime locale ownership are accepted. Before
+    deleting the compatibility mount, re-audit overlay shadowing plus parent/child enumeration for
+    SYSTEM paths so volatile keys compose with CM without consulting the projected tree. Then remove
+    post-publish SYSTEM replay, the SYSTEM `MutableHiveSet` mount/storage, and its projection-failure
+    diagnostic together. Retain `MutableHiveSet` for SOFTWARE, SECURITY, SAM, DEFAULT, and dynamic
+    user hives; do not add a second SYSTEM authority or fallback.

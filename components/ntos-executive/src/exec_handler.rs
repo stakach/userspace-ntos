@@ -604,6 +604,20 @@ fn query_system_hive_value(
     }
 }
 
+fn system_hive_key_exists(path: &str) -> Result<bool, u32> {
+    if !is_system_registry_path(path) {
+        return Err(STATUS_OBJECT_PATH_SYNTAX_BAD);
+    }
+    let opened = match unsafe { config_manager_open_system_hive_key(path) } {
+        Ok(opened) => opened,
+        Err(status) if status as u32 == STATUS_OBJECT_NAME_NOT_FOUND => return Ok(false),
+        Err(status) => return Err(status as u32),
+    };
+    unsafe { config_manager_close_system_hive_key(opened.lease) }
+        .map(|()| true)
+        .map_err(|status| status as u32)
+}
+
 enum CachedSystemSetupKey {
     Open {
         canonical_path: alloc::string::String,
@@ -4745,10 +4759,22 @@ impl ExecNtHandler {
                 opened
             }
             Err(status) => {
-                CM_NATIVE_SYSTEM_KEY_LEASE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                if status as u32 != STATUS_OBJECT_NAME_NOT_FOUND {
+                    CM_NATIVE_SYSTEM_KEY_LEASE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                }
                 return status as u32;
             }
         };
+        self.mint_opened_cm_system_registry_key(opened, desired, out)
+    }
+
+    unsafe fn mint_opened_cm_system_registry_key(
+        &mut self,
+        opened: nt_config_client::OpenedSystemHiveKey,
+        desired: u32,
+        out: u64,
+    ) -> u32 {
+        let _durable = allocator::enter_durable();
         let target = match self.install_cm_system_key_target(CmSystemKeyTarget {
             lease: opened.lease,
             physical_path: nt_hive_core::canon_path(&opened.physical_path),
@@ -7391,6 +7417,12 @@ impl ExecNtHandler {
         }
     }
 
+    fn note_system_registry_key_open(&self, full_path: &str) {
+        if is_keyboard_layout_key(&self.overlay_canon(full_path)) {
+            KBD_LAYOUT_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     unsafe fn open_registry_full_path(
         &mut self,
         full_path: &str,
@@ -7410,13 +7442,18 @@ impl ExecNtHandler {
             }
             return Some(self.mint_registry_key(OVERLAY_KEY_TAG | index as u32, desired, out));
         }
+        if is_system_registry_path(&canon) {
+            let status = self.mint_cm_system_registry_key(&canon, desired, out);
+            if status == 0 {
+                self.note_system_registry_key_open(&canon);
+            } else if status == STATUS_OBJECT_NAME_NOT_FOUND {
+                self.note_registry_open_miss(&canon);
+            }
+            return Some(status);
+        }
         if let Some(mutable_key) = self.mutable_registry_key_by_path(full_path) {
             self.note_mutable_registry_key_open(mutable_key, full_path);
-            return Some(if mutable_key.hive == HIVE_SEL_SYSTEM {
-                self.mint_cm_system_registry_key(full_path, desired, out)
-            } else {
-                self.mint_mutable_registry_key(mutable_key, desired, out)
-            });
+            return Some(self.mint_mutable_registry_key(mutable_key, desired, out));
         }
         if self.mutable_hive_owns_path(full_path) {
             self.note_registry_open_miss(full_path);
@@ -7528,7 +7565,7 @@ impl ExecNtHandler {
             });
         if let Some(path) = candidate {
             let canon = self.overlay_canon(&path);
-            if self.registry_path_exists(&canon) {
+            if self.registry_path_exists(&canon).unwrap_or(false) {
                 return path;
             }
         }
@@ -7555,13 +7592,18 @@ impl ExecNtHandler {
         const REG_DWORD: u32 = 4;
         const REG_SZ: u32 = 1;
         let (path, value_name) = self.locale_registry_path_and_value(user_profile);
-        let (ty, data) = self
-            .mutable_registry_value_by_path(&path, value_name)
-            .or_else(|| {
-                let key = self.resolve_key(&path)?;
-                self.registry_value(key, value_name)
-            })
-            .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+        let (ty, data) = if user_profile {
+            self.mutable_registry_value_by_path(&path, value_name)
+                .or_else(|| {
+                    let key = self.resolve_key(&path)?;
+                    self.registry_value(key, value_name)
+                })
+                .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?
+        } else {
+            query_system_hive_value(&path, value_name)?
+                .map(|(value_type, data)| (value_type as u32, data))
+                .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?
+        };
         if ty == REG_DWORD && data.len() == core::mem::size_of::<u32>() {
             Ok(u32::from_le_bytes(data[..4].try_into().unwrap()))
         } else if ty == REG_SZ {
@@ -7585,18 +7627,16 @@ impl ExecNtHandler {
         };
         let mut data = [0u8; 18];
         let len = utf16le_ascii_z(ascii, &mut data).ok_or(STATUS_INVALID_PARAMETER)?;
-        if self.mutable_registry_key_by_path(&path).is_none() {
-            return Err(STATUS_OBJECT_NAME_NOT_FOUND);
-        }
         if !user_profile {
             let value_type = nt_hive_core::RegistryValueType::Sz;
-            if self
-                .mutable_registry_key_by_path(&path)
-                .and_then(|key| self.mutable_hives.query_value(key, value_name))
-                .is_some_and(|(existing_type, existing)| {
+            if !system_hive_key_exists(&path)? {
+                return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+            }
+            if query_system_hive_value(&path, value_name)?.is_some_and(
+                |(existing_type, existing)| {
                     existing_type == value_type && existing == &data[..len]
-                })
-            {
+                },
+            ) {
                 return Ok(());
             }
             self.persist_and_publish_system_mutations(
@@ -7610,6 +7650,9 @@ impl ExecNtHandler {
             )?;
             self.note_mutable_hives_changed();
             return Ok(());
+        }
+        if self.mutable_registry_key_by_path(&path).is_none() {
+            return Err(STATUS_OBJECT_NAME_NOT_FOUND);
         }
         self.ensure_mutable_registry_value_by_path(&path, value_name, REG_SZ, &data[..len])
             .map(|_| ())
@@ -7795,16 +7838,22 @@ impl ExecNtHandler {
         true
     }
 
-    fn registry_path_exists(&self, canon: &str) -> bool {
-        matches!(
+    fn registry_path_exists(&self, canon: &str) -> Result<bool, u32> {
+        if matches!(
             canon,
             r"\" | r"\registry" | r"\registry\machine" | r"\registry\user"
         ) || self.registry_overlay_index_for_canon_path(canon).is_some()
-            || if self.mutable_hive_owns_path(canon) {
-                self.mutable_hives.resolve_key(canon).is_some()
-            } else {
-                self.resolve_key(canon).is_some()
-            }
+        {
+            return Ok(true);
+        }
+        if is_system_registry_path(canon) {
+            return system_hive_key_exists(canon);
+        }
+        Ok(if self.mutable_hive_owns_path(canon) {
+            self.mutable_hives.resolve_key(canon).is_some()
+        } else {
+            self.resolve_key(canon).is_some()
+        })
     }
 
     fn registry_value(&self, target: KeyRef, name: &str) -> Option<(u32, alloc::vec::Vec<u8>)> {
@@ -31877,9 +31926,10 @@ impl ExecNtHandler {
                     return status;
                 }
                 // A readable full registry path is resolved through one authority order for every
-                // process: explicit volatile overlay keys first, then mounted mutable hives, then
-                // borrowed read-only regf only for paths no mutable hive owns. Empty PE-literal
-                // names still fall through to the recovery arms below.
+                // process: explicit volatile overlay keys first, CM leases for SYSTEM, mounted
+                // mutable hives for the other writable mounts, then borrowed read-only regf only
+                // for paths no writable owner claims. Empty PE-literal names still fall through to
+                // the recovery arms below.
                 let full_open_path = if root_target == Some(MACHINE_ROOT_KEY) {
                     let mut full = alloc::string::String::from(r"\Registry\Machine\");
                     full.push_str(&path);
@@ -32087,10 +32137,10 @@ impl ExecNtHandler {
             },
             // NtCreateKey captured args: *KeyHandle=args[0], DesiredAccess=args[1],
             // *ObjectAttributes=args[2], TitleIndex=args[3], *Class=args[4],
-            // CreateOptions=args[5], *Disposition=args[6]. Persistent mounted-hive keys are
-            // created/opened in `MutableHiveSet`; explicitly volatile keys and paths outside mounted
-            // hives stay in the volatile overlay until D4 gives volatile keys first-class hive
-            // ownership.
+            // CreateOptions=args[5], *Disposition=args[6]. Persistent SYSTEM keys are created by CM;
+            // the other mounted hives retain `MutableHiveSet` ownership. Explicitly volatile keys
+            // and paths outside mounted hives stay in the volatile overlay until D4 gives volatile
+            // keys first-class hive ownership.
             NativeService::NtCreateKey => unsafe {
                 let desired_access = nt_ulong_arg(args[1]);
                 if args[0] == 0 || !self.probe_user_output(args[0], 8) {
@@ -32186,8 +32236,10 @@ impl ExecNtHandler {
                     .rsplit_once('\\')
                     .map(|(parent, _)| if parent.is_empty() { r"\" } else { parent })
                     .unwrap_or(r"\");
-                if !crate::probe_seg!(2, self.registry_path_exists(parent)) {
-                    return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
+                match crate::probe_seg!(2, self.registry_path_exists(parent)) {
+                    Ok(true) => {}
+                    Ok(false) => return STATUS_OBJECT_NAME_NOT_FOUND,
+                    Err(status) => return status,
                 }
                 // Disposition/storage split: explicit overlay handles keep their overlay identity,
                 // and path-discovered volatile overlay keys shadow mounted hives. Nonvolatile
@@ -32205,18 +32257,6 @@ impl ExecNtHandler {
                         self.registry_overlay_index_for_canon_path(&canon)
                     }
                 );
-                let mutable_existing = crate::probe_seg!(4, self.mutable_hives.resolve_key(&full));
-                let base_existing = crate::probe_seg!(
-                    5,
-                    if mutable_existing.is_none() && !self.mutable_hive_owns_path(&full) {
-                        self.resolve_key(&full)
-                    } else {
-                        None
-                    }
-                );
-                let existed = overlay_existing.is_some()
-                    || mutable_existing.is_some()
-                    || base_existing.is_some();
                 if let Some(oidx) = overlay_existing {
                     let status = {
                         let _durable = allocator::enter_durable();
@@ -32244,14 +32284,141 @@ impl ExecNtHandler {
                     bump_progress();
                     return 0;
                 }
+                if is_system_registry_path(&canon) {
+                    let opened = {
+                        let _durable = allocator::enter_durable();
+                        crate::config_manager_open_system_hive_key(&full)
+                    };
+                    match opened {
+                        Ok(opened) => {
+                            CM_NATIVE_SYSTEM_KEY_LEASE_ACQUIRES
+                                .fetch_add(1, Ordering::Relaxed);
+                            let status = self.mint_opened_cm_system_registry_key(
+                                opened,
+                                desired_access,
+                                args[0],
+                            );
+                            if status != 0 {
+                                return status;
+                            }
+                            let disp_ptr = args[6];
+                            if disp_ptr != 0 {
+                                self.xas_write_buf(
+                                    disp_ptr,
+                                    &REG_OPENED_EXISTING_KEY.to_le_bytes(),
+                                );
+                            }
+                            bump_progress();
+                            return 0;
+                        }
+                        Err(status) if status as u32 == STATUS_OBJECT_NAME_NOT_FOUND => {}
+                        Err(status) => {
+                            CM_NATIVE_SYSTEM_KEY_LEASE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                            return status as u32;
+                        }
+                    }
+                    if !create_volatile && !root_is_overlay {
+                        let canon_len = canon.len();
+                        let class_name = if args[4] != 0 {
+                            Some(self.read_registry_ustr_name(args[4]))
+                        } else {
+                            None
+                        };
+                        let class_present = class_name.is_some();
+                        let class_len = class_name.as_ref().map(|s| s.len()).unwrap_or(0);
+                        let mut canon_scratch = [0u8; 2048];
+                        let mut class_scratch = [0u8; 2048];
+                        if canon_len > canon_scratch.len() || class_len > class_scratch.len() {
+                            return 0xC000_003B; // STATUS_OBJECT_PATH_SYNTAX_BAD
+                        }
+                        canon_scratch[..canon_len].copy_from_slice(canon.as_bytes());
+                        if let Some(class_name) = class_name.as_ref() {
+                            class_scratch[..class_len].copy_from_slice(class_name.as_bytes());
+                        }
+                        drop(canon);
+                        drop(full);
+                        drop(name);
+                        drop(class_name);
+                        drop(transient_scope);
+                        let canon = match core::str::from_utf8(&canon_scratch[..canon_len]) {
+                            Ok(path) => path,
+                            Err(_) => return 0xC000_0033,
+                        };
+                        let class_name = if class_present {
+                            Some(match core::str::from_utf8(&class_scratch[..class_len]) {
+                                Ok(class_name) => class_name,
+                                Err(_) => return 0xC000_0033,
+                            })
+                        } else {
+                            None
+                        };
+                        let initial_security = if security_descriptor_ptr != 0 {
+                            let memory = ExecClientMemory { handler: self };
+                            Some(
+                                match nt_security::capture_security_descriptor_bytes(
+                                    &memory,
+                                    security_descriptor_ptr,
+                                ) {
+                                    Ok(descriptor) => descriptor,
+                                    Err(status) => return status,
+                                },
+                            )
+                        } else {
+                            None
+                        };
+                        let mut mutations =
+                            alloc::vec![OwnedSystemHiveMutation::CreateKey { path: canon.into() }];
+                        if class_present {
+                            mutations.push(OwnedSystemHiveMutation::SetKeyClass {
+                                path: canon.into(),
+                                class_name: class_name.map(alloc::string::String::from),
+                            });
+                        }
+                        if let Some(descriptor) = initial_security.as_deref() {
+                            mutations.push(OwnedSystemHiveMutation::SetKeySecurity {
+                                path: canon.into(),
+                                descriptor: descriptor.to_vec(),
+                            });
+                        }
+                        if let Err(status) = crate::probe_seg!(
+                            7,
+                            self.persist_and_publish_system_mutations(
+                                &mutations,
+                                SystemHiveMutationOrigin::Runtime,
+                            )
+                        ) {
+                            return status;
+                        }
+                        self.note_mutable_hives_changed();
+                        let status = crate::probe_seg!(
+                            9,
+                            self.mint_cm_system_registry_key(canon, desired_access, args[0])
+                        );
+                        if status != 0 {
+                            return status;
+                        }
+                        let disp_ptr = args[6];
+                        if disp_ptr != 0 {
+                            self.xas_write_buf(disp_ptr, &REG_CREATED_NEW_KEY.to_le_bytes());
+                        }
+                        bump_progress();
+                        return 0;
+                    }
+                }
+                let mutable_existing = crate::probe_seg!(4, self.mutable_hives.resolve_key(&full));
+                let base_existing = crate::probe_seg!(
+                    5,
+                    if mutable_existing.is_none() && !self.mutable_hive_owns_path(&full) {
+                        self.resolve_key(&full)
+                    } else {
+                        None
+                    }
+                );
+                let existed = mutable_existing.is_some() || base_existing.is_some();
                 if let Some(mutable_key) = mutable_existing {
                     let status = {
                         let _durable = allocator::enter_durable();
-                        if mutable_key.hive == HIVE_SEL_SYSTEM {
-                            self.mint_cm_system_registry_key(&full, desired_access, args[0])
-                        } else {
-                            self.mint_mutable_registry_key(mutable_key, desired_access, args[0])
-                        }
+                        self.mint_mutable_registry_key(mutable_key, desired_access, args[0])
                     };
                     if status != 0 {
                         return status;
@@ -32365,59 +32532,27 @@ impl ExecNtHandler {
                     } else {
                         None
                     };
-                    let mutable_key = if mutable_parent.hive == HIVE_SEL_SYSTEM {
-                        let mut mutations =
-                            alloc::vec![OwnedSystemHiveMutation::CreateKey { path: canon.into() }];
-                        if class_present {
-                            mutations.push(OwnedSystemHiveMutation::SetKeyClass {
-                                path: canon.into(),
-                                class_name: class_name.map(alloc::string::String::from),
-                            });
-                        }
-                        if let Some(descriptor) = initial_security.as_deref() {
-                            mutations.push(OwnedSystemHiveMutation::SetKeySecurity {
-                                path: canon.into(),
-                                descriptor: descriptor.to_vec(),
-                            });
-                        }
-                        if let Err(status) = crate::probe_seg!(
-                            7,
-                            self.persist_and_publish_system_mutations(
-                                &mutations,
-                                SystemHiveMutationOrigin::Runtime,
-                            )
-                        ) {
+                    let mutable_key = match crate::probe_seg!(
+                        7,
+                        self.journal_create_mutable_subkey(mutable_parent, leaf)
+                    ) {
+                        Ok(key) => key,
+                        Err(status) => return status,
+                    };
+                    if class_present {
+                        if let Err(status) =
+                            self.journal_set_mutable_key_class(mutable_key, class_name)
+                        {
                             return status;
                         }
-                        match self.mutable_registry_key_by_path(canon) {
-                            Some(key) => key,
-                            None => return STATUS_INVALID_HANDLE,
+                    }
+                    if let Some(descriptor) = initial_security.as_deref() {
+                        if let Err(status) = self
+                            .journal_set_mutable_key_security_descriptor(mutable_key, descriptor)
+                        {
+                            return status;
                         }
-                    } else {
-                        let mutable_key = match crate::probe_seg!(
-                            7,
-                            self.journal_create_mutable_subkey(mutable_parent, leaf)
-                        ) {
-                            Ok(key) => key,
-                            Err(status) => return status,
-                        };
-                        if class_present {
-                            if let Err(status) =
-                                self.journal_set_mutable_key_class(mutable_key, class_name)
-                            {
-                                return status;
-                            }
-                        }
-                        if let Some(descriptor) = initial_security.as_deref() {
-                            if let Err(status) = self.journal_set_mutable_key_security_descriptor(
-                                mutable_key,
-                                descriptor,
-                            ) {
-                                return status;
-                            }
-                        }
-                        mutable_key
-                    };
+                    }
                     crate::probe_seg!(8, self.note_mutable_hives_changed());
                     // Provenance counters for the LSA/SAM gate specs: keys created by lsasrv's
                     // own first-boot setup, plus registry writes needed by profile/computer-name
@@ -32452,11 +32587,7 @@ impl ExecNtHandler {
                     }
                     let status = crate::probe_seg!(
                         9,
-                        if mutable_key.hive == HIVE_SEL_SYSTEM {
-                            self.mint_cm_system_registry_key(canon, desired_access, args[0])
-                        } else {
-                            self.mint_mutable_registry_key(mutable_key, desired_access, args[0])
-                        }
+                        self.mint_mutable_registry_key(mutable_key, desired_access, args[0])
                     );
                     if status != 0 {
                         return status;
