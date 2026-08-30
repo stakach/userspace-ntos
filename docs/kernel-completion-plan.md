@@ -19607,3 +19607,43 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     AddDevice, START, `IoConnectInterrupt`, SCI ISR/DPC delivery, and driver-originated bus-relation
     invalidation before enabling PCI INTx routes. The currently active older desktop VM remains
     untouched, so runtime acceptance is intentionally still open.
+
+    B3 provider PCI-routing decode and Device-object IOCTL checkpoint (2026-08-31,
+    implementation green): `nt-acpi` now decodes the real ReactOS/Windows
+    `ACPI_EVAL_OUTPUT_BUFFER` representation returned by `IOCTL_ACPI_EVAL_METHOD(_PRT)` and the
+    `_CRS` resource template of a provider-resolved interrupt-link PDO. The decoder validates the
+    complete nested package shape, the ACPI-mandated wildcard function, device/pin bounds, route
+    uniqueness, argument padding, checksums, descriptor indices, electrical attributes, and a
+    topology-derived 128-entry maximum before allocation. Direct `_PRT` entries retain their GSI;
+    small IRQ descriptors remain typed as legacy IRQs until a supplied MADT interrupt-source
+    override translates them. Extended IRQ descriptors with a named ResourceSource, consumer
+    descriptors, multi-vector link `_CRS`, invalid PIC trigger/polarity pairs, ambiguous link
+    bindings, and malformed or overlapping entries fail closed. Link resources are bound to the
+    exact PCI device/pin route after provider namespace resolution, rather than selected by a
+    global first-match string lookup.
+
+    The I/O Manager now exposes the kernel-mode equivalent of `IoBuildDeviceIoControlRequest` for
+    standard and internal controls against a canonical Device id with no File object. It reuses the
+    existing attached-stack and `ExternalDispatchResult` ownership model, supports all four IOCTL
+    transfer methods, preserves raw warning/error `NTSTATUS` plus `IoStatus.Information`, and
+    returns the retained canonical IRP id when a driver pends. Handle-based requests share the same
+    buffer projection while retaining their access check and public result contract. The isolated
+    driver transport no longer collapses a completed warning into `DispatchOutcome::Failed`, so a
+    ReactOS ACPI `STATUS_BUFFER_OVERFLOW` probe retains the exact required output length across
+    either hosted backend.
+
+    Focused validation passes `nt-acpi` 14/14 and `nt-io-manager` 243/243. The host-testable
+    `nt-driver-host` suite passes 17/17; the isolated component checks for
+    `x86_64-unknown-none`; formatting and `git diff --check` are clean; and the executive
+    freestanding check remains green at the unchanged 209-warning baseline.
+
+    Review adjustment: next parse the MADT interrupt-source overrides from the already retained
+    ACPI table set, then issue a genuine File-less `IOCTL_ACPI_EVAL_METHOD` to each dynamically
+    identified PCI-root/bridge ACPI PDO. The first output probe must be the 20-byte
+    `sizeof(ACPI_EVAL_OUTPUT_BUFFER)` accepted by the shipped ReactOS driver; retry only with the
+    exact length returned in `IoStatus.Information`. Resolve every `_PRT` link NamePath in the
+    provider's namespace to its canonical link PDO, query `_CRS`, and publish the validated route
+    set under the same PCI-inventory/devnode generation. Replace the compiled q35 PIRQ table and
+    PCI config `INTERRUPT_LINE` handling atomically when that live route owner lands; neither may
+    survive as a fallback. Runtime ACPI/SCI and desktop acceptance remains one later serialized
+    boot because the active older desktop VM is still deliberately undisturbed.

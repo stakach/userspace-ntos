@@ -3261,6 +3261,103 @@ mod tests {
         (driver, seen)
     }
 
+    #[test]
+    fn device_object_ioctl_is_fileless_and_preserves_warning_information() {
+        let mut om = io();
+        let client = om.register_client();
+        let warning = NtStatus(0x8000_0005u32 as i32); // STATUS_BUFFER_OVERFLOW.
+        let (driver, seen) =
+            external_recording_driver(&mut om, "\\Driver\\Acpi", warning, 48, b"hdr");
+        let device = om.add_device(DeviceRecord::new(
+            ObjectId::NULL,
+            driver,
+            Some(path("\\Device\\AcpiPdo0")),
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        ));
+        let code = ioctl::ctl_code(
+            0x32,
+            1,
+            ioctl::METHOD_BUFFERED,
+            ioctl::FILE_READ_ACCESS | ioctl::FILE_WRITE_ACCESS,
+        );
+
+        let mut output = [0u8; 12];
+        let result = om
+            .device_control_device(client, device, code, b"BieA_PRT", &mut output)
+            .unwrap();
+
+        assert_eq!(
+            result,
+            ExternalDispatchResult::Completed {
+                status: warning,
+                information: 48,
+                file_context: None,
+            }
+        );
+        assert_eq!(&output[..3], b"hdr");
+        assert_eq!(om.file_count(), 0);
+        assert_eq!(om.irp_count(), 0);
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].client_id, client);
+        assert_eq!(seen[0].device_id, device);
+        assert_eq!(seen[0].file_id, None);
+        assert_eq!(seen[0].major, major::IRP_MJ_DEVICE_CONTROL);
+        assert_eq!(seen[0].input_len, 8);
+        assert_eq!(seen[0].output_len, 12);
+        assert_eq!(
+            seen[0].parameters,
+            IoParameters::DeviceControl(DeviceControlParameters {
+                ioctl_code: code,
+                input_len: 8,
+                output_len: 12,
+            })
+        );
+    }
+
+    #[test]
+    fn device_object_internal_ioctl_selects_internal_major() {
+        let mut om = io();
+        let client = om.register_client();
+        let (driver, seen) =
+            external_recording_driver(&mut om, "\\Driver\\Bus", NtStatus::SUCCESS, 0, &[]);
+        let device = om.add_device(DeviceRecord::new(
+            ObjectId::NULL,
+            driver,
+            None,
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::empty(),
+            0,
+        ));
+        let code = any_ioctl(0x820, ioctl::METHOD_NEITHER);
+        let mut output = [];
+
+        assert_eq!(
+            om.internal_device_control_device(client, device, code, b"input", &mut output),
+            Ok(ExternalDispatchResult::Completed {
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: None,
+            })
+        );
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].file_id, None);
+        assert_eq!(seen[0].major, major::IRP_MJ_INTERNAL_DEVICE_CONTROL);
+        assert_eq!(
+            seen[0].parameters,
+            IoParameters::InternalDeviceControl(DeviceControlParameters {
+                ioctl_code: code,
+                input_len: 5,
+                output_len: 0,
+            })
+        );
+    }
+
     #[derive(Default)]
     struct PendingStackState {
         seen: std::vec::Vec<(DriverId, DeviceId, u8, u8, IrpId)>,

@@ -128,7 +128,11 @@ impl DriverPeerTransport for SurtPeerTransport<'_> {
                 read_segment(request.user_buffer_offset as u64, user);
             }
         }
-        DispatchOutcome::from_status(NtStatus(status), information)
+        DispatchOutcome::Completed {
+            status: NtStatus(status),
+            information,
+            file_context: None,
+        }
     }
 
     fn cancel(&mut self, _irp_id: IrpId) {}

@@ -919,7 +919,7 @@ impl<P> IoManager<P> {
         )
     }
 
-    fn complete_external_dispatch(
+    pub(crate) fn complete_external_dispatch(
         &mut self,
         irp_id: IrpId,
         outcome: Result<DispatchOutcome, NtStatus>,

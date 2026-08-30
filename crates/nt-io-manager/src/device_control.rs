@@ -14,7 +14,7 @@ use nt_types::{AccessMask, ClientId, HandleValue};
 use crate::irp::{DeviceControlParameters, IoParameters};
 use crate::object_port::ObjectManagerPort;
 use crate::read_write::validate_transfer;
-use crate::IoManager;
+use crate::{DeviceId, ExternalDispatchResult, FileId, IoManager};
 
 /// The access an IOCTL requires, from its `CTL_CODE` access bits.
 fn ioctl_required_access(code: u32) -> AccessMask {
@@ -55,6 +55,36 @@ impl<P: ObjectManagerPort> IoManager<P> {
         self.ioctl(client, handle, ioctl_code, input, output, true)
     }
 
+    /// Build a File-less device-control IRP for a canonical Device object.
+    ///
+    /// This is the I/O Manager analogue of `IoBuildDeviceIoControlRequest`: kernel code already
+    /// holds Device-object authority, so no user handle or access check is involved. The raw driver
+    /// completion is preserved so warnings such as `STATUS_BUFFER_OVERFLOW` retain their
+    /// `IoStatus.Information` value. A pending result retains the canonical IRP id for the normal
+    /// completion engine.
+    pub fn device_control_device(
+        &mut self,
+        client: ClientId,
+        device_id: DeviceId,
+        ioctl_code: u32,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<ExternalDispatchResult, NtStatus> {
+        self.ioctl_device(client, device_id, ioctl_code, input, output, false)
+    }
+
+    /// Build a File-less internal-device-control IRP for a canonical Device object.
+    pub fn internal_device_control_device(
+        &mut self,
+        client: ClientId,
+        device_id: DeviceId,
+        ioctl_code: u32,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<ExternalDispatchResult, NtStatus> {
+        self.ioctl_device(client, device_id, ioctl_code, input, output, true)
+    }
+
     fn ioctl(
         &mut self,
         client: ClientId,
@@ -64,11 +94,54 @@ impl<P: ObjectManagerPort> IoManager<P> {
         output: &mut [u8],
         internal: bool,
     ) -> Result<u64, NtStatus> {
-        validate_transfer(input.len())?;
-        validate_transfer(output.len())?;
-
         let (file_id, device_id) =
             self.reference_open_file(client, handle, ioctl_required_access(ioctl_code))?;
+
+        let completion = self.ioctl_target(
+            client,
+            device_id,
+            Some(file_id),
+            ioctl_code,
+            input,
+            output,
+            internal,
+        )?;
+        match completion {
+            ExternalDispatchResult::Completed {
+                status,
+                information,
+                ..
+            } if status.is_success() => Ok(information),
+            ExternalDispatchResult::Completed { status, .. } => Err(status),
+            ExternalDispatchResult::Pending { .. } => Err(NtStatus::PENDING),
+        }
+    }
+
+    fn ioctl_device(
+        &mut self,
+        client: ClientId,
+        device_id: DeviceId,
+        ioctl_code: u32,
+        input: &[u8],
+        output: &mut [u8],
+        internal: bool,
+    ) -> Result<ExternalDispatchResult, NtStatus> {
+        self.ioctl_target(client, device_id, None, ioctl_code, input, output, internal)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ioctl_target(
+        &mut self,
+        client: ClientId,
+        device_id: DeviceId,
+        file_id: Option<FileId>,
+        ioctl_code: u32,
+        input: &[u8],
+        output: &mut [u8],
+        internal: bool,
+    ) -> Result<ExternalDispatchResult, NtStatus> {
+        validate_transfer(input.len())?;
+        validate_transfer(output.len())?;
 
         let method = ioctl::method(ioctl_code);
         let mut sysbuf: Vec<u8> = Vec::new();
@@ -118,10 +191,10 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .then_some(direct.as_mut_slice());
         let type3_input_buffer = (method == ioctl::METHOD_NEITHER).then_some(type3.as_mut_slice());
         let user_buffer = (method == ioctl::METHOD_NEITHER).then_some(user.as_mut_slice());
-        let info = self.build_and_dispatch_sync_with_transfer_buffers(
+        let completion = self.build_and_dispatch_external_with_transfer_buffers(
             client,
             device_id,
-            Some(file_id),
+            file_id,
             fn_major,
             params,
             input.len().min(u32::MAX as usize) as u32,
@@ -131,15 +204,17 @@ impl<P: ObjectManagerPort> IoManager<P> {
             type3_input_buffer,
             user_buffer,
         )?;
-        let n = (info as usize).min(output.len());
-        match method {
-            ioctl::METHOD_BUFFERED => output[..n].copy_from_slice(&sysbuf[..n]),
-            ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT => {
-                output[..n].copy_from_slice(&direct[..n])
+        if let ExternalDispatchResult::Completed { information, .. } = completion {
+            let n = (information as usize).min(output.len());
+            match method {
+                ioctl::METHOD_BUFFERED => output[..n].copy_from_slice(&sysbuf[..n]),
+                ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT => {
+                    output[..n].copy_from_slice(&direct[..n])
+                }
+                ioctl::METHOD_NEITHER => output[..n].copy_from_slice(&user[..n]),
+                _ => unreachable!("CTL_CODE method is two bits"),
             }
-            ioctl::METHOD_NEITHER => output[..n].copy_from_slice(&user[..n]),
-            _ => unreachable!("CTL_CODE method is two bits"),
         }
-        Ok(info)
+        Ok(completion)
     }
 }

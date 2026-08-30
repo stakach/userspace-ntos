@@ -256,6 +256,66 @@ impl<P: ObjectManagerPort> IoManager<P> {
         type3_input_buffer: Option<&mut [u8]>,
         user_buffer: Option<&mut [u8]>,
     ) -> Result<u64, NtStatus> {
+        let (irp_id, outcome) = self.build_and_dispatch_with_transfer_buffers(
+            client,
+            device_id,
+            file_id,
+            major,
+            params,
+            input_len,
+            output_len,
+            system_buffer,
+            direct_buffer,
+            type3_input_buffer,
+            user_buffer,
+        )?;
+        self.complete_sync(irp_id, outcome)
+    }
+
+    pub(crate) fn build_and_dispatch_external_with_transfer_buffers(
+        &mut self,
+        client: ClientId,
+        device_id: DeviceId,
+        file_id: Option<FileId>,
+        major: u8,
+        params: IoParameters,
+        input_len: u32,
+        output_len: u32,
+        system_buffer: &mut [u8],
+        direct_buffer: Option<&mut [u8]>,
+        type3_input_buffer: Option<&mut [u8]>,
+        user_buffer: Option<&mut [u8]>,
+    ) -> Result<crate::ExternalDispatchResult, NtStatus> {
+        let (irp_id, outcome) = self.build_and_dispatch_with_transfer_buffers(
+            client,
+            device_id,
+            file_id,
+            major,
+            params,
+            input_len,
+            output_len,
+            system_buffer,
+            direct_buffer,
+            type3_input_buffer,
+            user_buffer,
+        )?;
+        Ok(self.complete_external_dispatch(irp_id, outcome))
+    }
+
+    fn build_and_dispatch_with_transfer_buffers(
+        &mut self,
+        client: ClientId,
+        device_id: DeviceId,
+        file_id: Option<FileId>,
+        major: u8,
+        params: IoParameters,
+        input_len: u32,
+        output_len: u32,
+        system_buffer: &mut [u8],
+        direct_buffer: Option<&mut [u8]>,
+        type3_input_buffer: Option<&mut [u8]>,
+        user_buffer: Option<&mut [u8]>,
+    ) -> Result<(IrpId, Result<DispatchOutcome, NtStatus>), NtStatus> {
         let driver_id = self
             .device(device_id)
             .ok_or(NtStatus::INVALID_PARAMETER)?
@@ -301,7 +361,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             type3_input_buffer,
             user_buffer,
         );
-        self.complete_sync(irp_id, outcome)
+        Ok((irp_id, outcome))
     }
 
     /// Apply a synchronous dispatch outcome to `irp_id`, freeing it, and return

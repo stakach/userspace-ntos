@@ -10,6 +10,14 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+mod pci_routing;
+
+pub use pci_routing::{
+    parse_interrupt_resource_template, parse_pci_routing_table, resolve_pci_routing_table,
+    InterruptResource, InterruptSource, LegacyIrqOverride, PciInterruptLink, PciRouteSource,
+    PciRoutingEntry, PciRoutingError, PciRoutingTable, ResolvedPciRoute,
+};
+
 pub const SDT_HEADER_LEN: usize = 36;
 pub const FADT_SIGNATURE: [u8; 4] = *b"FACP";
 pub const DSDT_SIGNATURE: [u8; 4] = *b"DSDT";
