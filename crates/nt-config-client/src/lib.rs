@@ -3,8 +3,8 @@
 //! Encodes each call into the [`nt_config_abi`] wire form, hands it to a pluggable
 //! [`Backend`] (SURT rings on the kernel; in-process in tests), and decodes the
 //! [`CmReply`]. Supports path-addressed keys plus DWORD and raw typed values. Mirrors
-//! `nt-object-client`, with semantic devnode property queries that preserve required
-//! output length across the shared-frame transport.
+//! `nt-object-client`, with semantic devnode property queries that preserve required output length
+//! across the shared-frame transport and CM-owned SYSTEM key leases for native registry handles.
 
 #![no_std]
 
@@ -15,12 +15,13 @@ use alloc::vec::Vec;
 
 use nt_config_abi::{
     device_property_transfer, driver_service_class, driver_service_transfer, hive_import_transfer,
-    hive_key_transfer, hive_mount, hive_mutation_flags, hive_mutation_kind, hive_mutation_transfer,
-    launch_plan_kind, launch_plan_transfer, network_plan_kind, opcode, pnp_query_kind,
-    pnp_query_transfer, win32_service_plan_kind, win32_service_process_kind,
-    CmDevicePropertyRequest, CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveImportRequest,
-    CmHiveKeyRequest, CmHiveMutationRecord, CmHiveMutationRequest, CmKeyRequest,
-    CmLaunchPlanRequest, CmPnpQueryRequest, CmRawValueRequest, CmReply, CmValueRequest,
+    hive_key_lease_operation, hive_key_transfer, hive_mount, hive_mutation_flags,
+    hive_mutation_kind, hive_mutation_transfer, launch_plan_kind, launch_plan_transfer,
+    network_plan_kind, opcode, pnp_query_kind, pnp_query_transfer, win32_service_plan_kind,
+    win32_service_process_kind, CmDevicePropertyRequest, CmDriverServiceRequest,
+    CmEnumerateKeyRequest, CmHiveImportRequest, CmHiveKeyLeaseRequest, CmHiveKeyRequest,
+    CmHiveMutationRecord, CmHiveMutationRequest, CmKeyRequest, CmLaunchPlanRequest,
+    CmLeasedHiveKeyRequest, CmPnpQueryRequest, CmRawValueRequest, CmReply, CmValueRequest,
     CM_ABI_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_DRIVER_SERVICE_CHUNK_BYTES,
     CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_MAGIC,
     CM_DRIVER_SERVICE_SNAPSHOT_VERSION, CM_HIVE_IMPORT_CHUNK_BYTES, CM_HIVE_KEY_CHUNK_BYTES,
@@ -191,6 +192,13 @@ pub struct HiveKeySnapshot {
     pub security_descriptor: Option<Vec<u8>>,
     pub subkeys: Vec<HiveSubkeySnapshot>,
     pub values: Vec<HiveValueSnapshot>,
+}
+
+/// Opaque CM-owned identity for one open key in the mounted SYSTEM hive.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SystemHiveKeyLease {
+    pub token: u64,
+    pub opened_generation: u64,
 }
 
 struct SnapshotReader<'a> {
@@ -1166,6 +1174,151 @@ impl<B: Backend> ConfigClient<B> {
         Ok(commit.detail0)
     }
 
+    /// Acquire one stable CM-owned key identity from the mounted SYSTEM hive.
+    pub fn open_system_hive_key(&mut self, path: &str) -> Result<SystemHiveKeyLease, i32> {
+        let path_bytes = utf16_bytes(path);
+        if path_bytes.is_empty()
+            || path_bytes.len() > CM_MAX_HIVE_PATH_UNITS * 2
+            || path.chars().any(|ch| ch == '\0')
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let header_size = core::mem::size_of::<CmHiveKeyLeaseRequest>();
+        let request_header = CmHiveKeyLeaseRequest {
+            abi_size: header_size as u16,
+            abi_version: CM_ABI_VERSION,
+            operation: hive_key_lease_operation::OPEN,
+            mount: hive_mount::SYSTEM,
+            path_offset: header_size as u32,
+            path_len_bytes: u32::try_from(path_bytes.len())
+                .map_err(|_| STATUS_INVALID_PARAMETER)?,
+            lease_token: 0,
+        };
+        let mut request = Vec::new();
+        request
+            .try_reserve_exact(header_size.saturating_add(path_bytes.len()))
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        request.extend_from_slice(request_header.as_bytes());
+        request.extend_from_slice(&path_bytes);
+        let response = self
+            .backend
+            .call(opcode::CM_OP_SYSTEM_HIVE_KEY_LEASE, &request, &mut []);
+        if response.status != STATUS_SUCCESS {
+            return Err(response.status);
+        }
+        if response.detail0 == 0 || response.detail1 == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok(SystemHiveKeyLease {
+            token: response.detail1,
+            opened_generation: response.detail0,
+        })
+    }
+
+    /// Release exactly one CM-owned SYSTEM key identity.
+    pub fn close_system_hive_key(&mut self, lease: SystemHiveKeyLease) -> Result<u64, i32> {
+        if lease.token == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let header_size = core::mem::size_of::<CmHiveKeyLeaseRequest>();
+        let request = CmHiveKeyLeaseRequest {
+            abi_size: header_size as u16,
+            abi_version: CM_ABI_VERSION,
+            operation: hive_key_lease_operation::CLOSE,
+            mount: hive_mount::SYSTEM,
+            path_offset: 0,
+            path_len_bytes: 0,
+            lease_token: lease.token,
+        };
+        let response = self.backend.call(
+            opcode::CM_OP_SYSTEM_HIVE_KEY_LEASE,
+            request.as_bytes(),
+            &mut [],
+        );
+        if response.status != STATUS_SUCCESS {
+            return Err(response.status);
+        }
+        if response.detail0 == 0 || response.detail1 != lease.token {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok(response.detail0)
+    }
+
+    /// Read a complete immutable snapshot through one CM-owned SYSTEM key identity.
+    pub fn query_leased_system_hive_key(
+        &mut self,
+        lease: SystemHiveKeyLease,
+    ) -> Result<HiveKeySnapshot, i32> {
+        if lease.token == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let mut value = Vec::new();
+        let mut expected_total = None;
+        let mut token = 0u64;
+        let mut reply_bytes = [0u8; CM_HIVE_KEY_CHUNK_BYTES];
+        loop {
+            let operation = if token == 0 {
+                hive_key_transfer::BEGIN
+            } else {
+                hive_key_transfer::PULL
+            };
+            let offset = value.len();
+            let response = match self.leased_hive_key_call(
+                lease.token,
+                operation,
+                token,
+                u32::try_from(offset).map_err(|_| STATUS_INVALID_PARAMETER)?,
+                CM_HIVE_KEY_CHUNK_BYTES as u32,
+                &mut reply_bytes,
+            ) {
+                Ok(response) => response,
+                Err(status) => {
+                    self.abort_leased_hive_key(lease.token, token);
+                    return Err(status);
+                }
+            };
+            if response.status != STATUS_SUCCESS {
+                self.abort_leased_hive_key(lease.token, token);
+                return Err(response.status);
+            }
+            let total = usize::try_from(response.detail0).map_err(|_| STATUS_INVALID_PARAMETER)?;
+            let written = response.information as usize;
+            let reply_token_valid = if token == 0 {
+                (written == total && response.detail1 == 0)
+                    || (written < total && response.detail1 != 0)
+            } else {
+                response.detail1 == token
+            };
+            if total < CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES
+                || expected_total.is_some_and(|expected| expected != total)
+                || !reply_token_valid
+                || written > reply_bytes.len()
+                || offset.checked_add(written).is_none_or(|end| end > total)
+                || (offset < total && written == 0)
+            {
+                self.abort_leased_hive_key(
+                    lease.token,
+                    if token == 0 { response.detail1 } else { token },
+                );
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            if expected_total.is_none() {
+                if value.try_reserve_exact(total).is_err() {
+                    self.abort_leased_hive_key(lease.token, response.detail1);
+                    return Err(STATUS_INSUFFICIENT_RESOURCES);
+                }
+                expected_total = Some(total);
+            }
+            value.extend_from_slice(&reply_bytes[..written]);
+            if value.len() == total {
+                return decode_hive_key_snapshot(&value).ok_or(STATUS_INVALID_PARAMETER);
+            }
+            if token == 0 {
+                token = response.detail1;
+            }
+        }
+    }
+
     /// Read a complete immutable snapshot of one key in the CM-owned mounted SYSTEM hive.
     pub fn query_system_hive_key(&mut self, path: &str) -> Result<HiveKeySnapshot, i32> {
         let path_bytes = utf16_bytes(path);
@@ -1680,6 +1833,50 @@ impl<B: Backend> ConfigClient<B> {
         );
     }
 
+    fn leased_hive_key_call(
+        &mut self,
+        key_lease_token: u64,
+        operation: u16,
+        transfer_token: u64,
+        value_offset: u32,
+        chunk_capacity: u32,
+        reply_bytes: &mut [u8],
+    ) -> Result<CmReply, i32> {
+        if key_lease_token == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let header_size = core::mem::size_of::<CmLeasedHiveKeyRequest>();
+        let request = CmLeasedHiveKeyRequest {
+            abi_size: header_size as u16,
+            abi_version: CM_ABI_VERSION,
+            operation,
+            mount: hive_mount::SYSTEM,
+            value_offset,
+            chunk_capacity,
+            key_lease_token,
+            transfer_token,
+        };
+        Ok(self.backend.call(
+            opcode::CM_OP_QUERY_LEASED_HIVE_KEY,
+            request.as_bytes(),
+            reply_bytes,
+        ))
+    }
+
+    fn abort_leased_hive_key(&mut self, key_lease_token: u64, transfer_token: u64) {
+        if key_lease_token == 0 || transfer_token == 0 {
+            return;
+        }
+        let _ = self.leased_hive_key_call(
+            key_lease_token,
+            hive_key_transfer::ABORT,
+            transfer_token,
+            0,
+            0,
+            &mut [],
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn pnp_query_call(
         &mut self,
@@ -2044,6 +2241,96 @@ mod tests {
             .unwrap();
         assert_eq!(selected.mount_generation, snapshot.mount_generation);
         assert_eq!(selected.values, snapshot.values);
+    }
+
+    #[test]
+    fn system_key_lease_preserves_physical_identity_until_close_or_mount_replacement() {
+        const STATUS_INVALID_HANDLE: i32 = 0xC000_0008u32 as i32;
+
+        let mut hive = Hive::new(HiveKind::System);
+        let select = hive.create_key("Select");
+        hive.set_dword(select, "Current", 1);
+        let first = hive.create_key(r"ControlSet001\Services\Stable");
+        hive.set_dword(first, "Identity", 1);
+        let second = hive.create_key(r"ControlSet002\Services\Stable");
+        hive.set_dword(second, "Identity", 2);
+        hive.finish_clean_import();
+
+        let mut client = client();
+        assert_eq!(client.import_system_hive(&encode_image(&hive)), Ok(1));
+        let lease = client
+            .open_system_hive_key(r"\Registry\Machine\System\CurrentControlSet\Services\Stable")
+            .unwrap();
+        assert_eq!(lease.opened_generation, 1);
+        let leased = client.query_leased_system_hive_key(lease).unwrap();
+        assert_eq!(
+            leased.path,
+            r"\Registry\Machine\System\ControlSet001\Services\Stable"
+        );
+        assert_eq!(leased.mount_generation, 1);
+
+        let generation = client
+            .mutate_system_hive(
+                1,
+                &[
+                    SystemHiveMutation::SetValue {
+                        path: r"\Registry\Machine\System\ControlSet001\Services\Stable",
+                        name: "LeasedMutation",
+                        value_type: RegistryValueType::Dword as u32,
+                        data: &17u32.to_le_bytes(),
+                    },
+                    SystemHiveMutation::SetValue {
+                        path: r"\Registry\Machine\System\Select",
+                        name: "Current",
+                        value_type: RegistryValueType::Dword as u32,
+                        data: &2u32.to_le_bytes(),
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(generation, 2);
+
+        let leased = client.query_leased_system_hive_key(lease).unwrap();
+        assert_eq!(leased.mount_generation, 2);
+        assert_eq!(
+            leased.path,
+            r"\Registry\Machine\System\ControlSet001\Services\Stable"
+        );
+        assert!(leased
+            .values
+            .iter()
+            .any(|value| value.name == "LeasedMutation"));
+        let selected = client
+            .query_system_hive_key(r"\Registry\Machine\System\CurrentControlSet\Services\Stable")
+            .unwrap();
+        assert!(selected.path.contains("CurrentControlSet"));
+        assert_eq!(
+            selected
+                .values
+                .iter()
+                .find(|value| value.name == "Identity")
+                .map(|value| value.data.as_slice()),
+            Some(2u32.to_le_bytes().as_slice())
+        );
+
+        assert_eq!(client.close_system_hive_key(lease), Ok(2));
+        assert_eq!(
+            client.query_leased_system_hive_key(lease),
+            Err(STATUS_INVALID_HANDLE)
+        );
+
+        let stale = client
+            .open_system_hive_key(r"\Registry\Machine\System\ControlSet002\Services\Stable")
+            .unwrap();
+        assert_eq!(client.import_system_hive(&encode_image(&hive)), Ok(3));
+        assert_eq!(
+            client.query_leased_system_hive_key(stale),
+            Err(STATUS_INVALID_HANDLE)
+        );
+        assert_eq!(
+            client.close_system_hive_key(stale),
+            Err(STATUS_INVALID_HANDLE)
+        );
     }
 
     #[test]

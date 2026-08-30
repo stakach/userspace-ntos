@@ -2976,7 +2976,10 @@ existing synchronous DMA/PnP fixture so the two lifecycle modes remain independe
   control set onto that selected destination, preserve real REGF key class/security metadata
   through mutable-hive import and image transport, and only then publish the single composed image.
   No `ControlSet001` default, generated-only mount, or metadata-dropping import may remain as a
-  fallback.
+  fallback. Those selection/composition/read boundaries are closed; D5 remains open because native
+  SYSTEM key handles and persistence still retain an executive mirror after CM-first mutation. CM
+  now has the crate-tested opaque key-lease boundary required to migrate those handles without
+  reducing an open key to a path that can be retargeted by a later control-set selection change.
 
 ## Immediate Iteration
 
@@ -17665,3 +17668,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     must select across processes, write dirty transition pages to real swap slots, replace opaque frame
     backing transactionally, and return frames to the physical allocator. That work must stay in MM and
     must not add process-name policy or weaken the now-accepted job boundary.
+
+    CM-owned SYSTEM key lease foundation (2026-08-30, focused validation accepted; executive
+    integration remains): `nt-config-abi`, `nt-config-server`, and `nt-config-client` now expose
+    separate acquire/release and immutable-snapshot protocols for native handles into the mounted
+    SYSTEM hive. A growable CM-owned lease bank retains the stable hive `CellId` and its resolved
+    physical path; it does not retain only the caller's `CurrentControlSet` spelling. Each snapshot
+    transfer has an independent token and shares the existing bounded concurrent-reader budget.
+
+    In-place hive mutations preserve leases. A host integration proof opens
+    `CurrentControlSet\\Services\\Stable`, changes `Select\\Current` from control set 1 to 2, and
+    verifies that the lease still snapshots physical `ControlSet001` while a new path query selects
+    `ControlSet002`. Exact close rejects later use, successful whole-hive replacement invalidates all
+    old cell identities, failed operations do not borrow another token, and snapshot encoding keeps
+    class, security, subkeys, typed values, physical path, and current mount generation. Focused
+    validation passes `nt-config-abi` `4/4`, `nt-config-server` `22/22`, and `nt-config-client`
+    `16/16`; the freestanding executive release check passes at the established 209-warning baseline.
+
+    Review adjustment: wire these leases into the executive's native registry handle target table
+    next. SYSTEM opens/creates must acquire one CM lease, queries/enumeration/security must read an
+    immutable leased snapshot, relative opens must use the snapshot's physical path, and final Object
+    Manager handle release must close exactly that lease. Continue using CM's generation-checked
+    mutation transaction for writes. Delete the executive SYSTEM-handle cell identity only when every
+    native SYSTEM operation crosses this boundary; do not add a path-only handle, dual-write fallback,
+    fixed lease ceiling, or automatic reopen after mount replacement.
