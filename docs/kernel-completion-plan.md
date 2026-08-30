@@ -2985,10 +2985,11 @@ existing synchronous DMA/PnP fixture so the two lifecycle modes remain independe
   storage provider atomically replaces and flushes the image and truncates and flushes the replay
   log. Hosted win32k registry imports now use a pointer-free pump protocol whose executive-owned
   handles carry exact CM leases; win32k no longer maps or parses the raw SYSTEM hive. D5 remains open
-  because several executive boot/setup consumers and checkpoint scheduling paths still depend on
-  the compatibility mirror. Migrate those consumers, then delete mirror replay/storage and
-  projection diagnostics together; never reduce a live key to a reopenable path or retain a second
-  mutation authority.
+  because several executive boot/setup consumers still depend on the compatibility mirror.
+  SYSTEM dirty state, checkpoint admission, and checkpoint acknowledgement are now exclusively
+  CM-owned; the executive schedules only the other mounted hives by local dirty-cell count. Migrate
+  the remaining SYSTEM consumers, then delete mirror replay/storage and projection diagnostics
+  together; never reduce a live key to a reopenable path or retain a second mutation authority.
 
 ## Immediate Iteration
 
@@ -17909,3 +17910,35 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `MutableHiveSet` for SOFTWARE, SECURITY, SAM, DEFAULT, and dynamically loaded user hives until
     their own ownership work is explicitly planned; do not broaden SYSTEM retirement into unrelated
     hive behavior.
+
+    CM-owned SYSTEM dirty-state acceptance (2026-08-30): the executive no longer acknowledges a
+    checkpoint against its compatibility hive, compares CM clean state with mirror dirty cells,
+    includes SYSTEM in boot-hive dirty totals, sizes SYSTEM checkpoint headroom from a mirror image,
+    or carries SYSTEM in its pending/dirty boot-hive masks. `NtFlushKey` now recognizes a native CM
+    lease handle directly and asks CM to export if dirty; a clean CM response is the correct
+    successful no-op. Volatile-key flush-all and quiesce likewise ask CM independently, while their
+    existing dirty-cell candidate scheduler is explicitly limited to SOFTWARE, SECURITY, SAM, and
+    DEFAULT. Quiesce enters the CM checkpoint path whenever durable journal records are pending, so
+    future deletion of mirror replay cannot suppress publication. The executive remains only the
+    bounded stream's storage transport and writable-volume commit coordinator.
+
+    Serialized acceptance `.tmp/run-headless-cm-dirty-authority-20260830.log` reaches the genuine
+    Explorer desktop with all `299/299` checks passing and the sentinel matched. The workload
+    exercises four authoritative CM SYSTEM exports: 290812 bytes at generation 212/sequence 399,
+    two 466804-byte exports at generations 2487 and 2488, and the final 472616-byte export at
+    generation 2535/sequence 3039. Final quiesce reports 148 dirty cells solely from non-SYSTEM
+    hives; `NtFlushKey` completes four calls with zero boot-checkpoint failure. CM accepts all 2532
+    runtime transactions with zero rejection or projection failure, and native lease accounting is
+    `1337/1335/2/0` acquire/close/live/failure. Explorer completes 683 real api0 redirects with zero
+    callback or dead-callback failures, installs 18 client WndProcs without replay, reaches paint
+    begin/end `5/20` with 187 direct GDI returns and 135 batch flushes covering 184 records, and
+    paints all `786432/786432` framebuffer pixels with at least 32 colours.
+
+    Review adjustment: CM dirty/checkpoint state is accepted as the sole SYSTEM authority. The next
+    D5 slice should move `CollectSystemSetupSeedTarget` existence/value comparisons and native
+    SYSTEM open/create discovery off `mutable_hives`, using cached exact CM leases and narrow value
+    records rather than whole-key snapshots. Once no control-flow decision consumes the projected
+    SYSTEM tree, delete post-publish journal replay, the SYSTEM `MutableHiveSet` mount, and the final
+    projection-failure diagnostic together. Keep the original read-only REGF image only where a
+    separately identified boot-composition consumer still requires it; do not treat it as a runtime
+    registry fallback.

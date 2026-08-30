@@ -4793,7 +4793,6 @@ impl ExecNtHandler {
 
     fn boot_mutable_hive_pending_bit(hive_sel: u32) -> Option<u8> {
         match hive_sel {
-            HIVE_SEL_SYSTEM => Some(1 << 0),
             HIVE_SEL_SOFTWARE => Some(1 << 1),
             HIVE_SEL_SECURITY => Some(1 << 2),
             HIVE_SEL_SAM => Some(1 << 3),
@@ -5886,21 +5885,10 @@ impl ExecNtHandler {
         mounted
     }
 
-    fn checkpoint_system_hive_from_config_manager(
-        &mut self,
-        file_path: &str,
-        dirty_cells: usize,
-    ) -> u32 {
+    fn checkpoint_system_hive_from_config_manager(&mut self) -> u32 {
         let mut prepared = match unsafe { crate::config_manager_prepare_system_hive_checkpoint() } {
             Ok(Some(prepared)) => prepared,
-            Ok(None) => {
-                CM_RUNTIME_SYSTEM_PROJECTION_FAILURES.fetch_add(1, Ordering::Relaxed);
-                REG_FLUSH_KEY_BOOT_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
-                print_str(
-                    b"[cm-flush] CM reported clean SYSTEM while executive mirror is dirty\n",
-                );
-                return STATUS_UNSUCCESSFUL;
-            }
+            Ok(None) => return nt_fs::STATUS_SUCCESS,
             Err(status) => {
                 REG_FLUSH_KEY_BOOT_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
                 return status as u32;
@@ -5908,7 +5896,9 @@ impl ExecNtHandler {
         };
         let image_len = prepared.image.len();
         let image = core::mem::take(&mut prepared.image);
-        let mut provider = crate::writable_fs::WritableHiveIoProvider::new(file_path);
+        let mut provider = crate::writable_fs::WritableHiveIoProvider::new(
+            crate::writable_fs::CONFIG_SYSTEM_HIVE_PATH,
+        );
         let persist =
             nt_hive_core::HiveIoProvider::write_primary_image_atomic_owned(&mut provider, image)
                 .and_then(|()| nt_hive_core::HiveIoProvider::flush_image(&mut provider))
@@ -5918,7 +5908,7 @@ impl ExecNtHandler {
             unsafe { crate::config_manager_abort_system_hive_checkpoint(&prepared) };
             REG_FLUSH_KEY_BOOT_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
             print_str(b"[cm-flush] CM-owned SYSTEM checkpoint persistence failed path=");
-            print_ascii_str(file_path);
+            print_ascii_str(crate::writable_fs::CONFIG_SYSTEM_HIVE_PATH);
             print_str(b"\n");
             return Self::mutable_hive_journal_status(err);
         }
@@ -5933,40 +5923,31 @@ impl ExecNtHandler {
             return status as u32;
         }
 
-        let compatibility_ok = self
-            .mutable_hives
-            .hive_mut(HIVE_SEL_SYSTEM)
-            .is_some_and(|hive| {
-                hive.acknowledge_checkpoint(prepared.hive_sequence, prepared.image_generation)
-            });
-        if !compatibility_ok {
-            CM_RUNTIME_SYSTEM_PROJECTION_FAILURES.fetch_add(1, Ordering::Relaxed);
-            print_str(b"[cm-flush] executive SYSTEM mirror checkpoint acknowledgement failed\n");
-        }
         self.writable_fs_dirty = true;
         self.writable_fs_commit_required = true;
         REG_FLUSH_KEY_BOOT_HIVE_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
         REG_FLUSH_KEY_BOOT_HIVE_BYTES.store(image_len as u64, Ordering::Relaxed);
-        if let Some(bit) = Self::boot_mutable_hive_pending_bit(HIVE_SEL_SYSTEM) {
-            self.mutable_hive_journal_pending_boot_mask &= !bit;
-            self.mutable_hive_journal_dirty_boot_mask &= !bit;
-        }
         print_str(b"[cm-flush] CM-owned SYSTEM checkpoint ");
         print_u64(image_len as u64);
-        print_str(b"B dirty-cells=");
-        print_u64(dirty_cells as u64);
-        print_str(b" generation=");
+        print_str(b"B generation=");
         print_u64(prepared.mount_generation);
         print_str(b" sequence=");
         print_u64(prepared.hive_sequence);
         print_str(b" path=");
-        print_ascii_str(file_path);
+        print_ascii_str(crate::writable_fs::CONFIG_SYSTEM_HIVE_PATH);
         print_str(b"\n");
         nt_fs::STATUS_SUCCESS
     }
 
-    fn checkpoint_boot_mutable_hive(&mut self, hive_sel: u32, dirty_cells: usize) -> u32 {
+    fn checkpoint_non_system_boot_mutable_hive(
+        &mut self,
+        hive_sel: u32,
+        dirty_cells: usize,
+    ) -> u32 {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        if hive_sel == HIVE_SEL_SYSTEM {
+            return STATUS_INVALID_HANDLE;
+        }
         if dirty_cells == 0 {
             return nt_fs::STATUS_SUCCESS;
         }
@@ -5980,9 +5961,6 @@ impl ExecNtHandler {
         print_str(b" path=");
         print_ascii_str(file_path);
         print_str(b"\n");
-        if hive_sel == HIVE_SEL_SYSTEM {
-            return self.checkpoint_system_hive_from_config_manager(file_path, dirty_cells);
-        }
         let image_len = {
             let Some(hive) = self.mutable_hives.hive(hive_sel) else {
                 return STATUS_INVALID_HANDLE;
@@ -6087,7 +6065,6 @@ impl ExecNtHandler {
         let mut durable_bytes = 0usize;
         let mut counted_mask = 0u8;
         for hive_sel in [
-            HIVE_SEL_SYSTEM,
             HIVE_SEL_SOFTWARE,
             HIVE_SEL_SECURITY,
             HIVE_SEL_SAM,
@@ -6146,7 +6123,7 @@ impl ExecNtHandler {
         self.mutable_hive_journal_pending_boot_mask = 0;
     }
 
-    fn checkpoint_boot_mutable_hive_preserving_headroom(
+    fn checkpoint_non_system_boot_mutable_hive_preserving_headroom(
         &mut self,
         hive_sel: u32,
         dirty_cells: usize,
@@ -6185,16 +6162,19 @@ impl ExecNtHandler {
             print_str(b"\n");
             return nt_fs::STATUS_INSUFFICIENT_RESOURCES;
         }
-        self.checkpoint_boot_mutable_hive(hive_sel, dirty_cells)
+        self.checkpoint_non_system_boot_mutable_hive(hive_sel, dirty_cells)
     }
 
     fn flush_all_mutable_hives_preserving_headroom(
         &mut self,
         min_post_checkpoint_headroom: usize,
     ) -> u32 {
+        let system_status = self.checkpoint_system_hive_from_config_manager();
+        if system_status != nt_fs::STATUS_SUCCESS {
+            return system_status;
+        }
         let mut total_dirty = 0usize;
         for hive_sel in [
-            HIVE_SEL_SYSTEM,
             HIVE_SEL_SOFTWARE,
             HIVE_SEL_SECURITY,
             HIVE_SEL_SAM,
@@ -6205,7 +6185,7 @@ impl ExecNtHandler {
                 .hive(hive_sel)
                 .map_or(0, |hive| hive.dirty_count());
             total_dirty = total_dirty.saturating_add(dirty);
-            let status = self.checkpoint_boot_mutable_hive_preserving_headroom(
+            let status = self.checkpoint_non_system_boot_mutable_hive_preserving_headroom(
                 hive_sel,
                 dirty,
                 min_post_checkpoint_headroom,
@@ -6240,16 +6220,19 @@ impl ExecNtHandler {
         }
 
         const MIN_POST_BOOT_HIVE_PRIMARY_SEED_HEADROOM: usize = 0x18_0000;
-        const HIVE_SELS: [u32; 5] = [
-            HIVE_SEL_SYSTEM,
+        const HIVE_SELS: [u32; 4] = [
             HIVE_SEL_SOFTWARE,
             HIVE_SEL_SECURITY,
             HIVE_SEL_SAM,
             HIVE_SEL_USER_DEFAULT,
         ];
 
+        let system_status = self.checkpoint_system_hive_from_config_manager();
+        if system_status != nt_fs::STATUS_SUCCESS {
+            return system_status;
+        }
         let mut total_dirty = 0usize;
-        let mut candidates = [None; 5];
+        let mut candidates = [None; 4];
         let mut candidate_len = 0usize;
         for hive_sel in HIVE_SELS {
             let dirty = self
@@ -6303,7 +6286,8 @@ impl ExecNtHandler {
             let Some((index, candidate)) = selected else {
                 break;
             };
-            let status = self.checkpoint_boot_mutable_hive(candidate.hive_sel, candidate.dirty);
+            let status =
+                self.checkpoint_non_system_boot_mutable_hive(candidate.hive_sel, candidate.dirty);
             if status != nt_fs::STATUS_SUCCESS {
                 return status;
             }
@@ -6325,7 +6309,6 @@ impl ExecNtHandler {
     pub(crate) fn boot_mutable_hive_dirty_cells(&self) -> usize {
         let mut total_dirty = 0usize;
         for hive_sel in [
-            HIVE_SEL_SYSTEM,
             HIVE_SEL_SOFTWARE,
             HIVE_SEL_SECURITY,
             HIVE_SEL_SAM,
@@ -32723,6 +32706,13 @@ impl ExecNtHandler {
                             return status;
                         }
                     }
+                } else if self.cm_system_key_target(key).is_some() {
+                    REG_FLUSH_KEY_MUTABLE.fetch_add(1, Ordering::Relaxed);
+                    REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.store(0, Ordering::Relaxed);
+                    let status = self.checkpoint_system_hive_from_config_manager();
+                    if status != nt_fs::STATUS_SUCCESS {
+                        return status;
+                    }
                 } else if let Some(mutable_key) = self.mutable_registry_key(key) {
                     REG_FLUSH_KEY_MUTABLE.fetch_add(1, Ordering::Relaxed);
                     let dirty = self
@@ -32736,7 +32726,8 @@ impl ExecNtHandler {
                             return status;
                         }
                     } else {
-                        let status = self.checkpoint_boot_mutable_hive_preserving_headroom(
+                        let status = self
+                            .checkpoint_non_system_boot_mutable_hive_preserving_headroom(
                             mutable_key.hive,
                             dirty,
                             BOOT_HIVE_FLUSH_POST_CHECKPOINT_HEADROOM,
