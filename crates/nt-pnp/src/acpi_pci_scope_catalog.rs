@@ -4,6 +4,24 @@ use nt_acpi::AcpiNamespacePath;
 
 use crate::{PciInventory, PciLocation};
 
+/// Complete authenticated identity of the hosted ACPI PDO used as the evaluation endpoint.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AcpiPciProviderEndpoint {
+    pub device_id: u64,
+    pub hosted_domain_id: u64,
+    pub hosted_domain_cookie: u64,
+    pub pdo_object: u64,
+}
+
+impl AcpiPciProviderEndpoint {
+    fn is_valid(self) -> bool {
+        self.device_id != 0
+            && self.hosted_domain_id != 0
+            && self.hosted_domain_cookie != 0
+            && self.pdo_object != 0
+    }
+}
+
 /// Provider facts evaluated on one exact ACPI PCI-root PDO.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcpiPciRootScopeFact {
@@ -22,7 +40,7 @@ pub struct AcpiPciBridgeScopeFact {
 /// Complete provider-owned scope facts for one ACPI PCI-root PDO endpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcpiPciScopeSource {
-    pub provider_pdo_device_id: u64,
+    pub endpoint: AcpiPciProviderEndpoint,
     pub root: AcpiPciRootScopeFact,
     pub bridges: Vec<AcpiPciBridgeScopeFact>,
 }
@@ -30,7 +48,7 @@ pub struct AcpiPciScopeSource {
 /// One ACPI routing scope correlated to an exact live PCI bus.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcpiPciResolvedScope {
-    pub provider_pdo_device_id: u64,
+    pub endpoint: AcpiPciProviderEndpoint,
     pub path: AcpiNamespacePath,
     pub segment: u16,
     pub bus: u8,
@@ -43,7 +61,7 @@ pub enum AcpiPciScopeError {
     InvalidProviderEndpoint,
     InvalidBridgeAddress(u64),
     BridgeOutsideRoot,
-    DuplicateProviderEndpoint(u64),
+    DuplicateProviderEndpoint(AcpiPciProviderEndpoint),
     DuplicateNamespacePath,
     GenerationExhausted,
     StaleCatalog,
@@ -139,7 +157,7 @@ impl AcpiPciScopeCatalog {
         next.extend(
             self.sources
                 .iter()
-                .filter(|accepted| accepted.provider_pdo_device_id != source.provider_pdo_device_id)
+                .filter(|accepted| accepted.endpoint != source.endpoint)
                 .cloned(),
         );
         next.push(source);
@@ -148,9 +166,9 @@ impl AcpiPciScopeCatalog {
 
     pub fn prepare_remove_source(
         &self,
-        provider_pdo_device_id: u64,
+        endpoint: AcpiPciProviderEndpoint,
     ) -> Result<PreparedAcpiPciScopeCatalogUpdate, AcpiPciScopeError> {
-        if provider_pdo_device_id == 0 {
+        if !endpoint.is_valid() {
             return Err(AcpiPciScopeError::InvalidProviderEndpoint);
         }
         let mut next = Vec::new();
@@ -159,7 +177,7 @@ impl AcpiPciScopeCatalog {
         next.extend(
             self.sources
                 .iter()
-                .filter(|source| source.provider_pdo_device_id != provider_pdo_device_id)
+                .filter(|source| source.endpoint != endpoint)
                 .cloned(),
         );
         self.prepare_complete(next)
@@ -233,7 +251,7 @@ impl AcpiPciScopeCatalog {
             push_resolved_scope(
                 &mut scopes,
                 AcpiPciResolvedScope {
-                    provider_pdo_device_id: source.provider_pdo_device_id,
+                    endpoint: source.endpoint,
                     path: source.root.path.clone(),
                     segment: source.root.segment,
                     bus: source.root.base_bus,
@@ -245,7 +263,7 @@ impl AcpiPciScopeCatalog {
                 let parent = scopes
                     .iter()
                     .filter(|scope| {
-                        scope.provider_pdo_device_id == source.provider_pdo_device_id
+                        scope.endpoint == source.endpoint
                             && strict_descendant(bridge_fact.path.as_str(), scope.path.as_str())
                     })
                     .max_by_key(|scope| scope.path.as_str().len())
@@ -266,7 +284,7 @@ impl AcpiPciScopeCatalog {
                 push_resolved_scope(
                     &mut scopes,
                     AcpiPciResolvedScope {
-                        provider_pdo_device_id: source.provider_pdo_device_id,
+                        endpoint: source.endpoint,
                         path: bridge_fact.path.clone(),
                         segment: source.root.segment,
                         bus: buses.secondary,
@@ -293,7 +311,7 @@ impl AcpiPciScopeCatalog {
 }
 
 fn canonicalize_source(source: &mut AcpiPciScopeSource) -> Result<(), AcpiPciScopeError> {
-    if source.provider_pdo_device_id == 0 {
+    if !source.endpoint.is_valid() {
         return Err(AcpiPciScopeError::InvalidProviderEndpoint);
     }
     source.bridges.sort_unstable_by(|left, right| {
@@ -323,13 +341,11 @@ fn canonicalize_catalog(sources: &mut [AcpiPciScopeSource]) -> Result<(), AcpiPc
     for source in sources.iter_mut() {
         canonicalize_source(source)?;
     }
-    sources.sort_unstable_by_key(|source| source.provider_pdo_device_id);
+    sources.sort_unstable_by_key(|source| source.endpoint);
     for index in 0..sources.len() {
-        if index != 0
-            && sources[index - 1].provider_pdo_device_id == sources[index].provider_pdo_device_id
-        {
+        if index != 0 && sources[index - 1].endpoint == sources[index].endpoint {
             return Err(AcpiPciScopeError::DuplicateProviderEndpoint(
-                sources[index].provider_pdo_device_id,
+                sources[index].endpoint,
             ));
         }
         for other in 0..index {
@@ -390,9 +406,18 @@ mod tests {
         AcpiNamespacePath::parse(value).unwrap()
     }
 
+    fn provider(device_id: u64) -> AcpiPciProviderEndpoint {
+        AcpiPciProviderEndpoint {
+            device_id,
+            hosted_domain_id: 7,
+            hosted_domain_cookie: 9,
+            pdo_object: 0x1000 + device_id,
+        }
+    }
+
     fn source(provider: u64) -> AcpiPciScopeSource {
         AcpiPciScopeSource {
-            provider_pdo_device_id: provider,
+            endpoint: self::provider(provider),
             root: AcpiPciRootScopeFact {
                 path: path("\\_SB_.PCI0"),
                 segment: 0,
@@ -458,10 +483,33 @@ mod tests {
         assert!(!same.changed());
         assert_eq!(catalog.commit(same), Ok(1));
 
-        let removal = catalog.prepare_remove_source(44).unwrap();
+        let removal = catalog.prepare_remove_source(provider(44)).unwrap();
         assert!(removal.changed());
         assert_eq!(catalog.commit(removal), Ok(2));
         assert!(catalog.sources().is_empty());
+    }
+
+    #[test]
+    fn source_identity_requires_the_complete_authenticated_pdo_endpoint() {
+        let catalog = AcpiPciScopeCatalog::default();
+        let mut invalid = source(44);
+        invalid.endpoint.hosted_domain_cookie = 0;
+        assert_eq!(
+            catalog.prepare_replace_source(invalid),
+            Err(AcpiPciScopeError::InvalidProviderEndpoint)
+        );
+
+        let mut first = source(44);
+        first.bridges.clear();
+        let mut second = first.clone();
+        second.endpoint.hosted_domain_cookie += 1;
+        second.root.path = path("\\_SB_.PCI1");
+        let mut accepted = AcpiPciScopeCatalog::default();
+        let update = accepted.prepare_replace_source(first).unwrap();
+        accepted.commit(update).unwrap();
+        let update = accepted.prepare_replace_source(second).unwrap();
+        accepted.commit(update).unwrap();
+        assert_eq!(accepted.sources().len(), 2);
     }
 
     #[test]
@@ -494,7 +542,7 @@ mod tests {
             )))
         );
 
-        let removal = catalog.prepare_remove_source(44).unwrap();
+        let removal = catalog.prepare_remove_source(provider(44)).unwrap();
         catalog.commit(removal).unwrap();
 
         let mut unsupported = source(45);
@@ -524,7 +572,7 @@ mod tests {
         newer_inventory.commit(inventory_update).unwrap();
         assert!(!resolved.is_current(&catalog, &newer_inventory));
 
-        let removal = catalog.prepare_remove_source(44).unwrap();
+        let removal = catalog.prepare_remove_source(provider(44)).unwrap();
         catalog.commit(removal).unwrap();
         assert!(!resolved.is_current(&catalog, &inventory));
     }

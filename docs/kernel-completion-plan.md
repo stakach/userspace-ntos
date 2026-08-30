@@ -20003,3 +20003,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and before invalidation completion; and schedule one serialized generation-fenced reconciler.
     Runtime ACPI/SCI/desktop acceptance remains open because the active older desktop VM still owns
     the serialized boot lane and was not disturbed.
+
+    B3 authenticated topology-owner checkpoint (2026-08-31, implementation green): catalog source
+    identity is now the complete authenticated hosted PDO endpoint: I/O Manager DeviceId, hosted
+    domain id, hosted-domain freshness cookie, and component PDO object. Zero or partial endpoints
+    are rejected, while coincident DeviceIds in distinct fresh domains remain distinct sources.
+    The route owner now has an immediate invalidation transition that clears accepted routes and
+    their inventory/provider generations before asynchronous replacement work starts. Existing
+    claims fail after the fence, and any replacement prepared before the fence is stale; a fresh
+    complete publication is required to restore route authority. Focused `nt-pnp` validation passes
+    53/53.
+
+    The executive now has a focused `hosted_pci_topology` owner containing the one live
+    `PciInventory`, `AcpiPciScopeCatalog`, and `PciInterruptRouteOwner`. Initial mechanism-1
+    discovery is consumed into the generation-one inventory before boot resource projection. The
+    remaining vector handed to launch/context construction is a fallibly copied immutable
+    observation and cannot act as route identity. Boot logging exposes all three authority
+    generations; no unused future API or new warning is retained. The freestanding executive check
+    remains green at the 209-warning baseline, formatting is clean, and `git diff --check` passes.
+
+    Review adjustment: do not fence every BusRelations request globally. The next relation-state
+    slice must first classify exact `ACPI\\PNP0A03`/`ACPI\\PNP0A08` root PDO endpoints and live PCI
+    bus owners, then call the route invalidation transition at enqueue only for those relevant
+    authorities. Extend the retained query with checked, resumable File-less evaluation phases:
+    exact root `_SEG`/`_BBN` with missing-method-only zero defaults and BusNumber-resource
+    cross-check; multilevel `_ADR`/`_PRT` discovery; full-path `_ADR`/`_PRT` evaluation; and exact
+    link `_CRS`. Prepare the complete catalog update before CM mutation, commit it after the existing
+    devnode/BusRelations commits and before invalidation completion, then schedule the serialized
+    catalog/inventory reconciler. No unrelated relation may churn route generations.

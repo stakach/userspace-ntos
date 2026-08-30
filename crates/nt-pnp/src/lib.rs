@@ -31,8 +31,8 @@ mod pci_interrupt_routes;
 mod pci_inventory;
 
 pub use acpi_pci_scope_catalog::{
-    AcpiPciBridgeScopeFact, AcpiPciResolvedScope, AcpiPciRootScopeFact, AcpiPciScopeCatalog,
-    AcpiPciScopeError, AcpiPciScopeSource, PreparedAcpiPciScopeCatalogUpdate,
+    AcpiPciBridgeScopeFact, AcpiPciProviderEndpoint, AcpiPciResolvedScope, AcpiPciRootScopeFact,
+    AcpiPciScopeCatalog, AcpiPciScopeError, AcpiPciScopeSource, PreparedAcpiPciScopeCatalogUpdate,
     PreparedAcpiPciScopeResolution,
 };
 pub use pci_interrupt_routes::{

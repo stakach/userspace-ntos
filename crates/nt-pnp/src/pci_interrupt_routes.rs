@@ -42,6 +42,7 @@ pub enum PciInterruptRouteError {
     MissingRoute(PciLocation, u8),
     InvalidInventoryPin(PciLocation, u8),
     GenerationExhausted,
+    Invalidated,
     StaleOwner,
     StaleInventory,
     StaleProviderScopes,
@@ -139,6 +140,7 @@ impl PreparedPciInterruptRouteRevocation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PciInterruptRouteOwner {
     generation: u64,
+    accepted: bool,
     inventory_generation: Option<u64>,
     provider_scope_generation: Option<u64>,
     segment: Option<u16>,
@@ -149,6 +151,7 @@ impl Default for PciInterruptRouteOwner {
     fn default() -> Self {
         Self {
             generation: 0,
+            accepted: false,
             inventory_generation: None,
             provider_scope_generation: None,
             segment: None,
@@ -176,6 +179,22 @@ impl PciInterruptRouteOwner {
 
     pub fn routes(&self) -> &[PciInterruptRoute] {
         &self.routes
+    }
+
+    /// Fence every accepted route and retained claim immediately when a relevant ACPI or PCI
+    /// relation is invalidated. Replacement remains a separate fallible prepare/commit operation.
+    pub fn invalidate(&mut self) -> Result<u64, PciInterruptRouteError> {
+        self.accepted = false;
+        self.inventory_generation = None;
+        self.provider_scope_generation = None;
+        self.segment = None;
+        self.routes.clear();
+        let next = self
+            .generation
+            .checked_add(1)
+            .ok_or(PciInterruptRouteError::GenerationExhausted)?;
+        self.generation = next;
+        Ok(next)
     }
 
     /// Prepare routes for the currently accepted inventory. Every present function advertising an
@@ -263,6 +282,7 @@ impl PciInterruptRouteOwner {
             return Err(PciInterruptRouteError::StaleProviderScopes);
         }
         self.generation = prepared.target_generation;
+        self.accepted = true;
         self.inventory_generation = Some(prepared.inventory_generation);
         self.provider_scope_generation = Some(prepared.provider_scope_generation);
         self.segment = Some(prepared.segment);
@@ -275,6 +295,9 @@ impl PciInterruptRouteOwner {
         &self,
         provider_scope_generation: u64,
     ) -> Result<PreparedPciInterruptRouteRevocation, PciInterruptRouteError> {
+        if !self.accepted {
+            return Err(PciInterruptRouteError::Invalidated);
+        }
         if provider_scope_generation == 0 {
             return Err(PciInterruptRouteError::UnacceptedProviderScopes);
         }
@@ -309,6 +332,7 @@ impl PciInterruptRouteOwner {
             return Err(PciInterruptRouteError::StaleProviderScopes);
         }
         self.generation = prepared.target_generation;
+        self.accepted = false;
         self.inventory_generation = None;
         self.provider_scope_generation = None;
         self.segment = None;
@@ -325,6 +349,9 @@ impl PciInterruptRouteOwner {
         segment: u16,
         location: PciLocation,
     ) -> Result<Option<PciInterruptRouteClaim>, PciInterruptRouteError> {
+        if !self.accepted {
+            return Err(PciInterruptRouteError::Invalidated);
+        }
         if self.inventory_generation != Some(inventory.generation())
             || self.provider_scope_generation != Some(provider_scope_generation)
             || self.segment != Some(segment)
@@ -375,6 +402,9 @@ impl PciInterruptRouteOwner {
         provider_scope_generation: u64,
         claim: PciInterruptRouteClaim,
     ) -> Result<PciInterruptRoute, PciInterruptRouteError> {
+        if !self.accepted {
+            return Err(PciInterruptRouteError::Invalidated);
+        }
         if claim.publication_generation != self.generation {
             return Err(PciInterruptRouteError::StaleOwner);
         }
@@ -867,7 +897,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             owner.validate(&inventory, PROVIDER_RELATION_GENERATION, claim),
-            Err(PciInterruptRouteError::StaleOwner)
+            Err(PciInterruptRouteError::Invalidated)
         );
         assert_eq!(
             owner.resolve(
@@ -876,7 +906,78 @@ mod tests {
                 0,
                 PciLocation::new(0, 3, 0),
             ),
-            Err(PciInterruptRouteError::StaleProviderScopes)
+            Err(PciInterruptRouteError::Invalidated)
+        );
+    }
+
+    #[test]
+    fn relation_invalidation_immediately_fences_claims_and_prepared_replacements() {
+        let inventory = PciInventory::try_from_initial(vec![device(0, 3, 0, 1)]).unwrap();
+        let mut owner = PciInterruptRouteOwner::default();
+        let first = owner
+            .prepare_replace(
+                PROVIDER_RELATION_GENERATION,
+                0,
+                &inventory,
+                vec![route(0, 3, PciRouteFunction::Any, 0, 17)],
+            )
+            .unwrap();
+        owner
+            .commit(first, &inventory, PROVIDER_RELATION_GENERATION)
+            .unwrap();
+        let claim = owner
+            .resolve(
+                &inventory,
+                PROVIDER_RELATION_GENERATION,
+                0,
+                PciLocation::new(0, 3, 0),
+            )
+            .unwrap()
+            .unwrap();
+        let stale = owner
+            .prepare_replace(
+                PROVIDER_RELATION_GENERATION,
+                0,
+                &inventory,
+                vec![route(0, 3, PciRouteFunction::Any, 0, 18)],
+            )
+            .unwrap();
+
+        owner.invalidate().unwrap();
+        assert!(owner.routes().is_empty());
+        assert_eq!(
+            owner.validate(&inventory, PROVIDER_RELATION_GENERATION, claim),
+            Err(PciInterruptRouteError::Invalidated)
+        );
+        assert_eq!(
+            owner.commit(stale, &inventory, PROVIDER_RELATION_GENERATION),
+            Err(PciInterruptRouteError::StaleOwner)
+        );
+
+        let replacement = owner
+            .prepare_replace(
+                PROVIDER_RELATION_GENERATION,
+                0,
+                &inventory,
+                vec![route(0, 3, PciRouteFunction::Any, 0, 18)],
+            )
+            .unwrap();
+        owner
+            .commit(replacement, &inventory, PROVIDER_RELATION_GENERATION)
+            .unwrap();
+        assert_eq!(
+            owner
+                .resolve(
+                    &inventory,
+                    PROVIDER_RELATION_GENERATION,
+                    0,
+                    PciLocation::new(0, 3, 0),
+                )
+                .unwrap()
+                .unwrap()
+                .route()
+                .gsi,
+            18
         );
     }
 

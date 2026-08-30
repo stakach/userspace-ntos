@@ -63,8 +63,10 @@ mod pnp;
 pub(crate) use pnp::*;
 mod hard_error;
 mod hosted_pnp_context;
+mod hosted_pci_topology;
 mod power_manager;
 pub(crate) use hosted_pnp_context::*;
+pub(crate) use hosted_pci_topology::*;
 mod hosted_pnp_start;
 pub(crate) use hosted_pnp_start::*;
 mod selftests;
@@ -29556,8 +29558,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // PnP Manager bus walk — the enumeration is now the host-tested `nt-pnp` policy (parse
     // vendor/device/class + IRQ + decode each BAR with the write-all-ones size probe, restoring
     // it). The executive-side broker (`pnp.rs`) drives it over `pci_read32`/`pci_write32`.
-    let pci_devices = enumerate_pci_hierarchy(pci_io)
+    let discovered_pci_devices = enumerate_pci_hierarchy(pci_io)
         .unwrap_or_else(|_| panic!("platform published an invalid PCI bridge topology"));
+    let pci_devices = install_hosted_pci_topology(discovered_pci_devices)
+        .unwrap_or_else(|status| panic!("PCI topology authority installation failed: {status:?}"));
+    let (pci_inventory_generation, acpi_scope_generation, pci_route_generation) =
+        hosted_pci_topology_generations()
+            .expect("installed PCI topology authority was not retained");
+    print_str(b"[pci-topology] inventory/scopes/routes=");
+    print_u64(pci_inventory_generation);
+    print_str(b"/");
+    print_u64(acpi_scope_generation);
+    print_str(b"/");
+    print_u64(pci_route_generation);
+    print_str(b"\n");
     let mut count = 0u64;
     let mut found_storage = false;
     let (mut storage_bar5, mut storage_irq) = (0u32, 0u32);
