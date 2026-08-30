@@ -2849,12 +2849,12 @@ existing synchronous DMA/PnP fixture so the two lifecycle modes remain independe
   fault verdicts, committed-view range teardown, top-down placement, cross-authority overlap
   rejection, and bounded auto-placement retry around fixed authorities. Reopen C4 only for a newly
   observed VM semantic gap.
-- `[~]` C5: Complete per-process resident working-set ownership and
+- `[x]` C5: Complete per-process resident working-set ownership and
   `JOB_OBJECT_LIMIT_WORKINGSET`. MM now owns generation-checked limits, resident snapshots, fluidity
   validation, trimming, hard admission, and exact transition backing for private/COW pages; Ps owns
   only job policy and membership. Focused host validation and the freestanding executive check are
-  green. The serialized desktop proof, including the real transition/refault gate, remains before
-  closure.
+  green. The serialized desktop proof passes `298/298`, including the real transition/refault gate,
+  dynamic userinit/Explorer launch, callback/WndProc activity, and complete shell framebuffer paint.
 
 ### D. Registry And Filesystem Durability
 
@@ -17647,3 +17647,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     activity, complete shell framebuffer paint, zero pool regressions, and the sentinel before marking
     C5 complete. Physical reclamation under global pressure remains a separate MM page-writer frontier;
     do not relabel the current transition-frame owner as disk paging or reintroduce heap copies.
+
+    Serialized acceptance (2026-08-30): `.tmp/run-headless-working-set-final-20260830.log` completes the
+    release build and deterministic desktop boot with all `298/298` checks passing and the microtest
+    sentinel matched. The new real-page transition/refault proof reports `0xff/0xff`, preserves exact
+    frame identity and byte content, and passes `exec_working_set_transition_restored`. Userinit and
+    Explorer launch dynamically; Explorer completes 718 real api0 redirects with zero callback or
+    dead-callback failures, installs 18 client WndProcs without replay, reaches paint begin/end `5/22`
+    with 187 direct GDI returns and 144 batch flushes covering 195 records, and paints all
+    `480000/480000` framebuffer pixels with at least 32 colours. VM mapping, frame, alias, registry,
+    unmap, ASID, continuation-overflow, and pool failure counters remain zero.
+
+    Review adjustment: C5 is accepted end to end. Job working-set policy, resident accounting,
+    generation-checked trim/admission, exact transition ownership, refault restoration, inheritance,
+    disable, rollback, and rundown are closed without commitment substitution or heap page copies.
+    Physical frame reclamation remains deliberately separate: a future global memory-pressure owner
+    must select across processes, write dirty transition pages to real swap slots, replace opaque frame
+    backing transactionally, and return frames to the physical allocator. That work must stay in MM and
+    must not add process-name policy or weaken the now-accepted job boundary.
