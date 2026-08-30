@@ -18327,3 +18327,37 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     second empty BEGIN. Keep historical boot discovery until this run is green. Then remove the
     overlapping eager demand-start devnode cohort and change `PendingStartTest` to SCM auto-start so
     real `services.exe` issues `NtLoadDriver` and exercises the native reply owner separately.
+
+    B3 native SCM driver-start acceptance (2026-08-30): checkpoint `eaabf573` moves the existing
+    two-devnode `PendingStartTest` service from `SYSTEM_START` to `AUTO_START`. Generated-hive tests
+    prove that it is absent from the executive boot/system launch selection while its exact CM
+    service binding remains available with both devnodes. ReactOS `services.exe` therefore owns
+    policy and invokes the ordinary privileged `NtLoadDriver` path; no process, service, or fixture
+    identity is recognized by the executive.
+
+    Native START evidence is now owned by `ExecNtHandler`, not by global identity latches. It counts
+    all native load requests, records a pending batch only after the live syscall Reply capability
+    is transferred into its reserved continuation row, aggregates terminal AddDevice/START results,
+    and records the actual parked-syscall reply. Abandonment, continuation ownership loss, a failed
+    devnode, or a duplicate/missing reply leaves the generic acceptance invariant incomplete.
+
+    Focused validation passes all `14/14` generated-hive tests; formatting, `git diff --check`, and
+    the freestanding executive check pass at the established 209-warning baseline. Serialized
+    desktop acceptance `.tmp/run-desktop-native-driver-start-20260830.log` records one real
+    `NtLoadDriver` call, one parked/completed/replied batch, and two attempted/terminal/started
+    devnodes with two pending observations, zero failures, and final `STATUS_SUCCESS`. The boot
+    hardware cohort independently remains terminal at `3/3`. Genuine Explorer reaches paint
+    begin/end `5/20`, 187 direct GDI returns, and 135 batch flushes covering 184 records; all
+    `786432/786432` framebuffer pixels differ from the desktop background with at least 32 colours.
+    All `299/299` gates pass and the sentinel exits QEMU.
+
+    Review adjustment: the native SCM reply owner is closed independently and no longer depends on
+    eager boot ownership. The live CM device-action consumer remains implementation-green but lacks
+    a runtime producer. Next add the genuine bus/PnP relation-change boundary: a bus driver reports
+    changed relations, PnP diffs the returned children against CM topology, and one durability-
+    ordered transaction publishes the complete new Enum instance plus
+    `PublishDeviceAction::Arrival`. Require exact user notification/response, real AddDevice and
+    timer-DPC START completion, CM acknowledgement, and a subsequent empty claim. Only after that
+    proof remove the overlapping eager demand-start devnode launch plan and make historical
+    `PlugPlayControlStartDevice` validate canonical lifecycle state instead of returning permissive
+    success.
