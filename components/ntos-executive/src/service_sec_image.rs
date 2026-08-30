@@ -1944,6 +1944,9 @@ pub(crate) unsafe fn service_generic_section_fault(
         return Err(nt_address_space::STATUS_CONFLICTING_ADDRESSES);
     }
     nt_address_space::mapped_view_fault_access_status(view_info.protect, fault_access)?;
+    if nt_handler.restore_process_pagefile_page(pi, page, pml4, scratch_base)? {
+        return Ok(true);
+    }
     if csrss_frame_get_exact(pi as u64, page).0 != 0 {
         if fault_access == nt_address_space::FaultAccess::Lock {
             return Ok(true);
@@ -1978,6 +1981,7 @@ pub(crate) unsafe fn service_generic_section_fault(
         }
         return Err(0xC000_0005); // STATUS_ACCESS_VIOLATION
     }
+    nt_handler.ensure_process_working_set_admission(pi, page, scratch_base)?;
     let fault_plan = nt_address_space::mapped_view_fault_plan(view_info.protect, write_fault);
     let frame = service_generic_section_frame(
         generic_sections,
@@ -2054,6 +2058,7 @@ pub(crate) unsafe fn service_generic_section_fault(
 /// authorities used by a real user fault. `fault_observed` requests a remap when a retained private
 /// source frame proves the page was previously filled but the user mapping faulted again.
 pub(crate) unsafe fn service_image_page_residency(
+    nt_handler: &mut ExecNtHandler,
     pi: usize,
     page: u64,
     base: u64,
@@ -2073,6 +2078,9 @@ pub(crate) unsafe fn service_image_page_residency(
         return Err(nt_address_space::STATUS_CONFLICTING_ADDRESSES);
     }
     nt_address_space::image_view_fault_access_status(info.protect, fault_access)?;
+    if nt_handler.restore_process_pagefile_page(pi, page, pml4, scratch_base)? {
+        return Ok(());
+    }
 
     let write_fault = fault_access == nt_address_space::FaultAccess::Write;
     let fault_plan = nt_address_space::image_view_fault_plan(info.protect, write_fault);
@@ -2122,6 +2130,8 @@ pub(crate) unsafe fn service_image_page_residency(
     {
         return Ok(());
     }
+
+    nt_handler.ensure_process_working_set_admission(pi, page, scratch_base)?;
 
     if !shareable {
         let existing = csrss_frame_get(pi as u64, page);
@@ -2733,8 +2743,12 @@ unsafe fn dispatch_win32k_for_client(
 ) -> (u64, bool) {
     let result =
         win32k_glue::win32k_dispatch_wide(ssn, a0, a1, a2, a3, caller_sp, stack_args, client);
-    if sync_win32k_context_to_process_manager(nt_handler, client.pi as usize, client.pid, client.tid)
-    {
+    if sync_win32k_context_to_process_manager(
+        nt_handler,
+        client.pi as usize,
+        client.pid,
+        client.tid,
+    ) {
         result
     } else {
         (0xC000_00A3u32 as u64, false)
@@ -2766,8 +2780,12 @@ unsafe fn dispatch_win32k_for_client_with_completion_args(
         output_stage,
         client,
     );
-    if sync_win32k_context_to_process_manager(nt_handler, client.pi as usize, client.pid, client.tid)
-    {
+    if sync_win32k_context_to_process_manager(
+        nt_handler,
+        client.pi as usize,
+        client.pid,
+        client.tid,
+    ) {
         result
     } else {
         (0xC000_00A3u32 as u64, false)
@@ -8273,6 +8291,7 @@ pub(crate) unsafe fn service_sec_image(
             let mut fault_page_serviced = true;
             let image_fault_access = vm_fault_access_from_x86_error(m3);
             if let Err(status) = service_image_page_residency(
+                &mut nt_handler,
                 pi,
                 page,
                 base,
@@ -13939,23 +13958,22 @@ pub(crate) unsafe fn service_sec_image(
                     } else {
                         (sp, &[])
                     };
-                    let dispatch_ssn = if m0
-                        == win32k_subsystem::SSN_NT_USER_USER_HANDLE_GRANT_ACCESS
-                    {
-                        match nt_handler.job_id_for_user_handle_grant(d_a1) {
-                            Ok(job) => {
-                                d_a1 = job as u64;
-                                d_a3 = 0;
+                    let dispatch_ssn =
+                        if m0 == win32k_subsystem::SSN_NT_USER_USER_HANDLE_GRANT_ACCESS {
+                            match nt_handler.job_id_for_user_handle_grant(d_a1) {
+                                Ok(job) => {
+                                    d_a1 = job as u64;
+                                    d_a3 = 0;
+                                }
+                                Err(error) => {
+                                    d_a1 = 0;
+                                    d_a3 = error as u64;
+                                }
                             }
-                            Err(error) => {
-                                d_a1 = 0;
-                                d_a3 = error as u64;
-                            }
-                        }
-                        win32k_subsystem::SSN_WIN32_JOB_USER_HANDLE
-                    } else {
-                        m0
-                    };
+                            win32k_subsystem::SSN_WIN32_JOB_USER_HANDLE
+                        } else {
+                            m0
+                        };
                     let mut r = dispatch_win32k_for_client_with_completion_args(
                         &mut nt_handler,
                         dispatch_ssn,
@@ -16000,6 +16018,12 @@ pub(crate) unsafe fn service_sec_image(
         nt_exe_image::HostedProcessRole::InteractiveLogon,
     ) {
         crate::private_vm_unmap_selftest(
+            &mut nt_handler,
+            logon_pi,
+            procs[logon_pi].pml4,
+            procs[logon_pi].scratch_base,
+        );
+        crate::working_set_transition_selftest(
             &mut nt_handler,
             logon_pi,
             procs[logon_pi].pml4,

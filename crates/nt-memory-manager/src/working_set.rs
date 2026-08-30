@@ -1,8 +1,9 @@
-use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 pub const WORKING_SET_PAGE_SIZE: u64 = 0x1000;
 pub const FLUID_WORKING_SET_PAGES: u64 = 8;
+pub const DEFAULT_WORKING_SET_MINIMUM_PAGES: u64 = 20;
+pub const DEFAULT_WORKING_SET_MAXIMUM_PAGES: u64 = 45;
 
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
@@ -149,7 +150,7 @@ impl WorkingSetTable {
         let minimum_pages = if minimum_bytes == 0 {
             current.limits.minimum_pages
         } else {
-            minimum_bytes / WORKING_SET_PAGE_SIZE
+            (minimum_bytes / WORKING_SET_PAGE_SIZE).max(DEFAULT_WORKING_SET_MINIMUM_PAGES)
         };
         let maximum_pages = if maximum_bytes == 0 {
             current.limits.maximum_pages
@@ -211,6 +212,24 @@ impl WorkingSetTable {
         })
     }
 
+    pub fn prepare_enforcement(
+        &self,
+        owner: WorkingSetOwnerId,
+        hard_limit: bool,
+    ) -> Result<WorkingSetAdjustmentPlan, u32> {
+        let index = self.index_for(owner).ok_or(STATUS_INVALID_HANDLE)?;
+        let current = self.entries[index];
+        Ok(WorkingSetAdjustmentPlan {
+            owner,
+            generation: current.generation,
+            limits: WorkingSetLimits {
+                hard_limit,
+                ..current.limits
+            },
+            victims: Vec::new(),
+        })
+    }
+
     pub fn commit_adjustment(&mut self, plan: &WorkingSetAdjustmentPlan) -> Result<(), u32> {
         let index = self.index_for(plan.owner).ok_or(STATUS_INVALID_HANDLE)?;
         if self.entries[index].generation != plan.generation {
@@ -268,7 +287,7 @@ fn select_victims(
     candidates
         .try_reserve(pages.len())
         .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-    let mut locked_pages = 0u64;
+    let mut fixed_pages = 0u64;
     for (index, page) in pages.iter().enumerate() {
         if page.page & (WORKING_SET_PAGE_SIZE - 1) != 0
             || pages[..index]
@@ -277,13 +296,13 @@ fn select_victims(
         {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        if page.locked {
-            locked_pages = locked_pages.saturating_add(1);
-        } else if page.evictable && Some(page.page) != excluded_page {
+        if page.locked || !page.evictable {
+            fixed_pages = fixed_pages.saturating_add(1);
+        } else if Some(page.page) != excluded_page {
             candidates.push(*page);
         }
     }
-    if target_pages <= locked_pages.saturating_add(FLUID_WORKING_SET_PAGES) {
+    if target_pages <= fixed_pages.saturating_add(FLUID_WORKING_SET_PAGES) {
         return Err(STATUS_BAD_WORKING_SET_LIMIT);
     }
     let resident_pages = pages.len() as u64;
@@ -296,44 +315,33 @@ fn select_victims(
     Ok(candidates.into_iter().map(|page| page.page).collect())
 }
 
-struct PagefileRecord {
-    owner: WorkingSetOwnerId,
-    page: u64,
-    bytes: Box<[u8]>,
-}
-
-pub struct PagefileWritePlan {
-    owner: WorkingSetOwnerId,
-    page: u64,
-    generation: u64,
-    bytes: Box<[u8]>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct PagefileWrite<'a> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PagefilePage {
     pub owner: WorkingSetOwnerId,
     pub page: u64,
-    pub bytes: &'a [u8],
+    pub protection: u32,
+    pub backing: u64,
 }
 
-pub struct PagefileBatchPlan {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PagefilePublishPlan {
     generation: u64,
-    writes: Vec<PagefileRecord>,
+    next_generation: u64,
+    page: PagefilePage,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PagefileStoreStats {
     pub pages: usize,
     pub high_water: usize,
-    pub writes: u64,
-    pub replacements: u64,
-    pub reads: u64,
-    pub removals: u64,
+    pub publications: u64,
+    pub restores: u64,
+    pub takes: u64,
     pub stale_commits: u64,
 }
 
 pub struct PagefileStore {
-    records: Vec<PagefileRecord>,
+    records: Vec<PagefilePage>,
     generation: u64,
     stats: PagefileStoreStats,
 }
@@ -346,10 +354,9 @@ impl PagefileStore {
             stats: PagefileStoreStats {
                 pages: 0,
                 high_water: 0,
-                writes: 0,
-                replacements: 0,
-                reads: 0,
-                removals: 0,
+                publications: 0,
+                restores: 0,
+                takes: 0,
                 stale_commits: 0,
             },
         }
@@ -361,152 +368,96 @@ impl PagefileStore {
             .position(|record| record.owner == owner && record.page == page)
     }
 
-    pub fn prepare_write(
-        &mut self,
-        owner: WorkingSetOwnerId,
-        page: u64,
-        bytes: &[u8],
-    ) -> Result<PagefileWritePlan, u32> {
-        if page & (WORKING_SET_PAGE_SIZE - 1) != 0 || bytes.len() != WORKING_SET_PAGE_SIZE as usize
+    pub fn contains(&self, owner: WorkingSetOwnerId, page: u64) -> bool {
+        self.index_for(owner, page).is_some()
+    }
+
+    pub fn prepare_publish(&mut self, page: PagefilePage) -> Result<PagefilePublishPlan, u32> {
+        if page.page & (WORKING_SET_PAGE_SIZE - 1) != 0
+            || page.backing == 0
+            || self.index_for(page.owner, page.page).is_some()
         {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        if self.index_for(owner, page).is_none() {
-            self.records
-                .try_reserve(1)
-                .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-        }
-        let mut owned = Vec::new();
-        owned
-            .try_reserve_exact(bytes.len())
-            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-        owned.extend_from_slice(bytes);
-        Ok(PagefileWritePlan {
-            owner,
-            page,
-            generation: self.generation,
-            bytes: owned.into_boxed_slice(),
-        })
-    }
-
-    pub fn commit_write(&mut self, plan: PagefileWritePlan) -> Result<(), u32> {
-        if self.generation != plan.generation {
-            self.stats.stale_commits = self.stats.stale_commits.saturating_add(1);
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        self.generation = self
-            .generation
-            .checked_add(1)
-            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
-        if let Some(index) = self.index_for(plan.owner, plan.page) {
-            self.records[index].bytes = plan.bytes;
-            self.stats.replacements = self.stats.replacements.saturating_add(1);
-        } else {
-            self.records.push(PagefileRecord {
-                owner: plan.owner,
-                page: plan.page,
-                bytes: plan.bytes,
-            });
-            self.stats.pages = self.records.len();
-            self.stats.high_water = self.stats.high_water.max(self.records.len());
-        }
-        self.stats.writes = self.stats.writes.saturating_add(1);
-        Ok(())
-    }
-
-    pub fn prepare_write_batch(
-        &mut self,
-        writes: &[PagefileWrite<'_>],
-    ) -> Result<PagefileBatchPlan, u32> {
-        let mut new_records = 0usize;
-        for (index, write) in writes.iter().enumerate() {
-            if write.page & (WORKING_SET_PAGE_SIZE - 1) != 0
-                || write.bytes.len() != WORKING_SET_PAGE_SIZE as usize
-                || writes[..index]
-                    .iter()
-                    .any(|existing| existing.owner == write.owner && existing.page == write.page)
-            {
-                return Err(STATUS_INVALID_PARAMETER);
-            }
-            if self.index_for(write.owner, write.page).is_none() {
-                new_records += 1;
-            }
-        }
         self.records
-            .try_reserve(new_records)
+            .try_reserve(1)
             .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-        let mut owned = Vec::new();
-        owned
-            .try_reserve_exact(writes.len())
-            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-        for write in writes {
-            let mut bytes = Vec::new();
-            bytes
-                .try_reserve_exact(write.bytes.len())
-                .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-            bytes.extend_from_slice(write.bytes);
-            owned.push(PagefileRecord {
-                owner: write.owner,
-                page: write.page,
-                bytes: bytes.into_boxed_slice(),
-            });
-        }
-        Ok(PagefileBatchPlan {
-            generation: self.generation,
-            writes: owned,
-        })
-    }
-
-    pub fn commit_write_batch(&mut self, plan: PagefileBatchPlan) -> Result<(), u32> {
-        if self.generation != plan.generation {
-            self.stats.stale_commits = self.stats.stale_commits.saturating_add(1);
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        self.generation = self
+        let next_generation = self
             .generation
             .checked_add(1)
             .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
-        for write in plan.writes {
-            if let Some(index) = self.index_for(write.owner, write.page) {
-                self.records[index].bytes = write.bytes;
-                self.stats.replacements = self.stats.replacements.saturating_add(1);
-            } else {
-                self.records.push(write);
-            }
-            self.stats.writes = self.stats.writes.saturating_add(1);
+        Ok(PagefilePublishPlan {
+            generation: self.generation,
+            next_generation,
+            page,
+        })
+    }
+
+    pub fn commit_publish(&mut self, plan: PagefilePublishPlan) -> Result<(), u32> {
+        if self.generation != plan.generation
+            || self.index_for(plan.page.owner, plan.page.page).is_some()
+        {
+            self.stats.stale_commits = self.stats.stale_commits.saturating_add(1);
+            return Err(STATUS_INVALID_PARAMETER);
         }
+        self.generation = plan.next_generation;
+        self.records.push(plan.page);
         self.stats.pages = self.records.len();
         self.stats.high_water = self.stats.high_water.max(self.records.len());
+        self.stats.publications = self.stats.publications.saturating_add(1);
         Ok(())
     }
 
-    pub fn page(&mut self, owner: WorkingSetOwnerId, page: u64) -> Option<&[u8]> {
+    pub fn page(&self, owner: WorkingSetOwnerId, page: u64) -> Option<PagefilePage> {
         let index = self.index_for(owner, page)?;
-        self.stats.reads = self.stats.reads.saturating_add(1);
-        Some(&self.records[index].bytes)
+        Some(self.records[index])
     }
 
-    pub fn remove(&mut self, owner: WorkingSetOwnerId, page: u64) -> bool {
+    pub fn take(
+        &mut self,
+        owner: WorkingSetOwnerId,
+        page: u64,
+    ) -> Result<Option<PagefilePage>, u32> {
         let Some(index) = self.index_for(owner, page) else {
-            return false;
+            return Ok(None);
         };
-        self.records.swap_remove(index);
-        self.generation = self.generation.saturating_add(1);
+        let next_generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        let record = self.records.swap_remove(index);
+        self.generation = next_generation;
         self.stats.pages = self.records.len();
-        self.stats.removals = self.stats.removals.saturating_add(1);
-        true
+        self.stats.takes = self.stats.takes.saturating_add(1);
+        Ok(Some(record))
     }
 
-    pub fn retire_owner(&mut self, owner: WorkingSetOwnerId) -> usize {
-        let before = self.records.len();
-        self.records.retain(|record| record.owner != owner);
-        let removed = before - self.records.len();
-        if removed != 0 {
-            self.generation = self.generation.saturating_add(1);
-            self.stats.pages = self.records.len();
-            self.stats.removals = self.stats.removals.saturating_add(removed as u64);
+    pub fn restore(&mut self, page: PagefilePage) -> Result<(), u32> {
+        if page.page & (WORKING_SET_PAGE_SIZE - 1) != 0
+            || self.index_for(page.owner, page.page).is_some()
+            || page.backing == 0
+        {
+            return Err(STATUS_INVALID_PARAMETER);
         }
-        removed
+        self.records
+            .try_reserve(1)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        let next_generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        self.records.push(page);
+        self.generation = next_generation;
+        self.stats.pages = self.records.len();
+        self.stats.restores = self.stats.restores.saturating_add(1);
+        Ok(())
+    }
+
+    pub fn first_for_owner(&self, owner: WorkingSetOwnerId) -> Option<PagefilePage> {
+        self.records
+            .iter()
+            .copied()
+            .find(|record| record.owner == owner)
     }
 
     pub fn stats(&self) -> PagefileStoreStats {
@@ -562,12 +513,12 @@ mod tests {
     #[test]
     fn hard_admission_plans_replacement_before_growth() {
         let mut table = WorkingSetTable::new();
-        table.register(4, 12, 16).unwrap();
-        let pages: Vec<_> = (0..16)
+        table.register(4, 20, 32).unwrap();
+        let pages: Vec<_> = (0..32)
             .map(|index| page(0x1000 + index * 0x1000, index))
             .collect();
         let limits = table
-            .prepare_adjustment(4, 12 * 0x1000, 16 * 0x1000, true, true, &pages)
+            .prepare_adjustment(4, 20 * 0x1000, 32 * 0x1000, true, true, &pages)
             .unwrap();
         table.commit_adjustment(&limits).unwrap();
         let admission = table.prepare_admission(4, 0x40_000, &pages).unwrap();
@@ -602,6 +553,30 @@ mod tests {
     }
 
     #[test]
+    fn requested_minimum_is_clamped_to_the_native_process_floor() {
+        let mut table = WorkingSetTable::new();
+        table.register(2, 20, 45).unwrap();
+        let plan = table
+            .prepare_adjustment(2, 1, 30 * WORKING_SET_PAGE_SIZE, true, true, &[])
+            .unwrap();
+        assert_eq!(plan.limits().minimum_pages, 20);
+    }
+
+    #[test]
+    fn non_evictable_entries_count_ahead_of_the_fluid_reserve() {
+        let mut table = WorkingSetTable::new();
+        table.register(2, 20, 45).unwrap();
+        let mut pages: Vec<_> = (0..9)
+            .map(|index| page(0x1000 + index * 0x1000, index))
+            .collect();
+        pages[0].evictable = false;
+        assert_eq!(
+            table.prepare_adjustment(2, 0, 9 * WORKING_SET_PAGE_SIZE, true, true, &pages,),
+            Err(STATUS_BAD_WORKING_SET_LIMIT)
+        );
+    }
+
+    #[test]
     fn stale_limit_plan_cannot_overwrite_new_policy() {
         let mut table = WorkingSetTable::new();
         table.register(2, 20, 45).unwrap();
@@ -617,68 +592,69 @@ mod tests {
     }
 
     #[test]
-    fn pagefile_write_is_owned_before_frame_teardown_and_restorable() {
+    fn pagefile_transition_is_reserved_before_publication_and_restorable() {
         let mut store = PagefileStore::new();
-        let mut contents = [0u8; 0x1000];
-        contents[0] = 0x4d;
-        contents[0xfff] = 0x5a;
-        let plan = store.prepare_write(7, 0x20_000, &contents).unwrap();
+        let page = PagefilePage {
+            owner: 7,
+            page: 0x20_000,
+            protection: 0x04,
+            backing: 0x4d5a,
+        };
+        let plan = store.prepare_publish(page).unwrap();
         assert!(store.page(7, 0x20_000).is_none());
-        store.commit_write(plan).unwrap();
-        let restored = store.page(7, 0x20_000).unwrap();
-        assert_eq!(restored[0], 0x4d);
-        assert_eq!(restored[0xfff], 0x5a);
-        assert!(store.remove(7, 0x20_000));
+        store.commit_publish(plan).unwrap();
+        assert_eq!(store.page(7, 0x20_000), Some(page));
+        let taken = store.take(7, 0x20_000).unwrap().unwrap();
         assert!(store.page(7, 0x20_000).is_none());
+        store.restore(taken).unwrap();
+        assert_eq!(store.page(7, 0x20_000), Some(page));
     }
 
     #[test]
-    fn stale_pagefile_plan_cannot_replace_newer_contents() {
+    fn stale_pagefile_plan_cannot_publish_after_a_newer_transition() {
         let mut store = PagefileStore::new();
-        let old = store.prepare_write(7, 0x20_000, &[1; 0x1000]).unwrap();
-        let new = store.prepare_write(7, 0x30_000, &[2; 0x1000]).unwrap();
-        store.commit_write(new).unwrap();
-        assert_eq!(store.commit_write(old), Err(STATUS_INVALID_PARAMETER));
-        assert!(store.page(7, 0x20_000).is_none());
-    }
-
-    #[test]
-    fn owner_rundown_removes_only_its_pagefile_records() {
-        let mut store = PagefileStore::new();
-        for (owner, page) in [(2, 0x1000), (2, 0x2000), (3, 0x1000)] {
-            let plan = store
-                .prepare_write(owner, page, &[owner as u8; 0x1000])
-                .unwrap();
-            store.commit_write(plan).unwrap();
-        }
-        assert_eq!(store.retire_owner(2), 2);
-        assert!(store.page(2, 0x1000).is_none());
-        assert_eq!(store.page(3, 0x1000).unwrap()[0], 3);
-    }
-
-    #[test]
-    fn pagefile_batch_owns_every_page_before_publication() {
-        let mut store = PagefileStore::new();
-        let first = [0x11; 0x1000];
-        let second = [0x22; 0x1000];
-        let plan = store
-            .prepare_write_batch(&[
-                PagefileWrite {
-                    owner: 2,
-                    page: 0x1000,
-                    bytes: &first,
-                },
-                PagefileWrite {
-                    owner: 2,
-                    page: 0x2000,
-                    bytes: &second,
-                },
-            ])
+        let old = store
+            .prepare_publish(PagefilePage {
+                owner: 7,
+                page: 0x20_000,
+                protection: 0x04,
+                backing: 1,
+            })
             .unwrap();
+        let new = store
+            .prepare_publish(PagefilePage {
+                owner: 7,
+                page: 0x30_000,
+                protection: 0x04,
+                backing: 2,
+            })
+            .unwrap();
+        store.commit_publish(new).unwrap();
+        assert_eq!(store.commit_publish(old), Err(STATUS_INVALID_PARAMETER));
+        assert!(store.page(7, 0x20_000).is_none());
+    }
+
+    #[test]
+    fn owner_rundown_enumerates_only_its_transition_records() {
+        let mut store = PagefileStore::new();
+        for (owner, page, backing) in [(2, 0x1000, 1), (2, 0x2000, 2), (3, 0x1000, 3)] {
+            let plan = store
+                .prepare_publish(PagefilePage {
+                    owner,
+                    page,
+                    protection: 0x04,
+                    backing,
+                })
+                .unwrap();
+            store.commit_publish(plan).unwrap();
+        }
+        let mut removed = 0;
+        while let Some(page) = store.first_for_owner(2) {
+            assert_eq!(store.take(2, page.page), Ok(Some(page)));
+            removed += 1;
+        }
+        assert_eq!(removed, 2);
         assert!(store.page(2, 0x1000).is_none());
-        assert!(store.page(2, 0x2000).is_none());
-        store.commit_write_batch(plan).unwrap();
-        assert_eq!(store.page(2, 0x1000).unwrap()[0], 0x11);
-        assert_eq!(store.page(2, 0x2000).unwrap()[0], 0x22);
+        assert_eq!(store.page(3, 0x1000).unwrap().backing, 3);
     }
 }

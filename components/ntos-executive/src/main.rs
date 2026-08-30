@@ -1456,6 +1456,7 @@ pub(crate) unsafe fn process_committed_mapping_reset(pi: usize) {
     // This is an address-space lifetime boundary (fresh VSpace, temporary-slot release, or final
     // teardown), so no virtual lock may survive into the next owner of this process slot.
     let _ = vm_page_lock_retire_owner(pi as u64);
+    process_working_set_retire(pi);
     if let Some(table) = process_committed_mapping_table_mut(pi) {
         *table = nt_address_space::VmCommittedRangeTable::new();
     }
@@ -1683,6 +1684,9 @@ pub(crate) unsafe fn reclaim_unpublished_process_page_tables(pi: usize) -> u64 {
 pub(crate) unsafe fn reset_process_vm_state(slots: usize) -> bool {
     (&mut *core::ptr::addr_of_mut!(VM_PAGE_LOCKS)).reset();
     (&mut *core::ptr::addr_of_mut!(PROCESS_USER_PAGE_TABLES)).clear();
+    *core::ptr::addr_of_mut!(PROCESS_WORKING_SETS) = nt_memory_manager::WorkingSetTable::new();
+    *core::ptr::addr_of_mut!(PROCESS_PAGEFILE) = nt_memory_manager::PagefileStore::new();
+    WORKING_SET_AGE.store(1, Ordering::Relaxed);
     VM_LOCK_RECLAIM_REFUSALS.store(0, Ordering::Relaxed);
     reset_process_vm_region_maps(slots)
         && reset_process_committed_mappings(slots)
@@ -4648,6 +4652,7 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
     unsafe { winlogon_profile_copied_spec(passed) };
     get_message_guard_spec(passed);
     vspace_asid_unmap_spec(passed);
+    working_set_transition_spec(passed);
     root_cap_ownership_spec(passed);
     mapped_section_writeback_spec(passed);
     mapped_section_writecopy_cow_spec(passed);
@@ -5704,6 +5709,23 @@ fn vspace_asid_unmap_spec(passed: &mut u64) {
             // … and across the whole boot no private map was refused and no unmap errored.
             && map_fails == 0
             && unmap_fails == 0,
+        passed,
+    );
+}
+
+fn working_set_transition_spec(passed: &mut u64) {
+    let proof = WORKING_SET_TRANSITION_SELFTEST.load(Ordering::Relaxed);
+    let status = WORKING_SET_TRANSITION_STATUS.load(Ordering::Relaxed) as u32;
+    print_str(b"[working-set-transition] proof=0x");
+    print_hex(proof as u32);
+    print_str(b"/0x");
+    print_hex(WORKING_SET_TRANSITION_ALL as u32);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b"\n");
+    check(
+        b"exec_working_set_transition_restored",
+        proof == WORKING_SET_TRANSITION_ALL && status == nt_address_space::STATUS_SUCCESS,
         passed,
     );
 }
@@ -8550,6 +8572,15 @@ unsafe fn dll_cache_evict_unreferenced_all() -> u64 {
 const CLIENT_FRAME_REGISTRY_INITIAL_RESERVE: usize = 16384;
 static mut CLIENT_FRAME_REGISTRY: ClientFrameRegistry = ClientFrameRegistry::new();
 static CLIENT_COPY_TEMP_CAP: AtomicU64 = AtomicU64::new(0);
+static WORKING_SET_AGE: AtomicU64 = AtomicU64::new(1);
+static mut PROCESS_WORKING_SETS: nt_memory_manager::WorkingSetTable =
+    nt_memory_manager::WorkingSetTable::new();
+static mut PROCESS_PAGEFILE: nt_memory_manager::PagefileStore =
+    nt_memory_manager::PagefileStore::new();
+
+fn next_working_set_age() -> u64 {
+    WORKING_SET_AGE.fetch_add(1, Ordering::Relaxed)
+}
 
 unsafe fn client_frame_registry_reserve_initial() -> bool {
     (&mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY))
@@ -8608,9 +8639,16 @@ pub(crate) unsafe fn csrss_frame_put_at_cap_source_owned(
     source_cap: u64,
     owns_frame: bool,
 ) -> bool {
-    match (&mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY))
-        .insert(pi, page, fr, alias, alias_cap, source_cap, owns_frame)
-    {
+    match (&mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY)).insert_at_age(
+        pi,
+        page,
+        fr,
+        alias,
+        alias_cap,
+        source_cap,
+        owns_frame,
+        next_working_set_age(),
+    ) {
         Ok(ClientFrameInsert::Inserted { .. }) => true,
         Ok(ClientFrameInsert::Updated) => true,
         Err(_) => false,
@@ -8641,6 +8679,7 @@ pub(crate) unsafe fn csrss_frame_drop_process_range(pi: u64, base: u64, size: u6
         if vm_page_lock_is_locked(pi, page) {
             VM_LOCK_RECLAIM_REFUSALS.fetch_add(1, Ordering::Relaxed);
         } else {
+            process_pagefile_discard(pi, page);
             while let Some((frame, alias_cap, source_cap, owns_frame)) = csrss_frame_take(pi, page)
             {
                 if owns_frame {
@@ -9150,6 +9189,7 @@ impl SharedImageMappingCap {
 struct SharedImageMapping {
     pi: u8,
     page: u64,
+    age: u64,
     cap: SharedImageMappingCap,
 }
 
@@ -9158,6 +9198,7 @@ impl SharedImageMapping {
         Self {
             pi: 0,
             page: 0,
+            age: 0,
             cap: SharedImageMappingCap::empty(),
         }
     }
@@ -9538,6 +9579,7 @@ unsafe fn shared_image_mapping_push_prepared(
     chunk.entries[index] = SharedImageMapping {
         pi: pi as u8,
         page,
+        age: next_working_set_age(),
         cap,
     };
     chunk.len += 1;
@@ -9655,6 +9697,7 @@ unsafe fn shared_image_mapping_unmap_range(pi: u64, base: u64, end: u64) {
         {
             let mapping = (*chunks[chunk_index]).entries[entry_index];
             if mapping.pi as u64 == pi && mapping.page >= base && mapping.page < end {
+                process_pagefile_discard(pi, mapping.page);
                 if let Some(mapping) =
                     shared_image_mapping_remove_at(chunks, chunk_index, entry_index)
                 {
@@ -9701,6 +9744,124 @@ unsafe fn shared_image_mapping_unmap_process(pi: u64) -> u64 {
         IMAGE_MAP_CAP_BANK_NEXT.store(0, Ordering::Relaxed);
     }
     removed
+}
+
+unsafe fn process_working_set_register(pi: usize) -> Result<(), u32> {
+    let table = &mut *core::ptr::addr_of_mut!(PROCESS_WORKING_SETS);
+    if table.limits(pi as u64).is_some() {
+        return Ok(());
+    }
+    table.register(
+        pi as u64,
+        nt_memory_manager::DEFAULT_WORKING_SET_MINIMUM_PAGES,
+        nt_memory_manager::DEFAULT_WORKING_SET_MAXIMUM_PAGES,
+    )
+}
+
+unsafe fn process_working_set_resident_pages(
+    pi: usize,
+) -> Result<Vec<nt_memory_manager::WorkingSetPage>, u32> {
+    let frames = &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY);
+    let mut pages = Vec::new();
+    pages
+        .try_reserve(frames.records().len().saturating_add(1))
+        .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
+    for record in frames
+        .records()
+        .iter()
+        .filter(|record| record.pi == pi as u64)
+    {
+        pages.push(nt_memory_manager::WorkingSetPage {
+            page: record.page,
+            age: record.age,
+            locked: vm_page_lock_is_locked(pi as u64, record.page),
+            evictable: true,
+        });
+    }
+    if let Some(chunks) = (*core::ptr::addr_of!(SHARED_IMAGE_MAPPING_CHUNKS)).as_ref() {
+        for chunk in chunks.iter().copied() {
+            let len = shared_image_mapping_chunk_len(chunk);
+            for mapping in (&(*chunk).entries)[..len]
+                .iter()
+                .filter(|mapping| mapping.pi as usize == pi)
+            {
+                pages
+                    .try_reserve(1)
+                    .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
+                pages.push(nt_memory_manager::WorkingSetPage {
+                    page: mapping.page,
+                    age: mapping.age,
+                    locked: vm_page_lock_is_locked(pi as u64, mapping.page),
+                    evictable: true,
+                });
+            }
+        }
+    }
+    if kuser_page_alias_get(pi) != 0 {
+        pages
+            .try_reserve(1)
+            .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
+        pages.push(nt_memory_manager::WorkingSetPage {
+            page: KUSER_VA,
+            age: 0,
+            locked: false,
+            evictable: false,
+        });
+    }
+    Ok(pages)
+}
+
+unsafe fn process_working_set_pageout_mapping(pi: usize, page: u64) -> bool {
+    if vm_page_lock_is_locked(pi as u64, page) {
+        return false;
+    }
+    if (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY))
+        .get(pi as u64, page)
+        .is_some_and(|record| record.owns_frame)
+    {
+        return false;
+    }
+    detach_win32k_attached_page_for_thread_release(pi, page);
+    if let Some((frame, alias_cap, source_cap, owns_frame)) = csrss_frame_take(pi as u64, page) {
+        debug_assert!(!owns_frame);
+        recycle_mapped_cap(frame);
+        if alias_cap != frame {
+            recycle_mapped_cap(alias_cap);
+        }
+        if source_cap != 0 && source_cap != frame && source_cap != alias_cap {
+            recycle_plain_cap(source_cap);
+        }
+        return true;
+    }
+    if let Some(map_cap) = shared_image_mapping_take(pi as u64, page) {
+        recycle_mapped_cap(map_cap);
+        return true;
+    }
+    false
+}
+
+unsafe fn process_working_set_retire(pi: usize) {
+    let _ = (&mut *core::ptr::addr_of_mut!(PROCESS_WORKING_SETS)).unregister(pi as u64);
+    loop {
+        let pagefile = &mut *core::ptr::addr_of_mut!(PROCESS_PAGEFILE);
+        let Some(record) = pagefile.first_for_owner(pi as u64) else {
+            break;
+        };
+        let record = pagefile
+            .take(pi as u64, record.page)
+            .expect("transition generation remains available through owner rundown")
+            .expect("the serialized transition record remains present through owner rundown");
+        vm_frame_release_unmapped(record.backing);
+    }
+}
+
+unsafe fn process_pagefile_discard(pi: u64, page: u64) {
+    if let Some(record) = (&mut *core::ptr::addr_of_mut!(PROCESS_PAGEFILE))
+        .take(pi, page)
+        .expect("transition generation remains available during explicit unmap")
+    {
+        vm_frame_release_unmapped(record.backing);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -11575,6 +11736,20 @@ pub(crate) const VM_UNMAP_SELFTEST_CLEAN: u64 = 0x20;
 pub(crate) const VM_UNMAP_SELFTEST_ALL: u64 = 0x3f;
 pub(crate) static VM_UNMAP_SELFTEST: AtomicU64 = AtomicU64::new(0);
 
+// --- PROCESS WORKING-SET TRANSITION SELF-TEST --------------------------------------------------
+const WORKING_SET_TRANSITION_MAPPED: u64 = 0x01;
+const WORKING_SET_TRANSITION_SEEDED: u64 = 0x02;
+const WORKING_SET_TRANSITION_PAGED_OUT: u64 = 0x04;
+const WORKING_SET_TRANSITION_BACKING_RETAINED: u64 = 0x08;
+const WORKING_SET_TRANSITION_RESTORED: u64 = 0x10;
+const WORKING_SET_TRANSITION_SAME_BACKING: u64 = 0x20;
+const WORKING_SET_TRANSITION_CONTENT: u64 = 0x40;
+const WORKING_SET_TRANSITION_CLEAN: u64 = 0x80;
+const WORKING_SET_TRANSITION_ALL: u64 = 0xff;
+static WORKING_SET_TRANSITION_RAN: AtomicBool = AtomicBool::new(false);
+static WORKING_SET_TRANSITION_SELFTEST: AtomicU64 = AtomicU64::new(0);
+static WORKING_SET_TRANSITION_STATUS: AtomicU64 = AtomicU64::new(SELFTEST_NOT_RUN_STATUS);
+
 // --- MAPPED-DATA SECTION WRITEBACK SELF-TEST ----------------------------------------------------
 const MAPPED_SECTION_WRITEBACK_CREATED: u64 = 0x01;
 const MAPPED_SECTION_WRITEBACK_SEEDED: u64 = 0x02;
@@ -11829,6 +12004,107 @@ pub(crate) unsafe fn private_vm_unmap_selftest(
     print_hex(first as u32);
     print_str(b" second-frame=0x");
     print_hex(second as u32);
+    print_str(b"\n");
+}
+
+pub(crate) unsafe fn working_set_transition_selftest(
+    handler: &mut ExecNtHandler,
+    pi: usize,
+    pml4: u64,
+    scratch_base: u64,
+) {
+    const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+    const MARKER: u8 = 0xa5;
+    if pml4 == 0
+        || scratch_base == 0
+        || WORKING_SET_TRANSITION_RAN
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    let page = PRIVATE_VM_LIMIT - 0x2000;
+    let mut proof = 0u64;
+    let mut first_frame = 0u64;
+    let result = (|| -> Result<(), u32> {
+        vm_unmap_private_page(pi, page);
+        vm_map_private_page(
+            handler,
+            pi,
+            page,
+            nt_address_space::PAGE_READWRITE,
+            pml4,
+            scratch_base,
+        )?;
+        proof |= WORKING_SET_TRANSITION_MAPPED;
+        first_frame = csrss_frame_get_exact(pi as u64, page).0;
+        if first_frame == 0 {
+            return Err(STATUS_UNSUCCESSFUL);
+        }
+        cow_write_frame_byte(first_frame, scratch_base, 0, MARKER)?;
+        proof |= WORKING_SET_TRANSITION_SEEDED;
+
+        if !handler.pageout_owned_working_set_page(pi, page, nt_address_space::PAGE_READWRITE)? {
+            return Err(STATUS_UNSUCCESSFUL);
+        }
+        if csrss_frame_get_exact(pi as u64, page).0 != 0 {
+            return Err(STATUS_UNSUCCESSFUL);
+        }
+        proof |= WORKING_SET_TRANSITION_PAGED_OUT;
+        let transition = (&*core::ptr::addr_of!(PROCESS_PAGEFILE))
+            .page(pi as u64, page)
+            .ok_or(STATUS_UNSUCCESSFUL)?;
+        if transition.backing != first_frame
+            || transition.protection != nt_address_space::PAGE_READWRITE
+        {
+            return Err(STATUS_UNSUCCESSFUL);
+        }
+        proof |= WORKING_SET_TRANSITION_BACKING_RETAINED;
+
+        vm_map_private_page(
+            handler,
+            pi,
+            page,
+            nt_address_space::PAGE_READWRITE,
+            pml4,
+            scratch_base,
+        )?;
+        proof |= WORKING_SET_TRANSITION_RESTORED;
+        let restored_frame = csrss_frame_get_exact(pi as u64, page).0;
+        if restored_frame != first_frame
+            || (&*core::ptr::addr_of!(PROCESS_PAGEFILE)).contains(pi as u64, page)
+        {
+            return Err(STATUS_UNSUCCESSFUL);
+        }
+        proof |= WORKING_SET_TRANSITION_SAME_BACKING;
+        if cow_frame_byte(restored_frame, scratch_base, 0)? != MARKER {
+            return Err(STATUS_UNSUCCESSFUL);
+        }
+        proof |= WORKING_SET_TRANSITION_CONTENT;
+        Ok(())
+    })();
+
+    vm_unmap_private_page(pi, page);
+    if csrss_frame_get_exact(pi as u64, page).0 == 0
+        && !(&*core::ptr::addr_of!(PROCESS_PAGEFILE)).contains(pi as u64, page)
+    {
+        proof |= WORKING_SET_TRANSITION_CLEAN;
+    }
+    let status = match result {
+        Ok(()) if proof == WORKING_SET_TRANSITION_ALL => nt_address_space::STATUS_SUCCESS,
+        Ok(()) => STATUS_UNSUCCESSFUL,
+        Err(status) => status,
+    };
+    WORKING_SET_TRANSITION_SELFTEST.store(proof, Ordering::Relaxed);
+    WORKING_SET_TRANSITION_STATUS.store(status as u64, Ordering::Relaxed);
+    print_str(b"[working-set-transition-run] proof=0x");
+    print_hex(proof as u32);
+    print_str(b"/0x");
+    print_hex(WORKING_SET_TRANSITION_ALL as u32);
+    print_str(b" frame=0x");
+    print_hex(first_frame as u32);
+    print_str(b" status=0x");
+    print_hex(status);
     print_str(b"\n");
 }
 
@@ -12878,6 +13154,10 @@ unsafe fn vm_map_private_page(
     pml4: u64,
     scratch_base: u64,
 ) -> Result<(), u32> {
+    if handler.restore_process_pagefile_page(pi, page, pml4, scratch_base)? {
+        return Ok(());
+    }
+    handler.ensure_process_working_set_admission(pi, page, scratch_base)?;
     vm_ensure_private_pt(handler, pi, page, pml4)?;
     let frame = match vm_frame_acquire(scratch_base) {
         Ok(frame) => frame,
@@ -12959,6 +13239,7 @@ unsafe fn vm_unmap_private_page(pi: usize, page: u64) -> bool {
         VM_LOCK_RECLAIM_REFUSALS.fetch_add(1, Ordering::Relaxed);
         return false;
     }
+    process_pagefile_discard(pi as u64, page);
     if let Some((frame, alias_cap, source_cap, owns_frame)) = csrss_frame_take(pi as u64, page) {
         vm_watch(b"unmap", pi, page, frame);
         if owns_frame {
@@ -13041,6 +13322,38 @@ unsafe fn vm_copy_frame_4k(source_cap: u64, dest_frame: u64, scratch_base: u64) 
     let _ = page_unmap_r(dest_frame);
     let _ = page_unmap_r(source_copy);
     let _ = cnode_delete_recycle_r(source_copy);
+    Ok(())
+}
+
+unsafe fn vm_restore_transition_mapping(
+    pi: usize,
+    page: u64,
+    protection: u32,
+    pml4: u64,
+    frame: u64,
+) -> Result<(), u32> {
+    if page_map_r(frame, page, vm_page_rights(protection), pml4) != 0 {
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let mut alias = 0;
+    let mut alias_cap = 0;
+    if page >= SMSS_ALLOC_VA && page < SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
+        alias = heap_mirror_for_pi(pi) + (page - SMSS_ALLOC_VA);
+        let (copied, copy_error) = copy_cap_r(frame);
+        if copy_error != 0 || page_map_r(copied, alias, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+            if copied != 0 {
+                let _ = cnode_delete_recycle_r(copied);
+            }
+            let _ = page_unmap_r(frame);
+            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+        }
+        alias_cap = copied;
+    }
+    if !csrss_frame_put_at_cap(pi as u64, page, frame, alias, alias_cap) {
+        let _ = page_unmap_r(frame);
+        recycle_mapped_cap(alias_cap);
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
     Ok(())
 }
 

@@ -86,6 +86,24 @@ impl ClientFrameRegistry {
     ) -> Result<ClientFrameInsert, ClientFrameInsertError> {
         let age = self.next_age;
         self.next_age = self.next_age.saturating_add(1);
+        self.insert_at_age(
+            pi, page, frame, alias, alias_cap, source_cap, owns_frame, age,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_at_age(
+        &mut self,
+        pi: u64,
+        page: u64,
+        frame: u64,
+        alias: u64,
+        alias_cap: u64,
+        source_cap: u64,
+        owns_frame: bool,
+        age: u64,
+    ) -> Result<ClientFrameInsert, ClientFrameInsertError> {
+        self.next_age = self.next_age.max(age.saturating_add(1));
         if let Some(index) = self.index_for(pi, page) {
             let record = &mut self.records[index];
             if record.frame != frame {

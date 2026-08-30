@@ -2849,6 +2849,12 @@ existing synchronous DMA/PnP fixture so the two lifecycle modes remain independe
   fault verdicts, committed-view range teardown, top-down placement, cross-authority overlap
   rejection, and bounded auto-placement retry around fixed authorities. Reopen C4 only for a newly
   observed VM semantic gap.
+- `[~]` C5: Complete per-process resident working-set ownership and
+  `JOB_OBJECT_LIMIT_WORKINGSET`. MM now owns generation-checked limits, resident snapshots, fluidity
+  validation, trimming, hard admission, and exact transition backing for private/COW pages; Ps owns
+  only job policy and membership. Focused host validation and the freestanding executive check are
+  green. The serialized desktop proof, including the real transition/refault gate, remains before
+  closure.
 
 ### D. Registry And Filesystem Durability
 
@@ -17589,12 +17595,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
 
     The no-std `nt-memory-manager` owner now provides generation-checked per-process working-set
     policy, oldest-eligible victim plans, explicit locked/non-evictable exclusion, hard-limit admission
-    plans, and a private-page backing store. Pagefile writes own complete 4 KiB contents before frame
-    teardown; multi-page batches reserve and copy every record before publication, and stale policy or
-    pagefile plans fail without mutation. Per-process rundown removes exact backing records. The
-    existing client-frame registry now records replacement age, so eviction order belongs to the same
-    record that owns the process mapping and its seL4 caps. Focused `nt-memory-manager` validation
-    passes `30/30` without warnings.
+    plans, and opaque transition-page ownership. A transition record retains the exact unmapped frame
+    capability and protection after every process/alias mapping is detached, so private contents are
+    preserved without duplicating 4 KiB into the non-reclaiming executive heap. Publication is
+    capacity-reserved and generation-checked; failed refault remaps restore the same record, and
+    per-process rundown releases exact backing capabilities. The existing client-frame registry now
+    records replacement age, so eviction order belongs to the same record that owns the process
+    mapping and its seL4 caps. This is process working-set removal analogous to an NT transition or
+    standby page; it deliberately does not claim physical-page reclamation. A later global
+    memory-pressure page writer can replace the opaque backing capability with a disk pagefile slot
+    without changing job policy or fault admission.
 
     Review adjustment: do not enable `JOB_OBJECT_LIMIT_WORKINGSET` yet. The executive currently has
     two real resident-map owners: the growable client-frame registry covers private, mapped-section,
@@ -17606,3 +17616,34 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     assignment/inheritance, disable, and process rundown transactionally and remove the syscall's
     disabled flag handling. A short maximum must fail when locked pages make it non-fluid; it must
     never silently exceed the limit or discard private contents.
+
+    Working-set executive composition (2026-08-30, focused validation accepted; serialized desktop
+    proof remains): the executive now builds one resident snapshot from the client-frame registry,
+    clean shared-image cap bank, KUSER fixed mapping, and the VM lock owner. The MM victim planner
+    counts locked and otherwise non-evictable entries ahead of the eight-page fluid reserve, clamps a
+    requested minimum to the native 20-page process floor, trims before limit publication, and chooses
+    a replacement before every hard-limit admission. Shared mapped/image victims drop only their
+    process mapping and refault from the existing section/cache owner. Owned private and COW victims
+    detach win32k aliases and process PTEs, publish their exact frame as transition backing, and restore
+    that same capability and protection on the private, mapped-section, or image fault path.
+
+    `JOB_OBJECT_LIMIT_WORKINGSET` is now accepted by both basic and extended job setters. Ps validates
+    and publishes byte-valued policy; the executive checks `SeIncreaseBasePriorityPrivilege` above the
+    native minimum; MM prepares and commits each member's limit; existing assignment and inherited
+    child creation apply the same policy; clearing the flag disables hard enforcement; and failed child
+    creation plus process-slot rundown remove the exact MM owner and transition frames. Commitment
+    accounting remains independent. The old disabled-flag handling and the temporary heap-backed
+    pagefile design are absent.
+
+    A post-quiesce executive proof now maps a real private page, mutates it through an independent cap,
+    transitions the owned frame out of the process, verifies that the registry/PTE are absent while the
+    exact backing remains, refaults through `vm_map_private_page`, verifies identical frame identity and
+    byte content, then tears down both resident and transition state. Focused validation passes
+    `nt-memory-manager` `31/31` and `nt-process` `148/148`; formatting, `git diff --check`, and the
+    freestanding executive check pass at the established 209-warning baseline.
+
+    Review adjustment: run the serialized release/desktop proof next. Require the new
+    `exec_working_set_transition_restored` gate, genuine userinit/Explorer launch, real callback/WndProc
+    activity, complete shell framebuffer paint, zero pool regressions, and the sentinel before marking
+    C5 complete. Physical reclamation under global pressure remains a separate MM page-writer frontier;
+    do not relabel the current transition-frame owner as disk paging or reintroduce heap copies.

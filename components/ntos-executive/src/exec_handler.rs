@@ -2876,8 +2876,8 @@ fn zeroed_temporary_process_slot_vec() -> alloc::vec::Vec<nt_process::ProcessId>
 fn registered_win32_callouts_for_manager(
     pm: &mut nt_process::ProcessManager,
 ) -> Result<nt_process::Win32Callouts, u32> {
-    let registered = win32k_subsystem::registered_win32k_callouts()
-        .ok_or(STATUS_DEVICE_NOT_READY)?;
+    let registered =
+        win32k_subsystem::registered_win32k_callouts().ok_or(STATUS_DEVICE_NOT_READY)?;
     match pm.win32_callouts() {
         Some(current) if current == registered => Ok(current),
         Some(_) => Err(nt_process::STATUS_INVALID_PARAMETER),
@@ -3021,9 +3021,8 @@ pub(crate) fn win32_job_callout_selftest() -> u64 {
                 byte_len,
                 0,
             );
-            private_atom = core::ptr::read_volatile(
-                win32k_subsystem::WIN32K_JOB_ATOM_VADDR as *const u16,
-            );
+            private_atom =
+                core::ptr::read_volatile(win32k_subsystem::WIN32K_JOB_ATOM_VADDR as *const u16);
             if add_status == 0
                 && private_atom >= 0xC000
                 && stage_win32_job_atom_name(&ATOM_NAME)
@@ -3092,9 +3091,7 @@ pub(crate) fn win32_job_callout_selftest() -> u64 {
         .is_ok()
         {
             proof |= 0x08;
-            if pm.commit_job_ui_restrictions(plan).is_ok()
-                && pm.job_ui_restrictions(job) == Ok(0)
-            {
+            if pm.commit_job_ui_restrictions(plan).is_ok() && pm.job_ui_restrictions(job) == Ok(0) {
                 proof |= 0x10;
             }
         }
@@ -9800,6 +9797,36 @@ impl ExecNtHandler {
             self.rollback_hosted_process_creation(child_pi, pid);
             return Err(status);
         }
+        if let Some(job) = selected_job {
+            let limits = match self.pm.job_extended_limits(job) {
+                Ok(limits) => limits,
+                Err(status) => {
+                    self.rollback_hosted_process_creation(child_pi, pid);
+                    return Err(status);
+                }
+            };
+            if limits.basic.limit_flags & nt_process::job::JOB_OBJECT_LIMIT_WORKINGSET != 0 {
+                let plan = unsafe {
+                    self.prepare_process_working_set_policy(
+                        child_pi,
+                        limits.basic.minimum_working_set_size,
+                        limits.basic.maximum_working_set_size,
+                        true,
+                        true,
+                    )
+                };
+                match plan {
+                    Ok(plan) => unsafe {
+                        self.commit_process_working_set_policy(&plan)
+                            .expect("a private child has no competing working-set publication");
+                    },
+                    Err(status) => {
+                        self.rollback_hosted_process_creation(child_pi, pid);
+                        return Err(status);
+                    }
+                }
+            }
+        }
         for slot in 0..PM_RUNTIME_THREAD_SLOTS {
             let tid = match self.pm.create_dormant_thread(pid) {
                 Ok(tid) => tid,
@@ -9851,6 +9878,7 @@ impl ExecNtHandler {
         debug_assert!(deletion.exception_port.is_none());
         self.process_vspaces[pi] = 0;
         self.pool_used[pi] = 0;
+        unsafe { process_working_set_retire(pi) };
         self.clear_hosted_tp_worker_windows(pi);
         self.drain_job_notifications();
         self.drain_job_destructions();
@@ -15791,15 +15819,184 @@ impl ExecNtHandler {
         self.process_commit.set_limit(pid, limit)
     }
 
+    unsafe fn pageout_working_set_victims(
+        &mut self,
+        pi: usize,
+        victims: &[u64],
+    ) -> Result<(), u32> {
+        for page in victims.iter().copied() {
+            if vm_page_lock_is_locked(pi as u64, page) {
+                return Err(nt_memory_manager::STATUS_BAD_WORKING_SET_LIMIT);
+            }
+            if let Some(record) = csrss_frame_get_exact_record(pi as u64, page) {
+                if record.owns_frame {
+                    let information = self.query_memory_basic_information(pi, page)?;
+                    let protection = match information.type_ {
+                        nt_address_space::MEM_MAPPED => {
+                            nt_address_space::mapped_view_fault_plan(information.protect, true)
+                                .map_protection
+                        }
+                        nt_address_space::MEM_IMAGE => {
+                            nt_address_space::image_view_fault_plan(information.protect, true)
+                                .map_protection
+                        }
+                        _ => information.protect,
+                    };
+                    if self.pageout_owned_working_set_page(pi, page, protection)? {
+                        continue;
+                    }
+                }
+            }
+            if !process_working_set_pageout_mapping(pi, page) {
+                return Err(nt_process::STATUS_INVALID_PARAMETER);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) unsafe fn pageout_owned_working_set_page(
+        &mut self,
+        pi: usize,
+        page: u64,
+        protection: u32,
+    ) -> Result<bool, u32> {
+        if vm_page_lock_is_locked(pi as u64, page) {
+            return Err(nt_memory_manager::STATUS_BAD_WORKING_SET_LIMIT);
+        }
+        let Some(record) = csrss_frame_get_exact_record(pi as u64, page) else {
+            return Ok(false);
+        };
+        if !record.owns_frame {
+            return Ok(false);
+        }
+        let pagefile = &mut *core::ptr::addr_of_mut!(PROCESS_PAGEFILE);
+        let publish = pagefile.prepare_publish(nt_memory_manager::PagefilePage {
+            owner: pi as u64,
+            page,
+            protection,
+            backing: record.frame,
+        })?;
+        detach_win32k_attached_page_for_thread_release(pi, page);
+        if page_unmap_r(record.frame) != 0 {
+            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+        }
+        recycle_mapped_cap(record.alias_cap);
+        if record.source_cap != 0
+            && record.source_cap != record.frame
+            && record.source_cap != record.alias_cap
+        {
+            recycle_plain_cap(record.source_cap);
+        }
+        let removed = csrss_frame_take(pi as u64, page)
+            .expect("serialized pageout retains its exact resident-frame record");
+        debug_assert_eq!(removed.0, record.frame);
+        pagefile
+            .commit_publish(publish)
+            .expect("prepared transition slot commits without allocation");
+        Ok(true)
+    }
+
+    unsafe fn prepare_process_working_set_policy(
+        &mut self,
+        pi: usize,
+        minimum_bytes: u64,
+        maximum_bytes: u64,
+        hard_limit: bool,
+        increase_ok: bool,
+    ) -> Result<nt_memory_manager::WorkingSetAdjustmentPlan, u32> {
+        process_working_set_register(pi)?;
+        let pages = process_working_set_resident_pages(pi)?;
+        let plan = (&mut *core::ptr::addr_of_mut!(PROCESS_WORKING_SETS)).prepare_adjustment(
+            pi as u64,
+            minimum_bytes,
+            maximum_bytes,
+            increase_ok,
+            hard_limit,
+            &pages,
+        )?;
+        if !plan.victims().is_empty() {
+            self.pageout_working_set_victims(pi, plan.victims())?;
+        }
+        Ok(plan)
+    }
+
+    unsafe fn prepare_process_working_set_enforcement(
+        &mut self,
+        pi: usize,
+        hard_limit: bool,
+    ) -> Result<nt_memory_manager::WorkingSetAdjustmentPlan, u32> {
+        process_working_set_register(pi)?;
+        (&*core::ptr::addr_of!(PROCESS_WORKING_SETS)).prepare_enforcement(pi as u64, hard_limit)
+    }
+
+    unsafe fn commit_process_working_set_policy(
+        &mut self,
+        plan: &nt_memory_manager::WorkingSetAdjustmentPlan,
+    ) -> Result<(), u32> {
+        (&mut *core::ptr::addr_of_mut!(PROCESS_WORKING_SETS)).commit_adjustment(plan)
+    }
+
+    pub(crate) unsafe fn ensure_process_working_set_admission(
+        &mut self,
+        pi: usize,
+        page: u64,
+        _scratch_base: u64,
+    ) -> Result<(), u32> {
+        let table = &mut *core::ptr::addr_of_mut!(PROCESS_WORKING_SETS);
+        let Some(limits) = table.limits(pi as u64) else {
+            return Ok(());
+        };
+        if !limits.hard_limit || vm_page_is_resident(pi, page) {
+            return Ok(());
+        }
+        let pages = process_working_set_resident_pages(pi)?;
+        let plan = table.prepare_admission(pi as u64, page, &pages)?;
+        self.pageout_working_set_victims(pi, plan.victims())?;
+        (&*core::ptr::addr_of!(PROCESS_WORKING_SETS)).validate_admission(&plan)
+    }
+
+    pub(crate) unsafe fn restore_process_pagefile_page(
+        &mut self,
+        pi: usize,
+        page: u64,
+        pml4: u64,
+        scratch_base: u64,
+    ) -> Result<bool, u32> {
+        if !(&*core::ptr::addr_of!(PROCESS_PAGEFILE)).contains(pi as u64, page) {
+            return Ok(false);
+        }
+        self.ensure_process_working_set_admission(pi, page, scratch_base)?;
+        vm_ensure_private_pt(self, pi, page, pml4)?;
+        let pagefile = &mut *core::ptr::addr_of_mut!(PROCESS_PAGEFILE);
+        let transition = pagefile
+            .take(pi as u64, page)
+            .map_err(|_| nt_process::STATUS_INSUFFICIENT_RESOURCES)?
+            .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        if let Err(status) =
+            vm_restore_transition_mapping(pi, page, transition.protection, pml4, transition.backing)
+        {
+            pagefile
+                .restore(transition)
+                .expect("taking a transition record retains its vector capacity");
+            return Err(status);
+        }
+        Ok(true)
+    }
+
     unsafe fn set_job_extended_limits_transactional(
         &mut self,
         id: nt_process::job::JobId,
         limits: nt_process::job::JobExtendedLimits,
     ) -> Result<(), u32> {
         let ps_plan = self.pm.prepare_job_extended_limits(id, limits)?;
+        let previous = self.pm.job_extended_limits(id)?;
         let process_ids = self.pm.job_active_process_ids_owned(id)?;
         let mut mm_plans = alloc::vec::Vec::new();
+        let mut working_set_plans = alloc::vec::Vec::new();
         mm_plans
+            .try_reserve_exact(process_ids.len())
+            .map_err(|_| nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
+        working_set_plans
             .try_reserve_exact(process_ids.len())
             .map_err(|_| nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
 
@@ -15819,6 +16016,18 @@ impl ExecNtHandler {
         }
 
         let effective = ps_plan.limits();
+        let working_set_enabled =
+            effective.basic.limit_flags & nt_process::job::JOB_OBJECT_LIMIT_WORKINGSET != 0;
+        let working_set_was_enabled =
+            previous.basic.limit_flags & nt_process::job::JOB_OBJECT_LIMIT_WORKINGSET != 0;
+        if working_set_enabled
+            && effective.basic.minimum_working_set_size
+                > nt_memory_manager::DEFAULT_WORKING_SET_MINIMUM_PAGES
+                    * nt_memory_manager::WORKING_SET_PAGE_SIZE
+            && !self.current_token_has_privilege(nt_security::SE_INCREASE_BASE_PRIORITY)
+        {
+            return Err(STATUS_PRIVILEGE_NOT_HELD);
+        }
         let process_limit = if effective.basic.limit_flags
             & nt_process::job::JOB_OBJECT_LIMIT_PROCESS_MEMORY
             != 0
@@ -15827,17 +16036,38 @@ impl ExecNtHandler {
         } else {
             0
         };
-        for pid in process_ids {
+        for pid in process_ids.iter().copied() {
             mm_plans.push(
                 self.process_commit
                     .prepare_limit_update(pid, process_limit)?,
             );
+            if working_set_enabled || working_set_was_enabled {
+                let pi = self
+                    .pi_for_pid(pid)
+                    .expect("validated hosted process remains published during syscall");
+                let plan = if working_set_enabled {
+                    self.prepare_process_working_set_policy(
+                        pi,
+                        effective.basic.minimum_working_set_size,
+                        effective.basic.maximum_working_set_size,
+                        true,
+                        true,
+                    )?
+                } else {
+                    self.prepare_process_working_set_enforcement(pi, false)?
+                };
+                working_set_plans.push(plan);
+            }
         }
 
         self.pm.commit_job_extended_limits(ps_plan)?;
         self.process_commit
             .commit_limit_updates(&mm_plans)
             .expect("serialized job-limit plans remain current through publication");
+        for plan in &working_set_plans {
+            self.commit_process_working_set_policy(plan)
+                .expect("serialized working-set plans remain current through Ps publication");
+        }
         self.refresh_job_time_sampling();
         Ok(())
     }
@@ -17457,6 +17687,7 @@ impl ExecNtHandler {
                     )
                 };
                 service_image_page_residency(
+                    self,
                     target_pi,
                     plan.page,
                     base,
@@ -19287,10 +19518,7 @@ impl ExecNtHandler {
         if self.token_store.retain(token).is_err() {
             return STATUS_INVALID_HANDLE;
         }
-        let old = match self
-            .pm
-            .replace_process_primary_token(target, Some(token))
-        {
+        let old = match self.pm.replace_process_primary_token(target, Some(token)) {
             Ok(old) => old,
             Err(status) => {
                 let _ = self.token_store.release(token);
@@ -23176,9 +23404,7 @@ impl ExecNtHandler {
         {
             return Err(ERROR_INVALID_PARAMETER);
         }
-        let caller = self
-            .pm_pid_for_pi(self.pi)
-            .ok_or(ERROR_INVALID_PARAMETER)?;
+        let caller = self.pm_pid_for_pi(self.pi).ok_or(ERROR_INVALID_PARAMETER)?;
         if self.pm.process_job(caller) == Some(id) {
             return Err(ERROR_ACCESS_DENIED);
         }
@@ -23311,12 +23537,7 @@ impl ExecNtHandler {
     }
 
     fn job_atom_delete(&mut self, job: nt_process::job::JobId, atom: u16) -> u32 {
-        self.dispatch_win32_job_atom(
-            job,
-            win32k_subsystem::WIN32_JOB_ATOM_DELETE,
-            atom as u64,
-            0,
-        )
+        self.dispatch_win32_job_atom(job, win32k_subsystem::WIN32_JOB_ATOM_DELETE, atom as u64, 0)
     }
 
     unsafe fn job_atom_query(
@@ -23920,6 +24141,30 @@ impl ExecNtHandler {
             Ok(assignment) => assignment,
             Err(status) => return status,
         };
+        let working_set_plan = if assignment.status() == 0 {
+            let limits = match self.pm.job_extended_limits(id) {
+                Ok(limits) => limits,
+                Err(status) => return status,
+            };
+            if limits.basic.limit_flags & nt_process::job::JOB_OBJECT_LIMIT_WORKINGSET != 0 {
+                match unsafe {
+                    self.prepare_process_working_set_policy(
+                        target_pi,
+                        limits.basic.minimum_working_set_size,
+                        limits.basic.maximum_working_set_size,
+                        true,
+                        true,
+                    )
+                } {
+                    Ok(plan) => Some(plan),
+                    Err(status) => return status,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let ui_restrictions = match self.pm.job_ui_restrictions(id) {
             Ok(restrictions) => restrictions,
             Err(status) => return status,
@@ -23979,6 +24224,14 @@ impl ExecNtHandler {
                 return status;
             }
         };
+        if status == 0 {
+            if let Some(plan) = &working_set_plan {
+                unsafe {
+                    self.commit_process_working_set_policy(plan)
+                        .expect("serialized assignment preserves its prepared MM policy");
+                }
+            }
+        }
         if let Some(token) = replacement_token {
             let old = self
                 .pm
@@ -24185,8 +24438,7 @@ impl ExecNtHandler {
                     Ok(actual) => actual,
                     Err(required) => {
                         if args[4] != 0
-                            && !self
-                                .xas_try_write_buf(args[4], &(required as u32).to_le_bytes())
+                            && !self.xas_try_write_buf(args[4], &(required as u32).to_le_bytes())
                         {
                             return STATUS_ACCESS_VIOLATION;
                         }
@@ -24253,6 +24505,7 @@ impl ExecNtHandler {
         const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
         const SUPPORTED_BASIC_LIMIT_FLAGS: u32 = nt_process::job::JOB_OBJECT_LIMIT_PROCESS_TIME
             | nt_process::job::JOB_OBJECT_LIMIT_JOB_TIME
+            | nt_process::job::JOB_OBJECT_LIMIT_WORKINGSET
             | nt_process::job::JOB_OBJECT_LIMIT_ACTIVE_PROCESS
             | nt_process::job::JOB_OBJECT_LIMIT_AFFINITY
             | nt_process::job::JOB_OBJECT_LIMIT_PRIORITY_CLASS
@@ -24294,17 +24547,20 @@ impl ExecNtHandler {
         }
         match class {
             nt_process::job_abi::JobInformationClass::BasicLimit => {
-                let limits = nt_process::job_abi::decode_basic_limits(&input[..length]).unwrap();
+                let mut limits =
+                    nt_process::job_abi::decode_basic_limits(&input[..length]).unwrap();
                 if limits.limit_flags & !SUPPORTED_BASIC_LIMIT_FLAGS != 0 {
                     return STATUS_NOT_SUPPORTED;
                 }
-                match self.pm.set_job_basic_limits(id, limits) {
-                    Ok(()) => {
-                        self.refresh_job_time_sampling();
-                        0
-                    }
-                    Err(status) => status,
-                }
+                let mut extended = match self.pm.job_extended_limits(id) {
+                    Ok(extended) => extended,
+                    Err(status) => return status,
+                };
+                limits.limit_flags |= extended.basic.limit_flags
+                    & !nt_process::job::JOB_OBJECT_BASIC_LIMIT_VALID_FLAGS;
+                extended.basic = limits;
+                self.set_job_extended_limits_transactional(id, extended)
+                    .map_or_else(|status| status, |()| 0)
             }
             nt_process::job_abi::JobInformationClass::ExtendedLimit => {
                 let limits = nt_process::job_abi::decode_extended_limits(&input[..length]).unwrap();
@@ -24419,12 +24675,10 @@ impl ExecNtHandler {
                 };
                 let filter = if requested & nt_process::job::JOB_OBJECT_SECURITY_FILTER_TOKENS != 0
                 {
-                    let sids_to_disable =
-                        u64::from_le_bytes(input[16..24].try_into().unwrap());
+                    let sids_to_disable = u64::from_le_bytes(input[16..24].try_into().unwrap());
                     let privileges_to_delete =
                         u64::from_le_bytes(input[24..32].try_into().unwrap());
-                    let restricted_sids =
-                        u64::from_le_bytes(input[32..40].try_into().unwrap());
+                    let restricted_sids = u64::from_le_bytes(input[32..40].try_into().unwrap());
                     Some(nt_security::JobTokenFilter {
                         sids_to_disable: if sids_to_disable == 0 {
                             alloc::vec::Vec::new()
@@ -31141,12 +31395,7 @@ impl ExecNtHandler {
                 };
                 let add = ctx.service == NativeService::NtAddAtom;
                 let result = if let Some(job) = private_job {
-                    self.job_atom_add_or_find(
-                        job,
-                        add,
-                        integer,
-                        &name[..byte_len as usize / 2],
-                    )
+                    self.job_atom_add_or_find(job, add, integer, &name[..byte_len as usize / 2])
                 } else {
                     match (ctx.service, integer) {
                         (NativeService::NtAddAtom, Some(atom)) => {

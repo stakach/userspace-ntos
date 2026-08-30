@@ -1111,8 +1111,9 @@ impl JobStore {
             return Err(crate::STATUS_INVALID_PARAMETER);
         }
         if limits.limit_flags & JOB_OBJECT_LIMIT_WORKINGSET != 0
-            && (limits.minimum_working_set_size == 0
-                || limits.maximum_working_set_size == 0
+            && ((limits.minimum_working_set_size == 0 && limits.maximum_working_set_size == 0)
+                || (limits.minimum_working_set_size == u64::MAX
+                    && limits.maximum_working_set_size == u64::MAX)
                 || limits.minimum_working_set_size > limits.maximum_working_set_size)
         {
             return Err(crate::STATUS_INVALID_PARAMETER);
@@ -1736,6 +1737,35 @@ mod tests {
             jobs.create_set(&[(first, 4), (second, 5)]),
             Err(crate::STATUS_INVALID_PARAMETER)
         );
+    }
+
+    #[test]
+    fn working_set_limit_validation_matches_the_native_job_contract() {
+        let mut jobs = JobStore::new();
+        let job = jobs.create(0).unwrap();
+        let limits = |minimum, maximum| JobExtendedLimits {
+            basic: JobBasicLimits {
+                limit_flags: JOB_OBJECT_LIMIT_WORKINGSET,
+                minimum_working_set_size: minimum,
+                maximum_working_set_size: maximum,
+                ..JobBasicLimits::default()
+            },
+            ..JobExtendedLimits::default()
+        };
+
+        assert_eq!(
+            jobs.set_extended_limits(job, limits(0, 0)),
+            Err(crate::STATUS_INVALID_PARAMETER)
+        );
+        assert_eq!(
+            jobs.set_extended_limits(job, limits(u64::MAX, u64::MAX)),
+            Err(crate::STATUS_INVALID_PARAMETER)
+        );
+        assert_eq!(
+            jobs.set_extended_limits(job, limits(0x3000, 0x2000)),
+            Err(crate::STATUS_INVALID_PARAMETER)
+        );
+        jobs.set_extended_limits(job, limits(0, 0x20_000)).unwrap();
     }
 
     #[test]
