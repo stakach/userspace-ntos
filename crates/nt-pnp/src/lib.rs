@@ -31,9 +31,11 @@ mod pci_interrupt_routes;
 mod pci_inventory;
 
 pub use acpi_pci_scope_catalog::{
-    AcpiPciBridgeScopeFact, AcpiPciProviderEndpoint, AcpiPciResolvedScope, AcpiPciRootScopeFact,
-    AcpiPciScopeCatalog, AcpiPciScopeError, AcpiPciScopeSource, PreparedAcpiPciScopeCatalogUpdate,
-    PreparedAcpiPciScopeResolution,
+    acpi_pci_root_hardware_id, build_acpi_pci_root_scope_fact, plan_acpi_pci_scope_methods,
+    AcpiPciAddressMethodQuery, AcpiPciAddressScopeFact, AcpiPciProviderEndpoint,
+    AcpiPciResolvedScope, AcpiPciRootHardwareId, AcpiPciRootScopeFact, AcpiPciScopeCatalog,
+    AcpiPciScopeError, AcpiPciScopeMethodPlan, AcpiPciScopeSource,
+    PreparedAcpiPciScopeCatalogUpdate, PreparedAcpiPciScopeResolution,
 };
 pub use pci_interrupt_routes::{
     PciInterruptRoute, PciInterruptRouteClaim, PciInterruptRouteError, PciInterruptRouteOwner,

@@ -20031,3 +20031,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     link `_CRS`. Prepare the complete catalog update before CM mutation, commit it after the existing
     devnode/BusRelations commits and before invalidation completion, then schedule the serialized
     catalog/inventory reconciler. No unrelated relation may churn route generations.
+
+    B3 ACPI PCI root/scope acceptance checkpoint (2026-08-31, crate accepted): `nt-pnp` now
+    classifies only exact case-insensitive `ACPI\\PNP0A03` and `ACPI\\PNP0A08` root identities and
+    builds a root scope only when `_BBN` agrees with the provider's exact current-resource shape:
+    one `Internal` full descriptor, BusNumber 0, version/revision 1, one device-exclusive BusNumber
+    descriptor, zero flags/reserved, matching Start, and Length 1. Segment and bus values are range
+    checked; nonzero segment remains a later inventory-resolution barrier rather than being silently
+    truncated. Missing-method defaults remain a transport decision and are not fabricated here.
+
+    Filtered `_ADR` and `_PRT` results now enter a pure canonical method planner. It derives exact
+    owning scopes, marks a root `_PRT` separately, preserves parent-first full-path `_ADR` queries,
+    and rejects wrong filter results, duplicate owners, address scopes outside the root, or any
+    descendant `_PRT` without an exact `_ADR`. Catalog input now retains all address-scope facts,
+    because ordinary endpoints also own `_ADR`; reconciliation ignores live ordinary endpoints,
+    retains actual PCI bridges and their SecondaryBus windows, and rejects a `_PRT` owner that is
+    absent or not a bridge. Route coverage requires a resolved scope that actually owns `_PRT`, not
+    merely a bus-bearing namespace object. Focused `nt-pnp` validation passes 56/56.
+
+    Review adjustment: the next implementation slice is now mechanical transport rather than policy:
+    extend the retained relation query with resumable exact `_SEG`/`_BBN` evaluations, filtered
+    `_ADR`/`_PRT` enumeration, and the planned sequence of full-path `_ADR` evaluations. Assemble
+    one complete authenticated `AcpiPciScopeSource`, prepare its catalog replacement before durable
+    CM mutation, and commit it at the existing relation transaction boundary. Route-table and link
+    evaluation follows against the resulting resolved scope catalog.
