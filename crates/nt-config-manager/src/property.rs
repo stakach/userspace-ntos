@@ -120,7 +120,7 @@ impl PropertyValue {
 }
 
 /// A device's property bag (spec §11.5): legacy ordinal properties + modern `DEVPROPKEY`s.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PropertyBag {
     legacy: Vec<(u32, PropertyValue)>,
     devprops: Vec<(DevPropKey, PropertyValue)>,

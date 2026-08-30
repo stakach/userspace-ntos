@@ -166,10 +166,239 @@ pub struct DriverServiceLaunchSpec {
 /// This is the semantic Configuration Manager result consumed by `NtLoadDriver` and the PnP
 /// device-action owner. The registry remains authoritative; callers obtain this through
 /// [`ConfigManager::driver_service_binding`], which refreshes the Enum index before selection.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DriverServiceBinding {
     pub service: DriverServiceLaunchSpec,
     pub devnodes: Vec<DevnodeRecord>,
+}
+
+/// Immutable Configuration Manager identity used by the kernel PnP device-action owner.
+///
+/// A publication exists even when the devnode does not currently name a launchable driver
+/// service. This keeps topology change reporting separate from driver-load policy and lets a later
+/// registry generation repair an incomplete binding without manufacturing a second device.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DevnodePublication {
+    pub instance_id: String,
+    pub service: Option<DriverServiceLaunchSpec>,
+    pub pdo_name: Option<String>,
+    pub driver_key: Option<String>,
+    pub linkage_export: Option<String>,
+    pub hardware_ids: Vec<String>,
+    pub compatible_ids: Vec<String>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DeviceActionKind {
+    Arrival,
+    Change,
+    Removal,
+}
+
+/// One immutable topology change. `publication` is the new identity for arrival/change and the
+/// last published identity for removal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceActionEvent {
+    pub sequence: u64,
+    pub mount_generation: u64,
+    pub kind: DeviceActionKind,
+    pub publication: DevnodePublication,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DeviceActionJournalError {
+    InvalidGeneration,
+    AlreadySeeded,
+    DuplicateInstance,
+    StaleAcknowledgement,
+    InsufficientResources,
+}
+
+/// Generation-exact change journal between the CM registry authority and the PnP action owner.
+///
+/// The initial mounted hive seeds `known` without producing fake arrivals. Every later publication
+/// diffs a complete semantic snapshot, appends ordered immutable events, and advances the baseline
+/// only after all growable table storage has been reserved. Consumers may acknowledge only the
+/// exact head sequence, preventing a retry from skipping or duplicating a device action.
+pub struct DeviceActionJournal {
+    known: Vec<DevnodePublication>,
+    pending: Vec<DeviceActionEvent>,
+    last_mount_generation: u64,
+    next_sequence: u64,
+}
+
+impl Default for DeviceActionJournal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DeviceActionJournal {
+    pub const fn new() -> Self {
+        Self {
+            known: Vec::new(),
+            pending: Vec::new(),
+            last_mount_generation: 0,
+            next_sequence: 1,
+        }
+    }
+
+    pub fn seed(
+        &mut self,
+        mount_generation: u64,
+        current: &[DevnodePublication],
+    ) -> Result<(), DeviceActionJournalError> {
+        if mount_generation == 0 {
+            return Err(DeviceActionJournalError::InvalidGeneration);
+        }
+        if self.last_mount_generation != 0 || !self.known.is_empty() || !self.pending.is_empty() {
+            return Err(DeviceActionJournalError::AlreadySeeded);
+        }
+        validate_publication_set(current)?;
+        let mut known = Vec::new();
+        known
+            .try_reserve_exact(current.len())
+            .map_err(|_| DeviceActionJournalError::InsufficientResources)?;
+        known.extend_from_slice(current);
+        self.known = known;
+        self.last_mount_generation = mount_generation;
+        Ok(())
+    }
+
+    pub fn publish(
+        &mut self,
+        mount_generation: u64,
+        current: &[DevnodePublication],
+    ) -> Result<usize, DeviceActionJournalError> {
+        if self.last_mount_generation == 0 || mount_generation <= self.last_mount_generation {
+            return Err(DeviceActionJournalError::InvalidGeneration);
+        }
+        validate_publication_set(current)?;
+
+        let changed_or_added = current
+            .iter()
+            .filter(|publication| {
+                self.known
+                    .iter()
+                    .find(|known| same_instance(known, publication))
+                    .is_none_or(|known| known != *publication)
+            })
+            .count();
+        let removed = self
+            .known
+            .iter()
+            .filter(|known| {
+                !current
+                    .iter()
+                    .any(|publication| same_instance(known, publication))
+            })
+            .count();
+        let event_count = changed_or_added
+            .checked_add(removed)
+            .ok_or(DeviceActionJournalError::InsufficientResources)?;
+        let event_count_u64 = u64::try_from(event_count)
+            .map_err(|_| DeviceActionJournalError::InsufficientResources)?;
+        let next_sequence = self
+            .next_sequence
+            .checked_add(event_count_u64)
+            .ok_or(DeviceActionJournalError::InsufficientResources)?;
+
+        let mut next_known = Vec::new();
+        next_known
+            .try_reserve_exact(current.len())
+            .map_err(|_| DeviceActionJournalError::InsufficientResources)?;
+        next_known.extend_from_slice(current);
+
+        let mut events = Vec::new();
+        events
+            .try_reserve_exact(event_count)
+            .map_err(|_| DeviceActionJournalError::InsufficientResources)?;
+        let mut sequence = self.next_sequence;
+        for publication in current {
+            let previous = self
+                .known
+                .iter()
+                .find(|known| same_instance(known, publication));
+            let kind = match previous {
+                None => Some(DeviceActionKind::Arrival),
+                Some(previous) if previous != publication => Some(DeviceActionKind::Change),
+                Some(_) => None,
+            };
+            if let Some(kind) = kind {
+                events.push(DeviceActionEvent {
+                    sequence,
+                    mount_generation,
+                    kind,
+                    publication: publication.clone(),
+                });
+                sequence += 1;
+            }
+        }
+        for publication in &self.known {
+            if !current
+                .iter()
+                .any(|current| same_instance(publication, current))
+            {
+                events.push(DeviceActionEvent {
+                    sequence,
+                    mount_generation,
+                    kind: DeviceActionKind::Removal,
+                    publication: publication.clone(),
+                });
+                sequence += 1;
+            }
+        }
+        debug_assert_eq!(events.len(), event_count);
+        debug_assert_eq!(sequence, next_sequence);
+
+        self.pending
+            .try_reserve_exact(events.len())
+            .map_err(|_| DeviceActionJournalError::InsufficientResources)?;
+        self.pending.extend(events);
+        self.known = next_known;
+        self.last_mount_generation = mount_generation;
+        self.next_sequence = next_sequence;
+        Ok(event_count)
+    }
+
+    pub fn peek(&self) -> Option<&DeviceActionEvent> {
+        self.pending.first()
+    }
+
+    pub fn acknowledge(&mut self, sequence: u64) -> Result<(), DeviceActionJournalError> {
+        if self.pending.first().map(|event| event.sequence) != Some(sequence) {
+            return Err(DeviceActionJournalError::StaleAcknowledgement);
+        }
+        self.pending.remove(0);
+        Ok(())
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub const fn last_mount_generation(&self) -> u64 {
+        self.last_mount_generation
+    }
+}
+
+fn same_instance(left: &DevnodePublication, right: &DevnodePublication) -> bool {
+    left.instance_id.eq_ignore_ascii_case(&right.instance_id)
+}
+
+fn validate_publication_set(
+    publications: &[DevnodePublication],
+) -> Result<(), DeviceActionJournalError> {
+    for (index, publication) in publications.iter().enumerate() {
+        if publication.instance_id.is_empty()
+            || publications[index + 1..]
+                .iter()
+                .any(|other| same_instance(publication, other))
+        {
+            return Err(DeviceActionJournalError::DuplicateInstance);
+        }
+    }
+    Ok(())
 }
 
 /// The start action implied by a service key's `Type` metadata.
@@ -514,7 +743,7 @@ pub fn win32_service_process_kind_from_type(service_type: u32) -> Option<Win32Se
 }
 
 /// A device node (devnode) record (spec §10.1).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DevnodeRecord {
     pub id: DevnodeId,
     pub instance_id: String,
@@ -1450,6 +1679,33 @@ impl ConfigManager {
                 d.service
                     .as_deref()
                     .is_some_and(|s| s.eq_ignore_ascii_case(service))
+            })
+            .collect()
+    }
+
+    /// Complete semantic topology snapshot used to seed or advance the PnP device-action journal.
+    pub fn devnode_publications(&mut self) -> Vec<DevnodePublication> {
+        self.refresh_registry_devnodes();
+        self.devnodes
+            .iter()
+            .map(|devnode| {
+                let service = devnode.service.as_deref().and_then(|service_name| {
+                    let ServiceStartSpec::Driver(service) =
+                        self.service_start_spec(service_name)?
+                    else {
+                        return None;
+                    };
+                    Some(service)
+                });
+                DevnodePublication {
+                    instance_id: devnode.instance_id.clone(),
+                    service,
+                    pdo_name: devnode.pdo_name.clone(),
+                    driver_key: devnode.driver_key.clone(),
+                    linkage_export: self.devnode_linkage_export(devnode),
+                    hardware_ids: devnode.hardware_ids.clone(),
+                    compatible_ids: devnode.compatible_ids.clone(),
+                }
             })
             .collect()
     }
@@ -3888,5 +4144,135 @@ mod tests {
         assert!(cm
             .pnp_enabled_interface_links_by_guid_bytes(&guid_bytes, r"ROOT\MISSING\0000")
             .is_none());
+    }
+
+    #[test]
+    fn device_action_journal_separates_seed_from_live_changes() {
+        let mut cm = ConfigManager::new();
+        cm.register_service(
+            "LateDriver",
+            r"system32\drivers\late.sys",
+            Some("System"),
+            None,
+            SERVICE_DEMAND_START,
+            1,
+        );
+        cm.register_devnode(
+            r"ROOT\LATE\0000",
+            Some("LateDriver"),
+            Some(r"\Device\LatePdo0"),
+            &["ROOT\\LATE"],
+            &[],
+        );
+
+        let mut journal = DeviceActionJournal::new();
+        journal.seed(1, &cm.devnode_publications()).unwrap();
+        assert_eq!(journal.last_mount_generation(), 1);
+        assert_eq!(journal.pending_len(), 0);
+
+        let first = cm
+            .registry()
+            .open_key(&devnode_path(r"ROOT\LATE\0000"))
+            .unwrap();
+        cm.registry_mut()
+            .set_string(first, "PdoName", r"\Device\LatePdoChanged");
+        cm.register_devnode(
+            r"ROOT\LATE\0001",
+            Some("LateDriver"),
+            Some(r"\Device\LatePdo1"),
+            &["ROOT\\LATE"],
+            &[],
+        );
+
+        assert_eq!(journal.publish(2, &cm.devnode_publications()), Ok(2));
+        let changed = journal.peek().unwrap();
+        assert_eq!(changed.sequence, 1);
+        assert_eq!(changed.mount_generation, 2);
+        assert_eq!(changed.kind, DeviceActionKind::Change);
+        assert_eq!(changed.publication.instance_id, r"ROOT\LATE\0000");
+        assert_eq!(
+            changed.publication.pdo_name.as_deref(),
+            Some(r"\Device\LatePdoChanged")
+        );
+        assert_eq!(
+            journal.acknowledge(2),
+            Err(DeviceActionJournalError::StaleAcknowledgement)
+        );
+        journal.acknowledge(1).unwrap();
+
+        let arrival = journal.peek().unwrap();
+        assert_eq!(arrival.sequence, 2);
+        assert_eq!(arrival.kind, DeviceActionKind::Arrival);
+        assert_eq!(arrival.publication.instance_id, r"ROOT\LATE\0001");
+        assert_eq!(
+            arrival
+                .publication
+                .service
+                .as_ref()
+                .map(|service| service.start_type),
+            Some(SERVICE_DEMAND_START)
+        );
+        journal.acknowledge(2).unwrap();
+        assert_eq!(journal.publish(3, &cm.devnode_publications()), Ok(0));
+
+        assert!(cm.registry_mut().delete_key(first, true));
+        assert_eq!(journal.publish(4, &cm.devnode_publications()), Ok(1));
+        let removal = journal.peek().unwrap();
+        assert_eq!(removal.sequence, 3);
+        assert_eq!(removal.mount_generation, 4);
+        assert_eq!(removal.kind, DeviceActionKind::Removal);
+        assert_eq!(removal.publication.instance_id, r"ROOT\LATE\0000");
+        assert_eq!(
+            removal.publication.pdo_name.as_deref(),
+            Some(r"\Device\LatePdoChanged")
+        );
+    }
+
+    #[test]
+    fn device_action_journal_tracks_binding_changes_without_skips() {
+        let mut cm = ConfigManager::new();
+        cm.register_service(
+            "LateDriver",
+            r"system32\drivers\late.sys",
+            Some("System"),
+            None,
+            SERVICE_DEMAND_START,
+            1,
+        );
+        cm.register_devnode(
+            r"ROOT\LATE\0000",
+            Some("LateDriver"),
+            Some(r"\Device\LatePdo0"),
+            &[],
+            &[],
+        );
+        let mut journal = DeviceActionJournal::new();
+        journal.seed(10, &cm.devnode_publications()).unwrap();
+
+        let service = cm.registry().open_key(&service_path("LateDriver")).unwrap();
+        cm.registry_mut()
+            .set_string(service, "ImagePath", r"system32\drivers\late-updated.sys");
+        assert_eq!(journal.publish(11, &cm.devnode_publications()), Ok(1));
+        assert_eq!(
+            journal
+                .peek()
+                .and_then(|event| event.publication.service.as_ref())
+                .map(|service| service.image_path.as_str()),
+            Some(r"system32\drivers\late-updated.sys")
+        );
+        assert_eq!(
+            journal.publish(11, &cm.devnode_publications()),
+            Err(DeviceActionJournalError::InvalidGeneration)
+        );
+
+        let mut duplicate = cm.devnode_publications();
+        duplicate.push(duplicate[0].clone());
+        assert_eq!(
+            journal.publish(12, &duplicate),
+            Err(DeviceActionJournalError::DuplicateInstance)
+        );
+        assert_eq!(journal.last_mount_generation(), 11);
+        assert_eq!(journal.pending_len(), 1);
+        assert_eq!(journal.peek().unwrap().sequence, 1);
     }
 }

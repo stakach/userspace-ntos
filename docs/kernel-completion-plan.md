@@ -18238,3 +18238,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     returns and 135 batch flushes covering 184 records, and paints all `786432/786432` framebuffer
     pixels with at least 32 colours. D5 is closed; future registry work must add semantics behind the
     CM boundary rather than reconstructing executive SYSTEM state.
+
+    B3 live device-action journal foundation (2026-08-30, crate accepted): the latest B3 review
+    confirmed that the two-devnode asynchronous WDM fixture, real timer/DPC `IoCompleteRequest`
+    completion, native reply-owner mechanism, and replyless boot continuation are already present.
+    The remaining gap is runtime ownership: demand PnP bindings are still snapshotted and eagerly
+    launched with the boot cohort, while `NtPlugPlayControl` action classes only prove that a CM
+    instance exists.
+
+    `nt-config-manager` now provides a growable generation-exact device-action journal over complete
+    semantic devnode publications. Initial mounted state seeds the baseline without manufacturing
+    arrival events. Later generations atomically diff case-insensitive instance identity, retain the
+    new launch binding for arrival/change and the last published binding for removal, order all
+    records by a monotonic sequence, and permit acknowledgement of only the exact head. Duplicate
+    instances, stale/repeated generations, stale acknowledgements, sequence exhaustion, and table
+    reservation failure leave both the baseline and pending queue unchanged. Focused validation is
+    green at `nt-config-manager` `33/33`.
+
+    Review adjustment: the journal is closed as a host-tested primitive but has no production caller
+    yet. Put it behind isolated CM, seed it during the first SYSTEM mount, publish the post-mutation
+    topology only as part of the same generation commit, and expose a bounded immutable
+    BEGIN/PULL/ABORT plus exact ACK transport. Then replace the executive's enumeration-index event
+    cursor and eager demand PnP boot cohort with one-at-a-time live device action. A driver START is
+    acknowledged only after terminal lifecycle publication; pending or indeterminate ownership must
+    retain the exact event. Separately exercise a genuine user-mode `NtLoadDriver` caller across the
+    existing asynchronous fixture and prove exactly one terminal reply.
