@@ -23105,8 +23105,8 @@ struct ExecNtHandler {
     boot_driver_start_reports: BootDriverStartReports,
     native_driver_start_report: NativeDriverStartReport,
     pending_driver_start_transfer: Option<PendingDriverStartTransfer>,
-    pending_pnp_rebalances: nt_driver_start::PendingOperationTable<PendingPnpRebalance>,
-    pending_pnp_rebalance_transfer: Option<PendingPnpRebalanceTransfer>,
+    pending_pnp_operations: nt_driver_start::PendingOperationTable<PendingPnpOperation>,
+    pending_pnp_operation_transfer: Option<PendingPnpOperationTransfer>,
     /// Contended synchronous File acquisition transferred into the FIFO owner at the reply site.
     pending_synchronous_file_wait: Option<nt_io_manager::SynchronousFileWaiter>,
     /// Final-handle `NtClose` continuation reserved before removing the process handle. File Busy
@@ -23615,14 +23615,103 @@ struct PendingDriverStart {
     owner: PendingDriverStartOwner,
 }
 
-struct PendingPnpRebalanceTransfer {
-    batch: OwnedHostedPnpRebalance,
-    reservation: nt_driver_start::PendingOperationReservation,
+enum OwnedPendingPnpOperation {
+    Rebalance(OwnedHostedPnpRebalance),
+    Removal(OwnedHostedPnpRemoval),
 }
 
-struct PendingPnpRebalance {
-    batch: OwnedHostedPnpRebalance,
-    reply: Option<NativeDriverStartReply>,
+enum OwnedPendingPnpOperationProgress {
+    AwaitingCompletion,
+    Complete(u32),
+    OwnershipLost(u32),
+}
+
+impl OwnedPendingPnpOperation {
+    unsafe fn drive_after_completion_pump(&mut self) -> OwnedPendingPnpOperationProgress {
+        match self {
+            Self::Rebalance(batch) => match batch.drive_after_completion_pump() {
+                OwnedHostedPnpRebalanceProgress::AwaitingCompletion => {
+                    OwnedPendingPnpOperationProgress::AwaitingCompletion
+                }
+                OwnedHostedPnpRebalanceProgress::Complete(result) => {
+                    OwnedPendingPnpOperationProgress::Complete(match result {
+                        Ok(_) => nt_status::NtStatus::SUCCESS.raw() as u32,
+                        Err(failure) => failure.status.raw() as u32,
+                    })
+                }
+                OwnedHostedPnpRebalanceProgress::OwnershipLost(failure) => {
+                    OwnedPendingPnpOperationProgress::OwnershipLost(failure.status.raw() as u32)
+                }
+            },
+            Self::Removal(batch) => match batch.drive_after_completion_pump() {
+                OwnedHostedPnpRemovalProgress::AwaitingCompletion => {
+                    OwnedPendingPnpOperationProgress::AwaitingCompletion
+                }
+                OwnedHostedPnpRemovalProgress::Complete(result) => {
+                    OwnedPendingPnpOperationProgress::Complete(match result {
+                        Ok(()) => nt_status::NtStatus::SUCCESS.raw() as u32,
+                        Err(failure) => failure.status.raw() as u32,
+                    })
+                }
+                OwnedHostedPnpRemovalProgress::OwnershipLost(failure) => {
+                    OwnedPendingPnpOperationProgress::OwnershipLost(failure.status.raw() as u32)
+                }
+            },
+        }
+    }
+
+    fn needs_completion_redrive(&self) -> bool {
+        match self {
+            Self::Rebalance(batch) => batch.needs_completion_redrive(),
+            Self::Removal(batch) => batch.needs_completion_redrive(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PendingPnpOperationTransferKind {
+    User,
+    DeviceAction(nt_pnp_manager::DeviceActionClaimIdentity),
+}
+
+struct PendingPnpOperationTransfer {
+    operation: OwnedPendingPnpOperation,
+    reservation: nt_driver_start::PendingOperationReservation,
+    kind: PendingPnpOperationTransferKind,
+}
+
+enum PendingPnpOperationOwner {
+    User(Option<NativeDriverStartReply>),
+    DeviceAction {
+        identity: nt_pnp_manager::DeviceActionClaimIdentity,
+        reply: Option<NativeDriverStartReply>,
+    },
+}
+
+impl PendingPnpOperationOwner {
+    fn device_action_identity(&self) -> Option<nt_pnp_manager::DeviceActionClaimIdentity> {
+        match self {
+            Self::DeviceAction { identity, .. } => Some(*identity),
+            Self::User(_) => None,
+        }
+    }
+
+    fn reply(&self) -> Option<&NativeDriverStartReply> {
+        match self {
+            Self::User(reply) | Self::DeviceAction { reply, .. } => reply.as_ref(),
+        }
+    }
+
+    fn take_reply(&mut self) -> Option<NativeDriverStartReply> {
+        match self {
+            Self::User(reply) | Self::DeviceAction { reply, .. } => reply.take(),
+        }
+    }
+}
+
+struct PendingPnpOperation {
+    operation: OwnedPendingPnpOperation,
+    owner: PendingPnpOperationOwner,
 }
 
 static mut EXEC_NT_HANDLER_WORK: core::mem::MaybeUninit<ExecNtHandler> =

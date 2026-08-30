@@ -23415,6 +23415,117 @@ unsafe fn clear_hosted_provider_ndis_miniport_block_mirrors_for_instance(
     failures
 }
 
+unsafe fn clear_hosted_provider_state_for_device(binding: HostedDeviceBinding) -> u64 {
+    if hosted_device_binding_by_device_id(binding.device_id) != Some(binding) {
+        return 1;
+    }
+    let mut failures = 0u64;
+
+    for record in hosted_provider_miniport_interrupt_shadows_mut().iter_mut() {
+        if !record.present || record.device_id != binding.device_id {
+            continue;
+        }
+        if !hosted_provider_object_owner_is_live(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+        ) || !release_hosted_provider_miniport_interrupt_shadow_record(record)
+        {
+            failures = failures.saturating_add(1);
+        } else {
+            *record = HostedProviderMiniportInterruptShadow::empty();
+        }
+    }
+
+    for record in hosted_provider_miniport_timer_shadows_mut().iter_mut() {
+        if !record.present || record.device_id != binding.device_id {
+            continue;
+        }
+        if !hosted_provider_object_owner_is_live(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+        ) {
+            failures = failures.saturating_add(1);
+            continue;
+        }
+        if let Some(thunk) = record.callback_binding {
+            if !release_instance_executable_thunk_binding(thunk, true) {
+                failures = failures.saturating_add(1);
+                continue;
+            }
+            record.callback_binding = None;
+        }
+        if record.provider_component_va != 0
+            && !release_hosted_provider_owned_pool_allocation(
+                record.owner,
+                record.provider_instance,
+                record.dependent_instance,
+                record.provider_instance,
+                record.provider_component_va,
+            )
+        {
+            failures = failures.saturating_add(1);
+            continue;
+        }
+        *record = HostedProviderMiniportTimerShadow::empty();
+    }
+
+    for record in hosted_provider_ndis_work_item_shadows_mut().iter() {
+        if !record.present {
+            continue;
+        }
+        if [record.preparing, record.queued, record.active]
+            .iter()
+            .any(|invocation| invocation.device_id == binding.device_id)
+        {
+            failures = failures.saturating_add(1);
+        }
+    }
+
+    for record in hosted_provider_ndis_miniport_block_mirrors_mut().iter_mut() {
+        if !record.present || record.device_id != binding.device_id {
+            continue;
+        }
+        if !hosted_provider_object_owner_is_live(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+        ) {
+            failures = failures.saturating_add(1);
+            continue;
+        }
+        let mut binding_index = 0usize;
+        let mut binding_failure = false;
+        while binding_index < record.thunk_binding_count {
+            if let Some(thunk) = record.thunk_bindings[binding_index] {
+                if release_instance_executable_thunk_binding(thunk, true) {
+                    record.thunk_bindings[binding_index] = None;
+                } else {
+                    binding_failure = true;
+                }
+            }
+            binding_index += 1;
+        }
+        if binding_failure
+            || record.dependent_component_va != 0
+                && !release_hosted_provider_owned_pool_allocation(
+                    record.owner,
+                    record.provider_instance,
+                    record.dependent_instance,
+                    record.dependent_instance,
+                    record.dependent_component_va,
+                )
+        {
+            failures = failures.saturating_add(1);
+            continue;
+        }
+        *record = HostedProviderNdisMiniportBlockMirror::empty();
+    }
+
+    failures
+}
+
 unsafe fn hosted_provider_lifetime_records_reference_instance(instance_index: usize) -> bool {
     let references = |provider_instance: usize, dependent_instance: usize| {
         provider_instance == instance_index || dependent_instance == instance_index
@@ -37345,6 +37456,16 @@ pub(crate) unsafe fn hosted_function_device_id_for_instance(
     instance_id: &str,
     expected_driver_id: u64,
 ) -> Result<u64, nt_status::NtStatus> {
+    let (device_id, driver_id) = hosted_function_device_context_for_instance(instance_id)?;
+    if driver_id != expected_driver_id {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    Ok(device_id)
+}
+
+pub(crate) unsafe fn hosted_function_device_context_for_instance(
+    instance_id: &str,
+) -> Result<(u64, u64), nt_status::NtStatus> {
     let devnode_id = hosted_pnp_manager_mut()
         .devnode_for_instance(instance_id)
         .ok_or(nt_status::NtStatus(0xC000_000Eu32 as i32))?;
@@ -37359,14 +37480,13 @@ pub(crate) unsafe fn hosted_function_device_id_for_instance(
     let binding = hosted_device_binding_by_device_id(device_id)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     if binding.pdo_device_id != pdo_device_id
-        || binding.driver_id != expected_driver_id
         || io_manager_mut()
             .device(nt_io_manager::DeviceId(device_id))
             .is_none_or(|device| device.delete_pending)
     {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
-    Ok(device_id)
+    Ok((device_id, binding.driver_id))
 }
 
 pub(crate) unsafe fn hosted_device_service_name_for_instance(
@@ -38712,7 +38832,35 @@ unsafe fn clear_hosted_device_interfaces(
     failures
 }
 
-#[derive(Clone, Copy)]
+unsafe fn disable_hosted_device_interfaces(
+    domain: HostedDomainIdentity,
+    pdo_device_id: u64,
+) -> u64 {
+    let mut failures = 0u64;
+    for registration in hosted_device_interface_registrations_mut().iter_mut() {
+        if !registration.used
+            || !registration.enabled
+            || registration.owner_domain != domain
+            || registration.pdo_device_id != pdo_device_id
+        {
+            continue;
+        }
+        let released = parse_nt_path(registration.symbolic_link.as_str()).is_some_and(|link| {
+            matches!(
+                io_manager_mut().delete_symbolic_link(&link),
+                Ok(()) | Err(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)
+            )
+        });
+        if released {
+            registration.enabled = false;
+        } else {
+            failures = failures.saturating_add(1);
+        }
+    }
+    failures
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HostedDeviceBinding {
     driver_id: u64,
     device_id: u64,
@@ -39020,12 +39168,20 @@ pub(crate) struct HostedIoPortFaultGrant {
     pub(crate) len: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostedDeviceRetirementAuthority {
+    Driver,
+    PnpGuarded,
+    PnpRemove(IrpId),
+}
+
 #[derive(Clone, Copy)]
 struct HostedDeviceRetirement {
     instance: usize,
     domain: HostedDomainIdentity,
     device_object: u64,
     device_id: nt_io_manager::DeviceId,
+    authority: HostedDeviceRetirementAuthority,
     barrier_status: Option<nt_status::NtStatus>,
 }
 
@@ -39290,6 +39446,7 @@ enum HostedPnpTransactionPhase {
 
 struct HostedPnpTransaction {
     binding: HostedDeviceBinding,
+    stack_device_ids: Vec<nt_io_manager::DeviceId>,
     irp_id: IrpId,
     minor: nt_pnp_manager::PnpMinor,
     origin_driver_id: DriverId,
@@ -39309,6 +39466,13 @@ struct HostedPnpTransaction {
     resource_projection_released: bool,
     resource_assignment_released: bool,
     power_stop_published: bool,
+    interfaces_released: bool,
+    provider_state_released: bool,
+    stack_detached: bool,
+    retirement_authorized: bool,
+    device_retired: bool,
+    power_remove_published: bool,
+    pnp_remove_published: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39496,6 +39660,128 @@ unsafe fn hosted_device_retirements_mut() -> &'static mut Vec<HostedDeviceRetire
         *slot = Some(Vec::new());
     }
     slot.as_mut().unwrap()
+}
+
+fn hosted_device_retirement_matches_binding(
+    retirement: HostedDeviceRetirement,
+    binding: HostedDeviceBinding,
+) -> bool {
+    retirement.instance == binding.projection_instance
+        && retirement.domain == binding.projection_domain
+        && retirement.device_object == binding.device_object
+        && retirement.device_id == nt_io_manager::DeviceId(binding.device_id)
+}
+
+unsafe fn hosted_pnp_transaction_owns_stack_device(
+    irp_id: IrpId,
+    device_id: nt_io_manager::DeviceId,
+) -> bool {
+    (*core::ptr::addr_of!(HOSTED_PNP_TRANSACTIONS))
+        .as_ref()
+        .is_some_and(|transactions| {
+            transactions.iter().any(|transaction| {
+                transaction.irp_id == irp_id
+                    && transaction.stack_device_ids.contains(&device_id)
+            })
+        })
+}
+
+unsafe fn guard_hosted_device_retirements_for_pnp(
+    irp_id: IrpId,
+) -> Result<(), nt_status::NtStatus> {
+    if !(*core::ptr::addr_of!(HOSTED_PNP_TRANSACTIONS))
+        .as_ref()
+        .is_some_and(|transactions| transactions.iter().any(|entry| entry.irp_id == irp_id))
+    {
+        return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
+    }
+    for retirement in hosted_device_retirements_mut().iter_mut() {
+        if !hosted_pnp_transaction_owns_stack_device(irp_id, retirement.device_id) {
+            continue;
+        }
+        match retirement.authority {
+            HostedDeviceRetirementAuthority::Driver => {
+                retirement.authority = HostedDeviceRetirementAuthority::PnpGuarded;
+            }
+            HostedDeviceRetirementAuthority::PnpGuarded => {}
+            HostedDeviceRetirementAuthority::PnpRemove(_) => {
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            }
+        }
+    }
+    Ok(())
+}
+
+unsafe fn authorize_hosted_device_retirements(
+    binding: HostedDeviceBinding,
+    irp_id: IrpId,
+) -> Result<(), nt_status::NtStatus> {
+    let valid_transaction = (*core::ptr::addr_of!(HOSTED_PNP_TRANSACTIONS))
+        .as_ref()
+        .is_some_and(|transactions| {
+            transactions.iter().any(|transaction| {
+                transaction.irp_id == irp_id
+                    && transaction.minor == nt_pnp_manager::PnpMinor::RemoveDevice
+                    && transaction.binding == binding
+                    && transaction
+                        .stack_device_ids
+                        .contains(&nt_io_manager::DeviceId(binding.device_id))
+            })
+        });
+    if irp_id.raw() == 0
+        || !valid_transaction
+        || hosted_device_binding_by_device_id(binding.device_id) != Some(binding)
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let retirements = hosted_device_retirements_mut();
+    if retirements.iter().any(|retirement| {
+        retirement.domain == binding.projection_domain
+            && retirement.device_object == binding.device_object
+            && retirement.device_id != nt_io_manager::DeviceId(binding.device_id)
+    }) {
+        return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
+    }
+    let mut function_retirement_present = false;
+    for retirement in retirements.iter_mut() {
+        if !hosted_pnp_transaction_owns_stack_device(irp_id, retirement.device_id) {
+            continue;
+        }
+        if retirement.device_id == nt_io_manager::DeviceId(binding.device_id) {
+            if !hosted_device_retirement_matches_binding(*retirement, binding) {
+                return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
+            }
+            function_retirement_present = true;
+        }
+        if let Some(status) = retirement.barrier_status {
+            return Err(status);
+        }
+        match retirement.authority {
+            HostedDeviceRetirementAuthority::Driver
+            | HostedDeviceRetirementAuthority::PnpGuarded => {
+                retirement.authority = HostedDeviceRetirementAuthority::PnpRemove(irp_id);
+            }
+            HostedDeviceRetirementAuthority::PnpRemove(owner) if owner == irp_id => {}
+            HostedDeviceRetirementAuthority::PnpRemove(_) => {
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            }
+        }
+    }
+    if function_retirement_present {
+        return Ok(());
+    }
+    retirements
+        .try_reserve(1)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    retirements.push(HostedDeviceRetirement {
+        instance: binding.projection_instance,
+        domain: binding.projection_domain,
+        device_object: binding.device_object,
+        device_id: nt_io_manager::DeviceId(binding.device_id),
+        authority: HostedDeviceRetirementAuthority::PnpRemove(irp_id),
+        barrier_status: None,
+    });
+    Ok(())
 }
 
 unsafe fn hosted_device_resource_states_mut() -> &'static mut Vec<HostedDeviceResourceState> {
@@ -40248,6 +40534,198 @@ unsafe fn finish_hosted_stop_publication(irp_id: IrpId) -> Result<(), nt_status:
     Ok(())
 }
 
+unsafe fn finish_hosted_remove_quiescence(irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
+    let transaction = hosted_pnp_transactions_mut()
+        .iter()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if !matches!(
+        transaction.minor,
+        nt_pnp_manager::PnpMinor::SurpriseRemoval | nt_pnp_manager::PnpMinor::RemoveDevice
+    ) || transaction.driver_status.is_none()
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let binding = transaction.binding;
+    let final_remove = transaction.minor == nt_pnp_manager::PnpMinor::RemoveDevice;
+    let interfaces_released = transaction.interfaces_released;
+    let provider_state_released = transaction.provider_state_released;
+    let resource_projection_released = transaction.resource_projection_released;
+    let power_stop_published = transaction.power_stop_published;
+
+    if hosted_device_binding_by_device_id(binding.device_id) != Some(binding)
+        && !(interfaces_released
+            && (!final_remove || provider_state_released)
+            && resource_projection_released
+            && power_stop_published)
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    if !interfaces_released {
+        let failures = if final_remove {
+            clear_hosted_device_interfaces(
+                binding.projection_domain,
+                Some(binding.pdo_device_id),
+            )
+        } else {
+            disable_hosted_device_interfaces(binding.projection_domain, binding.pdo_device_id)
+        };
+        if failures != 0 {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+        hosted_pnp_transactions_mut()
+            .iter_mut()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            .interfaces_released = true;
+    }
+    if final_remove && !provider_state_released {
+        if clear_hosted_provider_state_for_device(binding) != 0 {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+        hosted_pnp_transactions_mut()
+            .iter_mut()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            .provider_state_released = true;
+    }
+    if !resource_projection_released {
+        if hosted_device_resource_state_by_device_id(binding.device_id).is_some() {
+            let sh = instance_by_driver_id(binding.driver_id)
+                .map(|(_, instance)| instance.exec_shared_va)
+                .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+            clear_hosted_resource_projection(binding, sh)?;
+        }
+        hosted_pnp_transactions_mut()
+            .iter_mut()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            .resource_projection_released = true;
+    }
+    if !power_stop_published {
+        crate::power_manager::complete_stop(binding.pdo_device_id)?;
+        hosted_pnp_transactions_mut()
+            .iter_mut()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            .power_stop_published = true;
+    }
+    Ok(())
+}
+
+unsafe fn finish_hosted_remove_publication(irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
+    finish_hosted_remove_quiescence(irp_id)?;
+    let transaction = hosted_pnp_transactions_mut()
+        .iter()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if transaction.minor != nt_pnp_manager::PnpMinor::RemoveDevice {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let binding = transaction.binding;
+    let expected_lower = transaction
+        .stack_device_ids
+        .windows(2)
+        .find(|pair| pair[0] == nt_io_manager::DeviceId(binding.device_id))
+        .map(|pair| pair[1])
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let stack_detached = transaction.stack_detached;
+    let retirement_authorized = transaction.retirement_authorized;
+    let device_retired = transaction.device_retired;
+    let power_remove_published = transaction.power_remove_published;
+    let pnp_remove_published = transaction.pnp_remove_published;
+
+    if !stack_detached {
+        let canonical_attachment = io_manager_mut()
+            .device(nt_io_manager::DeviceId(binding.device_id))
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            .attached_to;
+        if canonical_attachment.is_some_and(|lower| lower != expected_lower) {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        if canonical_attachment.is_some() {
+            let lower_object = io_manager_mut()
+                .hosted_device_address_by_identity(binding.projection_domain, expected_lower)
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+            if crate::hosted_driver_projection::hosted_attached_device(lower_object)
+                != binding.device_object
+            {
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            }
+            let detached = io_manager_mut()
+                .detach_device_from_stack(nt_io_manager::DeviceId(binding.device_id))?;
+            if detached != expected_lower {
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            }
+            crate::hosted_driver_projection::detach_hosted_device_projection(lower_object);
+        }
+        hosted_pnp_transactions_mut()
+            .iter_mut()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            .stack_detached = true;
+    }
+    if !retirement_authorized {
+        authorize_hosted_device_retirements(binding, irp_id)?;
+        hosted_pnp_transactions_mut()
+            .iter_mut()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            .retirement_authorized = true;
+    }
+    if !device_retired {
+        drain_hosted_device_retirements();
+        if let Some(retirement) = hosted_device_retirements_mut()
+            .iter()
+            .find(|retirement| {
+                hosted_pnp_transaction_owns_stack_device(irp_id, retirement.device_id)
+                    && retirement.authority
+                        == HostedDeviceRetirementAuthority::PnpRemove(irp_id)
+            })
+        {
+            return Err(
+                retirement
+                    .barrier_status
+                    .unwrap_or(nt_status::NtStatus::DELETE_PENDING),
+            );
+        }
+        if hosted_device_binding_by_device_id(binding.device_id).is_some()
+            || io_manager_mut()
+                .device(nt_io_manager::DeviceId(binding.device_id))
+                .is_some()
+        {
+            return Err(nt_status::NtStatus::DELETE_PENDING);
+        }
+        hosted_pnp_transactions_mut()
+            .iter_mut()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            .device_retired = true;
+    }
+    if !power_remove_published {
+        crate::power_manager::unregister_device(binding.pdo_device_id);
+        hosted_pnp_transactions_mut()
+            .iter_mut()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            .power_remove_published = true;
+    }
+    if !pnp_remove_published {
+        let token = hosted_pnp_manager_mut()
+            .removal_token(binding.pdo_device_id)
+            .map_err(hosted_pnp_status)?;
+        hosted_pnp_manager_mut()
+            .finish_remove(token)
+            .map_err(hosted_pnp_status)?;
+        hosted_pnp_transactions_mut()
+            .iter_mut()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            .pnp_remove_published = true;
+    }
+    Ok(())
+}
+
 unsafe fn finish_hosted_pnp_publication(irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
     let minor = hosted_pnp_transactions_mut()
         .iter()
@@ -40261,9 +40739,8 @@ unsafe fn finish_hosted_pnp_publication(irp_id: IrpId) -> Result<(), nt_status::
         | nt_pnp_manager::PnpMinor::CancelStopDevice
         | nt_pnp_manager::PnpMinor::QueryRemoveDevice
         | nt_pnp_manager::PnpMinor::CancelRemoveDevice => Ok(()),
-        nt_pnp_manager::PnpMinor::RemoveDevice | nt_pnp_manager::PnpMinor::SurpriseRemoval => {
-            Err(nt_status::NtStatus::NOT_SUPPORTED)
-        }
+        nt_pnp_manager::PnpMinor::SurpriseRemoval => finish_hosted_remove_quiescence(irp_id),
+        nt_pnp_manager::PnpMinor::RemoveDevice => finish_hosted_remove_publication(irp_id),
     }
 }
 
@@ -40941,8 +41418,21 @@ pub(crate) fn service_hosted_device(
         {
             return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
         }
+        let authority = if unsafe {
+            (*core::ptr::addr_of!(HOSTED_PNP_TRANSACTIONS))
+                .as_ref()
+                .is_some_and(|transactions| {
+                    transactions
+                        .iter()
+                        .any(|transaction| transaction.stack_device_ids.contains(&device_id))
+                })
+        } {
+            HostedDeviceRetirementAuthority::PnpGuarded
+        } else {
+            HostedDeviceRetirementAuthority::Driver
+        };
         let retirements = unsafe { hosted_device_retirements_mut() };
-        if let Some(existing) = retirements.iter().copied().find(|retirement| {
+        if let Some(existing) = retirements.iter_mut().find(|retirement| {
             retirement.device_id == device_id
                 || (retirement.domain == domain && retirement.device_object == pdo_object)
         }) {
@@ -40952,6 +41442,11 @@ pub(crate) fn service_hosted_device(
                 || existing.device_id != device_id
             {
                 return (STATUS_OBJECT_NAME_COLLISION, 0, 0, 0);
+            }
+            if authority == HostedDeviceRetirementAuthority::PnpGuarded
+                && existing.authority == HostedDeviceRetirementAuthority::Driver
+            {
+                existing.authority = HostedDeviceRetirementAuthority::PnpGuarded;
             }
             return (
                 existing
@@ -40971,6 +41466,7 @@ pub(crate) fn service_hosted_device(
             domain,
             device_object: pdo_object,
             device_id,
+            authority,
             barrier_status: None,
         });
         unsafe { drain_hosted_device_retirements() };
@@ -43960,6 +44456,44 @@ unsafe fn drain_hosted_device_retirements() -> usize {
         if retirement.barrier_status.is_some() {
             index += 1;
             continue;
+        }
+        match retirement.authority {
+            HostedDeviceRetirementAuthority::PnpGuarded => {
+                index += 1;
+                continue;
+            }
+            HostedDeviceRetirementAuthority::PnpRemove(owner) => {
+                let authorized = (*core::ptr::addr_of!(HOSTED_PNP_TRANSACTIONS))
+                    .as_ref()
+                    .is_some_and(|transactions| {
+                        transactions.iter().any(|transaction| {
+                            transaction.irp_id == owner
+                                && transaction.minor == nt_pnp_manager::PnpMinor::RemoveDevice
+                                && transaction.stack_device_ids.contains(&retirement.device_id)
+                                && transaction.retirement_authorized
+                        })
+                    });
+                if !authorized {
+                    hosted_device_retirements_mut()[index].barrier_status =
+                        Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+                    progress = progress.saturating_add(1);
+                    index += 1;
+                    continue;
+                }
+            }
+            HostedDeviceRetirementAuthority::Driver => {
+                let pnp_in_flight = (*core::ptr::addr_of!(HOSTED_PNP_TRANSACTIONS))
+                    .as_ref()
+                    .is_some_and(|transactions| {
+                        transactions.iter().any(|transaction| {
+                            transaction.stack_device_ids.contains(&retirement.device_id)
+                        })
+                    });
+                if pnp_in_flight {
+                    index += 1;
+                    continue;
+                }
+            }
         }
         let Some(inst) = instance(retirement.instance) else {
             hosted_device_retirements_mut()[index].barrier_status =
@@ -49030,21 +49564,40 @@ pub(crate) unsafe fn dispatch_hosted_pnp_lifecycle_canonical(
         Vec::new(),
     )?;
     let irp_id = prepared.irp_id();
-    let (origin_driver_id, completion_driver_id, completion_device_id) = {
+    let stack_identity = (|| {
         let irp = io_manager_mut()
             .irp(irp_id)
             .expect("prepared hosted lifecycle IRP disappeared before dispatch");
         let current = irp
             .current_stack()
             .expect("prepared hosted lifecycle IRP lost its captured device stack");
-        (irp.origin_driver_id, current.driver_id, current.device_id)
-    };
+        let mut stack_device_ids = Vec::new();
+        stack_device_ids
+            .try_reserve_exact(irp.stack.len())
+            .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+        stack_device_ids.extend(irp.stack.iter().map(|location| location.device_id));
+        Ok((
+            irp.origin_driver_id,
+            current.driver_id,
+            current.device_id,
+            stack_device_ids,
+        ))
+    })();
+    let (origin_driver_id, completion_driver_id, completion_device_id, stack_device_ids) =
+        match stack_identity {
+            Ok(identity) => identity,
+            Err(status) => {
+                let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
+                return Err(status);
+            }
+        };
     if let Err(status) = reserve_active_hosted_irp_transfer_slot() {
         let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
         return Err(status);
     }
     let transaction = HostedPnpTransaction {
         binding,
+        stack_device_ids,
         irp_id,
         minor,
         origin_driver_id,
@@ -49064,6 +49617,13 @@ pub(crate) unsafe fn dispatch_hosted_pnp_lifecycle_canonical(
         resource_projection_released: false,
         resource_assignment_released: false,
         power_stop_published: false,
+        interfaces_released: false,
+        provider_state_released: false,
+        stack_detached: false,
+        retirement_authorized: false,
+        device_retired: false,
+        power_remove_published: false,
+        pnp_remove_published: false,
     };
     if let Err(status) = reserve_hosted_pnp_transaction(transaction) {
         let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
@@ -49084,6 +49644,19 @@ pub(crate) unsafe fn dispatch_hosted_pnp_lifecycle_canonical(
     };
     set_hosted_pnp_transaction_token(irp_id, token)
         .expect("reserved hosted lifecycle transaction disappeared before dispatch");
+    if matches!(
+        minor,
+        nt_pnp_manager::PnpMinor::SurpriseRemoval | nt_pnp_manager::PnpMinor::RemoveDevice
+    ) {
+        if let Err(status) = guard_hosted_device_retirements_for_pnp(irp_id) {
+            set_hosted_pnp_indeterminate(irp_id, status)
+                .expect("hosted removal retirement guard lost its transaction");
+            return Ok(HostedPnpLifecycleOutcome::Indeterminate {
+                irp_id: irp_id.raw(),
+                transport_status: status,
+            });
+        }
+    }
 
     match io_manager_mut().dispatch_prepared_external_pnp(prepared) {
         ExternalPnpDispatchResult::Returned { status, .. } => {
@@ -49198,21 +49771,40 @@ pub(crate) unsafe fn start_hosted_device_canonical(
         )
         .map_err(local_failure)?;
     let irp_id = prepared.irp_id();
-    let (origin_driver_id, completion_driver_id, completion_device_id) = {
+    let stack_identity = (|| {
         let irp = io_manager_mut()
             .irp(irp_id)
             .expect("prepared hosted PnP IRP disappeared before dispatch");
         let current = irp
             .current_stack()
             .expect("prepared hosted PnP IRP lost its captured device stack");
-        (irp.origin_driver_id, current.driver_id, current.device_id)
-    };
+        let mut stack_device_ids = Vec::new();
+        stack_device_ids
+            .try_reserve_exact(irp.stack.len())
+            .map_err(|_| local_failure(nt_status::NtStatus::INSUFFICIENT_RESOURCES))?;
+        stack_device_ids.extend(irp.stack.iter().map(|location| location.device_id));
+        Ok((
+            irp.origin_driver_id,
+            current.driver_id,
+            current.device_id,
+            stack_device_ids,
+        ))
+    })();
+    let (origin_driver_id, completion_driver_id, completion_device_id, stack_device_ids) =
+        match stack_identity {
+            Ok(identity) => identity,
+            Err(failure) => {
+                let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
+                return Err(failure);
+            }
+        };
     if let Err(status) = reserve_active_hosted_irp_transfer_slot() {
         let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
         return Err(local_failure(status));
     }
     let transaction = HostedPnpTransaction {
         binding,
+        stack_device_ids,
         irp_id,
         minor: nt_pnp_manager::PnpMinor::StartDevice,
         origin_driver_id,
@@ -49232,6 +49824,13 @@ pub(crate) unsafe fn start_hosted_device_canonical(
         resource_projection_released: false,
         resource_assignment_released: false,
         power_stop_published: false,
+        interfaces_released: false,
+        provider_state_released: false,
+        stack_detached: false,
+        retirement_authorized: false,
+        device_retired: false,
+        power_remove_published: false,
+        pnp_remove_published: false,
     };
     if let Err(status) = reserve_hosted_pnp_transaction(transaction) {
         let _ = io_manager_mut().discard_prepared_external_pnp(prepared);

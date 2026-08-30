@@ -829,6 +829,249 @@ impl OwnedHostedPnpRebalance {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostedPnpRemovalKind {
+    Orderly,
+    Surprise,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostedPnpRemovalStage {
+    QueryRemove,
+    SurpriseRemove,
+    AwaitingLifecycle {
+        minor: nt_pnp_manager::PnpMinor,
+        irp_id: u64,
+        failure_status: Option<nt_status::NtStatus>,
+    },
+    Remove,
+    CancelRemove {
+        failure_status: nt_status::NtStatus,
+    },
+    Complete,
+    OwnershipLost,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HostedPnpRemovalFailure {
+    pub(crate) status: nt_status::NtStatus,
+    pub(crate) teardown_blocked: bool,
+}
+
+pub(crate) enum OwnedHostedPnpRemovalProgress {
+    AwaitingCompletion,
+    Complete(Result<(), HostedPnpRemovalFailure>),
+    OwnershipLost(HostedPnpRemovalFailure),
+}
+
+/// Own an orderly QUERY_REMOVE/CANCEL_REMOVE/REMOVE sequence or a bus-loss
+/// SURPRISE_REMOVE/REMOVE sequence for one exact canonical function stack.
+pub(crate) struct OwnedHostedPnpRemoval {
+    device_id: u64,
+    kind: HostedPnpRemovalKind,
+    stage: HostedPnpRemovalStage,
+    terminal: Option<Result<(), HostedPnpRemovalFailure>>,
+    ownership_failure: Option<HostedPnpRemovalFailure>,
+}
+
+impl OwnedHostedPnpRemoval {
+    pub(crate) fn new(device_id: u64, kind: HostedPnpRemovalKind) -> Self {
+        Self {
+            device_id,
+            kind,
+            stage: match kind {
+                HostedPnpRemovalKind::Orderly => HostedPnpRemovalStage::QueryRemove,
+                HostedPnpRemovalKind::Surprise => HostedPnpRemovalStage::SurpriseRemove,
+            },
+            terminal: None,
+            ownership_failure: None,
+        }
+    }
+
+    pub(crate) fn needs_completion_redrive(&self) -> bool {
+        matches!(self.stage, HostedPnpRemovalStage::AwaitingLifecycle { .. })
+    }
+
+    pub(crate) unsafe fn drive(&mut self) -> OwnedHostedPnpRemovalProgress {
+        self.drive_inner(true)
+    }
+
+    pub(crate) unsafe fn drive_after_completion_pump(
+        &mut self,
+    ) -> OwnedHostedPnpRemovalProgress {
+        self.drive_inner(false)
+    }
+
+    fn fail_terminal(&mut self, status: nt_status::NtStatus) {
+        self.terminal = Some(Err(HostedPnpRemovalFailure {
+            status,
+            teardown_blocked: false,
+        }));
+        self.stage = HostedPnpRemovalStage::Complete;
+    }
+
+    fn lose_ownership(&mut self, status: nt_status::NtStatus) {
+        self.ownership_failure = Some(HostedPnpRemovalFailure {
+            status,
+            teardown_blocked: true,
+        });
+        self.stage = HostedPnpRemovalStage::OwnershipLost;
+    }
+
+    unsafe fn dispatch_lifecycle(
+        &mut self,
+        minor: nt_pnp_manager::PnpMinor,
+        failure_status: Option<nt_status::NtStatus>,
+    ) -> Option<OwnedHostedPnpRemovalProgress> {
+        match driver_launch::dispatch_hosted_pnp_lifecycle_canonical(self.device_id, minor) {
+            Ok(driver_launch::HostedPnpLifecycleOutcome::Complete { driver_status }) => {
+                self.finish_lifecycle(minor, driver_status, failure_status);
+                None
+            }
+            Ok(driver_launch::HostedPnpLifecycleOutcome::Pending { irp_id })
+            | Ok(driver_launch::HostedPnpLifecycleOutcome::RepairRequired { irp_id, .. }) => {
+                self.stage = HostedPnpRemovalStage::AwaitingLifecycle {
+                    minor,
+                    irp_id,
+                    failure_status,
+                };
+                Some(OwnedHostedPnpRemovalProgress::AwaitingCompletion)
+            }
+            Ok(driver_launch::HostedPnpLifecycleOutcome::Indeterminate {
+                transport_status,
+                ..
+            }) => {
+                self.lose_ownership(transport_status);
+                Some(OwnedHostedPnpRemovalProgress::OwnershipLost(
+                    self.ownership_failure
+                        .expect("removal ownership barrier disappeared"),
+                ))
+            }
+            Err(status) => {
+                if minor == nt_pnp_manager::PnpMinor::RemoveDevice
+                    && self.kind == HostedPnpRemovalKind::Orderly
+                {
+                    self.stage = HostedPnpRemovalStage::CancelRemove {
+                        failure_status: failure_status.unwrap_or(status),
+                    };
+                    None
+                } else if minor == nt_pnp_manager::PnpMinor::CancelRemoveDevice
+                    || minor == nt_pnp_manager::PnpMinor::RemoveDevice
+                        && self.kind == HostedPnpRemovalKind::Surprise
+                {
+                    self.lose_ownership(failure_status.unwrap_or(status));
+                    Some(OwnedHostedPnpRemovalProgress::OwnershipLost(
+                        self.ownership_failure
+                            .expect("removal ownership barrier disappeared"),
+                    ))
+                } else {
+                    self.fail_terminal(failure_status.unwrap_or(status));
+                    None
+                }
+            }
+        }
+    }
+
+    fn finish_lifecycle(
+        &mut self,
+        minor: nt_pnp_manager::PnpMinor,
+        driver_status: nt_status::NtStatus,
+        failure_status: Option<nt_status::NtStatus>,
+    ) {
+        match minor {
+            nt_pnp_manager::PnpMinor::QueryRemoveDevice if driver_status.is_success() => {
+                self.stage = HostedPnpRemovalStage::Remove;
+            }
+            nt_pnp_manager::PnpMinor::QueryRemoveDevice => {
+                self.stage = HostedPnpRemovalStage::CancelRemove {
+                    failure_status: nt_status::NtStatus(0x8000_0028u32 as i32),
+                };
+            }
+            nt_pnp_manager::PnpMinor::CancelRemoveDevice => {
+                self.fail_terminal(failure_status.unwrap_or(driver_status));
+            }
+            nt_pnp_manager::PnpMinor::SurpriseRemoval => {
+                self.stage = HostedPnpRemovalStage::Remove;
+            }
+            nt_pnp_manager::PnpMinor::RemoveDevice => {
+                self.terminal = Some(Ok(()));
+                self.stage = HostedPnpRemovalStage::Complete;
+            }
+            _ => self.lose_ownership(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+        }
+    }
+
+    unsafe fn drive_inner(&mut self, pump_before_observe: bool) -> OwnedHostedPnpRemovalProgress {
+        loop {
+            match self.stage {
+                HostedPnpRemovalStage::QueryRemove => {
+                    if let Some(progress) = self.dispatch_lifecycle(
+                        nt_pnp_manager::PnpMinor::QueryRemoveDevice,
+                        None,
+                    ) {
+                        return progress;
+                    }
+                }
+                HostedPnpRemovalStage::SurpriseRemove => {
+                    if let Some(progress) = self.dispatch_lifecycle(
+                        nt_pnp_manager::PnpMinor::SurpriseRemoval,
+                        None,
+                    ) {
+                        return progress;
+                    }
+                }
+                HostedPnpRemovalStage::Remove => {
+                    if let Some(progress) =
+                        self.dispatch_lifecycle(nt_pnp_manager::PnpMinor::RemoveDevice, None)
+                    {
+                        return progress;
+                    }
+                }
+                HostedPnpRemovalStage::CancelRemove { failure_status } => {
+                    if let Some(progress) = self.dispatch_lifecycle(
+                        nt_pnp_manager::PnpMinor::CancelRemoveDevice,
+                        Some(failure_status),
+                    ) {
+                        return progress;
+                    }
+                }
+                HostedPnpRemovalStage::AwaitingLifecycle {
+                    minor,
+                    irp_id,
+                    failure_status,
+                } => {
+                    if pump_before_observe {
+                        driver_launch::pump_hosted_io_completions();
+                    }
+                    match driver_launch::observe_hosted_pnp_lifecycle(irp_id, minor) {
+                        Ok(driver_launch::HostedPnpLifecycleObservation::AwaitingCompletion) => {
+                            return OwnedHostedPnpRemovalProgress::AwaitingCompletion;
+                        }
+                        Ok(driver_launch::HostedPnpLifecycleObservation::Terminal {
+                            driver_status,
+                        }) => self.finish_lifecycle(minor, driver_status, failure_status),
+                        Ok(driver_launch::HostedPnpLifecycleObservation::Indeterminate {
+                            transport_status,
+                        })
+                        | Err(transport_status) => self.lose_ownership(transport_status),
+                    }
+                }
+                HostedPnpRemovalStage::Complete => {
+                    return OwnedHostedPnpRemovalProgress::Complete(
+                        self.terminal.expect("terminal removal has no retained result"),
+                    );
+                }
+                HostedPnpRemovalStage::OwnershipLost => {
+                    return OwnedHostedPnpRemovalProgress::OwnershipLost(
+                        self.ownership_failure
+                            .expect("indeterminate removal has no retained barrier"),
+                    );
+                }
+            }
+        }
+    }
+}
+
 struct HostedPnpDevnodeStart<'a, H, C> {
     instance_id: &'a str,
     driver_key: Option<&'a str>,

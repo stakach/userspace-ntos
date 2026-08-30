@@ -9297,8 +9297,8 @@ pub(crate) unsafe fn service_sec_image(
                 PendingDriverStartTransfer,
                 nt_syscall_abi::ParkedSyscallReply,
             )> = None;
-            let mut transfer_pending_pnp_rebalance: Option<(
-                PendingPnpRebalanceTransfer,
+            let mut transfer_pending_pnp_operation: Option<(
+                PendingPnpOperationTransfer,
                 nt_syscall_abi::ParkedSyscallReply,
             )> = None;
             let mut transfer_file_irp_drain: Option<(
@@ -9435,8 +9435,8 @@ pub(crate) unsafe fn service_sec_image(
                     "previous syscall leaked a driver START continuation reservation"
                 );
                 assert!(
-                    nt_handler.pending_pnp_rebalance_transfer.is_none(),
-                    "previous syscall leaked a PnP rebalance continuation reservation"
+                    nt_handler.pending_pnp_operation_transfer.is_none(),
+                    "previous syscall leaked a PnP operation continuation reservation"
                 );
                 nt_handler.pending_synchronous_file_wait = None;
                 assert!(
@@ -10001,8 +10001,8 @@ pub(crate) unsafe fn service_sec_image(
                 if let Some(transfer) = nt_handler.pending_driver_start_transfer.take() {
                     transfer_pending_driver_start = Some((transfer, parked_syscall_reply));
                 }
-                if let Some(transfer) = nt_handler.pending_pnp_rebalance_transfer.take() {
-                    transfer_pending_pnp_rebalance = Some((transfer, parked_syscall_reply));
+                if let Some(transfer) = nt_handler.pending_pnp_operation_transfer.take() {
+                    transfer_pending_pnp_operation = Some((transfer, parked_syscall_reply));
                 }
                 if let Some(mut waiter) = nt_handler.pending_synchronous_file_wait.take() {
                     // Publish the exact FIFO owner before any post-dispatch completion can release
@@ -15759,8 +15759,8 @@ pub(crate) unsafe fn service_sec_image(
                 m3 = nm3;
                 continue;
             }
-            if let Some((transfer, reply)) = transfer_pending_pnp_rebalance.take() {
-                pending_pnp_rebalance_transfer(&mut nt_handler, transfer, reply);
+            if let Some((transfer, reply)) = transfer_pending_pnp_operation.take() {
+                pending_pnp_operation_transfer(&mut nt_handler, transfer, reply);
                 trace_indefinite_wait_park(
                     &nt_handler,
                     badge,
@@ -22503,34 +22503,42 @@ unsafe fn pending_driver_start_transfer(
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
 }
 
-unsafe fn pending_pnp_rebalance_transfer(
+unsafe fn pending_pnp_operation_transfer(
     nt_handler: &mut ExecNtHandler,
-    transfer: PendingPnpRebalanceTransfer,
+    transfer: PendingPnpOperationTransfer,
     reply: nt_syscall_abi::ParkedSyscallReply,
 ) {
-    let PendingPnpRebalanceTransfer { batch, reservation } = transfer;
+    let PendingPnpOperationTransfer {
+        operation,
+        reservation,
+        kind,
+    } = transfer;
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     assert_ne!(
         stolen, 0,
-        "pending PnP rebalance Reply object disappeared after preflight"
+        "pending PnP operation Reply object disappeared after preflight"
     );
     let (fresh_index, fresh) = wait_reply_pool_find_free()
-        .expect("pending PnP rebalance Reply-pool claim disappeared after preflight");
+        .expect("pending PnP operation Reply-pool claim disappeared after preflight");
+    let reply = Some(NativeDriverStartReply {
+        tid: nt_handler.current_tid,
+        badge: nt_handler.current_badge,
+        reply_cap: stolen,
+        reply,
+    });
+    let owner = match kind {
+        PendingPnpOperationTransferKind::User => PendingPnpOperationOwner::User(reply),
+        PendingPnpOperationTransferKind::DeviceAction(identity) => {
+            PendingPnpOperationOwner::DeviceAction { identity, reply }
+        }
+    };
     nt_handler
-        .pending_pnp_rebalances
+        .pending_pnp_operations
         .publish(
             reservation,
-            PendingPnpRebalance {
-                batch,
-                reply: Some(NativeDriverStartReply {
-                    tid: nt_handler.current_tid,
-                    badge: nt_handler.current_badge,
-                    reply_cap: stolen,
-                    reply,
-                }),
-            },
+            PendingPnpOperation { operation, owner },
         )
-        .expect("reserved PnP rebalance continuation rejected its exact batch");
+        .expect("reserved PnP continuation rejected its exact operation");
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
 }
@@ -22693,27 +22701,33 @@ unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u6
     completed
 }
 
-unsafe fn pending_pnp_rebalance_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
+unsafe fn pending_pnp_operation_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     let mut completed = 0u64;
-    for slot in 0..nt_handler.pending_pnp_rebalances.slot_count() {
+    for slot in 0..nt_handler.pending_pnp_operations.slot_count() {
         let progress = {
-            let Some(pending) = nt_handler.pending_pnp_rebalances.get_mut(slot) else {
+            let Some(pending) = nt_handler.pending_pnp_operations.get_mut(slot) else {
                 continue;
             };
-            pending.batch.drive_after_completion_pump()
+            pending.operation.drive_after_completion_pump()
         };
         match progress {
-            OwnedHostedPnpRebalanceProgress::AwaitingCompletion => {}
-            OwnedHostedPnpRebalanceProgress::Complete(result) => {
-                let status = match result {
-                    Ok(_) => nt_status::NtStatus::SUCCESS.raw() as u32,
-                    Err(failure) => failure.status.raw() as u32,
-                };
+            OwnedPendingPnpOperationProgress::AwaitingCompletion => {}
+            OwnedPendingPnpOperationProgress::Complete(status) => {
+                let device_action_identity = nt_handler
+                    .pending_pnp_operations
+                    .get(slot)
+                    .and_then(|pending| pending.owner.device_action_identity());
+                if let Some(identity) = device_action_identity {
+                    nt_handler
+                        .pnp_complete_live_removal(identity, slot, status)
+                        .expect("terminal live removal lost its exact action owner");
+                    let _ = nt_handler.pnp_try_acknowledge_live_action();
+                }
                 let mut pending = nt_handler
-                    .pending_pnp_rebalances
+                    .pending_pnp_operations
                     .take(slot)
-                    .expect("completed PnP rebalance continuation disappeared");
-                if let Some(reply) = pending.reply.take() {
+                    .expect("completed PnP operation continuation disappeared");
+                if let Some(reply) = pending.owner.take_reply() {
                     pending_driver_start_reply_owner(
                         nt_handler,
                         reply.reply_cap,
@@ -22724,18 +22738,27 @@ unsafe fn pending_pnp_rebalance_redrive_all(nt_handler: &mut ExecNtHandler) -> u
                 }
                 completed = completed.saturating_add(1);
             }
-            OwnedHostedPnpRebalanceProgress::OwnershipLost(failure) => {
+            OwnedPendingPnpOperationProgress::OwnershipLost(status) => {
+                let device_action_identity = nt_handler
+                    .pending_pnp_operations
+                    .get(slot)
+                    .and_then(|pending| pending.owner.device_action_identity());
+                if let Some(identity) = device_action_identity {
+                    nt_handler
+                        .pnp_retain_live_removal_barrier(identity, status)
+                        .expect("lost live removal ownership lost its exact action claim");
+                }
                 let reply = nt_handler
-                    .pending_pnp_rebalances
+                    .pending_pnp_operations
                     .get_mut(slot)
-                    .and_then(|pending| pending.reply.take());
+                    .and_then(|pending| pending.owner.take_reply());
                 if let Some(reply) = reply {
                     pending_driver_start_reply_owner(
                         nt_handler,
                         reply.reply_cap,
                         reply.reply,
                         reply.badge,
-                        failure.status.raw() as u32,
+                        status,
                     );
                     completed = completed.saturating_add(1);
                 }
@@ -22754,7 +22777,7 @@ unsafe fn pump_hosted_io_and_redrive_driver_starts(nt_handler: &mut ExecNtHandle
     activated
         .saturating_add(pumped)
         .saturating_add(pending_driver_start_redrive_all(nt_handler))
-        .saturating_add(pending_pnp_rebalance_redrive_all(nt_handler))
+        .saturating_add(pending_pnp_operation_redrive_all(nt_handler))
 }
 
 fn pending_driver_start_redrive_needed(nt_handler: &ExecNtHandler) -> bool {
@@ -22769,13 +22792,13 @@ fn pending_driver_start_redrive_needed(nt_handler: &ExecNtHandler) -> bool {
         });
     driver_start
         || nt_handler
-            .pending_pnp_rebalances
+            .pending_pnp_operations
             .occupied_slots()
             .any(|slot| {
                 nt_handler
-                    .pending_pnp_rebalances
+                    .pending_pnp_operations
                     .get(slot)
-                    .is_some_and(|pending| pending.batch.needs_completion_redrive())
+                    .is_some_and(|pending| pending.operation.needs_completion_redrive())
             })
 }
 
@@ -22845,22 +22868,22 @@ pub(crate) unsafe fn pending_driver_start_abandon_thread(
         thread_wait_state_clear_badge(reply.badge);
         abandoned += 1;
     }
-    for slot in 0..nt_handler.pending_pnp_rebalances.slot_count() {
+    for slot in 0..nt_handler.pending_pnp_operations.slot_count() {
         let matches = nt_handler
-            .pending_pnp_rebalances
+            .pending_pnp_operations
             .get(slot)
-            .and_then(|pending| pending.reply.as_ref())
+            .and_then(|pending| pending.owner.reply())
             .is_some_and(|reply| reply.tid == tid && reply.reply_cap != 0);
         if !matches {
             continue;
         }
         let reply = nt_handler
-            .pending_pnp_rebalances
+            .pending_pnp_operations
             .get_mut(slot)
-            .expect("PnP rebalance owner disappeared during abandonment")
-            .reply
-            .take()
-            .expect("PnP rebalance reply disappeared during abandonment");
+            .expect("PnP operation owner disappeared during abandonment")
+            .owner
+            .take_reply()
+            .expect("PnP operation reply disappeared during abandonment");
         let cap = reply.reply_cap;
         let deleted = cnode_delete_r(cap);
         let retyped = if deleted == 0 {

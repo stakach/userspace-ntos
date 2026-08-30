@@ -19092,3 +19092,53 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     generation-protected `finish_remove` only after all external teardown commits. Driver unload
     follows only when every device, IRP, callback, and provider owner in that hosted-domain
     generation is gone.
+
+    B3 canonical removal ownership checkpoint (2026-08-31, implementation green): native
+    `PlugPlayControlQueryAndRemoveDevice` now resolves the requested CM instance to its exact live
+    canonical function-device binding and owns the complete orderly sequence. It sends
+    QUERY_REMOVE through the immutable captured stack, sends CANCEL_REMOVE after a veto or after an
+    accepted query whose final REMOVE cannot be dispatched, and returns
+    `STATUS_PLUGPLAY_QUERY_VETOED` with a bounded `PNP_VetoDevice` output only after cancellation has
+    returned. An unreturnable CANCEL or indeterminate transport retains the operation as a teardown
+    barrier rather than manufacturing success.
+
+    A distinct bus-disappearance owner retains the exact delivered CM device-action claim while it
+    sends SURPRISE_REMOVE and then final REMOVE. The notification response, lifecycle owner slot,
+    terminal status, and action acknowledgement are generation-exact; CM cannot retire the action
+    before both the response and terminal lifecycle are published. Rebalance and removal now share
+    one dynamically growing `PendingOperationTable` with typed user/device-action ownership. Reply
+    capability transfer, thread-death detachment, completion redrive, and indeterminate barriers no
+    longer have a second rebalance-only continuation implementation.
+
+    Removal publication is deliberately split at the native boundary. A returned SURPRISE_REMOVE
+    disables only that PDO's enabled interfaces, revokes only its resource/DMA/interrupt grants,
+    and removes only its started power visibility; durable provider mirrors remain alive so the
+    driver can receive final REMOVE and halt its miniport. A returned final REMOVE deletes the exact
+    interface registrations and releases only provider interrupt/timer/miniport mirrors carrying
+    that canonical `DeviceId`; live work-item invocations are retry barriers, not force-cancelled
+    callbacks. Sibling adapters and driver-wide protocol/provider registrations remain live.
+
+    Every lifecycle transaction fallibly copies the complete top-to-bottom I/O Manager stack before
+    dispatch. `IoDeleteDevice` retirement of a captured stack member is guarded while PnP owns that
+    stack, then upgraded to the exact final-REMOVE IRP authority. Final publication derives the
+    expected next-lower device from the immutable snapshot, validates and removes both canonical and
+    hosted projection attachment edges, drains exact delete-pending records, unregisters the PDO's
+    power record, and invokes generation-protected `finish_remove` only after the affected FDO
+    binding and I/O Manager record are gone. It neither unloads the driver nor clears sibling
+    devices.
+
+    Formatting and `git diff --check` are clean. Focused validation passes `nt-pnp-manager` 47/47,
+    `nt-driver-start` 6/6, `nt-power-manager` 15/15, and `nt-io-manager` 238/238; the freestanding
+    executive check passes at the unchanged 209-warning baseline. The pre-existing long-running
+    desktop QEMU still owns the serialized boot lane, so this checkpoint does not start a competing
+    build or boot.
+
+    Review adjustment: canonical per-device removal is closed. Continue B3 at driver unload and
+    hosted-domain rundown. Unload may begin only after every sibling device has reached final remove,
+    every canonical and raw attachment is gone, all IRPs and callback/work-item owners have
+    quiesced, and every provider dependency, executable thunk, interrupt/timer mirror, allocation,
+    and namespace registration for that domain generation is releasable. Remove any broad
+    per-instance teardown still reachable from single-device removal, retain an explicit barrier on
+    partial rundown, and unregister the driver/domain only after one retryable transaction has
+    committed all owned surfaces. Then run a serialized post-checkpoint desktop acceptance once the
+    existing lane is released.
