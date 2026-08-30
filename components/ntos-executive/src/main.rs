@@ -29584,6 +29584,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             for _ in 1..win32k_subsystem::WIN32K_JOB_ATOM_FRAMES {
                 let _ = alloc_frame();
             }
+            // Pointer-free registry staging. CM channels and leased-key state remain in the
+            // executive while win32k carries only bounded bytes and opaque handles.
+            let registry_request_base = alloc_frame();
+            for _ in 1..win32k_subsystem::WIN32K_REGISTRY_FRAMES {
+                let _ = alloc_frame();
+            }
             // Bulk provider argument staging for large GDI client buffers.
             let bulk_arg_base = alloc_frame();
             for _ in 1..win32k_subsystem::WIN32K_BULK_ARG_FRAMES {
@@ -29672,6 +29678,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let _ = page_map(
                     copy_cap(job_atom_base + i),
                     win32k_subsystem::WIN32K_JOB_ATOM_VADDR + i * 0x1000,
+                    RW_NX,
+                    CAP_INIT_THREAD_VSPACE,
+                );
+            }
+            for i in 0..win32k_subsystem::WIN32K_REGISTRY_FRAMES {
+                let _ = page_map(
+                    copy_cap(registry_request_base + i),
+                    win32k_subsystem::WIN32K_REGISTRY_VADDR + i * 0x1000,
                     RW_NX,
                     CAP_INIT_THREAD_VSPACE,
                 );
@@ -29850,8 +29864,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 }
                 // Native RTL NLS state. The storage host owns the file-backed frames; the win32k
                 // component receives read-only, non-executable aliases and validates their actual
-                // byte lengths before DriverEntry. All three tables and the SYSTEM hive below fit
-                // one 2 MiB page-table window.
+                // byte lengths before DriverEntry. Registry access crosses the CM service boundary,
+                // so the raw SYSTEM hive is deliberately absent from this component VSpace.
                 regions[n] = Region {
                     source: FrameSource::Alias(nls_ansi_base),
                     base_va: NLS_ANSI_VADDR,
@@ -29877,20 +29891,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 };
                 n += 1;
 
-                // SYSTEM hive buffer: win32k's ntoskrnl registry imports resolve real keys
-                // directly against the mounted regf bytes. Map the same staged hive read-only into
-                // the component rather than publishing a key/value mirror.
-                let system_hive_base = HIVEBUF_START.load(Ordering::Relaxed);
-                if system_hive_base != 0 {
-                    regions[n] = Region {
-                        source: FrameSource::Alias(system_hive_base),
-                        base_va: HIVEBUF_VADDR,
-                        count: HIVEBUF_FRAMES,
-                        rights: Rights::Uniform(RO_NX),
-                        pts: 0,
-                    };
-                    n += 1;
-                }
                 // DATA export region (aux PT window — no dedicated PT).
                 regions[n] = Region {
                     source: FrameSource::Alias(data_base),
@@ -29941,6 +29941,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     source: FrameSource::Alias(job_atom_base),
                     base_va: win32k_subsystem::WIN32K_JOB_ATOM_VADDR,
                     count: win32k_subsystem::WIN32K_JOB_ATOM_FRAMES,
+                    rights: Rights::Uniform(RW_NX),
+                    pts: 0,
+                };
+                n += 1;
+                // Registry request staging (aux PT window).
+                regions[n] = Region {
+                    source: FrameSource::Alias(registry_request_base),
+                    base_va: win32k_subsystem::WIN32K_REGISTRY_VADDR,
+                    count: win32k_subsystem::WIN32K_REGISTRY_FRAMES,
                     rights: Rights::Uniform(RW_NX),
                     pts: 0,
                 };

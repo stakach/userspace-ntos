@@ -1323,6 +1323,8 @@ fn pump_label_can_arrive_after_timer(ch: &PumpChannel, label: u64) -> bool {
         || (label == crate::win32k_subsystem::W32_VIDEO_IOCTL_LABEL
             && ch.caps.kind == ReqKind::Syscall)
         || (label == crate::win32k_subsystem::W32_LPC_LABEL && ch.caps.kind == ReqKind::Syscall)
+        || (label == crate::win32k_subsystem::W32_REGISTRY_LABEL
+            && ch.caps.kind == ReqKind::Syscall)
         || label == 6
         || (label == 3 && (ch.caps.io_port_faults || ch.caps.assert_skip))
 }
@@ -1921,6 +1923,22 @@ unsafe fn component_pump_loop(
         {
             let status = pump_service_lpc_request();
             pump_reply_recv_into!(ch, *reply_cap, msg, REQUEST_TAG_LEN, status as u32 as u64);
+            continue;
+        } else if label == crate::win32k_subsystem::W32_REGISTRY_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let (status, out1, out2) =
+                crate::win32k_subsystem::service_registry_request(msg.m0, msg.m1);
+            pump_reply_recv4_into!(
+                ch,
+                *reply_cap,
+                msg,
+                3,
+                status as u32 as u64,
+                out1,
+                out2,
+                0
+            );
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_PS_CREATE_SYSTEM_THREAD_LABEL
             && ch.caps.kind == ReqKind::Irp

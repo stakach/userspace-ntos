@@ -161,10 +161,6 @@ impl VideoBridgeState {
             && self.route_backend_ready()
     }
 
-    fn map_published(&self) -> bool {
-        self.ready && self.metadata_ready()
-    }
-
     fn projected_ready(&self) -> bool {
         self.ready
             && self.metadata_ready()
@@ -311,10 +307,6 @@ pub(crate) fn video_device_map_ready() -> bool {
         let state = video_state_snapshot();
         state.map_ready() && video_io_route_ready()
     }
-}
-
-pub(crate) fn video_device_map_published() -> bool {
-    unsafe { video_state_snapshot().map_published() }
 }
 
 pub(crate) fn hosted_video_device_route_ready() -> bool {

@@ -179,6 +179,12 @@ pub const WIN32K_JOB_ATOM_VADDR: u64 = WIN32K_LPC_VADDR + WIN32K_LPC_FRAMES * 0x
 pub const WIN32K_JOB_ATOM_FRAMES: u64 = 1;
 pub const WIN32K_JOB_ATOM_BYTES: usize = (WIN32K_JOB_ATOM_FRAMES as usize) * 0x1000;
 pub const WIN32K_JOB_ATOM_PAYLOAD_OFF: u64 = 0x20;
+/// Dedicated pointer-free registry staging. Registry imports execute in the win32k component, but
+/// the isolated Configuration Manager transport and all CM key leases remain executive-owned.
+pub const WIN32K_REGISTRY_VADDR: u64 =
+    WIN32K_JOB_ATOM_VADDR + WIN32K_JOB_ATOM_FRAMES * 0x1000;
+pub const WIN32K_REGISTRY_FRAMES: u64 = 16;
+pub const WIN32K_REGISTRY_BYTES: usize = (WIN32K_REGISTRY_FRAMES as usize) * 0x1000;
 /// Bulk client-buffer staging for provider-dispatched win32k calls whose input is data, not just
 /// scalar argument tails. `NtGdiStretchDIBitsInternal` can receive DIB payloads far larger than the
 /// generic ARG window, so it gets a dedicated shared 2 MiB PT window between AUX and the session heap.
@@ -188,7 +194,7 @@ const _: () = assert!(WIN32K_ARG_VADDR + WIN32K_ARG_FRAMES * 0x1000 <= WIN32K_VI
 const _: () =
     assert!(WIN32K_VIDEO_IOCTL_VADDR + WIN32K_VIDEO_IOCTL_FRAMES * 0x1000 <= WIN32K_LPC_VADDR);
 const _: () = assert!(
-    WIN32K_JOB_ATOM_VADDR + WIN32K_JOB_ATOM_FRAMES * 0x1000 <= WIN32K_BULK_ARG_VADDR
+    WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_FRAMES * 0x1000 <= WIN32K_BULK_ARG_VADDR
 );
 /// Kernel-mode KUSER_SHARED_DATA mapping used by win32k's direct `SharedUserData` reads. User
 /// processes also see the low 0x7FFE0000 alias; win32k, as a kernel driver, reads the canonical
@@ -776,6 +782,9 @@ pub const W32_VIDEO_IOCTL_LABEL: u64 = 0x775;
 /// A component-side kernel LPC request. Broker capabilities stay executive-owned; the component
 /// passes only an operation, an opaque broker handle, and a bounded native PORT_MESSAGE frame.
 pub const W32_LPC_LABEL: u64 = 0x776;
+/// A component-side registry request. The component stages bounded ASCII path/value bytes and the
+/// executive performs the operation through Configuration Manager using an opaque leased handle.
+pub const W32_REGISTRY_LABEL: u64 = 0x777;
 
 const VIDEO_IOCTL_HDEV: u64 = 0x00;
 const VIDEO_IOCTL_CODE: u64 = 0x08;
@@ -2683,8 +2692,10 @@ extern "win64" fn s_zw_create_event(
 }
 
 extern "win64" fn s_zw_close(handle: u64) -> i32 {
-    if close_win32k_reg_handle(handle) {
-        return 0;
+    if is_win32k_reg_handle(handle) {
+        let (status, _, _) =
+            unsafe { win32k_registry_broker_call(WIN32K_REGISTRY_OP_CLOSE, handle) };
+        return status;
     }
     s_ob_close_handle(handle, 0)
 }
@@ -8772,10 +8783,10 @@ extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -
 //
 // win32k's EngpUpdateGraphicsDeviceList / InitDisplayDriver (ReactOS win32ss/gdi/eng/device.c +
 // win32ss/user/ntuser/display.c) open registry keys through ntoskrnl imports. These trampolines now
-// resolve those imports against real executive-owned state: the mounted SYSTEM hive for service and
-// keyboard-layout keys, plus the runtime video DeviceMap key published through Configuration
-// Manager when the selected display route is registered. There is no key/value mirror: ZwOpenKey
-// only mints an opaque handle to a live target, and ZwQueryValueKey reads the value from that target.
+// resolve those imports against the isolated Configuration Manager's mounted SYSTEM hive for
+// service and keyboard-layout keys, plus the runtime video DeviceMap key published when the selected
+// display route is registered. Each SYSTEM handle owns one CM lease and its resolved physical path;
+// ZwQueryValueKey reads through that lease and ZwClose releases it exactly once.
 // The video route's projected IO object identities and framebuffer IOCTL state are owned by `video_device`;
 // win32k only carries opaque registry handles to the registry authority.
 
@@ -8789,27 +8800,40 @@ const RTL_QUERY_REGISTRY_DIRECT: u32 = 0x0000_0020;
 const RTL_QUERY_REGISTRY_TABLE_SIZE: u64 = 56;
 const REG_NONE: u32 = 0;
 const REG_DWORD: u32 = 4;
-const WIN32K_REG_HANDLE_BASE: u64 = 0x5A5A_1000;
+const WIN32K_REG_HANDLE_BASE: u64 = 0xFFFF_FF00_5732_0000;
+const WIN32K_REG_HANDLE_INDEX_MASK: u64 = 0x0000_FFFF;
+const WIN32K_REGISTRY_PATH_MAX: usize = 384;
+const WIN32K_REGISTRY_KEY_LEN: u64 = 0;
+const WIN32K_REGISTRY_VALUE_LEN: u64 = 4;
+const WIN32K_REGISTRY_VALUE_TYPE: u64 = 8;
+const WIN32K_REGISTRY_DATA_LEN: u64 = 12;
+const WIN32K_REGISTRY_KEY_OFF: u64 = 16;
+const WIN32K_REGISTRY_VALUE_OFF: u64 =
+    WIN32K_REGISTRY_KEY_OFF + WIN32K_REGISTRY_PATH_MAX as u64;
+const WIN32K_REGISTRY_DATA_OFF: u64 =
+    WIN32K_REGISTRY_VALUE_OFF + WIN32K_REGISTRY_PATH_MAX as u64;
+const WIN32K_REGISTRY_VALUE_CAP: usize =
+    WIN32K_REGISTRY_BYTES - WIN32K_REGISTRY_DATA_OFF as usize;
+const WIN32K_REGISTRY_OP_OPEN: u64 = 1;
+const WIN32K_REGISTRY_OP_CLOSE: u64 = 2;
+const WIN32K_REGISTRY_OP_QUERY_VALUE: u64 = 3;
+const _: () = assert!(
+    WIN32K_REGISTRY_DATA_OFF + WIN32K_REGISTRY_VALUE_CAP as u64 <= WIN32K_REGISTRY_BYTES as u64
+);
 static WIN32K_VIDEO_REG_QUERY_TRACE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Copy, Eq, PartialEq)]
 enum Win32kRegHandleTarget {
     Empty,
     VideoDeviceMap,
-    SystemHive { key: u32 },
+    SystemHive {
+        lease: nt_config_client::SystemHiveKeyLease,
+        physical_path: alloc::string::String,
+    },
 }
 
-#[derive(Clone, Copy)]
 struct Win32kRegHandle {
     handle: u64,
     target: Win32kRegHandleTarget,
-}
-
-impl Win32kRegHandle {
-    const EMPTY: Self = Self {
-        handle: 0,
-        target: Win32kRegHandleTarget::Empty,
-    };
 }
 
 static mut WIN32K_REG_HANDLES: Option<Vec<Win32kRegHandle>> = None;
@@ -8846,42 +8870,50 @@ fn win32k_reg_handles() -> Option<&'static Vec<Win32kRegHandle>> {
     unsafe { (&*core::ptr::addr_of!(WIN32K_REG_HANDLES)).as_ref() }
 }
 
-fn register_win32k_reg_handle(target: Win32kRegHandleTarget) -> Option<u64> {
-    if matches!(target, Win32kRegHandleTarget::Empty) {
-        return None;
+fn register_win32k_reg_handle(
+    target: Win32kRegHandleTarget,
+) -> Result<u64, Win32kRegHandleTarget> {
+    if matches!(&target, Win32kRegHandleTarget::Empty) {
+        return Err(target);
     }
     let handles = win32k_reg_handles_mut();
     for (idx, entry) in handles.iter_mut().enumerate() {
-        if matches!(entry.target, Win32kRegHandleTarget::Empty) {
-            let handle = WIN32K_REG_HANDLE_BASE.checked_add(idx as u64)?;
+        if matches!(&entry.target, Win32kRegHandleTarget::Empty) {
+            if idx as u64 > WIN32K_REG_HANDLE_INDEX_MASK {
+                return Err(target);
+            }
+            let handle = WIN32K_REG_HANDLE_BASE | idx as u64;
             *entry = Win32kRegHandle { handle, target };
-            return Some(handle);
+            return Ok(handle);
         }
     }
-    let handle = WIN32K_REG_HANDLE_BASE.checked_add(handles.len() as u64)?;
-    handles.try_reserve(1).ok()?;
+    if handles.len() as u64 > WIN32K_REG_HANDLE_INDEX_MASK {
+        return Err(target);
+    }
+    let handle = WIN32K_REG_HANDLE_BASE | handles.len() as u64;
+    if handles.try_reserve(1).is_err() {
+        return Err(target);
+    }
     handles.push(Win32kRegHandle { handle, target });
-    Some(handle)
+    Ok(handle)
 }
 
-fn lookup_win32k_reg_handle(handle: u64) -> Option<Win32kRegHandleTarget> {
-    win32k_reg_handles()?
-        .iter()
-        .find(|entry| {
-            entry.handle == handle && !matches!(entry.target, Win32kRegHandleTarget::Empty)
-        })
-        .map(|entry| entry.target)
+fn is_win32k_reg_handle(handle: u64) -> bool {
+    handle & !WIN32K_REG_HANDLE_INDEX_MASK == WIN32K_REG_HANDLE_BASE
 }
 
-fn close_win32k_reg_handle(handle: u64) -> bool {
+fn take_win32k_reg_handle(handle: u64) -> Option<Win32kRegHandleTarget> {
     let handles = win32k_reg_handles_mut();
     if let Some(entry) = handles.iter_mut().find(|entry| {
-        entry.handle == handle && !matches!(entry.target, Win32kRegHandleTarget::Empty)
+        entry.handle == handle && !matches!(&entry.target, Win32kRegHandleTarget::Empty)
     }) {
-        *entry = Win32kRegHandle::EMPTY;
-        true
+        entry.handle = 0;
+        Some(core::mem::replace(
+            &mut entry.target,
+            Win32kRegHandleTarget::Empty,
+        ))
     } else {
-        false
+        None
     }
 }
 
@@ -8904,52 +8936,64 @@ fn is_video_device_map_key(path: &[u8]) -> bool {
     reg_ascii_eq(registry_path_tail(path), b"hardware\\devicemap\\video")
 }
 
-fn system_hive_relative_path(hive: &RegfHive<'_>, path: &[u8]) -> Option<Vec<u8>> {
+fn system_hive_absolute_path(path: &[u8]) -> Result<alloc::string::String, i32> {
     let mut tail = registry_path_tail(path);
-    tail = strip_ascii_prefix(tail, b"system\\")?;
-    let selected = hive.current_control_set_name().ok()?;
-    let alias = selected.as_bytes();
-    if reg_ascii_eq(tail, b"currentcontrolset") {
-        let mut out = Vec::new();
-        out.try_reserve_exact(alias.len()).ok()?;
-        out.extend_from_slice(alias);
-        Some(out)
-    } else if let Some(rest) = strip_ascii_prefix(tail, b"currentcontrolset\\") {
-        let len = alias.len().checked_add(1)?.checked_add(rest.len())?;
-        let mut out = Vec::new();
-        out.try_reserve_exact(len).ok()?;
-        out.extend_from_slice(alias);
-        out.push(b'\\');
-        out.extend_from_slice(rest);
-        Some(out)
+    tail = if reg_ascii_eq(tail, b"system") {
+        &[]
     } else {
-        let mut out = Vec::new();
-        out.try_reserve_exact(tail.len()).ok()?;
-        out.extend_from_slice(tail);
-        Some(out)
+        strip_ascii_prefix(tail, b"system\\").ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?
+    };
+    let tail = core::str::from_utf8(tail).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
+    let prefix = r"\Registry\Machine\System";
+    let mut absolute = alloc::string::String::new();
+    absolute
+        .try_reserve_exact(prefix.len().saturating_add(usize::from(!tail.is_empty())).saturating_add(tail.len()))
+        .map_err(|_| STATUS_NO_MEMORY)?;
+    absolute.push_str(prefix);
+    if !tail.is_empty() {
+        absolute.push('\\');
+        absolute.push_str(tail);
     }
+    Ok(absolute)
 }
 
-fn system_hive_key_from_path(path: &[u8]) -> Option<u32> {
-    let hive = system_hive_regf()?;
-    let rel = system_hive_relative_path(&hive, path)?;
-    let rel_str = unsafe { core::str::from_utf8_unchecked(&rel) };
-    hive.open_key(rel_str)
-}
-
-fn system_hive_key_from_root_path(root: u32, path: &[u8]) -> Option<u32> {
-    let hive = system_hive_regf()?;
-    if path.is_empty() {
-        return Some(root);
+fn system_hive_relative_path_from_handle(
+    root: u64,
+    path: &[u8],
+) -> Result<alloc::string::String, i32> {
+    let handles = win32k_reg_handles().ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+    let entry = handles
+        .iter()
+        .find(|entry| entry.handle == root)
+        .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+    let Win32kRegHandleTarget::SystemHive { physical_path, .. } = &entry.target else {
+        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+    };
+    let relative = core::str::from_utf8(path).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
+    let separator = usize::from(!relative.is_empty());
+    let mut absolute = alloc::string::String::new();
+    absolute
+        .try_reserve_exact(
+            physical_path
+                .len()
+                .saturating_add(separator)
+                .saturating_add(relative.len()),
+        )
+        .map_err(|_| STATUS_NO_MEMORY)?;
+    absolute.push_str(physical_path);
+    if !relative.is_empty() {
+        absolute.push('\\');
+        absolute.push_str(relative);
     }
-    let rel_str = unsafe { core::str::from_utf8_unchecked(path) };
-    hive.open_key_from(root, rel_str)
+    Ok(absolute)
 }
 
 fn win32k_reg_path_is_absolute(path: &[u8]) -> bool {
     path.first() == Some(&b'\\')
         || strip_ascii_prefix(path, b"registry\\machine\\").is_some()
+        || reg_ascii_eq(path, b"system")
         || strip_ascii_prefix(path, b"system\\").is_some()
+        || reg_ascii_eq(path, b"hardware")
         || strip_ascii_prefix(path, b"hardware\\").is_some()
 }
 
@@ -9005,9 +9049,216 @@ unsafe fn object_attributes_name_ascii_lower(obj_attr: u64) -> Option<Vec<u8>> {
     read_unicode_string_ascii_lower(ustr)
 }
 
+unsafe fn write_win32k_registry_ascii(len_off: u64, data_off: u64, value: &[u8]) -> bool {
+    if value.len() > WIN32K_REGISTRY_PATH_MAX
+        || value.iter().any(|byte| *byte == 0 || *byte > 0x7f)
+    {
+        return false;
+    }
+    write_volatile(
+        (WIN32K_REGISTRY_VADDR + len_off) as *mut u32,
+        value.len() as u32,
+    );
+    for (index, byte) in value.iter().copied().enumerate() {
+        write_volatile(
+            (WIN32K_REGISTRY_VADDR + data_off + index as u64) as *mut u8,
+            byte,
+        );
+    }
+    true
+}
+
+unsafe fn read_win32k_registry_ascii(len_off: u64, data_off: u64) -> Option<Vec<u8>> {
+    let len = read_volatile((WIN32K_REGISTRY_VADDR + len_off) as *const u32) as usize;
+    if len > WIN32K_REGISTRY_PATH_MAX {
+        return None;
+    }
+    let mut value = Vec::new();
+    value.try_reserve_exact(len).ok()?;
+    for index in 0..len {
+        let byte = read_volatile(
+            (WIN32K_REGISTRY_VADDR + data_off + index as u64) as *const u8,
+        );
+        if byte == 0 || byte > 0x7f {
+            return None;
+        }
+        value.push(byte);
+    }
+    Some(value)
+}
+
+unsafe fn win32k_registry_broker_call(op: u64, arg: u64) -> (i32, u64, u64) {
+    let (_label, status, out1, out2, _) = crate::driver_launch::call_on4(
+        (W32_REGISTRY_LABEL << 12) | 2,
+        op,
+        arg,
+        0,
+        0,
+    );
+    (status as u32 as i32, out1, out2)
+}
+
+unsafe fn open_cm_system_hive_target(path: &str) -> Result<Win32kRegHandleTarget, i32> {
+    let opened = crate::config_manager_open_system_hive_key(path)?;
+    Ok(Win32kRegHandleTarget::SystemHive {
+        lease: opened.lease,
+        physical_path: opened.physical_path,
+    })
+}
+
+fn close_win32k_reg_target(target: Win32kRegHandleTarget) -> i32 {
+    match target {
+        Win32kRegHandleTarget::Empty => STATUS_OBJECT_NAME_NOT_FOUND,
+        Win32kRegHandleTarget::VideoDeviceMap => 0,
+        Win32kRegHandleTarget::SystemHive { lease, .. } => unsafe {
+            crate::config_manager_close_system_hive_key(lease)
+                .map(|()| 0)
+                .unwrap_or_else(|status| status)
+        },
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Win32kRegServiceQueryTarget {
+    VideoDeviceMap,
+    SystemHive(nt_config_client::SystemHiveKeyLease),
+}
+
+fn lookup_win32k_reg_service_query_target(handle: u64) -> Option<Win32kRegServiceQueryTarget> {
+    win32k_reg_handles()?
+        .iter()
+        .find(|entry| {
+            entry.handle == handle && !matches!(&entry.target, Win32kRegHandleTarget::Empty)
+        })
+        .and_then(|entry| match &entry.target {
+            Win32kRegHandleTarget::Empty => None,
+            Win32kRegHandleTarget::VideoDeviceMap => {
+                Some(Win32kRegServiceQueryTarget::VideoDeviceMap)
+            }
+            Win32kRegHandleTarget::SystemHive { lease, .. } => {
+                Some(Win32kRegServiceQueryTarget::SystemHive(*lease))
+            }
+        })
+}
+
+unsafe fn service_win32k_registry_open(root: u64, path: &[u8]) -> Result<u64, i32> {
+    let target = if !win32k_reg_path_is_absolute(path) {
+        let absolute = system_hive_relative_path_from_handle(root, path)?;
+        open_cm_system_hive_target(&absolute)?
+    } else if is_video_device_map_key(path) {
+        let path = core::str::from_utf8(path).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
+        if !crate::config_manager_open_key(path) {
+            return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+        }
+        Win32kRegHandleTarget::VideoDeviceMap
+    } else {
+        let absolute = system_hive_absolute_path(path)?;
+        open_cm_system_hive_target(&absolute)?
+    };
+    match register_win32k_reg_handle(target) {
+        Ok(handle) => Ok(handle),
+        Err(target) => {
+            let _ = close_win32k_reg_target(target);
+            Err(STATUS_NO_MEMORY)
+        }
+    }
+}
+
+unsafe fn service_win32k_registry_query(
+    handle: u64,
+    name: &[u8],
+) -> Result<(u32, Vec<u8>, bool), i32> {
+    match lookup_win32k_reg_service_query_target(handle).ok_or(STATUS_INVALID_HANDLE_I32)? {
+        Win32kRegServiceQueryTarget::VideoDeviceMap => {
+            crate::video_device::query_video_device_map_value_owned(name)
+                .map(|(value_type, data)| (value_type, data, true))
+        }
+        Win32kRegServiceQueryTarget::SystemHive(lease) => {
+            let name = core::str::from_utf8(name).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
+            crate::config_manager_query_leased_system_hive_value(lease, name)
+                .map(|value| (value.value_type, value.data, false))
+        }
+    }
+}
+
+/// Service one pointer-free registry request from the win32k component. This is called only by the
+/// executive-side component pump, which owns the Configuration Manager transport and handle table.
+pub(crate) unsafe fn service_registry_request(op: u64, arg: u64) -> (i32, u64, u64) {
+    write_volatile(
+        (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_VALUE_TYPE) as *mut u32,
+        0,
+    );
+    write_volatile(
+        (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DATA_LEN) as *mut u32,
+        0,
+    );
+    match op {
+        WIN32K_REGISTRY_OP_OPEN => {
+            let Some(path) = read_win32k_registry_ascii(
+                WIN32K_REGISTRY_KEY_LEN,
+                WIN32K_REGISTRY_KEY_OFF,
+            ) else {
+                return (STATUS_INVALID_PARAMETER_I32, 0, 0);
+            };
+            match service_win32k_registry_open(arg, &path) {
+                Ok(handle) => (0, handle, 0),
+                Err(status) => (status, 0, 0),
+            }
+        }
+        WIN32K_REGISTRY_OP_CLOSE => match take_win32k_reg_handle(arg) {
+            Some(target) => (close_win32k_reg_target(target), 0, 0),
+            None => (STATUS_INVALID_HANDLE_I32, 0, 0),
+        },
+        WIN32K_REGISTRY_OP_QUERY_VALUE => {
+            let Some(name) = read_win32k_registry_ascii(
+                WIN32K_REGISTRY_VALUE_LEN,
+                WIN32K_REGISTRY_VALUE_OFF,
+            ) else {
+                return (STATUS_INVALID_PARAMETER_I32, 0, 0);
+            };
+            match service_win32k_registry_query(arg, &name) {
+                Ok((value_type, data, video)) => {
+                    write_volatile(
+                        (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_VALUE_TYPE) as *mut u32,
+                        value_type,
+                    );
+                    write_volatile(
+                        (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DATA_LEN) as *mut u32,
+                        data.len().min(u32::MAX as usize) as u32,
+                    );
+                    if data.len() > WIN32K_REGISTRY_VALUE_CAP {
+                        return (STATUS_BUFFER_TOO_SMALL_I32, value_type as u64, data.len() as u64);
+                    }
+                    for (index, byte) in data.iter().copied().enumerate() {
+                        write_volatile(
+                            (WIN32K_REGISTRY_VADDR
+                                + WIN32K_REGISTRY_DATA_OFF
+                                + index as u64) as *mut u8,
+                            byte,
+                        );
+                    }
+                    if video {
+                        let trace = WIN32K_VIDEO_REG_QUERY_TRACE.fetch_add(1, Ordering::Relaxed);
+                        if trace < 16 {
+                            print_str(b"[win32k-reg] CM-validated video devicemap query name=");
+                            print_str(&name);
+                            print_str(b" len=");
+                            print_u64(data.len() as u64);
+                            print_str(b" status=0x00000000\n");
+                        }
+                    }
+                    (0, value_type as u64, data.len() as u64)
+                }
+                Err(status) => (status, 0, 0),
+            }
+        }
+        _ => (STATUS_INVALID_PARAMETER_I32, 0, 0),
+    }
+}
+
 /// `NTSTATUS ZwOpenKey(PHANDLE KeyHandle, ACCESS_MASK, POBJECT_ATTRIBUTES)`. OBJECT_ATTRIBUTES x64:
 /// ObjectName (PUNICODE_STRING) at +0x10. Resolve win32k's registry imports to live registry/device
-/// targets; optional keys not present in the mounted hives fail with NOT_FOUND.
+/// targets; optional keys not present in CM's mounted hive fail with CM's exact status.
 extern "win64" fn s_zw_open_key(handle_out: *mut u64, _access: u64, obj_attr: u64) -> i32 {
     if handle_out.is_null() {
         return STATUS_ACCESS_VIOLATION_I32;
@@ -9020,37 +9271,18 @@ extern "win64" fn s_zw_open_key(handle_out: *mut u64, _access: u64, obj_attr: u6
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
         let root_dir = read_unaligned((obj_attr + 0x8) as *const u64);
-        let root_target = if root_dir == 0 {
-            None
-        } else {
-            lookup_win32k_reg_handle(root_dir)
-        };
-        let target = if !win32k_reg_path_is_absolute(&path) {
-            match root_target {
-                Some(Win32kRegHandleTarget::SystemHive { key }) => {
-                    if let Some(key) = system_hive_key_from_root_path(key, &path) {
-                        Win32kRegHandleTarget::SystemHive { key }
-                    } else {
-                        return STATUS_OBJECT_NAME_NOT_FOUND;
-                    }
-                }
-                _ => {
-                    return STATUS_OBJECT_NAME_NOT_FOUND;
-                }
-            }
-        } else if is_video_device_map_key(&path) {
-            if !crate::video_device::video_device_map_published() {
-                return STATUS_OBJECT_NAME_NOT_FOUND;
-            }
-            Win32kRegHandleTarget::VideoDeviceMap
-        } else if let Some(key) = system_hive_key_from_path(&path) {
-            Win32kRegHandleTarget::SystemHive { key }
-        } else {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        };
-        let Some(hkey) = register_win32k_reg_handle(target) else {
-            return STATUS_NO_MEMORY;
-        };
+        if !write_win32k_registry_ascii(
+            WIN32K_REGISTRY_KEY_LEN,
+            WIN32K_REGISTRY_KEY_OFF,
+            &path,
+        ) {
+            return STATUS_INVALID_PARAMETER_I32;
+        }
+        let (status, hkey, _) =
+            win32k_registry_broker_call(WIN32K_REGISTRY_OP_OPEN, root_dir);
+        if status != 0 {
+            return status;
+        }
         write_unaligned(handle_out, hkey);
     }
     0
@@ -9080,51 +9312,33 @@ unsafe fn emit_kvpi_bytes(
     0
 }
 
-unsafe fn query_system_hive_value(
-    key: u32,
+unsafe fn query_win32k_registry_value(
+    handle: u64,
     name: &[u8],
     kvi: u64,
     length: u64,
     result_len: *mut u32,
 ) -> i32 {
-    let Some(hive) = system_hive_regf() else {
-        return STATUS_OBJECT_NAME_NOT_FOUND;
-    };
-    let name = core::str::from_utf8_unchecked(name);
-    let Some((value_type, data)) = hive.value(key, name) else {
-        return STATUS_OBJECT_NAME_NOT_FOUND;
-    };
-    emit_kvpi_bytes(kvi, length, result_len, value_type, &data)
-}
-
-unsafe fn query_video_device_map_value(
-    name: &[u8],
-    kvi: u64,
-    length: u64,
-    result_len: *mut u32,
-) -> i32 {
-    let ready = crate::video_device::video_device_map_published();
-    let status = match crate::video_device::query_video_device_map_value_owned(name) {
-        Ok((value_type, data)) => emit_kvpi_bytes(kvi, length, result_len, value_type, &data),
-        Err(status) => status,
-    };
-    let trace = WIN32K_VIDEO_REG_QUERY_TRACE.fetch_add(1, Ordering::Relaxed);
-    if trace < 16 {
-        print_str(b"[win32k-reg] video devicemap query name=");
-        print_str(name);
-        print_str(b" published=");
-        print_u64(ready as u64);
-        print_str(b" len=");
-        print_u64(length);
-        print_str(b" status=0x");
-        print_hex(status as u32);
-        if !result_len.is_null() {
-            print_str(b" result_len=");
-            print_u64(read_unaligned(result_len) as u64);
-        }
-        print_str(b"\n");
+    if !write_win32k_registry_ascii(
+        WIN32K_REGISTRY_VALUE_LEN,
+        WIN32K_REGISTRY_VALUE_OFF,
+        name,
+    ) {
+        return STATUS_INVALID_PARAMETER_I32;
     }
-    status
+    let (status, value_type, data_len) =
+        win32k_registry_broker_call(WIN32K_REGISTRY_OP_QUERY_VALUE, handle);
+    if status != 0 {
+        if status == STATUS_BUFFER_TOO_SMALL_I32 && !result_len.is_null() {
+            write_unaligned(result_len, 12u64.saturating_add(data_len) as u32);
+        }
+        return status;
+    }
+    let data = core::slice::from_raw_parts(
+        (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DATA_OFF) as *const u8,
+        data_len as usize,
+    );
+    emit_kvpi_bytes(kvi, length, result_len, value_type as u32, data)
 }
 
 /// `NTSTATUS ZwQueryValueKey(HANDLE, PUNICODE_STRING ValueName, KEY_VALUE_INFORMATION_CLASS, PVOID
@@ -9142,38 +9356,45 @@ extern "win64" fn s_zw_query_value_key(
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
     unsafe {
-        let Some(target) = lookup_win32k_reg_handle(hkey) else {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        };
         let Some(name) = read_unicode_string_ascii_lower(value_name) else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
-        match target {
-            Win32kRegHandleTarget::Empty => STATUS_OBJECT_NAME_NOT_FOUND,
-            Win32kRegHandleTarget::VideoDeviceMap => {
-                query_video_device_map_value(&name, kvi, length, result_len)
-            }
-            Win32kRegHandleTarget::SystemHive { key } => {
-                query_system_hive_value(key, &name, kvi, length, result_len)
-            }
-        }
+        query_win32k_registry_value(hkey, &name, kvi, length, result_len)
     }
 }
 
 fn win32k_registry_value_owned(
-    target: Win32kRegHandleTarget,
+    handle: u64,
     name: &[u8],
-) -> Option<(u32, Vec<u8>)> {
-    match target {
-        Win32kRegHandleTarget::Empty => None,
-        Win32kRegHandleTarget::VideoDeviceMap => unsafe {
-            crate::video_device::query_video_device_map_value_owned(name).ok()
-        },
-        Win32kRegHandleTarget::SystemHive { key } => {
-            let hive = system_hive_regf()?;
-            let name = unsafe { core::str::from_utf8_unchecked(name) };
-            hive.value(key, name)
+) -> Result<Option<(u32, Vec<u8>)>, i32> {
+    unsafe {
+        if !write_win32k_registry_ascii(
+            WIN32K_REGISTRY_VALUE_LEN,
+            WIN32K_REGISTRY_VALUE_OFF,
+            name,
+        ) {
+            return Err(STATUS_INVALID_PARAMETER_I32);
         }
+        let (status, value_type, data_len) =
+            win32k_registry_broker_call(WIN32K_REGISTRY_OP_QUERY_VALUE, handle);
+        if status == STATUS_OBJECT_NAME_NOT_FOUND {
+            return Ok(None);
+        }
+        if status != 0 {
+            return Err(status);
+        }
+        if data_len > WIN32K_REGISTRY_VALUE_CAP as u64 {
+            return Err(STATUS_BUFFER_TOO_SMALL_I32);
+        }
+        let mut data = Vec::new();
+        data.try_reserve_exact(data_len as usize)
+            .map_err(|_| STATUS_NO_MEMORY)?;
+        for index in 0..data_len as usize {
+            data.push(read_volatile(
+                (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DATA_OFF + index as u64) as *const u8,
+            ));
+        }
+        Ok(Some((value_type as u32, data)))
     }
 }
 
@@ -9232,9 +9453,9 @@ extern "win64" fn s_rtl_query_registry_values(
     if relative_to & RTL_REGISTRY_HANDLE == 0 {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
-    let Some(target) = lookup_win32k_reg_handle(path) else {
+    if !is_win32k_reg_handle(path) {
         return STATUS_OBJECT_NAME_NOT_FOUND;
-    };
+    }
 
     unsafe {
         for index in 0..64u64 {
@@ -9275,7 +9496,10 @@ extern "win64" fn s_rtl_query_registry_values(
             let Some(name) = read_wide_cstr_ascii_lower(name_ptr) else {
                 return STATUS_INVALID_PARAMETER_I32;
             };
-            let value = win32k_registry_value_owned(target, &name);
+            let value = match win32k_registry_value_owned(path, &name) {
+                Ok(value) => value,
+                Err(status) => return status,
+            };
             let status = if let Some((value_type, data)) = value {
                 rtl_query_registry_dispatch(
                     flags,

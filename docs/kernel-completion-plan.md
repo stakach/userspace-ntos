@@ -2983,10 +2983,12 @@ existing synchronous DMA/PnP fixture so the two lifecycle modes remain independe
   CM's exact prepared record bytes durable before asking CM to publish them. CM also owns bounded,
   generation-stamped SYSTEM checkpoint image export and acknowledges it only after the executive's
   storage provider atomically replaces and flushes the image and truncates and flushes the replay
-  log. D5 remains open because several non-native boot/setup consumers and checkpoint scheduling
-  still depend on the executive compatibility mirror. Migrate those consumers, then delete mirror
-  replay/storage and projection diagnostics together; never reduce a live key to a reopenable path
-  or retain a second mutation authority.
+  log. Hosted win32k registry imports now use a pointer-free pump protocol whose executive-owned
+  handles carry exact CM leases; win32k no longer maps or parses the raw SYSTEM hive. D5 remains open
+  because several executive boot/setup consumers and checkpoint scheduling paths still depend on
+  the compatibility mirror. Migrate those consumers, then delete mirror replay/storage and
+  projection diagnostics together; never reduce a live key to a reopenable path or retain a second
+  mutation authority.
 
 ## Immediate Iteration
 
@@ -17875,3 +17877,35 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     migrate each to a CM lease or narrow immutable record, and delete executive SYSTEM replay,
     checkpoint acknowledgement, storage, and projection counters in the same accepted slices. Do not
     add a mirror fallback if a consumer lacks a CM operation; add the narrow CM operation instead.
+
+    Win32k SYSTEM mirror retirement acceptance (2026-08-30): the hosted win32k component no longer
+    receives a raw `HIVEBUF` mapping or parses the SYSTEM REGF image inside its ntoskrnl registry
+    imports. `ZwOpenKey`, relative opens, `ZwQueryValueKey`, `RtlQueryRegistryValues`, and `ZwClose`
+    now cross a dedicated pointer-free component-pump request page. The component carries only
+    bounded path/value bytes and opaque handles; the executive owns every CM channel, leased SYSTEM
+    key, and CM-resolved physical path, and final close releases the exact lease. Failed CM opens or
+    reads propagate their real status without reopening a path or consulting a mirror. The runtime
+    video DeviceMap keeps its canonical video-subsystem value owner, but open admission is validated
+    through CM and no boot-framebuffer or static registry fallback remains. The obsolete win32k REGF
+    path walkers, raw hive lookup functions, raw SYSTEM VSpace mapping, and superseded video-map
+    publication helpers have been deleted.
+
+    Serialized acceptance `.tmp/run-headless-win32k-cm-broker-20260830.log` reaches the genuine
+    Explorer desktop with all `299/299` checks passing and the sentinel matched. Win32k DriverEntry
+    returns `STATUS_SUCCESS`; its real video DeviceMap queries cross the pointer-free broker after CM
+    validates the registry identity. CM reaches generation 2535 with 2532 accepted runtime
+    transactions, zero rejection, and zero projection failures; lease accounting remains balanced at
+    `1337/1335/2/0` acquire/close/live/failure.
+    Explorer completes 668 real api0 redirects with zero callback or dead-callback failures, installs
+    18 client WndProcs without replay, reaches paint begin/end `5/20` with 187 direct GDI returns and
+    135 batch flushes covering 184 records, and paints all `786432/786432` framebuffer pixels with at
+    least 32 colours.
+
+    Review adjustment: win32k has no remaining SYSTEM mirror dependency. D5 remains active for the
+    executive compatibility mirror only. Classify each remaining `mutable_hives` SYSTEM use as boot
+    import, setup read, post-CM replay bookkeeping, or dirty/checkpoint scheduling; move reads to CM
+    leases or the existing narrow immutable records, make CM checkpoint state the only SYSTEM dirty
+    authority, and delete each replaced branch and diagnostic in the same accepted slice. Preserve
+    `MutableHiveSet` for SOFTWARE, SECURITY, SAM, DEFAULT, and dynamically loaded user hives until
+    their own ownership work is explicitly planned; do not broaden SYSTEM retirement into unrelated
+    hive behavior.
