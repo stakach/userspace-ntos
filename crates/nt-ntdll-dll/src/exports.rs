@@ -25302,6 +25302,7 @@ zw_alias!(zw_restore_key, "ZwRestoreKey", nt_restore_key);
 zw_alias!(zw_resume_process, "ZwResumeProcess", nt_resume_process);
 zw_alias!(zw_resume_thread, "ZwResumeThread", nt_resume_thread);
 zw_alias!(zw_save_key, "ZwSaveKey", nt_save_key);
+zw_alias!(zw_save_key_ex, "ZwSaveKeyEx", nt_save_key_ex);
 zw_alias!(
     zw_secure_connect_port,
     "ZwSecureConnectPort",
