@@ -35,6 +35,7 @@ members = [
     "crates/nt-kernel-exec",
     "crates/nt-hal-abi",
     "crates/nt-cm-resources",
+    "crates/nt-acpi",
     "crates/nt-pnp",
     "crates/nt-pnp-abi",
     "crates/nt-power-types",
@@ -143,6 +144,7 @@ nt-driver-host = { path = "crates/nt-driver-host" }
 nt-kernel-exec = { path = "crates/nt-kernel-exec" }
 nt-hal-abi = { path = "crates/nt-hal-abi" }
 nt-cm-resources = { path = "crates/nt-cm-resources" }
+nt-acpi = { path = "crates/nt-acpi" }
 nt-pnp = { path = "crates/nt-pnp" }
 nt-pnp-abi = { path = "crates/nt-pnp-abi" }
 nt-power-types = { path = "crates/nt-power-types" }

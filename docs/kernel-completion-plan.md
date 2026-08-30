@@ -19365,3 +19365,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     firmware, and interpret only the namespace/event methods needed to deliver PCI bus notifications.
     Keep IRQ acknowledgement and table-frame minting in the executive mechanism layer; keep AML and
     PnP notification policy outside rust-micro.
+
+    B3 ACPI fixed-hardware policy checkpoint (2026-08-31, implementation green): a new no-std,
+    host-tested `nt-acpi` crate validates SDT length/checksum/signature and parses RSDT/XSDT entries
+    without physical-address truncation. Null and duplicate table addresses fail closed. Its FADT
+    parser selects the extended DSDT and Generic Address Structure registers when firmware provides
+    them, otherwise uses the specified legacy System-I/O blocks. SCI zero, unsupported address
+    spaces, malformed widths, odd event-block lengths, overflow, and truncated tables are errors.
+
+    PM1 and GPE event blocks are split into their exact status and enable halves, including the
+    firmware GPE1 base number. Active-event decoding requires both status and enable bits and returns
+    only their intersection. The crate contains no port I/O, MMIO, IRQ, seL4, QEMU, registry, or
+    device identity policy. Focused validation passes 5/5 for XSDT address preservation, extended
+    and legacy FADT paths, event-bit selection, checksum rejection, and register-shape rejection.
+
+    Review adjustment: do not add an AML interpreter to the executive. The small-kernel boundary is
+    for the executive to map only firmware table frames covered by BootInfo device authority,
+    validate their fixed hardware descriptors with `nt-acpi`, and mint the described table, SCI,
+    PM1, and GPE capabilities to the dynamically selected ACPI boot-bus driver. The hosted ReactOS
+    `acpi.sys` personality should own AML namespace evaluation, PCI-root discovery, `_Lxx`/`_Exx`
+    event methods, `_EJ0`, and bus-relation invalidation through normal driver/PnP contracts. First
+    audit that driver's real imports, DriverEntry/AddDevice path, and resource expectations; then
+    extend generic hosted-driver grant metadata for ACPI table and fixed-event resources without a
+    service-name branch. The executive live PCI census consumes only the resulting genuine bus
+    notification.
