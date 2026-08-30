@@ -565,6 +565,7 @@ const USER_HANDLE_FLAG_GRANTED: u8 = 0x20;
 const WND_HEAD_PTI_OFF: u64 = 0x10;
 const WND_EXSTYLE_OFF: u64 = 0x30;
 const WND_STYLE_OFF: u64 = 0x34;
+const WND_FNID_OFF: u64 = 0x40;
 const WND_SPWND_NEXT_OFF: u64 = 0x48;
 const WND_SPWND_PREV_OFF: u64 = 0x50;
 const WND_SPWND_PARENT_OFF: u64 = 0x58;
@@ -573,11 +574,41 @@ const WND_PCLS_OFF: u64 = 0x98;
 const CLS_PDCE_OFF: u64 = 0x18;
 const CLS_STYLE_OFF: u64 = 0x54;
 const SSN_NT_USER_CALL_ONE_PARAM: u64 = 0x1002;
+const SSN_NT_USER_MESSAGE_CALL: u64 = 0x1007;
+const SSN_NT_USER_POST_MESSAGE: u64 = 0x100E;
+const SSN_NT_USER_UNHOOK_WINDOWS_HOOK_EX: u64 = 0x1070;
+const SSN_NT_USER_SET_WINDOWS_HOOK_EX: u64 = 0x108D;
+const SSN_NT_USER_SET_WIN_EVENT_HOOK: u64 = 0x1109;
+const SSN_NT_USER_UNHOOK_WIN_EVENT: u64 = 0x110A;
 const SSN_NT_USER_SET_WINDOW_LONG: u64 = 0x105b;
 const SSN_NT_USER_SET_WINDOW_LONG_PTR: u64 = 0x1298;
 const SSN_NT_USER_GET_DC: u64 = 0x100a;
 const GWLP_WNDPROC_INDEX_U32: u64 = 0xffff_fffc;
 const ONEPARAM_ROUTINE_GETKEYBOARDLAYOUT: u64 = 0x28;
+const HWND_BROADCAST: u64 = 0xFFFF;
+const HWND_TOPMOST: u64 = u64::MAX;
+const FNID_MENU: u32 = 0x029C;
+const FNID_DESKTOP: u32 = 0x029D;
+const FNID_SWITCH: u32 = 0x02A0;
+const FNID_SENDMESSAGE: u64 = 0x02B1;
+const FNID_SENDMESSAGEFF: u64 = 0x02B2;
+const FNID_SENDMESSAGEWTOOPTION: u64 = 0x02B3;
+const FNID_BROADCASTSYSTEMMESSAGE: u64 = 0x02B5;
+const FNID_SENDNOTIFYMESSAGE: u64 = 0x02B7;
+const FNID_SENDMESSAGECALLBACK: u64 = 0x02B8;
+const BSM_APPLICATIONS: u32 = 0x0000_0008;
+const BSM_ALLDESKTOPS: u32 = 0x0000_0010;
+const BSF_QUERY: u32 = 0x0000_0001;
+const BSF_IGNORECURRENTTASK: u32 = 0x0000_0002;
+const BSF_NOHANG: u32 = 0x0000_0008;
+const BSF_POSTMESSAGE: u32 = 0x0000_0010;
+const BSF_FORCEIFHUNG: u32 = 0x0000_0020;
+const BSF_NOTIMEOUTIFNOTHUNG: u32 = 0x0000_0040;
+const SMTO_ABORTIFHUNG: u32 = 0x0000_0002;
+const SMTO_NOTIMEOUTIFNOTHUNG: u32 = 0x0000_0008;
+const BROADCAST_QUERY_DENY: u64 = 1_112_363_332;
+const WM_USER: u32 = 0x0400;
+const REGISTERED_MESSAGE_FIRST: u32 = 0xC000;
 static WIN32K_EXPLORER_SETWNDPROC_CLIENT_CALLS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_EXPLORER_SETWNDPROC_REPLAY_CALLS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_GDI_HANDLE_MISMATCH_TRACES: AtomicU64 = AtomicU64::new(0);
@@ -6427,6 +6458,19 @@ unsafe fn resolve_user_handle_entry(handle: u64) -> Option<UserHandleEntry> {
     })
 }
 
+unsafe fn user_handle_owner_process(entry: UserHandleEntry) -> Option<u64> {
+    match entry.object_type {
+        // Window, hook, WinEvent hook, and input-context entries are THREADINFO-owned.
+        1 | 5 | 15 | 17 if entry.owner != 0 => {
+            let process = read_volatile((entry.owner + THREADINFO_PPI_OFF) as *const u64);
+            (process != 0).then_some(process)
+        }
+        // Menu, cursor, call-proc, and accelerator entries are PROCESSINFO-owned.
+        2 | 3 | 7 | 8 if entry.owner != 0 => Some(entry.owner),
+        _ => None,
+    }
+}
+
 unsafe fn resolve_window_handle(hwnd: u64) -> u64 {
     resolve_user_handle_entry(hwnd)
         .filter(|entry| entry.object_type == 1)
@@ -11197,6 +11241,10 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         dispatch_win32_job_user_handle(a0, a1, a2 != 0, a3 as u32)
     } else if ssn == SSN_NT_USER_VALIDATE_HANDLE_SECURE {
         dispatch_validate_user_handle_secure(a0)
+    } else if let Some(result) = dispatch_job_scoped_broadcast(ssn, a0, a1, a2, a3) {
+        result
+    } else if let Some(result) = enforce_job_handle_target_policy(ssn, a0, a2) {
+        result
     } else if let Some(denied_result) = enforce_win32_job_ui_policy(ssn, a0, a1) {
         denied_result
     } else if matches!(ssn, 0x1036 | 0x10AD) {
@@ -11389,20 +11437,10 @@ struct ResolvedUserHandle {
 /// recycled slot cannot inherit an old exception.
 unsafe fn resolve_user_handle(handle: u64) -> Option<ResolvedUserHandle> {
     let entry = resolve_user_handle_entry(handle)?;
-    let owner_process = match entry.object_type {
-        // Window, hook, WinEvent hook, and input-context entries are THREADINFO-owned.
-        1 | 5 | 15 | 17 if entry.owner != 0 => {
-            let process = read_volatile((entry.owner + THREADINFO_PPI_OFF) as *const u64);
-            (process != 0).then_some(process)
-        }
-        // Menu, cursor, call-proc, and accelerator entries are PROCESSINFO-owned.
-        2 | 3 | 7 | 8 if entry.owner != 0 => Some(entry.owner),
-        _ => None,
-    };
     Some(ResolvedUserHandle {
         entry_address: entry.address,
         canonical: entry.canonical,
-        owner_process,
+        owner_process: user_handle_owner_process(entry),
     })
 }
 
@@ -11471,6 +11509,478 @@ unsafe fn dispatch_validate_user_handle_secure(user_handle: u64) -> u64 {
         resolved.canonical,
         resolved.owner_process,
     ))
+}
+
+#[derive(Clone, Copy)]
+struct BroadcastTarget {
+    hwnd: u64,
+    desktop: u64,
+}
+
+#[repr(C)]
+struct DoSendMessage {
+    flags: u32,
+    timeout: u32,
+    result: u64,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct BroadcastParm {
+    flags: u32,
+    recipients: u32,
+    desktop: u64,
+    window: u64,
+    luid: u64,
+}
+
+unsafe fn current_process_has_handle_restriction() -> bool {
+    let process = current_w32process();
+    process != 0
+        && win32_job_ui_policy().restrictions_for_process(process)
+            & nt_win32k_job::JOB_OBJECT_UILIMIT_HANDLES
+            != 0
+}
+
+unsafe fn current_request_argument(index: u64) -> Option<u64> {
+    if !(4..WIN32K_MAX_SERVICE_ARGS).contains(&index) {
+        return None;
+    }
+    let sh = WIN32K_SHARED_VADDR;
+    let caller_sp = read_volatile((sh + SH_REQ_CALLER_SP) as *const u64);
+    if caller_sp != 0 {
+        let address = caller_sp.checked_add(0x28 + (index - 4) * 8)?;
+        Some(read_volatile(address as *const u64))
+    } else {
+        let nargs = read_volatile((sh + SH_REQ_NARGS) as *const u64);
+        if nargs <= index {
+            None
+        } else {
+            Some(read_volatile(
+                (sh + SH_REQ_A4 + (index - 4) * 8) as *const u64,
+            ))
+        }
+    }
+}
+
+/// Call the registered seven-argument `NtUserMessageCall` handler with an explicit tail. This is
+/// used only after a restricted broadcast has been expanded into its permitted real HWND targets.
+unsafe fn dispatch_message_call_direct(
+    hwnd: u64,
+    message: u64,
+    wparam: u64,
+    lparam: u64,
+    result_info: u64,
+    fnid: u64,
+    ansi: u64,
+) -> u64 {
+    let base = read_volatile((WIN32K_SHARED_VADDR + SH_SSDT_BASE) as *const u64);
+    let count = read_volatile((WIN32K_SHARED_VADDR + SH_SSDT_COUNT) as *const u32) as u64;
+    let index = SSN_NT_USER_MESSAGE_CALL - WIN32K_SERVICE_BASE;
+    if base == 0
+        || (count != 0 && index >= count)
+        || registered_win32k_provider_argc(SSN_NT_USER_MESSAGE_CALL) != Some(7)
+    {
+        return 0;
+    }
+    let handler = read_volatile((base + index * 8) as *const u64);
+    if handler == 0 {
+        return 0;
+    }
+    let call: extern "win64" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 =
+        core::mem::transmute(handler as *const ());
+    call(
+        hwnd,
+        message,
+        wparam,
+        lparam,
+        result_info,
+        fnid,
+        ansi,
+    )
+}
+
+/// Snapshot the real top-level windows visible to a handle-restricted job. Explicit handle grants
+/// do not widen broadcasts: the documented broadcast and hook rules are same-job only.
+unsafe fn collect_job_broadcast_targets(
+    all_desktops: bool,
+    ignore_current_thread: bool,
+) -> Result<Vec<BroadcastTarget>, u32> {
+    let caller_process = current_w32process();
+    let caller_thread = current_w32thread();
+    let current_desktop = if all_desktops || caller_thread == 0 {
+        0
+    } else {
+        let info = read_volatile((caller_thread + THREADINFO_PDESKINFO_OFF) as *const u64);
+        if info == 0 {
+            0
+        } else {
+            read_volatile((info + 0x10) as *const u64)
+        }
+    };
+
+    let table = read_volatile((WIN32K_SHARED_VADDR + SH_SAS_AHELIST) as *const u64);
+    if table == 0 {
+        return Err(nt_win32k_job::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let entries = read_volatile(table as *const u64);
+    let maximum = (LAST_USER_HANDLE - FIRST_USER_HANDLE + 1) >> 1;
+    let count = (read_volatile((table + 0x10) as *const u32) as u64).min(maximum);
+    if entries == 0 {
+        return Err(nt_win32k_job::STATUS_INSUFFICIENT_RESOURCES);
+    }
+
+    let mut targets = Vec::new();
+    for index in 0..count {
+        let address = entries + index * USER_HANDLE_ENTRY_SIZE;
+        if read_volatile((address + USER_HANDLE_ENTRY_TYPE_OFF) as *const u8) != 1 {
+            continue;
+        }
+        let window = read_volatile(address as *const u64);
+        let owner = read_volatile((address + USER_HANDLE_ENTRY_OWNER_OFF) as *const u64);
+        if window == 0 || owner == 0 || (ignore_current_thread && owner == caller_thread) {
+            continue;
+        }
+        let parent = read_volatile((window + WND_SPWND_PARENT_OFF) as *const u64);
+        if parent == 0
+            || read_volatile((parent + WND_FNID_OFF) as *const u32) != FNID_DESKTOP
+            || (!all_desktops && parent != current_desktop)
+        {
+            continue;
+        }
+        let fnid = read_volatile((window + WND_FNID_OFF) as *const u32);
+        if matches!(fnid, FNID_MENU | FNID_SWITCH) {
+            continue;
+        }
+        let owner_process = read_volatile((owner + THREADINFO_PPI_OFF) as *const u64);
+        if !win32_job_ui_policy()
+            .same_job_target_allowed(caller_process, (owner_process != 0).then_some(owner_process))
+        {
+            continue;
+        }
+        targets
+            .try_reserve(1)
+            .map_err(|_| nt_win32k_job::STATUS_INSUFFICIENT_RESOURCES)?;
+        let generation =
+            read_volatile((address + USER_HANDLE_ENTRY_GENERATION_OFF) as *const u16);
+        targets.push(BroadcastTarget {
+            hwnd: FIRST_USER_HANDLE + index * 2 + (u64::from(generation) << 16),
+            desktop: read_volatile(parent as *const u64),
+        });
+    }
+    Ok(targets)
+}
+
+unsafe fn dispatch_broadcast_system_message(
+    message: u64,
+    wparam: u64,
+    lparam: u64,
+    result_info: u64,
+    ansi: u64,
+) -> u64 {
+    if !user_pointer_range_valid(
+        result_info,
+        core::mem::size_of::<BroadcastParm>() as u64,
+    ) {
+        set_current_client_last_error(998);
+        return 0;
+    }
+    let parameters = read_unaligned(result_info as *const BroadcastParm);
+    let flags = parameters.flags;
+    let recipients = parameters.recipients;
+    let all_desktops = recipients == 0 || recipients & BSM_ALLDESKTOPS != 0;
+    if !all_desktops && recipients & BSM_APPLICATIONS == 0 {
+        return 0;
+    }
+    let targets = match collect_job_broadcast_targets(
+        all_desktops,
+        flags & BSF_IGNORECURRENTTASK != 0,
+    ) {
+        Ok(targets) => targets,
+        Err(status) => {
+            set_current_client_last_error(user_handle_status_to_error(status));
+            return 0;
+        }
+    };
+
+    if flags & BSF_QUERY != 0 {
+        write_unaligned((result_info + 8) as *mut u64, 0);
+        write_unaligned((result_info + 16) as *mut u64, 0);
+        let timeout_flags = if flags & (BSF_FORCEIFHUNG | BSF_NOHANG) != 0 {
+            SMTO_ABORTIFHUNG
+        } else if flags & BSF_NOTIMEOUTIFNOTHUNG != 0 {
+            SMTO_NOTIMEOUTIFNOTHUNG
+        } else {
+            0
+        };
+        let mut accepted = true;
+        for target in targets {
+            let mut send = DoSendMessage {
+                flags: timeout_flags,
+                timeout: 2_000,
+                result: 0,
+            };
+            let sent = dispatch_message_call_direct(
+                target.hwnd,
+                message,
+                wparam,
+                lparam,
+                core::ptr::addr_of_mut!(send) as u64,
+                FNID_SENDMESSAGEWTOOPTION,
+                ansi,
+            );
+            if sent == 0 && flags & BSF_FORCEIFHUNG == 0 {
+                accepted = false;
+            }
+            if send.result == BROADCAST_QUERY_DENY {
+                write_unaligned((result_info + 8) as *mut u64, target.desktop);
+                write_unaligned((result_info + 16) as *mut u64, target.hwnd);
+                return 0;
+            }
+        }
+        return u64::from(accepted);
+    }
+
+    for target in &targets {
+        if flags & BSF_POSTMESSAGE != 0 {
+            let _ = dispatch_ssn(
+                SSN_NT_USER_POST_MESSAGE,
+                target.hwnd,
+                message,
+                wparam,
+                lparam,
+            );
+        } else {
+            let _ = dispatch_message_call_direct(
+                target.hwnd,
+                message,
+                wparam,
+                lparam,
+                0,
+                FNID_SENDNOTIFYMESSAGE,
+                ansi,
+            );
+        }
+    }
+    if flags & BSF_POSTMESSAGE == 0
+        && wparam == 0
+        && unicode_string_equals_ignore_ascii_case(lparam, b"Environment")
+    {
+        for target in targets {
+            let _ = dispatch_message_call_direct(
+                target.hwnd,
+                message,
+                wparam,
+                lparam,
+                0,
+                FNID_SENDMESSAGE,
+                ansi,
+            );
+        }
+    }
+    1
+}
+
+unsafe fn unicode_string_equals_ignore_ascii_case(address: u64, expected: &[u8]) -> bool {
+    let Some(bytes) = expected
+        .len()
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(2))
+    else {
+        return false;
+    };
+    if !user_pointer_range_valid(address, bytes as u64) {
+        return false;
+    }
+    for (index, expected) in expected.iter().enumerate() {
+        let unit = read_volatile((address + index as u64 * 2) as *const u16);
+        if unit > u8::MAX as u16 || (unit as u8).to_ascii_lowercase() != expected.to_ascii_lowercase()
+        {
+            return false;
+        }
+    }
+    read_volatile((address + expected.len() as u64 * 2) as *const u16) == 0
+}
+
+const fn user_pointer_range_valid(address: u64, bytes: u64) -> bool {
+    const USER_PROBE_ADDRESS: u64 = 0x0000_7FFF_FFFF_0000;
+    address != 0 && address < USER_PROBE_ADDRESS && bytes <= USER_PROBE_ADDRESS - address
+}
+
+const fn message_is_broadcastable(message: u64) -> bool {
+    let message = message as u32;
+    message < WM_USER || message >= REGISTERED_MESSAGE_FIRST
+}
+
+unsafe fn dispatch_job_scoped_broadcast(
+    ssn: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+) -> Option<u64> {
+    if !current_process_has_handle_restriction() {
+        return None;
+    }
+
+    if ssn == SSN_NT_USER_POST_MESSAGE && matches!(a0, HWND_BROADCAST | HWND_TOPMOST) {
+        if !message_is_broadcastable(a1) {
+            return Some(1);
+        }
+        let targets = match collect_job_broadcast_targets(false, false) {
+            Ok(targets) => targets,
+            Err(status) => {
+                set_current_client_last_error(user_handle_status_to_error(status));
+                return Some(0);
+            }
+        };
+        for target in targets {
+            let _ = dispatch_ssn(
+                SSN_NT_USER_POST_MESSAGE,
+                target.hwnd,
+                a1,
+                a2,
+                a3,
+            );
+        }
+        return Some(1);
+    }
+    if ssn != SSN_NT_USER_MESSAGE_CALL {
+        return None;
+    }
+
+    let result_info = current_request_argument(4)?;
+    let fnid = current_request_argument(5)?;
+    let ansi = current_request_argument(6)?;
+    if fnid == FNID_BROADCASTSYSTEMMESSAGE {
+        return Some(dispatch_broadcast_system_message(
+            a1,
+            a2,
+            a3,
+            result_info,
+            ansi,
+        ));
+    }
+    let broadcast_handle = a0 == HWND_BROADCAST
+        || (a0 == HWND_TOPMOST
+            && matches!(
+                fnid,
+                FNID_SENDMESSAGE | FNID_SENDMESSAGEFF | FNID_SENDMESSAGEWTOOPTION
+            ));
+    if !broadcast_handle
+        || !matches!(
+            fnid,
+            FNID_SENDMESSAGE
+                | FNID_SENDMESSAGEFF
+                | FNID_SENDMESSAGEWTOOPTION
+                | FNID_SENDNOTIFYMESSAGE
+                | FNID_SENDMESSAGECALLBACK
+        )
+    {
+        return None;
+    }
+    if !message_is_broadcastable(a1) {
+        return Some(1);
+    }
+    let targets = match collect_job_broadcast_targets(false, false) {
+        Ok(targets) => targets,
+        Err(status) => {
+            set_current_client_last_error(user_handle_status_to_error(status));
+            return Some(0);
+        }
+    };
+    let mut delivered = true;
+    for target in targets {
+        delivered &= dispatch_message_call_direct(
+            target.hwnd,
+            a1,
+            a2,
+            a3,
+            result_info,
+            fnid,
+            ansi,
+        ) != 0;
+    }
+    Some(u64::from(delivered))
+}
+
+unsafe fn enforce_job_user_handle_access(handle: u64) -> bool {
+    let Some(resolved) = resolve_user_handle(handle) else {
+        set_current_client_last_error(6);
+        return false;
+    };
+    let allowed = win32_job_ui_policy().user_handle_allowed(
+        current_w32process(),
+        resolved.canonical,
+        resolved.owner_process,
+    );
+    if !allowed {
+        set_current_client_last_error(5);
+    }
+    allowed
+}
+
+unsafe fn enforce_job_handle_target_policy(ssn: u64, a0: u64, a2: u64) -> Option<u64> {
+    if !current_process_has_handle_restriction() {
+        return None;
+    }
+    if ssn == SSN_NT_USER_SET_WINDOWS_HOOK_EX {
+        let target_process = if a2 == 0 {
+            None
+        } else {
+            thread_context_index_for_tid(a2).and_then(|index| {
+                let process_index = usize::try_from(thread_ctx_pi(index)).ok()?;
+                let process = process_ctx_w32process(process_index);
+                (process != 0).then_some(process)
+            })
+        };
+        if !win32_job_ui_policy()
+            .same_job_target_allowed(current_w32process(), target_process)
+        {
+            set_current_client_last_error(5);
+            return Some(0);
+        }
+        return None;
+    }
+    if ssn == SSN_NT_USER_SET_WIN_EVENT_HOOK {
+        let target_pid = current_request_argument(5).unwrap_or(0);
+        let target_tid = current_request_argument(6).unwrap_or(0);
+        let target_from_pid = (target_pid != 0).then(|| {
+            process_context_index_for_pid(target_pid)
+                .map(|index| process_ctx_w32process(index))
+                .filter(|process| *process != 0)
+        });
+        let target_from_tid = (target_tid != 0).then(|| {
+            thread_context_index_for_tid(target_tid).and_then(|index| {
+                let process_index = usize::try_from(thread_ctx_pi(index)).ok()?;
+                let process = process_ctx_w32process(process_index);
+                (process != 0).then_some(process)
+            })
+        });
+        let policy = win32_job_ui_policy();
+        let caller = current_w32process();
+        let allowed = target_from_pid
+            .into_iter()
+            .chain(target_from_tid)
+            .all(|target| policy.same_job_target_allowed(caller, target))
+            && (target_pid != 0 || target_tid != 0);
+        if !allowed {
+            set_current_client_last_error(5);
+            return Some(0);
+        }
+        return None;
+    }
+
+    let user_handle = match ssn {
+        SSN_NT_USER_MESSAGE_CALL | SSN_NT_USER_POST_MESSAGE
+            if a0 != 0 && !matches!(a0, HWND_BROADCAST | HWND_TOPMOST) =>
+        {
+            Some(a0)
+        }
+        SSN_NT_USER_UNHOOK_WINDOWS_HOOK_EX | SSN_NT_USER_UNHOOK_WIN_EVENT => Some(a0),
+        _ => None,
+    }?;
+    (!enforce_job_user_handle_access(user_handle)).then_some(0)
 }
 
 unsafe fn dispatch_ssn_with_job_atom_namespace(

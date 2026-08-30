@@ -17462,3 +17462,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     top-level windows in the caller's job and global hooks are scoped to that job's threads. Implement
     both inside win32k's real message/hook paths, remove superseded broad-deny logic, then run one
     serialized desktop proof covering the complete UI-handle slice before starting token restrictions.
+
+    Job-scoped broadcast/hook checkpoint (2026-08-30, focused validation accepted; serialized desktop
+    proof remains): restricted `NtUserPostMessage` and every broadcast form carried by the registered
+    seven-argument `NtUserMessageCall` service now expand `HWND_BROADCAST`/`HWND_TOPMOST` into a snapshot
+    of live, generation-correct top-level USER windows. Win32k derives each recipient from the provider's
+    actual USER handle table and `WND`/`THREADINFO` ownership, filters it through the authoritative job
+    membership store, keeps current-desktop versus `BSM_ALLDESKTOPS` behavior, excludes menu/switch
+    windows, honors `BSF_IGNORECURRENTTASK`, query timeout/deny results, asynchronous post/notify modes,
+    and the synchronous `Environment` notification. It then invokes only the real registered USER
+    handlers with concrete HWNDs; no synthetic delivery result or cross-job fallback remains. Explicit
+    handle grants deliberately do not widen broadcasts because the NT contract requires same-job
+    top-level recipients.
+
+    Direct message/post calls and hook removal now validate the live canonical USER handle against the
+    same owner/grant policy before entering ReactOS win32k. `NtUserSetWindowsHookEx` admits an explicit
+    target only when the target thread resolves to a W32PROCESS in the caller's job, and rejects an
+    unbounded global target. `NtUserSetWinEventHook` applies the same rule to each nonzero process/thread
+    filter and rejects an unbounded registration; both hook removal services accept only same-job or
+    explicitly granted live hook handles. Malformed or unresolved target metadata fails closed with
+    `ERROR_ACCESS_DENIED`.
+
+    Review adjustment: the provider-owned `JOB_OBJECT_UILIMIT_HANDLES` semantics are complete at focused
+    scope. `nt-win32k-job` now passes `9/9`; formatting, `git diff --check`, and the freestanding executive
+    check pass at the established 209-warning baseline. Run one serialized desktop proof before marking
+    this slice accepted. If the unrestricted Explorer boot remains unchanged, advance to token
+    restrictions through the Security Manager; do not add more syscall-name policy to Ps or the generic
+    executive dispatcher.

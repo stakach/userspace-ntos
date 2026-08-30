@@ -279,6 +279,18 @@ impl JobUiPolicyStore {
         self.jobs[index].granted_user_handles.contains(&user_handle)
     }
 
+    /// Check a target that cannot use the explicit USER-handle grant exception. Broadcast
+    /// recipients and hook threads are bounded to the caller's own job by the NT contract.
+    pub fn same_job_target_allowed(&self, process: u64, target_process: Option<u64>) -> bool {
+        let Some(index) = self.member_job_index(process) else {
+            return true;
+        };
+        if self.jobs[index].restrictions & JOB_OBJECT_UILIMIT_HANDLES == 0 {
+            return true;
+        }
+        target_process.is_some_and(|target| self.jobs[index].members.contains(&target))
+    }
+
     pub fn private_atom_table_for_process(&mut self, process: u64) -> Option<u64> {
         let index = self.member_job_index(process)?;
         if self.jobs[index].restrictions & JOB_OBJECT_UILIMIT_GLOBALATOMS == 0 {
@@ -637,5 +649,24 @@ mod tests {
         );
         assert!(!store.user_handle_allowed(0x11, handle, None));
         assert!(store.user_handle_allowed(0x33, handle, Some(0x22)));
+    }
+
+    #[test]
+    fn broadcasts_and_hooks_are_bounded_to_same_job_targets() {
+        let mut store = JobUiPolicyStore::new();
+        store
+            .register_job(1, 0x1000, JOB_OBJECT_UILIMIT_HANDLES)
+            .unwrap();
+        store.register_job(2, 0x2000, 0).unwrap();
+        store.add_process(1, 0x11).unwrap();
+        store.add_process(1, 0x12).unwrap();
+        store.add_process(2, 0x22).unwrap();
+
+        assert!(store.same_job_target_allowed(0x11, Some(0x12)));
+        assert!(!store.same_job_target_allowed(0x11, Some(0x22)));
+        assert!(!store.same_job_target_allowed(0x11, Some(0x33)));
+        assert!(!store.same_job_target_allowed(0x11, None));
+        assert!(store.same_job_target_allowed(0x22, Some(0x11)));
+        assert!(store.same_job_target_allowed(0x33, None));
     }
 }
