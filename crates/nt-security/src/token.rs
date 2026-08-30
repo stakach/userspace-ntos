@@ -532,6 +532,15 @@ impl AccessToken {
         !self.restricted_sids.is_empty()
     }
 
+    /// Native `SeTokenIsAdmin`: the Administrators alias must still be enabled and usable for
+    /// allow access. A filtered deny-only Administrators SID is deliberately not administrative.
+    pub fn is_administrator(&self) -> bool {
+        self.user == Sid::administrators()
+            || self.groups.iter().any(|group| {
+                group.sid == Sid::administrators() && group.is_enabled() && !group.is_deny_only()
+            })
+    }
+
     fn privilege(name: &'static str, low: u32, enabled: bool) -> TokenPrivilege {
         TokenPrivilege {
             name,

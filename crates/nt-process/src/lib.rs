@@ -3631,6 +3631,21 @@ impl ProcessManager {
         self.jobs.set_security_limits(id, limits)
     }
 
+    pub fn prepare_job_security_limits(
+        &self,
+        id: job::JobId,
+        requested: u32,
+    ) -> Result<job::JobSecurityLimitPlan, u32> {
+        self.jobs.prepare_security_limits(id, requested)
+    }
+
+    pub fn commit_job_security_limits(
+        &mut self,
+        plan: job::JobSecurityLimitPlan,
+    ) -> Result<(), u32> {
+        self.jobs.commit_security_limits(plan)
+    }
+
     pub fn job_end_of_job_time_action(&self, id: job::JobId) -> Result<u32, u32> {
         self.jobs.end_of_job_time_action(id)
     }

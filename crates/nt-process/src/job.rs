@@ -215,6 +215,33 @@ pub struct JobUiRestrictionPlan {
     restrictions: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobSecurityLimitPlan {
+    job_id: JobId,
+    security_generation: u64,
+    previous: u32,
+    requested: u32,
+    limits: u32,
+}
+
+impl JobSecurityLimitPlan {
+    pub const fn job_id(self) -> JobId {
+        self.job_id
+    }
+
+    pub const fn previous(self) -> u32 {
+        self.previous
+    }
+
+    pub const fn requested(self) -> u32 {
+        self.requested
+    }
+
+    pub const fn limits(self) -> u32 {
+        self.limits
+    }
+}
+
 impl JobUiRestrictionPlan {
     pub const fn previous(self) -> u32 {
         self.previous
@@ -304,6 +331,7 @@ struct Job {
     limits_generation: u64,
     membership_generation: u64,
     ui_generation: u64,
+    security_generation: u64,
     basic_limits: JobBasicLimits,
     extended_limits: JobExtendedLimits,
     accounting: JobAccounting,
@@ -468,6 +496,7 @@ impl JobStore {
             limits_generation: 0,
             membership_generation: 0,
             ui_generation: 0,
+            security_generation: 0,
             basic_limits: JobBasicLimits {
                 scheduling_class: 5,
                 ..JobBasicLimits::default()
@@ -1376,12 +1405,64 @@ impl JobStore {
     }
 
     pub fn set_security_limits(&mut self, id: JobId, limits: u32) -> Result<(), u32> {
-        if limits & !JOB_OBJECT_SECURITY_VALID_FLAGS != 0 {
+        let plan = self.prepare_security_limits(id, limits)?;
+        self.commit_security_limits(plan)
+    }
+
+    pub fn prepare_security_limits(
+        &self,
+        id: JobId,
+        requested: u32,
+    ) -> Result<JobSecurityLimitPlan, u32> {
+        if requested & !JOB_OBJECT_SECURITY_VALID_FLAGS != 0 {
             return Err(crate::STATUS_INVALID_PARAMETER);
         }
-        self.get_mut(id)
-            .ok_or(crate::STATUS_INVALID_HANDLE)?
-            .security_limits = limits;
+        let job = self.get(id).ok_or(crate::STATUS_INVALID_HANDLE)?;
+        let exclusive = JOB_OBJECT_SECURITY_ONLY_TOKEN | JOB_OBJECT_SECURITY_FILTER_TOKENS;
+        if requested & JOB_OBJECT_SECURITY_RESTRICTED_TOKEN != 0
+            && (job.security_limits | requested) & exclusive != 0
+        {
+            return Err(crate::STATUS_INVALID_PARAMETER);
+        }
+        if requested & JOB_OBJECT_SECURITY_ONLY_TOKEN != 0
+            && ((job.security_limits & exclusive != 0)
+                || requested
+                    & (JOB_OBJECT_SECURITY_FILTER_TOKENS | JOB_OBJECT_SECURITY_RESTRICTED_TOKEN)
+                    != 0)
+        {
+            return Err(crate::STATUS_INVALID_PARAMETER);
+        }
+        if requested & JOB_OBJECT_SECURITY_FILTER_TOKENS != 0
+            && ((job.security_limits & exclusive != 0)
+                || requested
+                    & (JOB_OBJECT_SECURITY_ONLY_TOKEN | JOB_OBJECT_SECURITY_RESTRICTED_TOKEN)
+                    != 0)
+        {
+            return Err(crate::STATUS_INVALID_PARAMETER);
+        }
+        Ok(JobSecurityLimitPlan {
+            job_id: id,
+            security_generation: job.security_generation,
+            previous: job.security_limits,
+            requested,
+            limits: job.security_limits | requested,
+        })
+    }
+
+    pub fn commit_security_limits(&mut self, plan: JobSecurityLimitPlan) -> Result<(), u32> {
+        let job = self
+            .get_mut(plan.job_id)
+            .ok_or(crate::STATUS_INVALID_HANDLE)?;
+        if job.security_generation != plan.security_generation
+            || job.security_limits != plan.previous
+        {
+            return Err(crate::STATUS_INVALID_PARAMETER);
+        }
+        job.security_generation = job
+            .security_generation
+            .checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        job.security_limits = plan.limits;
         Ok(())
     }
 
@@ -1675,5 +1756,75 @@ mod tests {
         assert_eq!(jobs.take_destruction().unwrap().id, first);
         assert_eq!(jobs.take_destruction().unwrap().id, second);
         assert_eq!(jobs.take_destruction(), None);
+    }
+
+    #[test]
+    fn security_limits_are_monotonic_and_generation_checked() {
+        let mut jobs = JobStore::new();
+        let job = jobs.create(0).unwrap();
+
+        let no_admin = jobs
+            .prepare_security_limits(job, JOB_OBJECT_SECURITY_NO_ADMIN)
+            .unwrap();
+        let stale = no_admin;
+        assert_eq!(no_admin.previous(), 0);
+        assert_eq!(no_admin.limits(), JOB_OBJECT_SECURITY_NO_ADMIN);
+        jobs.commit_security_limits(no_admin).unwrap();
+        assert_eq!(
+            jobs.commit_security_limits(stale),
+            Err(crate::STATUS_INVALID_PARAMETER)
+        );
+
+        jobs.set_security_limits(job, JOB_OBJECT_SECURITY_RESTRICTED_TOKEN)
+            .unwrap();
+        assert_eq!(
+            jobs.security_limits(job),
+            Ok(JOB_OBJECT_SECURITY_NO_ADMIN | JOB_OBJECT_SECURITY_RESTRICTED_TOKEN)
+        );
+        jobs.set_security_limits(job, 0).unwrap();
+        assert_eq!(
+            jobs.security_limits(job),
+            Ok(JOB_OBJECT_SECURITY_NO_ADMIN | JOB_OBJECT_SECURITY_RESTRICTED_TOKEN)
+        );
+    }
+
+    #[test]
+    fn security_token_modes_are_one_shot_and_mutually_exclusive() {
+        let mut jobs = JobStore::new();
+        let only = jobs.create(0).unwrap();
+        jobs.set_security_limits(only, JOB_OBJECT_SECURITY_ONLY_TOKEN)
+            .unwrap();
+        assert_eq!(
+            jobs.prepare_security_limits(only, JOB_OBJECT_SECURITY_ONLY_TOKEN),
+            Err(crate::STATUS_INVALID_PARAMETER)
+        );
+        assert_eq!(
+            jobs.prepare_security_limits(only, JOB_OBJECT_SECURITY_FILTER_TOKENS),
+            Err(crate::STATUS_INVALID_PARAMETER)
+        );
+        assert_eq!(
+            jobs.prepare_security_limits(only, JOB_OBJECT_SECURITY_RESTRICTED_TOKEN),
+            Err(crate::STATUS_INVALID_PARAMETER)
+        );
+
+        let filter = jobs.create(0).unwrap();
+        assert_eq!(
+            jobs.prepare_security_limits(
+                filter,
+                JOB_OBJECT_SECURITY_FILTER_TOKENS | JOB_OBJECT_SECURITY_RESTRICTED_TOKEN
+            ),
+            Err(crate::STATUS_INVALID_PARAMETER)
+        );
+        jobs.set_security_limits(filter, JOB_OBJECT_SECURITY_FILTER_TOKENS)
+            .unwrap();
+        assert_eq!(
+            jobs.prepare_security_limits(filter, JOB_OBJECT_SECURITY_ONLY_TOKEN),
+            Err(crate::STATUS_INVALID_PARAMETER)
+        );
+
+        assert_eq!(
+            jobs.prepare_security_limits(filter, JOB_OBJECT_SECURITY_VALID_FLAGS << 1),
+            Err(crate::STATUS_INVALID_PARAMETER)
+        );
     }
 }

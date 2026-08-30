@@ -17503,3 +17503,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Manager. Reuse the existing token and access-check owners, make provider admission plus Ps commit one
     rollback-safe operation, cover assignment/inheritance/rundown with focused host tests, and keep the
     generic syscall dispatcher free of executable identities or permissive fallback behavior.
+
+    Job security-limit transaction foundation (2026-08-30, focused validation accepted; executive
+    composition remains): Ps now owns a monotonic, generation-checked security-limit plan instead of a
+    replaceable flag word. `ONLY_TOKEN` and `FILTER_TOKENS` are one-shot and mutually exclusive, neither
+    may be combined with `RESTRICTED_TOKEN`, zero is a no-op rather than a way to revoke policy, and a
+    stale provider/manager commit cannot overwrite newer state. Ps still stores no token, SID, privilege,
+    or filter material.
+
+    The Security Manager now owns the corresponding provider policy keyed only by opaque JobId. It
+    captures filter inputs into owned SID/LUID vectors, retains and validates the primary job token,
+    duplicates an independent primary token for `ONLY_TOKEN` process admission, rejects administrative
+    or unrestricted identities for the respective flags, applies `FILTER_TOKENS` while impersonating,
+    and releases exact references during rollback and job rundown. Empty filters and mismatched provider
+    generations fail closed. Focused validation passes `nt-process` `146/146` and `nt-security` `86/86`.
+
+    Review adjustment: wire the native 40-byte x64 security-limit structure into this boundary next.
+    Capture its pointer-bearing arrays before provider publication, resolve `JobToken` with native token
+    access/type/privilege rules, compose provider install plus Ps commit with rollback, encode variable
+    query output from provider-owned material, and remove the old nonzero `STATUS_NOT_SUPPORTED` path.
+    Then apply admission to existing-process assignment, inherited child creation, every ETHREAD
+    impersonation entry point, primary-token replacement, and EJOB rundown before serialized desktop
+    acceptance.

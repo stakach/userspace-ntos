@@ -2690,3 +2690,121 @@ fn secure_port_connect_validates_the_named_port_owner_sid() {
         Err(STATUS_INVALID_PARAMETER)
     );
 }
+
+#[test]
+fn job_only_token_publication_rolls_back_and_rundown_releases_ownership() {
+    let mut tokens = TokenStore::new();
+    let source = tokens.insert(AccessToken::user(MACHINE));
+    let mut jobs = JobTokenPolicyStore::new();
+    let update = jobs
+        .install_update(
+            &mut tokens,
+            3,
+            0,
+            JOB_OBJECT_SECURITY_ONLY_TOKEN,
+            Some(source),
+            None,
+        )
+        .unwrap();
+    assert_eq!(jobs.flags(3), JOB_OBJECT_SECURITY_ONLY_TOKEN);
+    assert_eq!(tokens.reference_count(source), Some(2));
+
+    jobs.rollback_update(&mut tokens, update).unwrap();
+    assert_eq!(jobs.flags(3), 0);
+    assert_eq!(tokens.reference_count(source), Some(1));
+
+    jobs.install_update(
+        &mut tokens,
+        3,
+        0,
+        JOB_OBJECT_SECURITY_ONLY_TOKEN,
+        Some(source),
+        None,
+    )
+    .unwrap();
+    let process_token = jobs
+        .prepare_primary_replacement(&mut tokens, 3, source)
+        .unwrap()
+        .unwrap();
+    assert_ne!(process_token, source);
+    assert_eq!(
+        tokens.get(process_token).unwrap().token_type,
+        TokenType::Primary
+    );
+    tokens.release(process_token).unwrap();
+    assert_eq!(jobs.rundown(&mut tokens, 3), Ok(true));
+    assert_eq!(tokens.reference_count(source), Some(1));
+    assert_eq!(jobs.rundown(&mut tokens, 3), Ok(false));
+}
+
+#[test]
+fn job_no_admin_and_restricted_admission_fail_closed() {
+    let mut tokens = TokenStore::new();
+    let admin = tokens.insert(AccessToken::admin(MACHINE));
+    let user = tokens.insert(AccessToken::user(MACHINE));
+    let mut jobs = JobTokenPolicyStore::new();
+    jobs.install_update(
+        &mut tokens,
+        1,
+        0,
+        JOB_OBJECT_SECURITY_NO_ADMIN | JOB_OBJECT_SECURITY_RESTRICTED_TOKEN,
+        None,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        jobs.prepare_primary_replacement(&mut tokens, 1, admin),
+        Err(STATUS_ACCESS_DENIED)
+    );
+    assert_eq!(
+        jobs.prepare_primary_replacement(&mut tokens, 1, user),
+        Err(STATUS_ACCESS_DENIED)
+    );
+
+    let restricted = tokens
+        .filter(
+            user,
+            TokenFilterRequest {
+                flags: 0,
+                sids_to_disable: &[],
+                privileges_to_delete: &[],
+                restricted_sids: &[(Sid::everyone(), 0)],
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        jobs.prepare_primary_replacement(&mut tokens, 1, restricted),
+        Ok(None)
+    );
+}
+
+#[test]
+fn job_impersonation_filter_consumes_source_and_returns_independent_token() {
+    let mut tokens = TokenStore::new();
+    let source = tokens.insert(AccessToken::admin(MACHINE));
+    tokens.retain(source).unwrap();
+    let mut jobs = JobTokenPolicyStore::new();
+    jobs.install_update(
+        &mut tokens,
+        7,
+        0,
+        JOB_OBJECT_SECURITY_FILTER_TOKENS,
+        None,
+        Some(JobTokenFilter {
+            sids_to_disable: vec![(Sid::administrators(), 0)],
+            privileges_to_delete: Vec::new(),
+            restricted_sids: vec![(Sid::everyone(), 0)],
+        }),
+    )
+    .unwrap();
+
+    let admitted = jobs
+        .admit_owned_impersonation(&mut tokens, 7, source)
+        .unwrap();
+    assert_ne!(admitted, source);
+    assert_eq!(tokens.reference_count(source), Some(1));
+    let admitted_body = tokens.get(admitted).unwrap();
+    assert!(!admitted_body.is_administrator());
+    assert!(admitted_body.is_restricted());
+}
