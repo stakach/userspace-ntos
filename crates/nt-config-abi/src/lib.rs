@@ -33,6 +33,9 @@ pub const CM_HIVE_KEY_CHUNK_BYTES: usize = 4096;
 pub const CM_HIVE_KEY_SNAPSHOT_MAGIC: u32 = 0x4B48_4D43; // `CMHK`
 pub const CM_HIVE_KEY_SNAPSHOT_VERSION: u16 = 1;
 pub const CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES: usize = 24;
+pub const CM_HIVE_KEY_RECORD_MAGIC: u32 = 0x524B_4D43; // `CMKR`
+pub const CM_HIVE_KEY_RECORD_VERSION: u16 = 1;
+pub const CM_HIVE_KEY_RECORD_HEADER_BYTES: usize = 24;
 pub const CM_MAX_HIVE_PATH_UNITS: usize = 512;
 /// Maximum payload carried by one immutable driver launch-plan completion frame.
 pub const CM_LAUNCH_PLAN_CHUNK_BYTES: usize = 4096;
@@ -91,6 +94,8 @@ pub mod opcode {
     pub const CM_OP_SYSTEM_HIVE_KEY_LEASE: u16 = 0x2157;
     /// Return an immutable snapshot of a key addressed by an owned SYSTEM key lease.
     pub const CM_OP_QUERY_LEASED_HIVE_KEY: u16 = 0x2158;
+    /// Return one bounded immutable key/value record addressed by an owned SYSTEM key lease.
+    pub const CM_OP_QUERY_LEASED_HIVE_RECORD: u16 = 0x2159;
 }
 
 /// Operation carried by [`CmDevicePropertyRequest::operation`]. Property values are immutable for
@@ -127,6 +132,14 @@ pub mod hive_key_transfer {
 pub mod hive_key_lease_operation {
     pub const OPEN: u16 = 1;
     pub const CLOSE: u16 = 2;
+}
+
+/// Record selector carried by [`CmLeasedHiveRecordRequest::record_kind`].
+pub mod leased_hive_record_kind {
+    pub const KEY_INFORMATION: u16 = 1;
+    pub const VALUE_BY_NAME: u16 = 2;
+    pub const SUBKEY_BY_INDEX: u16 = 3;
+    pub const VALUE_BY_INDEX: u16 = 4;
 }
 
 /// Operation carried by [`CmHiveMutationRequest::operation`].
@@ -365,6 +378,26 @@ pub struct CmLeasedHiveKeyRequest {
     pub transfer_token: u64,
 }
 
+/// `query_leased_hive_record`: a narrow immutable record addressed by a key lease. BEGIN carries
+/// the record selector and optional UTF-16 value name; PULL/ABORT use only the two opaque tokens.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmLeasedHiveRecordRequest {
+    pub abi_size: u16,
+    pub abi_version: u16,
+    pub operation: u16,
+    pub mount: u16,
+    pub key_lease_token: u64,
+    pub transfer_token: u64,
+    pub value_offset: u32,
+    pub chunk_capacity: u32,
+    pub index: u32,
+    pub name_offset: u32,
+    pub name_len_bytes: u32,
+    pub record_kind: u16,
+    pub _reserved: u16,
+}
+
 /// `mutate_system_hive`: a generation-checked journal upload. BEGIN acquires the sole writer lease
 /// and reserves `journal_len_bytes`; APPEND carries the next ordered chunk; COMMIT validates every
 /// record and atomically publishes one new generation; ABORT releases the lease.
@@ -462,6 +495,7 @@ wire!(CmHiveImportRequest);
 wire!(CmHiveKeyRequest);
 wire!(CmHiveKeyLeaseRequest);
 wire!(CmLeasedHiveKeyRequest);
+wire!(CmLeasedHiveRecordRequest);
 wire!(CmHiveMutationRequest);
 wire!(CmHiveMutationRecord);
 wire!(CmLaunchPlanRequest);
@@ -557,10 +591,12 @@ mod tests {
         assert_eq!(opcode::CM_OP_QUERY_NETWORK_PLAN, 0x2155);
         assert_eq!(opcode::CM_OP_SYSTEM_HIVE_KEY_LEASE, 0x2157);
         assert_eq!(opcode::CM_OP_QUERY_LEASED_HIVE_KEY, 0x2158);
+        assert_eq!(opcode::CM_OP_QUERY_LEASED_HIVE_RECORD, 0x2159);
         assert_eq!(core::mem::size_of::<CmHiveImportRequest>(), 32);
         assert_eq!(core::mem::size_of::<CmHiveKeyRequest>(), 32);
         assert_eq!(core::mem::size_of::<CmHiveKeyLeaseRequest>(), 24);
         assert_eq!(core::mem::size_of::<CmLeasedHiveKeyRequest>(), 32);
+        assert_eq!(core::mem::size_of::<CmLeasedHiveRecordRequest>(), 48);
 
         let import = CmHiveImportRequest {
             abi_size: 32,

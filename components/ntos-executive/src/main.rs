@@ -15953,6 +15953,41 @@ pub(crate) unsafe fn config_manager_close_system_hive_key(
     Ok(())
 }
 
+pub(crate) unsafe fn config_manager_query_leased_system_hive_key_information(
+    lease: nt_config_client::SystemHiveKeyLease,
+) -> Result<nt_config_client::LeasedHiveKeyInformation, i32> {
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if expected_generation == 0 {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    let information = client.query_leased_system_hive_key_information(lease)?;
+    if information.mount_generation != expected_generation {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    Ok(information)
+}
+
+pub(crate) unsafe fn config_manager_query_leased_system_hive_value(
+    lease: nt_config_client::SystemHiveKeyLease,
+    name: &str,
+) -> Result<nt_config_client::LeasedHiveValue, i32> {
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if expected_generation == 0 {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    let value = client.query_leased_system_hive_value(lease, name)?;
+    if value.mount_generation != expected_generation {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    Ok(value)
+}
+
 pub(crate) unsafe fn config_manager_commit_system_hive_mutations(
     mutations: &[nt_config_client::SystemHiveMutation<'_>],
 ) -> Result<u64, i32> {

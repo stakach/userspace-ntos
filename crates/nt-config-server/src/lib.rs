@@ -24,19 +24,21 @@ use snapshot::{SnapshotBank, SnapshotChunk, SnapshotPool};
 use nt_config_abi::{
     device_property_transfer, driver_service_class, driver_service_transfer, hive_import_transfer,
     hive_key_lease_operation, hive_key_transfer, hive_mount, hive_mutation_transfer,
-    launch_plan_kind, launch_plan_transfer, network_plan_kind, opcode, pnp_query_kind,
-    pnp_query_transfer, read_utf16, win32_service_plan_kind, win32_service_process_kind,
-    CmDevicePropertyRequest, CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveImportRequest,
-    CmHiveKeyLeaseRequest, CmHiveKeyRequest, CmHiveMutationRequest, CmKeyRequest,
-    CmLaunchPlanRequest, CmLeasedHiveKeyRequest, CmPnpQueryRequest, CmRawValueRequest, CmReply,
-    CmValueRequest, CM_ABI_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_DRIVER_SERVICE_CHUNK_BYTES,
+    launch_plan_kind, launch_plan_transfer, leased_hive_record_kind, network_plan_kind, opcode,
+    pnp_query_kind, pnp_query_transfer, read_utf16, win32_service_plan_kind,
+    win32_service_process_kind, CmDevicePropertyRequest, CmDriverServiceRequest,
+    CmEnumerateKeyRequest, CmHiveImportRequest, CmHiveKeyLeaseRequest, CmHiveKeyRequest,
+    CmHiveMutationRequest, CmKeyRequest, CmLaunchPlanRequest, CmLeasedHiveKeyRequest,
+    CmLeasedHiveRecordRequest, CmPnpQueryRequest, CmRawValueRequest, CmReply, CmValueRequest,
+    CM_ABI_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_DRIVER_SERVICE_CHUNK_BYTES,
     CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_MAGIC,
     CM_DRIVER_SERVICE_SNAPSHOT_VERSION, CM_HIVE_IMPORT_CHUNK_BYTES, CM_HIVE_KEY_CHUNK_BYTES,
+    CM_HIVE_KEY_RECORD_HEADER_BYTES, CM_HIVE_KEY_RECORD_MAGIC, CM_HIVE_KEY_RECORD_VERSION,
     CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES, CM_HIVE_KEY_SNAPSHOT_MAGIC, CM_HIVE_KEY_SNAPSHOT_VERSION,
     CM_HIVE_MUTATION_CHUNK_BYTES, CM_LAUNCH_PLAN_CHUNK_BYTES, CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES,
     CM_LAUNCH_PLAN_SNAPSHOT_MAGIC, CM_LAUNCH_PLAN_SNAPSHOT_VERSION, CM_MAX_HIVE_PATH_UNITS,
-    CM_MAX_INSTANCE_UNITS, CM_MAX_PNP_AUX_BYTES, CM_MAX_SERVICE_UNITS,
-    CM_NETWORK_PLAN_SNAPSHOT_HEADER_BYTES, CM_NETWORK_PLAN_SNAPSHOT_MAGIC,
+    CM_MAX_HIVE_VALUE_NAME_UNITS, CM_MAX_INSTANCE_UNITS, CM_MAX_PNP_AUX_BYTES,
+    CM_MAX_SERVICE_UNITS, CM_NETWORK_PLAN_SNAPSHOT_HEADER_BYTES, CM_NETWORK_PLAN_SNAPSHOT_MAGIC,
     CM_NETWORK_PLAN_SNAPSHOT_VERSION, CM_OPTIONAL_BLOB_ABSENT, CM_OPTIONAL_STRING_ABSENT,
     CM_OPTIONAL_U32_ABSENT, CM_PNP_QUERY_SNAPSHOT_HEADER_BYTES, CM_PNP_QUERY_SNAPSHOT_MAGIC,
     CM_PNP_QUERY_SNAPSHOT_VERSION, CM_WIN32_SERVICE_PLAN_SNAPSHOT_HEADER_BYTES,
@@ -435,6 +437,118 @@ fn encode_hive_key_snapshot_from_key(
     Some(out)
 }
 
+fn utf16_byte_len(value: &str) -> Option<u32> {
+    u32::try_from(value.encode_utf16().count().checked_mul(2)?).ok()
+}
+
+fn begin_hive_key_record(record_kind: u16, mount_generation: u64, index: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_u32(&mut out, CM_HIVE_KEY_RECORD_MAGIC);
+    push_u16(&mut out, CM_HIVE_KEY_RECORD_VERSION);
+    push_u16(&mut out, record_kind);
+    out.extend_from_slice(&mount_generation.to_le_bytes());
+    push_u32(&mut out, index);
+    push_u32(&mut out, 0);
+    debug_assert_eq!(out.len(), CM_HIVE_KEY_RECORD_HEADER_BYTES);
+    out
+}
+
+fn encode_hive_key_information_record(
+    hive: &Hive,
+    mount_generation: u64,
+    key: CellId,
+    path: &str,
+) -> Option<Vec<u8>> {
+    let subkey_count = hive.subkey_count(key);
+    let value_count = hive.value_count(key);
+    let mut max_subkey_name_bytes = 0u32;
+    let mut max_subkey_class_bytes = 0u32;
+    for index in 0..subkey_count {
+        max_subkey_name_bytes =
+            max_subkey_name_bytes.max(utf16_byte_len(hive.subkey_name_by_index(key, index)?)?);
+        if let Some(class_name) = hive.subkey_class_by_index(key, index) {
+            max_subkey_class_bytes = max_subkey_class_bytes.max(utf16_byte_len(class_name)?);
+        }
+    }
+    let mut max_value_name_bytes = 0u32;
+    let mut max_value_data_bytes = 0u32;
+    for index in 0..value_count {
+        let (name, _, data) = hive.value_by_index(key, index)?;
+        max_value_name_bytes = max_value_name_bytes.max(utf16_byte_len(name)?);
+        max_value_data_bytes = max_value_data_bytes.max(u32::try_from(data.len()).ok()?);
+    }
+    let mut out = begin_hive_key_record(
+        leased_hive_record_kind::KEY_INFORMATION,
+        mount_generation,
+        0,
+    );
+    push_u32(&mut out, u32::try_from(subkey_count).ok()?);
+    push_u32(&mut out, max_subkey_name_bytes);
+    push_u32(&mut out, max_subkey_class_bytes);
+    push_u32(&mut out, u32::try_from(value_count).ok()?);
+    push_u32(&mut out, max_value_name_bytes);
+    push_u32(&mut out, max_value_data_bytes);
+    push_string(&mut out, path)?;
+    push_optional_string(&mut out, hive.key_class(key))?;
+    push_optional_blob(&mut out, hive.key_security_descriptor(key))?;
+    Some(out)
+}
+
+fn encode_hive_subkey_record(
+    hive: &Hive,
+    mount_generation: u64,
+    key: CellId,
+    index: u32,
+) -> Result<Vec<u8>, i32> {
+    let index_usize = usize::try_from(index).map_err(|_| STATUS_NO_MORE_ENTRIES)?;
+    let name = hive
+        .subkey_name_by_index(key, index_usize)
+        .ok_or(STATUS_NO_MORE_ENTRIES)?;
+    let mut out = begin_hive_key_record(
+        leased_hive_record_kind::SUBKEY_BY_INDEX,
+        mount_generation,
+        index,
+    );
+    push_string(&mut out, name).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    push_optional_string(&mut out, hive.subkey_class_by_index(key, index_usize))
+        .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    Ok(out)
+}
+
+fn encode_hive_value_record(
+    hive: &Hive,
+    mount_generation: u64,
+    key: CellId,
+    record_kind: u16,
+    index: u32,
+    requested_name: Option<&str>,
+) -> Result<Vec<u8>, i32> {
+    let (name, value_type, data) = if let Some(requested_name) = requested_name {
+        let mut found = None;
+        for candidate in 0..hive.value_count(key) {
+            let Some(value) = hive.value_by_index(key, candidate) else {
+                continue;
+            };
+            if value.0.eq_ignore_ascii_case(requested_name) {
+                found = Some(value);
+                break;
+            }
+        }
+        found.ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?
+    } else {
+        hive.value_by_index(
+            key,
+            usize::try_from(index).map_err(|_| STATUS_NO_MORE_ENTRIES)?,
+        )
+        .ok_or(STATUS_NO_MORE_ENTRIES)?
+    };
+    let mut out = begin_hive_key_record(record_kind, mount_generation, index);
+    push_string(&mut out, name).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    push_u32(&mut out, value_type as u32);
+    push_blob(&mut out, data).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    Ok(out)
+}
+
 fn encode_driver_service_binding(
     cm: &ConfigManager,
     binding: &DriverServiceBinding,
@@ -599,6 +713,7 @@ struct HiveImport {
 enum HiveKeySnapshotIdentity {
     Path(String),
     Lease(u64),
+    LeaseRecord(u64),
 }
 
 struct HiveKeySnapshotKey {
@@ -715,6 +830,9 @@ impl CmServer {
             opcode::CM_OP_QUERY_HIVE_KEY => self.op_query_hive_key(in_buf, out_buf),
             opcode::CM_OP_SYSTEM_HIVE_KEY_LEASE => self.op_system_hive_key_lease(in_buf, out_buf),
             opcode::CM_OP_QUERY_LEASED_HIVE_KEY => self.op_query_leased_hive_key(in_buf, out_buf),
+            opcode::CM_OP_QUERY_LEASED_HIVE_RECORD => {
+                self.op_query_leased_hive_record(in_buf, out_buf)
+            }
             opcode::CM_OP_QUERY_LAUNCH_PLAN => self.op_query_launch_plan(in_buf, out_buf),
             opcode::CM_OP_QUERY_WIN32_SERVICE_PLAN => {
                 self.op_query_win32_service_plan(in_buf, out_buf)
@@ -1694,6 +1812,186 @@ impl CmServer {
                                 if token == req.key_lease_token
                         )
                 }) {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                reply(STATUS_SUCCESS, 0)
+            }
+            _ => reply(STATUS_INVALID_PARAMETER, 0),
+        }
+    }
+
+    fn op_query_leased_hive_record(&mut self, buf: &[u8], out_buf: &mut [u8]) -> CmReply {
+        let Some(req) = CmLeasedHiveRecordRequest::from_bytes(buf) else {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        };
+        let header_size = core::mem::size_of::<CmLeasedHiveRecordRequest>();
+        if req.abi_size as usize != header_size
+            || req.abi_version != CM_ABI_VERSION
+            || req.mount != hive_mount::SYSTEM
+            || req._reserved != 0
+            || req.key_lease_token == 0
+            || req.chunk_capacity as usize > CM_HIVE_KEY_CHUNK_BYTES
+            || req.chunk_capacity as usize > out_buf.len()
+        {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        }
+        match req.operation {
+            hive_key_transfer::BEGIN => {
+                if req.transfer_token != 0 || req.value_offset != 0 || req.chunk_capacity == 0 {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let value_name = match req.record_kind {
+                    leased_hive_record_kind::KEY_INFORMATION => {
+                        if req.index != 0
+                            || req.name_offset != 0
+                            || req.name_len_bytes != 0
+                            || buf.len() != header_size
+                        {
+                            return reply(STATUS_INVALID_PARAMETER, 0);
+                        }
+                        None
+                    }
+                    leased_hive_record_kind::VALUE_BY_NAME => {
+                        if req.index != 0
+                            || req.name_offset as usize != header_size
+                            || req.name_len_bytes % 2 != 0
+                            || req.name_len_bytes as usize > CM_MAX_HIVE_VALUE_NAME_UNITS * 2
+                            || header_size.checked_add(req.name_len_bytes as usize)
+                                != Some(buf.len())
+                        {
+                            return reply(STATUS_INVALID_PARAMETER, 0);
+                        }
+                        let mut units = [0u16; CM_MAX_HIVE_VALUE_NAME_UNITS];
+                        let Some(unit_count) =
+                            read_utf16(buf, req.name_offset, req.name_len_bytes, &mut units)
+                        else {
+                            return reply(STATUS_INVALID_PARAMETER, 0);
+                        };
+                        let units = &units[..unit_count];
+                        if units.contains(&0) {
+                            return reply(STATUS_INVALID_PARAMETER, 0);
+                        }
+                        let Ok(name) = String::from_utf16(units) else {
+                            return reply(STATUS_INVALID_PARAMETER, 0);
+                        };
+                        Some(name)
+                    }
+                    leased_hive_record_kind::SUBKEY_BY_INDEX
+                    | leased_hive_record_kind::VALUE_BY_INDEX => {
+                        if req.name_offset != 0
+                            || req.name_len_bytes != 0
+                            || buf.len() != header_size
+                        {
+                            return reply(STATUS_INVALID_PARAMETER, 0);
+                        }
+                        None
+                    }
+                    _ => return reply(STATUS_INVALID_PARAMETER, 0),
+                };
+                let Some(lease) = self.system_key_leases.get(req.key_lease_token) else {
+                    return reply(STATUS_INVALID_HANDLE, 0);
+                };
+                let key = lease.key;
+                let physical_path = lease.physical_path.clone();
+                let Some(mounted) = self.system_hive.as_ref() else {
+                    return reply(STATUS_DEVICE_NOT_READY, 0);
+                };
+                if mounted.hive.key_path(key).is_none() {
+                    return reply(STATUS_OBJECT_NAME_NOT_FOUND, mounted.generation);
+                }
+                let value = match req.record_kind {
+                    leased_hive_record_kind::KEY_INFORMATION => encode_hive_key_information_record(
+                        &mounted.hive,
+                        mounted.generation,
+                        key,
+                        &physical_path,
+                    )
+                    .ok_or(STATUS_INSUFFICIENT_RESOURCES),
+                    leased_hive_record_kind::VALUE_BY_NAME => encode_hive_value_record(
+                        &mounted.hive,
+                        mounted.generation,
+                        key,
+                        req.record_kind,
+                        0,
+                        value_name.as_deref(),
+                    ),
+                    leased_hive_record_kind::SUBKEY_BY_INDEX => {
+                        encode_hive_subkey_record(&mounted.hive, mounted.generation, key, req.index)
+                    }
+                    leased_hive_record_kind::VALUE_BY_INDEX => encode_hive_value_record(
+                        &mounted.hive,
+                        mounted.generation,
+                        key,
+                        req.record_kind,
+                        req.index,
+                        None,
+                    ),
+                    _ => return reply(STATUS_INVALID_PARAMETER, mounted.generation),
+                };
+                let value = match value {
+                    Ok(value) => value,
+                    Err(status) => return reply(status, mounted.generation),
+                };
+                let Some(chunk) = self.hive_key_snapshots.begin(
+                    HiveKeySnapshotKey {
+                        mount: req.mount,
+                        identity: HiveKeySnapshotIdentity::LeaseRecord(req.key_lease_token),
+                    },
+                    value,
+                    req.chunk_capacity as usize,
+                    out_buf,
+                ) else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, mounted.generation);
+                };
+                snapshot_reply(chunk)
+            }
+            hive_key_transfer::PULL => {
+                if req.transfer_token == 0
+                    || req.chunk_capacity == 0
+                    || req.index != 0
+                    || req.name_offset != 0
+                    || req.name_len_bytes != 0
+                    || req.record_kind != 0
+                    || buf.len() != header_size
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let Some(chunk) = self.hive_key_snapshots.pull(
+                    req.transfer_token,
+                    req.value_offset as usize,
+                    req.chunk_capacity as usize,
+                    out_buf,
+                    |key| {
+                        key.mount == req.mount
+                            && matches!(
+                                key.identity,
+                                HiveKeySnapshotIdentity::LeaseRecord(token)
+                                    if token == req.key_lease_token
+                            )
+                    },
+                ) else {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                };
+                snapshot_reply(chunk)
+            }
+            hive_key_transfer::ABORT => {
+                if req.transfer_token == 0
+                    || req.value_offset != 0
+                    || req.chunk_capacity != 0
+                    || req.index != 0
+                    || req.name_offset != 0
+                    || req.name_len_bytes != 0
+                    || req.record_kind != 0
+                    || buf.len() != header_size
+                    || !self.hive_key_snapshots.abort(req.transfer_token, |key| {
+                        key.mount == req.mount
+                            && matches!(
+                                key.identity,
+                                HiveKeySnapshotIdentity::LeaseRecord(token)
+                                    if token == req.key_lease_token
+                            )
+                    })
+                {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
                 reply(STATUS_SUCCESS, 0)

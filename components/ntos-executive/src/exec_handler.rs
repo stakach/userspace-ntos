@@ -7376,42 +7376,62 @@ impl ExecNtHandler {
         0
     }
 
-    fn registry_value_with<R>(
+    fn registry_value_with_result<R>(
         &self,
         target: KeyRef,
         name: &str,
         mut visit: impl FnMut(u32, &[u8]) -> R,
-    ) -> Option<R> {
-        if let Some(index) = self.registry_overlay_index(target) {
-            if self.overlay.value_is_deleted(index, name) {
-                return None;
+    ) -> Result<Option<R>, u32> {
+        if let Some(target) = self.cm_system_key_target(target) {
+            let value =
+                unsafe { crate::config_manager_query_leased_system_hive_value(target.lease, name) }
+                    .map_err(|status| status as u32)?;
+            return Ok(Some(visit(value.value_type, &value.data)));
+        }
+        let result = (|| -> Option<R> {
+            if let Some(index) = self.registry_overlay_index(target) {
+                if self.overlay.value_is_deleted(index, name) {
+                    return None;
+                }
+                if let Some((ty, data)) = self.overlay.value(index, name) {
+                    return Some(visit(ty, data));
+                }
+                let path = self.overlay.path(index)?;
+                if let Some(key) = self.mutable_registry_key_by_path(path) {
+                    let (ty, data) = self.mutable_hives.query_value(key, name)?;
+                    return Some(visit(ty as u32, data));
+                }
+                if self.mutable_hive_owns_path(path) {
+                    return None;
+                }
+                let key = self.resolve_key(path)?;
+                let (hive, cell) = self.base_hive(key)?;
+                return hive.value_with(cell, name, visit);
             }
-            if let Some((ty, data)) = self.overlay.value(index, name) {
-                return Some(visit(ty, data));
-            }
-            let path = self.overlay.path(index)?;
-            if let Some(key) = self.mutable_registry_key_by_path(path) {
+            if let Some(key) = self.mutable_registry_key(target) {
                 let (ty, data) = self.mutable_hives.query_value(key, name)?;
                 return Some(visit(ty as u32, data));
             }
-            if self.mutable_hive_owns_path(path) {
-                return None;
+            if let Some(path) = self.registry_target_path(target) {
+                if self.mutable_hive_owns_path(&path) {
+                    return None;
+                }
             }
-            let key = self.resolve_key(path)?;
-            let (hive, cell) = self.base_hive(key)?;
-            return hive.value_with(cell, name, visit);
-        }
-        if let Some(key) = self.mutable_registry_key(target) {
-            let (ty, data) = self.mutable_hives.query_value(key, name)?;
-            return Some(visit(ty as u32, data));
-        }
-        if let Some(path) = self.registry_target_path(target) {
-            if self.mutable_hive_owns_path(&path) {
-                return None;
-            }
-        }
-        let (hive, cell) = self.base_hive(target)?;
-        hive.value_with(cell, name, visit)
+            let (hive, cell) = self.base_hive(target)?;
+            hive.value_with(cell, name, visit)
+        })();
+        Ok(result)
+    }
+
+    fn registry_value_with<R>(
+        &self,
+        target: KeyRef,
+        name: &str,
+        visit: impl FnMut(u32, &[u8]) -> R,
+    ) -> Option<R> {
+        self.registry_value_with_result(target, name, visit)
+            .ok()
+            .flatten()
     }
 
     fn mutable_hive_owns_path(&self, path: &str) -> bool {
@@ -33006,7 +33026,8 @@ impl ExecNtHandler {
             // NtQueryKey(KeyHandle[0], KeyInformationClass[1], KeyInformation[2], Length[3],
             // *ResultLength[4]). Registry consumers use the standard key-info classes for sizing,
             // HKCR path resolution, service enumeration, and cached count queries. Answer from the
-            // same merged base-hive/overlay view as NtEnumerateKey/NtQueryValueKey.
+            // key's owning authority: CM for leased SYSTEM identities, otherwise the executive's
+            // mounted/overlay namespaces.
             NativeService::NtQueryKey => unsafe {
                 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
                 const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
@@ -33019,10 +33040,43 @@ impl ExecNtHandler {
                 };
                 let _transient = allocator::enter_transient();
                 let use_xas_write = self.pi >= 2;
-                let stats = self.registry_key_stats(key);
                 let output_length = nt_ulong_arg(args[3]) as usize;
-                let full_path = self.registry_target_path(key).unwrap_or_default();
-                let class_name = self.registry_key_class(key);
+                let leased_information =
+                    match self.cm_system_key_target(key).map(|target| target.lease) {
+                        Some(lease) => {
+                            match crate::config_manager_query_leased_system_hive_key_information(
+                                lease,
+                            ) {
+                                Ok(information) => Some(information),
+                                Err(status) => return status as u32,
+                            }
+                        }
+                        None => None,
+                    };
+                let stats = leased_information.as_ref().map_or_else(
+                    || self.registry_key_stats(key),
+                    |information| RegistryKeyStats {
+                        subkeys: information.subkey_count,
+                        max_subkey_name_bytes: information.max_subkey_name_bytes,
+                        max_subkey_class_bytes: information.max_subkey_class_bytes,
+                        values: information.value_count,
+                        max_value_name_bytes: information.max_value_name_bytes,
+                        max_value_data_bytes: information.max_value_data_bytes,
+                    },
+                );
+                let full_path = leased_information.as_ref().map_or_else(
+                    || self.registry_target_path(key).unwrap_or_default(),
+                    |information| information.path.clone(),
+                );
+                let class_name = leased_information
+                    .as_ref()
+                    .and_then(|information| information.class_name.clone())
+                    .or_else(|| {
+                        leased_information
+                            .is_none()
+                            .then(|| self.registry_key_class(key))
+                            .flatten()
+                    });
                 let (info, minimum_length) = match build_registry_key_query_info(
                     info_class,
                     &full_path,
@@ -33528,18 +33582,19 @@ impl ExecNtHandler {
                 // needs cross-AS copyout.
                 let mut use_xas_write =
                     shell_com_inproc_bit != 0 || self.current_process_is_noninteractive_service();
-                if pe_backed_registry_strings && !is_virtual_registry_key(key) {
-                    // Hosted clients reading a value out of a REAL MOUNTED HIVE (not an overlay or
-                    // predefined-root handle): their out-params are advapi/userenv heap or stack the
-                    // plain mirror can't reach, so the copyout below must go cross-AS. Early live cases:
+                if pe_backed_registry_strings
+                    && (!is_virtual_registry_key(key) || self.cm_system_key_target(key).is_some())
+                {
+                    // Hosted clients reading a value out of a real mounted hive or a CM-owned SYSTEM
+                    // lease have out-params in advapi/userenv heap or stack that the plain mirror can't
+                    // reach, so the copyout below must go cross-AS. Early live cases:
                     //   • SetDefaultLanguage(NULL) -> the `Default` value of the SYSTEM-hive key
                     //     `...\Control\Nls\Language` (opened through the machine namespace). Was:
                     //     mirror-only → None → NOT_FOUND → SetDefaultLanguage FALSE →
                     //     InitializeSAS FALSE → ExitProcess(2).
                     //   • GetProfilesDirectoryW → `ProfilesDirectory` under the SOFTWARE-hive key
                     //     `Software\Microsoft\Windows NT\CurrentVersion\ProfileList`.
-                    // Scoped by `!is_virtual_registry_key`, so overlay/predefined-root reads stay
-                    // on their narrow paths.
+                    // Overlay and predefined-root reads stay on their narrow paths.
                     use_xas_write = true;
                 }
                 let key_is_real_winlogon = key_path.as_deref().is_some_and(is_winlogon_key);
@@ -33568,7 +33623,7 @@ impl ExecNtHandler {
                     );
                     status
                 } else {
-                    self.registry_value_with(key, &name_lc, |ty, data| {
+                    match self.registry_value_with_result(key, &name_lc, |ty, data| {
                         let mut value_use_xas_write = use_xas_write;
                         if self.current_process_is_winlogon() && key_is_real_winlogon {
                             WINLOGON_KEY_VALUES_SERVED.fetch_add(1, Ordering::Relaxed);
@@ -33691,27 +33746,30 @@ impl ExecNtHandler {
                             Some(data),
                         );
                         status
-                    })
-                    .unwrap_or_else(|| {
-                        // POST-PROFILE FRONTIER: once the user hive is loaded, winlogon's remaining
-                        // `HandleLogon` steps (`CreateUserEnvironment` → `SetDefaultLanguage` →
-                        // `AllowAccessOnSession` → `StartUserShell`) fail through `WARN`, which the
-                        // shipped binary does not print. A missed value read is the only externally
-                        // visible evidence of which step gave up, so name the KEY and the VALUE.
-                        if self.current_process_is_winlogon() && post_profile_phase() {
-                            self.trace_post_profile_registry(b"query-value", key, &name_lc);
+                    }) {
+                        Ok(Some(status)) => status,
+                        Ok(None) => {
+                            // POST-PROFILE FRONTIER: once the user hive is loaded, winlogon's remaining
+                            // `HandleLogon` steps (`CreateUserEnvironment` -> `SetDefaultLanguage` ->
+                            // `AllowAccessOnSession` -> `StartUserShell`) fail through `WARN`, which the
+                            // shipped binary does not print. A missed value read is the only externally
+                            // visible evidence of which step gave up, so name the KEY and the VALUE.
+                            if self.current_process_is_winlogon() && post_profile_phase() {
+                                self.trace_post_profile_registry(b"query-value", key, &name_lc);
+                            }
+                            trace_winlogon_post_lsa_registry(
+                                self,
+                                b"query-value",
+                                key_path.as_deref(),
+                                &name_lc,
+                                0xC000_0034,
+                                None,
+                                None,
+                            );
+                            0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND — smss uses defaults
                         }
-                        trace_winlogon_post_lsa_registry(
-                            self,
-                            b"query-value",
-                            key_path.as_deref(),
-                            &name_lc,
-                            0xC000_0034,
-                            None,
-                            None,
-                        );
-                        0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND — smss uses defaults
-                    })
+                        Err(status) => status,
+                    }
                 };
                 query_status
             },
@@ -36494,12 +36552,26 @@ impl ExecNtHandler {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
-                let current = self
-                    .registry_key_security_descriptor(key)
-                    .map(alloc::vec::Vec::from)
-                    .unwrap_or_else(|| {
-                        alloc::vec::Vec::from(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..])
-                    });
+                let current = match self.cm_system_key_target(key).map(|target| target.lease) {
+                    Some(lease) => {
+                        match crate::config_manager_query_leased_system_hive_key_information(lease) {
+                            Ok(information) => information.security_descriptor.unwrap_or_else(|| {
+                                alloc::vec::Vec::from(
+                                    &nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..],
+                                )
+                            }),
+                            Err(status) => return status as u32,
+                        }
+                    }
+                    None => self
+                        .registry_key_security_descriptor(key)
+                        .map(alloc::vec::Vec::from)
+                        .unwrap_or_else(|| {
+                            alloc::vec::Vec::from(
+                                &nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..],
+                            )
+                        }),
+                };
                 let descriptor = match nt_security::query_security_descriptor_bytes(
                     &current,
                     security_information,

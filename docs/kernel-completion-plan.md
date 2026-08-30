@@ -17726,3 +17726,40 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     ownership/checkpoint serialization behind CM and delete the executive post-CM projection. Keep
     focused CM query protocols bounded and generation checked so ordinary value reads do not transfer a
     complete large key when a narrow record is sufficient.
+
+    Native SYSTEM leased-record read acceptance (2026-08-30): the Configuration Manager protocol now
+    exposes four narrow immutable record kinds tied to an existing SYSTEM key lease: key information,
+    value by name, subkey by index, and value by index. BEGIN validates the complete selector/name
+    envelope and materialises one generation-stamped record; PULL and ABORT require the exact transfer
+    and key-lease tokens. Transfers share the bounded 32-reader/8 MiB snapshot pool, so large value data
+    crosses multiple fixed-size frames without transferring every sibling value or subkey. Missing
+    values and enumeration exhaustion return their native statuses, and invalid or replaced leases fail
+    closed without path reopen or another registry authority.
+
+    `NtQueryValueKey`, `NtQueryKey`, and registry-key `NtQuerySecurityObject` now consume these CM-owned
+    records whenever the handle target is a SYSTEM lease. Key counts, maximum lengths, class, physical
+    name, value type/data, and security descriptor no longer come from the executive's projected SYSTEM
+    hive on those paths. The native query preserves CM's exact errors and uses cross-address-space
+    copyout for hosted callers. Other hive mounts, virtual keys, and Object Manager security targets
+    retain their existing owners; there is no fallback from a failed CM lease to an executive mirror.
+
+    Focused validation passes `nt-config-abi` `4/4`, `nt-config-server` `22/22`, and
+    `nt-config-client` `16/16`, including case-insensitive named lookup, original-case enumeration,
+    exact end-of-enumeration status, lease identity across a `Select\\Current` change, replacement
+    invalidation, and multi-frame value reassembly. The freestanding executive release check remains
+    at the established 209-warning baseline.
+
+    Serialized acceptance `.tmp/run-headless-cm-native-query-records-20260830.log` reaches the genuine
+    Explorer desktop with all `299/299` checks passing and the sentinel matched. CM accepts 2532 runtime
+    SYSTEM transactions with zero rejection or projection failures; lease accounting is
+    `1336/1334/2/0` acquire/close/live/failure. Explorer completes 668 real api0 redirects with zero
+    callback or dead-callback failures, installs 18 client WndProcs without replay, reaches paint
+    begin/end `5/20` with 187 direct GDI returns and 135 batch flushes covering 184 records, and paints
+    all `480000/480000` framebuffer pixels with at least 32 colours.
+
+    Review adjustment: the leased query/value/security cut is accepted. D5 remains active for indexed
+    `NtEnumerateKey` and `NtEnumerateValueKey`, which must consume the already-tested narrow leased
+    records and preserve native sizing/copyout semantics. After enumeration is accepted, move durable
+    SYSTEM journal/checkpoint ownership behind CM and delete the executive's post-CM mutation
+    projection and duplicated SYSTEM read machinery. Do not broaden this into whole-key snapshots or
+    keep a mirror fallback for convenience.
