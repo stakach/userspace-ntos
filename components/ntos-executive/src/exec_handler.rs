@@ -3530,21 +3530,9 @@ impl ExecNtHandler {
         driver_starts: DriverStartBootstrap,
         require_boot_system: bool,
     ) -> &'static mut Self {
-        // SAFETY: HIVEBUF is a fixed, executive-lifetime mapping the storage host filled from
-        // ::ROSSYS.HIV; REAL_HIVE_SIZE is its reported byte length (0 if unstaged → None).
-        let hive = unsafe {
-            let n = REAL_HIVE_SIZE.load(Ordering::Relaxed) as usize;
-            if n == 0 {
-                None
-            } else {
-                let bytes: &'static [u8] =
-                    core::slice::from_raw_parts(HIVEBUF_VADDR as *const u8, n);
-                RegfHive::new(bytes)
-            }
-        };
         // The REAL SECURITY + SAM hives the storage host read BY PATH off
-        // `\reactos\system32\config\{security,sam}`. Same mechanism as the SYSTEM hive: borrow the
-        // staged bytes (no copy) and parse them read-only with nt-hive-regf.
+        // `\reactos\system32\config\{security,sam}`. Borrow the staged bytes (no copy) and parse
+        // them read-only with nt-hive-regf; isolated CM already owns the composed SYSTEM image.
         // SAFETY: fixed executive-lifetime mappings; the sizes are what the storage host reported
         // (0 if the file wasn't staged → None → the mount is simply absent).
         let (security_hive, sam_hive) = unsafe {
@@ -3560,8 +3548,8 @@ impl ExecNtHandler {
                 mount(SAMHIVEBUF_VADDR, SAM_HIVE_SIZE.load(Ordering::Relaxed)),
             )
         };
-        // The 4th mount: the REAL 471040 B SOFTWARE hive the storage host read BY PATH off
-        // `\reactos\system32\config\software` into SWHIVEBUF. Same borrow-no-copy mechanism.
+        // The remaining machine mount: the REAL 471040 B SOFTWARE hive the storage host read BY
+        // PATH off `\reactos\system32\config\software` into SWHIVEBUF. Same borrow-no-copy mechanism.
         // SAFETY: a fixed executive-lifetime mapping; the size is what the storage host reported
         // (0 if the file wasn't staged → None → the mount is simply absent).
         let software_hive = unsafe {
@@ -3578,24 +3566,10 @@ impl ExecNtHandler {
         } else {
             None
         };
-        let boot_system_image = owned_boot_system_image
-            .as_deref()
-            .or_else(|| unsafe { boot_system_hive_image_bytes() });
-        if let Some(boot_system_image) = boot_system_image {
-            let boot_system_hive = nt_hive_core::decode_image(boot_system_image)
-                .expect("prepared boot SYSTEM image remains valid");
-            mutable_hives
-                .mount(
-                    hive_mount(HIVE_SEL_SYSTEM),
-                    HIVE_SEL_SYSTEM,
-                    boot_system_hive,
-                )
-                .expect("mount composed boot SYSTEM hive");
-        } else if require_boot_system {
+        if require_boot_system && owned_boot_system_image.is_none() {
             panic!("live hosted-process service requires the composed boot SYSTEM image");
         }
         if let Some(image) = owned_boot_system_image {
-            BOOT_SYSTEM_HIVE_IMAGE_RELEASED_BYTES.store(image.len() as u64, Ordering::Relaxed);
             print_str(b"[cm-hive] released composed SYSTEM transport bytes=");
             print_u64(image.len() as u64);
             print_str(b"\n");
@@ -3717,7 +3691,6 @@ impl ExecNtHandler {
                 }
             };
         }
-        write_field!(hive, hive);
         write_field!(security_hive, security_hive);
         write_field!(sam_hive, sam_hive);
         write_field!(software_hive, software_hive);
@@ -4233,9 +4206,7 @@ impl ExecNtHandler {
         {
             Ok(generation) => generation,
             Err(status) => {
-                print_str(
-                    b"[setup-state] CM-owned HKLM\\SYSTEM\\Setup commit/projection failed status=0x",
-                );
+                print_str(b"[setup-state] CM-owned HKLM\\SYSTEM\\Setup commit failed status=0x");
                 print_hex(status);
                 print_str(b"\n");
                 return;
@@ -4246,7 +4217,7 @@ impl ExecNtHandler {
                 b"[setup-state] HKLM\\SYSTEM\\Setup normal installed boot values committed through CM generation ",
             );
             print_u64(generation);
-            print_str(b" and projected into the durable hive\n");
+            print_str(b" with durable journal ownership\n");
         }
     }
 
@@ -4317,22 +4288,10 @@ impl ExecNtHandler {
                 }
             };
         if !prepared.durable_journal.is_empty() {
-            self.note_mutable_hive_journal_records(
-                HIVE_SEL_SYSTEM,
+            self.note_durable_hive_journal_records(
+                None,
                 mutations.len().min(u32::MAX as usize) as u32,
             );
-            let projection_ok = self
-                .mutable_hives
-                .hive_mut(HIVE_SEL_SYSTEM)
-                .is_some_and(|hive| {
-                    let base_sequence = hive.sequence;
-                    nt_hive_core::try_replay_log(hive, &prepared.durable_journal, base_sequence)
-                        .is_ok()
-                });
-            if !projection_ok {
-                CM_RUNTIME_SYSTEM_PROJECTION_FAILURES.fetch_add(1, Ordering::Relaxed);
-                print_str(b"[cm-runtime] executive compatibility mirror replay failed\n");
-            }
         }
         if matches!(origin, SystemHiveMutationOrigin::Runtime) {
             CM_RUNTIME_SYSTEM_MUTATION_COMMITS.fetch_add(1, Ordering::Relaxed);
@@ -4440,7 +4399,7 @@ impl ExecNtHandler {
         {
             Ok(generation) => generation,
             Err(status) => {
-                print_str(b"[network-setup] CM-owned SYSTEM commit/projection failed status=0x");
+                print_str(b"[network-setup] CM-owned SYSTEM commit failed status=0x");
                 print_hex(status);
                 print_str(b"\n");
                 return;
@@ -4539,7 +4498,7 @@ impl ExecNtHandler {
         {
             Ok(generation) => generation,
             Err(status) => {
-                print_str(b"[print-setup] CM-owned SYSTEM commit/projection failed status=0x");
+                print_str(b"[print-setup] CM-owned SYSTEM commit failed status=0x");
                 print_hex(status);
                 print_str(b"\n");
                 return;
@@ -4822,7 +4781,7 @@ impl ExecNtHandler {
                     Some(generation)
                 }
                 Err(status) => {
-                    print_str(b"[locale-setup] CM-owned SYSTEM commit/projection failed status=0x");
+                    print_str(b"[locale-setup] CM-owned SYSTEM commit failed status=0x");
                     print_hex(status);
                     print_str(b"\n");
                     return;
@@ -5080,9 +5039,9 @@ impl ExecNtHandler {
     }
 
     /// The mounted base hive a non-virtual `KeyRef` belongs to, plus its in-hive cell offset. The
-    /// top nibble of the `KeyRef` selects SYSTEM (0) / SOFTWARE / SECURITY / SAM — see [`hive_sel`]
-    /// — or one of the `\Registry\User` mounts in [`ExecNtHandler::hive_mounts`] (`.Default` plus
-    /// whatever `NtLoadKey` has mounted). Uniform: a dynamic mount resolves exactly like a boot one.
+    /// top nibble of the `KeyRef` selects SOFTWARE / SECURITY / SAM — see [`hive_sel`] — or one of
+    /// the `\Registry\User` mounts in [`ExecNtHandler::hive_mounts`] (`.Default` plus whatever
+    /// `NtLoadKey` has mounted). SYSTEM keys are CM leases, never borrowed cells.
     pub(crate) fn base_hive(&self, target: KeyRef) -> Option<(&RegfHive<'static>, KeyRef)> {
         if is_virtual_registry_key(target) {
             return None;
@@ -5097,7 +5056,6 @@ impl ExecNtHandler {
             HIVE_SEL_SOFTWARE => self.software_hive.as_ref()?,
             HIVE_SEL_SECURITY => self.security_hive.as_ref()?,
             HIVE_SEL_SAM => self.sam_hive.as_ref()?,
-            HIVE_SEL_SYSTEM => self.hive.as_ref()?,
             _ => self
                 .hive_mounts
                 .iter()
@@ -5108,12 +5066,12 @@ impl ExecNtHandler {
         Some(hive)
     }
 
-    /// The NT mount path a hive selector's keys hang off. The four boot mounts are compile-time
-    /// constants; a `\Registry\User` mount carries its own path (a `<SID>` is only known at
-    /// `NtLoadKey` time), so this is the one place that has to be a lookup.
+    /// The NT mount path a hive selector's keys hang off. The three machine boot mounts are
+    /// compile-time constants; a `\Registry\User` mount carries its own path (a `<SID>` is only
+    /// known at `NtLoadKey` time), so this is the one place that has to be a lookup.
     pub(crate) fn hive_mount_path(&self, sel: u32) -> Option<alloc::string::String> {
         match sel {
-            HIVE_SEL_SOFTWARE | HIVE_SEL_SECURITY | HIVE_SEL_SAM | HIVE_SEL_SYSTEM => {
+            HIVE_SEL_SOFTWARE | HIVE_SEL_SECURITY | HIVE_SEL_SAM => {
                 Some(alloc::string::String::from(hive_mount(sel)))
             }
             _ => self
@@ -5240,16 +5198,16 @@ impl ExecNtHandler {
     }
 
     fn note_mutable_hive_journal_record(&mut self, hive_sel: u32) {
-        self.note_mutable_hive_journal_records(hive_sel, 1);
+        self.note_durable_hive_journal_records(Some(hive_sel), 1);
     }
 
-    fn note_mutable_hive_journal_records(&mut self, hive_sel: u32, records: u32) {
+    fn note_durable_hive_journal_records(&mut self, hive_sel: Option<u32>, records: u32) {
         // The sidecar journal record is already appended and flushed here. Whole-volume
         // snapshots are owned by explicit flush/quiesce paths, not by every registry mutation.
         self.mutable_hive_journal_pending_records = self
             .mutable_hive_journal_pending_records
             .saturating_add(records);
-        if let Some(bit) = Self::boot_mutable_hive_pending_bit(hive_sel) {
+        if let Some(bit) = hive_sel.and_then(Self::boot_mutable_hive_pending_bit) {
             self.mutable_hive_journal_pending_boot_mask |= bit;
             self.mutable_hive_journal_dirty_boot_mask |= bit;
         }
@@ -6147,7 +6105,6 @@ impl ExecNtHandler {
 
     fn boot_mutable_hive_checkpoint_path(hive_sel: u32) -> Option<&'static str> {
         match hive_sel {
-            HIVE_SEL_SYSTEM => Some(crate::writable_fs::CONFIG_SYSTEM_HIVE_PATH),
             HIVE_SEL_SOFTWARE => Some(crate::writable_fs::CONFIG_SOFTWARE_HIVE_PATH),
             HIVE_SEL_SECURITY => Some(crate::writable_fs::CONFIG_SECURITY_HIVE_PATH),
             HIVE_SEL_SAM => Some(crate::writable_fs::CONFIG_SAM_HIVE_PATH),
@@ -7641,9 +7598,6 @@ impl ExecNtHandler {
         if Self::is_dynamic_user_volatile_env_canon(&canon) {
             USER_VOLATILE_ENV_OPENED.fetch_add(1, Ordering::Relaxed);
         }
-        if key.hive == HIVE_SEL_SYSTEM && is_keyboard_layout_key(&canon) {
-            KBD_LAYOUT_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
-        }
         if key.hive == HIVE_SEL_SOFTWARE {
             SOFTWARE_HIVE_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
             if self.current_process_is_winlogon() && is_winlogon_key(&canon) {
@@ -7671,9 +7625,6 @@ impl ExecNtHandler {
             USER_VOLATILE_ENV_OPENED.fetch_add(1, Ordering::Relaxed);
         }
         let sel = hive_sel(key);
-        if sel == HIVE_SEL_SYSTEM && is_keyboard_layout_key(&canon) {
-            KBD_LAYOUT_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
-        }
         if sel == HIVE_SEL_SOFTWARE {
             SOFTWARE_HIVE_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
             if self.current_process_is_winlogon() && is_winlogon_key(&canon) {
@@ -8194,9 +8145,7 @@ impl ExecNtHandler {
     ) -> alloc::vec::Vec<alloc::string::String> {
         let mut subkeys = alloc::vec::Vec::new();
         let system_mount = hive_mount(HIVE_SEL_SYSTEM);
-        if LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) != 0
-            || self.mutable_hives.owns_path(system_mount)
-        {
+        if LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) != 0 {
             Self::push_registry_mount_child(&mut subkeys, parent_path, system_mount);
         }
         for sel in [HIVE_SEL_SOFTWARE, HIVE_SEL_SECURITY, HIVE_SEL_SAM] {
@@ -30845,11 +30794,10 @@ impl ExecNtHandler {
         {
             return None;
         }
-        // The FOUR REAL mounted regf hives. SYSTEM is untagged (its cell offsets ARE the KeyRef);
-        // SOFTWARE, SECURITY and SAM carry a hive-selector tag in the top nibble so a later
-        // handle→hive resolution can't confuse them (see `hive_sel`/`base_hive`).
+        // The remaining borrowed mounted regf hives carry a hive-selector tag in the top nibble so
+        // a later handle-to-hive resolution cannot confuse them. SYSTEM is exclusively CM-owned.
         if comps[2].eq_ignore_ascii_case("System") {
-            return self.hive.as_ref()?.open_key(&comps[3..].join("\\"));
+            return None;
         }
         if comps[2].eq_ignore_ascii_case("SECURITY") {
             let cell = self

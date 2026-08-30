@@ -2000,9 +2000,9 @@ pub const NLS_CASE_FRAMES: u64 = 4;
 /// needs no extra PT. Placed past the SYSTEM hive buffer.
 pub const NLS_20127_VADDR: u64 = 0x0000_0100_10B9_0000;
 pub const NLS_20127_FRAMES: u64 = 20;
-/// The real ReactOS SYSTEM registry hive (::ROSSYS.HIV, ~204 KiB regf), read off the disk by the
-/// isolated storage host into these shared frames; the executive parses it with nt-hive-regf so
-/// the NT registry serves smss's real config. Shares the 0xA0-0xC0 page table (past the NLS bufs).
+/// The installed ReactOS SYSTEM registry hive (::ROSSYS.HIV, ~204 KiB regf), read off the disk by
+/// the isolated storage host into these shared frames. Boot composition imports it once and hands
+/// the resulting image to isolated CM; it is not a runtime executive registry view.
 pub const HIVEBUF_VADDR: u64 = 0x0000_0100_10B5_0000;
 pub const HIVEBUF_FRAMES: u64 = 64; // 256 KiB
 /// The real ReactOS **SECURITY** hive (`\reactos\system32\config\security`, 8 KiB regf) — the LSA
@@ -6700,8 +6700,6 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
     let new_clients = LSA_RPC_NEW_CLIENT_REQUESTS.load(Ordering::Relaxed);
     let cm_runtime_commits = CM_RUNTIME_SYSTEM_MUTATION_COMMITS.load(Ordering::Relaxed);
     let cm_runtime_rejections = CM_RUNTIME_SYSTEM_MUTATION_REJECTIONS.load(Ordering::Relaxed);
-    let cm_runtime_projection_failures =
-        CM_RUNTIME_SYSTEM_PROJECTION_FAILURES.load(Ordering::Relaxed);
     let cm_runtime_create_keys = CM_RUNTIME_SYSTEM_CREATE_KEYS.load(Ordering::Relaxed);
     let cm_runtime_set_values = CM_RUNTIME_SYSTEM_SET_VALUES.load(Ordering::Relaxed);
     let cm_runtime_delete_values = CM_RUNTIME_SYSTEM_DELETE_VALUES.load(Ordering::Relaxed);
@@ -6754,8 +6752,6 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
     print_u64(cm_runtime_commits);
     print_str(b" rejected=");
     print_u64(cm_runtime_rejections);
-    print_str(b" projection-failures=");
-    print_u64(cm_runtime_projection_failures);
     print_str(b" ops create/set/delete-value/delete-key/class/security=");
     print_u64(cm_runtime_create_keys);
     print_str(b"/");
@@ -6781,7 +6777,6 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
     check(
         b"exec_cm_runtime_system_mutations_atomic",
         cm_runtime_rejections == 0
-            && cm_runtime_projection_failures == 0
             && (cm_runtime_commits == 0 || cm_runtime_ops >= cm_runtime_commits),
         passed,
     );
@@ -19251,27 +19246,27 @@ fn is_virtual_registry_key(kr: KeyRef) -> bool {
     kr >= MUTABLE_KEY_TAG
 }
 /// ── Mounted base hives ────────────────────────────────────────────────────────────────────────
-/// FOUR REAL regf files are mounted read-only under `\Registry\Machine`: SYSTEM (::ROSSYS.HIV,
-/// ~204 KiB), SOFTWARE (460 KiB), SECURITY and SAM (8 KiB each) — all read BY PATH off
-/// `\reactos\system32\config`. A `KeyRef` is a cell offset inside ONE of them, so the top nibble
-/// SELECTS the hive. Real cell offsets are far below 0x2000_0000 (the largest hive is 460 KiB), and
-/// the tags stay below `OVERLAY_KEY_TAG` so `is_virtual_registry_key` is unchanged.
+/// SOFTWARE (460 KiB), SECURITY, and SAM (8 KiB each) remain executive-owned read-only REGF boot
+/// navigators with mutable `nt-hive-core` counterparts. SYSTEM is imported into isolated CM during
+/// boot and has no runtime executive navigator. A borrowed `KeyRef` is a cell offset in one of the
+/// remaining REGF mounts, with its top nibble selecting the hive. Real cell offsets are far below
+/// 0x2000_0000, and the tags stay below `OVERLAY_KEY_TAG` so `is_virtual_registry_key` is unchanged.
 /// ★ WIDENED `0xE000_0000` -> `0xF000_0000` (batch 62). The mask must leave room for the hives
-/// mounted at RUN time by `NtLoadKey` as well as the four mounted at boot, and every selector has
+/// mounted at RUN time by `NtLoadKey` as well as the reserved boot selectors, and every selector has
 /// to stay strictly below [`OVERLAY_KEY_TAG`] (`0x8000_0000`) so `is_virtual_registry_key` is
-/// unchanged. Four
-/// tags of 3 bits gave exactly four mounts; four bits gives EIGHT (`0x0`-`0x7`), of which the four
-/// boot mounts keep their existing values byte-for-byte and the odd ones are free for the
+/// unchanged. Four tags of 3 bits gave exactly four mounts; four bits gives EIGHT (`0x0`-`0x7`),
+/// with the established selector values preserved and the odd ones available to the
 /// `\Registry\User` namespace. A widened mask is safe because a real cell offset is bounded by the
 /// hive's file size and the largest hive on the image is 471040 B — three orders of magnitude
 /// below the smallest tag.
 pub(crate) const HIVE_SEL_MASK: u32 = 0xF000_0000;
-/// Hive selector 0 — the SYSTEM hive (untagged, so every pre-existing SYSTEM `KeyRef` is unchanged).
+/// Reserved selector 0 for classifying and rejecting stale borrowed SYSTEM identities. Live SYSTEM
+/// handles use `CM_SYSTEM_KEY_TAG` leases instead.
 pub(crate) const HIVE_SEL_SYSTEM: u32 = 0x0000_0000;
 /// Hive selector for `\Registry\User\.Default` — the genuine `config\default` (`$$$PROTO.HIV`)
 /// prototype hive `CmpInitializeHiveList` mounts on every NT boot, staged in `DEFHIVEBUF`.
 pub(crate) const HIVE_SEL_USER_DEFAULT: u32 = 0x1000_0000;
-/// Hive selector for `\Registry\Machine\SOFTWARE` (the 4th mount; 460 KiB, so its cell offsets stay
+/// Hive selector for `\Registry\Machine\SOFTWARE` (460 KiB, so its cell offsets stay
 /// far below the 0x2000_0000 tag).
 pub(crate) const HIVE_SEL_SOFTWARE: u32 = 0x2000_0000;
 /// Hive selector for `\Registry\Machine\SECURITY`.
@@ -19300,11 +19295,12 @@ pub(crate) fn hive_cell(kr: KeyRef) -> KeyRef {
 /// Dynamic mounts carry their path at run time — see `ExecNtHandler::hive_mount_path`.
 pub(crate) fn hive_mount(sel: u32) -> &'static str {
     match sel {
+        HIVE_SEL_SYSTEM => r"\Registry\Machine\System",
         HIVE_SEL_SOFTWARE => r"\Registry\Machine\SOFTWARE",
         HIVE_SEL_SECURITY => r"\Registry\Machine\SECURITY",
         HIVE_SEL_SAM => r"\Registry\Machine\SAM",
         HIVE_SEL_USER_DEFAULT => r"\Registry\User\.Default",
-        _ => r"\Registry\Machine\System",
+        _ => panic!("dynamic or invalid hive selector has no static mount path"),
     }
 }
 
@@ -19315,7 +19311,8 @@ pub(crate) fn hive_kind_for_selector(sel: u32) -> HiveKind {
         HIVE_SEL_SAM => HiveKind::Sam,
         HIVE_SEL_USER_DEFAULT => HiveKind::Default,
         sel if HIVE_SEL_DYNAMIC.iter().any(|candidate| *candidate == sel) => HiveKind::Default,
-        _ => HiveKind::System,
+        HIVE_SEL_SYSTEM => HiveKind::System,
+        _ => panic!("invalid hive selector has no hive kind"),
     }
 }
 
@@ -19339,8 +19336,8 @@ pub(crate) enum MutableRegfHiveMountError {
 }
 
 /// ── `NtLoadKey` / `NtUnloadKey` — the run-time hive mounts ────────────────────────────────────
-/// One mounted `regf` hive that is NOT one of the four boot mounts: its selector, the NT path it
-/// is mounted at, the file it was loaded from, and the parsed navigator over its bytes.
+/// One mounted `regf` hive outside the executive-owned machine boot mounts: its selector, the NT
+/// path it is mounted at, the file it was loaded from, and the parsed navigator over its bytes.
 ///
 /// `\Registry\User\.Default` is mounted through this SAME table at boot (it is not a special
 /// case — it simply has `dynamic == false`, so `NtUnloadKey` refuses to detach it, exactly as NT
@@ -22037,13 +22034,11 @@ pub(crate) static REG_FLUSH_KEY_BOOT_HIVE_CHECKPOINTS: AtomicU64 = AtomicU64::ne
 pub(crate) static REG_FLUSH_KEY_BOOT_HIVE_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Failed attempts to checkpoint a boot-mounted hive during `NtFlushKey` or lazy-writer compaction.
 pub(crate) static REG_FLUSH_KEY_BOOT_HIVE_FAILURES: AtomicU64 = AtomicU64::new(0);
-/// Runtime `HKLM\SYSTEM` transactions accepted by isolated CM before the executive projected the
-/// same records into its durable hive journal. Boot/setup batches are deliberately excluded.
+/// Runtime `HKLM\SYSTEM` transactions durably journaled by the executive and then accepted by
+/// isolated CM. Boot/setup batches are deliberately excluded.
 pub(crate) static CM_RUNTIME_SYSTEM_MUTATION_COMMITS: AtomicU64 = AtomicU64::new(0);
-/// Runtime SYSTEM transactions rejected by CM before any executive projection was attempted.
+/// Runtime SYSTEM transactions rejected before CM publication.
 pub(crate) static CM_RUNTIME_SYSTEM_MUTATION_REJECTIONS: AtomicU64 = AtomicU64::new(0);
-/// Accepted runtime SYSTEM transactions whose durable executive projection failed.
-pub(crate) static CM_RUNTIME_SYSTEM_PROJECTION_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static CM_RUNTIME_SYSTEM_CREATE_KEYS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static CM_RUNTIME_SYSTEM_SET_VALUES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static CM_RUNTIME_SYSTEM_DELETE_VALUES: AtomicU64 = AtomicU64::new(0);
@@ -22606,10 +22601,6 @@ struct CmSystemKeyTarget {
 }
 
 struct ExecNtHandler {
-    /// The REAL ReactOS SYSTEM hive (root = \Registry\Machine\System), parsed read-only by
-    /// borrowing the regf bytes the storage host read off the disk into HIVEBUF (no 204 KiB copy —
-    /// the executive heap is small). None if the hive wasn't staged on the disk.
-    hive: Option<RegfHive<'static>>,
     /// The REAL ReactOS **SECURITY** hive (root = `\Registry\Machine\SECURITY`) — the LSA policy
     /// database's backing store, read BY PATH off `\reactos\system32\config\security`. The staged
     /// hive is the genuine post-setup one: 8 KiB, root key only, NO `Policy` subkey. That emptiness
@@ -22626,15 +22617,15 @@ struct ExecNtHandler {
     /// `Microsoft\Windows NT\CurrentVersion\ProfileList\ProfilesDirectory`, which is what
     /// `userenv!GetProfilesDirectoryW` — the first thing winlogon's `LoadUserProfileW` does — reads.
     pub(crate) software_hive: Option<RegfHive<'static>>,
-    /// ★ The `\Registry\User` (`HKEY_USERS`) MOUNT TABLE — every hive that is not one of the four
-    /// boot mounts above, in ONE general mechanism: `\Registry\User\.Default` (mounted at
-    /// construction from the staged `config\default`, exactly as `CmpInitializeHiveList` does) and
-    /// the per-user hives `NtLoadKey` mounts at run time. The vector owns its run-time path and hive
-    /// allocations directly.
+    /// ★ The `\Registry\User` (`HKEY_USERS`) MOUNT TABLE — every hive that is not one of the three
+    /// executive-owned boot mounts above, in ONE general mechanism: `\Registry\User\.Default`
+    /// (mounted at construction from the staged `config\default`, exactly as `CmpInitializeHiveList`
+    /// does) and the per-user hives `NtLoadKey` mounts at run time. The vector owns its run-time path
+    /// and hive allocations directly.
     pub(crate) hive_mounts: alloc::vec::Vec<HiveMount>,
-    /// Owned mutable hive authority mounted at the same NT registry roots as the borrowed `RegfHive`
-    /// selectors. Mounted-hive create/open handles use `mutable_key_handles` so later writes can
-    /// land in this authority without path shadowing through `RegistryOverlay`.
+    /// Owned mutable authority for non-SYSTEM boot hives and dynamic user hives. Isolated CM owns
+    /// SYSTEM exclusively. Mounted-hive create/open handles use `mutable_key_handles` so later
+    /// writes land in this authority without path shadowing through `RegistryOverlay`.
     mutable_hives: MutableHiveSet,
     /// Process handle targets in the mutable key range. Entries store stable hive/cell identity and
     /// are released when the last process handle to that target closes; dynamic hive unload also
@@ -22643,9 +22634,10 @@ struct ExecNtHandler {
     /// Native handle targets for the CM-owned SYSTEM hive. Each slot owns exactly one CM lease;
     /// duplicated process handles share the slot and final Object Manager release closes the lease.
     cm_system_key_handles: alloc::vec::Vec<Option<CmSystemKeyTarget>>,
-    /// Mutable-hive journal records appended since the last writable-volume snapshot. The log append
-    /// itself is synchronous in the mounted volume; this counter batches the expensive snapshot
-    /// reserve commit instead of exporting the whole writable volume after every registry value.
+    /// Durable hive journal records appended since the last writable-volume snapshot, including
+    /// CM-owned SYSTEM records. The append itself is synchronous in the mounted volume; this counter
+    /// batches the expensive snapshot reserve commit instead of exporting the whole writable volume
+    /// after every registry value.
     mutable_hive_journal_pending_records: u32,
     /// Bitmask of boot-mounted hives that have journal records in the pending snapshot batch.
     /// Dynamic profile hives can share the record counter, but boot-hive checkpoint proof must only
@@ -22940,9 +22932,8 @@ struct ExecNtHandler {
     /// The two security-subsystem-owned Anonymous Logon identities. Each syscall selects one by
     /// current LSA policy and retains a separate reference for the target ETHREAD.
     anonymous_logon_tokens: nt_security::AnonymousLogonTokenIds,
-    /// Volatile registry write plane for keys that do not belong to a mounted mutable hive.
-    /// Mounted hive paths use `mutable_hives`; this overlay remains for explicitly volatile state
-    /// such as boot-created Control keys until D4 gives volatile keys first-class hive ownership.
+    /// Volatile registry write plane. SYSTEM overlay keys compose against exact CM leases; other
+    /// mounted paths compose against `mutable_hives`. Persistent hive state never lands here.
     overlay: nt_hive_core::RegistryOverlay,
     /// Set by any handler that touched the writable filesystem. This schedules the service-loop
     /// ownership barrier so explicit durability requests can publish a volume snapshot before the
@@ -26033,7 +26024,6 @@ static NLS_CASE_SIZE: AtomicU64 = AtomicU64::new(0);
 static HIVEBUF_START: AtomicU64 = AtomicU64::new(0);
 static REAL_HIVE_SIZE: AtomicU64 = AtomicU64::new(0);
 static mut BOOT_SYSTEM_HIVE_IMAGE: Option<Vec<u8>> = None;
-static BOOT_SYSTEM_HIVE_IMAGE_RELEASED_BYTES: AtomicU64 = AtomicU64::new(0);
 /// The frame-cap base + byte size of the real SECURITY / SAM hives the storage host read BY PATH
 /// off `\reactos\system32\config\{security,sam}` into SECHIVEBUF / SAMHIVEBUF.
 pub(crate) static SECHIVEBUF_START: AtomicU64 = AtomicU64::new(0);
@@ -26041,7 +26031,7 @@ pub(crate) static SECURITY_HIVE_SIZE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SAMHIVEBUF_START: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SAM_HIVE_SIZE: AtomicU64 = AtomicU64::new(0);
 /// The frame-cap base + byte size of the real SOFTWARE hive the storage host read BY PATH off
-/// `\reactos\system32\config\software` into SWHIVEBUF (the 4th mounted regf).
+/// `\reactos\system32\config\software` into SWHIVEBUF.
 pub(crate) static SWHIVEBUF_START: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SOFTWARE_HIVE_SIZE: AtomicU64 = AtomicU64::new(0);
 /// The frame-cap base + byte size of the real DEFAULT hive the storage host read BY PATH off

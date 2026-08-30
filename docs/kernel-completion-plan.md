@@ -2869,8 +2869,9 @@ existing synchronous DMA/PnP fixture so the two lifecycle modes remain independe
   the listed audit surfaces; D4 still owns the remaining volatile/journal/setup-profile durability
   semantics.
 - `[x]` D2: Make the Configuration Manager/Hive Manager the live authority for mutable hives rather
-  than executive-local mirrors. Mounted boot/user hives are mirrored into `MutableHiveSet`, registry
-  reads prefer that authority, and `NtCreateKey`/`NtSetValueKey`/`NtDeleteValueKey` now use
+  than executive-local mirrors. Non-SYSTEM boot/user hives are mounted into `MutableHiveSet`, while
+  D5 makes isolated CM the exclusive SYSTEM authority. Registry reads prefer the owning authority,
+  and `NtCreateKey`/`NtSetValueKey`/`NtDeleteValueKey` now use
   mutable-hive key handles for non-volatile keys under mounted hives instead of creating overlay
   shadows. Mounted mutable hives also advertise path ownership, so shared value/subkey/key-stat
   queries no longer fall back to the borrowed boot image when the mutable authority owns a missing
@@ -2970,7 +2971,7 @@ existing synchronous DMA/PnP fixture so the two lifecycle modes remain independe
   hive flush/checkpoint gates remain green. The current D4 frontier is closed for repeat-boot
   registry/profile durability; future work should open a new storage-specific D item if real-device
   crash consistency exposes a narrower gap.
-- `[~]` D5: Converge the active SYSTEM hive behind the isolated Configuration Manager without
+- `[x]` D5: Converge the active SYSTEM hive behind the isolated Configuration Manager without
   metadata loss or a fixed control-set identity. Derive the boot control set from the mounted
   SYSTEM hive's `Select\\Current` value, rebase generated configuration from its declared source
   control set onto that selected destination, preserve real REGF key class/security metadata
@@ -2986,13 +2987,13 @@ existing synchronous DMA/PnP fixture so the two lifecycle modes remain independe
   log. Hosted win32k registry imports now use a pointer-free pump protocol whose executive-owned
   handles carry exact CM leases; win32k no longer maps or parses the raw SYSTEM hive. Native SYSTEM
   discovery, runtime value queries, indexed enumeration, key information/security queries, and
-  set/delete/security writes now retain CM lease identity without consulting or mutating the
-  compatibility mirror. D5 remains open for CM-backed overlay composition plus the remaining
-  executive bootstrap readers.
-  SYSTEM dirty state, checkpoint admission, and checkpoint acknowledgement are now exclusively
-  CM-owned; the executive schedules only the other mounted hives by local dirty-cell count. Migrate
-  the remaining SYSTEM consumers, then delete mirror replay/storage and projection diagnostics
-  together; never reduce a live key to a reopenable path or retain a second mutation authority.
+  set/delete/security writes retain CM lease identity. Volatile SYSTEM overlay composition and all
+  bootstrap readers resolve inherited state through exact CM operations. SYSTEM save/export,
+  dirty state, checkpoint admission, and checkpoint acknowledgement are exclusively CM-owned; the
+  executive schedules only the other mounted hives by local dirty-cell count. The raw runtime REGF
+  navigator, SYSTEM `MutableHiveSet` mount, post-publish replay, and projection diagnostics are
+  deleted together. Boot-only REGF composition, durable journal transport, and CM checkpoint
+  persistence remain, with no compatibility export or replay fallback.
 
 ## Immediate Iteration
 
@@ -18210,3 +18211,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     post-publish replay, the SYSTEM `MutableHiveSet` mount/storage, raw runtime hive field, and
     projection-failure diagnostics atomically. Retain boot-only REGF composition and CM
     journal/checkpoint persistence; do not retain a compatibility export or replay fallback.
+
+    Executive SYSTEM mirror retirement acceptance (2026-08-30): the executive no longer parses a
+    runtime SYSTEM `RegfHive`, mounts SYSTEM in `MutableHiveSet`, resolves borrowed SYSTEM cells, or
+    replays CM-published journal records into local registry state. The raw handler field, SYSTEM
+    mutable checkpoint path, legacy open diagnostics, compatibility replay, and projection-failure
+    gate are removed atomically. Unknown hive selectors now fail closed instead of defaulting to
+    SYSTEM. Defensive stale SYSTEM mutable/borrowed identities remain explicit invalid-handle paths,
+    not alternate authorities.
+
+    The installed REGF remains only as boot composition input. Its single composed image is imported
+    into isolated CM and the executive releases the transport allocation. Runtime writes append and
+    flush CM's exact prepared journal bytes before generation publication; checkpointing exports the
+    generation-stamped CM image, atomically persists and flushes it, truncates and flushes the log,
+    then acknowledges that exact generation. `MutableHiveSet` remains scoped to SOFTWARE, SECURITY,
+    SAM, DEFAULT, and dynamic user hives.
+
+    `git diff --check` and the freestanding executive release check pass at the established
+    209-warning baseline. Serialized desktop acceptance
+    `.tmp/run-desktop-cm-system-mirror-retired-20260830.log` reaches the genuine Explorer desktop
+    with all `299/299` checks passing and the sentinel matched. CM reaches generation 2544 after 2540
+    accepted runtime transactions with zero rejections; native SYSTEM leases remain balanced at
+    `1339/1337/2/0`. The final CM checkpoint exports 473876 bytes at generation 2544 and sequence
+    3056. Explorer completes 668 real api0 redirects with zero callback or dead-callback failures,
+    installs 18 client WndProcs without replay, reaches paint begin/end `5/20` with 187 direct GDI
+    returns and 135 batch flushes covering 184 records, and paints all `786432/786432` framebuffer
+    pixels with at least 32 colours. D5 is closed; future registry work must add semantics behind the
+    CM boundary rather than reconstructing executive SYSTEM state.
