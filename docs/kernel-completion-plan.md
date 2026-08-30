@@ -19020,3 +19020,33 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     release/re-arbitrate exact resource grants, retire per-device provider mirrors/timers/work
     items, and unload a driver only after all of its device stacks and callback owners quiesce. Remove
     any obsolete atomic START/REMOVE machinery encountered rather than retaining a fallback path.
+
+    B3 STOP/rebalance ownership foundation (2026-08-31, implementation green): the host-tested PnP
+    manager can now release the raw, translated, and filtered assignment of an exactly stopped PDO
+    without discarding its FDO/driver stack. A subsequent independently arbitrated assignment moves
+    that same stopped devnode back to `ResourcesAssigned` before restart. A two-device test proves
+    that stopping and releasing one sibling leaves the other sibling `Started`, mapped, and holding
+    its original resources. The PnP suite passes `47/47`.
+
+    The Power Manager now publishes PnP STOP separately from removal: `complete_stop` makes only the
+    exact devnode non-started/non-queryable while retaining its durable power record for a later
+    `complete_start`. Its two-sibling stop/restart proof passes with the full power suite at `15/15`.
+
+    Executive retained PnP transactions now use a general post-publication repair phase rather than
+    a START-only repair name. The post-STOP publication path is stepwise and retryable: revoke the
+    exact device's mapped/resource/DMA/interrupt projection, release only its PnP assignment, then
+    remove only its started power visibility. Each completed step is latched in the exact canonical
+    IRP transaction, so allocation/capability teardown failure retains a barrier and never
+    redispatches the STOP IRP. QUERY/CANCEL remain lifecycle-only, while START continues through the
+    same publication dispatcher. SURPRISE_REMOVE and final REMOVE explicitly retain an unsupported
+    repair barrier until their full object/provider teardown is implemented; they cannot fall
+    through as published. No dormant external lifecycle API was retained before a real owner exists.
+
+    Formatting, `git diff --check`, both focused manager suites, and the freestanding executive
+    check pass at the unchanged 209-warning baseline. Review adjustment: next add the live device
+    action owner and its synchronous/pending continuation together with the non-START dispatcher.
+    It must drive QUERY_STOP -> STOP or CANCEL_STOP for reset/rebalance, preserve the exact action and
+    canonical binding across waits, and restart the existing FDO after fresh filter/arbitration
+    without calling AddDevice again. Then extend the same owner through QUERY_REMOVE,
+    SURPRISE_REMOVE, final REMOVE, interface/provider teardown, and generation-protected
+    `finish_remove`.

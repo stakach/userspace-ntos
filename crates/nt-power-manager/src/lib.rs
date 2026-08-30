@@ -370,6 +370,16 @@ impl PowerManager {
         Ok(())
     }
 
+    /// Publish a completed PnP STOP without discarding the devnode's durable power record.
+    pub fn complete_stop(&mut self, devnode_id: u64) -> Result<(), PowerError> {
+        let record = self.find_mut(devnode_id).ok_or(PowerError::NotRegistered)?;
+        if record.remove_in_progress {
+            return Err(PowerError::Removed);
+        }
+        record.started = false;
+        Ok(())
+    }
+
     /// Register an already-started devnode in one operation.
     pub fn register_device(&mut self, devnode_id: u64) -> Result<(), PowerError> {
         self.prepare_device(devnode_id)?;
@@ -587,6 +597,23 @@ mod tests {
         );
         assert_eq!(p.system_state(DN), Some(SystemPowerState::Sleeping3));
         assert_eq!(p.system_state(DN + 1), Some(SystemPowerState::Working));
+    }
+
+    #[test]
+    fn stop_hides_only_the_exact_devnode_and_restart_republishes_it() {
+        let mut p = PowerManager::new();
+        p.register_device(DN).unwrap();
+        p.register_device(DN + 1).unwrap();
+
+        p.complete_stop(DN).unwrap();
+        assert!(!p.is_started(DN));
+        assert_eq!(p.started_device_state(DN), None);
+        assert!(p.is_started(DN + 1));
+        assert_eq!(p.started_device_state(DN + 1), Some(D0));
+
+        p.complete_start(DN).unwrap();
+        assert!(p.is_started(DN));
+        assert_eq!(p.started_device_state(DN), Some(D0));
     }
 
     #[test]

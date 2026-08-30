@@ -532,6 +532,7 @@ pub fn can_transition(from: DeviceState, to: DeviceState) -> bool {
             | (Started, QueryRemovePending)
             | (QueryStopPending, Stopped)
             | (QueryStopPending, Started) // cancel-stop
+            | (Stopped, ResourcesAssigned) // rebalance before restart
             | (Stopped, StartIrpSent) // restart
             | (Stopped, RemovePending)
             | (Failed, RemovePending)
@@ -978,8 +979,10 @@ impl PnpManager {
                 Err(PnpError::InvalidTransition)
             };
         }
-        if devnode.state != DeviceState::DeviceStackBuilt
-            || devnode.pending_dispatch.is_some()
+        if !matches!(
+            devnode.state,
+            DeviceState::DeviceStackBuilt | DeviceState::Stopped
+        ) || devnode.pending_dispatch.is_some()
             || devnode.negotiation.is_some()
             || devnode.remove_ready.is_some()
         {
@@ -988,6 +991,35 @@ impl PnpManager {
         properties.allocated_resources_raw = raw;
         properties.allocated_resources_translated = translated;
         devnode.state = DeviceState::ResourcesAssigned;
+        Ok(())
+    }
+
+    /// Release the exact hardware assignment after a returned STOP while retaining the built
+    /// function stack for a later rebalance and START.
+    pub fn release_stopped_resource_assignment(
+        &mut self,
+        pdo_object_id: u64,
+    ) -> Result<(), PnpError> {
+        let devnode = self
+            .devnodes
+            .iter_mut()
+            .find(|devnode| {
+                devnode.pdo_object_id == pdo_object_id
+                    && devnode.pdo_properties.is_some()
+                    && devnode.state != DeviceState::Removed
+            })
+            .ok_or(PnpError::StaleId)?;
+        if devnode.state != DeviceState::Stopped
+            || devnode.pending_dispatch.is_some()
+            || devnode.negotiation.is_some()
+            || devnode.remove_ready.is_some()
+        {
+            return Err(PnpError::InvalidTransition);
+        }
+        let properties = devnode.pdo_properties.as_mut().unwrap();
+        properties.allocated_resources_raw = PropertyBlobState::Unqueried;
+        properties.allocated_resources_translated = PropertyBlobState::Unqueried;
+        properties.filtered_resource_requirements = PropertyBlobState::Unqueried;
         Ok(())
     }
 
@@ -1972,6 +2004,22 @@ mod tests {
         let stop = begin_pnp(&mut p, pdo, PnpMinor::StopDevice).unwrap();
         assert_eq!(complete_pnp(&mut p, &stop, false), Ok(Stopped));
         assert!(!p.mapping_allowed(id));
+        p.release_stopped_resource_assignment(pdo).unwrap();
+        let properties = p.enumerated_pdo_properties(pdo).unwrap();
+        assert_eq!(
+            properties.allocated_resources_raw,
+            PropertyBlobState::Unqueried
+        );
+        assert_eq!(
+            properties.allocated_resources_translated,
+            PropertyBlobState::Unqueried
+        );
+        assert_eq!(
+            properties.filtered_resource_requirements,
+            PropertyBlobState::Unqueried
+        );
+        p.commit_resource_assignment(pdo, vec![3], vec![4]).unwrap();
+        assert_eq!(p.state(id), Some(ResourcesAssigned));
 
         let restart = begin_pnp(&mut p, pdo, PnpMinor::StartDevice).unwrap();
         complete_pnp(&mut p, &restart, true).unwrap();
@@ -2011,6 +2059,47 @@ mod tests {
         );
         let removal = p.removal_token(pdo).unwrap();
         p.finish_remove(removal).unwrap();
+    }
+
+    #[test]
+    fn stop_rebalance_is_exact_with_started_sibling() {
+        let mut p = PnpManager::new();
+        let first_pdo = 0x7100;
+        let second_pdo = 0x7200;
+        let first = p
+            .register_enumerated_pdo(r"PCI\VEN_1234&DEV_5678\0001", first_pdo, pci_properties())
+            .unwrap();
+        let second = p
+            .register_enumerated_pdo(r"PCI\VEN_1234&DEV_5678\0002", second_pdo, pci_properties())
+            .unwrap();
+        p.commit_device_stack(first_pdo, first_pdo + 1, 0x55)
+            .unwrap();
+        p.commit_device_stack(second_pdo, second_pdo + 1, 0x55)
+            .unwrap();
+        p.commit_resource_assignment(first_pdo, vec![1], vec![2])
+            .unwrap();
+        p.commit_resource_assignment(second_pdo, vec![5], vec![6])
+            .unwrap();
+        let first_start = begin_pnp(&mut p, first_pdo, PnpMinor::StartDevice).unwrap();
+        complete_pnp(&mut p, &first_start, true).unwrap();
+        let second_start = begin_pnp(&mut p, second_pdo, PnpMinor::StartDevice).unwrap();
+        complete_pnp(&mut p, &second_start, true).unwrap();
+
+        let query = begin_pnp(&mut p, first_pdo, PnpMinor::QueryStopDevice).unwrap();
+        complete_pnp(&mut p, &query, true).unwrap();
+        let stop = begin_pnp(&mut p, first_pdo, PnpMinor::StopDevice).unwrap();
+        complete_pnp(&mut p, &stop, true).unwrap();
+        p.release_stopped_resource_assignment(first_pdo).unwrap();
+
+        assert_eq!(p.state(first), Some(Stopped));
+        assert_eq!(p.state(second), Some(Started));
+        assert!(p.mapping_allowed(second));
+        assert_eq!(
+            p.enumerated_pdo_properties(second_pdo)
+                .unwrap()
+                .allocated_resources_raw,
+            PropertyBlobState::Present(vec![5])
+        );
     }
 
     #[test]

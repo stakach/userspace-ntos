@@ -37419,31 +37419,26 @@ unsafe fn drain_hosted_pnp_completions() -> usize {
                     index += 1;
                     continue;
                 }
-                if minor == nt_pnp_manager::PnpMinor::StartDevice {
-                    if finish_hosted_start_publication(irp_id).is_err() {
-                        transition_hosted_pnp_transaction_phase(
-                            irp_id,
-                            HostedPnpTransactionPhase::PostStartRepair,
-                        )
-                        .expect("hosted PnP repair transition lost its transaction");
-                        progress = progress.saturating_add(1);
-                        index += 1;
-                        continue;
-                    }
+                if finish_hosted_pnp_publication(irp_id).is_err() {
                     transition_hosted_pnp_transaction_phase(
                         irp_id,
-                        HostedPnpTransactionPhase::Terminal,
+                        HostedPnpTransactionPhase::PostPublicationRepair,
                     )
-                    .expect("hosted PnP terminal transition lost its transaction");
+                    .expect("hosted PnP repair transition lost its transaction");
                     progress = progress.saturating_add(1);
                     index += 1;
                     continue;
                 }
-                remove_hosted_pnp_transaction(irp_id);
+                transition_hosted_pnp_transaction_phase(
+                    irp_id,
+                    HostedPnpTransactionPhase::Terminal,
+                )
+                .expect("hosted PnP terminal transition lost its transaction");
                 progress = progress.saturating_add(1);
+                index += 1;
             }
-            HostedPnpTransactionPhase::PostStartRepair => {
-                if finish_hosted_start_publication(irp_id).is_ok() {
+            HostedPnpTransactionPhase::PostPublicationRepair => {
+                if finish_hosted_pnp_publication(irp_id).is_ok() {
                     transition_hosted_pnp_transaction_phase(
                         irp_id,
                         HostedPnpTransactionPhase::Terminal,
@@ -37500,7 +37495,7 @@ pub(crate) unsafe fn observe_hosted_pnp_start(
         | HostedPnpTransactionPhase::Dispatching
         | HostedPnpTransactionPhase::AwaitingCompletion
         | HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck
-        | HostedPnpTransactionPhase::PostStartRepair => {
+        | HostedPnpTransactionPhase::PostPublicationRepair => {
             Ok(HostedPnpStartObservation::AwaitingCompletion)
         }
     }
@@ -39201,7 +39196,7 @@ enum HostedPnpTransactionPhase {
     Dispatching,
     AwaitingCompletion,
     LifecycleCommittedAwaitingAck,
-    PostStartRepair,
+    PostPublicationRepair,
     Terminal,
     Indeterminate,
 }
@@ -39224,6 +39219,9 @@ struct HostedPnpTransaction {
     dma_usage_published: bool,
     resource_snapshot_published: bool,
     power_state_published: bool,
+    resource_projection_released: bool,
+    resource_assignment_released: bool,
+    power_stop_published: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39920,7 +39918,7 @@ unsafe fn transition_hosted_pnp_transaction_phase(
             HostedPnpTransactionPhase::AwaitingCompletion
         ) | (
             HostedPnpTransactionPhase::Dispatching,
-            HostedPnpTransactionPhase::PostStartRepair
+            HostedPnpTransactionPhase::PostPublicationRepair
         ) | (
             HostedPnpTransactionPhase::Dispatching,
             HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck
@@ -39929,12 +39927,12 @@ unsafe fn transition_hosted_pnp_transaction_phase(
             HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck
         ) | (
             HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck,
-            HostedPnpTransactionPhase::PostStartRepair
+            HostedPnpTransactionPhase::PostPublicationRepair
         ) | (
             HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck,
             HostedPnpTransactionPhase::Terminal
         ) | (
-            HostedPnpTransactionPhase::PostStartRepair,
+            HostedPnpTransactionPhase::PostPublicationRepair,
             HostedPnpTransactionPhase::Terminal
         )
     ) || (phase == HostedPnpTransactionPhase::Indeterminate
@@ -40084,6 +40082,72 @@ unsafe fn finish_hosted_start_publication(irp_id: IrpId) -> Result<(), nt_status
         }
     }
     Ok(())
+}
+
+unsafe fn finish_hosted_stop_publication(irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
+    let transaction = hosted_pnp_transactions_mut()
+        .iter()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if transaction.minor != nt_pnp_manager::PnpMinor::StopDevice
+        || transaction.driver_status.is_none()
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let binding = transaction.binding;
+    let resource_projection_released = transaction.resource_projection_released;
+    let resource_assignment_released = transaction.resource_assignment_released;
+    let power_stop_published = transaction.power_stop_published;
+    let sh = instance_by_driver_id(binding.driver_id)
+        .map(|(_, instance)| instance.exec_shared_va)
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+
+    if !resource_projection_released {
+        clear_hosted_resource_projection(binding, sh)?;
+        hosted_pnp_transactions_mut()
+            .iter_mut()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            .resource_projection_released = true;
+    }
+    if !resource_assignment_released {
+        hosted_pnp_manager_mut()
+            .release_stopped_resource_assignment(binding.pdo_device_id)
+            .map_err(hosted_pnp_status)?;
+        hosted_pnp_transactions_mut()
+            .iter_mut()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            .resource_assignment_released = true;
+    }
+    if !power_stop_published {
+        crate::power_manager::complete_stop(binding.pdo_device_id)?;
+        hosted_pnp_transactions_mut()
+            .iter_mut()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            .power_stop_published = true;
+    }
+    Ok(())
+}
+
+unsafe fn finish_hosted_pnp_publication(irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
+    let minor = hosted_pnp_transactions_mut()
+        .iter()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .map(|transaction| transaction.minor)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    match minor {
+        nt_pnp_manager::PnpMinor::StartDevice => finish_hosted_start_publication(irp_id),
+        nt_pnp_manager::PnpMinor::StopDevice => finish_hosted_stop_publication(irp_id),
+        nt_pnp_manager::PnpMinor::QueryStopDevice
+        | nt_pnp_manager::PnpMinor::CancelStopDevice
+        | nt_pnp_manager::PnpMinor::QueryRemoveDevice
+        | nt_pnp_manager::PnpMinor::CancelRemoveDevice => Ok(()),
+        nt_pnp_manager::PnpMinor::RemoveDevice | nt_pnp_manager::PnpMinor::SurpriseRemoval => {
+            Err(nt_status::NtStatus::NOT_SUPPORTED)
+        }
+    }
 }
 
 unsafe fn hosted_resource_manager_mut() -> &'static mut ResourceManager {
@@ -48908,6 +48972,9 @@ pub(crate) unsafe fn start_hosted_device_canonical(
         dma_usage_published: false,
         resource_snapshot_published: false,
         power_state_published: false,
+        resource_projection_released: false,
+        resource_assignment_released: false,
+        power_stop_published: false,
     };
     if let Err(status) = reserve_hosted_pnp_transaction(transaction) {
         let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
@@ -48944,11 +49011,11 @@ pub(crate) unsafe fn start_hosted_device_canonical(
             }
             set_hosted_pnp_driver_status(
                 irp_id,
-                HostedPnpTransactionPhase::PostStartRepair,
+                HostedPnpTransactionPhase::PostPublicationRepair,
                 status,
             )
             .expect("synchronous hosted PnP START lost its transaction");
-            if let Err(repair_status) = finish_hosted_start_publication(irp_id) {
+            if let Err(repair_status) = finish_hosted_pnp_publication(irp_id) {
                 return Ok(HostedPnpStartOutcome::RepairRequired {
                     irp_id: irp_id.raw(),
                     driver_status: status,

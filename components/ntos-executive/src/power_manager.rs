@@ -36,6 +36,10 @@ pub(crate) unsafe fn complete_start(devnode_id: u64) -> Result<(), nt_status::Nt
     manager_mut().complete_start(devnode_id).map_err(status)
 }
 
+pub(crate) unsafe fn complete_stop(devnode_id: u64) -> Result<(), nt_status::NtStatus> {
+    manager_mut().complete_stop(devnode_id).map_err(status)
+}
+
 pub(crate) unsafe fn unregister_device(devnode_id: u64) {
     if let Some(manager) = (*core::ptr::addr_of_mut!(POWER_MANAGER)).as_mut() {
         manager.unregister_device(devnode_id);
