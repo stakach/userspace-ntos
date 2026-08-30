@@ -254,18 +254,20 @@ pub struct PdoProperties {
 }
 
 impl PdoProperties {
-    pub fn enumerated(
-        bus_information: PnpBusInformation,
-        capabilities: PdoCapabilities,
+    pub fn from_bus_queries(
+        bus_information: Option<PnpBusInformation>,
+        capabilities: Option<PdoCapabilities>,
         boot_resources_raw: PropertyBlobState,
         boot_resources_translated: PropertyBlobState,
         resource_requirements: PropertyBlobState,
     ) -> Self {
-        let removal_policy = DeviceRemovalPolicy::from_capabilities(&capabilities);
+        let removal_policy = capabilities
+            .as_ref()
+            .map(DeviceRemovalPolicy::from_capabilities);
         Self {
-            bus_information: Some(bus_information),
-            capabilities: Some(capabilities),
-            removal_policy: Some(removal_policy),
+            bus_information,
+            capabilities,
+            removal_policy,
             boot_resources_raw,
             boot_resources_translated,
             resource_requirements,
@@ -273,6 +275,22 @@ impl PdoProperties {
             allocated_resources_raw: PropertyBlobState::Unqueried,
             allocated_resources_translated: PropertyBlobState::Unqueried,
         }
+    }
+
+    pub fn enumerated(
+        bus_information: PnpBusInformation,
+        capabilities: PdoCapabilities,
+        boot_resources_raw: PropertyBlobState,
+        boot_resources_translated: PropertyBlobState,
+        resource_requirements: PropertyBlobState,
+    ) -> Self {
+        Self::from_bus_queries(
+            Some(bus_information),
+            Some(capabilities),
+            boot_resources_raw,
+            boot_resources_translated,
+            resource_requirements,
+        )
     }
 
     fn immutable_identity_eq(&self, other: &Self) -> bool {
@@ -345,6 +363,7 @@ pub enum PnpError {
     ConflictingStack,
     DispatchInFlight,
     StaleDispatch,
+    StalePublication,
     InsufficientResources,
 }
 
@@ -422,6 +441,73 @@ struct Devnode {
     pending_dispatch: Option<PendingPnpDispatch>,
     negotiation: Option<PnpNegotiation>,
     remove_ready: Option<u64>,
+}
+
+/// Complete PnP-owned identity and immutable bus properties for one enumerated canonical PDO.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnumeratedPdoRecord {
+    pub instance_id: String,
+    pub pdo_object_id: u64,
+    pub properties: PdoProperties,
+}
+
+impl EnumeratedPdoRecord {
+    pub fn new(instance_id: String, pdo_object_id: u64, properties: PdoProperties) -> Self {
+        Self {
+            instance_id,
+            pdo_object_id,
+            properties,
+        }
+    }
+}
+
+enum PreparedEnumeratedPdo {
+    Existing {
+        record: EnumeratedPdoRecord,
+        id: u64,
+        generation: u64,
+    },
+    New {
+        record: EnumeratedPdoRecord,
+        id: u64,
+        generation: u64,
+    },
+}
+
+impl PreparedEnumeratedPdo {
+    const fn id(&self) -> u64 {
+        match self {
+            Self::Existing { id, .. } | Self::New { id, .. } => *id,
+        }
+    }
+}
+
+/// Fully owned and capacity-reserved PDO publication transaction.
+///
+/// Preparation performs every fallible allocation. Commit only revalidates the manager insertion
+/// generation and immutable identities before moving prebuilt records into reserved table slots.
+pub struct PreparedEnumeratedPdoBatch {
+    base_devnode_count: usize,
+    base_next_id: u64,
+    base_next_gen: u64,
+    committed_next_id: u64,
+    committed_next_gen: u64,
+    new_count: usize,
+    records: Vec<PreparedEnumeratedPdo>,
+}
+
+impl PreparedEnumeratedPdoBatch {
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    pub fn devnode_id(&self, index: usize) -> Option<u64> {
+        self.records.get(index).map(PreparedEnumeratedPdo::id)
+    }
 }
 
 /// Whether the v0.1 state machine permits `from -> to` (spec §8.2/§8.3). `Failed` is
@@ -534,6 +620,193 @@ impl PnpManager {
         self.create_service_bound_devnode(instance_id, service, pdo_object_id, NO_RESOURCES)
     }
 
+    fn matching_enumerated_pdo<'a>(
+        &'a self,
+        record: &EnumeratedPdoRecord,
+    ) -> Result<Option<&'a Devnode>, PnpError> {
+        let mut matching = None;
+        for devnode in &self.devnodes {
+            let pdo_matches = devnode.pdo_object_id == record.pdo_object_id;
+            let instance_matches = devnode
+                .instance_id
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case(&record.instance_id));
+            if !pdo_matches && !instance_matches {
+                continue;
+            }
+            if matching.is_some_and(|prior: &Devnode| prior.id != devnode.id) {
+                return Err(PnpError::ConflictingPdo);
+            }
+            matching = Some(devnode);
+        }
+        let Some(devnode) = matching else {
+            return Ok(None);
+        };
+        if devnode.state == DeviceState::Removed
+            || devnode.pdo_object_id != record.pdo_object_id
+            || !devnode
+                .instance_id
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case(&record.instance_id))
+            || !devnode
+                .pdo_properties
+                .as_ref()
+                .is_some_and(|properties| properties.immutable_identity_eq(&record.properties))
+        {
+            return Err(PnpError::ConflictingPdo);
+        }
+        Ok(Some(devnode))
+    }
+
+    /// Validate and reserve one atomic batch of canonical PDO publications.
+    ///
+    /// Records may name an exact existing live devnode, which is retained idempotently. Every new
+    /// devnode ID, generation, owned string/property record, and destination table slot is prepared
+    /// here so [`Self::commit_enumerated_pdo_batch`] does not allocate.
+    pub fn prepare_enumerated_pdo_batch(
+        &mut self,
+        records: Vec<EnumeratedPdoRecord>,
+    ) -> Result<PreparedEnumeratedPdoBatch, PnpError> {
+        for (index, record) in records.iter().enumerate() {
+            if record.instance_id.is_empty() || record.pdo_object_id == 0 {
+                return Err(PnpError::InvalidIdentity);
+            }
+            if records[..index].iter().any(|prior| {
+                prior.pdo_object_id == record.pdo_object_id
+                    || prior.instance_id.eq_ignore_ascii_case(&record.instance_id)
+            }) {
+                return Err(PnpError::ConflictingPdo);
+            }
+        }
+
+        let base_next_id = self.next_id;
+        let base_next_gen = self.next_gen;
+        let mut committed_next_id = base_next_id;
+        let mut committed_next_gen = base_next_gen;
+        let mut new_count = 0usize;
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve(records.len())
+            .map_err(|_| PnpError::InsufficientResources)?;
+        for record in records {
+            if let Some(existing) = self.matching_enumerated_pdo(&record)? {
+                prepared.push(PreparedEnumeratedPdo::Existing {
+                    record,
+                    id: existing.id,
+                    generation: existing.generation,
+                });
+                continue;
+            }
+            let id = committed_next_id;
+            let generation = committed_next_gen;
+            committed_next_id = committed_next_id
+                .checked_add(1)
+                .ok_or(PnpError::InsufficientResources)?;
+            committed_next_gen = committed_next_gen
+                .checked_add(1)
+                .ok_or(PnpError::InsufficientResources)?;
+            new_count = new_count
+                .checked_add(1)
+                .ok_or(PnpError::InsufficientResources)?;
+            prepared.push(PreparedEnumeratedPdo::New {
+                record,
+                id,
+                generation,
+            });
+        }
+        self.devnodes
+            .try_reserve(new_count)
+            .map_err(|_| PnpError::InsufficientResources)?;
+        Ok(PreparedEnumeratedPdoBatch {
+            base_devnode_count: self.devnodes.len(),
+            base_next_id,
+            base_next_gen,
+            committed_next_id,
+            committed_next_gen,
+            new_count,
+            records: prepared,
+        })
+    }
+
+    /// Commit a prepared PDO batch without allocation or partial publication.
+    pub fn commit_enumerated_pdo_batch(
+        &mut self,
+        prepared: PreparedEnumeratedPdoBatch,
+    ) -> Result<(), PnpError> {
+        let committed_len = self
+            .devnodes
+            .len()
+            .checked_add(prepared.new_count)
+            .ok_or(PnpError::StalePublication)?;
+        if self.devnodes.len() != prepared.base_devnode_count
+            || self.next_id != prepared.base_next_id
+            || self.next_gen != prepared.base_next_gen
+            || committed_len > self.devnodes.capacity()
+        {
+            return Err(PnpError::StalePublication);
+        }
+        for entry in &prepared.records {
+            match entry {
+                PreparedEnumeratedPdo::Existing {
+                    record,
+                    id,
+                    generation,
+                } => {
+                    let existing = self
+                        .matching_enumerated_pdo(record)
+                        .map_err(|_| PnpError::StalePublication)?
+                        .filter(|devnode| {
+                            devnode.id == *id
+                                && devnode.generation == *generation
+                                && devnode.state != DeviceState::Removed
+                        });
+                    if existing.is_none() {
+                        return Err(PnpError::StalePublication);
+                    }
+                }
+                PreparedEnumeratedPdo::New { record, .. } => {
+                    if self
+                        .matching_enumerated_pdo(record)
+                        .map_err(|_| PnpError::StalePublication)?
+                        .is_some()
+                    {
+                        return Err(PnpError::StalePublication);
+                    }
+                }
+            }
+        }
+
+        for entry in prepared.records {
+            let PreparedEnumeratedPdo::New {
+                record,
+                id,
+                generation,
+            } = entry
+            else {
+                continue;
+            };
+            debug_assert!(self.devnodes.len() < self.devnodes.capacity());
+            self.devnodes.push(Devnode {
+                id,
+                generation,
+                instance_id: Some(record.instance_id),
+                service: None,
+                state: DeviceState::Enumerated,
+                pdo_object_id: record.pdo_object_id,
+                fdo_object_id: 0,
+                driver_id: 0,
+                resources: NO_RESOURCES,
+                pdo_properties: Some(record.properties),
+                pending_dispatch: None,
+                negotiation: None,
+                remove_ready: None,
+            });
+        }
+        self.next_id = prepared.committed_next_id;
+        self.next_gen = prepared.committed_next_gen;
+        Ok(())
+    }
+
     /// Publish the immutable bus/capability state owned by one enumerated canonical PDO before a
     /// function driver's `AddDevice` is allowed to run. Re-publication is idempotent only for the
     /// exact same devnode identity and property record.
@@ -543,56 +816,23 @@ impl PnpManager {
         pdo_object_id: u64,
         properties: PdoProperties,
     ) -> Result<u64, PnpError> {
-        if instance_id.is_empty() || pdo_object_id == 0 {
-            return Err(PnpError::InvalidIdentity);
-        }
-        if let Some(existing) = self
-            .devnodes
-            .iter()
-            .find(|devnode| devnode.pdo_object_id == pdo_object_id)
-        {
-            return if existing
-                .instance_id
-                .as_deref()
-                .is_some_and(|value| value.eq_ignore_ascii_case(instance_id))
-                && existing
-                    .pdo_properties
-                    .as_ref()
-                    .is_some_and(|current| current.immutable_identity_eq(&properties))
-            {
-                Ok(existing.id)
-            } else {
-                Err(PnpError::ConflictingPdo)
-            };
-        }
-        let id = self.next_id;
-        let generation = self.next_gen;
-        let Some(next_id) = self.next_id.checked_add(1) else {
-            return Err(PnpError::InsufficientResources);
-        };
-        let Some(next_gen) = self.next_gen.checked_add(1) else {
-            return Err(PnpError::InsufficientResources);
-        };
-        self.devnodes
+        let mut owned_instance = String::new();
+        owned_instance
+            .try_reserve(instance_id.len())
+            .map_err(|_| PnpError::InsufficientResources)?;
+        owned_instance.push_str(instance_id);
+        let mut records = Vec::new();
+        records
             .try_reserve(1)
             .map_err(|_| PnpError::InsufficientResources)?;
-        self.devnodes.push(Devnode {
-            id,
-            generation,
-            instance_id: Some(instance_id.to_string()),
-            service: None,
-            state: DeviceState::Enumerated,
+        records.push(EnumeratedPdoRecord::new(
+            owned_instance,
             pdo_object_id,
-            fdo_object_id: 0,
-            driver_id: 0,
-            resources: NO_RESOURCES,
-            pdo_properties: Some(properties),
-            pending_dispatch: None,
-            negotiation: None,
-            remove_ready: None,
-        });
-        self.next_id = next_id;
-        self.next_gen = next_gen;
+            properties,
+        ));
+        let prepared = self.prepare_enumerated_pdo_batch(records)?;
+        let id = prepared.devnode_id(0).ok_or(PnpError::InvalidIdentity)?;
+        self.commit_enumerated_pdo_batch(prepared)?;
         Ok(id)
     }
 
@@ -1321,6 +1561,111 @@ mod tests {
                 address: 0,
             }),
             DeviceRemovalPolicy::ExpectSurpriseRemoval
+        );
+    }
+
+    #[test]
+    fn prepared_pdo_batch_reserves_and_commits_exact_records_without_growth() {
+        let mut p = PnpManager::new();
+        let existing_properties = pci_properties();
+        let existing_id = p
+            .register_enumerated_pdo(
+                r"PCI\VEN_1234&DEV_5678\0001",
+                0x1234,
+                existing_properties.clone(),
+            )
+            .unwrap();
+        let records = vec![
+            EnumeratedPdoRecord::new(
+                String::from(r"pci\ven_1234&dev_5678\0001"),
+                0x1234,
+                existing_properties,
+            ),
+            EnumeratedPdoRecord::new(
+                String::from(r"PCI\VEN_1234&DEV_5679\0001"),
+                0x1235,
+                pci_properties(),
+            ),
+            EnumeratedPdoRecord::new(
+                String::from(r"PCI\VEN_1234&DEV_5680\0001"),
+                0x1236,
+                pci_properties(),
+            ),
+        ];
+        let prepared = p.prepare_enumerated_pdo_batch(records).unwrap();
+        assert_eq!(prepared.len(), 3);
+        assert_eq!(prepared.devnode_id(0), Some(existing_id));
+        assert_eq!(prepared.devnode_id(1), Some(existing_id + 1));
+        assert_eq!(prepared.devnode_id(2), Some(existing_id + 2));
+        let reserved_capacity = p.devnodes.capacity();
+        p.commit_enumerated_pdo_batch(prepared).unwrap();
+        assert_eq!(p.devnodes.capacity(), reserved_capacity);
+        assert_eq!(p.devnodes.len(), 3);
+        assert_eq!(p.devnode_for_pdo(0x1235), Some(existing_id + 1));
+        assert_eq!(p.devnode_for_pdo(0x1236), Some(existing_id + 2));
+        assert_eq!(p.next_id, existing_id + 3);
+        assert_eq!(p.next_gen, existing_id + 3);
+    }
+
+    #[test]
+    fn prepared_pdo_batch_rejects_duplicates_conflicts_and_stale_commit() {
+        let mut p = PnpManager::new();
+        let records = vec![
+            EnumeratedPdoRecord::new(
+                String::from(r"PCI\VEN_1234&DEV_5678\0001"),
+                0x1234,
+                pci_properties(),
+            ),
+            EnumeratedPdoRecord::new(
+                String::from(r"pci\ven_1234&dev_5678\0001"),
+                0x1235,
+                pci_properties(),
+            ),
+        ];
+        assert_eq!(
+            p.prepare_enumerated_pdo_batch(records).err(),
+            Some(PnpError::ConflictingPdo)
+        );
+        assert!(p.devnodes.is_empty());
+
+        let prepared = p
+            .prepare_enumerated_pdo_batch(vec![EnumeratedPdoRecord::new(
+                String::from(r"PCI\VEN_1234&DEV_5678\0001"),
+                0x1234,
+                pci_properties(),
+            )])
+            .unwrap();
+        p.create_service_bound_devnode_without_resources(r"ROOT\INTERVENING\0000", None, 0x9000);
+        assert_eq!(
+            p.commit_enumerated_pdo_batch(prepared),
+            Err(PnpError::StalePublication)
+        );
+        assert_eq!(p.devnode_for_pdo(0x1234), None);
+    }
+
+    #[test]
+    fn absent_native_bus_properties_remain_absent_on_the_canonical_pdo() {
+        let mut p = PnpManager::new();
+        let properties = PdoProperties::from_bus_queries(
+            None,
+            None,
+            PropertyBlobState::KnownNone,
+            PropertyBlobState::KnownNone,
+            PropertyBlobState::KnownNone,
+        );
+        p.register_enumerated_pdo(r"ROOT\PROPERTYLESS\0000", 0x7777, properties)
+            .unwrap();
+        assert_eq!(
+            p.query_device_property(0x7777, 12),
+            Err(PnpPropertyError::ObjectNameNotFound)
+        );
+        assert_eq!(
+            p.query_device_property(0x7777, 16),
+            Err(PnpPropertyError::ObjectNameNotFound)
+        );
+        assert_eq!(
+            p.query_device_property(0x7777, 19),
+            Err(PnpPropertyError::ObjectNameNotFound)
         );
     }
 

@@ -18721,3 +18721,39 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     accept an exact existing devnode idempotently or reject conflicting immutable properties. Only
     after both CM and PnP publication are prepared may the transaction commit CM, devnodes, the
     relation table, and the invalidation claim in that order.
+
+    B3 atomic canonical-PDO publication checkpoint (2026-08-30, implementation green):
+    `nt-pnp-manager` now prepares complete owned batches of enumerated PDO records. Preparation
+    rejects empty identity, null PDOs, duplicate PDOs, case-insensitive duplicate instance paths,
+    conflicts with any existing identity, removed PDO reuse, and counter overflow. Exact live
+    existing records are retained idempotently. Every new devnode ID/generation, instance string,
+    immutable property record, prepared-entry slot, and destination table slot exists before the
+    transaction is returned. Commit revalidates the unchanged insertion generation and all exact
+    existing identities, then only moves records into reserved capacity; it performs no allocation
+    and cannot partially publish a rejected batch. The historical one-PDO registration API is now
+    a wrapper over this same transaction rather than an independent mutation path.
+
+    `PdoProperties` also represents truthful optional results from the native queries. A failed
+    `QUERY_BUS_INFORMATION` or `QUERY_CAPABILITIES` remains absent, including its derived removal
+    policy, while raw boot resources and requirements preserve `KnownNone` versus present bytes.
+    The bus path records translated boot resources as `KnownNone`; it does not copy raw descriptors
+    into a fabricated translated list.
+
+    The retained executive relation transaction builds a devnode record for every currently
+    reported authenticated child, not only semantic arrivals. It prepares that entire batch before
+    Config Manager persistence. Commit order is now durable SYSTEM-hive/CM publication, the
+    allocation-free canonical-PDO batch, the prepared BusRelations table, and finally the exact
+    invalidation claim. Any property-copy allocation pressure retries before publication; identity,
+    property, or generation conflict is a barrier. Focused `nt-pnp-manager` validation passes
+    `46/46`; formatting, `git diff --check`, and the freestanding executive check pass at the
+    unchanged 209-warning baseline.
+
+    Review adjustment: bus-reported children now exist as property-complete canonical PnP devnodes,
+    but their service actions still encounter the explicit guard that prevents the historical root
+    PDO constructor from replacing them. Next split `call_add_device_for_driver` into a root-bus
+    discovery wrapper and a common existing-PDO stack builder. The bus action must resolve the
+    already-published devnode and canonical I/O Manager `DeviceId`, project that exact PDO into the
+    selected function driver's authenticated hosted domain, call the real AddDevice, require the
+    driver's ordinary `IoAttachDeviceToDeviceStack`, commit the FDO stack, assign/filter resources,
+    and send the real START IRP. Remove the guard and obsolete root-only machinery only after that
+    complete path is green.

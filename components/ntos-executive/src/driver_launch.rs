@@ -35579,6 +35579,16 @@ fn hosted_relation_error_from_pnp(
     }
 }
 
+fn hosted_relation_error_from_devnode_pnp(
+    error: nt_pnp_manager::PnpError,
+) -> HostedRelationPublishError {
+    if error == nt_pnp_manager::PnpError::InsufficientResources {
+        HostedRelationPublishError::RetryResources
+    } else {
+        HostedRelationPublishError::Barrier(hosted_pnp_status(error))
+    }
+}
+
 fn hosted_relation_child_matches_instance(
     child: &nt_pnp_manager::BusReportedChild,
     instance: &str,
@@ -35605,6 +35615,77 @@ fn hosted_relation_instance_path(
     path.push('\\');
     path.push_str(&child.instance_id);
     Ok(path)
+}
+
+fn copy_hosted_relation_property_blob(
+    state: &nt_pnp_manager::PropertyBlobState,
+) -> Result<nt_pnp_manager::PropertyBlobState, HostedRelationPublishError> {
+    match state {
+        nt_pnp_manager::PropertyBlobState::Unqueried => Err(
+            HostedRelationPublishError::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+        ),
+        nt_pnp_manager::PropertyBlobState::KnownNone => {
+            Ok(nt_pnp_manager::PropertyBlobState::KnownNone)
+        }
+        nt_pnp_manager::PropertyBlobState::Present(bytes) => {
+            let mut copied = Vec::new();
+            copied
+                .try_reserve_exact(bytes.len())
+                .map_err(|_| HostedRelationPublishError::RetryResources)?;
+            copied.extend_from_slice(bytes);
+            Ok(nt_pnp_manager::PropertyBlobState::Present(copied))
+        }
+    }
+}
+
+unsafe fn prepare_hosted_relation_devnodes(
+    children: &[nt_pnp_manager::BusReportedChild],
+    properties: &[HostedBusChildProperties],
+) -> Result<nt_pnp_manager::PreparedEnumeratedPdoBatch, HostedRelationPublishError> {
+    if children.len() != properties.len() {
+        return Err(HostedRelationPublishError::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
+    }
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(children.len())
+        .map_err(|_| HostedRelationPublishError::RetryResources)?;
+    for (child, properties) in children.iter().zip(properties) {
+        let bus_information = match &properties.bus_information {
+            HostedBusInformationState::Unqueried => {
+                return Err(HostedRelationPublishError::Barrier(
+                    nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                ));
+            }
+            HostedBusInformationState::KnownNone => None,
+            HostedBusInformationState::Present(value) => Some(value.clone()),
+        };
+        let capabilities = match &properties.capabilities {
+            HostedDeviceCapabilitiesState::Unqueried => {
+                return Err(HostedRelationPublishError::Barrier(
+                    nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                ));
+            }
+            HostedDeviceCapabilitiesState::KnownNone => None,
+            HostedDeviceCapabilitiesState::Present(value) => Some(value.clone()),
+        };
+        let pdo_properties = nt_pnp_manager::PdoProperties::from_bus_queries(
+            bus_information,
+            capabilities,
+            copy_hosted_relation_property_blob(&properties.boot_resources_raw)?,
+            nt_pnp_manager::PropertyBlobState::KnownNone,
+            copy_hosted_relation_property_blob(&properties.resource_requirements)?,
+        );
+        records.push(nt_pnp_manager::EnumeratedPdoRecord::new(
+            hosted_relation_instance_path(child)?,
+            child.pdo_object_id,
+            pdo_properties,
+        ));
+    }
+    hosted_pnp_manager_mut()
+        .prepare_enumerated_pdo_batch(records)
+        .map_err(hosted_relation_error_from_devnode_pnp)
 }
 
 fn hosted_relation_enum_path(
@@ -35924,6 +36005,7 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
             nt_status::NtStatus::INVALID_DEVICE_REQUEST,
         ))?;
     if query.reported_children.len() != query.child_pdo_objects.len()
+        || query.reported_children.len() != query.child_properties.len()
         || query
             .reported_children
             .iter()
@@ -35945,6 +36027,8 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
     let prepared = hosted_bus_relations_mut()
         .prepare_bus_relations(bus_object_id, &query.reported_children)
         .map_err(hosted_relation_error_from_pnp)?;
+    let prepared_devnodes =
+        prepare_hosted_relation_devnodes(&query.reported_children, &query.child_properties)?;
 
     let mut policies = Vec::new();
     let mut existing = Vec::new();
@@ -35977,6 +36061,9 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
         }
     }
 
+    hosted_pnp_manager_mut()
+        .commit_enumerated_pdo_batch(prepared_devnodes)
+        .expect("published CM relation transaction invalidated its prepared PnP devnodes");
     hosted_bus_relations_mut()
         .commit_bus_relations(prepared)
         .expect("published CM relation transaction became stale before PnP commit");
@@ -39397,7 +39484,9 @@ fn hosted_pnp_status(error: nt_pnp_manager::PnpError) -> nt_status::NtStatus {
             nt_status::NtStatus::OBJECT_NAME_COLLISION
         }
         nt_pnp_manager::PnpError::DispatchInFlight => nt_status::NtStatus::DEVICE_BUSY,
-        nt_pnp_manager::PnpError::StaleId | nt_pnp_manager::PnpError::StaleDispatch => {
+        nt_pnp_manager::PnpError::StaleId
+        | nt_pnp_manager::PnpError::StaleDispatch
+        | nt_pnp_manager::PnpError::StalePublication => {
             nt_status::NtStatus::INVALID_DEVICE_REQUEST
         }
         nt_pnp_manager::PnpError::InvalidIdentity | nt_pnp_manager::PnpError::InvalidTransition => {
