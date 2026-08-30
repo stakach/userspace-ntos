@@ -22969,6 +22969,7 @@ struct ExecNtHandler {
     /// START IRP remains pending.
     pending_driver_starts: nt_driver_start::PendingDriverStartTable<PendingDriverStart>,
     boot_driver_start_reports: BootDriverStartReports,
+    native_driver_start_report: NativeDriverStartReport,
     pending_driver_start_transfer: Option<PendingDriverStartTransfer>,
     /// Contended synchronous File acquisition transferred into the FIFO owner at the reply site.
     pending_synchronous_file_wait: Option<nt_io_manager::SynchronousFileWaiter>,
@@ -23288,11 +23289,6 @@ fn report_deferred_generic_hardware_checks(
         passed,
     );
     check(
-        b"exec_generic_pnp_pending_starts_observed",
-        report.pending_observed >= 2,
-        passed,
-    );
-    check(
         b"exec_generic_hw_mmio_interrupt_dma",
         report.resource_granted
             && report.mmio_mapped
@@ -23376,6 +23372,72 @@ fn report_deferred_generic_hardware_checks(
     check(
         b"exec_generic_hw_dma_packet_descriptors",
         report.dma_common && report.dma_packet_descriptors,
+        passed,
+    );
+}
+
+#[derive(Clone, Copy, Default)]
+struct NativeDriverStartReport {
+    load_calls: u64,
+    pending_batches: u64,
+    completed_batches: u64,
+    replies: u64,
+    attempted: u64,
+    terminal: u64,
+    started: u64,
+    failed: u64,
+    pending_observed: u64,
+    last_status: u32,
+}
+
+impl NativeDriverStartReport {
+    fn record_terminal(&mut self, report: HostedPnpStartReport, status: u32) {
+        self.completed_batches = self.completed_batches.saturating_add(1);
+        self.attempted = self.attempted.saturating_add(report.attempted);
+        self.terminal = self.terminal.saturating_add(report.terminal);
+        self.started = self.started.saturating_add(report.started);
+        self.failed = self.failed.saturating_add(report.failed);
+        self.pending_observed = self
+            .pending_observed
+            .saturating_add(report.pending_observed);
+        self.last_status = status;
+    }
+}
+
+fn report_native_driver_start_check(report: NativeDriverStartReport, passed: &mut u64) {
+    print_str(b"[native-driver-start] NtLoadDriver calls=");
+    print_u64(report.load_calls);
+    print_str(b" pending/completed/replied=");
+    print_u64(report.pending_batches);
+    print_str(b"/");
+    print_u64(report.completed_batches);
+    print_str(b"/");
+    print_u64(report.replies);
+    print_str(b" attempted/terminal/started/failed/pending-observed=");
+    print_u64(report.attempted);
+    print_str(b"/");
+    print_u64(report.terminal);
+    print_str(b"/");
+    print_u64(report.started);
+    print_str(b"/");
+    print_u64(report.failed);
+    print_str(b"/");
+    print_u64(report.pending_observed);
+    print_str(b" last-status=0x");
+    print_hex(report.last_status);
+    print_str(b"\n");
+    check(
+        b"exec_native_driver_pending_start_replied",
+        report.load_calls >= report.pending_batches
+            && report.pending_batches != 0
+            && report.completed_batches == report.pending_batches
+            && report.replies == report.pending_batches
+            && report.attempted >= 2
+            && report.terminal == report.attempted
+            && report.started == report.terminal
+            && report.failed == 0
+            && report.pending_observed >= 2
+            && report.last_status == 0,
         passed,
     );
 }
@@ -28470,7 +28532,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         );
         let _ = tcb_resume(spawn.main_tcb);
         if ensure_executive_paging(BOOT_SEC_IMAGE_SCRATCH_BASE) {
-            let (v, f, _, _, _, _, _) = service_sec_image(
+            let (v, f, _, _, _, _, _, _) = service_sec_image(
                 si_fault,
                 spawn.pml4,
                 spawn.main_tcb,
@@ -31961,11 +32023,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             &mut passed,
         );
         check(
-            b"exec_generic_pnp_pending_starts_observed",
-            generic_hw_pending_observed >= 2,
-            &mut passed,
-        );
-        check(
             b"exec_generic_hw_mmio_interrupt_dma",
             generic_hw_granted
                 && generic_hw_mmio_mapped
@@ -32272,6 +32329,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         ntfaults,
                         sssn,
                         final_driver_start_reports,
+                        native_driver_start_report,
                     ) = service_sec_image(
                         si_fault,
                         spawn.pml4,
@@ -32323,6 +32381,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             &mut passed,
                         );
                     }
+                    report_native_driver_start_check(native_driver_start_report, &mut passed);
                     print_str(b"[ntos-exec] LIVE ReactOS smss+env: faulted ");
                     print_u64(sfaults);
                     print_str(b" page(s) (");

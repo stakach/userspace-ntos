@@ -4,8 +4,8 @@
 //! host, and path-dep builds (the executive) don't build bins, so this is invisible there.
 
 use nt_config_manager::{
-    encode_multi_sz, ConfigManager, SERVICE_FILE_SYSTEM_DRIVER, SERVICE_KERNEL_DRIVER,
-    SERVICE_SYSTEM_START,
+    encode_multi_sz, ConfigManager, SERVICE_AUTO_START, SERVICE_FILE_SYSTEM_DRIVER,
+    SERVICE_KERNEL_DRIVER, SERVICE_SYSTEM_START,
 };
 #[cfg(test)]
 use nt_config_manager::{SERVICE_BOOT_START, SERVICE_DEMAND_START};
@@ -1107,7 +1107,7 @@ fn build_hive_with_configuration(
         GeneratedRootPnpFixture {
             service_name: "PendingStartTest",
             image_path: r"system32\drivers\PendingStartTest.sys",
-            start: SERVICE_SYSTEM_START,
+            start: SERVICE_AUTO_START,
             hardware_id: r"ROOT\USERSPACE_NTOS_PENDING_START",
             compatible_ids: &[],
             pdo_name_prefix: "NTPNP_PENDING",
@@ -1217,7 +1217,7 @@ mod tests {
             .open_key(r"ControlSet001\Services\PendingStartTest")
             .expect("service key");
         assert_eq!(hive.query_dword(key, "Type"), Some(SERVICE_KERNEL_DRIVER));
-        assert_eq!(hive.query_dword(key, "Start"), Some(SERVICE_SYSTEM_START));
+        assert_eq!(hive.query_dword(key, "Start"), Some(SERVICE_AUTO_START));
         assert_eq!(
             hive.query_value(key, "ImagePath"),
             Some((
@@ -1249,12 +1249,15 @@ mod tests {
             );
         }
 
-        let cm = import_generated_hive_config_manager(&hive);
-        let bindings = cm.boot_system_pnp_driver_bindings();
-        let binding = bindings
+        let mut cm = import_generated_hive_config_manager(&hive);
+        assert!(cm
+            .boot_system_pnp_driver_bindings()
             .iter()
-            .find(|binding| binding.service.name == "PendingStartTest")
-            .expect("pending START service binding");
+            .all(|binding| binding.service.name != "PendingStartTest"));
+        let binding = cm
+            .driver_service_binding("PendingStartTest")
+            .expect("SCM auto-start driver binding");
+        assert_eq!(binding.service.start_type, SERVICE_AUTO_START);
         assert_eq!(binding.devnodes.len(), 2);
         assert_eq!(
             binding.devnodes[0].instance_id,

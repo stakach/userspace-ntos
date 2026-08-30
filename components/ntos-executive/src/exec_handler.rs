@@ -3795,6 +3795,7 @@ impl ExecNtHandler {
         write_field!(pending_file_io_reservation, None);
         write_field!(pending_driver_starts, driver_starts.pending);
         write_field!(boot_driver_start_reports, driver_starts.reports);
+        write_field!(native_driver_start_report, NativeDriverStartReport::default());
         write_field!(pending_driver_start_transfer, None);
         write_field!(pending_synchronous_file_wait, None);
         write_field!(pending_file_cleanup_wait, None);
@@ -7166,6 +7167,11 @@ impl ExecNtHandler {
         const STATUS_IMAGE_ALREADY_LOADED: u32 = 0xC000_010E;
         const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
         const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+
+        self.native_driver_start_report.load_calls = self
+            .native_driver_start_report
+            .load_calls
+            .saturating_add(1);
 
         if !self.current_token_has_privilege(nt_security::SE_LOAD_DRIVER) {
             return STATUS_PRIVILEGE_NOT_HELD;

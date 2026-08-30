@@ -5636,7 +5636,16 @@ pub(crate) unsafe fn service_sec_image(
     scratch_base: u64,
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
     driver_starts: DriverStartBootstrap,
-) -> (u64, u64, u64, u64, u64, u64, BootDriverStartReports) {
+) -> (
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    BootDriverStartReports,
+    NativeDriverStartReport,
+) {
     let live_service = ntdll.is_some();
     loader_trace_clear();
     reset_deferred_user_callback_returns();
@@ -19970,6 +19979,7 @@ pub(crate) unsafe fn service_sec_image(
     // Report the primary process's own fault stats regardless of which process stopped the loop.
     // The live path's primary is SMSS; the early SEC_IMAGE proof uses a dynamic diagnostic process.
     let boot_driver_start_reports = pending_driver_start_reports_snapshot(&nt_handler);
+    let native_driver_start_report = nt_handler.native_driver_start_report;
     (
         verdict,
         procs[primary_pi].faults,
@@ -19978,6 +19988,7 @@ pub(crate) unsafe fn service_sec_image(
         procs[primary_pi].ntfaults,
         stop_ssn,
         boot_driver_start_reports,
+        native_driver_start_report,
     )
 }
 
@@ -22429,6 +22440,7 @@ unsafe fn pending_driver_start_transfer(
         reply_cap: stolen,
         reply,
     };
+    let native_pending = matches!(kind, PendingDriverStartTransferKind::Native);
     let owner = match kind {
         PendingDriverStartTransferKind::Native => PendingDriverStartOwner::Native(native_reply),
         PendingDriverStartTransferKind::DeviceAction(identity) => {
@@ -22448,6 +22460,12 @@ unsafe fn pending_driver_start_transfer(
             },
         )
         .expect("reserved driver START continuation rejected its exact batch");
+    if native_pending {
+        nt_handler.native_driver_start_report.pending_batches = nt_handler
+            .native_driver_start_report
+            .pending_batches
+            .saturating_add(1);
+    }
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
 }
@@ -22462,6 +22480,14 @@ unsafe fn pending_native_driver_start_reply(
     else {
         return;
     };
+    pending_native_driver_start_reply_owner(nt_handler, reply, status);
+}
+
+unsafe fn pending_native_driver_start_reply_owner(
+    nt_handler: &mut ExecNtHandler,
+    reply: NativeDriverStartReply,
+    status: u32,
+) {
     pending_driver_start_reply_owner(
         nt_handler,
         reply.reply_cap,
@@ -22469,6 +22495,10 @@ unsafe fn pending_native_driver_start_reply(
         reply.badge,
         status,
     );
+    nt_handler.native_driver_start_report.replies = nt_handler
+        .native_driver_start_report
+        .replies
+        .saturating_add(1);
 }
 
 unsafe fn pending_driver_start_reply_owner(
@@ -22521,6 +22551,9 @@ unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u6
                         .boot_driver_start_reports
                         .merge(*target, pending.batch.report()),
                     PendingDriverStartOwner::Native(_) => {
+                        nt_handler
+                            .native_driver_start_report
+                            .record_terminal(pending.batch.report(), status);
                         pending_native_driver_start_reply(nt_handler, &mut pending, status)
                     }
                     PendingDriverStartOwner::DeviceAction { .. } => {
@@ -22586,13 +22619,7 @@ unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u6
                     nt_handler.boot_driver_start_reports.merge(target, report);
                 }
                 if let Some(reply) = native_reply {
-                    pending_driver_start_reply_owner(
-                        nt_handler,
-                        reply.reply_cap,
-                        reply.reply,
-                        reply.badge,
-                        status,
-                    );
+                    pending_native_driver_start_reply_owner(nt_handler, reply, status);
                     completed += 1;
                 }
             }
