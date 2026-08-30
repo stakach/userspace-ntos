@@ -17942,3 +17942,36 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     projection-failure diagnostic together. Keep the original read-only REGF image only where a
     separately identified boot-composition consumer still requires it; do not treat it as a runtime
     registry fallback.
+
+    CM-leased SYSTEM setup acceptance (2026-08-30): `CollectSystemSetupSeedTarget` no longer borrows
+    `ExecNtHandler` or consults the executive's projected SYSTEM tree. It recognizes the SYSTEM
+    namespace syntactically, caches one exact CM lease per existing setup key, caches truthful
+    missing-key results, and compares only narrow leased value records plus its own pending mutation
+    set. Every collected lease is explicitly closed by `finish()` before a mutation transaction can
+    be prepared or published; `Drop` is only a final ownership guard. Network and print diagnostics
+    reuse those same authoritative observations, the network-adapter plan is queried directly from
+    CM without a raw-hive presence gate, and locale's fallback value read and required NLS-key check
+    now use exact CM operations. Persistent registry setup also runs only for the live handler after
+    its composed hives and CM channel exist, eliminating the former pre-CM microtest errors without
+    adding a fallback path.
+
+    Serialized acceptance `.tmp/run-headless-cm-setup-leases-phase-20260830.log` reaches the genuine
+    Explorer desktop with all `299/299` checks passing and the sentinel matched. The single live
+    setup pass observes the locale values unchanged through CM, finds the generated network setup,
+    and commits the missing print environment/processor values at CM generation 3. CM finishes at
+    generation 2535 after 2532 accepted runtime transactions with zero rejection or projection
+    failure. Native handle leases remain balanced at `1337/1335/2/0`; the two live leases are the
+    expected still-open native handles, while all transient setup leases have left scope before
+    publication. Explorer completes 668 real api0 redirects with zero callback or dead-callback
+    failures, installs 18 client WndProcs without replay, reaches paint begin/end `5/20` with 187
+    direct GDI returns and 135 batch flushes covering 184 records, and paints all
+    `786432/786432` framebuffer pixels with at least 32 colours.
+
+    Review adjustment: setup discovery is now fully CM-owned. The next D5 slice is native SYSTEM
+    open/create discovery: `open_registry_full_path`, `registry_path_exists`, and `NtCreateKey`
+    still use `MutableHiveSet::resolve_key` to decide whether a SYSTEM key or parent exists before
+    minting a CM lease or preparing a create mutation. Route absolute and relative SYSTEM paths to
+    exact CM leases first, preserve real CM statuses, and remove the superseded mirror branches in
+    the same slice. Then move the runtime system-locale read/match path to narrow CM values. Once
+    those control-flow consumers are gone, re-audit overlay shadowing and enumeration before
+    deleting post-publish SYSTEM replay and the SYSTEM `MutableHiveSet` mount together.

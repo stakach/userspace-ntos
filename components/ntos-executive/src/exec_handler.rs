@@ -572,26 +572,181 @@ impl OwnedSystemHiveMutation {
     }
 }
 
-struct CollectSystemSetupSeedTarget<'a> {
-    handler: &'a ExecNtHandler,
-    mutations: alloc::vec::Vec<OwnedSystemHiveMutation>,
-    failed: bool,
+fn is_system_registry_path(path: &str) -> bool {
+    let canonical = nt_hive_core::canon_path(path);
+    canonical == r"\registry\machine\system"
+        || canonical.starts_with(r"\registry\machine\system\")
 }
 
-impl<'a> CollectSystemSetupSeedTarget<'a> {
-    fn new(handler: &'a ExecNtHandler) -> Self {
+fn query_system_hive_value(
+    path: &str,
+    name: &str,
+) -> Result<Option<(nt_hive_core::RegistryValueType, alloc::vec::Vec<u8>)>, u32> {
+    if !is_system_registry_path(path) {
+        return Err(STATUS_OBJECT_PATH_SYNTAX_BAD);
+    }
+    let opened = match unsafe { config_manager_open_system_hive_key(path) } {
+        Ok(opened) => opened,
+        Err(status) if status as u32 == STATUS_OBJECT_NAME_NOT_FOUND => return Ok(None),
+        Err(status) => return Err(status as u32),
+    };
+    let result = unsafe { config_manager_query_leased_system_hive_value(opened.lease, name) };
+    let close_result = unsafe { config_manager_close_system_hive_key(opened.lease) };
+    if let Err(status) = close_result {
+        return Err(status as u32);
+    }
+    match result {
+        Ok(value) => nt_hive_core::RegistryValueType::from_u32(value.value_type)
+            .map(|value_type| Some((value_type, value.data)))
+            .ok_or(STATUS_INVALID_PARAMETER),
+        Err(status) if status as u32 == STATUS_OBJECT_NAME_NOT_FOUND => Ok(None),
+        Err(status) => Err(status as u32),
+    }
+}
+
+enum CachedSystemSetupKey {
+    Open {
+        canonical_path: alloc::string::String,
+        lease: nt_config_client::SystemHiveKeyLease,
+    },
+    Missing {
+        canonical_path: alloc::string::String,
+    },
+}
+
+impl CachedSystemSetupKey {
+    fn canonical_path(&self) -> &str {
+        match self {
+            Self::Open { canonical_path, .. } | Self::Missing { canonical_path } => canonical_path,
+        }
+    }
+
+    fn lease(&self) -> Option<nt_config_client::SystemHiveKeyLease> {
+        match self {
+            Self::Open { lease, .. } => Some(*lease),
+            Self::Missing { .. } => None,
+        }
+    }
+}
+
+struct CollectSystemSetupSeedTarget {
+    keys: core::cell::RefCell<alloc::vec::Vec<CachedSystemSetupKey>>,
+    mutations: alloc::vec::Vec<OwnedSystemHiveMutation>,
+    failed: core::cell::Cell<bool>,
+}
+
+impl CollectSystemSetupSeedTarget {
+    fn new() -> Self {
         Self {
-            handler,
+            keys: core::cell::RefCell::new(alloc::vec::Vec::new()),
             mutations: alloc::vec::Vec::new(),
-            failed: false,
+            failed: core::cell::Cell::new(false),
         }
     }
 
     fn owns_system_path(&self, path: &str) -> bool {
-        self.handler
-            .mutable_hives
-            .resolve_path(path)
-            .is_some_and(|(hive, _)| hive == HIVE_SEL_SYSTEM)
+        is_system_registry_path(path)
+    }
+
+    fn cached_lease(
+        &self,
+        path: &str,
+    ) -> Result<Option<nt_config_client::SystemHiveKeyLease>, u32> {
+        if !self.owns_system_path(path) {
+            self.failed.set(true);
+            return Err(STATUS_OBJECT_PATH_SYNTAX_BAD);
+        }
+        let canonical_path = nt_hive_core::canon_path(path);
+        if let Some(lease) = self
+            .keys
+            .borrow()
+            .iter()
+            .find(|key| key.canonical_path() == canonical_path)
+            .and_then(CachedSystemSetupKey::lease)
+        {
+            return Ok(Some(lease));
+        }
+        if self
+            .keys
+            .borrow()
+            .iter()
+            .any(|key| key.canonical_path() == canonical_path)
+        {
+            return Ok(None);
+        }
+
+        match unsafe { config_manager_open_system_hive_key(path) } {
+            Ok(opened) => {
+                let lease = opened.lease;
+                self.keys.borrow_mut().push(CachedSystemSetupKey::Open {
+                    canonical_path,
+                    lease,
+                });
+                Ok(Some(lease))
+            }
+            Err(status) if status as u32 == STATUS_OBJECT_NAME_NOT_FOUND => {
+                self.keys
+                    .borrow_mut()
+                    .push(CachedSystemSetupKey::Missing { canonical_path });
+                Ok(None)
+            }
+            Err(status) => {
+                self.failed.set(true);
+                Err(status as u32)
+            }
+        }
+    }
+
+    fn existing_value(
+        &self,
+        path: &str,
+        name: &str,
+    ) -> Option<(nt_hive_core::RegistryValueType, alloc::vec::Vec<u8>)> {
+        let lease = match self.cached_lease(path) {
+            Ok(Some(lease)) => lease,
+            Ok(None) => return None,
+            Err(_) => return None,
+        };
+        match unsafe { config_manager_query_leased_system_hive_value(lease, name) } {
+            Ok(value) => match nt_hive_core::RegistryValueType::from_u32(value.value_type) {
+                Some(value_type) => Some((value_type, value.data)),
+                None => {
+                    self.failed.set(true);
+                    None
+                }
+            },
+            Err(status) if status as u32 == STATUS_OBJECT_NAME_NOT_FOUND => None,
+            Err(_) => {
+                self.failed.set(true);
+                None
+            }
+        }
+    }
+
+    fn has_key(&self, path: &str) -> bool {
+        self.mutations.iter().any(|mutation| {
+            matches!(
+                mutation,
+                OwnedSystemHiveMutation::CreateKey { path: pending }
+                    if pending.eq_ignore_ascii_case(path)
+            )
+        }) || matches!(self.cached_lease(path), Ok(Some(_)))
+    }
+
+    fn close_leases(&mut self) {
+        for key in self.keys.get_mut().drain(..) {
+            if let CachedSystemSetupKey::Open { lease, .. } = key {
+                if unsafe { config_manager_close_system_hive_key(lease) }.is_err() {
+                    self.failed.set(true);
+                }
+            }
+        }
+    }
+
+    fn finish(mut self) -> (alloc::vec::Vec<OwnedSystemHiveMutation>, bool) {
+        self.close_leases();
+        let mutations = core::mem::take(&mut self.mutations);
+        (mutations, self.failed.get())
     }
 
     fn pending_value(
@@ -618,25 +773,31 @@ impl<'a> CollectSystemSetupSeedTarget<'a> {
     }
 }
 
-impl nt_hive_core::ReactOsSetupSeedTarget for CollectSystemSetupSeedTarget<'_> {
+impl Drop for CollectSystemSetupSeedTarget {
+    fn drop(&mut self) {
+        self.close_leases();
+    }
+}
+
+impl nt_hive_core::ReactOsSetupSeedTarget for CollectSystemSetupSeedTarget {
     fn create_key(&mut self, path: &str) -> bool {
-        if !self.owns_system_path(path) {
-            self.failed = true;
-            return false;
+        match self.cached_lease(path) {
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                if !self.mutations.iter().any(|mutation| {
+                    matches!(
+                        mutation,
+                        OwnedSystemHiveMutation::CreateKey { path: pending }
+                            if pending.eq_ignore_ascii_case(path)
+                    )
+                }) {
+                    self.mutations
+                        .push(OwnedSystemHiveMutation::CreateKey { path: path.into() });
+                }
+                true
+            }
+            Err(_) => false,
         }
-        if self.handler.mutable_registry_key_by_path(path).is_none()
-            && !self.mutations.iter().any(|mutation| {
-                matches!(
-                    mutation,
-                    OwnedSystemHiveMutation::CreateKey { path: pending }
-                        if pending.eq_ignore_ascii_case(path)
-                )
-            })
-        {
-            self.mutations
-                .push(OwnedSystemHiveMutation::CreateKey { path: path.into() });
-        }
-        true
     }
 
     fn set_value(
@@ -647,13 +808,16 @@ impl nt_hive_core::ReactOsSetupSeedTarget for CollectSystemSetupSeedTarget<'_> {
         data: alloc::vec::Vec<u8>,
     ) -> bool {
         if !self.owns_system_path(path) {
-            self.failed = true;
+            self.failed.set(true);
             return false;
         }
         if self.value_matches(path, name, value_type, &data) {
             return false;
         }
-        if self.handler.mutable_registry_key_by_path(path).is_none() && !self.create_key(path) {
+        if self.failed.get() {
+            return false;
+        }
+        if !self.has_key(path) && !self.create_key(path) {
             return false;
         }
         self.mutations.push(OwnedSystemHiveMutation::SetValue {
@@ -667,11 +831,7 @@ impl nt_hive_core::ReactOsSetupSeedTarget for CollectSystemSetupSeedTarget<'_> {
 
     fn has_value(&self, path: &str, name: &str) -> bool {
         self.pending_value(path, name).is_some()
-            || self
-                .handler
-                .mutable_registry_key_by_path(path)
-                .and_then(|key| self.handler.mutable_hives.query_value(key, name))
-                .is_some()
+            || self.existing_value(path, name).is_some()
     }
 
     fn value_matches(
@@ -682,11 +842,8 @@ impl nt_hive_core::ReactOsSetupSeedTarget for CollectSystemSetupSeedTarget<'_> {
         data: &[u8],
     ) -> bool {
         self.pending_value(path, name)
-            .or_else(|| {
-                self.handler
-                    .mutable_registry_key_by_path(path)
-                    .and_then(|key| self.handler.mutable_hives.query_value(key, name))
-            })
+            .map(|(ty, existing)| (ty, existing.to_vec()))
+            .or_else(|| self.existing_value(path, name))
             .is_some_and(|(ty, existing)| ty == value_type && existing == data)
     }
 
@@ -697,12 +854,7 @@ impl nt_hive_core::ReactOsSetupSeedTarget for CollectSystemSetupSeedTarget<'_> {
     ) -> Option<(nt_hive_core::RegistryValueType, alloc::vec::Vec<u8>)> {
         self.pending_value(path, name)
             .map(|(ty, data)| (ty, data.to_vec()))
-            .or_else(|| {
-                self.handler
-                    .mutable_registry_key_by_path(path)
-                    .and_then(|key| self.handler.mutable_hives.query_value(key, name))
-                    .map(|(ty, data)| (ty, data.to_vec()))
-            })
+            .or_else(|| self.existing_value(path, name))
     }
 }
 
@@ -3589,27 +3741,29 @@ impl ExecNtHandler {
         trace_setup_provision_phase(b"hardware-begin", 0);
         handler.provision_volatile_hardware_registry();
         trace_setup_provision_phase(b"hardware-end", 0);
-        trace_setup_provision_phase(b"locale-begin", 0);
-        unsafe { handler.provision_default_user_locale() };
-        trace_setup_provision_phase(b"locale-end", 0);
-        trace_setup_provision_phase(b"profile-shell-begin", 0);
-        handler.provision_default_user_shell_folders();
-        trace_setup_provision_phase(b"profile-shell-end", 0);
-        trace_setup_provision_phase(b"profile-image-begin", 0);
-        handler.provision_default_user_ntuser_dat_image();
-        trace_setup_provision_phase(b"profile-image-end", 0);
-        trace_setup_provision_phase(b"setup-state-begin", 0);
-        handler.provision_normal_system_setup_state();
-        trace_setup_provision_phase(b"setup-state-end", 0);
-        trace_setup_provision_phase(b"network-begin", 0);
-        handler.provision_reactos_network_setup();
-        trace_setup_provision_phase(b"network-end", 0);
-        trace_setup_provision_phase(b"print-begin", 0);
-        handler.provision_reactos_print_setup();
-        trace_setup_provision_phase(b"print-end", 0);
-        trace_setup_provision_phase(b"shell-com-begin", 0);
-        handler.provision_reactos_explorer_shell_com_classes();
-        trace_setup_provision_phase(b"shell-com-end", 0);
+        if require_boot_system {
+            trace_setup_provision_phase(b"locale-begin", 0);
+            unsafe { handler.provision_default_user_locale() };
+            trace_setup_provision_phase(b"locale-end", 0);
+            trace_setup_provision_phase(b"profile-shell-begin", 0);
+            handler.provision_default_user_shell_folders();
+            trace_setup_provision_phase(b"profile-shell-end", 0);
+            trace_setup_provision_phase(b"profile-image-begin", 0);
+            handler.provision_default_user_ntuser_dat_image();
+            trace_setup_provision_phase(b"profile-image-end", 0);
+            trace_setup_provision_phase(b"setup-state-begin", 0);
+            handler.provision_normal_system_setup_state();
+            trace_setup_provision_phase(b"setup-state-end", 0);
+            trace_setup_provision_phase(b"network-begin", 0);
+            handler.provision_reactos_network_setup();
+            trace_setup_provision_phase(b"network-end", 0);
+            trace_setup_provision_phase(b"print-begin", 0);
+            handler.provision_reactos_print_setup();
+            trace_setup_provision_phase(b"print-end", 0);
+            trace_setup_provision_phase(b"shell-com-begin", 0);
+            handler.provision_reactos_explorer_shell_com_classes();
+            trace_setup_provision_phase(b"shell-com-end", 0);
+        }
         handler
     }
 
@@ -3939,60 +4093,64 @@ impl ExecNtHandler {
 
     /// Seed ReactOS network setup state that `hivesys.inf`, `nettcpip.inf`, and `afd_reg.inf`
     /// normally materialize. This publishes installed-boot service and TCPIP parameter metadata into
-    /// the mounted mutable SYSTEM hive; registry consumers and Config Manager still perform ordinary
-    /// opens, queries, ordering, and driver selection.
+    /// CM's mounted SYSTEM hive; registry consumers still perform ordinary opens, queries, ordering,
+    /// and driver selection.
     fn provision_reactos_network_setup(&mut self) {
         trace_setup_provision_phase(b"network-snapshot-begin", 0);
-        let network_adapters = self.hive.as_ref().map(|_| {
-            unsafe { config_manager_query_network_adapter_plan() }
-                .expect("query live Config Manager network-adapter plan")
-        });
+        let network_adapters = match unsafe { config_manager_query_network_adapter_plan() } {
+            Ok(plan) => plan,
+            Err(status) => {
+                trace_setup_provision_phase(b"network-snapshot-end", u64::MAX);
+                print_str(b"[network-setup] CM network-adapter plan query failed status=0x");
+                print_hex(status as u32);
+                print_str(b"\n");
+                return;
+            }
+        };
         trace_setup_provision_phase(
             b"network-snapshot-end",
-            network_adapters
-                .as_ref()
-                .map(|plan| plan.adapters.len() as u64)
-                .unwrap_or(u64::MAX),
+            network_adapters.adapters.len() as u64,
         );
-        let (stats, mutations, failed) = {
-            let mut target = CollectSystemSetupSeedTarget::new(self);
+        let (stats, mutations, failed, hostname_present) = {
+            let mut target = CollectSystemSetupSeedTarget::new();
             trace_setup_provision_phase(b"network-seed-core-begin", 0);
             let mut stats = nt_hive_core::seed_reactos_network_setup_into_target(&mut target);
             trace_setup_provision_phase(b"network-seed-core-end", stats.total_values() as u64);
-            if let Some(plan) = network_adapters.as_ref() {
-                trace_setup_provision_phase(b"network-bindings-begin", plan.adapters.len() as u64);
-                let adapters: Vec<_> = plan
-                    .adapters
-                    .iter()
-                    .map(|adapter| nt_hive_core::ReactOsNetworkAdapterBinding {
-                        instance_id: adapter.instance_id.clone(),
-                        class_key_path: adapter.class_key_path.clone(),
-                        linkage_key_path: adapter.linkage_key_path.clone(),
-                        interface_name: adapter.interface_name.clone(),
-                        device_name: adapter.device_name.clone(),
-                        tcpip_export_name: adapter.tcpip_export_name.clone(),
-                        driver_desc: adapter.driver_desc.clone(),
-                        component_id: adapter.component_id.clone(),
-                    })
-                    .collect();
-                trace_setup_provision_phase(b"network-bindings-seed-begin", adapters.len() as u64);
-                nt_hive_core::seed_reactos_network_adapter_bindings_into_target(
-                    &mut target,
-                    &adapters,
-                    &mut stats,
-                );
-                trace_setup_provision_phase(b"network-bindings-end", stats.total_values() as u64);
-            }
-            (stats, target.mutations, target.failed)
+            trace_setup_provision_phase(
+                b"network-bindings-begin",
+                network_adapters.adapters.len() as u64,
+            );
+            let adapters: Vec<_> = network_adapters
+                .adapters
+                .iter()
+                .map(|adapter| nt_hive_core::ReactOsNetworkAdapterBinding {
+                    instance_id: adapter.instance_id.clone(),
+                    class_key_path: adapter.class_key_path.clone(),
+                    linkage_key_path: adapter.linkage_key_path.clone(),
+                    interface_name: adapter.interface_name.clone(),
+                    device_name: adapter.device_name.clone(),
+                    tcpip_export_name: adapter.tcpip_export_name.clone(),
+                    driver_desc: adapter.driver_desc.clone(),
+                    component_id: adapter.component_id.clone(),
+                })
+                .collect();
+            trace_setup_provision_phase(b"network-bindings-seed-begin", adapters.len() as u64);
+            nt_hive_core::seed_reactos_network_adapter_bindings_into_target(
+                &mut target,
+                &adapters,
+                &mut stats,
+            );
+            trace_setup_provision_phase(b"network-bindings-end", stats.total_values() as u64);
+            let hostname_present = nt_hive_core::ReactOsSetupSeedTarget::has_value(
+                &target,
+                r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip\Parameters",
+                "Hostname",
+            );
+            let (mutations, failed) = target.finish();
+            (stats, mutations, failed, hostname_present)
         };
         if mutations.is_empty() {
-            if self
-                .mutable_registry_value_by_path(
-                    r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip\Parameters",
-                    "Hostname",
-                )
-                .is_some()
-            {
+            if hostname_present {
                 print_str(b"[network-setup] ReactOS network setup already present\n");
             } else {
                 print_str(b"[network-setup] ReactOS network setup not provisioned\n");
@@ -4071,8 +4229,8 @@ impl ExecNtHandler {
     /// architecture. This lets `spoolsv`/`localspl` discover the print environment through real
     /// registry syscalls and then load `winprint.dll` from the real spool directory.
     fn provision_reactos_print_setup(&mut self) {
-        let (stats, mutations, failed) = {
-            let mut target = CollectSystemSetupSeedTarget::new(self);
+        let (stats, mutations, failed, driver_present) = {
+            let mut target = CollectSystemSetupSeedTarget::new();
             trace_setup_provision_phase(b"print-seed-begin", 0);
             let stats = nt_hive_core::seed_reactos_print_setup_into_target(&mut target);
             trace_setup_provision_phase(
@@ -4082,16 +4240,16 @@ impl ExecNtHandler {
                     + stats.print_processor_values as u64
                     + stats.monitor_values as u64,
             );
-            (stats, target.mutations, target.failed)
+            let driver_present = nt_hive_core::ReactOsSetupSeedTarget::has_value(
+                &target,
+                r"\Registry\Machine\System\CurrentControlSet\Control\Print\Monitors\Local Port",
+                "Driver",
+            );
+            let (mutations, failed) = target.finish();
+            (stats, mutations, failed, driver_present)
         };
         if mutations.is_empty() {
-            if self
-                .mutable_registry_value_by_path(
-                    r"\Registry\Machine\System\CurrentControlSet\Control\Print\Monitors\Local Port",
-                    "Driver",
-                )
-                .is_some()
-            {
+            if driver_present {
                 print_str(b"[print-setup] ReactOS print setup already present\n");
             } else {
                 print_str(b"[print-setup] ReactOS print setup not provisioned\n");
@@ -4304,16 +4462,24 @@ impl ExecNtHandler {
             locale_id_ascii8(locale_id, &mut locale_ascii);
             b"reactos\\unattend.inf"
         } else {
-            let Some((source_ty, language_id)) = self
-                .resolve_key(NLS_LANGUAGE)
-                .and_then(|key| self.registry_value(key, "Default"))
-            else {
-                print_str(
-                    b"[locale-setup] no LocaleID in unattend.inf and HKLM\\...\\Nls\\Language\\Default absent -> no user locale\n",
-                );
-                return;
+            let (source_ty, language_id) = match query_system_hive_value(NLS_LANGUAGE, "Default") {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    print_str(
+                        b"[locale-setup] no LocaleID in unattend.inf and HKLM\\...\\Nls\\Language\\Default absent -> no user locale\n",
+                    );
+                    return;
+                }
+                Err(status) => {
+                    print_str(
+                        b"[locale-setup] CM HKLM\\...\\Nls\\Language\\Default query failed status=0x",
+                    );
+                    print_hex(status);
+                    print_str(b"\n");
+                    return;
+                }
             };
-            if source_ty != REG_SZ {
+            if source_ty != nt_hive_core::RegistryValueType::Sz {
                 print_str(b"[locale-setup] HKLM\\...\\Nls\\Language\\Default is not REG_SZ -> no user locale\n");
                 return;
             }
@@ -4367,40 +4533,38 @@ impl ExecNtHandler {
         };
         trace_setup_provision_phase(b"locale-user-value-end", user_locale_changed as u64);
         trace_setup_provision_phase(b"locale-system-key-begin", 0);
-        if self.mutable_registry_key_by_path(NLS_LANGUAGE).is_none() {
-            print_str(b"[locale-setup] HKLM\\...\\Nls\\Language absent -> no system locale\n");
+        let mut target = CollectSystemSetupSeedTarget::new();
+        if !target.has_key(NLS_LANGUAGE) {
+            let (_, failed) = target.finish();
+            if failed {
+                print_str(b"[locale-setup] CM HKLM\\...\\Nls\\Language open failed\n");
+            } else {
+                print_str(b"[locale-setup] HKLM\\...\\Nls\\Language absent -> no system locale\n");
+            }
             return;
         }
         trace_setup_provision_phase(b"locale-system-key-end", 1);
         trace_setup_provision_phase(b"locale-system-default-begin", system_locale_len as u64);
-        let (system_default_changed, install_language_changed, mutations, failed) = {
-            let mut target = CollectSystemSetupSeedTarget::new(self);
-            let system_default_changed = nt_hive_core::ReactOsSetupSeedTarget::set_value(
-                &mut target,
-                NLS_LANGUAGE,
-                "Default",
-                nt_hive_core::RegistryValueType::Sz,
-                system_locale[..system_locale_len].to_vec(),
-            );
-            trace_setup_provision_phase(
-                b"locale-system-default-end",
-                system_default_changed as u64,
-            );
-            trace_setup_provision_phase(b"locale-install-language-begin", system_locale_len as u64);
-            let install_language_changed = nt_hive_core::ReactOsSetupSeedTarget::set_value(
-                &mut target,
-                NLS_LANGUAGE,
-                "InstallLanguage",
-                nt_hive_core::RegistryValueType::Sz,
-                system_locale[..system_locale_len].to_vec(),
-            );
-            (
-                system_default_changed,
-                install_language_changed,
-                target.mutations,
-                target.failed,
-            )
-        };
+        let system_default_changed = nt_hive_core::ReactOsSetupSeedTarget::set_value(
+            &mut target,
+            NLS_LANGUAGE,
+            "Default",
+            nt_hive_core::RegistryValueType::Sz,
+            system_locale[..system_locale_len].to_vec(),
+        );
+        trace_setup_provision_phase(
+            b"locale-system-default-end",
+            system_default_changed as u64,
+        );
+        trace_setup_provision_phase(b"locale-install-language-begin", system_locale_len as u64);
+        let install_language_changed = nt_hive_core::ReactOsSetupSeedTarget::set_value(
+            &mut target,
+            NLS_LANGUAGE,
+            "InstallLanguage",
+            nt_hive_core::RegistryValueType::Sz,
+            system_locale[..system_locale_len].to_vec(),
+        );
+        let (mutations, failed) = target.finish();
         if failed {
             print_str(b"[locale-setup] SYSTEM mutation collection unavailable\n");
             return;
