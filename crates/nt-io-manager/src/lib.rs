@@ -6380,6 +6380,8 @@ mod tests {
                 driver_object: 0x1111,
                 next_device: 0x2222,
                 device_extension: 0x3333,
+                flags: 0x4455_6677,
+                characteristics: 0x8899_aabb,
                 device_type: 0x44,
                 stack_size: 3,
             },
@@ -6389,6 +6391,8 @@ mod tests {
         assert_eq!(le_u16(&dev, 0x02), WDM_X64_DEVICE_OBJECT_SIZE as u16);
         assert_eq!(le_u64(&dev, 0x08), 0x1111);
         assert_eq!(le_u64(&dev, 0x10), 0x2222);
+        assert_eq!(le_u32(&dev, 0x30), 0x4455_6677);
+        assert_eq!(le_u32(&dev, 0x34), 0x8899_aabb);
         assert_eq!(le_u64(&dev, 0x40), 0x3333);
         assert_eq!(le_u32(&dev, 0x48), 0x44);
         assert_eq!(dev[0x4c], 3);

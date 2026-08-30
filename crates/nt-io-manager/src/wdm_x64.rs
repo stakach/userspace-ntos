@@ -40,6 +40,8 @@ pub struct WdmDeviceObjectInit {
     pub driver_object: u64,
     pub next_device: u64,
     pub device_extension: u64,
+    pub flags: u32,
+    pub characteristics: u32,
     pub device_type: u32,
     pub stack_size: u8,
 }
@@ -210,6 +212,8 @@ pub fn write_wdm_device_object(
     put_u16(bytes, 0x02, WDM_X64_DEVICE_OBJECT_SIZE as u16);
     put_u64(bytes, 0x08, init.driver_object);
     put_u64(bytes, 0x10, init.next_device);
+    put_u32(bytes, 0x30, init.flags);
+    put_u32(bytes, 0x34, init.characteristics);
     put_u64(bytes, 0x40, init.device_extension);
     put_u32(bytes, 0x48, init.device_type);
     put_u8(bytes, 0x4c, init.stack_size);
@@ -254,6 +258,8 @@ pub fn write_wdm_open_device_projection(
             driver_object: init.driver_object,
             next_device: 0,
             device_extension: 0,
+            flags: 0,
+            characteristics: 0,
             device_type: init.device_type,
             stack_size: 1,
         },

@@ -90,8 +90,8 @@ use nt_io_manager::{
     WdmDriverObjectInit, WdmFileObjectInit, WdmIoStackLocationInit, WdmIoStackParameters,
     WdmIrpInit, WDM_X64_DRIVER_EXTENSION_OFFSET, WDM_X64_DRIVER_EXTENSION_SIZE,
     WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET,
-    WDM_X64_FILE_OBJECT_SIZE, WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_FILE,
-    WDM_X64_IRP_SIZE,
+    WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_FILE_OBJECT_SIZE, WDM_X64_IO_STACK_LOCATION_SIZE,
+    WDM_X64_IO_TYPE_DEVICE, WDM_X64_IO_TYPE_DRIVER, WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
 };
 use nt_kernel_exec::{
     classify_dispatcher_wait_timeout, init_ksemaphore, kevent, ksemaphore_read_state,
@@ -4604,6 +4604,7 @@ const HOSTED_DEVICE_OP_QUERY_PROPERTY_PULL: u64 = 2;
 const HOSTED_DEVICE_OP_QUERY_PROPERTY_ABORT: u64 = 3;
 const HOSTED_DEVICE_OP_CLAIM_PORT_RANGE: u64 = 4;
 const HOSTED_DEVICE_OP_INVALIDATE_RELATIONS: u64 = 5;
+const HOSTED_DEVICE_OP_CREATE: u64 = 6;
 const HOSTED_DEVICE_ARG_DATA_OFF: u64 = FSD_ARG_BYTES;
 const HOSTED_DEVICE_ARG_DATA_CAP: u64 = REP_DATA_LEN as u64;
 const _: () =
@@ -5483,6 +5484,17 @@ unsafe fn hosted_device_invalidate_relations(pdo: u64, relation_type: u32) {
     );
 }
 
+unsafe fn hosted_device_create(device: u64, driver: u64, extension_size: u64) -> (i32, u64) {
+    let (_label, status, canonical_device_id, _, _) = call_on4(
+        (FSD_SERVICE_DEVICE_LABEL << 12) | 4,
+        HOSTED_DEVICE_OP_CREATE,
+        device,
+        driver,
+        extension_size,
+    );
+    (status as u32 as i32, canonical_device_id)
+}
+
 unsafe fn broker_query_registry_path_value(
     key_path: &HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
     value_name: &HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
@@ -6156,11 +6168,19 @@ extern "win64" fn s_io_create_device(
     ext_size: u64,
     name: u64,
     dev_type: u64,
-    _chars: u64,
-    _excl: u64,
+    chars: u64,
+    excl: u64,
     dev_out: u64,
 ) -> i32 {
     unsafe {
+        if drv == 0
+            || dev_out == 0
+            || ext_size > u32::MAX as u64
+            || dev_type > u32::MAX as u64
+            || chars > u32::MAX as u64
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
         clear_shared_path_len(SH_DEVICE_NAME_LEN);
         let named_device = if name != 0 {
             match unicode_string_parts(name) {
@@ -6170,10 +6190,21 @@ extern "win64" fn s_io_create_device(
         } else {
             None
         };
+        if let Some((name_buf, name_len)) = named_device {
+            copy_wstr_to_shared(name_buf, name_len, SH_DEVICE_NAME_LEN, SH_DEVICE_NAME_BUF);
+        }
+        let flags = DeviceFlags::DEVICE_INITIALIZING.bits()
+            | if excl != 0 {
+                DeviceFlags::EXCLUSIVE.bits()
+            } else {
+                0
+            };
         let projection = match crate::hosted_driver_projection::create_hosted_device_projection(
             drv,
             ext_size,
             dev_type as u32,
+            flags,
+            chars as u32,
             pool_alloc,
             pool_free,
         ) {
@@ -6181,14 +6212,22 @@ extern "win64" fn s_io_create_device(
             Err(status) => return status,
         };
         let dev = projection.device_object();
-        if dev_out != 0 {
-            write_unaligned(dev_out as *mut u64, dev);
+        let (status, canonical_device_id) = hosted_device_create(dev, drv, ext_size);
+        if status < 0 || canonical_device_id == 0 {
+            crate::hosted_driver_projection::delete_hosted_device_projection(dev, pool_free);
+            clear_shared_path_len(SH_DEVICE_NAME_LEN);
+            return if status < 0 {
+                status
+            } else {
+                STATUS_INVALID_DEVICE_REQUEST
+            };
         }
-        // record it for the executive
+        write_unaligned(dev_out as *mut u64, dev);
+        // Retain the last-created pointer for the component ready handshake. Canonical identity was
+        // already published synchronously by the broker above.
         write_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *mut u64, dev);
         let mut v = read_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *const u32) | V_DEVICE;
-        if let Some((name_buf, name_len)) = named_device {
-            copy_wstr_to_shared(name_buf, name_len, SH_DEVICE_NAME_LEN, SH_DEVICE_NAME_BUF);
+        if named_device.is_some() {
             v |= V_NAMED_DEVICE;
         }
         write_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *mut u32, v);
@@ -30542,6 +30581,8 @@ unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64
             0,
             0,
             DeviceType::UNKNOWN.0,
+            0,
+            0,
             pool_alloc,
             pool_free,
         ) {
@@ -33903,10 +33944,10 @@ unsafe fn load_driver_reserved(
         map_cap_bank,
         reply_cap: active_reply_cap,
     };
-    let device_id = match register_io_device(driver_id, &dc) {
+    let device_id = match resolve_io_device(driver_id, &dc) {
         Ok(device_id) => device_id,
         Err(status) => {
-            print_str(b"[driver-launch] IoManager device publish failed status=0x");
+            print_str(b"[driver-launch] IoManager device resolve failed status=0x");
             print_hex(status.raw() as u32);
             print_str(b" for ");
             print_str(driver_object_path.as_bytes());
@@ -35985,21 +36026,98 @@ pub(crate) fn close_io_handle(handle: u64) -> Result<(), nt_status::NtStatus> {
     io_manager_mut().close(ClientId(IO_MANAGER_COMPONENT_ID), HandleValue(handle))
 }
 
-fn register_io_device(driver_id: u64, dc: &DriverComponent) -> Result<u64, nt_status::NtStatus> {
-    if dc.devobj == 0 || dc.device_name_len == 0 {
+unsafe fn validate_and_sync_hosted_device_projection(
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    device_object: u64,
+    device_id: nt_io_manager::DeviceId,
+    expected_driver: DriverId,
+    expected_driver_object: u64,
+    expected_name: Option<&NtPath>,
+) -> Result<(), nt_status::NtStatus> {
+    let (extension_size, device_type, characteristics, driver_id, canonical_name) = {
+        let record = io_manager_mut()
+            .device(device_id)
+            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+        (
+            record.extension_size,
+            record.device_type,
+            record.characteristics,
+            record.driver_id,
+            record.name.clone(),
+        )
+    };
+    if driver_id != expected_driver || canonical_name.as_ref() != expected_name {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let _guard = hosted_instance_pool_lock(inst.exec_pool_va)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let (device_exec, capacity) = hosted_pool_allocation_exec_range(inst.exec_pool_va, device_object)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let required = (WDM_X64_DEVICE_OBJECT_SIZE as u64)
+        .checked_add(extension_size as u64)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let expected_extension = if extension_size == 0 {
+        0
+    } else {
+        device_object + WDM_X64_DEVICE_OBJECT_SIZE as u64
+    };
+    if capacity < required
+        || hosted_instance_pool_allocation_is_free_unlocked(inst, device_object) != Some(false)
+        || read_unaligned(device_exec as *const i16) != WDM_X64_IO_TYPE_DEVICE
+        || read_unaligned((device_exec + 2) as *const u16) != WDM_X64_DEVICE_OBJECT_SIZE as u16
+        || read_unaligned((device_exec + 0x08) as *const u64) != expected_driver_object
+        || read_unaligned((device_exec + 0x40) as *const u64) != expected_extension
+        || read_unaligned((device_exec + 0x48) as *const u32) != device_type.0
+        || read_unaligned((device_exec + 0x34) as *const u32) != characteristics.bits()
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let flags = DeviceFlags::from_bits_retain(read_unaligned((device_exec + 0x30) as *const u32));
+    io_manager_mut()
+        .device_mut(device_id)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?
+        .flags = flags;
+    if io_manager_mut().hosted_device_by_identity(domain, device_object) != Some(device_id) {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    Ok(())
+}
+
+fn resolve_io_device(driver_id: u64, dc: &DriverComponent) -> Result<u64, nt_status::NtStatus> {
+    if dc.devobj == 0 {
+        if dc.device_name_len != 0 {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
         return Ok(0);
     }
-    let Some(name) = captured_nt_path(&dc.device_name_utf16, dc.device_name_len) else {
-        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    let name = if dc.device_name_len == 0 {
+        None
+    } else {
+        Some(
+            captured_nt_path(&dc.device_name_utf16, dc.device_name_len)
+                .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?,
+        )
     };
-    let device_id = io_manager_mut().create_device(
-        DriverId(driver_id),
-        Some(&name),
-        DeviceType::UNKNOWN,
-        DeviceCharacteristics::empty(),
-        DeviceFlags::BUFFERED_IO,
-        0,
-    )?;
+    let domain = HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId(dc.hosted_domain_id),
+        cookie: dc.hosted_domain_cookie,
+    };
+    let device_id = io_manager_mut()
+        .hosted_device_by_identity(domain, dc.devobj)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let inst = instance(dc.instance).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    unsafe {
+        validate_and_sync_hosted_device_projection(
+            inst,
+            domain,
+            dc.devobj,
+            device_id,
+            DriverId(driver_id),
+            dc.drvobj,
+            name.as_ref(),
+        )?;
+    }
     Ok(device_id.raw())
 }
 
@@ -37281,8 +37399,135 @@ pub(crate) fn service_hosted_device(
             | HOSTED_DEVICE_OP_QUERY_PROPERTY_ABORT
             | HOSTED_DEVICE_OP_CLAIM_PORT_RANGE
             | HOSTED_DEVICE_OP_INVALIDATE_RELATIONS
+            | HOSTED_DEVICE_OP_CREATE
     ) {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+    }
+    if op == HOSTED_DEVICE_OP_CREATE {
+        let Some((_instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        };
+        let domain = HostedDomainIdentity {
+            domain_id: nt_io_manager::HostedDomainId(inst.hosted_domain_id),
+            cookie: inst.hosted_domain_cookie,
+        };
+        let Ok(extension_size) = u32::try_from(arg3) else {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        };
+        let raw_name_len = unsafe {
+            read_volatile((ch.shared_va + SH_DEVICE_NAME_LEN) as *const u16)
+        };
+        let name = if raw_name_len == 0 {
+            None
+        } else {
+            let (captured_len, captured) = unsafe {
+                read_shared_path_capture(
+                    ch.shared_va,
+                    SH_DEVICE_NAME_LEN,
+                    SH_DEVICE_NAME_BUF,
+                )
+            };
+            if captured_len != raw_name_len {
+                return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+            }
+            match captured_nt_path(&captured, captured_len) {
+                Some(name) => Some(name),
+                None => return (STATUS_INVALID_PARAMETER, 0, 0, 0),
+            }
+        };
+
+        let native = unsafe {
+            let Some(_guard) = hosted_instance_pool_lock(inst.exec_pool_va) else {
+                return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+            };
+            let Some((driver_exec, driver_capacity)) =
+                hosted_pool_allocation_exec_range(inst.exec_pool_va, arg2)
+            else {
+                return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+            };
+            let Some((device_exec, device_capacity)) =
+                hosted_pool_allocation_exec_range(inst.exec_pool_va, pdo_object)
+            else {
+                return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+            };
+            let required_device_bytes = match (WDM_X64_DEVICE_OBJECT_SIZE as u64)
+                .checked_add(extension_size as u64)
+            {
+                Some(bytes) => bytes,
+                None => return (STATUS_INVALID_PARAMETER, 0, 0, 0),
+            };
+            if driver_capacity < WDM_X64_DRIVER_OBJECT_SIZE as u64
+                || device_capacity < required_device_bytes
+                || hosted_instance_pool_allocation_is_free_unlocked(inst, arg2) != Some(false)
+                || hosted_instance_pool_allocation_is_free_unlocked(inst, pdo_object) != Some(false)
+                || read_unaligned(driver_exec as *const i16) != WDM_X64_IO_TYPE_DRIVER
+                || read_unaligned((driver_exec + 2) as *const u16)
+                    != WDM_X64_DRIVER_OBJECT_SIZE as u16
+                || read_unaligned(device_exec as *const i16) != WDM_X64_IO_TYPE_DEVICE
+                || read_unaligned((device_exec + 2) as *const u16)
+                    != WDM_X64_DEVICE_OBJECT_SIZE as u16
+                || read_unaligned((device_exec + 0x08) as *const u64) != arg2
+            {
+                return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+            }
+            let expected_extension = if extension_size == 0 {
+                0
+            } else {
+                pdo_object + WDM_X64_DEVICE_OBJECT_SIZE as u64
+            };
+            if read_unaligned((device_exec + 0x40) as *const u64) != expected_extension {
+                return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+            }
+            (
+                read_unaligned((device_exec + 0x48) as *const u32),
+                read_unaligned((device_exec + 0x30) as *const u32),
+                read_unaligned((device_exec + 0x34) as *const u32),
+            )
+        };
+
+        let driver_id = match io_manager_mut().hosted_driver_by_identity(domain, arg2) {
+            Some(driver_id) => driver_id,
+            None => {
+                let shared_driver = unsafe {
+                    read_volatile((ch.shared_va + SH_DRVOBJ) as *const u64)
+                };
+                let driver_id = DriverId(inst.driver_id);
+                if arg2 != shared_driver
+                    || inst.driver_id == 0
+                    || io_manager_mut().driver(driver_id).is_none()
+                {
+                    return (STATUS_ACCESS_DENIED, 0, 0, 0);
+                }
+                if let Err(status) =
+                    io_manager_mut().bind_hosted_driver_identity(domain, arg2, driver_id)
+                {
+                    return (status.raw(), 0, 0, 0);
+                }
+                driver_id
+            }
+        };
+        let device_id = match io_manager_mut().create_device(
+            driver_id,
+            name.as_ref(),
+            DeviceType(native.0),
+            DeviceCharacteristics::from_bits_retain(native.2),
+            DeviceFlags::from_bits_retain(native.1),
+            extension_size,
+        ) {
+            Ok(device_id) => device_id,
+            Err(status) => return (status.raw(), 0, 0, 0),
+        };
+        if let Err(status) =
+            io_manager_mut().bind_hosted_device_identity(domain, pdo_object, device_id)
+        {
+            io_manager_mut()
+                .destroy_device(device_id)
+                .unwrap_or_else(|cleanup| {
+                    panic!("hosted IoCreateDevice rollback failed: {cleanup:?}")
+                });
+            return (status.raw(), 0, 0, 0);
+        }
+        return (STATUS_SUCCESS, device_id.raw(), 0, 0);
     }
     if op == HOSTED_DEVICE_OP_INVALIDATE_RELATIONS {
         let call = HOSTED_DEVICE_RELATION_INVALIDATION_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -43258,6 +43503,26 @@ unsafe fn rollback_uncommitted_add_device(
             cleanup_status = Some(status);
         }
     }
+    if let Some(fdo_device_id) = fdo_device_id {
+        if canonical_fdo_attached {
+            if let Err(status) = io_manager_mut().detach_device_from_stack(fdo_device_id) {
+                cleanup_status.get_or_insert(status);
+            }
+        }
+        let fdo_object = add_device.map(|result| result.fdo_object).unwrap_or(0);
+        if fdo_object == 0
+            || !io_manager_mut().unbind_hosted_device_identity(
+                projection_domain,
+                fdo_object,
+                fdo_device_id,
+            )
+        {
+            cleanup_status.get_or_insert(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        if let Err(status) = io_manager_mut().destroy_device(fdo_device_id) {
+            cleanup_status.get_or_insert(status);
+        }
+    }
     let (driver_object, previous_device_head) = add_device
         .map(|result| (result.driver_object, result.previous_device_head))
         .unwrap_or((0, 0));
@@ -43268,17 +43533,7 @@ unsafe fn rollback_uncommitted_add_device(
         previous_device_head,
         pdo_projection_created,
     ) {
-        cleanup_status = Some(status);
-    }
-    if let Some(fdo_device_id) = fdo_device_id {
-        if canonical_fdo_attached {
-            if let Err(status) = io_manager_mut().detach_device_from_stack(fdo_device_id) {
-                cleanup_status.get_or_insert(status);
-            }
-        }
-        if let Err(status) = io_manager_mut().destroy_device(fdo_device_id) {
-            cleanup_status.get_or_insert(status);
-        }
+        cleanup_status.get_or_insert(status);
     }
     if pdo_projection_created
         && !io_manager_mut().unbind_hosted_device_identity(
@@ -43296,7 +43551,7 @@ unsafe fn rollback_uncommitted_add_device(
 }
 
 /// Invoke a loaded WDM driver's real `DriverExtension->AddDevice` for one registry-selected devnode
-/// and publish the FDO it creates as an unnamed I/O Manager device owned by that driver.
+/// and commit the dynamically-published FDO to that devnode's canonical stack.
 pub(crate) unsafe fn call_add_device_for_driver<H, C>(
     driver_id: u64,
     class_guid: Option<&str>,
@@ -43469,21 +43724,32 @@ where
             }
             None => None,
         };
-        let device_type = if hosted_instance_video_port_initialized(inst) {
-            DeviceType(nt_video_miniport::FILE_DEVICE_VIDEO)
-        } else {
-            DeviceType::UNKNOWN
-        };
-        let device_id = io_manager_mut().create_device(
-            DriverId(driver_id),
-            fdo_name.as_ref(),
-            device_type,
-            DeviceCharacteristics::empty(),
-            DeviceFlags::BUFFERED_IO,
-            0,
-        )?;
+        let device_id = io_manager_mut()
+            .hosted_device_by_identity(projection_domain, add_device.fdo_object)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
         fdo_device_id = Some(device_id);
-        io_manager_mut().attach_device_to_stack(device_id, pdo_device)?;
+        validate_and_sync_hosted_device_projection(
+            projection_inst,
+            projection_domain,
+            add_device.fdo_object,
+            device_id,
+            DriverId(driver_id),
+            add_device.driver_object,
+            fdo_name.as_ref(),
+        )?;
+        match io_manager_mut()
+            .device(device_id)
+            .and_then(|device| device.attached_to)
+        {
+            None => {
+                let lower = io_manager_mut().attach_device_to_stack(device_id, pdo_device)?;
+                if lower != pdo_device {
+                    return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+                }
+            }
+            Some(lower) if lower == pdo_device => {}
+            Some(_) => return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+        }
         canonical_fdo_attached = true;
         hosted_pnp_manager_mut()
             .commit_device_stack(pdo_device_id, device_id.raw(), driver_id)

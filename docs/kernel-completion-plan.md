@@ -18453,3 +18453,34 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     post-AddDevice device creation. Then resolve each copied raw PDO through that authenticated
     hosted-domain mapping and issue the complete real `BusQueryDeviceID`, `BusQueryInstanceID`,
     `BusQueryHardwareIDs`, and `BusQueryCompatibleIDs` sequence before preparing any CM mutation.
+
+    B3 dynamic hosted device publication checkpoint (2026-08-30): every successful hosted
+    `IoCreateDevice` now publishes its canonical I/O Manager device synchronously before returning
+    to the driver. The existing component service channel authenticates the exact hosted-domain
+    generation and pump Reply owner, validates the driver and device pointers as live allocations
+    in that component's locked pool, checks the native x64 object type, size, owner, extension
+    extent, and optional NT name, and resolves the projected `DRIVER_OBJECT` to its already-reserved
+    canonical driver identity. Initial DriverEntry may publish that driver projection through the
+    same authenticated call; provider-domain AddDevice uses its pre-bound driver shadow.
+
+    The x64 WDM projection writer now carries the real `DEVICE_OBJECT.Flags` and
+    `Characteristics`; `IoCreateDevice` initializes `DO_DEVICE_INITIALIZING` and `DO_EXCLUSIVE`
+    according to the native contract instead of manufacturing `DO_BUFFERED_IO` later. A failed
+    canonical create or pointer bind rolls back both Object Manager state and the component-local
+    projection before the API returns. Post-DriverEntry no longer reconstructs only the last named
+    `SH_DEVOBJ` as an unknown buffered device. It resolves the already-published domain binding,
+    validates its canonical owner/name against the native projection, and synchronizes flags the
+    driver changed before returning. Post-AddDevice likewise consumes the real FDO identity and no
+    longer creates a second canonical device. Stack commit remains generation-owned by PnP, and
+    failure unbinds the FDO identity before freeing its component allocation.
+
+    Focused `nt-io-manager` validation passes `236/236`; formatting, `git diff --check`, and the
+    freestanding executive check pass at the unchanged 209-warning baseline. Review adjustment:
+    creation identity is now dynamic and the overlapping post-return constructors are removed.
+    Before consuming returned bus PDOs, move `IoAttachDeviceToDeviceStack`, `IoDetachDevice`, and
+    `IoDeleteDevice` onto authenticated hosted-device service operations. The current shims still
+    consult executive identity tables directly and only recognize the historical one-device
+    instance snapshot. Deletion must preserve NT delete-pending lifetime rather than freeing a live
+    projection, and stack operations must resolve both pointers in the caller's exact domain. Then
+    the relation worker can resolve every copied child PDO through the canonical mapping and start
+    the four real `IRP_MN_QUERY_ID` requests.

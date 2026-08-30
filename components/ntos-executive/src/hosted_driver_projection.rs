@@ -35,6 +35,8 @@ pub(crate) unsafe fn create_hosted_device_projection(
     driver_object: u64,
     extension_size: u64,
     device_type: u32,
+    flags: u32,
+    characteristics: u32,
     allocate: unsafe fn(u64) -> u64,
     free: unsafe fn(u64),
 ) -> Result<HostedDeviceProjection, i32> {
@@ -69,6 +71,8 @@ pub(crate) unsafe fn create_hosted_device_projection(
             driver_object,
             next_device,
             device_extension,
+            flags,
+            characteristics,
             device_type,
             stack_size: 1,
         },
