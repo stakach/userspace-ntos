@@ -19674,3 +19674,45 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     requested GSI/id, and fail closed when none or several match. The fallback address and fixed
     pin limit must be deleted before multi-controller PCI/SCI runtime acceptance; q35's current
     single-controller layout is not policy.
+
+    B3 generation-owned PCI interrupt-route checkpoint (2026-08-31, crate accepted): `nt-pnp`
+    now owns a complete provider route publication independently from ACPI decoding. A fallible
+    prepare/commit transaction binds the set to the exact accepted PCI-inventory generation; a
+    route-owner generation and copyable claim then fence every later resource publication and
+    capability mint. Inventory or publication replacement makes old claims unusable, while exact
+    revocation clears the complete set even when the device topology is already unavailable.
+
+    Publication validates segment/bus/device/function/pin bounds, duplicate entries, complete
+    coverage for every current function advertising an INTx pin, and same-GSI sharing, trigger,
+    and polarity agreement. Firmware entries for empty slots remain valid for hotplug. Exact
+    function entries deterministically override the ACPI wildcard, no PCI swizzle or config-space
+    `InterruptLine` is consulted, pinless functions need no route, and physical GSI zero remains
+    valid. Focused `nt-pnp` validation passes 44/44.
+
+    Review adjustment: the provider namespace prerequisite has a standard boundary:
+    `IOCTL_ACPI_ENUM_CHILDREN` (`0x0032c020`) against each exact canonical ACPI PDO. Record zero of
+    an immediate-only query supplies that PDO's fully qualified namespace path, so the retained
+    bus-relations transaction can bind `_PRT` link NameSegs to exact canonical link PDOs without a
+    service-name hook, DeviceExtension inspection, enumeration-order guess, or globally selected
+    `PNP0C0F`. Add a host-tested decoder and preserve the overflow result header even when
+    `IoStatus.Information` is zero, then add the query to the serialized relation owner before its
+    existing atomic publish.
+
+    The shipped ReactOS provider also suppresses distinct no-UID PDOs that share a HID and does not
+    yet dispatch this standard Vista-era enumeration IOCTL. Treat either condition as a route
+    publication barrier, never a reason to select the first link. Carry a focused provider fix:
+    enumerate PDOs by exact ACPICA handle, generate stable unique no-UID instance identities, and
+    implement the complete standard enumeration contract (self first, immediate/multilevel,
+    filtering, exact overflow and length semantics). Unqualified `_PRT` link names must resolve by
+    ACPI scope against the retained full paths; ambiguous or unresolvable names fail the whole
+    route transaction.
+
+    Before live route acceptance, remove the remaining downstream assumptions in the same atomic
+    integration: raw PCI resources must use the claim's GSI/trigger/share data rather than config
+    `irq_line`; polarity stays distinct in hosted route authority; resource-manager interrupt
+    validation must accept GSI zero; and the compiled q35 PIRQ table, config-line authority, HPET
+    conflict mask, and PCI InterruptLine writeback must disappear. The separately tracked
+    microkernel controller-catalog correction remains required before runtime proof: validated all-
+    IOAPIC MADT entries, hardware-reported redirection counts, ordinal/local-pin ABI handling,
+    controller-wide mask scans, and no `0xfec00000`, first-controller, saturating, or 24-entry
+    fallback.

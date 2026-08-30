@@ -26,8 +26,13 @@
 
 extern crate alloc;
 
+mod pci_interrupt_routes;
 mod pci_inventory;
 
+pub use pci_interrupt_routes::{
+    PciInterruptRoute, PciInterruptRouteClaim, PciInterruptRouteError, PciInterruptRouteOwner,
+    PciRouteFunction, PreparedPciInterruptRoutePublication,
+};
 pub use pci_inventory::{
     CommittedPciInventoryUpdate, PciInventory, PciInventoryError, PciLocation, PciResourceChange,
     PreparedPciCensus, PreparedPciInventoryUpdate,
