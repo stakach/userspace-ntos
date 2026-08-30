@@ -1141,9 +1141,9 @@ unsafe fn sync_completed_user_callback_win32k_context(
     nt_handler: &mut ExecNtHandler,
     completion_pi: usize,
     completion_tid: u64,
-) {
+) -> bool {
     let expected_pid = nt_handler.pm_pid_for_pi(completion_pi).unwrap_or(0) as u64;
-    sync_win32k_context_to_process_manager(nt_handler, completion_pi, expected_pid, completion_tid);
+    sync_win32k_context_to_process_manager(nt_handler, completion_pi, expected_pid, completion_tid)
 }
 
 unsafe fn drain_deferred_user_callback_returns(
@@ -1171,7 +1171,7 @@ unsafe fn drain_deferred_user_callback_returns(
             let completion_pi = deferred.pi as usize;
             effects_ok = completion_pi < MAX_PI;
             if effects_ok {
-                sync_completed_user_callback_win32k_context(
+                effects_ok = sync_completed_user_callback_win32k_context(
                     nt_handler,
                     completion_pi,
                     deferred.tid,
@@ -2605,7 +2605,7 @@ unsafe fn sync_win32k_context_to_process_manager(
     expected_pi: usize,
     expected_pid: u64,
     expected_tid: u64,
-) {
+) -> bool {
     let captured = if expected_pi < MAX_PI {
         win32k_glue::take_suspended_published_win32k_context(
             expected_pi as u32,
@@ -2621,7 +2621,7 @@ unsafe fn sync_win32k_context_to_process_manager(
             let Some(published) =
                 win32k_glue::take_matching_published_win32k_context(expected_pid, expected_tid)
             else {
-                return;
+                return true;
             };
             published
         }
@@ -2642,7 +2642,7 @@ unsafe fn sync_win32k_context_to_process_manager(
         print_str(b" actual=");
         print_u64(pid);
         print_str(b"\n");
-        return;
+        return false;
     }
 
     if pid != 0 && pid <= nt_process::ProcessId::MAX as u64 {
@@ -2653,7 +2653,19 @@ unsafe fn sync_win32k_context_to_process_manager(
                 .set_process_kernel_object(pid, published.eprocess);
         }
         if published.w32process != 0 {
-            let _ = nt_handler.pm.set_process_win32(pid, published.w32process);
+            if !nt_handler.pm.set_process_win32(pid, published.w32process) {
+                return false;
+            }
+            if let Err(status) =
+                nt_handler.publish_process_win32_job_membership(pid, published.w32process)
+            {
+                print_str(b"[ps-job] failed to attach W32PROCESS pid=");
+                print_u64(pid as u64);
+                print_str(b" status=0x");
+                print_hex(status);
+                print_str(b"\n");
+                return false;
+            }
         }
     }
     if tid != 0 && tid <= nt_process::ThreadId::MAX as u64 {
@@ -2668,7 +2680,7 @@ unsafe fn sync_win32k_context_to_process_manager(
                     print_u64(pid);
                     print_str(b"\n");
                 }
-                return;
+                return false;
             };
             if client_id.unique_process as u64 != pid {
                 let n = WIN32K_CONTEXT_IMPORT_TRACE.fetch_add(1, Ordering::Relaxed);
@@ -2681,7 +2693,7 @@ unsafe fn sync_win32k_context_to_process_manager(
                     print_u64(tid as u64);
                     print_str(b"\n");
                 }
-                return;
+                return false;
             }
         }
         if expected_tid != 0 && tid as u64 != expected_tid {
@@ -2705,6 +2717,7 @@ unsafe fn sync_win32k_context_to_process_manager(
             let _ = nt_handler.pm.set_thread_win32(tid, published.w32thread);
         }
     }
+    true
 }
 
 unsafe fn dispatch_win32k_for_client(
@@ -2720,8 +2733,12 @@ unsafe fn dispatch_win32k_for_client(
 ) -> (u64, bool) {
     let result =
         win32k_glue::win32k_dispatch_wide(ssn, a0, a1, a2, a3, caller_sp, stack_args, client);
-    sync_win32k_context_to_process_manager(nt_handler, client.pi as usize, client.pid, client.tid);
-    result
+    if sync_win32k_context_to_process_manager(nt_handler, client.pi as usize, client.pid, client.tid)
+    {
+        result
+    } else {
+        (0xC000_00A3u32 as u64, false)
+    }
 }
 
 unsafe fn dispatch_win32k_for_client_with_completion_args(
@@ -2749,8 +2766,12 @@ unsafe fn dispatch_win32k_for_client_with_completion_args(
         output_stage,
         client,
     );
-    sync_win32k_context_to_process_manager(nt_handler, client.pi as usize, client.pid, client.tid);
-    result
+    if sync_win32k_context_to_process_manager(nt_handler, client.pi as usize, client.pid, client.tid)
+    {
+        result
+    } else {
+        (0xC000_00A3u32 as u64, false)
+    }
 }
 
 unsafe fn post_winlogon_second_sas_after_welcome_drain(
@@ -9111,11 +9132,15 @@ pub(crate) unsafe fn service_sec_image(
                             sp,
                             flags,
                         ) {
-                            sync_completed_user_callback_win32k_context(
+                            if !sync_completed_user_callback_win32k_context(
                                 &mut nt_handler,
                                 pi,
                                 current_tid,
-                            );
+                            ) {
+                                print_str(
+                                    b"[win32k-context] ERROR: callback completion could not publish Ps identity\n",
+                                );
+                            }
                             if let Some(dispatch) = completion.outer_dispatch {
                                 if !process_completed_user_callback_outer_dispatch(
                                     nt_handler,

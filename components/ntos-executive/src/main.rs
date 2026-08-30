@@ -22196,6 +22196,8 @@ struct ExecNtHandler {
     /// Hosted processes whose Ps state was terminated by a job operation during this syscall.
     /// The service-loop owner drains the matching seL4 mechanisms after native dispatch returns.
     pending_job_terminations: Vec<u8>,
+    /// Ps job objects whose provider-owned W32 job identity must be torn down before their Object
+    /// Manager namespace/completion-port references are released.
     stop: bool,
     /// Monotonic fake-handle allocator for objects the executive doesn't model yet (ports, threads,
     /// events, sections, tokens, files). Persistent across smss + csrss (single source of truth —
@@ -25722,6 +25724,9 @@ static PM_POST_TERM_CONTINUED_BADGES: AtomicU64 = AtomicU64::new(0);
 ///   0x20 exit_thread (no-cascade) terminates the init thread yet the EPROCESS stays Running
 ///   0x40 an unrelated live thread in the same process keeps running past the terminate
 static PM_TERMINATE_THREAD_SELFTEST: AtomicU64 = AtomicU64::new(0);
+/// Registered win32k job-callout transport: provider SetInformation, invisible Ps prepare,
+/// generation-checked publish, clear, and provider rundown of an empty diagnostic job.
+static WIN32_JOB_UI_SELFTEST: AtomicU64 = AtomicU64::new(0);
 /// **Dbgk (the user-mode debugging plane) counters.** Incremented by the REAL
 /// `NtCreateDebugObject`/`NtDebugActiveProcess`/`NtWaitForDebugEvent`/`NtDebugContinue`/
 /// `NtRemoveProcessDebug` handlers in `exec_handler.rs` — nothing in the current hosted set issues
@@ -29718,6 +29723,23 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             check(
                 b"win32k_sspt_metadata_registered",
                 win32k_subsystem::registered_win32k_service_metadata().is_some(),
+                &mut passed,
+            );
+            check(
+                b"win32k_job_callout_registered",
+                win32k_subsystem::registered_win32k_callouts().is_some(),
+                &mut passed,
+            );
+            let job_ui_proof = exec_handler::win32_job_callout_selftest();
+            WIN32_JOB_UI_SELFTEST.store(job_ui_proof, Ordering::Relaxed);
+            print_str(b"[ps-job] win32k UI callout selftest proof=0x");
+            print_hex(job_ui_proof as u32);
+            print_str(b"/0x");
+            print_hex(0x7f);
+            print_str(b"\n");
+            check(
+                b"exec_win32k_job_ui_callout_roundtrip",
+                job_ui_proof == 0x7f,
                 &mut passed,
             );
             // Phase-2b milestone: GreDriverEntry ran through init and registered its NtUser/NtGdi

@@ -207,6 +207,47 @@ impl JobExtendedLimitPlan {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobUiRestrictionPlan {
+    job_id: JobId,
+    ui_generation: u64,
+    previous: u32,
+    restrictions: u32,
+}
+
+impl JobUiRestrictionPlan {
+    pub const fn previous(self) -> u32 {
+        self.previous
+    }
+
+    pub const fn restrictions(self) -> u32 {
+        self.restrictions
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobAssignmentPlan {
+    job_id: JobId,
+    membership_generation: u64,
+    member: JobMember,
+    status: u32,
+    notification: Option<JobNotification>,
+}
+
+impl JobAssignmentPlan {
+    pub const fn job_id(self) -> JobId {
+        self.job_id
+    }
+
+    pub const fn process_id(self) -> ProcessId {
+        self.member.process_id
+    }
+
+    pub const fn status(self) -> u32 {
+        self.status
+    }
+}
+
 impl JobNotifications {
     fn push(&mut self, notification: Option<JobNotification>) {
         let Some(notification) = notification else {
@@ -261,6 +302,8 @@ struct Job {
     close_done: bool,
     signaled: bool,
     limits_generation: u64,
+    membership_generation: u64,
+    ui_generation: u64,
     basic_limits: JobBasicLimits,
     extended_limits: JobExtendedLimits,
     accounting: JobAccounting,
@@ -346,6 +389,20 @@ impl JobStore {
         self.destructions[slot].take()
     }
 
+    pub fn restore_destruction(&mut self, destruction: JobDestruction) -> bool {
+        let Some(slot) = Self::slot(destruction.id) else {
+            return false;
+        };
+        let Some(entry) = self.destructions.get_mut(slot) else {
+            return false;
+        };
+        if entry.is_some() {
+            return false;
+        }
+        *entry = Some(destruction);
+        true
+    }
+
     fn destroy_cascade(&mut self, mut id: JobId) {
         loop {
             let Some(slot) = Self::slot(id) else {
@@ -409,6 +466,8 @@ impl JobStore {
             close_done: false,
             signaled: false,
             limits_generation: 0,
+            membership_generation: 0,
+            ui_generation: 0,
             basic_limits: JobBasicLimits {
                 scheduling_class: 5,
                 ..JobBasicLimits::default()
@@ -531,6 +590,18 @@ impl JobStore {
         process_session_id: u32,
         initial_commit_bytes: u64,
     ) -> Result<JobAssignment, u32> {
+        let plan =
+            self.prepare_assignment(id, process_id, process_session_id, initial_commit_bytes)?;
+        self.commit_assignment(plan)
+    }
+
+    pub fn prepare_assignment(
+        &mut self,
+        id: JobId,
+        process_id: ProcessId,
+        process_session_id: u32,
+        initial_commit_bytes: u64,
+    ) -> Result<JobAssignmentPlan, u32> {
         if initial_commit_bytes & (PAGE_SIZE - 1) != 0 {
             return Err(crate::STATUS_INVALID_PARAMETER);
         }
@@ -552,7 +623,7 @@ impl JobStore {
         job.members
             .try_reserve(1)
             .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-        job.members.push(JobMember {
+        let mut member = JobMember {
             process_id,
             active: true,
             accounting_folded: false,
@@ -561,17 +632,17 @@ impl JobStore {
             current_memory_used: 0,
             peak_memory_used: 0,
             memory_limit_reported: false,
-        });
-        job.accounting.total_processes = job.accounting.total_processes.saturating_add(1);
-        job.accounting.active_processes = job.accounting.active_processes.saturating_add(1);
+        };
         let over_limit = job.basic_limits.limit_flags & JOB_OBJECT_LIMIT_ACTIVE_PROCESS != 0
-            && job.accounting.active_processes > job.basic_limits.active_process_limit;
+            && job.accounting.active_processes.saturating_add(1)
+                > job.basic_limits.active_process_limit;
         if over_limit {
-            let member = job.members.last_mut().expect("just inserted job member");
             member.active = false;
             member.forced_termination = true;
-            job.accounting.active_processes -= 1;
-            return Ok(JobAssignment {
+            return Ok(JobAssignmentPlan {
+                job_id: id,
+                membership_generation: job.membership_generation,
+                member,
                 status: STATUS_QUOTA_EXCEEDED,
                 notification: job.notification(JOB_OBJECT_MSG_ACTIVE_PROCESS_LIMIT, 0),
             });
@@ -579,31 +650,75 @@ impl JobStore {
         let job_memory_over = job.basic_limits.limit_flags & JOB_OBJECT_LIMIT_JOB_MEMORY != 0
             && next_job_memory > job.extended_limits.job_memory_limit;
         if job_memory_over {
-            let member = job.members.last_mut().expect("just inserted job member");
             member.active = false;
             member.forced_termination = true;
             member.memory_limit_reported = true;
-            job.accounting.active_processes -= 1;
-            return Ok(JobAssignment {
+            return Ok(JobAssignmentPlan {
+                job_id: id,
+                membership_generation: job.membership_generation,
+                member,
                 status: STATUS_QUOTA_EXCEEDED,
                 notification: job.notification(JOB_OBJECT_MSG_JOB_MEMORY_LIMIT, process_id),
             });
         }
-        let member = job.members.last_mut().expect("just inserted job member");
         member.current_memory_used = initial_commit_bytes;
         member.peak_memory_used = initial_commit_bytes;
-        job.current_job_memory_used = next_job_memory;
-        job.extended_limits.peak_process_memory_used = job
-            .extended_limits
-            .peak_process_memory_used
-            .max(initial_commit_bytes);
-        job.extended_limits.peak_job_memory_used = job
-            .extended_limits
-            .peak_job_memory_used
-            .max(next_job_memory);
-        Ok(JobAssignment {
+        Ok(JobAssignmentPlan {
+            job_id: id,
+            membership_generation: job.membership_generation,
+            member,
             status: 0,
             notification: job.notification(JOB_OBJECT_MSG_NEW_PROCESS, process_id),
+        })
+    }
+
+    pub fn commit_assignment(&mut self, plan: JobAssignmentPlan) -> Result<JobAssignment, u32> {
+        if self.job_for_process(plan.member.process_id).is_some() {
+            return Err(crate::STATUS_INVALID_PARAMETER);
+        }
+        let job = self
+            .get_mut(plan.job_id)
+            .ok_or(crate::STATUS_INVALID_HANDLE)?;
+        if job.membership_generation != plan.membership_generation
+            || job.members.len() == job.members.capacity()
+        {
+            return Err(crate::STATUS_INVALID_PARAMETER);
+        }
+        let next_membership_generation = job
+            .membership_generation
+            .checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        let next_job_memory = if plan.status == crate::STATUS_SUCCESS {
+            Some(
+                job.current_job_memory_used
+                    .checked_add(plan.member.current_memory_used)
+                    .ok_or(STATUS_INSUFFICIENT_RESOURCES)?,
+            )
+        } else {
+            None
+        };
+
+        job.membership_generation = next_membership_generation;
+        job.accounting.total_processes = job.accounting.total_processes.saturating_add(1);
+        if plan.member.active {
+            job.accounting.active_processes = job.accounting.active_processes.saturating_add(1);
+        }
+        job.members.push(plan.member);
+        if let Some(next_job_memory) = next_job_memory {
+            let initial_commit_bytes = plan.member.current_memory_used;
+            job.current_job_memory_used = next_job_memory;
+            job.extended_limits.peak_process_memory_used = job
+                .extended_limits
+                .peak_process_memory_used
+                .max(initial_commit_bytes);
+            job.extended_limits.peak_job_memory_used = job
+                .extended_limits
+                .peak_job_memory_used
+                .max(next_job_memory);
+        }
+        Ok(JobAssignment {
+            status: plan.status,
+            notification: plan.notification,
         })
     }
 
@@ -706,6 +821,7 @@ impl JobStore {
             .current_job_memory_used
             .saturating_sub(job.members[member].current_memory_used);
         job.members.remove(member);
+        job.membership_generation = job.membership_generation.wrapping_add(1);
         if job.can_destroy() {
             self.destroy_cascade(id);
         }
@@ -1217,12 +1333,39 @@ impl JobStore {
     }
 
     pub fn set_ui_restrictions(&mut self, id: JobId, restrictions: u32) -> Result<(), u32> {
+        let plan = self.prepare_ui_restrictions(id, restrictions)?;
+        self.commit_ui_restrictions(plan)
+    }
+
+    pub fn prepare_ui_restrictions(
+        &self,
+        id: JobId,
+        restrictions: u32,
+    ) -> Result<JobUiRestrictionPlan, u32> {
         if restrictions & !JOB_OBJECT_UI_VALID_FLAGS != 0 {
             return Err(crate::STATUS_INVALID_PARAMETER);
         }
-        self.get_mut(id)
-            .ok_or(crate::STATUS_INVALID_HANDLE)?
-            .ui_restrictions = restrictions;
+        let job = self.get(id).ok_or(crate::STATUS_INVALID_HANDLE)?;
+        Ok(JobUiRestrictionPlan {
+            job_id: id,
+            ui_generation: job.ui_generation,
+            previous: job.ui_restrictions,
+            restrictions,
+        })
+    }
+
+    pub fn commit_ui_restrictions(&mut self, plan: JobUiRestrictionPlan) -> Result<(), u32> {
+        let job = self
+            .get_mut(plan.job_id)
+            .ok_or(crate::STATUS_INVALID_HANDLE)?;
+        if job.ui_generation != plan.ui_generation || job.ui_restrictions != plan.previous {
+            return Err(crate::STATUS_INVALID_PARAMETER);
+        }
+        job.ui_generation = job
+            .ui_generation
+            .checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        job.ui_restrictions = plan.restrictions;
         Ok(())
     }
 

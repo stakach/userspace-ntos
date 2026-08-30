@@ -324,6 +324,16 @@ pub const SH_USER_CALLBACK: u64 = 0x200;
 const _: () = assert!(SH_REQ_TOKEN_USER_SID_PTR + 8 <= SH_USER_CALLBACK);
 const _: () = assert!(SH_GDI_LOAD_LEAF + SH_GDI_LOAD_LEAF_CAP as u64 <= SH_USER_CALLBACK);
 const _: () = assert!(SH_USER_CALLBACK as usize + nt_user_callback::CALLBACK_FRAME_SIZE <= 0x1000);
+/// Provider-owned `WIN32_CALLOUTS_FPNS` metadata copied out by `PsEstablishWin32Callouts`. These
+/// pointers remain provider VAs and are invoked only by dispatching back into this component.
+pub const SH_CALLOUT_TABLE: u64 = 0xFD0;
+pub const SH_CALLOUT_PROCESS: u64 = 0xFD8;
+pub const SH_CALLOUT_THREAD: u64 = 0xFE0;
+pub const SH_CALLOUT_GLOBAL_ATOM: u64 = 0xFE8;
+pub const SH_CALLOUT_JOB: u64 = 0xFF0;
+pub const SH_CALLOUT_BATCH_FLUSH: u64 = 0xFF8;
+const _: () = assert!(SH_USER_CALLBACK as usize + nt_user_callback::CALLBACK_FRAME_SIZE <= SH_CALLOUT_TABLE as usize);
+const _: () = assert!(SH_CALLOUT_BATCH_FLUSH + 8 == 0x1000);
 
 pub const HOSTED_PROCESS_ROLE_NONE: u64 = 0;
 pub const HOSTED_PROCESS_ROLE_NATIVE_SESSION: u64 = 1;
@@ -352,6 +362,37 @@ pub fn registered_win32k_service_metadata() -> Option<(u64, u32, u64)> {
             None
         } else {
             Some((base, count, argument_table))
+        }
+    }
+}
+
+pub fn registered_win32k_callouts() -> Option<nt_process::Win32Callouts> {
+    unsafe {
+        let callouts = nt_process::Win32Callouts {
+            table: read_volatile((WIN32K_SHARED_VADDR + SH_CALLOUT_TABLE) as *const u64),
+            process_callout: read_volatile(
+                (WIN32K_SHARED_VADDR + SH_CALLOUT_PROCESS) as *const u64,
+            ),
+            thread_callout: read_volatile(
+                (WIN32K_SHARED_VADDR + SH_CALLOUT_THREAD) as *const u64,
+            ),
+            global_atom_callout: read_volatile(
+                (WIN32K_SHARED_VADDR + SH_CALLOUT_GLOBAL_ATOM) as *const u64,
+            ),
+            job_callout: read_volatile((WIN32K_SHARED_VADDR + SH_CALLOUT_JOB) as *const u64),
+            batch_flush_callout: read_volatile(
+                (WIN32K_SHARED_VADDR + SH_CALLOUT_BATCH_FLUSH) as *const u64,
+            ),
+        };
+        if callouts.table == 0
+            || callouts.process_callout == 0
+            || callouts.thread_callout == 0
+            || callouts.job_callout == 0
+            || callouts.batch_flush_callout == 0
+        {
+            None
+        } else {
+            Some(callouts)
         }
     }
 }
@@ -432,6 +473,9 @@ pub const SSN_TEST_FAULT: u64 = 0x1FFE;
 /// Real NT calls this through `KeGdiFlushUserBatch` before every win32k syscall when
 /// `TEB.GdiBatchCount != 0`; it is not an SSDT service.
 pub const SSN_GDI_BATCH_FLUSH_CALLOUT: u64 = 0x1FFD;
+/// Private executive selector for the provider registered in
+/// `WIN32_CALLOUTS_FPNS.JobCallout`.
+pub const SSN_WIN32_JOB_CALLOUT: u64 = 0x1FFC;
 /// Un-demand-paged, demand-pageable probe VA: past the win32k image tail (0x06A2_0000, so NOT
 /// flagged `in_image`) yet inside the same PD as the image, so the executive maps it with no new
 /// page table. Zeroed on first touch.
@@ -439,6 +483,7 @@ pub const TEST_FAULT_VA: u64 = 0x0000_0100_06B0_0000;
 /// The sentinel NTSTATUS the synthetic handler returns after surviving the fault.
 pub const TEST_FAULT_STATUS: i32 = 0x600D_600Du32 as i32;
 const WIN32_CALLOUT_BATCH_FLUSH_OFF: u64 = 6 * 8;
+const WIN32_CALLOUT_JOB_OFF: u64 = 5 * 8;
 
 /// win32k `.data` global `gptiDesktopThread` (desktop.c:54) RVA. `IntGetAndReferenceClass(WC_DESKTOP,
 /// bDesktopThread=TRUE)` (class.c:1457) reads it as the desktop thread's THREADINFO — NULL in our host
@@ -463,6 +508,8 @@ const PROCESSINFO_HDESK_STARTUP_OFF: u64 = 0x110;
 const PROCESSINFO_PRPWINSTA_OFF: u64 = 0x220;
 const PROCESSINFO_HWINSTA_OFF: u64 = 0x228;
 const PROCESSINFO_AMWINSTA_OFF: u64 = 0x230;
+/// `PROCESSINFO.pW32Job`, immediately after `dwLpkEntryPoints` in the NT5/ReactOS layout.
+const PROCESSINFO_PW32JOB_OFF: u64 = 0x260;
 /// PROCESSINFO->HeapMappings (`win32.h`). The first embedded entry is the global USER heap; its
 /// `Next` chain holds per-desktop heap mappings for DesktopHeapGetUserDelta/DesktopHeapAddressToUser.
 const PROCESSINFO_HEAP_MAPPINGS_OFF: u64 = 0x340;
@@ -2133,16 +2180,204 @@ extern "win64" fn s_set_win32thread(thread: u64, w32thread: u64, old: u64) -> u6
     }
 }
 
-/// `PsEstablishWin32Callouts(PWIN32_CALLOUTS_FG CalloutData)` — record win32k's callout table
-/// (ProcessCallout, ThreadCallout, …) into persistent storage so the host can invoke win32k's own
-/// process-create callout when a client first attaches. The table is on win32k's stack; copy it.
+#[repr(C)]
+struct Win32JobCalloutParameters {
+    job: u64,
+    callout_type: u32,
+    _padding: u32,
+    data: u64,
+}
+
+pub const PS_W32_JOB_CALLOUT_SET_INFORMATION: u32 = 0;
+pub const PS_W32_JOB_CALLOUT_ADD_PROCESS: u32 = 1;
+pub const PS_W32_JOB_CALLOUT_TERMINATE: u32 = 2;
+/// Component-private inverse of `AddProcess`, used only if Ps publication rolls back or a real
+/// W32PROCESS is deleted before its EJOB.
+pub const PS_W32_JOB_CONTROL_REMOVE_PROCESS: u32 = 3;
+
+static mut WIN32_JOB_UI_POLICY: core::mem::MaybeUninit<nt_win32k_job::JobUiPolicyStore> =
+    core::mem::MaybeUninit::uninit();
+static mut WIN32_JOB_UI_POLICY_INITIALIZED: bool = false;
+
+unsafe fn win32_job_ui_policy() -> &'static mut nt_win32k_job::JobUiPolicyStore {
+    if !WIN32_JOB_UI_POLICY_INITIALIZED {
+        core::ptr::addr_of_mut!(WIN32_JOB_UI_POLICY)
+            .write(core::mem::MaybeUninit::new(
+                nt_win32k_job::JobUiPolicyStore::new(),
+            ));
+        WIN32_JOB_UI_POLICY_INITIALIZED = true;
+    }
+    (&mut *core::ptr::addr_of_mut!(WIN32_JOB_UI_POLICY)).assume_init_mut()
+}
+
+unsafe fn set_win32_job_information(job: u64, restrictions: u32) -> u32 {
+    let policy = win32_job_ui_policy();
+    let token = match policy.job_token(job) {
+        Some(token) => token,
+        None => {
+            let token = reclaiming_pool_alloc(16);
+            if token == 0 {
+                return nt_win32k_job::STATUS_INSUFFICIENT_RESOURCES;
+            }
+            write_volatile(token as *mut u64, job);
+            write_volatile((token + 8) as *mut u32, restrictions);
+            if let Err(status) = policy.register_job(job, token, restrictions) {
+                reclaiming_pool_free(token);
+                return status;
+            }
+            return nt_win32k_job::STATUS_SUCCESS;
+        }
+    };
+    let members = match policy.members(job) {
+        Ok(members) => members,
+        Err(status) => return status,
+    };
+    for &process in members {
+        let current = read_volatile((process + PROCESSINFO_PW32JOB_OFF) as *const u64);
+        if current != 0 && current != token {
+            return nt_win32k_job::STATUS_INVALID_PARAMETER;
+        }
+    }
+    match policy.set_restrictions(job, restrictions) {
+        Ok(()) => {
+            write_volatile((token + 8) as *mut u32, restrictions);
+            for &process in policy
+                .members(job)
+                .expect("registered win32k job remains live during its callout")
+            {
+                write_volatile(
+                    (process + PROCESSINFO_PW32JOB_OFF) as *mut u64,
+                    nt_win32k_job::process_job_token(restrictions, token),
+                );
+            }
+            nt_win32k_job::STATUS_SUCCESS
+        }
+        Err(status) => status,
+    }
+}
+
+unsafe fn add_process_to_win32_job(job: u64, process: u64) -> u32 {
+    let policy = win32_job_ui_policy();
+    let Some(token) = policy.job_token(job) else {
+        return nt_win32k_job::STATUS_INVALID_HANDLE;
+    };
+    let slot = (process + PROCESSINFO_PW32JOB_OFF) as *mut u64;
+    let current = read_volatile(slot);
+    if current != 0 && current != token {
+        return nt_win32k_job::STATUS_ACCESS_DENIED;
+    }
+    match policy.add_process(job, process) {
+        Ok(token) => {
+            let restrictions = match policy.restrictions(job) {
+                Ok(restrictions) => restrictions,
+                Err(status) => return status,
+            };
+            write_volatile(
+                slot,
+                nt_win32k_job::process_job_token(restrictions, token),
+            );
+            nt_win32k_job::STATUS_SUCCESS
+        }
+        Err(status) => status,
+    }
+}
+
+unsafe fn remove_process_from_win32_job(job: u64, process: u64) -> u32 {
+    let policy = win32_job_ui_policy();
+    let Some(token) = policy.job_token(job) else {
+        return nt_win32k_job::STATUS_SUCCESS;
+    };
+    if !policy.process_in_job(job, process) {
+        return nt_win32k_job::STATUS_SUCCESS;
+    }
+    let slot = (process + PROCESSINFO_PW32JOB_OFF) as *mut u64;
+    let current = read_volatile(slot);
+    if current != 0 && current != token {
+        return nt_win32k_job::STATUS_INVALID_PARAMETER;
+    }
+    match policy.remove_process(job, process) {
+        Ok(_) => {
+            write_volatile(slot, 0);
+            nt_win32k_job::STATUS_SUCCESS
+        }
+        Err(status) => status,
+    }
+}
+
+unsafe fn terminate_win32_job(job: u64) -> u32 {
+    let policy = win32_job_ui_policy();
+    if !policy.contains_job(job) {
+        return nt_win32k_job::STATUS_SUCCESS;
+    }
+    let removed = match policy.take_job(job) {
+        Ok(removed) => removed,
+        Err(status) => return status,
+    };
+    for process in removed.members {
+        let slot = (process + PROCESSINFO_PW32JOB_OFF) as *mut u64;
+        if read_volatile(slot) == removed.token {
+            write_volatile(slot, 0);
+        }
+    }
+    reclaiming_pool_free(removed.token);
+    nt_win32k_job::STATUS_SUCCESS
+}
+
+extern "win64" fn s_win32_job_callout(parameters: u64) -> i32 {
+    if parameters == 0 {
+        return nt_win32k_job::STATUS_INVALID_PARAMETER as i32;
+    }
+    unsafe {
+        let parameters = &*(parameters as *const Win32JobCalloutParameters);
+        let status = match parameters.callout_type {
+            PS_W32_JOB_CALLOUT_SET_INFORMATION => {
+                set_win32_job_information(parameters.job, parameters.data as u32)
+            }
+            PS_W32_JOB_CALLOUT_ADD_PROCESS => {
+                add_process_to_win32_job(parameters.job, parameters.data)
+            }
+            PS_W32_JOB_CALLOUT_TERMINATE => terminate_win32_job(parameters.job),
+            _ => nt_win32k_job::STATUS_INVALID_PARAMETER,
+        };
+        status as i32
+    }
+}
+
+/// `PsEstablishWin32Callouts(PWIN32_CALLOUTS_FG CalloutData)` — compose and publish win32k's
+/// callout table. ReactOS leaves `JobCallout` empty; this component supplies that missing provider
+/// as part of its win32k personality rather than teaching the executive GUI policy.
 extern "win64" fn s_establish_win32_callouts(callout_data: u64) -> i32 {
     if callout_data != 0 {
         unsafe {
+            let _ = win32_job_ui_policy();
             for i in 0..(0x100u64 / 8) {
                 let v = read_volatile((callout_data + i * 8) as *const u64);
                 write_volatile((WIN32_CALLOUTS + i * 8) as *mut u64, v);
             }
+            let job_callout = s_win32_job_callout as *const () as usize as u64;
+            write_volatile(
+                (WIN32_CALLOUTS + WIN32_CALLOUT_JOB_OFF) as *mut u64,
+                job_callout,
+            );
+            let sh = WIN32K_SHARED_VADDR;
+            write_volatile((sh + SH_CALLOUT_TABLE) as *mut u64, WIN32_CALLOUTS);
+            write_volatile(
+                (sh + SH_CALLOUT_PROCESS) as *mut u64,
+                read_volatile(WIN32_CALLOUTS as *const u64),
+            );
+            write_volatile(
+                (sh + SH_CALLOUT_THREAD) as *mut u64,
+                read_volatile((WIN32_CALLOUTS + 8) as *const u64),
+            );
+            write_volatile(
+                (sh + SH_CALLOUT_GLOBAL_ATOM) as *mut u64,
+                read_volatile((WIN32_CALLOUTS + 2 * 8) as *const u64),
+            );
+            write_volatile((sh + SH_CALLOUT_JOB) as *mut u64, job_callout);
+            write_volatile(
+                (sh + SH_CALLOUT_BATCH_FLUSH) as *mut u64,
+                read_volatile((WIN32_CALLOUTS + WIN32_CALLOUT_BATCH_FLUSH_OFF) as *const u64),
+            );
         }
     }
     0
@@ -10729,6 +10964,13 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     let a1 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A1) as *const u64);
     let a2 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A2) as *const u64);
     let a3 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A3) as *const u64);
+    // Ps invokes the registered JobCallout as an executive-to-provider operation. It owns no
+    // calling GUI thread and must not inherit or manufacture a client win32 context merely to
+    // update win32k-owned job policy.
+    if ssn == SSN_WIN32_JOB_CALLOUT {
+        let result = dispatch_win32_job_callout(a0, a1 as u32, a2);
+        return (result as u32 as i32, result);
+    }
     let output_stage_valid = a0 >= WIN32K_MESSAGE_STAGE_BASE
         && a0 < WIN32K_MESSAGE_STAGE_BASE + 0x1000
         && (a0 - WIN32K_MESSAGE_STAGE_BASE) % WIN32K_MESSAGE_STAGE_SLOT_BYTES == 0;
@@ -10888,6 +11130,8 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         TEST_FAULT_STATUS as u32 as u64
     } else if ssn == SSN_GDI_BATCH_FLUSH_CALLOUT {
         dispatch_gdi_batch_flush_callout(client_pi, client_teb)
+    } else if let Some(denied_result) = enforce_win32_job_ui_policy(ssn, a0, a1) {
+        denied_result
     } else {
         dispatch_ssn(ssn, a0, a1, a2, a3)
     };
@@ -10953,6 +11197,67 @@ unsafe fn dispatch_gdi_batch_flush_callout(client_pi: u64, client_teb: u64) -> u
 
     let flush: extern "win64" fn() -> i32 = core::mem::transmute(routine as *const ());
     flush() as u32 as u64
+}
+
+unsafe fn dispatch_win32_job_callout(job: u64, callout_type: u32, data: u64) -> u64 {
+    if callout_type == PS_W32_JOB_CONTROL_REMOVE_PROCESS {
+        return remove_process_from_win32_job(job, data) as u64;
+    }
+    let routine = read_volatile((WIN32_CALLOUTS + WIN32_CALLOUT_JOB_OFF) as *const u64);
+    if routine == 0 {
+        return 0xC000_00A3u32 as u64;
+    }
+    let parameters = Win32JobCalloutParameters {
+        job,
+        callout_type,
+        _padding: 0,
+        data,
+    };
+    let callout: extern "win64" fn(u64) -> i32 = core::mem::transmute(routine as *const ());
+    callout(core::ptr::addr_of!(parameters) as u64) as u32 as u64
+}
+
+fn restricted_ui_operation(ssn: u64, a0: u64, a1: u64) -> Option<nt_win32k_job::UiOperation> {
+    use nt_win32k_job::UiOperation;
+
+    match ssn {
+        // Clipboard data and observable clipboard state.
+        0x102E | 0x1055 | 0x10CD | 0x10DC | 0x10ED | 0x10FD | 0x1115 | 0x1241
+        | 0x124F => Some(UiOperation::ReadClipboard),
+        // Clipboard mutations. Open/CloseClipboard remain available so a process restricted in
+        // only one direction can still use the permitted direction.
+        0x10D5 | 0x10FC | 0x111F | 0x1121 => Some(UiOperation::WriteClipboard),
+        // NtUserSystemParametersInfo: queries remain legal; only the NT5 SPI_SET surface is denied.
+        0x1041 if nt_win32k_job::is_system_parameter_write(a0 as u32) => {
+            Some(UiOperation::ChangeSystemParameters)
+        }
+        0x122A => Some(UiOperation::ChangeDisplaySettings),
+        // Registered window messages and atom-name queries use the session global atom namespace.
+        0x1036 | 0x10AD => Some(UiOperation::AccessGlobalAtoms),
+        // The NT contract restricts desktop creation and switching, not ordinary open/query use.
+        SSN_NT_USER_CREATE_DESKTOP | SSN_NT_USER_SWITCH_DESKTOP => {
+            Some(UiOperation::CreateOrSwitchDesktop)
+        }
+        // NtUserSetInformationThread(Thread, UserThreadInitiateShutdown, ...).
+        0x10E5 if a1 as u32 == 5 => Some(UiOperation::ExitWindows),
+        _ => None,
+    }
+}
+
+/// Return the API-appropriate failure value when the current W32PROCESS is denied by its job.
+unsafe fn enforce_win32_job_ui_policy(ssn: u64, a0: u64, a1: u64) -> Option<u64> {
+    let operation = restricted_ui_operation(ssn, a0, a1)?;
+    let process = current_w32process();
+    if process == 0 || win32_job_ui_policy().operation_allowed(process, operation) {
+        return None;
+    }
+    Some(match operation {
+        nt_win32k_job::UiOperation::ChangeDisplaySettings => u32::MAX as u64,
+        nt_win32k_job::UiOperation::ExitWindows => {
+            nt_win32k_job::STATUS_ACCESS_DENIED as u64
+        }
+        _ => 0,
+    })
 }
 
 fn expected_gdi_return_type(ssn: u64) -> Option<u32> {

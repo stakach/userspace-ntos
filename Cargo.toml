@@ -89,6 +89,7 @@ members = [
     "crates/nt-rtl-work-item",
     "crates/nt-rtl-timer-wait",
     "crates/nt-user-callback",
+    "crates/nt-win32k-job",
     "crates/nt-syscall-abi",
     "crates/nt-ntdll-layout",
     "crates/nt-ntdll",
@@ -193,6 +194,7 @@ nt-thread-start = { path = "crates/nt-thread-start" }
 nt-rtl-work-item = { path = "crates/nt-rtl-work-item" }
 nt-rtl-timer-wait = { path = "crates/nt-rtl-timer-wait" }
 nt-user-callback = { path = "crates/nt-user-callback" }
+nt-win32k-job = { path = "crates/nt-win32k-job" }
 nt-syscall-abi = { path = "crates/nt-syscall-abi" }
 nt-ntdll-layout = { path = "crates/nt-ntdll-layout" }
 nt-ntdll = { path = "crates/nt-ntdll" }

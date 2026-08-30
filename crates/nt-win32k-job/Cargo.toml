@@ -1,0 +1,11 @@
+[package]
+name = "nt-win32k-job"
+description = "Host-testable win32k policy for NT job-object UI restrictions and W32PROCESS membership."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

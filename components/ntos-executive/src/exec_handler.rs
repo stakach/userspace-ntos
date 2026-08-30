@@ -2873,6 +2873,110 @@ fn zeroed_temporary_process_slot_vec() -> alloc::vec::Vec<nt_process::ProcessId>
     slots
 }
 
+fn dispatch_win32_job_callout_for_manager(
+    pm: &mut nt_process::ProcessManager,
+    id: nt_process::job::JobId,
+    callout_type: u32,
+    data: u64,
+) -> Result<(), u32> {
+    let registered = win32k_subsystem::registered_win32k_callouts()
+        .ok_or(STATUS_DEVICE_NOT_READY)?;
+    let callouts = match pm.win32_callouts() {
+        Some(current) if current == registered => current,
+        Some(_) => return Err(nt_process::STATUS_INVALID_PARAMETER),
+        None => {
+            debug_assert!(pm.establish_win32_callouts(registered).is_none());
+            registered
+        }
+    };
+    if callouts.job_callout == 0 {
+        return Err(STATUS_DEVICE_NOT_READY);
+    }
+    let (status, completed) = unsafe {
+        win32k_glue::win32k_dispatch(
+            win32k_subsystem::SSN_WIN32_JOB_CALLOUT,
+            id as u64,
+            callout_type as u64,
+            data,
+            0,
+        )
+    };
+    if !completed {
+        return Err(STATUS_DEVICE_NOT_READY);
+    }
+    match status as u32 {
+        0 => Ok(()),
+        status => Err(status),
+    }
+}
+
+pub(crate) fn win32_job_callout_selftest() -> u64 {
+    let mut pm = nt_process::ProcessManager::new();
+    let Ok(job) = pm.create_job(0) else {
+        return 0;
+    };
+    let mut proof = 0u64;
+    let restrictions = nt_process::job::JOB_OBJECT_UI_VALID_FLAGS;
+    if let Ok(plan) = pm.prepare_job_ui_restrictions(job, restrictions) {
+        if dispatch_win32_job_callout_for_manager(
+            &mut pm,
+            job,
+            win32k_subsystem::PS_W32_JOB_CALLOUT_SET_INFORMATION,
+            restrictions as u64,
+        )
+        .is_ok()
+        {
+            proof |= 0x01;
+            if pm.job_ui_restrictions(job) == Ok(0) {
+                proof |= 0x02;
+            }
+            if pm.commit_job_ui_restrictions(plan).is_ok()
+                && pm.job_ui_restrictions(job) == Ok(restrictions)
+            {
+                proof |= 0x04;
+            }
+        }
+    }
+    if let Ok(plan) = pm.prepare_job_ui_restrictions(job, 0) {
+        if dispatch_win32_job_callout_for_manager(
+            &mut pm,
+            job,
+            win32k_subsystem::PS_W32_JOB_CALLOUT_SET_INFORMATION,
+            0,
+        )
+        .is_ok()
+        {
+            proof |= 0x08;
+            if pm.commit_job_ui_restrictions(plan).is_ok()
+                && pm.job_ui_restrictions(job) == Ok(0)
+            {
+                proof |= 0x10;
+            }
+        }
+    }
+    if pm.discard_unreferenced_job(job) {
+        proof |= 0x20;
+    }
+    if let Some(destruction) = pm.take_job_destruction() {
+        if destruction.id == job
+            && destruction.released_completion_port.is_none()
+            && dispatch_win32_job_callout_for_manager(
+                &mut pm,
+                destruction.id,
+                win32k_subsystem::PS_W32_JOB_CALLOUT_TERMINATE,
+                0,
+            )
+            .is_ok()
+            && !pm.job_exists(job)
+        {
+            proof |= 0x40;
+        } else {
+            let _ = pm.restore_job_destruction(destruction);
+        }
+    }
+    proof
+}
+
 impl ExecNtHandler {
     unsafe fn reserve_pending_file_io_owner(&mut self) -> bool {
         assert!(
@@ -19405,6 +19509,15 @@ impl ExecNtHandler {
             return false;
         }
 
+        if let Some(w32process) = self.pm.process_win32(pid) {
+            if self
+                .remove_process_win32_job_membership(pid, w32process)
+                .is_err()
+            {
+                return false;
+            }
+        }
+
         let thread_count = self
             .pm
             .process(pid)
@@ -22826,8 +22939,64 @@ impl ExecNtHandler {
         }
     }
 
+    fn dispatch_win32_job_callout(
+        &mut self,
+        id: nt_process::job::JobId,
+        callout_type: u32,
+        data: u64,
+    ) -> Result<(), u32> {
+        dispatch_win32_job_callout_for_manager(&mut self.pm, id, callout_type, data)
+    }
+
+    pub(crate) fn publish_process_win32_job_membership(
+        &mut self,
+        pid: nt_process::ProcessId,
+        w32process: u64,
+    ) -> Result<(), u32> {
+        let Some(job) = self.pm.process_job(pid) else {
+            return Ok(());
+        };
+        if self.pm.job_ui_restrictions(job)? == 0 {
+            return Ok(());
+        }
+        self.dispatch_win32_job_callout(
+            job,
+            win32k_subsystem::PS_W32_JOB_CALLOUT_ADD_PROCESS,
+            w32process,
+        )
+    }
+
+    fn remove_process_win32_job_membership(
+        &mut self,
+        pid: nt_process::ProcessId,
+        w32process: u64,
+    ) -> Result<(), u32> {
+        let Some(job) = self.pm.process_job(pid) else {
+            return Ok(());
+        };
+        self.dispatch_win32_job_callout(
+            job,
+            win32k_subsystem::PS_W32_JOB_CONTROL_REMOVE_PROCESS,
+            w32process,
+        )
+    }
+
     fn drain_job_destructions(&mut self) {
         while let Some(destruction) = self.pm.take_job_destruction() {
+            if let Err(status) = self.dispatch_win32_job_callout(
+                destruction.id,
+                win32k_subsystem::PS_W32_JOB_CALLOUT_TERMINATE,
+                0,
+            ) {
+                print_str(b"[ps-job] win32k job rundown retained id=");
+                print_u64(destruction.id as u64);
+                print_str(b" status=0x");
+                print_hex(status);
+                print_str(b"\n");
+                let restored = self.pm.restore_job_destruction(destruction);
+                debug_assert!(restored);
+                break;
+            }
             if let Some(association) = destruction.released_completion_port {
                 let _ = self.io_completion_ports.release(association.port_id);
             }
@@ -23263,12 +23432,46 @@ impl ExecNtHandler {
             .accounting(pid)
             .expect("registered process has MM commit accounting")
             .current_bytes;
-        let status = match self
+        let assignment = match self
             .pm
-            .assign_process_to_job_with_commit(id, pid, initial_commit_bytes)
+            .prepare_process_job_assignment(id, pid, initial_commit_bytes)
         {
-            Ok(status) => status,
+            Ok(assignment) => assignment,
             Err(status) => return status,
+        };
+        let mut win32_member_prepared = false;
+        let ui_restrictions = match self.pm.job_ui_restrictions(id) {
+            Ok(restrictions) => restrictions,
+            Err(status) => return status,
+        };
+        if assignment.status() == 0 && ui_restrictions != 0 {
+            if let Some(w32process) = self.pm.process_win32(pid) {
+                if let Err(status) = self.dispatch_win32_job_callout(
+                    id,
+                    win32k_subsystem::PS_W32_JOB_CALLOUT_ADD_PROCESS,
+                    w32process,
+                ) {
+                    return status;
+                }
+                win32_member_prepared = true;
+            }
+        }
+        let status = match self.pm.commit_process_job_assignment(assignment) {
+            Ok(status) => status,
+            Err(status) => {
+                if win32_member_prepared {
+                    if let Some(w32process) = self.pm.process_win32(pid) {
+                        if let Err(rollback_status) = self.dispatch_win32_job_callout(
+                            id,
+                            win32k_subsystem::PS_W32_JOB_CONTROL_REMOVE_PROCESS,
+                            w32process,
+                        ) {
+                            return rollback_status;
+                        }
+                    }
+                }
+                return status;
+            }
         };
         if status == 0 {
             self.sync_process_commit_limit(pid)
@@ -23560,12 +23763,61 @@ impl ExecNtHandler {
             }
             nt_process::job_abi::JobInformationClass::BasicUiRestrictions => {
                 let value = u32::from_le_bytes(input[..4].try_into().unwrap());
-                if value != 0 {
-                    return STATUS_NOT_SUPPORTED;
+                let plan = match self.pm.prepare_job_ui_restrictions(id, value) {
+                    Ok(plan) => plan,
+                    Err(status) => return status,
+                };
+                if plan.previous() == plan.restrictions() {
+                    return 0;
                 }
-                self.pm
-                    .set_job_ui_restrictions(id, value)
-                    .map_or_else(|status| status, |()| 0)
+                if let Err(status) = self.dispatch_win32_job_callout(
+                    id,
+                    win32k_subsystem::PS_W32_JOB_CALLOUT_SET_INFORMATION,
+                    value as u64,
+                ) {
+                    return status;
+                }
+                if value != 0 {
+                    let pids = match self.pm.job_active_process_ids_owned(id) {
+                        Ok(pids) => pids,
+                        Err(status) => {
+                            let rollback = self.dispatch_win32_job_callout(
+                                id,
+                                win32k_subsystem::PS_W32_JOB_CALLOUT_SET_INFORMATION,
+                                plan.previous() as u64,
+                            );
+                            return rollback.err().unwrap_or(status);
+                        }
+                    };
+                    for pid in pids {
+                        let Some(w32process) = self.pm.process_win32(pid) else {
+                            continue;
+                        };
+                        if let Err(status) = self.dispatch_win32_job_callout(
+                            id,
+                            win32k_subsystem::PS_W32_JOB_CALLOUT_ADD_PROCESS,
+                            w32process,
+                        ) {
+                            let rollback = self.dispatch_win32_job_callout(
+                                id,
+                                win32k_subsystem::PS_W32_JOB_CALLOUT_SET_INFORMATION,
+                                plan.previous() as u64,
+                            );
+                            return rollback.err().unwrap_or(status);
+                        }
+                    }
+                }
+                match self.pm.commit_job_ui_restrictions(plan) {
+                    Ok(()) => 0,
+                    Err(status) => {
+                        let rollback = self.dispatch_win32_job_callout(
+                            id,
+                            win32k_subsystem::PS_W32_JOB_CALLOUT_SET_INFORMATION,
+                            plan.previous() as u64,
+                        );
+                        rollback.err().unwrap_or(status)
+                    }
+                }
             }
             nt_process::job_abi::JobInformationClass::SecurityLimit => {
                 let value = u32::from_le_bytes(input[..4].try_into().unwrap());

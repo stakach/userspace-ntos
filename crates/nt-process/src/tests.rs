@@ -1960,6 +1960,8 @@ fn win32_callouts_established_once() {
         process_callout: 0xFFFF_F800_0020_1000,
         thread_callout: 0xFFFF_F800_0020_2000,
         global_atom_callout: 0xFFFF_F800_0020_3000,
+        job_callout: 0xFFFF_F800_0020_4000,
+        batch_flush_callout: 0xFFFF_F800_0020_5000,
     };
     // First establish returns no prior registration.
     assert_eq!(pm.establish_win32_callouts(c), None);
@@ -4170,6 +4172,83 @@ fn assigning_existing_process_applies_lower_process_memory_limit_for_future_grow
         Ok(STATUS_SUCCESS)
     );
     assert_eq!(pm.job_memory_usage(process), Ok((0x3000, 0x3000)));
+}
+
+#[test]
+fn job_assignment_plan_reserves_without_publishing_and_rejects_stale_commit() {
+    let mut pm = ProcessManager::new();
+    let first = pm.create_process("job-plan-first.exe", None, None);
+    let second = pm.create_process("job-plan-second.exe", None, None);
+    let job = pm.create_job(0).unwrap();
+
+    let stale = pm
+        .prepare_process_job_assignment(job, first, 0x2000)
+        .unwrap();
+    assert_eq!(stale.status(), STATUS_SUCCESS);
+    assert_eq!(pm.process_job(first), None);
+    assert_eq!(pm.job_accounting(job).unwrap().total_processes, 0);
+
+    let current = pm
+        .prepare_process_job_assignment(job, second, 0x1000)
+        .unwrap();
+    assert_eq!(
+        pm.commit_process_job_assignment(current),
+        Ok(STATUS_SUCCESS)
+    );
+    assert_eq!(pm.process_job(second), Some(job));
+    assert_eq!(
+        pm.commit_process_job_assignment(stale),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(pm.process_job(first), None);
+    assert_eq!(pm.job_accounting(job).unwrap().total_processes, 1);
+}
+
+#[test]
+fn job_assignment_plan_cannot_publish_a_terminated_process() {
+    let mut pm = ProcessManager::new();
+    let process = pm.create_process("job-plan-terminated.exe", None, None);
+    let job = pm.create_job(0).unwrap();
+    let plan = pm
+        .prepare_process_job_assignment(job, process, 0x1000)
+        .unwrap();
+
+    pm.terminate_process(process, 0).unwrap();
+    assert_eq!(
+        pm.commit_process_job_assignment(plan),
+        Err(STATUS_PROCESS_IS_TERMINATING)
+    );
+    assert_eq!(pm.process_job(process), None);
+    assert_eq!(pm.job_accounting(job).unwrap().total_processes, 0);
+}
+
+#[test]
+fn job_ui_restriction_plan_is_invisible_until_generation_checked_commit() {
+    let mut pm = ProcessManager::new();
+    let job = pm.create_job(0).unwrap();
+    let stale = pm
+        .prepare_job_ui_restrictions(job, job::JOB_OBJECT_UI_VALID_FLAGS)
+        .unwrap();
+    assert_eq!(stale.previous(), 0);
+    assert_eq!(stale.restrictions(), job::JOB_OBJECT_UI_VALID_FLAGS);
+    assert_eq!(pm.job_ui_restrictions(job), Ok(0));
+
+    let clear = pm.prepare_job_ui_restrictions(job, 0).unwrap();
+    pm.commit_job_ui_restrictions(clear).unwrap();
+    assert_eq!(
+        pm.commit_job_ui_restrictions(stale),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(pm.job_ui_restrictions(job), Ok(0));
+
+    let current = pm
+        .prepare_job_ui_restrictions(job, job::JOB_OBJECT_UI_VALID_FLAGS)
+        .unwrap();
+    pm.commit_job_ui_restrictions(current).unwrap();
+    assert_eq!(
+        pm.job_ui_restrictions(job),
+        Ok(job::JOB_OBJECT_UI_VALID_FLAGS)
+    );
 }
 
 #[test]

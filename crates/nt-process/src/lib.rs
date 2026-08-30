@@ -951,6 +951,10 @@ pub struct Win32Callouts {
     pub thread_callout: u64,
     /// `GlobalAtomTableCallout` — returns the per-session atom table.
     pub global_atom_callout: u64,
+    /// `JobCallout` — publishes job UI policy and W32PROCESS membership to win32k.
+    pub job_callout: u64,
+    /// `BatchFlushRoutine` — drains the current thread's GDI user batch.
+    pub batch_flush_callout: u64,
 }
 
 /// The Process Manager: processes, threads, and image sections (spec §5, §9-§13).
@@ -3334,6 +3338,10 @@ impl ProcessManager {
         self.jobs.take_destruction()
     }
 
+    pub fn restore_job_destruction(&mut self, destruction: job::JobDestruction) -> bool {
+        self.jobs.restore_destruction(destruction)
+    }
+
     pub fn assign_process_to_job(&mut self, id: job::JobId, pid: ProcessId) -> Result<u32, u32> {
         self.assign_process_to_job_with_commit(id, pid, 0)
     }
@@ -3344,14 +3352,36 @@ impl ProcessManager {
         pid: ProcessId,
         initial_commit_bytes: u64,
     ) -> Result<u32, u32> {
+        let plan = self.prepare_process_job_assignment(id, pid, initial_commit_bytes)?;
+        self.commit_process_job_assignment(plan)
+    }
+
+    pub fn prepare_process_job_assignment(
+        &mut self,
+        id: job::JobId,
+        pid: ProcessId,
+        initial_commit_bytes: u64,
+    ) -> Result<job::JobAssignmentPlan, u32> {
         let process = self.process(pid).ok_or(STATUS_INVALID_HANDLE)?;
         if process.state == ProcessState::Terminated {
             return Err(STATUS_PROCESS_IS_TERMINATING);
         }
         let session_id = process.session_id;
-        let assignment = self
-            .jobs
-            .assign(id, pid, session_id, initial_commit_bytes)?;
+        self.jobs
+            .prepare_assignment(id, pid, session_id, initial_commit_bytes)
+    }
+
+    pub fn commit_process_job_assignment(
+        &mut self,
+        plan: job::JobAssignmentPlan,
+    ) -> Result<u32, u32> {
+        let id = plan.job_id();
+        let pid = plan.process_id();
+        let process = self.process(pid).ok_or(STATUS_INVALID_HANDLE)?;
+        if process.state == ProcessState::Terminated {
+            return Err(STATUS_PROCESS_IS_TERMINATING);
+        }
+        let assignment = self.jobs.commit_assignment(plan)?;
         self.jobs.queue_notification(assignment.notification);
         if assignment.status == STATUS_SUCCESS {
             self.apply_job_limits_to_process(id, pid)?;
@@ -3576,6 +3606,21 @@ impl ProcessManager {
         restrictions: u32,
     ) -> Result<(), u32> {
         self.jobs.set_ui_restrictions(id, restrictions)
+    }
+
+    pub fn prepare_job_ui_restrictions(
+        &self,
+        id: job::JobId,
+        restrictions: u32,
+    ) -> Result<job::JobUiRestrictionPlan, u32> {
+        self.jobs.prepare_ui_restrictions(id, restrictions)
+    }
+
+    pub fn commit_job_ui_restrictions(
+        &mut self,
+        plan: job::JobUiRestrictionPlan,
+    ) -> Result<(), u32> {
+        self.jobs.commit_ui_restrictions(plan)
     }
 
     pub fn job_security_limits(&self, id: job::JobId) -> Result<u32, u32> {

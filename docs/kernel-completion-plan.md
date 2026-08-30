@@ -17361,3 +17361,45 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     executive shadow state. After that, connect token restrictions through the Security Manager. Keep
     `JOB_OBJECT_LIMIT_WORKINGSET` disabled until Memory Manager has resident-set accounting, trimming,
     and pageout.
+
+    Registered Win32 job-callout transaction and direct UI policy checkpoint (2026-08-30, accepted;
+    exact atom/handle semantics remain): win32k now composes the missing ReactOS `JobCallout` into the
+    provider-owned `WIN32_CALLOUTS_FPNS` table established through `PsEstablishWin32Callouts`. The
+    executive discovers the complete registered callout metadata from the shared provider ABI and
+    re-enters win32k through one private kernel-to-provider selector; it has no linked win32k routine,
+    executable identity, or permissive fallback. Job callouts bypass GUI-client context construction
+    because they are executive-to-provider operations rather than user syscalls.
+
+    Ps owns job identities, membership, and the authoritative restriction mask. UI updates and process
+    assignment now use generation-checked prepare/commit plans: win32k reserves or updates its policy
+    first, Ps remains unchanged until the provider succeeds, and every later Ps failure invokes the
+    inverse provider operation. Existing W32PROCESS members are attached when restrictions are enabled,
+    inherited membership is published when the real W32PROCESS appears, final process deletion removes
+    that membership, and EJOB rundown invokes the provider before the destruction record is retired.
+    Failed rundown restores the exact Ps destruction record rather than copying it into a parallel retry
+    queue.
+
+    The focused no-std `nt-win32k-job` owner stores growable stable job/member policy and classifies all
+    eight NT5 UI flags. Win32k publishes `PROCESSINFO.pW32Job` only for handle isolation and directly
+    enforces clipboard reads/writes, system-parameter mutations, display changes, desktop create/switch,
+    and exit-windows entry points. The native UI setter now accepts nonzero masks only through this
+    transaction; invalid masks and unavailable/mismatched providers fail without partial Ps state.
+    Focused validation passes `nt-win32k-job` `6/6` and `nt-process` `144/144`; formatting,
+    `git diff --check`, and the freestanding executive check pass at the established 209-warning
+    baseline.
+
+    Serialized proof `.tmp/run-headless-job-ui-gate-20260830.log` records the provider transaction as
+    `0x7f/0x7f`, dynamically launches userinit and Explorer, completes 668 real api0 redirects with zero
+    callback failures, installs 18 client WndProcs without replay, reaches Explorer paint begin/end
+    `5/20` with 187 direct GDI returns and 135 batch flushes covering 184 records, paints
+    `480000/480000` framebuffer pixels with at least 32 colours, passes all `297/297` checks, and matches
+    the sentinel.
+
+    Review adjustment: the callout transport, two-phase Ps/provider publication, membership lifecycle,
+    and direct restriction classes are closed. Do not yet call the whole UI restriction surface complete:
+    `JOB_OBJECT_UILIMIT_GLOBALATOMS` must select a persistent job-private atom namespace rather than deny
+    atom APIs, and `JOB_OBJECT_UILIMIT_HANDLES` must add the real `UserHandleGrantAccess` exception plus
+    job-scoped broadcast/hook behavior around win32k's existing `pW32Job` validation. Complete those
+    provider-owned semantics next, including teardown and host tests, then connect token restrictions
+    through the Security Manager. Working-set limits remain disabled until real resident trimming and
+    pageout exist.
