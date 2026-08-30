@@ -5,13 +5,12 @@ use alloc::vec::Vec;
 pub(crate) enum HostedPnpStartTrace {
     BootService,
     DemandStart,
-    HardwareProof,
+    ConfigPnp,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct HostedPnpStartOptions {
     pub(crate) trace: HostedPnpStartTrace,
-    pub(crate) inject_test_interrupt: bool,
     reuse_existing_stack: bool,
 }
 
@@ -19,7 +18,6 @@ impl HostedPnpStartOptions {
     pub(crate) const fn boot_service() -> Self {
         Self {
             trace: HostedPnpStartTrace::BootService,
-            inject_test_interrupt: false,
             reuse_existing_stack: false,
         }
     }
@@ -27,15 +25,13 @@ impl HostedPnpStartOptions {
     pub(crate) const fn demand_start() -> Self {
         Self {
             trace: HostedPnpStartTrace::DemandStart,
-            inject_test_interrupt: false,
             reuse_existing_stack: false,
         }
     }
 
-    pub(crate) const fn hardware_proof() -> Self {
+    pub(crate) const fn config_pnp() -> Self {
         Self {
-            trace: HostedPnpStartTrace::HardwareProof,
-            inject_test_interrupt: true,
+            trace: HostedPnpStartTrace::ConfigPnp,
             reuse_existing_stack: false,
         }
     }
@@ -43,7 +39,6 @@ impl HostedPnpStartOptions {
     pub(crate) const fn rebalance() -> Self {
         Self {
             trace: HostedPnpStartTrace::DemandStart,
-            inject_test_interrupt: false,
             reuse_existing_stack: true,
         }
     }
@@ -58,11 +53,9 @@ pub(crate) struct HostedPnpStartReport {
     pub(crate) mmio_mapped: bool,
     pub(crate) interrupt_connected: bool,
     pub(crate) interrupt_delivered: bool,
-    pub(crate) interrupt_acknowledged: bool,
     pub(crate) dpc_delivered: bool,
     pub(crate) dma_adapter: bool,
     pub(crate) dma_common: bool,
-    pub(crate) dma_packet_descriptors: bool,
     pub(crate) io_port_out32: bool,
     pub(crate) root_started: bool,
     pub(crate) video_route_published: bool,
@@ -78,31 +71,9 @@ pub(crate) struct HostedPnpStartReport {
     pub(crate) mmio_mapped_count: u64,
     pub(crate) interrupt_connected_count: u64,
     pub(crate) interrupt_delivered_count: u64,
-    pub(crate) interrupt_acknowledged_count: u64,
     pub(crate) dpc_delivered_count: u64,
     pub(crate) dma_adapter_count: u64,
     pub(crate) dma_common_count: u64,
-    pub(crate) dma_packet_descriptor_count: u64,
-    pub(crate) dma_packet_descriptor_common_count: u64,
-    pub(crate) dma_packet_descriptor_mapping_count: u64,
-    pub(crate) dma_packet_descriptor_completed_mapping_count: u64,
-    pub(crate) dma_device_tx_completion_count: u64,
-    pub(crate) dma_device_rx_completion_count: u64,
-    pub(crate) dma_device_interrupt_cause_count: u64,
-    pub(crate) dma_device_model_failure_count: u64,
-    pub(crate) dma_tx_window_observation_count: u64,
-    pub(crate) dma_tx_window_enabled_count: u64,
-    pub(crate) dma_tx_window_ring_ready_count: u64,
-    pub(crate) dma_tx_window_posted_count: u64,
-    pub(crate) dma_tx_window_idle_count: u64,
-    pub(crate) dma_tx_descriptor_candidate_count: u64,
-    pub(crate) dma_tx_descriptor_map_candidate_count: u64,
-    pub(crate) dma_tx_descriptor_done_seen_count: u64,
-    pub(crate) dma_tx_last_candidate_address: u64,
-    pub(crate) dma_tx_last_candidate_len: u64,
-    pub(crate) dma_tx_last_candidate_status: u64,
-    pub(crate) dma_tx_last_head: u64,
-    pub(crate) dma_tx_last_tail: u64,
     pub(crate) io_port_out32_count: u64,
     pub(crate) root_started_count: u64,
     pub(crate) video_route_attempted_count: u64,
@@ -120,11 +91,9 @@ impl HostedPnpStartReport {
         self.mmio_mapped |= other.mmio_mapped;
         self.interrupt_connected |= other.interrupt_connected;
         self.interrupt_delivered |= other.interrupt_delivered;
-        self.interrupt_acknowledged |= other.interrupt_acknowledged;
         self.dpc_delivered |= other.dpc_delivered;
         self.dma_adapter |= other.dma_adapter;
         self.dma_common |= other.dma_common;
-        self.dma_packet_descriptors |= other.dma_packet_descriptors;
         self.io_port_out32 |= other.io_port_out32;
         self.root_started |= other.root_started;
         self.video_route_published |= other.video_route_published;
@@ -146,42 +115,14 @@ impl HostedPnpStartReport {
             mmio_mapped_count,
             interrupt_connected_count,
             interrupt_delivered_count,
-            interrupt_acknowledged_count,
             dpc_delivered_count,
             dma_adapter_count,
             dma_common_count,
-            dma_packet_descriptor_count,
-            dma_packet_descriptor_common_count,
-            dma_packet_descriptor_mapping_count,
-            dma_packet_descriptor_completed_mapping_count,
-            dma_device_tx_completion_count,
-            dma_device_rx_completion_count,
-            dma_device_interrupt_cause_count,
-            dma_device_model_failure_count,
-            dma_tx_window_observation_count,
-            dma_tx_window_enabled_count,
-            dma_tx_window_ring_ready_count,
-            dma_tx_window_posted_count,
-            dma_tx_window_idle_count,
-            dma_tx_descriptor_candidate_count,
-            dma_tx_descriptor_map_candidate_count,
-            dma_tx_descriptor_done_seen_count,
             io_port_out32_count,
             root_started_count,
             video_route_attempted_count,
             video_route_published_count,
         );
-        if other.dma_tx_descriptor_candidate_count != 0
-            || other.dma_tx_descriptor_done_seen_count != 0
-        {
-            self.dma_tx_last_candidate_address = other.dma_tx_last_candidate_address;
-            self.dma_tx_last_candidate_len = other.dma_tx_last_candidate_len;
-            self.dma_tx_last_candidate_status = other.dma_tx_last_candidate_status;
-        }
-        if other.dma_tx_window_observation_count != 0 {
-            self.dma_tx_last_head = other.dma_tx_last_head;
-            self.dma_tx_last_tail = other.dma_tx_last_tail;
-        }
         if self.first_error == 0 {
             self.first_error = other.first_error;
         }
@@ -1886,9 +1827,6 @@ unsafe fn finish_started_devnode(
     }
     let status_raw = status.raw() as u32;
     print_start_status(options.trace, service_name, instance_id, status_raw);
-    if options.inject_test_interrupt && status.is_success() {
-        inject_proof_interrupt(device_id, options.trace, service_name, instance_id, report);
-    }
     collect_hardware_evidence(
         device_id,
         options.trace,
@@ -1956,77 +1894,6 @@ unsafe fn try_publish_hosted_video_route(
     print_hosted_video_route_published(service_name, instance_id, device_id, published);
 }
 
-unsafe fn inject_proof_interrupt(
-    device_id: u64,
-    trace: HostedPnpStartTrace,
-    service_name: &str,
-    instance_id: &str,
-    report: &mut HostedPnpStartReport,
-) {
-    if let Some(evidence) = driver_launch::hosted_hardware_evidence(device_id) {
-        if evidence.interrupt_connected()
-            && (evidence.mmio_mapped() || evidence.io_port_out32_serviced())
-        {
-            let ack_window = root_window_for_evidence(device_id, evidence);
-            if let Some(ref window) = ack_window {
-                core::ptr::write_volatile(
-                    (window.mmio_seed_va + ROOT_DMA_PROOF_INTERRUPT_ACK_OFFSET) as *mut u32,
-                    0,
-                );
-                core::ptr::write_volatile(
-                    (window.mmio_seed_va + ROOT_DMA_PROOF_INTERRUPT_STATUS_OFFSET) as *mut u32,
-                    1,
-                );
-            }
-            match driver_launch::inject_hosted_device_interrupt(device_id) {
-                Ok(delivery) => {
-                    let ack = ack_window
-                        .as_ref()
-                        .map(|window| {
-                            core::ptr::read_volatile(
-                                (window.mmio_seed_va + ROOT_DMA_PROOF_INTERRUPT_ACK_OFFSET)
-                                    as *const u32,
-                            )
-                        })
-                        .unwrap_or(0);
-                    if ack_window.is_some() {
-                        report.interrupt_acknowledged |= ack == 1;
-                        if ack == 1 {
-                            report.interrupt_acknowledged_count += 1;
-                        }
-                    }
-                    match driver_launch::redrive_hosted_device_tx_interrupt(device_id) {
-                        Ok(_) => {}
-                        Err(status) => {
-                            print_interrupt_delivery_failure(trace, status);
-                            remember_error(report, status);
-                        }
-                    }
-                    print_interrupt_delivery(trace, service_name, instance_id, delivery, ack);
-                }
-                Err(status) => {
-                    print_interrupt_delivery_failure(trace, status);
-                    remember_error(report, status);
-                }
-            }
-        }
-    }
-}
-
-unsafe fn root_window_for_evidence(
-    device_id: u64,
-    evidence: driver_launch::HostedHardwareEvidence,
-) -> Option<HostedPnpRootResourceDescriptor> {
-    let lease = driver_launch::hosted_pnp_context_lease_for_device(device_id)?;
-    hosted_pnp_root_resource_by_identity(
-        lease,
-        evidence.resource_mmio_phys,
-        evidence.dma_common_va,
-        evidence.dma_common_logical,
-    )
-    .ok()?
-}
-
 fn collect_hardware_evidence(
     device_id: u64,
     trace: HostedPnpStartTrace,
@@ -2035,9 +1902,6 @@ fn collect_hardware_evidence(
     start_status_raw: u32,
     report: &mut HostedPnpStartReport,
 ) {
-    if let Err(status) = unsafe { driver_launch::redrive_hosted_device_tx_interrupt(device_id) } {
-        remember_error(report, status);
-    }
     if let Some(evidence) = driver_launch::hosted_hardware_evidence(device_id) {
         if evidence.resource_granted() {
             report.resource_granted = true;
@@ -2048,7 +1912,6 @@ fn collect_hardware_evidence(
             report.dpc_delivered |= evidence.dpc_delivered();
             report.dma_adapter |= evidence.dma_adapter_created();
             report.dma_common |= evidence.dma_common_allocated();
-            report.dma_packet_descriptors |= evidence.dma_packet_descriptors_observed();
             report.io_port_out32 |= evidence.io_port_out32_serviced();
             report.root_started |= evidence.root_pdo_started;
             if evidence.mmio_mapped() {
@@ -2069,65 +1932,6 @@ fn collect_hardware_evidence(
             if evidence.dma_common_allocated() {
                 report.dma_common_count += 1;
             }
-            if evidence.dma_packet_descriptors_observed() {
-                report.dma_packet_descriptor_count += 1;
-            }
-            report.dma_packet_descriptor_common_count = report
-                .dma_packet_descriptor_common_count
-                .saturating_add(evidence.dma_descriptor_common_buffers);
-            report.dma_packet_descriptor_mapping_count = report
-                .dma_packet_descriptor_mapping_count
-                .saturating_add(evidence.dma_descriptor_transfer_mappings);
-            report.dma_packet_descriptor_completed_mapping_count = report
-                .dma_packet_descriptor_completed_mapping_count
-                .saturating_add(evidence.dma_descriptor_completed_transfer_mappings);
-            report.dma_device_tx_completion_count = report
-                .dma_device_tx_completion_count
-                .saturating_add(evidence.dma_device_tx_completions);
-            report.dma_device_rx_completion_count = report
-                .dma_device_rx_completion_count
-                .saturating_add(evidence.dma_device_rx_completions);
-            report.dma_device_interrupt_cause_count = report
-                .dma_device_interrupt_cause_count
-                .saturating_add(evidence.dma_device_interrupt_causes);
-            report.dma_device_model_failure_count = report
-                .dma_device_model_failure_count
-                .saturating_add(evidence.dma_device_model_failures);
-            report.dma_tx_window_observation_count = report
-                .dma_tx_window_observation_count
-                .saturating_add(evidence.dma_tx_window_observations);
-            report.dma_tx_window_enabled_count = report
-                .dma_tx_window_enabled_count
-                .saturating_add(evidence.dma_tx_window_enabled);
-            report.dma_tx_window_ring_ready_count = report
-                .dma_tx_window_ring_ready_count
-                .saturating_add(evidence.dma_tx_window_ring_ready);
-            report.dma_tx_window_posted_count = report
-                .dma_tx_window_posted_count
-                .saturating_add(evidence.dma_tx_window_posted);
-            report.dma_tx_window_idle_count = report
-                .dma_tx_window_idle_count
-                .saturating_add(evidence.dma_tx_window_idle);
-            report.dma_tx_descriptor_candidate_count = report
-                .dma_tx_descriptor_candidate_count
-                .saturating_add(evidence.dma_tx_descriptor_candidates);
-            report.dma_tx_descriptor_map_candidate_count = report
-                .dma_tx_descriptor_map_candidate_count
-                .saturating_add(evidence.dma_tx_descriptor_map_candidates);
-            report.dma_tx_descriptor_done_seen_count = report
-                .dma_tx_descriptor_done_seen_count
-                .saturating_add(evidence.dma_tx_descriptor_done_seen);
-            if evidence.dma_tx_descriptor_candidates != 0
-                || evidence.dma_tx_descriptor_done_seen != 0
-            {
-                report.dma_tx_last_candidate_address = evidence.dma_tx_last_candidate_address;
-                report.dma_tx_last_candidate_len = evidence.dma_tx_last_candidate_len;
-                report.dma_tx_last_candidate_status = evidence.dma_tx_last_candidate_status;
-            }
-            if evidence.dma_tx_window_observations != 0 {
-                report.dma_tx_last_head = evidence.dma_tx_last_head;
-                report.dma_tx_last_tail = evidence.dma_tx_last_tail;
-            }
             if evidence.io_port_out32_serviced() {
                 report.io_port_out32_count += 1;
             }
@@ -2146,8 +1950,8 @@ fn print_add_device_success(
     device_id: u64,
 ) {
     print_str(match trace {
-        HostedPnpStartTrace::HardwareProof => {
-            b"[driver-launch] generic hardware AddDevice service="
+        HostedPnpStartTrace::ConfigPnp => {
+            b"[driver-launch] config PnP AddDevice service="
         }
         HostedPnpStartTrace::DemandStart => b"[driver-launch] demand AddDevice service=",
         HostedPnpStartTrace::BootService => b"[driver-launch] AddDevice service=",
@@ -2167,8 +1971,8 @@ fn print_add_device_failure(
     status: nt_status::NtStatus,
 ) {
     print_str(match trace {
-        HostedPnpStartTrace::HardwareProof => {
-            b"[driver-launch] generic hardware AddDevice failed status=0x"
+        HostedPnpStartTrace::ConfigPnp => {
+            b"[driver-launch] config PnP AddDevice failed status=0x"
         }
         HostedPnpStartTrace::DemandStart => b"[driver-launch] demand AddDevice failed status=0x",
         HostedPnpStartTrace::BootService => b"[driver-launch] AddDevice failed status=0x",
@@ -2188,8 +1992,8 @@ fn print_resource_preparation_failure(
     status: nt_status::NtStatus,
 ) {
     print_str(match trace {
-        HostedPnpStartTrace::HardwareProof => {
-            b"[driver-launch] generic hardware bus resource publication failed status=0x"
+        HostedPnpStartTrace::ConfigPnp => {
+            b"[driver-launch] config PnP bus resource publication failed status=0x"
         }
         HostedPnpStartTrace::DemandStart => {
             b"[driver-launch] demand bus resource publication failed status=0x"
@@ -2230,8 +2034,8 @@ fn print_resource_grant_failure(
     status: nt_status::NtStatus,
 ) {
     print_str(match trace {
-        HostedPnpStartTrace::HardwareProof => {
-            b"[driver-launch] generic hardware resource grant failed status=0x"
+        HostedPnpStartTrace::ConfigPnp => {
+            b"[driver-launch] config PnP resource grant failed status=0x"
         }
         HostedPnpStartTrace::DemandStart => {
             b"[driver-launch] demand resource grant failed status=0x"
@@ -2254,16 +2058,16 @@ fn print_start_status(
 ) {
     if status == 0 {
         print_str(match trace {
-            HostedPnpStartTrace::HardwareProof => {
-                b"[driver-launch] generic hardware StartDevice service="
+            HostedPnpStartTrace::ConfigPnp => {
+                b"[driver-launch] config PnP StartDevice service="
             }
             HostedPnpStartTrace::DemandStart => b"[driver-launch] demand StartDevice service=",
             HostedPnpStartTrace::BootService => b"[driver-launch] StartDevice service=",
         });
     } else {
         print_str(match trace {
-            HostedPnpStartTrace::HardwareProof => {
-                b"[driver-launch] generic hardware StartDevice failed service="
+            HostedPnpStartTrace::ConfigPnp => {
+                b"[driver-launch] config PnP StartDevice failed service="
             }
             HostedPnpStartTrace::DemandStart => {
                 b"[driver-launch] demand StartDevice failed service="
@@ -2286,8 +2090,8 @@ fn print_start_indeterminate(
     transport_status: nt_status::NtStatus,
 ) {
     print_str(match trace {
-        HostedPnpStartTrace::HardwareProof => {
-            b"[driver-launch] generic hardware StartDevice indeterminate service="
+        HostedPnpStartTrace::ConfigPnp => {
+            b"[driver-launch] config PnP StartDevice indeterminate service="
         }
         HostedPnpStartTrace::DemandStart => {
             b"[driver-launch] demand StartDevice indeterminate service="
@@ -2304,8 +2108,8 @@ fn print_start_indeterminate(
 
 fn print_start_pending(trace: HostedPnpStartTrace, service_name: &str, instance_id: &str) {
     print_str(match trace {
-        HostedPnpStartTrace::HardwareProof => {
-            b"[driver-launch] generic hardware StartDevice pending service="
+        HostedPnpStartTrace::ConfigPnp => {
+            b"[driver-launch] config PnP StartDevice pending service="
         }
         HostedPnpStartTrace::DemandStart => b"[driver-launch] demand StartDevice pending service=",
         HostedPnpStartTrace::BootService => b"[driver-launch] StartDevice pending service=",
@@ -2316,48 +2120,6 @@ fn print_start_pending(trace: HostedPnpStartTrace, service_name: &str, instance_
     print_str(b"\n");
 }
 
-fn print_interrupt_delivery(
-    trace: HostedPnpStartTrace,
-    service_name: &str,
-    instance_id: &str,
-    delivery: driver_launch::HostedInterruptDelivery,
-    ack: u32,
-) {
-    print_str(match trace {
-        HostedPnpStartTrace::HardwareProof => {
-            b"[driver-launch] generic hardware interrupt delivery service="
-        }
-        HostedPnpStartTrace::DemandStart => b"[driver-launch] demand interrupt delivery service=",
-        HostedPnpStartTrace::BootService => b"[driver-launch] interrupt delivery service=",
-    });
-    print_str(service_name.as_bytes());
-    print_str(b" devnode=");
-    print_str(instance_id.as_bytes());
-    print_str(b" id=");
-    print_u64(delivery.interrupt_id);
-    print_str(b" vector=");
-    print_u64(delivery.vector as u64);
-    print_str(b" claimed=");
-    print_u64(delivery.claimed as u64);
-    print_str(b" ack=");
-    print_u64(ack as u64);
-    print_str(b"\n");
-}
-
-fn print_interrupt_delivery_failure(trace: HostedPnpStartTrace, status: nt_status::NtStatus) {
-    print_str(match trace {
-        HostedPnpStartTrace::HardwareProof => {
-            b"[driver-launch] generic hardware interrupt delivery failed status=0x"
-        }
-        HostedPnpStartTrace::DemandStart => {
-            b"[driver-launch] demand interrupt delivery failed status=0x"
-        }
-        HostedPnpStartTrace::BootService => b"[driver-launch] interrupt delivery failed status=0x",
-    });
-    print_hex(status.raw() as u32);
-    print_str(b"\n");
-}
-
 fn print_hardware_evidence(
     trace: HostedPnpStartTrace,
     service_name: &str,
@@ -2365,8 +2127,8 @@ fn print_hardware_evidence(
     start_status_raw: u32,
     evidence: driver_launch::HostedHardwareEvidence,
 ) {
-    if trace == HostedPnpStartTrace::HardwareProof {
-        print_str(b"[driver-launch] generic hardware evidence service=");
+    if trace == HostedPnpStartTrace::ConfigPnp {
+        print_str(b"[driver-launch] config PnP evidence service=");
         print_str(service_name.as_bytes());
         print_str(b" devnode=");
         print_str(instance_id.as_bytes());
@@ -2384,18 +2146,6 @@ fn print_hardware_evidence(
         print_u64(evidence.dma_adapter_created() as u64);
         print_str(b"/");
         print_u64(evidence.dma_common_allocated() as u64);
-        print_str(b" desc=");
-        print_u64(evidence.dma_packet_descriptors_observed() as u64);
-        print_str(b" txrx=");
-        print_u64(evidence.dma_device_tx_completions);
-        print_str(b"/");
-        print_u64(evidence.dma_device_rx_completions);
-        print_str(b" pbrx=");
-        print_u64(evidence.dma_device_post_bind_rx_attempts);
-        print_str(b"/");
-        print_u64(evidence.dma_device_post_bind_rx_deliveries);
-        print_str(b"/");
-        print_u64(evidence.dma_device_post_bind_rx_failures);
         print_str(b" io=");
         print_u64(evidence.io_port_out32_serviced() as u64);
         print_str(b" video=");
@@ -2445,70 +2195,6 @@ fn print_hardware_evidence(
     print_u64(evidence.dma_common_allocated() as u64);
     print_str(b" dma_len=");
     print_u64(evidence.dma_common_len);
-    print_str(b" dma_desc=");
-    print_u64(evidence.dma_packet_descriptors_observed() as u64);
-    print_str(b" dma_desc_rings=");
-    print_u64(evidence.dma_descriptor_rings);
-    print_str(b" dma_desc_addr/ok=");
-    print_u64(evidence.dma_descriptor_addresses);
-    print_str(b"/");
-    print_u64(evidence.dma_descriptor_decodable);
-    print_str(b" dma_desc_common/map=");
-    print_u64(evidence.dma_descriptor_common_buffers);
-    print_str(b"/");
-    print_u64(evidence.dma_descriptor_transfer_mappings);
-    print_str(b" dma_desc_len/done=");
-    print_u64(evidence.dma_descriptor_lengths);
-    print_str(b"/");
-    print_u64(evidence.dma_descriptor_completed);
-    print_str(b" dma_desc_done_common/map=");
-    print_u64(evidence.dma_descriptor_completed_common_buffers);
-    print_str(b"/");
-    print_u64(evidence.dma_descriptor_completed_transfer_mappings);
-    print_str(b" dma_desc_bad/fail=");
-    print_u64(evidence.dma_descriptor_malformed);
-    print_str(b"/");
-    print_u64(evidence.dma_descriptor_observation_failures);
-    print_str(b" dma_dev_tx/rx=");
-    print_u64(evidence.dma_device_tx_completions);
-    print_str(b"/");
-    print_u64(evidence.dma_device_rx_completions);
-    print_str(b" dma_dev_cause/fail=");
-    print_u64(evidence.dma_device_interrupt_causes);
-    print_str(b"/");
-    print_u64(evidence.dma_device_model_failures);
-    print_str(b" dma_post_bind_rx=");
-    print_u64(evidence.dma_device_post_bind_rx_attempts);
-    print_str(b"/");
-    print_u64(evidence.dma_device_post_bind_rx_deliveries);
-    print_str(b"/");
-    print_u64(evidence.dma_device_post_bind_rx_failures);
-    print_str(b" dma_tx_window=");
-    print_u64(evidence.dma_tx_window_observations);
-    print_str(b"/");
-    print_u64(evidence.dma_tx_window_enabled);
-    print_str(b"/");
-    print_u64(evidence.dma_tx_window_ring_ready);
-    print_str(b"/");
-    print_u64(evidence.dma_tx_window_posted);
-    print_str(b"/");
-    print_u64(evidence.dma_tx_window_idle);
-    print_str(b" dma_tx_head/tail=");
-    print_u64(evidence.dma_tx_last_head);
-    print_str(b"/");
-    print_u64(evidence.dma_tx_last_tail);
-    print_str(b" dma_tx_candidates/map/done=");
-    print_u64(evidence.dma_tx_descriptor_candidates);
-    print_str(b"/");
-    print_u64(evidence.dma_tx_descriptor_map_candidates);
-    print_str(b"/");
-    print_u64(evidence.dma_tx_descriptor_done_seen);
-    print_str(b" dma_tx_last_desc=0x");
-    print_hex(evidence.dma_tx_last_candidate_address as u32);
-    print_str(b"/");
-    print_u64(evidence.dma_tx_last_candidate_len);
-    print_str(b"/0x");
-    print_hex(evidence.dma_tx_last_candidate_status as u32);
     print_str(b"\n");
 
     print_hardware_evidence_prefix(trace, service_name, instance_id, b"io");
@@ -2579,7 +2265,7 @@ fn print_hardware_evidence_prefix(
     group: &[u8],
 ) {
     print_str(match trace {
-        HostedPnpStartTrace::HardwareProof => b"[driver-launch] generic hardware evidence service=",
+        HostedPnpStartTrace::ConfigPnp => b"[driver-launch] config PnP evidence service=",
         HostedPnpStartTrace::DemandStart => b"[driver-launch] demand hardware evidence service=",
         HostedPnpStartTrace::BootService => b"[driver-launch] hardware evidence service=",
     });

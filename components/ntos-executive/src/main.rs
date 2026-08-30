@@ -2054,8 +2054,6 @@ pub const IPCBUF_VADDR: u64 = 0x0000_0100_105F_B000;
 const _: () =
     assert!(STORAGE_SHARED_END <= IPCBUF_VADDR || IPCBUF_VADDR + 0x1000 <= STORAGE_SHARED_VADDR);
 const ROOT_DMA_PROOF_ID_VALUE: u32 = 0x444d_4131; // "DMA1"
-const ROOT_DMA_PROOF_INTERRUPT_STATUS_OFFSET: u64 = 0x08;
-const ROOT_DMA_PROOF_INTERRUPT_ACK_OFFSET: u64 = 0x0c;
 
 pub const STACK_FRAMES: u64 = 4; // 16 KiB
 pub const RING_LEN: usize = 4096;
@@ -23512,18 +23510,18 @@ struct BootDriverStartReportTarget {
 #[derive(Clone, Copy, Default)]
 struct BootDriverStartReports {
     boot_service: HostedPnpStartReport,
-    hardware_proof: HostedPnpStartReport,
-    hardware_pci: HostedPnpStartReport,
+    config_pnp: HostedPnpStartReport,
+    config_pci: HostedPnpStartReport,
 }
 
 impl BootDriverStartReports {
     fn merge(&mut self, target: BootDriverStartReportTarget, report: HostedPnpStartReport) {
         match target.trace {
             HostedPnpStartTrace::BootService => self.boot_service.merge(report),
-            HostedPnpStartTrace::HardwareProof => {
-                self.hardware_proof.merge(report);
+            HostedPnpStartTrace::ConfigPnp => {
+                self.config_pnp.merge(report);
                 if target.pci {
-                    self.hardware_pci.merge(report);
+                    self.config_pci.merge(report);
                 }
             }
             HostedPnpStartTrace::DemandStart => {
@@ -23776,26 +23774,17 @@ fn report_deferred_generic_hardware_checks(
             && (pci_report.mmio_mapped
                 || pci_report.io_port_out32
                 || pci_report.interrupt_delivered
-                || pci_report.dma_common
-                || pci_report.dma_packet_descriptors
-                || pci_report.dma_device_tx_completion_count != 0
-                || pci_report.dma_device_rx_completion_count != 0
-                || pci_report.dma_device_interrupt_cause_count != 0),
+                || pci_report.dma_common),
         passed,
     );
     check(
         b"exec_generic_hw_interrupt_delivered",
-        report.interrupt_connected && report.interrupt_delivered && report.interrupt_acknowledged,
+        report.interrupt_connected && report.interrupt_delivered,
         passed,
     );
     check(
         b"exec_generic_hw_dpc_delivered",
         report.interrupt_delivered && report.dpc_delivered,
-        passed,
-    );
-    check(
-        b"exec_generic_hw_dma_packet_descriptors",
-        report.dma_common && report.dma_packet_descriptors,
         passed,
     );
 }
@@ -32138,10 +32127,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         }
     }
 
-    // --- B3: registry-selected device-driver hardware proof. The generated boot hive declares a
-    // boot-start kernel driver plus an Enum devnode; the executive imports that registry state into
-    // Config Manager metadata, selects the service through the generic PnP binding selector, and then
-    // drives the same hosted AddDevice/START/resource-grant path used for real SYSTEM-hive devnodes.
+    // --- B3: start registry-selected PnP drivers against their discovered devnodes and
+    // generation-owned resources. The fixture device remains an independent compatibility lane and
+    // does not participate in normal config-selected driver startup.
     let mut generic_hw_registry_selected = false;
     let mut generic_hw_driver_loaded = false;
     let mut generic_hw_add_device = false;
@@ -32150,31 +32138,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut generic_hw_mmio_mapped = false;
     let mut generic_hw_interrupt_connected = false;
     let mut generic_hw_interrupt_delivered = false;
-    let mut generic_hw_interrupt_acknowledged = false;
     let mut generic_hw_dpc_delivered = false;
     let mut generic_hw_dma_adapter = false;
     let mut generic_hw_dma_common = false;
-    let mut generic_hw_dma_packet_descriptors = false;
-    let mut generic_hw_dma_descriptor_common_count = 0u64;
-    let mut generic_hw_dma_descriptor_mapping_count = 0u64;
-    let mut generic_hw_dma_descriptor_completed_mapping_count = 0u64;
-    let mut generic_hw_dma_device_tx_completion_count = 0u64;
-    let mut generic_hw_dma_device_rx_completion_count = 0u64;
-    let mut generic_hw_dma_device_interrupt_cause_count = 0u64;
-    let mut generic_hw_dma_device_model_failure_count = 0u64;
-    let mut generic_hw_dma_tx_window_observation_count = 0u64;
-    let mut generic_hw_dma_tx_window_enabled_count = 0u64;
-    let mut generic_hw_dma_tx_window_ring_ready_count = 0u64;
-    let mut generic_hw_dma_tx_window_posted_count = 0u64;
-    let mut generic_hw_dma_tx_window_idle_count = 0u64;
-    let mut generic_hw_dma_tx_descriptor_candidate_count = 0u64;
-    let mut generic_hw_dma_tx_descriptor_map_candidate_count = 0u64;
-    let mut generic_hw_dma_tx_descriptor_done_seen_count = 0u64;
-    let mut generic_hw_dma_tx_last_candidate_address = 0u64;
-    let mut generic_hw_dma_tx_last_candidate_len = 0u64;
-    let mut generic_hw_dma_tx_last_candidate_status = 0u64;
-    let mut generic_hw_dma_tx_last_head = 0u64;
-    let mut generic_hw_dma_tx_last_tail = 0u64;
     let mut generic_hw_io_out32 = false;
     let mut generic_hw_root_started = false;
     let mut generic_hw_video_route_published = false;
@@ -32215,14 +32181,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         .any(|plan| !plan.as_slice().is_empty())
     {
         if let Some(fs) = exec_fs() {
-            for proof_pnp_plan in config_pnp_launch_plans {
-                for proof_pnp_spec in proof_pnp_plan.as_slice() {
-                    let proof_pnp_devnodes = proof_pnp_plan.devnodes_for(proof_pnp_spec);
+            for config_plan in config_pnp_launch_plans {
+                for config_spec in config_plan.as_slice() {
+                    let config_devnodes = config_plan.devnodes_for(config_spec);
                     let spec_has_pci_devnode =
-                        inline_launch_spec_has_pci_devnode(proof_pnp_devnodes);
-                    let spec_devnodes = proof_pnp_spec.devnode_count as u64;
+                        inline_launch_spec_has_pci_devnode(config_devnodes);
+                    let spec_devnodes = config_spec.devnode_count as u64;
                     generic_hw_selected += spec_devnodes;
-                    generic_hw_registry_selected |= proof_pnp_spec.devnode_count != 0;
+                    generic_hw_registry_selected |= config_spec.devnode_count != 0;
                     generic_pci_registry_selected |= spec_has_pci_devnode;
                     if spec_has_pci_devnode {
                         generic_pci_selected += spec_devnodes;
@@ -32230,21 +32196,21 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         generic_root_selected += spec_devnodes;
                     }
                     print_str(b"[driver-launch] launching PnP service ");
-                    print_str(proof_pnp_spec.service_name.as_bytes());
+                    print_str(config_spec.service_name.as_bytes());
                     print_str(b" from config hive path=");
-                    print_str(proof_pnp_spec.image_path.as_bytes());
+                    print_str(config_spec.image_path.as_bytes());
                     print_str(b" object=");
-                    print_str(proof_pnp_spec.driver_object_path.as_bytes());
+                    print_str(config_spec.driver_object_path.as_bytes());
                     print_str(b" devnodes=");
-                    print_u64(proof_pnp_spec.devnode_count as u64);
+                    print_u64(config_spec.devnode_count as u64);
                     print_str(b"\n");
 
                     let provider_before = driver_launch::hosted_provider_sharing_evidence();
                     if let Some((_dc, start_report)) = launch_boot_driver_service(
                         &fs,
-                        proof_pnp_spec,
-                        proof_pnp_plan,
-                        HostedPnpStartOptions::hardware_proof(),
+                        config_spec,
+                        config_plan,
+                        HostedPnpStartOptions::config_pnp(),
                         &mut driver_start_bootstrap,
                     ) {
                         let provider_after = driver_launch::hosted_provider_sharing_evidence();
@@ -32294,11 +32260,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             generic_pci_resource_accessed |= start_report.mmio_mapped
                                 || start_report.io_port_out32
                                 || start_report.interrupt_delivered
-                                || start_report.dma_common
-                                || start_report.dma_packet_descriptors
-                                || start_report.dma_device_tx_completion_count != 0
-                                || start_report.dma_device_rx_completion_count != 0
-                                || start_report.dma_device_interrupt_cause_count != 0;
+                                || start_report.dma_common;
                             if generic_pci_first_error == 0 && start_report.first_error != 0 {
                                 generic_pci_first_error = start_report.first_error;
                             }
@@ -32311,70 +32273,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         generic_hw_mmio_mapped |= start_report.mmio_mapped;
                         generic_hw_interrupt_connected |= start_report.interrupt_connected;
                         generic_hw_interrupt_delivered |= start_report.interrupt_delivered;
-                        generic_hw_interrupt_acknowledged |= start_report.interrupt_acknowledged;
                         generic_hw_dpc_delivered |= start_report.dpc_delivered;
                         generic_hw_dma_adapter |= start_report.dma_adapter;
                         generic_hw_dma_common |= start_report.dma_common;
-                        generic_hw_dma_packet_descriptors |= start_report.dma_packet_descriptors;
-                        generic_hw_dma_descriptor_common_count =
-                            generic_hw_dma_descriptor_common_count
-                                .saturating_add(start_report.dma_packet_descriptor_common_count);
-                        generic_hw_dma_descriptor_mapping_count =
-                            generic_hw_dma_descriptor_mapping_count
-                                .saturating_add(start_report.dma_packet_descriptor_mapping_count);
-                        generic_hw_dma_descriptor_completed_mapping_count =
-                            generic_hw_dma_descriptor_completed_mapping_count.saturating_add(
-                                start_report.dma_packet_descriptor_completed_mapping_count,
-                            );
-                        generic_hw_dma_device_tx_completion_count =
-                            generic_hw_dma_device_tx_completion_count
-                                .saturating_add(start_report.dma_device_tx_completion_count);
-                        generic_hw_dma_device_rx_completion_count =
-                            generic_hw_dma_device_rx_completion_count
-                                .saturating_add(start_report.dma_device_rx_completion_count);
-                        generic_hw_dma_device_interrupt_cause_count =
-                            generic_hw_dma_device_interrupt_cause_count
-                                .saturating_add(start_report.dma_device_interrupt_cause_count);
-                        generic_hw_dma_device_model_failure_count =
-                            generic_hw_dma_device_model_failure_count
-                                .saturating_add(start_report.dma_device_model_failure_count);
-                        generic_hw_dma_tx_window_observation_count =
-                            generic_hw_dma_tx_window_observation_count
-                                .saturating_add(start_report.dma_tx_window_observation_count);
-                        generic_hw_dma_tx_window_enabled_count =
-                            generic_hw_dma_tx_window_enabled_count
-                                .saturating_add(start_report.dma_tx_window_enabled_count);
-                        generic_hw_dma_tx_window_ring_ready_count =
-                            generic_hw_dma_tx_window_ring_ready_count
-                                .saturating_add(start_report.dma_tx_window_ring_ready_count);
-                        generic_hw_dma_tx_window_posted_count =
-                            generic_hw_dma_tx_window_posted_count
-                                .saturating_add(start_report.dma_tx_window_posted_count);
-                        generic_hw_dma_tx_window_idle_count = generic_hw_dma_tx_window_idle_count
-                            .saturating_add(start_report.dma_tx_window_idle_count);
-                        generic_hw_dma_tx_descriptor_candidate_count =
-                            generic_hw_dma_tx_descriptor_candidate_count
-                                .saturating_add(start_report.dma_tx_descriptor_candidate_count);
-                        generic_hw_dma_tx_descriptor_map_candidate_count =
-                            generic_hw_dma_tx_descriptor_map_candidate_count
-                                .saturating_add(start_report.dma_tx_descriptor_map_candidate_count);
-                        generic_hw_dma_tx_descriptor_done_seen_count =
-                            generic_hw_dma_tx_descriptor_done_seen_count
-                                .saturating_add(start_report.dma_tx_descriptor_done_seen_count);
-                        if start_report.dma_tx_descriptor_candidate_count != 0
-                            || start_report.dma_tx_descriptor_done_seen_count != 0
-                        {
-                            generic_hw_dma_tx_last_candidate_address =
-                                start_report.dma_tx_last_candidate_address;
-                            generic_hw_dma_tx_last_candidate_len =
-                                start_report.dma_tx_last_candidate_len;
-                            generic_hw_dma_tx_last_candidate_status =
-                                start_report.dma_tx_last_candidate_status;
-                        }
-                        if start_report.dma_tx_window_observation_count != 0 {
-                            generic_hw_dma_tx_last_head = start_report.dma_tx_last_head;
-                            generic_hw_dma_tx_last_tail = start_report.dma_tx_last_tail;
-                        }
                         generic_hw_io_out32 |= start_report.io_port_out32;
                         generic_hw_root_started |= start_report.root_started;
                         generic_hw_video_route_published |= start_report.video_route_published;
@@ -32386,13 +32287,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         print_str(
                             b"[driver-launch] registry-selected PnP driver launch returned None service=",
                         );
-                        print_str(proof_pnp_spec.service_name.as_bytes());
+                        print_str(config_spec.service_name.as_bytes());
                         print_str(b" (not staged / load failed)\n");
                     }
                 }
             }
         } else {
-            print_str(b"[driver-launch] registry-selected PnP driver proof has no filesystem\n");
+            print_str(b"[driver-launch] registry-selected PnP launch has no filesystem\n");
         }
     } else {
         print_str(b"[driver-launch] config hive has no installed PnP driver binding\n");
@@ -32447,48 +32348,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_u64(generic_root_started);
         print_str(b" io_out32=");
         print_u64(generic_hw_io_out32 as u64);
-        print_str(b" dma_desc=");
-        print_u64(generic_hw_dma_packet_descriptors as u64);
-        print_str(b" dma_desc_common/map=");
-        print_u64(generic_hw_dma_descriptor_common_count);
-        print_str(b"/");
-        print_u64(generic_hw_dma_descriptor_mapping_count);
-        print_str(b" dma_desc_done_map=");
-        print_u64(generic_hw_dma_descriptor_completed_mapping_count);
-        print_str(b" dma_dev_tx/rx=");
-        print_u64(generic_hw_dma_device_tx_completion_count);
-        print_str(b"/");
-        print_u64(generic_hw_dma_device_rx_completion_count);
-        print_str(b" dma_dev_cause/fail=");
-        print_u64(generic_hw_dma_device_interrupt_cause_count);
-        print_str(b"/");
-        print_u64(generic_hw_dma_device_model_failure_count);
-        print_str(b" dma_tx_window=");
-        print_u64(generic_hw_dma_tx_window_observation_count);
-        print_str(b"/");
-        print_u64(generic_hw_dma_tx_window_enabled_count);
-        print_str(b"/");
-        print_u64(generic_hw_dma_tx_window_ring_ready_count);
-        print_str(b"/");
-        print_u64(generic_hw_dma_tx_window_posted_count);
-        print_str(b"/");
-        print_u64(generic_hw_dma_tx_window_idle_count);
-        print_str(b" dma_tx_head/tail=");
-        print_u64(generic_hw_dma_tx_last_head);
-        print_str(b"/");
-        print_u64(generic_hw_dma_tx_last_tail);
-        print_str(b" dma_tx_candidates/map/done=");
-        print_u64(generic_hw_dma_tx_descriptor_candidate_count);
-        print_str(b"/");
-        print_u64(generic_hw_dma_tx_descriptor_map_candidate_count);
-        print_str(b"/");
-        print_u64(generic_hw_dma_tx_descriptor_done_seen_count);
-        print_str(b" dma_tx_last_desc=0x");
-        print_hex(generic_hw_dma_tx_last_candidate_address as u32);
-        print_str(b"/");
-        print_u64(generic_hw_dma_tx_last_candidate_len);
-        print_str(b"/0x");
-        print_hex(generic_hw_dma_tx_last_candidate_status as u32);
         print_str(b" video_route=");
         print_u64(generic_hw_video_route_published as u64);
         print_str(b" video_route_attempted=");
@@ -32658,19 +32517,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         );
         check(
             b"exec_generic_hw_interrupt_delivered",
-            generic_hw_interrupt_connected
-                && generic_hw_interrupt_delivered
-                && generic_hw_interrupt_acknowledged,
+            generic_hw_interrupt_connected && generic_hw_interrupt_delivered,
             &mut passed,
         );
         check(
             b"exec_generic_hw_dpc_delivered",
             generic_hw_interrupt_delivered && generic_hw_dpc_delivered,
-            &mut passed,
-        );
-        check(
-            b"exec_generic_hw_dma_packet_descriptors",
-            generic_hw_dma_common && generic_hw_dma_packet_descriptors,
             &mut passed,
         );
     }
@@ -32904,7 +32756,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         Some((NTDLL_BASE, smss_ntdll_pe)),
                         driver_start_bootstrap,
                     );
-                    let final_hardware = final_driver_start_reports.hardware_proof;
+                    let final_config = final_driver_start_reports.config_pnp;
                     let final_boot = final_driver_start_reports.boot_service;
                     print_str(b"[driver-launch] final boot STARTs attempted/terminal/pending/indeterminate=");
                     print_u64(final_boot.attempted);
@@ -32915,13 +32767,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_str(b"/");
                     print_u64(final_boot.indeterminate);
                     print_str(b" config=");
-                    print_u64(final_hardware.attempted);
+                    print_u64(final_config.attempted);
                     print_str(b"/");
-                    print_u64(final_hardware.terminal);
+                    print_u64(final_config.terminal);
                     print_str(b"/");
-                    print_u64(final_hardware.pending);
+                    print_u64(final_config.pending);
                     print_str(b"/");
-                    print_u64(final_hardware.indeterminate);
+                    print_u64(final_config.indeterminate);
                     print_str(b"\n");
                     check(
                         b"exec_boot_pnp_starts_terminal",
@@ -32934,8 +32786,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     );
                     if generic_hw_gates_deferred {
                         report_deferred_generic_hardware_checks(
-                            final_hardware,
-                            final_driver_start_reports.hardware_pci,
+                            final_config,
+                            final_driver_start_reports.config_pci,
                             generic_hw_registry_selected,
                             generic_hw_selected,
                             generic_root_selected,

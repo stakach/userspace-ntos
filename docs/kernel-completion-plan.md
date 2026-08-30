@@ -19543,3 +19543,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     registry-selected PnP cohort. The only production interrupt evidence must be a real IRQ
     capability delivery to the ISR registered by the driver; any retained fixture stimulus must be
     confined to an explicit test-only boundary and excluded from normal boot policy.
+
+    B3 synthetic hosted-hardware removal checkpoint (2026-08-31, implementation green): ordinary
+    registry-selected PnP startup is now a `ConfigPnp` cohort and no longer carries a
+    `hardware_proof` identity or requests an executive-generated interrupt after START. The fake
+    root-MMIO interrupt status/acknowledgement window, its acceptance gate, and the post-bind
+    synthetic receive trigger have been deleted. The executive no longer contains E1000 or DC21x4
+    register profiles, packet/IP/MAC stimulus, descriptor completion, software interrupt-cause
+    injection, or a modeled port-I/O status overlay. Hosted port reads and writes now expose only
+    the actual capability-mediated I/O result.
+
+    The fixed 16-byte and DC21x4-specific descriptor observer and its proof gates were also removed;
+    descriptor layout is driver/device policy and cannot be a kernel acceptance contract. Dynamic
+    config-selected driver enumeration, AddDevice/START, resource grants, exact-device ownership,
+    `IoConnectInterrupt` registration, ISR execution, and DPC draining remain. The ordinary
+    interrupt-delivery and DPC gates deliberately remain red until a real hardware IRQ reaches that
+    registered ISR. The freestanding executive check passes after the deletion-heavy cleanup, and
+    formatting plus `git diff --check` remain clean.
+
+    Review adjustment: implement one generic hosted-IRQ ownership path, keyed by canonical device
+    generation and its assigned interrupt resource rather than service, PCI ID, NIC type, or fixed
+    vector. Mint the microkernel IRQ handler from that resource, retain it with the device/component
+    lifetime, route each genuine delivery to the exact `IoConnectInterrupt` registration in the
+    owning component VSpace, and perform mask/ack/unmask through the handler capability. Multiple
+    devices and multiple drivers must coexist, and STOP, REMOVE, rebalance, disconnect, component
+    failure, and driver unload must synchronously retire the route. ACPI SCI and PCI device IRQs use
+    this same mechanism; the driver's real ISR/DPC and bus invalidation remain the only source of
+    subsequent PnP work. Do not reintroduce an executive packet model, polling loop, timer stimulus,
+    device-name branch, or success fallback.

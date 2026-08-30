@@ -747,27 +747,6 @@ pub(crate) unsafe fn hosted_pnp_context_description<'a>(
         .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)
 }
 
-pub(crate) unsafe fn hosted_pnp_root_resource_by_identity(
-    lease: ContextLeaseIdentity,
-    mmio_phys: u64,
-    dma_va: u64,
-    dma_logical: u64,
-) -> Result<Option<HostedPnpRootResourceDescriptor>, nt_status::NtStatus> {
-    let description = hosted_pnp_context_authority_mut()
-        .registry
-        .description_by_identity(lease)
-        .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    Ok(description
-        .root_windows
-        .iter()
-        .find(|window| {
-            window.mmio_phys == mmio_phys
-                && window.dma_va == dma_va
-                && window.dma_logical == dma_logical
-        })
-        .cloned())
-}
-
 pub(crate) unsafe fn release_hosted_pnp_context_lease(
     lease: ContextLeaseIdentity,
 ) -> Result<(), nt_status::NtStatus> {
