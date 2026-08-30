@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use crate::PciDevice;
+use crate::{PciDevice, PciFunctionSnapshot};
 
 /// Stable bus identity for one PCI function.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -52,6 +52,39 @@ pub struct PreparedPciInventoryUpdate {
     departures: Vec<PciDevice>,
     arrivals: Vec<PciDevice>,
     resource_changes: Vec<PciResourceChange>,
+}
+
+/// Read-only topology delta. It never authorizes BAR probing or inventory mutation; arrivals must
+/// first complete any same-location departure and then be probed as quiescent functions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedPciCensus {
+    base_generation: u64,
+    snapshots: Vec<PciFunctionSnapshot>,
+    departures: Vec<PciDevice>,
+    arrivals: Vec<PciFunctionSnapshot>,
+    retained: Vec<PciLocation>,
+}
+
+impl PreparedPciCensus {
+    pub fn base_generation(&self) -> u64 {
+        self.base_generation
+    }
+
+    pub fn snapshots(&self) -> &[PciFunctionSnapshot] {
+        &self.snapshots
+    }
+
+    pub fn departures(&self) -> &[PciDevice] {
+        &self.departures
+    }
+
+    pub fn arrivals(&self) -> &[PciFunctionSnapshot] {
+        &self.arrivals
+    }
+
+    pub fn retained(&self) -> &[PciLocation] {
+        &self.retained
+    }
 }
 
 impl PreparedPciInventoryUpdate {
@@ -215,6 +248,73 @@ impl PciInventory {
         })
     }
 
+    /// Compare a non-mutating hardware census with the accepted inventory. This prepares only
+    /// topology ownership; it cannot commit because newly arrived functions do not yet have probed
+    /// resource extents.
+    pub fn prepare_census(
+        &self,
+        mut snapshots: Vec<PciFunctionSnapshot>,
+    ) -> Result<PreparedPciCensus, PciInventoryError> {
+        canonicalize_snapshots(&mut snapshots)?;
+        let mut departures = Vec::new();
+        let mut arrivals = Vec::new();
+        let mut retained = Vec::new();
+        departures
+            .try_reserve_exact(self.devices.len())
+            .map_err(|_| PciInventoryError::Allocation)?;
+        arrivals
+            .try_reserve_exact(snapshots.len())
+            .map_err(|_| PciInventoryError::Allocation)?;
+        retained
+            .try_reserve_exact(core::cmp::min(self.devices.len(), snapshots.len()))
+            .map_err(|_| PciInventoryError::Allocation)?;
+
+        let mut old_index = 0;
+        let mut new_index = 0;
+        while old_index < self.devices.len() || new_index < snapshots.len() {
+            let old = self.devices.get(old_index);
+            let new = snapshots.get(new_index);
+            match (old, new) {
+                (Some(old), Some(new)) => match PciLocation::from(old).cmp(&new.location()) {
+                    core::cmp::Ordering::Less => {
+                        departures.push(old.clone());
+                        old_index += 1;
+                    }
+                    core::cmp::Ordering::Greater => {
+                        arrivals.push(*new);
+                        new_index += 1;
+                    }
+                    core::cmp::Ordering::Equal => {
+                        if new.same_hardware_identity(old) {
+                            retained.push(new.location());
+                        } else {
+                            departures.push(old.clone());
+                            arrivals.push(*new);
+                        }
+                        old_index += 1;
+                        new_index += 1;
+                    }
+                },
+                (Some(old), None) => {
+                    departures.push(old.clone());
+                    old_index += 1;
+                }
+                (None, Some(new)) => {
+                    arrivals.push(*new);
+                    new_index += 1;
+                }
+                (None, None) => break,
+            }
+        }
+        Ok(PreparedPciCensus {
+            base_generation: self.generation,
+            snapshots,
+            departures,
+            arrivals,
+            retained,
+        })
+    }
+
     pub fn commit(
         &mut self,
         prepared: PreparedPciInventoryUpdate,
@@ -240,6 +340,22 @@ fn canonicalize(devices: &mut [PciDevice]) -> Result<(), PciInventoryError> {
     let mut previous = None;
     for device in devices {
         let location = PciLocation::from(&*device);
+        if location.device >= 32 || location.function >= 8 {
+            return Err(PciInventoryError::InvalidLocation(location));
+        }
+        if previous == Some(location) {
+            return Err(PciInventoryError::DuplicateLocation(location));
+        }
+        previous = Some(location);
+    }
+    Ok(())
+}
+
+fn canonicalize_snapshots(snapshots: &mut [PciFunctionSnapshot]) -> Result<(), PciInventoryError> {
+    snapshots.sort_unstable_by_key(|snapshot| snapshot.location());
+    let mut previous = None;
+    for snapshot in snapshots {
+        let location = snapshot.location();
         if location.device >= 32 || location.function >= 8 {
             return Err(PciInventoryError::InvalidLocation(location));
         }
@@ -285,6 +401,32 @@ mod tests {
                 size: 0x20_000,
                 maximum_address: u32::MAX as u64,
             }],
+        }
+    }
+
+    fn snapshot(device: &PciDevice) -> PciFunctionSnapshot {
+        let mut raw_bars = [0; crate::PCI_NUM_BARS];
+        for bar in &device.bars {
+            raw_bars[bar.index as usize] = bar.base as u32
+                | u32::from(bar.is_io)
+                | (u32::from(bar.is_64bit) << 2)
+                | (u32::from(bar.prefetchable) << 3);
+            if bar.is_64bit {
+                raw_bars[bar.index as usize + 1] = (bar.base >> 32) as u32;
+            }
+        }
+        PciFunctionSnapshot {
+            bus: device.bus,
+            dev: device.dev,
+            func: device.func,
+            vendor: device.vendor,
+            device: device.device,
+            class: device.class,
+            irq_line: device.irq_line,
+            irq_pin: device.irq_pin,
+            header_type: 0,
+            bar_count: 6,
+            raw_bars,
         }
     }
 
@@ -373,6 +515,29 @@ mod tests {
             Err(PciInventoryError::InvalidLocation(PciLocation::new(
                 0, 32, 0
             )))
+        );
+    }
+
+    #[test]
+    fn read_only_census_fences_departure_replacement_and_sibling() {
+        let removed = function(0, 3, 0x8086, 0x100e, 0xfebc_0000);
+        let sibling = function(0, 4, 0x8086, 0x100e, 0xfeba_0000);
+        let inventory =
+            PciInventory::try_from_initial(vec![removed.clone(), sibling.clone()]).unwrap();
+        let mut replacement = snapshot(&removed);
+        replacement.vendor = 0x1234;
+        replacement.device = 0x5678;
+
+        let census = inventory
+            .prepare_census(vec![snapshot(&sibling), replacement])
+            .unwrap();
+        assert_eq!(census.base_generation(), inventory.generation());
+        assert_eq!(census.departures(), &[removed]);
+        assert_eq!(census.arrivals(), &[replacement]);
+        assert_eq!(census.retained(), &[PciLocation::new(0, 4, 0)]);
+        assert_eq!(
+            inventory.devices(),
+            &[function(0, 3, 0x8086, 0x100e, 0xfebc_0000), sibling]
         );
     }
 }

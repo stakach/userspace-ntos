@@ -19312,3 +19312,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     CM/PnP actions. Trigger that transaction only from a real platform/ACPI PCI hotplug notification.
     The current QEMU machine exposes no QMP control socket and its long-running desktop lane remains
     undisturbed, so runtime hotplug acceptance remains open.
+
+    B3 non-mutating PCI census checkpoint (2026-08-31, implementation green): review of the live
+    scan path found that the boot enumerator cannot be reused while drivers are active. Its standard
+    BAR-size discovery temporarily disables I/O and memory decode and writes all ones to BARs, which
+    is valid before START but would corrupt ownership during an arbitrary hotplug scan. `nt-pnp` now
+    has a separate read-only function, bus, and bridge-hierarchy census. It captures identity,
+    class/header, interrupt pin/line, and raw BAR programming without any config write.
+
+    The accepted inventory can prepare a generation-bound topology census without mutating state.
+    It separates departures, quiescent arrivals, occupied-BDF replacements, and retained siblings.
+    Newly arrived functions still require the full size probe, but only after a same-location old
+    generation has completed final removal; the census itself cannot commit an incomplete resource
+    snapshot. A two-NIC replacement test proves that the old function departs, the replacement waits
+    as an arrival, the sibling remains retained, and accepted inventory is unchanged throughout
+    preparation. Focused `nt-pnp` validation passes 33/33 and the freestanding executive check
+    remains at the 209-warning baseline.
+
+    Review adjustment: build the executive rescan owner as a staged transaction: read-only census;
+    complete all departure/removal owners; probe only quiescent arrivals; prepare new PDOs, context
+    windows, grants, and CM actions; then commit the full inventory generation atomically. Resource
+    changes on retained functions must use the existing change/rebalance owner, not destructive
+    reprobe. A genuine trigger is blocked on a platform boundary that is now explicit: rust-micro
+    parses ACPI tables internally but its rootserver extended BootInfo publishes only TSC frequency,
+    not the ACPI RSDP. Publish the validated RSDP through the standard x86 ACPI BootInfo header and
+    make the corresponding ACPI table/device resources claimable by the executive. Then add a small
+    host-tested FADT/DSDT SCI/GPE notification owner and connect its PCI bus notification to this
+    census transaction. Do not poll PCI config space or synthesize a relation invalidation.

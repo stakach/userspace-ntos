@@ -30,7 +30,7 @@ mod pci_inventory;
 
 pub use pci_inventory::{
     CommittedPciInventoryUpdate, PciInventory, PciInventoryError, PciLocation, PciResourceChange,
-    PreparedPciInventoryUpdate,
+    PreparedPciCensus, PreparedPciInventoryUpdate,
 };
 
 use alloc::vec::Vec;
@@ -153,6 +153,54 @@ impl PciDevice {
     /// Native `PCI_SLOT_NUMBER.AsULONG` (`DeviceNumber:5`, then `FunctionNumber:3`).
     pub fn slot_number(&self) -> u32 {
         self.dev as u32 | ((self.func as u32) << 5)
+    }
+}
+
+/// Read-only PCI function snapshot used to detect topology changes without disabling decode or
+/// writing BAR sizing values into an already-started device.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PciFunctionSnapshot {
+    pub bus: u8,
+    pub dev: u8,
+    pub func: u8,
+    pub vendor: u16,
+    pub device: u16,
+    pub class: u32,
+    pub irq_line: u8,
+    pub irq_pin: u8,
+    pub header_type: u8,
+    pub bar_count: u8,
+    pub raw_bars: [u32; PCI_NUM_BARS],
+}
+
+impl PciFunctionSnapshot {
+    pub fn location(&self) -> PciLocation {
+        PciLocation::new(self.bus, self.dev, self.func)
+    }
+
+    pub fn base_class(&self) -> u8 {
+        (self.class >> 16) as u8
+    }
+
+    pub fn subclass(&self) -> u8 {
+        (self.class >> 8) as u8
+    }
+
+    pub fn is_pci_bridge(&self) -> bool {
+        self.base_class() == PCI_CLASS_BRIDGE && self.subclass() == PCI_SUBCLASS_PCI_TO_PCI
+    }
+
+    pub fn same_hardware_identity(&self, device: &PciDevice) -> bool {
+        self.location() == PciLocation::from(device)
+            && self.vendor == device.vendor
+            && self.device == device.device
+            && self.class == device.class
+    }
+}
+
+impl From<&PciFunctionSnapshot> for PciLocation {
+    fn from(snapshot: &PciFunctionSnapshot) -> Self {
+        snapshot.location()
     }
 }
 
@@ -306,6 +354,62 @@ where
     })
 }
 
+/// Read one PCI function without mutating config space. BAR dwords are captured exactly as
+/// programmed; their sizes are intentionally not probed.
+pub fn snapshot_function<R>(bus: u8, dev: u8, func: u8, read: R) -> Option<PciFunctionSnapshot>
+where
+    R: Fn(u8) -> u32,
+{
+    let vendor_device = read(PCI_CFG_VENDOR_DEVICE);
+    let vendor = vendor_device as u16;
+    if vendor == u16::MAX {
+        return None;
+    }
+    let class = read(PCI_CFG_CLASS_REV) >> 8;
+    let header_type = ((read(PCI_CFG_HEADER) >> 16) & 0xff) as u8 & PCI_HEADER_TYPE_MASK;
+    let bar_count = match header_type {
+        PCI_HEADER_TYPE_DEVICE => 6,
+        PCI_HEADER_TYPE_BRIDGE => 2,
+        PCI_HEADER_TYPE_CARDBUS => 1,
+        _ => 0,
+    };
+    let interrupt = read(PCI_CFG_INTERRUPT);
+    let mut raw_bars = [0; PCI_NUM_BARS];
+    for index in 0..bar_count {
+        raw_bars[index as usize] = read(PCI_CFG_BAR0 + index * 4);
+    }
+    Some(PciFunctionSnapshot {
+        bus,
+        dev,
+        func,
+        vendor,
+        device: (vendor_device >> 16) as u16,
+        class,
+        irq_line: interrupt as u8,
+        irq_pin: (interrupt >> 8) as u8,
+        header_type,
+        bar_count,
+        raw_bars,
+    })
+}
+
+pub fn snapshot_bus<R>(bus: u8, read: R) -> Vec<PciFunctionSnapshot>
+where
+    R: Fn(u8, u8, u8) -> u32,
+{
+    let mut snapshots = Vec::new();
+    for dev in 0..32u8 {
+        for func in 0..8u8 {
+            match snapshot_function(bus, dev, func, |offset| read(dev, func, offset)) {
+                Some(snapshot) => snapshots.push(snapshot),
+                None if func == 0 => break,
+                None => {}
+            }
+        }
+    }
+    snapshots
+}
+
 /// Enumerate every present function on `bus` (0..32 devices × 0..8 functions). `read(dev,func,off)`
 /// / `write(dev,func,off,v)` access config space for the given device/function on this bus. This is
 /// the PnP Manager's bus walk — the same one the executive did inline before `nt-pnp` existed.
@@ -407,6 +511,61 @@ where
         devices.extend(bus_devices);
     }
     Ok(devices)
+}
+
+/// Read-only counterpart to [`enumerate_hierarchy`]. This is the only hierarchy walk suitable for
+/// detecting hotplug while existing function drivers remain active.
+pub fn snapshot_hierarchy<R>(
+    root_bus: u8,
+    read: R,
+) -> Result<Vec<PciFunctionSnapshot>, PciTopologyError>
+where
+    R: Fn(u8, u8, u8, u8) -> u32,
+{
+    let mut scheduled = [false; 256];
+    let mut buses = Vec::new();
+    let mut snapshots = Vec::new();
+    scheduled[root_bus as usize] = true;
+    buses.push(root_bus);
+
+    let mut bus_index = 0;
+    while bus_index < buses.len() {
+        let bus = buses[bus_index];
+        bus_index += 1;
+        let bus_snapshots = snapshot_bus(bus, |device, function, offset| {
+            read(bus, device, function, offset)
+        });
+        for snapshot in &bus_snapshots {
+            if !snapshot.is_pci_bridge() {
+                continue;
+            }
+            let bridge = snapshot.location();
+            let numbers = read(
+                snapshot.bus,
+                snapshot.dev,
+                snapshot.func,
+                PCI_CFG_BUS_NUMBERS,
+            );
+            let primary = numbers as u8;
+            let secondary = (numbers >> 8) as u8;
+            let subordinate = (numbers >> 16) as u8;
+            if primary != bus || secondary == 0 || secondary > subordinate {
+                return Err(PciTopologyError::InvalidBridgeWindow {
+                    bridge,
+                    primary,
+                    secondary,
+                    subordinate,
+                });
+            }
+            if scheduled[secondary as usize] {
+                return Err(PciTopologyError::DuplicateSecondaryBus { bridge, secondary });
+            }
+            scheduled[secondary as usize] = true;
+            buses.push(secondary);
+        }
+        snapshots.extend(bus_snapshots);
+    }
+    Ok(snapshots)
 }
 
 /// A parsed PCI registry ID constraint, such as `PCI\VEN_8086&DEV_100E` or `PCI\CC_020000`.
