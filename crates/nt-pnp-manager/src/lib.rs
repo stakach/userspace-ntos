@@ -847,6 +847,17 @@ impl PnpManager {
             .map(|devnode| devnode.id)
     }
 
+    pub fn enumerated_pdo_properties(&self, pdo_object_id: u64) -> Option<&PdoProperties> {
+        self.devnodes
+            .iter()
+            .find(|devnode| {
+                devnode.pdo_object_id == pdo_object_id
+                    && devnode.state != DeviceState::Removed
+                    && devnode.pdo_properties.is_some()
+            })
+            .and_then(|devnode| devnode.pdo_properties.as_ref())
+    }
+
     /// Publish a successfully built function stack as one atomic lifecycle step.
     ///
     /// AddDevice execution and canonical I/O-manager attachment happen outside this crate. Their

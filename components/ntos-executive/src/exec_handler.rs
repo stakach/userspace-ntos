@@ -19767,14 +19767,6 @@ impl ExecNtHandler {
             nt_pnp_manager::DeviceActionLifecycleState::AwaitingAction => {}
         }
 
-        // A bus-reported PDO already has canonical I/O identity. The historical root-device start
-        // path would create a second PDO for this instance. Keep the action live until the relation
-        // worker has populated the bus-owned capabilities/resources needed by the existing-PDO
-        // AddDevice path.
-        if driver_launch::hosted_bus_reported_device_id(&instance).is_some() {
-            return STATUS_DEVICE_NOT_READY;
-        }
-
         let event = state.event.clone();
         let identity = state.owner.identity();
         let spec = match live_config_device_action_launch_spec(&event, SERVICE_DEMAND_START) {

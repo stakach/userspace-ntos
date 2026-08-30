@@ -40097,7 +40097,7 @@ fn register_hosted_device_binding(
     device_object: u64,
     pdo_object: u64,
     registry_identity_id: HostedRegistryIdentityId,
-    bus_information: &nt_pnp_manager::PnpBusInformation,
+    bus_information: Option<&nt_pnp_manager::PnpBusInformation>,
     pdo_address: u32,
 ) -> Result<(), nt_status::NtStatus> {
     if driver_id == 0
@@ -40907,7 +40907,7 @@ unsafe fn write_hosted_resource_state_projection(
 
 unsafe fn publish_hosted_device_identity_state(
     binding: HostedDeviceBinding,
-    bus_information: &nt_pnp_manager::PnpBusInformation,
+    bus_information: Option<&nt_pnp_manager::PnpBusInformation>,
     address: u32,
     resource_state_slot: Option<usize>,
 ) {
@@ -40917,8 +40917,12 @@ unsafe fn publish_hosted_device_identity_state(
         instance: binding.instance,
         projection_domain: binding.projection_domain,
         pdo_object: binding.pdo_object,
-        interface_type: bus_information.legacy_bus_type,
-        bus_number: bus_information.bus_number,
+        interface_type: bus_information
+            .map(|information| information.legacy_bus_type)
+            .unwrap_or(u32::MAX),
+        bus_number: bus_information
+            .map(|information| information.bus_number)
+            .unwrap_or(u32::MAX),
         address,
         ..HostedDeviceResourceState::default()
     };
@@ -45609,7 +45613,7 @@ unsafe fn dispatch_device_projection_control_for_instance(
     Ok(read_volatile((sh + SH_REQ_INFO) as *const u64))
 }
 
-unsafe fn create_hosted_root_pdo_projection(
+unsafe fn create_hosted_pdo_projection(
     projection_instance: usize,
 ) -> Result<u64, nt_status::NtStatus> {
     let pdo_object = dispatch_device_projection_control_for_instance(
@@ -45977,7 +45981,7 @@ unsafe fn rollback_uncommitted_add_device(
 }
 
 /// Invoke a loaded WDM driver's real `DriverExtension->AddDevice` for one registry-selected devnode
-/// and commit the dynamically-published FDO to that devnode's canonical stack.
+/// discovered through the executive root bus.
 pub(crate) unsafe fn call_add_device_for_driver<H, C>(
     driver_id: u64,
     class_guid: Option<&str>,
@@ -45994,19 +45998,6 @@ where
 {
     let bus_information = pdo_description.bus_information.clone();
     let pdo_address = pdo_description.capabilities.address;
-    let (index, inst) =
-        instance_by_driver_id(driver_id).ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
-    let provider_route = hosted_provider_dispatch_route_for_instance(index);
-    let projection_instance = provider_route
-        .map(|route| route.provider_instance)
-        .unwrap_or(index);
-    let projection_inst =
-        instance(projection_instance).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-    if projection_inst.hosted_domain_id == 0 || projection_inst.hosted_domain_cookie == 0 {
-        return Err(nt_status::NtStatus::INVALID_PARAMETER);
-    }
-    let registry_identity =
-        build_hosted_registry_identity(class_guid, driver_key, linkage_export, instance_path)?;
     let pdo_device_id = ensure_hosted_root_pdo(
         instance_path,
         hardware_ids,
@@ -46032,6 +46023,89 @@ where
     hosted_pnp_manager_mut()
         .register_enumerated_pdo(instance_path, pdo_device_id, pdo_properties)
         .map_err(hosted_pnp_status)?;
+    call_add_device_for_existing_pdo(
+        driver_id,
+        class_guid,
+        driver_key,
+        linkage_export,
+        instance_path,
+        pdo_device_id,
+        Some(bus_information),
+        pdo_address,
+    )
+}
+
+/// Invoke AddDevice for a bus-reported PDO that already has canonical I/O and PnP identity.
+pub(crate) unsafe fn call_add_device_for_bus_pdo(
+    driver_id: u64,
+    class_guid: Option<&str>,
+    driver_key: Option<&str>,
+    linkage_export: Option<&str>,
+    instance_path: &str,
+    pdo_device_id: u64,
+) -> Result<u64, nt_status::NtStatus> {
+    if hosted_bus_reported_device_id(instance_path) != Some(pdo_device_id) {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let devnode_id = hosted_pnp_manager_mut()
+        .devnode_for_pdo(pdo_device_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if !hosted_pnp_manager_mut()
+        .instance_id(devnode_id)
+        .is_some_and(|value| value.eq_ignore_ascii_case(instance_path))
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let (bus_information, pdo_address) = {
+        let properties = hosted_pnp_manager_mut()
+            .enumerated_pdo_properties(pdo_device_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        (
+            properties.bus_information.clone(),
+            properties
+                .capabilities
+                .as_ref()
+                .map(|capabilities| capabilities.address)
+                .unwrap_or(nt_pnp_manager::DEVICE_ADDRESS_UNAVAILABLE),
+        )
+    };
+    call_add_device_for_existing_pdo(
+        driver_id,
+        class_guid,
+        driver_key,
+        linkage_export,
+        instance_path,
+        pdo_device_id,
+        bus_information,
+        pdo_address,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn call_add_device_for_existing_pdo(
+    driver_id: u64,
+    class_guid: Option<&str>,
+    driver_key: Option<&str>,
+    linkage_export: Option<&str>,
+    instance_path: &str,
+    pdo_device_id: u64,
+    bus_information: Option<nt_pnp_manager::PnpBusInformation>,
+    pdo_address: u32,
+) -> Result<u64, nt_status::NtStatus> {
+    let pdo_device = nt_io_manager::DeviceId(pdo_device_id);
+    let (index, inst) =
+        instance_by_driver_id(driver_id).ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    let provider_route = hosted_provider_dispatch_route_for_instance(index);
+    let projection_instance = provider_route
+        .map(|route| route.provider_instance)
+        .unwrap_or(index);
+    let projection_inst =
+        instance(projection_instance).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    if projection_inst.hosted_domain_id == 0 || projection_inst.hosted_domain_cookie == 0 {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let registry_identity =
+        build_hosted_registry_identity(class_guid, driver_key, linkage_export, instance_path)?;
     let projection_domain = HostedDomainIdentity {
         domain_id: nt_io_manager::HostedDomainId(projection_inst.hosted_domain_id),
         cookie: projection_inst.hosted_domain_cookie,
@@ -46041,10 +46115,10 @@ where
     {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
-    let root_is_unattached = io_manager_mut()
+    let pdo_is_unattached = io_manager_mut()
         .device(pdo_device)
         .is_some_and(|device| device.top_of_stack == pdo_device && !device.delete_pending);
-    if !root_is_unattached {
+    if !pdo_is_unattached {
         return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
     }
     let existing_pdo_object =
@@ -46065,7 +46139,7 @@ where
             (pdo_object, false)
         }
         None => {
-            let pdo_object = create_hosted_root_pdo_projection(projection_instance)?;
+            let pdo_object = create_hosted_pdo_projection(projection_instance)?;
             if let Err(status) = io_manager_mut().bind_hosted_device_identity(
                 projection_domain,
                 pdo_object,
@@ -46188,7 +46262,7 @@ where
             add_device.fdo_object,
             pdo_object,
             registry_identity_id,
-            &bus_information,
+            bus_information.as_ref(),
             pdo_address,
         )?;
 
@@ -47489,6 +47563,34 @@ fn clone_pnp_resource_list(bytes: &[u8]) -> Result<Vec<u8>, nt_status::NtStatus>
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     copy.extend_from_slice(bytes);
     Ok(copy)
+}
+
+pub(crate) unsafe fn validate_hosted_bus_pdo_resource_properties(
+    instance_path: &str,
+    pdo_device_id: u64,
+    raw_boot_resources: Option<&[u8]>,
+    resource_requirements: Option<&[u8]>,
+) -> Result<(), nt_status::NtStatus> {
+    if hosted_bus_reported_device_id(instance_path) != Some(pdo_device_id) {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let properties = hosted_pnp_manager_mut()
+        .enumerated_pdo_properties(pdo_device_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let matches = |state: &nt_pnp_manager::PropertyBlobState, expected: Option<&[u8]>| match state {
+        nt_pnp_manager::PropertyBlobState::Unqueried => false,
+        nt_pnp_manager::PropertyBlobState::KnownNone => expected.is_none(),
+        nt_pnp_manager::PropertyBlobState::Present(bytes) => {
+            expected.is_some_and(|expected| expected == bytes)
+        }
+    };
+    if matches(&properties.boot_resources_raw, raw_boot_resources)
+        && matches(&properties.resource_requirements, resource_requirements)
+    {
+        Ok(())
+    } else {
+        Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+    }
 }
 
 pub(crate) unsafe fn commit_hosted_device_resource_assignment(

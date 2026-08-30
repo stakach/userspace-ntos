@@ -475,6 +475,20 @@ pub(crate) enum PreparedHostedResourcePlan {
 }
 
 impl PreparedHostedResourcePlan {
+    fn native_property_blobs(&self) -> (Option<&[u8]>, Option<&[u8]>) {
+        match self {
+            Self::Pci { bus_resources, .. } => (
+                Some(&bus_resources.raw_boot_resources),
+                Some(&bus_resources.resource_requirements),
+            ),
+            Self::Root { grant, .. } => (
+                Some(&grant.raw_boot_resources),
+                Some(&grant.resource_requirements),
+            ),
+            Self::None => (None, None),
+        }
+    }
+
     unsafe fn release_context_lease(self) -> Result<(), nt_status::NtStatus> {
         let lease = match self {
             Self::Pci { lease, .. } | Self::Root { lease, .. } => lease,
@@ -710,16 +724,50 @@ where
         pdo_description,
         resource_plan,
     } = prepared;
-    match driver_launch::call_add_device_for_driver(
-        driver_id,
-        class_guid,
-        devnode.driver_key,
-        devnode.linkage_export,
-        devnode.instance_id,
-        devnode.hardware_ids,
-        devnode.compatible_ids,
-        pdo_description,
-    ) {
+    let bus_pdo = driver_launch::hosted_bus_reported_device_id(devnode.instance_id);
+    if let Some(pdo_device_id) = bus_pdo {
+        let (raw_boot_resources, resource_requirements) = resource_plan.native_property_blobs();
+        if let Err(status) = driver_launch::validate_hosted_bus_pdo_resource_properties(
+            devnode.instance_id,
+            pdo_device_id,
+            raw_boot_resources,
+            resource_requirements,
+        ) {
+            let status = resource_plan
+                .release_context_lease()
+                .err()
+                .unwrap_or(status);
+            record_terminal_start_failure(report, status);
+            print_resource_preparation_failure(
+                options.trace,
+                service_name,
+                devnode.instance_id,
+                status,
+            );
+            return HostedPnpDevnodeProgress::Terminal { status };
+        }
+    }
+    let add_device = match bus_pdo {
+        Some(pdo_device_id) => driver_launch::call_add_device_for_bus_pdo(
+            driver_id,
+            class_guid,
+            devnode.driver_key,
+            devnode.linkage_export,
+            devnode.instance_id,
+            pdo_device_id,
+        ),
+        None => driver_launch::call_add_device_for_driver(
+            driver_id,
+            class_guid,
+            devnode.driver_key,
+            devnode.linkage_export,
+            devnode.instance_id,
+            devnode.hardware_ids,
+            devnode.compatible_ids,
+            pdo_description,
+        ),
+    };
+    match add_device {
         Ok(device_id) => {
             report.add_device = true;
             report.add_device_count += 1;

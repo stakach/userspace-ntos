@@ -18757,3 +18757,35 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     driver's ordinary `IoAttachDeviceToDeviceStack`, commit the FDO stack, assign/filter resources,
     and send the real START IRP. Remove the guard and obsolete root-only machinery only after that
     complete path is green.
+
+    B3 existing-PDO AddDevice/START checkpoint (2026-08-30, implementation green): the AddDevice
+    implementation is now split between PDO discovery and one common canonical stack builder. The
+    root-bus wrapper remains responsible only for creating/registering a root PDO. A new bus path
+    resolves the accepted instance to its already-published PnP devnode and canonical I/O Manager
+    `DeviceId`; it never calls the root constructor. The common builder projects that exact PDO into
+    the selected function driver's authenticated hosted domain (or reuses its exact existing domain
+    projection), invokes the real `DriverExtension->AddDevice`, requires the driver's ordinary
+    `IoAttachDeviceToDeviceStack` result to name the same canonical PDO, and commits the FDO stack.
+    Rollback unbinds and frees only a projection created by that attempt, preserving the bus
+    provider's PDO and canonical identity.
+
+    `NtPlugPlayControl(StartDevice)` no longer returns `STATUS_DEVICE_NOT_READY` merely because an
+    arrival came from BusRelations. The ordinary owned start batch selects the existing-PDO entry
+    point, grants/commits resources, and sends the same canonical START IRP used by root devices.
+    Before AddDevice, the prepared resource plan's raw boot-resource and requirement bytes must
+    exactly equal the retained native bus-query properties, including `KnownNone`; a mismatched root
+    fixture or silently substituted resource plan is rejected. Missing bus information or
+    capabilities remains truthful in PnP state and is represented as undefined runtime bus/address
+    identity until an actual resource grant supplies its dynamic bus identity.
+
+    Focused `nt-pnp-manager` validation passes `46/46`; formatting, `git diff --check`, and the
+    freestanding executive check pass at the unchanged 209-warning baseline. Serialized desktop
+    acceptance was not started because the pre-existing QEMU run still owns the single boot lane.
+    Review adjustment: the duplicate-PDO guard and constructor are gone from the bus action, but
+    resource requirements still move directly from the bus-owned plan to arbitration. Next add
+    typed `IRP_MN_FILTER_RESOURCE_REQUIREMENTS` in/out transport and a retained filter transaction
+    through the newly built function stack. Copy/validate the driver's returned requirements,
+    commit them as `filtered_resource_requirements`, arbitrate only that result, and retain pending
+    completion ownership exactly as for the other native PnP queries. Then remove the remaining
+    per-driver-instance `device_id`/`device_object` routing assumptions so one loaded function
+    driver can own any number of independently bound devices without a last-device cache.
