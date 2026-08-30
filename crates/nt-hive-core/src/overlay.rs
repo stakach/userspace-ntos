@@ -67,6 +67,7 @@ struct OverlayValue {
 struct OverlayKey {
     path: String,
     values: Vec<OverlayValue>,
+    class_name: Option<String>,
     security_descriptor: Option<usize>,
     volatile: bool,
     detached: bool,
@@ -181,6 +182,7 @@ impl RegistryOverlay {
         if let Some(i) = self.keys.iter().position(|k| k.path == canon && k.detached) {
             self.keys[i].detached = false;
             self.keys[i].values.clear();
+            self.keys[i].class_name = None;
             self.keys[i].security_descriptor = None;
             self.keys[i].volatile = volatile;
             return (i, true);
@@ -188,6 +190,7 @@ impl RegistryOverlay {
         self.keys.push(OverlayKey {
             path: canon,
             values: Vec::new(),
+            class_name: None,
             security_descriptor: None,
             volatile,
             detached: false,
@@ -346,6 +349,24 @@ impl RegistryOverlay {
     pub fn key_security_descriptor(&self, idx: usize) -> Option<&[u8]> {
         let k = self.keys.get(idx).filter(|k| !k.detached)?;
         self.blobs.get(k.security_descriptor?).map(Vec::as_slice)
+    }
+
+    /// Set the key's create-time class metadata. `Some("")` is an explicit empty class;
+    /// `None` clears the overlay override so a shadowing key can inherit its base class.
+    pub fn set_key_class(&mut self, idx: usize, class_name: Option<&str>) -> bool {
+        let Some(key) = self.keys.get_mut(idx).filter(|key| !key.detached) else {
+            return false;
+        };
+        key.class_name = class_name.map(String::from);
+        true
+    }
+
+    /// The class metadata explicitly owned by this overlay key, if any.
+    pub fn key_class(&self, idx: usize) -> Option<&str> {
+        self.keys
+            .get(idx)
+            .filter(|key| !key.detached)
+            .and_then(|key| key.class_name.as_deref())
     }
 
     /// Hide a value in this overlay, including a value that exists only in the read-only base hive.
@@ -701,6 +722,37 @@ mod tests {
         assert_eq!(ov.unique_data_blobs(), 1);
         assert_eq!(ov.key_security_descriptor(a), Some(&descriptor[..]));
         assert_eq!(ov.key_security_descriptor(b), Some(&descriptor[..]));
+    }
+
+    #[test]
+    fn key_classes_are_create_time_metadata_and_reset_on_reattach() {
+        let mut ov = RegistryOverlay::new();
+        let (key, created) = ov.create_with_volatility(r"\registry\machine\system\volatile", true);
+        assert!(created);
+        assert!(ov.set_key_class(key, Some("DeviceClass")));
+        assert_eq!(ov.key_class(key), Some("DeviceClass"));
+
+        let (same, reopened) = ov.create_with_volatility(
+            r"\registry\machine\system\volatile",
+            false,
+        );
+        assert_eq!(same, key);
+        assert!(!reopened);
+        assert_eq!(ov.key_class(key), Some("DeviceClass"));
+
+        assert!(ov.set_key_class(key, Some("")));
+        assert_eq!(ov.key_class(key), Some(""));
+        assert_eq!(
+            ov.detach_subtree(r"\registry\machine\system\volatile"),
+            1
+        );
+        let (reattached, created_again) = ov.create_with_volatility(
+            r"\registry\machine\system\volatile",
+            true,
+        );
+        assert_eq!(reattached, key);
+        assert!(created_again);
+        assert_eq!(ov.key_class(reattached), None);
     }
 
     #[test]

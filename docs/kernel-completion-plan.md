@@ -18062,3 +18062,37 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     metadata through exact CM leases. Convert callers to result-bearing paths so no transport failure
     can become `STATUS_NO_MORE_ENTRIES` or an empty statistic. Then migrate timezone/RTC and driver
     service bootstrap reads before deleting mirror replay, mount/storage, and projection diagnostics.
+
+    SYSTEM overlay metadata-composition acceptance (2026-08-30): volatile SYSTEM overlay keys now
+    own create-time class metadata and explicit security descriptors while inheriting untouched
+    metadata through exact CM leases. Reopening an overlay key does not replace its class, and
+    detaching then reusing an overlay slot clears the old class together with the key's other owned
+    state. SYSTEM subkey enumeration preserves CM ordering, appends mounted and overlay-only children
+    without case-insensitive duplicates, and composes child class and full-information statistics.
+    SYSTEM key statistics are recomputed from CM subkeys and values plus overlay overrides and
+    tombstones so counts and maxima describe the visible namespace rather than the compatibility
+    projection. Security queries and partial security updates read from the same provider that owns
+    the handle. All class, security, subkey, and statistic paths are result-bearing: lease, query,
+    enumeration, allocation, and close failures propagate instead of becoming empty metadata or
+    `STATUS_NO_MORE_ENTRIES`. The remaining legacy path-based SYSTEM value lookup and enumeration
+    arms were moved to the same exact CM composition model.
+
+    Focused validation passes `82/82` `nt-hive-core` unit tests plus `14/14` generated-hive tests;
+    the freestanding executive release check remains at the established 209-warning baseline.
+    Serialized acceptance `.tmp/run-headless-cm-overlay-metadata-20260830.log` reaches the genuine
+    Explorer desktop with all `299/299` checks passing and the sentinel matched. CM reaches
+    generation 2535 after 2532 accepted runtime transactions with zero rejection or compatibility
+    projection failure. Native SYSTEM handle leases remain balanced at `1337/1335/2/0`; Explorer
+    completes 677 real api0 redirects with zero callback or dead-callback failures, installs 18
+    client WndProcs without replay, reaches paint begin/end `5/20` with 187 direct GDI returns and
+    135 batch flushes covering 184 records, and paints all `786432/786432` framebuffer pixels with
+    at least 32 colours.
+
+    Review adjustment: SYSTEM overlay value and metadata composition is accepted. Next migrate the
+    timezone/RTC bootstrap reads and driver service load/unload identity to exact CM leases. Driver
+    service resolution must prove that the supplied registry path names the active control set; a
+    leaf-name shortcut must not redirect a caller from an inactive control set. Then replace
+    `overlay_canon`'s projected `CurrentControlSet` physicalization with CM-owned path identity.
+    Only after those paths and `NtSaveKey` are re-audited may the post-publish SYSTEM replay, SYSTEM
+    `MutableHiveSet` mount/storage, raw runtime hive field, and projection-failure diagnostics be
+    deleted atomically. Preserve CM journaling/checkpoint export and boot-only hive composition.
