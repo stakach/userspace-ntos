@@ -21072,7 +21072,7 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
     report
 }
 
-fn owned_driver_launch_spec_from_live_config_binding(
+pub(crate) fn owned_driver_launch_spec_from_live_config_binding(
     binding: nt_config_client::DriverServiceBinding,
     max_start: u32,
 ) -> Option<DriverServiceLaunchSpec> {
@@ -21104,6 +21104,26 @@ fn owned_driver_launch_spec_from_live_config_binding(
         class,
         devnodes,
     })
+}
+
+pub(crate) unsafe fn live_config_existing_device_launch_spec(
+    instance_id: &str,
+    max_start: u32,
+) -> Result<DriverServiceLaunchSpec, i32> {
+    let service_name = driver_launch::hosted_device_service_name_for_instance(instance_id)
+        .map_err(|status| status.raw())?;
+    let binding = config_manager_query_driver_service(&service_name)?;
+    let mut spec = owned_driver_launch_spec_from_live_config_binding(binding, max_start)
+        .ok_or(0xC000_0034u32 as i32)?;
+    let index = spec
+        .devnodes
+        .iter()
+        .position(|devnode| devnode.instance_id.eq_ignore_ascii_case(instance_id))
+        .ok_or(0xC000_0225u32 as i32)?;
+    let devnode = spec.devnodes.swap_remove(index);
+    spec.devnodes.clear();
+    spec.devnodes.push(devnode);
+    Ok(spec)
 }
 
 pub(crate) unsafe fn live_config_device_action_launch_spec(
@@ -23081,10 +23101,12 @@ struct ExecNtHandler {
     /// Driver START batches. The handler reserves a generation-exact slot before AddDevice/START
     /// side effects, and the service loop attaches the live syscall Reply object only when an exact
     /// START IRP remains pending.
-    pending_driver_starts: nt_driver_start::PendingDriverStartTable<PendingDriverStart>,
+    pending_driver_starts: nt_driver_start::PendingOperationTable<PendingDriverStart>,
     boot_driver_start_reports: BootDriverStartReports,
     native_driver_start_report: NativeDriverStartReport,
     pending_driver_start_transfer: Option<PendingDriverStartTransfer>,
+    pending_pnp_rebalances: nt_driver_start::PendingOperationTable<PendingPnpRebalance>,
+    pending_pnp_rebalance_transfer: Option<PendingPnpRebalanceTransfer>,
     /// Contended synchronous File acquisition transferred into the FIFO owner at the reply site.
     pending_synchronous_file_wait: Option<nt_io_manager::SynchronousFileWaiter>,
     /// Final-handle `NtClose` continuation reserved before removing the process handle. File Busy
@@ -23224,14 +23246,14 @@ impl BootDriverStartReports {
 }
 
 struct DriverStartBootstrap {
-    pending: nt_driver_start::PendingDriverStartTable<PendingDriverStart>,
+    pending: nt_driver_start::PendingOperationTable<PendingDriverStart>,
     reports: BootDriverStartReports,
 }
 
 impl DriverStartBootstrap {
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            pending: nt_driver_start::PendingDriverStartTable::with_capacity(capacity),
+            pending: nt_driver_start::PendingOperationTable::with_capacity(capacity),
             reports: BootDriverStartReports::default(),
         }
     }
@@ -23571,7 +23593,7 @@ enum PendingDriverStartTransferKind {
 
 struct PendingDriverStartTransfer {
     batch: OwnedHostedPnpStartBatch,
-    reservation: nt_driver_start::Reservation,
+    reservation: nt_driver_start::PendingOperationReservation,
     kind: PendingDriverStartTransferKind,
 }
 
@@ -23591,6 +23613,16 @@ enum PendingDriverStartOwner {
 struct PendingDriverStart {
     batch: OwnedHostedPnpStartBatch,
     owner: PendingDriverStartOwner,
+}
+
+struct PendingPnpRebalanceTransfer {
+    batch: OwnedHostedPnpRebalance,
+    reservation: nt_driver_start::PendingOperationReservation,
+}
+
+struct PendingPnpRebalance {
+    batch: OwnedHostedPnpRebalance,
+    reply: Option<NativeDriverStartReply>,
 }
 
 static mut EXEC_NT_HANDLER_WORK: core::mem::MaybeUninit<ExecNtHandler> =

@@ -12,6 +12,7 @@ pub(crate) enum HostedPnpStartTrace {
 pub(crate) struct HostedPnpStartOptions {
     pub(crate) trace: HostedPnpStartTrace,
     pub(crate) inject_test_interrupt: bool,
+    reuse_existing_stack: bool,
 }
 
 impl HostedPnpStartOptions {
@@ -19,6 +20,7 @@ impl HostedPnpStartOptions {
         Self {
             trace: HostedPnpStartTrace::BootService,
             inject_test_interrupt: false,
+            reuse_existing_stack: false,
         }
     }
 
@@ -26,6 +28,7 @@ impl HostedPnpStartOptions {
         Self {
             trace: HostedPnpStartTrace::DemandStart,
             inject_test_interrupt: false,
+            reuse_existing_stack: false,
         }
     }
 
@@ -33,6 +36,15 @@ impl HostedPnpStartOptions {
         Self {
             trace: HostedPnpStartTrace::HardwareProof,
             inject_test_interrupt: true,
+            reuse_existing_stack: false,
+        }
+    }
+
+    pub(crate) const fn rebalance() -> Self {
+        Self {
+            trace: HostedPnpStartTrace::DemandStart,
+            inject_test_interrupt: false,
+            reuse_existing_stack: true,
         }
     }
 }
@@ -564,6 +576,259 @@ impl OwnedHostedPnpStartBatch {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostedPnpRebalanceStage {
+    QueryStop,
+    AwaitingLifecycle {
+        minor: nt_pnp_manager::PnpMinor,
+        irp_id: u64,
+        failure_status: Option<nt_status::NtStatus>,
+    },
+    Stop,
+    CancelStop {
+        failure_status: nt_status::NtStatus,
+    },
+    Restart,
+    Complete,
+    OwnershipLost,
+}
+
+pub(crate) enum OwnedHostedPnpRebalanceProgress {
+    AwaitingCompletion,
+    Complete(Result<HostedPnpStartReport, HostedPnpStartBatchFailure>),
+    OwnershipLost(HostedPnpStartBatchFailure),
+}
+
+/// Own QUERY_STOP/STOP/CANCEL_STOP and restart of one existing canonical FDO stack.
+pub(crate) struct OwnedHostedPnpRebalance {
+    device_id: u64,
+    stage: HostedPnpRebalanceStage,
+    restart: OwnedHostedPnpStartBatch,
+    terminal: Option<Result<HostedPnpStartReport, HostedPnpStartBatchFailure>>,
+    ownership_failure: Option<HostedPnpStartBatchFailure>,
+}
+
+impl OwnedHostedPnpRebalance {
+    pub(crate) fn new(
+        device_id: u64,
+        driver_id: u64,
+        driver_ready_for_pnp: bool,
+        spec: DriverServiceLaunchSpec,
+    ) -> Self {
+        Self {
+            device_id,
+            stage: HostedPnpRebalanceStage::QueryStop,
+            restart: OwnedHostedPnpStartBatch::new_for_driver(
+                driver_id,
+                driver_ready_for_pnp,
+                spec,
+                HostedPnpStartOptions::rebalance(),
+            ),
+            terminal: None,
+            ownership_failure: None,
+        }
+    }
+
+    pub(crate) fn needs_completion_redrive(&self) -> bool {
+        matches!(
+            self.stage,
+            HostedPnpRebalanceStage::AwaitingLifecycle { .. }
+                | HostedPnpRebalanceStage::Restart
+        ) && (matches!(
+            self.stage,
+            HostedPnpRebalanceStage::AwaitingLifecycle { .. }
+        ) || self.restart.needs_completion_redrive())
+    }
+
+    pub(crate) unsafe fn drive(&mut self) -> OwnedHostedPnpRebalanceProgress {
+        self.drive_inner(true)
+    }
+
+    pub(crate) unsafe fn drive_after_completion_pump(
+        &mut self,
+    ) -> OwnedHostedPnpRebalanceProgress {
+        self.drive_inner(false)
+    }
+
+    fn fail_terminal(&mut self, failure: HostedPnpStartBatchFailure) {
+        self.terminal = Some(Err(failure));
+        self.stage = HostedPnpRebalanceStage::Complete;
+    }
+
+    fn lose_ownership(&mut self, status: nt_status::NtStatus) {
+        self.ownership_failure = Some(HostedPnpStartBatchFailure {
+            status,
+            teardown_blocked: true,
+        });
+        self.stage = HostedPnpRebalanceStage::OwnershipLost;
+    }
+
+    unsafe fn dispatch_lifecycle(
+        &mut self,
+        minor: nt_pnp_manager::PnpMinor,
+        failure_status: Option<nt_status::NtStatus>,
+    ) -> Option<OwnedHostedPnpRebalanceProgress> {
+        match driver_launch::dispatch_hosted_pnp_lifecycle_canonical(self.device_id, minor) {
+            Ok(driver_launch::HostedPnpLifecycleOutcome::Complete { driver_status }) => {
+                self.finish_lifecycle(minor, driver_status, failure_status);
+                None
+            }
+            Ok(driver_launch::HostedPnpLifecycleOutcome::Pending { irp_id })
+            | Ok(driver_launch::HostedPnpLifecycleOutcome::RepairRequired { irp_id, .. }) => {
+                self.stage = HostedPnpRebalanceStage::AwaitingLifecycle {
+                    minor,
+                    irp_id,
+                    failure_status,
+                };
+                Some(OwnedHostedPnpRebalanceProgress::AwaitingCompletion)
+            }
+            Ok(driver_launch::HostedPnpLifecycleOutcome::Indeterminate {
+                transport_status,
+                ..
+            }) => {
+                self.lose_ownership(transport_status);
+                Some(OwnedHostedPnpRebalanceProgress::OwnershipLost(
+                    self.ownership_failure.expect("rebalance barrier disappeared"),
+                ))
+            }
+            Err(status) => {
+                if minor == nt_pnp_manager::PnpMinor::StopDevice {
+                    self.stage = HostedPnpRebalanceStage::CancelStop {
+                        failure_status: status,
+                    };
+                    None
+                } else if minor == nt_pnp_manager::PnpMinor::CancelStopDevice {
+                    self.lose_ownership(failure_status.unwrap_or(status));
+                    Some(OwnedHostedPnpRebalanceProgress::OwnershipLost(
+                        self.ownership_failure.expect("rebalance barrier disappeared"),
+                    ))
+                } else {
+                    self.fail_terminal(HostedPnpStartBatchFailure {
+                        status: failure_status.unwrap_or(status),
+                        teardown_blocked: false,
+                    });
+                    None
+                }
+            }
+        }
+    }
+
+    fn finish_lifecycle(
+        &mut self,
+        minor: nt_pnp_manager::PnpMinor,
+        driver_status: nt_status::NtStatus,
+        failure_status: Option<nt_status::NtStatus>,
+    ) {
+        match minor {
+            nt_pnp_manager::PnpMinor::QueryStopDevice if driver_status.is_success() => {
+                self.stage = HostedPnpRebalanceStage::Stop;
+            }
+            nt_pnp_manager::PnpMinor::QueryStopDevice => {
+                self.stage = HostedPnpRebalanceStage::CancelStop {
+                    failure_status: driver_status,
+                };
+            }
+            nt_pnp_manager::PnpMinor::StopDevice => {
+                self.stage = HostedPnpRebalanceStage::Restart;
+            }
+            nt_pnp_manager::PnpMinor::CancelStopDevice => {
+                self.fail_terminal(HostedPnpStartBatchFailure {
+                    status: failure_status.unwrap_or(driver_status),
+                    teardown_blocked: false,
+                });
+            }
+            _ => self.lose_ownership(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+        }
+    }
+
+    unsafe fn drive_inner(&mut self, pump_before_observe: bool) -> OwnedHostedPnpRebalanceProgress {
+        loop {
+            match self.stage {
+                HostedPnpRebalanceStage::QueryStop => {
+                    if let Some(progress) = self.dispatch_lifecycle(
+                        nt_pnp_manager::PnpMinor::QueryStopDevice,
+                        None,
+                    ) {
+                        return progress;
+                    }
+                }
+                HostedPnpRebalanceStage::Stop => {
+                    if let Some(progress) =
+                        self.dispatch_lifecycle(nt_pnp_manager::PnpMinor::StopDevice, None)
+                    {
+                        return progress;
+                    }
+                }
+                HostedPnpRebalanceStage::CancelStop { failure_status } => {
+                    if let Some(progress) = self.dispatch_lifecycle(
+                        nt_pnp_manager::PnpMinor::CancelStopDevice,
+                        Some(failure_status),
+                    ) {
+                        return progress;
+                    }
+                }
+                HostedPnpRebalanceStage::AwaitingLifecycle {
+                    minor,
+                    irp_id,
+                    failure_status,
+                } => {
+                    if pump_before_observe {
+                        driver_launch::pump_hosted_io_completions();
+                    }
+                    match driver_launch::observe_hosted_pnp_lifecycle(irp_id, minor) {
+                        Ok(driver_launch::HostedPnpLifecycleObservation::AwaitingCompletion) => {
+                            return OwnedHostedPnpRebalanceProgress::AwaitingCompletion;
+                        }
+                        Ok(driver_launch::HostedPnpLifecycleObservation::Terminal {
+                            driver_status,
+                        }) => {
+                            self.finish_lifecycle(minor, driver_status, failure_status);
+                        }
+                        Ok(driver_launch::HostedPnpLifecycleObservation::Indeterminate {
+                            transport_status,
+                        })
+                        | Err(transport_status) => {
+                            self.lose_ownership(transport_status);
+                        }
+                    }
+                }
+                HostedPnpRebalanceStage::Restart => {
+                    let progress = if pump_before_observe {
+                        self.restart.drive()
+                    } else {
+                        self.restart.drive_after_completion_pump()
+                    };
+                    match progress {
+                        OwnedHostedPnpStartProgress::AwaitingCompletion => {
+                            return OwnedHostedPnpRebalanceProgress::AwaitingCompletion;
+                        }
+                        OwnedHostedPnpStartProgress::Complete(result) => {
+                            self.terminal = Some(result);
+                            self.stage = HostedPnpRebalanceStage::Complete;
+                        }
+                        OwnedHostedPnpStartProgress::OwnershipLost(failure) => {
+                            self.ownership_failure = Some(failure);
+                            self.stage = HostedPnpRebalanceStage::OwnershipLost;
+                        }
+                    }
+                }
+                HostedPnpRebalanceStage::Complete => {
+                    return OwnedHostedPnpRebalanceProgress::Complete(
+                        self.terminal
+                            .expect("terminal rebalance has no retained result"),
+                    );
+                }
+                HostedPnpRebalanceStage::OwnershipLost => {
+                    return OwnedHostedPnpRebalanceProgress::OwnershipLost(
+                        self.ownership_failure
+                            .expect("indeterminate rebalance has no retained barrier"),
+                    );
+                }
+            }
+        }
+    }
+}
+
 struct HostedPnpDevnodeStart<'a, H, C> {
     instance_id: &'a str,
     driver_key: Option<&'a str>,
@@ -898,31 +1163,42 @@ where
             return HostedPnpDevnodeProgress::Terminal { status };
         }
     }
-    let add_device = match bus_pdo {
-        Some(pdo_device_id) => driver_launch::call_add_device_for_bus_pdo(
-            driver_id,
-            class_guid,
-            devnode.driver_key,
-            devnode.linkage_export,
-            devnode.instance_id,
-            pdo_device_id,
-        ),
-        None => driver_launch::call_add_device_for_driver(
-            driver_id,
-            class_guid,
-            devnode.driver_key,
-            devnode.linkage_export,
-            devnode.instance_id,
-            devnode.hardware_ids,
-            devnode.compatible_ids,
-            pdo_description,
-        ),
+    let add_device = if options.reuse_existing_stack {
+        driver_launch::hosted_function_device_id_for_instance(devnode.instance_id, driver_id)
+    } else {
+        match bus_pdo {
+            Some(pdo_device_id) => driver_launch::call_add_device_for_bus_pdo(
+                driver_id,
+                class_guid,
+                devnode.driver_key,
+                devnode.linkage_export,
+                devnode.instance_id,
+                pdo_device_id,
+            ),
+            None => driver_launch::call_add_device_for_driver(
+                driver_id,
+                class_guid,
+                devnode.driver_key,
+                devnode.linkage_export,
+                devnode.instance_id,
+                devnode.hardware_ids,
+                devnode.compatible_ids,
+                pdo_description,
+            ),
+        }
     };
     match add_device {
         Ok(device_id) => {
-            report.add_device = true;
-            report.add_device_count += 1;
-            print_add_device_success(options.trace, service_name, devnode.instance_id, device_id);
+            if !options.reuse_existing_stack {
+                report.add_device = true;
+                report.add_device_count += 1;
+                print_add_device_success(
+                    options.trace,
+                    service_name,
+                    devnode.instance_id,
+                    device_id,
+                );
+            }
             let filter_outcome = match resource_plan.native_property_blobs().1 {
                 Some(requirements) => driver_launch::filter_hosted_device_resource_requirements(
                     device_id,

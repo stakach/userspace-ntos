@@ -3797,6 +3797,11 @@ impl ExecNtHandler {
         write_field!(boot_driver_start_reports, driver_starts.reports);
         write_field!(native_driver_start_report, NativeDriverStartReport::default());
         write_field!(pending_driver_start_transfer, None);
+        write_field!(
+            pending_pnp_rebalances,
+            nt_driver_start::PendingOperationTable::with_capacity(4)
+        );
+        write_field!(pending_pnp_rebalance_transfer, None);
         write_field!(pending_synchronous_file_wait, None);
         write_field!(pending_file_cleanup_wait, None);
         write_field!(pending_file_irp_drain, None);
@@ -19543,7 +19548,11 @@ impl ExecNtHandler {
             .ok_or(STATUS_INVALID_PARAMETER)?;
         state
             .owner
-            .complete_start(owner_slot, status)
+            .complete(
+                nt_pnp_manager::DeviceActionLifecycleOperation::Start,
+                owner_slot,
+                status,
+            )
             .map_err(|_| STATUS_INVALID_PARAMETER)
     }
 
@@ -19692,7 +19701,7 @@ impl ExecNtHandler {
                 buffer_len,
                 PNP_CONTROL_ENUMERATE_DEVICE_LEN,
             ),
-            3 | 20 => self.pnp_control_known_device_action(
+            3 => self.pnp_control_known_device_action(
                 buffer,
                 buffer_len,
                 PNP_CONTROL_DEVICE_CONTROL_LEN,
@@ -19706,6 +19715,7 @@ impl ExecNtHandler {
             14 => self.pnp_control_device_status(buffer, buffer_len),
             15 => self.pnp_control_device_depth(buffer, buffer_len),
             16 => self.pnp_control_device_relations(buffer, buffer_len),
+            20 => self.pnp_control_reset_device(buffer, buffer_len),
             _ => STATUS_NOT_SUPPORTED,
         }
     }
@@ -19759,7 +19769,7 @@ impl ExecNtHandler {
             return STATUS_NOT_SUPPORTED;
         }
         match state.owner.lifecycle() {
-            nt_pnp_manager::DeviceActionLifecycleState::Starting { .. } => {
+            nt_pnp_manager::DeviceActionLifecycleState::InFlight { .. } => {
                 return nt_status::NtStatus::DEVICE_BUSY.raw() as u32;
             }
             nt_pnp_manager::DeviceActionLifecycleState::Terminal { status }
@@ -19807,7 +19817,10 @@ impl ExecNtHandler {
             .as_mut()
             .expect("live action disappeared before START")
             .owner
-            .begin_start(owner_slot)
+            .begin(
+                nt_pnp_manager::DeviceActionLifecycleOperation::Start,
+                owner_slot,
+            )
             .is_err()
         {
             self.pending_driver_starts
@@ -19869,6 +19882,80 @@ impl ExecNtHandler {
                     )
                     .expect("indeterminate live START rejected its barrier owner");
                 status
+            }
+        }
+    }
+
+    unsafe fn pnp_control_reset_device(&mut self, buffer: u64, buffer_len: usize) -> u32 {
+        if buffer == 0 || buffer_len < PNP_CONTROL_DEVICE_CONTROL_LEN {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let instance = match self.pnp_read_device_instance(buffer) {
+            Ok(instance) => instance,
+            Err(status) => return status,
+        };
+        match Self::pnp_device_exists(&instance) {
+            Ok(true) => {}
+            Ok(false) => return STATUS_NO_SUCH_DEVICE,
+            Err(status) => return status,
+        }
+        let spec = match live_config_existing_device_launch_spec(&instance, SERVICE_DEMAND_START) {
+            Ok(spec) if spec.class == driver_launch::DriverClass::Device => spec,
+            Ok(_) => return STATUS_INVALID_PARAMETER,
+            Err(status) => return status as u32,
+        };
+        if spec.devnodes.len() != 1 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let Some((driver_id, ready_for_pnp)) =
+            driver_launch::loaded_driver_pnp_start_context(&spec.driver_object_path)
+        else {
+            return STATUS_DEVICE_NOT_READY;
+        };
+        if !ready_for_pnp {
+            return STATUS_DEVICE_NOT_READY;
+        }
+        let device_id = match driver_launch::hosted_function_device_id_for_instance(
+            &instance,
+            driver_id,
+        ) {
+            Ok(device_id) => device_id,
+            Err(status) => return status.raw() as u32,
+        };
+        if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free() {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        let reservation = match self.pending_pnp_rebalances.reserve() {
+            Ok(reservation) => reservation,
+            Err(_) => return STATUS_INSUFFICIENT_RESOURCES,
+        };
+        let mut batch =
+            OwnedHostedPnpRebalance::new(device_id, driver_id, ready_for_pnp, spec);
+        match batch.drive() {
+            OwnedHostedPnpRebalanceProgress::AwaitingCompletion => {
+                self.pending_pnp_rebalance_transfer = Some(PendingPnpRebalanceTransfer {
+                    batch,
+                    reservation,
+                });
+                nt_status::NtStatus::PENDING.raw() as u32
+            }
+            OwnedHostedPnpRebalanceProgress::Complete(result) => {
+                self.pending_pnp_rebalances
+                    .cancel(reservation)
+                    .expect("synchronous PnP rebalance lost its reservation");
+                match result {
+                    Ok(_) => 0,
+                    Err(failure) => failure.status.raw() as u32,
+                }
+            }
+            OwnedHostedPnpRebalanceProgress::OwnershipLost(failure) => {
+                self.pending_pnp_rebalances
+                    .publish(
+                        reservation,
+                        PendingPnpRebalance { batch, reply: None },
+                    )
+                    .expect("indeterminate PnP rebalance rejected its barrier owner");
+                failure.status.raw() as u32
             }
         }
     }

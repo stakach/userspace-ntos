@@ -9297,6 +9297,10 @@ pub(crate) unsafe fn service_sec_image(
                 PendingDriverStartTransfer,
                 nt_syscall_abi::ParkedSyscallReply,
             )> = None;
+            let mut transfer_pending_pnp_rebalance: Option<(
+                PendingPnpRebalanceTransfer,
+                nt_syscall_abi::ParkedSyscallReply,
+            )> = None;
             let mut transfer_file_irp_drain: Option<(
                 nt_io_manager::PendingFileIrpDrain,
                 nt_io_manager::PendingFileIrpDrainReservation,
@@ -9429,6 +9433,10 @@ pub(crate) unsafe fn service_sec_image(
                 assert!(
                     nt_handler.pending_driver_start_transfer.is_none(),
                     "previous syscall leaked a driver START continuation reservation"
+                );
+                assert!(
+                    nt_handler.pending_pnp_rebalance_transfer.is_none(),
+                    "previous syscall leaked a PnP rebalance continuation reservation"
                 );
                 nt_handler.pending_synchronous_file_wait = None;
                 assert!(
@@ -9992,6 +10000,9 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 if let Some(transfer) = nt_handler.pending_driver_start_transfer.take() {
                     transfer_pending_driver_start = Some((transfer, parked_syscall_reply));
+                }
+                if let Some(transfer) = nt_handler.pending_pnp_rebalance_transfer.take() {
+                    transfer_pending_pnp_rebalance = Some((transfer, parked_syscall_reply));
                 }
                 if let Some(mut waiter) = nt_handler.pending_synchronous_file_wait.take() {
                     // Publish the exact FIFO owner before any post-dispatch completion can release
@@ -15728,6 +15739,28 @@ pub(crate) unsafe fn service_sec_image(
             // reply until their devnode is terminal. Publication precedes Reply-object rotation.
             if let Some((transfer, reply)) = transfer_pending_driver_start.take() {
                 pending_driver_start_transfer(&mut nt_handler, transfer, reply);
+                trace_indefinite_wait_park(
+                    &nt_handler,
+                    badge,
+                    live_top_badges(&nt_handler),
+                    crash_parked,
+                    wait_parked,
+                );
+                mark_wait_parked!(pi, resume_ip);
+                let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
+                let _ = finalize_service_loop_state(&mut nt_handler);
+                let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                badge = nb;
+                mi = nmi;
+                m0 = nm0;
+                m1 = nm1;
+                m2 = nm2;
+                m3 = nm3;
+                continue;
+            }
+            if let Some((transfer, reply)) = transfer_pending_pnp_rebalance.take() {
+                pending_pnp_rebalance_transfer(&mut nt_handler, transfer, reply);
                 trace_indefinite_wait_park(
                     &nt_handler,
                     badge,
@@ -22470,6 +22503,38 @@ unsafe fn pending_driver_start_transfer(
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
 }
 
+unsafe fn pending_pnp_rebalance_transfer(
+    nt_handler: &mut ExecNtHandler,
+    transfer: PendingPnpRebalanceTransfer,
+    reply: nt_syscall_abi::ParkedSyscallReply,
+) {
+    let PendingPnpRebalanceTransfer { batch, reservation } = transfer;
+    let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    assert_ne!(
+        stolen, 0,
+        "pending PnP rebalance Reply object disappeared after preflight"
+    );
+    let (fresh_index, fresh) = wait_reply_pool_find_free()
+        .expect("pending PnP rebalance Reply-pool claim disappeared after preflight");
+    nt_handler
+        .pending_pnp_rebalances
+        .publish(
+            reservation,
+            PendingPnpRebalance {
+                batch,
+                reply: Some(NativeDriverStartReply {
+                    tid: nt_handler.current_tid,
+                    badge: nt_handler.current_badge,
+                    reply_cap: stolen,
+                    reply,
+                }),
+            },
+        )
+        .expect("reserved PnP rebalance continuation rejected its exact batch");
+    wait_reply_pool_mark_used(fresh_index);
+    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+}
+
 unsafe fn pending_native_driver_start_reply(
     nt_handler: &mut ExecNtHandler,
     pending: &mut PendingDriverStart,
@@ -22628,6 +22693,58 @@ unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u6
     completed
 }
 
+unsafe fn pending_pnp_rebalance_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
+    let mut completed = 0u64;
+    for slot in 0..nt_handler.pending_pnp_rebalances.slot_count() {
+        let progress = {
+            let Some(pending) = nt_handler.pending_pnp_rebalances.get_mut(slot) else {
+                continue;
+            };
+            pending.batch.drive_after_completion_pump()
+        };
+        match progress {
+            OwnedHostedPnpRebalanceProgress::AwaitingCompletion => {}
+            OwnedHostedPnpRebalanceProgress::Complete(result) => {
+                let status = match result {
+                    Ok(_) => nt_status::NtStatus::SUCCESS.raw() as u32,
+                    Err(failure) => failure.status.raw() as u32,
+                };
+                let mut pending = nt_handler
+                    .pending_pnp_rebalances
+                    .take(slot)
+                    .expect("completed PnP rebalance continuation disappeared");
+                if let Some(reply) = pending.reply.take() {
+                    pending_driver_start_reply_owner(
+                        nt_handler,
+                        reply.reply_cap,
+                        reply.reply,
+                        reply.badge,
+                        status,
+                    );
+                }
+                completed = completed.saturating_add(1);
+            }
+            OwnedHostedPnpRebalanceProgress::OwnershipLost(failure) => {
+                let reply = nt_handler
+                    .pending_pnp_rebalances
+                    .get_mut(slot)
+                    .and_then(|pending| pending.reply.take());
+                if let Some(reply) = reply {
+                    pending_driver_start_reply_owner(
+                        nt_handler,
+                        reply.reply_cap,
+                        reply.reply,
+                        reply.badge,
+                        failure.status.raw() as u32,
+                    );
+                    completed = completed.saturating_add(1);
+                }
+            }
+        }
+    }
+    completed
+}
+
 unsafe fn pump_hosted_io_and_redrive_driver_starts(nt_handler: &mut ExecNtHandler) -> u64 {
     let activated = driver_launch::drain_hosted_driver_dpc_activations();
     let pumped = driver_launch::pump_hosted_io_completions() as u64;
@@ -22637,10 +22754,11 @@ unsafe fn pump_hosted_io_and_redrive_driver_starts(nt_handler: &mut ExecNtHandle
     activated
         .saturating_add(pumped)
         .saturating_add(pending_driver_start_redrive_all(nt_handler))
+        .saturating_add(pending_pnp_rebalance_redrive_all(nt_handler))
 }
 
 fn pending_driver_start_redrive_needed(nt_handler: &ExecNtHandler) -> bool {
-    nt_handler
+    let driver_start = nt_handler
         .pending_driver_starts
         .occupied_slots()
         .any(|slot| {
@@ -22648,7 +22766,17 @@ fn pending_driver_start_redrive_needed(nt_handler: &ExecNtHandler) -> bool {
                 .pending_driver_starts
                 .get(slot)
                 .is_some_and(|pending| pending.batch.needs_completion_redrive())
-        })
+        });
+    driver_start
+        || nt_handler
+            .pending_pnp_rebalances
+            .occupied_slots()
+            .any(|slot| {
+                nt_handler
+                    .pending_pnp_rebalances
+                    .get(slot)
+                    .is_some_and(|pending| pending.batch.needs_completion_redrive())
+            })
 }
 
 fn pending_driver_start_reports_snapshot(nt_handler: &ExecNtHandler) -> BootDriverStartReports {
@@ -22716,6 +22844,35 @@ pub(crate) unsafe fn pending_driver_start_abandon_thread(
         }
         thread_wait_state_clear_badge(reply.badge);
         abandoned += 1;
+    }
+    for slot in 0..nt_handler.pending_pnp_rebalances.slot_count() {
+        let matches = nt_handler
+            .pending_pnp_rebalances
+            .get(slot)
+            .and_then(|pending| pending.reply.as_ref())
+            .is_some_and(|reply| reply.tid == tid && reply.reply_cap != 0);
+        if !matches {
+            continue;
+        }
+        let reply = nt_handler
+            .pending_pnp_rebalances
+            .get_mut(slot)
+            .expect("PnP rebalance owner disappeared during abandonment")
+            .reply
+            .take()
+            .expect("PnP rebalance reply disappeared during abandonment");
+        let cap = reply.reply_cap;
+        let deleted = cnode_delete_r(cap);
+        let retyped = if deleted == 0 {
+            untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
+        } else {
+            u64::MAX
+        };
+        if deleted == 0 && retyped == 0 {
+            release_reply_pool_cap(cap);
+        }
+        thread_wait_state_clear_badge(reply.badge);
+        abandoned = abandoned.saturating_add(1);
     }
     abandoned
 }

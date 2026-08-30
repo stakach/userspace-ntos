@@ -19050,3 +19050,45 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     without calling AddDevice again. Then extend the same owner through QUERY_REMOVE,
     SURPRISE_REMOVE, final REMOVE, interface/provider teardown, and generation-protected
     `finish_remove`.
+
+    B3 dynamic reset/rebalance checkpoint (2026-08-31, implementation green):
+    `PlugPlayControlResetDevice` is no longer an existence-only success. It resolves the live CM
+    instance to its service, loaded driver, canonical devnode, PDO, FDO, hosted-domain binding, and
+    current I/O Manager record, then owns QUERY_STOP through STOP or CANCEL_STOP. Every lifecycle
+    request traverses the complete captured FDO stack through the retained hosted PnP transaction;
+    pending completion, strict ACK, lifecycle commit, and post-publication repair use the same
+    identity checks as START. A failed QUERY_STOP is always followed by CANCEL_STOP, while an
+    unreturnable CANCEL_STOP or lost transport retains an explicit barrier.
+
+    After a returned STOP has revoked only that device's resource projection, assignment, and
+    started power visibility, the owner re-queries the current platform PnP context, sends
+    FILTER_RESOURCE_REQUIREMENTS again, arbitrates a fresh exact grant, and sends START through the
+    existing FDO stack. The START batch has an explicit existing-stack mode: it cannot call
+    AddDevice and verifies that the CM service's loaded driver still owns the exact FDO binding.
+    Filter and START waits remain inside the same owned rebalance continuation.
+
+    Pending rebalance syscalls use a dynamically growing generation-exact table. The live syscall
+    Reply object is transferred only after the reservation and driver side effects exist, terminal
+    completion replies exactly once, thread death detaches only its reply, and indeterminate driver
+    ownership leaves the operation retained as a teardown barrier. No current-device singleton or
+    first-binding lookup was added. Device-action claim ownership is now typed for START,
+    rebalance, and removal rather than encoding every continuation as `Starting`.
+    The reusable table is now named `PendingOperationTable`; the obsolete START-specific table and
+    reservation names were removed rather than carried into the general lifecycle machinery.
+
+    Filtered resource publication is now legal only after the canonical device stack exists, or
+    while that exact stack is stopped for rebalance; it can no longer mutate an enumerated or
+    started devnode out of phase. Formatting, `git diff --check`, focused `nt-pnp-manager`
+    validation (`47/47`), and the freestanding executive check pass at the unchanged 209-warning
+    baseline. The pre-existing `-no-shutdown` QEMU still owns the serialized desktop lane, so no
+    competing boot was started.
+
+    Review adjustment: reset/rebalance is closed for the current hosted-device boundary. Continue
+    with two distinct removal owners. User-requested removal must run QUERY_REMOVE and either
+    CANCEL_REMOVE with veto output or final REMOVE. Bus disappearance must run SURPRISE_REMOVE then
+    final REMOVE while the CM notification claim remains retained. Both paths must disable and
+    delete exact PDO interfaces, quiesce per-device provider callbacks/timers/work items, revoke
+    grants, detach and destroy only the affected FDO stack, unregister its power record, and call
+    generation-protected `finish_remove` only after all external teardown commits. Driver unload
+    follows only when every device, IRP, callback, and provider owner in that hosted-domain
+    generation is gone.

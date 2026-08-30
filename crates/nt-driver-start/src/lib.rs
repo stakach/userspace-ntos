@@ -191,12 +191,12 @@ impl DriverStartBatch {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Reservation {
+pub struct PendingOperationReservation {
     slot: usize,
     generation: u64,
 }
 
-impl Reservation {
+impl PendingOperationReservation {
     /// Stable table slot reserved for the continuation. The generation remains private so callers
     /// can correlate external ownership without gaining the ability to forge a reservation.
     pub const fn slot(self) -> usize {
@@ -205,7 +205,7 @@ impl Reservation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TableError {
+pub enum PendingOperationTableError {
     Full,
     StaleReservation,
 }
@@ -216,14 +216,14 @@ enum Slot<T> {
     Occupied { generation: u64, value: T },
 }
 
-/// Generation-exact publication table for pending load continuations.
+/// Generation-exact publication table for pending continuations.
 ///
 /// Growth occurs only in `reserve`, so callers can establish storage before driver side effects.
-pub struct PendingDriverStartTable<T> {
+pub struct PendingOperationTable<T> {
     slots: Vec<Slot<T>>,
 }
 
-impl<T> PendingDriverStartTable<T> {
+impl<T> PendingOperationTable<T> {
     pub fn with_capacity(capacity: usize) -> Self {
         let mut slots = Vec::with_capacity(capacity);
         for _ in 0..capacity {
@@ -246,7 +246,7 @@ impl<T> PendingDriverStartTable<T> {
         self.slots.capacity()
     }
 
-    pub fn reserve(&mut self) -> Result<Reservation, TableError> {
+    pub fn reserve(&mut self) -> Result<PendingOperationReservation, PendingOperationTableError> {
         let available = self.slots.iter().enumerate().find_map(|(slot, entry)| {
             if let Slot::Empty { generation } = entry {
                 Some((slot, generation.wrapping_add(1).max(1)))
@@ -257,16 +257,21 @@ impl<T> PendingDriverStartTable<T> {
         let (slot, generation) = if let Some(available) = available {
             available
         } else {
-            self.slots.try_reserve(1).map_err(|_| TableError::Full)?;
+            self.slots
+                .try_reserve(1)
+                .map_err(|_| PendingOperationTableError::Full)?;
             let slot = self.slots.len();
             self.slots.push(Slot::Empty { generation: 0 });
             (slot, 1)
         };
         self.slots[slot] = Slot::Reserved { generation };
-        Ok(Reservation { slot, generation })
+        Ok(PendingOperationReservation { slot, generation })
     }
 
-    pub fn cancel(&mut self, reservation: Reservation) -> Result<(), TableError> {
+    pub fn cancel(
+        &mut self,
+        reservation: PendingOperationReservation,
+    ) -> Result<(), PendingOperationTableError> {
         match self.slots.get(reservation.slot) {
             Some(Slot::Reserved { generation }) if *generation == reservation.generation => {
                 self.slots[reservation.slot] = Slot::Empty {
@@ -274,11 +279,15 @@ impl<T> PendingDriverStartTable<T> {
                 };
                 Ok(())
             }
-            _ => Err(TableError::StaleReservation),
+            _ => Err(PendingOperationTableError::StaleReservation),
         }
     }
 
-    pub fn publish(&mut self, reservation: Reservation, value: T) -> Result<usize, TableError> {
+    pub fn publish(
+        &mut self,
+        reservation: PendingOperationReservation,
+        value: T,
+    ) -> Result<usize, PendingOperationTableError> {
         match self.slots.get(reservation.slot) {
             Some(Slot::Reserved { generation }) if *generation == reservation.generation => {
                 self.slots[reservation.slot] = Slot::Occupied {
@@ -287,7 +296,7 @@ impl<T> PendingDriverStartTable<T> {
                 };
                 Ok(reservation.slot)
             }
-            _ => Err(TableError::StaleReservation),
+            _ => Err(PendingOperationTableError::StaleReservation),
         }
     }
 
@@ -332,7 +341,7 @@ mod tests {
 
     #[test]
     fn reservation_exposes_only_its_stable_owner_slot() {
-        let mut table = PendingDriverStartTable::<u32>::with_capacity(2);
+        let mut table = PendingOperationTable::<u32>::with_capacity(2);
         let first = table.reserve().unwrap();
         let second = table.reserve().unwrap();
         assert_eq!(first.slot(), 0);
@@ -393,12 +402,15 @@ mod tests {
 
     #[test]
     fn reservation_generation_rejects_stale_publication() {
-        let mut table = PendingDriverStartTable::with_capacity(1);
+        let mut table = PendingOperationTable::with_capacity(1);
         let first = table.reserve().unwrap();
         table.cancel(first).unwrap();
         let second = table.reserve().unwrap();
         assert_ne!(first, second);
-        assert_eq!(table.publish(first, 1), Err(TableError::StaleReservation));
+        assert_eq!(
+            table.publish(first, 1),
+            Err(PendingOperationTableError::StaleReservation)
+        );
         let slot = table.publish(second, 2).unwrap();
         assert_eq!(table.get(slot), Some(&2));
         assert_eq!(table.take(slot), Some(2));
@@ -407,7 +419,7 @@ mod tests {
 
     #[test]
     fn table_grows_only_during_reservation() {
-        let mut table = PendingDriverStartTable::<u64>::with_capacity(1);
+        let mut table = PendingOperationTable::<u64>::with_capacity(1);
         let first = table.reserve().unwrap();
         table.publish(first, 5).unwrap();
         let second = table.reserve().unwrap();

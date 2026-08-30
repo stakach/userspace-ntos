@@ -71,11 +71,25 @@ pub enum DeviceActionNotificationState {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DeviceActionLifecycleOperation {
+    Start,
+    Rebalance,
+    Remove,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DeviceActionLifecycleState {
     AwaitingAction,
-    Starting { owner_slot: usize },
-    Terminal { status: u32 },
-    Barrier { status: u32 },
+    InFlight {
+        operation: DeviceActionLifecycleOperation,
+        owner_slot: usize,
+    },
+    Terminal {
+        status: u32,
+    },
+    Barrier {
+        status: u32,
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -131,27 +145,36 @@ impl DeviceActionOwner {
         Ok(())
     }
 
-    pub fn begin_start(&mut self, owner_slot: usize) -> Result<(), DeviceActionOwnerError> {
+    pub fn begin(
+        &mut self,
+        operation: DeviceActionLifecycleOperation,
+        owner_slot: usize,
+    ) -> Result<(), DeviceActionOwnerError> {
         if self.lifecycle != DeviceActionLifecycleState::AwaitingAction {
             return Err(DeviceActionOwnerError::WrongPhase);
         }
-        self.lifecycle = DeviceActionLifecycleState::Starting { owner_slot };
+        self.lifecycle = DeviceActionLifecycleState::InFlight {
+            operation,
+            owner_slot,
+        };
         Ok(())
     }
 
-    pub fn complete_start(
+    pub fn complete(
         &mut self,
+        operation: DeviceActionLifecycleOperation,
         owner_slot: usize,
         status: u32,
     ) -> Result<(), DeviceActionOwnerError> {
         match self.lifecycle {
-            DeviceActionLifecycleState::Starting {
+            DeviceActionLifecycleState::InFlight {
+                operation: expected_operation,
                 owner_slot: expected,
-            } if expected == owner_slot => {
+            } if expected_operation == operation && expected == owner_slot => {
                 self.lifecycle = DeviceActionLifecycleState::Terminal { status };
                 Ok(())
             }
-            DeviceActionLifecycleState::Starting { .. } => Err(DeviceActionOwnerError::WrongOwner),
+            DeviceActionLifecycleState::InFlight { .. } => Err(DeviceActionOwnerError::WrongOwner),
             _ => Err(DeviceActionOwnerError::WrongPhase),
         }
     }
@@ -848,6 +871,19 @@ impl PnpManager {
             .map(|devnode| devnode.id)
     }
 
+    pub fn devnode_for_instance(&self, instance_id: &str) -> Option<u64> {
+        self.devnodes
+            .iter()
+            .find(|devnode| {
+                devnode.state != DeviceState::Removed
+                    && devnode
+                        .instance_id
+                        .as_deref()
+                        .is_some_and(|current| current.eq_ignore_ascii_case(instance_id))
+            })
+            .map(|devnode| devnode.id)
+    }
+
     pub fn enumerated_pdo_properties(&self, pdo_object_id: u64) -> Option<&PdoProperties> {
         self.devnodes
             .iter()
@@ -1037,6 +1073,15 @@ impl PnpManager {
                     && devnode.state != DeviceState::Removed
             })
             .ok_or(PnpError::StaleId)?;
+        if !matches!(
+            devnode.state,
+            DeviceState::DeviceStackBuilt | DeviceState::Stopped
+        ) || devnode.pending_dispatch.is_some()
+            || devnode.negotiation.is_some()
+            || devnode.remove_ready.is_some()
+        {
+            return Err(PnpError::InvalidTransition);
+        }
         devnode
             .pdo_properties
             .as_mut()
@@ -1524,6 +1569,11 @@ mod tests {
             p.query_device_property(pdo, 20),
             Ok(PnpDevicePropertyValue::Bytes(&[]))
         );
+        assert_eq!(
+            p.commit_filtered_resource_requirements(pdo, vec![0x44, 0x55]),
+            Err(PnpError::InvalidTransition)
+        );
+        p.commit_device_stack(pdo, 0x5678, 0x9abc).unwrap();
         p.commit_filtered_resource_requirements(pdo, vec![0x44, 0x55])
             .unwrap();
         assert_eq!(
@@ -1534,8 +1584,6 @@ mod tests {
             p.query_device_property(pdo, 21),
             Err(PnpPropertyError::DeviceNotReady)
         );
-
-        p.commit_device_stack(pdo, 0x5678, 0x9abc).unwrap();
         p.commit_resource_assignment(pdo, vec![4, 5], vec![6, 7])
             .unwrap();
         assert_eq!(
@@ -2018,6 +2066,8 @@ mod tests {
             properties.filtered_resource_requirements,
             PropertyBlobState::Unqueried
         );
+        p.commit_filtered_resource_requirements(pdo, vec![7, 8])
+            .unwrap();
         p.commit_resource_assignment(pdo, vec![3], vec![4]).unwrap();
         assert_eq!(p.state(id), Some(ResourcesAssigned));
 
@@ -2139,12 +2189,20 @@ mod tests {
         let mut response_first = DeviceActionOwner::new(action_identity()).unwrap();
         response_first.respond().unwrap();
         assert!(!response_first.ready_to_acknowledge());
-        response_first.begin_start(3).unwrap();
+        response_first
+            .begin(DeviceActionLifecycleOperation::Start, 3)
+            .unwrap();
         assert_eq!(
-            response_first.complete_start(2, 0),
+            response_first.complete(DeviceActionLifecycleOperation::Start, 2, 0),
             Err(DeviceActionOwnerError::WrongOwner)
         );
-        response_first.complete_start(3, 0).unwrap();
+        assert_eq!(
+            response_first.complete(DeviceActionLifecycleOperation::Rebalance, 3, 0),
+            Err(DeviceActionOwnerError::WrongOwner)
+        );
+        response_first
+            .complete(DeviceActionLifecycleOperation::Start, 3, 0)
+            .unwrap();
         assert!(response_first.ready_to_acknowledge());
         assert_eq!(response_first.acknowledge(), Ok(action_identity()));
 
@@ -2161,7 +2219,9 @@ mod tests {
     #[test]
     fn device_action_pending_and_barrier_retain_exact_claim() {
         let mut pending = DeviceActionOwner::new(action_identity()).unwrap();
-        pending.begin_start(9).unwrap();
+        pending
+            .begin(DeviceActionLifecycleOperation::Remove, 9)
+            .unwrap();
         pending.respond().unwrap();
         assert_eq!(
             pending.clone().acknowledge(),
@@ -2178,7 +2238,7 @@ mod tests {
         );
         assert!(!pending.ready_to_acknowledge());
         assert_eq!(
-            pending.complete_start(9, 0),
+            pending.complete(DeviceActionLifecycleOperation::Remove, 9, 0),
             Err(DeviceActionOwnerError::WrongPhase)
         );
     }

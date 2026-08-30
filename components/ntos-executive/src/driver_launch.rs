@@ -37341,6 +37341,51 @@ pub(crate) fn hosted_bus_reported_device_id(instance_id: &str) -> Option<u64> {
     }
 }
 
+pub(crate) unsafe fn hosted_function_device_id_for_instance(
+    instance_id: &str,
+    expected_driver_id: u64,
+) -> Result<u64, nt_status::NtStatus> {
+    let devnode_id = hosted_pnp_manager_mut()
+        .devnode_for_instance(instance_id)
+        .ok_or(nt_status::NtStatus(0xC000_000Eu32 as i32))?;
+    let pdo_device_id = hosted_pnp_manager_mut()
+        .pdo(devnode_id)
+        .filter(|device_id| *device_id != 0)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let device_id = hosted_pnp_manager_mut()
+        .fdo(devnode_id)
+        .filter(|device_id| *device_id != 0)
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    let binding = hosted_device_binding_by_device_id(device_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if binding.pdo_device_id != pdo_device_id
+        || binding.driver_id != expected_driver_id
+        || io_manager_mut()
+            .device(nt_io_manager::DeviceId(device_id))
+            .is_none_or(|device| device.delete_pending)
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    Ok(device_id)
+}
+
+pub(crate) unsafe fn hosted_device_service_name_for_instance(
+    instance_id: &str,
+) -> Result<String, nt_status::NtStatus> {
+    let devnode_id = hosted_pnp_manager_mut()
+        .devnode_for_instance(instance_id)
+        .ok_or(nt_status::NtStatus(0xC000_000Eu32 as i32))?;
+    let service = hosted_pnp_manager_mut()
+        .service(devnode_id)
+        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(service.len())
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    owned.push_str(service);
+    Ok(owned)
+}
+
 unsafe fn drain_hosted_pnp_completions() -> usize {
     let mut progress = 0usize;
     let mut index = 0usize;
@@ -37497,6 +37542,48 @@ pub(crate) unsafe fn observe_hosted_pnp_start(
         | HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck
         | HostedPnpTransactionPhase::PostPublicationRepair => {
             Ok(HostedPnpStartObservation::AwaitingCompletion)
+        }
+    }
+}
+
+pub(crate) unsafe fn observe_hosted_pnp_lifecycle(
+    irp_id: u64,
+    expected_minor: nt_pnp_manager::PnpMinor,
+) -> Result<HostedPnpLifecycleObservation, nt_status::NtStatus> {
+    if irp_id == 0 || expected_minor == nt_pnp_manager::PnpMinor::StartDevice {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let irp_id = IrpId(irp_id);
+    let transactions = hosted_pnp_transactions_mut();
+    let index = transactions
+        .iter()
+        .position(|transaction| transaction.irp_id == irp_id)
+        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    if transactions[index].minor != expected_minor {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    match transactions[index].phase {
+        HostedPnpTransactionPhase::Terminal => {
+            let transaction = transactions.remove(index);
+            Ok(HostedPnpLifecycleObservation::Terminal {
+                driver_status: transaction
+                    .driver_status
+                    .expect("terminal hosted PnP lifecycle IRP has no driver status"),
+            })
+        }
+        HostedPnpTransactionPhase::Indeterminate => {
+            Ok(HostedPnpLifecycleObservation::Indeterminate {
+                transport_status: transactions[index]
+                    .barrier_status
+                    .expect("indeterminate hosted PnP lifecycle IRP has no barrier status"),
+            })
+        }
+        HostedPnpTransactionPhase::Prepared
+        | HostedPnpTransactionPhase::Dispatching
+        | HostedPnpTransactionPhase::AwaitingCompletion
+        | HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck
+        | HostedPnpTransactionPhase::PostPublicationRepair => {
+            Ok(HostedPnpLifecycleObservation::AwaitingCompletion)
         }
     }
 }
@@ -39292,6 +39379,36 @@ pub(crate) enum HostedPnpStartOutcome {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum HostedPnpStartObservation {
+    AwaitingCompletion,
+    Terminal {
+        driver_status: nt_status::NtStatus,
+    },
+    Indeterminate {
+        transport_status: nt_status::NtStatus,
+    },
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HostedPnpLifecycleOutcome {
+    Complete {
+        driver_status: nt_status::NtStatus,
+    },
+    Pending {
+        irp_id: u64,
+    },
+    Indeterminate {
+        irp_id: u64,
+        transport_status: nt_status::NtStatus,
+    },
+    RepairRequired {
+        irp_id: u64,
+        driver_status: nt_status::NtStatus,
+        repair_status: nt_status::NtStatus,
+    },
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HostedPnpLifecycleObservation {
     AwaitingCompletion,
     Terminal {
         driver_status: nt_status::NtStatus,
@@ -48887,6 +49004,146 @@ pub(crate) unsafe fn rollback_hosted_device_start(
         clear_hosted_resource_projection(binding, inst.exec_shared_va)?;
     }
     Ok(())
+}
+
+/// Send one canonical non-START PnP lifecycle IRP through the complete FDO stack.
+pub(crate) unsafe fn dispatch_hosted_pnp_lifecycle_canonical(
+    device_id: u64,
+    minor: nt_pnp_manager::PnpMinor,
+) -> Result<HostedPnpLifecycleOutcome, nt_status::NtStatus> {
+    if minor == nt_pnp_manager::PnpMinor::StartDevice {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let binding = hosted_device_binding_by_device_id(device_id)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let (_, inst) = instance_by_driver_id(binding.driver_id)
+        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    if !inst.ready {
+        return Err(nt_status::NtStatus::DEVICE_NOT_READY);
+    }
+    let parameters = PnpParameters::lifecycle(minor.raw())?;
+    let prepared = io_manager_mut().prepare_external_pnp_owned_to_device(
+        ClientId(IO_MANAGER_COMPONENT_ID),
+        nt_io_manager::DeviceId(binding.pdo_device_id),
+        0,
+        parameters,
+        Vec::new(),
+    )?;
+    let irp_id = prepared.irp_id();
+    let (origin_driver_id, completion_driver_id, completion_device_id) = {
+        let irp = io_manager_mut()
+            .irp(irp_id)
+            .expect("prepared hosted lifecycle IRP disappeared before dispatch");
+        let current = irp
+            .current_stack()
+            .expect("prepared hosted lifecycle IRP lost its captured device stack");
+        (irp.origin_driver_id, current.driver_id, current.device_id)
+    };
+    if let Err(status) = reserve_active_hosted_irp_transfer_slot() {
+        let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
+        return Err(status);
+    }
+    let transaction = HostedPnpTransaction {
+        binding,
+        irp_id,
+        minor,
+        origin_driver_id,
+        completion_driver_id,
+        completion_device_id,
+        token: None,
+        phase: HostedPnpTransactionPhase::Prepared,
+        driver_status: None,
+        barrier_status: None,
+        pci_interrupt_line: None,
+        pci_line_published: false,
+        mmio_usage_published: false,
+        interrupt_usage_published: false,
+        dma_usage_published: false,
+        resource_snapshot_published: false,
+        power_state_published: false,
+        resource_projection_released: false,
+        resource_assignment_released: false,
+        power_stop_published: false,
+    };
+    if let Err(status) = reserve_hosted_pnp_transaction(transaction) {
+        let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
+        return Err(status);
+    }
+    let token = match hosted_pnp_manager_mut().begin_pnp_dispatch(
+        binding.pdo_device_id,
+        minor,
+        irp_id.raw(),
+    ) {
+        Ok(token) => token,
+        Err(error) => {
+            let status = hosted_pnp_status(error);
+            let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
+            remove_hosted_pnp_transaction(irp_id);
+            return Err(status);
+        }
+    };
+    set_hosted_pnp_transaction_token(irp_id, token)
+        .expect("reserved hosted lifecycle transaction disappeared before dispatch");
+
+    match io_manager_mut().dispatch_prepared_external_pnp(prepared) {
+        ExternalPnpDispatchResult::Returned { status, .. } => {
+            if let Err(transport_status) = complete_hosted_pnp_lifecycle(irp_id, status) {
+                set_hosted_pnp_indeterminate(irp_id, transport_status)
+                    .expect("synchronous hosted lifecycle failure lost its transaction");
+                return Ok(HostedPnpLifecycleOutcome::Indeterminate {
+                    irp_id: irp_id.raw(),
+                    transport_status,
+                });
+            }
+            set_hosted_pnp_driver_status(
+                irp_id,
+                HostedPnpTransactionPhase::PostPublicationRepair,
+                status,
+            )
+            .expect("synchronous hosted lifecycle return lost its transaction");
+            if let Err(repair_status) = finish_hosted_pnp_publication(irp_id) {
+                return Ok(HostedPnpLifecycleOutcome::RepairRequired {
+                    irp_id: irp_id.raw(),
+                    driver_status: status,
+                    repair_status,
+                });
+            }
+            remove_hosted_pnp_transaction(irp_id);
+            Ok(HostedPnpLifecycleOutcome::Complete {
+                driver_status: status,
+            })
+        }
+        ExternalPnpDispatchResult::ReturnedPayload { .. } => {
+            let transport_status = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+            set_hosted_pnp_indeterminate(irp_id, transport_status)
+                .expect("payload-returning hosted lifecycle IRP lost its transaction");
+            Ok(HostedPnpLifecycleOutcome::Indeterminate {
+                irp_id: irp_id.raw(),
+                transport_status,
+            })
+        }
+        ExternalPnpDispatchResult::Pending { irp_id } => {
+            transition_hosted_pnp_transaction_phase(
+                irp_id,
+                HostedPnpTransactionPhase::AwaitingCompletion,
+            )
+            .expect("pending hosted lifecycle IRP lost its transaction");
+            Ok(HostedPnpLifecycleOutcome::Pending {
+                irp_id: irp_id.raw(),
+            })
+        }
+        ExternalPnpDispatchResult::Indeterminate {
+            irp_id,
+            transport_status,
+        } => {
+            set_hosted_pnp_indeterminate(irp_id, transport_status)
+                .expect("indeterminate hosted lifecycle IRP lost its transaction");
+            Ok(HostedPnpLifecycleOutcome::Indeterminate {
+                irp_id: irp_id.raw(),
+                transport_status,
+            })
+        }
+    }
 }
 
 /// Send a canonical `IRP_MN_START_DEVICE` through the complete FDO stack.
