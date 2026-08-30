@@ -10,8 +10,10 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+mod madt;
 mod pci_routing;
 
+pub use madt::{parse_madt_interrupt_overrides, MadtError};
 pub use pci_routing::{
     parse_interrupt_resource_template, parse_pci_routing_table, resolve_pci_routing_table,
     InterruptResource, InterruptSource, LegacyIrqOverride, PciInterruptLink, PciRouteSource,
@@ -20,6 +22,7 @@ pub use pci_routing::{
 
 pub const SDT_HEADER_LEN: usize = 36;
 pub const FADT_SIGNATURE: [u8; 4] = *b"FACP";
+pub const MADT_SIGNATURE: [u8; 4] = *b"APIC";
 pub const DSDT_SIGNATURE: [u8; 4] = *b"DSDT";
 pub const FACS_SIGNATURE: [u8; 4] = *b"FACS";
 pub const FACS_MIN_LEN: usize = 64;
@@ -38,10 +41,12 @@ pub enum AcpiError {
     NullTableAddress,
     DuplicateTableAddress,
     DuplicateFadt,
+    DuplicateMadt,
     Allocation,
     PhysicalRead,
     DiscoveryLimit,
     MissingFadt,
+    InvalidMadt,
     MissingSciInterrupt,
     InvalidRegisterBlock,
     UnsupportedAddressSpace(u8),
@@ -286,6 +291,8 @@ pub struct AcpiPlatformResources {
     /// The FACS is not an SDT and therefore has no checksum.
     pub facs: Option<PhysicalRange>,
     pub fixed: FixedAcpiDescription,
+    /// MADT ISA-source translations used when an ACPI link reports a legacy IRQ.
+    pub interrupt_overrides: Vec<LegacyIrqOverride>,
     /// Page-normalized, sorted, non-overlapping extents containing every discovered table.
     pub firmware_memory: Vec<PhysicalRange>,
     /// Sorted, coalesced SystemMemory/SystemIO blocks needed for fixed ACPI events.
@@ -321,6 +328,7 @@ pub fn discover_platform_resources<R: PhysicalMemoryReader>(
         .try_reserve_exact(root.entries.len().saturating_add(1))
         .map_err(|_| AcpiError::Allocation)?;
     let mut fadt_bytes = None;
+    let mut interrupt_overrides = None;
     for address in root.entries {
         let (table, bytes) = read_sdt(reader, address, limits.max_table_length)?;
         if table.signature == FADT_SIGNATURE {
@@ -328,10 +336,17 @@ pub fn discover_platform_resources<R: PhysicalMemoryReader>(
                 return Err(AcpiError::DuplicateFadt);
             }
             fadt_bytes = Some(bytes);
+        } else if table.signature == MADT_SIGNATURE {
+            if interrupt_overrides.is_some() {
+                return Err(AcpiError::DuplicateMadt);
+            }
+            interrupt_overrides =
+                Some(parse_madt_interrupt_overrides(&bytes).map_err(|_| AcpiError::InvalidMadt)?);
         }
         tables.push(table);
     }
     let fixed = FixedAcpiDescription::parse(&fadt_bytes.ok_or(AcpiError::MissingFadt)?)?;
+    let interrupt_overrides = interrupt_overrides.unwrap_or_default();
 
     if tables.len() >= limits.max_tables {
         return Err(AcpiError::DiscoveryLimit);
@@ -374,6 +389,7 @@ pub fn discover_platform_resources<R: PhysicalMemoryReader>(
         facs,
         fixed_registers: normalized_fixed_registers(&fixed)?,
         firmware_memory: normalize_physical_ranges(&firmware_extents)?,
+        interrupt_overrides,
         fixed,
     })
 }
@@ -891,12 +907,14 @@ mod tests {
         const ROOT: u64 = 0x7ffe_1000;
         const FADT: u64 = 0x7ffe_2000;
         const SSDT: u64 = 0x7ffe_2800;
+        const MADT: u64 = 0x7ffe_2c00;
         const DSDT: u64 = 0x7ffe_3000;
         const FACS: u64 = 0x7ffe_3f80;
 
-        let mut xsdt = vec![0; SDT_HEADER_LEN + 16];
+        let mut xsdt = vec![0; SDT_HEADER_LEN + 24];
         write_u64(&mut xsdt, SDT_HEADER_LEN, FADT);
         write_u64(&mut xsdt, SDT_HEADER_LEN + 8, SSDT);
+        write_u64(&mut xsdt, SDT_HEADER_LEN + 16, MADT);
         let xsdt = finish_table(xsdt, b"XSDT");
 
         let mut fadt = vec![0; 244];
@@ -910,10 +928,17 @@ mod tests {
         write_gas(&mut fadt, 148, ADDRESS_SPACE_SYSTEM_IO, 32, 0x600);
         write_gas(&mut fadt, 220, ADDRESS_SPACE_SYSTEM_MEMORY, 64, 0xfed8_0000);
 
+        let mut madt = vec![0; SDT_HEADER_LEN + 8];
+        write_u32(&mut madt, SDT_HEADER_LEN + 4, 1);
+        madt.extend_from_slice(&[2, 10, 0, 9]);
+        madt.extend_from_slice(&20u32.to_le_bytes());
+        madt.extend_from_slice(&0x000fu16.to_le_bytes());
+
         let regions = vec![
             (ROOT, xsdt.clone()),
             (FADT, finish_table(fadt, b"FACP")),
             (SSDT, finish_table(vec![0; 80], b"SSDT")),
+            (MADT, finish_table(madt, b"APIC")),
             (DSDT, finish_table(vec![0; 0x900], b"DSDT")),
             (FACS, facs(FACS_MIN_LEN)),
         ];
@@ -929,8 +954,17 @@ mod tests {
         assert_eq!(resources.root.signature, *b"XSDT");
         assert_eq!(resources.fixed.sci_interrupt, 9);
         assert_eq!(resources.fixed.facs_address, Some(FACS));
-        assert_eq!(resources.tables.len(), 3);
+        assert_eq!(resources.tables.len(), 4);
         assert_eq!(resources.tables.last().unwrap().signature, *b"DSDT");
+        assert_eq!(
+            resources.interrupt_overrides,
+            vec![LegacyIrqOverride {
+                irq: 9,
+                gsi: 20,
+                level_sensitive: Some(true),
+                active_low: Some(true),
+            }]
+        );
         assert_eq!(
             resources.firmware_memory,
             vec![PhysicalRange {

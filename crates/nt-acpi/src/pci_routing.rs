@@ -34,6 +34,7 @@ pub enum PciRoutingError {
     DuplicateInterruptLink,
     AmbiguousInterruptLink,
     DuplicateLegacyIrqOverride,
+    ConflictingLegacyIrqOverride,
     UnsupportedResourceSource,
     Allocation,
 }
@@ -90,6 +91,8 @@ pub struct PciInterruptLink {
 pub struct LegacyIrqOverride {
     pub irq: u8,
     pub gsi: u32,
+    pub level_sensitive: Option<bool>,
+    pub active_low: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -396,7 +399,7 @@ pub fn resolve_pci_routing_table(
         if route.irq >= 16
             || legacy_irq_overrides[index + 1..]
                 .iter()
-                .any(|other| other.irq == route.irq)
+                .any(|other| other.irq == route.irq || other.gsi == route.gsi)
         {
             return Err(PciRoutingError::DuplicateLegacyIrqOverride);
         }
@@ -444,11 +447,20 @@ pub fn resolve_pci_routing_table(
         };
         let gsi = match interrupt.interrupt {
             InterruptSource::GlobalSystemInterrupt(gsi) => gsi,
-            InterruptSource::LegacyIrq(irq) => legacy_irq_overrides
-                .iter()
-                .find(|route| route.irq == irq)
-                .map(|route| route.gsi)
-                .unwrap_or(irq as u32),
+            InterruptSource::LegacyIrq(irq) => {
+                let route = legacy_irq_overrides.iter().find(|route| route.irq == irq);
+                if route.is_some_and(|route| {
+                    route
+                        .level_sensitive
+                        .is_some_and(|level| level != interrupt.level_sensitive)
+                        || route
+                            .active_low
+                            .is_some_and(|active_low| active_low != interrupt.active_low)
+                }) {
+                    return Err(PciRoutingError::ConflictingLegacyIrqOverride);
+                }
+                route.map(|route| route.gsi).unwrap_or(irq as u32)
+            }
         };
         routes.push(ResolvedPciRoute {
             segment: table.segment,
@@ -692,13 +704,33 @@ mod tests {
             name: String::from("LNKB"),
             resources,
         }];
-        let routes =
-            resolve_pci_routing_table(&table, &links, &[LegacyIrqOverride { irq: 5, gsi: 21 }])
-                .unwrap();
+        let routes = resolve_pci_routing_table(
+            &table,
+            &links,
+            &[LegacyIrqOverride {
+                irq: 5,
+                gsi: 21,
+                level_sensitive: Some(true),
+                active_low: Some(true),
+            }],
+        )
+        .unwrap();
         assert_eq!(routes[0].gsi, 21);
         assert!(routes[0].level_sensitive);
         assert!(routes[0].active_low);
         assert!(routes[0].shared);
+
+        let conflict = resolve_pci_routing_table(
+            &table,
+            &links,
+            &[LegacyIrqOverride {
+                irq: 5,
+                gsi: 21,
+                level_sensitive: Some(false),
+                active_low: Some(false),
+            }],
+        );
+        assert_eq!(conflict, Err(PciRoutingError::ConflictingLegacyIrqOverride));
     }
 
     #[test]

@@ -19647,3 +19647,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     PCI config `INTERRUPT_LINE` handling atomically when that live route owner lands; neither may
     survive as a fallback. Runtime ACPI/SCI and desktop acceptance remains one later serialized
     boot because the active older desktop VM is still deliberately undisturbed.
+
+    B3 MADT interrupt-route authority checkpoint (2026-08-31, implementation green): `nt-acpi`
+    now validates and decodes type-2 Interrupt Source Override entries from the checksum-validated
+    MADT while those bytes are still owned by `discover_platform_resources`. The fixed 44-byte
+    header, top-level reserved flags, exact 10-byte entry shape, ISA bus, IRQ range, GSI, polarity,
+    trigger mode, reserved encodings, entry framing, and duplicate IRQ/GSI mappings are checked.
+    Unknown entry types remain forward-compatible but cannot escape their declared bounds. The
+    resulting typed overrides are retained in `AcpiPlatformResources`; no executive physical-table
+    reread or copied firmware policy is needed.
+
+    Bus-conforming MADT attributes remain explicit `None`, while active-high/low and edge/level
+    overrides are preserved. PCI-link resolution translates a small IRQ through the exact MADT
+    mapping, uses identity only when firmware publishes no override for that IRQ, and rejects an
+    explicit electrical conflict with the link's `_CRS` descriptor. GSI zero remains valid. Focused
+    `nt-acpi` validation passes 16/16, formatting and `git diff --check` are clean, and the executive
+    freestanding check remains green at the unchanged 209-warning baseline.
+
+    Review adjustment: continue with the real 20-byte `_PRT` probe and exact-size retry on the
+    dynamically resolved ACPI PCI-root PDO, followed by route-specific `_CRS` queries on canonical
+    link PDOs. A separate microkernel audit found that IRQ issue still selects only the first MADT
+    IOAPIC, falls back to physical `0xfec00000`, clamps a below-base GSI with saturating subtraction,
+    ignores the caller's IOAPIC id, and assumes 24 redirection entries. Track this as a required
+    route-authority dependency: replace it with all validated MADT IOAPIC descriptors and each
+    controller's hardware-reported redirection count, select the unique controller that owns the
+    requested GSI/id, and fail closed when none or several match. The fallback address and fixed
+    pin limit must be deleted before multi-controller PCI/SCI runtime acceptance; q35's current
+    single-controller layout is not policy.
