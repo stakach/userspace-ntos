@@ -19246,3 +19246,37 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     canonical PDO and real AddDevice/START, and prove the sibling keeps its interface and data path.
     Do not add an executive stimulus or synthetic completion to make this proof pass. The existing
     long-running desktop QEMU still owns the boot lane and was not interrupted by this checkpoint.
+
+    B3 canonical root-PDO retirement checkpoint (2026-08-31, implementation green): final REMOVE
+    now authorizes retirement for both the hosted function device and the exact canonical root-bus
+    PDO captured by the immutable PnP transaction. The PDO retirement carries the same hosted-domain
+    generation, projection instance, native device object, canonical `DeviceId`, and final-REMOVE
+    IRP authority as the function-device teardown. A collision, missing stack member, or different
+    owner is a retained barrier; no object is selected by service name, device position, or current
+    global state.
+
+    Retirement first removes the exact PDO from the root bus's accepted child set, then uses normal
+    I/O Manager destruction to wait for references and upper attachments before deleting its
+    canonical object. Only after that succeeds does it unbind and free the dependent hosted-domain
+    projection. Final removal publication now proves that the function-device binding, FDO record,
+    root-bus PDO, canonical PDO record, and PDO domain mapping are all absent before invoking
+    generation-protected `finish_remove`. Retry after partial progress is idempotent and sibling
+    PDOs remain untouched.
+
+    The root bus accepts the same stable registry instance again only with a fresh canonical
+    `DeviceId`. A two-child regression removes one PDO, proves the started sibling remains in bus
+    relations, and publishes a replacement for the retired stable identity without altering that
+    sibling. Formatting is clean. Focused validation passes `nt-root-bus` 14/14,
+    `nt-io-manager` 241/241, and `nt-pnp-manager` 50/50; the freestanding executive check passes at
+    the unchanged 209-warning baseline.
+
+    Review adjustment: the in-memory canonical remove/re-enumerate boundary is closed. The next B3
+    implementation target is a bus-owned live hardware inventory and rescan authority. PCI
+    discovery is currently a boot-time bus-0 snapshot, so a real QEMU remove/add cannot yet cause
+    native relation invalidation. Add a host-tested inventory reconciler that scans the complete
+    supported PCI topology, identifies additions and disappearances by stable bus identity, reserves
+    canonical objects and resource grants before mutating the root-bus accepted set, and publishes
+    only exact relation-set changes. Then connect that reconciler to a genuine platform/ACPI PCI
+    hotplug invalidation source; do not add an executive stimulus, periodic synthetic rescan, or
+    QEMU-specific kernel path. After that boundary is green, release the existing serialized QEMU
+    lane and perform the two-NIC remove/re-add desktop acceptance described above.

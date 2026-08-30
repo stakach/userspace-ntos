@@ -764,6 +764,42 @@ mod tests {
         assert!(b.remove_pdo(PRIMARY_PDO));
         assert!(!b.remove_pdo(PRIMARY_PDO));
         assert!(b.is_empty());
+
+        let replacement = DeviceId::new(2, 9);
+        assert_eq!(
+            b.try_create_pdo(replacement, r"ROOT\A", &[r"ROOT\A"], &empty, "0001"),
+            Ok(replacement)
+        );
+        assert_eq!(
+            b.resolve_pdo_identity(r"ROOT\A", &[r"ROOT\A"], &empty, "0001"),
+            Ok(Some(replacement))
+        );
+    }
+
+    #[test]
+    fn removing_and_readding_one_pdo_preserves_its_sibling() {
+        let mut b = RootBus::new();
+        let empty: [&str; 0] = [];
+        let sibling = DeviceId::new(2, 2);
+        let replacement = DeviceId::new(3, 1);
+
+        b.try_create_pdo(PRIMARY_PDO, r"ROOT\A", &[r"ROOT\A"], &empty, "0001")
+            .unwrap();
+        b.try_create_pdo(sibling, r"ROOT\B", &[r"ROOT\B"], &empty, "0001")
+            .unwrap();
+        assert_eq!(b.dispatch_pnp(sibling, IRP_MN_START_DEVICE), 0);
+
+        assert!(b.remove_pdo(PRIMARY_PDO));
+        assert_eq!(b.query_device_relations(), alloc::vec![sibling]);
+        assert!(b.pdo_started(sibling));
+
+        b.try_create_pdo(replacement, r"ROOT\A", &[r"ROOT\A"], &empty, "0001")
+            .unwrap();
+        let relations = b.query_device_relations();
+        assert_eq!(relations.len(), 2);
+        assert!(relations.contains(&sibling));
+        assert!(relations.contains(&replacement));
+        assert!(b.pdo_started(sibling));
     }
 
     #[test]

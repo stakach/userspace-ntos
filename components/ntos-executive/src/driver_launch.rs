@@ -39669,10 +39669,26 @@ fn hosted_device_retirement_matches_binding(
     retirement: HostedDeviceRetirement,
     binding: HostedDeviceBinding,
 ) -> bool {
-    retirement.instance == binding.projection_instance
-        && retirement.domain == binding.projection_domain
-        && retirement.device_object == binding.device_object
-        && retirement.device_id == nt_io_manager::DeviceId(binding.device_id)
+    hosted_device_retirement_matches(
+        retirement,
+        binding.projection_instance,
+        binding.projection_domain,
+        binding.device_object,
+        nt_io_manager::DeviceId(binding.device_id),
+    )
+}
+
+fn hosted_device_retirement_matches(
+    retirement: HostedDeviceRetirement,
+    instance: usize,
+    domain: HostedDomainIdentity,
+    device_object: u64,
+    device_id: nt_io_manager::DeviceId,
+) -> bool {
+    retirement.instance == instance
+        && retirement.domain == domain
+        && retirement.device_object == device_object
+        && retirement.device_id == device_id
 }
 
 unsafe fn hosted_pnp_transaction_owns_stack_device(
@@ -39737,15 +39753,19 @@ unsafe fn authorize_hosted_device_retirements(
     {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
+    let pdo_device_id = nt_io_manager::DeviceId(binding.pdo_device_id);
     let retirements = hosted_device_retirements_mut();
     if retirements.iter().any(|retirement| {
         retirement.domain == binding.projection_domain
-            && retirement.device_object == binding.device_object
-            && retirement.device_id != nt_io_manager::DeviceId(binding.device_id)
+            && ((retirement.device_object == binding.device_object
+                && retirement.device_id != nt_io_manager::DeviceId(binding.device_id))
+                || (retirement.device_object == binding.pdo_object
+                    && retirement.device_id != pdo_device_id))
     }) {
         return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
     }
     let mut function_retirement_present = false;
+    let mut pdo_retirement_present = false;
     for retirement in retirements.iter_mut() {
         if !hosted_pnp_transaction_owns_stack_device(irp_id, retirement.device_id) {
             continue;
@@ -39755,6 +39775,18 @@ unsafe fn authorize_hosted_device_retirements(
                 return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
             }
             function_retirement_present = true;
+        }
+        if retirement.device_id == pdo_device_id {
+            if !hosted_device_retirement_matches(
+                *retirement,
+                binding.projection_instance,
+                binding.projection_domain,
+                binding.pdo_object,
+                pdo_device_id,
+            ) {
+                return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
+            }
+            pdo_retirement_present = true;
         }
         if let Some(status) = retirement.barrier_status {
             return Err(status);
@@ -39770,20 +39802,33 @@ unsafe fn authorize_hosted_device_retirements(
             }
         }
     }
-    if function_retirement_present {
+    if function_retirement_present && pdo_retirement_present {
         return Ok(());
     }
+    let missing = usize::from(!function_retirement_present) + usize::from(!pdo_retirement_present);
     retirements
-        .try_reserve(1)
+        .try_reserve(missing)
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    retirements.push(HostedDeviceRetirement {
-        instance: binding.projection_instance,
-        domain: binding.projection_domain,
-        device_object: binding.device_object,
-        device_id: nt_io_manager::DeviceId(binding.device_id),
-        authority: HostedDeviceRetirementAuthority::PnpRemove(irp_id),
-        barrier_status: None,
-    });
+    if !function_retirement_present {
+        retirements.push(HostedDeviceRetirement {
+            instance: binding.projection_instance,
+            domain: binding.projection_domain,
+            device_object: binding.device_object,
+            device_id: nt_io_manager::DeviceId(binding.device_id),
+            authority: HostedDeviceRetirementAuthority::PnpRemove(irp_id),
+            barrier_status: None,
+        });
+    }
+    if !pdo_retirement_present {
+        retirements.push(HostedDeviceRetirement {
+            instance: binding.projection_instance,
+            domain: binding.projection_domain,
+            device_object: binding.pdo_object,
+            device_id: pdo_device_id,
+            authority: HostedDeviceRetirementAuthority::PnpRemove(irp_id),
+            barrier_status: None,
+        });
+    }
     Ok(())
 }
 
@@ -40695,6 +40740,18 @@ unsafe fn finish_hosted_remove_publication(irp_id: IrpId) -> Result<(), nt_statu
         if hosted_device_binding_by_device_id(binding.device_id).is_some()
             || io_manager_mut()
                 .device(nt_io_manager::DeviceId(binding.device_id))
+                .is_some()
+            || io_manager_mut()
+                .device(nt_io_manager::DeviceId(binding.pdo_device_id))
+                .is_some()
+            || hosted_root_bus_mut()
+                .pdo(nt_io_manager::DeviceId(binding.pdo_device_id))
+                .is_some()
+            || io_manager_mut()
+                .hosted_device_address_by_identity(
+                    binding.projection_domain,
+                    nt_io_manager::DeviceId(binding.pdo_device_id),
+                )
                 .is_some()
         {
             return Err(nt_status::NtStatus::DELETE_PENDING);
@@ -44460,29 +44517,31 @@ unsafe fn drain_hosted_device_retirements() -> usize {
             index += 1;
             continue;
         }
+        let mut retire_root_pdo = false;
         match retirement.authority {
             HostedDeviceRetirementAuthority::PnpGuarded => {
                 index += 1;
                 continue;
             }
             HostedDeviceRetirementAuthority::PnpRemove(owner) => {
-                let authorized = (*core::ptr::addr_of!(HOSTED_PNP_TRANSACTIONS))
+                let transaction = (*core::ptr::addr_of!(HOSTED_PNP_TRANSACTIONS))
                     .as_ref()
-                    .is_some_and(|transactions| {
-                        transactions.iter().any(|transaction| {
+                    .and_then(|transactions| {
+                        transactions.iter().find(|transaction| {
                             transaction.irp_id == owner
                                 && transaction.minor == nt_pnp_manager::PnpMinor::RemoveDevice
                                 && transaction.stack_device_ids.contains(&retirement.device_id)
                                 && transaction.retirement_authorized
                         })
                     });
-                if !authorized {
+                let Some(transaction) = transaction else {
                     hosted_device_retirements_mut()[index].barrier_status =
                         Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
                     progress = progress.saturating_add(1);
                     index += 1;
                     continue;
-                }
+                };
+                retire_root_pdo = transaction.binding.pdo_device_id == retirement.device_id.raw();
             }
             HostedDeviceRetirementAuthority::Driver => {
                 let pnp_in_flight = (*core::ptr::addr_of!(HOSTED_PNP_TRANSACTIONS))
@@ -44523,6 +44582,16 @@ unsafe fn drain_hosted_device_retirements() -> usize {
         if interface_failures != 0 {
             hosted_device_retirements_mut()[index].barrier_status =
                 Some(nt_status::NtStatus::DEVICE_BUSY);
+            progress = progress.saturating_add(1);
+            index += 1;
+            continue;
+        }
+        if retire_root_pdo
+            && hosted_root_bus_mut().pdo(retirement.device_id).is_some()
+            && !hosted_root_bus_mut().remove_pdo(retirement.device_id)
+        {
+            hosted_device_retirements_mut()[index].barrier_status =
+                Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
             progress = progress.saturating_add(1);
             index += 1;
             continue;
