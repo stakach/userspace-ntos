@@ -17439,3 +17439,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Manager. The pinned ReactOS win32k image metadata used to locate its session atom-table cell remains
     version-validated at load time; move it into generated image metadata when the existing RVA catalog
     is replaced rather than creating a second runtime-discovery mechanism here.
+
+    USER-handle grant/secure-validation checkpoint (2026-08-30, focused validation accepted; broadcast,
+    hook, and serialized desktop proof remain): `NtUserUserHandleGrantAccess` now resolves the caller's
+    Object Manager job handle in Ps with `JOB_OBJECT_SET_ATTRIBUTES`, rejects missing UI policy and
+    callers already assigned to the target job, and sends only the stable JobId through the registered
+    provider boundary. Win32k validates the live USER entry, its accepted generation, allocation-class
+    owner, and target-job ownership before changing its exact per-job grant set. Successful grants are
+    idempotent, revocation removes the exact generation, allocation failure is reported, and the native
+    `HANDLEF_GRANTED` hint is published in the provider-owned USER table.
+
+    `NtUserValidateHandleSecure` now applies the real handle-isolation decision: unrestricted callers
+    pass, restricted callers may use objects owned by their own job or exact handles explicitly granted
+    to that job, ownerless and stale entries fail closed, and invalid live handles publish
+    `ERROR_INVALID_HANDLE`. Three older ad hoc USER-table decoders were replaced with one typed resolver,
+    so window lookup and secure validation share ReactOS `handle_to_entry` generation semantics. Focused
+    `nt-win32k-job` validation passes `8/8`; formatting, `git diff --check`, and the freestanding executive
+    check pass at the established 209-warning baseline.
+
+    Review adjustment: the grant exception and explicit secure-validation syscall are closed at focused
+    scope, but `JOB_OBJECT_UILIMIT_HANDLES` is not complete until broadcast delivery is restricted to
+    top-level windows in the caller's job and global hooks are scoped to that job's threads. Implement
+    both inside win32k's real message/hook paths, remove superseded broad-deny logic, then run one
+    serialized desktop proof covering the complete UI-handle slice before starting token restrictions.

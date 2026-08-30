@@ -487,6 +487,11 @@ pub const SSN_GDI_BATCH_FLUSH_CALLOUT: u64 = 0x1FFD;
 pub const SSN_WIN32_JOB_CALLOUT: u64 = 0x1FFC;
 /// Private pointer-free selector for native atom operations against win32k's job-owned namespace.
 pub const SSN_WIN32_JOB_ATOM: u64 = 0x1FFB;
+/// Private client-context selector for an executive-authorized `UserHandleGrantAccess` request.
+/// The public syscall carries an Object Manager job handle which win32k must never interpret.
+pub const SSN_WIN32_JOB_USER_HANDLE: u64 = 0x1FFA;
+pub const SSN_NT_USER_USER_HANDLE_GRANT_ACCESS: u64 = 0x1293;
+pub const SSN_NT_USER_VALIDATE_HANDLE_SECURE: u64 = 0x1294;
 pub const WIN32_JOB_ATOM_ADD_NAME: u64 = 0;
 pub const WIN32_JOB_ATOM_FIND_NAME: u64 = 1;
 pub const WIN32_JOB_ATOM_ADD_INTEGER: u64 = 2;
@@ -548,6 +553,14 @@ const W32HEAP_MAPPING_SIZE: u64 = 0x28;
 const W32PF_CREATEDWINORDC: u32 = 0x0400_0000;
 const W32PF_READSCREENACCESSGRANTED: u32 = 0x0000_0010;
 const WINSTA_ALL_ACCESS: u32 = 0x000f_037f;
+const FIRST_USER_HANDLE: u64 = 0x20;
+const LAST_USER_HANDLE: u64 = 0xFFEF;
+const USER_HANDLE_ENTRY_SIZE: u64 = 0x18;
+const USER_HANDLE_ENTRY_OWNER_OFF: u64 = 0x08;
+const USER_HANDLE_ENTRY_TYPE_OFF: u64 = 0x10;
+const USER_HANDLE_ENTRY_FLAGS_OFF: u64 = 0x11;
+const USER_HANDLE_ENTRY_GENERATION_OFF: u64 = 0x12;
+const USER_HANDLE_FLAG_GRANTED: u8 = 0x20;
 /// WND->head.pti offset (ntuser.h: THRDESKHEAD at +0).
 const WND_HEAD_PTI_OFF: u64 = 0x10;
 const WND_EXSTYLE_OFF: u64 = 0x30;
@@ -6360,22 +6373,64 @@ unsafe fn read_u64_field_if_present(base: u64, offset: u64) -> u64 {
     }
 }
 
+#[derive(Clone, Copy)]
+struct UserHandleEntry {
+    address: u64,
+    object: u64,
+    owner: u64,
+    object_type: u8,
+    canonical: u64,
+}
+
+/// Resolve one live entry exactly as ReactOS `handle_to_entry` does. The canonical value always
+/// contains the current generation, including when USER accepts the legacy zero/FFFF generation.
+unsafe fn resolve_user_handle_entry(handle: u64) -> Option<UserHandleEntry> {
+    if handle > u32::MAX as u64 {
+        return None;
+    }
+    let low = handle & 0xFFFF;
+    if !(FIRST_USER_HANDLE..=LAST_USER_HANDLE).contains(&low)
+        || (low - FIRST_USER_HANDLE) & 1 != 0
+    {
+        return None;
+    }
+    let table = read_volatile((WIN32K_SHARED_VADDR + SH_SAS_AHELIST) as *const u64);
+    if table == 0 {
+        return None;
+    }
+    let entries = read_volatile(table as *const u64);
+    let count = read_volatile((table + 0x10) as *const u32) as u64;
+    let index = (low - FIRST_USER_HANDLE) >> 1;
+    if entries == 0 || index >= count {
+        return None;
+    }
+    let entry = entries + index * USER_HANDLE_ENTRY_SIZE;
+    let object_type = read_volatile((entry + USER_HANDLE_ENTRY_TYPE_OFF) as *const u8);
+    if object_type == 0 {
+        return None;
+    }
+    let actual_generation =
+        read_volatile((entry + USER_HANDLE_ENTRY_GENERATION_OFF) as *const u16);
+    let supplied_generation = ((handle >> 16) & 0xFFFF) as u16;
+    if supplied_generation != 0
+        && supplied_generation != u16::MAX
+        && supplied_generation != actual_generation
+    {
+        return None;
+    }
+    Some(UserHandleEntry {
+        address: entry,
+        object: read_volatile(entry as *const u64),
+        owner: read_volatile((entry + USER_HANDLE_ENTRY_OWNER_OFF) as *const u64),
+        object_type,
+        canonical: low | u64::from(actual_generation) << 16,
+    })
+}
+
 unsafe fn resolve_window_handle(hwnd: u64) -> u64 {
-    let ahelist = read_volatile((WIN32K_SHARED_VADDR + SH_SAS_AHELIST) as *const u64);
-    if ahelist == 0 || (hwnd & 0xffff) < 0x20 {
-        return 0;
-    }
-    let handles = read_volatile(ahelist as *const u64);
-    let count = read_volatile((ahelist + 0x10) as *const u32) as u64;
-    let index = ((hwnd & 0xffff) - 0x20) >> 1;
-    if handles == 0 || index >= count {
-        return 0;
-    }
-    let entry = handles + index * 0x18;
-    if read_volatile((entry + 0x10) as *const u8) != 1 {
-        return 0;
-    }
-    read_volatile(entry as *const u64)
+    resolve_user_handle_entry(hwnd)
+        .filter(|entry| entry.object_type == 1)
+        .map_or(0, |entry| entry.object)
 }
 
 unsafe fn trace_getdc_window_context(hwnd: u64) {
@@ -7727,7 +7782,7 @@ unsafe fn ensure_win32k_threadinfo(thread_index: usize, client_teb: u64) -> bool
 }
 
 pub(crate) unsafe fn win32k_window_owner_pi(hwnd: u64) -> Option<u32> {
-    let pwnd = hwnd_to_pwnd(hwnd);
+    let pwnd = resolve_window_handle(hwnd);
     if pwnd == 0 {
         return None;
     }
@@ -9710,26 +9765,7 @@ extern "win64" fn removed_s_ke_user_mode_callback_synthetic_baseline(
             if msg == 0x0001 {
                 let hwnd = read_volatile((_input + WPCA_WND) as *const u64);
                 let lparam = read_volatile((_input + WPCA_LPARAM) as *const u64);
-                // Resolve HWND → PWND via the USER handle table (gSharedInfo.aheList, published by the
-                // executive from the USERCONNECT). handles@0x00, nb_handles@0x10; USER_HANDLE_ENTRY:
-                // ptr@0x00, sizeof 0x18 (ptr,pti,type,flags,generation). index = (hwnd&0xffff−0x20)>>1.
-                let ahelist = read_volatile((WIN32K_SHARED_VADDR + SH_SAS_AHELIST) as *const u64);
-                let mut pwnd = 0u64;
-                if ahelist != 0 && (hwnd & 0xffff) >= 0x20 {
-                    let handles = read_volatile(ahelist as *const u64);
-                    let nb = read_volatile((ahelist + 0x10) as *const u32) as u64;
-                    let index = ((hwnd & 0xffff) - 0x20) >> 1;
-                    if handles != 0 && index < nb {
-                        let entry = handles + index * 0x18;
-                        // Only accept a live TYPE_WINDOW(1) entry (USER_HANDLE_ENTRY.type @ +0x10) —
-                        // a freed/wrong-type slot (type==0/other) must NOT be dereferenced+written (ReactOS
-                        // handle_to_entry returns NULL for type==0). Guards against type-confusion if this
-                        // path is ever reused for an arbitrary HWND.
-                        if read_volatile((entry + 0x10) as *const u8) == 1 {
-                            pwnd = read_volatile(entry as *const u64);
-                        }
-                    }
-                }
+                let pwnd = resolve_window_handle(hwnd);
                 if pwnd != 0 && lparam != 0 {
                     // CREATESTRUCT.lpCreateParams @ +0x00 = the Session pointer.
                     let create_params = read_volatile(lparam as *const u64);
@@ -11157,6 +11193,10 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         TEST_FAULT_STATUS as u32 as u64
     } else if ssn == SSN_GDI_BATCH_FLUSH_CALLOUT {
         dispatch_gdi_batch_flush_callout(client_pi, client_teb)
+    } else if ssn == SSN_WIN32_JOB_USER_HANDLE {
+        dispatch_win32_job_user_handle(a0, a1, a2 != 0, a3 as u32)
+    } else if ssn == SSN_NT_USER_VALIDATE_HANDLE_SECURE {
+        dispatch_validate_user_handle_secure(a0)
     } else if let Some(denied_result) = enforce_win32_job_ui_policy(ssn, a0, a1) {
         denied_result
     } else if matches!(ssn, 0x1036 | 0x10AD) {
@@ -11335,6 +11375,102 @@ unsafe fn dispatch_win32_job_atom(job: u64, operation: u64, value: u64, capacity
         }
         _ => nt_win32k_job::STATUS_INVALID_PARAMETER as u64,
     }
+}
+
+struct ResolvedUserHandle {
+    entry_address: u64,
+    canonical: u64,
+    owner_process: Option<u64>,
+}
+
+/// Resolve a live ReactOS USER handle through the provider-owned handle table and recover its
+/// W32PROCESS owner using the allocation class of the entry type. Legacy generation-less handles
+/// are accepted by USER, but the grant store always receives the full current generation so a
+/// recycled slot cannot inherit an old exception.
+unsafe fn resolve_user_handle(handle: u64) -> Option<ResolvedUserHandle> {
+    let entry = resolve_user_handle_entry(handle)?;
+    let owner_process = match entry.object_type {
+        // Window, hook, WinEvent hook, and input-context entries are THREADINFO-owned.
+        1 | 5 | 15 | 17 if entry.owner != 0 => {
+            let process = read_volatile((entry.owner + THREADINFO_PPI_OFF) as *const u64);
+            (process != 0).then_some(process)
+        }
+        // Menu, cursor, call-proc, and accelerator entries are PROCESSINFO-owned.
+        2 | 3 | 7 | 8 if entry.owner != 0 => Some(entry.owner),
+        _ => None,
+    };
+    Some(ResolvedUserHandle {
+        entry_address: entry.address,
+        canonical: entry.canonical,
+        owner_process,
+    })
+}
+
+unsafe fn set_current_client_last_error(error: u32) {
+    let teb = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_TEB) as *const u64);
+    if teb != 0 {
+        write_volatile((teb + 0x68) as *mut u32, error);
+    }
+}
+
+fn user_handle_status_to_error(status: u32) -> u32 {
+    match status {
+        nt_win32k_job::STATUS_ACCESS_DENIED => 5,
+        nt_win32k_job::STATUS_INSUFFICIENT_RESOURCES => 8,
+        nt_win32k_job::STATUS_INVALID_HANDLE => 6,
+        _ => 87,
+    }
+}
+
+/// Complete the provider half of `NtUserUserHandleGrantAccess`. `job` is an exact Ps JobId, never
+/// the caller's Object Manager handle. A nonzero `executive_error` means Ps rejected the handle or
+/// caller before win32k state was touched.
+unsafe fn dispatch_win32_job_user_handle(
+    user_handle: u64,
+    job: u64,
+    grant: bool,
+    executive_error: u32,
+) -> u64 {
+    if executive_error != 0 {
+        set_current_client_last_error(executive_error);
+        return 0;
+    }
+    let caller_process = current_w32process();
+    let Some(resolved) = resolve_user_handle(user_handle) else {
+        set_current_client_last_error(87);
+        return 0;
+    };
+    let result = win32_job_ui_policy().grant_user_handle(
+        job,
+        caller_process,
+        resolved.canonical,
+        resolved.owner_process,
+        grant,
+    );
+    match result {
+        Ok(()) => {
+            let flags =
+                (resolved.entry_address + USER_HANDLE_ENTRY_FLAGS_OFF) as *mut u8;
+            write_volatile(flags, read_volatile(flags) | USER_HANDLE_FLAG_GRANTED);
+            1
+        }
+        Err(status) => {
+            set_current_client_last_error(user_handle_status_to_error(status));
+            0
+        }
+    }
+}
+
+unsafe fn dispatch_validate_user_handle_secure(user_handle: u64) -> u64 {
+    let Some(resolved) = resolve_user_handle(user_handle) else {
+        set_current_client_last_error(6);
+        return 0;
+    };
+    u64::from(win32_job_ui_policy().user_handle_allowed(
+        current_w32process(),
+        resolved.canonical,
+        resolved.owner_process,
+    ))
 }
 
 unsafe fn dispatch_ssn_with_job_atom_namespace(
@@ -12200,27 +12336,6 @@ unsafe fn seed_process_startup_desktop_for_process(
         print_str(b"\n");
     }
     true
-}
-
-unsafe fn hwnd_to_pwnd(hwnd: u64) -> u64 {
-    let ahelist = read_volatile((WIN32K_SHARED_VADDR + SH_SAS_AHELIST) as *const u64);
-    if ahelist == 0 || (hwnd & 0xffff) < 0x20 {
-        return 0;
-    }
-    let handles = read_volatile(ahelist as *const u64);
-    let nb = read_volatile((ahelist + 0x10) as *const u32) as u64;
-    let index = ((hwnd & 0xffff) - 0x20) >> 1;
-    if handles == 0 || index >= nb {
-        return 0;
-    }
-    let entry = handles + index * 0x18;
-    if read_volatile((entry + 0x10) as *const u8) == 1
-        && read_volatile((entry + 0x12) as *const u16) == (hwnd >> 16) as u16
-    {
-        read_volatile(entry as *const u64)
-    } else {
-        0
-    }
 }
 
 /// Load the staged system font (arial.ttf at [`FONTBUF_VADDR`]) into win32k via

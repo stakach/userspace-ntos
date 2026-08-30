@@ -13939,9 +13939,26 @@ pub(crate) unsafe fn service_sec_image(
                     } else {
                         (sp, &[])
                     };
+                    let dispatch_ssn = if m0
+                        == win32k_subsystem::SSN_NT_USER_USER_HANDLE_GRANT_ACCESS
+                    {
+                        match nt_handler.job_id_for_user_handle_grant(d_a1) {
+                            Ok(job) => {
+                                d_a1 = job as u64;
+                                d_a3 = 0;
+                            }
+                            Err(error) => {
+                                d_a1 = 0;
+                                d_a3 = error as u64;
+                            }
+                        }
+                        win32k_subsystem::SSN_WIN32_JOB_USER_HANDLE
+                    } else {
+                        m0
+                    };
                     let mut r = dispatch_win32k_for_client_with_completion_args(
                         &mut nt_handler,
-                        m0,
+                        dispatch_ssn,
                         d_a0,
                         d_a1,
                         d_a2,

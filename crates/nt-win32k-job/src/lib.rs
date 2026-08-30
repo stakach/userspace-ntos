@@ -72,6 +72,7 @@ struct JobPolicy {
     token: u64,
     restrictions: u32,
     members: Vec<u64>,
+    granted_user_handles: Vec<u64>,
     atoms: Option<OwnedAtomTable>,
 }
 
@@ -142,6 +143,7 @@ impl JobUiPolicyStore {
             token,
             restrictions,
             members: Vec::new(),
+            granted_user_handles: Vec::new(),
             atoms,
         });
         Ok(())
@@ -210,6 +212,71 @@ impl JobUiPolicyStore {
         self.member_job_index(process)
             .map(|index| self.jobs[index].restrictions)
             .unwrap_or(0)
+    }
+
+    /// Apply the NT `UserHandleGrantAccess` policy after the executive has resolved the caller's
+    /// job handle. USER handle validity and canonical generation are win32k concerns and must be
+    /// checked before entering this owner.
+    pub fn grant_user_handle(
+        &mut self,
+        job: u64,
+        caller_process: u64,
+        user_handle: u64,
+        owner_process: Option<u64>,
+        grant: bool,
+    ) -> Result<(), u32> {
+        if caller_process == 0 || user_handle == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let index = self.job_index(job).ok_or(STATUS_INVALID_HANDLE)?;
+        if self.jobs[index].restrictions == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if self.jobs[index].members.contains(&caller_process)
+            || owner_process.is_some_and(|owner| self.jobs[index].members.contains(&owner))
+        {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+
+        let existing = self.jobs[index]
+            .granted_user_handles
+            .iter()
+            .position(|candidate| *candidate == user_handle);
+        if grant {
+            if existing.is_none() {
+                self.jobs[index]
+                    .granted_user_handles
+                    .try_reserve(1)
+                    .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+                self.jobs[index].granted_user_handles.push(user_handle);
+            }
+        } else if let Some(existing) = existing {
+            self.jobs[index].granted_user_handles.remove(existing);
+        }
+        Ok(())
+    }
+
+    /// Enforce the NT5 secure USER-handle rule for a canonical, live handle. A restricted process
+    /// can use an object owned by its own job or one explicitly granted to that job.
+    pub fn user_handle_allowed(
+        &self,
+        process: u64,
+        user_handle: u64,
+        owner_process: Option<u64>,
+    ) -> bool {
+        let Some(index) = self.member_job_index(process) else {
+            return true;
+        };
+        if self.jobs[index].restrictions & JOB_OBJECT_UILIMIT_HANDLES == 0 {
+            return true;
+        }
+        let Some(owner_process) = owner_process else {
+            return false;
+        };
+        if self.jobs[index].members.contains(&owner_process) {
+            return true;
+        }
+        self.jobs[index].granted_user_handles.contains(&user_handle)
     }
 
     pub fn private_atom_table_for_process(&mut self, process: u64) -> Option<u64> {
@@ -528,5 +595,47 @@ mod tests {
             Some(first_address)
         );
         assert_eq!(store.find_atom_name(1, &alpha), Ok(atom));
+    }
+
+    #[test]
+    fn user_handle_grants_are_exact_job_owned_exceptions() {
+        let mut store = JobUiPolicyStore::new();
+        store
+            .register_job(1, 0x1000, JOB_OBJECT_UILIMIT_HANDLES)
+            .unwrap();
+        store
+            .register_job(2, 0x2000, JOB_OBJECT_UILIMIT_HANDLES)
+            .unwrap();
+        store.add_process(1, 0x11).unwrap();
+        store.add_process(2, 0x22).unwrap();
+
+        let handle = 0x0002_0042;
+        assert!(!store.user_handle_allowed(0x11, handle, Some(0x22)));
+        assert_eq!(
+            store.grant_user_handle(1, 0x22, handle, Some(0x22), true),
+            Ok(())
+        );
+        assert!(store.user_handle_allowed(0x11, handle, Some(0x22)));
+        assert!(!store.user_handle_allowed(0x11, 0x0003_0042, Some(0x22)));
+        assert_eq!(
+            store.grant_user_handle(1, 0x22, handle, Some(0x22), true),
+            Ok(())
+        );
+        assert_eq!(
+            store.grant_user_handle(1, 0x22, handle, Some(0x22), false),
+            Ok(())
+        );
+        assert!(!store.user_handle_allowed(0x11, handle, Some(0x22)));
+
+        assert_eq!(
+            store.grant_user_handle(1, 0x11, handle, Some(0x22), true),
+            Err(STATUS_ACCESS_DENIED)
+        );
+        assert_eq!(
+            store.grant_user_handle(1, 0x33, handle, Some(0x11), true),
+            Err(STATUS_ACCESS_DENIED)
+        );
+        assert!(!store.user_handle_allowed(0x11, handle, None));
+        assert!(store.user_handle_allowed(0x33, handle, Some(0x22)));
     }
 }

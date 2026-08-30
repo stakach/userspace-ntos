@@ -23087,6 +23087,36 @@ impl ExecNtHandler {
         Ok(id)
     }
 
+    /// Resolve the Object Manager half of `UserHandleGrantAccess`. The caller-visible syscall is a
+    /// BOOL API, so failures are returned as Win32 errors for win32k to publish in the current TEB.
+    /// Only the stable Ps JobId crosses the provider boundary.
+    pub(crate) fn job_id_for_user_handle_grant(
+        &self,
+        handle: u64,
+    ) -> Result<nt_process::job::JobId, u32> {
+        const ERROR_ACCESS_DENIED: u32 = 5;
+        const ERROR_INVALID_PARAMETER: u32 = 87;
+
+        let id = self
+            .job_id_for_handle(handle, nt_process::job::JOB_OBJECT_SET_ATTRIBUTES)
+            .map_err(|_| ERROR_INVALID_PARAMETER)?;
+        if self
+            .pm
+            .job_ui_restrictions(id)
+            .map_err(|_| ERROR_INVALID_PARAMETER)?
+            == 0
+        {
+            return Err(ERROR_INVALID_PARAMETER);
+        }
+        let caller = self
+            .pm_pid_for_pi(self.pi)
+            .ok_or(ERROR_INVALID_PARAMETER)?;
+        if self.pm.process_job(caller) == Some(id) {
+            return Err(ERROR_ACCESS_DENIED);
+        }
+        Ok(id)
+    }
+
     fn job_namespace_index(&self, id: nt_process::job::JobId) -> Option<usize> {
         self.obj_ns.iter().position(|entry| {
             entry.is_live() && entry.kind == OBJ_KIND_JOB && entry.payload == id as u64
