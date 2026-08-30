@@ -18484,3 +18484,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     projection, and stack operations must resolve both pointers in the caller's exact domain. Then
     the relation worker can resolve every copied child PDO through the canonical mapping and start
     the four real `IRP_MN_QUERY_ID` requests.
+
+    B3 hosted device lifetime/stack transport checkpoint (2026-08-30, implementation green):
+    `IoAttachDeviceToDeviceStack`, `IoDetachDevice`, and `IoDeleteDevice` now use the same
+    authenticated component service boundary as dynamic creation. Attach resolves source, target,
+    and the component-observed lower pointer in one exact hosted-domain generation, commits the
+    canonical edge, and rolls it back if the two stack views disagree. Detach validates both lower
+    and upper identities before removing the canonical edge; invalid void-API requests fail-stop
+    instead of silently leaving split topology. PnP no longer supplies a missing AddDevice attach as
+    a post-return fallback. The video-port compatibility AddDevice path calls the ordinary attach
+    import itself, and stack commit requires the resulting canonical FDO-to-PDO edge.
+
+    Hosted deletion now reserves a growable exact `{instance, domain, DEVICE_OBJECT*, DeviceId}`
+    retirement owner before changing canonical lifetime. An immediately deletable device is removed
+    from the I/O and Object Managers, unbound from its hosted domain, unlinked from the native
+    `DriverObject->DeviceObject` list through its locked executive pool alias, and returned to the
+    component allocator. A device held by open files or upper attachments is marked delete-pending
+    while its domain binding and projection remain live. The ordinary I/O completion pump retries
+    that exact owner after file/attachment progress and performs the same final teardown only when
+    canonical references have drained. Conflicting identities, stale domains, failed resource
+    teardown, and malformed native lists become retained barriers or fail-stop invariants; there is
+    no one-device instance lookup or synthetic free path left in these imports.
+
+    Formatting, `git diff --check`, and the freestanding executive check pass at the unchanged
+    209-warning baseline. Review adjustment: dynamic device creation, attachment, detachment, and
+    delete-pending lifetime are now carried across one canonical boundary. Next run serialized
+    desktop acceptance to catch driver-contract regressions from removing post-AddDevice attach.
+    Once accepted, advance the retained relation-query owner by resolving every returned PDO in the
+    bus provider's authenticated domain and dispatching the four real typed QUERY_ID requests.

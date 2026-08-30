@@ -4605,6 +4605,9 @@ const HOSTED_DEVICE_OP_QUERY_PROPERTY_ABORT: u64 = 3;
 const HOSTED_DEVICE_OP_CLAIM_PORT_RANGE: u64 = 4;
 const HOSTED_DEVICE_OP_INVALIDATE_RELATIONS: u64 = 5;
 const HOSTED_DEVICE_OP_CREATE: u64 = 6;
+const HOSTED_DEVICE_OP_ATTACH: u64 = 7;
+const HOSTED_DEVICE_OP_DETACH: u64 = 8;
+const HOSTED_DEVICE_OP_DELETE: u64 = 9;
 const HOSTED_DEVICE_ARG_DATA_OFF: u64 = FSD_ARG_BYTES;
 const HOSTED_DEVICE_ARG_DATA_CAP: u64 = REP_DATA_LEN as u64;
 const _: () =
@@ -5495,6 +5498,39 @@ unsafe fn hosted_device_create(device: u64, driver: u64, extension_size: u64) ->
     (status as u32 as i32, canonical_device_id)
 }
 
+unsafe fn hosted_device_attach(source: u64, target: u64, lower: u64) -> i32 {
+    let (_label, status, _, _, _) = call_on4(
+        (FSD_SERVICE_DEVICE_LABEL << 12) | 4,
+        HOSTED_DEVICE_OP_ATTACH,
+        source,
+        target,
+        lower,
+    );
+    status as u32 as i32
+}
+
+unsafe fn hosted_device_detach(lower: u64, upper: u64) -> i32 {
+    let (_label, status, _, _, _) = call_on4(
+        (FSD_SERVICE_DEVICE_LABEL << 12) | 4,
+        HOSTED_DEVICE_OP_DETACH,
+        lower,
+        upper,
+        0,
+    );
+    status as u32 as i32
+}
+
+unsafe fn hosted_device_delete(device: u64) -> i32 {
+    let (_label, status, _, _, _) = call_on4(
+        (FSD_SERVICE_DEVICE_LABEL << 12) | 4,
+        HOSTED_DEVICE_OP_DELETE,
+        device,
+        0,
+        0,
+    );
+    status as u32 as i32
+}
+
 unsafe fn broker_query_registry_path_value(
     key_path: &HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
     value_name: &HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
@@ -6238,47 +6274,11 @@ extern "win64" fn s_io_create_device(
 /// `void IoDeleteDevice(PDEVICE_OBJECT)`.
 extern "win64" fn s_io_delete_device(dev: u64) {
     if dev == 0 {
-        return;
+        panic!("IoDeleteDevice received a null DEVICE_OBJECT");
     }
     unsafe {
-        if let Some(binding) = hosted_device_binding_by_device_object(dev) {
-            if binding.device_id != 0 {
-                let device_id = nt_io_manager::DeviceId(binding.device_id);
-                match io_manager_mut().destroy_device(device_id) {
-                    Ok(_) => {
-                        clear_hosted_device_binding_by_device_id(binding.device_id);
-                        let table = driver_instances_mut();
-                        if binding.instance < table.len()
-                            && table[binding.instance].device_object == dev
-                        {
-                            table[binding.instance].device_id = 0;
-                            table[binding.instance].device_object = 0;
-                            table[binding.instance].ready = false;
-                        }
-                    }
-                    Err(nt_status::NtStatus::DELETE_PENDING) => return,
-                    Err(_) => return,
-                }
-            }
-        } else if let Some((index, inst)) = instance_by_device_object(dev) {
-            if inst.device_id != 0 {
-                let device_id = nt_io_manager::DeviceId(inst.device_id);
-                match io_manager_mut().destroy_device(device_id) {
-                    Ok(_) => {
-                        let table = driver_instances_mut();
-                        if index < table.len() && table[index].device_object == dev {
-                            table[index].device_id = 0;
-                            table[index].device_object = 0;
-                            table[index].ready = false;
-                        }
-                    }
-                    Err(nt_status::NtStatus::DELETE_PENDING) => return,
-                    Err(_) => return,
-                }
-            }
-        }
-
-        crate::hosted_driver_projection::delete_hosted_device_projection(dev, pool_free);
+        let status = hosted_device_delete(dev);
+        assert_eq!(status, STATUS_SUCCESS, "hosted IoDeleteDevice failed");
         if read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64) == dev {
             write_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *mut u64, 0);
             clear_shared_path_len(SH_DEVICE_NAME_LEN);
@@ -7051,29 +7051,11 @@ extern "win64" fn s_io_attach_device_to_device_stack(source: u64, target: u64) -
             Some(lower) => lower,
             None => return 0,
         };
-
-        let source_instance = instance_by_device_object(source);
-        let target_instance = instance_by_device_object(target);
-        match (source_instance, target_instance) {
-            (Some((_, source_inst)), Some((_, target_inst)))
-                if source_inst.device_id != 0 && target_inst.device_id != 0 =>
-            {
-                match io_manager_mut().attach_device_to_stack(
-                    nt_io_manager::DeviceId(source_inst.device_id),
-                    nt_io_manager::DeviceId(target_inst.device_id),
-                ) {
-                    Ok(lower_id) => instance_by_device_id(lower_id.raw())
-                        .map(|(_, inst)| inst.device_object)
-                        .unwrap_or(lower),
-                    Err(_) => {
-                        crate::hosted_driver_projection::detach_hosted_device_projection(lower);
-                        0
-                    }
-                }
-            }
-            (None, None) => lower,
-            _ => lower,
+        if hosted_device_attach(source, target, lower) != STATUS_SUCCESS {
+            crate::hosted_driver_projection::detach_hosted_device_projection(lower);
+            return 0;
         }
+        lower
     }
 }
 
@@ -7084,12 +7066,11 @@ extern "win64" fn s_io_detach_device(lower: u64) {
     }
     unsafe {
         let upper = crate::hosted_driver_projection::hosted_attached_device(lower);
-        if let Some((_, upper_inst)) = instance_by_device_object(upper) {
-            if upper_inst.device_id != 0 {
-                let _ = io_manager_mut()
-                    .detach_device_from_stack(nt_io_manager::DeviceId(upper_inst.device_id));
-            }
+        if upper == 0 {
+            panic!("IoDetachDevice target has no upper attachment");
         }
+        let status = hosted_device_detach(lower, upper);
+        assert_eq!(status, STATUS_SUCCESS, "hosted IoDetachDevice failed");
         crate::hosted_driver_projection::detach_hosted_device_projection(lower);
     }
 }
@@ -30148,7 +30129,12 @@ unsafe fn component_dispatch_video_add_device(drv: u64, pdo: u64) -> (i32, u64) 
         (&mut device_object as *mut u64) as u64,
     );
     if status == 0 {
-        (0, device_object)
+        if s_io_attach_device_to_device_stack(device_object, pdo) == 0 {
+            s_io_delete_device(device_object);
+            (STATUS_INVALID_DEVICE_REQUEST, 0)
+        } else {
+            (0, device_object)
+        }
     } else {
         (status, 0)
     }
@@ -34949,6 +34935,7 @@ unsafe fn start_hosted_device_relation_query() -> usize {
 pub(crate) fn pump_hosted_io_completions() -> usize {
     let pumped = pump_io_manager(io_manager_mut());
     pumped
+        .saturating_add(unsafe { drain_hosted_device_retirements() })
         .saturating_add(unsafe { drain_hosted_pnp_completions() })
         .saturating_add(unsafe { drain_hosted_device_relation_query() })
         .saturating_add(unsafe { start_hosted_device_relation_query() })
@@ -36373,7 +36360,17 @@ pub(crate) struct HostedIoPortFaultGrant {
     pub(crate) len: u64,
 }
 
+#[derive(Clone, Copy)]
+struct HostedDeviceRetirement {
+    instance: usize,
+    domain: HostedDomainIdentity,
+    device_object: u64,
+    device_id: nt_io_manager::DeviceId,
+    barrier_status: Option<nt_status::NtStatus>,
+}
+
 static mut HOSTED_DEVICE_BINDINGS: Option<Vec<HostedDeviceBinding>> = None;
+static mut HOSTED_DEVICE_RETIREMENTS: Option<Vec<HostedDeviceRetirement>> = None;
 static mut HOSTED_ROOT_BUS: Option<nt_root_bus::RootBus> = None;
 static mut HOSTED_PNP_MANAGER: Option<nt_pnp_manager::PnpManager> = None;
 static mut HOSTED_DEVICE_RELATION_INVALIDATIONS: Option<
@@ -36564,6 +36561,14 @@ unsafe fn hosted_device_bindings_mut() -> &'static mut Vec<HostedDeviceBinding> 
 
 unsafe fn hosted_device_bindings() -> Option<&'static Vec<HostedDeviceBinding>> {
     (*core::ptr::addr_of!(HOSTED_DEVICE_BINDINGS)).as_ref()
+}
+
+unsafe fn hosted_device_retirements_mut() -> &'static mut Vec<HostedDeviceRetirement> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DEVICE_RETIREMENTS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
 }
 
 unsafe fn hosted_device_resource_states_mut() -> &'static mut Vec<HostedDeviceResourceState> {
@@ -37225,14 +37230,14 @@ unsafe fn clear_hosted_resource_projection(
     Ok(())
 }
 
-fn authenticated_hosted_pdo(
+fn authenticated_hosted_device(
     ch: &crate::spawn_hosts::PumpChannel,
-    pdo_object: u64,
+    device_object: u64,
     active_reply_cap: u64,
 ) -> Result<(usize, DriverInstance, nt_io_manager::DeviceId), nt_status::NtStatus> {
     let (instance, inst) = instance_for_pump_channel(ch, active_reply_cap)
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    if inst.hosted_domain_id == 0 || inst.hosted_domain_cookie == 0 || pdo_object == 0 {
+    if inst.hosted_domain_id == 0 || inst.hosted_domain_cookie == 0 || device_object == 0 {
         return Err(nt_status::NtStatus::ACCESS_DENIED);
     }
     let identity = HostedDomainIdentity {
@@ -37240,8 +37245,18 @@ fn authenticated_hosted_pdo(
         cookie: inst.hosted_domain_cookie,
     };
     let device_id = io_manager_mut()
-        .hosted_device_by_identity(identity, pdo_object)
+        .hosted_device_by_identity(identity, device_object)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    Ok((instance, inst, device_id))
+}
+
+fn authenticated_hosted_pdo(
+    ch: &crate::spawn_hosts::PumpChannel,
+    pdo_object: u64,
+    active_reply_cap: u64,
+) -> Result<(usize, DriverInstance, nt_io_manager::DeviceId), nt_status::NtStatus> {
+    let (instance, inst, device_id) =
+        authenticated_hosted_device(ch, pdo_object, active_reply_cap)?;
     if unsafe { hosted_pnp_manager_mut().devnode_for_pdo(device_id.raw()) }.is_none() {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
@@ -37400,6 +37415,9 @@ pub(crate) fn service_hosted_device(
             | HOSTED_DEVICE_OP_CLAIM_PORT_RANGE
             | HOSTED_DEVICE_OP_INVALIDATE_RELATIONS
             | HOSTED_DEVICE_OP_CREATE
+            | HOSTED_DEVICE_OP_ATTACH
+            | HOSTED_DEVICE_OP_DETACH
+            | HOSTED_DEVICE_OP_DELETE
     ) {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
     }
@@ -37528,6 +37546,127 @@ pub(crate) fn service_hosted_device(
             return (status.raw(), 0, 0, 0);
         }
         return (STATUS_SUCCESS, device_id.raw(), 0, 0);
+    }
+    if op == HOSTED_DEVICE_OP_ATTACH {
+        let (source_instance, _, source_id) =
+            match authenticated_hosted_device(ch, pdo_object, active_reply_cap) {
+                Ok(resolved) => resolved,
+                Err(status) => return (status.raw(), 0, 0, 0),
+            };
+        let (target_instance, _, target_id) =
+            match authenticated_hosted_device(ch, arg2, active_reply_cap) {
+                Ok(resolved) => resolved,
+                Err(status) => return (status.raw(), 0, 0, 0),
+            };
+        let (lower_instance, _, expected_lower_id) =
+            match authenticated_hosted_device(ch, arg3, active_reply_cap) {
+                Ok(resolved) => resolved,
+                Err(status) => return (status.raw(), 0, 0, 0),
+            };
+        if source_instance != target_instance || source_instance != lower_instance {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        }
+        return match io_manager_mut().attach_device_to_stack(source_id, target_id) {
+            Ok(lower_id) if lower_id == expected_lower_id => {
+                (STATUS_SUCCESS, lower_id.raw(), 0, 0)
+            }
+            Ok(_) => {
+                io_manager_mut()
+                    .detach_device_from_stack(source_id)
+                    .unwrap_or_else(|status| {
+                        panic!("hosted attach mismatch rollback failed: {status:?}")
+                    });
+                (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0)
+            }
+            Err(status) => (status.raw(), 0, 0, 0),
+        };
+    }
+    if op == HOSTED_DEVICE_OP_DETACH {
+        let (lower_instance, _, lower_id) =
+            match authenticated_hosted_device(ch, pdo_object, active_reply_cap) {
+                Ok(resolved) => resolved,
+                Err(status) => return (status.raw(), 0, 0, 0),
+            };
+        let (upper_instance, _, upper_id) =
+            match authenticated_hosted_device(ch, arg2, active_reply_cap) {
+                Ok(resolved) => resolved,
+                Err(status) => return (status.raw(), 0, 0, 0),
+            };
+        if lower_instance != upper_instance {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        }
+        return match io_manager_mut().detach_device_from_stack(upper_id) {
+            Ok(detached_lower) if detached_lower == lower_id => {
+                (STATUS_SUCCESS, detached_lower.raw(), 0, 0)
+            }
+            Ok(_) => panic!("hosted detach returned a different canonical lower device"),
+            Err(status) => (status.raw(), 0, 0, 0),
+        };
+    }
+    if op == HOSTED_DEVICE_OP_DELETE {
+        let (instance, inst, device_id) =
+            match authenticated_hosted_device(ch, pdo_object, active_reply_cap) {
+                Ok(resolved) => resolved,
+                Err(status) => return (status.raw(), 0, 0, 0),
+            };
+        let domain = HostedDomainIdentity {
+            domain_id: nt_io_manager::HostedDomainId(inst.hosted_domain_id),
+            cookie: inst.hosted_domain_cookie,
+        };
+        if io_manager_mut()
+            .device(device_id)
+            .is_none_or(|device| device.attached_to.is_some())
+        {
+            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
+        }
+        let retirements = unsafe { hosted_device_retirements_mut() };
+        if let Some(existing) = retirements.iter().copied().find(|retirement| {
+            retirement.device_id == device_id
+                || (retirement.domain == domain && retirement.device_object == pdo_object)
+        }) {
+            if existing.instance != instance
+                || existing.domain != domain
+                || existing.device_object != pdo_object
+                || existing.device_id != device_id
+            {
+                return (STATUS_OBJECT_NAME_COLLISION, 0, 0, 0);
+            }
+            return (
+                existing
+                    .barrier_status
+                    .map(nt_status::NtStatus::raw)
+                    .unwrap_or(STATUS_SUCCESS),
+                0,
+                0,
+                0,
+            );
+        }
+        if retirements.try_reserve(1).is_err() {
+            return (STATUS_INSUFFICIENT_RESOURCES, 0, 0, 0);
+        }
+        retirements.push(HostedDeviceRetirement {
+            instance,
+            domain,
+            device_object: pdo_object,
+            device_id,
+            barrier_status: None,
+        });
+        unsafe { drain_hosted_device_retirements() };
+        let retained = unsafe { hosted_device_retirements_mut() }
+            .iter()
+            .copied()
+            .find(|retirement| {
+                retirement.domain == domain && retirement.device_object == pdo_object
+            });
+        return (
+            retained
+                .and_then(|retirement| retirement.barrier_status)
+                .map(nt_status::NtStatus::raw)
+                .unwrap_or(STATUS_SUCCESS),
+            0,
+            0,
+            0,
+        );
     }
     if op == HOSTED_DEVICE_OP_INVALIDATE_RELATIONS {
         let call = HOSTED_DEVICE_RELATION_INVALIDATION_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -40410,6 +40549,143 @@ fn clear_hosted_device_binding_by_device_id(device_id: u64) {
                 .as_mut()
                 .unwrap()[index] = EMPTY_HOSTED_DEVICE_BINDING;
         }
+    }
+}
+
+unsafe fn retire_hosted_device_projection(
+    inst: DriverInstance,
+    device_object: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let _guard = hosted_instance_pool_lock(inst.exec_pool_va)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let (device_exec, capacity) = hosted_pool_allocation_exec_range(inst.exec_pool_va, device_object)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    if capacity < WDM_X64_DEVICE_OBJECT_SIZE as u64
+        || hosted_instance_pool_allocation_is_free_unlocked(inst, device_object) != Some(false)
+        || read_unaligned(device_exec as *const i16) != WDM_X64_IO_TYPE_DEVICE
+        || read_unaligned((device_exec + 2) as *const u16) != WDM_X64_DEVICE_OBJECT_SIZE as u16
+    {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let driver_object = read_unaligned((device_exec + 0x08) as *const u64);
+    let next_device = read_unaligned((device_exec + 0x10) as *const u64);
+    if driver_object != 0 {
+        let (driver_exec, driver_capacity) =
+            hosted_pool_allocation_exec_range(inst.exec_pool_va, driver_object)
+                .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+        if driver_capacity < WDM_X64_DRIVER_OBJECT_SIZE as u64
+            || hosted_instance_pool_allocation_is_free_unlocked(inst, driver_object) != Some(false)
+            || read_unaligned(driver_exec as *const i16) != WDM_X64_IO_TYPE_DRIVER
+        {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        let mut link_exec = driver_exec + 0x08;
+        let mut current = read_unaligned(link_exec as *const u64);
+        let mut traversed = 0u64;
+        while current != device_object {
+            if current == 0 || traversed >= POOL_FREE_LIST_MAX {
+                return Err(nt_status::NtStatus::INVALID_PARAMETER);
+            }
+            let (current_exec, current_capacity) =
+                hosted_pool_allocation_exec_range(inst.exec_pool_va, current)
+                    .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+            if current_capacity < WDM_X64_DEVICE_OBJECT_SIZE as u64
+                || hosted_instance_pool_allocation_is_free_unlocked(inst, current) != Some(false)
+                || read_unaligned(current_exec as *const i16) != WDM_X64_IO_TYPE_DEVICE
+            {
+                return Err(nt_status::NtStatus::INVALID_PARAMETER);
+            }
+            link_exec = current_exec + 0x10;
+            current = read_unaligned(link_exec as *const u64);
+            traversed += 1;
+        }
+        write_unaligned(link_exec as *mut u64, next_device);
+    }
+    write_unaligned(device_exec as *mut u16, 0);
+    if !hosted_instance_pool_free_unlocked(inst, device_object) {
+        return Err(nt_status::NtStatus::UNSUCCESSFUL);
+    }
+    Ok(())
+}
+
+unsafe fn drain_hosted_device_retirements() -> usize {
+    let mut progress = 0usize;
+    let mut index = 0usize;
+    loop {
+        let Some(retirement) = hosted_device_retirements_mut().get(index).copied() else {
+            return progress;
+        };
+        if retirement.barrier_status.is_some() {
+            index += 1;
+            continue;
+        }
+        let Some(inst) = instance(retirement.instance) else {
+            hosted_device_retirements_mut()[index].barrier_status =
+                Some(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+            progress = progress.saturating_add(1);
+            index += 1;
+            continue;
+        };
+        let current_domain = HostedDomainIdentity {
+            domain_id: nt_io_manager::HostedDomainId(inst.hosted_domain_id),
+            cookie: inst.hosted_domain_cookie,
+        };
+        if current_domain != retirement.domain {
+            hosted_device_retirements_mut()[index].barrier_status =
+                Some(nt_status::NtStatus::ACCESS_DENIED);
+            progress = progress.saturating_add(1);
+            index += 1;
+            continue;
+        }
+        if io_manager_mut().device(retirement.device_id).is_some() {
+            match io_manager_mut().destroy_device(retirement.device_id) {
+                Ok(_) => progress = progress.saturating_add(1),
+                Err(nt_status::NtStatus::DELETE_PENDING) => {
+                    index += 1;
+                    continue;
+                }
+                Err(status) => {
+                    hosted_device_retirements_mut()[index].barrier_status = Some(status);
+                    progress = progress.saturating_add(1);
+                    index += 1;
+                    continue;
+                }
+            }
+        }
+        if hosted_device_binding_by_device_id(retirement.device_id.raw()).is_some() {
+            clear_hosted_device_binding_by_device_id(retirement.device_id.raw());
+            if hosted_device_binding_by_device_id(retirement.device_id.raw()).is_some() {
+                hosted_device_retirements_mut()[index].barrier_status =
+                    Some(nt_status::NtStatus::UNSUCCESSFUL);
+                progress = progress.saturating_add(1);
+                index += 1;
+                continue;
+            }
+        } else if !io_manager_mut().unbind_hosted_device_identity(
+            retirement.domain,
+            retirement.device_object,
+            retirement.device_id,
+        ) {
+            hosted_device_retirements_mut()[index].barrier_status =
+                Some(nt_status::NtStatus::INVALID_PARAMETER);
+            progress = progress.saturating_add(1);
+            index += 1;
+            continue;
+        }
+        retire_hosted_device_projection(inst, retirement.device_object).unwrap_or_else(|status| {
+            panic!("canonical hosted device retired before its projection: {status:?}")
+        });
+        let instances = driver_instances_mut();
+        if retirement.instance < instances.len()
+            && instances[retirement.instance].device_id == retirement.device_id.raw()
+            && instances[retirement.instance].device_object == retirement.device_object
+        {
+            instances[retirement.instance].device_id = 0;
+            instances[retirement.instance].device_object = 0;
+            instances[retirement.instance].ready = false;
+        }
+        hosted_device_retirements_mut().swap_remove(index);
+        progress = progress.saturating_add(1);
     }
 }
 
@@ -43741,14 +44017,8 @@ where
             .device(device_id)
             .and_then(|device| device.attached_to)
         {
-            None => {
-                let lower = io_manager_mut().attach_device_to_stack(device_id, pdo_device)?;
-                if lower != pdo_device {
-                    return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-                }
-            }
             Some(lower) if lower == pdo_device => {}
-            Some(_) => return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+            None | Some(_) => return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
         }
         canonical_fdo_attached = true;
         hosted_pnp_manager_mut()
