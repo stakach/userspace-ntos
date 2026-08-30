@@ -329,15 +329,15 @@ pub const SH_ENTRY_RVA: u64 = 0x00; // in:  DriverEntry RVA (u64)
 pub const SH_VERDICT: u64 = 0x08; // out: verdict bitmask (u32)
 pub const SH_DE_STATUS: u64 = 0x10; // out: DriverEntry NTSTATUS (i32)
 pub const SH_MJ_TABLE: u64 = 0x18; // out: recorded DriverObject->MajorFunction[] base VA (u64)
-pub const SH_DEVOBJ: u64 = 0x20; // out: the control DEVICE_OBJECT VA (u64)
+pub const SH_ACTIVE_DEVICE_OBJECT: u64 = 0x20; // in: exact DEVICE_OBJECT for the active dispatch
 pub const SH_POOL_USED: u64 = 0x28; // out: pool high-water (u64)
 pub const SH_DRVOBJ: u64 = 0x30; // out: the component-local DRIVER_OBJECT VA (u64)
 pub const SH_DRIVER_UNLOAD: u64 = 0x38; // out: DriverObject->DriverUnload after DriverEntry (u64)
-pub const SH_DEVICE_NAME_LEN: u64 = 0x80; // out: IoCreateDevice DeviceName bytes (u16)
+pub const SH_DEVICE_NAME_LEN: u64 = 0x80; // transient IoCreateDevice broker request length (u16)
 pub const SH_SYMLINK_LINK_LEN: u64 = 0x82; // out: IoCreateSymbolicLink LinkName bytes (u16)
 pub const SH_SYMLINK_TARGET_LEN: u64 = 0x84; // out: IoCreateSymbolicLink DeviceName bytes (u16)
 pub const SH_ADD_DEVICE: u64 = 0x88; // out: DriverExtension->AddDevice after DriverEntry (u64)
-pub const SH_DEVICE_NAME_BUF: u64 = 0x90; // out: UTF-16LE path capture
+pub const SH_DEVICE_NAME_BUF: u64 = 0x90; // transient IoCreateDevice broker request path
 pub const SH_SYMLINK_LINK_BUF: u64 = 0x190; // out: UTF-16LE path capture
 pub const SH_SYMLINK_TARGET_BUF: u64 = 0x290; // out: UTF-16LE path capture
 pub const SH_CAPTURED_PATH_BYTES: usize = 0x100;
@@ -546,10 +546,10 @@ const WDM_X64_DRIVER_EXTENSION_ADD_DEVICE_OFFSET: u64 = 0x08;
 pub const V_ENTERED: u32 = 1; // host called into DriverEntry
 pub const V_RETURNED: u32 = 2; // DriverEntry returned (did not fault)
 pub const V_SUCCESS: u32 = 4; // DriverEntry returned STATUS_SUCCESS
-pub const V_DEVICE: u32 = 8; // IoCreateDevice(control device) succeeded
+pub const V_DEVICE: u32 = 8; // at least one IoCreateDevice call succeeded
 pub const V_MJ: u32 = 0x10; // DriverEntry replaced MajorFunction[IRP_MJ_CREATE] with a real dispatch
 pub const V_REGFS: u32 = 0x20; // IoRegisterFileSystem was called
-pub const V_NAMED_DEVICE: u32 = 0x40; // IoCreateDevice declared a valid NT DeviceName
+pub const V_NAMED_DEVICE: u32 = 0x40; // at least one named IoCreateDevice call succeeded
 pub const V_SYMLINK: u32 = 0x80; // IoCreateSymbolicLink declared a valid link/target
 
 const PASSIVE_LEVEL: u8 = 0;
@@ -6302,14 +6302,12 @@ extern "win64" fn s_io_create_device(
             };
         }
         write_unaligned(dev_out as *mut u64, dev);
-        // Retain the last-created pointer for the component ready handshake. Canonical identity was
-        // already published synchronously by the broker above.
-        write_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *mut u64, dev);
         let mut v = read_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *const u32) | V_DEVICE;
         if named_device.is_some() {
             v |= V_NAMED_DEVICE;
         }
         write_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *mut u32, v);
+        clear_shared_path_len(SH_DEVICE_NAME_LEN);
     }
     0 // STATUS_SUCCESS
 }
@@ -6322,13 +6320,6 @@ extern "win64" fn s_io_delete_device(dev: u64) {
     unsafe {
         let status = hosted_device_delete(dev);
         assert_eq!(status, STATUS_SUCCESS, "hosted IoDeleteDevice failed");
-        if read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64) == dev {
-            write_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *mut u64, 0);
-            clear_shared_path_len(SH_DEVICE_NAME_LEN);
-            let verdict = read_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *const u32)
-                & !(V_DEVICE | V_NAMED_DEVICE);
-            write_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *mut u32, verdict);
-        }
     }
 }
 
@@ -6676,7 +6667,8 @@ unsafe fn hosted_registry_identity_id_by_pdo_object(pdo: u64) -> Option<HostedRe
 unsafe fn hosted_device_object_known(device_object: u64) -> bool {
     device_object != 0
         && (hosted_device_binding_by_device_object(device_object).is_some()
-            || read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64) == device_object)
+            || read_volatile((FSD_SHARED_VADDR + SH_ACTIVE_DEVICE_OBJECT) as *const u64)
+                == device_object)
 }
 
 unsafe fn trace_io_get_device_property(
@@ -6865,29 +6857,6 @@ fn build_hosted_interface_link(
     Some(out)
 }
 
-unsafe fn shared_device_name_ascii() -> Option<HostedAscii<HOSTED_EXPORT_NAME_MAX>> {
-    shared_device_name_ascii_at(FSD_SHARED_VADDR)
-}
-
-unsafe fn shared_device_name_ascii_at(sh: u64) -> Option<HostedAscii<HOSTED_EXPORT_NAME_MAX>> {
-    let len = read_volatile((sh + SH_DEVICE_NAME_LEN) as *const u16) as usize;
-    if len == 0 || len > HOSTED_EXPORT_NAME_MAX * 2 || (len & 1) != 0 {
-        return None;
-    }
-    let mut out = HostedAscii::<HOSTED_EXPORT_NAME_MAX>::empty();
-    let chars = len / 2;
-    let mut i = 0usize;
-    while i < chars {
-        let lo = read_volatile((sh + SH_DEVICE_NAME_BUF + (i * 2) as u64) as *const u8);
-        let hi = read_volatile((sh + SH_DEVICE_NAME_BUF + (i * 2 + 1) as u64) as *const u8);
-        if hi != 0 || lo == 0 || lo > 0x7f || !out.push_byte(lo) {
-            return None;
-        }
-        i += 1;
-    }
-    Some(out)
-}
-
 unsafe fn hosted_device_interface_registrations_mut(
 ) -> &'static mut Vec<HostedDeviceInterfaceRegistration> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DEVICE_INTERFACE_REGISTRATIONS);
@@ -6990,7 +6959,7 @@ extern "win64" fn s_io_register_device_interface(
         else {
             return STATUS_INVALID_PARAMETER;
         };
-        let target = shared_device_name_ascii().unwrap_or(identity.export_name);
+        let target = identity.export_name;
         if target.is_empty() {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         }
@@ -30390,7 +30359,10 @@ unsafe fn component_dispatch_video_add_device(drv: u64, pdo: u64) -> (i32, u64) 
     if pdo == 0 {
         return (STATUS_INVALID_PARAMETER, 0);
     }
-    write_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *mut u64, 0);
+    write_volatile(
+        (FSD_SHARED_VADDR + SH_ACTIVE_DEVICE_OBJECT) as *mut u64,
+        0,
+    );
 
     let object_number = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64);
     if object_number > u32::MAX as u64 {
@@ -30487,7 +30459,8 @@ unsafe fn component_dispatch_video_win32k_callbacks(
     }
     let phys_disp = read_unaligned(buffer as *const u64);
     let callout = read_unaligned((buffer + 8) as *const u64);
-    let video_device_object = read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64);
+    let video_device_object =
+        read_volatile((FSD_SHARED_VADDR + SH_ACTIVE_DEVICE_OBJECT) as *const u64);
     let mut index = 0u64;
     while index < VIDEO_WIN32K_CALLBACKS_SIZE_X64 as u64 {
         write_volatile((buffer + index) as *mut u8, 0);
@@ -30919,16 +30892,16 @@ unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64
             (FSD_SHARED_VADDR + SH_REQ_OUTLEN) as *mut u64,
             previous_device_head,
         );
-        write_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *mut u64, 0);
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_ACTIVE_DEVICE_OBJECT) as *mut u64,
+            0,
+        );
         let add: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(add_device as *const ());
         let status = add(request_drv, pdo);
-        let attached = crate::hosted_driver_projection::hosted_attached_device(pdo);
-        let fdo = if attached != 0 {
-            attached
-        } else {
-            read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64)
-        };
-        return (status, fdo);
+        return (
+            status,
+            crate::hosted_driver_projection::hosted_attached_device(pdo),
+        );
     }
     if major == FSD_DISPATCH_VIDEO_ADD_DEVICE {
         let pdo = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
@@ -31326,7 +31299,7 @@ const _: () = assert!(!valid_set_information_relation(
 ));
 
 unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
-    let devobj = read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64);
+    let devobj = read_volatile((FSD_SHARED_VADDR + SH_ACTIVE_DEVICE_OBJECT) as *const u64);
     let request = read_volatile(
         (FSD_DATA_VADDR + FSD_DATA_IRP_DISPATCH_REQUEST_OFF) as *const IrpDispatchRequest,
     );
@@ -46438,7 +46411,6 @@ struct AddDeviceDispatchResult {
     pdo_object: u64,
     fdo_object: u64,
     previous_device_head: u64,
-    fdo_name: Option<HostedAscii<HOSTED_EXPORT_NAME_MAX>>,
 }
 
 fn hosted_video_device_path(number: u32) -> Option<HostedAscii<HOSTED_EXPORT_NAME_MAX>> {
@@ -46490,7 +46462,7 @@ unsafe fn dispatch_video_add_device_for_instance(
     write_volatile((sh + SH_REQ_FILEID) as *mut u64, pdo_object);
     write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
     write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
-    write_volatile((sh + SH_DEVOBJ) as *mut u64, 0);
+    write_volatile((sh + SH_ACTIVE_DEVICE_OBJECT) as *mut u64, 0);
     clear_shared_path_len_at(sh, SH_DEVICE_NAME_LEN);
 
     let ch = crate::spawn_hosts::PumpChannel {
@@ -46535,7 +46507,6 @@ unsafe fn dispatch_video_add_device_for_instance(
         pdo_object,
         fdo_object,
         previous_device_head,
-        fdo_name: shared_device_name_ascii_at(sh),
     })
 }
 
@@ -46563,7 +46534,7 @@ unsafe fn dispatch_provider_add_device_for_instance(
     write_volatile((sh + SH_REQ_FILEID) as *mut u64, pdo_object);
     write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
     write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
-    write_volatile((sh + SH_DEVOBJ) as *mut u64, 0);
+    write_volatile((sh + SH_ACTIVE_DEVICE_OBJECT) as *mut u64, 0);
     clear_shared_path_len_at(sh, SH_DEVICE_NAME_LEN);
     clear_shared_device_interface_state_at(sh);
 
@@ -46608,7 +46579,6 @@ unsafe fn dispatch_provider_add_device_for_instance(
         pdo_object,
         fdo_object,
         previous_device_head,
-        fdo_name: shared_device_name_ascii_at(sh),
     })
 }
 
@@ -46643,7 +46613,7 @@ unsafe fn dispatch_add_device_for_instance(
     write_volatile((sh + SH_REQ_FILEID) as *mut u64, pdo_object);
     write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
     write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
-    write_volatile((sh + SH_DEVOBJ) as *mut u64, 0);
+    write_volatile((sh + SH_ACTIVE_DEVICE_OBJECT) as *mut u64, 0);
     clear_shared_path_len_at(sh, SH_DEVICE_NAME_LEN);
 
     let ch = crate::spawn_hosts::PumpChannel {
@@ -46687,7 +46657,6 @@ unsafe fn dispatch_add_device_for_instance(
         pdo_object,
         fdo_object,
         previous_device_head,
-        fdo_name: shared_device_name_ascii_at(sh),
     })
 }
 
@@ -46994,26 +46963,18 @@ unsafe fn call_add_device_for_existing_pdo(
         if add_device.pdo_object != pdo_object {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
-        if let Some(fdo_name) = add_device.fdo_name.as_ref() {
-            if registry_identity.has_linkage_export()
-                && !hosted_ascii_eq_ignore_case(fdo_name, &registry_identity.export_name)
-            {
-                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-            }
-        }
-        let fdo_name = match add_device.fdo_name.as_ref() {
-            Some(name) => {
-                Some(parse_nt_path(name.as_str()).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?)
-            }
-            None => None,
-        };
         let device_id = io_manager_mut()
             .hosted_device_by_identity(projection_domain, add_device.fdo_object)
             .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        if io_manager_mut()
-            .device(device_id)
-            .is_none_or(|device| device.name.as_ref() != fdo_name.as_ref())
-        {
+        let canonical_name_matches = io_manager_mut().device(device_id).is_some_and(|device| {
+            device.name.as_ref().is_none_or(|name| {
+                !registry_identity.has_linkage_export()
+                    || nt_path_ascii(name).is_some_and(|name| {
+                        name.eq_ignore_ascii_case(registry_identity.export_name.as_bytes())
+                    })
+            })
+        });
+        if !canonical_name_matches {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
         fdo_device_id = Some(device_id);
@@ -48168,7 +48129,7 @@ unsafe fn dispatch_video_initialize_for_instance(
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     let sh = inst.exec_shared_va;
-    write_volatile((sh + SH_DEVOBJ) as *mut u64, device_object);
+    write_volatile((sh + SH_ACTIVE_DEVICE_OBJECT) as *mut u64, device_object);
     write_volatile(
         (sh + SH_REQ_MAJOR) as *mut u64,
         FSD_DISPATCH_VIDEO_INITIALIZE,
@@ -48236,7 +48197,7 @@ unsafe fn dispatch_video_start_io_for_instance(
     }
     let sh = inst.exec_shared_va;
     let inlen = in_data.len();
-    write_volatile((sh + SH_DEVOBJ) as *mut u64, device_object);
+    write_volatile((sh + SH_ACTIVE_DEVICE_OBJECT) as *mut u64, device_object);
     write_volatile((sh + SH_REQ_MAJOR) as *mut u64, FSD_DISPATCH_VIDEO_START_IO);
     write_volatile((sh + SH_REQ_MINOR) as *mut u64, 0);
     write_volatile((sh + SH_REQ_FSCTL) as *mut u64, ioctl);
@@ -49244,7 +49205,7 @@ unsafe fn dispatch_irp_for_instance_exact(
     let ep = d.fault_ep;
     let pml4 = d.pml4;
     write_volatile((sh + SH_DRVOBJ) as *mut u64, driver_object);
-    write_volatile((sh + SH_DEVOBJ) as *mut u64, device_object);
+    write_volatile((sh + SH_ACTIVE_DEVICE_OBJECT) as *mut u64, device_object);
     write_volatile((sh + SH_REQ_MAJOR) as *mut u64, major);
     write_volatile((sh + SH_REQ_MINOR) as *mut u64, minor);
     write_volatile((sh + SH_REQ_FSCTL) as *mut u64, fsctl);

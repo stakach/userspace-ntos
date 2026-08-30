@@ -18958,3 +18958,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     names from the canonical device record, and remove all last-created writes and fallback reads.
     Then audit the analogous device-interface capture and proceed to multi-device STOP/REMOVE and
     unload/rebalance ownership.
+
+    B3 active-device transport cleanup (2026-08-31, implementation green): the shared
+    `SH_DEVOBJ` symbol is replaced by `SH_ACTIVE_DEVICE_OBJECT`, whose only contract is the exact
+    device supplied for the current IRP or explicit video dispatch. `IoCreateDevice` no longer
+    overwrites that cell or leaves a last-created device/name behind, and `IoDeleteDevice` no
+    longer mutates a driver-wide verdict from a cached pointer. The device-name buffer is now a
+    transient synchronous create-broker request and is cleared on return.
+
+    AddDevice no longer accepts the last-created active-cell fallback. Its component result is the
+    FDO actually attached above the canonical PDO; a successful status without that attachment is
+    rejected. The executive resolves the FDO through its authenticated hosted-domain projection
+    and reads its optional name from the canonical I/O Manager record for Linkage validation.
+    Device-interface registration no longer reads the last-created name either; its current target
+    remains the service's real Linkage Export metadata until the following interface-lifetime
+    audit replaces that simplified representation.
+
+    Formatting, `git diff --check`, and the freestanding executive check pass at the unchanged
+    209-warning baseline. Review adjustment: move `IoRegisterDeviceInterface` and
+    `IoSetDeviceInterfaceState` from component-local/captured state to an executive-owned,
+    generation-protected registration keyed by canonical PDO, class GUID, and reference string.
+    Enable/disable must resolve the current top of the PDO stack dynamically rather than store a
+    string target. Remove the shared device-interface capture once that exact lifecycle is green.
