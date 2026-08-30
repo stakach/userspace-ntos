@@ -17565,3 +17565,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     unchanged, continue the job-object family with resident working-set ownership only after Memory
     Manager has real resident accounting, trimming, and pageout; do not approximate it with commitment
     accounting.
+
+    Serialized acceptance (2026-08-30): the release staging build passes, and
+    `.tmp/run-headless-job-security-final-20260830.log` dynamically launches userinit and Explorer,
+    completes 668 real api0 redirects with zero callback or dead-callback failures, installs 18 client
+    WndProcs without replay, reaches Explorer paint begin/end `5/20` with 187 direct GDI returns and 135
+    batch flushes covering 184 records, and paints all `480000/480000` framebuffer pixels with at least
+    32 colours. All `297/297` checks pass and the microtest sentinel matches.
+
+    Review adjustment: the NT5 job token-restriction slice is accepted end to end. No synthetic
+    security result, executable-name branch, retroactive member rewrite, or permissive fallback was
+    added. The remaining job limit is `JOB_OBJECT_LIMIT_WORKINGSET`; begin it only by giving Memory
+    Manager authoritative per-process resident-set accounting and a real trim/pageout transaction.
