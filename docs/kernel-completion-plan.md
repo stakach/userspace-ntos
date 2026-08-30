@@ -18293,3 +18293,37 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     demand-start PnP path. Then change the existing asynchronous fixture to SCM auto-start so real
     `services.exe` exercises the native `NtLoadDriver` reply owner and proves exactly one terminal
     reply without kernel injection.
+
+    B3 live device-action owner checkpoint (2026-08-30, executive implementation green):
+    host-tested checkpoint `37abc0be` adds the pure one-action coordinator. It keeps user-mode event
+    response independent from kernel lifecycle, correlates a pending START with its exact reserved
+    owner slot, permits terminal failure as a terminal result, and makes ownership loss a permanent
+    non-acknowledgeable barrier. Its focused suite passes `17/17`.
+
+    Executive checkpoint `8dbc8458` retains one exact CM event, claim token, and coordinator after
+    the historical seeded install stream drains. Arrival is delivered as ReactOS' ordinary
+    `GUID_DEVICE_ENUMERATED` install event; topology change and removal use target-device events and
+    immediately retain an unsupported lifecycle barrier until real re-enumeration and teardown
+    exist. `PlugPlayControlUserResponse` marks only notification delivery. A matching
+    `PlugPlayControlStartDevice` resolves current service launch policy from CM, restricts the batch
+    to the immutable event devnode, binds to the already-loaded driver, and reserves its continuation
+    slot before AddDevice or START side effects. Synchronous and timer/DPC-pending completions publish
+    terminal state before the table row is removed or the syscall reply is sent. An abandoned caller
+    relinquishes only its Reply object; lifecycle and CM claim ownership continue. CM ACK is attempted
+    only after both response and terminal state, and a failed ACK retains the exact claim for retry.
+
+    The CM pending bit is consumed as an edge only when it changes from empty to nonempty, avoiding a
+    wake storm from unrelated SYSTEM commits while a claim is retained. Pending-start storage and
+    transfer names now reflect their shared boot, native-load, and live-PnP ownership instead of the
+    former native-load-only use. Focused `nt-driver-start` validation passes `6/6`; formatting,
+    `git diff --check`, and the freestanding executive check pass at the established 209-warning
+    baseline.
+
+    Review adjustment: the ownership consumer is implementation-green but not yet runtime-accepted.
+    Add one genuine bus/PnP producer that commits complete Enum topology and
+    `PublishDeviceAction::Arrival` together after user-mode PnP is waiting. Use a resource-free new
+    instance of an already-loaded registry-selected driver for the first proof, and require exact
+    event delivery, user response, real AddDevice/START, timer-DPC terminal completion, CM ACK, and a
+    second empty BEGIN. Keep historical boot discovery until this run is green. Then remove the
+    overlapping eager demand-start devnode cohort and change `PendingStartTest` to SCM auto-start so
+    real `services.exe` issues `NtLoadDriver` and exercises the native reply owner separately.
