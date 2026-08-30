@@ -578,44 +578,44 @@ fn is_system_registry_path(path: &str) -> bool {
         || canonical.starts_with(r"\registry\machine\system\")
 }
 
+fn with_system_hive_key_lease<R>(
+    path: &str,
+    visit: impl FnOnce(Option<nt_config_client::SystemHiveKeyLease>) -> Result<R, u32>,
+) -> Result<R, u32> {
+    if !is_system_registry_path(path) {
+        return Err(STATUS_OBJECT_PATH_SYNTAX_BAD);
+    }
+    let opened = match unsafe { config_manager_open_system_hive_key(path) } {
+        Ok(opened) => opened,
+        Err(status) if status as u32 == STATUS_OBJECT_NAME_NOT_FOUND => return visit(None),
+        Err(status) => return Err(status as u32),
+    };
+    let result = visit(Some(opened.lease));
+    unsafe { config_manager_close_system_hive_key(opened.lease) }
+        .map_err(|status| status as u32)?;
+    result
+}
+
 fn query_system_hive_value(
     path: &str,
     name: &str,
 ) -> Result<Option<(nt_hive_core::RegistryValueType, alloc::vec::Vec<u8>)>, u32> {
-    if !is_system_registry_path(path) {
-        return Err(STATUS_OBJECT_PATH_SYNTAX_BAD);
-    }
-    let opened = match unsafe { config_manager_open_system_hive_key(path) } {
-        Ok(opened) => opened,
-        Err(status) if status as u32 == STATUS_OBJECT_NAME_NOT_FOUND => return Ok(None),
-        Err(status) => return Err(status as u32),
-    };
-    let result = unsafe { config_manager_query_leased_system_hive_value(opened.lease, name) };
-    let close_result = unsafe { config_manager_close_system_hive_key(opened.lease) };
-    if let Err(status) = close_result {
-        return Err(status as u32);
-    }
-    match result {
-        Ok(value) => nt_hive_core::RegistryValueType::from_u32(value.value_type)
-            .map(|value_type| Some((value_type, value.data)))
-            .ok_or(STATUS_INVALID_PARAMETER),
-        Err(status) if status as u32 == STATUS_OBJECT_NAME_NOT_FOUND => Ok(None),
-        Err(status) => Err(status as u32),
-    }
+    with_system_hive_key_lease(path, |lease| {
+        let Some(lease) = lease else {
+            return Ok(None);
+        };
+        match unsafe { config_manager_query_leased_system_hive_value(lease, name) } {
+            Ok(value) => nt_hive_core::RegistryValueType::from_u32(value.value_type)
+                .map(|value_type| Some((value_type, value.data)))
+                .ok_or(STATUS_INVALID_PARAMETER),
+            Err(status) if status as u32 == STATUS_OBJECT_NAME_NOT_FOUND => Ok(None),
+            Err(status) => Err(status as u32),
+        }
+    })
 }
 
 fn system_hive_key_exists(path: &str) -> Result<bool, u32> {
-    if !is_system_registry_path(path) {
-        return Err(STATUS_OBJECT_PATH_SYNTAX_BAD);
-    }
-    let opened = match unsafe { config_manager_open_system_hive_key(path) } {
-        Ok(opened) => opened,
-        Err(status) if status as u32 == STATUS_OBJECT_NAME_NOT_FOUND => return Ok(false),
-        Err(status) => return Err(status as u32),
-    };
-    unsafe { config_manager_close_system_hive_key(opened.lease) }
-        .map(|()| true)
-        .map_err(|status| status as u32)
+    with_system_hive_key_lease(path, |lease| Ok(lease.is_some()))
 }
 
 enum CachedSystemSetupKey {
@@ -7215,8 +7215,10 @@ impl ExecNtHandler {
     }
 
     fn registry_overlay_index_for_canon_path(&self, canon: &str) -> Option<usize> {
-        self.overlay
-            .find_for_path_authority(canon, self.mutable_hive_owns_path(canon))
+        self.overlay.find_for_path_authority(
+            canon,
+            self.registry_path_has_mounted_authority(canon),
+        )
     }
 
     fn mutable_registry_key_by_path(
@@ -7709,26 +7711,39 @@ impl ExecNtHandler {
                 Err(status) => Err(status as u32),
             };
         }
-        let result = (|| -> Option<R> {
-            if let Some(index) = self.registry_overlay_index(target) {
-                if self.overlay.value_is_deleted(index, name) {
-                    return None;
-                }
-                if let Some((ty, data)) = self.overlay.value(index, name) {
-                    return Some(visit(ty, data));
-                }
-                let path = self.overlay.path(index)?;
-                if let Some(key) = self.mutable_registry_key_by_path(path) {
-                    let (ty, data) = self.mutable_hives.query_value(key, name)?;
-                    return Some(visit(ty as u32, data));
-                }
-                if self.mutable_hive_owns_path(path) {
-                    return None;
-                }
-                let key = self.resolve_key(path)?;
-                let (hive, cell) = self.base_hive(key)?;
-                return hive.value_with(cell, name, visit);
+        if let Some(index) = self.registry_overlay_index(target) {
+            if self.overlay.value_is_deleted(index, name) {
+                return Ok(None);
             }
+            if let Some((ty, data)) = self.overlay.value(index, name) {
+                return Ok(Some(visit(ty, data)));
+            }
+            let Some(path) = self.overlay.path(index) else {
+                return Ok(None);
+            };
+            if is_system_registry_path(path) {
+                return query_system_hive_value(path, name).map(|value| {
+                    value.map(|(value_type, data)| visit(value_type as u32, &data))
+                });
+            }
+            if let Some(key) = self.mutable_registry_key_by_path(path) {
+                return Ok(self
+                    .mutable_hives
+                    .query_value(key, name)
+                    .map(|(ty, data)| visit(ty as u32, data)));
+            }
+            if self.mutable_hive_owns_path(path) {
+                return Ok(None);
+            }
+            let Some(key) = self.resolve_key(path) else {
+                return Ok(None);
+            };
+            let Some((hive, cell)) = self.base_hive(key) else {
+                return Ok(None);
+            };
+            return Ok(hive.value_with(cell, name, visit));
+        }
+        let result = (|| -> Option<R> {
             if let Some(key) = self.mutable_registry_key(target) {
                 let (ty, data) = self.mutable_hives.query_value(key, name)?;
                 return Some(visit(ty as u32, data));
@@ -7757,6 +7772,10 @@ impl ExecNtHandler {
 
     fn mutable_hive_owns_path(&self, path: &str) -> bool {
         self.mutable_hives.owns_path(path)
+    }
+
+    fn registry_path_has_mounted_authority(&self, path: &str) -> bool {
+        is_system_registry_path(path) || self.mutable_hive_owns_path(path)
     }
 
     fn registry_value_matches(
@@ -7942,7 +7961,7 @@ impl ExecNtHandler {
         let child_path = Self::registry_child_path(parent_path, child_name);
         let canon = self.overlay_canon(&child_path);
         self.registry_overlay_index_for_canon_path(&canon).is_some()
-            || !self.mutable_hive_owns_path(&canon)
+            || !self.registry_path_has_mounted_authority(&canon)
     }
 
     fn registry_value_by_index_with<R>(
@@ -7950,13 +7969,80 @@ impl ExecNtHandler {
         target: KeyRef,
         requested_index: usize,
         mut visit: impl FnMut(&str, u32, &[u8], Option<ResolvedHiveValue>) -> R,
-    ) -> Option<R> {
+    ) -> Result<Option<R>, u32> {
         let overlay_index = self.registry_overlay_index(target);
         let base_path = if let Some(index) = overlay_index {
             self.overlay.path(index).map(alloc::string::String::from)
         } else {
             self.registry_target_path(target)
         };
+        if let (Some(overlay), Some(path)) = (overlay_index, base_path.as_deref()) {
+            if is_system_registry_path(path) {
+                return with_system_hive_key_lease(path, |lease| {
+                    let mut visible_index = 0usize;
+                    let mut base_names = alloc::vec::Vec::new();
+                    if let Some(lease) = lease {
+                        let information = unsafe {
+                            crate::config_manager_query_leased_system_hive_key_information(lease)
+                        }
+                        .map_err(|status| status as u32)?;
+                        base_names
+                            .try_reserve_exact(information.value_count as usize)
+                            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+                        for index in 0..information.value_count {
+                            let value = unsafe {
+                                crate::config_manager_enumerate_leased_system_hive_value(
+                                    lease, index,
+                                )
+                            }
+                            .map_err(|status| status as u32)?;
+                            base_names.push(value.name.clone());
+                            if self.overlay.value_is_deleted(overlay, &value.name) {
+                                continue;
+                            }
+                            if visible_index == requested_index {
+                                if let Some((overlay_type, overlay_data)) =
+                                    self.overlay.value(overlay, &value.name)
+                                {
+                                    return Ok(Some(visit(
+                                        &value.name,
+                                        overlay_type,
+                                        overlay_data,
+                                        None,
+                                    )));
+                                }
+                                return Ok(Some(visit(
+                                    &value.name,
+                                    value.value_type,
+                                    &value.data,
+                                    None,
+                                )));
+                            }
+                            visible_index += 1;
+                        }
+                    }
+                    for index in 0..self.overlay.values_len(overlay) {
+                        let Some((name, value_type, data)) =
+                            self.overlay.value_by_index(overlay, index)
+                        else {
+                            continue;
+                        };
+                        if base_names
+                            .iter()
+                            .any(|base| base.eq_ignore_ascii_case(name))
+                        {
+                            continue;
+                        }
+                        if visible_index == requested_index {
+                            return Ok(Some(visit(name, value_type, data, None)));
+                        }
+                        visible_index += 1;
+                    }
+                    Ok(None)
+                });
+            }
+        }
+        let result = (|| -> Option<R> {
         let mutable_base = base_path
             .as_deref()
             .and_then(|path| self.mutable_registry_key_by_path(path));
@@ -8064,6 +8150,8 @@ impl ExecNtHandler {
             }
         }
         None
+        })();
+        Ok(result)
     }
 
     fn registry_key_stats(&self, target: KeyRef) -> RegistryKeyStats {
@@ -33259,7 +33347,7 @@ impl ExecNtHandler {
                         Err(status) => (status as u32, RegistryValueCopyProvenance::default()),
                     }
                 } else {
-                    self.registry_value_by_index_with(
+                    match self.registry_value_by_index_with(
                         key,
                         index as usize,
                         |name, ty, data, source| {
@@ -33288,11 +33376,14 @@ impl ExecNtHandler {
                                 ),
                             )
                         },
-                    )
-                    .unwrap_or((
-                        STATUS_NO_MORE_ENTRIES,
-                        RegistryValueCopyProvenance::default(),
-                    ))
+                    ) {
+                        Ok(Some(result)) => result,
+                        Ok(None) => (
+                            STATUS_NO_MORE_ENTRIES,
+                            RegistryValueCopyProvenance::default(),
+                        ),
+                        Err(status) => (status, RegistryValueCopyProvenance::default()),
+                    }
                 };
                 if status == 0 && provenance.is_valid() {
                     let _ = self.registry_value_copy_provenance.record(provenance);

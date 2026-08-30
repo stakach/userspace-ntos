@@ -18035,3 +18035,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     mounted SYSTEM authority when deciding whether a nonvolatile shadow yields. After that, migrate
     the remaining timezone/RTC and driver-service bootstrap reads, then delete SYSTEM mirror replay,
     mount/storage, and projection diagnostics together.
+
+    SYSTEM overlay value-composition acceptance (2026-08-30): persistent overlay shadows under
+    `\\Registry\\Machine\\System` now yield to CM as the mounted namespace authority, while an
+    explicitly volatile overlay remains authoritative. Value-by-name lookup gives the volatile
+    overlay's value or tombstone precedence and otherwise inherits through one transient exact CM
+    lease. Indexed enumeration preserves CM base ordering, applies overlay tombstones and overrides,
+    then appends overlay-only values without case-insensitive duplicates. Missing keys and values
+    remain normal namespace outcomes; CM query, enumeration, allocation, transport, and close
+    failures propagate without consulting the projected SYSTEM tree. A common scoped helper closes
+    every successfully opened transient lease before returning.
+
+    The freestanding executive release check remains at the established 209-warning baseline.
+    Serialized acceptance `.tmp/run-headless-cm-overlay-values-20260830.log` reaches the genuine
+    Explorer desktop with all `299/299` checks passing and the sentinel matched. CM reaches
+    generation 2535 after 2532 accepted runtime transactions with zero rejection or compatibility
+    projection failure. Native SYSTEM handle leases remain balanced at `1337/1335/2/0`; the new
+    transient composition leases are closed within their operation. Explorer completes 668 real
+    api0 redirects with zero callback or dead-callback failures, installs 18 client WndProcs without
+    replay, reaches paint begin/end `5/20` with 187 direct GDI returns and 135 batch flushes covering
+    184 records, and paints all `786432/786432` framebuffer pixels with at least 32 colours.
+
+    Review adjustment: SYSTEM value composition is accepted. Continue the same provider-aware model
+    for subkey enumeration/existence, class metadata, security descriptors, and key statistics;
+    preserve overlay-only children and explicit overlay security while inheriting all untouched
+    metadata through exact CM leases. Convert callers to result-bearing paths so no transport failure
+    can become `STATUS_NO_MORE_ENTRIES` or an empty statistic. Then migrate timezone/RTC and driver
+    service bootstrap reads before deleting mirror replay, mount/storage, and projection diagnostics.
