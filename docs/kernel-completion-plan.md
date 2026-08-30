@@ -17489,3 +17489,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     this slice accepted. If the unrestricted Explorer boot remains unchanged, advance to token
     restrictions through the Security Manager; do not add more syscall-name policy to Ps or the generic
     executive dispatcher.
+
+    Serialized acceptance (2026-08-30): `.tmp/run-headless-job-handles-final-20260830.log` records the
+    complete Win32 job callout/atom/handle policy selftest at `0x7ff/0x7ff`, dynamically launches
+    userinit and Explorer, completes 670 real api0 redirects with zero callback or dead-callback
+    failures, installs 18 client WndProcs without replay, reaches Explorer paint begin/end `5/20` with
+    187 direct GDI returns and 135 batch flushes covering 184 records, and paints all `480000/480000`
+    framebuffer pixels with at least 32 colours. All `297/297` checks pass and the sentinel matches.
+
+    Review adjustment: the full Win32 UI-restriction slice is accepted. The next unresolved job-object
+    boundary is token restrictions: Ps must retain only job identity and the authoritative security-limit
+    transaction, while token construction/filtering and access decisions remain owned by the Security
+    Manager. Reuse the existing token and access-check owners, make provider admission plus Ps commit one
+    rollback-safe operation, cover assignment/inheritance/rundown with focused host tests, and keep the
+    generic syscall dispatcher free of executable identities or permissive fallback behavior.
