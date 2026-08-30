@@ -18869,3 +18869,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     callback, interrupt/DPC route, teardown, and diagnostic path must resolve a canonical
     `HostedDeviceBinding`/I/O Manager `DeviceId`, so one loaded driver can own any number of
     independently filtered and started devices or NICs without singleton identity.
+
+    B3 canonical dispatch/retirement checkpoint (2026-08-31, implementation green): ordinary
+    hosted IRP dispatch now requires the exact canonical `HostedDeviceBinding` for the IRP's I/O
+    Manager `DeviceId` and verifies that it belongs to the backend instance. The old fallback to
+    `DriverInstance.device_object`, the fallback device-id-to-instance scan, and the matching
+    device-object cache probe are gone. The provider-domain dispatch path likewise accepts only
+    the binding selected by the exact request device object. NPFS diagnostics resolve its named
+    device through the same canonical dispatch route.
+
+    Device retirement no longer clears a driver-wide cached identity or marks the entire driver
+    instance unready when one FDO disappears. Canonical binding and I/O Manager teardown retire
+    only that device, preserving every sibling device owned by the loaded driver. Formatting,
+    `git diff --check`, and the freestanding executive check pass at the unchanged 209-warning
+    baseline.
+
+    Review adjustment: `DriverInstance.device_id` and `device_object` remain only because provider
+    export marshaling, provider callbacks, DMA aliases, and a few diagnostics still read them as a
+    last-device context. Do not replace those reads with a first-binding lookup or another global
+    current-device slot. Carry an exact canonical binding from the active IRP or the provider's
+    per-device handle/mirror into each nested call, then delete both fields and their AddDevice
+    writes together. NDIS miniport mirrors in particular must retain the device identity captured
+    during exact START/initialize so callbacks remain correct with multiple NICs.

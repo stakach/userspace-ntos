@@ -6663,7 +6663,6 @@ unsafe fn hosted_registry_identity_id_by_pdo_object(pdo: u64) -> Option<HostedRe
 unsafe fn hosted_device_object_known(device_object: u64) -> bool {
     device_object != 0
         && (hosted_device_binding_by_device_object(device_object).is_some()
-            || instance_by_device_object(device_object).is_some()
             || read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64) == device_object)
 }
 
@@ -37465,66 +37464,45 @@ impl DriverDispatchBackend for HostedDriverBackend {
         let input = Vec::from(&ctx.system_buffer[..input_len]);
         let fsctl = projection_fsctl(irp);
         let request = hosted_irp_dispatch_request(self.instance, irp, input_len, output_len)?;
-        let binding = hosted_device_binding_by_device_id(irp.device_id.raw());
-        let device_object = binding
-            .map(|binding| binding.device_object)
-            .or_else(|| instance(self.instance).map(|inst| inst.device_object))
-            .unwrap_or(0);
+        let binding = hosted_device_binding_by_device_id(irp.device_id.raw())
+            .filter(|binding| binding.instance == self.instance)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        let device_object = binding.device_object;
         let result = unsafe {
-            if let Some(binding) = binding {
-                if let Some((index, inst)) = instance_by_driver_id(binding.driver_id) {
-                    match dispatch_video_irp_for_binding(
-                        index,
-                        inst,
-                        binding,
-                        irp.major as u64,
-                        irp.minor as u64,
-                        fsctl,
-                        irp.user_data,
-                        &input,
-                        &mut ctx.system_buffer[output_offset..output_end],
-                    ) {
-                        Ok(Some((status, information))) => Some((status, information, 0, false)),
-                        Ok(None) => dispatch_irp_for_instance(
-                            self.instance,
-                            irp.major as u64,
-                            irp.minor as u64,
-                            device_object,
-                            irp.irp_id.raw(),
-                            irp.file_id.map(|file_id| file_id.raw()).unwrap_or(0),
-                            fsctl,
-                            irp.user_data,
-                            irp.requestor_tid,
-                            Some(request),
-                            &input,
-                            &mut ctx.system_buffer[output_offset..output_end],
-                        )
-                        .map(|(status, information, file_context)| {
-                            (status, information, file_context, true)
-                        }),
-                        Err(status) => Some((status.raw(), 0, 0, false)),
-                    }
-                } else {
-                    None
-                }
-            } else {
-                dispatch_irp_for_instance(
-                    self.instance,
+            if let Some((index, inst)) = instance_by_driver_id(binding.driver_id) {
+                match dispatch_video_irp_for_binding(
+                    index,
+                    inst,
+                    binding,
                     irp.major as u64,
                     irp.minor as u64,
-                    device_object,
-                    irp.irp_id.raw(),
-                    irp.file_id.map(|file_id| file_id.raw()).unwrap_or(0),
                     fsctl,
                     irp.user_data,
-                    irp.requestor_tid,
-                    Some(request),
                     &input,
                     &mut ctx.system_buffer[output_offset..output_end],
-                )
-                .map(|(status, information, file_context)| {
-                    (status, information, file_context, true)
-                })
+                ) {
+                    Ok(Some((status, information))) => Some((status, information, 0, false)),
+                    Ok(None) => dispatch_irp_for_instance(
+                        self.instance,
+                        irp.major as u64,
+                        irp.minor as u64,
+                        device_object,
+                        irp.irp_id.raw(),
+                        irp.file_id.map(|file_id| file_id.raw()).unwrap_or(0),
+                        fsctl,
+                        irp.user_data,
+                        irp.requestor_tid,
+                        Some(request),
+                        &input,
+                        &mut ctx.system_buffer[output_offset..output_end],
+                    )
+                    .map(|(status, information, file_context)| {
+                        (status, information, file_context, true)
+                    }),
+                    Err(status) => Some((status.raw(), 0, 0, false)),
+                }
+            } else {
+                None
             }
         };
         match result {
@@ -43232,15 +43210,6 @@ unsafe fn drain_hosted_device_retirements() -> usize {
         retire_hosted_device_projection(inst, retirement.device_object).unwrap_or_else(|status| {
             panic!("canonical hosted device retired before its projection: {status:?}")
         });
-        let instances = driver_instances_mut();
-        if retirement.instance < instances.len()
-            && instances[retirement.instance].device_id == retirement.device_id.raw()
-            && instances[retirement.instance].device_object == retirement.device_object
-        {
-            instances[retirement.instance].device_id = 0;
-            instances[retirement.instance].device_object = 0;
-            instances[retirement.instance].ready = false;
-        }
         hosted_device_retirements_mut().swap_remove(index);
         progress = progress.saturating_add(1);
     }
@@ -44669,14 +44638,6 @@ fn instance_by_driver_id(driver_id: u64) -> Option<(usize, DriverInstance)> {
         .find(|(_, entry)| entry.used && entry.driver_id != 0 && entry.driver_id == driver_id)
 }
 
-fn instance_by_device_id(device_id: u64) -> Option<(usize, DriverInstance)> {
-    let t = unsafe { driver_instances()? };
-    t.iter()
-        .copied()
-        .enumerate()
-        .find(|(_, entry)| entry.used && entry.device_id != 0 && entry.device_id == device_id)
-}
-
 fn instance_by_shared_va(shared_va: u64) -> Option<(usize, DriverInstance)> {
     let t = unsafe { driver_instances()? };
     t.iter().copied().enumerate().find(|(_, entry)| {
@@ -45899,13 +45860,6 @@ pub(crate) fn service_hosted_driver_ps_terminate_system_thread(
         print_str(b"\n");
     }
     HostedDriverThreadTerminateServiceResult::Terminated { fresh_reply_cap }
-}
-
-fn instance_by_device_object(device_object: u64) -> Option<(usize, DriverInstance)> {
-    let t = unsafe { driver_instances()? };
-    t.iter().copied().enumerate().find(|(_, entry)| {
-        entry.used && entry.device_object != 0 && entry.device_object == device_object
-    })
 }
 
 unsafe fn dispatch_driver_unload_for_instance(
@@ -48556,8 +48510,8 @@ pub(crate) fn npfs_ready() -> bool {
 /// The PML4 (VSpace) cap behind `\Device\NamedPipe` (0 = not launched).
 pub(crate) fn npfs_pml4() -> u64 {
     device_id_by_name("\\Device\\NamedPipe")
-        .and_then(instance_by_device_id)
-        .map(|(_, d)| d.pml4)
+        .and_then(|device_id| hosted_dispatch_instance_for_device_id(device_id).ok())
+        .map(|(_, inst, _)| inst.pml4)
         .unwrap_or(0)
 }
 
@@ -48808,8 +48762,7 @@ unsafe fn dispatch_irp_for_instance_exact(
                 }
                 binding
             } else {
-                hosted_device_binding_by_device_object(device_object)
-                    .or_else(|| hosted_device_binding_by_device_id(dependent_inst.device_id))?
+                hosted_device_binding_by_device_object(device_object)?
             };
             if provider_inst.fault_ep == 0
                 || provider_inst.pml4 == 0
@@ -49870,18 +49823,16 @@ fn hosted_device_ready_for_dispatch(device_id: u64) -> bool {
 fn hosted_dispatch_instance_for_device_id(
     device_id: u64,
 ) -> Result<(usize, DriverInstance, u64), u32> {
-    if let Some(binding) = hosted_device_binding_by_device_id(device_id) {
-        let Some(inst) = instance(binding.instance) else {
-            return Err(STATUS_DEVICE_NOT_READY as u32);
-        };
-        if inst.driver_id != binding.driver_id {
-            return Err(STATUS_DEVICE_NOT_READY as u32);
-        }
-        return Ok((binding.instance, inst, binding.device_object));
+    let Some(binding) = hosted_device_binding_by_device_id(device_id) else {
+        return Err(STATUS_DEVICE_NOT_READY as u32);
+    };
+    let Some(inst) = instance(binding.instance) else {
+        return Err(STATUS_DEVICE_NOT_READY as u32);
+    };
+    if inst.driver_id != binding.driver_id {
+        return Err(STATUS_DEVICE_NOT_READY as u32);
     }
-    instance_by_device_id(device_id)
-        .map(|(index, inst)| (index, inst, inst.device_object))
-        .ok_or(STATUS_DEVICE_NOT_READY as u32)
+    Ok((binding.instance, inst, binding.device_object))
 }
 
 fn require_hosted_device_ready_for_dispatch(device_id: u64) -> Result<(), u32> {
