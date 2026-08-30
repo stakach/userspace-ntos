@@ -642,6 +642,54 @@ impl ResourceAssignment {
     }
 }
 
+/// Select only the platform resources admitted by one function stack's filtered native list.
+///
+/// Raw and translated descriptors retain their exact pairing. The returned assignment therefore
+/// names precisely the resources that may be published in START and minted into the driver
+/// domain; unrequested platform candidates are not carried through as implicit grants.
+pub fn select_resource_assignment(
+    available: &ResourceAssignment,
+    filtered_requirements: &[u8],
+    interface_type: i32,
+    bus_number: u32,
+    slot_number: u32,
+) -> Result<ResourceAssignment, ResourceRequirementsError> {
+    let selected = nt_cm_resources::select_io_resource_assignment(
+        filtered_requirements,
+        interface_type,
+        bus_number,
+        slot_number,
+        available.resources(ResourceView::Raw),
+    )
+    .map_err(ResourceRequirementsError::InvalidFilteredRequirements)?
+    .ok_or(ResourceRequirementsError::UnsatisfiedFilteredRequirements)?;
+    if selected.is_empty() {
+        return Err(ResourceRequirementsError::UnsatisfiedFilteredRequirements);
+    }
+    let mut raw = Vec::new();
+    let mut translated = Vec::new();
+    raw.try_reserve_exact(selected.len())
+        .map_err(|_| ResourceRequirementsError::OutOfMemory)?;
+    translated
+        .try_reserve_exact(selected.len())
+        .map_err(|_| ResourceRequirementsError::OutOfMemory)?;
+    for index in selected {
+        let raw_descriptor = available
+            .resources(ResourceView::Raw)
+            .get(index)
+            .copied()
+            .ok_or(ResourceRequirementsError::UnsatisfiedFilteredRequirements)?;
+        let translated_descriptor = available
+            .resources(ResourceView::Translated)
+            .get(index)
+            .copied()
+            .ok_or(ResourceRequirementsError::UnsatisfiedFilteredRequirements)?;
+        raw.push(raw_descriptor);
+        translated.push(translated_descriptor);
+    }
+    ResourceAssignment::new(raw, translated, available.dma_len)
+}
+
 /// A root-bus resource profile describes synthetic hardware enumerated by the native root bus.
 /// The registry devnode still selects the service; this profile only describes the resource shape
 /// the broker can mint for a root-enumerated device ID.
@@ -673,6 +721,8 @@ pub enum ResourceRequirementsError {
     OutOfMemory,
     MissingInterruptTranslation,
     InvalidInterruptPin,
+    InvalidFilteredRequirements(nt_cm_resources::IoResourceAssignmentError),
+    UnsatisfiedFilteredRequirements,
     EncodeCm(nt_cm_resources::CmResourceListError),
     Encode(nt_cm_resources::IoResourceRequirementsError),
 }
@@ -2036,6 +2086,59 @@ mod tests {
         assert_eq!(bytes[20], nt_cm_resources::CM_RESOURCE_TYPE_PORT);
         assert_eq!(bytes[40], nt_cm_resources::CM_RESOURCE_TYPE_PORT);
         assert_eq!(bytes[60], nt_cm_resources::CM_RESOURCE_TYPE_INTERRUPT);
+    }
+
+    #[test]
+    fn filtered_requirements_remove_unrequested_platform_grants() {
+        let device = PciDevice {
+            bus: 2,
+            dev: 4,
+            func: 1,
+            vendor: 0x8086,
+            device: 0x100e,
+            class: 0x020000,
+            irq_line: 11,
+            irq_pin: 1,
+            bars: vec![Bar {
+                index: 0,
+                is_io: false,
+                is_64bit: false,
+                prefetchable: false,
+                base: 0x8000_0000,
+                size: 0x20_000,
+                maximum_address: u32::MAX as u64,
+            }],
+        };
+        let available = assign_resources(&device, interrupt(11, false, 1), 0x4000)
+            .unwrap()
+            .unwrap();
+        let filtered = pci_resource_requirements_filtered(&device, false)
+            .unwrap()
+            .unwrap();
+        let selected = select_resource_assignment(
+            &available,
+            &filtered,
+            INTERFACE_TYPE_PCI_BUS,
+            device.bus as u32,
+            device.slot_number(),
+        )
+        .unwrap();
+
+        assert_eq!(selected.memory_resources(ResourceView::Raw).count(), 1);
+        assert_eq!(selected.interrupt_resource(ResourceView::Raw), None);
+        assert_eq!(selected.dma_len, 0x4000);
+        assert_eq!(
+            select_resource_assignment(
+                &available,
+                &filtered,
+                INTERFACE_TYPE_PCI_BUS,
+                device.bus as u32 + 1,
+                device.slot_number(),
+            ),
+            Err(ResourceRequirementsError::InvalidFilteredRequirements(
+                nt_cm_resources::IoResourceAssignmentError::InvalidIdentity,
+            ))
+        );
     }
 
     #[test]

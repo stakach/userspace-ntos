@@ -14369,21 +14369,26 @@ unsafe fn settle_hosted_pnp_context_grant(
     }
 }
 
+fn hosted_resource_requirements_status(
+    error: nt_pnp::ResourceRequirementsError,
+) -> nt_status::NtStatus {
+    match error {
+        nt_pnp::ResourceRequirementsError::OutOfMemory
+        | nt_pnp::ResourceRequirementsError::InvalidFilteredRequirements(
+            nt_cm_resources::IoResourceAssignmentError::OutOfMemory,
+        ) => nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+        _ => nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+    }
+}
+
 unsafe fn grant_hosted_pci_devnode_resources(
     device_id: u64,
     bus_resources: DevnodePciBusResources,
     window: HostedPnpPciResourceDescriptor,
     context_lease: nt_pnp_context::ContextLeaseIdentity,
+    filtered_resource_requirements: alloc::vec::Vec<u8>,
 ) -> Result<Option<HostedDevnodeGrant>, nt_status::NtStatus> {
-    let interrupt_required = bus_resources.device.irq_pin != 0;
-    let interrupt = if interrupt_required {
-        if !window.interrupt_routed {
-            return Err(hosted_pci_grant_error(
-                device_id,
-                b"interrupt-route",
-                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-            ));
-        }
+    let interrupt = if bus_resources.device.irq_pin != 0 && window.interrupt_routed {
         Some(nt_pnp::PciInterruptAssignment {
             bus_level: window.interrupt_vector,
             vector: window.interrupt_vector,
@@ -14393,24 +14398,19 @@ unsafe fn grant_hosted_pci_devnode_resources(
     } else {
         None
     };
-    let grant = build_devnode_pci_resource_grant(bus_resources, interrupt, window.dma_len)
-        .ok_or_else(|| {
-            hosted_pci_grant_error(
-                device_id,
-                b"assignment",
-                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-            )
-        })?;
-    if let Err(status) = driver_launch::commit_hosted_filtered_resource_requirements(
-        device_id,
-        &grant.resource_requirements,
-    ) {
-        return Err(hosted_pci_grant_error(
+    let grant = build_devnode_pci_resource_grant(
+        bus_resources,
+        interrupt,
+        window.dma_len,
+        filtered_resource_requirements,
+    )
+    .map_err(|error| {
+        hosted_pci_grant_error(
             device_id,
-            b"requirements-commit",
-            status,
-        ));
-    }
+            b"assignment",
+            hosted_resource_requirements_status(error),
+        )
+    })?;
     if !window.matches(&grant.device) {
         return Err(hosted_pci_grant_error(
             device_id,
@@ -14430,18 +14430,22 @@ unsafe fn grant_hosted_pci_devnode_resources(
         .assignment
         .interrupt_resource(nt_pnp::ResourceView::Translated);
     let has_mmio = memory.is_some();
-    let memory_bars: Vec<_> = grant
-        .device
-        .bars
-        .iter()
-        .filter(|bar| bar.is_present() && !bar.is_io)
-        .collect();
     let assigned_memory: Vec<_> = grant
         .assignment
         .memory_resources(nt_pnp::ResourceView::Translated)
         .collect();
+    let memory_bars: Vec<_> = assigned_memory
+        .iter()
+        .filter_map(|assigned| {
+            grant.device.bars.iter().find(|bar| {
+                bar.is_present()
+                    && !bar.is_io
+                    && bar.base == assigned.start
+                    && bar.size == assigned.length as u64
+            })
+        })
+        .collect();
     if assigned_memory.len() != memory_bars.len()
-        || assigned_memory.len() != window.memory.len()
         || memory_bars
             .iter()
             .zip(&assigned_memory)
@@ -14457,13 +14461,6 @@ unsafe fn grant_hosted_pci_devnode_resources(
             nt_status::NtStatus::INVALID_DEVICE_REQUEST,
         ));
     }
-    if !has_mmio && !window.memory.is_empty() {
-        return Err(hosted_pci_grant_error(
-            device_id,
-            b"unexpected-memory-window",
-            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-        ));
-    }
     if !window.dma_grant_valid() {
         return Err(hosted_pci_grant_error(
             device_id,
@@ -14471,7 +14468,9 @@ unsafe fn grant_hosted_pci_devnode_resources(
             nt_status::NtStatus::INVALID_DEVICE_REQUEST,
         ));
     }
-    let primary_window = window.memory.first();
+    let primary_window = memory_bars
+        .first()
+        .and_then(|bar| window.memory_window(bar.index));
     let mmio_len = memory.map(|memory| memory.length as u64).unwrap_or(0);
     if has_mmio && primary_window.is_none_or(|window| window.mapped_len() == 0) {
         return Err(hosted_pci_grant_error(
@@ -14499,13 +14498,6 @@ unsafe fn grant_hosted_pci_devnode_resources(
         .collect();
     if raw_memory.len() != memory_bars.len()
         || raw_ports.len() != translated_ports.len()
-        || raw_ports.len()
-            != grant
-                .device
-                .bars
-                .iter()
-                .filter(|bar| bar.is_present() && bar.is_io)
-                .count()
     {
         return Err(hosted_pci_grant_error(
             device_id,
@@ -14542,12 +14534,24 @@ unsafe fn grant_hosted_pci_devnode_resources(
             },
         });
     }
-    let io_bars: Vec<_> = grant
-        .device
-        .bars
+    let io_bars: Vec<_> = translated_ports
         .iter()
-        .filter(|bar| bar.is_present() && bar.is_io)
+        .filter_map(|assigned| {
+            grant.device.bars.iter().find(|bar| {
+                bar.is_present()
+                    && bar.is_io
+                    && bar.base == assigned.start
+                    && bar.size == assigned.length as u64
+            })
+        })
         .collect();
+    if io_bars.len() != translated_ports.len() {
+        return Err(hosted_pci_grant_error(
+            device_id,
+            b"port-window",
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
+    }
     let mut port_grants = Vec::new();
     port_grants
         .try_reserve_exact(io_bars.len())
@@ -14623,52 +14627,66 @@ unsafe fn grant_hosted_root_devnode_resources(
     grant: DevnodeRootResourceGrant,
     window: HostedPnpRootResourceDescriptor,
     context_lease: nt_pnp_context::ContextLeaseIdentity,
+    filtered_resource_requirements: alloc::vec::Vec<u8>,
 ) -> Result<Option<HostedDevnodeGrant>, nt_status::NtStatus> {
+    let grant = filter_devnode_root_resource_grant(grant, filtered_resource_requirements)
+        .map_err(hosted_resource_requirements_status)?;
     let raw_memory = grant
         .assignment
         .memory_resources(nt_pnp::ResourceView::Raw)
-        .next()
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        .next();
     let memory = grant
         .assignment
         .memory_resources(nt_pnp::ResourceView::Translated)
-        .next()
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        .next();
     let interrupt = grant
         .assignment
-        .interrupt_resource(nt_pnp::ResourceView::Translated)
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    if memory.start != window.mmio_phys || window.mmio_frame_base == 0 || window.dma_frame_base == 0
-    {
+        .interrupt_resource(nt_pnp::ResourceView::Translated);
+    if raw_memory.is_some() != memory.is_some() || window.dma_frame_base == 0 {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
-    let mmio_len = memory.length as u64;
-    if mmio_len == 0 || mmio_len > window.mmio_pages * 0x1000 {
+    let mmio_len = memory.map(|memory| memory.length as u64).unwrap_or(0);
+    if memory.is_some_and(|memory| {
+        memory.start != window.mmio_phys
+            || window.mmio_frame_base == 0
+            || mmio_len == 0
+            || mmio_len > window.mmio_pages * 0x1000
+    }) {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
-    let memory_grants = [driver_launch::HostedMemoryResourceGrant {
-        bar_index: 0,
-        raw_start: raw_memory.start,
-        translated_start: memory.start,
-        length: mmio_len,
-        flags: memory.flags,
-        share: memory.share,
-        pci_flags: 0,
-        component_va: window.mmio_va,
-        broker_va: window.mmio_seed_va,
-        frame_base: window.mmio_frame_base,
-        map_pages: window.mmio_pages,
-        video_memory_caller_va: 0,
-    }];
+    let mut memory_grants = Vec::new();
+    memory_grants
+        .try_reserve_exact(memory.is_some() as usize)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    if let (Some(raw_memory), Some(memory)) = (raw_memory, memory) {
+        memory_grants.push(driver_launch::HostedMemoryResourceGrant {
+            bar_index: 0,
+            raw_start: raw_memory.start,
+            translated_start: memory.start,
+            length: mmio_len,
+            flags: memory.flags,
+            share: memory.share,
+            pci_flags: 0,
+            component_va: window.mmio_va,
+            broker_va: window.mmio_seed_va,
+            frame_base: window.mmio_frame_base,
+            map_pages: window.mmio_pages,
+            video_memory_caller_va: 0,
+        });
+    }
     driver_launch::grant_hosted_device_resources(
         device_id,
         driver_launch::HostedBusIdentity::root_bus(),
         &memory_grants,
         &[],
-        interrupt.vector,
-        interrupt.share == nt_cm_resources::CM_RESOURCE_SHARE_SHARED,
-        interrupt.flags == nt_pnp::CM_RESOURCE_INTERRUPT_LATCHED,
-        interrupt.affinity,
+        interrupt.map(|interrupt| interrupt.vector).unwrap_or(0),
+        interrupt
+            .map(|interrupt| interrupt.share == nt_cm_resources::CM_RESOURCE_SHARE_SHARED)
+            .unwrap_or(false),
+        interrupt
+            .map(|interrupt| interrupt.flags == nt_pnp::CM_RESOURCE_INTERRUPT_LATCHED)
+            .unwrap_or(false),
+        interrupt.map(|interrupt| interrupt.affinity).unwrap_or(0),
         window.dma_va,
         0,
         window.dma_frame_base,
@@ -14682,11 +14700,11 @@ unsafe fn grant_hosted_root_devnode_resources(
         pci_interrupt_line: None,
         raw_resource_list: grant.raw_resource_list,
         translated_resource_list: grant.translated_resource_list,
-        mmio_phys: memory.start,
+        mmio_phys: memory.map(|memory| memory.start).unwrap_or(0),
         mmio_len,
         io_port_base: 0,
         io_port_len: 0,
-        vector: interrupt.vector,
+        vector: interrupt.map(|interrupt| interrupt.vector).unwrap_or(0),
         dma_len: grant.assignment.dma_len,
     }))
 }
@@ -14694,6 +14712,7 @@ unsafe fn grant_hosted_root_devnode_resources(
 unsafe fn grant_hosted_devnode_resources(
     device_id: u64,
     plan: PreparedHostedResourcePlan,
+    filtered_resource_requirements: alloc::vec::Vec<u8>,
 ) -> Result<Option<HostedDevnodeGrant>, nt_status::NtStatus> {
     match plan {
         PreparedHostedResourcePlan::Pci {
@@ -14702,8 +14721,13 @@ unsafe fn grant_hosted_devnode_resources(
             lease,
         } => {
             let context_lease = lease.into_identity();
-            let result =
-                grant_hosted_pci_devnode_resources(device_id, bus_resources, window, context_lease);
+            let result = grant_hosted_pci_devnode_resources(
+                device_id,
+                bus_resources,
+                window,
+                context_lease,
+                filtered_resource_requirements,
+            );
             settle_hosted_pnp_context_grant(device_id, context_lease, result)
         }
         PreparedHostedResourcePlan::Root {
@@ -14712,11 +14736,22 @@ unsafe fn grant_hosted_devnode_resources(
             lease,
         } => {
             let context_lease = lease.into_identity();
-            let result =
-                grant_hosted_root_devnode_resources(device_id, grant, window, context_lease);
+            let result = grant_hosted_root_devnode_resources(
+                device_id,
+                grant,
+                window,
+                context_lease,
+                filtered_resource_requirements,
+            );
             settle_hosted_pnp_context_grant(device_id, context_lease, result)
         }
-        PreparedHostedResourcePlan::None => Ok(None),
+        PreparedHostedResourcePlan::None => {
+            if filtered_resource_requirements.is_empty() {
+                Ok(None)
+            } else {
+                Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+            }
+        }
     }
 }
 

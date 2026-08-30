@@ -6,8 +6,8 @@
 //! It also encodes the bus-owned `IO_RESOURCE_REQUIREMENTS_LIST` returned by
 //! `IRP_MN_QUERY_RESOURCE_REQUIREMENTS` before allocation.
 //! The layout is `#pragma pack(4)` — a `CM_PARTIAL_RESOURCE_DESCRIPTOR` is 20 bytes.
-//! `no_std`, no allocation, no raw pointers in the encoded bytes; the caller copies
-//! the result into driver-visible memory.
+//! `no_std`, with fallible owned scratch only for resource-alternative selection; there are no raw
+//! pointers in the encoded bytes and the caller copies the result into driver-visible memory.
 //!
 //! Byte layout for one memory + one interrupt descriptor (total 60 bytes):
 //!
@@ -24,6 +24,10 @@
 //! descriptor and keep the same 20-byte descriptor stride.
 
 #![no_std]
+
+extern crate alloc;
+
+use alloc::vec::Vec;
 
 /// `CM_PARTIAL_RESOURCE_DESCRIPTOR.Type` values.
 pub const CM_RESOURCE_TYPE_NULL: u8 = 0;
@@ -112,6 +116,15 @@ fn read_u32(buf: &[u8], offset: usize) -> Result<u32, NativeResourceListError> {
         .ok_or(NativeResourceListError::Truncated)?;
     Ok(u32::from_le_bytes(
         bytes.try_into().expect("four-byte native resource field"),
+    ))
+}
+
+fn read_u64(buf: &[u8], offset: usize) -> Result<u64, NativeResourceListError> {
+    let bytes = buf
+        .get(offset..offset.saturating_add(8))
+        .ok_or(NativeResourceListError::Truncated)?;
+    Ok(u64::from_le_bytes(
+        bytes.try_into().expect("eight-byte native resource field"),
     ))
 }
 
@@ -474,6 +487,306 @@ pub enum CmResourceDescriptor {
     Memory(MemoryDescriptor),
     Port(PortDescriptor),
     Interrupt(InterruptDescriptor),
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum IoResourceAssignmentError {
+    Malformed(NativeResourceListError),
+    InvalidIdentity,
+    UnsupportedDescriptor,
+    OutOfMemory,
+}
+
+fn io_requirement_matches_candidate(
+    bytes: &[u8],
+    descriptor: usize,
+    candidate: CmResourceDescriptor,
+) -> Result<bool, IoResourceAssignmentError> {
+    validate_io_requirement_descriptor(bytes, descriptor)?;
+    let resource_type = bytes[descriptor + 1];
+    match (resource_type, candidate) {
+        (CM_RESOURCE_TYPE_MEMORY, CmResourceDescriptor::Memory(candidate)) => {
+            io_address_requirement_matches(
+                bytes,
+                descriptor,
+                candidate.start,
+                candidate.length,
+                candidate.flags,
+                candidate.share,
+            )
+        }
+        (CM_RESOURCE_TYPE_PORT, CmResourceDescriptor::Port(candidate)) => {
+            io_address_requirement_matches(
+                bytes,
+                descriptor,
+                candidate.start,
+                candidate.length,
+                candidate.flags,
+                candidate.share,
+            )
+        }
+        (CM_RESOURCE_TYPE_INTERRUPT, CmResourceDescriptor::Interrupt(candidate)) => {
+            let minimum =
+                read_u32(bytes, descriptor + 8).map_err(IoResourceAssignmentError::Malformed)?;
+            let maximum =
+                read_u32(bytes, descriptor + 12).map_err(IoResourceAssignmentError::Malformed)?;
+            let flags = u16::from_le_bytes([bytes[descriptor + 4], bytes[descriptor + 5]]);
+            Ok(minimum <= maximum
+                && candidate.vector >= minimum
+                && candidate.vector <= maximum
+                && candidate.flags == flags
+                && candidate.share == bytes[descriptor + 2])
+        }
+        (CM_RESOURCE_TYPE_MEMORY | CM_RESOURCE_TYPE_PORT | CM_RESOURCE_TYPE_INTERRUPT, _) => {
+            Ok(false)
+        }
+        _ => Err(IoResourceAssignmentError::UnsupportedDescriptor),
+    }
+}
+
+fn io_address_requirement_matches(
+    bytes: &[u8],
+    descriptor: usize,
+    candidate_start: u64,
+    candidate_length: u32,
+    candidate_flags: u16,
+    candidate_share: u8,
+) -> Result<bool, IoResourceAssignmentError> {
+    let length = read_u32(bytes, descriptor + 8).map_err(IoResourceAssignmentError::Malformed)?;
+    let alignment =
+        read_u32(bytes, descriptor + 12).map_err(IoResourceAssignmentError::Malformed)?;
+    let minimum = read_u64(bytes, descriptor + 16).map_err(IoResourceAssignmentError::Malformed)?;
+    let maximum = read_u64(bytes, descriptor + 24).map_err(IoResourceAssignmentError::Malformed)?;
+    let flags = u16::from_le_bytes([bytes[descriptor + 4], bytes[descriptor + 5]]);
+    let end = candidate_start.checked_add(candidate_length.saturating_sub(1) as u64);
+    Ok(length != 0
+        && alignment != 0
+        && maximum >= minimum
+        && candidate_length == length
+        && candidate_start >= minimum
+        && candidate_start % alignment as u64 == 0
+        && candidate_flags == flags
+        && candidate_share == bytes[descriptor + 2]
+        && end.is_some_and(|end| end <= maximum))
+}
+
+fn validate_io_requirement_descriptor(
+    bytes: &[u8],
+    descriptor: usize,
+) -> Result<(), IoResourceAssignmentError> {
+    let option = bytes[descriptor];
+    if !io_option_is_valid(option) {
+        return Err(IoResourceAssignmentError::UnsupportedDescriptor);
+    }
+    match bytes[descriptor + 1] {
+        CM_RESOURCE_TYPE_MEMORY | CM_RESOURCE_TYPE_PORT => {
+            let requirement = IoAddressRequirement {
+                option,
+                share: bytes[descriptor + 2],
+                flags: u16::from_le_bytes([bytes[descriptor + 4], bytes[descriptor + 5]]),
+                length: read_u32(bytes, descriptor + 8)
+                    .map_err(IoResourceAssignmentError::Malformed)?,
+                alignment: read_u32(bytes, descriptor + 12)
+                    .map_err(IoResourceAssignmentError::Malformed)?,
+                minimum: read_u64(bytes, descriptor + 16)
+                    .map_err(IoResourceAssignmentError::Malformed)?,
+                maximum: read_u64(bytes, descriptor + 24)
+                    .map_err(IoResourceAssignmentError::Malformed)?,
+            };
+            if !address_requirement_is_valid(requirement) {
+                return Err(IoResourceAssignmentError::UnsupportedDescriptor);
+            }
+        }
+        CM_RESOURCE_TYPE_INTERRUPT => {
+            let minimum =
+                read_u32(bytes, descriptor + 8).map_err(IoResourceAssignmentError::Malformed)?;
+            let maximum =
+                read_u32(bytes, descriptor + 12).map_err(IoResourceAssignmentError::Malformed)?;
+            let affinity_policy =
+                read_u32(bytes, descriptor + 16).map_err(IoResourceAssignmentError::Malformed)?;
+            let priority_policy =
+                read_u32(bytes, descriptor + 20).map_err(IoResourceAssignmentError::Malformed)?;
+            let targeted_processors =
+                read_u64(bytes, descriptor + 24).map_err(IoResourceAssignmentError::Malformed)?;
+            if minimum > maximum
+                || affinity_policy != 0
+                || priority_policy != 0
+                || targeted_processors != 0
+            {
+                return Err(IoResourceAssignmentError::UnsupportedDescriptor);
+            }
+        }
+        _ => return Err(IoResourceAssignmentError::UnsupportedDescriptor),
+    }
+    Ok(())
+}
+
+fn select_io_resource_groups(
+    bytes: &[u8],
+    descriptor_base: usize,
+    groups: &[(usize, usize, bool)],
+    candidates: &[CmResourceDescriptor],
+    used: &mut [bool],
+    selected: &mut Vec<usize>,
+) -> Result<bool, IoResourceAssignmentError> {
+    const UNCHOSEN: usize = usize::MAX;
+    const SKIPPED: usize = usize::MAX - 1;
+    let mut next_choice = Vec::new();
+    next_choice
+        .try_reserve_exact(groups.len())
+        .map_err(|_| IoResourceAssignmentError::OutOfMemory)?;
+    next_choice.resize(groups.len(), 0usize);
+    let mut chosen = Vec::new();
+    chosen
+        .try_reserve_exact(groups.len())
+        .map_err(|_| IoResourceAssignmentError::OutOfMemory)?;
+    chosen.resize(groups.len(), UNCHOSEN);
+    let mut group_index = 0usize;
+    loop {
+        if group_index == groups.len() {
+            selected.clear();
+            selected.extend(chosen.iter().copied().filter(|choice| *choice < SKIPPED));
+            return Ok(true);
+        }
+        if chosen[group_index] < SKIPPED {
+            used[chosen[group_index]] = false;
+        }
+        chosen[group_index] = UNCHOSEN;
+
+        let (first, end, required) = groups[group_index];
+        let descriptor_count = end
+            .checked_sub(first)
+            .ok_or(IoResourceAssignmentError::UnsupportedDescriptor)?;
+        let candidate_choices = descriptor_count
+            .checked_mul(candidates.len())
+            .ok_or(IoResourceAssignmentError::UnsupportedDescriptor)?;
+        let choice_count = candidate_choices
+            .checked_add(usize::from(!required))
+            .ok_or(IoResourceAssignmentError::UnsupportedDescriptor)?;
+        let mut advanced = false;
+        while next_choice[group_index] < choice_count {
+            let choice = next_choice[group_index];
+            next_choice[group_index] += 1;
+            if choice == candidate_choices {
+                chosen[group_index] = SKIPPED;
+                advanced = true;
+                break;
+            }
+            let descriptor_index = first + choice / candidates.len();
+            let candidate_index = choice % candidates.len();
+            let descriptor = descriptor_base
+                .checked_add(
+                    descriptor_index
+                        .checked_mul(IO_RESOURCE_DESCRIPTOR_SIZE)
+                        .ok_or(IoResourceAssignmentError::UnsupportedDescriptor)?,
+                )
+                .ok_or(IoResourceAssignmentError::UnsupportedDescriptor)?;
+            if used[candidate_index]
+                || !io_requirement_matches_candidate(
+                    bytes,
+                    descriptor,
+                    candidates[candidate_index],
+                )?
+            {
+                continue;
+            }
+            used[candidate_index] = true;
+            chosen[group_index] = candidate_index;
+            advanced = true;
+            break;
+        }
+        if advanced {
+            group_index += 1;
+            if group_index < groups.len() {
+                next_choice[group_index] = 0;
+                chosen[group_index] = UNCHOSEN;
+            }
+        } else if group_index == 0 {
+            return Ok(false);
+        } else {
+            next_choice[group_index] = 0;
+            group_index -= 1;
+        }
+    }
+}
+
+/// Select platform resource candidates satisfying one complete native requirements alternative.
+///
+/// Each required/preferred descriptor and its `IO_RESOURCE_ALTERNATIVE` followers form one group.
+/// A platform candidate can satisfy at most one group. Preferred groups are selected when a
+/// matching candidate exists and may be omitted otherwise. The returned indices preserve native
+/// group order and name the only resources that may be placed in the START lists.
+pub fn select_io_resource_assignment(
+    bytes: &[u8],
+    interface_type: i32,
+    bus_number: u32,
+    slot_number: u32,
+    candidates: &[CmResourceDescriptor],
+) -> Result<Option<Vec<usize>>, IoResourceAssignmentError> {
+    let extent = validate_io_resource_requirements_list_extent(bytes)
+        .map_err(IoResourceAssignmentError::Malformed)?;
+    if extent != bytes.len() {
+        return Err(IoResourceAssignmentError::Malformed(
+            NativeResourceListError::InconsistentSize,
+        ));
+    }
+    if read_u32(bytes, 4).map_err(IoResourceAssignmentError::Malformed)? != interface_type as u32
+        || read_u32(bytes, 8).map_err(IoResourceAssignmentError::Malformed)? != bus_number
+        || read_u32(bytes, 12).map_err(IoResourceAssignmentError::Malformed)? != slot_number
+    {
+        return Err(IoResourceAssignmentError::InvalidIdentity);
+    }
+    let alternatives = read_u32(bytes, 28).map_err(IoResourceAssignmentError::Malformed)? as usize;
+    let mut list_offset = IO_RESOURCE_REQUIREMENTS_FIXED_SIZE;
+    for _ in 0..alternatives {
+        let descriptor_count = read_u32(bytes, list_offset + 4)
+            .map_err(IoResourceAssignmentError::Malformed)? as usize;
+        let descriptor_base = list_offset + IO_RESOURCE_LIST_HEADER_SIZE;
+        let mut groups = Vec::new();
+        groups
+            .try_reserve_exact(descriptor_count)
+            .map_err(|_| IoResourceAssignmentError::OutOfMemory)?;
+        let mut descriptor_index = 0usize;
+        while descriptor_index < descriptor_count {
+            let first = descriptor_index;
+            let descriptor = descriptor_base + first * IO_RESOURCE_DESCRIPTOR_SIZE;
+            let option = bytes[descriptor];
+            if option & IO_RESOURCE_ALTERNATIVE != 0 || !io_option_is_valid(option) {
+                return Err(IoResourceAssignmentError::UnsupportedDescriptor);
+            }
+            validate_io_requirement_descriptor(bytes, descriptor)?;
+            descriptor_index += 1;
+            while descriptor_index < descriptor_count {
+                let descriptor = descriptor_base + descriptor_index * IO_RESOURCE_DESCRIPTOR_SIZE;
+                if bytes[descriptor] & IO_RESOURCE_ALTERNATIVE == 0 {
+                    break;
+                }
+                validate_io_requirement_descriptor(bytes, descriptor)?;
+                descriptor_index += 1;
+            }
+            groups.push((first, descriptor_index, option == IO_RESOURCE_REQUIRED));
+        }
+        let mut used = Vec::new();
+        used.try_reserve_exact(candidates.len())
+            .map_err(|_| IoResourceAssignmentError::OutOfMemory)?;
+        used.resize(candidates.len(), false);
+        let mut selected = Vec::new();
+        selected
+            .try_reserve_exact(groups.len())
+            .map_err(|_| IoResourceAssignmentError::OutOfMemory)?;
+        if select_io_resource_groups(
+            bytes,
+            descriptor_base,
+            &groups,
+            candidates,
+            &mut used,
+            &mut selected,
+        )? {
+            return Ok(Some(selected));
+        }
+        list_offset = descriptor_base + descriptor_count * IO_RESOURCE_DESCRIPTOR_SIZE;
+    }
+    Ok(None)
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -983,6 +1296,224 @@ mod tests {
             5
         );
         assert_eq!(bytes[written], 0xcc);
+    }
+
+    #[test]
+    fn assignment_selects_group_alternates_without_extra_candidates() {
+        let requirements = [
+            IoResourceRequirement::Memory(IoAddressRequirement {
+                option: IO_RESOURCE_PREFERRED,
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+                flags: CM_RESOURCE_MEMORY_READ_WRITE,
+                length: 0x1000,
+                alignment: 0x1000,
+                minimum: 0x2000,
+                maximum: 0x2fff,
+            }),
+            IoResourceRequirement::Memory(IoAddressRequirement {
+                option: IO_RESOURCE_ALTERNATIVE,
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+                flags: CM_RESOURCE_MEMORY_READ_WRITE,
+                length: 0x1000,
+                alignment: 0x1000,
+                minimum: 0x4000,
+                maximum: 0x4fff,
+            }),
+            IoResourceRequirement::Interrupt(IoInterruptRequirement {
+                option: IO_RESOURCE_REQUIRED,
+                share: CM_RESOURCE_SHARE_SHARED,
+                flags: CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE,
+                minimum_vector: 9,
+                maximum_vector: 12,
+                affinity_policy: 0,
+                priority_policy: 0,
+                targeted_processors: 0,
+            }),
+        ];
+        let mut bytes = [0u8; 136];
+        let written = build_io_resource_requirements_list(
+            &mut bytes,
+            INTERFACE_TYPE_PCI_BUS,
+            2,
+            0x18,
+            &requirements,
+        )
+        .unwrap();
+        let candidates = [
+            CmResourceDescriptor::Memory(MemoryDescriptor {
+                start: 0x4000,
+                length: 0x1000,
+                flags: 0,
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            }),
+            CmResourceDescriptor::Interrupt(InterruptDescriptor {
+                level: 11,
+                vector: 11,
+                affinity: 1,
+                flags: 0,
+                share: CM_RESOURCE_SHARE_SHARED,
+            }),
+            CmResourceDescriptor::Port(PortDescriptor {
+                start: 0x60,
+                length: 4,
+                flags: CM_RESOURCE_PORT_IO,
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            }),
+        ];
+
+        assert_eq!(
+            select_io_resource_assignment(
+                &bytes[..written],
+                INTERFACE_TYPE_PCI_BUS,
+                2,
+                0x18,
+                &candidates,
+            ),
+            Ok(Some(alloc::vec![0, 1]))
+        );
+        let mut incompatible = candidates;
+        let CmResourceDescriptor::Interrupt(mut incompatible_interrupt) = incompatible[1] else {
+            unreachable!()
+        };
+        incompatible_interrupt.flags = CM_RESOURCE_INTERRUPT_LATCHED;
+        incompatible[1] = CmResourceDescriptor::Interrupt(incompatible_interrupt);
+        assert_eq!(
+            select_io_resource_assignment(
+                &bytes[..written],
+                INTERFACE_TYPE_PCI_BUS,
+                2,
+                0x18,
+                &incompatible,
+            ),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn assignment_tries_complete_alternatives_and_rejects_identity_mismatch() {
+        let first = [IoResourceRequirement::Interrupt(IoInterruptRequirement {
+            option: IO_RESOURCE_REQUIRED,
+            share: CM_RESOURCE_SHARE_SHARED,
+            flags: 0,
+            minimum_vector: 3,
+            maximum_vector: 3,
+            affinity_policy: 0,
+            priority_policy: 0,
+            targeted_processors: 0,
+        })];
+        let second = [IoResourceRequirement::Interrupt(IoInterruptRequirement {
+            option: IO_RESOURCE_REQUIRED,
+            share: CM_RESOURCE_SHARE_SHARED,
+            flags: 0,
+            minimum_vector: 7,
+            maximum_vector: 7,
+            affinity_policy: 0,
+            priority_policy: 0,
+            targeted_processors: 0,
+        })];
+        let alternatives = [
+            IoResourceAlternative {
+                descriptors: &first,
+            },
+            IoResourceAlternative {
+                descriptors: &second,
+            },
+        ];
+        let mut bytes = [0u8; 112];
+        let written = build_io_resource_requirements_lists(
+            &mut bytes,
+            INTERFACE_TYPE_PNP_BUS,
+            0,
+            0,
+            &alternatives,
+        )
+        .unwrap();
+        let candidates = [CmResourceDescriptor::Interrupt(InterruptDescriptor {
+            level: 7,
+            vector: 7,
+            affinity: 1,
+            flags: 0,
+            share: CM_RESOURCE_SHARE_SHARED,
+        })];
+
+        assert_eq!(
+            select_io_resource_assignment(
+                &bytes[..written],
+                INTERFACE_TYPE_PNP_BUS,
+                0,
+                0,
+                &candidates,
+            ),
+            Ok(Some(alloc::vec![0]))
+        );
+        assert_eq!(
+            select_io_resource_assignment(
+                &bytes[..written],
+                INTERFACE_TYPE_PCI_BUS,
+                0,
+                0,
+                &candidates,
+            ),
+            Err(IoResourceAssignmentError::InvalidIdentity)
+        );
+    }
+
+    #[test]
+    fn assignment_backtracks_without_reusing_a_platform_candidate() {
+        let requirements = [
+            IoResourceRequirement::Memory(IoAddressRequirement {
+                option: IO_RESOURCE_REQUIRED,
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+                flags: CM_RESOURCE_MEMORY_READ_WRITE,
+                length: 0x1000,
+                alignment: 0x1000,
+                minimum: 0x1000,
+                maximum: 0x2fff,
+            }),
+            IoResourceRequirement::Memory(IoAddressRequirement {
+                option: IO_RESOURCE_REQUIRED,
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+                flags: CM_RESOURCE_MEMORY_READ_WRITE,
+                length: 0x1000,
+                alignment: 0x1000,
+                minimum: 0x1000,
+                maximum: 0x1fff,
+            }),
+        ];
+        let mut bytes = [0u8; 104];
+        let written = build_io_resource_requirements_list(
+            &mut bytes,
+            INTERFACE_TYPE_PNP_BUS,
+            0,
+            0,
+            &requirements,
+        )
+        .unwrap();
+        let candidates = [
+            CmResourceDescriptor::Memory(MemoryDescriptor {
+                start: 0x1000,
+                length: 0x1000,
+                flags: CM_RESOURCE_MEMORY_READ_WRITE,
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            }),
+            CmResourceDescriptor::Memory(MemoryDescriptor {
+                start: 0x2000,
+                length: 0x1000,
+                flags: CM_RESOURCE_MEMORY_READ_WRITE,
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            }),
+        ];
+
+        assert_eq!(
+            select_io_resource_assignment(
+                &bytes[..written],
+                INTERFACE_TYPE_PNP_BUS,
+                0,
+                0,
+                &candidates,
+            ),
+            Ok(Some(alloc::vec![1, 0]))
+        );
     }
 
     #[test]

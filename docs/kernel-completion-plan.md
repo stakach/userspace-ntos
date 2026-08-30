@@ -18817,3 +18817,55 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     PnP-owned list, commit `filtered_resource_requirements`, and expose only owned bytes to the
     resource arbiter. Allocation pressure must retry without redispatch or ACK. Driver failure,
     malformed replacement, stale topology, and indeterminate transport remain barriers.
+
+    B3 retained filter/arbitration checkpoint (2026-08-30, implementation green): the ordinary
+    owned device-start batch now performs the native sequence `AddDevice` ->
+    `IRP_MN_FILTER_RESOURCE_REQUIREMENTS` -> resource arbitration/grant -> `START_DEVICE`. The
+    filter request has a separate retained executive transaction keyed by canonical IRP, canonical
+    PDO/binding, immutable origin and completion driver/device identities, and the exact hosted
+    provider-allocation domain. It does not reuse the lifecycle transaction or a per-driver device
+    cache. Synchronous and pending returns enter the same copy/commit state machine. Every nonzero
+    returned pointer is copied, validated, and released before pending ACK; a returned copy equal
+    to the request allocation follows the transport's detached-ownership rule. A successful zero
+    result and `STATUS_NOT_SUPPORTED` retain the original PnP-owned list. Other driver failures,
+    malformed or unowned pointers, release failure, stale topology, ACK failure, and indeterminate
+    transport fail closed. Owned-byte or PnP-publication allocation pressure retains the exact
+    transaction and retries without redispatch or ACK.
+
+    Pending filter negotiation now remains distinct from pending START in
+    `OwnedHostedPnpStartBatch`. The batch retains its devnode index, function-device identity,
+    canonical filter IRP, and PnP context lease until the filter becomes terminal. Lost transport
+    ownership keeps the batch as a teardown barrier. A devnode with genuinely no bus requirements
+    publishes `KnownNone` without manufacturing or dispatching an empty native list.
+
+    The resource policy is host-tested rather than parsed in the executive. `nt-cm-resources`
+    validates the complete native list and uses fallible dynamic scratch plus iterative
+    backtracking to select one non-reused platform candidate for every required/preferred group,
+    including descriptor alternatives and complete-list alternatives. Interface, bus, and slot
+    identity, address/length/alignment, vector range, share disposition, and resource flags are
+    exact. Interrupt affinity/priority policies not yet supported by the platform provider are
+    explicit errors. `nt-pnp` preserves raw/translated pairing and returns only selected
+    descriptors. The executive no longer regenerates a nominal filtered PCI list inside grant
+    construction or grants unrequested BAR/interrupt candidates; PCI and root-bus START lists and
+    capability minting consume only this selected result. The old direct arbitrary filtered-list
+    commit entry point was narrowed to the no-requirements case.
+
+    The executive preserves typed arbitration failures through final grant construction. Selector
+    scratch-allocation failure is reported as `STATUS_INSUFFICIENT_RESOURCES`; malformed,
+    unsupported, identity-mismatched, or unsatisfied filtered requirements remain
+    `STATUS_INVALID_DEVICE_REQUEST` and cannot be mistaken for platform resource exhaustion.
+
+    Focused validation passes `nt-cm-resources` `16/16`, `nt-pnp` `25/25`, `nt-io-manager`
+    `238/238`, and `nt-pnp-manager` `46/46`; formatting, `git diff --check`, and the freestanding
+    executive check pass at the unchanged 209-warning baseline. The already-running serialized
+    desktop proof reached genuine explorer chrome and `299/299`, but it predates this checkpoint
+    and its `-no-shutdown` QEMU still owns the single boot lane, so it is baseline evidence rather
+    than acceptance for this slice.
+
+    Review adjustment: run a serialized post-checkpoint desktop proof when the existing lane is
+    released and inspect real filter/START evidence. The next implementation target is the other
+    half of the same multi-device boundary: remove `DriverInstance.device_id` and
+    `DriverInstance.device_object` as last-device routing state. Every driver import, provider
+    callback, interrupt/DPC route, teardown, and diagnostic path must resolve a canonical
+    `HostedDeviceBinding`/I/O Manager `DeviceId`, so one loaded driver can own any number of
+    independently filtered and started devices or NICs without singleton identity.

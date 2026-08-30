@@ -34748,13 +34748,17 @@ pub(crate) fn file_thread_io_drain_state(
 
 fn hosted_pnp_lifecycle_dispatch_active() -> bool {
     unsafe {
-        (*core::ptr::addr_of!(HOSTED_PNP_TRANSACTIONS))
+        let lifecycle_active = (*core::ptr::addr_of!(HOSTED_PNP_TRANSACTIONS))
             .as_ref()
             .is_some_and(|transactions| {
                 transactions.iter().any(|transaction| {
                     !matches!(transaction.phase, HostedPnpTransactionPhase::Terminal)
                 })
-            })
+            });
+        let filter_active = (*core::ptr::addr_of!(HOSTED_FILTER_REQUIREMENTS_TRANSACTIONS))
+            .as_ref()
+            .is_some_and(|transactions| !transactions.is_empty());
+        lifecycle_active || filter_active
     }
 }
 
@@ -36824,11 +36828,199 @@ unsafe fn start_hosted_device_relation_query() -> usize {
     1usize.saturating_add(drain_hosted_device_relation_query())
 }
 
+unsafe fn drain_hosted_filter_requirements_transactions() -> usize {
+    let mut progress = 0usize;
+    let mut index = 0usize;
+    while index < hosted_filter_requirements_transactions_mut().len() {
+        let (
+            irp_id,
+            phase,
+            binding,
+            origin_driver_id,
+            completion_driver_id,
+            completion_device_id,
+            allocation_instance,
+        ) = {
+            let transaction = &hosted_filter_requirements_transactions_mut()[index];
+            (
+                transaction.irp_id,
+                transaction.phase,
+                transaction.binding,
+                transaction.origin_driver_id,
+                transaction.completion_driver_id,
+                transaction.completion_device_id,
+                transaction.allocation_instance,
+            )
+        };
+        match phase {
+            HostedFilterRequirementsPhase::AwaitingCompletion => {
+                let Some(completion) = io_manager_mut().completed_irp(irp_id) else {
+                    index += 1;
+                    continue;
+                };
+                let identity_valid = completion.id == irp_id
+                    && completion.client_id == ClientId(IO_MANAGER_COMPONENT_ID)
+                    && completion.file_id.is_none()
+                    && completion.driver_id == origin_driver_id
+                    && completion.device_id == nt_io_manager::DeviceId(binding.pdo_device_id)
+                    && completion.major == major::IRP_MJ_PNP
+                    && completion.minor == nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS
+                    && completion.completion_driver_id == completion_driver_id
+                    && completion.completion_device_id == completion_device_id
+                    && completion.user_data == 0
+                    && completion.requestor_tid == 0
+                    && completion.completion_origin == IrpCompletionOrigin::Driver;
+                if !identity_valid {
+                    set_hosted_filter_requirements_indeterminate(
+                        irp_id,
+                        nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                    );
+                } else {
+                    retain_hosted_filter_requirements_return(
+                        irp_id,
+                        completion.status,
+                        completion.information,
+                        true,
+                    );
+                }
+                progress = progress.saturating_add(1);
+            }
+            HostedFilterRequirementsPhase::AwaitingCopy {
+                information,
+                pending_completion,
+            } => {
+                let copied = match copy_hosted_bus_property_result(
+                    allocation_instance,
+                    information,
+                    nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS,
+                ) {
+                    Ok(HostedBusPropertyValue::Blob(bytes)) => bytes,
+                    Ok(HostedBusPropertyValue::BusInformation(_)) => {
+                        set_hosted_filter_requirements_indeterminate(
+                            irp_id,
+                            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                        );
+                        progress = progress.saturating_add(1);
+                        continue;
+                    }
+                    Err(HostedDriverAllocationCopyError::RetryResources) => {
+                        index += 1;
+                        continue;
+                    }
+                    Err(HostedDriverAllocationCopyError::Malformed) => {
+                        set_hosted_filter_requirements_disposition(
+                            irp_id,
+                            pending_completion,
+                            HostedFilterRequirementsDisposition::Barrier(
+                                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                            ),
+                        );
+                        progress = progress.saturating_add(1);
+                        continue;
+                    }
+                    Err(HostedDriverAllocationCopyError::InvalidPointer) => {
+                        set_hosted_filter_requirements_indeterminate(
+                            irp_id,
+                            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                        );
+                        progress = progress.saturating_add(1);
+                        continue;
+                    }
+                    Err(HostedDriverAllocationCopyError::ReleaseFailed) => {
+                        set_hosted_filter_requirements_indeterminate(
+                            irp_id,
+                            nt_status::NtStatus::UNSUCCESSFUL,
+                        );
+                        progress = progress.saturating_add(1);
+                        continue;
+                    }
+                };
+                let status = hosted_filter_requirements_transactions_mut()[index]
+                    .driver_status
+                    .expect("filter-requirements copy has no driver status");
+                if status.is_success() {
+                    let transaction = &mut hosted_filter_requirements_transactions_mut()[index];
+                    transaction.filtered = Some(copied);
+                    transaction.phase = HostedFilterRequirementsPhase::AwaitingCommit {
+                        pending_completion,
+                    };
+                } else if status == nt_status::NtStatus::NOT_SUPPORTED {
+                    let transaction = &mut hosted_filter_requirements_transactions_mut()[index];
+                    transaction.filtered = Some(core::mem::take(&mut transaction.original));
+                    transaction.phase = HostedFilterRequirementsPhase::AwaitingCommit {
+                        pending_completion,
+                    };
+                } else {
+                    set_hosted_filter_requirements_disposition(
+                        irp_id,
+                        pending_completion,
+                        HostedFilterRequirementsDisposition::Barrier(status),
+                    );
+                }
+                progress = progress.saturating_add(1);
+            }
+            HostedFilterRequirementsPhase::AwaitingCommit { pending_completion } => {
+                let filtered_copy = {
+                    let transaction = &hosted_filter_requirements_transactions_mut()[index];
+                    clone_pnp_resource_list(
+                        transaction
+                            .filtered
+                            .as_deref()
+                            .expect("filter-requirements commit has no owned list"),
+                    )
+                };
+                let filtered_copy = match filtered_copy {
+                    Ok(filtered) => filtered,
+                    Err(status) if status == nt_status::NtStatus::INSUFFICIENT_RESOURCES => {
+                        index += 1;
+                        continue;
+                    }
+                    Err(status) => {
+                        set_hosted_filter_requirements_disposition(
+                            irp_id,
+                            pending_completion,
+                            HostedFilterRequirementsDisposition::Barrier(status),
+                        );
+                        progress = progress.saturating_add(1);
+                        continue;
+                    }
+                };
+                let disposition = match hosted_pnp_manager_mut()
+                    .commit_filtered_resource_requirements(binding.pdo_device_id, filtered_copy)
+                {
+                    Ok(()) => HostedFilterRequirementsDisposition::Ready,
+                    Err(error) => HostedFilterRequirementsDisposition::Barrier(hosted_pnp_status(error)),
+                };
+                set_hosted_filter_requirements_disposition(
+                    irp_id,
+                    pending_completion,
+                    disposition,
+                );
+                progress = progress.saturating_add(1);
+            }
+            HostedFilterRequirementsPhase::AwaitingAck { disposition } => {
+                match io_manager_mut().acknowledge_completed_irp_strict(irp_id) {
+                    Ok(_) => set_hosted_filter_requirements_disposition(irp_id, false, disposition),
+                    Err(status) => set_hosted_filter_requirements_indeterminate(irp_id, status),
+                }
+                progress = progress.saturating_add(1);
+            }
+            HostedFilterRequirementsPhase::Ready
+            | HostedFilterRequirementsPhase::Barrier
+            | HostedFilterRequirementsPhase::Indeterminate => {
+                index += 1;
+            }
+        }
+    }
+    progress
+}
+
 pub(crate) fn pump_hosted_io_completions() -> usize {
     let pumped = pump_io_manager(io_manager_mut());
     pumped
         .saturating_add(unsafe { drain_hosted_device_retirements() })
         .saturating_add(unsafe { drain_hosted_pnp_completions() })
+        .saturating_add(unsafe { drain_hosted_filter_requirements_transactions() })
         .saturating_add(unsafe { drain_hosted_device_relation_query() })
         .saturating_add(unsafe { start_hosted_device_relation_query() })
 }
@@ -38294,6 +38486,9 @@ static mut HOSTED_MDL_REGISTRY: Option<MdlRegistry> = None;
 static mut HOSTED_DEVICE_RESOURCE_STATES: Option<Vec<HostedDeviceResourceState>> = None;
 static mut HOSTED_DEVICE_PROPERTY_TRANSFERS: Option<HostedDevicePropertyTransferTable> = None;
 static mut HOSTED_PNP_TRANSACTIONS: Option<Vec<HostedPnpTransaction>> = None;
+static mut HOSTED_FILTER_REQUIREMENTS_TRANSACTIONS: Option<
+    Vec<HostedFilterRequirementsTransaction>,
+> = None;
 
 static HOSTED_DEVICE_RELATION_INVALIDATION_CALLS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DEVICE_RELATION_INVALIDATION_QUEUED: AtomicU64 = AtomicU64::new(0);
@@ -38554,6 +38749,54 @@ struct HostedPnpTransaction {
     interface_state_published: bool,
     resource_snapshot_published: bool,
     power_state_published: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostedFilterRequirementsDisposition {
+    Ready,
+    Barrier(nt_status::NtStatus),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostedFilterRequirementsPhase {
+    AwaitingCompletion,
+    AwaitingCopy {
+        information: u64,
+        pending_completion: bool,
+    },
+    AwaitingCommit {
+        pending_completion: bool,
+    },
+    AwaitingAck {
+        disposition: HostedFilterRequirementsDisposition,
+    },
+    Ready,
+    Barrier,
+    Indeterminate,
+}
+
+struct HostedFilterRequirementsTransaction {
+    binding: HostedDeviceBinding,
+    irp_id: IrpId,
+    origin_driver_id: DriverId,
+    completion_driver_id: DriverId,
+    completion_device_id: nt_io_manager::DeviceId,
+    allocation_instance: usize,
+    phase: HostedFilterRequirementsPhase,
+    driver_status: Option<nt_status::NtStatus>,
+    barrier_status: Option<nt_status::NtStatus>,
+    original: Vec<u8>,
+    filtered: Option<Vec<u8>>,
+}
+
+pub(crate) enum HostedFilterRequirementsOutcome {
+    Filtered { requirements: Vec<u8> },
+    Failed(nt_status::NtStatus),
+    Pending { irp_id: u64 },
+    Indeterminate {
+        irp_id: u64,
+        transport_status: nt_status::NtStatus,
+    },
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -39003,6 +39246,10 @@ unsafe fn copy_hosted_bus_property_result(
             nt_pnp_manager::copy_io_resource_requirements_list(allocation)
                 .map(HostedBusPropertyValue::Blob)
         }
+        nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS => {
+            nt_pnp_manager::copy_io_resource_requirements_list(allocation)
+                .map(HostedBusPropertyValue::Blob)
+        }
         _ => Err(nt_pnp_manager::BusPropertyCopyError::Malformed),
     };
     match copied {
@@ -39023,6 +39270,108 @@ unsafe fn copy_hosted_bus_property_result(
                 Err(HostedDriverAllocationCopyError::ReleaseFailed)
             }
         }
+    }
+}
+
+unsafe fn hosted_filter_requirements_transactions_mut(
+) -> &'static mut Vec<HostedFilterRequirementsTransaction> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_FILTER_REQUIREMENTS_TRANSACTIONS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn reserve_hosted_filter_requirements_transaction(
+    transaction: HostedFilterRequirementsTransaction,
+) -> Result<(), nt_status::NtStatus> {
+    let transactions = hosted_filter_requirements_transactions_mut();
+    if transaction.irp_id.raw() == 0
+        || transactions.iter().any(|current| {
+            current.irp_id == transaction.irp_id
+                || current.binding.device_id == transaction.binding.device_id
+        })
+        || (*core::ptr::addr_of!(HOSTED_PNP_TRANSACTIONS))
+            .as_ref()
+            .is_some_and(|current| {
+                current
+                    .iter()
+                    .any(|entry| entry.binding.device_id == transaction.binding.device_id)
+            })
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    transactions
+        .try_reserve(1)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    transactions.push(transaction);
+    Ok(())
+}
+
+unsafe fn set_hosted_filter_requirements_indeterminate(
+    irp_id: IrpId,
+    status: nt_status::NtStatus,
+) {
+    let transaction = hosted_filter_requirements_transactions_mut()
+        .iter_mut()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .expect("hosted filter-requirements transaction disappeared");
+    transaction.phase = HostedFilterRequirementsPhase::Indeterminate;
+    transaction.barrier_status = Some(status);
+}
+
+unsafe fn set_hosted_filter_requirements_disposition(
+    irp_id: IrpId,
+    pending_completion: bool,
+    disposition: HostedFilterRequirementsDisposition,
+) {
+    let transaction = hosted_filter_requirements_transactions_mut()
+        .iter_mut()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .expect("hosted filter-requirements transaction disappeared");
+    if pending_completion {
+        transaction.phase = HostedFilterRequirementsPhase::AwaitingAck { disposition };
+    } else {
+        match disposition {
+            HostedFilterRequirementsDisposition::Ready => {
+                transaction.phase = HostedFilterRequirementsPhase::Ready;
+                transaction.barrier_status = None;
+            }
+            HostedFilterRequirementsDisposition::Barrier(status) => {
+                transaction.phase = HostedFilterRequirementsPhase::Barrier;
+                transaction.barrier_status = Some(status);
+            }
+        }
+    }
+}
+
+unsafe fn retain_hosted_filter_requirements_return(
+    irp_id: IrpId,
+    status: nt_status::NtStatus,
+    information: u64,
+    pending_completion: bool,
+) {
+    let transaction = hosted_filter_requirements_transactions_mut()
+        .iter_mut()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .expect("hosted filter-requirements transaction disappeared");
+    transaction.driver_status = Some(status);
+    if information != 0 {
+        transaction.phase = HostedFilterRequirementsPhase::AwaitingCopy {
+            information,
+            pending_completion,
+        };
+    } else if status.is_success() || status == nt_status::NtStatus::NOT_SUPPORTED {
+        transaction.filtered = Some(core::mem::take(&mut transaction.original));
+        transaction.phase = HostedFilterRequirementsPhase::AwaitingCommit {
+            pending_completion,
+        };
+    } else {
+        set_hosted_filter_requirements_disposition(
+            irp_id,
+            pending_completion,
+            HostedFilterRequirementsDisposition::Barrier(status),
+        );
     }
 }
 
@@ -46450,7 +46799,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     pnp_context_lease: nt_pnp_context::ContextLeaseIdentity,
 ) -> Result<(), nt_status::NtStatus> {
     if memory.len() + ports.len() > SH_RESOURCE_ADDRESS_RECORD_CAPACITY as usize
-        || memory.is_empty() && ports.is_empty()
+        || memory.is_empty() && ports.is_empty() && interrupt_vector == 0
         || interrupt_affinity > u32::MAX as u64
     {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
@@ -47664,16 +48013,166 @@ pub(crate) unsafe fn commit_hosted_device_resource_assignment(
         .map_err(hosted_pnp_status)
 }
 
-pub(crate) unsafe fn commit_hosted_filtered_resource_requirements(
+pub(crate) unsafe fn commit_hosted_no_resource_requirements(
     device_id: u64,
-    filtered_requirements: &[u8],
 ) -> Result<(), nt_status::NtStatus> {
     let binding = hosted_device_binding_by_device_id(device_id)
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    let filtered = clone_pnp_resource_list(filtered_requirements)?;
     hosted_pnp_manager_mut()
-        .commit_filtered_resource_requirements(binding.pdo_device_id, filtered)
+        .commit_filtered_resource_requirements(binding.pdo_device_id, Vec::new())
         .map_err(hosted_pnp_status)
+}
+
+unsafe fn take_hosted_filter_requirements_outcome(
+    irp_id: IrpId,
+) -> Result<HostedFilterRequirementsOutcome, nt_status::NtStatus> {
+    let transactions = hosted_filter_requirements_transactions_mut();
+    let index = transactions
+        .iter()
+        .position(|transaction| transaction.irp_id == irp_id)
+        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    match transactions[index].phase {
+        HostedFilterRequirementsPhase::Ready => {
+            let mut transaction = transactions.remove(index);
+            Ok(HostedFilterRequirementsOutcome::Filtered {
+                requirements: transaction
+                    .filtered
+                    .take()
+                    .expect("ready filter-requirements transaction has no owned list"),
+            })
+        }
+        HostedFilterRequirementsPhase::Barrier => {
+            let transaction = transactions.remove(index);
+            Ok(HostedFilterRequirementsOutcome::Failed(
+                transaction
+                    .barrier_status
+                    .expect("barrier filter-requirements transaction has no status"),
+            ))
+        }
+        HostedFilterRequirementsPhase::Indeterminate => {
+            Ok(HostedFilterRequirementsOutcome::Indeterminate {
+                irp_id: irp_id.raw(),
+                transport_status: transactions[index]
+                    .barrier_status
+                    .expect("indeterminate filter-requirements transaction has no status"),
+            })
+        }
+        HostedFilterRequirementsPhase::AwaitingCompletion
+        | HostedFilterRequirementsPhase::AwaitingCopy { .. }
+        | HostedFilterRequirementsPhase::AwaitingCommit { .. }
+        | HostedFilterRequirementsPhase::AwaitingAck { .. } => {
+            Ok(HostedFilterRequirementsOutcome::Pending {
+                irp_id: irp_id.raw(),
+            })
+        }
+    }
+}
+
+pub(crate) unsafe fn filter_hosted_device_resource_requirements(
+    device_id: u64,
+    resource_requirements: &[u8],
+) -> Result<HostedFilterRequirementsOutcome, nt_status::NtStatus> {
+    let extent = nt_cm_resources::validate_io_resource_requirements_list_extent(
+        resource_requirements,
+    )
+    .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+    if extent != resource_requirements.len() {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    if (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY)).is_some() {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    let binding = hosted_device_binding_by_device_id(device_id)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let original = clone_pnp_resource_list(resource_requirements)?;
+    let payload = clone_pnp_resource_list(resource_requirements)?;
+    let input_len = u32::try_from(resource_requirements.len())
+        .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+    let parameters = PnpParameters::filter_resource_requirements(input_len)?;
+    let prepared = io_manager_mut().prepare_external_pnp_owned_to_device(
+        ClientId(IO_MANAGER_COMPONENT_ID),
+        nt_io_manager::DeviceId(binding.pdo_device_id),
+        0,
+        parameters,
+        payload,
+    )?;
+    let irp_id = prepared.irp_id();
+    let identities = io_manager_mut().irp(irp_id).and_then(|irp| {
+        let current = irp.current_stack()?;
+        let allocation_instance = hosted_relation_allocation_instance(current.driver_id)?;
+        Some((
+            irp.origin_driver_id,
+            current.driver_id,
+            current.device_id,
+            allocation_instance,
+        ))
+    });
+    let Some((origin_driver_id, completion_driver_id, completion_device_id, allocation_instance)) =
+        identities
+    else {
+        io_manager_mut().discard_prepared_external_pnp(prepared)?;
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    };
+    if let Err(status) = reserve_active_hosted_irp_transfer_slot() {
+        let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
+        return Err(status);
+    }
+    let transaction = HostedFilterRequirementsTransaction {
+        binding,
+        irp_id,
+        origin_driver_id,
+        completion_driver_id,
+        completion_device_id,
+        allocation_instance,
+        phase: HostedFilterRequirementsPhase::AwaitingCompletion,
+        driver_status: None,
+        barrier_status: None,
+        original,
+        filtered: None,
+    };
+    if let Err(status) = reserve_hosted_filter_requirements_transaction(transaction) {
+        let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
+        return Err(status);
+    }
+    match io_manager_mut().dispatch_prepared_external_pnp(prepared) {
+        ExternalPnpDispatchResult::Returned {
+            status,
+            information,
+        } => retain_hosted_filter_requirements_return(
+            irp_id,
+            status,
+            information,
+            false,
+        ),
+        ExternalPnpDispatchResult::ReturnedPayload { .. } => {
+            set_hosted_filter_requirements_indeterminate(
+                irp_id,
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            );
+        }
+        ExternalPnpDispatchResult::Pending { irp_id: pending_id } => {
+            assert_eq!(pending_id, irp_id);
+        }
+        ExternalPnpDispatchResult::Indeterminate {
+            irp_id: retained_id,
+            transport_status,
+        } => {
+            assert_eq!(retained_id, irp_id);
+            set_hosted_filter_requirements_indeterminate(irp_id, transport_status);
+        }
+    }
+    drain_hosted_filter_requirements_transactions();
+    take_hosted_filter_requirements_outcome(irp_id)
+}
+
+pub(crate) unsafe fn observe_hosted_filter_resource_requirements(
+    irp_id: u64,
+) -> Result<HostedFilterRequirementsOutcome, nt_status::NtStatus> {
+    if irp_id == 0 {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    drain_hosted_filter_requirements_transactions();
+    take_hosted_filter_requirements_outcome(IrpId(irp_id))
 }
 
 pub(crate) unsafe fn rollback_hosted_device_start(

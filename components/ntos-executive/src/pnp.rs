@@ -22,10 +22,10 @@ use alloc::vec::Vec;
 use crate::*;
 use nt_pnp::{
     assign_resources, assign_root_bus_resources, assignment_to_cm_list, enumerate_bus,
-    pci_boot_resources, pci_resource_requirements, pci_resource_requirements_filtered,
-    root_bus_resource_requirements, PciDevice, PciInterruptAssignment, ResourceAssignment,
-    ResourceView, RootBusResourceCatalog, RootBusResourceProfile, ASSIGNMENT_CM_LIST_MAX_SIZE,
-    ROOT_DMA_TEST_RESOURCE_PROFILE,
+    pci_boot_resources, pci_resource_requirements, root_bus_resource_requirements,
+    select_resource_assignment, PciDevice, PciInterruptAssignment, ResourceAssignment, ResourceView,
+    RootBusResourceCatalog, RootBusResourceProfile, ASSIGNMENT_CM_LIST_MAX_SIZE,
+    INTERFACE_TYPE_PCI_BUS, INTERFACE_TYPE_PNP_BUS, ROOT_DMA_TEST_RESOURCE_PROFILE,
 };
 
 static mut ROOT_BUS_RESOURCE_CATALOG: Option<RootBusResourceCatalog> = None;
@@ -164,7 +164,6 @@ pub(crate) unsafe fn restore_pci_interrupt_line(programming: PciInterruptLinePro
 pub(crate) struct DevnodePciResourceGrant {
     pub device: PciDevice,
     pub assignment: ResourceAssignment,
-    pub resource_requirements: Vec<u8>,
     pub raw_resource_list: Vec<u8>,
     pub translated_resource_list: Vec<u8>,
 }
@@ -243,10 +242,17 @@ pub(crate) fn build_devnode_pci_resource_grant(
     bus_resources: DevnodePciBusResources,
     interrupt: Option<PciInterruptAssignment>,
     dma_len: u64,
-) -> Option<DevnodePciResourceGrant> {
-    let assignment = assign_resources(&bus_resources.device, interrupt, dma_len).ok()??;
-    let resource_requirements =
-        pci_resource_requirements_filtered(&bus_resources.device, interrupt.is_some()).ok()??;
+    filtered_resource_requirements: Vec<u8>,
+) -> Result<DevnodePciResourceGrant, nt_pnp::ResourceRequirementsError> {
+    let available = assign_resources(&bus_resources.device, interrupt, dma_len)?
+        .ok_or(nt_pnp::ResourceRequirementsError::UnsatisfiedFilteredRequirements)?;
+    let assignment = select_resource_assignment(
+        &available,
+        &filtered_resource_requirements,
+        INTERFACE_TYPE_PCI_BUS,
+        bus_resources.device.bus as u32,
+        bus_resources.device.slot_number(),
+    )?;
     let mut translated_resource_list = vec![0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
     let n = assignment_to_cm_list(
         &mut translated_resource_list,
@@ -255,7 +261,7 @@ pub(crate) fn build_devnode_pci_resource_grant(
         &assignment,
         ResourceView::Translated,
     )
-    .ok()?;
+    .map_err(nt_pnp::ResourceRequirementsError::EncodeCm)?;
     translated_resource_list.truncate(n);
     let mut raw_resource_list = vec![0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
     let raw_len = assignment_to_cm_list(
@@ -265,15 +271,53 @@ pub(crate) fn build_devnode_pci_resource_grant(
         &assignment,
         ResourceView::Raw,
     )
-    .ok()?;
+    .map_err(nt_pnp::ResourceRequirementsError::EncodeCm)?;
     raw_resource_list.truncate(raw_len);
-    Some(DevnodePciResourceGrant {
+    Ok(DevnodePciResourceGrant {
         device: bus_resources.device,
         assignment,
-        resource_requirements,
         raw_resource_list,
         translated_resource_list,
     })
+}
+
+/// Apply the function stack's returned list to a pre-arbitrated root-bus candidate set and rebuild
+/// both START lists from only the admitted descriptors.
+pub(crate) fn filter_devnode_root_resource_grant(
+    mut grant: DevnodeRootResourceGrant,
+    filtered_resource_requirements: Vec<u8>,
+) -> Result<DevnodeRootResourceGrant, nt_pnp::ResourceRequirementsError> {
+    grant.assignment = select_resource_assignment(
+        &grant.assignment,
+        &filtered_resource_requirements,
+        INTERFACE_TYPE_PNP_BUS,
+        0,
+        0,
+    )?;
+    grant.resource_requirements = filtered_resource_requirements;
+    let mut translated_resource_list = vec![0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
+    let translated_len = assignment_to_cm_list(
+        &mut translated_resource_list,
+        INTERFACE_TYPE_PNP_BUS,
+        0,
+        &grant.assignment,
+        ResourceView::Translated,
+    )
+    .map_err(nt_pnp::ResourceRequirementsError::EncodeCm)?;
+    translated_resource_list.truncate(translated_len);
+    let mut raw_resource_list = vec![0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
+    let raw_len = assignment_to_cm_list(
+        &mut raw_resource_list,
+        INTERFACE_TYPE_PNP_BUS,
+        0,
+        &grant.assignment,
+        ResourceView::Raw,
+    )
+    .map_err(nt_pnp::ResourceRequirementsError::EncodeCm)?;
+    raw_resource_list.truncate(raw_len);
+    grant.raw_resource_list = raw_resource_list;
+    grant.translated_resource_list = translated_resource_list;
+    Ok(grant)
 }
 
 /// Resolve a registry-selected root-bus devnode against broker-backed resource profiles and build
